@@ -28,9 +28,12 @@ import {
 } from "../lib/context-usage-snapshot";
 import { AppError, NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { type OwnTurnPlacement, ownTurnPlacementOf } from "../lib/runtime-source";
 import {
 	CONTEXT_COMPOSITION_LIMITS,
 	readContextHistoryEntries,
+	TOP_LEVEL_SQL,
+	topLevelBindings,
 	yieldContextReader,
 } from "./context-composition-history";
 import { readContextSegments } from "./context-composition-projection";
@@ -57,12 +60,20 @@ const REQUEST_PREPARATION_BUDGET_MS = 2_000;
 const MAX_REQUEST_PREPARATIONS = 32;
 class ContextRevisionChanged extends Error {}
 class ContextActorRemoved extends Error {}
-function profileOf(meta: Metadata): "primary" | "subagent" {
-	return meta.type === "subagent" || meta.variant.startsWith("subagent:") ? "subagent" : "primary";
+/** The session's own-turn placement (`ownTurnPlacementOf`, the `isTopLevelMessage` rule). */
+function placementOf(meta: Metadata): OwnTurnPlacement {
+	return ownTurnPlacementOf({
+		type: meta.type,
+		variant: meta.variant,
+		parentNarratorId: meta.parentNarratorId,
+		runtimeRegistrationJson: meta.registration ? JSON.parse(meta.registration) : null,
+	});
 }
 type Metadata = {
 	type: string;
 	variant: string;
+	parentNarratorId: string | null;
+	registration: string | null;
 	revision: number;
 	messageVersion: number;
 	systemChars: number;
@@ -73,8 +84,8 @@ type Metadata = {
 };
 function revisionOf(meta: Metadata) {
 	return [
-		"profile-v3",
-		profileOf(meta),
+		"profile-v4",
+		placementOf(meta) ?? "",
 		meta.type,
 		meta.variant,
 		meta.revision,
@@ -148,7 +159,9 @@ export function createContextCharacterService(
 	const metadata = (id: string) =>
 		database
 			.query<Metadata, [string]>(
-				`SELECT type, variant, context_char_revision AS revision, message_version AS messageVersion,
+				`SELECT type, variant, parent_narrator_id AS parentNarratorId,
+		 CASE WHEN length(runtime_registration_json) <= 65536 THEN runtime_registration_json END AS registration,
+		 context_char_revision AS revision, message_version AS messageVersion,
 		 context_system_chars AS systemChars, context_summary_chars AS summaryChars,
 		 context_tools_chars AS toolsChars,
 		 CASE WHEN length(context_char_cache_json) <= 16384 THEN context_char_cache_json END AS cache,
@@ -264,14 +277,15 @@ export function createContextCharacterService(
 				append({ category: "summary", chars: meta.summaryChars });
 				append({ category: "toolDefinition", chars: meta.toolsChars });
 				const old = numeric.get(id);
-				const profile = `${meta.type}:${meta.variant}:${profileOf(meta)}`;
+				const placement = placementOf(meta);
+				const profile = `${meta.type}:${meta.variant}:${JSON.stringify(placement)}`;
 				metrics.queries++;
 				const boundary =
 					database
-						.query<{ seq: number }, [string, string]>(
-							`SELECT r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ? AND r.is_compact = 1 AND (? = 'subagent' OR m.parent_tool_use_id IS NULL) ORDER BY r.seq DESC LIMIT 1`,
+						.query<{ seq: number }, [string, string | null, string | null]>(
+							`SELECT r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ? AND r.is_compact = 1 AND ${TOP_LEVEL_SQL} ORDER BY r.seq DESC LIMIT 1`,
 						)
-						.get(id, profileOf(meta))?.seq ?? -1;
+						.get(id, ...topLevelBindings(placement))?.seq ?? -1;
 				let incremental =
 					!!old &&
 					old.boundary === boundary &&
@@ -371,7 +385,7 @@ export function createContextCharacterService(
 					},
 				});
 				for await (const rawEntry of readContextHistoryEntries(readerDatabase, id, {
-					profile: profileOf(meta),
+					topLevelToolUseId: placement,
 					check,
 					messageIds: incremental ? [...(affected ?? [])] : undefined,
 				})) {
@@ -646,6 +660,7 @@ export function createContextCharacterService(
 			if (disposed || signal?.aborted || preparations.has(id)) return null;
 			const initial = metadata(id);
 			if (!initial) return null;
+			const initialPlacement = placementOf(initial);
 			const requestCounts = validInputCharacters(counts);
 			if (requestCounts?.compositionSegments) {
 				// Final provider input is already classified. Never substitute today's
@@ -810,14 +825,14 @@ export function createContextCharacterService(
 					let batch: string[] = [];
 					const matches = () =>
 						database
-							.query<{ id: string }, string[]>(
+							.query<{ id: string }, (string | null)[]>(
 								`SELECT r.message_id AS id FROM narrator_message_refs r
 						 JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ?
 						 AND r.message_id IN (${batch.map(() => "?").join(",")})
 						 AND r.segment_compact_id IS NULL AND m.role != 'disp'
-						 ${profileOf(initial) === "primary" ? "AND m.parent_tool_use_id IS NULL" : ""} LIMIT 1`,
+						 AND ${TOP_LEVEL_SQL} LIMIT 1`,
 							)
-							.get(id, ...batch);
+							.get(id, ...batch, ...topLevelBindings(initialPlacement));
 					for (const messageId of scope.messageIds ?? []) {
 						if (
 							performance.now() >= deadline ||
@@ -848,6 +863,7 @@ export function createContextCharacterService(
 				meta.messageVersion === initial.messageVersion &&
 				meta.type === initial.type &&
 				meta.variant === initial.variant &&
+				placementOf(meta) === initialPlacement &&
 				meta.systemChars === initial.systemChars &&
 				meta.summaryChars === initial.summaryChars &&
 				meta.toolsChars === initial.toolsChars;

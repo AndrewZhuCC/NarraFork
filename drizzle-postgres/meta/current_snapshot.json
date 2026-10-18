@@ -1,6 +1,6 @@
 {
-  "id": "589f163a-9f46-4c42-9b4f-7421ec507a16",
-  "prevId": "ea5dc255-0883-4d86-bf3b-50e19f8d9e1b",
+  "id": "02c17b92-7607-4b75-983a-705ff12ec770",
+  "prevId": "a1fadcea-304f-40c9-b4aa-9ef79e733391",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -11462,6 +11462,222 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.narrator_event_subscriptions": {
+      "name": "narrator_event_subscriptions",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "source_narrator_id": {
+          "name": "source_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "recipient_narrator_id": {
+          "name": "recipient_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "events": {
+          "name": "events",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "wake": {
+          "name": "wake",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "origin": {
+          "name": "origin",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "authorized_by_user_id": {
+          "name": "authorized_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_narrator_event_sub_source_run": {
+          "name": "idx_narrator_event_sub_source_run",
+          "columns": [
+            {
+              "expression": "source_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "run_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrator_event_sub_recipient": {
+          "name": "idx_narrator_event_sub_recipient",
+          "columns": [
+            {
+              "expression": "recipient_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrator_event_sub_authorized_by": {
+          "name": "idx_narrator_event_sub_authorized_by",
+          "columns": [
+            {
+              "expression": "authorized_by_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrator_event_sub_session_unique": {
+          "name": "idx_narrator_event_sub_session_unique",
+          "columns": [
+            {
+              "expression": "source_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "recipient_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"run_id\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrator_event_sub_run_unique": {
+          "name": "idx_narrator_event_sub_run_unique",
+          "columns": [
+            {
+              "expression": "source_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "recipient_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "run_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"run_id\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_event_subscriptions_source_narrator_id_narrators_id_fk": {
+          "name": "narrator_event_subscriptions_source_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_event_subscriptions",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "source_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "narrator_event_subscriptions_authorized_by_user_id_users_id_fk": {
+          "name": "narrator_event_subscriptions_authorized_by_user_id_users_id_fk",
+          "tableFrom": "narrator_event_subscriptions",
+          "tableTo": "users",
+          "columnsFrom": [
+            "authorized_by_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrator_event_subscriptions_recipient_narrator_i_cea958b39a_fk": {
+          "name": "narrator_event_subscriptions_recipient_narrator_i_cea958b39a_fk",
+          "tableFrom": "narrator_event_subscriptions",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "recipient_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.narrator_file_snapshots": {
       "name": "narrator_file_snapshots",
       "schema": "",
@@ -15079,6 +15295,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "runtime_registration_json": {
+          "name": "runtime_registration_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "policy_source_narrator_id": {
+          "name": "policy_source_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -15232,6 +15460,21 @@
           "columns": [
             {
               "expression": "acl_root_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_policy_source": {
+          "name": "idx_narrators_policy_source",
+          "columns": [
+            {
+              "expression": "policy_source_narrator_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -15526,6 +15769,19 @@
             "id"
           ],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrators_policy_source_narrator_id_narrators_id_fk": {
+          "name": "narrators_policy_source_narrator_id_narrators_id_fk",
+          "tableFrom": "narrators",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "policy_source_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
           "onUpdate": "no action"
         }
       },

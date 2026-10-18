@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import {
@@ -14,7 +15,6 @@ const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 const realNarratorPersistenceModule = { ...(await import("../narrator-persistence")) };
 const realContinuationModule = { ...(await import("../tool-continuation-service")) };
 const realNarratorSessionModule = { ...(await import("../narrator-session")) };
-const realSubagentResumeModule = { ...(await import("../subagent-resume")) };
 const realAgentCommunicationModule = { ...(await import("../agent-communication")) };
 const realAgentReplyWaiterModule = { ...(await import("../agent-reply-waiter")) };
 const updateCoordinator = await import("../update-coordinator");
@@ -343,35 +343,35 @@ mock.module("../narrator-session", () => ({
 		executePersistedCalls += 1;
 		return executePersistedToolCallImpl(input);
 	},
-	continueNarrator: async () => {
+	// The one recovery entry. A recovering Agent continuation re-enters its delegated
+	// session's own run through it exactly like an owner continuation does; the test
+	// only tells them apart by which session is continued.
+	continueNarrator: async (
+		narratorId: string,
+		locale?: string,
+		_reply?: boolean,
+		_user?: string | null,
+		run?: Record<string, unknown>,
+	) => {
+		if (continuationRows.some((row) => row.payloadJson?.subagentId === narratorId)) {
+			resumedAgentCalls.push({ narratorId, locale, ...run });
+			if (expectedPendingReplyProbe) {
+				replyWaiterPresenceAtAgentResume.push(
+					realAgentReplyWaiterModule.hasPendingAgentReply(
+						expectedPendingReplyProbe.requesterId,
+						expectedPendingReplyProbe.responderId,
+						expectedPendingReplyProbe.scope,
+					),
+				);
+			}
+			return { ok: true, terminal: resumedAgentCompletion };
+		}
 		continueNarratorCalls += 1;
 		return continueNarratorImpl ? continueNarratorImpl() : continueNarratorResult;
 	},
 	abortActiveNarratorLoopForPlannedUpdateRecovery: () => {
 		abortActiveRecoveryLoopCalls += 1;
 		return true;
-	},
-}));
-
-mock.module("../subagent-resume", () => ({
-	...realSubagentResumeModule,
-	resumeSubagent: async (input: Record<string, unknown>) => {
-		resumedAgentCalls.push(input);
-		if (expectedPendingReplyProbe) {
-			replyWaiterPresenceAtAgentResume.push(
-				realAgentReplyWaiterModule.hasPendingAgentReply(
-					expectedPendingReplyProbe.requesterId,
-					expectedPendingReplyProbe.responderId,
-					expectedPendingReplyProbe.scope,
-				),
-			);
-		}
-		return {
-			started: true,
-			resumedSuspendedRunner: false,
-			originToolUseId: "origin",
-			terminalCompletion: resumedAgentCompletion,
-		};
 	},
 }));
 
@@ -443,7 +443,6 @@ afterAll(() => {
 	mock.module("../narrator-persistence", () => realNarratorPersistenceModule);
 	mock.module("../tool-continuation-service", () => realContinuationModule);
 	mock.module("../narrator-session", () => realNarratorSessionModule);
-	mock.module("../subagent-resume", () => realSubagentResumeModule);
 	mock.module("../agent-communication", () => realAgentCommunicationModule);
 	mock.restore();
 });
@@ -1254,7 +1253,7 @@ describe("planned update continuation scheduling", () => {
 		});
 	});
 
-	test("passes only the remaining Agent deadline to the continued runner", async () => {
+	test("continues the same Agent run without re-timing it", async () => {
 		loadMode = "idle";
 		const deadlineAt = new Date(Date.now() + 10_000).toISOString();
 		const record = continuationRecord("tool-agent-deadline", "owner", {
@@ -1270,17 +1269,64 @@ describe("planned update continuation scheduling", () => {
 		recoveryQueue = [recoveryItem(record, "message-agent-deadline", 0)];
 		const prepared = await prepareRecovery();
 
+		// The run that was executing before the update (registered by the fixture).
+		const runId = record.payloadJson?.logicalRunId;
+		expect(typeof runId).toBe("string");
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
 		expect(resumedAgentCalls).toHaveLength(1);
-		const remaining = resumedAgentCalls[0]?.timeoutMs as number;
-		expect(remaining).toBeGreaterThan(0);
-		expect(remaining).toBeLessThanOrEqual(10_000);
+		// The absolute deadline is a registered fact of that run: recovery re-enters the
+		// run by id and never supplies a fresh timeout that could restart it.
 		expect(resumedAgentCalls[0]).toMatchObject({
-			executionDeadlineAt: deadlineAt,
-			executionTimeoutMs: 30_000,
+			narratorId: "child-deadline",
+			resumeRunId: runId,
+			recovered: true,
 		});
+		for (const key of ["timeoutMs", "executionDeadlineAt", "executionTimeoutMs", "binding"])
+			expect(resumedAgentCalls[0]).not.toHaveProperty(key);
 		await recovery?.completion;
 	});
+
+	for (const expired of [false, true]) {
+		test(`M3 pre-registration Agent checkpoint preserves its original absolute deadline, expired=${expired}`, async () => {
+			loadMode = "idle";
+			const deadlineAt = new Date(Date.now() + (expired ? -1000 : 10_000)).toISOString();
+			const record = continuationRecord("legacy-deadline-tool", "owner", {
+				kind: "foreground_agent",
+				state: "waiting",
+				payloadJson: {
+					subagentId: "legacy-deadline-child",
+					executionDeadlineAt: deadlineAt,
+					executionTimeoutMs: 30_000,
+				},
+			});
+			toolCallResults.set(record.toolCallId, {
+				id: record.toolCallId,
+				toolUseId: record.toolCallId,
+				messageId: "legacy-deadline-message",
+				status: "running",
+				outputJson: null,
+			});
+			continuationRows = [record];
+			recoveryQueue = [recoveryItem(record, "legacy-deadline-message", 0)];
+			const prepared = await prepareRecovery();
+			// Simulate an old binary: the logical run/checkpoint exists, no registration yet.
+			await db
+				.update(narrators)
+				.set({ runtimeRegistrationJson: null })
+				.where(eq(narrators.id, "legacy-deadline-child"));
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			expect(resumedAgentCalls).toHaveLength(1);
+			expect(resumedAgentCalls[0]).toMatchObject({
+				resumeRunId: record.payloadJson?.logicalRunId,
+				binding: {
+					principal: { userId: null },
+					deadlineAt,
+					deliverTo: { narratorId: "owner", toolUseId: "legacy-deadline-tool" },
+				},
+			});
+			await recovery?.completion;
+		});
+	}
 
 	test("parent interrupt reaches recovered foreground Agent and Await", async () => {
 		loadMode = "idle";
@@ -1315,7 +1361,7 @@ describe("planned update continuation scheduling", () => {
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
 		expect(resumedAgentCalls).toHaveLength(1);
 		expect(awaitAgentCalls).toHaveLength(1);
-		const agentSignal = resumedAgentCalls[0]?.signal as AbortSignal;
+		const agentSignal = resumedAgentCalls[0]?.cancelSignal as AbortSignal;
 		const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
 		expect(agentSignal.aborted).toBe(false);
 		expect(awaitSignal.aborted).toBe(false);
@@ -1387,18 +1433,17 @@ describe("planned update continuation scheduling", () => {
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
 		await resultWriteReached;
-		const backgroundSignal = resumedAgentCalls[0]?.signal as AbortSignal;
-		expect(backgroundSignal.aborted).toBe(false);
+		// A background run is not bound to the parent's attempt: nothing it holds can be
+		// aborted by the parent's interrupt.
+		expect(resumedAgentCalls[0]?.cancelSignal).toBeUndefined();
 		expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
 		await cancellationStart;
-		expect(backgroundSignal.aborted).toBe(false);
 		releaseCancellation();
 		await Bun.sleep(0);
 		expect(continuationRows[0]?.state).toBe("cancelled");
 		releaseResultWrite();
 		await recovery?.completion;
 
-		expect(backgroundSignal.aborted).toBe(false);
 		expect(backgroundSettled).toBe(false);
 		expect(continuationRows[0]?.state).toBe("cancelled");
 		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
@@ -1480,11 +1525,10 @@ describe("planned update continuation scheduling", () => {
 		await resultWriteReached;
 		expect(resumedAgentCalls).toHaveLength(1);
 		expect(awaitAgentCalls).toHaveLength(1);
-		const backgroundSignal = resumedAgentCalls[0]?.signal as AbortSignal;
+		expect(resumedAgentCalls[0]?.cancelSignal).toBeUndefined();
 		const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
 		expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
 		await cancellationStart;
-		expect(backgroundSignal.aborted).toBe(false);
 		expect(awaitSignal.aborted).toBe(true);
 		releaseCancellation();
 		await Bun.sleep(0);
@@ -1493,7 +1537,6 @@ describe("planned update continuation scheduling", () => {
 		releaseResultWrite();
 		await recovery?.completion;
 
-		expect(backgroundSignal.aborted).toBe(false);
 		expect(backgroundSettled).toBe(false);
 		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
 		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();

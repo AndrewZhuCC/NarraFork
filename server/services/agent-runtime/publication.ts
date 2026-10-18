@@ -14,6 +14,15 @@ import { ValidationError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import { policySourceIdOf, registrationBeforeRun } from "../../lib/runtime-source";
+import {
+	type RunBindingInput,
+	type RuntimeRunBinding,
+	registerRun,
+} from "../../lib/validators/runtime-registration";
+
+export type StartedAgentRun = PublicationRun & { binding: RuntimeRunBinding };
+
 import {
 	claimNextRefSeq,
 	NARRATOR_REF_SEQ_EMPTY_TOP,
@@ -142,9 +151,12 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		parentNarratorId: string;
 		resumeRunId?: string;
 		started?: boolean;
+		/** Relationship facts of this run; written with the run id in one transaction. */
+		binding?: RunBindingInput;
+		legacyToolUseId?: string | null;
 		/** Task projection registration adopts the actor's existing run, never starts a second one. */
 		taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
-	}): PublicationRun {
+	}): StartedAgentRun {
 		return runAtomicWrite(database, "publication.startAgentRun", (tx) => {
 			let resumeRunId = input.resumeRunId;
 			if (input.taskRow && resumeRunId === undefined) {
@@ -189,6 +201,36 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				recipientId: input.parentNarratorId,
 			};
 			reserve(run, tx, input.started);
+			const topSeq = readTopRefSeq(tx, input.narratorId) ?? NARRATOR_REF_SEQ_EMPTY_TOP;
+			// The run's relationships commit with its id: nothing can observe the new run
+			// without also seeing who it delivers to, who cancels it and its deadline.
+			const source = tx
+				.select({
+					policySourceNarratorId: narrators.policySourceNarratorId,
+					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+					type: narrators.type,
+					variant: narrators.variant,
+					parentNarratorId: narrators.parentNarratorId,
+					subagentType: narrators.subagentType,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, input.narratorId))
+				.get();
+			const registration = registerRun(
+				source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
+				logicalRunId,
+				input.binding ?? {},
+				topSeq + 1,
+			);
+			tx.update(narrators)
+				.set({
+					runtimeRegistrationJson: registration,
+					// Writing a registration ends the legacy inference, so the source it
+					// inferred must become an explicit column in the same write.
+					policySourceNarratorId: source ? policySourceIdOf(source) : null,
+				})
+				.where(eq(narrators.id, input.narratorId))
+				.run();
 			if (!resumeRunId) {
 				// A stable ref boundary, not millisecond timestamps: two runs may start in
 				// the same ms. An empty narrator's watermark is NARRATOR_REF_SEQ_EMPTY_TOP
@@ -196,7 +238,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				// seq 0, and `source_after:0` would exclude it from the run's result.
 				tx.update(runtimePublicationOutbox)
 					.set({
-						resultRef: `source_after:${readTopRefSeq(tx, input.narratorId) ?? NARRATOR_REF_SEQ_EMPTY_TOP}`,
+						resultRef: `source_after:${topSeq}`,
 					})
 					.where(
 						and(
@@ -206,11 +248,51 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 					)
 					.run();
 			}
+			// Only a live projection follows the run here; an ended task row is reopened
+			// (status and run together) by the run service, never relinked half-way.
 			tx.update(backgroundTasks)
 				.set({ logicalRunId })
-				.where(eq(backgroundTasks.id, input.narratorId))
+				.where(and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")))
 				.run();
-			return run;
+			return { ...run, binding: registration.run };
+		});
+	}
+
+	/** Same run registration without optional result publication reservations. */
+	function registerUndeliveredRun(input: {
+		narratorId: string;
+		resumeRunId?: string;
+		binding: RunBindingInput;
+		legacyToolUseId?: string | null;
+	}): RuntimeRunBinding {
+		return runAtomicWrite(database, "publication.registerUndeliveredRun", (tx) => {
+			const logicalRunId = store.persistLogicalRun(input.narratorId, input, tx);
+			const source = tx
+				.select({
+					policySourceNarratorId: narrators.policySourceNarratorId,
+					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+					type: narrators.type,
+					variant: narrators.variant,
+					parentNarratorId: narrators.parentNarratorId,
+					subagentType: narrators.subagentType,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, input.narratorId))
+				.get();
+			const registration = registerRun(
+				source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
+				logicalRunId,
+				input.binding,
+				(readTopRefSeq(tx, input.narratorId) ?? NARRATOR_REF_SEQ_EMPTY_TOP) + 1,
+			);
+			tx.update(narrators)
+				.set({
+					runtimeRegistrationJson: registration,
+					policySourceNarratorId: source ? policySourceIdOf(source) : null,
+				})
+				.where(eq(narrators.id, input.narratorId))
+				.run();
+			return registration.run;
 		});
 	}
 
@@ -237,7 +319,12 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	}
 
 	/** Per-run UI-only source snapshot: never overwrite it when the same task starts again. */
-	function persistResult(run: PublicationRun, text: string, tx: RuntimeTx): string {
+	function persistResult(
+		run: PublicationRun,
+		text: string,
+		tx: RuntimeTx,
+		eventKind?: Exclude<PublicationEvent, "started">,
+	): string {
 		// Bash has one durable task per actual attempt; its output is already normalized
 		// to the existing 512 KiB budget. Never copy raw stdout into a message row.
 		if (run.producerKind === "bash") return `background_task:${run.taskId}:${run.logicalRunId}`;
@@ -307,6 +394,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 						type: "text",
 						text: storedText,
 						publicationResult: {
+							...(eventKind ? { eventKind } : {}),
 							logicalRunId: run.logicalRunId,
 							truncated,
 							originalBytes,
@@ -441,8 +529,18 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				)
 				.limit(1)
 				.get();
-			const result = decodeAgentTerminalSnapshot(receipt?.json ?? null, run.logicalRunId);
-			if (result) return result;
+			const result = decodeAgentTerminalSnapshot(
+				receipt?.json ?? null,
+				run.logicalRunId,
+				options.includeEventKind,
+			);
+			if (result)
+				return options.includeEventKind && terminalIntent
+					? {
+							...result,
+							eventKind: intent.eventKind as NonNullable<AgentTerminalResult["eventKind"]>,
+						}
+					: result;
 			const exactSource = agentSourceResultRef(consumedReceipt?.sourceResultRef);
 			return exactSource ? readAssistantSource(run, exactSource.slice(8)) : null;
 		}
@@ -576,6 +674,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		store,
 		reserve,
 		startAgentRun,
+		registerUndeliveredRun,
 		getAgentRun,
 		persistResult,
 		readAgentTerminalResult,
@@ -767,6 +866,7 @@ export function createUnwiredPublicationFacade(
 		},
 		reserve: () => unavailable("reserve"),
 		startAgentRun: () => unavailable("startAgentRun"),
+		registerUndeliveredRun: () => unavailable("registerUndeliveredRun"),
 		getAgentRun: () => unavailable("getAgentRun"),
 		persistResult: () => unavailable("persistResult"),
 		readAgentTerminalResult: () => unavailable("readAgentTerminalResult"),
@@ -819,6 +919,16 @@ export interface PublicationTerminalCommit {
 	readonly summary: string;
 	/** Foreground delivery stores the snapshot then consumes in the same transaction, without notice/wake. */
 	readonly delivery?: "background" | "foreground";
+	/** Detached PG fallback: exact tool card and terminal publish in one transaction. */
+	readonly toolConclusion?: {
+		toolCallId: string;
+		messageId: string;
+		toolUseId: string;
+		attempt?: number;
+		output: string;
+		status: "success" | "fail";
+		resultMessageId?: string;
+	};
 }
 
 export interface AsyncRuntimePublicationService {
@@ -828,9 +938,17 @@ export interface AsyncRuntimePublicationService {
 		parentNarratorId: string;
 		resumeRunId?: string;
 		started?: boolean;
+		binding?: RunBindingInput;
+		legacyToolUseId?: string | null;
 		/** PG-only: insert background_tasks row + reserve publication slots in one section. */
 		taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
-	}): Promise<PublicationRun>;
+	}): Promise<StartedAgentRun>;
+	registerUndeliveredRun(input: {
+		narratorId: string;
+		resumeRunId?: string;
+		binding: RunBindingInput;
+		legacyToolUseId?: string | null;
+	}): Promise<RuntimeRunBinding>;
 	getAgentRun(narratorId: string, recipientId: string): Promise<PublicationRun>;
 	newBashRun(taskId: string, recipientId: string): PublicationRun;
 	startBashRun(input: {
@@ -963,7 +1081,7 @@ function createSqliteAsyncPublicationService(
 					{
 						...input.run,
 						eventKind: input.eventKind,
-						resultRef: legacy.persistResult(input.run, input.text, tx),
+						resultRef: legacy.persistResult(input.run, input.text, tx, input.eventKind),
 						summary: input.summary,
 					},
 					tx,
@@ -973,6 +1091,7 @@ function createSqliteAsyncPublicationService(
 	return {
 		backend: "sqlite",
 		startAgentRun: async (input) => legacy.startAgentRun(input),
+		registerUndeliveredRun: async (input) => legacy.registerUndeliveredRun(input),
 		getAgentRun: async (narratorId, recipientId) => legacy.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => legacy.newBashRun(taskId, recipientId),
 		startBashRun: async (input) => {
@@ -1311,7 +1430,7 @@ function createSqliteAsyncPublicationService(
 						.where(eq(narratorMessages.id, `publication-result:${input.run.logicalRunId}`))
 						.get();
 					// Preserve the source_after boundary until the immutable snapshot exists.
-					legacy.persistResult(input.run, input.text, tx);
+					legacy.persistResult(input.run, input.text, tx, input.eventKind);
 					legacy.store.consumeAwaitedTerminal(input.run, tx);
 					return {
 						status: existing ? "duplicate" : "committed",
@@ -1456,6 +1575,7 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 	return {
 		backend: "postgres",
 		startAgentRun: (input) => engine.startAgentRun(input),
+		registerUndeliveredRun: (input) => engine.registerUndeliveredRun(input),
 		getAgentRun: (narratorId, recipientId) => engine.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => ({
 			producerKind: "bash",

@@ -144,6 +144,22 @@
 			"prevId": "ea5dc255-0883-4d86-bf3b-50e19f8d9e1b",
 			"version": "7",
 			"snapshotDigest": "f52554d3864e74c844630f1ace6bd08a3081ba1335074e9780fc488f6f47a816"
+		},
+		{
+			"idx": 18,
+			"tag": "0018_unified-runtime-registration",
+			"id": "a1fadcea-304f-40c9-b4aa-9ef79e733391",
+			"prevId": "589f163a-9f46-4c42-9b4f-7421ec507a16",
+			"version": "7",
+			"snapshotDigest": "3d98f2da678ba212e78a3ce7b13b591ca0444e700763ae310c871bcf7dd1b922"
+		},
+		{
+			"idx": 19,
+			"tag": "0019_policy-source-column",
+			"id": "02c17b92-7607-4b75-983a-705ff12ec770",
+			"prevId": "a1fadcea-304f-40c9-b4aa-9ef79e733391",
+			"version": "7",
+			"snapshotDigest": "f688d540f16baadf596b40fce3e17c97b99ada59d137beada30c2b5e6dcad7dc"
 		}
 	]
 }

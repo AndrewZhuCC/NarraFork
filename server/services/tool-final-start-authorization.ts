@@ -6,6 +6,7 @@ import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { loadNarratorForAccess, NARRATOR_ACL_COLUMNS } from "./narrator-acl";
 
 /** Trusted permission-time canonicalization belongs to the exact unstarted receipt.
@@ -145,9 +146,13 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 	};
 }
 
-/** One real final-start gate shared by primary/child loops and persisted recovery runners. */
+/**
+ * One real final-start gate shared by every runtime and persisted recovery runner. The
+ * capability ceiling is re-resolved here, for this narrator and actor, so an approval or
+ * tool history from before a source tightened cannot start a now-excluded tool.
+ */
 export function buildFinalToolStartAuthorization(
-	config: Pick<AgentConfig, "narratorId" | "cwd" | "signal" | "userId" | "reviewReadOnlyBash">,
+	config: Pick<AgentConfig, "narratorId" | "cwd" | "signal" | "userId">,
 ): NonNullable<AgentConfig["onToolExecutionFinalAuthorization"]> {
 	return async (context) => {
 		config.signal.throwIfAborted();
@@ -166,7 +171,20 @@ export function buildFinalToolStartAuthorization(
 				{ userId: actorId, isAdmin: actorBefore.isAdmin },
 				"write",
 			);
-		const { recheckFinalToolExecutionPermission } = await import("./narrator-permission");
+		const [{ recheckFinalToolExecutionPermission }, { resolveNarratorCapabilities }] =
+			await Promise.all([import("./narrator-permission"), import("./trait-layer-service")]);
+		const { policy: runtimePolicy, traits } = await resolveNarratorCapabilities(
+			config.narratorId,
+			actorId ?? null,
+		);
+		if (getDisabledToolSet(traits.traits).has(context.toolUse.name))
+			throw new Error(`Tool disabled by the current effective traits: ${context.toolUse.name}`);
+		if (context.toolUse.name === "Skill") {
+			const blocked = getBlockedSkills(traits.traits);
+			const requested = context.effectiveInput.skill ?? context.effectiveInput.name;
+			if (blocked.all || (typeof requested === "string" && blocked.names.has(requested)))
+				throw new Error("Skill blocked by the current effective traits");
+		}
 		const policyFence = await recheckFinalToolExecutionPermission({
 			narratorId: config.narratorId,
 			toolName: context.toolUse.name,
@@ -188,7 +206,8 @@ export function buildFinalToolStartAuthorization(
 						grantId: runtime.grantId,
 					}
 				: undefined,
-			reviewReadOnlyBash: config.reviewReadOnlyBash,
+			runtimePolicy,
+			actingUserId: actorId ?? null,
 			signal: config.signal,
 		});
 		const runtimeAfter = await assertOAuthNarratorRuntimeActive(config.narratorId, config.userId);

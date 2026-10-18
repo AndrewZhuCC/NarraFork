@@ -377,11 +377,17 @@ describe("bounds, real committed assets, and source AST guard", () => {
 		// 0010 appends stop reason after both context columns, then 0012 appends the model-history
 		// revision; schema declaration order cannot substitute for physical order reconstructed
 		// from the full journal.
-		expect(narrators?.slice(-4)).toEqual([
+		const historicalStart = narrators?.indexOf("context_char_cache_json") ?? -1;
+		expect(historicalStart).toBeGreaterThanOrEqual(0);
+		expect(narrators?.slice(historicalStart, historicalStart + 4)).toEqual([
 			"context_char_cache_json",
 			"context_usage_snapshot_json",
 			"last_stop_reason",
 			"model_history_revision",
+		]);
+		expect(narrators?.slice(-2)).toEqual([
+			"runtime_registration_json",
+			"policy_source_narrator_id",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		// The main-branch 0010 migration appends background_kind after insert_seq.

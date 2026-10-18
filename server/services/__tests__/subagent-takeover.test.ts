@@ -1,167 +1,83 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-const {
-	beginSubagentInterruptSuspension,
-	clearTakenOver,
-	consumePendingStopTakeover,
-	isBackgroundTakenOver,
-	isPendingStopTakeover,
-	isTakenOver,
-	isTakenOverForDisplay,
-	isTakeoverReleasePending,
-	listDisplayTakenOverSubagents,
-	listTakenOverSubagents,
-	markPendingBackgroundFinalize,
-	markPendingStopTakeover,
-	markTakenOver,
-} = await import("../subagent-takeover");
+/*
+ * The user's hold on a run's result (takeover) is one generic piece of run state:
+ * it does not depend on how the session was created or whether its run is detached.
+ */
+const { getRunHold, isRunHeldForDisplay, listRunHolds, preserveHeldSubstatus, setRunHold } =
+	await import("../agent-runtime/ownership");
 
 const SUBAGENT_ID = "subagent-takeover-test";
+const hold = () => setRunHold(SUBAGENT_ID, { released: false });
 
 afterEach(() => {
-	clearTakenOver(SUBAGENT_ID);
+	setRunHold(SUBAGENT_ID, undefined);
 });
 
-describe("pending stop-takeover marker (settling-window handoff)", () => {
-	test("mark then consume returns true exactly once", () => {
-		markPendingStopTakeover(SUBAGENT_ID);
-		expect(isPendingStopTakeover(SUBAGENT_ID)).toBe(true);
-
-		expect(consumePendingStopTakeover(SUBAGENT_ID)).toBe(true);
-		// A second consume must not re-trigger the handoff.
-		expect(consumePendingStopTakeover(SUBAGENT_ID)).toBe(false);
-		expect(isPendingStopTakeover(SUBAGENT_ID)).toBe(false);
+describe("hold state basics", () => {
+	test("a hold is recorded and listed", () => {
+		hold();
+		expect(getRunHold(SUBAGENT_ID)).toEqual({ released: false });
+		expect(listRunHolds()).toContain(SUBAGENT_ID);
 	});
 
-	test("consume without a prior mark returns false", () => {
-		expect(consumePendingStopTakeover(SUBAGENT_ID)).toBe(false);
+	test("taking over does not invent a pending release", () => {
+		hold();
+		expect(getRunHold(SUBAGENT_ID)?.released).toBe(false);
 	});
 
-	test("clearTakenOver also clears a pending stop-takeover marker", () => {
-		// Simulates the stop-takeover route recording a pending stop during the
-		// settling window, then the takeover being cleared through another path.
-		markTakenOver(SUBAGENT_ID);
-		markPendingStopTakeover(SUBAGENT_ID);
-		expect(isPendingStopTakeover(SUBAGENT_ID)).toBe(true);
-
-		clearTakenOver(SUBAGENT_ID);
-
-		expect(isTakenOver(SUBAGENT_ID)).toBe(false);
-		expect(isPendingStopTakeover(SUBAGENT_ID)).toBe(false);
-		expect(consumePendingStopTakeover(SUBAGENT_ID)).toBe(false);
-	});
-});
-
-describe("takeover state basics", () => {
-	test("foreground takeover is not flagged as background", () => {
-		markTakenOver(SUBAGENT_ID);
-		expect(isTakenOver(SUBAGENT_ID)).toBe(true);
-		expect(isBackgroundTakenOver(SUBAGENT_ID)).toBe(false);
-	});
-
-	test("background takeover sets both flags", () => {
-		markTakenOver(SUBAGENT_ID, { background: true });
-		expect(isTakenOver(SUBAGENT_ID)).toBe(true);
-		expect(isBackgroundTakenOver(SUBAGENT_ID)).toBe(true);
-	});
-
-	test("marking a takeover does not invent a pending release", () => {
-		markTakenOver(SUBAGENT_ID);
-
-		expect(isTakeoverReleasePending(SUBAGENT_ID)).toBe(false);
-		expect(consumePendingStopTakeover(SUBAGENT_ID)).toBe(false);
+	test("clearing removes the hold entirely", () => {
+		hold();
+		setRunHold(SUBAGENT_ID, undefined);
+		expect(getRunHold(SUBAGENT_ID)).toBeUndefined();
+		expect(listRunHolds()).not.toContain(SUBAGENT_ID);
 	});
 });
 
 /*
- * Which substatus a subagent-only interrupt suspends as.
- *
- * Exercised through `beginSubagentInterruptSuspension` — the call the runner actually
- * makes — so the sequence a repeated Stop performs is what gets checked, not a
- * restatement of the boolean.
- *
- * The repeated-interrupt case below is a real reported failure: the second Stop of a
- * takeover suspended as `manual_override`, so the takeover UI disappeared while
- * `isTakenOver` still held — leaving the parent blocked with nothing on screen
- * offering to release it. It used to be possible because the decision read a marker
- * that the FIRST suspension had consumed; taking over no longer interrupts at all, so
- * there is no first-interrupt special case left to get wrong.
+ * A stopped turn of a held run returns to the hold, so every status written while held
+ * keeps the durable `taken_over` mirror (which is also what restart recovery restores
+ * the hold from). Repeated Stops therefore keep the takeover visible every time.
  */
-describe("which substatus a subagent-only interrupt suspends as", () => {
-	test("an interrupt during a takeover suspends as taken_over", () => {
-		markTakenOver(SUBAGENT_ID);
-
-		expect(beginSubagentInterruptSuspension(SUBAGENT_ID).heldByTakeover).toBe(true);
+describe("status writes while held keep the takeover mirror", () => {
+	test("every write during a hold keeps taken_over", () => {
+		hold();
+		expect(preserveHeldSubstatus(SUBAGENT_ID, ["interrupted"])).toEqual([
+			"interrupted",
+			"taken_over",
+		]);
+		expect(preserveHeldSubstatus(SUBAGENT_ID, ["interrupted"])).toContain("taken_over");
+		expect(preserveHeldSubstatus(SUBAGENT_ID, ["taken_over"])).toEqual(["taken_over"]);
+		// Deciding the substatus never consumes the hold.
+		expect(getRunHold(SUBAGENT_ID)).toBeDefined();
 	});
 
-	test("every LATER interrupt within one takeover still suspends as taken_over", () => {
-		markTakenOver(SUBAGENT_ID);
-
-		expect(beginSubagentInterruptSuspension(SUBAGENT_ID).heldByTakeover).toBe(true);
-		expect(beginSubagentInterruptSuspension(SUBAGENT_ID).heldByTakeover).toBe(true);
-		expect(beginSubagentInterruptSuspension(SUBAGENT_ID).heldByTakeover).toBe(true);
-		// Deciding the substatus must not consume the hold: the takeover outlives the
-		// turn the user just stopped.
-		expect(isTakenOver(SUBAGENT_ID)).toBe(true);
-	});
-
-	test("an ordinary interrupt outside any takeover suspends as manual_override", () => {
-		expect(beginSubagentInterruptSuspension(SUBAGENT_ID).heldByTakeover).toBe(false);
-		// And it must not invent a takeover: doing so would keep the parent blocked
-		// after a plain Stop.
-		expect(isTakenOver(SUBAGENT_ID)).toBe(false);
-	});
-
-	test("after the takeover is stopped, an interrupt is plain again", () => {
-		markTakenOver(SUBAGENT_ID);
-		clearTakenOver(SUBAGENT_ID);
-
-		expect(beginSubagentInterruptSuspension(SUBAGENT_ID).heldByTakeover).toBe(false);
+	test("outside any hold a status write is unchanged", () => {
+		expect(preserveHeldSubstatus(SUBAGENT_ID, ["interrupted"])).toEqual(["interrupted"]);
+		expect(getRunHold(SUBAGENT_ID)).toBeUndefined();
 	});
 });
 
 /*
- * Control flow and DISPLAY diverge in one window, and conflating them is a real
- * reported bug: after the user stops a takeover on a still-WORKING subagent, the
- * release is deferred to the loop's end and `clearTakenOver` must NOT run yet (it
- * would wipe the pending-release marker the loop still has to consume). So
- * `isTakenOver` stays true on purpose — and any code that PAINTS the takeover
- * state from it re-lights a badge the user already dismissed on every page load
- * in that window.
+ * Control flow and display diverge in one window: after the user lets go while a
+ * turn is still running, the release is deferred to that run's terminal (the hold
+ * stays so the run delivers exactly once), but the badge must not keep claiming the
+ * user is driving.
  */
 describe("display state vs control-flow state after a deferred release", () => {
-	test("a deferred foreground release stops the badge while keeping the hold", () => {
-		markTakenOver(SUBAGENT_ID);
-		markPendingStopTakeover(SUBAGENT_ID);
-
-		// Still held: the loop must consume the marker and hand the result back.
-		expect(isTakenOver(SUBAGENT_ID)).toBe(true);
-		// But the user has let go, so nothing should claim they are driving.
-		expect(isTakeoverReleasePending(SUBAGENT_ID)).toBe(true);
-		expect(isTakenOverForDisplay(SUBAGENT_ID)).toBe(false);
-		expect(listDisplayTakenOverSubagents()).not.toContain(SUBAGENT_ID);
-		// The raw list still reports it — that is the control-flow answer.
-		expect(listTakenOverSubagents()).toContain(SUBAGENT_ID);
+	test("a deferred release stops the badge while keeping the hold", () => {
+		setRunHold(SUBAGENT_ID, { released: true });
+		expect(getRunHold(SUBAGENT_ID)).toBeDefined();
+		expect(isRunHeldForDisplay(SUBAGENT_ID)).toBe(false);
+		expect(listRunHolds()).toContain(SUBAGENT_ID);
 	});
 
-	test("a deferred background release does the same", () => {
-		markTakenOver(SUBAGENT_ID, { background: true });
-		markPendingBackgroundFinalize(SUBAGENT_ID);
-
-		expect(isTakenOver(SUBAGENT_ID)).toBe(true);
-		expect(isTakenOverForDisplay(SUBAGENT_ID)).toBe(false);
+	test("an ACTIVE hold is displayed", () => {
+		hold();
+		expect(isRunHeldForDisplay(SUBAGENT_ID)).toBe(true);
 	});
 
-	test("an ACTIVE takeover is displayed (the flag still has to work)", () => {
-		markTakenOver(SUBAGENT_ID);
-
-		expect(isTakenOverForDisplay(SUBAGENT_ID)).toBe(true);
-		expect(isTakeoverReleasePending(SUBAGENT_ID)).toBe(false);
-		expect(listDisplayTakenOverSubagents()).toContain(SUBAGENT_ID);
-	});
-
-	test("a subagent that was never taken over is not displayed", () => {
-		expect(isTakenOverForDisplay(SUBAGENT_ID)).toBe(false);
-		expect(listDisplayTakenOverSubagents()).not.toContain(SUBAGENT_ID);
+	test("a session that was never held is not displayed", () => {
+		expect(isRunHeldForDisplay(SUBAGENT_ID)).toBe(false);
 	});
 });

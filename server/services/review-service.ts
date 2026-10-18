@@ -12,10 +12,13 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { buildReviewSystemPrompt, getReviewStartMessage } from "../lib/prompt-i18n";
+import { appendRuntimePolicyTrait } from "../lib/runtime-policy-trait";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
+import { delegationRegistration } from "../lib/validators/runtime-registration";
 import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
+import { compileDelegationCeiling } from "./custom-subagent-service";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { closeNarrator, sendMessage, updateNarratorChapterRole } from "./narrator-session";
@@ -646,13 +649,21 @@ export const reviewService = {
 				where: eq(chapters.id, sourceChapterId),
 				columns: { worktreePath: true },
 			});
+			// Conversion adds a ceiling; existing declarations must keep narrowing this row.
+			const reviewTraits = appendRuntimePolicyTrait(
+				reviewNarrator.traits,
+				await compileDelegationCeiling("review"),
+			);
 			await db
 				.update(narrators)
 				.set({
 					type: "subagent",
 					variant: "subagent:review",
+					traits: reviewTraits,
 					subagentType: "review",
 					parentNarratorId: sourceNarrator.id,
+					policySourceNarratorId: sourceNarrator.id,
+					runtimeRegistrationJson: delegationRegistration(sourceNarrator.id, "review"),
 					chapterId: chapter.reviewSourceChapterId,
 					cwd: sourceChapter?.worktreePath ?? sourceNarrator.cwd,
 					updatedAt: now,

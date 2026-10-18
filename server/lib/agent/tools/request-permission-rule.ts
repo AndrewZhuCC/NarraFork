@@ -118,6 +118,7 @@ export const requestPermissionRuleTool: ToolDefinition = {
 					narratorId: ctx.narratorId,
 					toolUseId: ctx.currentToolUseId,
 					binding: ctx.toolCallBinding,
+					actingUserId: ctx.userId,
 				},
 				args,
 				context,

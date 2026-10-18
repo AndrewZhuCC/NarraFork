@@ -1,10 +1,21 @@
 import { BASH_TOOL_NAME } from "@server/lib/agent/tool-name";
+import type { RuntimePolicyTrait } from "@server/lib/runtime-policy-trait";
 
-/** Server-resolved capabilities, not model-supplied authorization or lifecycle hooks. */
+/**
+ * Server-resolved capability ceiling for one narrator. It is derived from traits
+ * (see `runtime-policy-trait.ts`) and never names a narrator role: two narrators
+ * with the same traits behave the same, however they were created.
+ */
 export interface RuntimePolicy {
-	readonly variant: "primary" | "subagent";
 	/** Search tools may only call the selected provider directly, never the channel router. */
-	readonly searchOnly?: boolean;
+	readonly searchOnly: boolean;
+	/** Shell may only run the constrained local read-only Git policy. */
+	readonly readOnlyGitShell: boolean;
+	readonly continuation: {
+		readonly promoteTodo: boolean;
+		/** Null is unbounded. Each declaring layer may only lower a finite limit. */
+		readonly maxPasses: number | null;
+	};
 	readonly tools: {
 		readonly builtin: "all" | readonly string[];
 		readonly mcp: "none" | "readOnly" | "nonDenied";
@@ -20,18 +31,8 @@ export interface RuntimePolicy {
 		readonly awaitOwnQuestion: boolean;
 		readonly planApproval: boolean;
 		readonly stopHooks: boolean;
+		readonly switchWorkingDirectory: boolean;
 	};
-}
-
-export interface RuntimePolicyInput {
-	variant: RuntimePolicy["variant"];
-	subagentType?: string;
-	customDefinition?: {
-		toolAccess: "readOnly" | "general" | "custom";
-		customTools: readonly string[];
-	} | null;
-	/** An inherited restriction may narrow, never widen, the selected profile. */
-	readOnly?: boolean;
 }
 
 const READ_TOOLS = Object.freeze([
@@ -62,83 +63,150 @@ const SEARCH_TOOLS = Object.freeze([
 	"Send",
 ]);
 
-export function resolveRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {
-	const primary = input.variant === "primary";
-	let builtin: RuntimePolicy["tools"]["builtin"] = primary ? "all" : READ_TOOLS;
-	let mcp: RuntimePolicy["tools"]["mcp"] = primary ? "nonDenied" : "readOnly";
-	let mcpNames: RuntimePolicy["tools"]["mcpNames"] = "all";
-	let readOnly = !primary;
-	if (!primary) {
-		switch (input.subagentType) {
-			case "general":
-				builtin = GENERAL_TOOLS;
-				mcp = "nonDenied";
-				readOnly = false;
-				break;
-			case "search":
-				builtin = SEARCH_TOOLS;
-				mcp = "none";
-				break;
-			case "explore":
-			case "plan":
-				break;
-			case "review":
-				// Review may inspect Git synchronously, never control running tasks.
-				builtin = READ_TOOLS.filter((name) => name !== "Stop");
-				break;
-			default:
-				// Missing/invalid custom definitions fail closed to the read-only profile.
-				if (input.customDefinition?.toolAccess === "general") {
-					builtin = GENERAL_TOOLS;
-					mcp = "nonDenied";
-					readOnly = false;
-				} else if (input.customDefinition?.toolAccess === "custom") {
-					builtin = Object.freeze([...input.customDefinition.customTools]);
-					mcpNames = builtin;
-					mcp = "nonDenied";
-					readOnly = false;
-				}
-		}
+/** Delegated work coordinates through its delegator; it never orchestrates or asks the user. */
+const DELEGATED_DENY: NonNullable<RuntimePolicyTrait["deny"]> = [
+	"spawnAgent",
+	"awaitAgent",
+	"sendAwait",
+	"askUserQuestion",
+	"planApproval",
+	"stopHooks",
+	"switchWorkingDirectory",
+];
+
+/** Template names with a built-in ceiling; any other name is a custom definition. */
+export const BUILTIN_DELEGATION_TEMPLATES: ReadonlySet<string> = new Set([
+	"general",
+	"explore",
+	"plan",
+	"review",
+	"search",
+]);
+
+export interface DelegationTemplateInput {
+	template: string;
+	customDefinition?: {
+		toolAccess: "readOnly" | "general" | "custom";
+		customTools: readonly string[];
+	} | null;
+}
+
+/**
+ * Compile a delegation template into an ordinary capability ceiling. This is the
+ * only place template names mean anything; the result is stored in the created
+ * narrator's traits. Missing/invalid custom definitions fail closed to read-only.
+ */
+export function compileDelegationPolicy(input: DelegationTemplateInput): RuntimePolicyTrait {
+	const base = {
+		version: 1 as const,
+		deny: [...DELEGATED_DENY],
+		continuation: { promoteTodo: false, maxPasses: 6 },
+	};
+	switch (input.template) {
+		case "general":
+			return { ...base, tools: [...GENERAL_TOOLS], mcp: "nonDenied" };
+		case "search":
+			return { ...base, tools: [...SEARCH_TOOLS], mcp: "none", readOnly: true, searchOnly: true };
+		case "review":
+			// Review may inspect Git synchronously, never control running tasks.
+			return {
+				...base,
+				tools: READ_TOOLS.filter((name) => name !== "Stop"),
+				mcp: "readOnly",
+				readOnly: true,
+				readOnlyGitShell: true,
+			};
+		case "explore":
+		case "plan":
+			return { ...base, tools: [...READ_TOOLS], mcp: "readOnly", readOnly: true };
 	}
-	if (input.readOnly) {
-		builtin = builtin === "all" ? READ_TOOLS : builtin.filter((name) => READ_TOOLS.includes(name));
-		if (mcp !== "none") mcp = "readOnly";
-		readOnly = true;
+	const custom = input.customDefinition;
+	if (custom?.toolAccess === "general")
+		return { ...base, tools: [...GENERAL_TOOLS], mcp: "nonDenied" };
+	if (custom?.toolAccess === "custom")
+		return {
+			...base,
+			tools: [...custom.customTools],
+			mcpNames: [...custom.customTools],
+			mcp: "nonDenied",
+		};
+	return { ...base, tools: [...READ_TOOLS], mcp: "readOnly", readOnly: true };
+}
+
+const MCP_RANK = { none: 0, readOnly: 1, nonDenied: 2 } as const;
+
+function intersect(current: "all" | string[], declared: readonly string[] | undefined) {
+	if (!declared) return current;
+	return current === "all" ? [...declared] : current.filter((name) => declared.includes(name));
+}
+
+/**
+ * Merge ceiling declarations from any number of layers. Every field only narrows,
+ * so order does not matter. Read-only from any layer also narrows built-ins to the
+ * read tools and MCP to read-only.
+ */
+export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]): RuntimePolicy {
+	let builtin: "all" | string[] = "all";
+	let mcpNames: "all" | string[] = "all";
+	let mcp: RuntimePolicy["tools"]["mcp"] = "nonDenied";
+	let readOnly = false;
+	let searchOnly = false;
+	let readOnlyGitShell = false;
+	let promoteTodo = true;
+	let maxPasses: number | null = null;
+	const denied = new Set<string>();
+	for (const trait of declarations) {
+		builtin = intersect(builtin, trait.tools);
+		mcpNames = intersect(mcpNames, trait.mcpNames);
+		if (trait.mcp && MCP_RANK[trait.mcp] < MCP_RANK[mcp]) mcp = trait.mcp;
+		readOnly ||= trait.readOnly === true;
+		searchOnly ||= trait.searchOnly === true;
+		readOnlyGitShell ||= trait.readOnlyGitShell === true;
+		promoteTodo &&= trait.continuation?.promoteTodo !== false;
+		const declaredPasses = trait.continuation?.maxPasses;
+		if (declaredPasses !== undefined) maxPasses = Math.min(maxPasses ?? Infinity, declaredPasses);
+		for (const key of trait.deny ?? []) denied.add(key);
 	}
+	if (readOnly) {
+		builtin = intersect(builtin, READ_TOOLS);
+		if (mcp === "nonDenied") mcp = "readOnly";
+	}
+	const allowed = (key: string) => !denied.has(key);
 	return Object.freeze({
-		variant: input.variant,
-		searchOnly: !primary && input.subagentType === "search",
+		searchOnly,
+		readOnlyGitShell,
+		continuation: Object.freeze({ promoteTodo, maxPasses }),
 		tools: Object.freeze({
 			builtin: builtin === "all" ? builtin : Object.freeze(builtin),
 			mcp,
-			mcpNames,
+			mcpNames: mcpNames === "all" ? mcpNames : Object.freeze(mcpNames),
 			readOnly,
 		}),
 		capabilities: Object.freeze({
-			spawnAgent: primary,
-			awaitAgent: primary,
-			sendAwait: primary,
-			// Subagents cannot ask the user at all: a delegated task must proceed with
-			// what it was given. The capability gate (not just the builtin list) is what
-			// stops a custom definition from re-enabling the tool via customTools.
-			askUserQuestion: primary ? "sync-or-async" : "disabled",
+			spawnAgent: allowed("spawnAgent"),
+			awaitAgent: allowed("awaitAgent"),
+			sendAwait: allowed("sendAwait"),
+			askUserQuestion: allowed("askUserQuestion") ? "sync-or-async" : "disabled",
 			awaitOwnQuestion: true,
-			planApproval: primary,
-			stopHooks: primary,
+			planApproval: allowed("planApproval"),
+			stopHooks: allowed("stopHooks"),
+			switchWorkingDirectory: allowed("switchWorkingDirectory"),
 		}),
 	});
 }
 
-/** Compatibility adapter for existing server-owned AgentConfig / ToolContext. */
+/** The ceiling of a narrator that declares nothing: every capability. */
+export const UNRESTRICTED_RUNTIME_POLICY: RuntimePolicy = resolveRuntimePolicy([]);
+
+/**
+ * Capability ceiling attached by server runtime assembly. A context without one
+ * was not assembled by the runtime (tests, internal probes) and gets the
+ * unrestricted ceiling; execution permission gates still apply.
+ */
 export function runtimePolicyForContext(context?: {
-	parentNarratorId?: string;
-	/** Resolved by server assembly, never read from tool arguments. */
 	runtimePolicy?: RuntimePolicy;
 }): RuntimePolicy {
-	return (
-		context?.runtimePolicy ??
-		resolveRuntimePolicy({ variant: context?.parentNarratorId ? "subagent" : "primary" })
-	);
+	return context?.runtimePolicy ?? UNRESTRICTED_RUNTIME_POLICY;
 }
 
 /** Shared by model schema consumers, the permission gate and the executing service. */
@@ -160,6 +228,7 @@ export function isRuntimeToolAllowed(
 	if (["Agent", "Task", "ContinueTask", "ForkNarrator"].includes(toolName) && !caps.spawnAgent)
 		return false;
 	if (["EnterPlanMode", "ExitPlanMode"].includes(toolName) && !caps.planApproval) return false;
+	if (toolName === "SwitchWorkingDirectory" && !caps.switchWorkingDirectory) return false;
 	if (toolName.startsWith("mcp__")) {
 		if (policy.tools.mcp === "none" || mcpBehavior === "deny") return false;
 		if (policy.tools.mcpNames !== "all" && !policy.tools.mcpNames.includes(toolName)) return false;

@@ -106,10 +106,8 @@ const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators, withNarratorStartAdmission } = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
 const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
-const { applySubagentBufferedQueueModeControl, executeSubagent } = await import(
-	"../subagent-executor"
-);
-const { markTakenOver, clearTakenOver, isTakenOver } = await import("../subagent-takeover");
+const { getRunControl, getRunHold, setRunHold } = await import("../agent-runtime/ownership");
+const { controlRun, startNarratorRun } = await import("../agent-runtime/run");
 
 // Actual route registrations + actual service controls/receipt; only auth and WS presentation
 // are outside this harness. Unlike the route contract unit tests no control is mocked.
@@ -128,7 +126,6 @@ const bindings = {
 	services: {
 		withNarratorStartAdmission,
 		applyBufferedQueueModeControl,
-		applySubagentBufferedQueueModeControl,
 		waitForBufferedMessageDelivery,
 		readBufferedMessageDeliveryReceipt,
 		wakeInboxIfEligible,
@@ -141,7 +138,6 @@ const bindings = {
 	retryBufferedMessage,
 	getBufferedMessagesAsync,
 	narratorService,
-	isSubagentVariant: (variant: string) => variant.startsWith("subagent"),
 	broadcastBufferQueue: async () => {},
 };
 new Function(...Object.keys(bindings), compiledRoute)(...Object.values(bindings));
@@ -217,6 +213,12 @@ beforeAll(async () => {
 				autoContinuationOverride: "off",
 				status: "idle",
 				cwd: process.cwd(),
+				// Server-side starts without a user resume the session's own identity; a
+				// session nobody owns and no run registered would not start at all.
+				runtimeRegistrationJson: {
+					version: 1,
+					run: { logicalRunId: "urgent-parent-run", principal: { userId: null } },
+				},
 				createdAt: now,
 				updatedAt: now,
 			},
@@ -354,6 +356,11 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 		autoContinuationOverride: "off",
 		status: "idle",
 		cwd: process.cwd(),
+		// Same as the parent above: an explicitly anonymous registered session.
+		runtimeRegistrationJson: {
+			version: 1,
+			run: { logicalRunId: "urgent-retry-run", principal: { userId: null } },
+		},
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -499,24 +506,29 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 		createdAt: now,
 		updatedAt: now,
 	});
-	const controller = new AbortController();
-	markTakenOver(child);
+	// A delegated session: its run delivers to the parent's Agent call. The user holds it.
+	await db
+		.update(narrators)
+		.set({
+			runtimeRegistrationJson: {
+				version: 1,
+				run: {
+					logicalRunId: "urgent-child-run",
+					deliverTo: { narratorId: parent, toolUseId: "child-owning-tool" },
+				},
+			},
+		})
+		.where(eq(narrators.id, child));
+	await controlRun(child, { kind: "hold" });
 	const startCall = calls.length;
-	const running = executeSubagent({
+	const handle = await startNarratorRun({
 		narratorId: child,
-		parentNarratorId: parent,
-		toolUseId: "child-owning-tool",
-		subagentType: "general",
-		prompt: "start child real Await",
-		cwd: process.cwd(),
-		model: "openai:test-model",
-		provider: "openai",
 		locale: "en",
-		signal: controller.signal,
-		systemPrompt: "Test child runtime",
-		initialHistory: [],
-		customDef: null,
+		text: "start child real Await",
+		principal: null,
+		deliver: false,
 	});
+	expect(handle.started).toBe(true);
 	try {
 		await until(
 			() => listRunningAwaits().some((entry) => entry.narratorId === child),
@@ -525,9 +537,10 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 		const toolSignal = await childStarted.promise;
 		const active = activeNarrators.get(child);
 		const owner = getExecutionOwner(child);
+		const run = getRunControl(child);
 		expect(active).toBeDefined();
 		await queued("child older tool guidance", child);
-		applySubagentBufferedQueueModeControl(child, "tool", true, true);
+		applyBufferedQueueModeControl(child, "tool", true, true);
 		expect(toolSignal.aborted).toBe(false);
 		const selected = await queued("child selected urgent guidance", child);
 		const response = await actualRoutes.request(`/${child}/buffer/${selected.id}/mode`, {
@@ -539,13 +552,16 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 		expect(await response.json()).toMatchObject({ ok: true, delivered: true });
 		expect(toolSignal.aborted).toBe(true);
 		expect((await childReturned.promise).metadata?.status).toBe("aborted");
-		expect(active?.abortController.signal.aborted).toBe(false);
-		expect(controller.signal.aborted).toBe(false);
-		expect(isTakenOver(child)).toBe(true);
-		const result = await running;
-		expect(result.hasError).toBe(false);
-		expect(result.aborted).toBe(false);
-		expect(owner?.isCurrent()).toBe(false);
+		// Interrupting a held run stops only the current turn: the hold, the run and its
+		// owner stay, and the urgent input is the next turn of the same run.
+		expect(run?.cancel.signal.aborted).toBe(false);
+		expect(getRunHold(child)).toBeDefined();
+		await until(
+			() => calls.slice(startCall).length >= 3 && !!getRunControl(child)?.wake,
+			"child parked after queued guidance",
+		);
+		expect(getExecutionOwner(child)).toBe(owner);
+		expect(owner?.isCurrent()).toBe(true);
 		expect(
 			calls
 				.slice(startCall)
@@ -556,10 +572,16 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 			"child older tool guidance",
 		]);
 		expect(getBufferedMessages(child)).toHaveLength(0);
+		// Releasing the hold ends the same run normally.
+		expect(await controlRun(child, { kind: "release" })).toBe(true);
+		const result = await handle.terminal;
+		expect(result.hasError).toBe(false);
+		expect(result.interrupted).toBe(false);
+		expect(owner?.isCurrent()).toBe(false);
 	} finally {
-		controller.abort();
-		await running.catch(() => {});
-		clearTakenOver(child);
+		await controlRun(child, { kind: "cancel" });
+		await handle.terminal;
+		setRunHold(child, undefined);
 	}
 }, 10_000);
 

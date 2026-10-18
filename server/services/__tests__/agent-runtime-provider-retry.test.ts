@@ -3,7 +3,6 @@ import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
-import type { RuntimeProfile } from "../agent-runtime/input";
 import { runtimePolicyForContext } from "../agent-runtime/policy";
 import type { ExecuteLoopOptions } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
@@ -15,7 +14,6 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { settings, usesStatefulModel } = await import("../../lib/settings");
 const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
-const { buildRuntimeHistory } = await import("../agent-runtime/history");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
@@ -27,6 +25,14 @@ const savedAnthropic = settings.anthropicProviders;
 const savedMaxToolCallsPerResponse = settings.agent.maxToolCallsPerResponse;
 const ids = ["retry-parent", "retry-primary", "retry-child"];
 const marker = "CONTINUATION_CONTEXT Self-continuations left: 5";
+// A delegated session is an ordinary session plus a registered result destination.
+const delegatedRegistration = {
+	version: 1 as const,
+	run: {
+		logicalRunId: "retry-run",
+		deliverTo: { narratorId: "retry-parent", toolUseId: "origin-tool" },
+	},
+};
 
 beforeEach(() => cleanDb(sqlite));
 afterEach(() => {
@@ -85,6 +91,7 @@ describe("tool-call limit stops the real runtime without locking later user turn
 					type: target === "retry-child" ? "subagent" : "primary",
 					variant: target === "retry-child" ? "subagent:general" : "primary",
 					parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+					runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
 					model,
 					autoContinuationOverride: "off",
 					cwd: process.env.HOME,
@@ -92,20 +99,9 @@ describe("tool-call limit stops the real runtime without locking later user turn
 					updatedAt: now,
 				});
 			}
-			const profile: RuntimeProfile =
-				kind === "primary"
-					? { kind }
-					: {
-							kind,
-							parentNarratorId: "retry-parent",
-							parentToolUseId: "origin-tool",
-							subagentType: "general",
-							systemPrompt: "tool limit contract",
-							initialHistory: [],
-						};
 			const active = session(id, model, prefix);
 			activeNarrators.set(id, active);
-			const owner = tryClaimExecution(id, kind);
+			const owner = tryClaimExecution(id, "run");
 			if (!owner) throw new Error("Missing tool-limit owner");
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 				expect(options.config.maxToolCallsPerResponse).toBe(7);
@@ -126,13 +122,7 @@ describe("tool-call limit stops the real runtime without locking later user turn
 				shouldRetry: true,
 				delayMs: 0,
 			});
-			const outcome = await runAgentLoopUnlocked(
-				active,
-				owner,
-				"first user input",
-				undefined,
-				profile,
-			);
+			const outcome = await runAgentLoopUnlocked(active, owner, "first user input", undefined);
 			expect(execute).toHaveBeenCalledTimes(1);
 			expect(retry).not.toHaveBeenCalled();
 			expect(outcome.hasError).toBe(true);
@@ -145,7 +135,7 @@ describe("tool-call limit stops the real runtime without locking later user turn
 			owner.release();
 			const next = session(id, model, prefix);
 			activeNarrators.set(id, next);
-			const nextOwner = tryClaimExecution(id, kind);
+			const nextOwner = tryClaimExecution(id, "run");
 			if (!nextOwner) throw new Error("Missing new user-turn owner");
 			execute.mockImplementation(async (options) => {
 				expect(options.config.signal.aborted).toBe(false);
@@ -163,7 +153,6 @@ describe("tool-call limit stops the real runtime without locking later user turn
 				nextOwner,
 				"new explicit user input",
 				undefined,
-				profile,
 			);
 			expect(execute).toHaveBeenCalledTimes(2);
 			expect(retry).not.toHaveBeenCalled();
@@ -199,6 +188,7 @@ describe("provider retry policy is identical through the real primary and child 
 						type: target === "retry-child" ? "subagent" : "primary",
 						variant: target === "retry-child" ? "subagent:general" : "primary",
 						parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+						runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
 						model,
 						autoContinuationOverride: "off",
 						cwd: process.env.HOME,
@@ -214,27 +204,9 @@ describe("provider retry policy is identical through the real primary and child 
 					undefined,
 					kind === "subagent" ? { parentToolUseId: "origin-tool" } : undefined,
 				);
-				const prepared = await buildRuntimeHistory({
-					narratorId: id,
-					model,
-					provider: prefix,
-					profile: kind,
-				});
-				const profile: RuntimeProfile =
-					kind === "primary"
-						? { kind }
-						: {
-								kind,
-								parentNarratorId: "retry-parent",
-								parentToolUseId: "origin-tool",
-								subagentType: "general",
-								systemPrompt: "retry contract",
-								initialHistory: prepared.history,
-								initialTrailingToolResults: prepared.trailingToolResults,
-							};
 				const active = session(id, model, prefix);
 				activeNarrators.set(id, active);
-				const owner = tryClaimExecution(id, kind);
+				const owner = tryClaimExecution(id, "run");
 				if (!owner) throw new Error("Missing retry owner");
 				const calls: Array<{ packet: string; conversation: string; reset: boolean | undefined }> =
 					[];
@@ -243,7 +215,8 @@ describe("provider retry policy is identical through the real primary and child 
 						const runtimePolicy = options.config.runtimePolicy;
 						if (!runtimePolicy)
 							throw new Error("Real shared config must carry its resolved policy");
-						expect(runtimePolicy.variant).toBe(kind);
+						// Legacy delegated rows resolve their stored template ceiling.
+						expect(runtimePolicy.capabilities.spawnAgent).toBe(kind === "primary");
 						expect(runtimePolicyForContext(options.config)).toBe(runtimePolicy);
 						calls.push({
 							packet: JSON.stringify({
@@ -275,13 +248,7 @@ describe("provider retry policy is identical through the real primary and child 
 					shouldRetry: true,
 					delayMs: 0,
 				});
-				const outcome = await runAgentLoopUnlocked(
-					active,
-					owner,
-					kind === "subagent" ? prepared.currentText : "",
-					undefined,
-					profile,
-				);
+				const outcome = await runAgentLoopUnlocked(active, owner, "", undefined);
 				expect(outcome.hasError).toBe(mode !== "responses");
 				expect(calls).toHaveLength(mode === "responses" ? 2 : 1);
 				expect(delay).toHaveBeenCalledTimes(mode === "responses" ? 1 : 0);
@@ -336,6 +303,16 @@ describe("subagent transient-retry recovery notifies the parent", () => {
 				type: target === "retry-child" ? "subagent" : "primary",
 				variant: target === "retry-child" ? "subagent:general" : "primary",
 				parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+				runtimeRegistrationJson:
+					target === "retry-child"
+						? {
+								version: 1,
+								run: {
+									logicalRunId: "retry-run",
+									deliverTo: { narratorId: "retry-parent", toolUseId: "origin-tool" },
+								},
+							}
+						: null,
 				model,
 				autoContinuationOverride: "off",
 				cwd: process.env.HOME,
@@ -343,17 +320,9 @@ describe("subagent transient-retry recovery notifies the parent", () => {
 				updatedAt: now,
 			});
 		}
-		const profile: RuntimeProfile = {
-			kind: "subagent",
-			parentNarratorId: "retry-parent",
-			parentToolUseId: "origin-tool",
-			subagentType: "general",
-			systemPrompt: "retry recovered contract",
-			initialHistory: [],
-		};
 		const active = session(id, model, prefix);
 		activeNarrators.set(id, active);
-		const owner = tryClaimExecution(id, "subagent");
+		const owner = tryClaimExecution(id, "run");
 		if (!owner) throw new Error("Missing retry-recovered owner");
 		let calls = 0;
 		spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
@@ -378,13 +347,7 @@ describe("subagent transient-retry recovery notifies the parent", () => {
 			delayMs: 0,
 		});
 		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
-		const outcome = await runAgentLoopUnlocked(
-			active,
-			owner,
-			"first user input",
-			undefined,
-			profile,
-		);
+		const outcome = await runAgentLoopUnlocked(active, owner, "first user input", undefined);
 
 		expect(outcome.finalText).toBe("finished");
 		expect(calls).toBe(2);
@@ -422,6 +385,7 @@ describe("runtime outcome distinguishes resource cleanup from user cancellation"
 						type: target === "retry-child" ? "subagent" : "primary",
 						variant: target === "retry-child" ? "subagent:general" : "primary",
 						parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+						runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
 						model,
 						autoContinuationOverride: "off",
 						cwd: process.env.HOME,
@@ -429,20 +393,9 @@ describe("runtime outcome distinguishes resource cleanup from user cancellation"
 						updatedAt: now,
 					});
 				}
-				const profile: RuntimeProfile =
-					kind === "primary"
-						? { kind }
-						: {
-								kind,
-								parentNarratorId: "retry-parent",
-								parentToolUseId: "origin-tool",
-								subagentType: "general",
-								systemPrompt: "finalization contract",
-								initialHistory: [],
-							};
 				const active = session(id, model, prefix);
 				activeNarrators.set(id, active);
-				const owner = tryClaimExecution(id, kind);
+				const owner = tryClaimExecution(id, "run");
 				if (!owner) throw new Error("Missing finalization owner");
 				spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
 					if (ending === "interrupted") active.abortController.abort();
@@ -455,7 +408,7 @@ describe("runtime outcome distinguishes resource cleanup from user cancellation"
 						completedAssistantTurn: ending === "success",
 					};
 				});
-				const outcome = await runAgentLoopUnlocked(active, owner, "input", undefined, profile);
+				const outcome = await runAgentLoopUnlocked(active, owner, "input");
 				expect(outcome.started).toBe(true);
 				expect(outcome.allowInboxWake).toBe(ending === "success");
 				expect(outcome.aborted).toBe(ending === "interrupted");

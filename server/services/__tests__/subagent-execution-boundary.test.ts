@@ -244,16 +244,14 @@ describe("subagent logical-run receipts", () => {
 			const persistence = (await import("../narrator-persistence")).narratorPersistence;
 			const prepare = spyOn(persistence, "prepareToolCallAttempt");
 			try {
-				const { resumeSubagent } = await import("../subagent-resume");
-				const result = await resumeSubagent({
-					subagentId: "child",
-					intent: "retry_denied_tool",
-					actor: "user",
-					retryToolUseId: reason === "not_found" ? "unknown" : "retry-write",
-					locale: "en",
-				});
-				expect(result.retryDeniedReason).toBe(reason);
-				expect(result.started).toBe(false);
+				// The one denied-tool retry entry, the same for every session.
+				const { reExecuteDeniedToolCall } = await import("../narrator-session");
+				const result = await reExecuteDeniedToolCall(
+					"child",
+					reason === "not_found" ? "unknown" : "retry-write",
+					"en",
+				);
+				expect(result).toEqual({ ok: false, reason });
 				expect(prepare).not.toHaveBeenCalled();
 				expect(
 					(await db.query.narrators.findFirst({ where: eq(narrators.id, "child") }))?.logicalRunId,
@@ -283,8 +281,10 @@ describe("subagent logical-run receipts", () => {
 		"prepare_failure",
 		"result_persistence_failure",
 	] as const) {
-		test(`real admitted retry (${outcome}) owns its new segment and releases unused slots`, async () => {
+		test(`real admitted retry (${outcome}) attributes its I/O to the session's run segment`, async () => {
 			await fixture();
+			// The session's current run delivers to the Agent call and owns a segment.
+			await establishSubagentExecutionSegment({ ...request, binding });
 			await db
 				.update(narrators)
 				.set({
@@ -391,23 +391,11 @@ describe("subagent logical-run receipts", () => {
 				});
 				return prepared;
 			});
-			let runAtIo: string | null = null;
+			let runAtIo = null as string | null;
 			const tools = await import("../../lib/agent/tool-executor");
 			spyOn(tools, "executeTool").mockImplementation(async (_tool, _config, options) => {
 				const current = await db.query.narrators.findFirst({ where: eq(narrators.id, "child") });
 				runAtIo = current?.logicalRunId ?? null;
-				expect(runAtIo).not.toBe("run-1");
-				if (outcome === "result_persistence_failure") {
-					expect(current?.backgroundStatus).toBe("running");
-					expect(current?.backgroundResult).toBeNull();
-					expect(current?.backgroundCompletedAt).toBeNull();
-					const task = await db.query.backgroundTasks.findFirst({
-						where: eq(backgroundTasks.id, "child"),
-					});
-					expect(task?.status).toBe("running");
-					expect(task?.output).toBeNull();
-					expect(task?.completedAt).toBeNull();
-				}
 				const childRun = await resolveSubagentExecutionSegment("child");
 				const toolSegment = await db.query.fileChangeExecutionSegments.findFirst({
 					where: eq(
@@ -427,66 +415,50 @@ describe("subagent logical-run receipts", () => {
 					{ type: "tool_result", toolUseId: "denied-write", output: "written" },
 				],
 			});
-			const runner = await import("../subagent-runner");
-			let continuation: Record<string, unknown> | undefined;
-			spyOn(runner, "startContinuedSubagent").mockImplementation(async (input) => {
-				continuation = input as unknown as Record<string, unknown>;
-				return {
-					runId: "continuation",
-					completion: Promise.resolve("done"),
-					terminalCompletion: Promise.resolve("done"),
-				};
+			// The continuation after a successful retry is an ordinary run start; observe it.
+			const runModule = await import("../agent-runtime/run");
+			const continuations: Array<Record<string, unknown>> = [];
+			const idle = Promise.resolve({
+				started: true,
+				output: "",
+				finalText: "",
+				hasError: false,
+				interrupted: false,
+				timedOut: false,
 			});
-			const publication = (
-				await import("../agent-runtime/publication")
-			).getRuntimePublicationService();
-			const releaseSlots = spyOn(publication, "releaseUnusedRunSlots");
+			spyOn(runModule, "startNarratorRun").mockImplementation(async (input) => {
+				continuations.push(input as unknown as Record<string, unknown>);
+				return { started: true, foreground: idle, terminal: idle, completion: idle };
+			});
 			try {
-				const { resumeSubagent } = await import("../subagent-resume");
-				const resumed = resumeSubagent({
-					subagentId: "child",
-					intent: "retry_denied_tool",
-					actor: "user",
-					retryToolUseId: "denied-write",
-					locale: "en",
-					skipConclusionDelivery: true,
-				});
+				const { reExecuteDeniedToolCall } = await import("../narrator-session");
+				const retried = reExecuteDeniedToolCall("child", "denied-write", "en");
 				if (outcome === "prepare_failure") {
-					await expect(resumed).rejects.toThrow("prepare failed");
+					await expect(retried).rejects.toThrow("prepare failed");
+					// Nothing ran: the session's run and its attribution are untouched.
+					expect(
+						(await db.query.narrators.findFirst({ where: eq(narrators.id, "child") }))
+							?.logicalRunId,
+					).toBe("run-1");
 				} else if (outcome === "tool_failure" || outcome === "result_persistence_failure") {
-					expect((await resumed).started).toBe(false);
+					expect(await retried).toMatchObject({ ok: true, shouldContinue: false });
 				} else {
-					const result = await resumed;
-					expect(result.started).toBe(true);
+					expect(await retried).toEqual({ ok: true });
 					expect(readFileSync(filePath, "utf8")).toBe("retried");
-					expect(continuation?.resumeLogicalRunId).toBe(runAtIo);
-					expect(continuation?.fileChangeStartedAt).toEqual(expect.any(String));
-					await result.terminalCompletion;
+					// The continuation goes through the one run entry with no new relations:
+					// the run still delivers to the destination the session registered.
+					expect(continuations).toHaveLength(1);
+					expect(continuations[0]).toMatchObject({ narratorId: "child" });
+					expect(continuations[0].binding).toBeUndefined();
+					expect(continuations[0].resumeRunId).toBeUndefined();
 				}
-				if (outcome !== "continue") {
-					expect(releaseSlots).toHaveBeenCalledTimes(1);
-					expect(continuation).toBeUndefined();
-					expect(state.isNarratorRuntimeBusy("child")).toBe(false);
-					const current = await db.query.narrators.findFirst({ where: eq(narrators.id, "child") });
-					expect(current?.logicalRunId).not.toBe("run-1");
-					expect(current?.logicalRunId).toBe(releaseSlots.mock.calls[0][0].logicalRunId);
-					if (outcome === "result_persistence_failure") {
-						expect(readFileSync(filePath, "utf8")).toBe("retried");
-						expect(current?.backgroundStatus).toBe("failed");
-						expect(current?.backgroundResult).toContain("result persistence failed");
-						expect(current?.backgroundCompletedAt).not.toBe("2020-01-01T00:00:00.000Z");
-						expect(Date.parse(current?.backgroundCompletedAt ?? "")).toBeGreaterThanOrEqual(
-							Date.parse(current?.turnStartedAt ?? ""),
-						);
-						const task = await db.query.backgroundTasks.findFirst({
-							where: eq(backgroundTasks.id, "child"),
-						});
-						expect(task?.status).toBe("failed");
-						expect(task?.output).toBe(current?.backgroundResult);
-						expect(task?.completedAt).toBe(current?.backgroundCompletedAt);
-						expect(task?.logicalRunId).toBe(current?.logicalRunId);
-					}
-				}
+				if (outcome !== "continue") expect(continuations).toEqual([]);
+				// The retried attempt's file changes are recorded under the session's run
+				// segment (asserted at I/O above), and no owner or runtime claim is left.
+				if (outcome !== "prepare_failure") expect(runAtIo).toBe("run-1");
+				expect(state.isNarratorRuntimeBusy("child")).toBe(false);
+				if (outcome === "result_persistence_failure")
+					expect(readFileSync(filePath, "utf8")).toBe("retried");
 			} finally {
 				state.activeNarrators.delete("child");
 				rmSync(filePath, { force: true });

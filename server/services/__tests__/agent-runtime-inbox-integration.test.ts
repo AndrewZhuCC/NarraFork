@@ -28,22 +28,33 @@ mock.module("../../lib/agent", () => ({
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 }));
 const inbox = await import("../agent-runtime/inbox");
+const { activeNarrators } = await import("../narrator-session-state");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { createAgentMessageDelivery } = await import("../agent-message-delivery");
 const { pushParentInboundMessage } = await import("../parent-inbound-queue");
 const { drainPendingInjections, projectPendingInjection } = await import(
 	"../parent-injection-queue"
 );
-const { deliverPendingInjection, drainInjectionsIntoHistory } = await import("../narrator-session");
+const { closeNarrator, deliverPendingInjection, drainInjectionsIntoHistory } = await import(
+	"../narrator-session"
+);
 const { deliverTeamMessage, drainTeamInbox, clearTeamInbox } = await import("../subagent-team");
+/** Queue an agent message on the agent lane, the way Send does. */
+async function pushAgentMessage(
+	_narratorId: string,
+	text: string,
+	options: { delivery: import("../agent-message-delivery").AgentMessageDelivery; createdBy?: null },
+) {
+	const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
+	return (await enqueueInboxAgent(options.delivery, text, { createdBy: options.createdBy }))
+		.delivery;
+}
 const {
-	pushSubagentBufferedMessage,
-	consumeNextBufferedSubagentMessage,
-	consumeBufferedSubagentMessageInPass,
-	getSubagentBufferedMessages,
-	updateSubagentBufferedMessage,
-} = await import("../subagent-executor");
-const { enqueueBufferedMessage, clearBufferedMessages } = await import("../narrator-buffer");
+	enqueueBufferedMessage,
+	clearBufferedMessages,
+	getBufferedMessages,
+	updateBufferedMessage,
+} = await import("../narrator-buffer");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
 const time = "2026-09-09T00:00:00.000Z";
@@ -53,7 +64,12 @@ function required<T>(value: T | null | undefined): T {
 	return value;
 }
 beforeEach(() => {
-	for (const id of ["parent", "child", "sender"]) getExecutionOwner(id)?.release();
+	for (const id of ["parent", "child", "sender"]) {
+		getExecutionOwner(id)?.release();
+		// A wake builds an in-memory session; it would read as live work later.
+		closeNarrator(id);
+		activeNarrators.delete(id);
+	}
 	cleanDb(sqlite);
 	failBroadcast = false;
 	for (const id of ["parent", "child", "sender"])
@@ -138,15 +154,25 @@ function bindDeliverySource(value: ReturnType<typeof delivery>) {
 		bindingNarratorId: call.narratorId,
 	};
 }
-function consume() {
-	return consumeNextBufferedSubagentMessage({
+/** The running session "child" whose run delivers to the parent's "origin" call. */
+function childSession(currentUserId?: string | null) {
+	return {
 		narratorId: "child",
-		parentNarratorId: "parent",
-		toolUseId: "origin",
-		model: "test",
-		provider: "anthropic",
 		cwd: ".",
-	});
+		locale: "en",
+		_currentUserId: currentUserId,
+		_tasksReminderInterval: -1,
+		_fenceInterval: -1,
+	} as Parameters<typeof drainInjectionsIntoHistory>[0];
+}
+/** The one consumer a running pass uses at its tool boundary, as the run's owner. */
+function consume(session = childSession()) {
+	return inbox.withInboxOwner("child", () =>
+		drainInjectionsIntoHistory(session, "en", {
+			parentNarratorId: "parent",
+			parentToolUseId: "origin",
+		}),
+	);
 }
 function state(id: string) {
 	return db
@@ -164,28 +190,65 @@ test("consumed Send recovers its own durable source receipt, not another wake tr
 	const expected = bindDeliverySource(first);
 	const second = delivery("child", "second");
 	bindDeliverySource(second);
-	await inbox.enqueueInboxAgent(first, first.text);
+	const acceptedFirst = await inbox.enqueueInboxAgent(first, first.text);
 	await inbox.enqueueInboxAgent(second, second.text);
-	const consumed = required(await consume());
-	expect(consumed.executionBinding).toEqual(expected);
-	expect(consumed.executionBinding?.bindingNarratorId).toBe("sender");
+	// The receipt resolves to the message's own sending call, never another trigger.
+	expect(await inbox.resolveInboxExecutionBinding(acceptedFirst.delivery)).toEqual(expected);
+	expect(expected.bindingNarratorId).toBe("sender");
+	// Both are adopted, in arrival order, by the one consumer.
+	const consumed = await consume();
+	expect(consumed.text.indexOf("first")).toBeLessThan(consumed.text.indexOf("second"));
+	expect(childMessages()).toHaveLength(2);
 });
 
-test("eligible queue wake restores a verified sender call rather than child creation", async () => {
-	const value = delivery("child", "queued followup");
-	const expected = bindDeliverySource(value);
-	await inbox.enqueueInboxAgent(value, value.text);
-	const resume = await import("../subagent-resume");
-	const captured: Record<string, unknown>[] = [];
-	const spy = spyOn(resume, "resumeSubagent").mockImplementation(async (input) => {
-		captured.push(input as unknown as Record<string, unknown>);
-		return { started: true, resumedSuspendedRunner: false, originToolUseId: "creation-slot" };
+/** Observe run starts without executing a model pass. */
+async function observeRunStarts() {
+	const runModule = await import("../agent-runtime/run");
+	const calls: Array<Record<string, unknown>> = [];
+	const idle = Promise.resolve({
+		started: true,
+		output: "",
+		finalText: "",
+		hasError: false,
+		interrupted: false,
+		timedOut: false,
 	});
+	const spy = spyOn(runModule, "startNarratorRun").mockImplementation(async (request) => {
+		calls.push({ ...request, sessionUser: request.active?._currentUserId });
+		return { started: true, foreground: idle, terminal: idle, completion: idle };
+	});
+	return { calls, restore: () => spy.mockRestore() };
+}
+
+test("an eligible queue wake starts the session's ordinary run; the Send changes no identity", async () => {
+	const value = delivery("child", "queued followup");
+	bindDeliverySource(value);
+	db.update(narrators)
+		.set({
+			status: "idle",
+			cwd: process.env.HOME,
+			runtimeRegistrationJson: {
+				version: 1,
+				run: { logicalRunId: "anonymous-wake-run", principal: { userId: null } },
+			},
+		})
+		.where(eq(narrators.id, "child"))
+		.run();
+	await inbox.enqueueInboxAgent(value, value.text, { createdBy: null, userId: null });
+	const runs = await observeRunStarts();
 	try {
 		expect(await inbox.wakeInboxIfEligible("child")).toBe(true);
-		expect(captured[0]).toMatchObject({ ...expected, mailboxInput: true });
+		// The message is already in history; the run starts with no new relationships
+		// and does not execute as the sender.
+		expect(runs.calls).toHaveLength(1);
+		expect(runs.calls[0]).toMatchObject({ narratorId: "child", text: "" });
+		expect(runs.calls[0].binding).toBeUndefined();
+		expect(runs.calls[0].principal).toBeNull();
+		expect(
+			childMessages().some((message) => message.contentText?.includes("queued followup")),
+		).toBe(true);
 	} finally {
-		spy.mockRestore();
+		runs.restore();
 	}
 });
 
@@ -198,7 +261,8 @@ test("retired mailbox attempt remains unattributed instead of adopting creation 
 		.where(eq(narratorToolCalls.id, value.senderToolCallBinding?.toolCallId ?? ""))
 		.run();
 	expect(await inbox.resolveInboxExecutionBinding(accepted.delivery)).toBeNull();
-	expect((await consume())?.executionBinding).toBeNull();
+	// An unattributed message is still adopted; it just borrows no execution identity.
+	expect((await consume()).text).toContain("old queued followup");
 });
 
 test("receipt lookup failure cannot discard an already durable message", async () => {
@@ -214,20 +278,36 @@ test("receipt lookup failure cannot discard an already durable message", async (
 	} finally {
 		lookup.mockRestore();
 	}
-	expect((await consume())?.executionBinding?.toolCallBinding.toolCallId).toBe(
-		value.senderToolCallBinding?.toolCallId,
+	expect(await inbox.resolveInboxExecutionBinding(accepted.delivery)).toEqual(
+		expect.objectContaining({
+			toolCallBinding: expect.objectContaining({
+				toolCallId: value.senderToolCallBinding?.toolCallId,
+			}),
+		}),
 	);
+	expect((await consume()).text).toContain("keep this input");
 });
 
-test("real Send idle entry forwards its own verified binding and sending actor", async () => {
+test("real Send to an idle session wakes its ordinary run as its own principal", async () => {
 	const value = delivery("child", "from Send");
 	const expected = bindDeliverySource(value);
-	const resume = await import("../subagent-resume");
-	const captured: Record<string, unknown>[] = [];
-	const spy = spyOn(resume, "resumeSubagent").mockImplementation(async (input) => {
-		captured.push(input as unknown as Record<string, unknown>);
-		return { started: true, resumedSuspendedRunner: false, originToolUseId: "creation-slot" };
-	});
+	db.update(narrators)
+		.set({
+			status: "idle",
+			cwd: process.env.HOME,
+			ownerUserId: null,
+			runtimeRegistrationJson: {
+				version: 1,
+				run: {
+					logicalRunId: "child-run",
+					deliverTo: { narratorId: "parent", toolUseId: "origin" },
+					principal: { userId: null },
+				},
+			},
+		})
+		.where(eq(narrators.id, "child"))
+		.run();
+	const runs = await observeRunStarts();
 	try {
 		const { sendSubagentMessageDetailed } = await import("../agent-communication");
 		await sendSubagentMessageDetailed({
@@ -238,13 +318,17 @@ test("real Send idle entry forwards its own verified binding and sending actor",
 			message: "from Send",
 			signal: new AbortController().signal,
 			locale: "en",
+			userId: "sender-user",
 		});
-		expect(captured[0]).toMatchObject({ ...expected, mailboxInput: true });
+		expect(runs.calls).toHaveLength(1);
+		expect(runs.calls[0]).toMatchObject({ narratorId: "child", text: "" });
+		// The sender's user is the message author only: never the run's principal.
+		expect(runs.calls[0].principal).toBeNull();
+		expect(runs.calls[0].sessionUser).not.toBe("sender-user");
 	} finally {
-		spy.mockRestore();
+		runs.restore();
 	}
 });
-
 test("idle injection claim stops at an earlier user input", async () => {
 	const store = createMailboxStore(db);
 	const earlier = store.enqueue({
@@ -294,7 +378,7 @@ test("parent/team/child producers persist into the same mailbox, read projection
 	expect(await drainPendingInjections("parent")).toHaveLength(1);
 	expect(await drainPendingInjections("parent")).toHaveLength(1);
 	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "child")).run();
-	const teamOwner = required(tryClaimExecution("child", "subagent"));
+	const teamOwner = required(tryClaimExecution("child", "run"));
 	const team = delivery();
 	await deliverTeamMessage(
 		"child",
@@ -309,7 +393,7 @@ test("parent/team/child producers persist into the same mailbox, read projection
 		},
 		"parent",
 	);
-	const buffered = await pushSubagentBufferedMessage("child", "[sender] next", {
+	const buffered = await pushAgentMessage("child", "[sender] next", {
 		delivery: delivery("child", "next"),
 	});
 	expect(await drainTeamInbox("child")).toHaveLength(2);
@@ -386,9 +470,9 @@ test("broadcast arriving during the publication barrier cannot authorize a defer
 test("live runner consumes broadcast without granting a future wake", async () => {
 	const d = delivery();
 	const accepted = await inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true, channel: "team" });
-	const owner = required(tryClaimExecution("child", "subagent"));
+	const owner = required(tryClaimExecution("child", "run"));
 	try {
-		expect(await consume()).toBeDefined();
+		expect((await consume()).text).toContain(d.text);
 		expect(state(accepted.delivery.id)?.state).toBe("materialized");
 	} finally {
 		owner.release();
@@ -436,13 +520,13 @@ test("user barrier and editing are shared; agent messages cannot be edited throu
 		"front",
 	);
 	const d = delivery();
-	const agentInput = await pushSubagentBufferedMessage("child", d.text, { delivery: d });
-	const owner = tryClaimExecution("child", "subagent");
+	const agentInput = await pushAgentMessage("child", d.text, { delivery: d });
+	const owner = tryClaimExecution("child", "run");
 	expect(
 		await inbox.claimInboxHead("child", (row) => row.kind === "agent_message"),
 	).toBeUndefined();
-	expect(await updateSubagentBufferedMessage("child", agentInput.id, "forged user")).toBe(false);
-	expect(getSubagentBufferedMessages("child").map((m) => m.id)).toEqual([user.id]);
+	expect(await updateBufferedMessage("child", agentInput.id, "forged user")).toBe(false);
+	expect(getBufferedMessages("child").map((m) => m.id)).toEqual([user.id]);
 	clearBufferedMessages("child");
 	expect(state(user.id)?.state).toBe("cancelled");
 	expect(state(agentInput.id)?.state).toBe("queued");
@@ -488,14 +572,15 @@ test("parent real delivery commits history/ref/materialization together and keep
 
 test("child real consumer retains mailbox payload after SQL failure and retries one history row", async () => {
 	const d = delivery();
-	const accepted = await pushSubagentBufferedMessage("child", `[sender] ${d.text}`, {
+	const accepted = await pushAgentMessage("child", `[sender] ${d.text}`, {
 		delivery: d,
 	});
 	sqlite.exec(
 		"CREATE TEMP TRIGGER fail_inbox_ref BEFORE INSERT ON narrator_message_refs BEGIN SELECT RAISE(ABORT, 'inbox ref fault'); END",
 	);
 	try {
-		await expect(consume()).rejects.toThrow("inbox ref fault");
+		// A failed row is released, not dropped: nothing is adopted this boundary.
+		expect((await consume()).text).not.toContain(d.text);
 	} finally {
 		sqlite.exec("DROP TRIGGER fail_inbox_ref");
 	}
@@ -509,9 +594,10 @@ test("child real consumer retains mailbox payload after SQL failure and retries 
 });
 
 test("post-commit WS failure never requeues the committed child delivery", async () => {
-	const accepted = await pushSubagentBufferedMessage("child", "plain user");
+	const value = delivery("child", "plain agent words");
+	const accepted = await pushAgentMessage("child", value.text, { delivery: value });
 	failBroadcast = true;
-	expect(await consume()).not.toBeNull();
+	expect((await consume()).text).toContain(value.text);
 	failBroadcast = false;
 	expect(state(accepted.id)?.state).toBe("materialized");
 	await consume();
@@ -522,121 +608,89 @@ test("after-tools consumer preserves principal barrier and only materializes on 
 	// In-pass adoption is an agent-delivery path; explicit user queue modes intentionally
 	// restart a pass. Keep this fixture on the path the assertion is testing.
 	const value = delivery("child", "new principal");
-	const accepted = await pushSubagentBufferedMessage("child", "new principal", {
+	const accepted = await pushAgentMessage("child", "new principal", {
 		createdBy: null,
 		delivery: value,
 	});
-	await inbox.withInboxOwner("child", async () => {
-		const result = await consumeBufferedSubagentMessageInPass({
-			narratorId: "child",
-			parentNarratorId: "parent",
-			toolUseId: "origin",
-			cwd: ".",
-			currentUserId: "other",
-		});
-		expect(result?.text).toBe('<sender kind="agent" id="sender" name="Sender" />\nnew principal');
-		expect(result?.parts).toEqual([
-			{ text: required(result).text, messageId: required(childMessages()[0]?.id) },
-		]);
-		expect(result?.parts[0]?.messageId).not.toBe(accepted.id);
-		expect(state(accepted.id)?.adoptedAt).toBeNull();
-	});
+	// The session runs as another user: an agent Send is still adopted mid-pass and
+	// does not become the run's principal.
+	const result = await consume(childSession("other"));
+	expect(result.text).toContain("new principal");
+	expect(result.parts.map((part) => part.messageId)).toEqual([required(childMessages()[0]?.id)]);
+	expect(result.parts[0]?.messageId).not.toBe(accepted.id);
+	expect(state(accepted.id)?.adoptedAt).toBeNull();
 });
 
-test("child after-tools parts separate the durable buffered input and its knowledge hint", async () => {
-	const knowledge = await import("../subagent-knowledge-injection");
-	const scan = spyOn(knowledge, "scanSubagentTextForKnowledge").mockResolvedValue({
-		content: "knowledge for the buffered message",
-		body: { kind: "knowledge", hits: [] },
-		record: { narratorId: "child", compactSeq: 0, hits: [] },
-	});
-	try {
-		// cleanDb clears the installation marker, not the shipped revision triggers. Restore
-		// this private fixture row so replay uses the real loader's trusted source contract.
-		const { MODEL_HISTORY_REVISION_CONTRACT } = await import(
-			"../agent-runtime/model-history-revision-sql"
-		);
-		const { readSqliteModelHistorySignature } = await import(
-			"../agent-runtime/model-history-revision"
-		);
-		sqlite
-			.query(
-				"INSERT INTO model_history_revision_contracts (id, installed_version) VALUES ('model-history', ?)",
-			)
-			.run(MODEL_HISTORY_REVISION_CONTRACT);
-		expect(readSqliteModelHistorySignature(sqlite, "child").trusted).toBe(true);
-		const value = delivery("child", "buffered message");
-		const accepted = await pushSubagentBufferedMessage("child", value.text, { delivery: value });
-		const projected = await inbox.withInboxOwner("child", () =>
-			drainInjectionsIntoHistory(
-				{
-					narratorId: "child",
-					cwd: ".",
-					_tasksReminderInterval: -1,
-					_fenceInterval: -1,
-				} as Parameters<typeof drainInjectionsIntoHistory>[0],
-				"en",
-				{ parentNarratorId: "parent", parentToolUseId: "origin" },
-			),
-		);
-		const userMessage = required(childMessages().find((message) => message.role === "user"));
-		const hintMessage = required(childMessages().find((message) => message.role === "sys"));
-		expect(projected.parts).toEqual(
-			[userMessage, hintMessage].map((message) => ({
-				text: projectMessageSenderText(message, message.contentText ?? ""),
-				messageId: message.id,
-			})),
-		);
-		expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
-		expect(projected.parts[0]?.messageId).not.toBe(accepted.id);
-		expect(projected.parts[0]?.messageId).not.toBe(projected.parts[1]?.messageId);
-		expect(userMessage.parentToolUseId).toBe("origin");
-		expect(hintMessage.parentToolUseId).toBe("origin");
-		expect(state(accepted.id)?.adoptedAt).toBeNull();
+// Knowledge hints are produced by the pass itself (orchestrator), not by the drain; the
+// end-to-end hint is covered in subagent-knowledge-injection. Here: the drained part is the
+// durable input row, and every provider replays exactly that row.
+test("tool-boundary drain parts are the durable buffered input and replay as such", async () => {
+	// cleanDb clears the installation marker, not the shipped revision triggers. Restore
+	// this private fixture row so replay uses the real loader's trusted source contract.
+	const { MODEL_HISTORY_REVISION_CONTRACT } = await import(
+		"../agent-runtime/model-history-revision-sql"
+	);
+	const { readSqliteModelHistorySignature } = await import(
+		"../agent-runtime/model-history-revision"
+	);
+	sqlite
+		.query(
+			"INSERT INTO model_history_revision_contracts (id, installed_version) VALUES ('model-history', ?)",
+		)
+		.run(MODEL_HISTORY_REVISION_CONTRACT);
+	expect(readSqliteModelHistorySignature(sqlite, "child").trusted).toBe(true);
+	const value = delivery("child", "buffered message");
+	const accepted = await pushAgentMessage("child", value.text, { delivery: value });
+	const projected = await consume();
+	// An agent Send is materialized as one injection row of the recipient's history.
+	const rows = childMessages();
+	expect(rows).toHaveLength(1);
+	const userMessage = required(rows[0]);
+	expect(projected.parts).toEqual([
+		{
+			text: projectMessageSenderText(userMessage, userMessage.contentText ?? ""),
+			messageId: userMessage.id,
+		},
+	]);
+	expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
+	expect(projected.parts[0]?.messageId).not.toBe(accepted.id);
+	expect(userMessage.parentToolUseId).toBe("origin");
+	expect(state(accepted.id)?.adoptedAt).toBeNull();
 
-		const { settings } = await import("../../lib/settings");
-		const originalProviders = settings.openaiProviders;
-		const agentModule = await import("../../lib/agent");
-		const realBuilder = spyOn(agentModule, "buildHistory").mockImplementation(agent.buildHistory);
-		try {
-			settings.openaiProviders = (["responses", "completions"] as const).map((apiMode) => ({
-				id: `buffered-replay-${apiMode}`,
-				name: "Buffered replay fixture",
-				prefix: `buffered-replay-${apiMode}`,
-				apiKey: "isolated-test-no-network",
-				baseUrl: "https://example.invalid/v1",
-				defaultModel: "gpt-5",
-				apiMode,
-			}));
-			const { buildRuntimeHistory } = await import("../agent-runtime/history");
-			for (const apiMode of ["responses", "completions"] as const) {
-				const rebuilt = await buildRuntimeHistory({
-					narratorId: "child",
-					profile: "subagent",
-					model: "gpt-5",
-					provider: `buffered-replay-${apiMode}`,
-				});
-				const historyText = JSON.stringify(rebuilt.history);
-				expect(historyText).toContain(value.text);
-				expect(historyText).toContain("knowledge for the buffered message");
-				expect(rebuilt.replayedInjectionMessageIds).toEqual([userMessage.id, hintMessage.id]);
-				const replayed = new Set(rebuilt.replayedInjectionMessageIds);
-				expect(projected.parts.filter((part) => !replayed.has(required(part.messageId)))).toEqual(
-					[],
-				);
-			}
-		} finally {
-			realBuilder.mockRestore();
-			settings.openaiProviders = originalProviders;
+	const { settings } = await import("../../lib/settings");
+	const originalProviders = settings.openaiProviders;
+	const agentModule = await import("../../lib/agent");
+	const realBuilder = spyOn(agentModule, "buildHistory").mockImplementation(agent.buildHistory);
+	try {
+		settings.openaiProviders = (["responses", "completions"] as const).map((apiMode) => ({
+			id: `buffered-replay-${apiMode}`,
+			name: "Buffered replay fixture",
+			prefix: `buffered-replay-${apiMode}`,
+			apiKey: "isolated-test-no-network",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "gpt-5",
+			apiMode,
+		}));
+		const { buildRuntimeHistory } = await import("../agent-runtime/history");
+		for (const apiMode of ["responses", "completions"] as const) {
+			const rebuilt = await buildRuntimeHistory({
+				narratorId: "child",
+				ownTurnPlacement: "origin",
+				model: "gpt-5",
+				provider: `buffered-replay-${apiMode}`,
+			});
+			expect(JSON.stringify(rebuilt.history)).toContain(value.text);
+			expect(rebuilt.replayedInjectionMessageIds).toEqual([userMessage.id]);
 		}
 	} finally {
-		scan.mockRestore();
+		realBuilder.mockRestore();
+		settings.openaiProviders = originalProviders;
 	}
 });
 
 test("completion outbox notices share the ordered consumer and restore only bounded immutable result", async () => {
 	const first = delivery("child", "report before completion");
-	await pushSubagentBufferedMessage("child", first.text, { delivery: first });
+	await pushAgentMessage("child", first.text, { delivery: first });
 	const store = createPublicationOutbox(db);
 	const run = {
 		producerKind: "agent" as const,
@@ -691,7 +745,7 @@ test("accepted maximum Send body is stored once and a new clone provenance canno
 
 test("failed agent payloads still fill their quota without preventing user acceptance", async () => {
 	for (let index = 0; index < 50; index++) await inbox.enqueueInboxAgent(delivery(), "same words");
-	const owner = tryClaimExecution("child", "subagent");
+	const owner = tryClaimExecution("child", "run");
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const row = required(await inbox.claimInboxHead("child", () => true));
 		await inbox.releaseInboxClaim(row, "preparation failed");
@@ -1043,11 +1097,11 @@ test("Await-revoked terminal claim is a benign empty projection and does not blo
 test("late claim callback cannot materialize after shared owner replacement", async () => {
 	const d = delivery("parent");
 	await inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });
-	const oldOwner = tryClaimExecution("parent", "primary");
+	const oldOwner = tryClaimExecution("parent", "run");
 	const row = await inbox.claimInboxHead("parent", () => true);
 	if (!row || !oldOwner) throw new Error("missing fixture claim");
 	oldOwner.release();
-	tryClaimExecution("parent", "primary");
+	tryClaimExecution("parent", "run");
 	await expect(
 		deliverPendingInjection("parent", "en", "busy", "onNextTurn", {
 			...projectPendingInjection(row),
@@ -1064,17 +1118,125 @@ test("late claim callback cannot materialize after shared owner replacement", as
 });
 
 test("pre-prompt command stays queued at after-tools until a new pass can execute it", async () => {
-	const accepted = await pushSubagentBufferedMessage("child", "after command", {
-		prePromptBashCommand: "pwd",
-	});
-	await inbox.withInboxOwner("child", async () => {
-		const result = await consumeBufferedSubagentMessageInPass({
-			narratorId: "child",
-			parentNarratorId: "parent",
-			toolUseId: "origin",
-			cwd: ".",
-		});
-		expect(result).toBeNull();
-		expect(state(accepted.id)?.state).toBe("queued");
-	});
+	const accepted = await enqueueBufferedMessage(
+		"child",
+		"after command",
+		undefined,
+		null,
+		null,
+		null,
+		undefined,
+		"back",
+		"pwd",
+	);
+	const result = await consume();
+	expect(result.text).not.toContain("after command");
+	expect(state(accepted.id)?.state).toBe("queued");
 });
+
+// A Send that arrives while the recipient's run is executing: adopted at the next tool
+// boundary of that same run (never a new run), withheld while its materialization fails,
+// and delivered exactly once afterwards. Real run service and orchestrator; only the
+// model pass is scripted. The sender's identity never becomes the run's principal.
+for (const shape of ["delegated", "unrelated"] as const) {
+	test(`running ${shape} session adopts a Send at its tool boundary once, as its own principal`, async () => {
+		const narratorExecutor = await import("../narrator-executor");
+		const { settings } = await import("../../lib/settings");
+		const { startNarratorRun } = await import("../agent-runtime/run");
+		const previous = settings.anthropicProviders;
+		settings.anthropicProviders = [
+			{
+				id: "boundary-provider",
+				name: "Boundary test",
+				prefix: "boundary-test",
+				apiKey: "test-only",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "claude-sonnet-4",
+				officialApi: false,
+			},
+		];
+		db.update(narrators)
+			.set({
+				status: "idle",
+				cwd: process.env.HOME,
+				model: "boundary-test:claude-sonnet-4",
+				autoContinuationOverride: "off",
+				// Same registered destination either way; only the parent link differs.
+				...(shape === "unrelated"
+					? { parentNarratorId: null, type: "primary", variant: "primary" }
+					: {}),
+				runtimeRegistrationJson: {
+					version: 1,
+					run: {
+						logicalRunId: "boundary-run",
+						deliverTo: { narratorId: "parent", toolUseId: "origin" },
+					},
+				},
+			})
+			.where(eq(narrators.id, "child"))
+			.run();
+		const texts: Array<string | undefined> = [];
+		let queuedAfterFailure = 0;
+		let principalDuringPass: string | null | undefined;
+		const text = (
+			value:
+				| Awaited<
+						ReturnType<
+							NonNullable<import("../../lib/agent/types").AgentConfig["getAfterToolsInjections"]>
+						>
+				  >
+				| undefined,
+		) => (typeof value === "string" ? value : value?.text);
+		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
+			async (input) => {
+				// The Send arrives mid-pass, as the sender's user.
+				const value = delivery("child", "mid-run report");
+				bindDeliverySource(value);
+				await inbox.enqueueInboxAgent(value, value.text, {
+					createdBy: null,
+					userId: "sender-user",
+				});
+				sqlite.run(`CREATE TEMP TRIGGER fail_boundary_ref BEFORE INSERT ON narrator_message_refs
+					WHEN NEW.narrator_id = 'child'
+					BEGIN SELECT RAISE(ABORT, 'boundary persistence rejected'); END`);
+				try {
+					texts.push(text(await input.config.getAfterToolsInjections?.()));
+				} finally {
+					sqlite.run("DROP TRIGGER fail_boundary_ref");
+				}
+				queuedAfterFailure = (await inbox.listInboxRows("child", ["agent_message"])).length;
+				const prepared = await input.config.getAfterToolsInjections?.();
+				texts.push(text(prepared));
+				if (typeof prepared !== "string") prepared?.onConsumed?.();
+				texts.push(text(await input.config.getAfterToolsInjections?.()));
+				principalDuringPass = input.config.userId;
+				return { finalText: "done", hasError: false, shouldUpdateTitle: false };
+			},
+		);
+		try {
+			const handle = await startNarratorRun({
+				narratorId: "child",
+				locale: "en",
+				text: "initial turn",
+				principal: null,
+				deliver: false,
+			});
+			expect(handle.started).toBe(true);
+			await handle.terminal;
+			// One run, one pass: the Send never started another run.
+			expect(executor).toHaveBeenCalledTimes(1);
+			expect(texts[0] ?? "").not.toContain("mid-run report");
+			expect(queuedAfterFailure).toBe(1);
+			expect(texts[1]).toContain("mid-run report");
+			expect(texts[2] ?? "").not.toContain("mid-run report");
+			expect(
+				childMessages().filter((message) => message.contentText?.includes("mid-run report")),
+			).toHaveLength(1);
+			expect(await inbox.listInboxRows("child", ["agent_message"])).toHaveLength(0);
+			expect(principalDuringPass ?? null).toBeNull();
+		} finally {
+			executor.mockRestore();
+			settings.anthropicProviders = previous;
+		}
+	});
+}

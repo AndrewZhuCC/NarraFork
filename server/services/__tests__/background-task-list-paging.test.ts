@@ -1396,7 +1396,7 @@ describe("background task list deltas", () => {
 		const taskId = "materialized-retention";
 		await seedBashTaskAt(taskId, "2026-08-02T00:00:00.000Z", "done");
 		await getRuntimePublicationService().flushRecipient(PARENT);
-		const owner = tryClaimExecution(PARENT, "primary");
+		const owner = tryClaimExecution(PARENT, "run");
 		if (!owner) throw new Error("Cannot claim isolated notice consumer");
 		try {
 			const row = await claimInboxHead(PARENT, (candidate) => candidate.kind === "task_notice");

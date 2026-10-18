@@ -6,7 +6,7 @@ import {
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessages, narrators } from "../db/schema";
+import { narratorMessages } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -19,6 +19,7 @@ import {
 	settings,
 } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { getExecutionOwner } from "./agent-runtime/ownership";
 import {
 	appendLiveCompactDelta,
 	finishLiveCompactProgress,
@@ -1056,11 +1057,6 @@ async function doRunCustomCompact({
 	await setCompactingSubstatus(narratorId, mode, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { variant: true },
-	});
-	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
 	let contextWindowSource: ModelContextWindowSource | undefined;
 	let compactProgress: CompactProgressReporter | undefined;
 
@@ -1327,22 +1323,17 @@ async function doRunCustomCompact({
 			broadcastToNarrator(narratorId, compactFailedMessageEvent);
 		}
 
-		if (failureMode === "blocking") {
-			// Only override status for primary narrators — subagent status is
-			// managed by finalizeSubagent; overwriting it here would race.
-			if (!isSubagent) {
-				await narratorService.updateStatus(narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: `Compact failed: ${errorMsg}`,
-				});
-			}
-			// activeNarrators only tracks primary narrators; subagents are not
-			// registered there, so this abort is a no-op for them (which is fine —
-			// the subagent's own signal is managed by executeSubagent).
-			const active = activeNarrators.get(narratorId);
-			if (active?.alive) {
-				active.abortController.abort();
-			}
+		// A session with a live execution has exactly one terminal: its run's. The
+		// failure reaches that run through the thrown error and the run's own recovery
+		// decides the outcome; the run's finalizer then settles status and delivers once.
+		// Writing a status or aborting the turn here would race that terminal (and an
+		// abort turned the failure into a cancellation). Only an idle session has no
+		// other reporter, so it records the failure on its row.
+		if (failureMode === "blocking" && !getExecutionOwner(narratorId)) {
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: `Compact failed: ${errorMsg}`,
+			});
 		}
 		await setCompactingSubstatus(narratorId, failureMode, false).catch((err) => {
 			logger.warn("Failed to clear compacting substatus after failed custom compact", {

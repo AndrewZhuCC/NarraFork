@@ -51,7 +51,13 @@ import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import { IMPORTED_TRAIT, subagentVariant } from "../../lib/narrator-utils";
+import { type RuntimePolicyTrait, withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { imageRefToContentBlock, saveUploadedImage } from "../../lib/uploads";
+import {
+	delegationRegistration,
+	parseRuntimeRegistration,
+} from "../../lib/validators/runtime-registration";
+import { compileDelegationCeiling } from "../custom-subagent-service";
 import { bumpNarratorMessageVersion } from "../narrator-persistence";
 import { dbTransactionWithSeqFloor } from "../narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "../narrator-refs/seq-store";
@@ -430,7 +436,10 @@ function importTitle(session: InterchangeSession, options: ImportSessionOptions)
 function createImportedSubagent(input: {
 	parent: typeof narrators.$inferSelect;
 	originToolCallId: string;
+	historyToolUseId: string;
 	subagentType: string;
+	/** Compiled template ceiling (`compileDelegationCeiling`), stored like a live delegation's. */
+	ceiling: RuntimePolicyTrait;
 	title: string | undefined;
 }): string {
 	const id = generateId();
@@ -442,12 +451,18 @@ function createImportedSubagent(input: {
 			type: "subagent",
 			subagentType: input.subagentType,
 			variant: subagentVariant(input.subagentType),
-			traits: ["standalone", IMPORTED_TRAIT],
+			traits: withRuntimePolicyTrait(["standalone", IMPORTED_TRAIT], input.ceiling),
 			title: input.title ?? null,
 			// Same as a live subagent: follow the parent's model rather than freezing it.
 			model: FOLLOW_PARENT_MODEL,
 			permissionMode: input.parent.permissionMode ?? "default",
 			parentNarratorId: input.parent.id,
+			// Same relationships a live delegation registers: the parent is source + controller.
+			policySourceNarratorId: input.parent.id,
+			runtimeRegistrationJson: parseRuntimeRegistration({
+				...delegationRegistration(input.parent.id, input.subagentType),
+				historyPlacement: { toolUseId: input.historyToolUseId },
+			}),
 			originToolCallId: input.originToolCallId,
 			subagentOriginKind: "tool",
 			cwd: input.parent.cwd,
@@ -520,10 +535,13 @@ export async function importInterchangeSession(
 				warnings.add("missing_subagent", sub.ref);
 				continue;
 			}
+			const subagentType = normalizeSubagentType(sub.subagentType);
 			const subagentId = createImportedSubagent({
 				parent: narrator,
 				originToolCallId,
-				subagentType: normalizeSubagentType(sub.subagentType),
+				historyToolUseId: sub.parentToolUseId,
+				subagentType,
+				ceiling: await compileDelegationCeiling(subagentType),
 				title: sub.title,
 			});
 			createdIds.push(subagentId);

@@ -325,43 +325,40 @@ export const agentTool: ToolDefinition = {
 			try {
 				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.archive);
 				const { narratorService } = await import("@server/services/narrator-service");
-				const { isSubagentVariant } = await import("@server/lib/narrator-utils");
+				const { authorizeAgentControl } = await import("@server/services/narrator-control");
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 
-				const narrator = await narratorService.getById(targetId).catch(() => null);
-				if (!narrator) {
+				if (!(await narratorService.getById(targetId).catch(() => null))) {
 					return {
 						output: `Agent archive error: no subagent found for "${raw.archive}".`,
 						isError: true,
 					};
 				}
-				if (!isSubagentVariant(narrator.variant)) {
-					return {
-						output: `Agent archive error: "${raw.archive}" is not a subagent.`,
-						isError: true,
-					};
-				}
-				if (narrator.parentNarratorId !== ctx.narratorId) {
+				// Archiving is a control action: only the registered controller may do it.
+				const narrator = await authorizeAgentControl({
+					callerNarratorId: ctx.narratorId,
+					targetNarratorId: targetId,
+					action: "archive",
+					userId: ctx.userId,
+				}).catch(() => null);
+				if (!narrator) {
 					return {
 						output: `Agent archive error: "${raw.archive}" is not a direct child subagent of this narrator.`,
 						isError: true,
 					};
 				}
 				const label = agentLabelFromNarrator(narrator, ctx.narratorId);
-				if (narrator.status === "archived") {
-					return {
-						output: `Agent ${label} (${narrator.id}) is already archived. It remains excluded from TeamStatus broadcast (@all members) until unarchived.`,
-					};
-				}
-
 				const { interruptAndArchiveSubagent } = await import("@server/services/subagent-lifecycle");
-				const archived = await interruptAndArchiveSubagent(narrator.id, {
-					parentNarratorId: ctx.narratorId,
-				});
+				const archived = await interruptAndArchiveSubagent(narrator.id);
 				if (!archived.ok) {
 					return {
 						output: `Agent archive error: failed to archive "${raw.archive}" (${archived.error ?? "unknown"}).`,
 						isError: true,
+					};
+				}
+				if (archived.alreadyArchived) {
+					return {
+						output: `Agent ${label} (${narrator.id}) is already archived. It remains excluded from TeamStatus broadcast (@all members) until unarchived.`,
 					};
 				}
 
@@ -385,23 +382,23 @@ export const agentTool: ToolDefinition = {
 			try {
 				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.unarchive);
 				const { narratorService } = await import("@server/services/narrator-service");
-				const { isSubagentVariant } = await import("@server/lib/narrator-utils");
+				const { authorizeAgentControl } = await import("@server/services/narrator-control");
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 
-				const narrator = await narratorService.getById(targetId).catch(() => null);
-				if (!narrator) {
+				if (!(await narratorService.getById(targetId).catch(() => null))) {
 					return {
 						output: `Agent unarchive error: no subagent found for "${raw.unarchive}".`,
 						isError: true,
 					};
 				}
-				if (!isSubagentVariant(narrator.variant)) {
-					return {
-						output: `Agent unarchive error: "${raw.unarchive}" is not a subagent.`,
-						isError: true,
-					};
-				}
-				if (narrator.parentNarratorId !== ctx.narratorId) {
+				// Archiving is a control action: only the registered controller may do it.
+				const narrator = await authorizeAgentControl({
+					callerNarratorId: ctx.narratorId,
+					targetNarratorId: targetId,
+					action: "archive",
+					userId: ctx.userId,
+				}).catch(() => null);
+				if (!narrator) {
 					return {
 						output: `Agent unarchive error: "${raw.unarchive}" is not a direct child subagent of this narrator.`,
 						isError: true,

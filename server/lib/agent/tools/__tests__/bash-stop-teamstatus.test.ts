@@ -1,5 +1,11 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+	compileDelegationPolicy,
+	resolveRuntimePolicy,
+	UNRESTRICTED_RUNTIME_POLICY,
+} from "@server/services/agent-runtime/policy";
 import * as oauthRuntime from "@server/services/oauth-narrator-runtime-policy";
+import * as traitLayers from "@server/services/trait-layer-service";
 import {
 	getUpdateCoordinationStatus,
 	resetUpdateCoordinationForTests,
@@ -48,6 +54,9 @@ const realNarratorServiceModule = {
 };
 const realNarratorSubagentModule = {
 	...(await import("@server/services/narrator-subagent")),
+};
+const realAgentRuntimeRunModule = {
+	...(await import("@server/services/agent-runtime/run")),
 };
 
 const fakeBackgroundTaskService = {
@@ -276,14 +285,19 @@ const teamFileChanges = new Map<string, Map<string, Set<string>>>();
 const deliveredMessages: DeliveredMessage[] = [];
 let deliveryHook: ((targetId: string) => Promise<string | undefined>) | undefined;
 
-mock.module("@server/services/narrator-subagent", () => ({
-	async cancelBackgroundTask(narratorId: string) {
-		cancelledAgents.push(narratorId);
-		const task = [...tasks.values()].find((task) => task.subagentNarratorId === narratorId);
-		if (!task || task.status !== "running") return false;
-		task.status = "cancelled";
-		return true;
+// Stop(agent) cancels through the task handle (its registered abort controller is the
+// run's cancel signal) or, with no live task, the run control itself. Both cancellers
+// are observed: `cancelled` (task handle) and `cancelledAgents` (run control).
+const liveRuns = new Set<string>();
+mock.module("@server/services/agent-runtime/run", () => ({
+	...realAgentRuntimeRunModule,
+	async controlRun(narratorId: string, action: { kind: string }) {
+		cancelledAgents.push(`${action.kind}:${narratorId}`);
+		return action.kind === "cancel" && liveRuns.delete(narratorId);
 	},
+}));
+
+mock.module("@server/services/narrator-subagent", () => ({
 	registerTaskAlias(_parentNarratorId: string, _taskId: string, title?: string) {
 		return { alias: title || "background-bash", conflicted: false };
 	},
@@ -329,13 +343,18 @@ mock.module("@server/services/agent-communication", () => ({
 	},
 }));
 
-// These in-memory narrator fixtures are ordinary (non-OAuth) sessions.
+// These in-memory narrator fixtures are ordinary (non-OAuth) sessions with no stored
+// ceiling; the real ceiling path is covered by narrator-unified-runtime-contract.test.ts.
 spyOn(oauthRuntime, "assertOAuthNarratorRuntimeActive").mockResolvedValue(null);
+const ceilingSpy = spyOn(traitLayers, "resolveNarratorRuntimePolicy").mockResolvedValue(
+	UNRESTRICTED_RUNTIME_POLICY,
+);
 
 afterAll(() => {
 	mock.module("@server/services/background-task-service", () => realBackgroundTaskServiceModule);
 	mock.module("@server/services/narrator-service", () => realNarratorServiceModule);
 	mock.module("@server/services/narrator-subagent", () => realNarratorSubagentModule);
+	mock.module("@server/services/agent-runtime/run", () => realAgentRuntimeRunModule);
 	mock.module("@server/services/agent-communication", () => realAgentCommunicationModule);
 	mock.restore();
 });
@@ -358,6 +377,7 @@ function seed() {
 	killHandlers.clear();
 	cancelled.length = 0;
 	cancelledAgents.length = 0;
+	liveRuns.clear();
 	narrators.clear();
 	teamFileChanges.clear();
 	deliveredMessages.length = 0;
@@ -820,17 +840,34 @@ describe("Stop tool", () => {
 	for (const selector of ["agent-task", "agent-alias"]) {
 		test(`agent stop resolves ${selector} and cancels the validated child narrator`, async () => {
 			seedAgentTask();
+			// The run registers its cancel signal as the task's abort controller.
+			const runCancel = new AbortController();
+			abortControllers.set("agent-task", runCancel);
 			const result = await stopTool.execute(
 				{ type: "agent", id: ` ${selector} ` },
 				makeCtx("parent"),
 			);
 			expect(result.isError).toBeFalsy();
 			expect(result.output).toContain("cancelled");
-			expect(cancelledAgents).toEqual(["child-agent"]);
-			expect(cancelled).toEqual([]);
+			expect(cancelled).toEqual(["agent-task"]);
+			expect(runCancel.signal.aborted).toBe(true);
+			expect(cancelledAgents).toEqual([]);
 			expect(tasks.get("agent-task")?.status).toBe("cancelled");
 		});
 	}
+
+	test("agent stop cancels a live run directly when its task handle is no longer running", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.status = "completed";
+		liveRuns.add("child-agent");
+		const result = await stopTool.execute({ type: "agent", id: "agent-task" }, makeCtx("parent"));
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("cancelled");
+		expect(cancelled).toEqual([]);
+		expect(cancelledAgents).toEqual(["cancel:child-agent"]);
+		expect(task.status).toBe("completed");
+	});
 
 	function seedAgentTask() {
 		seed();
@@ -854,13 +891,18 @@ describe("Stop tool", () => {
 		});
 	}
 
-	test("subagents cannot stop their own child agents through Stop", async () => {
+	test("a ceiling without orchestration cannot stop agents, even ones it controls", async () => {
 		seedAgentTask();
+		// Same rule for any caller: the delegation template's ceiling denies spawnAgent.
+		ceilingSpy.mockResolvedValueOnce(
+			resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]),
+		);
 		const result = await stopTool.execute(
 			{ type: "agent", id: "agent-task" },
 			makeCtx("parent", "grandparent"),
 		);
 		expect(result.isError).toBe(true);
+		expect(result.output).toContain("capability ceiling");
 		expect(cancelledAgents).toEqual([]);
 		expect(cancelled).toEqual([]);
 	});

@@ -8,21 +8,17 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	runtimePublicationOutbox,
 	users,
 } from "../../db/schema";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { narratorRoutes } from "../../routes/narrators";
+import { getRunHold, setRunHold } from "../agent-runtime/ownership";
+import { runtimePublication } from "../agent-runtime/publication";
+import { controlRun } from "../agent-runtime/run";
 import { narratorPersistence } from "../narrator-persistence";
 import { narratorService } from "../narrator-service";
-import {
-	clearTakenOver,
-	getConclusionWatcher,
-	isTakenOver,
-	markTakenOver,
-	registerConclusionWatcher,
-	removeConclusionWatcher,
-} from "../narrator-subagent";
 import * as subagentFileChanges from "../subagent-file-changes";
 
 const createdUsers: string[] = [];
@@ -956,16 +952,21 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 	}
 
 	for (const failure of ["binding", "write"]) {
-		test(`stop takeover retains watcher and state after ${failure} failure, then retries after COW`, async () => {
+		test(`stop takeover retains the hold after ${failure} failure, then retries after COW`, async () => {
 			const f = fixture();
 			share(f.parent.messageId, narrator(f.own.ownerUserId).id);
-			markTakenOver(f.subagent.id);
-			db.update(narrators)
-				.set({ substatus: JSON.stringify(["taken_over"]) })
-				.where(eq(narrators.id, f.subagent.id))
-				.run();
-			registerConclusionWatcher(f.subagent.id, f.own.id, f.parent.toolUseId, f.parent.id);
-			const watcher = getConclusionWatcher(f.subagent.id);
+			const run = runtimePublication.startAgentRun({
+				narratorId: f.subagent.id,
+				parentNarratorId: f.own.id,
+				binding: {
+					deliverTo: {
+						narratorId: f.own.id,
+						toolUseId: f.parent.toolUseId,
+						toolCallId: f.parent.id,
+					},
+				},
+			});
+			await controlRun(f.subagent.id, { kind: "hold" });
 			if (failure === "binding") removeRef(f.parent.messageId, f.own.id);
 			else
 				spyOn(narratorService, "updateToolCallResult").mockRejectedValueOnce(
@@ -976,8 +977,7 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 				method: "POST",
 			});
 			expect(failed.status).toBe(failure === "binding" ? 400 : 500);
-			expect(getConclusionWatcher(f.subagent.id)).toBe(watcher);
-			expect(isTakenOver(f.subagent.id)).toBe(true);
+			expect(getRunHold(f.subagent.id)).toBeDefined();
 			expect((await narratorService.getById(f.subagent.id)).substatus).toContain("taken_over");
 			if (failure === "binding") share(f.parent.messageId, f.own.id);
 			const retried = await app.request(`/api/narrators/${f.subagent.id}/stop-takeover`, {
@@ -985,8 +985,20 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 			});
 			expect(retried.status).toBe(200);
 			expect(await retried.json()).toEqual({ stopped: true, deferred: false });
-			expect(getConclusionWatcher(f.subagent.id)).toBeUndefined();
-			expect(isTakenOver(f.subagent.id)).toBe(false);
+			expect(getRunHold(f.subagent.id)).toBeUndefined();
+			expect((await narratorService.getById(f.subagent.id)).substatus).not.toContain("taken_over");
+			// The released result is published exactly once for the run that was held.
+			const published = db
+				.select({ eventKind: runtimePublicationOutbox.eventKind })
+				.from(runtimePublicationOutbox)
+				.where(
+					and(
+						eq(runtimePublicationOutbox.taskId, f.subagent.id),
+						eq(runtimePublicationOutbox.logicalRunId, run.logicalRunId),
+					),
+				)
+				.all();
+			expect(published).toEqual([{ eventKind: "completed" }]);
 			const reference = await narratorPersistence.resolveSubagentConclusionReference(
 				f.subagent.id,
 				f.own.id,
@@ -1002,11 +1014,11 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 
 afterEach(() => {
 	mock.restore();
-	for (const narratorId of createdNarrators) {
-		clearTakenOver(narratorId);
-		removeConclusionWatcher(narratorId);
-	}
+	for (const narratorId of createdNarrators) setRunHold(narratorId, undefined);
 	if (createdNarrators.length > 0) {
+		db.delete(runtimePublicationOutbox)
+			.where(inArray(runtimePublicationOutbox.taskId, createdNarrators))
+			.run();
 		db.update(narrators)
 			.set({ parentNarratorId: null, forkMessageId: null })
 			.where(inArray(narrators.id, createdNarrators))

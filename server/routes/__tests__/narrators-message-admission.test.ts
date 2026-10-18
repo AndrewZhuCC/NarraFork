@@ -24,15 +24,7 @@ const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
 		section('narratorRoutes.post("/:id/messages"', "// Retry last user message"),
 	]
 		.join("\n")
-		.replaceAll("export async function", "async function")
-		.replace(
-			/import\(\s*"\.\.\/services\/narrator-subagent"\s*\)/g,
-			"Promise.resolve(subagentQueue)",
-		)
-		.replace(
-			/import\(\s*"\.\.\/services\/subagent-executor"\s*\)/g,
-			"Promise.resolve(subagentQueue)",
-		),
+		.replaceAll("export async function", "async function"),
 );
 
 function fixture(
@@ -77,16 +69,9 @@ function fixture(
 	const legacyPush = mock(() => {
 		throw new Error("Primary admission bypassed");
 	});
-	const pushSub = mock(async (_id: string, _prompt: string, _options: Record<string, unknown>) => ({
-		ok: true,
-		id: "sub-queued",
-		bufferedAt: "now",
-	}));
-	const resume = mock(async (_options: Record<string, unknown>) => ({ userMessage: userMsg }));
 	const updateModel = mock(async () => {});
 	const modelBroadcast = mock(() => {});
 	const restoreModel = mock(async () => {});
-	const awaitCompact = mock(async () => {});
 	const broadcast = mock(() => {});
 	const saveRecording = mock(async (_id: string) => ({
 		id: "saved-recording",
@@ -125,13 +110,11 @@ function fixture(
 			}),
 			updateModel,
 		},
-		isSubagentVariant: (variant: string) => variant === "subagent",
 		isLoopRunning: () => !!options.busy,
 		isNarratorRuntimeBusy: () => options.runtimeBusy ?? !!options.busy,
 		isExecutionSuspended: () => false,
 		getQueueDuringCompaction: () => true,
 		isCompactInProgress: () => !!options.compact,
-		awaitCompactCompletion: awaitCompact,
 		reconcileRunningStatus: async () => {
 			status = options.busy ? "working" : "idle";
 		},
@@ -165,12 +148,6 @@ function fixture(
 		acceptUserMessage: accept,
 		sendMessage: legacySend,
 		pushBufferedMessage: legacyPush,
-		resumeSubagent: resume,
-		subagentQueue: {
-			bufferSubagentUserMessage: pushSub,
-			isTakenOver: () => true,
-			getSubagentBufferedMessagesAsync: async () => [],
-		},
 		toBufferSummary: (items: unknown[]) => items,
 		broadcastToNarrator: broadcast,
 		setTemporaryModelRestore: restoreModel,
@@ -209,13 +186,10 @@ function fixture(
 		accept,
 		legacySend,
 		legacyPush,
-		pushSub,
-		resume,
 		deletedImages,
 		updateModel,
 		modelBroadcast,
 		restoreModel,
-		awaitCompact,
 		broadcast,
 		post: (body: FormData | Record<string, unknown>) =>
 			app.request("http://localhost/narrators/session/messages", {
@@ -257,9 +231,6 @@ describe("save_dump immediate HTTP control", () => {
 		expect(f.accept).not.toHaveBeenCalled();
 		expect(f.legacySend).not.toHaveBeenCalled();
 		expect(f.legacyPush).not.toHaveBeenCalled();
-		expect(f.pushSub).not.toHaveBeenCalled();
-		expect(f.resume).not.toHaveBeenCalled();
-		expect(f.awaitCompact).not.toHaveBeenCalled();
 		expect(f.broadcast).not.toHaveBeenCalled();
 	});
 	test("save cleans up unused multipart uploads", async () => {
@@ -437,7 +408,6 @@ describe("primary HTTP message admission", () => {
 			const f = fixture({ compact: true, buffered: true });
 			expect((await f.post({ message: "hello", interrupt })).status).toBe(202);
 			expect(f.accept.mock.calls[0]?.[2].queueOnly).toBe(!interrupt);
-			expect(f.awaitCompact).not.toHaveBeenCalled();
 		}
 	});
 
@@ -509,31 +479,55 @@ describe("primary HTTP message admission", () => {
 	});
 });
 
+// A delegated session is sent to through the same admission as any session: the same
+// queue, the same intent scheduling, the same status codes. 201 = the input was claimed
+// and delivered now (response is the persisted user message); 202 = it was accepted
+// into the session's mailbox and will be consumed by the running/next run.
 describe("subagent HTTP compatibility", () => {
-	test("busy subagent uses its existing queue, ignoring primary interrupt intent", async () => {
-		const f = fixture({ subagent: true, status: "working", busy: true });
+	test.each([
+		false,
+		true,
+	])("busy session queues and schedules interrupt intent identically (subagent=%s)", async (subagent) => {
+		const f = fixture({ subagent, status: "working", busy: true, buffered: true });
 		const response = await f.post(multipart("true"));
 		expect(response.status).toBe(202);
-		expect(await response.json()).toEqual({ buffered: true, id: "sub-queued", bufferedAt: "now" });
-		expect(f.accept).not.toHaveBeenCalled();
-		expect(f.pushSub.mock.calls[0]?.[2]).toMatchObject({ requestSoftStop: false });
-		expect(f.pushSub.mock.calls[0]?.[2].interrupt).toBeUndefined();
-		expect(!!f.pushSub.mock.calls[0]?.[2].priority).toBe(false);
+		expect(await response.json()).toEqual({
+			buffered: true,
+			id: "queued-message",
+			bufferedAt: "now",
+		});
+		expect(f.accept).toHaveBeenCalledTimes(1);
+		// Interrupt intent reaches admission for every session; admission cancels the
+		// current activity and handles this input next, inside the same run.
+		expect(f.accept.mock.calls[0]?.[2]).toMatchObject({ interrupt: true, priority: true });
+		expect(f.accept.mock.calls[0]?.[2].queueOnly).toBe(false);
+		expect(f.legacySend).not.toHaveBeenCalled();
+		expect(f.legacyPush).not.toHaveBeenCalled();
+		// The mailbox owns the uploads now.
 		expect(f.deletedImages).toEqual([]);
 	});
 
 	test("explicit subagent priority is still passed through", async () => {
-		const f = fixture({ subagent: true, status: "working", busy: true });
+		const f = fixture({ subagent: true, status: "working", busy: true, buffered: true });
 		expect((await f.post({ message: "hello", priority: true })).status).toBe(202);
-		expect(f.pushSub.mock.calls[0]?.[2].priority).toBe(true);
+		expect(f.accept.mock.calls[0]?.[2]).toMatchObject({ priority: true, interrupt: undefined });
 	});
 
-	test("idle compacting subagent waits then resumes, ignoring interrupt", async () => {
-		const f = fixture({ subagent: true, compact: true });
-		expect((await f.post({ message: "hello", interrupt: true })).status).toBe(201);
-		expect(f.awaitCompact).toHaveBeenCalledTimes(1);
-		expect(f.resume).toHaveBeenCalledTimes(1);
-		expect(f.resume.mock.calls[0]?.[0].interrupt).toBeUndefined();
-		expect(f.accept).not.toHaveBeenCalled();
+	test("idle subagent send is delivered immediately (201)", async () => {
+		const f = fixture({ subagent: true });
+		const response = await f.post({ message: "hello" });
+		expect(response.status).toBe(201);
+		expect((await response.json()).id).toBe("user-message");
+		expect(f.accept).toHaveBeenCalledTimes(1);
+	});
+
+	test("idle compacting subagent queues behind the compaction; interrupt opts out", async () => {
+		for (const interrupt of [false, true]) {
+			const f = fixture({ subagent: true, compact: true, buffered: true });
+			expect((await f.post({ message: "hello", interrupt })).status).toBe(202);
+			// queueOnly: accepted durably, consumed by the post-compact drain, not now.
+			expect(f.accept.mock.calls[0]?.[2]).toMatchObject({ queueOnly: !interrupt });
+			expect(f.accept.mock.calls[0]?.[2].interrupt).toBe(interrupt);
+		}
 	});
 });

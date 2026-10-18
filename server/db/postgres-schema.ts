@@ -395,6 +395,11 @@ export const narrators = pgTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "set null",
 		}),
+		runtimeRegistrationJson: jsonText("runtime_registration_json"),
+		policySourceNarratorId: text("policy_source_narrator_id").references(
+			(): PgColumn => narrators.id,
+			{},
+		),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 		insertSeq: bigint("insert_seq", { mode: "number" }).notNull().generatedByDefaultAsIdentity(),
@@ -412,6 +417,7 @@ export const narrators = pgTable(
 		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_write_audience").on(table.writeAudience),
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
+		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
@@ -453,6 +459,42 @@ export const narratorGrants = pgTable(
 		index("idx_narrator_grant_principal").on(table.principalType, table.principalId),
 		index("idx_narrator_grant_narrator").on(table.narratorId),
 		index("idx_narrator_grant_granted_by").on(table.grantedBy),
+	],
+);
+
+export const narratorEventSubscriptions = pgTable(
+	"narrator_event_subscriptions",
+	{
+		id: text("id").primaryKey().notNull(),
+		sourceNarratorId: text("source_narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		recipientNarratorId: text("recipient_narrator_id").notNull(),
+		runId: text("run_id"),
+		events: jsonText("events").notNull(),
+		wake: boolean("wake").notNull().default(false),
+		origin: text("origin").notNull(),
+		authorizedByUserId: text("authorized_by_user_id").references((): PgColumn => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_narrator_event_sub_source_run").on(table.sourceNarratorId, table.runId),
+		index("idx_narrator_event_sub_recipient").on(table.recipientNarratorId),
+		index("idx_narrator_event_sub_authorized_by").on(table.authorizedByUserId),
+		uniqueIndex("idx_narrator_event_sub_session_unique")
+			.on(table.sourceNarratorId, table.recipientNarratorId)
+			.where(sql.raw('"run_id" IS NULL')),
+		uniqueIndex("idx_narrator_event_sub_run_unique")
+			.on(table.sourceNarratorId, table.recipientNarratorId, table.runId)
+			.where(sql.raw('"run_id" IS NOT NULL')),
+		foreignKey({
+			name: "narrator_event_subscriptions_recipient_narrator_i_cea958b39a_fk",
+			columns: [table.recipientNarratorId],
+			foreignColumns: [narrators.id],
+		}).onDelete("cascade"),
 	],
 );
 
@@ -3841,8 +3883,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 121,
-  "columnCount": 1720,
+  "tableCount": 122,
+  "columnCount": 1732,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6419,6 +6461,31 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "runtimeRegistrationJson",
+          "name": "runtime_registration_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "policySourceNarratorId",
+          "name": "policy_source_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "constraintName": "narrators_policy_source_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -6505,6 +6572,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_acl_root",
           "columns": [
             "aclRootNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_policy_source",
+          "columns": [
+            "policySourceNarratorId"
           ],
           "unique": false
         },
@@ -6700,6 +6774,175 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "grantedBy"
           ],
           "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorEventSubscriptions",
+      "name": "narrator_event_subscriptions",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "sourceNarratorId",
+          "name": "source_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_event_subscriptions_source_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "recipientNarratorId",
+          "name": "recipient_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_event_subscriptions_recipient_narrator_i_cea958b39a_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "runId",
+          "name": "run_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "events",
+          "name": "events",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "wake",
+          "name": "wake",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "origin",
+          "name": "origin",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "authorizedByUserId",
+          "name": "authorized_by_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_event_subscriptions_authorized_by_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_narrator_event_sub_source_run",
+          "columns": [
+            "sourceNarratorId",
+            "runId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrator_event_sub_recipient",
+          "columns": [
+            "recipientNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrator_event_sub_authorized_by",
+          "columns": [
+            "authorizedByUserId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrator_event_sub_session_unique",
+          "columns": [
+            "sourceNarratorId",
+            "recipientNarratorId"
+          ],
+          "unique": true,
+          "predicate": "\"run_id\" IS NULL"
+        },
+        {
+          "name": "idx_narrator_event_sub_run_unique",
+          "columns": [
+            "sourceNarratorId",
+            "recipientNarratorId",
+            "runId"
+          ],
+          "unique": true,
+          "predicate": "\"run_id\" IS NOT NULL"
         }
       ],
       "checks": [],

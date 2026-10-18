@@ -196,7 +196,7 @@ function enqueue(user = false) {
 				},
 	);
 	if (result.status !== "accepted") throw new Error(result.status);
-	const owner = getExecutionOwner("recipient") ?? tryClaimExecution("recipient", "primary");
+	const owner = getExecutionOwner("recipient") ?? tryClaimExecution("recipient", "run");
 	if (!owner) throw new Error("Test execution owner unavailable");
 	const row = store.claimBatch("recipient", { token: key, epoch: owner.epoch })[0] as MailboxRow;
 	const claim: MailboxClaim = {
@@ -355,7 +355,7 @@ test.each([
 	"user_input",
 	"task_notice",
 ] as const)("generic %s adoption survives a cold history build, while prepare/abort does not acknowledge", async (kind) => {
-	const owner = tryClaimExecution("recipient", "primary");
+	const owner = tryClaimExecution("recipient", "run");
 	if (!owner) throw new Error("Missing test owner");
 	const input = { narratorId: "recipient", text: "durable input", projectedByteSize: 13 };
 	const accepted = store.enqueue(
@@ -637,7 +637,7 @@ test("fault after mailbox materialization rolls message/ref/mailbox back togethe
 test("released owner cannot materialize even while its persistent claim token remains valid", async () => {
 	const { row, claim } = enqueue();
 	getExecutionOwner("recipient")?.release();
-	const successor = tryClaimExecution("recipient", "primary");
+	const successor = tryClaimExecution("recipient", "run");
 	expect(successor?.epoch).not.toBe(claim.epoch);
 	await expect(persist(row, claim)).rejects.toThrow("Stale mailbox claim execution owner");
 	expect(ref(row.recipientMessageId as string)).toBeUndefined();

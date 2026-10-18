@@ -10,7 +10,7 @@ import {
 	users,
 } from "../../db/schema";
 import type { AgentConfig, ToolContext } from "../../lib/agent/types";
-import { resolveRuntimePolicy } from "../agent-runtime/policy";
+import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
 
 const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
@@ -324,7 +324,7 @@ describe("asynchronous question integration", () => {
 	 */
 	test("subagents cannot ask, and the advertised schema has no top-level combinator", () => {
 		for (const type of ["general", "explore", "plan", "review", "search", "missing-custom"]) {
-			const policy = resolveRuntimePolicy({ variant: "subagent", subagentType: type });
+			const policy = resolveRuntimePolicy([compileDelegationPolicy({ template: type })]);
 			expect(policy.capabilities.askUserQuestion).toBe("disabled");
 			// Waiting on a question that already exists is a separate capability.
 			expect(policy.capabilities.awaitOwnQuestion).toBe(true);
@@ -344,11 +344,9 @@ describe("asynchronous question integration", () => {
 			toolAccess: "custom" as const,
 			customTools: ["Read", "Await", "AskUserQuestion"],
 		};
-		const policy = resolveRuntimePolicy({
-			variant: "subagent",
-			subagentType: "custom",
-			customDefinition,
-		});
+		const policy = resolveRuntimePolicy([
+			compileDelegationPolicy({ template: "custom", customDefinition }),
+		]);
 		expect(policy.capabilities.askUserQuestion).toBe("disabled");
 		expect(policy.capabilities.awaitOwnQuestion).toBe(true);
 		const filter = resolveToolFilter("custom", {
@@ -474,10 +472,10 @@ describe("asynchronous question integration", () => {
 			context: "Cache choice for this task; continue with Memory while waiting.",
 			questions: QUESTIONS,
 			// Approval binds this exact input; authority still comes only from AgentConfig.
-			runtimePolicy: resolveRuntimePolicy({ variant: "subagent", subagentType: "general" }),
+			runtimePolicy: resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]),
 		};
 		const ctx = await seedCall(PARENT, input);
-		const policy = resolveRuntimePolicy({ variant: "primary" });
+		const policy = resolveRuntimePolicy([]);
 		const config: AgentConfig = {
 			narratorId: PARENT,
 			conversationId: "p5-real-execution",

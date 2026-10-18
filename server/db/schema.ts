@@ -870,6 +870,25 @@ export const narrators = sqliteTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): any => narrators.id, {
 			onDelete: "set null",
 		}),
+		/**
+		 * Bounded runtime relationships of this narrator: policy source, controller
+		 * grant and the current run binding (cancel source, result delivery, principal,
+		 * deadline, history boundary). Facts only — capabilities live in traits and
+		 * model/permission settings in their own columns. Validated by
+		 * `lib/validators/runtime-registration.ts`; null = nothing registered.
+		 */
+		runtimeRegistrationJson: text("runtime_registration_json", { mode: "json" }).$type<
+			import("../lib/validators/runtime-registration").RuntimeRegistration
+		>(),
+		/**
+		 * Session this narrator takes its capability ceiling, execution rules, permission
+		 * mode updates and followed model from. Any narrator may be a source; no parent/
+		 * child relationship is implied. A column (not part of the registration JSON) so
+		 * dependents can be found through an index and a source cannot be deleted while
+		 * still in use — a vanished source must never silently widen its dependents.
+		 */
+		// biome-ignore lint/suspicious/noExplicitAny: self-module forward reference
+		policySourceNarratorId: text("policy_source_narrator_id").references((): any => narrators.id),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -907,6 +926,8 @@ export const narrators = sqliteTable(
 		// Join key for the subagent -> root delegation in the readable predicate, and the
 		// FK covering index for root deletion (ON DELETE SET NULL).
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
+		// Dependents of a policy source (permission-mode propagation, deletion guard).
+		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
@@ -994,6 +1015,58 @@ export const narratorGrants = sqliteTable(
 		index("idx_narrator_grant_narrator").on(table.narratorId),
 		// FK covering index for user deletion.
 		index("idx_narrator_grant_granted_by").on(table.grantedBy),
+	],
+);
+
+// === narrator_event_subscriptions ===
+/**
+ * Who receives which terminal events of which narrator. A registration table, not a
+ * queue: delivery reuses the existing publication outbox/mailbox. Source and recipient
+ * are any two narrators — no parent/child relationship is implied or required, and a
+ * subscription grants nothing beyond receiving the listed events.
+ *
+ * `runId` null = every run of the source; otherwise only that logical run. One row per
+ * (source, recipient, scope); re-registering updates `events`/`wake` in place.
+ */
+export const narratorEventSubscriptions = sqliteTable(
+	"narrator_event_subscriptions",
+	{
+		id: text("id").primaryKey(),
+		sourceNarratorId: text("source_narrator_id")
+			.notNull()
+			// biome-ignore lint/suspicious/noExplicitAny: self-module forward reference
+			.references((): any => narrators.id, { onDelete: "cascade" }),
+		recipientNarratorId: text("recipient_narrator_id")
+			.notNull()
+			// biome-ignore lint/suspicious/noExplicitAny: self-module forward reference
+			.references((): any => narrators.id, { onDelete: "cascade" }),
+		/** Source logical run this subscription is limited to; null = session-wide. */
+		runId: text("run_id"),
+		events: text("events", { mode: "json" })
+			.$type<import("../lib/validators/runtime-registration").NarratorTerminalEvent[]>()
+			.notNull(),
+		/** Whether delivery may start an idle recipient; otherwise it only lands in the inbox. */
+		wake: integer("wake", { mode: "boolean" }).notNull().default(false),
+		origin: text("origin", { enum: ["delegation", "explicit"] }).notNull(),
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
+		authorizedByUserId: text("authorized_by_user_id").references((): any => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_narrator_event_sub_source_run").on(table.sourceNarratorId, table.runId),
+		index("idx_narrator_event_sub_recipient").on(table.recipientNarratorId),
+		// FK covering index for user deletion.
+		index("idx_narrator_event_sub_authorized_by").on(table.authorizedByUserId),
+		// NULL run ids are distinct in a plain unique index, so each scope gets its own.
+		uniqueIndex("idx_narrator_event_sub_session_unique")
+			.on(table.sourceNarratorId, table.recipientNarratorId)
+			.where(sql`"run_id" IS NULL`),
+		uniqueIndex("idx_narrator_event_sub_run_unique")
+			.on(table.sourceNarratorId, table.recipientNarratorId, table.runId)
+			.where(sql`"run_id" IS NOT NULL`),
 	],
 );
 

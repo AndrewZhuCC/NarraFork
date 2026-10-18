@@ -39,6 +39,7 @@ import {
 	permissionRuleConflictKey,
 	permissionRuleService,
 } from "./permission-rule-service";
+import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 export const PERMISSION_RULE_REQUEST_TTL_MS = 300_000;
 function requestExpired(createdAt: string): boolean {
@@ -86,6 +87,19 @@ export interface PermissionRuleRequestIdentity {
 	narratorId: string;
 	toolUseId: string;
 	binding: ToolCallBinding;
+	/** Execution principal of the requesting run; the ceiling is resolved for it. */
+	actingUserId?: string | null;
+}
+/** Read-only ceilings (traits, including a followed policy source) cannot add mutable policy. */
+async function assertMutablePolicyCeiling(identity: PermissionRuleRequestIdentity): Promise<void> {
+	const ceiling = await resolveNarratorRuntimePolicy(
+		identity.narratorId,
+		identity.actingUserId ?? null,
+	);
+	if (ceiling.tools.readOnly || ceiling.readOnlyGitShell)
+		throw new ValidationError(
+			"Review/read-only/OAuth capability ceilings cannot request mutable policy",
+		);
 }
 export interface PreparedPermissionRuleRequest {
 	requestId: string;
@@ -128,12 +142,7 @@ const contextColumns = {
 function loadIdentity(narratorId: string) {
 	const row = db.select(contextColumns).from(narrators).where(eq(narrators.id, narratorId)).get();
 	if (!row) throw new ValidationError("Narrator no longer exists");
-	if (
-		row.variant === "subagent:review" ||
-		row.variant === "subagent:explore" ||
-		row.variant === "subagent:plan" ||
-		row.oauthPolicySnapshotJson
-	) {
+	if (row.oauthPolicySnapshotJson) {
 		throw new ValidationError(
 			"Review/read-only/OAuth capability ceilings cannot request mutable policy",
 		);
@@ -152,6 +161,7 @@ async function liveRevision(
 	context: ExecutionTargetContext,
 ) {
 	const narrator = loadIdentity(identity.narratorId);
+	await assertMutablePolicyCeiling(identity);
 	const current = await createExecutionTargetContext({
 		backend: context.backend,
 		target: { ...context.target },
@@ -682,6 +692,8 @@ async function consumeBoundPermissionRuleRequest(
 		createdAt: new Date().toISOString(),
 		updatedAt: new Date().toISOString(),
 	};
+	// The ceiling can narrow between approval and commit; re-check it last.
+	await assertMutablePolicyCeiling(identity);
 	const result = db.transaction((tx) => {
 		assertBinding(identity, tx);
 		const latest = tx

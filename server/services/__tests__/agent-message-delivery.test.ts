@@ -36,32 +36,35 @@ mock.module("../../lib/agent", () => ({
 }));
 const { narratorService } = await import("../narrator-service");
 const { deliverInjection } = await import("../narrator-injection");
-const realResume = { ...(await import("../subagent-resume")) };
-let resumeFails = false;
-mock.module("../subagent-resume", () => ({
-	...realResume,
-	resumeSubagent: async (input: import("../subagent-resume").ResumeSubagentInput) => {
-		if (resumeFails) throw new Error("resume rejected");
-		const userMessage = await narratorService.persistSubagentUserMessage(
-			input.subagentId,
-			input.prompt ?? "",
-			"origin",
-			{ delivery: input.delivery, createdBy: input.createdBy },
-		);
-		return { started: true, userMessage };
+// The model boundary of an idle wake: a Send to an idle session starts its ordinary run.
+// Record the start; the message itself is already materialized in the session's history.
+const runModule = { ...(await import("../agent-runtime/run")) };
+const runStarts: Array<{ narratorId: string; text: string }> = [];
+mock.module("../agent-runtime/run", () => ({
+	...runModule,
+	startNarratorRun: async (request: { narratorId: string; text: string }) => {
+		runStarts.push({ narratorId: request.narratorId, text: request.text });
+		const idle = Promise.resolve({
+			started: true,
+			output: "",
+			finalText: "",
+			hasError: false,
+			interrupted: false,
+			timedOut: false,
+		});
+		return { started: true, foreground: idle, terminal: idle, completion: idle };
 	},
 }));
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
+const { drainInjectionsIntoHistory } = await import("../narrator-session");
+const { buildRuntimeHistory } = await import("../agent-runtime/history");
 const {
-	clearSubagentBufferedMessages,
-	consumeNextBufferedSubagentMessage,
-	consumeBufferedSubagentMessageInPass,
-	executeSubagent,
-	getSubagentBufferedMessages,
-	pushSubagentBufferedMessage,
-	reorderSubagentBufferedMessages,
-	updateSubagentBufferedMessage,
-} = await import("../subagent-executor");
+	clearBufferedMessages,
+	enqueueBufferedMessage,
+	getBufferedMessages,
+	reorderBufferedMessages,
+	updateBufferedMessage,
+} = await import("../narrator-buffer");
 const { clearTeamInbox, deliverTeamMessage, drainTeamInbox, projectTeamMessage } = await import(
 	"../subagent-team"
 );
@@ -79,10 +82,27 @@ async function agentQueued(id = "child") {
 		text: inboxAgentText(row),
 	}));
 }
-async function inPass(input: Parameters<typeof consumeBufferedSubagentMessageInPass>[0]) {
-	const owner = tryClaimExecution(input.narratorId, "primary");
+/** The running session `narratorId` whose run delivers to the parent's "origin" call. */
+function runningSession(narratorId = "child", currentUserId?: string | null) {
+	return {
+		narratorId,
+		cwd: ".",
+		locale: "en",
+		_currentUserId: currentUserId,
+		_tasksReminderInterval: -1,
+		_fenceInterval: -1,
+	} as Parameters<typeof drainInjectionsIntoHistory>[0];
+}
+/** One tool-boundary drain of a running pass, as its execution owner. */
+async function inPass(input: { narratorId: string; currentUserId?: string | null }) {
+	const owner = tryClaimExecution(input.narratorId, "run");
 	try {
-		return await consumeBufferedSubagentMessageInPass(input);
+		const drained = await drainInjectionsIntoHistory(
+			runningSession(input.narratorId, input.currentUserId),
+			"en",
+			{ parentNarratorId: "parent", parentToolUseId: "origin" },
+		);
+		return drained.parts.length ? drained : null;
 	} finally {
 		owner?.release();
 	}
@@ -91,7 +111,7 @@ const now = "2026-09-08T12:00:00.000Z";
 function seed(id: string, parent: string | null, status = "working") {
 	sqlite
 		.prepare(
-			"INSERT INTO narrators (id, type, variant, parent_narrator_id, status, is_background, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO narrators (id, type, variant, parent_narrator_id, status, is_background, runtime_registration_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		)
 		.run(
 			id,
@@ -100,6 +120,16 @@ function seed(id: string, parent: string | null, status = "working") {
 			parent,
 			status,
 			parent ? 1 : 0,
+			// A delegated run delivers to its creating Agent call (registered at run start).
+			parent
+				? JSON.stringify({
+						version: 1,
+						run: {
+							logicalRunId: `${id}-run`,
+							deliverTo: { narratorId: parent, toolUseId: "origin" },
+						},
+					})
+				: null,
 			now,
 			now,
 		);
@@ -166,35 +196,75 @@ function consumedAt(messageId: string | undefined, narratorId = "child") {
 	);
 }
 
+/**
+ * The next pass of the child's run: adopt what is queued at its boundary, then build the
+ * model history the pass sends. Null when nothing was queued.
+ */
 async function consume() {
-	return consumeNextBufferedSubagentMessage({
-		narratorId: "child",
-		parentNarratorId: "parent",
-		toolUseId: "origin",
-		model: "test-model",
-		provider: "anthropic",
-		cwd: ".",
-	});
+	const owner = tryClaimExecution("child", "run");
+	try {
+		const drained = await drainInjectionsIntoHistory(runningSession(), "en", {
+			parentNarratorId: "parent",
+			parentToolUseId: "origin",
+		});
+		if (!drained.parts.length) return null;
+		const built = await buildRuntimeHistory({
+			narratorId: "child",
+			model: "test-model",
+			provider: "anthropic",
+		});
+		return { prompt: built.currentText, history: built.history };
+	} finally {
+		owner?.release();
+	}
+}
+
+/**
+ * A fresh run of the idle child for its queued human input (the session wake every
+ * session uses): the input is persisted once, then the run starts with it as its current
+ * input. Returns what the run's current input is, or null when nothing was delivered.
+ */
+async function restart() {
+	sqlite
+		.prepare("UPDATE narrators SET status = 'idle', cwd = ? WHERE id = 'child'")
+		.run(process.env.HOME ?? ".");
+	const before = runStarts.length;
+	const { resumeBufferedMessagesIfIdle } = await import("../narrator-session");
+	const { activeNarrators } = await import("../narrator-session-state");
+	try {
+		await resumeBufferedMessagesIfIdle("child", "en");
+		const started = runStarts.slice(before);
+		if (!started.length) return null;
+		const built = await buildRuntimeHistory({
+			narratorId: "child",
+			model: "test-model",
+			provider: "anthropic",
+			currentInput: started[0].text,
+		});
+		return { currentInput: started[0].text, prompt: built.currentText };
+	} finally {
+		activeNarrators.delete("child");
+	}
 }
 
 beforeEach(() => {
 	cleanDb(sqlite);
 	clearPendingAgentReplyWaits();
-	clearSubagentBufferedMessages("child");
+	clearBufferedMessages("child");
 	drainPendingInjections("parent");
 	clearTeamInbox("child");
 	clearTeamInbox("sibling");
 	broadcasts.length = 0;
-	resumeFails = false;
+	runStarts.length = 0;
 	seed("parent", null);
 	seed("child", "parent");
 	seed("sibling", "parent");
 });
 afterAll(() => {
 	clearPendingAgentReplyWaits();
-	clearSubagentBufferedMessages("child");
+	clearBufferedMessages("child");
 	drainPendingInjections("parent");
-	mock.module("../subagent-resume", () => realResume);
+	mock.module("../agent-runtime/run", () => runModule);
 	mock.module("../../websocket/narrator-ws", () => realWs);
 	mock.module("../../db", () => realDb);
 	mock.module("../../lib/agent", () => realAgent);
@@ -222,7 +292,8 @@ describe("Send exact delivery receipts", () => {
 		expect((await agentQueued())[0].delivery?.senderToolCallBinding).toEqual(binding);
 		const prepared = await consume();
 		const saved = row(id);
-		expect(JSON.parse(saved?.content_json ?? "[]")[1].body.items[0].fromToolCallBinding).toEqual(
+		// The Send is one injection row: its first block carries the exact delivery body.
+		expect(JSON.parse(saved?.content_json ?? "[]")[0].body.items[0].fromToolCallBinding).toEqual(
 			binding,
 		);
 		consumeAgentMessageHistory(prepared?.history ?? [], prepared?.prompt ?? "");
@@ -464,7 +535,7 @@ describe("Send exact delivery receipts", () => {
 			await markAgentMessageConsumed(delivery);
 			expect(consumedAt(id)).toBeNull();
 			expect(versions()).toEqual(before);
-			expect(getSubagentBufferedMessages("child")).toHaveLength(0);
+			expect(getBufferedMessages("child")).toHaveLength(0);
 		} finally {
 			sqlite.run("DROP TRIGGER fail_receipt_version");
 		}
@@ -491,7 +562,7 @@ describe("Send exact delivery receipts", () => {
 		try {
 			await expect(markAgentMessageConsumed(delivery)).resolves.toBeUndefined();
 			expect(consumedAt(id)).toBeNull();
-			expect(getSubagentBufferedMessages("child")).toHaveLength(0);
+			expect(getBufferedMessages("child")).toHaveLength(0);
 			expect(await consume()).toBeNull();
 			expect(
 				sqlite
@@ -578,21 +649,18 @@ describe("Send exact delivery receipts", () => {
 		expect(envelope.deliveryId).toBeString();
 		expect(envelope?.recipientMessageId).toBe(id as string);
 		const consumed = await consume();
-		expect(consumed?.prompt).toBe(
-			'<sender kind="agent" id="parent" name="parent" />\n[Message from the parent narrator]\nsame words',
-		);
+		expect(consumed).not.toBeNull();
+		// Materialized once as an injection row of the recipient, with the producer's framing.
 		expect(row(id)?.content_text).toBe("[Message from the parent narrator]\nsame words");
-		expect(consumed?.prompt.match(/same words/g)).toHaveLength(1);
-		expect(row(id)?.role).toBe("user");
-		expect(JSON.parse(row(id)?.content_json ?? "[]")[1]).toEqual({
+		expect(row(id)?.role).toBe("sys");
+		expect(JSON.parse(row(id)?.content_json ?? "[]")[0]).toMatchObject({
 			type: "system_injection",
 			source: "subagent_message",
 			body: agentMessageDeliveryBody(envelope as NonNullable<typeof envelope>),
 		});
-		const received = broadcasts.filter(({ event }) => event.type === "user_message");
-		expect(received).toHaveLength(2);
+		// One display frame per side (the recipient and the destination's tool card).
+		const received = broadcasts.filter(({ event }) => event.type === "message");
 		expect(received.map(({ target }) => target).sort()).toEqual(["child", "parent"]);
-		expect(received.every(({ event }) => (event.message as { id: string }).id === id)).toBe(true);
 		expect(await consume()).toBeNull();
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
@@ -604,27 +672,28 @@ describe("Send exact delivery receipts", () => {
 		const second = await send("sibling", "child", { toolUseId: "sibling-send" });
 		const ids = [first.targets[0].deliveryMessageId, second.targets[0].deliveryMessageId];
 		expect(ids[0]).not.toBe(ids[1]);
-		await reorderSubagentBufferedMessages(
+		await reorderBufferedMessages(
 			"child",
-			getSubagentBufferedMessages("child")
+			getBufferedMessages("child")
 				.map((item) => item.id)
 				.reverse(),
 		);
 		await consume();
 		await consume();
-		expect(JSON.parse(row(ids[0])?.content_json ?? "[]")[1].body.items[0].fromId).toBe("parent");
-		expect(JSON.parse(row(ids[1])?.content_json ?? "[]")[1].body.items[0].fromId).toBe("sibling");
+		expect(JSON.parse(row(ids[0])?.content_json ?? "[]")[0].body.items[0].fromId).toBe("parent");
+		expect(JSON.parse(row(ids[1])?.content_json ?? "[]")[0].body.items[0].fromId).toBe("sibling");
 	});
 
 	test("clearing user buffers preserves accepted agent delivery and identical human text stays separate", async () => {
 		const result = await send();
 		const reserved = result.targets[0].deliveryMessageId;
-		clearSubagentBufferedMessages("child");
+		clearBufferedMessages("child");
 		expect(await agentQueued()).toHaveLength(1);
-		await pushSubagentBufferedMessage("child", "[Message from the parent narrator]\nsame words");
-		await consume();
+		await enqueueBufferedMessage("child", "[Message from the parent narrator]\nsame words");
+		// The agent message is adopted at the boundary; the human input starts a new turn.
 		await consume();
 		expect(row(reserved)).not.toBeNull();
+		await restart();
 		const human = sqlite
 			.prepare(
 				"SELECT origin, content_json FROM narrator_messages WHERE narrator_id = 'child' AND origin = 'user'",
@@ -637,13 +706,14 @@ describe("Send exact delivery receipts", () => {
 	test("human buffer editing cannot rewrite an accepted agent message or its attribution", async () => {
 		const result = await send();
 		const queued = (await agentQueued())[0];
-		expect(await updateSubagentBufferedMessage("child", queued.id, "human correction")).toBe(false);
+		expect(await updateBufferedMessage("child", queued.id, "human correction")).toBe(false);
 		await consume();
 		expect(row(result.targets[0].deliveryMessageId)?.content_text).toContain("same words");
 		const actual = sqlite
 			.prepare("SELECT origin, content_text FROM narrator_messages WHERE narrator_id = 'child'")
 			.get() as { origin: string; content_text: string };
-		expect(actual.origin).toBe("assistant");
+		// Machine-authored, never attributed to a human editor.
+		expect(actual.origin).not.toBe("user");
 		expect(actual.content_text).not.toContain("human correction");
 	});
 
@@ -652,7 +722,7 @@ describe("Send exact delivery receipts", () => {
 			expect((await send()).targets[0].status).toBe("queued");
 		}
 		// User quota is independent of the full agent-message quota.
-		expect((await pushSubagentBufferedMessage("child", "pending")).ok).toBe(true);
+		expect((await enqueueBufferedMessage("child", "pending")).ok).toBe(true);
 		const result = await send();
 		expect(result.targets[0].status).toBe("failed");
 		expect(result.targets[0].deliveryMessageId).toBeUndefined();
@@ -661,21 +731,37 @@ describe("Send exact delivery receipts", () => {
 		).toHaveLength(0);
 	});
 
-	test("idle child passes its exact envelope into resume and returns the receiving row", async () => {
-		sqlite.prepare("UPDATE narrators SET status = 'idle' WHERE id = 'child'").run();
+	test("idle child receives its exact envelope and its ordinary run starts", async () => {
+		sqlite
+			.prepare("UPDATE narrators SET status = 'idle', cwd = ? WHERE id = 'child'")
+			.run(process.env.HOME ?? ".");
+		// An idle recipient resumes under its own registered anonymous identity, never the sender's.
+		sqlite
+			.prepare(
+				"UPDATE narrators SET runtime_registration_json = json_set(runtime_registration_json, '$.run.principal', json(?)) WHERE id = 'child'",
+			)
+			.run(JSON.stringify({ userId: null }));
 		const result = await send();
 		expect(result.targets[0].status).toBe("started");
+		// The run starts with no new input: the message is already in the session's history.
+		expect(runStarts).toEqual([{ narratorId: "child", text: "" }]);
 		expect(row(result.targets[0].deliveryMessageId)?.content_text).toBe(
 			"[Message from the parent narrator]\nsame words",
 		);
-		expect(getSubagentBufferedMessages("child")).toHaveLength(0);
+		expect(getBufferedMessages("child")).toHaveLength(0);
 	});
 
-	test("failed idle resume cannot label later human text", async () => {
-		sqlite.prepare("UPDATE narrators SET status = 'idle' WHERE id = 'child'").run();
-		resumeFails = true;
+	test("a wake that cannot start leaves the Send queued and never labels later human text", async () => {
+		// The recipient's last stop was the user's interrupt: an agent message alone does
+		// not restart it, so the message stays queued for the next eligible turn.
+		sqlite
+			.prepare(
+				"UPDATE narrators SET status = 'idle', cwd = ?, last_stop_reason = 'user_interrupt' WHERE id = 'child'",
+			)
+			.run(process.env.HOME ?? ".");
 		const result = await send();
 		expect(result.targets[0].status).toBe("queued");
+		expect(runStarts).toHaveLength(0);
 		expect(await agentQueued()).toHaveLength(1);
 		const human = await narratorService.persistSubagentUserMessage(
 			"child",
@@ -689,7 +775,7 @@ describe("Send exact delivery receipts", () => {
 		const result = await send("child", "parent");
 		const id = result.targets[0].deliveryMessageId;
 		expect(row(id)).toBeNull();
-		expect(tryClaimExecution("parent", "primary")).not.toBeNull();
+		expect(tryClaimExecution("parent", "run")).not.toBeNull();
 		const claimed = await claimInboxHead("parent", (row) => row.kind === "agent_message");
 		if (!claimed) throw new Error("Expected parent mailbox claim");
 		const [{ message }] = runItems([projectPendingInjection(claimed)], "subagent_message");
@@ -802,22 +888,23 @@ describe("Send exact delivery receipts", () => {
 			new Error("parent version unavailable"),
 		);
 		try {
-			const consumed = await inPass({
-				narratorId: "child",
-				parentNarratorId: "parent",
-				toolUseId: "origin",
-				cwd: ".",
-			});
+			const consumed = await inPass({ narratorId: "child" });
 			expect(consumed?.text).toContain("same words");
 			expect(row(result.targets[0].deliveryMessageId)).not.toBeNull();
-			expect(getSubagentBufferedMessages("child")).toHaveLength(0);
+			expect(getBufferedMessages("child")).toHaveLength(0);
 			expect(await consume()).toBeNull();
 			expect(
 				sqlite
 					.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'")
 					.all(),
 			).toHaveLength(1);
-			expect(broadcasts.filter(({ event }) => event.type === "user_message")).toHaveLength(2);
+			// One display frame for the recipient and one for the destination's tool card.
+			expect(
+				broadcasts
+					.filter(({ event }) => event.type === "message")
+					.map(({ target }) => target)
+					.sort(),
+			).toEqual(["child", "parent"]);
 		} finally {
 			versionLookup.mockRestore();
 		}
@@ -850,28 +937,20 @@ describe("Send exact delivery receipts", () => {
 			(await agentQueued())[0].delivery.deliveryId as string,
 			"explicit test cancellation",
 		);
-		await pushSubagentBufferedMessage("child", "draft", { createdBy: "editor" });
-		const queued = getSubagentBufferedMessages("child")[0];
-		expect(await updateSubagentBufferedMessage("child", queued.id, "human correction")).toBe(true);
-		expect(queued.delivery).toBeUndefined();
+		await enqueueBufferedMessage("child", "draft", undefined, null, "editor");
+		const queued = getBufferedMessages("child")[0];
+		expect(await updateBufferedMessage("child", queued.id, "human correction")).toBe(true);
+		// A human draft stays in the user lane: it is never an agent delivery.
+		expect((await agentQueued()).map((row) => row.text)).not.toContain("human correction");
 		const childRows = () =>
 			sqlite
 				.prepare(
 					"SELECT id, origin, content_text, created_by FROM narrator_messages WHERE narrator_id = 'child'",
 				)
 				.all();
-		const restart = consume;
 		// Explicit turn/pass input must wait for restart, never inject into this pass.
-		expect(
-			await inPass({
-				narratorId: "child",
-				parentNarratorId: "parent",
-				toolUseId: "origin",
-				cwd: ".",
-				currentUserId: "editor",
-			}),
-		).toBeNull();
-		expect(getSubagentBufferedMessages("child")).toHaveLength(1);
+		expect(await inPass({ narratorId: "child", currentUserId: "editor" })).toBeNull();
+		expect(getBufferedMessages("child")).toHaveLength(1);
 		const restores: Array<() => void> = [];
 		let rowsAtCreatorFailure = 0;
 		if (failure === "parent lookup") {
@@ -903,7 +982,7 @@ describe("Send exact delivery receipts", () => {
 			expect(consumed?.prompt).toBe(
 				'<sender kind="human" id="editor" name="Editor" />\nhuman correction',
 			);
-			expect(getSubagentBufferedMessages("child")).toHaveLength(0);
+			expect(getBufferedMessages("child")).toHaveLength(0);
 			expect(await restart()).toBeNull();
 			expect(await consume()).toBeNull();
 			expect(row(result.targets[0].deliveryMessageId)).toBeNull();
@@ -941,27 +1020,19 @@ describe("Send exact delivery receipts", () => {
 			(await agentQueued())[0].delivery.deliveryId as string,
 			"explicit test cancellation",
 		);
-		await pushSubagentBufferedMessage("child", "draft");
-		const queued = getSubagentBufferedMessages("child")[0];
-		expect(await updateSubagentBufferedMessage("child", queued.id, "retry human correction")).toBe(
-			true,
-		);
-		const edited = getSubagentBufferedMessages("child")[0];
-		const restart = consume;
-		expect(
-			await inPass({
-				narratorId: "child",
-				parentNarratorId: "parent",
-				toolUseId: "origin",
-				cwd: ".",
-			}),
-		).toBeNull();
+		await enqueueBufferedMessage("child", "draft");
+		const queued = getBufferedMessages("child")[0];
+		expect(await updateBufferedMessage("child", queued.id, "retry human correction")).toBe(true);
+		const edited = getBufferedMessages("child")[0];
+		expect(await inPass({ narratorId: "child" })).toBeNull();
 		sqlite.run(`CREATE TEMP TRIGGER fail_message_ref BEFORE INSERT ON narrator_message_refs
 			BEGIN SELECT RAISE(ABORT, 'ref insertion unavailable'); END`);
 		try {
-			await expect(restart()).rejects.toThrow("ref insertion unavailable");
-			expect(getSubagentBufferedMessages("child")).toEqual([
-				{ ...edited, error: expect.stringContaining("ref insertion unavailable") },
+			// The wake reports nothing started; the failed persistence is released, not lost.
+			expect(await restart().catch(() => null)).toBeNull();
+			expect(runStarts).toHaveLength(0);
+			expect(getBufferedMessages("child")).toEqual([
+				expect.objectContaining({ id: edited.id, text: edited.text }),
 			]);
 			expect(
 				sqlite
@@ -980,7 +1051,7 @@ describe("Send exact delivery receipts", () => {
 		expect(consumed?.currentInput).toBe("retry human correction");
 		expect(consumed?.prompt).toBe('<sender kind="human" />\nretry human correction');
 		expect(await restart()).toBeNull();
-		expect(getSubagentBufferedMessages("child")).toHaveLength(0);
+		expect(getBufferedMessages("child")).toHaveLength(0);
 		expect(row(result.targets[0].deliveryMessageId)).toBeNull();
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
@@ -989,93 +1060,9 @@ describe("Send exact delivery receipts", () => {
 		expect(broadcasts.filter(({ event }) => event.type === "user_message")).toHaveLength(2);
 	});
 
-	test("actual running-pass callback withholds failed bytes, requeues, then delivers once", async () => {
-		const narratorExecutor = await import("../narrator-executor");
-		const { settings } = await import("../../lib/settings");
-		const previous = settings.anthropicProviders;
-		settings.anthropicProviders = [
-			{
-				id: "delivery-provider",
-				name: "Delivery test",
-				prefix: "delivery-test",
-				apiKey: "test-only",
-				baseUrl: "https://example.invalid/v1",
-				defaultModel: "claude-sonnet-4",
-				officialApi: false,
-			},
-		];
-		sqlite
-			.prepare("UPDATE narrators SET auto_continuation_override = 'off' WHERE id = 'child'")
-			.run();
-		let firstText: string | undefined;
-		let secondText: string | undefined;
-		let thirdText: string | undefined;
-		const injectionText = (
-			injection:
-				| Awaited<
-						ReturnType<
-							NonNullable<import("../../lib/agent/types").AgentConfig["getAfterToolsInjections"]>
-						>
-				  >
-				| undefined,
-		) => (typeof injection === "string" ? injection : injection?.text);
-		let reserved: string | undefined;
-		let persistedAtFirstBoundary = false;
-		let queuedAfterFailure = 0;
-		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
-			async (input) => {
-				const sent = await send();
-				reserved = sent.targets[0].deliveryMessageId;
-				const failure = spyOn(narratorService, "persistSubagentUserMessage").mockRejectedValueOnce(
-					new Error("in-pass persistence rejected"),
-				);
-				try {
-					firstText = injectionText(await input.config.getAfterToolsInjections?.());
-				} finally {
-					failure.mockRestore();
-				}
-				persistedAtFirstBoundary = row(reserved) !== null;
-				queuedAfterFailure = (await agentQueued()).length;
-				const prepared = await input.config.getAfterToolsInjections?.();
-				secondText = injectionText(prepared);
-				expect(consumedAt(reserved)).toBeNull();
-				if (typeof prepared !== "string") prepared?.onConsumed?.();
-				await Promise.resolve();
-				thirdText = injectionText(await input.config.getAfterToolsInjections?.());
-				return { finalText: "done", hasError: false, shouldUpdateTitle: false };
-			},
-		);
-		try {
-			await executeSubagent({
-				narratorId: "child",
-				parentNarratorId: "parent",
-				toolUseId: "origin",
-				subagentType: "general",
-				prompt: "initial turn",
-				initialHistory: [],
-				initialTrailingToolResults: [],
-				cwd: process.env.HOME ?? ".",
-				model: "delivery-test:claude-sonnet-4",
-				provider: "delivery-test",
-				locale: "en",
-				signal: new AbortController().signal,
-				systemPrompt: "Test subagent",
-			});
-			expect(firstText ?? "").not.toContain("same words");
-			expect(persistedAtFirstBoundary).toBe(false);
-			expect(queuedAfterFailure).toBe(1);
-			expect(secondText).toBe(
-				'<sender kind="agent" id="parent" name="parent" />\n[Message from the parent narrator]\nsame words',
-			);
-			expect(thirdText ?? "").not.toContain("same words");
-			expect(row(reserved)?.role).toBe("user");
-			expect(consumedAt(reserved)).toBeNumber();
-			expect(broadcasts.filter(({ event }) => event.type === "user_message")).toHaveLength(2);
-		} finally {
-			executor.mockRestore();
-			settings.anthropicProviders = previous;
-		}
-	});
+	// "a running pass withholds failed bytes, requeues, then delivers once" runs the real
+	// run service, so it lives in agent-message-delivery-running-pass.test.ts (this
+	// file's static imports bind publication before its DB mock is installed).
 
 	test("reused provider tool ID binds a reply to the precise waiting tool row and attempt", async () => {
 		for (const [suffix, attempt] of [
@@ -1175,7 +1162,7 @@ describe("Send exact delivery receipts", () => {
 		const second = await deliverTeamMessage("sibling", message, "parent");
 		expect(first).toBeString();
 		expect(first).not.toBe(second);
-		expect(tryClaimExecution("child", "subagent")).not.toBeNull();
+		expect(tryClaimExecution("child", "run")).not.toBeNull();
 		const claimed = await claimInboxHead("child", (row) => row.kind === "agent_message");
 		if (!claimed) throw new Error("Expected team mailbox claim");
 		const childMessage = projectTeamMessage(claimed);
@@ -1183,7 +1170,7 @@ describe("Send exact delivery receipts", () => {
 		expect(childMessage.delivery?.senderToolCallBinding).toEqual(message.fromToolCallBinding);
 		expect((await drainTeamInbox("sibling"))[0].delivery?.recipientMessageId).toBe(second);
 		expect(row(first)).toBeNull();
-		expect(getSubagentBufferedMessages("child")).toHaveLength(0);
+		expect(getBufferedMessages("child")).toHaveLength(0);
 		const injection = await deliverInjection("child", {
 			messageId: first,
 			onPersist: (tx, messageId, refId) => {

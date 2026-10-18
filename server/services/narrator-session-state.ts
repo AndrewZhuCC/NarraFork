@@ -41,16 +41,16 @@ export interface ActiveNarrator {
 	_modelRef?: string;
 	/** Persisted selection, kept separate from the pool-authorized runtime reference. */
 	_modelSelectionRef?: string;
-	/** Cached inheritance edge; only active sessions participate in live propagation. */
-	_followParentNarratorId?: string | null;
+	/** Cached model-source edge; only active sessions participate in live propagation. */
+	_modelSourceNarratorId?: string | null;
 	/** Invalidates asynchronous inheritance resolutions after a manual/parent model change. */
 	_modelRefreshVersion?: number;
 	_modelRefreshPending?: Promise<void>;
 	_modelRefreshError?: unknown;
 	/** Fixed effort mandated by the inherited model's selected pool entry. */
 	_inheritedReasoningEffort?: ReasoningEffort;
-	/** Parent's own override for a `__parent__` child; ranks below the child's override. */
-	_parentReasoningEffort?: ReasoningEffort;
+	/** The followed source's own override; ranks below this session's override. */
+	_sourceReasoningEffort?: ReasoningEffort;
 	model: string;
 	provider: string;
 	/** Settings revision used to derive `_modelRef` / `_reasoningEffortRef` into runtime values. */
@@ -563,47 +563,6 @@ export const pendingPermissions = hotSafe<Map<string, PendingPermission>>(
 	"narrafork.pendingPermissions",
 	() => new Map(),
 );
-
-// === Active subagent runtime settings (lightweight, for getRuntimeSettingsOverride) ===
-
-export interface ActiveSubagentSettings {
-	model: string;
-	reasoningEffort: ReasoningEffort | null;
-}
-
-export const activeSubagentSettings = createRuntimeMapView("subagentSettings");
-
-export function registerActiveSubagent(
-	narratorId: string,
-	model: string,
-	reasoningEffort: ReasoningEffort | null | undefined,
-): void {
-	activeSubagentSettings.set(narratorId, {
-		model,
-		reasoningEffort: reasoningEffort ?? null,
-	});
-}
-
-export function unregisterActiveSubagent(narratorId: string): void {
-	activeSubagentSettings.delete(narratorId);
-}
-
-export function updateActiveSubagentModel(narratorId: string, model: string): boolean {
-	const s = activeSubagentSettings.get(narratorId);
-	if (!s) return false;
-	s.model = model;
-	return true;
-}
-
-export function updateActiveSubagentReasoningEffort(
-	narratorId: string,
-	reasoningEffort: ReasoningEffort | null,
-): boolean {
-	const s = activeSubagentSettings.get(narratorId);
-	if (!s) return false;
-	s.reasoningEffort = reasoningEffort;
-	return true;
-}
 
 export interface PendingDangerConfirmation {
 	narratorId: string;

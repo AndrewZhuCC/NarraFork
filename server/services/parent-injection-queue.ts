@@ -8,6 +8,7 @@ import {
 	enqueueInboxAgent,
 	hasInboxKind,
 	type InboxAgentMetadata,
+	inboxAgentText,
 	inboxDelivery,
 	inboxMetadata,
 	listInboxRows,
@@ -283,6 +284,8 @@ export function projectPendingInjection(
 			fromToolUseId: delivery.fromToolUseId,
 			fromMessageId: metadata.fromMessageId,
 			text: row.text,
+			// A Send addressed to this session carries its producer's framing.
+			...(metadata.channel === "buffer" ? { modelText: inboxAgentText(row) } : {}),
 			timestamp: row.bufferedAt,
 		},
 	};

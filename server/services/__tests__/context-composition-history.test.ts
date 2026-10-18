@@ -84,9 +84,9 @@ function tool(
 		)
 		.run(id, owner, messageId, call, attempt, time, input, output);
 }
-async function segments(options: { profile?: "primary" | "subagent"; check?: () => void } = {}) {
+async function segments(options: { topLevelToolUseId?: string | null; check?: () => void } = {}) {
 	return Array.fromAsync(
-		readContextHistory(counted, "n", { profile: "primary", check: () => {}, ...options }),
+		readContextHistory(counted, "n", { topLevelToolUseId: null, check: () => {}, ...options }),
 	);
 }
 
@@ -162,7 +162,7 @@ test("targeted entries emit hidden/display/excluded/before-compact empties and o
 	message("sys", 7, [{ category: "system", chars: 7 }], "sys");
 	const entries = await Array.fromAsync(
 		readContextHistoryEntries(counted, "n", {
-			profile: "primary",
+			topLevelToolUseId: null,
 			check: () => {},
 			messageIds: ["old", "compact", "hidden", "display", "child", "summary", "sys", "missing"],
 		}),
@@ -176,7 +176,7 @@ test("targeted entries emit hidden/display/excluded/before-compact empties and o
 		["summary", [{ category: "summary", chars: 5 }]],
 		["sys", [{ category: "system", chars: 7 }]],
 	]);
-	expect(await segments({ profile: "subagent" })).toEqual([
+	expect(await segments({ topLevelToolUseId: "parent" })).toEqual([
 		{ category: "assistant", chars: 60 },
 		{ category: "summary", chars: 5 },
 		{ category: "system", chars: 7 },
@@ -194,7 +194,11 @@ test("linked child compact cannot advance primary boundary; tail reader skips ol
 		{ category: "assistant", chars: 5 },
 	]);
 	const entries = await Array.fromAsync(
-		readContextHistoryEntries(counted, "n", { profile: "primary", check: () => {}, afterSeq: 2 }),
+		readContextHistoryEntries(counted, "n", {
+			topLevelToolUseId: null,
+			check: () => {},
+			afterSeq: 2,
+		}),
 	);
 	expect(entries.map((entry) => entry.messageId)).toEqual(["last"]);
 });
@@ -363,7 +367,7 @@ test("actual common/fallback SQL needs message-leading indexes under large globa
 		try {
 			const entries = await Array.fromAsync(
 				readContextHistoryEntries(counted, "n", {
-					profile: "primary",
+					topLevelToolUseId: null,
 					check: () => {},
 					messageIds: ["collision"],
 				}),

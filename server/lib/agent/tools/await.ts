@@ -300,6 +300,7 @@ export const awaitTool: ToolDefinition = {
 				const result = await awaitAgentResultDetailed({
 					callerNarratorId: ctx.narratorId,
 					id,
+					userId: ctx.userId,
 					// The reschedulable timeoutController drives the deadline; give the inner
 					// waits a large cap so their own timers never win first.
 					timeoutMs: MAX_AWAIT_TIMEOUT_MS,

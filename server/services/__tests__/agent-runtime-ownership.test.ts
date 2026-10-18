@@ -18,7 +18,6 @@ import {
 } from "../../lib/search/execution-scope";
 import type { ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
-import type { SubagentExecOptions } from "../subagent-executor";
 
 const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
@@ -28,10 +27,8 @@ const { createRuntimeEventContext } = await import("../agent-runtime/context");
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
 const sessionModule = await import("../narrator-session");
 const { runAgentLoop } = sessionModule;
-const executorModule = await import("../subagent-executor");
-const { executeSubagent, buildSubagentEventContext } = executorModule;
-const { executeBackgroundTask, runForegroundLoop, startForegroundRun, startContinuedSubagent } =
-	await import("../subagent-runner");
+const bufferModule = await import("../narrator-buffer");
+const { listDeliveringRuns, startNarratorRun } = await import("../agent-runtime/run");
 const state = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
 const passExecutor = await import("../narrator-executor");
@@ -72,6 +69,18 @@ beforeEach(() => {
 				type: id === ROOT ? "primary" : "subagent",
 				variant: id === ROOT ? "primary" : "subagent:general",
 				parentNarratorId: id === ROOT ? null : ROOT,
+				// A delegated session: an ordinary session whose run delivers to a call.
+				runtimeRegistrationJson:
+					id === ROOT
+						? { version: 1, run: { logicalRunId: `seed-${id}`, principal: { userId: null } } }
+						: {
+								version: 1,
+								run: {
+									logicalRunId: `seed-${id}`,
+									principal: { userId: null },
+									deliverTo: { narratorId: ROOT, toolUseId: "spawn-tool" },
+								},
+							},
 				model: "test:model",
 				cwd: process.env.HOME,
 				autoContinuationOverride: "off",
@@ -85,7 +94,6 @@ afterEach(() => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		state.activeNarrators.delete(id);
-		state.activeSubagentSettings.delete(id);
 	}
 	mock.restore();
 });
@@ -112,32 +120,28 @@ function active(narratorId: string): ActiveNarrator {
 		_substatus: new Set(),
 	};
 }
-function child(narratorId = CHILD): SubagentExecOptions {
-	return {
-		narratorId,
-		parentNarratorId: ROOT,
-		toolUseId: "spawn-tool",
-		subagentType: "general",
-		prompt: "owner test",
-		cwd: process.env.HOME as string,
-		model: "test:model",
-		provider: "test",
-		locale: "zh-CN",
-		signal: new AbortController().signal,
-		systemPrompt: "test",
-		initialHistory: [],
-	};
+/** Start a run through the single run entry and settle on its true terminal. */
+async function runOf(narratorId: string, text = "owner test") {
+	const handle = await startNarratorRun({ narratorId, locale: "zh-CN", text });
+	if (!handle.started)
+		throw Object.assign(new Error("Narrator already has an execution owner"), {
+			code: "NARRATOR_EXECUTION_BUSY",
+		});
+	return handle.completion;
 }
 
 /** Pause real entry adapters after admission, before any model/file preparation. */
 function preparationBarrier(expectedIds: string[]) {
 	const entered = new Map(expectedIds.map((id) => [id, Promise.withResolvers<void>()]));
 	const done = Promise.withResolvers<void>();
-	spyOn(narratorService, "getById").mockImplementation(async (id) => {
+	const hold = async (id: string): Promise<never> => {
 		entered.get(id)?.resolve();
 		await done.promise;
 		throw new Error("controlled preparation failure");
-	});
+	};
+	spyOn(narratorService, "getById").mockImplementation(hold);
+	// A run started without a prepared session constructs it first.
+	spyOn(sessionModule, "ensureNarrator").mockImplementation(hold);
 	return {
 		entered: Promise.all([...entered.values()].map((gate) => gate.promise)),
 		release: () => done.resolve(),
@@ -154,61 +158,41 @@ function failedPreparation(run: Promise<unknown>) {
 	);
 }
 
-describe("publication release respects the runtime inbox wake decision", () => {
-	for (const mode of ["foreground", "background", "resume", "deferred-resume"] as const) {
+describe("owner release respects the runtime inbox wake decision", () => {
+	// Same run entry for a session that delivers to a call (CHILD) and one that does not.
+	for (const id of [CHILD, ROOT]) {
 		for (const allowInboxWake of [false, true]) {
-			test(`${mode}: allowInboxWake=${allowInboxWake}`, async () => {
+			test(`${id === CHILD ? "delivering" : "plain"}: allowInboxWake=${allowInboxWake}`, async () => {
 				const orchestrator = await import("../agent-runtime/orchestrator");
 				const inbox = await import("../agent-runtime/inbox");
-				const { runtimePublication } = await import("../agent-runtime/publication");
 				spyOn(orchestrator, "runAgentLoopUnlocked").mockResolvedValue({
 					started: true,
 					finalText: allowInboxWake ? "done" : "Balance exhausted / retries exhausted",
 					hasError: !allowInboxWake,
 					allowInboxWake,
 				});
+				spyOn(inbox, "hasInboxKind").mockResolvedValue(true);
 				const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
-				if (mode === "background") {
-					runtimePublication.startAgentRun({ narratorId: CHILD, parentNarratorId: ROOT });
-					await executeBackgroundTask(child());
-				} else if (mode === "foreground") {
-					const run = startForegroundRun({
-						...child(),
-						subagentId: CHILD,
-						initialHistory: [],
-						customDef: null,
-					});
-					expect((await run.terminal).allowInboxWake).toBe(allowInboxWake);
-				} else {
-					const run = await startContinuedSubagent({
-						subagentId: CHILD,
-						parentNarratorId: ROOT,
-						toolUseId: "origin-tool",
-						prompt: "continue",
-						locale: "en",
-						signal: new AbortController().signal,
-						persistPrompt: false,
-						initialHistory: [],
-						initialTrailingToolResults: [],
-						skipConclusionDelivery: true,
-						deferPublicationRelease: mode === "deferred-resume",
-					});
-					await run.terminalCompletion;
-					if (mode === "deferred-resume") {
-						expect(wake).not.toHaveBeenCalled();
-						expect(getExecutionOwner(CHILD)).toBeDefined();
-						run.releasePublication?.();
-					}
-				}
-				// Release schedules async backend resolution before waking the inbox. Wait
-				// for that boundary, not one event-loop tick that can leak into the next test.
+				const handle = await startNarratorRun({
+					narratorId: id,
+					locale: "en",
+					text: "run",
+					principal: null,
+					deliver: false,
+				});
+				expect(handle.started).toBe(true);
+				await handle.terminal;
+				// Release schedules async work before waking the inbox. Wait for that
+				// boundary, not one event-loop tick that can leak into the next test.
 				if (allowInboxWake) {
-					await waitUntil(() => wake.mock.calls.some(([id]) => id === CHILD));
+					await waitUntil(() => wake.mock.calls.some(([target]) => target === id));
 				} else {
-					await new Promise((resolve) => setImmediate(resolve));
+					await new Promise((resolve) => setTimeout(resolve, 20));
 				}
-				expect(getExecutionOwner(CHILD)).toBeUndefined();
-				expect(wake.mock.calls.filter(([id]) => id === CHILD)).toHaveLength(allowInboxWake ? 1 : 0);
+				expect(getExecutionOwner(id)).toBeUndefined();
+				expect(wake.mock.calls.filter(([target]) => target === id)).toHaveLength(
+					allowInboxWake ? 1 : 0,
+				);
 			});
 		}
 	}
@@ -229,17 +213,16 @@ describe("continued subagents remain checkpointable during maintenance", () => {
 				const update = await coordinator;
 				const { executeTool } = await import("../../lib/agent/tool-executor");
 				const { toolRegistry } = await import("../../lib/agent/tool-registry");
-				const runner = await import("../subagent-runner");
+				const runModule = await import("../agent-runtime/run");
 				const { sendSubagentMessage } = await import("../agent-communication");
 				const entered = Promise.withResolvers<void>();
 				const releaseTool = Promise.withResolvers<void>();
 				const loopFinished = Promise.withResolvers<void>();
 				let executions = 0;
-				let run: Awaited<ReturnType<typeof startContinuedSubagent>> | undefined;
-				spyOn(runner, "startContinuedSubagent").mockImplementation(async (input) => {
-					expect(input.resumableUpdateLease).toBeUndefined();
-					expect(input.updateExecutionLease).toBeUndefined();
-					run = await startContinuedSubagent(input);
+				// The continued session runs through the one run entry; observe its handle.
+				let run: Awaited<ReturnType<typeof startNarratorRun>> | undefined;
+				spyOn(runModule, "startNarratorRun").mockImplementation(async (input) => {
+					run = await startNarratorRun(input);
 					return run;
 				});
 				toolRegistry.register({
@@ -358,28 +341,22 @@ describe("continued subagents remain checkpointable during maintenance", () => {
 							signal: new AbortController().signal,
 							locale: "en",
 						});
-						expect(run, sent).toBeDefined();
+						expect(sent).toContain("Sent to");
+						await waitUntil(() => run !== undefined);
 					} else {
-						run = await runner.startContinuedSubagent({
-							subagentId: CHILD,
-							parentNarratorId: ROOT,
-							toolUseId: "continue-origin",
-							prompt: "Continue with an ordinary tool",
-							locale: "en",
-							signal: new AbortController().signal,
-							initialHistory: [],
-							initialTrailingToolResults: [],
-							skipConclusionDelivery: true,
-						});
+						const { acceptUserMessage } = await import("../narrator-session");
+						await acceptUserMessage(CHILD, "Continue with an ordinary tool", { userId: null });
+						await waitUntil(() => run !== undefined);
 					}
-					expect(run).toBeDefined();
+					expect(run?.started).toBe(true);
 					if (timing === "paused-before-dispatch") {
 						await waitUntil(() => update.getUpdateCoordinationStatus().pausedToolCount === 1);
 						expect(executions).toBe(0);
 						expect(update.getUpdateCoordinationStatus()).toMatchObject({
 							pendingOrdinaryExecutionCount: 0,
-							resumableExecutionCount: 1,
 						});
+						// The continued run is in the checkpoint inventory planned updates read.
+						expect(listDeliveringRuns().some((entry) => entry.narratorId === CHILD)).toBe(true);
 						const { toolContinuationService } = await import("../tool-continuation-service");
 						const epoch = update.getUpdateCoordinationStatus().updateEpoch;
 						expect(epoch).toBeString();
@@ -403,8 +380,8 @@ describe("continued subagents remain checkpointable during maintenance", () => {
 						update.beginQuiescingTools();
 						expect(update.getUpdateCoordinationStatus()).toMatchObject({
 							pendingOrdinaryExecutionCount: 1,
-							resumableExecutionCount: 1,
 						});
+						expect(listDeliveringRuns().some((entry) => entry.narratorId === CHILD)).toBe(true);
 						let drained = false;
 						const drain = update.waitForOrdinaryToolDrain().then(() => {
 							drained = true;
@@ -419,14 +396,14 @@ describe("continued subagents remain checkpointable during maintenance", () => {
 					}
 					releaseTool.resolve();
 					await loopFinished.promise;
-					await run?.terminalCompletion;
+					await run?.terminal;
 					expect(executions).toBe(1);
 					expect(execute).toHaveBeenCalledTimes(1);
-					expect(update.getUpdateCoordinationStatus().resumableExecutionCount).toBe(0);
+					expect(listDeliveringRuns().some((entry) => entry.narratorId === CHILD)).toBe(false);
 				} finally {
 					releaseTool.resolve();
 					if (update.isUpdateScheduled()) update.failScheduledUpdate("continued-run-test cleanup");
-					await run?.terminalCompletion;
+					await run?.terminal;
 				}
 			});
 		}
@@ -442,38 +419,36 @@ async function waitUntil(predicate: () => boolean) {
 }
 
 describe("shared execution owner through real entry adapters", () => {
-	for (const first of ["primary", "subagent"] as const) {
-		test(`${first} blocks both entry adapters for the same narrator`, async () => {
+	// Both entries are the same run service; "session" passes a prepared ActiveNarrator.
+	for (const first of ["session", "run"] as const) {
+		test(`${first} entry blocks every other start for the same narrator`, async () => {
 			const gate = preparationBarrier([CHILD]);
 			const running = failedPreparation(
-				first === "primary" ? runAgentLoop(active(CHILD), "start") : executeSubagent(child()),
+				first === "session" ? runAgentLoop(active(CHILD), "start") : runOf(CHILD),
 			);
 			try {
 				await gate.entered;
 				const owner = getExecutionOwner(CHILD);
-				expect(owner?.kind).toBe(first);
+				expect(owner?.kind).toBe("run");
 				expect(state.isNarratorRuntimeBusy(CHILD)).toBe(true);
 				expect(state.narratorLoopAdmissions.has(CHILD)).toBe(true);
 				expect(await runAgentLoop(active(CHILD), "duplicate")).toEqual({ started: false });
-				await expect(executeSubagent(child())).rejects.toMatchObject({
-					code: "NARRATOR_EXECUTION_BUSY",
-				});
 				const updateStatus = spyOn(narratorService, "updateStatus");
-				await expect(executeBackgroundTask(child())).rejects.toMatchObject({
-					code: "NARRATOR_EXECUTION_BUSY",
-				});
-				const foreground = startForegroundRun({
-					...child(),
-					subagentId: CHILD,
-					initialHistory: [],
-					customDef: null,
-				});
-				await expect(foreground.foreground).rejects.toMatchObject({
-					code: "NARRATOR_EXECUTION_BUSY",
-				});
-				await expect(foreground.terminal).rejects.toMatchObject({
-					code: "NARRATOR_EXECUTION_BUSY",
-				});
+				// A competing start (a delegation, a wake, a recovery) is refused, not queued
+				// as a second executor, and touches no status.
+				expect(
+					(await startNarratorRun({ narratorId: CHILD, locale: "en", text: "x" })).started,
+				).toBe(false);
+				expect(
+					(
+						await startNarratorRun({
+							narratorId: CHILD,
+							locale: "en",
+							text: "x",
+							foreground: true,
+						})
+					).started,
+				).toBe(false);
 				expect(updateStatus).not.toHaveBeenCalled();
 				expect(getExecutionOwner(CHILD)).toBe(owner);
 			} finally {
@@ -485,28 +460,26 @@ describe("shared execution owner through real entry adapters", () => {
 		});
 	}
 
-	for (const first of ["primary", "subagent"] as const) {
+	for (const first of ["session", "run"] as const) {
 		test(`${first} late failed preparation cannot clear its successor`, async () => {
 			const gate = preparationBarrier([CHILD]);
 			const session = active(CHILD);
 			state.activeNarrators.set(CHILD, session);
 			const run = failedPreparation(
-				first === "primary" ? runAgentLoop(session, "old") : executeSubagent(child()),
+				first === "session" ? runAgentLoop(session, "old") : runOf(CHILD),
 			);
 			try {
 				await gate.entered;
 				const old = getExecutionOwner(CHILD);
 				if (!old) throw new Error("expected admitted owner");
 				old.release();
-				const successor = tryClaimExecution(CHILD, "primary");
+				const successor = tryClaimExecution(CHILD, "run");
 				if (!successor) throw new Error("expected successor");
-				state.registerActiveSubagent(CHILD, "successor:model", null);
 				gate.release();
 				await run;
 				expect(getExecutionOwner(CHILD)).toBe(successor);
 				expect(state.activeNarrators.get(CHILD)).toBe(session);
 				expect(session.alive).toBe(true);
-				expect(state.activeSubagentSettings.get(CHILD)?.model).toBe("successor:model");
 			} finally {
 				gate.release();
 				await run;
@@ -518,8 +491,8 @@ describe("shared execution owner through real entry adapters", () => {
 		const gate = preparationBarrier(ids);
 		const runs = [
 			failedPreparation(runAgentLoop(active(ROOT), "parent")),
-			failedPreparation(executeSubagent(child(CHILD))),
-			failedPreparation(executeSubagent(child(SIBLING))),
+			failedPreparation(runOf(CHILD)),
+			failedPreparation(runOf(SIBLING)),
 		];
 		try {
 			await gate.entered;
@@ -536,7 +509,7 @@ describe("shared execution owner through real entry adapters", () => {
 
 	test("a child does not make its idle parent busy", async () => {
 		const gate = preparationBarrier([CHILD]);
-		const run = failedPreparation(executeSubagent(child()));
+		const run = failedPreparation(runOf(CHILD));
 		try {
 			await gate.entered;
 			expect(state.isNarratorRuntimeBusy(CHILD)).toBe(true);
@@ -548,11 +521,11 @@ describe("shared execution owner through real entry adapters", () => {
 		}
 	});
 
-	test("a root revert rejects child preparation before it claims an epoch", async () => {
-		const reservation = state.reserveNarratorRevertAdmission(ROOT);
+	test("a revert of the session rejects a run start before it claims an epoch", async () => {
+		const reservation = state.reserveNarratorRevertAdmission(CHILD);
 		const getById = spyOn(narratorService, "getById");
 		try {
-			await expect(executeSubagent(child())).rejects.toMatchObject({
+			await expect(runOf(CHILD)).rejects.toMatchObject({
 				code: "NARRATOR_REVERT_IN_PROGRESS",
 			});
 			expect(getById).not.toHaveBeenCalled();
@@ -563,7 +536,25 @@ describe("shared execution owner through real entry adapters", () => {
 	});
 });
 
-describe("runner owns the entire finalization and publication", () => {
+/**
+ * A search channel's delegated run, the way the search router consumes it: the run's
+ * true terminal, a failed terminal surfacing as a rejection so the next channel runs.
+ */
+async function searchChannel(): Promise<string> {
+	const handle = await startNarratorRun({
+		narratorId: CHILD,
+		locale: "zh-CN",
+		text: "search",
+		principal: null,
+		deliver: false,
+	});
+	const terminal = await handle.terminal;
+	if (terminal.hasError || terminal.interrupted || terminal.timedOut)
+		throw new Error(terminal.finalText || "Search subagent failed");
+	return terminal.output;
+}
+
+describe("the run service owns the entire finalization", () => {
 	test("search channel failures reject only after releasing the child execution owner", async () => {
 		spyOn(passExecutor, "executeAgentLoop").mockResolvedValue({
 			shouldUpdateTitle: false,
@@ -574,13 +565,7 @@ describe("runner owns the entire finalization and publication", () => {
 		});
 		await expect(
 			withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 2 }, () =>
-				runForegroundLoop({
-					...child(),
-					subagentType: "search",
-					subagentId: CHILD,
-					initialHistory: [],
-					customDef: null,
-				}),
+				searchChannel(),
 			),
 		).rejects.toThrow("native provider failed");
 		expect(getExecutionOwner(CHILD)).toBeUndefined();
@@ -601,13 +586,7 @@ describe("runner owns the entire finalization and publication", () => {
 		});
 		await expect(
 			withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 1 }, () =>
-				runForegroundLoop({
-					...child(),
-					subagentType: "search",
-					subagentId: CHILD,
-					initialHistory: [],
-					customDef: null,
-				}),
+				searchChannel(),
 			),
 		).rejects.toThrow("turn budget exhausted");
 		expect(execute).toHaveBeenCalledTimes(1);
@@ -722,20 +701,20 @@ describe("runner owns the entire finalization and publication", () => {
 			});
 			await expect(
 				withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 1 }, () =>
-					runForegroundLoop({
-						...child(),
-						subagentType: "search",
-						subagentId: CHILD,
-						initialHistory: [],
-						customDef: null,
-					}),
+					searchChannel(),
 				),
 			).rejects.toThrow(failure.message);
-			expect(update).toHaveBeenCalledWith(CHILD, "idle", {
+			const finalStatus = update.mock.calls.filter(([id]) => id === CHILD).at(-1);
+			expect(finalStatus?.[1]).toBe("idle");
+			expect(finalStatus?.[2]).toMatchObject({
 				substatus: ["error"],
 				errorMessage: failure.message,
 				errorCode: failure.errorCode,
 				diagnostics: failure.diagnostics,
+			});
+			expect(await narratorService.getById(CHILD)).toMatchObject({
+				status: "idle",
+				errorMessage: failure.message,
 			});
 			expect(execute).toHaveBeenCalledTimes(1);
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
@@ -757,22 +736,15 @@ describe("runner owns the entire finalization and publication", () => {
 			});
 			await expect(
 				withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 1 }, () =>
-					runForegroundLoop({
-						...child(),
-						subagentType: "search",
-						subagentId: CHILD,
-						initialHistory: [],
-						customDef: null,
-					}),
+					searchChannel(),
 				),
 			).resolves.toBeString();
 			expect(execute).toHaveBeenCalledTimes(1);
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
 		});
 	}
-	for (const background of [false, true]) {
-		test(`${background ? "background" : "foreground"} refuses competing starts while finalizer is awaiting`, async () => {
-			const directExecutor = executeSubagent;
+	for (const foreground of [true, false]) {
+		test(`${foreground ? "foreground" : "detached"} run refuses competing starts while its finalizer is awaiting`, async () => {
 			spyOn(sessionModule, "startBackgroundCompletionContinuationIfPossible").mockResolvedValue({
 				started: false,
 			});
@@ -793,116 +765,52 @@ describe("runner owns the entire finalization and publication", () => {
 				}
 				return realUpdate(...args);
 			});
-			if (background) {
-				// Direct runner fixtures must register the same durable run slots as task creation.
-				const { runtimePublication } = await import("../agent-runtime/publication");
-				runtimePublication.startAgentRun({ narratorId: CHILD, parentNarratorId: ROOT });
-			}
-			const completion = background
-				? executeBackgroundTask(child())
-				: startForegroundRun({
-						...child(),
-						subagentId: CHILD,
-						initialHistory: [],
-						customDef: null,
-					}).terminal;
+			const handle = await startNarratorRun({
+				narratorId: CHILD,
+				locale: "en",
+				text: "run",
+				principal: null,
+				foreground,
+				deliver: false,
+			});
 			try {
 				await entered.promise;
 				const owner = getExecutionOwner(CHILD);
-				expect(owner?.kind).toBe("subagent");
+				expect(owner?.kind).toBe("run");
 				expect(state.isNarratorRuntimeBusy(CHILD)).toBe(true);
 				expect(await runAgentLoop(active(CHILD), "competing primary")).toEqual({ started: false });
-				await expect(directExecutor(child())).rejects.toMatchObject({
-					code: "NARRATOR_EXECUTION_BUSY",
-				});
-				await expect(executeBackgroundTask(child())).rejects.toMatchObject({
-					code: "NARRATOR_EXECUTION_BUSY",
-				});
+				expect(
+					(await startNarratorRun({ narratorId: CHILD, locale: "en", text: "x" })).started,
+				).toBe(false);
 				expect(getExecutionOwner(CHILD)).toBe(owner);
 			} finally {
 				release.resolve();
-				await completion;
+				await handle.terminal;
 			}
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
 			expect(state.hasNarratorAdmissionWork(ROOT)).toBe(false);
 		});
 	}
 
-	test("continued background publication retains the borrowed owner after the inner runner ends", async () => {
-		await db
-			.update(narrators)
-			.set({ model: "test:model", cwd: process.env.HOME })
-			.where(eq(narrators.id, CHILD));
-		spyOn(passExecutor, "executeAgentLoop").mockResolvedValue({
-			shouldUpdateTitle: false,
-			completedNaturally: true,
-			completedAssistantTurn: true,
-			finalText: "continued result",
-			hasError: false,
-		});
-		spyOn(sessionModule, "startBackgroundCompletionContinuationIfPossible").mockResolvedValue({
-			started: false,
-		});
-		// P2 publishes the terminal state only with the caller's exact conclusion transaction.
-		// Exercise its real ownership handoff instead of waiting for a pre-publication status read.
-		const run = await startContinuedSubagent({
-			subagentId: CHILD,
-			parentNarratorId: ROOT,
-			toolUseId: "origin-tool",
-			prompt: "continue",
-			locale: "en",
-			signal: new AbortController().signal,
-			persistPrompt: false,
-			initialHistory: [],
-			initialTrailingToolResults: [],
-			preserveBackground: true,
-			deferPublicationRelease: true,
-		});
-		try {
-			await run.terminalCompletion;
-			expect(run.takeResumedBackgroundAnnouncement?.()).toMatchObject({
-				subagentId: CHILD,
-				parentNarratorId: ROOT,
-				status: "completed",
-			});
-			expect(getExecutionOwner(CHILD)?.kind).toBe("subagent");
-			expect(await runAgentLoop(active(CHILD), "competing publication")).toEqual({
-				started: false,
-			});
-			await expect(executeBackgroundTask(child())).rejects.toMatchObject({
-				code: "NARRATOR_EXECUTION_BUSY",
-			});
-		} finally {
-			await run.terminalCompletion;
-			run.releasePublication?.();
-			await run.completion;
-		}
-		expect(getExecutionOwner(CHILD)).toBeUndefined();
-	});
-
-	test("borrowing an owner does not permit duplicate executor passes or release the runner", async () => {
-		const owner = tryClaimExecution(CHILD, "subagent");
+	test("an existing owner rejects duplicate starts without releasing the run", async () => {
+		const owner = tryClaimExecution(CHILD, "run");
 		if (!owner) throw new Error("expected runner owner");
-		const gate = preparationBarrier([CHILD]);
-		const run = failedPreparation(executeSubagent(child(), owner));
-		try {
-			await gate.entered;
-			await expect(executeSubagent(child(), owner)).rejects.toMatchObject({
-				code: "NARRATOR_EXECUTION_BUSY",
-			});
-		} finally {
-			gate.release();
-			await run;
-		}
+		// The production admission owner, not a redundant per-pass reservation,
+		// excludes every competing run start.
+		expect(tryClaimExecution(CHILD, "run")).toBeNull();
+		// A separate run start never borrows the owner it does not hold.
+		expect((await startNarratorRun({ narratorId: CHILD, locale: "en", text: "x" })).started).toBe(
+			false,
+		);
 		expect(getExecutionOwner(CHILD)).toBe(owner);
 		owner.release();
 	});
 
-	test("a suspended foreground runner resumes the same epoch through its control channel", async () => {
-		const manual = await import("../subagent-manual-override");
-		const takeover = await import("../subagent-takeover");
-		const { isExecutionSuspended } = await import("../agent-runtime/ownership");
-		await db.update(narrators).set({ model: "test:model" }).where(eq(narrators.id, CHILD));
+	test("a held run parks on the same epoch and resumes through the control channel", async () => {
+		const { getRunControl, isExecutionSuspended, setRunHold } = await import(
+			"../agent-runtime/ownership"
+		);
+		const { controlRun } = await import("../agent-runtime/run");
 		const execute = spyOn(passExecutor, "executeAgentLoop").mockResolvedValue({
 			shouldUpdateTitle: false,
 			completedNaturally: true,
@@ -910,22 +818,16 @@ describe("runner owns the entire finalization and publication", () => {
 			finalText: "one pass",
 			hasError: false,
 		});
-		const entered = Promise.withResolvers<void>();
-		const originalWait = manual.waitForManualOverride;
-		spyOn(manual, "waitForManualOverride").mockImplementation((...args) => {
-			const control = originalWait(...args);
-			entered.resolve();
-			return control;
-		});
-		takeover.markTakenOver(CHILD);
-		const run = startForegroundRun({
-			...child(),
-			subagentId: CHILD,
-			initialHistory: [],
-			customDef: null,
+		setRunHold(CHILD, { released: false });
+		const handle = await startNarratorRun({
+			narratorId: CHILD,
+			locale: "en",
+			text: "run",
+			principal: null,
+			deliver: false,
 		});
 		try {
-			await entered.promise;
+			await waitUntil(() => !!getRunControl(CHILD)?.wake);
 			const owner = getExecutionOwner(CHILD);
 			expect(owner).toBeDefined();
 			expect(isExecutionSuspended(CHILD)).toBe(true);
@@ -934,77 +836,99 @@ describe("runner owns the entire finalization and publication", () => {
 			expect(await runAgentLoop(active(CHILD), "competing suspended loop")).toEqual({
 				started: false,
 			});
-			takeover.clearTakenOver(CHILD);
-			expect(
-				manual.resumeManualOverride(CHILD, {
-					prompt: "resume",
-					history: [],
-					trailingToolResults: [],
-				}),
-			).toBe(true);
+			// Queued input wakes the same run; the release lets it end after that turn.
+			const { enqueueBufferedMessage } = await import("../narrator-buffer");
+			await enqueueBufferedMessage(CHILD, "resume");
+			setRunHold(CHILD, { released: true });
+			getRunControl(CHILD)?.wake?.("input");
 			expect(getExecutionOwner(CHILD)).toBe(owner);
-			await run.terminal;
+			await handle.terminal;
 			expect(execute).toHaveBeenCalledTimes(2);
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
 		} finally {
-			takeover.clearTakenOver(CHILD);
-			manual.clearManualOverrideRuntimes();
-			await run.terminal;
+			await controlRun(CHILD, { kind: "cancel" });
+			setRunHold(CHILD, undefined);
+			await handle.terminal;
 		}
 	});
 
-	test("expired finalizer cannot clear a successor queue or status", async () => {
-		const old = tryClaimExecution(CHILD, "subagent");
+	test("a failed run keeps queued input for an explicit retry", async () => {
+		spyOn(passExecutor, "executeAgentLoop").mockImplementation(async () => {
+			// Input arrives while the failing pass runs.
+			await bufferModule.enqueueBufferedMessage(CHILD, "keep me");
+			return {
+				shouldUpdateTitle: false,
+				completedNaturally: false,
+				completedAssistantTurn: false,
+				finalText: "provider failed",
+				hasError: true,
+			};
+		});
+		const wake = spyOn(await import("../agent-runtime/inbox"), "wakeInboxIfEligible");
+		try {
+			const handle = await startNarratorRun({
+				narratorId: CHILD,
+				locale: "en",
+				text: "run",
+				principal: null,
+				deliver: false,
+			});
+			expect((await handle.terminal).hasError).toBe(true);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			// Not consumed by the failing run and not auto-woken past the failure.
+			expect(bufferModule.getBufferedMessages(CHILD).map((m) => m.text)).toEqual(["keep me"]);
+			expect(wake.mock.calls.filter(([id]) => id === CHILD)).toHaveLength(0);
+			expect(getExecutionOwner(CHILD)).toBeUndefined();
+		} finally {
+			await bufferModule.clearBufferedMessages(CHILD);
+		}
+	});
+
+	test("an expired owner's release cannot clear a successor run or its queue", async () => {
+		const old = tryClaimExecution(CHILD, "run");
 		if (!old) throw new Error("expected old owner");
 		old.release();
-		const current = tryClaimExecution(CHILD, "subagent");
+		const current = tryClaimExecution(CHILD, "run");
 		if (!current) throw new Error("expected successor");
-		const accepted = await executorModule.pushSubagentBufferedMessage(CHILD, "keep me");
+		const accepted = await bufferModule.enqueueBufferedMessage(CHILD, "keep me");
 		expect(accepted.ok).toBe(true);
-		const queued = executorModule.getSubagentBufferedMessages(CHILD);
-		expect(queued).toHaveLength(1);
-		expect(queued[0]).toMatchObject({ id: accepted.id, text: "keep me" });
-		const update = spyOn(narratorService, "updateStatus");
+		const queued = bufferModule.getBufferedMessages(CHILD);
 		try {
-			await executorModule.finalizeSubagent(CHILD, ROOT, "old-origin", false, null, { owner: old });
-			expect(executorModule.getSubagentBufferedMessages(CHILD)).toEqual(queued);
-			expect(update).not.toHaveBeenCalled();
+			expect(old.release()).toBe(false);
+			expect(bufferModule.getBufferedMessages(CHILD)).toEqual(queued);
 			expect(getExecutionOwner(CHILD)).toBe(current);
 		} finally {
-			executorModule.clearSubagentBufferedMessages(CHILD);
+			await bufferModule.clearBufferedMessages(CHILD);
 		}
 	});
 });
 
 describe("epoch CAS and legacy projections", () => {
-	test("old releases cannot clear a new owner or its session/settings view", () => {
-		const old = tryClaimExecution(CHILD, "subagent");
+	test("old releases cannot clear a new owner or its session view", () => {
+		const old = tryClaimExecution(CHILD, "run");
 		if (!old) throw new Error("expected old owner");
 		expect(old.release()).toBe(true);
-		const current = tryClaimExecution(CHILD, "primary");
+		const current = tryClaimExecution(CHILD, "run");
 		if (!current) throw new Error("expected current owner");
 		const session = active(CHILD);
 		state.activeNarrators.set(CHILD, session);
-		state.registerActiveSubagent(CHILD, "new:model", null);
 		expect(old.epoch).not.toBe(current.epoch);
 		expect(old.isCurrent()).toBe(false);
 		expect(old.release()).toBe(false);
 		expect(getExecutionOwner(CHILD)).toBe(current);
 		expect(state.activeNarrators.get(CHILD)).toBe(session);
 		expect([...state.activeNarrators]).toEqual([[CHILD, session]]);
-		expect(state.activeSubagentSettings.get(CHILD)?.model).toBe("new:model");
 		state.activeNarrators.clear();
-		state.activeSubagentSettings.clear();
 		expect(state.isNarratorRuntimeBusy(CHILD)).toBe(true);
 	});
 
 	test("runtime busy claims do not own the execution slot", () => {
 		const release = state.claimNarratorRuntime(ROOT, "recovery-publication");
 		try {
-			const owner = tryClaimExecution(ROOT, "primary");
+			const owner = tryClaimExecution(ROOT, "run");
 			if (!owner) throw new Error("expected execution owner");
 			expect(owner).not.toBeNull();
-			expect(tryClaimExecution(ROOT, "subagent")).toBeNull();
+			expect(tryClaimExecution(ROOT, "run")).toBeNull();
 			owner.release();
 			expect(state.isNarratorRuntimeBusy(ROOT)).toBe(true);
 		} finally {
@@ -1014,40 +938,41 @@ describe("epoch CAS and legacy projections", () => {
 });
 
 describe("shared event context", () => {
-	test("child initializes provider/model/locale before any request event", () => {
-		const context = buildSubagentEventContext(
-			CHILD,
-			ROOT,
-			"spawn",
-			"conversation",
-			"test:model",
-			"test",
-			"zh-CN",
-		);
-		expect(context).toMatchObject({
+	test("a delivering run's pass context carries its placement and pass-local state", async () => {
+		const contexts: Array<import("../narrator-event-handler").EventHandlerContext> = [];
+		spyOn(passExecutor, "executeAgentLoop").mockImplementation(async (options) => {
+			contexts.push(options.eventContext);
+			options.eventContext.setMeterData(12, "tokens");
+			return {
+				shouldUpdateTitle: false,
+				completedNaturally: contexts.length > 1,
+				completedAssistantTurn: true,
+				finalText: "done",
+				hasError: false,
+				interrupted: contexts.length === 1,
+				interruptedReason: "completion_limit",
+			};
+		});
+		const handle = await startNarratorRun({
+			narratorId: CHILD,
+			locale: "zh-CN",
+			text: "run",
+			principal: null,
+			deliver: false,
+		});
+		await handle.terminal;
+		expect(contexts.length).toBeGreaterThanOrEqual(2);
+		expect(contexts[0]).toMatchObject({
 			narratorId: CHILD,
 			broadcastTargetId: ROOT,
 			provider: "test",
 			providerPrefix: "test",
 			model: "test:model",
 			locale: "zh-CN",
-			parentToolUseId: "spawn",
-			subagentModel: "test:model",
+			parentToolUseId: "spawn-tool",
 		});
-		context.setMeterData(12, "tokens");
-		expect(context.getMeterUsage()).toBe(12);
-		const next = buildSubagentEventContext(
-			CHILD,
-			ROOT,
-			"spawn",
-			"conversation",
-			"test:model",
-			"test",
-			"en",
-		);
-		expect(next.getMeterUsage()).toBeUndefined();
-		expect(next.toolCallIdsMap).not.toBe(context.toolCallIdsMap);
-		expect(context.apiRequestsMap).toBeUndefined();
+		// Request bookkeeping is per pass; no map is shared across passes.
+		expect(contexts[1].toolCallIdsMap).not.toBe(contexts[0].toolCallIdsMap);
 	});
 
 	test("primary retains caller-owned metering, SSE, TTFT and substatus accessors", () => {

@@ -1,11 +1,75 @@
 import { randomUUID } from "node:crypto";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
-import type { ActiveNarrator, ActiveSubagentSettings } from "../narrator-session-state";
-import { getManualOverrideMap } from "../subagent-manual-override";
-import type { RunningSubagentExecutionSnapshot } from "../subagent-runner";
+import type {
+	RunCancelWith,
+	RunDeliverTo,
+	RuntimeRunBinding,
+} from "../../lib/validators/runtime-registration";
+import type { ActiveNarrator } from "../narrator-session-state";
 
-export type ExecutionKind = "primary" | "subagent" | "tool-replay";
+/** A model run, or a bounded tool/input replay that excludes one. Never a role. */
+export type ExecutionKind = "run" | "tool-replay";
+
+/** Result of one run as its caller/finalizer sees it. */
+export interface RunResult {
+	started: boolean;
+	logicalRunId?: string;
+	/** Model-visible result for whoever the run delivers to (tagged, with file changes). */
+	output: string;
+	finalText: string;
+	hasError: boolean;
+	interrupted: boolean;
+	timedOut: boolean;
+	terminalStatus?: import("./input").RuntimeTerminalStatus;
+	/** True when the caller was handed back early (detach); the run continues. */
+	handoff?: boolean;
+}
+
+/**
+ * Relationship state of the run an owner is executing. One per owner, generic for
+ * every session: who cancels it, whether a caller is waiting for its result, and how
+ * a suspended hold is woken. Durable facts live in the registration; this is the
+ * live half.
+ */
+export interface RunControl {
+	readonly startedAt: number;
+	/** The final persisted registration; the run never reconstructs its merge rules. */
+	binding?: RuntimeRunBinding;
+	logicalRunId?: string;
+	/** Tool call the run delivers its result to (display adapter and legacy admission). */
+	deliverTo?: RunDeliverTo;
+	/** Registered absolute deadline. */
+	deadlineAt?: string;
+	/** Execution principal of the run (attribution of its result notice). */
+	principal?: string | null;
+	/** The exact caller attempt whose cancellation cancels this run; detach clears it. */
+	cancelWith?: RunCancelWith;
+	/** Whole-run cancellation (caller attempt, deadline, task cancel). */
+	readonly cancel: AbortController;
+	timedOut: boolean;
+	/** File-change provenance segment of this run, when it delivers to a tool call. */
+	executionSegmentId?: string;
+	/** A caller is waiting in the foreground; resolved once, by terminal or detach. */
+	waiter?: (result: RunResult) => void;
+	/** The finalizer has claimed how the result is delivered; a detach can no longer start. */
+	finalizing?: boolean;
+	/** A detach that claimed the caller and is still registering the task projection. */
+	detaching?: Promise<void>;
+	/** Drops the caller-attempt listener (detach). */
+	detachCaller?: () => void;
+	/** Set while the run is suspended by a hold. */
+	wake?: (reason: "input" | "release" | "cancel") => void;
+	readonly terminal: Promise<RunResult>;
+}
+
+/** A user control hold on a session's result: survives runs, mirrored as `taken_over`. */
+export interface RunHold {
+	/** The user let go while a turn was still running; deliver when it ends. */
+	released: boolean;
+	/** Retained after a failed terminal commit; release retries without a model pass. */
+	result?: RunResult;
+}
 
 /** Execution epochs are unrelated to durable tool attempts or publication tokens. */
 export interface ExecutionOwner {
@@ -20,12 +84,11 @@ export interface ExecutionOwner {
 interface RuntimeRecord {
 	owner?: ExecutionOwner;
 	phase?: "suspended";
-	pass?: object;
 	bufferSoftStop?: boolean;
 	session?: ActiveNarrator;
-	subagentSettings?: ActiveSubagentSettings;
 	toolReplayCompletion?: Promise<void>;
-	subagentExecution?: RunningSubagentExecutionSnapshot & { token: string };
+	run?: RunControl;
+	hold?: RunHold;
 }
 
 const records = hotSafe<Map<string, RuntimeRecord>>(
@@ -49,9 +112,9 @@ function prune(narratorId: string): void {
 		!record.owner &&
 		!record.bufferSoftStop &&
 		!record.session &&
-		!record.subagentSettings &&
 		!record.toolReplayCompletion &&
-		!record.subagentExecution
+		!record.run &&
+		!record.hold
 	)
 		records.delete(narratorId);
 }
@@ -65,7 +128,6 @@ export function tryClaimExecution(narratorId: string, kind: ExecutionKind): Exec
 	const record = recordFor(narratorId);
 	if (record.owner) return null;
 	delete record.phase;
-	delete record.pass;
 	const owner: ExecutionOwner = {
 		narratorId,
 		epoch: randomUUID(),
@@ -75,7 +137,7 @@ export function tryClaimExecution(narratorId: string, kind: ExecutionKind): Exec
 			if (!owner.isCurrent()) return false;
 			delete record.owner;
 			delete record.phase;
-			delete record.pass;
+			delete record.run;
 			prune(narratorId);
 			return true;
 		},
@@ -88,10 +150,61 @@ export function tryClaimExecution(narratorId: string, kind: ExecutionKind): Exec
 export function isExecutionSuspended(narratorId: string): boolean {
 	const record = records.get(narratorId);
 	if (!record?.owner) return false;
-	return (
-		(record.phase === "suspended" || legacyOwners.has(record.owner)) &&
-		getManualOverrideMap().has(narratorId)
+	return record.phase === "suspended";
+}
+
+/** Live run state of the current owner, if it is executing a run. */
+export function getRunControl(narratorId: string): RunControl | undefined {
+	return records.get(narratorId)?.run;
+}
+
+/** Attach run state to the owner that executes it; cleared on release. */
+export function setRunControl(owner: ExecutionOwner, run: RunControl | undefined): void {
+	const record = records.get(owner.narratorId);
+	if (record?.owner !== owner) return;
+	if (run) record.run = run;
+	else delete record.run;
+}
+
+export function listRuns(): Array<{ narratorId: string; run: RunControl }> {
+	return [...records].flatMap(([narratorId, record]) =>
+		record.run ? [{ narratorId, run: record.run }] : [],
 	);
+}
+
+/** Live runs registered to be cancelled with `callerNarratorId`'s in-flight attempts. */
+export function listRunsCancelledWith(callerNarratorId: string): RunControl[] {
+	const runs: RunControl[] = [];
+	for (const record of records.values())
+		if (record.run?.cancelWith?.narratorId === callerNarratorId) runs.push(record.run);
+	return runs;
+}
+
+export function getRunHold(narratorId: string): RunHold | undefined {
+	return records.get(narratorId)?.hold;
+}
+
+export function setRunHold(narratorId: string, hold: RunHold | undefined): void {
+	const record = recordFor(narratorId);
+	if (hold) record.hold = hold;
+	else delete record.hold;
+	prune(narratorId);
+}
+
+export function listRunHolds(): string[] {
+	return [...records].flatMap(([id, record]) => (record.hold ? [id] : []));
+}
+
+/** Keep the durable mirror until terminal persistence succeeds, including a deferred release. */
+export function preserveHeldSubstatus(narratorId: string, next: string[]): string[] {
+	const hold = records.get(narratorId)?.hold;
+	return hold && !next.includes("taken_over") ? [...next, "taken_over"] : next;
+}
+
+/** Held and not yet released by the user: the condition the takeover badge shows. */
+export function isRunHeldForDisplay(narratorId: string): boolean {
+	const hold = records.get(narratorId)?.hold;
+	return !!hold && !hold.released;
 }
 
 export function setExecutionSuspended(owner: ExecutionOwner, suspended: boolean): boolean {
@@ -104,33 +217,7 @@ export function setExecutionSuspended(owner: ExecutionOwner, suspended: boolean)
 	return true;
 }
 
-/** A borrowed runner owner still admits at most one executor invocation at a time. */
-export function claimExecutionPass(owner: ExecutionOwner): (() => void) | null {
-	const record = records.get(owner.narratorId);
-	if (record?.owner !== owner || record.pass || isExecutionSuspended(owner.narratorId)) return null;
-	const pass = {};
-	record.pass = pass;
-	return () => {
-		if (record.owner === owner && record.pass === pass) delete record.pass;
-	};
-}
-
-export function requestRuntimeBufferSoftStop(narratorId: string): void {
-	recordFor(narratorId).bufferSoftStop = true;
-}
-
-export function hasRuntimeBufferSoftStop(narratorId: string): boolean {
-	return records.get(narratorId)?.bufferSoftStop === true;
-}
-
-export function clearRuntimeBufferSoftStop(narratorId: string): void {
-	const record = records.get(narratorId);
-	if (!record) return;
-	delete record.bufferSoftStop;
-	prune(narratorId);
-}
-
-/** Existing primary callbacks keep their field API, backed by the same runtime control state. */
+/** Session callbacks keep their field API, backed by the same runtime control state. */
 function attachSessionControlView(
 	narratorId: string,
 	record: RuntimeRecord,
@@ -149,7 +236,10 @@ function attachSessionControlView(
 	});
 }
 
-type ViewField = Exclude<keyof RuntimeRecord, "owner" | "phase" | "pass" | "bufferSoftStop">;
+type ViewField = Exclude<
+	keyof RuntimeRecord,
+	"owner" | "phase" | "bufferSoftStop" | "run" | "hold"
+>;
 
 /** Legacy Map API with no backing Map: all reads/writes project the single record. */
 export function createRuntimeMapView<K extends ViewField>(
@@ -258,11 +348,7 @@ function releaseLegacyBinding(binding: LegacyBinding, terminal = false): void {
 		const record = records.get(binding.owner.narratorId);
 		for (const source of sources ?? []) {
 			const cache = source as LegacyBinding;
-			if (
-				record &&
-				(cache.field === "session" || cache.field === "subagentSettings") &&
-				record[cache.field] === cache.value
-			)
+			if (record && cache.field === "session" && record[cache.field] === cache.value)
 				delete record[cache.field];
 		}
 	}
@@ -273,10 +359,9 @@ function releaseLegacyBinding(binding: LegacyBinding, terminal = false): void {
 }
 
 function legacyMapKind(field: ViewField, value: unknown): ExecutionKind | undefined {
-	if (field === "subagentSettings" || field === "subagentExecution") return "subagent";
 	if (field === "toolReplayCompletion") return "tool-replay";
 	const session = value as ActiveNarrator;
-	return session.alive && session._loopRunning ? "primary" : undefined;
+	return session.alive && session._loopRunning ? "run" : undefined;
 }
 
 function adoptLegacyMap<K extends ViewField>(key: string, field: K): void {
@@ -315,10 +400,7 @@ function adoptLegacyMap<K extends ViewField>(key: string, field: K): void {
 			(!current || current === binding.owner || (!binding.owner && legacyOwners.has(current)))
 		)
 			view.delete(id);
-		releaseLegacyBinding(
-			binding,
-			field === "subagentExecution" || field === "toolReplayCompletion",
-		);
+		releaseLegacyBinding(binding, field === "toolReplayCompletion");
 		return true;
 	};
 	for (const [id, value] of entries) set(id, value);
@@ -359,7 +441,7 @@ function adoptLegacyAdmissions(): void {
 		const previous = bindings.get(id);
 		if (previous?.owner?.isCurrent()) return legacy;
 		const binding: LegacyBinding = { value: id };
-		binding.owner = bindLegacyOwner(id, "primary", binding);
+		binding.owner = bindLegacyOwner(id, "run", binding);
 		bindings.set(id, binding);
 		if (previous) releaseLegacyBinding(previous);
 		return legacy;
@@ -412,12 +494,8 @@ function adoptLegacyAdmissions(): void {
 	});
 }
 
-// Adopt the loop reservation before session metadata: an old primary finalizer may
+// Adopt the loop reservation before session metadata: an old finalizer may
 // already have cleared alive/_loopRunning, yet still owns its original admission.
-// The runner snapshot also covers old children in async preparation before settings
-// registration; its old token-checked unregister is the authoritative legacy terminal.
 adoptLegacyAdmissions();
 adoptLegacyMap("narrafork.activeNarrators", "session");
-adoptLegacyMap("narrafork:runningSubagentExecutions", "subagentExecution");
-adoptLegacyMap("narrafork.activeSubagentSettings", "subagentSettings");
 adoptLegacyMap("narrafork.narratorToolExecutionAdmissions", "toolReplayCompletion");

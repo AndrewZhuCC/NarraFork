@@ -30,17 +30,15 @@ import { aclGrants, knowledgeTags, narrators, users } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
+import { getExecutionOwner } from "../agent-runtime/ownership";
+import { startNarratorRun } from "../agent-runtime/run";
 import { knowledgeService } from "../knowledge-service";
+import { clearBufferedMessages, enqueueBufferedMessage } from "../narrator-buffer";
 import type { ExecuteLoopOptions } from "../narrator-executor";
 import * as narratorExecutor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
+import { resumeBufferedMessagesIfIdle } from "../narrator-session";
 import { activeNarrators } from "../narrator-session-state";
-import {
-	clearSubagentBufferedMessages,
-	consumeNextBufferedSubagentMessage,
-	executeSubagent,
-	pushSubagentBufferedMessage,
-} from "../subagent-executor";
 import {
 	getSubagentKnowledgeCycle,
 	resolveInjectionUserId,
@@ -420,8 +418,18 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			variant: "subagent:general",
 			parentNarratorId,
 			traits: ["standalone"],
+			status: "idle",
 			model,
+			cwd: process.env.HOME,
 			autoContinuationOverride: "off",
+			// A delegated session: its run delivers to the creating call.
+			runtimeRegistrationJson: {
+				version: 1,
+				run: {
+					logicalRunId: `knowledge-${narratorId}`,
+					deliverTo: { narratorId: parentNarratorId, toolUseId },
+				},
+			},
 			createdAt: nowIso(),
 			updatedAt: nowIso(),
 		});
@@ -433,7 +441,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			id: userId,
 			name: creator?.username,
 		});
-		await pushSubagentBufferedMessage(narratorId, text, { createdBy: userId });
+		await enqueueBufferedMessage(narratorId, text, undefined, null, userId);
 		const requests: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults">[] = [];
 		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
 			async (input) => {
@@ -447,36 +455,26 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 		);
 		try {
 			expect(process.env.NARRAFORK_TEST).toBe("1");
-			// This is the real drain used by the executor AND runner restart/takeover paths.
-			// It scans with real ACL, persists a sys row, and rebuilds real provider history.
-			const consumed = drainInExecutor
-				? { prompt: "initial dispatch", history: [], trailingToolResults: [], userId: null }
-				: await consumeNextBufferedSubagentMessage({
-						narratorId,
-						parentNarratorId,
-						toolUseId,
-						model,
-						provider: prefix,
-						cwd: process.env.HOME as string,
-						locale: "en",
-					});
-			if (!consumed) throw new Error("expected the queued message to be consumed");
-			await executeSubagent({
-				narratorId,
-				parentNarratorId,
-				toolUseId,
-				subagentType: "general",
-				prompt: consumed.prompt,
-				initialHistory: consumed.history,
-				initialTrailingToolResults: consumed.trailingToolResults,
-				userId: consumed.userId,
-				cwd: process.env.HOME as string,
-				model,
-				provider: prefix,
-				locale: "en",
-				signal: new AbortController().signal,
-				systemPrompt: "Test subagent",
-			});
+			// The one input consumer scans with real ACL, persists a sys row, and rebuilds
+			// real provider history — whether the queued input wakes an idle session or is
+			// adopted at the end of a running pass.
+			if (drainInExecutor) {
+				const handle = await startNarratorRun({
+					narratorId,
+					locale: "en",
+					text: "initial dispatch",
+					principal: null,
+				});
+				expect(handle.started).toBe(true);
+				await handle.terminal;
+			} else {
+				expect((await resumeBufferedMessagesIfIdle(narratorId, "en")).resumed).toBe(true);
+			}
+			const deadline = Date.now() + 5_000;
+			while (requests.length < (drainInExecutor ? 2 : 1) || getExecutionOwner(narratorId)) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for the queued input run");
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
 			expect(requests).toHaveLength(drainInExecutor ? 2 : 1);
 			const request = requests[requests.length - 1];
 			const rows = await narratorService.getModelHistorySinceLastCompact(narratorId);
@@ -485,20 +483,14 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			if (authorized) {
 				expect(hint?.contentText).toContain(secretEntryId);
 				expect(hint?.parentToolUseId).toBe(toolUseId);
-				const modelHint = projectSenderText(hint?.contentText ?? "", {
-					kind: "system",
-					id: "knowledge_base_hint",
-					name: "knowledge_base_hint",
-				});
 				expect(hint?.contentText).not.toContain("<sender");
 				if (officialApi) {
-					expect(request.userText).toBe(modelText);
-					expect(request.history).toContainEqual({ role: "system", content: modelHint });
+					expect(request.userText).toContain(modelText);
+					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
 				} else {
-					const combined = `${modelHint}\n\n${modelText}`;
-					expect(request.userText).toBe(
-						drainInExecutor ? combined : projectSenderText(combined, { kind: "system" }),
-					);
+					// The hint and the queued message both join the current turn, once each.
+					expect(request.userText).toContain(modelText);
+					expect(request.userText).toContain(hint?.contentText ?? "");
 					expect(JSON.stringify(request.history)).not.toContain(secretEntryId);
 					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
 				}
@@ -511,7 +503,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			}
 		} finally {
 			executor.mockRestore();
-			clearSubagentBufferedMessages(narratorId);
+			clearBufferedMessages(narratorId);
 		}
 	}
 

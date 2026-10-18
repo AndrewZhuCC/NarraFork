@@ -3,7 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
-import { resolveRuntimePolicy } from "../../../services/agent-runtime/policy";
+import {
+	compileDelegationPolicy,
+	resolveRuntimePolicy,
+} from "../../../services/agent-runtime/policy";
 import {
 	extractToolPaths,
 	MAX_PLAN_FILE_BYTES,
@@ -341,12 +344,13 @@ describe("broken tool input attribution", () => {
 
 describe("executeTool trusted runtime policy", () => {
 	test("passes the exact server policy to ToolContext and cannot be overwritten by tool input", async () => {
-		const policy = resolveRuntimePolicy({
-			variant: "subagent",
-			subagentType: "custom",
-			customDefinition: { toolAccess: "custom", customTools: ["Read"] },
-		});
-		const forgedPolicy = resolveRuntimePolicy({ variant: "primary" });
+		const policy = resolveRuntimePolicy([
+			compileDelegationPolicy({
+				template: "custom",
+				customDefinition: { toolAccess: "custom", customTools: ["Read"] },
+			}),
+		]);
+		const forgedPolicy = resolveRuntimePolicy([]);
 		let receivedPolicy: unknown;
 		let receivedInput: unknown;
 		toolRegistry.register({
@@ -379,11 +383,12 @@ describe("executeTool trusted runtime policy", () => {
 		try {
 			const config = makeConfig(async () => ({ behavior: "allow" }));
 			config.parentNarratorId = "trusted-parent";
-			config.runtimePolicy = resolveRuntimePolicy({
-				variant: "subagent",
-				subagentType: "custom",
-				customDefinition: { toolAccess: "custom", customTools: ["Read", "Await"] },
-			});
+			config.runtimePolicy = resolveRuntimePolicy([
+				compileDelegationPolicy({
+					template: "custom",
+					customDefinition: { toolAccess: "custom", customTools: ["Read", "Await"] },
+				}),
+			]);
 			const result = await executeTool(
 				{
 					toolUseId: "policy-ask-denied",
@@ -391,7 +396,7 @@ describe("executeTool trusted runtime policy", () => {
 					input: {
 						async: true,
 						questions: [{ question: "direction", header: "Which direction?", options: [] }],
-						runtimePolicy: resolveRuntimePolicy({ variant: "primary" }),
+						runtimePolicy: resolveRuntimePolicy([]),
 					},
 				},
 				config,
@@ -409,7 +414,9 @@ describe("executeTool trusted runtime policy", () => {
 		toolRegistry.register(askUserQuestionTool);
 		try {
 			const config = makeConfig(async () => ({ behavior: "allow" }));
-			config.runtimePolicy = resolveRuntimePolicy({ variant: "subagent", subagentType: "general" });
+			config.runtimePolicy = resolveRuntimePolicy([
+				compileDelegationPolicy({ template: "general" }),
+			]);
 			const result = await executeTool(
 				{
 					toolUseId: "policy-sync-denied",

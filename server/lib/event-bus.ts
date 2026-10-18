@@ -257,22 +257,6 @@ export type NarraForkEvent =
 			subagentType: string;
 	  }
 	| {
-			type: "narrator:background_task_completed";
-			narratorId: string;
-			parentNarratorId: string;
-			taskNarratorId: string;
-			toolUseId: string;
-			resultPreview: string;
-	  }
-	| {
-			type: "narrator:background_task_failed";
-			narratorId: string;
-			parentNarratorId: string;
-			taskNarratorId: string;
-			toolUseId: string;
-			error: string;
-	  }
-	| {
 			type: "narrator:background_task_cancelled";
 			narratorId: string;
 			parentNarratorId: string;

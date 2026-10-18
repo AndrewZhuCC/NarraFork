@@ -62,6 +62,13 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
+import {
+	isTopLevelMessage,
+	type OwnTurnPlacement,
+	ownTurnPlacementOf,
+	ownTurnSql,
+	RUNTIME_SOURCE_COLUMNS,
+} from "../lib/runtime-source";
 import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings";
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
@@ -71,6 +78,7 @@ import {
 	loadModelHistorySource,
 	markModelHistoryRows,
 } from "./agent-runtime/model-history-source";
+import { isRunHeldForDisplay, listRunHolds } from "./agent-runtime/ownership";
 import {
 	AWAIT_AGENT_RESOLVED_FIELD,
 	type AwaitAgentResolution,
@@ -118,7 +126,6 @@ import {
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
-import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent-takeover";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -2271,7 +2278,7 @@ export interface SubagentActivity {
 	fileChanges?: SubagentFileChanges;
 	/**
 	 * The child is currently TAKEN OVER by the user, so the parent's tool call is
-	 * blocked until the user stops it (`subagent-takeover.ts`).
+	 * blocked until the user stops it (the run hold in `agent-runtime/ownership.ts`).
 	 *
 	 * Carried on the activity snapshot because that snapshot is the reconnect
 	 * catch-up channel: without it a client that reconnects mid-takeover would keep
@@ -2471,7 +2478,7 @@ async function buildSubagentActivities(
 			// still-working subagent the release is DEFERRED to its loop end, and the
 			// takeover set stays populated on purpose. Reading the raw set here re-lit
 			// the badge on every page load in that window.
-			...(isTakenOverForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
+			...(isRunHeldForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
 		});
 	}
 	return activities;
@@ -2904,7 +2911,8 @@ function attachSubagentActivities(
 async function buildTreeFromTopLevelRefs(
 	narratorId: string,
 	refRows: Array<{ messageId: string; seq: number }>,
-	isSubagent: boolean,
+	/** The session's own-turn placement (`ownTurnPlacementOf`). */
+	placement: OwnTurnPlacement,
 	ioBudget: number,
 	signal?: AbortSignal,
 	deadlineAt = Date.now() + 10_000,
@@ -2925,9 +2933,9 @@ async function buildTreeFromTopLevelRefs(
 	const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 	topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 	attachMessageSeqs(topMessages, seqMap);
-	if (isSubagent) {
-		for (const message of topMessages) message.parentToolUseId = null;
-	}
+	// Own turns placed under the session's destination are not nesting on its own page.
+	for (const message of topMessages)
+		if (isTopLevelMessage(message, placement)) message.parentToolUseId = null;
 
 	const subagentToolUseIds = collectSubagentToolUseIds(topMessages);
 	const subagentToolUseIdSet = new Set(subagentToolUseIds);
@@ -2994,7 +3002,7 @@ async function buildTreeFromTopLevelRefs(
  *   - `activities`   → an Agent/Task/Send card's child narrator id
  *   - `awaitAgentIds`→ a running `Await({type:"agent"})`'s resolved child id
  *
- * Takeover authority is the in-memory Set (`subagent-takeover.ts`), so the
+ * Takeover authority is the in-memory Set (the run hold in `agent-runtime/ownership.ts`), so the
  * membership test is synchronous. A finished Await needs no flag: its output
  * already states `taken_over` in words.
  *
@@ -3006,7 +3014,7 @@ function collectTakenOverToolUseIds(
 	awaitAgentIds: ReadonlyMap<string, AwaitAgentResolution>,
 ): Set<string> {
 	const flagged = new Set<string>();
-	const takenOver = new Set(listDisplayTakenOverSubagents());
+	const takenOver = new Set(listRunHolds().filter(isRunHeldForDisplay));
 	if (takenOver.size === 0) return flagged;
 	for (const [toolUseId, activity] of activities) {
 		const child = activity.subagentNarratorId;
@@ -3639,11 +3647,9 @@ const narratorMessageQueriesUnlocked = {
 		return rows;
 	},
 
-	async _getPostCompactTopLevelRefs(
-		narratorId: string,
-		options?: { includeChildMessages?: boolean },
-	) {
-		const includeChildMessages = options?.includeChildMessages ?? false;
+	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
+	async _getPostCompactTopLevelRefs(narratorId: string) {
+		const ownTurn = ownTurnSql(await this.ownTurnPlacement(narratorId));
 
 		const lastCompactRow = await db
 			.select({ seq: narratorMessageRefs.seq })
@@ -3669,17 +3675,14 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					inArray(narratorMessages.role, ["user", "assistant"]),
 					isNull(narratorMessageRefs.segmentCompactId),
-					...(includeChildMessages ? [] : [isNull(narratorMessages.parentToolUseId)]),
+					ownTurn,
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
 	},
 
 	async getCompactBoundaryMessage(narratorId: string, keepPairs = 2): Promise<string | null> {
-		const includeChildMessages = await this.isSubagentNarrator(narratorId);
-		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
-			includeChildMessages,
-		});
+		const refs = await this._getPostCompactTopLevelRefs(narratorId);
 		const keepCount = Math.max(1, Math.floor(keepPairs)) * 2;
 		if (refs.length < keepCount + 2) return null;
 		const boundaryRef = refs[refs.length - keepCount];
@@ -3698,10 +3701,7 @@ const narratorMessageQueriesUnlocked = {
 	 * post-compact messages), in which case no summary can reduce the context.
 	 */
 	async getEmergencyCompactBoundaryMessage(narratorId: string): Promise<string | null> {
-		const includeChildMessages = await this.isSubagentNarrator(narratorId);
-		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
-			includeChildMessages,
-		});
+		const refs = await this._getPostCompactTopLevelRefs(narratorId);
 		// Need at least 2 messages: one to summarize + one to keep as the boundary.
 		if (refs.length < 2) return null;
 		// Keep only the most recent message; compact everything before it.
@@ -3888,12 +3888,16 @@ const narratorMessageQueriesUnlocked = {
 		};
 	},
 
-	async isSubagentNarrator(narratorId: string): Promise<boolean> {
+	/**
+	 * Where this session's own turns are placed (`ownTurnPlacementOf`): the tool call its
+	 * run delivers to, `null` for none, `"*"` for an unregistered legacy delegation.
+	 */
+	async ownTurnPlacement(narratorId: string): Promise<OwnTurnPlacement> {
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { variant: true },
+			columns: RUNTIME_SOURCE_COLUMNS,
 		});
-		return narrator != null && isSubagentVariant(narrator.variant);
+		return narrator ? ownTurnPlacementOf(narrator) : null;
 	},
 
 	/**
@@ -3923,11 +3927,10 @@ const narratorMessageQueriesUnlocked = {
 	 *
 	 * This is the lightweight replacement for the old around-window query: it only
 	 * reads narrow indexed columns and never returns content_json/message trees.
-	 * For primary narrators, child messages are resolved by walking parent
-	 * tool-use ownership until a referenced top-level message is found. For a
-	 * subagent narrator, its own refs are already top-level from that page's point
-	 * of view, even when messages carry parentToolUseId pointing to the parent
-	 * narrator.
+	 * A session's own turns (`isTopLevelMessage`: no placement, or placed under the
+	 * tool call its run delivers to) are their own location. A nested message is
+	 * resolved by walking parent tool-use ownership until a referenced top-level
+	 * message is found.
 	 */
 	async getMessageLocation(
 		narratorId: string,
@@ -3937,8 +3940,8 @@ const narratorMessageQueriesUnlocked = {
 		topLevelMessageId: string;
 		seq: number;
 	}> {
-		const [isSubagent, target] = await Promise.all([
-			this.isSubagentNarrator(narratorId),
+		const [placement, target] = await Promise.all([
+			this.ownTurnPlacement(narratorId),
 			db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
 				columns: { id: true, parentToolUseId: true },
@@ -3963,7 +3966,7 @@ const narratorMessageQueriesUnlocked = {
 			});
 
 		const directRef = await findVisibleRef(target.id);
-		if (directRef && (isSubagent || !target.parentToolUseId)) {
+		if (directRef && isTopLevelMessage(target, placement)) {
 			return { messageId: target.id, topLevelMessageId: target.id, seq: directRef.seq };
 		}
 
@@ -4039,9 +4042,9 @@ const narratorMessageQueriesUnlocked = {
 		}
 		const narratorMeta = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { variant: true, messageVersion: true },
+			columns: { ...RUNTIME_SOURCE_COLUMNS, messageVersion: true },
 		});
-		const isSubagent = narratorMeta != null && isSubagentVariant(narratorMeta.variant);
+		const placement = narratorMeta ? ownTurnPlacementOf(narratorMeta) : null;
 		const messageVersion = narratorMeta?.messageVersion ?? 0;
 		if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
 			throw new AppError(
@@ -4073,22 +4076,19 @@ const narratorMessageQueriesUnlocked = {
 		// largest narrators, for the tail page and the `beforeSeq` scroll-up page
 		// alike. Deliberately NOT an `INDEXED BY` hint: this spelling needs no
 		// SQLite-only syntax, so it stays off the dialect-migration ledger.
-		const isTopLevelRef = () =>
+		// The session's own turns (`isTopLevelMessage`); `"*"` (legacy) filters nothing.
+		const ownTurn = ownTurnSql(placement);
+		const isTopLevelRef = (condition: SQL) =>
 			exists(
 				db
 					.select({ one: sql`1` })
 					.from(narratorMessages)
-					.where(
-						and(
-							eq(narratorMessages.id, narratorMessageRefs.messageId),
-							isNull(narratorMessages.parentToolUseId),
-						),
-					),
+					.where(and(eq(narratorMessages.id, narratorMessageRefs.messageId), condition)),
 			);
 		const baseConditions = [
 			eq(narratorMessageRefs.narratorId, narratorId),
 			isNull(narratorMessageRefs.segmentCompactId),
-			...(isSubagent ? [] : [isTopLevelRef()]),
+			...(ownTurn ? [isTopLevelRef(ownTurn)] : []),
 		];
 
 		// `afterSeq` → ascending page after the cursor (kept for compatibility with
@@ -4151,7 +4151,7 @@ const narratorMessageQueriesUnlocked = {
 				await buildTreeFromTopLevelRefs(
 					narratorId,
 					pageRows,
-					isSubagent,
+					placement,
 					// The ONLY path whose bodies are measured for the exact layout: the budget
 					// must fill the detail caps, or a card reserves a box it cannot fill.
 					EXACT_TOOL_IO_BUDGET,
@@ -4198,7 +4198,8 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getMessagesAfter(narratorId: string, after: CatchUpCursor, limit = 200) {
-		const isSubagent = await this.isSubagentNarrator(narratorId);
+		const placement = await this.ownTurnPlacement(narratorId);
+		const ownTurn = ownTurnSql(placement);
 		const inputCursor: CatchUpCursor = after;
 
 		let parentAnchorSeq: number | null = null;
@@ -4229,7 +4230,7 @@ const narratorMessageQueriesUnlocked = {
 				where: eq(narratorMessages.id, parentLastMessageId),
 				columns: { narratorId: true, parentToolUseId: true },
 			});
-			if (!isSubagent && parentMessage?.parentToolUseId) {
+			if (parentMessage?.parentToolUseId && !isTopLevelMessage(parentMessage, placement)) {
 				const childAnchorMessageId = parentLastMessageId;
 				const scope = db.transaction((tx) =>
 					resolveAggregateScopeTx(tx, narratorId, [parentMessage.parentToolUseId as string]),
@@ -4258,12 +4259,14 @@ const narratorMessageQueriesUnlocked = {
 			if (anchor.parentToolUseId) upsertCursorChildAnchor(baseChildAnchors, anchor);
 		}
 
-		const resolvedAnchors = !isSubagent
-			? await resolveCatchUpChildAnchors(narratorId, trimCursorChildAnchors(baseChildAnchors))
-			: {
-					messageAnchors: new Map<string, ResolvedChildAnchor>(),
-					subagentAnchors: new Map<string, CatchUpChildAnchor>(),
-				};
+		// Legacy "*" (step 5: delete): every row is an own turn, nothing is nested.
+		const resolvedAnchors =
+			placement !== "*"
+				? await resolveCatchUpChildAnchors(narratorId, trimCursorChildAnchors(baseChildAnchors))
+				: {
+						messageAnchors: new Map<string, ResolvedChildAnchor>(),
+						subagentAnchors: new Map<string, CatchUpChildAnchor>(),
+					};
 		const resolvedChildAnchors = resolvedAnchors.messageAnchors;
 		const cursorChildAnchors = trimCursorChildAnchors(
 			new Map<string, CatchUpChildAnchor>([
@@ -4311,7 +4314,7 @@ const narratorMessageQueriesUnlocked = {
 				gt(narratorMessageRefs.seq, parentAnchorSeq),
 				isNull(narratorMessageRefs.segmentCompactId),
 			];
-			if (!isSubagent) rowConditions.push(sql`${narratorMessages.parentToolUseId} IS NULL`);
+			if (ownTurn) rowConditions.push(ownTurn);
 			refRows = await db
 				.select({
 					messageId: narratorMessageRefs.messageId,
@@ -4365,13 +4368,11 @@ const narratorMessageQueriesUnlocked = {
 		const topMsgs = [] as typeof allMessages;
 		const childMsgs = [] as typeof allMessages;
 		for (const msg of allMessages) {
-			if (isSubagent) {
+			if (isTopLevelMessage(msg, placement)) {
 				msg.parentToolUseId = null;
 				topMsgs.push(msg);
-			} else if (msg.parentToolUseId) {
-				childMsgs.push(msg);
 			} else {
-				topMsgs.push(msg);
+				childMsgs.push(msg);
 			}
 		}
 

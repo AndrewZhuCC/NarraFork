@@ -13,7 +13,7 @@ let service: ReturnType<typeof createContextCharacterService>;
 beforeEach(() => {
 	database = new Database(":memory:");
 	// Deliberately omit every body column: accidentally reading a body fails at SQL preparation.
-	database.run(`CREATE TABLE narrators (id TEXT PRIMARY KEY, type TEXT DEFAULT 'primary', variant TEXT DEFAULT 'primary', message_version INTEGER DEFAULT 0,
+	database.run(`CREATE TABLE narrators (id TEXT PRIMARY KEY, type TEXT DEFAULT 'primary', variant TEXT DEFAULT 'primary', parent_narrator_id TEXT, runtime_registration_json TEXT, message_version INTEGER DEFAULT 0,
 	 context_char_revision INTEGER DEFAULT 0, context_system_chars INTEGER DEFAULT 0,
 	 context_summary_chars INTEGER DEFAULT 0, context_tools_chars INTEGER DEFAULT 0, context_char_cache_json TEXT, context_usage_snapshot_json TEXT);
 	 CREATE TABLE narrator_message_refs (narrator_id TEXT, message_id TEXT, seq INTEGER, is_compact INTEGER DEFAULT 0, segment_compact_id TEXT);
@@ -171,22 +171,39 @@ test("legacy system role ignores ordinary content but keeps segment summary; sys
 	expect(result.totalChars).toBe(30);
 });
 
-test("primary excludes linked child trees while subagent keeps its own projected refs", async () => {
+const deliversTo = (toolUseId: string) =>
+	JSON.stringify({
+		version: 1,
+		run: { logicalRunId: "r", deliverTo: { narratorId: "caller", toolUseId } },
+	});
+
+test("only the session's own turns count: no placement, or placed under its run's destination", async () => {
 	message("top", 1, [{ category: "user", chars: 3 }]);
-	message("child-tree", 2, [{ category: "assistant", chars: 5 }], "assistant");
-	database.run(`UPDATE narrator_messages SET parent_tool_use_id='parent-tool' WHERE id='child-tree';
-	 INSERT INTO narrator_tool_calls(id,narrator_id,message_id,tool_use_id,input_chars,output_chars) VALUES ('nested-tool','child','child-tree','bash',7,11);
-	 INSERT INTO narrators(id,type,variant) VALUES ('child','subagent','primary');
-	 INSERT INTO narrator_message_refs SELECT 'child',message_id,seq,is_compact,segment_compact_id FROM narrator_message_refs WHERE narrator_id='n';`);
+	message("own-turn", 2, [{ category: "assistant", chars: 5 }], "assistant");
+	message("nested", 3, [{ category: "assistant", chars: 13 }], "assistant");
+	database.run(`UPDATE narrator_messages SET parent_tool_use_id='dest-tool' WHERE id='own-turn';
+	 UPDATE narrator_messages SET parent_tool_use_id='other-tool' WHERE id='nested';
+	 INSERT INTO narrator_tool_calls(id,narrator_id,message_id,tool_use_id,input_chars,output_chars) VALUES ('own-tool','n','own-turn','bash',7,11);`);
+	// No registered destination: placed rows are nested, not own turns.
 	expect((await ready()).totalChars).toBe(3);
-	await service.get("child");
-	await service.settled();
-	expect((await service.get("child")).totalChars).toBe(26);
-	// Profile itself participates in the cache fingerprint even without a version bump.
-	database.run("UPDATE narrators SET variant='subagent:general' WHERE id='n'");
+	// Registering a destination (no parent, ordinary type) makes rows under it own turns;
+	// the registration participates in the cache fingerprint without a version bump.
+	database
+		.query("UPDATE narrators SET runtime_registration_json=? WHERE id='n'")
+		.run(deliversTo("dest-tool"));
 	expect((await service.get("n")).pending).toBe(true);
 	await service.settled();
 	expect((await service.get("n")).totalChars).toBe(26);
+	// A delegated session with the same registration counts exactly the same rows.
+	database.run(`INSERT INTO narrators(id,type,variant,parent_narrator_id) VALUES ('child','subagent','subagent:general','caller');
+	 INSERT INTO narrator_message_refs SELECT 'child',message_id,seq,is_compact,segment_compact_id FROM narrator_message_refs WHERE narrator_id='n';
+	 INSERT INTO narrator_tool_calls(id,narrator_id,message_id,tool_use_id,input_chars,output_chars) VALUES ('own-tool-child','child','own-turn','bash',7,11);`);
+	database
+		.query("UPDATE narrators SET runtime_registration_json=? WHERE id='child'")
+		.run(deliversTo("dest-tool"));
+	await service.get("child");
+	await service.settled();
+	expect((await service.get("child")).totalChars).toBe(26);
 });
 
 test("child compact marker cannot advance the primary compact boundary", async () => {

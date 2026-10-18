@@ -96,6 +96,12 @@ function seedNarrator(narratorId: string) {
 			variant: "primary",
 			traits: ["standalone"],
 			model: "openai:test-model",
+			// These fixtures intentionally exercise anonymous system execution, not an
+			// unknown principal (which the runtime correctly refuses to invent).
+			runtimeRegistrationJson: {
+				version: 1,
+				run: { logicalRunId: `fixture-${narratorId}`, principal: { userId: null } },
+			},
 			permissionMode: "bypassPermissions",
 			autoContinuationOverride: "off",
 			status: "idle",
@@ -433,6 +439,98 @@ test("a live queued Bash does not hold admission and interrupt terminates its pr
 		interruptManualBash(narratorId);
 		closeNarrator(narratorId);
 		await within(stopped.promise).catch(() => {});
+		execute.mockRestore();
+	}
+}, 10_000);
+
+test("interrupt terminates a running loop's pre-command Bash and is adopted in the same run", async () => {
+	const narratorId = "mailbox-loop-pre-bash";
+	seedNarrator(narratorId);
+	db.insert(users)
+		.values({ id: "pre-user", username: "pre-user", passwordHash: "unused", createdAt: now })
+		.run();
+	const { bashTool } = await import("../../lib/agent/tools/bash");
+	const { interruptManualBash } = await import("../narrator-service");
+	const oldStarted = Promise.withResolvers<void>();
+	const releaseOld = Promise.withResolvers<void>();
+	const bashStarted = Promise.withResolvers<AbortSignal>();
+	const bashStopped = Promise.withResolvers<void>();
+	const original = bashTool.execute;
+	const execute = spyOn(bashTool, "execute").mockImplementation(async (input, context) => {
+		try {
+			return await original(input, {
+				...context,
+				emitOutput: (output) => {
+					context.emitOutput?.(output);
+					if (String(output).includes("pre-ready")) bashStarted.resolve(context.signal);
+				},
+			});
+		} finally {
+			bashStopped.resolve();
+		}
+	});
+	let ownerAtUrgent: unknown;
+	beforeResponse = async (params) => {
+		if (params.content === "old task") {
+			oldStarted.resolve();
+			await releaseOld.promise;
+		}
+		if (params.content === "urgent input") ownerAtUrgent = getExecutionOwner(narratorId);
+	};
+	async function within<T>(promise: Promise<T>): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				promise,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(new Error("Pre-command settlement timed out")), 2000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	try {
+		await acceptUserMessage(narratorId, "old task");
+		await within(oldStarted.promise);
+		const owner = getExecutionOwner(narratorId);
+		// An ordinary next step with a pre-command: the live loop adopts it and runs the
+		// Bash as its current activity.
+		expect(
+			await acceptUserMessage(narratorId, "after pre", {
+				userId: "pre-user",
+				preBashCommand: "printf pre-ready; sleep 300",
+			}),
+		).toMatchObject({ buffered: true });
+		releaseOld.resolve();
+		const signal = await within(bashStarted.promise);
+		expect(signal.aborted).toBe(false);
+		expect(getExecutionOwner(narratorId)).toBe(owner);
+
+		expect(
+			await within(acceptUserMessage(narratorId, "urgent input", { interrupt: true })),
+		).toMatchObject({ buffered: true });
+		expect(signal.aborted).toBe(true);
+		await within(bashStopped.promise);
+
+		const deadline = Date.now() + 3_000;
+		while (!providerCalls.includes("urgent input") && Date.now() < deadline) await Bun.sleep(10);
+		expect(providerCalls[0]).toBe("old task");
+		expect(providerCalls).toContain("urgent input");
+		// Same run: the owner that ran the old task adopted the urgent input.
+		expect(ownerAtUrgent).toBe(owner);
+		expect(
+			db
+				.select({ reason: narrators.lastStopReason })
+				.from(narrators)
+				.where(eq(narrators.id, narratorId))
+				.get()?.reason,
+		).not.toBe("user_interrupt");
+	} finally {
+		releaseOld.resolve();
+		interruptManualBash(narratorId);
+		closeNarrator(narratorId);
+		await within(bashStopped.promise).catch(() => {});
 		execute.mockRestore();
 	}
 }, 10_000);
@@ -810,21 +908,19 @@ test("plan-mode parent wakes after a report arrives during idle finalization", a
 		.set({ traits: ["standalone", "plan"] })
 		.where(eq(narrators.id, narratorId))
 		.run();
-	const original = narratorService.compareAndSetStatus.bind(narratorService);
+	const original = narratorService.updateStatus.bind(narratorService);
 	let queued = false;
-	const update = spyOn(narratorService, "compareAndSetStatus").mockImplementation(
-		async (...args) => {
-			const result = await original(...args);
-			if (args[0] === narratorId && args[2] === "idle" && providerCalls.length === 1 && !queued) {
-				queued = true;
-				enqueueDelegatedReport(narratorId, "agent");
-				// The old owner still holds execution; release must recheck the durable queue.
-				expect(getExecutionOwner(narratorId)).toBeDefined();
-				expect(await wakeInboxIfEligible(narratorId)).toBe(false);
-			}
-			return result;
-		},
-	);
+	const update = spyOn(narratorService, "updateStatus").mockImplementation(async (...args) => {
+		const result = await original(...args);
+		if (args[0] === narratorId && args[1] === "idle" && providerCalls.length === 1 && !queued) {
+			queued = true;
+			enqueueDelegatedReport(narratorId, "agent");
+			// The old owner still holds execution; release must recheck the durable queue.
+			expect(getExecutionOwner(narratorId)).toBeDefined();
+			expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		}
+		return result;
+	});
 	try {
 		await acceptUserMessage(narratorId, "delegate research then stop");
 		await waitForIdle(narratorId, 2);
@@ -880,7 +976,7 @@ test.each([
 	enqueueDelegatedReport(narratorId, "agent");
 	let release: (() => void) | undefined;
 	if (barrier === "owner") {
-		const owner = tryClaimExecution(narratorId, "primary");
+		const owner = tryClaimExecution(narratorId, "run");
 		if (!owner) throw new Error("failed to claim owner");
 		release = () => {
 			owner.release();

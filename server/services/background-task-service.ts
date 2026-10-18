@@ -831,6 +831,8 @@ class BackgroundTaskService {
 		toolUseId?: string;
 		alias?: string;
 		title?: string;
+		/** Relations of the run this task projects (new run, or a re-registration on adopt). */
+		binding?: import("../lib/validators/runtime-registration").RunBindingInput;
 	}): Promise<BackgroundTaskRecord> {
 		const now = new Date().toISOString();
 		const pub = getRuntimePublicationService();
@@ -941,6 +943,7 @@ class BackgroundTaskService {
 			narratorId: opts.subagentNarratorId,
 			parentNarratorId: opts.parentNarratorId,
 			taskRow,
+			binding: opts.binding,
 		});
 		// On SQLite, startAgentRun ignores taskRow — insert the task row
 		// in the legacy sync path.
@@ -2453,7 +2456,7 @@ class BackgroundTaskService {
 	 *
 	 * Rows that ALSO have a unified task row are excluded. This is not only about
 	 * old data: every background subagent alive today writes both
-	 * (`narrators.is_background = 1` in subagent-runner/subagent-detach, then
+	 * (`narrators.is_background = 1` in subagent-runner/agent-runtime/run, then
 	 * `createAgentTask` with the same id), so without this the current path yields
 	 * each running subagent twice — double-counting `activeCount`, halving the
 	 * effective page size, and letting the legacy projection (no alias, no
@@ -3362,17 +3365,52 @@ class BackgroundTaskService {
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<WaitResult> {
+		const deadline = Date.now() + timeoutMs;
+		// Terminal intent commits before idle, but a waiter must observe the complete
+		// finalizer (including visible status), not its intermediate task-row commit.
+		const afterFinalizer = async (result: WaitResult): Promise<WaitResult> => {
+			if (result.publicationRun?.producerKind !== "agent" || !result.terminalResultReceived)
+				return result;
+			const { getRunControl } = await import("./agent-runtime/ownership");
+			const run = getRunControl(taskId);
+			if (run?.logicalRunId !== result.publicationRun.logicalRunId) return result;
+			// Keep the caller's original cancellation and budget during this last,
+			// bounded wait too; a blocked status write must not strand Await.
+			return new Promise<WaitResult>((resolve) => {
+				const cleanup = () => {
+					clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
+				};
+				const onAbort = () => {
+					cleanup();
+					resolve({ status: "aborted", output: this.getOutputBuffer(taskId) });
+				};
+				const timer = setTimeout(
+					() => {
+						cleanup();
+						resolve({ status: "timeout", output: this.getOutputBuffer(taskId) });
+					},
+					Math.max(0, deadline - Date.now()),
+				);
+				signal?.addEventListener("abort", onAbort, { once: true });
+				void run.terminal.then(() => {
+					cleanup();
+					resolve(result);
+				});
+				if (signal?.aborted) onAbort();
+			});
+		};
 		// Check if already done
 		const task = await this.getById(taskId);
 		if (task && task.status !== "running") {
-			return {
+			return afterFinalizer({
 				status: toWaitStatus(task.status),
 				output: task.output,
 				...terminalWaitReceipt(task),
-			};
+			});
 		}
 
-		return new Promise<WaitResult>((resolve) => {
+		const result = await new Promise<WaitResult>((resolve) => {
 			let settled = false;
 			let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -3470,6 +3508,7 @@ class BackgroundTaskService {
 					// Live lifecycle listeners remain authoritative if the recheck fails.
 				});
 		});
+		return afterFinalizer(result);
 	}
 
 	async waitForText(
@@ -3772,7 +3811,37 @@ class BackgroundTaskService {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			return this.recoverStaleTasksAfterRestart(protectedTaskIds, scanned.at(-1)?.id);
 		};
+		// A failed source transaction may have left a same-run terminal checkpoint.
+		// Finish it through the one run finalizer before the generic stale-task path
+		// can replace the answer with a synthetic restart cancellation.
+		const restoredTerminals = new Set<string>();
+		for (const task of scanned) {
+			if (task.type !== "agent" || !task.logicalRunId || protectedTaskIds.has(task.id)) continue;
+			const checkpoint = await db.query.narrators.findFirst({
+				where: eq(narrators.id, task.subagentNarratorId ?? task.id),
+				columns: { id: true, logicalRunId: true, backgroundCompletedAt: true, substatus: true },
+			});
+			if (
+				checkpoint?.logicalRunId !== task.logicalRunId ||
+				!checkpoint.backgroundCompletedAt ||
+				!parseSubstatus(checkpoint.substatus).includes(`terminal_run:${task.logicalRunId}`)
+			)
+				continue;
+			const { startNarratorRun } = await import("./agent-runtime/run");
+			const handle = await startNarratorRun({
+				narratorId: checkpoint.id,
+				locale: "en",
+				text: "",
+				recovered: true,
+				resumeRunId: task.logicalRunId,
+			});
+			if (handle.started) await handle.completion;
+			// A live owner or failed commit retains its reservation/checkpoint; never
+			// fall through and publish a different terminal for the same run.
+			restoredTerminals.add(task.id);
+		}
 		const staleTasks = scanned
+			.filter((task) => !restoredTerminals.has(task.id))
 			// Only an agent row can be protected — see the note above on why a bash row
 			// has no resume path to protect.
 			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));
