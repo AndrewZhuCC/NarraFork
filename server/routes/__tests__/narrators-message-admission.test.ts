@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import { type FileReference, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
@@ -6,6 +7,7 @@ import {
 } from "@shared/text-file-types";
 import { Hono } from "hono";
 import {
+	bindComposerDocumentReferences,
 	parseOptionalComposerDocument,
 	validateComposerAssets,
 	validateComposerProjection,
@@ -52,6 +54,7 @@ function fixture(
 		expandedCommand?: boolean;
 		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
+		canonicalPrefix?: string;
 	} = {},
 ) {
 	let status = options.status ?? "idle";
@@ -106,6 +109,7 @@ function fixture(
 		ValidationError,
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
+		bindComposerDocumentReferences,
 		validateComposerProjection,
 		validateComposerAssets,
 		sendMessageSchema,
@@ -116,7 +120,9 @@ function fixture(
 		captureFileReferences: async (_id: string, _userId: string, refs: FileReference[]) =>
 			refs.map((reference) => ({
 				type: "file_reference",
-				reference,
+				reference: options.canonicalPrefix
+					? { ...reference, path: `${options.canonicalPrefix}${reference.path}` }
+					: reference,
 				snapshotText: "private snapshot bytes",
 				snapshotHash: "a".repeat(64),
 				capturedAt: "2026-09-21T00:00:00.000Z",
@@ -328,6 +334,43 @@ describe("primary HTTP message admission", () => {
 		expect(
 			(await f.post({ message: "rich", composerDocument: { ...document, version: 9 } })).status,
 		).toBe(400);
+	});
+	test("document adopts canonical file reference metadata from capture", async () => {
+		const f = fixture({ buffered: true, canonicalPrefix: "/private" });
+		const reference = { id: "ref", deviceId: "local", path: "/tmp/a.ts", label: "a.ts" };
+		const document = {
+			version: 1,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "see " },
+						{ type: "fileReference", id: "node", reference },
+					],
+				},
+			],
+			assets: [],
+		};
+		const message = "see #file:a.ts";
+		const response = await f.post({
+			message,
+			fileReferences: [{ ...reference, inputRange: [4, message.length] }],
+			composerDocument: document,
+		});
+		expect(response.status).toBe(202);
+		const admission = f.accept.mock.calls[0]?.[2] as {
+			composerDocument: ComposerDocument;
+			fileReferences: { reference: FileReference }[];
+		};
+		const node = admission.composerDocument.paragraphs[0]?.children[1];
+		expect(node?.type === "fileReference" && node.reference.path).toBe("/private/tmp/a.ts");
+		// Durable admission re-validates against the captured snapshots.
+		expect(() =>
+			validateComposerProjection(
+				admission.composerDocument,
+				message,
+				admission.fileReferences.map((snapshot) => snapshot.reference),
+			),
+		).not.toThrow();
 	});
 	test.each([
 		"turn",

@@ -51,6 +51,29 @@ export function validateComposerProjection(
 	)
 		throw new ValidationError("Composer document does not match text or file references");
 }
+/**
+ * Capture canonicalizes requested references (absolute/realpath, EOF selection), so the
+ * client's layout sidecar must adopt the frozen metadata before downstream validation.
+ */
+export function bindComposerDocumentReferences(
+	document: ComposerDocument | undefined,
+	references: readonly FileReference[] | undefined,
+): ComposerDocument | undefined {
+	if (!document || !references?.length) return document;
+	const byId = new Map(references.map((ref) => [ref.id, ref]));
+	return {
+		...document,
+		paragraphs: document.paragraphs.map((paragraph) => ({
+			children: paragraph.children.map((node) => {
+				if (node.type !== "fileReference") return node;
+				const captured = byId.get(node.reference.id);
+				if (!captured) return node;
+				const { inputRange: _range, ...reference } = captured;
+				return { ...node, reference };
+			}),
+		})),
+	};
+}
 // biome-ignore lint/suspicious/noExplicitAny: persisted content blocks are dynamic JSON
 export function validatePersistedComposerDocument(value: unknown, blocks: readonly any[]) {
 	const document = parseOptionalComposerDocument(value);

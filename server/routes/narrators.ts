@@ -92,6 +92,7 @@ import {
 } from "../lib/browser/session";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
+	bindComposerDocumentReferences,
 	parseOptionalComposerDocument,
 	validateComposerAssets,
 	validateComposerProjection,
@@ -2159,7 +2160,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		interrupt: requestedInterrupt,
 		queueMode,
 		fileReferences,
-		composerDocument,
+		composerDocument: requestedComposerDocument,
 	} = await parseMessageRequest(c, id);
 	// Explicit mode wins over legacy booleans; omission retains existing callers.
 	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
@@ -2173,7 +2174,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// a rejected reference must not strand images saved by multipart parsing.
 	let uploadsAccepted = false;
 	try {
-		const mixedDocument = composerDocument?.paragraphs.some((paragraph) =>
+		const mixedDocument = requestedComposerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
 		);
 		const queuedNewCommand = mixedDocument ? null : parseNewCommand(message);
@@ -2405,6 +2406,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		const snapshots = fileReferences?.length
 			? await captureFileReferences(id, userId, fileReferences, c.req.raw.signal)
 			: undefined;
+		const composerDocument = bindComposerDocumentReferences(
+			requestedComposerDocument,
+			snapshots?.map((snapshot) => snapshot.reference),
+		);
 
 		// Extract model override from resolved command (if any)
 		const modelOverride =
@@ -3059,6 +3064,10 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		userId,
 		c.req.raw.signal,
 	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
+	);
 
 	// Editing a message truncates everything after it and regenerates, so the running
 	// turn is exactly what the user is replacing. Interrupt it for them rather than
@@ -3375,6 +3384,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		located.message.fileReferences ?? [],
 		fileReferences,
 		(references) => captureFileReferences(id, c.get("user").sub, references, c.req.raw.signal),
+	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
 	);
 	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
