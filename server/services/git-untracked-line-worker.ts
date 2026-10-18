@@ -141,7 +141,16 @@ if (port) {
 	let active: AbortController | undefined;
 	port.on(
 		"message",
-		async (message: { action: "read"; cwd: string; paths: string[] } | { action: "cancel" }) => {
+		async (
+			message:
+				| { action: "read"; cwd: string; paths: string[] }
+				| { action: "cancel" }
+				| { action: "ping" },
+		) => {
+			if (message.action === "ping") {
+				port.postMessage({ ready: true });
+				return;
+			}
 			if (message.action === "cancel") {
 				active?.abort();
 				return;

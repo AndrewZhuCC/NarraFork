@@ -669,6 +669,7 @@ export class LocalBackend implements ExecutionBackend {
 			stdout: "pipe",
 			stderr: "pipe",
 			signal: params.signal,
+			windowsHide: true,
 		});
 
 		let timedOut = false;
@@ -726,11 +727,18 @@ export class LocalBackend implements ExecutionBackend {
 		if (params.env) env = { ...env, ...params.env };
 
 		let spawnArgs: [string, string[], object];
+		// windowsHide：Windows 上不隐藏会让每次 Bash 工具调用都弹出控制台窗口。
 		if (shellInfo.loginWrap) {
 			spawnArgs = [
 				shellInfo.path,
 				["--login", "-c", params.command],
-				{ cwd: params.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				{
+					cwd: params.cwd,
+					env,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: false,
+					windowsHide: true,
+				},
 			];
 		} else if (shellInfo.type === "powershell") {
 			const psArgs = freshEnv
@@ -739,13 +747,25 @@ export class LocalBackend implements ExecutionBackend {
 			spawnArgs = [
 				shellInfo.path,
 				psArgs,
-				{ cwd: params.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				{
+					cwd: params.cwd,
+					env,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: false,
+					windowsHide: true,
+				},
 			];
 		} else if (freshEnv) {
 			spawnArgs = [
 				shellInfo.path,
 				["-l", "-c", params.command],
-				{ cwd: params.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+				{
+					cwd: params.cwd,
+					env,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: true,
+					windowsHide: true,
+				},
 			];
 		} else {
 			spawnArgs = [
@@ -757,6 +777,7 @@ export class LocalBackend implements ExecutionBackend {
 					env,
 					stdio: ["ignore", "pipe", "pipe"],
 					detached: !isWin,
+					windowsHide: true,
 				},
 			];
 		}
@@ -790,6 +811,7 @@ export class LocalBackend implements ExecutionBackend {
 			stdout: "pipe",
 			stderr: "pipe",
 			signal,
+			windowsHide: true,
 		});
 		const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
 		return stdout;
@@ -802,6 +824,7 @@ export class LocalBackend implements ExecutionBackend {
 			stdout: "pipe",
 			stderr: "pipe",
 			signal: params.signal,
+			windowsHide: true,
 		});
 		const killProc = () => {
 			try {

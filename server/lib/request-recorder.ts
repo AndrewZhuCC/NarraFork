@@ -15,6 +15,7 @@ import {
 	type RequestRecordingDetail,
 	type SavedRecording,
 } from "../../shared/request-recording";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "./compiled-worker";
 import { diskSafetySettings } from "./disk-safety";
 import { AppError } from "./errors";
 import { hotSafe } from "./hot-safe";
@@ -31,9 +32,7 @@ import {
 	type RecordingSide,
 } from "./request-recorder-protocol";
 import { sanitizeRecordingMetadata } from "./request-recorder-sanitize";
-import { isCompiledRuntime } from "./runtime-target";
 import { settings } from "./settings";
-import { shareHtmlWorkerEntry } from "./share-preview-html";
 
 export { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "./request-recorder-protocol";
 
@@ -107,17 +106,15 @@ export class RequestRecorderClient {
 		if (this.starting) return this.starting;
 		const generation = ++this.generation;
 		this.starting = (async () => {
-			const paths = isCompiledRuntime()
-				? [
-						"./lib/request-recorder-worker.js",
-						"./server/lib/request-recorder-worker.js",
-						"./request-recorder-worker.js",
-					]
-				: ["./request-recorder-worker.ts"];
+			const paths = compiledWorkerSpecifiers(
+				"lib/request-recorder-worker.ts",
+				"./request-recorder-worker.ts",
+				import.meta.url,
+			);
 			let failure: unknown;
 			for (const path of paths) {
 				if (this.closed || generation !== this.generation) return;
-				const worker = new Worker(shareHtmlWorkerEntry(new URL(path, import.meta.url).href), {
+				const worker = new Worker(workerEntryFromSpecifier(path), {
 					workerData: { home: this.home },
 				});
 				this.worker = worker;

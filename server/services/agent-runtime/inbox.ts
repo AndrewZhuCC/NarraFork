@@ -1214,6 +1214,8 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 						intent: "follow_up",
 						actor: "parent_agent",
 						mailboxInput: true,
+						// Same as a direct Send wake: nobody waits on this run in the foreground.
+						asBackgroundTask: true,
 						locale,
 					})
 				).started;

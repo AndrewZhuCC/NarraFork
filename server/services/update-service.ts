@@ -40,6 +40,7 @@ import {
 } from "../lib/helper-distribution-runtime";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { managerChildTokenEnv } from "../lib/manager-token";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
@@ -113,6 +114,7 @@ async function zstdCliResponds(binary: string, signal?: AbortSignal): Promise<bo
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
+			windowsHide: true,
 		});
 	} catch {
 		return false;
@@ -1932,6 +1934,8 @@ async function drainAndSpawnPreparedUpdate(options: {
 		// mode would silently fall back to direct connections after every update.
 		const env = {
 			...envWithAmbientProxy(),
+			// 启动时已从 process.env 清掉。替换进程仍要能接受面板的关闭和更新。
+			...managerChildTokenEnv(),
 			NARRAFORK_GRACEFUL_RESTART_URL: session.url,
 			NARRAFORK_GRACEFUL_RESTART_TOKEN: session.token,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
@@ -1956,6 +1960,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 						cwd: process.cwd(),
 						env,
 						stdio: ["ignore", "ignore", "ignore"],
+						windowsHide: true,
 					},
 				)
 			: Bun.spawn([options.newExecPath, ...launchArgs], {

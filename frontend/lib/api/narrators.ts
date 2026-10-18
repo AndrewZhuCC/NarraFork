@@ -911,6 +911,7 @@ export const narratorsApi = {
 		behaviorFenceIntervalOverride?: number | null;
 		behaviorFenceAttachOverride?: "inherit" | "on" | "off";
 		cwd?: string;
+		title?: string;
 		makeNamed?: boolean;
 		handle?: string;
 		kind?: "knowledge" | "setup";

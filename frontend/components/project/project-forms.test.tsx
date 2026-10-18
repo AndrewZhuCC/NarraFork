@@ -209,6 +209,47 @@ test("non-project narrator modal retains instance default and omits membership",
 	await click("createNarrator");
 	expect(create.mock.calls[0]?.[0]).toMatchObject({ cwd: "/instance" });
 	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("contextProjectId");
+	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("title");
+});
+test("a filled session title is trimmed and sent; blank or whitespace is omitted", async () => {
+	edits.sessionTitle = "  Sprint review  ";
+	await act(async () => root.render(<CreateNarratorModal opened onClose={() => {}} />));
+	await click("sessionTitle");
+	await click("createNarrator");
+	expect(create.mock.calls[0]?.[0]).toMatchObject({ title: "Sprint review" });
+
+	create.mockClear();
+	edits.sessionTitle = "   ";
+	await act(async () => root.render(<CreateNarratorModal opened onClose={() => {}} />));
+	await click("sessionTitle");
+	await click("createNarrator");
+	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("title");
+});
+test("closing the dialog clears a typed session title", async () => {
+	function Host() {
+		const [opened, setOpened] = useState(true);
+		return (
+			<>
+				<button type="button" onClick={() => setOpened(true)}>
+					reopen
+				</button>
+				<CreateNarratorModal opened={opened} onClose={() => setOpened(false)} />
+			</>
+		);
+	}
+	edits.sessionTitle = "Keep me";
+	await act(async () => root.render(<Host />));
+	await click("sessionTitle");
+	expect(container.querySelector('[data-input="sessionTitle"]')?.getAttribute("data-value")).toBe(
+		"Keep me",
+	);
+	await click("cancel");
+	await click("reopen");
+	expect(container.querySelector('[data-input="sessionTitle"]')?.getAttribute("data-value")).toBe(
+		"",
+	);
+	await click("createNarrator");
+	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("title");
 });
 test("metadata edits submit only this form's settings, not stale commands, routines or unknown keys", async () => {
 	const chapterSettings = {
