@@ -21,6 +21,18 @@ export function parseOptionalComposerDocument(value: unknown): ComposerDocument 
 		throw new ValidationError("Invalid composer document");
 	}
 }
+/**
+ * multipart/form-data serialization rewrites every lone LF/CR in string fields to CRLF, while
+ * the JSON composerDocument keeps the editor's LF. Recover the exact projection in that case.
+ */
+export function restoreMultipartComposerText(
+	value: string,
+	document: ComposerDocument | undefined,
+): string {
+	if (!document) return value;
+	const { text } = composerDocumentText(document);
+	return value !== text && text.replace(/\r\n|\r|\n/g, "\r\n") === value ? text : value;
+}
 export function validateComposerProjection(
 	document: ComposerDocument | undefined,
 	text: string,
@@ -50,6 +62,29 @@ export function validateComposerProjection(
 			JSON.stringify(references.map(canonical))
 	)
 		throw new ValidationError("Composer document does not match text or file references");
+}
+/**
+ * Capture canonicalizes requested references (absolute/realpath, EOF selection), so the
+ * client's layout sidecar must adopt the frozen metadata before downstream validation.
+ */
+export function bindComposerDocumentReferences(
+	document: ComposerDocument | undefined,
+	references: readonly FileReference[] | undefined,
+): ComposerDocument | undefined {
+	if (!document || !references?.length) return document;
+	const byId = new Map(references.map((ref) => [ref.id, ref]));
+	return {
+		...document,
+		paragraphs: document.paragraphs.map((paragraph) => ({
+			children: paragraph.children.map((node) => {
+				if (node.type !== "fileReference") return node;
+				const captured = byId.get(node.reference.id);
+				if (!captured) return node;
+				const { inputRange: _range, ...reference } = captured;
+				return { ...node, reference };
+			}),
+		})),
+	};
 }
 // biome-ignore lint/suspicious/noExplicitAny: persisted content blocks are dynamic JSON
 export function validatePersistedComposerDocument(value: unknown, blocks: readonly any[]) {
