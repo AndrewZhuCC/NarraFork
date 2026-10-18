@@ -6,7 +6,7 @@
 | # | 现象 | 根因 | 修复 |
 |---|------|------|------|
 | 1 | Send 后紧接 Await 拿到上一轮报告 | 同回合的 Send 与 Await 被并行执行 | Send→Await 加执行屏障 |
-| 3 | Send 后 Stop 说 "not running" | Send 续跑是前台运行，Stop 只查后台注册表 | Stop 回落到已有的前台中断 |
+| 3 | Send 后 Stop 说 "not running" | Send 续跑被转成前台运行，状态散落在两套来源 | Send 续跑统一走后台任务 |
 | 2 | 发给运行中子代理的消息没被执行 | 父代理 Send 的排队分支缺少收尾竞态的补唤醒 | 复用用户发消息的那条入队路径 |
 | 4 | ContextAsk 分块结论矛盾 | 它只读已持久化转录，排队中的消息不在里面 | 不改机制，只改工具描述 |
 
@@ -27,7 +27,22 @@
 
 `Send` 续跑一个后台子代理时，`startContinuedSubagent` 会把它转成前台运行（`isBackground=false`，不注册后台 abort controller）。而 `Stop({type:"agent"})` 调用的 `cancelBackgroundTask` 只查后台注册表，查不到就返回 "not running"。所以只要子代理是经 Send 续跑的，Stop 必然失败，跟时序无关。
 
-**修复**：前台续跑的每一轮都会把 abort controller 登记到 `getForegroundAbortControllers()`（`agent-runtime/control.ts` 的 `resetForegroundTurn`），`Send(doInterrupt)` 用的 `interruptForegroundSubagent` 就是靠它。Stop 在 `cancelBackgroundTask` 返回 false 时再调一次 `interruptForegroundSubagent` 即可，一个分支就够了，不需要改续跑的前后台语义。
+**修复：Send 续跑统一作为后台任务运行。** Send 本来就是异步的，父代理并不阻塞等待，续跑在语义上就是一个后台任务。现在它一会儿是后台、一会儿是前台，Stop、Await、TeamStatus 各读各的状态，这才是问题3的根源。
+
+仓库里已经有完全相同的流程：`narrator-subagent-recovery.ts` 的"恢复失败子代理"就是先把一个 idle 子代理转成后台任务，再续跑。
+
+1. `backgroundTaskService.createAgentTask`：建立或重启 background_tasks 行（已存在时走幂等的重启分支）。
+2. 把 narrator 标记为 `isBackground=true`、`backgroundStatus="running"`，并加上 `background` trait。
+3. `resumeSubagent({ preserveBackground: true, skipConclusionDelivery: true, ... })`。
+
+把第1、2步提取成一个共享函数（例如 `promoteSubagentToBackground`），恢复流程和 Send 续跑都调用它；Send 续跑在第3步传同样的两个参数。这样做之后：
+
+- **Stop**：后台 abort controller 已注册，`cancelBackgroundTask` 直接生效，不需要额外分支。
+- **Await / TeamStatus**：都读 background_tasks 这一条状态源，续跑期间显示 running。
+- **结果送达**：走后台完成通知（`finalizeBackgroundCompletion` 负责通知并唤醒父代理）。父代理 Send 之后可以直接结束回合等唤醒，这也符合 CLAUDE.md 里"非必要不 Await"的规则。
+- **一处行为变化**：原 Agent 工具卡片上的结果不再被续跑结果覆盖，保留首轮结果；后续每一轮的结果作为独立的完成通知送达。新旧结果因此分得更清楚，问题1里"把旧报告当新结果"的误判也更难发生。
+
+原本就是前台启动的子代理，被 Send 续跑时也同样转成后台任务。
 
 ## 问题2：发给运行中子代理的消息没有被执行
 
@@ -50,5 +65,5 @@
 一个 PR 完成问题1～3 的修复，并附上问题4 的描述修改，每个修复各配一个回归测试：
 
 1. 分组测试：`Send(X)` 后紧跟 `Await(X)` 被分成两组。
-2. Stop 测试：前台续跑中的子代理可以被 Stop。
+2. Send 续跑测试：续跑后 background_tasks 行为 running，Stop 能取消，完成后父代理收到完成通知。
 3. Send 测试：子代理在 Send 入队期间结束运行时，消息会被补唤醒处理。
