@@ -36,7 +36,7 @@ import {
 	assertSubagentSendIsAsync,
 } from "./subagent-communication-policy";
 import { interruptForegroundSubagent } from "./subagent-detach";
-import { pushSubagentBufferedMessage } from "./subagent-executor";
+import { bufferSubagentUserMessage } from "./subagent-executor";
 import { agentLabelFromNarrator, resolveAgentLabel, shortAgentId } from "./subagent-label";
 import { resumeSubagent } from "./subagent-resume";
 import { waitForBackgroundTask } from "./subagent-runner";
@@ -1469,8 +1469,11 @@ async function sendSubagentMessageDetailedWithRun(
 			let deliveryMessageId = delivery.recipientMessageId;
 
 			if (fresh.status === "working" || fresh.status === "waiting") {
-				const buffered = await pushSubagentBufferedMessage(fresh.id, deliveredMessage, {
-					position: interruptTarget ? "front" : "back",
+				// Same entry as direct user input: it re-wakes the target when its run ends
+				// while this message is being queued, which a bare enqueue would strand.
+				const buffered = await bufferSubagentUserMessage(fresh.id, deliveredMessage, {
+					priority: interruptTarget,
+					requestSoftStop: false,
 					delivery,
 					createdBy: input.userId ?? null,
 				});
@@ -1546,6 +1549,9 @@ async function sendSubagentMessageDetailedWithRun(
 						intent: "follow_up",
 						actor: "parent_agent",
 						mailboxInput: true,
+						// Send never waits for the run, so the continuation is a background task:
+						// Await, Stop and TeamStatus then share the background_tasks row.
+						asBackgroundTask: true,
 						prompt: deliveredMessage,
 						delivery: inboxDelivery(accepted.delivery),
 						createdBy: input.userId ?? null,

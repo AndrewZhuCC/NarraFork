@@ -42,7 +42,7 @@
 - **结果送达**：走后台完成通知（`finalizeBackgroundCompletion` 负责通知并唤醒父代理）。父代理 Send 之后可以直接结束回合等唤醒，这也符合 CLAUDE.md 里"非必要不 Await"的规则。
 - **一处行为变化**：原 Agent 工具卡片上的结果不再被续跑结果覆盖，保留首轮结果；后续每一轮的结果作为独立的完成通知送达。新旧结果因此分得更清楚，问题1里"把旧报告当新结果"的误判也更难发生。
 
-原本就是前台启动的子代理，被 Send 续跑时也同样转成后台任务。
+原本就是前台启动的子代理，被 Send 续跑时也同样转成后台任务。信箱补唤醒（`wakeInboxIfEligible`）启动的续跑同理。实现上是 `resumeSubagent` 的 `asBackgroundTask` 选项，认领逻辑在 `subagent-background-claim.ts`，恢复流程也复用它。
 
 ## 问题2：发给运行中子代理的消息没有被执行
 
