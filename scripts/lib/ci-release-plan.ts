@@ -8,6 +8,7 @@ import {
 } from "../../shared/helper-distribution";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import { EXECUTOR_VERSION_RE } from "../../shared/remote-executor-manifest";
+import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import {
 	CI_RELEASE_BUN,
@@ -141,6 +142,10 @@ const planSchema = z
 								size: id.max(1024 ** 3),
 								sha256: z.string().regex(/^[a-f0-9]{64}$/),
 								sha512: z.string().regex(/^[A-Za-z0-9+/]{86}==$/),
+								recoveryManifestVersions: z
+									.unknown()
+									.transform((value) => parseRecoveryManifestVersions(value))
+									.optional(),
 								helperDistribution: z
 									.unknown()
 									.transform((value) => parseHelperDistributionDependencies(value))

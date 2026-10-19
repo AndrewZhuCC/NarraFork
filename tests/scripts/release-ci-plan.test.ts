@@ -442,6 +442,33 @@ describe("CI release plan trust boundary", () => {
 		expect(validateCiReleasePlan(input).baselines[0]?.metadata.helperDistribution).toEqual(
 			dependencies,
 		);
+		for (const versions of [
+			[1, 2],
+			[1, 2, 3],
+			[3, 1, 2],
+		]) {
+			expect(
+				validateCiReleasePlan({
+					...plan,
+					baselines: [
+						{ ...baseline, metadata: { ...baseline.metadata, recoveryManifestVersions: versions } },
+					],
+				}).baselines[0]?.metadata.recoveryManifestVersions,
+			).toEqual([...versions].sort((a, b) => a - b));
+		}
+		expect(
+			validateCiReleasePlan(input).baselines[0]?.metadata.recoveryManifestVersions,
+		).toBeUndefined();
+		for (const versions of [[], [0], [256], [1, 1], [1.5], ["1"], null]) {
+			expect(() =>
+				validateCiReleasePlan({
+					...plan,
+					baselines: [
+						{ ...baseline, metadata: { ...baseline.metadata, recoveryManifestVersions: versions } },
+					],
+				}),
+			).toThrow();
+		}
 		const { helperDistribution: _dependencies, ...legacy } = baseline.metadata;
 		expect(
 			validateCiReleasePlan({ ...plan, baselines: [{ ...baseline, metadata: legacy }] })

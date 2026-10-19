@@ -27,9 +27,9 @@
  */
 
 import { cpus } from "node:os";
+import { compiledWorkerSpecifiers } from "../compiled-worker";
 import { hotOnce, hotSafe, hotTimerClear } from "../hot-safe";
 import { logger } from "../logger";
-import { isCompiledRuntime } from "../runtime-target";
 import {
 	DB_WORKER_PROBE_READY_TIMEOUT_MS,
 	DB_WORKER_READY_TIMEOUT_MS,
@@ -160,37 +160,17 @@ function state(): PoolState {
 	}));
 }
 
-/**
- * Candidate paths for the worker entry inside a compiled binary's virtual filesystem.
- *
- * Three non-obvious facts, all verified against real compiled binaries:
- *   1. In a compiled binary EVERY module reports the binary itself as `import.meta.url`
- *      (`file:///$bunfs/root/narrafork`), so resolving `./worker-entry.js` relatively yields
- *      `$bunfs/root/worker-entry.js` — which does not exist, and `new Worker` then fails
- *      asynchronously with ModuleNotFound.
- *   2. The bundler embeds each additional entry point at its path RELATIVE TO the main entry's
- *      directory, with the extension rewritten to `.js`. For the production entry
- *      (`server/index.ts`) that is `lib/db-worker/worker-entry.js`; for a probe or test harness
- *      outside `server/` it becomes `server/lib/db-worker/worker-entry.js`.
- *   3. Because the layout therefore depends on which entry point was compiled, a single hard-coded
- *      path is fragile. We try the known shapes in order and remember the one that works.
- *
- * Keep in sync with the extra entry point in scripts/build-cross-platform.ts.
- */
-const COMPILED_WORKER_PATHS = [
-	"./lib/db-worker/worker-entry.js",
-	"./server/lib/db-worker/worker-entry.js",
-	"./worker-entry.js",
-];
-
-/** Specifiers to try, most likely first. Dev has exactly one; compiled has several candidates. */
+/** Specifiers to try, most likely first. Dev has exactly one; compiled probes every layout. */
 function workerSpecifierCandidates(): string[] {
 	const s = state();
 	if (s.testSpecifiers) return s.testSpecifiers;
-	if (!isCompiledRuntime()) return [new URL("./worker-entry.ts", import.meta.url).href];
 	// Once a candidate has produced a working worker, stop probing the others.
 	if (s.resolvedWorkerSpecifier) return [s.resolvedWorkerSpecifier];
-	return COMPILED_WORKER_PATHS.map((path) => new URL(path, import.meta.url).href);
+	return compiledWorkerSpecifiers(
+		"lib/db-worker/worker-entry.ts",
+		"./worker-entry.ts",
+		import.meta.url,
+	);
 }
 
 export function getConfiguredConcurrency(): number {
@@ -324,6 +304,8 @@ function awaitReady(pooled: PooledWorker, timeoutMs: number): Promise<void> {
 
 /** Start a worker from one specific specifier. Its ready signal settles on the ready/error event. */
 function spawnWorkerFrom(specifier: string): PooledWorker {
+	// The global Worker accepts file: hrefs. node:worker_threads does not; those call sites
+	// pass workerEntryFromSpecifier instead.
 	const worker = new Worker(specifier);
 	const pooled: PooledWorker = {
 		worker,
@@ -373,7 +355,7 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
  * Spawn a ready worker, probing candidate specifiers until one works.
  *
  * Probing exists because the embedded worker path in a compiled binary depends on which entry point
- * was compiled (see COMPILED_WORKER_PATHS). The winning specifier is cached, so this costs at most
+ * was compiled (see compiledWorkerSpecifiers). The winning specifier is cached, so this costs at most
  * one round of failed spawns per process.
  *
  * The last candidate is not a probe: once every other shape has been ruled out, a slow-but-correct

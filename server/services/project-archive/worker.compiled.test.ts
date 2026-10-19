@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { compiledWorkerBuildEntrypoints } from "../../lib/compiled-worker";
 
 const exec = promisify(execFile);
 const root = resolve(import.meta.dir, "../../..");
@@ -54,17 +55,14 @@ test("production compile explicitly includes both project archive workers", asyn
 	if (!command) throw new Error("Production compile arguments unavailable");
 	const withoutComments = command[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
 	expect(withoutComments).toMatch(/^\s*process\.execPath\s*,/);
+	expect(withoutComments).toContain('"./server/index.ts"');
+	expect(withoutComments).toContain("...compiledWorkerBuildEntrypoints()");
 	const { stdout } = await exec(process.execPath, ["--eval", "process.stdout.write(Bun.version)"], {
 		timeout: 10_000,
 		maxBuffer: 1024,
 	});
 	expect(stdout).toBe(Bun.version);
-	const args = [
-		process.execPath,
-		...[...withoutComments.matchAll(/"([^"\r\n]+)"/g)].map((match) => match[1]),
-	];
-	expect(args.slice(0, 3)).toEqual([process.execPath, "build", "./server/index.ts"]);
-	const actual = args.slice(2, args.indexOf("--compile"));
+	const actual = compiledWorkerBuildEntrypoints();
 	for (const entry of entries) expect(actual).toContain(entry);
 });
 

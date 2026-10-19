@@ -452,7 +452,7 @@ test("eligible queue wake restores a verified sender call rather than child crea
 	});
 	try {
 		expect(await inbox.wakeInboxIfEligible("child")).toBe(true);
-		expect(captured[0]).toMatchObject({ ...expected, mailboxInput: true });
+		expect(captured[0]).toMatchObject({ ...expected, mailboxInput: true, asBackgroundTask: true });
 	} finally {
 		spy.mockRestore();
 	}
@@ -508,9 +508,51 @@ test("real Send idle entry forwards its own verified binding and sending actor",
 			signal: new AbortController().signal,
 			locale: "en",
 		});
-		expect(captured[0]).toMatchObject({ ...expected, mailboxInput: true });
+		expect(captured[0]).toMatchObject({ ...expected, mailboxInput: true, asBackgroundTask: true });
 	} finally {
 		spy.mockRestore();
+	}
+});
+
+test("Send queued while the target's run ends re-wakes it instead of stranding the message", async () => {
+	const value = delivery("child", "late correction");
+	const expected = bindDeliverySource(value);
+	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "child")).run();
+	const owner = required(tryClaimExecution("child", "subagent"));
+	const { activeNarrators } = await import("../narrator-session-state");
+	activeNarrators.set("child", {} as never);
+	const enqueue = inbox.enqueueInboxAgent;
+	// The run finishes in the window between Send reading `working` and the enqueue.
+	const enqueueSpy = spyOn(inbox, "enqueueInboxAgent").mockImplementation(async (...args) => {
+		const accepted = await enqueue(...args);
+		activeNarrators.delete("child");
+		owner.release();
+		return accepted;
+	});
+	const woken: string[] = [];
+	const wakeSpy = spyOn(inbox, "wakeInboxIfEligible").mockImplementation(async (id) => {
+		woken.push(id);
+		return true;
+	});
+	try {
+		const { sendSubagentMessageDetailed } = await import("../agent-communication");
+		const result = await sendSubagentMessageDetailed({
+			callerNarratorId: "sender",
+			id: "child",
+			toolUseId: expected.bindingToolUseId,
+			toolCallBinding: expected.toolCallBinding,
+			message: "late correction",
+			signal: new AbortController().signal,
+			locale: "en",
+		});
+		expect(result.targets[0]?.status).toBe("queued");
+		await Promise.resolve();
+		expect(woken).toEqual(["child"]);
+	} finally {
+		enqueueSpy.mockRestore();
+		wakeSpy.mockRestore();
+		activeNarrators.delete("child");
+		owner.release();
 	}
 });
 

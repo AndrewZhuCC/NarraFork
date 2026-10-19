@@ -736,6 +736,75 @@ describe("resumeSubagent status reconciliation", () => {
 	});
 });
 
+/**
+ * A Send continuation is never awaited in the foreground, so it runs as a background
+ * task. Await, Stop and TeamStatus then all read the same background_tasks row instead
+ * of a subagent that flips between foreground and background.
+ */
+describe("resumeSubagent asBackgroundTask", () => {
+	test("claims a background run and continues with background semantics", async () => {
+		const claim = await import("../subagent-background-claim");
+		const claimSpy = spyOn(claim, "claimSubagentBackgroundRun").mockResolvedValue({
+			alias: "bg-alias",
+		});
+		try {
+			const subagentId = "resume-as-background";
+			const result = await resumeSubagent({
+				subagentId,
+				intent: "follow_up",
+				actor: "parent_agent",
+				prompt: "next round",
+				asBackgroundTask: true,
+				locale: "en",
+			});
+			expect(result.started).toBe(true);
+			expect(claimSpy).toHaveBeenCalledTimes(1);
+			expect(claimSpy.mock.calls[0]?.[0]).toMatchObject({
+				parentNarratorId,
+				subagent: { id: subagentId },
+				originToolUseId,
+			});
+			expect(startCalls[0]).toMatchObject({
+				preserveBackground: true,
+				skipStaleAttach: true,
+				skipConclusionDelivery: true,
+			});
+			await finishRun(subagentId);
+		} finally {
+			claimSpy.mockRestore();
+		}
+	});
+
+	test("a claim that fails is withdrawn and no run starts", async () => {
+		const claim = await import("../subagent-background-claim");
+		const claimSpy = spyOn(claim, "claimSubagentBackgroundRun").mockRejectedValue(
+			new Error("task row conflict"),
+		);
+		const clearSpy = spyOn(claim, "clearSubagentBackgroundRunClaim").mockResolvedValue();
+		try {
+			await expect(
+				resumeSubagent({
+					subagentId: "resume-as-background-claim-fails",
+					intent: "follow_up",
+					actor: "parent_agent",
+					prompt: "next round",
+					asBackgroundTask: true,
+					locale: "en",
+				}),
+			).rejects.toThrow("task row conflict");
+			expect(clearSpy).toHaveBeenCalledWith(
+				"resume-as-background-claim-fails",
+				parentNarratorId,
+				"task row conflict",
+			);
+			expect(startCalls).toHaveLength(0);
+		} finally {
+			claimSpy.mockRestore();
+			clearSpy.mockRestore();
+		}
+	});
+});
+
 describe("resumeSubagent", () => {
 	test("real plugin creation persists provenance across database reads and repeated resumes", async () => {
 		const { db } = await import("../../db");

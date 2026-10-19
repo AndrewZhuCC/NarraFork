@@ -615,7 +615,7 @@ export async function bufferSubagentUserMessage(
 		priority?: boolean;
 		requestSoftStop?: boolean;
 	},
-): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean; duplicate?: boolean }> {
 	let needsWake = false;
 	let wakeLocale: Locale = "en";
 	const accepted = await withNarratorStartAdmission(subagentId, async () => {
