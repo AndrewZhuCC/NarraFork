@@ -6,7 +6,13 @@
 	"composerAttachmentsRestoreFailed": "Could not read draft attachments. Local attachment storage was not overwritten. Retry before sending.",
 	"attachments": {
 		"missing": "Attachment needs to be reselected",
-		"restoring": "Restoring attachment…"
+		"restoring": "Restoring attachment…",
+		"previewTitle": "Attachment preview · {{name}}",
+		"previewContent": "Read-only attachment text",
+		"previewLoading": "Reading attachment…",
+		"previewFailed": "Could not read this attachment. Close the preview and try again, or reselect the file.",
+		"previewEmpty": "This attachment is empty.",
+		"previewTruncated": "Preview truncated to {{limit}} KiB. The original attachment is unchanged."
 	},
 	"richComposer": {
 		"collapse": "Exit fullscreen",

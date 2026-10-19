@@ -17,6 +17,7 @@ import { parseHTML } from "linkedom";
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import narratorEn from "../../../locales/en/narrator.json";
 import { joinQuotedComposerInput } from "./composer-quotes";
 import { FileReferenceScopeProvider } from "./FileReferenceScope";
 import { insertFileReference } from "./file-reference-input";
@@ -169,6 +170,7 @@ beforeEach(async () => {
 		resources: {
 			en: {
 				narrator: {
+					attachments: narratorEn.attachments,
 					draftConflict: "draft conflict",
 					draftUseServer: "use server",
 					draftUseLocal: "use local",
@@ -271,6 +273,74 @@ function deferred<T>() {
 	});
 	return { promise, resolve };
 }
+
+async function activateAttachment(name: string) {
+	const button = host.querySelector<HTMLButtonElement>(
+		`[data-composer-atom="attachment"] button[aria-label="${name}"]`,
+	);
+	expect(button).not.toBeNull();
+	const event = new Event("click", { bubbles: true });
+	Object.defineProperty(event, "detail", { value: 0 });
+	await act(async () => button?.dispatchEvent(event));
+}
+
+describe("composer local text attachment previews", () => {
+	test("opens the cached File without changing the draft, attachment membership, or persistence", async () => {
+		await render();
+		const content = "<script>not executable</script>\nlocal text";
+		const file = new File([content], "local.html", { type: "text/html" });
+		await act(async () =>
+			expect(
+				handle.current?.insertAcceptedFiles(
+					[file],
+					handle.current.captureAttachmentInsertion("direct"),
+				),
+			).toBe(true),
+		);
+		const before = handle.current?.getDocument();
+		const stored = readNarratorInputDraft("u1", "n1");
+		documentAssetsChange.mockClear();
+		updateSpy.mockClear();
+		await activateAttachment(file.name);
+		expect(document.querySelector("pre")?.textContent).toBe(content);
+		expect(document.querySelector("script")).toBeNull();
+		expect(handle.current?.getDocument()).toEqual(before);
+		expect(readNarratorInputDraft("u1", "n1")).toEqual(stored);
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+		expect(updateSpy).not.toHaveBeenCalled();
+		expect(handle.current?.hasMissingAssets()).toBe(false);
+	});
+
+	test.each([
+		"narrator",
+		"user",
+	] as const)("switching %s closes the preview and cannot revive a late read", async (owner) => {
+		await render();
+		const pending = deferred<ArrayBuffer>();
+		const file = new File(["placeholder"], "private.txt");
+		spyOn(file, "slice").mockReturnValue({ arrayBuffer: () => pending.promise } as Blob);
+		await act(async () =>
+			expect(
+				handle.current?.insertAcceptedFiles(
+					[file],
+					handle.current.captureAttachmentInsertion("direct"),
+				),
+			).toBe(true),
+		);
+		await activateAttachment(file.name);
+		expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+		if (owner === "narrator") testNarratorId = "n2";
+		else qc.setQueryData(["auth", "me"], { id: "u2" });
+		await render();
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
+		await act(async () => pending.resolve(new TextEncoder().encode("private late content").buffer));
+		expect(document.body.textContent).not.toContain("private late content");
+		if (owner === "narrator") testNarratorId = "n1";
+		else qc.setQueryData(["auth", "me"], { id: "u1" });
+		await render();
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
+	});
+});
 
 describe("composer revision-only initial reconciliation", () => {
 	for (const state of [

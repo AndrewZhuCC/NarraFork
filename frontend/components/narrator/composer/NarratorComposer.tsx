@@ -2,6 +2,7 @@ import { Box, Button, Group, Stack, Text } from "@mantine/core";
 import { useDisclosure, useFocusTrap } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
+	type ComposerAsset,
 	type ComposerDocument,
 	type ComposerInlineNode,
 	composerDocumentText,
@@ -34,6 +35,7 @@ import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
+import { ComposerTextAttachmentPreview } from "./ComposerTextAttachmentPreview";
 import {
 	composerAssetsFromFiles,
 	composerInputFromDocument,
@@ -245,12 +247,25 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					])
 				: null;
 
+		const attachmentPreviewScope = JSON.stringify([currentUserId, narratorId]);
+		const [attachmentPreview, setAttachmentPreview] = useState<{
+			scope: string;
+			asset: ComposerAsset;
+		} | null>(null);
+		const activeAttachmentPreview =
+			attachmentPreview?.scope === attachmentPreviewScope ? attachmentPreview : null;
+		useEffect(() => {
+			setAttachmentPreview((current) =>
+				current?.scope === attachmentPreviewScope ? current : null,
+			);
+		}, [attachmentPreviewScope]);
+
 		// Fullscreen modal state
 		const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] =
 			useDisclosure(false);
-		const fullscreenTrap = useFocusTrap(fullscreenOpened);
+		const fullscreenTrap = useFocusTrap(fullscreenOpened && !activeAttachmentPreview);
 		useEffect(() => {
-			if (!fullscreenOpened) return;
+			if (!fullscreenOpened || activeAttachmentPreview) return;
 			const owner = textareaRef.current?.ownerDocument;
 			const close = (event: KeyboardEvent) => {
 				if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
@@ -268,7 +283,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			};
 			owner?.addEventListener("keydown", close, true);
 			return () => owner?.removeEventListener("keydown", close, true);
-		}, [fullscreenOpened, closeFullscreen]);
+		}, [fullscreenOpened, closeFullscreen, activeAttachmentPreview]);
 
 		// Text and reference occurrences have one source of truth, local to this subtree.
 		const [inputState, setInputState] = useState<FileReferenceInput>({
@@ -1648,6 +1663,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				aria-modal={fullscreenOpened || undefined}
 				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}
 			>
+				{activeAttachmentPreview && (
+					<ComposerTextAttachmentPreview
+						key={`${attachmentPreviewScope}:${activeAttachmentPreview.asset.id}`}
+						file={resourceCacheRef.current.get(activeAttachmentPreview.asset.id)}
+						name={activeAttachmentPreview.asset.name}
+						onClose={() => setAttachmentPreview(null)}
+					/>
+				)}
 				<CommandPopover
 					anchorRef={textareaRef}
 					commands={commandsList ?? []}
@@ -1773,6 +1796,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onPasteFiles={onPasteImages}
 					onOpenQuote={(quote) => revealComposerQuote(dock, quote, editorElement)}
 					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
+					onOpenAttachment={(asset) => {
+						if (asset.kind !== "textFile") return;
+						setAttachmentPreview({ scope: attachmentPreviewScope, asset });
+					}}
 					onOpenImage={(asset) => {
 						const file = resourceCacheRef.current.get(asset.id);
 						if (!file) return;

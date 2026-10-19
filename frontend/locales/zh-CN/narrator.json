@@ -6,7 +6,13 @@
 	"composerAttachmentsRestoreFailed": "草稿附件读取失败，未覆盖本地附件。请重试恢复后再发送。",
 	"attachments": {
 		"missing": "附件需重新选择",
-		"restoring": "正在恢复附件…"
+		"restoring": "正在恢复附件…",
+		"previewTitle": "附件预览 · {{name}}",
+		"previewContent": "只读附件文本",
+		"previewLoading": "正在读取附件…",
+		"previewFailed": "无法读取此附件。请关闭预览后重试，或重新选择文件。",
+		"previewEmpty": "此附件为空。",
+		"previewTruncated": "预览已截断至 {{limit}} KiB，原始附件未改变。"
 	},
 	"richComposer": {
 		"collapse": "退出全屏",
