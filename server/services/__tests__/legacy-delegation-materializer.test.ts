@@ -24,7 +24,9 @@ afterAll(() => {
 const now = "2026-10-19T00:00:00.000Z";
 
 async function seed(id: string, values: Partial<typeof narrators.$inferInsert> = {}) {
-	await db.insert(narrators).values({ id, status: "idle", createdAt: now, updatedAt: now, ...values });
+	await db
+		.insert(narrators)
+		.values({ id, status: "idle", createdAt: now, updatedAt: now, ...values });
 }
 
 async function linkedTurn(narratorId: string, toolUseId: string, createdAt: string) {

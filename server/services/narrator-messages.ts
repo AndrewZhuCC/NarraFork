@@ -3929,7 +3929,7 @@ const narratorMessageQueriesUnlocked = {
 
 	/**
 	 * Where this session's own turns are placed (`ownTurnPlacementOf`): the tool call its
-	 * run delivers to, `null` for none, `"*"` for an unregistered legacy delegation.
+	 * run delivers to, `null` for none.
 	 */
 	async ownTurnPlacement(narratorId: string): Promise<OwnTurnPlacement> {
 		const narrator = await db.query.narrators.findFirst({
@@ -4121,7 +4121,7 @@ const narratorMessageQueriesUnlocked = {
 			// largest narrators, for the tail page and the `beforeSeq` scroll-up page
 			// alike. Deliberately NOT an `INDEXED BY` hint: this spelling needs no
 			// SQLite-only syntax, so it stays off the dialect-migration ledger.
-			// The session's own turns (`isTopLevelMessage`); `"*"` (legacy) filters nothing.
+			// The session's own turns (`isTopLevelMessage`).
 			const ownTurn = ownTurnSql(placement);
 			const isTopLevelRef = (condition: SQL) =>
 				exists(
@@ -4344,14 +4344,10 @@ const narratorMessageQueriesUnlocked = {
 			if (anchor.parentToolUseId) upsertCursorChildAnchor(baseChildAnchors, anchor);
 		}
 
-		// Legacy "*" (step 5: delete): every row is an own turn, nothing is nested.
-		const resolvedAnchors =
-			placement !== "*"
-				? await resolveCatchUpChildAnchors(narratorId, trimCursorChildAnchors(baseChildAnchors))
-				: {
-						messageAnchors: new Map<string, ResolvedChildAnchor>(),
-						subagentAnchors: new Map<string, CatchUpChildAnchor>(),
-					};
+		const resolvedAnchors = await resolveCatchUpChildAnchors(
+			narratorId,
+			trimCursorChildAnchors(baseChildAnchors),
+		);
 		const resolvedChildAnchors = resolvedAnchors.messageAnchors;
 		const cursorChildAnchors = trimCursorChildAnchors(
 			new Map<string, CatchUpChildAnchor>([
