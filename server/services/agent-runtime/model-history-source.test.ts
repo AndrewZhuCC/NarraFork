@@ -43,6 +43,19 @@ function message(db: Database, id: string, seq: number, extra = "", role = "user
 		"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, 'owner', ?, ?)",
 	).run(`ref:${id}`, id, seq);
 }
+/** Runs `mutate` right after the main thread's first signature read, before the worker starts. */
+function afterFirstSignature(mutate: () => void) {
+	const realRead = revisionModule.readSqliteModelHistorySignature;
+	let reads = 0;
+	const spy = spyOn(revisionModule, "readSqliteModelHistorySignature").mockImplementation(
+		(connection, id) => {
+			const signature = realRead(connection, id);
+			if (++reads === 1) mutate();
+			return signature;
+		},
+	);
+	return () => spy.mockRestore();
+}
 function revision(db: Database, id = "owner") {
 	return readSqliteModelHistorySignature(db, id).revision;
 }
@@ -196,74 +209,77 @@ describe("complete bounded model source", () => {
 		db.run("UPDATE narrator_messages SET sdk_message_uuid='late-final' WHERE id='small'");
 		await expect(verifyModelHistoryRowsCurrent(view)).rejects.toThrow("request not sent");
 	});
-	test("a write landing during the read takes a fresh snapshot instead of failing", async () => {
+	test("a write landing between the signature and the read is labelled by the worker snapshot", async () => {
 		const db = fixture(true);
 		message(db, "first", 0);
-		const realRead = revisionModule.readSqliteModelHistorySignature;
-		let reads = 0;
-		const barrier = spyOn(revisionModule, "readSqliteModelHistorySignature").mockImplementation(
-			(connection, id) => {
-				if (++reads === 2) {
-					const writer = new Database(db.filename);
-					try {
-						message(writer, "late", 1);
-					} finally {
-						writer.close();
-					}
-				}
-				return realRead(connection, id);
-			},
-		);
+		const restore = afterFirstSignature(() => {
+			const writer = new Database(db.filename);
+			try {
+				message(writer, "late", 1);
+			} finally {
+				writer.close();
+			}
+		});
 		try {
 			const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
 			expect(source.messages.map((row) => row.id)).toEqual(["first", "late"]);
-			expect(reads).toBe(3);
 			const view = source.messages.map((row) => ({ ...row }));
 			markModelHistoryRows(view, source);
 			await verifyModelHistoryRowsCurrent(view);
 		} finally {
-			barrier.mockRestore();
+			restore();
 		}
 	});
-	test("an untrusted snapshot cannot be promoted when triggers return between read and signing", async () => {
+	test("revision coverage lost before the snapshot fails instead of signing unversioned rows", async () => {
+		const db = fixture(true);
+		message(db, "shared", 0);
+		const restore = afterFirstSignature(() => {
+			const writer = new Database(db.filename);
+			try {
+				writer.run("DROP TRIGGER model_history_v1_tool_update");
+			} finally {
+				writer.close();
+			}
+		});
+		try {
+			await expect(
+				loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner"),
+			).rejects.toThrow("trust changed");
+			expect(modelHistorySourceStats().cacheEntries).toBe(0);
+		} finally {
+			restore();
+		}
+	});
+	test("an untrusted snapshot cannot be promoted when triggers return before the read", async () => {
 		const db = fixture(true);
 		message(db, "shared", 0);
 		db.run(
 			"INSERT INTO narrator_tool_calls (id,narrator_id,message_id,tool_use_id,tool_name,input_json,output_json,status,created_at) VALUES ('tool','owner','shared','use','Read','{}','\"old\"','success','now')",
 		);
 		db.run("DROP TRIGGER model_history_v1_tool_update");
-		const realRead = revisionModule.readSqliteModelHistorySignature;
-		let reads = 0;
-		const barrier = spyOn(revisionModule, "readSqliteModelHistorySignature").mockImplementation(
-			(connection, id) => {
-				if (++reads === 2) {
-					// The worker already returned old rows. A second connection changes them while
-					// coverage is disabled, then restores catalog trust without a body/tool bump.
-					const writer = new Database(db.filename);
-					try {
-						writer.run(`UPDATE narrator_tool_calls SET output_json='"new"' WHERE id='tool'`);
-						const trigger = renderModelHistoryRevisionSql("sqlite")
-							.split("--> statement-breakpoint")
-							.find((statement) =>
-								statement.trim().startsWith("CREATE TRIGGER model_history_v1_tool_update"),
-							);
-						if (!trigger) throw new Error("missing fixture trigger");
-						writer.run(trigger);
-					} finally {
-						writer.close();
-					}
-				}
-				return realRead(connection, id);
-			},
-		);
+		// A second connection changes rows while coverage is disabled, then restores catalog
+		// trust without a body/tool bump. The read started untrusted and must stay untrusted.
+		const restore = afterFirstSignature(() => {
+			const writer = new Database(db.filename);
+			try {
+				writer.run(`UPDATE narrator_tool_calls SET output_json='"new"' WHERE id='tool'`);
+				const trigger = renderModelHistoryRevisionSql("sqlite")
+					.split("--> statement-breakpoint")
+					.find((statement) =>
+						statement.trim().startsWith("CREATE TRIGGER model_history_v1_tool_update"),
+					);
+				if (!trigger) throw new Error("missing fixture trigger");
+				writer.run(trigger);
+			} finally {
+				writer.close();
+			}
+		});
 		try {
-			await expect(
-				loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner"),
-			).rejects.toThrow("trust changed");
+			const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
+			expect(source.messages[0].toolCalls[0].modelRevision).toBe(0);
 			expect(modelHistorySourceStats().cacheEntries).toBe(0);
-			expect(reads).toBe(2);
 		} finally {
-			barrier.mockRestore();
+			restore();
 		}
 	});
 	test("JSON object overhead is rejected before parsing an oversized graph", async () => {
@@ -366,7 +382,7 @@ describe("hot source signature lifecycle", () => {
 		expect(current.messages[0].contentJson).toEqual([{ type: "text", text: "shared" }]);
 		expect(current.counters.reusedBodies ?? 0).toBe(0);
 		expect(reloaded.modelHistorySourceStats().loads).toBe(before.loads + 1);
-		expect(reloaded.modelHistorySourceStats().signatureReads).toBe(before.signatureReads + 2);
+		expect(reloaded.modelHistorySourceStats().signatureReads).toBe(before.signatureReads + 1);
 		expect(() => reloaded.markModelHistoryRows([], unknown)).toThrow(/signature/i);
 		const rows = current.messages.map((row) => ({ ...row }));
 		reloaded.markModelHistoryRows(rows, current);
