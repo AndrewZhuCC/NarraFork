@@ -197,6 +197,13 @@ function hostForLocalHandoff(host: string): string {
 	return host;
 }
 
+/** Origin another process on this machine uses to reach this server; null before it listens. */
+export function getLocalServerOrigin(): string | null {
+	if (!_runtimeAddressGetter) return null;
+	const address = _runtimeAddressGetter();
+	return `${address.protocol}://${hostForLocalHandoff(address.host)}:${address.port}`;
+}
+
 function buildGracefulShutdownUrl(address: RuntimeAddress): string {
 	const host = hostForLocalHandoff(address.host);
 	return `${address.protocol}://${host}:${address.port}/api/gracefully_shutdown`;
