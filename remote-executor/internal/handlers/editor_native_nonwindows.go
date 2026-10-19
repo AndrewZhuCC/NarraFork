@@ -28,17 +28,6 @@ func ensureEditorPrivateDirectory(path string) error {
 	return nil
 }
 func validateEditorSourceWritable(_ *os.File) error { return nil }
-func validateEditorHostRecordFile(file *os.File) error {
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
-		return fmt.Errorf("Host receipt file must be private, regular and single-link")
-	}
-	return nil
-}
 func syncEditorDirectory(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

@@ -29,13 +29,13 @@ import { localBackend } from "../lib/agent/execution/local-backend";
 import * as executors from "../lib/executor-binaries";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { editorOperationMetadataSchema } from "../lib/validators/editor-documents";
+import { denyHostEditorHelpers } from "../routes/editor-native-fixture";
 import {
-	executeAtomicEditorFileChange,
+	executeEditorDocumentFileChange,
 	getEditorDocumentService,
 	queryEditorOperation,
 } from "./editor-document-runtime";
 import { type EditorActor, EditorDocumentService } from "./editor-document-service";
-import * as helpers from "./editor-helper";
 import {
 	createFileChangeLocalIo,
 	fileChangeLocalIo,
@@ -71,11 +71,8 @@ test.each([
 	const forbidden = () => {
 		throw new Error("Host save must not enter helper/distribution");
 	};
+	const processGuard = denyHostEditorHelpers();
 	const traps = [
-		spyOn(helpers.EditorHelperSession, "open").mockImplementation(forbidden),
-		spyOn(helpers, "editorHelperAvailable").mockImplementation(forbidden),
-		spyOn(helpers, "editorHostReceiptAvailable").mockImplementation(forbidden),
-		spyOn(helpers, "resolveEditorHelper").mockImplementation(forbidden),
 		spyOn(executors, "ensureExecutorBinary").mockImplementation(forbidden),
 		spyOn(globalThis, "fetch").mockImplementation(
 			Object.assign(forbidden, { preconnect: forbidden }),
@@ -318,7 +315,7 @@ test.each([
 		await expect(lstat(join(getNarraforkHome(), "editor-native-operations"))).rejects.toMatchObject(
 			{ code: "ENOENT" },
 		);
-		expect(helpers.editorHelperDiagnostics()).toMatchObject({ processes: 0, queued: 0, roots: 0 });
+		expect(processGuard.starts).toBe(0);
 		for (const trap of traps) expect(trap).toHaveBeenCalledTimes(0);
 	} finally {
 		revoked = false;
@@ -330,6 +327,7 @@ test.each([
 		if (Reflect.get(globalThis, singleton) === service)
 			Reflect.deleteProperty(globalThis, singleton);
 		for (const trap of traps) trap.mockRestore();
+		processGuard.restore();
 	}
 }, 30_000);
 
@@ -354,7 +352,7 @@ async function input(next = Buffer.from("replacement")) {
 test("unsupported remote adapters cannot fall through to a Host path", async () => {
 	await writeFile(target, "original");
 	await expect(
-		executeAtomicEditorFileChange({
+		executeEditorDocumentFileChange({
 			requestId: randomUUID(),
 			resourceKey: "unsupported",
 			userId: "user",

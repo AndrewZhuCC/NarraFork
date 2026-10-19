@@ -222,9 +222,6 @@ func TestEditorWriterFeatureRequiresConfiguredEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = e.ConfigureHostReceipts(filepath.Join(t.TempDir(), "host-receipts")); err != nil {
-		t.Fatal(err)
-	}
 	h.SetEditorEngine(e)
 	for _, method := range []string{"editor.hostReceipt.put", "editor.hostReceipt.get", "editor.hostReceipt.settle"} {
 		if _, err := d.Dispatch(context.Background(), method, map[string]any{"operationId": "hidden"}, nil); err == nil {

@@ -27,12 +27,9 @@ func newPrivateEditorFixture(t *testing.T) (*editorFixture, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = e.ConfigureHostReceipts(filepath.Join(root, "editor-native-operations")); err != nil {
-		t.Fatal(err)
-	}
 	h.SetEditorEngine(e)
 	// A later, exact operator allow cannot override executor-owned private state.
-	h.guard.rules = append(h.guard.rules, resolvedRule{action: RuleAllow, root: e.root}, resolvedRule{action: RuleAllow, root: e.hostReceipts.io.root})
+	h.guard.rules = append(h.guard.rules, resolvedRule{action: RuleAllow, root: e.root})
 	canonical, identity, err := h.EditorRootIdentity(root)
 	if err != nil {
 		t.Fatal(err)
@@ -42,9 +39,10 @@ func newPrivateEditorFixture(t *testing.T) (*editorFixture, string, string) {
 		t.Fatal(err)
 	}
 	stage := f.stage(t, []byte("STATE_NEEDLE private body"))
-	record := hostReceiptFixture(f, "private-host-proof")
-	record.ResourceKey = "STATE_NEEDLE private association"
-	hostReceiptCall(t, f, "editor.hostReceipt.put", map[string]any{"value": record})
+	proof := f.request(t, "STATE_NEEDLE-private-proof", []byte("before"), []byte("before"))
+	if result := f.call(t, "editor.apply", proof).(EditorApplyResult); result.Outcome != "committed" {
+		t.Fatal(result)
+	}
 	visible := filepath.Join(root, "public", filepath.Base(e.root), "visible.txt")
 	if err = os.MkdirAll(filepath.Dir(visible), 0700); err != nil {
 		t.Fatal(err)
@@ -56,10 +54,9 @@ func newPrivateEditorFixture(t *testing.T) (*editorFixture, string, string) {
 }
 func TestEditorPrivateStateGuard(t *testing.T) {
 	f, stage, visible := newPrivateEditorFixture(t)
-	engineAlias, hostAlias := filepath.Join(f.root, "engine-alias"), filepath.Join(f.root, "host-alias")
+	engineAlias := filepath.Join(f.root, "engine-alias")
 	editorPrivateAlias(t, f.e.root, engineAlias)
-	editorPrivateAlias(t, f.e.hostReceipts.io.root, hostAlias)
-	paths := []string{f.e.bodyPath(stage), f.e.stagePath(stage), filepath.Join(f.e.root, "engine.lock"), filepath.Join(f.e.hostReceipts.io.root, "private-host-proof.json"), filepath.Join(engineAlias, stage+".body"), filepath.Join(hostAlias, "private-host-proof.json"), filepath.Join(engineAlias, "new", "nested.json")}
+	paths := []string{f.e.bodyPath(stage), f.e.receiptPath("owner", "STATE_NEEDLE-private-proof"), filepath.Join(f.e.root, "engine.lock"), filepath.Join(engineAlias, stage+".body"), filepath.Join(engineAlias, "new", "nested.json")}
 	if runtime.GOOS == "windows" {
 		paths = append(paths, strings.ToUpper(f.e.bodyPath(stage)), `\\?\`+f.e.bodyPath(stage), f.e.root+":stream", `\\?\`+f.e.root+":stream")
 	}
@@ -123,7 +120,7 @@ func TestEditorPrivateStateGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, entry := range listing.(map[string]any)["entries"].([]map[string]any) {
-		if entry["name"] == filepath.Base(f.e.root) || entry["name"] == filepath.Base(f.e.hostReceipts.io.root) {
+		if entry["name"] == filepath.Base(f.e.root) {
 			t.Fatal("parent list exposed private state", entry)
 		}
 	}
@@ -136,7 +133,7 @@ func TestEditorPrivateStateGuard(t *testing.T) {
 		if filepath.ToSlash(name) == "public/"+filepath.Base(f.e.root)+"/visible.txt" {
 			found = true
 		}
-		if strings.Contains(name, stage) || strings.Contains(name, "private-host-proof") {
+		if strings.Contains(name, stage) || strings.Contains(name, "STATE_NEEDLE-private-proof") {
 			t.Fatal("parent glob exposed private descendant", name)
 		}
 	}
@@ -153,7 +150,7 @@ func TestEditorPrivateStateGuard(t *testing.T) {
 		if name == "public/"+filepath.Base(f.e.root)+"/visible.txt" {
 			found = true
 		}
-		if strings.Contains(name, stage) || strings.Contains(name, "private-host-proof") {
+		if strings.Contains(name, stage) || strings.Contains(name, "STATE_NEEDLE-private-proof") {
 			t.Fatal("recursive transfer exposed private descendant", name)
 		}
 	}
@@ -176,9 +173,6 @@ func TestEditorPrivateStateGuard(t *testing.T) {
 	}
 	if f.query(t, req).Outcome != "committed" {
 		t.Fatal("query broken by internal deny")
-	}
-	if got := hostReceiptCall(t, f, "editor.hostReceipt.get", map[string]any{"operationId": "private-host-proof"}); got["value"] == nil {
-		t.Fatal("trusted Host store broken by internal deny")
 	}
 	attack := f.request(t, "attack-private", []byte("STATE_NEEDLE private body"), []byte("forged"))
 	attack.Identity.CanonicalPath = f.e.bodyPath(stage)
@@ -220,7 +214,7 @@ func TestEditorPrivateGuardKeepsOrdinaryGit(t *testing.T) {
 }
 
 func TestEditorPrivateFailedInitialization(t *testing.T) {
-	for _, which := range []string{"engine", "host"} {
+	for _, which := range []string{"engine"} {
 		t.Run(which, func(t *testing.T) {
 			root := t.TempDir()
 			h := New(NewPathGuard(nil), 128*1024)
@@ -237,19 +231,8 @@ func TestEditorPrivateFailedInitialization(t *testing.T) {
 			if err := os.WriteFile(marker, []byte("old sole proof"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if which == "engine" {
-				if _, err := NewEditorEngine(h, weak); err == nil {
-					t.Fatal("weak private root unexpectedly initialized")
-				}
-			} else {
-				e, err := NewEditorEngine(h, filepath.Join(root, "good-state"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				h.SetEditorEngine(e)
-				if err = e.ConfigureHostReceipts(weak); err == nil {
-					t.Fatal("weak Host root unexpectedly initialized")
-				}
+			if _, err := NewEditorEngine(h, weak); err == nil {
+				t.Fatal("weak private root unexpectedly initialized")
 			}
 			alias := filepath.Join(root, "alias")
 			editorPrivateAlias(t, weak, alias)

@@ -33,7 +33,6 @@ import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
-import type { EditorDurableOperation } from "./editor-remote-operation-store";
 import { applyLocalFileChange } from "./file-change-apply-result";
 import { FileChangeBlobCatalog, FileChangeBlobCatalogError } from "./file-change-blob-catalog";
 import {
@@ -344,36 +343,44 @@ export class LocalFileChangeRuntime {
 
 	/** Reconcile only a positively terminal engine receipt against its ORIGINAL intent.
 	 * No target read/write, current-hash inference, new runtime adoption, or rollback claim. */
-	settleEditorReceipt(record: EditorDurableOperation, result: EditorApplyResult): void {
-		const operation = this.evidence.getOperation(record.hostOperationId);
-		const effect = this.evidence.listEffects(record.hostOperationId, { limit: 2 }).items[0];
+	settleEditorReceipt(operationId: string, result: EditorApplyResult): void {
+		const operation = this.evidence.getOperation(operationId);
+		const effects = this.evidence.listEffects(operationId, { limit: 2 }).items;
+		const effect = effects.length === 1 ? effects[0] : undefined;
 		const verify = () => {
 			if (
 				!operation ||
 				!effect ||
 				!operation.executionBindingJson ||
 				operation.sourceKind !== "editor" ||
-				operation.sourceId !== record.operationId ||
-				operation.ownerUserId !== record.userId ||
-				operation.narratorId !== record.narratorId ||
-				operation.requestDigest !== record.requestDigest ||
-				effect.id !== record.effectId ||
-				effect.identityJson.deviceId !== record.deviceId ||
-				effect.identityJson.canonicalPath !== record.identity.canonicalPath ||
-				result.operationId !== record.operationId ||
+				!operation.ownerUserId ||
+				!operation.narratorId ||
+				!operation.workspaceLeaseId ||
+				operation.editorRawSnapshotRevision === null ||
+				effect.identityJson.deviceId === "local" ||
+				effect.identityJson.deviceId !== operation.executionBindingJson.deviceId ||
+				effect.requestDigest !== operation.requestDigest ||
+				result.operationId !== operation.sourceId ||
 				!["committed", "rejected"].includes(result.outcome) ||
 				(result.outcome === "committed" &&
-					(result.rawDigest !== record.rawDigest ||
-						result.totalBytes !== record.bytes ||
-						effect.intendedAfterStateJson.kind !== "regular" ||
-						effect.intendedAfterStateJson.blob.digest !== result.rawDigest))
+					(effect.intendedAfterStateJson.kind !== "regular" ||
+						effect.intendedAfterStateJson.blob.digest !== result.rawDigest ||
+						effect.intendedAfterStateJson.blob.sizeBytes !== result.totalBytes)) ||
+				(result.outcome === "rejected" && (result.rawDigest !== null || result.totalBytes !== null))
 			)
 				throw new Error("Editor receipt does not match its original owned intent");
 		};
 		verify();
-		if (!operation || !effect || !operation.executionBindingJson)
+		if (
+			!operation ||
+			!effect ||
+			!operation.executionBindingJson ||
+			!operation.workspaceLeaseId ||
+			!operation.requestDigest
+		)
 			throw new Error("Editor intent unavailable");
 		const executionBinding = operation.executionBindingJson;
+		const requestDigest = operation.requestDigest;
 		if (effect.settlement === "settled") {
 			if (
 				!effect.executionConfirmed ||
@@ -387,14 +394,17 @@ export class LocalFileChangeRuntime {
 		if (!scope) throw new Error("Original editor scope unavailable");
 		this.coordinator.acknowledgeEditorReceipt(
 			{
-				leaseId: record.leaseId,
+				leaseId: operation.workspaceLeaseId,
 				operationId: operation.id,
 				effectId: effect.id,
 				mutationId: effect.mutationId,
 			},
 			verify,
 		);
-		const reservation = this.coordinator.reserveRecovery({ scope, leaseId: record.leaseId });
+		const reservation = this.coordinator.reserveRecovery({
+			scope,
+			leaseId: operation.workspaceLeaseId,
+		});
 		try {
 			reservation.complete((tx) => {
 				verify();
@@ -402,11 +412,11 @@ export class LocalFileChangeRuntime {
 					{
 						operationId: operation.id,
 						mutationId: effect.mutationId,
-						requestDigest: record.requestDigest,
+						requestDigest,
 						receipt: {
 							receiptId: generateId(),
 							mutationId: effect.mutationId,
-							requestDigest: record.requestDigest,
+							requestDigest,
 							executionBinding,
 							confirmed: true,
 							outcome: result.outcome === "committed" ? "applied" : "not_applied",
@@ -1029,6 +1039,13 @@ export class LocalFileChangeRuntime {
 		request: EditorFileChangeRequest<Result>,
 	): Promise<FileChangeCompletion<Result>> {
 		request = Object.freeze({ ...request, input: snapshotFileToolInput(request.input) });
+		if (
+			request.remote &&
+			(request.input.hashKind !== "raw-sha256" ||
+				!Number.isSafeInteger(request.input.snapshotRevision) ||
+				Number(request.input.snapshotRevision) < 0)
+		)
+			throw new LocalFileValidationError("Remote editor requires its raw snapshot revision");
 		const runtime = request.remote?.runtime ?? this.readRuntime(LOCAL_DEVICE_ID);
 		const backend = request.remote?.backend ?? localBackend;
 		if (request.remote) {
@@ -1670,6 +1687,10 @@ export class LocalFileChangeRuntime {
 											attempt: request.attempt,
 											requestDigest,
 											expectedEffectCount: 1,
+											workspaceLeaseId: request.remote ? lease.leaseId : null,
+											editorRawSnapshotRevision: request.remote
+												? Number(request.input.snapshotRevision)
+												: null,
 											actor: request.actor,
 											narratorId: request.narratorId,
 											projectId: request.projectId,
@@ -1875,18 +1896,9 @@ export class LocalFileChangeRuntime {
 														? {
 																sourceId: request.sourceId,
 																userId: request.userId as string,
-																narratorId: request.narratorId,
 																operationId: operation.id,
 																effectId: effect.id,
-																mutationId: effect.mutationId,
 																requestDigest,
-																leaseId: lease.leaseId,
-																preparedResult: prepared.result,
-																snapshotRevision: Number(request.input.snapshotRevision),
-																hashKind:
-																	request.input.hashKind === "raw-sha256"
-																		? "raw-sha256"
-																		: undefined,
 																executionBinding: lease.executionBinding,
 																scope,
 																before: beforeState,

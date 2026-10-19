@@ -165,6 +165,20 @@ jobs:
         run: go test -count=1 -timeout=5m ./internal/handlers ./internal/rpc -run "Conditional|Metadata|FileMutation|Windows|Darwin"
       - name: Check native Go code
         run: go vet ./internal/handlers ./internal/rpc
+      - name: Set up Bun for native Host persistence tests
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - name: Install native Host test dependencies
+        working-directory: .
+        run: bun install --frozen-lockfile
+      # This explicit remote peer is separate from the fresh Host, which forbids helper bootstrap.
+      - name: Build controlled remote editor fixture
+        working-directory: .
+        run: bun scripts/build-editor-test-helper.ts
+      - name: Run native Host remote persistence regressions
+        working-directory: .
+        run: bun test --isolate server/services/editor-document-remote-persistence.test.ts
 
   integration-typescript:
     name: TypeScript, Bun tests, and production build

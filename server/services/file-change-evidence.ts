@@ -63,6 +63,8 @@ export interface BeginFileChangeOperation {
 	/** Caller hashes the complete, fixed request/target set, not a sampled prefix. */
 	requestDigest: string;
 	expectedEffectCount: number;
+	workspaceLeaseId?: string | null;
+	editorRawSnapshotRevision?: number | null;
 	actor: FileChangeActor;
 	executionBinding: FileChangeExecutionBinding;
 	toolCallId?: string | null;
@@ -1305,6 +1307,26 @@ export class FileChangeEvidenceService {
 		);
 	}
 
+	/** Unique installation/editor/request/attempt lookup; never a journal scan. */
+	getEditorOperation(sourceInstanceId: string, sourceId: string): FileChangeOperationRecord | null {
+		assertString(sourceInstanceId, "sourceInstanceId");
+		assertString(sourceId, "sourceId");
+		return (
+			this.database
+				.select()
+				.from(fileChangeOperations)
+				.where(
+					and(
+						eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
+						eq(fileChangeOperations.sourceKind, "editor"),
+						eq(fileChangeOperations.sourceId, sourceId),
+						eq(fileChangeOperations.attempt, 1),
+					),
+				)
+				.get() ?? null
+		);
+	}
+
 	getEffect(operationId: string, mutationId: string): FileChangeEffectRecord | null {
 		assertString(operationId, "operationId");
 		assertString(mutationId, "mutationId");
@@ -1520,6 +1542,16 @@ function normalizeOperation(input: BeginFileChangeOperation) {
 		1,
 		FILE_CHANGE_LIMITS.revertFiles,
 	);
+	const revision = input.editorRawSnapshotRevision ?? null;
+	if (revision !== null) {
+		assertInteger(revision, "editorRawSnapshotRevision", 0, Number.MAX_SAFE_INTEGER);
+		if (
+			input.sourceKind !== "editor" ||
+			input.executionBinding.deviceId === "local" ||
+			!input.workspaceLeaseId
+		)
+			throw fail("INVALID_INPUT", "Remote editor snapshot requires its original lease");
+	}
 	const values = {
 		evidenceVersion: FILE_CHANGE_EVIDENCE_VERSION,
 		sourceInstanceId: input.sourceInstanceId,
@@ -1528,6 +1560,8 @@ function normalizeOperation(input: BeginFileChangeOperation) {
 		attempt: input.attempt,
 		requestDigest: input.requestDigest,
 		expectedEffectCount: input.expectedEffectCount,
+		workspaceLeaseId: nullableId(input.workspaceLeaseId),
+		editorRawSnapshotRevision: revision,
 		actorSubjectKey: input.actor.subjectKey,
 		actorJson: normalizeActor(input.actor),
 		executionBindingJson: normalizeBinding(input.executionBinding),

@@ -40,6 +40,16 @@ func TestEditorCrashChild(t *testing.T) {
 	}
 	h.SetEditorEngine(e)
 	fixture.Request.Identity.RuntimeEpoch = EditorRuntimeEpoch()
+	if !fixture.Reclaim {
+		// Transfer fixture bytes, never a stage capability. Upload/seal and apply
+		// must belong to this child engine; only the resulting receipt survives.
+		body, err := os.ReadFile(e.bodyPath(fixture.Request.StageID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := &editorFixture{h: h, e: e, root: fixture.Root, path: fixture.Request.Identity.CanonicalPath, state: fixture.State, identity: fixture.Request.Identity}
+		fixture.Request.StageID = local.stage(t, body)
+	}
 	e.fault = func(point string) error {
 		if point == fixture.Point {
 			os.Exit(42)
@@ -47,7 +57,12 @@ func TestEditorCrashChild(t *testing.T) {
 		return nil
 	}
 	if fixture.Reclaim {
-		_, err = h.EditorDispatch(context.Background(), "editor.stage.open", map[string]any{"namespace": "owner", "resourceKey": "resource", "maxBytes": 0, "idleTimeoutMs": 30000})
+		release, lockErr := e.lock(context.Background())
+		if lockErr != nil {
+			t.Fatal(lockErr)
+		}
+		defer release()
+		_, _, _, err = e.inventory()
 	} else {
 		_, err = h.EditorDispatch(context.Background(), "editor.apply", editorParams(t, fixture.Request))
 	}
@@ -111,8 +126,11 @@ func TestEditorReceiptRetirementProcessCrashOrder(t *testing.T) {
 			if err != nil || !os.SameFile(installed, after) {
 				t.Fatal("retirement crash replay caused a second installation")
 			}
-			if _, err = os.Stat(f.e.stagePath(req.StageID)); !os.IsNotExist(err) {
-				t.Fatal("stage capability was not durably retired first")
+			if _, ok := f.e.stages[req.StageID]; ok {
+				t.Fatal("retired stage was reconstructed from disk")
+			}
+			if _, err = os.Stat(f.e.bodyPath(req.StageID)); !os.IsNotExist(err) {
+				t.Fatal("retired body survived receipt removal")
 			}
 		})
 	}
@@ -146,6 +164,14 @@ func TestEditorRealProcessCrashRecoveryAndTemporaryQuota(t *testing.T) {
 				t.Fatalf("fixture did not crash at %s: %v %s", point, err, output)
 			}
 			f.restart(t)
+			var durable editorReceipt
+			if err := editorReadJSON(f.e.receiptPath(req.Namespace, req.OperationID), &durable); err != nil {
+				t.Fatal(err)
+			}
+			if durable.StageBytes != 5 || durable.StageRawDigest != editorDigest([]byte("after")) {
+				t.Fatal("intent omitted its sealed body metadata", durable)
+			}
+			req = durable.Request
 			q := f.query(t, req)
 			want := "uncertain"
 			if point == "intent" || point == "prepared" {
@@ -154,9 +180,18 @@ func TestEditorRealProcessCrashRecoveryAndTemporaryQuota(t *testing.T) {
 			if q.Outcome != want {
 				t.Fatalf("process recovery %s %+v", point, q)
 			}
-			// Admission cleans only the recorded pre-dispatch preparation object;
-			// uncertain journals/stages remain protected despite expiration.
-			f.call(t, "editor.stage.open", EditorStageOpen{Namespace: "owner", ResourceKey: "resource", MaxBytes: 1, IdleTimeoutMs: 30000})
+			// The first query itself publishes rejection and releases unneeded
+			// recovery bytes; no later admission may hide lazy body cleanup.
+			_, bodyErr := os.Stat(f.e.bodyPath(req.StageID))
+			if want == "rejected" && !os.IsNotExist(bodyErr) {
+				t.Fatal("first recovery query retained rejected body", bodyErr)
+			}
+			if want == "uncertain" && bodyErr != nil {
+				t.Fatal("uncertain query lost recovery body", bodyErr)
+			}
+			if again := f.query(t, req); again.Outcome != want {
+				t.Fatal("unacknowledged recovery receipt was not queryable", again)
+			}
 			temporaries, err := filepath.Glob(filepath.Join(f.root, ".nf-editor-*"))
 			if err != nil {
 				t.Fatal(err)

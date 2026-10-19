@@ -525,7 +525,7 @@ export class EditorDocumentService {
 		if (need === "write" && this.deps.writerAvailable && !this.deps.writerAvailable(binding))
 			throw new EditorDocumentError(
 				"EDITOR_PROVIDER_UNSUPPORTED",
-				"Verified editor helper unavailable; prepare the pinned executor from the configured update source and reopen this file",
+				"Editor provider is not writable; upgrade the authorized remote executor if required",
 				503,
 			);
 		assertSameEditorBinding(actor, session.input, session.binding, binding);
@@ -591,9 +591,7 @@ export class EditorDocumentService {
 							? {
 									writeUnavailableReason:
 										this.deps.writerUnavailableReason?.(binding) ??
-										(binding.rawSource
-											? ("durable_executor_unavailable" as const)
-											: ("verified_helper_unavailable" as const)),
+										("durable_executor_unavailable" as const),
 								}
 							: {}),
 						rawRead: true,
@@ -636,7 +634,7 @@ export class EditorDocumentService {
 						? {
 								writeUnavailableReason:
 									this.deps.writerUnavailableReason?.(binding) ??
-									("verified_helper_unavailable" as const),
+									("durable_executor_unavailable" as const),
 							}
 						: {}),
 				},
@@ -1679,6 +1677,10 @@ export class EditorDocumentService {
 		) {
 			if (operation.deviceId && actor.authorizeOperation)
 				await actor.authorizeOperation(operation.deviceId);
+			// Remote receipts are canonical in SQLite, including live terminal results
+			// whose direct ACK may have failed. Do not bypass reconciliation via cache.
+			if (operation.deviceId && operation.deviceId !== "local" && this.deps.queryOperation)
+				return this.deps.queryOperation(actor, operationId);
 			if (operation.recovery?.hashKind === "raw-sha256" && this.deps.rawWriter)
 				return this.deps.rawWriter.queryOperation(actor, operationId, operation.recovery);
 			if (operation.recovery && this.deps.queryOperation)

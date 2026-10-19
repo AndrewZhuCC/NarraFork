@@ -4475,6 +4475,10 @@ export const fileChangeOperations = sqliteTable(
 		/** Nullable only for pre-journal rows, which cannot authorize execution. */
 		requestDigest: text("request_digest"),
 		expectedEffectCount: integer("expected_effect_count"),
+		/** Original editor admission; terminal lease pruning must not delete the operation. */
+		workspaceLeaseId: text("workspace_lease_id"),
+		/** Present only for a new trusted remote raw-v2 save; NULL is never inferred. */
+		editorRawSnapshotRevision: real("editor_raw_snapshot_revision"),
 		preparedEffectCount: integer("prepared_effect_count").notNull().default(0),
 		evidenceBytes: integer("evidence_bytes").notNull().default(0),
 		settledEffectCount: integer("settled_effect_count").notNull().default(0),

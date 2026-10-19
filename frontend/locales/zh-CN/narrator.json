@@ -1562,8 +1562,6 @@
 	"fileEditor.receiptNotApplied": "旧上传已确认未提交。保留的草稿未作改变。",
 	"fileEditor.receiptFailed": "旧保存未提交：{{message}}",
 	"fileEditor.readOnly": "只读",
-	"fileEditor.verified_helper_unavailable": "原子编辑辅助程序不可用。后台会从已配置的更新源准备锁定版本的 executor；准备完成后请重新打开文件。不会回退到不安全写入。",
-	"fileEditor.host_receipt_storage_unavailable": "已验证的辅助程序暂不能提供本机私有持久回执存储。请从已配置更新源准备或升级锁定版本 executor 后重新打开文件；不会回退到不安全写入。",
 	"fileEditor.durable_executor_unavailable": "请升级远程 executor 以启用持久化编辑保存。当前文件保持只读。",
 	"fileEditor.missingContext": "缺少叙述者上下文，无法安全打开此文件。",
 	"fileEditor.search": "查找 / 替换",

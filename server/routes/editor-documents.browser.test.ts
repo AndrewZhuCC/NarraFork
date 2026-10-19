@@ -499,6 +499,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 							editorDraftBrowserAcceptance(page, {
 								path,
 								origin,
+								signal: deadline.signal,
 								original: originalText,
 								downloadDirectory: join(root, "draft-downloads"),
 								writeDisk: (text) => writeFile(path, text),

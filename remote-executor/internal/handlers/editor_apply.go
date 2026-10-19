@@ -144,10 +144,10 @@ func (e *EditorEngine) apply(ctx context.Context, req EditorApplyRequest) (any, 
 	if err != nil {
 		return nil, err
 	}
-	if !editorValidDigest(s.RawDigest) {
+	if !s.Sealed || !s.BodySynced || !editorValidDigest(s.RawDigest) {
 		return nil, fmt.Errorf("EDITOR_STAGE_SEAL_FAILED: stage not sealed")
 	}
-	r := editorReceipt{Version: 1, Request: req, Fingerprint: fingerprint, State: "intent"}
+	r := editorReceipt{Version: 1, Request: req, Fingerprint: fingerprint, State: "intent", StageRawDigest: s.RawDigest, StageBytes: s.Size}
 	receiptPath := e.receiptPath(req.Namespace, req.OperationID)
 	if err = e.save(receiptPath, &r); err != nil {
 		return nil, err
@@ -155,16 +155,24 @@ func (e *EditorEngine) apply(ctx context.Context, req EditorApplyRequest) (any, 
 	if err = e.inject("intent"); err != nil {
 		return nil, err
 	}
+	// Intent's durable directory sync also covers the already-synced body
+	// entry in this root. There is no independent persistent stage metadata.
 	s.OperationID = req.OperationID
-	if err = e.save(e.stagePath(s.StageID), s); err != nil {
-		return nil, err
-	}
+	terminalPublished := false
+	// Registered before all later FD defers, so Windows deletion runs only
+	// after body/preparation handles close. Cleanup never changes durable proof.
+	defer func() {
+		if terminalPublished && !e.bodyRequired(&r) {
+			_ = e.removeBody(s.StageID)
+		}
+	}()
 	finish := func(result *EditorApplyResult) (any, error) {
 		r.State = result.Outcome
 		r.Result = result
 		if err := e.save(receiptPath, &r); err != nil {
 			return nil, err
 		}
+		terminalPublished = true
 		return *result, nil
 	}
 	reject := func(err error) (any, error) {

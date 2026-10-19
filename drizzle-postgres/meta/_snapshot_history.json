@@ -208,6 +208,14 @@
 			"prevId": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
 			"version": "7",
 			"snapshotDigest": "609d364919742b1c67eee672481fc63b9a4c3cbd90b93268743b396ba5cefb3a"
+		},
+		{
+			"idx": 26,
+			"tag": "0026_editor_operation_recovery",
+			"id": "3c176d82-b56d-4f33-b79f-fa7d6adfefd9",
+			"prevId": "c7aa010f-c918-4c1f-bd1f-9fd0548f3fe8",
+			"version": "7",
+			"snapshotDigest": "6917d9a60f8a49350d4bb212a602b136692ed031657e355311d4103a1438a522"
 		}
 	]
 }
