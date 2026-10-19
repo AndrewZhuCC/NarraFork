@@ -6,7 +6,6 @@ import type {
 import { parseComposerDocument } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import {
-	IconExternalLink,
 	IconFileText,
 	IconLoader2,
 	IconPaperclip,
@@ -112,6 +111,7 @@ export interface InlineComposerEditorProps {
 	onOpenQuote?: (quote: Extract<ComposerInlineNode, { type: "quote" }>) => void;
 	onOpenFile?: (reference: FileReference) => void;
 	onOpenImage?: (asset: ComposerAsset) => void;
+	onOpenAttachment?: (asset: ComposerAsset) => void;
 	controls?: ReactNode;
 	leadingControls?: ReactNode;
 	/** Transient preview only; never becomes a document node or history entry. */
@@ -131,6 +131,7 @@ type AtomContextValue = Pick<
 	| "onOpenQuote"
 	| "onOpenFile"
 	| "onOpenImage"
+	| "onOpenAttachment"
 > & { assets: ReadonlyMap<string, ComposerAsset> };
 const AtomContext = createContext<AtomContextValue>({ assets: new Map() });
 
@@ -258,6 +259,8 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 	const resource = value.type === "attachment" ? context.resources?.get(value.assetId) : undefined;
 	const [objectURL, setObjectURL] = useState<{ file: File; url: string }>();
 	const [failedSource, setFailedSource] = useState<string>();
+	const gesture = useRef<{ type: string; x: number; y: number; moved: boolean } | null>(null);
+	const pointerType = useRef("mouse");
 	useEffect(() => {
 		setFailedSource(undefined);
 		if (asset?.kind !== "image" || !resource || typeof resource === "string") {
@@ -307,9 +310,14 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				? context.onOpenFile
 					? () => context.onOpenFile?.(value.reference)
 					: undefined
-				: asset && context.onOpenImage && image
-					? () => context.onOpenImage?.(asset)
+				: asset
+					? image
+						? context.onOpenImage && (() => context.onOpenImage?.(asset))
+						: context.onOpenAttachment && (() => context.onOpenAttachment?.(asset))
 					: undefined;
+	const preview = () => {
+		if (!restoring && !missing) open?.();
+	};
 	const Icon =
 		value.type === "quote"
 			? IconQuote
@@ -334,8 +342,42 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				className={classes.nodeBody}
 				title={value.type === "quote" ? value.text.slice(0, 600) : label}
 				aria-label={label}
-				onPointerDown={(event) => event.preventDefault()}
-				onClick={select}
+				onPointerDown={(event) => {
+					event.preventDefault();
+					pointerType.current = event.pointerType;
+					gesture.current = {
+						type: event.pointerType,
+						x: event.clientX,
+						y: event.clientY,
+						moved: false,
+					};
+				}}
+				onPointerMove={(event) => {
+					const start = gesture.current;
+					if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 8)
+						start.moved = true;
+				}}
+				onPointerCancel={() => {
+					gesture.current = null;
+				}}
+				onClick={(event) => {
+					const start = gesture.current;
+					gesture.current = null;
+					const type = (event.nativeEvent as PointerEvent).pointerType || start?.type;
+					if ((!type && event.detail === 0) || (start && !start.moved && type !== "mouse"))
+						preview();
+					else select();
+				}}
+				onDoubleClick={() => {
+					if (pointerType.current === "mouse") preview();
+				}}
+				onKeyDown={(event) => {
+					if (event.key === "Enter" || event.key === " ") {
+						// Let the button generate its native keyboard click, but never submit the composer.
+						event.stopPropagation();
+						gesture.current = null;
+					}
+				}}
 			>
 				{image ? (
 					<span className={classes.thumbnail}>
@@ -359,18 +401,6 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				)}
 			</button>
 			<span className={classes.nodeActions}>
-				{open && (
-					<button
-						type="button"
-						className={classes.action}
-						aria-label={t("quote.open", { defaultValue: "Open" })}
-						disabled={restoring || missing}
-						onPointerDown={(event) => event.preventDefault()}
-						onClick={open}
-					>
-						<IconExternalLink size={12} />
-					</button>
-				)}
 				<button
 					type="button"
 					className={classes.action}
@@ -911,6 +941,7 @@ export const InlineComposerEditor = forwardRef<
 			onOpenQuote: props.onOpenQuote,
 			onOpenFile: props.onOpenFile,
 			onOpenImage: props.onOpenImage,
+			onOpenAttachment: props.onOpenAttachment,
 			// The generation changes only for insert/load, not individual text keystrokes.
 			generation: assetGeneration,
 		}),
@@ -923,6 +954,7 @@ export const InlineComposerEditor = forwardRef<
 			props.onOpenQuote,
 			props.onOpenFile,
 			props.onOpenImage,
+			props.onOpenAttachment,
 		],
 	);
 	return (

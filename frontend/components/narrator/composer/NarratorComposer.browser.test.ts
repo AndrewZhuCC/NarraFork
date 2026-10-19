@@ -647,7 +647,7 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 		expect(shortcut.shortcut).toBe("Tab");
 		expect(shortcut.icon).toBe(true);
 		expect(shortcut.topBorder).toBeGreaterThan(0);
-		expect(shortcut.bottomBorder).toBeGreaterThan(shortcut.topBorder);
+		expect(shortcut.bottomBorder).toBe(shortcut.topBorder);
 		expect(shortcut.shrink).toBe("0");
 		expect(shortcut.height).toBeLessThan(shortcut.chipHeight);
 		const consumed = await page.evaluate(() =>
@@ -1552,3 +1552,133 @@ test("reusing the mounted composer never exposes the previous account's live or 
 		await closePersistentAttachments(page);
 	}
 }, 20_000);
+
+for (const width of [1440, 390]) {
+	for (const scheme of ["light", "dark"] as const) {
+		test(`${width}px ${scheme}: quote confirmation keeps chip typography and vertical alignment`, async () => {
+			const page = await open();
+			try {
+				await page.setViewport({ width, height: 844 });
+				await page.evaluate((theme) => {
+					document.documentElement.setAttribute("data-mantine-color-scheme", theme);
+				}, scheme);
+				await selectQuotableSource(page);
+				const measure = (selector: string) =>
+					page.$eval(selector, (chip) => {
+						const body = chip.querySelector("button");
+						const label = body?.querySelector(":scope > span:last-child");
+						const icon = body?.querySelector(":scope > svg");
+						if (!body || !label || !icon) throw new Error("Missing chip content");
+						const box = chip.getBoundingClientRect();
+						const style = getComputedStyle(chip);
+						const textStyle = getComputedStyle(label);
+						const centerOffset = (element: Element) => {
+							const rect = element.getBoundingClientRect();
+							return rect.y + rect.height / 2 - box.y - box.height / 2;
+						};
+						const kbd = chip.querySelector("kbd");
+						const keyText = kbd?.querySelector("span");
+						return {
+							height: box.height,
+							y: box.y,
+							border: style.borderTopWidth,
+							font: textStyle.font,
+							textHeight: label.getBoundingClientRect().height,
+							labelOffset: centerOffset(label),
+							iconOffset: centerOffset(icon),
+							icon: icon.getAttribute("class"),
+							label: label.textContent,
+							keyOffset: kbd && keyText ? centerOffset(keyText) - centerOffset(kbd) : 0,
+							keyHeight: keyText?.getBoundingClientRect().height,
+						};
+					});
+				if (process.env.NF_COMPOSER_SCREENSHOTS)
+					await page.screenshot({
+						path: `.narrafork/quote-${width}-${scheme}-before.png`,
+						fullPage: true,
+					});
+				const before = await measure("[data-inline-quote-candidate]");
+				expect(before.height).toBe(24);
+				expect(Math.abs(before.keyOffset)).toBeLessThanOrEqual(1);
+				expect(before.keyHeight).toBeLessThanOrEqual(16);
+				await page.keyboard.press("Tab");
+				await settle(page);
+				if (process.env.NF_COMPOSER_SCREENSHOTS)
+					await page.screenshot({
+						path: `.narrafork/quote-${width}-${scheme}-after.png`,
+						fullPage: true,
+					});
+				const after = await measure('[data-composer-atom="quote"]');
+				expect(after.height).toBe(before.height);
+				expect(after.border).toBe(before.border);
+				expect(after.font).toBe(before.font);
+				expect(after.textHeight).toBe(before.textHeight);
+				expect(after.label).toBe(before.label);
+				expect(after.icon).toBe(before.icon);
+				expect(Math.abs(after.y - before.y)).toBeLessThanOrEqual(1);
+				for (const geometry of [before, after]) {
+					expect(Math.abs(geometry.labelOffset)).toBeLessThanOrEqual(1);
+					expect(Math.abs(geometry.iconOffset)).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				await close(page);
+			}
+		});
+	}
+}
+
+for (const input of ["mouse", "touch"] as const)
+	test(`${input}: text attachment previews stay above fullscreen and Escape closes only the preview`, async () => {
+		const page = await open();
+		try {
+			if (input === "touch") {
+				await page.setViewport({ width: 390, height: 844, hasTouch: true });
+				await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
+			}
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.stageMixed());
+			await settle(page);
+			const before = await snapshot(page);
+			await page.click("button:has(svg.tabler-icon-arrows-maximize)");
+			await settle(page);
+			const body = '[data-composer-atom="attachment"] button[aria-label="console.log"]';
+			if (input === "mouse") {
+				await page.click(body);
+				expect(await page.$('pre[role="region"]')).toBeNull();
+				await page.click(body, { clickCount: 2 });
+			} else {
+				const point = await page.$eval(body, (element) => {
+					const rect = element.getBoundingClientRect();
+					return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+				});
+				await page.touchscreen.tap(point.x, point.y);
+			}
+			await page.waitForSelector('pre[role="region"]', { visible: true });
+			expect(
+				await page.$eval('pre[role="region"]', (preview) => {
+					const rect = preview.getBoundingClientRect();
+					return (
+						document
+							.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+							?.closest('pre[role="region"]') === preview
+					);
+				}),
+			).toBe(true);
+			expect(await page.$eval('pre[role="region"]', (preview) => preview.textContent)).toBe(
+				"console output",
+			);
+			expect((await snapshot(page)).document).toEqual(before.document);
+			if (process.env.NF_COMPOSER_SCREENSHOTS)
+				await page.screenshot({
+					path: `.narrafork/text-attachment-preview-fullscreen-${input}.png`,
+					fullPage: true,
+				});
+			await page.keyboard.press("Escape");
+			await page.waitForSelector('pre[role="region"]', { hidden: true });
+			expect(await page.$('[aria-label="Compose message"]')).not.toBeNull();
+			await page.keyboard.press("Escape");
+			await settle(page);
+			expect(await page.$('[aria-label="Compose message"]')).toBeNull();
+		} finally {
+			await close(page);
+		}
+	});
