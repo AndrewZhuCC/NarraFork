@@ -188,6 +188,10 @@ async function prepareLogicalRun(
 			deliverTo = { ...deliverTo, toolCallId: row.originToolCallId };
 		}
 	}
+	// LEGACY COMPATIBILITY (delete in step 5): an unregistered background session
+	// delivers through its task row.
+	if (row.runtimeRegistrationJson == null && row.isBackground && deliverTo)
+		deliverTo = { ...deliverTo, viaTask: true };
 	// A result destination is optional; every run registers the same durable facts.
 	const binding: RunBindingInput = {
 		...req.binding,
@@ -206,7 +210,7 @@ async function prepareLogicalRun(
 	// A new run that only inherits a destination which already holds an earlier
 	// result delivers through a task row instead of rewriting that result.
 	const inherited = !(req.binding || req.resumeRunId || req.recovered);
-	if (!req.foreground && (row.isBackground || (inherited && (await settled(deliverTo)))))
+	if (!req.foreground && (deliverTo.viaTask || (inherited && (await settled(deliverTo)))))
 		await projectRunAsTask(narratorId, row, deliverTo, publicationRun, binding);
 	return { binding: registered, publicationRun };
 }

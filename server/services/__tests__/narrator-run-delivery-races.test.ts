@@ -31,6 +31,7 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { readRuntimeRegistrationColumn } from "../../lib/validators/runtime-registration";
 
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 
@@ -171,6 +172,12 @@ const binding = (extra: Record<string, unknown> = {}) => ({
 	principal: { userId: null },
 	...extra,
 });
+
+/** A background session: its runs deliver through the task row. */
+const backgroundBinding = () => {
+	const base = binding({ cancelWith: undefined });
+	return { ...base, deliverTo: { ...base.deliverTo, viaTask: true as const } };
+};
 
 /** Scripted model passes: each step may block, then replies with a persisted answer. */
 function scriptPasses(
@@ -572,10 +579,10 @@ describe("C. a new run of an ended background task", () => {
 			alias: "race-alias",
 			binding: binding({ cancelWith: undefined }),
 		});
-		db.update(narrators)
-			.set({ isBackground: true, backgroundStatus: "running" })
-			.where(eq(narrators.id, RUN))
-			.run();
+		// The registration alone makes later runs deliver through the task row.
+		expect(
+			readRuntimeRegistrationColumn(sessionRow()?.runtimeRegistrationJson)?.run?.deliverTo?.viaTask,
+		).toBe(true);
 		const first = await startNarratorRun({
 			narratorId: RUN,
 			locale: "en",
@@ -1132,7 +1139,7 @@ describe("hold protocol regressions", () => {
 		const old = (
 			await pub.startRun({
 				narratorId: RUN,
-				binding: binding(),
+				binding: backgroundBinding(),
 			})
 		).publication!;
 		db.insert(backgroundTasks)
@@ -1169,7 +1176,7 @@ describe("hold protocol regressions", () => {
 					narratorId: RUN,
 					locale: "en",
 					text: "new work",
-					binding: binding(),
+					binding: backgroundBinding(),
 				})
 			).started,
 		).toBe(false);
@@ -1198,7 +1205,7 @@ describe("hold protocol regressions", () => {
 			narratorId: RUN,
 			locale: "en",
 			text: "new work",
-			binding: binding(),
+			binding: backgroundBinding(),
 		});
 		await settle(() => !!getRunControl(RUN)?.logicalRunId);
 		expect(getRunControl(RUN)?.logicalRunId).not.toBe(old.logicalRunId);

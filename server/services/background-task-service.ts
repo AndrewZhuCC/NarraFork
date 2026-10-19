@@ -821,6 +821,11 @@ class BackgroundTaskService {
 	}): Promise<BackgroundTaskRecord> {
 		const opts = {
 			...input,
+			// A task projection is exactly a destination reached through the task row.
+			binding: {
+				...input.binding,
+				deliverTo: { ...input.binding.deliverTo, viaTask: true as const },
+			},
 			parentNarratorId: input.binding.deliverTo.narratorId,
 			toolUseId: input.binding.deliverTo.toolUseId,
 		};
