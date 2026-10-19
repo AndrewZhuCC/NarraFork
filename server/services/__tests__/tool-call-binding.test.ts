@@ -732,6 +732,18 @@ describe("真实工具行执行绑定", () => {
 		const child = await narratorService.createSubagent(input);
 		expect(child.originToolCallId).toBe("source");
 		expect(child.subagentOriginKind).toBe("tool");
+		await db
+			.update(narrators)
+			.set({
+				runtimeRegistrationJson: {
+					version: 1,
+					run: {
+						logicalRunId: "conclusion-run",
+						deliverTo: { narratorId: "n", toolUseId: "call_0", toolCallId: "source", attempt: 1 },
+					},
+				},
+			})
+			.where(eq(narrators.id, child.id));
 		expect(
 			await narratorPersistence.resolveSubagentConclusionReference(child.id, "n", "call_0"),
 		).toMatchObject({ toolCallId: "source", messageId: "message", originToolCallId: "source" });
@@ -740,7 +752,7 @@ describe("真实工具行执行绑定", () => {
 		).rejects.toThrow("parent's executing Agent row");
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference(child.id, "other", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
+		).rejects.toThrow("registered delivery tool-call");
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference(
 				child.id,
@@ -768,19 +780,28 @@ describe("真实工具行执行绑定", () => {
 			cwd: testHome,
 			originToolCallId: "source",
 		});
-		const { registerConclusionWatcher, getConclusionWatcher, removeConclusionWatcher } =
-			await import("../subagent-manual-override");
-		registerConclusionWatcher(child.id, "n", "call_0", child.originToolCallId ?? undefined);
+		await db
+			.update(narrators)
+			.set({
+				runtimeRegistrationJson: {
+					version: 1,
+					run: {
+						logicalRunId: "conclusion-run",
+						deliverTo: { narratorId: "n", toolUseId: "call_0", toolCallId: "source", attempt: 1 },
+					},
+				},
+			})
+			.where(eq(narrators.id, child.id));
 		await db
 			.insert(narratorMessageRefs)
 			.values({ id: "fork-ref", narratorId: "fork", messageId: "shared", seq: 1 });
 		const privateMessageId = await narratorPersistence.copyOnWriteMessage("n", "shared");
-		const watcher = getConclusionWatcher(child.id);
+		// The exact registered destination remains authoritative after parent COW.
 		const target = await narratorPersistence.resolveSubagentConclusionReference(
 			child.id,
 			"n",
 			"call_0",
-			watcher?.originToolCallId,
+			child.originToolCallId ?? undefined,
 		);
 		expect(target.messageId).toBe(privateMessageId);
 		expect(target.toolCallId).not.toBe("source");
@@ -800,12 +821,17 @@ describe("真实工具行执行绑定", () => {
 			.where(eq(narrators.id, "other"));
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference("other", "n", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
-		await db.update(narrators).set({ originToolCallId: null }).where(eq(narrators.id, child.id));
+		).rejects.toThrow("registered delivery tool-call");
+		await db
+			.update(narrators)
+			.set({
+				originToolCallId: null,
+				runtimeRegistrationJson: { version: 1 },
+			})
+			.where(eq(narrators.id, child.id));
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference(child.id, "n", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
-		removeConclusionWatcher(child.id);
+		).rejects.toThrow("registered delivery tool-call");
 	});
 
 	test("实际Agent工具经runner创建子代理时保留ctx主键", async () => {

@@ -11,7 +11,7 @@ import {
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, inArray, isNull, like, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorBufferedMessages,
@@ -50,12 +50,13 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
+import { policyDependentsWhere, runDeliverToOf } from "../lib/runtime-source";
 import { settings } from "../lib/settings";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
-import { getExecutionOwner } from "./agent-runtime/ownership";
+import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
@@ -75,7 +76,6 @@ import {
 } from "./narrator-refs/seq-store";
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
-import { preserveTakenOverSubstatus } from "./subagent-takeover";
 
 const executionSegments = createFileChangeExecutionSegmentsService(db);
 
@@ -2547,13 +2547,14 @@ const sqliteNarratorPersistence = {
 
 		await db.update(narrators).set(parentUpdate).where(eq(narrators.id, narratorId));
 
+		// Sessions that registered this one as their policy source take the same change
+		// (unchanged semantics: live dependents only, one level, overwritten).
 		await db
 			.update(narrators)
 			.set(parentUpdate)
 			.where(
 				and(
-					eq(narrators.parentNarratorId, narratorId),
-					like(narrators.variant, "subagent:%"),
+					policyDependentsWhere(narratorId),
 					inArray(narrators.status, ["working", "waiting", "idle"]),
 				),
 			);
@@ -2642,8 +2643,11 @@ const sqliteNarratorPersistence = {
 			turnStartedAt?: string;
 			resumeTurn?: boolean;
 			skipErrorMessage?: boolean;
+			/** Run finalization must not unarchive a concurrently archived session. */
+			unlessArchived?: boolean;
 		},
 	) {
+		let wroteStatus = false;
 		const errorMessage = options?.errorMessage;
 		const errorCode = options?.errorCode;
 		const diagnostics = normalizeApiRequestDiagnostics(options?.diagnostics);
@@ -2685,10 +2689,9 @@ const sqliteNarratorPersistence = {
 					currentSubstatus,
 					requestedSubstatus,
 				);
-				// Keep the taken_over tag alive across loop-completion overwrites
-				// (finalizeSubagent / status transitions) while the in-memory
-				// takeover state is active.
-				actualSubstatus = preserveTakenOverSubstatus(narratorId, actualSubstatus);
+				// Keep the taken_over mirror alive across full-status overwrites while
+				// the user holds this session's run.
+				actualSubstatus = preserveHeldSubstatus(narratorId, actualSubstatus);
 				actualSubstatus = transitionTurnTimingSubstatus(currentSubstatus, actualSubstatus, {
 					status,
 					nowMs,
@@ -2700,9 +2703,9 @@ const sqliteNarratorPersistence = {
 			// Retry on transient SQLite locks so a status/substatus transition
 			// (e.g. clearing "reflecting" after a danger reflection ends) is never
 			// silently dropped when the DB is momentarily busy.
-			await withDbRetry(
-				() =>
-					db
+			wroteStatus = await withDbRetry(
+				async () => {
+					const write = db
 						.update(narrators)
 						.set({
 							status,
@@ -2714,7 +2717,17 @@ const sqliteNarratorPersistence = {
 							...(turnStartedAt !== undefined && { turnStartedAt }),
 							...(actualSubstatus !== undefined && { substatus: JSON.stringify(actualSubstatus) }),
 						})
-						.where(eq(narrators.id, narratorId)),
+						.where(
+							and(
+								eq(narrators.id, narratorId),
+								options?.unlessArchived ? ne(narrators.status, "archived") : undefined,
+							),
+						);
+					if (options?.unlessArchived)
+						return (await write.returning({ id: narrators.id })).length > 0;
+					await write;
+					return true;
+				},
 				{ label: "updateStatus.write", maxRetries: 5 },
 			);
 		};
@@ -2723,6 +2736,8 @@ const sqliteNarratorPersistence = {
 		} else {
 			await writeStatus();
 		}
+
+		if (options?.unlessArchived && !wroteStatus) return false;
 
 		backgroundOccupancyStore.refreshNarrator(narratorId);
 		// Always emit status_changed so downstream listeners (gateway, notifications)
@@ -2900,7 +2915,7 @@ const sqliteNarratorPersistence = {
 					currentSubstatus,
 					requestedSubstatus,
 				);
-				actualSubstatus = preserveTakenOverSubstatus(narratorId, actualSubstatus);
+				actualSubstatus = preserveHeldSubstatus(narratorId, actualSubstatus);
 				actualSubstatus = transitionTurnTimingSubstatus(currentSubstatus, actualSubstatus, {
 					status: newStatus,
 					nowMs,
@@ -2976,16 +2991,20 @@ const sqliteNarratorPersistence = {
 	 * Update only the substatus tags without changing the main status.
 	 * Broadcasts a substatus_change event to all subscribers.
 	 */
-	async updateSubstatus(narratorId: string, substatus: string[]) {
+	async updateSubstatus(
+		narratorId: string,
+		substatus: string[],
+		options?: { preserveTiming?: boolean },
+	) {
 		await narratorSubstatusLock.acquire(narratorId, async () => {
 			const row = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
 				columns: { substatus: true },
 			});
-			const actualSubstatus = preserveTurnTimingSubstatus(
-				parseSubstatus(row?.substatus),
-				substatus,
-			);
+			const actualSubstatus =
+				options?.preserveTiming === false
+					? substatus
+					: preserveTurnTimingSubstatus(parseSubstatus(row?.substatus), substatus);
 			await writeSubstatus(narratorId, actualSubstatus);
 			broadcastToNarrator(narratorId, {
 				type: "substatus_change",
@@ -3239,7 +3258,7 @@ const sqliteNarratorPersistence = {
 		return Object.freeze({ toolCallId: binding.toolCallId, attempt });
 	},
 
-	/** A child can publish only into the actual parent slot recorded at creation. */
+	/** A session can publish only into its registered exact delivery slot. */
 	async resolveSubagentConclusionReference(
 		subagentId: string,
 		parentNarratorId: string,
@@ -3248,53 +3267,24 @@ const sqliteNarratorPersistence = {
 	) {
 		const child = await db.query.narrators.findFirst({
 			where: eq(narrators.id, subagentId),
-			columns: { type: true, variant: true, parentNarratorId: true, originToolCallId: true },
+			columns: { runtimeRegistrationJson: true },
 		});
+		const deliverTo = child ? runDeliverToOf(child) : undefined;
 		if (
-			!child ||
-			child.type !== "subagent" ||
-			!child.variant.startsWith("subagent:") ||
-			child.parentNarratorId !== parentNarratorId ||
-			!child.originToolCallId
+			!deliverTo ||
+			deliverTo.narratorId !== parentNarratorId ||
+			deliverTo.toolUseId !== toolUseId ||
+			!deliverTo.toolCallId ||
+			(expectedOriginToolCallId && expectedOriginToolCallId !== deliverTo.toolCallId)
 		) {
-			throw new ValidationError("Subagent has no trusted parent tool-call origin");
-		}
-		if (expectedOriginToolCallId && expectedOriginToolCallId !== child.originToolCallId) {
 			throw new ValidationError(
-				"Conclusion watcher does not match the subagent's original Agent row",
+				"Conclusion watcher does not match the registered delivery tool-call",
 			);
 		}
-		const original = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, child.originToolCallId),
-			columns: {
-				narratorId: true,
-				toolUseId: true,
-				toolName: true,
-				executionIdentityVersion: true,
-				executionOriginToolCallId: true,
-			},
-		});
-		if (
-			original &&
-			(original.narratorId !== parentNarratorId ||
-				original.toolUseId !== toolUseId ||
-				original.toolName !== "Agent" ||
-				original.executionIdentityVersion !== 1 ||
-				original.executionOriginToolCallId !== null)
-		) {
-			throw new ValidationError("Subagent origin is not the parent's original Agent row");
-		}
 		const target = await this.resolveToolCallConclusionReference(parentNarratorId, toolUseId, {
-			toolCallId: child.originToolCallId,
+			toolCallId: deliverTo.toolCallId,
 		});
-		const visible = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, target.toolCallId),
-			columns: { toolName: true, executionIdentityVersion: true },
-		});
-		if (!visible || visible.toolName !== "Agent" || visible.executionIdentityVersion !== 1) {
-			throw new ValidationError("Subagent conclusion target is not a trusted Agent history slot");
-		}
-		return { ...target, originToolCallId: child.originToolCallId };
+		return { ...target, originToolCallId: deliverTo.toolCallId };
 	},
 
 	/** Resolve an existing history slot, including its COW copy. Never execution authority. */

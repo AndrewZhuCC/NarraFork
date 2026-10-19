@@ -19,6 +19,7 @@ import {
 	resolveHelperRestoreSource,
 	runHelperReleaseController,
 } from "../../scripts/release-helpers";
+import componentVersions from "../../shared/component-versions.json";
 import { HELPER_PLATFORMS } from "../../shared/helper-distribution";
 
 const commit = "a".repeat(40);
@@ -387,7 +388,10 @@ const exec = child.execFileSync;
 const writes = [];
 const calls = [];
 const protocolReads = [];
-const artifact = Buffer.from("executor version 0.9.1");
+const logs = [];
+const log = console.log;
+console.log = (...args) => logs.push(args.join(" "));
+const artifact = Buffer.from("executor version ${componentVersions.executor.version}");
 const isArtifact = (path) => /remote-executor[/\\\\]dist[/\\\\]narrafork-executor-linux-amd64$/.test(String(path));
 mock.module("node:fs", () => ({ ...fs,
  existsSync: (path) => isArtifact(path) || exists(path),
@@ -395,7 +399,7 @@ mock.module("node:fs", () => ({ ...fs,
  readFileSync: (path, ...args) => { if (String(path).endsWith("protocol.go")) { protocolReads.push(String(path)); throw new Error("Forbidden mirror source protocol read ${protocol}"); } return isArtifact(path) ? artifact : read(path, ...args); },
  writeFileSync: (path, contents) => { writes.push({path: String(path), manifest: JSON.parse(contents)}); },
 }));
-mock.module("node:child_process", () => ({ ...child, execFileSync: (path, ...args) => isArtifact(path) ? "executor version 0.9.1" : exec(path, ...args) }));
+mock.module("node:child_process", () => ({ ...child, execFileSync: (path, ...args) => isArtifact(path) ? "executor version ${componentVersions.executor.version}" : exec(path, ...args) }));
 const {parseHelperReleaseArguments: parseArguments} = await import(${JSON.stringify(resolve("scripts/release-helpers.ts"))});
 mock.module(${JSON.stringify(resolve("scripts/release-helpers.ts"))}, () => ({
  parseHelperReleaseArguments: (args) => {
@@ -409,7 +413,7 @@ mock.module(${JSON.stringify(resolve("scripts/lib/build-repository.ts"))}, () =>
 process.argv = [process.execPath, ${JSON.stringify(resolve("scripts/release-executor.ts"))}, ...${JSON.stringify(args)}];
 process.exit = (code) => { throw new Error("fixture exit " + code); };
 try { await import(${JSON.stringify(resolve("scripts/release-executor.ts"))}); }
-catch (error) { console.log(JSON.stringify({error: error.message, writes, calls, protocolReads})); }
+catch (error) { log(JSON.stringify({error: error.message, writes, calls, protocolReads, logs})); }
 `,
 		);
 		try {
@@ -428,6 +432,7 @@ catch (error) { console.log(JSON.stringify({error: error.message, writes, calls,
 	test("server mirror defaults to component pin without writing current manifest", () => {
 		const result = fixture(["--dry-run", "--upload-only", "--platform=linux-amd64"]);
 		expect(result.error).toBe("fixture exit 0");
+		expect(result.logs.join("\n")).toContain(`executor-v${componentVersions.executor.version}`);
 		expect(result.writes).toHaveLength(0);
 		expect(result.protocolReads).toHaveLength(0);
 		expect(result.calls).toHaveLength(0);

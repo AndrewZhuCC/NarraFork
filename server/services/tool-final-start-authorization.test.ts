@@ -18,7 +18,9 @@ import { bashTool } from "../lib/agent/tools/bash";
 import { writeTool } from "../lib/agent/tools/write";
 import type { AgentConfig, AgentToolUse, ToolCallBinding } from "../lib/agent/types";
 import { generateId } from "../lib/id";
+import { withRuntimePolicyTrait } from "../lib/runtime-policy-trait";
 import { executionPolicyEngine } from "./execution-policy/engine";
+import { materializeLegacyDelegations } from "./legacy-delegation-materializer";
 import { handlePermission } from "./narrator-permission";
 import { narratorPersistence } from "./narrator-persistence";
 import { permissionPolicyChanges, permissionRuleService } from "./permission-rule-service";
@@ -26,6 +28,7 @@ import {
 	buildFinalToolStartAuthorization,
 	persistPermissionResolvedInput,
 } from "./tool-final-start-authorization";
+import { resetTraitLayerCaches } from "./trait-layer-service";
 
 const { db } = await import("../db");
 toolRegistry.register(writeTool);
@@ -89,6 +92,7 @@ async function actor(kind: "primary" | "subagent") {
 		createdAt: now(),
 		updatedAt: now(),
 	});
+	await materializeLegacyDelegations([id]);
 	return id;
 }
 async function fixture(
@@ -283,6 +287,24 @@ describe("real final-start policy after snapshot/slot waits", () => {
 		expect(await readFile(bash.output, "utf8")).toBe("spawned");
 		expect(execSpy).toHaveBeenCalled();
 	});
+	for (const kind of ["primary", "subagent"] as const)
+		test(`${kind}: a ceiling tightened after approval stops the approved Write before I/O`, async () => {
+			const f = await fixture(kind, "Write");
+			// The subagent fixture follows its parent as its stored policy source; the primary
+			// tightens its own ceiling.
+			f.config.onToolExecutionBefore = async () => {
+				await db
+					.update(narrators)
+					.set({ traits: withRuntimePolicyTrait([], { version: 1, readOnly: true }) })
+					.where(eq(narrators.id, parentId));
+				resetTraitLayerCaches();
+			};
+			const result = await executeTool(f.tu, f.config, { toolCallBinding: f.binding });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("capability ceiling");
+			expect(await missing(f.output)).toBe(true);
+			expect(writeSpy).not.toHaveBeenCalled();
+		});
 	test("revoking the actual triggering actor's ownership during preparation denies the previously allowed Write", async () => {
 		const f = await fixture("primary", "Write");
 		f.config.onToolExecutionBefore = async () => {

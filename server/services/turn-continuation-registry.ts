@@ -70,9 +70,7 @@ export type ContinuationDisposition =
 	 * check for everybody in order to describe one source honestly.
 	 *
 	 * `via` names the carrying source and must itself be `handled` by this audience,
-	 * which is verified — otherwise this becomes a way to point at nothing. Real case:
-	 * permission feedback for a subagent is queued by `bufferSubagentUserMessage`, so it
-	 * is consumed at the `buffered-message` boundary the loop already has.
+	 * which is verified — otherwise this becomes a way to point at nothing.
 	 */
 	| { kind: "handledVia"; via: string; reason: string }
 	/**
@@ -137,12 +135,6 @@ const na = (reason: string): ContinuationDisposition => ({ kind: "notApplicable"
  */
 // biome-ignore lint/correctness/noUnusedVariables: retained as the vocabulary for the next gap found; see above.
 const gap = (reason: string): ContinuationDisposition => ({ kind: "gap", reason });
-
-const handledVia = (via: string, reason: string): ContinuationDisposition => ({
-	kind: "handledVia",
-	via,
-	reason,
-});
 
 /**
  * Every continuation source, in the order the loops consult them.
@@ -282,21 +274,10 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 			"immediately after the tool completes rather than after the whole turn.",
 		dispositions: {
 			primary: handled,
-			// Closed. This WAS a real gap: a subagent's tool calls go through the same
-			// `handlePermission`, so a user could approve one with attached text and that text
-			// was silently dropped — both the payload and the soft-stop flag were keyed through
-			// `activeNarrators`, which a subagent has no entry in.
-			//
-			subagent: handledVia(
-				"buffered-message",
-				"A subagent reaches the same two effects through its own plumbing rather than the " +
-					"primary's: `deliverSubagentPermissionFeedback` routes the text through " +
-					'`bufferSubagentUserMessage`, which both queues it as a `role: "user"` turn and ' +
-					"arms the soft stop the loop already reads via " +
-					"`shouldStopSubagentForBufferedMessage`. It is therefore consumed at the " +
-					"buffered-message boundary, and a marker of its own would name a branch that " +
-					"does not exist.",
-			),
+			// Closed. Every session has the same `activeNarrators` entry and the one
+			// orchestrator, so a delegated run adopts approval feedback through the same
+			// `pendingFeedback` + `_feedbackSoftStop` branch as any session.
+			subagent: handled,
 		},
 	},
 	{

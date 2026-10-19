@@ -73,8 +73,13 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 						seq: (top[0]?.seq ?? -1) + 1,
 					});
 				}
-				const start = () =>
-					engine.startAgentRun({ narratorId: "actor", parentNarratorId: "parent" });
+				const start = async () =>
+					(
+						await engine.startRun({
+							narratorId: "actor",
+							binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+						})
+					).publication!;
 				const taskRow = () => ({
 					id: "actor",
 					parentNarratorId: "parent",
@@ -94,11 +99,13 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 				).toBeNull();
 				await message("first-output", "FIRST RUN OUTPUT");
 				const before = await db.select().from(outbox);
-				const adopted = await engine.startAgentRun({
-					narratorId: "actor",
-					parentNarratorId: "parent",
-					taskRow: taskRow(),
-				});
+				const adopted = (
+					await engine.startRun({
+						narratorId: "actor",
+						taskRow: taskRow(),
+						binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+					})
+				).publication!;
 				expect(adopted).toEqual(first);
 				expect((await db.select().from(backgroundTasks))[0]?.logicalRunId).toBe(first.logicalRunId);
 				expect(await db.select().from(outbox)).toEqual(before);
@@ -112,11 +119,11 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 				).toBeNull();
 				await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, "actor"));
 				await expect(
-					engine.startAgentRun({
+					engine.startRun({
 						narratorId: "actor",
-						parentNarratorId: "parent",
 						resumeRunId: "explicit-stale",
 						taskRow: { ...taskRow(), id: "unused" },
+						binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
 					}),
 				).rejects.toThrow("Stale logical run recovery");
 				const second = await start();
@@ -185,11 +192,13 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 					sourceResultRef: "message:second-output",
 				});
 				await db.delete(backgroundTasks).where(eq(backgroundTasks.id, "actor"));
-				const third = await engine.startAgentRun({
-					narratorId: "actor",
-					parentNarratorId: "parent",
-					taskRow: taskRow(),
-				});
+				const third = (
+					await engine.startRun({
+						narratorId: "actor",
+						taskRow: taskRow(),
+						binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+					})
+				).publication!;
 				expect(third.logicalRunId).not.toBe(second.logicalRunId);
 				expect(await engine.readAgentTerminalResult(third)).toBeNull();
 				expect(
@@ -204,11 +213,13 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 				expect(await engine.readAgentTerminalResult(third)).toEqual({ output: "EARLY FAILURE" });
 				await queue.outbox.consumeAwaitedTerminal(third);
 				await db.delete(backgroundTasks).where(eq(backgroundTasks.id, "actor"));
-				const fourth = await engine.startAgentRun({
-					narratorId: "actor",
-					parentNarratorId: "parent",
-					taskRow: taskRow(),
-				});
+				const fourth = (
+					await engine.startRun({
+						narratorId: "actor",
+						taskRow: taskRow(),
+						binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+					})
+				).publication!;
 				expect(fourth.logicalRunId).not.toBe(third.logicalRunId);
 				expect(await engine.readAgentTerminalResult(fourth)).toBeNull();
 				expect(await engine.readAgentTerminalResult(third)).toEqual({ output: "EARLY FAILURE" });

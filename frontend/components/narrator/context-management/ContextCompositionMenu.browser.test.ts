@@ -96,6 +96,7 @@ const data: ContextComposition = {
 				timeout: 15000,
 			});
 			const page = await browser.newPage();
+			await page.emulateCPUThrottling(4);
 			for (const language of ["zh-CN", "en"]) {
 				for (const [width, height] of [
 					[360, 800],
@@ -112,6 +113,26 @@ const data: ContextComposition = {
 						visible: true,
 						timeout: 5000,
 					});
+					// Loaded content resizes the popup; Floating UI repositions it asynchronously.
+					// A visible bar alone does not mean the opening transition/position has settled.
+					await page.waitForFunction(
+						() => {
+							const popup = document.querySelector('[data-testid="context-composition-menu"]');
+							if (
+								!popup ||
+								popup.getAnimations().some((animation) => animation.playState === "running")
+							)
+								return false;
+							const bounds = popup.getBoundingClientRect();
+							return (
+								bounds.left >= 0 &&
+								bounds.right <= innerWidth &&
+								bounds.top >= 0 &&
+								bounds.bottom <= innerHeight
+							);
+						},
+						{ timeout: 5000 },
+					);
 					const layout = await page.evaluate(() => {
 						const bar = document.querySelector('[data-testid="context-composition-bar"]');
 						if (!bar) throw new Error("Missing character bar");

@@ -8,7 +8,7 @@
  * `import.meta.url` (`file:///$bunfs/root/<name>`), not its own source path. The check therefore
  * describes the runtime, not the asking file, and gives the same answer from any module. (That same
  * property is why relative worker specifiers must be probed rather than resolved once — see
- * `db-worker/pool.ts`.)
+ * `compiled-worker.ts`.)
  */
 
 /** True when running inside a compiled single-file binary. */

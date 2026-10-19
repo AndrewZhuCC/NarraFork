@@ -178,6 +178,7 @@ export {
 	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
+	restoreNarratorDraftSchema,
 	retryFailedCompactSchema,
 	revertFilesSchema,
 	revertScopeSchema,

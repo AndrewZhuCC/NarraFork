@@ -15,6 +15,7 @@
  * caller-migration track produces.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
@@ -32,13 +33,43 @@ import { backgroundTaskService } from "../background-task-service";
 runtimePublication.stop();
 afterEach(() => cleanDb(sqlite));
 
+describe("PG detached terminal transaction wiring (source guard, not PG integration)", () => {
+	test("C7 tool conclusion, snapshot and terminal intent use the same short PG transaction", () => {
+		const engine = readFileSync(
+			new URL("../agent-runtime/postgres-runtime-publication.ts", import.meta.url),
+			"utf8",
+		);
+		const body = engine.slice(
+			engine.indexOf("async commitAgentTerminal(input:"),
+			engine.indexOf("/** Bash terminal:"),
+		);
+		expect(body).toContain('runComposite("publication.commitAgentTerminal", async (tx) =>');
+		const toolWrite = /tx\s*\.update\(narratorToolCalls\)/;
+		expect(body).toMatch(toolWrite);
+		expect(body).toContain("persistResultSection(tx, input.run, input.text, input.eventKind)");
+		expect(body).toContain("primitives.commitIntent(tx,");
+		expect(body.search(toolWrite)).toBeLessThan(body.indexOf("persistResultSection(tx,"));
+		expect(body.indexOf("primitives.commitIntent(tx,")).toBeLessThan(
+			body.indexOf("if (composite.needsSeqFloorMark)"),
+		);
+		const runner = readFileSync(new URL("../agent-runtime/run.ts", import.meta.url), "utf8");
+		const fallback = runner.slice(
+			runner.indexOf("if (!sqlite) {"),
+			runner.indexOf("await updateToolCallConclusion({"),
+		);
+		expect(fallback).toContain("commitAgentTerminal({");
+		expect(fallback).toContain("toolConclusion:");
+		expect(fallback).not.toContain("updateToolCallConclusion");
+	});
+});
+
 describe("SQLite async publication facade wiring", () => {
 	test("getRuntimePublicationService returns sqlite backend on SQLite", () => {
 		const pub = getRuntimePublicationService();
 		expect(pub.backend).toBe("sqlite");
 	});
 
-	test("startAgentRun via async facade creates logical run + reserves slots", async () => {
+	test("startRun via async facade creates logical run + reserves slots", async () => {
 		const parent = generateId();
 		const child = generateId();
 		const now = new Date().toISOString();
@@ -58,10 +89,12 @@ describe("SQLite async publication facade wiring", () => {
 			])
 			.run();
 		const pub = getRuntimePublicationService();
-		const run = await pub.startAgentRun({
-			narratorId: child,
-			parentNarratorId: parent,
-		});
+		const run = (
+			await pub.startRun({
+				narratorId: child,
+				binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+			})
+		).publication!;
 		expect(run.producerKind).toBe("agent");
 		expect(run.taskId).toBe(child);
 		expect(run.recipientId).toBe(parent);
@@ -172,7 +205,12 @@ describe("SQLite async publication facade wiring", () => {
 			.values({ id: generateId(), narratorId: child, messageId, seq: 0 })
 			.run();
 		const pub = getRuntimePublicationService();
-		const run = await pub.startAgentRun({ narratorId: child, parentNarratorId: parent });
+		const run = (
+			await pub.startRun({
+				narratorId: child,
+				binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+			})
+		).publication!;
 		const result = await pub.commitAgentTerminal({
 			run,
 			eventKind: "completed",

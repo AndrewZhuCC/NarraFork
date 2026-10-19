@@ -27,6 +27,7 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 // Captured before the mock lands: `mock.module` is process-wide, so leaving the
@@ -109,11 +110,17 @@ const SUB_ID = "sub1";
 const TOOL_USE_ID = "toolu_agent_01";
 
 function seedNarrator(id: string, variant = "primary", parentNarratorId?: string) {
+	const registration = parentNarratorId
+		? JSON.stringify({
+				...delegationRegistration(parentNarratorId, "general"),
+				historyPlacement: { toolUseId: TOOL_USE_ID },
+			})
+		: null;
 	sqlite
 		.prepare(
-			"INSERT INTO narrators (id, variant, parent_narrator_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+			"INSERT INTO narrators (id, variant, parent_narrator_id, policy_source_narrator_id, runtime_registration_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		)
-		.run(id, variant, parentNarratorId ?? null, now, now);
+		.run(id, variant, parentNarratorId ?? null, parentNarratorId ?? null, registration, now, now);
 }
 
 /**

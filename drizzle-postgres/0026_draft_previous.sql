@@ -1,0 +1,1 @@
+ALTER TABLE "narrator_drafts" ADD COLUMN "previous_json" text;

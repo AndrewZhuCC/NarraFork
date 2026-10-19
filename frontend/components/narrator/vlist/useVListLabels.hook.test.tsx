@@ -141,6 +141,41 @@ describe("useVListLabels summary labels", () => {
 		});
 	});
 
+	it("localizes the communication warning sentences and preserves the status placeholder", async () => {
+		// The ADAPTER substitutes `{status}` (with the target's own `status_*` word), so the
+		// placeholder has to survive i18next in every language — the same contract the
+		// `{count}` entries follow. Without it the reader would see an empty sentence.
+		// The status word is the app's own status label, so it keeps its capitalization.
+		const sentences = {
+			en: {
+				template: "Target is {status} — the message may not be received",
+				idle: "Target is Idle — the message may not be received",
+			},
+			"zh-CN": {
+				template: "目标当前为{status}，消息可能收不到",
+				idle: "目标当前为空闲，消息可能收不到",
+			},
+		} as const;
+		await withLabels(async ({ labels, i18n }) => {
+			for (const language of ["en", "zh-CN"] as const) {
+				await act(async () => {
+					await i18n.changeLanguage(language);
+				});
+				const bundle = labels().adapterLabels;
+				expect(bundle.communicationWarning_sendTargetNotWorking).toBe(sentences[language].template);
+				expect(
+					bundle.communicationWarning_sendTargetNotWorking.replace("{status}", bundle.status_idle),
+				).toBe(sentences[language].idle);
+				expect(bundle.communicationWarning_broadcastWorkingOnly).toBe(
+					i18n.t("communicationWarning_broadcastWorkingOnly"),
+				);
+				expect(bundle.communicationWarning_broadcastCancelled).toBe(
+					i18n.t("communicationWarning_broadcastCancelled"),
+				);
+			}
+		});
+	});
+
 	it("reuses translations across renders and summaries without freezing live metadata", async () => {
 		await withLabels(async ({ labels, rerender, i18n }) => {
 			const initial = labels();

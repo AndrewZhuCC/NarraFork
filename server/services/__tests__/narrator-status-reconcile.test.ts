@@ -281,7 +281,7 @@ describe("failed startup recovery — finite unowned target cleanup", () => {
 			let release = () => {};
 			if (owner === "loop") registerLiveLoop(NARRATOR_ID);
 			if (owner === "loop-admission") {
-				const execution = tryClaimExecution(NARRATOR_ID, "primary");
+				const execution = tryClaimExecution(NARRATOR_ID, "run");
 				expect(execution).not.toBeNull();
 				release = () => {
 					execution?.release();

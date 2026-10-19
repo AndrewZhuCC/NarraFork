@@ -3,7 +3,9 @@ import { dirname, join } from "node:path";
 import matter from "gray-matter";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import type { RuntimePolicyTrait } from "../lib/runtime-policy-trait";
 import { narraforkDir } from "../lib/settings";
+import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -265,6 +267,21 @@ export async function remove(name: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
+
+/**
+ * Compile a delegation template, loading its custom definition when it is not built
+ * in, into the ceiling trait stored on the created narrator. Every creation path
+ * (live delegation, review conversion, session import) uses this, so stored rows
+ * carry their ceiling and runtime never re-reads the template.
+ */
+export async function compileDelegationCeiling(template: string): Promise<RuntimePolicyTrait> {
+	return compileDelegationPolicy({
+		template,
+		customDefinition: BUILTIN_DELEGATION_TEMPLATES.has(template)
+			? null
+			: await loadByName(template),
+	});
+}
 
 export const customSubagentService = {
 	loadAll,

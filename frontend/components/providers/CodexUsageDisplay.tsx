@@ -12,7 +12,7 @@ import {
 	getCodexUsageWindows,
 	sortCodexUsageWindows,
 } from "../../lib/codex-usage-windows";
-import { relativeTime } from "../../lib/relative-time";
+import { formatCountdown, relativeTime } from "../../lib/relative-time";
 
 function formatPercent(value: number): string {
 	return Number.isFinite(value) ? `${value.toFixed(1)}%` : "-";
@@ -52,17 +52,7 @@ export function CodexUsageDisplay({ usage }: { usage?: CodexUsageData }) {
 		typeof resetCreditsAvailable === "number" && Number.isFinite(resetCreditsAvailable);
 	const formatResetTime = (resetAt: number) => {
 		if (!Number.isFinite(resetAt) || resetAt <= 0) return t("codexUsageResetUnknown");
-		const timestamp = resetAt * 1000;
-		const diff = timestamp - Date.now();
-		if (!Number.isFinite(diff)) return t("codexUsageResetUnknown");
-		if (diff < 0) return t("codexUsageExpired");
-		const totalMinutes = Math.floor(diff / 60_000);
-		const days = Math.floor(totalMinutes / 1440);
-		const hours = Math.floor((totalMinutes % 1440) / 60);
-		const minutes = totalMinutes % 60;
-		if (days > 0) return `${days}d ${hours}h ${minutes}m`;
-		if (hours > 0) return `${hours}h ${minutes}m`;
-		return `${minutes}m`;
+		return formatCountdown(resetAt * 1000) ?? t("codexUsageExpired");
 	};
 
 	return (

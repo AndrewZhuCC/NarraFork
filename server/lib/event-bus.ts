@@ -10,6 +10,7 @@ import { logger } from "./logger";
 // === Event type definitions ===
 
 export type NarraForkEvent =
+	| { type: "auth:changed"; userId?: string }
 	| { type: "git:workspace_invalidated"; queryKey: string }
 	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
 	| {
@@ -256,22 +257,6 @@ export type NarraForkEvent =
 			taskNarratorId: string;
 			toolUseId: string;
 			subagentType: string;
-	  }
-	| {
-			type: "narrator:background_task_completed";
-			narratorId: string;
-			parentNarratorId: string;
-			taskNarratorId: string;
-			toolUseId: string;
-			resultPreview: string;
-	  }
-	| {
-			type: "narrator:background_task_failed";
-			narratorId: string;
-			parentNarratorId: string;
-			taskNarratorId: string;
-			toolUseId: string;
-			error: string;
 	  }
 	| {
 			type: "narrator:background_task_cancelled";

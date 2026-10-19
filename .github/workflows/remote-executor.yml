@@ -90,6 +90,13 @@ jobs:
         working-directory: remote-executor
         run: test -z "$(gofmt -l .)"
 
+      - name: Install Go test system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+          command -v rg
+          rg --version
+
       - name: Run Go tests
         working-directory: remote-executor
         run: go test ./...

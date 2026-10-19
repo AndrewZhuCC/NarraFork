@@ -13,7 +13,7 @@ const narrators = new Map<
 >();
 const statusUpdates: Array<{ id: string; status: string }> = [];
 const cancelled: string[] = [];
-const hardInterrupts: string[] = [];
+const runControls: Array<{ id: string; kind: string }> = [];
 const closed: string[] = [];
 
 const realModules: Record<string, unknown> = {};
@@ -24,7 +24,7 @@ beforeAll(async () => {
 	realModules.narratorService = await import("../narrator-service");
 	realModules.narratorSession = await import("../narrator-session");
 	realModules.subagentRunner = await import("../subagent-runner");
-	realModules.narratorSubagent = await import("../narrator-subagent");
+	realModules.agentRuntimeRun = await import("../agent-runtime/run");
 
 	mock.module("../narrator-service", () => ({
 		narratorService: {
@@ -52,10 +52,11 @@ beforeAll(async () => {
 			return true;
 		},
 	}));
-	mock.module("../narrator-subagent", () => ({
-		interruptForegroundSubagent(id: string, options?: { hard?: boolean }) {
-			if (options?.hard) hardInterrupts.push(id);
-			return true;
+	// Retiring ends the run itself (and any hold) through the one run control.
+	mock.module("../agent-runtime/run", () => ({
+		controlRun: async (id: string, command: { kind: string }) => {
+			runControls.push({ id, kind: command.kind });
+			return narrators.get(id)?.status === "working";
 		},
 	}));
 
@@ -68,7 +69,7 @@ afterAll(() => {
 	mock.module("../narrator-service", () => realModules.narratorService as never);
 	mock.module("../narrator-session", () => realModules.narratorSession as never);
 	mock.module("../subagent-runner", () => realModules.subagentRunner as never);
-	mock.module("../narrator-subagent", () => realModules.narratorSubagent as never);
+	mock.module("../agent-runtime/run", () => realModules.agentRuntimeRun as never);
 	mock.restore();
 });
 
@@ -76,7 +77,7 @@ function seed() {
 	narrators.clear();
 	statusUpdates.length = 0;
 	cancelled.length = 0;
-	hardInterrupts.length = 0;
+	runControls.length = 0;
 	closed.length = 0;
 	narrators.set("sub-1", {
 		id: "sub-1",
@@ -111,8 +112,8 @@ describe("interruptAndArchiveSubagent", () => {
 		expect(result.ok).toBe(true);
 		expect(result.archived).toBe(true);
 		expect(result.interrupted).toBe(true);
-		expect(cancelled).toEqual(["sub-1"]);
-		expect(hardInterrupts).toEqual(["sub-1"]);
+		expect(closed).toEqual(["sub-1"]);
+		expect(runControls).toEqual([{ id: "sub-1", kind: "cancel" }]);
 		expect(statusUpdates).toEqual([{ id: "sub-1", status: "archived" }]);
 		expect(narrators.get("sub-1")?.status).toBe("archived");
 	});
@@ -128,24 +129,22 @@ describe("interruptAndArchiveSubagent", () => {
 		expect(statusUpdates).toEqual([]);
 	});
 
-	test("refuses primary narrators and unknown ids without status writes", async () => {
+	test("archives an authorized ordinary session through run control; unknown ids write nothing", async () => {
 		seed();
 		const primary = await interruptAndArchiveSubagent("primary");
-		expect(primary.ok).toBe(false);
-		expect(primary.error).toBe("not_subagent");
+		expect(primary.ok).toBe(true);
+		expect(primary.archived).toBe(true);
+		expect(runControls).toEqual([{ id: "primary", kind: "cancel" }]);
+		expect(closed).toEqual(["primary"]);
+		expect(statusUpdates).toEqual([{ id: "primary", status: "archived" }]);
+		statusUpdates.length = 0;
 		const missing = await interruptAndArchiveSubagent("nope");
 		expect(missing.ok).toBe(false);
 		expect(missing.error).toBe("not_found");
 		expect(statusUpdates).toEqual([]);
 	});
-
-	test("enforces parentNarratorId when provided", async () => {
-		seed();
-		const foreign = await interruptAndArchiveSubagent("sub-1", { parentNarratorId: "other" });
-		expect(foreign.ok).toBe(false);
-		expect(foreign.error).toBe("not_direct_child");
-		expect(narrators.get("sub-1")?.status).toBe("working");
-	});
+	// Who may archive is the controller grant (narrator-control.ts), checked by the
+	// Agent tool before this mechanism runs; see narrator-unified-runtime-contract.test.ts.
 });
 
 describe("archiveRetiredSubagents", () => {

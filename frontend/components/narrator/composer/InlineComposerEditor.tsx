@@ -6,7 +6,6 @@ import type {
 import { parseComposerDocument } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import {
-	IconExternalLink,
 	IconFileText,
 	IconLoader2,
 	IconPaperclip,
@@ -65,11 +64,6 @@ export interface InlineComposerSelection {
 	empty?: boolean;
 	type?: "text" | "node" | "all";
 }
-/** Document positions of the browser caret, read from the DOM rather than editor state. */
-export interface InlineComposerCaret {
-	anchor: number;
-	head: number;
-}
 export interface InlineComposerTextContext {
 	text: string;
 	start: number;
@@ -91,12 +85,12 @@ export interface InlineComposerEditorHandle {
 	insertFiles(files: File[]): void;
 	getSelection(): InlineComposerSelection;
 	/**
-	 * Browser caret mapped through the current DOM. Editor state lags arrow keys until
-	 * `selectionchange`, so line-vs-history decisions must not read `state.selection`.
+	 * Collapsed caret on the first visual line (`up`) or the last (`down`), including soft wraps.
+	 * Read before the key's default action; editor state lags that action until selectionchange.
 	 */
-	readLiveCaret(): InlineComposerCaret | null;
-	/** Collapsed caret still on `before`'s visual line, including soft wraps and boundary jitter. */
-	caretStayedOnLine(before: InlineComposerCaret | null): boolean;
+	isCaretOnVerticalEdge(direction: "up" | "down"): boolean;
+	/** Put the caret at the end and scroll it into the composer viewport. */
+	revealCaretAtEnd(): void;
 	/** The caret's contiguous text run; atoms, hard breaks and paragraphs are boundaries. */
 	getTextContext(): InlineComposerTextContext | null;
 	captureSelectionBookmark(): InlineComposerSelectionBookmark;
@@ -124,6 +118,7 @@ export interface InlineComposerEditorProps {
 	onOpenQuote?: (quote: Extract<ComposerInlineNode, { type: "quote" }>) => void;
 	onOpenFile?: (reference: FileReference) => void;
 	onOpenImage?: (asset: ComposerAsset) => void;
+	onOpenAttachment?: (asset: ComposerAsset) => void;
 	controls?: ReactNode;
 	leadingControls?: ReactNode;
 	/** Transient preview only; never becomes a document node or history entry. */
@@ -143,6 +138,7 @@ type AtomContextValue = Pick<
 	| "onOpenQuote"
 	| "onOpenFile"
 	| "onOpenImage"
+	| "onOpenAttachment"
 > & { assets: ReadonlyMap<string, ComposerAsset> };
 const AtomContext = createContext<AtomContextValue>({ assets: new Map() });
 
@@ -270,6 +266,8 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 	const resource = value.type === "attachment" ? context.resources?.get(value.assetId) : undefined;
 	const [objectURL, setObjectURL] = useState<{ file: File; url: string }>();
 	const [failedSource, setFailedSource] = useState<string>();
+	const gesture = useRef<{ type: string; x: number; y: number; moved: boolean } | null>(null);
+	const pointerType = useRef("mouse");
 	useEffect(() => {
 		setFailedSource(undefined);
 		if (asset?.kind !== "image" || !resource || typeof resource === "string") {
@@ -319,9 +317,14 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				? context.onOpenFile
 					? () => context.onOpenFile?.(value.reference)
 					: undefined
-				: asset && context.onOpenImage && image
-					? () => context.onOpenImage?.(asset)
+				: asset
+					? image
+						? context.onOpenImage && (() => context.onOpenImage?.(asset))
+						: context.onOpenAttachment && (() => context.onOpenAttachment?.(asset))
 					: undefined;
+	const preview = () => {
+		if (!restoring && !missing) open?.();
+	};
 	const Icon =
 		value.type === "quote"
 			? IconQuote
@@ -346,8 +349,42 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				className={classes.nodeBody}
 				title={value.type === "quote" ? value.text.slice(0, 600) : label}
 				aria-label={label}
-				onPointerDown={(event) => event.preventDefault()}
-				onClick={select}
+				onPointerDown={(event) => {
+					event.preventDefault();
+					pointerType.current = event.pointerType;
+					gesture.current = {
+						type: event.pointerType,
+						x: event.clientX,
+						y: event.clientY,
+						moved: false,
+					};
+				}}
+				onPointerMove={(event) => {
+					const start = gesture.current;
+					if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 8)
+						start.moved = true;
+				}}
+				onPointerCancel={() => {
+					gesture.current = null;
+				}}
+				onClick={(event) => {
+					const start = gesture.current;
+					gesture.current = null;
+					const type = (event.nativeEvent as PointerEvent).pointerType || start?.type;
+					if ((!type && event.detail === 0) || (start && !start.moved && type !== "mouse"))
+						preview();
+					else select();
+				}}
+				onDoubleClick={() => {
+					if (pointerType.current === "mouse") preview();
+				}}
+				onKeyDown={(event) => {
+					if (event.key === "Enter" || event.key === " ") {
+						// Let the button generate its native keyboard click, but never submit the composer.
+						event.stopPropagation();
+						gesture.current = null;
+					}
+				}}
 			>
 				{image ? (
 					<span className={classes.thumbnail}>
@@ -371,18 +408,6 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				)}
 			</button>
 			<span className={classes.nodeActions}>
-				{open && (
-					<button
-						type="button"
-						className={classes.action}
-						aria-label={t("quote.open", { defaultValue: "Open" })}
-						disabled={restoring || missing}
-						onPointerDown={(event) => event.preventDefault()}
-						onClick={open}
-					>
-						<IconExternalLink size={12} />
-					</button>
-				)}
 				<button
 					type="button"
 					className={classes.action}
@@ -806,38 +831,35 @@ export const InlineComposerEditor = forwardRef<
 		editor.view.dom.setAttribute("data-placeholder", props.placeholder ?? "");
 		editor.view.dom.setAttribute("aria-disabled", String(!!props.disabled));
 	}, [editor, props.placeholder, props.disabled, t]);
-	const readLiveCaret = (): InlineComposerCaret | null => {
-		if (!editor || editor.isDestroyed) return null;
-		const view = editor.view;
-		const selection = view.dom.ownerDocument.getSelection();
-		if (!selection?.anchorNode || !selection.focusNode || selection.rangeCount === 0) return null;
-		if (!view.dom.contains(selection.anchorNode) || !view.dom.contains(selection.focusNode))
-			return null;
+	const isCaretOnVerticalEdge = (direction: "up" | "down") => {
+		if (!editor || editor.isDestroyed || editor.view.dom.getClientRects().length === 0)
+			return false;
+		const selection = editor.state.selection;
+		if (!selection.empty || !(selection instanceof TextSelection)) return false;
 		try {
-			return {
-				anchor: view.posAtDOM(selection.anchorNode, selection.anchorOffset),
-				head: view.posAtDOM(selection.focusNode, selection.focusOffset),
-			};
+			const edge =
+				direction === "up"
+					? TextSelection.atStart(editor.state.doc).from
+					: TextSelection.atEnd(editor.state.doc).from;
+			const caret = editor.view.coordsAtPos(selection.head);
+			const boundary = editor.view.coordsAtPos(edge);
+			if (caret.bottom <= caret.top || boundary.bottom <= boundary.top) return false;
+			const lineHeight =
+				Number.parseFloat(getComputedStyle(editor.view.dom).lineHeight) ||
+				boundary.bottom - boundary.top;
+			return Math.abs(caret.top - boundary.top) < Math.max(4, lineHeight / 2);
 		} catch {
-			return null;
+			return false;
 		}
 	};
-	const caretStayedOnLine = (before: InlineComposerCaret | null) => {
-		const after = readLiveCaret();
-		if (!before || !after || before.anchor !== before.head || after.anchor !== after.head)
-			return false;
-		if (before.head === after.head) return true;
-		if (!editor || editor.isDestroyed) return false;
-		try {
-			const from = editor.view.coordsAtPos(before.head);
-			const to = editor.view.coordsAtPos(after.head);
-			const lineHeight =
-				Number.parseFloat(getComputedStyle(editor.view.dom).lineHeight) || to.bottom - to.top || 24;
-			// A boundary press can nudge the DOM caret onto a trailing break without leaving the line.
-			return Math.abs(from.top - to.top) < Math.max(4, lineHeight / 2);
-		} catch {
-			return false;
-		}
+	const revealCaretAtEnd = () => {
+		if (!editor || editor.isDestroyed) return;
+		editor.view.dispatch(
+			editor.state.tr
+				.setSelection(TextSelection.atEnd(editor.state.doc))
+				.scrollIntoView()
+				.setMeta("addToHistory", false),
+		);
 	};
 	useImperativeHandle(ref, () => ({
 		focus: () => {
@@ -870,8 +892,8 @@ export const InlineComposerEditor = forwardRef<
 		},
 		getSelection: () =>
 			editor ? selectionOf(editor.state.doc, editor.state.selection) : { start: 0, end: 0 },
-		readLiveCaret,
-		caretStayedOnLine,
+		isCaretOnVerticalEdge,
+		revealCaretAtEnd,
 		getTextContext: () => {
 			if (!editor || editor.isDestroyed) return null;
 			const { selection, doc } = editor.state;
@@ -958,6 +980,7 @@ export const InlineComposerEditor = forwardRef<
 			onOpenQuote: props.onOpenQuote,
 			onOpenFile: props.onOpenFile,
 			onOpenImage: props.onOpenImage,
+			onOpenAttachment: props.onOpenAttachment,
 			// The generation changes only for insert/load, not individual text keystrokes.
 			generation: assetGeneration,
 		}),
@@ -970,6 +993,7 @@ export const InlineComposerEditor = forwardRef<
 			props.onOpenQuote,
 			props.onOpenFile,
 			props.onOpenImage,
+			props.onOpenAttachment,
 		],
 	);
 	return (

@@ -127,6 +127,20 @@ describe("strict TokenDance protocol mapping", () => {
 			"no supported protocol",
 		);
 	});
+	test("an explicit model protocol overrides the catalog recommendation", () => {
+		catalog("openai:responses");
+		const previous = settings.agent.modelProtocolOverrides;
+		settings.agent.modelProtocolOverrides = {
+			"tokendance:opaque-model": "anthropic-messages",
+		};
+		try {
+			const provider = new TokenDanceProvider();
+			provider.prepareForModel("tokendance:opaque-model");
+			expect(provider.getActiveReasoningSource()).toBe("tokendance:anthropic-messages");
+		} finally {
+			settings.agent.modelProtocolOverrides = previous;
+		}
+	});
 	test("registry, resolution, stateful helpers and context windows", () => {
 		catalog("openai:responses");
 		expect(resolve("tokendance:opaque-model").adapter).toBeInstanceOf(TokenDanceProvider);

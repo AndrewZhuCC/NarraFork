@@ -53,7 +53,7 @@ export const ARCHIVE_FORWARD_REFERENCES: Readonly<
 > = {
 	exploration_groups: ["base_chapter_id", "decided_chapter_id"],
 	chapters: ["parent_chapter_id", "merged_into_chapter_id", "review_source_chapter_id"],
-	narrators: ["parent_narrator_id", "fork_message_id"],
+	narrators: ["parent_narrator_id", "policy_source_narrator_id", "fork_message_id"],
 };
 
 /**

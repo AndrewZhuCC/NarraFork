@@ -15,12 +15,17 @@ import { TokenDanceRechargeDialog } from "../settings/TokenDanceRechargeDialog";
 import { ModelList, type ModelListProps } from "./ModelList";
 export function TokenDanceSection({
 	connection,
+	/** 启用开关的草稿值（保存条统一提交，避免一拨就落库）。 */
+	enabled,
+	onToggleEnabled,
 	onLogin,
 	onChanged,
 	onDeleted,
 	...modelListProps
 }: Omit<ModelListProps, "models" | "defaultContextWindows"> & {
 	connection: TokenDancePublicConnection;
+	enabled: boolean;
+	onToggleEnabled: () => void;
 	onLogin: () => Promise<void>;
 	onChanged: () => Promise<void>;
 	onDeleted: () => void;
@@ -140,9 +145,9 @@ export function TokenDanceSection({
 			{recoveryAction && <Alert color="yellow">{t(`tokendance.${recoveryAction}`)}</Alert>}
 			<Switch
 				label={t("tokendance.enabled")}
-				checked={!connection.disabled}
+				checked={enabled}
 				disabled={busy || !isAdmin}
-				onChange={() => void run(() => api.tokenDanceUpdateConnection(!connection.disabled))}
+				onChange={onToggleEnabled}
 			/>
 			<Group wrap="wrap">
 				<Button

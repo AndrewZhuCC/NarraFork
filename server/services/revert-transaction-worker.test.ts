@@ -11,7 +11,6 @@ import type { RevertSelectionResult } from "./revert-selection-service";
 import type { TransactionManifestRequest } from "./revert-transaction-manifest-worker";
 import {
 	RevertTransactionError,
-	revertManifestWorkerEntryPoint,
 	revertManifestWorkerSpecifiers,
 	runRevertManifestWorker,
 } from "./revert-transaction-worker";
@@ -54,30 +53,6 @@ describe("revert manifest worker resolution", () => {
 			"file:///$bunfs/root/server/services/revert-transaction-manifest-worker.js",
 			"file:///$bunfs/root/revert-transaction-manifest-worker.js",
 		]);
-	});
-	test("Windows embedded entries preserve forward-slash virtual keys", () => {
-		for (const root of ["file:///B:/~BUN/root/", "file:///B:/%7EBUN/root/"]) {
-			expect(
-				revertManifestWorkerSpecifiers(true, `${root}narrafork.exe`).map(
-					revertManifestWorkerEntryPoint,
-				),
-			).toEqual([
-				"B:/~BUN/root/services/revert-transaction-manifest-worker.js",
-				"B:/~BUN/root/server/services/revert-transaction-manifest-worker.js",
-				"B:/~BUN/root/revert-transaction-manifest-worker.js",
-			]);
-		}
-	});
-	test("ordinary file URLs and Linux virtual URLs retain URL handling", () => {
-		for (const specifier of [
-			"file:///C:/workspace%20name/worker.ts",
-			"file:///workspace/worker.ts",
-			"file:///$bunfs/root/services/worker.js",
-		]) {
-			const entry = revertManifestWorkerEntryPoint(specifier);
-			expect(entry).toBeInstanceOf(URL);
-			expect(String(entry)).toBe(specifier);
-		}
 	});
 });
 

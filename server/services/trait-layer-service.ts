@@ -1,6 +1,6 @@
 /**
- * Loads the upper trait layers (user, project) and resolves them against a
- * narrator's own traits.
+ * Loads the upper trait layers (user, project, policy source) and resolves them
+ * against a narrator's own traits.
  *
  * `lib/trait-resolution.ts` owns the merge; this service owns the I/O. It exists
  * separately because the resolver must stay pure and testable without a database.
@@ -13,18 +13,26 @@
  */
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { projects, userPreferences } from "../db/schema";
+import { narrators, projects, userPreferences } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { parseRuntimePolicyTraits } from "../lib/runtime-policy-trait";
+import {
+	MAX_POLICY_SOURCE_DEPTH,
+	policySourceIdOf,
+	RUNTIME_SOURCE_COLUMNS,
+} from "../lib/runtime-source";
 import {
 	type EnforcedTraitKeys,
 	parseEnforcedKeys,
 	type ResolvedTraitsResult,
 	resolveLayeredTraits,
 } from "../lib/trait-resolution";
+import { type RuntimePolicy, resolveRuntimePolicy } from "./agent-runtime/policy";
+import { resolveNarratorProjectId } from "./narrator-project";
 
 /**
  * Per-layer locks. Separate instances because the layers are different rows with
@@ -88,7 +96,14 @@ export function resetTraitLayerCaches(): void {
 	userLayerCache.clear();
 }
 
-async function loadProjectTraits(projectId: string | null | undefined): Promise<string[]> {
+/**
+ * `strict` is for capability resolution: a hard ceiling that cannot be read must
+ * fail the caller instead of resolving as if the layer were empty.
+ */
+async function loadProjectTraits(
+	projectId: string | null | undefined,
+	strict = false,
+): Promise<string[]> {
 	if (!projectId) return [];
 	const cached = readCache(projectLayerCache, projectId);
 	if (cached) return cached;
@@ -101,6 +116,7 @@ async function loadProjectTraits(projectId: string | null | undefined): Promise<
 		writeCache(projectLayerCache, projectId, traits);
 		return traits;
 	} catch (error) {
+		if (strict) throw error;
 		// A failed upper-layer read must not break the session; degrade to
 		// narrator-only traits, which is the pre-layering behaviour.
 		logger.debug("Failed to load project trait layer", { projectId, error: String(error) });
@@ -108,7 +124,10 @@ async function loadProjectTraits(projectId: string | null | undefined): Promise<
 	}
 }
 
-async function loadUserTraits(userId: string | null | undefined): Promise<string[]> {
+async function loadUserTraits(
+	userId: string | null | undefined,
+	strict = false,
+): Promise<string[]> {
 	if (!userId) return [];
 	const cached = readCache(userLayerCache, userId);
 	if (cached) return cached;
@@ -121,6 +140,7 @@ async function loadUserTraits(userId: string | null | undefined): Promise<string
 		writeCache(userLayerCache, userId, traits);
 		return traits;
 	} catch (error) {
+		if (strict) throw error;
 		logger.debug("Failed to load user trait layer", { userId, error: String(error) });
 		return [];
 	}
@@ -132,7 +152,7 @@ async function loadUserTraits(userId: string | null | undefined): Promise<string
  * `contextProjectId` over the chapter — the opposite of what the session layer
  * did. See `narrator-project.ts` for why the chapter wins.
  */
-export { resolveNarratorProjectId } from "./narrator-project";
+export { resolveNarratorProjectId };
 
 export interface ResolveTraitsInput {
 	/** The narrator's own traits column. */
@@ -141,26 +161,107 @@ export interface ResolveTraitsInput {
 	projectId?: string | null;
 	/** Acting user, resolved per request like `fastModeDefault` is. */
 	actingUserId?: string | null;
+	/** Registered policy source (see {@link policySourceIdOf}); its effective traits narrow. */
+	policySourceId?: string | null;
 }
 
+/** Re-exported: the one source rule (`lib/runtime-source.ts`). */
+
 /**
- * Resolve the effective traits for a narrator across all three layers.
+ * Resolve the effective traits for a narrator across all layers.
  *
- * When no project and no acting user apply, this returns the narrator's traits
- * unchanged, so standalone/unattended paths keep today's exact behaviour.
+ * When no project, acting user or policy source applies, this returns the
+ * narrator's traits unchanged, so standalone/unattended paths keep today's exact
+ * behaviour. The source layer is always strict: a source that cannot be resolved
+ * fails the call instead of silently dropping its boundaries.
  */
 export async function resolveEffectiveTraits(
 	input: ResolveTraitsInput,
 ): Promise<ResolvedTraitsResult> {
-	const [projectTraits, userTraits] = await Promise.all([
-		loadProjectTraits(input.projectId),
-		loadUserTraits(input.actingUserId),
+	return resolveLayers(input, false, []);
+}
+
+async function resolveLayers(
+	input: ResolveTraitsInput,
+	strict: boolean,
+	chain: readonly string[],
+): Promise<ResolvedTraitsResult> {
+	const [projectTraits, userTraits, source] = await Promise.all([
+		loadProjectTraits(input.projectId, strict),
+		loadUserTraits(input.actingUserId, strict),
+		input.policySourceId
+			? resolveNarratorTraitsInChain(input.policySourceId, input.actingUserId ?? null, chain)
+			: null,
 	]);
 	return resolveLayeredTraits({
 		user: userTraits.length > 0 ? { traits: userTraits } : null,
 		project: projectTraits.length > 0 ? { traits: projectTraits } : null,
+		source: source ? { traits: source.traits } : null,
 		narrator: { traits: input.narratorTraits },
 	});
+}
+
+async function resolveNarratorTraitsInChain(
+	narratorId: string,
+	actingUserId: string | null,
+	chain: readonly string[],
+): Promise<ResolvedTraitsResult> {
+	if (chain.includes(narratorId)) throw new Error("Policy source cycle detected");
+	if (chain.length >= MAX_POLICY_SOURCE_DEPTH) throw new Error("Policy source chain is too deep");
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: {
+			...RUNTIME_SOURCE_COLUMNS,
+			traits: true,
+			chapterId: true,
+			contextProjectId: true,
+		},
+	});
+	if (!row) throw new NotFoundError("Narrator", narratorId);
+	return resolveLayers(
+		{
+			// Every delegation stores its compiled template ceiling here at creation.
+			narratorTraits: row.traits,
+			projectId: await resolveNarratorProjectId(row),
+			actingUserId,
+			policySourceId: policySourceIdOf(row),
+		},
+		true,
+		[...chain, narratorId],
+	);
+}
+
+/**
+ * Strict effective traits of a stored narrator, including its registered policy
+ * source chain. This is the resolution capability decisions are made from: any
+ * unreadable layer, missing source, cycle or over-deep chain throws.
+ */
+async function resolveNarratorEffectiveTraits(
+	narratorId: string,
+	actingUserId: string | null = null,
+): Promise<ResolvedTraitsResult> {
+	return resolveNarratorTraitsInChain(narratorId, actingUserId, []);
+}
+
+/**
+ * Capability ceiling of a stored narrator: its own, project, user and policy-source
+ * ceilings merged narrow-only. Throws when any of them cannot be read, so a
+ * failure never runs a narrator without its ceiling.
+ */
+export async function resolveNarratorRuntimePolicy(
+	narratorId: string,
+	actingUserId: string | null = null,
+): Promise<RuntimePolicy> {
+	return (await resolveNarratorCapabilities(narratorId, actingUserId)).policy;
+}
+
+/** One strict resolution yielding both the effective traits and the ceiling derived from them. */
+export async function resolveNarratorCapabilities(
+	narratorId: string,
+	actingUserId: string | null = null,
+): Promise<{ traits: ResolvedTraitsResult; policy: RuntimePolicy }> {
+	const traits = await resolveNarratorEffectiveTraits(narratorId, actingUserId);
+	return { traits, policy: resolveRuntimePolicy(parseRuntimePolicyTraits(traits.traits)) };
 }
 
 // === Layer trait editing ===

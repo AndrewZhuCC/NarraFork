@@ -438,6 +438,25 @@ export function caretProbe() {
 	return { head, top: editor.view.coordsAtPos(head).top, text: composer.current?.getText() ?? "" };
 }
 
+export function scrollProbe() {
+	const editor = textboxEditor();
+	const scroller = editor.view.dom.closest<HTMLElement>("[data-composer-scroll]");
+	if (!scroller) throw new Error("Missing composer scroller");
+	const caret = editor.view.coordsAtPos(editor.state.selection.head);
+	const box = scroller.getBoundingClientRect();
+	return {
+		head: editor.state.selection.head,
+		text: composer.current?.getText() ?? "",
+		scrollTop: scroller.scrollTop,
+		scrollHeight: scroller.scrollHeight,
+		clientHeight: scroller.clientHeight,
+		caretTop: caret.top,
+		caretBottom: caret.bottom,
+		boxTop: box.top,
+		boxBottom: box.bottom,
+	};
+}
+
 export function placeCaretAt(text: string, offset: number) {
 	const editor = textboxEditor();
 	let pos: number | null = null;
@@ -596,14 +615,7 @@ export function rejectAttachmentReads() {
 }
 export async function seedLegacyTextDraft(text: string) {
 	const id = owner() ?? "persist-a";
-	const previous = readNarratorInputDraft(currentUser, id);
-	const stored = await api.updateNarratorDraft(
-		id,
-		text,
-		previous.serverRevision ?? 1,
-		"legacy-fixture",
-		[],
-	);
+	const stored = await api.updateNarratorDraft(id, text, "legacy-fixture", []);
 	persistNarratorInputDraft(currentUser, id, text, stored.revision, stored.updatedAt, [], {
 		text,
 		fileReferences: [],

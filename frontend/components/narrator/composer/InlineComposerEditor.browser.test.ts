@@ -1296,3 +1296,161 @@ test("placeholder follows the real document, including restored trailing newline
 		await close(page);
 	}
 });
+
+const previewDocument: ComposerDocument = {
+	...empty,
+	paragraphs: [
+		{
+			children: [
+				{ type: "quote", id: "preview-quote", label: "Quoted text", text: "Original text" },
+				{
+					type: "fileReference",
+					id: "preview-file",
+					reference: {
+						id: "file-ref",
+						deviceId: "local",
+						path: "/project/readme.txt",
+						label: "readme.txt",
+					},
+				},
+				{ type: "attachment", id: "image-node", assetId: imageAsset.id },
+				{ type: "attachment", id: "text-node", assetId: "text-1" },
+			],
+		},
+	],
+	assets: [
+		imageAsset,
+		{ id: "text-1", kind: "textFile", name: "notes.txt", size: 20, mimeType: "text/plain" },
+	],
+};
+const previewBodies = [
+	'[data-composer-atom="quote"] > button',
+	'[data-composer-atom="fileReference"] > button',
+	'[data-composer-asset-id="image-1"] > button',
+	'[data-composer-asset-id="text-1"] > button',
+];
+async function loadPreviews(page: Page) {
+	await load(page, previewDocument);
+	await page.evaluate(() =>
+		(window as unknown as FixtureWindow).fixture.resources([
+			["image-1", "/api/test-image"],
+			["text-1", "text fixture"],
+		]),
+	);
+	await settle(page);
+}
+
+test("chip bodies select on mouse click, preview once on double click or keyboard; close never opens", async () => {
+	const page = await open();
+	try {
+		await loadPreviews(page);
+		let opened = 0;
+		for (const selector of previewBodies) {
+			expect(
+				await page.$eval(selector, (body) => body.parentElement?.querySelectorAll("button").length),
+			).toBe(2);
+			await page.click(selector);
+			expect((await snapshot(page)).opened).toBe(opened);
+			expect((await snapshot(page)).nativeSelection.type).toBe("node");
+			await page.click(selector, { clickCount: 2 });
+			expect((await snapshot(page)).opened).toBe(++opened);
+			await page.focus(selector);
+			await page.keyboard.press("Enter");
+			expect((await snapshot(page)).opened).toBe(++opened);
+			await page.keyboard.press("Space");
+			expect((await snapshot(page)).opened).toBe(++opened);
+			expect((await snapshot(page)).sends).toBe(0);
+		}
+		expect((await snapshot(page)).document).toEqual(previewDocument);
+		for (const selector of previewBodies) {
+			await page.click(selector.replace(" > button", " button:last-child"));
+			expect((await snapshot(page)).opened).toBe(opened);
+		}
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([]);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("touch taps preview once on a hybrid device while mouse keeps single-click selection", async () => {
+	const page = await open();
+	try {
+		await page.setViewport({ width: 1024, height: 844, hasTouch: true });
+		await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
+		await loadPreviews(page);
+		let opened = 0;
+		for (const selector of previewBodies) {
+			const point = await page.$eval(selector, (body) => {
+				const rect = body.getBoundingClientRect();
+				return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+			});
+			await page.touchscreen.tap(point.x, point.y);
+			expect((await snapshot(page)).opened).toBe(++opened);
+			await page.click(selector);
+			expect((await snapshot(page)).opened).toBe(opened);
+			await page.click(selector, { clickCount: 2 });
+			expect((await snapshot(page)).opened).toBe(++opened);
+		}
+		const remove = await page.$eval('[data-composer-atom="quote"] button:last-child', (button) => {
+			const rect = button.getBoundingClientRect();
+			return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+		});
+		await page.touchscreen.tap(remove.x, remove.y);
+		expect((await snapshot(page)).opened).toBe(opened);
+		expect(
+			(await snapshot(page)).document?.paragraphs[0].children.some((node) => node.type === "quote"),
+		).toBe(false);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("cancelled/moved direct pointers do not preview; pen taps do and missing assets remain unavailable", async () => {
+	const page = await open();
+	try {
+		await loadPreviews(page);
+		for (const cancelled of [false, true]) {
+			await page.$eval(
+				previewBodies[0],
+				(body, cancel) => {
+					const init = { bubbles: true, pointerType: "touch", clientX: 10, clientY: 10 };
+					body.dispatchEvent(new PointerEvent("pointerdown", init));
+					body.dispatchEvent(
+						new PointerEvent(cancel ? "pointercancel" : "pointermove", { ...init, clientY: 40 }),
+					);
+					body.dispatchEvent(new PointerEvent("click", init));
+				},
+				cancelled,
+			);
+			expect((await snapshot(page)).opened).toBe(0);
+		}
+		await page.$eval(previewBodies[0], (body) => {
+			const init = { bubbles: true, pointerType: "pen" };
+			body.dispatchEvent(new PointerEvent("pointerdown", init));
+			body.dispatchEvent(new PointerEvent("pointerup", init));
+			body.dispatchEvent(new PointerEvent("click", init));
+		});
+		expect((await snapshot(page)).opened).toBe(1);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.resources([]));
+		await settle(page);
+		for (const hydrating of [false, true]) {
+			await page.evaluate(
+				(value) => (window as unknown as FixtureWindow).fixture.hydrating(value),
+				hydrating,
+			);
+			await settle(page);
+			for (const selector of previewBodies.slice(2)) {
+				expect(
+					await page.$eval(selector, (body) => body.parentElement?.hasAttribute("data-loading")),
+				).toBe(hydrating);
+				await page.click(selector, { clickCount: 2 });
+				expect((await snapshot(page)).opened).toBe(1);
+				await page.focus(selector);
+				await page.keyboard.press("Enter");
+				expect((await snapshot(page)).opened).toBe(1);
+			}
+		}
+	} finally {
+		await close(page);
+	}
+}, 15_000);

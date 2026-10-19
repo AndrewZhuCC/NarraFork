@@ -8,7 +8,7 @@
  * against the complete committed drizzle-postgres journal. SQLite handles are
  * poisoned: any touch fails the suite (sqliteTouches === 0).
  *
- *   - startAgentRun with taskRow: logical run + slot reservation + task INSERT
+ *   - startRun with taskRow: logical run + slot reservation + task INSERT
  *     in ONE withPgRetry section.
  *   - startBashRun with taskRow: same atomicity for bash tasks.
  *   - commitAgentTerminal / commitBashTerminal: result snapshot + terminal
@@ -85,7 +85,7 @@ async function buildEngine(port: number, credentials: { user: string; password: 
 	});
 
 	test(
-		"startAgentRun with taskRow: atomic run + task insert",
+		"startRun with taskRow: atomic run + task insert",
 		async () => {
 			const result = await withPostgres(async ({ port, credentials }) => {
 				const { engine, db } = await buildEngine(port, credentials);
@@ -115,21 +115,23 @@ async function buildEngine(port: number, credentials: { user: string; password: 
 					},
 				]);
 
-				const run = await engine.startAgentRun({
-					narratorId: childId,
-					parentNarratorId: parentId,
-					taskRow: {
-						id: taskId,
-						parentNarratorId: parentId,
-						type: "agent",
-						status: "running",
-						subagentNarratorId: childId,
-						subagentType: "general",
-						startedAt: now,
-						createdAt: now,
-						updatedAt: now,
-					},
-				});
+				const run = (
+					await engine.startRun({
+						narratorId: childId,
+						taskRow: {
+							id: taskId,
+							parentNarratorId: parentId,
+							type: "agent",
+							status: "running",
+							subagentNarratorId: childId,
+							subagentType: "general",
+							startedAt: now,
+							createdAt: now,
+							updatedAt: now,
+						},
+						binding: { deliverTo: { narratorId: parentId, toolUseId: "test-tool-use" } },
+					})
+				).publication!;
 
 				expect(run.producerKind).toBe("agent");
 				expect(run.taskId).toBe(childId);
@@ -309,10 +311,12 @@ async function buildEngine(port: number, credentials: { user: string; password: 
 					seq: 0,
 				});
 
-				const run = await engine.startAgentRun({
-					narratorId: childId,
-					parentNarratorId: parentId,
-				});
+				const run = (
+					await engine.startRun({
+						narratorId: childId,
+						binding: { deliverTo: { narratorId: parentId, toolUseId: "test-tool-use" } },
+					})
+				).publication!;
 
 				const result = await engine.commitAgentTerminal({
 					run,

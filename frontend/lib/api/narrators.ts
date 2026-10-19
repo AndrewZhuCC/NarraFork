@@ -799,7 +799,6 @@ export const narratorsApi = {
 	updateNarratorDraft: (
 		id: string,
 		text: string,
-		baseRevision: number,
 		sourceId?: string,
 		fileReferences?: FileReference[],
 		composerDocument?: ComposerDocument,
@@ -817,7 +816,23 @@ export const narratorsApi = {
 			sourceId: string | null;
 		}>(`/narrators/${id}/draft`, {
 			method: "PUT",
-			body: JSON.stringify({ text, baseRevision, sourceId, fileReferences, composerDocument }),
+			body: JSON.stringify({ text, sourceId, fileReferences, composerDocument }),
+		}),
+	/** Swap the draft with the server's undo slot (the version the last write replaced). */
+	restoreNarratorDraftPrevious: (id: string, sourceId?: string) =>
+		request<{
+			ok: boolean;
+			hasDraft: boolean;
+			text: string;
+			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
+			revision: number;
+			updatedAt: string | null;
+			updatedBy: string | null;
+			sourceId: string | null;
+		}>(`/narrators/${id}/draft/restore`, {
+			method: "POST",
+			body: JSON.stringify({ sourceId }),
 		}),
 	getNarratorUsageStats: (id: string, opts?: { includeSubagents?: boolean }) => {
 		const params = new URLSearchParams();
