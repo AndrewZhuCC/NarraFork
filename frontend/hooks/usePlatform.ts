@@ -54,7 +54,13 @@ export type GatewayPlatform =
 	| "weixin"
 	| "qqbot";
 
-export type ProviderCapabilityKey = "openai" | "anthropic" | "nug" | "codex" | "gemini";
+export type ProviderCapabilityKey =
+	| "openai"
+	| "anthropic"
+	| "nug"
+	| "codex"
+	| "CommandCode"
+	| "gemini";
 
 type ChapterContainerRoute =
 	| "setup"

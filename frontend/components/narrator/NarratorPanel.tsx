@@ -176,6 +176,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { commandCodeQuotaView } from "./model/commandcode-quota-format";
 import { usageSourceFor } from "./model/custom-api-usage-source";
 import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import {
@@ -720,6 +721,16 @@ function NarratorPanelBody({
 		currentUser?.role === "admin",
 		t,
 	);
+
+	// Command Code 额度：仅在当前模型走 commandcode 前缀时启用，避免无谓的接口调用。
+	const commandCodeEnabled = !!resolvedModel?.startsWith("CommandCode:");
+	const commandCodeUsageQuery = useQuery({
+		queryKey: ["commandcode", "usage"],
+		queryFn: () => api.commandCodeUsage(),
+		enabled: commandCodeEnabled,
+		refetchInterval: commandCodeEnabled ? 60_000 : false,
+	});
+	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
 
 	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
 	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
@@ -3552,9 +3563,13 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								balance: tokenDanceQuota?.balance ?? quotaBalance,
-								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
+								balance: commandCodeQuota?.balance ?? tokenDanceQuota?.balance ?? quotaBalance,
+								detailsText:
+									commandCodeQuota?.detailsText ?? tokenDanceQuota?.detailsText ?? quotaDetailsText,
+								hasDetailsPopover:
+									commandCodeQuota?.hasDetailsPopover ??
+									tokenDanceQuota?.hasDetailsPopover ??
+									hasQuotaDetailsPopover,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
