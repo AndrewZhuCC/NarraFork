@@ -119,7 +119,8 @@ function Fixture() {
 							}}
 							resources={resources}
 							disabled={disabled}
-							placeholder="Message"
+							adaptive={location.search.includes("adaptive")}
+							placeholder={new URLSearchParams(location.search).get("placeholder") ?? "Message"}
 							candidate={
 								show
 									? {

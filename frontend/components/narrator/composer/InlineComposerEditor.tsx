@@ -637,10 +637,9 @@ export const InlineComposerEditor = forwardRef<
 				"aria-multiline": "true",
 				class: classes.editable,
 				"data-empty": String(
-					state.doc.childCount === 1 &&
-						state.doc.firstChild?.content.size === 0 &&
-						!propsRef.current.candidate,
+					state.doc.childCount === 1 && state.doc.firstChild?.content.size === 0,
 				),
+				"data-has-candidate": String(!!propsRef.current.candidate),
 			}),
 			handleKeyDown: (_view, event) => event.defaultPrevented,
 			clipboardTextSerializer: (slice) =>

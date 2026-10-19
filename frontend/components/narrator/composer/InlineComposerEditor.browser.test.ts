@@ -1467,8 +1467,8 @@ test("placeholder follows the real document, including restored trailing newline
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(true));
 		await page.waitForSelector('[role="textbox"] [data-inline-quote-candidate]');
 		expect(
-			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
-		).toBe("none");
+			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").visibility),
+		).toBe("hidden");
 		expect((await snapshot(page)).document).toEqual(empty);
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(false));
 		await settle(page);
@@ -1479,3 +1479,46 @@ test("placeholder follows the real document, including restored trailing newline
 		await close(page);
 	}
 });
+
+for (const width of [1000, 390]) {
+	test(`${width}px: long suggestions keep their height while quote previews appear and disappear`, async () => {
+		const suggestion =
+			"Continue by reviewing the current changes and explain the next action. ".repeat(4);
+		const page = await open(`?adaptive&placeholder=${encodeURIComponent(suggestion)}`);
+		try {
+			await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
+			await page.setViewport({ width, height: 844 });
+			await settle(page);
+			const geometry = () =>
+				page.evaluate(() => {
+					const shell = document.querySelector<HTMLElement>("[data-inline-composer]");
+					const input = document.querySelector<HTMLElement>('[role="textbox"]');
+					const messages = document.getElementById("messages");
+					if (!shell || !input || !messages) throw new Error("Missing composer layout");
+					const placeholder = getComputedStyle(input, "::before");
+					return {
+						height: shell.getBoundingClientRect().height,
+						messagesHeight: messages.getBoundingClientRect().height,
+						placeholderVisibility: placeholder.visibility,
+					};
+				});
+			const baseline = await geometry();
+			expect(baseline.height).toBeGreaterThan(70);
+			expect(baseline.placeholderVisibility).toBe("visible");
+			for (const visible of [true, false, true, false]) {
+				await page.evaluate(
+					(show) => (window as unknown as FixtureWindow).fixture.showCandidate(show),
+					visible,
+				);
+				await settle(page);
+				const current = await geometry();
+				expect(Math.abs(current.height - baseline.height)).toBeLessThanOrEqual(1);
+				expect(Math.abs(current.messagesHeight - baseline.messagesHeight)).toBeLessThanOrEqual(1);
+				expect(current.placeholderVisibility).toBe(visible ? "hidden" : "visible");
+				expect((await snapshot(page)).document).toEqual(empty);
+			}
+		} finally {
+			await close(page);
+		}
+	}, 15000);
+}

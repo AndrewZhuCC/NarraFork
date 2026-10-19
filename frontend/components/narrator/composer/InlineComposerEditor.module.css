@@ -56,6 +56,11 @@
 	height: 0;
 }
 
+/* Preserve the suggestion's measured height while the quote preview hides it. */
+.editable[data-has-candidate="true"]::before {
+	visibility: hidden;
+}
+
 .controls {
 	padding: 4px 8px 8px;
 	flex-shrink: 0;
