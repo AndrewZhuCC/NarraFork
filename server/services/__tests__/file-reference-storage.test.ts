@@ -122,13 +122,13 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 		sqlite.close();
 	});
 
-	describe("reference metadata draft CAS", () => {
+	describe("reference metadata draft sync", () => {
 		test("reference-only drafts are present and clear leaves a revision tombstone", async () => {
 			expect(await drafts.getNarratorDraft("u", "n")).toMatchObject({
 				hasDraft: false,
 				fileReferences: [],
 			});
-			const result = await drafts.updateNarratorDraft("u", "n", "", "device", 0, [reference()]);
+			const result = await drafts.updateNarratorDraft("u", "n", "", "device", [reference()]);
 			expect(result).toMatchObject({ hasDraft: true, revision: 1, fileReferences: [reference()] });
 			expect(await drafts.getNarratorDraft("u", "n")).toMatchObject({
 				hasDraft: true,
@@ -138,7 +138,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			expect(await drafts.narratorHasDraft("u", "n")).toBe(true);
 			expect(await drafts.getNarratorIdsWithDraft("u", ["n", "other"])).toEqual(new Set(["n"]));
 			expect(await drafts.narratorHasDraft("other-user", "n")).toBe(false);
-			const cleared = await drafts.updateNarratorDraft("u", "n", "", "device", 1, []);
+			const cleared = await drafts.updateNarratorDraft("u", "n", "", "device", []);
 			expect(cleared).toMatchObject({
 				previousHasDraft: true,
 				hasDraft: false,
@@ -149,16 +149,23 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			expect(db.select().from(schema.narratorDrafts).get()?.fileReferencesJson).toBeNull();
 		});
 
-		test("text and references share one CAS and reject a stale cross-device write", async () => {
-			await drafts.updateNarratorDraft("u", "n", "first", "one", 0, [reference("one")]);
+		test("text and references share one last-writer-wins revision", async () => {
+			await drafts.updateNarratorDraft("u", "n", "first", "one", [reference("one")]);
 			const [a, b] = await Promise.all([
-				drafts.updateNarratorDraft("u", "n", "second", "two", 1, [reference("two")]),
-				drafts.updateNarratorDraft("u", "n", "stale", "three", 1, []),
+				drafts.updateNarratorDraft("u", "n", "second", "two", [reference("two")]),
+				drafts.updateNarratorDraft("u", "n", "stale", "three", []),
 			]);
-			expect(a).toMatchObject({ revision: 2, text: "second", fileReferences: [reference("two")] });
-			expect(b).toMatchObject({
-				conflict: true,
-				current: { revision: 2, text: "second", fileReferences: [reference("two")] },
+			// The lock serializes the race: one write lands at revision 2, the other
+			// overwrites it at revision 3 and the replaced version stays restorable.
+			const [winner, loser] = a.revision === 2 ? [a, b] : [b, a];
+			expect(winner.revision).toBe(2);
+			expect(loser).toMatchObject({ revision: 3, hasPrevious: true });
+			expect(await drafts.getNarratorDraft("u", "n")).toMatchObject({
+				revision: 3,
+				text: loser.text,
+			});
+			expect(await drafts.restoreNarratorDraftPrevious("u", "n")).toMatchObject({
+				text: winner.text,
 			});
 		});
 
@@ -166,18 +173,18 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			const token = "#file:file.ts";
 			const ref = reference();
 			ref.inputRange = [0, token.length];
-			await drafts.updateNarratorDraft("u", "n", `${token} hello`, "one", 0, [
+			await drafts.updateNarratorDraft("u", "n", `${token} hello`, "one", [
 				ref,
 				{ ...reference("chip"), inputRange: undefined },
 			]);
 			expect(
-				await drafts.updateNarratorDraft("u", "n", `${token} updated`, undefined, 1),
+				await drafts.updateNarratorDraft("u", "n", `${token} updated`, undefined),
 			).toMatchObject({ fileReferences: [ref], sourceId: "one" });
 			expect(
-				await drafts.updateNarratorDraft("u", "n", `prefix ${token} updated`, undefined, 2),
+				await drafts.updateNarratorDraft("u", "n", `prefix ${token} updated`, undefined),
 			).toMatchObject({ fileReferences: [] });
-			await drafts.updateNarratorDraft("u", "n", token, "one", 3, [ref]);
-			expect(await drafts.updateNarratorDraft("u", "n", "", "one", 4)).toMatchObject({
+			await drafts.updateNarratorDraft("u", "n", token, "one", [ref]);
+			expect(await drafts.updateNarratorDraft("u", "n", "", "one")).toMatchObject({
 				fileReferences: [],
 				hasDraft: false,
 			});
@@ -185,7 +192,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 
 		test("copies accepted draft metadata before a caller mutates it", async () => {
 			const ref = reference();
-			const promise = drafts.updateNarratorDraft("u", "n", "draft", undefined, 0, [ref]);
+			const promise = drafts.updateNarratorDraft("u", "n", "draft", undefined, [ref]);
 			ref.path = "/changed";
 			ref.inputRange?.splice(0, 1, 99);
 			await promise;
@@ -193,7 +200,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 		});
 
 		test("presence selects only ids, never materializing large draft columns", async () => {
-			await drafts.updateNarratorDraft("u", "n", "", undefined, 0, [reference()]);
+			await drafts.updateNarratorDraft("u", "n", "", undefined, [reference()]);
 			queries.length = 0;
 			await drafts.narratorHasDraft("u", "n");
 			await drafts.getNarratorIdsWithDraft("u", ["n"]);

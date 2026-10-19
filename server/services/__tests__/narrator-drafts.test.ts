@@ -19,6 +19,7 @@ const {
 	getNarratorDraftMetadata,
 	getNarratorIdsWithDraft,
 	narratorHasDraft,
+	restoreNarratorDraftPrevious,
 	updateNarratorDraft,
 } = await import("../narrator-draft-service");
 
@@ -62,7 +63,6 @@ describe("per-user narrator drafts", () => {
 			"rich-narrator",
 			text,
 			"tab",
-			0,
 			[],
 			document,
 		);
@@ -73,7 +73,6 @@ describe("per-user narrator drafts", () => {
 			revision: 1,
 			previousHasDraft: false,
 		});
-		if ("conflict" in saved) throw new Error("Unexpected draft conflict");
 		const { previousHasDraft: _previous, ...state } = saved;
 		expect(await getNarratorDraft("rich-user", "rich-narrator")).toEqual(state);
 		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toEqual({
@@ -88,7 +87,7 @@ describe("per-user narrator drafts", () => {
 		expect(row?.text).toBe("");
 	});
 
-	test("removing the last attachment clears layout in the response, storage and CAS conflicts", async () => {
+	test("removing the last attachment clears layout in the response and storage", async () => {
 		await seedUser("rich-user");
 		await seedNarrator("rich-narrator");
 		const document: ComposerDocument = {
@@ -96,11 +95,11 @@ describe("per-user narrator drafts", () => {
 			paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "image" }] }],
 			assets: [{ id: "image", kind: "image", name: "image.png", size: 9, mimeType: "image/png" }],
 		};
-		await updateNarratorDraft("rich-user", "rich-narrator", "", "tab", 0, [], document);
+		await updateNarratorDraft("rich-user", "rich-narrator", "", "tab", [], document);
 		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toMatchObject({
 			hasDraft: true,
 		});
-		const cleared = await updateNarratorDraft("rich-user", "rich-narrator", "", undefined, 1, [], {
+		const cleared = await updateNarratorDraft("rich-user", "rich-narrator", "", undefined, [], {
 			version: 1,
 			paragraphs: [{ children: [] }],
 			assets: [],
@@ -122,13 +121,10 @@ describe("per-user narrator drafts", () => {
 		});
 		expect(await narratorHasDraft("rich-user", "rich-narrator")).toBe(false);
 		expect(await getNarratorIdsWithDraft("rich-user", ["rich-narrator"])).toEqual(new Set());
-		expect(
-			await updateNarratorDraft("rich-user", "rich-narrator", "stale", "tab", 1),
-		).toMatchObject({
-			conflict: true,
-			current: { hasDraft: false, composerDocument: undefined, revision: 2 },
-		});
-		expect((await db.select().from(narratorDrafts).get())?.composerDocument).toBeNull();
+		// The clear replaced real content, so the attachment version is restorable.
+		const restored = await restoreNarratorDraftPrevious("rich-user", "rich-narrator", "tab");
+		expect(restored).toMatchObject({ hasDraft: true, composerDocument: document, revision: 3 });
+		expect((await db.select().from(narratorDrafts).get())?.composerDocument).toEqual(document);
 	});
 
 	test.each([
@@ -139,7 +135,7 @@ describe("per-user narrator drafts", () => {
 	])("empty historical drafts tolerate invalid document JSON: %j", async (historical) => {
 		await seedUser("rich-user");
 		await seedNarrator("rich-narrator");
-		await updateNarratorDraft("rich-user", "rich-narrator", "", "tab", 0);
+		await updateNarratorDraft("rich-user", "rich-narrator", "", "tab");
 		sqlite.run("UPDATE narrator_drafts SET composer_document = ?", [JSON.stringify(historical)]);
 		expect(await getNarratorDraft("rich-user", "rich-narrator")).toMatchObject({
 			hasDraft: false,
@@ -151,14 +147,12 @@ describe("per-user narrator drafts", () => {
 		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toMatchObject({
 			hasDraft: true,
 		});
-		expect(await updateNarratorDraft("rich-user", "rich-narrator", "", undefined, 1)).toMatchObject(
-			{
-				hasDraft: false,
-				composerDocument: undefined,
-				previousHasDraft: false,
-				revision: 2,
-			},
-		);
+		expect(await updateNarratorDraft("rich-user", "rich-narrator", "", undefined)).toMatchObject({
+			hasDraft: false,
+			composerDocument: undefined,
+			previousHasDraft: false,
+			revision: 2,
+		});
 		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toMatchObject({
 			hasDraft: false,
 		});
@@ -184,17 +178,10 @@ describe("per-user narrator drafts", () => {
 			"rich-narrator",
 			"#file:a.ts",
 			"tab",
-			0,
 			[reference],
 			document,
 		);
-		const saved = await updateNarratorDraft(
-			"rich-user",
-			"rich-narrator",
-			"#file:a.ts",
-			undefined,
-			1,
-		);
+		const saved = await updateNarratorDraft("rich-user", "rich-narrator", "#file:a.ts", undefined);
 		expect(saved).toMatchObject({
 			hasDraft: true,
 			composerDocument: undefined,
@@ -210,7 +197,7 @@ describe("per-user narrator drafts", () => {
 		});
 	});
 
-	test("rich layout participates in CAS, missing blobs remain visible and legacy saves clear layout", async () => {
+	test("rich layout survives sync, missing blobs remain visible and legacy saves clear layout", async () => {
 		await seedUser("rich-user");
 		await seedNarrator("rich-narrator");
 		const document = {
@@ -220,27 +207,16 @@ describe("per-user narrator drafts", () => {
 				{ id: "image", kind: "image" as const, name: "image.png", size: 9, mimeType: "image/png" },
 			],
 		};
-		const first = await updateNarratorDraft(
-			"rich-user",
-			"rich-narrator",
-			"",
-			"tab",
-			0,
-			[],
-			document,
-		);
+		const first = await updateNarratorDraft("rich-user", "rich-narrator", "", "tab", [], document);
 		expect(first).toMatchObject({ hasDraft: true, composerDocument: document, revision: 1 });
 		expect(await getNarratorDraft("rich-user", "rich-narrator")).toMatchObject({
 			composerDocument: document,
 		});
 		expect(await narratorHasDraft("rich-user", "rich-narrator")).toBe(true);
-		expect(
-			await updateNarratorDraft("rich-user", "rich-narrator", "stale", "tab", 0),
-		).toMatchObject({ conflict: true, current: { composerDocument: document } });
-		await updateNarratorDraft("rich-user", "rich-narrator", "legacy", "tab", 1);
+		await updateNarratorDraft("rich-user", "rich-narrator", "legacy", "tab");
 		expect((await getNarratorDraft("rich-user", "rich-narrator")).composerDocument).toBeUndefined();
 		await expect(
-			updateNarratorDraft("rich-user", "rich-narrator", "different", "tab", 2, [], document),
+			updateNarratorDraft("rich-user", "rich-narrator", "different", "tab", [], document),
 		).rejects.toThrow("does not match");
 	});
 	test("isolates text and clear tombstones between users", async () => {
@@ -269,31 +245,55 @@ describe("per-user narrator drafts", () => {
 			revision: 2,
 			previousHasDraft: true,
 		});
-		expect("conflict" in cleared ? null : cleared.updatedAt).not.toBeNull();
+		expect(cleared.updatedAt).not.toBeNull();
 		expect(await getNarratorDraft("user-b", "narrator-1")).toMatchObject({
 			hasDraft: true,
 			text: "draft-b",
 		});
 	});
 
-	test("rejects stale base revisions without overwriting the newer draft", async () => {
+	test("last writer wins and the overwritten version stays restorable", async () => {
 		await seedUser("user-a");
 		await seedNarrator("narrator-1");
 
-		const first = await updateNarratorDraft("user-a", "narrator-1", "first", "source-a", 0);
-		expect(first).toMatchObject({ revision: 1, text: "first" });
-		const second = await updateNarratorDraft("user-a", "narrator-1", "second", "source-b", 1);
-		expect(second).toMatchObject({ revision: 2, text: "second" });
-
-		const stale = await updateNarratorDraft("user-a", "narrator-1", "stale", "source-a", 1);
-		expect(stale).toEqual({
-			conflict: true,
-			current: expect.objectContaining({ revision: 2, text: "second", sourceId: "source-b" }),
-		});
+		const first = await updateNarratorDraft("user-a", "narrator-1", "first", "source-a");
+		expect(first).toMatchObject({ revision: 1, text: "first", hasPrevious: false });
+		// A stale tab loses the race silently: no rejection, no arbitration UI.
+		const second = await updateNarratorDraft("user-a", "narrator-1", "second", "source-b");
+		expect(second).toMatchObject({ revision: 2, text: "second", hasPrevious: true });
 		expect(await getNarratorDraft("user-a", "narrator-1")).toMatchObject({
 			revision: 2,
 			text: "second",
+			sourceId: "source-b",
+			hasPrevious: true,
 		});
+
+		// Restore swaps current with the undo slot; restoring again swaps back.
+		const restored = await restoreNarratorDraftPrevious("user-a", "narrator-1", "source-a");
+		expect(restored).toMatchObject({ revision: 3, text: "first", hasPrevious: true });
+		expect(await getNarratorDraft("user-a", "narrator-1")).toMatchObject({
+			revision: 3,
+			text: "first",
+			hasPrevious: true,
+		});
+		const forward = await restoreNarratorDraftPrevious("user-a", "narrator-1", "source-a");
+		expect(forward).toMatchObject({ revision: 4, text: "second" });
+
+		// An unchanged re-save must not bury the undo slot.
+		const resave = await updateNarratorDraft("user-a", "narrator-1", "second", "source-b");
+		expect(resave).toMatchObject({ revision: 5, hasPrevious: true });
+		expect(await restoreNarratorDraftPrevious("user-a", "narrator-1")).toMatchObject({
+			text: "first",
+		});
+	});
+
+	test("overwriting an empty draft leaves no undo slot", async () => {
+		await seedUser("user-a");
+		await seedNarrator("narrator-1");
+		expect(await restoreNarratorDraftPrevious("user-a", "narrator-1")).toBeNull();
+		const written = await updateNarratorDraft("user-a", "narrator-1", "typed", "source-a");
+		expect(written).toMatchObject({ hasPrevious: false });
+		expect(await restoreNarratorDraftPrevious("user-a", "narrator-1")).toBeNull();
 	});
 
 	test("returns draft markers only for the requested user", async () => {
@@ -320,7 +320,7 @@ describe("per-user narrator drafts", () => {
 		await updateNarratorDraft("user-a", "narrator-1", "typing…", "source-a");
 		expect(await narratorHasDraft("user-a", "narrator-1")).toBe(true);
 		// A cleared (tombstone) draft must read as absent.
-		await updateNarratorDraft("user-a", "narrator-1", "", "source-a", 1);
+		await updateNarratorDraft("user-a", "narrator-1", "", "source-a");
 		expect(await narratorHasDraft("user-a", "narrator-1")).toBe(false);
 		// Another user's draft never leaks into this user's presence check.
 		await seedUser("user-b");
@@ -332,16 +332,16 @@ describe("per-user narrator drafts", () => {
 		await seedUser("user-a");
 		await seedNarrator("narrator-1");
 
-		await updateNarratorDraft("user-a", "narrator-1", "first", "source-a", 0);
+		await updateNarratorDraft("user-a", "narrator-1", "first", "source-a");
 		// Autosave that does not resend sourceId must keep the prior attribution.
-		const kept = await updateNarratorDraft("user-a", "narrator-1", "second", undefined, 1);
+		const kept = await updateNarratorDraft("user-a", "narrator-1", "second", undefined);
 		expect(kept).toMatchObject({ text: "second", sourceId: "source-a" });
 		expect(await getNarratorDraft("user-a", "narrator-1")).toMatchObject({
 			text: "second",
 			sourceId: "source-a",
 		});
 		// An explicit new sourceId still reassigns it.
-		const reassigned = await updateNarratorDraft("user-a", "narrator-1", "third", "source-b", 2);
+		const reassigned = await updateNarratorDraft("user-a", "narrator-1", "third", "source-b");
 		expect(reassigned).toMatchObject({ sourceId: "source-b" });
 	});
 });
