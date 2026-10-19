@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { resolveRuntimePolicy } from "../../services/agent-runtime/policy";
+import { compileDelegationPolicy, resolveRuntimePolicy } from "../../services/agent-runtime/policy";
 import type { SearchChannelConfig } from "../settings/types";
 import type { SearchRequest } from "./types";
 
@@ -29,7 +29,7 @@ export async function runSearchProbe(
 			locale: request.locale ?? "en",
 			signal: request.signal ?? new AbortController().signal,
 			userId: request.userId ?? null,
-			runtimePolicy: resolveRuntimePolicy({ variant: "subagent", subagentType: "search" }),
+			runtimePolicy: resolveRuntimePolicy([compileDelegationPolicy({ template: "search" })]),
 			maxTurns: channel.maxTurns ?? 4,
 			reasoningEffort: channel.reasoningEffort,
 			maxTransientRetries: 0,

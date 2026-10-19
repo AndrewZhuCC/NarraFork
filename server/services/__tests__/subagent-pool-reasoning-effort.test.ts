@@ -62,7 +62,9 @@ if (process.env[CHILD_ENV] !== "1") {
 	const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
 	mock.module("../narrator-executor", () => ({
 		executeAgentLoop: async ({ config }: ExecuteLoopOptions): Promise<ExecuteLoopResult> => {
-			configs.push(config);
+			// A finished background child wakes its parent through the ordinary inbox; only
+			// the delegated session's runs are what these cases measure.
+			if (config.narratorId !== "reasoning-effort-parent") configs.push(config);
 			return {
 				finalText: "isolated model result",
 				hasError: false,
@@ -96,7 +98,9 @@ if (process.env[CHILD_ENV] !== "1") {
 	);
 	const network = spyOn(globalThis, "fetch").mockImplementation(forbiddenFetch);
 	const { settings } = await import("../../lib/settings");
-	const { narrators, narratorMessages } = await import("../../db/schema");
+	const { narrators, narratorMessages, narratorMessageRefs, narratorToolCalls } = await import(
+		"../../db/schema"
+	);
 	const { narratorService } = await import("../narrator-service");
 	const realCreateSubagent = narratorService.createSubagent;
 	const creationInputs: Parameters<typeof realCreateSubagent>[0][] = [];
@@ -104,16 +108,18 @@ if (process.env[CHILD_ENV] !== "1") {
 		creationInputs.push(input);
 		return realCreateSubagent.call(narratorService, input);
 	});
-	const { runSubagent, startContinuedSubagent, waitForBackgroundTask } = await import(
-		"../subagent-runner"
-	);
+	const { runSubagent } = await import("../subagent-runner");
+	const session = await import("../narrator-session");
+	const { getExecutionOwner } = await import("../agent-runtime/ownership");
+	const { hasNarratorAdmissionWork } = await import("../narrator-session-state");
+	const { backgroundTaskService } = await import("../background-task-service");
 	const { upsertEncodedTrait, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX } = await import(
 		"../../lib/narrator-custom-traits"
 	);
 	const encodeSubagentModelsTrait = (pools: Record<string, unknown[]>) =>
 		upsertEncodedTrait([], SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, { version: 1, pools })[0];
 	const { clearAliasRegistry } = await import("../subagent-alias");
-	const { activeSubagentSettings } = await import("../narrator-session-state");
+	const { activeNarrators } = await import("../narrator-session-state");
 	const MODEL = "anthropic:claude-sonnet-4-20250514";
 	const PARENT = "reasoning-effort-parent";
 	const TOOL = "reasoning-effort-agent-tool";
@@ -163,10 +169,60 @@ if (process.env[CHILD_ENV] !== "1") {
 		});
 	}
 
+	/** The real persisted Agent attempt a delegation is created by and delivers into. */
+	async function agentCall() {
+		const now = new Date().toISOString();
+		await db.insert(narratorMessages).values({
+			id: "reasoning-effort-agent-message",
+			narratorId: PARENT,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: TOOL, name: "Agent", input: {} }],
+			createdAt: now,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: "reasoning-effort-agent-ref",
+			narratorId: PARENT,
+			messageId: "reasoning-effort-agent-message",
+			seq: 1,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "reasoning-effort-agent-row",
+			narratorId: PARENT,
+			messageId: "reasoning-effort-agent-message",
+			toolUseId: TOOL,
+			toolName: "Agent",
+			inputJson: {},
+			executionIdentityVersion: 1,
+			executionAttempt: 1,
+			executionStartedAt: now,
+			status: "running",
+			createdAt: now,
+		});
+		return { toolCallId: "reasoning-effort-agent-row", attempt: 1 };
+	}
+
+	/**
+	 * Run the existing session again through the ordinary input entry every session
+	 * uses, and wait until that run has ended.
+	 */
+	async function continueChild(childId: string, prompt: string) {
+		const runs = () => configs.filter((config) => config.narratorId === childId).length;
+		const before = runs();
+		await session.sendMessage(childId, prompt);
+		const deadline = Date.now() + 3_000;
+		while (
+			(runs() === before || getExecutionOwner(childId) || hasNarratorAdmissionWork(childId)) &&
+			Date.now() < deadline
+		)
+			await Bun.sleep(5);
+		expect(runs()).toBe(before + 1);
+	}
+
 	async function run(effort?: ReasoningEffort, background = false, model: string | null = MODEL) {
 		const result = await runSubagent({
 			parentNarratorId: PARENT,
 			toolUseId: TOOL,
+			toolCallBinding: await agentCall(),
 			subagentType: "general",
 			prompt: "Return an isolated test result without tools.",
 			cwd: process.env.HOME as string,
@@ -185,9 +241,9 @@ if (process.env[CHILD_ENV] !== "1") {
 		const child = rows[0];
 		if (background) {
 			expect(result).toContain("background");
-			const completion = await waitForBackgroundTask(child.id, 3_000);
+			const completion = await backgroundTaskService.waitForCompletion(child.id, 3_000);
 			expect(completion.status).toBe("completed");
-			expect(completion.result).toContain("isolated model result");
+			expect(completion.output).toContain("isolated model result");
 		} else {
 			expect(result).toContain("isolated model result");
 		}
@@ -211,17 +267,15 @@ if (process.env[CHILD_ENV] !== "1") {
 			model: MODEL,
 			reasoningEffort: effective,
 		});
+		// Every run announces the destination's card once, with what that run uses.
 		const starts = broadcasts.filter(({ event }) => event.type === "subagent_started");
 		expect(starts).toHaveLength(runs);
-		expect(starts.at(-1)).toMatchObject({
-			target: PARENT,
-			event: {
-				subagentNarratorId: child.id,
-				toolUseId: TOOL,
-				model: MODEL,
-				reasoningEffort: effective,
-			},
-		});
+		for (const start of starts)
+			expect(start).toMatchObject({
+				target: PARENT,
+				event: { subagentNarratorId: child.id, toolUseId: TOOL, model: MODEL },
+			});
+		expect(starts.at(-1)?.event.reasoningEffort).toBe(effective);
 		const messages = await db.query.narratorMessages.findMany({
 			where: eq(narratorMessages.narratorId, child.id),
 			limit: 10,
@@ -231,7 +285,7 @@ if (process.env[CHILD_ENV] !== "1") {
 		// Background bookkeeping may insert a system message before the user row
 		// in SQLite's query order; only user messages carry this transport link.
 		for (const message of userMessages) expect(message.parentToolUseId).toBe(TOOL);
-		expect(activeSubagentSettings.has(child.id)).toBe(false);
+		expect(activeNarrators.has(child.id)).toBe(false);
 		expect(network).not.toHaveBeenCalled();
 	}
 
@@ -300,16 +354,7 @@ if (process.env[CHILD_ENV] !== "1") {
 				await assertChain(child, "high", "high");
 				settings.agent.subagentModelReasoningEfforts = { general: { [MODEL]: "none" } };
 				await db.update(narrators).set({ reasoningEffort: "low" }).where(eq(narrators.id, PARENT));
-				const continued = await startContinuedSubagent({
-					subagentId: child.id,
-					parentNarratorId: PARENT,
-					toolUseId: TOOL,
-					prompt: "Continue the same isolated task.",
-					signal: new AbortController().signal,
-					locale: "en",
-					preserveBackground: background,
-				});
-				expect(await continued.terminalCompletion).toContain("isolated model result");
+				await continueChild(child.id, "Continue the same isolated task.");
 				await assertChain(await narratorService.getById(child.id), "high", "high", 2);
 			});
 		}
@@ -333,16 +378,10 @@ if (process.env[CHILD_ENV] !== "1") {
 				// Legacy children (or an explicit manual selection) can still follow the parent.
 				await narratorService.updateModel(child.id, FOLLOW_PARENT_MODEL);
 				await narratorService.updateModel(PARENT, nextModel);
-				const continued = await startContinuedSubagent({
-					subagentId: child.id,
-					parentNarratorId: PARENT,
-					toolUseId: TOOL,
-					prompt: "Continue with the new parent's model and its fixed pool effort.",
-					signal: new AbortController().signal,
-					locale: "en",
-					preserveBackground: background,
-				});
-				expect(await continued.terminalCompletion).toContain("isolated model result");
+				await continueChild(
+					child.id,
+					"Continue with the new parent's model and its fixed pool effort.",
+				);
 				const childConfigs = configs.filter((config) => config.narratorId === child.id);
 				expect(childConfigs).toHaveLength(2);
 				expect(childConfigs.at(-1)?.model).toBe(nextModel);
@@ -350,17 +389,31 @@ if (process.env[CHILD_ENV] !== "1") {
 				const starts = broadcasts.filter(
 					({ event }) => event.type === "subagent_started" && event.subagentNarratorId === child.id,
 				);
+				// Created once, then re-announced by the continued run with its new model.
 				expect(starts).toHaveLength(2);
 				expect(starts[0]?.event).toMatchObject({
 					model: MODEL,
 					reasoningEffort: "high",
 				});
-				expect(starts.at(-1)?.event).toMatchObject({
-					model: FOLLOW_PARENT_MODEL,
+				expect(starts[1]).toMatchObject({
+					target: PARENT,
+					event: {
+						model: FOLLOW_PARENT_MODEL,
+						reasoningEffort: "none",
+						modelInheritance: { model: nextModel },
+					},
+				});
+				// The following child's card learns the newly resolved model and fixed effort
+				// from the session's own runtime-model update.
+				const settingsUpdates = broadcasts.filter(
+					({ target, event }) => target === child.id && event.type === "model_settings_changed",
+				);
+				expect(settingsUpdates.at(-1)?.event).toMatchObject({
+					model: nextModel,
 					reasoningEffort: "none",
 				});
 				expect((await narratorService.getById(child.id)).model).toBe(FOLLOW_PARENT_MODEL);
-				expect(activeSubagentSettings.has(child.id)).toBe(false);
+				expect(activeNarrators.has(child.id)).toBe(false);
 				expect(network).not.toHaveBeenCalled();
 			});
 		}
@@ -371,15 +424,7 @@ if (process.env[CHILD_ENV] !== "1") {
 			await assertChain(child, null, "low");
 			settings.agent.defaultReasoningEffort = "xhigh";
 			settings.agent.subagentModelReasoningEfforts = { general: { [MODEL]: "none" } };
-			const continued = await startContinuedSubagent({
-				subagentId: child.id,
-				parentNarratorId: PARENT,
-				toolUseId: TOOL,
-				prompt: "Continue with the current global default.",
-				signal: new AbortController().signal,
-				locale: "en",
-			});
-			expect(await continued.terminalCompletion).toContain("isolated model result");
+			await continueChild(child.id, "Continue with the current global default.");
 			await assertChain(await narratorService.getById(child.id), null, "xhigh", 2);
 		});
 	});

@@ -270,7 +270,7 @@ A 回退 102，目标为 v2：B 的 101 自然保留，B 的 103 会被覆盖。
 - Await、查看结果、只读 ContextAsk 本身不产生新委派：仅选中这些等待/查看消息，不撤销发生在范围外的原始调用。后台子代理属于发起它的调用，不按完成通知出现在哪条消息里归属。
 - 调用失败、取消或缺少最终回复，不抹去已记录的 Edit/Write。旧数据缺少某条委派关联时，只报告该来源的覆盖缺口，不能使整个主代理回退不可用。
 
-现有 [server/services/subagent-runner.ts](../server/services/subagent-runner.ts) 已记录初始 `originToolCallId`；[server/services/subagent-resume.ts](../server/services/subagent-resume.ts) 和 [server/services/agent-communication.ts](../server/services/agent-communication.ts) 的继续执行/输入投递需要补齐每次执行段关联。不能沿用当前选择器“找到子代理后选择它的全部历史”的语义。
+现有 [server/services/subagent-runner.ts](../server/services/subagent-runner.ts) 已记录初始 `originToolCallId`；[server/services/agent-runtime/run.ts](../server/services/agent-runtime/run.ts)（原 `subagent-resume.ts` 已合并于此）和 [server/services/agent-communication.ts](../server/services/agent-communication.ts) 的继续执行/输入投递需要补齐每次执行段关联。不能沿用当前选择器“找到子代理后选择它的全部历史”的语义。
 
 #### 仍在运行的子代理：只撤销选中的委派，不冻结整个团队
 

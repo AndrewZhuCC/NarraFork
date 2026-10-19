@@ -313,7 +313,13 @@ describe("request-local narrator loading", () => {
 			total: queries.length,
 			aggregateParentReads: scopeQueries.length,
 		});
-		expect(queries.some((query) => query.includes('"variant", "message_version"'))).toBe(true);
+		// One narrow metadata read: the run registration (own-turn placement) and version.
+		expect(
+			queries.some(
+				(query) =>
+					query.includes('"runtime_registration_json"') && query.includes('"message_version"'),
+			),
+		).toBe(true);
 		expect(
 			queries
 				.filter((query) => query.includes('"creator"'))

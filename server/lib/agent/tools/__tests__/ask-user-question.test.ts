@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { isRuntimeToolAllowed, resolveRuntimePolicy } from "@server/services/agent-runtime/policy";
+import {
+	compileDelegationPolicy,
+	isRuntimeToolAllowed,
+	resolveRuntimePolicy,
+} from "@server/services/agent-runtime/policy";
 import {
 	projectAskUserQuestionInput,
 	projectAskUserQuestionMessagesForModel,
@@ -31,7 +35,7 @@ describe("Question lifecycle capability", () => {
 		for (const action of ["get", "list", "resolve", "withdraw"])
 			expect(questionTool.parameters.safeParse({ action }).success).toBe(true);
 		for (const subagentType of ["general", "explore", "plan", "review", "search"]) {
-			const policy = resolveRuntimePolicy({ variant: "subagent", subagentType });
+			const policy = resolveRuntimePolicy([compileDelegationPolicy({ template: subagentType })]);
 			expect(isRuntimeToolAllowed(policy, "Question")).toBe(true);
 			expect(isRuntimeToolAllowed(policy, "AskUserQuestion")).toBe(false);
 		}

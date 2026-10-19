@@ -1,10 +1,14 @@
 /**
  * Layered trait resolution.
  *
- * Traits used to live only on a narrator. They now resolve across three layers,
+ * Traits used to live only on a narrator. They now resolve across four layers,
  * lowest priority first:
  *
- *   user  →  project  →  narrator
+ *   user  →  project  →  source  →  narrator
+ *
+ * `source` is the effective traits of the narrator registered as this one's policy
+ * source (any narrator, not necessarily a parent). Its restrictions and grants are
+ * boundaries for the narrator above it, so they are always treated as enforced.
  *
  * A layer that omits a trait inherits it. A layer that declares one may override
  * it, but *how* an override composes depends on what the trait means — which is
@@ -25,7 +29,7 @@
  * represented separately instead of being collapsed into one strength.
  */
 
-export const TRAIT_LAYERS = ["user", "project", "narrator"] as const;
+export const TRAIT_LAYERS = ["user", "project", "source", "narrator"] as const;
 export type TraitLayer = (typeof TRAIT_LAYERS)[number];
 
 export type TraitMergeKind = "restriction" | "grant" | "preference";

@@ -83,6 +83,8 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 			{ name: "previous_permission_mode", type: "TEXT" },
 			{ name: "plan_file_id", type: "TEXT" },
 			{ name: "context_project_id", type: "TEXT" },
+			{ name: "runtime_registration_json", type: "TEXT" },
+			{ name: "policy_source_narrator_id", type: "TEXT" },
 		],
 	},
 	{
@@ -245,7 +247,9 @@ CREATE TABLE IF NOT EXISTS narrators (
 	context_tools_chars INTEGER NOT NULL DEFAULT 0,
 	context_char_revision INTEGER NOT NULL DEFAULT 0,
 	updated_at TEXT NOT NULL,
-	context_project_id TEXT
+	context_project_id TEXT,
+	runtime_registration_json TEXT,
+	policy_source_narrator_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS narrator_messages (

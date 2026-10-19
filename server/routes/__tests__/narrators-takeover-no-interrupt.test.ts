@@ -12,11 +12,13 @@
  * What is pinned is the ABSENCE of an abort, which no response body can show
  * (`{takenOver: true}` either way) and which no status check can show either: the
  * subagent stays `working` in both designs, and the takeover badge is written in
- * both. The observable difference is the AbortController the route was handed —
- * hence the assertion is on the signal, plus the hard-interrupt marker so a
- * re-introduced abort cannot sneak back as a "soft" one.
+ * both. The observable difference is the run's cancellation and the session's live
+ * turn controller — hence the assertions are on those signals.
+ *
+ * The run is driven by the one run service for every session; a delegated session is
+ * a session whose run registered a result destination (`deliverTo`).
  */
-import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,14 +38,17 @@ const { narrators, users } = await import("../../db/schema");
 const { eq } = await import("drizzle-orm");
 const { generateId } = await import("../../lib/id");
 const { parseSubstatus } = await import("../../lib/narrator-utils");
+const { activeNarrators } = await import("../../services/narrator-session-state");
 const {
-	clearTakenOver,
-	consumeForegroundSubagentHardInterrupt,
-	getBackgroundAbortControllers,
-	getForegroundAbortControllers,
-	isBackgroundTakenOver,
-	isTakenOver,
-} = await import("../../services/narrator-subagent");
+	getExecutionOwner,
+	getRunHold,
+	isRunHeldForDisplay,
+	setRunControl,
+	setRunHold,
+	tryClaimExecution,
+} = await import("../../services/agent-runtime/ownership");
+type RunControl = import("../../services/agent-runtime/ownership").RunControl;
+const isTakenOver = isRunHeldForDisplay;
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -78,18 +83,32 @@ function takeover(id: string) {
 	return app().request(`http://localhost/narrators/${id}/takeover`, { method: "POST" });
 }
 
-/** Stand in for a running foreground subagent turn. */
-function registerForegroundTurn(id: string): AbortController {
-	const controller = new AbortController();
-	getForegroundAbortControllers().set(id, controller);
-	return controller;
+function stopTakeover(id: string) {
+	return app().request(`http://localhost/narrators/${id}/stop-takeover`, { method: "POST" });
 }
 
-/** Stand in for a running background subagent turn. */
-function registerBackgroundTurn(id: string): AbortController {
-	const controller = new AbortController();
-	getBackgroundAbortControllers().set(id, controller);
-	return controller;
+/**
+ * Stand in for a run of this session in flight: the run service's registry entry
+ * (owner + run control) and the session's live turn controller.
+ */
+function registerRun(id: string, parked = false) {
+	const owner = tryClaimExecution(id, "run");
+	if (!owner) throw new Error("expected a free execution slot");
+	const terminal =
+		Promise.withResolvers<import("../../services/agent-runtime/ownership").RunResult>();
+	const wakes: string[] = [];
+	const run: RunControl = {
+		startedAt: Date.now(),
+		cancel: new AbortController(),
+		timedOut: false,
+		terminal: terminal.promise,
+		deliverTo: { narratorId: parentId, toolUseId: "origin-tool" },
+		...(parked ? { wake: (reason) => void wakes.push(reason) } : {}),
+	};
+	setRunControl(owner, run);
+	const turn = new AbortController();
+	activeNarrators.set(id, { narratorId: id, alive: true, abortController: turn } as never);
+	return { owner, run, turn, wakes };
 }
 
 async function setSubagentRow(values: Record<string, unknown>): Promise<void> {
@@ -134,6 +153,13 @@ beforeAll(async () => {
 			// A subagent holds no access state of its own: the route gate judges it by
 			// this root. Omitting it makes every request a 404 before the handler runs.
 			aclRootNarratorId: parentId,
+			runtimeRegistrationJson: {
+				version: 1,
+				run: {
+					logicalRunId: "takeover-run",
+					deliverTo: { narratorId: parentId, toolUseId: "origin-tool" },
+				},
+			},
 			status: "working",
 			createdAt: now,
 			updatedAt: now,
@@ -142,10 +168,9 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
-	getForegroundAbortControllers().clear();
-	getBackgroundAbortControllers().clear();
-	consumeForegroundSubagentHardInterrupt(subagentId);
-	clearTakenOver(subagentId);
+	setRunHold(subagentId, undefined);
+	getExecutionOwner(subagentId)?.release();
+	activeNarrators.delete(subagentId);
 	await setSubagentRow({
 		status: "working",
 		substatus: "[]",
@@ -154,151 +179,90 @@ afterEach(async () => {
 	});
 });
 
-describe("taking over a foreground subagent", () => {
+describe("taking over a running delegated session", () => {
 	test("leaves the running turn untouched and records the hold", async () => {
-		const controller = registerForegroundTurn(subagentId);
+		const { run, turn } = registerRun(subagentId);
 
 		const res = await takeover(subagentId);
 
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ takenOver: true });
 		// The whole point: the turn keeps running to its natural end.
-		expect(controller.signal.aborted).toBe(false);
-		expect(consumeForegroundSubagentHardInterrupt(subagentId)).toBe(false);
-		// The hold is recorded, so the runner's post-turn branch will park the
-		// subagent instead of handing the result to the blocked parent.
+		expect(turn.signal.aborted).toBe(false);
+		expect(run.cancel.signal.aborted).toBe(false);
+		// The hold is recorded, so the run parks at its turn end instead of delivering.
 		expect(isTakenOver(subagentId)).toBe(true);
-		expect(isBackgroundTakenOver(subagentId)).toBe(false);
 	});
 
 	test("shows the badge immediately while the subagent is still working", async () => {
-		registerForegroundTurn(subagentId);
+		registerRun(subagentId);
 
 		await takeover(subagentId);
 
 		const row = await readSubagent();
 		// Status is deliberately NOT moved to idle: the subagent really is mid-turn.
-		// Only the tag is added, so the page and the parent's card can say "taken
-		// over" during a turn the user has not stopped.
 		expect(row?.status).toBe("working");
 		expect(parseSubstatus(row?.substatus)).toContain("taken_over");
 	});
-});
 
-describe("taking over a background subagent", () => {
-	test("leaves the running task alive and remembers it was background", async () => {
+	test("a detached (background) run stays alive under the same hold", async () => {
 		await setSubagentRow({ isBackground: true, backgroundStatus: "running" });
-		const controller = registerBackgroundTurn(subagentId);
+		const { run, turn } = registerRun(subagentId);
 
 		const res = await takeover(subagentId);
 
 		expect(res.status).toBe(200);
-		expect(controller.signal.aborted).toBe(false);
-		// The background flavour must be remembered: the parent holds a
-		// background_task_id rather than a blocked tool call, so stop-takeover has to
-		// finalize it as a background completion.
-		expect(isBackgroundTakenOver(subagentId)).toBe(true);
+		expect(turn.signal.aborted).toBe(false);
+		expect(run.cancel.signal.aborted).toBe(false);
+		// One hold for every run: where the result goes is the run's registered fact.
+		expect(isTakenOver(subagentId)).toBe(true);
 	});
 });
 
-describe("releasing a background takeover after switching to a foreground runner", () => {
-	test("records the release for the current foreground driver, not the former background driver", async () => {
-		const { markTakenOver, isPendingStopTakeover, consumePendingBackgroundFinalize } = await import(
-			"../../services/narrator-subagent"
-		);
-		markTakenOver(subagentId, { background: true });
-		registerForegroundTurn(subagentId);
-		const response = await app().request(`http://localhost/narrators/${subagentId}/stop-takeover`, {
-			method: "POST",
-		});
+describe("releasing a hold", () => {
+	test("while a turn is still running: deferred to that run's own terminal", async () => {
+		const { run, wakes } = registerRun(subagentId);
+		setRunHold(subagentId, { released: false });
+
+		const response = await stopTakeover(subagentId);
+
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ stopped: true, deferred: true });
-		expect(isPendingStopTakeover(subagentId)).toBe(true);
-		expect(consumePendingBackgroundFinalize(subagentId)).toBe(false);
+		// The run delivers once when it ends; nothing is delivered from the route.
+		expect(getRunHold(subagentId)?.released).toBe(true);
+		expect(wakes).toEqual([]);
+		expect(run.cancel.signal.aborted).toBe(false);
 	});
 
-	test("releases the suspended runner instead of bypassing its terminal completion", async () => {
-		const { markTakenOver, waitForManualOverride, isManualOverride } = await import(
-			"../../services/narrator-subagent"
-		);
-		await setSubagentRow({
-			status: "idle",
-			isBackground: false,
-			substatus: JSON.stringify(["taken_over"]),
-		});
-		markTakenOver(subagentId, { background: true });
-		// Suspension retains the foreground runner's controller until finalization.
-		registerForegroundTurn(subagentId);
-		const controller = new AbortController();
-		const completion = waitForManualOverride(
-			subagentId,
-			controller.signal,
-			parentId,
-			"origin-tool",
-		);
-		try {
-			const response = await app().request(
-				`http://localhost/narrators/${subagentId}/stop-takeover`,
-				{ method: "POST" },
-			);
-			expect(response.status).toBe(200);
-			expect(await response.json()).toEqual({ stopped: true, deferred: false });
-			expect(isManualOverride(subagentId)).toBe(false);
-			expect(await completion).toMatchObject({ action: "finish", hasError: false });
-		} finally {
-			controller.abort();
-			await completion;
-		}
-	});
-});
+	test("while the run is parked: wakes the same run to deliver its result", async () => {
+		await setSubagentRow({ status: "idle", substatus: JSON.stringify(["taken_over"]) });
+		const { owner, run, wakes } = registerRun(subagentId, true);
+		setRunHold(subagentId, { released: false });
 
-describe("resuming while releasing a suspended takeover", () => {
-	test("defers to the resumed turn when it consumes the wait during the result lookup", async () => {
-		const { markTakenOver, waitForManualOverride, resumeManualOverride, isPendingStopTakeover } =
-			await import("../../services/narrator-subagent");
-		const session = await import("../../services/narrator-session");
-		markTakenOver(subagentId);
-		registerForegroundTurn(subagentId);
-		const controller = new AbortController();
-		const completion = waitForManualOverride(
-			subagentId,
-			controller.signal,
-			parentId,
-			"origin-tool",
-		);
-		const lookup = spyOn(session, "getSubagentFinalText").mockImplementationOnce(async () => {
-			expect(
-				resumeManualOverride(subagentId, {
-					prompt: "continue",
-					history: [],
-					trailingToolResults: [],
-				}),
-			).toBe(true);
-			return "previous result";
-		});
-		try {
-			const response = await app().request(
-				`http://localhost/narrators/${subagentId}/stop-takeover`,
-				{ method: "POST" },
-			);
-			expect(lookup).toHaveBeenCalledTimes(1);
-			expect(response.status).toBe(200);
-			expect(await response.json()).toEqual({ stopped: true, deferred: true });
-			expect(isPendingStopTakeover(subagentId)).toBe(true);
-			expect(isTakenOver(subagentId)).toBe(true);
-			expect(await completion).toMatchObject({ action: "resume", prompt: "continue" });
-		} finally {
-			lookup.mockRestore();
-			controller.abort();
-			await completion;
-		}
+		const response = await stopTakeover(subagentId);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ stopped: true, deferred: false });
+		expect(wakes).toEqual(["release"]);
+		expect(isTakenOver(subagentId)).toBe(false);
+		// Delivery is not committed by this stub waiter. Keep the retryable hold fact
+		// until the real finalizer commits, even though its takeover badge is off.
+		expect(getRunHold(subagentId)?.released).toBe(true);
+		// Same owner and run: release neither restarts nor re-times the run.
+		expect(getExecutionOwner(subagentId)).toBe(owner);
+		expect(run.cancel.signal.aborted).toBe(false);
+	});
+
+	test("refuses a session that is not held", async () => {
+		registerRun(subagentId);
+		const response = await stopTakeover(subagentId);
+		expect(response.status).toBe(400);
 	});
 });
 
 describe("when nothing is actually running", () => {
 	test("refuses with 409 rather than recording a hold nobody will honour", async () => {
-		// working in the DB, but no engine owns it: a foreground subagent between
-		// turns, or a zombie row left by a crashed loop.
+		// working in the DB, but no run owns it: between passes, or a zombie row.
 		const res = await takeover(subagentId);
 
 		expect(res.status).toBe(409);
@@ -314,5 +278,10 @@ describe("when nothing is actually running", () => {
 
 		expect(res.status).toBe(400);
 		expect(isTakenOver(subagentId)).toBe(false);
+	});
+
+	test("refuses a session whose run delivers nowhere", async () => {
+		const res = await takeover(parentId);
+		expect(res.status).toBe(400);
 	});
 });

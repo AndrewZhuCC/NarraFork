@@ -1,28 +1,19 @@
 /**
- * injection-wake-dispatch.test.ts — which ENGINE a `wakeIfIdle` injection starts.
+ * injection-wake-dispatch.test.ts — how a `wakeIfIdle` injection starts a turn.
  *
  * `startInjectionContinuationIfPossible` is the wake half of `deliverInjection`'s
- * `schedule: "wakeIfIdle"`, and it ran `runAgentLoop` unconditionally. For a primary
- * narrator that is correct and is what the other continuation entries do. For a
- * SUBAGENT it is not merely a different path — it bypasses everything that makes a
- * subagent run legitimate: the resume lock, the origin `tool_use` id, and the
- * conclusion publication that writes the result back into the parent's still-open
- * Agent tool call. `sendMessage` / `continueNarrator` / `retryLastMessage` all refuse a
- * subagent outright for that reason; this entry had no such guard, and
- * `async_question` already reaches it with `wakeIfIdle` whenever its target is idle.
+ * `schedule: "wakeIfIdle"`. There is one run entry for every session: a delegated
+ * session is woken exactly like an ordinary one, and its result still reaches the tool
+ * call its run registered (the registration, not the wake path, carries that).
  *
- * The failure mode is why this is tested at the dispatch rather than at the outcome:
- * running a subagent through the primary loop does not throw. It produces a turn whose
- * result never reaches the parent's tool call, which looks like "the subagent answered
- * but the parent never noticed" — indistinguishable from a dozen other things.
- *
- * So the assertions are about WHO is asked to run the turn, and about the refusals
- * being refusals rather than exceptions: the injected row is already durable by then,
+ * The assertions are about WHAT the one entry is asked to run — no new relationships,
+ * empty text because the row is already in history, no borrowed principal — and about
+ * refusals being refusals rather than exceptions: the injected row is already durable,
  * so "not started" costs immediacy while a throw would fail the producer that was only
  * trying to notify somebody.
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
@@ -36,38 +27,40 @@ mock.module("../../websocket/narrator-ws", () => ({
 }));
 
 /**
- * Stand in for the resume machinery. The real `resumeSubagent` pulls in the whole
- * subagent runner; what matters here is only that the dispatch reaches it with the
- * right intent and actor — its own admission rules are tested in `subagent-resume`.
+ * Stand in for the run entry. Every wake — whatever created the session — starts its
+ * turn through `startNarratorRun`; what matters here is only that the dispatch reaches
+ * it with the right request and execution principal.
  */
-interface ResumeCall {
-	subagentId: string;
-	intent: string;
-	actor: string;
-	prompt?: string;
+interface RunCall {
+	narratorId: string;
+	text: string;
+	binding: unknown;
+	principal: unknown;
+	sessionUser: string | null | undefined;
 }
-const resumeCalls: ResumeCall[] = [];
-const resumePrincipals: unknown[] = [];
-let resumeStarted = true;
-let resumeThrows: Error | null = null;
-const activeResumeRuns = new Set<string>();
-const realSubagentResume = { ...(await import("../subagent-resume")) };
-mock.module("../subagent-resume", () => ({
-	...realSubagentResume,
-	hasActiveSubagentResumeRun: (id: string) => activeResumeRuns.has(id),
-	// biome-ignore lint/suspicious/noExplicitAny: only the asserted fields are used
-	resumeSubagent: async (input: any) => {
-		resumePrincipals.push(input.executionPrincipal);
-		resumeCalls.push({
-			subagentId: input.subagentId,
-			intent: input.intent,
-			actor: input.actor,
-			prompt: input.prompt,
-		});
-		if (resumeThrows) throw resumeThrows;
-		return { started: resumeStarted, resumedSuspendedRunner: false, originToolUseId: "toolu_x" };
-	},
-}));
+const runCalls: RunCall[] = [];
+let runThrows: Error | null = null;
+const runModule = await import("../agent-runtime/run");
+const idle = Promise.resolve({
+	started: true,
+	output: "",
+	finalText: "",
+	hasError: false,
+	interrupted: false,
+	timedOut: false,
+});
+spyOn(runModule, "startNarratorRun").mockImplementation(async (request) => {
+	runCalls.push({
+		narratorId: request.narratorId,
+		text: request.text,
+		binding: request.binding,
+		principal: request.principal,
+		sessionUser: request.active?._currentUserId,
+	});
+	if (runThrows) throw runThrows;
+	return { started: true, foreground: idle, terminal: idle, completion: idle };
+});
+const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
 
 const { startInjectionContinuationIfPossible } = await import("../narrator-session");
 // Preserve collaborator initialization order without unused/shadowed local bindings.
@@ -75,6 +68,7 @@ await import("../parent-inbound-queue");
 await import("../bg-completion-queue");
 await import("../agent-communication");
 await import("../subagent-runner");
+const { activeNarrators } = await import("../narrator-session-state");
 
 const now = "2026-07-28T10:00:00.000Z";
 const PARENT_ID = "wake-parent";
@@ -82,24 +76,41 @@ const SUB_ID = "wake-sub";
 
 beforeEach(() => {
 	cleanDb(sqlite);
-	resumeCalls.length = 0;
-	resumePrincipals.length = 0;
-	activeResumeRuns.clear();
-	resumeStarted = true;
-	resumeThrows = null;
+	runCalls.length = 0;
+	runThrows = null;
 });
 afterEach(() => {
+	for (const id of [PARENT_ID, SUB_ID]) {
+		getExecutionOwner(id)?.release();
+		activeNarrators.delete(id);
+	}
 	cleanDb(sqlite);
 });
+afterAll(() => mock.restore());
+
+async function waitUntil(predicate: () => boolean) {
+	const deadline = Date.now() + 2_000;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error("Timed out waiting for the wake dispatch");
+		await new Promise((resolve) => setTimeout(resolve, 2));
+	}
+}
 
 function seedNarrator(
 	id: string,
-	options: { variant?: string; parent?: string; status?: string; traits?: string } = {},
+	options: {
+		variant?: string;
+		parent?: string;
+		status?: string;
+		traits?: string;
+		/** The session's run delivers its result to this narrator's tool call. */
+		deliverTo?: string;
+	} = {},
 ) {
 	sqlite
 		.prepare(
-			`INSERT INTO narrators (id, variant, parent_narrator_id, status, traits, created_at, updated_at, last_stop_reason)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, 'normal')`,
+			`INSERT INTO narrators (id, variant, parent_narrator_id, status, traits, cwd, runtime_registration_json, created_at, updated_at, last_stop_reason)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal')`,
 		)
 		.run(
 			id,
@@ -107,6 +118,16 @@ function seedNarrator(
 			options.parent ?? null,
 			options.status ?? "idle",
 			options.traits ?? "[]",
+			process.env.HOME ?? "/",
+			options.deliverTo
+				? JSON.stringify({
+						version: 1,
+						run: {
+							logicalRunId: `${id}-run`,
+							deliverTo: { narratorId: options.deliverTo, toolUseId: "toolu_x" },
+						},
+					})
+				: null,
 			now,
 			now,
 		);
@@ -118,17 +139,10 @@ describe("parent injection initiating user", () => {
 			"../parent-injection-queue"
 		);
 		const { createMailboxStore } = await import("../agent-runtime/mailbox");
-		const { announceResumedBackgroundTask } = await import("../subagent-runner");
 		seedNarrator(PARENT_ID, { status: "working" });
 		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
-		await announceResumedBackgroundTask({
-			subagentId: SUB_ID,
-			parentNarratorId: PARENT_ID,
-			userId: "A",
-			status: "completed",
-			wakeParent: true,
-			locale: "en",
-		});
+		// The run finalizer attributes a detached result notice to the run's principal.
+		recordTaskNoticeUser(SUB_ID, "A");
 		const store = createMailboxStore(db);
 		store.enqueue({
 			kind: "task_notice",
@@ -191,10 +205,10 @@ describe("parent injection initiating user", () => {
 	});
 });
 
-describe("an idle SUBAGENT recipient", () => {
-	test("an async question answer persists to the child before dispatching its original resume path", async () => {
+describe("an async question answer", () => {
+	test("persists to the recipient and wakes it as the question's own principal", async () => {
 		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
+		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID, deliverTo: PARENT_ID });
 		const { narratorMessages, narratorToolCalls, users } = await import("../../db/schema");
 		const questions = await import("../narrator-question-service");
 		await db.insert(users).values({
@@ -252,14 +266,11 @@ describe("an idle SUBAGENT recipient", () => {
 		expect(answer.ok).toBe(true);
 		if (!answer.ok) throw new Error("answer failed");
 		expect(answer.record.answerMessageId).not.toBeNull();
-		expect(resumePrincipals).toEqual([{ version: 1, userId: "wake-original-user" }]);
-		expect(resumeCalls).toEqual([
-			{
-				subagentId: SUB_ID,
-				intent: "continue_tool_results",
-				actor: "parent_agent",
-				prompt: undefined,
-			},
+		await waitUntil(() => runCalls.length > 0);
+		// The run executes as the principal that asked, never as the answering user, and
+		// starts with empty text because the answer is already in history.
+		expect(runCalls).toEqual([
+			expect.objectContaining({ narratorId: SUB_ID, text: "", sessionUser: "wake-original-user" }),
 		]);
 		const row = sqlite
 			.query(
@@ -273,106 +284,119 @@ describe("an idle SUBAGENT recipient", () => {
 			content_text: expect.stringContaining("keep compatibility"),
 		});
 	});
-
-	test("is resumed rather than run through the primary loop", async () => {
-		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
-
-		const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
-
-		expect(result.started).toBe(true);
-		expect(resumeCalls).toHaveLength(1);
-		expect(resumeCalls[0].subagentId).toBe(SUB_ID);
-	});
-
-	test("uses the intent that means 'the content is already in history'", async () => {
-		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
-
-		await startInjectionContinuationIfPossible(SUB_ID, "en");
-
-		// `continue_tool_results` rebuilds history from the rows and replays trailing tool
-		// results — the resume counterpart of `runAgentLoop(active, "")`. `follow_up` would
-		// be wrong: it demands a prompt and would persist a SECOND row saying "continue",
-		// displacing the injection from the trailing position the history builders lift.
-		expect(resumeCalls[0].intent).toBe("continue_tool_results");
-		expect(resumeCalls[0].prompt).toBeUndefined();
-	});
-
-	test("is attributed to the agent side, because nobody typed this", async () => {
-		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
-
-		await startInjectionContinuationIfPossible(SUB_ID, "en");
-
-		expect(resumeCalls[0].actor).toBe("parent_agent");
-	});
-
-	test("reports not started when the resume itself declines", async () => {
-		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
-		resumeStarted = false;
-
-		const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
-		expect(result.started).toBe(false);
-	});
 });
 
-describe("a subagent that must not be woken", () => {
-	test("plan mode is respected, mirroring the primary rule", async () => {
-		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, {
-			variant: "subagent:general",
-			parent: PARENT_ID,
-			traits: JSON.stringify(["plan"]),
+/*
+ * A delegated session is an ordinary session whose run delivers to a tool call. Its
+ * wake goes through the one run entry like any other session's; the registration (not
+ * the parent link or variant) carries where the result goes. Both shapes run below.
+ */
+const shapes = [
+	{
+		name: "delegated",
+		seed: () =>
+			seedNarrator(SUB_ID, {
+				variant: "subagent:general",
+				parent: PARENT_ID,
+				deliverTo: PARENT_ID,
+			}),
+	},
+	{ name: "unrelated", seed: () => seedNarrator(SUB_ID, { deliverTo: PARENT_ID }) },
+] as const;
+
+for (const shape of shapes) {
+	describe(`an idle ${shape.name} recipient`, () => {
+		test("is woken through the one run entry and keeps its registered destination", async () => {
+			seedNarrator(PARENT_ID);
+			shape.seed();
+
+			const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
+
+			expect(result.started).toBe(true);
+			await waitUntil(() => runCalls.length > 0);
+			expect(runCalls).toHaveLength(1);
+			expect(runCalls[0].narratorId).toBe(SUB_ID);
+			// No new relationships: the run still owes its result to the registered call.
+			expect(runCalls[0].binding).toBeUndefined();
 		});
 
-		const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
-		expect(result.started).toBe(false);
-		expect(resumeCalls).toEqual([]);
-	});
+		test("starts with empty text, because the content is already in history", async () => {
+			seedNarrator(PARENT_ID);
+			shape.seed();
 
-	test("a resume already in flight is left to consume the row", async () => {
+			await startInjectionContinuationIfPossible(SUB_ID, "en");
+			await waitUntil(() => runCalls.length > 0);
+
+			// A synthetic "continue" row would displace the injection from the trailing
+			// position the history builders lift.
+			expect(runCalls[0].text).toBe("");
+		});
+
+		test("does not borrow the related session's principal, because nobody typed this", async () => {
+			seedNarrator(PARENT_ID);
+			shape.seed();
+			activeNarrators.set(PARENT_ID, { _currentUserId: "parent-user" } as never);
+
+			await startInjectionContinuationIfPossible(SUB_ID, "en");
+			await waitUntil(() => runCalls.length > 0);
+
+			expect(runCalls[0].principal).toBeUndefined();
+			expect(runCalls[0].sessionUser).not.toBe("parent-user");
+		});
+
+		test("a run already owning the session is left to consume the row", async () => {
+			seedNarrator(PARENT_ID);
+			shape.seed();
+			tryClaimExecution(SUB_ID, "run");
+
+			const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
+			expect(result.started).toBe(false);
+			// Not merely "no second run": asking for one would race the current owner.
+			expect(runCalls).toEqual([]);
+		});
+
+		test("plan mode is respected, the same rule for every session", async () => {
+			seedNarrator(PARENT_ID);
+			shape.seed();
+			sqlite.run("UPDATE narrators SET traits = ? WHERE id = ?", [
+				JSON.stringify(["plan"]),
+				SUB_ID,
+			]);
+
+			const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
+			expect(result.started).toBe(false);
+			expect(runCalls).toEqual([]);
+		});
+
+		test("a run start that throws is reported, never propagated to the producer", async () => {
+			// The row is already persisted when this runs. A producer notifying a session
+			// must not fail because the session could not be woken.
+			seedNarrator(PARENT_ID);
+			shape.seed();
+			runThrows = new Error("Archived narrators cannot run");
+
+			await expect(startInjectionContinuationIfPossible(SUB_ID, "en")).resolves.toBeDefined();
+			await waitUntil(() => runCalls.length > 0);
+			await waitUntil(() =>
+				String(
+					(
+						sqlite.query("SELECT substatus FROM narrators WHERE id = ?").get(SUB_ID) as {
+							substatus: string | null;
+						} | null
+					)?.substatus,
+				).includes("error"),
+			);
+		});
+	});
+}
+
+describe("a session with no relationship at all", () => {
+	test("is woken through the same entry", async () => {
 		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
-		activeResumeRuns.add(SUB_ID);
 
-		const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
-		expect(result.started).toBe(false);
-		// Not merely "no second run": asking for one would be the race `resumeSubagent`
-		// rejects, surfacing as a ValidationError in a producer that only sent a notice.
-		expect(resumeCalls).toEqual([]);
-	});
-
-	test("a parentless subagent is not resumable, and says so instead of throwing", async () => {
-		seedNarrator(SUB_ID, { variant: "subagent:general" });
-
-		const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
-		expect(result.started).toBe(false);
-		expect(resumeCalls).toEqual([]);
-	});
-
-	test("a resume that throws is reported as not started, never propagated", async () => {
-		// The row is already persisted when this runs. A producer notifying a subagent
-		// must not fail because the subagent could not be woken — the content simply
-		// waits for the next request.
-		seedNarrator(PARENT_ID);
-		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
-		resumeThrows = new Error("Archived subagents cannot be resumed");
-
-		const result = await startInjectionContinuationIfPossible(SUB_ID, "en");
-		expect(result.started).toBe(false);
-	});
-});
-
-describe("a primary narrator recipient", () => {
-	test("never reaches the resume path", async () => {
-		seedNarrator(PARENT_ID);
-
-		// Whether the loop actually starts depends on runtime state this test does not
-		// build; what must hold is that the subagent engine is not involved.
-		await startInjectionContinuationIfPossible(PARENT_ID, "en").catch(() => undefined);
-
-		expect(resumeCalls).toEqual([]);
+		const result = await startInjectionContinuationIfPossible(PARENT_ID, "en");
+		expect(result.started).toBe(true);
+		await waitUntil(() => runCalls.length > 0);
+		expect(runCalls[0]).toMatchObject({ narratorId: PARENT_ID, text: "" });
 	});
 });

@@ -23,24 +23,26 @@ import {
 	settlePreparedAgentReply,
 	snapshotDeliveryCoordinates,
 } from "./agent-reply-waiter";
-import { enqueueInboxAgent, inboxDelivery, wakeInboxIfEligible } from "./agent-runtime/inbox";
-import { getExecutionOwner } from "./agent-runtime/ownership";
+import { enqueueInboxAgent, wakeInboxIfEligible } from "./agent-runtime/inbox";
+import { getExecutionOwner, getRunHold } from "./agent-runtime/ownership";
 import { getRuntimePublicationService, type PublicationRun } from "./agent-runtime/publication";
+import { controlRun, wakeHeldRun } from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
+import { authorizeAgentControl } from "./narrator-control";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import {
-	assertSubagentCanAwaitAgent,
-	assertSubagentSendIsAsync,
+	assertRuntimeCanAwaitAgent,
+	assertRuntimeCanSendAwait,
 } from "./subagent-communication-policy";
-import { interruptForegroundSubagent } from "./subagent-detach";
-import { bufferSubagentUserMessage } from "./subagent-executor";
 import { agentLabelFromNarrator, resolveAgentLabel, shortAgentId } from "./subagent-label";
-import { resumeSubagent } from "./subagent-resume";
-import { waitForBackgroundTask } from "./subagent-runner";
-import { isTakenOver, TAKEN_OVER_SUBSTATUS } from "./subagent-takeover";
+
+const TAKEN_OVER_SUBSTATUS = "taken_over";
+const isTakenOver = (narratorId: string) => !!getRunHold(narratorId);
+
+import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -87,6 +89,8 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 export interface AwaitAgentInput {
 	callerNarratorId: string;
 	id: string;
+	/** Execution principal of the caller's run; the ceiling is resolved for it. */
+	userId?: string | null;
 	timeoutMs?: number;
 	signal: AbortSignal;
 	/**
@@ -1097,7 +1101,9 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
 	const scope = await getCommunicationScope(opts.callerNarratorId);
-	assertSubagentCanAwaitAgent(scope.callerIsSubagent);
+	assertRuntimeCanAwaitAgent(
+		await resolveNarratorRuntimePolicy(scope.caller.id, opts.userId ?? null),
+	);
 
 	const background = await awaitBackgroundAgentTask(opts);
 	if (background) {
@@ -1135,33 +1141,9 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			receipt,
 			target.title,
 		);
-	if (target.isBackground && target.backgroundStatus === "running") {
-		const { signal, relabel } = buildAwaitTimeoutContext(opts);
-		const waited = await waitForBackgroundTask(
-			target.id,
-			opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-			signal,
-		);
-		// Legacy background completion events have no run. Verify their result against
-		// the same narrator epoch captured BEFORE waiting, never getAgentRun afterward.
-		const latest = await narratorService.getById(target.id).catch(() => null);
-		if (
-			["completed", "failed", "cancelled", "timed_out"].includes(waited.status) &&
-			latest &&
-			target.logicalRunId === latest.logicalRunId
-		) {
-			const terminal = await readSubagentTerminal(
-				target.id,
-				scope.teamParentId,
-				latest,
-				target.status === "working" || target.status === "waiting"
-					? target.logicalRunId
-					: undefined,
-			);
-			return build(relabel(waited.status), terminal.output, terminal);
-		}
-		return build(relabel(waited.status), waited.result);
-	}
+	// Every background run is projected by a task row (creation, detach, recovery and
+	// each later run of the session), handled above; the session row alone never
+	// settles a background wait.
 	if (target.status === "working" || target.status === "waiting") {
 		// If the subagent is being taken over by the user, do not block waiting for
 		// a result that only arrives when takeover ends. Report it immediately.
@@ -1318,21 +1300,24 @@ async function sendSubagentMessageDetailedWithRun(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
 	const scope = await getCommunicationScope(input.callerNarratorId);
-	assertSubagentSendIsAsync(scope.callerIsSubagent, input.shouldAwait);
-
-	if (input.doInterrupt && scope.callerIsSubagent) {
-		throw new Error("doInterrupt is only supported from a primary narrator to its child subagents");
-	}
+	assertRuntimeCanSendAwait(
+		await resolveNarratorRuntimePolicy(scope.caller.id, input.userId ?? null),
+		input.shouldAwait,
+	);
 
 	// Resolve and authorize the WHOLE call before any reply settlement, enqueue or interrupt.
+	// Reaching a target (step 4 owns that rule) is not control: an interrupt additionally
+	// needs the target's registered controller grant for "steer".
 	const targets = await resolveSendTargets(input, scope);
-	if (
-		input.doInterrupt &&
-		targets.some(
-			(target) => target.parentNarratorId !== scope.caller.id || !isSubagentVariant(target.variant),
-		)
-	)
-		throw new Error("doInterrupt is only supported for this narrator's direct child subagents");
+	if (input.doInterrupt) {
+		for (const target of targets)
+			await authorizeAgentControl({
+				callerNarratorId: scope.caller.id,
+				targetNarratorId: target.id,
+				action: "steer",
+				userId: input.userId ?? null,
+			});
+	}
 	input.replyRun?.setTargetCount?.(targets.length);
 	try {
 		input.onTargetsResolved?.(targets.length);
@@ -1392,9 +1377,6 @@ async function sendSubagentMessageDetailedWithRun(
 							: "Sent to parent; queued at a safe input boundary (reading not guaranteed).",
 				);
 				continue;
-			}
-			if (input.doInterrupt && target.parentNarratorId !== input.callerNarratorId) {
-				throw new Error("doInterrupt is only supported for this narrator's direct child subagents");
 			}
 
 			const fresh = await narratorService.getById(target.id);
@@ -1469,24 +1451,28 @@ async function sendSubagentMessageDetailedWithRun(
 			let deliveryMessageId = delivery.recipientMessageId;
 
 			if (fresh.status === "working" || fresh.status === "waiting") {
-				// Same entry as direct user input: it re-wakes the target when its run ends
-				// while this message is being queued, which a bare enqueue would strand.
-				const buffered = await bufferSubagentUserMessage(fresh.id, deliveredMessage, {
-					priority: interruptTarget,
-					requestSoftStop: false,
-					delivery,
+				const enqueued = await enqueueInboxAgent(delivery, deliveredMessage, {
 					createdBy: input.userId ?? null,
 				});
-				if (!buffered.ok) {
+				if (enqueued.delivery.state === "cancelled" || enqueued.delivery.state === "failed")
 					throw new Error(
-						buffered.full ? "Target message queue is full" : "Message was not buffered",
+						`Previous delivery is ${enqueued.delivery.state}; explicit retry is required`,
 					);
-				}
+				const buffered = { duplicate: enqueued.status === "duplicate" };
+				// The run may have ended while this was being queued; the ordinary wake
+				// rechecks ownership, so a still-live run simply adopts it at its boundary.
+				if (!buffered.duplicate)
+					void wakeInboxIfEligible(fresh.id, input.locale as Locale).catch((error) =>
+						logger.warn("Queued Send wake deferred", {
+							narratorId: fresh.id,
+							error: String(error),
+						}),
+					);
 				deliveryMessageId = delivery.recipientMessageId;
 				let interruptNote = takeoverNote;
 				let interrupted: boolean | undefined;
 				if (interruptTarget && !buffered.duplicate) {
-					interrupted = interruptForegroundSubagent(fresh.id);
+					interrupted = await controlRun(fresh.id, { kind: "stop" });
 					interruptNote = interrupted
 						? " Interrupted foreground subagent."
 						: " Target is not an interruptible foreground subagent.";
@@ -1539,25 +1525,13 @@ async function sendSubagentMessageDetailedWithRun(
 				);
 			let wakeFailed = false;
 			if (accepted.delivery.state === "queued") {
-				const bgAbort = new AbortController();
+				// The ordinary wake of any idle session: a held run is woken in place, an
+				// idle session starts a run that adopts the message in order. The sender's
+				// identity is the message author only, never the recipient's principal.
 				try {
-					await resumeSubagent({
-						toolCallBinding: input.toolCallBinding,
-						bindingToolUseId: input.toolUseId,
-						bindingNarratorId: input.callerNarratorId,
-						subagentId: fresh.id,
-						intent: "follow_up",
-						actor: "parent_agent",
-						mailboxInput: true,
-						// Send never waits for the run, so the continuation is a background task:
-						// Await, Stop and TeamStatus then share the background_tasks row.
-						asBackgroundTask: true,
-						prompt: deliveredMessage,
-						delivery: inboxDelivery(accepted.delivery),
-						createdBy: input.userId ?? null,
-						signal: bgAbort.signal,
-						locale: input.locale as Locale,
-					});
+					wakeFailed =
+						!wakeHeldRun(fresh.id) &&
+						!(await wakeInboxIfEligible(fresh.id, input.locale as Locale));
 				} catch (error) {
 					wakeFailed = true;
 					logger.warn("Accepted mailbox input awaits eligible wake", {

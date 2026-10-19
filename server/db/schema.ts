@@ -935,6 +935,29 @@ export const narrators = sqliteTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): any => narrators.id, {
 			onDelete: "set null",
 		}),
+		/**
+		 * Bounded runtime relationships of this narrator: policy source, controller
+		 * grant and the current run binding (cancel source, result delivery, principal,
+		 * deadline, history boundary). Facts only — capabilities live in traits and
+		 * model/permission settings in their own columns. Validated by
+		 * `lib/validators/runtime-registration.ts`; null = nothing registered.
+		 */
+		runtimeRegistrationJson: text("runtime_registration_json", { mode: "json" }).$type<
+			import("../lib/validators/runtime-registration").RuntimeRegistration
+		>(),
+		/**
+		 * Session this narrator takes its capability ceiling, execution rules, permission
+		 * mode updates and followed model from. Any narrator may be a source; no parent/
+		 * child relationship is implied. A column (not part of the registration JSON) so
+		 * dependents are an index lookup. Removing a source first freezes its effective
+		 * ceiling into each dependent's traits (`narratorService.remove`), so the SET NULL
+		 * never widens a dependent.
+		 */
+		policySourceNarratorId: text("policy_source_narrator_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: self-module forward reference
+			(): any => narrators.id,
+			{ onDelete: "set null" },
+		),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -972,6 +995,8 @@ export const narrators = sqliteTable(
 		// Join key for the subagent -> root delegation in the readable predicate, and the
 		// FK covering index for root deletion (ON DELETE SET NULL).
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
+		// Dependents of a policy source (permission-mode propagation, deletion guard).
+		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),

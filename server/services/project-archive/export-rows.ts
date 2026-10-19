@@ -60,6 +60,7 @@ import {
 } from "./archive-writer";
 import type { ArchiveRow, ArchiveValue, ProjectArchiveMainStore } from "./main-store";
 import type { ArchiveTable } from "./manifest";
+import { projectPortableRuntimeRegistration } from "./untrusted-policy";
 
 /** Rows per main-database page. The store clamps this to its own ceiling. */
 const PAGE_SIZE = 500;
@@ -81,6 +82,7 @@ const FILTER_CHUNK = 200;
  */
 const PROJECTIONS: Partial<Record<ArchiveTable, (row: Record<string, ArchiveValue>) => void>> = {
 	narrators(row) {
+		projectPortableRuntimeRegistration(row);
 		// `plan_mode` in the archive is derived from `traits`, not copied from the main column.
 		//
 		// This preserves the pre-existing export exactly. The two agree in the main database —

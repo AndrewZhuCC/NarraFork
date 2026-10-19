@@ -1,5 +1,10 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { and, eq } from "drizzle-orm";
+/**
+ * Publication through the one run service: a run's terminal reaches the exact tool call
+ * it registered, exactly once, and nothing (notice, wake, rewritten tool result) becomes
+ * visible before the publishing transaction commits. Only the model pass is fake.
+ */
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import {
@@ -10,23 +15,56 @@ import {
 	narratorToolCalls,
 	runtimePublicationOutbox,
 } from "../../db/schema";
+import type { ProviderAdapter } from "../../lib/agent/provider";
+import { registerExternalProviderResolver } from "../../lib/agent/provider";
 import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
+import { getExecutionOwner } from "../agent-runtime/ownership";
 import { getRuntimePublicationService, runtimePublication } from "../agent-runtime/publication";
+import { listDeliveringRuns, startNarratorRun } from "../agent-runtime/run";
 import { backgroundTaskService } from "../background-task-service";
 import * as session from "../narrator-session";
-import * as executor from "../subagent-executor";
-import { resumeSubagent } from "../subagent-resume";
+import { activeNarrators } from "../narrator-session-state";
+
+const provider: ProviderAdapter = {
+	formatTools: () => [],
+	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	injectSystemPrompt: () => {},
+	chat() {
+		throw new Error("Publication test must never call a model");
+	},
+	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
+	pushUserTurn: () => {},
+	pushAssistantTurn: () => {},
+	generate: async () => "",
+	generateWithMeta: async () => ({ text: "" }),
+	generateWithHistory: async () => "",
+};
+const unregisterProvider = registerExternalProviderResolver({
+	resolve: (name) => (name === "test" ? provider : null),
+	listReadiness: () => [],
+});
 
 runtimePublication.stop();
-afterEach(() => cleanDb(sqlite));
+const created: string[] = [];
+afterEach(() => {
+	for (const id of created.splice(0)) {
+		getExecutionOwner(id)?.release();
+		activeNarrators.delete(id);
+	}
+	runtimePublication.setWake(undefined);
+	cleanDb(sqlite);
+});
+afterAll(() => unregisterProvider());
 
+/** A delegated session `child` whose run delivers to the parent's Agent call. */
 async function fixture(background: boolean) {
 	const parent = generateId(),
 		child = generateId(),
 		messageId = generateId(),
 		toolCallId = generateId(),
 		toolUseId = generateId();
+	created.push(parent, child);
 	const now = new Date().toISOString();
 	db.insert(narrators)
 		.values([
@@ -37,11 +75,13 @@ async function fixture(background: boolean) {
 				type: "subagent",
 				parentNarratorId: parent,
 				status: "idle",
-				model: "claude-sonnet-4-6",
+				model: "test:model",
+				cwd: process.env.HOME,
 				isBackground: background,
 				backgroundStatus: background ? "running" : null,
 				originToolCallId: toolCallId,
 				subagentOriginKind: "tool",
+				autoContinuationOverride: "off",
 				createdAt: now,
 				updatedAt: now,
 			},
@@ -90,72 +130,127 @@ async function fixture(background: boolean) {
 	db.insert(narratorMessageRefs)
 		.values({ id: generateId(), narratorId: child, messageId: childMessageId, seq: 1 })
 		.run();
-	const run = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
-	if (background)
-		await backgroundTaskService.createAgentTask({
-			id: child,
-			parentNarratorId: parent,
-			subagentNarratorId: child,
-			subagentType: "general",
-			toolUseId,
-		});
-	return { parent, child, toolCallId, toolUseId, run };
+	const binding = {
+		deliverTo: { narratorId: parent, toolUseId, toolCallId, attempt: 1 },
+		principal: { userId: null },
+	};
+	return { parent, child, toolCallId, toolUseId, binding };
 }
 
-describe("initial foreground publication", () => {
+/** The model pass: optionally writes one assistant reply, then reports its outcome. */
+async function fakePass(child: string, output: string, write: boolean, hasError = false) {
+	const orchestrator = await import("../agent-runtime/orchestrator");
+	return spyOn(orchestrator, "runAgentLoopUnlocked").mockImplementation(async () => {
+		db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child)).run();
+		if (write) {
+			const id = generateId();
+			db.insert(narratorMessages)
+				.values({
+					id,
+					narratorId: child,
+					role: "assistant",
+					contentText: output,
+					contentJson: [{ type: "text", text: output }],
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+			db.insert(narratorMessageRefs)
+				.values({ id: generateId(), narratorId: child, messageId: id, seq: 2 })
+				.run();
+		}
+		return { started: true, finalText: output, hasError, allowInboxWake: false };
+	});
+}
+
+const parentRows = (parent: string) =>
+	db
+		.select()
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.narratorId, parent))
+		.all();
+const toolOutput = (toolCallId: string) =>
+	db.select().from(narratorToolCalls).where(eq(narratorToolCalls.id, toolCallId)).get()?.outputJson;
+
+for (const commitFailure of [true, false])
+	test(`real Agent tool returns ${commitFailure ? "isError for infrastructure failure" : "ordinary model failure as a normal result"}`, async () => {
+		const f = await fixture(false);
+		db.update(narrators)
+			.set({
+				traits: ["standalone"],
+				model: "test:model",
+				cwd: process.cwd(),
+				autoContinuationOverride: "off",
+			})
+			.where(eq(narrators.id, f.parent))
+			.run();
+		db.update(narratorToolCalls)
+			.set({ status: "running" })
+			.where(eq(narratorToolCalls.id, f.toolCallId))
+			.run();
+		const { agentTool } = await import("../../lib/agent/tools/task");
+		const executor = await import("../narrator-executor");
+		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async ({ config }) => {
+			if (config.narratorId) created.push(config.narratorId);
+			return { finalText: "ordinary provider failure", hasError: true, shouldUpdateTitle: false };
+		});
+		const facade = getRuntimePublicationService();
+		const commit = spyOn(facade, "commitAgentTerminal");
+		if (commitFailure)
+			commit.mockRejectedValue(new Error("injected Agent terminal commit failure"));
+		try {
+			const result = await agentTool.execute(
+				{ prompt: "work", subagent_type: "general" },
+				{
+					narratorId: f.parent,
+					cwd: process.cwd(),
+					signal: new AbortController().signal,
+					locale: "en",
+					currentToolUseId: f.toolUseId,
+					toolCallBinding: { toolCallId: f.toolCallId, attempt: 1 },
+					updateExecutionLease: {
+						kind: "resumable",
+						setNarratorId: () => {},
+						transfer: () => true,
+						release: () => {},
+					},
+					requestPermission: async () => ({ behavior: "allow" }),
+				},
+			);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(commit).toHaveBeenCalledTimes(1);
+			if (commitFailure) {
+				expect(result.isError).toBe(true);
+				expect(result.output).toContain("injected Agent terminal commit failure");
+			} else {
+				expect(result.isError).toBeFalsy();
+				expect(result.output).toContain("ordinary provider failure");
+			}
+		} finally {
+			execute.mockRestore();
+			commit.mockRestore();
+		}
+	});
+
+describe("foreground publication", () => {
 	for (const { failure, executionFailure } of [
 		{ failure: false, executionFailure: false },
 		{ failure: false, executionFailure: true },
 		{ failure: true, executionFailure: true },
 	])
-		test(`commit barrier and terminal settle (failure=${failure}, executionFailure=${executionFailure})`, async () => {
+		test(`the caller resolves only after the terminal commit (failure=${failure}, executionFailure=${executionFailure})`, async () => {
 			const f = await fixture(false);
-			const { startForegroundRun, listRunningSubagentExecutions } = await import(
-				"../subagent-runner"
-			);
-			const { getExecutionOwner } = await import("../agent-runtime/ownership");
 			const { awaitAgentResultDetailed } = await import("../agent-communication");
 			const facade = getRuntimePublicationService();
 			const gate = Promise.withResolvers<void>();
 			const entered = Promise.withResolvers<void>();
-			let completions = 0,
-				wakes = 0;
-			const watch: Parameters<typeof eventBus.onAny>[0] = (event) => {
-				if (event.type === "narrator:subagent_completed" && event.narratorId === f.child)
-					completions++;
-			};
-			eventBus.onAny(watch);
+			let wakes = 0;
 			runtimePublication.setWake(() => {
 				wakes++;
 			});
 			const output = executionFailure
 				? "FOREGROUND FAILURE WITHOUT ASSISTANT"
 				: "FOREGROUND SUCCESS";
-			const execute = spyOn(executor, "executeSubagent").mockImplementation(async () => {
-				db.update(narrators).set({ status: "working" }).where(eq(narrators.id, f.child)).run();
-				if (!executionFailure) {
-					const id = generateId();
-					db.insert(narratorMessages)
-						.values({
-							id,
-							narratorId: f.child,
-							role: "assistant",
-							contentText: output,
-							contentJson: [{ type: "text", text: output }],
-							createdAt: new Date().toISOString(),
-						})
-						.run();
-					db.insert(narratorMessageRefs)
-						.values({ id: generateId(), narratorId: f.child, messageId: id, seq: 2 })
-						.run();
-				}
-				return {
-					finalText: output,
-					hasError: executionFailure,
-					allowInboxWake: false,
-					finalUserId: null,
-				};
-			});
+			const pass = await fakePass(f.child, output, !executionFailure, executionFailure);
 			const original = facade.commitAgentTerminal;
 			const commit = spyOn(facade, "commitAgentTerminal").mockImplementation(async (input) => {
 				entered.resolve();
@@ -164,45 +259,43 @@ describe("initial foreground publication", () => {
 				return original(input);
 			});
 			try {
-				const run = startForegroundRun({
-					publicationRun: f.run,
-					subagentId: f.child,
-					parentNarratorId: f.parent,
-					toolUseId: f.toolUseId,
-					subagentType: "general",
-					prompt: "test",
-					cwd: process.cwd(),
-					model: "claude-sonnet-4-6",
-					provider: "anthropic",
-					systemPrompt: "test",
-					customDef: null,
+				const handle = await startNarratorRun({
+					narratorId: f.child,
 					locale: "en",
-					signal: new AbortController().signal,
-					initialHistory: [],
+					text: "",
+					binding: f.binding,
+					foreground: true,
 				});
-				// Register rejection handlers immediately: both foreground and terminal must settle.
-				const terminal = run.terminal.then(
-					(value) => value,
-					(error) => error,
+				expect(handle.started).toBe(true);
+				let foregroundSettled = false;
+				const foreground = handle.foreground.then(
+					(value) => {
+						foregroundSettled = true;
+						return value;
+					},
+					(error: unknown) => {
+						foregroundSettled = true;
+						return error;
+					},
 				);
-				const foreground = run.foreground.then(
+				const completion = handle.completion.then(
 					(value) => value,
-					(error) => error,
+					(error: unknown) => error,
 				);
 				await entered.promise;
-				expect(completions).toBe(0);
-				expect(db.select().from(narrators).where(eq(narrators.id, f.child)).get()?.status).toBe(
-					"working",
-				);
+				// The caller has not received anything yet, and nothing reached its mailbox.
+				expect(foregroundSettled).toBe(false);
+				expect(parentRows(f.parent)).toHaveLength(0);
 				gate.resolve();
 				if (failure) {
-					expect(await terminal).toBeInstanceOf(Error);
-					expect(await foreground).toBeInstanceOf(Error);
-					expect(completions).toBe(0);
+					// Infrastructure failure retains the foreground Agent tool boundary.
+					expect(await foreground).toEqual(new Error("foreground receipt unavailable"));
+					expect(await completion).toBeInstanceOf(Error);
 				} else {
-					expect(await terminal).toMatchObject({ finalText: output });
-					await foreground;
-					expect(completions).toBe(1);
+					const result = await handle.foreground;
+					expect(result).toMatchObject({ finalText: output, hasError: executionFailure });
+					expect(result.output).toContain(output);
+					// The stored terminal is the Await receipt, readable more than once.
 					for (let i = 0; i < 2; i++)
 						expect(
 							await awaitAgentResultDetailed({
@@ -211,96 +304,104 @@ describe("initial foreground publication", () => {
 								timeoutMs: 100,
 								signal: new AbortController().signal,
 							}),
-						).toMatchObject({ terminalResultReceived: true, publicationRun: f.run });
+						).toMatchObject({ terminalResultReceived: true });
 				}
+				await handle.terminal;
+				expect(commit).toHaveBeenCalledTimes(1);
 				expect(getExecutionOwner(f.child)).toBeUndefined();
-				expect(listRunningSubagentExecutions().some((row) => row.subagentId === f.child)).toBe(
-					false,
-				);
+				expect(listDeliveringRuns().some((row) => row.narratorId === f.child)).toBe(false);
+				// The foreground consumed its own terminal: nothing is left to publish.
 				expect(
 					db
 						.select()
 						.from(runtimePublicationOutbox)
-						.where(eq(runtimePublicationOutbox.logicalRunId, f.run.logicalRunId))
-						.all(),
+						.where(eq(runtimePublicationOutbox.taskId, f.child))
+						.all()
+						.filter((row) => row.state === "pending" || row.state === "reserved"),
 				).toHaveLength(0);
-				expect(
-					db
-						.select()
-						.from(narratorBufferedMessages)
-						.where(eq(narratorBufferedMessages.narratorId, f.parent))
-						.all(),
-				).toHaveLength(0);
+				expect(parentRows(f.parent)).toHaveLength(0);
 				expect(wakes).toBe(0);
 			} finally {
 				gate.resolve();
-				execute.mockRestore();
+				pass.mockRestore();
 				commit.mockRestore();
-				eventBus.offAny(watch);
 			}
 		});
 });
 
-describe("resume preparation reservation cleanup", () => {
-	for (const phase of ["history", "attachment"] as const) {
-		test(`${phase} failure releases unused slots without deleting committed events`, async () => {
+describe("a run that fails before its pass still ends once", () => {
+	for (const phase of ["history", "pass"] as const) {
+		test(`${phase} failure keeps committed events and publishes one failed terminal`, async () => {
 			const f = await fixture(false);
-			const { startContinuedSubagent } = await import("../subagent-runner");
-			const { getExecutionOwner } = await import("../agent-runtime/ownership");
-			const files = await import("../../lib/uploads");
-			const history = spyOn(executor, "loadSubagentHistory").mockRejectedValue(
-				new Error("history preparation failed"),
-			);
-			const attachment = spyOn(files, "saveTextFileToWorktree").mockRejectedValue(
-				new Error("attachment preparation failed"),
-			);
-			const rows = () =>
-				db
-					.select()
-					.from(runtimePublicationOutbox)
-					.where(eq(runtimePublicationOutbox.logicalRunId, f.run.logicalRunId))
-					.all();
-			runtimePublication.store.reserveRunSlots(f.run, { started: true });
+			const history = await import("../agent-runtime/history");
+			const orchestrator = await import("../agent-runtime/orchestrator");
+			const failing =
+				phase === "history"
+					? spyOn(history, "buildRuntimeHistory").mockRejectedValue(
+							new Error("history preparation failed"),
+						)
+					: spyOn(orchestrator, "runAgentLoopUnlocked").mockRejectedValue(
+							new Error("pass preparation failed"),
+						);
+			// A registered run that already published its start.
+			const run = await getRuntimePublicationService().startAgentRun({
+				narratorId: f.child,
+				parentNarratorId: f.parent,
+				binding: f.binding,
+			});
+			runtimePublication.store.reserveRunSlots(run, { started: true });
 			runtimePublication.store.commitIntent({
-				...f.run,
+				...run,
 				eventKind: "started",
 				resultRef: "message:existing",
 				summary: "existing result",
 			});
+			const rows = () =>
+				db
+					.select()
+					.from(runtimePublicationOutbox)
+					.where(eq(runtimePublicationOutbox.logicalRunId, run.logicalRunId))
+					.all();
 			const committed = rows().filter((row) => row.state !== "reserved");
 			expect(committed).toHaveLength(1);
-			expect(rows().some((row) => row.state === "reserved")).toBe(true);
 			try {
-				await expect(
-					startContinuedSubagent({
-						subagentId: f.child,
-						parentNarratorId: f.parent,
-						toolUseId: "origin-tool",
-						prompt: "continue",
-						locale: "en",
-						signal: new AbortController().signal,
-						persistPrompt: phase === "attachment",
-						resumeLogicalRunId: f.run.logicalRunId,
-						textFiles: phase === "attachment" ? [new File(["fixture"], "fixture.txt")] : undefined,
-					}),
-				).rejects.toThrow(`${phase} preparation failed`);
-				expect(rows()).toEqual(committed);
+				const handle = await startNarratorRun({
+					narratorId: f.child,
+					locale: "en",
+					text: "continue",
+					resumeRunId: run.logicalRunId,
+				});
+				// A thrown pass rejects completion; a failed preparation inside the pass
+				// returns an error outcome. Either way the run ends once, as failed.
+				await handle.completion.catch(() => {});
+				const terminal = await handle.terminal;
+				expect(terminal.hasError).toBe(true);
+				expect(terminal.finalText).toContain(`${phase} preparation failed`);
+				// The registered run continued; no second logical run was started.
+				expect(
+					db.select().from(narrators).where(eq(narrators.id, f.child)).get()?.logicalRunId,
+				).toBe(run.logicalRunId);
+				const after = rows();
+				// The committed start survives, no slot stays reserved, one terminal exists.
+				for (const row of committed)
+					expect(after.find((candidate) => candidate.id === row.id)).toBeDefined();
+				expect(after.filter((row) => row.state === "reserved")).toHaveLength(0);
+				expect(String(toolOutput(f.toolCallId))).toContain(`${phase} preparation failed`);
 				expect(getExecutionOwner(f.child)).toBeUndefined();
 			} finally {
-				history.mockRestore();
-				attachment.mockRestore();
+				failing.mockRestore();
 			}
 		});
 	}
 });
 
-// Real resume -> continued runner -> task producer -> exact parent conclusion.
-// Only the model boundary is fake, and the genuine conclusion function is delayed, not replaced.
-describe("runner publication waits for the exact parent tool transaction", () => {
-	for (const preserveBackground of [false, true])
-		for (const skipConclusionDelivery of [false, true]) {
-			test(`preserve=${preserveBackground}, skipConclusion=${skipConclusionDelivery}`, async () => {
-				const f = await fixture(preserveBackground);
+// A detached run delivers through the exact registered tool call (or its running task),
+// and nothing becomes visible to the parent before that transaction commits.
+describe("detached publication waits for the exact parent tool transaction", () => {
+	for (const background of [false, true])
+		for (const deliver of [true, false]) {
+			test(`background=${background}, deliver=${deliver}`, async () => {
+				const f = await fixture(background);
 				const gate = Promise.withResolvers<void>();
 				const entered = Promise.withResolvers<void>();
 				let wakes = 0;
@@ -321,17 +422,7 @@ describe("runner publication waits for the exact parent tool transaction", () =>
 				runtimePublication.setWake(() => {
 					wakes++;
 				});
-				const history = spyOn(executor, "loadSubagentHistory").mockResolvedValue({
-					history: [],
-					trailingToolResults: [],
-					trailingUserText: undefined,
-				});
-				const execute = spyOn(executor, "executeSubagent").mockResolvedValue({
-					finalText: "NEW RESULT",
-					hasError: false,
-					allowInboxWake: true,
-					finalUserId: null,
-				});
+				const pass = await fakePass(f.child, "NEW RESULT", true);
 				const originalConclusion = session.updateToolCallConclusion;
 				const conclusion = spyOn(session, "updateToolCallConclusion").mockImplementation(
 					async (input) => {
@@ -341,27 +432,30 @@ describe("runner publication waits for the exact parent tool transaction", () =>
 					},
 				);
 				try {
-					const resumed = await resumeSubagent({
-						subagentId: f.child,
-						intent: "follow_up",
-						prompt: "finish",
-						actor: "parent_agent",
+					let resumeRunId: string | undefined;
+					if (background) {
+						// The task projection registers the run; the run service adopts it.
+						const task = await backgroundTaskService.createAgentTask({
+							id: f.child,
+							parentNarratorId: f.parent,
+							subagentNarratorId: f.child,
+							subagentType: "general",
+							toolUseId: f.toolUseId,
+							binding: f.binding,
+						});
+						resumeRunId = task.logicalRunId ?? undefined;
+					}
+					const handle = await startNarratorRun({
+						narratorId: f.child,
 						locale: "en",
-						preserveBackground,
-						skipConclusionDelivery,
-						skipStaleAttach: true,
-						resumeLogicalRunId: f.run.logicalRunId,
+						text: "",
+						...(resumeRunId ? { resumeRunId } : { binding: f.binding }),
+						deliver,
 					});
-					if (!skipConclusionDelivery) {
+					if (deliver && !background) {
 						await entered.promise;
 						runtimePublication.flushRecipient(f.parent);
-						expect(
-							db
-								.select()
-								.from(narratorBufferedMessages)
-								.where(eq(narratorBufferedMessages.narratorId, f.parent))
-								.all(),
-						).toHaveLength(0);
+						expect(parentRows(f.parent)).toHaveLength(0);
 						expect(
 							db
 								.select()
@@ -370,49 +464,35 @@ describe("runner publication waits for the exact parent tool transaction", () =>
 								.all(),
 						).toHaveLength(0);
 						expect(wakes).toBe(0);
-						expect(controlEvents).toHaveLength(0);
-						if (preserveBackground)
-							expect((await backgroundTaskService.getById(f.child))?.status).toBe("running");
-						expect(
-							db
-								.select()
-								.from(narratorToolCalls)
-								.where(eq(narratorToolCalls.id, f.toolCallId))
-								.get()?.outputJson,
-						).toBe("OLD RESULT");
+						expect(toolOutput(f.toolCallId)).toBe("OLD RESULT");
 					}
 					gate.resolve();
-					await resumed.terminalCompletion;
+					await handle.terminal;
 					runtimePublication.flushRecipient(f.parent);
-					const notices = db
-						.select()
-						.from(narratorBufferedMessages)
-						.where(
-							and(
-								eq(narratorBufferedMessages.narratorId, f.parent),
-								eq(narratorBufferedMessages.kind, "task_notice"),
-							),
-						)
-						.all();
-					expect(notices).toHaveLength(preserveBackground || !skipConclusionDelivery ? 1 : 0);
-					const output = db
-						.select()
-						.from(narratorToolCalls)
-						.where(eq(narratorToolCalls.id, f.toolCallId))
-						.get()?.outputJson;
-					if (skipConclusionDelivery) expect(output).toBe("OLD RESULT");
-					else expect(String(output)).toContain("NEW RESULT");
-					expect(execute).toHaveBeenCalledTimes(1);
-					expect(controlEvents).toHaveLength(preserveBackground ? 1 : 0);
-					if (preserveBackground)
+					const notices = parentRows(f.parent).filter((row) => row.kind === "task_notice");
+					expect(notices).toHaveLength(deliver ? 1 : 0);
+					if (background && !deliver) {
+						// Intentional semantic change (unified runtime): a run started with
+						// deliver=false delivers nothing, so it also notifies nothing — not even
+						// for a background task. The old background runner still sent one task
+						// notice here (1); the unified finalizer sends none (0). Not delivering
+						// means not notifying.
+						expect(notices).toHaveLength(0);
+						expect(controlEvents).toHaveLength(0);
+						expect(wakes).toBe(0);
+					}
+					// Background delivery goes through the task card, never the tool result.
+					if (!deliver || background) expect(toolOutput(f.toolCallId)).toBe("OLD RESULT");
+					else expect(String(toolOutput(f.toolCallId))).toContain("NEW RESULT");
+					expect(pass).toHaveBeenCalledTimes(1);
+					expect(controlEvents).toHaveLength(background && deliver ? 1 : 0);
+					if (background && deliver)
 						expect((await backgroundTaskService.getById(f.child))?.status).toBe("completed");
 				} finally {
 					gate.resolve();
 					eventBus.offAny(watch);
-					execute.mockRestore();
-					history.mockRestore();
+					pass.mockRestore();
 					conclusion.mockRestore();
-					runtimePublication.setWake(undefined);
 				}
 			}, 10000);
 		}

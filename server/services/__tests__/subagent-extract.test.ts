@@ -11,7 +11,7 @@ import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:t
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
-import { resolveRuntimePolicy } from "../agent-runtime/policy";
+import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -180,11 +180,11 @@ describe("extractSubagentToPrimary", () => {
 		expect(extracted.writeAudience).toBe("owner");
 
 		// Acceptance: primary runtime policy unlocks AskUserQuestion + full builtin tools.
-		const policy = resolveRuntimePolicy({ variant: "primary" });
+		const policy = resolveRuntimePolicy([]);
 		expect(policy.capabilities.askUserQuestion).toBe("sync-or-async");
 		expect(policy.tools.builtin).toBe("all");
 
-		const subPolicy = resolveRuntimePolicy({ variant: "subagent", subagentType: "explore" });
+		const subPolicy = resolveRuntimePolicy([compileDelegationPolicy({ template: "explore" })]);
 		expect(subPolicy.capabilities.askUserQuestion).toBe("disabled");
 	});
 

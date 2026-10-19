@@ -363,7 +363,7 @@ agent 向你提问而你没在时，可以由摘要模型根据对话内容代�
 | 区段压缩 | `narrator-compact.ts` `runSegmentCompact` |
 | 分叉 | `narrator-service.ts` `forkNarrator` |
 | 子任务接管 | `routes/narrators.ts` takeover 端点 |
-| 软/硬中断 | `subagent-detach.ts` `interruptForegroundSubagent` |
+| 软/硬中断 | `agent-runtime/run.ts` `controlRun`（stop/cancel；原 `subagent-detach.ts` 已合并于此） |
 | 反思循环 | `server/lib/agent/loop.ts` `runReflectionLoop` |
 | 任务反思提示词（含 3067 测试的教训注释） | `server/lib/agent/loop.ts:1066-1090` |
 | 讨论室读权限 | `chat-service.ts` `assertCanRead` |

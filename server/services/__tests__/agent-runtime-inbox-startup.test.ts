@@ -44,11 +44,11 @@ test("cold bootstrap releases only previous-process or proven legacy claims, nev
 	const legacy = enqueue("legacy");
 	store.claimBatch("legacy", { token: "unprefixed-old", epoch: "old-unprefixed" });
 	const current = enqueue("live");
-	const owner = tryClaimExecution("live", "primary");
+	const owner = tryClaimExecution("live", "run");
 	if (!owner) throw new Error("owner missing");
 	await inbox.claimInboxHead("live", () => true);
 	const legacyLive = enqueue("legacy-live");
-	const legacyOwner = tryClaimExecution("legacy-live", "primary");
+	const legacyOwner = tryClaimExecution("legacy-live", "run");
 	if (!legacyOwner) throw new Error("owner missing");
 	store.claimBatch("legacy-live", { token: "legacy-still-live", epoch: legacyOwner.epoch });
 	expect(await inbox.recoverInboxClaimsOnColdStartup()).toBe(2);
@@ -93,7 +93,7 @@ test("predicate runs against publication-eligible head, never claims a different
 		seq: -1,
 	});
 	if (!("delivery" in user)) throw new Error("full");
-	tryClaimExecution("barrier", "primary");
+	tryClaimExecution("barrier", "run");
 	expect((await inbox.peekInbox("barrier"))?.id).toBe(user.delivery.id);
 	expect(
 		await inbox.claimInboxHead(

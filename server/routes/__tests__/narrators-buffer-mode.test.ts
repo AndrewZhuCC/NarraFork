@@ -29,7 +29,6 @@ function fixture(
 	options: {
 		rows?: QueueRow[];
 		mutation?: boolean;
-		child?: boolean;
 		claimedAfterRetry?: boolean;
 		retryError?: string;
 		controlError?: boolean;
@@ -79,16 +78,8 @@ function fixture(
 			// PG safety: failing to supply explicit authority would hit a forbidden sync read.
 			if (args[2] === undefined || args[3] === undefined)
 				throw new Error("Forbidden sync queue probe");
-			expect(options.child).not.toBe(true);
 			controls.push(args);
 			if (options.controlError) throw new Error("Control failed");
-		},
-		applySubagentBufferedQueueModeControl: (...args: unknown[]) => {
-			expect(locked).toBe(true);
-			expect(options.child).toBe(true);
-			if (args[2] === undefined || args[3] === undefined)
-				throw new Error("Forbidden sync queue probe");
-			controls.push(args);
 		},
 		readBufferedMessageDeliveryReceipt: async () =>
 			options.receiptState
@@ -112,11 +103,11 @@ function fixture(
 			return options.wakeResult ?? false; // Busy owners leave delivery to their finalizer.
 		},
 
-		removeSubagentBufferedMessage: async (_id: string, mid: string) => {
+		removeBufferedMessage: async (_id: string, mid: string) => {
 			rows = rows.filter((row) => row.id !== mid);
 			return true;
 		},
-		clearSubagentBufferedMessages: async () => {
+		clearBufferedMessages: async () => {
 			rows = [];
 		},
 	};
@@ -132,8 +123,6 @@ function fixture(
 		updateBufferedMessageMode: update,
 		retryBufferedMessage: retryMutation,
 		getBufferedMessagesAsync: authoritativeRead,
-		narratorService: { getById: async () => ({ variant: options.child ? "subagent" : "primary" }) },
-		isSubagentVariant: (variant: string) => variant === "subagent",
 		clearBufferedMessageSoftStopIfIdle: (...args: unknown[]) => {
 			if (args[1] === undefined) throw new Error("Forbidden sync queue probe");
 			clears.push(args);
@@ -226,14 +215,13 @@ describe("buffer retry HTTP mutation", () => {
 			expect(f.rows().map((row) => row.id)).toEqual(["earlier", "message"]);
 		});
 	}
-	test("busy child retries legacy urgent mode via child tool controls", async () => {
-		const f = fixture({ child: true, rows: [{ id: "message", state: "failed", priority: true }] });
+	test("busy session retries legacy priority mode via tool controls", async () => {
+		const f = fixture({ rows: [{ id: "message", state: "failed", priority: true }] });
 		expect((await f.retry()).status).toBe(200);
 		expect(f.controls).toEqual([["session", "tool", true, true]]);
 	});
-	test("busy child interrupt retry signals the child instead of primary execution", async () => {
+	test("busy session interrupt retry signals the session's own execution", async () => {
 		const f = fixture({
-			child: true,
 			rows: [{ id: "message", state: "failed", queueMode: "interrupt" }],
 		});
 		expect((await f.retry()).status).toBe(200);
@@ -389,10 +377,9 @@ describe("buffer mode HTTP mutation", () => {
 			expect(f.controls).toEqual([["session", "turn", state === "queued", true]]);
 		}
 	});
-	test("child controls receive the same queued authority", async () => {
-		const f = fixture({ child: true });
-		expect((await f.mode()).status).toBe(200);
-		expect(f.controls).toEqual([["session", "tool", true, true]]);
+	test("the route never consults the session's variant: one control for every session", () => {
+		expect(compiled).not.toContain("isSubagentVariant");
+		expect(compiled).not.toContain("Subagent");
 	});
 	test("invalid modes fail before mutation", async () => {
 		const f = fixture();
