@@ -2,10 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { getPrompt } from "../../../server/lib/prompts/core";
 import { buildKnowledgeStewardSystemPrompt } from "../../../server/lib/prompts/knowledge-steward";
 import { buildReviewSystemPrompt, getReviewStartMessage } from "../../../server/lib/prompts/review";
-import {
-	getSubagentParentReportingHint,
-	getSubagentPrompt,
-} from "../../../server/lib/prompts/subagents";
+import { getRunDeliveryHint, getSubagentPrompt } from "../../../server/lib/prompts/subagents";
 import {
 	getDynamicSpecSystemReminder,
 	getPlanModeSystemReminder,
@@ -60,8 +57,8 @@ describe("model prompt modules", () => {
 	test("directs read-only context questions through ContextAsk instead of Send", () => {
 		const promptEn = getPrompt("contextAsk", "en");
 		const promptZh = getPrompt("contextAsk", "zh-CN");
-		const reportingEn = getSubagentParentReportingHint("en");
-		const reportingZh = getSubagentParentReportingHint("zh-CN");
+		const reportingEn = getRunDeliveryHint("en", { narratorId: "recipient" });
+		const reportingZh = getRunDeliveryHint("zh-CN", { narratorId: "recipient" });
 
 		expect(promptEn).toContain("untrusted evidence");
 		expect(promptEn).toContain("reduce phase");

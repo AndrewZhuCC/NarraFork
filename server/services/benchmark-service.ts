@@ -367,7 +367,7 @@ async function executeTask(
 			.where(eq(benchmarkTaskResults.id, taskResultId));
 
 		// Send the task prompt
-		await sendMessage(narrator.id, task.prompt, undefined, "en", false);
+		await sendMessage(narrator.id, task.prompt, undefined, "en", false, null, null);
 
 		// Wait for completion
 		const timeoutMs =

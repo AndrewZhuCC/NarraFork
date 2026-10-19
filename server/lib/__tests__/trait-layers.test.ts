@@ -21,8 +21,8 @@ function enforced(resolved: ResolvedTraitSet): string[] {
 }
 
 describe("layer ordering", () => {
-	test("layers run user → project → narrator", () => {
-		expect(TRAIT_LAYERS).toEqual(["user", "project", "narrator"]);
+	test("layers run user → project → source → narrator", () => {
+		expect(TRAIT_LAYERS).toEqual(["user", "project", "source", "narrator"]);
 	});
 });
 

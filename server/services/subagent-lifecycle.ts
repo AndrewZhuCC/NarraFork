@@ -1,5 +1,5 @@
 /**
- * subagent-lifecycle.ts — shared retire path for subagents whose card is gone.
+ * Shared retire path for every session, including sessions whose Agent card is gone.
  *
  * Used by:
  * - Agent tool `archive` / `unarchive`
@@ -10,7 +10,6 @@
  */
 
 import { logger } from "../lib/logger";
-import { isSubagentVariant } from "../lib/narrator-utils";
 
 export interface InterruptAndArchiveResult {
 	ok: boolean;
@@ -25,14 +24,12 @@ export interface InterruptAndArchiveResult {
 }
 
 /**
- * Stop running work on a subagent and mark it archived.
+ * Cancel a session's run and mark it archived. Callers enforce their control/write ACL.
  *
  * Never throws: history deletion must succeed even if a lifecycle side-effect fails.
- * Non-subagent ids are refused without touching status.
  */
 export async function interruptAndArchiveSubagent(
 	subagentId: string,
-	options?: { parentNarratorId?: string },
 ): Promise<InterruptAndArchiveResult> {
 	const base: InterruptAndArchiveResult = {
 		ok: false,
@@ -47,30 +44,12 @@ export async function interruptAndArchiveSubagent(
 		if (!narrator) {
 			return { ...base, error: "not_found" };
 		}
-		if (!isSubagentVariant(narrator.variant) && narrator.type !== "subagent") {
-			return { ...base, error: "not_subagent" };
-		}
-		if (
-			options?.parentNarratorId &&
-			narrator.parentNarratorId &&
-			narrator.parentNarratorId !== options.parentNarratorId
-		) {
-			return { ...base, error: "not_direct_child" };
-		}
-		if (narrator.status === "archived") {
-			return { ...base, ok: true, alreadyArchived: true };
-		}
-
-		const { cancelBackgroundTask } = await import("./subagent-runner");
 		const { closeNarrator, isNarratorActive } = await import("./narrator-session");
-		const { interruptForegroundSubagent } = await import("./narrator-subagent");
+		const { controlRun } = await import("./agent-runtime/run");
 
-		let interrupted = false;
-		try {
-			if (await cancelBackgroundTask(narrator.id)) interrupted = true;
-		} catch {
-			// Background cancel is best-effort.
-		}
+		// End the registered run (including any hold/task projection) before closing
+		// the session. This mechanism does not depend on a delegation identity.
+		let interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
 		try {
 			if (isNarratorActive(narrator.id)) {
 				closeNarrator(narrator.id);
@@ -79,13 +58,10 @@ export async function interruptAndArchiveSubagent(
 		} catch {
 			// closeNarrator is best-effort.
 		}
-		try {
-			// Hard interrupt: the card is gone, so this is a retire, not a turn stop.
-			if (interruptForegroundSubagent(narrator.id, { hard: true })) interrupted = true;
-		} catch {
-			// Foreground interrupt is best-effort.
-		}
 
+		if (narrator.status === "archived") {
+			return { ...base, ok: true, alreadyArchived: true, interrupted };
+		}
 		await narratorService.updateStatus(narrator.id, "archived");
 		return { ok: true, alreadyArchived: false, archived: true, interrupted, id: narrator.id };
 	} catch (err) {

@@ -8,6 +8,7 @@ import {
 	narratorWhitelistDirs,
 	projects,
 } from "@server/db/schema";
+import { MAX_POLICY_SOURCE_DEPTH, policySourceIdOf } from "@server/lib/runtime-source";
 import { getSettingsRevision, settings } from "@server/lib/settings";
 import { eq, inArray } from "drizzle-orm";
 import {
@@ -29,7 +30,7 @@ import type {
 export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 	narratorId: string;
 	ownerNarratorId: string;
-	/** Includes this narrator and its subagent ancestors, never siblings. */
+	/** This narrator and its registered policy-source chain, never siblings. */
 	inheritedNarratorIds?: string[];
 	projectId: string | null;
 	projectGitPath: string | null;
@@ -41,7 +42,12 @@ export class ExecutionPolicyRepository {
 		return this.loadNow(narratorId);
 	}
 
-	/** Bounded synchronous snapshot, also usable inside the final request transaction. */
+	/**
+	 * Bounded synchronous snapshot, also usable inside the final request transaction.
+	 * Rules merge along the registered policy-source chain (same source rule and depth
+	 * bound as capability resolution), so any two related narrators share rules the
+	 * same way, whatever created them.
+	 */
 	loadNow(narratorId: string, store: Pick<typeof db, "select"> = db): LoadedExecutionPolicy {
 		const inheritedNarratorIds: string[] = [];
 		let next: string | null = narratorId;
@@ -49,7 +55,10 @@ export class ExecutionPolicyRepository {
 		const contextProjects = new Set<string>();
 		const reviewBoundaries: LegacyDirectoryBlacklistEntry[] = [];
 		while (next) {
-			if (inheritedNarratorIds.includes(next) || inheritedNarratorIds.length >= 16) {
+			if (
+				inheritedNarratorIds.includes(next) ||
+				inheritedNarratorIds.length >= MAX_POLICY_SOURCE_DEPTH
+			) {
 				throw new Error("Invalid or excessive permission inheritance chain");
 			}
 			const narrator = store
@@ -57,6 +66,9 @@ export class ExecutionPolicyRepository {
 					id: narrators.id,
 					chapterId: narrators.chapterId,
 					contextProjectId: narrators.contextProjectId,
+					policySourceNarratorId: narrators.policySourceNarratorId,
+					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+					type: narrators.type,
 					variant: narrators.variant,
 					parentNarratorId: narrators.parentNarratorId,
 				})
@@ -88,7 +100,7 @@ export class ExecutionPolicyRepository {
 			}
 			projectId ??= effectiveProjectId;
 			if (effectiveProjectId) contextProjects.add(effectiveProjectId);
-			next = narrator.variant.startsWith("subagent:") ? narrator.parentNarratorId : null;
+			next = policySourceIdOf(narrator);
 		}
 		const ownerNarratorId = inheritedNarratorIds.at(-1) ?? narratorId;
 		let projectGitPath: string | null = null;

@@ -72,6 +72,7 @@ import {
 	clearBufferedMessages,
 	getBufferedMessagesAsync,
 	pushBufferedMessage,
+	removeBufferedMessage,
 	resolveDecisionNarratorId,
 	resolvePermissionOrDangerReflection,
 	toBufferSummary,
@@ -2276,7 +2277,7 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
-				let bufResult = await pushBufferedMessage(
+				let { ok } = await pushBufferedMessage(
 					msg.narratorId,
 					bufferText,
 					undefined,
@@ -2287,37 +2288,30 @@ export const handleNarratorWS = {
 					undefined,
 					preBashCommand,
 				);
-				// Fallback: try buffering for a running foreground subagent
-				let usedSubagent = false;
-				if (!bufResult.ok) {
+				// No live session to queue behind: the ordinary admission of any session
+				// (queues behind an owner, or starts a run that adopts the input).
+				if (!ok) {
 					try {
-						const { bufferSubagentUserMessage, isTakenOver } = await import(
-							"../services/narrator-subagent"
-						);
-						bufResult = await bufferSubagentUserMessage(msg.narratorId, bufferText, {
+						const { acceptUserMessage } = await import("../services/narrator-session");
+						await acceptUserMessage(msg.narratorId, bufferText, {
+							locale: userId ? await getUserLanguage(userId) : "en",
 							commandText,
-							createdBy: userId,
-							requestSoftStop: !isTakenOver(msg.narratorId),
+							userId,
+							preBashCommand,
 						});
-						usedSubagent = bufResult.ok;
-					} catch {
-						// ignore
+						ok = true;
+					} catch (err) {
+						logger.warn("Failed to admit buffered message", {
+							narratorId: msg.narratorId,
+							error: String(err),
+						});
 					}
 				}
-				if (bufResult.ok) {
-					let messages: ReturnType<typeof toBufferSummary>;
-					if (usedSubagent) {
-						const { getSubagentBufferedMessagesAsync } = await import(
-							"../services/subagent-executor"
-						);
-						messages = toBufferSummary(await getSubagentBufferedMessagesAsync(msg.narratorId));
-					} else {
-						messages = toBufferSummary(await getBufferedMessagesAsync(msg.narratorId));
-					}
+				if (ok) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",
 						narratorId: msg.narratorId,
-						messages,
+						messages: toBufferSummary(await getBufferedMessagesAsync(msg.narratorId)),
 					});
 				} else {
 					safeSend(ws, {
@@ -2331,14 +2325,8 @@ export const handleNarratorWS = {
 				await clearBufferedMessages(msg.narratorId);
 				// Cancelling queued input must also drop a pending post-tool soft stop,
 				// otherwise the running turn ends at the next tool boundary with nothing
-				// to resume (clearSubagentBufferedMessages does this for subagents).
+				// to resume.
 				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
-				try {
-					const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
-					await clearSubagentBufferedMessages(msg.narratorId);
-				} catch {
-					// ignore
-				}
 				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
 					narratorId: msg.narratorId,
@@ -2352,8 +2340,7 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "remove_buffer": {
-				const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
-				const ok = await removeSubagentBufferedMessage(msg.narratorId, msg.messageId);
+				const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
 					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					await broadcastBufferQueueForNarrator(msg.narratorId);

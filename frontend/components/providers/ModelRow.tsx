@@ -13,6 +13,8 @@ export interface ModelRowProps {
 	onTestModel?: () => void;
 	/** Set to false to hide the context window input (e.g. Codex). */
 	showContextWindow?: boolean;
+	/** Provider-specific controls rendered at the end of the row (e.g. protocol picker). */
+	extra?: React.ReactNode;
 }
 
 /** Below this the save layer rejects the value outright. */
@@ -29,6 +31,7 @@ export const ModelRow = React.memo(function ModelRow({
 	onContextWindowChange,
 	onTestModel,
 	showContextWindow = true,
+	extra,
 }: ModelRowProps) {
 	const { t } = useTranslation("settings");
 	const showSmallWindowWarning =
@@ -44,6 +47,7 @@ export const ModelRow = React.memo(function ModelRow({
 			<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 120 }}>
 				{modelLabel}
 			</Text>
+			{extra}
 			{showContextWindow && (
 				<Tooltip
 					label={showSmallWindowWarning ? t("contextWindowTooSmallWarning") : ""}

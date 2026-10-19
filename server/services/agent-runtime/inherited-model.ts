@@ -1,13 +1,13 @@
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import type { ReasoningEffort } from "../../lib/agent";
+import { modelPoolKeyOf, policySourceIdOf, type RuntimeSourceRow } from "../../lib/runtime-source";
 import type { ActiveNarrator } from "../narrator-session-state";
 
-export interface InheritedModelNarrator {
+/** Model fields plus the explicit source registration; no parent or template fields. */
+export type InheritedModelNarrator = RuntimeSourceRow & {
 	model?: string | null;
-	parentNarratorId?: string | null;
-	subagentType?: string | null;
 	reasoningEffort?: ReasoningEffort | null;
-}
+};
 
 export interface InheritedModelResolution {
 	model: string;
@@ -36,7 +36,8 @@ interface InheritedModelDependencies {
  * All asynchronous writes use a per-active generation, never a persisted model write.
  * The request boundary awaits the current generation; an obsolete resolution cannot
  * restore inheritance after a manual selection, revive a dead session, or win a race
- * against a newer parent change. Dependencies keep DB/provider work out of this state
+ * against a newer source change. The source is whatever the row registers; any
+ * session may follow any other. Dependencies keep DB/provider work out of this state
  * machine and make out-of-order completions directly testable.
  */
 export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
@@ -47,14 +48,13 @@ export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
 		return active._modelRefreshVersion;
 	}
 
-	function select(active: ActiveNarrator, modelRef: string, parentNarratorId?: string | null) {
+	function select(active: ActiveNarrator, modelRef: string, sourceNarratorId?: string | null) {
 		invalidate(active);
 		active._modelSelectionRef = modelRef;
-		active._followParentNarratorId =
-			modelRef === FOLLOW_PARENT_MODEL ? parentNarratorId : undefined;
+		active._modelSourceNarratorId = modelRef === FOLLOW_PARENT_MODEL ? sourceNarratorId : undefined;
 		if (modelRef !== FOLLOW_PARENT_MODEL) {
 			active._inheritedReasoningEffort = undefined;
-			active._parentReasoningEffort = undefined;
+			active._sourceReasoningEffort = undefined;
 		}
 	}
 
@@ -72,7 +72,9 @@ export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
 				if (!narrator || narrator.model !== FOLLOW_PARENT_MODEL) {
 					throw new Error("Inherited model selection changed before resolution");
 				}
-				active._followParentNarratorId = narrator.parentNarratorId;
+				const sourceId = policySourceIdOf(narrator);
+				const poolKey = modelPoolKeyOf(narrator);
+				active._modelSourceNarratorId = sourceId;
 				const resolved = await deps.resolve(
 					narrator,
 					active._currentUserId ?? null,
@@ -86,13 +88,13 @@ export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
 				if (
 					!latest ||
 					latest.model !== FOLLOW_PARENT_MODEL ||
-					latest.parentNarratorId !== narrator.parentNarratorId ||
-					latest.subagentType !== narrator.subagentType
+					policySourceIdOf(latest) !== sourceId ||
+					modelPoolKeyOf(latest) !== poolKey
 				) {
 					throw new Error("Inherited model selection changed during resolution");
 				}
 				if (resolved.model === FOLLOW_PARENT_MODEL || resolved.modelRef === FOLLOW_PARENT_MODEL) {
-					throw new Error("Inherited model resolver returned an unresolved parent reference");
+					throw new Error("Inherited model resolver returned an unresolved source reference");
 				}
 				deps.apply(active, resolved);
 				active._modelUnavailableWaitCancel?.();
@@ -114,7 +116,7 @@ export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
 		while (active._modelRefreshPending) await active._modelRefreshPending;
 		// Fail closed once, then clear: a sticky error would block every later
 		// request boundary even when a subsequent refresh (settings revision
-		// change, parent update, manual reselect) could recover.
+		// change, source update, manual reselect) could recover.
 		if (active._modelRefreshError) {
 			const error = active._modelRefreshError;
 			active._modelRefreshError = undefined;
@@ -122,18 +124,19 @@ export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
 		}
 	}
 
-	function parentChanged(parentNarratorId: string): void {
-		// No historical-descendant query: work is bounded by the live runtime map.
-		// Include nested followers, using a visited set to tolerate malformed cycles.
-		const changed = new Set([parentNarratorId]);
+	/** A source's model/effort changed: refresh live followers, including nested ones. */
+	function sourceChanged(sourceNarratorId: string): void {
+		// No historical-dependent query: work is bounded by the live runtime map.
+		// A visited set tolerates malformed cycles.
+		const changed = new Set([sourceNarratorId]);
 		const followers = [...deps.activeValues()].filter(
 			(active) => active.alive && active._modelSelectionRef === FOLLOW_PARENT_MODEL,
 		);
-		for (const parentId of changed) {
+		for (const sourceId of changed) {
 			for (const active of followers) {
 				if (
 					changed.has(active.narratorId) ||
-					(active._followParentNarratorId && active._followParentNarratorId !== parentId)
+					(active._modelSourceNarratorId && active._modelSourceNarratorId !== sourceId)
 				) {
 					continue;
 				}
@@ -143,5 +146,5 @@ export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
 		}
 	}
 
-	return { select, refresh, settle, parentChanged };
+	return { select, refresh, settle, sourceChanged };
 }

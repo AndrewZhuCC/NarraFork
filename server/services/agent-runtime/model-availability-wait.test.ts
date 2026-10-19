@@ -214,9 +214,11 @@ describe("persisted settings notification integration", () => {
 
 // Source-level guards supplement behavioral tests without loading the live DB/session runtime.
 describe("model wait runtime wiring", () => {
-	test("shared primary/subagent orchestrator listens to settings and compares default resolution", () => {
+	test("one model wait shared by every session listens to settings and compares default resolution", () => {
 		const source = readFileSync(new URL("./orchestrator.ts", import.meta.url), "utf8");
-		expect(source).toContain('profile.kind === "subagent"');
+		// A single wait site serves primary and delegated sessions alike: no identity branch.
+		expect(source.split("await waitForModelAvailabilityOrChange(").length - 1).toBe(1);
+		expect(source).not.toContain("profile.kind");
 		expect(source).toContain("const turnModelRef = active._modelRef;");
 		expect(source).toContain("subscribe: subscribeSettingsChanges");
 		expect(source).toContain(

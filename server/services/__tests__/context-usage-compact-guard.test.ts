@@ -29,7 +29,6 @@ function makeHooks(isCompactDone: () => boolean) {
 	return buildContextManagementHooks({
 		narratorId: NARRATOR_ID,
 		locale: "en",
-		isSubagent: true,
 		getModel: () => "test-model",
 		getProvider: () => "anthropic",
 		onCompactDone: () => {},

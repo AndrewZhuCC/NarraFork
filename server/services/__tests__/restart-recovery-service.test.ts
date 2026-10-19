@@ -9,6 +9,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	runtimePublicationOutbox,
 } from "../../db/schema";
 import { getNarraforkPath } from "../../lib/narrafork-home";
 import {
@@ -30,13 +31,16 @@ const { toolContinuationService } = await import("../tool-continuation-service")
 const { narratorPersistence } = await import("../narrator-persistence");
 const coordinator = await import("../update-coordinator");
 const session = await import("../narrator-session");
-const subagentResume = await import("../subagent-resume");
 const now = "2026-10-07T00:00:00.000Z";
 const backgroundStartOutput =
 	'<background_task_id>helper</background_task_id>\n\nBackground task started. Await({ type: "agent", id: "helper" })';
 const originalArgs = [...process.argv];
-const resumed: Array<Parameters<typeof subagentResume.resumeSubagent>[0]> = [];
-const continued: string[] = [];
+type RecoveredRun = NonNullable<Parameters<typeof session.continueNarrator>[4]>;
+/** Every recovery start goes through the one entry: the session and its run options. */
+const runs: Array<{ narratorId: string; run?: RecoveredRun }> = [];
+/** Recovery that did not re-enter the session's own persisted run. */
+const freshRuns: string[] = [];
+const started = () => runs.map((entry) => entry.narratorId);
 let executedTools = 0;
 
 function emptyProtection() {
@@ -47,6 +51,19 @@ function emptyProtection() {
 	};
 }
 
+/** A run registration that delivers its result to `deliverTo` (what makes a run delegated). */
+function deliveringRun(
+	id: string,
+	deliverTo: { narratorId: string; toolUseId: string; toolCallId?: string },
+) {
+	return { version: 1 as const, run: { logicalRunId: `run-${id}`, deliverTo } };
+}
+
+/**
+ * By default a seeded session's run delivers to a caller that is not itself being
+ * recovered (an independently mounted delegated run). Pass `runtimeRegistrationJson:
+ * null` for a session that delivers to nobody.
+ */
 async function seedNarrator(id: string, values: Partial<typeof narrators.$inferInsert> = {}) {
 	await db.insert(narrators).values({
 		id,
@@ -54,6 +71,10 @@ async function seedNarrator(id: string, values: Partial<typeof narrators.$inferI
 		type: "subagent",
 		status: "working",
 		logicalRunId: `run-${id}`,
+		runtimeRegistrationJson: deliveringRun(id, {
+			narratorId: "external-caller",
+			toolUseId: `use-for-${id}`,
+		}),
 		createdAt: now,
 		updatedAt: now,
 		...values,
@@ -103,6 +124,7 @@ async function seedAgent(background = false) {
 	await seedNarrator("parent", {
 		variant: "primary",
 		type: "primary",
+		runtimeRegistrationJson: null,
 		status: "waiting",
 		substatus: JSON.stringify(["awaiting_subagent"]),
 	});
@@ -114,6 +136,11 @@ async function seedAgent(background = false) {
 	await seedNarrator("child", {
 		parentNarratorId: "parent",
 		originToolCallId: "agent-call",
+		runtimeRegistrationJson: deliveringRun("child", {
+			narratorId: "parent",
+			toolUseId: "use-agent-call",
+			toolCallId: "agent-call",
+		}),
 	});
 	if (background) {
 		await db.insert(backgroundTasks).values({
@@ -142,20 +169,26 @@ beforeEach(async () => {
 	resetRecoveryHandoffForTests();
 	coordinator.resetUpdateCoordinationForTests();
 	process.argv = originalArgs.filter((arg) => arg !== recovery.NO_AUTO_RESUME_FLAG);
-	resumed.length = 0;
-	continued.length = 0;
+	runs.length = 0;
+	freshRuns.length = 0;
 	executedTools = 0;
 	await unlink(getNarraforkPath("restart-recovery.json")).catch((error: NodeJS.ErrnoException) => {
 		if (error.code !== "ENOENT") throw error;
 	});
-	spyOn(subagentResume, "resumeSubagent").mockImplementation(async (input) => {
-		resumed.push(input);
-		// Simulate the resume/model boundary completing the existing Agent call, not a new run.
-		const child = await db.query.narrators.findFirst({
-			where: eq(narrators.id, input.subagentId),
+	spyOn(session, "continueNarrator").mockImplementation(async (narratorId, _l, _r, _u, run) => {
+		runs.push({ narratorId, run });
+		// Recovery always continues the persisted run (same id, same deadline), never a new one.
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		if (!run?.recovered || (row?.logicalRunId && run.resumeRunId !== row.logicalRunId))
+			freshRuns.push(narratorId);
+		// Simulate the run boundary: a run that delivers and has no running task row
+		// rewrites its registered destination tool call once; a task row receives it otherwise.
+		const deliverTo = await session.readSessionDeliverTo(narratorId);
+		const task = await db.query.backgroundTasks.findFirst({
+			where: eq(backgroundTasks.subagentNarratorId, narratorId),
 		});
-		if (child?.originToolCallId && !input.preserveBackground && !input.skipConclusionDelivery) {
-			const origin = await tool(child.originToolCallId);
+		if (deliverTo?.toolCallId && run?.deliver !== false && task?.status !== "running") {
+			const origin = await tool(deliverTo.toolCallId);
 			if (origin) {
 				await narratorPersistence.updateToolCallResultIfActive(
 					origin.toolUseId,
@@ -165,14 +198,7 @@ beforeEach(async () => {
 				);
 			}
 		}
-		return {
-			started: true,
-			terminalCompletion: Promise.resolve("Recovered child result"),
-		} as never;
-	});
-	spyOn(session, "continueNarrator").mockImplementation(async (id) => {
-		continued.push(id);
-		return { ok: true } as never;
+		return { ok: true, terminal: Promise.resolve("Recovered child result") };
 	});
 	spyOn(session, "executePersistedToolCall").mockImplementation(async () => {
 		executedTools++;
@@ -182,6 +208,10 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+	const { listRunHolds, setRunHold } =
+		require("../agent-runtime/ownership") as typeof import("../agent-runtime/ownership");
+	for (const id of listRunHolds()) setRunHold(id, undefined);
+	expect(freshRuns).toEqual([]);
 	process.argv = [...originalArgs];
 	coordinator.resetUpdateCoordinationForTests();
 	mock.restore();
@@ -236,6 +266,77 @@ describe("ordinary restart eligibility and tool disposition", () => {
 });
 
 describe("ordinary restart with real persisted recovery records", () => {
+	test("M5 full startup preserves a held background task and pending permission without notifying its caller", async () => {
+		await seedAgent(true);
+		await seedTool("held-permission", "child", {
+			status: "pending",
+			permissionSuggestions: [
+				{ type: "danger_reflection", requestId: "held-approval", status: "awaiting_user" },
+			],
+		});
+		await db
+			.update(narrators)
+			.set({ substatus: '["taken_over"]' })
+			.where(eq(narrators.id, "child"));
+		const { runtimePublication } = await import("../agent-runtime/publication");
+		runtimePublication.stop();
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(prepared.manifest).toBeNull();
+		expect(prepared.protection.narratorIds.has("child")).toBe(true);
+		expect(prepared.protection.backgroundTaskIds.has("background-child")).toBe(true);
+		expect(prepared.protection.toolCallIds.has("held-permission")).toBe(true);
+		Reflect.deleteProperty(globalThis, Symbol.for("narrafork.narrator.initialized"));
+		try {
+			await session.recoverOnStartup(prepared.protection);
+			expect(
+				(
+					await db.query.backgroundTasks.findFirst({
+						where: eq(backgroundTasks.id, "background-child"),
+					})
+				)?.status,
+			).toBe("running");
+			expect(await tool("held-permission")).toMatchObject({
+				status: "pending",
+				permissionSuggestions: [
+					{ type: "danger_reflection", requestId: "held-approval", status: "awaiting_user" },
+				],
+			});
+			expect(await db.select().from(runtimePublicationOutbox)).toHaveLength(0);
+			expect(started()).toEqual([]);
+		} finally {
+			Reflect.deleteProperty(globalThis, Symbol.for("narrafork.narrator.initialized"));
+		}
+	});
+
+	test("M4 terminal persisted before idle is recovered as delivery, not a new model run", async () => {
+		await seedAgent(true);
+		const { getRuntimePublicationService, runtimePublication } = await import(
+			"../agent-runtime/publication"
+		);
+		runtimePublication.stop();
+		const pub = getRuntimePublicationService();
+		const run = await pub.startAgentRun({
+			narratorId: "child",
+			parentNarratorId: "parent",
+			resumeRunId: "run-child",
+		});
+		await pub.commitAgentTerminal({
+			run,
+			eventKind: "completed",
+			text: "durable crash answer",
+			summary: "crashed before idle",
+		});
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(prepared.manifest).toBeNull();
+		expect((await db.query.narrators.findFirst({ where: eq(narrators.id, "child") }))?.status).toBe(
+			"idle",
+		);
+		await recovery.restoreOrdinaryRestartRecovery(prepared);
+		expect(started()).toEqual([]);
+		expect((await pub.readAgentTerminalResult(run))?.output).toBe("durable crash answer");
+		expect(await db.select().from(runtimePublicationOutbox)).toHaveLength(1);
+	});
+
 	test("publishes validated previous targets before an early bounded continuation read fails", async () => {
 		await seedNarrator("parent", { type: "primary", variant: "primary", status: "idle" });
 		await seedNarrator("child", { parentNarratorId: "parent" });
@@ -327,7 +428,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		).toThrow("manifest changed");
 		expect(coordinator.getUpdateCoordinationStatus().phase).toBe("idle");
 		expect(coordinator.getUpdateCoordinationStatus().updateEpoch).toBeUndefined();
-		expect(resumed).toEqual([]);
+		expect(runs).toEqual([]);
 		expect(JSON.parse(await readFile(getNarraforkPath("restart-recovery.json"), "utf8"))).toEqual(
 			foreign,
 		);
@@ -405,7 +506,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 				expect(startup.protection.backgroundTaskIds.has("background-child")).toBe(true);
 			const ordinary = await recovery.prepareOrdinaryRestartRecovery(startup.protection);
 			expect(ordinary.manifest).toBeNull();
-			expect(resumed).toEqual([]);
+			expect(runs).toEqual([]);
 			expect(executedTools).toBe(0);
 		});
 	}
@@ -471,15 +572,53 @@ describe("ordinary restart with real persisted recovery records", () => {
 		const handle = await recovery.restoreOrdinaryRestartRecovery(prepared);
 		expect(handle).not.toBeNull();
 		await handle?.completion;
-		expect(resumed.map((input) => input.subagentId)).toEqual(["child"]);
-		expect(resumed[0]?.resumeLogicalRunId).toBe("run-child");
-		expect(continued).toEqual(["parent"]);
+		// Child and parent recover through the same entry: the child's run delivers to the
+		// waiting call once, then the parent continues from that result.
+		expect(started()).toEqual(["child", "parent"]);
+		expect(runs[0]?.run?.resumeRunId).toBe("run-child");
+		expect(runs[0]?.run?.deliver).not.toBe(false);
 		expect((await tool("agent-call"))?.status).toBe("success");
 		expect(executedTools).toBe(0);
 		const repeated = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(repeated.manifest).toBeNull();
 		expect(await recovery.restoreOrdinaryRestartRecovery(repeated)).toBeNull();
-		expect(resumed).toHaveLength(1);
+		expect(runs).toHaveLength(2);
+	});
+
+	test("a session with no parent that registers deliverTo recovers exactly like a delegated one", async () => {
+		await seedAgent();
+		// Same registration, no creation relationship: no parent, no origin, ordinary type.
+		await db
+			.update(narrators)
+			.set({
+				type: "primary",
+				variant: "primary",
+				parentNarratorId: null,
+				originToolCallId: null,
+				subagentOriginKind: null,
+			})
+			.where(eq(narrators.id, "child"));
+		// A session with neither parent nor registration is not selected.
+		await seedNarrator("plain", {
+			type: "primary",
+			variant: "primary",
+			runtimeRegistrationJson: null,
+		});
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(prepared.protection.narratorIds).toEqual(new Set(["parent", "child"]));
+		expect(prepared.manifest?.targets.map((target) => target.narratorId).sort()).toEqual([
+			"child",
+			"parent",
+		]);
+		const record = await toolContinuationService.getByToolCallId("agent-call");
+		expect(record?.kind).toBe("foreground_agent");
+		expect(record?.payloadJson?.subagentId).toBe("child");
+		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
+		// The run delivers once, then the session it delivers to continues from it.
+		expect(started()).toEqual(["child", "parent"]);
+		expect(runs[0]?.run?.resumeRunId).toBe("run-child");
+		expect((await tool("agent-call"))?.status).toBe("success");
+		expect(executedTools).toBe(0);
 	});
 
 	test("background Agent preserves its existing task and does not rerun the parent", async () => {
@@ -490,10 +629,10 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect(record?.kind).toBe("background_agent");
 		expect(record?.payloadJson?.backgroundTaskId).toBe("background-child");
 		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
-		expect(resumed).toHaveLength(1);
-		expect(resumed[0]?.preserveBackground).toBe(true);
-		expect(resumed[0]?.skipConclusionDelivery).toBe(true);
-		expect(continued).toEqual([]);
+		// Only the child's run continues; it is not bound to a caller attempt, and its
+		// result goes to its still-running task row, not into the start result.
+		expect(started()).toEqual(["child"]);
+		expect(runs[0]?.run?.cancelSignal).toBeUndefined();
 		expect((await db.select().from(backgroundTasks)).map((row) => row.id)).toEqual([
 			"background-child",
 		]);
@@ -569,7 +708,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect((await tool("started-write"))?.errorMessage).toBe(recovery.RESTART_EXECUTION_UNKNOWN);
 		const mounted = await recovery.restoreOrdinaryRestartRecovery(prepared);
 		await approvalMounted;
-		expect(resumed.some((input) => input.subagentId === "independent")).toBe(true);
+		expect(runs.some((input) => input.narratorId === "independent")).toBe(true);
 		expect(executedTools).toBe(1);
 		finishApproval();
 		await mounted?.completion;
@@ -577,10 +716,8 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect(
 			(await toolContinuationService.getByToolCallId("approval"))?.payloadJson?.recoveryStatus,
 		).not.toBe("failed");
-		expect(resumed.filter((input) => input.subagentId === "child")).toHaveLength(1);
-		expect(resumed.find((input) => input.subagentId === "child")?.resumeLogicalRunId).toBe(
-			"run-child",
-		);
+		expect(runs.filter((input) => input.narratorId === "child")).toHaveLength(1);
+		expect(runs.find((input) => input.narratorId === "child")?.run?.resumeRunId).toBe("run-child");
 		expect(await db.select({ id: narrators.id }).from(narrators)).toHaveLength(3);
 	});
 
@@ -605,7 +742,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 			const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 			finishRecoveryDiscovery();
 			await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
-			expect(resumed.map((input) => input.subagentId)).toEqual(["independent"]);
+			expect(runs.map((input) => input.narratorId)).toEqual(["independent"]);
 			expect(await toolContinuationService.getByToolCallId("agent-call")).toEqual(previous);
 		});
 	}
@@ -630,14 +767,12 @@ describe("ordinary restart with real persisted recovery records", () => {
 		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		finishRecoveryDiscovery();
 		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
-		expect(resumed).toHaveLength(1);
-		expect(resumed[0]).toMatchObject({
-			subagentId: "child",
-			resumeLogicalRunId: "run-child",
-			preserveBackground: true,
-			skipConclusionDelivery: true,
+		// Only the child's own run continues; the parent is not revived.
+		expect(runs).toHaveLength(1);
+		expect(runs[0]).toMatchObject({
+			narratorId: "child",
+			run: { resumeRunId: "run-child", recovered: true },
 		});
-		expect(continued).toEqual([]);
 		expect(executedTools).toBe(0);
 		expect(await toolContinuationService.getByToolCallId("agent-call")).toEqual(original);
 		expect(
@@ -661,7 +796,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect(await toolContinuationService.getByToolCallId("started-write")).toBeNull();
 		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
 		expect(executedTools).toBe(0);
-		expect(resumed.map((input) => input.subagentId)).toEqual(["standalone"]);
+		expect(started()).toEqual(["standalone"]);
 	});
 
 	test("pending approval and not-yet-started tools are protected, not blanket-failed", async () => {
@@ -678,7 +813,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect((await tool("approval"))?.status).toBe("pending");
 		expect((await toolContinuationService.getByToolCallId("deferred"))?.kind).toBe("deferred_tool");
 		expect(executedTools).toBe(0);
-		expect(resumed).toEqual([]);
+		expect(runs).toEqual([]);
 	});
 
 	test("scanner protects only verified execution rows, never COW history clones or legacy identities", async () => {
@@ -738,16 +873,13 @@ describe("ordinary restart with real persisted recovery records", () => {
 			expect(mountedInputs).toHaveLength(1);
 			expect(mountedInputs[0]?.permissionMode).toBe("normal");
 			expect((await tool("approval"))?.status).toBe("pending");
-			expect(resumed.map((input) => input.subagentId)).toEqual(["streaming-child"]);
+			expect(started()).toEqual(["streaming-child"]);
 		} finally {
 			releaseApproval();
 			await handle?.completion;
 		}
 		expect((await tool("approval"))?.status).toBe("success");
-		expect(resumed.map((input) => input.subagentId).sort()).toEqual([
-			"approval-child",
-			"streaming-child",
-		]);
+		expect(started().sort()).toEqual(["approval-child", "streaming-child"]);
 	});
 
 	test("terminal tool results and completed or severed legacy children are never revived", async () => {
@@ -763,15 +895,18 @@ describe("ordinary restart with real persisted recovery records", () => {
 			substatus: JSON.stringify(["taken_over"]),
 			logicalRunId: null,
 		});
-		await seedNarrator("unrelated-primary", { type: "primary", variant: "primary" });
+		await seedNarrator("unrelated-primary", {
+			type: "primary",
+			variant: "primary",
+			runtimeRegistrationJson: null,
+		});
 		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(prepared.manifest?.targets.map((row) => row.narratorId)).toEqual(["active-legacy"]);
 		expect(prepared.protection.toolCallIds.size).toBe(0);
 		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
-		expect(resumed.map((input) => input.subagentId)).toEqual(["active-legacy"]);
+		expect(started()).toEqual(["active-legacy"]);
 		expect((await tool("legacy-success"))?.outputJson).toBe("kept");
 		expect((await tool("legacy-fail"))?.outputJson).toBe("kept failure");
-		expect(continued).toEqual([]);
 		expect(executedTools).toBe(0);
 	});
 
@@ -784,10 +919,10 @@ describe("ordinary restart with real persisted recovery records", () => {
 		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(await toolContinuationService.getByToolCallId("agent-call")).toBeNull();
 		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
-		expect(resumed.map((input) => input.subagentId)).toEqual(["child"]);
-		expect(resumed[0]?.skipConclusionDelivery).toBe(true);
+		expect(started()).toEqual(["child"]);
+		// The call already has its result: the child's later run must not deliver into it.
+		expect(runs[0]?.run?.deliver).toBe(false);
 		expect((await tool("agent-call"))?.outputJson).toBe("Historical result");
-		expect(continued).toEqual([]);
 		expect(executedTools).toBe(0);
 	});
 
@@ -812,8 +947,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect(prepared.protection.toolCallIds.has("approval")).toBe(true);
 		expect((await tool("started"))?.status).toBe("fail");
 		expect(await recovery.restoreOrdinaryRestartRecovery(prepared)).toBeNull();
-		expect(resumed).toEqual([]);
-		expect(continued).toEqual([]);
+		expect(runs).toEqual([]);
 		expect(executedTools).toBe(0);
 		const manifest = JSON.parse(await readFile(getNarraforkPath("restart-recovery.json"), "utf8"));
 		expect(manifest.snapshot.updateEpoch).toBe(prepared.manifest?.snapshot.updateEpoch);
@@ -887,7 +1021,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		const cold = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect((await toolContinuationService.getByToolCallId("approval"))?.id).toBe(approvalId);
 		await (await recovery.restoreOrdinaryRestartRecovery(cold))?.completion;
-		expect(resumed.map((input) => input.subagentId).sort()).toEqual(["live", "paused"]);
+		expect(started().sort()).toEqual(["live", "paused"]);
 		expect((await tool("approval"))?.status).toBe("success");
 	});
 
@@ -924,7 +1058,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		resetRecoveryHandoffForTests();
 		const cold = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		await (await recovery.restoreOrdinaryRestartRecovery(cold))?.completion;
-		expect(resumed.map((input) => input.subagentId)).toEqual(["result-owner"]);
+		expect(started()).toEqual(["result-owner"]);
 		expect((await tool("finished"))?.outputJson).toBe("Durable signal result");
 		expect(
 			(await toolContinuationService.getByToolCallId("finished"))?.payloadJson?.recoveryPhase,
@@ -978,7 +1112,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 			"streaming-only",
 		]);
 		expect(await recovery.restoreOrdinaryRestartRecovery(cold)).toBeNull();
-		expect(resumed).toEqual([]);
+		expect(runs).toEqual([]);
 		expect(executedTools).toBe(0);
 	});
 
@@ -1019,7 +1153,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		resetRecoveryHandoffForTests();
 		const cold = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(cold.manifest).toBeNull();
-		expect(resumed).toEqual([]);
+		expect(runs).toEqual([]);
 		expect(executedTools).toBe(0);
 	});
 
@@ -1061,7 +1195,12 @@ describe("ordinary restart with real persisted recovery records", () => {
 	test("explicit manual continue resumes only the chosen subtree with --no-auto-resume", async () => {
 		process.argv.push(recovery.NO_AUTO_RESUME_FLAG);
 		await seedNarrator("chosen");
-		await seedNarrator("descendant", { parentNarratorId: "chosen" });
+		await seedNarrator("descendant", {
+			runtimeRegistrationJson: deliveringRun("descendant", {
+				narratorId: "chosen",
+				toolUseId: "use-chosen",
+			}),
+		});
 		await seedNarrator("unrelated");
 		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(prepared.protection.narratorIds.size).toBe(0);
@@ -1069,15 +1208,14 @@ describe("ordinary restart with real persisted recovery records", () => {
 		await db.update(narrators).set({ status: "idle", substatus: JSON.stringify(["interrupted"]) });
 		expect(await recovery.restoreOrdinaryRestartRecovery(prepared)).toBeNull();
 		expect(await recovery.manuallyResumeRestartRecovery("missing")).toBe(false);
-		expect(resumed).toEqual([]);
+		expect(runs).toEqual([]);
 		expect(await recovery.manuallyResumeRestartRecovery("chosen")).toBe(true);
-		expect(resumed.map((input) => input.subagentId).sort()).toEqual(["chosen", "descendant"]);
-		expect(resumed.map((input) => input.resumeLogicalRunId).sort()).toEqual([
+		expect(started().sort()).toEqual(["chosen", "descendant"]);
+		expect(runs.map((entry) => entry.run?.resumeRunId).sort()).toEqual([
 			"run-chosen",
 			"run-descendant",
 		]);
 		expect(executedTools).toBe(0);
-		expect(continued).toEqual([]);
 		// Manual entry returns after mounting; wait for its real background manifest transaction.
 		let remaining: string[] = [];
 		const deadline = Date.now() + 2_000;
@@ -1091,7 +1229,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		} while (Date.now() < deadline);
 		expect(remaining).toEqual(["unrelated"]);
 		expect(await recovery.manuallyResumeRestartRecovery("chosen")).toBe(false);
-		expect(resumed).toHaveLength(2);
+		expect(runs).toHaveLength(2);
 	});
 
 	test("idle children without interrupted tags retain eligibility for undelivered persisted results", async () => {
@@ -1128,7 +1266,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 			(await toolContinuationService.getByToolCallId("finished"))?.payloadJson?.recoveryPhase,
 		).toBe("result_written");
 		expect(await recovery.restoreOrdinaryRestartRecovery(second)).toBeNull();
-		expect(resumed).toEqual([]);
+		expect(runs).toEqual([]);
 		expect(executedTools).toBe(0);
 	});
 
@@ -1160,10 +1298,9 @@ describe("ordinary restart with real persisted recovery records", () => {
 		});
 		expect(handle).not.toBeNull();
 		await handle?.completion;
-		expect(resumed.map((input) => input.subagentId)).toEqual(["child"]);
-		expect(resumed[0]?.resumeLogicalRunId).toBe("run-child");
+		expect(started()).toEqual(["child"]);
+		expect(runs[0]?.run?.resumeRunId).toBe("run-child");
 		expect(executedTools).toBe(1);
-		expect(continued).toEqual([]);
 		expect((await tool("agent-call"))?.status).toBe("success");
 		expect((await toolContinuationService.getByToolCallId("agent-call"))?.state).toBe("paused");
 		expect(
@@ -1207,7 +1344,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect(after?.completedAt).toBe(completedAt);
 		expect(after?.errorMessage).toBeNull();
 		expect(executedTools).toBe(0);
-		expect(resumed.map((input) => input.subagentId)).toEqual(["result-owner"]);
+		expect(started()).toEqual(["result-owner"]);
 		expect(
 			(await toolContinuationService.getByToolCallId("finished"))?.payloadJson?.recoveryPhase,
 		).toBe("owner_continuation_started");
@@ -1233,7 +1370,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect((await tool("started"))?.completedAt).toBe(completedAt);
 		expect((await tool("started"))?.outputJson).toBe(recovery.RESTART_EXECUTION_UNKNOWN);
 		expect(await recovery.restoreOrdinaryRestartRecovery(second)).toBeNull();
-		expect(resumed).toEqual([]);
+		expect(runs).toEqual([]);
 		expect(executedTools).toBe(0);
 	});
 });

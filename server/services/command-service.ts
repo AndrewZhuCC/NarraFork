@@ -5,6 +5,7 @@ import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-rout
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
+import { policySourceIdOf, RUNTIME_SOURCE_COLUMNS } from "../lib/runtime-source";
 import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
 import { loadSkillSummariesForContext, resolveSkillContextForNarrator } from "./skill-service";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
@@ -468,7 +469,12 @@ export async function getSlashMenuItems(
 		resolveSkillContextForNarrator(narratorId),
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { traits: true, chapterId: true, contextProjectId: true },
+			columns: {
+				traits: true,
+				chapterId: true,
+				contextProjectId: true,
+				...RUNTIME_SOURCE_COLUMNS,
+			},
 		}),
 	]);
 	// The slash menu must hide anything the layered traits block, otherwise a
@@ -478,6 +484,7 @@ export async function getSlashMenuItems(
 				narratorTraits: narrator.traits,
 				projectId: await resolveNarratorProjectId(narrator),
 				actingUserId: userId,
+				policySourceId: policySourceIdOf(narrator),
 			})
 		: null;
 	const blockedSkills = getBlockedSkills(layeredTraits?.traits ?? narrator?.traits);

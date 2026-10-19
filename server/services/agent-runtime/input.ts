@@ -1,41 +1,7 @@
+import type { ApiRequestDiagnostics } from "../../lib/agent/types";
 import type { ImageRef } from "../../lib/uploads";
-import type { CustomSubagentDef } from "../custom-subagent-service";
 import type { ExecuteLoopResult } from "../narrator-executor";
-import type { ProxyAbortController } from "../subagent-detach";
 import { createRuntimeRecoveryState, type RuntimeRecoveryState } from "./transition";
-
-/** Entry adapters supply data and finite capabilities, never an alternate loop. */
-export interface RuntimeForegroundControl {
-	parentSignal: AbortSignal;
-	timeoutSignal?: AbortSignal;
-	proxy: ProxyAbortController;
-	turnAbort: AbortController;
-	detached: boolean;
-	cleanupTurnAbort?: () => void;
-}
-
-export interface SubagentRuntimeProfile {
-	kind: "subagent";
-	/** Durable child-run provenance retained across retries and continuation passes. */
-	executionSegmentId?: string;
-	parentNarratorId: string;
-	parentToolUseId: string;
-	subagentType: string;
-	customDefinition?: CustomSubagentDef | null;
-	systemPrompt: string;
-	initialModel?: string;
-	rebuildSystemPrompt?: (contextSummary?: string | null) => Promise<string>;
-	initialHistory: unknown[];
-	/** Host-prepared current packet paired with initialHistory; never raw caller text. */
-	initialCurrentText?: string;
-	initialTrailingToolResults?: unknown[];
-	initialPrePromptBashCommand?: string;
-	control?: RuntimeForegroundControl;
-}
-
-export type RuntimeProfile =
-	| { kind: "primary"; initialPrePromptBashCommand?: string }
-	| SubagentRuntimeProfile;
 
 export type RuntimeInput =
 	| { kind: "current"; text: string; images?: ImageRef[] }
@@ -44,7 +10,7 @@ export type RuntimeInput =
 	| { kind: "inbox"; deliveryId: string; epoch: string }
 	| { kind: "continuation"; source: string };
 
-/** One mutable run state shared across retries, compacts and user-control resumes. */
+/** One mutable run state shared across retries, compacts and held-run resumes. */
 export interface RuntimeRunState {
 	input: Extract<RuntimeInput, { kind: "current" }>;
 	recovery: RuntimeRecoveryState;
@@ -57,29 +23,42 @@ export interface RuntimeRunState {
 	finalText: string;
 	hitMaxTurns: boolean;
 	totalTokens: number;
+	/** Stop hooks follow the capability ceiling of the last pass. */
+	stopHooks: boolean;
 }
 
 export function createRuntimeRunState(
 	input: Extract<RuntimeInput, { kind: "current" }>,
-	profile: RuntimeProfile,
+	prePromptBashCommand?: string,
 ): RuntimeRunState {
 	return {
 		input,
 		recovery: createRuntimeRecoveryState(),
 		firstPass: true,
 		initialSettingsApplied: false,
-		pendingPrePromptBashCommand: profile.initialPrePromptBashCommand,
+		pendingPrePromptBashCommand: prePromptBashCommand,
 		hadError: false,
 		wasInterrupted: false,
 		finalText: "",
 		hitMaxTurns: false,
 		totalTokens: 0,
+		stopHooks: true,
 	};
 }
 
+/** Machine-readable status is distinct from the caller's display text. */
+export interface RuntimeTerminalStatus {
+	substatus: string[];
+	errorCode?: string;
+	errorMessage?: string;
+	diagnostics?: ApiRequestDiagnostics;
+}
+
 export interface RuntimeRunOutcome {
+	terminalStatus?: RuntimeTerminalStatus;
 	started: boolean;
 	allowInboxWake?: boolean;
+	freshInput?: boolean;
 	finalText?: string;
 	hasError?: boolean;
 	aborted?: boolean;

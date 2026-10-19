@@ -4,7 +4,7 @@ import { db } from "../db";
 import { chapters, projects } from "../db/schema";
 import { buildHistory, resolveProviderAndModel } from "../lib/agent";
 import { estimateJsonTokens } from "../lib/agent/estimate-json-tokens";
-import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import { isPlanModeTrait } from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
 import type { Locale } from "../lib/prompt-i18n";
 import {
@@ -13,6 +13,7 @@ import {
 	resolveProvider,
 	settings,
 } from "../lib/settings";
+import { isTopLevelMessage } from "./agent-runtime/history";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
@@ -75,10 +76,14 @@ export async function estimateNarratorBuildHistoryTokens(
 		...options,
 		deadline,
 	});
-	const isSubagentNarrator = isSubagentVariant(narrator.variant);
-	const dbMessages = isSubagentNarrator
-		? rawMessages.map((message) => ({ ...message, parentToolUseId: null }))
-		: rawMessages;
+	// Historical transcript mounting is top level even without a live delivery target.
+	const { readSessionOwnTurnPlacement } = await import("./narrator-session");
+	const ownPlacement = await readSessionOwnTurnPlacement(narratorId);
+	const dbMessages = rawMessages.map((message) =>
+		message.parentToolUseId && isTopLevelMessage(message, ownPlacement)
+			? { ...message, parentToolUseId: null }
+			: message,
+	);
 
 	const effectiveModel =
 		narrator.model === FOLLOW_PARENT_MODEL

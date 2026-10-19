@@ -12,7 +12,7 @@ import {
 	ARCHIVE_TABLE_ORDER,
 	type ArchiveTable,
 } from "./manifest";
-import { sanitizeLegacyPolicyRow } from "./untrusted-policy";
+import { portableRuntimeControllerId, sanitizeLegacyPolicyRow } from "./untrusted-policy";
 import { postgresArchiveConnection } from "./worker-postgres-store";
 import { sqliteArchiveConnection } from "./worker-sqlite-store";
 
@@ -162,6 +162,11 @@ export async function runLegacyImportWorker(
 			for (const row of batch.rows) {
 				check();
 				if (typeof row.id !== "string" || !row.id) throw new Error("Invalid archive row ID");
+				if (batch.table === "narrators") {
+					const controller = portableRuntimeControllerId(row);
+					if (controller && !archiveIds.get("narrators")?.has(controller))
+						throw new Error("Missing self-contained runtime controller dependency");
+				}
 				for (const [field, dependency] of Object.entries(
 					ARCHIVE_INTERNAL_REFERENCES[batch.table] ?? {},
 				)) {

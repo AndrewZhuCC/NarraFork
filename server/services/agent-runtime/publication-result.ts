@@ -1,8 +1,11 @@
 /** Bounded, dialect-neutral parsing for Await's per-run result projection. */
+export type AgentTerminalEvent = "completed" | "failed" | "timed_out" | "cancelled";
 export interface AgentTerminalResult {
 	output: string;
 	/** Exact source used for this output, captured by the reader before any later run can start. */
 	sourceResultRef?: string;
+	/** Requested only by recovery; ordinary Await's output shape is unchanged. */
+	eventKind?: AgentTerminalEvent;
 }
 export interface AwaitedTerminalConsumeOptions {
 	sourceResultRef?: string;
@@ -19,6 +22,7 @@ export function agentSourceResultRef(value: unknown): string | undefined {
 export interface AgentTerminalResultReadOptions {
 	/** Trusted observation of this exact run settling, not merely an initially idle actor. */
 	settledRunId?: string;
+	includeEventKind?: boolean;
 }
 export const AGENT_RESULT_JSON_MAX_BYTES = 128 * 1024;
 export const AGENT_RESULT_OUTPUT_CHARS = 12_000;
@@ -55,6 +59,7 @@ function blocks(raw: string | null): Record<string, unknown>[] | null {
 export function decodeAgentTerminalSnapshot(
 	raw: string | null,
 	logicalRunId: string,
+	includeEventKind = false,
 ): AgentTerminalResult | null {
 	const body = blocks(raw);
 	if (!body) return null;
@@ -71,7 +76,16 @@ export function decodeAgentTerminalSnapshot(
 			const sourceResultRef = agentSourceResultRef(
 				"sourceResultRef" in receipt ? receipt.sourceResultRef : undefined,
 			);
+			const event = "eventKind" in receipt ? receipt.eventKind : undefined;
+			const eventKind =
+				event === "completed" ||
+				event === "failed" ||
+				event === "timed_out" ||
+				event === "cancelled"
+					? event
+					: undefined;
 			return {
+				...(includeEventKind && eventKind ? { eventKind } : {}),
 				output: boundedOutput(block.text, "truncated" in receipt && receipt.truncated === true),
 				...(sourceResultRef ? { sourceResultRef } : {}),
 			};

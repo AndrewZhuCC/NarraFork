@@ -6,14 +6,10 @@
  * narrators already enjoy.
  */
 
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { narrators } from "../db/schema";
 import { TRANSIENT_RETRY_BASE_MS } from "../lib/agent/types";
 import { eventBus } from "../lib/event-bus";
 import { getToolMessage } from "../lib/i18n";
 import { logger } from "../lib/logger";
-import { isSubagentVariant } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { getAutoCompactKeepPairs, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -21,6 +17,7 @@ import { narratorService } from "./narrator-service";
 import {
 	awaitCompactCompletion,
 	markCompactAsBlocking,
+	readSessionDeliverTo,
 	runCustomCompact,
 } from "./narrator-session";
 import { compactLocks, hasPendingHistoryCompact } from "./narrator-session-state";
@@ -403,17 +400,14 @@ export async function handleTransientError(opts: {
 	eventBus.emit({ type: "narrator:warning", narratorId, message: error });
 	broadcastToNarrator(narratorId, warningPayload);
 
-	// If this is a subagent, also notify the parent narrator so SubagentCard
-	// can display the retry status inline.
+	// A run that delivers its result to a tool call also shows the retry on that
+	// call's card (SubagentCard), in the session it delivers to.
 	try {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { variant: true, parentNarratorId: true },
-		});
-		if (narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
-			broadcastToNarrator(narrator.parentNarratorId, {
+		const deliverTo = await readSessionDeliverTo(narratorId);
+		if (deliverTo) {
+			broadcastToNarrator(deliverTo.narratorId, {
 				type: "subagent_warning",
-				narratorId: narrator.parentNarratorId,
+				narratorId: deliverTo.narratorId,
 				subagentNarratorId: narratorId,
 				message: error,
 				retryCount,

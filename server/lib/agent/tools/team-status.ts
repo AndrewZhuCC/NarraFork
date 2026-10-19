@@ -434,7 +434,14 @@ export const teamStatusTool: ToolDefinition = {
 						kind: "send",
 						broadcast: true,
 						await: false,
-						warning,
+						// Codes, not prose: the message bubble renders these two sentences from
+						// its own translations. Only per-target failure lines are free text
+						// (`warningDetails`) — `output` above keeps the English for the model.
+						warningCodes: [
+							"broadcastWorkingOnly",
+							...(ctx.signal.aborted ? ["broadcastCancelled"] : []),
+						],
+						...(failures.length > 0 ? { warningDetails: failures } : {}),
 						targetNames,
 						recentIdle: idleSuggestions,
 						recentIdleTruncated,
@@ -501,7 +508,12 @@ export const teamStatusTool: ToolDefinition = {
 						broadcast: false,
 						await: false,
 						targetCount: 1,
-						...(warning ? { warning: warning.trim() } : {}),
+						// The bubble builds this sentence from its own translations; the status
+						// travels as a raw value so the words come from the shared `status_*`
+						// wording rather than from a second copy here.
+						...(warning
+							? { warningCodes: ["sendTargetNotWorking"], warningStatus: target.status }
+							: {}),
 						targets: [
 							{
 								id: target.id,

@@ -61,17 +61,12 @@ import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { getSubagentType, isSubagentVariant } from "../lib/narrator-utils";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import {
-	assertRuntimeCanAskQuestion,
-	type RuntimePolicy,
-	resolveRuntimePolicy,
-} from "./agent-runtime/policy";
+import { assertRuntimeCanAskQuestion, type RuntimePolicy } from "./agent-runtime/policy";
 import { coerceAskQuestions } from "./ask-user-question-coerce";
-import { customSubagentService } from "./custom-subagent-service";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
 
@@ -405,24 +400,10 @@ async function broadcastChange(
 // Creation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Resolve question authority from persisted identity, never a model-supplied parent hint. */
+/** Resolve question authority from the narrator's stored ceiling, never a model-supplied hint. */
 export async function resolveNarratorQuestionPolicy(narratorId: string): Promise<RuntimePolicy> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { variant: true },
-	});
-	if (!narrator) throw new Error("Question narrator not found.");
-	const subagentType = getSubagentType(narrator.variant);
-	const builtin = ["explore", "plan", "review", "search", "general"];
-	const customDefinition =
-		subagentType && !builtin.includes(subagentType)
-			? await customSubagentService.loadByName(subagentType)
-			: undefined;
-	return resolveRuntimePolicy({
-		variant: isSubagentVariant(narrator.variant) ? "subagent" : "primary",
-		subagentType: subagentType ?? undefined,
-		customDefinition,
-	});
+	const { resolveNarratorRuntimePolicy } = await import("./trait-layer-service");
+	return resolveNarratorRuntimePolicy(narratorId);
 }
 
 export async function assertNarratorCanAskQuestion(narratorId: string): Promise<RuntimePolicy> {

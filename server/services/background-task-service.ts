@@ -35,12 +35,13 @@ import { db } from "../db";
 import { backgroundTasks, deviceTransferTasks, narrators, narratorToolCalls } from "../db/schema";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import type { ToolCallBinding, ToolExecutionTarget } from "../lib/agent/types";
+import { narratorTraitsLock } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { parseSubstatus } from "../lib/narrator-utils";
+import { parseSubstatus, parseTraits } from "../lib/narrator-utils";
 import { escapeLikeNeedle } from "../lib/sql-like";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
 import {
@@ -813,6 +814,8 @@ class BackgroundTaskService {
 		toolUseId?: string;
 		alias?: string;
 		title?: string;
+		/** Relations of the run this task projects (new run, or a re-registration on adopt). */
+		binding?: import("../lib/validators/runtime-registration").RunBindingInput;
 	}): Promise<BackgroundTaskRecord> {
 		const now = new Date().toISOString();
 		const pub = getRuntimePublicationService();
@@ -923,6 +926,7 @@ class BackgroundTaskService {
 			narratorId: opts.subagentNarratorId,
 			parentNarratorId: opts.parentNarratorId,
 			taskRow,
+			binding: opts.binding,
 		});
 		// On SQLite, startAgentRun ignores taskRow — insert the task row
 		// in the legacy sync path.
@@ -1667,6 +1671,55 @@ class BackgroundTaskService {
 
 	// ── Query ───────────────────────────────────────────────────────────
 
+	/**
+	 * Project a narrator as running background work: the narrator fields (and the
+	 * `background` trait) that Await, Stop, TeamStatus and the task drawer read beside
+	 * its task row. Under narratorTraitsLock with a fresh read, because `traits` is a
+	 * whole-column JSON array: writing an earlier copy would drop any trait written since.
+	 */
+	async markNarratorRunning(narratorId: string): Promise<void> {
+		await narratorTraitsLock.acquire(narratorId, async () => {
+			const current = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { traits: true },
+			});
+			await db
+				.update(narrators)
+				.set({
+					isBackground: true,
+					backgroundStatus: "running",
+					backgroundResult: null,
+					backgroundCompletedAt: null,
+					traits: [...new Set([...parseTraits(current?.traits), "background"])],
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId));
+		});
+		backgroundOccupancyStore.refreshNarrator(narratorId);
+	}
+
+	/** The narrator side of an ended task projection (its row was settled separately). */
+	async markNarratorTerminal(
+		narratorId: string,
+		status: "completed" | "failed" | "cancelled",
+		result: string,
+		where?: { logicalRunId: string },
+	): Promise<void> {
+		await db
+			.update(narrators)
+			.set({
+				backgroundStatus: status,
+				backgroundResult: result,
+				backgroundCompletedAt: new Date().toISOString(),
+			})
+			.where(
+				where
+					? and(eq(narrators.id, narratorId), eq(narrators.logicalRunId, where.logicalRunId))
+					: eq(narrators.id, narratorId),
+			);
+		backgroundOccupancyStore.refreshNarrator(narratorId);
+	}
+
 	async getById(taskId: string): Promise<BackgroundTaskRecord | null> {
 		if (resolveRuntimeQueueBackend() === "postgres") {
 			// PG path: route through the named bounded read in the publication facade.
@@ -2254,7 +2307,7 @@ class BackgroundTaskService {
 	 *
 	 * Rows that ALSO have a unified task row are excluded. This is not only about
 	 * old data: every background subagent alive today writes both
-	 * (`narrators.is_background = 1` in subagent-runner/subagent-detach, then
+	 * (`narrators.is_background = 1` in subagent-runner/agent-runtime/run, then
 	 * `createAgentTask` with the same id), so without this the current path yields
 	 * each running subagent twice — double-counting `activeCount`, halving the
 	 * effective page size, and letting the legacy projection (no alias, no
@@ -2933,17 +2986,52 @@ class BackgroundTaskService {
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<WaitResult> {
+		const deadline = Date.now() + timeoutMs;
+		// Terminal intent commits before idle, but a waiter must observe the complete
+		// finalizer (including visible status), not its intermediate task-row commit.
+		const afterFinalizer = async (result: WaitResult): Promise<WaitResult> => {
+			if (result.publicationRun?.producerKind !== "agent" || !result.terminalResultReceived)
+				return result;
+			const { getRunControl } = await import("./agent-runtime/ownership");
+			const run = getRunControl(taskId);
+			if (run?.logicalRunId !== result.publicationRun.logicalRunId) return result;
+			// Keep the caller's original cancellation and budget during this last,
+			// bounded wait too; a blocked status write must not strand Await.
+			return new Promise<WaitResult>((resolve) => {
+				const cleanup = () => {
+					clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
+				};
+				const onAbort = () => {
+					cleanup();
+					resolve({ status: "aborted", output: this.getOutputBuffer(taskId) });
+				};
+				const timer = setTimeout(
+					() => {
+						cleanup();
+						resolve({ status: "timeout", output: this.getOutputBuffer(taskId) });
+					},
+					Math.max(0, deadline - Date.now()),
+				);
+				signal?.addEventListener("abort", onAbort, { once: true });
+				void run.terminal.then(() => {
+					cleanup();
+					resolve(result);
+				});
+				if (signal?.aborted) onAbort();
+			});
+		};
 		// Check if already done
 		const task = await this.getById(taskId);
 		if (task && task.status !== "running") {
-			return {
+			return afterFinalizer({
 				status: toWaitStatus(task.status),
 				output: task.output,
 				...terminalWaitReceipt(task),
-			};
+			});
 		}
 
-		return new Promise<WaitResult>((resolve) => {
+		const result = await new Promise<WaitResult>((resolve) => {
 			let settled = false;
 			let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -3041,6 +3129,7 @@ class BackgroundTaskService {
 					// Live lifecycle listeners remain authoritative if the recheck fails.
 				});
 		});
+		return afterFinalizer(result);
 	}
 
 	async waitForText(
@@ -3343,7 +3432,37 @@ class BackgroundTaskService {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			return this.recoverStaleTasksAfterRestart(protectedTaskIds, scanned.at(-1)?.id);
 		};
+		// A failed source transaction may have left a same-run terminal checkpoint.
+		// Finish it through the one run finalizer before the generic stale-task path
+		// can replace the answer with a synthetic restart cancellation.
+		const restoredTerminals = new Set<string>();
+		for (const task of scanned) {
+			if (task.type !== "agent" || !task.logicalRunId || protectedTaskIds.has(task.id)) continue;
+			const checkpoint = await db.query.narrators.findFirst({
+				where: eq(narrators.id, task.subagentNarratorId ?? task.id),
+				columns: { id: true, logicalRunId: true, backgroundCompletedAt: true, substatus: true },
+			});
+			if (
+				checkpoint?.logicalRunId !== task.logicalRunId ||
+				!checkpoint.backgroundCompletedAt ||
+				!parseSubstatus(checkpoint.substatus).includes(`terminal_run:${task.logicalRunId}`)
+			)
+				continue;
+			const { startNarratorRun } = await import("./agent-runtime/run");
+			const handle = await startNarratorRun({
+				narratorId: checkpoint.id,
+				locale: "en",
+				text: "",
+				recovered: true,
+				resumeRunId: task.logicalRunId,
+			});
+			if (handle.started) await handle.completion;
+			// A live owner or failed commit retains its reservation/checkpoint; never
+			// fall through and publish a different terminal for the same run.
+			restoredTerminals.add(task.id);
+		}
 		const staleTasks = scanned
+			.filter((task) => !restoredTerminals.has(task.id))
 			// Only an agent row can be protected — see the note above on why a bash row
 			// has no resume path to protect.
 			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));

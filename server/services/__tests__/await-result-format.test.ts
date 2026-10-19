@@ -21,13 +21,10 @@ const {
 	getBackgroundTaskTerminalVersion,
 	resolveBackgroundTaskEffectiveStatus,
 } = await import("../background-task-service");
-const {
-	claimSubagentUpdateExecutionLease,
-	listRunningSubagentExecutions,
-	registerRunningSubagentExecution,
-	resolveBackgroundCompletionOutcome,
-	resolveSubagentExecutionTiming,
-} = await import("../subagent-runner");
+const { claimSubagentUpdateExecutionLease } = await import("../subagent-runner");
+const { listDeliveringRuns } = await import("../agent-runtime/run");
+const { setRunControl, tryClaimExecution } = await import("../agent-runtime/ownership");
+const { registerRun, runDeadlineAt } = await import("../../lib/validators/runtime-registration");
 const updateCoordinator = await import("../update-coordinator");
 const { getRuntimePublicationService, runtimePublication } = await import(
 	"../agent-runtime/publication"
@@ -295,34 +292,35 @@ describe("Await question result wording", () => {
 	});
 });
 
-describe("recovered Agent execution deadline", () => {
-	test("uses remaining wall time while preserving the original timeout label", () => {
-		const timing = resolveSubagentExecutionTiming({
-			now: Date.parse("2026-07-20T12:00:04.000Z"),
-			timeoutMs: 6_000,
-			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
-			executionTimeoutMs: 10_000,
-		});
-
-		expect(timing).toEqual({
-			remainingTimeoutMs: 6_000,
-			timeoutLabelMs: 10_000,
-			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
-			expiredAtMount: false,
-		});
+describe("recovered run execution deadline", () => {
+	test("a run's deadline is absolute: re-registering the same run never restarts it", () => {
+		const startedAt = Date.parse("2026-07-20T12:00:00.000Z");
+		const deadlineAt = runDeadlineAt(10_000, startedAt);
+		expect(deadlineAt).toBe("2026-07-20T12:00:10.000Z");
+		const deliverTo = { narratorId: "parent-agent", toolUseId: "origin-tool" };
+		const first = registerRun(null, "run-1", { deliverTo, deadlineAt }, 0);
+		// Recovery (or detach) four seconds later restates the binding with a fresh timeout.
+		const recovered = registerRun(
+			first,
+			"run-1",
+			{ deliverTo, deadlineAt: runDeadlineAt(10_000, startedAt + 4_000) },
+			7,
+		);
+		expect(recovered.run?.deadlineAt).toBe("2026-07-20T12:00:10.000Z");
+		expect(recovered.run?.historyStartSeq).toBe(0);
+		// A new logical run starts its own deadline.
+		const next = registerRun(
+			recovered,
+			"run-2",
+			{ deliverTo, deadlineAt: runDeadlineAt(10_000, startedAt + 4_000) },
+			7,
+		);
+		expect(next.run?.deadlineAt).toBe("2026-07-20T12:00:14.000Z");
 	});
 
-	test("mounts an expired recovered Agent as an immediate original timeout", () => {
-		const timing = resolveSubagentExecutionTiming({
-			now: Date.parse("2026-07-20T12:00:11.000Z"),
-			timeoutMs: 0,
-			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
-			executionTimeoutMs: 10_000,
-		});
-
-		expect(timing.remainingTimeoutMs).toBe(0);
-		expect(timing.timeoutLabelMs).toBe(10_000);
-		expect(timing.expiredAtMount).toBe(true);
+	test("no timeout registers no deadline", () => {
+		expect(runDeadlineAt(0)).toBeUndefined();
+		expect(runDeadlineAt(undefined)).toBeUndefined();
 	});
 });
 
@@ -368,55 +366,37 @@ describe("subagent update execution lease", () => {
 		claimed?.release();
 	});
 
-	test("exposes a running background Agent to planned-update checkpoint inventory", () => {
-		const unregister = registerRunningSubagentExecution({
-			subagentId: "background-checkpoint-agent",
-			parentNarratorId: "parent-agent",
-			toolUseId: "background-checkpoint-tool",
-			timeoutMs: 300_000,
-			executionDeadlineAt: "2026-07-20T12:05:00.000Z",
-			background: true,
-		});
+	test("exposes a running delivering run to planned-update checkpoint inventory", () => {
+		const id = "background-checkpoint-agent";
+		const owner = tryClaimExecution(id, "run");
+		if (!owner) throw new Error("expected a free execution slot");
 		try {
-			expect(listRunningSubagentExecutions()).toContainEqual(
-				expect.objectContaining({
-					subagentId: "background-checkpoint-agent",
-					toolUseId: "background-checkpoint-tool",
-					background: true,
-				}),
-			);
+			setRunControl(owner, {
+				startedAt: Date.now(),
+				cancel: new AbortController(),
+				timedOut: false,
+				terminal: new Promise(() => {}),
+				logicalRunId: "checkpoint-run",
+				deliverTo: { narratorId: "parent-agent", toolUseId: "background-checkpoint-tool" },
+				deadlineAt: "2026-07-20T12:05:00.000Z",
+			});
+			expect(listDeliveringRuns()).toContainEqual({
+				narratorId: id,
+				recipientId: "parent-agent",
+				toolUseId: "background-checkpoint-tool",
+				startedAt: expect.any(Number),
+				deadlineAt: "2026-07-20T12:05:00.000Z",
+				logicalRunId: "checkpoint-run",
+			});
 		} finally {
-			unregister();
+			owner.release();
 		}
-		expect(
-			listRunningSubagentExecutions().some(
-				(entry) => entry.subagentId === "background-checkpoint-agent",
-			),
-		).toBe(false);
+		// The run record is gone with its owner.
+		expect(listDeliveringRuns().some((entry) => entry.narratorId === id)).toBe(false);
 	});
 });
 
 describe("background task status resolution", () => {
-	test("execution timeout takes precedence over empty output or abort state", () => {
-		expect(
-			resolveBackgroundCompletionOutcome({
-				timedOut: true,
-				hasError: false,
-				aborted: true,
-			}),
-		).toBe("timeout");
-	});
-
-	test("an aborted task is not treated as completed", () => {
-		expect(
-			resolveBackgroundCompletionOutcome({
-				timedOut: false,
-				hasError: false,
-				aborted: true,
-			}),
-		).toBe("failed");
-	});
-
 	test("a completed historical run becomes continued while its narrator is active", () => {
 		expect(
 			resolveBackgroundTaskEffectiveStatus({

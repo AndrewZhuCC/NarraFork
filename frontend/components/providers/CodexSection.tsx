@@ -83,12 +83,16 @@ import { reconcileCodexBrowserAuthState } from "./codex-browser-auth-state";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
+import type { CustomApiProtocol } from "./types";
 
 interface CodexSectionProps {
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
+	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
+	modelProtocols: Record<string, CustomApiProtocol>;
+	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
@@ -395,6 +399,8 @@ export const CodexSection = React.memo(function CodexSection({
 	onToggleHidden,
 	customModels,
 	onCustomModelsChange,
+	modelProtocols,
+	onModelProtocolChange,
 	modelContextWindows,
 	onContextWindowChange,
 	onTestModel,
@@ -1885,6 +1891,8 @@ export const CodexSection = React.memo(function CodexSection({
 								models={codexModelIds.map((id) => ({ value: `codex:${id}`, label: id }))}
 								hiddenModels={hiddenModels}
 								onToggleHidden={onToggleHidden}
+								modelProtocols={modelProtocols}
+								onModelProtocolChange={onModelProtocolChange}
 								modelContextWindows={modelContextWindows}
 								defaultContextWindows={builtinContextWindows}
 								onContextWindowChange={onContextWindowChange}

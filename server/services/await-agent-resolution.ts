@@ -108,7 +108,7 @@ export function singleSendSelector(input: Record<string, unknown>): string | und
 
 /**
  * Field marking a tool call whose target subagent is currently TAKEN OVER by the
- * user (`subagent-takeover.ts`).
+ * user (a run hold, `agent-runtime/ownership.ts`).
  *
  * Why the parent's card needs it at all: a takeover leaves the parent narrator
  * blocked — a foreground Agent/Task call stays suspended in

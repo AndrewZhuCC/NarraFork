@@ -25,7 +25,9 @@ const { getRuntimePublicationService, runtimePublication } = await import(
 const { awaitTool, listRunningAgentAwaitsForSubagent, listRunningAwaits } = await import(
 	"../../lib/agent/tools/await"
 );
-const { markTakenOver, clearTakenOver } = await import("../subagent-takeover");
+const { setRunHold } = await import("../agent-runtime/ownership");
+const markTakenOver = (id: string) => setRunHold(id, { released: false });
+const clearTakenOver = (id: string) => setRunHold(id, undefined);
 const parent = "await-receipt-parent";
 const child = "await-receipt-child";
 const taskId = "await-receipt-bash";
@@ -471,43 +473,6 @@ test("background agent fast result uses its terminal task row, not current run l
 	});
 });
 
-test("legacy background completion binds the epoch captured before the wait", async () => {
-	await db
-		.update(narrators)
-		.set({
-			isBackground: true,
-			traits: ["background"],
-			backgroundStatus: "running",
-			status: "idle",
-		})
-		.where(eq(narrators.id, child));
-	const waiting = awaitAgentResultDetailed({
-		callerNarratorId: parent,
-		id: child,
-		signal: new AbortController().signal,
-		timeoutMs: 1000,
-	});
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	await db
-		.update(narrators)
-		.set({ backgroundStatus: "completed", backgroundResult: "legacy final" })
-		.where(eq(narrators.id, child));
-	commitAgentResult(agentRun, "legacy final");
-	eventBus.emit({
-		type: "narrator:background_task_completed",
-		narratorId: parent,
-		parentNarratorId: parent,
-		taskNarratorId: child,
-		toolUseId: "legacy-tool",
-		resultPreview: "legacy final",
-	});
-	expect(await waiting).toMatchObject({
-		terminalResultReceived: true,
-		publicationRun: agentRun,
-		output: "legacy final",
-	});
-});
-
 test("foreground subscribe recheck binds the terminal continuation", async () => {
 	commitAgentResult();
 	const current = await narratorService.getById(child);
@@ -620,7 +585,12 @@ test("early failed continuation without a new assistant never consumes old text"
 	});
 	const terminal = await awaitTool.execute({ type: "agent", id: child }, ctx());
 	expect(terminal.output).toContain("early failure");
-	expect(consume.mock.calls[0]?.[0]).toEqual(next);
+	expect(consume.mock.calls[0]?.[0]).toEqual({
+		producerKind: next.producerKind,
+		taskId: next.taskId,
+		recipientId: next.recipientId,
+		logicalRunId: next.logicalRunId,
+	});
 });
 
 test("deferred continuation requires a post-boundary assistant and observed same-run settlement", async () => {
@@ -687,47 +657,6 @@ test("background agent waiter sourceResultRef is forwarded without a new result 
 	expect(consume).toHaveBeenCalledWith(agentRun, { sourceResultRef: "message:background-answer" });
 });
 
-test("generic background agent completion forwards its reader-bound sourceResultRef", async () => {
-	const next = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
-	await db
-		.update(narrators)
-		.set({
-			isBackground: true,
-			traits: ["background"],
-			backgroundStatus: "running",
-			status: "working",
-		})
-		.where(eq(narrators.id, child));
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	const waiting = awaitTool.execute({ type: "agent", id: child }, ctx());
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	appendAssistant("generic-background-answer", "generic background final", 0);
-	await db
-		.update(narrators)
-		.set({
-			status: "idle",
-			backgroundStatus: "completed",
-			backgroundResult: "generic background final",
-		})
-		.where(eq(narrators.id, child));
-	eventBus.emit({
-		type: "narrator:background_task_completed",
-		narratorId: parent,
-		parentNarratorId: parent,
-		taskNarratorId: child,
-		toolUseId: "generic-tool",
-		resultPreview: "generic background final",
-	});
-	const result = await waiting;
-	expect(result.output).toContain("generic background final");
-	expect(consume).toHaveBeenCalledWith(next, {
-		sourceResultRef: "message:generic-background-answer",
-	});
-});
-
 test("Await forwards the exact deferred source even when another run starts before consume", async () => {
 	runtimePublication.stop();
 	appendAssistant("prior-answer", "old run answer", 0);
@@ -750,7 +679,15 @@ test("Await forwards the exact deferred source even when another run starts befo
 	const result = await waiting;
 	expect(result.output).toContain("awaited run answer");
 	expect(result.output).not.toContain("later run answer");
-	expect(observer).toHaveBeenCalledWith(next, { sourceResultRef: "message:awaited-answer" });
+	expect(observer).toHaveBeenCalledWith(
+		{
+			producerKind: next.producerKind,
+			taskId: next.taskId,
+			recipientId: next.recipientId,
+			logicalRunId: next.logicalRunId,
+		},
+		{ sourceResultRef: "message:awaited-answer" },
+	);
 	expect(db.select().from(runtimeAwaitedTerminalConsumptions).all()[0]?.sourceResultRef).toBe(
 		"message:awaited-answer",
 	);

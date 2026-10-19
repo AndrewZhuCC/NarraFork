@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { settings } from "../../../settings";
 import type { AgentConfig, ToolContext, ToolUpdateExecutionLease } from "../../types";
 
@@ -264,17 +264,27 @@ describe("Agent archive / unarchive commands", () => {
 			interruptAndArchiveSubagent: async (id: string) => {
 				const n = narrators.get(id);
 				if (!n) return { ok: false, error: "not_found", id };
+				const alreadyArchived = n.status === "archived";
 				cancelled.push(id);
 				hardInterrupts.push(id);
 				closed.push(id);
-				statusUpdates.push({ id, status: "archived" });
-				n.status = "archived";
-				return { ok: true, alreadyArchived: false, archived: true, interrupted: true, id };
+				if (!alreadyArchived) {
+					statusUpdates.push({ id, status: "archived" });
+					n.status = "archived";
+				}
+				return { ok: true, alreadyArchived, archived: !alreadyArchived, interrupted: true, id };
 			},
 			archiveRetiredSubagents: async (ids: readonly string[]) =>
 				ids.map((id) => ({ ok: true, id, alreadyArchived: false, archived: true })),
 		}));
 
+		// In-memory fixtures carry no stored ceiling; the real ceiling path is covered by
+		// narrator-unified-runtime-contract.test.ts.
+		const traitLayers = await import("@server/services/trait-layer-service");
+		const { UNRESTRICTED_RUNTIME_POLICY } = await import("@server/services/agent-runtime/policy");
+		spyOn(traitLayers, "resolveNarratorRuntimePolicy").mockResolvedValue(
+			UNRESTRICTED_RUNTIME_POLICY,
+		);
 		({ agentTool } = await import("../task"));
 	});
 
@@ -368,9 +378,12 @@ describe("Agent archive / unarchive commands", () => {
 
 	test("archive rejects non-subagents and foreign subagents", async () => {
 		seed();
+		// Archiving is a control grant: a session nobody registered as controllable
+		// (here the caller itself) is refused the same way as a foreign one.
 		const notSub = await agentTool.execute({ archive: "parent" }, makeCtx());
 		expect(notSub.isError).toBe(true);
-		expect(notSub.output).toContain("not a subagent");
+		expect(notSub.output).toContain("not a direct child");
+		expect(narrators.get("parent")?.status).toBe("working");
 
 		const foreign = await agentTool.execute({ archive: "foreign" }, makeCtx("parent"));
 		expect(foreign.isError).toBe(true);

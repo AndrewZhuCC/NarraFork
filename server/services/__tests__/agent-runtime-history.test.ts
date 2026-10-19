@@ -72,10 +72,14 @@ afterEach(() => {
 	settings.geminiProviders = originalGeminiProviders;
 });
 afterAll(() => sqlite.close());
+/**
+ * "subagent" names the session shape whose run delivers to the "origin" call: its own
+ * turns are placed under that call. The rule is the same for every session.
+ */
 function options(profile: "primary" | "subagent" = "primary", official = false) {
 	return {
 		narratorId: profile === "primary" ? "primary" : "child",
-		profile,
+		ownTurnPlacement: profile === "subagent" ? "origin" : null,
 		model: "claude-sonnet-4",
 		provider: official ? "history-official" : "history-relay",
 	};
@@ -688,7 +692,7 @@ test("snapshot-only accepted input recovers frozen attachment bytes without reso
 });
 
 test("real loader plus currentRevision adoption retain exact history identity and current-input guard", async () => {
-	const owner = tryClaimExecution("primary", "primary");
+	const owner = tryClaimExecution("primary", "run");
 	if (!owner) throw new Error("Missing owner");
 	const store = createMailboxStore(db);
 	const result = store.enqueue({
@@ -741,7 +745,7 @@ test("real loader plus currentRevision adoption retain exact history identity an
 });
 
 test("grouped extracted sys receipts require the exact projected packet before adoption", async () => {
-	const owner = tryClaimExecution("primary", "primary");
+	const owner = tryClaimExecution("primary", "run");
 	if (!owner) throw new Error("Missing owner");
 	const store = createMailboxStore(db);
 	const result = store.enqueue({
@@ -881,7 +885,7 @@ test.each([
 		if (mode === "relay") expect(recovered.currentText).toContain('image: "logo.png"');
 		const child = await buildRuntimeHistory({
 			...runtimeOptions,
-			profile: "subagent",
+			ownTurnPlacement: "origin",
 			sourceMessages: [{ ...user, parentToolUseId: "origin" }],
 			currentInput: user.contentText,
 		});

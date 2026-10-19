@@ -15,12 +15,10 @@ import {
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
-import type { RuntimeProfile } from "../agent-runtime/input";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
-import { deferred } from "./agent-runtime-contract.harness";
 
 /**
  * Exercises the real shared orchestrator and its control/persistence hooks. Only the
@@ -39,17 +37,22 @@ const executor = await import("../narrator-executor");
 const { isGitCommandToolResult, runAgentLoopUnlocked } = await import(
 	"../agent-runtime/orchestrator"
 );
-const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
+const {
+	tryClaimExecution,
+	getExecutionOwner,
+	getRunHold,
+	isExecutionSuspended,
+	setRunControl,
+	setRunHold,
+} = await import("../agent-runtime/ownership");
+type RunControl = import("../agent-runtime/ownership").RunControl;
+const { controlRun, startNarratorRun } = await import("../agent-runtime/run");
 const { activeNarrators } = await import("../narrator-session-state");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { settings } = await import("../../lib/settings");
-const manual = await import("../subagent-manual-override");
-const takeover = await import("../subagent-takeover");
-const { ProxyAbortController } = await import("../subagent-detach");
-const { resetForegroundTurn } = await import("../agent-runtime/control");
-const { isExecutionSuspended } = await import("../agent-runtime/ownership");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
-const { bufferSubagentUserMessage, executeSubagent } = await import("../subagent-executor");
+const { acceptUserMessage } = await import("../narrator-session");
+const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
 const MODEL = "orchestratorfixture:model";
 const adapter: ProviderAdapter = {
 	formatTools: () => [],
@@ -102,6 +105,17 @@ beforeEach(async () => {
 				type: id === "contract-child" ? "subagent" : "primary",
 				variant: id === "contract-child" ? "subagent:general" : "primary",
 				parentNarratorId: id === "contract-child" ? "contract-parent" : null,
+				// The delegated run delivers to its Agent call: registered, as startAgentRun does.
+				runtimeRegistrationJson:
+					id === "contract-child"
+						? {
+								version: 1,
+								run: {
+									logicalRunId: "contract-run",
+									deliverTo: { narratorId: "contract-parent", toolUseId: "origin-agent" },
+								},
+							}
+						: null,
 				model: MODEL,
 				cwd: process.env.HOME,
 				autoContinuationOverride: "off",
@@ -152,33 +166,56 @@ function active(id: string): ActiveNarrator {
 		_substatus: new Set(),
 	};
 }
-const profiles: RuntimeProfile[] = [
+/**
+ * Two shapes, one runtime: an ordinary session, and the same kind of session whose run
+ * delivers its result to a tool call (the registration seeded above). Nothing else
+ * distinguishes them; `kind` only names the fixture row.
+ */
+type Shape = {
+	kind: "primary" | "subagent";
+	executionSegmentId?: string;
+	parentNarratorId?: string;
+	parentToolUseId?: string;
+};
+const profiles: Shape[] = [
 	{ kind: "primary" },
 	{
 		kind: "subagent",
 		executionSegmentId: "profile-child-run-segment",
 		parentNarratorId: "contract-parent",
 		parentToolUseId: "origin-agent",
-		subagentType: "general",
-		systemPrompt: "contract prompt",
-		initialHistory: [],
 	},
 ];
 function fixture(
-	profile: RuntimeProfile,
+	profile: Shape,
 	script: Array<ExecuteLoopResult | ((options: ExecuteLoopOptions) => Promise<ExecuteLoopResult>)>,
 ) {
 	const id = profile.kind === "primary" ? "contract-primary" : "contract-child";
 	const session = active(id);
-	const owner = tryClaimExecution(id, profile.kind);
+	const owner = tryClaimExecution(id, "run");
 	if (!owner) throw new Error("Missing fixture owner");
 	activeNarrators.set(id, session);
+	// The live half of the run, as the run service mounts it.
+	const runControl: RunControl = {
+		startedAt: Date.now(),
+		cancel: new AbortController(),
+		timedOut: false,
+		terminal: new Promise(() => {}),
+		...(profile.parentNarratorId && profile.parentToolUseId
+			? {
+					deliverTo: {
+						narratorId: profile.parentNarratorId,
+						toolUseId: profile.parentToolUseId,
+					},
+				}
+			: {}),
+		executionSegmentId: profile.executionSegmentId,
+	};
+	setRunControl(owner, runControl);
 	backgroundOccupancyStore.setRuntimeLive(id, true);
 	const calls: ExecuteLoopOptions[] = [];
 	spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
-		expect(options.config.executionSegmentId).toBe(
-			profile.kind === "subagent" ? profile.executionSegmentId : undefined,
-		);
+		expect(options.config.executionSegmentId).toBe(profile.executionSegmentId);
 		calls.push(options);
 		const step = script[calls.length - 1];
 		if (!step) throw new Error("Unexpected extra model pass");
@@ -188,7 +225,8 @@ function fixture(
 		calls,
 		owner,
 		session,
-		run: (text = "same input") => runAgentLoopUnlocked(session, owner, text, undefined, profile),
+		runControl,
+		run: (text = "same input") => runAgentLoopUnlocked(session, owner, text, undefined, runControl),
 	};
 }
 
@@ -434,11 +472,13 @@ describe("subagent signed source projection", () => {
 });
 
 describe("real shared orchestrator profile contract", () => {
-	for (const kind of ["references", "bash"] as const) {
+	for (const kind of ["references", "bash", "official-references"] as const) {
 		test(`primary: spilled ${kind} survive materialization and start the next pass`, async () => {
 			const oldHome = process.env.NARRAFORK_HOME;
 			const home = mkdtempSync(join(tmpdir(), "nf-orchestrator-spill-"));
 			process.env.NARRAFORK_HOME = home;
+			const { settings: providerSettings } = await import("../../lib/settings");
+			const originalAnthropic = providerSettings.anthropicProviders;
 			try {
 				const { enqueueBufferedMessage } = await import("../narrator-buffer");
 				const service = await import("../narrator-service");
@@ -456,6 +496,39 @@ describe("real shared orchestrator profile contract", () => {
 					snapshotHash: "hash",
 					capturedAt: new Date().toISOString(),
 				};
+				const official = kind === "official-references";
+				const references = kind !== "bash";
+				if (official) {
+					providerSettings.anthropicProviders = [
+						{
+							id: "contract-official",
+							name: "Official",
+							prefix: "contract-official",
+							apiKey: "isolated-test-no-network",
+							baseUrl: "https://example.invalid/v1",
+							defaultModel: "claude-sonnet-4",
+							officialApi: true,
+						},
+					];
+					// A system injection lands after the adopted input, before the pass is built.
+					const history = await import("../narrator-service");
+					const load = history.narratorService.getModelHistorySinceLastCompact.bind(
+						history.narratorService,
+					);
+					let loads = 0;
+					spyOn(history.narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+						async (...args) => {
+							if (++loads === 2) {
+								const { deliverInjection } = await import("../narrator-injection");
+								await deliverInjection("contract-primary", {
+									content: "trailing system hint",
+									source: "contract_hint",
+								});
+							}
+							return load(...args);
+						},
+					);
+				}
 				let spillPath = "";
 				let id = "";
 				const h = fixture({ kind: "primary" }, [
@@ -470,7 +543,7 @@ describe("real shared orchestrator profile contract", () => {
 							undefined,
 							"back",
 							kind === "bash" ? command : null,
-							kind === "references" ? [snapshot] : undefined,
+							references ? [snapshot] : undefined,
 						);
 						expect(accepted.ok).toBe(true);
 						id = accepted.id;
@@ -486,12 +559,36 @@ describe("real shared orchestrator profile contract", () => {
 					},
 					async (options) => {
 						expect(existsSync(spillPath)).toBe(false);
-						if (kind === "references") expect(options.userText).toContain(snapshot.snapshotText);
+						if (references) expect(options.userText).toContain(snapshot.snapshotText);
+						if (official) {
+							// Official provider: the snapshot is the current input exactly once,
+							// never a second copy in history; the trailing sys row is kept.
+							expect(options.userText.split(snapshot.snapshotText).length).toBe(2);
+							const history = JSON.stringify(options.history);
+							expect(history).not.toContain(snapshot.snapshotText);
+							// Official semantics: the trailing sys row stays a system message in history.
+							expect(options.history).toEqual(
+								expect.arrayContaining([
+									expect.objectContaining({
+										role: "system",
+										content: expect.stringContaining("trailing system hint"),
+									}),
+								]),
+							);
+						}
 						// The Bash double does not append a tool result, so history rebuilding
 						// may recover the queued prompt as the trailing current user turn.
 						return { ...finished };
 					},
 				]);
+				if (official) {
+					h.session.model = "contract-official:claude-sonnet-4";
+					h.session.provider = "contract-official";
+					db.update(narrators)
+						.set({ model: "contract-official:claude-sonnet-4" })
+						.where(eq(narrators.id, "contract-primary"))
+						.run();
+				}
 				const result = await h.run();
 				expect(result.hasError).toBe(false);
 				expect(h.calls).toHaveLength(2);
@@ -507,48 +604,48 @@ describe("real shared orchestrator profile contract", () => {
 					expect(bash.mock.calls[0][1]).toBe(command);
 				} else expect(bash).not.toHaveBeenCalled();
 			} finally {
+				providerSettings.anthropicProviders = originalAnthropic;
 				if (oldHome === undefined) delete process.env.NARRAFORK_HOME;
 				else process.env.NARRAFORK_HOME = oldHome;
 				rmSync(home, { recursive: true, force: true });
 			}
 		});
 	}
-	test("executeSubagent entry inherits runtime character hooks and excludes legacy summary", async () => {
+	test("the run entry inherits runtime character hooks and excludes the legacy summary", async () => {
 		const summary = "入口历史摘要😀";
-		const finalPrompt = `actual entry custom policy\n${summary}\nfinal rules`;
 		db.update(narrators)
-			.set({ contextSummary: summary, contextSummaryChars: 0 })
+			.set({
+				contextSummary: summary,
+				contextSummaryChars: 0,
+				systemPrompt: "actual entry custom policy",
+			})
 			.where(eq(narrators.id, "contract-child"))
 			.run();
+		let systemPrompt = "";
 		backgroundOccupancyStore.refreshNarrator("contract-child");
 		await backgroundOccupancyStore.flush();
 		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
-			expect(options.config.systemPrompt).toBe(finalPrompt);
-			expect(options.config.executionSegmentId).toBe("child-run-segment");
+			systemPrompt = options.config.systemPrompt ?? "";
+			expect(systemPrompt).toContain(summary);
+			// A run that delivers to a call gets a file-change segment of its own.
+			expect(options.config.executionSegmentId).toBeString();
 			await options.config.onToolsCharacters?.(456);
 			return finished;
 		});
-		const result = await executeSubagent({
-			executionSegmentId: "child-run-segment",
+		const handle = await startNarratorRun({
 			narratorId: "contract-child",
-			parentNarratorId: "contract-parent",
-			toolUseId: "origin-agent",
-			subagentType: "general",
-			prompt: "entry input",
-			cwd: process.env.HOME as string,
-			model: MODEL,
-			provider: "orchestratorfixture",
 			locale: "en",
-			signal: new AbortController().signal,
-			systemPrompt: finalPrompt,
-			initialHistory: [],
+			text: "entry input",
+			principal: null,
+			deliver: false,
 		});
+		const result = await handle.terminal;
 		expect(result.hasError).toBe(false);
 		expect(pass).toHaveBeenCalledTimes(1);
 		expect(
 			db.select().from(narrators).where(eq(narrators.id, "contract-child")).get(),
 		).toMatchObject({
-			contextSystemChars: finalPrompt.length - summary.length,
+			contextSystemChars: systemPrompt.length - summary.length,
 			contextToolsChars: 456,
 			contextSummaryChars: 0,
 		});
@@ -588,15 +685,12 @@ describe("real shared orchestrator profile contract", () => {
 
 		test(`${profile.kind}: final prompt and bound tools character callback reach runtime cache`, async () => {
 			const summary = "持久摘要😀";
-			const selectedProfile: RuntimeProfile =
-				profile.kind === "primary"
-					? profile
-					: {
-							...profile,
-							rebuildSystemPrompt: async (text) =>
-								`actual custom subagent prompt\n${text ?? ""}\npolicy`,
-						};
-			const h = fixture(selectedProfile, [
+			// The session's own stored base prompt, for either shape.
+			db.update(narrators)
+				.set({ systemPrompt: "actual custom session prompt" })
+				.where(eq(narrators.id, profile.kind === "primary" ? "contract-primary" : "contract-child"))
+				.run();
+			const h = fixture(profile, [
 				async (options) => {
 					await options.config.onToolsCharacters?.(321);
 					const row = db
@@ -925,11 +1019,12 @@ describe("real shared orchestrator profile contract", () => {
 			const h = fixture(profiles[1], [
 				async (options) => {
 					expect(options.config.userId).toBe("principal-a");
-					const accepted = await bufferSubagentUserMessage("contract-child", feedback, {
-						createdBy: scenario.recipient,
-						requestSoftStop: scenario.softStop,
+					const accepted = await acceptUserMessage("contract-child", feedback, {
+						userId: scenario.recipient,
+						queueMode: scenario.softStop ? "tool" : "turn",
+						queueOnly: true,
 					});
-					expect(accepted.ok).toBe(true);
+					if (!accepted.buffered) throw new Error("expected queued input");
 					order.push("queued");
 					if (scenario.softStop) expect(options.config.shouldStop?.()).toBe(true);
 					const injection = await options.config.getAfterToolsInjections?.();
@@ -1012,12 +1107,8 @@ describe("real shared orchestrator profile contract", () => {
 					text,
 					{ toolCallId: "after-tools-send-call", attempt: 1 },
 				);
-				const accepted = await bufferSubagentUserMessage("contract-child", text, {
-					createdBy: "principal-a",
-					requestSoftStop: false,
-					delivery,
-				});
-				expect(accepted.ok).toBe(true);
+				const accepted = (await enqueueInboxAgent(delivery, text, { createdBy: "principal-a" }))
+					.delivery;
 				expect(options.config.shouldStop?.()).toBe(false);
 				const packet = await options.config.getAfterToolsInjections?.();
 				if (!packet || typeof packet === "string") throw new Error("Missing after-tools packet");
@@ -1031,15 +1122,16 @@ describe("real shared orchestrator profile contract", () => {
 				const message = db
 					.select()
 					.from(narratorMessages)
-					.where(eq(narratorMessages.contentText, text))
+					.where(eq(narratorMessages.id, row?.recipientMessageId ?? ""))
 					.get();
-				expect(message).toMatchObject({
-					createdBy: "principal-a",
-					parentToolUseId: "origin-agent",
-				});
+				// The Send author is the message's attribution; placement follows the run.
+				expect(message?.contentText).toContain(text);
+				expect(message).toMatchObject({ parentToolUseId: "origin-agent" });
+				// One adopted agent message, projected to both audiences (the session's own
+				// page and the destination's tool card) by the one injection writer.
 				const projected = broadcast.mock.calls.filter(
 					([, event]) =>
-						event.type === "user_message" &&
+						(event.type === "message" || event.type === "user_message") &&
 						typeof event.message === "object" &&
 						event.message !== null &&
 						"id" in event.message &&
@@ -1065,12 +1157,12 @@ describe("real shared orchestrator profile contract", () => {
 
 	test("missing custom child definition retains readonly fallback in the real pass policy", async () => {
 		const { toolRegistry } = await import("../../lib/agent/tool-registry");
-		const base = profiles[1];
-		if (base.kind !== "subagent") throw new Error("Missing child profile");
-		const h = fixture(
-			{ ...base, subagentType: "custom:missing-definition", customDefinition: null },
-			[finished],
-		);
+		// Legacy row without a stored ceiling: its template compiles fail-closed.
+		db.update(narrators)
+			.set({ variant: "subagent:custom-missing-definition" })
+			.where(eq(narrators.id, "contract-child"))
+			.run();
+		const h = fixture(profiles[1], [finished]);
 		expect((await h.run()).hasError).toBe(false);
 		const read = toolRegistry.get("Read");
 		const write = toolRegistry.get("Write");
@@ -1112,7 +1204,11 @@ describe("real shared orchestrator profile contract", () => {
 
 	test("child doing Spec work exhausts the real per-run continuation budget without changing task status", async () => {
 		const { writeSpecFile, readSpecFile } = await import("../spec-vfs-service");
-		const { MAX_SUBAGENT_CONTINUATION_PASSES } = await import("../turn-continuation-decisions");
+		const { resolveNarratorRuntimePolicy } = await import("../trait-layer-service");
+		const MAX_SUBAGENT_CONTINUATION_PASSES = (await resolveNarratorRuntimePolicy("contract-child"))
+			.continuation.maxPasses;
+		if (MAX_SUBAGENT_CONTINUATION_PASSES === null)
+			throw new Error("Expected a compiled delegation budget");
 		await db
 			.update(narrators)
 			.set({ autoContinuationOverride: "always" })
@@ -1138,236 +1234,199 @@ describe("real shared orchestrator profile contract", () => {
 		);
 	});
 
-	test("takeover waits in real control, resumes the same epoch and rejects an old-turn abort", async () => {
-		const parent = new AbortController();
-		const proxy = new ProxyAbortController();
-		const profile: Extract<RuntimeProfile, { kind: "subagent" }> = {
-			...(profiles[1] as Extract<RuntimeProfile, { kind: "subagent" }>),
-			control: {
-				parentSignal: parent.signal,
-				proxy,
-				turnAbort: new AbortController(),
-				detached: false,
-			},
+	/** Hold the fixture run; the returned function waits until it parks at the hold. */
+	function heldRun(h: ReturnType<typeof fixture>) {
+		setRunHold(h.session.narratorId, { released: false });
+		return async () => {
+			const deadline = Date.now() + 3_000;
+			while (!h.runControl.wake) {
+				if (Date.now() > deadline) throw new Error("Held run never parked");
+				await new Promise((resolve) => setTimeout(resolve, 2));
+			}
 		};
-		const entered = deferred<void>();
-		const originalWait = manual.waitForManualOverride;
-		spyOn(manual, "waitForManualOverride").mockImplementation((...args) => {
-			const waiting = originalWait(...args);
-			entered.resolve();
-			return waiting;
-		});
-		const h = fixture(profile, [
-			finished,
-			async (options) => {
-				if (!oldTurn) throw new Error("Missing captured old turn");
-				oldTurn.abort("late cancelled turn callback");
-				expect(options.config.signal.aborted).toBe(false);
-				expect(profile.control?.turnAbort).not.toBe(oldTurn);
-				return finished;
-			},
-		]);
-		resetForegroundTurn(h.session, profile);
-		const oldTurn = profile.control?.turnAbort;
-		if (!oldTurn) throw new Error("Takeover fixture requires foreground control");
-		takeover.markTakenOver(h.session.narratorId);
-		const run = h.run();
-		try {
-			await entered.promise;
-			expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
-			expect(tryClaimExecution(h.session.narratorId, "primary")).toBeNull();
-			takeover.clearTakenOver(h.session.narratorId);
-			expect(
-				manual.resumeManualOverride(h.session.narratorId, {
-					prompt: "manual resume",
-					history: [],
-					trailingToolResults: [],
-				}),
-			).toBe(true);
-			expect((await run).hasError).toBe(false);
-			expect(h.calls.map((call) => call.userText)).toEqual([
-				'<sender kind="system" />\nsame input',
-				'<sender kind="system" />\nmanual resume',
-			]);
-			expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
-		} finally {
-			takeover.clearTakenOver(h.session.narratorId);
-			manual.clearManualOverrideRuntimes();
-			profile.control?.cleanupTurnAbort?.();
-			proxy.dispose();
-			await run;
-		}
-	});
+	}
+	async function queueUserInput(id: string, text: string) {
+		const { enqueueBufferedMessage } = await import("../narrator-buffer");
+		const accepted = await enqueueBufferedMessage(id, text);
+		expect(accepted.ok).toBe(true);
+	}
+	/** End a parked/running fixture run so the test can await it. */
+	async function endRun(h: ReturnType<typeof fixture>, run: Promise<unknown>) {
+		h.runControl.cancel.abort("cleanup");
+		h.runControl.wake?.("cancel");
+		setRunHold(h.session.narratorId, undefined);
+		await run;
+	}
 
-	test("a SESSION-level abort on a taken-over subagent re-suspends instead of ending the run", async () => {
-		/*
-		 * The production Stop path aborted `active.abortController` directly (via
-		 * `interruptNarrator`), never `turnAbort`. The runtime then took the generic
-		 * abort exit, the runner cleared the takeover and the parent's blocked Agent
-		 * call was settled. The stop must instead land in the control transition and
-		 * park the subagent in `taken_over`, with the same run resumable afterwards.
-		 */
-		const parent = new AbortController();
-		const proxy = new ProxyAbortController();
-		const profile: Extract<RuntimeProfile, { kind: "subagent" }> = {
-			...(profiles[1] as Extract<RuntimeProfile, { kind: "subagent" }>),
-			control: {
-				parentSignal: parent.signal,
-				proxy,
-				turnAbort: new AbortController(),
-				detached: false,
-			},
-		};
-		const entered = deferred<void>();
-		const originalWait = manual.waitForManualOverride;
-		spyOn(manual, "waitForManualOverride").mockImplementation((...args) => {
-			const waiting = originalWait(...args);
-			entered.resolve();
-			return waiting;
+	for (const profile of profiles) {
+		test(`${profile.kind}: a held run parks on the same owner and resumes for queued input`, async () => {
+			const h = fixture(profile, [finished, finished]);
+			const parked = heldRun(h);
+			const run = h.run();
+			try {
+				await parked();
+				expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
+				expect(tryClaimExecution(h.session.narratorId, "run")).toBeNull();
+				await queueUserInput(h.session.narratorId, "manual resume");
+				// Released first, so the next natural completion ends the run.
+				setRunHold(h.session.narratorId, { released: true });
+				h.runControl.wake?.("input");
+				expect((await run).hasError).toBe(false);
+				expect(h.calls).toHaveLength(2);
+				expect(h.calls[1].userText).toContain("manual resume");
+				expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
+			} finally {
+				await endRun(h, run);
+			}
 		});
-		const h = fixture(profile, [
-			async () => {
-				// Exactly what `interruptNarrator(subagentId)` does to a running subagent.
-				h.session.abortController.abort();
-				return { ...finished, aborted: true, completedNaturally: false };
-			},
-			finished,
-		]);
-		resetForegroundTurn(h.session, profile);
-		const turn = profile.control?.turnAbort;
-		takeover.markTakenOver(h.session.narratorId);
-		const run = h.run();
-		try {
-			await entered.promise;
-			// The turn controller was never touched: the session abort alone got here.
-			expect(turn?.signal.aborted).toBe(false);
-			expect(takeover.isTakenOver(h.session.narratorId)).toBe(true);
-			expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
-			// Release before resuming, otherwise the next natural completion re-suspends
-			// in `taken_over` (correctly) and the run never returns.
-			takeover.clearTakenOver(h.session.narratorId);
-			expect(
-				manual.resumeManualOverride(h.session.narratorId, {
-					prompt: "after stop",
-					history: [],
-					trailingToolResults: [],
-				}),
-			).toBe(true);
-			const result = await run;
-			expect(result.hasError).toBe(false);
-			expect(h.calls.map((call) => call.userText)).toEqual([
-				'<sender kind="system" />\nsame input',
-				'<sender kind="system" />\nafter stop',
-			]);
-		} finally {
-			takeover.clearTakenOver(h.session.narratorId);
-			manual.clearManualOverrideRuntimes();
-			profile.control?.cleanupTurnAbort?.();
-			proxy.dispose();
-			await run;
-		}
-	});
 
-	test("a stop that lands during a transient-retry backoff re-suspends a taken-over subagent", async () => {
-		/*
-		 * Only the check right after a model pass used to route a stop into control.
-		 * A stop during the retry backoff hit the retry's own abort exit instead, the
-		 * runner cleared the takeover and settled the parent — "stop this turn" ended
-		 * the takeover depending on when it was clicked.
-		 */
-		const parent = new AbortController();
-		const proxy = new ProxyAbortController();
-		const profile: Extract<RuntimeProfile, { kind: "subagent" }> = {
-			...(profiles[1] as Extract<RuntimeProfile, { kind: "subagent" }>),
-			control: {
-				parentSignal: parent.signal,
-				proxy,
-				turnAbort: new AbortController(),
-				detached: false,
-			},
-		};
-		const entered = deferred<void>();
-		const originalWait = manual.waitForManualOverride;
-		spyOn(manual, "waitForManualOverride").mockImplementation((...args) => {
-			const waiting = originalWait(...args);
-			entered.resolve();
-			return waiting;
-		});
-		const recovery = await import("../narrator-recovery");
-		spyOn(recovery, "handleTransientError").mockImplementation(async () => {
-			// The user presses Stop while the loop sleeps before replaying.
-			profile.control?.turnAbort.abort("Interrupted by user");
-			return { shouldRetry: false, delayMs: 0 };
-		});
-		const h = fixture(profile, [
-			// A silent disconnect takes the backoff path even on a stateless provider
-			// (a stateless `retryableError` is "retry-exhausted" and never sleeps).
-			{
-				...finished,
-				completedNaturally: false,
-				completedAssistantTurn: false,
-				silentDisconnect: true,
-			},
-			finished,
-		]);
-		resetForegroundTurn(h.session, profile);
-		takeover.markTakenOver(h.session.narratorId);
-		const run = h.run();
-		try {
-			await entered.promise;
-			expect(takeover.isTakenOver(h.session.narratorId)).toBe(true);
-			expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
-			takeover.clearTakenOver(h.session.narratorId);
-			expect(
-				manual.resumeManualOverride(h.session.narratorId, {
-					prompt: "after backoff stop",
-					history: [],
-					trailingToolResults: [],
-				}),
-			).toBe(true);
-			expect((await run).hasError).toBe(false);
-			expect(h.calls.map((call) => call.userText)).toEqual([
-				'<sender kind="system" />\nsame input',
-				'<sender kind="system" />\nafter backoff stop',
+		test(`${profile.kind}: Stop of a held turn parks the run instead of ending it`, async () => {
+			/*
+			 * A local Stop aborts the session's turn controller. For a held run that ends
+			 * the current turn only: the run parks at its hold (same owner, same run, no
+			 * delivery) and the user's next input continues it.
+			 */
+			const h = fixture(profile, [
+				async () => {
+					expect(await controlRun(h.session.narratorId, { kind: "stop" })).toBe(true);
+					expect(h.runControl.cancel.signal.aborted).toBe(false);
+					return { ...finished, aborted: true, completedNaturally: false };
+				},
+				finished,
 			]);
-		} finally {
-			takeover.clearTakenOver(h.session.narratorId);
-			manual.clearManualOverrideRuntimes();
-			profile.control?.cleanupTurnAbort?.();
-			proxy.dispose();
-			await run;
-		}
-	});
+			const parked = heldRun(h);
+			const run = h.run();
+			try {
+				await parked();
+				expect(getRunHold(h.session.narratorId)).toBeDefined();
+				expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
+				expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
+				await queueUserInput(h.session.narratorId, "after stop");
+				setRunHold(h.session.narratorId, { released: true });
+				h.runControl.wake?.("input");
+				const result = await run;
+				expect(result.hasError).toBe(false);
+				expect(h.calls).toHaveLength(2);
+				expect(h.calls[1].userText).toContain("after stop");
+			} finally {
+				await endRun(h, run);
+			}
+		});
 
-	test("a SESSION-level abort on a subagent that is NOT taken over still ends the run", async () => {
-		const parent = new AbortController();
-		const proxy = new ProxyAbortController();
-		const profile: Extract<RuntimeProfile, { kind: "subagent" }> = {
-			...(profiles[1] as Extract<RuntimeProfile, { kind: "subagent" }>),
-			control: {
-				parentSignal: parent.signal,
-				proxy,
-				turnAbort: new AbortController(),
-				detached: false,
-			},
-		};
-		const wait = spyOn(manual, "waitForManualOverride");
-		const h = fixture(profile, [
-			async () => {
-				h.session.abortController.abort();
-				return { ...finished, aborted: true, completedNaturally: false };
-			},
-		]);
-		resetForegroundTurn(h.session, profile);
-		try {
-			await h.run();
-			expect(wait).not.toHaveBeenCalled();
+		test(`${profile.kind}: a stop during a transient-retry backoff also parks a held run`, async () => {
+			/*
+			 * A stop can land at any await of a pass. One during the retry backoff must
+			 * reach the same hold transition, not the retry's own abort exit.
+			 */
+			const recovery = await import("../narrator-recovery");
+			let h: ReturnType<typeof fixture> | undefined;
+			spyOn(recovery, "handleTransientError").mockImplementation(async () => {
+				if (h) await controlRun(h.session.narratorId, { kind: "stop" });
+				return { shouldRetry: false, delayMs: 0 };
+			});
+			h = fixture(profile, [
+				// A silent disconnect takes the backoff path even on a stateless provider.
+				{
+					...finished,
+					completedNaturally: false,
+					completedAssistantTurn: false,
+					silentDisconnect: true,
+				},
+				finished,
+			]);
+			const fixtureRun = h;
+			const parked = heldRun(fixtureRun);
+			const run = fixtureRun.run();
+			try {
+				await parked();
+				expect(getRunHold(fixtureRun.session.narratorId)).toBeDefined();
+				expect(fixtureRun.runControl.cancel.signal.aborted).toBe(false);
+				await queueUserInput(fixtureRun.session.narratorId, "after backoff stop");
+				setRunHold(fixtureRun.session.narratorId, { released: true });
+				fixtureRun.runControl.wake?.("input");
+				expect((await run).hasError).toBe(false);
+				expect(fixtureRun.calls.at(-1)?.userText).toContain("after backoff stop");
+			} finally {
+				await endRun(fixtureRun, run);
+			}
+		});
+
+		test(`${profile.kind}: a Stop of a run that is NOT held ends the run`, async () => {
+			const h = fixture(profile, [
+				async () => {
+					expect(await controlRun(h.session.narratorId, { kind: "stop" })).toBe(true);
+					return { ...finished, aborted: true, completedNaturally: false };
+				},
+			]);
+			const result = await h.run();
+			expect(result.aborted).toBe(true);
 			expect(h.calls).toHaveLength(1);
-		} finally {
-			profile.control?.cleanupTurnAbort?.();
-			proxy.dispose();
-		}
-	});
+			expect(h.runControl.wake).toBeUndefined();
+			expect(h.runControl.cancel.signal.aborted).toBe(true);
+		});
+
+		test(`${profile.kind}: interrupt input cancels current IO and is adopted in the same run`, async () => {
+			const h = fixture(profile, [
+				async (options) => {
+					const { acceptUserMessage } = await import("../narrator-session");
+					const accepted = await acceptUserMessage(h.session.narratorId, "urgent input", {
+						queueMode: "interrupt",
+					});
+					expect(accepted.buffered).toBe(true);
+					// The current provider request / tool IO is cancelled…
+					expect(options.config.urgentGuidanceSignal?.aborted).toBe(true);
+					// …but not the turn, the run or its caller, and no user interrupt is recorded.
+					expect(options.config.signal.aborted).toBe(false);
+					expect(h.runControl.cancel.signal.aborted).toBe(false);
+					return { ...finished, completedNaturally: false, hadToolUses: true };
+				},
+				async (options) => {
+					expect(options.userText).toContain("urgent input");
+					// Each pass gets a fresh urgent channel.
+					expect(options.config.urgentGuidanceSignal?.aborted).toBe(false);
+					return finished;
+				},
+			]);
+			const result = await h.run();
+			expect(result.hasError).toBe(false);
+			expect(result.aborted).toBeFalsy();
+			expect(h.calls).toHaveLength(2);
+			expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
+			expect(
+				db
+					.select({ reason: narrators.lastStopReason })
+					.from(narrators)
+					.where(eq(narrators.id, h.session.narratorId))
+					.get()?.reason,
+			).not.toBe("user_interrupt");
+		});
+
+		test(`${profile.kind}: interrupt input to a held run is adopted in the same run, hold kept`, async () => {
+			const h = fixture(profile, [
+				async (options) => {
+					const { acceptUserMessage } = await import("../narrator-session");
+					await acceptUserMessage(h.session.narratorId, "held urgent", { queueMode: "interrupt" });
+					expect(options.config.urgentGuidanceSignal?.aborted).toBe(true);
+					expect(options.config.signal.aborted).toBe(false);
+					return { ...finished, completedNaturally: false, hadToolUses: true };
+				},
+				async (options) => {
+					expect(options.userText).toContain("held urgent");
+					return finished;
+				},
+			]);
+			const parked = heldRun(h);
+			const run = h.run();
+			try {
+				await parked();
+				expect(h.calls).toHaveLength(2);
+				expect(getRunHold(h.session.narratorId)).toEqual({ released: false });
+				expect(h.runControl.cancel.signal.aborted).toBe(false);
+			} finally {
+				await endRun(h, run);
+			}
+		});
+	}
 
 	test("PG finalizer/consumption contract has no SQLite cleanup fallthrough", async () => {
 		const source = await Bun.file(
@@ -1378,29 +1437,12 @@ describe("real shared orchestrator profile contract", () => {
 		expect(source).toContain("function hasPostgresRuntime()");
 		expect(source).toContain("Skipping pending model restore");
 		expect(source).toContain("Skipping persisted transient substatus cleanup");
-		expect(source).toContain("Skipping persisted subagent handoff");
-		expect(source).toContain("const narr = pgRuntime");
 		expect(source).not.toContain("const narr = await db.query.narrators.findFirst");
 		const subagentSource = await Bun.file(
 			new URL("../subagent-executor.ts", import.meta.url),
 		).text();
-		expect(subagentSource).toContain("cleanupBufferedTextFilesAsync");
 		expect(subagentSource).not.toContain("cleanupBufferedTextFiles(");
 	});
-});
-
-test("prepared child current packet preserves distinct knowledge and human senders", async () => {
-	const child = profiles.find((profile) => profile.kind === "subagent");
-	if (!child || child.kind !== "subagent") throw new Error("Missing child profile");
-	const packet =
-		'<sender kind="system" id="knowledge_hint" name="knowledge_hint" />\nRelevant context\n\n<sender kind="human" id="principal-a" name="principal-a" />\nHuman request';
-	const h = fixture({ ...child, initialCurrentText: packet }, [finished]);
-	const outcome = await h.run("Human request");
-	expect(outcome.hasError).toBe(false);
-	expect(h.calls).toHaveLength(1);
-	expect(h.calls[0].userText).toBe(packet);
-	expect(h.calls[0].userText.match(/Human request/g)).toHaveLength(1);
-	expect(h.calls[0].userText.match(/kind="human"/g)).toHaveLength(1);
 });
 
 for (const profile of profiles) {
@@ -1456,7 +1498,6 @@ for (const profile of profiles) {
 			expect(knowledge.contentText).not.toContain("<sender ");
 			const rebuilt = await buildRuntimeHistory({
 				narratorId: h.session.narratorId,
-				profile: profile.kind,
 				model: MODEL,
 				provider: "orchestratorfixture",
 				sourceMessages: rawMessages,

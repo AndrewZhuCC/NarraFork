@@ -31,7 +31,9 @@ mock.module("../../db", () => ({ db, sqlite }));
 
 const { eventBus } = await import("../../lib/event-bus");
 const { waitForSubagentResult } = await import("../agent-communication");
-const { clearTakenOver, markTakenOver } = await import("../subagent-takeover");
+const { setRunHold } = await import("../agent-runtime/ownership");
+const markTakenOver = (id: string) => setRunHold(id, { released: false });
+const clearTakenOver = (id: string) => setRunHold(id, undefined);
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);

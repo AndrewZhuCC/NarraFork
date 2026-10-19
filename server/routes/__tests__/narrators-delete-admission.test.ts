@@ -295,21 +295,14 @@ describe("the narrator itself running", () => {
 	}, 30_000);
 });
 
-describe("a suspended subagent runner", () => {
-	test("admits history deletion without aborting the retained runner", async () => {
+describe("a run parked by its hold", () => {
+	test("admits history deletion without aborting the retained run", async () => {
 		const { tryClaimExecution, setExecutionSuspended, isExecutionSuspended } = await import(
 			"../../services/agent-runtime/ownership"
 		);
-		const { waitForManualOverride } = await import("../../services/subagent-manual-override");
-		const owner = tryClaimExecution(narratorId, "subagent");
+		const owner = tryClaimExecution(narratorId, "run");
 		if (!owner) throw new Error("Failed to claim test execution");
-		const parentController = new AbortController();
-		const completion = waitForManualOverride(
-			narratorId,
-			parentController.signal,
-			"parent",
-			"origin-tool",
-		);
+		// A held run parks at its turn boundary: the owner is retained, no turn runs.
 		const session = registerBusyLoop(narratorId, WORKTREE, { stopsOnAbort: false });
 		setExecutionSuspended(owner, true);
 		try {
@@ -321,8 +314,7 @@ describe("a suspended subagent runner", () => {
 			expect(session._loopRunning).toBe(true);
 			expect(isExecutionSuspended(narratorId)).toBe(true);
 		} finally {
-			parentController.abort();
-			await completion;
+			setExecutionSuspended(owner, false);
 			owner.release();
 		}
 	}, 30_000);
