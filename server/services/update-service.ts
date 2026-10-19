@@ -18,12 +18,13 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { open } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { inArray } from "drizzle-orm";
 import type { GithubPatchStep } from "../../shared/release-patch";
 import {
+	isLegacyMirrorSourceIdentity,
 	type PreparedUpdateIdentity,
+	parseRecoveryManifestVersions,
 	parseUpdateSourceIdentity,
 	sameUpdateSourceIdentity,
 	type UpdateSourceIdentity,
@@ -36,15 +37,12 @@ import {
 	createDistributionContext,
 	type DistributionContext,
 } from "../lib/helper-distribution-runtime";
+import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { managerChildTokenEnv } from "../lib/manager-token";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
-import {
-	createUpdateFetchContext,
-	fetchUpdateWithTimeout,
-	readUpdateJson,
-	type UpdateFetchContext,
-} from "../lib/net/update-fetch";
+import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -55,7 +53,6 @@ import { settings } from "../lib/settings";
 import { DEFAULT_GITHUB_REPOSITORY } from "../lib/settings/update-source";
 import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
-import { applyZstdPatchToFile, type ZstdPatchMeta } from "../lib/zstd-patch";
 import {
 	createGithubUpdateDeadline,
 	downloadGithubUpdateToFile,
@@ -67,6 +64,7 @@ import {
 	githubReleaseUpdater,
 	type UpdateNotesRequest,
 } from "./github-release-update";
+import { getReservedRecoverySourceEpochs } from "./recovery-handoff";
 import { toolContinuationService } from "./tool-continuation-service";
 import {
 	assertUpdateNotCancelled,
@@ -75,18 +73,24 @@ import {
 	capturePlannedUpdateRecoverySnapshot,
 	consumePlannedUpdateRecoverySnapshot,
 	failScheduledUpdate,
+	getScheduledRecoveryEpochs,
 	getUpdateCoordinationStatus,
 	markUpdateRestarting,
 	type PlannedUpdateRecoverySnapshot,
+	releasePreparedUpdateRecoveryHandoff,
 	removePlannedUpdateRecoverySnapshot,
+	rollbackPreparedUpdateRecoverySnapshot,
 	scheduleUpdate,
 	UpdateCancelledError,
 	type UpdateCoordinationStatus,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
+	waitForScheduledRecoveryHandoff,
 	waitForUpdateCheckpointFence,
 	writePlannedUpdateRecoverySnapshot,
+	writePreparedUpdateRecoverySnapshot,
 } from "./update-coordinator";
+import { checkMirrorUpdate, downloadMirrorPatch, getMirrorNotes } from "./update-mirror-client";
 import {
 	CHECKPOINT_ACTIVE_TOOL_LIMIT,
 	checkpointPlannedUpdateContinuations,
@@ -106,6 +110,7 @@ async function zstdCliResponds(binary: string, signal?: AbortSignal): Promise<bo
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
+			windowsHide: true,
 		});
 	} catch {
 		return false;
@@ -146,7 +151,13 @@ export interface ReleaseInfo {
 	repository?: string;
 	/** Effective source policy captured before the check starts, never inferred at download time. */
 	sourceIdentity?: UpdateSourceIdentity;
+	/** Verified binary sidecar capability; never supplied by an apply request. */
+	recoveryManifestVersions?: number[];
 	_github?: { repository: string; downloadUrl: string; patchChain?: GithubPatchStep[] };
+	_mirror?: {
+		serverUrl: string;
+		patch?: { name: string; size: number; sha256: string; url: string };
+	};
 	version: string;
 	releaseDate: string;
 	releaseNotes?: string | Record<string, string>;
@@ -226,21 +237,35 @@ const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
 /** Recovery manifest name, owned by update-coordinator; cleanup must never delete it. */
 const RECOVERY_SNAPSHOT_FILE_NAME = "planned-update-recovery.json";
 const PLACED_UPDATE_INFO_FILE_NAME = "placed-update.json";
-/** Small JSON metadata: a slow server here should fail fast rather than hang the SSE stream. */
-const METADATA_FETCH_TIMEOUT_MS = 30_000;
-/** Patch payloads can legitimately take a while on a slow link, but never forever. */
-const PAYLOAD_FETCH_TIMEOUT_MS = 15 * 60_000;
-/** Wall-clock budget for one zstd reconstruction. */
-const PATCH_APPLY_TIMEOUT_MS = 10 * 60_000;
-/** Absolute ceilings, independent of what the server announces. */
-const MAX_PATCH_BYTES = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES = 1024 * 1024 * 1024;
-/** Tolerance over the announced patch size before a download is rejected. */
-const PATCH_SIZE_SLACK = 1.25;
 const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
 const CHECKPOINT_MAX_ROUNDS = 8;
 const CHECKPOINT_REQUIRED_STABLE_PASSES = 2;
 
+interface FailedUpdateCleanup {
+	updateEpoch: string;
+	targetVersion: string;
+	error: string;
+	cancelled?: boolean;
+}
+
+// A failed durable rollback keeps its gate closed. Preserve the current attempt
+// so the operator can retry cleanup instead of being stranded after the watchdog.
+const failedUpdateCleanup = hotSafe("update.failedHandoffCleanup", () => ({
+	pending: null as { options: FailedUpdateCleanup; retrying: boolean; error: string } | null,
+}));
+function getUpdateCoordinationWithCleanup(): UpdateCoordinationStatus & {
+	cleanupRetryPending: boolean;
+} {
+	const status = getUpdateCoordinationStatus();
+	const pending = failedUpdateCleanup.pending;
+	const needsRetry = status.scheduled && status.updateEpoch === pending?.options.updateEpoch;
+	return {
+		...status,
+		cleanupRetryPending: needsRetry,
+		...(needsRetry && pending ? { error: pending.error, errorKind: "failed" as const } : {}),
+	};
+}
 interface PlacedUpdateInfo {
 	version: string;
 	fromVersion: string;
@@ -253,6 +278,8 @@ interface PlacedUpdateInfo {
 	sizeBytes: number;
 	/** Absent on legacy metadata; never backfilled from the current source settings. */
 	sourceIdentity?: UpdateSourceIdentity;
+	/** Frozen with the verified binary identity, not inferred from its version. */
+	recoveryManifestVersions?: number[];
 }
 
 /**
@@ -299,56 +326,6 @@ function isSamePath(a: string, b: string): boolean {
 function isPathInsideDirectory(childPath: string, parentPath: string): boolean {
 	const relativePath = relative(resolve(parentPath), resolve(childPath));
 	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
-}
-
-async function fetchWithTimeout(
-	url: string,
-	options: { timeoutMs: number; signal?: AbortSignal; transport?: UpdateFetchContext },
-): Promise<Response> {
-	return fetchUpdateWithTimeout(url, options);
-}
-
-/**
- * Stream a response body to disk with a byte ceiling.
- *
- * `arrayBuffer()` would let the server decide how much memory this process allocates, so the
- * body is written incrementally and aborted as soon as it exceeds `maxBytes`.
- */
-async function streamResponseToFile(
-	response: Response,
-	filePath: string,
-	options: { maxBytes: number; onProgress?: (bytesWritten: number) => void },
-): Promise<number> {
-	const declaredLength = Number(response.headers.get("content-length") ?? 0);
-	if (Number.isFinite(declaredLength) && declaredLength > options.maxBytes) {
-		throw new Error(
-			`Update payload declares ${declaredLength} bytes, over the ${options.maxBytes}-byte limit`,
-		);
-	}
-	if (!response.body) throw new Error("Update payload response had no body");
-
-	const handle = await open(filePath, "w");
-	let written = 0;
-	try {
-		const reader = response.body.getReader();
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				written += value.byteLength;
-				if (written > options.maxBytes) {
-					throw new Error(`Update payload exceeded the ${options.maxBytes}-byte limit`);
-				}
-				await handle.write(value);
-				options.onProgress?.(written);
-			}
-		} finally {
-			await reader.cancel().catch(() => {});
-		}
-	} finally {
-		await handle.close();
-	}
-	return written;
 }
 
 function safeUnlink(filePath: string): void {
@@ -452,52 +429,8 @@ function resolveUpdateCacheDestination(
 	});
 }
 
-/** V2 API response from the update server */
-interface V2CheckResponse {
-	updateAvailable: boolean;
-	currentVersion?: string;
-	version?: string;
-	releaseDate?: string;
-	releaseNotes?: string | Record<string, string>;
-	platform?: string;
-	file?: {
-		filename: string;
-		size: number;
-		sha512: string;
-	};
-	zstdPatch?: {
-		fromVersion: string;
-		patchSize: number;
-		url: string;
-		metaUrl: string;
-	} | null;
-	patchChain?: Array<{
-		fromVersion: string;
-		toVersion: string;
-		patchSize: number;
-		url: string;
-		metaUrl: string;
-	}> | null;
-	releaseNotesPerVersion?: Array<{
-		version: string;
-		releaseDate: string;
-		releaseNotes?: string | Record<string, string>;
-	}>;
-}
-
-/**
- * Re-exported so existing importers (and the settings Zod schema) keep one source of truth.
- * The predicate itself lives in `lib/` because the write path needs it too — see that module.
- */
 export { isTrustedUpdateServerUrl };
 
-/**
- * Build the base URL for the update server (strips trailing slash).
- * Falls back to the default update server when the configured URL is empty.
- *
- * Returns an empty string for an untrusted origin, which every caller already treats as
- * "update server not configured".
- */
 function getServerBaseUrl(): string {
 	// Application updates and helper distribution are separate paths; GitHub never uses this URL.
 	const url = (settings.update?.serverUrl || "https://narrafork-update.b.domexie.cn").replace(
@@ -548,181 +481,6 @@ export function __resolveSameOriginUrlForTests(
 	return resolveSameOriginUrl(serverBase, candidate);
 }
 
-function resolveSameOriginPatchUrls(
-	serverBase: string,
-	step: { url: string; metaUrl: string },
-): { url: string; metaUrl: string } | null {
-	const url = resolveSameOriginUrl(serverBase, step.url);
-	const metaUrl = resolveSameOriginUrl(serverBase, step.metaUrl);
-	if (!url || !metaUrl) return null;
-	return { url, metaUrl };
-}
-
-/** Resolve a patch chain, dropping the whole chain when any step leaves the server origin. */
-function resolveSameOriginPatchChain(
-	serverBase: string,
-	chain: Array<{
-		fromVersion: string;
-		toVersion: string;
-		patchSize: number;
-		url: string;
-		metaUrl: string;
-	}>,
-): NonNullable<ReleaseInfo["_v2"]>["patchChain"] {
-	const resolved: NonNullable<NonNullable<ReleaseInfo["_v2"]>["patchChain"]> = [];
-	for (const step of chain) {
-		const urls = resolveSameOriginPatchUrls(serverBase, step);
-		if (!urls) return undefined;
-		resolved.push({ ...step, ...urls });
-	}
-	return resolved;
-}
-
-/**
- * Parse a semver string into comparable parts.
- * Pre-release versions (e.g. 0.2.0-beta.1) sort lower than the same version without pre-release.
- */
-function parseSemver(v: string): { major: number; minor: number; patch: number; pre: string } {
-	const [core, ...rest] = v.split("-");
-	const [major = 0, minor = 0, patch = 0] = core.split(".").map(Number);
-	return { major, minor, patch, pre: rest.join("-") };
-}
-
-/**
- * Compare two semver strings. Returns >0 if a > b, <0 if a < b, 0 if equal.
- * Pre-release identifiers are compared segment-by-segment with numeric awareness
- * (e.g. beta.9 < beta.10).
- */
-function compareSemver(a: string, b: string): number {
-	const va = parseSemver(a);
-	const vb = parseSemver(b);
-	if (va.major !== vb.major) return va.major - vb.major;
-	if (va.minor !== vb.minor) return va.minor - vb.minor;
-	if (va.patch !== vb.patch) return va.patch - vb.patch;
-	// No pre-release > has pre-release (e.g. 0.2.0 > 0.2.0-beta.1)
-	if (!va.pre && vb.pre) return 1;
-	if (va.pre && !vb.pre) return -1;
-	// Compare pre-release segment-by-segment (semver §11)
-	const aParts = va.pre.split(".");
-	const bParts = vb.pre.split(".");
-	for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
-		if (i >= aParts.length) return -1; // fewer segments = lower precedence
-		if (i >= bParts.length) return 1;
-		const aNum = Number(aParts[i]);
-		const bNum = Number(bParts[i]);
-		const aIsNum = !Number.isNaN(aNum);
-		const bIsNum = !Number.isNaN(bNum);
-		if (aIsNum && bIsNum) {
-			if (aNum !== bNum) return aNum - bNum;
-		} else if (aIsNum !== bIsNum) {
-			return aIsNum ? -1 : 1; // numeric < string per semver spec
-		} else {
-			const cmp = aParts[i].localeCompare(bParts[i]);
-			if (cmp !== 0) return cmp;
-		}
-	}
-	return 0;
-}
-
-/**
- * Fetch a single channel from the update server and build an UpdateCheckResult.
- */
-async function checkChannel(
-	serverUrl: string,
-	product: string,
-	channel: string,
-	platform: string,
-	transport: UpdateFetchContext,
-): Promise<UpdateCheckResult> {
-	const checkUrl = `${serverUrl}/api/v2/products/${product}/releases/latest?channel=${channel}&platform=${platform}&version=${APP_VERSION}`;
-	logger.debug("Checking for updates", { url: checkUrl, channel });
-
-	const response = await fetchWithTimeout(checkUrl, {
-		timeoutMs: METADATA_FETCH_TIMEOUT_MS,
-		transport,
-	});
-	if (!response.ok) {
-		void response.body?.cancel().catch(() => {});
-		logger.warn("Update check failed", { status: response.status, channel });
-		return {
-			updateAvailable: false,
-			currentVersion: APP_VERSION,
-			errorCode: "NETWORK_ERROR",
-			error: `Update server returned HTTP ${response.status}`,
-		};
-	}
-
-	const data = (await readUpdateJson(response)) as V2CheckResponse;
-
-	if (!data.updateAvailable || !data.version || !data.file) {
-		return {
-			updateAvailable: false,
-			currentVersion: APP_VERSION,
-			latestVersion: data.version,
-		};
-	}
-
-	const directPatchUrls = data.zstdPatch
-		? resolveSameOriginPatchUrls(serverUrl, data.zstdPatch)
-		: null;
-	const chainUrls = data.patchChain
-		? resolveSameOriginPatchChain(serverUrl, data.patchChain)
-		: undefined;
-
-	const releaseInfo: ReleaseInfo = {
-		source: "update-server",
-		version: data.version,
-		releaseDate: data.releaseDate ?? new Date().toISOString(),
-		releaseNotes: data.releaseNotes,
-		path: data.file.filename,
-		sha512: data.file.sha512,
-		files: [
-			{
-				url: data.file.filename,
-				size: data.file.size,
-				sha512: data.file.sha512,
-			},
-		],
-		_v2: {
-			serverUrl,
-			zstdPatchUrl: directPatchUrls?.url,
-			zstdPatchMetaUrl: directPatchUrls?.metaUrl,
-			patchChain: chainUrls,
-		},
-		releaseNotesPerVersion: data.releaseNotesPerVersion,
-	};
-
-	let downloadSize: number | undefined;
-	let zstdPatchSize: number | undefined;
-	let strategy: "zstd" | undefined;
-	let patchChain: UpdateCheckResult["patchChain"];
-
-	if (data.zstdPatch && directPatchUrls && data.zstdPatch.fromVersion === APP_VERSION) {
-		zstdPatchSize = data.zstdPatch.patchSize;
-		strategy = "zstd";
-		downloadSize = zstdPatchSize;
-	} else if (chainUrls && chainUrls.length > 0) {
-		patchChain = chainUrls;
-		strategy = "zstd";
-		downloadSize = patchChain.reduce((sum, s) => sum + s.patchSize, 0);
-	}
-
-	const totalSize = data.file.size;
-	if (!downloadSize) downloadSize = totalSize;
-
-	return {
-		updateAvailable: true,
-		currentVersion: APP_VERSION,
-		latestVersion: data.version,
-		releaseInfo,
-		downloadSize,
-		totalSize,
-		zstdPatchSize,
-		strategy,
-		patchChain,
-	};
-}
-
 /** Capture source policy before any asynchronous detection; cached results stay immutable. */
 export async function checkForUpdate(
 	options: { force?: boolean; transport?: UpdateFetchContext } = {},
@@ -741,7 +499,7 @@ export async function checkForUpdate(
 		const startedAt = Date.now();
 		result = await githubReleaseUpdater.check(
 			{
-				repository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
+				repository: sourceIdentity.repository,
 				channel: sourceIdentity.channel,
 				platform: sourceIdentity.platform,
 				currentVersion: APP_VERSION,
@@ -771,12 +529,18 @@ export async function checkForUpdate(
 /** Notes are optional, but must never cross a configuration or artifact identity boundary. */
 export async function getUpdateNotes(request: UpdateNotesRequest, signal?: AbortSignal) {
 	const captured = getCurrentUpdateSourceIdentity();
-	if (captured?.source !== "github" || !sameUpdateSourceIdentity(request.sourceIdentity, captured))
+	if (!captured || !sameUpdateSourceIdentity(request.sourceIdentity, captured))
 		throw new GithubUpdateError("UPDATE_SOURCE_CHANGED", "Update source changed; check again");
-	const result = await githubReleaseUpdater.getNotes(
-		{ ...request, sourceIdentity: captured },
-		signal,
-	);
+	const result =
+		captured.source === "github"
+			? await githubReleaseUpdater.getNotes({ ...request, sourceIdentity: captured }, signal)
+			: await getMirrorNotes(
+					captured,
+					request.version,
+					request.sha512,
+					createUpdateFetchContext(),
+					signal,
+				);
 	if (!sameUpdateSourceIdentity(captured, getCurrentUpdateSourceIdentity()))
 		throw new GithubUpdateError(
 			"UPDATE_SOURCE_CHANGED",
@@ -798,6 +562,7 @@ export function getCurrentUpdateSourceIdentity(): UpdateSourceIdentity | null {
 			: {
 					...common,
 					source: "update-server",
+					repository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 					serverUrl: getServerBaseUrl(),
 					product: settings.update?.product ?? "narrafork",
 				},
@@ -809,9 +574,9 @@ export function isUpdateSourceCurrent(releaseInfo: ReleaseInfo): boolean {
 	if (!captured || !sameUpdateSourceIdentity(captured, getCurrentUpdateSourceIdentity()))
 		return false;
 	if (captured.source !== (releaseInfo.source ?? "update-server")) return false;
-	if (captured.source === "github") {
-		return releaseInfo.repository?.trim().toLowerCase() === captured.repository;
-	}
+	if (releaseInfo.repository?.trim().toLowerCase() !== captured.repository) return false;
+	if (captured.source === "github") return true;
+	if (releaseInfo._mirror?.serverUrl !== captured.serverUrl) return false;
 	return (
 		!releaseInfo._v2?.serverUrl ||
 		sameUpdateSourceIdentity(captured, {
@@ -835,172 +600,22 @@ async function checkForServerUpdate(
 		};
 	}
 
-	const { channel, platform, product } = sourceIdentity;
-
 	try {
-		const context = transport ?? createUpdateFetchContext();
-		if (channel === "beta") {
-			// Check both channels in parallel
-			const [betaResult, stableResult] = await Promise.all([
-				checkChannel(serverUrl, product, "beta", platform, context),
-				checkChannel(serverUrl, product, "stable", platform, context),
-			]);
-
-			// Pick the higher version between the two channels
-			if (stableResult.updateAvailable && betaResult.updateAvailable) {
-				const sv = stableResult.latestVersion ?? "0.0.0";
-				const bv = betaResult.latestVersion ?? "0.0.0";
-				return compareSemver(sv, bv) >= 0 ? stableResult : betaResult;
-			}
-			if (stableResult.updateAvailable) return stableResult;
-			if (betaResult.updateAvailable) return betaResult;
-			return betaResult.errorCode ? betaResult : stableResult.errorCode ? stableResult : betaResult;
-		}
-
-		return await checkChannel(serverUrl, product, channel, platform, context);
+		return await checkMirrorUpdate(
+			sourceIdentity,
+			APP_VERSION,
+			transport ?? createUpdateFetchContext(),
+		);
 	} catch (err) {
 		logger.error("Update check error", { error: String(err) });
 		return {
 			updateAvailable: false,
 			currentVersion: APP_VERSION,
-			errorCode: "NETWORK_ERROR",
-			error: "Update server check failed",
+			repository: sourceIdentity.repository,
+			errorCode: err instanceof GithubUpdateError ? err.code : "NETWORK_ERROR",
+			error:
+				err instanceof GithubUpdateError ? err.message : "Independent update server check failed",
 		};
-	}
-}
-
-interface PatchApplicationContext {
-	/** Source binary for this step. */
-	sourcePath: string;
-	/** Destination for the reconstructed binary. */
-	outputPath: string;
-	stepUrl: string;
-	meta: ZstdPatchMeta;
-	declaredPatchSize: number;
-	forceDownload: boolean;
-	signal?: AbortSignal;
-	transport: UpdateFetchContext;
-	helperContext: DistributionContext;
-	onProgress?: (progress: UpdateProgress) => void;
-	progressBase: number;
-	progressSpan: number;
-}
-
-class ZstdCliMissingError extends Error {
-	constructor() {
-		super("zstd CLI required for patch-from mode");
-		this.name = "ZstdCliMissingError";
-	}
-}
-
-async function fetchPatchMeta(
-	metaUrl: string,
-	signal: AbortSignal | undefined,
-	transport: UpdateFetchContext,
-): Promise<ZstdPatchMeta> {
-	const metaResp = await fetchWithTimeout(metaUrl, {
-		timeoutMs: METADATA_FETCH_TIMEOUT_MS,
-		signal,
-		transport,
-	});
-	if (!metaResp.ok) {
-		void metaResp.body?.cancel().catch(() => {});
-		throw new Error(`Failed to fetch patch meta: ${metaResp.status}`);
-	}
-	return (await readUpdateJson(metaResp, 64 * 1024)) as ZstdPatchMeta;
-}
-
-/**
- * Fetch one patch to disk and reconstruct the next binary, file-to-file.
- *
- * Every network hop is bounded (timeout plus a byte ceiling derived from the announced patch
- * size) and the reconstruction itself happens in a child process / off-thread binding, so the
- * event loop stays free for ordinary HTTP, WebSocket and agent traffic.
- */
-async function downloadAndApplyPatchStep(context: PatchApplicationContext): Promise<void> {
-	const patchTempPath = `${context.outputPath}.patch.${process.pid}.${Date.now()}.tmp`;
-	const meta = context.meta;
-	try {
-		context.onProgress?.({
-			phase: "downloading",
-			bytesDownloaded: 0,
-			totalBytes: meta.patchSize,
-			percent: Math.round(context.progressBase),
-		});
-
-		const patchResp = await fetchWithTimeout(context.stepUrl, {
-			timeoutMs: PAYLOAD_FETCH_TIMEOUT_MS,
-			signal: context.signal,
-			transport: context.transport,
-		});
-		if (!patchResp.ok) {
-			void patchResp.body?.cancel().catch(() => {});
-			throw new Error(`Failed to fetch patch: ${patchResp.status}`);
-		}
-		// Trust the smaller of the two announced sizes, with slack for header/framing drift.
-		const declared = Math.max(meta.patchSize || 0, context.declaredPatchSize || 0);
-		const maxPatchBytes = Math.min(
-			MAX_PATCH_BYTES,
-			declared > 0 ? Math.ceil(declared * PATCH_SIZE_SLACK) + 64 * 1024 : MAX_PATCH_BYTES,
-		);
-		const patchBytes = await streamResponseToFile(patchResp, patchTempPath, {
-			maxBytes: maxPatchBytes,
-			onProgress: (bytesWritten) => {
-				context.onProgress?.({
-					phase: "downloading",
-					bytesDownloaded: bytesWritten,
-					totalBytes: meta.patchSize,
-					percent: Math.round(
-						context.progressBase +
-							context.progressSpan * 0.5 * Math.min(1, bytesWritten / (meta.patchSize || 1)),
-					),
-				});
-			},
-		});
-
-		let zstdCliPath: string | undefined;
-		if (meta.mode === "patch-from") {
-			const cli = await getZstdCliPath(
-				context.forceDownload,
-				true,
-				context.signal,
-				context.helperContext,
-			);
-			if (!cli) throw new ZstdCliMissingError();
-			zstdCliPath = cli;
-		}
-
-		logger.info("Applying zstd patch", {
-			patchSize: patchBytes,
-			newFileSize: meta.newFileSize,
-			mode: meta.mode ?? "dictionary",
-		});
-		context.onProgress?.({
-			phase: "applying",
-			bytesDownloaded: patchBytes,
-			totalBytes: meta.newFileSize,
-			percent: Math.round(context.progressBase + context.progressSpan * 0.5),
-		});
-
-		await applyZstdPatchToFile({
-			oldFilePath: context.sourcePath,
-			patchFilePath: patchTempPath,
-			outputFilePath: context.outputPath,
-			meta,
-			zstdPath: zstdCliPath,
-			signal: context.signal,
-			timeoutMs: PATCH_APPLY_TIMEOUT_MS,
-			maxOutputBytes: MAX_BINARY_BYTES,
-		});
-
-		context.onProgress?.({
-			phase: "applying",
-			bytesDownloaded: patchBytes,
-			totalBytes: meta.newFileSize,
-			percent: Math.round(context.progressBase + context.progressSpan),
-		});
-	} finally {
-		safeUnlink(patchTempPath);
 	}
 }
 
@@ -1036,8 +651,22 @@ export async function downloadUpdate(
 }> {
 	const forceDownload = options.forceDownload ?? false;
 	const sourceIdentity = parseUpdateSourceIdentity(releaseInfo.sourceIdentity);
-	releaseInfo = { ...releaseInfo, sourceIdentity: sourceIdentity ?? undefined };
-	const isGithub = releaseInfo.source === "github";
+	let recoveryManifestVersions: number[];
+	try {
+		recoveryManifestVersions = parseRecoveryManifestVersions(releaseInfo.recoveryManifestVersions);
+	} catch {
+		return {
+			success: false,
+			error: "Invalid recovery protocol capabilities; check for updates again",
+		};
+	}
+	releaseInfo = {
+		...releaseInfo,
+		sourceIdentity: sourceIdentity ?? undefined,
+		recoveryManifestVersions,
+	};
+	const isGithub =
+		!!releaseInfo._github && (releaseInfo.source === "github" || !!releaseInfo._mirror);
 	if (!sourceIdentity || !isUpdateSourceCurrent(releaseInfo)) {
 		return { success: false, error: "Update source changed; check for updates again" };
 	}
@@ -1061,13 +690,13 @@ export async function downloadUpdate(
 	const updatePath = join(UPDATE_DIR, releaseFileName);
 	const tempPath = `${updatePath}.${process.pid}.${randomUUID()}.tmp`;
 	let ownsGithubTemp = false;
-	// Patch chains reconstruct one intermediate binary per step; both slots are reused.
-	const intermediatePaths = [`${tempPath}.step-a`, `${tempPath}.step-b`];
 
 	logger.info("Starting update download", {
 		version: releaseInfo.version,
 		execPath,
-		hasV2: !!releaseInfo._v2,
+		source: releaseInfo.source,
+		repository: sourceIdentity.repository,
+		hasMirror: !!releaseInfo._mirror,
 	});
 
 	const githubDeadline = isGithub ? createGithubUpdateDeadline(options.signal) : undefined;
@@ -1097,13 +726,12 @@ export async function downloadUpdate(
 		});
 
 		let applied = false;
-		let zstdCliMissing = false;
 
 		if (isGithub && githubDeadline) {
 			const startedAt = Date.now();
 			const strategy = await downloadGithubUpdateToFile(
 				{
-					release: releaseInfo,
+					release: { ...releaseInfo, source: "github" },
 					currentVersion: APP_VERSION,
 					basePath: execPath,
 					outputPath: tempPath,
@@ -1116,25 +744,36 @@ export async function downloadUpdate(
 				},
 				{
 					downloadPatch: (step, path, downloadOptions) =>
-						downloadGithubPatchToFile(step, path, { ...downloadOptions, fetcher: transport.fetch }),
-					downloadFull: (release, path, downloadOptions) =>
-						downloadGithubBinaryToFile(release, path, {
+						releaseInfo._mirror
+							? downloadMirrorPatch(releaseInfo, path, downloadOptions, transport)
+							: downloadGithubPatchToFile(step, path, {
+									...downloadOptions,
+									fetcher: transport.fetch,
+								}),
+					downloadFull: (release, path, downloadOptions) => {
+						if (!isUpdateSourceCurrent(releaseInfo))
+							throw new Error("Update source changed; check again");
+						return downloadGithubBinaryToFile(release, path, {
 							...downloadOptions,
 							fetcher: transport.fetch,
-						}),
+						});
+					},
 					resolveZstd: (patchSignal) =>
 						getZstdCliPath(forceDownload, true, patchSignal, helperContext),
 					onFallback: (error) =>
-						logger.warn("GitHub delta unavailable; downloading GitHub full binary", {
-							source: "github",
-							error: String(error),
-						}),
+						logger.warn(
+							"Incremental update unavailable; downloading canonical GitHub full binary",
+							{
+								source: releaseInfo.source,
+								error: String(error),
+							},
+						),
 				},
 			);
 			ownsGithubTemp = true;
 			applied = true;
-			logger.info("GitHub update downloaded", {
-				source: "github",
+			logger.info("Canonical update downloaded", {
+				source: releaseInfo.source,
 				strategy,
 				version: releaseInfo.version,
 				bytes: releaseInfo.files[0]?.size,
@@ -1142,104 +781,7 @@ export async function downloadUpdate(
 			});
 		}
 
-		// Strategy: direct zstd patch (only the explicitly selected update server).
-		if (!isGithub && execPath && existsSync(execPath)) {
-			const zstdMetaUrl = releaseInfo._v2?.zstdPatchMetaUrl;
-			const zstdPatchUrl = releaseInfo._v2?.zstdPatchUrl;
-
-			if (zstdMetaUrl && zstdPatchUrl) {
-				try {
-					// Check the base version before spending a payload download on an unusable patch.
-					const meta = await fetchPatchMeta(zstdMetaUrl, signal, transport);
-					if (meta.fromVersion !== APP_VERSION) {
-						logger.debug("Zstd patch version mismatch", {
-							patchFrom: meta.fromVersion,
-							current: APP_VERSION,
-						});
-					} else {
-						await downloadAndApplyPatchStep({
-							sourcePath: execPath,
-							outputPath: tempPath,
-							stepUrl: zstdPatchUrl,
-							meta,
-							declaredPatchSize: meta.patchSize,
-							forceDownload,
-							signal,
-							transport,
-							helperContext,
-							onProgress,
-							progressBase: 0,
-							progressSpan: 100,
-						});
-						applied = true;
-						logger.info("Zstd patch applied successfully", { resultSize: meta.newFileSize });
-					}
-				} catch (err) {
-					if (err instanceof ZstdCliMissingError) zstdCliMissing = true;
-					safeUnlink(tempPath);
-					logger.warn("Zstd patch failed", { error: String(err) });
-					if (signal?.aborted) throw err;
-				}
-			}
-		}
-
-		// Strategy: patch chain (multi-step)
-		if (!isGithub && !applied && execPath && existsSync(execPath)) {
-			const chain = releaseInfo._v2?.patchChain;
-			if (chain && chain.length > 0) {
-				try {
-					logger.info("Using patch chain", { steps: chain.length });
-					let sourcePath = execPath;
-
-					for (let i = 0; i < chain.length; i++) {
-						const step = chain[i];
-						const isLast = i === chain.length - 1;
-						const outputPath = isLast ? tempPath : intermediatePaths[i % 2];
-						const meta = await fetchPatchMeta(step.metaUrl, signal, transport);
-						await downloadAndApplyPatchStep({
-							sourcePath,
-							outputPath,
-							stepUrl: step.url,
-							meta,
-							declaredPatchSize: step.patchSize,
-							forceDownload,
-							signal,
-							transport,
-							helperContext,
-							onProgress,
-							progressBase: (i / chain.length) * 100,
-							progressSpan: (1 / chain.length) * 100,
-						});
-						// The previous intermediate is no longer needed once the next one exists.
-						if (sourcePath !== execPath) safeUnlink(sourcePath);
-						sourcePath = outputPath;
-					}
-
-					applied = true;
-					logger.info("Patch chain applied successfully", { steps: chain.length });
-				} catch (err) {
-					if (err instanceof ZstdCliMissingError) zstdCliMissing = true;
-					logger.warn("Patch chain failed", { error: String(err) });
-					if (signal?.aborted) throw err;
-				} finally {
-					for (const path of intermediatePaths) safeUnlink(path);
-				}
-			}
-		}
-
-		if (!applied) {
-			if (zstdCliMissing) {
-				return {
-					success: false,
-					error: "ZSTD_CLI_MISSING",
-				};
-			}
-			return {
-				success: false,
-				error:
-					"No applicable update strategy: neither direct zstd patch nor patch chain available.",
-			};
-		}
+		if (!applied) throw new Error("Canonical GitHub descriptor required; check again");
 
 		// Verify SHA512
 		emitProgress({
@@ -1303,6 +845,7 @@ export async function downloadUpdate(
 		const finalSize = statSync(finalUpdatePath).size;
 		const preparedInfo: PlacedUpdateInfo = {
 			sourceIdentity,
+			recoveryManifestVersions,
 			version: releaseInfo.version,
 			fromVersion: APP_VERSION,
 			fileName: finalFileName,
@@ -1461,6 +1004,7 @@ async function verifyFileSha512Cached(
 
 function preparedUpdateIdentity(info: PlacedUpdateInfo): PreparedUpdateIdentity {
 	const sourceIdentity = parseUpdateSourceIdentity(info.sourceIdentity);
+	const recoveryManifestVersions = parseRecoveryManifestVersions(info.recoveryManifestVersions);
 	const id = createHash("sha256")
 		.update(
 			JSON.stringify([
@@ -1475,6 +1019,8 @@ function preparedUpdateIdentity(info: PlacedUpdateInfo): PreparedUpdateIdentity 
 				info.sha512,
 				info.sizeBytes,
 				sourceIdentity,
+				// Keep legacy selectors stable, but bind newly verified capabilities.
+				...(info.recoveryManifestVersions === undefined ? [] : [recoveryManifestVersions]),
 			]),
 		)
 		.digest("hex");
@@ -1484,6 +1030,7 @@ function preparedUpdateIdentity(info: PlacedUpdateInfo): PreparedUpdateIdentity 
 		sha512: info.sha512,
 		sizeBytes: info.sizeBytes,
 		sourceIdentity,
+		recoveryManifestVersions,
 	};
 }
 
@@ -1510,9 +1057,14 @@ function readPlacedUpdateRecord(): PlacedUpdateInfo | null {
 			info.sizeBytes > MAX_BINARY_BYTES ||
 			(info.newBinaryPath !== undefined && typeof info.newBinaryPath !== "string") ||
 			(info.updatePath !== undefined && typeof info.updatePath !== "string") ||
-			(info.sourceIdentity != null && !parseUpdateSourceIdentity(info.sourceIdentity))
+			(info.sourceIdentity != null &&
+				!parseUpdateSourceIdentity(info.sourceIdentity) &&
+				!isLegacyMirrorSourceIdentity(info.sourceIdentity))
 		)
 			return null;
+		if (info.recoveryManifestVersions !== undefined) {
+			info.recoveryManifestVersions = parseRecoveryManifestVersions(info.recoveryManifestVersions);
+		}
 		return info;
 	} catch {
 		return null;
@@ -1655,6 +1207,7 @@ export function getUpdateDirectory(): string {
 export async function getUpdateStatus(targetVersion?: string): Promise<
 	UpdateCoordinationStatus & {
 		ready: boolean;
+		cleanupRetryPending: boolean;
 		updateFile?: string;
 		canAutoRestart: boolean;
 		newBinaryPath?: string;
@@ -1679,7 +1232,7 @@ export async function getUpdateStatus(targetVersion?: string): Promise<
 		...(artifactPath
 			? { instructions: getUpdateInstructions(artifactPath, placedInfo?.newBinaryPath) }
 			: {}),
-		...getUpdateCoordinationStatus(),
+		...getUpdateCoordinationWithCleanup(),
 	};
 }
 
@@ -1798,7 +1351,16 @@ export async function applyUpdate(
 		};
 	}
 
-	const scheduled = scheduleUpdate(placedInfo.version);
+	let scheduled: UpdateCoordinationStatus;
+	try {
+		scheduled = scheduleUpdate(placedInfo.version, "update", {
+			supportedRecoveryManifestVersions: parseRecoveryManifestVersions(
+				placedInfo.recoveryManifestVersions,
+			),
+		});
+	} catch (reason) {
+		return { success: false, error: reason instanceof Error ? reason.message : String(reason) };
+	}
 	// scheduleUpdate always assigns an epoch when it transitions an idle coordinator.
 	const updateEpoch = scheduled.updateEpoch as string;
 	const drainStartedAt = new Date().toISOString();
@@ -1840,9 +1402,9 @@ function preserveFailedUpdateRecoveryEvidence(options: {
 	try {
 		const existing = consumePlannedUpdateRecoverySnapshot();
 		if (existing?.updateEpoch === options.updateEpoch) {
-			// A cancelled manual preparation must not leave a valid next-start authorization
-			// behind when continuation cleanup fails. Retain diagnostics, revoke resume permission.
-			if (existing.resumeOnNextStartup) {
+			// A failed automatic or manual handoff must not retain authorization.
+			// Automatic snapshots normally have a nonce, not resumeOnNextStartup.
+			if (!existing.evidenceOnly || existing.resumeOnNextStartup) {
 				writePlannedUpdateRecoverySnapshot(
 					{ ...existing, resumeOnNextStartup: false, evidenceOnly: true },
 					{ expectedEpoch: options.updateEpoch },
@@ -1884,13 +1446,33 @@ function preserveFailedUpdateRecoveryEvidence(options: {
 }
 
 /** @internal Exported for focused update failure-path tests. */
-export async function failPreparedUpdateAttempt(options: {
-	updateEpoch: string;
-	targetVersion: string;
-	error: string;
-	/** Operator-initiated abandonment rather than a genuine failure. */
-	cancelled?: boolean;
-}): Promise<void> {
+export async function failPreparedUpdateAttempt(options: FailedUpdateCleanup): Promise<void> {
+	try {
+		await cleanupPreparedUpdateAttempt(options);
+		if (
+			!getUpdateCoordinationStatus().scheduled &&
+			failedUpdateCleanup.pending?.options.updateEpoch === options.updateEpoch
+		) {
+			failedUpdateCleanup.pending = null;
+		}
+	} catch (error) {
+		const current = getUpdateCoordinationStatus();
+		if (
+			current.scheduled &&
+			current.updateEpoch === options.updateEpoch &&
+			current.operation !== "system_shutdown"
+		) {
+			failedUpdateCleanup.pending = {
+				options: { ...options },
+				retrying: false,
+				error: `${options.error}; cleanup failed: ${String(error)}`,
+			};
+		}
+		throw error;
+	}
+}
+
+async function cleanupPreparedUpdateAttempt(options: FailedUpdateCleanup): Promise<void> {
 	const current = getUpdateCoordinationStatus();
 	if (current.updateEpoch !== options.updateEpoch) {
 		logger.warn("Ignoring stale prepared-update failure", {
@@ -1902,6 +1484,37 @@ export async function failPreparedUpdateAttempt(options: {
 	}
 
 	cancelGracefulRestartSession();
+	// Inspect the immutable reservation, not source validators: a failed source
+	// identity check is itself a rollback failure that must remain retryable.
+	if (getReservedRecoverySourceEpochs(options.updateEpoch).length > 0) {
+		// A new root may include waits owned by earlier recovery passes. Revoke
+		// only our publication, then cancel only rows created by this attempt.
+		// Any failure here deliberately keeps the ticket/gate for a retry.
+		try {
+			rollbackPreparedUpdateRecoverySnapshot(options.updateEpoch);
+			const cancelledCount = await toolContinuationService.cancelEpoch(
+				options.updateEpoch,
+				options.error,
+			);
+			if (getUpdateCoordinationStatus().updateEpoch !== options.updateEpoch) return;
+			releasePreparedUpdateRecoveryHandoff(options.updateEpoch);
+			if (failedUpdateCleanup.pending?.options.updateEpoch === options.updateEpoch) {
+				failedUpdateCleanup.pending = null;
+			}
+			failScheduledUpdate(options.error, { cancelled: options.cancelled });
+			logger.info("Recovery handoff rolled back without cancelling inherited sources", {
+				updateEpoch: options.updateEpoch,
+				cancelledCount,
+			});
+		} catch (error) {
+			logger.error("Recovery handoff rollback incomplete; retaining checkpoint gate", {
+				updateEpoch: options.updateEpoch,
+				error: String(error),
+			});
+			throw error;
+		}
+		return;
+	}
 	try {
 		const manifest = consumePlannedUpdateRecoverySnapshot();
 		if (manifest?.updateEpoch === options.updateEpoch && manifest.resumeOnNextStartup) {
@@ -1986,9 +1599,23 @@ export function cancelPreparedUpdate(reason?: string): {
 	cancelled: boolean;
 	status: UpdateCoordinationStatus;
 } {
-	const before = getUpdateCoordinationStatus();
+	const before = getUpdateCoordinationWithCleanup();
 	if (!before.scheduled || !before.updateEpoch || before.operation === "system_shutdown") {
 		return { cancelled: false, status: before };
+	}
+	const pendingCleanup = failedUpdateCleanup.pending;
+	if (pendingCleanup?.options.updateEpoch === before.updateEpoch) {
+		// This epoch's handoff session has already been revoked by the failed
+		// cleanup. Unlike a live replacement handshake, retrying is now safe.
+		if (!pendingCleanup.retrying) {
+			pendingCleanup.retrying = true;
+			runFailedUpdateCleanup({
+				...pendingCleanup.options,
+				error: reason ?? pendingCleanup.options.error,
+				cancelled: true,
+			});
+		}
+		return { cancelled: true, status: getUpdateCoordinationWithCleanup() };
 	}
 	// Cancelling during `restarting` would leave the already-spawned replacement racing this
 	// process for the same port and handoff; let the handoff watchdog resolve that instead.
@@ -1996,7 +1623,7 @@ export function cancelPreparedUpdate(reason?: string): {
 		return { cancelled: false, status: before };
 	}
 	cancelScheduledUpdate(reason);
-	return { cancelled: true, status: getUpdateCoordinationStatus() };
+	return { cancelled: true, status: getUpdateCoordinationWithCleanup() };
 }
 
 /**
@@ -2141,14 +1768,21 @@ export async function checkpointPreparedUpdateFence(
 	updateEpoch: string,
 	hooks: PlannedUpdateCheckpointHooks = {},
 ): Promise<PlannedUpdateRecoverySnapshot> {
+	await waitForScheduledRecoveryHandoff();
+	assertUpdateNotCancelled();
+	const recoveryEpochs = () => {
+		const epochs = getScheduledRecoveryEpochs();
+		return epochs.length ? epochs : [updateEpoch];
+	};
 	const waitForFence = hooks.waitForFence ?? waitForUpdateCheckpointFence;
 	const checkpoint = hooks.checkpoint ?? checkpointPlannedUpdateContinuations;
 	const loadActiveToolCallIds = hooks.listActiveToolCallIds ?? listActiveToolCallIds;
 	const loadCoveredToolCallIds =
 		hooks.listCoveredToolCallIds ??
-		(async (epoch: string) =>
-			(await toolContinuationService.listByEpoch(epoch)).map((row) => row.toolCallId));
-	const verifySendAwaits = hooks.verifySendAwaitContinuations ?? verifySendAwaitCheckpointEpoch;
+		(async () =>
+			(await toolContinuationService.listByEpoch(recoveryEpochs())).map((row) => row.toolCallId));
+	const verifySendAwaits =
+		hooks.verifySendAwaitContinuations ?? (() => verifySendAwaitCheckpointEpoch(recoveryEpochs()));
 
 	let stablePasses = 0;
 	let snapshot: PlannedUpdateRecoverySnapshot | null = null;
@@ -2204,6 +1838,8 @@ async function drainAndSpawnPreparedUpdate(options: {
 	targetVersion: string;
 	updateEpoch: string;
 }): Promise<void> {
+	await waitForScheduledRecoveryHandoff();
+	assertUpdateNotCancelled();
 	await waitForBackgroundBashDrain();
 	assertUpdateNotCancelled();
 	beginQuiescingTools();
@@ -2212,7 +1848,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 	// Last cancellation checkpoint before the two irreversible steps: writing the recovery
 	// manifest and spawning the replacement process.
 	assertUpdateNotCancelled();
-	writePlannedUpdateRecoverySnapshot(recoverySnapshot);
+	writePreparedUpdateRecoverySnapshot(recoverySnapshot);
 	markUpdateRestarting();
 
 	let session: ReturnType<typeof beginGracefulRestartSession>;
@@ -2226,7 +1862,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 	// handoff session (so a crash between the two still leaves recovery evidence), so the nonce is
 	// stamped in now that it is known. Only the replacement receiving this same nonce may act on
 	// the manifest; any other startup discards it instead of resuming its narrators.
-	writePlannedUpdateRecoverySnapshot(recoverySnapshot, {
+	writePreparedUpdateRecoverySnapshot(recoverySnapshot, {
 		expectedEpoch: options.updateEpoch,
 		handoffMarkerNonce: session.markerNonce,
 	});
@@ -2238,6 +1874,8 @@ async function drainAndSpawnPreparedUpdate(options: {
 		// mode would silently fall back to direct connections after every update.
 		const env = {
 			...envWithAmbientProxy(),
+			// 启动时已从 process.env 清掉。替换进程仍要能接受面板的关闭和更新。
+			...managerChildTokenEnv(),
 			NARRAFORK_GRACEFUL_RESTART_URL: session.url,
 			NARRAFORK_GRACEFUL_RESTART_TOKEN: session.token,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
@@ -2262,6 +1900,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 						cwd: process.cwd(),
 						env,
 						stdio: ["ignore", "ignore", "ignore"],
+						windowsHide: true,
 					},
 				)
 			: Bun.spawn([options.newExecPath, ...launchArgs], {

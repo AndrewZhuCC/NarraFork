@@ -20,7 +20,6 @@ import {
 	createMemoryProfiler,
 	memoryProfileView,
 	PROFILE_SUPERVISOR_PHASE_BUDGETS,
-	profileWorkerEntryPoint,
 	profileWorkerSpecifiers,
 	statusMemoryProfile,
 	stopMemoryProfile,
@@ -1078,14 +1077,11 @@ describe("memory profile supervisor", () => {
 			await f.dispose();
 		}
 	});
-	test("compiled worker candidates retain Bun virtual filesystem Windows entrypoint", () => {
+	test("compiled worker candidates", () => {
 		expect(
 			profileWorkerSpecifiers(false, "file:///repo/server/lib/browser/memory-profiler.ts"),
 		).toEqual(["file:///repo/server/lib/browser/memory-profile-worker.ts"]);
 		expect(profileWorkerSpecifiers(true, "file:///$bunfs/root/index.js")).toHaveLength(3);
-		expect(
-			profileWorkerEntryPoint("file:///C:/~BUN/root/lib/browser/memory-profile-worker.js"),
-		).toBe("C:/~BUN/root/lib/browser/memory-profile-worker.js");
 	});
 	test("pure registry revocation cancels access but leaves file ownership to async caller", async () => {
 		const root = await mkdtemp(join(tmpdir(), "nf-profile-registry-"));

@@ -232,6 +232,31 @@ describe("main downloadUpdate helper/transport wiring", () => {
 		expect(JSON.stringify(result.preparedIdentity)).not.toContain("secret");
 	});
 
+	test("explicit mirror sourceIdentity still freezes configured GitHub helper source and full fallback", async () => {
+		if (!settings.update) throw new Error("Missing update settings");
+		settings.update.source = "update-server";
+		const info = {
+			...fixtureRelease(),
+			source: "update-server" as const,
+			_mirror: { serverUrl: settings.update.serverUrl },
+		};
+		seam = async (options, dependencies) => {
+			expect(options.release.sourceIdentity?.source).toBe("update-server");
+			expect(await dependencies.resolveZstd(options.signal)).toBe("/mock/verified/zstd");
+			expect(helpers[0]?.options.context?.source).toEqual({ source: "github", repository });
+			await dependencies.downloadFull(options.release, options.outputPath, {
+				signal: options.signal,
+			});
+			return "full";
+		};
+		const result = await downloadUpdate(info, undefined, { signal: parent.signal });
+		expect(result.success).toBe(true);
+		expect(result.preparedIdentity?.sourceIdentity?.source).toBe("update-server");
+		expect(
+			wireRequests.every(({ url }) => url.startsWith(`https://github.com/${repository}/`)),
+		).toBe(true);
+	});
+
 	test("helper unavailability reaches real patch executor's same-GitHub full fallback", async () => {
 		helperMode = "missing";
 		seam = async (options, dependencies) => {

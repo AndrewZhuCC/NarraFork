@@ -11,6 +11,7 @@ import {
 	integer,
 	type PgColumn,
 	pgTable,
+	primaryKey,
 	text,
 	unique,
 	uniqueIndex,
@@ -56,6 +57,68 @@ export const permissionRuleRequests = pgTable(
 			table.createdAt,
 			table.id,
 		),
+	],
+);
+
+export const resourceProtectionPaths = pgTable(
+	"resource_protection_paths",
+	{
+		source: text("source").notNull(),
+		sourceId: text("source_id").notNull(),
+		slot: integer("slot").notNull(),
+		deviceId: text("device_id").notNull(),
+		canonicalPath: text("canonical_path"),
+		repositoryKey: text("repository_key"),
+		shadowKey: text("shadow_key"),
+		scopeProjectId: text("scope_project_id"),
+		aliasSensitive: integer("alias_sensitive").notNull().default(0),
+		claimJson: text("claim_json").notNull(),
+	},
+	(table) => [
+		index("idx_protection_path").on(
+			table.deviceId,
+			table.canonicalPath,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_repository").on(
+			table.deviceId,
+			table.repositoryKey,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_shadow").on(table.shadowKey, table.source, table.sourceId, table.slot),
+		index("idx_protection_scope").on(
+			table.scopeProjectId,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_alias").on(
+			table.aliasSensitive,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		primaryKey({ columns: [table.source, table.sourceId, table.slot] }),
+	],
+);
+
+export const resourceProtectionSources = pgTable(
+	"resource_protection_sources",
+	{
+		source: text("source").notNull(),
+		sourceId: text("source_id").notNull(),
+		revision: integer("revision").notNull().default(1),
+		dirty: integer("dirty").notNull().default(1),
+		cursor: text("cursor"),
+		complete: integer("complete").notNull().default(0),
+	},
+	(table) => [
+		index("idx_protection_dirty").on(table.dirty, table.source, table.sourceId),
+		primaryKey({ columns: [table.source, table.sourceId] }),
 	],
 );
 
@@ -720,23 +783,32 @@ export const modelHistoryRevisionContracts = pgTable("model_history_revision_con
 	installedVersion: text("installed_version").notNull(),
 });
 
-export const narratorContextCharPages = pgTable(
-	"narrator_context_char_pages",
+export const narratorContextPins = pgTable(
+	"narrator_context_pins",
 	{
-		id: text("id").primaryKey().notNull(),
+		generation: text("generation").primaryKey().notNull(),
 		narratorId: text("narrator_id")
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
-		generation: text("generation").notNull(),
-		page: integer("page").notNull(),
+		segmentsJson: jsonText("segments_json").notNull(),
+	},
+	(table) => [index("idx_context_pins_narrator").on(table.narratorId)],
+);
+
+export const narratorMessageContextStats = pgTable(
+	"narrator_message_context_stats",
+	{
+		messageId: text("message_id").primaryKey().notNull(),
+		role: text("role").notNull(),
+		parentToolUseId: text("parent_tool_use_id"),
 		segmentsJson: jsonText("segments_json").notNull(),
 	},
 	(table) => [
-		uniqueIndex("context_char_pages_generation_page_idx").on(
-			table.narratorId,
-			table.generation,
-			table.page,
-		),
+		foreignKey({
+			name: "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk",
+			columns: [table.messageId],
+			foreignColumns: [narratorMessages.id],
+		}).onDelete("cascade"),
 	],
 );
 
@@ -753,6 +825,7 @@ export const narratorMessages = pgTable(
 		contentJson: jsonText("content_json").notNull(),
 		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
+		composerDocument: jsonText("composer_document"),
 		contextCharsJson: jsonText("context_chars_json"),
 		tokensIn: integer("tokens_in"),
 		costUsd: doublePrecision("cost_usd"),
@@ -901,7 +974,15 @@ export const narratorToolCalls = pgTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
-		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		index("idx_toolcalls_context_id").on(
+			table.messageId,
+			table.id,
+			table.toolUseId,
+			table.createdAt,
+			table.executionAttempt,
+			table.inputChars,
+			table.outputChars,
+		),
 		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
 		index("idx_toolcalls_context_latest").on(
 			table.messageId,
@@ -1515,6 +1596,7 @@ export const narratorDrafts = pgTable(
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		text: text("text").notNull().default(""),
 		fileReferencesJson: text("file_references_json"),
+		composerDocument: jsonText("composer_document"),
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
@@ -1991,7 +2073,8 @@ export const apiRequests = pgTable(
 		meterUsage: doublePrecision("meter_usage"),
 		meterUnit: text("meter_unit"),
 		errorMessage: text("error_message"),
-		rawDumpJson: text("raw_dump_json"),
+		diagnosticsJson: text("diagnostics_json"),
+		recordingRequestId: text("recording_request_id"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -2001,6 +2084,7 @@ export const apiRequests = pgTable(
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
+		index("idx_api_requests_recording").on(table.recordingRequestId),
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
 	],
 );
@@ -2999,9 +3083,10 @@ export const knowledgeInjectionEvents = pgTable(
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		compactSeq: integer("compact_seq").notNull(),
-		entryId: text("entry_id")
-			.notNull()
-			.references((): PgColumn => knowledgeEntries.id, { onDelete: "cascade" }),
+		entryId: text("entry_id").references((): PgColumn => knowledgeEntries.id, {
+			onDelete: "cascade",
+		}),
+		personalEntryId: text("personal_entry_id"),
 		entryRevisionId: text("entry_revision_id"),
 		source: text("source").notNull(),
 		triggerMessageId: text("trigger_message_id"),
@@ -3011,11 +3096,28 @@ export const knowledgeInjectionEvents = pgTable(
 	},
 	(table) => [
 		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
+		uniqueIndex("idx_kie_cycle_personal_entry").on(
+			table.narratorId,
+			table.compactSeq,
+			table.personalEntryId,
+		),
+		index("idx_kie_personal_entry").on(table.personalEntryId),
 		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
 		index("idx_kie_entry").on(table.entryId),
 		index("idx_kie_trigger_message").on(table.triggerMessageId),
 		index("idx_kie_trigger_tool_call").on(table.triggerToolCallId),
 		index("idx_kie_entry_revision").on(table.entryRevisionId),
+		check(
+			"knowledge_injection_exactly_one_entry",
+			sql.raw(
+				'("entry_id" IS NOT NULL AND "personal_entry_id" IS NULL) OR ("entry_id" IS NULL AND "personal_entry_id" IS NOT NULL)',
+			),
+		),
+		foreignKey({
+			name: "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk",
+			columns: [table.personalEntryId],
+			foreignColumns: [knowledgeDrafts.id],
+		}).onDelete("cascade"),
 		foreignKey({
 			name: "knowledge_injection_events_entry_revision_id_know_a5763cfc54_fk",
 			columns: [table.entryRevisionId],
@@ -3767,8 +3869,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 119,
-  "columnCount": 1689,
+  "tableCount": 122,
+  "columnCount": 1711,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -3993,6 +4095,260 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "resourceProtectionPaths",
+      "name": "resource_protection_paths",
+      "columns": [
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceId",
+          "name": "source_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "slot",
+          "name": "slot",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "canonicalPath",
+          "name": "canonical_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "repositoryKey",
+          "name": "repository_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "shadowKey",
+          "name": "shadow_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scopeProjectId",
+          "name": "scope_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "aliasSensitive",
+          "name": "alias_sensitive",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "claimJson",
+          "name": "claim_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_protection_path",
+          "columns": [
+            "deviceId",
+            "canonicalPath",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_repository",
+          "columns": [
+            "deviceId",
+            "repositoryKey",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_shadow",
+          "columns": [
+            "shadowKey",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_scope",
+          "columns": [
+            "scopeProjectId",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_alias",
+          "columns": [
+            "aliasSensitive",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "source",
+            "sourceId",
+            "slot"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "resourceProtectionSources",
+      "name": "resource_protection_sources",
+      "columns": [
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceId",
+          "name": "source_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "dirty",
+          "name": "dirty",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "cursor",
+          "name": "cursor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "complete",
+          "name": "complete",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_protection_dirty",
+          "columns": [
+            "dirty",
+            "source",
+            "sourceId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "source",
+            "sourceId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "narratorWorktreeResources",
@@ -8106,12 +8462,12 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
-      "exportName": "narratorContextCharPages",
-      "name": "narrator_context_char_pages",
+      "exportName": "narratorContextPins",
+      "name": "narrator_context_pins",
       "columns": [
         {
-          "property": "id",
-          "name": "id",
+          "property": "generation",
+          "name": "generation",
           "kind": "text",
           "pgType": "text",
           "notNull": true,
@@ -8130,27 +8486,9 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "table": "narrators",
             "column": "id",
             "onDelete": "cascade",
-            "constraintName": "narrator_context_char_pages_narrator_id_narrators_id_fk"
+            "constraintName": "narrator_context_pins_narrator_id_narrators_id_fk"
           },
           "emitAsTableConstraint": false
-        },
-        {
-          "property": "generation",
-          "name": "generation",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "page",
-          "name": "page",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false
         },
         {
           "property": "segmentsJson",
@@ -8165,15 +8503,69 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "indexes": [
         {
-          "name": "context_char_pages_generation_page_idx",
+          "name": "idx_context_pins_narrator",
           "columns": [
-            "narratorId",
-            "generation",
-            "page"
+            "narratorId"
           ],
-          "unique": true
+          "unique": false
         }
       ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorMessageContextStats",
+      "name": "narrator_message_context_stats",
+      "columns": [
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "role",
+          "name": "role",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "parentToolUseId",
+          "name": "parent_tool_use_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "segmentsJson",
+          "name": "segments_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],
@@ -8260,6 +8652,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "contentText",
           "name": "content_text",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "composerDocument",
+          "name": "composer_document",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,
@@ -9394,7 +9796,12 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_toolcalls_context_id",
           "columns": [
             "messageId",
-            "id"
+            "id",
+            "toolUseId",
+            "createdAt",
+            "executionAttempt",
+            "inputChars",
+            "outputChars"
           ],
           "unique": false
         },
@@ -12903,6 +13310,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "composerDocument",
+          "name": "composer_document",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "sourceId",
           "name": "source_id",
           "kind": "text",
@@ -15526,8 +15943,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "property": "rawDumpJson",
-          "name": "raw_dump_json",
+          "property": "diagnosticsJson",
+          "name": "diagnostics_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "recordingRequestId",
+          "name": "recording_request_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -15590,6 +16016,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "userId",
             "createdAt",
             "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_api_requests_recording",
+          "columns": [
+            "recordingRequestId"
           ],
           "unique": false
         },
@@ -21835,7 +22268,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "entry_id",
           "kind": "text",
           "pgType": "text",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false,
           "references": {
@@ -21845,6 +22278,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "knowledge_injection_events_entry_id_knowledge_entries_id_fk"
           },
           "emitAsTableConstraint": false
+        },
+        {
+          "property": "personalEntryId",
+          "name": "personal_entry_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "knowledgeDrafts",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk"
+          },
+          "emitAsTableConstraint": true
         },
         {
           "property": "entryRevisionId",
@@ -21933,6 +22382,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": true
         },
         {
+          "name": "idx_kie_cycle_personal_entry",
+          "columns": [
+            "narratorId",
+            "compactSeq",
+            "personalEntryId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_kie_personal_entry",
+          "columns": [
+            "personalEntryId"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_kie_narrator_cycle",
           "columns": [
             "narratorId",
@@ -21969,8 +22434,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
-      "checks": [],
-      "checkDefinitions": [],
+      "checks": [
+        "knowledge_injection_exactly_one_entry"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "knowledge_injection_exactly_one_entry",
+          "expression": "(\"entry_id\" IS NOT NULL AND \"personal_entry_id\" IS NULL) OR (\"entry_id\" IS NULL AND \"personal_entry_id\" IS NOT NULL)"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []

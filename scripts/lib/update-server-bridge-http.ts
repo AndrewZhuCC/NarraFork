@@ -14,6 +14,8 @@ export interface FileHash {
 	sha256: string;
 	sha512: string;
 }
+export { UpdateServerBridgeHttp as UpdateServerMirrorHttp };
+
 export const BRIDGE_METADATA_LIMIT = 1024 * 1024;
 export const BRIDGE_POST_LIMIT = 256 * 1024 * 1024;
 export const BRIDGE_REQUEST_TIMEOUT = 15 * 60 * 1000;
@@ -55,6 +57,10 @@ export function resolveUpdateServerBridgeConfig(
 	Object.defineProperty(config, "token", { value: token, enumerable: false });
 	return Object.freeze(config);
 }
+
+// Historical import names remain for the read-only 123 distribution tooling.
+export type UpdateServerMirrorConfig = UpdateServerBridgeConfig;
+export const resolveUpdateServerMirrorConfig = resolveUpdateServerBridgeConfig;
 
 export class BridgeHttpError extends Error {
 	constructor(readonly status: number) {
@@ -198,7 +204,7 @@ export class UpdateServerBridgeHttp {
 			NF_UPDATE_SERVER: config.serverUrl,
 			NF_UPDATE_TOKEN: config.token,
 		});
-		if (!validated) throw new Error("Missing bridge configuration");
+		if (!validated) throw new Error("Missing independent update server configuration");
 		this.serverUrl = validated.serverUrl;
 		this.#token = validated.token;
 		this.#fetch = options.fetchImpl ?? fetch;
@@ -218,9 +224,9 @@ export class UpdateServerBridgeHttp {
 			url.username ||
 			url.password ||
 			url.hash ||
-			!url.pathname.startsWith("/api/v2/")
+			!(url.pathname.startsWith("/api/v2/") || url.pathname.startsWith("/api/v3/"))
 		)
-			throw new Error("Bridge URL must be a same-origin v2 API endpoint");
+			throw new Error("Independent update server URL must be a same-origin API endpoint");
 		return url.href;
 	}
 	async #operation<T>(
@@ -395,6 +401,94 @@ export class UpdateServerBridgeHttp {
 			);
 		} finally {
 			outgoing.close();
+		}
+	}
+	/** JSON-only bounded control request; payloads use putRaw instead. */
+	async postJson(path: string, value: unknown, options: ReadOptions = {}): Promise<unknown> {
+		const text = JSON.stringify(value);
+		if (Buffer.byteLength(text) > (options.maxBytes ?? BRIDGE_METADATA_LIMIT))
+			throw new Error("Independent update server JSON budget exceeded");
+		return this.#operation(
+			path,
+			{
+				method: "POST",
+				body: text,
+				headers: { "Content-Type": "application/json" },
+			},
+			{ ...options, authenticated: true },
+			(response, signal) => this.#json(response, BRIDGE_METADATA_LIMIT, signal),
+		);
+	}
+	/** Raw stream, bounded and hashed as consumed. Never buffers a patch or accepts a full binary. */
+	async putRaw(
+		path: string,
+		stream: ReadableStream<Uint8Array>,
+		options: BodyOptions & {
+			expected: { size: number; sha256: string };
+			headers: Record<string, string>;
+		},
+	): Promise<unknown> {
+		const maximum = boundedLimit(options.maxBytes);
+		if (
+			options.expected.size > maximum ||
+			options.expected.size <= 0 ||
+			!/^[a-f0-9]{64}$/.test(options.expected.sha256)
+		)
+			throw new Error("Invalid mirror upload identity");
+		const reader = stream.getReader();
+		const hash = createHash("sha256");
+		let size = 0;
+		let complete = false;
+		const outgoing = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				try {
+					options.signal?.throwIfAborted();
+					const item = await reader.read();
+					if (item.done) {
+						if (size !== options.expected.size || hash.digest("hex") !== options.expected.sha256)
+							throw new Error("Mirror upload size/hash mismatch");
+						complete = true;
+						controller.close();
+						return;
+					}
+					size += item.value.byteLength;
+					if (size > options.expected.size || size > maximum)
+						throw new Error("Mirror upload exceeds budget");
+					hash.update(item.value);
+					controller.enqueue(item.value);
+				} catch (error) {
+					controller.error(error);
+					void reader.cancel().catch(() => {});
+				}
+			},
+			cancel(reason) {
+				return reader.cancel(reason);
+			},
+		});
+		const cancel = () => {
+			void reader.cancel().catch(() => {});
+		};
+		options.signal?.addEventListener("abort", cancel, { once: true });
+		try {
+			const result = await this.#operation(
+				path,
+				{
+					method: "PUT",
+					body: outgoing,
+					headers: {
+						...options.headers,
+						"Content-Type": "application/octet-stream",
+						"Content-Length": String(options.expected.size),
+					},
+				},
+				{ ...options, authenticated: true },
+				(response, signal) => this.#json(response, BRIDGE_METADATA_LIMIT, signal),
+			);
+			if (!complete) throw new Error("Mirror server did not consume complete upload");
+			return result;
+		} finally {
+			options.signal?.removeEventListener("abort", cancel);
+			void reader.cancel().catch(() => {});
 		}
 	}
 	async put(

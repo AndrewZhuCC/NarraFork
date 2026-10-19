@@ -387,7 +387,14 @@ describe("CI immutable release bundle restoration", () => {
 			expect(readFileSync(join(restored.destination, "dist", file.name))).toEqual(
 				readFileSync(join(state.bundle, "dist", file.name)),
 			);
-		expect(state.calls.every((args) => args[0] === "api" && args.length === 2)).toBe(true);
+		expect(
+			state.calls.every(
+				(args) =>
+					args[0] === "api" &&
+					(args.length === 2 ||
+						(args.length === 4 && args[1].includes("/compare/") && args[2] === "--jq")),
+			),
+		).toBe(true);
 	});
 	test("allows own in-progress run only after required jobs succeeded", async () => {
 		const state = fixture();

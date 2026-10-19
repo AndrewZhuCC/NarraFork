@@ -5,7 +5,7 @@ import {
 } from "@frontend/lib/compact-number";
 import { formatReferenceCost, referenceCostStatus } from "@frontend/lib/usage-cost";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
-import { Card, Grid, Group, Stack, Text, Tooltip } from "@mantine/core";
+import { Card, Grid, Group, Stack, Text } from "@mantine/core";
 import {
 	IconActivity,
 	IconBolt,
@@ -14,6 +14,7 @@ import {
 	IconCoin,
 	IconDatabase,
 	IconFileText,
+	IconPercentage,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 
@@ -37,6 +38,21 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 
 	const cacheWriteTooltip = `5m: ${cacheCreation5mTokens.compact} (${cacheCreation5mTokens.exact}) · 1h: ${cacheCreation1hTokens.compact} (${cacheCreation1hTokens.exact})`;
 
+	// 缓存命中率 = 缓存读取 ÷ (缓存读取 + 缓存写入 + 纯输入)，随筛选条件实时计算。
+	// 大字取整数百分比，小字保留两位小数；分母为 0（该区间没有输入侧 token）时两者都显示占位符。
+	const cacheHitRateDenominator =
+		stats.totalCacheReadTokens + stats.totalCacheCreationTokens + stats.totalInputTokens;
+	const cacheHitRatePercent =
+		cacheHitRateDenominator > 0
+			? (stats.totalCacheReadTokens / cacheHitRateDenominator) * 100
+			: null;
+	const cacheHitRate =
+		cacheHitRatePercent === null
+			? t("usageHistoryCacheHitRateEmpty")
+			: `${Math.round(cacheHitRatePercent)}%`;
+	const cacheHitRateExact =
+		cacheHitRatePercent === null ? null : `${cacheHitRatePercent.toFixed(2)}%`;
+
 	return (
 		<Grid>
 			{/* 左卡：用量概览 */}
@@ -50,9 +66,9 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 							</Text>
 						</Group>
 
-						{/* 主数字行 */}
+						{/* 主数字行：四类 token + 缓存命中率 + 请求数（格式一致：图标+标签 → 大号数值 → 精确值） */}
 						<Group gap="xl" wrap="wrap">
-							<Stack gap={2}>
+							<Stack gap={2} align="center">
 								<Group gap={6}>
 									<IconDatabase size={14} color="var(--mantine-color-blue-6)" />
 									<Text size="xs" c="dimmed">
@@ -69,7 +85,96 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 								)}
 							</Stack>
 
-							<Stack gap={2}>
+							<Stack gap={2} align="center">
+								<Group gap={6}>
+									<IconBolt size={14} color="var(--mantine-color-violet-6)" />
+									<Text size="xs" c="dimmed">
+										{t("usageHistoryTokenInput")}
+									</Text>
+								</Group>
+								<Text fw={700} size="lg">
+									{inputTokens.compact}
+								</Text>
+								{inputTokens.isCompact && (
+									<Text size="xs" c="dimmed">
+										{inputTokens.exact}
+									</Text>
+								)}
+							</Stack>
+
+							<Stack gap={2} align="center">
+								<Group gap={6}>
+									<IconActivity size={14} color="var(--mantine-color-green-6)" />
+									<Text size="xs" c="dimmed">
+										{t("usageHistoryTokenOutput")}
+									</Text>
+								</Group>
+								<Text fw={700} size="lg">
+									{outputTokens.compact}
+								</Text>
+								{outputTokens.isCompact && (
+									<Text size="xs" c="dimmed">
+										{outputTokens.exact}
+									</Text>
+								)}
+							</Stack>
+
+							<Stack gap={2} align="center">
+								<Group gap={6}>
+									<IconDatabase size={14} color="var(--mantine-color-cyan-6)" />
+									<Text size="xs" c="dimmed">
+										{t("usageHistoryStatCacheRead")}
+									</Text>
+								</Group>
+								<Text fw={700} size="lg">
+									{cacheReadTokens.compact}
+								</Text>
+								{cacheReadTokens.isCompact && (
+									<Text size="xs" c="dimmed">
+										{cacheReadTokens.exact}
+									</Text>
+								)}
+							</Stack>
+
+							<Stack gap={2} align="center">
+								<Group gap={6}>
+									<IconDatabase size={14} color="var(--mantine-color-teal-6)" />
+									<Text size="xs" c="dimmed">
+										{t("usageHistoryStatCacheWrite")}
+									</Text>
+								</Group>
+								<Text fw={700} size="lg">
+									{cacheCreationTokens.compact}
+								</Text>
+								{cacheCreationTokens.isCompact ? (
+									<Text size="xs" c="dimmed">
+										{cacheCreationTokens.exact}
+									</Text>
+								) : (
+									<Text size="xs" c="dimmed">
+										{cacheWriteTooltip}
+									</Text>
+								)}
+							</Stack>
+
+							<Stack gap={2} align="center">
+								<Group gap={6}>
+									<IconPercentage size={14} color="var(--mantine-color-yellow-6)" />
+									<Text size="xs" c="dimmed">
+										{t("usageHistoryStatCacheHitRate")}
+									</Text>
+								</Group>
+								<Text fw={700} size="lg">
+									{cacheHitRate}
+								</Text>
+								{cacheHitRateExact && (
+									<Text size="xs" c="dimmed">
+										{cacheHitRateExact}
+									</Text>
+								)}
+							</Stack>
+
+							<Stack gap={2} align="center">
 								<Group gap={6}>
 									<IconFileText size={14} color="var(--mantine-color-gray-6)" />
 									<Text size="xs" c="dimmed">
@@ -85,56 +190,35 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 									</Text>
 								)}
 							</Stack>
-
-							<Stack gap={2}>
-								<Group gap={6}>
-									<IconCoin size={14} color="var(--mantine-color-green-6)" />
-									<Text size="xs" c="dimmed">
-										{t("usageHistoryStatTotalCost")}
-									</Text>
-								</Group>
-								<Text fw={700} size="lg">
-									{formatReferenceCost(
-										stats,
-										stats.totalCost,
-										{ unknown: t("usageCostUnknown"), partial: t("usageCostPartial") },
-										totalCost.compact,
-									)}
-								</Text>
-								{referenceCostStatus(stats, stats.totalCost) !== "complete" && (
-									<Text size="xs" c="orange">
-										{t("usageCostIncompleteNote")}
-									</Text>
-								)}
-								{totalCost.isCompact &&
-									referenceCostStatus(stats, stats.totalCost) === "complete" && (
-										<Text size="xs" c="dimmed">
-											{totalCost.exact}
-										</Text>
-									)}
-							</Stack>
 						</Group>
 
-						{/* 细分行 */}
+						{/* 细分行：参考成本 */}
 						<Group gap="md" wrap="wrap">
-							<Text size="xs" c="dimmed">
-								{t("usageHistoryTokenInput")} {inputTokens.compact}
-								{inputTokens.isCompact ? ` (${inputTokens.exact})` : ""}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{t("usageHistoryTokenOutput")} {outputTokens.compact}
-								{outputTokens.isCompact ? ` (${outputTokens.exact})` : ""}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{t("usageHistoryStatCacheRead")} {cacheReadTokens.compact}
-								{cacheReadTokens.isCompact ? ` (${cacheReadTokens.exact})` : ""}
-							</Text>
-							<Tooltip label={cacheWriteTooltip} multiline>
-								<Text size="xs" c="dimmed" style={{ cursor: "help" }}>
-									{t("usageHistoryStatCacheWrite")} {cacheCreationTokens.compact}
-									{cacheCreationTokens.isCompact ? ` (${cacheCreationTokens.exact})` : ""}
+							<Group gap={6}>
+								<IconCoin size={14} color="var(--mantine-color-green-6)" />
+								<Text size="xs" c="dimmed">
+									{t("usageHistoryStatTotalCost")}
 								</Text>
-							</Tooltip>
+							</Group>
+							<Text size="xs" c="dimmed">
+								{formatReferenceCost(
+									stats,
+									stats.totalCost,
+									{ unknown: t("usageCostUnknown"), partial: t("usageCostPartial") },
+									totalCost.compact,
+								)}
+							</Text>
+							{referenceCostStatus(stats, stats.totalCost) !== "complete" && (
+								<Text size="xs" c="orange">
+									{t("usageCostIncompleteNote")}
+								</Text>
+							)}
+							{totalCost.isCompact &&
+								referenceCostStatus(stats, stats.totalCost) === "complete" && (
+									<Text size="xs" c="dimmed">
+										{totalCost.exact}
+									</Text>
+								)}
 						</Group>
 					</Stack>
 				</Card>
@@ -153,7 +237,7 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 
 						{/* 主数字行 */}
 						<Group gap="xl" wrap="wrap">
-							<Stack gap={2}>
+							<Stack gap={2} align="center">
 								<Group gap={6}>
 									<IconClock size={14} color="var(--mantine-color-orange-6)" />
 									<Text size="xs" c="dimmed">
@@ -168,7 +252,7 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 								</Text>
 							</Stack>
 
-							<Stack gap={2}>
+							<Stack gap={2} align="center">
 								<Group gap={6}>
 									<IconBolt size={14} color="var(--mantine-color-yellow-6)" />
 									<Text size="xs" c="dimmed">
@@ -183,7 +267,7 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 								</Text>
 							</Stack>
 
-							<Stack gap={2}>
+							<Stack gap={2} align="center">
 								<Group gap={6}>
 									<IconBrain size={14} color="var(--mantine-color-violet-6)" />
 									<Text size="xs" c="dimmed">

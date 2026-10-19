@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { type FileHandle, open } from "node:fs/promises";
-import { Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import {
 	EDITOR_IO_TIMEOUT_MS,
 	EDITOR_RAW_WINDOW_BYTES,
@@ -16,9 +16,9 @@ import type {
 	EditorRawReadOpen,
 } from "../../shared/editor-provider-contracts";
 import { editorRawEncoding } from "../../shared/editor-stream-codec";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { editorWorkerEntryPoint, editorWorkerSpecifierCandidates } from "./editor-document-jobs";
 import type { StreamWorkerRequest, StreamWorkerResult } from "./editor-document-stream-worker";
 
 export interface EditorRemoteRawSource {
@@ -27,7 +27,7 @@ export interface EditorRemoteRawSource {
 	close(input: EditorRawReadClose): Promise<void>;
 }
 type WorkerSlot = {
-	worker: Worker;
+	worker?: Worker;
 	ready: Promise<void>;
 	exited: Promise<void>;
 	failure?: Error;
@@ -66,8 +66,10 @@ export class EditorSourceWorkers {
 	private sequence = 0;
 	private next = 0;
 	constructor(
-		private specifiers = editorWorkerSpecifierCandidates().map((path) =>
-			path.replace("editor-document-worker", "editor-document-stream-worker"),
+		private specifiers = compiledWorkerSpecifiers(
+			"services/editor-document-stream-worker.ts",
+			"./editor-document-stream-worker.ts",
+			import.meta.url,
 		),
 	) {}
 	assign(): WorkerSlot {
@@ -76,52 +78,50 @@ export class EditorSourceWorkers {
 	private slot(index: number): WorkerSlot {
 		if (this.slots[index]) return this.slots[index];
 		const pending: WorkerSlot["pending"] = new Map();
-		const worker = new Worker(editorWorkerEntryPoint(this.specifiers[0]));
-		let timer: ReturnType<typeof setTimeout>;
-		let rejectReady!: (error: Error) => void;
 		let confirmExit!: () => void;
 		const exited = new Promise<void>((resolve) => {
 			confirmExit = resolve;
 		});
-		const ready = new Promise<void>((resolve, reject) => {
-			rejectReady = reject;
-			timer = setTimeout(() => {
-				fail(streamError("EDITOR_WORKER_READY_TIMEOUT", 503));
-				void worker.terminate();
-			}, 5000);
-			worker.on("message", (message) => {
-				if (message.ready) {
-					clearTimeout(timer);
-					resolve();
-					return;
-				}
-				const request = pending.get(message.id);
-				pending.delete(message.id);
-				if (message.error)
-					request?.reject(
-						Object.assign(streamError(message.error), message.code ? { code: message.code } : {}),
-					);
-				else request?.resolve(message.result);
-			});
-		});
-		const slot: WorkerSlot = { worker, ready, exited, pending };
+		const slot: WorkerSlot = { ready: Promise.resolve(), exited, pending };
 		const fail = (error: Error) => {
 			slot.failure ??= error;
-			clearTimeout(timer);
-			rejectReady(slot.failure);
 			for (const request of pending.values()) request.reject(slot.failure);
 			pending.clear();
 		};
-		worker.on("error", (error) => {
-			fail(error instanceof Error ? error : streamError("EDITOR_WORKER_FAILED", 503));
-			void worker.terminate();
-		});
-		worker.on("exit", () => {
-			fail(streamError("EDITOR_WORKER_CLOSED", 503));
+		const finishExit = () => {
 			confirmExit();
 			if (this.slots[index] === slot) this.slots[index] = undefined;
 			this.onExit?.(slot);
-		});
+		};
+		// Probe only before readiness, sharing the original five-second startup deadline.
+		// No stream request is dispatched until the loader has selected a live worker.
+		slot.ready = connectCompiledWorker(this.specifiers, { signal: AbortSignal.timeout(5000) })
+			.then(({ worker }) => {
+				slot.worker = worker;
+				worker.on("message", (message) => {
+					if (message.ready) return;
+					const request = pending.get(message.id);
+					pending.delete(message.id);
+					if (message.error)
+						request?.reject(
+							Object.assign(streamError(message.error), message.code ? { code: message.code } : {}),
+						);
+					else request?.resolve(message.result);
+				});
+				worker.on("error", (error) => {
+					fail(error instanceof Error ? error : streamError("EDITOR_WORKER_FAILED", 503));
+					void worker.terminate();
+				});
+				worker.on("exit", () => {
+					fail(streamError("EDITOR_WORKER_CLOSED", 503));
+					finishExit();
+				});
+			})
+			.catch((error) => {
+				fail(error instanceof Error ? error : streamError("EDITOR_WORKER_FAILED", 503));
+				finishExit();
+				throw slot.failure;
+			});
 		this.slots[index] = slot;
 		return slot;
 	}
@@ -134,7 +134,7 @@ export class EditorSourceWorkers {
 			return await new Promise<StreamWorkerResult>((resolve, reject) => {
 				slot.pending.set(id, { resolve, reject });
 				try {
-					slot.worker.postMessage({ id, request });
+					slot.worker?.postMessage({ id, request });
 				} catch (error) {
 					slot.pending.delete(id);
 					reject(error);
@@ -158,7 +158,13 @@ export class EditorSourceWorkers {
 		return this.slots.filter(Boolean).length;
 	}
 	async dispose() {
-		await Promise.all(this.slots.map((slot) => slot?.worker.terminate()));
+		await Promise.all(
+			this.slots.map(async (slot) => {
+				if (!slot) return;
+				await slot.ready.catch(() => {});
+				await slot.worker?.terminate();
+			}),
+		);
 		this.slots = [];
 	}
 }

@@ -199,6 +199,30 @@ describe("update status poll interval", () => {
 		).toBe(UPDATE_STATUS_IDLE_POLL_MS);
 	});
 
+	test("failed cleanup retains the attempt and status polling until cancellation succeeds", () => {
+		for (const scheduled of [true, false]) {
+			const cleanup = status({
+				scheduled,
+				phase: "restarting",
+				cleanupRetryPending: true,
+				error: "rollback failed",
+			});
+			expect(hasActiveUpdateSchedule(cleanup)).toBe(true);
+			expect(resolveUpdateStatusPollInterval({ status: cleanup, dataUpdatedAt: 5000 })).toBe(
+				UPDATE_STATUS_ACTIVE_POLL_MS,
+			);
+		}
+		const cancelled = status({
+			scheduled: false,
+			cleanupRetryPending: false,
+			phase: "idle",
+			errorKind: "cancelled",
+			error: "cancelled",
+		});
+		expect(hasActiveUpdateSchedule(cancelled)).toBe(false);
+		expect(resolveUpdateStatusPollInterval({ status: cancelled, dataUpdatedAt: 6000 })).toBe(false);
+	});
+
 	test("an error while still scheduled keeps the fast poll", () => {
 		expect(
 			resolveUpdateStatusPollInterval({

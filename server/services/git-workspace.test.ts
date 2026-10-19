@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
+import type { GitLineStats } from "@shared/git-line-stats";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
@@ -37,6 +38,8 @@ import { executionPolicyEngine } from "./execution-policy/engine";
 import type { ExecutionTargetContext } from "./execution-policy/types";
 import { recordAttribution } from "./file-attribution-service";
 import { gitDiscoveryCache } from "./git-discovery-cache";
+import * as lineStatsService from "./git-line-stats";
+import { clearGitLineStatsCache } from "./git-line-stats-cache";
 import { gitService, withGitRequestContext } from "./git-service";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import {
@@ -779,6 +782,73 @@ describe("Git workspace project scan pagination", () => {
 });
 
 describe("authenticated Git management", () => {
+	test("independent line statistics keep section counts and invalidate after staging", async () => {
+		const ws = await workspace();
+		await writeFile(join(repo, "seed.txt"), "seed\nstaged\n");
+		await git(repo, "add", "seed.txt");
+		await writeFile(join(repo, "seed.txt"), "seed\nstaged\nunstaged\n");
+		await writeFile(join(repo, "new.txt"), "one\ntwo\n");
+		const suffix = `line-stats?workspaceKey=${ws.workspaceKey}`;
+		const response = await request(suffix);
+		expect(response.status).toBe(200);
+		const stats = (await response.json()) as GitLineStats;
+		expect(stats).toMatchObject({ linesAdded: 4, linesRemoved: 0, complete: true });
+		expect(stats.files.find((file) => file.path === "seed.txt")).toMatchObject({
+			stagedLinesAdded: 1,
+			unstagedLinesAdded: 1,
+		});
+		expect((await request("stage", { all: true, workspaceKey: ws.workspaceKey })).status).toBe(200);
+		const staged = (await (await request(suffix)).json()) as GitLineStats;
+		expect(staged.linesAdded).toBe(4);
+		expect(staged.files.every((file) => file.unstagedLinesAdded === 0)).toBe(true);
+		expect((await request("line-stats?workspaceKey=obsolete")).status).toBe(409);
+	});
+
+	test("slow or failed statistics never hold up lightweight status", async () => {
+		clearGitLineStatsCache();
+		let started!: () => void;
+		const startedPromise = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let fail!: (error: Error) => void;
+		const statsRead = spyOn(lineStatsService, "getGitLineStats").mockImplementation(() => {
+			started();
+			return new Promise<GitLineStats>((_resolve, reject) => {
+				fail = reject;
+			});
+		});
+		let pending: Promise<Response> | undefined;
+		try {
+			pending = request("line-stats");
+			await startedPromise;
+			const status = await request("status");
+			expect(status.status).toBe(200);
+			expect(await status.json()).not.toHaveProperty("linesAdded");
+			fail(new Error("statistics failed"));
+			expect((await pending).status).toBe(500);
+			expect((await request("status")).status).toBe(200);
+		} finally {
+			fail?.(new Error("cleanup"));
+			await pending;
+			statsRead.mockRestore();
+			clearGitLineStatsCache();
+		}
+	});
+
+	test("cached line statistics are still authorized on each request", async () => {
+		await writeFile(join(repo, "new.txt"), "one\n");
+		expect((await request("line-stats")).status).toBe(200);
+		const reader = generateId();
+		await db
+			.insert(users)
+			.values({ id: reader, username: reader, passwordHash: "fixture", createdAt: now() });
+		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(404);
+		await db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId));
+		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(200);
+		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, narratorId));
+		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(404);
+	});
+
 	test("legacy chapter routes retain their existing no-workspace-key contract", async () => {
 		const projectId = await project(repo);
 		const chapterId = generateId();

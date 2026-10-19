@@ -53,6 +53,7 @@ import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
+import { savedSelectionReference } from "../composer/file-reference-input";
 import type { DiffLine } from "../diff/DiffView";
 import { availableModes } from "../file-viewer/file-viewer-modes";
 import { useEditorPanelVisible, useRetainedEditorView } from "../narrator-panel-visibility";
@@ -83,7 +84,12 @@ import {
 	observePreviewAnchorChanges,
 	scrollTopForLine,
 } from "./editor-scroll-sync";
-import { sessionCanSave, sessionDirty, sessionExitBlocked } from "./editor-session-state";
+import {
+	type EditorSessionState,
+	sessionCanSave,
+	sessionDirty,
+	sessionExitBlocked,
+} from "./editor-session-state";
 import {
 	captureEditorSnapshot,
 	computeEditorConflictDiff,
@@ -160,6 +166,7 @@ function FileEditorBinding(props: FileEditorContentProps) {
 	const latest = useRef(t);
 	latest.current = t;
 	const { narratorId, filePath, deviceId = "local", referenceOrigin = false } = props;
+	const sourceTargetRef = useRef({ deviceId, path: filePath });
 	const visible = useEditorPanelVisible();
 	const retainedView = useRetainedEditorView(visible);
 	const leaseRef = useRef<EditorDocumentLease | null>(null);
@@ -240,12 +247,16 @@ function FileEditorBinding(props: FileEditorContentProps) {
 								]);
 								if ((referenceOrigin || deviceId !== "local") && !narratorId)
 									throw new Error(latest.current("fileEditor.missingContext"));
-								if (deviceId !== "local")
-									return fileReferenceApi.preview(
+								if (deviceId !== "local") {
+									const source = await fileReferenceApi.preview(
 										narratorId as string,
 										{ deviceId, path: filePath },
 										boundedSignal,
 									);
+									boundedSignal.throwIfAborted();
+									sourceTargetRef.current = source.target;
+									return source;
+								}
 								return request<{ content: string; encoding: string; hash: string }>(
 									`/fs/edit-source?path=${encodeURIComponent(filePath)}`,
 									{ signal: boundedSignal },
@@ -324,7 +335,14 @@ function FileEditorBinding(props: FileEditorContentProps) {
 				<Loader size="sm" />
 			</Center>
 		);
-	return <FileEditorDocument {...props} workingCopy={copy} viewState={viewState} />;
+	return (
+		<FileEditorDocument
+			{...props}
+			workingCopy={copy}
+			viewState={viewState}
+			sourceTargetRef={sourceTargetRef}
+		/>
+	);
 }
 
 function FileEditorDocument({
@@ -338,9 +356,11 @@ function FileEditorDocument({
 	onDirtyChange,
 	workingCopy,
 	viewState,
+	sourceTargetRef,
 }: FileEditorContentProps & {
 	workingCopy: EditorWorkingCopy;
 	viewState: { current: import("monaco-editor").editor.ICodeEditorViewState | null };
+	sourceTargetRef: { current: { deviceId: string; path: string } };
 }) {
 	const { t } = useTranslation("narrator");
 	const visible = useEditorPanelVisible();
@@ -351,6 +371,9 @@ function FileEditorDocument({
 	const tRef = useRef(t);
 	tRef.current = t;
 	const scope = useFileReferenceScope();
+	const addReferenceRef = useRef(scope.addReference);
+	addReferenceRef.current = scope.addReference;
+	const quoteActiveRef = useRef(false);
 	const publishSelection = onFileReferenceSelectionChange ?? scope.setSelection;
 	// Session callbacks outlive renders; always invoke the latest publisher.
 	const publishSelectionRef = useRef(publishSelection);
@@ -509,6 +532,13 @@ function FileEditorDocument({
 			}),
 		[workingCopy],
 	);
+	// Quoting belongs to this view; loading/disposal belong to the shared working copy.
+	useEffect(() => {
+		quoteActiveRef.current = true;
+		return () => {
+			quoteActiveRef.current = false;
+		};
+	}, []);
 	const load = () => {
 		if (session.state.phase !== "idle") return;
 		if (sessionDirty(session.state) && !window.confirm(tRef.current("fileEditor.confirmReload")))
@@ -562,6 +592,46 @@ function FileEditorDocument({
 		},
 		[deviceId, filePath, publishSelection, session],
 	);
+	const quoteBlocked = (current: EditorSessionState | null) =>
+		!current?.loaded ||
+		current.invalidated ||
+		current.discarded ||
+		current.loading ||
+		current.phase !== "idle" ||
+		!current.baseHash ||
+		!!current.error ||
+		!!current.conflict ||
+		!!current.confirmation ||
+		sessionDirty(current);
+	const quoteSelection = (range: FileSelection) => {
+		// Check the controller, not a render snapshot: edits/save-start publish synchronously.
+		const current = session.state;
+		if (
+			!quoteActiveRef.current ||
+			!addReferenceRef.current ||
+			!current.baseHash ||
+			quoteBlocked(current)
+		)
+			return;
+		const target = session.currentDocument?.target ?? sourceTargetRef.current;
+		const reference = savedSelectionReference({
+			target: { ...target, selection: range },
+			label: filePanelBaseName(target.path),
+			expectedHash: current.baseHash,
+			dirty: sessionDirty(current),
+		});
+		if (reference) addReferenceRef.current(reference);
+	};
+	const quoteSelectionDisabledReason =
+		!state?.loaded || state.loading
+			? t("common:loading")
+			: state.phase !== "idle"
+				? t(state.phase === "unknown" ? "fileEditor.unknownSave" : "fileEditor.saveTask")
+				: sessionDirty(state)
+					? t("quote.fileUnsaved")
+					: quoteBlocked(state)
+						? t("quote.fileUnavailable")
+						: null;
 	const dirty = state ? sessionDirty(state) : false;
 	const exitBlocked = state ? sessionExitBlocked(state) : false;
 	const baseHash = state?.baseHash;
@@ -1395,6 +1465,8 @@ function FileEditorDocument({
 							onReady={handleReady}
 							onDocumentChange={handleChange}
 							onSelectionChange={handleSelection}
+							onQuoteSelection={scope.addReference ? quoteSelection : undefined}
+							quoteSelectionDisabledReason={quoteSelectionDisabledReason}
 							onSearchRequested={openSearch}
 							onSave={handleSave}
 							onError={(error) => setEditorError(error.message)}

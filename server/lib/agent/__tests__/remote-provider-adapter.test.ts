@@ -10,7 +10,7 @@ import {
 	type ProviderOperationKind,
 	ProviderRpcError,
 } from "@server/services/plugin-provider-rpc";
-import type { RecordingFrame, RequestRecording } from "@shared/request-recording";
+import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared/request-recording";
 import { createRequestRecording, RequestRecorderClient } from "../../request-recorder";
 import type { RecorderOperation } from "../../request-recorder-protocol";
 import { settings } from "../../settings";
@@ -296,7 +296,8 @@ describe("RemoteProviderAdapter", () => {
 				{ category: "summary", chars: 5 },
 				{ category: "toolDefinition", chars: 40 },
 				{ category: "user", chars: 20 },
-				{ category: "assistant", chars: 10 },
+				{ category: "assistant", chars: 5 },
+				{ category: "reasoning", chars: 5 },
 				{ category: "toolCall", chars: 5 },
 				{ category: "toolResult", chars: 10 },
 				{ category: "attachment", chars: 10 },
@@ -328,6 +329,12 @@ describe("RemoteProviderAdapter", () => {
 			);
 			expect(snapshots).toEqual([null, reported ?? null]);
 		}
+		expect(
+			providerStreamEventSchema.safeParse({
+				type: "request_started",
+				inputCharacters: classified,
+			}).success,
+		).toBe(true);
 		expect(
 			providerStreamEventSchema.safeParse({
 				type: "request_started",
@@ -659,6 +666,49 @@ describe("RemoteProviderAdapter", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	for (const partial of [false, true]) {
+		for (const failure of [undefined, "STREAM_IDLE_TIMEOUT", "OUTPUT_LIMIT"] as const) {
+			test(`chat emits cancelled terminal billing before draining (partial=${partial}, failure=${failure})`, async () => {
+				let drained = false;
+				const original = failure
+					? new ProviderRpcError(failure, "original transport failure", { retryable: true })
+					: undefined;
+				const events = async function* () {
+					if (partial) {
+						yield event("usage", {
+							usage: {
+								promptTokens: 100,
+								inputTokens: 60,
+								cachedInputTokens: 40,
+								completionTokens: 8,
+							},
+						});
+					}
+					yield event("done", {
+						status: "cancelled",
+						stopReason: "cancelled",
+						usage: partial
+							? { cachedInputTokens: 100, completionTokens: 0 }
+							: { inputTokens: 17, completionTokens: 9 },
+					});
+					drained = true;
+					if (original) throw original;
+				};
+				const iterator = makeAdapter(makeRpc(events)).chat(chatParams());
+				if (partial) expect((await iterator.next()).value?.usage?.completionTokens).toBe(8);
+				expect((await iterator.next()).value?.usage).toMatchObject(
+					partial
+						? { promptTokens: 100, inputTokens: 0, cachedInputTokens: 100, completionTokens: 0 }
+						: { promptTokens: 17, inputTokens: 17, completionTokens: 9 },
+				);
+				expect(drained).toBe(false);
+				if (original) await expect(iterator.next()).rejects.toBe(original);
+				else await expect(iterator.next()).rejects.toMatchObject({ name: "AbortError" });
+				expect(drained).toBe(true);
+			});
+		}
+	}
+
 	for (const kind of ["chat", "generate"] as const) {
 		const run = (adapter: RemoteProviderAdapter, signal = new AbortController().signal) =>
 			kind === "chat"
@@ -778,6 +828,205 @@ describe("RemoteProviderAdapter", () => {
 		});
 	});
 
+	for (const sample of [
+		{ usage: { inputTokens: 17, promptTokens: 100 }, expected: 17 },
+		{ usage: { inputTokens: 0, promptTokens: 100 }, expected: 0 },
+		{ usage: { inputTokens: 17 }, expected: 17 },
+		{ usage: { promptTokens: 100 }, expected: 40 },
+		{ usage: { promptTokens: 60 }, expected: 0 },
+		{ usage: { promptTokens: 20 }, expected: 0 },
+		{ usage: { promptTokens: 0 }, expected: 0 },
+	]) {
+		test(`chat and generate normalize plugin usage ${JSON.stringify(sample.usage)}`, async () => {
+			const usage = {
+				...sample.usage,
+				cachedInputTokens: 40,
+				cacheCreationInputTokens: 20,
+				completionTokens: 7,
+				reasoningTokens: 2,
+			};
+			for (const source of ["usage", "done"] as const) {
+				const events = [
+					event(source, {
+						usage,
+						...(source === "done" && { status: "completed", stopReason: "end_turn" }),
+					}),
+					...(source === "usage"
+						? [event("done", { status: "completed", stopReason: "end_turn" })]
+						: []),
+				];
+				const adapter = makeAdapter(makeRpc(events, events));
+				const chat = await collect(adapter.chat(chatParams()));
+				expect(chat.find((item) => item.usage)?.usage).toEqual({
+					...usage,
+					promptTokens: sample.usage.promptTokens ?? sample.expected + 60,
+					inputTokens: sample.expected,
+				});
+				const result = await adapter.generateWithMeta("prompt", "remote:model-1");
+				expect(result.usage).toEqual({
+					inputTokens: sample.expected,
+					outputTokens: 7,
+					cachedInputTokens: 40,
+					cacheCreationInputTokens: 20,
+					cacheCreation5mInputTokens: 0,
+					cacheCreation1hInputTokens: 0,
+					reasoningTokens: 2,
+				});
+			}
+		});
+	}
+
+	for (const aggregate of [undefined, 20, 10, 30]) {
+		for (const inputTokens of [undefined, 0, 17]) {
+			test(`TTL writes aggregate=${aggregate} input=${inputTokens} map once in chat and generate`, async () => {
+				const write = Math.max(aggregate ?? 0, 20);
+				const usage = {
+					promptTokens: 100,
+					inputTokens,
+					cachedInputTokens: 40,
+					cacheCreationInputTokens: aggregate,
+					cacheCreation5mTokens: 8,
+					cacheCreation1hTokens: 12,
+					completionTokens: 7,
+				};
+				for (const source of ["usage", "done"] as const) {
+					const events = [
+						event(source, { usage, status: "completed", stopReason: "end_turn" }),
+						...(source === "usage"
+							? [event("done", { status: "completed", stopReason: "end_turn" })]
+							: []),
+					];
+					const adapter = makeAdapter(makeRpc(events, events));
+					const chat = await collect(adapter.chat(chatParams()));
+					expect(chat.find((item) => item.usage)?.usage).toMatchObject({
+						promptTokens: 100,
+						inputTokens: inputTokens ?? 60 - write,
+						cacheCreationInputTokens: write,
+						cacheCreation5mTokens: 8,
+						cacheCreation1hTokens: 12,
+					});
+					const result = await adapter.generateWithMeta("prompt", "remote:model-1");
+					expect(result.usage).toMatchObject({
+						inputTokens: inputTokens ?? 60 - write,
+						cacheCreationInputTokens: write,
+						cacheCreation5mInputTokens: 8,
+						cacheCreation1hInputTokens: 12,
+					});
+				}
+			});
+		}
+	}
+
+	test("chat synthesizes full prompt from net input and TTL cache without clearing input on output-only events", async () => {
+		const events = [
+			event("usage", {
+				usage: {
+					inputTokens: 17,
+					cachedInputTokens: 40,
+					cacheCreation5mTokens: 8,
+					cacheCreation1hTokens: 12,
+					completionTokens: 1,
+				},
+			}),
+			event("usage", { usage: { completionTokens: 7 } }),
+			event("done", { status: "completed", stopReason: "end_turn" }),
+		];
+		const chat = await collect(makeAdapter(makeRpc(events)).chat(chatParams()));
+		expect(chat[0]?.usage).toEqual({
+			promptTokens: 77,
+			inputTokens: 17,
+			cachedInputTokens: 40,
+			cacheCreationInputTokens: 20,
+			cacheCreation5mTokens: 8,
+			cacheCreation1hTokens: 12,
+			completionTokens: 1,
+		});
+		expect(chat[1]?.usage).toEqual({ ...chat[0]?.usage, completionTokens: 7 });
+	});
+
+	for (const cachedInputTokens of [60, 100, 0]) {
+		for (const finalSource of ["usage", "done"] as const) {
+			test(`${finalSource} cache correction ${cachedInputTokens} merges before deriving chat/generate input`, async () => {
+				const events = [
+					event("usage", { usage: { promptTokens: 100, inputTokens: 60, cachedInputTokens: 40 } }),
+					event(finalSource, {
+						usage: { cachedInputTokens, completionTokens: 8 },
+						status: "completed",
+						stopReason: "end_turn",
+					}),
+					...(finalSource === "usage"
+						? [event("done", { status: "completed", stopReason: "end_turn" })]
+						: []),
+				];
+				const adapter = makeAdapter(makeRpc(events, events));
+				const chat = await collect(adapter.chat(chatParams()));
+				expect(chat[1]?.usage).toMatchObject({
+					promptTokens: 100,
+					inputTokens: 100 - cachedInputTokens,
+					cachedInputTokens,
+					completionTokens: 8,
+				});
+				expect((await adapter.generateWithMeta("prompt", "remote:model-1")).usage).toMatchObject({
+					inputTokens: 100 - cachedInputTokens,
+					cachedInputTokens,
+					outputTokens: 8,
+				});
+			});
+		}
+	}
+
+	test("partial accounting resets each remote request and honors explicit net zero", async () => {
+		let request = 0;
+		const rpc = makeRpc(async function* () {
+			if (request++ === 0) {
+				yield event("usage", {
+					usage: { promptTokens: 100, inputTokens: 60, cachedInputTokens: 40 },
+				});
+				yield event("usage", { usage: { promptTokens: 0, completionTokens: 8 } });
+				yield event("usage", { usage: { inputTokens: 0, cachedInputTokens: 100 } });
+			} else {
+				yield event("usage", { usage: { completionTokens: 9 } });
+			}
+			yield event("done", { status: "completed", stopReason: "end_turn" });
+		});
+		const adapter = makeAdapter(rpc);
+		const first = await collect(adapter.chat(chatParams()));
+		expect(first[1]?.usage).toMatchObject({
+			promptTokens: 100,
+			inputTokens: 60,
+			cachedInputTokens: 40,
+			completionTokens: 8,
+		});
+		expect(first[2]?.usage).toMatchObject({
+			promptTokens: 100,
+			inputTokens: 0,
+			cachedInputTokens: 100,
+		});
+		const second = await collect(adapter.chat(chatParams()));
+		expect(second[0]?.usage).toEqual({ completionTokens: 9 });
+	});
+
+	test("generate preserves TTL-only usage even without input or output counters", async () => {
+		const adapter = makeAdapter(
+			makeRpc(
+				[],
+				[
+					event("done", {
+						status: "completed",
+						stopReason: "end_turn",
+						usage: { cacheCreation5mTokens: 8, cacheCreation1hTokens: 12 },
+					}),
+				],
+			),
+		);
+		expect((await adapter.generateWithMeta("prompt", "remote:model-1")).usage).toMatchObject({
+			inputTokens: 0,
+			cacheCreationInputTokens: 20,
+			cacheCreation5mInputTokens: 8,
+			cacheCreation1hInputTokens: 12,
+		});
+	});
+
 	test("generateWithHistory uses history mode and rejects tool events", async () => {
 		const rpc = makeRpc(
 			[],
@@ -872,11 +1121,34 @@ describe("RemoteProviderAdapter", () => {
 	});
 });
 
+/** Collector bridged to an in-memory recording that keeps everything it receives. */
+function recordedCollector(requestId = "plugin-recorded") {
+	const frames: RecordingFrame[] = [];
+	const requests: RecordingRequest[] = [];
+	const metas: Record<string, unknown>[] = [];
+	const recording: RequestRecording = {
+		requestId,
+		pin: () => {},
+		request: (value) => requests.push(value),
+		responseMeta: (value) => metas.push(value),
+		responseChunk: () => {},
+		frame: (frame) => frames.push(frame),
+		finish: () => {},
+	};
+	const body = (direction: RecordingFrame["direction"]) =>
+		frames
+			.filter((frame) => frame.direction === direction && frame.type === "plugin.reported_body")
+			.map((frame) => (typeof frame.text === "string" ? frame.text : ""))
+			.join("");
+	return { collector: new ApiRequestDumpCollector(recording), frames, requests, metas, body };
+}
+
 describe("RemoteProviderAdapter request dump", () => {
 	test("plugin evidence is delivered live before done and masks split secrets", async () => {
 		const frames: RecordingFrame[] = [];
 		const recording: RequestRecording = {
 			requestId: "plugin-live",
+			pin: () => {},
 			request: () => {},
 			responseMeta: () => {},
 			responseChunk: () => {},
@@ -892,7 +1164,7 @@ describe("RemoteProviderAdapter request dump", () => {
 			yield { type: "done", status: "completed", stopReason: "end_turn" };
 		});
 		const stream = makeAdapter(rpc).chat(
-			chatParams({ requestDump: new ApiRequestDumpCollector(undefined, recording) }),
+			chatParams({ requestDump: new ApiRequestDumpCollector(recording) }),
 		);
 		while (!(await stream.next()).value?.text) {}
 		const evidence = frames
@@ -916,6 +1188,7 @@ describe("RemoteProviderAdapter request dump", () => {
 		const frames: RecordingFrame[] = [];
 		const recording: RequestRecording = {
 			requestId: "plugin-truncated",
+			pin: () => {},
 			request: () => {},
 			responseMeta: () => {},
 			responseChunk: () => {},
@@ -938,8 +1211,8 @@ describe("RemoteProviderAdapter request dump", () => {
 			event("text.delta", { text: "business output" }),
 			done(),
 		]);
-		const previous = settings.agent.requestDumpRecordingEnabled;
-		settings.agent.requestDumpRecordingEnabled = true;
+		const previous = settings.requestEvidence;
+		settings.requestEvidence = { ...previous, ringEnabled: true };
 		const operations: RecorderOperation[] = [];
 		const configure = spyOn(RequestRecorderClient.prototype, "configure").mockImplementation(
 			() => {},
@@ -963,9 +1236,7 @@ describe("RemoteProviderAdapter request dump", () => {
 				coreRecording.frame(frame);
 			};
 			const events = await collect(
-				makeAdapter(rpc).chat(
-					chatParams({ requestDump: new ApiRequestDumpCollector(undefined, recording) }),
-				),
+				makeAdapter(rpc).chat(chatParams({ requestDump: new ApiRequestDumpCollector(recording) })),
 			);
 			coreRecording.finish({ status: "completed" });
 			expect(events[0].text).toBe("business output");
@@ -981,7 +1252,7 @@ describe("RemoteProviderAdapter request dump", () => {
 		} finally {
 			capture.mockRestore();
 			configure.mockRestore();
-			settings.agent.requestDumpRecordingEnabled = previous;
+			settings.requestEvidence = previous;
 		}
 	});
 
@@ -996,6 +1267,7 @@ describe("RemoteProviderAdapter request dump", () => {
 		const frames: RecordingFrame[] = [];
 		const recording: RequestRecording = {
 			requestId: "host-truncated",
+			pin: () => {},
 			request: () => {},
 			responseMeta: () => {},
 			responseChunk: () => {},
@@ -1004,9 +1276,7 @@ describe("RemoteProviderAdapter request dump", () => {
 		};
 		const rpc = makeRpc([clipped, event("text.delta", { text: "business output" }), done()]);
 		const output = await collect(
-			makeAdapter(rpc).chat(
-				chatParams({ requestDump: new ApiRequestDumpCollector(undefined, recording) }),
-			),
+			makeAdapter(rpc).chat(chatParams({ requestDump: new ApiRequestDumpCollector(recording) })),
 		);
 		expect(output[0].text).toBe("business output");
 		expect(frames.filter((frame) => frame.sourceTruncated)).toMatchObject([
@@ -1021,16 +1291,14 @@ describe("RemoteProviderAdapter request dump", () => {
 			makeAdapter(withDump).chat(chatParams({ requestDump: new ApiRequestDumpCollector() })),
 		);
 		const hinted = withDump.chatParams?.requestDump as { maxBytes?: number } | undefined;
-		expect(typeof hinted?.maxBytes).toBe("number");
-		expect(hinted?.maxBytes).toBeGreaterThan(0);
-		expect(hinted?.maxBytes).toBeLessThanOrEqual(PLUGIN_REQUEST_DUMP_MAX_BYTES);
+		expect(hinted?.maxBytes).toBe(PLUGIN_REQUEST_DUMP_MAX_BYTES);
 
 		const withoutDump = makeRpc([done()]);
 		await collect(makeAdapter(withoutDump).chat(chatParams()));
 		expect(withoutDump.chatParams?.requestDump).toBeUndefined();
 	});
 
-	test("dump events populate the collector and never reach the parsed stream", async () => {
+	test("dump events reach the recording and never reach the parsed stream", async () => {
 		const rpc = makeRpc([
 			event("dump.request", {
 				transport: "http-sse",
@@ -1044,7 +1312,7 @@ describe("RemoteProviderAdapter request dump", () => {
 			event("text.delta", { text: "answer" }),
 			done(),
 		]);
-		const collector = new ApiRequestDumpCollector();
+		const { collector, requests, metas, body } = recordedCollector();
 		const events = await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
 
 		// Dump events are a diagnostic side channel: only the real model output remains.
@@ -1052,19 +1320,19 @@ describe("RemoteProviderAdapter request dump", () => {
 			{ text: "answer", textOutputIndex: undefined },
 			{ stopReason: "end_turn" },
 		]);
-		const dump = collector.snapshot();
-		expect(dump.request).toMatchObject({
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).toMatchObject({
 			transport: "http-sse",
 			url: "https://upstream.invalid/v1/chat",
 			headers: { "content-type": "application/json" },
-			body: { model: "model-1", input: "hello" },
 		});
-		expect(dump.response).toMatchObject({
+		expect(JSON.parse(body("request"))).toEqual({ model: "model-1", input: "hello" });
+		expect(Object.assign({}, ...metas)).toMatchObject({
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
-			bodyText: "data: chunk-1\n",
 			bodyIncomplete: false,
 		});
+		expect(body("response")).toBe("data: chunk-1\n");
 	});
 
 	test("config secrets are masked in reported url, headers, and bodies", async () => {
@@ -1080,16 +1348,16 @@ describe("RemoteProviderAdapter request dump", () => {
 			event("dump.response", { status: 200, bodyChunk: "echo: secret-value", final: true }),
 			done(),
 		]);
-		const collector = new ApiRequestDumpCollector();
+		const { collector, frames, requests, metas, body } = recordedCollector();
 		await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
 
-		const serialized = JSON.stringify(collector.snapshot());
-		expect(serialized).not.toContain("secret-value");
-		const dump = collector.snapshot();
+		expect(JSON.stringify({ frames, requests, metas })).not.toContain("secret-value");
 		// authorization is masked by header name; x-other only by the known secret value.
-		expect(dump.request?.headers?.authorization).toBe("Bear********alue");
-		expect(dump.request?.headers?.["x-other"]).toBe("secr********alue");
-		expect(dump.request?.url).toBe("https://upstream.invalid/v1/chat?key=secr********alue");
+		expect(requests[0]?.headers?.authorization).toBe("Bear********alue");
+		expect(requests[0]?.headers?.["x-other"]).toBe("secr********alue");
+		expect(requests[0]?.url).toBe("https://upstream.invalid/v1/chat?key=secr********alue");
+		expect(body("request")).toBe('{"auth":"secr********alue"}');
+		expect(body("response")).toBe("echo: secr********alue");
 	});
 
 	test("masks secrets split across chunks in both requests and responses of every retry", async () => {
@@ -1108,15 +1376,12 @@ describe("RemoteProviderAdapter request dump", () => {
 			events.push(event("dump.response", { bodyChunk: "value", final: true }));
 		}
 		events.push(done());
-		const collector = new ApiRequestDumpCollector();
+		const { collector, frames, requests, metas, body } = recordedCollector();
 		await collect(makeAdapter(makeRpc(events)).chat(chatParams({ requestDump: collector })));
-		const dump = collector.snapshot();
-		expect(dump.attempts).toHaveLength(2);
-		expect(JSON.stringify(dump)).not.toContain("secret-value");
-		expect(dump.request?.body).toEqual({ auth: "secr********alue" });
-		expect(dump.response?.bodyText).toBe("secr********alue");
-		for (const attempt of dump.attempts ?? [])
-			expect(attempt.response?.bodyText).toBe("secr********alue");
+		expect(requests).toHaveLength(3);
+		expect(JSON.stringify({ frames, requests, metas })).not.toContain("secret-value");
+		expect(body("request")).toBe('{"auth":"secr********alue"}'.repeat(3));
+		expect(body("response")).toBe("secr********alue".repeat(3));
 	});
 
 	test("masks encoded secret forms even when chunks split inside escape sequences", async () => {
@@ -1127,7 +1392,7 @@ describe("RemoteProviderAdapter request dump", () => {
 			Buffer.from("secret-value").toString("base64"),
 			"secret\\u002dvalue",
 		]) {
-			const collector = new ApiRequestDumpCollector();
+			const { collector, body } = recordedCollector();
 			const rpc = makeRpc([
 				event("dump.request", {
 					url: "https://upstream.invalid",
@@ -1139,12 +1404,12 @@ describe("RemoteProviderAdapter request dump", () => {
 				done(),
 			]);
 			await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
-			expect(collector.snapshot().request?.body).toEqual({ auth: "secr********alue" });
-			expect(collector.snapshot().response?.bodyText).toBe("secr********alue");
+			expect(body("request")).toBe('{"auth":"secr********alue"}');
+			expect(body("response")).toBe("secr********alue");
 		}
 	});
 
-	test("plugin-internal retries archive earlier attempts", async () => {
+	test("plugin-internal retries record every attempt in order", async () => {
 		const rpc = makeRpc([
 			event("dump.request", { url: "https://upstream.invalid/attempt-1", final: true }),
 			event("dump.response", { status: 429, bodyChunk: "rate limited", final: true }),
@@ -1152,15 +1417,17 @@ describe("RemoteProviderAdapter request dump", () => {
 			event("dump.response", { status: 200, bodyChunk: "ok", final: true }),
 			done(),
 		]);
-		const collector = new ApiRequestDumpCollector();
+		const { collector, requests, metas, body } = recordedCollector();
 		await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
 
-		const dump = collector.snapshot();
-		expect(dump.attempts).toHaveLength(1);
-		expect(dump.attempts?.[0]?.requestText).toContain("attempt-1");
-		expect(dump.attempts?.[0]?.response).toMatchObject({ status: 429 });
-		expect(dump.request?.url).toBe("https://upstream.invalid/attempt-2");
-		expect(dump.response).toMatchObject({ status: 200, bodyText: "ok" });
+		expect(requests.map((request) => request.url)).toEqual([
+			"https://upstream.invalid/attempt-1",
+			"https://upstream.invalid/attempt-2",
+		]);
+		expect(metas.filter((meta) => meta.status !== undefined).map((meta) => meta.status)).toEqual([
+			429, 200,
+		]);
+		expect(body("response")).toBe("rate limitedok");
 	});
 
 	test("a request without a response is preserved when the stream ends", async () => {
@@ -1179,11 +1446,11 @@ describe("RemoteProviderAdapter request dump", () => {
 			}),
 			done(),
 		]);
-		const collector = new ApiRequestDumpCollector();
+		const { collector, requests, body } = recordedCollector();
 		await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
 
-		const dump = collector.snapshot();
-		expect(dump.request?.url).toBe("https://upstream.invalid/v1/chat");
+		expect(requests.map((request) => request.url)).toEqual(["https://upstream.invalid/v1/chat"]);
+		expect(body("request")).toBe("{}");
 	});
 
 	test("dump events are dropped silently when no collector is attached", async () => {

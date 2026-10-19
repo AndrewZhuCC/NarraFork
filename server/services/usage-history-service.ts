@@ -1,7 +1,6 @@
 import { db } from "@server/db";
 import { getDbPath } from "@server/db/connection";
 import { apiRequests, chapters, narrators, users } from "@server/db/schema";
-import { redactSpillPointerPaths } from "@server/lib/api-request-dump-store";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
 import { runReadTask } from "@server/lib/db-worker/pool";
@@ -123,6 +122,9 @@ export type UsageBreakdownMetric =
 	| "cost"
 	| "inputTokens"
 	| "outputTokens"
+	| "cachedInputTokens"
+	| "cacheCreationTokens"
+	| "cacheHitRate"
 	| "reasoningTokens";
 
 export interface UsageBreakdownEntry {
@@ -333,33 +335,11 @@ export interface UsageHistoryRecord {
 	chapterTitle?: string | null;
 	chapterId?: string | null;
 	projectId?: string | null;
-	hasRawDump?: boolean;
-	rawDump?: unknown | null;
-}
-
-/**
- * Row backing a dump download: the identity a forwarded dump needs, plus the raw JSON text.
- *
- * The dump stays a STRING here on purpose — parsing it would pull a multi-MB row through
- * the main thread for a response that may end up streaming a file instead.
- */
-export interface RawDumpSource {
-	id: string;
-	userId: string | null;
-	username: string | null;
-	narratorId: string | null;
-	narratorTitle: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
-	projectId: string | null;
-	kind: string;
-	provider: string | null;
-	credentialId: string | null;
-	credentialName: string | null;
-	model: string | null;
-	errorMessage: string | null;
-	createdAt: string;
-	rawDumpJson: string | null;
+	/** Bounded diagnostics summary exists (list rows never carry its content). */
+	hasDiagnostics?: boolean;
+	diagnostics?: unknown | null;
+	/** Attempt id in the request recorder; locates ring/pinned evidence for this row. */
+	recordingRequestId?: string | null;
 }
 
 interface UsageHistoryListRow {
@@ -387,7 +367,8 @@ interface UsageHistoryListRow {
 	contextPercent: number | null;
 	meterUsage: number | null;
 	meterUnit: string | null;
-	hasRawDump: number | null;
+	hasDiagnostics: number | null;
+	recordingRequestId: string | null;
 	errorMessage: string | null;
 	createdAt: string;
 	narratorTitle: string | null;
@@ -472,20 +453,17 @@ export class UsageHistoryService {
 			cacheCreation5mTokens: row.cacheCreation5mTokens ?? 0,
 			cacheCreation1hTokens: row.cacheCreation1hTokens ?? 0,
 			reasoningTokens: row.reasoningTokens ?? 0,
-			hasRawDump: Number(row.hasRawDump) === 1,
+			hasDiagnostics: Number(row.hasDiagnostics) === 1,
 			errorMessage: row.errorMessage,
 		};
 	}
 
-	private parseRawDump(rawDumpJson: string | null): unknown | null {
-		if (!rawDumpJson) return null;
+	private parseDiagnostics(diagnosticsJson: string | null): unknown | null {
+		if (!diagnosticsJson) return null;
 		try {
-			// The spill pointer's absolute path is a property of the host, not of the request
-			// being diagnosed, and it carries the OS account name. Strip it on the way out; the
-			// download route resolves the path from the row itself.
-			return redactSpillPointerPaths(JSON.parse(rawDumpJson));
+			return JSON.parse(diagnosticsJson);
 		} catch {
-			return { invalidJson: true, rawText: rawDumpJson };
+			return null;
 		}
 	}
 
@@ -548,7 +526,8 @@ export class UsageHistoryService {
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
-				hasRawDump: sql<number>`CASE WHEN ${apiRequests.rawDumpJson} IS NOT NULL THEN 1 ELSE 0 END`,
+				hasDiagnostics: sql<number>`CASE WHEN ${apiRequests.diagnosticsJson} IS NOT NULL THEN 1 ELSE 0 END`,
+				recordingRequestId: apiRequests.recordingRequestId,
 				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
@@ -616,7 +595,8 @@ export class UsageHistoryService {
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
-				hasRawDump: sql<number>`CASE WHEN ${apiRequests.rawDumpJson} IS NOT NULL THEN 1 ELSE 0 END`,
+				hasDiagnostics: sql<number>`CASE WHEN ${apiRequests.diagnosticsJson} IS NOT NULL THEN 1 ELSE 0 END`,
+				recordingRequestId: apiRequests.recordingRequestId,
 				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
@@ -793,48 +773,6 @@ export class UsageHistoryService {
 		};
 	}
 
-	/**
-	 * Everything needed to serve a complete dump download.
-	 *
-	 * Separate from {@link getUsageRecord} because the download route must not read the
-	 * dump text into a JSON response envelope when a spill file exists — it streams the
-	 * file instead. Returning the raw JSON string lets the route decide.
-	 */
-	async getRawDumpSource(id: string): Promise<RawDumpSource | null> {
-		const [record] = await this.database
-			.select({
-				id: apiRequests.id,
-				userId: apiRequests.userId,
-				username: users.username,
-				narratorId: apiRequests.narratorId,
-				kind: apiRequests.kind,
-				provider: apiRequests.provider,
-				credentialId: apiRequests.credentialId,
-				model: apiRequests.model,
-				errorMessage: apiRequests.errorMessage,
-				createdAt: apiRequests.createdAt,
-				rawDumpJson: apiRequests.rawDumpJson,
-				// Joined only here, never in the list query: a downloaded dump gets forwarded to
-				// whoever is helping diagnose it, and `narratorId` alone does not say which
-				// conversation or project produced it. One row, indexed lookups — the CLAUDE.md
-				// rule this respects is "list summaries stay lean", not "never join".
-				narratorTitle: narrators.title,
-				chapterId: narrators.chapterId,
-				chapterTitle: chapters.title,
-				projectId: chapters.projectId,
-			})
-			.from(apiRequests)
-			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
-			.leftJoin(users, eq(apiRequests.userId, users.id))
-			.where(eq(apiRequests.id, id));
-		if (!record) return null;
-		return {
-			...record,
-			credentialName: this.getCredentialName(record.provider, record.credentialId),
-		};
-	}
-
 	async getUsageRecord(id: string): Promise<UsageHistoryRecord | null> {
 		const [record] = await this.database
 			.select({
@@ -861,7 +799,8 @@ export class UsageHistoryService {
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
-				rawDumpJson: apiRequests.rawDumpJson,
+				diagnosticsJson: apiRequests.diagnosticsJson,
+				recordingRequestId: apiRequests.recordingRequestId,
 				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
@@ -876,7 +815,7 @@ export class UsageHistoryService {
 			.where(eq(apiRequests.id, id));
 
 		if (!record) return null;
-		const { rawDumpJson, ...rest } = record;
+		const { diagnosticsJson, ...rest } = record;
 		return {
 			...rest,
 			credentialName: this.getCredentialName(record.provider, record.credentialId),
@@ -887,8 +826,8 @@ export class UsageHistoryService {
 			cacheCreation5mTokens: record.cacheCreation5mTokens ?? 0,
 			cacheCreation1hTokens: record.cacheCreation1hTokens ?? 0,
 			reasoningTokens: record.reasoningTokens ?? 0,
-			hasRawDump: !!rawDumpJson,
-			rawDump: this.parseRawDump(rawDumpJson),
+			hasDiagnostics: !!diagnosticsJson,
+			diagnostics: this.parseDiagnostics(diagnosticsJson),
 			errorMessage: record.errorMessage,
 		};
 	}
@@ -1187,6 +1126,15 @@ export class UsageHistoryService {
 				return sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`;
 			case "inputTokens":
 				return sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`;
+			case "cachedInputTokens":
+				return sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`;
+			case "cacheCreationTokens":
+				return sql<number>`coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`;
+			// 缓存命中率 = 缓存读取 ÷ (缓存读取 + 缓存写入 + 纯输入)。
+			// 必须先分别求和再相除：按行求比率再平均会让小请求行获得与百万级请求相同的权重。
+			// 分母为 0（该组无任何输入侧 token）时返回 0，避免 NaN 污染图表。
+			case "cacheHitRate":
+				return sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0) * 1.0 / nullif(coalesce(sum(${apiRequests.cachedInputTokens}), 0) + coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0) + coalesce(sum(${apiRequests.inputTokens}), 0), 0)`;
 			case "outputTokens":
 				return sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`;
 			case "reasoningTokens":

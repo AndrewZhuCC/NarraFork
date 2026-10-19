@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import iconv from "iconv-lite";
 import { testEnvironment } from "../../tests/preload";
+import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 import { safeSpawn } from "../lib/spawn";
 
 test("compiled binary embeds both reusable raw source workers and codecs outside the source checkout", async () => {
@@ -16,8 +17,9 @@ test("compiled binary embeds both reusable raw source workers and codecs outside
 				"build",
 				"--compile",
 				"./server/editor-raw-smoke.fixture.ts",
-				"./server/services/editor-document-stream-worker.ts",
-				"./server/services/editor-document-worker.ts",
+				...compiledWorkerBuildEntrypoints(),
+				"--asset-naming=[dir]/[name].[ext]",
+				"--minify",
 				"--outfile",
 				binary,
 			],

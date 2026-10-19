@@ -46,6 +46,82 @@ function reasons(source: string): string[] {
 	}
 }
 
+describe("controlled constant expression indexes and text length", () => {
+	const fixture = (term: string) => `${HEAD}
+export const t = sqliteTable("t", { id: text("id"), payload: text("payload", { mode: "json" }) }, (table) => [
+  uniqueIndex("singleton").on(${term}).where(sql\`\${table.id} IS NOT NULL\`),
+]);`;
+	test.each([
+		"1",
+		"(1)",
+		"(( 1 ))",
+	])("preserves the constant %s separately from columns", (value) => {
+		const result = generatePostgresSchema(fixture(`sql\`${value}\``));
+		expect(result.coverage.tables[0].indexes[0]).toEqual({
+			name: "singleton",
+			columns: [],
+			expression: "1",
+			unique: true,
+			predicate: '"id" IS NOT NULL',
+		});
+		expect(result.source).toContain('uniqueIndex("singleton").on(sql.raw("(1)"))');
+		expect(result.coverage.tables[0].indexes[0].emitAsUniqueConstraint).toBeUndefined();
+	});
+	test.each([
+		"2",
+		"1+0",
+		"true",
+		"'1'",
+		"abs(1)",
+		"1); DROP TABLE t; --",
+		"(1",
+		"1)",
+	])("rejects arbitrary index expression %s", (value) => {
+		expect(reasons(fixture(`sql\`${value}\``)).join(" ")).toContain("unsupported index expression");
+	});
+	test.each([
+		'sql.raw("(1)")',
+		"sql`1`, table.id",
+		`sql\`\${table.id}\``,
+		"other`1`",
+	])("rejects unsupported index term %s", (value) =>
+		expect(reasons(fixture(value)).length).toBeGreaterThan(0));
+	test("a constant index cannot be promoted to cover an FK column", () => {
+		const source =
+			fixture("sql`1`").replace(`.where(sql\`\${table.id} IS NOT NULL\`)`, "") +
+			'export const child = sqliteTable("child", { parent: text("parent").references(() => t.id) });';
+		expect(reasons(source).join(" ")).toContain("FK target has no usable unique constraint");
+	});
+	const checkFixture = (expression: string) => `${HEAD}
+export const t = sqliteTable("t", { id: text("id"), payload: text("payload", {mode: "json"}), count: integer("count") }, (table) => [
+  check("bound", sql\`${expression}\`),
+]);`;
+	test("preserves character length for text and JSON text, but maps byte budgets separately", () => {
+		for (const expression of [
+			`length(\${table.id}) <= 2048`,
+			`length(\${table.payload}) <= 8192`,
+		]) {
+			const result = generatePostgresSchema(checkFixture(expression));
+			expect(result.coverage.tables[0].checkDefinitions[0].expression).toContain("length(");
+			expect(result.source).not.toContain("octet_length");
+		}
+		expect(
+			generatePostgresSchema(checkFixture(`length(cast(\${table.payload} as blob)) <= 8192`))
+				.source,
+		).toContain('octet_length(\\"payload\\")');
+	});
+	test.each([
+		`length(\${table.count})`,
+		`length(\${table.id}, 1)`,
+		`length(lower(\${table.id}))`,
+		"length(unknown)",
+		"length('literal')",
+		"random()",
+	])("rejects unsupported length/function expression %s", (expression) => {
+		expect(reasons(checkFixture(`${expression} <= 8`)).length).toBeGreaterThan(0);
+	});
+});
+
 describe("JSON column defaults", () => {
 	// The codec JSON-encodes on write. A raw JS default would either be encoded twice or,
 	// because the column is text-typed, emitted by Drizzle Kit as a bare unquoted value.

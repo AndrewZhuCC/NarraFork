@@ -48,6 +48,11 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 			await deps.cleanup(ownedEpoch, error, cancelled);
 		} catch (cleanupError) {
 			error = `${error}; cleanup failed: ${String(cleanupError)}`;
+			// Durable rollback has not completed. Retain the epoch so cancel can
+			// retry; do not report idle or admit another preparation over this one.
+			shutdownRequested = false;
+			phase = "failed";
+			return;
 		}
 		shutdownRequested = false;
 		phase = cancelled ? "idle" : "failed";
@@ -71,7 +76,11 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 		if (phase === "prepared" && !closeAfterPreparation) return success();
 		if (phase !== "prepared") {
 			if (deps.coordination().scheduled) return failure("An update is already scheduled");
-			epoch = deps.schedule().updateEpoch;
+			try {
+				epoch = deps.schedule().updateEpoch;
+			} catch (reason) {
+				return failure(reason instanceof Error ? reason.message : String(reason));
+			}
 		}
 		// Prepared state can last indefinitely. Re-converge the same epoch before exiting,
 		// because resumable waits may settle or be interrupted while the gate is closed.
@@ -84,7 +93,12 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 			try {
 				const snapshot = await deps.drain(ownedEpoch);
 				deps.assertNotCancelled();
-				deps.persist({ ...snapshot, resumeOnNextStartup: true });
+				deps.persist({
+					...snapshot,
+					resumeOnNextStartup: true,
+					evidenceOnly: undefined,
+					handoffMarkerNonce: undefined,
+				});
 				phase = "prepared";
 				if (shutdownRequested) closePrepared();
 			} catch (reason) {
@@ -98,7 +112,8 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 
 	function cancel() {
 		if (phase === "shutting_down") return failure("Server shutdown has already begun");
-		if (phase !== "preparing" && phase !== "prepared") return success();
+		if (phase !== "preparing" && phase !== "prepared" && !(phase === "failed" && epoch))
+			return success();
 		deps.cancel();
 		shutdownRequested = false;
 		if (!preparation && epoch) {

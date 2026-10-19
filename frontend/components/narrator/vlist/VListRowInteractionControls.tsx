@@ -28,6 +28,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { copyTextToClipboard } from "../../../lib/clipboard";
 import { CompactMenuSub } from "../compact/CompactMenuSub";
+import { openHostedToolCallInspector } from "../tool-call/tool-call-inspector-host";
 import { useToolFileNavigation } from "../tool-call/useToolFileNavigation";
 import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { VListRowInteractionProps } from "./VListRowInteraction";
@@ -161,7 +162,20 @@ export function VListRowInteractionControls({
 				<Menu.Item
 					leftSection={<IconInfoCircle size={14} />}
 					onClick={() => {
-						setInspectorOpened(true);
+						// The list shell owns the dialog. A virtual row is evicted once it
+						// leaves the overscan window, and a modal mounted here would go with it.
+						const id = toolDetailRef?.toolUseId ?? toolUseId;
+						const hosted =
+							narratorId != null &&
+							id != null &&
+							openHostedToolCallInspector({
+								narratorId,
+								toolUseId: id,
+								toolCallId: toolDetailRef?.toolCallId,
+								messageId: toolDetailRef?.messageId,
+								executionAttempt: toolDetailRef?.executionAttempt,
+							});
+						if (!hosted) setInspectorOpened(true);
 						swipe.closeSwipe();
 					}}
 				>

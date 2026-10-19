@@ -14,6 +14,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if runGitLineStatsTestHelper() || runGitStatusTestHelper() {
+		return
+	}
 	os.Exit(testgit.Main(m))
 }
 

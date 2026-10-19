@@ -23,6 +23,7 @@ import {
 	foreignKey,
 	index,
 	integer,
+	primaryKey,
 	real,
 	sqliteTable,
 	text,
@@ -73,6 +74,70 @@ export const permissionRuleRequests = sqliteTable(
 			table.createdAt,
 			table.id,
 		),
+	],
+);
+
+/** Business rows own resources; their paths are derived. Legacy receipt paths are retained pins. */
+export const resourceProtectionPaths = sqliteTable(
+	"resource_protection_paths",
+	{
+		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		sourceId: text("source_id").notNull(),
+		slot: integer("slot").notNull(),
+		deviceId: text("device_id").notNull(),
+		canonicalPath: text("canonical_path"),
+		repositoryKey: text("repository_key"),
+		shadowKey: text("shadow_key"),
+		scopeProjectId: text("scope_project_id"),
+		aliasSensitive: integer("alias_sensitive").notNull().default(0),
+		claimJson: text("claim_json").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.source, table.sourceId, table.slot] }),
+		index("idx_protection_path").on(
+			table.deviceId,
+			table.canonicalPath,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_repository").on(
+			table.deviceId,
+			table.repositoryKey,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_shadow").on(table.shadowKey, table.source, table.sourceId, table.slot),
+		index("idx_protection_scope").on(
+			table.scopeProjectId,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_alias").on(
+			table.aliasSensitive,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+	],
+);
+
+/** Derived source revisions/dirty markers and bootstrap progress; receipt rows retain legacy pins. */
+export const resourceProtectionSources = sqliteTable(
+	"resource_protection_sources",
+	{
+		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		sourceId: text("source_id").notNull(),
+		revision: integer("revision").notNull().default(1),
+		dirty: integer("dirty").notNull().default(1),
+		cursor: text("cursor"),
+		complete: integer("complete").notNull().default(0),
+	},
+	(table) => [
+		primaryKey({ columns: [table.source, table.sourceId] }),
+		index("idx_protection_dirty").on(table.dirty, table.source, table.sourceId),
 	],
 );
 
@@ -1453,21 +1518,33 @@ export const modelHistoryRevisionContracts = sqliteTable("model_history_revision
 });
 
 // === narrator_messages ===
-export const narratorContextCharPages = sqliteTable(
-	"narrator_context_char_pages",
+/**
+ * One frozen segment list for the request currently shown in the composition menu.
+ * The usage snapshot keeps the small totals; this row keeps the ordered numbers.
+ */
+export const narratorContextPins = sqliteTable(
+	"narrator_context_pins",
 	{
-		id: text("id").primaryKey(),
+		generation: text("generation").primaryKey(),
 		narratorId: text("narrator_id")
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
-		generation: text("generation").notNull(),
-		page: integer("page").notNull(),
 		segmentsJson: text("segments_json", { mode: "json" }).$type<ContextSegment[]>().notNull(),
 	},
-	(t) => [
-		uniqueIndex("context_char_pages_generation_page_idx").on(t.narratorId, t.generation, t.page),
-	],
+	(t) => [index("idx_context_pins_narrator").on(t.narratorId)],
 );
+/**
+ * Numeric projection of a message. Composition reads this instead of the message
+ * body. Triggers keep it aligned with role, parent and context_chars_json.
+ */
+export const narratorMessageContextStats = sqliteTable("narrator_message_context_stats", {
+	messageId: text("message_id")
+		.primaryKey()
+		.references(() => narratorMessages.id, { onDelete: "cascade" }),
+	role: text("role").notNull(),
+	parentToolUseId: text("parent_tool_use_id"),
+	segmentsJson: text("segments_json", { mode: "json" }).$type<ContextCharStats>().notNull(),
+});
 
 export const narratorMessages = sqliteTable(
 	"narrator_messages",
@@ -1483,6 +1560,9 @@ export const narratorMessages = sqliteTable(
 		/** Incremented transactionally when model-visible body/identity changes. */
 		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
+		composerDocument: text("composer_document", { mode: "json" }).$type<
+			import("@shared/composer-document").ComposerDocument
+		>(),
 		contextCharsJson: text("context_chars_json", { mode: "json" }).$type<ContextCharStats>(),
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
@@ -1760,8 +1840,17 @@ export const narratorToolCalls = sqliteTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
-		// Numeric context keyset paging must not sort the entire message on every batch.
-		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		// Numeric context keyset paging must not sort the entire message on every batch,
+		// and must not open input_json/output_json just to read the character columns.
+		index("idx_toolcalls_context_id").on(
+			table.messageId,
+			table.id,
+			table.toolUseId,
+			table.createdAt,
+			table.executionAttempt,
+			table.inputChars,
+			table.outputChars,
+		),
 		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
 		// Latest attempts are scoped to the canonical message, not its current fork holder.
 		index("idx_toolcalls_context_latest").on(
@@ -2784,6 +2873,9 @@ export const narratorDrafts = sqliteTable(
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		text: text("text").notNull().default(""),
 		fileReferencesJson: text("file_references_json"), // bounded FileReference[]; no file contents
+		composerDocument: text("composer_document", { mode: "json" }).$type<
+			import("@shared/composer-document").ComposerDocument
+		>(),
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
@@ -3506,8 +3598,10 @@ export const apiRequests = sqliteTable(
 		meterUnit: text("meter_unit"),
 		// 错误信息（请求失败时记录）
 		errorMessage: text("error_message"),
-		// 原始请求/响应 dump（调试用）
-		rawDumpJson: text("raw_dump_json"),
+		// 有界请求诊断（不是完整 dump；完整证据在请求录制里）
+		diagnosticsJson: text("diagnostics_json"),
+		// 本次请求在录制系统中的 attempt id，用于定位循环/固定录制
+		recordingRequestId: text("recording_request_id"),
 		// 时间戳
 		createdAt: text("created_at").notNull(),
 	},
@@ -3518,6 +3612,8 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
+		// Usage history rows find their request evidence through this attempt id.
+		index("idx_api_requests_recording").on(table.recordingRequestId),
 		// Per-credential filtering would otherwise scan the whole table.
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
 	],
@@ -4850,9 +4946,10 @@ export const knowledgeInjectionEvents = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		compactSeq: integer("compact_seq").notNull(),
-		entryId: text("entry_id")
-			.notNull()
-			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		entryId: text("entry_id").references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		personalEntryId: text("personal_entry_id").references(() => knowledgeDrafts.id, {
+			onDelete: "cascade",
+		}),
 		entryRevisionId: text("entry_revision_id").references(() => knowledgeRevisions.id, {
 			onDelete: "set null",
 		}),
@@ -4869,7 +4966,17 @@ export const knowledgeInjectionEvents = sqliteTable(
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
+		check(
+			"knowledge_injection_exactly_one_entry",
+			sql`(${table.entryId} IS NOT NULL AND ${table.personalEntryId} IS NULL) OR (${table.entryId} IS NULL AND ${table.personalEntryId} IS NOT NULL)`,
+		),
 		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
+		uniqueIndex("idx_kie_cycle_personal_entry").on(
+			table.narratorId,
+			table.compactSeq,
+			table.personalEntryId,
+		),
+		index("idx_kie_personal_entry").on(table.personalEntryId),
 		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
 		index("idx_kie_entry").on(table.entryId),
 		// FK covering indexes: both parents (narrator_messages / narrator_tool_calls) are

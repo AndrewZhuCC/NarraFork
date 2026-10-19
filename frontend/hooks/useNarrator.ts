@@ -83,14 +83,17 @@ export function useNarratorsPaginated(opts?: {
 
 export interface FileTreeStatusFile {
 	path: string;
-	linesAdded: number;
-	linesRemoved: number;
+	status?: string;
+	oldPath?: string;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 export interface FileTreeStatus {
 	isGitRepo: boolean;
 	files: FileTreeStatusFile[];
 	totalFiles: number;
+	totalFilesExact?: boolean;
 	truncated: boolean;
 }
 
@@ -819,6 +822,7 @@ export function useCreateNarrator() {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			cwd?: string;
+			title?: string;
 			makeNamed?: boolean;
 			handle?: string;
 			kind?: "knowledge";

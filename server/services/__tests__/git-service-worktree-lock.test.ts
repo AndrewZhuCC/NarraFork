@@ -29,11 +29,13 @@
  * self-deadlock wedges the test runner instead of failing it, so a regression would look
  * like CI hanging rather than a red test.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { worktreeLock } from "../../lib/async-mutex";
+import { PathKeyedMutex, worktreeLock } from "../../lib/async-mutex";
+import * as spawn from "../../lib/spawn";
 import { safeSpawn } from "../../lib/spawn";
 import { gitService } from "../git-service";
 
@@ -424,5 +426,126 @@ describe("the hazard the unlocked variants exist for", () => {
 		expect(
 			await withinDeadline("the queued write, after its caller returned", () => inner),
 		).toBeTruthy();
+	});
+});
+
+/** Explicit barriers, not sleeps: a held backend command must exclude queued mutations. */
+function barrier() {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { promise, release };
+}
+
+describe("gitService shared worktree registry", () => {
+	test("add/remove/prune share a common-dir queue across linked checkouts and aliases", async () => {
+		const dir = await createRepo();
+		const other = await createRepo();
+		const source = join(dir, ".worktrees", "source");
+		const removable = join(dir, ".worktrees", "removable");
+		await git(["worktree", "add", source, "-b", "source"], dir);
+		await git(["worktree", "add", removable, "-b", "removable"], dir);
+		await git(["branch", "first"], dir);
+		await git(["branch", "second"], dir);
+		await git(["branch", "independent"], other);
+		const aliasRoot = mkdtempSync(join(tmpdir(), "nf-wtlock-alias-"));
+		tempDirs.push(aliasRoot);
+		const alias = join(aliasRoot, "source");
+		symlinkSync(source, alias, process.platform === "win32" ? "junction" : "dir");
+		const commonDirectory = await realpath(join(dir, ".git"));
+		const entered = barrier();
+		const release = barrier();
+		const queued = barrier();
+		const commands: string[] = [];
+		let acquisitions = 0;
+		const acquire = PathKeyedMutex.prototype.acquire;
+		const lockSpy = spyOn(PathKeyedMutex.prototype, "acquire").mockImplementation(function <T>(
+			this: PathKeyedMutex,
+			path: string,
+			fn: () => Promise<T>,
+		): Promise<T> {
+			const result = acquire.call(this, path, fn) as Promise<T>;
+			if (path === commonDirectory && ++acquisitions === 4) queued.release();
+			return result;
+		});
+		const originalSpawn = spawn.safeSpawn;
+		const spawnSpy = spyOn(spawn, "safeSpawn").mockImplementation(async (options) => {
+			const index = options.cmd.indexOf("worktree");
+			if (index >= 0 && options.cwd !== other) {
+				const operation = options.cmd[index + 1];
+				commands.push(operation);
+				if (operation === "add" && options.cmd.at(-1) === "first") {
+					entered.release();
+					await release.promise;
+				}
+			}
+			return originalSpawn(options);
+		});
+		const pending: Promise<void>[] = [];
+		try {
+			// A distinct leaf lock must also remain safe for existing worktreeLock holders.
+			pending.push(
+				worktreeLock.acquire(dir, () =>
+					gitService.createWorktree(dir, join(dir, ".worktrees", "first"), "first"),
+				),
+			);
+			await withinDeadline("first worktree add entered", () => entered.promise);
+			pending.push(
+				gitService.createWorktree(alias, join(dir, ".worktrees", "second"), "second"),
+				gitService.pruneWorktrees(source),
+				gitService.removeWorktree(dir, removable),
+			);
+			// Observe that every waiter is enqueued before checking dispatch exclusion.
+			await withinDeadline("all registry mutations queued", () => queued.promise);
+			await withinDeadline("an unrelated repository is not blocked", () =>
+				gitService.createWorktree(other, join(other, ".worktrees", "independent"), "independent"),
+			);
+			expect(commands).toEqual(["add"]);
+			release.release();
+			await Promise.all(pending);
+			expect(commands.filter((command) => command === "add")).toHaveLength(2);
+			expect(commands.filter((command) => command === "remove")).toHaveLength(1);
+			expect(commands.filter((command) => command === "prune")).toHaveLength(1);
+			const worktrees = await git(["worktree", "list", "--porcelain"], dir);
+			expect(worktrees).toContain("branch refs/heads/first");
+			expect(worktrees).toContain("branch refs/heads/second");
+			expect(worktrees).not.toContain("branch refs/heads/removable");
+		} finally {
+			release.release();
+			await Promise.allSettled(pending);
+			spawnSpy.mockRestore();
+			lockSpy.mockRestore();
+		}
+	}, 15_000);
+
+	test("a failed add releases the registry queue without retrying or swallowing the error", async () => {
+		const dir = await createRepo();
+		await git(["branch", "valid"], dir);
+		let attempts = 0;
+		const originalSpawn = spawn.safeSpawn;
+		const spawnSpy = spyOn(spawn, "safeSpawn").mockImplementation((options) => {
+			if (options.cmd.includes("worktree") && options.cmd.at(-1) === "missing") attempts++;
+			return originalSpawn(options);
+		});
+		const pending: Promise<unknown>[] = [];
+		try {
+			const failed = gitService.createWorktree(dir, join(dir, ".worktrees", "failed"), "missing");
+			// Attach the rejection assertion before another asynchronous Git probe can finish.
+			pending.push(
+				(async () => {
+					await expect(failed).rejects.toThrow("Failed to create worktree:");
+				})(),
+			);
+			pending.push(gitService.createWorktree(dir, join(dir, ".worktrees", "valid"), "valid"));
+			await Promise.all(pending);
+			expect(attempts).toBe(1);
+			expect(await git(["branch", "--show-current"], join(dir, ".worktrees", "valid"))).toBe(
+				"valid",
+			);
+		} finally {
+			await Promise.allSettled(pending);
+			spawnSpy.mockRestore();
+		}
 	});
 });

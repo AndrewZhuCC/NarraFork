@@ -1,13 +1,14 @@
+import { ApiError } from "@frontend/lib/api/client";
 import { formatCompactNumber, formatDuration } from "@frontend/lib/compact-number";
+import { saveBlobAsFile } from "@frontend/lib/file-download";
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { formatReferenceCost } from "@frontend/lib/usage-cost";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import { usageUserLabel } from "@frontend/lib/usage-history-user";
-import type { UsageHistoryRawDumpSpill, UsageHistoryRecord } from "@frontend/types/usage-history";
+import type { UsageHistoryRecord } from "@frontend/types/usage-history";
 import {
 	ActionIcon,
-	Alert,
 	Badge,
 	Button,
 	Card,
@@ -25,9 +26,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import { formatFileSize } from "@shared/text-file-types";
 import {
-	IconAlertTriangle,
 	IconArrowDown,
 	IconArrowUp,
 	IconBrain,
@@ -38,7 +37,6 @@ import {
 	IconDeviceFloppy,
 	IconDownload,
 	IconExclamationCircle,
-	IconFileDownload,
 	IconToggleLeft,
 	IconToggleRight,
 } from "@tabler/icons-react";
@@ -47,18 +45,16 @@ import type { TFunction } from "i18next";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CopyButton } from "../common/CopyButton";
+import { downloadErrorRequestDump } from "../narrator/useErrorRequestDump";
 
 interface UsageHistoryTableProps {
 	records: UsageHistoryRecord[];
 	loading?: boolean;
 }
 
-const MAX_RAW_DUMP_DISPLAY_CHARS = 120_000;
+const MAX_DIAGNOSTICS_DISPLAY_CHARS = 120_000;
 
-function formatRawDumpPreview(
-	value: unknown,
-	maxChars: number,
-): { text: string; truncated: boolean } {
+function formatJsonPreview(value: unknown, maxChars: number): { text: string; truncated: boolean } {
 	const parts: string[] = [];
 	const seen = new WeakSet<object>();
 	let remaining = maxChars;
@@ -129,47 +125,9 @@ function formatRawDumpPreview(
 	return { text: parts.join(""), truncated };
 }
 
-/**
- * Read the spill pointer off a dump of unknown shape.
- *
- * The dump arrives as a stored JSON blob, so it may predate the current pointer shape or
- * carry none at all. A pointer is only honoured when it asserts one of the two truncations
- * it can describe; anything else means "no evidence anything was cut", and inventing that
- * warning would be worse than omitting it.
- *
- * `truncated` is accepted on its own even though the server always writes `inlineTruncated`
- * alongside it: the two facts are independent, and the severe one (no complete copy exists)
- * must not be silenced by the absence of the mild one.
- */
-function readRawDumpSpill(dump: unknown): UsageHistoryRawDumpSpill | null {
-	if (dump == null || typeof dump !== "object" || Array.isArray(dump)) return null;
-	const spill = (dump as { spill?: unknown }).spill;
-	if (spill == null || typeof spill !== "object" || Array.isArray(spill)) return null;
-	const pointer = spill as UsageHistoryRawDumpSpill;
-	if (pointer.inlineTruncated !== true && pointer.truncated !== true) return null;
-	return pointer;
-}
-
-function finiteBytes(value: unknown): number | null {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-}
-
-function rawDumpDownloadFileName(record: UsageHistoryRecord): string {
-	const timestamp = Number.isFinite(Date.parse(record.createdAt))
-		? new Date(record.createdAt).toISOString().replace(/[:.]/g, "-")
-		: "unknown-time";
-	return `api-request-${timestamp}-${record.id}.json`;
-}
-
-function saveBlob(fileName: string, blob: Blob): void {
-	const url = URL.createObjectURL(blob);
-	const link = document.createElement("a");
-	link.href = url;
-	link.download = fileName;
-	document.body.append(link);
-	link.click();
-	link.remove();
-	URL.revokeObjectURL(url);
+/** Evidence lives in the narrator's request recorder, keyed by the loop attempt id. */
+function canDownloadEvidence(record: UsageHistoryRecord): boolean {
+	return !!record.recordingRequestId && !!record.narratorId;
 }
 
 function getProviderColor(provider: string | null) {
@@ -250,15 +208,6 @@ function TokensCell({
 }) {
 	const { t } = useTranslation("common");
 
-	// For OpenAI/Codex: input_tokens includes cached_tokens, so we need to subtract
-	// For Anthropic: input_tokens already excludes cache_read_input_tokens
-	const isOpenAIStyle = record.provider === "codex" || record.provider === "openai";
-
-	// Calculate actual billed input tokens (non-cached)
-	const actualInputTokens = isOpenAIStyle
-		? record.inputTokens - record.cachedInputTokens
-		: record.inputTokens;
-
 	const iconSize = compact ? 12 : 14;
 	const textSize = compact ? "xs" : "sm";
 	const cacheWriteTokens = formatCompactNumber(record.cacheCreationInputTokens);
@@ -268,7 +217,7 @@ function TokensCell({
 			<Group gap={compact ? 8 : 12} wrap="nowrap">
 				<Group gap={4} wrap="nowrap" align="flex-start">
 					<IconArrowUp size={iconSize} color="var(--mantine-color-violet-6)" />
-					<TokenAmount value={actualInputTokens} compact={compact} textSize={textSize} />
+					<TokenAmount value={record.inputTokens} compact={compact} textSize={textSize} />
 				</Group>
 				<Group gap={4} wrap="nowrap" align="flex-start">
 					<IconArrowDown size={iconSize} color="var(--mantine-color-green-6)" />
@@ -440,7 +389,7 @@ function CopyErrorAction({ message, asButton = false }: { message: string; asBut
 	);
 }
 
-function DownloadRawDumpAction({
+function DownloadEvidenceAction({
 	record,
 	loading,
 	onDownload,
@@ -465,13 +414,13 @@ function DownloadRawDumpAction({
 					onDownload(record);
 				}}
 			>
-				{t("usageHistoryDownloadRequestResponse")}
+				{t("usageHistoryDownloadEvidence")}
 			</Button>
 		);
 	}
 
 	return (
-		<Tooltip label={t("usageHistoryDownloadRequestResponse")} withArrow>
+		<Tooltip label={t("usageHistoryDownloadEvidence")} withArrow>
 			<ActionIcon
 				variant="subtle"
 				color="blue"
@@ -480,109 +429,11 @@ function DownloadRawDumpAction({
 					event.stopPropagation();
 					onDownload(record);
 				}}
-				aria-label={t("usageHistoryDownloadRequestResponse")}
+				aria-label={t("usageHistoryDownloadEvidence")}
 			>
 				<IconDownload size={16} />
 			</ActionIcon>
 		</Tooltip>
-	);
-}
-
-/**
- * State the truncations that apply to the dump shown below, worst first.
- *
- * Three unrelated things can cut a dump short, and they differ in what the user can do
- * about it — so they must not be phrased as one:
- *
- *  1. `spill.truncated` — the FILE itself was shed to fit the server's per-file ceiling.
- *     No complete copy exists anywhere; downloading does not recover it. This is the only
- *     permanent loss, so it sets the alert's severity and leads the text.
- *  2. `spill.inlineTruncated` — the database row holds only a head. Downloading the dump
- *     returns the whole file, so this is informational.
- *  3. `displayCapped` — the preview below stops at a character budget to keep the modal
- *     responsive. Nothing is lost; it is a rendering limit.
- *
- * (3) keeps its in-place marker at the end of the preview (that marker is what says WHERE
- * the text stops), and is restated here only when an alert is already being shown, so a
- * reader of the alert is not left thinking the cut they can see has a different cause.
- */
-function RawDumpSpillAlert({
-	spill,
-	displayCapped,
-}: {
-	spill: UsageHistoryRawDumpSpill;
-	displayCapped: boolean;
-}) {
-	const { t } = useTranslation("common");
-	const incomplete = spill.truncated === true;
-	const keptBytes = finiteBytes(spill.bytes);
-	const originalBytes = finiteBytes(spill.originalBytes);
-
-	return (
-		<Alert
-			mb="sm"
-			color={incomplete ? "orange" : "yellow"}
-			variant="light"
-			icon={incomplete ? <IconAlertTriangle size={18} /> : <IconFileDownload size={18} />}
-			title={
-				incomplete ? t("usageHistoryRawDumpIncompleteTitle") : t("usageHistoryRawDumpSpillTitle")
-			}
-		>
-			<Stack gap={4}>
-				{incomplete ? (
-					<>
-						<Text size="sm" fw={500}>
-							{t("usageHistoryRawDumpIncompleteBody")}
-						</Text>
-						{spill.inlineTruncated === true ? (
-							<Text size="sm">{t("usageHistoryRawDumpIncompleteHead")}</Text>
-						) : null}
-					</>
-				) : (
-					<Text size="sm">{t("usageHistoryRawDumpSpillBody")}</Text>
-				)}
-
-				{incomplete ? (
-					// `bytes` is what survived, not the dump's size, so the "Complete dump: …"
-					// wording must not be reused here.
-					originalBytes !== null && keptBytes !== null && originalBytes > keptBytes ? (
-						<Text size="xs" c="dimmed">
-							{t("usageHistoryRawDumpIncompleteBytes", {
-								original: formatFileSize(originalBytes),
-								kept: formatFileSize(keptBytes),
-								lost: formatFileSize(originalBytes - keptBytes),
-							})}
-						</Text>
-					) : originalBytes !== null ? (
-						<Text size="xs" c="dimmed">
-							{t("usageHistoryRawDumpIncompleteOriginal", {
-								size: formatFileSize(originalBytes),
-							})}
-						</Text>
-					) : keptBytes !== null ? (
-						<Text size="xs" c="dimmed">
-							{t("usageHistoryRawDumpIncompleteKept", { size: formatFileSize(keptBytes) })}
-						</Text>
-					) : null
-				) : keptBytes !== null ? (
-					<Text size="xs" c="dimmed">
-						{t("usageHistoryRawDumpSpillSize", { size: formatFileSize(keptBytes) })}
-					</Text>
-				) : null}
-
-				{displayCapped ? (
-					<Text size="xs" c="dimmed">
-						{t("usageHistoryRawDumpDisplayCapNote")}
-					</Text>
-				) : null}
-
-				{spill.fileName ? (
-					<Text size="xs" c="dimmed" ff="monospace" style={{ wordBreak: "break-all" }}>
-						{t("usageHistoryRawDumpSpillFile", { fileName: spill.fileName })}
-					</Text>
-				) : null}
-			</Stack>
-		</Alert>
 	);
 }
 
@@ -601,7 +452,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 		const getValue = (r: UsageHistoryRecord): number => {
 			switch (sortField) {
 				case "tokens":
-					return r.inputTokens + r.outputTokens;
+					return r.inputTokens + r.outputTokens + r.cachedInputTokens + r.cacheCreationInputTokens;
 				case "cost":
 					return r.costUsd ?? 0;
 				case "ttft":
@@ -627,43 +478,39 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 		}
 	};
 
-	const { data: selectedRecord, isLoading: isLoadingRawDump } = useQuery({
+	const { data: selectedRecord, isLoading: isLoadingDetail } = useQuery({
 		queryKey: ["usage-history", "detail", selectedRecordId],
 		queryFn: () => usageHistoryApi.getRecord(selectedRecordId as string),
 		enabled: !!selectedRecordId,
 		gcTime: 0,
 	});
-	const rawDumpDisplay = useMemo(() => {
-		if (!selectedRecord?.rawDump) return null;
-		return formatRawDumpPreview(selectedRecord.rawDump, MAX_RAW_DUMP_DISPLAY_CHARS);
-	}, [selectedRecord?.rawDump]);
-	/**
-	 * The row is only a head whenever the dump spilled to a file, and the panel below shows
-	 * exactly that head. Without this the truncation is invisible and a user diagnoses a
-	 * rejected request from a body that stops mid-way. The pointer also carries whether the
-	 * FILE was shed — see {@link RawDumpSpillAlert} for why the two must read differently.
-	 */
-	const rawDumpSpill = useMemo(
-		() => readRawDumpSpill(selectedRecord?.rawDump),
-		[selectedRecord?.rawDump],
-	);
+	const diagnosticsDisplay = useMemo(() => {
+		if (selectedRecord?.diagnostics == null) return null;
+		return formatJsonPreview(selectedRecord.diagnostics, MAX_DIAGNOSTICS_DISPLAY_CHARS);
+	}, [selectedRecord?.diagnostics]);
 
 	/**
-	 * Always fetch from the server's download endpoint.
-	 *
-	 * Serializing the record already in memory would download whatever the row happened to
-	 * hold — a truncated preview whenever the dump spilled to a file. The endpoint returns
-	 * the complete dump either way.
+	 * Pin this exact attempt in the recorder and download it. The recording only exists
+	 * while it is still in the narrator's window or already pinned; afterwards it is gone.
 	 */
-	const handleDownloadRawDump = async (record: UsageHistoryRecord) => {
+	const handleDownloadEvidence = async (record: UsageHistoryRecord) => {
+		if (!record.narratorId || !record.recordingRequestId) return;
 		setDownloadingRecordId(record.id);
 		try {
-			const { blob, fileName } = await usageHistoryApi.downloadRawDump(record.id);
-			saveBlob(fileName ?? rawDumpDownloadFileName(record), blob);
+			const { blob, fileName } = await downloadErrorRequestDump(
+				record.narratorId,
+				record.recordingRequestId,
+				AbortSignal.timeout(120_000),
+			);
+			saveBlobAsFile(blob, fileName ?? `request-recording-${record.recordingRequestId}.zip`);
 		} catch (error) {
-			console.error("Failed to download raw dump", error);
+			console.error("Failed to download request evidence", error);
 			window.alert(
-				error instanceof Error && error.message ? error.message : t("usageHistoryDownloadFailed"),
+				error instanceof ApiError && error.status === 404
+					? t("usageHistoryEvidenceUnavailable")
+					: error instanceof Error && error.message
+						? error.message
+						: t("usageHistoryDownloadFailed"),
 			);
 		} finally {
 			setDownloadingRecordId(null);
@@ -738,11 +585,11 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 								{record.errorMessage ? (
 									<Group gap="xs">
 										<CopyErrorAction message={record.errorMessage} asButton />
-										{record.hasRawDump ? (
-											<DownloadRawDumpAction
+										{canDownloadEvidence(record) ? (
+											<DownloadEvidenceAction
 												record={record}
 												loading={downloadingRecordId === record.id}
-												onDownload={handleDownloadRawDump}
+												onDownload={handleDownloadEvidence}
 												asButton
 											/>
 										) : null}
@@ -814,14 +661,14 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 									compact
 								/>
 
-								{record.hasRawDump ? (
+								{record.hasDiagnostics || canDownloadEvidence(record) ? (
 									<Button
 										size="compact-xs"
 										variant="light"
 										leftSection={<IconCodeDots size={14} />}
 										onClick={() => setSelectedRecordId(record.id)}
 									>
-										{t("usageHistoryViewRawDump")}
+										{t("usageHistoryViewDiagnostics")}
 									</Button>
 								) : null}
 							</Stack>
@@ -996,25 +843,25 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										)}
 									</Table.Td>
 									<Table.Td>
-										{record.hasRawDump || record.errorMessage ? (
+										{record.hasDiagnostics || canDownloadEvidence(record) || record.errorMessage ? (
 											<Group gap={4} wrap="nowrap">
 												{record.errorMessage ? (
 													<CopyErrorAction message={record.errorMessage} />
 												) : null}
-												{record.errorMessage && record.hasRawDump ? (
-													<DownloadRawDumpAction
+												{record.errorMessage && canDownloadEvidence(record) ? (
+													<DownloadEvidenceAction
 														record={record}
 														loading={downloadingRecordId === record.id}
-														onDownload={handleDownloadRawDump}
+														onDownload={handleDownloadEvidence}
 													/>
 												) : null}
-												{record.hasRawDump ? (
-													<Tooltip label={t("usageHistoryViewRawDump")}>
+												{record.hasDiagnostics || canDownloadEvidence(record) ? (
+													<Tooltip label={t("usageHistoryViewDiagnostics")}>
 														<ActionIcon
 															variant="subtle"
 															color="gray"
 															onClick={() => setSelectedRecordId(record.id)}
-															aria-label={t("usageHistoryViewRawDump")}
+															aria-label={t("usageHistoryViewDiagnostics")}
 														>
 															<IconCodeDots size={16} />
 														</ActionIcon>
@@ -1037,7 +884,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 			<Modal
 				opened={!!selectedRecordId}
 				onClose={() => setSelectedRecordId(null)}
-				title={t("usageHistoryRawDumpTitle")}
+				title={t("usageHistoryDiagnosticsTitle")}
 				size="xl"
 				centered
 			>
@@ -1054,35 +901,34 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 						/>
 					</SimpleGrid>
 				) : null}
-				{selectedRecord?.errorMessage || selectedRecord?.hasRawDump ? (
+				{selectedRecord?.errorMessage || (selectedRecord && canDownloadEvidence(selectedRecord)) ? (
 					<Group justify="flex-end" mb="sm" gap="xs">
 						{selectedRecord.errorMessage ? (
 							<CopyErrorAction message={selectedRecord.errorMessage} asButton />
 						) : null}
-						{selectedRecord.hasRawDump ? (
-							<DownloadRawDumpAction
+						{canDownloadEvidence(selectedRecord) ? (
+							<DownloadEvidenceAction
 								record={selectedRecord}
 								loading={downloadingRecordId === selectedRecord.id}
-								onDownload={handleDownloadRawDump}
+								onDownload={handleDownloadEvidence}
 								asButton
 							/>
 						) : null}
 					</Group>
 				) : null}
-				{rawDumpSpill && !isLoadingRawDump ? (
-					<RawDumpSpillAlert
-						spill={rawDumpSpill}
-						displayCapped={rawDumpDisplay?.truncated === true}
-					/>
+				{selectedRecord && canDownloadEvidence(selectedRecord) ? (
+					<Text size="xs" c="dimmed" mb="sm">
+						{t("usageHistoryEvidenceHint")}
+					</Text>
 				) : null}
-				{isLoadingRawDump ? (
+				{isLoadingDetail ? (
 					<Group justify="center" py="xl">
 						<Loader size="sm" />
 						<Text size="sm" c="dimmed">
-							{t("usageHistoryRawDumpLoading")}
+							{t("usageHistoryDiagnosticsLoading")}
 						</Text>
 					</Group>
-				) : rawDumpDisplay ? (
+				) : diagnosticsDisplay ? (
 					<Code
 						block
 						style={{
@@ -1093,12 +939,12 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 							fontSize: 12,
 						}}
 					>
-						{rawDumpDisplay.text}
-						{rawDumpDisplay.truncated ? `\n\n${t("usageHistoryRawDumpTruncated")}` : null}
+						{diagnosticsDisplay.text}
+						{diagnosticsDisplay.truncated ? `\n\n${t("usageHistoryDiagnosticsTruncated")}` : null}
 					</Code>
 				) : (
 					<Text size="sm" c="dimmed">
-						{t("usageHistoryRawDumpEmpty")}
+						{t("usageHistoryDiagnosticsEmpty")}
 					</Text>
 				)}
 			</Modal>

@@ -68,7 +68,37 @@ export const MAX_DRAFT_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024;
  */
 export const MAX_DRAFT_ATTACHMENT_RECORDS = 20;
 
+const composerAssetIds = new WeakMap<File, string>();
+
+/** Resource identity belongs to the File object, never its (possibly duplicated) name. */
+export function getComposerAssetId(file: File): string {
+	let id = composerAssetIds.get(file);
+	if (!id) {
+		id =
+			globalThis.crypto?.randomUUID?.() ??
+			`asset-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		composerAssetIds.set(file, id);
+	}
+	return id;
+}
+
+function isComposerAssetId(id: unknown): id is string {
+	if (typeof id !== "string" || !id.length || id.length > 4096) return false;
+	for (let i = 0; i < id.length; i++) {
+		const code = id.charCodeAt(i);
+		if (code <= 32 || code === 127) return false;
+	}
+	return true;
+}
+
+export function setComposerAssetId(file: File, id: string): void {
+	if (!isComposerAssetId(id)) throw new Error("Invalid composer asset id");
+	composerAssetIds.set(file, id);
+}
+
 interface DraftAttachmentEntry {
+	/** Optional for records written before inline attachments. */
+	id?: string;
 	name: string;
 	type: string;
 	size: number;
@@ -130,7 +160,8 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 	if (!idb) return Promise.resolve(null);
 	if (dbPromise) return dbPromise;
 
-	dbPromise = new Promise((resolve) => {
+	let failed = false;
+	const pending = new Promise<IDBDatabase>((resolve, reject) => {
 		const request = idb.open(DB_NAME, DB_VERSION);
 
 		request.onupgradeneeded = (event) => {
@@ -152,26 +183,38 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 		};
 
 		request.onerror = () => {
-			dbPromise = null;
-			resolve(null);
+			failed = true;
+			reject(request.error ?? new Error("IndexedDB draft attachments open failed"));
 		};
 
 		request.onblocked = () => {
-			dbPromise = null;
-			resolve(null);
+			failed = true;
+			reject(new Error("IndexedDB draft attachments open blocked"));
 		};
 
 		request.onsuccess = () => {
 			const db = request.result;
+			// A blocked request can still succeed after the caller has retried.
+			// It must not retain a handle or replace the newer cached connection.
+			if (failed) {
+				db.close();
+				return;
+			}
 			db.onversionchange = () => {
 				db.close();
-				dbPromise = null;
+				if (dbPromise === pending) dbPromise = null;
 			};
 			resolve(db);
 		};
 	});
+	dbPromise = pending;
+	// Also reset after a synchronous open() exception. Only this attempt owns
+	// this cache entry; a late failure must not clear a newer successful open.
+	void pending.catch(() => {
+		if (dbPromise === pending) dbPromise = null;
+	});
 
-	return dbPromise;
+	return pending;
 }
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
@@ -233,6 +276,7 @@ function shouldPersistFile(file: File, kind: AttachmentKind): boolean {
 
 function fileToEntry(file: File, index: number, kind: AttachmentKind): DraftAttachmentEntry {
 	return {
+		id: getComposerAssetId(file),
 		name: getStoredFileName(file, index, kind),
 		type: file.type,
 		size: file.size,
@@ -267,7 +311,14 @@ function entryToFile(entry: unknown, index: number, kind: AttachmentKind): File 
 			: `attachment-${index + 1}.txt`;
 	const name = typeof item.name === "string" && item.name.trim() ? item.name : fallbackName;
 	const lastModified = typeof item.lastModified === "number" ? item.lastModified : Date.now();
-	return new File([blob], name, { type, lastModified });
+	const file = new File([blob], name, { type, lastModified });
+	if (isComposerAssetId(item.id)) {
+		setComposerAssetId(file, item.id);
+	} else {
+		getComposerAssetId(file);
+	}
+	item.id = getComposerAssetId(file);
+	return file;
 }
 
 /** Epoch millis for a record, tolerating v2 records that only have `updatedAt`. */
@@ -376,11 +427,15 @@ export async function loadDraftImageAttachments(
 	narratorId: string,
 ): Promise<LoadedDraftAttachments> {
 	const empty: LoadedDraftAttachments = { images: [], textFiles: [], droppedCount: 0 };
+	if (!userId || !narratorId) return empty;
 	const db = await openDraftImageAttachmentDb();
-	if (!db || !userId || !narratorId) return empty;
+	// Unreadable storage is not evidence that this owner has no stored draft.
+	// Callers must retain the old record rather than autosaving a partial cache.
+	if (!db) throw new Error("IndexedDB draft attachments storage unavailable");
 
 	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
-	const transaction = db.transaction(STORE_NAME, "readonly");
+	// Migrate legacy resource ids atomically with this read; never overwrite a newer record.
+	const transaction = db.transaction(STORE_NAME, "readwrite");
 	const store = transaction.objectStore(STORE_NAME);
 	const record = await requestToPromise<unknown>(store.get(draftKey));
 	if (!isDraftRecord(record)) return empty;
@@ -398,6 +453,11 @@ export async function loadDraftImageAttachments(
 
 	const rawImages = readEntryList(record.images);
 	const rawTextFiles = readEntryList(record.textFiles);
+	const originalIds = JSON.stringify(
+		[...rawImages, ...rawTextFiles].map((entry) =>
+			entry && typeof entry === "object" ? (entry as Partial<DraftAttachmentEntry>).id : null,
+		),
+	);
 	const images = rawImages
 		.map((entry, index) => entryToFile(entry, index, "image"))
 		.filter((file): file is File => file != null);
@@ -405,6 +465,17 @@ export async function loadDraftImageAttachments(
 		.map((entry, index) => entryToFile(entry, index, "text"))
 		.filter((file): file is File => file != null);
 
+	const migratedIds = JSON.stringify(
+		[...rawImages, ...rawTextFiles].map((entry) =>
+			entry && typeof entry === "object" ? (entry as Partial<DraftAttachmentEntry>).id : null,
+		),
+	);
+	if (originalIds !== migratedIds) {
+		// Preserve timestamp/budgets and unusable entries; only add ids to recoverable blobs.
+		const done = transactionDone(transaction);
+		store.put(record);
+		await done;
+	}
 	return {
 		images,
 		textFiles,

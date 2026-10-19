@@ -1995,12 +1995,15 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 describe("production preview API and actual local evidence", () => {
 	test("real Write -> human editor -> Edit -> late human produces a prepared HTTP plan without applying", async () => {
 		const path = join(workspace, "combined.txt");
+		// A two-character marker can occur inside an unrelated random metadata ID.
+		// Use a body sentinel longer than those IDs without weakening the leak check.
+		const lateHumanBody = "LATE_HUMAN_FILE_BODY_MUST_NOT_LEAK_IN_METADATA";
 		const original = "A0\n1\n2\n3\n4\nH0\n5\n6\n7\n8\nB0\n";
 		await writeFile(path, original);
 		await write(path, original.replace("A0", "A1"));
 		await human(path, (await readFile(path, "utf8")).replace("H0", "H1"));
 		await edit(path, "B0", "B1");
-		await human(path, (await readFile(path, "utf8")).replace("H1", "H2"));
+		await human(path, (await readFile(path, "utf8")).replace("H1", lateHumanBody));
 		const before = history();
 		const disk = await readFile(path);
 		const plan = await prepared();
@@ -2021,14 +2024,14 @@ describe("production preview API and actual local evidence", () => {
 		expect(page.hasMore).toBe(false);
 		expect(page.items).toHaveLength(1);
 		expect((await bytes(page.items[0].desiredStateJson)).toString()).toBe(
-			original.replace("H0", "H2"),
+			original.replace("H0", lateHumanBody),
 		);
 		expect(await bytes(page.items[0].expectedStateJson)).toEqual(disk);
 		expect(await readFile(path)).toEqual(disk);
 		expect(history()).toBe(before);
 		expect(raw).not.toContain("contentJson");
 		expect(raw).not.toContain("executionReceiptJson");
-		expect(raw).not.toContain("H2");
+		expect(raw).not.toContain(lateHumanBody);
 		const repeated = await prepared();
 		expect(repeated.id).toBe(plan.id);
 	});

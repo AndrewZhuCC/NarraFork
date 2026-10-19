@@ -356,13 +356,17 @@ describe("buildDiffHighlightPlan", () => {
 			"// short note\nconst value = 1;\nconst kept = 2;",
 		]);
 		// Removed rows read the old file; context and added rows read the new file.
+		// Context also names its old-file line, which is not the same index once
+		// the removed block comment occupies a line the new side does not have.
 		expect(plan?.rows).toEqual([
 			{ source: 0, line: 0 },
 			{ source: 1, line: 0 },
-			{ source: 1, line: 1 },
+			{ source: 1, line: 1, old: { source: 0, line: 1 } },
 			{ source: 0, line: 2 },
 			{ source: 1, line: 2 },
 		]);
+		expect(plan?.sources[0]?.split("\n")[1]).toBe("const value = 1;");
+		expect(plan?.sources[1]?.split("\n")[1]).toBe("const value = 1;");
 	});
 
 	it("points every row at its own content, whichever side it came from", () => {

@@ -2,6 +2,11 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
+	MAX_MODEL_CONTEXT_WINDOW,
+	MIN_MODEL_CONTEXT_WINDOW,
+	normalizeModelContextWindowOverrides,
+} from "@shared/model-context-window";
+import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -9,6 +14,7 @@ import {
 	MAX_RECORDING_REQUEST_BYTES,
 	MAX_RECORDING_RESPONSE_BYTES,
 	MIN_RECORDING_WINDOW_BYTES,
+	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
 } from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
@@ -25,6 +31,11 @@ import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
 } from "../lib/custom-api-quota-cache";
+import {
+	getDeepSeekBalanceGenerations,
+	refreshAllDeepSeekBalances,
+	syncDeepSeekBalanceCache,
+} from "../lib/deepseek-balance-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import {
@@ -37,6 +48,11 @@ import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
+import {
+	getOpencodeUsageGenerations,
+	refreshAllOpencodeUsages,
+	syncOpencodeUsageCache,
+} from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
@@ -59,8 +75,10 @@ import {
 	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	purgeStaleAgentModelRefs,
+	requestEvidenceFromLegacyAgent,
 	saveSettings,
 	settings,
+	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
@@ -225,6 +243,9 @@ const nugProviderSchema = z.object({
 });
 
 const geminiProviderSchema = z.object({
+	userAgentMode: userAgentModeSchema,
+	customUserAgent: customUserAgentSchema,
+	extraHeaders: extraHeadersSchema,
 	id: z.string().min(1),
 	name: z.string(),
 	prefix: z.string().min(1),
@@ -405,27 +426,6 @@ export const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				freshShellEnv: z.boolean(),
 				translateReasoning: z.boolean(),
-				requestDumpRecordingEnabled: z.boolean(),
-				requestDumpRequestBytes: z
-					.number()
-					.int()
-					.min(0)
-					.max(MAX_RECORDING_REQUEST_BYTES)
-					.refine(
-						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
-						"Use 0 to disable recording, or at least 1024 bytes",
-					),
-				requestDumpResponseBytes: z
-					.number()
-					.int()
-					.min(0)
-					.max(MAX_RECORDING_RESPONSE_BYTES)
-					.refine(
-						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
-						"Use 0 to disable recording, or at least 1024 bytes",
-					),
-				requestDumpEnabled: z.boolean(),
-				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				planModeAllowInlinePlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
@@ -497,7 +497,13 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.record(z.string(), z.number().int().min(256).max(10_000_000)),
+				modelContextWindows: z.preprocess(
+					normalizeModelContextWindowOverrides,
+					z.record(
+						z.string(),
+						z.number().int().min(MIN_MODEL_CONTEXT_WINDOW).max(MAX_MODEL_CONTEXT_WINDOW),
+					),
+				),
 				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
@@ -553,6 +559,31 @@ export const updateSettingsSchema = z
 					.optional(),
 				providerOrder: z.array(z.string()).max(50).optional(),
 				disabledProviders: z.array(z.string()).max(200).optional(),
+			})
+			.partial()
+			.optional(),
+		requestEvidence: z
+			.object({
+				ringEnabled: z.boolean(),
+				ringRequestBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_REQUEST_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				ringResponseBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_RESPONSE_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				autoPin: z.enum(REQUEST_EVIDENCE_AUTO_PIN_VALUES),
 			})
 			.partial()
 			.optional(),
@@ -708,7 +739,7 @@ export const updateSettingsSchema = z
 	})
 	.strict();
 
-function normalizeLegacySettingsPatch(body: unknown): unknown {
+export function normalizeLegacySettingsPatch(body: unknown): unknown {
 	if (!body || typeof body !== "object" || Array.isArray(body)) return body;
 	const draft = { ...(body as Record<string, unknown>) };
 	stripObsoleteSettingsKeys(draft);
@@ -726,6 +757,16 @@ function normalizeLegacySettingsPatch(body: unknown): unknown {
 			agent.dangerReflectionEnabled = agent.dangerReflectionLevel !== "off";
 		} else if ("dangerReflectionEnabled" in agent) {
 			agent.dangerReflectionLevel = agent.dangerReflectionEnabled === false ? "off" : "standard";
+		}
+		// Legacy clients still send `agent.requestDump*`; an explicit section wins.
+		const legacyEvidence = requestEvidenceFromLegacyAgent(agent);
+		if (legacyEvidence) {
+			const explicit =
+				draft.requestEvidence && typeof draft.requestEvidence === "object"
+					? (draft.requestEvidence as Record<string, unknown>)
+					: {};
+			draft.requestEvidence = { ...legacyEvidence, ...explicit };
+			stripLegacyRequestDumpKeys(agent);
 		}
 		draft.agent = agent;
 	}
@@ -866,6 +907,7 @@ async function buildSettingsResponse(
 		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
+		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -919,6 +961,10 @@ async function buildSettingsResponse(
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		kimiUsages: getAllKimiCachedUsages(),
+		// Opaque runtime tokens for the OpenCode Go usage cache. The panel compares
+		// them so an allowance fetched for a replaced account is never rendered
+		// under the new one.
+		opencodeUsageGenerations: getOpencodeUsageGenerations(),
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
@@ -1657,6 +1703,11 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		} else {
 			saveSettings(merged);
 		}
+		// Invalidate account/transport identities immediately after a successful save.
+		syncDeepSeekBalanceCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllDeepSeekBalances().catch(() => {});
+		}
 		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
 		// configs: new local-egress providers connect immediately, removed or
@@ -1681,6 +1732,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// settings response.
 		if (validated.customApiProviders) {
 			void refreshAllKimiUsages().catch(() => {});
+		}
+
+		// Invalidate account/transport identities immediately after a successful
+		// save, then warm the new ones so a freshly added (or replaced) OpenCode Go
+		// provider shows its allowance without waiting for the next staleness window.
+		syncOpencodeUsageCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllOpencodeUsages().catch(() => {});
 		}
 
 		if (vnetChanged) {

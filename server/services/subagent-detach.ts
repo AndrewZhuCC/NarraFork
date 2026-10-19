@@ -6,6 +6,7 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getSubagentType, parseTraits } from "../lib/narrator-utils";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
@@ -396,6 +397,7 @@ async function prepareDetachedBackgroundTask(
 				updatedAt: now,
 			})
 			.where(eq(narrators.id, subagentId));
+		backgroundOccupancyStore.refreshNarrator(subagentId);
 
 		// 4. Register alias if not already registered (foreground tasks may not have one yet).
 		let detachAlias: string;
@@ -475,6 +477,7 @@ async function restoreAttachedSubagentToBackground(
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, subagentId));
+	backgroundOccupancyStore.refreshNarrator(subagentId);
 	return true;
 }
 
@@ -579,6 +582,7 @@ export async function attachSubagent(
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, subagentId));
+	backgroundOccupancyStore.refreshNarrator(subagentId);
 
 	// 3. Create attach waiter — the running loop will resolve this when it completes.
 	const { promise, resolve } = Promise.withResolvers<{ finalText: string; hasError: boolean }>();

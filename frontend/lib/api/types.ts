@@ -9,6 +9,7 @@ import type { FileReference, FileReferenceContext } from "@shared/file-reference
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
+import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -18,6 +19,55 @@ export type ChangelogEntry = {
 	version: string;
 	date: string;
 } & LocalizedValue<string>;
+
+/**
+ * One OpenCode Go plan window (5-hour rolling / weekly / monthly) as cached by
+ * the server. `percent` is how much of the window is already USED; the status bar
+ * converts it to the "remaining" convention the other quota indicators use.
+ */
+export interface OpencodeUsageWindow {
+	status: "ok" | "rate-limited" | null;
+	percent: number | null;
+	/** ISO timestamp when the window refills. The windows are not calendar periods. */
+	resetsAt: string | null;
+}
+
+/**
+ * Per-provider OpenCode Go usage cache entry.
+ *
+ * `GET /api/opencode/usages` is readable by any signed-in user, but the upstream error text
+ * is not: it describes the deployment's own provider account rather than the requesting
+ * user's allowance, so the server sends `error` only to admins and everyone else gets
+ * `hasError`. Both fields are optional here because a given response carries exactly one of
+ * them — read them through `opencodeUsageFailed()` rather than testing `error` directly, or a
+ * non-admin's failed fetch reads as a successful one whose numbers are merely stale.
+ */
+export interface OpencodeUsageCache {
+	rolling: OpencodeUsageWindow | null;
+	weekly: OpencodeUsageWindow | null;
+	monthly: OpencodeUsageWindow | null;
+	generation: string;
+	fetchedAt: number;
+	/** Admin-only: the upstream failure text. Absent for non-admins. */
+	error?: string | null;
+	/** Non-admin substitute for `error`: that it failed, without saying how. */
+	hasError?: boolean;
+}
+
+/** Per-provider official DeepSeek balance; errors are redacted for non-admins. */
+export interface DeepSeekBalanceCache {
+	generation: string;
+	isAvailable: boolean | null;
+	balanceInfos: Array<{
+		currency: string;
+		totalBalance: string;
+		grantedBalance: string;
+		toppedUpBalance: string;
+	}>;
+	fetchedAt: number;
+	error?: string | null;
+	hasError?: boolean;
+}
 
 /** One Kimi usage window (5-hour / weekly / monthly) as cached by the server. */
 export interface KimiUsageWindow {
@@ -177,8 +227,12 @@ export interface SearchResponse {
 export interface StorageCategoryResult {
 	key: string;
 	sizeBytes: number;
+	truncated?: boolean;
+	unavailable?: { backend: string; reason: string };
 	details?: Record<string, unknown>;
 }
+
+export type { StorageCategoryKey };
 
 export interface StorageScanResult {
 	categories: StorageCategoryResult[];
@@ -192,11 +246,23 @@ export interface StorageScanResult {
  */
 export type StorageScanJobStatus = "idle" | "running" | "complete" | "error" | "cancelled";
 
+export interface StorageCategoryJobState {
+	key: StorageCategoryKey;
+	status: StorageScanJobStatus;
+	progressMessage: string | null;
+	progressDetail: { done: number; total: number | null } | null;
+	result: StorageCategoryResult | null;
+	error: string | null;
+	startedAt: number | null;
+	finishedAt: number | null;
+}
+
 export interface StorageScanJobState {
 	status: StorageScanJobStatus;
 	progressMessage: string | null;
-	progressDetail: { done: number; total: number } | null;
+	progressDetail: { done: number; total: number | null } | null;
 	categories: StorageCategoryResult[];
+	categoryJobs: StorageCategoryJobState[];
 	result: StorageScanResult | null;
 	error: string | null;
 	startedAt: number | null;
@@ -270,7 +336,6 @@ export interface DatabaseStorageBreakdown {
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
-		apiRequestDumps: DatabaseCleanupCandidateSummary;
 		/**
 		 * Aged tool-call input/output payloads. Clears the columns and KEEPS the rows —
 		 * they carry the tree hashes that file-history revert depends on.
@@ -279,11 +344,7 @@ export interface DatabaseStorageBreakdown {
 	};
 }
 
-export type DatabaseCleanupTarget =
-	| "archivedSessions"
-	| "staleSessions"
-	| "apiRequestDumps"
-	| "toolCallPayloads";
+export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
 	| "chapterBound"
@@ -313,7 +374,6 @@ export interface DatabaseCleanupPreviewCounts {
 	messages: number;
 	toolCalls: number;
 	apiRequests: number;
-	dumpsCleared: number;
 }
 
 export interface DatabaseCleanupNarratorSample extends FallbackDiagnostics {

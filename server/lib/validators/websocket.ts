@@ -44,11 +44,12 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			narratorId: z.string().min(1).max(128).optional(),
 			chapterId: z.string().min(1).max(128).optional(),
 			workspaceKey: z.string().min(1).max(128).optional(),
+			view: z.enum(["summary", "details"]).optional(),
 		})
 		.strict(),
 	z
 		.object({
-			type: z.literal("git_workspace_unsubscribe"),
+			type: z.enum(["git_workspace_unsubscribe", "git_workspace_refresh"]),
 			subscriptionId: z.string().min(1).max(128),
 		})
 		.strict(),

@@ -9,11 +9,11 @@ import { createReleaseRoutes } from "../update-server/routes/releases";
 import type { StorageBackend } from "../update-server/storage/types";
 import type { ReleaseMeta, ZstdPatchMeta } from "../update-server/types";
 
-test("production HTTP entry allows bounded full release uploads above 128 MiB", () => {
+test("production HTTP entry admits bounded streaming patches up to 512 MiB", () => {
 	// app.request bypasses Bun.serve admission, so route tests alone cannot catch
-	// an entry-point limit that rejects full binaries before authentication/routes.
+	// an entry-point limit that rejects canonical patches before streaming validation.
 	const entry = readFileSync(new URL("../update-server/index.ts", import.meta.url), "utf8");
-	expect(entry).toMatch(/Bun\.serve\(\{[\s\S]*?maxRequestBodySize:\s*256\s*\*\s*1024\s*\*\s*1024/);
+	expect(entry).toMatch(/Bun\.serve\(\{[\s\S]*?maxRequestBodySize:\s*512\s*\*\s*1024\s*\*\s*1024/);
 });
 
 class MemoryStorage implements StorageBackend {
@@ -169,10 +169,10 @@ test("release upload route keeps published platform identities immutable", async
 		const oldSha = createHash("sha512").update(oldBinary).digest("base64");
 		const newBinary = Buffer.alloc(120, 0x62);
 		const newSha = createHash("sha512").update(newBinary).digest("base64");
-		const initial = await upload(
-			adminToken as string,
-			makeUploadForm("0.5.11", oldSha, makePatchMeta(oldSha)),
-		);
+		const initialForm = makeUploadForm("0.5.11", oldSha, makePatchMeta(oldSha));
+		initialForm.delete("zstdPatch");
+		initialForm.delete("zstdPatchMeta");
+		const initial = await upload(adminToken as string, initialForm);
 		expect(initial.status).toBe(200);
 		await storage.saveFile(binaryPath, oldBinary);
 
@@ -180,35 +180,35 @@ test("release upload route keeps published platform identities immutable", async
 			uploadToken,
 			makeUploadForm("0.5.11", oldSha, makePatchMeta(oldSha)),
 		);
-		expect(sameIdentityRetry.status).toBe(200);
+		expect(sameIdentityRetry.status).toBe(410);
 
 		const publishedSnapshot = snapshotFiles(storage, releasePath);
 		const defaultImmutable = await upload(
 			adminToken as string,
 			makeUploadForm("0.5.11", newSha, makePatchMeta(newSha)),
 		);
-		expect(defaultImmutable.status).toBe(409);
+		expect(defaultImmutable.status).toBe(410);
 		expect(snapshotFiles(storage, releasePath)).toEqual(publishedSnapshot);
 
 		const ignoredUploaderOverride = await upload(
 			uploadToken,
 			makeUploadForm("0.5.11", newSha, makePatchMeta(newSha), true),
 		);
-		expect(ignoredUploaderOverride.status).toBe(409);
+		expect(ignoredUploaderOverride.status).toBe(410);
 		expect(snapshotFiles(storage, releasePath)).toEqual(publishedSnapshot);
 
 		const ignoredAdminDeltaOverride = await upload(
 			adminToken as string,
 			makeUploadForm("0.5.11", newSha, makePatchMeta(newSha), true),
 		);
-		expect(ignoredAdminDeltaOverride.status).toBe(409);
+		expect(ignoredAdminDeltaOverride.status).toBe(410);
 		expect(snapshotFiles(storage, releasePath)).toEqual(publishedSnapshot);
 
 		const ignoredAdminFullOverride = await upload(
 			adminToken as string,
 			makeFullUploadForm("0.5.11", newBinary, makePatchMeta(newSha), true),
 		);
-		expect(ignoredAdminFullOverride.status).toBe(409);
+		expect(ignoredAdminFullOverride.status).toBe(410);
 		expect(snapshotFiles(storage, releasePath)).toEqual(publishedSnapshot);
 
 		const invalidSourceMeta = makePatchMeta("target-c", {
@@ -219,7 +219,7 @@ test("release upload route keeps published platform identities immutable", async
 			adminToken as string,
 			makeUploadForm("0.5.12", "target-c", invalidSourceMeta),
 		);
-		expect(invalidSource.status).toBe(400);
+		expect(invalidSource.status).toBe(410);
 		expect(await storage.fileExists(`products/${product}/releases/0.5.12/meta.json`)).toBe(false);
 	} finally {
 		rmSync(configDirectory, { recursive: true, force: true });

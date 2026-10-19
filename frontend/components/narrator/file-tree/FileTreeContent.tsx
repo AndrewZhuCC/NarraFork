@@ -67,6 +67,7 @@ export interface FileTreeContentProps {
 	onToggleShowHidden?: () => void;
 	/** File figures plus pre-aggregated directory figures, keyed by tree-relative path. */
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
+	changedPaths?: ReadonlySet<string>;
 	/** Git returned only a bounded prefix, so directory totals are lower bounds. */
 	lineStatsTruncated?: boolean;
 	/** Refresh the Git figures alongside a manual directory refresh. */
@@ -119,6 +120,7 @@ export function FileTreeContent({
 	showHidden,
 	onToggleShowHidden,
 	lineStats,
+	changedPaths,
 	lineStatsTruncated = false,
 	onRefreshLineStats,
 	onOpenFile,
@@ -173,13 +175,14 @@ export function FileTreeContent({
 				root={root}
 				loading={loading}
 				errors={errors}
+				changedPaths={changedPaths}
 				lineStats={lineStats}
 				lineStatsTruncated={lineStatsTruncated}
 				onOpenFile={onOpenFile}
 				onReload={reload}
 			/>
 		),
-		[errors, lineStats, lineStatsTruncated, loading, onOpenFile, reload, root],
+		[changedPaths, errors, lineStats, lineStatsTruncated, loading, onOpenFile, reload, root],
 	);
 	const refreshAll = useCallback(() => {
 		reloadAll();
@@ -274,6 +277,7 @@ interface FileTreeRowProps {
 	loading: ReadonlySet<string>;
 	errors: ReadonlyMap<string, string>;
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
+	changedPaths?: ReadonlySet<string>;
 	lineStatsTruncated: boolean;
 	onOpenFile: (absolutePath: string, fileName: string) => void;
 	onReload: (dir: string) => Promise<void>;
@@ -285,6 +289,7 @@ function FileTreeRow({
 	loading,
 	errors,
 	lineStats,
+	changedPaths,
 	lineStatsTruncated,
 	onOpenFile,
 	onReload,
@@ -310,6 +315,7 @@ function FileTreeRow({
 
 	const isLoading = loading.has(entry.path);
 	const error = errors.get(entry.path);
+	const changed = changedPaths?.has(entry.path);
 	const stats = lineStats?.get(entry.path);
 	const hasStats = !!stats && (stats.added > 0 || stats.removed > 0);
 	const statsAreLowerBound = entry.isDirectory && lineStatsTruncated;
@@ -350,6 +356,9 @@ function FileTreeRow({
 			)}
 			<Text
 				size="sm"
+				c={changed ? "yellow" : undefined}
+				title={changed ? t("fileTree.gitChanged") : undefined}
+				data-git-changed={changed || undefined}
 				truncate
 				style={{
 					flex: 1,

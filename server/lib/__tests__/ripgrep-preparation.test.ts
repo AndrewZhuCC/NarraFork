@@ -100,11 +100,12 @@ function grep(signal: AbortSignal) {
 	};
 	return new Backend().grep(params);
 }
-function switchSource() {
+function switchSource(repository?: string) {
 	settings.update = {
 		...(settings.update ?? DEFAULT_UPDATE_SETTINGS),
 		source: "update-server",
 		serverUrl: "https://personal.example",
+		...(repository ? { githubRepository: repository } : {}),
 	};
 }
 beforeEach(async () => {
@@ -172,22 +173,42 @@ describe("ripgrep preparation operation boundaries", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls.every((url) => url.startsWith("https://github.com/fork/repo/"))).toBe(true);
 	});
-	test("an awaited GitHub manifest cannot resume preparation against a newly selected personal server", async () => {
+	test.each([
+		["delivery only", undefined],
+		["canonical repository", "other/repo"],
+	] as const)("an awaited GitHub manifest respects a %s change", async (_change, repository) => {
 		const response = deferred<Response>();
 		const started = deferred<void>();
-		useRoutes(async () => {
+		useRoutes(async (url) => {
+			if (!url.endsWith(".json")) return new Response(nativeBinary);
 			started.resolve();
 			return response.promise;
 		});
+		subprocess.mockImplementation((() => ({
+			exited: Promise.resolve(0),
+		})) as unknown as typeof Bun.spawn);
 		const result = resolver();
 		await started.promise;
-		switchSource();
+		switchSource(repository);
 		response.resolve(Response.json(catalog()));
-		expect(await result).toBeNull();
-		expect(calls).toHaveLength(1);
-		expect(calls[0]).toContain("github.com/fork/repo/releases/download/helpers-v1.0.0/");
+		const path = await result;
+		if (repository) {
+			expect(path).toBeNull();
+			expect(calls).toHaveLength(1);
+			expect(subprocess).not.toHaveBeenCalled();
+		} else {
+			expect(path).not.toBeNull();
+			if (!path) throw new Error("Same-repository helper must remain ready");
+			expect(fs.readFileSync(path)).toEqual(nativeBinary);
+			expect(calls).toHaveLength(2);
+			expect(subprocess).toHaveBeenCalledTimes(1);
+		}
+		expect(
+			calls.every((url) =>
+				url.startsWith(`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/`),
+			),
+		).toBe(true);
 		expect(calls.some((url) => url.includes("personal.example"))).toBe(false);
-		expect(subprocess).not.toHaveBeenCalled();
 	});
 	test("an already canceled Grep starts no helper fetch or fallback process", async () => {
 		const controller = new AbortController();
@@ -252,14 +273,34 @@ describe("ripgrep preparation operation boundaries", () => {
 			expect(probeSignal.aborted).toBe(true);
 			expect(subprocess).toHaveBeenCalledTimes(1);
 		});
-		test(`${cached ? "cached" : "downloaded"} version probe cannot return a stale source's ready path`, async () => {
-			if (cached) expect(await downloadHelperBinary(spec)).not.toBeNull();
+		test.each([
+			["delivery only", undefined],
+			["canonical repository", "other/repo"],
+		] as const)(`${cached ? "cached" : "downloaded"} version probe respects a %s change`, async (_change, repository) => {
+			const cachedPath = cached ? await downloadHelperBinary(spec) : null;
+			if (cached) expect(cachedPath).not.toBeNull();
 			const probe = pendingProbe();
 			const result = resolver();
 			await probe.started;
-			switchSource();
+			switchSource(repository);
 			probe.complete(0);
-			expect(await result).toBeNull();
+			const path = await result;
+			if (repository) expect(path).toBeNull();
+			else {
+				expect(path).not.toBeNull();
+				if (!path) throw new Error("Same-repository helper must remain ready");
+				expect(fs.readFileSync(path)).toEqual(nativeBinary);
+				if (cached) {
+					if (!cachedPath) throw new Error("Verified cache fixture must have a path");
+					expect(path).toBe(cachedPath);
+				}
+			}
+			expect(calls).toHaveLength(2);
+			expect(
+				calls.every((url) =>
+					url.startsWith(`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/`),
+				),
+			).toBe(true);
 			expect(calls.some((url) => url.includes("personal.example"))).toBe(false);
 			expect(subprocess).toHaveBeenCalledTimes(1);
 		});

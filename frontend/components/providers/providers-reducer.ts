@@ -1,3 +1,4 @@
+import { isValidModelContextWindow } from "@shared/model-context-window";
 import { useCallback, useMemo } from "react";
 import type { NUGProviderState } from "./NUGProvidersSection";
 import type {
@@ -466,7 +467,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			const merged = { ...state.modelContextWindows };
 			let changed = false;
 			for (const [key, value] of Object.entries(action.windows)) {
-				if (!(key in merged)) {
+				if (isValidModelContextWindow(value) && !(key in merged)) {
 					merged[key] = value;
 					changed = true;
 				}

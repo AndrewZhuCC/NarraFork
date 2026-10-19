@@ -304,6 +304,12 @@ async function renderBadge(
 		},
 	});
 	queryClient.setQueryData(["gitStatus", chapterId], statusOverride ?? makeStatus(path));
+	queryClient.setQueryData(["gitLineStats", chapterId], {
+		files: [],
+		linesAdded: 0,
+		linesRemoved: 0,
+		complete: false,
+	});
 	queryClient.setQueryData(["gitModifications", chapterId, "uncommitted"], modifications);
 
 	const container = document.createElement("div");
@@ -357,7 +363,7 @@ async function hoverAttribution(container: HTMLElement): Promise<string> {
 	target.dispatchEvent(new Event("mouseover", { bubbles: true }));
 	await new Promise((resolve) => setTimeout(resolve, 180));
 	await flushRender();
-	return document.body.textContent ?? "";
+	return document.querySelector(".mantine-HoverCard-dropdown")?.textContent ?? "";
 }
 
 describe("GitChangesTab attribution hover card", () => {

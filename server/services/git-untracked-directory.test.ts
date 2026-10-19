@@ -18,12 +18,16 @@
  * git's own listing semantics — a mocked `execRead` would just assert that we
  * pass a flag, not that the flag does what we believe.
  */
-import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GitError, UnbornHeadError } from "../lib/errors";
+import { logger } from "../lib/logger";
+import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
 import { gitService } from "./git-service";
+import { getStatusSummaryCached } from "./git-status-cache";
 
 // Windows' first `safeSpawn` performs the one-time inheritable-handle scan. On a
 // busy machine that alone can exceed Bun's 5-second default test timeout; killing
@@ -110,7 +114,7 @@ describe("untracked directories are expanded to files", () => {
 		expect(summary.totalFiles).toBe(3);
 	});
 
-	test("scopes paths and line counts to a narrator cwd below the repository root", async () => {
+	test("scopes lightweight paths to a narrator cwd below the repository root", async () => {
 		const repo = await makeRepo();
 		const subdir = join(repo, "sub");
 		mkdirSync(subdir);
@@ -127,15 +131,18 @@ describe("untracked directories are expanded to files", () => {
 		const paths = summary.files.map((file) => file.path).sort();
 
 		expect(paths).toEqual(["inside.txt", "new.txt"]);
-		expect(summary.files.find((file) => file.path === "inside.txt")).toMatchObject({
-			linesAdded: 1,
-			linesRemoved: 0,
+		expect(summary.files.find((file) => file.path === "inside.txt")).toEqual({
+			status: " M",
+			path: "inside.txt",
 		});
-		expect(summary.files.find((file) => file.path === "new.txt")).toMatchObject({
-			linesAdded: 2,
-			linesRemoved: 0,
+		expect(summary.files.find((file) => file.path === "new.txt")).toEqual({
+			status: "??",
+			path: "new.txt",
 		});
+		expect(summary.linesAdded).toBeUndefined();
+		expect(summary.linesRemoved).toBeUndefined();
 		expect(summary.totalFiles).toBe(2);
+		expect(summary.totalFilesExact).toBe(true);
 	});
 
 	test("a nested directory sharing the cwd name keeps its correct relative path", async () => {
@@ -148,14 +155,229 @@ describe("untracked directories are expanded to files", () => {
 		const summary = await gitService.getStatusSummary(subdir);
 		const paths = summary.files.map((file) => file.path).sort();
 
-		// `ls-files --others` already reports paths relative to the cwd; stripping the
-		// repo prefix off them would turn `sub/x.txt` into the nonexistent `x.txt`,
-		// dropping its line count and mismatching the status entry's key.
+		// Porcelain paths are root-relative; remove the cwd prefix exactly once.
 		expect(paths).toEqual(["sub/x.txt", "y.txt"]);
-		expect(summary.files.find((file) => file.path === "sub/x.txt")).toMatchObject({
-			linesAdded: 2,
-			linesRemoved: 0,
+		expect(summary.files.find((file) => file.path === "sub/x.txt")).toEqual({
+			status: "??",
+			path: "sub/x.txt",
 		});
+	});
+
+	test("cache and direct readers share real status processes and fresh overrides bypass settled results", async () => {
+		const repo = await makeRepo();
+		writeNested(repo);
+		const spawnSpy = spyOn(Bun, "spawn");
+		const statusCalls = () =>
+			spawnSpy.mock.calls.filter(([cmd]) => Array.isArray(cmd) && cmd.includes("status")).length;
+		try {
+			const results = await Promise.all(
+				Array.from({ length: 12 }, (_, index) =>
+					index % 2 ? gitService.getStatusSummary(repo) : getStatusSummaryCached(repo),
+				),
+			);
+			expect(statusCalls()).toBe(1);
+			for (const summary of results) expect(summary.totalFiles).toBe(3);
+			await getStatusSummaryCached(repo);
+			expect(statusCalls()).toBe(1);
+			writeFileSync(join(repo, "another.txt"), "new\n");
+			expect((await gitService.getStatusSummary(repo)).totalFiles).toBe(3);
+			expect(statusCalls()).toBe(1);
+			expect((await gitService.getStatusSummary(repo, { ttlMs: 0 })).totalFiles).toBe(4);
+			expect(statusCalls()).toBe(2);
+		} finally {
+			spawnSpy.mockRestore();
+		}
+	});
+
+	test("a failed status waits for cancelled sibling subprocesses to finish", async () => {
+		const repo = await makeRepo();
+		const started = Promise.withResolvers<void>();
+		const aborted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let metadataCount = 0;
+		let abortCount = 0;
+		let settled = false;
+		const spawnSpy = spyOn(spawn, "safeSpawn").mockImplementation(async (options) => {
+			if (options.cmd.includes("status")) {
+				await started.promise;
+				throw new Error("status process failed");
+			}
+			metadataCount++;
+			options.signal?.addEventListener(
+				"abort",
+				() => {
+					if (++abortCount === 3) aborted.resolve();
+				},
+				{ once: true },
+			);
+			if (metadataCount === 3) started.resolve();
+			await release.promise;
+			return { stdout: "", stderr: "", exitCode: 143 };
+		});
+		const query = gitService.getStatusSummary(repo).then(
+			() => {
+				settled = true;
+				return undefined;
+			},
+			(error: unknown) => {
+				settled = true;
+				return error;
+			},
+		);
+		try {
+			await aborted.promise;
+			expect(abortCount).toBe(3);
+			expect(settled).toBe(false);
+			release.resolve();
+			expect(await query).toEqual(new Error("status process failed"));
+		} finally {
+			release.resolve();
+			await query;
+			spawnSpy.mockRestore();
+		}
+	});
+
+	test("summary launches only status and metadata and never reads file contents", async () => {
+		const repo = await makeRepo();
+		writeNested(repo);
+		const commands: string[][] = [];
+		const originalSpawn = spawn.safeSpawn;
+		const spawnSpy = spyOn(spawn, "safeSpawn").mockImplementation((options) => {
+			commands.push(options.cmd);
+			return originalSpawn(options);
+		});
+		const readSpy = spyOn(Bun, "file").mockImplementation(() => {
+			throw new Error("Status must not read file contents");
+		});
+		try {
+			const summary = await gitService.getStatusSummary(repo);
+			expect(summary.totalFiles).toBe(3);
+			expect(readSpy).not.toHaveBeenCalled();
+			expect(commands).toHaveLength(4);
+			for (const cmd of commands) {
+				expect(
+					cmd.includes("status") || cmd.includes("rev-parse") || cmd.includes("symbolic-ref"),
+				).toBe(true);
+				expect(cmd).not.toContain("diff");
+				expect(cmd).not.toContain("ls-files");
+				expect(cmd).not.toContain("--numstat");
+			}
+		} finally {
+			spawnSpy.mockRestore();
+			readSpy.mockRestore();
+		}
+	});
+
+	test("unborn repositories preserve branch and staged/untracked status without line counts", async () => {
+		const repo = mkdtempSync(join(tmpdir(), "nf-unborn-status-"));
+		tempDirs.push(repo);
+		await git(["init", "-q", "-b", "fresh"], repo);
+		writeFileSync(join(repo, "staged.txt"), "staged\n");
+		writeFileSync(join(repo, "untracked.txt"), "untracked\n");
+		await git(["add", "staged.txt"], repo);
+		const summary = await gitService.getStatusSummary(repo);
+		expect(summary).toMatchObject({
+			headSha: "",
+			branch: "fresh",
+			staged: 1,
+			untracked: 1,
+			totalFilesExact: true,
+		});
+		expect(summary.files).toEqual([
+			{ status: "A ", path: "staged.txt" },
+			{ status: "??", path: "untracked.txt" },
+		]);
+		const errors = spyOn(logger, "error");
+		try {
+			expect(await gitService.getCurrentBranch(repo)).toBe("fresh");
+			await expect(gitService.getHeadCommit(repo)).rejects.toBeInstanceOf(UnbornHeadError);
+			expect(errors.mock.calls.some((call) => call[0] === "git command failed")).toBe(false);
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
+	test("a directory that is not a git repository is not an unborn HEAD", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nf-not-a-repo-"));
+		tempDirs.push(dir);
+		const errors = spyOn(logger, "error");
+		const assertGitFailure = async (run: Promise<unknown>) => {
+			const error = await run.then(
+				() => {
+					throw new Error("expected a git failure");
+				},
+				(caught: unknown) => caught,
+			);
+			expect(error).toBeInstanceOf(GitError);
+			expect(error).not.toBeInstanceOf(UnbornHeadError);
+		};
+		try {
+			await assertGitFailure(gitService.getHeadCommit(dir));
+			await assertGitFailure(gitService.getCurrentBranch(dir));
+			expect(errors.mock.calls.filter((call) => call[0] === "git command failed")).toHaveLength(2);
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
+	test("subdirectory renames preserve both paths including UTF-8 and whitespace", async () => {
+		const repo = await makeRepo();
+		const subdir = join(repo, "sub");
+		mkdirSync(subdir);
+		writeFileSync(join(subdir, "旧 文件.txt"), "base\n");
+		await git(["add", "."], repo);
+		await git(["commit", "-q", "-m", "rename base"], repo);
+		await git(["mv", "旧 文件.txt", "新 文件.txt"], subdir);
+		const summary = await gitService.getStatusSummary(subdir);
+		expect(summary.files).toEqual([{ status: "R ", path: "新 文件.txt", oldPath: "旧 文件.txt" }]);
+		expect(summary.totalFilesExact).toBe(true);
+	});
+
+	test("detached HEAD still reports HEAD and a commit SHA", async () => {
+		const repo = await makeRepo();
+		await git(["checkout", "--detach", "-q"], repo);
+		const summary = await gitService.getStatusSummary(repo);
+		expect(summary.branch).toBe("HEAD");
+		expect(summary.headSha).toMatch(/^[0-9a-f]{40}$/);
+		expect(await gitService.getCurrentBranch(repo)).toBe("HEAD");
+		expect(await gitService.getHeadCommit(repo)).toBe(summary.headSha);
+		expect(summary.hasChanges).toBe(false);
+		expect(summary.totalFilesExact).toBe(true);
+	});
+
+	test("details truncate at 200 while an exhaustive total remains exact", async () => {
+		const repo = await makeRepo();
+		for (let index = 0; index < 205; index++) writeFileSync(join(repo, `file-${index}`), "x\n");
+		const summary = await gitService.getStatusSummary(repo);
+		expect(summary.files).toHaveLength(200);
+		expect(summary.totalFiles).toBe(205);
+		expect(summary.untracked).toBe(205);
+		expect(summary.truncated).toBe(true);
+		expect(summary.totalFilesExact).toBe(true);
+	});
+
+	test("scan budget stops at 10000 files and exposes a lower bound", async () => {
+		const repo = await makeRepo();
+		for (let index = 0; index < 10005; index++) writeFileSync(join(repo, `file-${index}`), "x\n");
+		const summary = await gitService.getStatusSummary(repo);
+		expect(summary.files).toHaveLength(200);
+		expect(summary.totalFiles).toBe(10000);
+		expect(summary.truncated).toBe(true);
+		expect(summary.totalFilesExact).toBe(false);
+	});
+
+	test("real merge conflicts retain their porcelain status", async () => {
+		const repo = await makeRepo();
+		await git(["checkout", "-q", "-b", "side"], repo);
+		writeFileSync(join(repo, "tracked.txt"), "side\n");
+		await git(["commit", "-qam", "side"], repo);
+		await git(["checkout", "-q", "main"], repo);
+		writeFileSync(join(repo, "tracked.txt"), "main\n");
+		await git(["commit", "-qam", "main"], repo);
+		await git(["merge", "side"], repo);
+		const summary = await gitService.getStatusSummary(repo);
+		expect(summary.files).toEqual([{ status: "UU", path: "tracked.txt" }]);
+		expect(summary.totalFilesExact).toBe(true);
 	});
 
 	test("still honours .gitignore, so expansion cannot leak ignored output", async () => {

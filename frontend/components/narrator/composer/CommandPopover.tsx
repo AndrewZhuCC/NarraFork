@@ -93,6 +93,7 @@ export function CommandPopover({
 	visible,
 	onSelect,
 	onClose,
+	anchorRef,
 }: CommandPopoverProps) {
 	const { t } = useTranslation("narrator");
 	const computedScheme = useComputedColorScheme("dark");
@@ -141,6 +142,12 @@ export function CommandPopover({
 	const handleKeyDown = useCallback(
 		(e: KeyboardEvent) => {
 			if (!visible || visibleCommands.length === 0) return;
+			const anchor = anchorRef?.current;
+			if (
+				anchorRef &&
+				(!anchor || !e.target || !(e.target as Node).nodeType || !anchor.contains(e.target as Node))
+			)
+				return;
 
 			// The listener is capture-phase, so it sees the keystroke before the IME
 			// candidate list does. While a CJK query is being composed, Enter/Tab pick
@@ -177,15 +184,16 @@ export function CommandPopover({
 				onSelect(visibleCommands[selectedIndex]);
 			}
 		},
-		[visible, visibleCommands, selectedIndex, onSelect, onClose, query],
+		[visible, visibleCommands, selectedIndex, onSelect, onClose, query, anchorRef],
 	);
 
 	useEffect(() => {
 		if (visible) {
-			document.addEventListener("keydown", handleKeyDown, true);
-			return () => document.removeEventListener("keydown", handleKeyDown, true);
+			const doc = anchorRef?.current?.ownerDocument ?? document;
+			doc.addEventListener("keydown", handleKeyDown, true);
+			return () => doc.removeEventListener("keydown", handleKeyDown, true);
 		}
-	}, [visible, handleKeyDown]);
+	}, [visible, handleKeyDown, anchorRef]);
 
 	if (!visible || visibleCommands.length === 0) return null;
 
@@ -210,6 +218,8 @@ export function CommandPopover({
 				<UnstyledButton
 					key={`${cmd.type}-${cmd.name}`}
 					data-command-item
+					onPointerDown={(event) => event.preventDefault()}
+					onMouseDown={(event) => event.preventDefault()}
 					onClick={() => onSelect(cmd)}
 					onMouseEnter={() => setSelectedIndex(i)}
 					style={{

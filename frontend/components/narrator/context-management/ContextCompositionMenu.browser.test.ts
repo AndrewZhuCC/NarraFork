@@ -170,8 +170,8 @@ const data: ContextComposition = {
 					await page.keyboard.press("Enter");
 					await page.waitForSelector('[role="status"]', { visible: true, timeout: 5000 });
 					const selection = await page.$eval('[role="status"]', (node) => node.textContent);
-					expect(selection).toContain("≈100K");
-					expect(selection).toContain(
+					expect(selection).toContain("≈100K · 25.0%");
+					expect(selection).not.toContain(
 						language === "zh-CN" ? "并非各分类的实测 token" : "not measured per category",
 					);
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });
@@ -217,7 +217,6 @@ const data: ContextComposition = {
 								source,
 								occupiedTokens: tokens,
 								percentage,
-								inputCharacters: { totalChars: 4000, systemChars: 100, toolsChars: 0 },
 							},
 						);
 						await page.waitForFunction(
@@ -227,7 +226,7 @@ const data: ContextComposition = {
 							{},
 							label,
 						);
-						const calibratedBar = await page.$eval(
+						const compositionBar = await page.$eval(
 							'[data-testid="context-composition-bar"]',
 							(bar) => {
 								const buttons = Array.from(bar.querySelectorAll("button"));
@@ -245,17 +244,17 @@ const data: ContextComposition = {
 								};
 							},
 						);
-						expect(calibratedBar.firstTokens).toContain(
+						expect(compositionBar.firstTokens).toContain(
 							source === "upstream"
-								? "≈23.2K · 2.5%"
+								? "≈231.5K · 25.0%"
 								: source === "usage"
-									? "≈12.8K · 2.5%"
-									: "≈10K · 2.5%",
+									? "≈127.7K · 25.0%"
+									: "≈100K · 25.0%",
 						);
-						expect(calibratedBar.firstWidth).toBeCloseTo(0.025, 3);
-						expect(calibratedBar.filled).toBeCloseTo(0.1, 3);
-						expect(calibratedBar.background).not.toBe("rgba(0, 0, 0, 0)");
-						expect(calibratedBar.noMore).toBe(true);
+						expect(compositionBar.firstWidth).toBeCloseTo(0.25, 3);
+						expect(compositionBar.filled).toBeCloseTo(1, 3);
+						expect(compositionBar.background).not.toBe("rgba(0, 0, 0, 0)");
+						expect(compositionBar.noMore).toBe(true);
 						expect(await page.evaluate(() => document.body.innerText.match(/~/g)?.length)).toBe(1);
 					}
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });

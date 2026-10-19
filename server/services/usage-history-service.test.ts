@@ -80,6 +80,66 @@ test("reference cost coverage survives detail, totals, series and breakdown with
 	).toMatchObject({ costStatus: "partial", partialRequestCount: 1 });
 });
 
+test("preserves normalized OpenAI input and cache buckets in history and aggregates", async () => {
+	db.insert(apiRequests)
+		.values([
+			{
+				id: "openai-mixed-cache",
+				createdAt,
+				provider: "openai",
+				inputTokens: 200,
+				outputTokens: 30,
+				cachedInputTokens: 800,
+				cacheCreationInputTokens: 600,
+				reasoningTokens: 10,
+			},
+			{
+				id: "openai-fully-cached",
+				createdAt,
+				provider: "openai",
+				inputTokens: 0,
+				outputTokens: 20,
+				cachedInputTokens: 400,
+			},
+		])
+		.run();
+	const filters = { provider: "openai" };
+	for (const records of [
+		(await service.listUsageHistory(filters)).records,
+		(await service.listUsageHistoryCursor(filters)).records,
+	]) {
+		expect(records.find((record) => record.id === "openai-mixed-cache")).toMatchObject({
+			inputTokens: 200,
+			cachedInputTokens: 800,
+			cacheCreationInputTokens: 600,
+		});
+		expect(records.find((record) => record.id === "openai-fully-cached")).toMatchObject({
+			inputTokens: 0,
+			cachedInputTokens: 400,
+		});
+	}
+	expect(await service.getUsageRecord("openai-mixed-cache")).toMatchObject({
+		inputTokens: 200,
+		cachedInputTokens: 800,
+	});
+	const expectedTotals = {
+		totalInputTokens: 200,
+		totalOutputTokens: 50,
+		totalCacheReadTokens: 1200,
+		totalCacheCreationTokens: 600,
+		totalReasoningTokens: 10,
+		totalTokens: 2050,
+	};
+	expect(await service.getUsageStats(filters)).toMatchObject(expectedTotals);
+	const series = await service.getUsageTimeSeries({
+		...filters,
+		startDate: "2026-07-17T00:00:00.000Z",
+		endDate: "2026-07-17T23:59:59.999Z",
+	});
+	expect(series.points).toHaveLength(1);
+	expect(series.points[0]).toMatchObject(expectedTotals);
+});
+
 function seedUsers() {
 	db.insert(users)
 		.values([

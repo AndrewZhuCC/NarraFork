@@ -13,8 +13,6 @@ import type {
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
 import { historyInputMessageIds } from "@shared/native-injection";
-import type { RecordingRequest } from "@shared/request-recording";
-import { settings } from "../settings";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -25,12 +23,10 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import type { ApiRequestDump } from "./request-dump";
 import {
-	BoundedUtf8Capture,
 	collectSecretConfigValues,
 	maskSecretValues,
-	responseDumpBudget,
+	type RecordingAttemptRequest,
 	sanitizeHeaders,
 } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -219,6 +215,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		}
 		const removeAbort = this.listenForAbort(operation, params.signal);
 		const dumpTap = this.createDumpTap(params, chatParams);
+		let usage: ProviderUsage | undefined;
 		let requestStarted = false;
 		let cancelled = false;
 		try {
@@ -241,7 +238,12 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 					requestStarted = true;
 					params.onRequestStart?.();
 				}
-				const mapped = mapStreamEvent(event, {
+				let mergedEvent = event;
+				if ((event.type === "usage" || event.type === "done") && event.usage) {
+					usage = mergeUsage(usage, event.usage);
+					mergedEvent = { ...event, usage };
+				}
+				const mapped = mapStreamEvent(mergedEvent, {
 					providerPrefix: this.providerPrefix,
 					providerTypeId: this.providerTypeId,
 					providerInstanceId: this.providerInstanceId,
@@ -250,6 +252,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 				if (mapped === undefined) continue;
 				if (mapped === CANCELLED) {
+					// A cancelled terminal may be the only (or corrected) billing snapshot.
+					if (event.type === "done" && event.usage && usage) yield mapUsage(usage);
 					// Drain the RPC generator so its post-done error takes precedence.
 					cancelled = true;
 					continue;
@@ -532,8 +536,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 	 *
 	 * Attempt tracking mirrors the collector's model: a `dump.request` carrying
 	 * url/headers opens a new upstream attempt, and the first `dump.response` of an
-	 * attempt calls `beginResponseAttempt`, which archives the previous attempt into
-	 * `attempts[]` — so plugins that retry internally produce a faithful attempt list.
+	 * attempt calls `beginResponseAttempt` — so plugins that retry internally produce a
+	 * faithful attempt sequence in the recording.
 	 */
 	private createDumpTap(
 		params: ChatParams,
@@ -560,14 +564,12 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			transport?: string;
 			url?: string;
 			headers?: Record<string, string>;
-			body: BoundedUtf8Capture;
-			truncated: boolean;
 		}
 		let pendingRequest: PendingRequest | null = null;
 		let responseOpen = false;
 		let responseFailed = false;
 		let responseTruncated = false;
-		let responseBody: BoundedUtf8Capture | null = null;
+		let responseBytes = 0;
 		// Delay only a bounded suffix so credentials split across arbitrary plugin
 		// chunks are still masked. All other reported bytes reach the worker live.
 		const secretTail = Math.min(
@@ -592,41 +594,24 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 		};
 
-		const buildRequest = (): NonNullable<ApiRequestDump["request"]> & RecordingRequest => {
-			const pending = pendingRequest;
-			const sanitizedBody = new BoundedUtf8Capture(maxBytes);
-			sanitizedBody.append(mask(pending?.body.text() ?? ""));
-			let bodyText = sanitizedBody.text();
-			if (
-				pending?.truncated ||
-				(pending && pending.body.received > pending.body.kept) ||
-				sanitizedBody.received > sanitizedBody.kept
-			) {
-				bodyText += "\n[request body truncated by plugin to fit the dump budget]";
-			}
-			return {
-				transport: pending?.transport ?? "plugin",
-				...(pending?.url ? { url: pending.url } : {}),
-				...(pending?.headers ? { headers: pending.headers } : {}),
-				bodyText,
-			};
-		};
+		// Bodies already reached the recorder as sanitized frames; attempts carry metadata only.
+		const buildRequest = (): RecordingAttemptRequest => ({
+			transport: pendingRequest?.transport ?? "plugin",
+			...(pendingRequest?.url ? { url: pendingRequest.url } : {}),
+			...(pendingRequest?.headers ? { headers: pendingRequest.headers } : {}),
+		});
 		const closeResponse = (complete: boolean): void => {
 			if (!responseOpen) return;
 			responseOpen = false;
-			// Mask the bounded concatenation, not each chunk: plugins choose arbitrary
+			// Mask the pending tail, not each chunk: plugins choose arbitrary
 			// boundaries (including inside escaped secrets). Reset for EVERY retry.
 			emitBody("response", "", true);
-			if (responseBody) collector.appendResponseText(mask(responseBody.text()), false);
 			collector.finishResponseCapture(complete && !responseFailed && !responseTruncated);
-			if (responseBody)
-				collector.setResponseMeta({
-					bodyBytesReceived: responseBody.received,
-					...(responseTruncated || responseBody.received > responseBody.kept
-						? { bodyTruncated: true }
-						: {}),
-				});
-			responseBody = null;
+			collector.setResponseMeta({
+				bodyBytesReceived: responseBytes,
+				...(responseTruncated ? { bodyTruncated: true } : {}),
+			});
+			responseBytes = 0;
 			responseFailed = false;
 			responseTruncated = false;
 		};
@@ -664,24 +649,17 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						...(event.transport ? { transport: mask(event.transport) } : {}),
 						...(event.url ? { url: mask(event.url) } : {}),
 						...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
-						body: new BoundedUtf8Capture(maxBytes),
-						truncated: false,
 					};
 				}
-				if (event.bodyChunk) {
-					pendingRequest?.body.append(event.bodyChunk);
-					emitBody("request", event.bodyChunk);
-				}
-				if (event.truncated && pendingRequest) pendingRequest.truncated = true;
+				if (event.bodyChunk) emitBody("request", event.bodyChunk);
 				return;
 			}
 			// dump.response
 			if (!responseOpen) {
 				responseOpen = true;
 				responseFailed = false;
-				responseBody = new BoundedUtf8Capture(maxBytes);
 				emitBody("request", "", true);
-				collector.beginResponseAttempt(buildRequest(), maxBytes, false);
+				collector.beginResponseAttempt(buildRequest(), false);
 				pendingRequest = null;
 				collector.setResponseMeta({
 					...(event.status !== undefined ? { status: event.status } : {}),
@@ -689,7 +667,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 			}
 			if (event.bodyChunk) {
-				responseBody?.append(event.bodyChunk);
+				responseBytes += Buffer.byteLength(event.bodyChunk);
 				emitBody("response", event.bodyChunk);
 			}
 			if (event.truncated) responseTruncated = true;
@@ -725,10 +703,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			...(params.requestDump
 				? {
 						requestDump: {
-							maxBytes: Math.min(
-								responseDumpBudget(settings.agent?.requestDumpMaxSize),
-								PLUGIN_REQUEST_DUMP_MAX_BYTES,
-							),
+							maxBytes: PLUGIN_REQUEST_DUMP_MAX_BYTES,
 						},
 					}
 				: {}),
@@ -826,7 +801,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						await input.options?.onTextDelta?.(event.text);
 						break;
 					case "usage":
-						usage = event.usage;
+						usage = mergeUsage(usage, event.usage);
 						break;
 					case "error":
 						throw operationError(event.error, {
@@ -845,7 +820,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						if (event.status === "failed") {
 							throw new Error(`Provider generation failed (${event.stopReason})`);
 						}
-						usage = event.usage ?? usage;
+						if (event.usage) usage = mergeUsage(usage, event.usage);
 						return buildGenerateMeta(text, usage, credentialId);
 					case "reasoning.delta":
 						// Surfaced so lightweight callers can show a "thinking" progress
@@ -1011,19 +986,50 @@ function mapDone(
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function mergeUsage(previous: ProviderUsage | undefined, update: ProviderUsage): ProviderUsage {
+	const merged = { ...previous, ...update };
+	if (update.promptTokens === 0 && (previous?.promptTokens ?? 0) > 0) {
+		merged.promptTokens = previous?.promptTokens;
+	}
+	// An old net counter must not survive a correction to its prompt/cache buckets.
+	// A freshly reported inputTokens (including zero) remains authoritative.
+	if (
+		merged.promptTokens !== undefined &&
+		update.inputTokens === undefined &&
+		((update.promptTokens ?? 0) > 0 ||
+			update.cachedInputTokens !== undefined ||
+			update.cacheCreationInputTokens !== undefined ||
+			update.cacheCreation5mTokens !== undefined ||
+			update.cacheCreation1hTokens !== undefined)
+	) {
+		delete merged.inputTokens;
+	}
+	return merged;
+}
+
 function mapUsage(usage: ProviderUsage): ParsedStreamEvent {
 	return {
 		usage: {
-			...(usage.promptTokens === undefined ? {} : { promptTokens: usage.promptTokens }),
-			...(usage.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
+			...(usage.promptTokens === undefined && usage.inputTokens === undefined
+				? {}
+				: {
+						promptTokens:
+							usage.promptTokens ??
+							(usage.inputTokens ?? 0) + (usage.cachedInputTokens ?? 0) + cacheWriteTokens(usage),
+					}),
+			...(usage.inputTokens === undefined && usage.promptTokens === undefined
+				? {}
+				: { inputTokens: netInputTokens(usage) }),
 			...(usage.completionTokens === undefined ? {} : { completionTokens: usage.completionTokens }),
 			...(usage.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
 			...(usage.cachedInputTokens === undefined
 				? {}
 				: { cachedInputTokens: usage.cachedInputTokens }),
-			...(usage.cacheCreationInputTokens === undefined
+			...(usage.cacheCreationInputTokens === undefined &&
+			usage.cacheCreation5mTokens === undefined &&
+			usage.cacheCreation1hTokens === undefined
 				? {}
-				: { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
+				: { cacheCreationInputTokens: cacheWriteTokens(usage) }),
 			...(usage.cacheCreation5mTokens === undefined
 				? {}
 				: { cacheCreation5mTokens: usage.cacheCreation5mTokens }),
@@ -1435,6 +1441,24 @@ function buildGenerateMeta(
 	};
 }
 
+function cacheWriteTokens(usage: ProviderUsage): number {
+	return Math.max(
+		usage.cacheCreationInputTokens ?? 0,
+		(usage.cacheCreation5mTokens ?? 0) + (usage.cacheCreation1hTokens ?? 0),
+	);
+}
+
+function netInputTokens(usage: ProviderUsage): number {
+	// Plugin inputTokens 遵循内部净输入契约；promptTokens 则是含缓存读写的完整输入。
+	return (
+		usage.inputTokens ??
+		Math.max(
+			(usage.promptTokens ?? 0) - (usage.cachedInputTokens ?? 0) - cacheWriteTokens(usage),
+			0,
+		)
+	);
+}
+
 function usageToUsageData(usage: ProviderUsage | undefined): GenerateMetaResult["usage"] {
 	if (!usage) return null;
 	if (
@@ -1442,15 +1466,17 @@ function usageToUsageData(usage: ProviderUsage | undefined): GenerateMetaResult[
 		usage.promptTokens === undefined &&
 		usage.completionTokens === undefined &&
 		usage.cachedInputTokens === undefined &&
-		usage.cacheCreationInputTokens === undefined
+		usage.cacheCreationInputTokens === undefined &&
+		usage.cacheCreation5mTokens === undefined &&
+		usage.cacheCreation1hTokens === undefined
 	) {
 		return null;
 	}
 	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
+		inputTokens: netInputTokens(usage),
 		outputTokens: usage.completionTokens ?? 0,
 		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreationInputTokens: cacheWriteTokens(usage),
 		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
 		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,

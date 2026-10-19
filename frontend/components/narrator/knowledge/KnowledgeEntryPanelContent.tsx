@@ -3,7 +3,7 @@
  *
  * Supports both global entries (shared base) and personal entries. Permission
  * rules:
- * - Global: `isAdmin || isOwner` → direct edit via `useAddKnowledgeRevision`.
+ * - Global: the server's `viewerCaps.canWriteMain` → direct edit via `useAddKnowledgeRevision`.
  * - Personal: always editable by the owner via `useUpdatePersonalEntryContent`.
  *
  * Does NOT replicate the full tab structure of the standalone route. Only shows
@@ -44,6 +44,7 @@ import {
 	usePersonalEntry,
 	useUpdatePersonalEntryContent,
 } from "../../../hooks/useKnowledge";
+import { knowledgePersonalEntryDestination } from "../../../lib/knowledge-review-nav";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import type { KnowledgeEntryScope } from "../panels/panel-kind";
 import {
@@ -144,10 +145,8 @@ export function KnowledgeEntryPanelContent({
 		if (scope === "global") {
 			navigate({ to: "/knowledge/$entryId", params: { entryId } });
 		} else {
-			navigate({
-				to: "/knowledge/personal/$personalEntryId",
-				params: { personalEntryId: entryId },
-			});
+			// Linked and standalone personal versions share one page.
+			navigate(knowledgePersonalEntryDestination(entryId));
 		}
 	}, [navigate, entryId, scope]);
 

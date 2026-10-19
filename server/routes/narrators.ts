@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import type { ComposerDocument } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -38,7 +39,6 @@ import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import {
-	apiRequests,
 	chapters,
 	containerInstances,
 	narratorBlacklistCmds,
@@ -60,7 +60,6 @@ import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
-import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
@@ -92,6 +91,13 @@ import {
 	touchSessionVisual,
 } from "../lib/browser/session";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import {
+	bindComposerDocumentReferences,
+	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../lib/composer-document";
 import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import {
@@ -510,16 +516,22 @@ export async function parseMessageRequest(
 	interrupt?: boolean;
 	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	fileReferences?: FileReference[];
+	composerDocument?: ComposerDocument;
 }> {
 	const contentType = c.req.header("content-type") ?? "";
-	if (contentType.includes("multipart/form-data")) {
+	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
 		const formData = await c.req.formData();
 		const rawMode = formData.get("queueMode");
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
-		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
+		const composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		const message = restoreMultipartComposerText(
+			typeof rawMessage === "string" ? rawMessage : "",
+			composerDocument,
+		);
+		validateComposerProjection(composerDocument, message, fileReferences);
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -549,10 +561,14 @@ export async function parseMessageRequest(
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 		}
+		validateComposerAssets(composerDocument, imageFiles, textFileEntries);
 		const images: ImageRef[] = [];
 		try {
 			for (const file of imageFiles) {
-				images.push(await saveUploadedImage(narratorId, file));
+				const image = await saveUploadedImage(narratorId, file);
+				images.push(
+					composerDocument ? { ...image, size: file.size, sourceMimeType: file.type } : image,
+				);
 			}
 		} catch (error) {
 			// Validation above catches the common rejections, but a write can still fail
@@ -576,11 +592,18 @@ export async function parseMessageRequest(
 			interrupt: formData.get("interrupt") === "true" || undefined,
 			queueMode: modeResult.data,
 			fileReferences,
+			composerDocument,
 		};
 	}
 	const body = await c.req.json();
 	const parsed = sendMessageSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	validateComposerProjection(
+		parsed.data.composerDocument,
+		parsed.data.message,
+		parsed.data.fileReferences,
+	);
+	validateComposerAssets(parsed.data.composerDocument, [], []);
 	return {
 		message: parsed.data.message,
 		images: [],
@@ -589,6 +612,7 @@ export async function parseMessageRequest(
 		interrupt: parsed.data.interrupt,
 		queueMode: parsed.data.queueMode,
 		fileReferences: parsed.data.fileReferences,
+		composerDocument: parsed.data.composerDocument,
 	};
 }
 
@@ -613,6 +637,39 @@ narratorRoutes.use("*", async (_c, next) => {
 	requireSqliteNarratorSurface();
 	return next();
 });
+
+// JSON composer requests never inherit the much larger multipart attachment budget.
+// The middleware bounds streamed bodies before req.json(), including absent/lying Content-Length.
+const boundedComposerJsonRequest = bodyLimit({
+	maxSize: 4 * 1024 * 1024,
+	onError: (c) =>
+		c.json(
+			{ error: "Composer JSON request exceeds the 4 MiB limit", code: "COMPOSER_JSON_TOO_LARGE" },
+			413,
+		),
+});
+for (const path of [
+	"/:id/messages",
+	"/:id/draft",
+	"/:id/edit-and-regenerate/:messageId",
+	"/:id/buffer/:mid",
+]) {
+	narratorRoutes.use(path, (c, next) => {
+		// Draft is JSON-only, regardless of the advertised content type. The other
+		// handlers use a real multipart decoder for precisely this media type.
+		if (
+			path !== "/:id/draft" &&
+			c.req.header("content-type")?.split(";")[0]?.trim().toLowerCase() === "multipart/form-data"
+		)
+			return next();
+		// Hono's limiter trusts Content-Length when present. Force its counting-stream
+		// path so a missing or dishonest length cannot reach req.json() unbounded.
+		const headers = new Headers(c.req.raw.headers);
+		headers.delete("content-length");
+		c.req.raw = new Request(c.req.raw, { headers });
+		return boundedComposerJsonRequest(c, next);
+	});
+}
 
 // This smaller guard MUST run before the general attachment-body middleware below.
 // Preview inputs contain only bounded selectors, never tool bodies or raw evidence.
@@ -788,9 +845,7 @@ narratorRoutes.route("/:id/request-recordings", requestRecordingRoutes);
 
 // The /:id/* middleware above enforces requireNarratorAccess(..., "read").
 narratorRoutes.get("/:id/context-composition", async (c) => {
-	return c.json(
-		await getNarratorContextComposition(c.req.param("id"), c.req.raw.signal, c.req.query("cursor")),
-	);
+	return c.json(await getNarratorContextComposition(c.req.param("id"), c.req.raw.signal));
 });
 
 /**
@@ -1169,18 +1224,32 @@ narratorRoutes.get("/", async (c) => {
 
 		// Batch fetch active background task counts (subagents + bash + transfers).
 		// Lazy import matches the other background-task routes in this file.
-		const { backgroundTaskService } = await import("../services/background-task-service");
-		const backgroundTaskCounts =
-			await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
+		let backgroundTaskCounts:
+			| Map<string, import("@shared/background-task-list").BackgroundTaskActiveCounts>
+			| undefined;
+		try {
+			const { backgroundTaskService } = await import("../services/background-task-service");
+			backgroundTaskCounts = await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
+		} catch (err) {
+			// Occupancy is auxiliary: unknown counts must not become fabricated zeros.
+			logger.warn("Failed to load background counts for narrator list", {
+				count: narratorIds.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 
 		const items = rawItems.map((n) => ({
 			...publicNarratorResponse(n, draftNarratorIds.has(n.id)),
 			messageCount: messageCounts.get(n.id) ?? 0,
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
-			activeBackgroundTaskCount: backgroundTaskCounts.get(n.id)?.activeCount ?? 0,
-			activeBackgroundWorkCount: backgroundTaskCounts.get(n.id)?.activeWorkCount ?? 0,
-			activeBackgroundServiceCount: backgroundTaskCounts.get(n.id)?.activeServiceCount ?? 0,
+			...(backgroundTaskCounts
+				? {
+						activeBackgroundTaskCount: backgroundTaskCounts.get(n.id)?.activeCount ?? 0,
+						activeBackgroundWorkCount: backgroundTaskCounts.get(n.id)?.activeWorkCount ?? 0,
+						activeBackgroundServiceCount: backgroundTaskCounts.get(n.id)?.activeServiceCount ?? 0,
+					}
+				: {}),
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
 			runningContainerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.running ?? 0) : 0,
 			viewers: presenceMap.get(n.id) ?? [],
@@ -1565,60 +1634,94 @@ narratorRoutes.get("/:id/panel-state", async (c) => {
 	return c.json(result);
 });
 
-// Download the raw SSE request/response dump for a leaked-tool-call diagnostic.
-// Narrator-scoped so non-admin users participating in debugging can fetch the data,
-// with an ownership check preventing access to other narrators' requests.
-narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
+narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 	const id = c.req.param("id");
-	const requestId = c.req.param("requestId");
-	await narratorService.getById(id); // 404 if narrator missing
-
-	const [row] = await db
+	const mid = c.req.param("mid");
+	const ref = await db.query.narratorMessageRefs.findFirst({
+		where: and(eq(narratorMessageRefs.narratorId, id), eq(narratorMessageRefs.messageId, mid)),
+		columns: { id: true },
+	});
+	if (!ref) throw new NotFoundError("Message", mid);
+	const message = await db
 		.select({
-			id: apiRequests.id,
-			narratorId: apiRequests.narratorId,
-			provider: apiRequests.provider,
-			model: apiRequests.model,
-			createdAt: apiRequests.createdAt,
-			errorMessage: apiRequests.errorMessage,
-			rawDumpJson: apiRequests.rawDumpJson,
+			composerDocument: narratorMessages.composerDocument,
+			bodyRevision: narratorMessages.bodyRevision,
+			content: sql<
+				string | null
+			>`CASE WHEN ${narratorMessages.role} = 'user' AND length(CAST(${narratorMessages.contentJson} AS BLOB)) <= ${4 * 1024 * 1024} THEN ${narratorMessages.contentJson} ELSE NULL END`,
 		})
-		.from(apiRequests)
-		.where(eq(apiRequests.id, requestId));
-
-	if (!row || row.narratorId !== id) {
-		// Treat a mismatched owner the same as missing to avoid leaking existence.
-		return c.json({ error: "Request dump not found for this narrator" }, 404);
-	}
-	if (!row.rawDumpJson) {
-		return c.json(
-			{
-				error:
-					"No raw dump stored for this request. Raw SSE data is only retained when a leak is detected or request dumping is enabled.",
-			},
-			404,
-		);
-	}
-
-	let rawDump: unknown;
-	try {
-		// Same redaction as the usage-history detail path: the stored dump carries absolute
-		// server paths (spill pointer / malformed capture) that name the host OS account, and a
-		// dump is something users export and forward to whoever is helping them. This route
-		// used to return the row verbatim, so it leaked what the other path was careful about.
-		rawDump = redactSpillPointerPaths(JSON.parse(row.rawDumpJson));
-	} catch {
-		rawDump = { invalidJson: true, rawText: row.rawDumpJson };
-	}
-
+		.from(narratorMessages)
+		.where(eq(narratorMessages.id, mid))
+		.get();
+	if (!message) throw new NotFoundError("Message", mid);
+	if (message.content === null)
+		throw new ValidationError("Message attachment metadata exceeds the composer detail limit");
+	const blocks: Record<string, unknown>[] = JSON.parse(message.content);
+	const images = Array.isArray(blocks)
+		? blocks
+				.filter((block) => block.type === "image" && typeof block.imageId === "string")
+				.map((block) => ({
+					imageId: block.imageId,
+					filename: block.filename,
+					mediaType: block.mediaType,
+					width: block.width,
+					height: block.height,
+					uploadNarratorId: block.uploadNarratorId ?? id,
+					size: block.size,
+					sourceMimeType: block.sourceMimeType,
+				}))
+		: [];
+	const textFiles = Array.isArray(blocks)
+		? blocks
+				.filter((block) => block.type === "text_file" && typeof block.filePath === "string")
+				.map((block) => ({ filename: block.filename, filePath: block.filePath, size: block.size }))
+		: [];
 	return c.json({
-		id: row.id,
-		narratorId: row.narratorId,
-		provider: row.provider,
-		model: row.model,
-		createdAt: row.createdAt,
-		errorMessage: row.errorMessage,
-		rawDump,
+		composerDocument: message.composerDocument ?? undefined,
+		images,
+		textFiles,
+		bodyRevision: message.bodyRevision,
+		text: Array.isArray(blocks)
+			? blocks
+					.filter((block) => block.type === "text" && typeof block.text === "string")
+					.map((block) => block.text)
+					.join("")
+			: "",
+		fileReferences: getFileReferenceSnapshots(blocks).map((snapshot) => snapshot.reference),
+	});
+});
+
+narratorRoutes.get("/:id/buffer/:mid/composer-document", async (c) => {
+	const located = await locateBufferedMessage(c.req.param("id"), c.req.param("mid"));
+	if (!located) throw new NotFoundError("Buffered message", c.req.param("mid"));
+	const message = located.message;
+	const images = (message.images ?? []).map((image) => ({
+		imageId: image.imageId,
+		filename: image.filename,
+		mediaType: image.mediaType,
+		width: image.width,
+		height: image.height,
+		uploadNarratorId: image.uploadNarratorId ?? c.req.param("id"),
+		size: image.size,
+		sourceMimeType: image.sourceMimeType,
+	}));
+	const textFiles =
+		message._savedFiles?.map((file, index) => ({
+			index,
+			filename: file.filename,
+			size: file.size,
+		})) ??
+		(message.textFiles ?? []).map((file, index) => ({
+			index,
+			filename: file.name,
+			size: file.size,
+		}));
+	return c.json({
+		composerDocument: message.composerDocument,
+		images,
+		textFiles,
+		text: message.text,
+		fileReferences: (message.fileReferences ?? []).map((snapshot) => snapshot.reference),
 	});
 });
 
@@ -1642,6 +1745,7 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		parsed.data.sourceId,
 		parsed.data.baseRevision,
 		parsed.data.fileReferences,
+		parsed.data.composerDocument,
 	);
 	if ("conflict" in update) {
 		return c.json(
@@ -1660,6 +1764,7 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		hasDraft: update.hasDraft,
 		text: update.text,
 		fileReferences: update.fileReferences,
+		hasComposerDocument: !!update.composerDocument,
 		revision: update.revision,
 		updatedAt: update.updatedAt,
 		updatedBy: update.updatedBy,
@@ -1670,10 +1775,12 @@ narratorRoutes.put("/:id/draft", async (c) => {
 	});
 	return c.json({
 		ok: true,
+		composerDocument: update.composerDocument,
 		traits: publicTraitsResponse(narrator.traits),
 		hasDraft: update.hasDraft,
 		text: update.text,
 		fileReferences: update.fileReferences,
+		hasComposerDocument: !!update.composerDocument,
 		revision: update.revision,
 		updatedAt: update.updatedAt,
 		updatedBy: update.updatedBy,
@@ -2057,6 +2164,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		interrupt: requestedInterrupt,
 		queueMode,
 		fileReferences,
+		composerDocument: requestedComposerDocument,
 	} = await parseMessageRequest(c, id);
 	// Explicit mode wins over legacy booleans; omission retains existing callers.
 	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
@@ -2070,7 +2178,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// a rejected reference must not strand images saved by multipart parsing.
 	let uploadsAccepted = false;
 	try {
-		const queuedNewCommand = parseNewCommand(message);
+		const mixedDocument = requestedComposerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		);
+		const queuedNewCommand = mixedDocument ? null : parseNewCommand(message);
 		if (queuedNewCommand && fileReferences?.length) {
 			throw new ValidationError(
 				"File references are not supported by /new; send them in the new session",
@@ -2099,9 +2210,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// response can prompt the UI to show a "queued protected task" toast.
 		let specGoalQueued = false;
 		let specGoalObjective = "";
-		const cmdResult = queuedNewCommand
-			? ({ resolved: false } as Awaited<ReturnType<typeof resolveCommand>>)
-			: await resolveCommand(message, id, userId);
+		const cmdResult =
+			queuedNewCommand || mixedDocument
+				? ({ resolved: false } as Awaited<ReturnType<typeof resolveCommand>>)
+				: await resolveCommand(message, id, userId);
 		if (
 			fileReferences?.length &&
 			cmdResult.resolved &&
@@ -2298,6 +2410,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		const snapshots = fileReferences?.length
 			? await captureFileReferences(id, userId, fileReferences, c.req.raw.signal)
 			: undefined;
+		const composerDocument = bindComposerDocumentReferences(
+			requestedComposerDocument,
+			snapshots?.map((snapshot) => snapshot.reference),
+		);
 
 		// Extract model override from resolved command (if any)
 		const modelOverride =
@@ -2408,6 +2524,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					queueMode,
 					requestSoftStop: !takenOver,
 					fileReferences: snapshots,
+					composerDocument: finalMessage === message ? composerDocument : undefined,
 				});
 				if (!result.ok) {
 					if (result.full) throw new ValidationError("Message queue is full");
@@ -2454,6 +2571,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				actor: "user",
 				prompt: finalMessage,
 				fileReferences: snapshots,
+				composerDocument: finalMessage === message ? composerDocument : undefined,
 				images: images.length > 0 ? images : undefined,
 				textFiles: textFiles.length > 0 ? textFiles : undefined,
 				commandText,
@@ -2494,6 +2612,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			textFiles,
 			preBashCommand: prePromptBashCommand,
 			fileReferences: snapshots,
+			composerDocument: finalMessage === message ? composerDocument : undefined,
 			priority,
 			interrupt,
 			queueMode,
@@ -2847,6 +2966,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 
 	let content: string;
 	let fileReferences: FileReference[] | undefined;
+	let composerDocument: ComposerDocument | undefined;
 	// Whether the truncated messages' file changes are rolled back, and how wide.
 	// Undefined => the legacy `rollback` field decides (see below), then default true.
 	let skipRevert: boolean | undefined;
@@ -2874,10 +2994,14 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	};
 
 	const contentType = c.req.header("content-type") ?? "";
-	if (contentType.includes("multipart/form-data")) {
+	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
 		const formData = await c.req.formData();
-		content = (formData.get("content") as string) ?? "";
 		fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
+		composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		content = restoreMultipartComposerText(
+			(formData.get("content") as string) ?? "",
+			composerDocument,
+		);
 		const rawSkipRevert = formData.get("skipRevert");
 		if (typeof rawSkipRevert === "string") skipRevert = rawSkipRevert === "true";
 		const rawRollback = formData.get("rollback");
@@ -2922,6 +3046,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		const body = editAndRegenerateJsonSchema.parse(await c.req.json());
 		content = body.content ?? "";
 		fileReferences = body.fileReferences;
+		composerDocument = body.composerDocument;
 		skipRevert = body.skipRevert;
 		legacyRollback = body.rollback;
 		scope = body.scope;
@@ -2937,6 +3062,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 
 	const narrator = await narratorService.getById(id);
 	const userId = c.get("user").sub;
+	validateComposerProjection(composerDocument, content, fileReferences);
 	// Invalid/new references must fail before interrupting or rewriting history.
 	const snapshots = await resolveEditedFileReferences(
 		id,
@@ -2944,6 +3070,10 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		fileReferences,
 		userId,
 		c.req.raw.signal,
+	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
 	);
 
 	// Editing a message truncates everything after it and regenerates, so the running
@@ -2976,6 +3106,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			editKeepTextFilePaths: keepTextFilePaths,
 			editNewTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
 			editFileReferences: snapshots,
+			editComposerDocument: composerDocument,
 			createdBy: userId,
 			locale,
 			replyInUserLanguage,
@@ -2988,6 +3119,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 
 	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage, {
 		fileReferences: snapshots,
+		composerDocument,
 		keepImageIds,
 		newImages: newImages.length > 0 ? newImages : undefined,
 		keepTextFilePaths,
@@ -3168,19 +3300,21 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	let rawText: string | undefined;
 	let fileReferences: FileReference[] | undefined;
+	let composerDocument: ComposerDocument | undefined;
 	let keepImageIds: string[] | undefined;
 	let keepTextFiles: Array<{ index: number; filename: string }> | undefined;
 	const newImageFiles: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const contentType = c.req.header("content-type") ?? "";
-	if (contentType.includes("multipart/form-data")) {
+	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
 		const formData = await c.req.formData();
 		const rawTextField = formData.get("text");
 		if (typeof rawTextField === "string") rawText = rawTextField;
 		const parsed = updateBufferedMessageSchema.safeParse({
 			...(rawText !== undefined ? { text: rawText } : {}),
 			fileReferences: parseFileReferenceInput(formData.get("fileReferences")),
+			composerDocument: parseOptionalComposerDocument(formData.get("composerDocument")),
 			...(formData.has("keepImageIds")
 				? { keepImageIds: parseJsonArrayField(formData.get("keepImageIds"), "keepImageIds") }
 				: {}),
@@ -3192,6 +3326,8 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepImageIds = parsed.data.keepImageIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
+		composerDocument = parsed.data.composerDocument;
+		if (rawText !== undefined) rawText = restoreMultipartComposerText(rawText, composerDocument);
 
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
@@ -3215,6 +3351,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepImageIds = parsed.data.keepImageIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
+		composerDocument = parsed.data.composerDocument;
 	}
 
 	const located = await locateBufferedMessage(id, mid);
@@ -3222,7 +3359,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// Omitted text keeps the current wording, so a client that only manages
 	// attachments does not have to echo the message body back.
-	const text = (rawText ?? located.message.text).trim();
+	const text = composerDocument
+		? (rawText ?? located.message.text)
+		: (rawText ?? located.message.text).trim();
 	const { keptImages, keptTextFileIndexes } = resolveKeptBufferAttachments(
 		located,
 		keepImageIds,
@@ -3239,6 +3378,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	// them as ordinary model turns. Editing must not bypass send-time rejection.
 	if (
 		!located.fromSubagentQueue &&
+		!composerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		) &&
 		(fileReferences ?? located.message.fileReferences ?? []).length > 0 &&
 		[text, located.message.commandText ?? ""].some((value) =>
 			/^\/(?:new|goal)(?:\s|$)/.test(value.trim()),
@@ -3250,6 +3392,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		located.message.fileReferences ?? [],
 		fileReferences,
 		(references) => captureFileReferences(id, c.get("user").sub, references, c.req.raw.signal),
+	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
 	);
 	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
@@ -3280,7 +3426,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		for (const file of newImageFiles) {
 			const saved = await saveUploadedImage(id, file);
 			createdImageIds.push(saved.imageId);
-			newImages.push(saved);
+			newImages.push(
+				composerDocument ? { ...saved, size: file.size, sourceMimeType: file.type } : saved,
+			);
 		}
 
 		// Both actor types retain the same saved paths; never re-upload kept Files.
@@ -3296,6 +3444,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			images: [...keptImages, ...newImages],
 			savedFiles,
 			fileReferences: snapshots,
+			composerDocument,
 		});
 		if (!ok) throw new NotFoundError("Buffered message", mid);
 		committed = true;
@@ -3525,28 +3674,17 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 				? expectedMessageVersion
 				: undefined,
 	});
-	// Read the message version AFTER the page, never concurrently.
-	//
-	// The page builder materializes a lazy fork's missing refs on demand
-	// (`ensureRefsCoverSeq`), and that backfill bumps `messageVersion`. Run in
-	// parallel, this query resolves BEFORE the backfill commits while the page
-	// carries the post-backfill version — so the equality check below failed
-	// deterministically on the first upward scroll past a fork boundary, the one
-	// place the backfill actually copies anything. Sequenced, both sides observe
-	// the same post-backfill version, and the check goes back to meaning what it
-	// says: another writer changed the narrator underneath us.
+	// The page is internally consistent on its own: the service snapshots
+	// `messageVersion` after any lazy-ref backfill and re-checks it after the build
+	// (rebuilding unpinned pages on drift). A second comparison here only reopened a
+	// window in which any unrelated write on a live narrator turned a good page into
+	// a 409, so this read is just the existence check.
 	await requireNarratorAccess(c, id, "read");
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
-		columns: { messageVersion: true },
+		columns: { id: true },
 	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	if (narratorMeta.messageVersion !== result.messageVersion)
-		throw new AppError(
-			"Narrator message version changed while the exact-layout page was being built",
-			409,
-			"PRETEXT_DOCUMENT_CHANGED",
-		);
 	return c.json(result);
 });
 
@@ -6507,7 +6645,7 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 });
 
 /**
- * Current uncommitted line counts for the narrator file tree.
+ * Current lightweight Git file states for the narrator file tree.
  *
  * The tree may be rooted at a standalone narrator's cwd or at a subdirectory inside a
  * chapter worktree, so this route is narrator-scoped rather than chapter-scoped. Git's
@@ -6524,16 +6662,19 @@ narratorRoutes.get("/:id/file-tree-status", async (c) => {
 	// Share the same short-lived cache used by the Git panel. The watcher invalidates it
 	// before broadcasting file activity, and concurrent file-tree surfaces then reuse the
 	// one fresh Git query instead of each spawning their own set of processes.
-	const status = await getStatusSummaryCached(cwd);
+	const status = await getStatusSummaryCached(cwd, { signal: c.req.raw.signal });
 	return c.json({
 		isGitRepo: true,
 		files: status.files.map((file) => ({
 			path: file.path,
+			status: file.status,
+			oldPath: file.oldPath,
 			linesAdded: file.linesAdded,
 			linesRemoved: file.linesRemoved,
 		})),
 		totalFiles: status.totalFiles,
-		truncated: status.totalFiles > status.files.length,
+		totalFilesExact: status.totalFilesExact,
+		truncated: status.truncated === true || status.totalFiles > status.files.length,
 	});
 });
 

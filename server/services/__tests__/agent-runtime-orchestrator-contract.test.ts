@@ -41,6 +41,7 @@ const { isGitCommandToolResult, runAgentLoopUnlocked } = await import(
 );
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { settings } = await import("../../lib/settings");
 const manual = await import("../subagent-manual-override");
 const takeover = await import("../subagent-takeover");
@@ -85,8 +86,10 @@ const unregister = provider.registerExternalProviderResolver({
 	listReadiness: () => [],
 });
 const ids = ["contract-parent", "contract-primary", "contract-child"];
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	settings.agent.autoContinuationMode = "off";
 	const now = new Date().toISOString();
 	for (const id of ["principal-a", "principal-b"]) {
@@ -106,15 +109,20 @@ beforeEach(() => {
 				updatedAt: now,
 			})
 			.run();
+	backgroundOccupancyStore.refreshNarrators(ids);
+	await backgroundOccupancyStore.flush();
 });
-afterEach(() => {
+afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
+		backgroundOccupancyStore.setRuntimeLive(id, false);
 	}
+	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
 afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
 	unregister();
 	mock.module("../../db", () => realDb);
 });
@@ -165,6 +173,7 @@ function fixture(
 	const owner = tryClaimExecution(id, profile.kind);
 	if (!owner) throw new Error("Missing fixture owner");
 	activeNarrators.set(id, session);
+	backgroundOccupancyStore.setRuntimeLive(id, true);
 	const calls: ExecuteLoopOptions[] = [];
 	spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 		expect(options.config.executionSegmentId).toBe(
@@ -183,6 +192,62 @@ function fixture(
 	};
 }
 
+describe("round token totals at the Stop hook", () => {
+	for (const exit of ["normal", "workspace", "tool-limit", "throw"] as const) {
+		test(`accounts every owned request before ${exit} exits`, async () => {
+			const { hookService } = await import("../hook-service");
+			const stopTotals: number[] = [];
+			spyOn(hookService, "runHooks").mockImplementation(async (event, input) => {
+				if (event === "Stop") stopTotals.push(input.total_tokens as number);
+				return { outcome: "success" };
+			});
+			const h = fixture(profiles[0], [
+				async (options) => {
+					options.eventContext.accountRequestTokenUsage?.({
+						inputTokens: 1000,
+						completionTokens: 100,
+					});
+					options.eventContext.accountRequestTokenUsage?.({
+						inputTokens: 1100,
+						completionTokens: 100,
+					});
+					// Latest occupancy deliberately disagrees with request totals.
+					options.eventContext.setTokenUsage({ inputTokens: 1, completionTokens: 1 });
+					if (exit === "workspace") h.session._workspacePassInvalidated = true;
+					if (exit === "tool-limit") options.config.onToolCallLimitExceeded?.(1);
+					if (exit === "throw") throw new Error("scripted failure after usage");
+					return { ...finished };
+				},
+				async (options) => {
+					options.eventContext.accountRequestTokenUsage?.({ inputTokens: 10, completionTokens: 5 });
+					return { ...finished };
+				},
+			]);
+			await h.run();
+			expect(stopTotals).toEqual([exit === "workspace" ? 2315 : 2300]);
+		});
+	}
+
+	test("stale active callbacks cannot charge the replacement narrator or parent", async () => {
+		const h = fixture(profiles[1], [
+			async (options) => {
+				const replacement = active("contract-child");
+				activeNarrators.set("contract-child", replacement);
+				options.eventContext.accountRequestTokenUsage?.({
+					inputTokens: 1000,
+					completionTokens: 100,
+				});
+				expect(replacement._requestTokenTotal).toBeUndefined();
+				expect(h.session._requestTokenTotal).toBeUndefined();
+				activeNarrators.set("contract-child", h.session);
+				return { ...finished };
+			},
+		]);
+		await h.run();
+		expect(h.session._requestTokenTotal).toBeUndefined();
+	});
+});
+
 describe("Bash Git command detection for status refresh", () => {
 	test("uses parsed command nodes instead of matching argument text", async () => {
 		expect(await isGitCommandToolResult("Bash", { command: "git status" }, "/tmp")).toBe(true);
@@ -195,6 +260,99 @@ describe("Bash Git command detection for status refresh", () => {
 		expect(await isGitCommandToolResult("Bash", { command: "echo git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Bash", { command: "printf git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Write", { command: "git status" }, "/tmp")).toBe(false);
+	});
+});
+
+describe("tool Git status refresh", () => {
+	test("invalidates at the write boundary and shares cached status in the trailing chapter broadcast", async () => {
+		const statusCache = await import("../git-status-cache");
+		const { gitService } = await import("../git-service");
+		const ws = await import("../../websocket/narrator-ws");
+		const repo = join(process.env.HOME as string, "git-track-fixture");
+		statusCache.clearStatusCache();
+		const summary = {
+			hasChanges: true,
+			staged: 0,
+			unstaged: 1,
+			untracked: 0,
+			totalFiles: 1,
+			files: [{ path: "changed.txt", status: " M" }],
+			headSha: "fixture-head",
+			branch: "feature",
+		};
+		const { coordinateGitStatusQuery, getLocalGitStatusQueryKey } = await import(
+			"../git-status-query"
+		);
+		const query = mock(async () => summary);
+		spyOn(gitService, "getStatusSummary").mockImplementation((path, options) =>
+			coordinateGitStatusQuery(getLocalGitStatusQueryKey(path), query, options),
+		);
+		const ahead = spyOn(gitService, "getCommitsAhead").mockResolvedValue({
+			count: 2,
+			baseBranch: "main",
+		});
+		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const cachedRead = spyOn(statusCache, "getStatusSummaryCached");
+		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
+		let verified = false;
+		const h = fixture(profiles[0], [
+			async (options) => {
+				h.session._chapterId = "git-track-chapter";
+				h.session._worktreePath = repo;
+				h.session._baseBranch = "main";
+				const scheduled: Array<() => void> = [];
+				const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+					callback: () => void,
+				) => {
+					scheduled.push(callback);
+					return scheduled.length as unknown as ReturnType<typeof setTimeout>;
+				}) as typeof setTimeout);
+				const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+				try {
+					options.hooks?.onGitTrack?.("Write", "write-1", { file_path: "changed.txt" });
+					expect(invalidate).toHaveBeenCalledTimes(1);
+					options.hooks?.onGitTrack?.("Edit", "write-2", { file_path: "changed.txt" });
+					expect(invalidate).toHaveBeenCalledTimes(2);
+					expect(query).not.toHaveBeenCalled();
+					expect(clear).toHaveBeenCalledTimes(1);
+					expect(scheduled).toHaveLength(2);
+				} finally {
+					timer.mockRestore();
+					clear.mockRestore();
+				}
+
+				// A directory subscriber already refreshed after the latest write.
+				await statusCache.getStatusSummaryCached(repo);
+				expect(query).toHaveBeenCalledTimes(1);
+				cachedRead.mockClear();
+				scheduled[1]();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(invalidate).toHaveBeenCalledTimes(2);
+				expect(query).toHaveBeenCalledTimes(1);
+				expect(cachedRead).toHaveBeenCalledWith(repo);
+				expect(ahead).toHaveBeenCalledWith(repo, "main");
+				expect(
+					broadcast.mock.calls.some(
+						([, message]) =>
+							message.type === "git_status" &&
+							message.toolUseId === "write-2" &&
+							message.chapterId === "git-track-chapter" &&
+							message.commitsAhead === 2 &&
+							message.baseBranch === "main" &&
+							!("files" in message.status),
+					),
+				).toBe(true);
+				verified = true;
+				return { ...finished };
+			},
+		]);
+		try {
+			await h.run();
+			expect(h.calls).toHaveLength(1);
+			expect(verified).toBe(true);
+		} finally {
+			statusCache.clearStatusCache();
+		}
 	});
 });
 
@@ -362,6 +520,8 @@ describe("real shared orchestrator profile contract", () => {
 			.set({ contextSummary: summary, contextSummaryChars: 0 })
 			.where(eq(narrators.id, "contract-child"))
 			.run();
+		backgroundOccupancyStore.refreshNarrator("contract-child");
+		await backgroundOccupancyStore.flush();
 		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 			expect(options.config.systemPrompt).toBe(finalPrompt);
 			expect(options.config.executionSegmentId).toBe("child-run-segment");
@@ -421,6 +581,8 @@ describe("real shared orchestrator profile contract", () => {
 				.set({ contextSummary: "cached", contextSummaryChars: 6 })
 				.where(eq(narrators.id, h.session.narratorId))
 				.run();
+			backgroundOccupancyStore.refreshNarrator(h.session.narratorId);
+			await backgroundOccupancyStore.flush();
 			expect((await h.run()).hasError).toBe(false);
 		});
 
@@ -453,6 +615,8 @@ describe("real shared orchestrator profile contract", () => {
 				.set({ contextSummary: summary, contextSummaryChars: 0 })
 				.where(eq(narrators.id, h.session.narratorId))
 				.run();
+			backgroundOccupancyStore.refreshNarrator(h.session.narratorId);
+			await backgroundOccupancyStore.flush();
 			expect((await h.run()).hasError).toBe(false);
 		});
 

@@ -1,0 +1,9 @@
+# NarraFork is a self-hosted, authenticated developer tool — not a public website.
+# An indexed instance leaks its host name, workspace paths and project names to
+# anyone who searches for them, so crawling is refused for the whole app.
+#
+# Vite copies this file to the root of dist/frontend, which is what makes it
+# reachable in every serving mode: the filesystem middleware (server/main.ts) and
+# the embedded-asset map baked into a compiled binary both look it up by path.
+User-agent: *
+Disallow: /

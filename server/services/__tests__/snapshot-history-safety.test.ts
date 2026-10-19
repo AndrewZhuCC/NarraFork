@@ -12,10 +12,12 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { logger } from "../../lib/logger";
 import { batchDeleteBlocksSchema } from "../../lib/validators/narrators";
 import * as scopedRevert from "../narrator-scoped-revert";
 import { narratorService } from "../narrator-service";
 import * as snapshotRevert from "../snapshot-revert";
+import { worktreeTreeSnapshot } from "../worktree-tree-snapshot";
 
 const narratorIds: string[] = [];
 const directories: string[] = [];
@@ -1071,5 +1073,261 @@ describe("history rollback refusal and transaction compensation", () => {
 		expect(refs).toHaveLength(1);
 		expect(refs[0].segmentCompactId).toBe(checkpoints[0].messageId);
 		expect(refs[0].seq).toBe(1);
+	});
+});
+
+describe("message history truncation timing", () => {
+	test("logs bounded phase durations for a successful history-only transaction", async () => {
+		const { narratorId } = fixture();
+		const boundary = addMessage(narratorId, [{ type: "text", text: "keep" }], 1);
+		const tail = addMessage(narratorId, [{ type: "text", text: "delete" }], 2);
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const result = await narratorService.deleteMessagesAfter(narratorId, boundary, {
+			skipRevert: true,
+		});
+		expect(result.deletedMessageIds).toEqual([tail]);
+		const calls = [...info.mock.calls, ...warn.mock.calls];
+		const start = calls.find(([message]) => message === "Message history truncation started")?.[1];
+		const finish = calls.find(
+			([message]) => message === "Message history truncation completed",
+		)?.[1];
+		expect(finish).toMatchObject({
+			narratorId,
+			messageId: boundary,
+			skipRevert: true,
+			success: true,
+			selectedMessageCount: 1,
+			timingId: start?.timingId,
+		});
+		const phases = finish?.phaseDurationsMs as Record<string, number>;
+		for (const phase of [
+			"transaction",
+			"plan",
+			"questions",
+			"checkpoints",
+			"deleteRefs",
+			"deleteOrphans",
+			"updateNarrator",
+			"questionNotifications",
+		]) {
+			expect(phases[phase]).toBeGreaterThanOrEqual(0);
+		}
+	});
+
+	test("logs a failed transaction while retaining rollback semantics", async () => {
+		const { narratorId } = fixture();
+		const boundary = addMessage(narratorId, [{ type: "text", text: "keep" }], 1);
+		const tail = addMessage(narratorId, [{ type: "text", text: "retain after failure" }], 2);
+		failSecondMessageDelete(tail);
+		spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		await expect(
+			narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true }),
+		).rejects.toThrow("injected history failure");
+		expect(messageRefs(tail)).toHaveLength(1);
+		const finish = warn.mock.calls.find(
+			([message]) => message === "Message history truncation completed",
+		)?.[1];
+		expect(finish).toMatchObject({ narratorId, success: false });
+		const phases = finish?.phaseDurationsMs as Record<string, number>;
+		expect(phases.transaction).toBeGreaterThanOrEqual(0);
+		expect(phases.deleteOrphans).toBeGreaterThanOrEqual(0);
+	});
+});
+
+describe("keep-files range snapshot diagnostics", () => {
+	for (const shape of ["no-tools", "large-write", "large-bash-tree-boundary"] as const) {
+		test(`${shape}: real range deletion preserves bytes without capturing or restoring trees`, async () => {
+			const { narratorId, cwd } = fixture();
+			const boundary = addMessage(narratorId, [{ type: "text", text: "keep user turn" }], 1);
+			const path = join(cwd, "kept-workspace.txt");
+			writeFileSync(path, "current workspace bytes\n");
+			const toolUseId = generateId();
+			const tail = addMessage(
+				narratorId,
+				shape === "no-tools"
+					? [{ type: "text", text: "discard assistant text" }]
+					: [{ type: "tool_use", id: toolUseId, name: shape === "large-write" ? "Write" : "Bash" }],
+				2,
+			);
+			const payloadBytes = shape === "no-tools" ? 0 : 3 * 1024 * 1024;
+			if (shape !== "no-tools") {
+				const call = addTool(narratorId, tail, toolUseId, path);
+				db.update(narratorToolCalls)
+					.set(
+						shape === "large-write"
+							? { inputJson: { file_path: path, content: "x".repeat(payloadBytes) } }
+							: {
+									toolName: "Bash",
+									inputJson: { command: "fixture" },
+									outputJson: "x".repeat(payloadBytes),
+									treeHashBefore: "a".repeat(40),
+									treeHashAfter: "b".repeat(40),
+								},
+					)
+					.where(eq(narratorToolCalls.id, call))
+					.run();
+			}
+			const info = spyOn(logger, "info").mockImplementation(() => {});
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const capture = spyOn(worktreeTreeSnapshot, "capture");
+			const hotCapture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+			const restore = spyOn(worktreeTreeSnapshot, "restore");
+			const reverse = spyOn(worktreeTreeSnapshot, "reverseAndRestore");
+			let lastBeat = performance.now();
+			let maxLagMs = 0;
+			const heartbeat = setInterval(() => {
+				const now = performance.now();
+				maxLagMs = Math.max(maxLagMs, now - lastBeat - 1);
+				lastBeat = now;
+			}, 1);
+			let durationMs = 0;
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				maxLagMs = 0;
+				lastBeat = performance.now();
+				const started = performance.now();
+				await narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true });
+				durationMs = performance.now() - started;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			} finally {
+				clearInterval(heartbeat);
+			}
+			expect(readFileSync(path, "utf8")).toBe("current workspace bytes\n");
+			expect(capture).not.toHaveBeenCalled();
+			expect(hotCapture).not.toHaveBeenCalled();
+			expect(restore).not.toHaveBeenCalled();
+			expect(reverse).not.toHaveBeenCalled();
+			const checkpoints = db
+				.select({
+					id: narratorToolCalls.id,
+					treeHashBefore: narratorToolCalls.treeHashBefore,
+					treeHashAfter: narratorToolCalls.treeHashAfter,
+				})
+				.from(narratorToolCalls)
+				.where(
+					and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.isFileHistoryCheckpoint, true),
+					),
+				)
+				.all();
+			expect(checkpoints).toHaveLength(shape === "no-tools" ? 0 : 1);
+			if (shape === "large-bash-tree-boundary")
+				expect(checkpoints[0]).toMatchObject({
+					treeHashBefore: "a".repeat(40),
+					treeHashAfter: "b".repeat(40),
+				});
+			const timing = [...info.mock.calls, ...warn.mock.calls].find(
+				([message]) => message === "Message history truncation completed",
+			)?.[1];
+			expect(timing?.success).toBe(true);
+			// Measurement only: hardware-dependent time is not a flaky acceptance bound.
+			console.info("Keep-files range diagnostic", {
+				shape,
+				payloadBytes,
+				durationMs,
+				maxLagMs,
+				phaseDurationsMs: timing?.phaseDurationsMs,
+			});
+		});
+	}
+});
+
+describe("editor preview is separate from keep-files regeneration", () => {
+	test("an unchanged Bash boundary triggers preview capture but creates no history checkpoint", async () => {
+		const { narratorId, cwd } = fixture();
+		const boundary = addMessage(narratorId, [{ type: "text", text: "user turn" }], 1);
+		const toolUseId = generateId();
+		const tail = addMessage(narratorId, [{ type: "tool_use", id: toolUseId, name: "Bash" }], 2);
+		const path = join(cwd, "kept-workspace.txt");
+		writeFileSync(path, "current workspace bytes\n");
+		const call = addTool(narratorId, tail, toolUseId, path);
+		db.update(narratorToolCalls)
+			.set({
+				toolName: "Bash",
+				inputJson: { command: "read-only fixture" },
+				treeHashBefore: "a".repeat(40),
+				treeHashAfter: "a".repeat(40),
+			})
+			.where(eq(narratorToolCalls.id, call))
+			.run();
+		spyOn(logger, "info").mockImplementation(() => {});
+		spyOn(logger, "warn").mockImplementation(() => {});
+		spyOn(worktreeTreeSnapshot, "hasTree").mockResolvedValue(true);
+		const capture = spyOn(worktreeTreeSnapshot, "capture").mockResolvedValue("b".repeat(40));
+		const hotCapture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		spyOn(worktreeTreeSnapshot, "diffPaths").mockResolvedValue(["kept-workspace.txt"]);
+		const restore = spyOn(worktreeTreeSnapshot, "restore");
+		const reverse = spyOn(worktreeTreeSnapshot, "reverseAndRestore");
+
+		// The editor starts this comparison before it knows the user's eventual choice.
+		const preview = await snapshotRevert.previewSeqTreeRevert(narratorId, 1);
+		expect(preview?.files).toHaveLength(1);
+		expect(capture).toHaveBeenCalledTimes(1);
+		expect(hotCapture).not.toHaveBeenCalled();
+
+		await narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true });
+		expect(capture).toHaveBeenCalledTimes(1);
+		expect(restore).not.toHaveBeenCalled();
+		expect(reverse).not.toHaveBeenCalled();
+		expect(readFileSync(path, "utf8")).toBe("current workspace bytes\n");
+		const checkpoints = db
+			.select({ id: narratorToolCalls.id })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.isFileHistoryCheckpoint, true),
+				),
+			)
+			.all();
+		expect(checkpoints).toHaveLength(0);
+	});
+});
+
+describe("revert-preview timing diagnostics", () => {
+	test("a missing historical boundary does not capture the workspace", async () => {
+		const { narratorId } = fixture();
+		addMessage(narratorId, [{ type: "text", text: "no tools" }], 1);
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const capture = spyOn(worktreeTreeSnapshot, "capture");
+		expect(await snapshotRevert.previewSeqTreeRevert(narratorId, 1)).toBeNull();
+		expect(capture).not.toHaveBeenCalled();
+		const timing = info.mock.calls.find(
+			([message]) => message === "Sequence revert preview completed",
+		)?.[1];
+		expect(timing).toMatchObject({ narratorId, minSeq: 1, hasBoundary: false, success: true });
+		expect(timing?.boundaryLookupMs).toBeGreaterThanOrEqual(0);
+	});
+
+	test("a failed preview capture remains read-only and logs its capture phase", async () => {
+		const { narratorId, cwd } = fixture();
+		const toolUseId = generateId();
+		const messageId = addMessage(
+			narratorId,
+			[{ type: "tool_use", id: toolUseId, name: "Bash" }],
+			1,
+		);
+		const call = addTool(narratorId, messageId, toolUseId, join(cwd, "kept.txt"));
+		db.update(narratorToolCalls)
+			.set({ treeHashBefore: "a".repeat(40) })
+			.where(eq(narratorToolCalls.id, call))
+			.run();
+		spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		spyOn(worktreeTreeSnapshot, "hasTree").mockResolvedValue(true);
+		spyOn(worktreeTreeSnapshot, "capture").mockRejectedValue(
+			new Error("diagnostic capture failure"),
+		);
+		const restore = spyOn(worktreeTreeSnapshot, "restore");
+		expect(await snapshotRevert.previewSeqTreeRevert(narratorId, 1)).toBeNull();
+		expect(restore).not.toHaveBeenCalled();
+		const timing = warn.mock.calls.find(
+			([message]) => message === "Tree revert preview completed",
+		)?.[1];
+		expect(timing).toMatchObject({ narratorId, outcome: "unavailable", captureMode: "structural" });
+		expect((timing?.phaseDurationsMs as Record<string, number>).capture).toBeGreaterThanOrEqual(0);
 	});
 });

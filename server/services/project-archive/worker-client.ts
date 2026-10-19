@@ -1,29 +1,20 @@
 import type { EventEmitter } from "node:events";
 import { Worker } from "node:worker_threads";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "@server/lib/compiled-worker";
 import { hotSafe } from "@server/lib/hot-safe";
 import { isCompiledRuntime } from "@server/lib/runtime-target";
 export type PrivateArchiveWorkerKind = "legacy-sync" | "legacy-import";
-const paths = {
-	"legacy-sync": "project-archive/legacy-sync-worker",
-	"legacy-import": "project-archive/legacy-import-worker",
-} as const;
 export function privateArchiveWorkerSpecifiers(
 	kind: PrivateArchiveWorkerKind,
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	const path = paths[kind];
-	return (
-		compiled
-			? [`./services/${path}.js`, `./server/services/${path}.js`, `./${path.split("/").at(-1)}.js`]
-			: [`./${path.split("/").at(-1)}.ts`]
-	).map((specifier) => new URL(specifier, moduleUrl).href);
-}
-function entryPoint(specifier: string): URL | string {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname))
-		return decodeURIComponent(url.pathname.slice(1));
-	return url;
+	return compiledWorkerSpecifiers(
+		`services/project-archive/${kind}-worker.ts`,
+		`./${kind}-worker.ts`,
+		moduleUrl,
+		compiled,
+	);
 }
 type PrivateArchiveWorkerHandle = Pick<EventEmitter, "once" | "off"> & {
 	terminate(): Promise<number>;
@@ -67,7 +58,7 @@ export function createPrivateArchiveWorkerLifecycle<W extends PrivateArchiveWork
 			assertOpen();
 			signal.throwIfAborted();
 			if (Date.now() >= deadline) throw new Error("Project archive worker startup timed out");
-			const worker = createWorker(entryPoint(specifier));
+			const worker = createWorker(workerEntryFromSpecifier(specifier));
 			const entry: Entry = { onExit: () => forget(worker, entry) };
 			// Register BEFORE ready: startup and detached HTTP-202 jobs also hold DB handles.
 			workers.set(worker, entry);

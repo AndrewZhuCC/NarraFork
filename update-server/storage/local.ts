@@ -1,6 +1,8 @@
 /**
  * Local filesystem storage backend.
  */
+
+import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -9,16 +11,31 @@ import {
 	rmSync,
 	statSync,
 	unlinkSync,
-	writeFileSync,
 } from "node:fs";
+import { mkdir, open, opendir, rename, stat, statfs, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import type { StorageBackend } from "./types";
+import type { StorageBackend, VerifiedFileOptions } from "./types";
 
 /** Thrown when a storage path would escape the configured base directory. */
 export class UnsafeStoragePathError extends Error {
 	constructor(path: string) {
 		super(`Unsafe storage path: ${path}`);
 		this.name = "UnsafeStoragePathError";
+	}
+}
+
+async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	if (signal.aborted) throw new Error("Mirror upload aborted or deadline exceeded");
+	let reject: (error: Error) => void = () => {};
+	const interrupted = new Promise<never>((_, r) => {
+		reject = r;
+	});
+	const abort = () => reject(new Error("Mirror upload aborted or deadline exceeded"));
+	signal.addEventListener("abort", abort, { once: true });
+	try {
+		return await Promise.race([operation, interrupted]);
+	} finally {
+		signal.removeEventListener("abort", abort);
 	}
 }
 
@@ -51,25 +68,143 @@ export class LocalStorage implements StorageBackend {
 	}
 
 	async saveFile(path: string, data: Buffer | ReadableStream): Promise<void> {
-		const fullPath = this.resolve(path);
-		const dir = dirname(fullPath);
-		if (!existsSync(dir)) {
-			mkdirSync(dir, { recursive: true });
-		}
+		if (Buffer.isBuffer(data)) return this.saveAtomicFile(path, data);
+		await this.writeStream(path, data, undefined);
+	}
 
-		if (Buffer.isBuffer(data)) {
-			writeFileSync(fullPath, data);
-		} else {
-			// ReadableStream → collect into Buffer
-			const chunks: Uint8Array[] = [];
-			const reader = (data as ReadableStream).getReader();
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				chunks.push(value);
+	async saveAtomicFile(path: string, data: Buffer, signal?: AbortSignal): Promise<void> {
+		if (signal?.aborted) throw new Error("Mirror metadata commit aborted");
+		const full = this.resolve(path);
+		await mkdir(dirname(full), { recursive: true });
+		const temporary = `${full}.${randomUUID()}.tmp`;
+		const file = await open(temporary, "wx", 0o600);
+		try {
+			if (signal?.aborted) throw new Error("Mirror metadata commit aborted");
+			await file.writeFile(data);
+			await file.sync();
+			await file.close();
+			if (signal?.aborted) throw new Error("Mirror metadata commit aborted");
+			await rename(temporary, full);
+		} finally {
+			await file.close().catch(() => {});
+			await unlink(temporary).catch(() => {});
+		}
+	}
+
+	private reservedBytes = 0;
+	private activeUploads = 0;
+
+	/** Only scan the new content-addressed mirror directory, never historical data. */
+	private async mirrorBytes(): Promise<number> {
+		const directory = this.resolve("mirror-objects");
+		const entries = await opendir(directory).catch((error) => {
+			if (error.code === "ENOENT") return null;
+			throw error;
+		});
+		let total = 0;
+		let count = 0;
+		if (entries)
+			for await (const entry of entries) {
+				if (++count > 4096) throw new Error("Mirror object quota exceeded");
+				if (!entry.isFile()) throw new Error("Invalid mirror object storage");
+				total += await stat(join(directory, entry.name))
+					.then((value) => value.size)
+					.catch((error) => {
+						if (error.code === "ENOENT") return 0;
+						throw error;
+					});
 			}
-			const buf = Buffer.concat(chunks);
-			writeFileSync(fullPath, buf);
+		return total;
+	}
+
+	async saveVerifiedFile(
+		path: string,
+		data: ReadableStream<Uint8Array>,
+		options: VerifiedFileOptions,
+	): Promise<void> {
+		if (this.activeUploads >= 2) throw new Error("Mirror upload concurrency limit");
+		const signal = AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs)]);
+		this.activeUploads++;
+		// Reserve before any asynchronous admission work, including concurrent quota probes.
+		this.reservedBytes += options.size;
+		try {
+			const disk = await abortable(statfs(this.resolvedBaseDir), signal);
+			if (disk.bavail * disk.bsize < options.minFreeBytes + this.reservedBytes)
+				throw new Error("Mirror disk reserve exhausted");
+			const existing = (await this.getFileSize(path)) ?? 0;
+			if (
+				(await abortable(this.mirrorBytes(), signal)) + this.reservedBytes - existing >
+				options.quotaBytes
+			)
+				throw new Error("Mirror disk quota exceeded");
+			await this.writeStream(path, data, { ...options, signal });
+		} finally {
+			this.reservedBytes -= options.size;
+			this.activeUploads--;
+			void data.cancel().catch(() => {});
+		}
+	}
+
+	private async writeStream(
+		path: string,
+		data: ReadableStream<Uint8Array>,
+		options: VerifiedFileOptions | undefined,
+	): Promise<void> {
+		const full = this.resolve(path);
+		await mkdir(dirname(full), { recursive: true });
+		const temporary = `${full}.${randomUUID()}.tmp`;
+		const file = await open(temporary, "wx", 0o600);
+		const reader = data.getReader();
+		const hash = createHash("sha256");
+		let bytes = 0;
+		let rejectAbort: (reason: Error) => void = () => {};
+		const interrupted = new Promise<never>((_, reject) => {
+			rejectAbort = reject;
+		});
+		const abort = () =>
+			rejectAbort(
+				new Error(
+					options?.signal.reason?.name === "TimeoutError"
+						? "Mirror upload deadline exceeded"
+						: "Mirror upload aborted",
+				),
+			);
+		options?.signal.addEventListener("abort", abort, { once: true });
+		const timer = setTimeout(
+			() => rejectAbort(new Error("Mirror upload deadline exceeded")),
+			options?.timeoutMs ?? 120_000,
+		);
+		try {
+			if (options?.signal.aborted) throw new Error("Mirror upload aborted");
+			while (true) {
+				const { done, value } = await Promise.race([reader.read(), interrupted]);
+				if (done) break;
+				bytes += value.byteLength;
+				if (bytes > (options?.size ?? 512 * 1024 * 1024))
+					throw new Error("Mirror upload byte limit exceeded");
+				let offset = 0;
+				while (offset < value.byteLength) {
+					const result = await Promise.race([
+						file.write(value, offset, Math.min(64 * 1024, value.byteLength - offset)),
+						interrupted,
+					]);
+					if (result.bytesWritten === 0) throw new Error("Mirror disk write failed");
+					hash.update(value.subarray(offset, offset + result.bytesWritten));
+					offset += result.bytesWritten;
+				}
+			}
+			if (options && (bytes !== options.size || hash.digest("hex") !== options.sha256))
+				throw new Error("Mirror upload size or SHA256 mismatch");
+			await Promise.race([file.sync(), interrupted]);
+			if (options?.signal.aborted) throw new Error("Mirror upload aborted");
+			await file.close();
+			await rename(temporary, full);
+		} finally {
+			clearTimeout(timer);
+			options?.signal.removeEventListener("abort", abort);
+			void reader.cancel().catch(() => {});
+			await file.close().catch(() => {});
+			await unlink(temporary).catch(() => {});
 		}
 	}
 

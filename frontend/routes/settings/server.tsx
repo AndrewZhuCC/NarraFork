@@ -2,6 +2,7 @@ import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { DataDirectorySecurityCheckButton } from "../../components/DataDirectorySecurityAlert";
 import { ServerSystemSection } from "../../components/settings/ServerSystemSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 
@@ -23,6 +24,7 @@ function SettingsServerPage() {
 	return (
 		<Stack>
 			<Title order={3}>{t("serverAndSystemSection")}</Title>
+			<DataDirectorySecurityCheckButton />
 			<ServerSystemSection
 				port={is.port}
 				setPort={is.setPort}

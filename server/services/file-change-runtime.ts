@@ -118,6 +118,7 @@ const TOOL_COLUMNS = {
 	canonical: narratorToolCalls.canonicalFilePath,
 	generation: narratorToolCalls.runtimeGeneration,
 	operationId: narratorToolCalls.fileChangeOperationId,
+	segmentId: narratorToolCalls.executionSegmentId,
 };
 
 /** Process identity survives --hot but is never reused across an actual restart. */
@@ -209,9 +210,10 @@ export class EditorFileChangeUncertainError extends Error {
  * Adding a name here is not enough on its own: the replay path (`applyToolCall` in
  * file-state-rebuild.ts) dispatches on this same name and SILENTLY treats an unknown one
  * as "no change", which would reconstruct a file as though the edit never happened. Any
- * new member needs a replay branch there too.
+ * new member needs a replay branch there too. GenUI requires its byte-exact
+ * journal; legacy text replay explicitly refuses it because input has no template bytes.
  */
-export type FileChangeToolName = "Write" | "Edit" | "StructSed";
+export type FileChangeToolName = "Write" | "Edit" | "StructSed" | "GenUI";
 
 type BoundFileChange<Result> = {
 	io?: FileChangeLocalIo;
@@ -246,6 +248,8 @@ type BoundFileChange<Result> = {
 	beforeIntentValidation?(): Promise<void>;
 	onDispatch?(): void;
 	onNotApplied?(): void;
+	/** Use the backend's path-safe exclusive creation primitive, never replace a file. */
+	exclusiveCreate?: boolean;
 };
 
 export interface LocalFileChangeRequest {
@@ -253,6 +257,8 @@ export interface LocalFileChangeRequest {
 	backend: ExecutionBackend;
 	toolName: FileChangeToolName;
 	filePath: string;
+	/** GenUI alone creates a generated App.tsx beneath its frozen directory target. */
+	exclusiveCreate?: boolean;
 	/** Only this tool's actual input, hashed with the frozen target. Never stored as a body. */
 	input: Record<string, unknown>;
 	/** Pure construction: no target IO, legacy snapshot or attribution inside this callback. */
@@ -604,7 +610,21 @@ export class LocalFileChangeRuntime {
 			throw new Error("Blob directory identity changed; evidence needs verification");
 	}
 
-	private validateCall(request: LocalFileChangeRequest) {
+	/** Preflight before generated directories are allocated; no filesystem or journal IO. */
+	assertAdmission(
+		request: Pick<LocalFileChangeRequest, "ctx" | "backend" | "toolName" | "filePath">,
+	): void {
+		const { row } = this.validateCall(request);
+		if (row.operationId !== null)
+			throw new Error("Tool-call operation is already bound; refusing redispatch");
+	}
+
+	private validateCall(
+		request: Pick<
+			LocalFileChangeRequest,
+			"ctx" | "backend" | "toolName" | "filePath" | "exclusiveCreate"
+		>,
+	) {
 		const { ctx, backend, toolName } = request;
 		const binding = ctx.toolCallBinding;
 		const target = ctx.executionTarget;
@@ -646,12 +666,30 @@ export class LocalFileChangeRuntime {
 			row.lexical !== target.lexicalPath ||
 			row.canonical !== target.canonicalPath ||
 			row.generation !== target.runtimeGeneration ||
+			(toolName === "GenUI" && row.segmentId !== (ctx.executionSegmentId ?? null)) ||
 			((row.status !== "running" || row.startedAt === null) && row.operationId === null)
 		)
 			throw new Error("Tool-call row/attempt does not match its real authorized execution");
-		if (
-			!backend.paths.equals(backend.paths.resolve(target.cwd, request.filePath), target.lexicalPath)
-		)
+		const filePath = backend.paths.resolve(target.cwd, request.filePath);
+		if (request.exclusiveCreate) {
+			// The authorized/persisted target remains the UI base. Only the generated
+			// direct child App.tsx may refine it; never rewrite the tool-call identity.
+			const directory = backend.paths.dirname(filePath);
+			if (
+				toolName !== "GenUI" ||
+				!backend.paths.equals(target.lexicalPath, target.canonicalPath) ||
+				!backend.paths.equals(backend.paths.dirname(directory), target.canonicalPath) ||
+				backend.paths.basename(filePath) !== "App.tsx" ||
+				!/^[\p{L}\p{N}][\p{L}\p{N}_-]{1,112}$/u.test(backend.paths.basename(directory))
+			)
+				throw new Error("Exclusive create escaped its frozen directory target");
+			return {
+				row,
+				target: Object.freeze({ ...target, lexicalPath: filePath, canonicalPath: filePath }),
+				runtime: Object.freeze({ ...runtime }),
+			};
+		}
+		if (!backend.paths.equals(filePath, target.lexicalPath))
 			throw new Error("Tool input changed its frozen path");
 		return { row, target: Object.freeze({ ...target }), runtime: Object.freeze({ ...runtime }) };
 	}
@@ -890,6 +928,8 @@ export class LocalFileChangeRuntime {
 			},
 		};
 		const { ctx, backend } = request;
+		if (request.toolName === "GenUI" && !request.exclusiveCreate)
+			throw new Error("GenUI file changes require exclusive creation");
 		const frozen = this.validateCall(request);
 		try {
 			request.input = snapshotFileToolInput(request.input);
@@ -944,6 +984,7 @@ export class LocalFileChangeRuntime {
 			subtype: actorRow.subtype,
 			executionSegmentId: ctx.executionSegmentId ?? null,
 			construct: request.construct,
+			exclusiveCreate: request.exclusiveCreate,
 			assertBinding: () => {
 				this.validateCall(request);
 			},
@@ -962,7 +1003,8 @@ export class LocalFileChangeRuntime {
 		try {
 			completed = await this.executeBound(bound);
 		} catch (error) {
-			if (!(error instanceof BlobHistoryUnavailableBeforeDispatch)) throw error;
+			if (!(error instanceof BlobHistoryUnavailableBeforeDispatch) || request.exclusiveCreate)
+				throw error;
 			ctx.signal.throwIfAborted();
 			this.initialization = undefined;
 			void this.initialize().catch(() => {});
@@ -1720,7 +1762,14 @@ export class LocalFileChangeRuntime {
 												namespace,
 												{
 													bytes: prepared.nextBytes,
-													mode: before.mode ?? 0o666 & ~process.umask(),
+													// The intended mode has to be one the platform can report
+													// back, or the write can never be verified. Windows has no
+													// owner-only bit: a new file there always stats as 0o666.
+													mode:
+														before.mode ??
+														(request.exclusiveCreate && process.platform !== "win32"
+															? 0o600
+															: 0o666) & ~process.umask(),
 													identity: null,
 												},
 												signal,
@@ -1849,6 +1898,7 @@ export class LocalFileChangeRuntime {
 												canonicalPath,
 												before,
 												nextBytes: prepared.nextBytes,
+												exclusiveCreate: request.exclusiveCreate,
 												signal,
 												assertTarget,
 												diagnostics,
@@ -2113,7 +2163,7 @@ export class LocalFileChangeRuntime {
 					action:
 						request.sourceKind === "editor"
 							? "human"
-							: request.toolName === "Write"
+							: request.toolName === "Write" || request.toolName === "GenUI"
 								? "write"
 								: "edit",
 					toolName: request.toolName,
@@ -2213,7 +2263,7 @@ export function withFileToolNoDispatch(
 /** Freeze the host assertion identity before the tool's first await. */
 export function createFileToolNoDispatchRecorder(
 	ctx: ToolContext,
-	toolName: "Write" | "Edit" | "StructSed",
+	toolName: FileChangeToolName,
 ): (reason: "validation_rejected" | "preview") => Promise<void> {
 	const frozen: ToolContext = {
 		...ctx,
@@ -2226,7 +2276,7 @@ export function createFileToolNoDispatchRecorder(
 /** Called by trusted tools BEFORE crossing any file-writing/intent boundary. */
 export async function recordFileToolNoDispatch(
 	ctx: ToolContext,
-	toolName: "Write" | "Edit" | "StructSed",
+	toolName: FileChangeToolName,
 	reason: "validation_rejected" | "preview",
 ): Promise<void> {
 	if (!ctx.toolCallBinding || !ctx.executionTarget || ctx.executionTarget.pathFlavor === "spec")
@@ -2237,6 +2287,13 @@ export async function recordFileToolNoDispatch(
 	} catch (cause) {
 		throw new FileNoDispatchEvidenceError(cause);
 	}
+}
+
+export async function assertLocalFileChangeAdmission(
+	request: Pick<LocalFileChangeRequest, "ctx" | "backend" | "toolName" | "filePath">,
+): Promise<void> {
+	if (request.backend.kind !== "local") return;
+	(await currentRuntime()).assertAdmission(request);
 }
 
 export async function executeLocalFileChange(

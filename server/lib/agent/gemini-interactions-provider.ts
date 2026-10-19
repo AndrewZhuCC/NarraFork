@@ -4,12 +4,14 @@ import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { GeminiProviderConfig } from "../settings";
-import { parseModelId, settings } from "../settings";
+import { parseModelId } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
+import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
+import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -26,7 +28,7 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { captureResponseStream, responseDumpBudget, sanitizeHeaders } from "./request-dump";
+import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -44,7 +46,6 @@ export const GEMINI_MAX_STREAM_BYTES = 64 * 1024 * 1024;
 export const GEMINI_MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
 export const GEMINI_MAX_TEXT_BYTES = 16 * 1024 * 1024;
 export const GEMINI_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024;
-export const GEMINI_MAX_REQUEST_DUMP_BYTES = 4 * 1024 * 1024;
 
 interface GeminiSystemMarker {
 	type: "system";
@@ -266,20 +267,14 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
 
 		const url = `${this.baseUrl()}/interactions`;
-		const headers = this.headers(true);
-		params.requestDump?.beginResponseAttempt(
-			{
-				transport: "http",
-				method: "POST",
-				url,
-				headers: sanitizeHeaders(headers),
-				bodyText,
-			},
-			Math.min(
-				responseDumpBudget(settings.agent?.requestDumpMaxSize),
-				GEMINI_MAX_REQUEST_DUMP_BYTES,
-			),
-		);
+		const headers = this.headers(true, params.conversationId);
+		params.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		logger.debug("Gemini Interactions request", {
 			model,
 			baseUrl: this.baseUrl(),
@@ -513,13 +508,29 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 	}
 
-	private headers(stream: boolean): Record<string, string> {
-		return {
+	private headers(stream: boolean, conversationId?: string): Record<string, string> {
+		const fingerprint = resolveClientFingerprint({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+			extraHeaders: this.config.extraHeaders,
+			conversationId,
+		});
+		const headers = new Headers({
 			"Content-Type": "application/json",
 			"x-goog-api-key": this.getApiKey(),
 			"Api-Revision": INTERACTIONS_REVISION,
+			"User-Agent": fingerprint.userAgent,
 			...(stream ? { Accept: "text/event-stream" } : {}),
-		};
+			...buildOpencodeSessionHeader({
+				baseUrl: this.baseUrl(),
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		});
+		// HTTP names are case-insensitive; extra headers replace, never comma-join defaults.
+		for (const [name, value] of Object.entries(fingerprint.headers)) headers.set(name, value);
+		return Object.fromEntries(headers.entries());
 	}
 
 	private buildRequestBody(options: {
@@ -1336,10 +1347,15 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
@@ -1347,10 +1363,13 @@ function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): U
 
 function mapUsage(usage: GeminiInteractionUsage | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0;
+	const cachedInputTokens = usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0;
 	return {
-		inputTokens: usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0,
+		// Interactions 原始输入计数包含缓存读取。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.total_output_tokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0,
-		cachedInputTokens: usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens:
 			usage.total_thought_tokens ?? usage.thought_tokens ?? usage.reasoning_tokens ?? 0,
@@ -1454,8 +1473,12 @@ function sanitizeNode(node: unknown): unknown {
 	const output: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
 		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
+		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
+			continue;
+		}
 		if (key === "const") {
-			output.enum = [value];
+			// Gemini's enum field accepts strings only; retain the type for other literals.
+			if (typeof value === "string") output.enum = [value];
 		} else if (key === "properties" && value && typeof value === "object") {
 			output.properties = Object.fromEntries(
 				Object.entries(value as Record<string, unknown>).map(([name, schema]) => [

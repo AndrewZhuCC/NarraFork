@@ -5,7 +5,6 @@ import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { ChapterBar, NarratorGitBar } from "./header/ChapterBar";
-import { AttachmentPreviews } from "./interaction/AttachmentPreviews";
 import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
 import { QueuedMessagesPanel } from "./interaction/QueuedMessagesPanel";
 import { UploadProgressBar } from "./interaction/UploadProgressBar";
@@ -43,8 +42,13 @@ export interface NarratorInteractionAreaProps {
 	// pure util imported directly, and the image viewer comes from context.
 	attachedImages: File[];
 	attachedTextFiles: File[];
+	attachmentsHydrating?: boolean;
+	attachmentsRestoreFailed?: boolean;
+	onRetryAttachments?: () => void;
+	restoredAttachmentResources?: ReadonlyMap<string, File>;
 	updateAttachedImages: React.Dispatch<React.SetStateAction<File[]>>;
 	updateAttachedTextFiles: React.Dispatch<React.SetStateAction<File[]>>;
+	reconcileDocumentAssets?: (ids: readonly string[]) => void;
 
 	// ── Send / upload progress ──
 	sendingState: {
@@ -204,14 +208,6 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				borderTop={props.chapterId || props.onOpenGitPanel ? undefined : statusBar.borderTop}
 			/>
 
-			{/* Staged image + text-file previews (owns its own object-URL previews). */}
-			<AttachmentPreviews
-				attachedImages={props.attachedImages}
-				attachedTextFiles={props.attachedTextFiles}
-				updateAttachedImages={props.updateAttachedImages}
-				updateAttachedTextFiles={props.updateAttachedTextFiles}
-			/>
-
 			{/* Upload / send progress while attachments upload. */}
 			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 			{/* Input */}
@@ -232,6 +228,17 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 			) : (
 				<NarratorComposerRow
 					{...props.composerRowProps}
+					attachedImages={props.attachedImages}
+					attachedTextFiles={props.attachedTextFiles}
+					attachmentsHydrating={props.attachmentsHydrating}
+					attachmentsRestoreFailed={props.attachmentsRestoreFailed}
+					onRetryAttachments={props.onRetryAttachments}
+					restoredAttachmentResources={props.restoredAttachmentResources}
+					onDocumentAssetsChange={props.reconcileDocumentAssets}
+					onAttachmentsChange={(images, textFiles) => {
+						props.updateAttachedImages(images);
+						props.updateAttachedTextFiles(textFiles);
+					}}
 					narratorId={props.common.narratorId}
 					queueHoldProgress={queueHoldProgress}
 					startQueueHold={startQueueHold}

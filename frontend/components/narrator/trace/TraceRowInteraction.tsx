@@ -18,9 +18,11 @@
  * ── Height neutrality (load-bearing for the vlist path) ──
  * The vlist predicts every row's height arithmetically with zero DOM measurement,
  * so this wrapper must not change layout: selection uses `outline` (which does not
- * occupy space), both menus are portaled to document.body, and the inspector /
- * preview modals are lazy AND mounted only while open. An idle row therefore pays
- * nothing and measures exactly as before.
+ * occupy space), both menus are portaled to document.body, and the file-preview
+ * modal is lazy and mounted only while open. The tool-call inspector is owned by
+ * the list shell when that host is registered, so row eviction cannot close it;
+ * otherwise this row keeps a local fallback. An idle row therefore pays nothing
+ * and measures exactly as before.
  *
  * ── Placement ──
  * Deliberately OUTSIDE vlist/ so BOTH render paths can use it: the isolation guard
@@ -64,6 +66,7 @@ import {
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "../message/MessageSelectionCtx";
+import { openHostedToolCallInspector } from "../tool-call/tool-call-inspector-host";
 import { useToolFileNavigation } from "../tool-call/useToolFileNavigation";
 import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { TraceRowIdentity } from "./trace-row-identity";
@@ -314,7 +317,18 @@ export function TraceRowInteraction({
 				<Menu.Item
 					leftSection={<IconInfoCircle size={14} />}
 					onClick={() => {
-						setInspectorOpened(true);
+						const toolUseId = tool?.toolUseId;
+						const hosted =
+							narratorId != null &&
+							toolUseId != null &&
+							openHostedToolCallInspector({
+								narratorId,
+								toolUseId,
+								toolCallId: toolDetailRef?.toolCallId,
+								messageId: toolDetailRef?.messageId,
+								executionAttempt: toolDetailRef?.executionAttempt,
+							});
+						if (!hosted) setInspectorOpened(true);
 						swipe.closeSwipe();
 					}}
 				>

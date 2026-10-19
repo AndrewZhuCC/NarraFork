@@ -215,8 +215,10 @@ export interface ActiveNarrator {
 	 * but has not yet been consumed by a rebuilt in-memory agent history.
 	 */
 	_pendingHistoryCompactSeq?: number;
-	/** Token usage baseline at the start of the current turn (for round token totals). */
-	_tokenUsageBaseline?: TokenUsageSnapshot;
+	/** Cumulative ordinary input + output from completed requests owned by this active narrator. */
+	_requestTokenTotal?: number;
+	/** Cumulative request-token baseline at the start of the current pass. */
+	_tokenUsageBaseline?: number;
 	/** Guard against infinite auto-continuation when continuation turns make no effective progress. */
 	_continuationSuppressed?: boolean;
 	/** Whether the current pass is a normal task continuation or a blocked-task recovery turn. */
@@ -320,6 +322,8 @@ export interface BufferCreator {
 
 /** Shape stored in DB for text files that were saved to a temp directory. */
 export interface SavedBufferedFile {
+	originalName?: string;
+	sourceMimeType?: string;
 	filename: string;
 	path: string;
 	size: number;
@@ -334,6 +338,8 @@ export interface BufferedExecutionIntent {
 }
 
 export interface BufferedMessage {
+	hasComposerDocument?: boolean;
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	executionIntent?: BufferedExecutionIntent;
 	id: string;

@@ -1833,6 +1833,40 @@ describe("classifyToolDetail — knowledge", () => {
 		expect(rows[0]?.href).toBe("/knowledge/e9");
 		expect(metaBadgeLabels(d)).toEqual(["#x", "kw"]);
 	});
+	it("links personal versions to their own page, not to a global entry", () => {
+		const search = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "KnowledgeSearch",
+				category: "knowledge",
+				metadata: {
+					results: [{ id: "p1", personalEntryId: "p1", title: "Mine", snippet: "" }],
+				},
+			}),
+			"structured",
+		);
+		expect(search.entries?.[0]?.href).toBe("/knowledge/mine/p1");
+
+		const read = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "KnowledgeRead",
+			category: "knowledge",
+			inputJson: { personalEntryId: "p2" },
+			outputJson: "body",
+			metadata: { personalEntryId: "p2", linkedEntryId: "e2", title: "My copy" },
+		});
+		expect(metaRowsOf(read).rows[0]?.href).toBe("/knowledge/mine/p2");
+
+		const edit = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "KnowledgeEdit",
+			category: "knowledge",
+			inputJson: { action: "save", personalEntryId: "p3" },
+			outputJson: "Saved content to your personal entry (p3).",
+			metadata: { tool: "KnowledgeEdit", personalEntryId: "p3" },
+		});
+		expect(metaRowsOf(edit).rows[0]).toMatchObject({ text: "p3", href: "/knowledge/mine/p3" });
+	});
 });
 
 describe("classifyToolDetail — taskOutput", () => {

@@ -21,11 +21,12 @@ test("composition no longer builds runtime history, prompts or token estimates",
 			"output_json",
 			"system_prompt",
 			"context_summary AS",
+			"narrator_messages",
 		])
 			expect(source).not.toContain(forbidden);
 	}
 });
-test("composition endpoint retains read ACL and forwards cancellation plus cursor", () => {
+test("composition endpoint retains read ACL and forwards cancellation", () => {
 	expect(route).toContain(
 		'requireNarratorAccess(c, id, c.req.method === "GET" ? "read" : "write")',
 	);
@@ -33,8 +34,7 @@ test("composition endpoint retains read ACL and forwards cancellation plus curso
 		route.indexOf('narratorRoutes.get("/:id/context-composition"'),
 		route.indexOf("\n});", route.indexOf('narratorRoutes.get("/:id/context-composition"')) + 4,
 	);
-	expect(endpoint).toContain(
-		'getNarratorContextComposition(c.req.param("id"), c.req.raw.signal, c.req.query("cursor"))',
-	);
+	expect(endpoint).toContain('getNarratorContextComposition(c.req.param("id"), c.req.raw.signal)');
+	expect(endpoint).not.toContain("cursor");
 	expect(endpoint).not.toContain("getUserLanguage");
 });

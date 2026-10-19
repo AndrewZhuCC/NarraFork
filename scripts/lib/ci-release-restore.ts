@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
+import { runPublicationProcess as runBridgeProcess } from "./ci-publication-runtime";
 import { validateCiReleaseBuildSource } from "./ci-release-build-restore";
 import { verifyReleaseBundle } from "./ci-release-bundle";
 import { readReleaseText } from "./ci-release-io";
@@ -17,7 +18,6 @@ import {
 	validateCiReleaseTag,
 } from "./ci-release-plan";
 import { CI_RELEASE_TARGETS, CI_RELEASE_WORKFLOW } from "./ci-release-types";
-import { runBridgeProcess } from "./ci-update-server-bridge-restore";
 import type { GhRunner } from "./github-release";
 
 export const MAX_RELEASE_BUNDLE_BYTES = 24 * 1024 ** 3;

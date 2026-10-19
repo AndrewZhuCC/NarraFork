@@ -79,14 +79,7 @@ export function EntryAclPanel({ entry }: { entry: KnowledgeEntry }) {
 
 	return (
 		<Stack gap="md">
-			{/* Section 1: Settings */}
-			<div>
-				<Title order={5}>{t("entryAcl")}</Title>
-				<Text size="xs" c="dimmed">
-					{t("entryAclDesc")}
-				</Text>
-			</div>
-
+			{/* Section 1: Settings (the surrounding settings card owns the heading) */}
 			<Select
 				label={t("classificationLevel")}
 				placeholder={t("aclLevelPlaceholder")}

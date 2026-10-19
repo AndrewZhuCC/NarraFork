@@ -501,6 +501,67 @@ describe("settings conditional admin guards", () => {
 		}
 	});
 
+	test.each([
+		"generate-content",
+		"interactions",
+	] as const)("legacy Gemini %s settings preserve fingerprints through HTTP save and readback", async (geminiTransport) => {
+		const original = structuredClone(settings);
+		try {
+			const provider = {
+				id: "gemini-fingerprint",
+				name: "Gemini",
+				prefix: "gemini-fingerprint",
+				apiKey: "real-gemini-key",
+				baseUrl: "https://opencode.ai/inference/go/v1",
+				defaultModel: "gemini-2.5-flash",
+				geminiTransport,
+				userAgentMode: "custom" as const,
+				customUserAgent: "Gemini-Client/1",
+				extraHeaders: { "X-OpenCode-Session": "manual-session", "X-Test": "retained" },
+			};
+			const app = appForRole("admin");
+			const patch = (body: unknown) =>
+				app.request("/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(body),
+				});
+			expect((await patch({ geminiProviders: [provider] })).status).toBe(200);
+			for (const family of ["geminiProviders", "customApiProviders"] as const) {
+				expect(settings[family]?.find((entry) => entry.id === provider.id)).toMatchObject(provider);
+			}
+			const response = await app.request("/settings");
+			expect(response.status).toBe(200);
+			const saved = await response.json();
+			const legacy = saved.geminiProviders.find(
+				(entry: { id: string }) => entry.id === provider.id,
+			);
+			expect(legacy).toMatchObject({
+				userAgentMode: provider.userAgentMode,
+				customUserAgent: provider.customUserAgent,
+				extraHeaders: provider.extraHeaders,
+			});
+			expect(legacy.apiKey).not.toBe(provider.apiKey);
+			expect((await patch({ geminiProviders: saved.geminiProviders })).status).toBe(200);
+			expect(settings.customApiProviders?.find((entry) => entry.id === provider.id)).toMatchObject(
+				provider,
+			);
+			expect(
+				(
+					await patch({
+						openaiProviders: saved.openaiProviders,
+						anthropicProviders: saved.anthropicProviders,
+					})
+				).status,
+			).toBe(200);
+			expect(settings.geminiProviders?.find((entry) => entry.id === provider.id)).toMatchObject(
+				provider,
+			);
+		} finally {
+			saveSettings(original);
+		}
+	});
+
 	test("masked unified Gemini patches round-trip explicit transport without losing the key", async () => {
 		const original = structuredClone(settings);
 		try {

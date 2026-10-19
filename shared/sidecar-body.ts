@@ -65,9 +65,19 @@ export interface SideCarTaskEntry {
 
 /** One knowledge-base entry the injection surfaced. */
 export interface SideCarKnowledgeHit {
+	scope?: "personal" | "global";
 	entryId: string;
 	title: string;
 	summary: string;
+}
+
+/** Model-facing knowledge hints shared by direct injections and sidecar projection. */
+export function formatKnowledgeInjections(hits: SideCarKnowledgeHit[], heading: string): string {
+	const lines = hits.map(
+		(hit) =>
+			`- [${hit.scope ?? "global"}:${hit.entryId}] ${hit.title}: ${hit.summary} (KnowledgeRead ${JSON.stringify(hit.scope === "personal" ? { personalEntryId: hit.entryId } : { entryId: hit.entryId })})`,
+	);
+	return `${heading}\n${lines.join("\n")}`;
 }
 
 /** One finished background task (subagent or bash). */
@@ -730,15 +740,8 @@ export function renderSideCarBodyToText(
 		case "tasks":
 			return renderTasksToText(body, templates);
 
-		case "knowledge": {
-			// `formatInjectionsBare`: heading, one `- [id] title: summary` per hit, then a
-			// blank line and the read-more hint.
-			const lines = body.hits.map((hit) => `- [${hit.entryId}] ${hit.title}: ${hit.summary}`);
-			return `${tpl(templates, "knowledgeHeading")}\n${lines.join("\n")}\n\n${tpl(
-				templates,
-				"knowledgeReadHint",
-			)}`;
-		}
+		case "knowledge":
+			return formatKnowledgeInjections(body.hits, tpl(templates, "knowledgeHeading"));
 
 		case "tasksDone":
 			return body.items

@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
+import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -12,12 +13,7 @@ import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-inj
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
-import {
-	type ApiRequestHandle,
-	finishApiRequest,
-	shouldCollectRequestDump,
-	startApiRequest,
-} from "../api-request-tracker";
+import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import {
 	type BooleanOverride,
 	type DangerReflectionLevel,
@@ -43,6 +39,7 @@ import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
+import { buildUsageDataFromSnapshot } from "../usage-tracking";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -59,11 +56,7 @@ import {
 } from "./error-handling";
 import { localPathSemantics } from "./execution/path-semantics";
 import { countInputCharacters } from "./input-characters";
-import {
-	buildMalformedCaptureRecord,
-	isMalformedRequestBodyError,
-	writeMalformedRequestDump,
-} from "./malformed-request-dump";
+import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectAskUserQuestionInput, projectQuestionModelInput } from "./question-model-input";
@@ -73,7 +66,7 @@ import {
 	type PersistedRecoveryGate,
 	recoveryReflection,
 } from "./recovery-gate";
-import { ApiRequestDumpCollector, RING_DIAGNOSTIC_PREFIX_BYTES } from "./request-dump";
+import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
 import {
 	groupToolExecutions,
@@ -199,6 +192,11 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	// deferred question before the call completes; `withdraw` so a maintenance-only
 	// call is not rendered as an empty question.
 	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
+	// `source` is UI markup the chat renders while it streams.
+	GenUI: {
+		short: [...GEN_UI_STREAM_FIELDS.short],
+		large: [...GEN_UI_STREAM_FIELDS.large],
+	},
 };
 
 interface StreamingToolAccumulator {
@@ -1191,16 +1189,7 @@ export function summarizeReflectionFailure(
 type ApiRequestEndEvent = Extract<AgentEvent, { type: "api_request_end" }>;
 
 function normalizeApiRequestUsage(usage: ApiRequestEndEvent["usage"]) {
-	if (!usage) return null;
-	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
-		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
-		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
-		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
-		reasoningTokens: usage.reasoningTokens ?? 0,
-	};
+	return buildUsageDataFromSnapshot(usage);
 }
 
 async function recordReflectionApiRequestEnd(
@@ -1230,8 +1219,6 @@ async function recordReflectionApiRequestEnd(
 			meterUsage: event.meterUsage ?? null,
 			meterUnit: event.meterUnit ?? null,
 			errorMessage: event.errorMessage ?? null,
-			rawDump: event.rawDump,
-			dumpSpillReuseToken: event.dumpSpillReuseToken,
 		});
 	} catch (error) {
 		logger.warn("Failed to record reflection API request", {
@@ -1361,6 +1348,7 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
+			shouldIdleOnReasoningOnly: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -2833,6 +2821,9 @@ async function* agentLoopInMetadataSnapshot(
 	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
 	 */
 	let toolsPlanModeDisabled = planModeDisablesTools();
+	// The current provider-formatted results are the single replay source, including on
+	// turn zero: a retry rebuild may rename IDs or move these results into history.
+	// Never re-read initialToolResults when committing or reflecting the current input.
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
@@ -2993,6 +2984,7 @@ async function* agentLoopInMetadataSnapshot(
 							{
 								kind: "knowledge",
 								hits: scan.hits.map((hit) => ({
+									scope: hit.scope,
 									entryId: hit.entryId,
 									title: hit.title,
 									summary: hit.summary,
@@ -3117,7 +3109,7 @@ async function* agentLoopInMetadataSnapshot(
 	 *
 	 * Rebuilt on every history replacement so it always describes the live history.
 	 */
-	let historyToolUseIds = collectToolUseIdsFromHistory(history, initialToolResults);
+	let historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 
 	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
 		resetUpstreamSessionOnNextRequest = true;
@@ -3252,7 +3244,7 @@ async function* agentLoopInMetadataSnapshot(
 				history,
 				isFirstTurn ? userText : combinePendingInput(nextTurnContent, pendingInputParts),
 				effectiveModel,
-				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+				pendingToolResults,
 				isFirstTurn ? images : undefined,
 			);
 			yield { type: "turn_complete", turnIndex };
@@ -3311,7 +3303,7 @@ async function* agentLoopInMetadataSnapshot(
 					reflectionHistory,
 					content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				return reflectionHistory;
@@ -3853,19 +3845,6 @@ async function* agentLoopInMetadataSnapshot(
 			let requestDiagnostics: ApiRequestDiagnostics | undefined;
 			let requestDump: ApiRequestDumpCollector | undefined;
 			/**
-			 * Set when leaked XML tool calls are detected this turn (recovered or unrecovered),
-			 * forcing the raw dump to persist regardless of the errors-only setting so the SSE
-			 * data is downloadable for debugging.
-			 */
-			let forceDumpPersist = false;
-			/**
-			 * Fallback dump used when the upstream rejected the request body as malformed and
-			 * no dump collector was active for this attempt (dumping disabled and the provider
-			 * does not leak XML tool calls). With a collector present the capture is attached
-			 * to the real dump instead — see {@link captureMalformedRequest}.
-			 */
-			let malformedRequestRecord: unknown;
-			/**
 			 * Attempts already spent replaying an upstream "malformed request body" rejection.
 			 *
 			 * Kept separate from `chatRetryCount` because this rejection is not a transient
@@ -3877,28 +3856,6 @@ async function* agentLoopInMetadataSnapshot(
 			 * would only delay a hard error while re-sending the whole history each time.
 			 */
 			let malformedRetryCount = 0;
-			/**
-			 * Path of the dump file written for this turn's first malformed rejection, if any.
-			 *
-			 * The replays re-send an identical body, so one file is the whole evidence there is;
-			 * later attempts reuse this path instead of writing near-duplicates. `null` records
-			 * "the write was attempted and failed", which must not be retried either — the
-			 * capture record has a distinct note for that case and re-attempting would just
-			 * produce the same failure. See {@link captureMalformedRequest}.
-			 */
-			let malformedDumpPath: string | null | undefined;
-			/**
-			 * Turn-scoped key letting every attempt of THIS rejection share one spilled dump file.
-			 *
-			 * `malformedDumpPath` already keeps the malformed-dump directory to one file per turn,
-			 * but each attempt also persists its own force-saved `api_requests` row, and those
-			 * dumps spill to a SECOND directory (`request-dumps`) that had no such guard: three
-			 * attempts produced three near-identical multi-MB files, pruning unrelated
-			 * captures out of the newest-N window to store the same request three times. The
-			 * token is what tells the tracker these rows describe one request; each row still
-			 * gets a pointer, so no attempt looks like a failure without evidence.
-			 */
-			let malformedSpillReuseToken: string | undefined;
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
 			let requestFinished = false;
@@ -3933,60 +3890,19 @@ async function* agentLoopInMetadataSnapshot(
 			/**
 			 * Special case: the upstream rejected the request body as malformed
 			 * (`REQUEST_BODY_INVALID` / "Improperly formed request.") without saying which
-			 * field was wrong. Force-save the exact request that produced it to a dedicated
-			 * file so the root cause survives every retry path, and ANNOTATE the dump with a
-			 * pointer to that file plus a structural summary.
-			 *
-			 * The annotation must never replace the dump. A user opening a dump is asking what
-			 * was sent; handing back only a summary and a server-side path is the one outcome
-			 * the dump exists to prevent. Row size is bounded downstream by spilling the whole
-			 * dump to a file (see `api-request-dump-store`), not by dropping the request here.
+			 * field was wrong. Pin this attempt's recording so the exact request survives the
+			 * ring window, and attach a bounded structural summary that usually points at the
+			 * offender. Replays re-send the identical body; each attempt is its own recording.
 			 */
-			const captureMalformedRequest = async (errorMessage?: string): Promise<void> => {
-				const snapshot = requestDump?.snapshot();
-				// Write the file only for this turn's FIRST rejection. The replays re-send a
-				// byte-identical body, so a second file would be a near-duplicate of several MB,
-				// and at 3 attempts per turn they would evict unrelated captures through the
-				// newest-N pruning — losing other evidence to keep three copies of one.
-				//
-				// The capture record itself is still rebuilt every attempt: each attempt inserts
-				// its own `api_requests` row, and a row without the annotation would look like an
-				// ordinary failure with no pointer to the evidence.
-				if (malformedDumpPath === undefined) {
-					malformedDumpPath = await writeMalformedRequestDump({
-						narratorId: config.narratorId,
-						requestId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						errorMessage,
-						diagnostics: requestDiagnostics,
-						dump: snapshot,
-					});
-				}
-				const filePath = malformedDumpPath;
-				const captureRecord = buildMalformedCaptureRecord({
-					narratorId: config.narratorId,
-					requestId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					errorMessage,
-					diagnostics: requestDiagnostics,
-					dump: snapshot,
-					filePath,
+			const captureMalformedRequest = (): void => {
+				if (!requestDump) return;
+				const summary = summarizeRequestBody(requestDump.lastRequestBody());
+				requestDump.frame({
+					direction: "request",
+					type: "malformed_request_summary",
+					metadata: { reason: "malformed_request_body", ...(summary ? { summary } : {}) },
 				});
-				if (requestDump) {
-					requestDump.setCapture(captureRecord.capture);
-				} else {
-					// No collector ran for this attempt, so there is no dump to annotate and the
-					// capture record is all the evidence there is.
-					malformedRequestRecord = captureRecord;
-				}
-				forceDumpPersist = true;
-				// Established on the FIRST rejection of this turn and reused by its replays, so
-				// their identical dumps share one spill file. Keyed on the first attempt's
-				// requestId: unique per turn without needing another id source, and stable across
-				// the replays because it is only assigned once.
-				malformedSpillReuseToken ??= `malformed:${requestId}`;
+				requestDump.pin("malformed");
 			};
 
 			function getEstimatedUpstreamPromptTokens(): number | undefined {
@@ -4049,7 +3965,6 @@ async function* agentLoopInMetadataSnapshot(
 					} else requestDiagnostics = normalizedDiagnostics;
 				}
 				const diagnostics = requestDiagnostics;
-				requestDump?.setDiagnostics(diagnostics);
 				// Start is lazy. Let the consumer create/bind its durable API row, and
 				// attach bounded diagnostics, before automatic errors-only saving fires.
 				requestDump?.finish({ error: errorMessage, status: errorMessage ? "error" : "completed" });
@@ -4091,16 +4006,8 @@ async function* agentLoopInMetadataSnapshot(
 					contextPercent: requestContextPercent,
 					meterUsage: requestMeterUsage,
 					meterUnit: requestMeterUnit,
-					// The dump wins whenever one exists: `malformedRequestRecord` is only set on
-					// the no-collector path, where it is the sole record of the rejection.
-					rawDump:
-						settings.agent.requestDumpEnabled || forceDumpPersist
-							? (requestDump?.snapshot() ?? malformedRequestRecord)
-							: undefined,
 					errorMessage,
 					diagnostics,
-					forceDumpPersist,
-					dumpSpillReuseToken: malformedSpillReuseToken,
 				};
 			}
 
@@ -4453,10 +4360,6 @@ async function* agentLoopInMetadataSnapshot(
 				settledResults.clear();
 				streamReadyTools.clear();
 				streamExecutionOpen = false;
-				// Leak-detection dump flag is per successful attempt; clear stale state so a
-				// retry that no longer leaks does not force-persist the previous attempt's dump.
-				forceDumpPersist = false;
-				malformedRequestRecord = undefined;
 				yieldedToolResults.clear();
 				brokenToolUseIds.clear();
 				toolUseAccum.clear();
@@ -4503,12 +4406,8 @@ async function* agentLoopInMetadataSnapshot(
 				requestMeterUnit = undefined;
 				requestDiagnostics = undefined;
 
-				// Collection decision is live (not session-start): saving dump settings must
-				// affect the next provider.chat() in this already-running narrator without
-				// interrupt/restart. Also force-enabled when the provider may leak XML tool
-				// calls so leaked-tool diagnostics always have a bounded raw dump.
-				// Providers write bodyText/events through the *WithLimit helpers, so collection
-				// stays bounded even when force-enabled here.
+				// Recording settings are read live (not at session start): saving them affects
+				// the next provider.chat() in this already-running narrator without restart.
 				activeRequestDump?.finish({
 					status: "interrupted",
 					error: "Attempt replaced before final response classification",
@@ -4522,15 +4421,7 @@ async function* agentLoopInMetadataSnapshot(
 					model: effectiveModel,
 					kind: config.reflectionLoop ? "reflection" : "narrator",
 				});
-				const collectLegacyDump = shouldCollectRequestDump(provider.mayLeakXmlToolCalls);
-				requestDump =
-					recording || collectLegacyDump
-						? new ApiRequestDumpCollector(
-								{ provider: effectiveProvider, model: effectiveModel },
-								recording,
-								collectLegacyDump ? undefined : RING_DIAGNOSTIC_PREFIX_BYTES,
-							)
-						: undefined;
+				requestDump = recording ? new ApiRequestDumpCollector(recording) : undefined;
 				activeRequestDump = requestDump;
 
 				const attemptAbort = new AbortController();
@@ -5360,20 +5251,37 @@ async function* agentLoopInMetadataSnapshot(
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
 							};
 						}
-						// Convert OpenAI/Anthropic usage to context_usage percentage
-						if (parsed.usage && parsed.usage.promptTokens != null) {
+						// Billing updates can be output-only; occupancy still requires a real prompt.
+						if (parsed.usage) {
 							receivedUsage = true;
 							const previousUsage = requestUsage as ApiRequestEndEvent["usage"];
+							const zeroPlaceholder =
+								parsed.usage.promptTokens === 0 &&
+								parsed.usage.completionTokens === 0 &&
+								[
+									parsed.usage.inputTokens,
+									parsed.usage.reasoningTokens,
+									parsed.usage.cachedInputTokens,
+									parsed.usage.cacheCreationInputTokens,
+									parsed.usage.cacheCreation5mTokens,
+									parsed.usage.cacheCreation1hTokens,
+								].every((count) => count == null || count === 0);
 							// Merge partial counters without letting prompt/input placeholders
-							// erase known counts. Output and cache counters update independently.
+							// erase known counts. A nonempty fully cached prompt legitimately has
+							// zero ordinary input. Output and cache counters update independently.
 							requestUsage = {
-								promptTokens: parsed.usage.promptTokens || previousUsage?.promptTokens || 0,
+								promptTokens:
+									parsed.usage.promptTokens === 0 && previousUsage?.promptTokens
+										? previousUsage.promptTokens
+										: (parsed.usage.promptTokens ?? previousUsage?.promptTokens),
 								inputTokens:
-									parsed.usage.inputTokens === 0 && previousUsage?.inputTokens
+									parsed.usage.promptTokens === 0 &&
+									parsed.usage.inputTokens === 0 &&
+									previousUsage?.inputTokens
 										? previousUsage.inputTokens
 										: (parsed.usage.inputTokens ?? previousUsage?.inputTokens),
 								completionTokens:
-									parsed.usage.completionTokens === 0 && previousUsage?.completionTokens
+									zeroPlaceholder && previousUsage?.completionTokens
 										? previousUsage.completionTokens
 										: (parsed.usage.completionTokens ?? previousUsage?.completionTokens),
 								reasoningTokens: parsed.usage.reasoningTokens ?? previousUsage?.reasoningTokens,
@@ -5396,6 +5304,7 @@ async function* agentLoopInMetadataSnapshot(
 							// causes the UI to briefly flash "0%" before showing the real value.
 							if (
 								contextWindow &&
+								parsed.usage.promptTokens != null &&
 								parsed.usage.promptTokens > 0 &&
 								upstreamContextPercent === undefined
 							) {
@@ -5531,7 +5440,7 @@ async function* agentLoopInMetadataSnapshot(
 							if (
 								isMalformedRequestBodyError({ reason, message, diagnostics: requestDiagnostics })
 							) {
-								await captureMalformedRequest(message);
+								captureMalformedRequest();
 								// Almost always an upstream hiccup that clears on its own, so replay the
 								// identical request a couple of times before surfacing a hard failure.
 								if (canReplayMalformedRequest()) {
@@ -6055,7 +5964,7 @@ async function* agentLoopInMetadataSnapshot(
 					// Opaque upstream "malformed request body" rejection: capture the exact
 					// request before any retry/classification path can discard it.
 					if (isMalformedRequestBodyError(err)) {
-						await captureMalformedRequest(msg);
+						captureMalformedRequest();
 						// Same reasoning as the stream-event path: replay a bounded number of times,
 						// since this rejection is overwhelmingly an upstream hiccup. Placed before the
 						// payment/availability checks because those cannot apply to this error, and
@@ -6495,12 +6404,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "done" };
 						return;
 					}
-					provider.pushUserTurn(
-						history,
-						content,
-						effectiveModel,
-						isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-					);
+					provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					pendingToolResults = [];
 					nextTurnContent = buildReflectionCorrectionPrompt(config);
 					yield { type: "turn_complete", turnIndex };
@@ -6782,6 +6686,17 @@ async function* agentLoopInMetadataSnapshot(
 					yield* abandonAttemptForReplay(REASONING_ONLY_MESSAGE);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
+						return;
+					}
+
+					// Keep the ordinary cleanup above, but do not retry or compact a model
+					// that has nothing to say while waiting for a background result / Send.
+					if (await config.shouldIdleOnReasoningOnly?.()) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield { type: "done", reason: "reasoning_only_idle" };
 						return;
 					}
 
@@ -7085,7 +7000,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				yield { type: "turn_complete", turnIndex };
@@ -7148,7 +7063,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				if (
@@ -7181,13 +7096,7 @@ async function* agentLoopInMetadataSnapshot(
 				});
 				if (toolUses.length === 0) {
 					if (isFirstTurn) {
-						provider.pushUserTurn(
-							history,
-							userText,
-							effectiveModel,
-							initialToolResults ?? [],
-							images,
-						);
+						provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
 					} else if (content || pendingToolResults.length > 0) {
 						provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					}
@@ -7227,7 +7136,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 				);
 				provider.pushAssistantTurn(history, assistantText, []);
 				pendingToolResults = [];
@@ -7249,7 +7158,7 @@ async function* agentLoopInMetadataSnapshot(
 			// After-tools injections are already consumed; retain their actual content
 			// in memory too, or later requests lose them until a full history rebuild.
 			if (isFirstTurn) {
-				provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
+				provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
 			} else if (content || pendingToolResults.length > 0) {
 				provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 			}

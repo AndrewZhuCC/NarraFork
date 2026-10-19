@@ -15,13 +15,18 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
+import { Tooltip } from "@mantine/core";
 import type { FileReference } from "@shared/file-reference";
-import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronRight, IconQuote } from "@tabler/icons-react";
 import { useId, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import {
 	FileReferenceScopeProvider,
 	useFileReferenceScope,
 } from "../../composer/FileReferenceScope";
+import { revealComposerQuote, revealQuotedFile } from "../../composer/quote-jump";
+import { QUOTE_ROLE_ATTR } from "../../composer/quote-source-attrs";
+import { useNarratorDockContext } from "../../dock/NarratorDockContext";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
 	ASSISTANT_PAD_X,
@@ -32,6 +37,7 @@ import {
 	USER_BUBBLE_PADDING,
 	USER_HEADER_BODY_GAP,
 	USER_HEADER_HEIGHT,
+	USER_QUOTE_CHIP_HEIGHT,
 } from "../measure/measure-message-bubble";
 import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
@@ -128,6 +134,7 @@ export function RenderMessageBubble({
 	if (role === "assistant") {
 		return (
 			<div
+				{...{ [QUOTE_ROLE_ATTR]: "assistant" }}
 				style={{
 					position: "relative",
 					paddingInline: ASSISTANT_PAD_X,
@@ -215,7 +222,10 @@ function CommandBubble({
 	const surface = bubbleSurface(isSelf);
 
 	return (
-		<div style={{ display: "flex", justifyContent: surface.justifyContent }}>
+		<div
+			{...{ [QUOTE_ROLE_ATTR]: "user" }}
+			style={{ display: "flex", justifyContent: surface.justifyContent }}
+		>
 			<div
 				style={{
 					position: "relative",
@@ -402,7 +412,10 @@ function UserBubble({
 	const surface = bubbleSurface(isSelf);
 
 	return (
-		<div style={{ display: "flex", justifyContent: surface.justifyContent }}>
+		<div
+			{...{ [QUOTE_ROLE_ATTR]: "user" }}
+			style={{ display: "flex", justifyContent: surface.justifyContent }}
+		>
 			<div
 				style={{
 					position: "relative",
@@ -463,6 +476,16 @@ function UserBubble({
 					if (block.tag === "user-deleted") {
 						return <TombstoneLine key="user-deleted" block={block} top={top} />;
 					}
+					if (block.tag === "user-quote-chips") {
+						return (
+							<UserQuoteChips
+								key="user-quote-chips"
+								block={block}
+								top={top}
+								left={USER_BUBBLE_PADDING}
+							/>
+						);
+					}
 					return (
 						<UserAttachmentView
 							// biome-ignore lint/suspicious/noArrayIndexKey: attachment blocks are a stable ordered list (message contentJson order)
@@ -505,6 +528,117 @@ function UserBubble({
 					</div>
 				) : null}
 			</div>
+		</div>
+	);
+}
+
+interface StoredQuoteChip {
+	label: string;
+	text: string;
+	anchor: string | null;
+}
+
+interface StoredQuoteChipBox {
+	x: number;
+	y: number;
+	width: number;
+}
+
+/**
+ * Quote chips for a sent user message. The measured box already wrapped them;
+ * this only paints those positions. The quoted paragraphs stay in the chip
+ * metadata so a click can highlight the source.
+ */
+function UserQuoteChips({
+	block,
+	top,
+	left,
+}: {
+	block: PreparedFixedBlock;
+	top: number;
+	left: number;
+}) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	const data = block.data ?? {};
+	const quotes = Array.isArray(data.quotes) ? (data.quotes as StoredQuoteChip[]) : [];
+	const chips = Array.isArray(data.chips) ? (data.chips as StoredQuoteChipBox[]) : [];
+	return (
+		<div
+			style={{
+				position: "absolute",
+				top,
+				left,
+				width: block.displayWidth,
+				height: block.height,
+			}}
+		>
+			{quotes.map((quote, index) => {
+				const box = chips[index];
+				if (!box) return null;
+				const preview = quote.text.length > 600 ? `${quote.text.slice(0, 600)}…` : quote.text;
+				return (
+					<Tooltip
+						// biome-ignore lint/suspicious/noArrayIndexKey: chip order is the stored quote order
+						key={index}
+						label={
+							<span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{preview}</span>
+						}
+						multiline
+						w={360}
+						openDelay={300}
+						withinPortal
+					>
+						<button
+							type="button"
+							aria-label={t("quote.open")}
+							disabled={!quote.anchor}
+							onClick={(event) => {
+								if (!quote.anchor) return;
+								if (window.getSelection()?.isCollapsed === false) return;
+								event.stopPropagation();
+								revealComposerQuote(
+									dock,
+									{ label: quote.label, text: quote.text, anchor: quote.anchor },
+									event.currentTarget,
+								);
+							}}
+							style={{
+								position: "absolute",
+								left: box.x,
+								top: box.y,
+								width: box.width,
+								height: USER_QUOTE_CHIP_HEIGHT,
+								boxSizing: "border-box",
+								display: "flex",
+								alignItems: "center",
+								gap: 4,
+								padding: "0 6px",
+								border: "1px solid var(--mantine-color-default-border)",
+								borderRadius: "var(--mantine-radius-sm)",
+								background: "var(--mantine-color-default-hover)",
+								color: "inherit",
+								font: typographyMetrics().font.xs,
+								overflow: "hidden",
+								cursor: quote.anchor ? "pointer" : "default",
+								textAlign: "left",
+							}}
+						>
+							<IconQuote size={12} style={{ flexShrink: 0 }} />
+							<span
+								style={{
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap",
+									minWidth: 0,
+								}}
+							>
+								{quote.label}
+							</span>
+						</button>
+					</Tooltip>
+				);
+			})}
 		</div>
 	);
 }
@@ -651,6 +785,7 @@ function UserAttachmentView({
 	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 }) {
 	const scope = useFileReferenceScope();
+	const dock = useNarratorDockContext();
 	const data = block.data ?? {};
 	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 	if (block.tag === "user-text-file" || block.tag === "user-file-reference") {
@@ -662,8 +797,12 @@ function UserAttachmentView({
 		const reference = data.reference as FileReference | undefined;
 		const openFile =
 			block.tag === "user-file-reference"
-				? reference && scope.openFile
-					? () => scope.openFile?.(reference)
+				? reference
+					? scope.openFile
+						? () => scope.openFile?.(reference)
+						: dock
+							? () => revealQuotedFile(dock, reference)
+							: undefined
 					: undefined
 				: fetchUrl && onFetchAttachment
 					? () => onFetchAttachment(fetchUrl, filename)

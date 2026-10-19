@@ -1,11 +1,24 @@
 import { expect, spyOn } from "bun:test";
 import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import type { Page } from "puppeteer-core";
 import type {} from "../../scripts/smoke-editor-real-io-fixture";
 import { MAX_FILE_REFERENCE_SOURCE_BYTES } from "../../shared/file-reference";
 import * as connection from "../services/device-connection-service";
 import { RemoteBackend } from "../services/device-remote-backend";
 import { createFileReferenceService } from "../services/file-reference-service";
+
+declare global {
+	interface Window {
+		__editorRemoteFailure?: {
+			url: string;
+			method: string;
+			status: number;
+			body: string | null;
+			error: string | null;
+		};
+	}
+}
 
 /** Real service + RemoteBackend request/base64 handling; controlled RPC transport, not a user device. */
 export function remoteEditorFixture(input: {
@@ -141,23 +154,102 @@ export function remoteEditorFixture(input: {
 			] as const) {
 				mode = next;
 				const before = calls.filter((call) => call.method === "fs.read").length;
-				const failed = page.waitForResponse(
-					(response) => response.url().includes("/file-references/") && response.status() >= 400,
+				const endpoint = new URL(
+					`/api/narrators/${encodeURIComponent(input.narratorId)}/file-references/${next === "truncated" ? "preview" : "info"}`,
+					origin,
 				);
-				await page.reload({ waitUntil: "domcontentloaded" });
-				const response = await failed;
-				expect(await response.json()).toHaveProperty("code", code);
-				await page.waitForFunction(
-					() => !!document.querySelector("button") && !document.querySelector(".monaco-editor"),
-				);
-				expect(await page.evaluate(() => window.__editorRealIo?.state().ready ?? false)).toBe(
-					false,
-				);
-				expect(await readFile(input.path, "utf8")).toBe(hostSentinel);
-				expect(calls.filter((call) => call.method === "fs.read").length - before).toBe(
-					next === "truncated" ? 1 : 0,
-				);
-				failures.push({ mode: next, code });
+				endpoint.search = new URLSearchParams({ deviceId, path: basename(input.path) }).toString();
+				// Observe this navigation's real fetch body, not Chrome's evictable CDP body cache.
+				// One precise GET error is cloned per document; the app receives its original response.
+				const observation = await page.evaluateOnNewDocument((url) => {
+					const nativeFetch = window.fetch;
+					window.fetch = Object.assign(async (...args: Parameters<typeof nativeFetch>) => {
+						const result = await nativeFetch.apply(window, args);
+						const [request, init] = args;
+						const method = init?.method ?? (request instanceof Request ? request.method : "GET");
+						if (
+							!window.__editorRemoteFailure &&
+							method.toUpperCase() === "GET" &&
+							result.url === url &&
+							result.status >= 400
+						) {
+							const captured: NonNullable<Window["__editorRemoteFailure"]> = {
+								url: result.url,
+								method: "GET",
+								status: result.status,
+								body: null,
+								error: null,
+							};
+							window.__editorRemoteFailure = captured;
+							void (async () => {
+								const reader = result.clone().body?.getReader();
+								if (!reader) throw new Error("Remote error has no response body");
+								const timer = setTimeout(() => {
+									captured.error = "Remote error body exceeded 5s";
+									void reader.cancel().catch(() => {});
+								}, 5000);
+								try {
+									const decoder = new TextDecoder();
+									let bytes = 0;
+									let body = "";
+									while (true) {
+										const { done, value } = await reader.read();
+										if (captured.error) throw new Error(captured.error);
+										if (done) break;
+										bytes += value.byteLength;
+										if (bytes > 4096) throw new Error("Remote error body exceeded 4 KiB");
+										body += decoder.decode(value, { stream: true });
+									}
+									captured.body = body + decoder.decode();
+								} finally {
+									clearTimeout(timer);
+									void reader.cancel().catch(() => {});
+									reader.releaseLock();
+								}
+							})().catch((error) => {
+								captured.error = String(error).slice(0, 240);
+							});
+						}
+						return result;
+					}, nativeFetch);
+				}, endpoint.href);
+				try {
+					const failed = page.waitForResponse(
+						(response) =>
+							response.url() === endpoint.href &&
+							response.request().method() === "GET" &&
+							response.status() >= 400,
+					);
+					await page.reload({ waitUntil: "domcontentloaded" });
+					const response = await failed;
+					await page.waitForFunction(
+						() =>
+							window.__editorRemoteFailure?.body != null ||
+							window.__editorRemoteFailure?.error != null,
+					);
+					const captured = await page.evaluate(() => window.__editorRemoteFailure);
+					expect(captured).toMatchObject({
+						url: endpoint.href,
+						method: "GET",
+						status: response.status(),
+						error: null,
+					});
+					if (!captured?.body) throw new Error("Missing actual remote error body");
+					expect(JSON.parse(captured.body)).toHaveProperty("code", code);
+					await page.waitForFunction(
+						() => !!document.querySelector("button") && !document.querySelector(".monaco-editor"),
+					);
+					expect(await page.evaluate(() => window.__editorRealIo?.state().ready ?? false)).toBe(
+						false,
+					);
+					expect(await readFile(input.path, "utf8")).toBe(hostSentinel);
+					expect(calls.filter((call) => call.method === "fs.read").length - before).toBe(
+						next === "truncated" ? 1 : 0,
+					);
+					failures.push({ mode: next, code });
+				} finally {
+					await page.removeScriptToEvaluateOnNewDocument(observation.identifier);
+				}
 			}
 			expect(new URL(page.url()).origin).toBe(origin);
 			console.info(

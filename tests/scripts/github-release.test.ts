@@ -1306,13 +1306,26 @@ globalThis.fetch = async () => { throw new Error("FORBIDDEN_LEGACY_BASELINE_FETC
 		expect(output).toContain("Invalid platform count");
 		expect(output).not.toContain("Update server token not found");
 		expect(output).not.toContain("baseline verification");
-		const legacy = Bun.spawnSync(args, {
+		const mirror = Bun.spawnSync(args, {
 			cwd: join(import.meta.dir, "../.."),
 			env,
 			stdout: "pipe",
 			stderr: "pipe",
 		});
-		expect(legacy.stderr.toString()).toContain("Update server token not found");
+		expect(mirror.exitCode).not.toBe(0);
+		expect(mirror.stderr.toString()).toContain("Unknown platform");
+		// Mirror configuration is still required, but only after valid mirror input.
+		const validMirror = Bun.spawnSync(
+			args.filter((arg) => arg !== "--platform=unknown"),
+			{
+				cwd: join(import.meta.dir, "../.."),
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		expect(validMirror.exitCode).not.toBe(0);
+		expect(validMirror.stderr.toString()).toContain("FAILED_CONFIG");
 	});
 });
 

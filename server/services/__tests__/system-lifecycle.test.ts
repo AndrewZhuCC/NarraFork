@@ -10,7 +10,9 @@ import {
 	failScheduledUpdate,
 	getUpdateCoordinationStatus,
 	markUpdateRestarting,
+	releasePreparedUpdateRecoveryHandoff,
 	resetUpdateCoordinationForTests,
+	rollbackPreparedUpdateRecoverySnapshot,
 	scheduleUpdate,
 	tryAcquireFinalUpdateExecution,
 	UpdateCancelledError,
@@ -21,7 +23,13 @@ import {
 } from "../update-coordinator";
 
 function harness(
-	options: { available?: boolean; failCheckpoint?: boolean; failShutdown?: boolean } = {},
+	options: {
+		available?: boolean;
+		failCheckpoint?: boolean;
+		failShutdown?: boolean;
+		failSchedule?: boolean;
+		failCleanup?: boolean;
+	} = {},
 ) {
 	const shutdown = mock(() => !options.failShutdown);
 	const persist = mock((snapshot: ReturnType<typeof capturePlannedUpdateRecoverySnapshot>) => {
@@ -30,7 +38,10 @@ function harness(
 	const lifecycle = createSystemLifecycle({
 		coordination: getUpdateCoordinationStatus,
 		canShutdown: () => options.available !== false,
-		schedule: () => scheduleUpdate(undefined, "system_shutdown"),
+		schedule: () => {
+			if (options.failSchedule) throw new Error("Recovery source is not owned by this process");
+			return scheduleUpdate(undefined, "system_shutdown");
+		},
 		drain: async () => {
 			await waitForBackgroundBashDrain();
 			assertUpdateNotCancelled();
@@ -46,7 +57,10 @@ function harness(
 		cancel: () => {
 			cancelScheduledUpdate();
 		},
-		cleanup: async (_epoch, error, cancelled) => {
+		cleanup: async (epoch, error, cancelled) => {
+			if (options.failCleanup) throw new Error("Manifest rollback unavailable");
+			rollbackPreparedUpdateRecoverySnapshot(epoch);
+			releasePreparedUpdateRecoveryHandoff(epoch);
 			failScheduledUpdate(error, { cancelled });
 		},
 		isCancellation: (error) => error instanceof UpdateCancelledError,
@@ -151,6 +165,39 @@ describe("system shutdown lifecycle", () => {
 		expect(getUpdateCoordinationStatus().operation).toBe("update");
 	});
 
+	test("source admission failure returns a conflict without starting preparation", () => {
+		const { lifecycle, shutdown, persist } = harness({ failSchedule: true });
+		expect(lifecycle.prepare()).toEqual({
+			success: false,
+			error: "Recovery source is not owned by this process",
+		});
+		expect(lifecycle.status().phase).toBe("idle");
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+		expect(persist).not.toHaveBeenCalled();
+		expect(shutdown).not.toHaveBeenCalled();
+	});
+
+	test("failed durable rollback keeps the epoch and gate until cancellation can retry", async () => {
+		const options = { failCheckpoint: true, failCleanup: true };
+		const { lifecycle, shutdown } = harness(options);
+		lifecycle.shutdown();
+		await lifecycle.settled();
+		const epoch = getUpdateCoordinationStatus().updateEpoch;
+		expect(lifecycle.status()).toMatchObject({
+			phase: "failed",
+			shutdownRequested: false,
+			error: expect.stringContaining("Manifest rollback unavailable"),
+		});
+		expect(getUpdateCoordinationStatus().scheduled).toBe(true);
+		expect(lifecycle.prepare().success).toBe(false);
+		expect(getUpdateCoordinationStatus().updateEpoch).toBe(epoch);
+		options.failCleanup = false;
+		expect(lifecycle.cancel().success).toBe(true);
+		await lifecycle.settled();
+		expect(lifecycle.status().phase).toBe("idle");
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+		expect(shutdown).not.toHaveBeenCalled();
+	});
 	test("only explicit manual authorization permits an ordinary startup", () => {
 		expect(classifyRecoveryManifestOwnership({}, null).owned).toBe(false);
 		expect(classifyRecoveryManifestOwnership({ resumeOnNextStartup: true }, null).owned).toBe(true);

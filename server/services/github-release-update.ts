@@ -13,7 +13,11 @@ import {
 	compareReleaseVersions as compareSemanticVersions,
 	isValidReleaseVersion as validSemver,
 } from "../../shared/release-version";
-import { parseUpdateSourceIdentity, type UpdateSourceIdentity } from "../../shared/update-identity";
+import {
+	parseRecoveryManifestVersions,
+	parseUpdateSourceIdentity,
+	type UpdateSourceIdentity,
+} from "../../shared/update-identity";
 import { parseUpdateIndex, parseUpdateNotes } from "../../shared/update-index";
 import {
 	MAX_UPDATE_INDEX_BYTES,
@@ -21,6 +25,7 @@ import {
 	UPDATE_INDEX_BRANCH,
 	UPDATE_INDEX_FILE,
 	type UpdateIndexAsset,
+	type UpdateIndexBinary,
 	type UpdateIndexV1,
 } from "../../shared/update-index-types";
 import { logger } from "../lib/logger";
@@ -210,6 +215,85 @@ async function readBoundedJson(
 		}
 	} finally {
 		await abortable(reader.cancel(), signal).catch(() => {});
+	}
+}
+
+/** Validate capabilities only after binding the sidecar to the selected binary identity. */
+export function validateGithubBinaryMetadata(
+	metadata: unknown,
+	expected: {
+		name: string;
+		platform: string;
+		version: string;
+		size: number;
+		indexed?: { sha256: string; sha512: string; commit: string };
+	},
+): { sha512: string; recoveryManifestVersions: number[] } {
+	if (
+		!isRecord(metadata) ||
+		metadata.name !== expected.name ||
+		metadata.platform !== expected.platform ||
+		metadata.version !== expected.version ||
+		metadata.size !== expected.size ||
+		typeof metadata.sha512 !== "string" ||
+		!SHA512_RE.test(metadata.sha512) ||
+		typeof metadata.sha256 !== "string" ||
+		!/^[a-f0-9]{64}$/.test(metadata.sha256) ||
+		(expected.indexed &&
+			(metadata.sha256 !== expected.indexed.sha256 ||
+				metadata.sha512 !== expected.indexed.sha512 ||
+				typeof metadata.commit !== "string" ||
+				!/^[a-f0-9]{7,40}$/.test(metadata.commit) ||
+				!expected.indexed.commit.startsWith(metadata.commit)))
+	) {
+		throw new GithubUpdateError(
+			"INVALID_METADATA",
+			"GitHub binary metadata identity or checksum is invalid",
+		);
+	}
+	try {
+		return {
+			sha512: metadata.sha512,
+			recoveryManifestVersions: parseRecoveryManifestVersions(metadata.recoveryManifestVersions),
+		};
+	} catch {
+		throw new GithubUpdateError("INVALID_METADATA", "Invalid recoveryManifestVersions declaration");
+	}
+}
+
+/** Mirror checks use the same GitHub sidecar authority, frozen transport and bounded reader. */
+export async function readIndexedGithubBinaryMetadata(
+	input: { repository: string; version: string; commit: string; binary: UpdateIndexBinary },
+	options: { signal: AbortSignal; fetcher: GithubFetch },
+): Promise<{ sha512: string; recoveryManifestVersions: number[] }> {
+	const { binary } = input;
+	if (
+		!Number.isSafeInteger(binary.metadata.size) ||
+		binary.metadata.size <= 0 ||
+		binary.metadata.size > 64 * 1024
+	) {
+		throw new GithubUpdateError("INVALID_METADATA", "Invalid GitHub sidecar size");
+	}
+	const url = `https://github.com/${input.repository}/releases/download/v${input.version}/${binary.metadata.name}`;
+	validateGithubAssetUrl(url, input.repository, input.version, `${binary.name}.metadata.json`);
+	const signal = AbortSignal.any([options.signal, AbortSignal.timeout(10_000)]);
+	const response = await fetchGithubAsset(url, signal, options.fetcher);
+	try {
+		if (!response.ok)
+			throw new GithubUpdateError("NETWORK_ERROR", "GitHub binary sidecar unavailable");
+		const metadata = await readBoundedJson(response, 64 * 1024, signal);
+		if (metadata.bytes !== binary.metadata.size || metadata.sha256 !== binary.metadata.sha256) {
+			throw new GithubUpdateError("INVALID_METADATA", "GitHub sidecar size or checksum mismatch");
+		}
+		return validateGithubBinaryMetadata(metadata.value, {
+			name: binary.name,
+			platform: binary.platform,
+			version: input.version,
+			size: binary.size,
+			indexed: { sha256: binary.sha256, sha512: binary.sha512, commit: input.commit },
+		});
+	} finally {
+		await abortable(response.body?.cancel() ?? Promise.resolve(), signal).catch(() => {});
 	}
 }
 
@@ -927,33 +1011,26 @@ export class GithubReleaseUpdater {
 			} finally {
 				await response.body?.cancel().catch(() => {});
 			}
-			if (
-				!isRecord(metadata) ||
-				metadata.name !== candidate.binary.name ||
-				metadata.platform !== input.platform ||
-				metadata.version !== candidate.version ||
-				metadata.size !== candidate.binary.size ||
-				typeof metadata.sha512 !== "string" ||
-				!SHA512_RE.test(metadata.sha512) ||
-				typeof metadata.sha256 !== "string" ||
-				!/^[a-f0-9]{64}$/.test(metadata.sha256) ||
-				(indexedBinary &&
-					(metadata.sha256 !== indexedBinary.sha256 ||
-						metadata.sha512 !== indexedBinary.sha512 ||
-						typeof metadata.commit !== "string" ||
-						!/^[a-f0-9]{7,40}$/.test(metadata.commit) ||
-						!indexedRelease?.commit.startsWith(metadata.commit)))
-			) {
-				throw new GithubUpdateError(
-					"INVALID_METADATA",
-					"GitHub binary metadata identity or checksum is invalid",
-				);
-			}
+			const { sha512, recoveryManifestVersions } = validateGithubBinaryMetadata(metadata, {
+				name: candidate.binary.name,
+				platform: input.platform,
+				version: candidate.version,
+				size: candidate.binary.size,
+				...(indexedBinary
+					? {
+							indexed: {
+								sha256: indexedBinary.sha256,
+								sha512: indexedBinary.sha512,
+								commit: indexedRelease?.commit ?? "",
+							},
+						}
+					: {}),
+			});
 			const patchChain = await this.probePatches(
 				releases,
 				input,
 				candidate,
-				metadata.sha512,
+				sha512,
 				deadline,
 				totalBytes,
 				fetcher,
@@ -987,10 +1064,9 @@ export class GithubReleaseUpdater {
 					notesDeferred: !!index,
 					notesAvailable: !!indexedRelease?.notes,
 					path: candidate.binary.name,
-					sha512: metadata.sha512,
-					files: [
-						{ url: candidate.binary.name, size: candidate.binary.size, sha512: metadata.sha512 },
-					],
+					sha512,
+					recoveryManifestVersions,
+					files: [{ url: candidate.binary.name, size: candidate.binary.size, sha512 }],
 					_github: {
 						downloadUrl: candidate.binary.url,
 						repository: input.repository,

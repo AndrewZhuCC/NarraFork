@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	assertCiMainAncestor,
 	ciApiList,
 	createCiReleasePlan,
 	revalidateCiReleasePlan,
@@ -157,6 +158,26 @@ const componentEvidence = {
 };
 
 describe("CI release plan trust boundary", () => {
+	test("ancestry checks project only trust fields before bounded output collection", async () => {
+		const state = fixture();
+		await assertCiMainAncestor(state.run, commit);
+		expect(state.calls.at(-1)).toEqual([
+			"api",
+			`repos/${CI_RELEASE_REPOSITORY}/compare/${commit}...${main}?per_page=1`,
+			"--jq",
+			"{status, merge_base_commit: {sha: .merge_base_commit.sha}}",
+		]);
+		state.ancestor = false;
+		await expect(assertCiMainAncestor(state.run, commit)).rejects.toThrow("not an ancestor");
+		await expect(
+			assertCiMainAncestor(async (args) => {
+				if (args[1].includes("/compare/")) {
+					return JSON.stringify({ status: "ahead", merge_base_commit: { sha: main } });
+				}
+				return state.run(args);
+			}, commit),
+		).rejects.toThrow("not an ancestor");
+	});
 	test("component evidence has strict bounded structure and its own version/tag identity", async () => {
 		const plan = await createCiReleasePlan(options(fixture()));
 		expect(validateCiReleasePlan({ ...plan, componentEvidence }).componentEvidence).toEqual(
@@ -202,10 +223,7 @@ describe("CI release plan trust boundary", () => {
 		expect(plan.componentEvidence).toEqual(componentEvidence);
 		expect(calls).toEqual(["read", "collect"]);
 	});
-	test.each([
-		"index",
-		"mirror",
-	] as const)("%s recovery preflight skips unavailable components but still requires protected publication", async (mode) => {
+	test("index recovery preflight skips unavailable components but still requires protected publication", async () => {
 		const state = fixture();
 		state.componentVersions = { executor: { version: "0.9.1", protocolVersion: 1 } };
 		state.releases = [
@@ -226,8 +244,7 @@ describe("CI release plan trust boundary", () => {
 		const opts = {
 			...options(state),
 			publish: true,
-			indexOnly: mode === "index",
-			mirrorOnly: mode === "mirror",
+			indexOnly: true,
 			sourceRunId: 122,
 			componentChecks: { readDependencies: unavailable, collectEvidence: unavailable },
 		};
@@ -235,9 +252,9 @@ describe("CI release plan trust boundary", () => {
 		expect(plan.componentEvidence).toBeUndefined();
 		expect(componentCalls).toBe(0);
 		expect(state.calls.some((call) => call[1].endsWith("environments/release"))).toBe(true);
-		await expect(
-			createCiReleasePlan({ ...opts, indexOnly: false, mirrorOnly: false }),
-		).rejects.toThrow("helpers/executor unavailable");
+		await expect(createCiReleasePlan({ ...opts, indexOnly: false })).rejects.toThrow(
+			"helpers/executor unavailable",
+		);
 		expect(componentCalls).toBe(1);
 		state.environment.protection_rules = [];
 		await expect(createCiReleasePlan(opts)).rejects.toThrow("required reviewers");
@@ -425,6 +442,33 @@ describe("CI release plan trust boundary", () => {
 		expect(validateCiReleasePlan(input).baselines[0]?.metadata.helperDistribution).toEqual(
 			dependencies,
 		);
+		for (const versions of [
+			[1, 2],
+			[1, 2, 3],
+			[3, 1, 2],
+		]) {
+			expect(
+				validateCiReleasePlan({
+					...plan,
+					baselines: [
+						{ ...baseline, metadata: { ...baseline.metadata, recoveryManifestVersions: versions } },
+					],
+				}).baselines[0]?.metadata.recoveryManifestVersions,
+			).toEqual([...versions].sort((a, b) => a - b));
+		}
+		expect(
+			validateCiReleasePlan(input).baselines[0]?.metadata.recoveryManifestVersions,
+		).toBeUndefined();
+		for (const versions of [[], [0], [256], [1, 1], [1.5], ["1"], null]) {
+			expect(() =>
+				validateCiReleasePlan({
+					...plan,
+					baselines: [
+						{ ...baseline, metadata: { ...baseline.metadata, recoveryManifestVersions: versions } },
+					],
+				}),
+			).toThrow();
+		}
 		const { helperDistribution: _dependencies, ...legacy } = baseline.metadata;
 		expect(
 			validateCiReleasePlan({ ...plan, baselines: [{ ...baseline, metadata: legacy }] })
@@ -648,7 +692,14 @@ describe("CI release plan trust boundary", () => {
 		await expect(createCiReleasePlan({ ...options(state), publish: true, run })).rejects.toThrow(
 			"404",
 		);
-		expect(state.calls.every((args) => args.length === 2 || args[1] === "graphql")).toBe(true);
+		expect(
+			state.calls.every(
+				(args) =>
+					args.length === 2 ||
+					args[1] === "graphql" ||
+					(args.length === 4 && args[1].includes("/compare/") && args[2] === "--jq"),
+			),
+		).toBe(true);
 	});
 	test("publication rechecks moved tag and lost main ancestry", async () => {
 		const state = fixture();

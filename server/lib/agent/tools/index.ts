@@ -15,6 +15,7 @@ import {
 	exitPlanReviseTool,
 } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
+import { genUiTool } from "./gen-ui";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { hookAdminTool } from "./hook-admin";
@@ -65,6 +66,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
+	["GenUI", genUiTool],
 	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],

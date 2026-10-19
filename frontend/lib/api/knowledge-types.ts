@@ -41,6 +41,52 @@ export interface KnowledgeCollection {
 	updatedAt: string;
 }
 
+/**
+ * What the requesting user may do with one collection, as decided by the server
+ * (GET /knowledge/collections). Each flag mirrors the gate of the endpoint named beside it;
+ * the UI shows actions from these bits instead of re-deriving the ACL.
+ */
+export interface KnowledgeCollectionViewerCaps {
+	/** PATCH /collections/:id (rename / description). */
+	canEdit: boolean;
+	/** PATCH /collections/:id/acl (level / controlled tags). */
+	canManageAcl: boolean;
+	/** POST /collections/:id/transfer-owner. */
+	canTransferOwner: boolean;
+	/** DELETE /collections/:id. */
+	canDelete: boolean;
+	/** POST /entries into this collection. */
+	canCreateEntry: boolean;
+}
+
+/** A row of GET /knowledge/collections: the collection plus the caller's capability bits. */
+export interface KnowledgeCollectionListItem extends KnowledgeCollection {
+	viewerCaps: KnowledgeCollectionViewerCaps;
+}
+
+/**
+ * What the requesting user may do with one entry, as decided by the server
+ * (GET /knowledge/entries/:id). Each flag mirrors the gate of the endpoint named beside it.
+ */
+export interface KnowledgeEntryViewerCaps {
+	/** POST /entries/:id/revisions — direct edit of main. */
+	canWriteMain: boolean;
+	/** PATCH /entries/:id — title / tags / keywords / status. */
+	canEditMeta: boolean;
+	/** PATCH /entries/:id/acl — level / controlled tags / review tags. */
+	canManageAcl: boolean;
+	/** POST /entries/:id/transfer-owner. */
+	canTransferOwner: boolean;
+	/** DELETE /entries/:id. */
+	canDelete: boolean;
+	/** May review linked publish requests on this entry (own requests excepted). */
+	canReview: boolean;
+	/** POST /entries/:id/links (this entry as source); incoming links carry `canRemove`. */
+	canManageLinks: boolean;
+	/** The caller's active personal version of this entry, if any. */
+	myPersonalEntryId: string | null;
+}
+
 export interface KnowledgeEntry {
 	id: string;
 	collectionId: string;
@@ -62,6 +108,15 @@ export interface KnowledgeEntry {
 	updatedAt: string;
 }
 
+/** GET /knowledge/entries/:id: the full entry plus the caller's capability bits. */
+export interface KnowledgeEntryDetail extends KnowledgeEntry {
+	/** Display name of `ownerUserId` (null when unowned or the user is gone). */
+	ownerUsername: string | null;
+	/** Version number of the newest revision (null before the first one). */
+	currentVersion: number | null;
+	viewerCaps: KnowledgeEntryViewerCaps;
+}
+
 /** Search / list result row (lighter shape with snippet). */
 export interface KnowledgeSearchResult {
 	id: string;
@@ -74,6 +129,36 @@ export interface KnowledgeSearchResult {
 	updatedAt: string;
 	snippet: string;
 }
+
+/**
+ * One page of GET /knowledge/entries in paged mode (`limit` and/or `cursor` sent).
+ * List rows carry `tagsJson`; FTS search rows (when `q` is set) carry `tags` + `snippet`.
+ * `nextCursor` is null once exhausted; a non-null cursor may accompany a short or even
+ * empty page (ACL filtering within the server's per-request scan budget).
+ */
+export interface KnowledgeEntryPage {
+	items: KnowledgeEntryListItem[];
+	nextCursor: string | null;
+}
+
+/** Per-row annotations of the paged list (owner name, the caller's personal version). */
+export interface KnowledgeEntryListAnnotations {
+	ownerUsername: string | null;
+	myPersonalEntryId: string | null;
+	/** The personal version forked from an older main revision (list rows only; search rows
+	 *  carry no revision id, so this stays false there). */
+	myPersonalEntryBehindMain: boolean;
+}
+
+/** A row of the paged entry list: a list row, or (with `q`) a search row with owner + level. */
+export type KnowledgeEntryListItem = KnowledgeEntryListAnnotations &
+	(
+		| KnowledgeEntry
+		| (KnowledgeSearchResult & { ownerUserId: string | null; classificationLevel: string | null })
+	);
+
+/** `sort` of the browse list: `relevance` applies only with a search query. */
+export type KnowledgeEntrySort = "updated" | "title" | "relevance";
 
 /**
  * A revision's METADATA, as returned by the history list.
@@ -148,6 +233,10 @@ export interface KnowledgePersonalEntrySummary {
 	 * endpoint, so the badge costs nothing extra. Always false for standalone entries (no main).
 	 */
 	drifted?: boolean;
+	/** Linked: the global entry's title — null when the caller can no longer read it. */
+	entryTitle?: string | null;
+	/** Standalone: the publish target's name — null when unset or not readable. */
+	targetCollectionName?: string | null;
 }
 
 /**
@@ -158,6 +247,45 @@ export interface KnowledgePersonalEntrySummary {
 export interface KnowledgePersonalEntry
 	extends Omit<KnowledgePersonalEntrySummary, "contentLength"> {
 	content: string;
+}
+
+/** Why a personal entry cannot be submitted right now (server `personalEntrySubmitBlockers`). */
+export type KnowledgePersonalSubmitBlocker =
+	| "archived"
+	| "missing_target"
+	| "missing_title"
+	| "open_request";
+
+/**
+ * What the owner may do with one personal version — each flag is the gate of the endpoint it
+ * stands for (edit body, edit standalone metadata, rebase, delete, submit).
+ */
+export interface KnowledgePersonalEntryViewerCaps {
+	canEdit: boolean;
+	canEditMeta: boolean;
+	canRebase: boolean;
+	canDelete: boolean;
+	canSubmit: boolean;
+	submitBlockers: KnowledgePersonalSubmitBlocker[];
+}
+
+/** `GET /personal-entries/:id`: the personal-version page payload. */
+export interface KnowledgePersonalEntryDetail extends KnowledgePersonalEntry {
+	/** Linked and readable only. */
+	entryTitle: string | null;
+	/** Linked and readable only: the diff baseline. */
+	currentMainContent: string | null;
+	/** Linked and readable only. */
+	drift: { drifted: boolean; versionsBehind: number } | null;
+	targetCollectionName: string | null;
+	/** Requests a delete would close (pending / conflict / changes requested), newest first. */
+	openSubmissions: {
+		id: string;
+		status: KnowledgeSubmissionStatus;
+		round: number;
+		createdAt: string;
+	}[];
+	viewerCaps: KnowledgePersonalEntryViewerCaps;
 }
 
 /**
@@ -207,9 +335,67 @@ export interface KnowledgeSubmission {
 	createdAt: string;
 }
 
-/** getSubmission adds a unified diff string. */
+/**
+ * A reviewer-list row (`GET /submissions`) with ACL-checked display metadata for the review
+ * inbox. `entryTitle` / `collectionName` are null when the caller cannot read them.
+ */
+export interface KnowledgeSubmissionListItem extends KnowledgeSubmission {
+	entryTitle: string | null;
+	/** Linked → the entry's collection; standalone → the publish target. */
+	targetCollectionId: string | null;
+	collectionName: string | null;
+	submitterUsername: string | null;
+	/** Open linked request based on a stale main; null when unknown / not applicable. */
+	drifted: boolean | null;
+}
+
+/**
+ * What the caller may do with one publish request. Computed server-side by the same functions
+ * the action endpoints use — the request page never infers these from role or identity.
+ */
+export interface KnowledgeSubmissionViewerCaps {
+	isSubmitter: boolean;
+	/** A verdict is accepted (at least comment-only). */
+	canReview: boolean;
+	/** `approve` is accepted (pending only; a conflict is resolved instead). */
+	canApprove: boolean;
+	canResolveConflict: boolean;
+	canWithdraw: boolean;
+	canResubmit: boolean;
+}
+
+/** One round of the same proposal (same personal version and target). */
+export interface KnowledgeSubmissionHistoryItem {
+	id: string;
+	changeNote: string | null;
+	round?: number;
+	status: KnowledgeSubmissionStatus;
+	verdict: KnowledgeVerdict | null;
+	findingsJson: KnowledgeFinding[] | null;
+	reviewerUserId: string | null;
+	reviewerUsername: string | null;
+	reviewedAt: string | null;
+	createdAt: string;
+}
+
+/** `GET /submissions/:id`: the request page's whole payload. */
 export interface KnowledgeSubmissionDetail extends KnowledgeSubmission {
+	/** Unified diff base → proposed. */
 	diff: string;
+	/** The fork point the proposal was made against ("" for standalone). */
+	baseContent: string;
+	/** Current main; null for standalone or when the caller cannot read the entry. */
+	currentMainContent: string | null;
+	entryTitle: string | null;
+	targetCollectionId: string | null;
+	collectionName: string | null;
+	submitterUsername: string | null;
+	reviewerUsername: string | null;
+	/** Linked and readable only. */
+	drift: { drifted: boolean; versionsBehind: number } | null;
+	/** Rounds of this proposal, newest first (includes this request). */
+	history: KnowledgeSubmissionHistoryItem[];
+	viewerCaps: KnowledgeSubmissionViewerCaps;
 }
 
 /**
@@ -239,6 +425,23 @@ export interface KnowledgeOpenSubmission {
 	draftId: string;
 	entryId: string | null;
 	status: Extract<KnowledgeSubmissionStatus, "pending" | "conflict" | "changes_requested">;
+	createdAt: string;
+}
+
+/**
+ * A verdict on the caller's own submission, for the notification bell.
+ *
+ * Deliberately has no title, change note, or proposed content. Those can carry
+ * classified text; the bell links to the entry, which re-checks read access.
+ */
+export interface KnowledgeSubmissionOutcome {
+	id: string;
+	draftId: string;
+	entryId: string | null;
+	status: Extract<KnowledgeSubmissionStatus, "approved" | "rejected" | "changes_requested">;
+	verdict: KnowledgeVerdict | null;
+	findingsJson: KnowledgeFinding[] | null;
+	reviewedAt: string | null;
 	createdAt: string;
 }
 
@@ -366,6 +569,8 @@ export interface KnowledgeEntryLink {
 	direction: "out" | "in";
 	fromEntry: KnowledgeLinkEndpoint;
 	toEntry: KnowledgeLinkEndpoint;
+	/** DELETE /links/:id would be accepted (the gate on the link's source entry). */
+	canRemove: boolean;
 }
 
 export interface KnowledgeGraphNode extends KnowledgeLinkEndpoint {

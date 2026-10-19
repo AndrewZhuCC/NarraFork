@@ -1,0 +1,147 @@
+name: Independent update server mirror
+
+on:
+  workflow_run:
+    workflows: [Release, Auxiliary helpers and executor release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Mirror metadata and current patches of an already-public GitHub release
+        type: choice
+        options: [main, helpers, executor]
+        required: true
+      tag:
+        description: Exact already-public tag; never builds or publishes GitHub assets
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: independent-update-server-mirror
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'workflow_run' && vars.NF_MIRROR_ENABLED == 'true' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      eligible: ${{ steps.qualified.outputs.eligible }}
+      artifact-name: ${{ steps.trigger.outputs.artifact_name }}
+      source-run-id: ${{ steps.trigger.outputs.run_id }}
+      control-sha: ${{ steps.control.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - id: control
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - name: Require a real successful publisher, exact bounded receipt, and existing protected Environment
+        id: trigger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/mirror-update-server.ts --resolve-trigger --event-file="$GITHUB_EVENT_PATH"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: github.event_name == 'workflow_run' && steps.trigger.outputs.eligible == 'true'
+        with:
+          name: ${{ steps.trigger.outputs.artifact_name }}
+          run-id: ${{ steps.trigger.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: artifacts/source-publication
+      - name: Verify receipt data and current public authority before independent approval
+        id: qualified
+        if: steps.trigger.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            bun scripts/mirror-update-server.ts --verify-trigger-receipt --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json
+          else
+            printf 'eligible=true\n' >> "$GITHUB_OUTPUT"
+          fi
+
+  mirror:
+    needs: preflight
+    if: needs.preflight.outputs.eligible == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    # Existing Environment, new independent approval. Preflight fails if protection is missing.
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.control-sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      # Receipt is JSON data only: no bundle, historical bridge, executable control or source code.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: github.event_name == 'workflow_run'
+        with:
+          name: ${{ needs.preflight.outputs.artifact-name }}
+          run-id: ${{ needs.preflight.outputs.source-run-id }}
+          github-token: ${{ github.token }}
+          path: artifacts/source-publication
+      - name: Validate explicit transport without probing or fallback
+        env:
+          NF_MIRROR_TRANSPORT: ${{ vars.NF_MIRROR_TRANSPORT || 'direct' }}
+        run: bun -e 'import { resolveMirrorTransport } from "./scripts/lib/mirror-relay-stage.ts"; resolveMirrorTransport(process.env)'
+      - name: Direct mirror with server-verified commit receipt (no asset readback)
+        if: vars.NF_MIRROR_TRANSPORT == '' || vars.NF_MIRROR_TRANSPORT == 'direct'
+        env:
+          NF_MIRROR_TRANSPORT: direct
+          GH_TOKEN: ${{ github.token }}
+          NF_UPDATE_SERVER: ${{ vars.NF_UPDATE_SERVER }}
+          NF_UPDATE_TOKEN: ${{ secrets.NF_UPDATE_TOKEN }}
+          MIRROR_KIND: ${{ inputs.kind }}
+          MIRROR_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            bun scripts/mirror-update-server.ts --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json
+          else
+            bun scripts/mirror-update-server.ts --kind="$MIRROR_KIND" --tag="$MIRROR_TAG"
+          fi
+      - name: Stage for server pull (STAGED_FOR_PULL is not a committed mirror)
+        if: vars.NF_MIRROR_TRANSPORT == 'webdav'
+        env:
+          NF_MIRROR_TRANSPORT: webdav
+          GH_TOKEN: ${{ github.token }}
+          NF_MIRROR_WEBDAV_URL: ${{ vars.NF_MIRROR_WEBDAV_URL }}
+          NF_MIRROR_WEBDAV_FEED: ${{ vars.NF_MIRROR_WEBDAV_FEED || 'default' }}
+          NF_MIRROR_WEBDAV_USERNAME: ${{ secrets.NF_MIRROR_WEBDAV_USERNAME }}
+          NF_MIRROR_WEBDAV_PASSWORD: ${{ secrets.NF_MIRROR_WEBDAV_PASSWORD }}
+          NF_MIRROR_WEBDAV_TOKEN: ${{ secrets.NF_MIRROR_WEBDAV_TOKEN }}
+          NF_MIRROR_RELAY_SIGNING_KEY: ${{ secrets.NF_MIRROR_RELAY_SIGNING_KEY }}
+          MIRROR_KIND: ${{ inputs.kind }}
+          MIRROR_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            bun scripts/mirror-update-server.ts --event-file="$GITHUB_EVENT_PATH" --receipt-file=artifacts/source-publication/publication-receipt.json
+          else
+            bun scripts/mirror-update-server.ts --kind="$MIRROR_KIND" --tag="$MIRROR_TAG"
+          fi
+      - name: Preserve independent mirror result (hard cancellation may have no receipt)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: independent-mirror-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/mirror/receipt.json
+          if-no-files-found: warn
+          retention-days: 30

@@ -61,6 +61,7 @@ describe("private request recording directories", () => {
 	test.each([
 		"request-recordings",
 		"saved-request-recordings",
+		"token-repair-jobs",
 	])("refuses %s root and every descendant", (name) => {
 		for (const suffix of [
 			"",
@@ -80,10 +81,13 @@ describe("private request recording directories", () => {
 			isPrivateRequestRecordingPath(join(HOME, "malformed-request-dumps", "dump.json"), HOME, true),
 		).toBe(false);
 	});
-	test("file and directory symlinks outside the home cannot reveal private recordings", () => {
+	test.each([
+		"saved-request-recordings",
+		"token-repair-jobs",
+	])("symlinks cannot reveal private %s", (name) => {
 		const temporary = mkdtempSync(join(tmpdir(), "nf-private-recording-path-"));
 		const home = join(temporary, "platform");
-		const root = join(home, "saved-request-recordings");
+		const root = join(home, name);
 		mkdirSync(root, { recursive: true });
 		const file = join(root, "manifest.json");
 		writeFileSync(file, "private recording");

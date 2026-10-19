@@ -274,7 +274,19 @@ export async function runStreamWorker(request: StreamWorkerRequest): Promise<Str
 if (parentPort) {
 	parentPort.on(
 		"message",
-		async ({ id, request }: { id: number; request: StreamWorkerRequest }) => {
+		async ({
+			id,
+			request,
+			action,
+		}: {
+			id: number;
+			request: StreamWorkerRequest;
+			action?: string;
+		}) => {
+			if (action === "ping") {
+				parentPort?.postMessage({ ready: true });
+				return;
+			}
 			try {
 				const result = await runStreamWorker(request);
 				parentPort?.postMessage(

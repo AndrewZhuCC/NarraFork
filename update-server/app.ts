@@ -8,12 +8,17 @@ import { logger } from "./lib/logger";
 import { createCheckRoutes } from "./routes/check";
 import { createDownloadRoutes } from "./routes/download";
 import { healthRoutes } from "./routes/health";
+import { createMirrorRoutes } from "./routes/mirror";
 import { createReleaseRoutes } from "./routes/releases";
 import { tokenRoutes } from "./routes/tokens";
 import { createToolRoutes } from "./routes/tools";
+import { MirrorIngestService } from "./services/mirror-ingest";
 import type { StorageBackend } from "./storage/types";
 
-export function createApp(storage: StorageBackend): Hono {
+export function createApp(
+	storage: StorageBackend,
+	ingest: MirrorIngestService = new MirrorIngestService(storage),
+): Hono {
 	const app = new Hono();
 
 	// CORS
@@ -24,7 +29,16 @@ export function createApp(storage: StorageBackend): Hono {
 			cors({
 				origin: config.cors.origins,
 				allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-				allowHeaders: ["Authorization", "Content-Type"],
+				allowHeaders: [
+					"Authorization",
+					"Content-Type",
+					"X-Mirror-Kind",
+					"X-Mirror-Name",
+					"X-Mirror-Size",
+					"X-Mirror-Repository",
+					"X-Mirror-Version",
+					"X-Mirror-Platform",
+				],
 			}),
 		);
 	}
@@ -41,6 +55,7 @@ export function createApp(storage: StorageBackend): Hono {
 	app.route("/health", healthRoutes);
 
 	// Public endpoints
+	app.route("/api/v3/products", createMirrorRoutes(storage, ingest));
 	app.route("/api/v2/products", createCheckRoutes(storage));
 	app.route("/api/v2/products", createDownloadRoutes(storage));
 

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
+	EXECUTOR_RELEASE_VERSION,
 	getHelperAssetName,
 	HELPER_CATALOG_VERSION,
 	HELPER_EXECUTOR_PROTOCOL_VERSION,
@@ -393,7 +394,7 @@ describe("source-bound helper runtime", () => {
 			),
 		).rejects.toThrow("limit");
 	});
-	test("legacy update-server tools paths remain compatible without cross-origin redirects", async () => {
+	test("mirror metadata selection still downloads canonical GitHub helpers", async () => {
 		settings.update = {
 			...(settings.update ?? originalUpdate),
 			source: "update-server",
@@ -403,7 +404,17 @@ describe("source-bound helper runtime", () => {
 		const calls: string[] = [];
 		const path = await downloadHelperBinary(value, { fetcher: routes(calls) });
 		expect(path).not.toBeNull();
-		expect(calls).toEqual(["https://legacy.example/api/v2/tools/zstd-linux-x64"]);
+		expect(calls).toEqual([
+			`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/helper-manifest-v1.json`,
+			`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/zstd-linux-x64`,
+		]);
+		const context = createDistributionContext({
+			source: "update-server",
+			repository: "fork/repo",
+			serverUrl: "https://legacy.example",
+		});
+		expect(context.source).toEqual({ source: "github", repository: "fork/repo" });
+		expect(context.isCurrent()).toBe(true);
 	});
 });
 describe("executor build identity integration", () => {
@@ -421,7 +432,7 @@ const originalRead = fs.readFileSync;
 const mode = ${JSON.stringify(mode)};
 mock.module("node:fs", () => ({ ...fs,
  existsSync: (path) => String(path).endsWith("package.json") ? mode === "dev" : originalExists(path),
- readFileSync: (path, ...args) => String(path).endsWith("package.json") ? '{"version":"0.9.3"}' : originalRead(path, ...args),
+ readFileSync: (path, ...args) => String(path).endsWith("package.json") ? '{"version":"0.9.4"}' : originalRead(path, ...args),
 }));
 const { createHelperDistributionDependencies } = await import(${module("shared/helper-distribution.ts")});
 const declaration = mode === "legacy" ? undefined : mode === "malformed" ? {} : mode === "null" ? null :
@@ -480,9 +491,11 @@ try {
 			rmSync(root, { recursive: true, force: true });
 		}
 	}
-	for (const mode of ["dev", "compiled"]) {
-		const app = mode === "dev" ? "0.9.3" : "0.9.2";
-		const executor = mode === "dev" ? "0.9.2" : "0.9.1";
+	// Dev reads the repository pin; compiled reads its historical build declaration.
+	for (const [mode, app, executor] of [
+		["dev", "0.9.4", EXECUTOR_RELEASE_VERSION],
+		["compiled", "0.9.2", "0.9.1"],
+	] as const) {
 		test(`${mode} APP ${app} fetches and generates install script for independent executor ${executor}`, () => {
 			const result = fixture(mode);
 			expect(result.error).toBeUndefined();

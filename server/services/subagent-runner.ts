@@ -51,6 +51,7 @@ import {
 import type { PublicationRun } from "./agent-runtime/publication-outbox";
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService, getBackgroundTaskTerminalVersion } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
 import { customSubagentService } from "./custom-subagent-service";
@@ -357,6 +358,7 @@ async function finalizeBackgroundCompletion(
 		});
 	}
 
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	const subNarrator = await narratorService.getById(narratorId).catch(() => null);
 	const title = subNarrator?.title ?? narratorId;
 	// The notification tells the model how to Await/Send this agent, so it carries
@@ -698,6 +700,7 @@ async function finalizeTakenOverBackgroundSubagentUnlocked(
 				tx,
 			);
 		});
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 	}
 
 	// Restore the background task row (set to "cancelled" during takeover) to its
@@ -799,6 +802,7 @@ async function transitionBackgroundTakenOverToIdle(
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, narratorId));
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 
 	// idle[taken_over] — preserveTakenOverSubstatus keeps the tag because the
 	// in-memory takeover Set is still set.
@@ -1164,6 +1168,7 @@ export async function cancelBackgroundTask(taskNarratorId: string): Promise<bool
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, taskNarratorId));
+	backgroundOccupancyStore.refreshNarrator(taskNarratorId);
 	await narratorService.updateStatus(taskNarratorId, "idle", {
 		substatus: ["interrupted"],
 		skipErrorMessage: true,
@@ -2163,6 +2168,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, subagentId));
+			backgroundOccupancyStore.refreshNarrator(subagentId);
 			eventBus.emit({
 				type: "narrator:background_task_started",
 				narratorId: parentNarratorId,
@@ -2317,6 +2323,7 @@ export interface ContinueSubagentInput {
 	resumeLogicalRunId?: string;
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	fileReferences?: FileReferenceSnapshot[];
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	subagentId: string;
 	parentNarratorId: string;
 	/** Stable tool call that originally created this subagent. */
@@ -2578,6 +2585,7 @@ async function startContinuedSubagentUnlocked(
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, subagentId));
+			backgroundOccupancyStore.refreshNarrator(subagentId);
 		}
 		await narratorService.updateStatus(subagentId, "working");
 		if (input.fileChangeStartedAt) {
@@ -2602,6 +2610,7 @@ async function startContinuedSubagentUnlocked(
 					images: input.images,
 					textFiles: savedTextFiles,
 					fileReferences: acceptedReferences,
+					composerDocument: input.composerDocument,
 					delivery: input.delivery,
 					commandText: input.commandText,
 					createdBy: input.createdBy,

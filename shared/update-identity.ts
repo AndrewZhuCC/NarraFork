@@ -1,8 +1,31 @@
+import { isValidGitHubRepository } from "./github-repository";
+
+/** Current main-program capability; helper/executor builds must not inherit this declaration. */
+export const CURRENT_RECOVERY_MANIFEST_VERSIONS = Object.freeze([1, 2, 3] as const);
+
+/** Missing historical metadata means v1/v2 only, never inferred from the application version. */
+export function parseRecoveryManifestVersions(value: unknown): number[] {
+	if (value === undefined) return [1, 2];
+	if (
+		!Array.isArray(value) ||
+		value.length === 0 ||
+		value.length > 32 ||
+		[...value].some((version) => !Number.isSafeInteger(version) || version < 1 || version > 255) ||
+		new Set(value).size !== value.length
+	) {
+		throw new Error(
+			"Invalid recoveryManifestVersions: expected 1–32 unique integers from 1 to 255",
+		);
+	}
+	return [...value].sort((a, b) => a - b);
+}
+
 /** Immutable effective configuration captured before an asynchronous update check. */
 export type UpdateSourceIdentity =
 	| { source: "github"; repository: string; channel: "stable" | "beta"; platform: string }
 	| {
 			source: "update-server";
+			repository: string;
 			serverUrl: string;
 			product: string;
 			channel: "stable" | "beta";
@@ -15,6 +38,8 @@ export interface PreparedUpdateIdentity {
 	version: string;
 	sha512: string;
 	sizeBytes: number;
+	/** Verified main-binary capability; absent historical records support only v1/v2. */
+	recoveryManifestVersions?: number[];
 	/** Old metadata cannot truthfully recover its original source from today's settings. */
 	sourceIdentity: UpdateSourceIdentity | null;
 }
@@ -23,6 +48,30 @@ function record(value: unknown): Record<string, unknown> | null {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: null;
+}
+
+/** Recognize old prepared provenance as unbound history, never as today's authority. */
+export function isLegacyMirrorSourceIdentity(value: unknown): boolean {
+	const item = record(value);
+	if (
+		!item ||
+		item.source !== "update-server" ||
+		Object.hasOwn(item, "repository") ||
+		(item.channel !== "stable" && item.channel !== "beta") ||
+		typeof item.platform !== "string" ||
+		!/^[a-z0-9-]{1,64}$/.test(item.platform) ||
+		typeof item.product !== "string" ||
+		!item.product ||
+		item.product.length > 256 ||
+		typeof item.serverUrl !== "string" ||
+		item.serverUrl.length > 4096
+	)
+		return false;
+	try {
+		return ["http:", "https:"].includes(new URL(item.serverUrl).protocol);
+	} catch {
+		return false;
+	}
 }
 
 export function parseUpdateSourceIdentity(value: unknown): UpdateSourceIdentity | null {
@@ -34,10 +83,11 @@ export function parseUpdateSourceIdentity(value: unknown): UpdateSourceIdentity 
 		!/^[a-z0-9-]{1,64}$/.test(item.platform)
 	)
 		return null;
+	// Legacy mirror records without repository cannot recover authority from today's settings.
+	if (typeof item.repository !== "string" || item.repository.length > 256) return null;
+	const repository = item.repository.trim().toLowerCase();
+	if (!isValidGitHubRepository(repository)) return null;
 	if (item.source === "github") {
-		if (typeof item.repository !== "string" || item.repository.length > 256) return null;
-		const repository = item.repository.trim().toLowerCase();
-		if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository)) return null;
 		return { source: "github", repository, channel: item.channel, platform: item.platform };
 	}
 	if (
@@ -55,6 +105,7 @@ export function parseUpdateSourceIdentity(value: unknown): UpdateSourceIdentity 
 		url.pathname = url.pathname.replace(/\/+$/, "");
 		return {
 			source: "update-server",
+			repository,
 			serverUrl: url.toString().replace(/\/+$/, ""),
 			product: item.product,
 			channel: item.channel,
@@ -71,7 +122,14 @@ export function updateSourceIdentityKey(value: unknown): string | null {
 	return JSON.stringify(
 		source.source === "github"
 			? [source.source, source.repository, source.channel, source.platform]
-			: [source.source, source.serverUrl, source.product, source.channel, source.platform],
+			: [
+					source.source,
+					source.repository,
+					source.serverUrl,
+					source.product,
+					source.channel,
+					source.platform,
+				],
 	);
 }
 
@@ -88,10 +146,20 @@ export function preparedMatchesRelease(
 				version: string;
 				sha512: string;
 				files: Array<{ size: number }>;
+				recoveryManifestVersions?: number[];
 				sourceIdentity?: UpdateSourceIdentity;
 		  }
 		| undefined,
 ): boolean {
+	try {
+		if (
+			JSON.stringify(parseRecoveryManifestVersions(prepared?.recoveryManifestVersions)) !==
+			JSON.stringify(parseRecoveryManifestVersions(release?.recoveryManifestVersions))
+		)
+			return false;
+	} catch {
+		return false;
+	}
 	return (
 		!!prepared &&
 		!!release &&

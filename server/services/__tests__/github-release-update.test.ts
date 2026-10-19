@@ -163,6 +163,77 @@ function descriptor(): ReleaseInfo {
 	};
 }
 
+describe("GitHub recovery capability metadata", () => {
+	function declare(item: ReturnType<typeof fixture>, changes: Record<string, unknown>) {
+		item.metadata = JSON.stringify({ ...JSON.parse(item.metadata), ...changes });
+		item.release.assets[1].size = Buffer.byteLength(item.metadata);
+	}
+	test("legacy sidecars remain v1/v2 regardless of application version", async () => {
+		const result = await mockGithub([fixture("999.0.0")]).updater.check(input);
+		expect(result.releaseInfo?.recoveryManifestVersions).toEqual([1, 2]);
+	});
+	test("validated main sidecar declarations survive check and retain full artifact identity", async () => {
+		const item = fixture();
+		declare(item, { recoveryManifestVersions: [3, 1, 2] });
+		const result = await mockGithub([item]).updater.check(input);
+		expect(result.releaseInfo?.recoveryManifestVersions).toEqual([1, 2, 3]);
+		expect(result.releaseInfo?.sha512).toBe(digest);
+		expect(result.releaseInfo?.files[0].size).toBe(payload.length);
+	});
+	for (const invalid of [
+		null,
+		"3",
+		{},
+		[],
+		[0],
+		[256],
+		[1.5],
+		["3"],
+		[1, 2, 3, 3],
+		Array.from({ length: 33 }, (_, index) => index + 1),
+	]) {
+		test(`rejects invalid recovery capability ${JSON.stringify(invalid)} without promotion`, async () => {
+			const item = fixture();
+			declare(item, { recoveryManifestVersions: invalid });
+			const result = await mockGithub([item]).updater.check(input);
+			expect(result.errorCode).toBe("INVALID_METADATA");
+			expect(result.updateAvailable).toBe(false);
+			expect(result.releaseInfo).toBeUndefined();
+		});
+	}
+	test("refresh cannot reuse capabilities after selected binary identity changes", async () => {
+		const item = fixture();
+		declare(item, { recoveryManifestVersions: [1, 2, 3] });
+		const items = [item];
+		const { updater } = mockGithub(items);
+		expect((await updater.check(input)).releaseInfo?.recoveryManifestVersions).toContain(3);
+		const replacement = fixture();
+		const changedDigest = createHash("sha512").update("replacement").digest("base64");
+		declare(replacement, { sha512: changedDigest });
+		items[0] = replacement;
+		const checked = await updater.check(input, { force: true });
+		expect(checked.releaseInfo?.sha512).toBe(changedDigest);
+		expect(checked.releaseInfo?.recoveryManifestVersions).toEqual([1, 2]);
+		declare(replacement, { recoveryManifestVersions: [3, 3] });
+		const malformed = await updater.check(input, { force: true });
+		expect(malformed.errorCode).toBe("INVALID_METADATA");
+		expect(malformed.releaseInfo).toBeUndefined();
+	});
+	test("capabilities cannot bypass sidecar identity and size validation", async () => {
+		for (const change of [
+			{ name: "another-binary" },
+			{ size: payload.length + 1 },
+			{ sha512: "bad" },
+		]) {
+			const item = fixture();
+			declare(item, { ...change, recoveryManifestVersions: [1, 2, 3] });
+			const result = await mockGithub([item]).updater.check(input);
+			expect(result.errorCode).toBe("INVALID_METADATA");
+			expect(result.releaseInfo).toBeUndefined();
+		}
+	});
+});
+
 describe("GitHub release selection", () => {
 	test("selects semantic version, not API order or timestamp; keeps bilingual notes and full strategy", async () => {
 		const { updater } = mockGithub([fixture("1.1.0"), fixture("2.0.0")]);

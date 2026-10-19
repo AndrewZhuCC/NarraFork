@@ -62,15 +62,14 @@ function assertCompatibility(manifest: ExecutorManifest): void {
 		throw new ExecutorDistributionError("Executor binary exceeds size limit");
 }
 function parseManifest(value: unknown, source: HelperSource, tag: string): ExecutorManifest {
-	const manifest =
-		source.source === "github"
-			? parseExecutorReleaseManifest(value, {
-					repository: source.repository,
-					tag,
-					version: executorVersion,
-					protocolVersion: executorProtocol,
-				}).manifest
-			: parseExecutorManifest(value);
+	if (source.source !== "github")
+		throw new ExecutorDistributionError("Executor requires GitHub authority");
+	const manifest = parseExecutorReleaseManifest(value, {
+		repository: source.repository,
+		tag,
+		version: executorVersion,
+		protocolVersion: executorProtocol,
+	}).manifest;
 	assertCompatibility(manifest);
 	origins.set(manifest, { source, tag });
 	return manifest;
@@ -122,7 +121,7 @@ export async function getExecutorManifest(
 		options.source ?? captureHelperSource(),
 		options.fetcher,
 	);
-	const tag = context.source.source === "github" ? executorTag : "legacy-tools";
+	const tag = executorTag;
 	const key = `${context.key}\0${tag}\0${executorVersion}\0${executorProtocol}`;
 	options.signal?.throwIfAborted();
 	if (!context.isCurrent()) return null;
@@ -185,7 +184,7 @@ export function freezeExecutorArtifact(
 	}
 	return {
 		source: { ...source },
-		tag: origin?.tag ?? (source.source === "github" ? executorTag : "legacy-tools"),
+		tag: origin?.tag ?? executorTag,
 		version: parsed.version,
 		protocolVersion: parsed.protocolVersion,
 		platform,
@@ -234,7 +233,8 @@ export async function ensureExecutorBinary(
 	assertCompatibility(check);
 	if (
 		binding.platform !== platform ||
-		binding.tag !== (binding.source.source === "github" ? executorTag : "legacy-tools")
+		binding.source.source !== "github" ||
+		binding.tag !== executorTag
 	)
 		throw new ExecutorDistributionError("Executor binding mismatch");
 	const downloaded = await downloadHelperBinary(

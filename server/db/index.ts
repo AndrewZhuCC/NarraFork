@@ -42,6 +42,7 @@ import type { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { acquireInstanceLock, releaseInstanceLock } from "../lib/instance-lock";
 import { logger } from "../lib/logger";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import type { DatabaseMaintenancePort } from "./backend/maintenance-port";
 import { createSqliteLifecycle, type SqliteLifecycle } from "./backend/sqlite-lifecycle";
@@ -57,6 +58,10 @@ import {
 	resolveDatabaseBackendConfig,
 } from "./postgres-runtime";
 import * as relations from "./relations";
+import {
+	initializeAbsentReceiptProtectionSource,
+	installResourceProtectionTriggers,
+} from "./resource-protection-index";
 import * as schema from "./schema";
 
 /**
@@ -173,7 +178,21 @@ if (databaseConfig.backend === "postgres") {
 	}
 
 	sqlite = lifecycle.connection;
+	installResourceProtectionTriggers(sqlite);
+	initializeAbsentReceiptProtectionSource(sqlite, getNarraforkPath("worktree-requests"));
 	db = createMainDb(sqlite);
+	if (process.env.NARRAFORK_TEST !== "1") {
+		// Never await the service module here: it imports this singleton on first maintenance.
+		setTimeout(() => {
+			void import("../services/resource-protection-index")
+				.then((service) => {
+					service.startProtectionIndexMaintenance();
+				})
+				.catch((error) =>
+					logger.warn("Protection index maintenance unavailable", { error: String(error) }),
+				);
+		}, 0).unref();
+	}
 }
 
 /**

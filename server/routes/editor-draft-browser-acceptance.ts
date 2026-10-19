@@ -110,16 +110,83 @@ export async function editorDraftBrowserAcceptance(
 	);
 	// Crash the fixture renderer, NOT the host/agent server. No unload checkpoint is assumed.
 	const session = await page.createCDPSession();
+	const crashStarted = performance.now();
+	const crashDiagnostics: { event: string; ms: number; error?: string }[] = [];
+	const recordCrash = (event: string, error?: unknown) => {
+		if (crashDiagnostics.length < 10)
+			crashDiagnostics.push({
+				event,
+				ms: Math.round(performance.now() - crashStarted),
+				// These are controlled CDP command errors, never document content or URLs.
+				...(error === undefined ? {} : { error: String(error).slice(0, 240) }),
+			});
+	};
+	let observedCrash!: () => void;
 	const crashed = new Promise<void>((resolve) => {
-		page.once("error", () => resolve());
+		observedCrash = resolve;
 	});
-	void session.send("Page.crash").catch(() => {});
-	await Promise.race([
-		crashed,
-		new Promise<never>((_, reject) =>
-			setTimeout(() => reject(new Error("Renderer did not crash")), 5000),
-		),
+	let observing = true;
+	const onTargetCrashed = () => {
+		recordCrash("Inspector.targetCrashed");
+		if (observing && performance.now() - crashStarted <= 5000) observedCrash();
+	};
+	// Puppeteer's primary session is diagnostic only; success requires our enabled session.
+	const onPageError = () => recordCrash("page.error");
+	session.on("Inspector.targetCrashed", onTargetCrashed);
+	page.on("error", onPageError);
+	let crashTimeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			new Promise<never>((_, reject) => {
+				crashTimeout = setTimeout(() => reject(new Error("Renderer did not crash")), 5000);
+			}),
+			(async () => {
+				// Preparation and injection share the original five-second observation window.
+				await session.send("Inspector.enable");
+				recordCrash("Inspector.enabled");
+				if (!observing || performance.now() - crashStarted > 5000) return await crashed;
+				recordCrash("Page.crash.sent");
+				void session.send("Page.crash").then(
+					() => recordCrash("Page.crash.resolved"),
+					(error) => recordCrash("Page.crash.rejected", error),
+				);
+				await crashed;
+			})(),
+		]);
+	} catch (error) {
+		throw new Error(`Renderer crash observation failed: ${JSON.stringify(crashDiagnostics)}`, {
+			cause: error,
+		});
+	} finally {
+		observing = false;
+		clearTimeout(crashTimeout);
+		session.off("Inspector.targetCrashed", onTargetCrashed);
+		page.off("error", onPageError);
+		await session.detach().catch((error) => recordCrash("session.detach.rejected", error));
+		console.info("[editor-renderer-crash]", JSON.stringify(crashDiagnostics));
+	}
+	await page.reload({ waitUntil: "domcontentloaded" });
+	await ready();
+	await page.waitForSelector("[data-editor-draft-restore]");
+	expect((await state()).drafts.bodyReads).toBe(0);
+	await page.click("[data-editor-draft-restore]");
+	await wait(() => !!window.__editorCache.snapshot().registry.pinReasons.dirty);
+	const recoveredPanes = await page.evaluate(() =>
+		["file-0", "file-1"].map((id) => window.__editorCache.paneState(id).text),
+	);
+	expect(recoveredPanes).toEqual([
+		`/* LOCAL_REFRESH */${fixture.original}`,
+		`/* LOCAL_REFRESH */${fixture.original}`,
 	]);
+	expect(await page.$("[data-editor-draft-restored]")).not.toBeNull();
+	expect((await state()).drafts.bodyReads).toBeGreaterThan(0);
+	expect(await fixture.readDisk()).toBe(`/* DISK_CHANGED */${fixture.original}`);
+	await wait(
+		() =>
+			window.__editorCache.snapshot().drafts.running === 0 &&
+			window.__editorCache.snapshot().drafts.queued === 0,
+	);
+	// Rediscover without loading bodies for the independent multi-window and ACL checks below.
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await ready();
 	await page.waitForSelector("[data-editor-draft-restore]");

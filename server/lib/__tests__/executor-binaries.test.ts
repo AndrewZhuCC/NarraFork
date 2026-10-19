@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { EXECUTOR_MANIFEST_FILENAME, type ExecutorManifest } from "@shared/remote-executor";
+import {
+	EXECUTOR_MANIFEST_FILENAME,
+	EXECUTOR_PLATFORMS,
+	type ExecutorManifest,
+} from "@shared/remote-executor";
 import {
 	ExecutorDistributionError,
 	ensureExecutorBinary,
@@ -31,21 +35,27 @@ const ORIGINAL_UPDATE = settings.update ?? {
 	checkIntervalMinutes: 60,
 	autoDownload: false,
 };
-const SOURCE = { source: "update-server", serverUrl: "https://legacy.example" } as const;
-const MANIFEST_PATH = distributionPath(SOURCE, `legacy-tools\0${EXECUTOR_VERSION}\0${1}\0manifest`);
+const SOURCE = { source: "github", repository: "fixture/executor-tests" } as const;
+const MANIFEST_PATH = distributionPath(
+	SOURCE,
+	`executor-v${EXECUTOR_VERSION}\0${EXECUTOR_VERSION}\0${1}\0manifest`,
+);
 
 function manifest(overrides: Partial<ExecutorManifest> = {}): ExecutorManifest {
 	return {
 		version: EXECUTOR_VERSION,
 		protocolVersion: 1,
 		releasedAt: "2026-08-15T00:00:00.000Z",
-		platforms: {
-			"linux-amd64": {
-				filename: `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`,
-				size: LINUX_BINARY.byteLength,
-				sha256: LINUX_SHA256,
-			},
-		},
+		platforms: Object.fromEntries(
+			EXECUTOR_PLATFORMS.map((platform) => [
+				platform,
+				{
+					filename: `narrafork-executor-${EXECUTOR_VERSION}-${platform}${platform.startsWith("windows") ? ".exe" : ""}`,
+					size: LINUX_BINARY.byteLength,
+					sha256: LINUX_SHA256,
+				},
+			]),
+		),
 		...overrides,
 	};
 }
@@ -68,8 +78,18 @@ function mockFetch(routes: RouteResponses): { calls: string[] } {
 	return { calls };
 }
 
+function envelope(body: unknown) {
+	return {
+		schemaVersion: 1,
+		repository: SOURCE.repository,
+		tag: `executor-v${EXECUTOR_VERSION}`,
+		commit: "a".repeat(40),
+		manifest: body,
+		licenses: [{ name: "LICENSE.txt", size: 10, sha256: "a".repeat(64) }],
+	};
+}
 function jsonResponse(body: unknown): Response {
-	const text = typeof body === "string" ? body : JSON.stringify(body);
+	const text = typeof body === "string" ? body : JSON.stringify(envelope(body));
 	return new Response(text, { status: 200, headers: { "content-type": "application/json" } });
 }
 
@@ -86,7 +106,13 @@ function clearHelperBinDir(): void {
 }
 
 beforeEach(() => {
-	settings.update = { ...ORIGINAL_UPDATE, ...SOURCE, proxy: { mode: "direct" } };
+	settings.update = {
+		...ORIGINAL_UPDATE,
+		source: "update-server",
+		githubRepository: SOURCE.repository,
+		serverUrl: "https://mirror-unused.example",
+		proxy: { mode: "direct" },
+	};
 	resetExecutorManifestCache();
 	clearHelperBinDir();
 });
@@ -106,7 +132,9 @@ describe("getExecutorManifest", () => {
 		expect(resolved?.protocolVersion).toBe(1);
 		// Persisted so a later offline start can still enroll devices.
 		expect(existsSync(MANIFEST_PATH)).toBe(true);
-		expect(JSON.parse(readFileSync(MANIFEST_PATH, "utf-8")).version).toBe(EXECUTOR_VERSION);
+		expect(JSON.parse(readFileSync(MANIFEST_PATH, "utf-8")).manifest.version).toBe(
+			EXECUTOR_VERSION,
+		);
 	});
 
 	test("caches within the freshness window and coalesces concurrent fetches", async () => {
@@ -120,7 +148,7 @@ describe("getExecutorManifest", () => {
 
 	test("falls back to the persisted manifest when the server is unreachable", async () => {
 		mkdirSync(DISTRIBUTION_CACHE_DIR, { recursive: true });
-		writeFileSync(MANIFEST_PATH, JSON.stringify(manifest()));
+		writeFileSync(MANIFEST_PATH, JSON.stringify(envelope(manifest())));
 		mockFetch({
 			manifest: () => {
 				throw new Error("network down");
@@ -179,12 +207,13 @@ describe("getExecutorManifest", () => {
 			"version/protocol",
 		);
 	});
-	test("offline manifest cannot migrate across configured servers", async () => {
-		writeFileSync(MANIFEST_PATH, JSON.stringify(manifest()));
+	test("offline canonical manifest cannot migrate across configured repositories", async () => {
+		writeFileSync(MANIFEST_PATH, JSON.stringify(envelope(manifest())));
 		settings.update = {
 			...ORIGINAL_UPDATE,
 			source: "update-server",
 			serverUrl: "https://other.example",
+			githubRepository: "other/executor",
 			proxy: { mode: "direct" },
 		};
 		mockFetch({ manifest: () => new Response(null, { status: 404 }) });
@@ -251,7 +280,9 @@ describe("ensureExecutorBinary", () => {
 
 	test("reports a clear error for a platform the release does not publish", async () => {
 		mockFetch({ manifest: () => jsonResponse(manifest()) });
-		await expect(ensureExecutorBinary("windows-arm64")).rejects.toThrow(
+		const incomplete = manifest();
+		delete incomplete.platforms["windows-arm64"];
+		await expect(ensureExecutorBinary("windows-arm64", { manifest: incomplete })).rejects.toThrow(
 			/does not publish a build for windows-arm64/,
 		);
 	});
@@ -265,7 +296,9 @@ describe("ensureExecutorBinary", () => {
 describe("getExecutorArtifactDigest", () => {
 	test("returns the published digest and rejects unknown platforms", () => {
 		expect(getExecutorArtifactDigest(manifest(), "linux-amd64")).toBe(LINUX_SHA256);
-		expect(() => getExecutorArtifactDigest(manifest(), "darwin-arm64")).toThrow(
+		const incomplete = manifest();
+		delete incomplete.platforms["darwin-arm64"];
+		expect(() => getExecutorArtifactDigest(incomplete, "darwin-arm64")).toThrow(
 			ExecutorDistributionError,
 		);
 	});

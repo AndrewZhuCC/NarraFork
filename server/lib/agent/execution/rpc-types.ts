@@ -35,6 +35,10 @@ export const FEATURE_EDITOR_RAW_READ_V1 = "editor.raw-read.v1";
 export const FEATURE_EDITOR_DURABLE_WRITE_V1 = "editor.durable-write.v1";
 /** Trusted stdio bootstrap only; never a remote WS filesystem capability. */
 export const FEATURE_EDITOR_HOST_RECEIPT_V1 = "editor.host-receipt.v1";
+/** Non-recursive exclusive mkdir with canonical path verification (legacy capability). */
+export const FEATURE_FS_MKDIR_EXCLUSIVE_V1 = "fs.mkdir.exclusive.v1";
+/** Exclusive mkdir/write bind canonical parent handles, preventing parent-link replacement races. */
+export const FEATURE_FS_CREATE_BOUND_PARENT_V1 = "fs.create.bound-parent.v1";
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
@@ -141,6 +145,7 @@ export type RpcMethod =
 	| "fs.writeConditional"
 	| "fs.remove"
 	| "fs.mkdirp"
+	| "fs.mkdirExclusive"
 	| "fs.list"
 	| "fs.exists"
 	| "glob"
@@ -282,6 +287,9 @@ export interface FsWriteParams {
 	dataB64: string;
 	/** Canonical create/existing path returned by fs.stat and approved by policy. */
 	expectedResolvedPath?: string;
+	/** Requires fs.mkdir.exclusive.v1 plus fs.create.bound-parent.v1; no implicit mkdirp. */
+	exclusive?: boolean;
+	timeoutMs?: number;
 }
 
 export interface FsRemoveParams {

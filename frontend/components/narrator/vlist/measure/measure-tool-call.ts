@@ -1758,6 +1758,15 @@ export function measureToolBody(
 	viewportHeight?: number,
 ): MeasuredToolBody {
 	switch (detail.kind) {
+		case "gen-ui":
+			// Inline UI reserves the height its declared size maps to; the file card and
+			// the kit prompt are three fixed text rows. Neither is ever measured.
+			return finishRegion(
+				detail,
+				[makeFixed(detail.contentPx ?? 88, "gen-ui", 0)],
+				innerWidth,
+				null,
+			);
 		case "meta-rows": {
 			const rows = detail.rows.slice(0, META_ROWS_MAX);
 			const blocks: PreparedBlock[] = [];

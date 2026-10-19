@@ -1017,11 +1017,7 @@ export async function loadTreePreviewContents(
 	return out;
 }
 
-/**
- * Read-only comparison with a historical tree, not an executable rollback plan.
- * Object availability does not verify coverage or permit deletion. Missing trees
- * return null; callers must keep the unavailable state rather than infer safety.
- */
+/** Legacy comparison only; capturing the current tree does not authorize a restore. */
 async function previewTreeBoundary(
 	narratorId: string,
 	treeHash: string | null,
@@ -1029,17 +1025,37 @@ async function previewTreeBoundary(
 	if (!treeHash) return null;
 	const worktreePath = await resolveNarratorCwd(narratorId);
 	if (!worktreePath) return null;
+	const startedAt = new Date().toISOString();
+	logger.info("Tree revert preview started", { narratorId, treeHash, startedAt });
+	const started = performance.now();
+	const phaseDurationsMs: Record<string, number> = {};
+	let phase = "hasTree";
+	let phaseStarted = started;
+	let outcome = "unavailable";
+	let fileCount = 0;
+	const nextPhase = (next: string) => {
+		const now = performance.now();
+		phaseDurationsMs[phase] = now - phaseStarted;
+		phase = next;
+		phaseStarted = now;
+	};
 	try {
 		if (!(await worktreeTreeSnapshot.hasTree(worktreePath, treeHash, LOCAL_DEVICE_ID))) {
+			outcome = "missing_tree";
 			return null;
 		}
+		nextPhase("capture");
 		const current = await worktreeTreeSnapshot.capture(worktreePath, LOCAL_DEVICE_ID);
+		nextPhase("diffPaths");
 		const changed = await worktreeTreeSnapshot.diffPaths(
 			worktreePath,
 			treeHash,
 			current,
 			LOCAL_DEVICE_ID,
 		);
+		nextPhase("formatPreview");
+		fileCount = changed.length;
+		outcome = "compared";
 		return {
 			available: false,
 			reason: "legacy_unverified",
@@ -1050,14 +1066,32 @@ async function previewTreeBoundary(
 				deviceId: LOCAL_DEVICE_ID,
 				filePath: joinWorktreePath(worktreePath, relPath),
 				relPath,
-				// Without a complete receipt, missing membership is unknown rather than
-				// proof of absence. M0 does not authorize deletion of any legacy path.
+				// Missing membership is unknown, not permission to delete a legacy path.
 				willBeDeleted: false,
 			})),
 		};
 	} catch (error) {
+		outcome = "unavailable";
 		logger.debug("Tree revert preview unavailable", { narratorId, treeHash, error: String(error) });
 		return null;
+	} finally {
+		phaseDurationsMs[phase] = performance.now() - phaseStarted;
+		const round = (ms: number) => Math.round(ms * 100) / 100;
+		const durationMs = round(performance.now() - started);
+		const log = durationMs >= 100 || outcome === "unavailable" ? logger.warn : logger.info;
+		log("Tree revert preview completed", {
+			narratorId,
+			treeHash,
+			startedAt,
+			durationMs,
+			outcome,
+			fileCount,
+			captureMode: "structural",
+			// Wall time includes async git/lock waits; it is not event-loop lag.
+			phaseDurationsMs: Object.fromEntries(
+				Object.entries(phaseDurationsMs).map(([name, ms]) => [name, round(ms)]),
+			),
+		});
 	}
 }
 
@@ -1065,18 +1099,37 @@ function joinWorktreePath(worktreePath: string, relPath: string): string {
 	return nodeResolve(worktreePath, relPath);
 }
 
-/**
- * Preview the rollback that "undo everything from this sequence onwards" performs.
- *
- * Both the rollback and delete confirmation dialogs use this, because both operate
- * on a contiguous tail starting at a message's seq.
- */
+/** Read-only tail preview, requested by the editor before the keep/revert choice. */
 export async function previewSeqTreeRevert(
 	narratorId: string,
 	minSeq: number,
 ): Promise<TreeRevertPreview | null> {
-	const boundary = await resolveSeqTreeBoundary(narratorId, minSeq);
-	return previewTreeBoundary(narratorId, boundary?.treeHash ?? null);
+	const startedAt = new Date().toISOString();
+	logger.info("Sequence revert preview started", { narratorId, minSeq, startedAt });
+	const started = performance.now();
+	let boundaryLookupMs: number | null = null;
+	let hasBoundary = false;
+	let success = false;
+	try {
+		const boundary = await resolveSeqTreeBoundary(narratorId, minSeq);
+		boundaryLookupMs = Math.round((performance.now() - started) * 100) / 100;
+		hasBoundary = !!boundary;
+		const preview = await previewTreeBoundary(narratorId, boundary?.treeHash ?? null);
+		success = true;
+		return preview;
+	} finally {
+		const durationMs = Math.round((performance.now() - started) * 100) / 100;
+		const log = durationMs >= 100 || !success ? logger.warn : logger.info;
+		log("Sequence revert preview completed", {
+			narratorId,
+			minSeq,
+			startedAt,
+			durationMs,
+			boundaryLookupMs,
+			hasBoundary,
+			success,
+		});
+	}
 }
 
 /** Preview the rollback that deleting a set of messages would perform. */

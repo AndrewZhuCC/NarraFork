@@ -94,7 +94,7 @@ export type SnapshotTable = {
 		{ name: string; columns: string[]; nullsNotDistinct?: boolean }
 	>;
 	checkConstraints?: Record<string, { name: string; value: string }>;
-	compositePrimaryKeys?: Record<string, unknown>;
+	compositePrimaryKeys?: Record<string, { name: string; columns: string[] }>;
 	policies?: Record<string, unknown>;
 	isRLSEnabled?: boolean;
 };
@@ -123,10 +123,12 @@ export type ExpectedColumn = {
 	/** `null` unless the column is GENERATED ... AS IDENTITY. */
 	identity: { type: "always" | "byDefault"; sequenceName: string } | null;
 };
+/** Array position is the index key position; expression keys never masquerade as columns. */
+export type IndexKey = string | { expression: string };
 export type ExpectedIndex = {
 	table: string;
 	name: string;
-	columns: string[];
+	columns: IndexKey[];
 	isUnique: boolean;
 	method: string;
 	/** Raw snapshot predicate; canonicalized through the server before comparison. */
@@ -141,6 +143,7 @@ export type ExpectedUnique = {
 	columns: string[];
 	nullsNotDistinct: boolean;
 };
+export type ExpectedPrimaryKey = { table: string; name: string; columns: string[] };
 export type ExpectedCheck = { table: string; name: string; value: string };
 /**
  * The sequence backing an identity column. Values are compared as TEXT: seqmax for a
@@ -182,6 +185,7 @@ export type Expected = {
 	foreignKeys: SnapshotForeignKey[];
 	indexes: ExpectedIndex[];
 	uniques: ExpectedUnique[];
+	primaryKeys: ExpectedPrimaryKey[];
 	checks: ExpectedCheck[];
 	sequences: ExpectedSequence[];
 	/**
@@ -215,6 +219,7 @@ export function buildExpected(
 	const foreignKeys: SnapshotForeignKey[] = [];
 	const indexes: ExpectedIndex[] = [];
 	const uniques: ExpectedUnique[] = [];
+	const primaryKeys: ExpectedPrimaryKey[] = [];
 	const checks: ExpectedCheck[] = [];
 	const sequences: ExpectedSequence[] = [];
 
@@ -227,8 +232,39 @@ export function buildExpected(
 	for (const table of Object.values(snapshot.tables ?? {})) {
 		if (table.schema) problems.push(`table ${table.name}: non-public schema ${table.schema}`);
 		if (table.isRLSEnabled) problems.push(`table ${table.name}: RLS is not covered by this gate`);
-		if (Object.keys(table.compositePrimaryKeys ?? {}).length > 0) {
-			problems.push(`table ${table.name}: composite primary keys are not covered`);
+		// Drizzle stores table-level PK membership only in compositePrimaryKeys; the
+		// participating columns' primaryKey flags remain false in the snapshot.
+		const tablePrimaryKeys: ExpectedPrimaryKey[] = [
+			...Object.values(table.columns)
+				.filter((column) => column.primaryKey)
+				.map((column) => ({
+					table: table.name,
+					name: `${table.name}_pkey`,
+					columns: [column.name],
+				})),
+			...Object.values(table.compositePrimaryKeys ?? {}).map((key) => ({
+				table: table.name,
+				name: key.name,
+				columns: [...key.columns],
+			})),
+		];
+		if (tablePrimaryKeys.length > 1) {
+			problems.push(`table ${table.name}: multiple primary keys`);
+		}
+		const primaryKeyColumns = new Set<string>();
+		for (const key of tablePrimaryKeys) {
+			if (!key.name) problems.push(`table ${table.name}: primary key has no name`);
+			if (!key.columns.length) problems.push(`primary key ${table.name}.${key.name}: no columns`);
+			if (new Set(key.columns).size !== key.columns.length) {
+				problems.push(`primary key ${table.name}.${key.name}: duplicate columns`);
+			}
+			for (const name of key.columns) {
+				if (!Object.values(table.columns).some((column) => column.name === name)) {
+					problems.push(`primary key ${table.name}.${key.name}: unknown column ${name}`);
+				}
+				primaryKeyColumns.add(name);
+			}
+			primaryKeys.push(key);
 		}
 		if (Object.keys(table.policies ?? {}).length > 0) {
 			problems.push(`table ${table.name}: policies are not covered`);
@@ -289,8 +325,8 @@ export function buildExpected(
 				table: table.name,
 				name: column.name,
 				type: column.type,
-				notNull: column.notNull,
-				primaryKey: column.primaryKey,
+				notNull: column.notNull || primaryKeyColumns.has(column.name),
+				primaryKey: primaryKeyColumns.has(column.name),
 				// Identity allocation is represented by attidentity, not a pg_attrdef default.
 				default: column.default === undefined ? null : String(column.default),
 				generated: column.generated
@@ -351,9 +387,7 @@ export function buildExpected(
 		foreignKeys: foreignKeys.length,
 		uniqueConstraints: uniques.length,
 		checkConstraints: checks.length,
-		primaryKeys: tables.filter((name) =>
-			columns.some((column) => column.table === name && column.primaryKey),
-		).length,
+		primaryKeys: primaryKeys.length,
 		indexes: indexes.length,
 		partialIndexes: indexes.filter((index) => index.where !== null).length,
 		uniqueIndexes: indexes.filter((index) => index.isUnique).length,
@@ -371,6 +405,7 @@ export function buildExpected(
 			foreignKeys,
 			indexes,
 			uniques,
+			primaryKeys,
 			checks,
 			sequences,
 			columnOrder: physicalColumnOrder(snapshot, prior, problems),
@@ -419,29 +454,19 @@ export function physicalColumnOrder(
 }
 
 /**
- * Column names of a snapshot index, in index order.
- *
- * Snapshot index columns are objects (`{expression, isExpression, asc, nulls}`), so the
- * name lives in `expression`; stringifying the object yields "[object Object]", which
- * compares unequal against every real column name and therefore reports every index as
- * broken. Anything this gate cannot express — an expression key, DESC, NULLS FIRST — is
- * reported instead of being flattened into a name.
+ * Column names and expression keys of a snapshot index, preserving position and kind.
+ * Expressions are canonicalized by PostgreSQL, never flattened into column names.
+ * Unsupported DESC/NULLS FIRST ordering still fails closed.
  */
 export function expectedIndexColumns(
 	table: string,
 	index: SnapshotIndex,
 	problems: string[],
-): string[] {
-	const names: string[] = [];
+): IndexKey[] {
+	const names: IndexKey[] = [];
 	for (const column of index.columns ?? []) {
 		if (typeof column !== "object" || column === null || typeof column.expression !== "string") {
 			problems.push(`index ${table}.${index.name}: unreadable column entry ${clip(column)}`);
-			continue;
-		}
-		if (column.isExpression) {
-			problems.push(
-				`index ${table}.${index.name}: expression keys are not covered (${clip(column.expression)})`,
-			);
 			continue;
 		}
 		if (column.asc === false || (column.nulls ?? "last") !== "last") {
@@ -449,7 +474,7 @@ export function expectedIndexColumns(
 				`index ${table}.${index.name}: only ASC/NULLS LAST is covered (${clip(column)})`,
 			);
 		}
-		names.push(column.expression);
+		names.push(column.isExpression ? { expression: column.expression } : column.expression);
 	}
 	if (names.length === 0) problems.push(`index ${table}.${index.name}: no key columns`);
 	return names;
@@ -571,8 +596,11 @@ export const CATALOG_FACETS = {
 	indexes: `SELECT c.relname || '#' || i.relname AS "k",
 			json_build_array(
 				c.relname, i.relname, ix.indisunique,
-				(SELECT json_agg(z.attname ORDER BY u.n) FROM unnest(ix.indkey) WITH ORDINALITY u(attnum, n)
-					JOIN pg_attribute z ON z.attrelid = ix.indrelid AND z.attnum = u.attnum),
+				(SELECT json_agg(CASE WHEN u.attnum = 0
+					THEN json_build_object('expression', pg_get_indexdef(ix.indexrelid, u.n::int, true))
+					ELSE to_json(z.attname) END ORDER BY u.n)
+					FROM unnest(ix.indkey) WITH ORDINALITY u(attnum, n)
+					LEFT JOIN pg_attribute z ON z.attrelid = ix.indrelid AND z.attnum = u.attnum),
 				(SELECT json_agg(u.opt ORDER BY u.n) FROM unnest(ix.indoption) WITH ORDINALITY u(opt, n)),
 				am.amname, pg_get_expr(ix.indpred, ix.indrelid),
 				ix.indnatts, ix.indnkeyatts, ix.indnullsnotdistinct,
@@ -583,6 +611,16 @@ export const CATALOG_FACETS = {
 		JOIN pg_am am ON am.oid = i.relam
 		JOIN ${PUBLIC_TABLE} ON c.oid = ix.indrelid
 		WHERE ${IS_PUBLIC_TABLE} AND NOT ix.indisprimary`,
+
+	primaryKeys: `SELECT c.relname || '#' || k2.conname AS "k",
+		json_build_array(
+			c.relname, k2.conname,
+			(SELECT json_agg(z.attname ORDER BY u.n) FROM unnest(k2.conkey) WITH ORDINALITY u(attnum, n)
+				JOIN pg_attribute z ON z.attrelid = c.oid AND z.attnum = u.attnum),
+			array_length(k2.conkey, 1)
+		) AS "j"
+		FROM pg_constraint k2 JOIN ${PUBLIC_TABLE} ON c.oid = k2.conrelid
+		WHERE ${IS_PUBLIC_TABLE} AND k2.contype = 'p'`,
 
 	uniques: `SELECT k2.conname AS "k",
 			json_build_array(
@@ -638,6 +676,7 @@ export const FACET_WIDTHS: Record<FacetName, number> = {
 	columns: 8,
 	foreignKeys: 9,
 	indexes: 11,
+	primaryKeys: 4,
 	uniques: 5,
 	checks: 3,
 	generated: 5,
@@ -755,7 +794,7 @@ export type ActualColumn = ExpectedColumn;
 export type ActualIndex = {
 	table: string;
 	name: string;
-	columns: string[];
+	columns: IndexKey[];
 	options: number[];
 	isUnique: boolean;
 	method: string;
@@ -767,6 +806,7 @@ export type ActualIndex = {
 };
 export type ActualForeignKey = SnapshotForeignKey & { columnCount: number; refColumnCount: number };
 export type ActualUnique = ExpectedUnique & { columnCount: number };
+export type ActualPrimaryKey = ExpectedPrimaryKey & { columnCount: number };
 export type ActualCheck = { table: string; name: string; definition: string };
 export type ActualGenerated = {
 	table: string;
@@ -783,6 +823,7 @@ export type Catalog = {
 	foreignKeys: ActualForeignKey[];
 	indexes: ActualIndex[];
 	uniques: ActualUnique[];
+	primaryKeys: ActualPrimaryKey[];
 	checks: ActualCheck[];
 	generated: ActualGenerated[];
 	sequences: ActualSequence[];
@@ -888,7 +929,20 @@ export function parseCatalog(facets: Record<FacetName, unknown[][]>): {
 			table: String(row[0]),
 			name: String(row[1]),
 			isUnique: row[2] === true,
-			columns: asStrings(row[3]),
+			columns: Array.isArray(row[3])
+				? row[3].map((key: unknown) => {
+						if (typeof key === "string") return key;
+						if (
+							key !== null &&
+							typeof key === "object" &&
+							"expression" in key &&
+							typeof key.expression === "string"
+						)
+							return { expression: key.expression };
+						problems.push(`index ${row[0]}.${row[1]}: unreadable key ${clip(key)}`);
+						return "<unresolved key>";
+					})
+				: [],
 			options: asNumbers(row[4]),
 			method: String(row[5]),
 			where: asString(row[6]),
@@ -896,6 +950,12 @@ export function parseCatalog(facets: Record<FacetName, unknown[][]>): {
 			keyColumnCount: Number(row[8]),
 			nullsNotDistinct: row[9] === true,
 			constraintBacked: String(row[10]) === "u",
+		})),
+		primaryKeys: facets.primaryKeys.map((row) => ({
+			table: String(row[0]),
+			name: String(row[1]),
+			columns: asStrings(row[2]),
+			columnCount: Number(row[3]),
 		})),
 		uniques: facets.uniques.map((row) => ({
 			table: String(row[0]),
@@ -941,6 +1001,7 @@ export function parseCatalog(facets: Record<FacetName, unknown[][]>): {
 // ---------------------------------------------------------------------------------------
 
 export type DeparseRequest =
+	| { id: string; kind: "index"; table: string; text: string }
 	| { id: string; kind: "predicate"; table: string; keyColumn: string; text: string }
 	| { id: string; kind: "check"; table: string; text: string }
 	| { id: string; kind: "generated"; table: string; type: string; text: string }
@@ -976,13 +1037,18 @@ export function deparseRequests(expected: Expected): DeparseRequest[] {
 		requests.push(request);
 	};
 	for (const index of expected.indexes) {
+		for (const key of index.columns) {
+			if (typeof key === "string") continue;
+			counter += 1;
+			push({ id: `idx_${counter}`, kind: "index", table: index.table, text: key.expression });
+		}
 		if (index.where === null) continue;
 		counter += 1;
 		push({
 			id: `pred_${counter}`,
 			kind: "predicate",
 			table: index.table,
-			keyColumn: firstColumn.get(index.table) ?? index.columns[0],
+			keyColumn: firstColumn.get(index.table) ?? "<missing ordinary column>",
 			text: index.where,
 		});
 	}
@@ -1033,7 +1099,9 @@ export function buildDeparseScript(requests: DeparseRequest[]): string {
 	}
 	for (const request of requests) {
 		const scratch = alias.get(request.table);
-		if (request.kind === "predicate") {
+		if (request.kind === "index") {
+			lines.push(`CREATE INDEX nf_${request.id} ON ${scratch} ((${request.text}));`);
+		} else if (request.kind === "predicate") {
 			lines.push(
 				`CREATE INDEX nf_${request.id} ON ${scratch} ("${request.keyColumn}") WHERE ${request.text};`,
 			);
@@ -1052,6 +1120,9 @@ export function buildDeparseScript(requests: DeparseRequest[]): string {
 	}
 	lines.push(`SELECT json_build_array(i.relname, pg_get_expr(ix.indpred, ix.indrelid))::text
 		FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE i.relname LIKE 'nf\\_pred\\_%'
+	UNION ALL
+	SELECT json_build_array(i.relname, pg_get_indexdef(ix.indexrelid, 1, true))::text
+		FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE i.relname LIKE 'nf\\_idx\\_%'
 	UNION ALL
 	SELECT json_build_array(conname, pg_get_constraintdef(oid))::text
 		FROM pg_constraint WHERE conname LIKE 'nf\\_chk\\_%'
@@ -1323,6 +1394,20 @@ export function compareBaseline(
 		}
 	}
 
+	diffKeyed(
+		"primary key",
+		new Map(expected.primaryKeys.map((key) => [`${key.table}.${key.name}`, key.columns])),
+		new Map(actual.primaryKeys.map((key) => [`${key.table}.${key.name}`, key.columns])),
+		problems,
+	);
+	for (const key of actual.primaryKeys) {
+		if (key.columns.length !== key.columnCount) {
+			problems.push(
+				`primary key ${key.table}.${key.name}: ${key.columns.length} of ${key.columnCount} columns resolved`,
+			);
+		}
+	}
+
 	const fkShape = (fk: SnapshotForeignKey) => ({
 		tableFrom: fk.tableFrom,
 		tableTo: fk.tableTo,
@@ -1359,7 +1444,15 @@ export function compareBaseline(
 			expected.indexes.map((index) => [
 				indexKey(index),
 				{
-					columns: index.columns,
+					columns: index.columns.map((key) =>
+						typeof key === "string"
+							? key
+							: {
+									expression:
+										canonical.get(deparseKey("index", index.table, key.expression)) ??
+										`<no canonical form for ${key.expression}>`,
+								},
+					),
 					isUnique: index.isUnique,
 					method: index.method,
 					where:

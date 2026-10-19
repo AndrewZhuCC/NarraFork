@@ -316,7 +316,8 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		setIsCancellingSchedule(true);
 		setCancelError(null);
 		try {
-			await api.cancelUpdate();
+			const response = await api.cancelUpdate();
+			if (!response.success) throw new Error(response.error ?? t("updateCancelScheduleFailed"));
 			// The attempt is over as far as this client is concerned. Releasing the optimistic claim
 			// here is what lets the poll wind down once the coordinator reports idle; leaving it set
 			// kept `/api/update/status` running once a second indefinitely.
@@ -456,15 +457,20 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const statusErrorIsCurrent =
 		!!preparedStatus?.error &&
 		(applyAttemptStartedAt === null || preparedStatusUpdatedAt >= applyAttemptStartedAt);
-	const coordinationFailed = statusErrorIsCurrent && preparedStatus?.scheduled !== true;
+	// A failed rollback still owns this attempt; only cancellation may release it. Never
+	// turn its error into an idle state that offers another /apply against the held sources.
+	const cleanupRetryPending = preparedStatus?.cleanupRetryPending === true;
+	const coordinationFailed =
+		!cleanupRetryPending && statusErrorIsCurrent && preparedStatus?.scheduled !== true;
 	// An operator cancellation lands in the same error field as a genuine failure, but it is an
 	// expected outcome rather than something that went wrong.
 	const coordinationCancelled = coordinationFailed && preparedStatus?.errorKind === "cancelled";
-	const updateScheduled = coordinationFailed
-		? false
-		: applyResult?.scheduled === true || preparedStatus?.scheduled === true;
+	const updateScheduled =
+		cleanupRetryPending ||
+		(!coordinationFailed &&
+			(applyResult?.scheduled === true || preparedStatus?.scheduled === true));
 	const coordinationPhase =
-		preparedStatus?.scheduled || coordinationFailed
+		preparedStatus?.scheduled || cleanupRetryPending || coordinationFailed
 			? preparedStatus?.phase
 			: (applyResult?.phase ?? preparedStatus?.phase);
 	const coordinationCountsSource = preparedStatus?.scheduled
@@ -509,6 +515,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 			: rawDownloadError;
 	const applyError =
 		cancelError ??
+		(cleanupRetryPending ? (preparedStatus?.error ?? t("updateCleanupRetryDescription")) : null) ??
 		restartWaitError ??
 		(applyResult && !applyResult.success ? applyResult.error : null) ??
 		(statusErrorIsCurrent ? preparedStatus?.error : null) ??
@@ -522,15 +529,23 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	}, [preparedStatus?.scheduled]);
 
 	useEffect(() => {
-		if (coordinationFailed) {
+		if (coordinationFailed || cleanupRetryPending) {
 			restartWaitRef.current?.controller.abort();
 			restartWaitRef.current = null;
+			if (cleanupRetryPending) setRestartWaitError(null);
 			return;
 		}
 		if (updateScheduled && coordinationPhase === "restarting") {
 			void startRestartWait(targetVersion);
 		}
-	}, [coordinationFailed, coordinationPhase, startRestartWait, targetVersion, updateScheduled]);
+	}, [
+		cleanupRetryPending,
+		coordinationFailed,
+		coordinationPhase,
+		startRestartWait,
+		targetVersion,
+		updateScheduled,
+	]);
 
 	return (
 		<Modal
@@ -552,7 +567,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							{preparedSource?.source === "github"
 								? t("updateSourceGithub", { repository: preparedSource.repository })
 								: preparedSource?.source === "update-server"
-									? `${t("updateSourceServer")}: ${preparedSource.serverUrl} / ${preparedSource.product}`
+									? `${t("updateSourceServer")}: ${preparedSource.repository} · ${preparedSource.serverUrl} / ${preparedSource.product}`
 									: t("updatePreparedUnknownSource")}
 							{preparedSource && ` · ${preparedSource.channel} · ${preparedSource.platform}`}
 						</Text>
@@ -575,7 +590,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						<Badge variant="light">
 							{releaseInfo.source === "github"
 								? t("updateSourceGithub", { repository: releaseInfo.repository })
-								: t("updateSourceServer")}
+								: `${t("updateSourceServer")}: ${releaseInfo.repository}`}
 						</Badge>
 						<Badge variant="outline">
 							{t(
@@ -665,7 +680,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					</div>
 				)}
 
-				{progress?.fallback && releaseInfo?.source === "github" && (
+				{progress?.fallback && releaseInfo && (
 					<Alert color="yellow" variant="light">
 						{t("updateDeltaFallback")}
 					</Alert>
@@ -920,7 +935,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							</Alert>
 						)}
 
-						{updateScheduled && !restartStarted && (
+						{updateScheduled && !restartStarted && !cleanupRetryPending && (
 							<Stack gap="xs">
 								{waitBlockers.length > 0 && (
 									<Stack gap={2}>
@@ -977,7 +992,22 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					</Alert>
 				)}
 
-				{restartStarted && (
+				{cleanupRetryPending && (
+					<Stack gap="xs">
+						<Text size="sm">{t("updateCleanupRetryDescription")}</Text>
+						<Button
+							variant="light"
+							color="red"
+							leftSection={<IconX size={14} />}
+							onClick={handleCancelSchedule}
+							loading={isCancellingSchedule}
+						>
+							{t("updateRetryCancellation")}
+						</Button>
+					</Stack>
+				)}
+
+				{restartStarted && !cleanupRetryPending && (
 					<Stack gap="sm">
 						<Alert color="blue" variant="light" icon={<IconPower size={16} />}>
 							{t("updateRestarting")}

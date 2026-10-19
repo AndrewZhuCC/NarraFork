@@ -68,6 +68,7 @@ const recordingRoots = [
 	"editor-transfers",
 	"editor-native",
 	"editor-native-operations",
+	"token-repair-jobs",
 ].map((name) => {
 	const directory = join(narraforkDir, name, "share-privacy-test");
 	mkdirSync(directory, { recursive: true });
@@ -93,7 +94,7 @@ afterAll(() => {
 
 describe("ShareFile cannot publish private request recordings", () => {
 	test.each([
-		0, 1, 2, 3, 4,
+		0, 1, 2, 3, 4, 5,
 	])("refuses private directory %s, files, compression and multi-file archives", async (index) => {
 		const directory = recordingRoots[index];
 		const file = join(directory, "request.json");

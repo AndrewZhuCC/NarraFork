@@ -1,10 +1,23 @@
 import { KNOWLEDGE_EXCERPT_MAX_CHARS, knowledgeExcerpt } from "@shared/knowledge-excerpt";
+import { formatKnowledgeInjections as formatInjectionsBare } from "@shared/sidecar-body";
+
+export { formatInjectionsBare };
+
 import { settings } from "../lib/settings";
 import { knowledgeReadStore } from "./knowledge/store";
 import { knowledgeAcl } from "./knowledge-acl";
 import { knowledgeInjectionReads, knowledgeService } from "./knowledge-service";
 
+export function injectionKey(hit: { scope?: "personal" | "global"; entryId: string }): string {
+	return `${hit.scope ?? "global"}:${hit.entryId}`;
+}
+
+function candidateKey(candidate: KeywordCandidate): string {
+	return injectionKey({ scope: candidate.scope, entryId: candidate.id });
+}
+
 export interface InjectionHit {
+	scope?: "personal" | "global";
 	entryId: string;
 	entryRevisionId?: string | null;
 	title: string;
@@ -115,8 +128,8 @@ function buildMatcher(candidates: KeywordCandidate[]): {
 			}
 
 			const entryIds = entryIdsByKeyword.get(keyword);
-			if (entryIds && !entryIds.has(entry.id)) {
-				entryIds.add(entry.id);
+			if (entryIds && !entryIds.has(candidateKey(entry))) {
+				entryIds.add(candidateKey(entry));
 				needles[needleIndex].entries.push(entry);
 			}
 		}
@@ -147,7 +160,9 @@ interface CompiledMatcher {
 
 function compileMatcher(candidates: KeywordCandidate[]): CompiledMatcher {
 	const { nodes, needles } = buildMatcher(candidates);
-	const candidateOrder = new Map(candidates.map((candidate, index) => [candidate.id, index]));
+	const candidateOrder = new Map(
+		candidates.map((candidate, index) => [candidateKey(candidate), index]),
+	);
 	return { nodes, needles, candidateOrder };
 }
 
@@ -165,11 +180,16 @@ interface MatcherCacheEntry {
 const matcherCache = new Map<string, MatcherCacheEntry>();
 const MATCHER_CACHE_MAX_SCOPES = 64;
 
-function matcherCacheKey(opts: { collectionId?: string; projectId?: string }): string {
-	return `${opts.collectionId ?? ""}|${opts.projectId ?? ""}`;
+function matcherCacheKey(opts: {
+	collectionId?: string;
+	projectId?: string;
+	userId?: string | null;
+}): string {
+	return JSON.stringify([opts.collectionId ?? "", opts.projectId ?? "", opts.userId ?? ""]);
 }
 
 async function getCompiledMatcher(opts: {
+	userId?: string | null;
 	collectionId?: string;
 	projectId?: string;
 }): Promise<CompiledMatcher> {
@@ -215,13 +235,13 @@ function matchWithCompiledMatcher(
 				continue;
 			}
 			for (const candidate of needle.entries) {
-				const existing = hits.get(candidate.id);
+				const existing = hits.get(candidateKey(candidate));
 				if (
 					!existing ||
 					start < existing.firstIndex ||
 					(start === existing.firstIndex && needle.keyword.length > existing.keywordLength)
 				) {
-					hits.set(candidate.id, {
+					hits.set(candidateKey(candidate), {
 						candidate,
 						firstIndex: start,
 						keywordLength: needle.keyword.length,
@@ -237,7 +257,8 @@ function matchWithCompiledMatcher(
 			(a, b) =>
 				a.firstIndex - b.firstIndex ||
 				b.keywordLength - a.keywordLength ||
-				(candidateOrder.get(a.candidate.id) ?? 0) - (candidateOrder.get(b.candidate.id) ?? 0),
+				(candidateOrder.get(candidateKey(a.candidate)) ?? 0) -
+					(candidateOrder.get(candidateKey(b.candidate)) ?? 0),
 		)
 		.map((hit) => hit.candidate);
 }
@@ -270,6 +291,7 @@ export async function resolveInjections(
 	let matcher: CompiledMatcher;
 	try {
 		matcher = await getCompiledMatcher({
+			userId,
 			collectionId: opts.collectionId,
 			projectId: opts.projectId,
 		});
@@ -282,35 +304,49 @@ export async function resolveInjections(
 	const caps = await knowledgeAcl.resolveCapsByUserId(userId);
 	const principal = { userId: caps.userId, role: caps.role };
 	// Reuse the caps we just resolved so filterReadable doesn't re-query grants.
-	const readable = await knowledgeService.filterReadable(principal, matched, { caps });
+	const readableGlobal = await knowledgeService.filterReadable(
+		principal,
+		matched.filter((r) => r.scope !== "personal"),
+		{ caps },
+	);
+	const readableGlobalIds = new Set(readableGlobal.map((r) => r.id));
+	const readable = matched.filter((r) => r.scope === "personal" || readableGlobalIds.has(r.id));
 
 	const selected: typeof readable = [];
 	for (const r of readable) {
-		if (opts.already?.has(r.id)) continue;
+		if (opts.already?.has(candidateKey(r))) continue;
 		selected.push(r);
 		if (selected.length >= cfg.maxInjectedEntries) break;
 	}
 	if (selected.length === 0) return [];
 
-	const snippets = await knowledgeInjectionReads.snippetsByEntryIds(selected.map((r) => r.id));
-	return selected.map((r) => ({
-		entryId: r.id,
-		entryRevisionId: r.entryRevisionId,
-		title: r.title,
-		summary: summarize(snippets.get(r.id) ?? "", r.title),
-	}));
+	const snippets = await knowledgeInjectionReads.snippetsByEntryIds(
+		selected.filter((r) => r.scope !== "personal").map((r) => r.id),
+	);
+	const personalSnippets = userId
+		? await knowledgeInjectionReads.personalSnippetsByEntryIds(
+				userId,
+				selected.filter((r) => r.scope === "personal").map((r) => r.id),
+			)
+		: new Map<string, string>();
+	return selected
+		.filter((r) => r.scope !== "personal" || personalSnippets.has(r.id))
+		.map((r) => ({
+			scope: r.scope,
+			entryId: r.id,
+			entryRevisionId: r.entryRevisionId,
+			title: r.title,
+			summary: summarize(
+				(r.scope === "personal" ? personalSnippets : snippets).get(r.id) ?? "",
+				r.title,
+			),
+		}));
 }
 
 /** Render injection hits as a system-reminder style block (or null if none). */
 export function formatInjections(hits: InjectionHit[], heading: string): string | null {
 	if (hits.length === 0) return null;
 	return `<knowledge_base_hint>\n${formatInjectionsBare(hits, heading)}\n</knowledge_base_hint>`;
-}
-
-/** Render injection hits as plain text (no XML wrapper) — for callers that wrap themselves. */
-export function formatInjectionsBare(hits: InjectionHit[], heading: string): string {
-	const lines = hits.map((h) => `- [${h.entryId}] ${h.title}: ${h.summary}`);
-	return `${heading}\n${lines.join("\n")}\n\n(Use KnowledgeRead with an id for full content.)`;
 }
 
 export function createKnowledgeHintBlock(
@@ -340,7 +376,7 @@ export async function scanToolOutputForKnowledgeDetailed(
 			: output;
 	const hits = await resolveInjections(userId, scanText, { ...opts, already });
 	if (hits.length === 0) return null;
-	for (const h of hits) already.add(h.entryId);
+	for (const h of hits) already.add(injectionKey(h));
 	return {
 		hits,
 		content: formatInjectionsBare(

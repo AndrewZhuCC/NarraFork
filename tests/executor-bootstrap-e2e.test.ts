@@ -1,7 +1,7 @@
 /**
  * End-to-end check of the executor distribution path.
  *
- * Publishes a real binary to a scratch update server, then exercises the
+ * Serves a canonical GitHub release fixture over scratch HTTP, then exercises the
  * NarraFork side: manifest fetch, proxied download with a one-time ticket, and
  * install-script generation. Verifies the script's own integrity checks against
  * the bytes actually served.
@@ -11,9 +11,9 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EXECUTOR_MANIFEST_FILENAME } from "@shared/remote-executor";
+import { EXECUTOR_MANIFEST_FILENAME, EXECUTOR_PLATFORMS } from "@shared/remote-executor";
 import { Hono } from "hono";
-import { buildExecutorManifest, formatExecutorManifest } from "../scripts/lib/executor-manifest";
+import { buildExecutorManifest } from "../scripts/lib/executor-manifest";
 import { buildAppErrorResponse } from "../server/lib/app-error-response";
 import {
 	ensureExecutorBinary,
@@ -33,13 +33,11 @@ import { BUILD_EXECUTOR_DISTRIBUTION } from "../server/lib/version";
 
 const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
+import { setOutboundFetchOverrideForTest } from "../server/lib/net/outbound-fetch";
 import {
 	executorBootstrapRoutes,
 	resetExecutorBootstrapRateLimit,
 } from "../server/routes/executor-bootstrap";
-import { createApp } from "../update-server/app";
-import { addToken, initConfig } from "../update-server/lib/config";
-import { LocalStorage } from "../update-server/storage/local";
 
 // A structural ELF fixture, never executed by this suite.
 const BINARY = Buffer.alloc(256);
@@ -61,43 +59,43 @@ const originalUpdate = settings.update ?? {
 
 beforeAll(async () => {
 	scratchDir = mkdtempSync(join(tmpdir(), "nf-executor-e2e-"));
-	await initConfig(join(scratchDir, "config.json"));
-	const { token } = await addToken("e2e-uploader", "upload");
-	const storage = new LocalStorage(join(scratchDir, "data"));
-	const app = createApp(storage);
-	updateServer = Bun.serve({ port: 0, fetch: app.fetch });
-	const baseUrl = `http://localhost:${updateServer.port}`;
-
-	// Publish through the real HTTP upload path, not by writing files directly.
 	const manifest = buildExecutorManifest({
 		version: EXECUTOR_VERSION,
 		protocolVersion: 1,
 		releasedAt: new Date().toISOString(),
-		artifacts: [{ platform: "linux-amd64", bytes: new Uint8Array(BINARY) }],
+		artifacts: EXECUTOR_PLATFORMS.map((platform) => ({ platform, bytes: new Uint8Array(BINARY) })),
 	});
-	const put = async (filename: string, body: Uint8Array, contentType: string) => {
-		const response = await fetch(`${baseUrl}/api/v2/tools/${filename}`, {
-			method: "PUT",
-			headers: { Authorization: `Bearer ${token}`, "Content-Type": contentType },
-			body: new Blob([Uint8Array.from(body)]),
-		});
-		expect(response.status).toBe(200);
+	const tag = `executor-v${EXECUTOR_VERSION}`;
+	const prefix = `https://github.com/fixture/bootstrap/releases/download/${tag}/`;
+	const envelope = {
+		schemaVersion: 1,
+		repository: "fixture/bootstrap",
+		tag,
+		commit: "a".repeat(40),
+		manifest,
+		licenses: [{ name: "LICENSE.txt", size: 10, sha256: "a".repeat(64) }],
 	};
-	await put(
-		`narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`,
-		new Uint8Array(BINARY),
-		"application/octet-stream",
-	);
-	await put(
-		EXECUTOR_MANIFEST_FILENAME,
-		new Uint8Array(Buffer.from(formatExecutorManifest(manifest))),
-		"application/json",
-	);
-
-	// Point this NarraFork instance at the scratch update server.
+	updateServer = Bun.serve({
+		port: 0,
+		fetch: (request) => {
+			const filename = new URL(request.url).pathname.split("/").at(-1);
+			if (filename === EXECUTOR_MANIFEST_FILENAME) return Response.json(envelope);
+			if (filename === `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`)
+				return new Response(BINARY);
+			return new Response(null, { status: 404 });
+		},
+	});
+	const baseUrl = `http://localhost:${updateServer.port}`;
+	setOutboundFetchOverrideForTest(async (input, init) => {
+		const url = String(input);
+		expect(url).toStartWith(prefix); // Never visit metadata mirror unsigned-tools endpoints.
+		const response = await fetch(`${baseUrl}/${new URL(url).pathname.split("/").at(-1)}`, init);
+		return new Response(response.body, { status: response.status, headers: response.headers });
+	});
 	settings.update = {
 		...originalUpdate,
 		source: "update-server",
+		githubRepository: "fixture/bootstrap",
 		serverUrl: baseUrl,
 		proxy: { mode: "direct" },
 	};
@@ -113,12 +111,14 @@ beforeEach(() => {
 	settings.update = {
 		...originalUpdate,
 		source: "update-server",
+		githubRepository: "fixture/bootstrap",
 		serverUrl: `http://localhost:${updateServer.port}`,
 		proxy: { mode: "direct" },
 	};
 });
 afterAll(() => {
 	updateServer?.stop(true);
+	setOutboundFetchOverrideForTest(null);
 	settings.update = originalUpdate;
 	resetExecutorManifestCache();
 	resetExecutorTickets();
@@ -144,7 +144,7 @@ function bootstrapApp() {
 	return app;
 }
 
-test("NarraFork mirrors the published release and serves it against a ticket", async () => {
+test("mirror-metadata mode downloads pinned GitHub executor bytes and serves the immutable ticket", async () => {
 	const manifest = await getExecutorManifest({ forceRefresh: true });
 	expect(manifest?.version).toBe(EXECUTOR_VERSION);
 	expect(manifest?.platforms["linux-amd64"]?.sha256).toBe(SHA256);

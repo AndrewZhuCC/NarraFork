@@ -82,6 +82,34 @@ function ownedFile(streams: EditorDocumentStreams, readId: string) {
 	return file;
 }
 
+test("source worker probes a missing entry before ready and keeps its two-worker budget", async () => {
+	const { root } = await fixture();
+	const workers = new EditorSourceWorkers([
+		pathToFileURL(join(root, "missing-worker.ts")).href,
+		new URL("./editor-document-stream-worker.ts", import.meta.url).href,
+	]);
+	clean.push(() => workers.dispose());
+	for (let index = 0; index < 4; index++) {
+		const slot = workers.assign();
+		const result = await workers.run(slot, { action: "diagnostics", stream: "" });
+		expect(result.counters?.fds).toBe(0);
+	}
+	expect(workers.count).toBe(2);
+	await workers.dispose();
+	expect(workers.count).toBe(0);
+});
+
+test("failed source-worker startup settles close and disposal without stream dispatch", async () => {
+	const { root } = await fixture();
+	const workers = new EditorSourceWorkers([pathToFileURL(join(root, "missing-worker.ts")).href]);
+	clean.push(() => workers.dispose());
+	const slot = workers.assign();
+	await expectRejected(workers.run(slot, { action: "diagnostics", stream: "" }), "No worker entry");
+	expect(await workers.run(slot, { action: "close", stream: "" })).toEqual({});
+	await workers.dispose();
+	expect(workers.count).toBe(0);
+});
+
 async function remoteBodyFixture(size = 64 * 1024 + 3) {
 	const bytes = new Uint8Array(size).fill(65);
 	const { streams } = await fixture(new Uint8Array());
@@ -414,7 +442,7 @@ test("ready worker error settles pending requests and old-slot close without wai
 	const file = join(root, "crash-worker.ts");
 	await writeFile(
 		file,
-		`import { parentPort } from "node:worker_threads"; parentPort.on("message", ({ id, request }) => { if(request.action === "read") throw new Error("fixture worker crash"); parentPort.postMessage({id,result:{counters:{preflightBytes:0,bodyBytes:0,fds:0}}}); }); parentPort.postMessage({ready:true});`,
+		`import { parentPort } from "node:worker_threads"; parentPort.on("message", ({ id, request, action }) => { if(action === "ping") { parentPort.postMessage({ready:true}); return; } if(request.action === "read") throw new Error("fixture worker crash"); parentPort.postMessage({id,result:{counters:{preflightBytes:0,bodyBytes:0,fds:0}}}); }); parentPort.postMessage({ready:true});`,
 	);
 	const pool = new EditorSourceWorkers([pathToFileURL(file).href]);
 	try {

@@ -532,6 +532,45 @@ export function canWriteMain(caps: PrincipalCaps, entry: AclEntry): boolean {
 }
 
 /**
+ * The entry-link management authority on the SOURCE side — `POST /entries/:id/links` (this entry
+ * as `from`) and `DELETE /links/:id` (the link's `from` entry). Today it is read access (design
+ * §6.5's "source writable" is deliberately relaxed, see knowledge-link-service `addLink`); the
+ * target of a new link must additionally be readable. Shared with `viewerCaps.canManageLinks`
+ * so tightening it later moves the UI and the endpoints together.
+ */
+export function canManageEntryLinks(
+	caps: PrincipalCaps,
+	entry: AclEntry,
+	collection: AclCollection,
+): Promise<boolean> {
+	return canRead(caps, entry, collection);
+}
+
+/**
+ * The DIRECT-WRITE (append a main revision) authority used by `addRevision`: entry-level write
+ * (admin / entry owner / write grant via {@link canWriteMain}) OR collection write (adds the
+ * collection owner). Callers must run the collection read gate first. Shared with
+ * `viewerCaps.canWriteMain` so the UI's "edit" button and the endpoint cannot drift apart.
+ */
+export function canDirectWriteEntry(
+	caps: PrincipalCaps,
+	entry: AclEntry,
+	collection: AclCollection,
+): boolean {
+	return canWriteMain(caps, entry) || canWriteCollection(caps, collection);
+}
+
+/**
+ * May the principal change ACL attributes (level / controlled tags / review tags) through the
+ * HTTP surface? Admin only — the same rule `requireAdmin` enforces on `PATCH /entries/:id/acl`
+ * and `PATCH /collections/:id/acl` (those routes are session-only, so role is the whole test).
+ * Exposed as a function so `viewerCaps.canManageAcl` names the rule instead of re-deriving it.
+ */
+export function canAdministerKnowledgeAcl(caps: PrincipalCaps): boolean {
+	return caps.isAdmin;
+}
+
+/**
  * Can the principal REVIEW changes to this entry?
  * admin / owner / holds review grant for EVERY review tag of the entry.
  */
@@ -1354,6 +1393,8 @@ export const knowledgeAcl = {
 	canWriteCollection,
 	isCollectionOwnerOrAdmin,
 	isEntryOwnerOrAdmin,
+	canDirectWriteEntry,
+	canAdministerKnowledgeAcl,
 	canWriteMain,
 	canReview,
 	readableEntryFilter,

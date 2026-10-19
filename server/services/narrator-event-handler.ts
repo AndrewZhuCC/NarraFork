@@ -38,6 +38,7 @@ import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { pinRecordingRequest } from "../lib/request-recorder";
 import {
 	DEFAULT_CONTEXT_THRESHOLDS,
 	DEFAULT_CONTEXT_WINDOW,
@@ -312,6 +313,8 @@ export interface EventHandlerContext {
 	setContextUsagePct: (pct: number) => void;
 	setMeterData: (usage: number, unit: string) => void;
 	setTokenUsage: (usage: TokenUsageSnapshot | undefined) => void;
+	/** Completed request usage, separate from the latest context occupancy snapshot. */
+	accountRequestTokenUsage?: (usage: TokenUsageSnapshot | undefined) => void;
 	setTtftMs?: (ttftMs: number | undefined) => void;
 
 	// --- Substatus management ---
@@ -3533,6 +3536,13 @@ export async function processEvent(
 		}
 
 		case "api_request_end": {
+			// Consume the owned start before any await: duplicate/concurrent ends cannot
+			// count twice, and persistence/context failures cannot lose completed usage.
+			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
+			if (requestInfo) {
+				ctx.apiRequestsMap?.delete(event.requestId);
+				ctx.accountRequestTokenUsage?.(event.usage);
+			}
 			const snapshot = boundedContextSnapshot(event.contextSnapshot);
 			if (snapshot) {
 				await storeNarratorContextUsage(narratorId, snapshot);
@@ -3568,23 +3578,12 @@ export async function processEvent(
 				}
 			}
 			// Create API request record in database
-			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
 			if (!requestInfo) {
 				logger.warn("API request end without start", { narratorId, requestId: event.requestId });
 				return null;
 			}
 
-			const usageData = event.usage
-				? {
-						inputTokens: event.usage.inputTokens ?? event.usage.promptTokens ?? 0,
-						outputTokens: event.usage.completionTokens ?? 0,
-						cachedInputTokens: event.usage.cachedInputTokens ?? 0,
-						cacheCreationInputTokens: event.usage.cacheCreationInputTokens ?? 0,
-						cacheCreation5mInputTokens: event.usage.cacheCreation5mTokens ?? 0,
-						cacheCreation1hInputTokens: event.usage.cacheCreation1hTokens ?? 0,
-						reasoningTokens: event.usage.reasoningTokens ?? 0,
-					}
-				: null;
+			const usageData = buildUsageDataFromSnapshot(event.usage);
 
 			try {
 				const apiRequestId = await finishApiRequest(requestInfo, {
@@ -3598,16 +3597,6 @@ export async function processEvent(
 					meterUnit: event.meterUnit ?? null,
 					errorMessage: event.errorMessage ?? null,
 					diagnostics: event.diagnostics,
-					rawDump: event.rawDump,
-					// Leaked-tool detection forces the raw SSE dump to persist so it stays
-					// downloadable even when error-only dumping is enabled. We intentionally do
-					// NOT synthesize an errorMessage here: that would mark a successful request
-					// as errored and skip assistant-message binding. The notice below carries
-					// the apiRequestId for the download endpoint instead.
-					forceDumpPersist: event.forceDumpPersist,
-					// Replays of one rejected request share a spill file rather than each writing
-					// a near-identical multi-MB copy that prunes other captures away.
-					dumpSpillReuseToken: event.dumpSpillReuseToken,
 				});
 				// The loop retains this attempt's diagnostic object across deferred errors
 				// and retries. Enrich only an exact local attempt match; upstream requestId
@@ -3632,12 +3621,16 @@ export async function processEvent(
 				// mark stream-captured tool calls or prompt downloading the raw dump.
 				const leaked = ctx.pendingLeakedToolCalls?.get(event.requestId);
 				if (leaked?.length) {
+					// Capture failures are worth keeping past the ring window.
+					if (leaked.some((signal) => signal.phase !== "stream_captured"))
+						pinRecordingRequest(event.requestId, "leak");
 					for (const signal of leaked) {
 						dualBroadcast(ctx, {
 							type: "leaked_tool_call_notice",
 							narratorId: broadcastTargetId,
 							phase: signal.phase,
 							apiRequestId,
+							recordingRequestId: event.requestId,
 							toolUseIds: signal.toolUseIds,
 							toolNames: signal.toolNames,
 							snippet: signal.snippet,

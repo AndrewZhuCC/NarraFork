@@ -20,7 +20,7 @@ import { useNarratorWS } from "../../../hooks/useNarratorWS";
 import { useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import { FileTreeContent } from "./FileTreeContent";
 import type { TreeChange } from "./tree-patch";
-import { buildTreeLineStats } from "./tree-store";
+import { buildTreeChangedPaths, buildTreeLineStats } from "./tree-store";
 
 export interface FileTreePanelProps {
 	narratorId: string;
@@ -72,9 +72,19 @@ export function FileTreePanel({
 		!!root,
 		treeIdentity,
 	);
-	const lineStats = useMemo(
-		() => buildTreeLineStats(fileTreeStatus?.files ?? []),
+	const changedPaths = useMemo(
+		() => buildTreeChangedPaths(fileTreeStatus?.files ?? []),
 		[fileTreeStatus?.files],
+	);
+	const lineStats = useMemo(
+		() =>
+			buildTreeLineStats(
+				fileTreeStatus?.files ?? [],
+				!fileTreeStatus?.truncated &&
+					fileTreeStatus?.totalFilesExact !== false &&
+					(fileTreeStatus?.totalFiles ?? 0) <= (fileTreeStatus?.files.length ?? 0),
+			),
+		[fileTreeStatus],
 	);
 	const refreshLineStats = useCallback(() => {
 		void refetchFileTreeStatus();
@@ -134,6 +144,7 @@ export function FileTreePanel({
 			root={root}
 			showHidden={showHidden}
 			onToggleShowHidden={toggleShowHidden}
+			changedPaths={changedPaths}
 			lineStats={lineStats}
 			lineStatsTruncated={fileTreeStatus?.truncated === true}
 			onRefreshLineStats={refreshLineStats}

@@ -8,6 +8,7 @@ import {
 } from "../../shared/helper-distribution";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import { EXECUTOR_VERSION_RE } from "../../shared/remote-executor-manifest";
+import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import {
 	CI_RELEASE_BUN,
@@ -141,6 +142,10 @@ const planSchema = z
 								size: id.max(1024 ** 3),
 								sha256: z.string().regex(/^[a-f0-9]{64}$/),
 								sha512: z.string().regex(/^[A-Za-z0-9+/]{86}==$/),
+								recoveryManifestVersions: z
+									.unknown()
+									.transform((value) => parseRecoveryManifestVersions(value))
+									.optional(),
 								helperDistribution: z
 									.unknown()
 									.transform((value) => parseHelperDistributionDependencies(value))
@@ -180,9 +185,14 @@ export async function ciApi(
 	run: GhRunner,
 	path: string,
 	repository = CI_RELEASE_REPOSITORY,
+	projection?: string,
 ): Promise<unknown> {
 	if (!isValidGitHubRepository(repository)) throw new Error("Invalid CI repository");
-	const output = await run(["api", `repos/${repository}${path ? `/${path}` : ""}`]);
+	const output = await run([
+		"api",
+		`repos/${repository}${path ? `/${path}` : ""}`,
+		...(projection ? ["--jq", projection] : []),
+	]);
 	if (Buffer.byteLength(output) > CI_API_MAX_BYTES) throw new Error("GitHub API output limit");
 	return JSON.parse(output);
 }
@@ -412,7 +422,14 @@ export async function assertCiMainAncestor(
 		.object.sha;
 	const comparison = z
 		.object({ status: z.string(), merge_base_commit: z.object({ sha }) })
-		.parse(await ciApi(run, `compare/${commit}...${main}`, repository));
+		.parse(
+			await ciApi(
+				run,
+				`compare/${commit}...${main}?per_page=1`,
+				repository,
+				"{status, merge_base_commit: {sha: .merge_base_commit.sha}}",
+			),
+		);
 	if (
 		!["ahead", "identical"].includes(comparison.status) ||
 		comparison.merge_base_commit.sha !== commit
@@ -529,8 +546,6 @@ export interface CreateCiReleasePlanOptions {
 	publish: boolean;
 	/** Read-only preparation or repair of the index for an already published release. */
 	indexOnly?: boolean;
-	/** Restore the sealed legacy mirror of an already published release. */
-	mirrorOnly?: boolean;
 	signal?: AbortSignal;
 	/** Fixture injection only; production uses bounded read-only component checks. */
 	componentChecks?: CiReleaseComponentChecks;
@@ -572,7 +587,7 @@ export async function createCiReleasePlan(
 	let dependencies: HelperDistributionDependencies | undefined;
 	if (options.publish) await assertReleaseEnvironment(run, repository, defaultBranch);
 	// Repairs authorize writes to an existing publication, not a new component release.
-	if (options.publish && !options.indexOnly && !options.mirrorOnly) {
+	if (options.publish && !options.indexOnly) {
 		const componentOptions = {
 			repository,
 			targetCommit: commit,
@@ -610,7 +625,7 @@ export async function revalidateCiReleasePlan(
 	options: {
 		root: string;
 		publish: boolean;
-		/** Index/mirror recovery verifies sealed identities, not current remote component readiness. */
+		/** Index recovery verifies sealed identities, not current remote component readiness. */
 		requireAlreadyPublished?: boolean;
 		run?: GhRunner;
 		env?: NodeJS.ProcessEnv;

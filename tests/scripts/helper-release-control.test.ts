@@ -387,24 +387,33 @@ const stat = fs.statSync;
 const exec = child.execFileSync;
 const writes = [];
 const calls = [];
+const protocolReads = [];
+const logs = [];
+const log = console.log;
+console.log = (...args) => logs.push(args.join(" "));
 const artifact = Buffer.from("executor version ${componentVersions.executor.version}");
 const isArtifact = (path) => /remote-executor[/\\\\]dist[/\\\\]narrafork-executor-linux-amd64$/.test(String(path));
 mock.module("node:fs", () => ({ ...fs,
  existsSync: (path) => isArtifact(path) || exists(path),
  statSync: (path) => isArtifact(path) ? {size: artifact.length} : stat(path),
- readFileSync: (path, ...args) => isArtifact(path) ? artifact : String(path).endsWith("protocol.go") ? "const ProtocolVersion = ${protocol}" : read(path, ...args),
+ readFileSync: (path, ...args) => { if (String(path).endsWith("protocol.go")) { protocolReads.push(String(path)); throw new Error("Forbidden mirror source protocol read ${protocol}"); } return isArtifact(path) ? artifact : read(path, ...args); },
  writeFileSync: (path, contents) => { writes.push({path: String(path), manifest: JSON.parse(contents)}); },
 }));
 mock.module("node:child_process", () => ({ ...child, execFileSync: (path, ...args) => isArtifact(path) ? "executor version ${componentVersions.executor.version}" : exec(path, ...args) }));
+const {parseHelperReleaseArguments: parseArguments} = await import(${JSON.stringify(resolve("scripts/release-helpers.ts"))});
 mock.module(${JSON.stringify(resolve("scripts/release-helpers.ts"))}, () => ({
- parseHelperReleaseArguments: () => ({options: new Map([["plan", "plan.json"], ["root", ${JSON.stringify(root)}]])}),
+ parseHelperReleaseArguments: (args) => {
+  const parsed = parseArguments(args);
+  return {...parsed, options: new Map([...parsed.options, ["root", ${JSON.stringify(root)}]])};
+ },
  runHelperReleaseController: async (args) => { calls.push(args); },
 }));
-mock.module(${JSON.stringify(resolve("scripts/lib/helper-release-control.ts"))}, () => ({readHelperReleasePlan: async () => ({kind: "executor", version: "0.5.24"})}));
+mock.module(${JSON.stringify(resolve("scripts/lib/helper-release-control.ts"))}, () => ({readHelperReleasePlan: async () => ({kind: "executor", version: "0.5.24", repository: "Example/Fork"})}));
+mock.module(${JSON.stringify(resolve("scripts/lib/build-repository.ts"))}, () => ({resolveBuildGitHubRepository: () => "Example/Fork"}));
 process.argv = [process.execPath, ${JSON.stringify(resolve("scripts/release-executor.ts"))}, ...${JSON.stringify(args)}];
 process.exit = (code) => { throw new Error("fixture exit " + code); };
 try { await import(${JSON.stringify(resolve("scripts/release-executor.ts"))}); }
-catch (error) { console.log(JSON.stringify({error: error.message, writes, calls})); }
+catch (error) { log(JSON.stringify({error: error.message, writes, calls, protocolReads, logs})); }
 `,
 		);
 		try {
@@ -420,25 +429,25 @@ catch (error) { console.log(JSON.stringify({error: error.message, writes, calls}
 			rmSync(root, { recursive: true, force: true });
 		}
 	}
-	test("legacy server target defaults to component pin, never the application version", () => {
+	test("server mirror defaults to component pin without writing current manifest", () => {
 		const result = fixture(["--dry-run", "--upload-only", "--platform=linux-amd64"]);
 		expect(result.error).toBe("fixture exit 0");
-		expect(result.writes).toHaveLength(1);
-		expect(result.writes[0].manifest.version).toBe(componentVersions.executor.version);
-		expect(result.writes[0].manifest.protocolVersion).toBe(1);
+		expect(result.logs.join("\n")).toContain(`executor-v${componentVersions.executor.version}`);
+		expect(result.writes).toHaveLength(0);
+		expect(result.protocolReads).toHaveLength(0);
 		expect(result.calls).toHaveLength(0);
 	}, 20_000);
-	test("server target rejects explicit versions or source protocol inconsistent with config before writes", () => {
-		const wrongVersion = fixture([
-			`${componentVersions.executor.version}-wrong`,
-			"--dry-run",
-			"--upload-only",
-		]);
-		expect(wrongVersion.error).toContain("component-versions.json");
+	test("server mirror rejects malformed versions and never reads source protocol or builds", () => {
+		const wrongVersion = fixture(["invalid", "--dry-run", "--upload-only"]);
+		expect(wrongVersion.error).toContain("version format");
 		expect(wrongVersion.writes).toHaveLength(0);
 		const wrongProtocol = fixture(["--dry-run", "--upload-only", "--platform=linux-amd64"], 2);
-		expect(wrongProtocol.error).toBe("fixture exit 1");
+		expect(wrongProtocol.error).toBe("fixture exit 0");
+		expect(wrongProtocol.protocolReads).toHaveLength(0);
 		expect(wrongProtocol.writes).toHaveLength(0);
+		const obsolete = fixture(["--skip-build", "--dry-run"]);
+		expect(obsolete.error).toContain("obsolete/unsupported");
+		expect(obsolete.writes).toHaveLength(0);
 	}, 40_000);
 	test("GitHub historical restore keeps immutable bundle version instead of current pin", () => {
 		for (const positional of [[], ["0.5.24"]]) {
@@ -462,7 +471,59 @@ catch (error) { console.log(JSON.stringify({error: error.message, writes, calls}
 		]);
 		expect(result.error).toContain("immutable bundle plan");
 		expect(result.calls).toHaveLength(0);
+		const wrongRepository = fixture([
+			"--target=github",
+			"--dry-run",
+			"--plan=plan.json",
+			"--output=bundle",
+			"--github-repository=Other/Fork",
+		]);
+		expect(wrongRepository.error).toContain("repository does not match the immutable bundle plan");
+		expect(wrongRepository.calls).toHaveLength(0);
 	}, 50_000);
+	test("GitHub CLI forwards original attempt and artifact for publication and offline dry-run", () => {
+		for (const dryRun of [false, true]) {
+			const result = fixture([
+				"--target=github",
+				"--plan=plan.json",
+				"--output=bundle",
+				"--source-run-attempt=1",
+				"--bundle-artifact-id=456",
+				"--upload-only",
+				...(dryRun ? ["--dry-run"] : []),
+			]);
+			expect(result.error).toBe("fixture exit 0");
+			expect(result.writes).toHaveLength(0);
+			expect(result.protocolReads).toHaveLength(0);
+			expect(result.calls).toEqual([
+				[
+					"publish",
+					"--plan=plan.json",
+					"--output=bundle",
+					"--source-run-attempt=1",
+					"--bundle-artifact-id=456",
+					...(dryRun ? ["--dry-run"] : []),
+				],
+			]);
+			const parsed = parseHelperReleaseArguments(result.calls[0]);
+			expect(parsed.command).toBe("publish");
+			expect(parsed.dryRun).toBe(dryRun);
+			expect(parsed.options.get("source-run-attempt")).toBe("1");
+			expect(parsed.options.get("bundle-artifact-id")).toBe("456");
+		}
+	}, 40_000);
+	for (const option of ["source-run-attempt", "bundle-artifact-id"])
+		test(`GitHub CLI rejects malformed --${option} before controller execution`, () => {
+			const result = fixture([
+				"--target=github",
+				"--plan=plan.json",
+				"--output=bundle",
+				`--${option}=not-an-id`,
+			]);
+			expect(result.error).toContain(`Invalid --${option}`);
+			expect(result.calls).toHaveLength(0);
+			expect(result.writes).toHaveLength(0);
+		}, 20_000);
 });
 
 describe("strict auxiliary controller arguments", () => {

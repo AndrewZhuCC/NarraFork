@@ -41,6 +41,28 @@ describe("executeAgentLoop file-reference context", () => {
 });
 
 describe("executeAgentLoop result handling", () => {
+	test("reasoning-only idle is a quiet natural stop without an assistant turn", async () => {
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(new AbortController().signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{ type: "stream_reset" },
+					{ type: "done", reason: "reasoning_only_idle" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+		expect(result.hasError).toBe(false);
+		expect(result.reasoningOnlyIdle).toBe(true);
+		expect(result.completedNaturally).toBe(true);
+		expect(result.completedAssistantTurn).toBe(false);
+	});
+
 	test("handles an empty assistant turn", async () => {
 		const ac = new AbortController();
 

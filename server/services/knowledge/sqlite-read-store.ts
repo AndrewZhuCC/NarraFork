@@ -18,7 +18,22 @@
  *     PARSED (the schema's json mode), which the port's `unknown` row fields state
  *     explicitly; the raw statements used to return strings the service parsed.
  */
-import { and, desc, eq, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	getTableColumns,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	like,
+	lt,
+	ne,
+	or,
+	sql,
+} from "drizzle-orm";
 import { db } from "../../db";
 import {
 	aclEvents,
@@ -39,6 +54,8 @@ import type {
 	AclEventReadRow,
 	KeywordInjectionCandidateRow,
 	KnowledgeEntryLinkRow,
+	KnowledgeEntryListFilter,
+	KnowledgeEntryListOrder,
 	KnowledgeEntryListRow,
 	KnowledgeEntryRow,
 	KnowledgeReadStore,
@@ -77,6 +94,53 @@ const ENTRY_LIST_COLUMNS = {
 	createdAt: true,
 	updatedAt: true,
 } as const;
+
+/**
+ * WHERE for the ordered browse list: SQL-side filters + the keyset predicate of the order.
+ * `level` is the effective level (own level, else the collection's default — a small `IN`
+ * subselect over collections).
+ */
+function entryListWhere(filter: KnowledgeEntryListFilter, order: KnowledgeEntryListOrder) {
+	const level = filter.level;
+	let keyset: ReturnType<typeof or>;
+	if (order.sort === "title") {
+		const after = order.after;
+		keyset = after
+			? or(
+					gt(knowledgeEntries.title, after.title),
+					and(eq(knowledgeEntries.title, after.title), gt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	} else {
+		const after = order.after;
+		keyset = after
+			? or(
+					lt(knowledgeEntries.updatedAt, after.updatedAt),
+					and(eq(knowledgeEntries.updatedAt, after.updatedAt), lt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	}
+	return and(
+		filter.collectionId ? eq(knowledgeEntries.collectionId, filter.collectionId) : undefined,
+		filter.status ? eq(knowledgeEntries.status, filter.status) : undefined,
+		level
+			? or(
+					eq(knowledgeEntries.classificationLevel, level),
+					and(
+						isNull(knowledgeEntries.classificationLevel),
+						inArray(
+							knowledgeEntries.collectionId,
+							db
+								.select({ id: knowledgeCollections.id })
+								.from(knowledgeCollections)
+								.where(eq(knowledgeCollections.defaultLevel, level)),
+						),
+					),
+				)
+			: undefined,
+		keyset,
+	);
+}
 
 const COLLECTION_ACL_COLUMNS = {
 	id: true,
@@ -121,6 +185,37 @@ function projectScopeClause(projectId: string | undefined) {
 			.where(
 				or(eq(knowledgeCollections.projectId, projectId), isNull(knowledgeCollections.projectId)),
 			),
+	);
+}
+
+function personalInjectionWhere(opts: {
+	userId: string;
+	collectionId?: string;
+	projectId?: string;
+}) {
+	return and(
+		eq(knowledgeDrafts.authorUserId, opts.userId),
+		eq(knowledgeDrafts.status, "active"),
+		isNull(knowledgeDrafts.entryId),
+		isNotNull(knowledgeDrafts.keywordsJson),
+		opts.collectionId ? eq(knowledgeDrafts.targetCollectionId, opts.collectionId) : undefined,
+		opts.projectId
+			? or(
+					isNull(knowledgeDrafts.targetCollectionId),
+					inArray(
+						knowledgeDrafts.targetCollectionId,
+						db
+							.select({ id: knowledgeCollections.id })
+							.from(knowledgeCollections)
+							.where(
+								or(
+									eq(knowledgeCollections.projectId, opts.projectId),
+									isNull(knowledgeCollections.projectId),
+								),
+							),
+					),
+				)
+			: undefined,
 	);
 }
 
@@ -188,7 +283,10 @@ export const sqliteKnowledgeInjectionReads = {
 	},
 	listInjectedEntryIds(narratorId: string, compactSeq: number) {
 		return db
-			.select({ entryId: knowledgeInjectionEvents.entryId })
+			.select({
+				entryId: knowledgeInjectionEvents.entryId,
+				personalEntryId: knowledgeInjectionEvents.personalEntryId,
+			})
 			.from(knowledgeInjectionEvents)
 			.where(
 				and(
@@ -197,11 +295,42 @@ export const sqliteKnowledgeInjectionReads = {
 				),
 			)
 			.all()
-			.map((row) => row.entryId);
+			.map((row) =>
+				row.personalEntryId ? `personal:${row.personalEntryId}` : `global:${row.entryId}`,
+			);
 	},
 };
 
 export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
+	async listPersonalEntries(opts) {
+		const { content, ...columns } = getTableColumns(knowledgeDrafts);
+		return db
+			.select({ ...columns, contentLength: sql<number>`length(${content})` })
+			.from(knowledgeDrafts)
+			.where(
+				and(
+					eq(knowledgeDrafts.authorUserId, opts.userId),
+					opts.status ? eq(knowledgeDrafts.status, opts.status) : undefined,
+				),
+			)
+			.orderBy(desc(knowledgeDrafts.updatedAt))
+			.limit(Math.max(1, Math.min(opts.limit, 200)))
+			.all();
+	},
+	async getEntryRevisionPointers(ids) {
+		if (!ids.length) return [];
+		return db
+			.select({ id: knowledgeEntries.id, currentRevisionId: knowledgeEntries.currentRevisionId })
+			.from(knowledgeEntries)
+			.where(inArray(knowledgeEntries.id, ids))
+			.limit(200)
+			.all();
+	},
+	async getPersonalEntryById(id) {
+		return (
+			(await db.query.knowledgeDrafts.findFirst({ where: eq(knowledgeDrafts.id, id) })) ?? null
+		);
+	},
 	async getEntryById(entryId) {
 		const row = await db.query.knowledgeEntries.findFirst({
 			where: eq(knowledgeEntries.id, entryId),
@@ -242,11 +371,36 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 	},
 
 	async listEntries(opts) {
+		const after = opts.after;
 		return db.query.knowledgeEntries.findMany({
-			where: opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+			where: and(
+				opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+				after
+					? or(
+							lt(knowledgeEntries.updatedAt, after.updatedAt),
+							and(
+								eq(knowledgeEntries.updatedAt, after.updatedAt),
+								lt(knowledgeEntries.id, after.id),
+							),
+						)
+					: undefined,
+			),
 			columns: ENTRY_LIST_COLUMNS,
-			orderBy: (e, { desc: d }) => [d(e.updatedAt)],
+			orderBy: (e, { desc: d }) => [d(e.updatedAt), d(e.id)],
 			limit: opts.limit,
+		}) as Promise<KnowledgeEntryListRow[]>;
+	},
+
+	async listEntriesOrdered(opts) {
+		const { limit, order, ...filter } = opts;
+		return db.query.knowledgeEntries.findMany({
+			where: entryListWhere(filter, order),
+			columns: ENTRY_LIST_COLUMNS,
+			orderBy:
+				order.sort === "title"
+					? [asc(knowledgeEntries.title), asc(knowledgeEntries.id)]
+					: [desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id)],
+			limit,
 		}) as Promise<KnowledgeEntryListRow[]>;
 	},
 
@@ -376,6 +530,14 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 			columns: { username: true },
 		});
 		return row ?? null;
+	},
+
+	async listUsernamesByIds(userIds) {
+		if (userIds.length === 0) return [];
+		return db.query.users.findMany({
+			where: inArray(users.id, userIds),
+			columns: { id: true, username: true },
+		});
 	},
 
 	async listUserIdsAndRoles(opts) {
@@ -583,6 +745,33 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 		});
 	},
 
+	async findActivePersonalEntryId(entryId, authorUserId) {
+		const row = await db.query.knowledgeDrafts.findFirst({
+			where: and(
+				eq(knowledgeDrafts.entryId, entryId),
+				eq(knowledgeDrafts.authorUserId, authorUserId),
+				eq(knowledgeDrafts.status, "active"),
+			),
+			columns: { id: true },
+		});
+		return row?.id ?? null;
+	},
+
+	async listActivePersonalEntriesForEntries(entryIds, authorUserId) {
+		if (entryIds.length === 0) return [];
+		const rows = await db.query.knowledgeDrafts.findMany({
+			where: and(
+				inArray(knowledgeDrafts.entryId, entryIds),
+				eq(knowledgeDrafts.authorUserId, authorUserId),
+				eq(knowledgeDrafts.status, "active"),
+			),
+			columns: { id: true, entryId: true, baseRevisionId: true },
+		});
+		return rows.flatMap((r) =>
+			r.entryId ? [{ id: r.id, entryId: r.entryId, baseRevisionId: r.baseRevisionId }] : [],
+		);
+	},
+
 	async listKnowledgeAclEventRows(opts) {
 		const conds = [like(aclEvents.scopeType, "knowledge%")];
 		if (opts.eventType) conds.push(eq(aclEvents.eventType, opts.eventType));
@@ -605,6 +794,50 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 			limit: opts.limit,
 		});
 		return rows as AclEventReadRow[];
+	},
+
+	async listPersonalKeywordInjectionCandidates(opts) {
+		return db
+			.select({
+				id: knowledgeDrafts.id,
+				collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
+				title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
+				currentRevisionId: sql<null>`null`,
+				tagsJson: sql<null>`null`,
+				keywordsJson: knowledgeDrafts.keywordsJson,
+				updatedAt: knowledgeDrafts.updatedAt,
+			})
+			.from(knowledgeDrafts)
+			.where(personalInjectionWhere(opts))
+			.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
+			.limit(opts.limit);
+	},
+	async personalKeywordInjectionSignature(opts) {
+		const rows = await db
+			.select({
+				cnt: sql<number>`count(*)`,
+				maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
+			})
+			.from(knowledgeDrafts)
+			.where(personalInjectionWhere(opts));
+		return `${Number(rows[0]?.cnt ?? 0)}:${rows[0]?.maxUpdated ?? ""}`;
+	},
+	async personalInjectionSnippets(userId, ids, maxChars) {
+		if (!ids.length) return [];
+		return db
+			.select({
+				id: knowledgeDrafts.id,
+				snippet: sql<string>`substr(${knowledgeDrafts.content}, 1, ${maxChars})`,
+			})
+			.from(knowledgeDrafts)
+			.where(
+				and(
+					eq(knowledgeDrafts.authorUserId, userId),
+					eq(knowledgeDrafts.status, "active"),
+					isNull(knowledgeDrafts.entryId),
+					inArray(knowledgeDrafts.id, ids),
+				),
+			);
 	},
 
 	async listKeywordInjectionCandidates(opts) {
@@ -666,7 +899,10 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 
 	async listInjectedEntryIds(narratorId, compactSeq) {
 		const rows = await db
-			.select({ entryId: knowledgeInjectionEvents.entryId })
+			.select({
+				entryId: knowledgeInjectionEvents.entryId,
+				personalEntryId: knowledgeInjectionEvents.personalEntryId,
+			})
 			.from(knowledgeInjectionEvents)
 			.where(
 				and(
@@ -674,6 +910,8 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 					eq(knowledgeInjectionEvents.compactSeq, compactSeq),
 				),
 			);
-		return rows.map((row) => row.entryId);
+		return rows.map((row) =>
+			row.personalEntryId ? `personal:${row.personalEntryId}` : `global:${row.entryId}`,
+		);
 	},
 };

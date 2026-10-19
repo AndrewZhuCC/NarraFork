@@ -83,6 +83,7 @@ import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
+import { useToolCallInspectorHost } from "../tool-call/tool-call-inspector-host";
 import {
 	getCategory,
 	getCategoryColor,
@@ -321,6 +322,7 @@ import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-l
 import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
+import { installVListTextDragGuard } from "./vlist-text-drag";
 import { buildToolMetaIndex } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
 import {
@@ -880,6 +882,9 @@ export const PretextExactMessageList = memo(
 			} | null>(null);
 			/** Message whose pre-edit original text the (single) shell modal reveals. */
 			const [originalModalMessageId, setOriginalModalMessageId] = useState<string | null>(null);
+			// One inspector for the list. Rows only request it; mounting the dialog on
+			// the row unmounts it whenever that row leaves the overscan window.
+			const toolCallInspector = useToolCallInspectorHost(narratorId);
 			// Per-key real-pixel height overrides for rows whose content cannot be
 			// predicted arithmetically (mermaid / katex / unknown images, the live
 			// permission form, and the inline editor). A row reports its settled height via
@@ -3951,6 +3956,10 @@ export const PretextExactMessageList = memo(
 			useLayoutEffect(() => {
 				const node = viewportNode;
 				if (!node) return;
+				// Before the pointer tracker. A text-selection dragstart is cancelled here,
+				// and the tracker must observe that cancellation instead of latching a
+				// native-drag slot that dragend will never clear.
+				const stopTextDrag = installVListTextDragGuard(node);
 				const pointerTracker = createPointerDragTracker(() => controller.release());
 				const canMeasure = () => {
 					return (
@@ -4023,6 +4032,7 @@ export const PretextExactMessageList = memo(
 				observer?.observe(node);
 				return () => {
 					observer?.disconnect();
+					stopTextDrag();
 					pointerTracker.dispose();
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
@@ -5562,6 +5572,7 @@ export const PretextExactMessageList = memo(
 					{/* Fullscreen content viewer — ONE instance for the whole list, mounted only
 			    while a body is open. Rows (and their action bars) only report which
 			    target to show, so a scrolling list never builds a modal per body. */}
+					{toolCallInspector}
 					{contentView.openTarget ? (
 						<VListContentViewModal
 							target={contentView.openTarget}

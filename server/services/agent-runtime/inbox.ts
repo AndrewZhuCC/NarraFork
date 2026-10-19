@@ -12,6 +12,7 @@ import {
 	projectMessageSenderText,
 } from "../../lib/agent/sender-projection";
 import type { ToolCallBinding } from "../../lib/agent/types";
+import { validatePersistedComposerDocument } from "../../lib/composer-document";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
@@ -856,6 +857,7 @@ async function deliverClaimedInboxInjectionPg(
 
 /** The committed result of a PostgreSQL user_input materialize, for broadcast/display. */
 export interface MaterializedInboxUserMessage {
+	composerDocument: import("@shared/composer-document").ComposerDocument | null;
 	id: string;
 	narratorId: string;
 	parentToolUseId: string | null;
@@ -903,6 +905,7 @@ export async function materializeClaimedInboxUserMessage(input: {
 	createdBy?: string | null;
 	origin?: import("@shared/message-origin").MessageOriginOptions;
 	parentToolUseId?: string | null;
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 }): Promise<MaterializedInboxUserMessage> {
 	const refsPort = getNarratorMessageRefsPort();
 	if (!refsPort)
@@ -910,6 +913,10 @@ export async function materializeClaimedInboxUserMessage(input: {
 			"materializeClaimedInboxUserMessage is the PostgreSQL placement path; " +
 				"SQLite keeps persistUserMessage's synchronous persistPlacement transaction",
 		);
+	const composerDocument = validatePersistedComposerDocument(
+		input.composerDocument,
+		input.contentBlocks,
+	);
 	assertInboxClaimOwner(input.claim);
 	const queue = requireRuntimeQueuePort();
 	const { createPgPlacedMessageMaterializer } = await import("../narrator-persistence");
@@ -925,6 +932,7 @@ export async function materializeClaimedInboxUserMessage(input: {
 		role: "user",
 		contentJson: input.contentBlocks,
 		contentText: input.text,
+		composerDocument: composerDocument ?? null,
 		commandText: input.commandText ?? null,
 		createdBy: input.createdBy ?? null,
 		origin: input.origin?.origin ?? "user",
@@ -955,6 +963,7 @@ export async function materializeClaimedInboxUserMessage(input: {
 		role: "user",
 		contentJson: input.contentBlocks,
 		contentText: input.text,
+		composerDocument: composerDocument ?? null,
 		commandText: input.commandText ?? null,
 		createdBy: input.createdBy ?? null,
 		origin: input.origin?.origin ?? "user",
@@ -967,6 +976,7 @@ export async function materializeClaimedInboxUserMessage(input: {
 }
 
 export interface ClaimedUserInputMessage {
+	hasComposerDocument?: boolean;
 	id: string;
 	narratorId: string;
 	parentToolUseId: string | null;
@@ -1001,12 +1011,14 @@ export async function persistClaimedUserInput(input: {
 	createdBy?: string | null;
 	origin?: MessageOriginOptions;
 	parentToolUseId?: string | null;
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 }): Promise<ClaimedUserInputMessage> {
 	const toClaimedUserInputMessage = (message: {
 		id: string;
 		narratorId: string;
 		parentToolUseId: string | null;
 		role: string;
+		composerDocument?: import("@shared/composer-document").ComposerDocument | null;
 		contentJson: unknown;
 		contentText: string | null;
 		commandText: string | null;
@@ -1024,6 +1036,7 @@ export async function persistClaimedUserInput(input: {
 		role: "user",
 		contentJson: Array.isArray(message.contentJson) ? message.contentJson : [],
 		contentText: message.contentText ?? input.text,
+		...(message.composerDocument ? { hasComposerDocument: true } : {}),
 		commandText: message.commandText,
 		createdBy: message.createdBy,
 		origin: message.origin ?? input.origin?.origin ?? "user",
@@ -1047,6 +1060,7 @@ export async function persistClaimedUserInput(input: {
 		input.origin,
 		{
 			mailboxClaim: input.claim,
+			composerDocument: input.composerDocument,
 			...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
 		},
 	);
@@ -1200,6 +1214,8 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 						intent: "follow_up",
 						actor: "parent_agent",
 						mailboxInput: true,
+						// Same as a direct Send wake: nobody waits on this run in the foreground.
+						asBackgroundTask: true,
 						locale,
 					})
 				).started;
@@ -1207,9 +1223,9 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } =
 				await import("../narrator-session");
 			const first = await peekInbox(narratorId);
-			// A user behind a bounded batch of notices is still explicit work, not
-			// an autonomous continuation (which intentionally refuses plan mode).
-			// The user consumer drains those preceding notices without skipping them.
+			// A user behind a bounded batch of notices is still explicit work.
+			// The user consumer drains those preceding notices without skipping them;
+			// delegated reports alone use the notification continuation, also in plan mode.
 			if (first?.kind === "user_input" || (await hasInboxKind(narratorId, ["user_input"])))
 				return (await resumeBufferedMessagesIfIdle(narratorId, locale)).resumed;
 			return (await startParentInboundContinuationIfPossible(narratorId, "en")).started;

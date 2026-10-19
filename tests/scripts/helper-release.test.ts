@@ -1037,6 +1037,8 @@ describe("authenticated draft lookup", () => {
 			GITHUB_EVENT_NAME: "workflow_dispatch",
 			GITHUB_REF: "refs/heads/main",
 			GITHUB_SHA: commit,
+			GITHUB_RUN_ID: "123",
+			GITHUB_RUN_ATTEMPT: "2",
 		};
 		const calls: string[][] = [];
 		const run: GhRunner = async (args) => {
@@ -1085,7 +1087,7 @@ describe("authenticated draft lookup", () => {
 				},
 				dir,
 				false,
-				{ run, environment },
+				{ run, environment, sourceRunAttempt: "1" },
 			),
 		).rejects.toThrow("required reviewers");
 		expect(f.helperRelease.draft).toBe(true);

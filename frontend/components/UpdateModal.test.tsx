@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
@@ -7,7 +7,9 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { api } from "../lib/api";
+import * as pwa from "../lib/pwa";
 import { type UpdateSourceSettings, updateSettingsKey } from "../lib/update-source";
+import type { PreparedUpdateStatus } from "../lib/update-state";
 import common from "../locales/en/common.json";
 
 mock.module("./common/confirm-dialog-context", () => ({
@@ -22,6 +24,7 @@ const originalCheck = api.checkUpdate;
 const originalGetSettings = api.getSettings;
 const originalStatus = api.getUpdateStatus;
 const originalApply = api.applyUpdate;
+const originalCancel = api.cancelUpdate;
 const originalNotes = api.getUpdateNotes;
 const globals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root | undefined;
@@ -122,6 +125,7 @@ afterEach(async () => {
 	container.remove();
 	api.getUpdateStatus = originalStatus;
 	api.applyUpdate = originalApply;
+	api.cancelUpdate = originalCancel;
 	api.getUpdateNotes = originalNotes;
 	api.checkUpdate = originalCheck;
 	api.getSettings = originalGetSettings;
@@ -278,6 +282,131 @@ function successfulCheck() {
 		},
 	};
 }
+
+describe("UpdateModal failed recovery cleanup", () => {
+	function failedCleanup(overrides: Partial<PreparedUpdateStatus> = {}): PreparedUpdateStatus {
+		return {
+			ready: true,
+			canAutoRestart: true,
+			version: "1.1.0",
+			preparedIdentity: originalIdentity,
+			instructions: { manual: false, message: "ready" },
+			scheduled: true,
+			phase: "restarting",
+			cancelRequested: true,
+			cleanupRetryPending: true,
+			error: "Recovery rollback failed: retained source evidence",
+			...overrides,
+		};
+	}
+
+	test.each([
+		true,
+		false,
+	])("cleanup failure with scheduled=%s exposes retry, never a new apply or readiness wait", async (scheduled) => {
+		api.getUpdateStatus = async () => failedCleanup({ scheduled });
+		const wait = spyOn(pwa, "waitForUpdatedServerAndReload").mockResolvedValue();
+		try {
+			await render();
+			expect(document.body.textContent).toContain(
+				"Recovery rollback failed: retained source evidence",
+			);
+			expect(document.body.textContent).not.toContain(common.updateRestartingDescription);
+			expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+			expect(findButton(common.updateSchedule)).toBeUndefined();
+			expect(findButton(common.updateForceShutdown)).toBeUndefined();
+			expect(wait).not.toHaveBeenCalled();
+			expect(appliedVersion).toBeUndefined();
+		} finally {
+			wait.mockRestore();
+		}
+	});
+
+	test("cleanup retry remains reachable when prepared binary metadata is no longer ready", async () => {
+		api.getUpdateStatus = async () => failedCleanup({ ready: false, preparedIdentity: undefined });
+		await render();
+		expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+		expect(findButton(common.updateSchedule)).toBeUndefined();
+	});
+
+	test("normal restart hides cancellation, but a cleanup failure aborts its existing readiness poll", async () => {
+		let status = failedCleanup({
+			cleanupRetryPending: false,
+			cancelRequested: false,
+			error: undefined,
+		});
+		api.getUpdateStatus = async () => status;
+		let waitSignal: AbortSignal | undefined;
+		const wait = spyOn(pwa, "waitForUpdatedServerAndReload").mockImplementation((options) => {
+			waitSignal = options?.signal;
+			return new Promise<void>((resolve) =>
+				waitSignal?.addEventListener("abort", () => resolve(), { once: true }),
+			);
+		});
+		try {
+			await render();
+			expect(wait).toHaveBeenCalledTimes(1);
+			expect(waitSignal?.aborted).toBe(false);
+			expect(document.body.textContent).toContain(common.updateRestartingDescription);
+			expect(findButton(common.updateCancelSchedule)).toBeUndefined();
+			expect(findButton(common.updateRetryCancellation)).toBeUndefined();
+			status = failedCleanup();
+			await act(async () => {
+				client.setQueryData(["update-status", "1.1.0"], status);
+			});
+			await settle();
+			expect(waitSignal?.aborted).toBe(true);
+			expect(wait).toHaveBeenCalledTimes(1);
+			expect(document.body.textContent).not.toContain(common.updateRestartingDescription);
+			expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+			expect(findButton(common.updateSchedule)).toBeUndefined();
+		} finally {
+			wait.mockRestore();
+		}
+	});
+
+	test.each([
+		"response",
+		"throw",
+	])("failed cancellation %s preserves retry; success restores the same prepared selector", async (failure) => {
+		let status = failedCleanup();
+		api.getUpdateStatus = async () => status;
+		let cancellations = 0;
+		api.cancelUpdate = async () => {
+			if (++cancellations === 1) {
+				if (failure === "throw") throw new Error("Retry rollback still failed");
+				return { success: false, cancelled: false, error: "Retry rollback still failed" };
+			}
+			status = {
+				...status,
+				cleanupRetryPending: false,
+				cancelRequested: false,
+				scheduled: false,
+				phase: "idle",
+				errorKind: "cancelled",
+				error: "cancelled",
+			};
+			return { success: true, cancelled: true, scheduled: false, phase: "idle" };
+		};
+		await render();
+		await act(async () => findButton(common.updateRetryCancellation)?.click());
+		await settle();
+		expect(cancellations).toBe(1);
+		expect(document.body.textContent).toContain("Retry rollback still failed");
+		expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+		expect(findButton(common.updateSchedule)).toBeUndefined();
+		expect(appliedVersion).toBeUndefined();
+		await act(async () => findButton(common.updateRetryCancellation)?.click());
+		await settle();
+		expect(cancellations).toBe(2);
+		expect(findButton(common.updateRetryCancellation)).toBeUndefined();
+		expect(document.body.textContent).toContain(common.updateScheduleCancelled);
+		expect(findButton(common.updateSchedule)).toBeDefined();
+		expect(appliedVersion).toBeUndefined();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe(originalIdentity.id);
+	});
+});
 
 describe("UpdateModal deferred release notes", () => {
 	function recommendation() {
@@ -692,11 +821,7 @@ describe("UpdateModal saved source changes", () => {
 			initial: githubSettings,
 			next: { ...githubSettings, githubRepository: "FORK/Project" },
 		},
-		{
-			name: "server ignores GitHub repository",
-			initial: serverSettings,
-			next: { ...serverSettings, githubRepository: "another/project" },
-		},
+
 		{
 			name: "server URL normalization",
 			initial: serverSettings,
@@ -726,6 +851,11 @@ describe("UpdateModal saved source changes", () => {
 
 	test.each([
 		{ name: "source", initial: githubSettings, next: serverSettings },
+		{
+			name: "mirror repository",
+			initial: serverSettings,
+			next: { ...serverSettings, githubRepository: "another/project" },
+		},
 		{
 			name: "GitHub repository",
 			initial: githubSettings,

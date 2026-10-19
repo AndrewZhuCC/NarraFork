@@ -32,13 +32,7 @@
 
 import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import {
-	backgroundTasks,
-	narratorMessageRefs,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-} from "../db/schema";
+import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { generateId, generateShortId } from "../lib/id";
@@ -51,10 +45,12 @@ import {
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
-import { registerAndPersistSubagentAlias } from "./subagent-alias";
+import {
+	claimSubagentBackgroundRun,
+	clearSubagentBackgroundRunClaim,
+} from "./subagent-background-claim";
 
 /** Statuses that mean "this tool call never produced a usable result". */
 const NON_TERMINAL_TOOL_CALL_STATUSES = new Set(["initializing", "pending", "running"]);
@@ -1048,53 +1044,6 @@ export interface ResumeRecoverySubagentsResult {
 }
 
 /**
- * Undo the "running background task" claim after a restart failed to take off.
- *
- * Leaving `backgroundStatus: "running"` behind would make the row look like live work:
- * `Await` would wait for a result that can never arrive, and a later recovery pass would
- * see a task that is already running and skip it.
- */
-async function clearBackgroundRunningClaim(
-	subagentId: string,
-	parentNarratorId: string,
-	reason: string,
-): Promise<void> {
-	// Creation can throw after INSERT (e.g. while broadcasting). Check ownership
-	// before compensating: an id conflict with another task must leave it untouched.
-	try {
-		const { hasActiveSubagentResumeRun } = await import("./subagent-resume");
-		// A manual resume may have won the per-subagent lock while this batch
-		// prepared its row. Never withdraw the claim of that live continuation.
-		if (hasActiveSubagentResumeRun(subagentId)) return;
-		const task = await db.query.backgroundTasks.findFirst({
-			where: and(
-				eq(backgroundTasks.id, subagentId),
-				eq(backgroundTasks.type, "agent"),
-				eq(backgroundTasks.parentNarratorId, parentNarratorId),
-				eq(backgroundTasks.subagentNarratorId, subagentId),
-			),
-			columns: { id: true },
-		});
-		// Await reads background_tasks first: clearing only the narrator flag leaves
-		// a durable running task with no runner and can hold an await batch open.
-		if (task) await backgroundTaskService.markFailed(subagentId, reason);
-	} catch (err) {
-		logger.error("Failed to settle an unstarted recovery task", { subagentId, error: String(err) });
-	}
-	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({ backgroundStatus: "failed", backgroundCompletedAt: now, updatedAt: now })
-		.where(and(eq(narrators.id, subagentId), eq(narrators.backgroundStatus, "running")))
-		.catch((err) => {
-			logger.error("Failed to clear the background claim of an unstarted subagent", {
-				subagentId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		});
-}
-
-/**
  * Restart the selected subagents as BACKGROUND tasks.
  *
  * `preserveBackground` only means "do not clear the background flags"; a
@@ -1171,53 +1120,13 @@ export async function resumeRecoverySubagents(input: {
 					continue;
 				}
 
-				const title = subagent.title?.trim() || subagentId;
-				const subagentType = subagent.subagentType?.trim() || "general";
-
-				// a) stable alias so the model can Await it later. `title` may itself be the
-				//    id (untitled subagent); the alias builder recognizes that and falls back
-				//    to a short id instead of slugifying the whole nanoid.
-				const { alias } = await registerAndPersistSubagentAlias(
-					input.narratorId,
-					subagentId,
-					title,
-				);
-				// b) durable background task row (idempotent restart when it exists).
-				// The service can fail after INSERT, so compensate that path too.
+				// Claim it as a background task. The service can fail after INSERT, so
+				// compensate that path too.
 				taskClaimed = true;
-				await backgroundTaskService.createAgentTask({
-					id: subagentId,
+				const { alias } = await claimSubagentBackgroundRun({
 					parentNarratorId: input.narratorId,
-					subagentNarratorId: subagentId,
-					subagentType,
-					toolUseId: originToolUseId,
-					alias,
-					title,
-				});
-				// c) mark the narrator itself as background (detach's job, done by hand).
-				//    Under narratorTraitsLock with a fresh read, because `traits` is a whole-column
-				//    JSON array: writing the copy fetched at the top of this iteration would drop
-				//    any trait written since (including the watermark this very card just stamped).
-				//    `updatedAt` IS written here on purpose — unlike the watermark, this row is
-				//    being resumed, so its old failure time is no longer the relevant one.
-				await narratorTraitsLock.acquire(subagentId, async () => {
-					const current = await db.query.narrators.findFirst({
-						where: eq(narrators.id, subagentId),
-						columns: { traits: true },
-					});
-					await db
-						.update(narrators)
-						.set({
-							isBackground: true,
-							backgroundStatus: "running",
-							backgroundResult: null,
-							backgroundCompletedAt: null,
-							traits: [
-								...new Set([...parseTraits(current?.traits ?? subagent.traits), "background"]),
-							],
-							updatedAt: new Date().toISOString(),
-						})
-						.where(eq(narrators.id, subagentId));
+					subagent,
+					originToolUseId,
 				});
 
 				// d) restart, keeping background semantics and leaving the historical
@@ -1235,7 +1144,7 @@ export async function resumeRecoverySubagents(input: {
 					skipConclusionDelivery: true,
 				});
 				if (!started.started) {
-					await clearBackgroundRunningClaim(subagentId, input.narratorId, "resume_not_started");
+					await clearSubagentBackgroundRunClaim(subagentId, input.narratorId, "resume_not_started");
 					skipped.push({ id: subagentId, reason: "resume_not_started" });
 					continue;
 				}
@@ -1248,7 +1157,8 @@ export async function resumeRecoverySubagents(input: {
 				resumed.push(alias);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
-				if (taskClaimed) await clearBackgroundRunningClaim(subagentId, input.narratorId, message);
+				if (taskClaimed)
+					await clearSubagentBackgroundRunClaim(subagentId, input.narratorId, message);
 				logger.warn("Failed to resume recovery subagent", { subagentId, error: message });
 				skipped.push({ id: subagentId, reason: message });
 			}

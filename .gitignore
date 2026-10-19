@@ -39,6 +39,7 @@ analyze2/
 *.heapsnapshot
 script/
 scripts/*
+!scripts/benchmark-token-repair-bulk.ts
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts
@@ -47,6 +48,14 @@ scripts/lib/*
 !scripts/lib/github-release.ts
 # Release CI control, immutable bundles, strict native inputs and native smoke.
 !scripts/ci-release.ts
+!scripts/mirror-update-server.ts
+!scripts/lib/ci-publication-runtime.ts
+!scripts/lib/publication-receipt.ts
+!scripts/lib/local-github-patch-source.ts
+!scripts/lib/mirror-public-github.ts
+!scripts/lib/mirror-workflow.ts
+!scripts/lib/mirror-relay-stage.ts
+!scripts/lib/update-server-main-mirror-history.ts
 !scripts/smoke-release-binary.ts
 # Explicit 123 distribution operators; old server receives patches/metadata only.
 !scripts/publish-123-distribution.ts
