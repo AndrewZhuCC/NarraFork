@@ -171,12 +171,12 @@ beforeEach(async () => {
 		lng: "en",
 		resources: {
 			en: {
-			narrator: {
-				attachments: narratorEn.attachments,
-				draftReplacedByRemote: "replaced by remote",
-				draftRestorePrevious: "restore original",
-				draftDismissReplace: "dismiss",
-			},
+				narrator: {
+					attachments: narratorEn.attachments,
+					draftReplacedByRemote: "replaced by remote",
+					draftRestorePrevious: "restore original",
+					draftDismissReplace: "dismiss",
+				},
 			},
 		},
 		react: { useSuspense: false },
@@ -1635,6 +1635,25 @@ describe("composer atomic reference contract", () => {
 		);
 		expect(host.textContent).toContain("replaced by remote");
 		await act(async () => handle.current?.setText("fresh typing"));
+		expect(host.textContent).not.toContain("replaced by remote");
+	});
+	test("a later non-empty remote write supersedes the undo offer", async () => {
+		getSpy.mockResolvedValue({ ...initial, hasDraft: true, text: "original" });
+		await render();
+		await act(async () =>
+			handle.current?.handleDraftChanged({ ...initial, revision: 2, sourceId: "other" }),
+		);
+		expect(host.textContent).toContain("replaced by remote");
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				hasDraft: true,
+				text: "fresh content",
+				revision: 3,
+				sourceId: "other",
+			}),
+		);
+		expect(handle.current?.getText()).toBe("fresh content");
 		expect(host.textContent).not.toContain("replaced by remote");
 	});
 	test("newer reconnect metadata pulls the missed body and follows it when clean", async () => {

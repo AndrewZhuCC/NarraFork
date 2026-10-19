@@ -28,7 +28,7 @@ import { useNarratorCommands } from "../../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInputHistory";
 import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
-import { api } from "../../../lib/api";
+import { ApiError, api } from "../../../lib/api";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
 import { useImageViewer } from "../../common/image-viewer-context";
@@ -1034,11 +1034,22 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						lastSyncedDraftRef.current,
 						readPersistableDocument(inputStateRef.current.composerDocument),
 					);
+					setDraftReplacedByRemote(false);
 				})
-				// The undo slot was already consumed elsewhere; just drop the notice.
-				.catch(() => {})
-				.finally(() => setDraftReplacedByRemote(false));
-		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument]);
+				.catch((err) => {
+					// 404: the undo slot was already consumed elsewhere — drop the notice quietly.
+					// Other failures keep the notice so the restore can be retried.
+					if (err instanceof ApiError && err.status === 404) {
+						setDraftReplacedByRemote(false);
+						return;
+					}
+					notifications.show({
+						title: t("draftSyncFailed"),
+						message: err instanceof Error ? err.message : String(err),
+						color: "red",
+					});
+				});
+		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument, t]);
 
 		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
@@ -1129,8 +1140,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						!remoteText && remoteRefs.length === 0 && !draft.composerDocument?.assets.length;
 					restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
 					// Only a remote CLEAR of real content earns the undo offer — anything
-					// noisier would fire on every routine cross-tab sync.
-					if (hadContent && remoteEmpty) setDraftReplacedByRemote(true);
+					// noisier would fire on every routine cross-tab sync. A later non-empty
+					// write supersedes the offer (the undo slot holds the newest overwrite).
+					setDraftReplacedByRemote(hadContent && remoteEmpty);
 				}
 				lastSyncedDraftRef.current = remoteInput;
 				lastDraftRevisionRef.current = draft.revision;

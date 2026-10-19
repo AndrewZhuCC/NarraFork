@@ -1799,6 +1799,9 @@ narratorRoutes.post("/:id/draft/restore", async (c) => {
 		updatedBy: update.updatedBy,
 		sourceId: update.sourceId,
 	});
+	await syncNarratorDraftToRecentTabs(userId, id, {
+		promote: !update.previousHasDraft && update.hasDraft,
+	});
 	return c.json({
 		ok: true,
 		composerDocument: update.composerDocument,
