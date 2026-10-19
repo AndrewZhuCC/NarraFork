@@ -56,7 +56,18 @@ afterEach(async () => {
 /** Exact production singleton, default runtime, SQLite evidence and worker metadata.
  * No seeded helper or alternative writer. Only prohibited entrypoints are trapped;
  * worker threads and legitimate Git/snapshot subprocesses remain available. */
-test("fresh production Host raw open, exact 20MiB save and cold query need zero helper/distribution/network calls", async () => {
+// Independent scenarios keep their original 30s budget; unrelated saves must not consume
+// the large-save receipt/ACL scenario's remaining time on slower native filesystems.
+test.each([
+	"20MiB-and-cold-query",
+	"utf-8",
+	"utf-16le",
+	"utf-16be",
+	"gbk",
+	"racing-saves",
+] as const)("fresh production Host %s needs zero helper/distribution/network calls", async (scenario) => {
+	const scenarioRoot = root,
+		scenarioTarget = target;
 	const forbidden = () => {
 		throw new Error("Host save must not enter helper/distribution");
 	};
@@ -79,7 +90,13 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 		.values({ id: userId, username: userId, passwordHash: "fixture", role: "user", createdAt: now })
 		.run();
 	db.insert(narrators)
-		.values({ id: narratorId, cwd: root, ownerUserId: userId, createdAt: now, updatedAt: now })
+		.values({
+			id: narratorId,
+			cwd: scenarioRoot,
+			ownerUserId: userId,
+			createdAt: now,
+			updatedAt: now,
+		})
 		.run();
 	let revoked = false;
 	const actor: EditorActor = {
@@ -91,10 +108,10 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 		authorize: async () => {
 			if (revoked) throw new Error("revoked");
 			return {
-				cwd: root,
+				cwd: scenarioRoot,
 				projectId: null,
-				lexicalPath: target,
-				canonicalPath: target,
+				lexicalPath: scenarioTarget,
+				canonicalPath: scenarioTarget,
 				outsideRoots: false,
 				deviceId: "local",
 				workspaceRevision: 0,
@@ -107,9 +124,9 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 		await expect(lstat(join(getNarraforkHome(), "editor-native-operations"))).rejects.toMatchObject(
 			{ code: "ENOENT" },
 		);
-		await writeFile(target, "a\r\nb\rc\n");
+		await writeFile(scenarioTarget, "a\r\nb\rc\n");
 		const opened = await service.create(actor, {
-			path: target,
+			path: scenarioTarget,
 			origin: "legacy",
 			protocol: "raw-v2",
 		});
@@ -131,12 +148,12 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 			tags: Uint8Array,
 			openedDocument?: EditorRawDocumentDescriptor,
 		) => {
-			if (!openedDocument) await writeFile(target, before);
-			const inode = (await lstat(target)).ino;
+			if (!openedDocument) await writeFile(scenarioTarget, before);
+			const inode = (await lstat(scenarioTarget)).ino;
 			const doc =
 				openedDocument ??
 				(await service.create(actor, {
-					path: target,
+					path: scenarioTarget,
 					origin: "legacy",
 					protocol: "raw-v2",
 					encodingHint: encoding,
@@ -169,8 +186,8 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 			await service.sealRaw(actor, doc.docId, upload.uploadId, seal);
 			const result = await service.commit(actor, doc.docId, upload.uploadId, {});
 			expect(result.status).toBe("saved");
-			expect(await readFile(target)).toEqual(Buffer.from(next));
-			expect((await lstat(target)).ino).toBe(inode);
+			expect(await readFile(scenarioTarget)).toEqual(Buffer.from(next));
+			expect((await lstat(scenarioTarget)).ino).toBe(inode);
 			expect(await service.operation(actor, result.operationId)).toMatchObject({
 				status: "saved",
 				result: { snapshotRevision: 17, hashKind: "raw-sha256", hash: hash(next) },
@@ -178,16 +195,19 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 			await service.remove(actor, doc.docId);
 			return { result, next };
 		};
-		const twenty = new Uint8Array(EDITOR_FILE_MAX_BYTES).fill(65);
-		const large = await save(
-			twenty,
-			`B${"A".repeat(EDITOR_FILE_MAX_BYTES - 1)}`,
-			"utf-8",
-			"none",
-			new Uint8Array(),
-		);
-		expect(large.next.length).toBe(EDITOR_FILE_MAX_BYTES);
-		for (const encoding of ["utf-8", "utf-16le", "utf-16be", "gbk"] as const) {
+		let large: Awaited<ReturnType<typeof save>> | undefined;
+		if (scenario === "20MiB-and-cold-query") {
+			const twenty = new Uint8Array(EDITOR_FILE_MAX_BYTES).fill(65);
+			large = await save(
+				twenty,
+				`B${"A".repeat(EDITOR_FILE_MAX_BYTES - 1)}`,
+				"utf-8",
+				"none",
+				new Uint8Array(),
+			);
+			expect(large.next.length).toBe(EDITOR_FILE_MAX_BYTES);
+		} else if (scenario !== "racing-saves") {
+			const encoding = scenario;
 			const bom =
 				encoding === "gbk"
 					? "none"
@@ -210,87 +230,91 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 				Buffer.concat([prefix, iconv.encode("A\r\nb\rc\n中文", encoding)]),
 			);
 		}
-		await writeFile(target, "same-base");
-		const documents = await Promise.all(
-			[0, 1].map(() =>
-				service.create(actor, { path: target, origin: "legacy", protocol: "raw-v2" }),
-			),
-		);
-		const racing = await Promise.allSettled(
-			documents.map((document, index) => {
-				if (document.protocol !== "raw-v2") throw new Error("raw descriptor required");
-				return save(
-					Buffer.from("same-base"),
-					`winner-${index}`,
-					"utf-8",
-					"none",
-					new Uint8Array(),
-					document,
-				);
-			}),
-		);
-		expect(racing.filter((result) => result.status === "fulfilled")).toHaveLength(1);
-		const rejected = racing.find((result) => result.status === "rejected");
-		expect(rejected?.status === "rejected" ? rejected.reason : null).toMatchObject({
-			code: "STALE_WRITE",
-		});
+		if (scenario === "racing-saves") {
+			await writeFile(scenarioTarget, "same-base");
+			const documents = await Promise.all(
+				[0, 1].map(() =>
+					service.create(actor, { path: scenarioTarget, origin: "legacy", protocol: "raw-v2" }),
+				),
+			);
+			const racing = await Promise.allSettled(
+				documents.map((document, index) => {
+					if (document.protocol !== "raw-v2") throw new Error("raw descriptor required");
+					return save(
+						Buffer.from("same-base"),
+						`winner-${index}`,
+						"utf-8",
+						"none",
+						new Uint8Array(),
+						document,
+					);
+				}),
+			);
+			expect(racing.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+			const rejected = racing.find((result) => result.status === "rejected");
+			expect(rejected?.status === "rejected" ? rejected.reason : null).toMatchObject({
+				code: "STALE_WRITE",
+			});
+		}
 		await expect(queryEditorOperation(actor, randomUUID())).rejects.toMatchObject({
 			code: "EDITOR_OPERATION_UNKNOWN",
 		});
-		// Simulate a lost success reply: metadata survives an independent service's
-		// cold recovery. Current disk is deliberately unrelated: query is evidence-only.
-		cold = new EditorDocumentService({
-			root: join(getNarraforkHome(), "editor-transfers"),
-			execute: () => {
-				throw new Error("query must never dispatch");
-			},
-			queryOperation: queryEditorOperation,
-		});
-		await writeFile(target, "unrelated-current-disk");
-		expect(await cold.operation(actor, large.result.operationId)).toMatchObject({
-			status: "saved",
-			result: { hash: hash(large.next), snapshotRevision: 17 },
-		});
-		expect(await readFile(target, "utf8")).toBe("unrelated-current-disk");
-		expect(await queryEditorOperation(actor, large.result.operationId)).toMatchObject({
-			status: "uncertain",
-		});
-		const recovery = editorOperationMetadataSchema.parse(
-			JSON.parse(
-				await readFile(
-					join(getNarraforkHome(), "editor-transfers", `ed-${large.result.operationId}.json`),
-					"utf8",
+		if (large) {
+			// Simulate a lost success reply: metadata survives an independent service's
+			// cold recovery. Current disk is deliberately unrelated: query is evidence-only.
+			cold = new EditorDocumentService({
+				root: join(getNarraforkHome(), "editor-transfers"),
+				execute: () => {
+					throw new Error("query must never dispatch");
+				},
+				queryOperation: queryEditorOperation,
+			});
+			await writeFile(scenarioTarget, "unrelated-current-disk");
+			expect(await cold.operation(actor, large.result.operationId)).toMatchObject({
+				status: "saved",
+				result: { hash: hash(large.next), snapshotRevision: 17 },
+			});
+			expect(await readFile(scenarioTarget, "utf8")).toBe("unrelated-current-disk");
+			expect(await queryEditorOperation(actor, large.result.operationId)).toMatchObject({
+				status: "uncertain",
+			});
+			const recovery = editorOperationMetadataSchema.parse(
+				JSON.parse(
+					await readFile(
+						join(getNarraforkHome(), "editor-transfers", `ed-${large.result.operationId}.json`),
+						"utf8",
+					),
 				),
-			),
-		);
-		expect(
-			await queryEditorOperation(actor, large.result.operationId, {
-				...recovery,
-				rawDigest: "f".repeat(64),
-			}),
-		).toMatchObject({ status: "uncertain" });
-		const row = db
-			.select({ id: fileChangeOperations.id })
-			.from(fileChangeOperations)
-			.where(eq(fileChangeOperations.sourceId, large.result.operationId))
-			.get();
-		if (!row) throw new Error("missing Host evidence");
-		db.update(fileChangeOperations)
-			.set({ settlement: "applying" })
-			.where(eq(fileChangeOperations.id, row.id))
-			.run();
-		expect(await cold.operation(actor, large.result.operationId)).toMatchObject({
-			status: "uncertain",
-		});
-		db.update(fileChangeOperations)
-			.set({ settlement: "settled" })
-			.where(eq(fileChangeOperations.id, row.id))
-			.run();
-		await expect(
-			queryEditorOperation({ ...actor, userId: "other" }, large.result.operationId),
-		).rejects.toMatchObject({ code: "EDITOR_OPERATION_UNKNOWN" });
-		revoked = true;
-		await expect(cold.operation(actor, large.result.operationId)).rejects.toThrow("revoked");
+			);
+			expect(
+				await queryEditorOperation(actor, large.result.operationId, {
+					...recovery,
+					rawDigest: "f".repeat(64),
+				}),
+			).toMatchObject({ status: "uncertain" });
+			const row = db
+				.select({ id: fileChangeOperations.id })
+				.from(fileChangeOperations)
+				.where(eq(fileChangeOperations.sourceId, large.result.operationId))
+				.get();
+			if (!row) throw new Error("missing Host evidence");
+			db.update(fileChangeOperations)
+				.set({ settlement: "applying" })
+				.where(eq(fileChangeOperations.id, row.id))
+				.run();
+			expect(await cold.operation(actor, large.result.operationId)).toMatchObject({
+				status: "uncertain",
+			});
+			db.update(fileChangeOperations)
+				.set({ settlement: "settled" })
+				.where(eq(fileChangeOperations.id, row.id))
+				.run();
+			await expect(
+				queryEditorOperation({ ...actor, userId: "other" }, large.result.operationId),
+			).rejects.toMatchObject({ code: "EDITOR_OPERATION_UNKNOWN" });
+			revoked = true;
+			await expect(cold.operation(actor, large.result.operationId)).rejects.toThrow("revoked");
+		}
 		await expect(lstat(join(getNarraforkHome(), "editor-native-operations"))).rejects.toMatchObject(
 			{ code: "ENOENT" },
 		);
@@ -300,6 +324,11 @@ test("fresh production Host raw open, exact 20MiB save and cold query need zero 
 		revoked = false;
 		await cold?.dispose();
 		await service.dispose();
+		// Disposed streams cannot be reused. Only retire this test process's singleton,
+		// leaving the next independent scenario to use the real production factory.
+		const singleton = Symbol.for("narrafork.editor-documents.v1");
+		if (Reflect.get(globalThis, singleton) === service)
+			Reflect.deleteProperty(globalThis, singleton);
 		for (const trap of traps) trap.mockRestore();
 	}
 }, 30_000);
