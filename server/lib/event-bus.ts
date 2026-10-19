@@ -10,6 +10,7 @@ import { logger } from "./logger";
 // === Event type definitions ===
 
 export type NarraForkEvent =
+	| { type: "auth:changed"; userId?: string }
 	| { type: "git:workspace_invalidated"; queryKey: string }
 	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
 	| {

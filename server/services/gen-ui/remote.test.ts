@@ -1,5 +1,8 @@
 import { describe, expect, mock, test } from "bun:test";
-import { FEATURE_FS_CREATE_BOUND_PARENT_V1 } from "@server/lib/agent/execution/rpc-types";
+import {
+	FEATURE_EDITOR_DURABLE_WRITE_V1,
+	FEATURE_FS_CREATE_BOUND_PARENT_V1,
+} from "@server/lib/agent/execution/rpc-types";
 
 const features = new Set<string>();
 const calls: Array<{
@@ -8,7 +11,10 @@ const calls: Array<{
 	options: Record<string, unknown>;
 }> = [];
 let created = true;
+let connectionGeneration: number | null = 42;
 mock.module("../device-connection-service", () => ({
+	getDeviceConnectionGeneration: (device: string) =>
+		device === "remote-only" ? connectionGeneration : null,
 	hasDeviceProtocolFeature: (_device: string, feature: string) => features.has(feature),
 	sendRpc: async (
 		_device: string,
@@ -31,6 +37,24 @@ const backend = new RemoteBackend("remote-only", {
 });
 
 describe("remote exclusive creation capability", () => {
+	test("editor capability remains bound to the authenticated connection generation", () => {
+		calls.length = 0;
+		features.add(FEATURE_EDITOR_DURABLE_WRITE_V1);
+		try {
+			for (const [generation, supported] of [
+				[42, true],
+				[43, false],
+				[null, false],
+			] as const) {
+				connectionGeneration = generation;
+				expect(backend.supportsEditorDurableWrite).toBe(supported);
+			}
+			expect(calls).toEqual([]);
+		} finally {
+			connectionGeneration = 42;
+			features.delete(FEATURE_EDITOR_DURABLE_WRITE_V1);
+		}
+	});
 	test("old executors fail before an RPC, never delegate to local IO", async () => {
 		features.clear();
 		calls.length = 0;

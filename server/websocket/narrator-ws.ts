@@ -56,6 +56,7 @@ import type {
 	UnloadToolResult,
 } from "../services/command-service";
 import { resolveCommand } from "../services/command-service";
+import { editorFileSubscriptions } from "../services/editor-file-subscription";
 import { canReadNarrator, canWriteNarrator, NARRATOR_ACL_COLUMNS } from "../services/narrator-acl";
 import { getStreamingSnapshot } from "../services/narrator-event-handler";
 import {
@@ -99,6 +100,7 @@ import {
 	createCatchUpBuffer,
 	drainCatchUpBuffer,
 } from "./catch-up-buffer";
+import { handleEditorFileMessage, releaseEditorFileSubscriptions } from "./editor-file-ws";
 import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
 import {
 	createCodexQuotaOverviewWsMessage,
@@ -129,6 +131,8 @@ export interface NarratorWSData {
 	 */
 	subscribedChatRooms: Set<string>;
 	userId?: string;
+	sessionExp?: number;
+	sessionTokenVersion?: number;
 	username?: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
@@ -154,6 +158,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages";
 // Client → Server messages
 export type NarratorClientMessage =
 	| GitWorkspaceClientMessage
+	| import("@shared/editor-file-events").EditorFileClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -248,6 +253,7 @@ function removeConnection(ws: NarratorWS): void {
 	ws.data.publicShareConnectionLease?.release();
 	removeAllChatSubscriptions(ws);
 	releaseGitWorkspaceSubscriptions(ws);
+	releaseEditorFileSubscriptions(ws);
 	const removed = connections.delete(ws);
 	if (removed && ws.data.publicShare) {
 		try {
@@ -680,6 +686,12 @@ function sendToolInputLane(ws: NarratorWS, message: ToolInputChunkMessage): bool
 }
 
 export function broadcastToNarrator(narratorId: string, message: NarratorServerMessage): void {
+	if (
+		["workspace_context_changed", "workspace_paths_changed", "permission_policy_changed"].includes(
+			message.type,
+		)
+	)
+		editorFileSubscriptions.hint(narratorId);
 	if (
 		"toolUseId" in message &&
 		typeof message.toolUseId === "string" &&
@@ -1355,6 +1367,7 @@ async function sendCatchUpForAnchor(
 export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 	narratorId: string,
 ): Promise<void> {
+	editorFileSubscriptions.hint(narratorId);
 	const row = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: NARRATOR_ACL_COLUMNS,
@@ -1381,6 +1394,7 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 }
 
 export function broadcastToUser(userId: string, data: NarratorServerMessage): void {
+	if (data.type === "project_access_changed") editorFileSubscriptions.hint();
 	const userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) return;
 	const msg = JSON.stringify(data);
@@ -2057,6 +2071,10 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "editor_file_subscribe":
+			case "editor_file_unsubscribe":
+				await handleEditorFileMessage(ws, msg);
+				break;
 			case "git_workspace_subscribe":
 			case "git_workspace_unsubscribe":
 			case "git_workspace_refresh":
