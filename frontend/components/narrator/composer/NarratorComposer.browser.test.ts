@@ -96,7 +96,7 @@ beforeAll(async () => {
 						...body,
 						ok: true,
 						traits: [],
-						revision: body.baseRevision + 1,
+						revision: row.revision + 1,
 						hasDraft:
 							!!body.text ||
 							!!body.fileReferences?.length ||
@@ -122,7 +122,7 @@ beforeAll(async () => {
 						...body,
 						ok: true,
 						traits: [],
-						revision: body.baseRevision + 1,
+						revision: emptyDraft.revision + 1,
 						hasDraft:
 							!!body.text ||
 							!!body.fileReferences?.length ||

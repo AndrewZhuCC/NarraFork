@@ -12,6 +12,7 @@ import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { MAX_POLICY_SOURCE_DEPTH } from "../../lib/runtime-source";
 import { isRuntimeToolAllowed } from "../agent-runtime/policy";
 import { customSubagentService } from "../custom-subagent-service";
+import { materializeLegacyDelegations } from "../legacy-delegation-materializer";
 import { getRuntimeRegistration, setPolicySource } from "../narrator-runtime-registration";
 import { narratorService } from "../narrator-service";
 import {
@@ -157,7 +158,7 @@ describe("delegation creation", () => {
 		expect(isRuntimeToolAllowed(await resolveNarratorRuntimePolicy(child.id), "Write")).toBe(false);
 	});
 
-	test("every legacy delegated shape without a stored ceiling resolves restricted", async () => {
+	test("every legacy delegated shape materializes a restricted ceiling", async () => {
 		const typeOnly = await narrator();
 		await db
 			.update(narrators)
@@ -170,6 +171,7 @@ describe("delegation creation", () => {
 			.update(narrators)
 			.set({ type: "subagent", variant: "primary", subagentType: "explore" })
 			.where(eq(narrators.id, typedExplore));
+		await materializeLegacyDelegations([typeOnly, bareVariant, typedExplore]);
 		for (const id of [typeOnly, bareVariant, typedExplore]) {
 			const policy = await resolveNarratorRuntimePolicy(id);
 			expect(policy.capabilities.spawnAgent).toBe(false);
@@ -232,9 +234,10 @@ describe("delegation creation", () => {
 		expect(isRuntimeToolAllowed(policy, "Read")).toBe(true);
 	});
 
-	test("legacy delegated rows without a stored ceiling resolve their template", async () => {
+	test("legacy delegated rows materialize their template's ceiling", async () => {
 		const id = await narrator();
 		await db.update(narrators).set({ variant: "subagent:review" }).where(eq(narrators.id, id));
+		await materializeLegacyDelegations([id]);
 		const policy = await resolveNarratorRuntimePolicy(id);
 		expect(policy.readOnlyGitShell).toBe(true);
 		expect(policy.capabilities.askUserQuestion).toBe("disabled");

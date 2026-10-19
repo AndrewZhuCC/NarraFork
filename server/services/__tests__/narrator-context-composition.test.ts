@@ -93,11 +93,11 @@ test("only the session's own turns count: no placement, or placed under its run'
 		.query("UPDATE narrators SET runtime_registration_json=? WHERE id='n'")
 		.run(deliversTo("dest-tool"));
 	expect((await service.get("n")).totalChars).toBe(8);
-	// An unregistered legacy delegation keeps every placement; once registered, a
-	// delegated session counts exactly the rows the ordinary session does.
+	// A delegated shape adds no placement: it counts exactly the rows the ordinary
+	// session does, before and after a destination is registered.
 	database.run(`INSERT INTO narrators(id,type,variant,parent_narrator_id) VALUES ('child','subagent','subagent:general','caller');
 	 INSERT INTO narrator_message_refs SELECT 'child',message_id,seq,is_compact,segment_compact_id FROM narrator_message_refs WHERE narrator_id='n';`);
-	expect((await service.get("child")).totalChars).toBe(21);
+	expect((await service.get("child")).totalChars).toBe(3);
 	database
 		.query("UPDATE narrators SET runtime_registration_json=? WHERE id='child'")
 		.run(deliversTo("dest-tool"));

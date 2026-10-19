@@ -472,10 +472,20 @@ test("Chrome146 production raw path: 20MiB, dual-view candidate swap, digests, e
 		await page.waitForFunction(
 			() => (window as unknown as RawWindow).rawFixture.state().registry.visibleConsumers === 1,
 		);
-		expect(service.streams.diagnostics.active).toBe(1);
-		expect(
-			await page.evaluate(() => (window as unknown as RawWindow).rawFixture.state().codecs.workers),
-		).toBe(1);
+		// Stream/worker registration settles asynchronously around the body gate: CI
+		// saw 0 (not registered yet) and 2 (prior stream not torn down yet) here.
+		let activeStreams = -1;
+		let codecWorkers = -1;
+		for (let attempt = 0; attempt < 100 && (activeStreams !== 1 || codecWorkers !== 1); attempt++) {
+			activeStreams = service.streams.diagnostics.active;
+			codecWorkers = await page.evaluate(
+				() => (window as unknown as RawWindow).rawFixture.state().codecs.workers,
+			);
+			if (activeStreams !== 1 || codecWorkers !== 1)
+				await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		expect(activeStreams).toBe(1);
+		expect(codecWorkers).toBe(1);
 		await page.evaluate(() =>
 			(window as unknown as RawWindow).rawFixture.loadingViews(false, false),
 		);
@@ -488,7 +498,12 @@ test("Chrome146 production raw path: 20MiB, dual-view candidate swap, digests, e
 				!state.registry.pinReasons.candidate
 			);
 		});
-		expect(service.streams.diagnostics.active).toBe(0);
+		let remainingStreams = -1;
+		for (let attempt = 0; attempt < 100 && remainingStreams !== 0; attempt++) {
+			remainingStreams = service.streams.diagnostics.active;
+			if (remainingStreams !== 0) await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		expect(remainingStreams).toBe(0);
 		bodyGate.release.resolve();
 		slowBody = undefined;
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.loadingViews(true, true));

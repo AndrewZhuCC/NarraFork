@@ -42,6 +42,7 @@ import { projects } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getProjectDbPath } from "../lib/project-db";
+import { materializeLegacyDelegations } from "./legacy-delegation-materializer";
 import { initializeRefSeqFloor, markNarratorSeqFloorHealedMany } from "./narrator-refs/seq-store";
 import type { ArchiveActor } from "./project-archive/access";
 import { ProjectArchiveFile } from "./project-archive/archive-file";
@@ -304,6 +305,8 @@ export async function importProject(
 			});
 			markNarratorSeqFloorHealedMany(chunk);
 		}
+		// Old archives carry delegations without registrations.
+		await materializeLegacyDelegations(uniqueNarratorIds);
 
 		logger.info("Project imported from backup", { projectId, projectName, gitPath, counts });
 		return { projectId, projectName, tables: counts, skipped: false };

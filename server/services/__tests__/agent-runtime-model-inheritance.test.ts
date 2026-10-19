@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 
@@ -92,6 +93,10 @@ beforeEach(() => {
 				type: id === CHILD ? "subagent" : "primary",
 				variant: id === CHILD ? "subagent:general" : "primary",
 				parentNarratorId: id === CHILD ? PARENT : null,
+				...(id === CHILD && {
+					policySourceNarratorId: PARENT,
+					runtimeRegistrationJson: delegationRegistration(PARENT, "general"),
+				}),
 				subagentType: id === CHILD ? "general" : null,
 				model: id === CHILD ? FOLLOW_PARENT_MODEL : A,
 				cwd: process.env.HOME,

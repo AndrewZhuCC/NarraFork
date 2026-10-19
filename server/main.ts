@@ -124,6 +124,7 @@ import { initDeviceConnectionService } from "./services/device-connection-servic
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
+import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -1455,6 +1456,10 @@ initDeviceTransferService();
 if (activeDatabaseBackend === "postgres") {
 	logger.warn("OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated");
 } else {
+	// Narrators written before runtime registrations store their relations from now on.
+	await materializeLegacyDelegations().catch((error) =>
+		logger.warn("Legacy delegation materialization failed", { error: String(error) }),
+	);
 	try {
 		await backfillOAuthGrantAuthoritiesOnStartup();
 		await backfillIntegrationResourceBindingsOnStartup();

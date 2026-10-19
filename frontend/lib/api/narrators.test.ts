@@ -119,7 +119,7 @@ describe("narrators API", () => {
 					return Response.json({ composerDocument: doc });
 				},
 			});
-			await api.updateNarratorDraft("n", "hello", 1, "source", [], doc);
+			await api.updateNarratorDraft("n", "hello", "source", [], doc);
 			expect(JSON.parse(String(requests[0].init.body)).composerDocument).toEqual(doc);
 			const controller = new AbortController();
 			expect(await api.getMessageComposerDocument("n/a", "m/a", controller.signal)).toEqual({
@@ -886,7 +886,7 @@ describe("narrators API", () => {
 			}
 		});
 
-		test("reference-only drafts share the text CAS request", async () => {
+		test("reference-only drafts share the text sync request", async () => {
 			Object.defineProperty(g, "localStorage", {
 				value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
 				configurable: true,
@@ -904,10 +904,9 @@ describe("narrators API", () => {
 				},
 				configurable: true,
 			});
-			const result = await api.updateNarratorDraft("n", "", 3, "tab", [reference]);
+			const result = await api.updateNarratorDraft("n", "", "tab", [reference]);
 			expect(sent).toEqual({
 				text: "",
-				baseRevision: 3,
 				sourceId: "tab",
 				fileReferences: [reference],
 			});

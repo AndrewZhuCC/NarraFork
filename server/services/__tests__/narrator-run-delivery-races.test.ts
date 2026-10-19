@@ -1081,58 +1081,6 @@ describe("hold protocol regressions", () => {
 		expect(sessionRow()?.status).toBe("idle");
 	});
 
-	for (const originOnly of [false, true]) {
-		test(`M2 legacy cold release materializes origin (${originOnly ? "origin only" : "mounted history"}) once`, async () => {
-			seed();
-			db.update(narrators)
-				.set({ originToolCallId: ORIGIN_ROW, substatus: '["taken_over"]' })
-				.where(eq(narrators.id, RUN))
-				.run();
-			if (!originOnly) {
-				db.insert(narratorMessages)
-					.values({
-						id: "legacy-user",
-						narratorId: RUN,
-						role: "user",
-						contentJson: [{ type: "text", text: "original task" }],
-						parentToolUseId: ORIGIN,
-						createdAt: NOW,
-					})
-					.run();
-				db.insert(narratorMessageRefs)
-					.values({ id: "legacy-user-ref", narratorId: RUN, messageId: "legacy-user", seq: seq++ })
-					.run();
-			}
-			db.insert(narratorMessages)
-				.values({
-					id: "legacy-answer",
-					narratorId: RUN,
-					role: "assistant",
-					contentJson: [{ type: "text", text: "legacy answer" }],
-					contentText: "legacy answer",
-					parentToolUseId: ORIGIN,
-					createdAt: NOW,
-				})
-				.run();
-			db.insert(narratorMessageRefs)
-				.values({
-					id: "legacy-answer-ref",
-					narratorId: RUN,
-					messageId: "legacy-answer",
-					seq: seq++,
-				})
-				.run();
-			await hydrateRunHolds();
-			expect(await controlRun(RUN, { kind: "release" })).toBe(true);
-			expect(await controlRun(RUN, { kind: "release" })).toBe(false);
-			expect(toolOutput()).toContain("legacy answer");
-			expect(sessionRow()?.runtimeRegistrationJson).toMatchObject({
-				run: { deliverTo: { toolCallId: ORIGIN_ROW } },
-			});
-			expect(delivered(sessionRow()?.logicalRunId ?? undefined)).toHaveLength(1);
-		});
-	}
-
 	test("C4 cold release owns delivery while a new start and duplicate release race it", async () => {
 		seed();
 		const pub = getRuntimePublicationService();

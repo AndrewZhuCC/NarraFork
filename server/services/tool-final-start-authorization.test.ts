@@ -20,6 +20,7 @@ import type { AgentConfig, AgentToolUse, ToolCallBinding } from "../lib/agent/ty
 import { generateId } from "../lib/id";
 import { withRuntimePolicyTrait } from "../lib/runtime-policy-trait";
 import { executionPolicyEngine } from "./execution-policy/engine";
+import { materializeLegacyDelegations } from "./legacy-delegation-materializer";
 import { handlePermission } from "./narrator-permission";
 import { narratorPersistence } from "./narrator-persistence";
 import { permissionPolicyChanges, permissionRuleService } from "./permission-rule-service";
@@ -91,6 +92,7 @@ async function actor(kind: "primary" | "subagent") {
 		createdAt: now(),
 		updatedAt: now(),
 	});
+	await materializeLegacyDelegations([id]);
 	return id;
 }
 async function fixture(
@@ -288,8 +290,8 @@ describe("real final-start policy after snapshot/slot waits", () => {
 	for (const kind of ["primary", "subagent"] as const)
 		test(`${kind}: a ceiling tightened after approval stops the approved Write before I/O`, async () => {
 			const f = await fixture(kind, "Write");
-			// The subagent fixture has no stored registration, so it follows its parent through
-			// the single legacy source rule; the primary tightens its own ceiling.
+			// The subagent fixture follows its parent as its stored policy source; the primary
+			// tightens its own ceiling.
 			f.config.onToolExecutionBefore = async () => {
 				await db
 					.update(narrators)

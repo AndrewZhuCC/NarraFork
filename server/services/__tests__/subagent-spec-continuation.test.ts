@@ -25,7 +25,9 @@ import { narrators, narratorToolCalls } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
 import { generateId } from "../../lib/id";
 import { deleteNugCachedModels, setNugCachedModels } from "../../lib/nug-model-cache";
+import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { settings, usesStatefulModel } from "../../lib/settings";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
 import { startNarratorRun } from "../agent-runtime/run";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
@@ -757,12 +759,19 @@ describe("persisted continuation reaches the next executor request", () => {
 		const completedToolId = generateId();
 		const now = new Date().toISOString();
 		for (const id of [parentNarratorId, narratorId]) {
+			const delegated = id === narratorId;
 			await db.insert(narrators).values({
 				id,
-				type: id === narratorId ? "subagent" : "primary",
-				variant: id === narratorId ? "subagent:general" : "primary",
-				parentNarratorId: id === narratorId ? parentNarratorId : null,
-				traits: ["standalone"],
+				type: delegated ? "subagent" : "primary",
+				variant: delegated ? "subagent:general" : "primary",
+				parentNarratorId: delegated ? parentNarratorId : null,
+				...(delegated && {
+					policySourceNarratorId: parentNarratorId,
+					runtimeRegistrationJson: delegationRegistration(parentNarratorId, "general"),
+				}),
+				traits: delegated
+					? withRuntimePolicyTrait(["standalone"], compileDelegationPolicy({ template: "general" }))
+					: ["standalone"],
 				model,
 				autoContinuationOverride: "always",
 				createdAt: now,

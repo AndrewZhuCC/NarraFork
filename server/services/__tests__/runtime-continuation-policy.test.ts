@@ -9,6 +9,7 @@ import { runtimeBasePrompt } from "../agent-runtime/orchestrator";
 import { resolveRuntimePolicy } from "../agent-runtime/policy";
 import { startNarratorRun } from "../agent-runtime/run";
 import { compileDelegationCeiling } from "../custom-subagent-service";
+import { materializeLegacyDelegations } from "../legacy-delegation-materializer";
 import * as executor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
 import { maybeStartContinuation } from "../narrator-session";
@@ -112,11 +113,12 @@ describe("A1 policy owns continuation, not deliverTo", () => {
 			expect(state.stop?.reason).toBe("passLimit");
 		});
 	}
-	test("unregistered legacy delegation derives the template continuation ceiling", async () => {
+	test("a materialized legacy delegation carries the template continuation ceiling", async () => {
 		const h = await fixture({ legacy: true });
+		expect(await materializeLegacyDelegations([h.id])).toBe(1);
 		const row = await narratorService.getById(h.id);
-		expect(row.runtimeRegistrationJson).toBeNull();
-		expect(parseRuntimePolicyTraits(row.traits)).toHaveLength(0);
+		expect(row.runtimeRegistrationJson).not.toBeNull();
+		expect(parseRuntimePolicyTraits(row.traits)).toHaveLength(1);
 		expect((await resolveNarratorRuntimePolicy(h.id)).continuation).toEqual({
 			promoteTodo: false,
 			maxPasses: 6,

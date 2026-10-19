@@ -26,6 +26,8 @@ const runtimeSession = await import("../narrator-session");
 const { writeSpecFile } = await import("../spec-vfs-service");
 const { readSpecContinuationState } = runtimeSession;
 const recovery = await import("../narrator-recovery");
+const { compileDelegationCeiling } = await import("../custom-subagent-service");
+const { withRuntimePolicyTrait } = await import("../../lib/runtime-policy-trait");
 const ws = await import("../../websocket/narrator-ws");
 const savedOpenai = settings.openaiProviders;
 const savedAnthropic = settings.anthropicProviders;
@@ -40,6 +42,8 @@ const delegatedRegistration = {
 		deliverTo: { narratorId: "retry-parent", toolUseId: "origin-tool" },
 	},
 };
+// The delegation's capability ceiling, compiled from its template at creation.
+const delegatedTraits = withRuntimePolicyTrait([], await compileDelegationCeiling("general"));
 
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
@@ -443,6 +447,7 @@ describe("provider retry policy is identical through the real primary and child 
 						variant: target === "retry-child" ? "subagent:general" : "primary",
 						parentNarratorId: target === "retry-child" ? "retry-parent" : null,
 						runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
+						traits: target === "retry-child" ? delegatedTraits : [],
 						model,
 						autoContinuationOverride: "off",
 						cwd: process.env.HOME,
@@ -469,7 +474,7 @@ describe("provider retry policy is identical through the real primary and child 
 						const runtimePolicy = options.config.runtimePolicy;
 						if (!runtimePolicy)
 							throw new Error("Real shared config must carry its resolved policy");
-						// Legacy delegated rows resolve their stored template ceiling.
+						// Delegated rows resolve their stored template ceiling.
 						expect(runtimePolicy.capabilities.spawnAgent).toBe(kind === "primary");
 						expect(runtimePolicyForContext(options.config)).toBe(runtimePolicy);
 						calls.push({
@@ -640,6 +645,7 @@ describe("runtime outcome distinguishes resource cleanup from user cancellation"
 						variant: target === "retry-child" ? "subagent:general" : "primary",
 						parentNarratorId: target === "retry-child" ? "retry-parent" : null,
 						runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
+						traits: target === "retry-child" ? delegatedTraits : [],
 						model,
 						autoContinuationOverride: "off",
 						cwd: process.env.HOME,

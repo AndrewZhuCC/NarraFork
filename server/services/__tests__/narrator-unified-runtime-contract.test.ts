@@ -21,6 +21,7 @@ import {
 import { setRunHold } from "../agent-runtime/ownership";
 import { compileDelegationPolicy, isRuntimeToolAllowed } from "../agent-runtime/policy";
 import { executionPolicyRepository } from "../execution-policy/repository";
+import { materializeLegacyDelegations } from "../legacy-delegation-materializer";
 import { authorizeAgentControl } from "../narrator-control";
 import { setPolicySource, setRuntimeRegistration } from "../narrator-runtime-registration";
 import { narratorService } from "../narrator-service";
@@ -68,7 +69,7 @@ async function primary(model = A): Promise<string> {
  * - delegated: created through `createSubagent`;
  * - unrelated: two ordinary narrators given the same registrations, no parent link;
  * - legacy: a delegated row written before registrations existed (parent link and
- *   delegated variant only), resolved through the single compatibility rule.
+ *   delegated variant only), after the one-time materialization stored its relations.
  */
 type Shape = "delegated" | "unrelated" | "legacy";
 
@@ -84,7 +85,7 @@ async function related(shape: Shape): Promise<{ source: string; dependent: strin
 		});
 		created.push(child.id);
 		await narratorService.updateStatus(child.id, "idle");
-		if (shape === "legacy")
+		if (shape === "legacy") {
 			await db
 				.update(narrators)
 				.set({
@@ -93,6 +94,8 @@ async function related(shape: Shape): Promise<{ source: string; dependent: strin
 					traits: ["standalone"],
 				})
 				.where(eq(narrators.id, child.id));
+			await materializeLegacyDelegations([child.id]);
+		}
 		return { source, dependent: child.id };
 	}
 	const dependent = await primary();

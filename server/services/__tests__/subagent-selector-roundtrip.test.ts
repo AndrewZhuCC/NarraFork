@@ -18,6 +18,7 @@ import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
 import { narratorTraitsLock } from "../../lib/async-mutex";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -62,6 +63,8 @@ async function seed(
 		type: "subagent",
 		variant: "subagent:general",
 		parentNarratorId: PARENT,
+		policySourceNarratorId: PARENT,
+		runtimeRegistrationJson: delegationRegistration(PARENT, "general"),
 		title: over.title ?? null,
 		...(over.traits ? { traits: over.traits } : {}),
 		createdAt: now,

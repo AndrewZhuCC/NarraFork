@@ -366,12 +366,10 @@ if (process.env[CHILD_ENV] !== "1") {
 			expect(JSON.stringify(continued[0].history)).toContain(savedMarker);
 		});
 
-		test("an unregistered legacy delegation keeps its persisted transcript when continued", async () => {
+		test("a materialized legacy delegation keeps its persisted transcript when continued", async () => {
 			// A row from before registrations existed: no registration, no policy source.
-			// Its destination is derived by the runtime-source compatibility rule, so the
-			// turns it placed under that call stay in the model history.
-			// Follows its parent's model: the legacy source must survive the first run's
-			// registration write, or the run fails before any history is built.
+			// Materialization stores its mount and source, so the turns it placed under that
+			// call stay in the model history and it still follows its parent's model.
 			const child = await create();
 			const origin = await db.query.narratorToolCalls.findFirst({
 				where: eq(narratorToolCalls.id, child.originToolCallId ?? ""),
@@ -386,6 +384,8 @@ if (process.env[CHILD_ENV] !== "1") {
 				savedMarker,
 				origin?.toolUseId ?? TOOL,
 			);
+			const { materializeLegacyDelegations } = await import("../legacy-delegation-materializer");
+			expect(await materializeLegacyDelegations([child.id])).toBe(1);
 			await drive(child.id, "resume");
 			const continued = executions.filter((run) => run.config.narratorId === child.id);
 			expect(continued).toHaveLength(1);

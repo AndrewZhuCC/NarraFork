@@ -1,4 +1,4 @@
-import { Box, Button, Group, Stack, Text } from "@mantine/core";
+import { Box, Button, Group, Text } from "@mantine/core";
 import { useDisclosure, useFocusTrap } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
@@ -65,7 +65,6 @@ import { getMentionQuery, type MentionCandidate, MentionPopover } from "./Mentio
 import classes from "./NarratorComposer.module.css";
 import {
 	canHydrateNarratorDraftFromMeta,
-	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
 	getNarratorDraftStorageId,
 	isAcknowledgedNarratorDraft,
@@ -155,12 +154,14 @@ export interface NarratorComposerHandle {
 	/** Clear only the on-screen text for an in-flight send; the draft record is
 	 * left untouched so a failed send can restore it. */
 	hideTextForSend(): void;
-	/** Post-send draft bookkeeping (sync empty / adopt conflicting server draft). */
+	/** Post-send draft bookkeeping (sync the empty tombstone). */
 	commitDraftAfterSend(): void;
 	/** Record a sent message in the up-arrow input history. */
 	noteSent(text: string, refs?: FileReference[], document?: ComposerDocument): void;
 	/** Forward a WS `draft_changed` event into the draft state machine. */
 	handleDraftChanged(draft: NarratorRemoteDraft): void;
+	/** Forward reconnect/page-load draft metadata; the body is fetched only when newer. */
+	handleDraftMeta(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }): void;
 }
 
 export interface NarratorComposerProps {
@@ -189,7 +190,7 @@ export interface NarratorComposerProps {
 
 /**
  * The narrator chat text input and everything derived from it per keystroke:
- * draft hydration/sync/conflict, input history, slash-command and @mention
+ * draft hydration/sync, input history, slash-command and @mention
  * popovers, and the draft warning banners.
  *
  * WHY THIS EXISTS AS A SEPARATE COMPONENT
@@ -298,9 +299,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const bodyText = bodyInput.text;
 		const inputStateRef = useRef(inputState);
 		const [draftHydrated, setDraftHydrated] = useState(false);
-		const [draftSyncState, setDraftSyncState] = useState<
-			"loading" | "ready" | "error" | "conflict"
-		>("loading");
+		const [draftSyncState, setDraftSyncState] = useState<"loading" | "ready" | "error">("loading");
+		// A remote write replaced non-empty local content; the overwritten version
+		// sits in the server's undo slot until restored or the user edits again.
+		const [draftReplacedByRemote, setDraftReplacedByRemote] = useState(false);
 		const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
 		const inputRef = useRef(input);
 		const draftSourceIdRef = useRef(createDraftSourceId());
@@ -312,7 +314,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		} | null>(null);
 		const lastDraftRevisionRef = useRef<number | null>(null);
 		const lastDraftUpdatedAtRef = useRef<string | null>(null);
-		const draftConflictRef = useRef<NarratorRemoteDraft | null>(null);
 		const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 		const draftSyncSeqRef = useRef(0);
 		const draftReadEpochRef = useRef(0);
@@ -703,6 +704,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				(unknown.unsynced || !sameFileReferenceInput(inputStateRef.current, unknown.input));
 			// Without a trusted server baseline, reverting to the restored value cannot acknowledge edits.
 			if (unknownEdited) unknown.unsynced = true;
+			// Editing resumes: the remote-replace notice and its undo offer are stale.
+			if (
+				lastSyncedDraftRef.current &&
+				!sameFileReferenceInput(inputState, lastSyncedDraftRef.current)
+			)
+				setDraftReplacedByRemote(false);
 			persistNarratorInputDraft(
 				currentUserId,
 				narratorId,
@@ -728,7 +735,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const syncDraftNow = useCallback(
 			async (
 				text: string,
-				baseRevision = lastDraftRevisionRef.current,
 				references = inputStateRef.current.fileReferences,
 				composerDocument: ComposerDocument | null = inputStateRef.current.composerDocument ?? null,
 			) => {
@@ -736,7 +742,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				if (!currentUserId) throw new Error("Current user is unavailable");
 				if (draftOwnerScopeRef.current !== currentDraftScope)
 					throw new Error("Draft belongs to a previous account or narrator");
-				if (baseRevision == null) throw new Error("Draft has not been loaded from the server");
+				if (lastDraftRevisionRef.current == null)
+					throw new Error("Draft has not been loaded from the server");
 				if (!isDraftWithinSyncLimit(text)) {
 					throw new Error(`Draft exceeds the ${MAX_NARRATOR_DRAFT_CHARS} character sync limit`);
 				}
@@ -745,106 +752,40 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					draftSyncTimerRef.current = null;
 				}
 				const seq = ++draftSyncSeqRef.current;
-				const sourceId = draftSourceIdRef.current;
-				let revision = baseRevision;
-				let retriedOwnRevision = false;
-				while (true) {
-					try {
-						const result = await api.updateNarratorDraft(
-							narratorId,
-							text,
-							revision,
-							sourceId,
-							refs,
-							readPersistableDocument(composerDocument),
-						);
-						if (
-							seq === draftSyncSeqRef.current &&
-							qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId
-						) {
-							const newerConflict = draftConflictRef.current;
-							if (newerConflict && newerConflict.revision > result.revision) return result;
-							lastSyncedDraftRef.current = {
-								text: result.text,
-								fileReferences: readFileReferences(result.fileReferences, result.text),
-								composerDocument: readComposerDocument(result.composerDocument),
-							};
-							lastDraftRevisionRef.current = result.revision;
-							lastDraftUpdatedAtRef.current = result.updatedAt;
-							draftConflictRef.current = null;
-							setDraftSyncState("ready");
-							persistNarratorInputDraft(
-								currentUserId,
-								narratorId,
-								inputRef.current,
-								result.revision,
-								result.updatedAt,
-								inputStateRef.current.fileReferences,
-								lastSyncedDraftRef.current,
-								readPersistableDocument(inputStateRef.current.composerDocument),
-							);
-							qc.setQueryData(
-								["narrators", narratorId],
-								(old: Record<string, unknown> | undefined) =>
-									old ? { ...old, traits: result.traits, hasDraft: result.hasDraft } : old,
-							);
-						}
-						return result;
-					} catch (err) {
-						if (
-							seq !== draftSyncSeqRef.current ||
-							qc.getQueryData<{ id?: string }>(["auth", "me"])?.id !== currentUserId
-						)
-							return;
-						const current =
-							err instanceof ApiError && err.status === 409
-								? (err.data?.current as
-										| {
-												hasDraft?: unknown;
-												text?: unknown;
-												fileReferences?: unknown;
-												composerDocument?: unknown;
-												revision?: unknown;
-												updatedAt?: unknown;
-												updatedBy?: unknown;
-												sourceId?: unknown;
-										  }
-										| undefined)
-								: undefined;
-						if (
-							current &&
-							typeof current.text === "string" &&
-							typeof current.revision === "number"
-						) {
-							const remote: NarratorRemoteDraft = {
-								hasDraft: !!current.hasDraft,
-								text: current.text,
-								fileReferences: readFileReferences(current.fileReferences, current.text),
-								composerDocument: readComposerDocument(current.composerDocument),
-								revision: current.revision,
-								updatedAt: typeof current.updatedAt === "string" ? current.updatedAt : null,
-								updatedBy: typeof current.updatedBy === "string" ? current.updatedBy : null,
-								sourceId: typeof current.sourceId === "string" ? current.sourceId : null,
-							};
-							const action = classifyDraftRevisionConflict({
-								requestSequence: seq,
-								latestSequence: draftSyncSeqRef.current,
-								requestSourceId: sourceId,
-								currentSourceId: remote.sourceId,
-							});
-							if (action === "retry" && !retriedOwnRevision) {
-								retriedOwnRevision = true;
-								revision = remote.revision;
-								continue;
-							}
-							if (action === "conflict") {
-								draftConflictRef.current = remote;
-								setDraftSyncState("conflict");
-							}
-						}
-						throw err;
-					}
+				const result = await api.updateNarratorDraft(
+					narratorId,
+					text,
+					draftSourceIdRef.current,
+					refs,
+					readPersistableDocument(composerDocument),
+				);
+				if (
+					seq === draftSyncSeqRef.current &&
+					qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId
+				) {
+					lastSyncedDraftRef.current = {
+						text: result.text,
+						fileReferences: readFileReferences(result.fileReferences, result.text),
+						composerDocument: readComposerDocument(result.composerDocument),
+					};
+					lastDraftRevisionRef.current = result.revision;
+					lastDraftUpdatedAtRef.current = result.updatedAt;
+					setDraftSyncState("ready");
+					persistNarratorInputDraft(
+						currentUserId,
+						narratorId,
+						inputRef.current,
+						result.revision,
+						result.updatedAt,
+						inputStateRef.current.fileReferences,
+						lastSyncedDraftRef.current,
+						readPersistableDocument(inputStateRef.current.composerDocument),
+					);
+					qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+						old ? { ...old, traits: result.traits, hasDraft: result.hasDraft } : old,
+					);
 				}
+				return result;
 			},
 			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument],
 		);
@@ -854,7 +795,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			declareDocumentAssets([]);
 			releaseUnusedResources();
 			attachmentStateRef.current.onChange?.([], []);
-			if (draftSyncState === "ready") void syncDraftNow("", undefined, [], null).catch(() => {});
+			if (draftSyncState === "ready") void syncDraftNow("", [], null).catch(() => {});
 		}, [draftSyncState, syncDraftNow, restoreInput, releaseUnusedResources, declareDocumentAssets]);
 
 		const hideTextForSend = useCallback(() => {
@@ -877,7 +818,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		useEffect(() => {
 			void draftLoadAttempt;
-			// An old account/narrator's in-flight CAS must not overwrite the newly hydrated pair.
+			// An old account/narrator's in-flight save must not overwrite the newly hydrated pair.
 			draftSyncSeqRef.current++;
 			const readEpoch = ++draftReadEpochRef.current;
 			draftOwnerScopeRef.current = null;
@@ -900,7 +841,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId;
 			setDraftHydrated(false);
 			setDraftSyncState("loading");
-			draftConflictRef.current = null;
+			setDraftReplacedByRemote(false);
 			lastSyncedDraftRef.current = null;
 			unacknowledgedDraftRef.current = null;
 			lastDraftRevisionRef.current = null;
@@ -998,28 +939,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						fileReferences: serverFileReferences,
 						composerDocument: readComposerDocument(draft.composerDocument),
 					};
-					lastDraftRevisionRef.current = resolved.conflict
-						? localDraft.serverRevision
-						: draft.revision;
-					lastDraftUpdatedAtRef.current = resolved.conflict
-						? localDraft.serverUpdatedAt
-						: draft.updatedAt;
+					lastDraftRevisionRef.current = draft.revision;
+					lastDraftUpdatedAtRef.current = draft.updatedAt;
 					persistNarratorInputDraft(
 						currentUserId,
 						narratorId,
 						resolved.text,
-						resolved.conflict ? localDraft.serverRevision : draft.revision,
-						resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
+						draft.revision,
+						draft.updatedAt,
 						resolved.fileReferences ?? [],
 						lastSyncedDraftRef.current,
 						readPersistableDocument(inputStateRef.current.composerDocument),
 					);
-					if (resolved.conflict) {
-						draftConflictRef.current = draft;
-						setDraftSyncState("conflict");
-					} else {
-						setDraftSyncState("ready");
-					}
+					setDraftSyncState("ready");
 				})
 				.catch(() => {
 					if (alive()) setDraftSyncState("error");
@@ -1070,56 +1002,54 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			setDraftLoadAttempt((attempt) => attempt + 1);
 		}, []);
 
-		const acceptServerDraft = useCallback(() => {
-			const remote = draftConflictRef.current;
-			if (!remote || !currentUserId) return;
-			const remoteText = remote.hasDraft ? remote.text : "";
-			const refs = remote.hasDraft ? readFileReferences(remote.fileReferences, remoteText) : [];
-			lastSyncedDraftRef.current = {
-				text: remoteText,
-				fileReferences: refs,
-				composerDocument: remote.composerDocument,
-			};
-			lastDraftRevisionRef.current = remote.revision;
-			lastDraftUpdatedAtRef.current = remote.updatedAt;
-			draftConflictRef.current = null;
-			restoreRemoteInput(remoteText, refs, remote.composerDocument);
-			setDraftSyncState("ready");
-			persistNarratorInputDraft(
-				currentUserId,
-				narratorId,
-				remoteText,
-				remote.revision,
-				remote.updatedAt,
-				refs,
-				lastSyncedDraftRef.current,
-				readPersistableDocument(inputStateRef.current.composerDocument),
-			);
-		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument]);
-
 		const commitDraftAfterSend = useCallback(() => {
 			if (draftSyncState === "ready") {
 				setDraftSyncState("loading");
-				void syncDraftNow("", undefined, [], null).catch(() => setDraftSyncState("error"));
-			} else if (draftSyncState === "conflict") {
-				// The local text was sent, but another client owns a newer draft. Keep that
-				// remote draft rather than clearing it as a side effect of this send.
-				acceptServerDraft();
+				void syncDraftNow("", [], null).catch(() => setDraftSyncState("error"));
 			}
 			releaseUnusedResources();
-		}, [draftSyncState, syncDraftNow, acceptServerDraft, releaseUnusedResources]);
+		}, [draftSyncState, syncDraftNow, releaseUnusedResources]);
 
-		const overwriteServerDraft = useCallback(() => {
-			const remote = draftConflictRef.current;
-			if (!remote) return;
-			void syncDraftNow(inputRef.current, remote.revision).catch((err) => {
-				notifications.show({
-					title: t("draftSyncFailed"),
-					message: err instanceof Error ? err.message : String(err),
-					color: "red",
+		/** Swap the draft back to the version the last remote write replaced. */
+		const restorePreviousDraft = useCallback(() => {
+			if (!currentUserId) return;
+			void api
+				.restoreNarratorDraftPrevious(narratorId, draftSourceIdRef.current)
+				.then((draft) => {
+					const text = draft.hasDraft ? draft.text : "";
+					const refs = draft.hasDraft ? readFileReferences(draft.fileReferences, text) : [];
+					const document = readComposerDocument(draft.composerDocument);
+					lastSyncedDraftRef.current = { text, fileReferences: refs, composerDocument: document };
+					lastDraftRevisionRef.current = draft.revision;
+					lastDraftUpdatedAtRef.current = draft.updatedAt;
+					restoreRemoteInput(text, refs, document);
+					setDraftSyncState("ready");
+					persistNarratorInputDraft(
+						currentUserId,
+						narratorId,
+						text,
+						draft.revision,
+						draft.updatedAt,
+						refs,
+						lastSyncedDraftRef.current,
+						readPersistableDocument(inputStateRef.current.composerDocument),
+					);
+					setDraftReplacedByRemote(false);
+				})
+				.catch((err) => {
+					// 404: the undo slot was already consumed elsewhere — drop the notice quietly.
+					// Other failures keep the notice so the restore can be retried.
+					if (err instanceof ApiError && err.status === 404) {
+						setDraftReplacedByRemote(false);
+						return;
+					}
+					notifications.show({
+						title: t("draftSyncFailed"),
+						message: err instanceof Error ? err.message : String(err),
+						color: "red",
+					});
 				});
-			});
-		}, [syncDraftNow, t]);
+		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument, t]);
 
 		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
@@ -1183,23 +1113,42 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							unknown?.unsynced ||
 							(unknown && !sameFileReferenceInput(inputStateRef.current, unknown.input))
 						);
-				if (
-					draft.sourceId !== draftSourceIdRef.current &&
-					hasLocalUnsyncedChanges &&
-					!sameFileReferenceInput(remoteInput, inputStateRef.current)
-				) {
-					draftConflictRef.current = draft;
-					setDraftSyncState("conflict");
+				const fromThisEditor = draft.sourceId === draftSourceIdRef.current;
+				if (!fromThisEditor && hasLocalUnsyncedChanges) {
+					/*
+					 * Local keystrokes win. The user is typing here, so the remote body is
+					 * left untouched on screen; the next debounced save overwrites it and
+					 * the server keeps the overwritten version in its undo slot. Only the
+					 * revision bookkeeping advances, keeping the out-of-order guard fresh.
+					 * "ready" matters when this event discarded the in-flight hydration:
+					 * without it the debounced save would stay gated on "loading" forever.
+					 */
+					lastDraftRevisionRef.current = draft.revision;
+					lastDraftUpdatedAtRef.current = draft.updatedAt;
+					setDraftSyncState("ready");
 					return;
 				}
-				const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
-				if (shouldApplyRemote) restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
+				if (!fromThisEditor) {
+					const replaced = lastSyncedDraftRef.current;
+					const hadContent = !!(
+						replaced &&
+						(replaced.text ||
+							replaced.fileReferences.length ||
+							replaced.composerDocument?.assets.length)
+					);
+					const remoteEmpty =
+						!remoteText && remoteRefs.length === 0 && !draft.composerDocument?.assets.length;
+					restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
+					// Only a remote CLEAR of real content earns the undo offer — anything
+					// noisier would fire on every routine cross-tab sync. A later non-empty
+					// write supersedes the offer (the undo slot holds the newest overwrite).
+					setDraftReplacedByRemote(hadContent && remoteEmpty);
+				}
 				lastSyncedDraftRef.current = remoteInput;
 				lastDraftRevisionRef.current = draft.revision;
 				lastDraftUpdatedAtRef.current = draft.updatedAt;
-				draftConflictRef.current = null;
 				setDraftSyncState("ready");
-				const nextInput = shouldApplyRemote ? remoteInput : inputStateRef.current;
+				const nextInput = fromThisEditor ? inputStateRef.current : remoteInput;
 				if (currentUserId) {
 					persistNarratorInputDraft(
 						currentUserId,
@@ -1217,6 +1166,34 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 
 		remoteDraftHandlerRef.current = handleDraftChanged;
+
+		/*
+		 * Reconnect reconcile entry point. The panel-state snapshot carries draft
+		 * metadata but never a body; when it proves the live event stream missed a
+		 * write (WS gap), pull the body and run it through the normal state machine.
+		 * The local-keystrokes-win rule inside handleDraftChanged still applies.
+		 */
+		const handleDraftMeta = useCallback(
+			(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) => {
+				const current = lastDraftRevisionRef.current;
+				if (current == null || meta.revision <= current) return;
+				const epoch = draftReadEpochRef.current;
+				const scope = draftOwnerScopeRef.current;
+				void api
+					.getNarratorDraft(narratorId, AbortSignal.timeout(15_000))
+					.then((detail) => {
+						if (
+							epoch !== draftReadEpochRef.current ||
+							scope !== draftOwnerScopeRef.current ||
+							detail.revision <= (lastDraftRevisionRef.current ?? 0)
+						)
+							return;
+						remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
+					})
+					.catch(() => {});
+			},
+			[narratorId],
+		);
 
 		// --- Command popover ---
 		// A quoted message is never a slash command: the quote prefix leads its text.
@@ -1636,6 +1613,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				commitDraftAfterSend,
 				noteSent: (text, refs, document) => inputHistory.push(text, refs, document),
 				handleDraftChanged,
+				handleDraftMeta,
 			}),
 			[
 				captureAttachmentSelection,
@@ -1651,6 +1629,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				commitDraftAfterSend,
 				inputHistory,
 				handleDraftChanged,
+				handleDraftMeta,
 			],
 		);
 
@@ -1734,20 +1713,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						</Button>
 					</Group>
 				)}
-				{draftSyncState === "conflict" && (
-					<Stack gap={4} mb={4}>
-						<Text size="xs" c="orange">
-							{t("draftConflict")}
+				{draftReplacedByRemote && (
+					<Group gap="xs" mb={4} wrap="nowrap">
+						<Text size="xs" c="orange" style={{ flex: 1 }}>
+							{t("draftReplacedByRemote")}
 						</Text>
-						<Group gap="xs">
-							<Button size="compact-xs" variant="light" onClick={acceptServerDraft}>
-								{t("draftUseServer")}
-							</Button>
-							<Button size="compact-xs" color="orange" onClick={overwriteServerDraft}>
-								{t("draftUseLocal")}
-							</Button>
-						</Group>
-					</Stack>
+						<Button size="compact-xs" variant="light" onClick={restorePreviousDraft}>
+							{t("draftRestorePrevious")}
+						</Button>
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							color="gray"
+							onClick={() => setDraftReplacedByRemote(false)}
+						>
+							{t("draftDismissReplace")}
+						</Button>
+					</Group>
 				)}
 				{!isDraftWithinSyncLimit(input) && (
 					<Text size="xs" c="orange" mb={4}>

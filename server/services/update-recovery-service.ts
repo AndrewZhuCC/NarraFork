@@ -1191,7 +1191,11 @@ async function restoreAgent(
 		const call = await toolContinuationService.getToolCallResult(record.toolCallId);
 		if (!call) throw new Error("Agent continuation's spawning call no longer exists");
 		legacyBinding = {
-			deliverTo: { narratorId: record.narratorId, toolUseId: call.toolUseId },
+			deliverTo: {
+				narratorId: record.narratorId,
+				toolUseId: call.toolUseId,
+				toolCallId: record.toolCallId,
+			},
 			principal: executionPrincipalOf(source ?? {}) ?? { userId: null },
 			deadlineAt: payloadString(record.payloadJson, "executionDeadlineAt"),
 		};

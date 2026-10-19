@@ -178,7 +178,7 @@ function fixture(
 		previousHasDraft: false,
 		hasDraft: true,
 		text: args[2],
-		fileReferences: args[5] ?? [],
+		fileReferences: args[4] ?? [],
 		revision: 2,
 		updatedBy: args[0],
 		updatedAt: "now",
@@ -694,7 +694,7 @@ describe("file reference draft and ACL wiring", () => {
 		const f = fixture();
 		const result = await f.request(
 			"draft",
-			{ text: "", baseRevision: 1, sourceId: "tab", fileReferences: [reference] },
+			{ text: "", sourceId: "tab", fileReferences: [reference] },
 			"PUT",
 		);
 		expect(result.status).toBe(200);
@@ -703,8 +703,8 @@ describe("file reference draft and ACL wiring", () => {
 			"session",
 			"",
 			"tab",
-			1,
 			[reference],
+			undefined,
 		]);
 		expect(await result.json()).toMatchObject({ fileReferences: [reference] });
 		expect(f.events[0]).toMatchObject({ type: "draft_changed", fileReferences: [reference] });

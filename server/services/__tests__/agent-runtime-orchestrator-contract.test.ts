@@ -89,6 +89,10 @@ const unregister = provider.registerExternalProviderResolver({
 	listReadiness: () => [],
 });
 const ids = ["contract-parent", "contract-primary", "contract-child"];
+const { compileDelegationCeiling } = await import("../custom-subagent-service");
+const { withRuntimePolicyTrait } = await import("../../lib/runtime-policy-trait");
+// The delegation's capability ceiling, compiled from its template at creation.
+const childCeiling = withRuntimePolicyTrait([], await compileDelegationCeiling("general"));
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
@@ -116,6 +120,7 @@ beforeEach(async () => {
 								},
 							}
 						: null,
+				traits: id === "contract-child" ? childCeiling : [],
 				model: MODEL,
 				cwd: process.env.HOME,
 				autoContinuationOverride: "off",
@@ -1155,9 +1160,15 @@ describe("real shared orchestrator profile contract", () => {
 
 	test("missing custom child definition retains readonly fallback in the real pass policy", async () => {
 		const { toolRegistry } = await import("../../lib/agent/tool-registry");
-		// Legacy row without a stored ceiling: its template compiles fail-closed.
+		// A custom template missing at creation compiles fail-closed.
 		db.update(narrators)
-			.set({ variant: "subagent:custom-missing-definition" })
+			.set({
+				variant: "subagent:custom-missing-definition",
+				traits: withRuntimePolicyTrait(
+					[],
+					await compileDelegationCeiling("custom-missing-definition"),
+				),
+			})
 			.where(eq(narrators.id, "contract-child"))
 			.run();
 		const h = fixture(profiles[1], [finished]);

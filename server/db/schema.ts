@@ -2904,6 +2904,15 @@ export const narratorDrafts = sqliteTable(
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
+		/**
+		 * Snapshot of the version overwritten by the latest write (single undo slot).
+		 *
+		 * Drafts are a per-user resource, so writes are last-writer-wins instead of
+		 * CAS-rejected; this JSON blob (`{text,fileReferencesJson,composerDocument,
+		 * revision,updatedAt}`) is the only safety net, letting the user restore the
+		 * version their other tab/device just replaced.
+		 */
+		previousJson: text("previous_json"),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_drafts_user_narrator").on(table.userId, table.narratorId),

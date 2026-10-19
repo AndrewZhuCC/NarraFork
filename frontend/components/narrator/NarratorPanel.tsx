@@ -951,6 +951,13 @@ function NarratorPanelBody({
 		(draft: NarratorRemoteDraft) => composerRef.current?.handleDraftChanged(draft),
 		[],
 	);
+	// Reconnect reconciles carry draft metadata (never a body): let the composer
+	// pull the body when the snapshot proves the live event stream was missed.
+	const forwardDraftMeta = useCallback(
+		(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) =>
+			composerRef.current?.handleDraftMeta(meta),
+		[],
+	);
 
 	// Pending composer attachments (images + text files) + their IndexedDB draft
 	// persistence. The send flow (hide/clear/restore) and drag handlers below
@@ -1251,6 +1258,7 @@ function NarratorPanelBody({
 		nugProviderId: nugProviderInfo?.providerId,
 		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
 		onDraftChanged: forwardDraftChanged,
+		onDraftMeta: forwardDraftMeta,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
 		},

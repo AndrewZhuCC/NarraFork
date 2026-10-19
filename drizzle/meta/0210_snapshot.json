@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "8c064879-d4bb-4660-8c9f-14f7990f62fa",
+  "id": "934e970e-45d7-48c4-b715-7914d12a11a7",
   "prevId": "887c0e87-bf13-4952-b878-d3f7fa996b32",
   "tables": {
     "acl_events": {
@@ -4326,20 +4326,6 @@
         "expected_effect_count": {
           "name": "expected_effect_count",
           "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "workspace_lease_id": {
-          "name": "workspace_lease_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "editor_raw_snapshot_revision": {
-          "name": "editor_raw_snapshot_revision",
-          "type": "real",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -9412,6 +9398,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "previous_json": {
+          "name": "previous_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         }
       },

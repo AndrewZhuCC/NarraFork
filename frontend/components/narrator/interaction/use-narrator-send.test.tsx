@@ -72,6 +72,7 @@ beforeEach(() => {
 		commitDraftAfterSend: mock(() => {}),
 		noteSent: mock(() => {}),
 		handleDraftChanged: mock(() => {}),
+		handleDraftMeta: mock(() => {}),
 	};
 	options = {
 		narratorId: "n",
