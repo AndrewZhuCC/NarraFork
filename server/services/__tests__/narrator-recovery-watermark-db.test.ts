@@ -18,6 +18,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import { backgroundTasks, narratorMessages, narrators } from "../../db/schema";
 import { narratorTraitsLock } from "../../lib/async-mutex";
 import { parseTraits } from "../../lib/narrator-utils";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 // Snapshot the real db module before mocking: Bun's mock.module is process-wide and
@@ -58,12 +59,27 @@ async function seedParent(): Promise<void> {
 		.onConflictDoNothing({ target: narrators.id });
 }
 
-async function seedFailedSubagent(id: string, traits: string[] = []): Promise<void> {
+async function seedFailedSubagent(
+	id: string,
+	traits: string[] = [],
+	deliverToolUseId?: string,
+): Promise<void> {
 	await seedParent();
+	const registration = delegationRegistration(PARENT_ID, "general");
 	await db.insert(narrators).values({
 		id,
 		variant: "subagent:general",
 		parentNarratorId: PARENT_ID,
+		policySourceNarratorId: PARENT_ID,
+		runtimeRegistrationJson: deliverToolUseId
+			? {
+					...registration,
+					run: {
+						logicalRunId: `run-${id}`,
+						deliverTo: { narratorId: PARENT_ID, toolUseId: deliverToolUseId },
+					},
+				}
+			: registration,
 		status: "idle",
 		substatus: JSON.stringify(["error", `turn_pause_started_ms:${FAILED_AT_MS}`]),
 		traits,
@@ -216,7 +232,7 @@ describe("markRecoveryOffered", () => {
 });
 
 async function seedRecoverableSubagent(id: string, alias: string): Promise<void> {
-	await seedFailedSubagent(id, [`${SUBAGENT_ALIAS_TRAIT_PREFIX}${alias}`]);
+	await seedFailedSubagent(id, [`${SUBAGENT_ALIAS_TRAIT_PREFIX}${alias}`], `tool-${id}`);
 	await db.insert(narratorMessages).values({
 		id: `${id}-origin`,
 		narratorId: id,

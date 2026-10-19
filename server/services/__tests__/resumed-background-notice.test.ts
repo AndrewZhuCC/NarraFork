@@ -199,7 +199,13 @@ describe("a user-continued run delivers its own result once", () => {
 					locale: "en",
 					text: "continue",
 					principal: null,
-					binding: { deliverTo: { narratorId: "notice-parent", toolUseId: "notice-origin" } },
+					binding: {
+						deliverTo: {
+							narratorId: "notice-parent",
+							toolUseId: "notice-origin",
+							toolCallId: "notice-agent-call",
+						},
+					},
 				});
 				expect(handle.started).toBe(true);
 				if (status === "cancelled")
