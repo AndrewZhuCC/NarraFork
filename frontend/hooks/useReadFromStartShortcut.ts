@@ -169,6 +169,23 @@ export function registerReadFromStartTarget(get: () => ReadingTarget): () => voi
 	};
 }
 
+/** Sandboxed previews cannot bubble their native Tab to the narrator document. */
+export function focusComposerFromFrame(frame: HTMLIFrameElement | null): void {
+	if (!frame) return;
+	const doc = frame.ownerDocument;
+	const page = pages.get(doc);
+	const KeyboardEvent = doc.defaultView?.KeyboardEvent;
+	if (!page || !KeyboardEvent || !frame.isConnected) return;
+	// Native Tab may already have moved focus when the frame's message arrives.
+	handleReadFromStartShortcut(
+		new KeyboardEvent("keydown", { key: "Tab", code: "Tab", cancelable: true }),
+		doc,
+		page,
+		readNarratorShortcuts().focusComposer,
+		true,
+	);
+}
+
 export function useFocusComposerShortcut(
 	ref: RefObject<HTMLElement | null>,
 	isPrimary = false,

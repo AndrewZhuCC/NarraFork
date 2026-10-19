@@ -1,5 +1,6 @@
 import { subscribeHostPresentation } from "@frontend/components/plugins/host-presentation";
 import { useGenUI } from "@frontend/hooks/useGenUI";
+import { focusComposerFromFrame } from "@frontend/hooks/useReadFromStartShortcut";
 import { api } from "@frontend/lib/api";
 import { Alert, Box, Button, Group, Loader, Stack, Text } from "@mantine/core";
 import type { GenUiFileReference } from "@shared/gen-ui-files";
@@ -155,6 +156,10 @@ function PreviewFrame({
 			);
 		const onNavigation = (event: MessageEvent) => {
 			if (event.source !== frame.current?.contentWindow) return;
+			if (event.data?.type === "narrafork:preview-focus-composer") {
+				focusComposerFromFrame(frame.current);
+				return;
+			}
 			if (event.data?.type === "narrafork:preview-left") setNavigated(true);
 			const data = event.data as { type?: unknown; action?: unknown; value?: unknown } | null;
 			if (

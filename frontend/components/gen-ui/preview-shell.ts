@@ -119,6 +119,15 @@ export function createPreviewShell(
   };
   window.addEventListener("error", event => fail(event.error || new Error(event.message)));
   window.addEventListener("unhandledrejection", event => fail(event.reason));
+  window.addEventListener("keydown", event => {
+    if (!event.isTrusted || event.defaultPrevented || event.key !== "Tab" || event.repeat ||
+        event.isComposing || event.keyCode === 229 || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (event.target instanceof Element && event.target.closest(
+      'input, textarea, select, form, [role="slider"], [role="spinbutton"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], .monaco-editor, .xterm'
+    )) return;
+    // Keep native Tab as a fallback when the host has no enabled composer shortcut.
+    parent.postMessage({type: "narrafork:preview-focus-composer"}, "*");
+  });
   const style = (text) => {
     const element = document.createElement("style");
     element.textContent = text;

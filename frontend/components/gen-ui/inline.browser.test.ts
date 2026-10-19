@@ -17,6 +17,7 @@ declare global {
 			stream(source: string, live: boolean): void;
 			kit(notice: unknown): void;
 			form(toolUseId: string | undefined): void;
+			focusBinding(value: string): void;
 		};
 	}
 }
@@ -459,4 +460,68 @@ browserTest(
 		});
 	},
 	120_000,
+);
+
+browserTest(
+	"Tab from GenUI content focuses the composer without hijacking fields or disabled bindings",
+	async () => {
+		const kit = (path: string) =>
+			path.endsWith("/gen-ui/kit")
+				? Response.json({ status: { state: "builtin", components: [] }, request: null })
+				: null;
+		await withFixturePage(kit, async (page, messages) => {
+			await page.evaluate(() =>
+				window.inlineFixture.stream(
+					'<Stack><Button id="tab-button">Action</Button><Slider defaultValue={12} /><TextInput id="first" label="First" /><TextInput id="second" label="Second" /></Stack>',
+					false,
+				),
+			);
+			const handle = await page.waitForSelector('#card iframe[title="Plans"]');
+			const frame = (await handle?.contentFrame()) as Frame;
+			await frame.waitForSelector("#second");
+			await frame.click("#root", { offset: { x: 2, y: 2 } });
+			await page.keyboard.press("Tab");
+			await page.waitForFunction(() => document.activeElement?.id === "composer");
+			expect(
+				await page.$eval("#composer", (node) => node.ownerDocument.activeElement === node),
+			).toBe(true);
+
+			await frame.focus('[role="slider"]');
+			await page.keyboard.press("Tab");
+			await frame.waitForFunction(() => document.activeElement?.id === "first");
+			expect(await frame.$eval("#first", (node) => node.ownerDocument.activeElement === node)).toBe(
+				true,
+			);
+
+			await frame.focus("#first");
+			await page.keyboard.press("Tab");
+			await frame.waitForFunction(() => document.activeElement?.id === "second");
+			expect(
+				await frame.$eval("#second", (node) => node.ownerDocument.activeElement === node),
+			).toBe(true);
+
+			await page.evaluate(() => window.inlineFixture.focusBinding(""));
+			await frame.click("#root", { offset: { x: 2, y: 2 } });
+			await page.keyboard.press("Tab");
+			await frame.waitForFunction(() => document.activeElement?.id === "tab-button");
+			expect(
+				await page.$eval("#composer", (node) => node.ownerDocument.activeElement === node),
+			).toBe(false);
+
+			// A read-only card can tab out before its message reaches the parent.
+			await page.evaluate(() => {
+				window.inlineFixture.focusBinding("Tab");
+				window.inlineFixture.stream('<Text id="read-only">Read only</Text>', false);
+			});
+			await frame.waitForSelector("#read-only");
+			await frame.click("#root", { offset: { x: 2, y: 2 } });
+			await page.keyboard.press("Tab");
+			await page.waitForFunction(() => document.activeElement?.id === "composer");
+			expect(
+				await page.$eval("#composer", (node) => node.ownerDocument.activeElement === node),
+			).toBe(true);
+			expect(messages).toHaveLength(0);
+		});
+	},
+	30000,
 );

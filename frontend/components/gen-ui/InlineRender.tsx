@@ -1,4 +1,5 @@
 import { subscribeHostPresentation } from "@frontend/components/plugins/host-presentation";
+import { focusComposerFromFrame } from "@frontend/hooks/useReadFromStartShortcut";
 import { api } from "@frontend/lib/api";
 import { Alert, Box, Button, Group, Loader, Text } from "@mantine/core";
 import { parseUiMarkup } from "@shared/gen-ui-markup";
@@ -308,6 +309,10 @@ export function InlineRender({
 				message?: unknown;
 				fields?: unknown;
 			} | null;
+			if (data?.type === "narrafork:preview-focus-composer") {
+				focusComposerFromFrame(frame.current);
+				return;
+			}
 			if (data?.type === "narrafork:ui-ready") {
 				onReady();
 				return;

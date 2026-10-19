@@ -1,11 +1,13 @@
 import "@mantine/core/styles.css";
 import { RenderLodCtx } from "@frontend/components/narrator/lod/RenderLodCtx";
+import { setNarratorShortcut } from "@frontend/hooks/useNarratorShortcuts";
+import { useFocusComposerShortcut } from "@frontend/hooks/useReadFromStartShortcut";
 import { setToken } from "@frontend/lib/api/client";
 import { mantineTheme } from "@frontend/lib/mantine-theme";
 import { MantineProvider, v8CssVariablesResolver } from "@mantine/core";
 import type { GenUiKitNotice } from "@shared/gen-ui-kit";
 import { createInstance } from "i18next";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import { GenUICard } from "./GenUICard";
@@ -53,6 +55,8 @@ setToken("fixture-private-token");
 
 /** The props a `render` tool row passes down, driven by the test like a stream would. */
 function Fixture() {
+	const composerRef = useRef<HTMLTextAreaElement>(null);
+	useFocusComposerShortcut(composerRef, true);
 	const [inline, setInline] = useState({ source: "", live: true });
 	const [kit, setKit] = useState<GenUiKitNotice | undefined>(undefined);
 	const [form, setForm] = useState<string | undefined>(undefined);
@@ -61,6 +65,7 @@ function Fixture() {
 			stream: (source: string, live: boolean) => setInline({ source, live }),
 			kit: setKit,
 			form: setForm,
+			focusBinding: (value: string) => setNarratorShortcut("focusComposer", value),
 		},
 	});
 	return (
@@ -80,6 +85,15 @@ function Fixture() {
 							height={400}
 						/>
 					</div>
+					<button type="button" id="after-preview">
+						After preview
+					</button>
+					<textarea
+						id="composer"
+						ref={composerRef}
+						data-narrator-composer="n1"
+						aria-label="Composer"
+					/>
 				</RenderLodCtx.Provider>
 			</MantineProvider>
 		</I18nextProvider>
