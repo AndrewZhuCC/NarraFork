@@ -347,6 +347,11 @@ function readWithinWindowBudget<T>(read: () => Promise<T>, signal: AbortSignal):
 	});
 }
 
+function isDocumentChangedError(error: unknown): boolean {
+	const failure = error as { status?: number; data?: { code?: unknown } } | null;
+	return failure?.status === 409 && failure.data?.code === "PRETEXT_DOCUMENT_CHANGED";
+}
+
 export async function refreshPretextDocumentWindow(
 	narratorId: string,
 	previous: PretextDocumentInput,
@@ -384,20 +389,29 @@ export async function refreshPretextDocumentWindow(
 			if (controller.signal.aborted) throw windowAbortReason(controller.signal);
 			if (remainingBytes <= 0) return undefined;
 			let reportedBytes: number | undefined;
-			const page = await readWithinWindowBudget(
-				() =>
-					fetchPage(narratorId, {
-						afterSeq,
-						limit: 100,
-						messageVersion: version,
-						signal: controller.signal,
-						maxResponseBytes: remainingBytes,
-						onResponseBytes: (bytes) => {
-							reportedBytes = bytes;
-						},
-					}),
-				controller.signal,
-			);
+			let page: Awaited<ReturnType<typeof fetchPage>>;
+			try {
+				page = await readWithinWindowBudget(
+					() =>
+						fetchPage(narratorId, {
+							afterSeq,
+							limit: 100,
+							messageVersion: version,
+							signal: controller.signal,
+							maxResponseBytes: remainingBytes,
+							onResponseBytes: (bytes) => {
+								reportedBytes = bytes;
+							},
+						}),
+					controller.signal,
+				);
+			} catch (error) {
+				// The pinned revision moved on: the same "window no longer current"
+				// outcome as a version mismatch below, which the caller answers with a
+				// structural reload. Throwing instead skipped that reload entirely.
+				if (isDocumentChangedError(error)) return undefined;
+				throw error;
+			}
 			// Production reports actual streamed bytes before JSON parsing. Custom
 			// fetchers used by embedders/tests still pay the serialized-payload budget.
 			const pageBytes = reportedBytes ?? new TextEncoder().encode(JSON.stringify(page)).byteLength;

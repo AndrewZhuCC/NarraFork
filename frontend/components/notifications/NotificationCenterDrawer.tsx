@@ -5,7 +5,9 @@ import type { NotificationListItem as NotificationListItemData } from "@shared/n
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useHasKnowledgeReviewNotices } from "../../hooks/useKnowledge";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
+import { KnowledgeReviewNotices } from "./KnowledgeReviewNotices";
 import { NotificationListItem } from "./NotificationListItem";
 import {
 	listQueryParams,
@@ -45,6 +47,8 @@ export function NotificationCenterDrawer({
 	const [filter, setFilter] = useState<NotificationCenterFilter>("all");
 	const query = useNotificationList(filter, opened && tab === "activity");
 	const markRead = useMarkNotificationsRead();
+	const showKnowledge = opened && tab === "activity" && filter === "all";
+	const hasKnowledgeNotices = useHasKnowledgeReviewNotices();
 	useMobileDrawerHistory(opened, onClose);
 	const activate = (item: NotificationListItemData) => {
 		if (item.readAt === null)
@@ -168,11 +172,16 @@ export function NotificationCenterDrawer({
 									</Button>
 								</Alert>
 							)}
-							{!query.isLoading && !query.isError && !query.items.length && !query.hasNextPage && (
+							{showKnowledge ? <KnowledgeReviewNotices onOpen={onClose} /> : null}
+							{!query.isLoading &&
+							!query.isError &&
+							!query.items.length &&
+							!query.hasNextPage &&
+							!(showKnowledge && hasKnowledgeNotices) ? (
 								<Text size="sm" c="dimmed" ta="center" p="md" data-testid="notification-empty">
 									{t(filter === "all" ? "notificationEmpty" : "notificationEmptyFiltered")}
 								</Text>
-							)}
+							) : null}
 							<Stack gap={4} data-testid="notification-list">
 								{query.items.map((item) => (
 									<NotificationListItem key={item.groupKey} item={item} onActivate={activate} />

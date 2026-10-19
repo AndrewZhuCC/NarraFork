@@ -122,6 +122,57 @@ describe("parity fixture baseline", () => {
 	});
 });
 
+describe("table primary key parity", () => {
+	const compositeFixture = () => {
+		const source = fixture();
+		source.tables[1].columns[0].primary = false;
+		source.tables[1].primaryKeys = [{ name: "posts_scope_pk", columns: ["authorEmail", "id"] }];
+		return source;
+	};
+
+	test("compares table-level PKs without requiring inline column primary flags", () => {
+		const source = compositeFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+	});
+
+	test.each([
+		"name",
+		"order",
+		"wrong column",
+		"missing key",
+		"extra key",
+	])("detects %s drift", (change) => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		const table = target.tables[1];
+		switch (change) {
+			case "name":
+				table.primaryKeys[0].name = "renamed_pk";
+				break;
+			case "order":
+				table.primaryKeys[0].columns.reverse();
+				break;
+			case "wrong column":
+				table.primaryKeys[0].columns = ["id"];
+				break;
+			case "missing key":
+				table.primaryKeys = [];
+				break;
+			case "extra key":
+				table.primaryKeys.push({ name: "extra_pk", columns: ["id"] });
+				break;
+		}
+		expect(validateCoverage(source, target).join("\n")).toContain("primary key");
+	});
+
+	test("retains inline column primary flag comparison", () => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		target.tables[1].columns[0].primary = true;
+		expect(validateCoverage(source, target)).toContain("column mismatch posts.id");
+	});
+});
+
 describe("constant expression index parity", () => {
 	const expressionFixture = () => {
 		const source = fixture();
@@ -472,10 +523,44 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 122 tables and 1732 columns including token repair, Git identities, history revisions and runtime registration", () => {
+	test("covers 122 tables and 1713 columns including composer layouts and runtime registration", () => {
 		expect(target.tables.length).toBe(122);
-		// 1729 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1732);
+		// 1710 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1713);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_context_pins")
+				?.columns.map((column) => column.property),
+		).toEqual(["generation", "narratorId", "segmentsJson"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_message_context_stats")
+				?.columns.map((column) => column.property),
+		).toEqual(["messageId", "role", "parentToolUseId", "segmentsJson"]);
+		expect(target.tables.some((table) => table.name === "narrator_context_char_pages")).toBe(false);
+		for (const name of ["narrator_drafts", "narrator_messages"]) {
+			expect(
+				target.tables
+					.find((table) => table.name === name)
+					?.columns.find((column) => column.property === "composerDocument"),
+			).toMatchObject({
+				name: "composer_document",
+				mode: "json",
+				pgType: "text",
+				notNull: false,
+			});
+		}
+		expect(
+			target.tables
+				.find((table) => table.name === "knowledge_injection_events")
+				?.columns.find((column) => column.property === "personalEntryId"),
+		).toMatchObject({
+			name: "personal_entry_id",
+			pgType: "text",
+			notNull: false,
+			references: { table: "knowledgeDrafts", column: "id", onDelete: "cascade" },
+		});
 		expect(target.tables.some((table) => table.name.startsWith("intelligent_ui_"))).toBe(false);
 		expect(
 			target.tables

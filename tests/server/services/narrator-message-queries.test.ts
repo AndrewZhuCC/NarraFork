@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
 import {
 	buildSubagentSummarySqlExpr,
@@ -18,6 +18,7 @@ import {
 	narratorWhitelistDirs,
 	projects,
 } from "../../../server/db/schema";
+import { logger } from "../../../server/lib/logger";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -107,6 +108,58 @@ function insertMessage(params: {
 			seq: params.seq,
 		})
 		.run();
+}
+
+type CompactRecoverySelection = {
+	sql: string;
+	bindings: number[];
+	method: "get" | "all";
+	rows: Array<{ cursor: number; id?: string }>;
+};
+
+// Wrap executed native statements, not source text or mocked query results.
+function captureCompactRecoverySelections(afterSelect?: (call: CompactRecoverySelection) => void) {
+	const calls: CompactRecoverySelection[] = [];
+	const originalQuery = sqlite.query.bind(sqlite);
+	const querySpy = spyOn(sqlite, "query").mockImplementation(((query: string) => {
+		const statement = originalQuery<CompactRecoverySelection["rows"][number], number[]>(query);
+		if (!/^\s*SELECT[\s\S]*FROM narrator_messages[\s\S]*compact_pending/i.test(query)) {
+			return statement;
+		}
+		return new Proxy(statement, {
+			get(target, property, receiver) {
+				if (property !== "get" && property !== "all")
+					return Reflect.get(target, property, receiver);
+				return (...bindings: number[]) => {
+					const result = property === "all" ? target.all(...bindings) : target.get(...bindings);
+					const call: CompactRecoverySelection = {
+						sql: query,
+						bindings,
+						method: property,
+						rows: Array.isArray(result) ? result : result ? [result] : [],
+					};
+					calls.push(call);
+					afterSelect?.(call);
+					return result;
+				};
+			},
+		});
+	}) as typeof sqlite.query);
+	return { calls, restore: () => querySpy.mockRestore() };
+}
+
+function seedLegacyCompactingMessages(count: number) {
+	sqlite.transaction(() => {
+		for (let i = 0; i < count; i++) {
+			insertMessage({
+				id: `legacy-${i}`,
+				seq: i,
+				role: "system",
+				contentText: "[Compacting]",
+				contentJson: [{ type: "compact", status: "compacting", mode: "blocking" }],
+			});
+		}
+	})();
 }
 
 function insertToolCall(params: {
@@ -970,6 +1023,325 @@ describe("narratorService message query regressions", () => {
 			model: "provider:retry",
 			status: "failed",
 		});
+	});
+
+	it("recovers 205 negative-rowid placeholders through bounded index-driven candidate pages", async () => {
+		seedBase();
+		seedLegacyCompactingMessages(205);
+		sqlite.run("UPDATE narrator_messages SET rowid = -1000 - rowid");
+		const expected = sqlite
+			.query<{ cursor: number; id: string }, []>(
+				"SELECT rowid AS cursor, id FROM narrator_messages ORDER BY rowid",
+			)
+			.all();
+		const upperBound = expected[204].cursor;
+		expect(upperBound).toBeLessThan(0);
+		const capture = captureCompactRecoverySelections();
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		let pagesAtYield = -1;
+		const timer = setTimeout(() => {
+			pagesAtYield = capture.calls.filter((call) => call.method === "all").length;
+		}, 0);
+		try {
+			expect(await recoverStaleCompactingMessages()).toEqual({ preserved: 0, deleted: 205 });
+			expect(pagesAtYield).toBe(1);
+			expect(capture.calls).toHaveLength(4);
+			const [upper, ...pages] = capture.calls;
+			expect(upper.method).toBe("get");
+			expect(upper.bindings).toEqual([]);
+			expect(upper.rows).toEqual([{ cursor: upperBound }]);
+			expect(pages.map((page) => page.rows.length)).toEqual([100, 100, 5]);
+			expect(pages.map((page) => page.bindings)).toEqual([
+				[upperBound, 100],
+				[upperBound, expected[99].cursor, 100],
+				[upperBound, expected[199].cursor, 100],
+			]);
+			expect(pages.flatMap((page) => page.rows)).toEqual(expected);
+			for (const call of capture.calls) {
+				expect(call.sql).not.toMatch(/content_json|content_text|SELECT\s+\*/i);
+				const plan = sqlite
+					.query<{ detail: string }, number[]>(`EXPLAIN QUERY PLAN ${call.sql}`)
+					.all(...call.bindings);
+				expect(plan.length).toBeGreaterThan(0);
+				for (const step of plan) {
+					expect(step.detail).toMatch(/USING (?:COVERING )?INDEX idx_messages_compact_pending/);
+					expect(step.detail).not.toMatch(
+						/USE TEMP B-TREE|SCAN (?:TABLE )?narrator_messages(?:$|\s+AS)/i,
+					);
+				}
+			}
+			expect(db.select().from(narratorMessages).all()).toEqual([]);
+			expect(db.select().from(narratorMessageRefs).all()).toEqual([]);
+			expect([...info.mock.calls, ...warn.mock.calls]).toContainEqual([
+				expect.any(String),
+				expect.objectContaining({
+					batches: 3,
+					candidates: 205,
+					preserved: 0,
+					deleted: 205,
+					skipped: 0,
+					failed: 0,
+					selectionMs: expect.any(Number),
+					recoveryMs: expect.any(Number),
+					durationMs: expect.any(Number),
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			warn.mockRestore();
+			info.mockRestore();
+			capture.restore();
+		}
+	});
+
+	it("does not inspect or change ordinary history when the pending index is empty", async () => {
+		seedBase();
+		const text = "ordinary history ".repeat(128);
+		const contentJson = JSON.stringify([{ type: "text", text }]);
+		const createdAt = ts();
+		const message = sqlite.prepare(`INSERT INTO narrator_messages
+			(id, narrator_id, role, content_json, content_text, created_at)
+			VALUES (?, 'n1', 'assistant', ?, ?, ?)`);
+		const ref = sqlite.prepare(`INSERT INTO narrator_message_refs
+			(id, narrator_id, message_id, seq) VALUES (?, 'n1', ?, ?)`);
+		sqlite.transaction(() => {
+			for (let i = 0; i < 2000; i++) {
+				const id = `ordinary-${i}`;
+				message.run(id, contentJson, text, createdAt);
+				ref.run(`ref-n1-${id}`, id, i);
+			}
+		})();
+		const beforeMessages = db.select().from(narratorMessages).all();
+		const beforeRefs = db.select().from(narratorMessageRefs).all();
+		const beforeNarrator = db.select().from(narrators).all();
+		const capture = captureCompactRecoverySelections();
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await recoverStaleCompactingMessages()).toEqual({ preserved: 0, deleted: 0 });
+			expect(capture.calls).toHaveLength(1);
+			expect(capture.calls[0]).toMatchObject({ method: "get", bindings: [], rows: [] });
+			expect(capture.calls[0].sql).not.toMatch(/content_json|content_text|SELECT\s+\*/i);
+			expect([...info.mock.calls, ...warn.mock.calls]).toContainEqual([
+				expect.any(String),
+				{
+					batches: 0,
+					candidates: 0,
+					preserved: 0,
+					deleted: 0,
+					skipped: 0,
+					failed: 0,
+					selectionMs: expect.any(Number),
+					recoveryMs: 0,
+					durationMs: expect.any(Number),
+				},
+			]);
+			expect(db.select().from(narratorMessages).all()).toEqual(beforeMessages);
+			expect(db.select().from(narratorMessageRefs).all()).toEqual(beforeRefs);
+			expect(db.select().from(narrators).all()).toEqual(beforeNarrator);
+		} finally {
+			warn.mockRestore();
+			info.mockRestore();
+			capture.restore();
+		}
+	});
+
+	it.each([
+		999, 1000,
+	])("logs startup recovery at the appropriate level for %i ms", async (durationMs) => {
+		seedBase();
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const clock = spyOn(performance, "now")
+			.mockReturnValueOnce(100)
+			.mockReturnValueOnce(200)
+			.mockReturnValue(100 + durationMs);
+		try {
+			expect(await recoverStaleCompactingMessages()).toEqual({ preserved: 0, deleted: 0 });
+			const expected = durationMs >= 1000 ? warn : info;
+			const unexpected = durationMs >= 1000 ? info : warn;
+			expect(expected).toHaveBeenCalledWith(expect.any(String), {
+				batches: 0,
+				candidates: 0,
+				skipped: 0,
+				failed: 0,
+				preserved: 0,
+				deleted: 0,
+				selectionMs: 100,
+				recoveryMs: 0,
+				durationMs,
+			});
+			expect(unexpected).not.toHaveBeenCalled();
+		} finally {
+			clock.mockRestore();
+			warn.mockRestore();
+			info.mockRestore();
+		}
+	});
+
+	it("advances past failed and concurrently completed rows without revisiting them or chasing new rows", async () => {
+		seedBase();
+		seedLegacyCompactingMessages(205);
+		sqlite.run(`CREATE TEMP TRIGGER fail_one_compact_recovery BEFORE DELETE ON narrator_messages
+			WHEN OLD.id = 'legacy-98' BEGIN SELECT RAISE(ABORT, 'injected compact recovery failure'); END`);
+		let changed = false;
+		const capture = captureCompactRecoverySelections((call) => {
+			if (call.method !== "all" || changed) return;
+			changed = true;
+			// Race after enumeration but before transactional revalidation. Leave the
+			// text unchanged to prove compact_pending is independently rechecked.
+			db.update(narratorMessages)
+				.set({ contentJson: [{ type: "compact", status: "compacted", summary: "already done" }] })
+				.where(eq(narratorMessages.id, "legacy-99"))
+				.run();
+			insertMessage({
+				id: "late-pending",
+				seq: 205,
+				role: "system",
+				contentText: "[Compacting]",
+				contentJson: [{ type: "compact", status: "compacting", mode: "blocking" }],
+			});
+		});
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const error = spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			expect(await recoverStaleCompactingMessages()).toEqual({ preserved: 0, deleted: 203 });
+			const selected = capture.calls
+				.filter((call) => call.method === "all")
+				.flatMap((call) => call.rows);
+			expect(selected).toHaveLength(205);
+			expect(new Set(selected.map((row) => row.id)).size).toBe(205);
+			expect(selected.some((row) => row.id === "late-pending")).toBe(false);
+			expect(
+				error.mock.calls.filter(
+					([message]) => message === "Failed to recover stale compacting message",
+				),
+			).toEqual([
+				[
+					"Failed to recover stale compacting message",
+					{
+						messageId: "legacy-98",
+						error: expect.stringContaining("injected compact recovery failure"),
+					},
+				],
+			]);
+			expect([...info.mock.calls, ...warn.mock.calls]).toContainEqual([
+				expect.any(String),
+				expect.objectContaining({
+					batches: 3,
+					candidates: 205,
+					skipped: 1,
+					failed: 1,
+					preserved: 0,
+					deleted: 203,
+				}),
+			]);
+			expect(
+				db
+					.select({ id: narratorMessages.id })
+					.from(narratorMessages)
+					.all()
+					.map((row) => row.id)
+					.sort(),
+			).toEqual(["late-pending", "legacy-98", "legacy-99"]);
+			expect(
+				db
+					.select({ messageId: narratorMessageRefs.messageId })
+					.from(narratorMessageRefs)
+					.all()
+					.map((row) => row.messageId)
+					.sort(),
+			).toEqual(["late-pending", "legacy-98", "legacy-99"]);
+			sqlite.run("DROP TRIGGER fail_one_compact_recovery");
+			expect(await recoverStaleCompactingMessages()).toEqual({ preserved: 0, deleted: 2 });
+			const completed = db.select().from(narratorMessages).all();
+			const refs = db.select().from(narratorMessageRefs).all();
+			const narrator = db.select().from(narrators).all();
+			expect(completed).toHaveLength(1);
+			expect(completed[0]).toMatchObject({ id: "legacy-99", compactPending: 0 });
+			expect(await recoverStaleCompactingMessages()).toEqual({ preserved: 0, deleted: 0 });
+			expect(db.select().from(narratorMessages).all()).toEqual(completed);
+			expect(db.select().from(narratorMessageRefs).all()).toEqual(refs);
+			expect(db.select().from(narrators).all()).toEqual(narrator);
+		} finally {
+			sqlite.run("DROP TRIGGER IF EXISTS fail_one_compact_recovery");
+			error.mockRestore();
+			warn.mockRestore();
+			info.mockRestore();
+			capture.restore();
+		}
+	});
+
+	it("leaves mismatched pending rows, terminal markers and text-only placeholders unchanged", async () => {
+		seedBase();
+		const fixtures = [
+			{
+				id: "wrong-role",
+				role: "assistant" as const,
+				contentText: "[Compacting]",
+				contentJson: [{ type: "compact", status: "compacting" }],
+			},
+			{
+				id: "wrong-text",
+				contentText: "unrelated text",
+				contentJson: [{ type: "compact", status: "compacting" }],
+			},
+			{
+				id: "failed",
+				contentText: "[Compacting]",
+				contentJson: [{ type: "compact", status: "failed" }],
+			},
+			{
+				id: "completed",
+				contentText: "[Compacting]",
+				contentJson: [{ type: "compact", status: "compacted" }],
+			},
+			{
+				id: "text-only",
+				contentText: "[Compacting]",
+				contentJson: [{ type: "text", text: "[Compacting]" }],
+			},
+		];
+		for (const [seq, fixture] of fixtures.entries())
+			insertMessage({ role: "system", seq, ...fixture });
+		const before = db.select().from(narratorMessages).all();
+		const refs = db.select().from(narratorMessageRefs).all();
+		const narrator = db.select().from(narrators).all();
+		expect(
+			before
+				.filter((row) => row.compactPending === 1)
+				.map((row) => row.id)
+				.sort(),
+		).toEqual(["wrong-role", "wrong-text"]);
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			for (let attempt = 0; attempt < 2; attempt++) {
+				expect(await recoverStaleCompactingMessages()).toEqual({ preserved: 0, deleted: 0 });
+				expect(db.select().from(narratorMessages).all()).toEqual(before);
+				expect(db.select().from(narratorMessageRefs).all()).toEqual(refs);
+				expect(db.select().from(narrators).all()).toEqual(narrator);
+			}
+			const summaries = [...info.mock.calls, ...warn.mock.calls].filter(
+				([, data]) => data?.candidates !== undefined,
+			);
+			expect(summaries).toHaveLength(2);
+			for (const [, data] of summaries) {
+				expect(data).toMatchObject({
+					batches: 1,
+					candidates: 2,
+					skipped: 2,
+					failed: 0,
+					preserved: 0,
+					deleted: 0,
+				});
+			}
+		} finally {
+			warn.mockRestore();
+			info.mockRestore();
+		}
 	});
 
 	it("preserves retry attempts and fails the running attempt during startup recovery", async () => {

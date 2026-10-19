@@ -46,6 +46,7 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -72,6 +73,7 @@ import {
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
+import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -101,6 +103,7 @@ import {
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
+import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
@@ -173,12 +176,19 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { usageSourceFor } from "./model/custom-api-usage-source";
+import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import {
+	formatOpencodeBarText,
+	formatOpencodeDetailsText,
+	isOpencodeProviderBaseUrl,
+} from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -736,6 +746,55 @@ function NarratorPanelBody({
 		refetchInterval: 60_000,
 	});
 
+	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
+	// generation token so an allowance fetched for a replaced account is never shown.
+	// The current window lives in the status bar; weekly/monthly are in the popover.
+	const currentOpencodeProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const opencodeGeneration = currentOpencodeProviderId
+		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
+		: undefined;
+	const opencodeUsageQuery = useOpencodeUsage(
+		currentOpencodeProviderId,
+		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
+		firstScreenActivity,
+	);
+
+	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
+	// generation so a balance fetched for a replaced account is never shown.
+	const currentDeepSeekProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const deepseekGeneration = currentDeepSeekProviderId
+		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
+		: undefined;
+	const deepseekBalancesQuery = useDeepSeekBalance(
+		currentDeepSeekProviderId,
+		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
+		firstScreenActivity,
+	);
+
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
 	const activeTerminalCount = useMemo(
@@ -756,6 +815,7 @@ function NarratorPanelBody({
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
 				fileReferences?: FileReference[];
+				composerDocument?: import("@shared/composer-document").ComposerDocument;
 			},
 		): Promise<boolean> => {
 			if (!rollbackEditRegenerateSupported) {
@@ -894,8 +954,29 @@ function NarratorPanelBody({
 		updateAttachedTextFiles,
 		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
+		reconcileDocumentAssets,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
+		retryAttachmentRestore,
+		restoredAttachmentResources,
 	} = useComposerAttachments({ narratorId, currentUserId, sendingRef, t });
 
+	// Composer file ingestion (image/text validation + resize, file picker, paste
+	// bridge, and the whole-panel dropzone handlers). The dropzone stays wired to
+	// the panel root below, so the hook is called here rather than sunk into a child.
+	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps, ingestingRef } =
+		useComposerFileIngest({
+			narratorId,
+			sendingRef,
+			updateAttachedImages,
+			updateAttachedTextFiles,
+			setIsDragging,
+			dragCounterRef,
+			captureInsertion: (origin) => composerRef.current?.captureAttachmentInsertion(origin),
+			onAcceptedFiles: (files, bookmark) =>
+				composerRef.current?.insertAcceptedFiles(files, bookmark) ?? false,
+			t,
+		});
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
@@ -1081,14 +1162,40 @@ function NarratorPanelBody({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
+		if (cfg.id === currentDeepSeekProviderId) {
+			return {
+				providerId: cfg.id,
+				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
+			};
+		}
+		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
+		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
+		// Go one would otherwise fall through to the previous account's Kimi allowance.
+		const usageSource = usageSourceFor({
+			providerId: cfg.id,
+			opencodeProviderId: currentOpencodeProviderId,
+			kimiProviderId: currentKimiProviderId,
+		});
+		if (usageSource === "opencode") {
+			const usage = opencodeUsageQuery.data;
+			if (usage) {
+				const quotaBalance = formatOpencodeBarText(usage, t);
+				const detailedQuotaBalance = formatOpencodeDetailsText(usage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
+			}
+		}
 		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
 		// in the details popover) instead of the generic relay quota string.
-		const kimiUsage = kimiUsagesData?.[cfg.id];
-		if (kimiUsage) {
-			const quotaBalance = formatKimiBarText(kimiUsage, t);
-			const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
-			if (quotaBalance || detailedQuotaBalance) {
-				return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+		if (usageSource === "kimi") {
+			const kimiUsage = kimiUsagesData?.[cfg.id];
+			if (kimiUsage) {
+				const quotaBalance = formatKimiBarText(kimiUsage, t);
+				const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
 			}
 		}
 		const quotas = settingsData?.customApiQuotas as
@@ -1107,6 +1214,12 @@ function NarratorPanelBody({
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
 		kimiUsagesData,
+		currentKimiProviderId,
+		currentOpencodeProviderId,
+		opencodeUsageQuery.data,
+		currentDeepSeekProviderId,
+		deepseekBalancesQuery.data,
+		deepseekBalancesQuery.isError,
 		t,
 	]);
 
@@ -1958,10 +2071,7 @@ function NarratorPanelBody({
 				return;
 			}
 			if (scope === "personal") {
-				navigate({
-					to: "/knowledge/personal/$personalEntryId",
-					params: { personalEntryId: entryId },
-				});
+				navigate(knowledgePersonalEntryDestination(entryId));
 				return;
 			}
 			navigate({ to: "/knowledge/$entryId", params: { entryId } });
@@ -2488,6 +2598,9 @@ function NarratorPanelBody({
 	} = useNarratorSend({
 		narratorId,
 		composerRef,
+		ingestingRef,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
 		attachedImagesRef,
@@ -2559,19 +2672,6 @@ function NarratorPanelBody({
 			onAllowRetry: handleAllowRetryToolCall,
 		}),
 		[narratorIsIdle, allowRetryLatestAssistantMessageId, handleAllowRetryToolCall],
-	);
-
-	// Composer file ingestion (image/text validation + resize, file picker, paste
-	// bridge, and the whole-panel dropzone handlers). The dropzone stays wired to
-	// the panel root below, so the hook is called here rather than sunk into a child.
-	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps } = useComposerFileIngest(
-		{
-			updateAttachedImages,
-			updateAttachedTextFiles,
-			setIsDragging,
-			dragCounterRef,
-			t,
-		},
 	);
 
 	/*
@@ -3362,8 +3462,13 @@ function NarratorPanelBody({
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
+						attachmentsHydrating={attachmentsHydrating}
+						attachmentsRestoreFailed={attachmentsRestoreFailed}
+						onRetryAttachments={retryAttachmentRestore}
+						restoredAttachmentResources={restoredAttachmentResources}
 						updateAttachedImages={updateAttachedImages}
 						updateAttachedTextFiles={updateAttachedTextFiles}
+						reconcileDocumentAssets={reconcileDocumentAssets}
 						sendingState={sendingState}
 						cancelSending={cancelSending}
 						queueDeps={{

@@ -17,9 +17,13 @@
 
 import { Database } from "bun:sqlite";
 import {
+	collectSessionAggregateStats,
 	loadScanContext,
+	measurementContextFromSnapshot,
 	measureTable,
 	type ScanTableRef,
+	scanDatabaseObjectStorage,
+	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
@@ -27,7 +31,10 @@ import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
 	DbWorkerOutbound,
+	StorageScanCleanupSummariesParams,
+	StorageScanCleanupSummariesResult,
 	StorageScanContextResult,
+	StorageScanTablesParams,
 	StorageScanTablesResult,
 } from "./protocol";
 import { runSearchQuery } from "./search-query";
@@ -77,18 +84,24 @@ function runStorageScanContext(dbPath: string): StorageScanContextResult {
 function runStorageScanTables(
 	dbPath: string,
 	requestId: string,
-	tableNames: string[],
+	params: StorageScanTablesParams,
+	signal: AbortSignal,
 ): StorageScanTablesResult {
 	const sqlite = getConnection(dbPath);
-	// Re-read the schema context in this thread: index/dbstat maps are connection-scoped and
-	// cheap (pragmas + two schema queries, no table data).
-	const context = loadScanContext(sqlite);
+	// A snapshot from the context task already walked dbstat. Loading it again would repeat that
+	// full page scan once per shard.
+	const context = params.context
+		? measurementContextFromSnapshot(params.context)
+		: loadScanContext(sqlite);
 	const byName = new Map(context.tables.map((table) => [table.name, table]));
-	const wanted: ScanTableRef[] = tableNames
+	const wanted: ScanTableRef[] = params.tableNames
 		.map((name) => byName.get(name))
 		.filter((table): table is ScanTableRef => Boolean(table));
 
-	const tables = wanted.map((table, index) => {
+	const tables: StorageScanTablesResult["tables"] = [];
+	for (const [index, table] of wanted.entries()) {
+		// A running statement cannot be interrupted. Stop before the next table.
+		if (signal.aborted) throw new Error("storage scan aborted");
 		const summary = measureTable(sqlite, table, context);
 		post({
 			type: "progress",
@@ -97,9 +110,44 @@ function runStorageScanTables(
 			done: index + 1,
 			total: wanted.length,
 		});
-		return summary;
-	});
+		tables.push(summary);
+	}
 	return { tables };
+}
+
+function runStorageScanSerial(
+	dbPath: string,
+	requestId: string,
+	mainBytes: number,
+	signal: AbortSignal,
+) {
+	const sqlite = getConnection(dbPath);
+	return scanDatabaseObjectStorage(sqlite, mainBytes, {
+		onTableMeasured: (tableName, index, total) => {
+			if (signal.aborted) throw new Error("storage scan aborted");
+			post({ type: "progress", requestId, tableName, done: index, total });
+		},
+	});
+}
+
+function runStorageScanCleanupSummaries(
+	dbPath: string,
+	params: StorageScanCleanupSummariesParams,
+): StorageScanCleanupSummariesResult {
+	const sqlite = getConnection(dbPath);
+	return {
+		archivedApproxBytes: collectSessionAggregateStats(
+			sqlite,
+			params.archivedNarratorIds,
+			params.relations,
+		).approxBytes,
+		staleApproxBytes: collectSessionAggregateStats(
+			sqlite,
+			params.staleNarratorIds,
+			params.relations,
+		).approxBytes,
+		toolCalls: summarizeToolCallPayloads(sqlite, params.toolCallCutoffIso),
+	};
 }
 
 const activeTasks = new Map<string, AbortController>();
@@ -129,26 +177,37 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	const controller = new AbortController();
 	activeTasks.set(message.requestId, controller);
 	try {
+		const params = message.params;
 		const result =
-			message.params.kind === "displayPageMessagesPostgres"
+			params.kind === "displayPageMessagesPostgres"
 				? await runPostgresDisplayPageQuery(
 						message.dbPath,
-						{ ...message.params, kind: "displayPageMessages" },
+						{ ...params, kind: "displayPageMessages" },
 						controller.signal,
 					)
-				: message.params.kind === "displayPageMessages"
-					? runDisplayPageQuery(getConnection(message.dbPath), message.params)
-					: message.params.kind === "searchQuery"
-						? runSearchQuery(getConnection(message.dbPath), message.params)
-						: message.params.kind === "usageHistoryQuery"
-							? runUsageHistoryQuery(getConnection(message.dbPath), message.params)
-							: message.params.kind === "storageScanContext"
+				: params.kind === "displayPageMessages"
+					? runDisplayPageQuery(getConnection(message.dbPath), params)
+					: params.kind === "searchQuery"
+						? runSearchQuery(getConnection(message.dbPath), params)
+						: params.kind === "usageHistoryQuery"
+							? runUsageHistoryQuery(getConnection(message.dbPath), params)
+							: params.kind === "storageScanContext"
 								? runStorageScanContext(message.dbPath)
-								: runStorageScanTables(
-										message.dbPath,
-										message.requestId,
-										message.params.tableNames,
-									);
+								: params.kind === "storageScanSerial"
+									? runStorageScanSerial(
+											message.dbPath,
+											message.requestId,
+											params.mainBytes,
+											controller.signal,
+										)
+									: params.kind === "storageScanCleanupSummaries"
+										? runStorageScanCleanupSummaries(message.dbPath, params)
+										: runStorageScanTables(
+												message.dbPath,
+												message.requestId,
+												params,
+												controller.signal,
+											);
 		post({
 			type: "result",
 			requestId: message.requestId,

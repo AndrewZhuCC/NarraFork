@@ -240,8 +240,9 @@ process.send = (message) => {
  * in flight. Progress is throttled to one event per 250 ms in the worker AND again in the parent,
  * so on a loaded runner a 2 MiB hash can finish, or its physical event be dropped, before a test's
  * onProgress mutation ever runs. Instead, the worker's preload pauses right after it emits its
- * first physical progress with readBytes > 0 (object handle open mid-hash) and records that in a
- * marker file. `held` resolves from the marker, independent of the parent's progress throttle.
+ * first physical progress with readBytes > 0 (object handle open mid-hash) and records that in an
+ * atomically published marker file. `held` resolves from the marker, independent of the parent's
+ * progress throttle; it must never observe an empty file between creation and writing its bytes.
  * Hashing, metadata, budgets and the summary are untouched; only the emission is gated, like the
  * metadata barrier above. Once released, every later worker runs free.
  */
@@ -253,15 +254,18 @@ async function withPhysicalBarrier<T>(
 	await rm(marker, { force: true });
 	await writeFile(
 		preload,
-		`import { readFileSync, writeFileSync } from "node:fs";
+		`import { readFileSync, renameSync, writeFileSync } from "node:fs";
 const send = process.send.bind(process);
+const pendingMarker = ${JSON.stringify(`${marker}.pending-`)} + process.pid;
 let paused = false;
 process.send = (message) => {
 	const data = typeof message === "string" ? JSON.parse(message) : undefined;
 	send(message);
 	if (!paused && data?.type === "progress" && data.value.phase === "physical" && data.value.readBytes > 0) {
 		paused = true;
-		writeFileSync(${JSON.stringify(marker)}, String(data.value.readBytes), { mode: 0o600 });
+		// Publish only complete bytes: the parent's concurrent read must not see Number("") === 0.
+		writeFileSync(pendingMarker, String(data.value.readBytes), { mode: 0o600 });
+		renameSync(pendingMarker, ${JSON.stringify(marker)});
 		if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test physical barrier");
 	}
 };
@@ -821,10 +825,17 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		const request = await options({ budget: { chunkBytes: 128 } });
 		const summary = await withPhysicalBarrier(async ({ held, release }) => {
 			const running = auditFileChangePhysical(request);
-			expect(await held).toBeGreaterThan(0);
-			changed = true;
+			const readBytes = await held;
+			expect(readBytes).toBeGreaterThan(0);
+			expect(readBytes).toBeLessThan(ref.sizeBytes);
 			try {
+				const before = await identity(pathFor(ref));
 				utimesSync(pathFor(ref), new Date(), new Date(Date.now() + 5000));
+				const after = await identity(pathFor(ref));
+				expect(after.ino).toBe(before.ino);
+				expect(after.sizeBytes).toBe(before.sizeBytes);
+				expect(after.mtimeNs).not.toBe(before.mtimeNs);
+				changed = true;
 			} finally {
 				release();
 			}

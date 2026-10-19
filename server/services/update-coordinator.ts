@@ -1,7 +1,10 @@
 import {
+	closeSync,
 	existsSync,
+	fstatSync,
 	mkdirSync,
-	readFileSync,
+	openSync,
+	readSync,
 	renameSync,
 	unlinkSync,
 	writeFileSync,
@@ -10,6 +13,26 @@ import { join } from "node:path";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
+import {
+	bindRecoveryHandoffEpoch,
+	getRecoveryHandoffSources,
+	getRegisteredRecoveryManifestIdentity,
+	getRegisteredRecoverySource,
+	hasReservedRecoverySourceEpoch,
+	invalidateRecoveryTarget,
+	isRecoveryAdvanceActive,
+	MAX_RECOVERY_MANIFEST_BYTES,
+	MAX_RECOVERY_TARGETS,
+	normalizeRecoverySources,
+	type RecoveryHandoffTicket,
+	type RecoverySource,
+	releaseRecoveryHandoff,
+	reserveRecoveryHandoff,
+	resetRecoveryHandoffForTests,
+	waitForRecoveryHandoffReady,
+} from "./recovery-handoff";
+
+export type { RecoverySource } from "./recovery-handoff";
 
 export type UpdatePhase = "idle" | "draining_background_bash" | "quiescing_tools" | "restarting";
 export type UpdateExecutionKind = "background_bash" | "ordinary" | "resumable";
@@ -54,7 +77,8 @@ export interface NarratorRecoveryTarget {
 }
 
 export interface PlannedUpdateRecoverySnapshot {
-	version: 2;
+	version: 2 | 3;
+	sources?: RecoverySource[];
 	updateEpoch: string;
 	targetVersion?: string;
 	capturedAt: string;
@@ -82,7 +106,8 @@ export interface PlannedUpdateRecoverySnapshot {
 }
 
 interface WritablePlannedUpdateRecoverySnapshot {
-	version: 1 | 2;
+	version: 1 | 2 | 3;
+	sources?: RecoverySource[];
 	updateEpoch?: string;
 	targetVersion?: string;
 	capturedAt: string;
@@ -191,6 +216,18 @@ interface CheckpointActivityRecord {
 
 const UPDATE_DIR = getNarraforkPath("updates");
 const RECOVERY_SNAPSHOT_PATH = join(UPDATE_DIR, "planned-update-recovery.json");
+const scheduledHandoff = hotSafe("update-recovery-handoff-v1", () => ({
+	current: undefined as
+		| {
+				ticket: RecoveryHandoffTicket;
+				epoch: string;
+				original: string | undefined;
+				published: string | undefined;
+				ready?: boolean;
+				cancellation: AbortController;
+		  }
+		| undefined,
+}));
 
 const state = hotSafe<CoordinatorState>("narrafork.updateCoordinator.state", () => ({
 	phase: "idle",
@@ -472,6 +509,7 @@ export function cancelScheduledUpdate(reason?: string): boolean {
 			blockers: collectBlockers(Date.now()),
 		});
 	}
+	scheduledHandoff.current?.cancellation.abort();
 	const error = cancellationError();
 	if (error) cancelCoordinationWaiters(error);
 	return true;
@@ -765,6 +803,7 @@ export function registerNarratorLoop(
 	locale: string,
 	options: { userId?: string | null; replyInUserLanguage?: boolean } = {},
 ): () => void {
+	invalidateRecoveryTarget(narratorId);
 	const token = generateToken("loop");
 	narratorLoops.set(token, {
 		narratorId,
@@ -784,12 +823,57 @@ export function registerNarratorLoop(
 export function scheduleUpdate(
 	targetVersion?: string,
 	operation: "update" | "system_shutdown" = "update",
+	options: { supportedRecoveryManifestVersions?: readonly number[] } = {},
 ): UpdateCoordinationStatus {
 	if (state.phase !== "idle") return resolveStatus();
+	const ticket = reserveRecoveryHandoff();
+	let recoverySourceEpochs: string[];
+	try {
+		const original = readRecoverySnapshotText();
+		if (original !== undefined) {
+			const root = parsePlannedUpdateRecoverySnapshot(JSON.parse(original));
+			const claimed = root && getRegisteredRecoverySource(root.updateEpoch);
+			if (
+				!root ||
+				!claimed ||
+				claimed.kind !== "planned" ||
+				claimed.capturedAt !== root.capturedAt ||
+				JSON.stringify(claimed.narrators) !== JSON.stringify(root.narrators) ||
+				getRegisteredRecoveryManifestIdentity(root.updateEpoch) !== JSON.stringify(root)
+			) {
+				throw new Error("Recovery manifest is corrupt, unknown, or not claimed by this process");
+			}
+			for (const source of root.sources ?? []) {
+				const registered = getRegisteredRecoverySource(source.updateEpoch);
+				if (!registered || JSON.stringify(registered) !== JSON.stringify(source))
+					throw new Error("Recovery source lineage is not claimed by this process");
+			}
+		}
+		const sources = getRecoveryHandoffSources(ticket);
+		recoverySourceEpochs = sources.map((source) => source.updateEpoch);
+		if (
+			sources.length &&
+			operation !== "system_shutdown" &&
+			!options.supportedRecoveryManifestVersions?.includes(3)
+		)
+			throw new Error("Target binary does not support recovery manifest v3");
+		const epoch = generateUpdateEpoch();
+		bindRecoveryHandoffEpoch(ticket, epoch);
+		scheduledHandoff.current = {
+			ticket,
+			epoch,
+			original,
+			published: undefined,
+			cancellation: new AbortController(),
+		};
+	} catch (error) {
+		releaseRecoveryHandoff(ticket);
+		throw error;
+	}
 	state.operation = operation;
 	state.phase = "draining_background_bash";
 	state.targetVersion = targetVersion;
-	state.updateEpoch = generateUpdateEpoch();
+	state.updateEpoch = scheduledHandoff.current?.epoch;
 	state.error = undefined;
 	state.errorKind = undefined;
 	// A cancellation belongs to the epoch that was cancelled; never inherit it.
@@ -798,6 +882,8 @@ export function scheduleUpdate(
 	logger.info("Update scheduled; draining background Bash executions", {
 		targetVersion,
 		updateEpoch: state.updateEpoch,
+		// Logging must not re-read source files after committing the schedule.
+		recoverySourceEpochs,
 		pendingBackgroundBashCount: countExecutions("background_bash"),
 		pendingOrdinaryExecutionCount: countExecutions("ordinary"),
 		resumableExecutionCount: countExecutions("resumable"),
@@ -880,6 +966,19 @@ export function failScheduledUpdate(
 	error: string,
 	options: { cancelled?: boolean } = {},
 ): UpdateCoordinationStatus {
+	const handoff = scheduledHandoff.current;
+	if (handoff) {
+		if (
+			handoff.published !== undefined &&
+			getRecoveryHandoffSources(handoff.ticket).length === 0 &&
+			readRecoverySnapshotText() === handoff.published &&
+			parsePlannedUpdateRecoverySnapshot(JSON.parse(handoff.published))?.evidenceOnly === true
+		) {
+			// Legacy no-source failure evidence is not an authorization and remains on disk.
+			releaseRecoveryHandoff(handoff.ticket);
+			scheduledHandoff.current = undefined;
+		} else releasePreparedUpdateRecoveryHandoff(handoff.epoch);
+	}
 	state.phase = "idle";
 	state.operation = undefined;
 	state.targetVersion = undefined;
@@ -911,8 +1010,10 @@ export function capturePlannedUpdateRecoverySnapshot(): PlannedUpdateRecoverySna
 		targets.set(record.narratorId, { narratorId: record.narratorId, locale: "en" });
 	}
 
+	const sources = getScheduledRecoverySources();
 	return {
-		version: 2,
+		version: sources.length ? 3 : 2,
+		...(sources.length ? { sources } : {}),
 		updateEpoch: state.updateEpoch ?? generateUpdateEpoch(),
 		targetVersion: state.targetVersion,
 		capturedAt: new Date().toISOString(),
@@ -921,7 +1022,24 @@ export function capturePlannedUpdateRecoverySnapshot(): PlannedUpdateRecoverySna
 }
 
 function parseNarrators(value: unknown): NarratorRecoveryTarget[] | null {
-	if (!Array.isArray(value)) return null;
+	if (!Array.isArray(value) || value.length > MAX_RECOVERY_TARGETS) return null;
+	const ids = new Set<string>();
+	if (
+		value.some(
+			(entry) =>
+				!entry ||
+				typeof entry !== "object" ||
+				typeof entry.narratorId !== "string" ||
+				!entry.narratorId ||
+				typeof entry.locale !== "string" ||
+				(entry.userId !== undefined && entry.userId !== null && typeof entry.userId !== "string") ||
+				(entry.replyInUserLanguage !== undefined &&
+					typeof entry.replyInUserLanguage !== "boolean") ||
+				ids.has(entry.narratorId) ||
+				!ids.add(entry.narratorId),
+		)
+	)
+		return null;
 	return value.flatMap((entry) => {
 		if (
 			!entry ||
@@ -951,18 +1069,48 @@ export function parsePlannedUpdateRecoverySnapshot(
 	value: unknown,
 ): PlannedUpdateRecoverySnapshot | null {
 	if (!value || typeof value !== "object") return null;
+	try {
+		if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_RECOVERY_MANIFEST_BYTES) return null;
+	} catch {
+		return null;
+	}
 	const parsed = value as Partial<WritablePlannedUpdateRecoverySnapshot>;
-	if (parsed.version !== 1 && parsed.version !== 2) return null;
+	if (
+		typeof parsed.capturedAt !== "string" ||
+		!parsed.capturedAt ||
+		(parsed.targetVersion !== undefined && typeof parsed.targetVersion !== "string") ||
+		(parsed.handoffMarkerNonce !== undefined &&
+			(typeof parsed.handoffMarkerNonce !== "string" || !parsed.handoffMarkerNonce)) ||
+		[parsed.resumeOnNextStartup, parsed.evidenceOnly].some(
+			(flag) => flag !== undefined && typeof flag !== "boolean",
+		)
+	)
+		return null;
+	if (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) return null;
 	const narrators = parseNarrators(parsed.narrators);
 	if (!narrators) return null;
-	if (parsed.version === 2 && typeof parsed.updateEpoch !== "string") return null;
-	const capturedAt =
-		typeof parsed.capturedAt === "string" ? parsed.capturedAt : new Date().toISOString();
+	if (parsed.version !== 1 && (typeof parsed.updateEpoch !== "string" || !parsed.updateEpoch))
+		return null;
+	if (parsed.version !== 3 && parsed.sources !== undefined) return null;
+	let sources: RecoverySource[] = [];
+	try {
+		sources = parsed.version === 3 ? normalizeRecoverySources(parsed.sources) : [];
+	} catch {
+		return null;
+	}
+	if (
+		sources.some((source) => source.updateEpoch === parsed.updateEpoch) ||
+		sources.reduce((total, source) => total + source.narrators.length, narrators.length) >
+			MAX_RECOVERY_TARGETS
+	)
+		return null;
+	const capturedAt = parsed.capturedAt;
 
 	return {
-		version: 2,
+		version: sources.length ? 3 : 2,
+		...(sources.length ? { sources } : {}),
 		updateEpoch:
-			parsed.version === 2
+			parsed.version !== 1
 				? (parsed.updateEpoch as string)
 				: `legacy_${capturedAt.replace(/[^a-zA-Z0-9]/g, "_")}`,
 		targetVersion: typeof parsed.targetVersion === "string" ? parsed.targetVersion : undefined,
@@ -976,12 +1124,32 @@ export function parsePlannedUpdateRecoverySnapshot(
 	};
 }
 
+function readRecoverySnapshotText(): string | undefined {
+	if (!existsSync(RECOVERY_SNAPSHOT_PATH)) return undefined;
+	const fd = openSync(RECOVERY_SNAPSHOT_PATH, "r");
+	try {
+		const size = fstatSync(fd).size;
+		if (size > MAX_RECOVERY_MANIFEST_BYTES)
+			throw new Error("Recovery manifest exceeds 4 MiB limit");
+		const buffer = Buffer.alloc(size + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const read = readSync(fd, buffer, length, buffer.length - length, null);
+			if (!read) break;
+			length += read;
+		}
+		if (length > size) throw new Error("Recovery manifest changed size during bounded read");
+		return buffer.subarray(0, length).toString("utf8");
+	} finally {
+		closeSync(fd);
+	}
+}
+
 function readExistingRecoverySnapshotEpoch(): string | undefined {
 	if (!existsSync(RECOVERY_SNAPSHOT_PATH)) return undefined;
 	try {
-		return parsePlannedUpdateRecoverySnapshot(
-			JSON.parse(readFileSync(RECOVERY_SNAPSHOT_PATH, "utf8")),
-		)?.updateEpoch;
+		return parsePlannedUpdateRecoverySnapshot(JSON.parse(readRecoverySnapshotText() ?? "null"))
+			?.updateEpoch;
 	} catch {
 		return undefined;
 	}
@@ -1021,9 +1189,12 @@ export function writePlannedUpdateRecoverySnapshot(
 	snapshot: WritablePlannedUpdateRecoverySnapshot = capturePlannedUpdateRecoverySnapshot(),
 	guard: Partial<RecoveryManifestEpochGuard> = {},
 ): PlannedUpdateRecoverySnapshot {
+	if (![1, 2, 3].includes(snapshot.version))
+		throw new Error("Unsupported recovery manifest version");
 	const normalized = parsePlannedUpdateRecoverySnapshot({
 		...snapshot,
-		version: 2,
+		version: snapshot.sources?.length ? 3 : 2,
+		...(snapshot.sources?.length ? {} : { sources: undefined }),
 		updateEpoch: snapshot.updateEpoch ?? state.updateEpoch ?? generateUpdateEpoch(),
 		handoffMarkerNonce: guard.handoffMarkerNonce ?? snapshot.handoffMarkerNonce,
 	});
@@ -1046,10 +1217,22 @@ export function writePlannedUpdateRecoverySnapshot(
 		throw new RecoveryManifestEpochConflictError(existingEpoch ?? null, normalized.updateEpoch);
 	}
 
-	mkdirSync(UPDATE_DIR, { recursive: true });
-	const tempPath = `${RECOVERY_SNAPSHOT_PATH}.${process.pid}.${Date.now()}.tmp`;
-	writeFileSync(tempPath, JSON.stringify(normalized, null, 2));
-	renameSync(tempPath, RECOVERY_SNAPSHOT_PATH);
+	if (manifestExists) {
+		const existing = parsePlannedUpdateRecoverySnapshot(
+			JSON.parse(readRecoverySnapshotText() ?? "null"),
+		);
+		if (
+			existing?.sources?.length &&
+			JSON.stringify(existing.sources) !== JSON.stringify(normalized.sources)
+		)
+			throw new Error("Ordinary recovery write cannot alter inherited sources");
+	}
+	if (hasReservedRecoverySourceEpoch(normalized.updateEpoch))
+		throw new Error("Recovery source manifest is reserved");
+	const text = JSON.stringify(normalized, null, 2);
+	atomicWriteRecoveryText(text);
+	if (scheduledHandoff.current?.epoch === normalized.updateEpoch)
+		scheduledHandoff.current.published = text;
 	logger.info("Planned update recovery snapshot written", {
 		path: RECOVERY_SNAPSHOT_PATH,
 		updateEpoch: normalized.updateEpoch,
@@ -1058,12 +1241,166 @@ export function writePlannedUpdateRecoverySnapshot(
 	return normalized;
 }
 
+function atomicWriteRecoveryText(text: string): void {
+	if (Buffer.byteLength(text, "utf8") > MAX_RECOVERY_MANIFEST_BYTES)
+		throw new Error("Recovery manifest exceeds 4 MiB limit");
+	mkdirSync(UPDATE_DIR, { recursive: true });
+	const tempPath = `${RECOVERY_SNAPSHOT_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	try {
+		writeFileSync(tempPath, text, { flag: "wx" });
+		renameSync(tempPath, RECOVERY_SNAPSHOT_PATH);
+	} finally {
+		try {
+			unlinkSync(tempPath);
+		} catch {
+			/* renamed or no temp was written */
+		}
+	}
+}
+
+export async function waitForScheduledRecoveryHandoff(
+	options: { signal?: AbortSignal } = {},
+): Promise<void> {
+	const handoff = scheduledHandoff.current;
+	if (!handoff || handoff.epoch !== state.updateEpoch)
+		throw new Error("No scheduled recovery handoff");
+	assertUpdateNotCancelled();
+	if (handoff.ready) return;
+	const startedAt = Date.now();
+	try {
+		const signal = options.signal
+			? AbortSignal.any([options.signal, handoff.cancellation.signal])
+			: handoff.cancellation.signal;
+		await waitForRecoveryHandoffReady(handoff.ticket, { signal });
+		assertUpdateNotCancelled();
+		const current = readRecoverySnapshotText();
+		if (current !== handoff.original) {
+			const original =
+				handoff.original && parsePlannedUpdateRecoverySnapshot(JSON.parse(handoff.original));
+			if (current === undefined && original && !getRegisteredRecoverySource(original.updateEpoch))
+				handoff.original = undefined;
+			else throw new Error("Recovery manifest changed while waiting for the short barrier");
+		}
+		handoff.ready = true;
+		const elapsedMs = Date.now() - startedAt;
+		if (elapsedMs >= 1000)
+			logger.warn("Recovery handoff short barrier was slow", {
+				updateEpoch: handoff.epoch,
+				elapsedMs,
+				sourceCount: getRecoveryHandoffSources(handoff.ticket).length,
+			});
+	} catch (error) {
+		logger.warn("Recovery handoff short barrier failed", {
+			updateEpoch: handoff.epoch,
+			elapsedMs: Date.now() - startedAt,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		// This wait occurs before publication; cancellation/timeout unpins only this reservation.
+		try {
+			releaseRecoveryHandoff(handoff.ticket);
+		} catch {
+			/* timeout/abort already released it */
+		}
+		if (scheduledHandoff.current === handoff) scheduledHandoff.current = undefined;
+		throw cancellationError() ?? error;
+	}
+}
+
+export function getScheduledRecoverySources(): RecoverySource[] {
+	return scheduledHandoff.current ? getRecoveryHandoffSources(scheduledHandoff.current.ticket) : [];
+}
+export function getScheduledRecoveryEpochs(): readonly string[] {
+	return state.updateEpoch
+		? [state.updateEpoch, ...getScheduledRecoverySources().map((source) => source.updateEpoch)]
+		: [];
+}
+
+export function writePreparedUpdateRecoverySnapshot(
+	snapshot: WritablePlannedUpdateRecoverySnapshot = capturePlannedUpdateRecoverySnapshot(),
+	guard: Partial<RecoveryManifestEpochGuard> = {},
+): PlannedUpdateRecoverySnapshot {
+	const handoff = scheduledHandoff.current;
+	if (!handoff || handoff.epoch !== state.updateEpoch || snapshot.updateEpoch !== handoff.epoch)
+		throw new Error("Prepared recovery handoff epoch mismatch");
+	if (!handoff.ready)
+		throw new Error("Prepared recovery handoff has not reached its short barrier");
+	const sources = getRecoveryHandoffSources(handoff.ticket);
+	const incomingSources = normalizeRecoverySources(snapshot.sources ?? []);
+	if (incomingSources.length !== sources.length)
+		throw new Error("Prepared recovery sources do not match the reserved scope");
+	for (const source of sources) {
+		const incoming = incomingSources.find(
+			(candidate) => candidate.updateEpoch === source.updateEpoch,
+		);
+		if (
+			!incoming ||
+			JSON.stringify({ ...incoming, unstartedTools: undefined }) !==
+				JSON.stringify({ ...source, unstartedTools: undefined })
+		)
+			throw new Error("Prepared recovery source metadata changed outside the reservation");
+		// Only fresh bounded tool receipts may augment a reserved source. They cannot authorize
+		// execution: cold startup still checks the persisted attempt and execution-start receipt.
+		source.unstartedTools = incoming.unstartedTools;
+	}
+	if (guard.expectedEpoch !== undefined && guard.expectedEpoch !== handoff.epoch)
+		throw new Error("Prepared recovery manifest guard mismatch");
+	if (readRecoverySnapshotText() !== (handoff.published ?? handoff.original))
+		throw new Error("Recovery manifest changed during handoff");
+	const normalized = parsePlannedUpdateRecoverySnapshot({
+		...snapshot,
+		version: sources.length ? 3 : 2,
+		sources: sources.length ? sources : undefined,
+		handoffMarkerNonce: guard.handoffMarkerNonce ?? snapshot.handoffMarkerNonce,
+	});
+	if (!normalized) throw new Error("Invalid prepared recovery manifest");
+	const text = JSON.stringify(normalized, null, 2);
+	atomicWriteRecoveryText(text);
+	handoff.published = text;
+	logger.info("Prepared recovery root published", {
+		updateEpoch: handoff.epoch,
+		sourceEpochs: sources.map((source) => source.updateEpoch),
+		narratorCount: normalized.narrators.length,
+		manifestBytes: Buffer.byteLength(text, "utf8"),
+	});
+	return normalized;
+}
+
+export function rollbackPreparedUpdateRecoverySnapshot(epoch: string): void {
+	const handoff = scheduledHandoff.current;
+	if (!handoff && state.updateEpoch === epoch) return; // An unpublished short wait was cancelled.
+	if (!handoff || handoff.epoch !== epoch)
+		throw new Error("Prepared recovery rollback epoch mismatch");
+	getRecoveryHandoffSources(handoff.ticket);
+	const current = readRecoverySnapshotText();
+	if (handoff.published === undefined) {
+		if (current !== handoff.original)
+			throw new Error("Unpublished recovery manifest changed during handoff");
+		return;
+	}
+	if (current !== handoff.published)
+		throw new Error("Prepared recovery manifest changed before rollback");
+	if (handoff.original === undefined) unlinkSync(RECOVERY_SNAPSHOT_PATH);
+	else atomicWriteRecoveryText(handoff.original);
+	handoff.published = undefined;
+}
+
+export function releasePreparedUpdateRecoveryHandoff(epoch: string): void {
+	const handoff = scheduledHandoff.current;
+	if (!handoff && state.updateEpoch === epoch) return;
+	if (!handoff || handoff.epoch !== epoch)
+		throw new Error("Prepared recovery release epoch mismatch");
+	if (handoff.published !== undefined)
+		throw new Error("Cannot release published recovery handoff before rollback");
+	if (readRecoverySnapshotText() !== handoff.original)
+		throw new Error("Cannot release recovery handoff after manifest identity changed");
+	releaseRecoveryHandoff(handoff.ticket);
+	scheduledHandoff.current = undefined;
+}
+
 export function consumePlannedUpdateRecoverySnapshot(): PlannedUpdateRecoverySnapshot | null {
 	if (!existsSync(RECOVERY_SNAPSHOT_PATH)) return null;
 	try {
-		return parsePlannedUpdateRecoverySnapshot(
-			JSON.parse(readFileSync(RECOVERY_SNAPSHOT_PATH, "utf8")),
-		);
+		return parsePlannedUpdateRecoverySnapshot(JSON.parse(readRecoverySnapshotText() ?? "null"));
 	} catch (error) {
 		logger.warn("Failed to consume planned update recovery snapshot", {
 			path: RECOVERY_SNAPSHOT_PATH,
@@ -1112,6 +1449,14 @@ export function classifyRecoveryManifestOwnership(
 }
 
 export function removePlannedUpdateRecoverySnapshot(guard: RecoveryManifestEpochGuard): void {
+	const handoff = scheduledHandoff.current;
+	if (handoff?.epoch === guard.expectedEpoch && handoff.original !== undefined)
+		throw new Error("Inherited recovery root requires explicit rollback");
+	if (
+		hasReservedRecoverySourceEpoch(guard.expectedEpoch) &&
+		!isRecoveryAdvanceActive(guard.expectedEpoch)
+	)
+		return;
 	const existingEpoch = readExistingRecoverySnapshotEpoch();
 	// Absent manifest: nothing to remove, and a corrupt/unparseable manifest (undefined epoch while
 	// the file exists) is not claimed by this epoch, so leave it for its owner/consumer.
@@ -1127,6 +1472,7 @@ export function removePlannedUpdateRecoverySnapshot(guard: RecoveryManifestEpoch
 	}
 	try {
 		unlinkSync(RECOVERY_SNAPSHOT_PATH);
+		if (handoff?.epoch === guard.expectedEpoch) handoff.published = undefined;
 	} catch {
 		// already absent
 	}
@@ -1134,6 +1480,8 @@ export function removePlannedUpdateRecoverySnapshot(guard: RecoveryManifestEpoch
 
 /** Test-only reset helper; production code never needs to reset a scheduled update. */
 export function resetUpdateCoordinationForTests(): void {
+	resetRecoveryHandoffForTests();
+	scheduledHandoff.current = undefined;
 	executions.clear();
 	narratorLoops.clear();
 	toolStartGrants.clear();

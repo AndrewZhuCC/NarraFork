@@ -38,6 +38,7 @@ import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { pinRecordingRequest } from "../lib/request-recorder";
 import {
 	DEFAULT_CONTEXT_THRESHOLDS,
 	DEFAULT_CONTEXT_WINDOW,
@@ -3596,16 +3597,6 @@ export async function processEvent(
 					meterUnit: event.meterUnit ?? null,
 					errorMessage: event.errorMessage ?? null,
 					diagnostics: event.diagnostics,
-					rawDump: event.rawDump,
-					// Leaked-tool detection forces the raw SSE dump to persist so it stays
-					// downloadable even when error-only dumping is enabled. We intentionally do
-					// NOT synthesize an errorMessage here: that would mark a successful request
-					// as errored and skip assistant-message binding. The notice below carries
-					// the apiRequestId for the download endpoint instead.
-					forceDumpPersist: event.forceDumpPersist,
-					// Replays of one rejected request share a spill file rather than each writing
-					// a near-identical multi-MB copy that prunes other captures away.
-					dumpSpillReuseToken: event.dumpSpillReuseToken,
 				});
 				// The loop retains this attempt's diagnostic object across deferred errors
 				// and retries. Enrich only an exact local attempt match; upstream requestId
@@ -3630,12 +3621,16 @@ export async function processEvent(
 				// mark stream-captured tool calls or prompt downloading the raw dump.
 				const leaked = ctx.pendingLeakedToolCalls?.get(event.requestId);
 				if (leaked?.length) {
+					// Capture failures are worth keeping past the ring window.
+					if (leaked.some((signal) => signal.phase !== "stream_captured"))
+						pinRecordingRequest(event.requestId, "leak");
 					for (const signal of leaked) {
 						dualBroadcast(ctx, {
 							type: "leaked_tool_call_notice",
 							narratorId: broadcastTargetId,
 							phase: signal.phase,
 							apiRequestId,
+							recordingRequestId: event.requestId,
 							toolUseIds: signal.toolUseIds,
 							toolNames: signal.toolNames,
 							snippet: signal.snippet,

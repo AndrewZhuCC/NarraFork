@@ -77,6 +77,74 @@ const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
 	"../../lib/uploads"
 );
 
+test("composer layout survives cold durable queue projection, summary stays small, and legacy edits clear it", async () => {
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "text" as const, text: "rich" }] }],
+		assets: [],
+	};
+	const result = await enqueueBufferedMessage(
+		NARRATOR_ID,
+		"rich",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		"back",
+		undefined,
+		undefined,
+		"fifo",
+		undefined,
+		undefined,
+		document,
+	);
+	const row = db
+		.select()
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.id, result.id))
+		.get();
+	if (!row) throw new Error("Missing buffered row");
+	const projected = projectMailboxUserMessage(row);
+	expect(projected.composerDocument).toEqual(document);
+	const descriptors = Object.getOwnPropertyDescriptors(projected);
+	Object.defineProperty(projected, "composerDocument", {
+		get() {
+			throw new Error("summary read full document");
+		},
+		configurable: true,
+	});
+	expect(JSON.stringify(toBufferSummary([projected]))).not.toContain("paragraphs");
+	Object.defineProperties(projected, descriptors);
+	expect(await updateBufferedMessage(NARRATOR_ID, result.id, "legacy")).toBe(true);
+	const changed = db
+		.select()
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.id, result.id))
+		.get();
+	if (!changed) throw new Error("Missing edited row");
+	expect(projectMailboxUserMessage(changed).composerDocument).toBeUndefined();
+	await expect(
+		enqueueBufferedMessage(
+			NARRATOR_ID,
+			"mismatch",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"back",
+			undefined,
+			undefined,
+			"fifo",
+			undefined,
+			undefined,
+			document,
+		),
+	).rejects.toThrow("does not match");
+	await removeBufferedMessage(NARRATOR_ID, result.id);
+});
+
 const NARRATOR_ID = "buffer-attach-narrator";
 const SUBAGENT_ID = "buffer-attach-subagent";
 for (const id of [NARRATOR_ID, SUBAGENT_ID]) {

@@ -15,6 +15,7 @@ import {
 	ordinaryBufferReorder,
 	resolveBufferQueueMode,
 } from "@shared/buffer-queue-mode";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import { MAX_EDIT_TEXT_FILES_PER_MESSAGE, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
@@ -25,6 +26,11 @@ import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
 } from "../lib/agent/file-reference-projection";
+import {
+	parseOptionalComposerDocument,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../lib/composer-document";
 import { AppError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -292,6 +298,7 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	composerDocumentPath?: string;
 	queueMode?: BufferQueueMode;
 	executionIntent?: BufferedMessage["executionIntent"];
 	stagingId?: string;
@@ -342,7 +349,13 @@ export async function persistBufferedTextFiles(
 			taken.add(name);
 			const path = join(dir, name);
 			// Register before write so a partial write is cleaned after failure too.
-			saved.push({ filename: name, path, size: file.size });
+			saved.push({
+				filename: name,
+				path,
+				size: file.size,
+				originalName: file.name,
+				sourceMimeType: file.type,
+			});
 			await writeBufferedFile(path, file);
 		}
 		return saved;
@@ -440,7 +453,11 @@ export function loadBufferedTextFiles(saved: SavedBufferedFile[]): File[] {
 			throw new Error("Buffered attachment exceeds size limit");
 		// Bun's file-backed Blob retains the path instead of synchronously loading a
 		// potentially 100MB attachment into the request/event-loop heap.
-		return [new File([Bun.file(s.path)], s.filename, { type: "text/plain" })];
+		return [
+			new File([Bun.file(s.path)], s.originalName ?? s.filename, {
+				type: s.sourceMimeType ?? "text/plain",
+			}),
+		];
 	});
 }
 /** These inputs must cross the old loop's finalizer (including temporary-model restore). */
@@ -464,6 +481,14 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 		error: row.lastError,
 		get text() {
 			return payload ? readManagedText(payload.path) : row.text;
+		},
+		hasComposerDocument: !!metadata.composerDocumentPath,
+		get composerDocument() {
+			return metadata.composerDocumentPath
+				? parseOptionalComposerDocument(
+						JSON.parse(readManagedText(metadata.composerDocumentPath, 2 * 1024 * 1024)),
+					)
+				: undefined;
 		},
 		images: json<ImageRef[] | undefined>(row.imagesJson, undefined),
 		get fileReferences() {
@@ -608,7 +633,15 @@ export async function enqueueBufferedMessage(
 	frontOrder: "stack" | "fifo" = "stack",
 	executionIntent?: BufferedMessage["executionIntent"],
 	queueMode?: BufferQueueMode,
+	composerDocument?: ComposerDocument,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+	composerDocument = parseOptionalComposerDocument(composerDocument);
+	validateComposerProjection(
+		composerDocument,
+		text,
+		(fileReferences ?? []).map((snapshot) => snapshot.reference),
+	);
+	validateComposerAssets(composerDocument, images ?? [], textFiles ?? []);
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
 	images = images?.map((image) => ({ ...image }));
@@ -632,6 +665,12 @@ export async function enqueueBufferedMessage(
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
 		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
+		if (composerDocument)
+			metadata.composerDocumentPath = await writeStagingText(
+				stagingId,
+				"composer",
+				JSON.stringify(composerDocument),
+			);
 		if (queueMode) frontOrder = queueMode === "interrupt" ? "stack" : "fifo";
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
@@ -769,6 +808,7 @@ export async function enqueueBufferedMessage(
 	}
 }
 export interface BufferedMessageAttachmentUpdate {
+	composerDocument?: ComposerDocument;
 	images?: ImageRef[];
 	textFiles?: File[];
 	savedFiles?: SavedBufferedFile[];
@@ -789,6 +829,20 @@ export async function updateBufferedMessage(
 		!pending.includes(row.state as "queued" | "failed")
 	)
 		return false;
+	const current = projectMailboxUserMessage(row);
+	opts.composerDocument = parseOptionalComposerDocument(opts.composerDocument);
+	validateComposerProjection(
+		opts.composerDocument,
+		text,
+		(opts.fileReferences ?? current.fileReferences ?? []).map((snapshot) => snapshot.reference),
+	);
+	validateComposerAssets(
+		opts.composerDocument,
+		opts.images ?? current.images ?? [],
+		opts.textFiles ??
+			(opts.savedFiles ? loadBufferedTextFiles(opts.savedFiles) : current.textFiles) ??
+			[],
+	);
 	const bytes = Buffer.byteLength(text);
 	if (bytes > MAX_BUFFERED_PAYLOAD_BYTES)
 		throw new Error("Edited input exceeds mailbox size limit");
@@ -807,6 +861,16 @@ export async function updateBufferedMessage(
 	const prepared: string[] = [];
 	const superseded: string[] = [];
 	try {
+		if (metadata.composerDocumentPath) superseded.push(metadata.composerDocumentPath);
+		delete metadata.composerDocumentPath;
+		if (opts.composerDocument) {
+			metadata.composerDocumentPath = await writeStagingText(
+				stagingId,
+				"composer",
+				JSON.stringify(opts.composerDocument),
+			);
+			prepared.push(metadata.composerDocumentPath);
+		}
 		let payloadRefJson: string | null = null;
 		if (bytes > MAILBOX_LIMITS.inlineBytes) {
 			const path = await writeStagingText(stagingId, "body", text);
@@ -1228,6 +1292,7 @@ export interface BufferedTextFileSummary {
 	size: number;
 }
 export interface BufferMessageSummary {
+	hasComposerDocument?: boolean;
 	queueMode?: BufferQueueMode;
 	state?: "queued" | "failed";
 	error?: string | null;
@@ -1256,9 +1321,11 @@ export function toBufferSummary(
 		| "priority"
 		| "queueMode"
 		| "fileReferences"
+		| "hasComposerDocument"
 	>[],
 ): BufferMessageSummary[] {
 	return msgs.map((m) => ({
+		hasComposerDocument: m.hasComposerDocument || undefined,
 		id: m.id,
 		state: m.state,
 		error: m.error,

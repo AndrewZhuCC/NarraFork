@@ -2,7 +2,10 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
+import { db } from "../../../db";
+import { narratorMessages, narrators, narratorToolCalls } from "../../../db/schema";
 import {
 	compileDelegationPolicy,
 	resolveRuntimePolicy,
@@ -14,6 +17,10 @@ import {
 	resolvePermissionDecision,
 } from "../../../services/narrator-permission";
 import { activeNarrators } from "../../../services/narrator-session-state";
+import {
+	registerRecoverySource,
+	resetRecoveryHandoffForTests,
+} from "../../../services/recovery-handoff";
 import {
 	SUBAGENT_ALIAS_TRAIT_PREFIX,
 	subagentMatchesSelector,
@@ -71,6 +78,7 @@ const TEST_TOOL_NAME = "__ExecutorGuardTest";
 const ADMISSION_TOOL_NAME = "__AdmissionOrdinaryTest";
 const DISABLED_ADMISSION_TOOL_NAME = "__AdmissionDisabledTest";
 const originalUpsertContinuation = toolContinuationService.upsert;
+const originalCheckpointContinuation = toolContinuationService.checkpoint;
 
 const originalPlanReflectionAutoApprove = settings.agent.planReflectionAutoApprove;
 const originalPlanReflectionAllowAutoCompact = settings.agent.planReflectionAllowAutoCompact;
@@ -91,7 +99,9 @@ afterEach(() => {
 	toolRegistry.unregister("Await");
 	toolRegistry.unregister("Bash");
 	toolContinuationService.upsert = originalUpsertContinuation;
+	toolContinuationService.checkpoint = originalCheckpointContinuation;
 	resetUpdateCoordinationForTests();
+	resetRecoveryHandoffForTests();
 	setRemoteBackendResolver(null);
 	setPlanReflectionOverrideLoaderForTests(null);
 	settings.agent.planReflectionAutoApprove = originalPlanReflectionAutoApprove;
@@ -587,6 +597,124 @@ describe("executeTool update admission gate", () => {
 		expect(result.output).toBe("executed");
 		expect(permissionCalls).toBe(1);
 		expect(executions).toBe(1);
+	});
+
+	test.each([
+		"mounted",
+		"checkpoint-in-flight",
+		"fresh-late-write",
+	])("a real gate preserves old claims and cleans only new rows when cancelled at %s", async (cancelAt) => {
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: "carry-owner", createdAt: now, updatedAt: now });
+		await db.insert(narratorMessages).values({
+			id: "carry-message",
+			narratorId: "carry-owner",
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "row-carry-tool",
+			narratorId: "carry-owner",
+			messageId: "carry-message",
+			toolUseId: "carry-tool",
+			toolName: ADMISSION_TOOL_NAME,
+			status: "pending",
+			executionAttempt: 1,
+			createdAt: now,
+		});
+		let executions = 0;
+		let permissions = 0;
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "carryover gate fixture",
+			parameters: z.object({}),
+			execute: async () => {
+				executions++;
+				return { output: "once" };
+			},
+		});
+		try {
+			if (cancelAt !== "fresh-late-write") {
+				await toolContinuationService.create({
+					toolCallId: "row-carry-tool",
+					narratorId: "carry-owner",
+					updateEpoch: "old-recovery",
+					kind: "pending_permission",
+					state: "waiting",
+					payloadJson: { permissionGranted: false },
+				});
+				await toolContinuationService.claim("row-carry-tool", {
+					claimToken: "original-owner",
+					deadlineAt: "2099-01-01T00:00:00.000Z",
+				});
+				registerRecoverySource({
+					updateEpoch: "old-recovery",
+					kind: "planned",
+					capturedAt: now,
+					narrators: [{ narratorId: "carry-owner", locale: "en" }],
+					pendingNarratorIds: ["carry-owner"],
+				});
+			}
+			const original = await toolContinuationService.getByToolCallId("row-carry-tool");
+			const scheduled = scheduleUpdate("test-version", undefined, {
+				supportedRecoveryManifestVersions: [1, 2, 3],
+			});
+			beginQuiescingTools();
+			const config = makeConfig(async () => {
+				permissions++;
+				return { behavior: "allow" };
+			});
+			config.narratorId = "carry-owner";
+			let checkpointEntered = false;
+			let releaseCheckpoint = () => {};
+			if (cancelAt !== "mounted") {
+				const blocked = new Promise<void>((resolve) => {
+					releaseCheckpoint = resolve;
+				});
+				toolContinuationService.checkpoint = async (input) => {
+					checkpointEntered = true;
+					await blocked;
+					return originalCheckpointContinuation.call(toolContinuationService, input);
+				};
+			}
+			const result = executeTool(
+				{ toolUseId: "carry-tool", name: ADMISSION_TOOL_NAME, input: {} },
+				config,
+			);
+			await waitForCondition(() =>
+				cancelAt !== "mounted"
+					? checkpointEntered
+					: getUpdateCoordinationStatus().pausedToolCount === 1,
+			);
+			expect(executions).toBe(0);
+			expect(permissions).toBe(0);
+			expect(await toolContinuationService.getByToolCallId("row-carry-tool")).toEqual(original);
+			failScheduledUpdate("cancel second prepare");
+			if (!scheduled.updateEpoch) throw new Error("Missing scheduled fixture epoch");
+			await toolContinuationService.cancelEpoch(scheduled.updateEpoch);
+			releaseCheckpoint();
+			await expect(result).resolves.toMatchObject({ output: "once" });
+			expect(executions).toBe(1);
+			expect(permissions).toBe(1);
+			if (cancelAt === "fresh-late-write") {
+				expect(await toolContinuationService.getByToolCallId("row-carry-tool")).toMatchObject({
+					updateEpoch: scheduled.updateEpoch,
+					state: "cancelled",
+				});
+			} else {
+				expect(await toolContinuationService.getByToolCallId("row-carry-tool")).toEqual(original);
+				expect(
+					await toolContinuationService.markResultWritten("row-carry-tool", {
+						claimToken: "original-owner",
+					}),
+				).not.toBeNull();
+			}
+		} finally {
+			await db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, "row-carry-tool"));
+			await db.delete(narratorMessages).where(eq(narratorMessages.id, "carry-message"));
+			await db.delete(narrators).where(eq(narrators.id, "carry-owner"));
+		}
 	});
 
 	test("phase 2 continuation metadata stays below the database limit for large tool input", async () => {

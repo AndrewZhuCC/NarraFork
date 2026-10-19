@@ -180,7 +180,7 @@ describe("misc APIs", () => {
 		);
 
 		await expect(
-			api.cleanupDatabase({ target: "apiRequestDumps", olderThanDays: 7 }),
+			api.cleanupDatabase({ target: "toolCallPayloads", olderThanDays: 7 }),
 		).rejects.toThrow("Database vacuum is disabled on this backend");
 	});
 

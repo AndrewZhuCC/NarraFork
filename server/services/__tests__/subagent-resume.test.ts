@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	backgroundTasks,
 	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
@@ -189,6 +190,8 @@ function message(
 	db.insert(narratorMessageRefs)
 		.values({ id: `ref-${id}`, narratorId: CHILD, messageId: id, seq: seq++ })
 		.run();
+	// Raw fixture rows bypass the seq allocator; keep its counter ahead of them.
+	db.update(narrators).set({ nextSeq: seq }).where(eq(narrators.id, CHILD)).run();
 }
 
 /**
@@ -209,6 +212,34 @@ function scriptPasses() {
 const toolOutput = () =>
 	db.select().from(narratorToolCalls).where(eq(narratorToolCalls.id, ORIGIN_ROW)).get()?.outputJson;
 
+/** The parent's Send: a receipted tool call of the parent session. */
+function sendCall() {
+	db.insert(narratorMessages)
+		.values({
+			id: "send-msg",
+			narratorId: PARENT,
+			role: "assistant",
+			contentJson: [],
+			createdAt: NOW,
+		})
+		.run();
+	db.insert(narratorToolCalls)
+		.values({
+			id: "send-call",
+			narratorId: PARENT,
+			messageId: "send-msg",
+			toolUseId: "send-use",
+			toolName: "Send",
+			status: "running",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			createdAt: NOW,
+		})
+		.run();
+}
+
+const task = () => db.select().from(backgroundTasks).where(eq(backgroundTasks.id, CHILD)).get();
+
 async function settle(condition: () => boolean) {
 	for (let i = 0; i < 200 && !condition(); i++) await new Promise((r) => setTimeout(r, 5));
 	expect(condition()).toBe(true);
@@ -216,13 +247,17 @@ async function settle(condition: () => boolean) {
 
 for (const shape of shapes) {
 	describe(`follow-up of a ${shape.name}`, () => {
-		test("a user follow-up starts the ordinary run, which delivers to the registered call once", async () => {
+		test("a follow-up run no caller waits for delivers once, through a task row", async () => {
 			seed(shape);
 			scriptPasses();
 			script = [async () => ({ finalText: "second answer" })];
 			await session.acceptUserMessage(CHILD, "follow up", { locale: "en", userId: null });
 			await settle(() => passes.length === 1 && !getExecutionOwner(CHILD));
-			await settle(() => String(toolOutput()).includes("second answer"));
+			await settle(() => task()?.status === "completed");
+			expect(task()).toMatchObject({ parentNarratorId: PARENT, toolUseId: ORIGIN });
+			expect(String(task()?.output).match(/second answer/g)).toHaveLength(1);
+			// The call's result was delivered by the first run and is never rewritten.
+			expect(toolOutput()).toBe("FIRST RESULT");
 			expect(passes[0]).toContain("follow up");
 			// The follow-up is a turn of this session, placed under the same destination.
 			const turn = db
@@ -239,7 +274,38 @@ for (const shape of shapes) {
 				.all()
 				.filter((row) => row.taskId === CHILD && row.state === "reserved");
 			expect(owed).toHaveLength(0);
-			expect(String(toolOutput()).match(/second answer/g)).toHaveLength(1);
+		});
+
+		test("a Send wake of the ended session runs as a background task Stop can reach", async () => {
+			seed(shape);
+			const gate = Promise.withResolvers<void>();
+			scriptPasses();
+			script = [
+				async () => {
+					await gate.promise;
+					return { finalText: "sent answer" };
+				},
+			];
+			sendCall();
+			const delivery = createAgentMessageDelivery(
+				CHILD,
+				{ id: PARENT, title: "Parent", label: "parent", type: "primary", isParent: true },
+				"send-use",
+				"one more thing",
+				{ toolCallId: "send-call", attempt: 1 },
+			);
+			await enqueueInboxAgent(delivery, delivery.text, { createdBy: null, userId: null });
+			expect(await wakeInboxIfEligible(CHILD)).toBe(true);
+			await settle(() => passes.length === 1);
+			expect(task()?.status).toBe("running");
+			expect(task()?.logicalRunId).toBe(getRunControl(CHILD)?.logicalRunId);
+			expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()).toMatchObject({
+				isBackground: true,
+				backgroundStatus: "running",
+			});
+			gate.resolve();
+			await settle(() => task()?.status === "completed");
+			expect(toolOutput()).toBe("FIRST RESULT");
 		});
 
 		test("a second start while a run is executing is refused, not run twice", async () => {
@@ -364,7 +430,8 @@ describe("a held run (user takeover) is continued in place", () => {
 		await controlRun(CHILD, { kind: "release" });
 		const terminal = await handle.terminal;
 		expect(terminal.finalText).toContain("turn two");
-		await settle(() => String(toolOutput()).includes("turn two"));
+		await settle(() => String(task()?.output).includes("turn two"));
+		expect(String(task()?.output)).not.toContain("turn one");
 		expect(getRunHold(CHILD)).toBeUndefined();
 	});
 
@@ -405,28 +472,7 @@ describe("a held run (user takeover) is continued in place", () => {
 		});
 		// The parent's Send: a receipted tool call of the parent session.
 		const text = "parent says: also check the edge case";
-		db.insert(narratorMessages)
-			.values({
-				id: "send-msg",
-				narratorId: PARENT,
-				role: "assistant",
-				contentJson: [],
-				createdAt: NOW,
-			})
-			.run();
-		db.insert(narratorToolCalls)
-			.values({
-				id: "send-call",
-				narratorId: PARENT,
-				messageId: "send-msg",
-				toolUseId: "send-use",
-				toolName: "Send",
-				status: "running",
-				executionAttempt: 1,
-				executionIdentityVersion: 1,
-				createdAt: NOW,
-			})
-			.run();
+		sendCall();
 		const delivery = createAgentMessageDelivery(
 			CHILD,
 			{ id: PARENT, title: "Parent", label: "parent", type: "primary", isParent: true },

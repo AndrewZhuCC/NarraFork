@@ -33,7 +33,7 @@
  * silently widen a narrow one.
  */
 
-import type { KnowledgeCollectionRow } from "./write-store";
+import type { KnowledgeCollectionRow, KnowledgeDraftRow } from "./write-store";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Row shapes (plain data, field-identical across backends)
@@ -78,7 +78,40 @@ export interface KnowledgeEntryGraphRow extends KnowledgeEntryAclRow {
 	slug: string;
 }
 
+/** Keyset position in the (updatedAt DESC, id DESC) entry list order. */
+export interface KnowledgeEntryListCursor {
+	updatedAt: string;
+	id: string;
+}
+
+/** Keyset position in the (title ASC, id ASC) entry list order. */
+export interface KnowledgeEntryTitleCursor {
+	title: string;
+	id: string;
+}
+
+/**
+ * Entry list order + its keyset position. `updated` = (updatedAt DESC, id DESC) — the default
+ * and the only order before `sort` existed; `title` = (title ASC, id ASC), compared with the
+ * column's own collation on each engine (binary in SQLite, the database collation in PG), so the
+ * keyset predicate and the ORDER BY always agree within one backend.
+ */
+export type KnowledgeEntryListOrder =
+	| { sort: "updated"; after?: KnowledgeEntryListCursor }
+	| { sort: "title"; after?: KnowledgeEntryTitleCursor };
+
+/**
+ * SQL-side list filters. `level` matches the EFFECTIVE classification — the entry's own level,
+ * or (when it has none) its collection's `defaultLevel` — the same value the read gate ranks.
+ */
+export interface KnowledgeEntryListFilter {
+	collectionId?: string;
+	level?: string;
+	status?: "active" | "archived";
+}
+
 /** The list-view projection: everything a listing renders, never the content blob. */
+
 export interface KnowledgeEntryListRow {
 	id: string;
 	collectionId: string;
@@ -234,6 +267,15 @@ export type LinkListDirection = "out" | "in" | "both";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface KnowledgeReadStore {
+	getPersonalEntryById(id: string): Promise<KnowledgeDraftRow | null>;
+	listPersonalEntries(opts: {
+		userId: string;
+		status?: "active" | "archived";
+		limit: number;
+	}): Promise<(Omit<KnowledgeDraftRow, "content"> & { contentLength: number })[]>;
+	getEntryRevisionPointers(
+		ids: string[],
+	): Promise<{ id: string; currentRevisionId: string | null }[]>;
 	// ── entries ──
 	/** Full row by id, or null. The caller decides whether the content blob is needed. */
 	getEntryById(entryId: string): Promise<KnowledgeEntryRow | null>;
@@ -245,8 +287,23 @@ export interface KnowledgeReadStore {
 	getEntriesAclByIds(entryIds: string[]): Promise<KnowledgeEntryAclRow[]>;
 	/** Batch: ACL + display fields of many entries (graph traversal preload). */
 	getEntriesGraphByIds(entryIds: string[]): Promise<KnowledgeEntryGraphRow[]>;
-	/** List-view rows, newest-updated first, bounded by `limit`. */
-	listEntries(opts: { collectionId?: string; limit: number }): Promise<KnowledgeEntryListRow[]>;
+	/**
+	 * List-view rows ordered by (updatedAt DESC, id DESC), bounded by `limit`. When `after`
+	 * is given, only rows strictly after that keyset position are returned (keyset
+	 * pagination — the `id` tie-break keeps equal timestamps from being skipped/duplicated).
+	 */
+	listEntries(opts: {
+		collectionId?: string;
+		limit: number;
+		after?: KnowledgeEntryListCursor;
+	}): Promise<KnowledgeEntryListRow[]>;
+	/**
+	 * {@link listEntries} with an explicit order and SQL-side filters (the paginated browse list).
+	 * Same projection; bounded by `limit`; rows strictly after `order.after` in that order.
+	 */
+	listEntriesOrdered(
+		opts: KnowledgeEntryListFilter & { limit: number; order: KnowledgeEntryListOrder },
+	): Promise<KnowledgeEntryListRow[]>;
 	/** The slug pre-check before an entry insert. Only the id crosses back. */
 	findEntryBySlug(collectionId: string, slug: string): Promise<{ id: string } | null>;
 
@@ -286,6 +343,8 @@ export interface KnowledgeReadStore {
 	userExists(userId: string): Promise<boolean>;
 	getUserRoleById(userId: string): Promise<{ id: string; role: string } | null>;
 	getUsernameById(userId: string): Promise<{ username: string } | null>;
+	/** Batch: usernames of the given ids (display only; one `IN` lookup bounded by the caller). */
+	listUsernamesByIds(userIds: string[]): Promise<{ id: string; username: string }[]>;
 	/** Bounded user listing for batch cap resolution / role-scoped notify fan-out. */
 	listUserIdsAndRoles(opts: {
 		role?: string;
@@ -347,6 +406,15 @@ export interface KnowledgeReadStore {
 	/** Authors holding an ACTIVE draft pinned to a base revision of this entry —
 	 *  the drift-notification population, bounded by `limit`. */
 	listActiveDraftHolderIds(entryId: string, limit: number): Promise<{ authorUserId: string }[]>;
+	/** The id of `authorUserId`'s ACTIVE personal version of this entry, or null. One lookup on
+	 *  the (entry_id, author_user_id) index — powers `viewerCaps.myPersonalEntryId`. */
+	findActivePersonalEntryId(entryId: string, authorUserId: string): Promise<string | null>;
+	/** Batch form for a list page: `authorUserId`'s ACTIVE personal versions of the given entries
+	 *  (one `IN` lookup on the same index; the caller bounds `entryIds` by its page size). */
+	listActivePersonalEntriesForEntries(
+		entryIds: string[],
+		authorUserId: string,
+	): Promise<{ id: string; entryId: string; baseRevisionId: string | null }[]>;
 
 	// ── audit read ──
 	/**
@@ -367,6 +435,22 @@ export interface KnowledgeReadStore {
 	}): Promise<AclEventReadRow[]>;
 
 	// ── passive keyword injection ──
+	listPersonalKeywordInjectionCandidates(opts: {
+		userId: string;
+		collectionId?: string;
+		projectId?: string;
+		limit: number;
+	}): Promise<KeywordInjectionCandidateRow[]>;
+	personalKeywordInjectionSignature(opts: {
+		userId: string;
+		collectionId?: string;
+		projectId?: string;
+	}): Promise<string>;
+	personalInjectionSnippets(
+		userId: string,
+		ids: string[],
+		maxChars: number,
+	): Promise<{ id: string; snippet: string | null }[]>;
 	/**
 	 * Active entries that carry keywords: the injection candidate scan. Metadata and
 	 * keyword JSON only — never the body — ordered newest-updated first and bounded

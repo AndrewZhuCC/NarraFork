@@ -1,5 +1,25 @@
 import { isValidGitHubRepository } from "./github-repository";
 
+/** Current main-program capability; helper/executor builds must not inherit this declaration. */
+export const CURRENT_RECOVERY_MANIFEST_VERSIONS = Object.freeze([1, 2, 3] as const);
+
+/** Missing historical metadata means v1/v2 only, never inferred from the application version. */
+export function parseRecoveryManifestVersions(value: unknown): number[] {
+	if (value === undefined) return [1, 2];
+	if (
+		!Array.isArray(value) ||
+		value.length === 0 ||
+		value.length > 32 ||
+		[...value].some((version) => !Number.isSafeInteger(version) || version < 1 || version > 255) ||
+		new Set(value).size !== value.length
+	) {
+		throw new Error(
+			"Invalid recoveryManifestVersions: expected 1–32 unique integers from 1 to 255",
+		);
+	}
+	return [...value].sort((a, b) => a - b);
+}
+
 /** Immutable effective configuration captured before an asynchronous update check. */
 export type UpdateSourceIdentity =
 	| { source: "github"; repository: string; channel: "stable" | "beta"; platform: string }
@@ -18,6 +38,8 @@ export interface PreparedUpdateIdentity {
 	version: string;
 	sha512: string;
 	sizeBytes: number;
+	/** Verified main-binary capability; absent historical records support only v1/v2. */
+	recoveryManifestVersions?: number[];
 	/** Old metadata cannot truthfully recover its original source from today's settings. */
 	sourceIdentity: UpdateSourceIdentity | null;
 }
@@ -124,10 +146,20 @@ export function preparedMatchesRelease(
 				version: string;
 				sha512: string;
 				files: Array<{ size: number }>;
+				recoveryManifestVersions?: number[];
 				sourceIdentity?: UpdateSourceIdentity;
 		  }
 		| undefined,
 ): boolean {
+	try {
+		if (
+			JSON.stringify(parseRecoveryManifestVersions(prepared?.recoveryManifestVersions)) !==
+			JSON.stringify(parseRecoveryManifestVersions(release?.recoveryManifestVersions))
+		)
+			return false;
+	} catch {
+		return false;
+	}
 	return (
 		!!prepared &&
 		!!release &&

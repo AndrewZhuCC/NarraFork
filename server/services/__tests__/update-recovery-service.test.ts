@@ -1,4 +1,5 @@
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
@@ -10,6 +11,13 @@ import {
 } from "../../db/schema";
 import { NotFoundError } from "../../lib/errors";
 import { runtimePublication } from "../agent-runtime/publication";
+import {
+	invalidateRecoveryTarget,
+	releaseRecoveryHandoff,
+	reserveRecoveryHandoff,
+	resetRecoveryHandoffForTests,
+	waitForRecoveryHandoffReady,
+} from "../recovery-handoff";
 
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 const realNarratorPersistenceModule = { ...(await import("../narrator-persistence")) };
@@ -29,7 +37,7 @@ function actAsReplacementProcess(markerNonce: string | undefined = HANDOFF_NONCE
 }
 
 let loadMode: "missing" | "transient" | "idle" | "working" | "archived" = "transient";
-let requestedProtectionEpoch: string | null = null;
+let requestedProtectionEpoch: import("../tool-continuation-service").EpochScope | null = null;
 let renewCalls = 0;
 let renewClaimSucceeds = true;
 let executePersistedCalls = 0;
@@ -38,6 +46,7 @@ let cancelInterruptibleGate: Promise<void> | null = null;
 let markCancelInterruptibleStarted: (() => void) | null = null;
 let continueNarratorResult: { ok: boolean } = { ok: true };
 let continueNarratorImpl: (() => Promise<{ ok: boolean }>) | null = null;
+let useRealLegacyContinuation = false;
 let beforeConditionalToolResultWrite: (() => void | Promise<void>) | null = null;
 let beforeMarkResultWritten: ((toolCallId: string) => void | Promise<void>) | null = null;
 let afterOwnerPending: (() => void | Promise<void>) | null = null;
@@ -51,6 +60,7 @@ let executePersistedToolCallImpl: (input?: {
 });
 const resumedAgentCalls: Array<Record<string, unknown>> = [];
 const awaitAgentCalls: Array<Record<string, unknown>> = [];
+let onAwaitMounted: (() => void) | null = null;
 const updatedToolResults: Array<{ args: unknown[] }> = [];
 let expectedPendingReplyProbe: {
 	requesterId: string;
@@ -96,6 +106,13 @@ mock.module("../narrator-service", () => ({
 		getById: async (id: string) => {
 			if (loadMode === "missing") throw new NotFoundError("Narrator", id);
 			if (loadMode === "transient") throw new Error("temporary database failure");
+			// Real start admission resolves the narrator's DB root even when this test
+			// replaces its service projection. Keep that fixture identity real as well.
+			const now = new Date().toISOString();
+			db.insert(narrators)
+				.values({ id, type: "primary", variant: "primary", createdAt: now, updatedAt: now })
+				.onConflictDoNothing()
+				.run();
 			return {
 				id,
 				variant: "primary",
@@ -177,14 +194,16 @@ mock.module("../tool-continuation-service", () => ({
 		},
 		bindRecoveryTokenForNarrator: async (
 			narratorId: string,
-			updateEpoch: string,
+			updateEpoch: import("../tool-continuation-service").EpochScope,
 			recoveryToken: string,
 		) => {
 			const updated = continuationRows
 				.filter(
 					(row) =>
 						row.narratorId === narratorId &&
-						row.updateEpoch === updateEpoch &&
+						(typeof updateEpoch === "string"
+							? row.updateEpoch === updateEpoch
+							: updateEpoch.includes(row.updateEpoch)) &&
 						row.state !== "cancelled" &&
 						row.payloadJson?.recoveryPhase !== "owner_continuation_started",
 				)
@@ -281,7 +300,7 @@ mock.module("../tool-continuation-service", () => ({
 		markOwnerContinuationStartedForNarrator: async () => true,
 		cancelInterruptibleForNarrator: async (
 			narratorId: string,
-			updateEpoch: string,
+			updateEpoch: import("../tool-continuation-service").EpochScope,
 			input:
 				| string
 				| {
@@ -301,7 +320,9 @@ mock.module("../tool-continuation-service", () => ({
 				.filter(
 					(row) =>
 						row.narratorId === narratorId &&
-						row.updateEpoch === updateEpoch &&
+						(typeof updateEpoch === "string"
+							? row.updateEpoch === updateEpoch
+							: updateEpoch.includes(row.updateEpoch)) &&
 						(includeBackgroundAgentOwner || row.kind !== "background_agent") &&
 						(!recoveryToken || row.payloadJson?.recoveryToken === recoveryToken) &&
 						row.state !== "cancelled" &&
@@ -369,6 +390,14 @@ mock.module("../narrator-session", () => ({
 		continueNarratorCalls += 1;
 		return continueNarratorImpl ? continueNarratorImpl() : continueNarratorResult;
 	},
+	continueNarratorAfterPlannedUpdate: async (
+		...args: Parameters<typeof realNarratorSessionModule.continueNarratorAfterPlannedUpdate>
+	) => {
+		continueNarratorCalls += 1;
+		if (useRealLegacyContinuation)
+			return realNarratorSessionModule.continueNarratorAfterPlannedUpdate(...args);
+		return continueNarratorImpl ? continueNarratorImpl() : continueNarratorResult;
+	},
 	abortActiveNarratorLoopForPlannedUpdateRecovery: () => {
 		abortActiveRecoveryLoopCalls += 1;
 		return true;
@@ -379,6 +408,7 @@ mock.module("../agent-communication", () => ({
 	...realAgentCommunicationModule,
 	awaitAgentResultDetailed: async (input: Record<string, unknown>) => {
 		awaitAgentCalls.push(input);
+		onAwaitMounted?.();
 		return awaitAgentResult;
 	},
 }));
@@ -402,6 +432,7 @@ beforeAll(() => {
 });
 
 afterEach(() => {
+	resetRecoveryHandoffForTests();
 	loadMode = "transient";
 	requestedProtectionEpoch = null;
 	renewCalls = 0;
@@ -412,6 +443,7 @@ afterEach(() => {
 	markCancelInterruptibleStarted = null;
 	continueNarratorResult = { ok: true };
 	continueNarratorImpl = null;
+	useRealLegacyContinuation = false;
 	beforeConditionalToolResultWrite = null;
 	beforeMarkResultWritten = null;
 	afterOwnerPending = null;
@@ -420,6 +452,7 @@ afterEach(() => {
 	executePersistedToolCallImpl = async () => ({ ok: true, shouldContinue: true });
 	resumedAgentCalls.length = 0;
 	awaitAgentCalls.length = 0;
+	onAwaitMounted = null;
 	updatedToolResults.length = 0;
 	expectedPendingReplyProbe = null;
 	replyWaiterPresenceAtAgentResume.length = 0;
@@ -495,7 +528,10 @@ function recoveryItem(
 	};
 }
 
-async function prepareRecovery() {
+async function prepareRecovery(
+	targets: import("../update-coordinator").NarratorRecoveryTarget[] = [],
+	sources: import("../recovery-handoff").RecoverySource[] = [],
+) {
 	// These are current-protocol scheduling fixtures, not fabricated legacy proofs.
 	// Persist their original run/slot and exact origin before simulating replacement.
 	for (const item of recoveryQueue) {
@@ -575,7 +611,8 @@ async function prepareRecovery() {
 		targetVersion: "4.0.0",
 		capturedAt: new Date().toISOString(),
 		handoffMarkerNonce: HANDOFF_NONCE,
-		narrators: [],
+		narrators: targets,
+		...(sources.length ? { sources } : {}),
 	});
 	actAsReplacementProcess();
 	return getPlannedUpdateStartupProtection();
@@ -610,6 +647,282 @@ function sendAwaitSnapshot(input: {
 }
 
 describe("planned update recovery snapshot", () => {
+	for (const kind of ["foreground_agent", "await_agent", "pending_permission"] as const) {
+		test(`independent legacy narrator starts while ${kind} is unfinished`, async () => {
+			loadMode = "idle";
+			const gate = Promise.withResolvers<void>();
+			const record = continuationRecord(`long-${kind}`, "owner", {
+				kind,
+				payloadJson: { subagentId: "child", targetId: "child" },
+			});
+			continuationRows = [record];
+			recoveryQueue = [recoveryItem(record, "message", 0)];
+			resumedAgentCompletion = gate.promise.then(() => "done");
+			awaitAgentResult = gate.promise.then(() => ({
+				id: "child",
+				status: "completed",
+				formatted: "done",
+			}));
+			executePersistedToolCallImpl = async () => {
+				await gate.promise;
+				return { ok: true, shouldContinue: true };
+			};
+			loadMode = "working";
+			const startup = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+			loadMode = "idle";
+			if (kind === "await_agent") {
+				const now = new Date().toISOString();
+				db.insert(narrators)
+					.values({
+						id: "owner",
+						type: "primary",
+						variant: "primary",
+						createdAt: now,
+						updatedAt: now,
+					})
+					.run();
+				db.insert(narratorMessages)
+					.values({
+						id: "message",
+						narratorId: "owner",
+						role: "assistant",
+						contentJson: [],
+						createdAt: now,
+					})
+					.run();
+				db.insert(narratorToolCalls)
+					.values({
+						id: record.toolCallId,
+						narratorId: "owner",
+						messageId: "message",
+						toolUseId: record.toolCallId,
+						toolName: "Await",
+						inputJson: {},
+						status: "running",
+						createdAt: now,
+					})
+					.run();
+			}
+			const mounting = restoreNarratorsAfterPlannedUpdate(startup);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			try {
+				expect(continueNarratorCalls).toBe(1);
+			} finally {
+				gate.resolve();
+				const recovery = await mounting;
+				await recovery?.completion;
+			}
+		});
+	}
+
+	test("a failed queue mount does not skip independent legacy recovery", async () => {
+		loadMode = "idle";
+		const record = continuationRecord("bad-send", "owner", { kind: "send_await" });
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "message", 0)];
+		loadMode = "working";
+		const startup = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+		loadMode = "idle";
+		await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(continueNarratorCalls).toBe(1);
+	});
+	test("a sibling mount failure keeps a live owner's interrupt controller until it finishes", async () => {
+		loadMode = "idle";
+		const gate = Promise.withResolvers<void>();
+		const live = continuationRecord("live-permission", "live", { kind: "pending_permission" });
+		const failed = continuationRecord("bad-agent", "failed", { kind: "foreground_agent" });
+		continuationRows = [live, failed];
+		recoveryQueue = [
+			recoveryItem(live, "live-message", 0),
+			recoveryItem(failed, "failed-message", 0),
+		];
+		executePersistedToolCallImpl = async () => {
+			await gate.promise;
+			return { ok: true, shouldContinue: true };
+		};
+		const startup = await prepareRecovery();
+		await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow("missing subagentId");
+		expect(executePersistedCalls).toBe(1);
+		expect(realNarratorSessionModule.interruptNarrator("live")).toBe(true);
+		gate.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(continuationRows.find((row) => row.toolCallId === live.toolCallId)?.state).toBe(
+			"cancelled",
+		);
+	});
+
+	test("a pending legacy cancellation during a handoff reservation cannot revive on release", async () => {
+		loadMode = "working";
+		const startup = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+		loadMode = "idle";
+		const ticket = reserveRecoveryHandoff();
+		await waitForRecoveryHandoffReady(ticket);
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(continueNarratorCalls).toBe(0);
+		invalidateRecoveryTarget("legacy");
+		releaseRecoveryHandoff(ticket);
+		await handle?.completion;
+		expect(continueNarratorCalls).toBe(0);
+	});
+
+	test("handoff does not wait for approval and pauses the old completion until cancellation", async () => {
+		loadMode = "idle";
+		const gate = Promise.withResolvers<void>();
+		const record = continuationRecord("long-permission", "owner", { kind: "pending_permission" });
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "message", 0)];
+		executePersistedToolCallImpl = async () => {
+			await gate.promise;
+			return { ok: true, shouldContinue: true };
+		};
+		const startup = await prepareRecovery();
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		updateCoordinator.scheduleUpdate(undefined, "system_shutdown", {
+			supportedRecoveryManifestVersions: [1, 2, 3],
+		});
+		await updateCoordinator.waitForScheduledRecoveryHandoff();
+		const next = updateCoordinator.writePreparedUpdateRecoverySnapshot();
+		expect(next.sources?.map((source) => source.updateEpoch)).toEqual(["epoch"]);
+		gate.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(continueNarratorCalls).toBe(0);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()?.updateEpoch).toBe(
+			next.updateEpoch,
+		);
+		updateCoordinator.cancelScheduledUpdate();
+		updateCoordinator.rollbackPreparedUpdateRecoverySnapshot(next.updateEpoch);
+		updateCoordinator.releasePreparedUpdateRecoveryHandoff(next.updateEpoch);
+		await handle?.completion;
+		expect(continueNarratorCalls).toBe(1);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+	});
+
+	for (const kind of ["planned", "ordinary"] as const) {
+		test(`current root legacy target outranks completed same-ID ${kind} source target`, async () => {
+			loadMode = "working";
+			const startup = await prepareRecovery(
+				[{ narratorId: "legacy", locale: "en" }],
+				[
+					{
+						updateEpoch: "old-source",
+						kind,
+						capturedAt: "2026-10-01T00:00:00.000Z",
+						narrators: [{ narratorId: "legacy", locale: "en" }],
+						pendingNarratorIds: [],
+					},
+				],
+			);
+			loadMode = "idle";
+			const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+			await handle?.completion;
+			expect(continueNarratorCalls).toBe(1);
+		});
+	}
+
+	test("v3 installs inherited Send waiters before a legacy responder can start", async () => {
+		loadMode = "working";
+		const snapshot = sendAwaitSnapshot({ toolUseId: "inherited-send", responders: ["legacy"] });
+		const record = continuationRecord("inherited-send-call", "owner", {
+			updateEpoch: "old-source",
+			kind: "send_await",
+			state: "waiting",
+			payloadJson: { sendAwait: snapshot },
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "send-message", 0)];
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: snapshot.toolUseId,
+			messageId: "send-message",
+			status: "running",
+			outputJson: null,
+		});
+		const startup = await prepareRecovery(
+			[{ narratorId: "legacy", locale: "en" }],
+			[
+				{
+					updateEpoch: "old-source",
+					kind: "planned",
+					capturedAt: "2026-10-01T00:00:00.000Z",
+					narrators: [],
+					pendingNarratorIds: [],
+				},
+			],
+		);
+		loadMode = "idle";
+		let responded = false;
+		continueNarratorImpl = async () => {
+			if (!responded) {
+				responded = true;
+				expect(
+					realAgentReplyWaiterModule.hasPendingAgentReply(
+						"owner",
+						"legacy",
+						snapshot.waiters[0].scope,
+					),
+				).toBe(true);
+				expect(
+					realAgentReplyWaiterModule.resolvePendingAgentReply({
+						fromNarratorId: "legacy",
+						toNarratorId: "owner",
+						scope: snapshot.waiters[0].scope,
+						replyTo: snapshot.waiters[0].requestId,
+						message: "restored response",
+					}),
+				).toMatchObject({ matched: true });
+			}
+			return { ok: true };
+		};
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		await handle?.completion;
+		expect(responded).toBe(true);
+		expect(continueNarratorCalls).toBe(2);
+	});
+
+	test("v3 combines root and source tools into one ordered message and one owner delivery", async () => {
+		loadMode = "idle";
+		const first = continuationRecord("root-write", "owner");
+		const second = continuationRecord("source-write", "owner", { updateEpoch: "old-source" });
+		continuationRows = [first, second];
+		recoveryQueue = [
+			recoveryItem(first, "same-message", 0),
+			recoveryItem(second, "same-message", 1),
+		];
+		const gate = Promise.withResolvers<void>();
+		const started: string[] = [];
+		executePersistedToolCallImpl = async (input) => {
+			started.push(input?.toolCallId ?? "missing");
+			if (input?.toolCallId === first.toolCallId) await gate.promise;
+			return { ok: true, shouldContinue: true };
+		};
+		const startup = await prepareRecovery(
+			[],
+			[
+				{
+					updateEpoch: "old-source",
+					kind: "planned",
+					capturedAt: "2026-10-01T00:00:00.000Z",
+					narrators: [{ narratorId: "owner", locale: "en" }],
+					pendingNarratorIds: ["owner"],
+				},
+			],
+		);
+		startup.protection = { ...startup.protection, narratorIds: new Set(["owner"]) };
+		expect(requestedProtectionEpoch).toEqual(["epoch", "old-source"]);
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		expect(started).toEqual(["root-write"]);
+		expect(continueNarratorCalls).toBe(0);
+		gate.resolve();
+		await handle?.completion;
+		expect(started).toEqual(["root-write", "source-write"]);
+		expect(continueNarratorCalls).toBe(1);
+		expect(ownerStartedCalls).toBe(1);
+		expect(continuationRows.map((row) => row.updateEpoch)).toEqual(["epoch", "old-source"]);
+		expect(new Set(continuationRows.map((row) => row.payloadJson?.recoveryToken)).size).toBe(1);
+	});
+
 	test("manual startup claims prepared work once and resumes through existing recovery", async () => {
 		loadMode = "working";
 		setObservedRestartHandoffForTests(null);
@@ -675,6 +988,35 @@ describe("planned update recovery snapshot", () => {
 		expect(startup.protection).toBe(startupProtection);
 	});
 
+	test.each([
+		true,
+		false,
+	])("publishes only owned targets before a bounded discovery read fails (owned=%s)", async (owned) => {
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "discovery-failure",
+			capturedAt: new Date().toISOString(),
+			handoffMarkerNonce: HANDOFF_NONCE,
+			narrators: [{ narratorId: "owner", locale: "en" }],
+		});
+		actAsReplacementProcess(owned ? HANDOFF_NONCE : "another-process");
+		const { toolContinuationService: service } = await import("../tool-continuation-service");
+		const read = spyOn(service, "listByEpoch").mockRejectedValue(
+			new Error("Continuation recovery payload budget exceeded"),
+		);
+		const targets: string[] = [];
+		try {
+			const startup = getPlannedUpdateStartupProtection({
+				onTargetsDiscovered: (ids) => targets.push(...ids),
+			});
+			if (owned) await expect(startup).rejects.toThrow("payload budget exceeded");
+			else expect((await startup).snapshot).toBeNull();
+			expect(targets).toEqual(owned ? ["owner"] : []);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
 	test("reports a failed legacy resume without writing the target back to the manifest", async () => {
 		// A retry entry could only ever be claimed by a startup that does not own this manifest,
 		// which is exactly how abandoned narrators were resumed on every later boot.
@@ -704,7 +1046,8 @@ describe("planned update recovery snapshot", () => {
 			narrators: [{ narratorId: "n1", locale: "en" }],
 		});
 
-		// The next startup is not this update's replacement, so the leftover cannot resume anything.
+		// The next process is not this update's replacement, so the leftover cannot resume anything.
+		resetRecoveryHandoffForTests();
 		setObservedRestartHandoffForTests(null);
 		continueNarratorCalls = 0;
 		const nextStartup = await getPlannedUpdateStartupProtection();
@@ -1021,8 +1364,13 @@ describe("planned update continuation scheduling", () => {
 		await Bun.sleep(0);
 		expect(executePersistedCalls).toBe(1);
 		expect(awaitStarted).toBe(false);
-		releaseAgent();
+		// Readiness and another close attempt do not wait for human approval or Agent completion.
 		const recovery = await restoring;
+		const ticket = reserveRecoveryHandoff();
+		await waitForRecoveryHandoffReady(ticket);
+		expect(awaitStarted).toBe(false);
+		releaseRecoveryHandoff(ticket);
+		releaseAgent();
 		await recovery?.completion;
 		expect(awaitStarted).toBe(true);
 	});
@@ -1065,8 +1413,13 @@ describe("planned update continuation scheduling", () => {
 		await Bun.sleep(0);
 		expect(executePersistedCalls).toBe(1);
 		expect(awaitStarted).toBe(false);
-		releaseAgent();
+		// Readiness and another close attempt do not wait for human approval or Agent completion.
 		const recovery = await restoring;
+		const ticket = reserveRecoveryHandoff();
+		await waitForRecoveryHandoffReady(ticket);
+		expect(awaitStarted).toBe(false);
+		releaseRecoveryHandoff(ticket);
+		releaseAgent();
 		await recovery?.completion;
 		expect(awaitStarted).toBe(true);
 	});
@@ -1229,6 +1582,748 @@ describe("planned update continuation scheduling", () => {
 		finishBackground("<subagent_id>child-background</subagent_id>\n\ndone");
 	});
 
+	test.each([
+		true,
+		false,
+	])("background recovery resumes only a severed foreground owner (severed=%s)", async (severed) => {
+		loadMode = severed ? "working" : "idle";
+		const childFinished = Promise.withResolvers<string>();
+		resumedAgentCompletion = childFinished.promise;
+		const record = continuationRecord("background-only", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([{ narratorId: "owner", locale: "en" }]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		loadMode = "idle";
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await recovery?.completion;
+			expect(resumedAgentCalls).toHaveLength(1);
+			expect(continueNarratorCalls).toBe(severed ? 1 : 0);
+			expect(continuationRows[0]?.payloadJson?.recoveryPhase).toBe("owner_continuation_started");
+		} finally {
+			childFinished.resolve("done");
+		}
+	});
+
+	async function prepareBackgroundOwner() {
+		sqlite
+			.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)")
+			.run("acl-user", "acl-user", "unused", new Date().toISOString());
+		loadMode = "working";
+		const childFinished = Promise.withResolvers<string>();
+		resumedAgentCompletion = childFinished.promise;
+		const record = continuationRecord("background-race", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([
+			{ narratorId: "owner", locale: "en", userId: "acl-user" },
+		]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		loadMode = "idle";
+		return { prepared, childFinished };
+	}
+
+	test("interrupt during legacy owner lookup cannot restart its foreground turn", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		const entered = Promise.withResolvers<void>();
+		const lookup = Promise.withResolvers<void>();
+		const { narratorService } = await import("../narrator-service");
+		const getById = narratorService.getById;
+		const lookupSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => {
+			if (id === "owner") {
+				entered.resolve();
+				await lookup.promise;
+			}
+			return getById(id);
+		});
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await entered.promise;
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			lookup.resolve();
+			await recovery?.completion;
+			expect(continueNarratorCalls).toBe(0);
+			expect(resumedAgentCalls).toHaveLength(1);
+			expect((resumedAgentCalls[0]?.cancelSignal as AbortSignal | undefined)?.aborted).not.toBe(
+				true,
+			);
+		} finally {
+			lookup.resolve();
+			lookupSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test("interrupt inside real continuation history admission cannot abort a later user run", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const entered = Promise.withResolvers<void>();
+		const history = Promise.withResolvers<void>();
+		const newRunFinished = Promise.withResolvers<void>();
+		const interruptFinalizer = Promise.withResolvers<void>();
+		const finalizerEntered = Promise.withResolvers<void>();
+		cancelInterruptibleGate = interruptFinalizer.promise;
+		markCancelInterruptibleStarted = finalizerEntered.resolve;
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+			async () => {
+				entered.resolve();
+				await history.promise;
+				return [];
+			},
+		);
+		const launches: string[] = [];
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation(
+			async (active, _owner, text) => {
+				active._loopRunning = true;
+				launches.push(text);
+				await newRunFinished.promise;
+				active._loopRunning = false;
+				return { started: true };
+			},
+		);
+		const next = {
+			narratorId: "owner",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+			// A direct start runs as the user who sent the turn.
+			_currentUserId: "acl-user",
+		} as import("../narrator-session-state").ActiveNarrator;
+		let newRun: Promise<{ started: boolean }> | undefined;
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await entered.promise;
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			// The newer start is genuinely queued behind the old continuation admission.
+			activeNarrators.set("owner", next);
+			newRun = realNarratorSessionModule.runAgentLoop(next, "new user turn");
+			history.resolve();
+			await finalizerEntered.promise;
+			expect(launches).toEqual([]);
+			interruptFinalizer.resolve();
+			await recovery?.completion;
+			// The queued start prepares its run outside the admission, after the finalizer.
+			for (let i = 0; i < 200 && launches.length === 0; i++) await Bun.sleep(5);
+			expect(launches).toEqual(["new user turn"]);
+			expect(next.abortController.signal.aborted).toBe(false);
+			expect((resumedAgentCalls[0]?.cancelSignal as AbortSignal | undefined)?.aborted).not.toBe(
+				true,
+			);
+			const persisted =
+				await realNarratorServiceModule.narratorService.getModelHistorySinceLastCompact("owner");
+			expect(persisted.filter((message) => message.role === "user")).toHaveLength(0);
+		} finally {
+			history.resolve();
+			interruptFinalizer.resolve();
+			newRunFinished.resolve();
+			await newRun;
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test.each([
+		{ toolTail: false, gate: "status" },
+		{ toolTail: true, gate: "status" },
+		{ toolTail: false, gate: "enqueue" },
+		{ toolTail: false, gate: "claim" },
+	])("real continuation keeps interrupt coverage through loop dispatch (%j)", async ({
+		toolTail,
+		gate,
+	}) => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const statusEntered = Promise.withResolvers<void>();
+		const statusGate = Promise.withResolvers<void>();
+		const buffer = await import("../narrator-buffer");
+		if (gate === "claim")
+			await buffer.enqueueBufferedMessage(
+				"owner",
+				"queued real input",
+				undefined,
+				null,
+				"acl-user",
+			);
+		const inbox = await import("../agent-runtime/inbox");
+		const claim = inbox.claimInboxHead;
+		const claimSpy = spyOn(inbox, "claimInboxHead").mockImplementation(async (...args) => {
+			const row = await claim(...args);
+			if (gate === "claim") {
+				statusEntered.resolve();
+				await statusGate.promise;
+			}
+			return row;
+		});
+		const enqueue = buffer.enqueueBufferedMessage;
+		const enqueueSpy = spyOn(buffer, "enqueueBufferedMessage").mockImplementation(
+			async (...args) => {
+				const accepted = await enqueue(...args);
+				if (gate === "enqueue") {
+					statusEntered.resolve();
+					await statusGate.promise;
+				}
+				return accepted;
+			},
+		);
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue(
+			toolTail
+				? ([
+						{
+							id: "tool-tail",
+							role: "assistant",
+							contentJson: [{ type: "tool_use", id: "tool-use", name: "Bash" }],
+						},
+					] as never)
+				: [],
+		);
+		const getById = narratorService.getById;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => ({
+			...(await getById(id)),
+			title: "Existing",
+		}));
+		const statusSpy = spyOn(narratorService, "updateStatus").mockImplementation(
+			async (_id, status) => {
+				if (status === "working") {
+					statusEntered.resolve();
+					await statusGate.promise;
+				}
+			},
+		);
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockResolvedValue({ started: true });
+		const active = {
+			narratorId: "owner",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("owner", active);
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await statusEntered.promise;
+			expect(active._currentUserId).toBe("acl-user");
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			statusGate.resolve();
+			await recovery?.completion;
+			expect(runtimeSpy).not.toHaveBeenCalled();
+			expect(await buffer.getBufferedMessagesAsync("owner")).toHaveLength(gate === "claim" ? 1 : 0);
+			expect((resumedAgentCalls[0]?.cancelSignal as AbortSignal | undefined)?.aborted).not.toBe(
+				true,
+			);
+		} finally {
+			statusGate.resolve();
+			await recovery?.completion;
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			getSpy.mockRestore();
+			statusSpy.mockRestore();
+			enqueueSpy.mockRestore();
+			claimSpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test.each([
+		"plain",
+		"queued",
+		"queued-bash",
+		"queued-bash-interrupt",
+	])("real background owner continuation hands off with accepted user identity (%s)", async (input) => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators, hasNarratorRuntimeClaim } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const finishLoop = Promise.withResolvers<void>();
+		const buffer = await import("../narrator-buffer");
+		if (input !== "plain") {
+			sqlite
+				.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)")
+				.run("queued-user", "queued-user", "unused", new Date().toISOString());
+			await buffer.enqueueBufferedMessage(
+				"owner",
+				"queued user turn",
+				undefined,
+				null,
+				"queued-user",
+				null,
+				undefined,
+				"back",
+				input.includes("bash") ? "test-command" : null,
+			);
+		}
+		const narratorModule = await import("../narrator-service");
+		const bashSpy = spyOn(narratorModule, "handleBashCommand").mockImplementation(
+			async (_id, _command, _raw, userId, options) => {
+				expect(userId).toBe("queued-user");
+				expect(options?.signal?.aborted).toBe(false);
+				if (input === "queued-bash-interrupt") {
+					expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+					expect(options?.signal?.aborted).toBe(true);
+				}
+				return { type: "bash", id: "test-bash", output: "done", isError: false };
+			},
+		);
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue(
+			[],
+		);
+		const getById = narratorService.getById;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => ({
+			...(await getById(id)),
+			title: "Existing",
+		}));
+		const active = {
+			narratorId: "owner",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("owner", active);
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation(
+			async (current, owner, _text, _images, _run, prePromptBashCommand) => {
+				expect(owner.isCurrent()).toBe(true);
+				current._loopRunning = true;
+				if (prePromptBashCommand)
+					await narratorModule.handleBashCommand(
+						"owner",
+						prePromptBashCommand,
+						"",
+						current._currentUserId ?? undefined,
+						{ signal: current.abortController.signal },
+					);
+				await finishLoop.promise;
+				current._loopRunning = false;
+				return { started: true };
+			},
+		);
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await recovery?.completion;
+			expect(runtimeSpy).toHaveBeenCalledTimes(1);
+			expect(active._currentUserId).toBe(input === "plain" ? "acl-user" : "queued-user");
+			expect(bashSpy).toHaveBeenCalledTimes(input.includes("bash") ? 1 : 0);
+			expect(hasNarratorRuntimeClaim("owner")).toBe(false);
+			expect(await buffer.getBufferedMessagesAsync("owner")).toHaveLength(0);
+			if (input !== "queued-bash-interrupt")
+				expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			expect(active.abortController.signal.aborted).toBe(true);
+			expect((resumedAgentCalls[0]?.cancelSignal as AbortSignal | undefined)?.aborted).not.toBe(
+				true,
+			);
+			if (input !== "plain") {
+				const history =
+					await realNarratorServiceModule.narratorService.getModelHistorySinceLastCompact("owner");
+				expect(history.filter((row) => row.role === "user").map((row) => row.contentText)).toEqual([
+					"queued user turn",
+				]);
+			}
+		} finally {
+			finishLoop.resolve();
+			// Serialize with runtime ownership release before the next isolated case.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(realNarratorSessionModule.isLoopRunning("owner")).toBe(false);
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			getSpy.mockRestore();
+			bashSpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test("long queued Bash transfers to real runtime before a short recovery handoff", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const buffer = await import("../narrator-buffer");
+		sqlite
+			.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)")
+			.run("queued-user", "queued-user", "unused", new Date().toISOString());
+		await buffer.enqueueBufferedMessage(
+			"owner",
+			"queued long Bash turn",
+			undefined,
+			null,
+			"queued-user",
+			null,
+			undefined,
+			"back",
+			"test-long-command",
+		);
+		const narratorModule = await import("../narrator-service");
+		const { narratorService } = narratorModule;
+		const { activeNarrators } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const executor = await import("../narrator-executor");
+		const { bashTool } = await import("../../lib/agent/tools/bash");
+		const bashEntered = Promise.withResolvers<AbortSignal>();
+		const finishBash = Promise.withResolvers<void>();
+		const finishedRuntime = Promise.withResolvers<void>();
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue(
+			[],
+		);
+		const getById = narratorService.getById;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => ({
+			...(await getById(id)),
+			title: "Existing",
+		}));
+		const statusSpy = spyOn(narratorService, "updateStatus").mockImplementation(
+			realNarratorServiceModule.narratorService.updateStatus,
+		);
+		const handleSpy = spyOn(narratorModule, "handleBashCommand").mockImplementation(
+			realNarratorServiceModule.handleBashCommand,
+		);
+		const toolSpy = spyOn(bashTool, "execute").mockImplementation(async (_input, context) => {
+			bashEntered.resolve(context.signal);
+			await finishBash.promise;
+			return { output: "cancelled test command", isError: false };
+		});
+		const executorSpy = spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
+			throw new Error("Interrupted Bash must never request a model turn");
+		});
+		const runUnlocked = runtime.runAgentLoopUnlocked;
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation((...args) => {
+			const running = runUnlocked(...args);
+			void running.then(() => finishedRuntime.resolve(), finishedRuntime.reject);
+			return running;
+		});
+		const active = {
+			narratorId: "owner",
+			conversationId: "test-long-bash",
+			model: "test-model",
+			provider: "anthropic",
+			systemPrompt: null,
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+			_substatus: new Set(),
+			_enabledOptionalTools: new Set(),
+			_disabledTools: new Set(),
+			_blockedSkills: { all: false, names: new Set<string>() },
+			_preparedPlanModes: new Map(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("owner", active);
+		let ticket: ReturnType<typeof reserveRecoveryHandoff> | undefined;
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			const bashSignal = await bashEntered.promise;
+			ticket = reserveRecoveryHandoff();
+			await expect(waitForRecoveryHandoffReady(ticket, { timeoutMs: 40 })).resolves.toBeUndefined();
+			expect(active._loopRunning).toBe(true);
+			expect(active._currentUserId).toBe("queued-user");
+			expect(handleSpy.mock.calls[0]?.[3]).toBe("queued-user");
+			releaseRecoveryHandoff(ticket);
+			ticket = undefined;
+			await recovery?.completion;
+			expect(toolSpy).toHaveBeenCalledTimes(1);
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			expect(bashSignal.aborted).toBe(true);
+			expect((resumedAgentCalls[0]?.cancelSignal as AbortSignal | undefined)?.aborted).not.toBe(
+				true,
+			);
+			finishBash.resolve();
+			await finishedRuntime.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(runtimeSpy).toHaveBeenCalledTimes(1);
+			expect(toolSpy).toHaveBeenCalledTimes(1);
+			expect(executorSpy).not.toHaveBeenCalled();
+			expect(realNarratorSessionModule.isLoopRunning("owner")).toBe(false);
+			const row = await realNarratorServiceModule.narratorService.getById("owner");
+			expect(row.status).toBe("idle");
+			expect(JSON.parse(row.substatus)).toContain("interrupted");
+		} finally {
+			if (ticket) {
+				try {
+					releaseRecoveryHandoff(ticket);
+				} catch {
+					/* Readiness timeout already released it. */
+				}
+			}
+			if (!active.abortController.signal.aborted)
+				realNarratorSessionModule.interruptNarrator("owner");
+			finishBash.resolve();
+			await recovery?.completion;
+			if (runtimeSpy.mock.calls.length) await finishedRuntime.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			getSpy.mockRestore();
+			statusSpy.mockRestore();
+			handleSpy.mockRestore();
+			toolSpy.mockRestore();
+			executorSpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test.each([
+		false,
+		true,
+	])("independent legacy cancellation settles late working write before next start (newRun=%s)", async (startNewRun) => {
+		loadMode = "working";
+		useRealLegacyContinuation = true;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "legacy",
+			type: "primary",
+			variant: "primary",
+			status: "working",
+			createdAt: now,
+			updatedAt: now,
+		});
+		const prepared = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators, hasNarratorRuntimeClaim } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const entered = Promise.withResolvers<void>();
+		const workingGate = Promise.withResolvers<void>();
+		const finishNewRun = Promise.withResolvers<void>();
+		const realStatus = realNarratorServiceModule.narratorService.updateStatus;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(
+			realNarratorServiceModule.narratorService.getById,
+		);
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue([
+			{
+				id: "legacy-tool-tail",
+				role: "assistant",
+				contentJson: [{ type: "tool_use", id: "legacy-tool", name: "Bash" }],
+			},
+		] as never);
+		const statusSpy = spyOn(narratorService, "updateStatus").mockImplementation(async (...args) => {
+			if (args[1] === "working") {
+				entered.resolve();
+				await workingGate.promise;
+			}
+			return realStatus(...args);
+		});
+		const active = {
+			narratorId: "legacy",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("legacy", active);
+		const launches: string[] = [];
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation(
+			async (current, _owner, text) => {
+				launches.push(text);
+				current._loopRunning = true;
+				await realStatus("legacy", "working");
+				await finishNewRun.promise;
+				current._loopRunning = false;
+				return { started: true };
+			},
+		);
+		let newRun: Promise<{ started: boolean }> | undefined;
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await entered.promise;
+			expect(realNarratorSessionModule.interruptNarrator("legacy")).toBe(true);
+			if (startNewRun) {
+				const next = { ...active, abortController: new AbortController() };
+				activeNarrators.set("legacy", next);
+				// The legacy row has no owner: this turn runs anonymously.
+				newRun = realNarratorSessionModule.runAgentLoop(next, "new legacy user turn", undefined, {
+					principal: null,
+				});
+			}
+			workingGate.resolve();
+			await recovery?.completion;
+			// A queued start prepares its run outside the admission, after the finalizer.
+			for (let i = 0; startNewRun && i < 200 && launches.length === 0; i++) await Bun.sleep(5);
+			const row = await realNarratorServiceModule.narratorService.getById("legacy");
+			expect(row.status).toBe(startNewRun ? "working" : "idle");
+			if (!startNewRun) {
+				expect(JSON.parse(row.substatus)).toContain("interrupted");
+				expect(row.lastStopReason).toBe("user_interrupt");
+			}
+			expect(launches).toEqual(startNewRun ? ["new legacy user turn"] : []);
+			expect(hasNarratorRuntimeClaim("legacy")).toBe(false);
+		} finally {
+			workingGate.resolve();
+			finishNewRun.resolve();
+			await newRun;
+			activeNarrators.delete("legacy");
+			getSpy.mockRestore();
+			historySpy.mockRestore();
+			statusSpy.mockRestore();
+			runtimeSpy.mockRestore();
+		}
+	});
+
+	test("background owner handoff reservation never waits on its own nested advance", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		const reserved = Promise.withResolvers<ReturnType<typeof reserveRecoveryHandoff>>();
+		const severed = prepared.severedNarratorIds;
+		prepared.severedNarratorIds = {
+			...severed,
+			has(id: string) {
+				const ticket = reserveRecoveryHandoff();
+				reserved.resolve(ticket);
+				return severed.has(id);
+			},
+		} as ReadonlySet<string>;
+		let ticket: ReturnType<typeof reserveRecoveryHandoff> | undefined;
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			ticket = await reserved.promise;
+			await expect(waitForRecoveryHandoffReady(ticket, { timeoutMs: 40 })).resolves.toBeUndefined();
+		} finally {
+			if (ticket) {
+				try {
+					releaseRecoveryHandoff(ticket);
+				} catch {
+					/* Timeout already releases the ticket. */
+				}
+			}
+			await recovery?.completion;
+			childFinished.resolve("done");
+		}
+	});
+
+	test("an invalidated background owner is not resumed after its child mounts", async () => {
+		loadMode = "working";
+		const record = continuationRecord("background-invalidated", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([{ narratorId: "owner", locale: "en" }]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		invalidateRecoveryTarget("owner");
+		loadMode = "idle";
+		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+		await recovery?.completion;
+		expect(continueNarratorCalls).toBe(0);
+	});
+
+	test("failed background parent continuation is visible and retains recovery evidence", async () => {
+		loadMode = "working";
+		const record = continuationRecord("background-parent-failed", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([{ narratorId: "owner", locale: "en" }]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		sqlite.prepare("UPDATE narrators SET status = 'working' WHERE id = 'owner'").run();
+		loadMode = "idle";
+		continueNarratorImpl = async () => {
+			throw new Error("foreground continuation failed");
+		};
+		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+		await expect(recovery?.completion).rejects.toThrow("Failed to mount 1 legacy narrator");
+		expect(continueNarratorCalls).toBe(1);
+		const row = sqlite
+			.prepare("SELECT status, substatus, error_message FROM narrators WHERE id = 'owner'")
+			.get() as { status: string; substatus: string; error_message: string };
+		expect(row.status).toBe("idle");
+		expect(JSON.parse(row.substatus)).toContain("error");
+		expect(row.error_message).toContain("Startup recovery failed");
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).not.toBeNull();
+	});
+
+	test("token binding failure releases all registrations before any execution starts", async () => {
+		loadMode = "idle";
+		const first = continuationRecord("first-result", "first", { state: "completed" });
+		const second = continuationRecord("second-result", "second", { state: "completed" });
+		continuationRows = [first, second];
+		recoveryQueue = [
+			recoveryItem(first, "first-message", 0),
+			recoveryItem(second, "second-message", 0),
+		];
+		const prepared = await prepareRecovery();
+		const { toolContinuationService: service } = await import("../tool-continuation-service");
+		const { hasNarratorRuntimeClaim } = await import("../narrator-session-state");
+		const bind = service.bindRecoveryTokenForNarrator;
+		const binding = spyOn(service, "bindRecoveryTokenForNarrator").mockImplementation(
+			async (...args) => {
+				if (args[0] === "second") throw new Error("binding failed");
+				return bind(...args);
+			},
+		);
+		try {
+			await expect(restoreNarratorsAfterPlannedUpdate(prepared)).rejects.toThrow("binding failed");
+			expect(hasNarratorRuntimeClaim("first")).toBe(false);
+			expect(hasNarratorRuntimeClaim("second")).toBe(false);
+			expect(executePersistedCalls).toBe(0);
+			expect(continueNarratorCalls).toBe(0);
+		} finally {
+			binding.mockRestore();
+		}
+	});
+
 	test("preserves an explicit Agent timeout as an absolute execution deadline", () => {
 		const startedAt = Date.parse("2026-07-20T12:00:00.000Z");
 		const resolved = resolveAgentExecutionDeadline({
@@ -1330,6 +2425,8 @@ describe("planned update continuation scheduling", () => {
 
 	test("parent interrupt reaches recovered foreground Agent and Await", async () => {
 		loadMode = "idle";
+		const awaitMounted = Promise.withResolvers<void>();
+		onAwaitMounted = awaitMounted.resolve;
 		let finishAgent = (_value: string) => {};
 		resumedAgentCompletion = new Promise<string>((resolve) => {
 			finishAgent = resolve;
@@ -1359,19 +2456,23 @@ describe("planned update continuation scheduling", () => {
 		const prepared = await prepareRecovery();
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		expect(resumedAgentCalls).toHaveLength(1);
-		expect(awaitAgentCalls).toHaveLength(1);
-		const agentSignal = resumedAgentCalls[0]?.cancelSignal as AbortSignal;
-		const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
-		expect(agentSignal.aborted).toBe(false);
-		expect(awaitSignal.aborted).toBe(false);
-
-		expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
-		expect(agentSignal.aborted).toBe(true);
-		expect(awaitSignal.aborted).toBe(true);
-		finishAgent("<subagent_id>child-interrupt</subagent_id>\n\ninterrupted");
-		finishAwait({ id: "child-interrupt", status: "aborted", formatted: "interrupted" });
-		await recovery?.completion;
+		try {
+			expect(resumedAgentCalls).toHaveLength(1);
+			await awaitMounted.promise;
+			expect(awaitAgentCalls).toHaveLength(1);
+			const agentSignal = resumedAgentCalls[0]?.cancelSignal as AbortSignal;
+			const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
+			expect(agentSignal.aborted).toBe(false);
+			expect(awaitSignal.aborted).toBe(false);
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			expect(agentSignal.aborted).toBe(true);
+			expect(awaitSignal.aborted).toBe(true);
+		} finally {
+			realNarratorSessionModule.interruptNarrator("owner");
+			finishAgent("<subagent_id>child-interrupt</subagent_id>\n\ninterrupted");
+			finishAwait({ id: "child-interrupt", status: "aborted", formatted: "interrupted" });
+			await recovery?.completion;
+		}
 		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
 		expect(continueNarratorCalls).toBe(0);
 	});
@@ -1453,6 +2554,8 @@ describe("planned update continuation scheduling", () => {
 
 	test("parent interrupt resolves mixed background delivery without failing recovery", async () => {
 		loadMode = "idle";
+		const awaitMounted = Promise.withResolvers<void>();
+		onAwaitMounted = awaitMounted.resolve;
 		let finishBackground = (_value: string) => {};
 		let backgroundSettled = false;
 		resumedAgentCompletion = new Promise<string>((resolve) => {
@@ -1522,26 +2625,36 @@ describe("planned update continuation scheduling", () => {
 		const prepared = await prepareRecovery();
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		await resultWriteReached;
-		expect(resumedAgentCalls).toHaveLength(1);
-		expect(awaitAgentCalls).toHaveLength(1);
-		expect(resumedAgentCalls[0]?.cancelSignal).toBeUndefined();
-		const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
-		expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
-		await cancellationStart;
-		expect(awaitSignal.aborted).toBe(true);
-		releaseCancellation();
-		await Bun.sleep(0);
-		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
-		finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
-		releaseResultWrite();
-		await recovery?.completion;
+		try {
+			await resultWriteReached;
+			expect(resumedAgentCalls).toHaveLength(1);
+			await awaitMounted.promise;
+			expect(awaitAgentCalls).toHaveLength(1);
+			// A background continuation has no caller cancellation to inherit.
+			expect(resumedAgentCalls[0]?.cancelSignal).toBeUndefined();
+			const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			await cancellationStart;
+			expect(awaitSignal.aborted).toBe(true);
+			releaseCancellation();
+			await Bun.sleep(0);
+			expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
+			finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
+			releaseResultWrite();
+			await recovery?.completion;
 
-		expect(backgroundSettled).toBe(false);
-		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
-		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
-		finishBackground("<subagent_id>background-mixed-child</subagent_id>\n\ndone");
-		await resumedAgentCompletion;
+			expect(backgroundSettled).toBe(false);
+			expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
+			expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+		} finally {
+			realNarratorSessionModule.interruptNarrator("owner");
+			releaseCancellation();
+			finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
+			releaseResultWrite();
+			finishBackground("<subagent_id>background-mixed-child</subagent_id>\n\ndone");
+			await recovery?.completion;
+			await resumedAgentCompletion;
+		}
 	});
 
 	test("recovered Await output matches the uninterrupted tool result shape", () => {
@@ -1781,6 +2894,7 @@ describe("planned update continuation scheduling", () => {
 			scope: snapshot.waiters[0].scope,
 		};
 		const sendRecord = continuationRecord("tool-send-priority", "owner", {
+			updateEpoch: "old-source",
 			kind: "send_await",
 			state: "waiting",
 			payloadJson: { sendAwait: snapshot },
@@ -1802,7 +2916,18 @@ describe("planned update continuation scheduling", () => {
 			recoveryItem(agentRecord, "message-agent-priority", 0),
 			recoveryItem(sendRecord, "message-send-priority", 0),
 		];
-		const prepared = await prepareRecovery();
+		const prepared = await prepareRecovery(
+			[],
+			[
+				{
+					updateEpoch: "old-source",
+					kind: "planned",
+					capturedAt: "2026-10-01T00:00:00.000Z",
+					narrators: [],
+					pendingNarratorIds: [],
+				},
+			],
+		);
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
 		expect(replyWaiterPresenceAtAgentResume).toEqual([true]);

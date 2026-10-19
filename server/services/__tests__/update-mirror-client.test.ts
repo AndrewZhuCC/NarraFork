@@ -13,7 +13,10 @@ import {
 	createGithubUpdateDeadline,
 	downloadGithubUpdateToFile,
 } from "../github-release-patch-apply";
-import { downloadGithubBinaryToFile } from "../github-release-update";
+import {
+	downloadGithubBinaryToFile,
+	readIndexedGithubBinaryMetadata,
+} from "../github-release-update";
 import { checkMirrorUpdate, downloadMirrorPatch, getMirrorNotes } from "../update-mirror-client";
 import {
 	checkForUpdate,
@@ -77,6 +80,23 @@ let outputPath: string;
 let calls: string[];
 let mode: string;
 let transport: UpdateFetchContext;
+let binaryMetadataChanges: Record<string, unknown>;
+
+function binarySidecar() {
+	return Buffer.from(
+		JSON.stringify({
+			name,
+			version,
+			platform,
+			size: binary.length,
+			sha256: hash(binary),
+			sha512: hash(binary, "sha512"),
+			commit: "a".repeat(40),
+			recoveryManifestVersions: [1, 2, 3],
+			...binaryMetadataChanges,
+		}),
+	);
+}
 
 function fixturePatch() {
 	return mode === "rebuild" ? zstdCompressSync(Buffer.alloc(binary.length)) : patchBytes;
@@ -111,7 +131,11 @@ function index(): UpdateIndexV1 {
 						sha256: hash(binary),
 						sha512: hash(binary, "sha512"),
 						platform: identity.platform,
-						metadata: { name: `${name}.metadata.json`, size: 20, sha256: "b".repeat(64) },
+						metadata: {
+							name: `${name}.metadata.json`,
+							size: binarySidecar().length,
+							sha256: hash(binarySidecar()),
+						},
 						patches: [
 							{
 								name: patchName,
@@ -150,6 +174,7 @@ beforeEach(async () => {
 	await writeFile(basePath, baseBinary);
 	calls = [];
 	mode = "good";
+	binaryMetadataChanges = {};
 	transport = {
 		key: "fixture-frozen-proxy",
 		isCurrent: () => true,
@@ -157,6 +182,7 @@ beforeEach(async () => {
 			calls.push(url);
 			expect(init?.redirect).toBe("manual");
 			if (url === `${baseUrl}/index`) return Response.json(index());
+			if (url === `${fullUrl}.metadata.json`) return streamed(binarySidecar());
 			if (url === `${baseUrl}/assets/${hash(notesBytes)}`)
 				return streamed(mode === "badnotes" ? Buffer.alloc(notesBytes.length) : notesBytes);
 			if (url.startsWith(`${baseUrl}/availability/`)) {
@@ -241,6 +267,99 @@ async function clean(output = true) {
 	if (output) expect(await readFile(outputPath)).toEqual(binary);
 }
 
+describe("canonical mirror recovery capabilities", () => {
+	test("legacy GitHub sidecars remain compatible without claiming v3", async () => {
+		binaryMetadataChanges = { recoveryManifestVersions: undefined };
+		expect((await checked()).recoveryManifestVersions).toEqual([1, 2]);
+	});
+	test("future protocol numbers do not imply v3", async () => {
+		binaryMetadataChanges = { recoveryManifestVersions: [1, 2, 4] };
+		expect((await checked()).recoveryManifestVersions).toEqual([1, 2, 4]);
+	});
+	for (const changes of [
+		{ recoveryManifestVersions: null },
+		{ recoveryManifestVersions: [3, 3] },
+		{ recoveryManifestVersions: [] },
+		{ recoveryManifestVersions: [1, 2, 256] },
+		{ name: "another" },
+		{ version: "999.0.0" },
+		{ platform: "unknown" },
+		{ size: binary.length + 1 },
+		{ commit: "b".repeat(40) },
+		{ sha256: "b".repeat(64) },
+		{ sha512: hash("another", "sha512") },
+	]) {
+		test(`invalid GitHub sidecar ${JSON.stringify(changes)} fails before patch selection`, async () => {
+			binaryMetadataChanges = changes;
+			await expect(checked()).rejects.toMatchObject({ code: "INVALID_METADATA" });
+			expect(calls).toEqual([`${baseUrl}/index`, `${fullUrl}.metadata.json`]);
+		});
+	}
+	for (const failure of ["digest", "size", "oversize", "json", "unavailable", "redirect"]) {
+		test(`GitHub sidecar ${failure} cannot grant mirror v3 capabilities`, async () => {
+			const original = transport.fetch;
+			transport.fetch = async (url, init) => {
+				if (url !== `${fullUrl}.metadata.json`) return original(url, init);
+				if (failure === "unavailable") return new Response(null, { status: 404 });
+				if (failure === "redirect")
+					return new Response(null, {
+						status: 302,
+						headers: { location: "https://evil.example/sidecar" },
+					});
+				if (failure === "oversize") return streamed(Buffer.alloc(64 * 1024 + 1));
+				if (failure === "json") return new Response("{");
+				if (failure === "size") return new Response(`${binarySidecar().toString()} `);
+				return new Response(binarySidecar().toString().replace("[1,2,3]", "[1,2,4]"));
+			};
+			await expect(checked()).rejects.toThrow();
+			expect(
+				calls.some((url) => url.includes("availability") || url.includes("evil.example")),
+			).toBe(false);
+		});
+	}
+	test("same-version changed binary cannot reuse previously checked capabilities", async () => {
+		expect((await checked()).recoveryManifestVersions).toContain(3);
+		const changedDigest = hash("different target", "sha512");
+		binaryMetadataChanges = { sha512: changedDigest, recoveryManifestVersions: undefined };
+		const replacement = index();
+		replacement.releases[0].files[0].sha512 = changedDigest;
+		const original = transport.fetch;
+		transport.fetch = async (url, init) =>
+			url === `${baseUrl}/index` ? Response.json(replacement) : original(url, init);
+		const release = await checked();
+		expect(release.sha512).toBe(changedDigest);
+		expect(release.recoveryManifestVersions).toEqual([1, 2]);
+	});
+	test("indexed sidecar request and stream honor the caller deadline", async () => {
+		const target = index().releases[0];
+		for (const stage of ["headers", "body"]) {
+			await expect(
+				readIndexedGithubBinaryMetadata(
+					{
+						repository: identity.repository,
+						version,
+						commit: target.commit,
+						binary: target.files[0],
+					},
+					{
+						signal: AbortSignal.timeout(20),
+						fetcher: async () =>
+							stage === "headers"
+								? new Promise(() => {})
+								: new Response(
+										new ReadableStream({
+											start(controller) {
+												controller.enqueue(Buffer.from("{"));
+											},
+										}),
+									),
+					},
+				),
+			).rejects.toThrow();
+		}
+	});
+});
+
 describe("canonical mirror actual file pipeline", () => {
 	test("stable channel without a published release reports NO_RELEASE rather than up-to-date", async () => {
 		const betaOnly = index();
@@ -264,10 +383,13 @@ describe("canonical mirror actual file pipeline", () => {
 		expect(result.releaseInfo).toBeUndefined();
 		expect(calls).toEqual([`${baseUrl}/index`]);
 	});
-	test("available direct patch verifies metadata/base/payload/output and never requests GitHub", async () => {
+	test("available direct patch verifies metadata/base/payload/output and requests only the binary sidecar from GitHub", async () => {
 		const release = await checked();
+		expect(release.recoveryManifestVersions).toEqual([1, 2, 3]);
 		expect(await run(release)).toBe("zstd");
-		expect(calls.every((url) => url.startsWith(identity.serverUrl))).toBe(true);
+		expect(calls.filter((url) => !url.startsWith(identity.serverUrl))).toEqual([
+			`${fullUrl}.metadata.json`,
+		]);
 		await clean();
 	});
 	test.each([
@@ -286,7 +408,10 @@ describe("canonical mirror actual file pipeline", () => {
 		if (failure === "badbase") await writeFile(basePath, Buffer.alloc(baseBinary.length));
 		if (failure === "badbasesize") await writeFile(basePath, "wrong size");
 		expect(await run(release)).toBe("full");
-		expect(calls.filter((url) => url.startsWith("https://github.com/"))).toEqual([fullUrl]);
+		expect(calls.filter((url) => url.startsWith("https://github.com/"))).toEqual([
+			`${fullUrl}.metadata.json`,
+			fullUrl,
+		]);
 		expect(calls.some((url) => url.includes("api.github.com") || url.includes("/latest"))).toBe(
 			false,
 		);
@@ -326,6 +451,7 @@ describe("canonical mirror actual file pipeline", () => {
 	test("optional mirror notes are byte-verified and frozen to the selected repository/version/hash", async () => {
 		const release = await checked();
 		expect(release.notesAvailable).toBe(true);
+		calls = [];
 		expect((await getMirrorNotes(identity, version, release.sha512, transport)).notes).toEqual({
 			en: "Canonical fixture notes",
 			"zh-CN": "Canonical fixture notes",
@@ -362,6 +488,7 @@ describe("canonical mirror actual file pipeline", () => {
 		const downloaded = await downloadUpdate(checked.releaseInfo);
 		expect(downloaded.success).toBe(true);
 		expect(downloaded.preparedIdentity?.sourceIdentity).toEqual(checked.sourceIdentity ?? null);
+		expect(downloaded.preparedIdentity?.recoveryManifestVersions).toEqual([1, 2, 3]);
 		if (!downloaded.updatePath) throw new Error("Missing verified output");
 		expect(await readFile(downloaded.updatePath)).toEqual(binary);
 		const controller = new AbortController();

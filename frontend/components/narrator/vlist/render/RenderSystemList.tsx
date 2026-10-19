@@ -35,7 +35,7 @@ interface RenderSystemListProps {
 	 * Optional click handler for an entry (navigation lives outside vlist/). When
 	 * omitted the entry lines are rendered static / non-interactive.
 	 */
-	onOpenEntry?: (entryId: string) => void;
+	onOpenEntry?: (entryId: string, scope: "global" | "personal") => void;
 }
 
 /**
@@ -70,7 +70,7 @@ export function RenderSystemList({ measured, onOpenEntry }: RenderSystemListProp
 						const clickable = typeof onOpenEntry === "function";
 						return (
 							<Tooltip
-								key={e.entryId}
+								key={`${e.scope ?? "global"}:${e.entryId}`}
 								label={e.summary || e.title || e.entryId}
 								multiline
 								maw={360}
@@ -82,7 +82,9 @@ export function RenderSystemList({ measured, onOpenEntry }: RenderSystemListProp
 									c="indigo"
 									truncate
 									style={clickable ? { cursor: "pointer" } : undefined}
-									onClick={clickable ? () => onOpenEntry?.(e.entryId) : undefined}
+									onClick={
+										clickable ? () => onOpenEntry?.(e.entryId, e.scope ?? "global") : undefined
+									}
 								>
 									{label}
 								</Text>

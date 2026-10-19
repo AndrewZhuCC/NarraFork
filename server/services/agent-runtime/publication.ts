@@ -20,6 +20,7 @@ import {
 	type RuntimeRunBinding,
 	registerRun,
 } from "../../lib/validators/runtime-registration";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 
 export type StartedAgentRun = PublicationRun & { binding: RuntimeRunBinding };
 
@@ -1179,6 +1180,7 @@ function createSqliteAsyncPublicationService(
 					);
 				}
 			});
+			backgroundOccupancyStore.refreshNarrator(input.narratorId);
 		},
 		commitTerminalTransition: async (input) => {
 			const task = runAtomicWrite(db, "publication.commitTerminalTransition", (tx) => {
@@ -1345,6 +1347,7 @@ function createSqliteAsyncPublicationService(
 					.where(eq(narrators.id, input.narratorId))
 					.run();
 			});
+			backgroundOccupancyStore.refreshNarrator(input.narratorId);
 		},
 		markTakenOver: async (input) =>
 			Promise.resolve(
@@ -1586,7 +1589,10 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 		startBashRun: (input) => engine.startBashRun(input),
 		releaseUnusedRunSlots: (run) => queue.outbox.releaseUnusedRunSlots(run),
 		restartAgentTask: (input) => engine.restartAgentTask(input),
-		updateNarratorBackground: (input) => engine.updateNarratorBackground(input),
+		updateNarratorBackground: async (input) => {
+			await engine.updateNarratorBackground(input);
+			backgroundOccupancyStore.refreshNarrator(input.narratorId);
+		},
 		commitTerminalTransition: (input) => engine.commitTerminalTransition(input),
 		cleanupTasks: (input) => engine.cleanupTasks(input),
 		readBackgroundTask: async (taskId) =>
@@ -1594,7 +1600,10 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 		readTaskDetail: async (taskId) =>
 			(await engine.readTaskDetail(taskId)) as BackgroundTaskRecord | null,
 		cancelTask: (input) => engine.cancelTask(input),
-		cancelAgentNarrator: (input) => engine.cancelAgentNarrator(input),
+		cancelAgentNarrator: async (input) => {
+			await engine.cancelAgentNarrator(input);
+			backgroundOccupancyStore.refreshNarrator(input.narratorId);
+		},
 		markTakenOver: (input) => engine.markTakenOver(input),
 		finalizeTakeover: (input) => engine.finalizeTakeover(input),
 		readRunningStaleTasks: (afterId) => engine.readRunningStaleTasks(afterId),

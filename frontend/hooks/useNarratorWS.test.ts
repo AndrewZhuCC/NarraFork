@@ -405,8 +405,10 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		const receipts: unknown[] = [];
 		const editOrigins: unknown[] = [];
 		const snapshotOrigins: unknown[] = [];
+		const gitStatuses: unknown[] = [];
 		function Harness(): ReactNode {
 			useNarratorWS(narratorId, {
+				onGitStatus: (status) => gitStatuses.push(status),
 				onToolStarted: (_id, _name, _start, _end, _input, _parent, _meta, origin) =>
 					editOrigins.push(origin),
 				onStreamingSnapshot: (snapshot) =>
@@ -456,6 +458,30 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			expect(newListener).toBeFunction();
 			newListener?.({ type: "title_updated", narratorId: "n2", title: "fresh-new-frame" });
 			expect(newWrites).toEqual(["fresh-new-frame"]);
+			newListener?.({
+				type: "git_status",
+				narratorId: "n2",
+				chapterId: "c",
+				linesAdded: 7,
+				linesRemoved: 2,
+			});
+			newListener?.({
+				type: "git_status",
+				narratorId: "n2",
+				chapterId: "c",
+				commitsAhead: 1,
+				baseBranch: "main",
+			});
+			expect(gitStatuses).toEqual([
+				{ chapterId: "c", commitsAhead: 0, baseBranch: "", linesAdded: 7, linesRemoved: 2 },
+				{
+					chapterId: "c",
+					commitsAhead: 1,
+					baseBranch: "main",
+					linesAdded: undefined,
+					linesRemoved: undefined,
+				},
+			]);
 			// Dedicated evidence crosses the raw WS dispatcher; input metadata is not a fallback.
 			const editInput = { file_path: "a.ts", old_string: "h".repeat(20_000), new_string: "new" };
 			const origin = createStreamingEditOrigin("edit", editInput, {

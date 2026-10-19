@@ -1,3 +1,4 @@
+import { STORAGE_CATEGORY_KEYS } from "@shared/storage-categories";
 import { Hono } from "hono";
 import { z } from "zod/v4";
 import {
@@ -78,32 +79,43 @@ storageRoutes.post("/workspace-barriers/:scopeId/maintenance/commit", requireAdm
 	);
 });
 
+const scanSelectionSchema = z.object({
+	categories: z.array(z.enum(STORAGE_CATEGORY_KEYS)).min(1).optional(),
+});
+
 /**
- * POST /api/storage/scan/start — Kick off a storage scan as a server-side background job
- * (admin only). Scanning is decoupled from the HTTP connection: the client may navigate
- * away and the scan still runs to completion and populates the shared cache. Concurrent
- * calls dedupe onto the in-flight job (`started: false`).
+ * POST /api/storage/scan/start — Kick off category scans as server-side background work
+ * (admin only). Omit `categories` to start every category. They run together; a category
+ * that is already running is left alone (`started` is false only when nothing new began).
+ * Scanning is decoupled from the HTTP connection.
  */
-storageRoutes.post("/scan/start", requireAdmin, (c) => {
-	const { started, state } = startStorageScan();
+storageRoutes.post("/scan/start", requireAdmin, async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = scanSelectionSchema.safeParse(body ?? {});
+	if (!parsed.success) return c.json({ error: "Invalid scan request" }, 400);
+	const { started, state } = startStorageScan(parsed.data);
 	return c.json({ started, state });
 });
 
 /**
- * GET /api/storage/scan/status — Poll the background scan job (admin only).
+ * GET /api/storage/scan/status — Poll every category job (admin only).
  */
 storageRoutes.get("/scan/status", requireAdmin, (c) => {
 	return c.json({ state: getStorageScanJob() });
 });
 
 /**
- * POST /api/storage/scan/cancel — Abort the running scan job, if any (admin only).
+ * POST /api/storage/scan/cancel — Abort running category scans (admin only).
+ * Omit `categories` to abort every running category.
  */
 storageRoutes.post("/scan/cancel", requireAdmin, async (c) => {
-	// Awaited: `abort()` alone leaves the state at `running`, so the response would
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = scanSelectionSchema.safeParse(body ?? {});
+	if (!parsed.success) return c.json({ error: "Invalid scan request" }, 400);
+	// Awaited: `abort()` alone leaves the category at `running`, so the response would
 	// report the very status the caller just cancelled. The service waits (briefly,
-	// bounded) for the scan to reach its terminal state before answering.
-	return c.json({ state: await cancelStorageScan() });
+	// bounded) for those categories to reach a terminal state before answering.
+	return c.json({ state: await cancelStorageScan(parsed.data) });
 });
 
 /**
@@ -124,7 +136,6 @@ const cleanupTargetSchema = z.object({
 const databaseCleanupTargetSchema = z.enum([
 	"archivedSessions",
 	"staleSessions",
-	"apiRequestDumps",
 	"toolCallPayloads",
 ]);
 

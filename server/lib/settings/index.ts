@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { normalizeProxyUrl } from "@shared/proxy-settings";
+import type { RecordingSettings } from "@shared/request-recording";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
@@ -34,6 +35,13 @@ import {
 } from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
+import { withSettingsFileLock } from "../settings-file-lock";
+import {
+	type ManagerOwnedFields,
+	managerFieldsFromSettings,
+	preserveExternalManagerFields,
+	readManagerOwnedFields,
+} from "../settings-manager-fields";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { normalizeModelContextWindows } from "./model-context-windows";
@@ -143,8 +151,52 @@ const settingsPath = resolve(narraforkDir, "settings.json");
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
 const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = [];
 
-/** The superseded 1MB `agent.requestDumpMaxSize` default, rewritten on load. */
-const LEGACY_REQUEST_DUMP_MAX_SIZE = 1024 * 1024;
+/** Pre-unification `agent.*` request dump keys, replaced by `requestEvidence`. */
+const LEGACY_REQUEST_DUMP_KEYS = [
+	"requestDumpRecordingEnabled",
+	"requestDumpRequestBytes",
+	"requestDumpResponseBytes",
+	"requestDumpEnabled",
+	"requestDumpErrorsOnly",
+	"requestDumpMaxSize",
+] as const;
+
+/**
+ * Translate legacy `agent.requestDump*` keys into a `requestEvidence` patch.
+ * Returns undefined when none are present. `requestDumpMaxSize` has no successor.
+ */
+export function requestEvidenceFromLegacyAgent(
+	agent: Record<string, unknown> | undefined,
+): Partial<RecordingSettings> | undefined {
+	if (!agent || !LEGACY_REQUEST_DUMP_KEYS.some((key) => key in agent)) return undefined;
+	const patch: Partial<RecordingSettings> = {};
+	if (typeof agent.requestDumpRecordingEnabled === "boolean")
+		patch.ringEnabled = agent.requestDumpRecordingEnabled;
+	if (typeof agent.requestDumpRequestBytes === "number")
+		patch.ringRequestBytes = agent.requestDumpRequestBytes;
+	if (typeof agent.requestDumpResponseBytes === "number")
+		patch.ringResponseBytes = agent.requestDumpResponseBytes;
+	if (typeof agent.requestDumpEnabled === "boolean")
+		patch.autoPin = agent.requestDumpEnabled
+			? agent.requestDumpErrorsOnly === true
+				? "errors"
+				: "all"
+			: "off";
+	return patch;
+}
+
+/** Remove legacy request dump keys in place; true when anything was removed. */
+export function stripLegacyRequestDumpKeys(agent: Record<string, unknown> | undefined): boolean {
+	if (!agent) return false;
+	let changed = false;
+	for (const key of LEGACY_REQUEST_DUMP_KEYS) {
+		if (key in agent) {
+			delete agent[key];
+			changed = true;
+		}
+	}
+	return changed;
+}
 
 export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): boolean {
 	let changed = false;
@@ -328,16 +380,13 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
-	// Raise the superseded 1MB raw-dump ceiling.
-	//
-	// 1MB was the old default and is below the size of essentially any request worth
-	// dumping (full history + replayed tool output), so it truncated the request body of
-	// every capture. Because it was a *default* rather than a deliberate choice, it sits
-	// in settings.json verbatim for existing installs and would survive the new default
-	// forever. Only the exact old default is rewritten: any other value — including a
-	// smaller one — is an operator decision and is left alone.
-	if (raw.agent?.requestDumpMaxSize === LEGACY_REQUEST_DUMP_MAX_SIZE) {
-		merged.agent.requestDumpMaxSize = DEFAULTS.agent.requestDumpMaxSize;
+	// Request dump settings moved from `agent.requestDump*` to `requestEvidence`. An
+	// explicit `requestEvidence` section wins; legacy keys are dropped either way.
+	const legacyEvidence = requestEvidenceFromLegacyAgent(raw.agent);
+	if (legacyEvidence && raw.requestEvidence === undefined) {
+		merged.requestEvidence = { ...merged.requestEvidence, ...legacyEvidence };
+	}
+	if (stripLegacyRequestDumpKeys(merged.agent as unknown as Record<string, unknown>)) {
 		needsSave = true;
 	}
 
@@ -500,6 +549,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 
 	if (initializeTokenDanceModelCollection(merged)) needsSave = true;
 
+	lastDiskManagerFields = managerFieldsFromSettings(merged);
 	if (needsSave) saveSettings(merged);
 
 	// Pricing lives in its own module so cost attribution does not have to pull in
@@ -643,6 +693,8 @@ export function purgeStaleAgentModelRefs(
 const _cache: { current: NarraForkSettings | null } = { current: null };
 
 let settingsRevision = 0;
+/** 上次从磁盘加载（或写回）时，管理器可能单独修改的那些字段。 */
+let lastDiskManagerFields: ManagerOwnedFields = {};
 const settingsChangeListeners = new Set<() => void>();
 
 /** Subscribe to persisted settings after the runtime singleton has been updated. */
@@ -784,16 +836,28 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	reconcileLegacyWindowSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
-	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
-	try {
-		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {
-			mode: 0o600,
-		});
-		renameSync(tempPath, settingsPath);
-	} catch (error) {
-		rmSync(tempPath, { force: true });
-		throw error;
-	}
+	withSettingsFileLock(narraforkDir, () => {
+		let disk: unknown = {};
+		if (existsSync(settingsPath)) {
+			try {
+				disk = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			} catch {
+				disk = {};
+			}
+		}
+		preserveExternalManagerFields(newSettings, readManagerOwnedFields(disk), lastDiskManagerFields);
+		const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
+		try {
+			writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {
+				mode: 0o600,
+			});
+			renameSync(tempPath, settingsPath);
+		} catch (error) {
+			rmSync(tempPath, { force: true });
+			throw error;
+		}
+		lastDiskManagerFields = managerFieldsFromSettings(newSettings);
+	});
 	markLegacyWindowSettingsSaved(newSettings);
 	settingsRevision++;
 

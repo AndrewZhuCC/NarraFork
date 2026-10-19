@@ -3,12 +3,17 @@ import type {
 	KnowledgeBulkGrantResponse,
 	KnowledgeCollection,
 	KnowledgeCollectionAcl,
+	KnowledgeCollectionListItem,
 	KnowledgeDeletePersonalEntryResult,
 	KnowledgeDraft,
 	KnowledgeDraftDiff,
 	KnowledgeDraftDrift,
 	KnowledgeEntry,
+	KnowledgeEntryDetail,
 	KnowledgeEntryLink,
+	KnowledgeEntryPage,
+	KnowledgeEntrySort,
+	KnowledgeEntryStatus,
 	KnowledgeFinding,
 	KnowledgeGrant,
 	KnowledgeGraph,
@@ -17,6 +22,7 @@ import type {
 	KnowledgeLinkType,
 	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
+	KnowledgePersonalEntryDetail,
 	KnowledgePersonalEntrySummary,
 	KnowledgeRebaseResult,
 	KnowledgeRebaseStrategy,
@@ -28,6 +34,8 @@ import type {
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 	KnowledgeSubmissionDetail,
+	KnowledgeSubmissionListItem,
+	KnowledgeSubmissionOutcome,
 	KnowledgeSubmitResult,
 	KnowledgeTag,
 	KnowledgeTagType,
@@ -88,10 +96,13 @@ function qs(params: Record<string, string | undefined>): string {
 	return s ? `?${s}` : "";
 }
 
+/** Default page size for the paged entry list (server max is 200). */
+export const KNOWLEDGE_ENTRY_PAGE_SIZE = 50;
+
 export const knowledgeApi = {
 	// ─── Collections ───
 	listKnowledgeCollections: (projectId?: string) =>
-		request<KnowledgeCollection[]>(`/knowledge/collections${qs({ projectId })}`),
+		request<KnowledgeCollectionListItem[]>(`/knowledge/collections${qs({ projectId })}`),
 	createKnowledgeCollection: (data: {
 		name: string;
 		slug?: string;
@@ -113,7 +124,26 @@ export const knowledgeApi = {
 	// ─── Entries ───
 	listKnowledgeEntries: (opts: { collectionId?: string; tag?: string; q?: string } = {}) =>
 		request<KnowledgeSearchResult[] | KnowledgeEntry[]>(`/knowledge/entries${qs(opts)}`),
-	getKnowledgeEntry: (id: string) => request<KnowledgeEntry>(`/knowledge/entries/${id}`),
+	/** Keyset-paginated entry list; follow `nextCursor` until null. */
+	listKnowledgeEntriesPage: (
+		opts: {
+			collectionId?: string;
+			tag?: string;
+			q?: string;
+			level?: string;
+			status?: KnowledgeEntryStatus;
+			sort?: KnowledgeEntrySort;
+			cursor?: string;
+			limit?: number;
+		} = {},
+	) =>
+		request<KnowledgeEntryPage>(
+			`/knowledge/entries${qs({
+				...opts,
+				limit: String(opts.limit ?? KNOWLEDGE_ENTRY_PAGE_SIZE),
+			})}`,
+		),
+	getKnowledgeEntry: (id: string) => request<KnowledgeEntryDetail>(`/knowledge/entries/${id}`),
 	createKnowledgeEntry: (data: CreateEntryInput) =>
 		request<KnowledgeEntry>("/knowledge/entries", {
 			method: "POST",
@@ -224,7 +254,7 @@ export const knowledgeApi = {
 			body: JSON.stringify(data),
 		}),
 	getPersonalEntry: (id: string) =>
-		request<KnowledgePersonalEntry>(`/knowledge/personal-entries/${id}`),
+		request<KnowledgePersonalEntryDetail>(`/knowledge/personal-entries/${id}`),
 	updatePersonalEntryMeta: (
 		id: string,
 		data: { title?: string; targetCollectionId?: string | null; keywords?: string[] },
@@ -255,10 +285,17 @@ export const knowledgeApi = {
 				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
 			})}`,
 		),
+	/** Recent verdicts on the caller's own submissions. No titles or bodies. */
+	listMyKnowledgeSubmissionOutcomes: (opts: { limit?: number } = {}) =>
+		request<KnowledgeSubmissionOutcome[]>(
+			`/knowledge/my-submission-outcomes${qs({
+				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
+			})}`,
+		),
 
 	// ─── Submissions (review) ───
 	listKnowledgeSubmissions: (opts: { entryId?: string; status?: string } = {}) =>
-		request<KnowledgeSubmission[]>(`/knowledge/submissions${qs(opts)}`),
+		request<KnowledgeSubmissionListItem[]>(`/knowledge/submissions${qs(opts)}`),
 	getKnowledgeSubmission: (id: string) =>
 		request<KnowledgeSubmissionDetail>(`/knowledge/submissions/${id}`),
 	reviewKnowledgeSubmission: (

@@ -498,11 +498,11 @@ export function applyToolCall(
 	toolCall: OrderedToolCall,
 ): string | null {
 	const input = toolCall.inputJson as Record<string, unknown> | null;
-	if (toolCall.toolName === "IntelligentUI" && input?.action !== "show") {
+	if (toolCall.toolName === "GenUI" && input?.action !== "show") {
 		// Template bytes live in the v2 journal, not the input. Never silently
 		// replay generated creates as no-ops or recreate a historical template.
 		throw new ReplayDivergedError(
-			`IntelligentUI call ${toolCall.toolUseId} requires its file-change journal.`,
+			`GenUI call ${toolCall.toolUseId} requires its file-change journal.`,
 			toolCall.toolUseId,
 		);
 	}

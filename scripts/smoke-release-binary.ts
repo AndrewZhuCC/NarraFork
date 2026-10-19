@@ -880,6 +880,7 @@ export async function smokeReleaseBinary(
 		const origin = `http://127.0.0.1:${port}`;
 		const child = scope.spawn([
 			executable,
+			"--serve",
 			"--host=127.0.0.1",
 			`--port=${port}`,
 			"--no-auto-resume",

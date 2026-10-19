@@ -172,7 +172,7 @@ export function ownTurnPlacementOf(row: RuntimeSourceRow): OwnTurnPlacement {
  * a row is the session's own turn when it has no placement, or when it is placed under
  * either this session's historical mount or its current delivery mount
  * (`ownTurnPlacementOf`; `"*"` = every placement). Anything else is a nested transcript. Nothing here depends on how the
- * session was created. SQL form: `TOP_LEVEL_SQL` / `ownTurnSql`.
+ * session was created. SQL form: `topLevelSql` / `ownTurnSql`.
  */
 export function isTopLevelMessage(
 	message: { parentToolUseId?: string | null },

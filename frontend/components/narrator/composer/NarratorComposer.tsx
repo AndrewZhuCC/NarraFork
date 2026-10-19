@@ -1,6 +1,13 @@
-import { Box, Button, Group, Stack, Text, Textarea } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { Box, Button, Group, Stack, Text } from "@mantine/core";
+import { useDisclosure, useFocusTrap } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import {
+	type ComposerDocument,
+	type ComposerInlineNode,
+	composerDocumentText,
+	parseComposerDocument,
+	readComposerDocument,
+} from "@shared/composer-document";
 import type { FileReference, FileReferenceCandidate } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { useQueryClient } from "@tanstack/react-query";
@@ -23,17 +30,21 @@ import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { ApiError, api } from "../../../lib/api";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
+import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
-import { ComposerFullscreenModal } from "./ComposerFullscreenModal";
-import { ComposerQuoteChips } from "./ComposerQuoteChips";
 import {
-	joinQuotedComposerInput,
-	MAX_COMPOSER_QUOTES,
-	sameComposerQuote,
-	splitQuotedComposerInput,
-} from "./composer-quotes";
+	composerAssetsFromFiles,
+	composerInputFromDocument,
+	composerNodeId,
+	importComposerInput,
+	missingComposerAssets,
+} from "./composer-document-adapter";
+import { getComposerFileOrder } from "./composer-file-order";
+import { composerOptimizeTarget } from "./composer-optimize-target";
+import { joinQuotedComposerInput, MAX_COMPOSER_QUOTES } from "./composer-quotes";
+import { getComposerAssetId } from "./draft-image-attachments";
 import { FileReferencePopover } from "./FileReferencePopover";
 import { useFileReferenceScope } from "./FileReferenceScope";
 import {
@@ -42,12 +53,14 @@ import {
 	type FileReferenceInput,
 	fileReferenceKeyAction,
 	getFileReferenceQuery,
-	insertFileReference,
 	readFileReferences,
 	rememberFileReference,
 	sameFileReferenceInput,
 } from "./file-reference-input";
+import { InlineComposerEditor, type InlineComposerEditorHandle } from "./InlineComposerEditor";
+import { InlineQuoteCandidate } from "./InlineQuoteCandidate";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
+import classes from "./NarratorComposer.module.css";
 import {
 	canHydrateNarratorDraftFromMeta,
 	classifyDraftRevisionConflict,
@@ -60,13 +73,11 @@ import {
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
 import { revealComposerQuote, revealQuotedFile } from "./quote-jump";
-import {
-	TextareaOptimizeControls,
-	textareaOptimizeControlsWidth,
-} from "./TextareaOptimizeControls";
+import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
 import { type QuoteCandidate, useQuoteCandidate } from "./use-quote-candidate";
 
 const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
+const EMPTY_FILES: File[] = [];
 
 function createDraftSourceId(): string {
 	return (
@@ -79,11 +90,27 @@ function isDraftWithinSyncLimit(input: string): boolean {
 	return input.length <= MAX_NARRATOR_DRAFT_CHARS;
 }
 
-/** Remote draft shape carried by the WS `draft_changed` event and 409 conflicts. */
+function splitDocumentInput(document: ComposerDocument) {
+	// The model prefix is a projection of quote atoms, not a second parser for literal text.
+	// A quote-looking text node after a real quote must remain in the editable body.
+	const quotes = document.paragraphs.flatMap((paragraph) =>
+		paragraph.children.filter((node) => node.type === "quote"),
+	);
+	const bodyDocument: ComposerDocument = {
+		...document,
+		paragraphs: document.paragraphs.map((paragraph) => ({
+			children: paragraph.children.filter((node) => node.type !== "quote"),
+		})),
+	};
+	return { quotes, body: composerDocumentText(bodyDocument) };
+}
+
 export interface NarratorRemoteDraft {
 	hasDraft: boolean;
 	text: string;
 	fileReferences?: FileReference[];
+	composerDocument?: ComposerDocument;
+	hasComposerDocument?: boolean;
 	revision: number;
 	updatedAt: string | null;
 	updatedBy: string | null;
@@ -100,6 +127,16 @@ export type ComposerQueueMode = "turn" | "tool" | "interrupt";
 export interface NarratorComposerHandle {
 	/** Current raw textarea value (untrimmed). */
 	getText(): string;
+	getDocument(): ComposerDocument | undefined;
+	hasMissingAssets(): boolean;
+	captureAttachmentSelection(): void;
+	captureAttachmentInsertion(
+		origin: "picker" | "paste" | "drop" | "direct",
+	): ReturnType<InlineComposerEditorHandle["captureSelectionBookmark"]> | undefined;
+	insertAcceptedFiles(
+		files: File[],
+		bookmark?: ReturnType<InlineComposerEditorHandle["captureSelectionBookmark"]>,
+	): boolean;
 	/** True when both text and file references are empty (other attachments are panel-owned). */
 	isTextEmpty(): boolean;
 	/** True when `target` is this composer's textarea element. */
@@ -108,7 +145,7 @@ export interface NarratorComposerHandle {
 	setText(text: string): void;
 	getFileReferences(): FileReference[];
 	setFileReferences(refs: FileReference[]): void;
-	restoreInput(text: string, refs: FileReference[]): void;
+	restoreInput(text: string, refs: FileReference[], document?: ComposerDocument): void;
 	addFileReference(ref: FileReference): void;
 	appendText(text: string): void;
 	/** Clear text and references and, when ready, sync the empty draft tombstone. */
@@ -119,7 +156,7 @@ export interface NarratorComposerHandle {
 	/** Post-send draft bookkeeping (sync empty / adopt conflicting server draft). */
 	commitDraftAfterSend(): void;
 	/** Record a sent message in the up-arrow input history. */
-	noteSent(text: string, refs?: FileReference[]): void;
+	noteSent(text: string, refs?: FileReference[], document?: ComposerDocument): void;
 	/** Forward a WS `draft_changed` event into the draft state machine. */
 	handleDraftChanged(draft: NarratorRemoteDraft): void;
 }
@@ -135,6 +172,17 @@ export interface NarratorComposerProps {
 	onSendWithMode: (mode: "turn" | "tool" | "interrupt") => void | Promise<void>;
 	onTextFlagsChange: (has: boolean) => void;
 	onPasteImages?: (files: File[]) => void;
+	attachedImages?: File[];
+	attachedTextFiles?: File[];
+	attachmentsHydrating?: boolean;
+	attachmentsRestoreFailed?: boolean;
+	onRetryAttachments?: () => void;
+	restoredAttachmentResources?: ReadonlyMap<string, File>;
+	onAttachmentsChange?: (images: File[], textFiles: File[]) => void;
+	onDocumentAssetsChange?: (ids: readonly string[]) => void;
+	controls?: React.ReactNode;
+	actions?: React.ReactNode;
+	sending?: boolean;
 }
 
 /**
@@ -164,6 +212,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			onSendWithMode,
 			onTextFlagsChange,
 			onPasteImages,
+			attachedImages = EMPTY_FILES,
+			attachedTextFiles = EMPTY_FILES,
+			attachmentsHydrating = false,
+			attachmentsRestoreFailed = false,
+			onRetryAttachments,
+			restoredAttachmentResources,
+			onAttachmentsChange,
+			onDocumentAssetsChange,
+			controls,
+			actions,
+			sending = false,
 		},
 		ref,
 	) {
@@ -189,6 +248,27 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// Fullscreen modal state
 		const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] =
 			useDisclosure(false);
+		const fullscreenTrap = useFocusTrap(fullscreenOpened);
+		useEffect(() => {
+			if (!fullscreenOpened) return;
+			const owner = textareaRef.current?.ownerDocument;
+			const close = (event: KeyboardEvent) => {
+				if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
+				// Popovers own their first Escape. Otherwise intercept before ProseMirror's
+				// native Escape/select-parent handler can stop the bubbling event.
+				if (
+					Array.from(owner?.querySelectorAll('[role="menu"], [role="listbox"]') ?? []).some(
+						(menu) => menu.getClientRects().length > 0,
+					)
+				)
+					return;
+				event.preventDefault();
+				event.stopPropagation();
+				closeFullscreen();
+			};
+			owner?.addEventListener("keydown", close, true);
+			return () => owner?.removeEventListener("keydown", close, true);
+		}, [fullscreenOpened, closeFullscreen]);
 
 		// Text and reference occurrences have one source of truth, local to this subtree.
 		const [inputState, setInputState] = useState<FileReferenceInput>({
@@ -196,12 +276,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			fileReferences: [],
 		});
 		const { text: input, fileReferences } = inputState;
+		const document = useMemo(() => importComposerInput(inputState), [inputState]);
 		// Leading quote blocks are shown as chips; the textarea and its popovers
 		// only ever see the body after them (see composer-quotes.ts).
-		const { quotes, body: bodyInput } = useMemo(
-			() => splitQuotedComposerInput(inputState),
-			[inputState],
-		);
+		const { quotes, body: bodyInput } = useMemo(() => splitDocumentInput(document), [document]);
 		const bodyText = bodyInput.text;
 		const inputStateRef = useRef(inputState);
 		const [draftHydrated, setDraftHydrated] = useState(false);
@@ -224,7 +302,87 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const draftSyncSeqRef = useRef(0);
 		const draftReadEpochRef = useRef(0);
 		const draftOwnerScopeRef = useRef<string | null>(null);
-		const textareaRef = useRef<HTMLTextAreaElement>(null);
+		const textareaRef = useRef<HTMLDivElement>(null);
+		const editorRef = useRef<InlineComposerEditorHandle>(null);
+		const [editorElement, setEditorElement] = useState<HTMLDivElement | null>(null);
+		const [editorFocused, setEditorFocused] = useState(false);
+		useEffect(() => {
+			editorElement?.setAttribute("data-narrator-composer", narratorId);
+		}, [editorElement, narratorId]);
+		const openImageViewer = useImageViewer();
+		const previewURLsRef = useRef(new Map<File, string>());
+		useEffect(() => {
+			if (!currentDraftScope) return;
+			const urls = previewURLsRef.current;
+			return () => {
+				for (const url of urls.values()) URL.revokeObjectURL(url);
+				urls.clear();
+			};
+		}, [currentDraftScope]);
+		// The live resource cache outlives node deletion so undo can restore its File.
+		const resourceCacheRef = useRef(new Map<string, File>());
+		const resourceOwnerRef = useRef(currentDraftScope);
+		const authoritativeAssetsRef = useRef<Set<string> | null>(null);
+		const attachmentRecoveryRef = useRef({ attachmentsHydrating, attachmentsRestoreFailed });
+		attachmentRecoveryRef.current = { attachmentsHydrating, attachmentsRestoreFailed };
+		const hasUnconfirmedLegacyAttachments = useCallback(
+			() =>
+				authoritativeAssetsRef.current === null &&
+				(attachmentRecoveryRef.current.attachmentsHydrating ||
+					attachmentRecoveryRef.current.attachmentsRestoreFailed),
+			[],
+		);
+		const readPersistableDocument = useCallback(
+			(value: ComposerDocument | null | undefined) =>
+				hasUnconfirmedLegacyAttachments() ? undefined : (value ?? undefined),
+			[hasUnconfirmedLegacyAttachments],
+		);
+		if (resourceOwnerRef.current !== currentDraftScope) {
+			resourceCacheRef.current.clear();
+			authoritativeAssetsRef.current = null;
+			resourceOwnerRef.current = currentDraftScope;
+		}
+		// Successfully recovered but deleted files stay available to this owner's undo history.
+		// They are not live attachments and never drive legacy adoption or persistence by themselves.
+		for (const [id, file] of restoredAttachmentResources ?? [])
+			if (!resourceCacheRef.current.has(id)) resourceCacheRef.current.set(id, file);
+		for (const file of [...attachedImages, ...attachedTextFiles])
+			resourceCacheRef.current.set(getComposerAssetId(file), file);
+		const resources = new Map(resourceCacheRef.current);
+		const documentRef = useRef(document);
+		documentRef.current = document;
+		const releaseUnusedResources = useCallback(() => {
+			const keep = new Set(documentRef.current.assets.map((asset) => asset.id));
+			for (const [id, file] of resourceCacheRef.current) {
+				if (keep.has(id)) continue;
+				resourceCacheRef.current.delete(id);
+				const url = previewURLsRef.current.get(file);
+				if (url) URL.revokeObjectURL(url);
+				previewURLsRef.current.delete(file);
+			}
+		}, []);
+		const pickerBookmarkRef = useRef<ReturnType<
+			InlineComposerEditorHandle["captureSelectionBookmark"]
+		> | null>(null);
+		const reconcileAssetsRef = useRef(onDocumentAssetsChange);
+		reconcileAssetsRef.current = onDocumentAssetsChange;
+		useEffect(() => {
+			void currentDraftScope; // A different owner must not inherit an open file picker's bookmark.
+			return () => {
+				pickerBookmarkRef.current?.cancel();
+				pickerBookmarkRef.current = null;
+			};
+		}, [currentDraftScope]);
+		const attachmentStateRef = useRef({
+			images: attachedImages,
+			textFiles: attachedTextFiles,
+			onChange: onAttachmentsChange,
+		});
+		attachmentStateRef.current = {
+			images: attachedImages,
+			textFiles: attachedTextFiles,
+			onChange: onAttachmentsChange,
+		};
 		// null until the user is known: recall is keyed per `(user, narrator)`, and a
 		// placeholder key would both consume a slot in the bounded history namespace and
 		// strand whatever was typed before hydration in a list nothing reads again.
@@ -232,10 +390,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			currentUserId ? getNarratorDraftStorageId(currentUserId, narratorId) : null,
 		);
 
+		const declareDocumentAssets = useCallback((ids: readonly string[]) => {
+			authoritativeAssetsRef.current = new Set(ids);
+			reconcileAssetsRef.current?.(ids);
+		}, []);
+
 		/** Synchronous ref updates make restore→send in the same tick atomic. */
 		const applyInput = useCallback((next: FileReferenceInput) => {
+			const nextDocument = importComposerInput(next);
 			inputStateRef.current = next;
 			inputRef.current = next.text;
+			documentRef.current = nextDocument;
 			setInputState(next);
 		}, []);
 		const setText = useCallback(
@@ -244,7 +409,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			},
 			[applyInput],
 		);
-		const readQuotedInput = useCallback(() => splitQuotedComposerInput(inputStateRef.current), []);
+		const readQuotedInput = useCallback(() => splitDocumentInput(documentRef.current), []);
 		const applyBody = useCallback(
 			(body: FileReferenceInput) => {
 				applyInput(joinQuotedComposerInput(readQuotedInput().quotes, body));
@@ -253,15 +418,73 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 		const setBodyText = useCallback(
 			(text: string) => {
-				applyBody(editFileReferenceInput(readQuotedInput().body, text));
+				const previous = readQuotedInput().body.text;
+				if (previous === text) return;
+				if (editorRef.current) {
+					let start = 0;
+					while (start < previous.length && start < text.length && previous[start] === text[start])
+						start++;
+					let end = previous.length;
+					let nextEnd = text.length;
+					while (end > start && nextEnd > start && previous[end - 1] === text[nextEnd - 1]) {
+						end--;
+						nextEnd--;
+					}
+					editorRef.current.setSelection(start, end);
+					editorRef.current.insertNodes(
+						text.slice(start, nextEnd) ? [{ type: "text", text: text.slice(start, nextEnd) }] : [],
+					);
+				} else applyBody(editFileReferenceInput(readQuotedInput().body, text));
 			},
 			[applyBody, readQuotedInput],
 		);
 		const restoreInput = useCallback(
-			(text: string, refs: FileReference[]) => {
-				applyInput({ text, fileReferences: copyFileReferences(refs, text) });
+			(text: string, refs: FileReference[], composerDocument?: ComposerDocument) => {
+				const next = { text, fileReferences: copyFileReferences(refs, text), composerDocument };
+				// Validate/apply before committing refs: a failed restore must keep the local draft intact.
+				const restored = parseComposerDocument(importComposerInput(next));
+				editorRef.current?.setDocument(restored);
+				applyInput(next);
+				// Local acknowledged snapshots need the same ownership contract as remote detail.
+				// An absent legacy layout is still unknown until its old blobs have been imported.
+				if (readComposerDocument(composerDocument))
+					declareDocumentAssets(restored.assets.map((asset) => asset.id));
 			},
-			[applyInput],
+			[applyInput, declareDocumentAssets],
+		);
+		/** Remote documents are authoritative about membership, not just text/layout. */
+		const restoreRemoteInput = useCallback(
+			(text: string, refs: FileReference[], composerDocument?: ComposerDocument) => {
+				restoreInput(text, refs, composerDocument);
+				const ids = composerDocument?.assets.map((asset) => asset.id) ?? [];
+				declareDocumentAssets(ids);
+				if (!reconcileAssetsRef.current) {
+					const keep = new Set(ids);
+					const current = attachmentStateRef.current;
+					const images = current.images.filter((file) => keep.has(getComposerAssetId(file)));
+					const textFiles = current.textFiles.filter((file) => keep.has(getComposerAssetId(file)));
+					if (
+						images.length !== current.images.length ||
+						textFiles.length !== current.textFiles.length
+					)
+						current.onChange?.(images, textFiles);
+				}
+			},
+			[restoreInput, declareDocumentAssets],
+		);
+		const captureAttachmentSelection = useCallback(() => {
+			pickerBookmarkRef.current?.cancel();
+			pickerBookmarkRef.current = editorRef.current?.captureSelectionBookmark() ?? null;
+		}, []);
+		const captureAttachmentInsertion = useCallback(
+			(origin: "picker" | "paste" | "drop" | "direct") => {
+				const pending = pickerBookmarkRef.current;
+				pickerBookmarkRef.current = null;
+				if (origin === "picker" && pending) return pending;
+				pending?.cancel();
+				return editorRef.current?.captureSelectionBookmark();
+			},
+			[],
 		);
 		const setFileReferences = useCallback(
 			(refs: FileReference[]) => {
@@ -279,28 +502,172 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const addFileReference = useCallback(
 			(reference: FileReference) => {
 				try {
-					const next = insertFileReference(readQuotedInput().body, reference);
-					applyBody(next);
+					editorRef.current?.insertNodes([{ type: "fileReference", id: reference.id, reference }]);
 					if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
-					requestAnimationFrame(() => {
-						textareaRef.current?.focus();
-						textareaRef.current?.setSelectionRange(next.caret, next.caret);
-					});
 				} catch (error) {
 					notifications.show({
-						title: t("fileReferences.addFailed", { defaultValue: "无法添加文件引用" }),
+						title: t("fileReferences.addFailed"),
 						message: error instanceof Error ? error.message : String(error),
 						color: "red",
 					});
 				}
 			},
-			[applyBody, fileCacheScope, readQuotedInput, t],
+			[fileCacheScope, t],
 		);
+
+		const syncAttachedFiles = useCallback((next: ComposerDocument) => {
+			const files = next.assets.flatMap((asset) => {
+				const file = resourceCacheRef.current.get(asset.id);
+				return file ? [{ file, kind: asset.kind }] : [];
+			});
+			const images = files.filter((item) => item.kind === "image").map((item) => item.file);
+			const textFiles = files.filter((item) => item.kind === "textFile").map((item) => item.file);
+			const previous = attachmentStateRef.current;
+			if (
+				images.length !== previous.images.length ||
+				textFiles.length !== previous.textFiles.length ||
+				images.some((file, index) => file !== previous.images[index]) ||
+				textFiles.some((file, index) => file !== previous.textFiles[index])
+			)
+				previous.onChange?.(images, textFiles);
+		}, []);
+		const applyDocument = useCallback(
+			(next: ComposerDocument) => {
+				// Initialization/selection-only transactions must not create a dirty rich draft.
+				if (
+					JSON.stringify(readComposerDocument(next)) ===
+					JSON.stringify(readComposerDocument(documentRef.current))
+				)
+					return;
+				applyInput(composerInputFromDocument(next));
+				if (!hasUnconfirmedLegacyAttachments())
+					declareDocumentAssets(next.assets.map((asset) => asset.id));
+				inputHistory.reset();
+				syncAttachedFiles(next);
+			},
+			[
+				applyInput,
+				inputHistory.reset,
+				syncAttachedFiles,
+				hasUnconfirmedLegacyAttachments,
+				declareDocumentAssets,
+			],
+		);
+
+		const insertAcceptedFiles = useCallback(
+			(
+				files: File[],
+				bookmark?: ReturnType<InlineComposerEditorHandle["captureSelectionBookmark"]>,
+			) => {
+				const editor = editorRef.current;
+				if (files.length && hasUnconfirmedLegacyAttachments()) {
+					bookmark?.cancel();
+					notifications.show({
+						color: "yellow",
+						message: t(
+							attachmentRecoveryRef.current.attachmentsRestoreFailed
+								? "composerAttachmentsRestoreFailed"
+								: "composerRestoringAssets",
+						),
+					});
+					return false;
+				}
+				if (!files.length || !editor?.getElement() || sendingRef.current) {
+					bookmark?.cancel();
+					return false;
+				}
+				if (!bookmark?.restore()) {
+					notifications.show({ message: t("composerAttachmentInsertionExpired"), color: "yellow" });
+					return false;
+				}
+				const assets = composerAssetsFromFiles(
+					files.filter((file) => file.type.startsWith("image/")),
+					files.filter((file) => !file.type.startsWith("image/")),
+				);
+				for (const file of files) resourceCacheRef.current.set(getComposerAssetId(file), file);
+				const nodes: ComposerInlineNode[] = files.map((file) => ({
+					type: "attachment",
+					id: composerNodeId(),
+					assetId: getComposerAssetId(file),
+				}));
+				try {
+					editor.insertNodes(nodes, assets);
+					const used = new Set(editor.getDocument().assets.map((asset) => asset.id));
+					if (!assets.every((asset) => used.has(asset.id)))
+						throw new Error(t("fileReferences.addFailed"));
+					return true;
+				} catch (error) {
+					const used = new Set(documentRef.current.assets.map((asset) => asset.id));
+					for (const asset of assets)
+						if (!used.has(asset.id)) resourceCacheRef.current.delete(asset.id);
+					notifications.show({
+						title: t("fileReferences.addFailed"),
+						message: error instanceof Error ? error.message : String(error),
+						color: "red",
+					});
+					return false;
+				}
+			},
+			[sendingRef, t, hasUnconfirmedLegacyAttachments],
+		);
+
+		// Legacy/local hydration only. New uploads are inserted through per-batch bookmarks.
+		// Late hydration must never replace the user's current selection.
+		useEffect(() => {
+			let cancelled = false;
+			queueMicrotask(() => {
+				if (cancelled) return;
+				if (sendingRef.current) return;
+				const current = documentRef.current;
+				const known = new Set(current.assets.map((asset) => asset.id));
+				const fresh = composerAssetsFromFiles(attachedImages, attachedTextFiles).filter(
+					(asset) =>
+						!known.has(asset.id) &&
+						(!authoritativeAssetsRef.current || authoritativeAssetsRef.current.has(asset.id)),
+				);
+				fresh.sort((a, b) => {
+					const left = resourceCacheRef.current.get(a.id);
+					const right = resourceCacheRef.current.get(b.id);
+					return (
+						(left ? getComposerFileOrder(left) : Number.MAX_SAFE_INTEGER) -
+						(right ? getComposerFileOrder(right) : Number.MAX_SAFE_INTEGER)
+					);
+				});
+				if (!fresh.length) return;
+				const nodes: ComposerInlineNode[] = fresh.map((asset) => ({
+					type: "attachment",
+					id: composerNodeId(),
+					assetId: asset.id,
+				}));
+				if (editorRef.current?.getElement()) {
+					const selection = editorRef.current.captureSelectionBookmark();
+					editorRef.current.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+					editorRef.current.insertNodes(nodes, fresh);
+					selection.restore();
+				} else {
+					const paragraphs = current.paragraphs.map((paragraph) => ({
+						children: [...paragraph.children],
+					}));
+					paragraphs[paragraphs.length - 1].children.push(...nodes);
+					applyInput(
+						composerInputFromDocument({
+							...current,
+							paragraphs,
+							assets: [...current.assets, ...fresh],
+						}),
+					);
+				}
+			});
+			return () => {
+				cancelled = true;
+			};
+		}, [attachedImages, attachedTextFiles, applyInput, sendingRef]);
 
 		// Prompt optimization hook
 		const optimizeHook = usePromptOptimize({
 			narratorId,
-			textareaRef,
+			textareaRef: useRef<HTMLTextAreaElement>(null),
+			target: () => composerOptimizeTarget(editorRef.current),
 			onOptimized: (text) => {
 				// Fallback: if execCommand fails, update state directly
 				setBodyText(text);
@@ -329,15 +696,18 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				lastDraftUpdatedAtRef.current,
 				fileReferences,
 				lastSyncedDraftRef.current ?? (unknownEdited ? null : undefined),
+				readPersistableDocument(inputState.composerDocument),
 			);
 		}, [
 			currentUserId,
 			currentDraftScope,
 			draftHydrated,
 			input,
+			inputState,
 			fileReferences,
 			narratorId,
 			sendingRef,
+			readPersistableDocument,
 		]);
 
 		const syncDraftNow = useCallback(
@@ -345,6 +715,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				text: string,
 				baseRevision = lastDraftRevisionRef.current,
 				references = inputStateRef.current.fileReferences,
+				composerDocument: ComposerDocument | null = inputStateRef.current.composerDocument ?? null,
 			) => {
 				const refs = copyFileReferences(references, text);
 				if (!currentUserId) throw new Error("Current user is unavailable");
@@ -370,6 +741,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							revision,
 							sourceId,
 							refs,
+							readPersistableDocument(composerDocument),
 						);
 						if (
 							seq === draftSyncSeqRef.current &&
@@ -380,6 +752,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							lastSyncedDraftRef.current = {
 								text: result.text,
 								fileReferences: readFileReferences(result.fileReferences, result.text),
+								composerDocument: readComposerDocument(result.composerDocument),
 							};
 							lastDraftRevisionRef.current = result.revision;
 							lastDraftUpdatedAtRef.current = result.updatedAt;
@@ -393,6 +766,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								result.updatedAt,
 								inputStateRef.current.fileReferences,
 								lastSyncedDraftRef.current,
+								readPersistableDocument(inputStateRef.current.composerDocument),
 							);
 							qc.setQueryData(
 								["narrators", narratorId],
@@ -414,6 +788,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 												hasDraft?: unknown;
 												text?: unknown;
 												fileReferences?: unknown;
+												composerDocument?: unknown;
 												revision?: unknown;
 												updatedAt?: unknown;
 												updatedBy?: unknown;
@@ -430,6 +805,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								hasDraft: !!current.hasDraft,
 								text: current.text,
 								fileReferences: readFileReferences(current.fileReferences, current.text),
+								composerDocument: readComposerDocument(current.composerDocument),
 								revision: current.revision,
 								updatedAt: typeof current.updatedAt === "string" ? current.updatedAt : null,
 								updatedBy: typeof current.updatedBy === "string" ? current.updatedBy : null,
@@ -455,13 +831,16 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					}
 				}
 			},
-			[currentUserId, currentDraftScope, narratorId, qc],
+			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument],
 		);
 
 		const clearTextAndDraft = useCallback(() => {
 			restoreInput("", []);
-			if (draftSyncState === "ready") void syncDraftNow("", undefined, []).catch(() => {});
-		}, [draftSyncState, syncDraftNow, restoreInput]);
+			declareDocumentAssets([]);
+			releaseUnusedResources();
+			attachmentStateRef.current.onChange?.([], []);
+			if (draftSyncState === "ready") void syncDraftNow("", undefined, [], null).catch(() => {});
+		}, [draftSyncState, syncDraftNow, restoreInput, releaseUnusedResources, declareDocumentAssets]);
 
 		const hideTextForSend = useCallback(() => {
 			restoreInput("", []);
@@ -518,7 +897,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			const localDraft = readNarratorInputDraft(currentUserId, narratorId);
 			lastDraftRevisionRef.current = localDraft.serverRevision;
 			lastDraftUpdatedAtRef.current = localDraft.serverUpdatedAt;
-			restoreInput(localDraft.text, localDraft.fileReferences ?? []);
+			restoreInput(localDraft.text, localDraft.fileReferences ?? [], localDraft.composerDocument);
 			const localDraftAtRequest = inputStateRef.current;
 			// Restore trusted text AND references before the persist effect is enabled.
 			// A dirty clear or a legacy/unknown CAS base must not be stamped synchronized.
@@ -545,6 +924,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						lastSyncedDraftRef.current = {
 							text: localDraft.text,
 							fileReferences: readFileReferences(localDraft.fileReferences, localDraft.text),
+							composerDocument: localDraft.composerDocument,
 						};
 						lastDraftRevisionRef.current = panel.draft.revision;
 						lastDraftUpdatedAtRef.current = panel.draft.updatedAt;
@@ -557,6 +937,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							panel.draft.updatedAt,
 							inputStateRef.current.fileReferences,
 							lastSyncedDraftRef.current,
+							readPersistableDocument(inputStateRef.current.composerDocument),
 						);
 						return;
 					}
@@ -579,20 +960,35 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						serverText,
 						serverFileReferences,
 						serverRevision: draft.revision,
+						serverComposerDocument: readComposerDocument(draft.composerDocument),
+						currentComposerDocument: readPersistableDocument(
+							inputStateRef.current.composerDocument,
+						),
 						currentInput,
 						currentFileReferences: inputStateRef.current.fileReferences,
 						localChangedSinceRequest:
 							!sameFileReferenceInput(inputStateRef.current, localDraftAtRequest) ||
 							(!!unacknowledgedDraftRef.current?.unsynced && !localDraft.unsynced),
 					});
-					lastSyncedDraftRef.current = { text: serverText, fileReferences: serverFileReferences };
+					if (resolved.composerDocument || localDraft.composerDocument)
+						restoreRemoteInput(
+							resolved.text,
+							resolved.fileReferences ?? [],
+							resolved.composerDocument,
+						);
+					else
+						restoreInput(resolved.text, resolved.fileReferences ?? [], resolved.composerDocument);
+					lastSyncedDraftRef.current = {
+						text: serverText,
+						fileReferences: serverFileReferences,
+						composerDocument: readComposerDocument(draft.composerDocument),
+					};
 					lastDraftRevisionRef.current = resolved.conflict
 						? localDraft.serverRevision
 						: draft.revision;
 					lastDraftUpdatedAtRef.current = resolved.conflict
 						? localDraft.serverUpdatedAt
 						: draft.updatedAt;
-					restoreInput(resolved.text, resolved.fileReferences ?? []);
 					persistNarratorInputDraft(
 						currentUserId,
 						narratorId,
@@ -601,6 +997,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
 						resolved.fileReferences ?? [],
 						lastSyncedDraftRef.current,
+						readPersistableDocument(inputStateRef.current.composerDocument),
 					);
 					if (resolved.conflict) {
 						draftConflictRef.current = draft;
@@ -619,7 +1016,16 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				draftSyncSeqRef.current++;
 				controller.abort();
 			};
-		}, [currentUserId, currentDraftScope, draftLoadAttempt, narratorId, restoreInput, qc]);
+		}, [
+			currentUserId,
+			currentDraftScope,
+			draftLoadAttempt,
+			narratorId,
+			restoreInput,
+			restoreRemoteInput,
+			readPersistableDocument,
+			qc,
+		]);
 
 		useEffect(() => {
 			if (!draftHydrated || !currentUserId || draftSyncState !== "ready" || sendingRef.current)
@@ -654,11 +1060,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			if (!remote || !currentUserId) return;
 			const remoteText = remote.hasDraft ? remote.text : "";
 			const refs = remote.hasDraft ? readFileReferences(remote.fileReferences, remoteText) : [];
-			lastSyncedDraftRef.current = { text: remoteText, fileReferences: refs };
+			lastSyncedDraftRef.current = {
+				text: remoteText,
+				fileReferences: refs,
+				composerDocument: remote.composerDocument,
+			};
 			lastDraftRevisionRef.current = remote.revision;
 			lastDraftUpdatedAtRef.current = remote.updatedAt;
 			draftConflictRef.current = null;
-			restoreInput(remoteText, refs);
+			restoreRemoteInput(remoteText, refs, remote.composerDocument);
 			setDraftSyncState("ready");
 			persistNarratorInputDraft(
 				currentUserId,
@@ -668,19 +1078,21 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				remote.updatedAt,
 				refs,
 				lastSyncedDraftRef.current,
+				readPersistableDocument(inputStateRef.current.composerDocument),
 			);
-		}, [currentUserId, narratorId, restoreInput]);
+		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument]);
 
 		const commitDraftAfterSend = useCallback(() => {
 			if (draftSyncState === "ready") {
 				setDraftSyncState("loading");
-				void syncDraftNow("", undefined, []).catch(() => setDraftSyncState("error"));
+				void syncDraftNow("", undefined, [], null).catch(() => setDraftSyncState("error"));
 			} else if (draftSyncState === "conflict") {
 				// The local text was sent, but another client owns a newer draft. Keep that
 				// remote draft rather than clearing it as a side effect of this send.
 				acceptServerDraft();
 			}
-		}, [draftSyncState, syncDraftNow, acceptServerDraft]);
+			releaseUnusedResources();
+		}, [draftSyncState, syncDraftNow, acceptServerDraft, releaseUnusedResources]);
 
 		const overwriteServerDraft = useCallback(() => {
 			const remote = draftConflictRef.current;
@@ -694,16 +1106,59 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			});
 		}, [syncDraftNow, t]);
 
+		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
 			(draft: NarratorRemoteDraft) => {
 				const currentRevision = lastDraftRevisionRef.current;
 				if (currentRevision != null && draft.revision < currentRevision) return;
+				if (draft.hasDraft && draft.hasComposerDocument && !draft.composerDocument) {
+					const epoch = ++draftReadEpochRef.current;
+					const scope = draftOwnerScopeRef.current;
+					void api
+						.getNarratorDraft(narratorId, AbortSignal.timeout(15_000))
+						.then((detail) => {
+							if (
+								epoch !== draftReadEpochRef.current ||
+								scope !== draftOwnerScopeRef.current ||
+								detail.revision < draft.revision ||
+								detail.revision < (lastDraftRevisionRef.current ?? 0)
+							)
+								return;
+							// A newer save may legitimately clear the draft or come from a legacy text client.
+							// Only the same nonempty revision is bound by this summary's layout promise.
+							if (
+								detail.hasDraft &&
+								detail.revision === draft.revision &&
+								!readComposerDocument(detail.composerDocument)
+							)
+								throw new Error("Draft detail is missing the announced layout");
+							remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
+						})
+						.catch(() => {
+							if (
+								epoch === draftReadEpochRef.current &&
+								scope === draftOwnerScopeRef.current &&
+								// PUT already returns the full draft after broadcasting its summary.
+								// A failed redundant GET cannot invalidate that acknowledged snapshot.
+								!(
+									(lastDraftRevisionRef.current ?? -1) >= draft.revision &&
+									lastSyncedDraftRef.current
+								)
+							)
+								setDraftSyncState("error");
+						});
+					return;
+				}
 				draftReadEpochRef.current++;
 				const remoteText = draft.hasDraft ? draft.text : "";
 				const remoteRefs = draft.hasDraft
 					? readFileReferences(draft.fileReferences, remoteText)
 					: [];
-				const remoteInput = { text: remoteText, fileReferences: remoteRefs };
+				const remoteInput = {
+					text: remoteText,
+					fileReferences: remoteRefs,
+					composerDocument: draft.composerDocument,
+				};
 				const unknown = unacknowledgedDraftRef.current;
 				const hasLocalUnsyncedChanges = lastSyncedDraftRef.current
 					? !sameFileReferenceInput(inputStateRef.current, lastSyncedDraftRef.current)
@@ -722,12 +1177,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					setDraftSyncState("conflict");
 					return;
 				}
+				const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
+				if (shouldApplyRemote) restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
 				lastSyncedDraftRef.current = remoteInput;
 				lastDraftRevisionRef.current = draft.revision;
 				lastDraftUpdatedAtRef.current = draft.updatedAt;
 				draftConflictRef.current = null;
 				setDraftSyncState("ready");
-				const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
 				const nextInput = shouldApplyRemote ? remoteInput : inputStateRef.current;
 				if (currentUserId) {
 					persistNarratorInputDraft(
@@ -738,16 +1194,22 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						draft.updatedAt,
 						nextInput.fileReferences,
 						lastSyncedDraftRef.current,
+						readPersistableDocument(nextInput.composerDocument),
 					);
 				}
-				if (shouldApplyRemote) restoreInput(remoteText, remoteRefs);
 			},
-			[currentUserId, narratorId, restoreInput],
+			[currentUserId, narratorId, restoreRemoteInput, readPersistableDocument],
 		);
+
+		remoteDraftHandlerRef.current = handleDraftChanged;
 
 		// --- Command popover ---
 		// A quoted message is never a slash command: the quote prefix leads its text.
-		const commandInput = quotes.length ? "" : bodyText;
+		const commandInput = document.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		)
+			? ""
+			: bodyText;
 		// Only fetch commands when user starts typing "/" to avoid unnecessary API call on page load
 		const { data: commandsList } = useNarratorCommands(
 			commandInput.startsWith("/") ? narratorId : undefined,
@@ -756,6 +1218,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// or when typing optional tool sub-completion (/load <tool>, /unload <tool>).
 		// Suppress when browsing input history so arrow keys keep navigating history.
 		const commandPopoverVisible =
+			editorFocused &&
 			commandInput.startsWith("/") &&
 			!commandInput.includes("\n") &&
 			(!commandInput.includes(" ") ||
@@ -798,12 +1261,32 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// === @mention of named narrators ===========================================
 		const { data: namedNarrators } = useNamedNarrators();
 		const [mentionCaret, setMentionCaret] = useState<number | null>(null);
+		const [queryContext, setQueryContext] =
+			useState<ReturnType<InlineComposerEditorHandle["getTextContext"]>>(null);
+		const handleComposerSelection = useCallback((selection: { start: number; end: number }) => {
+			const input = editorRef.current?.getElement();
+			if (!input?.contains(input.ownerDocument.activeElement)) {
+				setMentionCaret(null);
+				setQueryContext(null);
+				return;
+			}
+			setMentionCaret(selection.start);
+			const next = editorRef.current?.getTextContext() ?? null;
+			setQueryContext((current) =>
+				current?.text === next?.text &&
+				current?.start === next?.start &&
+				current?.end === next?.end &&
+				current?.caret === next?.caret
+					? current
+					: next,
+			);
+		}, []);
 		const mentionQuery = useMemo(() => {
-			if (mentionCaret === null) return null;
-			// Don't compete with the slash-command popover.
+			if (mentionCaret === null || !queryContext) return null;
+			// Atom boundaries must never be joined into a mention token.
 			if (commandInput.startsWith("/")) return null;
-			return getMentionQuery(bodyText, mentionCaret);
-		}, [bodyText, commandInput, mentionCaret]);
+			return getMentionQuery(queryContext.text, queryContext.caret - queryContext.start);
+		}, [commandInput, mentionCaret, queryContext]);
 		const mentionCandidates = useMemo<MentionCandidate[]>(() => {
 			if (!namedNarrators) return [];
 			return namedNarrators
@@ -816,7 +1299,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}));
 		}, [namedNarrators]);
 		const mentionPopoverVisible =
-			mentionQuery !== null && !inputHistory.isBrowsing && mentionCandidates.length > 0;
+			editorFocused &&
+			mentionQuery !== null &&
+			!inputHistory.isBrowsing &&
+			mentionCandidates.length > 0;
 		const handleMentionSelect = useCallback(
 			(candidate: MentionCandidate) => {
 				const caret = mentionCaret;
@@ -832,11 +1318,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				// Move caret to just after the inserted handle.
 				const nextCaret = before.length + insert.length;
 				requestAnimationFrame(() => {
-					const ta = textareaRef.current;
-					if (ta) {
-						ta.focus();
-						ta.setSelectionRange(nextCaret, nextCaret);
-					}
+					editorRef.current?.focus();
+					editorRef.current?.setSelection(nextCaret, nextCaret);
 					setMentionCaret(nextCaret);
 				});
 			},
@@ -846,9 +1329,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		const [dismissedFileQuery, setDismissedFileQuery] = useState<string | null>(null);
 		const fileQuery = useMemo(() => {
-			if (mentionCaret === null || commandInput.startsWith("/") || inputHistory.isBrowsing)
+			if (
+				!editorFocused ||
+				mentionCaret === null ||
+				!queryContext ||
+				commandInput.startsWith("/") ||
+				inputHistory.isBrowsing
+			)
 				return null;
-			const query = getFileReferenceQuery(bodyText, mentionCaret, bodyInput.fileReferences);
+			const query = getFileReferenceQuery(
+				bodyText,
+				mentionCaret,
+				bodyInput.fileReferences,
+				queryContext.start,
+			);
 			return query && JSON.stringify([bodyText, mentionCaret]) !== dismissedFileQuery
 				? query
 				: null;
@@ -857,18 +1351,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			bodyInput.fileReferences,
 			commandInput,
 			mentionCaret,
+			queryContext,
+			editorFocused,
 			inputHistory.isBrowsing,
 			dismissedFileQuery,
 		]);
 		const closeFilePopover = useCallback(() => {
 			setDismissedFileQuery(
-				JSON.stringify([readQuotedInput().body.text, textareaRef.current?.selectionStart]),
+				JSON.stringify([readQuotedInput().body.text, editorRef.current?.getSelection().start]),
 			);
 		}, [readQuotedInput]);
 		const moveFileCaret = useCallback((caret: number) => {
 			requestAnimationFrame(() => {
-				textareaRef.current?.focus();
-				textareaRef.current?.setSelectionRange(caret, caret);
+				editorRef.current?.focus();
+				editorRef.current?.setSelection(caret, caret);
 				setMentionCaret(caret);
 			});
 		}, []);
@@ -876,22 +1372,22 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			(reference: FileReference) => {
 				if (!fileQuery) return;
 				try {
-					const next = insertFileReference(readQuotedInput().body, reference, [
-						fileQuery.start,
-						fileQuery.end,
+					editorRef.current?.setSelection(fileQuery.start, fileQuery.end);
+					editorRef.current?.insertNodes([
+						{ type: "fileReference", id: reference.id, reference },
+						{ type: "text", text: " " },
 					]);
-					applyBody(next);
 					if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
-					moveFileCaret(next.caret);
+					setDismissedFileQuery(null);
 				} catch (error) {
 					notifications.show({
-						title: t("fileReferences.addFailed", { defaultValue: "无法添加文件引用" }),
+						title: t("fileReferences.addFailed"),
 						message: error instanceof Error ? error.message : String(error),
 						color: "red",
 					});
 				}
 			},
-			[fileQuery, applyBody, fileCacheScope, moveFileCaret, readQuotedInput, t],
+			[fileQuery, fileCacheScope, t],
 		);
 		const handleFileNavigate = useCallback(
 			(candidate: FileReferenceCandidate) => {
@@ -906,97 +1402,51 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		useEffect(() => dock?.registerAddFileReference?.(addFileReference), [dock, addFileReference]);
 
 		// === Selection quotes ======================================================
-		const editorSelection =
-			fileScope.selection !== undefined ? fileScope.selection : dock?.fileReferenceSelection;
-		const focusBodyEnd = useCallback(() => {
-			requestAnimationFrame(() => {
-				const ta = textareaRef.current;
-				if (!ta) return;
-				ta.focus();
-				ta.setSelectionRange(ta.value.length, ta.value.length);
-			});
-		}, []);
 		const acceptQuoteRef = useRef<(candidate: QuoteCandidate) => void>(() => {});
 		const quoteCandidate = useQuoteCandidate({
 			textareaRef,
-			editorSelection,
+			element: editorElement,
 			onShortcut: (candidate) => acceptQuoteRef.current(candidate),
 		});
-		const hideQuoteCandidate = quoteCandidate.hide;
 		const acceptQuote = useCallback(
 			(candidate: QuoteCandidate) => {
-				const notifyFailure = (message: string) =>
-					notifications.show({ title: t("quote.addFailed"), message, color: "red" });
-				if (candidate.kind === "text") {
-					const { quotes: current, body } = readQuotedInput();
-					if (!current.some((quote) => sameComposerQuote(quote, candidate.quote))) {
-						if (current.length >= MAX_COMPOSER_QUOTES) {
-							notifyFailure(t("quote.limit", { count: MAX_COMPOSER_QUOTES }));
-							return;
-						}
-						applyInput(joinQuotedComposerInput([...current, candidate.quote], body));
-					}
-					textareaRef.current?.ownerDocument.getSelection()?.removeAllRanges();
-				} else {
-					const { reference } = candidate;
-					if (!reference) {
-						notifyFailure(t("quote.fileUnsaved"));
-						return;
-					}
-					const current = inputStateRef.current;
-					const duplicate = current.fileReferences.some(
-						(item) =>
-							!item.inputRange &&
-							item.deviceId === reference.deviceId &&
-							item.path === reference.path &&
-							JSON.stringify(item.selection) === JSON.stringify(reference.selection),
-					);
-					if (!duplicate) {
-						try {
-							applyInput({
-								text: current.text,
-								fileReferences: copyFileReferences(
-									[...current.fileReferences, reference],
-									current.text,
-								),
-							});
-						} catch (error) {
-							notifyFailure(error instanceof Error ? error.message : String(error));
-							return;
-						}
-						if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
-					}
+				if (hasUnconfirmedLegacyAttachments()) {
+					notifications.show({
+						color: "yellow",
+						message: t(
+							attachmentRecoveryRef.current.attachmentsRestoreFailed
+								? "composerAttachmentsRestoreFailed"
+								: "composerRestoringAssets",
+						),
+					});
+					return;
 				}
-				hideQuoteCandidate(candidate);
-				focusBodyEnd();
+				try {
+					if (candidate.kind === "file") {
+						if (!candidate.reference) throw new Error(t("quote.fileUnsaved"));
+						addFileReference(candidate.reference);
+					} else {
+						const current = documentRef.current.paragraphs
+							.flatMap((paragraph) => paragraph.children)
+							.filter((node) => node.type === "quote");
+						if (current.length >= MAX_COMPOSER_QUOTES)
+							throw new Error(t("quote.limit", { count: MAX_COMPOSER_QUOTES }));
+						editorRef.current?.insertNodes([
+							{ type: "quote", id: composerNodeId(), ...candidate.quote },
+						]);
+					}
+					quoteCandidate.hide(candidate);
+				} catch (error) {
+					notifications.show({
+						title: t("quote.addFailed"),
+						message: error instanceof Error ? error.message : String(error),
+						color: "red",
+					});
+				}
 			},
-			[applyInput, fileCacheScope, focusBodyEnd, hideQuoteCandidate, readQuotedInput, t],
+			[addFileReference, quoteCandidate.hide, t, hasUnconfirmedLegacyAttachments],
 		);
 		acceptQuoteRef.current = acceptQuote;
-		const removeQuote = useCallback(
-			(index: number) => {
-				const { quotes: current, body } = readQuotedInput();
-				applyInput(
-					joinQuotedComposerInput(
-						current.filter((_, i) => i !== index),
-						body,
-					),
-				);
-				focusBodyEnd();
-			},
-			[applyInput, focusBodyEnd, readQuotedInput],
-		);
-		const removeDetachedFileReference = useCallback(
-			(id: string) => {
-				setFileReferences(inputStateRef.current.fileReferences.filter((item) => item.id !== id));
-				focusBodyEnd();
-			},
-			[focusBodyEnd, setFileReferences],
-		);
-		const detachedFileReferences = useMemo(
-			() => fileReferences.filter((reference) => !reference.inputRange),
-			[fileReferences],
-		);
 
 		useEffect(() => {
 			if (appendInputRef) {
@@ -1011,35 +1461,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			};
 		}, [appendInputRef, dock, appendText]);
 
-		// Force react-textarea-autosize to recalculate after viewport width
-		// changes (e.g. DevTools mobile↔desktop toggle). The library recalculates
-		// on window "resize" but can read stale layout during rapid toggles.
-		// Bumping a counter triggers a React re-render → useLayoutEffect inside
-		// TextareaAutosize fires resizeTextarea() with the final layout values.
-		const [, setTextareaResizeTick] = useState(0);
-		useEffect(() => {
-			const ta = textareaRef.current;
-			if (!ta) return;
-			let prevWidth = ta.clientWidth;
-			let timer = 0;
-			const ro = new ResizeObserver(() => {
-				const w = ta.clientWidth;
-				if (w !== prevWidth) {
-					prevWidth = w;
-					clearTimeout(timer);
-					// Wait for layout to settle before triggering re-render
-					timer = window.setTimeout(() => {
-						setTextareaResizeTick((n) => n + 1);
-					}, 100);
-				}
-			});
-			ro.observe(ta);
-			return () => {
-				clearTimeout(timer);
-				ro.disconnect();
-			};
-		}, []);
-
 		// Report the empty↔non-empty transition upward (the panel's send-button
 		// gating and permission Enter-hint need it), never the text itself.
 		const hasText = input.trim().length > 0 || fileReferences.length > 0;
@@ -1047,23 +1468,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			onTextFlagsChange(hasText);
 		}, [hasText, onTextFlagsChange]);
 
-		const handlePaste = (e: React.ClipboardEvent) => {
-			const items = e.clipboardData.items;
-			const imageFiles: File[] = [];
-			for (const item of items) {
-				if (item.type.startsWith("image/")) {
-					const file = item.getAsFile();
-					if (file) imageFiles.push(file);
-				}
-			}
-			if (imageFiles.length > 0) {
-				onPasteImages?.(imageFiles);
-			}
-		};
-
 		// Enter outside interactive controls returns focus to this visible chat input.
 		useEffect(() => {
-			const textarea = textareaRef.current;
+			const textarea = editorElement;
 			if (!textarea || permEnterActive) return;
 			const doc = textarea.ownerDocument;
 			const handler = (e: KeyboardEvent) => {
@@ -1077,7 +1484,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					e.ctrlKey ||
 					e.metaKey ||
 					e.altKey ||
-					textarea.disabled ||
+					sendingRef.current ||
 					textarea.getClientRects().length === 0
 				)
 					return;
@@ -1104,32 +1511,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			};
 			doc.defaultView?.addEventListener("keydown", handler);
 			return () => doc.defaultView?.removeEventListener("keydown", handler);
-		}, [permEnterActive]);
+		}, [permEnterActive, editorElement, sendingRef]);
 
-		const composingRef = useRef(false);
-		const beforeEditRef = useRef<{ start: number; end: number } | undefined>(undefined);
 		const handleKeyDown = (e: React.KeyboardEvent) => {
-			if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current)
-				return;
+			if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || sendingRef.current) return;
 			if (fileQuery && fileReferenceKeyAction(e.nativeEvent)) {
 				// The scoped capture listener owns these keys, including empty/loading results.
-				e.preventDefault();
-				e.stopPropagation();
-				return;
-			}
-			if (
-				e.key === "Backspace" &&
-				!e.shiftKey &&
-				!e.ctrlKey &&
-				!e.metaKey &&
-				!e.altKey &&
-				bodyText === "" &&
-				(quotes.length > 0 || detachedFileReferences.length > 0)
-			) {
-				e.preventDefault();
-				const lastFile = detachedFileReferences[detachedFileReferences.length - 1];
-				if (lastFile) removeDetachedFileReference(lastFile.id);
-				else removeQuote(quotes.length - 1);
+				// Defer to the native capture listener on the editor DOM. Stopping at
+				// this React ancestor would prevent FileReferencePopover from receiving it.
 				return;
 			}
 			// Let CommandPopover handle arrow/tab/escape keys when visible,
@@ -1171,31 +1560,38 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				return;
 			}
-			// 上下箭头翻阅输入历史
-			// 需要处理 soft-wrap（长文本自动折行）的情况：
-			// 先让浏览器执行默认的光标移动，如果光标位置没变说明已在首/末视觉行，
-			// 此时才触发历史导航。
-			if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-				const textarea = e.currentTarget as HTMLTextAreaElement;
-				const posBefore = textarea.selectionStart;
+			// Up/down follow visual lines, including soft wraps. History runs only when that
+			// press leaves the caret on the same line (start of the text going up, end going
+			// down). Editor state still has the pre-key caret until selectionchange, which can
+			// land after this frame and make every ArrowUp look like the boundary.
+			if (
+				(e.key === "ArrowUp" || e.key === "ArrowDown") &&
+				!e.shiftKey &&
+				!e.ctrlKey &&
+				!e.metaKey &&
+				(!documentRef.current.assets.length || inputHistory.isBrowsing)
+			) {
+				const before = editorRef.current?.readLiveCaret() ?? null;
 				const direction = e.key === "ArrowUp" ? "up" : "down";
-				// 让浏览器先处理默认行为，下一帧再检查光标是否移动
-				requestAnimationFrame(() => {
-					const posAfter = textarea.selectionStart;
-					if (posBefore !== posAfter) return; // 光标移动了，说明还在文本中间行
+				const recallIfCaretStayed = () => {
+					if (!editorRef.current?.caretStayedOnLine(before)) return;
 					const result = inputHistory.navigateEntry(
 						direction,
 						inputRef.current,
 						inputStateRef.current.fileReferences,
+						readPersistableDocument(inputStateRef.current.composerDocument),
 					);
-					if (result !== null) {
-						restoreInput(result.text, result.fileReferences);
-						// 将光标移到末尾
-						requestAnimationFrame(() => {
-							textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
-						});
+					if (result) {
+						restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
+						syncAttachedFiles(documentRef.current);
+						requestAnimationFrame(() =>
+							editorRef.current?.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
+						);
 					}
-				});
+				};
+				const frame = editorRef.current?.getElement()?.ownerDocument.defaultView;
+				if (frame) frame.requestAnimationFrame(recallIfCaretStayed);
+				else requestAnimationFrame(recallIfCaretStayed);
 			}
 		};
 
@@ -1203,10 +1599,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			ref,
 			(): NarratorComposerHandle => ({
 				getText: () => inputRef.current,
+				captureAttachmentSelection,
+				captureAttachmentInsertion,
+				insertAcceptedFiles,
+				getDocument: () => inputStateRef.current.composerDocument,
+				hasMissingAssets: () =>
+					missingComposerAssets(documentRef.current, resourceCacheRef.current),
 				isTextEmpty: () =>
 					inputRef.current.trim().length === 0 && inputStateRef.current.fileReferences.length === 0,
-				ownsTextarea: (target) => target === textareaRef.current,
-				focus: () => textareaRef.current?.focus(),
+				ownsTextarea: (target) =>
+					!!target &&
+					typeof target === "object" &&
+					"nodeType" in target &&
+					!!textareaRef.current?.contains(target as Node),
+				focus: () => editorRef.current?.focus(),
 				setText,
 				getFileReferences: () => copyFileReferences(inputStateRef.current.fileReferences),
 				setFileReferences,
@@ -1216,10 +1622,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				clearTextAndDraft,
 				hideTextForSend,
 				commitDraftAfterSend,
-				noteSent: (text, refs) => inputHistory.push(text, refs),
+				noteSent: (text, refs, document) => inputHistory.push(text, refs, document),
 				handleDraftChanged,
 			}),
 			[
+				captureAttachmentSelection,
+				captureAttachmentInsertion,
+				insertAcceptedFiles,
 				setText,
 				setFileReferences,
 				restoreInput,
@@ -1234,8 +1643,16 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 
 		return (
-			<Box style={{ position: "relative", flex: 1 }}>
+			<Box
+				ref={fullscreenTrap}
+				className={fullscreenOpened ? classes.fullscreen : undefined}
+				style={fullscreenOpened ? undefined : { position: "relative", flex: 1, minWidth: 0 }}
+				role={fullscreenOpened ? "dialog" : undefined}
+				aria-modal={fullscreenOpened || undefined}
+				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}
+			>
 				<CommandPopover
+					anchorRef={textareaRef}
 					commands={commandsList ?? []}
 					input={commandInput}
 					visible={commandPopoverVisible}
@@ -1243,6 +1660,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onClose={closeCommandPopover}
 				/>
 				<MentionPopover
+					anchorRef={textareaRef}
 					candidates={mentionCandidates}
 					query={mentionQuery}
 					visible={mentionPopoverVisible}
@@ -1268,6 +1686,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						input={commandInput}
 						visible={!commandPopoverVisible}
 					/>
+				)}
+				{attachmentsRestoreFailed && (
+					<Group gap="xs" mb={4} wrap="nowrap" data-attachment-restore-error>
+						<Text size="xs" c="orange" style={{ flex: 1 }}>
+							{t("composerAttachmentsRestoreFailed")}
+						</Text>
+						{onRetryAttachments && (
+							<Button
+								size="compact-xs"
+								variant="light"
+								onClick={onRetryAttachments}
+								disabled={sending}
+							>
+								{t("draftRetry")}
+							</Button>
+						)}
+					</Group>
 				)}
 				{draftSyncState === "error" && (
 					<Group gap="xs" mb={4} wrap="nowrap">
@@ -1301,88 +1736,86 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						})}
 					</Text>
 				)}
-				<ComposerQuoteChips
-					quotes={quotes}
-					fileReferences={detachedFileReferences}
-					candidate={quoteCandidate.candidate}
-					onAccept={acceptQuote}
-					onDismiss={hideQuoteCandidate}
-					onRemoveQuote={removeQuote}
-					onRemoveFileReference={removeDetachedFileReference}
-					onOpenQuote={(quote) => revealComposerQuote(dock, quote, textareaRef.current)}
-					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
-				/>
-				<Textarea
-					ref={textareaRef}
-					data-narrator-composer
+				<InlineComposerEditor
+					ref={editorRef}
+					elementRef={textareaRef}
+					onElement={setEditorElement}
+					value={document}
+					adaptive={!fullscreenOpened}
+					leadingControls={controls}
+					candidate={
+						quoteCandidate.candidate
+							? {
+									key: quoteCandidate.candidate.key,
+									content: (
+										<InlineQuoteCandidate
+											candidate={quoteCandidate.candidate}
+											showShortcut={quoteCandidate.showShortcut}
+											disabled={sending || hasUnconfirmedLegacyAttachments()}
+											onAccept={acceptQuote}
+											onDismiss={quoteCandidate.hide}
+										/>
+									),
+								}
+							: undefined
+					}
+					onChange={applyDocument}
+					resources={resources}
+					attachmentsHydrating={attachmentsHydrating}
+					attachmentsRestoreFailed={attachmentsRestoreFailed}
+					disabled={sending}
 					placeholder={t(quotes.length ? "quote.placeholder" : "sendPlaceholder")}
-					value={bodyText}
-					onBeforeInput={(e) => {
-						beforeEditRef.current = {
-							start: e.currentTarget.selectionStart,
-							end: e.currentTarget.selectionEnd,
-						};
-					}}
-					onChange={(e) => {
-						applyBody(
-							editFileReferenceInput(
-								readQuotedInput().body,
-								e.currentTarget.value,
-								beforeEditRef.current,
-							),
-						);
-						beforeEditRef.current = undefined;
-						setDismissedFileQuery(null);
-						setMentionCaret(e.currentTarget.selectionStart);
-						inputHistory.reset();
-					}}
-					onCompositionStart={() => {
-						composingRef.current = true;
-					}}
-					onCompositionEnd={() => {
-						composingRef.current = false;
+					onSelectionChange={handleComposerSelection}
+					onFocus={() => setEditorFocused(true)}
+					onBlur={() => {
+						setEditorFocused(false);
+						setMentionCaret(null);
+						setQueryContext(null);
 					}}
 					onKeyDown={handleKeyDown}
-					onKeyUp={(e) => setMentionCaret(e.currentTarget.selectionStart)}
-					onClick={(e) => setMentionCaret(e.currentTarget.selectionStart)}
-					onBlur={() => setMentionCaret(null)}
-					onPaste={handlePaste}
-					autosize
-					minRows={1}
-					maxRows={6}
-					rightSection={
-						<TextareaOptimizeControls
-							disabled={!bodyText.trim() || optimizeHook.loading}
-							loading={optimizeHook.loading}
-							withContext={optimizeHook.withContext}
-							onToggleContext={optimizeHook.toggleContext}
-							onOptimize={optimizeHook.handleOptimize}
-							onCancelOptimize={optimizeHook.cancelOptimize}
-							onExpand={() => {
-								optimizeHook.cancelOptimize();
-								openFullscreen();
-							}}
-							contextMessageCount={optimizeHook.contextMessageCount}
-							onContextMessageCountChange={optimizeHook.setContextMessageCount}
-						/>
-					}
-					// Reserve the controls' actual width. Mantine does not measure a rightSection: it writes this
-					// value straight into the input's `padding-inline-end`, and the literal "auto" made that
-					// declaration invalid, so the buttons covered the tail of the text instead of sitting beside it.
-					rightSectionWidth={textareaOptimizeControlsWidth(true)}
-				/>
-				<ComposerFullscreenModal
-					opened={fullscreenOpened}
-					onClose={closeFullscreen}
-					initialText={bodyText}
-					onSubmit={(text) => {
-						setBodyText(text);
-						closeFullscreen();
-						requestAnimationFrame(() => textareaRef.current?.focus());
+					onPasteFiles={onPasteImages}
+					onOpenQuote={(quote) => revealComposerQuote(dock, quote, editorElement)}
+					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
+					onOpenImage={(asset) => {
+						const file = resourceCacheRef.current.get(asset.id);
+						if (!file) return;
+						let src = previewURLsRef.current.get(file);
+						if (!src) {
+							src = URL.createObjectURL(file);
+							previewURLsRef.current.set(file, src);
+						}
+						openImageViewer({ src, blob: file, filename: file.name, alt: file.name });
 					}}
-					optimizeHook={optimizeHook}
-					narratorId={narratorId}
+					controls={
+						<Group gap="xs" wrap="wrap" justify="flex-end">
+							{fullscreenOpened && (
+								<Button size="compact-xs" variant="subtle" onClick={closeFullscreen}>
+									{t("richComposer.collapse")}
+								</Button>
+							)}
+							<TextareaOptimizeControls
+								disabled={!bodyText.trim() || optimizeHook.loading || sending}
+								loading={optimizeHook.loading}
+								withContext={optimizeHook.withContext}
+								onToggleContext={optimizeHook.toggleContext}
+								onOptimize={optimizeHook.handleOptimize}
+								onCancelOptimize={optimizeHook.cancelOptimize}
+								onExpand={() => {
+									optimizeHook.cancelOptimize();
+									openFullscreen();
+								}}
+								contextMessageCount={optimizeHook.contextMessageCount}
+								onContextMessageCountChange={optimizeHook.setContextMessageCount}
+							/>
+							{actions}
+						</Group>
+					}
 				/>
+				{!attachmentsRestoreFailed && missingComposerAssets(document, resources) && (
+					<Text size="xs" c={attachmentsHydrating ? "dimmed" : "orange"}>
+						{t(attachmentsHydrating ? "composerRestoringAssets" : "composerMissingAssets")}
+					</Text>
+				)}
 			</Box>
 		);
 	},

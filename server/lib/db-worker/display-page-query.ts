@@ -40,15 +40,18 @@ function columns(fields: string, jsonFields: string, booleanFields = ""): Displa
 }
 
 /** Explicit DTO allowlists: no relation aggregation/json_group_array, no arbitrary SQL. */
-export const DISPLAY_MESSAGE_COLUMNS = columns(
-	`id narratorId messageUuid parentToolUseId role contentJson bodyRevision contentText
+export const DISPLAY_MESSAGE_COLUMNS = [
+	...columns(
+		`id narratorId messageUuid parentToolUseId role contentJson bodyRevision contentText
 	contextCharsJson tokensIn costUsd costStatus costMissingFields turnUsageJson provider credentialId
 	model outputTokens cachedInputTokens cacheCreationInputTokens cacheCreation5mTokens
 	cacheCreation1hTokens reasoningTokens ttftMs durationMs contextPercent meterUsage meterUnit
 	commitSha treeHashAfter snapshotCommitSha commandText createdBy origin originLabel editedAt
 	editedBy originalContentJson compactPending createdAt`,
-	"contentJson contextCharsJson costMissingFields turnUsageJson originalContentJson",
-);
+		"contentJson contextCharsJson costMissingFields turnUsageJson originalContentJson",
+	),
+	{ column: "composer_document", field: "hasComposerDocument", json: false, boolean: true },
+];
 
 export const DISPLAY_TOOL_COLUMNS = columns(
 	`id narratorId messageId toolUseId toolName modelRevision inputJson outputJson inputChars outputChars
@@ -68,12 +71,21 @@ const CREATOR_COLUMNS = columns("id username avatarColor avatarImageId", "");
 type Limits = typeof DISPLAY_PAGE_LIMITS | typeof DISPLAY_FIXTURE_LIMITS;
 
 function selection(alias: string, descriptors: readonly DisplayColumn[]): string {
-	return descriptors.map(({ column, field }) => `${alias}."${column}" AS "${field}"`).join(", ");
+	return descriptors
+		.map(
+			({ column, field }) =>
+				`${field === "hasComposerDocument" ? `(${alias}."${column}" IS NOT NULL)` : `${alias}."${column}"`} AS "${field}"`,
+		)
+		.join(", ");
 }
 
 function storedBytes(alias: string, descriptors: readonly DisplayColumn[]): string {
 	return descriptors
-		.map(({ column }) => `coalesce(length(CAST(${alias}."${column}" AS BLOB)), 0)`)
+		.map(({ column, field }) =>
+			field === "hasComposerDocument"
+				? "1"
+				: `coalesce(length(CAST(${alias}."${column}" AS BLOB)), 0)`,
+		)
 		.join(" + ");
 }
 

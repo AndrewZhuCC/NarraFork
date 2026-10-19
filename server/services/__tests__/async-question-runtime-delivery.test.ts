@@ -23,6 +23,7 @@ const {
 	interruptNarrator,
 } = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const time = "2026-10-05T00:00:00.000Z";
 const narratorId = "question-runtime";
 
@@ -186,6 +187,8 @@ async function seedQuestion() {
 		.values({ id: "ref-ask", narratorId, messageId: "ask", seq: 1 })
 		.run();
 	db.update(narrators).set({ nextSeq: 1 }).where(eq(narrators.id, narratorId)).run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	await backgroundOccupancyStore.flush();
 	db.insert(narratorToolCalls)
 		.values({
 			id: "question-call",
@@ -217,8 +220,10 @@ async function seedQuestion() {
 	).record;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	db.insert(narrators)
 		.values({
 			id: narratorId,
@@ -228,9 +233,18 @@ beforeEach(() => {
 			updatedAt: time,
 		})
 		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	await backgroundOccupancyStore.flush();
 });
-afterEach(() => activeNarrators.delete(narratorId));
-afterAll(() => sqlite.close());
+afterEach(async () => {
+	activeNarrators.delete(narratorId);
+	backgroundOccupancyStore.setRuntimeLive(narratorId, false);
+	await backgroundOccupancyStore.flush();
+});
+afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
+	sqlite.close();
+});
 
 describe("async question receipt runtime adoption", () => {
 	test("scheduling needs a persisted user event and never creates a queue-only answer", async () => {
@@ -338,6 +352,8 @@ describe("async question receipt runtime adoption", () => {
 	test("unlinking the original shared request withdraws it while a fork retains its background row", async () => {
 		const question = await seedQuestion();
 		db.insert(narrators).values({ id: "fork", createdAt: time, updatedAt: time }).run();
+		backgroundOccupancyStore.refreshNarrator("fork");
+		await backgroundOccupancyStore.flush();
 		db.insert(narratorMessageRefs)
 			.values({ id: "fork-ask", narratorId: "fork", messageId: "ask", seq: 1 })
 			.run();
@@ -354,6 +370,8 @@ describe("async question receipt runtime adoption", () => {
 	test("a fork deleting inherited background does not withdraw the original actor's live question", async () => {
 		const question = await seedQuestion();
 		db.insert(narrators).values({ id: "fork", createdAt: time, updatedAt: time }).run();
+		backgroundOccupancyStore.refreshNarrator("fork");
+		await backgroundOccupancyStore.flush();
 		db.insert(narratorMessageRefs)
 			.values({ id: "fork-ask", narratorId: "fork", messageId: "ask", seq: 1 })
 			.run();
@@ -389,6 +407,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const { awaitTool } = await import("../../lib/agent/tools/await");
 		const wait = awaitTool.execute(
 			{ type: "question", id: question.id, timeout: 2000 },
@@ -464,6 +483,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const { answerAsyncQuestion } = await import("../narrator-question-service");
 		const answer = await answerAsyncQuestion(question.id, {
 			answers: { choice: "UNIQUE_MODEL_ANSWER" },
@@ -496,6 +516,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const { answerAsyncQuestion } = await import("../narrator-question-service");
 		const answer = await answerAsyncQuestion(question.id, {
 			answers: { choice: "PREVIOUSLY_CONSUMED_ANSWER" },
@@ -529,6 +550,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const first = {
 			id: "event-sent",
 			text: '<sender kind="human" />\n{"answerMessageId":"event-sent","answer":"same answer"}',

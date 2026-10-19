@@ -81,7 +81,7 @@ func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
 	if !ts.hello.Capabilities.Git || ts.hello.Capabilities.Shell {
 		t.Fatal("CLI capabilities did not preserve Git with --disable-shell")
 	}
-	for _, required := range []string{rpc.FeatureGitWorkspaceV1, rpc.FeatureGitCommitPreviewV1} {
+	for _, required := range []string{rpc.FeatureGitWorkspaceV1, rpc.FeatureGitCommitPreviewV1, rpc.FeatureGitLineStatsV1} {
 		count := 0
 		for _, feature := range ts.hello.Capabilities.Features {
 			if feature == required {
@@ -120,7 +120,15 @@ func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
 	}
 	call("status", nil)
 	write("initial\n")
+	stats := call("lineStats", nil)["lineStats"].(map[string]any)
+	if stats["complete"] != true || stats["linesAdded"] != float64(1) || len(stats["files"].([]any)) != 1 {
+		t.Fatalf("real RPC untracked line statistics: %v", stats)
+	}
 	call("stage", map[string]any{"all": true})
+	stats = call("lineStats", nil)["lineStats"].(map[string]any)
+	if stats["complete"] != true || stats["linesAdded"] != float64(1) {
+		t.Fatalf("real RPC unborn staged line statistics: %v", stats)
+	}
 	call("unstage", map[string]any{"all": true})
 	call("stage", map[string]any{"files": []any{"file.txt"}})
 	sha := strings.TrimSpace(call("commit", map[string]any{"message": "first", "identity": identity})["stdout"].(string))

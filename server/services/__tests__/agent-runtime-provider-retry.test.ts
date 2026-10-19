@@ -2,7 +2,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narratorMessages, narrators } from "../../db/schema";
+import { backgroundTasks, narratorMessages, narrators } from "../../db/schema";
+import type { RunControl } from "../agent-runtime/ownership";
 import { runtimePolicyForContext } from "../agent-runtime/policy";
 import type { ExecuteLoopOptions } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
@@ -14,10 +15,16 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { settings, usesStatefulModel } = await import("../../lib/settings");
 const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
-const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
+const { tryClaimExecution, getExecutionOwner, setRunControl } = await import(
+	"../agent-runtime/ownership"
+);
 const { activeNarrators } = await import("../narrator-session-state");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { narratorService } = await import("../narrator-service");
 const executor = await import("../narrator-executor");
+const runtimeSession = await import("../narrator-session");
+const { writeSpecFile } = await import("../spec-vfs-service");
+const { readSpecContinuationState } = runtimeSession;
 const recovery = await import("../narrator-recovery");
 const ws = await import("../../websocket/narrator-ws");
 const savedOpenai = settings.openaiProviders;
@@ -34,8 +41,12 @@ const delegatedRegistration = {
 	},
 };
 
-beforeEach(() => cleanDb(sqlite));
-afterEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
+	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
+});
+afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
@@ -43,9 +54,24 @@ afterEach(() => {
 	settings.openaiProviders = savedOpenai;
 	settings.anthropicProviders = savedAnthropic;
 	settings.agent.maxToolCallsPerResponse = savedMaxToolCallsPerResponse;
+	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
-afterAll(() => mock.module("../../db", () => realDb));
+afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
+	mock.module("../../db", () => realDb);
+});
+
+// Direct SQL fixtures must publish the same entity-specific maintenance as production writes.
+async function seedNarrator(row: typeof narrators.$inferInsert): Promise<void> {
+	await db.insert(narrators).values(row);
+	backgroundOccupancyStore.refreshNarrator(row.id);
+}
+
+async function seedTask(row: typeof backgroundTasks.$inferInsert): Promise<void> {
+	await db.insert(backgroundTasks).values(row);
+	backgroundOccupancyStore.refreshTask(row.id);
+}
 
 function session(id: string, model: string, provider: string): ActiveNarrator {
 	return {
@@ -65,6 +91,234 @@ function session(id: string, model: string, provider: string): ActiveNarrator {
 		_substatus: new Set(),
 	};
 }
+
+async function reasoningIdleFixture(kind: "primary" | "subagent", autoContinuation = false) {
+	const prefix = "runtime_reasoning_idle";
+	const model = `${prefix}:gpt-5`;
+	settings.openaiProviders = [
+		{
+			id: prefix,
+			name: prefix,
+			prefix,
+			apiKey: "test-only",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "gpt-5",
+			apiMode: "responses",
+		},
+	];
+	const id = kind === "primary" ? "retry-primary" : "retry-child";
+	const now = new Date().toISOString();
+	for (const target of ["retry-parent", id]) {
+		await seedNarrator({
+			id: target,
+			type: target === "retry-child" ? "subagent" : "primary",
+			variant: target === "retry-child" ? "subagent:general" : "primary",
+			parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+			// The delegated session's run delivers to the parent's call (its own turns).
+			runtimeRegistrationJson:
+				target === "retry-child"
+					? {
+							version: 1,
+							run: {
+								logicalRunId: "reasoning-idle-run",
+								deliverTo: { narratorId: "retry-parent", toolUseId: "origin-tool" },
+							},
+						}
+					: null,
+			model,
+			autoContinuationOverride: autoContinuation ? "always" : "off",
+			cwd: process.env.HOME,
+			createdAt: now,
+			updatedAt: now,
+		});
+	}
+	const active = session(id, model, prefix);
+	activeNarrators.set(id, active);
+	const owner = tryClaimExecution(id, "run");
+	if (!owner) throw new Error("Missing reasoning-idle owner");
+	const run: RunControl | undefined =
+		kind === "primary"
+			? undefined
+			: {
+					startedAt: Date.now(),
+					cancel: new AbortController(),
+					timedOut: false,
+					terminal: new Promise(() => {}),
+					deliverTo: { narratorId: "retry-parent", toolUseId: "origin-tool" },
+				};
+	if (run) setRunControl(owner, run);
+	return { id, model, prefix, now, run, active, owner };
+}
+
+const reasoningIdleResult = {
+	finalText: "",
+	hasError: false,
+	shouldUpdateTitle: false,
+	completedNaturally: true,
+	reasoningOnlyIdle: true,
+};
+
+async function openReasoningIdleTask(id: string) {
+	await writeSpecFile(
+		id,
+		"spec://tasks.json",
+		JSON.stringify({ tasks: [{ text: "Finish the pending implementation", status: "doing" }] }),
+		{ actor: "agent", createdBy: "assistant" },
+	);
+	expect((await readSpecContinuationState(id)).openTask?.status).toBe("doing");
+}
+
+describe("reasoning-only idle uses the real runtime's work and input provenance", () => {
+	for (const background of ["agent", "task", "service", "none", "completed"] as const) {
+		test(`primary / ${background}: only live background work permits idle`, async () => {
+			const expected = background === "agent" || background === "task";
+			const fixture = await reasoningIdleFixture("primary", expected);
+			const { id, now, active, owner, run } = fixture;
+			if (background === "agent") {
+				await seedNarrator({
+					id: "retry-child",
+					type: "subagent",
+					variant: "subagent:general",
+					parentNarratorId: id,
+					status: "working",
+					isBackground: true,
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+			if (background !== "none") {
+				await seedTask({
+					id: "reasoning-idle-background",
+					parentNarratorId: id,
+					type: background === "agent" ? "agent" : "bash",
+					backgroundKind: background === "service" ? "service" : "task",
+					subagentNarratorId: background === "agent" ? "retry-child" : null,
+					status: background === "completed" ? "completed" : "running",
+					startedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+			if (expected) await openReasoningIdleTask(id);
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
+				options.config.onModelInputConsumed?.(options.history, options.userText);
+				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
+				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
+			});
+			const outcome = await runAgentLoopUnlocked(active, owner, "input", undefined, run);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(outcome.hasError).toBe(false);
+			expect((await narratorService.getById(id)).status).toBe("idle");
+			if (expected) {
+				expect((await readSpecContinuationState(id)).openTask?.status).toBe("doing");
+			}
+		});
+	}
+
+	for (const tail of ["mailbox", "user", "assistant"] as const) {
+		test(`subagent / ${tail}: built history preserves only trusted mailbox tail provenance`, async () => {
+			const expected = tail === "mailbox";
+			const { id, active, owner, run } = await reasoningIdleFixture("subagent", expected);
+			// A quiet mailbox pass must not replay an answer from an earlier turn.
+			await narratorService.persistAssistantMessage(id, {
+				uuid: "reasoning-idle-old-assistant",
+				session_id: "reasoning-idle-session",
+				parent_tool_use_id: "origin-tool",
+				message: { content: [{ type: "text", text: "stale assistant answer" }] },
+			});
+			await narratorService.persistSystemMessage(
+				id,
+				"Mailbox update",
+				[
+					{
+						type: "system_injection",
+						source: "subagent_message",
+						modelText: "Mailbox update",
+						body: {
+							kind: "messages",
+							items: [{ fromId: "retry-parent", fromTitle: "Parent", text: "Mailbox update" }],
+						},
+					},
+				],
+				undefined,
+				undefined,
+				{ parentToolUseId: "origin-tool" },
+			);
+			if (tail === "user") {
+				await narratorService.persistUserMessage(
+					id,
+					'<sender kind="agent" id="retry-parent" />\nordinary user text',
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{ parentToolUseId: "origin-tool" },
+				);
+			} else if (tail === "assistant") {
+				await narratorService.persistAssistantMessage(id, {
+					uuid: "reasoning-idle-assistant",
+					session_id: "reasoning-idle-session",
+					parent_tool_use_id: "origin-tool",
+					message: { content: [{ type: "text", text: "ordinary assistant text" }] },
+				});
+			}
+			if (expected) await openReasoningIdleTask(id);
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
+				options.config.onModelInputConsumed?.(options.history, options.userText);
+				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
+				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
+			});
+			const outcome = await runAgentLoopUnlocked(active, owner, "", undefined, run);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(outcome.hasError).toBe(false);
+			if (expected) {
+				expect(outcome.finalText).toBe("");
+				expect((await narratorService.getById(id)).status).toBe("idle");
+				expect((await readSpecContinuationState(id)).openTask?.status).toBe("doing");
+			}
+		});
+	}
+
+	test("busy subagent changes mailbox provenance only when after-tools input is consumed", async () => {
+		const { active, owner, run } = await reasoningIdleFixture("subagent");
+		const consumed = mock(() => {});
+		const drain = spyOn(runtimeSession, "drainInjectionsIntoHistory");
+		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			options.config.onModelInputConsumed?.(options.history, options.userText);
+			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
+			for (const step of [
+				{ parts: [{ text: "mailbox update" }], mailbox: true, before: false, after: true },
+				{ parts: [], mailbox: false, before: true, after: true },
+				{ parts: [{ text: "ordinary guidance" }], mailbox: false, before: true, after: false },
+			]) {
+				drain.mockResolvedValueOnce({
+					text: step.parts.map((part) => part.text).join("\n"),
+					parts: step.parts,
+					lastInputWasMailbox: step.mailbox,
+					onConsumed: consumed,
+				});
+				const input = await options.config.getAfterToolsInjections?.();
+				if (!input || typeof input === "string") throw new Error("Expected structured drain input");
+				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.before);
+				input.onConsumed?.();
+				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
+				// Provider retries re-adopt the same packet, but do not repeat onConsumed.
+				options.config.onModelInputConsumed?.(options.history, options.userText);
+				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
+			}
+			expect(consumed).toHaveBeenCalledTimes(3);
+			options.config.onModelInputConsumed?.(options.history, "a new user turn");
+			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
+			return { ...reasoningIdleResult, reasoningOnlyIdle: false };
+		});
+		const outcome = await runAgentLoopUnlocked(active, owner, "ordinary input", undefined, run);
+		expect(execute).toHaveBeenCalledTimes(1);
+		expect(drain).toHaveBeenCalledTimes(3);
+		expect(outcome.hasError).toBe(false);
+	});
+});
 
 describe("tool-call limit stops the real runtime without locking later user turns", () => {
 	for (const kind of ["primary", "subagent"] as const) {
@@ -86,7 +340,7 @@ describe("tool-call limit stops the real runtime without locking later user turn
 			const id = kind === "primary" ? "retry-primary" : "retry-child";
 			const now = new Date().toISOString();
 			for (const target of ["retry-parent", id]) {
-				await db.insert(narrators).values({
+				await seedNarrator({
 					id: target,
 					type: target === "retry-child" ? "subagent" : "primary",
 					variant: target === "retry-child" ? "subagent:general" : "primary",
@@ -183,7 +437,7 @@ describe("provider retry policy is identical through the real primary and child 
 				const id = kind === "primary" ? "retry-primary" : "retry-child";
 				const now = new Date().toISOString();
 				for (const target of ["retry-parent", id]) {
-					await db.insert(narrators).values({
+					await seedNarrator({
 						id: target,
 						type: target === "retry-child" ? "subagent" : "primary",
 						variant: target === "retry-child" ? "subagent:general" : "primary",
@@ -298,7 +552,7 @@ describe("subagent transient-retry recovery notifies the parent", () => {
 		const id = "retry-child";
 		const now = new Date().toISOString();
 		for (const target of ["retry-parent", id]) {
-			await db.insert(narrators).values({
+			await seedNarrator({
 				id: target,
 				type: target === "retry-child" ? "subagent" : "primary",
 				variant: target === "retry-child" ? "subagent:general" : "primary",
@@ -380,7 +634,7 @@ describe("runtime outcome distinguishes resource cleanup from user cancellation"
 				const id = kind === "primary" ? "retry-primary" : "retry-child";
 				const now = new Date().toISOString();
 				for (const target of ["retry-parent", id]) {
-					await db.insert(narrators).values({
+					await seedNarrator({
 						id: target,
 						type: target === "retry-child" ? "subagent" : "primary",
 						variant: target === "retry-child" ? "subagent:general" : "primary",

@@ -49,6 +49,11 @@ import {
 } from "../lib/boolean-override";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
+	parseOptionalComposerDocument,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../lib/composer-document";
+import {
 	measureMessageCharacters,
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
@@ -147,6 +152,7 @@ import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import {
 	backgroundAgentNoticePreview,
@@ -168,12 +174,7 @@ import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./na
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
 import { getNarratorMessageRefsPort } from "./narrator-refs/store";
-import {
-	enrichToolUseBlocks,
-	handleBashCommand,
-	narratorService,
-	truncateToolIO,
-} from "./narrator-service";
+import { enrichToolUseBlocks, narratorService, truncateToolIO } from "./narrator-service";
 import { generateQuickTitle, setProvisionalTitleFromUserMessage } from "./narrator-title";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
 import {
@@ -247,6 +248,7 @@ interface PlannedUpdateRecoveryControl {
 	controller: AbortController;
 	onInterrupt?: (token: string) => void | Promise<void>;
 	interruptFinalizer: Promise<void> | null;
+	releaseRuntimeClaim: () => void;
 	/**
 	 * Subagents this recovery owner is waiting on, if any.
 	 *
@@ -285,6 +287,7 @@ export function registerPlannedUpdateRecoveryController(
 		controller,
 		onInterrupt,
 		interruptFinalizer: null,
+		releaseRuntimeClaim,
 		foregroundSubagentIds: options.foregroundSubagentIds ?? [],
 	};
 	plannedUpdateRecoveryControls.set(narratorId, control);
@@ -351,6 +354,7 @@ import {
 	getBufferedMessages,
 	getBufferedMessagesAsync,
 	projectMailboxUserMessage,
+	removeBufferedMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
 } from "./narrator-buffer";
@@ -366,6 +370,7 @@ import {
 	recoverStaleCompactingMessages,
 } from "./narrator-persistence";
 import { ensureNarratorPlanFileId } from "./narrator-plan-mode";
+import { invalidateRecoveryTarget } from "./recovery-handoff";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete.
 // Defined next to the snapshot hooks so both loops agree on the set.
@@ -399,7 +404,17 @@ export type { ContinuationStallState };
  */
 export { computeContinuationStallState };
 
-export function parseQueuedNewCommand(message: string, commandText?: string | null) {
+export function parseQueuedNewCommand(
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+) {
+	if (
+		composerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		)
+	)
+		return null;
 	const raw = commandText?.trim().startsWith("/new") ? commandText.trim() : message.trim();
 	const match = raw.match(/^\/new(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
@@ -412,7 +427,17 @@ export function parseQueuedNewCommand(message: string, commandText?: string | nu
  * immediately; on consumption we parse it here and run executeQueuedGoalCommand.
  * Returns null (fall through to a normal model turn) when there is no objective.
  */
-export function parseQueuedGoalCommand(message: string, commandText?: string | null) {
+export function parseQueuedGoalCommand(
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+) {
+	if (
+		composerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		)
+	)
+		return null;
 	const raw = commandText?.trim().startsWith("/goal") ? commandText.trim() : message.trim();
 	const match = raw.match(/^\/goal(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
@@ -812,8 +837,12 @@ async function resumeNextBufferedMessageUnlocked(
 		// differently: a terminal command owns its attachments from here on, while a
 		// plain message keeps its files on disk until delivery has actually succeeded —
 		// they are what a restore needs when it has not.
-		const newCommand = parseQueuedNewCommand(first.text, first.commandText);
-		const goalCommand = parseQueuedGoalCommand(first.text, first.commandText);
+		const newCommand = parseQueuedNewCommand(first.text, first.commandText, first.composerDocument);
+		const goalCommand = parseQueuedGoalCommand(
+			first.text,
+			first.commandText,
+			first.composerDocument,
+		);
 		const controlCommand = first.executionIntent?.controlCommand;
 		if (newCommand || controlCommand) {
 			const commandMessage = await withInboxOwner(narratorId, async () => {
@@ -963,7 +992,6 @@ async function resumeNextBufferedMessageUnlocked(
 				})
 				.catch((err) => handleTerminalCommandError("/goal", err));
 		} else {
-			let dispatch: (() => Promise<void>) | undefined;
 			await feedMessageUnlocked(
 				narratorId,
 				first.text,
@@ -983,8 +1011,7 @@ async function resumeNextBufferedMessageUnlocked(
 				undefined,
 				first.fileReferences,
 			)
-				.then(async ({ userMsg, userBroadcasted, dispatch: deferred }) => {
-					dispatch = deferred;
+				.then(async ({ userMsg, userBroadcasted }) => {
 					// Delivered: the attachments have been re-materialized into the turn, so the
 					// queued copies are finally safe to drop. Cleanup is deliberately awaited only
 					// after durable persistence; a cleanup failure must not restore an already-delivered
@@ -1018,7 +1045,6 @@ async function resumeNextBufferedMessageUnlocked(
 					});
 					return handleTerminalCommandError("auto-resume message", err);
 				});
-			return dispatch;
 		}
 	} finally {
 		if (!ownerTransferred) {
@@ -2458,7 +2484,12 @@ export async function drainInjectionsIntoHistory(
 	active: ActiveNarrator,
 	locale: Locale,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
-): Promise<{ text: string; parts: AgentInputPart[]; onConsumed: () => void }> {
+): Promise<{
+	text: string;
+	parts: AgentInputPart[];
+	lastInputWasMailbox: boolean;
+	onConsumed: () => void;
+}> {
 	const narratorId = active.narratorId;
 	const parts: AgentInputPart[] = [];
 	const { buildPendingQuestionHint } = await import("./narrator-question-service");
@@ -2583,6 +2614,9 @@ export async function drainInjectionsIntoHistory(
 	return {
 		text: parts.map((part) => part.text).join("\n\n"),
 		parts,
+		lastInputWasMailbox: adoptedDeliveries.some(
+			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
+		),
 		onConsumed: () => {
 			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
 			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
@@ -2968,13 +3002,17 @@ export async function runAgentLoop(
 	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
-	options: Omit<
+	{
+		recoveryStart,
+		...options
+	}: Omit<
 		import("./agent-runtime/run").StartNarratorRunRequest,
-		"narratorId" | "locale" | "text" | "images" | "active"
-	> = {},
+		"narratorId" | "locale" | "text" | "images" | "active" | "admission"
+	> & { recoveryStart?: RecoveryContinuationStart } = {},
 ): Promise<{ started: boolean }> {
 	const narratorId = active.narratorId;
 	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
+		recoveryStart?.resolveAdmission(false);
 		return { started: false };
 	}
 	const { startNarratorRun } = await import("./agent-runtime/run");
@@ -2986,16 +3024,20 @@ export async function runAgentLoop(
 			images,
 			active,
 			...options,
+			...(recoveryStart ? { admission: recoveryStart } : {}),
 		});
 		if (!handle.started) return { started: false };
 		await handle.completion;
 		return { started: true };
 	} catch (error) {
+		if (recoveryStart?.cancelled()) return { started: false };
 		if (!narratorLoopAdmissions.has(narratorId)) {
 			active._loopRunning = false;
 			active.alive = false;
 		}
 		throw error;
+	} finally {
+		recoveryStart?.resolveAdmission(false);
 	}
 }
 
@@ -3035,9 +3077,7 @@ export async function readSessionOwnTurnPlacement(narratorId: string): Promise<O
 async function feedMessage(
 	...args: Parameters<typeof feedMessageUnlocked>
 ): ReturnType<typeof feedMessageUnlocked> {
-	const result = await withNarratorStartAdmission(args[0], () => feedMessageUnlocked(...args));
-	await result.dispatch?.();
-	return result;
+	return withNarratorStartAdmission(args[0], () => feedMessageUnlocked(...args));
 }
 
 async function feedMessageUnlocked(
@@ -3063,8 +3103,9 @@ async function feedMessageUnlocked(
 		/** Run relations for a recovered/continued run (see StartNarratorRunRequest). */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
-			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "principal"
+			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "principal" | "binding"
 		>;
+		recoveryStart?: RecoveryContinuationStart;
 	},
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
@@ -3072,17 +3113,18 @@ async function feedMessageUnlocked(
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
 	userBroadcasted?: boolean;
-	/** Pre-command work transferred out of the outermost start admission. */
-	dispatch?: () => Promise<void>;
 	/** Settles when the started run reaches its terminal. */
 	terminal?: Promise<unknown>;
 	/** Input for a fresh pass; ownership and terminal promises remain with run.ts. */
-	preparedInput?: { text: string; images?: ImageRef[] };
+	preparedInput?: { text: string; images?: ImageRef[]; prePromptBashCommand?: string };
 	/** The message is durable, but a later dispatch step failed and was reported. */
 	postCommitError?: unknown;
 }> {
+	const recoveryStart = internalOptions?.recoveryStart;
+	recoveryStart?.check();
 	let acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	recoveryStart?.check();
 	// Final guard against a concurrent loop slipping past the route-level admission
 	// check (which should have buffered this message). ensureNarrator reuses the live
 	// `active`, so starting a second runAgentLoop here would corrupt the shared session.
@@ -3112,6 +3154,7 @@ async function feedMessageUnlocked(
 		throw new ValidationError("Narrator input is already being adopted");
 	let claimedInput: RuntimeMailboxRow | undefined;
 	let stagingId: string | undefined;
+	let acceptedInputId: string | undefined;
 	let userMsg: typeof narratorMessages.$inferSelect;
 	let effectivePrompt: string;
 	try {
@@ -3121,6 +3164,7 @@ async function feedMessageUnlocked(
 		// The shared barrier honors the facade's sync API and a wired service's Promise
 		// shape alike.
 		await flushInboxPublicationBarrier(narratorId);
+		recoveryStart?.check();
 		// An idle narrator may still have earlier agent/task mailbox work that deliberately
 		// does not auto-wake it (notably cancellation notices). Consume that non-user work
 		// before appending this new user input, otherwise the exact claim below reports that
@@ -3129,6 +3173,7 @@ async function feedMessageUnlocked(
 		// it cannot start a second loop or skip an earlier user_input row.
 		if (!internalOptions?.bufferedId && !internalOptions?.bufferedRow)
 			await drainAndPersistPendingInjections(active);
+		recoveryStart?.check();
 		const acceptedId =
 			internalOptions?.bufferedId ??
 			(
@@ -3145,6 +3190,8 @@ async function feedMessageUnlocked(
 					acceptedReferences,
 				)
 			).id;
+		acceptedInputId = acceptedId;
+		recoveryStart?.check();
 		claimedInput =
 			internalOptions?.bufferedRow ??
 			(await claimInboxHead(
@@ -3159,6 +3206,7 @@ async function feedMessageUnlocked(
 		)
 			throw new ValidationError("Buffered input claim does not match its owner");
 		if (!claimedInput) throw new ValidationError("Input is queued behind earlier mailbox work");
+		recoveryStart?.check();
 		const accepted = projectMailboxUserMessage(claimedInput);
 		prompt = accepted.text;
 		images = accepted.images;
@@ -3175,6 +3223,7 @@ async function feedMessageUnlocked(
 		const savedTextFiles: TextFileRef[] = [];
 		if (rawTextFiles?.length) {
 			for (const file of rawTextFiles) {
+				recoveryStart?.check();
 				savedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
 			}
 		}
@@ -3215,6 +3264,7 @@ async function feedMessageUnlocked(
 		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
 
 		const deliverTo = await readSessionDeliverTo(narratorId);
+		recoveryStart?.check();
 		userMsg = (await persistClaimedUserInput({
 			claim: inboxClaim(claimedInput),
 			reservedMessageId: claimedInput.recipientMessageId,
@@ -3226,6 +3276,7 @@ async function feedMessageUnlocked(
 			origin,
 			// Placed under the tool call the session delivers to (display adapter only).
 			parentToolUseId: deliverTo?.toolUseId,
+			composerDocument: accepted.composerDocument,
 		})) as unknown as typeof narratorMessages.$inferSelect;
 		// Display adapter: the destination's tool card shows the placed turn, exactly as
 		// the in-pass consumer does. The session's own frame is sent by the caller.
@@ -3240,6 +3291,13 @@ async function feedMessageUnlocked(
 		}
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
+		if (
+			recoveryStart &&
+			acceptedInputId &&
+			!internalOptions?.bufferedId &&
+			!internalOptions?.bufferedRow
+		)
+			await removeBufferedMessage(narratorId, acceptedInputId);
 		throw error;
 	} finally {
 		if (!internalOptions?.prepareOnly) inputOwner.release();
@@ -3266,6 +3324,7 @@ async function feedMessageUnlocked(
 			: new Date().toISOString();
 
 		const narrator = await narratorService.getById(narratorId);
+		recoveryStart?.check();
 		await narratorService.updateStatus(
 			narratorId,
 			"working",
@@ -3276,38 +3335,30 @@ async function feedMessageUnlocked(
 					}
 				: { setTurnStart: true },
 		);
+		recoveryStart?.check();
 		// The user message above is already persisted, so "first turn" means exactly one
 		// user message exists. `messageCount` cannot answer this any more — it now counts
 		// every message, not finished turns.
 		if (!narrator.title && (await isFirstUserTurn(narratorId))) {
+			recoveryStart?.check();
 			active._provisionalTitle =
 				(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
+			recoveryStart?.check();
 			generateQuickTitle(narratorId, prompt, locale).catch(() => {});
 		}
 
-		if (internalOptions?.prepareOnly) {
-			if (preBashCommand)
-				await handleBashCommand(
-					narratorId,
-					preBashCommand,
-					`/bash ${preBashCommand}`,
-					userId ?? undefined,
-					{ skipUserMessage: true, signal: active.abortController.signal },
-				);
-			return {
-				active,
-				userMsg,
-				preparedInput: {
-					text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
-					images,
-				},
-			};
-		}
-
-		// runBashFirst flow: after persisting the user message, run the Bash command as
-		// an assistant tool card, then start the loop with empty text. buildHistory
+		recoveryStart?.check();
+		// runBashFirst flow: the run executes the accepted Bash command as an assistant
+		// tool card before its first model pass, then starts with empty text. buildHistory
 		// reconstructs the Bash tool_result as the current user turn, so the model sees
-		// the order: user prompt → Bash tool call/result → model reply.
+		// the order: user prompt → Bash tool call/result → model reply. The runtime owns
+		// the command (and its cancellation), so no admission waits on a long Bash.
+		const input = {
+			text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
+			images: preBashCommand ? undefined : images,
+			...(preBashCommand ? { prePromptBashCommand: preBashCommand } : {}),
+		};
+		if (internalOptions?.prepareOnly) return { active, userMsg, preparedInput: input };
 		if (preBashCommand) {
 			// Broadcast the persisted user message before Bash starts. In chunk mode the
 			// frontend renders directly from WS events (not the query optimistic cache),
@@ -3317,78 +3368,14 @@ async function feedMessageUnlocked(
 				narratorId,
 				message: fileReferenceMessageForDisplay(userMsg),
 			});
-			// Transfer an execution epoch, never the start mutex, to the dispatcher.
-			// Publish both cancellation channels before releasing admission: interrupt
-			// input during async Bash setup must abort this activity, not a later run.
-			const activityOwner = tryClaimExecution(narratorId, "tool-replay");
-			if (!activityOwner) throw new ValidationError("Narrator pre-command is already owned");
-			const controller = new AbortController();
-			active.abortController = controller;
-			const signal = urgentActivitySignal(active, controller.signal);
-			const completion = Promise.withResolvers<unknown>();
-			const terminal = completion.promise;
-			const dispatch = async () => {
-				try {
-					await handleBashCommand(
-						narratorId,
-						preBashCommand,
-						`/bash ${preBashCommand}`,
-						userId ?? undefined,
-						{ skipUserMessage: true, signal },
-					);
-					await withNarratorStartAdmission(narratorId, async () => {
-						if (!activityOwner.isCurrent() || controller.signal.aborted || !active.alive) {
-							completion.resolve(undefined);
-							return;
-						}
-						activityOwner.release();
-						// Urgent input cancels the pre-command, not this run: its mailbox
-						// work is consumed by the same loop after the Bash result.
-						completion.resolve(
-							runAgentLoop(active, "", undefined, {
-								...internalOptions?.run,
-								...(userId !== undefined ? { principal: userId } : {}),
-							}),
-						);
-					});
-				} catch (error) {
-					completion.reject(error);
-				} finally {
-					activityOwner.release();
-				}
-			};
-			terminal.catch(async (err) => {
-				const diagnostics = diagnosticsFromError(err);
-				logger.error("runAgentLoop unhandled error", {
-					narratorId,
-					error: String(err),
-					diagnostics,
-				});
-				await narratorService.updateStatus(narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: String(err),
-					diagnostics,
-				});
-				broadcastToNarrator(narratorId, {
-					type: "narrator_error",
-					narratorId,
-					error: String(err),
-					diagnostics,
-				});
-			});
-			return { active, userMsg, userBroadcasted: true, terminal, dispatch };
 		}
-
 		// Start agent loop in background
-		const terminal = runAgentLoop(
-			active,
-			projectFileReferenceText(effectivePrompt, acceptedReferences),
-			images,
-			{
-				...internalOptions?.run,
-				...(userId !== undefined ? { principal: userId } : {}),
-			},
-		);
+		const terminal = runAgentLoop(active, input.text, input.images, {
+			...internalOptions?.run,
+			...(userId !== undefined ? { principal: userId } : {}),
+			prePromptBashCommand: input.prePromptBashCommand,
+			recoveryStart,
+		});
 		terminal.catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
@@ -3405,7 +3392,7 @@ async function feedMessageUnlocked(
 			});
 		});
 
-		return { active, userMsg, terminal };
+		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
 	} catch (error) {
 		if (!internalOptions?.bufferedDelivery) throw error;
 		logger.error("Buffered message committed but could not start", {
@@ -3425,7 +3412,7 @@ export async function prepareQueuedRunInput(
 	active: ActiveNarrator,
 	owner: ExecutionOwner,
 	run: import("./agent-runtime/ownership").RunControl,
-): Promise<{ text: string; images?: ImageRef[] } | undefined> {
+): Promise<{ text: string; images?: ImageRef[]; prePromptBashCommand?: string } | undefined> {
 	const id = active.narratorId;
 	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
 	const delivered = await drainAndPersistPendingInjections(active);
@@ -3729,6 +3716,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 // === Public API ===
 
 export interface UserMessageAdmissionOptions {
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	images?: ImageRef[];
 	locale?: Locale;
 	replyInUserLanguage?: boolean;
@@ -3804,7 +3792,6 @@ export async function acceptUserMessage(
 	const locale = options.locale ?? "en";
 	const queueMode =
 		options.queueMode ?? (options.interrupt ? "interrupt" : options.priority ? "tool" : "turn");
-	let dispatch: (() => Promise<void>) | undefined;
 	const result = await withNarratorStartAdmission(
 		narratorId,
 		async (): Promise<UserMessageAdmissionResult> => {
@@ -3829,6 +3816,7 @@ export async function acceptUserMessage(
 					"fifo",
 					options.executionIntent,
 					queueMode,
+					options.composerDocument,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3859,8 +3847,8 @@ export async function acceptUserMessage(
 						// exits. Leave it to the command-aware buffered consumer, not feedMessage.
 						const queuedCommand =
 							options.executionIntent?.controlCommand ||
-							parseQueuedNewCommand(prompt, options.commandText) ||
-							parseQueuedGoalCommand(prompt, options.commandText);
+							parseQueuedNewCommand(prompt, options.commandText, options.composerDocument) ||
+							parseQueuedGoalCommand(prompt, options.commandText, options.composerDocument);
 						claimed = queuedCommand
 							? undefined
 							: await claimInboxHead(
@@ -3868,11 +3856,7 @@ export async function acceptUserMessage(
 									(row) => row.id === accepted.id && row.kind === "user_input",
 								);
 						if (claimed) {
-							const {
-								userMsg,
-								userBroadcasted,
-								dispatch: deferred,
-							} = await feedMessageUnlocked(
+							const { userMsg, userBroadcasted } = await feedMessageUnlocked(
 								narratorId,
 								prompt,
 								options.images,
@@ -3891,7 +3875,6 @@ export async function acceptUserMessage(
 								undefined,
 								options.fileReferences,
 							);
-							dispatch = deferred;
 							if (!userBroadcasted)
 								broadcastToNarrator(narratorId, {
 									type: "user_message",
@@ -3929,7 +3912,6 @@ export async function acceptUserMessage(
 			}
 		},
 	);
-	await dispatch?.();
 	if (result.buffered) {
 		// Outside start admission: waking takes the same lock, so awaiting it inside
 		// would deadlock. The wake rechecks compactLocks too: compaction may have
@@ -5222,9 +5204,77 @@ async function retryLastMessageUnlocked(
  * model receives a properly localised prompt.
  */
 export async function continueNarrator(
-	...args: Parameters<typeof continueNarratorUnlocked>
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+	userId?: string | null,
+	run?: NonNullable<Parameters<typeof continueNarratorUnlocked>[4]>["run"],
 ): ReturnType<typeof continueNarratorUnlocked> {
-	return withNarratorStartAdmission(args[0], () => continueNarratorUnlocked(...args));
+	return withNarratorStartAdmission(narratorId, () =>
+		continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, { run }),
+	);
+}
+
+interface RecoveryContinuationStart {
+	cancelled: () => boolean;
+	check: () => void;
+	onAdmitted: () => void;
+	resolveAdmission: (started: boolean) => void;
+}
+
+/** Token-scoped recovery only: never relax the public continue/runtime-busy guard. */
+export async function continueNarratorAfterPlannedUpdate(
+	narratorId: string,
+	recoveryToken: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+	userId?: string | null,
+	run?: NonNullable<Parameters<typeof continueNarratorUnlocked>[4]>["run"],
+): Promise<{ ok: boolean }> {
+	return withNarratorStartAdmission(narratorId, async () => {
+		const control = plannedUpdateRecoveryControls.get(narratorId);
+		if (!control || control.token !== recoveryToken || control.controller.signal.aborted)
+			return { ok: false };
+		const admission = Promise.withResolvers<boolean>();
+		const start: RecoveryContinuationStart = {
+			cancelled: () => control.controller.signal.aborted,
+			check() {
+				control.controller.signal.throwIfAborted();
+				if (plannedUpdateRecoveryControls.get(narratorId) !== control)
+					throw new Error("Recovery continuation owner was replaced");
+			},
+			onAdmitted() {
+				// No await separates this from the actual execution-owner claim. Interrupts
+				// now target the published active runtime, not the old recovery owner.
+				plannedUpdateRecoveryControls.delete(narratorId);
+				admission.resolve(true);
+			},
+			resolveAdmission: admission.resolve,
+		};
+		// The start mutex prevents a user run taking the released slot. The controller
+		// remains registered across ALL asynchronous history/session/input preparation.
+		control.releaseRuntimeClaim();
+		try {
+			const result = await continueNarratorUnlocked(
+				narratorId,
+				locale,
+				replyInUserLanguage,
+				userId,
+				{ run, recoveryStart: start },
+			);
+			const admitted = result.ok ? { ok: await admission.promise } : result;
+			if (control.controller.signal.aborted) await control.interruptFinalizer;
+			return admitted;
+		} catch (error) {
+			if (control.controller.signal.aborted) {
+				// Do not admit a newer user run before the old owner's idle/cancellation
+				// finalizer settles; its delayed writes must not land on the new turn.
+				await control.interruptFinalizer;
+				return { ok: false };
+			}
+			throw error;
+		}
+	});
 }
 
 async function continueNarratorUnlocked(
@@ -5232,16 +5282,23 @@ async function continueNarratorUnlocked(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
-	/** Recovery: re-enter a persisted run (deadline kept) and whether it delivers. */
-	run?: Pick<
-		import("./agent-runtime/run").StartNarratorRunRequest,
-		"resumeRunId" | "recovered" | "deliver" | "cancelSignal"
-	>,
+	options: {
+		/** Recovery: re-enter a persisted run (deadline kept) and whether it delivers. */
+		run?: Pick<
+			import("./agent-runtime/run").StartNarratorRunRequest,
+			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "binding"
+		>;
+		recoveryStart?: RecoveryContinuationStart;
+	} = {},
 ): Promise<{ ok: boolean; terminal?: Promise<unknown> }> {
+	const { run, recoveryStart } = options;
+	recoveryStart?.check();
 	const narrator = await narratorService.getById(narratorId);
+	recoveryStart?.check();
 	// If the last top-level message is a tool-call assistant turn, replay the
 	// tool-result request packet instead of appending a textual "continue".
 	const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
+	recoveryStart?.check();
 
 	const continueTiming = resolveContinueTurnTiming({
 		substatus: parseSubstatus(narrator.substatus),
@@ -5272,6 +5329,7 @@ async function continueNarratorUnlocked(
 	if (shouldReplayToolResults && danglingReasoningIds.length > 0) {
 		const deletedMessageIds: string[] = [];
 		for (const messageId of danglingReasoningIds) {
+			recoveryStart?.check();
 			try {
 				const removed = await narratorService.deleteDanglingReasoningMessage(narratorId, messageId);
 				if (removed) deletedMessageIds.push(messageId);
@@ -5305,6 +5363,10 @@ async function continueNarratorUnlocked(
 	if (!shouldReplayToolResults && !trailingInjection) {
 		// No pending tool calls and no fresh injection — send a simple "continue" user message.
 		const continueText = getToolMessage("userContinue", locale);
+		// A user queued this input while recovery held the runtime claim. Adopt it
+		// instead of appending a synthetic Continue behind an unclaimable mailbox head.
+		const queuedInput = recoveryStart ? (await getBufferedMessagesAsync(narratorId))[0] : undefined;
+		recoveryStart?.check();
 		const { userMsg, terminal } = await feedMessage(
 			narratorId,
 			continueText,
@@ -5316,6 +5378,8 @@ async function continueNarratorUnlocked(
 			undefined,
 			undefined,
 			{
+				recoveryStart,
+				bufferedId: queuedInput?.id,
 				...(continueTiming.preserveTurnStart
 					? { preserveTurnStart: true, turnStartedAt: continueTiming.turnStartedAt }
 					: {}),
@@ -5330,7 +5394,9 @@ async function continueNarratorUnlocked(
 		return { ok: true, terminal };
 	}
 
+	recoveryStart?.check();
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	recoveryStart?.check();
 	// Restore the triggering user so knowledge-base ACL works after a rebuild
 	// (interrupt may have destroyed the prior active, leaving _currentUserId unset).
 	active._currentUserId = userId ?? active._currentUserId ?? null;
@@ -5350,9 +5416,11 @@ async function continueNarratorUnlocked(
 	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
 	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
 	// the current turn.
+	recoveryStart?.check();
 	const terminal = runAgentLoop(active, "", undefined, {
 		...run,
 		...(userId !== undefined ? { principal: userId } : {}),
+		recoveryStart,
 	});
 	terminal.catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
@@ -6236,6 +6304,10 @@ function extractImageRefs(
 					imageId: block.imageId as string,
 					filename: block.filename as string,
 					mediaType: block.mediaType as string,
+					...(typeof block.size === "number" ? { size: block.size } : {}),
+					...(typeof block.sourceMimeType === "string"
+						? { sourceMimeType: block.sourceMimeType }
+						: {}),
 					...dimensions,
 					...(uploadNarratorId ? { uploadNarratorId } : {}),
 				});
@@ -6443,6 +6515,7 @@ export async function editAndRegenerate(
 }
 
 export interface EditAndRegenerateOptions {
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
 	fileReferences?: FileReferenceSnapshot[];
 	keepImageIds?: string[];
@@ -6505,6 +6578,12 @@ async function editAndRegenerateUnlocked(
 	const selectedReferences = freezeFileReferenceSnapshots(
 		opts?.fileReferences ?? getFileReferenceSnapshots(originalBlocks),
 	);
+	const document = parseOptionalComposerDocument(opts?.composerDocument);
+	validateComposerProjection(
+		document,
+		newContent,
+		selectedReferences.map((snapshot) => snapshot.reference),
+	);
 	const actualImageIds = originalBlocks
 		.filter((block) => block.type === "image" && typeof block.imageId === "string")
 		.map((block) => block.imageId as string);
@@ -6517,6 +6596,38 @@ async function editAndRegenerateUnlocked(
 		opts?.keepTextFilePaths,
 	);
 
+	if (document && targetMsg.composerDocument) {
+		validateComposerAssets(
+			document,
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "image")
+					.filter((_, index) => keepImageIds.includes(actualImageIds[index])),
+				...(opts?.newImages ?? []),
+			],
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "textFile")
+					.filter((_, index) => keepTextFilePaths.includes(actualTextFilePaths[index])),
+				...(opts?.newTextFiles ?? []),
+			],
+		);
+	}
+	validateComposerAssets(
+		document,
+		[
+			...extractImageRefs(originalBlocks, targetMsg.narratorId).filter((image) =>
+				keepImageIds.includes(image.imageId),
+			),
+			...(opts?.newImages ?? []),
+		],
+		[
+			...extractTextFileRefs(originalBlocks).filter((file) =>
+				keepTextFilePaths.includes(file.filePath),
+			),
+			...(opts?.newTextFiles ?? []),
+		],
+	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
 	const uploadBytes = [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])].reduce(
@@ -6666,7 +6777,11 @@ async function editAndRegenerateUnlocked(
 		for (const file of opts?.newImages ?? []) {
 			const ref = await saveUploadedImage(narratorId, file);
 			createdImageIds.push(ref.imageId);
-			savedNewImages.push({ ...ref, uploadNarratorId: narratorId });
+			savedNewImages.push({
+				...ref,
+				uploadNarratorId: narratorId,
+				...(document ? { size: file.size, sourceMimeType: file.type } : {}),
+			});
 		}
 
 		const savedNewTextFiles: TextFileRef[] = [];
@@ -6718,6 +6833,7 @@ async function editAndRegenerateUnlocked(
 		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
 			contentText: effectivePrompt,
 			contentJson: newContentJson,
+			composerDocument: document ?? null,
 		});
 		copyOnWriteSucceeded = true;
 	} catch (error) {
@@ -7387,6 +7503,7 @@ export function abortActiveNarratorLoopForPlannedUpdateRecovery(
 }
 
 export function interruptNarrator(narratorId: string): boolean {
+	invalidateRecoveryTarget(narratorId);
 	// Persist before aborting: the finalizer and answer wake may race this call.
 	db.update(narrators)
 		.set({ lastStopReason: "user_interrupt" })
@@ -7694,6 +7811,58 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
 			narratorId,
 			previousStatus: narrator.status,
 		});
+	}
+	return changed;
+}
+
+/**
+ * Fail only this startup's discovered recovery targets, never a process-wide scan.
+ * Parallel recovery queues and human approvals retain their runtime ownership;
+ * their failure/finalization paths must release that ownership before calling here.
+ * Admission serializes the owner check and terminal CAS against new starts.
+ */
+export async function failUnownedStartupRecovery(
+	narratorIds: Iterable<string>,
+	error: unknown,
+): Promise<number> {
+	const errorMessage = `Startup recovery failed: ${
+		error instanceof Error ? error.message : String(error)
+	}`.slice(0, 4_000);
+	let changed = 0;
+	let visited = 0;
+	for (const narratorId of new Set(narratorIds)) {
+		try {
+			// Root admission is team-wide: a live background child's work must not keep an
+			// unowned parent working. Only this narrator's own start/finalization protects it.
+			if (
+				!listNarratorAdmissionOwners(narratorId).includes(narratorId) &&
+				!isNarratorRuntimeBusy(narratorId)
+			) {
+				await withNarratorStartAdmission(narratorId, async () => {
+					if (isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId)) return;
+					if (
+						await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
+							substatus: ["error", "interrupted"],
+							errorMessage,
+						})
+					) {
+						changed++;
+						broadcastToNarrator(narratorId, {
+							type: "narrator_error",
+							narratorId,
+							error: errorMessage,
+						});
+					}
+				});
+			}
+		} catch (cleanupError) {
+			// A reserved revert or one unavailable row must not prevent other targets settling.
+			logger.error("Failed to settle unowned startup recovery narrator", {
+				narratorId,
+				error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+			});
+		}
+		if (++visited % 100 === 0) await Bun.sleep(0);
 	}
 	return changed;
 }
@@ -8305,6 +8474,7 @@ export async function recoverOnStartup(
 					.update(narrators)
 					.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
 					.where(inArray(narrators.id, plainIds));
+			backgroundOccupancyStore.refreshNarrators(interruptedIds);
 			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
 				count: interruptedIds.length,
 			});
@@ -8436,10 +8606,7 @@ export async function recoverOnStartup(
 	// Preserve modern compact lifecycle records across restarts. Running attempts
 	// become failed audit entries; only legacy placeholders with no attempt/retry
 	// history are removed.
-	const staleCompactRecovery = await recoverStaleCompactingMessages();
-	if (staleCompactRecovery.preserved > 0 || staleCompactRecovery.deleted > 0) {
-		logger.info("Stale compacting messages recovered on startup", staleCompactRecovery);
-	}
+	await recoverStaleCompactingMessages();
 
 	const transientCompactRows = await db.query.narrators.findMany({
 		columns: { id: true, substatus: true },

@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
+import type { RecordingSettings } from "@shared/request-recording";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { LoadBalancingMode } from "../codex-manager";
@@ -622,6 +623,8 @@ export interface NarraForkSettings {
 		packActivateRequiresPermission: boolean;
 	};
 	/** Plugin subsystem settings. */
+	/** Request evidence (ring recording + auto-pin); read live for each provider request. */
+	requestEvidence: RecordingSettings;
 	plugins: {
 		/**
 		 * Whether the plugin subsystem is enabled. Defaults to true. The
@@ -741,18 +744,6 @@ export interface NarraForkSettings {
 		reasoningEffortBlocklist?: Array<{ pattern: string; enabled?: boolean }>;
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
-		/** Enable bounded circular recording; settings are read live for each request. */
-		requestDumpRecordingEnabled: boolean;
-		/** Circular request-side capacity in bytes. 0 disables circular capture on this side, not continuous retention. */
-		requestDumpRequestBytes: number;
-		/** Circular response-side capacity in bytes. 0 disables circular capture on this side, not continuous retention. */
-		requestDumpResponseBytes: number;
-		/** Force continuous retention of raw provider request/response dumps. */
-		requestDumpEnabled: boolean;
-		/** When request dumps are enabled, only persist raw dumps for failed provider calls. */
-		requestDumpErrorsOnly: boolean;
-		/** Maximum size (bytes) for raw dump body text. Default 1MB. Set to -1 for unlimited. */
-		requestDumpMaxSize: number;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
 		/** Maximum tool calls per model response (integer 1–128). Exceeding it aborts the narrator, not a session-wide cumulative limit. */

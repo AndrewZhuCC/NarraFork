@@ -86,7 +86,7 @@ import {
 	isPublicToolSourceAllowed,
 	projectPublicNarratorEvent,
 	rememberPublicToolIdentity,
-} from "../services/public-narrator-share-intelligent-ui";
+} from "../services/public-narrator-share-gen-ui";
 import {
 	onPublicShareRevoked,
 	revalidatePublicShare,
@@ -2059,6 +2059,7 @@ export const handleNarratorWS = {
 		switch (msg.type) {
 			case "git_workspace_subscribe":
 			case "git_workspace_unsubscribe":
+			case "git_workspace_refresh":
 				await handleGitWorkspaceMessage(ws, msg);
 				break;
 			case "pong":

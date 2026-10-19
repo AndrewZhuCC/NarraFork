@@ -13,19 +13,10 @@
  * Shared types are the single source for classification, measurement and paint.
  */
 
-import {
-	type IntelligentUiFileReference,
-	readIntelligentUiFileReference,
-} from "../intelligent-ui-files";
-import { type IntelligentUiKitNotice, readIntelligentUiKitNotice } from "../intelligent-ui-kit";
-import {
-	INTELLIGENT_UI_PUBLIC_SUMMARY,
-	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
-} from "../intelligent-ui-public";
-import {
-	INTELLIGENT_UI_INLINE_HEIGHTS,
-	readIntelligentUiInlineSize,
-} from "../intelligent-ui-tool-policy";
+import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
+import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
+import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
+import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -504,9 +495,9 @@ export type ToolSectionLabel =
 	| "plan"
 	| "error";
 
-export interface ToolIntelligentUiDetail {
-	kind: "intelligent-ui";
-	file: IntelligentUiFileReference | null;
+export interface ToolGenUiDetail {
+	kind: "gen-ui";
+	file: GenUiFileReference | null;
 	publicSummary?: boolean;
 	historyUnavailable?: boolean;
 	/**
@@ -519,7 +510,7 @@ export interface ToolIntelligentUiDetail {
 	/** Reserved body height: a pure function of the declared size, never a measurement. */
 	contentPx?: number;
 	title?: string;
-	kit?: IntelligentUiKitNotice;
+	kit?: GenUiKitNotice;
 	/**
 	 * The runtime the finished call was validated against. Old UI keeps rendering with it
 	 * after the workspace later gains (or loses) a project kit; absent while streaming.
@@ -527,6 +518,18 @@ export interface ToolIntelligentUiDetail {
 	runtime?: "builtin" | "project";
 	/** Identity of the host-owned state above, which arrives after the input does. */
 	revision?: string;
+	/**
+	 * Set while a `wait: true` render holds its call open: the card's submit answers that
+	 * call instead of sending a chat message.
+	 */
+	formToolUseId?: string;
+	/** The `render` call's id: every frame drawing it shares what the reader entered. */
+	stateKey?: string;
+	/**
+	 * When a `show` call put its app in the chat. The card runs the app in place, and only
+	 * the most recent app starts without a click.
+	 */
+	appShownAt?: string;
 }
 
 /** A body a section can host: every leaf kind EXCEPT `sections` (no nesting). */
@@ -537,7 +540,7 @@ export type ToolSectionBody =
 	| ToolSpecTasksDetail
 	| ToolMetaRowsDetail
 	| ToolAskDetail
-	| ToolIntelligentUiDetail;
+	| ToolGenUiDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -894,27 +897,25 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			: input.inputJson;
 	const output = toolOutputValue(input.outputJson, metadata);
 	if (
-		toolName === "IntelligentUI" &&
-		(input.publicSummary === INTELLIGENT_UI_PUBLIC_SUMMARY_CODE ||
-			output === INTELLIGENT_UI_PUBLIC_SUMMARY ||
-			asObject(output)?.text === INTELLIGENT_UI_PUBLIC_SUMMARY)
+		toolName === "GenUI" &&
+		(input.publicSummary === GEN_UI_PUBLIC_SUMMARY_CODE ||
+			output === GEN_UI_PUBLIC_SUMMARY ||
+			asObject(output)?.text === GEN_UI_PUBLIC_SUMMARY)
 	) {
-		return single("intelligent-ui", {
-			kind: "intelligent-ui",
+		return single("gen-ui", {
+			kind: "gen-ui",
 			file: null,
 			publicSummary: true,
 		});
 	}
 	// Only host-owned metadata is a file reference; never promote tool input or output text.
-	const uiRef = toolName === "IntelligentUI" ? metadata?.intelligentUi : null;
-	const uiFile = readIntelligentUiFileReference(uiRef);
+	const uiRef = toolName === "GenUI" ? metadata?.genUi : null;
+	const uiFile = readGenUiFileReference(uiRef);
 	const uiKit =
-		toolName === "IntelligentUI"
-			? (readIntelligentUiKitNotice(metadata?.intelligentUiKit) ?? undefined)
-			: undefined;
-	const uiDrawnWith = asObject(metadata?.intelligentUiInline)?.kit;
+		toolName === "GenUI" ? (readGenUiKitNotice(metadata?.genUiKit) ?? undefined) : undefined;
+	const uiDrawnWith = asObject(metadata?.genUiInline)?.kit;
 	const uiRuntime: "builtin" | "project" | undefined =
-		toolName === "IntelligentUI" && (uiDrawnWith === "builtin" || uiDrawnWith === "project")
+		toolName === "GenUI" && (uiDrawnWith === "builtin" || uiDrawnWith === "project")
 			? uiDrawnWith
 			: undefined;
 	const uiKitFields = {
@@ -926,7 +927,14 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				}
 			: {}),
 	};
-	const uiInput = toolName === "IntelligentUI" ? asObject(fields) : undefined;
+	const uiShowMeta = toolName === "GenUI" ? asObject(metadata?.genUiShow) : undefined;
+	const uiShow =
+		uiShowMeta?.version === 1 &&
+		typeof uiShowMeta.shownAt === "string" &&
+		!Number.isNaN(Date.parse(uiShowMeta.shownAt))
+			? { shownAt: uiShowMeta.shownAt, size: uiShowMeta.size }
+			: null;
+	const uiInput = toolName === "GenUI" ? asObject(fields) : undefined;
 	// A call that failed, was refused or was stopped drew nothing the reader should take
 	// for an answer: its status and error text are the body instead.
 	const uiUnusable = isFailStatus(status) || status === "denied" || status === "cancelled";
@@ -936,33 +944,49 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 		typeof uiInput?.source === "string" &&
 		(uiInput.action === undefined || uiInput.action === "render") &&
 		!uiUnusable
-			? single("intelligent-ui", {
-					kind: "intelligent-ui",
+			? single("gen-ui", {
+					kind: "gen-ui",
 					file: null,
 					text: uiInput.source,
-					contentPx: INTELLIGENT_UI_INLINE_HEIGHTS[readIntelligentUiInlineSize(uiInput.size)],
+					contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiInput.size)],
 					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
 					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
 					...uiKitFields,
+					...(typeof input.toolUseId === "string" ? { stateKey: input.toolUseId } : {}),
+					...(uiInput.wait === true &&
+					status != null &&
+					!isTerminalToolStatus(status) &&
+					typeof input.toolUseId === "string"
+						? {
+								formToolUseId: input.toolUseId,
+								revision: `${uiKitFields.revision ?? ""}:form`,
+							}
+						: {}),
 				})
 			: null;
 	const uiDetail: ToolDetailData | null = uiInline
 		? uiInline
 		: uiRef
-			? single("intelligent-ui", {
-					kind: "intelligent-ui",
+			? single("gen-ui", {
+					kind: "gen-ui",
 					// Select the visible copy, not an origin PK retained in immutable tool output.
 					// The server checks both visibility and the copy's trusted provenance column.
 					file: uiFile && input.toolCallId ? { ...uiFile, toolCallId: input.toolCallId } : uiFile,
+					...(uiShow && uiFile
+						? {
+								appShownAt: uiShow.shownAt,
+								contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiShow.size)],
+							}
+						: {}),
 					...(metadata?.fileChangeHistoryUnavailable === true ? { historyUnavailable: true } : {}),
 					...uiKitFields,
 				})
 			: // A kit build the user must confirm is something to act on, not text to read.
 				uiKit?.request && !uiUnusable
-				? single("intelligent-ui", { kind: "intelligent-ui", file: null, ...uiKitFields })
+				? single("gen-ui", { kind: "gen-ui", file: null, ...uiKitFields })
 				: null;
 	const base = withErrorSection(
-		toolName === "IntelligentUI"
+		toolName === "GenUI"
 			? (uiDetail ?? sections([textSection("output.main", output, "output")]))
 			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
@@ -3244,12 +3268,18 @@ function classifyKnowledge(
 		for (let i = 0; i < visible; i++) {
 			const r = asObject(results[i]) ?? {};
 			const id = readLeafText(r.id) ?? "";
+			// Standalone personal results have no global entry page: they open their own.
+			const personalId = readLeafText(r.personalEntryId);
 			const title = readLeafText(r.title) ?? (id || "entry");
 			const tags = stringArray(r.tags);
 			const snippet = readLeafText(r.snippet) ?? "";
 			entries.push({
 				title,
-				...(id ? { href: knowledgeEntryHref(id) } : {}),
+				...(personalId
+					? { href: knowledgePersonalEntryHref(personalId) }
+					: id
+						? { href: knowledgeEntryHref(id) }
+						: {}),
 				badges: chips([
 					...tags.slice(0, 6).map((tag) => chip(`#${tag}`, "grape")),
 					chip(r.isPersonal === true ? "personal" : undefined, "cyan"),
@@ -3270,14 +3300,16 @@ function classifyKnowledge(
 		const body = resolveDisplayText(outputJson);
 		const entryId =
 			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
+		const personalId = personalEntryIdOf(metadata, inputJson);
+		const href = knowledgeHref(entryId, personalId);
 		const title = (metadata ? readLeafText(metadata.title) : undefined) ?? "";
 		const tags = stringArray(metadata?.tags);
 		const keywords = stringArray(metadata?.keywords);
 		const header = metaRows([
-			title || entryId
+			title || entryId || personalId
 				? {
-						text: title || entryId,
-						...(entryId ? { href: knowledgeEntryHref(entryId) } : {}),
+						text: title || entryId || personalId || "",
+						...(href ? { href } : {}),
 						badges: chips([
 							chip(metadata?.isPersonal === true ? "personal" : undefined, "cyan"),
 							chip(metadata?.behindMain === true ? "behind main" : undefined, "orange"),
@@ -3307,8 +3339,12 @@ function classifyKnowledge(
 		const entryId =
 			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
 		const scope = (metadata ? readLeafText(metadata.scope) : undefined) ?? "";
+		const personalId = entryId ? undefined : personalEntryIdOf(metadata, inputJson);
+		const headerId = entryId || personalId;
 		const header = metaRows([
-			entryId ? { text: entryId, mono: true, href: knowledgeEntryHref(entryId) } : null,
+			headerId
+				? { text: headerId, mono: true, href: knowledgeHref(entryId, personalId) as string }
+				: null,
 			badgeRow(
 				chips([
 					chip(scope, "grape"),
@@ -3332,6 +3368,31 @@ function classifyKnowledge(
 /** In-app link to a knowledge entry (the chunked EntryLink target). */
 function knowledgeEntryHref(entryId: string): string {
 	return `/knowledge/${entryId}`;
+}
+
+/** In-app link to a personal version (linked or standalone): its one page. */
+function knowledgePersonalEntryHref(personalEntryId: string): string {
+	return `/knowledge/mine/${personalEntryId}`;
+}
+
+function personalEntryIdOf(
+	metadata: Record<string, unknown> | null,
+	inputJson: unknown,
+): string | undefined {
+	return (
+		(metadata ? readLeafText(metadata.personalEntryId) : undefined) ||
+		extractField(inputJson, "personalEntryId") ||
+		undefined
+	);
+}
+
+/** A personal version opens its own page; otherwise the global entry's. */
+function knowledgeHref(
+	entryId: string | undefined,
+	personalEntryId: string | undefined,
+): string | undefined {
+	if (personalEntryId) return knowledgePersonalEntryHref(personalEntryId);
+	return entryId ? knowledgeEntryHref(entryId) : undefined;
 }
 
 /**

@@ -10,9 +10,11 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { Worker } from "node:worker_threads";
+import { compiledWorkerBuildEntrypoints } from "../server/lib/compiled-worker";
 import { buildLicenseManifestFromDisk } from "../server/lib/licenses/manifest";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import type { LocalizedValue } from "../shared/i18n-locales";
+import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { validatePtyDependency } from "./lib/ci-build-native";
@@ -47,6 +49,8 @@ const GENERATED_BUILD_INFO_FILE = join(ROOT, "server", "generated", "build-info.
 const GENERATED_CHANGELOG_FILE = join(ROOT, "server", "generated", "embedded-changelog.ts");
 const GENERATED_LICENSES_FILE = join(ROOT, "server", "generated", "embedded-licenses.ts");
 const DIST_DIR = join(ROOT, "dist");
+/** Windows 可执行文件图标：由 scripts/generate-windows-icon.ts 从品牌 PNG 生成。 */
+const WINDOWS_ICON_PATH = join(DIST_DIR, "narrafork.ico");
 
 // ============================================================================
 // Main build script
@@ -433,30 +437,8 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		process.execPath,
 		"build",
 		"./server/index.ts",
-		// Additional entry point: the database read worker. `new Worker()` specifiers are NOT
-		// followed by the bundler, so without listing it here the worker module is simply absent
-		// from the binary and every spawn fails with ModuleNotFound. It is embedded as
-		// `worker-entry.js` (note the rewritten extension), which is what pool.ts resolves at
-		// runtime when it detects the compiled runtime.
-		"./server/lib/db-worker/worker-entry.ts",
-		// Large editor IO/encoding runs off-thread in source and compiled builds alike.
-		"./server/services/editor-document-worker.ts",
-		// Model history JSON decoding stays off-thread in compiled distributions too.
-		"./server/services/agent-runtime/model-history-worker.ts",
-		"./server/lib/browser/memory-snapshot-worker.ts",
-		"./server/lib/browser/memory-profile-worker.ts",
-		// Share HTML cleaning runs off-thread, including in compiled distributions.
-		"./server/lib/share-preview-worker.ts",
-		// Default request recording and ZIP jobs stay off the HTTP/agent thread.
-		"./server/lib/request-recorder-worker.ts",
-		// Revert manifest validation also runs in a Worker; Worker URLs are not bundled imports.
-		"./server/services/revert-transaction-manifest-worker.ts",
-		// Private archive scans/copies/imports must remain off-thread in released binaries.
-		"./server/services/project-archive/legacy-sync-worker.ts",
-		"./server/services/project-archive/legacy-import-worker.ts",
-		// Historical accounting analysis and bounded JSON parsing never run on the HTTP thread.
-		"./server/services/usage-token-repair-worker.ts",
-		"./server/services/usage-token-repair-evidence-worker.ts",
+		// Worker entries are not bundled imports; see server/lib/compiled-worker.ts.
+		...compiledWorkerBuildEntrypoints(),
 		`--define=__NARRAFORK_BUILD_REPOSITORY__=${JSON.stringify(BUILD_REPOSITORY)}`,
 		"--compile",
 		"--minify",
@@ -465,6 +447,14 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		"--asset-naming=[dir]/[name].[ext]",
 		// electron is referenced by puppeteer-core but never used in headless mode
 		"--external=electron",
+		// Windows：面板自带 UI，编译产物不该再弹控制台；图标由
+		// scripts/generate-windows-icon.ts 从品牌 PNG 生成，缺失时跳过而不是让编译失败。
+		...(platform.target.startsWith("bun-windows")
+			? [
+					"--windows-hide-console",
+					...(existsSync(WINDOWS_ICON_PATH) ? [`--windows-icon=${WINDOWS_ICON_PATH}`] : []),
+				]
+			: []),
 		"--outfile",
 		outfile,
 	]);
@@ -501,6 +491,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 				commit: commitHash,
 				repository: BUILD_REPOSITORY,
 				helperDistribution: HELPER_DISTRIBUTION,
+				recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 				releaseCi,
 			},
 		});
@@ -525,6 +516,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 								commit: commitHash,
 								repository: BUILD_REPOSITORY,
 								helperDistribution: HELPER_DISTRIBUTION,
+								recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 							});
 						} catch (error) {
 							reject(error);
@@ -569,6 +561,7 @@ if (releaseCi) {
 			commit: commitHash,
 			repository: BUILD_REPOSITORY,
 			helperDistribution: HELPER_DISTRIBUTION,
+			recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 		});
 		const reported = results[index].metadata;
 		if (

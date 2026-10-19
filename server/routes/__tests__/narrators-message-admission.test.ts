@@ -1,10 +1,18 @@
 import { describe, expect, mock, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import { type FileReference, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 } from "@shared/text-file-types";
 import { Hono } from "hono";
+import {
+	bindComposerDocumentReferences,
+	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../../lib/composer-document";
 import { AppError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
 import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
@@ -36,8 +44,10 @@ function fixture(
 		subagent?: boolean;
 		compact?: boolean;
 		modelOverride?: boolean;
+		expandedCommand?: boolean;
 		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
+		canonicalPrefix?: string;
 	} = {},
 ) {
 	let status = options.status ?? "idle";
@@ -84,6 +94,11 @@ function fixture(
 		narratorRoutes: routes,
 		ValidationError,
 		parseFileReferenceInput,
+		parseOptionalComposerDocument,
+		bindComposerDocumentReferences,
+		restoreMultipartComposerText,
+		validateComposerProjection,
+		validateComposerAssets,
 		sendMessageSchema,
 		bufferQueueModeSchema,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
@@ -92,7 +107,9 @@ function fixture(
 		captureFileReferences: async (_id: string, _userId: string, refs: FileReference[]) =>
 			refs.map((reference) => ({
 				type: "file_reference",
-				reference,
+				reference: options.canonicalPrefix
+					? { ...reference, path: `${options.canonicalPrefix}${reference.path}` }
+					: reference,
 				snapshotText: "private snapshot bytes",
 				snapshotHash: "a".repeat(64),
 				capturedAt: "2026-09-21T00:00:00.000Z",
@@ -142,7 +159,13 @@ function fixture(
 								bashCommand: "pwd",
 								command: { modelOverride: { model: "replacement", mode: "temporary" } },
 							}
-						: { resolved: false },
+						: options.expandedCommand
+							? {
+									resolved: true,
+									expandedPrompt: "expanded skill instructions",
+									rawCommand: message,
+								}
+							: { resolved: false },
 		getUserLanguage: async () => "zh-CN",
 		getUserReplyInLanguage: async () => true,
 		acceptUserMessage: accept,
@@ -201,6 +224,25 @@ function fixture(
 	};
 }
 
+test.each([
+	false,
+	true,
+])("subagent expanded commands discard obsolete text-only layout (busy=%s)", async (busy) => {
+	const f = fixture({ subagent: true, busy, buffered: busy, expandedCommand: true });
+	const document = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "/skill explain" }] }],
+		assets: [],
+	};
+	const response = await f.post({ message: "/skill explain", composerDocument: document });
+	expect(response.status).toBe(busy ? 202 : 201);
+	// Every session takes the one admission; the expanded text replaces the layout.
+	const [, prompt, input] = f.accept.mock.calls[0] ?? [];
+	expect(input?.composerDocument).toBeUndefined();
+	expect(prompt).toBe("expanded skill instructions");
+	expect(input?.commandText).toBe("/skill explain");
+});
+
 function multipart(interrupt?: string) {
 	const body = new FormData();
 	body.set("message", "hello");
@@ -253,6 +295,80 @@ describe("save_dump immediate HTTP control", () => {
 });
 
 describe("primary HTTP message admission", () => {
+	test("semantic document is validated and passed intact to durable admission", async () => {
+		const f = fixture({ buffered: true });
+		const document = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "text", text: "rich" }] }],
+			assets: [],
+		};
+		expect((await f.post({ message: "rich", composerDocument: document })).status).toBe(202);
+		expect(f.accept.mock.calls[0]?.[2].composerDocument).toEqual(document);
+		expect((await f.post({ message: "different", composerDocument: document })).status).toBe(400);
+		expect(
+			(await f.post({ message: "rich", composerDocument: { ...document, version: 9 } })).status,
+		).toBe(400);
+	});
+	test("multipart CRLF normalization keeps a pasted-image document in sync", async () => {
+		const f = fixture({ buffered: true });
+		const document = {
+			version: 1,
+			paragraphs: [
+				{ children: [{ type: "text", text: "line one" }] },
+				{
+					children: [
+						{ type: "text", text: "line two" },
+						{ type: "attachment", id: "node", assetId: "asset" },
+					],
+				},
+			],
+			assets: [{ id: "asset", kind: "image", name: "image.png", size: 5, mimeType: "image/png" }],
+		};
+		const body = new FormData();
+		body.set("message", "line one\nline two");
+		body.append("images", new File(["image"], "image.png", { type: "image/png" }));
+		body.set("composerDocument", JSON.stringify(document));
+		expect((await f.post(body)).status).toBe(202);
+		expect(f.accept.mock.calls[0]?.[1]).toBe("line one\nline two");
+		expect(f.accept.mock.calls[0]?.[2].composerDocument).toEqual(document);
+	});
+	test("document adopts canonical file reference metadata from capture", async () => {
+		const f = fixture({ buffered: true, canonicalPrefix: "/private" });
+		const reference = { id: "ref", deviceId: "local", path: "/tmp/a.ts", label: "a.ts" };
+		const document = {
+			version: 1,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "see " },
+						{ type: "fileReference", id: "node", reference },
+					],
+				},
+			],
+			assets: [],
+		};
+		const message = "see #file:a.ts";
+		const response = await f.post({
+			message,
+			fileReferences: [{ ...reference, inputRange: [4, message.length] }],
+			composerDocument: document,
+		});
+		expect(response.status).toBe(202);
+		const admission = f.accept.mock.calls[0]?.[2] as {
+			composerDocument: ComposerDocument;
+			fileReferences: { reference: FileReference }[];
+		};
+		const node = admission.composerDocument.paragraphs[0]?.children[1];
+		expect(node?.type === "fileReference" && node.reference.path).toBe("/private/tmp/a.ts");
+		// Durable admission re-validates against the captured snapshots.
+		expect(() =>
+			validateComposerProjection(
+				admission.composerDocument,
+				message,
+				admission.fileReferences.map((snapshot) => snapshot.reference),
+			),
+		).not.toThrow();
+	});
 	test.each([
 		"turn",
 		"tool",

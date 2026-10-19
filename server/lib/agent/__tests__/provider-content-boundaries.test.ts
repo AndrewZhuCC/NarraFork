@@ -371,6 +371,49 @@ describe("native content boundaries", () => {
 		expect(events[2].toolUseChunk?.toolUseId).toBe("call_1");
 	});
 
+	test("Chat reads a final message reasoning_content when the delta omits it", async () => {
+		setOutboundFetchOverrideForTest(async () =>
+			sse([
+				{
+					choices: [
+						{
+							message: { reasoning_content: "from message" },
+							finish_reason: "tool_calls",
+						},
+					],
+				},
+			]),
+		);
+		const events = await collect(
+			new OpenAIProvider({ ...config, apiMode: "completions" }).chat(chatParams()),
+		);
+		expect(events.filter((event) => event.reasoning).map((event) => event.reasoning)).toEqual([
+			"from message",
+		]);
+	});
+
+	test("Chat prefers delta reasoning over a duplicated message snapshot", async () => {
+		setOutboundFetchOverrideForTest(async () =>
+			sse([
+				{
+					choices: [
+						{
+							delta: { reasoning_content: "delta thought" },
+							message: { reasoning_content: "full snapshot" },
+							finish_reason: "stop",
+						},
+					],
+				},
+			]),
+		);
+		const events = await collect(
+			new OpenAIProvider({ ...config, apiMode: "completions" }).chat(chatParams()),
+		);
+		expect(events.filter((event) => event.reasoning).map((event) => event.reasoning)).toEqual([
+			"delta thought",
+		]);
+	});
+
 	test("Gemini generateContent merges same-lane deltas, not distinct parts or tools", async () => {
 		setOutboundFetchOverrideForTest(async () =>
 			sse([

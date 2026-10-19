@@ -26,6 +26,7 @@ import {
 	monacoHostVisible,
 	revealMonacoPosition,
 } from "./monaco-scroll";
+import { MonacoSelectionQuote } from "./monaco-selection-quote";
 
 export interface MonacoEditorHandle {
 	getEditor(): editor.IStandaloneCodeEditor | null;
@@ -52,6 +53,8 @@ export interface MonacoEditorProps {
 	onReady?: (handle: MonacoEditorHandle | null) => void;
 	onDocumentChange?: (status: MonacoDocumentStatus) => void;
 	onSelectionChange?: (selection: FileSelection | null, explicit: boolean) => void;
+	onQuoteSelection?: (selection: FileSelection) => void;
+	quoteSelectionDisabledReason?: string | null;
 	onSearchRequested?: () => void;
 	onSave?: () => void;
 	onError?: (error: Error) => void;
@@ -99,6 +102,8 @@ function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 export function MonacoEditor(props: MonacoEditorProps) {
 	const { ref, documentKey } = props;
 	const { t } = useTranslation("narrator");
+	const quoteLabel = useRef(t("quote.add"));
+	quoteLabel.current = t("quote.add");
 	const [longLineDocumentKey, setLongLineDocumentKey] = useState<string | null>(null);
 	const [fullLongLineDocumentKey, setFullLongLineDocumentKey] = useState<string | null>(null);
 	const fullLongLines = fullLongLineDocumentKey === documentKey;
@@ -156,6 +161,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			let renderingFull = fullLongLinesRef.current;
 			const view = api.editor.create(host, {
 				...monacoEditorOptions(!!initial.readOnly, !!initial.lineWrapping, false),
+				glyphMargin: !!initial.onQuoteSelection,
 				stopRenderingLineAfter: renderingFull ? -1 : MONACO_LONG_LINE_LIMIT,
 				theme: "narrafork",
 				ariaLabel: initial.filePath,
@@ -176,6 +182,12 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			if (longLines.hasLongLine) view.updateOptions({ wordWrap: "off" });
 			view.setModel(model);
 			const navigation = new MonacoNavigationHighlight(view);
+			const quoteSelection = new MonacoSelectionQuote(api, view, model, host.ownerDocument, () => ({
+				owner: latest.current.filePath,
+				label: quoteLabel.current,
+				onQuoteSelection: latest.current.onQuoteSelection,
+				disabledReason: latest.current.quoteSelectionDisabledReason,
+			}));
 			let loadedValue = initial.initialValue;
 			let loadedPath = initialLanguagePath;
 			let lastNavigation = "";
@@ -299,6 +311,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 						pendingReveal = null;
 					}
 				}
+				quoteSelection.sync();
 				layout();
 			};
 			// Drag-select fires onDidChangeCursorSelection on every pointer move. Publishing
@@ -365,6 +378,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				}),
 				model.onDidChangeContent((event) => {
 					if (event.isFlush) {
+						quoteSelection.invalidate();
 						loadRevision++;
 						// Also support explicit reloads performed through the public model handle.
 						queueMicrotask(() => {
@@ -389,6 +403,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					}
 				}),
 				view.onDidChangeCursorSelection((event) => {
+					quoteSelection.sync(event.reason !== api.editor.CursorChangeReason.ContentFlush);
 					// Flush/recover are document-only changes and cannot steal another panel's ownership.
 					const explicit =
 						event.reason !== api.editor.CursorChangeReason.ContentFlush &&
@@ -423,6 +438,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				removeBoundary();
 				for (const subscription of subscriptions) subscription.dispose();
 				blurSubscription?.dispose();
+				quoteSelection.dispose();
 				navigation.dispose();
 				runtime.current = null;
 				view.dispose();

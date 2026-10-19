@@ -58,6 +58,7 @@ class TestResizeObserver {
 
 let root: Root | undefined;
 let restoreGitApi: (() => void) | undefined;
+const originalGitLineStats = api.getGitLineStats;
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -170,11 +171,18 @@ function makeMixedStatus(): GitStatusSummary {
 function stubGitApi(calls: Array<{ name: string; body?: unknown }>, status: GitStatusSummary) {
 	const original = {
 		getGitStatus: api.getGitStatus,
+		getGitLineStats: api.getGitLineStats,
 		gitStage: api.gitStage,
 		gitUnstage: api.gitUnstage,
 		gitDiscard: api.gitDiscard,
 	};
 	api.getGitStatus = async () => status;
+	api.getGitLineStats = async () => ({
+		files: status.files.map((f) => ({ ...f, complete: true })),
+		linesAdded: status.linesAdded ?? 0,
+		linesRemoved: status.linesRemoved ?? 0,
+		complete: true,
+	});
 	api.gitStage = async (_chapterId, body) => {
 		calls.push({ name: "stage", body });
 		return status;
@@ -328,6 +336,12 @@ function buttonByLabel(container: HTMLElement, label: string): HTMLButtonElement
 describe("GitChangesTab status filter", () => {
 	beforeEach(async () => {
 		installDom();
+		api.getGitLineStats = async () => ({
+			files: [],
+			linesAdded: 0,
+			linesRemoved: 0,
+			complete: false,
+		});
 		// Both preference caches are memoized at module scope, and installDom() hands
 		// out a FRESH Map-backed sessionStorage per test: a stale parse would leak one
 		// test's filter into the next.
@@ -339,9 +353,70 @@ describe("GitChangesTab status filter", () => {
 	afterEach(() => {
 		restoreGitApi?.();
 		restoreGitApi = undefined;
+		api.getGitLineStats = originalGitLineStats;
 		if (!root) return;
 		root.unmount();
 		root = undefined;
+	});
+
+	test("slow and failed line stats never delay status rows or disable actions", async () => {
+		const client = makeClient();
+		const chapterId = "chapter-slow-stats";
+		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
+		let rejectStats!: (error: Error) => void;
+		api.getGitLineStats = () =>
+			new Promise((_resolve, reject) => {
+				rejectStats = reject;
+			});
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		await expandAllFolders(container);
+		expect(fileRowPaths(container)).toHaveLength(5);
+		expect(container.querySelector('[aria-label="Counting lines…"]')).not.toBeNull();
+		expect(buttonByText(container, "Stage All").disabled).toBe(false);
+		rejectStats(new Error("stats failed"));
+		await waitFor(
+			() => container.textContent?.includes("Line counts failed") === true,
+			"stats failure",
+		);
+		expect(fileRowPaths(container)).toHaveLength(5);
+		expect(buttonByText(container, "Stage All").disabled).toBe(false);
+		client.clear();
+	});
+
+	test("complete binary measurements may display zero, but missing measurements do not", async () => {
+		const client = makeClient();
+		const chapterId = "chapter-binary-stats";
+		const status = {
+			...makeMixedStatus(),
+			staged: 0,
+			unstaged: 2,
+			untracked: 0,
+			files: [
+				{ status: " M", path: "binary.png" },
+				{ status: " M", path: "unknown.png" },
+			],
+			totalFiles: 2,
+		};
+		client.setQueryData(["gitStatus", chapterId], status);
+		client.setQueryData(["gitLineStats", chapterId], {
+			files: [
+				{ path: "binary.png", unstagedLinesAdded: 0, unstagedLinesRemoved: 0, complete: true },
+				{ path: "unknown.png", complete: false },
+			],
+			linesAdded: 0,
+			linesRemoved: 0,
+			complete: false,
+		});
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		expect(
+			container.querySelector('[aria-label="View diff of binary.png"]')?.textContent,
+		).toContain("+0-0");
+		expect(
+			container.querySelector('[aria-label="View diff of unknown.png"]')?.textContent,
+		).not.toMatch(/[+-]0/);
+		client.clear();
 	});
 
 	test("branch name uses the remaining header space instead of a percentage cap", async () => {
@@ -502,7 +577,97 @@ describe("GitChangesTab status filter", () => {
 		expect(container.textContent).toContain("Unstaged (3+)");
 		expect(container.textContent).toContain("Staged count is a lower bound");
 		expect(container.textContent).toContain("Unstaged count is a lower bound");
+		client.setQueryData<GitStatusSummary>(
+			["gitStatus", chapterId],
+			(old) =>
+				old && {
+					...old,
+					truncated: false,
+					totalFilesExact: false,
+				},
+		);
+		await flushRender();
+		expect(container.textContent).toContain("Staged (3+)");
+		expect(container.textContent).toContain("Unstaged (3+)");
+		expect(container.textContent).toContain("Unstaged count is a lower bound");
 
+		client.clear();
+	});
+
+	test("independent partial stats show known rows, never invent zero or sum incomplete folders", async () => {
+		const chapterId = "chapter-lightweight";
+		const client = makeClient();
+		const status: GitStatusSummary = {
+			hasChanges: true,
+			staged: 0,
+			unstaged: 2,
+			untracked: 0,
+			files: [file(" M", "src/known.ts"), { status: " M", path: "src/unknown.ts" }],
+			totalFiles: 2,
+			headSha: "abc",
+			branch: "main",
+		};
+		client.setQueryData(["gitStatus", chapterId], status);
+		client.setQueryData(["gitLineStats", chapterId], {
+			files: [
+				{ path: "src/known.ts", unstagedLinesAdded: 1, unstagedLinesRemoved: 0, complete: true },
+			],
+			linesAdded: 1,
+			linesRemoved: 0,
+			complete: false,
+		});
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		const folder = container.querySelector('[aria-label="Expand folder src"]');
+		expect(folder?.textContent).not.toContain("+1");
+		expect(container.querySelector('[aria-label="Incomplete line counts"]')).not.toBeNull();
+		await expandAllFolders(container);
+		const row = (path: string) => container.querySelector(`[aria-label="View diff of ${path}"]`);
+		expect(row("src/known.ts")?.textContent).toContain("+1");
+		expect(row("src/unknown.ts")?.textContent).not.toMatch(/[+-]0|NaN/);
+		// A lightweight status refresh does not erase independently measured rows.
+		client.setQueryData(["gitStatus", chapterId], {
+			...status,
+			files: status.files.map(({ status, path }) => ({ status, path })),
+		});
+		await flushRender();
+		expect(row("src/known.ts")?.textContent).toContain("+1");
+		client.setQueryData(["gitLineStats", chapterId], {
+			files: [],
+			linesAdded: 0,
+			linesRemoved: 0,
+			complete: false,
+		});
+		await flushRender();
+		expect(row("src/known.ts")?.textContent).not.toMatch(/[+-]1|[+-]0|NaN/);
+		expect(fileRowPaths(container)).toHaveLength(2);
+		client.clear();
+	});
+
+	test("a list cap with an exact scan does not claim lower-bound section counts", async () => {
+		const chapterId = "chapter-exact-capped";
+		const client = makeClient();
+		client.setQueryData(["gitStatus", chapterId], {
+			hasChanges: true,
+			truncated: true,
+			totalFilesExact: true,
+			staged: 3,
+			unstaged: 2,
+			untracked: 1,
+			files: [
+				{ status: "M ", path: "src/staged.ts" },
+				{ status: " M", path: "src/worktree.ts" },
+			],
+			totalFiles: 6,
+			headSha: "abc",
+			branch: "main",
+		} satisfies GitStatusSummary);
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		expect(container.textContent).toContain("Staged (3)");
+		expect(container.textContent).toContain("Unstaged (3)");
+		expect(container.textContent).not.toContain("lower bound");
+		expect(container.textContent).toContain("some files are not shown");
 		client.clear();
 	});
 

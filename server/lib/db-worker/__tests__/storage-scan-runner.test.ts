@@ -115,8 +115,8 @@ describe("runParallelObjectStorageScan", () => {
 				dbPath,
 				mainBytes: MAIN_BYTES,
 			});
-			expect(viaFallback.executedOn).toBe("main-thread");
-			expect(viaFallback.workerCount).toBe(0);
+			expect(viaFallback.executedOn).toBe("worker-serial");
+			expect(viaFallback.workerCount).toBe(1);
 
 			expect(storageFields(viaWorkers)).toEqual(storageFields(viaFallback));
 			// Not vacuous: the fixture must have measurable content.
@@ -288,7 +288,8 @@ describe("read failures are not reported as empty tables", () => {
 		// mode-specific assertion here pinned the runtime instead of the behaviour under test.
 		const healthy = measureTable(reader, table, context);
 		expect(healthy.readFailed).toBeUndefined();
-		expect(healthy.rowCount).toBe(50);
+		// The breakdown does not count rows. Bytes come from dbstat, or from SUM(length) when it is absent.
+		expect(healthy.rowCount).toBeNull();
 		expect(healthy.totalBytes).toBeGreaterThan(0);
 
 		writer.run("BEGIN EXCLUSIVE");
@@ -300,15 +301,20 @@ describe("read failures are not reported as empty tables", () => {
 			writer.run("ROLLBACK");
 		}
 
-		expect(locked.readFailed).toBe(true);
-		// rowCount stays null — "unknown", never 0.
 		expect(locked.rowCount).toBeNull();
-		expect(locked.approxContentBytes).toBe(0);
+		if (context.dbstat.supported) {
+			// Bytes were already taken from dbstat. There is no per-table query left to hit the lock.
+			expect(locked.readFailed).toBeUndefined();
+			expect(locked.totalBytes).toBe(healthy.totalBytes);
+		} else {
+			expect(locked.readFailed).toBe(true);
+			expect(locked.approxContentBytes).toBe(0);
+		}
 
-		// Once the lock is released the same call succeeds again, proving the failure was contention.
 		const recovered = measureTable(reader, table, context);
 		expect(recovered.readFailed).toBeUndefined();
-		expect(recovered.rowCount).toBe(50);
+		expect(recovered.rowCount).toBeNull();
+		expect(recovered.totalBytes).toBeGreaterThan(0);
 
 		reader.close();
 		writer.close();
@@ -369,7 +375,7 @@ describe("read failures are not reported as empty tables", () => {
 		const flaky = withInjectedBusyFailures(reader, 1);
 		const measured = measureTable(flaky, table, context);
 		expect(measured.readFailed).toBeUndefined();
-		expect(measured.rowCount).toBe(1);
+		expect(measured.rowCount).toBeNull();
 		// `totalBytes` rather than `approxContentBytes`, for the same build-dependent reason as above:
 		// the approximate field is 0 by design in dbstat mode. The claim being made is "the retried
 		// read produced a real measurement", which the total carries in either mode.
@@ -390,8 +396,11 @@ describe("read failures are not reported as empty tables", () => {
 
 		// More failures than the retry schedule allows (2 retries => 3 attempts per query).
 		const measured = measureTable(withInjectedBusyFailures(reader, 5), table, context);
-		expect(measured.readFailed).toBe(true);
 		expect(measured.rowCount).toBeNull();
+		// dbstat mode issues no per-table query, so injected BUSY never fires. Approximate mode
+		// still has the SUM(length) scan, and that one must be reported as unread rather than empty.
+		if (context.dbstat.supported) expect(measured.readFailed).toBeUndefined();
+		else expect(measured.readFailed).toBe(true);
 		reader.close();
 	}, 30_000);
 
@@ -422,13 +431,16 @@ describe("read failures are not reported as empty tables", () => {
 
 		const startedAt = Date.now();
 		const measured = measureTable(broken, table, context);
-		expect(measured.readFailed).toBe(true);
-		// One attempt per measurement query, with no backoff sleeping. HOW MANY queries there are is
-		// mode-dependent: the approximate path runs count + `SUM(length(...))`, while the dbstat path
-		// runs only the count (page sizes come from dbstat, so the content scan is skipped). Hard-coding
-		// 2 asserted the approximate mode rather than the no-retry rule, and broke on a Bun whose
-		// bundled SQLite gained dbstat. The rule itself is "attempted exactly once each, no sleeping".
-		expect(attempts).toBe(context.dbstat.supported ? 1 : 2);
+		expect(measured.rowCount).toBeNull();
+		// dbstat mode does not query the table. Approximate mode runs one SUM(length) and does not
+		// retry a non-BUSY error.
+		if (context.dbstat.supported) {
+			expect(measured.readFailed).toBeUndefined();
+			expect(attempts).toBe(0);
+		} else {
+			expect(measured.readFailed).toBe(true);
+			expect(attempts).toBe(1);
+		}
 		expect(Date.now() - startedAt).toBeLessThan(200);
 		reader.close();
 	}, 30_000);
@@ -452,9 +464,15 @@ describe("read failures are not reported as empty tables", () => {
 		const elapsed = Date.now() - startedAt;
 		writer.run("ROLLBACK");
 
-		expect(measured.readFailed).toBe(true);
-		// Retries share a 200ms sleep budget across both reads of the table, and each attempt is capped
-		// by busy_timeout. A table that cannot be read must not stall the scan for seconds.
+		if (context.dbstat.supported) {
+			expect(measured.readFailed).toBeUndefined();
+			expect(measured.totalBytes).toBeGreaterThan(0);
+		} else {
+			expect(measured.readFailed).toBe(true);
+		}
+		// Approximate mode retries share a 200ms sleep budget, and each attempt is capped by
+		// busy_timeout. A table that cannot be read must not stall the scan for seconds. dbstat mode
+		// does not query the table, so it returns immediately.
 		expect(elapsed).toBeLessThan(1_500);
 
 		reader.close();

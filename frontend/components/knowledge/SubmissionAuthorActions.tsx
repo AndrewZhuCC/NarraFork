@@ -2,18 +2,13 @@
  * Author-side actions on a publish request: withdraw and re-submit.
  *
  * These close the two open ends of the review state machine:
- *  - An open request (pending / conflict) could previously only be retracted by editing the
- *    draft and relying on auto-invalidation — a side effect used as a feature, and impossible
- *    for a `conflict` request (which is deliberately never auto-closed). → Withdraw.
- *  - A `changes_requested` request left the author to hand-create a submission that looked
- *    unrelated to the reviewer. → Re-submit, which links the rounds.
+ *  - An open request (pending / conflict / changes requested) can be retracted explicitly
+ *    instead of by editing the draft and relying on auto-invalidation. -> Withdraw.
+ *  - A `changes_requested` request is re-submitted as a linked next round. -> Re-submit.
  *
- * Visibility is by status AND identity: only the submitter (or an admin) sees the buttons, and
- * only for the status each action accepts. The server enforces both independently — this
- * component just avoids showing a button that would be refused.
- *
- * Shared by the global entry's Submissions tab and the standalone personal-entry page, so both
- * surfaces behave identically.
+ * Visibility comes from the request's server-computed `viewerCaps` (`canWithdraw` /
+ * `canResubmit`: submitter-or-admin plus the status each action accepts), so the buttons
+ * appear exactly when the endpoint would accept the call. Rendered on the request page.
  */
 import { Alert, Button, Group, Modal, Stack, Text, Textarea } from "@mantine/core";
 import { IconAlertTriangle, IconArrowBackUp, IconSend } from "@tabler/icons-react";
@@ -23,39 +18,24 @@ import {
 	useResubmitKnowledgeSubmission,
 	useWithdrawKnowledgeSubmission,
 } from "../../hooks/useKnowledge";
-import type { KnowledgeSubmissionStatus } from "../../lib/api";
+import type { KnowledgeSubmissionViewerCaps } from "../../lib/api";
 
 export interface SubmissionAuthorActionsProps {
 	submissionId: string;
-	status: KnowledgeSubmissionStatus;
-	/** Submission owner, compared against the current user to decide visibility. */
-	submitterUserId: string;
-	currentUserId: string | undefined;
-	isAdmin: boolean;
+	/** Server-computed: whether withdraw / resubmit would be accepted for this viewer. */
+	caps: Pick<KnowledgeSubmissionViewerCaps, "canWithdraw" | "canResubmit">;
 	/** Personal entry (draft) id, used only to scope cache invalidation. */
 	personalEntryId?: string;
-	/** Re-submit reads the draft's saved content, so unsaved edits must be flushed first. */
-	onBeforeResubmit?: () => Promise<void> | void;
+	/** Called with the new round's submission id after a successful re-submit. */
+	onResubmitted?: (submissionId: string) => void;
 	size?: "compact-xs" | "xs";
 }
 
-/**
- * Statuses the author may withdraw — mirrors WITHDRAWABLE_STATUSES in knowledge-branch-service.
- *
- * `changes_requested` is included so "I'm dropping this" is expressible: re-submitting used to
- * be its only transition, which left an author who decided against the requested changes with
- * no way to close the request.
- */
-const WITHDRAWABLE: KnowledgeSubmissionStatus[] = ["pending", "conflict", "changes_requested"];
-
 export function SubmissionAuthorActions({
 	submissionId,
-	status,
-	submitterUserId,
-	currentUserId,
-	isAdmin,
+	caps,
 	personalEntryId,
-	onBeforeResubmit,
+	onResubmitted,
 	size = "compact-xs",
 }: SubmissionAuthorActionsProps) {
 	const { t } = useTranslation("knowledge");
@@ -66,24 +46,19 @@ export function SubmissionAuthorActions({
 	const [reason, setReason] = useState("");
 	const [note, setNote] = useState("");
 
-	// The server allows an admin to act on someone else's submission; mirror that here so an
-	// admin cleaning up isn't stuck with a read-only view.
-	const isMine = !!currentUserId && submitterUserId === currentUserId;
-	if (!isMine && !isAdmin) return null;
-
-	const canWithdraw = WITHDRAWABLE.includes(status);
-	const canResubmit = status === "changes_requested";
+	const { canWithdraw, canResubmit } = caps;
 	if (!canWithdraw && !canResubmit) return null;
 
-	const doResubmit = async () => {
-		// Flush unsaved body edits first: the new submission is built from the SAVED draft.
-		await onBeforeResubmit?.();
+	// The new round is built from the personal version's SAVED content (the version's editor
+	// guards unsaved edits on its own page, so none can be pending here).
+	const doResubmit = () => {
 		resubmit.mutate(
 			{ id: submissionId, changeNote: note.trim() || undefined, personalEntryId },
 			{
-				onSuccess: () => {
+				onSuccess: (next) => {
 					setResubmitOpen(false);
 					setNote("");
+					onResubmitted?.(next.id);
 				},
 			},
 		);

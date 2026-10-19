@@ -1,7 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { parseQueuedGoalCommand } from "../narrator-session";
+import { parseQueuedGoalCommand, parseQueuedNewCommand } from "../narrator-session";
 
 describe("parseQueuedGoalCommand", () => {
+	test("mixed semantic documents never become /new or /goal controls after queuing", () => {
+		const document = {
+			version: 1 as const,
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment" as const, id: "node", assetId: "asset" },
+						{ type: "text" as const, text: "/goal ordinary wording" },
+					],
+				},
+			],
+			assets: [
+				{ id: "asset", kind: "image" as const, name: "x.png", size: 9, mimeType: "image/png" },
+			],
+		};
+		expect(parseQueuedGoalCommand("/goal ordinary wording", undefined, document)).toBeNull();
+		expect(
+			parseQueuedNewCommand("/new ordinary wording", "/new ordinary wording", document),
+		).toBeNull();
+	});
 	test("parses a /goal command carried in commandText", () => {
 		const parsed = parseQueuedGoalCommand("/goal ship the release", "/goal ship the release");
 		expect(parsed).toEqual({ rawCommand: "/goal ship the release", objective: "ship the release" });

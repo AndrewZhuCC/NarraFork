@@ -19,7 +19,7 @@ import { localBackend } from "../../lib/agent/execution/registry";
 import { executeTool } from "../../lib/agent/tool-executor";
 import { toolRegistry } from "../../lib/agent/tool-registry";
 import { bashTool } from "../../lib/agent/tools/bash";
-import { intelligentUiTool } from "../../lib/agent/tools/intelligent-ui";
+import { genUiTool } from "../../lib/agent/tools/gen-ui";
 import { writeTool } from "../../lib/agent/tools/write";
 import type { AgentConfig, AgentToolUse, ToolCallBinding } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
@@ -56,7 +56,7 @@ const { reviewService } = await import("../review-service");
 const skillBody = mock(async () => ({ output: "skill ran" }));
 toolRegistry.register(writeTool);
 toolRegistry.register(bashTool);
-toolRegistry.register(intelligentUiTool);
+toolRegistry.register(genUiTool);
 toolRegistry.register({
 	name: "Skill",
 	description: "fixture",
@@ -83,7 +83,7 @@ beforeEach(async () => {
 	root = await actor();
 	writeSpy = spyOn(localBackend, "writeFileBytes");
 	execSpy = spyOn(localBackend, "execCommand");
-	uiSpy = spyOn(intelligentUiTool, "execute");
+	uiSpy = spyOn(genUiTool, "execute");
 });
 afterEach(async () => {
 	writeSpy.mockRestore();
@@ -198,27 +198,27 @@ describe("S4 read-only capability is stronger than bypassPermissions", () => {
 			expect(await missing(join(cwd, "effect.txt"))).toBe(true);
 		});
 	}
-	test("blocks IntelligentUI create before its body or backend writes", async () => {
+	test("blocks GenUI create before its body or backend writes", async () => {
 		await db
 			.update(narrators)
 			.set({ traits: withRuntimePolicyTrait([], { version: 1, readOnly: true }) })
 			.where(eq(narrators.id, root));
-		const f = await fixture(root, "IntelligentUI", { action: "create", prefix: "denied" });
+		const f = await fixture(root, "GenUI", { action: "create", prefix: "denied" });
 		const result = await f.execute();
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("read-only capability ceiling");
 		expect(uiSpy).not.toHaveBeenCalled();
 		expect(writeSpy).not.toHaveBeenCalled();
-		expect(await missing(join(cwd, ".narrafork", "intelligent_ui"))).toBe(true);
+		expect(await missing(join(cwd, ".narrafork", "gen_ui"))).toBe(true);
 	});
 	test("positive control creates UI files when no read-only ceiling applies", async () => {
 		const result = await (
-			await fixture(root, "IntelligentUI", { action: "create", prefix: "allowed" })
+			await fixture(root, "GenUI", { action: "create", prefix: "allowed" })
 		).execute();
 		expect(result.isError).not.toBe(true);
 		expect(uiSpy).toHaveBeenCalledTimes(1);
 		expect(writeSpy).toHaveBeenCalled();
-		expect(await missing(join(cwd, ".narrafork", "intelligent_ui"))).toBe(false);
+		expect(await missing(join(cwd, ".narrafork", "gen_ui"))).toBe(false);
 	});
 	test("still executes a safe read-only Bash command", async () => {
 		await db

@@ -22,6 +22,7 @@ import { createMailboxStore } from "../agent-runtime/mailbox";
 import { getExecutionOwner, getRunControl } from "../agent-runtime/ownership";
 import { getRuntimePublicationService, runtimePublication } from "../agent-runtime/publication";
 import { cancelRunsBoundTo, startNarratorRun } from "../agent-runtime/run";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import * as executor from "../narrator-executor";
 import {
 	drainAndPersistPendingInjections,
@@ -56,8 +57,10 @@ const unregister = registerExternalProviderResolver({
 const done = { finalText: "done", hasError: false, shouldUpdateTitle: false };
 const originalAutoContinuation = settings.agent.autoContinuationMode;
 
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	resetTraitLayerCaches();
 	runtimePublication.stop();
 	settings.agent.autoContinuationMode = "off";
@@ -95,6 +98,7 @@ afterEach(async () => {
 	cleanDb(sqlite);
 });
 afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
 	unregister();
 	settings.agent.autoContinuationMode = originalAutoContinuation;
 });

@@ -12,8 +12,6 @@ import {
 import { needsLegacyDeliverTo, registrationBeforeRun, runDeliverToOf } from "../runtime-source";
 import { resolveLayeredTraits } from "../trait-resolution";
 import {
-	MAX_SUBSCRIPTIONS_PER_SOURCE,
-	narratorEventSubscriptionInputSchema,
 	parseRuntimeRegistration,
 	RUNTIME_REGISTRATION_MAX_BYTES,
 	registerRun,
@@ -176,19 +174,6 @@ describe("runtime registration contract", () => {
 				modelPool: "x".repeat(RUNTIME_REGISTRATION_MAX_BYTES),
 			}),
 		).toThrow();
-	});
-
-	test("subscription input dedupes events and requires at least one", () => {
-		const parsed = narratorEventSubscriptionInputSchema.parse({
-			sourceNarratorId: "a",
-			recipientNarratorId: "b",
-			events: ["completed", "completed", "failed"],
-			origin: "explicit",
-		});
-		expect(parsed.events).toEqual(["completed", "failed"]);
-		expect(parsed.wake).toBe(false);
-		expect(() => narratorEventSubscriptionInputSchema.parse({ ...parsed, events: [] })).toThrow();
-		expect(MAX_SUBSCRIPTIONS_PER_SOURCE).toBe(64);
 	});
 });
 

@@ -33,6 +33,7 @@ import {
 	projectVisibilitySchema,
 	updateProjectSchema,
 } from "../lib/validators";
+import { backgroundOccupancyStore } from "../services/background-occupancy-store";
 import { chapterService } from "../services/chapter-service";
 import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
 import { containerService } from "../services/container-service";
@@ -598,6 +599,7 @@ projectRoutes.delete("/:id", async (c) => {
 						.run();
 					tx.delete(chapters).where(inArray(chapters.id, remainingChapterIds)).run();
 				});
+				backgroundOccupancyStore.removeNarrators(allNarratorIds);
 			}
 
 			const deviceRevokedAt = new Date().toISOString();

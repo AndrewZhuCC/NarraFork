@@ -26,6 +26,7 @@ import {
 	projects,
 	worktreeTreeSnapshots,
 } from "../db/schema";
+import { LocalBackend } from "../lib/agent/execution/local-backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
@@ -36,17 +37,19 @@ import { narratorRoutes } from "../routes/narrators";
 import { projectRoutes } from "../routes/projects";
 import { chapterCleanup } from "./chapter-cleanup";
 import { chapterFork } from "./chapter-fork";
-import { chapterMerge } from "./chapter-merge";
 import { chapterService } from "./chapter-service";
 import { chapterSplit } from "./chapter-split";
 import { chapterWriteStore } from "./chapter-write/store";
+import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { narratorCreationWorkspaceTarget, narratorService } from "./narrator-service";
 import * as narratorSession from "./narrator-session";
-import { FileWorktreeJournal } from "./narrator-worktree-journal";
+import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
+import { NarratorWorktreeService, type WorktreeTarget } from "./narrator-worktree-service";
 import * as oauthRuntime from "./oauth-runtime-revocation";
+import { maintainProtectionIndex } from "./resource-protection-index";
 import { reviewService } from "./review-service";
 import {
 	SnapshotCaptureReceiptService,
@@ -59,6 +62,7 @@ import {
 	confirmLifecyclePathCreated,
 	inspect,
 	ResourceProtectionError,
+	withChapterCreation,
 	withLegacyCreationRollback,
 	withLegacyRetirement,
 	withLifecycleGuardPorts,
@@ -108,6 +112,26 @@ const otherRoots: string[] = [];
 function changes() {
 	return sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
 }
+function beginLegacyReceiptImport() {
+	// Each fixture models an upgrade with files already present, not a live journal owner.
+	sqlite.exec(`UPDATE resource_protection_sources SET complete = 0, cursor = NULL
+		WHERE source = 'receipt' AND source_id = ''`);
+}
+async function importLegacyReceiptFixture(complete = true) {
+	beginLegacyReceiptImport();
+	for (let batch = 0; batch < 4; batch++) {
+		await maintainProtectionIndex(performance.now() + 5000);
+		if (
+			sqlite
+				.query<{ complete: number }, []>(
+					"SELECT complete FROM resource_protection_sources WHERE source = 'receipt' AND source_id = ''",
+				)
+				.get()?.complete
+		)
+			return;
+	}
+	if (complete) throw new Error("Legacy fixture import did not complete");
+}
 async function inventory(
 	state: "preparing" | "ready" | "unknown" = "ready",
 	owner: string | null = narratorId,
@@ -126,6 +150,10 @@ async function inventory(
 	});
 }
 beforeEach(async () => {
+	await rm(getNarraforkPath("worktree-requests"), { recursive: true, force: true });
+	// Reset only this isolated test's compatibility lifetime, including invalid old fixtures.
+	sqlite.exec(`DELETE FROM resource_protection_paths WHERE source = 'receipt';
+		DELETE FROM resource_protection_sources WHERE source = 'receipt' AND source_id != ''`);
 	temporary = await mkdtemp(join(tmpdir(), "nf-lifecycle-guard-"));
 	path = join(temporary, ".worktrees", "legacy-Ab1234");
 	await mkdir(path, { recursive: true });
@@ -159,6 +187,7 @@ beforeEach(async () => {
 		createdAt: new Date().toISOString(),
 		updatedAt: new Date().toISOString(),
 	});
+	await importLegacyReceiptFixture();
 });
 afterEach(async () => {
 	mock.restore();
@@ -196,18 +225,10 @@ function sideEffects() {
 
 for (const [name, action] of [
 	["dormant before terminal cleanup", () => chapterCleanup.dormant(chapterId)],
-	[
-		"forced batch cleanup before status/terminal changes",
-		() => chapterCleanup.batchCleanup([chapterId], { force: true, deleteBranch: true }),
-	],
 	["chapter remove before narrator archival", () => chapterService.remove(chapterId)],
 	[
 		"project chapter remove before narrator delete/volume down",
 		() => chapterService.removeForProjectDeletion(chapterId, temporary),
-	],
-	[
-		"merge source retirement before Git commit or target mutation",
-		() => chapterMerge.merge(chapterId, { targetChapterId: "unused-target" }),
 	],
 ] as const) {
 	test(`${name}: independent inventory has zero lifecycle effects`, async () => {
@@ -235,36 +256,36 @@ test("review dismissal preflight is before closeNarrator and SQL status update",
 	expect(changes()).toBe(before);
 });
 
-test("Project DELETE protected preflight runs before OAuth removal and any fallback/cascade", async () => {
-	// No repository directory is being removed in this case; paths come from chapters.
+test("Project DELETE without a repository preserves independent disk resources without blocking metadata", async () => {
 	await db.update(projects).set({ gitPath: null }).where(eq(projects.id, projectId));
 	await inventory("unknown", null);
+	const marker = Buffer.from([0, 255, 42]);
+	await writeFile(join(path, "retained.bin"), marker);
 	const effects = sideEffects();
-	const before = changes();
 	const response = await app.request(`/projects/${projectId}`, { method: "DELETE" });
-	expect(response.status).toBe(409);
-	expect(await response.json()).toMatchObject({ code: "RESOURCE_PROTECTED" });
-	for (const effect of effects) expect(effect).toHaveBeenCalledTimes(0);
-	expect(changes()).toBe(before);
+	expect(response.status).toBe(200);
+	expect(await readFile(join(path, "retained.bin"))).toEqual(marker);
+	expect(effects[8]).toHaveBeenCalledTimes(0);
 	expect(
-		db.select({ id: projects.id }).from(projects).where(eq(projects.id, projectId)).get()?.id,
-	).toBe(projectId);
+		db
+			.select({ state: narratorWorktreeResources.state })
+			.from(narratorWorktreeResources)
+			.where(eq(narratorWorktreeResources.worktreePath, path))
+			.get()?.state,
+	).toBe("unknown");
 });
 
-test("Project DELETE unreadable inventory refuses before all effects", async () => {
+test("metadata-only Project DELETE does not read unrelated resource inventory", async () => {
 	await db.update(projects).set({ gitPath: null }).where(eq(projects.id, projectId));
-	const effects = sideEffects();
-	const before = changes();
+	sideEffects();
+	const readClaims = mock(async () => ({ complete: false, claims: [] }));
 	const response = await withLifecycleGuardPorts(
-		{
-			canonicalPath: async (path) => path,
-			readClaims: async () => ({ complete: false, claims: [] }),
-		},
+		{ canonicalPath: async (value) => value, readClaims },
 		async () => app.request(`/projects/${projectId}`, { method: "DELETE" }),
 	);
-	expect(response.status).toBe(409);
-	for (const effect of effects) expect(effect).toHaveBeenCalledTimes(0);
-	expect(changes()).toBe(before);
+	expect(response.status).toBe(200);
+	expect(readClaims).not.toHaveBeenCalled();
+	expect(gitService.removeWorktree).not.toHaveBeenCalled();
 });
 
 test("Git final sink refuses owned inventory without invoking Git", async () => {
@@ -304,17 +325,18 @@ test("shadow force cannot override inventory, shared chapter or incomplete evide
 	expect(deletion).toHaveBeenCalledTimes(0);
 });
 
-test("wake/reclaim refuses independent path before add/remove/rm fallback", async () => {
+test("wake tries non-destructive creation before refusing actual reclaim of an independent path", async () => {
 	await db
 		.update(chapters)
 		.set({ status: "dormant", worktreePath: null })
 		.where(eq(chapters.id, chapterId));
 	await inventory();
 	const add = spyOn(gitService, "createWorktree").mockRejectedValue(new Error("already exists"));
+	spyOn(gitService, "pruneWorktrees").mockResolvedValue(undefined);
 	const remove = spyOn(gitService, "removeWorktree").mockResolvedValue(undefined);
 	const deletion = spyOn(fs, "rmSync").mockImplementation(() => undefined);
 	await expect(chapterCleanup.wake(chapterId)).rejects.toBeInstanceOf(ResourceProtectionError);
-	expect(add).toHaveBeenCalledTimes(0);
+	expect(add).toHaveBeenCalledTimes(2);
 	expect(remove).toHaveBeenCalledTimes(0);
 	expect(deletion).toHaveBeenCalledTimes(0);
 });
@@ -372,7 +394,7 @@ test("canonical aliases and nested ordinary cwd are protected in actual bounded 
 		.set({ cwd: join(path, "src") })
 		.where(eq(narrators.id, id));
 	await expect(
-		withLegacyRetirement([chapterId], "delete", async () => undefined),
+		withLegacyRetirement([chapterId], "delete", async () => undefined, [{ path }]),
 	).rejects.toBeInstanceOf(ResourceProtectionError);
 });
 
@@ -384,11 +406,16 @@ test("registry commit and directory switch share the destructive reservation; po
 		worktreePath: path,
 		createRequestId: generateId(),
 	};
-	await withLegacyRetirement([chapterId], "retire", async () => {
-		await expect(narratorWorktreeResourceRegistry.register(resource)).rejects.toBeInstanceOf(
-			ResourceProtectionError,
-		);
-	});
+	await withLegacyRetirement(
+		[chapterId],
+		"retire",
+		async () => {
+			await expect(narratorWorktreeResourceRegistry.register(resource)).rejects.toBeInstanceOf(
+				ResourceProtectionError,
+			);
+		},
+		[{ path }],
+	);
 	await narratorWorktreeResourceRegistry.register(resource);
 	expect(
 		db
@@ -455,13 +482,18 @@ test("real switch CAS rejects during retirement; the same request can retry afte
 		requestId: "lifecycle-switch",
 		target: { deviceId: "local", cwd: nested },
 	};
-	await withLegacyRetirement([chapterId], "retire", async () => {
-		const before = changes();
-		await expect(
-			workspaceContextService.switch(narratorId, request, { origin: "http" }),
-		).rejects.toBeInstanceOf(ResourceProtectionError);
-		expect(changes()).toBe(before);
-	});
+	await withLegacyRetirement(
+		[chapterId],
+		"retire",
+		async () => {
+			const before = changes();
+			await expect(
+				workspaceContextService.switch(narratorId, request, { origin: "http" }),
+			).rejects.toBeInstanceOf(ResourceProtectionError);
+			expect(changes()).toBe(before);
+		},
+		[{ path }],
+	);
 	const result = await workspaceContextService.switch(narratorId, request, { origin: "http" });
 	expect(result.current.cwd).toBe(nested);
 	expect(
@@ -689,11 +721,16 @@ for (const kind of ["create", "subagent", "fork", "forkFromMessages"] as const) 
 				});
 			return narratorService.forkFromMessages(narratorId, [messageId]);
 		};
-		await withLegacyRetirement([chapterId], "retire during creation", async () => {
-			const before = changes();
-			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
-			expect(changes()).toBe(before);
-		});
+		await withLegacyRetirement(
+			[chapterId],
+			"retire during creation",
+			async () => {
+				const before = changes();
+				await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
+				expect(changes()).toBe(before);
+			},
+			[{ path }],
+		);
 		const created = await action();
 		otherNarrators.push(created.id);
 		expect(
@@ -732,6 +769,7 @@ for (const operation of ["git", "reclaim"] as const) {
 		const add = spyOn(gitService, "createWorktree").mockRejectedValue(
 			new Error("must not dispatch"),
 		);
+		spyOn(gitService, "pruneWorktrees").mockResolvedValue(undefined);
 		const guardedAction = () =>
 			operation === "git"
 				? gitService.removeWorktree(temporary, alias)
@@ -765,7 +803,7 @@ for (const operation of ["git", "reclaim"] as const) {
 		expect(rmSpy).toHaveBeenCalledTimes(0);
 		expect(spawnSpy).toHaveBeenCalledTimes(0);
 		if (operation === "reclaim") {
-			expect(add).toHaveBeenCalledTimes(0);
+			expect(add).toHaveBeenCalledTimes(2);
 			for (const effect of effects) expect(effect).toHaveBeenCalledTimes(0);
 			expect(git).toHaveBeenCalledTimes(0);
 		}
@@ -906,6 +944,7 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 					repositoryKey: "shadow-fixture",
 				}),
 			);
+			await importLegacyReceiptFixture();
 		}
 		try {
 			const deletion = spyOn(fs, "rmSync").mockImplementation(() => undefined);
@@ -918,11 +957,17 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 			expect(deletion).toHaveBeenCalledTimes(0);
 			expect(changes()).toBe(before);
 			expect(await readFile(join(shadow, "marker.bin"))).toEqual(marker);
+			if (receipt) {
+				// Completed compatibility evidence is frozen, never a live view of this file.
+				await writeFile(receipt, "{");
+				await maintainProtectionIndex(performance.now() + 5000);
+				await rm(receipt);
+				receipt = undefined;
+			}
 			// Exercise actual high-level entrances, not just the final destroy sink.
 			const effects = sideEffects();
 			for (const action of [
 				() => chapterService.remove(chapterId),
-				() => chapterCleanup.dormant(chapterId),
 				() => chapterService.removeForProjectDeletion(chapterId, temporary),
 			]) {
 				const before = changes();
@@ -931,19 +976,10 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 				expect(changes()).toBe(before);
 			}
 			await db.update(projects).set({ gitPath: null }).where(eq(projects.id, projectId));
-			const sqlBefore = changes();
 			const response = await app.request(`/projects/${projectId}`, { method: "DELETE" });
-			expect(response.status).toBe(409);
-			expect(await response.json()).toMatchObject({ code: "RESOURCE_PROTECTED" });
-			for (const effect of effects) expect(effect).toHaveBeenCalledTimes(0);
-			expect(changes()).toBe(sqlBefore);
-			expect(
-				db
-					.select({ status: chapters.status })
-					.from(chapters)
-					.where(eq(chapters.id, chapterId))
-					.get()?.status,
-			).toBe("active");
+			expect(response.status).toBe(200);
+			expect(deletion).toHaveBeenCalledTimes(0);
+			expect(await readFile(join(shadow, "marker.bin"))).toEqual(marker);
 		} finally {
 			mock.restore();
 			if (receipt) await rm(receipt);
@@ -1024,7 +1060,7 @@ test("rm fallback re-reads complete claims after ordinary Git failure, beyond in
 	expect(await readFile(join(path, "marker.bin"))).toEqual(marker);
 });
 
-test("project Git probe ignores contaminated Git selectors rather than falsely changing repository identity", async () => {
+test("project deletion does not claim unrelated same-repository resources or depend on a common-dir probe", async () => {
 	const env = {
 		...process.env,
 		GIT_DIR: undefined,
@@ -1070,12 +1106,17 @@ test("project Git probe ignores contaminated Git selectors rather than falsely c
 		process.env.GIT_COMMON_DIR = join(foreign, ".git");
 		process.env.GIT_WORK_TREE = foreign;
 		process.env.GIT_INDEX_FILE = join(foreign, ".git", "index");
-		const effects = sideEffects();
-		const before = changes();
+		sideEffects();
 		const response = await app.request(`/projects/${projectId}`, { method: "DELETE" });
-		expect(response.status).toBe(409);
-		for (const effect of effects) expect(effect).toHaveBeenCalledTimes(0);
-		expect(changes()).toBe(before);
+		expect(response.status).toBe(200);
+		expect(fs.existsSync(join(foreign, ".git"))).toBe(true);
+		expect(
+			db
+				.select({ id: narratorWorktreeResources.id })
+				.from(narratorWorktreeResources)
+				.where(eq(narratorWorktreeResources.id, id))
+				.get()?.id,
+		).toBe(id);
 	} finally {
 		keys.forEach((key, index) => {
 			const value = previous[index];
@@ -1098,6 +1139,7 @@ for (const deviceId of [false, "", {}, [], 42, null, " "] as const) {
 			receipt,
 			JSON.stringify({ destination: path, repositoryKey: "fixture-repository", deviceId }),
 		);
+		await importLegacyReceiptFixture(false);
 		try {
 			const effects = sideEffects();
 			const dispatch = spyOn(spawn, "safeSpawn");
@@ -1130,14 +1172,20 @@ for (const deviceId of [undefined, "local", "remote-fixture"] as const) {
 				...(deviceId === undefined ? {} : { deviceId }),
 			}),
 		);
+		await importLegacyReceiptFixture();
 		try {
 			const effects = sideEffects();
 			const before = changes();
 			let admitted = false;
 			const run = () =>
-				withLegacyRetirement([chapterId], "fixture retirement", async () => {
-					admitted = true;
-				});
+				withLegacyRetirement(
+					[chapterId],
+					"fixture retirement",
+					async () => {
+						admitted = true;
+					},
+					[{ path }],
+				);
 			if (deviceId === "remote-fixture") await run();
 			else await expect(run()).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
 			expect(admitted).toBe(deviceId === "remote-fixture");
@@ -1462,6 +1510,7 @@ for (const malformed of [
 				? `{"__proto__":{},"destination":${JSON.stringify(path)},"repositoryKey":"fixture-repository"}`
 				: JSON.stringify(malformed === "array" ? [record] : record),
 		);
+		await importLegacyReceiptFixture(false);
 		try {
 			const effects = sideEffects();
 			const dispatch = spyOn(spawn, "safeSpawn");
@@ -1522,9 +1571,90 @@ async function shadowBirthFixture() {
 	return { dir, capture, assertRetained };
 }
 
+for (const kind of ["cwd", "registry"] as const) {
+	test(`cold initialization protects a missing physical shadow with an independent ${kind} claim`, async () => {
+		const { dir, capture, assertRetained } = await shadowBirthFixture();
+		const id = generateId();
+		const now = new Date().toISOString();
+		if (kind === "cwd") {
+			otherNarrators.push(id);
+			await db
+				.insert(narrators)
+				.values({ id, cwd: dir, title: "missing shadow claim", createdAt: now, updatedAt: now });
+		} else {
+			await db.insert(narratorWorktreeResources).values({
+				id,
+				ownerNarratorId: null,
+				deviceId: "local",
+				repositoryKey: "fixture-repository",
+				worktreePath: dir,
+				createRequestId: id,
+				state: "unknown",
+				createdAt: now,
+				updatedAt: now,
+			});
+		}
+		const git = spyOn(spawn, "safeSpawn");
+		const deletion = spyOn(fs, "rmSync");
+		const before = changes();
+		await expect(capture(false)).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+		await expect(capture(true)).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+		expect(git).toHaveBeenCalledTimes(0);
+		expect(deletion).toHaveBeenCalledTimes(0);
+		expect(fs.existsSync(dir)).toBe(false);
+		assertRetained(before);
+	});
+}
+
 const failedShadowInit = { exitCode: 1, stdout: "", stderr: "fixture shadow init failure" };
 
-test("actual retirement capture init failure refuses rm after D is renamed and replaced by a new inode", async () => {
+for (const legacy of ["frozen-pin", "corrupt", "unimported"] as const) {
+	test(`cold initialization ignores ${legacy} legacy compatibility while destruction remains protected`, async () => {
+		const { dir, capture, assertRetained } = await shadowBirthFixture();
+		const directory = getNarraforkPath("worktree-requests");
+		await mkdir(directory, { recursive: true });
+		// More than one read-only proof page models an unfinished import, not a permanent cap.
+		const count = legacy === "unimported" ? 65 : 1;
+		for (let index = 0; index < count; index++) {
+			await writeFile(
+				join(directory, `${index.toString(16).padStart(64, "0")}.json`),
+				legacy === "corrupt"
+					? "{"
+					: JSON.stringify({
+							destination: dir,
+							deviceId: "local",
+							repositoryKey: "fixture-repository",
+						}),
+			);
+		}
+		if (legacy === "unimported") beginLegacyReceiptImport();
+		else await importLegacyReceiptFixture(legacy !== "corrupt");
+		const marker = Buffer.from([0, 255, 128, 13, 10]);
+		const deletion = spyOn(fs, "rmSync");
+		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
+			await writeFile(join(dir, "marker.bin"), marker);
+			return failedShadowInit;
+		});
+		const before = changes();
+		await expect(capture(false)).rejects.toThrow(
+			"shadow repo init failed: fixture shadow init failure",
+		);
+		expect(init).toHaveBeenCalledTimes(1);
+		await expect(
+			withLegacyRetirement([chapterId], "legacy compatibility destruction fixture", () =>
+				worktreeTreeSnapshot.destroy(path, "local", { force: true }),
+			),
+		).rejects.toMatchObject({
+			code: legacy === "frozen-pin" ? "RESOURCE_PROTECTED" : "RESOURCE_PROTECTION_UNAVAILABLE",
+		});
+		expect(deletion).toHaveBeenCalledTimes(0);
+		assertRetained(before);
+		expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
+	});
+}
+
+test("actual retirement capture preserves the init error and both inodes after a birth replacement", async () => {
 	const { dir, capture, assertRetained } = await shadowBirthFixture();
 	const backup = join(temporary, "original-birth-D");
 	const original = Buffer.from([0, 128, 255, 13, 10, 1]);
@@ -1539,7 +1669,7 @@ test("actual retirement capture init failure refuses rm after D is renamed and r
 		return failedShadowInit;
 	});
 	const before = changes();
-	await expect(capture()).rejects.toBeInstanceOf(ResourceProtectionError);
+	await expect(capture()).rejects.toThrow("shadow repo init failed: fixture shadow init failure");
 	expect(init).toHaveBeenCalledTimes(1);
 	expect(deletion).toHaveBeenCalledTimes(0);
 	assertRetained(before);
@@ -1547,26 +1677,26 @@ test("actual retirement capture init failure refuses rm after D is renamed and r
 	expect(await readFile(join(dir, "marker.bin"))).toEqual(replacement);
 });
 
-test("actual retirement capture init failure preserves a pre-existing invalid shadow directory", async () => {
-	const { dir, capture, assertRetained } = await shadowBirthFixture();
-	await mkdir(dir, { recursive: true });
-	const marker = Buffer.from([0, 255, 128, 13, 10]);
-	await writeFile(join(dir, "marker.bin"), marker);
-	const deletion = spyOn(fs, "rmSync");
-	const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
-		expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
-		return failedShadowInit;
+for (const headOnly of [false, true]) {
+	test(`actual capture refuses an unknown shadow directory ${headOnly ? "with only HEAD" : "without HEAD"} before git`, async () => {
+		const { dir, capture, assertRetained } = await shadowBirthFixture();
+		await mkdir(dir, { recursive: true });
+		const marker = Buffer.from([0, 255, 128, 13, 10]);
+		await writeFile(join(dir, "marker.bin"), marker);
+		if (headOnly) await writeFile(join(dir, "HEAD"), "ref: refs/heads/main\n");
+		const deletion = spyOn(fs, "rmSync");
+		const git = spyOn(spawn, "safeSpawn");
+		const before = changes();
+		await expect(capture()).rejects.toBeInstanceOf(TreeSnapshotError);
+		expect(git).toHaveBeenCalledTimes(0);
+		expect(deletion).toHaveBeenCalledTimes(0);
+		assertRetained(before);
+		expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
 	});
-	const before = changes();
-	await expect(capture()).rejects.toBeInstanceOf(TreeSnapshotError);
-	expect(init).toHaveBeenCalledTimes(1);
-	expect(deletion).toHaveBeenCalledTimes(0);
-	assertRetained(before);
-	expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
-});
+}
 
 for (const legacy of [true, false]) {
-	test(`actual ${legacy ? "retirement" : "ordinary"} capture cleans only its unchanged, unclaimed new birth on init failure`, async () => {
+	test(`actual ${legacy ? "retirement" : "ordinary"} capture retains failed initialization through gcAll and resumes`, async () => {
 		const { dir, capture, assertRetained } = await shadowBirthFixture();
 		const deletion = spyOn(fs, "rmSync");
 		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
@@ -1574,24 +1704,38 @@ for (const legacy of [true, false]) {
 			await writeFile(join(dir, "partial-owned.bin"), Buffer.from([0, 255, 13, 10]));
 			return failedShadowInit;
 		});
+		if (!legacy) {
+			// This variant exercises truly unclaimed physical storage, not a retained lineage.
+			await db.update(chapters).set({ snapshotShadowKey: null }).where(eq(chapters.id, chapterId));
+		}
 		const before = changes();
 		await expect(capture(legacy)).rejects.toBeInstanceOf(TreeSnapshotError);
 		expect(init).toHaveBeenCalledTimes(1);
-		expect(deletion).toHaveBeenCalledTimes(1);
-		expect(deletion).toHaveBeenCalledWith(dir, { recursive: true, force: true });
-		expect(fs.existsSync(dir)).toBe(false);
+		await worktreeTreeSnapshot.gcAll();
+		expect(init).toHaveBeenCalledTimes(1);
+		expect(deletion).toHaveBeenCalledTimes(0);
+		expect(await readFile(join(dir, "partial-owned.bin"))).toEqual(Buffer.from([0, 255, 13, 10]));
+		expect(fs.existsSync(join(dir, "HEAD"))).toBe(false);
 		assertRetained(before);
+		const marker = await readFile(join(dir, "nf-shadow-init"));
+		const birth = fs.lstatSync(dir);
+		expect(marker.length).toBeLessThanOrEqual(256);
+		init.mockRestore();
+		expect(await capture(legacy)).toMatch(/^[0-9a-f]{40}$/);
+		expect(fs.lstatSync(dir).ino).toBe(birth.ino);
+		expect(fs.existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+		expect(await readFile(join(dir, "partial-owned.bin"))).toEqual(Buffer.from([0, 255, 13, 10]));
+		expect(deletion).toHaveBeenCalledTimes(0);
 	});
 }
 
-for (const kind of ["cwd", "registry", "receipt"] as const) {
-	test(`actual retirement capture re-reads a late persisted ${kind} claim before failed-birth rm`, async () => {
+for (const kind of ["cwd", "registry"] as const) {
+	test(`actual retirement capture retains the init error and data after a bypassed late ${kind} claim`, async () => {
 		const { dir, capture, assertRetained } = await shadowBirthFixture();
 		const marker = Buffer.from([0, 255, 128, 13, 10]);
 		let before: number | undefined;
-		let receipt: string | undefined;
 		const deletion = spyOn(fs, "rmSync");
-		spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
 			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
 			await writeFile(join(dir, "marker.bin"), marker);
 			if (kind === "cwd") {
@@ -1605,7 +1749,7 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 					createdAt: now,
 					updatedAt: now,
 				});
-			} else if (kind === "registry") {
+			} else {
 				const id = generateId();
 				const now = new Date().toISOString();
 				await db.insert(narratorWorktreeResources).values({
@@ -1619,41 +1763,25 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 					createdAt: now,
 					updatedAt: now,
 				});
-			} else {
-				const directory = getNarraforkPath("worktree-requests");
-				await mkdir(directory, { recursive: true });
-				receipt = join(
-					directory,
-					`${createHash("sha256").update(generateId()).digest("hex")}.json`,
-				);
-				await writeFile(
-					receipt,
-					JSON.stringify({
-						destination: dir,
-						deviceId: "local",
-						repositoryKey: "fixture-repository",
-					}),
-				);
 			}
 			before = changes(); // exclude the deliberate adversarial evidence insertion
 			return failedShadowInit;
 		});
-		try {
-			await expect(capture()).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
-			expect(deletion).toHaveBeenCalledTimes(0);
-			assertRetained(before);
-			expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
-		} finally {
-			if (receipt) await rm(receipt);
-		}
+		await expect(capture()).rejects.toThrow("shadow repo init failed: fixture shadow init failure");
+		expect(init).toHaveBeenCalledTimes(1);
+		await expect(capture()).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+		expect(init).toHaveBeenCalledTimes(1);
+		expect(deletion).toHaveBeenCalledTimes(0);
+		assertRetained(before);
+		expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
 	});
 }
 
 for (const kind of ["cwd", "registry", "receipt"] as const) {
-	test(`actual retirement capture keeps the birth barrier during Git await and refuses ${kind} admission`, async () => {
+	test(`cold initialization permits a shared checkout ${kind} reference without a global barrier`, async () => {
 		const { dir, capture, assertRetained } = await shadowBirthFixture();
-		const directory = getNarraforkPath("worktree-requests");
-		const journal = new FileWorktreeJournal(directory);
+		const directory = getNarraforkPath("worktree-requests-v2");
+		const journal = new FileWorktreeJournal(directory, getNarraforkPath("worktree-requests"));
 		const publish = spyOn(journal, "claim");
 		const requestId = "birth-admission-receipt";
 		const receipt = join(
@@ -1663,49 +1791,59 @@ for (const kind of ["cwd", "registry", "receipt"] as const) {
 				.digest("hex")}.json`,
 		);
 		const deletion = spyOn(fs, "rmSync");
-		spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+		let before: number | undefined;
+		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
 			expect(opts.cmd).toEqual(["git", "init", "--bare", dir]);
-			const admit =
-				kind === "cwd"
-					? narratorService.create({ cwd: dir, title: "late independent cwd" })
-					: kind === "registry"
-						? narratorWorktreeResourceRegistry.register({
-								ownerNarratorId: narratorId,
-								deviceId: "local",
-								repositoryKey: "fixture-repository",
-								worktreePath: dir,
-								createRequestId: generateId(),
-							})
-						: withWorkspaceAdmission({ deviceId: "local", path: dir }, () =>
-								journal.claim(narratorId, requestId, {
-									proposalHash: "fixture",
-									repositoryKey: "fixture-repository",
-									destination: dir,
-									deviceId: "local",
-									expectedHead: "a".repeat(40),
-									request: {
-										expectedRevision: 0,
-										workspaceKey: "fixture",
-										requestId,
-										destinationPath: dir,
-										branch: { kind: "new", name: "fixture" },
-									},
-								}),
-							);
-			await expect(admit).rejects.toBeInstanceOf(ResourceProtectionError);
+			if (kind === "cwd") {
+				const created = await narratorService.create({ cwd: path, title: "shared checkout cwd" });
+				otherNarrators.push(created.id);
+			} else if (kind === "registry") {
+				await narratorWorktreeResourceRegistry.register({
+					ownerNarratorId: narratorId,
+					deviceId: "local",
+					repositoryKey: "fixture-repository",
+					worktreePath: path,
+					createRequestId: generateId(),
+				});
+			} else {
+				// The production v2 publisher does not create a resource ownership claim.
+				await journal.claim(narratorId, requestId, {
+					proposalHash: "fixture",
+					repositoryKey: "fixture-repository",
+					destination: path,
+					deviceId: "local",
+					expectedHead: "",
+					dispatchState: "not_started",
+					request: {
+						expectedRevision: 0,
+						workspaceKey: "fixture",
+						requestId,
+						destinationPath: path,
+						branch: { kind: "new", name: "fixture" },
+					},
+				});
+			}
+			before = changes();
 			return failedShadowInit;
 		});
-		const before = changes();
-		await expect(capture()).rejects.toBeInstanceOf(TreeSnapshotError);
-		assertRetained(before);
-		expect(publish).toHaveBeenCalledTimes(0);
-		expect(fs.existsSync(receipt)).toBe(false);
-		expect(deletion).toHaveBeenCalledTimes(1);
-		expect(fs.existsSync(dir)).toBe(false);
+		try {
+			await expect(capture(false)).rejects.toThrow(
+				"shadow repo init failed: fixture shadow init failure",
+			);
+			expect(init).toHaveBeenCalledTimes(1);
+			assertRetained(before);
+			expect(publish).toHaveBeenCalledTimes(kind === "receipt" ? 1 : 0);
+			expect(fs.existsSync(receipt)).toBe(kind === "receipt");
+			expect(deletion).not.toHaveBeenCalled();
+			expect(fs.existsSync(dir)).toBe(true);
+			expect(fs.existsSync(join(dir, "nf-shadow-init"))).toBe(true);
+		} finally {
+			if (kind === "receipt") await rm(receipt);
+		}
 	});
 }
 
-test("actual retirement capture refuses failed-birth rm when the final inventory becomes unavailable", async () => {
+test("actual retirement capture preserves its init error without a final inventory query", async () => {
 	const { dir, capture, assertRetained } = await shadowBirthFixture();
 	const marker = Buffer.from([0, 255, 128, 13, 10]);
 	const deletion = spyOn(fs, "rmSync");
@@ -1725,8 +1863,279 @@ test("actual retirement capture refuses failed-birth rm when the final inventory
 			},
 			() => capture(),
 		),
-	).rejects.toMatchObject({ code: "RESOURCE_PROTECTION_UNAVAILABLE" });
+	).rejects.toThrow("shadow repo init failed: fixture shadow init failure");
 	expect(deletion).toHaveBeenCalledTimes(0);
 	assertRetained(before);
 	expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
 });
+
+test("metadata-only legacy scope does not consult unrelated inventory", async () => {
+	const readClaims = mock(async () => {
+		throw new Error("unrelated inventory unavailable");
+	});
+	let ran = false;
+	await withLifecycleGuardPorts({ canonicalPath: async (value) => value, readClaims }, () =>
+		withLegacyRetirement([chapterId], "metadata only", async () => {
+			ran = true;
+		}),
+	);
+	expect(ran).toBe(true);
+	expect(readClaims).not.toHaveBeenCalled();
+});
+
+test("retiring one checkout does not block a sibling creation using the same source repository", async () => {
+	const sibling = join(temporary, ".worktrees", "new-sibling");
+	let created = false;
+	await withLegacyRetirement(
+		[chapterId],
+		"retire existing checkout",
+		async () => {
+			await withChapterCreation(
+				projectId,
+				temporary,
+				async () => {
+					await mkdir(sibling);
+					await confirmLifecyclePathCreated(sibling);
+					const narrator = await narratorService.create({ cwd: sibling, title: "new sibling" });
+					otherNarrators.push(narrator.id);
+					created = true;
+				},
+				sibling,
+			);
+		},
+		[{ path }],
+	);
+	expect(created).toBe(true);
+	expect(fs.existsSync(sibling)).toBe(true);
+});
+
+test("actual cold snapshot initialization allows shared subagents and unrelated local/remote admissions", async () => {
+	const initialized = await spawn.safeSpawn({
+		cmd: ["git", "init", path],
+		timeout: 5000,
+		maxOutputBytes: 4096,
+	});
+	expect(initialized.exitCode).toBe(0);
+	await writeFile(join(path, "snapshot.txt"), "cold snapshot\n");
+	const dir = treeSnapshotPhysicalDir("local", path);
+	otherRoots.push(dir);
+	let enter!: () => void;
+	let release!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		enter = resolve;
+	});
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const originalSpawn = spawn.safeSpawn;
+	spyOn(spawn, "safeSpawn").mockImplementation(async (options) => {
+		if (options.cmd[0] === "git" && options.cmd[1] === "init" && options.cmd[2] === "--bare") {
+			enter();
+			await gate;
+		}
+		return originalSpawn(options);
+	});
+	const readClaims = mock(
+		async (
+			_deadline: number,
+			_signal?: AbortSignal,
+			targets?: readonly { path?: string }[],
+			includeLegacyReceipts?: boolean,
+		) => {
+			expect(includeLegacyReceipts).toBe(false);
+			expect(targets?.every((target) => target.path === dir)).toBe(true);
+			return { complete: true, claims: [] };
+		},
+	);
+	const capture = withLifecycleGuardPorts(
+		{ canonicalPath: async (value) => value, readClaims },
+		() => worktreeTreeSnapshot.capture(path),
+	);
+	void capture.catch(() => {});
+	try {
+		await Promise.race([
+			entered,
+			capture.then(() => {
+				throw new Error("cold initializer was not entered");
+			}),
+		]);
+		const child = await narratorService.createSubagent({
+			parentNarratorId: narratorId,
+			subagentOriginKind: "standalone",
+			subagentType: "general",
+			cwd: path,
+		});
+		otherNarrators.push(child.id);
+		const ordinary = await narratorService.create({ cwd: temporary, title: "unrelated local cwd" });
+		otherNarrators.push(ordinary.id);
+		let remote = false;
+		await withWorkspaceAdmission(
+			{ deviceId: "remote-fixture", path: "/unrelated/remote" },
+			async () => {
+				remote = true;
+			},
+		);
+		expect(remote).toBe(true);
+	} finally {
+		release();
+	}
+	expect(await capture).toMatch(/^[0-9a-f]{40,64}$/);
+	expect(readClaims).toHaveBeenCalled();
+});
+
+test("a real zero-dispatch failed create keeps its v2 receipt without creating protection pins", async () => {
+	const directory = getNarraforkPath("worktree-requests-v2");
+	const journal = new FileWorktreeJournal(directory, getNarraforkPath("worktree-requests"));
+	const requestId = "failed-create-lifecycle";
+	const target: WorktreeTarget = {
+		workspace: {
+			deviceId: "local",
+			cwd: temporary,
+			rootPath: temporary,
+			workspaceKey: "fixture",
+			repositoryKey: "fixture-repository",
+			state: "ready",
+			capabilities: { read: true, write: true },
+		},
+		backend: new LocalBackend(),
+		repositoryPath: join(temporary, ".git"),
+	};
+	const runGit = mock(async () => {
+		throw new Error("invalid path must not dispatch Git");
+	});
+	const service = new NarratorWorktreeService<string>({
+		authorize: async () => target,
+		withRevision: async (_id, _revision, action) => action(),
+		withRepositoryLock: async (_key, action) => action(),
+		journal,
+		resources: narratorWorktreeResourceRegistry,
+		runGit,
+	});
+	const request = {
+		expectedRevision: 0,
+		workspaceKey: "fixture",
+		requestId,
+		destinationPath: ".worktrees/rejected-relative",
+		branch: { kind: "new" as const, name: "fixture" },
+	};
+	const receipt = join(
+		directory,
+		`${createHash("sha256")
+			.update(JSON.stringify([narratorId, requestId]))
+			.digest("hex")}.json`,
+	);
+	try {
+		const result = await service.create("actor", narratorId, request, new AbortController().signal);
+		expect(result.outcome).toBe("failed");
+		const record = await journal.read(narratorId, requestId);
+		expect(record?.dispatchState).toBe("not_started");
+		expect(worktreeReceiptHasResourceEffect(record)).toBe(false);
+		await maintainProtectionIndex(performance.now() + 5000);
+		expect(
+			sqlite
+				.query<{ count: number }, []>(
+					"SELECT count(*) AS count FROM resource_protection_paths WHERE source = 'receipt'",
+				)
+				.get()?.count,
+		).toBe(0);
+		let checked = false;
+		await withLegacyRetirement(
+			[chapterId],
+			"actual target check after failed create",
+			async () => {
+				checked = true;
+			},
+			[{ path }],
+		);
+		expect(checked).toBe(true);
+		await expect(
+			service.create("actor", narratorId, request, new AbortController().signal),
+		).rejects.toMatchObject({ code: "WORKTREE_RECOVERY_DENIED" });
+		expect(runGit).not.toHaveBeenCalled();
+		expect(await journal.read(narratorId, requestId)).toEqual(record);
+	} finally {
+		await rm(receipt, { force: true });
+	}
+});
+
+test("batch cleanup reports a genuinely protected target without mutating that target", async () => {
+	await inventory();
+	const effects = sideEffects();
+	const before = changes();
+	const report = await chapterCleanup.batchCleanup([chapterId], {
+		force: true,
+		deleteBranch: true,
+	});
+	expect(report.cleaned).toEqual([]);
+	expect(report.errors).toHaveLength(1);
+	expect(report.errors[0]?.chapterId).toBe(chapterId);
+	for (const effect of effects) expect(effect).not.toHaveBeenCalled();
+	expect(changes()).toBe(before);
+});
+
+test("record-only chapter deletion does not invent a shadow or consult global inventory", async () => {
+	await db
+		.update(chapters)
+		.set({ worktreePath: null, snapshotShadowKey: null })
+		.where(eq(chapters.id, chapterId));
+	const readClaims = mock(async () => {
+		throw new Error("unrelated inventory unavailable");
+	});
+	sideEffects();
+	await withLifecycleGuardPorts({ canonicalPath: async (value) => value, readClaims }, () =>
+		chapterService.remove(chapterId),
+	);
+	expect(readClaims).not.toHaveBeenCalled();
+	expect(gitService.removeWorktree).not.toHaveBeenCalled();
+	expect(
+		db.select({ id: chapters.id }).from(chapters).where(eq(chapters.id, chapterId)).get(),
+	).toBeUndefined();
+});
+
+for (const relation of ["same", "alias", "ancestor"] as const) {
+	test(`root chapter without an automatic narrator admits only a non-deleted ${relation} directory`, async () => {
+		const rootPath =
+			relation === "ancestor"
+				? temporary
+				: relation === "alias"
+					? join(temporary, "root-alias")
+					: path;
+		if (relation === "alias") await symlink(path, rootPath);
+		const otherProjectId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(projects).values({
+			id: otherProjectId,
+			name: "root reference fixture",
+			gitPath: rootPath,
+			chapterSettings: { autoCreateNarrator: false },
+			createdAt: now,
+			updatedAt: now,
+		});
+		spyOn(commitSyncService, "syncChapterCommits").mockResolvedValue(0);
+		try {
+			await withLegacyRetirement(
+				[chapterId],
+				"remove exact checkout",
+				async () => {
+					const before = changes();
+					const create = chapterService.createRootChapter({
+						projectId: otherProjectId,
+						title: "root reference",
+						gitPath: rootPath,
+						defaultBranch: "main",
+					});
+					if (relation === "ancestor") {
+						const root = await create;
+						expect(root.worktreePath).toBe(rootPath);
+					} else {
+						await expect(create).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+						expect(changes()).toBe(before);
+					}
+				},
+				[{ path }],
+			);
+		} finally {
+			await db.delete(projects).where(eq(projects.id, otherProjectId));
+		}
+	});
+}

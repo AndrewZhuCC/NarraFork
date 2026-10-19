@@ -48,8 +48,8 @@ export interface TreeLineStats {
 /** One Git status record as consumed by the file tree. */
 export interface TreeFileLineChange {
 	path: string;
-	linesAdded: number;
-	linesRemoved: number;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 /**
@@ -62,17 +62,32 @@ export interface TreeFileLineChange {
  */
 export function buildTreeLineStats(
 	changes: readonly TreeFileLineChange[],
+	complete = true,
 ): ReadonlyMap<string, TreeLineStats> {
 	const files = new Map<string, TreeLineStats>();
+	const unknownPaths = new Set<string>();
 	for (const change of changes) {
 		const path = normalizeTreePath(change.path);
 		if (!path) continue;
+		if (
+			change.linesAdded == null ||
+			change.linesRemoved == null ||
+			!Number.isFinite(change.linesAdded) ||
+			!Number.isFinite(change.linesRemoved)
+		) {
+			unknownPaths.add(path);
+			continue;
+		}
 		files.set(path, {
 			added: Math.max(0, Math.floor(change.linesAdded)),
 			removed: Math.max(0, Math.floor(change.linesRemoved)),
 		});
 	}
 
+	if (!complete) {
+		for (const path of unknownPaths) files.delete(path);
+		return files;
+	}
 	const totals = new Map<string, TreeLineStats>(files);
 	for (const [filePath, stats] of files) {
 		let slash = filePath.lastIndexOf("/");
@@ -86,7 +101,34 @@ export function buildTreeLineStats(
 			slash = dir.lastIndexOf("/");
 		}
 	}
+	// A missing measurement invalidates the complete total for every ancestor.
+	for (const path of unknownPaths) {
+		totals.delete(path);
+		let slash = path.lastIndexOf("/");
+		while (slash > 0) {
+			const dir = path.slice(0, slash);
+			totals.delete(dir);
+			slash = dir.lastIndexOf("/");
+		}
+	}
 	return totals;
+}
+
+/** Changed paths and their ancestors remain useful even when no line counts were measured. */
+export function buildTreeChangedPaths(changes: readonly { path: string }[]): ReadonlySet<string> {
+	const paths = new Set<string>();
+	for (const change of changes) {
+		const path = normalizeTreePath(change.path);
+		if (!path) continue;
+		paths.add(path);
+		let slash = path.lastIndexOf("/");
+		while (slash > 0) {
+			const dir = path.slice(0, slash);
+			paths.add(dir);
+			slash = dir.lastIndexOf("/");
+		}
+	}
+	return paths;
 }
 
 function normalizeTreePath(path: string): string {

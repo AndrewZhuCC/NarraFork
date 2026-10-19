@@ -131,15 +131,57 @@
 		{
 			"idx": 18,
 			"version": "7",
-			"when": 1792146496236,
-			"tag": "0018_unified-runtime-registration",
+			"when": 1792071785464,
+			"tag": "0018_personal_knowledge_injection",
 			"breakpoints": true
 		},
 		{
 			"idx": 19,
 			"version": "7",
-			"when": 1792168915771,
-			"tag": "0019_policy-source-column",
+			"when": 1792086101922,
+			"tag": "0019_resource_protection",
+			"breakpoints": true
+		},
+		{
+			"idx": 20,
+			"version": "7",
+			"when": 1792089888326,
+			"tag": "0020_history_token_repair_bulk",
+			"breakpoints": true
+		},
+		{
+			"idx": 21,
+			"version": "7",
+			"when": 1792144295364,
+			"tag": "0021_rich_composer_document",
+			"breakpoints": true
+		},
+		{
+			"idx": 22,
+			"version": "7",
+			"when": 1792157728491,
+			"tag": "0022_context_numeric_stats",
+			"breakpoints": true
+		},
+		{
+			"idx": 23,
+			"version": "7",
+			"when": 1792214926424,
+			"tag": "0023_drop_legacy_request_dumps",
+			"breakpoints": true
+		},
+		{
+			"idx": 24,
+			"version": "7",
+			"when": 1792214934470,
+			"tag": "0024_request_evidence_columns",
+			"breakpoints": true
+		},
+		{
+			"idx": 25,
+			"version": "7",
+			"when": 1792376112322,
+			"tag": "0025_unified-runtime-registration",
 			"breakpoints": true
 		}
   ]

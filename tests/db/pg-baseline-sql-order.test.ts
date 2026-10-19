@@ -229,6 +229,31 @@ describe("SQL-derived physical column order", () => {
 		}
 	});
 
+	test("context stats copy is admitted only by exact text", () => {
+		const folder = join(import.meta.dir, "../../drizzle-postgres");
+		const sql = readBounded(join(folder, "0022_context_numeric_stats.sql"), 1024 * 1024);
+		const statements = sql
+			.split("--> statement-breakpoint")
+			.map((part) => part.trim())
+			.filter((part) => /^(CREATE (FUNCTION|TRIGGER)|INSERT INTO)/.test(part));
+		expect(statements).toHaveLength(4);
+		for (const statement of statements) expect(run(statement, {}).problems).toEqual([]);
+		const fn = statements.find((statement) => statement.startsWith("CREATE FUNCTION"));
+		if (!fn) throw new Error("fixture");
+		const tampered = fn.replace("RETURN NEW;", "RETURN NULL;");
+		expect(run(tampered, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+	});
+
+	test("row level security toggles do not change column order", () => {
+		const order = good(
+			`CREATE TABLE t(a text);
+			ALTER TABLE t DISABLE ROW LEVEL SECURITY;
+			ALTER TABLE t ENABLE ROW LEVEL SECURITY;`,
+			{ t: ["a"] },
+		);
+		expect(order.get("t")).toEqual(["a"]);
+	});
+
 	test.each([
 		"CREATE TABLE t(a text,a text);",
 		"CREATE TABLE t(a text); CREATE TABLE t(b text);",
@@ -291,6 +316,7 @@ describe("SQL-derived physical column order", () => {
 			columns: structuredClone(expected.columns),
 			foreignKeys: [],
 			indexes: [],
+			primaryKeys: [],
 			uniques: [],
 			checks: [],
 			generated: [],

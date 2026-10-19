@@ -32,6 +32,7 @@ import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { getExecutionOwner } from "../agent-runtime/ownership";
 import { startNarratorRun } from "../agent-runtime/run";
+import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
 import { clearBufferedMessages, enqueueBufferedMessage } from "../narrator-buffer";
 import type { ExecuteLoopOptions } from "../narrator-executor";
@@ -342,6 +343,31 @@ describe("agent-to-agent messages are scanned under the acting human's permissio
 });
 
 describe("compact-cycle de-dup", () => {
+	test("personal scope survives the subagent body and durable ledger payload", async () => {
+		const keyword = `subpersonal${TAG}`;
+		const draft = await knowledgeBranchService.createStandalone(
+			{ userId: clearedUserId, role: "user" },
+			{ title: "Private", content: "secret personal content", keywords: [keyword] },
+		);
+		const result = await scanSubagentTextForKnowledge({
+			narratorId: subagentId,
+			parentNarratorId,
+			text: keyword,
+			source: "team_message",
+			turnUserId: clearedUserId,
+			cycle: { seq: -1, ids: new Set() },
+			locale: "en",
+		});
+		expect(result?.record.hits).toContainEqual(
+			expect.objectContaining({ scope: "personal", entryId: draft.id }),
+		);
+		expect(result?.body).toMatchObject({
+			kind: "knowledge",
+			hits: [{ scope: "personal", entryId: draft.id }],
+		});
+		expect(result?.content).toContain(JSON.stringify({ personalEntryId: draft.id }));
+	});
+
 	test("an entry already in the cycle set is not injected again", async () => {
 		const cycle = { seq: -1, ids: new Set<string>() };
 		const first = await scanSubagentTextForKnowledge({
@@ -356,7 +382,7 @@ describe("compact-cycle de-dup", () => {
 		});
 		expect(first?.record.hits.map((h) => h.entryId)).toContain(publicEntryId);
 		// The scan records its own hits, so a second message in the same cycle is quiet.
-		expect(cycle.ids.has(publicEntryId)).toBe(true);
+		expect(cycle.ids.has(`global:${publicEntryId}`)).toBe(true);
 
 		const second = await scanSubagentTextForKnowledge({
 			narratorId: subagentId,

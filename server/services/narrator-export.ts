@@ -34,12 +34,12 @@
 
 import { parseCompactMessageBlock } from "@shared/compact-message";
 import {
-	INTELLIGENT_UI_PUBLIC_SUMMARY,
-	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
-	INTELLIGENT_UI_TOOL_NAME,
-	isIntelligentUiToolName,
-	publicIntelligentUiSummary,
-} from "@shared/intelligent-ui-public";
+	GEN_UI_PUBLIC_SUMMARY,
+	GEN_UI_PUBLIC_SUMMARY_CODE,
+	GEN_UI_TOOL_NAME,
+	isGenUiToolName,
+	publicGenUiSummary,
+} from "@shared/gen-ui-public";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
@@ -52,7 +52,7 @@ import {
 	RUNTIME_SOURCE_COLUMNS,
 } from "../lib/runtime-source";
 import { resolveLazyLineage } from "./narrator-refs-backfill";
-import { projectPublicNarratorPayload } from "./public-narrator-share-intelligent-ui";
+import { projectPublicNarratorPayload } from "./public-narrator-share-gen-ui";
 
 // ── Tunables ───────────────────────────────────────────────────────────────
 
@@ -566,7 +566,7 @@ export async function* iterateNarratorTranscript(
 const messageHasPrivateUi = sql<number>`EXISTS (
 	SELECT 1 FROM narrator_tool_calls AS private_ui_call
 	WHERE private_ui_call.message_id = narrator_messages.id
-	AND private_ui_call.tool_name = ${INTELLIGENT_UI_TOOL_NAME}
+	AND private_ui_call.tool_name = ${GEN_UI_TOOL_NAME}
 	LIMIT 1
 )`;
 
@@ -635,19 +635,19 @@ async function loadToolCallMeta(messageIds: string[]) {
 			createdAt: narratorToolCalls.createdAt,
 			// A private UI contributes no source, error excerpt or source-length side channel.
 			errorMessage: sql<string | null>`CASE
-				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN NULL
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN NULL
 				ELSE substr(${narratorToolCalls.errorMessage}, 1, ${EXPORT_TOOL_ERROR_LIMIT})
 				END`.as("error_excerpt"),
 			errorBytes: sql<number>`CASE
-				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN 0
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
 				ELSE length(COALESCE(${narratorToolCalls.errorMessage}, '')) END`.as("error_bytes"),
 			inputBytes: sql<number>`CASE
-				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN 0
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
 				ELSE length(COALESCE(CAST(${narratorToolCalls.inputJson} AS TEXT), '')) END`.as(
 				"input_bytes",
 			),
 			outputBytes: sql<number>`CASE
-				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN 0
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
 				ELSE length(COALESCE(CAST(${narratorToolCalls.outputJson} AS TEXT), '')) END`.as(
 				"output_bytes",
 			),
@@ -693,7 +693,7 @@ function selectToolBodyIds(rows: Awaited<ReturnType<typeof loadToolCallMeta>>): 
 	let spent = 0;
 	for (const row of rows) {
 		// Excluded BEFORE the body query, even when includeToolIO was requested.
-		if (isIntelligentUiToolName(row.toolName)) continue;
+		if (isGenUiToolName(row.toolName)) continue;
 		const projected =
 			Math.min(row.inputBytes, EXPORT_TOOL_FIELD_LIMIT) +
 			Math.min(row.outputBytes, EXPORT_TOOL_FIELD_LIMIT);
@@ -962,7 +962,7 @@ export function assemblePage(
 }
 
 /**
- * IntelligentUI cards have the same static boundary as an anonymous share;
+ * GenUI cards have the same static boundary as an anonymous share;
  * clamped child JSON must not resurrect preview references via contentText.
  * Ordinary file-tool history, including UI source, is not classified as private.
  * Metadata is batched by indexed message IDs and bounded independently of IO.
@@ -982,7 +982,7 @@ async function projectExportMessages(
 			.where(
 				and(
 					inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
-					eq(narratorToolCalls.toolName, INTELLIGENT_UI_TOOL_NAME),
+					eq(narratorToolCalls.toolName, GEN_UI_TOOL_NAME),
 				),
 			)
 			.limit(maxIdentities - count + 1);
@@ -1002,8 +1002,8 @@ async function projectExportMessages(
 				contentJson: [
 					{
 						type: "text",
-						text: INTELLIGENT_UI_PUBLIC_SUMMARY,
-						publicSummary: INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+						text: GEN_UI_PUBLIC_SUMMARY,
+						publicSummary: GEN_UI_PUBLIC_SUMMARY_CODE,
 					},
 				],
 				contentText: null,
@@ -1022,9 +1022,7 @@ async function projectExportMessages(
 						: block?.type === "tool_result"
 							? block.tool_use_id
 							: undefined;
-				return typeof id === "string" && privateIds?.has(id)
-					? publicIntelligentUiSummary(block)
-					: block;
+				return typeof id === "string" && privateIds?.has(id) ? publicGenUiSummary(block) : block;
 			}),
 		};
 	});
@@ -1240,14 +1238,14 @@ function contentBlocks(contentJson: any): any[] {
 }
 
 function privateUiSummaryLabel(lang: NarratorExportLang): string {
-	return lang === "zh-CN" ? "此会话导出不提供交互式预览。" : INTELLIGENT_UI_PUBLIC_SUMMARY;
+	return lang === "zh-CN" ? "此会话导出不提供交互式预览。" : GEN_UI_PUBLIC_SUMMARY;
 }
 
 function renderMessageBody(row: ExportMessageRow, lang: NarratorExportLang): string {
 	const parts: string[] = [];
 	for (const block of contentBlocks(row.contentJson)) {
 		if (!block || typeof block !== "object") continue;
-		if (block.publicSummary === INTELLIGENT_UI_PUBLIC_SUMMARY_CODE) {
+		if (block.publicSummary === GEN_UI_PUBLIC_SUMMARY_CODE) {
 			parts.push(`_${privateUiSummaryLabel(lang)}_`);
 			continue;
 		}
@@ -1290,8 +1288,7 @@ function renderMessageBody(row: ExportMessageRow, lang: NarratorExportLang): str
 }
 
 function renderToolCall(tool: ExportToolCall, lang: NarratorExportLang): string {
-	if (isIntelligentUiToolName(tool.toolName))
-		return details(INTELLIGENT_UI_TOOL_NAME, privateUiSummaryLabel(lang));
+	if (isGenUiToolName(tool.toolName)) return details(GEN_UI_TOOL_NAME, privateUiSummaryLabel(lang));
 	const heading = [
 		tool.toolName,
 		tool.status,
@@ -1383,8 +1380,8 @@ function jsonMessage(message: ExportMessage, includeToolIO: boolean) {
 		folded: message.folded,
 		content: contentBlocks(message.row.contentJson),
 		toolCalls: message.toolCalls.map((tool) =>
-			isIntelligentUiToolName(tool.toolName)
-				? { ...publicIntelligentUiSummary({ ...tool }), subagentMessages: [] }
+			isGenUiToolName(tool.toolName)
+				? { ...publicGenUiSummary({ ...tool }), subagentMessages: [] }
 				: {
 						toolUseId: tool.toolUseId,
 						toolName: tool.toolName,

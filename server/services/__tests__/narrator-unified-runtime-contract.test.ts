@@ -160,11 +160,19 @@ describe.each(shapes)("%s session: permissions follow the registered source", (s
 		expect(rows.find((row) => row.id === bystander)?.permissionMode).not.toBe("readOnly");
 	});
 
-	test("a source still in use cannot be deleted out from under its dependent", async () => {
+	test("deleting a source freezes its ceiling into the dependent, never widens it", async () => {
 		const { source, dependent } = await related(shape);
 		if (shape !== "unrelated") return; // a source's own children are removed with it
-		await expect(narratorService.remove(source)).rejects.toThrow("policy source");
-		expect(executionPolicyRepository.loadNow(dependent).inheritedNarratorIds).toContain(source);
+		await setTraits(source, withRuntimePolicyTrait([], { version: 1, readOnly: true }));
+		await narratorService.remove(source);
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, dependent),
+			columns: { policySourceNarratorId: true },
+		});
+		expect(row?.policySourceNarratorId).toBeNull();
+		expect(isRuntimeToolAllowed(await resolveNarratorRuntimePolicy(dependent), "Write")).toBe(
+			false,
+		);
 	});
 });
 
@@ -230,21 +238,12 @@ describe.each(shapes)("%s session: control is a separate, explicit grant", (shap
 			).toBe(dependent);
 	});
 
-	test("siblings, subscribers and fork sources get no control", async () => {
+	test("siblings and fork sources get no control", async () => {
 		const { source, dependent } = await related(shape);
 		// A sibling registered against the same source.
 		const sibling = await primary();
 		await setPolicySource(sibling, source);
 		await setRuntimeRegistration(sibling, delegationRegistration(source, "general"));
-		// A subscriber of the dependent's events.
-		const subscriber = await primary();
-		const { upsertNarratorEventSubscription } = await import("../narrator-runtime-registration");
-		await upsertNarratorEventSubscription({
-			sourceNarratorId: dependent,
-			recipientNarratorId: subscriber,
-			events: ["completed"],
-			origin: "explicit",
-		});
 		// A fork source: parent link on an ordinary narrator, no registration.
 		const forkSource = await primary();
 		const fork = await primary();
@@ -255,14 +254,9 @@ describe.each(shapes)("%s session: control is a separate, explicit grant", (shap
 			).rejects.toThrow();
 		for (const action of ["stop", "archive"] as const) {
 			await denied(sibling, dependent, action);
-			await denied(subscriber, dependent, action);
 			await denied(dependent, sibling, action);
 			await denied(forkSource, fork, action);
 		}
-		const { narratorEventSubscriptions } = await import("../../db/schema");
-		await db
-			.delete(narratorEventSubscriptions)
-			.where(eq(narratorEventSubscriptions.sourceNarratorId, dependent));
 	});
 
 	test("a grant limited to some actions does not imply the others", async () => {
@@ -415,26 +409,18 @@ describe("every creation path stores its ceiling on the row", () => {
 	});
 });
 
-test("deleting a source with a surviving dependent fails before anything is removed", async () => {
+test("deleting a source removes its delegated children and keeps a survivor restricted", async () => {
 	const { source, dependent: child } = await related("delegated");
 	const survivor = await primary();
 	await setPolicySource(survivor, source);
-	await expect(narratorService.remove(source)).rejects.toThrow("policy source");
-	// Refused up front: the delegated child was not deleted on the way to the refusal.
+	await setTraits(source, withRuntimePolicyTrait([], { version: 1, readOnly: true }));
+	await narratorService.remove(source);
 	const remaining = await db.query.narrators.findMany({
 		where: inArray(narrators.id, [source, child, survivor]),
-		columns: { id: true },
+		columns: { id: true, policySourceNarratorId: true },
 	});
-	expect(remaining.map((row) => row.id).sort()).toEqual([source, child, survivor].sort());
-	// The source's own child alone is not a blocker.
-	await setPolicySource(survivor, null);
-	await narratorService.remove(source);
-	expect(
-		await db.query.narrators.findMany({
-			where: inArray(narrators.id, [source, child]),
-			columns: { id: true },
-		}),
-	).toEqual([]);
+	expect(remaining).toEqual([{ id: survivor, policySourceNarratorId: null }]);
+	expect(isRuntimeToolAllowed(await resolveNarratorRuntimePolicy(survivor), "Write")).toBe(false);
 });
 
 test("a primary fork with a parent link is unaffected by permission-mode propagation", async () => {

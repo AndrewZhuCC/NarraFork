@@ -3,7 +3,7 @@ import { resolve, sep } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
-import { and, desc, eq, inArray, isNotNull, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	aclGrants,
@@ -91,6 +91,7 @@ import {
 import {
 	appendRuntimePolicyTrait,
 	hasRuntimePolicyTrait,
+	parseRuntimePolicyTraits,
 	type RuntimePolicyTrait,
 	withRuntimePolicyTrait,
 } from "../lib/runtime-policy-trait";
@@ -115,6 +116,7 @@ import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { agentMessageDeliveryBody } from "./agent-message-delivery";
 import { type AgentMessageSender, buildAgentMessageOrigin } from "./agent-message-origin";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -1268,6 +1270,36 @@ async function forkTraits(
 	return traits;
 }
 
+/**
+ * A surviving session must never be widened by losing its policy source: freeze the
+ * source's effective ceiling into each dependent's own traits (narrow-only), then
+ * clear the source. Delegated children are deleted with the source before this runs.
+ */
+async function freezePolicyDependents(sourceId: string): Promise<void> {
+	const dependents = await db.query.narrators.findMany({
+		where: eq(narrators.policySourceNarratorId, sourceId),
+		columns: { id: true },
+	});
+	if (dependents.length === 0) return;
+	const { resolveNarratorCapabilities } = await import("./trait-layer-service");
+	const ceilings = parseRuntimePolicyTraits(
+		(await resolveNarratorCapabilities(sourceId)).traits.traits,
+	);
+	for (const { id } of dependents) {
+		await narratorTraitsLock.acquire(id, async () => {
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { traits: true },
+			});
+			const traits = ceilings.reduce<unknown>(appendRuntimePolicyTrait, row?.traits);
+			await db
+				.update(narrators)
+				.set({ traits: parseTraits(traits), policySourceNarratorId: null })
+				.where(and(eq(narrators.id, id), eq(narrators.policySourceNarratorId, sourceId)));
+		});
+	}
+}
+
 /** Keep the policy/model source, never the parent's controller or run/result destination. */
 function forkPolicySource(parent: typeof narrators.$inferSelect) {
 	const modelPool = modelPoolKeyOf(parent);
@@ -1707,6 +1739,7 @@ export function createPreparedNarratorInTransaction(
 
 /** Publish non-transactional narrator creation side effects after commit. */
 export function publishNarratorCreated(narrator: typeof narrators.$inferSelect): void {
+	backgroundOccupancyStore.refreshNarrator(narrator.id);
 	logger.info("Narrator created", {
 		id: narrator.id,
 		chapterId: narrator.chapterId,
@@ -1912,6 +1945,7 @@ export const narratorService = {
 					})
 					.returning();
 
+				backgroundOccupancyStore.refreshNarrator(id);
 				logger.info("Subagent created", {
 					id,
 					parentNarratorId: input.parentNarratorId,
@@ -2093,6 +2127,7 @@ export const narratorService = {
 			images?: ImageRef[];
 			textFiles?: TextFileRef[];
 			fileReferences?: import("@shared/file-reference").FileReferenceSnapshot[];
+			composerDocument?: import("@shared/composer-document").ComposerDocument;
 			commandText?: string | null;
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
@@ -2154,6 +2189,7 @@ export const narratorService = {
 				parentToolUseId,
 				messageId: delivery?.recipientMessageId,
 				mailboxClaim: options?.mailboxClaim ?? delivery?.mailboxClaim,
+				composerDocument: options?.composerDocument,
 			},
 		);
 		// See (2) above: withheld here rather than in the shared entry point, so the
@@ -2278,21 +2314,6 @@ export const narratorService = {
 	},
 
 	async remove(narratorId: string) {
-		// A surviving session that still takes its ceiling/rules from this one would be
-		// silently widened by losing its source, so refuse — BEFORE deleting anything.
-		// Direct children are deleted with this narrator and are not survivors; the FK
-		// backs this check up.
-		const dependent = await db.query.narrators.findFirst({
-			where: and(
-				eq(narrators.policySourceNarratorId, narratorId),
-				or(isNull(narrators.parentNarratorId), ne(narrators.parentNarratorId, narratorId)),
-			),
-			columns: { id: true },
-		});
-		if (dependent)
-			throw new ValidationError(
-				`Narrator ${narratorId} is still the policy source of ${dependent.id}; re-source it first`,
-			);
 		const children = await db.query.narrators.findMany({
 			where: eq(narrators.parentNarratorId, narratorId),
 			columns: { id: true, type: true, variant: true },
@@ -2305,6 +2326,7 @@ export const narratorService = {
 		for (const child of children) {
 			if (!survivingForks.some((fork) => fork.id === child.id)) await this.remove(child.id);
 		}
+		await freezePolicyDependents(narratorId);
 
 		// Any surviving narrator that still borrows pre-compact refs from this one must
 		// materialize what it can keep and drop the link first: the self-FK would abort
@@ -2448,6 +2470,8 @@ export const narratorService = {
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});
+		backgroundOccupancyStore.removeNarrators([narratorId]);
+		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
 		eventBus.emit({ type: "human_attention:changed" });
 		if (bindingTransition) {

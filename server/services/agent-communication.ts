@@ -1459,6 +1459,15 @@ async function sendSubagentMessageDetailedWithRun(
 						`Previous delivery is ${enqueued.delivery.state}; explicit retry is required`,
 					);
 				const buffered = { duplicate: enqueued.status === "duplicate" };
+				// The run may have ended while this was being queued; the ordinary wake
+				// rechecks ownership, so a still-live run simply adopts it at its boundary.
+				if (!buffered.duplicate)
+					void wakeInboxIfEligible(fresh.id, input.locale as Locale).catch((error) =>
+						logger.warn("Queued Send wake deferred", {
+							narratorId: fresh.id,
+							error: String(error),
+						}),
+					);
 				deliveryMessageId = delivery.recipientMessageId;
 				let interruptNote = takeoverNote;
 				let interrupted: boolean | undefined;

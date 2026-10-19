@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import type {
@@ -40,7 +41,7 @@ function installDom() {
 		Text: window.Text,
 		matchMedia,
 		getComputedStyle: () => ({ getPropertyValue: () => "" }),
-		IS_REACT_ACT_ENVIRONMENT: false,
+		IS_REACT_ACT_ENVIRONMENT: true,
 	});
 }
 
@@ -98,19 +99,20 @@ function getTierCard(tier: string): HTMLElement {
 }
 
 async function renderOverview(stats: CodexUsageTierStats) {
-	root.render(
-		<I18nextProvider i18n={testI18n}>
-			<MantineProvider>
-				<CodexQuotaOverview
-					summary={summary(stats)}
-					trend={trend}
-					scheduler={scheduler}
-					tierOrder={["team"]}
-				/>
-			</MantineProvider>
-		</I18nextProvider>,
-	);
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await act(async () => {
+		root.render(
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					<CodexQuotaOverview
+						summary={summary(stats)}
+						trend={trend}
+						scheduler={scheduler}
+						tierOrder={["team"]}
+					/>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+	});
 }
 
 beforeEach(async () => {
@@ -129,8 +131,8 @@ beforeEach(async () => {
 	root = createRoot(container);
 });
 
-afterEach(() => {
-	root.unmount();
+afterEach(async () => {
+	await act(async () => root.unmount());
 	container.remove();
 });
 

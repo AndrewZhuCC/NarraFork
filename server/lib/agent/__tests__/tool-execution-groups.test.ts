@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { sharesParallelGroup } from "@shared/tool-parallel-groups";
 import {
 	groupToolExecutions,
 	isAgentDependentToolExecutionGroup,
@@ -185,17 +186,33 @@ describe("tool execution grouping", () => {
 		});
 
 		test("barrier is driven by the Agent member, not the adjacent tool", () => {
-			// Read joins the Agent batch first, so Send (barrier-dependent) splits off. Await
+			// Read joins the Agent batch first, so Send (barrier-dependent) splits off. Read
 			// then joins Send because that fresh group has no Agent — the barrier only triggers
 			// while the current group actually contains an Agent.
 			expect(
-				groupToolExecutions([tool("Read"), tool("Agent"), tool("Send"), tool("Await")]).map(
+				groupToolExecutions([tool("Read"), tool("Agent"), tool("Send"), tool("Read")]).map(
 					(group) => group.map(({ name }) => name),
 				),
 			).toEqual([
 				["Read", "Agent"],
-				["Send", "Await"],
+				["Send", "Read"],
 			]);
+		});
+
+		test("Await after a Send in the same batch opens a new group", () => {
+			// Send wakes the idle subagent before returning; a concurrent Await would read
+			// the previous run's terminal result.
+			expect(
+				groupToolExecutions([tool("Send"), tool("Read"), tool("Await")]).map((group) =>
+					group.map(({ name }) => name),
+				),
+			).toEqual([["Send", "Read"], ["Await"]]);
+		});
+
+		test("sharesParallelGroup follows the Send barrier past an intervening call", () => {
+			expect(sharesParallelGroup([tool("Send"), tool("Read")])).toBe(true);
+			expect(sharesParallelGroup([tool("Send"), tool("Read"), tool("Await")])).toBe(false);
+			expect(sharesParallelGroup([tool("Await"), tool("Send")])).toBe(true);
 		});
 
 		test("Agent + Agent stays parallel", () => {

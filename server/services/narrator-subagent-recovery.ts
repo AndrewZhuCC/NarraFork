@@ -57,6 +57,7 @@ import {
 	runDeliverToOf,
 } from "../lib/runtime-source";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
@@ -1097,6 +1098,7 @@ async function clearBackgroundRunningClaim(
 				error: err instanceof Error ? err.message : String(err),
 			});
 		});
+	backgroundOccupancyStore.refreshNarrator(subagentId);
 }
 
 /**
@@ -1200,31 +1202,8 @@ export async function resumeRecoverySubagents(input: {
 						principal: { userId: input.userId ?? null },
 					},
 				});
-				// c) mark the narrator itself as background (detach's job, done by hand).
-				//    Under narratorTraitsLock with a fresh read, because `traits` is a whole-column
-				//    JSON array: writing the copy fetched at the top of this iteration would drop
-				//    any trait written since (including the watermark this very card just stamped).
-				//    `updatedAt` IS written here on purpose — unlike the watermark, this row is
-				//    being resumed, so its old failure time is no longer the relevant one.
-				await narratorTraitsLock.acquire(subagentId, async () => {
-					const current = await db.query.narrators.findFirst({
-						where: eq(narrators.id, subagentId),
-						columns: { traits: true },
-					});
-					await db
-						.update(narrators)
-						.set({
-							isBackground: true,
-							backgroundStatus: "running",
-							backgroundResult: null,
-							backgroundCompletedAt: null,
-							traits: [
-								...new Set([...parseTraits(current?.traits ?? subagent.traits), "background"]),
-							],
-							updatedAt: new Date().toISOString(),
-						})
-						.where(eq(narrators.id, subagentId));
-				});
+				// c) mark the narrator itself as background, the same way a detached run is.
+				await backgroundTaskService.markNarratorRunning(subagentId);
 
 				// d) continue the task's run. Its result lands on the task (the historical
 				//    Agent tool_result stays untouched), exactly like any detached run.

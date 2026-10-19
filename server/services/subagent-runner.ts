@@ -4,9 +4,6 @@
  * controls or finalizes a run — `agent-runtime/run.ts` does that for every session.
  */
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { narrators } from "../db/schema";
 import {
 	normalizeOptionalExecutionTimeout,
 	resolveOptionalExecutionTimeout,
@@ -19,7 +16,6 @@ import {
 	resolveEffectiveSubagentModelPolicy,
 	resolveSubagentModelSelectionFromPolicy,
 } from "../lib/narrator-custom-traits";
-import { parseTraits } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
 import { expandAllowedPoolForDisplay, FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
@@ -330,7 +326,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			: "";
 
 		if (background) {
-			await markBackground(subagentId);
+			await backgroundTaskService.markNarratorRunning(subagentId);
 			// The task projection registers this run (and its relations) in one start.
 			const task = await backgroundTaskService.createAgentTask({
 				id: subagentId,
@@ -417,17 +413,4 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		updateLease.release();
 		throw error;
 	}
-}
-
-async function markBackground(subagentId: string): Promise<void> {
-	const subNarrator = await narratorService.getById(subagentId);
-	await db
-		.update(narrators)
-		.set({
-			isBackground: true,
-			backgroundStatus: "running",
-			traits: [...new Set([...parseTraits(subNarrator.traits), "background"])],
-			updatedAt: new Date().toISOString(),
-		})
-		.where(eq(narrators.id, subagentId));
 }

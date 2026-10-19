@@ -86,7 +86,7 @@ import {
 	readRuntimeRegistrationColumn,
 } from "../../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
-import { consumeAgentMessageHistory } from "../agent-message-delivery";
+import { consumeAgentMessageHistory, isLastModelInputMailbox } from "../agent-message-delivery";
 import {
 	claimInboxHead,
 	hasInboxKind,
@@ -96,10 +96,11 @@ import {
 import { type ExecutionOwner, getRunHold, type RunControl } from "../agent-runtime/ownership";
 import { awaitRunHold } from "../agent-runtime/run";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
+import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { gitService } from "../git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
-import { knowledgeInjection } from "../knowledge-injection";
+import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
 	cleanupBufferedTextFilesAsync,
@@ -350,9 +351,11 @@ export async function runAgentLoopUnlocked(
 	images?: ImageRef[],
 	/** Live relationship state of this run; absent for a bare session run in tests. */
 	run?: RunControl,
+	/** An accepted `/bash` pre-command the runtime runs (and owns) before the first pass. */
+	prePromptBashCommand?: string,
 ): Promise<RuntimeRunOutcome> {
 	const { narratorId, locale } = active;
-	const runState = createRuntimeRunState({ kind: "current", text, images });
+	const runState = createRuntimeRunState({ kind: "current", text, images }, prePromptBashCommand);
 	const continuationState = createSpecContinuationState();
 	let continuationStopNote: string | null = null;
 	let abortedBeforeCleanup: boolean | undefined;
@@ -462,6 +465,7 @@ export async function runAgentLoopUnlocked(
 	// One continuation decision for every session. Placement affects only the saved
 	// transcript and the explanation attached to the delivered result, never its budget.
 	const continueForSpec = async (cause: "spec" | "maxTurns", suppressed: boolean) => {
+		if (runState.lastPass?.reasoningOnlyIdle) return null;
 		const content = await maybeStartContinuation(active, suppressed, {
 			cause,
 			state: continuationState,
@@ -604,10 +608,13 @@ export async function runAgentLoopUnlocked(
 			// Keep accepted snapshots and uploaded files recoverable until the
 			// ordinary user message commits, just like the interrupt drain path.
 			const terminalCommand =
-				parseQueuedNewCommand(buffered.text, buffered.commandText) ||
-				parseQueuedGoalCommand(buffered.text, buffered.commandText);
+				parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument) ||
+				parseQueuedGoalCommand(buffered.text, buffered.commandText, buffered.composerDocument);
 			pendingBufferedDelivery = buffered;
-			if (terminalCommand && parseQueuedNewCommand(buffered.text, buffered.commandText)) {
+			if (
+				terminalCommand &&
+				parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument)
+			) {
 				await persistClaimedUserInput({
 					claim: bufferedClaim,
 					reservedMessageId: bufferedRow?.recipientMessageId,
@@ -641,7 +648,11 @@ export async function runAgentLoopUnlocked(
 				remaining,
 			});
 			// [continuation-source: queued-command]
-			const newCommand = parseQueuedNewCommand(buffered.text, buffered.commandText);
+			const newCommand = parseQueuedNewCommand(
+				buffered.text,
+				buffered.commandText,
+				buffered.composerDocument,
+			);
 			if (newCommand) {
 				const newNarratorId = await executeQueuedNewCommand(
 					active,
@@ -671,7 +682,11 @@ export async function runAgentLoopUnlocked(
 			// A queued /goal appends its protected task, then continues this same
 			// loop with an explicit Spec instruction. Later queued messages retain
 			// their order and are consumed after this goal turn.
-			const goalCommand = parseQueuedGoalCommand(buffered.text, buffered.commandText);
+			const goalCommand = parseQueuedGoalCommand(
+				buffered.text,
+				buffered.commandText,
+				buffered.composerDocument,
+			);
 			if (goalCommand) {
 				await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
 				active._continuationSuppressed = false;
@@ -750,6 +765,7 @@ export async function runAgentLoopUnlocked(
 				narratorId,
 				text: effectiveBufferedText,
 				contentBlocks: persistBlocks,
+				composerDocument: buffered.composerDocument,
 				commandText: buffered.commandText,
 				createdBy: buffered.createdBy,
 				parentToolUseId: placement?.parentToolUseId,
@@ -834,6 +850,15 @@ export async function runAgentLoopUnlocked(
 				);
 				runState.input.text = "";
 				runState.firstPass = false;
+				// A stop during the pre-command ends the turn before any model request.
+				if (active.abortController.signal.aborted) {
+					const next = await applyInterruptedTurnControl(abortedPass());
+					if (next === "continue") continue;
+					if (next === "break") break;
+					await finalizeInterruptedRun(active, narratorId);
+					runState.wasInterrupted = true;
+					break;
+				}
 			}
 			const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
 			// Knowledge-injection de-dup is scoped to a compact cycle: when the latest compact
@@ -1342,6 +1367,10 @@ export async function runAgentLoopUnlocked(
 					const chapterId = active._chapterId ?? null;
 					const worktreePath = gitTrackPathForSession(active);
 					if (!worktreePath) return;
+					// Mark the directory dirty at the tool boundary, not in the narrator's
+					// trailing timer. The directory pool owns throttled live refreshes;
+					// this timer only retains the legacy chapter-specific broadcast.
+					invalidateStatus(worktreePath);
 					const baseBranch = active._baseBranch as string | undefined;
 					const scheduleRefresh = (delayMs: number) => {
 						// Collapse rapid successive calls into one trailing query. Git commands
@@ -1349,11 +1378,10 @@ export async function runAgentLoopUnlocked(
 						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 						active._gitTrackTimer = setTimeout(() => {
 							active._gitTrackTimer = undefined;
-							// File changes just happened → invalidate then read through
-							// the shared cache so co-located narrators reuse one query.
-							invalidateStatus(worktreePath);
+							// Reuse the directory pool's result (or another narrator's query).
+							// A late timer must not invalidate the same completed write again.
 							Promise.all([
-								getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
+								getStatusSummaryCached(worktreePath),
 								baseBranch
 									? gitService.getCommitsAhead(worktreePath, baseBranch)
 									: Promise.resolve({ count: 0, baseBranch: "" }),
@@ -1492,6 +1520,9 @@ export async function runAgentLoopUnlocked(
 
 			let toolCallLimitExceeded = false;
 			const passWorkspaceContext = active._workspaceContext;
+			let lastModelInputWasMailbox = false;
+			let adoptedInput: { history: unknown[]; content: string } | undefined;
+			let afterToolsInput: { history: unknown[]; content: string; mailbox: boolean } | undefined;
 			const config: import("../../lib/agent").AgentConfig = {
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: run?.executionSegmentId,
@@ -1714,6 +1745,13 @@ export async function runAgentLoopUnlocked(
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
+				shouldIdleOnReasoningOnly: async () => {
+					// Waiting on a mailbox reply or on its own background work, for any session.
+					if (lastModelInputWasMailbox) return true;
+					const { activeWorkCount } =
+						await backgroundTaskService.countActiveKindsByParent(narratorId);
+					return activeWorkCount > 0;
+				},
 				initialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
 				onCompletedToolCount: (count: number) => {
 					active._todoReminderCompletedToolCount = count;
@@ -1725,6 +1763,11 @@ export async function runAgentLoopUnlocked(
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
 				onModelInputConsumed: (history, content, answerEventIds) => {
+					adoptedInput = { history, content };
+					lastModelInputWasMailbox =
+						afterToolsInput?.history === history && afterToolsInput.content === content
+							? afterToolsInput.mailbox
+							: isLastModelInputMailbox(history, content);
 					consumeAgentMessageHistory(history, content);
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
@@ -1733,7 +1776,23 @@ export async function runAgentLoopUnlocked(
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
 				},
-				getAfterToolsInjections: () => drainInjectionsIntoHistory(active, locale, placement),
+				getAfterToolsInjections: async () => {
+					const input = await drainInjectionsIntoHistory(active, locale, placement);
+					return {
+						...input,
+						onConsumed: () => {
+							input.onConsumed();
+							if (input.parts.length > 0) {
+								lastModelInputWasMailbox = input.lastInputWasMailbox;
+								// onConsumed runs only once, whereas the exact same request can
+								// be adopted again after a transient retry. Retain its provenance.
+								afterToolsInput = adoptedInput
+									? { ...adoptedInput, mailbox: input.lastInputWasMailbox }
+									: undefined;
+							}
+						},
+					};
+				},
 				deliverInjectionRow: async (injection) => {
 					const { messageId, turnText } = await deliverInjection(narratorId, {
 						subagent: placement,
@@ -1961,7 +2020,7 @@ export async function runAgentLoopUnlocked(
 								source: "user_message",
 								hits,
 							});
-							for (const h of hits) knowledgeInjectedIds.add(h.entryId);
+							for (const h of hits) knowledgeInjectedIds.add(injectionKey(h));
 							effectiveText = `${effectiveText}\n\n${projectMessageSenderText(knowledgeMessage, block)}`;
 						}
 					}
@@ -2209,7 +2268,7 @@ export async function runAgentLoopUnlocked(
 			// Track the latest pass's final text for the Stop hook (set on every pass,
 			// so the most recent assistant text / error message wins regardless of how
 			// the loop ultimately terminates).
-			if (result.finalText) {
+			if (result.finalText || result.reasoningOnlyIdle) {
 				runState.finalText = result.finalText;
 			}
 
@@ -3362,7 +3421,13 @@ export async function runAgentLoopUnlocked(
 	if (runState.lastPass?.paymentRequired)
 		finalText = `Payment required: ${runState.lastPass.paymentRequired.message}`;
 	// A run that delivers to a tool call always delivers its best available text.
-	if (placement && !finalText.trim() && !runState.hadError && !aborted) {
+	if (
+		placement &&
+		!runState.lastPass?.reasoningOnlyIdle &&
+		!finalText.trim() &&
+		!runState.hadError &&
+		!aborted
+	) {
 		const latest = await narratorService.getLatestAssistantTextAndId(narratorId).catch(() => null);
 		if (latest?.text.trim()) finalText = latest.text;
 		else

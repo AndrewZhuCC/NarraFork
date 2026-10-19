@@ -7,7 +7,7 @@
  * allow-list is the shape one wants, and it is not available here: a project's
  * `gitPath` is arbitrary (the user picks it in the directory browser), worktrees
  * live under it, and the file viewer also legitimately opens platform files
- * OUTSIDE any project — request dumps under `~/.narrafork/malformed-request-dumps`,
+ * OUTSIDE any project — legacy request dumps under `~/.narrafork/malformed-request-dumps`,
  * truncated tool output, subagent conclusions. Enumerating "everything a viewer may
  * open" would either break those paths or grow into a second copy of the whole data
  * layout.
@@ -59,6 +59,8 @@ const SECRET_HOME_FILES: readonly string[] = [
 const PRIVATE_RECORDING_DIRS: readonly string[] = [
 	REQUEST_RECORDING_DIR,
 	REQUEST_RECORDING_SAVED_DIR,
+	// Legacy cross-user maintenance data; private until the startup cleanup removes it.
+	"token-repair-jobs",
 ];
 
 /** Private protocol state must not be exposed or rewritten through generic file APIs.

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -15,20 +15,33 @@ interface Frame {
 	data: string;
 }
 
-const originalAgent = settings.agent;
+function publishedFrames(text: string, requestId: string): Frame[] {
+	// A live segment may be observed partway through a write. Only a trailing
+	// newline publishes a frame; malformed complete lines must still fail loudly.
+	const end = text.lastIndexOf("\n");
+	if (end < 0) return [];
+	const frames: Frame[] = [];
+	for (const line of text.slice(0, end).split("\n")) {
+		if (!line) continue;
+		const frame = JSON.parse(line) as Frame;
+		if (frame.requestId === requestId) frames.push(frame);
+	}
+	return frames;
+}
 
-beforeAll(() => {
-	settings.agent = {
-		...settings.agent,
-		requestDumpRecordingEnabled: true,
-		requestDumpRequestBytes: 4 * 1024 * 1024,
-		requestDumpResponseBytes: 4 * 1024 * 1024,
-		requestDumpEnabled: false,
-		requestDumpErrorsOnly: false,
+const originalEvidence = settings.requestEvidence;
+
+// The shared preload restores settings after every test, including parser unit cases.
+beforeEach(() => {
+	settings.requestEvidence = {
+		ringEnabled: true,
+		ringRequestBytes: 4 * 1024 * 1024,
+		ringResponseBytes: 4 * 1024 * 1024,
+		autoPin: "off",
 	};
 });
 afterAll(async () => {
-	settings.agent = originalAgent;
+	settings.requestEvidence = originalEvidence;
 	// Stop the shared worker so the test process can exit.
 	const clients = (globalThis as Record<symbol, unknown>)[
 		Symbol.for("request-recording-clients")
@@ -55,11 +68,7 @@ async function framesFor(requestId: string): Promise<Frame[]> {
 			continue;
 		}
 		for (const file of files) {
-			for (const line of (await readFile(join(chunks, file), "utf8")).split("\n")) {
-				if (!line) continue;
-				const frame = JSON.parse(line) as Frame;
-				if (frame.requestId === requestId) frames.push(frame);
-			}
+			frames.push(...publishedFrames(await readFile(join(chunks, file), "utf8"), requestId));
 		}
 	}
 	return frames;
@@ -81,6 +90,23 @@ async function waitForEnd(requestId: string, expected: number): Promise<Frame[]>
 }
 
 describe("二进制响应块录制", () => {
+	test("live segment reader waits for a newline without accepting a partial frame", () => {
+		const frame: Frame = {
+			requestId: "target",
+			direction: "response",
+			packet: 1,
+			offset: 0,
+			data: "QQ==",
+		};
+		const line = JSON.stringify(frame);
+		expect(publishedFrames(line, "target")).toEqual([]);
+		expect(publishedFrames(`${line}\n{"requestId":"target`, "target")).toEqual([frame]);
+		expect(publishedFrames(`${line}\n${line}\n`, "target")).toEqual([frame, frame]);
+		expect(publishedFrames(`${line}\n`, "other")).toEqual([]);
+	});
+	test("live segment reader still rejects corrupted completed frames", () => {
+		expect(() => publishedFrames('{"requestId":"target"\n', "target")).toThrow();
+	});
 	test("worker 就绪后每个二进制分块只写一帧（transfer 不得阻止 offset 前进）", async () => {
 		// Warm the worker so later postMessage calls transfer synchronously.
 		const warm = createRequestRecording({

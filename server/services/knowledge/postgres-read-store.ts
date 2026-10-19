@@ -34,7 +34,22 @@ import {
 	knowledgeTagTypes,
 	users,
 } from "@server/db/postgres-schema";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	getTableColumns,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	like,
+	lt,
+	ne,
+	or,
+	sql,
+} from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type {
 	AclEventReadRow,
@@ -45,6 +60,8 @@ import type {
 	KnowledgeEntryAclRow,
 	KnowledgeEntryGraphRow,
 	KnowledgeEntryLinkRow,
+	KnowledgeEntryListFilter,
+	KnowledgeEntryListOrder,
 	KnowledgeEntryListRow,
 	KnowledgeEntryRow,
 	KnowledgeLevelRow,
@@ -115,6 +132,58 @@ const GRANT_SELECT = {
 	createdAt: aclGrants.createdAt,
 } as const;
 
+/**
+ * WHERE for the ordered browse list: SQL-side filters + the keyset predicate of the order
+ * (same rows as the SQLite twin). `level` is the effective level (own level, else the
+ * collection's default — a small `IN` subselect over collections). Title comparison uses the
+ * column's database collation, the same one its ORDER BY uses, so the keyset stays exact.
+ */
+function entryListWhere(
+	db: PgDb,
+	filter: KnowledgeEntryListFilter,
+	order: KnowledgeEntryListOrder,
+) {
+	const level = filter.level;
+	let keyset: ReturnType<typeof or>;
+	if (order.sort === "title") {
+		const after = order.after;
+		keyset = after
+			? or(
+					gt(knowledgeEntries.title, after.title),
+					and(eq(knowledgeEntries.title, after.title), gt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	} else {
+		const after = order.after;
+		keyset = after
+			? or(
+					lt(knowledgeEntries.updatedAt, after.updatedAt),
+					and(eq(knowledgeEntries.updatedAt, after.updatedAt), lt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	}
+	return and(
+		filter.collectionId ? eq(knowledgeEntries.collectionId, filter.collectionId) : undefined,
+		filter.status ? eq(knowledgeEntries.status, filter.status) : undefined,
+		level
+			? or(
+					eq(knowledgeEntries.classificationLevel, level),
+					and(
+						isNull(knowledgeEntries.classificationLevel),
+						inArray(
+							knowledgeEntries.collectionId,
+							db
+								.select({ id: knowledgeCollections.id })
+								.from(knowledgeCollections)
+								.where(eq(knowledgeCollections.defaultLevel, level)),
+						),
+					),
+				)
+			: undefined,
+		keyset,
+	);
+}
+
 export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 	/** Knowledge-scoped grant rows: the two scopes the knowledge ACL lives in. */
 	const knowledgeGrantScopeWhere = () =>
@@ -134,7 +203,67 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 		);
 	};
 
+	const personalInjectionWhere = (opts: {
+		userId: string;
+		collectionId?: string;
+		projectId?: string;
+	}) =>
+		and(
+			eq(knowledgeDrafts.authorUserId, opts.userId),
+			eq(knowledgeDrafts.status, "active"),
+			isNull(knowledgeDrafts.entryId),
+			isNotNull(knowledgeDrafts.keywordsJson),
+			opts.collectionId ? eq(knowledgeDrafts.targetCollectionId, opts.collectionId) : undefined,
+			opts.projectId
+				? or(
+						isNull(knowledgeDrafts.targetCollectionId),
+						inArray(
+							knowledgeDrafts.targetCollectionId,
+							db
+								.select({ id: knowledgeCollections.id })
+								.from(knowledgeCollections)
+								.where(
+									or(
+										eq(knowledgeCollections.projectId, opts.projectId),
+										isNull(knowledgeCollections.projectId),
+									),
+								),
+						),
+					)
+				: undefined,
+		);
+
 	return {
+		async listPersonalEntries(opts) {
+			const { content, ...columns } = getTableColumns(knowledgeDrafts);
+			return db
+				.select({ ...columns, contentLength: sql<number>`length(${content})`.mapWith(Number) })
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.authorUserId, opts.userId),
+						opts.status ? eq(knowledgeDrafts.status, opts.status) : undefined,
+					),
+				)
+				.orderBy(desc(knowledgeDrafts.updatedAt))
+				.limit(Math.max(1, Math.min(opts.limit, 200)));
+		},
+		async getEntryRevisionPointers(ids) {
+			if (!ids.length) return [];
+			return db
+				.select({ id: knowledgeEntries.id, currentRevisionId: knowledgeEntries.currentRevisionId })
+				.from(knowledgeEntries)
+				.where(inArray(knowledgeEntries.id, ids))
+				.limit(200);
+		},
+		async getPersonalEntryById(id) {
+			const rows = await db
+				.select()
+				.from(knowledgeDrafts)
+				.where(eq(knowledgeDrafts.id, id))
+				.limit(1);
+			return rows[0] ?? null;
+		},
 		async getEntryById(entryId) {
 			const rows = await db
 				.select()
@@ -181,12 +310,41 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 		},
 
 		async listEntries(opts) {
+			const after = opts.after;
 			const rows = await db
 				.select(ENTRY_LIST_SELECT)
 				.from(knowledgeEntries)
-				.where(opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined)
-				.orderBy(desc(knowledgeEntries.updatedAt))
+				.where(
+					and(
+						opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+						after
+							? or(
+									lt(knowledgeEntries.updatedAt, after.updatedAt),
+									and(
+										eq(knowledgeEntries.updatedAt, after.updatedAt),
+										lt(knowledgeEntries.id, after.id),
+									),
+								)
+							: undefined,
+					),
+				)
+				.orderBy(desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id))
 				.limit(opts.limit);
+			return rows as KnowledgeEntryListRow[];
+		},
+
+		async listEntriesOrdered(opts) {
+			const { limit, order, ...filter } = opts;
+			const rows = await db
+				.select(ENTRY_LIST_SELECT)
+				.from(knowledgeEntries)
+				.where(entryListWhere(db, filter, order))
+				.orderBy(
+					...(order.sort === "title"
+						? [asc(knowledgeEntries.title), asc(knowledgeEntries.id)]
+						: [desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id)]),
+				)
+				.limit(limit);
 			return rows as KnowledgeEntryListRow[];
 		},
 
@@ -336,6 +494,14 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 				.where(eq(users.id, userId))
 				.limit(1);
 			return rows[0] ?? null;
+		},
+
+		async listUsernamesByIds(userIds) {
+			if (userIds.length === 0) return [];
+			return db
+				.select({ id: users.id, username: users.username })
+				.from(users)
+				.where(inArray(users.id, userIds));
 		},
 
 		async listUserIdsAndRoles(opts) {
@@ -578,6 +744,42 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 				.limit(limit);
 		},
 
+		async findActivePersonalEntryId(entryId, authorUserId) {
+			const rows = await db
+				.select({ id: knowledgeDrafts.id })
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.entryId, entryId),
+						eq(knowledgeDrafts.authorUserId, authorUserId),
+						eq(knowledgeDrafts.status, "active"),
+					),
+				)
+				.limit(1);
+			return rows[0]?.id ?? null;
+		},
+
+		async listActivePersonalEntriesForEntries(entryIds, authorUserId) {
+			if (entryIds.length === 0) return [];
+			const rows = await db
+				.select({
+					id: knowledgeDrafts.id,
+					entryId: knowledgeDrafts.entryId,
+					baseRevisionId: knowledgeDrafts.baseRevisionId,
+				})
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						inArray(knowledgeDrafts.entryId, entryIds),
+						eq(knowledgeDrafts.authorUserId, authorUserId),
+						eq(knowledgeDrafts.status, "active"),
+					),
+				);
+			return rows.flatMap((r) =>
+				r.entryId ? [{ id: r.id, entryId: r.entryId, baseRevisionId: r.baseRevisionId }] : [],
+			);
+		},
+
 		async listKnowledgeAclEventRows(opts) {
 			const conds = [like(aclEvents.scopeType, "knowledge%")];
 			if (opts.eventType) conds.push(eq(aclEvents.eventType, opts.eventType));
@@ -601,6 +803,50 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 				.orderBy(desc(aclEvents.createdAt), desc(aclEvents.id))
 				.limit(opts.limit);
 			return rows as AclEventReadRow[];
+		},
+
+		async listPersonalKeywordInjectionCandidates(opts) {
+			return db
+				.select({
+					id: knowledgeDrafts.id,
+					collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
+					title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
+					currentRevisionId: sql<null>`null`,
+					tagsJson: sql<null>`null`,
+					keywordsJson: knowledgeDrafts.keywordsJson,
+					updatedAt: knowledgeDrafts.updatedAt,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts))
+				.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
+				.limit(opts.limit);
+		},
+		async personalKeywordInjectionSignature(opts) {
+			const rows = await db
+				.select({
+					cnt: sql<number>`count(*)`,
+					maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts));
+			return `${Number(rows[0]?.cnt ?? 0)}:${rows[0]?.maxUpdated ?? ""}`;
+		},
+		async personalInjectionSnippets(userId, ids, maxChars) {
+			if (!ids.length) return [];
+			return db
+				.select({
+					id: knowledgeDrafts.id,
+					snippet: sql<string>`substr(${knowledgeDrafts.content}, 1, ${maxChars})`,
+				})
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.authorUserId, userId),
+						eq(knowledgeDrafts.status, "active"),
+						isNull(knowledgeDrafts.entryId),
+						inArray(knowledgeDrafts.id, ids),
+					),
+				);
 		},
 
 		async listKeywordInjectionCandidates(opts) {
@@ -664,7 +910,10 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 
 		async listInjectedEntryIds(narratorId, compactSeq) {
 			const rows = await db
-				.select({ entryId: knowledgeInjectionEvents.entryId })
+				.select({
+					entryId: knowledgeInjectionEvents.entryId,
+					personalEntryId: knowledgeInjectionEvents.personalEntryId,
+				})
 				.from(knowledgeInjectionEvents)
 				.where(
 					and(
@@ -672,7 +921,9 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 						eq(knowledgeInjectionEvents.compactSeq, compactSeq),
 					),
 				);
-			return rows.map((row) => row.entryId);
+			return rows.map((row) =>
+				row.personalEntryId ? `personal:${row.personalEntryId}` : `global:${row.entryId}`,
+			);
 		},
 	};
 }

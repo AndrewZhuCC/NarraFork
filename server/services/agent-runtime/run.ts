@@ -37,6 +37,7 @@ import {
 	readRuntimeRegistrationColumn,
 } from "../../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { withNarratorStartAdmission, withNarratorWorkAdmission } from "../narrator-session-state";
 import {
@@ -53,7 +54,7 @@ import {
 	setRunHold,
 	tryClaimExecution,
 } from "./ownership";
-import { getRuntimePublicationService, publicationEvent } from "./publication";
+import { getRuntimePublicationService, publicationEvent, runtimePublication } from "./publication";
 import type { PublicationRun } from "./publication-outbox";
 
 export type { RunResult } from "./ownership";
@@ -89,6 +90,14 @@ export interface StartNarratorRunRequest {
 	cancelSignal?: AbortSignal;
 	/** A caller waits for this run's result (foreground delegation). */
 	foreground?: boolean;
+	/** An accepted `/bash` pre-command the run executes before its first model pass. */
+	prePromptBashCommand?: string;
+	/**
+	 * Hooks of a token-scoped recovery start: `check` runs inside the start admission
+	 * and throws when the recovery owner was cancelled or replaced; `onAdmitted` runs
+	 * synchronously with the execution-owner claim.
+	 */
+	admission?: { check(): void; onAdmitted(): void };
 }
 
 export interface RunHandle {
@@ -204,51 +213,64 @@ async function prepareLogicalRun(
 		legacyToolUseId,
 	});
 	// A caller waiting in the foreground receives the result itself, never via a task.
-	if (!req.foreground) await reopenTaskProjection(narratorId, row, deliverTo, publicationRun);
+	// A new run that only inherits a destination which already holds an earlier
+	// result delivers through a task row instead of rewriting that result.
+	const inherited = !(req.binding || req.resumeRunId || req.recovered);
+	if (!req.foreground && (row.isBackground || (inherited && (await settled(deliverTo)))))
+		await projectRunAsTask(narratorId, row, deliverTo, publicationRun, binding);
 	return { binding: publicationRun.binding, publicationRun };
 }
 
+async function settled(deliverTo: RunDeliverTo): Promise<boolean> {
+	if (!deliverTo.toolCallId) return false;
+	const call = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, deliverTo.toolCallId),
+		columns: { status: true },
+	});
+	return call?.status === "success" || call?.status === "fail";
+}
+
 /**
- * A new run of a session whose task row already ended: move the row to this run and
- * back to `running` (compare-and-set on its old status), and the session's background
- * projection with it. A run the row already projects is left alone.
+ * Project a run as a background task: the task card, Await, Stop and the completion
+ * notice all describe the run that is executing, and a destination tool call whose
+ * result an earlier run already delivered is never rewritten. The row is created, or moved to this run and back to `running`; a row
+ * that already projects this run is left alone.
  */
-async function reopenTaskProjection(
+async function projectRunAsTask(
 	narratorId: string,
 	row: RunSource,
 	deliverTo: RunDeliverTo,
 	publicationRun: PublicationRun,
+	binding: RunBindingInput,
 ): Promise<void> {
-	const { backgroundTaskService } = await import("../background-task-service");
-	// A cancelled or restart-interrupted task left the background (isBackground=false):
-	// its next run delivers to the tool call like any other run.
-	if (!row.isBackground) return;
+	const [{ backgroundTaskService }, { registerAndPersistSubagentAlias }] = await Promise.all([
+		import("../background-task-service"),
+		import("../subagent-alias"),
+	]);
 	const task = await backgroundTaskService.getById(narratorId).catch(() => null);
-	if (!task || task.type !== "agent" || task.status === "running") return;
-	if (task.parentNarratorId !== deliverTo.narratorId) return;
-	const now = new Date().toISOString();
-	const restarted = await getRuntimePublicationService().restartAgentTask({
-		taskId: narratorId,
-		logicalRunId: publicationRun.logicalRunId,
-		subagentNarratorId: task.subagentNarratorId ?? narratorId,
-		subagentType: task.subagentType ?? row.subagentType ?? "general",
-		toolUseId: task.toolUseId ?? deliverTo.toolUseId,
-		alias: task.alias ?? undefined,
-		title: task.title ?? row.title ?? undefined,
-		expectedStatus: task.status,
-		now,
+	if (task?.status === "running" && task.logicalRunId === publicationRun.logicalRunId) return;
+	// The id belongs to another caller's task: deliver to the tool call instead.
+	if (task && (task.type !== "agent" || task.parentNarratorId !== deliverTo.narratorId)) return;
+	const alias =
+		task?.alias ??
+		(
+			await registerAndPersistSubagentAlias(
+				deliverTo.narratorId,
+				narratorId,
+				row.title ?? undefined,
+			)
+		).alias;
+	await backgroundTaskService.createAgentTask({
+		id: narratorId,
+		parentNarratorId: deliverTo.narratorId,
+		subagentNarratorId: narratorId,
+		subagentType: task?.subagentType ?? row.subagentType ?? "general",
+		toolUseId: task?.toolUseId ?? deliverTo.toolUseId,
+		alias,
+		title: task?.title ?? row.title ?? undefined,
+		binding,
 	});
-	if (!restarted) return;
-	await db
-		.update(narrators)
-		.set({
-			isBackground: true,
-			backgroundStatus: "running",
-			backgroundResult: null,
-			backgroundCompletedAt: null,
-			updatedAt: now,
-		})
-		.where(eq(narrators.id, narratorId));
+	await backgroundTaskService.markNarratorRunning(narratorId);
 	backgroundTaskService.notifyDerivedStatusChanged(deliverTo.narratorId, narratorId);
 }
 
@@ -289,8 +311,10 @@ async function announceRunToDestination(
 export async function startNarratorRun(req: StartNarratorRunRequest): Promise<RunHandle> {
 	const id = req.narratorId;
 	const launch = await withNarratorStartAdmission(id, async () => {
+		req.admission?.check();
 		const owner = tryClaimExecution(id, "run");
 		if (!owner) return null;
+		req.admission?.onAdmitted();
 		const { promise: terminal, resolve: resolveTerminal } = Promise.withResolvers<RunResult>();
 		const {
 			promise: foreground,
@@ -527,7 +551,14 @@ async function executeRun(
 		const { runAgentLoopUnlocked } = await import("./orchestrator");
 		let outcome: RunOutcome = run.cancel.signal.aborted
 			? { aborted: true }
-			: await runAgentLoopUnlocked(active, owner, req.text, req.images, run);
+			: await runAgentLoopUnlocked(
+					active,
+					owner,
+					req.text,
+					req.images,
+					run,
+					req.prePromptBashCommand,
+				);
 		for (;;) {
 			// The loop's async cleanup may have admitted a hold after its last boundary.
 			// Arbitrate again before claiming terminal delivery, without an intervening await.
@@ -561,7 +592,15 @@ async function executeRun(
 			const input = await sessionModule.prepareQueuedRunInput(active, owner, run);
 			outcome.freshInput = false;
 			// Withdrawn input and terminal control commands do not execute a model pass.
-			if (input) outcome = await runAgentLoopUnlocked(active, owner, input.text, input.images, run);
+			if (input)
+				outcome = await runAgentLoopUnlocked(
+					active,
+					owner,
+					input.text,
+					input.images,
+					run,
+					input.prePromptBashCommand,
+				);
 		}
 		allowInboxWake = outcome.allowInboxWake === true;
 		finished = true;
@@ -660,6 +699,18 @@ interface RunOutcome {
  * destination the run registered. The terminal snapshot and every recipient's intent
  * commit in one short transaction (publication); waking recipients happens after.
  */
+type TerminalEvent = "completed" | "failed" | "timed_out" | "cancelled";
+/** The session's background projection of a terminal event. */
+const backgroundStatusOf = (event: TerminalEvent) =>
+	event === "completed" || event === "cancelled" ? event : "failed";
+/** Why a run with no output of its own was cancelled (caller interrupt, user stop, ...). */
+function cancelReason(signal: AbortSignal): string {
+	const reason = signal.reason instanceof Error ? signal.reason.message : signal.reason;
+	return typeof reason === "string" && reason.trim()
+		? `Interrupted: ${reason}`
+		: "Interrupted because the caller was interrupted";
+}
+
 async function finishRun(
 	id: string,
 	run: RunControl,
@@ -690,7 +741,7 @@ async function finishRun(
 				: outcome.contextLengthExceeded
 					? "Error: context length exceeded"
 					: cancelled && !outcome.finalText?.trim()
-						? "Interrupted because the caller was interrupted"
+						? cancelReason(run.cancel.signal)
 						: outcome.finalText) || "(no output)";
 	const base: RunResult = {
 		started: true,
@@ -760,12 +811,7 @@ async function finishRun(
 							.update(narrators)
 							.set({
 								backgroundResult: finalText,
-								backgroundStatus:
-									eventKind === "completed"
-										? "completed"
-										: eventKind === "cancelled"
-											? "cancelled"
-											: "failed",
+								backgroundStatus: backgroundStatusOf(eventKind),
 								backgroundCompletedAt: new Date().toISOString(),
 								substatus: JSON.stringify([
 									...(outcome.terminalStatus?.substatus ??
@@ -784,6 +830,7 @@ async function finishRun(
 							),
 					{ label: "run.checkpointBackgroundTerminal", maxRetries: 5 },
 				);
+				backgroundOccupancyStore.refreshNarrator(id);
 			}
 		}
 		throw error;
@@ -952,7 +999,7 @@ async function deliverDetachedResult(
 	deliverTo: RunDeliverTo,
 	publicationRun: PublicationRun,
 	terminal: {
-		eventKind: "completed" | "failed" | "timed_out" | "cancelled";
+		eventKind: TerminalEvent;
 		finalText: string;
 		hasError: boolean;
 		/** Execution principal the notice is attributed to. */
@@ -974,14 +1021,11 @@ async function deliverDetachedResult(
 						? await backgroundTaskService.markCancelled(id)
 						: await backgroundTaskService.markFailed(id, finalText);
 		if (transitioned) {
-			await db
-				.update(narrators)
-				.set({
-					backgroundStatus: eventKind === "completed" ? "completed" : "failed",
-					backgroundResult: finalText,
-					backgroundCompletedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, id));
+			await backgroundTaskService.markNarratorTerminal(
+				id,
+				backgroundStatusOf(eventKind),
+				finalText,
+			);
 			getRuntimePublicationService().schedule();
 			return;
 		}
@@ -1028,28 +1072,17 @@ async function deliverDetachedResult(
 		hasError,
 		resultMessageId: await getSubagentResultMessageId(id),
 		refreshTiming: true,
-		...(sqlite
-			? {
-					onPersist: (tx) => {
-						const { runtimePublication } =
-							require("./publication") as typeof import("./publication");
-						runtimePublication.commit(
-							{
-								...publicationRun,
-								eventKind,
-								resultRef: runtimePublication.persistResult(
-									publicationRun,
-									finalText,
-									tx,
-									eventKind,
-								),
-								summary,
-							},
-							tx,
-						);
-					},
-				}
-			: {}),
+		onPersist: (tx) => {
+			runtimePublication.commit(
+				{
+					...publicationRun,
+					eventKind,
+					resultRef: runtimePublication.persistResult(publicationRun, finalText, tx, eventKind),
+					summary,
+				},
+				tx,
+			);
+		},
 	});
 	await backgroundTaskService.announcePersistedAgentTerminal(id, publicationRun.logicalRunId);
 	getRuntimePublicationService().schedule();
@@ -1226,10 +1259,7 @@ async function registerDetachedTask(
 		binding: { deliverTo, cancelWith: undefined },
 	});
 	// The session's background projection follows only a task row that exists.
-	await db
-		.update(narrators)
-		.set({ isBackground: true, backgroundStatus: "running", updatedAt: new Date().toISOString() })
-		.where(eq(narrators.id, narratorId));
+	await backgroundTaskService.markNarratorRunning(narratorId);
 	backgroundTaskService.registerAbortController(narratorId, run.cancel);
 	return (
 		`<background_task_id>${alias}</background_task_id>\n\n` +
@@ -1366,8 +1396,8 @@ async function deliverHeldResult(
 	await clearDeliveredHold(narratorId, hold);
 	await settleStatus(narratorId, deliverTo, {
 		hasError,
-		interrupted: false,
-		timedOut: false,
+		interrupted: hold.result?.interrupted ?? false,
+		timedOut: hold.result?.timedOut ?? false,
 		finalText,
 		terminalStatus: hold.result?.terminalStatus,
 	});

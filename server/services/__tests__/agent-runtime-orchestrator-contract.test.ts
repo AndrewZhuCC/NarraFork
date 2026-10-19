@@ -48,6 +48,7 @@ const {
 type RunControl = import("../agent-runtime/ownership").RunControl;
 const { controlRun, startNarratorRun } = await import("../agent-runtime/run");
 const { activeNarrators } = await import("../narrator-session-state");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { settings } = await import("../../lib/settings");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
 const { acceptUserMessage } = await import("../narrator-session");
@@ -88,8 +89,10 @@ const unregister = provider.registerExternalProviderResolver({
 	listReadiness: () => [],
 });
 const ids = ["contract-parent", "contract-primary", "contract-child"];
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	settings.agent.autoContinuationMode = "off";
 	const now = new Date().toISOString();
 	for (const id of ["principal-a", "principal-b"]) {
@@ -120,15 +123,20 @@ beforeEach(() => {
 				updatedAt: now,
 			})
 			.run();
+	backgroundOccupancyStore.refreshNarrators(ids);
+	await backgroundOccupancyStore.flush();
 });
-afterEach(() => {
+afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
+		backgroundOccupancyStore.setRuntimeLive(id, false);
 	}
+	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
 afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
 	unregister();
 	mock.module("../../db", () => realDb);
 });
@@ -204,6 +212,7 @@ function fixture(
 		executionSegmentId: profile.executionSegmentId,
 	};
 	setRunControl(owner, runControl);
+	backgroundOccupancyStore.setRuntimeLive(id, true);
 	const calls: ExecuteLoopOptions[] = [];
 	spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 		expect(options.config.executionSegmentId).toBe(profile.executionSegmentId);
@@ -289,6 +298,99 @@ describe("Bash Git command detection for status refresh", () => {
 		expect(await isGitCommandToolResult("Bash", { command: "echo git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Bash", { command: "printf git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Write", { command: "git status" }, "/tmp")).toBe(false);
+	});
+});
+
+describe("tool Git status refresh", () => {
+	test("invalidates at the write boundary and shares cached status in the trailing chapter broadcast", async () => {
+		const statusCache = await import("../git-status-cache");
+		const { gitService } = await import("../git-service");
+		const ws = await import("../../websocket/narrator-ws");
+		const repo = join(process.env.HOME as string, "git-track-fixture");
+		statusCache.clearStatusCache();
+		const summary = {
+			hasChanges: true,
+			staged: 0,
+			unstaged: 1,
+			untracked: 0,
+			totalFiles: 1,
+			files: [{ path: "changed.txt", status: " M" }],
+			headSha: "fixture-head",
+			branch: "feature",
+		};
+		const { coordinateGitStatusQuery, getLocalGitStatusQueryKey } = await import(
+			"../git-status-query"
+		);
+		const query = mock(async () => summary);
+		spyOn(gitService, "getStatusSummary").mockImplementation((path, options) =>
+			coordinateGitStatusQuery(getLocalGitStatusQueryKey(path), query, options),
+		);
+		const ahead = spyOn(gitService, "getCommitsAhead").mockResolvedValue({
+			count: 2,
+			baseBranch: "main",
+		});
+		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const cachedRead = spyOn(statusCache, "getStatusSummaryCached");
+		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
+		let verified = false;
+		const h = fixture(profiles[0], [
+			async (options) => {
+				h.session._chapterId = "git-track-chapter";
+				h.session._worktreePath = repo;
+				h.session._baseBranch = "main";
+				const scheduled: Array<() => void> = [];
+				const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+					callback: () => void,
+				) => {
+					scheduled.push(callback);
+					return scheduled.length as unknown as ReturnType<typeof setTimeout>;
+				}) as typeof setTimeout);
+				const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+				try {
+					options.hooks?.onGitTrack?.("Write", "write-1", { file_path: "changed.txt" });
+					expect(invalidate).toHaveBeenCalledTimes(1);
+					options.hooks?.onGitTrack?.("Edit", "write-2", { file_path: "changed.txt" });
+					expect(invalidate).toHaveBeenCalledTimes(2);
+					expect(query).not.toHaveBeenCalled();
+					expect(clear).toHaveBeenCalledTimes(1);
+					expect(scheduled).toHaveLength(2);
+				} finally {
+					timer.mockRestore();
+					clear.mockRestore();
+				}
+
+				// A directory subscriber already refreshed after the latest write.
+				await statusCache.getStatusSummaryCached(repo);
+				expect(query).toHaveBeenCalledTimes(1);
+				cachedRead.mockClear();
+				scheduled[1]();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(invalidate).toHaveBeenCalledTimes(2);
+				expect(query).toHaveBeenCalledTimes(1);
+				expect(cachedRead).toHaveBeenCalledWith(repo);
+				expect(ahead).toHaveBeenCalledWith(repo, "main");
+				expect(
+					broadcast.mock.calls.some(
+						([, message]) =>
+							message.type === "git_status" &&
+							message.toolUseId === "write-2" &&
+							message.chapterId === "git-track-chapter" &&
+							message.commitsAhead === 2 &&
+							message.baseBranch === "main" &&
+							!("files" in message.status),
+					),
+				).toBe(true);
+				verified = true;
+				return { ...finished };
+			},
+		]);
+		try {
+			await h.run();
+			expect(h.calls).toHaveLength(1);
+			expect(verified).toBe(true);
+		} finally {
+			statusCache.clearStatusCache();
+		}
 	});
 });
 
@@ -520,6 +622,8 @@ describe("real shared orchestrator profile contract", () => {
 			.where(eq(narrators.id, "contract-child"))
 			.run();
 		let systemPrompt = "";
+		backgroundOccupancyStore.refreshNarrator("contract-child");
+		await backgroundOccupancyStore.flush();
 		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 			systemPrompt = options.config.systemPrompt ?? "";
 			expect(systemPrompt).toContain(summary);
@@ -574,6 +678,8 @@ describe("real shared orchestrator profile contract", () => {
 				.set({ contextSummary: "cached", contextSummaryChars: 6 })
 				.where(eq(narrators.id, h.session.narratorId))
 				.run();
+			backgroundOccupancyStore.refreshNarrator(h.session.narratorId);
+			await backgroundOccupancyStore.flush();
 			expect((await h.run()).hasError).toBe(false);
 		});
 
@@ -603,6 +709,8 @@ describe("real shared orchestrator profile contract", () => {
 				.set({ contextSummary: summary, contextSummaryChars: 0 })
 				.where(eq(narrators.id, h.session.narratorId))
 				.run();
+			backgroundOccupancyStore.refreshNarrator(h.session.narratorId);
+			await backgroundOccupancyStore.flush();
 			expect((await h.run()).hasError).toBe(false);
 		});
 

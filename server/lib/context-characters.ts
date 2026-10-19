@@ -119,7 +119,14 @@ export function measureMessageCharacters(
 					);
 					break;
 				case "thinking":
-					add(category, block.thinking ?? block.text);
+					add("reasoning", block.thinking ?? block.text);
+					break;
+				case "reasoning":
+				case "reasoning_text":
+				case "thought":
+					// Stored thinking is normalized to `reasoning` blocks; its text stays
+					// under `text`, never under the summary field used on the wire.
+					add("reasoning", block.modelText ?? block.text);
 					break;
 				default:
 					add(category, block.modelText ?? block.text);

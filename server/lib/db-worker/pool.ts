@@ -27,9 +27,9 @@
  */
 
 import { cpus } from "node:os";
+import { compiledWorkerSpecifiers } from "../compiled-worker";
 import { hotOnce, hotSafe, hotTimerClear } from "../hot-safe";
 import { logger } from "../logger";
-import { isCompiledRuntime } from "../runtime-target";
 import {
 	DB_WORKER_PROBE_READY_TIMEOUT_MS,
 	DB_WORKER_READY_TIMEOUT_MS,
@@ -160,37 +160,17 @@ function state(): PoolState {
 	}));
 }
 
-/**
- * Candidate paths for the worker entry inside a compiled binary's virtual filesystem.
- *
- * Three non-obvious facts, all verified against real compiled binaries:
- *   1. In a compiled binary EVERY module reports the binary itself as `import.meta.url`
- *      (`file:///$bunfs/root/narrafork`), so resolving `./worker-entry.js` relatively yields
- *      `$bunfs/root/worker-entry.js` — which does not exist, and `new Worker` then fails
- *      asynchronously with ModuleNotFound.
- *   2. The bundler embeds each additional entry point at its path RELATIVE TO the main entry's
- *      directory, with the extension rewritten to `.js`. For the production entry
- *      (`server/index.ts`) that is `lib/db-worker/worker-entry.js`; for a probe or test harness
- *      outside `server/` it becomes `server/lib/db-worker/worker-entry.js`.
- *   3. Because the layout therefore depends on which entry point was compiled, a single hard-coded
- *      path is fragile. We try the known shapes in order and remember the one that works.
- *
- * Keep in sync with the extra entry point in scripts/build-cross-platform.ts.
- */
-const COMPILED_WORKER_PATHS = [
-	"./lib/db-worker/worker-entry.js",
-	"./server/lib/db-worker/worker-entry.js",
-	"./worker-entry.js",
-];
-
-/** Specifiers to try, most likely first. Dev has exactly one; compiled has several candidates. */
+/** Specifiers to try, most likely first. Dev has exactly one; compiled probes every layout. */
 function workerSpecifierCandidates(): string[] {
 	const s = state();
 	if (s.testSpecifiers) return s.testSpecifiers;
-	if (!isCompiledRuntime()) return [new URL("./worker-entry.ts", import.meta.url).href];
 	// Once a candidate has produced a working worker, stop probing the others.
 	if (s.resolvedWorkerSpecifier) return [s.resolvedWorkerSpecifier];
-	return COMPILED_WORKER_PATHS.map((path) => new URL(path, import.meta.url).href);
+	return compiledWorkerSpecifiers(
+		"lib/db-worker/worker-entry.ts",
+		"./worker-entry.ts",
+		import.meta.url,
+	);
 }
 
 export function getConfiguredConcurrency(): number {
@@ -324,6 +304,8 @@ function awaitReady(pooled: PooledWorker, timeoutMs: number): Promise<void> {
 
 /** Start a worker from one specific specifier. Its ready signal settles on the ready/error event. */
 function spawnWorkerFrom(specifier: string): PooledWorker {
+	// The global Worker accepts file: hrefs. node:worker_threads does not; those call sites
+	// pass workerEntryFromSpecifier instead.
 	const worker = new Worker(specifier);
 	const pooled: PooledWorker = {
 		worker,
@@ -373,7 +355,7 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
  * Spawn a ready worker, probing candidate specifiers until one works.
  *
  * Probing exists because the embedded worker path in a compiled binary depends on which entry point
- * was compiled (see COMPILED_WORKER_PATHS). The winning specifier is cached, so this costs at most
+ * was compiled (see compiledWorkerSpecifiers). The winning specifier is cached, so this costs at most
  * one round of failed spawns per process.
  *
  * The last candidate is not a probe: once every other shape has been ruled out, a slow-but-correct
@@ -708,6 +690,112 @@ export class WorkersUnavailableError extends Error {
 		super(`database read workers unavailable: ${reason}`);
 		this.name = "WorkersUnavailableError";
 	}
+}
+
+/**
+ * Run one task on a freshly spawned worker, then terminate it.
+ *
+ * Ignores the pool's disabled flag. The storage scan uses this when the shared pool cannot take
+ * the work, so a disabled pool does not fall back to a synchronous scan on the server thread.
+ * It must not be used while VACUUM has shut the pool down to clear readers.
+ */
+export async function runEphemeralReadTask<T>(
+	dbPath: string,
+	params: DbReadTaskParams,
+	options: RunReadTaskOptions = {},
+): Promise<T> {
+	const specifiers = workerSpecifierCandidates();
+	let lastError: Error | null = null;
+	for (const specifier of specifiers) {
+		try {
+			return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options);
+		} catch (err) {
+			if (options.signal?.aborted) throw err;
+			lastError = err instanceof Error ? err : new Error(String(err));
+		}
+	}
+	throw lastError ?? new WorkersUnavailableError("ephemeral_spawn_failed");
+}
+
+function runEphemeralOnSpecifier<T>(
+	specifier: string,
+	dbPath: string,
+	params: DbReadTaskParams,
+	options: RunReadTaskOptions,
+): Promise<T> {
+	const requestId = `ephemeral-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	const timeoutMs = options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
+	return new Promise<T>((resolve, reject) => {
+		const worker = new Worker(specifier);
+		let settled = false;
+		let ready = false;
+		const finish = (error?: Error, result?: T) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", onAbort);
+			try {
+				worker.terminate();
+			} catch {
+				// best effort
+			}
+			if (error) reject(error);
+			else resolve(result as T);
+		};
+		const onAbort = () => {
+			try {
+				worker.postMessage({ type: "cancel", requestId });
+			} catch {
+				// The worker is already gone.
+			}
+			finish(new Error("database read task aborted"));
+		};
+		const timer = setTimeout(
+			() => finish(new Error(`database read task timed out after ${timeoutMs}ms`)),
+			timeoutMs,
+		);
+		if (options.signal) {
+			if (options.signal.aborted) {
+				finish(new Error("database read task aborted"));
+				return;
+			}
+			options.signal.addEventListener("abort", onAbort, { once: true });
+		}
+		worker.onerror = (event: ErrorEvent) => {
+			finish(new Error(event?.message ?? "database worker failed to start"));
+		};
+		worker.onmessage = (event: MessageEvent<DbWorkerOutbound>) => {
+			const message = event.data;
+			if (!ready) {
+				if (message?.type !== "ready") {
+					finish(new Error("database worker sent no ready handshake"));
+					return;
+				}
+				ready = true;
+				try {
+					worker.postMessage({ type: "task", requestId, dbPath, params });
+				} catch (err) {
+					finish(err instanceof Error ? err : new Error(String(err)));
+				}
+				return;
+			}
+			if (message?.type === "progress") {
+				options.onProgress?.({
+					tableName: message.tableName,
+					done: message.done,
+					total: message.total,
+				});
+				return;
+			}
+			if (message?.type === "result" && message.requestId === requestId) {
+				finish(undefined, message.result as T);
+				return;
+			}
+			if (message?.type === "error" && message.requestId === requestId) {
+				finish(new Error(message.message || "database worker failed"));
+			}
+		};
+	});
 }
 
 /**

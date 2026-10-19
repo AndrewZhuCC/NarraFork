@@ -1,5 +1,11 @@
-import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect } from "react";
+import {
+	type QueryClient,
+	skipToken,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { CurrentDiffView } from "../../server/services/git-current-diff-view";
 import type {
 	FileChangeActorKind,
@@ -11,7 +17,9 @@ import {
 	type GitCommitDetail,
 	type GitCommitPatch,
 } from "../../shared/git-commit-preview";
+import type { GitLineStats } from "../../shared/git-line-stats";
 import type { GitWorkspaceSummary } from "../../shared/git-workspace";
+import type { GitWorkspaceSnapshot, GitWorkspaceView } from "../../shared/git-workspace-events";
 import { type ApiError, api } from "../lib/api";
 import {
 	type GitLogEntry,
@@ -20,7 +28,11 @@ import {
 	gitBasePath,
 	gitTargetKey,
 } from "../lib/api/git";
-import { GitWorkspaceSubscriptions } from "../lib/git-workspace-subscription";
+import {
+	GitWorkspaceSubscriptions,
+	gitFactKey,
+	gitSnapshotKey,
+} from "../lib/git-workspace-subscription";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
 import { observePageLifecycle } from "../lib/page-lifecycle";
 import { useNarrator } from "./useNarrator";
@@ -35,7 +47,7 @@ export type { GitLogEntry, GitTarget, GitWorkspace } from "../lib/api/git";
 
 // Types
 export interface GitStatusSummary {
-	/** The executor reached its output budget; counts may be lower bounds. */
+	/** The file list is incomplete; totalFilesExact separately indicates scan completeness. */
 	truncated?: boolean;
 	hasChanges: boolean;
 	staged: number;
@@ -45,19 +57,21 @@ export interface GitStatusSummary {
 		/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
 		status: string;
 		path: string;
-		linesAdded: number;
-		linesRemoved: number;
-		stagedLinesAdded: number;
-		stagedLinesRemoved: number;
-		unstagedLinesAdded: number;
-		unstagedLinesRemoved: number;
+		linesAdded?: number;
+		linesRemoved?: number;
+		stagedLinesAdded?: number;
+		stagedLinesRemoved?: number;
+		unstagedLinesAdded?: number;
+		unstagedLinesRemoved?: number;
 	}>;
 	/** Total changed files (may exceed files.length when capped server-side). */
 	totalFiles: number;
+	/** False means the scan stopped early; undefined preserves older responses. */
+	totalFilesExact?: boolean;
 	headSha: string;
 	branch: string;
-	linesAdded: number;
-	linesRemoved: number;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 export interface GitStashEntry {
@@ -137,6 +151,8 @@ const GIT_QUERY_GC_TIME_MS = 60_000;
 const GIT_WORKSPACE_RECOVERY_INTERVAL_MS = 30_000;
 export const GIT_FACT_QUERIES = [
 	"gitStatus",
+	"gitLineStats",
+	"gitWorkspaceSnapshot",
 	"gitModifications",
 	"gitDiff",
 	"gitLog",
@@ -173,27 +189,58 @@ export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace)
 }
 
 const gitWorkspaceSubscriptions = new WeakMap<QueryClient, GitWorkspaceSubscriptions>();
+// One-shot explicit refresh flags. Ordinary HTTP fallback keeps the server's short cache.
+const freshGitReads = new WeakMap<QueryClient, Set<string>>();
+function requestFreshGitRead(qc: QueryClient, key: string | undefined, kind: string) {
+	let reads = freshGitReads.get(qc);
+	if (!reads) {
+		reads = new Set();
+		freshGitReads.set(qc, reads);
+	}
+	reads.add(JSON.stringify([key, kind]));
+}
+function takeFreshGitRead(qc: QueryClient, key: string | undefined, kind: string) {
+	return freshGitReads.get(qc)?.delete(JSON.stringify([key, kind])) ?? false;
+}
 
-/** The panel owns the subscription, not individual status/diff observers. */
-export function useGitWorkspaceSubscription(target: GitTarget) {
-	const qc = useQueryClient();
-	const chapterId = typeof target === "string" ? target : undefined;
-	const narratorId = typeof target === "string" ? undefined : target.narratorId;
+function workspaceSubscriptions(qc: QueryClient) {
+	let subscriptions = gitWorkspaceSubscriptions.get(qc);
+	if (!subscriptions) {
+		subscriptions = new GitWorkspaceSubscriptions(qc, narratorWSManager, undefined, (target) => {
+			if (typeof target === "string") return;
+			blockGitSummary(qc, target.narratorId);
+			void qc.cancelQueries({ queryKey: ["gitWorkspace", target.narratorId] });
+			qc.setQueriesData<GitWorkspace>(
+				{ queryKey: ["gitWorkspace", target.narratorId] },
+				(workspace) =>
+					workspace
+						? { ...workspace, state: "access_denied", capabilities: { read: false, write: false } }
+						: undefined,
+			);
+		});
+		gitWorkspaceSubscriptions.set(qc, subscriptions);
+	}
+	return subscriptions;
+}
+
+/** All consumers share a subscription; opening a panel upgrades its projection. */
+export function useGitWorkspaceSubscription(
+	target: GitTarget | null | undefined,
+	view: GitWorkspaceView = "details",
+) {
+	const subscriptions = workspaceSubscriptions(useQueryClient());
+	const chapterId = typeof target === "string" ? target : target?.chapterId;
+	const narratorId = typeof target === "string" ? undefined : target?.narratorId;
 	const workspaceKey = gitTargetKey(target);
+	useSyncExternalStore(subscriptions.watch, subscriptions.getRevision, subscriptions.getRevision);
 	useEffect(() => {
-		let subscriptions = gitWorkspaceSubscriptions.get(qc);
-		if (!subscriptions) {
-			subscriptions = new GitWorkspaceSubscriptions(qc, narratorWSManager);
-			gitWorkspaceSubscriptions.set(qc, subscriptions);
-		}
+		if (!workspaceKey) return;
 		return subscriptions.subscribe(
-			chapterId ?? {
-				narratorId: narratorId as string,
-				workspaceKey: workspaceKey as string,
-				canWrite: false,
-			},
+			narratorId ? { narratorId, workspaceKey, chapterId, canWrite: false } : workspaceKey,
+			view,
 		);
-	}, [qc, chapterId, narratorId, workspaceKey]);
+	}, [subscriptions, chapterId, narratorId, workspaceKey, view]);
+	return subscriptions;
 }
 
 // One permission subscription per QueryClient, shared by all mounted workspace consumers.
@@ -201,7 +248,10 @@ const deniedGitSummaries = new WeakMap<QueryClient, Set<string>>();
 // Presentation summaries may paint immediately, but can never become Git API targets.
 const gitSummarySeeds = new WeakSet<GitWorkspace>();
 const gitDetailSummaryScopes = new WeakMap<GitWorkspaceSummary, string>();
-export type GitDisplayCounts = Pick<GitStatusSummary, "totalFiles" | "linesAdded" | "linesRemoved">;
+export type GitDisplayCounts = Pick<
+	GitStatusSummary,
+	"totalFiles" | "totalFilesExact" | "truncated" | "linesAdded" | "linesRemoved"
+>;
 interface GitDisplaySnapshot {
 	scope: string;
 	workspace: GitWorkspace;
@@ -348,20 +398,22 @@ async function readWorkspace<T>(
 	qc: QueryClient,
 	target: GitTarget | null | undefined,
 	read: () => Promise<T>,
+	reprobeUnavailable = true,
 ): Promise<T> {
 	try {
 		return await read();
 	} catch (error) {
 		const failure = error as ApiError;
-		// An older executor missing preview operations is not a workspace change.
-		// Re-probing here would unmount/reopen its consumer and repeat the same 409.
-		const unsupportedPreview =
-			failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED;
+		// An older executor missing an optional read is not a workspace change.
+		// Re-probing would unmount/reopen its consumer and repeat the same failure.
+		const unsupportedOperation =
+			(failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED) ||
+			failure?.data?.code === "GIT_LINE_STATS_UNSUPPORTED";
 		if (
 			target &&
 			typeof target !== "string" &&
-			!unsupportedPreview &&
-			[401, 403, 409, 503].includes(failure?.status)
+			!unsupportedOperation &&
+			([401, 403, 409].includes(failure?.status) || (reprobeUnavailable && failure?.status === 503))
 		) {
 			if ([401, 403].includes(failure.status)) blockGitSummary(qc, target.narratorId);
 			void qc.cancelQueries({ queryKey: ["narrators", target.narratorId], exact: true });
@@ -535,8 +587,8 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 			if (!narratorId || !data || accessFailure || denied) return;
 			storeGitDisplay(qc, narratorId, scope, data, {
 				totalFiles: counts.totalFiles,
-				linesAdded: counts.linesAdded,
-				linesRemoved: counts.linesRemoved,
+				totalFilesExact: counts.totalFilesExact,
+				truncated: counts.truncated,
 			});
 		},
 		[qc, narratorId, scope, data, accessFailure, denied],
@@ -561,8 +613,16 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 export function invalidateWorkspaceQueries(
 	qc: ReturnType<typeof useQueryClient>,
 	target: GitTarget,
+	manual = true,
 ): void {
-	gitWorkspaceSubscriptions.get(qc)?.retry(target);
+	const subscriptions = gitWorkspaceSubscriptions.get(qc);
+	if (subscriptions && !subscriptions.isVisible()) return;
+	const pushed = manual
+		? subscriptions?.refresh(target)
+		: subscriptions?.owns(gitTargetKey(target) as string);
+	if (manual && !pushed) {
+		for (const kind of ["status", "lineStats"]) requestFreshGitRead(qc, gitTargetKey(target), kind);
+	}
 	const keys = new Set([gitTargetKey(target)]);
 	const workspaces = qc
 		.getQueriesData<GitWorkspace>({ queryKey: ["gitWorkspace"] })
@@ -587,7 +647,14 @@ export function invalidateWorkspaceQueries(
 		}
 	}
 	for (const key of keys) {
-		for (const prefix of GIT_FACT_QUERIES) qc.invalidateQueries({ queryKey: [prefix, key] });
+		for (const prefix of GIT_FACT_QUERIES) {
+			if (
+				prefix === "gitWorkspaceSnapshot" ||
+				(pushed && ["gitStatus", "gitLineStats"].includes(prefix))
+			)
+				continue;
+			qc.invalidateQueries({ queryKey: [prefix, key] });
+		}
 	}
 	// Re-probe after success AND failure: remote writes may have completed before disconnecting.
 	if (typeof target !== "string")
@@ -615,21 +682,106 @@ export function invalidateGitStatusPushQueries(
 		if (workspace?.chapterId) keys.add(workspace.chapterId);
 	}
 	for (const key of keys) {
-		for (const prefix of GIT_LIVE_FACT_QUERIES)
+		for (const prefix of GIT_LIVE_FACT_QUERIES) {
+			if (
+				prefix === "gitWorkspaceSnapshot" ||
+				(gitWorkspaceSubscriptions.get(qc)?.owns(key) &&
+					["gitStatus", "gitLineStats"].includes(prefix))
+			)
+				continue;
 			void qc.invalidateQueries({ queryKey: [prefix, key] });
+		}
 	}
 }
 
-export function useGitStatus(target: GitTarget | undefined | null) {
+type GitProjection<T, V extends GitWorkspaceView> = V extends "summary" ? Omit<T, "files"> : T;
+
+function useGitFact<T>(
+	target: GitTarget | null | undefined,
+	view: GitWorkspaceView,
+	kind: "status" | "lineStats",
+	read: (target: GitTarget, signal: AbortSignal, fresh: boolean) => Promise<T>,
+) {
 	const qc = useQueryClient();
-	return useQuery<GitStatusSummary>({
-		queryKey: ["gitStatus", gitTargetKey(target)],
+	const subscriptions = useGitWorkspaceSubscription(target, view);
+	const key = gitTargetKey(target);
+	const pushed = !!target && subscriptions.isPush(target);
+	const denied = !!target && subscriptions.isDenied(target);
+	const snapshot = useQuery<GitWorkspaceSnapshot>({
+		queryKey: gitSnapshotKey(key, view),
+		queryFn: skipToken,
+		enabled: false,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+	});
+	const query = useQuery<T>({
+		// HTTP returns a complete details response, so summary + panel share that read too.
+		queryKey: gitFactKey(
+			kind === "status" ? "gitStatus" : "gitLineStats",
+			key,
+			pushed ? view : "details",
+		),
 		queryFn: ({ signal }) =>
-			readWorkspace(qc, target, () => api.getGitStatus(target as GitTarget, signal)),
-		enabled: !!target,
+			readWorkspace(
+				qc,
+				target,
+				() => read(target as GitTarget, signal, takeFreshGitRead(qc, key, kind)),
+				kind === "status",
+			),
+		enabled: !!target && !denied && !pushed && subscriptions.isVisible(),
+		staleTime: 5_000,
+		refetchOnWindowFocus: false,
+		refetchOnReconnect: false,
 		retry: false,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
+	const code = denied
+		? "access_denied"
+		: pushed
+			? snapshot.data?.[kind === "status" ? "statusError" : "lineStatsError"]
+			: undefined;
+	const error = code ? Object.assign(new Error(code), { data: { code } }) : query.error;
+	const data = denied ? undefined : query.data;
+	const updating = !!target && !denied && pushed && (!snapshot.data || snapshot.data.updating);
+	return {
+		...query,
+		data,
+		error,
+		isError: !!error,
+		isFetching: query.isFetching || updating,
+		isLoading: !data && !error && (query.isLoading || updating),
+		updating,
+		refetch: () => {
+			if (target && subscriptions.refresh(target))
+				return Promise.resolve({ ...query, data, error });
+			requestFreshGitRead(qc, key, kind);
+			return query.refetch();
+		},
+	};
+}
+
+export function useGitLineStats<V extends GitWorkspaceView = "details">(
+	target: GitTarget | undefined | null,
+	view: V = "details" as V,
+) {
+	return useGitFact<GitProjection<GitLineStats, V>>(
+		target,
+		view,
+		"lineStats",
+		(target, signal, fresh) =>
+			api.getGitLineStats(target, signal, fresh) as Promise<GitProjection<GitLineStats, V>>,
+	);
+}
+
+export function useGitStatus<V extends GitWorkspaceView = "details">(
+	target: GitTarget | undefined | null,
+	view: V = "details" as V,
+) {
+	return useGitFact<GitProjection<GitStatusSummary, V>>(
+		target,
+		view,
+		"status",
+		(target, signal, fresh) => api.getGitStatus(target, signal, fresh),
+	);
 }
 
 /**
@@ -642,26 +794,8 @@ export function useGitStatus(target: GitTarget | undefined | null) {
 const GIT_BADGE_REFRESH_MIN_INTERVAL_MS = 2_000;
 
 /**
- * Foreground/reconnect catch-up for the git status badges (ChapterBar /
- * NarratorGitBar). Mounted ONCE at the app shell, not per bar.
- *
- * The badge queries (`gitStatus`, `chapterGitStatus`) are normally kept fresh by
- * server pushes routed over the narrator WS. Two gaps leave them stale:
- *
- * - **Window focus without a visibility change.** React Query's focus manager
- *   only listens to `visibilitychange`; clicking between two visible windows
- *   (or Alt-Tab on a WM that keeps the window "visible") fires no such event,
- *   so the built-in `refetchOnWindowFocus` never triggers.
- * - **WS reconnect.** Pushes sent while the socket was down are lost, and the
- *   server-side git workspace subscription only exists while the Git PANEL is
- *   open (`useGitWorkspaceSubscription`) — a bar without the panel has no
- *   catch-up of its own, so the badge would keep pre-disconnect numbers
- *   indefinitely.
- *
- * `invalidateQueries` refetches active observers only, so an app showing no
- * badge pays nothing. Deliberately limited to the two badge queries: the open
- * Git panel already gets its facts re-invalidated by the `git_workspace_subscribed`
- * snapshot that follows its resubscribe on reconnect.
+ * App-shell catch-up for legacy consumers and disconnected HTTP fallback only.
+ * Subscribed statistics recover through snapshots, never ACK/focus/reconnect GETs.
  */
 export function useGitBadgeRefresh() {
 	const qc = useQueryClient();
@@ -671,7 +805,12 @@ export function useGitBadgeRefresh() {
 			const now = Date.now();
 			if (now - lastRefreshAt < GIT_BADGE_REFRESH_MIN_INTERVAL_MS) return;
 			lastRefreshAt = now;
-			void qc.invalidateQueries({ queryKey: ["gitStatus"] });
+			if (gitWorkspaceSubscriptions.get(qc)?.isVisible() === false) return;
+			for (const prefix of ["gitStatus", "gitLineStats"])
+				void qc.invalidateQueries({
+					queryKey: [prefix],
+					predicate: (query) => !gitWorkspaceSubscriptions.get(qc)?.owns(String(query.queryKey[1])),
+				});
 			void qc.invalidateQueries({ queryKey: ["chapterGitStatus"] });
 		};
 		const unobserve = observePageLifecycle({ onForeground: refresh });
@@ -806,7 +945,7 @@ function useGitMutation<T, R>(target: GitTarget, run: (value: T) => Promise<R>, 
 		mutationFn: run,
 		retry: false,
 		onSettled: () => {
-			invalidateWorkspaceQueries(qc, target);
+			invalidateWorkspaceQueries(qc, target, false);
 			if (graph) qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});

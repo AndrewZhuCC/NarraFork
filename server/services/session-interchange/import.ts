@@ -57,6 +57,7 @@ import {
 	delegationRegistration,
 	parseRuntimeRegistration,
 } from "../../lib/validators/runtime-registration";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import { compileDelegationCeiling } from "../custom-subagent-service";
 import { bumpNarratorMessageVersion } from "../narrator-persistence";
 import { dbTransactionWithSeqFloor } from "../narrator-refs/seq-floor-tx";
@@ -479,6 +480,7 @@ function createImportedSubagent(input: {
 			updatedAt: now,
 		})
 		.run();
+	backgroundOccupancyStore.refreshNarrator(id);
 	return id;
 }
 

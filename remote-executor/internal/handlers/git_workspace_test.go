@@ -380,7 +380,13 @@ func TestGitWorkspaceDisableShellReadFilters(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, ".gitattributes"), []byte("tracked filter=payload\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(tracked, []byte("modified content\n"), 0600); err != nil {
+			// A size change lets lightweight porcelain mark the path dirty without
+			// hashing it. Keep the same size to exercise a real clean filter in status.
+			if err := os.WriteFile(tracked, []byte("changed\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			changedTime := time.Now().Add(2 * time.Second)
+			if err := os.Chtimes(tracked, changedTime, changedTime); err != nil {
 				t.Fatal(err)
 			}
 			params := map[string]any{"cwd": root, "expectedRoot": root, "operation": operation}

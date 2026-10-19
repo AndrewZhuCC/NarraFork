@@ -51,7 +51,6 @@ function legacyCollectSessionAggregateStats(
 			messages: 0,
 			toolCalls: 0,
 			apiRequests: 0,
-			dumpsCleared: 0,
 			approxBytes: 0,
 		};
 	}
@@ -85,16 +84,6 @@ function legacyCollectSessionAggregateStats(
 			approxBytes += sumTableApproxBytes(sqlite, relation.tableName, relation.alias, fromClause);
 			if (relation.countAs === "toolCalls") toolCalls += count;
 			else if (relation.countAs === "apiRequests") apiRequests += count;
-		}
-
-		let dumpsCleared = 0;
-		if (tableExists(sqlite, "api_requests")) {
-			dumpsCleared = countQuery(
-				sqlite,
-				`FROM api_requests ar
-				 JOIN ${narratorTable} target_n ON target_n.id = ar.narrator_id
-				 WHERE ar.raw_dump_json IS NOT NULL`,
-			);
 		}
 
 		if (tableExists(sqlite, "background_tasks")) {
@@ -136,7 +125,7 @@ function legacyCollectSessionAggregateStats(
 			);
 		}
 
-		return { narrators, messages, toolCalls, apiRequests, dumpsCleared, approxBytes };
+		return { narrators, messages, toolCalls, apiRequests, approxBytes };
 	});
 }
 
@@ -292,17 +281,14 @@ describe("collectSessionAggregateStats", () => {
 			messages: 0,
 			toolCalls: 0,
 			apiRequests: 0,
-			dumpsCleared: 0,
 			approxBytes: 0,
 		});
 	});
 
-	test("counts only api_requests rows that still hold a dump", () => {
+	test("counts every api_requests row of the target sessions", () => {
 		const targets = ["n0", "n1", "n2", "n3"];
 		const stats = collectSessionAggregateStats(db, targets, RELATIONS);
 		expect(stats.apiRequests).toBe(4);
-		// Even-indexed narrators got a dump payload.
-		expect(stats.dumpsCleared).toBe(2);
 	});
 
 	/**

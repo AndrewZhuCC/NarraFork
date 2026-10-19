@@ -55,7 +55,7 @@ const KNOWLEDGE_TOOL_MAP_HINT =
 export const knowledgeSearchTool: ToolDefinition = {
 	name: "KnowledgeSearch",
 	description:
-		"Search the project knowledge base (full-text + tag). Returns matching entries (id, title, snippet, tags) that the current user is allowed to read. By default this reflects YOUR personal library: entries you have an active personal version of are matched and shown from it (marked '(personal)'; '(personal ⚠ behind main)' when it has drifted behind the latest global version). Pass useDraft:false to search only the committed global versions. Use this to find documented errors, procedures, FAQs, and reference material before answering or acting. Then use KnowledgeRead to fetch an entry's full content by id.",
+		"Search the project knowledge base (full-text + tag). Returns matching entries (id, title, snippet, tags) that the current user is allowed to read. By default this reflects YOUR personal library: entries you have an active personal version of are matched and shown from it (marked '(personal)'; '(personal ⚠ behind main)' when it has drifted behind the latest global version). Pass useDraft:false to search only the committed global versions. Use this to find documented errors, procedures, FAQs, and reference material before answering or acting. Standalone personal entries are included even before publication; use their personalEntryId with KnowledgeRead. For global or linked entries use entryId to fetch full content.",
 	parameters: z.object({
 		query: z
 			.string()
@@ -89,8 +89,18 @@ export const knowledgeSearchTool: ToolDefinition = {
 				projectId: ctx.projectId ?? undefined,
 				limit: normalizeNumber(limit, { min: 1, max: 30, fallback: 10 }),
 				draftUserId,
+				includeStandalone: !!draftUserId,
 			});
-			const readable = await knowledgeService.filterReadable(principal, results);
+			// Standalone hits are owner-scoped in the database. Global/linked hits still
+			// require the normal dual-axis ACL; a personal copy never bypasses it.
+			const globalReadable = await knowledgeService.filterReadable(
+				principal,
+				results.filter((row) => !row.personalEntryId),
+			);
+			const readableIds = new Set(globalReadable.map((row) => row.id));
+			const readable = results.filter(
+				(row) => (!!draftUserId && !!row.personalEntryId) || readableIds.has(row.id),
+			);
 			if (readable.length === 0) {
 				return {
 					output: `No matching knowledge entries found.\n\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
@@ -104,10 +114,10 @@ export const knowledgeSearchTool: ToolDefinition = {
 						? " (personal ⚠ behind main — rebase before relying on it, or re-query with useDraft:false to see the global version)"
 						: " (personal)"
 					: "";
-				return `- [${r.id}] ${r.title}${draftMark}${r.tags?.length ? ` (tags: ${r.tags.join(", ")})` : ""}\n  ${r.snippet ?? ""}`;
+				return `- [${r.personalEntryId ? `personalEntryId: ${r.personalEntryId}` : r.id}] ${r.title}${draftMark}${r.tags?.length ? ` (tags: ${r.tags.join(", ")})` : ""}\n  ${r.snippet ?? ""}`;
 			});
 			return {
-				output: `Found ${readable.length} entr${readable.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\nUse KnowledgeRead with an id to read full content.\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
+				output: `Found ${readable.length} entr${readable.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\nUse KnowledgeRead with entryId for global/linked results, or personalEntryId for standalone results, to read full content.\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
 				title: `KnowledgeSearch: ${query}`,
 				metadata: {
 					tool: "KnowledgeSearch",
@@ -117,6 +127,7 @@ export const knowledgeSearchTool: ToolDefinition = {
 						const row = r as { fromDraft?: boolean; drifted?: boolean };
 						return {
 							id: r.id,
+							...(r.personalEntryId ? { personalEntryId: r.personalEntryId } : {}),
 							title: r.title,
 							snippet: r.snippet ?? "",
 							tags: r.tags ?? [],
@@ -149,9 +160,18 @@ function knowledgeReadLogId(value: string): string {
 export const knowledgeReadTool: ToolDefinition = {
 	name: "KnowledgeRead",
 	description:
-		"Read the full content of a knowledge-base entry by id (from KnowledgeSearch). By default, if YOU have an active personal version of the entry that is up to date with main, its content is returned (your working copy). If your personal version has DRIFTED behind the latest main, the current global version is returned instead, with a diff and a hint to rebase via KnowledgeEdit. Pass useDraft:false to always read the committed global version. Access is checked against the current user's clearance and tags; entries you cannot access return as not found.",
+		"Read knowledge by exactly one of entryId (global entry) or personalEntryId (your personal entry from KnowledgeSearch/KnowledgeLibrary, including unpublished standalone entries). Publication is never required for personal reads. personalEntryId returns that exact personal version and cannot be combined with useDraft:false. By default, if YOU have an active personal version of the entry that is up to date with main, its content is returned (your working copy). If your personal version has DRIFTED behind the latest main, the current global version is returned instead, with a diff and a hint to rebase via KnowledgeEdit. Pass useDraft:false to always read the committed global version. Access is checked against the current user's clearance and tags; entries you cannot access return as not found.",
 	parameters: z.object({
-		entryId: z.string().describe("The knowledge entry id to read"),
+		entryId: z
+			.string()
+			.optional()
+			.describe("Global knowledge entry id; mutually exclusive with personalEntryId"),
+		personalEntryId: z
+			.string()
+			.optional()
+			.describe(
+				"Your personal entry id from KnowledgeLibrary or KnowledgeSearch; no publication required",
+			),
 		useDraft: z
 			.boolean()
 			.optional()
@@ -160,12 +180,71 @@ export const knowledgeReadTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { entryId, useDraft } = args as { entryId: string; useDraft?: boolean };
+		const { entryId, personalEntryId, useDraft } = args as {
+			entryId?: string;
+			personalEntryId?: string;
+			useDraft?: boolean;
+		};
+		if (Boolean(entryId) === Boolean(personalEntryId)) {
+			return { output: "Provide exactly one of entryId or personalEntryId.", isError: true };
+		}
+		if (personalEntryId && useDraft === false) {
+			return {
+				output:
+					"personalEntryId reads a personal version. Omit useDraft:false, or use entryId with useDraft:false to read a published global entry.",
+				isError: true,
+			};
+		}
 		// Advanced as the read progresses so a failure can name the hop that broke. Never rendered.
 		let stage: KnowledgeReadStage = "principal";
 		try {
 			const principal = await principalOf(ctx);
 			stage = "entry";
+			if (personalEntryId) {
+				if (!principal.userId) throw new NotFoundError("Personal knowledge entry", personalEntryId);
+				const personal = await knowledgeBranchService.getMine(principal, personalEntryId);
+				// Personal tool reads are owner-only, even for administrators.
+				if (personal.authorUserId !== principal.userId) {
+					throw new NotFoundError("Personal knowledge entry", personalEntryId);
+				}
+				let title = personal.title ?? "Personal entry";
+				let tags: string[] = [];
+				if (personal.entryId) {
+					const linked = await knowledgeService.getEntry(personal.entryId, {
+						principal,
+						projectId: ctx.projectId ?? undefined,
+					});
+					title = personal.title ?? linked.title;
+					tags = Array.isArray(linked.tagsJson) ? (linked.tagsJson as string[]) : [];
+				} else if (personal.targetCollectionId && ctx.projectId) {
+					const collection = await knowledgeService.getCollection(personal.targetCollectionId);
+					if (collection.projectId && collection.projectId !== ctx.projectId) {
+						throw new NotFoundError("Personal knowledge entry", personalEntryId);
+					}
+				}
+				const body = personal.content;
+				const truncated = body.length > KNOWLEDGE_READ_MAX_CHARS;
+				const cappedBody = truncated
+					? `${body.slice(0, KNOWLEDGE_READ_MAX_CHARS)}\n\n…[truncated ${body.length - KNOWLEDGE_READ_MAX_CHARS} chars; the entry is longer than the read limit]`
+					: body;
+				return {
+					output: `# ${title}\n> This is your personal version (${personal.status}); publication is not required to read or edit it.\n\n${cappedBody}\n\n---\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
+					title: `KnowledgeRead: ${title}`,
+					metadata: {
+						tool: "KnowledgeRead",
+						personalEntryId,
+						linkedEntryId: personal.entryId,
+						title,
+						tags,
+						keywords: Array.isArray(personal.keywordsJson) ? personal.keywordsJson : [],
+						isDraft: true,
+						fromDraft: true,
+						status: personal.status,
+						truncated,
+					},
+				};
+			}
+			if (!entryId) throw new NotFoundError("Knowledge entry", "");
 			// getEntry enforces ACL when principal is supplied; no access → NotFoundError.
 			const entry = (await knowledgeService.getEntry(entryId, {
 				withContent: true,
@@ -251,7 +330,7 @@ export const knowledgeReadTool: ToolDefinition = {
 			if (err instanceof NotFoundError || err instanceof ForbiddenError) {
 				return {
 					output:
-						`Knowledge entry not found or not accessible: ${entryId}. ` +
+						`Knowledge entry not found or not accessible: ${entryId ?? personalEntryId}. ` +
 						`Either the id is wrong or your clearance/tags do not cover it. ` +
 						`Use KnowledgeSearch to get valid ids, or ask an admin for access.`,
 					isError: true,
@@ -260,7 +339,7 @@ export const knowledgeReadTool: ToolDefinition = {
 			// Driver errors may embed SQL, parameters or content. Log only fixed classifications.
 			logger.error("KnowledgeRead failed", {
 				stage,
-				entryId: knowledgeReadLogId(entryId),
+				entryId: knowledgeReadLogId(entryId ?? personalEntryId ?? ""),
 				narratorId: knowledgeReadLogId(ctx.narratorId),
 				errorType: err instanceof Error ? "Error" : "NonError",
 			});
@@ -299,7 +378,7 @@ export const knowledgeLibraryTool: ToolDefinition = {
 		"Orient yourself in the knowledge base (read-only, no approval needed). Actions:\n" +
 		"- list_collections: the collections the current user may READ (already ACL-filtered), each marked writable:true when they may write into it directly. Use this to get a collectionId for KnowledgeCreate instead of asking the user for one.\n" +
 		"- list_mine: YOUR personal library entries (the ones KnowledgeCreate makes by default) — id, title, whether it is linked to a global entry or standalone, its publish target collection, drift status, and open publish-request status.\n" +
-		"Returns metadata summaries only, never entry content — use KnowledgeRead for bodies.",
+		"Returns metadata summaries only, never entry content — use KnowledgeRead with personalEntryId from list_mine for bodies, without publishing.",
 	parameters: z.object({
 		action: z
 			.enum(["list_collections", "list_mine"])
@@ -399,15 +478,16 @@ export const knowledgeLibraryTool: ToolDefinition = {
 			}));
 			const lines = summaries.map((s) => {
 				const kind = s.standalone
-					? `standalone${s.targetCollectionId ? ` → collection ${s.targetCollectionId}` : " (no publish target set — use KnowledgeEdit action 'set_target')"}`
+					? `standalone${s.targetCollectionId ? ` → collection ${s.targetCollectionId}` : " (private; no publish target)"}`
 					: `linked to entry ${s.linkedEntryId}${s.drifted ? " ⚠ behind main — rebase needed" : ""}`;
 				return `- [${s.personalEntryId}] ${s.title ?? "(inherits global title)"} — ${kind}; status ${s.status}, ${s.contentLength} chars`;
 			});
 			return {
 				output:
 					`${summaries.length} personal entr${summaries.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\n` +
-					`Use KnowledgeEdit to work on these (save / rebase / set_target / publish, then ` +
-					`my_submissions / withdraw / resubmit to follow a publish request through review).`,
+					`Use KnowledgeRead with personalEntryId to read these without publishing. ` +
+					`Use KnowledgeEdit with personalEntryId (save / update_meta) to edit them. ` +
+					`Publishing is optional: set_target / publish shares an entry through review.`,
 				title: "KnowledgeLibrary: list_mine",
 				metadata: {
 					tool: "KnowledgeLibrary",

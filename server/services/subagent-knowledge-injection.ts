@@ -58,7 +58,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
-import { knowledgeInjection } from "./knowledge-injection";
+import { injectionKey, knowledgeInjection } from "./knowledge-injection";
 import { knowledgeInjectionReads } from "./knowledge-service";
 import { narratorService } from "./narrator-service";
 import { activeNarrators } from "./narrator-session-state";
@@ -217,7 +217,12 @@ export interface SubagentKnowledgeScanResult {
 	record: {
 		narratorId: string;
 		compactSeq: number;
-		hits: Array<{ entryId: string; entryRevisionId?: string | null; summary?: string | null }>;
+		hits: Array<{
+			scope?: "personal" | "global";
+			entryId: string;
+			entryRevisionId?: string | null;
+			summary?: string | null;
+		}>;
 	};
 }
 
@@ -256,7 +261,7 @@ export async function scanSubagentTextForKnowledge(
 			projectId: input.projectId ?? undefined,
 		});
 		if (hits.length === 0) return null;
-		for (const hit of hits) cycle.ids.add(hit.entryId);
+		for (const hit of hits) cycle.ids.add(injectionKey(hit));
 
 		// Only the BODY is taken from the shared template: its rendered text carries point
 		// B's "based on the latest tool output" heading, which would misdescribe an incoming
@@ -266,6 +271,7 @@ export async function scanSubagentTextForKnowledge(
 			{
 				kind: "knowledge",
 				hits: hits.map((hit) => ({
+					scope: hit.scope,
 					entryId: hit.entryId,
 					title: hit.title,
 					summary: hit.summary,

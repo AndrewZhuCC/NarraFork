@@ -7,11 +7,19 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import * as relations from "../db/relations";
 import { applyPendingMigrationsByHash } from "../db/run-migrations";
 import * as schema from "../db/schema";
+import { LocalBackend } from "../lib/agent/execution/local-backend";
+import { safeSpawn } from "../lib/spawn";
+import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
 import {
 	createWorktreeResourceRegistry,
 	unknownWorktreeScope,
 	worktreeResourceId,
 } from "./narrator-worktree-resource-store";
+import {
+	NarratorWorktreeService,
+	type WorktreeServicePorts,
+	type WorktreeTarget,
+} from "./narrator-worktree-service";
 
 const root = resolve(import.meta.dir, "../..");
 const journal = JSON.parse(readFileSync(join(root, "drizzle/meta/_journal.json"), "utf8")) as {
@@ -253,6 +261,233 @@ test("registration pins verified project scope and scope CAS pins both old and n
 			scopeOwnerUserId: "owner",
 		}),
 	).toBe(true);
+});
+
+describe("undispatched registration release", () => {
+	test("matching fresh preparing metadata is removed without deleting any disk content", async () => {
+		const { sqlite, database } = fixture();
+		const registry = createWorktreeResourceRegistry(database, (_resource, body) => body());
+		const directory = mkdtempSync(join(tmpdir(), "nf-undispatched-resource-"));
+		const marker = join(directory, "keep.txt");
+		writeFileSync(marker, "not created by Git; preserve me");
+		try {
+			const resource = { ...registration, worktreePath: directory };
+			expect(await registry.register(resource)).toEqual({ inserted: true });
+			expect(sqlite.query("SELECT state FROM narrator_worktree_resources").get()).toEqual({
+				state: "preparing",
+			});
+			await registry.releaseUndispatched(resource);
+			expect(sqlite.query("SELECT id FROM narrator_worktree_resources").all()).toEqual([]);
+			expect(readFileSync(marker, "utf8")).toBe("not created by Git; preserve me");
+			await registry.releaseUndispatched(resource);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("register reports inserted only for this INSERT, never for compatible existing resources", async () => {
+		const { sqlite, database } = fixture();
+		const registry = createWorktreeResourceRegistry(database, (_resource, body) => body());
+		for (const state of ["preparing", "ready", "unknown"] as const) {
+			const resource = { ...registration, worktreePath: `/fixture/${state}` };
+			expect(await registry.register(resource)).toEqual({ inserted: true });
+			if (state !== "preparing") await registry.setState(resource, state);
+			const before = sqlite.query("SELECT * FROM narrator_worktree_resources ORDER BY id").all();
+			expect(await registry.register(resource)).toEqual({ inserted: false });
+			expect(sqlite.query("SELECT * FROM narrator_worktree_resources ORDER BY id").all()).toEqual(
+				before,
+			);
+		}
+	});
+
+	for (const historicalState of ["preparing", "unknown"] as const) {
+		for (const failure of ["cancelled", "dispatch-save"] as const) {
+			test(`real create after receipt loss retains historical ${historicalState} registration on ${failure}`, async () => {
+				const { sqlite, database } = fixture();
+				const registry = createWorktreeResourceRegistry(database, (_resource, body) => body());
+				const directory = mkdtempSync(join(tmpdir(), "nf-reused-resource-"));
+				try {
+					const source = join(directory, "repo");
+					mkdirSync(source);
+					async function git(args: string[]) {
+						const result = await safeSpawn({
+							cmd: ["git", "-C", source, ...args],
+							timeout: 5000,
+							maxOutputBytes: 128 * 1024,
+						});
+						if (result.exitCode !== 0) throw new Error(result.stderr);
+						return result;
+					}
+					await git(["init", "-b", "main"]);
+					writeFileSync(join(source, "tracked.txt"), "original content\n");
+					await git(["add", "tracked.txt"]);
+					await git([
+						"-c",
+						"user.name=Fixture",
+						"-c",
+						"user.email=fixture@example.test",
+						"commit",
+						"-m",
+						"initial",
+					]);
+					mkdirSync(join(source, ".worktrees"));
+					const request = {
+						requestId: registration.createRequestId,
+						expectedRevision: 0,
+						workspaceKey: "workspace",
+						destinationPath: join(source, ".worktrees", "destination"),
+						branch: { kind: "new" as const, name: "feature" },
+					};
+					const target: WorktreeTarget = {
+						workspace: {
+							deviceId: "local",
+							cwd: source,
+							rootPath: source,
+							workspaceKey: "workspace",
+							repositoryKey: registration.repositoryKey,
+							state: "ready",
+							capabilities: { read: true, write: true },
+						},
+						backend: new LocalBackend(),
+						repositoryPath: join(source, ".git"),
+					};
+					const receiptDirectory = join(directory, "receipts");
+					const journal = new FileWorktreeJournal(receiptDirectory);
+					const controller = new AbortController();
+					const marker = join(request.destinationPath, "keep.bin");
+					const content = Buffer.from([0, 255, 42, 13, 10]);
+					let recovering = false;
+					let priorDispatched = false;
+					let writes = 0;
+					let releases = 0;
+					const ports: WorktreeServicePorts<string> = {
+						authorize: async () => target,
+						withRevision: async (_id, _revision, body) => body(),
+						withRepositoryLock: async (_key, body) => body(),
+						journal,
+						resources: {
+							register: async (resource) => {
+								const result = await registry.register(resource);
+								if (recovering) {
+									expect(result).toEqual({ inserted: false });
+									// Independent files appearing after the final destination check must survive.
+									mkdirSync(request.destinationPath);
+									writeFileSync(marker, content);
+									if (failure === "cancelled") controller.abort();
+								}
+								return result;
+							},
+							setState: async (resource, state) => {
+								if (!recovering && historicalState === "preparing")
+									throw new Error("Prior dispatch lost its final registry update");
+								return registry.setState(resource, state);
+							},
+							releaseUndispatched: async (resource) => {
+								releases++;
+								return registry.releaseUndispatched(resource);
+							},
+						},
+						runGit: async (_target, args, signal, writing) => {
+							if (writing) {
+								writes++;
+								priorDispatched = true;
+								throw new Error("Prior Git dispatch outcome lost");
+							}
+							if (!recovering && priorDispatched) throw new Error("Prior outcome unverifiable");
+							return safeSpawn({
+								cmd: ["git", "--no-optional-locks", "-C", source, ...args],
+								timeout: 5000,
+								maxOutputBytes: 128 * 1024,
+								signal,
+							});
+						},
+					};
+					const service = new NarratorWorktreeService(ports);
+					expect((await service.create("actor", "n", request, controller.signal)).outcome).toBe(
+						"unknown",
+					);
+					expect(writes).toBe(1);
+					const before = sqlite.query("SELECT * FROM narrator_worktree_resources").get();
+					expect(before).toMatchObject({ state: historicalState, ownership_revision: 0 });
+					expect(worktreeReceiptHasResourceEffect(await journal.read("n", request.requestId))).toBe(
+						true,
+					);
+					rmSync(receiptDirectory, { recursive: true, force: true });
+					expect(await journal.read("n", request.requestId)).toBeNull();
+					recovering = true;
+					writes = 0;
+					const save = journal.save.bind(journal);
+					journal.save = async (...args) => {
+						if (failure === "dispatch-save" && args[2].dispatchState === "started")
+							throw new Error("New dispatch marker write failed");
+						return save(...args);
+					};
+					const failed = await service.create("actor", "n", request, controller.signal);
+					expect(failed.outcome).toBe("failed");
+					expect(writes).toBe(0);
+					expect(releases).toBe(0);
+					expect(sqlite.query("SELECT * FROM narrator_worktree_resources").get()).toEqual(before);
+					expect(readFileSync(marker)).toEqual(content);
+					const receipt = await journal.read("n", request.requestId);
+					expect(receipt?.dispatchState).toBe("not_started");
+					expect(worktreeReceiptHasResourceEffect(receipt)).toBe(false);
+					expect(await service.create("actor", "n", request, new AbortController().signal)).toEqual(
+						failed,
+					);
+					expect(writes).toBe(0);
+					expect(releases).toBe(0);
+				} finally {
+					rmSync(directory, { recursive: true, force: true });
+				}
+			});
+		}
+	}
+
+	test("another owner/request/repository/device/path cannot release preparing metadata", async () => {
+		const { sqlite, database } = fixture();
+		const registry = createWorktreeResourceRegistry(database, (_resource, body) => body());
+		await registry.register(registration);
+		const before = sqlite.query("SELECT * FROM narrator_worktree_resources").get();
+		for (const resource of [
+			{ ...registration, ownerNarratorId: "another-owner" },
+			{ ...registration, createRequestId: "another-request" },
+			{ ...registration, repositoryKey: "another-repository" },
+			{ ...registration, deviceId: "another-device" },
+			{ ...registration, worktreePath: "/fixture/another-path" },
+		]) {
+			await registry.releaseUndispatched(resource);
+			expect(sqlite.query("SELECT * FROM narrator_worktree_resources").get()).toEqual(before);
+		}
+	});
+
+	test("ready/unknown results and transferred ownership revisions cannot be released", async () => {
+		const { sqlite, database } = fixture();
+		const registry = createWorktreeResourceRegistry(database, (_resource, body) => body());
+		for (const state of ["ready", "unknown"] as const) {
+			const resource = { ...registration, worktreePath: `/fixture/${state}` };
+			await registry.register(resource);
+			await registry.setState(resource, state);
+			await registry.releaseUndispatched(resource);
+		}
+		await registry.register(registration);
+		expect(
+			await registry.compareAndSetScope(
+				worktreeResourceId(registration.deviceId, registration.worktreePath),
+				0,
+				{ scopeKind: "project", scopeProjectId: "p", scopeOwnerUserId: "owner" },
+			),
+		).toBe(true);
+		await registry.releaseUndispatched(registration);
+		expect(
+			sqlite
+				.query("SELECT state, ownership_revision FROM narrator_worktree_resources ORDER BY state")
+				.all(),
+		).toEqual([
+			{ state: "preparing", ownership_revision: 1 },
+			{ state: "ready", ownership_revision: 0 },
+			{ state: "unknown", ownership_revision: 0 },
+		]);
+	});
 });
 
 describe("registry stable verified scope", () => {

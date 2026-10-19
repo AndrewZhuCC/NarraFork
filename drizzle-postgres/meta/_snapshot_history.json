@@ -147,19 +147,67 @@
 		},
 		{
 			"idx": 18,
-			"tag": "0018_unified-runtime-registration",
-			"id": "a1fadcea-304f-40c9-b4aa-9ef79e733391",
+			"tag": "0018_personal_knowledge_injection",
+			"id": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
 			"prevId": "589f163a-9f46-4c42-9b4f-7421ec507a16",
 			"version": "7",
-			"snapshotDigest": "3d98f2da678ba212e78a3ce7b13b591ca0444e700763ae310c871bcf7dd1b922"
+			"snapshotDigest": "3cdb7aad98c67d8abcecfb9fda4f0102cb1dda7d3374719a7eaee0c519732ffe"
 		},
 		{
 			"idx": 19,
-			"tag": "0019_policy-source-column",
-			"id": "02c17b92-7607-4b75-983a-705ff12ec770",
-			"prevId": "a1fadcea-304f-40c9-b4aa-9ef79e733391",
+			"tag": "0019_resource_protection",
+			"id": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
+			"prevId": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
 			"version": "7",
-			"snapshotDigest": "f688d540f16baadf596b40fce3e17c97b99ada59d137beada30c2b5e6dcad7dc"
+			"snapshotDigest": "1c2b7c90348a965d5a92acb2a76160e89172db410126889d3b19fcc33df79510"
+		},
+		{
+			"idx": 20,
+			"tag": "0020_history_token_repair_bulk",
+			"id": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+			"prevId": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
+			"version": "7",
+			"snapshotDigest": "7cf8740acee4caea396d53dfaa786cb7d29552068ea4fd1674a5f34eac764ae6"
+		},
+		{
+			"idx": 21,
+			"tag": "0021_rich_composer_document",
+			"id": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
+			"prevId": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+			"version": "7",
+			"snapshotDigest": "3c80d720f39991d0d854ae8fb218d53dcd253d49bd4aa9c3a655536cb487d123"
+		},
+		{
+			"idx": 22,
+			"tag": "0022_context_numeric_stats",
+			"id": "3fc16cee-d009-4621-8ff8-75080ec7d211",
+			"prevId": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
+			"version": "7",
+			"snapshotDigest": "0f56b1fc448b5bc0a187faa9e0649ca59003698b49141c0b733242eaeed2cc9c"
+		},
+		{
+			"idx": 23,
+			"tag": "0023_drop_legacy_request_dumps",
+			"id": "db796e37-a6d9-48f5-bb09-4d51967795a5",
+			"prevId": "3fc16cee-d009-4621-8ff8-75080ec7d211",
+			"version": "7",
+			"snapshotDigest": "ef0893f081518eef1149eb8707ad3bd60961cb0074ca69b3f5f0795d45ab270d"
+		},
+		{
+			"idx": 24,
+			"tag": "0024_request_evidence_columns",
+			"id": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
+			"prevId": "db796e37-a6d9-48f5-bb09-4d51967795a5",
+			"version": "7",
+			"snapshotDigest": "f5a511f0aa3f502c75f9e8d5bd322051c8d275fb23a9255322b2df1b47da1443"
+		},
+		{
+			"idx": 25,
+			"tag": "0025_unified-runtime-registration",
+			"id": "c7aa010f-c918-4c1f-bd1f-9fd0548f3fe8",
+			"prevId": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
+			"version": "7",
+			"snapshotDigest": "609d364919742b1c67eee672481fc63b9a4c3cbd90b93268743b396ba5cefb3a"
 		}
 	]
 }

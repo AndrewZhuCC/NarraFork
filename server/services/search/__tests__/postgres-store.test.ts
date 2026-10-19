@@ -49,7 +49,11 @@ mock.module("../../../db", () => ({ db, sqlite }));
 const { ensureFts } = await import("../../../db/fts");
 ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
 
-const { sqliteSearchStore } = await import("../sqlite-store");
+const { createSqliteSearchStore } = await import("../sqlite-store");
+// Use the seeded fixture, not the production worker's separately opened database.
+const sqliteSearchStore = createSqliteSearchStore(async (sql, params) =>
+	sqlite.prepare<Record<string, unknown>, typeof params>(sql).all(...params),
+);
 const { createPostgresSearchStore } = await import("../postgres-store");
 const { ensurePgFts } = await import("../../../db/pg-fts");
 const { createPostgresClient } = await import("../../../db/postgres-client");
@@ -335,6 +339,54 @@ function expectRankOrdered(rows: readonly { rank: number | null }[], label: stri
 	}
 }
 
+describe("PostgreSQL standalone search SQL", () => {
+	for (const strategy of ["index", "substring"] as const) {
+		test(`${strategy} binds owner and target scope and preserves standalone identity`, async () => {
+			let statement = "";
+			let bound: unknown[] = [];
+			const store = createPostgresSearchStore({
+				async unsafe(sql, params) {
+					statement = sql;
+					bound = params ?? [];
+					return [
+						{
+							id: "personal",
+							personal_entry_id: "personal",
+							collection_id: null,
+							title: "needle",
+							status: "active",
+						},
+					];
+				},
+			});
+			const rows = await store.searchKnowledgeDrafts({
+				...draftQuery("needle", strategy),
+				includeStandalone: true,
+				projectId: "project",
+				collectionId: "collection",
+			});
+			expect(statement).toContain("LEFT JOIN knowledge_entries e ON e.id = d.entry_id");
+			expect(statement).toContain("AND d.author_user_id =");
+			expect(statement).toContain("AND d.status =");
+			expect(statement).toContain("d.entry_id IS NULL AND d.target_collection_id IS NULL");
+			expect(statement).toContain("COALESCE(e.collection_id, d.target_collection_id)");
+			if (strategy === "substring")
+				expect(statement).toContain("COALESCE(e.title, d.title, '') ILIKE");
+			expect(bound).toEqual(
+				expect.arrayContaining(["u-author", "active", "project", "collection"]),
+			);
+			expect(rows[0]).toMatchObject({
+				id: "personal",
+				personalEntryId: "personal",
+				collectionId: null,
+				fromDraft: true,
+			});
+			await store.searchKnowledgeDrafts(draftQuery("needle", strategy));
+			expect(statement).not.toContain("LEFT JOIN");
+		});
+	}
+});
+
 describe("PostgreSQL knowledge time ordering", () => {
 	for (const strategy of ["index", "substring"] as const) {
 		for (const draft of [false, true]) {
@@ -413,6 +465,48 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 					await seedPostgres(pg);
 					const lite: SearchStore = sqliteSearchStore;
 					const store: SearchStore = createPostgresSearchStore(pg);
+					// Standalone rows use the same draft index, but must remain owner-only.
+					for (const [id, owner, status, target] of [
+						["standalone", "u-author", "active", null],
+						["standalone-target", "u-author", "active", "kc1"],
+						["standalone-other", "u-stranger", "active", null],
+						["standalone-archived", "u-author", "archived", null],
+					] as const) {
+						const values = [id, owner, status, target, "standalonefind 电池", NOW];
+						const columns =
+							"id, author_user_id, status, target_collection_id, title, content, content_hash, created_at, updated_at";
+						sqlite
+							.prepare(
+								`INSERT INTO knowledge_drafts (${columns}) VALUES (?, ?, ?, ?, ?, '', 'hash', ?, ?)`,
+							)
+							.run(...[...values, NOW]);
+						await pg.unsafe(
+							`INSERT INTO knowledge_drafts (${columns}) VALUES ($1, $2, $3, $4, $5, '', 'hash', $6, $6)`,
+							values,
+						);
+					}
+					for (const strategy of ["index", "substring"] as const) {
+						const query = {
+							...draftQuery(strategy === "index" ? "standalonefind" : "电池", strategy),
+							includeStandalone: true,
+						};
+						for (const s of [lite, store]) {
+							expect(ids(await s.searchKnowledgeDrafts(query))).toEqual([
+								"standalone",
+								"standalone-target",
+							]);
+							expect(ids(await s.searchKnowledgeDrafts({ ...query, projectId: "p2" }))).toEqual([
+								"standalone",
+							]);
+							expect(ids(await s.searchKnowledgeDrafts({ ...query, collectionId: "kc1" }))).toEqual(
+								["standalone-target"],
+							);
+							expect(await s.searchKnowledgeDrafts({ ...query, includeStandalone: false })).toEqual(
+								[],
+							);
+						}
+					}
+
 					const failures: string[] = [];
 					const check = (label: string, actual: unknown, expected: unknown) => {
 						try {
@@ -682,6 +776,9 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						throw new Error(`parity failures:\n${failures.join("\n")}`);
 					}
 					return "ok";
+				} catch (error) {
+					console.error("Search parity fixture failed", error);
+					throw error;
 				} finally {
 					await client.close();
 				}

@@ -138,33 +138,10 @@ export function registerRun(
 	};
 }
 
-/** Read the stored column: null means nothing registered; anything invalid throws. */
+/**
+ * Read the stored column: null means nothing registered; anything invalid throws. The
+ * size ceiling is enforced on write (`parseRuntimeRegistration`), not on every read.
+ */
 export function readRuntimeRegistrationColumn(value: unknown): RuntimeRegistration | null {
-	return value === null || value === undefined ? null : parseRuntimeRegistration(value);
+	return value === null || value === undefined ? null : runtimeRegistrationSchema.parse(value);
 }
-
-// === Event subscriptions ===
-
-/** Durable terminal outcomes a subscription may ask for. */
-export const NARRATOR_TERMINAL_EVENTS = ["completed", "failed", "timed_out", "cancelled"] as const;
-export type NarratorTerminalEvent = (typeof NARRATOR_TERMINAL_EVENTS)[number];
-
-/** Subscriptions per source narrator; registration beyond this is refused. */
-export const MAX_SUBSCRIPTIONS_PER_SOURCE = 64;
-
-export const narratorEventSubscriptionInputSchema = z.strictObject({
-	sourceNarratorId: narratorId,
-	recipientNarratorId: narratorId,
-	/** Limit to one logical run of the source; omitted/null = session-wide. */
-	runId: recordId.nullable().optional(),
-	events: z
-		.array(z.enum(NARRATOR_TERMINAL_EVENTS))
-		.min(1)
-		.max(NARRATOR_TERMINAL_EVENTS.length)
-		.transform((events) => [...new Set(events)]),
-	wake: z.boolean().default(false),
-	origin: z.enum(["delegation", "explicit"]),
-	authorizedByUserId: z.string().min(1).max(64).nullable().optional(),
-});
-
-export type NarratorEventSubscriptionInput = z.input<typeof narratorEventSubscriptionInputSchema>;

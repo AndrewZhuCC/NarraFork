@@ -17,7 +17,7 @@
  *    owners (recovery stages) that hold a status via a runtime claim.
  */
 
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
@@ -27,11 +27,22 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
-const { reconcileRunningStatus, registerPlannedUpdateRecoveryController } = await import(
-	"../narrator-session"
-);
-const { activeNarrators, claimNarratorRuntime, pendingPermissions, pendingDangerReflections } =
-	await import("../narrator-session-state");
+const {
+	failUnownedStartupRecovery,
+	reconcileRunningStatus,
+	registerPlannedUpdateRecoveryController,
+} = await import("../narrator-session");
+const {
+	activeNarrators,
+	claimNarratorRuntime,
+	listNarratorAdmissionOwners,
+	pendingPermissions,
+	pendingDangerReflections,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
+} = await import("../narrator-session-state");
+const websocket = await import("../../websocket/narrator-ws");
+const { tryClaimExecution } = await import("../agent-runtime/ownership");
 
 const NARRATOR_ID = "reconcile-narrator";
 const OTHER_ID = "reconcile-other-narrator";
@@ -211,6 +222,173 @@ describe("reconcileRunningStatus — forward (stale idle → working)", () => {
 
 		expect(await reconcileRunningStatus(NARRATOR_ID)).toBe(true);
 		expect((await readNarrator())?.status).toBe("working");
+	});
+});
+
+describe("failed startup recovery — finite unowned target cleanup", () => {
+	for (const status of ["working", "waiting"] as const) {
+		test(`persists and broadcasts an explicit recovery failure for unowned ${status}`, async () => {
+			await seedNarrator(status);
+			const broadcast = spyOn(websocket, "broadcastToNarrator").mockImplementation(() => {});
+			try {
+				expect(
+					await failUnownedStartupRecovery([NARRATOR_ID], new Error("bounded read failed")),
+				).toBe(1);
+				expect(await readNarrator()).toEqual({
+					status: "idle",
+					substatus: ["error", "interrupted"],
+				});
+				const row = await db.query.narrators.findFirst({
+					where: eq(narrators.id, NARRATOR_ID),
+					columns: { errorMessage: true },
+				});
+				expect(row?.errorMessage).toBe("Startup recovery failed: bounded read failed");
+				expect(broadcast).toHaveBeenCalledWith(
+					NARRATOR_ID,
+					expect.objectContaining({ type: "status_change", status: "idle" }),
+				);
+				expect(broadcast).toHaveBeenCalledWith(NARRATOR_ID, {
+					type: "narrator_error",
+					narratorId: NARRATOR_ID,
+					error: row?.errorMessage,
+				});
+			} finally {
+				broadcast.mockRestore();
+			}
+		});
+	}
+
+	test("only changes discovered IDs and deduplicates the same target", async () => {
+		await seedNarrator("working");
+		await db.insert(narrators).values({
+			id: OTHER_ID,
+			status: "working",
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		expect(
+			await failUnownedStartupRecovery([NARRATOR_ID, NARRATOR_ID, "missing"], "mount failed"),
+		).toBe(1);
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, OTHER_ID) }))?.status,
+		).toBe("working");
+		expect(await failUnownedStartupRecovery([], "early discovery failure")).toBe(0);
+	});
+
+	for (const owner of ["loop", "loop-admission", "permission", "reflection", "claim"] as const) {
+		test(`does not affect a live ${owner} owner`, async () => {
+			await seedNarrator("waiting", ["reflecting"]);
+			let release = () => {};
+			if (owner === "loop") registerLiveLoop(NARRATOR_ID);
+			if (owner === "loop-admission") {
+				const execution = tryClaimExecution(NARRATOR_ID, "run");
+				expect(execution).not.toBeNull();
+				release = () => {
+					execution?.release();
+				};
+			}
+			if (owner === "permission") {
+				pendingPermissions.set("startup-permission", {
+					narratorId: NARRATOR_ID,
+				} as NonNullable<ReturnType<typeof pendingPermissions.get>>);
+			}
+			if (owner === "reflection") {
+				pendingDangerReflections.set("startup-reflection", {
+					narratorId: NARRATOR_ID,
+				} as NonNullable<ReturnType<typeof pendingDangerReflections.get>>);
+			}
+			if (owner === "claim") release = claimNarratorRuntime(NARRATOR_ID, "parallel-recovery");
+			try {
+				expect(await failUnownedStartupRecovery([NARRATOR_ID], "other queue failed")).toBe(0);
+				expect(await readNarrator()).toEqual({ status: "waiting", substatus: ["reflecting"] });
+			} finally {
+				release();
+			}
+		});
+	}
+
+	test("does not wait behind a live start admission or interfere with its start", async () => {
+		await seedNarrator("working");
+		const entered = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		const start = withNarratorStartAdmission(NARRATOR_ID, async () => {
+			entered.resolve();
+			await resume.promise;
+			registerLiveLoop(NARRATOR_ID);
+		});
+		await entered.promise;
+		try {
+			expect(await failUnownedStartupRecovery([NARRATOR_ID], "other queue failed")).toBe(0);
+			expect((await readNarrator())?.status).toBe("working");
+		} finally {
+			resume.resolve();
+			await start;
+		}
+	});
+
+	test("a background child's terminal admission cannot protect its unowned parent", async () => {
+		await seedNarrator("working");
+		await db.insert(narrators).values({
+			id: OTHER_ID,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: NARRATOR_ID,
+			status: "working",
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		const entered = Promise.withResolvers<void>();
+		const terminal = Promise.withResolvers<void>();
+		const child = withNarratorWorkAdmission(OTHER_ID, async () => {
+			entered.resolve();
+			await terminal.promise;
+		});
+		await entered.promise;
+		try {
+			expect(listNarratorAdmissionOwners(NARRATOR_ID)).toContain(OTHER_ID);
+			expect(listNarratorAdmissionOwners(NARRATOR_ID)).not.toContain(NARRATOR_ID);
+			expect(await failUnownedStartupRecovery([NARRATOR_ID, OTHER_ID], "parent mount failed")).toBe(
+				1,
+			);
+			expect(await readNarrator()).toEqual({ status: "idle", substatus: ["error", "interrupted"] });
+			expect(
+				(await db.query.narrators.findFirst({ where: eq(narrators.id, OTHER_ID) }))?.status,
+			).toBe("working");
+		} finally {
+			terminal.resolve();
+			await child;
+		}
+	});
+
+	test("released queue claims allow a later failure to settle the zombie", async () => {
+		await seedNarrator("working");
+		const release = claimNarratorRuntime(NARRATOR_ID, "failed-queue");
+		try {
+			expect(await failUnownedStartupRecovery([NARRATOR_ID], "mount failed")).toBe(0);
+		} finally {
+			release();
+		}
+		expect(await failUnownedStartupRecovery([NARRATOR_ID], "mount failed")).toBe(1);
+	});
+
+	test("never overwrites the original error of an already idle narrator", async () => {
+		await seedNarrator("idle", ["error"]);
+		await db
+			.update(narrators)
+			.set({ errorMessage: "original provider error" })
+			.where(eq(narrators.id, NARRATOR_ID));
+		const broadcast = spyOn(websocket, "broadcastToNarrator").mockImplementation(() => {});
+		try {
+			expect(await failUnownedStartupRecovery([NARRATOR_ID], "other queue failed")).toBe(0);
+			expect(await readNarrator()).toEqual({ status: "idle", substatus: ["error"] });
+			expect(
+				(await db.query.narrators.findFirst({ where: eq(narrators.id, NARRATOR_ID) }))
+					?.errorMessage,
+			).toBe("original provider error");
+			expect(broadcast).not.toHaveBeenCalled();
+		} finally {
+			broadcast.mockRestore();
+		}
 	});
 });
 

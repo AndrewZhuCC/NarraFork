@@ -15,6 +15,10 @@ import {
 	Title,
 } from "@mantine/core";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import {
+	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
+	type RequestEvidenceAutoPin,
+} from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import {
 	IconAlertTriangle,
@@ -62,16 +66,14 @@ export interface AgentSectionProps {
 	setFreshShellEnv: (v: boolean) => void;
 	translateReasoning: boolean;
 	setTranslateReasoning: (v: boolean) => void;
-	requestDumpRecordingEnabled: boolean;
-	setRequestDumpRecordingEnabled: (v: boolean) => void;
-	requestDumpRequestBytes: number;
-	setRequestDumpRequestBytes: (v: number) => void;
-	requestDumpResponseBytes: number;
-	setRequestDumpResponseBytes: (v: number) => void;
-	requestDumpEnabled: boolean;
-	setRequestDumpEnabled: (v: boolean) => void;
-	requestDumpErrorsOnly: boolean;
-	setRequestDumpErrorsOnly: (v: boolean) => void;
+	ringEnabled: boolean;
+	setRingEnabled: (v: boolean) => void;
+	ringRequestBytes: number;
+	setRingRequestBytes: (v: number) => void;
+	ringResponseBytes: number;
+	setRingResponseBytes: (v: number) => void;
+	autoPin: RequestEvidenceAutoPin;
+	setAutoPin: (v: RequestEvidenceAutoPin) => void;
 	defaultNarratorVisibility: DefaultNarratorVisibility;
 	setDefaultNarratorVisibility: (v: DefaultNarratorVisibility) => void;
 	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
@@ -161,6 +163,10 @@ export interface AgentSectionProps {
 	updateUserPref: AnyMutation;
 }
 
+function isRequestEvidenceAutoPin(value: string | null): value is RequestEvidenceAutoPin {
+	return (REQUEST_EVIDENCE_AUTO_PIN_VALUES as readonly (string | null)[]).includes(value);
+}
+
 export function AgentSection(props: AgentSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
@@ -174,16 +180,18 @@ export function AgentSection(props: AgentSectionProps) {
 	});
 	const [dumpWarningOpen, setDumpWarningOpen] = useState(false);
 
-	const handleRequestDumpToggle = (checked: boolean) => {
-		if (checked && !props.requestDumpEnabled) {
+	// Pinning every request can fill the disk quickly; confirm before switching to it.
+	const handleAutoPinChange = (value: string | null) => {
+		if (!isRequestEvidenceAutoPin(value)) return;
+		if (value === "all" && props.autoPin !== "all") {
 			setDumpWarningOpen(true);
 			return;
 		}
-		props.setRequestDumpEnabled(checked);
+		props.setAutoPin(value);
 	};
 
-	const confirmRequestDump = () => {
-		props.setRequestDumpEnabled(true);
+	const confirmAutoPinAll = () => {
+		props.setAutoPin("all");
 		setDumpWarningOpen(false);
 	};
 
@@ -260,64 +268,62 @@ export function AgentSection(props: AgentSectionProps) {
 				checked={props.translateReasoning}
 				onChange={(e) => props.setTranslateReasoning(e.currentTarget.checked)}
 			/>
-			<Stack id="request-dump-enabled" gap={4}>
+			<Stack id="request-evidence" gap={4}>
 				<Switch
-					label={t("requestDumpRecordingEnabled")}
-					description={t("requestDumpRecordingEnabledDesc")}
-					checked={props.requestDumpRecordingEnabled}
-					onChange={(e) => props.setRequestDumpRecordingEnabled(e.currentTarget.checked)}
+					label={t("requestEvidenceRingEnabled")}
+					description={t("requestEvidenceRingEnabledDesc")}
+					checked={props.ringEnabled}
+					onChange={(e) => props.setRingEnabled(e.currentTarget.checked)}
 				/>
 				<Group grow>
 					<NumberInput
-						label={t("requestDumpRequestCapacity")}
-						description={t("requestDumpCapacityDesc")}
-						value={props.requestDumpRequestBytes / (1024 * 1024)}
+						label={t("requestEvidenceRequestCapacity")}
+						description={t("requestEvidenceCapacityDesc")}
+						value={props.ringRequestBytes / (1024 * 1024)}
 						min={0}
 						max={512}
 						suffix=" MiB"
 						decimalScale={2}
-						onChange={(v) => props.setRequestDumpRequestBytes(Math.round(Number(v) * 1024 * 1024))}
+						onChange={(v) => props.setRingRequestBytes(Math.round(Number(v) * 1024 * 1024))}
 					/>
 					<NumberInput
-						label={t("requestDumpResponseCapacity")}
-						description={t("requestDumpCapacityDesc")}
-						value={props.requestDumpResponseBytes / (1024 * 1024)}
+						label={t("requestEvidenceResponseCapacity")}
+						description={t("requestEvidenceCapacityDesc")}
+						value={props.ringResponseBytes / (1024 * 1024)}
 						min={0}
 						max={2048}
 						suffix=" MiB"
 						decimalScale={2}
-						onChange={(v) => props.setRequestDumpResponseBytes(Math.round(Number(v) * 1024 * 1024))}
+						onChange={(v) => props.setRingResponseBytes(Math.round(Number(v) * 1024 * 1024))}
 					/>
 				</Group>
-				<Switch
-					label={t("requestDumpEnabled")}
-					description={t("requestDumpEnabledDesc")}
-					checked={props.requestDumpEnabled}
-					onChange={(e) => handleRequestDumpToggle(e.currentTarget.checked)}
-				/>
-				<Switch
-					label={t("requestDumpErrorsOnly")}
-					description={t("requestDumpErrorsOnlyDesc")}
-					checked={props.requestDumpErrorsOnly}
-					disabled={!props.requestDumpEnabled}
-					onChange={(e) => props.setRequestDumpErrorsOnly(e.currentTarget.checked)}
+				<Select
+					label={t("requestEvidenceAutoPin")}
+					description={t("requestEvidenceAutoPinDesc")}
+					data={REQUEST_EVIDENCE_AUTO_PIN_VALUES.map((value) => ({
+						value,
+						label: t(`requestEvidenceAutoPin_${value}`),
+					}))}
+					value={props.autoPin}
+					allowDeselect={false}
+					onChange={handleAutoPinChange}
 				/>
 				<Modal
 					opened={dumpWarningOpen}
 					onClose={() => setDumpWarningOpen(false)}
-					title={t("requestDumpWarningTitle")}
+					title={t("requestEvidenceWarningTitle")}
 					centered
 				>
 					<Stack>
 						<Alert color="orange" icon={<IconAlertTriangle size={16} />} variant="light">
-							<Text size="sm">{t("requestDumpWarningBody")}</Text>
+							<Text size="sm">{t("requestEvidenceWarningBody")}</Text>
 						</Alert>
 						<Group justify="flex-end">
 							<Button variant="default" onClick={() => setDumpWarningOpen(false)}>
-								{t("requestDumpWarningCancel")}
+								{t("requestEvidenceWarningCancel")}
 							</Button>
-							<Button color="orange" onClick={confirmRequestDump}>
-								{t("requestDumpWarningConfirm")}
+							<Button color="orange" onClick={confirmAutoPinAll}>
+								{t("requestEvidenceWarningConfirm")}
 							</Button>
 						</Group>
 					</Stack>

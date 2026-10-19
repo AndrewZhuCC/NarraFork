@@ -22,6 +22,7 @@ import {
 	DEFAULT_RECORDING_RESPONSE_BYTES,
 	RECORDING_SCHEMA,
 	type RecordingIdentity,
+	type RecordingPinReason,
 	type RecordingSettings,
 	type RequestRecordingDetail,
 	type SavedRecording,
@@ -52,7 +53,8 @@ import {
 const SAVE_ID = /^[A-Za-z0-9_-]{21}$/;
 const HASH = /^[a-f0-9]{64}$/;
 const SEGMENT_NAME = /^[a-f0-9-]{36}\.jsonl$/;
-const META_PER_RECORD = 16 * 1024;
+// Room for request + response header sets (each bounded at 64 KiB by the sanitizer).
+const META_PER_RECORD = 192 * 1024;
 const SUMMARY_BYTES = 512 * 1024;
 const MAX_ACTIVE_RECORDS = 128;
 
@@ -80,6 +82,8 @@ interface RecordingRecord {
 	continuous: boolean;
 	errorsOnly: boolean;
 	saveId?: string;
+	/** Requested pin; applied when the request ends. */
+	pinReason?: RecordingPinReason;
 }
 interface RecordingManifest {
 	schema: typeof RECORDING_SCHEMA;
@@ -169,11 +173,10 @@ export class RequestRecorderStore {
 	private gateAt = 0;
 	private gateAllowed = true;
 	private config: RecordingSettings = {
-		requestDumpRecordingEnabled: true,
-		requestDumpRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
-		requestDumpResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
-		requestDumpEnabled: false,
-		requestDumpErrorsOnly: false,
+		ringEnabled: true,
+		ringRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
+		ringResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
+		autoPin: "off",
 	};
 	constructor(
 		readonly home: string,
@@ -531,6 +534,7 @@ export class RequestRecorderStore {
 				const record = this.records.get(op.requestId);
 				if (!record) return null;
 				if (op.value.metadataTruncated) this.gap(record, op.side, 1, "metadata truncated");
+				if (op.value.headersTruncated) this.gap(record, op.side, 1, "headers truncated");
 				record.metadata.push({
 					side: op.side,
 					value: op.value,
@@ -563,6 +567,8 @@ export class RequestRecorderStore {
 				}
 				return null;
 			}
+			case "pin":
+				return this.pin(op.requestId, op.reason);
 			case "detail":
 				return this.detail(op.narratorId, op.requestId, signal);
 			case "save-specific": {
@@ -570,10 +576,10 @@ export class RequestRecorderStore {
 				signal?.throwIfAborted();
 				// A single-request durable bundle already satisfies the contract.
 				if (found.saved?.requestCount === 1 && found.record.endedAt) return found.saved;
-				return this.save(op.narratorId, [found.record], found.chunks, signal);
+				return this.save(op.narratorId, [found.record], found.chunks, signal, "request");
 			}
 			case "save":
-				return this.save(op.narratorId);
+				return this.save(op.narratorId, undefined, undefined, undefined, "manual");
 			case "list":
 				return this.list(op.narratorId, op.cursor, op.limit);
 			case "delete":
@@ -726,9 +732,7 @@ export class RequestRecorderStore {
 		}
 	}
 	private budget(side: RecordingSide): number {
-		return side === "request"
-			? this.config.requestDumpRequestBytes
-			: this.config.requestDumpResponseBytes;
+		return side === "request" ? this.config.ringRequestBytes : this.config.ringResponseBytes;
 	}
 	private async discardSegment(item: { requestId: string; segment: Segment }): Promise<void> {
 		const record = this.records.get(item.requestId);
@@ -792,10 +796,34 @@ export class RequestRecorderStore {
 			await this.writeContinuous(record);
 			this.forgetRecord(op.requestId);
 			await rm(this.recordDir(op.requestId), { recursive: true, force: true });
+		} else if (record.pinReason) {
+			await this.savePinned(record, record.pinReason);
 		} else if (record.continuous && record.errorsOnly && op.error) {
-			await this.save(record.identity.narratorId, [record]);
+			await this.savePinned(record, "error");
 		}
 		await this.prune();
+	}
+	/** Pin a request on end; an already-ended request in the ring is saved right away. */
+	private async pin(requestId: string, reason: RecordingPinReason): Promise<void> {
+		const record = this.records.get(requestId);
+		// Continuous captures are already pinned from their start.
+		if (!record || record.saveId) return;
+		if (!record.endedAt) {
+			record.pinReason ??= reason;
+			this.markDirty(record);
+			return;
+		}
+		await this.savePinned(record, reason);
+	}
+	private async savePinned(record: RecordingRecord, reason: RecordingPinReason): Promise<void> {
+		const key = `${record.identity.narratorId}\0${record.identity.requestId}`;
+		if (this.completedSaves.has(key)) return;
+		try {
+			await this.save(record.identity.narratorId, [record], undefined, undefined, reason);
+		} catch (error) {
+			// Automatic pins are best effort: limits and disk pressure keep the ring copy only.
+			this.gap(record, "response", 0, `pin failed: ${boundedError(error)}`);
+		}
 	}
 	private async pruneExports(): Promise<void> {
 		for (const [path, expiresAt] of this.completedExports) {
@@ -837,6 +865,7 @@ export class RequestRecorderStore {
 		narratorId: string,
 		records: RecordingRecord[],
 		continuous = false,
+		reason?: RecordingPinReason,
 	): SavedRecording {
 		return {
 			id,
@@ -861,6 +890,7 @@ export class RequestRecorderStore {
 					record.gaps.request > 0 || record.gaps.response > 0 || record.gapReasons.length > 0,
 			),
 			...(continuous ? { continuous: true } : {}),
+			...(reason ? { reason } : {}),
 		};
 	}
 	private rememberCompletedSave(summary: SavedRecording, records: RecordingRecord[]): void {
@@ -877,7 +907,13 @@ export class RequestRecorderStore {
 	private async writeContinuous(record: RecordingRecord): Promise<void> {
 		if (!record.saveId) return;
 		const dir = this.saveDir(record.identity.narratorId, record.saveId);
-		const summary = this.summary(record.saveId, record.identity.narratorId, [record], true);
+		const summary = this.summary(
+			record.saveId,
+			record.identity.narratorId,
+			[record],
+			true,
+			"continuous",
+		);
 		summary.createdAt = record.startedAt;
 		await atomicJson(join(dir, "manifest.json"), {
 			schema: RECORDING_SCHEMA,
@@ -905,6 +941,7 @@ export class RequestRecorderStore {
 		selected?: RecordingRecord[],
 		selectedChunks?: string,
 		signal?: AbortSignal,
+		reason?: RecordingPinReason,
 	): Promise<SavedRecording> {
 		signal?.throwIfAborted();
 		if (!(await this.writable()))
@@ -917,7 +954,7 @@ export class RequestRecorderStore {
 		const records =
 			selected ??
 			[...this.records.values()].filter((record) => record.identity.narratorId === narratorId);
-		if (!records.length && this.config.requestDumpEnabled && !this.config.requestDumpErrorsOnly) {
+		if (!records.length && this.config.autoPin === "all") {
 			// In continuous mode completed requests are already durable, not in the ring.
 			const latest = (await this.list(narratorId, undefined, 50)).items.find(
 				(item) => item.continuous,
@@ -933,7 +970,7 @@ export class RequestRecorderStore {
 		}
 		await this.flush();
 		const id = generateId();
-		const summary = this.summary(id, narratorId, records);
+		const summary = this.summary(id, narratorId, records, false, reason);
 		const frozen = structuredClone(records);
 		const manifest: RecordingManifest = { schema: RECORDING_SCHEMA, summary, requests: frozen };
 		const manifestBytes = Buffer.byteLength(JSON.stringify(manifest));

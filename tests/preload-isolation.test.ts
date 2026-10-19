@@ -21,13 +21,13 @@ describe("global test data isolation", () => {
 	});
 
 	test("missing branches are restored from the isolated snapshot, not shipped defaults", () => {
-		const expected = structuredClone(settings.agent);
-		expect(expected.requestDumpRecordingEnabled).toBe(false);
+		const expected = structuredClone(settings.requestEvidence);
+		expect(expected.ringEnabled).toBe(false);
 		for (const value of [undefined, null]) {
-			Reflect.set(settings, "agent", value);
+			Reflect.set(settings, "requestEvidence", value);
 			repairMissingSettingsBranches();
-			expect(settings.agent).toEqual(expected);
-			expect(settings.agent).not.toBe(expected);
+			expect(settings.requestEvidence).toEqual(expected);
+			expect(settings.requestEvidence).not.toBe(expected);
 		}
 	});
 

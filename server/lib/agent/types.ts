@@ -801,20 +801,11 @@ export type AgentEvent =
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
-			rawDump?: unknown;
 			errorMessage?: string;
 			diagnostics?: ApiRequestDiagnostics;
-			/** Force raw-dump persistence regardless of the errors-only setting. */
-			forceDumpPersist?: boolean;
-			/**
-			 * Turn-scoped key marking several attempts as re-sends of ONE request, so their
-			 * identical dumps share a single spilled file instead of filling the newest-N
-			 * dump directory with multi-MB near-duplicates.
-			 */
-			dumpSpillReuseToken?: string;
 	  }
 	| { type: "silent_disconnect" }
-	| { type: "done" };
+	| { type: "done"; reason?: "reasoning_only_idle" };
 
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
@@ -910,7 +901,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Skill",
 	"LearningGuide",
 	// Visibility only: narrator-permission admits show, never create.
-	"IntelligentUI",
+	"GenUI",
 ]);
 
 // === Agent config ===
@@ -1177,6 +1168,8 @@ export interface AgentConfig {
 		turnIndex: number,
 		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
 	) => Promise<AgentHistoryReplacement | null>;
+	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
+	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**

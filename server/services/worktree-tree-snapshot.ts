@@ -39,16 +39,18 @@
 
 import { createHash } from "node:crypto";
 import {
+	constants,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	type Stats,
 	statSync,
 } from "node:fs";
-import { lstat, rmdir, unlink } from "node:fs/promises";
+import { lstat, open, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type {
@@ -69,7 +71,7 @@ import {
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
-import { normalizePathForComparison } from "../lib/platform-path";
+import { normalizePathForComparison, pathsEqualForOS } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
 import { treeSnapshotPhysicalDir as shadowDir, treeSnapshotKey } from "./tree-snapshot-paths";
@@ -77,13 +79,14 @@ import { treeSnapshotPhysicalDir as shadowDir, treeSnapshotKey } from "./tree-sn
 export { treeSnapshotKey } from "./tree-snapshot-paths";
 
 import {
-	assertLifecycleProtectionCurrent,
 	confirmLifecyclePathCreated,
 	confirmLifecyclePathRemoved,
 	isResourceProtectionError,
 	lifecycleCreationPath,
 	revalidateLifecycleTarget,
+	withLifecycleContext,
 	withProtectionReservation,
+	withShadowCreationReservation,
 } from "./worktree-lifecycle-guard";
 import { clearClaims } from "./worktree-write-claims";
 
@@ -1103,39 +1106,152 @@ async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<v
 	excludeMtimes.set(dir, combinedKey);
 }
 
-/** Create the shadow bare repo if absent. */
-async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void> {
-	// A retirement may take its final snapshot before removing the checkout.
-	// Record that trusted creation rather than accepting arbitrary inode changes.
-	dir = await lifecycleCreationPath(dir);
-	if (existsSync(resolve(dir, "HEAD"))) {
-		await syncExcludesIfStale(dir, worktreePath);
-		return;
+/** Cheap, bounded shape check: a lone HEAD or an arbitrary directory is not a repo. */
+function hasShadowRepoLayout(dir: string, missingHead = false): boolean {
+	try {
+		if (!lstatSync(dir).isDirectory() || existsSync(resolve(dir, "commondir"))) return false;
+		for (const name of ["objects", "refs"]) {
+			if (!lstatSync(resolve(dir, name)).isDirectory()) return false;
+		}
+		for (const name of missingHead ? ["config"] : ["config", "HEAD"]) {
+			const entry = lstatSync(resolve(dir, name));
+			if (!entry.isFile() || entry.size > 64 * 1024) return false;
+		}
+		return true;
+	} catch {
+		return false;
 	}
-	await withProtectionReservation(
-		[{ deviceId: LOCAL_DEVICE_ID, path: dir }],
-		"shadow initialization",
-		async () => {
+}
+
+/** Validate without attaching a worktree (which would hide core.bare=false). */
+async function validateShadowRepo(dir: string): Promise<void> {
+	if (!hasShadowRepoLayout(dir)) throw new TreeSnapshotError("existing shadow repo is invalid");
+	const before = lstatSync(dir);
+	const canonical = realpathSync(dir);
+	const result = await safeSpawn({
+		cmd: ["git", "--git-dir", dir, "rev-parse", "--is-bare-repository", "--absolute-git-dir"],
+		timeout: GIT_TIMEOUT_MS,
+		maxOutputBytes: 4096,
+		env: { ...process.env, ...SHADOW_CONFIG_ENV },
+	});
+	const after = lstatSync(dir);
+	const [bare, gitDir] = result.stdout.trim().split("\n");
+	// Windows realpath preserves the input casing, while Git reports the disk
+	// spelling. Compare OS paths, but still require the exact directory identity.
+	const reported = gitDir && existsSync(gitDir) ? lstatSync(gitDir) : null;
+	if (
+		result.exitCode !== 0 ||
+		result.stdoutTruncated ||
+		result.stderrTruncated ||
+		bare !== "true" ||
+		!gitDir ||
+		before.dev !== after.dev ||
+		before.ino !== after.ino ||
+		reported?.dev !== before.dev ||
+		reported?.ino !== before.ino ||
+		!pathsEqualForOS(realpathSync(dir), canonical, process.platform) ||
+		!pathsEqualForOS(realpathSync(gitDir), canonical, process.platform)
+	)
+		throw new TreeSnapshotError("existing shadow repo is invalid or changed identity");
+}
+
+// Only a failed, exclusively created birth may resume init, including after restart.
+// Fixed protocol, bounded to 256 bytes; not an ownership record for existing repos.
+const SHADOW_INIT_MARKER = "nf-shadow-init";
+
+function shadowInitMarkerContents(dir: string, worktreePath: string): string {
+	const born = lstatSync(dir);
+	const parent = lstatSync(resolve(dir, ".."));
+	if (!born.isDirectory() || !parent.isDirectory())
+		throw new TreeSnapshotError("shadow initialization directory identity is invalid");
+	const key = createHash("sha256")
+		.update(treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath))
+		.digest("hex");
+	return `nf-shadow-init-v1\n${key}\n${born.dev}:${born.ino}\n${parent.dev}:${parent.ino}\n`;
+}
+
+async function hasValidShadowInitMarker(dir: string, worktreePath: string): Promise<boolean> {
+	try {
+		const expected = shadowInitMarkerContents(dir, worktreePath);
+		const markerPath = resolve(dir, SHADOW_INIT_MARKER);
+		const entry = await lstatIfPresent(markerPath);
+		if (!entry?.isFile() || entry.size > 256) return false;
+		const marker = await open(
+			markerPath,
+			constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+		);
+		try {
+			const stat = await marker.stat();
+			if (!stat.isFile() || stat.size > 256 || stat.dev !== entry.dev || stat.ino !== entry.ino)
+				return false;
+			const buffer = Buffer.alloc(257);
+			const { bytesRead } = await marker.read(buffer, 0, buffer.length, 0);
+			return (
+				buffer.subarray(0, bytesRead).toString("utf8") === expected &&
+				shadowInitMarkerContents(dir, worktreePath) === expected
+			);
+		} finally {
+			await marker.close();
+		}
+	} catch {
+		return false;
+	}
+}
+
+/** Create only an exclusively born shadow directory; never adopt unknown contents. */
+async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void> {
+	// Shared checkout use freezes identities, not ownership. Keep the raw checkout
+	// path for shadow keys; canonical paths are only lifecycle comparison identities.
+	await withLifecycleContext([dir, worktreePath], async () => {
+		// A retirement may take its final snapshot before removing the checkout.
+		dir = await lifecycleCreationPath(dir);
+		if (
+			existsSync(resolve(dir, "HEAD")) &&
+			!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))
+		) {
+			await validateShadowRepo(dir);
 			dir = await revalidateLifecycleTarget(dir);
-			if (existsSync(resolve(dir, "HEAD"))) {
-				await syncExcludesIfStale(dir, worktreePath);
-				return;
-			}
-			mkdirSync(resolve(dir, ".."), { recursive: true });
-			// An exclusive leaf mkdir, not recursive mkdir's first ancestor, proves
-			// this attempt created D. Pre-existing invalid repos are never disposable.
-			let createdDirectory = false;
-			try {
+			await syncExcludesIfStale(dir, worktreePath);
+			return;
+		}
+		// Only the physical cold birth is exclusive. The source checkout remains
+		// shareable, and existing valid repos never need receipt migration here.
+		await withShadowCreationReservation({ deviceId: LOCAL_DEVICE_ID, path: dir }, async () => {
+			dir = await revalidateLifecycleTarget(dir);
+			if (await lstatIfPresent(dir)) {
+				if (!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))) {
+					await validateShadowRepo(dir);
+					dir = await revalidateLifecycleTarget(dir);
+					await syncExcludesIfStale(dir, worktreePath);
+					return;
+				}
+			} else {
+				mkdirSync(resolve(dir, ".."), { recursive: true });
+				dir = await revalidateLifecycleTarget(dir);
+				// EEXIST is not permission to run git init against somebody else's directory.
 				mkdirSync(dir);
-				createdDirectory = true;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			}
-			if (createdDirectory) {
 				const born = lstatSync(dir);
 				if (!born.isDirectory()) throw new TreeSnapshotError("shadow birth is not a directory");
 				await confirmLifecyclePathCreated(dir, `${born.dev}:${born.ino}`);
-			} else dir = await revalidateLifecycleTarget(dir);
+				dir = await revalidateLifecycleTarget(dir);
+				try {
+					await writeFile(
+						resolve(dir, SHADOW_INIT_MARKER),
+						shadowInitMarkerContents(dir, worktreePath),
+						{
+							flag: "wx",
+							mode: 0o600,
+						},
+					);
+				} catch (error) {
+					throw new TreeSnapshotError(
+						`shadow initialization marker creation failed: ${String(error)}`,
+					);
+				}
+			}
+			dir = await revalidateLifecycleTarget(dir);
+			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
+				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
 			// `git init --bare` rejects --work-tree, so this cannot go through runGit.
 			const result = await safeSpawn({
 				cmd: ["git", "init", "--bare", dir],
@@ -1143,21 +1259,22 @@ async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void
 				maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
 			});
 			if (result.exitCode !== 0) {
-				if (createdDirectory) {
-					await assertLifecycleProtectionCurrent(
-						[{ deviceId: LOCAL_DEVICE_ID, path: dir }],
-						"shadow initialization rollback",
-					);
-					const frozenDir = await revalidateLifecycleTarget(dir);
-					rmSync(frozenDir, { recursive: true, force: true });
-					await confirmLifecyclePathRemoved(frozenDir);
-				}
+				// Retain even our own failed birth: partial files are evidence, not garbage.
 				throw new TreeSnapshotError(`shadow repo init failed: ${result.stderr.trim()}`);
 			}
+			dir = await revalidateLifecycleTarget(dir);
+			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
+				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
+			await validateShadowRepo(dir);
+			dir = await revalidateLifecycleTarget(dir);
 			await syncExcludes(dir, worktreePath);
+			dir = await revalidateLifecycleTarget(dir);
+			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
+				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
+			await unlink(resolve(dir, SHADOW_INIT_MARKER));
 			excludeMtimes.delete(dir);
-		},
-	);
+		});
+	});
 }
 
 /**
@@ -2379,8 +2496,7 @@ async function linkSnapshotUnlocked(
 /**
  * Put a missing `HEAD` back rather than deleting the repository around it.
  *
- * `HEAD` is the only file this module probes to decide a shadow repo exists, and the
- * orphan sweep used to treat its absence as "invalid, delete the directory". That is
+ * The orphan sweep used to treat a missing HEAD as "invalid, delete the directory". That is
  * a data-loss bug rather than a cleanup: `HEAD` is a 23-byte pointer whose *target*
  * is never read (snapshots live under `refs/nf/`, and every command names its object
  * explicitly), while `objects/` beside it holds every tree and snapshot commit that
@@ -2388,28 +2504,36 @@ async function linkSnapshotUnlocked(
  * reference. A truncated write, a full disk or an interrupted `git init` therefore
  * cost a chapter its entire revert history.
  *
- * So the directory is only removed when there is demonstrably nothing to lose: no
- * objects and no refs. Otherwise `HEAD` is rewritten with what `git init` would have
- * produced, which is enough to make the repository usable again — and the result is
- * verified by asking git, so a directory broken in some *other* way is left in place
- * for a human instead of being silently deleted.
+ * Unknown and incomplete directories are always retained. Recognizable bare repos
+ * with objects or refs can have their missing HEAD restored under the shadow mutex;
+ * git then verifies the result before maintenance continues.
  *
  * Returns whether the repository is usable afterwards.
  */
 async function repairShadowHead(dir: string): Promise<boolean> {
-	if (!shadowDirHasContent(dir)) {
-		logger.warn("Removing an empty tree-snapshot repo (missing HEAD, no objects or refs)", {
-			dir,
-		});
-		try {
-			rmSync(dir, { recursive: true, force: true });
-		} catch {
-			// Nothing to salvage either way; the next sweep tries again.
-		}
+	if (!hasShadowRepoLayout(dir, true) || !shadowDirHasContent(dir)) {
+		logger.warn("Keeping an incomplete tree-snapshot directory with missing HEAD", { dir });
 		return false;
 	}
 	try {
-		await Bun.write(resolve(dir, "HEAD"), "ref: refs/heads/main\n");
+		const before = lstatSync(dir);
+		const bare = await safeSpawn({
+			cmd: ["git", "config", "--file", resolve(dir, "config"), "--bool", "--get", "core.bare"],
+			timeout: GIT_TIMEOUT_MS,
+			maxOutputBytes: 4096,
+		});
+		const after = lstatSync(dir);
+		if (
+			bare.exitCode !== 0 ||
+			bare.stdout.trim() !== "true" ||
+			bare.stdoutTruncated ||
+			bare.stderrTruncated ||
+			!after.isDirectory() ||
+			before.dev !== after.dev ||
+			before.ino !== after.ino
+		)
+			return false;
+		await writeFile(resolve(dir, "HEAD"), "ref: refs/heads/main\n", { flag: "wx" });
 	} catch (error) {
 		logger.warn("Could not repair a tree-snapshot repo's missing HEAD; keeping it as is", {
 			dir,
@@ -2417,13 +2541,12 @@ async function repairShadowHead(dir: string): Promise<boolean> {
 		});
 		return false;
 	}
-	// `rev-parse --git-dir` is git's own validity check, so a repo broken in a way this
-	// repair does not cover is reported rather than repacked blindly.
-	const check = await runGit(["rev-parse", "--git-dir"], dir, dir);
-	if (check.exitCode !== 0) {
+	try {
+		await validateShadowRepo(dir);
+	} catch (error) {
 		logger.warn("Tree-snapshot repo is still unusable after restoring HEAD; keeping it", {
 			dir,
-			stderr: check.stderr,
+			error: String(error),
 		});
 		return false;
 	}
@@ -3623,7 +3746,7 @@ export const worktreeTreeSnapshot = {
 		try {
 			return await withProtectionReservation(
 				[
-					{ deviceId, path: worktreePath, shadowKey: treeSnapshotKey(deviceId, worktreePath) },
+					{ deviceId, shadowKey: treeSnapshotKey(deviceId, worktreePath) },
 					{ deviceId, path: dir },
 				],
 				"shadow destroy",
@@ -3707,11 +3830,25 @@ export const worktreeTreeSnapshot = {
 		for (const entry of readdirSync(SHADOW_ROOT, { withFileTypes: true })) {
 			if (!entry.isDirectory()) continue;
 			const dir = resolve(SHADOW_ROOT, entry.name);
-			if (!existsSync(resolve(dir, "HEAD")) && !(await repairShadowHead(dir))) continue;
-			// Serialized against captures: `gc` rewrites the object store, and a
+			// Serialized against captures: HEAD repair and `gc` both mutate the repo; a
 			// concurrent `add -A`/`write-tree` in the same repo can fail or race with
 			// the repack.
 			await acquireShadowStructural(dir, async () => {
+				// Initialization evidence is not a maintenance candidate, even if HEAD exists.
+				if (await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER))) return;
+				if (!existsSync(resolve(dir, "HEAD"))) {
+					if (!(await repairShadowHead(dir))) return;
+				} else {
+					try {
+						await validateShadowRepo(dir);
+					} catch (error) {
+						logger.warn("Keeping an invalid tree-snapshot repo without maintenance", {
+							dir,
+							error: String(error),
+						});
+						return;
+					}
+				}
 				// `--no-prune` is the load-bearing flag. Repacking is the point; deleting
 				// unreachable objects is not, because "unreachable" is the normal state of
 				// a snapshot recorded before the DAG existed, and the database is the real

@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { RequestRecorderClient } from "../../request-recorder";
 import type { AnthropicProviderConfig } from "../../settings";
 import { settings, usesStatefulModel } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
@@ -152,34 +153,44 @@ afterAll(() => {
 });
 
 describe("agentLoop resumable-error handling (NUG continuation-after-forwarded-payload)", () => {
-	test("attaches correlated diagnostics before ending the recording", async () => {
-		const originalEnabled = settings.agent.requestDumpEnabled;
-		settings.agent.requestDumpEnabled = true;
-		const calls: string[] = [];
-		const originalDiagnostics = ApiRequestDumpCollector.prototype.setDiagnostics;
+	test("ends the recording once with the error and correlates diagnostics to it", async () => {
+		const evidence = settings.requestEvidence;
+		settings.requestEvidence = { ...evidence, ringEnabled: true };
+		// Observe the producer boundary only; no recorder worker or filesystem IO.
+		const configure = spyOn(RequestRecorderClient.prototype, "configure").mockImplementation(
+			() => {},
+		);
+		const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
+			() => true,
+		);
+		const finished: Array<{ error?: string; status?: string } | undefined> = [];
 		const originalFinish = ApiRequestDumpCollector.prototype.finish;
-		const diagnostics = spyOn(
-			ApiRequestDumpCollector.prototype,
-			"setDiagnostics",
-		).mockImplementation(function (this: ApiRequestDumpCollector, value) {
-			if (value?.recordingRequestId) calls.push("diagnostics");
-			return originalDiagnostics.call(this, value);
-		});
 		const finish = spyOn(ApiRequestDumpCollector.prototype, "finish").mockImplementation(function (
 			this: ApiRequestDumpCollector,
 			value,
 		) {
-			calls.push("finish");
+			finished.push(value);
 			return originalFinish.call(this, value);
 		});
 		try {
 			installResponses([partialTextThenResumableError({ text: "partial", resumable: true })]);
-			await runLoop();
-			expect(calls).toEqual(["diagnostics", "finish"]);
+			const events = await runLoop();
+			expect(finished).toHaveLength(1);
+			expect(finished[0]?.status).toBe("error");
+			expect(finished[0]?.error).toBeTruthy();
+			// Diagnostics no longer ride in the recording; they travel on api_request_end
+			// (persisted as bounded diagnostics_json) and point back at the recording.
+			const end = events.find(
+				(event): event is Extract<AgentEvent, { type: "api_request_end" }> =>
+					event.type === "api_request_end",
+			);
+			expect(end?.requestId).toBeTruthy();
+			expect(end?.diagnostics?.recordingRequestId).toBe(end?.requestId);
 		} finally {
-			settings.agent.requestDumpEnabled = originalEnabled;
-			diagnostics.mockRestore();
+			settings.requestEvidence = evidence;
 			finish.mockRestore();
+			capture.mockRestore();
+			configure.mockRestore();
 		}
 	});
 

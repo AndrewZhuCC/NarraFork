@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
@@ -26,14 +26,36 @@ const { listDeliveringRuns } = await import("../agent-runtime/run");
 const { setRunControl, tryClaimExecution } = await import("../agent-runtime/ownership");
 const { registerRun, runDeadlineAt } = await import("../../lib/validators/runtime-registration");
 const updateCoordinator = await import("../update-coordinator");
-const { getRuntimePublicationService } = await import("../agent-runtime/publication");
+const { getRuntimePublicationService, runtimePublication } = await import(
+	"../agent-runtime/publication"
+);
+const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+
+beforeEach(async () => {
+	// Wording/lifecycle fixtures have no model; keep publication durable without starting a loop.
+	runtimePublication.setWake(() => {});
+	backgroundOccupancyStore.resetForTests();
+	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
+});
 
 afterAll(() => {
+	runtimePublication.stop();
+	runtimePublication.setWake(async (narratorId) => {
+		await wakeInboxIfEligible(narratorId);
+	});
+	backgroundOccupancyStore.resetForTests();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await backgroundOccupancyStore.flush();
+	// Let the fire-and-forget list deltas finish before their database/index are reset.
+	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+	await backgroundOccupancyStore.flush();
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
 	updateCoordinator.resetUpdateCoordinationForTests();
 });
@@ -455,6 +477,8 @@ async function seedAgentTaskEntities(suffix: string): Promise<{
 			updatedAt: now,
 		},
 	]);
+	backgroundOccupancyStore.refreshNarrators([parentNarratorId, subagentNarratorId]);
+	await backgroundOccupancyStore.flush();
 	return { parentNarratorId, subagentNarratorId };
 }
 
@@ -506,6 +530,8 @@ describe("background agent task lifecycle", () => {
 				errorMessage: null,
 			})
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 
 		const summaries = await backgroundTaskService.listSummariesByParent(parentNarratorId);
 		expect(summaries).toHaveLength(1);
@@ -556,6 +582,8 @@ describe("background agent task lifecycle", () => {
 			.update(narrators)
 			.set({ isBackground: true, backgroundStatus: "running", status: "working" })
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
 			parentNarratorId,
@@ -616,6 +644,8 @@ describe("background agent task lifecycle", () => {
 			.update(narrators)
 			.set({ isBackground: true, backgroundStatus: "running", status: "working" })
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
 			parentNarratorId,
@@ -802,6 +832,8 @@ describe("background agent task lifecycle", () => {
 			.update(narrators)
 			.set({ isBackground: true, backgroundStatus: "running" })
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
 			parentNarratorId,

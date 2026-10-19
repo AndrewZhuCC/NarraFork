@@ -29,12 +29,14 @@ export interface RuntimeRunState {
 
 export function createRuntimeRunState(
 	input: Extract<RuntimeInput, { kind: "current" }>,
+	prePromptBashCommand?: string,
 ): RuntimeRunState {
 	return {
 		input,
 		recovery: createRuntimeRecoveryState(),
 		firstPass: true,
 		initialSettingsApplied: false,
+		pendingPrePromptBashCommand: prePromptBashCommand,
 		hadError: false,
 		wasInterrupted: false,
 		finalText: "",

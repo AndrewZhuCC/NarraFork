@@ -1,27 +1,18 @@
 /**
- * Runtime registration and subscriptions through the real database: policy sources
+ * Runtime registration through the real database: policy sources
  * are followed live and fail closed, registrations are relationship-only, and two
  * narrators with no parent/child link can be related exactly like a delegation.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
-import { narratorEventSubscriptions, narrators, users } from "../../db/schema";
-import { generateId } from "../../lib/id";
+import { narrators } from "../../db/schema";
 import { DISABLED_TOOLS_TRAIT_PREFIX, upsertEncodedTrait } from "../../lib/narrator-custom-traits";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { MAX_POLICY_SOURCE_DEPTH } from "../../lib/runtime-source";
-import { MAX_SUBSCRIPTIONS_PER_SOURCE } from "../../lib/validators/runtime-registration";
 import { isRuntimeToolAllowed } from "../agent-runtime/policy";
 import { customSubagentService } from "../custom-subagent-service";
-import {
-	deleteNarratorEventSubscription,
-	getRuntimeRegistration,
-	listSubscriptionsForRecipient,
-	listSubscriptionsForSourceRun,
-	setPolicySource,
-	upsertNarratorEventSubscription,
-} from "../narrator-runtime-registration";
+import { getRuntimeRegistration, setPolicySource } from "../narrator-runtime-registration";
 import { narratorService } from "../narrator-service";
 import {
 	resetTraitLayerCaches,
@@ -35,9 +26,6 @@ afterEach(async () => {
 	resetTraitLayerCaches();
 	const ids = created.splice(0);
 	if (ids.length === 0) return;
-	await db
-		.delete(narratorEventSubscriptions)
-		.where(inArray(narratorEventSubscriptions.sourceNarratorId, ids));
 	// Children reference parents; clear the links before deleting.
 	await db
 		.update(narrators)
@@ -250,114 +238,5 @@ describe("delegation creation", () => {
 		const policy = await resolveNarratorRuntimePolicy(id);
 		expect(policy.readOnlyGitShell).toBe(true);
 		expect(policy.capabilities.askUserQuestion).toBe("disabled");
-	});
-});
-
-describe("event subscriptions", () => {
-	test("non-parent narrators can subscribe; one row per scope, updated in place", async () => {
-		const source = await narrator();
-		const recipient = await narrator();
-		const first = await upsertNarratorEventSubscription({
-			sourceNarratorId: source,
-			recipientNarratorId: recipient,
-			events: ["completed"],
-			origin: "explicit",
-		});
-		const again = await upsertNarratorEventSubscription({
-			sourceNarratorId: source,
-			recipientNarratorId: recipient,
-			events: ["failed", "cancelled"],
-			wake: true,
-			origin: "explicit",
-		});
-		expect(again.id).toBe(first.id);
-		expect(again.events).toEqual(["failed", "cancelled"]);
-		expect(again.wake).toBe(true);
-
-		const runScoped = await upsertNarratorEventSubscription({
-			sourceNarratorId: source,
-			recipientNarratorId: recipient,
-			runId: "run-1",
-			events: ["completed"],
-			origin: "delegation",
-		});
-		expect(runScoped.id).not.toBe(first.id);
-		expect((await listSubscriptionsForSourceRun(source, "run-1")).map((s) => s.id).sort()).toEqual(
-			[first.id, runScoped.id].sort(),
-		);
-		expect((await listSubscriptionsForSourceRun(source, "run-2")).map((s) => s.id)).toEqual([
-			first.id,
-		]);
-		expect((await listSubscriptionsForRecipient(recipient)).items).toHaveLength(2);
-
-		// Subscribing grants no relationship: no control or policy source appears.
-		expect(await getRuntimeRegistration(recipient)).toBeNull();
-
-		expect(await deleteNarratorEventSubscription(first.id)).toBe(true);
-		expect(await deleteNarratorEventSubscription(first.id)).toBe(false);
-	});
-
-	test("a human registration is attributed to that human, not a caller-chosen id", async () => {
-		const owner = generateId();
-		await db.insert(users).values({
-			id: owner,
-			username: `sub-${owner}`,
-			passwordHash: "fixture",
-			createdAt: new Date().toISOString(),
-		});
-		try {
-			const source = await narrator();
-			const recipient = await narrator();
-			const sub = await upsertNarratorEventSubscription(
-				{
-					sourceNarratorId: source,
-					recipientNarratorId: recipient,
-					events: ["completed"],
-					origin: "explicit",
-					authorizedByUserId: "someone-else",
-				},
-				{ userId: owner, isAdmin: true },
-			);
-			expect(sub.authorizedByUserId).toBe(owner);
-		} finally {
-			await db
-				.delete(narratorEventSubscriptions)
-				.where(eq(narratorEventSubscriptions.authorizedByUserId, owner));
-			await db.delete(users).where(eq(users.id, owner));
-		}
-	});
-
-	test("self-subscription is refused and the per-source cap is enforced", async () => {
-		const source = await narrator();
-		await expect(
-			upsertNarratorEventSubscription({
-				sourceNarratorId: source,
-				recipientNarratorId: source,
-				events: ["completed"],
-				origin: "explicit",
-			}),
-		).rejects.toThrow("itself");
-		const recipient = await narrator();
-		const now = new Date().toISOString();
-		await db.insert(narratorEventSubscriptions).values(
-			Array.from({ length: MAX_SUBSCRIPTIONS_PER_SOURCE }, (_, i) => ({
-				id: `cap-${source}-${i}`,
-				sourceNarratorId: source,
-				recipientNarratorId: recipient,
-				runId: `run-${i}`,
-				events: ["completed" as const],
-				origin: "explicit" as const,
-				createdAt: now,
-				updatedAt: now,
-			})),
-		);
-		await expect(
-			upsertNarratorEventSubscription({
-				sourceNarratorId: source,
-				recipientNarratorId: recipient,
-				events: ["completed"],
-				origin: "explicit",
-			}),
-		).rejects.toThrow(`at most ${MAX_SUBSCRIPTIONS_PER_SOURCE}`);
 	});
 });

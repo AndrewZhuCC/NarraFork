@@ -160,6 +160,7 @@ describe("GET /api/fs/download", () => {
 	test.each([
 		"request-recordings",
 		"saved-request-recordings",
+		"token-repair-jobs",
 	])("generic file routes cannot serve %s, directly or via symlink", async (directory) => {
 		const root = join(narraforkDir, directory, "owner-recording");
 		mkdirSync(root, { recursive: true });

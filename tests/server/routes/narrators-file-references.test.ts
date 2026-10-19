@@ -1,5 +1,12 @@
 import { describe, expect, mock, test } from "bun:test";
 import { getFileReferenceSnapshots } from "@server/lib/agent/file-reference-projection";
+import {
+	bindComposerDocumentReferences,
+	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "@server/lib/composer-document";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import {
 	parseFileReferenceInput,
@@ -13,6 +20,7 @@ import {
 	updateBufferedMessageSchema,
 	updateNarratorDraftSchema,
 } from "@server/lib/validators/narrators";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import {
 	type FileReference,
 	type FileReferenceSnapshot,
@@ -112,6 +120,7 @@ function fixture(
 		return message;
 	}
 	interface AcceptedInput {
+		composerDocument?: ComposerDocument;
 		fileReferences?: FileReferenceSnapshot[];
 		images?: Array<{ imageId: string }>;
 		queueOnly?: boolean;
@@ -197,6 +206,11 @@ function fixture(
 		ValidationError,
 		NotFoundError,
 		parseFileReferenceInput,
+		parseOptionalComposerDocument,
+		bindComposerDocumentReferences,
+		restoreMultipartComposerText,
+		validateComposerAssets,
+		validateComposerProjection,
 		replaceFileReferenceSnapshots,
 		getFileReferenceSnapshots,
 		fileReferenceMessageForDisplay,
@@ -352,6 +366,45 @@ function multipart(message = "", refs: unknown = [reference]) {
 }
 
 describe("file reference HTTP sends", () => {
+	test.each([
+		[false, false],
+		[true, false],
+		[false, true],
+		[true, true],
+	])("composer projection precedes reference capture (multipart=%s, mismatch=%s)", async (form, mismatch) => {
+		const f = fixture();
+		const composerDocument: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "Inspect " },
+						{ type: "fileReference", id: "inline-ref", reference },
+					],
+				},
+			],
+		};
+		const projection = composerDocumentText(composerDocument);
+		const message = projection.text + (mismatch ? " altered" : "");
+		const body = { message, fileReferences: projection.fileReferences, composerDocument };
+		const multipartBody = new FormData();
+		multipartBody.set("message", message);
+		multipartBody.set("fileReferences", JSON.stringify(projection.fileReferences));
+		multipartBody.set("composerDocument", JSON.stringify(composerDocument));
+		const response = await f.request("messages", form ? multipartBody : body);
+		expect(response.status).toBe(mismatch ? 400 : 201);
+		if (mismatch) {
+			expect(f.captures).toHaveLength(0);
+			expect(f.send).not.toHaveBeenCalled();
+		} else {
+			expect(f.captures).toHaveLength(1);
+			expect(f.send.mock.calls[0][2]).toMatchObject({
+				composerDocument,
+				fileReferences: projection.fileReferences.map((ref) => snapshot(ref, "freshly read bytes")),
+			});
+		}
+	});
 	test("multipart references alone count as content without images or text files", async () => {
 		const f = fixture();
 		const form = new FormData();
