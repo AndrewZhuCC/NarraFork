@@ -184,6 +184,9 @@ test.each([
 		await load(page, commentable);
 		expect((await snapshot(page)).document).toEqual(commentable);
 		expect(await page.$$("[data-composer-comment]")).toHaveLength(2);
+		expect(
+			await page.$eval(`[data-composer-comment="${id}"] > span`, (label) => label.textContent),
+		).toBe(id === "q1" ? "saved quote comment" : "saved file comment");
 		expect(await page.$('[data-composer-atom="attachment"] [data-composer-comment]')).toBeNull();
 		await page.click(`[data-composer-atom="${type}"] > button`);
 		await settle(page);
@@ -219,6 +222,14 @@ test.each([
 		await settle(page);
 		const changed = await snapshot(page);
 		expect(changed.document).toEqual(updated);
+		const preview = await page.$eval(`[data-composer-comment="${id}"] > span`, (label) => ({
+			text: label.textContent,
+			width: label.getBoundingClientRect().width,
+			overflow: getComputedStyle(label).textOverflow,
+		}));
+		expect(preview.text).toBe(comment);
+		expect(preview.width).toBeGreaterThan(0);
+		expect(preview.overflow).toBe("ellipsis");
 		expect(changed.changes).toBe(before.changes + 1);
 		expect(changed.selection).toEqual(before.selection);
 		expect(changed.nativeSelection).toEqual(before.nativeSelection);
@@ -252,6 +263,7 @@ test.each([
 		);
 		expect(cleared).toMatchObject({ id, type });
 		expect(cleared).not.toHaveProperty("comment");
+		expect(await page.$(`[data-composer-comment="${id}"] > span`)).toBeNull();
 		expect(
 			await page.$eval(`[data-composer-comment="${id}"]`, (button) =>
 				button.hasAttribute("data-has-comment"),

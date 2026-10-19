@@ -839,7 +839,9 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 			anchor: "m:message-source",
 		});
 		expect(await page.$("[data-inline-quote-candidate]")).toBeNull();
-		expect(await page.evaluate(() => document.activeElement?.getAttribute("role"))).toBe("textbox");
+		await page.waitForFunction(() =>
+			document.activeElement?.hasAttribute("data-quote-comment-editor"),
+		);
 		await page.keyboard.press("Tab");
 		await settle(page);
 		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);
@@ -1161,6 +1163,122 @@ test("empty, short text and regular chips use a compact single line; long conten
 		await close(page);
 	}
 }, 15_000);
+
+test.each([
+	1000, 390,
+])("%spx select-all deletion keeps a pending quote inside the empty paragraph", async (width) => {
+	const page = await open();
+	try {
+		await page.setViewport({ width, height: 800 });
+		await layoutSettled(page);
+		const baseline = await layoutSnapshot(page);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.load({
+				version: 1,
+				assets: [],
+				paragraphs: [
+					{
+						children: Array.from({ length: 8 }, (_, index) => ({
+							type: "quote" as const,
+							id: `all-delete-${index}`,
+							label: `A quoted source long enough to wrap ${index}`,
+							text: `Source ${index}`,
+						})),
+					},
+				],
+			}),
+		);
+		await layoutSettled(page);
+		expect((await layoutSnapshot(page)).height).toBeGreaterThan(baseline.height);
+		await page.focus('[role="textbox"]');
+		await page.waitForFunction(() => document.activeElement?.getAttribute("role") === "textbox");
+		const modifier = await page.evaluate(() =>
+			/Mac/.test(navigator.platform) ? "Meta" : "Control",
+		);
+		await page.keyboard.down(modifier);
+		await page.keyboard.press("a");
+		await page.keyboard.up(modifier);
+		await page.keyboard.press("Backspace");
+		await layoutSettled(page);
+		expect((await snapshot(page)).document?.paragraphs).toEqual([{ children: [] }]);
+		await page.click("#quote-source");
+		await selectQuotableSource(page);
+		await layoutSettled(page);
+		expect(
+			await page.$eval("[data-composer-candidate-host]", (node) => node.parentElement?.tagName),
+		).toBe("P");
+		expect((await layoutSnapshot(page)).height).toBe(baseline.height);
+	} finally {
+		await close(page);
+	}
+}, 15000);
+
+test("quote candidates keep layout stable after multiple commented quotes and removing them", async () => {
+	const page = await open();
+	try {
+		await layoutSettled(page);
+		await page.$eval("[data-inline-composer]", (element) => {
+			const root = element as HTMLElement;
+			const leading = Number.parseFloat(root.style.getPropertyValue("--composer-leading-space"));
+			const trailing = Number.parseFloat(root.style.getPropertyValue("--composer-trailing-space"));
+			root.style.width = `${leading + trailing + 24 + 160 + 2}px`;
+		});
+		await layoutSettled(page);
+		const baseline = await layoutSnapshot(page);
+		expect(baseline.mode).toBe("compact");
+		const samples = () =>
+			page.evaluate(async () => {
+				const root = document.querySelector<HTMLElement>("[data-inline-composer]");
+				if (!root) throw new Error("Missing input");
+				const targets: string[] = [];
+				for (let index = 0; index < 48; index++) {
+					await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+					if (index >= 24) targets.push(`${root.dataset.layout}:${root.style.height}`);
+				}
+				return [...new Set(targets)];
+			});
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.load({
+				version: 1,
+				assets: [],
+				paragraphs: [
+					{
+						children: Array.from({ length: 5 }, (_, index) => ({
+							type: "quote" as const,
+							id: `layout-quote-${index}`,
+							label: `Quoted source ${index}`,
+							text: "Source text",
+							comment: "A comment that is longer than its inline preview ".repeat(4),
+						})),
+					},
+				],
+			}),
+		);
+		expect(await samples()).toHaveLength(1);
+		await page.click("#quote-source");
+		await selectQuotableSource(page);
+		expect(await samples()).toHaveLength(1);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clearSelection());
+		expect(await samples()).toHaveLength(1);
+		while (await page.$("[data-composer-atom]")) {
+			await page.click("[data-composer-atom] > span > button:last-child");
+			await settle(page);
+			if ((await page.$$("[data-composer-atom]")).length === 1) {
+				await layoutSettled(page);
+				expect((await layoutSnapshot(page)).height).toBe(baseline.height);
+			}
+		}
+		expect(await samples()).toHaveLength(1);
+		expect((await layoutSnapshot(page)).height).toBe(baseline.height);
+		await page.click("#quote-source");
+		await selectQuotableSource(page);
+		expect(await samples()).toHaveLength(1);
+		expect(await page.$("[data-inline-quote-candidate]")).not.toBeNull();
+		expect((await layoutSnapshot(page)).height).toBe(baseline.height);
+	} finally {
+		await close(page);
+	}
+}, 15000);
 
 test("height transitions reverse in flight without remounting the editor or queuing stale targets", async () => {
 	const page = await open();

@@ -271,6 +271,7 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 	const context = useContext(AtomContext);
 	const { t } = useTranslation("narrator");
 	const value = node.attrs.value as AtomNode;
+	const comment = value.type === "attachment" ? undefined : value.comment;
 	const asset = value.type === "attachment" ? context.assets.get(value.assetId) : undefined;
 	const resource = value.type === "attachment" ? context.resources?.get(value.assetId) : undefined;
 	const [objectURL, setObjectURL] = useState<{ file: File; url: string }>();
@@ -341,6 +342,7 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 			contentEditable={false}
 			className={`${classes.atom} ${image ? classes.imageAtom : classes.chip} ${selected ? classes.selected : ""}`}
 			data-composer-atom={value.type}
+			data-has-comment={!!comment || undefined}
 			data-composer-asset-id={value.type === "attachment" ? value.assetId : undefined}
 			data-missing={missing || undefined}
 			data-loading={restoring || undefined}
@@ -379,7 +381,7 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				{value.type !== "attachment" && context.onEditComment && (
 					<button
 						type="button"
-						className={classes.action}
+						className={`${classes.action} ${comment ? classes.commentAction : ""}`}
 						disabled={context.disabled}
 						aria-label={t("quote.editComment", { defaultValue: "Edit comment" })}
 						title={
@@ -399,6 +401,7 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 						}}
 					>
 						<IconMessageCircle size={12} />
+						{comment && <span className={classes.label}>{comment.slice(0, 600)}</span>}
 					</button>
 				)}
 				{open && (
@@ -547,8 +550,16 @@ export const InlineComposerEditor = forwardRef<
 								const change = transaction.getMeta(candidateKey) as
 									| { visible: boolean }
 									| undefined;
-								if (change) return change.visible ? transaction.selection.from : null;
-								return position == null ? null : transaction.mapping.map(position);
+								const next = change
+									? change.visible
+										? transaction.selection.from
+										: null
+									: position == null
+										? null
+										: transaction.mapping.map(position);
+								// AllSelection starts outside the paragraph. Keep only the preview
+								// in inline content, without changing the user's real selection.
+								return next == null ? null : TextSelection.near(transaction.doc.resolve(next)).from;
 							},
 						},
 						props: {

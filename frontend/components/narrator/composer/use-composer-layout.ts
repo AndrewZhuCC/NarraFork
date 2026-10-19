@@ -1,7 +1,6 @@
 import type { Editor } from "@tiptap/core";
 import { type RefObject, useLayoutEffect, useRef } from "react";
 
-const HYSTERESIS = 8;
 const MIN_INPUT_WIDTH = 64;
 
 /** Geometry belongs to this input only, never to its message-list parent. */
@@ -31,7 +30,6 @@ export function useComposerLayout({
 		let disposed = false;
 		let initialized = false;
 		let observedWidth = -1;
-		let expanded = false;
 		const setVariable = (key: string, value: number) => {
 			const next = `${value}px`;
 			if (root.style.getPropertyValue(key) !== next) root.style.setProperty(key, next);
@@ -39,13 +37,15 @@ export function useComposerLayout({
 		const measure = () => {
 			frame = null;
 			if (disposed || editor.isDestroyed || root.clientWidth === 0) return;
+			// Measure the same compact width every time; expanded chips and clipped text
+			// cannot tell us whether the document will fit after collapsing.
+			root.dataset.layout = "compact";
 			const leading = leadingRef.current?.getBoundingClientRect();
 			const trailing = trailingRef.current?.getBoundingClientRect();
 			const leadingSpace = leading?.width ? leading.width + 8 : 0;
 			const trailingSpace = trailing?.width ? trailing.width + 8 : 0;
 			setVariable("--composer-leading-space", leadingSpace);
 			setVariable("--composer-trailing-space", trailingSpace);
-			root.dataset.layout ??= "compact";
 			const style = view.getComputedStyle(editable);
 			const lineHeight = Number.parseFloat(style.lineHeight) || 24;
 			const verticalPadding =
@@ -55,20 +55,8 @@ export function useComposerLayout({
 			const compactHeight = Math.max(singleHeight, controlsHeight + 14) + 2;
 			const available = root.clientWidth - 24 - leadingSpace - trailingSpace;
 			const oneLine = editable.scrollHeight <= Math.ceil(singleHeight) + 1;
-			let nextExpanded = available < MIN_INPUT_WIDTH || !oneLine;
-			if (expanded && oneLine && available >= MIN_INPUT_WIDTH) {
-				// Only measure an inline range when the visible document already fits one line.
-				// Large documents take the scrollHeight fast path, not a full text measurement.
-				const paragraph = editable.firstElementChild;
-				const range = root.ownerDocument.createRange();
-				if (paragraph) range.selectNodeContents(paragraph);
-				const width = paragraph ? range.getBoundingClientRect().width : 0;
-				nextExpanded = width > available - HYSTERESIS;
-			}
-			if (nextExpanded !== expanded) {
-				expanded = nextExpanded;
-				root.dataset.layout = expanded ? "expanded" : "compact";
-			}
+			const expanded = available < MIN_INPUT_WIDTH || !oneLine;
+			if (expanded) root.dataset.layout = "expanded";
 			const naturalHeight = editable.scrollHeight;
 			setVariable("--composer-content-height", expanded ? naturalHeight : compactHeight - 2);
 			// Let CSS resolve dvh/min()/custom limits, including a keyboard-shortened viewport.
