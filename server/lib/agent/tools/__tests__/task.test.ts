@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { settings } from "../../../settings";
+import { delegationRegistration } from "../../../validators/runtime-registration";
 import type { AgentConfig, ToolContext, ToolUpdateExecutionLease } from "../../types";
 
 const runCalls: Array<Record<string, unknown>> = [];
@@ -178,6 +179,7 @@ describe("Agent archive / unarchive commands", () => {
 		status: string;
 		title: string | null;
 		traits?: unknown;
+		runtimeRegistrationJson?: unknown;
 	};
 
 	const narrators = new Map<string, FakeNarrator>();
@@ -325,6 +327,7 @@ describe("Agent archive / unarchive commands", () => {
 			id: "child-1",
 			parentNarratorId: "parent",
 			variant: "subagent:general",
+			runtimeRegistrationJson: delegationRegistration("parent", "general"),
 			status: "working",
 			title: "Run Tests",
 		});
@@ -332,6 +335,7 @@ describe("Agent archive / unarchive commands", () => {
 			id: "foreign",
 			parentNarratorId: "other-parent",
 			variant: "subagent:general",
+			runtimeRegistrationJson: delegationRegistration("other-parent", "general"),
 			status: "idle",
 			title: "Foreign",
 		});

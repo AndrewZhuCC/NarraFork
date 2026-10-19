@@ -3,6 +3,7 @@ import { inArray } from "drizzle-orm";
 import { db } from "../../../../db";
 import { narratorMessageRefs, narrators } from "../../../../db/schema";
 import { contextAskService } from "../../../../services/context-ask-service";
+import { delegationRegistration } from "../../../validators/runtime-registration";
 import type { ToolContext } from "../../types";
 import { contextAskTool } from "../context-ask";
 
@@ -14,6 +15,14 @@ const outsideParentId = `context-outside-parent-${suffix}`;
 const outsideChildId = `context-outside-child-${suffix}`;
 const narratorIds = [parentId, childId, siblingId, outsideParentId, outsideChildId];
 const originalAsk = contextAskService.ask;
+
+/** Relations a delegation stores when it is created. */
+function delegated(parent: string, pool = "general") {
+	return {
+		policySourceNarratorId: parent,
+		runtimeRegistrationJson: delegationRegistration(parent, pool),
+	};
+}
 
 function makeCtx(narratorId: string): ToolContext {
 	return {
@@ -42,6 +51,7 @@ beforeAll(async () => {
 			type: "subagent",
 			variant: "subagent:explore",
 			parentNarratorId: parentId,
+			...delegated(parentId, "explore"),
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -51,6 +61,7 @@ beforeAll(async () => {
 			type: "subagent",
 			variant: "subagent:general",
 			parentNarratorId: parentId,
+			...delegated(parentId),
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -68,6 +79,7 @@ beforeAll(async () => {
 			type: "subagent",
 			variant: "subagent:explore",
 			parentNarratorId: outsideParentId,
+			...delegated(outsideParentId, "explore"),
 			createdAt: now,
 			updatedAt: now,
 		},

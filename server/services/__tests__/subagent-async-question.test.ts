@@ -10,7 +10,18 @@ import {
 	users,
 } from "../../db/schema";
 import type { AgentConfig, ToolContext } from "../../lib/agent/types";
+import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
+
+/** Relations and capability ceiling a delegation stores when it is created. */
+function delegated(parent: string, pool = "general") {
+	return {
+		policySourceNarratorId: parent,
+		runtimeRegistrationJson: delegationRegistration(parent, pool),
+		traits: withRuntimePolicyTrait([], compileDelegationPolicy({ template: pool })),
+	};
+}
 
 const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
@@ -97,6 +108,7 @@ beforeEach(async () => {
 			id: CHILD,
 			variant: "subagent:general",
 			parentNarratorId: PARENT,
+			...delegated(PARENT),
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -104,6 +116,7 @@ beforeEach(async () => {
 			id: SIBLING,
 			variant: "subagent:explore",
 			parentNarratorId: PARENT,
+			...delegated(PARENT, "explore"),
 			createdAt: now,
 			updatedAt: now,
 		},

@@ -15,6 +15,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -30,6 +31,14 @@ afterAll(() => {
 });
 
 const PARENT = "collision-parent";
+
+/** Relations a delegation stores when it is created. */
+function delegated(parent: string, pool = "general") {
+	return {
+		policySourceNarratorId: parent,
+		runtimeRegistrationJson: delegationRegistration(parent, pool),
+	};
+}
 const A = "AaaaAaaaAaaaAaaaAaaa1";
 const B = "BbbbBbbbBbbbBbbbBbbb2";
 
@@ -58,6 +67,7 @@ async function seed(
 		type: "subagent",
 		variant: "subagent:general",
 		parentNarratorId: PARENT,
+		...delegated(PARENT),
 		title: over.title ?? null,
 		...(over.traits ? { traits: over.traits } : {}),
 		createdAt: now,
@@ -144,6 +154,7 @@ describe("two subagents that would share a label", () => {
 			type: "subagent",
 			variant: "subagent:general",
 			parentNarratorId: "other-parent",
+			...delegated("other-parent"),
 			title: "Theirs",
 			createdAt: now,
 			updatedAt: now,
