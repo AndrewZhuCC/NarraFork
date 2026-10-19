@@ -2,38 +2,48 @@ import { describe, expect, test } from "bun:test";
 import { awaitTool } from "../../lib/agent/tools/await";
 import { sendTool } from "../../lib/agent/tools/send";
 import type { AgentConfig } from "../../lib/agent/types";
+import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
 import {
-	assertSubagentCanAwaitAgent,
-	assertSubagentSendIsAsync,
+	assertRuntimeCanAwaitAgent,
+	assertRuntimeCanSendAwait,
 	SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR,
 	SUBAGENT_SEND_ASYNC_ONLY_ERROR,
 } from "../subagent-communication-policy";
 
-describe("subagent communication policy", () => {
-	test("rejects await=true for every Send issued by a subagent", () => {
-		expect(() => assertSubagentSendIsAsync(true, true)).toThrow(SUBAGENT_SEND_ASYNC_ONLY_ERROR);
+// Capability, not role: a delegated ceiling withholds sync waits, an undeclared one keeps them.
+const delegated = resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]);
+const undeclared = resolveRuntimePolicy([]);
+
+describe("communication capability policy", () => {
+	test("rejects await=true without the sendAwait capability", () => {
+		expect(() => assertRuntimeCanSendAwait(delegated, true)).toThrow(
+			SUBAGENT_SEND_ASYNC_ONLY_ERROR,
+		);
 	});
 
-	test("allows asynchronous Send from a subagent", () => {
-		expect(() => assertSubagentSendIsAsync(true, false)).not.toThrow();
-		expect(() => assertSubagentSendIsAsync(true, undefined)).not.toThrow();
+	test("allows asynchronous Send without the sendAwait capability", () => {
+		expect(() => assertRuntimeCanSendAwait(delegated, false)).not.toThrow();
+		expect(() => assertRuntimeCanSendAwait(delegated, undefined)).not.toThrow();
 	});
 
-	test("does not change primary narrator Send behavior", () => {
-		expect(() => assertSubagentSendIsAsync(false, true)).not.toThrow();
+	test("does not change Send behavior when the capability is present", () => {
+		expect(() => assertRuntimeCanSendAwait(undeclared, true)).not.toThrow();
 	});
 
-	test("rejects agent Await from subagents", () => {
-		expect(() => assertSubagentCanAwaitAgent(true)).toThrow(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
+	test("rejects agent Await without the awaitAgent capability", () => {
+		expect(() => assertRuntimeCanAwaitAgent(delegated)).toThrow(
+			SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR,
+		);
 	});
 
-	test("keeps agent Await available to primary narrators", () => {
-		expect(() => assertSubagentCanAwaitAgent(false)).not.toThrow();
+	test("keeps agent Await available when the capability is present", () => {
+		expect(() => assertRuntimeCanAwaitAgent(undeclared)).not.toThrow();
 	});
 
-	test("hides synchronous agent options from subagent model schemas", () => {
-		const subagentConfig = { parentNarratorId: "parent" } as AgentConfig;
-		const primaryConfig = {} as AgentConfig;
+	test("hides synchronous agent options from schemas under a delegated ceiling", () => {
+		// A parent id alone never changes the schema; only the attached ceiling does.
+		const subagentConfig = { runtimePolicy: delegated } as AgentConfig;
+		const primaryConfig = { parentNarratorId: "parent", runtimePolicy: undeclared } as AgentConfig;
 		const subagentSendProperties = (sendTool.getRawJsonSchema?.(subagentConfig).properties ??
 			{}) as Record<string, unknown>;
 		const primarySendProperties = (sendTool.getRawJsonSchema?.(primaryConfig).properties ??

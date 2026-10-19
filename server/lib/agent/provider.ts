@@ -14,7 +14,9 @@ import type {
 import type { ContextInputCharacters } from "@shared/context-usage";
 import type { ProviderReadiness } from "@shared/provider-readiness";
 import { getCodexManager } from "../codex-manager";
+import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
+import { logger } from "../logger";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
@@ -23,6 +25,7 @@ import {
 	getOpenaiProviderConfig,
 	parseModelId,
 	resolveEffectiveModel,
+	resolveModelProtocol,
 	resolveProvider,
 	settings,
 } from "../settings";
@@ -30,10 +33,16 @@ import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../token
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
+import { buildCommandCodeProvider } from "./commandcode-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
+import {
+	connectionForProtocolSwitch,
+	type ProtocolConnectionFields,
+	protocolMatchesConnection,
+} from "./protocol-override";
 import { type ProviderSource, ProviderSourceRegistry } from "./provider-source-registry";
 import type { ApiRequestDumpCollector } from "./request-dump";
 import { TokenDanceProvider } from "./tokendance-provider";
@@ -335,6 +344,21 @@ builtinProviderSources.register("codex", {
 	],
 });
 
+builtinProviderSources.register("CommandCode", {
+	resolve: (provider, model) =>
+		provider === "CommandCode" ? buildCommandCodeProvider(model, settings.commandCode) : null,
+	listReadiness: () => [
+		{
+			id: "builtin:CommandCode",
+			prefix: "CommandCode",
+			name: "Command Code",
+			ready:
+				!settings.commandCode?.disabled &&
+				!!resolveCommandCodeToken(settings.commandCode?.apiKey).credential,
+		},
+	],
+});
+
 /** API families expose the same instances used to construct their adapters. */
 function registerCredentialProviderSource<
 	T extends {
@@ -352,9 +376,30 @@ function registerCredentialProviderSource<
 	isComplete: (config: T) => boolean = (config) => !!config.apiKey.trim(),
 ): void {
 	builtinProviderSources.register(kind, {
-		resolve: (prefix) => {
+		resolve: (prefix, model) => {
 			const config = getConfig(prefix);
-			return config ? create(config) : null;
+			if (!config) return null;
+			// 逐模型协议覆盖：协议和这条连接本来的适配器不同时，换一族适配器，但留下代理和指纹。
+			const protocol = resolveModelProtocol(prefix, model);
+			const connection = config as ProtocolConnectionFields;
+			if (protocol && !protocolMatchesConnection(kind, connection, protocol)) {
+				try {
+					const shared = connectionForProtocolSwitch(connection, model);
+					if (protocol === "anthropic-messages") return new AnthropicProvider(shared);
+					if (protocol === "gemini-compatible") return createGeminiProvider(shared);
+					return new OpenAIProvider({
+						...shared,
+						apiMode: protocol === "openai-responses" ? "responses" : "completions",
+					});
+				} catch (error) {
+					logger.warn("Model protocol override fell back to the provider default", {
+						prefix,
+						protocol,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			return create(config);
 		},
 		listReadiness: () =>
 			listConfigs().map((config) => ({

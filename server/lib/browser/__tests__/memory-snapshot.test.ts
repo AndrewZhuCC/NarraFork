@@ -6,7 +6,6 @@ import { join } from "node:path";
 import {
 	createSnapshotExporter,
 	exportHeapSnapshot,
-	snapshotWorkerEntryPoint,
 	snapshotWorkerSpecifiers,
 } from "../memory-snapshot";
 import { SNAPSHOT_PENDING_BYTES, type SnapshotIO, SnapshotStream } from "../memory-snapshot-stream";
@@ -380,12 +379,9 @@ describe("snapshot supervisor", () => {
 				}),
 			).rejects.toThrow("(connect)");
 		}));
-	test("compiled candidates and Windows virtual-drive paths", () => {
+	test("compiled candidates", () => {
 		expect(snapshotWorkerSpecifiers(true, "file:///$bunfs/root/narrafork")[0]).toBe(
 			"file:///$bunfs/root/lib/browser/memory-snapshot-worker.js",
 		);
-		expect(
-			snapshotWorkerEntryPoint("file:///B:/%7EBUN/root/lib/browser/memory-snapshot-worker.js"),
-		).toBe("B:/~BUN/root/lib/browser/memory-snapshot-worker.js");
 	});
 });

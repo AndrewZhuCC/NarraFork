@@ -1,26 +1,17 @@
 /**
- * `POST /narrators/:id/interrupt` against a TAKEN-OVER foreground subagent.
+ * `POST /narrators/:id/interrupt` against a session whose run the user holds (takeover).
  *
- * The Stop button and the takeover flow met in a way that silently destroyed user
- * input. During a takeover the primary action button turns into the red interrupt
- * button, and when the queue head is a priority message it is even LABELLED "cut in
- * line" (`interruptCutInLine`) — so holding it is exactly what a user does to make a
- * queued message run next. That gesture calls this route.
+ * Holding the Stop button during a takeover is how a user makes a queued message run
+ * next. Stop there must end ONLY the current turn: the run (its owner, destination and
+ * deadline) stays, the hold stays, and the stopped turn returns to the hold where the
+ * queued input is consumed. Ending the run would discard that input and hand the
+ * caller a result it was never supposed to get yet.
  *
- * The route's subagent fallback was unconditionally HARD:
- *
- *   interruptForegroundSubagent(id, { hard: true })
- *
- * A hard interrupt makes `runForegroundLoop` take its `hardSubagentInterrupt` branch
- * and `break` out of the loop BEFORE the queue drain and before the takeover
- * suspension. `finalizeSubagent` then calls `clearSubagentBufferedMessages`, so every
- * queued message is discarded, and the terminal publication resolves the parent's
- * blocked tool call — the takeover ends and the parent's Agent card gets a result it
- * was never supposed to get yet.
- *
- * So what is pinned here is the interrupt FLAVOUR, not a message count: the flavour is
- * the single bit that decides whether the loop keeps the queue and the takeover, and
- * it is invisible in the response body (both flavours answer `{interrupted: true}`).
+ * Two signals are observable and both are pinned: the session's turn controller (what
+ * Stop aborts) and the run's own cancellation (what must stay untouched while held).
+ * A session that is not held is stopped the ordinary way: its turn ends and so does
+ * the run. Every session takes this same route; none is special because it was
+ * created by delegation.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -41,15 +32,11 @@ const { db } = await import("../../db");
 const { narrators, users } = await import("../../db/schema");
 const { eq } = await import("drizzle-orm");
 const { generateId } = await import("../../lib/id");
-const {
-	clearTakenOver,
-	consumeForegroundSubagentHardInterrupt,
-	getDetachableMap,
-	getForegroundAbortControllers,
-	isTakenOver,
-	markTakenOver,
-	ProxyAbortController,
-} = await import("../../services/narrator-subagent");
+const { getExecutionOwner, getRunHold, setRunControl, setRunHold, tryClaimExecution } =
+	await import("../../services/agent-runtime/ownership");
+type RunControl = import("../../services/agent-runtime/ownership").RunControl;
+const isTakenOver = (id: string) => !!getRunHold(id);
+const markTakenOver = (id: string) => setRunHold(id, { released: false });
 const { activeNarrators } = await import("../../services/narrator-session-state");
 type ActiveNarrator = import("../../services/narrator-session-state").ActiveNarrator;
 
@@ -84,18 +71,6 @@ function app() {
 
 function interrupt(id: string) {
 	return app().request(`http://localhost/narrators/${id}/interrupt`, { method: "POST" });
-}
-
-/**
- * Stand in for a running foreground subagent turn.
- *
- * The registry entry is all the route sees; the loop that would consume the abort
- * lives in `subagent-runner` and is out of scope here.
- */
-function registerForegroundTurn(id: string): AbortController {
-	const controller = new AbortController();
-	getForegroundAbortControllers().set(id, controller);
-	return controller;
 }
 
 beforeAll(async () => {
@@ -139,42 +114,36 @@ beforeAll(async () => {
 });
 
 /**
- * Stand in for a running foreground subagent the way production has it.
- *
- * A live subagent is ALWAYS registered in `activeNarrators` (subagent-executor does
- * it before the first pass) and in the detach registry (subagent-runner, for the
- * whole run). Registering only the foreground controller — as the cases above do —
- * lets `interruptNarrator` return false and silently skips the branch production
- * actually takes, which is how the takeover-destroying Stop went unnoticed.
+ * Stand in for a run of this session in flight the way the run service has it: the
+ * owner + run control in the registry and the session's live turn controller. A run
+ * parked by its hold has no turn in flight, only a wake.
  */
-function registerRealisticForegroundRun(id: string, parentSignal = new AbortController().signal) {
-	const turn = registerForegroundTurn(id);
-	const session = new AbortController();
-	activeNarrators.set(id, {
-		narratorId: id,
-		alive: true,
-		abortController: session,
-	} as unknown as ActiveNarrator);
-	getDetachableMap().set(id, {
-		runId: "route-test-run",
-		markDetached: () => {},
-		publishHandoff: () => false,
-		proxy: new ProxyAbortController(),
-		parentSignal,
-		fgAbort: turn,
-		toolUseId: "route-test-tool-use",
-		parentNarratorId: parentId,
-		subagentId: id,
-	});
-	return { turn, session };
+function registerRun(id: string, parked = false) {
+	const owner = tryClaimExecution(id, "run");
+	if (!owner) throw new Error("expected a free execution slot");
+	const run: RunControl = {
+		startedAt: Date.now(),
+		cancel: new AbortController(),
+		timedOut: false,
+		terminal: new Promise(() => {}),
+		deliverTo: { narratorId: parentId, toolUseId: "origin-tool" },
+		...(parked ? { wake: () => {} } : {}),
+	};
+	setRunControl(owner, run);
+	const turn = new AbortController();
+	if (!parked)
+		activeNarrators.set(id, {
+			narratorId: id,
+			alive: true,
+			abortController: turn,
+		} as unknown as ActiveNarrator);
+	return { run, turn };
 }
 
 afterEach(async () => {
-	getForegroundAbortControllers().clear();
-	getDetachableMap().clear();
+	setRunHold(subagentId, undefined);
+	getExecutionOwner(subagentId)?.release();
 	activeNarrators.delete(subagentId);
-	consumeForegroundSubagentHardInterrupt(subagentId);
-	clearTakenOver(subagentId);
 	// Restore the running-turn state the other tests assume, so a case that parks the
 	// subagent in idle cannot make its neighbours pass for the wrong reason.
 	await db
@@ -183,54 +152,32 @@ afterEach(async () => {
 		.where(eq(narrators.id, subagentId));
 });
 
-describe("interrupting a taken-over foreground subagent", () => {
-	test("stops the turn softly so the queue and the takeover survive", async () => {
+describe("interrupting a held run", () => {
+	test("stops only the current turn; the run and the hold survive", async () => {
 		markTakenOver(subagentId);
-		const controller = registerForegroundTurn(subagentId);
+		const { run, turn } = registerRun(subagentId);
 
 		const res = await interrupt(subagentId);
 
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ interrupted: true });
 		// The turn must still be stopped — a takeover does not make Stop a no-op.
-		expect(controller.signal.aborted).toBe(true);
-		// But NOT hard: the hard marker is what makes the runner skip the queue drain,
-		// discard queued messages and hand the result back to the blocked parent.
-		expect(consumeForegroundSubagentHardInterrupt(subagentId)).toBe(false);
-		// The takeover itself is untouched by stopping a turn within it.
+		expect(turn.signal.aborted).toBe(true);
+		// But the run is not cancelled: the stopped turn returns to the hold.
+		expect(run.cancel.signal.aborted).toBe(false);
 		expect(isTakenOver(subagentId)).toBe(true);
+		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
+		expect(after[0]?.substatus).not.toContain("interrupted");
 	});
 
-	test("a subagent that is NOT taken over is still hard-interrupted", async () => {
-		const controller = registerForegroundTurn(subagentId);
-
-		const res = await interrupt(subagentId);
-
-		expect(res.status).toBe(200);
-		expect(controller.signal.aborted).toBe(true);
-		// The plain Stop button must keep fully ending the subagent, otherwise the
-		// parent tool call stays blocked while the subagent looks idle.
-		expect(consumeForegroundSubagentHardInterrupt(subagentId)).toBe(true);
-	});
-
-	test("does not end the takeover when it sits SUSPENDED with no turn running", async () => {
+	test("a parked held run has no turn in flight: nothing is stopped or settled", async () => {
 		/*
-		 * A suspended takeover is parked in `idle[taken_over]` waiting for the user's
-		 * next command: no foreground controller, nothing in flight to stop.
-		 *
-		 * What matters is what must NOT happen. The soft path's only other lever is
-		 * `interruptManualOverride`, which SETTLES the subagent and hands a result to the
-		 * blocked parent — reaching for it here would silently end the takeover instead
-		 * of interrupting anything, and ending one is `POST /:id/stop-takeover`'s job.
-		 * The zombie fallback further down the route is also inert here, because
-		 * `idle` is neither `working` nor `waiting`.
-		 *
-		 * Pinned because it is unreachable from the UI (which shows "Stop takeover" in
-		 * this state), so only a direct API caller can observe it — and a change that
-		 * "fixes" the falsy result by settling the subagent would destroy a live
-		 * takeover with the user's queued work in it.
+		 * Parked in `idle[taken_over]` waiting for the user's next input: nothing is in
+		 * flight to stop. Ending the hold is `POST /:id/stop-takeover`'s job, and the
+		 * zombie fallback is inert because a held run is never a zombie.
 		 */
 		markTakenOver(subagentId);
+		const { run } = registerRun(subagentId, true);
 		await db
 			.update(narrators)
 			.set({ status: "idle", substatus: JSON.stringify(["taken_over"]) })
@@ -240,62 +187,61 @@ describe("interrupting a taken-over foreground subagent", () => {
 
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ interrupted: false });
-		// Still taken over, still the user's session: nothing was concluded.
+		expect(run.cancel.signal.aborted).toBe(false);
 		expect(isTakenOver(subagentId)).toBe(true);
-		expect(consumeForegroundSubagentHardInterrupt(subagentId)).toBe(false);
 		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
 		expect(after[0]?.status).toBe("idle");
 		expect(after[0]?.substatus).toBe(JSON.stringify(["taken_over"]));
 	});
 
-	test("REAL registration: stops the turn softly, never the session controller", async () => {
+	test("a held run whose turn just ended is never treated as a zombie", async () => {
 		markTakenOver(subagentId);
-		const { turn, session } = registerRealisticForegroundRun(subagentId);
-
-		const res = await interrupt(subagentId);
-
-		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ interrupted: true });
-		// The turn controller is what routes the stop into the takeover-aware control
-		// transition (drain the queue or re-suspend in `taken_over`).
-		expect(turn.signal.aborted).toBe(true);
-		expect(consumeForegroundSubagentHardInterrupt(subagentId)).toBe(false);
-		// The session controller must stay untouched: aborting it is the generic
-		// terminal abort that cleared the takeover and settled the parent's Agent call.
-		expect(session.signal.aborted).toBe(false);
-		expect(isTakenOver(subagentId)).toBe(true);
-		// Nothing was settled on the subagent row either.
-		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
-		expect(after[0]?.status).toBe("working");
-	});
-
-	test("REAL registration while SUSPENDED: nothing is stopped or settled", async () => {
-		markTakenOver(subagentId);
-		const { turn, session } = registerRealisticForegroundRun(subagentId);
-		// Suspended in the control transition: the runner still owns the run, but no
-		// turn is in flight, so there is no foreground controller.
-		getForegroundAbortControllers().delete(subagentId);
-		await db
-			.update(narrators)
-			.set({ status: "idle", substatus: JSON.stringify(["taken_over"]) })
-			.where(eq(narrators.id, subagentId));
-
+		// working in the DB, no live turn (between passes) — still held, not a zombie.
 		const res = await interrupt(subagentId);
 
 		expect(await res.json()).toEqual({ interrupted: false });
-		expect(turn.signal.aborted).toBe(false);
-		expect(session.signal.aborted).toBe(false);
-		expect(isTakenOver(subagentId)).toBe(true);
 		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
-		expect(after[0]?.substatus).toBe(JSON.stringify(["taken_over"]));
+		expect(after[0]?.status).toBe("working");
+		expect(isTakenOver(subagentId)).toBe(true);
 	});
+});
 
-	test("REAL registration without a takeover still stops the whole session", async () => {
-		const { session } = registerRealisticForegroundRun(subagentId);
+describe("interrupting a run that is not held", () => {
+	test("stops the session's turn the ordinary way (the run then ends)", async () => {
+		const { turn } = registerRun(subagentId);
 
 		const res = await interrupt(subagentId);
 
 		expect(await res.json()).toEqual({ interrupted: true });
-		expect(session.signal.aborted).toBe(true);
+		// The turn ends; the run's loop then reaches its single finalizer, which
+		// delivers the interrupted result once to the registered destination.
+		expect(turn.signal.aborted).toBe(true);
+	});
+
+	test("an undelegated session takes the very same path", async () => {
+		const owner = tryClaimExecution(parentId, "run");
+		const turn = new AbortController();
+		activeNarrators.set(parentId, {
+			narratorId: parentId,
+			alive: true,
+			abortController: turn,
+		} as unknown as ActiveNarrator);
+		try {
+			const res = await interrupt(parentId);
+			expect(await res.json()).toEqual({ interrupted: true });
+			expect(turn.signal.aborted).toBe(true);
+		} finally {
+			owner?.release();
+			activeNarrators.delete(parentId);
+		}
+	});
+
+	test("a zombie row (working, nothing running) is reset to interrupted", async () => {
+		const res = await interrupt(subagentId);
+
+		expect(await res.json()).toEqual({ interrupted: true });
+		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
+		expect(after[0]?.status).toBe("idle");
+		expect(after[0]?.substatus).toContain("interrupted");
 	});
 });

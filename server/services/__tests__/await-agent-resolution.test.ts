@@ -17,6 +17,7 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -33,6 +34,14 @@ const { clearAliasRegistry, registerTaskAlias } = await import("../subagent-alia
 const PARENT_ID = "parent-narrator-000";
 const SUB_A = "subagent-aaaaaaaaaaa";
 const SUB_B = "subagent-bbbbbbbbbbb";
+
+/** Relations a delegation stores when it is created. */
+function delegated(parent: string, pool = "general") {
+	return {
+		policySourceNarratorId: parent,
+		runtimeRegistrationJson: delegationRegistration(parent, pool),
+	};
+}
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -55,6 +64,7 @@ async function seedTeam(
 			type: "subagent" as const,
 			variant: "subagent:general",
 			parentNarratorId: PARENT_ID,
+			...delegated(PARENT_ID),
 			title: sub.title ?? null,
 			...(sub.traits ? { traits: sub.traits } : {}),
 			createdAt: now,
@@ -133,6 +143,7 @@ describe("running Send navigation", () => {
 				id: "foreign-child",
 				variant: "subagent:general",
 				parentNarratorId: "foreign-parent",
+				...delegated("foreign-parent"),
 				createdAt: now,
 				updatedAt: now,
 			},
@@ -344,6 +355,7 @@ describe("resolveAwaitAgentNarratorIds", () => {
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: "other-parent-00000000",
+				...delegated("other-parent-00000000"),
 				title: "Theirs",
 				createdAt: now,
 				updatedAt: now,
@@ -440,6 +452,7 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: FORKED,
+				...delegated(FORKED),
 				title: "Compare runtime build",
 				createdAt: now,
 				updatedAt: now,
@@ -452,6 +465,7 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: FORK_SOURCE,
+				...delegated(FORK_SOURCE),
 				title: "Compare runtime build",
 				createdAt: now,
 				updatedAt: now,

@@ -8,6 +8,7 @@
  */
 
 import { Worker } from "node:worker_threads";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../compiled-worker";
 import { hotSafe } from "../hot-safe";
 import { logger } from "../logger";
 import { isCompiledRuntime } from "../runtime-target";
@@ -46,23 +47,12 @@ export function fsScanWorkerSpecifierCandidates(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	const paths = compiled
-		? [
-				"./lib/fs-scan-worker/fs-scan-worker-entry.js",
-				"./server/lib/fs-scan-worker/fs-scan-worker-entry.js",
-				"./fs-scan-worker-entry.js",
-			]
-		: ["./fs-scan-worker-entry.ts"];
-	return paths.map((path) => new URL(path, moduleUrl).href);
-}
-
-/** Bun's compiled module keys use forward slashes. Only unwrap the virtual drive. */
-export function fsScanWorkerEntryPoint(specifier: string): string | URL {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)) {
-		return decodeURIComponent(url.pathname.slice(1));
-	}
-	return url;
+	return compiledWorkerSpecifiers(
+		"lib/fs-scan-worker/fs-scan-worker-entry.ts",
+		"./fs-scan-worker-entry.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 
 async function withSlot<T>(run: () => Promise<T>): Promise<T> {
@@ -110,7 +100,7 @@ function measureInWorker(
 	const maxEntries = options.maxEntries ?? DIR_SCAN_MAX_ENTRIES;
 	const maxDepth = options.maxDepth ?? DIR_SCAN_MAX_DEPTH;
 	return new Promise((resolve, reject) => {
-		const worker = new Worker(fsScanWorkerEntryPoint(specifier));
+		const worker = new Worker(workerEntryFromSpecifier(specifier));
 		let settled = false;
 		let ready = false;
 		const readyTimer = setTimeout(

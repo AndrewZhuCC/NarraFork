@@ -1,5 +1,12 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { delegationRegistration } from "@server/lib/validators/runtime-registration";
+import {
+	compileDelegationPolicy,
+	resolveRuntimePolicy,
+	UNRESTRICTED_RUNTIME_POLICY,
+} from "@server/services/agent-runtime/policy";
 import * as oauthRuntime from "@server/services/oauth-narrator-runtime-policy";
+import * as traitLayers from "@server/services/trait-layer-service";
 import {
 	getUpdateCoordinationStatus,
 	resetUpdateCoordinationForTests,
@@ -48,6 +55,9 @@ const realNarratorServiceModule = {
 };
 const realNarratorSubagentModule = {
 	...(await import("@server/services/narrator-subagent")),
+};
+const realAgentRuntimeRunModule = {
+	...(await import("@server/services/agent-runtime/run")),
 };
 
 const fakeBackgroundTaskService = {
@@ -185,9 +195,29 @@ type FakeNarrator = {
 	title: string | null;
 	lastActivityAt?: string;
 	traits?: string[];
+	runtimeRegistrationJson?: unknown;
 };
 
-const narrators = new Map<string, FakeNarrator>();
+/** Delegated rows are stored registered: their creator holds the control grant. */
+class NarratorFixtures extends Map<string, FakeNarrator> {
+	override set(id: string, narrator: FakeNarrator) {
+		const delegated = narrator.parentNarratorId && narrator.variant.startsWith("subagent");
+		return super.set(
+			id,
+			delegated && narrator.runtimeRegistrationJson === undefined
+				? {
+						...narrator,
+						runtimeRegistrationJson: delegationRegistration(
+							narrator.parentNarratorId as string,
+							narrator.variant.slice("subagent:".length) || "general",
+						),
+					}
+				: narrator,
+		);
+	}
+}
+
+const narrators = new NarratorFixtures();
 
 const fakeNarratorService = {
 	async listSubagentsForBroadcast(parentNarratorId: string, senderId: string, now = Date.now()) {
@@ -212,7 +242,7 @@ const fakeNarratorService = {
 			recentIdleTruncated: idle.length > 100,
 		};
 	},
-	async listSubagentsByParent(parentNarratorId: string) {
+	async listTeamMembers(parentNarratorId: string) {
 		return [...narrators.values()].filter((n) => n.parentNarratorId === parentNarratorId);
 	},
 	// Mirrors the real bounded view: active members first, then newest, with the
@@ -276,14 +306,19 @@ const teamFileChanges = new Map<string, Map<string, Set<string>>>();
 const deliveredMessages: DeliveredMessage[] = [];
 let deliveryHook: ((targetId: string) => Promise<string | undefined>) | undefined;
 
-mock.module("@server/services/narrator-subagent", () => ({
-	async cancelBackgroundTask(narratorId: string) {
-		cancelledAgents.push(narratorId);
-		const task = [...tasks.values()].find((task) => task.subagentNarratorId === narratorId);
-		if (!task || task.status !== "running") return false;
-		task.status = "cancelled";
-		return true;
+// Stop(agent) cancels through the task handle (its registered abort controller is the
+// run's cancel signal) or, with no live task, the run control itself. Both cancellers
+// are observed: `cancelled` (task handle) and `cancelledAgents` (run control).
+const liveRuns = new Set<string>();
+mock.module("@server/services/agent-runtime/run", () => ({
+	...realAgentRuntimeRunModule,
+	async controlRun(narratorId: string, action: { kind: string }) {
+		cancelledAgents.push(`${action.kind}:${narratorId}`);
+		return action.kind === "cancel" && liveRuns.delete(narratorId);
 	},
+}));
+
+mock.module("@server/services/narrator-subagent", () => ({
 	registerTaskAlias(_parentNarratorId: string, _taskId: string, title?: string) {
 		return { alias: title || "background-bash", conflicted: false };
 	},
@@ -329,13 +364,18 @@ mock.module("@server/services/agent-communication", () => ({
 	},
 }));
 
-// These in-memory narrator fixtures are ordinary (non-OAuth) sessions.
+// These in-memory narrator fixtures are ordinary (non-OAuth) sessions with no stored
+// ceiling; the real ceiling path is covered by narrator-unified-runtime-contract.test.ts.
 spyOn(oauthRuntime, "assertOAuthNarratorRuntimeActive").mockResolvedValue(null);
+const ceilingSpy = spyOn(traitLayers, "resolveNarratorRuntimePolicy").mockResolvedValue(
+	UNRESTRICTED_RUNTIME_POLICY,
+);
 
 afterAll(() => {
 	mock.module("@server/services/background-task-service", () => realBackgroundTaskServiceModule);
 	mock.module("@server/services/narrator-service", () => realNarratorServiceModule);
 	mock.module("@server/services/narrator-subagent", () => realNarratorSubagentModule);
+	mock.module("@server/services/agent-runtime/run", () => realAgentRuntimeRunModule);
 	mock.module("@server/services/agent-communication", () => realAgentCommunicationModule);
 	mock.restore();
 });
@@ -358,7 +398,17 @@ function seed() {
 	killHandlers.clear();
 	cancelled.length = 0;
 	cancelledAgents.length = 0;
+	liveRuns.clear();
 	narrators.clear();
+	// Team roots are read from their own rows; nobody controls these primaries.
+	for (const id of ["primary", "parent"])
+		narrators.set(id, {
+			id,
+			parentNarratorId: null,
+			variant: "primary",
+			status: "idle",
+			title: null,
+		});
 	teamFileChanges.clear();
 	deliveredMessages.length = 0;
 	deliveryHook = undefined;
@@ -820,17 +870,34 @@ describe("Stop tool", () => {
 	for (const selector of ["agent-task", "agent-alias"]) {
 		test(`agent stop resolves ${selector} and cancels the validated child narrator`, async () => {
 			seedAgentTask();
+			// The run registers its cancel signal as the task's abort controller.
+			const runCancel = new AbortController();
+			abortControllers.set("agent-task", runCancel);
 			const result = await stopTool.execute(
 				{ type: "agent", id: ` ${selector} ` },
 				makeCtx("parent"),
 			);
 			expect(result.isError).toBeFalsy();
 			expect(result.output).toContain("cancelled");
-			expect(cancelledAgents).toEqual(["child-agent"]);
-			expect(cancelled).toEqual([]);
+			expect(cancelled).toEqual(["agent-task"]);
+			expect(runCancel.signal.aborted).toBe(true);
+			expect(cancelledAgents).toEqual([]);
 			expect(tasks.get("agent-task")?.status).toBe("cancelled");
 		});
 	}
+
+	test("agent stop cancels a live run directly when its task handle is no longer running", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.status = "completed";
+		liveRuns.add("child-agent");
+		const result = await stopTool.execute({ type: "agent", id: "agent-task" }, makeCtx("parent"));
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("cancelled");
+		expect(cancelled).toEqual([]);
+		expect(cancelledAgents).toEqual(["cancel:child-agent"]);
+		expect(task.status).toBe("completed");
+	});
 
 	function seedAgentTask() {
 		seed();
@@ -854,13 +921,18 @@ describe("Stop tool", () => {
 		});
 	}
 
-	test("subagents cannot stop their own child agents through Stop", async () => {
+	test("a ceiling without orchestration cannot stop agents, even ones it controls", async () => {
 		seedAgentTask();
+		// Same rule for any caller: the delegation template's ceiling denies spawnAgent.
+		ceilingSpy.mockResolvedValueOnce(
+			resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]),
+		);
 		const result = await stopTool.execute(
 			{ type: "agent", id: "agent-task" },
 			makeCtx("parent", "grandparent"),
 		);
 		expect(result.isError).toBe(true);
+		expect(result.output).toContain("capability ceiling");
 		expect(cancelledAgents).toEqual([]);
 		expect(cancelled).toEqual([]);
 	});
@@ -904,8 +976,14 @@ describe("Stop tool", () => {
 				task.parentNarratorId = "other-parent";
 				task.type = "bash";
 			}
-			if (invalid === "foreign-child") child.parentNarratorId = "other-parent";
-			if (invalid === "primary-child") child.variant = "primary";
+			if (invalid === "foreign-child") {
+				child.parentNarratorId = "other-parent";
+				child.runtimeRegistrationJson = delegationRegistration("other-parent", "general");
+			}
+			if (invalid === "primary-child") {
+				child.variant = "primary";
+				child.runtimeRegistrationJson = null;
+			}
 			if (invalid === "missing-child") narrators.clear();
 			const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
 			expect(result.isError).toBe(true);
@@ -1201,10 +1279,14 @@ describe("TeamStatus actions", () => {
 			broadcast: true,
 			await: false,
 			targetCount: 1,
+			// A successful broadcast states the working-only rule by CODE — the bubble
+			// translates it — and carries no failure detail.
+			warningCodes: ["broadcastWorkingOnly"],
 			targetNames: ["Worker"],
 			recentIdle: [],
 			targets: [{ id: "sub-1", label: "worker", title: "Worker", status: "queued" }],
 		});
+		expect(result.metadata).not.toHaveProperty("warningDetails");
 		expect(deliveredMessages).toHaveLength(1);
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
@@ -1321,6 +1403,10 @@ describe("TeamStatus actions", () => {
 			broadcast: false,
 			await: false,
 			targetCount: 1,
+			// The status is reported as a raw value: the bubble builds the sentence from
+			// its own `communicationWarning_*` / `status_*` translations.
+			warningCodes: ["sendTargetNotWorking"],
+			warningStatus: "idle",
 			targets: [
 				{
 					id: "sub-1",
@@ -1330,7 +1416,6 @@ describe("TeamStatus actions", () => {
 					status: "queued",
 				},
 			],
-			warning: "(warning: target is idle, message may not be received)",
 		});
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
@@ -1455,6 +1540,10 @@ describe("TeamStatus broadcast status scope", () => {
 		expect(result.isError).toBe(true);
 		expect(result.metadata).toMatchObject({
 			targetCount: 1,
+			// Per-target failures stay free text (they name a target and an error, which
+			// has no translation), while the rule itself is a code.
+			warningCodes: ["broadcastWorkingOnly"],
+			warningDetails: ["name-failed: Error: queue full"],
 			targets: [{ id: "ok" }],
 			targetNames: ["Name ending", "Name failed", "Name ok"],
 		});
@@ -1479,7 +1568,11 @@ describe("TeamStatus broadcast status scope", () => {
 		);
 		expect(peak).toBe(4);
 		expect(deliveredMessages).toHaveLength(4);
-		expect(result.metadata).toMatchObject({ targetCount: 4 });
+		expect(result.metadata).toMatchObject({
+			targetCount: 4,
+			// Cancellation is a code too: the bubble owns the sentence.
+			warningCodes: ["broadcastWorkingOnly", "broadcastCancelled"],
+		});
 		expect(result.output).toContain("Broadcast cancelled");
 	});
 });

@@ -196,7 +196,15 @@ describe("interrupt task guard", () => {
 		releaseChat = () => {
 			gateOpened = true;
 		};
-		const sendPromise = sendMessage(narratorId, "work on the stale task", undefined, "en");
+		const sendPromise = sendMessage(
+			narratorId,
+			"work on the stale task",
+			undefined,
+			"en",
+			false,
+			null,
+			null,
+		);
 		await waitFor(() => providerCalls.length === 1);
 
 		expect(interruptNarrator(narratorId)).toBe(true);
@@ -267,7 +275,7 @@ describe("interrupt task guard", () => {
 
 		// The next user turn must NOT be followed by a spec auto-continuation for
 		// the stale task — the one-shot suppression consumes exactly that turn.
-		await sendMessage(narratorId, "changed my mind", undefined, "en");
+		await sendMessage(narratorId, "changed my mind", undefined, "en", false, null, null);
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle", 15_000);
 		expect(await specContinuationCount(narratorId)).toBe(0);
 
@@ -285,7 +293,7 @@ describe("interrupt task guard", () => {
 		);
 
 		releaseChat = () => {};
-		const firstSend = sendMessage(narratorId, "start work", undefined, "en");
+		const firstSend = sendMessage(narratorId, "start work", undefined, "en", false, null, null);
 		await waitFor(() => providerCalls.length === 1);
 
 		expect(await interruptAndWaitForIdle(narratorId, { timeoutMs: 5_000 })).toBe(true);
@@ -293,7 +301,15 @@ describe("interrupt task guard", () => {
 		releaseChat = null;
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
 
-		const replacement = sendMessage(narratorId, "replacement turn", undefined, "en");
+		const replacement = sendMessage(
+			narratorId,
+			"replacement turn",
+			undefined,
+			"en",
+			false,
+			null,
+			null,
+		);
 		await waitFor(() => providerCalls.length === 2);
 		await replacement;
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
@@ -334,7 +350,7 @@ describe("interrupt task guard", () => {
 		await insertIdleNarrator(narratorId);
 
 		releaseChat = () => {};
-		const sendPromise = sendMessage(narratorId, "hello", undefined, "en");
+		const sendPromise = sendMessage(narratorId, "hello", undefined, "en", false, null, null);
 		await waitFor(() => providerCalls.length === 1);
 
 		expect(interruptNarrator(narratorId)).toBe(true);
@@ -358,7 +374,15 @@ describe("interrupt task guard", () => {
 
 		for (let round = 0; round < 2; round++) {
 			releaseChat = () => {};
-			const sendPromise = sendMessage(narratorId, `round ${round}`, undefined, "en");
+			const sendPromise = sendMessage(
+				narratorId,
+				`round ${round}`,
+				undefined,
+				"en",
+				false,
+				null,
+				null,
+			);
 			await waitFor(() => providerCalls.length === round + 1);
 			interruptNarrator(narratorId);
 			releaseChat?.();

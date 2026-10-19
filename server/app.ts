@@ -12,6 +12,7 @@ import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
+import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
@@ -26,6 +27,7 @@ import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
 import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
+import { commandCodeRoutes } from "./routes/commandcode";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
 import { deepseekRoutes } from "./routes/deepseek";
@@ -324,6 +326,13 @@ app.route("/api/external/v1", externalV1Routes);
 // Anonymous sharing is a closed, Share-token-only prefix, never a login bypass.
 app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
 
+// Claimed by the `narrafork://` protocol client, which has no session: the one-time token is the
+// credential (see lib/reveal-protocol.ts).
+app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
+	const path = claimRevealToken(c.req.param("token"));
+	return path ? c.json({ path }) : c.json({ error: "Unknown or expired reveal token" }, 404);
+});
+
 // 管理器面板的更新与停止：凭本机回环 + 进程令牌，因此必须注册在全局会话认证之前。
 // Hono 按注册顺序匹配，挂载点晚于 requireSessionAuth 就永远轮不到这里。
 app.route("/api/update", localPeerUpdateRoutes);
@@ -426,6 +435,7 @@ app.route("/api/deepseek", deepseekRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nug", nugRoutes);

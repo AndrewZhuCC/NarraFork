@@ -36,10 +36,10 @@
  *   large fields (`output`, `input_json`, message bodies) are selected.
  */
 
-import { eq, inArray } from "drizzle-orm";
+import { inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators } from "../db/schema";
-import { isSubagentVariant } from "../lib/narrator-utils";
+import { RUNTIME_SOURCE_COLUMNS, teamMembersWhere, teamRootOf } from "../lib/runtime-source";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 
 /**
@@ -108,7 +108,7 @@ export function singleSendSelector(input: Record<string, unknown>): string | und
 
 /**
  * Field marking a tool call whose target subagent is currently TAKEN OVER by the
- * user (`subagent-takeover.ts`).
+ * user (a run hold, `agent-runtime/ownership.ts`).
  *
  * Why the parent's card needs it at all: a takeover leaves the parent narrator
  * blocked — a foreground Agent/Task call stays suspended in
@@ -386,9 +386,9 @@ function resolveAgainstRoster(
  * Returns `toolUseId → { id, title }` for the selectors that resolved
  * unambiguously. Unresolvable entries are simply absent.
  *
- * `teamParentId` must be the TEAM scope (a subagent's parent, or the narrator
- * itself for a primary), because both the alias registry and the roster are
- * keyed by parent — the same rule `getCommunicationScope` applies.
+ * `teamParentId` must be the team root (`teamRootOf`), because both the alias
+ * registry and the roster are keyed by it — the same rule `getCommunicationScope`
+ * applies.
  */
 export async function resolveAwaitAgentNarratorIds(
 	teamParentId: string,
@@ -400,7 +400,7 @@ export async function resolveAwaitAgentNarratorIds(
 	try {
 		const [roster, tasks] = await Promise.all([
 			db.query.narrators.findMany({
-				where: eq(narrators.parentNarratorId, teamParentId),
+				where: teamMembersWhere(teamParentId),
 				columns: { id: true, title: true, traits: true, variant: true },
 			}),
 			db.query.backgroundTasks.findMany({
@@ -461,8 +461,7 @@ export async function resolveAwaitAgentNarratorIds(
 					candidate = sendTaskAliases.get(owner)?.get(entry.selector)?.id ?? entry.selector;
 					if (candidate !== entry.selector) break;
 				}
-				const eligible = (target: (typeof roster)[number]) =>
-					isSubagentVariant(target.variant ?? "") && target.id !== entry.callerId;
+				const eligible = (target: (typeof roster)[number]) => target.id !== entry.callerId;
 				const direct = rosterById.get(candidate);
 				if (direct) {
 					if (eligible(direct))
@@ -515,31 +514,16 @@ export async function resolveAwaitAgentIdsForToolCalls(
 	const ownerIds = [...new Set([...ownerByToolUseId.values()])];
 	if (ownerIds.length === 0) return new Map();
 
-	// A subagent's Await resolves against its PARENT's roster (its own siblings),
-	// exactly as getCommunicationScope defines the team scope.
-	//
-	// ⚠️ "Is the caller a subagent" is decided by `variant`, NOT by the presence of
-	// `parentNarratorId` — that is what `getCommunicationScope` (the authority the
-	// Await tool itself runs through) does, and the two disagree for a real and
-	// common shape: a FORKED primary narrator also carries a `parentNarratorId`
-	// (the narrator it was forked from), while its own subagents are parented to
-	// IT. Treating that parent link as "I am a subagent" pointed the lookup at the
-	// fork source's roster, where the target does not exist.
-	//
-	// Measured on a real database: of 2082 Await-agent calls whose subagent id is
-	// known from persisted metadata, this mistake alone lost 131 — a running Await
-	// on a forked narrator's own child could never offer "open session". It fails
-	// silently (a missing menu item), which is why it survived so long.
+	// Each Await resolves against its owner's team, as getCommunicationScope defines it.
+	// A forked primary carries a `parentNarratorId` too, but nobody controls it, so it
+	// stays the root of its own team.
 	const scopeByNarratorId = new Map<string, string>();
 	try {
 		const owners = await db.query.narrators.findMany({
 			where: inArray(narrators.id, ownerIds),
-			columns: { id: true, parentNarratorId: true, variant: true },
+			columns: { id: true, ...RUNTIME_SOURCE_COLUMNS },
 		});
-		for (const owner of owners) {
-			const isSubagent = isSubagentVariant(owner.variant ?? "");
-			scopeByNarratorId.set(owner.id, isSubagent ? (owner.parentNarratorId ?? owner.id) : owner.id);
-		}
+		for (const owner of owners) scopeByNarratorId.set(owner.id, teamRootOf(owner));
 	} catch {
 		return new Map();
 	}

@@ -101,6 +101,7 @@ function callbacks(
 			getPendingPermissions: fallback?.permissions ?? (async () => []),
 			getBufferedMessages: fallback?.buffer ?? (async () => []),
 		},
+		onDraftMetaRef: { current: undefined },
 	};
 	const factory = new Function(
 		...Object.keys(scope),

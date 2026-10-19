@@ -61,7 +61,7 @@ export function readSqliteModelHistorySignature(
 }
 
 export async function readPostgresModelHistorySignature(
-	sql: SQL,
+	sql: Pick<SQL, "unsafe">,
 	narratorId: string,
 	options: { signal?: AbortSignal; deadline?: number } = {},
 ): Promise<ModelHistorySignature> {

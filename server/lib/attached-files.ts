@@ -46,5 +46,13 @@ export function buildAttachedFilesHint(
 					: "worktree copy unavailable; no usable path"),
 		);
 	}
+	// Images already reach the model as visual blocks; the path exists so the file itself can be
+	// placed or used in the project. Without saying so, models re-open the path to "see" it.
+	if (images.some((image) => image.file)) {
+		lines.push(
+			"Images above are already in this message; their paths are only for using the file itself " +
+				"(e.g. copying it into the project), not for viewing it again.",
+		);
+	}
 	return `\n\n<attached_files>\n${lines.join("\n")}\n</attached_files>`;
 }

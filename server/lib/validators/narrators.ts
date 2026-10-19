@@ -191,7 +191,10 @@ export const updateNarratorDraftSchema = z.object({
 	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS),
 	fileReferences: fileReferencesSchema.optional(),
 	composerDocument: composerDocumentSchema,
-	baseRevision: z.number().int().min(0),
+	sourceId: z.string().min(1).max(120).optional(),
+});
+
+export const restoreNarratorDraftSchema = z.object({
 	sourceId: z.string().min(1).max(120).optional(),
 });
 

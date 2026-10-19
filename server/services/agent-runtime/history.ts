@@ -13,19 +13,26 @@ import {
 	projectSenderText,
 	type SenderMessage,
 } from "../../lib/agent/sender-projection";
+import { isTopLevelMessage, type OwnTurnPlacement } from "../../lib/runtime-source";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
-import { verifyModelHistoryRowsCurrent } from "./model-history-source";
 
 export type RuntimeHistoryMessage = SenderMessage & {
 	injectionConsumedAt?: Date | string | null;
 };
 
+/** The one "top-level message" rule; defined beside the placement it reads. */
+export { isTopLevelMessage } from "../../lib/runtime-source";
+
 export interface RuntimeHistoryOptions {
 	narratorId: string;
 	model: string;
 	provider: string;
-	/** Only the child history view drops its subtree placement; persisted ownership never changes. */
-	profile: "primary" | "subagent";
+	/**
+	 * Explicit own transcript placement. Its placement is dropped for the
+	 * model view only; persisted ownership never changes. Omitted: read the session's
+	 * durable historical placement, falling back to its live run destination.
+	 */
+	ownTurnPlacement?: OwnTurnPlacement;
 	/** Already-authorized exact history page, when the caller also needs it for context preparation. */
 	sourceMessages?: readonly RuntimeHistoryMessage[];
 	/** Already accepted current input, with its original principal/attachment barrier. */
@@ -57,6 +64,7 @@ export function recoverRuntimeTrailingUserText(
 ): string | null {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
+		// Model projection: own turns have no placement left (see isTopLevelMessage).
 		if (message.parentToolUseId) continue;
 		if (message.role !== "user") return null;
 		const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
@@ -99,6 +107,7 @@ function projectCurrentInput(messages: readonly RuntimeHistoryMessage[], text: s
 	}
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
+		// Model projection: own turns have no placement left (see isTopLevelMessage).
 		if (message.parentToolUseId || message.role === "disp" || message.role === "system") continue;
 		if (message.role === "assistant" || message.role === "user") break;
 		const projected = projectMatch(message);
@@ -171,13 +180,19 @@ export async function buildRuntimeHistory(
 			deadline,
 		}));
 	checkBudget();
+	const ownPlacement =
+		options.ownTurnPlacement !== undefined
+			? options.ownTurnPlacement
+			: await (await import("../narrator-session")).readSessionOwnTurnPlacement(options.narratorId);
+	checkBudget();
 	// Detach mutable row arrays and block metadata, not huge text payloads,
 	// so shared/COW source rows remain unchanged during provider projection.
 	let modelMessages = sourceMessages
 		.filter((message) => message.role !== "disp")
 		.map((message) => ({
 			...message,
-			...(options.profile === "subagent" ? { parentToolUseId: null } : {}),
+			// Historical mounting is not nesting, even when no live run delivers there.
+			...(isTopLevelMessage(message, ownPlacement) ? { parentToolUseId: null } : {}),
 			contentJson: Array.isArray(message.contentJson)
 				? message.contentJson.map((block) =>
 						block && typeof block === "object" ? { ...block } : block,
@@ -220,11 +235,6 @@ export async function buildRuntimeHistory(
 		modelMessages.map(projectMessageSenderForModel),
 		built.trailingUserText,
 	);
-	await verifyModelHistoryRowsCurrent(sourceMessages, {
-		signal: options.attachmentSignal,
-		deadline,
-	});
-	checkBudget();
 	const input = projectCurrentInput(modelMessages, currentInput ?? "");
 	const combined = built.trailingUserText?.trim()
 		? input.trim()

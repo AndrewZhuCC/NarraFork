@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,33 +9,13 @@ import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
 import { settings } from "../../lib/settings";
 import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
-import { modelHistoryFixtureSql } from "../agent-runtime/model-history-fixture";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
-import {
-	loadModelHistorySource,
-	markModelHistoryRows,
-} from "../agent-runtime/model-history-source";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
-const { buildRuntimeHistory: buildSignedRuntimeHistory } = await import("../agent-runtime/history");
-// Explicit sourceMessages in this provider-projection suite are synthetic, not persisted rows.
-// Obtain their unversioned provenance through the real loader on a private legacy fixture;
-// never bypass the guard or downgrade rows loaded from the shipped DB in the integration cases.
-const syntheticDb = new Database(":memory:");
-syntheticDb.run(modelHistoryFixtureSql);
-syntheticDb.run("INSERT INTO narrators (id,title) VALUES ('synthetic','Synthetic')");
-const syntheticSource = await loadModelHistorySource(
-	{ backend: "sqlite", sqlite: syntheticDb },
-	"synthetic",
-);
-syntheticDb.close();
-function buildRuntimeHistory(options: Parameters<typeof buildSignedRuntimeHistory>[0]) {
-	if (options.sourceMessages) markModelHistoryRows(options.sourceMessages, syntheticSource);
-	return buildSignedRuntimeHistory(options);
-}
+const { buildRuntimeHistory } = await import("../agent-runtime/history");
 const { narratorPersistence } = await import("../narrator-persistence");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { consumeAgentMessageHistory } = await import("../agent-message-delivery");
@@ -93,10 +72,14 @@ afterEach(() => {
 	settings.geminiProviders = originalGeminiProviders;
 });
 afterAll(() => sqlite.close());
+/**
+ * "subagent" names the session shape whose run delivers to the "origin" call: its own
+ * turns are placed under that call. The rule is the same for every session.
+ */
 function options(profile: "primary" | "subagent" = "primary", official = false) {
 	return {
 		narratorId: profile === "primary" ? "primary" : "child",
-		profile,
+		ownTurnPlacement: profile === "subagent" ? "origin" : null,
 		model: "claude-sonnet-4",
 		provider: official ? "history-official" : "history-relay",
 	};
@@ -709,7 +692,7 @@ test("snapshot-only accepted input recovers frozen attachment bytes without reso
 });
 
 test("real loader plus currentRevision adoption retain exact history identity and current-input guard", async () => {
-	const owner = tryClaimExecution("primary", "primary");
+	const owner = tryClaimExecution("primary", "run");
 	if (!owner) throw new Error("Missing owner");
 	const store = createMailboxStore(db);
 	const result = store.enqueue({
@@ -762,7 +745,7 @@ test("real loader plus currentRevision adoption retain exact history identity an
 });
 
 test("grouped extracted sys receipts require the exact projected packet before adoption", async () => {
-	const owner = tryClaimExecution("primary", "primary");
+	const owner = tryClaimExecution("primary", "run");
 	if (!owner) throw new Error("Missing owner");
 	const store = createMailboxStore(db);
 	const result = store.enqueue({
@@ -902,7 +885,7 @@ test.each([
 		if (mode === "relay") expect(recovered.currentText).toContain('image: "logo.png"');
 		const child = await buildRuntimeHistory({
 			...runtimeOptions,
-			profile: "subagent",
+			ownTurnPlacement: "origin",
 			sourceMessages: [{ ...user, parentToolUseId: "origin" }],
 			currentInput: user.contentText,
 		});

@@ -2,10 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	getDynamicSpecSystemReminder,
-	getSubagentParentReportingHint,
-} from "../../lib/prompt-i18n";
+import { getDynamicSpecSystemReminder, getRunDeliveryHint } from "../../lib/prompt-i18n";
 import { MAX_PROJECT_INSTRUCTIONS_BYTES } from "../../lib/read-file-capped";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
 
@@ -178,24 +175,34 @@ describe("plan mode designated plan file state", () => {
 
 describe("subagent communication guidance", () => {
 	test("requires asynchronous Send and delegates agent dependencies to the parent", () => {
-		const en = getSubagentParentReportingHint("en", false);
-		const zh = getSubagentParentReportingHint("zh-CN", false);
+		const {
+			compileDelegationPolicy,
+			resolveRuntimePolicy,
+			runtimeInteractionHint,
+		} = require("../agent-runtime/policy");
+		const policy = resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]);
+		const en =
+			runtimeInteractionHint(policy, "en") +
+			getRunDeliveryHint("en", { narratorId: "caller" }, { narratorId: "caller" });
+		const zh =
+			runtimeInteractionHint(policy, "zh-CN") +
+			getRunDeliveryHint("zh-CN", { narratorId: "caller" }, { narratorId: "caller" });
 
-		expect(en).toContain("Every Send issued by a subagent is asynchronous");
-		expect(en).toContain("never set await:true");
-		expect(en).toContain('Await({ type: "agent", id: "..." })');
-		expect(en).toContain("foreground subagent");
-		expect(zh).toContain("你发出的所有 Send 都是异步的");
-		expect(zh).toContain('不要使用 Await({ type: "agent", id: "..." })');
-		expect(zh).toContain("当前是前台子代理");
+		expect(en).toContain("Send must be asynchronous");
+		expect(en).toContain("do not set await=true");
+		expect(en).toContain("Do not use Await(agent)");
+		expect(en).toContain("caller is waiting");
+		expect(zh).toContain("Send 只能异步发送");
+		expect(zh).toContain("不得使用 Await(agent)");
+		expect(zh).toContain("调用方正在等待");
 	});
 
 	test("background guidance permits asynchronous parent progress reports", () => {
-		const en = getSubagentParentReportingHint("en", true);
-		const zh = getSubagentParentReportingHint("zh-CN", true);
+		const en = getRunDeliveryHint("en", { narratorId: "recipient" });
+		const zh = getRunDeliveryHint("zh-CN", { narratorId: "recipient" });
 
-		expect(en).toContain('Send({ id: "parent"');
-		expect(zh).toContain('Send({ id: "parent"');
+		expect(en).toContain('Send({ id: "recipient"');
+		expect(zh).toContain('Send({ id: "recipient"');
 	});
 });
 

@@ -282,6 +282,7 @@ beforeEach(() => {
 	const modelsSpy = spyOn(models, "useAllModels").mockReturnValue({
 		providerLabels: { existing: "Existing provider", draft: "New draft" },
 		codexModels: [],
+		commandcodeModels: [],
 		openaiByProvider: [],
 		anthropicByProvider: [],
 		geminiByProvider: [],
@@ -480,7 +481,8 @@ describe("provider add nested route", () => {
 				});
 			expect(router.state.location.pathname).toBe("/settings/providers");
 			expectOriginalDisabled();
-			expect(container.querySelectorAll('[role="button"]').length).toBe(2);
+			// codex + CommandCode + existing: CommandCode 平台卡加入概览后多一张。
+			expect(container.querySelectorAll('[role="button"]').length).toBe(3);
 			expect(container.textContent).not.toContain("Discard this draft");
 			expectNoSave();
 		});
@@ -525,7 +527,8 @@ describe("provider add nested route", () => {
 			await leaveDetail();
 			expectOriginalDisabled();
 			expect(container.textContent).toContain(text("unsavedSave"));
-			expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+			// codex + CommandCode + existing + 新增的 draft。
+			expect(container.querySelectorAll('[role="button"]').length).toBe(4);
 		});
 	}
 
@@ -946,7 +949,9 @@ describe("provider add nested route", () => {
 			[...container.querySelectorAll("p")].find(
 				(node) => node.textContent === "tokendance:raw:model",
 			)?.parentElement;
-		expect(modelRow()?.querySelector("input")?.value).toContain("64");
+		// 协议选择器加入行首后，上下文窗口输入不再是第一个 input —— 按值找。
+		const rowInputs = [...(modelRow()?.querySelectorAll("input") ?? [])];
+		expect(rowInputs.some((input) => input.value.includes("64"))).toBe(true);
 		// The unified row contains NumberInput controls and model testing; its last button toggles visibility.
 		const rowButtons = modelRow()?.querySelectorAll<HTMLButtonElement>("button");
 		const visibility = rowButtons?.item(rowButtons.length - 1);
@@ -1003,7 +1008,7 @@ describe("provider add nested route", () => {
 		expect(refreshSpy).toHaveBeenCalledTimes(2);
 	});
 
-	test("TokenDance overview disable has no duplicate request during pending operation", async () => {
+	test("TokenDance overview switch drafts locally and only persists via the save bar", async () => {
 		serverSettings = {
 			...clone(initialSettings),
 			tokendance: {
@@ -1015,13 +1020,8 @@ describe("provider add nested route", () => {
 			},
 		};
 		queryClient.setQueryData(["admin", "settings"], serverSettings);
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
 		const updateSpy = spyOn(api, "tokenDanceUpdateConnection").mockImplementation(
 			async (disabled) => {
-				await gate;
 				const connection = {
 					...(serverSettings.tokendance as {
 						connected: boolean;
@@ -1043,19 +1043,104 @@ describe("provider add nested route", () => {
 		);
 		const toggle = card?.querySelector<HTMLInputElement>('input[type="checkbox"]');
 		if (!toggle) throw new Error("Missing platform switch");
+		// 点击只写草稿：不触发任何连接接口，且底部保存条出现。
 		await act(async () => {
 			toggle.dispatchEvent(new Event("click", { bubbles: true }));
 		});
+		expect(updateSpy).toHaveBeenCalledTimes(0);
+		expect(saveCalls).toBe(0);
+		expect(container.textContent).toContain(text("unsavedSave"));
+		expect(container.textContent).toContain(text("unsavedDiscard"));
+		// 保存条是唯一的提交点：点「保存更改」后才写连接与 settings。
+		await click(button("unsavedSave"));
 		expect(updateSpy).toHaveBeenCalledTimes(1);
-		expect(toggle.disabled).toBe(true);
+		expect(updateSpy.mock.calls[0]?.[0]).toBe(true);
+		expect(saveCalls).toBe(1);
+		expect(
+			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
+		).not.toContain("tokendance");
+	});
+
+	test("TokenDance detail enable switch drafts locally too", async () => {
+		serverSettings = {
+			...clone(initialSettings),
+			tokendance: {
+				connected: true,
+				name: "TokenDance fresh",
+				disabled: false,
+				generation: 1,
+				models: [],
+			},
+		};
+		queryClient.setQueryData(["admin", "settings"], serverSettings);
+		const updateSpy = spyOn(api, "tokenDanceUpdateConnection").mockImplementation(
+			async (disabled) => {
+				const connection = {
+					...(serverSettings.tokendance as {
+						connected: boolean;
+						name: string;
+						disabled: boolean;
+						generation: number;
+						models: [];
+					}),
+					disabled,
+				};
+				serverSettings = { ...serverSettings, tokendance: connection };
+				return connection;
+			},
+		);
+		restorers.push(() => updateSpy.mockRestore());
+		await mount();
+		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("TokenDance fresh"),
+		);
+		if (!card) throw new Error("Missing TokenDance card");
+		await click(card);
+		// 详情页的「启用」开关同样只写草稿，不直接改连接记录。
+		const toggle = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		if (!toggle) throw new Error("Missing detail enable switch");
 		await act(async () => {
 			toggle.dispatchEvent(new Event("click", { bubbles: true }));
 		});
+		expect(updateSpy).toHaveBeenCalledTimes(0);
+		expect(saveCalls).toBe(0);
+		expect(container.textContent).toContain(text("unsavedSave"));
+		await click(button("unsavedSave"));
 		expect(updateSpy).toHaveBeenCalledTimes(1);
+	});
+
+	test("codex overview switch drafts locally and reorders only after saving", async () => {
+		// codex 无凭据（codexAvailable 缺失）：排序过去会把它压在平台分区末尾，
+		// 开关切了也不动。现在排序只看已保存的开关状态，无凭据只影响徽章。
+		// 概览按「平台集成 / 自定义」分区渲染，排序语义是分区内 active 在前、
+		// inactive 沉底 —— 所以断言 codex 与 CommandCode 的分区内相对顺序。
+		serverSettings = clone(initialSettings);
+		await mount();
+		const cardIndex = (needle: string) =>
+			[...container.querySelectorAll('[role="button"]')].findIndex((node) =>
+				node.textContent?.includes(needle),
+			);
+		// 两者都启用：按插入序 codex 在 CommandCode 前。
+		expect(cardIndex("codex")).toBeLessThan(cardIndex("CommandCode"));
+		const codexCard = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("codex"),
+		);
+		const toggle = codexCard?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		if (!toggle) throw new Error("Missing codex platform switch");
+		// 点击只写草稿：不落库、保存条出现、卡片顺序不动。
 		await act(async () => {
-			release();
+			toggle.dispatchEvent(new Event("click", { bubbles: true }));
 		});
 		expect(saveCalls).toBe(0);
+		expect(container.textContent).toContain(text("unsavedSave"));
+		expect(cardIndex("codex")).toBeLessThan(cardIndex("CommandCode"));
+		// 保存后才重排一次：codex 在平台分区内沉底。
+		await click(button("unsavedSave"));
+		expect(saveCalls).toBe(1);
+		expect(
+			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
+		).toContain("codex");
+		expect(cardIndex("codex")).toBeGreaterThan(cardIndex("CommandCode"));
 	});
 
 	test("direct entry to add initializes the parent and cancellation returns to providers", async () => {
@@ -1064,7 +1149,8 @@ describe("provider add nested route", () => {
 		await click(button("addProviderCancel"));
 		expect(router.state.location.pathname).toBe("/settings/providers");
 		expect(container.textContent).toContain("Existing provider");
-		expect(container.querySelectorAll('[role="button"]').length).toBe(2);
+		// codex + CommandCode + existing：CommandCode 平台卡加入概览后多一张。
+		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
 		expectNoSave();
 	});
 });

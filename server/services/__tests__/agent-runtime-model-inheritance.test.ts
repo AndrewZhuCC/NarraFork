@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 
@@ -92,6 +93,10 @@ beforeEach(() => {
 				type: id === CHILD ? "subagent" : "primary",
 				variant: id === CHILD ? "subagent:general" : "primary",
 				parentNarratorId: id === CHILD ? PARENT : null,
+				...(id === CHILD && {
+					policySourceNarratorId: PARENT,
+					runtimeRegistrationJson: delegationRegistration(PARENT, "general"),
+				}),
 				subagentType: id === CHILD ? "general" : null,
 				model: id === CHILD ? FOLLOW_PARENT_MODEL : A,
 				cwd: process.env.HOME,
@@ -104,11 +109,10 @@ beforeEach(() => {
 });
 afterEach(async () => {
 	const active = activeNarrators.get(CHILD);
-	if (active) {
-		await active._modelRefreshPending;
-		getExecutionOwner(CHILD)?.release();
-		activeNarrators.delete(CHILD);
-	}
+	if (active) await active._modelRefreshPending;
+	// The run service (not the loop) releases a run's owner; these tests drive the loop.
+	getExecutionOwner(CHILD)?.release();
+	activeNarrators.delete(CHILD);
 	mock.restore();
 });
 afterAll(() => {
@@ -123,8 +127,6 @@ function writeModel(id: string, model: string) {
 
 function fixture(
 	script: (options: ExecuteLoopOptions, active: ActiveNarrator) => Promise<ExecuteLoopResult>,
-	primary = false,
-	initialModel = B,
 ) {
 	const active: ActiveNarrator = {
 		narratorId: CHILD,
@@ -142,30 +144,13 @@ function fixture(
 		_blockedSkills: { all: false, names: new Set() },
 		_substatus: new Set(),
 	};
-	const owner = tryClaimExecution(CHILD, primary ? "primary" : "subagent");
+	const owner = tryClaimExecution(CHILD, "run");
 	if (!owner) throw new Error("Missing test execution owner");
 	activeNarrators.set(CHILD, active);
 	spyOn(executor, "executeAgentLoop").mockImplementation((options) => script(options, active));
 	return {
 		active,
-		run: () =>
-			runAgentLoopUnlocked(
-				active,
-				owner,
-				"fixture input",
-				undefined,
-				primary
-					? { kind: "primary" }
-					: {
-							kind: "subagent",
-							parentNarratorId: PARENT,
-							parentToolUseId: "inherit-origin",
-							subagentType: "general",
-							systemPrompt: "fixture prompt",
-							initialModel,
-							initialHistory: [{ protocol: "obsolete-provider", source: "snapshot" }],
-						},
-			),
+		run: () => runAgentLoopUnlocked(active, owner, "fixture input"),
 	};
 }
 
@@ -202,19 +187,17 @@ describe("shared orchestrator inherited runtime model", () => {
 		).toBe(true);
 	});
 
-	test("a DB pin overrides an older executor model and its prebuilt history", async () => {
+	test("a DB pin overrides an older executor model and history is rebuilt for it", async () => {
 		db.update(narrators).set({ model: B }).where(eq(narrators.id, CHILD)).run();
 		let checked = false;
-		const f = fixture(
-			async ({ history }, active) => {
-				expect(active.model).toBe(B);
-				expect(history).toEqual([{ protocol: "inheritfixture", source: "rebuilt" }]);
-				checked = true;
-				return finished;
-			},
-			false,
-			A,
-		);
+		const f = fixture(async ({ history }, active) => {
+			expect(active.model).toBe(B);
+			expect(history).toEqual([{ protocol: "inheritfixture", source: "rebuilt" }]);
+			checked = true;
+			return finished;
+		});
+		// The session still carries an older executor model.
+		f.active.model = A;
 		await f.run();
 		expect(checked).toBe(true);
 	});
@@ -224,17 +207,13 @@ describe("shared orchestrator inherited runtime model", () => {
 		db.update(narrators).set({ model: otherModel }).where(eq(narrators.id, PARENT)).run();
 		settings.agent.subagentAllowedModels.general = [otherModel];
 		let checked = false;
-		const f = fixture(
-			async ({ history, config }, active) => {
-				expect(active.model).toBe(otherModel);
-				expect(config.provider).toBe("otherfixture");
-				expect(history).toEqual([{ protocol: "otherfixture", source: "rebuilt" }]);
-				checked = true;
-				return finished;
-			},
-			false,
-			otherModel,
-		);
+		const f = fixture(async ({ history, config }, active) => {
+			expect(active.model).toBe(otherModel);
+			expect(config.provider).toBe("otherfixture");
+			expect(history).toEqual([{ protocol: "otherfixture", source: "rebuilt" }]);
+			checked = true;
+			return finished;
+		});
 		await f.run();
 		expect(checked).toBe(true);
 	});
@@ -401,7 +380,7 @@ describe("shared orchestrator inherited runtime model", () => {
 			.set({ model: B, pendingModelRestore: FOLLOW_PARENT_MODEL })
 			.where(eq(narrators.id, CHILD))
 			.run();
-		const f = fixture(async () => finished, true);
+		const f = fixture(async () => finished);
 		await f.run();
 		await settleNarratorRuntimeModel(f.active);
 		const row = db.select().from(narrators).where(eq(narrators.id, CHILD)).get();

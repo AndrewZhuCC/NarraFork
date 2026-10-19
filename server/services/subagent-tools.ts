@@ -1,19 +1,15 @@
+import { toolRegistry } from "@server/lib/agent/tool-registry";
 import type { ToolDefinition } from "@server/lib/agent/types";
-import {
-	getSubagentParentReportingHint,
-	getSubagentPrompt,
-	type Locale,
-	type SubagentType,
-} from "@server/lib/prompt-i18n";
+import { getSubagentPrompt, type Locale, type SubagentType } from "@server/lib/prompt-i18n";
 import { settings } from "@server/lib/settings";
 import {
+	compileDelegationPolicy,
 	isRuntimeToolAllowed,
 	type RuntimePolicy,
 	resolveRuntimePolicy,
-	runtimeInteractionHint,
+	UNRESTRICTED_RUNTIME_POLICY,
 } from "./agent-runtime/policy";
 import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
-import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 
 function normalizeMcpToolBehavior(behavior: string | null | undefined): string | null {
 	return behavior === "allow" ? "readWrite" : (behavior ?? null);
@@ -48,18 +44,24 @@ export function runtimeToolFilter(policy: RuntimePolicy): (tool: ToolDefinition)
 	return (tool) => isRuntimeToolAllowed(policy, tool.name, resolveMcpToolBehavior(tool));
 }
 
-/**
- * Check if an MCP tool should be included for the primary narrator.
- * Only excludes tools with "deny" behavior.
- */
-export function isMcpToolAllowedForNarrator(tool: ToolDefinition): boolean {
-	return runtimeToolFilter(resolveRuntimePolicy({ variant: "primary" }))(tool);
+/** The same ceiling check by tool name, for execution-time gates. Unknown MCP tools fail closed. */
+export function isRuntimeToolNameAllowed(policy: RuntimePolicy, toolName: string): boolean {
+	const tool = toolRegistry.get(toolName);
+	if (!tool) return !toolName.startsWith("mcp__") && isRuntimeToolAllowed(policy, toolName);
+	return runtimeToolFilter(policy)(tool);
 }
 
 /**
- * Resolve the tool filter for a subagent type.
- * Projects the shared built-in/custom capability policy into tool visibility.
- * MCP configuration remains live and execution permission gates remain mandatory.
+ * Check if an MCP tool is visible under an unrestricted ceiling.
+ * Only excludes tools with "deny" behavior.
+ */
+export function isMcpToolAllowedForNarrator(tool: ToolDefinition): boolean {
+	return runtimeToolFilter(UNRESTRICTED_RUNTIME_POLICY)(tool);
+}
+
+/**
+ * Tool visibility of a delegation template's compiled ceiling (creation-side
+ * preview; a running narrator uses its own resolved traits).
  * Accepts an optional pre-loaded customDef to avoid redundant I/O.
  */
 export function resolveToolFilter(
@@ -67,71 +69,36 @@ export function resolveToolFilter(
 	customDef?: CustomSubagentDef | null,
 ): ((tool: ToolDefinition) => boolean) | undefined {
 	return runtimeToolFilter(
-		resolveRuntimePolicy({
-			variant: "subagent",
-			subagentType,
-			customDefinition: customDef,
-		}),
+		resolveRuntimePolicy([
+			compileDelegationPolicy({ template: subagentType, customDefinition: customDef }),
+		]),
 	);
 }
 
 /**
- * Build the effective system prompt for a subagent.
- * Optionally injects contextSummary (after compact).
- * Accepts an optional pre-loaded customPrompt to avoid redundant I/O.
+ * The base prompt a delegation template compiles to, stored on the created narrator.
  *
- * Communication rules are included for every subagent. `canReportToParent`
- * only controls whether interim parent reports are advertised; foreground
- * subagents still receive the async-only communication policy.
+ * Only the template's own instructions: runtime adds the effective sections (cwd,
+ * senders, devices, compact summary) and the relationship and capability hints from
+ * the narrator's registration and ceiling on every pass, the same way for every
+ * session. A custom template's prompt is read once, here; editing or deleting the
+ * definition later does not change sessions created from it.
  */
-export async function buildSubagentSystemPrompt(
+export async function buildDelegationBasePrompt(
 	subagentType: SubagentType,
-	cwd: string,
 	locale: Locale,
-	contextSummary?: string | null,
 	customPrompt?: string | null,
-	canReportToParent = false,
-	runtimePolicy?: RuntimePolicy,
 ): Promise<string> {
-	// Try built-in prompt first
-	let basePrompt = getSubagentPrompt(subagentType, locale);
-
-	// If not a built-in type, use the pre-loaded custom prompt or load it
-	if (!basePrompt) {
-		if (customPrompt !== undefined) {
-			basePrompt = customPrompt;
-		} else {
-			const customDef = await customSubagentService.loadByName(subagentType);
-			basePrompt = customDef?.prompt ?? null;
-		}
-	}
-
-	// Fallback to a generic prompt if nothing found
-	if (!basePrompt) {
-		basePrompt =
-			locale === "zh-CN"
-				? "你是一个执行委派任务的子代理。完成任务并简洁地报告结果。"
-				: "You are a subagent executing a delegated task. Complete the task and report your results concisely.";
-	}
-
-	// All subagents receive the async-only communication policy. Background
-	// subagents additionally receive permission to report interim progress to the
-	// parent; foreground subagents are told that their final result is returned
-	// automatically when they finish.
-	const customDefinition = !["explore", "plan", "review", "search", "general"].includes(
-		subagentType,
-	)
-		? await customSubagentService.loadByName(subagentType)
-		: undefined;
-	const policy =
-		runtimePolicy ?? resolveRuntimePolicy({ variant: "subagent", subagentType, customDefinition });
-	basePrompt = `${basePrompt}\n\n${getSubagentParentReportingHint(locale, canReportToParent)}\n${runtimeInteractionHint(policy, locale)}`;
-
-	const { prompt } = await buildEffectiveSystemPrompt({
-		basePrompt,
-		cwd,
-		locale,
-		contextSummary,
-	});
-	return prompt ?? basePrompt;
+	const builtin = getSubagentPrompt(subagentType, locale);
+	if (builtin) return builtin;
+	const custom =
+		customPrompt !== undefined
+			? customPrompt
+			: ((await customSubagentService.loadByName(subagentType))?.prompt ?? null);
+	return (
+		custom ||
+		(locale === "zh-CN"
+			? "你是一个执行委派任务的子代理。完成任务并简洁地报告结果。"
+			: "You are a subagent executing a delegated task. Complete the task and report your results concisely.")
+	);
 }

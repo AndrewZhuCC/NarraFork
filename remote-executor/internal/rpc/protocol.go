@@ -136,6 +136,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureGitWorkspaceStatusV1,
 		FeatureGitLineStatsV1,
 		FeatureGitCommitPreviewV1,
+		FeatureEditorRawReadV1,
 	} {
 		seen := false
 		for _, feature := range features {

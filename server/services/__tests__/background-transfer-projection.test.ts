@@ -111,6 +111,19 @@ async function flush(): Promise<void> {
 	for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+/**
+ * `createTransferTask` queues its list delta without awaiting it. Under CI load
+ * that frame can land after the test has already cleared `broadcasts`, and then
+ * it looks like the progress broadcast bumped the list version.
+ */
+async function waitForListDelta(): Promise<void> {
+	for (let i = 0; i < 50; i++) {
+		if (broadcasts.some((entry) => entry.message.type === "background_task_list_delta")) return;
+		await flush();
+	}
+	throw new Error("timed out waiting for the transfer projection list delta");
+}
+
 describe("transfer projection lifecycle", () => {
 	test("creates one row per transfer and REVIVES it on resume", async () => {
 		// A resumed transfer claims again under a new generation. Inserting a second
@@ -379,7 +392,7 @@ describe("live progress reaches the list without touching the delta sequence", (
 			transferTaskId: transferId,
 			title: "upload → app.apk",
 		});
-		await flush();
+		await waitForListDelta();
 		const versionsBefore = broadcasts
 			.filter((b) => b.message.type === "background_task_list_delta")
 			.map((b) => b.message.version);

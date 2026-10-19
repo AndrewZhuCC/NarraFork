@@ -32,7 +32,10 @@ function assistant(id: string, text: string, seq: number) {
 		.run();
 }
 function start() {
-	return service.startAgentRun({ narratorId: "actor", parentNarratorId: "parent" });
+	return service.startRun({
+		narratorId: "actor",
+		binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+	}).publication!;
 }
 function snapshot(run: ReturnType<typeof start>, text: string, commit = true) {
 	return db.transaction((tx) => {
@@ -66,7 +69,12 @@ afterAll(() => {
 
 test("foreground terminal persists then consumes atomically, preserves source and never publishes notices", async () => {
 	const facade = getRuntimePublicationService();
-	const run = await facade.startAgentRun({ narratorId: "actor", parentNarratorId: "parent" });
+	const run = (
+		await facade.startRun({
+			narratorId: "actor",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		})
+	).publication!;
 	const output = `FIRST ${"x".repeat(40_000)}`;
 	assistant("foreground-current", output, 0);
 	const input = {
@@ -89,7 +97,12 @@ test("foreground terminal persists then consumes atomically, preserves source an
 	expect((await facade.readAgentTerminalResult(run))?.output).toContain("FIRST");
 	expect(db.select().from(outbox).all()).toHaveLength(0);
 	expect(db.select().from(mailbox).all()).toHaveLength(0);
-	const next = await facade.startAgentRun({ narratorId: "actor", parentNarratorId: "parent" });
+	const next = (
+		await facade.startRun({
+			narratorId: "actor",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		})
+	).publication!;
 	await facade.commitAgentTerminal({
 		...input,
 		run: next,
@@ -102,7 +115,12 @@ test("foreground terminal persists then consumes atomically, preserves source an
 	);
 	expect(await facade.readAgentTerminalResult({ ...next, recipientId: "wrong" })).toBeNull();
 	// Consumption failure must roll back the snapshot/ref/counters, not leave a half receipt.
-	const failed = await facade.startAgentRun({ narratorId: "actor", parentNarratorId: "parent" });
+	const failed = (
+		await facade.startRun({
+			narratorId: "actor",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		})
+	).publication!;
 	sqlite.exec(
 		"CREATE TRIGGER fail_foreground_consumption BEFORE INSERT ON runtime_awaited_terminal_consumptions BEGIN SELECT RAISE(ABORT, 'receipt failure'); END",
 	);

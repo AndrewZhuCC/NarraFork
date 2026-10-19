@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-
+import { SESSION_VERSION_CLAIM } from "@shared/session-auth";
 import { eq } from "drizzle-orm";
 
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
@@ -124,6 +124,7 @@ import { initDeviceConnectionService } from "./services/device-connection-servic
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
+import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -1105,6 +1106,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 					// when it lapses; the upgrade is the only place the token is verified.
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
+						sessionTokenVersion: payload[SESSION_VERSION_CLAIM] ?? 0,
 						sessionUserId: payload.sub,
 					});
 					if (!wsData) {
@@ -1454,6 +1456,10 @@ initDeviceTransferService();
 if (activeDatabaseBackend === "postgres") {
 	logger.warn("OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated");
 } else {
+	// Narrators written before runtime registrations store their relations from now on.
+	await materializeLegacyDelegations().catch((error) =>
+		logger.warn("Legacy delegation materialization failed", { error: String(error) }),
+	);
 	try {
 		await backfillOAuthGrantAuthoritiesOnStartup();
 		await backfillIntegrationResourceBindingsOnStartup();

@@ -251,10 +251,14 @@ async function renderSection() {
 						<ConfirmDialogContext.Provider value={{ confirm: async () => true }}>
 							<TokenDanceSection
 								connection={connection}
+								enabled
+								onToggleEnabled={() => {}}
 								onLogin={async () => {}}
 								onChanged={async () => {}}
 								onDeleted={() => {}}
 								hiddenModels={new Set()}
+								modelProtocols={{}}
+								onModelProtocolChange={() => {}}
 								modelContextWindows={{}}
 								onToggleHidden={() => {}}
 								onContextWindowChange={() => {}}

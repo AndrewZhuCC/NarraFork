@@ -44,6 +44,12 @@ export interface ParentInboundMessage {
 	fromToolUseId?: string;
 	/** Message text (already capped). */
 	text: string;
+	/**
+	 * The producer's own model framing of a Send addressed to this session (e.g.
+	 * "[Message from the parent narrator]"). When present it is what the model reads;
+	 * the generic progress-report framing applies only to reports sent to a parent.
+	 */
+	modelText?: string;
 	timestamp: string;
 }
 

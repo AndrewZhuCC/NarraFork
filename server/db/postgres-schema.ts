@@ -458,6 +458,11 @@ export const narrators = pgTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "set null",
 		}),
+		runtimeRegistrationJson: jsonText("runtime_registration_json"),
+		policySourceNarratorId: text("policy_source_narrator_id").references(
+			(): PgColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 		insertSeq: bigint("insert_seq", { mode: "number" }).notNull().generatedByDefaultAsIdentity(),
@@ -475,6 +480,7 @@ export const narrators = pgTable(
 		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_write_audience").on(table.writeAudience),
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
+		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
@@ -1600,6 +1606,7 @@ export const narratorDrafts = pgTable(
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
+		previousJson: text("previous_json"),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_drafts_user_narrator").on(table.userId, table.narratorId),
@@ -3870,7 +3877,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 122,
-  "columnCount": 1711,
+  "columnCount": 1714,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6701,6 +6708,32 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "runtimeRegistrationJson",
+          "name": "runtime_registration_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "policySourceNarratorId",
+          "name": "policy_source_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_policy_source_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -6787,6 +6820,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_acl_root",
           "columns": [
             "aclRootNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_policy_source",
+          "columns": [
+            "policySourceNarratorId"
           ],
           "unique": false
         },
@@ -13345,6 +13385,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "kind": "text",
           "pgType": "text",
           "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "previousJson",
+          "name": "previous_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
           "primary": false,
           "unique": false
         }

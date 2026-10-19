@@ -129,18 +129,11 @@ export function validateComposerAssets(
 		assets.forEach((asset, index) => {
 			const file = files[index];
 			const name = file.name ?? file.filename;
-			// File.type is a MIME, but persisted content blocks use type as a discriminator.
-			const mime =
-				file.sourceMimeType ??
-				file.mimeType ??
-				file.mediaType ??
-				(file.type?.includes("/") ? file.type : undefined);
+			// MIME is advisory, not identity: multipart may rewrite aliases/defaults,
+			// and image decoding may detect a different format. Upload validation owns type safety.
 			if (
 				(name !== undefined && asset.name !== name) ||
-				(file.size !== undefined && asset.size !== file.size) ||
-				(mime !== undefined &&
-					asset.mimeType.split(";")[0].trim().toLowerCase() !==
-						mime.split(";")[0].trim().toLowerCase())
+				(file.size !== undefined && asset.size !== file.size)
 			)
 				throw new ValidationError("Composer attachment metadata does not match uploads");
 		});

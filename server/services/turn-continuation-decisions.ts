@@ -1,24 +1,17 @@
-/**
- * Pure end-of-pass decisions shared by both orchestration loops.
- *
- * The repository's established seam for loop decisions is a pure function (see
- * `planSubagentCompactRestart`, `planSubagentPaymentRequired`,
- * `planSubagentSilentDisconnect`): the loop bodies themselves depend on far too much to
- * instantiate in a test, and driving them end-to-end needs `mock.module`, which in Bun is
- * process-wide pollution rather than per-suite setup. Extracting the decision leaves the
- * loop body holding only the effects.
- *
- * A decision belongs here — rather than beside one loop — when both audiences reach the
- * SAME conclusion from the same inputs. Where the conclusions genuinely differ (a primary
- * narrator may park in `payment_required` and wait for a top-up; a subagent owes its
- * parent a `tool_result` and must fail with a stated reason), the difference is real and
- * the functions stay separate. See `turn-continuation-registry.ts` for the inventory and
- * for which audience handles what.
- */
+/** Pure end-of-pass decisions for the ordinary narrator runtime. */
 
 import type { AutoContinuationMode } from "../lib/boolean-override";
 import { getBlockedTaskActionInstruction, type Locale } from "../lib/prompt-i18n";
 import type { ExecuteLoopResult } from "./narrator-executor";
+
+/** A compact resumes unfinished work only; consuming a late compact is not new work. */
+export function shouldResumeAfterCompact(
+	result: Pick<ExecuteLoopResult, "completedNaturally" | "hasError">,
+	pending: boolean,
+	aborted: boolean,
+): boolean {
+	return !result.completedNaturally && !result.hasError && !aborted && pending;
+}
 
 /**
  * How many consecutive completion-limit / resumable-error continuations one response turn
@@ -159,31 +152,14 @@ export function computeContinuationStallState(
  * because the max-turns case has to state that the budget — not the work — is what
  * ended the pass.
  */
-export type SubagentContinuationCause = "spec" | "maxTurns";
+export type SpecContinuationCause = "spec" | "maxTurns";
 
-/**
- * How many self-continuations one subagent RUN may drive in total, across both causes.
- *
- * The stall counter alone is not sufficient here. It only counts *consecutive*
- * no-progress passes, so a subagent that alternates "run a tool, get reminded, run a
- * tool" never trips it — which is correct for a primary narrator (a human is watching,
- * and the session is meant to be long-lived) and wrong for a subagent, whose run holds
- * its parent's tool call open the entire time. This cap is the wall-clock-ish backstop:
- * a subagent that has taken this many extra passes is no longer "finishing up", and its
- * parent deserves an answer plus the option to dispatch again.
- *
- * Counted per run rather than per cause so the two causes cannot take turns exhausting
- * separate budgets.
- */
-export const MAX_SUBAGENT_CONTINUATION_PASSES = 6;
-
-/** Run-local continuation state for a subagent. The subagent's equivalent of the
- * `ActiveNarrator` stall fields, scoped to one run because that is the bound's lifetime. */
-export interface SubagentContinuationState {
+/** Run-local pass accounting. Policy ceilings span both continuation causes. */
+export interface SpecContinuationState {
 	/** Total continuation passes this run has already started, for either cause. */
 	passes: number;
 	/** Last stall classification, threaded back into `computeContinuationStallState`. */
-	stall: { count: number; key?: string };
+	stall: { count: number; key?: string; suppressed?: boolean };
 	/**
 	 * Set when the pass that just ran was itself a granted continuation, recording which
 	 * KIND was granted.
@@ -197,15 +173,21 @@ export interface SubagentContinuationState {
 	 * model edits its spec.
 	 */
 	grantedKind?: "task" | "blocked";
+	/** The last declined grant, available for result-delivery explanations. */
+	stop?: Extract<SpecContinuationPlan, { action: "stop" }>;
 }
 
-export function createSubagentContinuationState(): SubagentContinuationState {
+export function createSpecContinuationState(): SpecContinuationState {
 	return { passes: 0, stall: { count: 0 } };
 }
 
-export type SubagentContinuationPlan =
+export type SpecContinuationPlan =
 	/** Nothing to continue for; let the normal termination path run. */
-	| { action: "none"; stall: { count: number; key?: string }; grantedKind?: "task" | "blocked" }
+	| {
+			action: "none";
+			stall: { count: number; key?: string; suppressed?: boolean };
+			grantedKind?: "task" | "blocked";
+	  }
 	/**
 	 * Continue: the caller persists the prompt as a `sys` row and drives one more pass.
 	 *
@@ -215,9 +197,9 @@ export type SubagentContinuationPlan =
 	 */
 	| {
 			action: "continue";
-			cause: SubagentContinuationCause;
+			cause: SpecContinuationCause;
 			passes: number;
-			stall: { count: number; key?: string };
+			stall: { count: number; key?: string; suppressed?: boolean };
 			grantedKind: "task" | "blocked";
 			task: { text: string; protected: boolean; status: "doing" | "blocked" };
 	  }
@@ -231,45 +213,36 @@ export type SubagentContinuationPlan =
 	 */
 	| {
 			action: "stop";
-			cause: SubagentContinuationCause;
+			cause: SpecContinuationCause;
 			reason: "stalled" | "passLimit";
 			passes: number;
-			stall: { count: number; key?: string };
+			stall: { count: number; key?: string; suppressed?: boolean };
 			grantedKind?: "task" | "blocked";
 	  };
 
 /**
- * Decide whether a finished subagent pass should be followed by another one.
- *
- * ## Inputs, and what is deliberately NOT an input
- *
- * `openTask` is resolved by the caller from the subagent's own spec namespace (spec
- * files are keyed by narratorId, so reading the parent's would be both wrong and
- * silent). `mode` is the effective auto-continuation setting; `off` means the operator
- * turned this off and no cause may override it — unlike the primary side there is no
- * `explicitStart` escape, because a subagent has no `/goal` command of its own.
- *
- * The pass's turn count is not an input. On the `maxTurns` cause the next pass gets a
- * fresh budget, so bounding by turns would not bound anything.
- *
- * ## Order of the two bounds
- *
- * The stall check runs FIRST: a subagent that is producing nothing should stop at the
- * stall limit even when it has passes left, and reporting "stalled" is more useful than
- * reporting "out of passes" for the same run.
+ * Decide whether any narrator gets another Spec pass. Relationships are not inputs.
+ * Tasks belong to its own namespace, settings supply the mode, and traits supply
+ * the optional total pass ceiling. The shared stall rule wins over pass exhaustion.
+ * Explicit /goal starts once even with mode off; later automatic passes respect it.
  */
-export function planSubagentContinuation(input: {
-	cause: SubagentContinuationCause;
+export function planSpecContinuation(input: {
+	cause: SpecContinuationCause;
 	mode: AutoContinuationMode;
 	/** The task the reminder would be about, or null when the spec has nothing open. */
 	openTask: { text: string; protected: boolean; status: "doing" | "blocked" } | null;
 	/** Open protected tasks, for `protectedOnly`. */
 	protectedOpenCount: number;
-	previous: SubagentContinuationState;
-	result: Pick<ExecuteLoopResult, "hadToolUses" | "taskReflectionDenialFingerprint">;
+	previous: SpecContinuationState;
+	/** Omit when the ordinary loop already classified this pass into previous.stall. */
+	result?: Pick<ExecuteLoopResult, "hadToolUses" | "taskReflectionDenialFingerprint">;
+	/** Policy ceiling; omitted/null preserves ordinary unlimited progress continuation. */
+	maxPasses?: number | null;
+	/** An explicit /goal starts once even when automatic continuation is off. */
+	explicitStart?: boolean;
 	/** The run is ending for another reason (abort, error); never continue. */
 	suppressed?: boolean;
-}): SubagentContinuationPlan {
+}): SpecContinuationPlan {
 	const { cause, mode, openTask, previous, result } = input;
 	const keep = { count: previous.stall.count, key: previous.stall.key };
 	const declined = {
@@ -277,7 +250,7 @@ export function planSubagentContinuation(input: {
 		stall: keep,
 		...(previous.grantedKind ? { grantedKind: previous.grantedKind } : {}),
 	};
-	if (input.suppressed || mode === "off" || !openTask) return declined;
+	if (input.suppressed || (mode === "off" && !input.explicitStart) || !openTask) return declined;
 	if (mode === "protectedOnly" && input.protectedOpenCount === 0) return declined;
 	// `blockStop` means "stop when only blocked tasks remain", so a blocked-only spec
 	// yields no continuation while an open `doing` task still does.
@@ -291,9 +264,11 @@ export function planSubagentContinuation(input: {
 	// buffered message) is somebody else's turn, and charging it as a no-progress
 	// continuation would deny the first legitimate continuation to a subagent that
 	// happened to answer in prose.
-	const stall = previous.grantedKind
-		? computeContinuationStallState(previous.grantedKind, result, previous.stall)
-		: { count: 0, key: undefined, suppressed: false };
+	const stall = result
+		? previous.grantedKind
+			? computeContinuationStallState(previous.grantedKind, result, previous.stall)
+			: { count: 0, key: undefined, suppressed: false }
+		: previous.stall;
 	const nextStall = { count: stall.count, key: stall.key };
 	if (stall.suppressed) {
 		return {
@@ -305,7 +280,7 @@ export function planSubagentContinuation(input: {
 			...(previous.grantedKind ? { grantedKind: previous.grantedKind } : {}),
 		};
 	}
-	if (previous.passes >= MAX_SUBAGENT_CONTINUATION_PASSES) {
+	if (input.maxPasses != null && previous.passes >= input.maxPasses) {
 		return {
 			action: "stop",
 			cause,
@@ -325,28 +300,18 @@ export function planSubagentContinuation(input: {
 	};
 }
 
-/**
- * The model-facing text for a subagent continuation pass.
- *
- * Mirrors the primary loop's wording decisions, which were arrived at by fixing
- * observed failures, and adds the one thing that is specific to a subagent: it owes
- * its parent a result, so "report what you have" is always a legitimate ending. The
- * primary version instead offers `AskUserQuestion`, which a subagent does not have
- * (`DISALLOWED_SUBAGENT_TOOLS`) — telling it to ask the user would be an instruction it
- * cannot follow.
- *
- * It also states the remaining budget. Without that, a subagent has no way to know that
- * its self-continuations are finite and may keep deferring the summary it owes.
- */
-export function buildSubagentContinuationPrompt(input: {
-	cause: SubagentContinuationCause;
+/** Capability-projected continuation copy: legal question access and optional pass budget. */
+export function buildSpecContinuationPrompt(input: {
+	cause: SpecContinuationCause;
 	task: { text: string; protected: boolean; status: "doing" | "blocked" };
 	/** Passes already used, including the one being started. */
 	passes: number;
+	maxPasses: number | null;
+	canAskUserQuestion: boolean;
 	locale: Locale;
 }): string {
-	const { cause, task, passes, locale } = input;
-	const remaining = Math.max(0, MAX_SUBAGENT_CONTINUATION_PASSES - passes);
+	const { cause, task, passes, maxPasses, canAskUserQuestion, locale } = input;
+	const remaining = maxPasses === null ? null : Math.max(0, maxPasses - passes);
 	const isZh = locale === "zh-CN";
 	const label = task.protected ? " [protected]" : "";
 	const protectedNote = task.protected
@@ -363,33 +328,35 @@ export function buildSubagentContinuationPrompt(input: {
 			? "The previous pass spent its per-pass turn budget (not a judgement on your work) while spec://tasks.json still had open work, so the system granted another pass."
 			: "The system granted another pass because spec://tasks.json still has open work. That only means the entry is not marked finished — not that your work was judged incomplete, and its content may be out of date.";
 
-	const budget = isZh
-		? `\n\n剩余自动续跑次数：${remaining}。用完后本次运行会直接结束并把当前结果交回父级，所以不要把总结留到最后一趟。`
-		: `\n\nSelf-continuations left: ${remaining}. When they run out this run ends and whatever you have is handed back to your parent, so do not save your summary for a later pass.`;
+	const budget =
+		remaining === null
+			? ""
+			: isZh
+				? `\n\n剩余自动续跑次数：${remaining}。用完后本次运行会结束，所以不要把总结留到最后一趟。`
+				: `\n\nSelf-continuations left: ${remaining}. When they run out this run ends, so do not save your summary for a later pass.`;
+	const blockedAdvice = canAskUserQuestion
+		? isZh
+			? "需要用户介入时，用 AskUserQuestion 提问并结束回合。"
+			: "When the blocker needs the user, ask with AskUserQuestion and end the turn."
+		: isZh
+			? "当前能力不允许 AskUserQuestion。需要外部信息、权限或决策时，写清已完成部分、当前结论和所缺信息并结束本次运行。"
+			: "AskUserQuestion is unavailable under the current capability ceiling. If you need external information, permission, or a decision, state what you completed, your findings, and exactly what is missing, then end this run.";
 
 	if (task.status === "blocked") {
 		const actionInstruction = getBlockedTaskActionInstruction(locale);
 		return isZh
-			? `子代理 Dynamic Spec blocked 任务续跑（系统消息，不是用户或父级发言）。\n\n${why}\n\nblocked 任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${task.text}${label}\n\n${actionInstruction}\n\n你是子代理，没有 AskUserQuestion，也不能等用户回答。如果解除阻塞确实需要用户或父级决策，就把当前结论、已完成部分和所缺信息写清楚并结束本次运行 —— 这会作为结果交回父级，由它去问。${budget}`
-			: `Subagent Dynamic Spec blocked-task continuation (system message — not the user and not your parent speaking).\n\n${why}\n\nBlocked task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${task.text}${label}\n\n${actionInstruction}\n\nYou are a subagent: you have no AskUserQuestion and cannot wait for an answer. If clearing the blocker genuinely needs the user or your parent, state your findings, what you completed, and exactly what is missing, then end this run — that text is returned to your parent, which can ask.${budget}`;
+			? `Dynamic Spec blocked 任务续跑（系统消息，不是用户发言）。\n\n${why}\n\nblocked 任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${task.text}${label}\n\n${actionInstruction}\n\n${blockedAdvice}${budget}`
+			: `Dynamic Spec blocked-task continuation (system message — not the user speaking).\n\n${why}\n\nBlocked task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${task.text}${label}\n\n${actionInstruction}\n\n${blockedAdvice}${budget}`;
 	}
 
 	return isZh
-		? `子代理 Dynamic Spec 自动续跑（系统消息，不是用户或父级发言）。\n\n${why}\n\n当前任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${task.text}${label}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done，并给出交回父级的结论。不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户或父级提供信息、权限或决策：把已完成部分和所缺信息写清楚并结束本次运行，由父级去问。\n- 已不符合当前实际：在保留原意图的前提下改写或删除该条目，并说明原因。\n\n改动 spec://tasks.json 时先读取再就地修改，不要按本消息重写整个文件。${protectedNote}${budget}`
-		: `Subagent Dynamic Spec auto-continuation (system message — not the user and not your parent speaking).\n\n${why}\n\nCurrent task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${task.text}${label}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json and state the conclusion you are returning to your parent. Do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs information, permission, or a decision from the user or your parent: state what you completed and what is missing, then end this run so your parent can ask.\n- No longer matches reality: rewrite or remove the entry while preserving the original intent, and say why.\n\nWhen you change spec://tasks.json, read it first and edit in place; do not rewrite the file from this message.${protectedNote}${budget}`;
+		? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n${why}\n\n当前任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${task.text}${label}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done，并给出当前结论。不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- ${blockedAdvice}\n- 已不符合当前实际：在保留原意图的前提下改写或删除该条目，并说明原因。\n\n改动 spec://tasks.json 时先读取再就地修改，不要按本消息重写整个文件。${protectedNote}${budget}`
+		: `Dynamic Spec auto-continuation (system message — not the user speaking).\n\n${why}\n\nCurrent task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${task.text}${label}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json and state your conclusion. Do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- ${blockedAdvice}\n- No longer matches reality: rewrite or remove the entry while preserving the original intent, and say why.\n\nWhen you change spec://tasks.json, read it first and edit in place; do not rewrite the file from this message.${protectedNote}${budget}`;
 }
 
-/**
- * The parent-facing note appended when the continuation bound stopped a run.
- *
- * A subagent owes its parent a `tool_result`, so the bound must not merely stop the
- * loop: it has to say why the run ended with work still open, or the parent reads the
- * partial answer as a finished one. Deliberately NOT an error — the work that did
- * happen is real, and marking it `hasError` would discard the conclusion file for an
- * explore/plan subagent.
- */
-export function subagentContinuationStopNote(
-	plan: Extract<SubagentContinuationPlan, { action: "stop" }>,
+/** Explain an unfinished result when a registered recipient receives it; not an error. */
+export function specContinuationStopNote(
+	plan: Extract<SpecContinuationPlan, { action: "stop" }>,
 	locale: Locale,
 ): string {
 	const isZh = locale === "zh-CN";
@@ -399,8 +366,8 @@ export function subagentContinuationStopNote(
 			: "[Auto-continuation stopped: the extra passes produced no effective progress (no tool calls, or the same protected-task rejection repeated). spec://tasks.json still has open work.]";
 	}
 	return isZh
-		? `[自动续跑已停止：本次运行已用满 ${MAX_SUBAGENT_CONTINUATION_PASSES} 次续跑预算。spec://tasks.json 中仍有未完成条目，如需继续请重新派发。]`
-		: `[Auto-continuation stopped: this run used its budget of ${MAX_SUBAGENT_CONTINUATION_PASSES} continuation passes. spec://tasks.json still has open work; dispatch again to continue.]`;
+		? `[自动续跑已停止：本次运行已达到续跑预算（已续跑 ${plan.passes} 次）。spec://tasks.json 中仍有未完成条目，如需继续请重新派发。]`
+		: `[Auto-continuation stopped: this run reached its continuation budget after ${plan.passes} continuation passes. spec://tasks.json still has open work; dispatch again to continue.]`;
 }
 
 /**

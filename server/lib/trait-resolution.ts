@@ -1,5 +1,5 @@
 /**
- * Layered trait resolution over the three storage layers.
+ * Layered trait resolution over the storage layers (user, project, source, narrator).
  *
  * `trait-layers.ts` owns the merge algebra; this module binds it to the actual
  * encoded traits (`custom-disabled-tools:`, `custom-blocked-skills:`,
@@ -15,6 +15,13 @@
  * Enforcement metadata cannot survive flattening, so it is returned alongside in
  * `enforced`. Write paths use that to reject an edit up front rather than letting
  * resolution silently discard it.
+ *
+ * The `source` layer is another narrator's already-resolved traits (its registered
+ * policy source). It has no enforced marker of its own: everything it restricts is a
+ * boundary for the narrator above it, so its restriction/grant keys are always
+ * enforced. Runtime capability ceilings (`custom-runtime-policy:`) are not merged
+ * here; every layer's entries are carried through unchanged because their merge is
+ * an order-independent narrowing that `runtime-policy-trait.ts` performs, strictly.
  */
 import type { SubagentModelUse } from "@shared/subagent-model-policy";
 import {
@@ -39,6 +46,7 @@ import {
 	upsertEncodedTrait,
 } from "./narrator-custom-traits";
 import { parseTraits } from "./narrator-utils";
+import { RUNTIME_POLICY_TRAIT_PREFIX } from "./runtime-policy-trait";
 import {
 	mergeGrantTrait,
 	mergeRestrictionTrait,
@@ -217,16 +225,19 @@ function mergeSubagentModels(
 export function resolveLayeredTraits(input: {
 	user?: TraitLayerSource | null;
 	project?: TraitLayerSource | null;
+	/** Effective traits of the registered policy source narrator, if any. */
+	source?: TraitLayerSource | null;
 	narrator: TraitLayerSource;
 }): ResolvedTraitsResult {
 	const layerSources: TraitLayerInput<TraitLayerSource> = {
 		user: input.user ?? undefined,
 		project: input.project ?? undefined,
+		source: input.source ?? undefined,
 		narrator: input.narrator,
 	};
+	const upperLayers = [input.user, input.project, input.source];
 
-	const hasUpperLayer =
-		parseTraits(input.user?.traits).length > 0 || parseTraits(input.project?.traits).length > 0;
+	const hasUpperLayer = upperLayers.some((layer) => parseTraits(layer?.traits).length > 0);
 
 	// Fast path: with no upper layers there is nothing to merge, so return the
 	// narrator's traits untouched. This makes single-layer behaviour byte-identical
@@ -259,7 +270,12 @@ export function resolveLayeredTraits(input: {
 		const source = layerSources[layer];
 		if (!source) continue;
 		const raw = source.traits;
-		const enforcedKeys = parseEnforcedKeys(raw);
+		// A source's restrictions/grants are boundaries for the narrator above it, so
+		// they are enforced; its relaxations of lower defaults are its own choice.
+		const enforcedKeys: EnforcedTraitKeys =
+			layer === "source"
+				? { disabledTools: true, blockedSkills: true, subagentModels: true }
+				: parseEnforcedKeys(raw);
 		let declared = false;
 
 		const disabled: DisabledToolsTrait | null = parseDisabledToolsTrait(raw);
@@ -280,7 +296,9 @@ export function resolveLayeredTraits(input: {
 			modelLayers[layer] = { trait: models, enforced: enforcedKeys.subagentModels === true };
 			declared = true;
 		}
-		const injection = parseDeviceInjectionTrait(raw);
+		// Preferences are the source's own choices, not boundaries: only its
+		// restrictions and grants carry over.
+		const injection = layer === "source" ? null : parseDeviceInjectionTrait(raw);
 		if (injection) {
 			injectionLayers[layer] = injection;
 			declared = true;
@@ -302,6 +320,13 @@ export function resolveLayeredTraits(input: {
 			!trait.startsWith(SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX) &&
 			!trait.startsWith(ENFORCED_TRAIT_PREFIX),
 	);
+	for (const layer of upperLayers) {
+		for (const trait of parseTraits(layer?.traits)) {
+			if (trait.startsWith(RUNTIME_POLICY_TRAIT_PREFIX) && !traits.includes(trait)) {
+				traits.push(trait);
+			}
+		}
+	}
 
 	if (disabled.items.size > 0) {
 		traits = upsertEncodedTrait(

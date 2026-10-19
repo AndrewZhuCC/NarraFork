@@ -1,6 +1,7 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type ContextSegment, safeCharacters } from "@shared/context-composition";
 import type { SQL } from "bun";
+import { isTopLevelMessage, type OwnTurnPlacement } from "../lib/runtime-source";
 import { readContextSegments } from "./context-composition-projection";
 
 /** Shared by SQLite and PostgreSQL. `?` placeholders are rewritten to `$1` for Postgres. */
@@ -126,8 +127,14 @@ export interface ContextHistoryEntry {
 	seq: number;
 	segments: ContextSegment[];
 }
-type Options = {
-	profile: "primary" | "subagent";
+/**
+ * Which rows are the session's own turns (the `isTopLevelMessage` rule): rows with no
+ * placement, plus rows placed under `topLevelToolUseId` — the tool call this session's
+ * run delivers to. `"*"` keeps every placement (an unregistered legacy delegation,
+ * whose destination is not known without a history lookup).
+ */
+export type TopLevelPlacement = { topLevelToolUseId: OwnTurnPlacement };
+type Options = TopLevelPlacement & {
 	check: () => void;
 	messageIds?: readonly string[];
 	afterSeq?: number;
@@ -157,8 +164,13 @@ const LATEST_TOOL = `NOT EXISTS (SELECT 1 FROM narrator_tool_calls newer
  (newer.execution_attempt, newer.created_at, newer.id) >
  (t.execution_attempt, t.created_at, t.id))`;
 const placeholders = (length: number) => Array(length).fill("?").join(",");
-const visible = (row: HistoryRow, profile: Options["profile"]) =>
-	!row.hidden && row.role !== "disp" && (profile === "subagent" || row.parentToolUseId === null);
+/** SQL form of the own-turn rule: historical mount and current destination. */
+export const topLevelSql = (alias: string) =>
+	`(${alias}.parent_tool_use_id IS NULL OR ? IN ('*', ${alias}.parent_tool_use_id) OR ${alias}.parent_tool_use_id = ?)`;
+export const topLevelBindings = (placement: OwnTurnPlacement): [string | null, string | null] =>
+	Array.isArray(placement) ? placement : [placement, placement];
+const visible = (row: HistoryRow, placement: OwnTurnPlacement) =>
+	!row.hidden && row.role !== "disp" && isTopLevelMessage(row, placement);
 const newerThan = (a: NumericTool, b: NumericTool) =>
 	a.executionAttempt > b.executionAttempt ||
 	(a.executionAttempt === b.executionAttempt &&
@@ -362,15 +374,15 @@ export async function* readContextHistoryEntries(
 	options: Options,
 ): AsyncGenerator<ContextHistoryEntry> {
 	const query = resolveContextQuery(source);
-	const { check, profile, messageIds } = options;
+	const { check, topLevelToolUseId: placement, messageIds } = options;
 	const slice = timeSlice(check);
 	check();
 	const boundaryRow = await query.get<{ seq: number }>(
 		`SELECT r.seq AS "seq" FROM narrator_message_refs r
 		 JOIN narrator_message_context_stats s ON s.message_id = r.message_id
 		 WHERE r.narrator_id = ? AND r.is_compact = 1
-		 AND (? = 'subagent' OR s.parent_tool_use_id IS NULL) ORDER BY r.seq DESC LIMIT 1`,
-		[narratorId, profile],
+		 AND ${topLevelSql("s")} ORDER BY r.seq DESC LIMIT 1`,
+		[narratorId, ...topLevelBindings(placement)],
 	);
 	const boundary = boundaryRow?.seq ?? -1;
 	let seq = Math.max(boundary, options.afterSeq ?? -1);
@@ -394,12 +406,12 @@ export async function* readContextHistoryEntries(
 		);
 		if (!rows.length && !targets) return;
 		const active = rows.filter(
-			(row) => row.seq > boundary && visible(row, profile) && row.role !== "system",
+			(row) => row.seq > boundary && visible(row, placement) && row.role !== "system",
 		);
 		const tools = await readBatchTools(query, active, slice, check);
 		for (const row of rows) {
 			const segments =
-				row.seq > boundary && visible(row, profile)
+				row.seq > boundary && visible(row, placement)
 					? await projectRow(query, row, tools?.get(row.id), tools === null, slice, check)
 					: [];
 			yield { messageId: row.id, seq: row.seq, segments };

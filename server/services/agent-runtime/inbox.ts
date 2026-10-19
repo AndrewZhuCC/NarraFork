@@ -1116,6 +1116,9 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 	const wake = Promise.resolve()
 		.then(async () => {
 			await flushInboxPublicationBarrier(narratorId);
+			// A held run keeps its owner while parked: queued input wakes that same run.
+			const { wakeHeldRun } = await import("./run");
+			if (wakeHeldRun(narratorId)) return true;
 			if (getExecutionOwner(narratorId)) return false;
 			const { isNarratorRuntimeBusy, compactLocks, isNarratorRevertAdmissionBlocked } =
 				await import("../narrator-session-state");
@@ -1191,34 +1194,6 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 							.limit(1)
 							.get();
 				if (!notice) return false;
-			}
-			if (row.variant.startsWith("subagent:")) {
-				// A taken-over subagent with no live runner (e.g. a background takeover parked
-				// idle) is woken only for its OWN queued work — user input or a Send to it; the
-				// takeover survives that turn. A task notice alone must not start a turn the
-				// user is holding. (A suspended runner still owns execution and is resumed by
-				// the sender directly, never through this wake.)
-				const { isTakenOver } = await import("../subagent-takeover");
-				if (isTakenOver(narratorId)) {
-					const { acceptsBufferedSubagentInput } = await import("../subagent-executor");
-					const head = await peekInbox(narratorId);
-					if (!head || !acceptsBufferedSubagentInput(head)) return false;
-				}
-				const { resumeSubagent } = await import("../subagent-resume");
-				const head = await peekInbox(narratorId);
-				const executionBinding = head ? await resolveInboxExecutionBinding(head) : null;
-				return (
-					await resumeSubagent({
-						...executionBinding,
-						subagentId: narratorId,
-						intent: "follow_up",
-						actor: "parent_agent",
-						mailboxInput: true,
-						// Same as a direct Send wake: nobody waits on this run in the foreground.
-						asBackgroundTask: true,
-						locale,
-					})
-				).started;
 			}
 			const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } =
 				await import("../narrator-session");

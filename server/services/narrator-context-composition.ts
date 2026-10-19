@@ -20,6 +20,7 @@ import {
 } from "../lib/context-usage-snapshot";
 import { AppError, NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { type OwnTurnPlacement, ownTurnPlacementOf } from "../lib/runtime-source";
 import {
 	type ContextQuery,
 	postgresContextQuery,
@@ -33,16 +34,18 @@ import { readContextSegments } from "./context-composition-projection";
 const SEGMENT_CAP = 4096;
 
 type Meta = {
-	type: string;
-	variant: string;
+	registration: string | null;
 	systemChars: number;
 	summaryChars: number;
 	toolsChars: number;
 	usage: string | null;
 };
 
-function profileOf(type: string, variant: string): "primary" | "subagent" {
-	return type === "subagent" || variant.startsWith("subagent:") ? "subagent" : "primary";
+/** The session's own-turn placement (`ownTurnPlacementOf`, the `isTopLevelMessage` rule). */
+function placementOf(meta: Meta): OwnTurnPlacement {
+	return ownTurnPlacementOf({
+		runtimeRegistrationJson: meta.registration ? JSON.parse(meta.registration) : null,
+	});
 }
 
 function prefixSegments(system: number, summary: number, tools: number): ContextSegment[] {
@@ -76,7 +79,7 @@ export function createContextCharacterService(database: Database) {
 export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 	const metadata = (id: string) =>
 		query.get<Meta>(
-			`SELECT type AS "type", variant AS "variant", context_system_chars AS "systemChars",
+			`SELECT runtime_registration_json AS "registration", context_system_chars AS "systemChars",
 			 context_summary_chars AS "summaryChars", context_tools_chars AS "toolsChars",
 			 context_usage_snapshot_json AS "usage" FROM narrators WHERE id = ?`,
 			[id],
@@ -84,12 +87,12 @@ export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 
 	async function historySegments(
 		id: string,
-		profile: "primary" | "subagent",
+		placement: OwnTurnPlacement,
 		signal?: AbortSignal,
 	): Promise<{ segments: ContextSegment[]; truncated: boolean }> {
 		const segments: ContextSegment[] = [];
 		for await (const entry of readContextHistoryEntries(query, id, {
-			profile,
+			topLevelToolUseId: placement,
 			check: () => {
 				if (signal?.aborted) throw new DOMException("Context composition cancelled", "AbortError");
 			},
@@ -266,7 +269,7 @@ export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 				const fixed = requestCounts
 					? prefixSegments(requestCounts.systemChars - summary, summary, requestCounts.toolsChars)
 					: prefixSegments(meta.systemChars, meta.summaryChars, meta.toolsChars);
-				const history = await historySegments(id, profileOf(meta.type, meta.variant), signal);
+				const history = await historySegments(id, placementOf(meta), signal);
 				if (signal?.aborted) return null;
 				if (await relevant()) return await unknown();
 				if (history.truncated) return await unknown();
@@ -314,7 +317,7 @@ export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 					};
 				}
 			}
-			const history = await historySegments(id, profileOf(meta.type, meta.variant), signal);
+			const history = await historySegments(id, placementOf(meta), signal);
 			const segments = liveSegments(meta, history.segments);
 			const totals = groupContextSegments(segments);
 			return {
