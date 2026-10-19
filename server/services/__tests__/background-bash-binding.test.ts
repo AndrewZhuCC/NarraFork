@@ -55,8 +55,9 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 	mock.module("../narrator-subagent", () => ({ registerTaskAlias: aliases.registerTaskAlias }));
 	mock.module("../narrator-service", () => ({
 		narratorService: {
-			listSubagentsByParent: (id: string) =>
+			listTeamMembers: (id: string) =>
 				db.select({ id: narrators.id }).from(narrators).where(eq(narrators.parentNarratorId, id)),
+			getById: (id: string) => db.query.narrators.findFirst({ where: eq(narrators.id, id) }),
 		},
 	}));
 	const realId = { ...(await import("../../lib/id")) };

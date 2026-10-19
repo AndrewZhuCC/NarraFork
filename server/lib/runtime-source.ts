@@ -11,7 +11,7 @@
  * the single place that derivation lives; `trait-layer-service` uses the same shape
  * test for legacy capability ceilings.
  */
-import { and, eq, inArray, isNull, like, or, type SQL } from "drizzle-orm";
+import { and, eq, inArray, isNull, like, or, type SQL, sql } from "drizzle-orm";
 import { narratorMessages, narrators } from "../db/schema";
 import { getSubagentType, isSubagentVariant } from "./narrator-utils";
 import {
@@ -49,8 +49,15 @@ function isUnregisteredLegacyDelegation(row: RuntimeSourceRow): boolean {
 function legacyDependentsSql(sourceId: string): SQL | undefined {
 	return and(
 		isNull(narrators.policySourceNarratorId),
-		isNull(narrators.runtimeRegistrationJson),
 		eq(narrators.parentNarratorId, sourceId),
+		unregisteredLegacyDelegationSql(),
+	);
+}
+
+/** SQL form of {@link isUnregisteredLegacyDelegation} (step 5: delete). */
+function unregisteredLegacyDelegationSql(): SQL | undefined {
+	return and(
+		isNull(narrators.runtimeRegistrationJson),
 		or(
 			eq(narrators.type, "subagent"),
 			like(narrators.variant, "subagent:%"),
@@ -79,6 +86,40 @@ export function controllerOf(row: RuntimeSourceRow): RuntimeRegistration["contro
 	return isUnregisteredLegacyDelegation(row) && row.parentNarratorId
 		? { narratorId: row.parentNarratorId, actions: [...CONTROLLER_ACTIONS] }
 		: null;
+}
+
+/**
+ * The team a narrator belongs to, named by its root: the narrator holding its session
+ * control grant, else the recipient of its run, else the narrator itself. The grant
+ * comes first because it is durable, while each run may deliver elsewhere. A team
+ * member is any other narrator with the same root; a root is never its own member.
+ */
+export function teamRootOf(row: RuntimeSourceRow & { id: string }): string {
+	return (
+		controllerOf(row)?.narratorId ??
+		readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run?.deliverTo?.narratorId ??
+		row.id
+	);
+}
+
+/** Whether `row` is a member of `rootId`'s team. */
+export function isTeamMember(row: RuntimeSourceRow & { id: string }, rootId: string): boolean {
+	return row.id !== rootId && teamRootOf(row) === rootId;
+}
+
+/**
+ * SQL form of {@link isTeamMember}. Delegation records its grant and its run's
+ * recipient together with `parent_narrator_id`, so that index narrows the scan and the
+ * registration decides membership.
+ */
+export function teamMembersWhere(rootId: string): SQL | undefined {
+	return and(
+		eq(narrators.parentNarratorId, rootId),
+		or(
+			sql`coalesce(json_extract(${narrators.runtimeRegistrationJson}, '$.controller.narratorId'), json_extract(${narrators.runtimeRegistrationJson}, '$.run.deliverTo.narratorId')) = ${rootId}`,
+			unregisteredLegacyDelegationSql(),
+		),
+	);
 }
 
 /**

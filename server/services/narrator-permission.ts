@@ -83,7 +83,7 @@ import {
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import { isPlanModeTrait } from "../lib/narrator-utils";
 import {
 	type DeviceAccessPolicy,
 	intersectOAuthClientPolicies,
@@ -99,6 +99,7 @@ import {
 } from "../lib/plan-file-path";
 import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
+import { isTeamMember, type RuntimeSourceRow, teamRootOf } from "../lib/runtime-source";
 import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -2895,10 +2896,8 @@ export function shouldTriggerDangerReflection(
 	return dangerSeverityRank(danger.severity) >= dangerReflectionThreshold(level);
 }
 
-type PermissionScopeNarrator = {
+type PermissionScopeNarrator = RuntimeSourceRow & {
 	id?: string | null;
-	variant?: string | null;
-	parentNarratorId?: string | null;
 	permissionMode?: string | null;
 	relaxedPlan?: boolean | null;
 	previousPermissionMode?: string | null;
@@ -2977,10 +2976,8 @@ async function resolveSendTargetsForPermission(
 ): Promise<PermissionScopeNarrator[]> {
 	const selectors = sendSelectors(input);
 	if (selectors.length === 0) return [];
-	const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
-	const teamParentId = callerIsSubagent ? caller.parentNarratorId : callerId;
-	if (typeof teamParentId !== "string" || teamParentId.length === 0) return [];
-	const parentId: string = teamParentId;
+	const parentId = teamRootOf({ ...caller, id: callerId });
+	const callerIsSubagent = parentId !== callerId;
 
 	const resolved: PermissionScopeNarrator[] = [];
 	const seen = new Set<string>();
@@ -2996,7 +2993,7 @@ async function resolveSendTargetsForPermission(
 		// launching narrator by teamParentId so mixed target lists still work.
 		if (addressesParent) {
 			const parent = await narratorService.getById(parentId).catch(() => null);
-			if (!parent?.id || parent.id !== parentId || isSubagentVariant(parent.variant ?? "")) {
+			if (!parent?.id || parent.id !== parentId || teamRootOf(parent) !== parent.id) {
 				return [];
 			}
 			if (!seen.has(parent.id)) {
@@ -3007,12 +3004,7 @@ async function resolveSendTargetsForPermission(
 		}
 		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
 		if (direct) {
-			if (
-				!direct.id ||
-				!isSubagentVariant(direct.variant ?? "") ||
-				direct.parentNarratorId !== parentId ||
-				(callerIsSubagent && direct.id === callerId)
-			) {
+			if (!direct.id || !isTeamMember(direct, parentId) || direct.id === callerId) {
 				return [];
 			}
 			if (!seen.has(direct.id)) {
@@ -3022,20 +3014,14 @@ async function resolveSendTargetsForPermission(
 			continue;
 		}
 
-		const siblings = await narratorService.listSubagentsByParent(parentId);
+		const siblings = await narratorService.listTeamMembers(parentId);
 		const candidates = siblings.filter((s) => {
 			if (callerIsSubagent && s.id === callerId) return false;
 			return subagentMatchesSelector(s, selector);
 		});
 		if (candidates.length !== 1) return [];
 		const target = await narratorService.getById(candidates[0].id).catch(() => null);
-		if (
-			!target?.id ||
-			!isSubagentVariant(target.variant ?? "") ||
-			target.parentNarratorId !== parentId
-		) {
-			return [];
-		}
+		if (!target?.id || !isTeamMember(target, parentId)) return [];
 		if (!seen.has(target.id)) {
 			seen.add(target.id);
 			resolved.push(target);
@@ -3059,8 +3045,9 @@ export async function shouldAutoAllowSendWithinScope(
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
-		const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
-		const teamParentId = callerIsSubagent ? caller.parentNarratorId : null;
+		const root = teamRootOf({ ...caller, id: narratorId });
+		const callerIsSubagent = root !== narratorId;
+		const teamParentId = callerIsSubagent ? root : null;
 		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
 		const selectors = sendSelectors(input);
 		const onlyAddressesParent =
@@ -4374,6 +4361,8 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 			chapterId: narrators.chapterId,
 			contextProjectId: narrators.contextProjectId,
 			parentNarratorId: narrators.parentNarratorId,
+			type: narrators.type,
+			runtimeRegistrationJson: narrators.runtimeRegistrationJson,
 			cwd: narrators.cwd,
 			workspaceRevision: narrators.workspaceRevision,
 			defaultDeviceId: narrators.defaultDeviceId,
@@ -4924,7 +4913,9 @@ export async function handlePermission(
 			planFileId: true,
 			dangerReflectionOverride: true,
 			variant: true,
+			type: true,
 			parentNarratorId: true,
+			runtimeRegistrationJson: true,
 			traits: true,
 		},
 	});

@@ -221,7 +221,7 @@ const fakeNarratorService = {
 			recentIdleTruncated: idle.length > 100,
 		};
 	},
-	async listSubagentsByParent(parentNarratorId: string) {
+	async listTeamMembers(parentNarratorId: string) {
 		return [...narrators.values()].filter((n) => n.parentNarratorId === parentNarratorId);
 	},
 	// Mirrors the real bounded view: active members first, then newest, with the
@@ -379,6 +379,15 @@ function seed() {
 	cancelledAgents.length = 0;
 	liveRuns.clear();
 	narrators.clear();
+	// Team roots are read from their own rows; nobody controls these primaries.
+	for (const id of ["primary", "parent"])
+		narrators.set(id, {
+			id,
+			parentNarratorId: null,
+			variant: "primary",
+			status: "idle",
+			title: null,
+		});
 	teamFileChanges.clear();
 	deliveredMessages.length = 0;
 	deliveryHook = undefined;

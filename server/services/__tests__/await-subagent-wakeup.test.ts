@@ -101,7 +101,7 @@ async function writeSettledRow(substatus: string[] = ["unread"]): Promise<void> 
 function startWait(signal?: AbortSignal) {
 	return waitForSubagentResult({
 		subagentId: SUBAGENT_ID,
-		parentNarratorId: PARENT_ID,
+		recipientId: PARENT_ID,
 		timeoutMs: GENEROUS_TIMEOUT_MS,
 		signal,
 	});

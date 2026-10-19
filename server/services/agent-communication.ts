@@ -1,7 +1,8 @@
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
-import { getSubagentType, isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
+import { getSubagentType, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
+import { runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
 import { isParentSelector, type SendDeliveryTarget } from "@shared/communication-tool";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
@@ -564,15 +565,8 @@ async function getCommunicationScope(callerNarratorId: string): Promise<{
 	callerIsSubagent: boolean;
 }> {
 	const caller = await narratorService.getById(callerNarratorId);
-	const callerIsSubagent = isSubagentVariant(caller.variant);
-	if (callerIsSubagent && !caller.parentNarratorId) {
-		throw new Error("Subagent has no parent narrator");
-	}
-	return {
-		caller,
-		teamParentId: callerIsSubagent ? (caller.parentNarratorId as string) : callerNarratorId,
-		callerIsSubagent,
-	};
+	const teamParentId = teamRootOf(caller);
+	return { caller, teamParentId, callerIsSubagent: teamParentId !== caller.id };
 }
 
 function assertTargetAllowed(
@@ -582,10 +576,11 @@ function assertTargetAllowed(
 	// These messages reach the model, so they name the target the same readable
 	// way every other Send/Await outlet does.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
-	if (!isSubagentVariant(target.variant)) {
+	const root = teamRootOf(target);
+	if (root === target.id) {
 		throw new Error(`${label} is not a subagent`);
 	}
-	if (target.parentNarratorId !== scope.teamParentId) {
+	if (root !== scope.teamParentId) {
 		throw new Error(`${label} does not belong to this narrator's subagent team`);
 	}
 	if (scope.callerIsSubagent && target.id === scope.caller.id) {
@@ -618,7 +613,7 @@ async function resolveOneTarget(
 		return direct;
 	}
 
-	const siblings = await narratorService.listSubagentsByParent(scope.teamParentId);
+	const siblings = await narratorService.listTeamMembers(scope.teamParentId);
 	const candidates = siblings.filter((s) => {
 		if (scope.callerIsSubagent && s.id === scope.caller.id) return false;
 		return subagentMatchesSelector(s, selector);
@@ -815,7 +810,7 @@ type SubagentWaitResult = Pick<
 /** Never pair a later run lookup with an earlier assistant result. */
 async function readSubagentTerminal(
 	subagentId: string,
-	parentNarratorId: string,
+	recipientId: string,
 	current: Narrator,
 	observedRunningRunId?: string | null,
 ): Promise<SubagentWaitResult> {
@@ -823,7 +818,7 @@ async function readSubagentTerminal(
 		? {
 				producerKind: "agent",
 				taskId: subagentId,
-				recipientId: parentNarratorId,
+				recipientId,
 				logicalRunId: current.logicalRunId,
 			}
 		: undefined;
@@ -877,14 +872,15 @@ async function readSubagentTerminal(
 
 export async function waitForSubagentResult(opts: {
 	subagentId: string;
-	parentNarratorId: string;
+	/** Recipient of the subagent's current run. */
+	recipientId: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 }): Promise<SubagentWaitResult> {
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const current = await narratorService.getById(opts.subagentId);
 	if (current.status !== "working" && current.status !== "waiting") {
-		return readSubagentTerminal(opts.subagentId, opts.parentNarratorId, current);
+		return readSubagentTerminal(opts.subagentId, opts.recipientId, current);
 	}
 
 	const observedRunningRunId = current.logicalRunId;
@@ -913,7 +909,7 @@ export async function waitForSubagentResult(opts: {
 					return;
 				const result = await readSubagentTerminal(
 					opts.subagentId,
-					opts.parentNarratorId,
+					opts.recipientId,
 					current,
 					observedRunningRunId,
 				);
@@ -1124,6 +1120,8 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 	notifyTargetResolved(opts, target.id, target.title);
 	// The narrator row is in hand, so the label needs no extra query.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
+	// The result belongs to whoever the target's current run delivers to.
+	const recipientId = runDeliverToOf(target)?.narratorId ?? scope.teamParentId;
 	const build = (
 		status: string,
 		output: string | null | undefined,
@@ -1153,13 +1151,13 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await waitForSubagentResult({
 			subagentId: target.id,
-			parentNarratorId: target.parentNarratorId as string,
+			recipientId,
 			timeoutMs: opts.timeoutMs,
 			signal,
 		});
 		return build(relabel(waited.status), waited.output, waited);
 	}
-	const terminal = await readSubagentTerminal(target.id, scope.teamParentId, target);
+	const terminal = await readSubagentTerminal(target.id, recipientId, target);
 	return build(terminal.status, terminal.output, terminal);
 }
 
@@ -1208,8 +1206,7 @@ function withSenderPrefix(
 }
 
 /**
- * Deliver a subagent → parent progress report. The parent is always a primary
- * narrator (subagents cannot spawn nested subagents). A working/waiting parent
+ * Deliver a subagent → parent (team root) progress report. A working/waiting parent
  * drains the report at its next sidecar boundary; an idle parent is woken.
  */
 async function deliverSubagentMessageToParent(
@@ -1220,15 +1217,6 @@ async function deliverSubagentMessageToParent(
 	const parent = await narratorService.getById(parentId).catch(() => null);
 	if (!parent) {
 		return { id: parentId, status: "failed", error: "Parent narrator not found" };
-	}
-	// Defensive: nested subagents are impossible (createSubagent rejects them),
-	// so a subagent's parent must be a primary narrator. Guard anyway.
-	if (isSubagentVariant(parent.variant)) {
-		logger.warn("Subagent parent is unexpectedly a subagent; refusing parent delivery", {
-			callerNarratorId: input.callerNarratorId,
-			parentNarratorId: parentId,
-		});
-		return { id: parentId, status: "failed", error: "Parent is not a primary narrator" };
 	}
 	if (parent.status === "archived") {
 		return { id: parentId, title: parent.title, status: "failed", error: "Parent is archived" };
@@ -1289,7 +1277,7 @@ async function resolveSendTargets(
 		const target = targetsParent
 			? await narratorService.getById(scope.teamParentId)
 			: await resolveOneTarget(selector, scope);
-		if (targetsParent && isSubagentVariant(target.variant))
+		if (targetsParent && teamRootOf(target) !== target.id)
 			throw new Error("Parent is not a primary narrator");
 		targets.set(target.id, target);
 	}
