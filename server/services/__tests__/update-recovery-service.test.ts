@@ -599,10 +599,10 @@ async function prepareRecovery(
 			})
 			.onConflictDoNothing()
 			.run();
-		const run = runtimePublication.startAgentRun({
+		const run = runtimePublication.startRun({
 			narratorId: subagentId,
-			parentNarratorId: record.narratorId,
-		});
+			binding: { deliverTo: { narratorId: record.narratorId, toolUseId: "test-tool-use" } },
+		}).publication!;
 		record.payloadJson = { ...record.payloadJson, logicalRunId: run.logicalRunId };
 	}
 	updateCoordinator.writePlannedUpdateRecoverySnapshot({

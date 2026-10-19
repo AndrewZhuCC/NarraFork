@@ -194,31 +194,21 @@ async function prepareLogicalRun(
 		...(deliverTo ? { deliverTo } : {}),
 		principal: { userId: principal },
 	};
-	const service = getRuntimePublicationService();
-	if (!deliverTo) {
-		return {
-			binding: await service.registerUndeliveredRun({
-				narratorId,
-				resumeRunId: req.resumeRunId,
-				binding,
-				legacyToolUseId,
-			}),
-		};
-	}
-	const publicationRun = await service.startAgentRun({
-		narratorId,
-		parentNarratorId: deliverTo.narratorId,
-		resumeRunId: req.resumeRunId,
-		binding,
-		legacyToolUseId,
-	});
+	const { binding: registered, publication: publicationRun } =
+		await getRuntimePublicationService().startRun({
+			narratorId,
+			resumeRunId: req.resumeRunId,
+			binding,
+			legacyToolUseId,
+		});
+	if (!deliverTo || !publicationRun) return { binding: registered };
 	// A caller waiting in the foreground receives the result itself, never via a task.
 	// A new run that only inherits a destination which already holds an earlier
 	// result delivers through a task row instead of rewriting that result.
 	const inherited = !(req.binding || req.resumeRunId || req.recovered);
 	if (!req.foreground && (row.isBackground || (inherited && (await settled(deliverTo)))))
 		await projectRunAsTask(narratorId, row, deliverTo, publicationRun, binding);
-	return { binding: publicationRun.binding, publicationRun };
+	return { binding: registered, publicationRun };
 }
 
 async function settled(deliverTo: RunDeliverTo): Promise<boolean> {
@@ -262,13 +252,11 @@ async function projectRunAsTask(
 		).alias;
 	await backgroundTaskService.createAgentTask({
 		id: narratorId,
-		parentNarratorId: deliverTo.narratorId,
 		subagentNarratorId: narratorId,
 		subagentType: task?.subagentType ?? row.subagentType ?? "general",
-		toolUseId: task?.toolUseId ?? deliverTo.toolUseId,
 		alias,
 		title: task?.title ?? row.title ?? undefined,
-		binding,
+		binding: { ...binding, deliverTo },
 	});
 	await backgroundTaskService.markNarratorRunning(narratorId);
 	backgroundTaskService.notifyDerivedStatusChanged(deliverTo.narratorId, narratorId);
@@ -1250,10 +1238,8 @@ async function registerDetachedTask(
 	// Re-registering the same run keeps its destination and absolute deadline.
 	await backgroundTaskService.createAgentTask({
 		id: narratorId,
-		parentNarratorId: deliverTo.narratorId,
 		subagentNarratorId: narratorId,
 		subagentType: row?.subagentType ?? "general",
-		toolUseId: deliverTo.toolUseId,
 		alias,
 		title: row?.title ?? undefined,
 		binding: { deliverTo, cancelWith: undefined },

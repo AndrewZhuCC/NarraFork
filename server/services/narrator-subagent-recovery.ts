@@ -1173,8 +1173,6 @@ export async function resumeRecoverySubagents(input: {
 					skipped.push({ id: subagentId, reason: "origin_tool_call_missing" });
 					continue;
 				}
-				const originToolUseId = deliverTo.toolUseId;
-
 				const title = subagent.title?.trim() || subagentId;
 				const subagentType = subagent.subagentType?.trim() || "general";
 
@@ -1191,10 +1189,8 @@ export async function resumeRecoverySubagents(input: {
 				taskClaimed = true;
 				const task = await backgroundTaskService.createAgentTask({
 					id: subagentId,
-					parentNarratorId: input.narratorId,
 					subagentNarratorId: subagentId,
 					subagentType,
-					toolUseId: originToolUseId,
 					alias,
 					title,
 					binding: {

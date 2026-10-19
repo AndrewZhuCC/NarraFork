@@ -116,7 +116,10 @@ async function backgroundRun(owner: string, child: string, registered = true) {
 	const now = new Date().toISOString();
 	const { runtimePublication } = await import("../agent-runtime/publication");
 	const run = registered
-		? runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: owner })
+		? runtimePublication.startRun({
+				narratorId: child,
+				binding: { deliverTo: { narratorId: owner, toolUseId: "test-tool-use" } },
+			}).publication!
 		: undefined;
 	const id = registered ? child : generateId();
 	await db.insert(backgroundTasks).values({

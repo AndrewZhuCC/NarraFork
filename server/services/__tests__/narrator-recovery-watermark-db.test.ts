@@ -292,7 +292,6 @@ describe("resumeRecoverySubagents DB recovery", () => {
 				// insert without run identity is inadmissible after the legacy cutoff.
 				await backgroundTaskService.createAgentTask({
 					id: "sub-fails",
-					parentNarratorId: PARENT_ID,
 					subagentNarratorId: "sub-fails",
 					subagentType: "general",
 					alias: "retry-fails",

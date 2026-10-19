@@ -105,7 +105,7 @@ beforeEach(async () => {
 				type: id === "contract-child" ? "subagent" : "primary",
 				variant: id === "contract-child" ? "subagent:general" : "primary",
 				parentNarratorId: id === "contract-child" ? "contract-parent" : null,
-				// The delegated run delivers to its Agent call: registered, as startAgentRun does.
+				// The delegated run delivers to its Agent call: registered, as startRun does.
 				runtimeRegistrationJson:
 					id === "contract-child"
 						? {

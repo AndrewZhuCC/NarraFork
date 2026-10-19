@@ -315,11 +315,13 @@ describe("ordinary restart with real persisted recovery records", () => {
 		);
 		runtimePublication.stop();
 		const pub = getRuntimePublicationService();
-		const run = await pub.startAgentRun({
-			narratorId: "child",
-			parentNarratorId: "parent",
-			resumeRunId: "run-child",
-		});
+		const run = (
+			await pub.startRun({
+				narratorId: "child",
+				resumeRunId: "run-child",
+				binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+			})
+		).publication!;
 		await pub.commitAgentTerminal({
 			run,
 			eventKind: "completed",

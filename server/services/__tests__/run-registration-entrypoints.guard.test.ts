@@ -104,23 +104,18 @@ test("every production run entry supplies identity or explicitly relies on its o
 	expect(unchecked).toEqual([]);
 });
 
-test("undelivered registration is dispatched through both backend adapters, with no PG SQLite fallback", async () => {
+test("run registration is dispatched through both backend adapters, with no PG SQLite fallback", async () => {
 	const source = await Bun.file(new URL("../agent-runtime/publication.ts", import.meta.url)).text();
 	const pg = await Bun.file(
 		new URL("../agent-runtime/postgres-runtime-publication.ts", import.meta.url),
 	).text();
-	expect(source).toContain(
-		"registerUndeliveredRun: async (input) => legacy.registerUndeliveredRun(input)",
-	);
-	expect(source).toContain(
-		"registerUndeliveredRun: (input) => engine.registerUndeliveredRun(input)",
-	);
-	expect(pg).toContain('runComposite("publication.registerUndeliveredRun"');
+	expect(source).toContain("startRun: async (input) => legacy.startRun(input)");
+	expect(source).toContain("startRun: (input) => engine.startRun(input)");
 	const method = pg.slice(
-		pg.indexOf("async registerUndeliveredRun("),
-		pg.indexOf("async getAgentRun(", pg.indexOf("async registerUndeliveredRun(")),
+		pg.indexOf("async startRun("),
+		pg.indexOf("async getAgentRun(", pg.indexOf("async startRun(")),
 	);
-	expect(method).toContain("primitives.persistLogicalRun(tx, input.narratorId, input)");
+	expect(method).toContain('runComposite("publication.startRun"');
 	expect(method).toContain("readTopRefSeqPg(tx, input.narratorId)");
 	expect(method).not.toContain("runAtomicWrite");
 });

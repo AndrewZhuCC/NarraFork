@@ -393,9 +393,9 @@ describe("listTeamBashTasks", () => {
 		await seedSubagent({ id: "agent-sub", createdAt: isoAt(0), status: "working" });
 		await backgroundTaskService.createAgentTask({
 			id: "agent-sub",
-			parentNarratorId: PARENT,
 			subagentNarratorId: "agent-sub",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await seedBashTask({ id: "bash-1", createdAt: isoAt(1) });
 

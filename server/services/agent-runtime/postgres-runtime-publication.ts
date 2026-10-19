@@ -9,8 +9,8 @@
  * `runAtomicWrite` per operation; on PostgreSQL each of those same operations is a
  * NAMED composite here, executed as ONE `withPgRetry` whole-section transaction:
  *
- *   - `startAgentRun`      — logical run + slot reservation + `source_after` result
- *                            boundary + `background_tasks.logical_run_id` link.
+ *   - `startRun`           — logical run + registration (+ slots, `source_after` result
+ *                            boundary, task row) for a run with a destination.
  *   - `startBashRun`       — new Bash run identity + slot reservation.
  *   - `persistResult`      — the per-run result snapshot message + ref (agent kind).
  *   - `commit`             — a single publication intent.
@@ -90,7 +90,7 @@ import {
 	persistPgMessageWithRef,
 } from "../narrator-refs/postgres-store";
 import { MAILBOX_LIMITS as L } from "./limits";
-import type { PublicationTerminalCommit, StartedAgentRun } from "./publication";
+import type { PublicationTerminalCommit, StartedRun, StartRunInput } from "./publication";
 import {
 	type LegacyCompletionAdmission,
 	type LegacyCompletionRegistration,
@@ -732,27 +732,17 @@ export function createPostgresRuntimePublication(
 	return {
 		readAgentTerminalResult,
 		/**
-		 * Agent start admission: logical run, slot reservation, the `source_after`
-		 * result boundary and the task-row link commit in ONE section.
-		 *
-		 * When `taskRow` is supplied, the `background_tasks` INSERT (new task
-		 * projection) is included in the same section — the same atomicity the
-		 * SQLite producer has (reserve + task row in one transaction). The
+		 * Run registration: logical run and relationship facts, plus (for a run with a
+		 * destination) slot reservation, the `source_after` result boundary and the
+		 * task-row projection, in ONE section, exactly like the SQLite producer. The
 		 * (tool_call_id, execution_attempt) unique index guards against a second
 		 * process for the same actual attempt.
 		 */
-		async startAgentRun(input: {
-			narratorId: string;
-			parentNarratorId: string;
-			resumeRunId?: string;
-			started?: boolean;
-			binding?: RunBindingInput;
-			legacyToolUseId?: string | null;
-			taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
-		}): Promise<StartedAgentRun> {
-			return runComposite("publication.startAgentRun", async (tx) => {
+		async startRun(input: StartRunInput): Promise<StartedRun> {
+			return runComposite("publication.startRun", async (tx) => {
+				const recipientId = input.binding.deliverTo?.narratorId;
 				let resumeRunId = input.resumeRunId;
-				if (input.taskRow && resumeRunId === undefined) {
+				if (input.taskRow && recipientId && resumeRunId === undefined) {
 					// Actor first: serialize with explicit run starts before adopting its identity.
 					// Do not use getAgentRun here: a missing id is a new start, not legacy admission.
 					await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
@@ -768,7 +758,7 @@ export function createPostgresRuntimePublication(
 						await tx
 							.select({ id: narrators.id })
 							.from(narrators)
-							.where(eq(narrators.id, input.parentNarratorId))
+							.where(eq(narrators.id, recipientId))
 							.for("update");
 						const reservation = await tx
 							.select({ id: outbox.id })
@@ -778,7 +768,7 @@ export function createPostgresRuntimePublication(
 									eq(outbox.producerKind, "agent"),
 									eq(outbox.taskId, input.narratorId),
 									eq(outbox.logicalRunId, currentRunId),
-									eq(outbox.recipientId, input.parentNarratorId),
+									eq(outbox.recipientId, recipientId),
 									eq(outbox.eventKind, "terminal"),
 									eq(outbox.state, "reserved"),
 								),
@@ -792,7 +782,7 @@ export function createPostgresRuntimePublication(
 									eq(consumptions.producerKind, "agent"),
 									eq(consumptions.taskId, input.narratorId),
 									eq(consumptions.logicalRunId, currentRunId),
-									eq(consumptions.recipientId, input.parentNarratorId),
+									eq(consumptions.recipientId, recipientId),
 								),
 							)
 							.limit(1);
@@ -802,16 +792,15 @@ export function createPostgresRuntimePublication(
 				const logicalRunId = await primitives.persistLogicalRun(tx, input.narratorId, {
 					...(resumeRunId === undefined ? {} : { resumeRunId }),
 				});
-				const run: PublicationRun = {
-					producerKind: "agent",
-					taskId: input.narratorId,
-					logicalRunId,
-					recipientId: input.parentNarratorId,
-				};
-				const reservation = await primitives.reserveRunSlots(tx, run, {
-					started: input.started,
-				});
-				if (reservation.status === "full") throw capacityError();
+				const publication: PublicationRun | undefined = recipientId
+					? { producerKind: "agent", taskId: input.narratorId, logicalRunId, recipientId }
+					: undefined;
+				if (publication) {
+					const reservation = await primitives.reserveRunSlots(tx, publication, {
+						started: input.started,
+					});
+					if (reservation.status === "full") throw capacityError();
+				}
 				const topSeq = (await readTopRefSeqPg(tx, input.narratorId)) ?? PG_REF_SEQ_EMPTY_TOP;
 				// The run's relationships commit with its id (same rule as SQLite).
 				const [source] = await tx
@@ -829,7 +818,7 @@ export function createPostgresRuntimePublication(
 				const registration = registerRun(
 					source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
 					logicalRunId,
-					input.binding ?? {},
+					input.binding,
 					topSeq + 1,
 				);
 				await tx
@@ -840,7 +829,7 @@ export function createPostgresRuntimePublication(
 						policySourceNarratorId: source ? policySourceIdOf(source) : null,
 					})
 					.where(eq(narrators.id, input.narratorId));
-				if (!resumeRunId) {
+				if (publication && !resumeRunId) {
 					// A stable ref boundary, not millisecond timestamps: two runs may start in
 					// the same ms. An empty narrator's watermark is the EMPTY_TOP sentinel
 					// (= base 0 minus one), NOT 0 — the first ref of an empty narrator claims
@@ -852,12 +841,12 @@ export function createPostgresRuntimePublication(
 						})
 						.where(
 							and(
-								eq(outbox.dedupeKey, publicationDedupeKey(run, "terminal")),
+								eq(outbox.dedupeKey, publicationDedupeKey(publication, "terminal")),
 								eq(outbox.state, "reserved"),
 							),
 						);
 				}
-				if (input.taskRow) {
+				if (publication && input.taskRow) {
 					const inserted = await tx
 						.insert(backgroundTasks)
 						.values({ ...input.taskRow, logicalRunId })
@@ -877,44 +866,7 @@ export function createPostgresRuntimePublication(
 					.where(
 						and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")),
 					);
-				return { ...run, binding: registration.run };
-			});
-		},
-
-		async registerUndeliveredRun(input: {
-			narratorId: string;
-			resumeRunId?: string;
-			binding: RunBindingInput;
-			legacyToolUseId?: string | null;
-		}): Promise<RuntimeRunBinding> {
-			return runComposite("publication.registerUndeliveredRun", async (tx) => {
-				const logicalRunId = await primitives.persistLogicalRun(tx, input.narratorId, input);
-				const [source] = await tx
-					.select({
-						policySourceNarratorId: narrators.policySourceNarratorId,
-						runtimeRegistrationJson: narrators.runtimeRegistrationJson,
-						type: narrators.type,
-						variant: narrators.variant,
-						parentNarratorId: narrators.parentNarratorId,
-						subagentType: narrators.subagentType,
-					})
-					.from(narrators)
-					.where(eq(narrators.id, input.narratorId))
-					.limit(1);
-				const registration = registerRun(
-					source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
-					logicalRunId,
-					input.binding,
-					((await readTopRefSeqPg(tx, input.narratorId)) ?? PG_REF_SEQ_EMPTY_TOP) + 1,
-				);
-				await tx
-					.update(narrators)
-					.set({
-						runtimeRegistrationJson: registration,
-						policySourceNarratorId: source ? policySourceIdOf(source) : null,
-					})
-					.where(eq(narrators.id, input.narratorId));
-				return registration.run;
+				return { binding: registration.run, ...(publication ? { publication } : {}) };
 			});
 		},
 

@@ -473,29 +473,38 @@ for (const matchingOrigin of [true, false]) {
 test("A7 same-id registration returns the persisted merge; a new run replaces only run facts", async () => {
 	const publication = getRuntimePublicationService();
 	const deadlineAt = new Date(Date.now() + 10_000).toISOString();
-	const first = await publication.registerUndeliveredRun({
-		narratorId: TARGET,
-		binding: {
-			principal: { userId: A },
-			deadlineAt,
-			cancelWith: { narratorId: CALLER, toolCallId: "call", attempt: 1 },
-		},
-	});
-	const second = await publication.registerUndeliveredRun({
-		narratorId: TARGET,
-		resumeRunId: first.logicalRunId,
-		binding: { principal: { userId: B }, deadlineAt: new Date(Date.now() + 99_000).toISOString() },
-	});
+	const first = (
+		await publication.startRun({
+			narratorId: TARGET,
+			binding: {
+				principal: { userId: A },
+				deadlineAt,
+				cancelWith: { narratorId: CALLER, toolCallId: "call", attempt: 1 },
+			},
+		})
+	).binding;
+	const second = (
+		await publication.startRun({
+			narratorId: TARGET,
+			resumeRunId: first.logicalRunId,
+			binding: {
+				principal: { userId: B },
+				deadlineAt: new Date(Date.now() + 99_000).toISOString(),
+			},
+		})
+	).binding;
 	expect(stored().registration?.run).toEqual(second);
 	expect(second).toMatchObject({
 		principal: { userId: B },
 		deadlineAt,
 		cancelWith: first.cancelWith,
 	});
-	const third = await publication.registerUndeliveredRun({
-		narratorId: TARGET,
-		binding: { principal: { userId: null } },
-	});
+	const third = (
+		await publication.startRun({
+			narratorId: TARGET,
+			binding: { principal: { userId: null } },
+		})
+	).binding;
 	expect(third.logicalRunId).not.toBe(first.logicalRunId);
 	expect(third).not.toHaveProperty("deadlineAt");
 	expect(third).not.toHaveProperty("cancelWith");

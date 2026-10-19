@@ -344,11 +344,12 @@ describe("a run that fails before its pass still ends once", () => {
 							new Error("pass preparation failed"),
 						);
 			// A registered run that already published its start.
-			const run = await getRuntimePublicationService().startAgentRun({
-				narratorId: f.child,
-				parentNarratorId: f.parent,
-				binding: f.binding,
-			});
+			const run = (
+				await getRuntimePublicationService().startRun({
+					narratorId: f.child,
+					binding: f.binding,
+				})
+			).publication!;
 			runtimePublication.store.reserveRunSlots(run, { started: true });
 			runtimePublication.store.commitIntent({
 				...run,
@@ -437,10 +438,8 @@ describe("detached publication waits for the exact parent tool transaction", () 
 						// The task projection registers the run; the run service adopts it.
 						const task = await backgroundTaskService.createAgentTask({
 							id: f.child,
-							parentNarratorId: f.parent,
 							subagentNarratorId: f.child,
 							subagentType: "general",
-							toolUseId: f.toolUseId,
 							binding: f.binding,
 						});
 						resumeRunId = task.logicalRunId ?? undefined;
