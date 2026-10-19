@@ -294,6 +294,7 @@ test.each([
 					HOME: peerHome,
 					USERPROFILE: peerHome,
 					XDG_CACHE_HOME: join(peerHome, "cache"),
+					LOCALAPPDATA: join(peerHome, "cache"),
 					LANG: "C.UTF-8",
 				},
 			},

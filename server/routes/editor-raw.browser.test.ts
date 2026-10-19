@@ -456,6 +456,16 @@ test("Chrome146 production raw path: 20MiB, dual-view candidate swap, digests, e
 			hidden,
 		);
 		await bodyGate.entered.promise;
+		// The first body request does not prove both async panel leases have attached.
+		// Establish a shared live candidate before testing that hiding one preserves it.
+		await page.waitForFunction(() => {
+			const state = (window as unknown as RawWindow).rawFixture.state();
+			return (
+				state.registry.visibleConsumers === 2 &&
+				state.registry.workingCopies === 1 &&
+				state.codecs.workers === 1
+			);
+		});
 		await page.evaluate(() =>
 			(window as unknown as RawWindow).rawFixture.loadingViews(false, true),
 		);

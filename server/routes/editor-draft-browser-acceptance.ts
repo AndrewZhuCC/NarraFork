@@ -113,11 +113,15 @@ export async function editorDraftBrowserAcceptance(
 	fixture.signal.throwIfAborted();
 	const session = await page.createCDPSession();
 	const crashed = Promise.withResolvers<void>();
-	const onTargetCrashed = () => crashed.resolve();
+	let active = true;
+	const onTargetCrashed = () => {
+		active = false;
+		console.info("EDITOR_DRAFT_RENDERER_CRASH_CONFIRMED");
+		crashed.resolve();
+	};
 	const onAbort = () => crashed.reject(fixture.signal.reason);
 	session.on("Inspector.targetCrashed", onTargetCrashed);
 	fixture.signal.addEventListener("abort", onAbort, { once: true });
-	let commandError: string | undefined;
 	try {
 		fixture.signal.throwIfAborted();
 		// Crash notification and recovery share the existing overall work budget.
@@ -126,17 +130,32 @@ export async function editorDraftBrowserAcceptance(
 			(async () => {
 				await session.send("Inspector.enable");
 				fixture.signal.throwIfAborted();
-				void session.send("Page.crash").catch((error) => {
-					commandError = String(error).slice(0, 240);
-				});
+				if (!active) return;
+				const browserPid = page.browser().process()?.pid;
+				const connection = session.connection();
+				if (!browserPid || !connection) throw new Error("Expected fixture-owned Chrome");
+				const { processInfo } = await connection.send("SystemInfo.getProcessInfo");
+				fixture.signal.throwIfAborted();
+				if (!active) return;
+				const pids = processInfo.filter((info) => info.type === "renderer").map((info) => info.id);
+				if (
+					pids.length < 1 ||
+					pids.length > 8 ||
+					pids.some(
+						(pid) =>
+							!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || pid === browserPid,
+					)
+				)
+					throw new Error("Invalid fixture renderer process set");
+				console.info("EDITOR_DRAFT_RENDERER_TERMINATION", { rendererCount: pids.length });
+				for (const pid of pids) process.kill(pid, "SIGKILL");
 				await crashed.promise;
 			})(),
 		]);
 	} catch (error) {
-		throw new Error(`Renderer crash was not confirmed${commandError ? `: ${commandError}` : ""}`, {
-			cause: error,
-		});
+		throw new Error("Renderer crash was not confirmed", { cause: error });
 	} finally {
+		active = false;
 		session.off("Inspector.targetCrashed", onTargetCrashed);
 		fixture.signal.removeEventListener("abort", onAbort);
 		// Overall-budget teardown may already have detached this session.

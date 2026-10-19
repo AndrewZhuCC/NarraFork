@@ -523,11 +523,12 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 122 tables and 1713 columns including composer layouts and runtime registration", () => {
+	test("covers 122 tables and 1715 columns including editor recovery", () => {
 		expect(target.tables.length).toBe(122);
-		// 1710 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		// 1712 SQLite-derived columns, including the two editor recovery columns,
+		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1713);
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1715);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")
