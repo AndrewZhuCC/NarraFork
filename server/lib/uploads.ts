@@ -61,8 +61,6 @@ export function contentJsonHasImageBlocks(contentJson: unknown): boolean {
 	});
 }
 
-const ALLOWED_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-
 export const MIME_TO_EXT: Record<string, string> = {
 	"image/png": ".png",
 	"image/jpeg": ".jpg",
@@ -403,12 +401,8 @@ function validateImageDimensions(dimensions: ImageDimensions | undefined): void 
 	}
 }
 
+// Check the byte budget before reading; processImageUpload validates the actual image format.
 export function validateUploadedImage(file: File): void {
-	if (!ALLOWED_MIME_TYPES.has(file.type)) {
-		throw new ValidationError(
-			`Unsupported image type: ${file.type}. Supported: PNG, JPEG, GIF, WebP`,
-		);
-	}
 	if (file.size > MAX_IMAGE_SIZE) {
 		throw new ValidationError(
 			`Image too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 20MB`,
@@ -431,11 +425,9 @@ export interface ProcessedImageUpload {
  * so the (up to 20 MiB) payload is never read from the File twice — only a
  * bounded header prefix is ever scanned on the main thread.
  *
- * Fail-closed: a file that declares an image MIME type but whose magic bytes do
- * not match a supported format, or whose dimensions cannot be parsed, is
- * rejected rather than silently stored. This blocks disguised or corrupt
- * uploads from later being served back as images or sent to AI providers.
- * Callers must validate the declared MIME type and size *before* calling this.
+ * Reject unsupported signatures and unparseable dimensions. The detected format is
+ * authoritative: client declarations and multipart MIME inference may be inaccurate.
+ * Callers must validate the byte budget *before* calling this.
  */
 export async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
 	const bytes = new Uint8Array(await file.arrayBuffer());
@@ -443,11 +435,6 @@ export async function processImageUpload(file: File): Promise<ProcessedImageUplo
 	if (!detectedMediaType) {
 		throw new ValidationError(
 			"Unrecognized image content: file does not match a supported PNG, JPEG, GIF, or WebP signature.",
-		);
-	}
-	if (detectedMediaType !== file.type) {
-		throw new ValidationError(
-			`Image content type mismatch: declared ${file.type}, detected ${detectedMediaType}.`,
 		);
 	}
 	const dimensions = parseImageDimensions(bytes);
@@ -1020,9 +1007,6 @@ export async function deleteNarratorUploads(narratorId: string): Promise<void> {
 const AVATAR_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 export async function saveAvatarImage(userId: string, file: File): Promise<ImageRef> {
-	if (!AVATAR_MIME_TYPES.has(file.type)) {
-		throw new ValidationError(`Unsupported avatar type: ${file.type}. Supported: PNG, JPEG, WebP`);
-	}
 	if (file.size > MAX_AVATAR_SIZE) {
 		throw new ValidationError(
 			`Avatar too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 2MB`,
@@ -1031,6 +1015,11 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 	// Shares the upload pipeline: bytes are read once, the content is sniffed
 	// and dimensions parsed (fail-closed), and the same buffer is written to disk.
 	const { bytes, dimensions, detectedMediaType } = await processImageUpload(file);
+	if (!AVATAR_MIME_TYPES.has(detectedMediaType)) {
+		throw new ValidationError(
+			`Unsupported avatar type: ${detectedMediaType}. Supported: PNG, JPEG, WebP`,
+		);
+	}
 
 	const imageId = generateShortId();
 	const ext = MIME_TO_EXT[detectedMediaType] ?? ".bin";

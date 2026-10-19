@@ -518,23 +518,51 @@ describe("uploads helpers", () => {
 		}
 	});
 
-	test("rejects declared MIME types that do not match the image bytes", async () => {
+	test("uses detected image format instead of rejecting changed or missing MIME", async () => {
 		const testDir = mkdtempSync(resolve(tmpdir(), "narrafork-uploads-mime-mismatch-"));
 		try {
 			setUploadsDirForTests(testDir);
-			const spoofedPng = new File([fileBytes(gifHeader(16, 16))], "spoofed.png", {
+			for (const type of ["", "application/octet-stream", "image/x-png", "image/jpeg"]) {
+				const file = new File([fileBytes(pngHeader(16, 16))], "image.jpg", { type });
+				const saved = await saveUploadedImage("source-narrator", file);
+				expect(saved.mediaType).toBe("image/png");
+				expect(getImagePath("source-narrator", saved.imageId)).toEndWith(".png");
+				const avatar = await saveAvatarImage("user-1", file);
+				expect(avatar.mediaType).toBe("image/png");
+			}
+			const body = new FormData();
+			body.append(
+				"images",
+				new File([fileBytes(pngHeader(16, 16))], "image.jpg", { type: "image/png" }),
+			);
+			const parsed = await new Request("http://localhost", { method: "POST", body }).formData();
+			const file = parsed.get("images") as File;
+			expect(file.type).toBe("image/jpeg");
+			expect((await saveUploadedImage("source-narrator", file)).mediaType).toBe("image/png");
+			// GIF remains valid for attachments, but not avatars, regardless of its label.
+			const mislabeledGif = new File([fileBytes(gifHeader(16, 16))], "image.png", {
 				type: "image/png",
 			});
-			await expect(saveUploadedImage("source-narrator", spoofedPng)).rejects.toThrow(
-				/Image content type mismatch/,
+			expect((await saveUploadedImage("source-narrator", mislabeledGif)).mediaType).toBe(
+				"image/gif",
 			);
-			await expect(saveAvatarImage("user-1", spoofedPng)).rejects.toThrow(
-				/Image content type mismatch/,
+			await expect(saveAvatarImage("user-1", mislabeledGif)).rejects.toThrow(
+				"Unsupported avatar type: image/gif",
 			);
-			expect(existsSync(resolve(testDir, "source-narrator"))).toBe(false);
-			expect(existsSync(resolve(testDir, "avatars", "user-1"))).toBe(false);
 		} finally {
 			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+
+	test("oversized images are rejected before their bytes are read", async () => {
+		const file = new File([], "image.png", { type: "image/png" });
+		Object.defineProperty(file, "size", { value: MAX_IMAGE_SIZE + 1 });
+		const read = spyOn(file, "arrayBuffer");
+		try {
+			await expect(saveUploadedImage("source-narrator", file)).rejects.toThrow("Image too large");
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
 		}
 	});
 

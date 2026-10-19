@@ -332,6 +332,31 @@ describe("primary HTTP message admission", () => {
 		expect(f.accept.mock.calls[0]?.[1]).toBe("line one\nline two");
 		expect(f.accept.mock.calls[0]?.[2].composerDocument).toEqual(document);
 	});
+	test("ZIP MIME alias survives HTTP parsing and downstream attachment validation", async () => {
+		const f = fixture({ buffered: true });
+		const zip = new File(["PK archive bytes"], "archive.zip", {
+			type: "application/x-zip-compressed",
+		});
+		const document: ComposerDocument = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "asset" }] }],
+			assets: [
+				{ id: "asset", kind: "textFile", name: zip.name, size: zip.size, mimeType: zip.type },
+			],
+		};
+		const body = new FormData();
+		body.set("message", "");
+		body.set("composerDocument", JSON.stringify(document));
+		body.append("textFiles", zip);
+		expect((await f.post(body)).status).toBe(202);
+		const admission = f.accept.mock.calls[0]?.[2] as {
+			composerDocument: ComposerDocument;
+			textFiles: File[];
+		};
+		expect(admission.composerDocument).toEqual(document);
+		expect(admission.textFiles[0].type).toBe("application/zip");
+		validateComposerAssets(admission.composerDocument, [], admission.textFiles);
+	});
 	test("document adopts canonical file reference metadata from capture", async () => {
 		const f = fixture({ buffered: true, canonicalPrefix: "/private" });
 		const reference = { id: "ref", deviceId: "local", path: "/tmp/a.ts", label: "a.ts" };
