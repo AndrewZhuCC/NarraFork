@@ -11,10 +11,16 @@ import type { FileChangeLocalIo, LocalFileApplyResult } from "./file-change-loca
 
 export interface EditorAtomicIoOptions {
 	read: FileChangeLocalIo["read"];
-	open(): Promise<EditorRpc>;
-	/** Synchronous, invocation-local transfer; never another receipt store/cache. */
-	onReceipt?(receipt: EditorApplyResult): void;
+	/** Bound to the original device; calls share its existing multiplexed connection. */
+	rpc: EditorRpc;
+	/** Synchronous, invocation-local transfer; never another receipt store/cache.
+	 * `query` is the exact executor query/ACK binding for this receipt. */
+	onReceipt?(receipt: EditorApplyResult, query: EditorReceiptQuery, hostOperationId: string): void;
 }
+export type EditorReceiptQuery = Pick<
+	EditorApplyRequest,
+	"namespace" | "resourceKey" | "operationId" | "requestDigest"
+>;
 export function editorOperationNamespace(
 	sourceInstanceId: string,
 	userId: string,
@@ -57,7 +63,6 @@ export function createEditorFileAtomicIo(options: EditorAtomicIoOptions): FileCh
 		async apply(input): Promise<LocalFileApplyResult> {
 			const parentEffects = { createdPaths: [], possiblePaths: [] };
 			let dispatched = false;
-			let rpc: EditorRpc | undefined;
 			let stageId: string | undefined;
 			const editor = input.editor;
 			if (
@@ -88,7 +93,7 @@ export function createEditorFileAtomicIo(options: EditorAtomicIoOptions): FileCh
 					throw reject("File is read-only");
 				if (input.nextBytes.length > EDITOR_FILE_MAX_BYTES)
 					throw reject("Editor output exceeds 20 MiB");
-				rpc = await options.open();
+				const { rpc } = options;
 				const root = await rpc.call<FsStatResult>(
 					"fs.stat",
 					{
@@ -118,7 +123,7 @@ export function createEditorFileAtomicIo(options: EditorAtomicIoOptions): FileCh
 				if (!parent.isDirectory) throw reject("Editor target parent must already exist");
 				const stage = await rpc.call<EditorStageHandle>(
 					"editor.stage.open",
-					{ ...owner, maxBytes: EDITOR_FILE_MAX_BYTES, idleTimeoutMs: 10_000 },
+					{ ...owner, maxBytes: input.nextBytes.length, idleTimeoutMs: 10_000 },
 					input.signal,
 				);
 				if (
@@ -182,7 +187,16 @@ export function createEditorFileAtomicIo(options: EditorAtomicIoOptions): FileCh
 					intended.blob.digest,
 					input.nextBytes.length,
 				);
-				options.onReceipt?.(receipt);
+				options.onReceipt?.(
+					receipt,
+					{
+						namespace,
+						resourceKey: owner.resourceKey,
+						operationId: request.operationId,
+						requestDigest: request.requestDigest,
+					},
+					editor.operationId,
+				);
 				if (receipt.outcome === "committed") return { kind: "applied", error: null, parentEffects };
 				return {
 					kind: receipt.outcome === "rejected" ? "not_applied" : "target_mutation_unknown",
@@ -199,11 +213,10 @@ export function createEditorFileAtomicIo(options: EditorAtomicIoOptions): FileCh
 					error,
 				};
 			} finally {
-				if (rpc && stageId && !dispatched)
-					await rpc
+				if (stageId && !dispatched)
+					await options.rpc
 						.call("editor.stage.abort", { ...owner, stageId, reason: "cancel" })
 						.catch(() => {});
-				await rpc?.close();
 			}
 		},
 	};

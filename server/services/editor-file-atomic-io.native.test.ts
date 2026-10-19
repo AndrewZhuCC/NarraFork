@@ -275,20 +275,22 @@ test("real remote 20 MiB and only one same-base save wins", async () => {
 	expect(fixture.applies).toBe(2);
 }, 30_000);
 
-test("Host after-read failure retains unknown until original executor proof; no second apply", async () => {
+test("lost apply reply stays unknown until original executor proof; no second apply", async () => {
 	const doc = await document(),
 		saved = await stage(doc, "after");
-	const observation = backend.editorObservation.bind(backend);
-	let reads = 0;
-	const failure = spyOn(backend, "editorObservation").mockImplementation(async (...args) => {
-		if (++reads === 2) throw new Error("Fixture after-read unavailable");
-		return observation(...args);
-	});
+	const reads = spyOn(backend, "editorObservation");
+	fixture.dropSuccess();
 	try {
 		await expect(saved.commit()).rejects.toMatchObject({ code: "WRITE_RECONCILE_REQUIRED" });
+		// Only the before observation: a commit receipt, not a 20 MiB re-read, is the proof.
+		expect(reads).toHaveBeenCalledTimes(1);
 	} finally {
-		failure.mockRestore();
+		reads.mockRestore();
 	}
+	await fixture.reconnect();
+	const reconnected = resolveBackend({ requested: fixture.deviceId });
+	if (!(reconnected instanceof RemoteBackend)) throw new Error("Remote fixture unavailable");
+	backend = reconnected;
 	expect(await readFile(target, "utf8")).toBe("after");
 	expect(fixture.applies).toBe(1);
 	expect(fixture.acks).toBe(0);

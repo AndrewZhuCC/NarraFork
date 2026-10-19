@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -216,18 +215,13 @@ func (e *EditorEngine) stageAppend(ctx context.Context, req EditorStageAppend) (
 		return nil, err
 	}
 	defer file.Close()
-	// RAM records only acknowledged prefixes. A short/cancelled write may leave
+	// RAM records only acknowledged prefixes. A failed/cancelled write may leave
 	// a suffix; retry overwrites it and seal truncates to the accepted length.
-	write := file.WriteAt
-	if e.stageWrite != nil {
-		write = func(b []byte, offset int64) (int, error) { return e.stageWrite(file, b, offset) }
-	}
-	n, err := write(b, s.Size)
-	if err != nil {
+	if _, err = file.WriteAt(b, s.Size); err != nil {
 		return nil, err
 	}
-	if n != len(b) {
-		return nil, io.ErrShortWrite
+	if err = e.inject("stage-written"); err != nil {
+		return nil, err
 	}
 	if err = ctx.Err(); err != nil {
 		return nil, err
@@ -257,30 +251,23 @@ func (e *EditorEngine) stageSeal(ctx context.Context, req EditorStageSeal) (any,
 		return nil, err
 	}
 	defer file.Close()
-	if !s.BodySynced {
-		if err = file.Truncate(s.Size); err != nil {
-			return nil, err
-		}
-		digest, size, err := hashEditorFile(ctx, file)
-		if err != nil {
-			return nil, err
-		}
-		if size != req.TotalBytes || digest != req.RawDigest {
-			return nil, fmt.Errorf("EDITOR_STAGE_SEAL_FAILED: body digest mismatch")
-		}
-		s.RawDigest = digest
-		syncBody := file.Sync
-		if e.stageSync != nil {
-			syncBody = func() error { return e.stageSync(file) }
-		}
-		if err = syncBody(); err != nil {
-			return nil, err
-		}
-		s.BodySynced = true
-	}
-	if err = ctx.Err(); err != nil {
+	if err = file.Truncate(s.Size); err != nil {
 		return nil, err
 	}
+	digest, size, err := hashEditorFile(ctx, file)
+	if err != nil {
+		return nil, err
+	}
+	if size != req.TotalBytes || digest != req.RawDigest {
+		return nil, fmt.Errorf("EDITOR_STAGE_SEAL_FAILED: body digest mismatch")
+	}
+	if err = e.inject("stage-sync"); err != nil {
+		return nil, err
+	}
+	if err = file.Sync(); err != nil {
+		return nil, err
+	}
+	s.RawDigest = digest
 	// No directory or stage-metadata sync: the handle is engine-local. Apply's
 	// durable intent syncs this same directory BEFORE any target mutation.
 	s.Sealed = true
@@ -294,18 +281,10 @@ func (e *EditorEngine) stageAbort(req EditorStageAbort) (any, error) {
 	if req.Reason != "cancel" && req.Reason != "idle_timeout" && req.Reason != "superseded" {
 		return nil, fmt.Errorf("invalid editor abort reason")
 	}
+	// readStage refuses a dispatched stage: apply binds it before publishing intent.
 	s, err := e.readStage(req.Namespace, req.ResourceKey, req.StageID)
 	if err != nil {
 		return nil, err
-	}
-	_, receipts, err := e.scanState()
-	if err != nil {
-		return nil, err
-	}
-	for _, r := range receipts {
-		if r.Request.StageID == s.StageID {
-			return nil, fmt.Errorf("cannot abort a dispatched editor stage")
-		}
 	}
 	if err = e.dropStage(s); err != nil {
 		return nil, err

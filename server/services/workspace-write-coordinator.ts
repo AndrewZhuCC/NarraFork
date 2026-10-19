@@ -862,17 +862,13 @@ export class WorkspaceWriteCoordinator {
 	}
 	/** A verified editor engine terminal receipt proves THIS mutation has stopped;
 	 * host-process termination alone never proves an external helper/RPC ended. */
-	acknowledgeEditorReceipt(
-		input: {
-			leaseId: string;
-			operationId: string;
-			effectId: string;
-			mutationId: string;
-		},
-		verifyReceipt: () => void,
-	): void {
+	acknowledgeEditorReceipt(input: {
+		leaseId: string;
+		operationId: string;
+		effectId: string;
+		mutationId: string;
+	}): void {
 		this.transaction((tx) => {
-			verifyReceipt();
 			const lease = tx
 				.select()
 				.from(durableLeases)

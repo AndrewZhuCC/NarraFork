@@ -1539,7 +1539,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		});
 		expect(Reflect.get(jobs, "transfers")).toBe(0);
 	});
-	test("IO admission bounds complete commits to two globally and one per user", async () => {
+	test("IO admission runs four users at once, one task each, and caps each user's queue", async () => {
 		const jobs = new EditorDocumentJobs(),
 			release = deferred();
 		const active = new Set<string>();
@@ -1552,13 +1552,14 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 				await release.promise;
 				active.delete(user);
 			});
-		const a = work("a"),
-			b = work("b");
-		const queued = Array.from({ length: 8 }, (_, i) => work(i % 2 ? "a" : "c"));
-		await expect(work("extra")).rejects.toThrow("queue is full");
+		const running = ["a", "b", "c", "d", "e"].map(work);
+		// One user's extra windows queue behind its own task and cannot starve others.
+		const queued = [work("a"), work("a")];
+		await expect(work("a")).rejects.toThrow("queue is full");
+		const other = work("f");
 		release.resolve();
-		await Promise.all([a, b, ...queued]);
-		expect(peak).toBe(2);
+		await Promise.all([...running, ...queued, other]);
+		expect(peak).toBe(4);
 	});
 	test("oversize or malformed recovery metadata is rejected before unbounded parsing", async () => {
 		const jobs = new EditorDocumentJobs(),

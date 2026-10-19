@@ -162,9 +162,6 @@ func TestEditorRetentionNeverDeletesSoleProofOrUncertain(t *testing.T) {
 	if got := g.query(t, unknown); got.Outcome != "uncertain" {
 		t.Fatal("unknown proof expired", got)
 	}
-	if _, err := os.Stat(g.e.bodyPath(unknown.StageID)); err != nil {
-		t.Fatal("unknown body evidence expired", err)
-	}
 }
 
 func TestEditorFenceBudgetDoesNotPermanentlyBlockCleanup(t *testing.T) {

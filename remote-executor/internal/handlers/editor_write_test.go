@@ -187,10 +187,8 @@ func TestEditorFailureBoundariesNeverInferSuccess(t *testing.T) {
 			if q2 := f.query(t, req); q2.Outcome != expected {
 				t.Fatal("unstable recovery")
 			}
-			if point == "applying" || written {
-				if _, err := os.Stat(f.e.bodyPath(req.StageID)); err != nil {
-					t.Fatal("uncertain evidence deleted", err)
-				}
+			if _, err := os.Stat(f.e.bodyPath(req.StageID)); !os.IsNotExist(err) {
+				t.Fatal("recovered receipt retained the stage body", err)
 			}
 		})
 	}
@@ -445,7 +443,7 @@ func TestEditorExpiredUndispatchedCleanupPreservesUncertain(t *testing.T) {
 		t.Fatal("interrupted pending not uncertain")
 	}
 	f.call(t, "editor.stage.open", EditorStageOpen{Namespace: "owner", ResourceKey: "resource", MaxBytes: 1, IdleTimeoutMs: 30000})
-	if _, err := os.Stat(f.e.bodyPath(req.StageID)); err != nil {
+	if f.query(t, req).Outcome != "uncertain" {
 		t.Fatal("TTL destroyed uncertain evidence")
 	}
 	if _, err := f.h.EditorDispatch(context.Background(), "editor.stage.abort", editorParams(t, EditorStageAbort{Namespace: "owner", ResourceKey: "resource", StageID: req.StageID, Reason: "cancel"})); err == nil {

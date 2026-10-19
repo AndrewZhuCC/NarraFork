@@ -1,6 +1,6 @@
 import { join, relative, sep } from "node:path";
 import { EDITOR_FILE_MAX_BYTES, type EditorOperationResult } from "../../shared/editor-document";
-import type { EditorApplyResult, EditorQueryResult } from "../../shared/editor-provider-contracts";
+import type { EditorQueryResult } from "../../shared/editor-provider-contracts";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -15,9 +15,9 @@ import {
 } from "./editor-document-service";
 import {
 	createEditorFileAtomicIo,
+	type EditorReceiptQuery,
 	editorOperationNamespace,
 	editorWriterResourceKey,
-	validateEditorApplyResult,
 } from "./editor-file-atomic-io";
 import type { FileChangeEffectRecord, FileChangeOperationRecord } from "./file-change-evidence";
 import { createFileChangeLocalIo } from "./file-change-local-io";
@@ -83,39 +83,11 @@ function remoteResult(
 		},
 	};
 }
-// Host operations whose terminal ACK the executor already accepted in this process.
-// Bounded memo only: losing it costs one idempotent ACK, never a result.
-const ACKNOWLEDGED_LIMIT = 4096;
-const acknowledged = new Set<string>();
-function rememberAcknowledged(operationId: string) {
-	acknowledged.add(operationId);
-	if (acknowledged.size > ACKNOWLEDGED_LIMIT)
-		acknowledged.delete(acknowledged.values().next().value as string);
-}
-async function acknowledgeEditorReceipt(
-	operation: FileChangeOperationRecord,
-	effect: FileChangeEffectRecord,
-	authorize: () => Promise<void>,
-	receipt: EditorApplyResult,
-) {
-	const runtime = await getCurrentLocalFileChangeRuntime();
-	if (runtime.evidence.getOperation(operation.id)?.settlement !== "settled") return;
-	await authorize();
-	// A response alone is insufficient: original evidence and lease must already be durable.
-	runtime.settleEditorReceipt(operation.id, receipt);
-	if (acknowledged.has(operation.id)) return;
-	const backend = resolveBackend({ requested: effect.identityJson.deviceId });
+/** ACK lets the executor retire terminal proof once the Host holds it durably. Idempotent. */
+async function acknowledgeEditorReceipt(deviceId: string, query: EditorReceiptQuery) {
+	const backend = resolveBackend({ requested: deviceId });
 	if (!(backend instanceof RemoteBackend)) throw new Error("Original editor device unavailable");
-	const rpc = backend.editorWriteRpc();
-	try {
-		await rpc.call("editor.query", {
-			...remoteQueryRequest(operation, effect),
-			acknowledgeTerminal: true,
-		});
-		rememberAcknowledged(operation.id);
-	} finally {
-		await rpc.close();
-	}
+	await backend.editorWriteRpc().call("editor.query", { ...query, acknowledgeTerminal: true });
 }
 
 export const executeEditorDocumentFileChange: EditorDocumentDependencies["execute"] = async (
@@ -127,11 +99,11 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 	if (!resourceKey)
 		throw new AppError("Editor resource binding unavailable", 503, "EDITOR_PROVIDER_UNSUPPORTED");
 	const backend = remote?.backend;
-	let validatedReceipt: EditorApplyResult | undefined;
+	let terminal: { query: EditorReceiptQuery; hostOperationId: string } | undefined;
 	const io =
 		remote && backend instanceof RemoteBackend
 			? createEditorFileAtomicIo({
-					open: async () => backend.editorWriteRpc(),
+					rpc: backend.editorWriteRpc(),
 					read: (path, signal) =>
 						backend.editorObservation(
 							{
@@ -145,8 +117,8 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 							resourceKey,
 							signal,
 						),
-					onReceipt: (receipt) => {
-						validatedReceipt = receipt;
+					onReceipt: (receipt, query, hostOperationId) => {
+						if (receipt.outcome !== "uncertain") terminal = { query, hostOperationId };
 					},
 				})
 			: createFileChangeLocalIo(undefined, {
@@ -172,34 +144,14 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 			run,
 		);
 	} finally {
-		if (
-			remote &&
-			validatedReceipt &&
-			validatedReceipt.outcome !== "uncertain" &&
-			request.authorizeReceipt
-		) {
+		// The runtime settles a terminal receipt itself; ACK only once that is durable.
+		// A failed ACK is retried by the next operation query, never by a reapply.
+		if (backend && terminal) {
+			const { query, hostOperationId } = terminal;
 			try {
 				const runtime = await getCurrentLocalFileChangeRuntime();
-				const namespace = await runtime.verifyNamespace();
-				const operation = runtime.evidence.getEditorOperation(
-					namespace.sourceInstanceId,
-					request.requestId,
-				);
-				const effects = operation
-					? runtime.evidence.listEffects(operation.id, { limit: 2 }).items
-					: [];
-				if (
-					operation &&
-					operation.ownerUserId === request.userId &&
-					operation.narratorId === request.narratorId &&
-					effects.length === 1
-				)
-					await acknowledgeEditorReceipt(
-						operation,
-						effects[0],
-						request.authorizeReceipt,
-						validatedReceipt,
-					);
+				if (runtime.evidence.getOperation(hostOperationId)?.settlement === "settled")
+					await acknowledgeEditorReceipt(backend.deviceId, query);
 			} catch (error) {
 				logger.debug("Editor engine ACK deferred", { error: String(error) });
 			}
@@ -307,18 +259,17 @@ export const queryEditorOperation: NonNullable<
 	const effects = runtime.evidence.listEffects(operation.id, { limit: 2 }).items;
 	const deviceId =
 		operation.executionBindingJson?.deviceId ?? effects[0]?.identityJson.deviceId ?? "local";
-	if (actor.authorizeOperation) await actor.authorizeOperation(deviceId);
+	const authorize = actor.authorizeOperation?.bind(actor, deviceId);
+	if (authorize) await authorize();
 	else if (deviceId !== "local")
 		throw new EditorDocumentError(
 			"EDITOR_OPERATION_UNKNOWN",
 			"Original receipt device authorization unavailable",
 			403,
 		);
-	if (deviceId !== "local") {
-		if (effects.length !== 1 || !actor.authorizeOperation)
-			return { status: "uncertain", operationId };
-		const effect = effects[0];
-		if (!remoteEditorIntent(operation, effect))
+	if (authorize && deviceId !== "local") {
+		const effect = effects.length === 1 ? effects[0] : undefined;
+		if (!effect || !remoteEditorIntent(operation, effect))
 			return {
 				status: "uncertain",
 				operationId,
@@ -328,76 +279,45 @@ export const queryEditorOperation: NonNullable<
 						"This remote save has no durable receipt binding; verify the file before retrying",
 				},
 			};
-		const authorize = actor.authorizeOperation.bind(actor, deviceId);
-		const saved = remoteResult(operation, effect);
+		const query = remoteQueryRequest(operation, effect);
 		if (operation.settlement === "settled") {
-			// Retry only terminal ACK. Offline/failed ACK cannot downgrade proven SQLite results.
-			if ((saved.status === "saved" && saved.result) || saved.status === "failed") {
-				const receipt: EditorApplyResult =
-					saved.status === "saved" && saved.result
-						? {
-								operationId,
-								outcome: "committed",
-								rawDigest: saved.result.hash,
-								totalBytes: saved.result.bytes,
-							}
-						: { operationId, outcome: "rejected", rawDigest: null, totalBytes: null };
-				await acknowledgeEditorReceipt(operation, effect, authorize, receipt).catch((error) => {
-					actor.signal?.throwIfAborted();
-					logger.debug("Editor engine ACK deferred", { error: String(error) });
-				});
-			}
-			return saved;
+			const result = remoteResult(operation, effect);
+			// Retry only the terminal ACK; an offline executor never downgrades SQLite proof.
+			if (result.status !== "uncertain")
+				await acknowledgeEditorReceipt(deviceId, query).catch((error) =>
+					logger.debug("Editor engine ACK deferred", { error: String(error) }),
+				);
+			return result;
 		}
+		// Lost reply or cold recovery: adopt only a positively terminal executor receipt.
 		try {
 			const backend = resolveBackend({ requested: deviceId });
 			if (!(backend instanceof RemoteBackend))
 				throw new Error("Original editor device unavailable");
 			const rpc = backend.editorWriteRpc();
-			try {
-				const request = remoteQueryRequest(operation, effect);
-				const proof = await rpc.call<EditorQueryResult>("editor.query", request, actor.signal);
-				// Revalidated once after the RPC; settlement is synchronous up to the ACK.
-				await actor.authorizeOperation(deviceId);
-				const intended = effect.intendedAfterStateJson;
-				if (
-					proof?.operationId === operationId &&
-					proof.result &&
-					proof.result.outcome === proof.outcome &&
-					(proof.outcome === "committed" || proof.outcome === "rejected") &&
-					intended.kind === "regular"
-				) {
-					validateEditorApplyResult(
-						proof.result,
-						{ operationId },
-						intended.blob.digest,
-						intended.blob.sizeBytes,
-					);
-					try {
-						runtime.settleEditorReceipt(operation.id, proof.result);
-					} catch (error) {
-						logger.warn("Editor receipt contradicts original intent", {
-							operationId,
-							error: String(error),
-						});
-						return { status: "uncertain", operationId };
-					}
-					// ACK failure never downgrades the durable Host result or replays apply.
-					await rpc
-						.call("editor.query", { ...request, acknowledgeTerminal: true }, actor.signal)
-						.then(
-							() => rememberAcknowledged(operation.id),
-							(error) => logger.debug("Editor engine ACK deferred", { error: String(error) }),
-						);
+			const proof = await rpc.call<EditorQueryResult>("editor.query", query, actor.signal);
+			if (
+				proof?.result &&
+				proof.result.outcome === proof.outcome &&
+				(proof.outcome === "committed" || proof.outcome === "rejected")
+			) {
+				try {
+					runtime.settleEditorReceipt(operation.id, proof.result);
+				} catch (error) {
+					logger.warn("Editor receipt contradicts original intent", {
+						operationId,
+						error: String(error),
+					});
+					return { status: "uncertain", operationId };
 				}
-			} finally {
-				await rpc.close();
+				await rpc.call("editor.query", { ...query, acknowledgeTerminal: true }, actor.signal);
 			}
 		} catch (error) {
 			actor.signal?.throwIfAborted();
 			logger.debug("Editor remote query unavailable", { operationId, error: String(error) });
 		}
-		await actor.authorizeOperation(deviceId);
+		// Access may have been revoked while the RPC was in flight.
+		await authorize();
 		const latest = runtime.evidence.getOperation(operation.id);
 		const observed = runtime.evidence.getEffect(operation.id, effect.mutationId);
 		return latest && observed

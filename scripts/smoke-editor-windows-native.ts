@@ -129,12 +129,11 @@ async function apply(value: LocalFileApplyInput, drop = false) {
 			}
 			return result;
 		},
-		close: async () => {},
 	};
 	try {
 		return await createEditorFileAtomicIo({
 			read: fileChangeLocalIo.read,
-			open: async () => rpc,
+			rpc,
 		}).apply(value);
 	} finally {
 		await session.close();

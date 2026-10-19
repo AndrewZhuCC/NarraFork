@@ -1522,15 +1522,6 @@ export class EditorDocumentService {
 							hashKind: upload.hashKind,
 							snapshotRevision: upload.snapshotRevision,
 						},
-						authorizeReceipt: async () => {
-							if (!actor.authorizeOperation)
-								throw new EditorDocumentError(
-									"EDITOR_OPERATION_UNKNOWN",
-									"Receipt metadata authorization unavailable",
-									403,
-								);
-							await actor.authorizeOperation(binding.deviceId ?? session.input.deviceId ?? "local");
-						},
 						authorize: async () => {
 							// Cancellation/DELETE may mark closing after commit began; pin keeps the bound bytes alive.
 							const fresh = await actor.authorize(session.input, "write");
@@ -1675,11 +1666,9 @@ export class EditorDocumentService {
 			operation.userId === actor.userId &&
 			operation.narratorId === actor.narratorId
 		) {
-			if (operation.deviceId && actor.authorizeOperation)
-				await actor.authorizeOperation(operation.deviceId);
-			// Remote receipts are canonical in SQLite, including live terminal results
-			// whose direct ACK may have failed. A live commit must not race its own apply,
-			// and a pre-dispatch rejection has no SQLite row, so both stay cache-only.
+			// Remote receipts are canonical in SQLite (the query authorizes the device), including
+			// terminal results whose direct ACK may have failed. A live commit must not race its
+			// own apply, and a pre-dispatch rejection has no SQLite row: both stay cache-only.
 			if (
 				operation.deviceId &&
 				operation.deviceId !== "local" &&
@@ -1688,6 +1677,8 @@ export class EditorDocumentService {
 				operation.value.status !== "failed"
 			)
 				return this.deps.queryOperation(actor, operationId);
+			if (operation.deviceId && actor.authorizeOperation)
+				await actor.authorizeOperation(operation.deviceId);
 			if (operation.recovery?.hashKind === "raw-sha256" && this.deps.rawWriter)
 				return this.deps.rawWriter.queryOperation(actor, operationId, operation.recovery);
 			if (operation.recovery && this.deps.queryOperation)

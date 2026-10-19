@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,8 +24,10 @@ func volatileAppend(t *testing.T, f *editorFixture, id string, seq, offset int64
 func TestEditorVolatileStageSyncBudget(t *testing.T) {
 	f := newEditorFixture(t, nil)
 	syncs := 0
-	f.e.stageSync = func(file *os.File) error { syncs++; return file.Sync() }
 	f.e.fault = func(point string) error {
+		if point == "stage-sync" {
+			syncs++
+		}
 		if point == "metadata-sync" {
 			return fmt.Errorf("upload attempted durable metadata publication")
 		}
@@ -62,41 +62,26 @@ func TestEditorVolatileStageSyncBudget(t *testing.T) {
 		t.Fatal("sealed body remained mutable")
 	}
 }
-func TestEditorVolatileShortWriteAndCancelledSuffix(t *testing.T) {
+func TestEditorVolatileCancelledSuffix(t *testing.T) {
 	f := newEditorFixture(t, nil)
 	stage := volatileOpen(t, f, 16)
-	f.e.stageWrite = func(file *os.File, b []byte, offset int64) (int, error) {
-		if _, err := file.WriteAt([]byte("abcunaccepted"), offset); err != nil {
-			return 0, err
-		}
-		return 1, nil
-	}
-	request := EditorStageAppend{Namespace: "owner", ResourceKey: "resource", StageID: stage.StageID, Seq: 0, Offset: 0, Bytes: 3, Digest: editorDigest([]byte("abc")), DataB64: "YWJj"}
-	if _, err := f.h.EditorDispatch(context.Background(), "editor.stage.append", editorParams(t, request)); !errors.Is(err, io.ErrShortWrite) {
-		t.Fatal("short write was accepted", err)
-	}
-	if row := f.e.stages[stage.StageID]; row.Size != 0 || len(row.Chunks) != 0 {
-		t.Fatal("short write advanced the acknowledged prefix")
-	}
-	f.e.stageWrite = nil
 	volatileAppend(t, f, stage.StageID, 0, 0, []byte("abc"))
+	// A write that landed but was never acknowledged leaves a suffix.
 	ctx, cancel := context.WithCancel(context.Background())
-	f.e.stageWrite = func(file *os.File, b []byte, offset int64) (int, error) {
-		n, err := file.WriteAt(b, offset)
-		cancel()
-		return n, err
+	f.e.fault = func(point string) error {
+		if point == "stage-written" {
+			cancel()
+		}
+		return nil
 	}
-	request.Seq = 1
-	request.Offset = 3
-	request.Digest = editorDigest([]byte("def"))
-	request.DataB64 = "ZGVm"
+	request := EditorStageAppend{Namespace: "owner", ResourceKey: "resource", StageID: stage.StageID, Seq: 1, Offset: 3, Bytes: 3, Digest: editorDigest([]byte("def")), DataB64: "ZGVm"}
 	if _, err := f.h.EditorDispatch(ctx, "editor.stage.append", editorParams(t, request)); !errors.Is(err, context.Canceled) {
 		t.Fatal("cancelled append was accepted", err)
 	}
 	if f.e.stages[stage.StageID].Size != 3 {
 		t.Fatal("cancelled write advanced the prefix")
 	}
-	f.e.stageWrite = nil
+	f.e.fault = nil
 	f.call(t, "editor.stage.seal", EditorStageSeal{Namespace: "owner", ResourceKey: "resource", StageID: stage.StageID, TotalBytes: 3, RawDigest: editorDigest([]byte("abc"))})
 	body, err := os.ReadFile(f.e.bodyPath(stage.StageID))
 	if err != nil || string(body) != "abc" {
@@ -108,7 +93,12 @@ func TestEditorFailedSealCannotDispatch(t *testing.T) {
 	stage := volatileOpen(t, f, 5)
 	volatileAppend(t, f, stage.StageID, 0, 0, []byte("after"))
 	seal := EditorStageSeal{Namespace: "owner", ResourceKey: "resource", StageID: stage.StageID, TotalBytes: 5, RawDigest: editorDigest([]byte("after"))}
-	f.e.stageSync = func(*os.File) error { return errors.New("sync failed") }
+	f.e.fault = func(point string) error {
+		if point == "stage-sync" {
+			return errors.New("sync failed")
+		}
+		return nil
+	}
 	if _, err := f.h.EditorDispatch(context.Background(), "editor.stage.seal", editorParams(t, seal)); err == nil {
 		t.Fatal("failed body sync was acknowledged")
 	}
@@ -120,7 +110,7 @@ func TestEditorFailedSealCannotDispatch(t *testing.T) {
 	if f.query(t, request).Outcome != "not_found" {
 		t.Fatal("failed seal published an operation")
 	}
-	f.e.stageSync = nil
+	f.e.fault = nil
 	f.call(t, "editor.stage.seal", seal)
 	if result := f.call(t, "editor.apply", request).(EditorApplyResult); result.Outcome != "committed" {
 		t.Fatal("same sealed bytes could not retry before dispatch", result)
@@ -264,8 +254,9 @@ func TestEditorUnpublishedTerminalKeepsRecoveryBody(t *testing.T) {
 	if query := f.query(t, request); query.Outcome != "uncertain" {
 		t.Fatal("unpublished success was guessed", query)
 	}
-	if _, err := os.Stat(f.e.bodyPath(request.StageID)); err != nil {
-		t.Fatal("uncertain query deleted recovery evidence", err)
+	// Uncertain proof lives in the receipt; the body no longer holds a stage slot.
+	if _, err := os.Stat(f.e.bodyPath(request.StageID)); !os.IsNotExist(err) {
+		t.Fatal("uncertain query retained the stage body", err)
 	}
 }
 
@@ -296,62 +287,6 @@ func TestEditorTerminalBodiesDoNotFillStagingBudget(t *testing.T) {
 	receipts, err := filepath.Glob(filepath.Join(f.state, "*.op.json"))
 	if err != nil || len(receipts) != 8 {
 		t.Fatal("body cleanup discarded unacknowledged terminal receipts", len(receipts), err)
-	}
-}
-func TestEditorLegacyStateStaysQueryableAndIsReclaimed(t *testing.T) {
-	f := newEditorFixture(t, []byte("before"))
-	request := f.request(t, "current", []byte("before"), []byte("after"))
-	if result := f.call(t, "editor.apply", request).(EditorApplyResult); result.Outcome != "committed" {
-		t.Fatal(result)
-	}
-	var r editorReceipt
-	if err := editorReadJSON(f.e.receiptPath(request.Namespace, request.OperationID), &r); err != nil {
-		t.Fatal(err)
-	}
-	// Rewrite it as a pre-epoch receipt: bare 48-hex stage, no body metadata.
-	legacy := r
-	legacy.Request.OperationID = "legacy"
-	legacy.Request.RequestDigest = editorDigest([]byte("legacy"))
-	legacy.Request.StageID = strings.Repeat("ab", 24)
-	result := *r.Result
-	result.OperationID = "legacy"
-	legacy.Result = &result
-	raw, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fields map[string]any
-	if err = json.Unmarshal(raw, &fields); err != nil {
-		t.Fatal(err)
-	}
-	delete(fields, "stageRawDigest")
-	delete(fields, "stageBytes")
-	if err = f.e.save(f.e.receiptPath("owner", "legacy"), fields); err != nil {
-		t.Fatal(err)
-	}
-	orphan := strings.Repeat("cd", 24)
-	old := time.Now().Add(-time.Hour)
-	for _, name := range []string{orphan + ".body", orphan + ".stage.json"} {
-		path := filepath.Join(f.state, name)
-		if err = os.WriteFile(path, []byte("{}"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err = os.Chtimes(path, old, old); err != nil {
-			t.Fatal(err)
-		}
-	}
-	volatileOpen(t, f, 1)
-	query := EditorQueryRequest{Namespace: "owner", ResourceKey: "resource", OperationID: "legacy", RequestDigest: legacy.Request.RequestDigest}
-	if q := f.call(t, "editor.query", query).(EditorQueryResult); q.Outcome != "committed" {
-		t.Fatal("legacy receipt became unreadable", q)
-	}
-	for _, name := range []string{orphan + ".body", orphan + ".stage.json"} {
-		if _, err = os.Stat(filepath.Join(f.state, name)); !os.IsNotExist(err) {
-			t.Fatal("legacy stage state was not reclaimed", name, err)
-		}
-	}
-	if _, _, _, err = f.e.inventory(); err != nil {
-		t.Fatal("legacy receipt blocked inventory", err)
 	}
 }
 func TestEditorSharedRootKeepsForeignLiveStage(t *testing.T) {

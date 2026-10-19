@@ -180,14 +180,10 @@ func TestEditorRealProcessCrashRecoveryAndTemporaryQuota(t *testing.T) {
 			if q.Outcome != want {
 				t.Fatalf("process recovery %s %+v", point, q)
 			}
-			// The first query itself publishes rejection and releases unneeded
-			// recovery bytes; no later admission may hide lazy body cleanup.
-			_, bodyErr := os.Stat(f.e.bodyPath(req.StageID))
-			if want == "rejected" && !os.IsNotExist(bodyErr) {
-				t.Fatal("first recovery query retained rejected body", bodyErr)
-			}
-			if want == "uncertain" && bodyErr != nil {
-				t.Fatal("uncertain query lost recovery body", bodyErr)
+			// The first query itself publishes the outcome and releases the body:
+			// rejected and uncertain proof live in the receipt, never in staging.
+			if _, bodyErr := os.Stat(f.e.bodyPath(req.StageID)); !os.IsNotExist(bodyErr) {
+				t.Fatal("first recovery query retained the stage body", bodyErr)
 			}
 			if again := f.query(t, req); again.Outcome != want {
 				t.Fatal("unacknowledged recovery receipt was not queryable", again)

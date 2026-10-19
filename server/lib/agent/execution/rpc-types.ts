@@ -36,7 +36,6 @@ export const FEATURE_EDITOR_DURABLE_WRITE_V1 = "editor.durable-write.v1";
 /** Editor RPC selected by the authorized backend; no local helper bootstrap. */
 export interface EditorRpc {
 	call<T>(method: string, params: object, signal?: AbortSignal): Promise<T>;
-	close(): Promise<void>;
 }
 /** Non-recursive exclusive mkdir with canonical path verification (legacy capability). */
 export const FEATURE_FS_MKDIR_EXCLUSIVE_V1 = "fs.mkdir.exclusive.v1";
