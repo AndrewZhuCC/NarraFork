@@ -353,7 +353,7 @@ describe("真实 WS 错误不落入空响应兜底", () => {
 		["completed", 503, false],
 		["completed", 400, true],
 		["completed", 503, true],
-	] as const)("保留错误并按状态重试，关闭 dump 也有效 (%s, %i, usage=%s)", async (delivery, status, withUsage) => {
+	] as const)("保留错误并按状态重试，关闭请求证据也有效 (%s, %i, usage=%s)", async (delivery, status, withUsage) => {
 		const message = "backend rejected this request";
 		const code = "gateway_failure";
 		const frame =
@@ -385,8 +385,10 @@ describe("真实 WS 错误不落入空响应兜底", () => {
 		wsBaseUrl = `http://127.0.0.1:${server.port}/backend-api/codex`;
 		providerScenario = "ws_error_response";
 		providerAttempts = 0;
-		const dumpEnabled = settings.agent.requestDumpEnabled;
-		settings.agent.requestDumpEnabled = false;
+		// With request evidence fully off there is no recorder bridge at all; the error
+		// classification must not depend on one.
+		const evidence = settings.requestEvidence;
+		settings.requestEvidence = { ...evidence, ringEnabled: false, autoPin: "off" };
 		try {
 			const events = await runLoop({ maxTransientRetries: 1 });
 			const terminal = events.at(-1);
@@ -403,13 +405,12 @@ describe("真实 WS 错误不落入空响应兜底", () => {
 			const requests = events.filter((event) => event.type === "api_request_end");
 			expect(requests).toHaveLength(providerAttempts);
 			for (const request of requests) {
-				expect(request.rawDump).toBeUndefined();
 				expect(request.diagnostics).toMatchObject({ code, statusCode: status });
 				expect(request.diagnostics?.message).toContain(message);
 				expect(request.diagnostics?.reason).not.toMatch(/^empty_response/);
 			}
 		} finally {
-			settings.agent.requestDumpEnabled = dumpEnabled;
+			settings.requestEvidence = evidence;
 			await clearCodexResponsesWebSocketSessions();
 			server.stop(true);
 		}

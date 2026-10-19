@@ -1,4 +1,8 @@
-import type { RecordingIdentity, RecordingSettings } from "../../shared/request-recording";
+import type {
+	RecordingIdentity,
+	RecordingPinReason,
+	RecordingSettings,
+} from "../../shared/request-recording";
 import type { DiskSafetySettings } from "./disk-safety-config";
 
 export const REQUEST_RECORDING_DIR = "request-recordings";
@@ -34,6 +38,7 @@ export type RecorderOperation =
 	| { type: "gap"; requestId: string; side: RecordingSide; bytes: number; reason: string }
 	| { type: "end"; requestId: string; error?: string; status?: string }
 	| { type: "bind"; requestId: string; apiRequestId: string }
+	| { type: "pin"; requestId: string; reason: RecordingPinReason }
 	| { type: "save"; narratorId: string }
 	| { type: "detail"; narratorId: string; requestId: string }
 	| { type: "save-specific"; narratorId: string; requestId: string }

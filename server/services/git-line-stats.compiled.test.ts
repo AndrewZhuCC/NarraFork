@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitLineStats } from "../../shared/git-line-stats";
+import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 
 const exec = promisify(execFile);
 const project = resolve(import.meta.dir, "../..");
@@ -12,13 +13,10 @@ const childOptions = { timeout: 60_000, maxBuffer: 1024 * 1024 };
 
 test("compiled Git line statistics embed the worker and run after all copied sources are removed", async () => {
 	const buildSource = await readFile(join(project, "scripts/build-cross-platform.ts"), "utf8");
-	const compile = buildSource.match(
-		/const compile = await runBuildStep\(\s*\[([\s\S]*?)\]\s*,?\s*\)/,
+	expect(buildSource).toContain("...compiledWorkerBuildEntrypoints()");
+	expect(compiledWorkerBuildEntrypoints()).toContain(
+		"./server/services/git-untracked-line-worker.ts",
 	);
-	if (!compile) throw new Error("Production compiler arguments were not found");
-	const argumentsOnly = compile[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
-	const entries = [...argumentsOnly.matchAll(/"([^"\r\n]+)"/g)].map((match) => match[1]);
-	expect(entries).toContain("./server/services/git-untracked-line-worker.ts");
 
 	const fixture = await mkdtemp(join(tmpdir(), "nf-git-lines-compiled-"));
 	try {
@@ -28,6 +26,7 @@ test("compiled Git line statistics embed the worker and run after all copied sou
 		const copied = [
 			"server/services/git-line-stats.ts",
 			"server/services/git-untracked-line-worker.ts",
+			"server/lib/compiled-worker.ts",
 			"server/lib/errors.ts",
 			"server/lib/logger.ts",
 			"server/lib/narrafork-home.ts",
@@ -49,11 +48,11 @@ test("compiled Git line statistics embed the worker and run after all copied sou
 		const probe = join(source, "server/probe.ts");
 		await writeFile(
 			probe,
-			`import { getGitLineStats, gitLineStatsWorkerEntryPoint } from "./services/git-line-stats";
+			`import { getGitLineStats, gitLineStatsWorkerSpecifiers } from "./services/git-line-stats";
 import { isCompiledRuntime } from "./lib/runtime-target";
 console.log(JSON.stringify({
 	compiled: isCompiledRuntime(),
-	worker: String(gitLineStatsWorkerEntryPoint()),
+	worker: gitLineStatsWorkerSpecifiers()[0],
 	cwd: process.cwd(),
 	stats: await getGitLineStats(Bun.argv[2]),
 }));

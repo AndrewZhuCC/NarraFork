@@ -71,7 +71,7 @@ import { settings } from ${JSON.stringify(settings)};
 settings.diskSafety = { ...settings.diskSafety, mode: "off" };
 const client = new RequestRecorderClient(process.env.NARRAFORK_HOME!);
 try {
- client.configure({ requestDumpRecordingEnabled: true, requestDumpRequestBytes: 1048576, requestDumpResponseBytes: 1048576, requestDumpEnabled: false, requestDumpErrorsOnly: false });
+ client.configure({ ringEnabled: true, ringRequestBytes: 1048576, ringResponseBytes: 1048576, autoPin: "off", });
  await client.call({ type: "begin", identity: { requestId: "compiled-request", narratorId: "compiled-narrator", provider: "fixture", model: "fixture" }, continuous: false, errorsOnly: false });
  const data = new TextEncoder().encode("data: compiled-worker-test\\n\\n");
  client.capture({ type: "chunk", requestId: "compiled-request", side: "response", kind: "body", data, packet: 1, offset: 0, total: data.byteLength, time: new Date().toISOString() });

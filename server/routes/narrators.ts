@@ -39,7 +39,6 @@ import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import {
-	apiRequests,
 	chapters,
 	containerInstances,
 	narratorBlacklistCmds,
@@ -61,7 +60,6 @@ import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
-import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
@@ -94,7 +92,9 @@ import {
 } from "../lib/browser/session";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
+	bindComposerDocumentReferences,
 	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../lib/composer-document";
@@ -525,9 +525,12 @@ export async function parseMessageRequest(
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
-		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		const composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		const message = restoreMultipartComposerText(
+			typeof rawMessage === "string" ? rawMessage : "",
+			composerDocument,
+		);
 		validateComposerProjection(composerDocument, message, fileReferences);
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
@@ -1631,63 +1634,6 @@ narratorRoutes.get("/:id/panel-state", async (c) => {
 	return c.json(result);
 });
 
-// Download the raw SSE request/response dump for a leaked-tool-call diagnostic.
-// Narrator-scoped so non-admin users participating in debugging can fetch the data,
-// with an ownership check preventing access to other narrators' requests.
-narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
-	const id = c.req.param("id");
-	const requestId = c.req.param("requestId");
-	await narratorService.getById(id); // 404 if narrator missing
-
-	const [row] = await db
-		.select({
-			id: apiRequests.id,
-			narratorId: apiRequests.narratorId,
-			provider: apiRequests.provider,
-			model: apiRequests.model,
-			createdAt: apiRequests.createdAt,
-			errorMessage: apiRequests.errorMessage,
-			rawDumpJson: apiRequests.rawDumpJson,
-		})
-		.from(apiRequests)
-		.where(eq(apiRequests.id, requestId));
-
-	if (!row || row.narratorId !== id) {
-		// Treat a mismatched owner the same as missing to avoid leaking existence.
-		return c.json({ error: "Request dump not found for this narrator" }, 404);
-	}
-	if (!row.rawDumpJson) {
-		return c.json(
-			{
-				error:
-					"No raw dump stored for this request. Raw SSE data is only retained when a leak is detected or request dumping is enabled.",
-			},
-			404,
-		);
-	}
-
-	let rawDump: unknown;
-	try {
-		// Same redaction as the usage-history detail path: the stored dump carries absolute
-		// server paths (spill pointer / malformed capture) that name the host OS account, and a
-		// dump is something users export and forward to whoever is helping them. This route
-		// used to return the row verbatim, so it leaked what the other path was careful about.
-		rawDump = redactSpillPointerPaths(JSON.parse(row.rawDumpJson));
-	} catch {
-		rawDump = { invalidJson: true, rawText: row.rawDumpJson };
-	}
-
-	return c.json({
-		id: row.id,
-		narratorId: row.narratorId,
-		provider: row.provider,
-		model: row.model,
-		createdAt: row.createdAt,
-		errorMessage: row.errorMessage,
-		rawDump,
-	});
-});
-
 narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
@@ -2218,7 +2164,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		interrupt: requestedInterrupt,
 		queueMode,
 		fileReferences,
-		composerDocument,
+		composerDocument: requestedComposerDocument,
 	} = await parseMessageRequest(c, id);
 	// Explicit mode wins over legacy booleans; omission retains existing callers.
 	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
@@ -2232,7 +2178,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// a rejected reference must not strand images saved by multipart parsing.
 	let uploadsAccepted = false;
 	try {
-		const mixedDocument = composerDocument?.paragraphs.some((paragraph) =>
+		const mixedDocument = requestedComposerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
 		);
 		const queuedNewCommand = mixedDocument ? null : parseNewCommand(message);
@@ -2464,6 +2410,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		const snapshots = fileReferences?.length
 			? await captureFileReferences(id, userId, fileReferences, c.req.raw.signal)
 			: undefined;
+		const composerDocument = bindComposerDocumentReferences(
+			requestedComposerDocument,
+			snapshots?.map((snapshot) => snapshot.reference),
+		);
 
 		// Extract model override from resolved command (if any)
 		const modelOverride =
@@ -3046,9 +2996,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
 		const formData = await c.req.formData();
-		content = (formData.get("content") as string) ?? "";
 		fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		content = restoreMultipartComposerText(
+			(formData.get("content") as string) ?? "",
+			composerDocument,
+		);
 		const rawSkipRevert = formData.get("skipRevert");
 		if (typeof rawSkipRevert === "string") skipRevert = rawSkipRevert === "true";
 		const rawRollback = formData.get("rollback");
@@ -3117,6 +3070,10 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		fileReferences,
 		userId,
 		c.req.raw.signal,
+	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
 	);
 
 	// Editing a message truncates everything after it and regenerates, so the running
@@ -3370,6 +3327,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
+		if (rawText !== undefined) rawText = restoreMultipartComposerText(rawText, composerDocument);
 
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
@@ -3434,6 +3392,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		located.message.fileReferences ?? [],
 		fileReferences,
 		(references) => captureFileReferences(id, c.get("user").sub, references, c.req.raw.signal),
+	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
 	);
 	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
@@ -3712,28 +3674,17 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 				? expectedMessageVersion
 				: undefined,
 	});
-	// Read the message version AFTER the page, never concurrently.
-	//
-	// The page builder materializes a lazy fork's missing refs on demand
-	// (`ensureRefsCoverSeq`), and that backfill bumps `messageVersion`. Run in
-	// parallel, this query resolves BEFORE the backfill commits while the page
-	// carries the post-backfill version — so the equality check below failed
-	// deterministically on the first upward scroll past a fork boundary, the one
-	// place the backfill actually copies anything. Sequenced, both sides observe
-	// the same post-backfill version, and the check goes back to meaning what it
-	// says: another writer changed the narrator underneath us.
+	// The page is internally consistent on its own: the service snapshots
+	// `messageVersion` after any lazy-ref backfill and re-checks it after the build
+	// (rebuilding unpinned pages on drift). A second comparison here only reopened a
+	// window in which any unrelated write on a live narrator turned a good page into
+	// a 409, so this read is just the existence check.
 	await requireNarratorAccess(c, id, "read");
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
-		columns: { messageVersion: true },
+		columns: { id: true },
 	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	if (narratorMeta.messageVersion !== result.messageVersion)
-		throw new AppError(
-			"Narrator message version changed while the exact-layout page was being built",
-			409,
-			"PRETEXT_DOCUMENT_CHANGED",
-		);
 	return c.json(result);
 });
 

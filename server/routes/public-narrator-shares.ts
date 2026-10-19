@@ -198,20 +198,13 @@ publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 				? expectedMessageVersion
 				: undefined,
 	});
-	// Read the message version AFTER the page, never concurrently — the page
-	// builder's lazy-ref backfill bumps it, and only the sequenced read observes
-	// the same post-backfill version (see the narrator route's note).
+	// The service guarantees the page's own revision consistency (see the narrator
+	// route's note); a second version comparison here only produced spurious 409s.
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, auth.narratorId),
-		columns: { messageVersion: true },
+		columns: { id: true },
 	});
 	if (!narratorMeta) throw unavailablePublicShare();
-	if (narratorMeta.messageVersion !== result.messageVersion)
-		throw new AppError(
-			"Narrator message version changed while the exact-layout page was being built",
-			409,
-			"PRETEXT_DOCUMENT_CHANGED",
-		);
 	revalidatePublicShare(auth);
 	return c.json(projectPublicNarratorPayload(auth.narratorId, result));
 });

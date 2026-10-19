@@ -1,0 +1,40 @@
+/**
+ * Mantine `Slider` marks must not widen their container.
+ *
+ * A slider built with `marks` renders each mark as an absolutely positioned
+ * `.mantine-Slider-markWrapper` whose left edge is the mark's leading edge
+ * (`--mark-offset - slider-size / 2`) and whose WIDTH is shrink-to-fit around
+ * its content — the dot plus the nowrap label. So the wrapper extends a whole
+ * label to the RIGHT of the last mark's centre, and nothing clips it: it becomes
+ * scrollable overflow of the nearest scroll container.
+ *
+ * Symptom: any panel whose content box is `overflow: auto` grows a horizontal
+ * scrollbar it has no reason to have. The narrator dock's typography panel is
+ * the visible case — the transcript is laid out beside those sliders, so a
+ * stray horizontal scrollbar both misaligns the panel and steals height from the
+ * transcript. At page level the same overflow scrolls the settings page a few
+ * pixels sideways.
+ *
+ * Fix: keep the wrapper as a zero-size anchor — its left edge is all the layout
+ * needs, and that is where the dot is painted — and take the label out of the
+ * wrapper's own sizing by making it absolutely positioned. Because its insets
+ * are all `auto`, it keeps its static position (the anchor) and therefore keeps
+ * Mantine's own offsets and transform, including Mantine's RTL mirroring. Both
+ * the dots and the labels measure pixel-identically before and after at every
+ * width; the boxes simply stop claiming width.
+ *
+ * Scope: horizontal sliders only. Vertical ones already size their wrapper to
+ * zero and stack the label beside it, so they are left alone.
+ *
+ * Regression: `frontend/components/narrator/appearance-panel-overflow.browser.test.tsx`
+ * renders the real typography panel inside a real dock surface and asserts the
+ * panel's scroll box never overflows horizontally.
+ */
+
+.mantine-Slider-root:not([data-orientation="vertical"]) .mantine-Slider-markWrapper {
+	width: 0;
+}
+
+.mantine-Slider-root:not([data-orientation="vertical"]) .mantine-Slider-markLabel {
+	position: absolute;
+}

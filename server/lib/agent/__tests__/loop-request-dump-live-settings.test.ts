@@ -3,12 +3,8 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SavedRecording } from "@shared/request-recording";
-import {
-	isRequestDumpEnabled,
-	shouldCollectRequestDump,
-	startApiRequest,
-} from "../../api-request-tracker";
+import type { RecordingSettings, SavedRecording } from "@shared/request-recording";
+import { startApiRequest } from "../../api-request-tracker";
 import { RequestRecorderClient } from "../../request-recorder";
 import {
 	REQUEST_RECORDING_SAVED_DIR,
@@ -17,14 +13,14 @@ import {
 import { RequestRecorderStore } from "../../request-recorder-store";
 import { settings } from "../../settings";
 import type { ProviderAdapter } from "../provider";
-import { RING_DIAGNOSTIC_PREFIX_BYTES } from "../request-dump";
 import type { AgentConfig, AgentEvent } from "../types";
 import { ApiError } from "../types";
 
 /**
- * Dump settings must be live: saving `agent.requestDumpEnabled` affects the next
+ * Request evidence settings must be live: saving `requestEvidence` affects the next
  * provider request in an already-running process without rebuilding the narrator
- * session. Collection is decided at each attempt start; persist is decided at finish.
+ * session. Whether a recorder bridge exists is decided at each attempt start; whether the
+ * recording is kept (auto-pin) is decided by the recorder when the request ends.
  */
 
 /** Whether the last provider.chat() received a dump collector. */
@@ -33,8 +29,6 @@ let lastChatHadDump = false;
 let anyChatHadDump = false;
 let chatCount = 0;
 let failBeforeStart = false;
-let largeResponse = false;
-let lastPrefixKept = 0;
 let responseScenario:
 	| "empty"
 	| "nameless-tool"
@@ -67,13 +61,7 @@ const testProvider: ProviderAdapter = {
 			throw new ApiError(Number(responseScenario), "Rejected before first stream event");
 		if (responseScenario === "disconnect")
 			throw new Error("ECONNRESET: upstream connection closed");
-		if (largeResponse) {
-			params.requestDump?.setResponseBodyTextWithLimit(
-				"x".repeat(2 * 1024 * 1024),
-				32 * 1024 * 1024,
-			);
-			lastPrefixKept = params.requestDump?.snapshot().response?.bodyBytesKept ?? 0;
-		} else params.requestDump?.setResponseBodyText('{"ok":true}');
+		params.requestDump?.appendResponseText('{"ok":true}');
 		if (responseScenario === "empty") {
 			yield { usage: { promptTokens: 1, completionTokens: 0 }, stopReason: "end_turn" };
 			return;
@@ -130,6 +118,15 @@ function makeConfig(signal: AbortSignal): AgentConfig {
 	};
 }
 
+/** Apply a partial `requestEvidence` patch; returns a restore function. */
+function setEvidence(patch: Partial<RecordingSettings>): () => void {
+	const previous = settings.requestEvidence;
+	settings.requestEvidence = { ...previous, ...patch };
+	return () => {
+		settings.requestEvidence = previous;
+	};
+}
+
 async function runLoop(onEvent?: (event: AgentEvent) => void): Promise<AgentEvent[]> {
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
@@ -141,81 +138,42 @@ async function runLoop(onEvent?: (event: AgentEvent) => void): Promise<AgentEven
 	return events;
 }
 
-describe("dump 开关实时生效", () => {
-	test("helpers read the live settings singleton", () => {
-		const prev = settings.agent.requestDumpEnabled;
-		try {
-			settings.agent.requestDumpEnabled = false;
-			expect(isRequestDumpEnabled()).toBe(false);
-			expect(shouldCollectRequestDump(false)).toBe(false);
-			expect(shouldCollectRequestDump(true)).toBe(true);
-
-			settings.agent.requestDumpEnabled = true;
-			expect(isRequestDumpEnabled()).toBe(true);
-			expect(shouldCollectRequestDump(false)).toBe(true);
-		} finally {
-			settings.agent.requestDumpEnabled = prev;
-		}
-	});
-
-	test("保存后下一次请求即带上 collector，无需重启叙述者", async () => {
-		const prevEnabled = settings.agent.requestDumpEnabled;
-		const prevErrorsOnly = settings.agent.requestDumpErrorsOnly;
-		const prevRecording = settings.agent.requestDumpRecordingEnabled;
+describe("request evidence 开关实时生效", () => {
+	test("保存后下一次请求即带上 recorder bridge，无需重启叙述者", async () => {
+		const restore = setEvidence({ ringEnabled: false, autoPin: "off" });
 		const discardCapture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
 			() => true,
 		);
 		try {
-			settings.agent.requestDumpRecordingEnabled = false;
-			// Off: first "session" (next user message after save-to-off) collects nothing.
-			settings.agent.requestDumpEnabled = false;
-			settings.agent.requestDumpErrorsOnly = false;
+			// Off: next user message after save-to-off records nothing.
 			chatCount = 0;
-			const offEvents = await runLoop();
+			await runLoop();
 			expect(chatCount).toBeGreaterThan(0);
 			expect(anyChatHadDump).toBe(false);
-			for (const event of offEvents) {
-				if (event.type === "api_request_end") {
-					expect(event.rawDump).toBeUndefined();
-				}
-			}
 
-			// Toggle on — simulates settings PATCH updating the singleton mid-process.
-			// The next agentLoop invocation is the next user message; no ActiveNarrator
-			// rebuild, no process restart.
-			settings.agent.requestDumpEnabled = true;
-			settings.agent.requestDumpErrorsOnly = false;
-
-			const onEvents = await runLoop();
+			// Toggle on — simulates a settings PATCH updating the singleton mid-process.
+			settings.requestEvidence = { ...settings.requestEvidence, ringEnabled: true };
+			await runLoop();
 			expect(anyChatHadDump).toBe(true);
 			expect(lastChatHadDump).toBe(true);
-			const ends = onEvents.filter((e) => e.type === "api_request_end");
-			expect(ends.length).toBeGreaterThan(0);
-			for (const end of ends) {
-				expect(end.rawDump).toBeDefined();
-				const dump = end.rawDump as { request?: { body?: unknown }; response?: unknown };
-				expect(dump.request?.body).toEqual({ hello: "world" });
-			}
 
-			// Toggle off again: the subsequent request must stop collecting immediately.
-			settings.agent.requestDumpEnabled = false;
-			const offAgain = await runLoop();
+			// Toggle off again: the subsequent request must stop recording immediately.
+			settings.requestEvidence = { ...settings.requestEvidence, ringEnabled: false };
+			await runLoop();
 			expect(anyChatHadDump).toBe(false);
-			for (const event of offAgain) {
-				if (event.type === "api_request_end") {
-					expect(event.rawDump).toBeUndefined();
-				}
-			}
+
+			// autoPin alone (ring off) still records: pinning needs a recording to keep.
+			settings.requestEvidence = { ...settings.requestEvidence, autoPin: "errors" };
+			await runLoop();
+			expect(anyChatHadDump).toBe(true);
 		} finally {
-			settings.agent.requestDumpEnabled = prevEnabled;
-			settings.agent.requestDumpErrorsOnly = prevErrorsOnly;
-			settings.agent.requestDumpRecordingEnabled = prevRecording;
+			restore();
 			discardCapture.mockRestore();
 		}
 	});
 
 	test("请求尚未onRequestStart便失败也结束录制并保留error", async () => {
-		const previous = settings.agent.requestDumpRecordingEnabled;
+		const restore = setEvidence({ ringEnabled: true });
 		const operations: RecorderOperation[] = [];
 		const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
 			(operation) => {
@@ -224,7 +182,6 @@ describe("dump 开关实时生效", () => {
 			},
 		);
 		try {
-			settings.agent.requestDumpRecordingEnabled = true;
 			failBeforeStart = true;
 			const events = await runLoop();
 			expect(events.some((event) => event.type === "api_request_start")).toBe(false);
@@ -237,7 +194,7 @@ describe("dump 开关实时生效", () => {
 		} finally {
 			failBeforeStart = false;
 			capture.mockRestore();
-			settings.agent.requestDumpRecordingEnabled = previous;
+			restore();
 		}
 	});
 
@@ -248,14 +205,16 @@ describe("dump 开关实时生效", () => {
 		"503",
 		"disconnect",
 		"no-start",
-	] as const)("errors-only 保存最终判定为错误的 %s，并在懒start后保留API关联", async (scenario) => {
+	] as const)("autoPin=errors 保存最终判定为错误的 %s，并在懒start后保留API关联", async (scenario) => {
 		const home = await mkdtemp(join(tmpdir(), "loop-recording-verdict-"));
 		const store = new RequestRecorderStore(home);
-		const previous = {
-			enabled: settings.agent.requestDumpEnabled,
-			errorsOnly: settings.agent.requestDumpErrorsOnly,
-			recording: settings.agent.requestDumpRecordingEnabled,
+		const evidence: RecordingSettings = {
+			ringEnabled: true,
+			ringRequestBytes: 1024 * 1024,
+			ringResponseBytes: 1024 * 1024,
+			autoPin: "errors",
 		};
+		const restore = setEvidence(evidence);
 		const operations: RecorderOperation[] = [];
 		let writes: Promise<void> = Promise.resolve();
 		const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
@@ -268,19 +227,7 @@ describe("dump 开关实时生效", () => {
 			},
 		);
 		try {
-			settings.agent.requestDumpEnabled = true;
-			settings.agent.requestDumpErrorsOnly = true;
-			settings.agent.requestDumpRecordingEnabled = true;
-			await store.execute({
-				type: "configure",
-				settings: {
-					requestDumpRecordingEnabled: true,
-					requestDumpRequestBytes: 1024 * 1024,
-					requestDumpResponseBytes: 1024 * 1024,
-					requestDumpEnabled: true,
-					requestDumpErrorsOnly: true,
-				},
-			});
+			await store.execute({ type: "configure", settings: evidence });
 			responseScenario = scenario;
 			const apiIds = new Map<string, string>();
 			const events = await runLoop((event) => {
@@ -337,16 +284,14 @@ describe("dump 开关实时生效", () => {
 		} finally {
 			responseScenario = undefined;
 			capture.mockRestore();
-			settings.agent.requestDumpEnabled = previous.enabled;
-			settings.agent.requestDumpErrorsOnly = previous.errorsOnly;
-			settings.agent.requestDumpRecordingEnabled = previous.recording;
+			restore();
 			await writes.catch(() => {});
 			await rm(home, { recursive: true, force: true });
 		}
 	});
 
 	test("consumer return 在最终判定前退出也结束录制，成功请求只在最终判定后finish", async () => {
-		const previous = settings.agent.requestDumpRecordingEnabled;
+		const restore = setEvidence({ ringEnabled: true });
 		const operations: RecorderOperation[] = [];
 		const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
 			(operation) => {
@@ -355,7 +300,6 @@ describe("dump 开关实时生效", () => {
 			},
 		);
 		try {
-			settings.agent.requestDumpRecordingEnabled = true;
 			const controller = new AbortController();
 			for await (const event of agentLoop(makeConfig(controller.signal), "go", [])) {
 				if (event.type !== "stream_text") continue;
@@ -375,12 +319,12 @@ describe("dump 开关实时生效", () => {
 			expect(success[0]).toMatchObject({ status: "completed", error: undefined });
 		} finally {
 			capture.mockRestore();
-			settings.agent.requestDumpRecordingEnabled = previous;
+			restore();
 		}
 	});
 
 	test("录制identity使用与start事件一致的冻结请求owner，而不是随后变化的session owner", async () => {
-		const previous = settings.agent.requestDumpRecordingEnabled;
+		const restore = setEvidence({ ringEnabled: true });
 		const operations: RecorderOperation[] = [];
 		const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
 			(operation) => {
@@ -389,7 +333,6 @@ describe("dump 开关实时生效", () => {
 			},
 		);
 		try {
-			settings.agent.requestDumpRecordingEnabled = true;
 			const config = makeConfig(new AbortController().signal);
 			let ownerReads = 0;
 			Object.defineProperty(config, "userId", { get: () => `shared-owner-${++ownerReads}` });
@@ -403,13 +346,12 @@ describe("dump 开关实时生效", () => {
 			expect(begin?.type === "begin" ? begin.identity.userId : undefined).not.toBe(config.userId);
 		} finally {
 			capture.mockRestore();
-			settings.agent.requestDumpRecordingEnabled = previous;
+			restore();
 		}
 	});
 
-	test("默认循环录制实时上报但不产生SQLite rawDump", async () => {
-		const prevEnabled = settings.agent.requestDumpEnabled;
-		const prevRecording = settings.agent.requestDumpRecordingEnabled;
+	test("默认循环录制实时上报请求/响应并绑定API行", async () => {
+		const restore = setEvidence({ ringEnabled: true, autoPin: "off" });
 		const operations: RecorderOperation[] = [];
 		const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
 			(operation) => {
@@ -418,14 +360,11 @@ describe("dump 开关实时生效", () => {
 			},
 		);
 		try {
-			settings.agent.requestDumpEnabled = false;
-			settings.agent.requestDumpRecordingEnabled = true;
-			largeResponse = true;
 			const events = await runLoop();
-			largeResponse = false;
-			expect(lastPrefixKept).toBe(RING_DIAGNOSTIC_PREFIX_BYTES);
 			expect(anyChatHadDump).toBe(true);
-			expect(operations.some((operation) => operation.type === "begin")).toBe(true);
+			const begin = operations.find((operation) => operation.type === "begin");
+			// autoPin=off: ring only, nothing is continuous or errors-only pinned.
+			expect(begin).toMatchObject({ continuous: false, errorsOnly: false });
 			expect(
 				operations.some((operation) => operation.type === "chunk" && operation.side === "request"),
 			).toBe(true);
@@ -433,6 +372,7 @@ describe("dump 开关实时生效", () => {
 				operations.some((operation) => operation.type === "chunk" && operation.side === "response"),
 			).toBe(true);
 			expect(operations.some((operation) => operation.type === "end")).toBe(true);
+			expect(operations.some((operation) => operation.type === "pin")).toBe(false);
 			const start = events.find((event) => event.type === "api_request_start");
 			expect(start).toBeDefined();
 			if (start?.type === "api_request_start") {
@@ -449,17 +389,12 @@ describe("dump 开关实时生效", () => {
 					apiRequestId: handle.id,
 				});
 			}
-			const ends = events.filter((event) => event.type === "api_request_end");
-			expect(ends.length).toBeGreaterThan(0);
-			for (const end of ends) expect(end.rawDump).toBeUndefined();
-			settings.agent.requestDumpRecordingEnabled = false;
+			settings.requestEvidence = { ...settings.requestEvidence, ringEnabled: false };
 			await runLoop();
 			expect(anyChatHadDump).toBe(false);
 		} finally {
 			capture.mockRestore();
-			settings.agent.requestDumpEnabled = prevEnabled;
-			settings.agent.requestDumpRecordingEnabled = prevRecording;
-			largeResponse = false;
+			restore();
 		}
 	});
 });

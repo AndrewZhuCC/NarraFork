@@ -11,6 +11,10 @@ import "@mantine/core/styles.css";
 import "@mantine/dates/styles.css";
 import "@mantine/notifications/styles.css";
 import "@mantine/tiptap/styles.css";
+// Patches a Mantine Slider layout detail: mark labels must not widen the
+// scroll container they sit in. Global because every `marks` slider needs it —
+// see the stylesheet header.
+import "@frontend/styles/mantine-slider-marks.css";
 import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 /*
  * The plain store, NOT `hooks/usePluginThemes`.

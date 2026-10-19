@@ -822,6 +822,7 @@ export function useCreateNarrator() {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			cwd?: string;
+			title?: string;
 			makeNamed?: boolean;
 			handle?: string;
 			kind?: "knowledge";

@@ -34,11 +34,10 @@ import { settings } from "../settings";
 let home: string;
 let store: RequestRecorderStore;
 const config: RecordingSettings = {
-	requestDumpRecordingEnabled: true,
-	requestDumpRequestBytes: 1024 * 1024,
-	requestDumpResponseBytes: 1024 * 1024,
-	requestDumpEnabled: false,
-	requestDumpErrorsOnly: false,
+	ringEnabled: true,
+	ringRequestBytes: 1024 * 1024,
+	ringResponseBytes: 1024 * 1024,
+	autoPin: "off",
 };
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 beforeEach(async () => {
@@ -150,7 +149,7 @@ describe("循环录制与固定保存", () => {
 	test("请求和返回独立淘汰，保留最新而非响应开头", async () => {
 		await store.execute({
 			type: "configure",
-			settings: { ...config, requestDumpRequestBytes: 500, requestDumpResponseBytes: 900 },
+			settings: { ...config, ringRequestBytes: 500, ringResponseBytes: 900 },
 		});
 		await begin("old");
 		await chunk("old", "request", "old-request".repeat(20));
@@ -177,7 +176,7 @@ describe("循环录制与固定保存", () => {
 	test("超大单包只保留末尾并标明原始长度/偏移", async () => {
 		await store.execute({
 			type: "configure",
-			settings: { ...config, requestDumpResponseBytes: 600 },
+			settings: { ...config, ringResponseBytes: 600 },
 		});
 		await begin("oversized");
 		await chunk("oversized", "response", `${"a".repeat(5000)}TAIL`);
@@ -225,7 +224,7 @@ describe("循环录制与固定保存", () => {
 		const snapshot = await save();
 		await store.execute({
 			type: "configure",
-			settings: { ...config, requestDumpRequestBytes: 0, requestDumpResponseBytes: 0 },
+			settings: { ...config, ringRequestBytes: 0, ringResponseBytes: 0 },
 		});
 		const job = await store.prepareArchive("n1", snapshot.id);
 		const output = await store.buildArchive(job, new AbortController().signal);
@@ -268,7 +267,7 @@ describe("循环录制与固定保存", () => {
 	test("强制持续保留不受循环预算回收，结束后记录可列出", async () => {
 		await store.execute({
 			type: "configure",
-			settings: { ...config, requestDumpRequestBytes: 0, requestDumpResponseBytes: 0 },
+			settings: { ...config, ringRequestBytes: 0, ringResponseBytes: 0 },
 		});
 		await begin("continuous", "n1", true);
 		await chunk("continuous", "response", "always-kept");
@@ -435,7 +434,7 @@ describe("录制元数据脱敏与 worker 邮箱", () => {
 			const snapshot = await client.call<SavedRecording>({ type: "save", narratorId: "n1" });
 			expect(snapshot.partial).toBe(true);
 			expect(snapshot.truncated).toBe(true);
-			expect(snapshot.bytes).toBeLessThanOrEqual(config.requestDumpResponseBytes);
+			expect(snapshot.bytes).toBeLessThanOrEqual(config.ringResponseBytes);
 			expect((await savedManifest(snapshot)).requests[0].gapReasons).toContain("mailbox overload");
 		} finally {
 			await client.close();
@@ -585,7 +584,7 @@ describe("review 崩溃恢复回归", () => {
 		store = new RequestRecorderStore(home);
 		await store.execute({
 			type: "configure",
-			settings: { ...config, requestDumpResponseBytes: 0 },
+			settings: { ...config, ringResponseBytes: 0 },
 		});
 		expect(await readdir(ringChunks("zero-after-restart"))).toEqual([]);
 		expect((await save()).bytes).toBe(0);
@@ -613,7 +612,7 @@ describe("review 崩溃恢复回归", () => {
 		);
 	});
 	test("开始即持久化归属和发布状态，首checkpoint前连续录制崩溃仍可管理", async () => {
-		await store.execute({ type: "configure", settings: { ...config, requestDumpEnabled: true } });
+		await store.execute({ type: "configure", settings: { ...config, autoPin: "all" } });
 		await begin("early-continuous", "n1", true);
 		await chunk("early-continuous", "response", "before-checkpoint");
 		const ids = await readdir(fixedParent());
@@ -681,7 +680,7 @@ describe("review 崩溃恢复回归", () => {
 });
 
 test("continuous receipt存在但chunks未创建的崩溃窗口仍恢复为可下载可删除的部分保存", async () => {
-	await store.execute({ type: "configure", settings: { ...config, requestDumpEnabled: true } });
+	await store.execute({ type: "configure", settings: { ...config, autoPin: "all" } });
 	const target = store as unknown as { chunksDir(record: unknown): string };
 	const crash = spyOn(target, "chunksDir").mockImplementation(() => {
 		throw new Error("simulated crash before chunks creation");
@@ -704,4 +703,105 @@ test("continuous receipt存在但chunks未创建的崩溃窗口仍恢复为可�
 	expect(await Bun.file(archive.path).exists()).toBe(true);
 	await store.execute({ type: "delete", narratorId: "n1", saveId: result.items[0].id });
 	expect(await readdir(join(home, REQUEST_RECORDING_SAVED_DIR, hash("n1")))).toEqual([]);
+});
+
+describe("请求证据自动固定", () => {
+	test("进行中请求被固定后，结束时以原因写入固定保存", async () => {
+		await begin("pinned-live");
+		await chunk("pinned-live", "request", "req");
+		await store.execute({ type: "pin", requestId: "pinned-live", reason: "leak" });
+		await chunk("pinned-live", "response", "resp");
+		let listed = (await store.execute({ type: "list", narratorId: "n1" })) as {
+			items: SavedRecording[];
+		};
+		expect(listed.items).toHaveLength(0);
+		await store.execute({ type: "end", requestId: "pinned-live" });
+		listed = (await store.execute({ type: "list", narratorId: "n1" })) as {
+			items: SavedRecording[];
+		};
+		expect(listed.items).toHaveLength(1);
+		expect(listed.items[0].reason).toBe("leak");
+		expect(listed.items[0].requestIds).toEqual(["pinned-live"]);
+		expect(await savedTexts(listed.items[0])).toEqual(["req", "resp"]);
+	});
+	test("已结束的环形请求被固定时立即保存，重复固定不产生第二份", async () => {
+		await begin("pinned-late");
+		await chunk("pinned-late", "request", "late");
+		await store.execute({ type: "end", requestId: "pinned-late", error: "boom" });
+		await store.execute({ type: "pin", requestId: "pinned-late", reason: "malformed" });
+		await store.execute({ type: "pin", requestId: "pinned-late", reason: "malformed" });
+		const listed = (await store.execute({ type: "list", narratorId: "n1" })) as {
+			items: SavedRecording[];
+		};
+		expect(listed.items).toHaveLength(1);
+		expect(listed.items[0].reason).toBe("malformed");
+	});
+	test("仅错误模式只固定失败请求并标注 error 原因", async () => {
+		await begin("ok", "n1", true, true);
+		await chunk("ok", "request", "fine");
+		await store.execute({ type: "end", requestId: "ok" });
+		await begin("bad", "n1", true, true);
+		await chunk("bad", "request", "broken");
+		await store.execute({ type: "end", requestId: "bad", error: "HTTP 400" });
+		const listed = (await store.execute({ type: "list", narratorId: "n1" })) as {
+			items: SavedRecording[];
+		};
+		expect(listed.items.map((item) => [item.requestIds, item.reason])).toEqual([
+			[["bad"], "error"],
+		]);
+	});
+	test("手动保存标注 manual 原因", async () => {
+		await begin("manual");
+		await chunk("manual", "request", "x");
+		expect((await save()).reason).toBe("manual");
+	});
+	test("未知请求的固定是无操作", async () => {
+		await store.execute({ type: "pin", requestId: "missing", reason: "leak" });
+		const listed = (await store.execute({ type: "list", narratorId: "n1" })) as {
+			items: SavedRecording[];
+		};
+		expect(listed.items).toHaveLength(0);
+	});
+});
+
+describe("响应头独立预算", () => {
+	test("大量网关头保留在预算内，超出部分标记截断", () => {
+		const headers: Record<string, string> = {};
+		for (let index = 0; index < 400; index++) headers[`x-trace-${index}`] = "v".repeat(100);
+		const result = sanitizeRecordingMetadata({ status: 200, headers });
+		const kept = Object.keys(result.headers as Record<string, string>);
+		expect(kept.length).toBeGreaterThan(200);
+		expect(kept.length).toBeLessThanOrEqual(256);
+		expect(kept[0]).toBe("x-trace-0");
+		expect(result.headersTruncated).toBe(true);
+		expect(result.status).toBe(200);
+	});
+	test("头预算不受通用 8KiB 元数据预算限制，且敏感头仍被遮蔽", () => {
+		const headers: Record<string, string> = { authorization: "Bearer secret" };
+		for (let index = 0; index < 60; index++) headers[`x-ratelimit-${index}`] = "1".repeat(200);
+		const result = sanitizeRecordingMetadata({ headers });
+		const kept = result.headers as Record<string, string>;
+		expect(Object.keys(kept)).toHaveLength(61);
+		expect(kept.authorization).toBe("[REDACTED]");
+		expect(result.headersTruncated).toBeUndefined();
+	});
+	test("单个超长头值被截断并标记", () => {
+		const result = sanitizeRecordingMetadata({ headers: { "x-big": "a".repeat(20_000) } });
+		expect((result.headers as Record<string, string>)["x-big"]).toHaveLength(8 * 1024);
+		expect(result.headersTruncated).toBe(true);
+	});
+	test("元数据中的头截断在录制里留下 gap", async () => {
+		await begin("hdr");
+		await store.execute({
+			type: "meta",
+			requestId: "hdr",
+			side: "response",
+			value: { status: 200, headers: { a: "b" }, headersTruncated: true },
+		});
+		await store.execute({ type: "end", requestId: "hdr" });
+		const saved = await save();
+		expect((await savedManifest(saved)).requests[0].gapReasons.join(";")).toContain(
+			"headers truncated",
+		);
+	});
 });

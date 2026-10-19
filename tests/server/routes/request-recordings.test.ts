@@ -219,7 +219,7 @@ describe("request recording HTTP contracts and ACL", () => {
 				durationMs: 1234,
 				ttftMs: 56,
 				errorMessage: `failed /home/private-account/private.dump ${"中".repeat(5000)}`,
-				rawDumpJson: "DO_NOT_EXPOSE_RAW_DUMP",
+				diagnosticsJson: "DO_NOT_EXPOSE_RAW_DUMP",
 			},
 			{
 				id: foreignApiId,
@@ -228,7 +228,7 @@ describe("request recording HTTP contracts and ACL", () => {
 				durationMs: 999,
 				ttftMs: 999,
 				errorMessage: "foreign error",
-				rawDumpJson: "FOREIGN_DUMP",
+				diagnosticsJson: "FOREIGN_DUMP",
 			},
 		]);
 		const lookup = mock(lookupApiRequestMetadata);

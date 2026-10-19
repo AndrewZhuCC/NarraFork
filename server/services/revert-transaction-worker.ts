@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { isCompiledRuntime } from "../lib/runtime-target";
@@ -16,23 +17,12 @@ export function revertManifestWorkerSpecifiers(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	const paths = compiled
-		? [
-				"./services/revert-transaction-manifest-worker.js",
-				"./server/services/revert-transaction-manifest-worker.js",
-				"./revert-transaction-manifest-worker.js",
-			]
-		: ["./revert-transaction-manifest-worker.ts"];
-	return paths.map((path) => new URL(path, moduleUrl).href);
-}
-
-/** Preserve Bun's Windows virtual module key instead of converting it to backslashes. */
-export function revertManifestWorkerEntryPoint(specifier: string): string | URL {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)) {
-		return decodeURIComponent(url.pathname.slice(1));
-	}
-	return url;
+	return compiledWorkerSpecifiers(
+		"services/revert-transaction-manifest-worker.ts",
+		"./revert-transaction-manifest-worker.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 
 const READY_TIMEOUT_MS = 5_000;
@@ -91,7 +81,7 @@ async function workerAt<T>(
 			abort = () => refuse(new RevertTransactionError("MANIFEST_CANCELLED"));
 			signal.addEventListener("abort", abort, { once: true });
 			if (signal.aborted) return abort();
-			thread = new Worker(revertManifestWorkerEntryPoint(specifier));
+			thread = new Worker(workerEntryFromSpecifier(specifier));
 			timer = setTimeout(
 				() => refuse(new RevertTransactionError("MANIFEST_WORKER_TIMEOUT")),
 				timeoutMs,

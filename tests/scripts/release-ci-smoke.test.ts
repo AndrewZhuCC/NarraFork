@@ -591,6 +591,7 @@ if (process.argv.includes("--narrafork-watcher-worker")) {
     } else if (message.type === "shutdown") process.exit(0);
   }
 } else {
+  if (!process.argv.includes("--serve")) throw new Error("Fixture requires direct server mode, not the Windows manager");
   writeFileSync(${JSON.stringify(evidence)}, root);
   const settings = JSON.parse(readFileSync(join(process.env.NARRAFORK_HOME, "settings.json"), "utf8"));
   if (settings.server?.openBrowser !== "off") throw new Error("Fixture requires a headless isolated configuration");

@@ -426,12 +426,84 @@ export function namedCandidates(candidates: { id: string; handle: string; title?
 	query.setQueryData(["named-narrators"], candidates);
 }
 
-export function nativeSelection(from: number, to = from) {
-	const element = document.querySelector<HTMLElement>("[role=textbox]") as HTMLElement & {
-		editor: Editor;
+function textboxEditor(): Editor {
+	const element = document.querySelector<HTMLElement & { editor?: Editor }>("[role=textbox]");
+	if (!element?.editor) throw new Error("Missing composer editor");
+	return element.editor;
+}
+
+export function caretProbe() {
+	const editor = textboxEditor();
+	const head = editor.state.selection.head;
+	return { head, top: editor.view.coordsAtPos(head).top, text: composer.current?.getText() ?? "" };
+}
+
+export function scrollProbe() {
+	const editor = textboxEditor();
+	const scroller = editor.view.dom.closest<HTMLElement>("[data-composer-scroll]");
+	if (!scroller) throw new Error("Missing composer scroller");
+	const caret = editor.view.coordsAtPos(editor.state.selection.head);
+	const box = scroller.getBoundingClientRect();
+	return {
+		head: editor.state.selection.head,
+		text: composer.current?.getText() ?? "",
+		scrollTop: scroller.scrollTop,
+		scrollHeight: scroller.scrollHeight,
+		clientHeight: scroller.clientHeight,
+		caretTop: caret.top,
+		caretBottom: caret.bottom,
+		boxTop: box.top,
+		boxBottom: box.bottom,
 	};
-	element.editor.commands.setTextSelection({ from, to });
-	element.editor.commands.focus();
+}
+
+export function placeCaretAt(text: string, offset: number) {
+	const editor = textboxEditor();
+	let pos: number | null = null;
+	editor.state.doc.descendants((node, position) => {
+		if (pos != null || !node.isText || !node.text) return;
+		const index = node.text.indexOf(text);
+		if (index >= 0) pos = position + index + offset;
+	});
+	if (pos == null) throw new Error(`Missing text ${text}`);
+	editor.commands.setTextSelection(pos);
+	editor.commands.focus();
+	return caretProbe();
+}
+
+/** `line` is the visual row, so soft-wrapped text counts even without hard breaks. */
+export function placeCaretOnVisualLine(line: number) {
+	const editor = textboxEditor();
+	const samples: { pos: number; top: number }[] = [];
+	editor.state.doc.descendants((node, position) => {
+		if (!node.isText || !node.text) return;
+		for (let index = 0; index <= node.text.length; index++) {
+			try {
+				samples.push({ pos: position + index, top: editor.view.coordsAtPos(position + index).top });
+			} catch {
+				// Replaced atoms have no caret rectangle.
+			}
+		}
+	});
+	const lines: { top: number; positions: number[] }[] = [];
+	for (const sample of samples) {
+		const group = lines.find((entry) => Math.abs(entry.top - sample.top) <= 2);
+		if (group) group.positions.push(sample.pos);
+		else lines.push({ top: sample.top, positions: [sample.pos] });
+	}
+	lines.sort((a, b) => a.top - b.top);
+	const chosen = lines[Math.max(0, Math.min(line, lines.length - 1))];
+	if (!chosen) throw new Error("Composer has no visual caret line");
+	const pos = chosen.positions[Math.floor(chosen.positions.length / 2)] ?? chosen.positions[0];
+	editor.commands.setTextSelection(pos);
+	editor.commands.focus();
+	return { ...caretProbe(), lineCount: lines.length };
+}
+
+export function nativeSelection(from: number, to = from) {
+	const editor = textboxEditor();
+	editor.commands.setTextSelection({ from, to });
+	editor.commands.focus();
 }
 
 export function publishFileSelection(dirty = false) {
