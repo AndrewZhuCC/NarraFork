@@ -2312,10 +2312,12 @@ function NarratorPanelBody({
 			domIds,
 			targetIds,
 			highlightId,
+			needle,
 		}: {
 			domIds: string[];
 			targetIds: string[];
 			highlightId?: string;
+			needle?: string;
 		}): Promise<boolean> => {
 			// The virtual list owns the whole jump (reveal, flash, and paging upward into
 			// not-yet-loaded history). Short-circuiting on a mounted DOM node here would
@@ -2324,7 +2326,7 @@ function NarratorPanelBody({
 			// `highlightedId` state.
 			const handle = chunkListRef.current;
 			if (!handle) return false;
-			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId });
+			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId, needle });
 		},
 		[],
 	);
@@ -2334,13 +2336,14 @@ function NarratorPanelBody({
 	const registerScrollToMessage = dock?.registerScrollToMessage;
 	useEffect(() => {
 		if (!registerScrollToMessage) return;
-		return registerScrollToMessage((messageId: string) => {
+		return registerScrollToMessage((messageId, options) => {
 			// The dock callback is synchronous; the list reports an unreachable target to the
 			// user itself, so there is nothing for the search panel to do with the result.
 			void scrollToMessageTarget({
 				domIds: [`msg-${messageId}`],
 				targetIds: [messageId],
 				highlightId: messageId,
+				needle: options?.needle,
 			});
 		});
 	}, [registerScrollToMessage, scrollToMessageTarget]);
@@ -3809,11 +3812,12 @@ function NarratorPanelBody({
 								// forward anything to the narrator. Forwarding goes through the SAME
 								// `forwardTextToNarrator` the dock bridge registers, so the mobile
 								// path preserves the in-progress draft and staged attachments too.
-								onJumpToMessage={(messageId) => {
+								onJumpToMessage={(messageId, options) => {
 									void scrollToMessageTarget({
 										domIds: [`msg-${messageId}`],
 										targetIds: [messageId],
 										highlightId: messageId,
+										needle: options?.needle,
 									});
 								}}
 								onForwardToNarrator={forwardTextToNarrator}

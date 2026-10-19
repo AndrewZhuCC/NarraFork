@@ -958,6 +958,9 @@ export const ExactRow = memo(
 				// to this node (see vlist-fold-motion). `id` cannot serve: it is the
 				// MESSAGE id, which several rows of one message share. Height-neutral.
 				data-nf-row-key={item.spec.key}
+				// Lets a message jump rank this message's rows (prose over thinking / tool
+				// cards that share its id). Height-neutral (a data attribute).
+				data-nf-row-kind={kind}
 				{...(kind === "markdown" ? { [QUOTE_ROLE_ATTR]: "assistant" } : {})}
 				style={{
 					position: "absolute",

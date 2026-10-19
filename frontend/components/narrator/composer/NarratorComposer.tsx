@@ -47,7 +47,11 @@ import {
 } from "./composer-document-adapter";
 import { getComposerFileOrder } from "./composer-file-order";
 import { composerOptimizeTarget } from "./composer-optimize-target";
-import { joinQuotedComposerInput, MAX_COMPOSER_QUOTES } from "./composer-quotes";
+import {
+	type ComposerQuote,
+	joinQuotedComposerInput,
+	MAX_COMPOSER_QUOTES,
+} from "./composer-quotes";
 import { getComposerAssetId } from "./draft-image-attachments";
 import { FileReferencePopover } from "./FileReferencePopover";
 import { useFileReferenceScope } from "./FileReferenceScope";
@@ -75,6 +79,7 @@ import {
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
+import { QuoteDetailModal } from "./QuoteDetailModal";
 import { revealComposerQuote, revealQuotedFile } from "./quote-jump";
 import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
 import { type QuoteCandidate, useQuoteCandidate } from "./use-quote-candidate";
@@ -266,7 +271,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// Fullscreen modal state
 		const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] =
 			useDisclosure(false);
-		const fullscreenTrap = useFocusTrap(fullscreenOpened && !activeAttachmentPreview);
+		// Quote chip click opens its full text; the jump is a button inside it.
+		const [quoteDetail, setQuoteDetail] = useState<ComposerQuote | null>(null);
+		const fullscreenTrap = useFocusTrap(
+			fullscreenOpened && !activeAttachmentPreview && !quoteDetail,
+		);
 		// 全屏是原地 position: fixed(见 NarratorComposer.module.css 的 .fullscreen),
 		// 必须把焦点陷阱以外的 ref 也挂到同一个 Box 上,供祖先层叠逃逸使用。
 		const fullscreenBoxRef = useRef<HTMLDivElement>(null);
@@ -1661,6 +1670,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				aria-modal={fullscreenOpened || undefined}
 				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}
 			>
+				<QuoteDetailModal
+					quote={quoteDetail}
+					onClose={() => setQuoteDetail(null)}
+					onJump={(quote) => revealComposerQuote(dock, quote, editorElement)}
+				/>
 				{activeAttachmentPreview && (
 					<ComposerTextAttachmentPreview
 						key={`${attachmentPreviewScope}:${activeAttachmentPreview.asset.id}`}
@@ -1795,7 +1809,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					}}
 					onKeyDown={handleKeyDown}
 					onPasteFiles={onPasteImages}
-					onOpenQuote={(quote) => revealComposerQuote(dock, quote, editorElement)}
+					onOpenQuote={setQuoteDetail}
 					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
 					onOpenAttachment={(asset) => {
 						if (asset.kind !== "textFile") return;

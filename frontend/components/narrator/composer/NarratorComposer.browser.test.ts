@@ -2031,3 +2031,50 @@ for (const input of ["mouse", "touch"] as const)
 			await close(page);
 		}
 	});
+test("a quote chip click opens its full text; the jump is an explicit button", async () => {
+	const page = await open();
+	const text = "Intro **bold** line\n\n```ts\nconst answer = 42;\n```";
+	try {
+		await loadDocument(page, {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "Ask " },
+						{
+							type: "quote",
+							id: "q-detail",
+							label: "Intro bold line",
+							text,
+							anchor: "m:message-source",
+						},
+					],
+				},
+			],
+		});
+		await page.click('[data-composer-atom="quote"] > button');
+		await page.waitForSelector("[data-quote-detail-body]", { visible: true });
+		const body = await page.$eval("[data-quote-detail-body]", (node) => ({
+			text: node.textContent ?? "",
+			bold: node.querySelector("strong")?.textContent,
+			code: !!node.querySelector("pre, code"),
+		}));
+		expect(body.text).toContain("const answer = 42;");
+		expect(body.bold).toBe("bold");
+		expect(body.code).toBe(true);
+		// Opening the detail neither jumped away nor touched the draft.
+		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);
+		expect(
+			await page.$eval(
+				"[data-quote-detail-jump]",
+				(button) => (button as HTMLButtonElement).disabled,
+			),
+		).toBe(false);
+		await page.click("[data-quote-detail-jump]");
+		await page.waitForSelector("[data-quote-detail-body]", { hidden: true });
+		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);
+	} finally {
+		await close(page);
+	}
+});
