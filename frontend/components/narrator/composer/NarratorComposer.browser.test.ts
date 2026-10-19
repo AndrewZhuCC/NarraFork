@@ -1090,14 +1090,18 @@ async function layoutSnapshot(page: Page) {
 		const root = document.querySelector<HTMLElement>("[data-inline-composer]");
 		const textbox = root?.querySelector<HTMLElement>('[role="textbox"]');
 		if (!root || !textbox) throw new Error("Missing input");
+		const frame = root.getBoundingClientRect();
+		const controls = root.querySelector("[data-composer-controls]")?.getBoundingClientRect();
 		return {
 			mode: root.dataset.layout,
-			height: root.getBoundingClientRect().height,
+			height: frame.height,
 			target: Number.parseFloat(root.style.height),
 			width: root.clientWidth,
 			scrollWidth: root.scrollWidth,
 			contentHeight:
 				root.querySelector("[data-composer-scroll]")?.getBoundingClientRect().height ?? 0,
+			controlGapAbove: controls ? controls.top - frame.top : Number.NaN,
+			controlGapBelow: controls ? frame.bottom - controls.bottom : Number.NaN,
 			placeholder: getComputedStyle(textbox, "::before").content,
 			focused: root.ownerDocument.activeElement === textbox,
 		};
@@ -1121,6 +1125,8 @@ test("empty, short text and regular chips use a compact single line; long conten
 		const empty = await layoutSnapshot(page);
 		expect(empty.mode).toBe("compact");
 		expect(empty.height).toBeLessThanOrEqual(54);
+		// Single-line controls keep symmetric vertical gaps (8px above and below).
+		expect(Math.abs(empty.controlGapAbove - empty.controlGapBelow)).toBeLessThanOrEqual(1);
 		for (const doc of [
 			shortLayoutDocument,
 			{
