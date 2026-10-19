@@ -3,39 +3,37 @@ import { awaitTool, listRunningAwaits } from "@server/lib/agent/tools/await";
 import { sendTool } from "@server/lib/agent/tools/send";
 import type { AgentConfig, ToolContext } from "@server/lib/agent/types";
 import {
+	compileDelegationPolicy,
+	type DelegationTemplateInput,
 	isRuntimeToolAllowed,
-	type RuntimePolicyInput,
 	resolveRuntimePolicy,
 	runtimeAwaitTargets,
 	runtimeInteractionHint,
 } from "../agent-runtime/policy";
 import {
-	assertSubagentCanAwaitAgent,
-	assertSubagentSendIsAsync,
+	assertRuntimeCanAwaitAgent,
+	assertRuntimeCanSendAwait,
 	SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR,
 	SUBAGENT_SEND_ASYNC_ONLY_ERROR,
 } from "../subagent-communication-policy";
 import { resolveToolFilter, runtimeToolFilter } from "../subagent-tools";
 
-const profiles: RuntimePolicyInput[] = [
-	{ variant: "primary" },
-	...["general", "explore", "plan", "review", "search", "missing-custom"].map((subagentType) => ({
-		variant: "subagent" as const,
-		subagentType,
-	})),
+/** null = an ordinary narrator that declares no ceiling. */
+type Profile = DelegationTemplateInput | null;
+const policyOf = (input: Profile) =>
+	resolveRuntimePolicy(input ? [compileDelegationPolicy(input)] : []);
+const template = (name: string, customDefinition?: DelegationTemplateInput["customDefinition"]) =>
+	({ template: name, customDefinition }) satisfies DelegationTemplateInput;
+
+const profiles: Profile[] = [
+	null,
+	...["general", "explore", "plan", "review", "search", "missing-custom"].map((name) =>
+		template(name),
+	),
+	template("custom", { toolAccess: "readOnly", customTools: [] }),
+	template("custom", { toolAccess: "general", customTools: [] }),
 	{
-		variant: "subagent",
-		subagentType: "custom",
-		customDefinition: { toolAccess: "readOnly", customTools: [] },
-	},
-	{
-		variant: "subagent",
-		subagentType: "custom",
-		customDefinition: { toolAccess: "general", customTools: [] },
-	},
-	{
-		variant: "subagent",
-		subagentType: "custom",
+		template: "custom",
 		customDefinition: {
 			toolAccess: "custom",
 			customTools: [
@@ -56,11 +54,12 @@ const profiles: RuntimePolicyInput[] = [
 
 describe("shared capability projections", () => {
 	for (const [index, input] of profiles.entries()) {
-		test(`${index}: ${input.variant}/${input.subagentType ?? "default"}: tools, schemas, hints and service guards agree`, () => {
-			const policy = resolveRuntimePolicy(input);
-			const child = input.variant === "subagent";
-			const config = { parentNarratorId: child ? "parent" : undefined } as AgentConfig;
-			const custom = input.customDefinition
+		test(`${index}: ${input?.template ?? "undeclared"}: tools, schemas, hints and service guards agree`, () => {
+			const policy = policyOf(input);
+			const child = input !== null;
+			// Schemas read the attached ceiling only; a parent id must not change them.
+			const config = { parentNarratorId: "parent", runtimePolicy: policy } as AgentConfig;
+			const custom = input?.customDefinition
 				? {
 						...input.customDefinition,
 						customTools: [...input.customDefinition.customTools],
@@ -71,9 +70,7 @@ describe("shared capability projections", () => {
 						location: "test",
 					}
 				: undefined;
-			const filter = child
-				? resolveToolFilter(input.subagentType ?? "general", custom)
-				: runtimeToolFilter(policy);
+			const filter = input ? resolveToolFilter(input.template, custom) : runtimeToolFilter(policy);
 			expect(filter?.(sendTool)).toBe(true);
 			expect(filter?.(awaitTool)).toBe(true);
 			for (const name of [
@@ -98,8 +95,8 @@ describe("shared capability projections", () => {
 			expect(Boolean(sendProperties.await)).toBe(policy.capabilities.sendAwait);
 			expect(awaitProperties.type.enum).toEqual(runtimeAwaitTargets(policy));
 			expect(awaitProperties.type.enum).toContain("question");
-			const sendGuard = () => assertSubagentSendIsAsync(child, true);
-			const awaitGuard = () => assertSubagentCanAwaitAgent(child);
+			const sendGuard = () => assertRuntimeCanSendAwait(policy, true);
+			const awaitGuard = () => assertRuntimeCanAwaitAgent(policy);
 			if (child) {
 				expect(sendGuard).toThrow(SUBAGENT_SEND_ASYNC_ONLY_ERROR);
 				expect(awaitGuard).toThrow(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
@@ -129,21 +126,25 @@ describe("shared capability projections", () => {
 			"review",
 			"search",
 		]) {
-			const policy = resolveRuntimePolicy({ variant: "subagent", subagentType });
+			const policy = policyOf(template(subagentType));
 			expect(isRuntimeToolAllowed(policy, "Stop")).toBe(
 				subagentType !== "review" && subagentType !== "search",
 			);
 		}
-		expect(isRuntimeToolAllowed(resolveRuntimePolicy({ variant: "primary" }), "Stop")).toBe(true);
+		expect(isRuntimeToolAllowed(policyOf(null), "Stop")).toBe(true);
 	});
 
 	test("inherited readOnly narrows custom MCP and file access without widening its allowlist", () => {
-		const policy = resolveRuntimePolicy({
-			variant: "subagent",
-			subagentType: "custom",
-			readOnly: true,
-			customDefinition: { toolAccess: "custom", customTools: ["Read", "Write", "mcp__test__read"] },
-		});
+		// The read-only ceiling may come from any layer (here: a policy source).
+		const policy = resolveRuntimePolicy([
+			compileDelegationPolicy(
+				template("custom", {
+					toolAccess: "custom",
+					customTools: ["Read", "Write", "mcp__test__read"],
+				}),
+			),
+			{ version: 1, readOnly: true },
+		]);
 		expect(policy.tools.readOnly).toBe(true);
 		expect(isRuntimeToolAllowed(policy, "Read")).toBe(true);
 		expect(isRuntimeToolAllowed(policy, "Write")).toBe(false);
@@ -157,12 +158,12 @@ describe("shared capability projections", () => {
 
 	test("missing custom definition and built-in readOnly cannot be upgraded by a custom override", () => {
 		for (const subagentType of ["missing", "explore", "plan", "review"]) {
-			const policy = resolveRuntimePolicy({
-				variant: "subagent",
-				subagentType,
-				customDefinition:
+			const policy = policyOf(
+				template(
+					subagentType,
 					subagentType === "missing" ? null : { toolAccess: "general", customTools: [] },
-			});
+				),
+			);
 			expect(policy.tools.readOnly).toBe(true);
 			expect(isRuntimeToolAllowed(policy, "Write")).toBe(false);
 			expect(isRuntimeToolAllowed(policy, "mcp__test__write", "readWrite")).toBe(false);
@@ -172,10 +173,7 @@ describe("shared capability projections", () => {
 
 	test("policy snapshots custom tool names rather than sharing mutable configuration", () => {
 		const customTools = ["Read"];
-		const policy = resolveRuntimePolicy({
-			variant: "subagent",
-			customDefinition: { toolAccess: "custom", customTools },
-		});
+		const policy = policyOf(template("custom", { toolAccess: "custom", customTools }));
 		customTools.push("Write");
 		expect(isRuntimeToolAllowed(policy, "Write")).toBe(false);
 		expect(Object.isFrozen(policy.capabilities)).toBe(true);
@@ -185,8 +183,8 @@ describe("shared capability projections", () => {
 	test("direct tool execution rejects legacy synchronous child inputs before service work or wait registration", async () => {
 		const ctx = {
 			narratorId: "child",
-			parentNarratorId: "parent",
 			currentToolUseId: "policy-denied",
+			runtimePolicy: policyOf(template("general")),
 			signal: new AbortController().signal,
 		} as ToolContext;
 		expect(

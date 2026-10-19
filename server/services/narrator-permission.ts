@@ -83,7 +83,7 @@ import {
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import { isPlanModeTrait } from "../lib/narrator-utils";
 import {
 	type DeviceAccessPolicy,
 	intersectOAuthClientPolicies,
@@ -99,9 +99,13 @@ import {
 } from "../lib/plan-file-path";
 import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
+import { isTeamMember, type RuntimeSourceRow, teamRootOf } from "../lib/runtime-source";
 import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { RuntimePolicy } from "./agent-runtime/policy";
+import { isRuntimeToolNameAllowed } from "./subagent-tools";
+import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 export {
 	normalizeDangerReflectionLevel,
@@ -144,7 +148,6 @@ import { isTrustedReviewBoundary } from "./narrator-review-boundary";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
-	activeSubagentSettings,
 	isNarratorRuntimeBusy,
 	type PendingDangerReflection,
 	type PendingExecutionTarget,
@@ -2893,10 +2896,8 @@ export function shouldTriggerDangerReflection(
 	return dangerSeverityRank(danger.severity) >= dangerReflectionThreshold(level);
 }
 
-type PermissionScopeNarrator = {
+type PermissionScopeNarrator = RuntimeSourceRow & {
 	id?: string | null;
-	variant?: string | null;
-	parentNarratorId?: string | null;
 	permissionMode?: string | null;
 	relaxedPlan?: boolean | null;
 	previousPermissionMode?: string | null;
@@ -2975,10 +2976,8 @@ async function resolveSendTargetsForPermission(
 ): Promise<PermissionScopeNarrator[]> {
 	const selectors = sendSelectors(input);
 	if (selectors.length === 0) return [];
-	const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
-	const teamParentId = callerIsSubagent ? caller.parentNarratorId : callerId;
-	if (typeof teamParentId !== "string" || teamParentId.length === 0) return [];
-	const parentId: string = teamParentId;
+	const parentId = teamRootOf({ ...caller, id: callerId });
+	const callerIsSubagent = parentId !== callerId;
 
 	const resolved: PermissionScopeNarrator[] = [];
 	const seen = new Set<string>();
@@ -2994,7 +2993,7 @@ async function resolveSendTargetsForPermission(
 		// launching narrator by teamParentId so mixed target lists still work.
 		if (addressesParent) {
 			const parent = await narratorService.getById(parentId).catch(() => null);
-			if (!parent?.id || parent.id !== parentId || isSubagentVariant(parent.variant ?? "")) {
+			if (!parent?.id || parent.id !== parentId || teamRootOf(parent) !== parent.id) {
 				return [];
 			}
 			if (!seen.has(parent.id)) {
@@ -3005,12 +3004,7 @@ async function resolveSendTargetsForPermission(
 		}
 		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
 		if (direct) {
-			if (
-				!direct.id ||
-				!isSubagentVariant(direct.variant ?? "") ||
-				direct.parentNarratorId !== parentId ||
-				(callerIsSubagent && direct.id === callerId)
-			) {
+			if (!direct.id || !isTeamMember(direct, parentId) || direct.id === callerId) {
 				return [];
 			}
 			if (!seen.has(direct.id)) {
@@ -3020,20 +3014,14 @@ async function resolveSendTargetsForPermission(
 			continue;
 		}
 
-		const siblings = await narratorService.listSubagentsByParent(parentId);
+		const siblings = await narratorService.listTeamMembers(parentId);
 		const candidates = siblings.filter((s) => {
 			if (callerIsSubagent && s.id === callerId) return false;
 			return subagentMatchesSelector(s, selector);
 		});
 		if (candidates.length !== 1) return [];
 		const target = await narratorService.getById(candidates[0].id).catch(() => null);
-		if (
-			!target?.id ||
-			!isSubagentVariant(target.variant ?? "") ||
-			target.parentNarratorId !== parentId
-		) {
-			return [];
-		}
+		if (!target?.id || !isTeamMember(target, parentId)) return [];
 		if (!seen.has(target.id)) {
 			seen.add(target.id);
 			resolved.push(target);
@@ -3057,8 +3045,9 @@ export async function shouldAutoAllowSendWithinScope(
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
-		const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
-		const teamParentId = callerIsSubagent ? caller.parentNarratorId : null;
+		const root = teamRootOf({ ...caller, id: narratorId });
+		const callerIsSubagent = root !== narratorId;
+		const teamParentId = callerIsSubagent ? root : null;
 		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
 		const selectors = sendSelectors(input);
 		const onlyAddressesParent =
@@ -4042,7 +4031,14 @@ export interface FinalToolPermissionCheck {
 	cwd?: string;
 	signal?: AbortSignal;
 	runtimeConstraint?: RuntimePermissionConstraint;
-	reviewReadOnlyBash?: boolean;
+	/**
+	 * Current capability ceiling for this actor. Resolved here when omitted — never the
+	 * pass snapshot — so an approval or tool history recorded under a wider ceiling
+	 * cannot start a tool the narrator may no longer use.
+	 */
+	runtimePolicy?: RuntimePolicy;
+	/** Execution principal of the run; ceilings are resolved for it. */
+	actingUserId?: string | null;
 }
 export interface FinalToolPermissionFence {
 	assertStillCurrent(): void;
@@ -4365,6 +4361,8 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 			chapterId: narrators.chapterId,
 			contextProjectId: narrators.contextProjectId,
 			parentNarratorId: narrators.parentNarratorId,
+			type: narrators.type,
+			runtimeRegistrationJson: narrators.runtimeRegistrationJson,
 			cwd: narrators.cwd,
 			workspaceRevision: narrators.workspaceRevision,
 			defaultDeviceId: narrators.defaultDeviceId,
@@ -4558,9 +4556,15 @@ export async function recheckFinalToolExecutionPermission(
 	}
 	// Stop controls a persisted task, not the narrator's current filesystem/backend.
 	// Keep this out of path policy compilation and remote canonicalization entirely.
+	// The ceiling bounds every start, including approvals granted before it narrowed.
+	const runtimePolicy =
+		check.runtimePolicy ??
+		(await resolveNarratorRuntimePolicy(check.narratorId, check.actingUserId ?? null));
+	if (!isRuntimeToolNameAllowed(runtimePolicy, check.toolName))
+		finalPermissionDeny("tool is outside the current runtime capability ceiling");
+	const readOnlyGitShell = runtimePolicy.readOnlyGitShell;
 	if (check.toolName === "Stop") {
-		if (check.reviewReadOnlyBash || before.narrator.variant === "subagent:review")
-			finalPermissionDeny("Review mode cannot control running tasks.");
+		if (readOnlyGitShell) finalPermissionDeny("Review mode cannot control running tasks.");
 		const { authorizeStopTask } = await import("./stop-task-policy");
 		const targetFence = check.runtimeConstraint
 			? await authorizeStopTask(check.narratorId, check.input, check.runtimeConstraint)
@@ -4688,13 +4692,21 @@ export async function recheckFinalToolExecutionPermission(
 			: constraint && (check.toolName === "KnowledgeCreate" || check.toolName === "KnowledgeEdit")
 				? "bypassPermissions"
 				: (constraint?.permissionMode ?? before.narrator.permissionMode ?? "default");
-	const review = check.reviewReadOnlyBash || before.narrator.variant === "subagent:review";
 	if (
-		review &&
+		(readOnlyGitShell || runtimePolicy.tools.readOnly) &&
 		!isTaskStateMaintenanceTool(check.toolName, check.input) &&
-		(WRITE_TOOLS.has(decisionTool) || check.toolName === "RequestPermissionRule")
+		((WRITE_TOOLS.has(decisionTool) && !isReadOnlyCall(decisionTool, decisionInput)) ||
+			check.toolName === "RequestPermissionRule" ||
+			(isBashToolName(check.toolName) &&
+				(!analysis ||
+					analysis.hasWriteOperation ||
+					analysis.nonWhitelisted.length > 0 ||
+					analysis.dangerousPatterns.length > 0 ||
+					analysis.hasEnvInjection)) ||
+			(["GenUI", "Notification", "ScheduledTask", "Worktree"].includes(check.toolName) &&
+				!isReadOnlyCall(check.toolName, check.input)))
 	)
-		finalPermissionDeny("review capability ceiling");
+		finalPermissionDeny("read-only capability ceiling");
 	const sendInScope =
 		check.toolName === "Send" &&
 		(await shouldAutoAllowSendWithinScope(check.narratorId, before.narrator, check.input));
@@ -4702,7 +4714,12 @@ export async function recheckFinalToolExecutionPermission(
 	if (check.toolName === "RequestPermissionRule") {
 		if (!context) finalPermissionDeny("missing dedicated rule request execution context");
 		await validatePermissionRuleRequestApproval(
-			{ narratorId: check.narratorId, toolUseId: check.toolUseId, binding: check.binding },
+			{
+				narratorId: check.narratorId,
+				toolUseId: check.toolUseId,
+				binding: check.binding,
+				actingUserId: check.actingUserId,
+			},
 			check.input,
 			context,
 		);
@@ -4729,7 +4746,7 @@ export async function recheckFinalToolExecutionPermission(
 						: resolveEffectiveRelaxedPlan(mode, before.narrator.relaxedPlan),
 					planFileId: before.narrator.planFileId ?? undefined,
 					planFilePath: activeNarrators.get(check.narratorId)?._planFilePath,
-					reviewReadOnlyBash: review,
+					reviewReadOnlyBash: readOnlyGitShell,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
 				});
@@ -4896,7 +4913,9 @@ export async function handlePermission(
 			planFileId: true,
 			dangerReflectionOverride: true,
 			variant: true,
+			type: true,
 			parentNarratorId: true,
+			runtimeRegistrationJson: true,
 			traits: true,
 		},
 	});
@@ -4945,7 +4964,7 @@ export async function handlePermission(
 	const isBashControlOp =
 		isBashToolName(toolName) && !input.command && (input.await != null || input.stop != null);
 	const isStopControlOp = toolName === "Stop";
-	if (isStopControlOp && (reviewReadOnlyBash || narrator?.variant === "subagent:review")) {
+	if (isStopControlOp && reviewReadOnlyBash) {
 		return { behavior: "deny", message: "Review mode cannot control running tasks." };
 	}
 	if (isStopControlOp && runtimeConstraint) {
@@ -5962,7 +5981,12 @@ async function handlePermissionRuleRequest(args: {
 	try {
 		signal.throwIfAborted();
 		prepared = await preparePermissionRuleRequest(
-			{ narratorId, toolUseId, binding },
+			{
+				narratorId,
+				toolUseId,
+				binding,
+				actingUserId: activeNarrators.get(narratorId)?._currentUserId ?? null,
+			},
 			args.input,
 			context,
 		);
@@ -6215,134 +6239,6 @@ export interface ResolvePermissionOpts {
 
 type DangerReflectionDecidedBy = "reflection" | "user" | "auto" | `narrator:${string}`;
 
-/**
- * How approval feedback text reaches a SUBAGENT.
- *
- * ## Why subagents need their own path at all
- *
- * The primary-narrator path stashes the text in `pendingFeedback` (keyed by
- * narratorId) and arms `_feedbackSoftStop` on the `activeNarrators` entry; the
- * `[continuation-source: permission-feedback]` branch of `runAgentLoop` then
- * persists it as a real `role: "user"` turn and restarts the pass with it.
- *
- * A subagent has NO `activeNarrators` entry — a running subagent registers only in
- * `activeSubagentSettings` — so BOTH halves of that mechanism silently no-op for
- * one. The user could type feedback into the InlinePermission form rendered inside
- * the parent's SubagentCard, approve, and have the text vanish without a trace,
- * which is worse than offering no input box at all.
- *
- * ## Why a message and not a note on the tool result
- *
- * The subagent's equivalent of "stash payload + arm soft stop" is the buffered
- * message queue: `bufferSubagentUserMessage` enqueues the text AND requests the
- * next safe post-tool boundary (`shouldStopSubagentForBufferedMessage` is exactly
- * what the subagent loop passes as its `shouldStop`). The queue is drained by
- * `getAfterToolsInjections` (in-pass) or `consumeNextBufferedSubagentMessage`
- * (pass restart), and both persist it through `persistSubagentUserMessage`. So the
- * result is the same shape the primary path produces: a `role: "user"` turn.
- *
- * That is what the content IS. The user typed a turn ("go ahead, but watch out for
- * X"); routing it through `deliverInjection` instead would file it as a `sys`
- * injection row — lower weight for the model, attributed to the system rather than
- * to the person who wrote it, and rendered as a system card instead of their
- * message. Attaching it to the tool result would be worse still: it would arrive
- * as commentary on one call rather than as an instruction for what to do next.
- *
- * ## Why a seam and not a lazy import at the call site
- *
- * `mock.module` is process-wide in Bun: replacing `subagent-executor` for one test
- * file hands the replacement to every later file in the run, and that module holds
- * lazily-initialized queues other suites read. A seam the test installs and
- * restores keeps the blast radius inside the test.
- */
-export interface SubagentFeedbackDelivery {
-	/** Whether a subagent loop is currently running under this narrator id. */
-	isSubagentRunning: (narratorId: string) => boolean;
-	/**
-	 * Queue the text as the subagent's next user turn and request a safe stop.
-	 * Returns false when the queue refused it (full, or no running subagent).
-	 */
-	deliver: (
-		narratorId: string,
-		text: string,
-		options: { createdBy: string | null },
-	) => boolean | Promise<boolean>;
-}
-
-/** Lazily bound to the real subagent modules; replaced only by tests. */
-let subagentFeedbackDelivery: SubagentFeedbackDelivery | null = null;
-
-/**
- * Install a subagent feedback delivery implementation, returning the previous one
- * so a test can restore it. Pass `null` to fall back to the real subagent modules.
- */
-export function setSubagentFeedbackDelivery(
-	next: SubagentFeedbackDelivery | null,
-): SubagentFeedbackDelivery | null {
-	const previous = subagentFeedbackDelivery;
-	subagentFeedbackDelivery = next;
-	return previous;
-}
-
-/**
- * Whether this permission's feedback must take the subagent path.
- *
- * Kept synchronous so the primary-narrator branch stays exactly what it was: an
- * in-line `pendingFeedback.set` before `pending.resolve`, with no await inserted
- * between the two. `activeSubagentSettings` is registered for the whole span of a
- * subagent run, so this needs no database read on the decision path.
- */
-function isSubagentFeedbackRecipient(narratorId: string): boolean {
-	if (subagentFeedbackDelivery) return subagentFeedbackDelivery.isSubagentRunning(narratorId);
-	return activeSubagentSettings.has(narratorId);
-}
-
-/**
- * Queue approval feedback text as the subagent's next user turn.
- *
- * Failure is logged, not thrown: the permission has already been decided and the
- * approved tool is about to run, so raising here would fail a call the user allowed.
- */
-async function deliverSubagentPermissionFeedback(
-	narratorId: string,
-	text: string,
-	userId: string | null,
-): Promise<void> {
-	try {
-		let delivery = subagentFeedbackDelivery;
-		if (!delivery) {
-			const [{ bufferSubagentUserMessage }, { isTakenOver }] = await Promise.all([
-				import("./subagent-executor"),
-				import("./subagent-takeover"),
-			]);
-			delivery = {
-				isSubagentRunning: (id) => activeSubagentSettings.has(id),
-				deliver: async (id, message, options) =>
-					(
-						await bufferSubagentUserMessage(id, message, {
-							createdBy: options.createdBy,
-							// A taken-over subagent is driven by the user directly, so cutting
-							// short the turn they are steering would be wrong; the resume path
-							// drains the queue instead. Same rule every other subagent send obeys.
-							requestSoftStop: !isTakenOver(id),
-						})
-					).ok,
-			};
-		}
-		if (!(await delivery.deliver(narratorId, text, { createdBy: userId }))) {
-			logger.warn("Subagent permission feedback could not be queued", {
-				narratorId,
-				chars: text.length,
-			});
-		}
-	} catch (err) {
-		logger.error("Failed to deliver subagent permission feedback", {
-			narratorId,
-			error: String(err),
-		});
-	}
-}
-
 async function enableRelaxedPlanAfterPlanSoftDeny(
 	narratorId: string,
 	broadcastTargetId: string,
@@ -6557,12 +6453,9 @@ export async function resolvePermission(
 		// Carry the approver so the injected turn shows their avatar rather than an
 		// anonymous "you".
 		const feedbackUserId = decidedBy === "user" ? (userId ?? null) : null;
-		// A subagent has no `activeNarrators` entry, so `pendingFeedback` +
-		// `_feedbackSoftStop` would both be written into the void for one. Its
-		// equivalent is the buffered-message queue — see `SubagentFeedbackDelivery`.
-		const subagentFeedback =
-			approvalFeedback && isSubagentFeedbackRecipient(pending.narratorId) ? approvalFeedback : null;
-		if (approvalFeedback && !subagentFeedback) {
+		// One path for every session: the run adopts the text at its next safe boundary
+		// as the approver's own turn (`[continuation-source: permission-feedback]`).
+		if (approvalFeedback) {
 			pendingFeedback.set(pending.narratorId, {
 				toolUseId: pending.toolUseId,
 				feedbackText: approvalFeedback,
@@ -6598,16 +6491,13 @@ export async function resolvePermission(
 
 		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
 
-		// The ExitPlanMode exclusion is a PRIMARY-narrator rule and stays scoped to the
-		// primary branch: approving a plan already restarts the loop through
-		// `_planApprovedContinue`, which merges `pendingFeedback` into its own prompt, so
-		// arming a second stop would cut that restart short. Subagents have no plan mode
-		// at all (`subagent-tools.ts` admits neither EnterPlanMode nor ExitPlanMode, and
-		// `isPlanModeTrait` is never true for a subagent row), so the exclusion is
-		// vacuous on their path and is deliberately not carried over.
-		if (subagentFeedback) {
-			await deliverSubagentPermissionFeedback(pending.narratorId, subagentFeedback, feedbackUserId);
-		} else if (approvalFeedback && pending.toolName !== "ExitPlanMode") {
+		// Approving a plan already restarts the loop through `_planApprovedContinue`,
+		// which merges `pendingFeedback` into its own prompt, so arming a second stop
+		// would cut that restart short.
+		//
+		// A held run (the user drives it) is stopped at the same boundary: the feedback
+		// is the user's own next turn, exactly as for a session they drive directly.
+		if (approvalFeedback && pending.toolName !== "ExitPlanMode") {
 			const active = activeNarrators.get(pending.narratorId);
 			if (active?.alive) {
 				active._feedbackSoftStop = true;

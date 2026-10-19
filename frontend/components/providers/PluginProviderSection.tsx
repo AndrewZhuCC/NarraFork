@@ -55,6 +55,7 @@ import { localizePluginError } from "../plugins-admin/errors";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
+import type { CustomApiProtocol } from "./types";
 
 /** Initial height of an embedded plugin view, before the plugin reports its content size. */
 const SURFACE_HEIGHT = 560;
@@ -82,6 +83,9 @@ export interface PluginProviderModelControls {
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelValue: string) => void;
 	onBatchToggleHidden?: (modelValues: string[], hidden: boolean) => void;
+	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
+	modelProtocols: Record<string, CustomApiProtocol>;
+	onModelProtocolChange: (modelValue: string, protocol: CustomApiProtocol | null) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelValue: string, size: number | null) => void;
 	customModels: CustomModelEntry[];
@@ -442,6 +446,8 @@ function PluginProviderModels({
 					hiddenModels={controls.hiddenModels}
 					onToggleHidden={controls.onToggleHidden}
 					onBatchToggleHidden={controls.onBatchToggleHidden}
+					modelProtocols={controls.modelProtocols}
+					onModelProtocolChange={controls.onModelProtocolChange}
 					modelContextWindows={controls.modelContextWindows}
 					defaultContextWindows={defaultContextWindows}
 					onContextWindowChange={controls.onContextWindowChange}

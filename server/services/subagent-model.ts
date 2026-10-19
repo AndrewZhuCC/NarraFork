@@ -7,19 +7,29 @@ import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import {
+	type EffectiveSubagentModelPolicy,
 	resolveEffectiveSubagentModelPolicy,
 	resolveSubagentModelSelectionFromPolicy,
 	type SubagentModelSelection,
 } from "../lib/narrator-custom-traits";
+import {
+	modelPoolKeyOf,
+	policySourceIdOf,
+	RUNTIME_SOURCE_COLUMNS,
+	type RuntimeSourceRow,
+} from "../lib/runtime-source";
 import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
 
-interface SubagentModelRef {
+/**
+ * The model fields of a narrator plus its explicit source registration. Nothing here
+ * reads a parent link or creation template: following is relative to the registered
+ * policy source, within the pool chosen at creation (see `lib/runtime-source.ts`).
+ */
+export type SourceModelRef = RuntimeSourceRow & {
 	id?: string;
 	model?: string | null;
-	parentNarratorId?: string | null;
-	subagentType?: string | null;
-}
+};
 
 export interface SubagentRunModel {
 	/** Parent reference has been unwrapped and checked against the allowed pool. */
@@ -37,11 +47,11 @@ export interface SubagentRunModel {
 	inheritance?: SubagentModelInheritance;
 }
 
-/** Configured default model for a builtin subagent type, if any. */
+/** Configured default model for a builtin pool key, if any. */
 export function resolveSubagentTypePreference(
-	subagentType: string | null | undefined,
+	poolKey: string | null | undefined,
 ): string | undefined {
-	const type = subagentType ?? "general";
+	const type = poolKey ?? "general";
 	if (type === "explore" || type === "plan" || type === "search" || type === "review") {
 		return settings.agent.subagentModels?.[type] || undefined;
 	}
@@ -65,25 +75,28 @@ export function subagentStoredModelReference(input: {
 }
 
 /**
- * Pool policy decision for a `__parent__` row, WITHOUT resolving routing.
+ * Pool policy decision for a `__parent__` (follow-source) row, WITHOUT resolving routing.
  *
  * Kept separate from `resolveSubagentModelForRun` because `resolveEffectiveModel`
  * advances balanced aggregation round-robin; display paths must not do that.
  *
- * Order is parent → first pool entry. The global default is deliberately not a
+ * Order is source → first pool entry. The global default is deliberately not a
  * middle step: once a pool exists, a fallback must be something the pool author
- * chose, not whatever the instance default happens to be.
+ * chose, not whatever the instance default happens to be. The pool is the one
+ * registered at creation (`modelPool`); without one the source's model is used as is.
  */
 export async function resolveSubagentModelInheritance(
-	narrator: SubagentModelRef,
+	narrator: SourceModelRef,
 	actingUserId?: string | null,
 ): Promise<{ selection: SubagentModelSelection; inheritance: SubagentModelInheritance }> {
-	if (!narrator.parentNarratorId) {
-		throw new ValidationError("Follow-parent model requires a parent narrator");
+	const sourceId = policySourceIdOf(narrator);
+	if (!sourceId) {
+		throw new ValidationError("Following a model requires a registered source narrator");
 	}
-	const parent = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narrator.parentNarratorId),
+	const source = await db.query.narrators.findFirst({
+		where: eq(narrators.id, sourceId),
 		columns: {
+			...RUNTIME_SOURCE_COLUMNS,
 			model: true,
 			reasoningEffort: true,
 			traits: true,
@@ -91,23 +104,27 @@ export async function resolveSubagentModelInheritance(
 			contextProjectId: true,
 		},
 	});
-	if (!parent || parent.model === FOLLOW_PARENT_MODEL) {
-		throw new ValidationError("Cannot resolve the subagent's parent model");
+	if (!source || source.model === FOLLOW_PARENT_MODEL) {
+		throw new ValidationError("Cannot resolve the source narrator's model");
 	}
-	const parentTraits = await resolveEffectiveTraits({
-		narratorTraits: parent.traits,
-		projectId: await resolveNarratorProjectId(parent),
-		actingUserId: actingUserId ?? null,
-	});
-	const policy = resolveEffectiveSubagentModelPolicy(
-		parentTraits.traits,
-		narrator.subagentType ?? "general",
-	);
-	const parentModel = parent.model || FOLLOW_DEFAULT_MODEL;
-	// When the parent has no concrete model ID, "follow parent" would only reach the
-	// global default. A configured type preference is the right source instead.
-	const typePref = resolveSubagentTypePreference(narrator.subagentType);
-	if (!hasConcreteModelId(parent.model) && typePref) {
+	const poolKey = modelPoolKeyOf(narrator);
+	const sourceTraits = poolKey
+		? await resolveEffectiveTraits({
+				narratorTraits: source.traits,
+				projectId: await resolveNarratorProjectId(source),
+				actingUserId: actingUserId ?? null,
+				policySourceId: policySourceIdOf(source),
+			})
+		: null;
+	const policy: EffectiveSubagentModelPolicy =
+		poolKey && sourceTraits
+			? resolveEffectiveSubagentModelPolicy(sourceTraits.traits, poolKey)
+			: { source: "none", poolKey: "general", models: [], isExplicitEmpty: false };
+	const sourceModel = source.model || FOLLOW_DEFAULT_MODEL;
+	// When the source has no concrete model ID, following it would only reach the
+	// global default. A configured preference for the pool is the right source instead.
+	const typePref = poolKey ? resolveSubagentTypePreference(poolKey) : undefined;
+	if (!hasConcreteModelId(source.model) && typePref) {
 		const preferred = resolveSubagentModelSelectionFromPolicy({
 			policy,
 			explicitModel: typePref,
@@ -119,18 +136,18 @@ export async function resolveSubagentModelInheritance(
 				inheritance: {
 					source: "preference",
 					model: displayModelReference(preferred.model),
-					parentModel: displayModelReference(parentModel),
+					parentModel: displayModelReference(sourceModel),
 					...(policy.source !== "none" && { poolKey: policy.poolKey }),
-					...(parent.reasoningEffort && { parentReasoningEffort: parent.reasoningEffort }),
+					...(source.reasoningEffort && { parentReasoningEffort: source.reasoningEffort }),
 				},
 			};
 		}
 	}
-	// A type preference selected at creation is a pin. Following rows keep following
-	// their parent; they do not silently acquire a newly configured type preference.
+	// A preference selected at creation is a pin. Following rows keep following their
+	// source; they do not silently acquire a newly configured preference.
 	const followed = resolveSubagentModelSelectionFromPolicy({
 		policy,
-		explicitModel: parentModel,
+		explicitModel: sourceModel,
 		candidates: [],
 	});
 	const selection = followed ?? resolveSubagentModelSelectionFromPolicy({ policy, candidates: [] });
@@ -144,9 +161,9 @@ export async function resolveSubagentModelInheritance(
 			// Display fields only; routing uses `selection` untouched. Without a pool the
 			// selection is still `__default__`, which the label must not show raw.
 			model: displayModelReference(selection.model),
-			parentModel: displayModelReference(parentModel),
+			parentModel: displayModelReference(sourceModel),
 			...(policy.source !== "none" && { poolKey: policy.poolKey }),
-			...(parent.reasoningEffort && { parentReasoningEffort: parent.reasoningEffort }),
+			...(source.reasoningEffort && { parentReasoningEffort: source.reasoningEffort }),
 		},
 	};
 }
@@ -194,12 +211,12 @@ export function formatSubagentModelFallbackNote(inheritance?: SubagentModelInher
 }
 
 /**
- * __parent__ is narrator-scoped, not a global model alias. Never send it to a
- * provider. Legacy null rows still follow the global default, not their parent.
- * Only the new sentinel opts into live parent inheritance.
+ * `__parent__` is the stored "follow my source" value, not a global model alias. Never
+ * send it to a provider. Legacy null rows still follow the global default. Only the
+ * sentinel opts into live following of the registered source.
  */
 export async function resolveSubagentModelForRun(
-	narrator: SubagentModelRef,
+	narrator: SourceModelRef,
 	actingUserId?: string | null,
 	stickyProvider?: string,
 ): Promise<SubagentRunModel> {
@@ -223,7 +240,7 @@ export async function resolveSubagentModelForRun(
 }
 
 /**
- * Effective tier for a subagent run: pool tier > child override > parent > default.
+ * Effective tier for a run: pool tier > own override > source > default.
  * `defaultEffort` is the provider/global default, computed by the caller.
  */
 export function subagentRunReasoningEffort(

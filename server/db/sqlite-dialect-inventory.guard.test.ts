@@ -493,6 +493,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/search-query.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
 	"server/lib/project-db.ts": ["driver", "pragma"],
+	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],

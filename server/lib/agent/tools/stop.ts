@@ -36,7 +36,8 @@ export const stopTool: ToolDefinition = {
 	},
 	getRawJsonSchema(config) {
 		const schema = stopTool.rawJsonSchema as Record<string, unknown>;
-		if (!config.parentNarratorId) return schema;
+		// Stopping an agent is orchestration; a ceiling without it can only stop own Bash.
+		if (config.runtimePolicy?.capabilities.spawnAgent !== false) return schema;
 		const properties = schema.properties as Record<string, Record<string, unknown>>;
 		return {
 			...schema,
@@ -53,12 +54,6 @@ export const stopTool: ToolDefinition = {
 			return { output: `Invalid Stop parameters: ${parsed.error.message}`, isError: true };
 		}
 		const { type, id } = parsed.data;
-		if (ctx.parentNarratorId && type === "agent") {
-			return {
-				output: 'Subagents may only use Stop({ type: "bash", id }) for their own background tasks.',
-				isError: true,
-			};
-		}
 		try {
 			const task = await resolveOwnedStopTask(ctx.narratorId, parsed.data);
 			// Imports/child validation can yield after final admission. Re-read the live
@@ -91,27 +86,33 @@ export const stopTool: ToolDefinition = {
 
 			let cancelled: boolean;
 			if (type === "agent") {
-				// Never pass an arbitrary task/narrator ID to the cancellation registry.
-				const { narratorService } = await import("@server/services/narrator-service");
-				const { isSubagentVariant } = await import("@server/lib/narrator-utils");
+				// Never pass an arbitrary task/narrator ID to the cancellation registry: the
+				// target must register this narrator as its controller for "stop".
+				const { authorizeAgentControl } = await import("@server/services/narrator-control");
 				const narratorId = task.subagentNarratorId;
-				const narrator = narratorId
-					? await narratorService.getById(narratorId).catch(() => null)
-					: null;
-				if (
-					!narrator ||
-					!isSubagentVariant(narrator.variant) ||
-					narrator.parentNarratorId !== ctx.narratorId
-				) {
+				if (!narratorId)
 					return {
 						output: `Background agent task ${id} is not a direct child subagent of this narrator.`,
 						isError: true,
 					};
-				}
-				const { cancelBackgroundTask } = await import("@server/services/narrator-subagent");
+				// Hard OAuth ceiling first, then the control grant; the fence is re-asserted below.
 				const assertAuthorized = await authorizeCancellation();
+				const narrator = await authorizeAgentControl({
+					callerNarratorId: ctx.narratorId,
+					targetNarratorId: narratorId,
+					action: "stop",
+					userId: ctx.userId,
+				}).catch((error: unknown) => error as Error);
+				if (narrator instanceof Error) {
+					return { output: `Stop error: ${narrator.message}`, isError: true };
+				}
 				assertAuthorized();
-				cancelled = await cancelBackgroundTask(narrator.id);
+				// The task row is the run's cancellation handle; a run with no live task
+				// handle is cancelled through the run service directly.
+				const { controlRun } = await import("@server/services/agent-runtime/run");
+				cancelled =
+					(await backgroundTaskService.cancel(task.id, { assertAuthorized }).catch(() => false)) ||
+					(await controlRun(narrator.id, { kind: "cancel", reason: "Cancelled by controller" }));
 			} else {
 				const assertAuthorized = await authorizeCancellation();
 				assertAuthorized();

@@ -233,37 +233,20 @@ export function getSubagentPrompt(
 	return entry ? pickLocalizedValue(entry, locale) : null;
 }
 
-/**
- * Guidance appended to every subagent system prompt: how to report progress
- * back to the narrator that launched it. The final result is still returned
- * automatically when the subagent finishes, so this is for interim updates.
- */
-export function getSubagentParentReportingHint(
-	locale: Locale = DEFAULT_LOCALE,
-	canReportToParent = true,
+/** Result delivery is a run relationship, independent of control and capabilities. */
+export function getRunDeliveryHint(
+	locale: Locale,
+	deliverTo: { narratorId: string },
+	cancelWith?: { narratorId: string },
 ): string {
+	const target = JSON.stringify(deliverTo.narratorId);
+	const callerWaiting = cancelWith?.narratorId === deliverTo.narratorId;
 	if (locale === "zh-CN") {
-		const parentGuidance = canReportToParent
-			? '- 可用 `Send({ id: "parent", message: "已完成 X，正在做 Y" })` 报告有实质内容的进度；目标 "parent"（或 "main"）是父叙述者保留关键字。'
-			: "- 当前是前台子代理，父叙述者会等待你的最终结果；不要向 parent 发送中间消息，直接完成任务并返回结果。";
-		return `与父叙述者通信：
-- 你发出的所有 Send 都是异步的：不要设置 await:true，也不要等待父叙述者或同级子代理回信。需要回报时直接发送消息，然后继续工作。
-- 不要使用 Await({ type: "agent", id: "..." }) 等待其他代理；如果存在依赖，由父叙述者负责编排。Await 仍可用于等待 Bash 任务。
-${parentGuidance}
-- 适合发送：阶段性进展、关键中间发现和阻碍。请保持简洁，不要刷屏。
-- 只想从同级子代理已有的持久化上下文获取定向答案时，使用 ContextAsk；它不会给目标发消息、唤醒、中断或修改其上下文。只有传递新信息、要求或修正时才使用 Send。
-- 这不是必需的：你的最终结果在任务完成时会自动返回给父叙述者，无需用 Send 重复发送最终结论。
-- 你也可以用 ContextAsk 查询同级子代理上下文、用 Send 给同级子代理发消息，并用 TeamStatus 查看同级状态。`;
+		return `结果交付：本次运行结束后，最终结果会自动返回给叙述者 ${target}，无需用 Send 重复发送最终结论。
+${callerWaiting ? "该调用方正在等待最终结果；优先完成任务并返回结果，无需发送中间进度。" : `需要汇报实质进度或阻碍时，向明确目标发送，例如 Send({ id: ${target}, message: "已完成 X，正在做 Y" })；保持简洁，不要刷屏。`}
+只想从其他代理已有的持久化上下文获取定向答案时，使用 ContextAsk；它不会给目标发消息、唤醒、中断或修改其上下文。只有传递新信息、要求或修正时才使用 Send。`;
 	}
-	const parentGuidance = canReportToParent
-		? '- Use `Send({ id: "parent", message: "Finished X, now working on Y" })` for meaningful progress reports. The target "parent" (or "main") is reserved for the parent narrator.'
-		: "- You are a foreground subagent; the parent narrator is waiting for your final result. Do not send interim messages to parent; complete the task and return the result.";
-	return `Communicating with the parent narrator:
-- Every Send issued by a subagent is asynchronous: never set await:true and never wait for a parent or sibling reply. Send the message and continue working.
-- Do not use Await({ type: "agent", id: "..." }) to wait for another agent; ask the parent narrator to coordinate dependencies. Await remains available for Bash tasks.
-${parentGuidance}
-- Good uses for Send: staged progress, key intermediate findings, and blockers. Keep messages concise — do not spam.
-- When you only need a targeted answer from a sibling's existing persisted context, use ContextAsk. It does not message, wake, interrupt, or modify the target; use Send only to deliver new information, requirements, or corrections.
-- This is optional: your final result is returned to the parent automatically when you finish, so do not Send the final conclusion redundantly.
-	- You can use ContextAsk to query sibling subagents, Send to message sibling subagents, and TeamStatus to inspect siblings.`;
+	return `Result delivery: when this run finishes, its final result is returned automatically to narrator ${target}; do not Send the final conclusion redundantly.
+${callerWaiting ? "That caller is waiting for the final result; prioritize completing the task and returning the result rather than interim progress." : `For meaningful progress or blockers, address the recipient explicitly, e.g. Send({ id: ${target}, message: "Finished X, now working on Y" }); keep it concise and avoid status spam.`}
+For a targeted answer from another agent's existing persisted context, use ContextAsk. It does not message, wake, interrupt, or modify the target; use Send only to deliver new information, requirements, or corrections.`;
 }

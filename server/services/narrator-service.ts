@@ -71,6 +71,7 @@ import {
 	upsertEncodedTrait,
 } from "../lib/narrator-custom-traits";
 import {
+	getSubagentType,
 	isSubagentVariant,
 	KNOWLEDGE_KIND_TRAIT,
 	type NarratorTrait,
@@ -87,6 +88,20 @@ import {
 	getToolMessageWithParams,
 	type Locale,
 } from "../lib/prompt-i18n";
+import {
+	appendRuntimePolicyTrait,
+	hasRuntimePolicyTrait,
+	parseRuntimePolicyTraits,
+	type RuntimePolicyTrait,
+	withRuntimePolicyTrait,
+} from "../lib/runtime-policy-trait";
+import {
+	hasLegacyDelegatedShape,
+	modelPoolKeyOf,
+	policySourceIdOf,
+	type RuntimeSourceRow,
+	teamMembersWhere,
+} from "../lib/runtime-source";
 import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
 import { escapeLikeNeedle } from "../lib/sql-like";
 import {
@@ -97,6 +112,7 @@ import {
 	type PersistedUserImageBlock,
 	type TextFileRef,
 } from "../lib/uploads";
+import { delegationRegistration } from "../lib/validators/runtime-registration";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { agentMessageDeliveryBody } from "./agent-message-delivery";
@@ -114,6 +130,7 @@ import type {
 	UnloadToolResult,
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
+import { compileDelegationCeiling } from "./custom-subagent-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
@@ -388,7 +405,8 @@ interface CreateSubagentInput {
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
-	inheritedTraits?: string[];
+	/** Compiled template ceiling; compiled from `subagentType` when omitted. */
+	runtimePolicy?: RuntimePolicyTrait;
 	defaultDeviceId?: string | null;
 }
 
@@ -419,24 +437,25 @@ const ADMIN_ONLY_LOAD_TOOLS = new Set([
  * (trait-layer-service → db → … → narrator-service).
  */
 async function resolveLayeredTraitsFor(
-	narrator: { traits: unknown; chapterId?: string | null; contextProjectId?: string | null },
+	narrator: {
+		traits: unknown;
+		chapterId?: string | null;
+		contextProjectId?: string | null;
+	} & RuntimeSourceRow,
 	userId: string | undefined,
 ): Promise<string[]> {
-	try {
-		const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
-			"./trait-layer-service"
-		);
-		const resolved = await resolveEffectiveTraits({
-			narratorTraits: narrator.traits,
-			projectId: await resolveNarratorProjectId(narrator),
-			actingUserId: userId ?? null,
-		});
-		return resolved.traits;
-	} catch {
-		// Degrade to narrator-only traits rather than failing the command.
-		const { parseTraits } = await import("../lib/narrator-utils");
-		return parseTraits(narrator.traits);
-	}
+	// No narrator-only fallback: these traits gate tool loading and skills, and a
+	// failed upper-layer or policy-source read must not drop their restrictions.
+	const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
+		"./trait-layer-service"
+	);
+	const resolved = await resolveEffectiveTraits({
+		narratorTraits: narrator.traits,
+		projectId: await resolveNarratorProjectId(narrator),
+		actingUserId: userId ?? null,
+		policySourceId: policySourceIdOf(narrator),
+	});
+	return resolved.traits;
 }
 
 /**
@@ -1234,12 +1253,61 @@ async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void>
 type NarratorInsertExecutor = Pick<typeof db, "insert">;
 
 /** A fork keeps execution constraints and explicit audiences, but not named/task identity. */
-function forkTraits(parent: typeof narrators.$inferSelect, chapterId: string | null): string[] {
+async function forkTraits(
+	parent: typeof narrators.$inferSelect,
+	chapterId: string | null,
+): Promise<string[]> {
 	const excluded = new Set(["standalone", "named", "scheduled", "background"]);
-	return [
+	const traits = [
 		...(chapterId ? [] : ["standalone"]),
 		...parseTraits(parent.traits).filter((trait) => !excluded.has(trait)),
 	];
+	// Step-5 compatibility: primary forks no longer have the legacy delegated shape
+	// which inferred this ceiling at read time. Materialize it before losing that shape.
+	if (hasLegacyDelegatedShape(parent) && !hasRuntimePolicyTrait(parent.traits)) {
+		const template = getSubagentType(parent.variant) || parent.subagentType || "general";
+		return appendRuntimePolicyTrait(traits, await compileDelegationCeiling(template));
+	}
+	return traits;
+}
+
+/**
+ * A surviving session must never be widened by losing its policy source: freeze the
+ * source's effective ceiling into each dependent's own traits (narrow-only), then
+ * clear the source. Delegated children are deleted with the source before this runs.
+ */
+async function freezePolicyDependents(sourceId: string): Promise<void> {
+	const dependents = await db.query.narrators.findMany({
+		where: eq(narrators.policySourceNarratorId, sourceId),
+		columns: { id: true },
+	});
+	if (dependents.length === 0) return;
+	const { resolveNarratorCapabilities } = await import("./trait-layer-service");
+	const ceilings = parseRuntimePolicyTraits(
+		(await resolveNarratorCapabilities(sourceId)).traits.traits,
+	);
+	for (const { id } of dependents) {
+		await narratorTraitsLock.acquire(id, async () => {
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { traits: true },
+			});
+			const traits = ceilings.reduce<unknown>(appendRuntimePolicyTrait, row?.traits);
+			await db
+				.update(narrators)
+				.set({ traits: parseTraits(traits), policySourceNarratorId: null })
+				.where(and(eq(narrators.id, id), eq(narrators.policySourceNarratorId, sourceId)));
+		});
+	}
+}
+
+/** Keep the policy/model source, never the parent's controller or run/result destination. */
+function forkPolicySource(parent: typeof narrators.$inferSelect) {
+	const modelPool = modelPoolKeyOf(parent);
+	return {
+		policySourceNarratorId: policySourceIdOf(parent),
+		runtimeRegistrationJson: modelPool ? { version: 1 as const, modelPool } : null,
+	};
 }
 
 function copyForkAccessAndRules(
@@ -1717,8 +1785,11 @@ export const narratorService = {
 			}
 			const parent = await this.getById(input.parentNarratorId);
 
-			if (isSubagentVariant(parent.variant)) {
-				throw new ValidationError("Subagents cannot spawn nested subagents");
+			const { resolveNarratorRuntimePolicy } = await import("./trait-layer-service");
+			if (!(await resolveNarratorRuntimePolicy(parent.id)).capabilities.spawnAgent) {
+				throw new ValidationError(
+					"This narrator's capability ceiling does not allow spawning agents",
+				);
 			}
 			if (input.originToolCallId != null) {
 				const origin = await db.query.narratorToolCalls.findFirst({
@@ -1790,10 +1861,21 @@ export const narratorService = {
 				(storedModel === FOLLOW_PARENT_MODEL ? null : (parent.reasoningEffort ?? null));
 
 			const subChapterId = parent.chapterId ?? null;
-			const subTraits: string[] = [
-				...(subChapterId === null ? ["standalone"] : []),
-				...(input.inheritedTraits ?? []),
-			];
+			// The template is compiled into an ordinary ceiling trait; the parent's own
+			// restrictions are not copied but followed live through the registered
+			// policy source, so a later tightening of the parent reaches the child.
+			const runtimePolicy =
+				input.runtimePolicy ?? (await compileDelegationCeiling(input.subagentType));
+			const subTraits = withRuntimePolicyTrait(
+				subChapterId === null ? ["standalone"] : [],
+				runtimePolicy,
+			);
+			// The delegator is the policy/model source and the controller; the model pool
+			// the child follows the source within is fixed now, from the template.
+			const runtimeRegistration = delegationRegistration(
+				input.parentNarratorId,
+				input.subagentType,
+			);
 
 			const creationWorkspace: CreationWorkspace = {
 				chapterId: subChapterId,
@@ -1845,6 +1927,8 @@ export const narratorService = {
 						// Nested subagents point at the same root, so the chain is never walked on a
 						// decision path.
 						aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
+						runtimeRegistrationJson: runtimeRegistration,
+						policySourceNarratorId: input.parentNarratorId,
 						// Kept because "whose work is this" is still read for listings, attribution
 						// and user deletion — it just no longer decides access.
 						ownerUserId: parent.ownerUserId,
@@ -1882,11 +1966,7 @@ export const narratorService = {
 			variant: narrators.variant,
 			status: narrators.status,
 		};
-		const scope = and(
-			eq(narrators.parentNarratorId, parentNarratorId),
-			notInArray(narrators.id, [senderId]),
-			sql`${narrators.variant} LIKE 'subagent:%'`,
-		);
+		const scope = and(teamMembersWhere(parentNarratorId), notInArray(narrators.id, [senderId]));
 		// Match the existing last-activity convention, not incidental title/settings edits.
 		const lastActivity = sql<string>`COALESCE(${narrators.lastMessageAt}, ${narrators.updatedAt}, ${narrators.createdAt})`;
 		const targets = await db
@@ -1920,9 +2000,9 @@ export const narratorService = {
 	 * Unbounded on purpose for explicit Send/Await/ContextAsk selector resolution.
 	 * Display uses listSubagentsForTeamView; broadcast uses listSubagentsForBroadcast.
 	 */
-	async listSubagentsByParent(parentNarratorId: string) {
+	async listTeamMembers(rootId: string) {
 		return db.query.narrators.findMany({
-			where: eq(narrators.parentNarratorId, parentNarratorId),
+			where: teamMembersWhere(rootId),
 			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
 	},
@@ -1961,7 +2041,7 @@ export const narratorService = {
 	}> {
 		const limit = Math.max(1, Math.trunc(input.limit));
 		const needle = escapeLikeNeedle(input.query);
-		const conditions = [eq(narrators.parentNarratorId, input.parentNarratorId)];
+		const conditions = [teamMembersWhere(input.parentNarratorId)];
 		if (needle) {
 			const like = `%${needle}%`;
 			const match = or(
@@ -2175,6 +2255,7 @@ export const narratorService = {
 	/** List all named narrators (traits include "named"), most recent first. */
 	async listNamed() {
 		const rows = await db.query.narrators.findMany({
+			columns: { runtimeRegistrationJson: false },
 			where: and(eq(narrators.type, "primary"), isNotNull(narrators.handle)),
 			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
 		});
@@ -2223,6 +2304,7 @@ export const narratorService = {
 
 	async listByChapter(chapterId: string) {
 		return db.query.narrators.findMany({
+			columns: { runtimeRegistrationJson: false },
 			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
@@ -2241,6 +2323,7 @@ export const narratorService = {
 		for (const child of children) {
 			if (!survivingForks.some((fork) => fork.id === child.id)) await this.remove(child.id);
 		}
+		await freezePolicyDependents(narratorId);
 
 		// Any surviving narrator that still borrows pre-compact refs from this one must
 		// materialize what it can keep and drop the link first: the self-FK would abort
@@ -2461,6 +2544,8 @@ export const narratorService = {
 				| "dontAsk";
 
 			const executionContext = await resolveForkExecutionContext(parent);
+			const inheritedTraits = await forkTraits(parent, null);
+			const policySource = forkPolicySource(parent);
 
 			// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
 			// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
@@ -2479,7 +2564,8 @@ export const narratorService = {
 								chapterId: null,
 								type: "primary",
 								variant: "primary",
-								traits: forkTraits(parent, null),
+								traits: inheritedTraits,
+								...policySource,
 								...executionContext,
 								...creationWorkspace,
 								model: storedModel,
@@ -2674,7 +2760,8 @@ export const narratorService = {
 			// (follow the global default). Never固化 the resolved default here.
 			const resolvedReasoningEffort = parent.reasoningEffort ?? null;
 
-			const forkTraits2 = forkTraits(parent, targetChapterId);
+			const forkTraits2 = await forkTraits(parent, targetChapterId);
+			const policySource = forkPolicySource(parent);
 			const executionContext = await resolveForkExecutionContext(parent);
 
 			// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
@@ -2697,6 +2784,7 @@ export const narratorService = {
 								type: "primary",
 								variant: "primary",
 								traits: forkTraits2,
+								...policySource,
 								...executionContext,
 								// A new chapter supplies its own project and effective workspace.
 								...(targetChapterId
@@ -3152,7 +3240,7 @@ export const narratorService = {
 		narratorMessageQueries.getLatestAssistantTextAndId.bind(narratorMessageQueries),
 	getLatestSuccessfulCompactSummary:
 		narratorMessageQueries.getLatestSuccessfulCompactSummary.bind(narratorMessageQueries),
-	isSubagentNarrator: narratorMessageQueries.isSubagentNarrator.bind(narratorMessageQueries),
+	ownTurnPlacement: narratorMessageQueries.ownTurnPlacement.bind(narratorMessageQueries),
 	getPretextDocumentPage:
 		narratorMessageQueries.getPretextDocumentPage.bind(narratorMessageQueries),
 	getMessageVersion: narratorMessageQueries.getMessageVersion.bind(narratorMessageQueries),

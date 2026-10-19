@@ -27,7 +27,7 @@ export function InlineQuoteCandidate({
 	return (
 		// biome-ignore lint/a11y/useSemanticElements: a paragraph widget requires phrasing content, not a block fieldset.
 		<span
-			className={classes.candidate}
+			className={`${classes.atom} ${classes.chip} ${classes.candidate}`}
 			data-inline-quote-candidate
 			role="group"
 			aria-label={t("quote.add", { defaultValue: "Quote selection" })}
@@ -35,7 +35,8 @@ export function InlineQuoteCandidate({
 		>
 			<button
 				type="button"
-				className={classes.candidateAccept}
+				className={`${classes.nodeBody} ${classes.candidateAccept}`}
+				aria-label={t("quote.add", { defaultValue: "Quote selection" })}
 				aria-keyshortcuts={keyboardShortcut ? "Tab" : undefined}
 				disabled={disabled || unavailable}
 				title={
@@ -54,15 +55,11 @@ export function InlineQuoteCandidate({
 						title={t("quote.tabKey")}
 					>
 						<IconArrowBarToRight size={12} aria-hidden="true" />
-						Tab
+						<span>Tab</span>
 					</kbd>
-				) : (
-					<Icon size={14} />
-				)}
-				<span className={classes.candidateAction} data-quote-action>
-					{t("quote.add", { defaultValue: "Quote selection" })}
-				</span>
-				<span className={classes.label}>· {label}</span>
+				) : null}
+				<Icon size={14} aria-hidden="true" data-quote-action />
+				<span className={classes.label}>{label}</span>
 			</button>
 			<button
 				type="button"
@@ -70,7 +67,7 @@ export function InlineQuoteCandidate({
 				aria-label={t("quote.dismiss", { defaultValue: "Dismiss" })}
 				onClick={() => onDismiss(candidate)}
 			>
-				<IconX size={14} />
+				<IconX size={12} />
 			</button>
 		</span>
 	);

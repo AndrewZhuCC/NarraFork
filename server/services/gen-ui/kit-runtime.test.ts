@@ -8,6 +8,7 @@ import { genUiParameters } from "@server/lib/agent/tools/gen-ui";
 import type { ToolContext } from "@server/lib/agent/types";
 import { readGenUiKitNotice } from "@shared/gen-ui-kit";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import { UNRESTRICTED_RUNTIME_POLICY } from "../agent-runtime/policy";
 import { answerGenUiForm, isGenUiFormWaiting } from "./form-wait";
 import {
 	approveKitRequest,
@@ -231,7 +232,14 @@ describe("render", () => {
 		expect(noSubmit.isError).toBe(true);
 		expect(noSubmit.output).toContain("wait: true needs a submit() control");
 		expect(isGenUiFormWaiting("n", "form-2")).toBe(false);
-		env.ctx = { ...env.ctx, parentNarratorId: "parent" } as ToolContext;
+		// A delegated session's policy ceiling disables questions; that is what forbids waiting.
+		env.ctx = {
+			...env.ctx,
+			runtimePolicy: {
+				...UNRESTRICTED_RUNTIME_POLICY,
+				capabilities: { ...UNRESTRICTED_RUNTIME_POLICY.capabilities, askUserQuestion: "disabled" },
+			},
+		} as ToolContext;
 		const subagent = await executeKitAction(
 			{ action: "render", source: "<Button onClick={submit()}>Go</Button>", wait: true },
 			env,

@@ -13,6 +13,7 @@ let online = true, supported = true, previewSupported = true, statusSupported = 
 const calls = [];
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 65536 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
+ getDeviceConnectionGeneration: () => online ? generation : null,
  hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1") || (statusSupported && f === "git.workspace.status.v1") || (lineStatsSupported && f === "git.workspace.line-stats.v1")),
  sendRpc: async (id, method, params, opts) => {
   calls.push({id, method, params, opts});

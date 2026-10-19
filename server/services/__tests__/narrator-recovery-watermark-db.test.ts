@@ -36,7 +36,8 @@ const {
 } = await import("../narrator-subagent-recovery");
 const { backgroundTaskService } = await import("../background-task-service");
 const { clearAliasRegistry, SUBAGENT_ALIAS_TRAIT_PREFIX } = await import("../subagent-alias");
-const subagentResume = await import("../subagent-resume");
+const session = await import("../narrator-session");
+const ownership = await import("../agent-runtime/ownership");
 
 const FAILED_AT_MS = Date.parse("2026-04-01T02:00:00.000Z");
 const FAILED_AT = new Date(FAILED_AT_MS).toISOString();
@@ -80,7 +81,10 @@ async function readRow(id: string) {
 
 beforeEach(() => cleanDb(sqlite));
 
+const releaseOwners: Array<{ release(): unknown }> = [];
+
 afterEach(() => {
+	for (const owner of releaseOwners.splice(0)) owner.release();
 	mock.restore();
 	clearAliasRegistry(PARENT_ID);
 });
@@ -225,11 +229,16 @@ async function seedRecoverableSubagent(id: string, alias: string): Promise<void>
 
 function mockSuccessfulResume() {
 	// Keep alias registration and all DB transitions real, but never start an agent loop.
-	return spyOn(subagentResume, "resumeSubagent").mockImplementation(async ({ subagentId }) => ({
-		started: true,
-		resumedSuspendedRunner: false,
-		originToolUseId: `tool-${subagentId}`,
+	// Recovery continues the session's own task run through the ordinary entry.
+	return spyOn(session, "continueNarrator").mockImplementation(async () => ({
+		ok: true,
+		terminal: Promise.resolve(),
 	}));
+}
+
+/** The session each recovery continued, in order. */
+function continuedIds(resume: ReturnType<typeof mockSuccessfulResume>): string[] {
+	return resume.mock.calls.map(([id]) => id);
 }
 
 async function readBackgroundTask(id: string) {
@@ -269,7 +278,7 @@ describe("resumeRecoverySubagents DB recovery", () => {
 			resumed: ["retry-works"],
 			skipped: [{ id: "sub-fails", reason: "initialization failed after task creation" }],
 		});
-		expect(resume.mock.calls.map(([input]) => input.subagentId)).toEqual(["sub-works"]);
+		expect(continuedIds(resume)).toEqual(["sub-works"]);
 		expect((await readBackgroundTask("sub-works"))?.alias).toBe("retry-works");
 		await expectFailedBackgroundTask("sub-fails", "initialization failed after task creation");
 	});
@@ -283,10 +292,12 @@ describe("resumeRecoverySubagents DB recovery", () => {
 				// insert without run identity is inadmissible after the legacy cutoff.
 				await backgroundTaskService.createAgentTask({
 					id: "sub-fails",
-					parentNarratorId: PARENT_ID,
 					subagentNarratorId: "sub-fails",
 					subagentType: "general",
 					alias: "retry-fails",
+					binding: {
+						deliverTo: { narratorId: PARENT_ID, toolUseId: "tool-sub-fails" },
+					},
 				});
 				if (existingStatus === "failed") {
 					await backgroundTaskService.markFailed("sub-fails", "Previous failure");
@@ -305,14 +316,16 @@ describe("resumeRecoverySubagents DB recovery", () => {
 				resumed: ["retry-works"],
 				skipped: [{ id: "sub-fails", reason: "resume initialization failed" }],
 			});
-			expect(resume.mock.calls.map(([input]) => input.subagentId)).toEqual(resumeInput.subagentIds);
-			expect(resume).toHaveBeenLastCalledWith(
-				expect.objectContaining({
-					subagentId: "sub-works",
-					preserveBackground: true,
-					skipConclusionDelivery: true,
-				}),
-			);
+			expect(continuedIds(resume)).toEqual(resumeInput.subagentIds);
+			// The same task run continues (never a fresh one): its result lands on the task
+			// row, and the historical Agent tool result stays untouched.
+			const task = await readBackgroundTask("sub-works");
+			expect(resume.mock.calls.at(-1)?.[0]).toBe("sub-works");
+			expect(resume.mock.calls.at(-1)?.[4]).toEqual({
+				resumeRunId: task?.logicalRunId ?? undefined,
+				recovered: true,
+			});
+			expect(task?.logicalRunId).toBeTruthy();
 			expect((await readBackgroundTask("sub-works"))?.status).toBe("running");
 			await expectFailedBackgroundTask("sub-fails", "resume initialization failed");
 		});
@@ -322,11 +335,7 @@ describe("resumeRecoverySubagents DB recovery", () => {
 		await seedRecoverableSubagent("sub-fails", "retry-fails");
 		await seedRecoverableSubagent("sub-works", "retry-works");
 		const resume = mockSuccessfulResume();
-		resume.mockResolvedValueOnce({
-			started: false,
-			resumedSuspendedRunner: false,
-			originToolUseId: "tool-sub-fails",
-		});
+		resume.mockResolvedValueOnce({ ok: false });
 
 		const result = await resumeRecoverySubagents(resumeInput);
 
@@ -356,9 +365,10 @@ describe("resumeRecoverySubagents DB recovery", () => {
 		});
 		const before = await readBackgroundTask("sub-fails");
 		const resume = mockSuccessfulResume();
-		spyOn(subagentResume, "hasActiveSubagentResumeRun").mockImplementation(
-			(id) => id === "sub-fails",
-		);
+		// Another execution already owns the session (e.g. a manual continue in flight).
+		const owner = ownership.tryClaimExecution("sub-fails", "run");
+		if (!owner) throw new Error("Missing test execution owner");
+		releaseOwners.push(owner);
 
 		const result = await resumeRecoverySubagents(resumeInput);
 
@@ -366,21 +376,20 @@ describe("resumeRecoverySubagents DB recovery", () => {
 			resumed: ["retry-works"],
 			skipped: [{ id: "sub-fails", reason: "already_resuming" }],
 		});
-		expect(resume.mock.calls.map(([input]) => input.subagentId)).toEqual(["sub-works"]);
+		expect(continuedIds(resume)).toEqual(["sub-works"]);
 		expect(await readBackgroundTask("sub-fails")).toEqual(before);
 	});
 
 	test("does not compensate a concurrent resume that acquired ownership during preparation", async () => {
 		await seedRecoverableSubagent("sub-fails", "retry-fails");
 		await seedRecoverableSubagent("sub-works", "retry-works");
-		let active = false;
-		spyOn(subagentResume, "hasActiveSubagentResumeRun").mockImplementation(
-			(id) => id === "sub-fails" && active,
-		);
 		const resume = mockSuccessfulResume();
 		resume.mockImplementationOnce(async () => {
-			active = true;
-			throw new Error("Subagent already has an active resumed run");
+			// A concurrent continuation claimed the session after preparation; this
+			// attempt is refused and must not settle the task that run now owns.
+			const owner = ownership.tryClaimExecution("sub-fails", "run");
+			if (owner) releaseOwners.push(owner);
+			return { ok: false };
 		});
 
 		const result = await resumeRecoverySubagents(resumeInput);
@@ -405,7 +414,7 @@ describe("resumeRecoverySubagents DB recovery", () => {
 				resumed: ["retry-works"],
 				skipped: [{ id: "sub-fails", reason: "no_longer_failed" }],
 			});
-			expect(resume.mock.calls.map(([input]) => input.subagentId)).toEqual(["sub-works"]);
+			expect(continuedIds(resume)).toEqual(["sub-works"]);
 			expect(await readBackgroundTask("sub-fails")).toBeUndefined();
 			expect(await db.query.narrators.findFirst({ where: eq(narrators.id, "sub-fails") })).toEqual(
 				before,
@@ -432,7 +441,7 @@ describe("recovery admission uses the parent's latest turn", () => {
 			resumed: ["retry-works"],
 			skipped: [{ id: "sub-fails", reason: "failure_outside_latest_turn" }],
 		});
-		expect(resume.mock.calls.map(([input]) => input.subagentId)).toEqual(["sub-works"]);
+		expect(continuedIds(resume)).toEqual(["sub-works"]);
 		expect(await readBackgroundTask("sub-fails")).toBeUndefined();
 	});
 

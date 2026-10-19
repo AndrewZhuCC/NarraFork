@@ -8,7 +8,6 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { MAX_SUBAGENT_INTERRUPTION_RETRIES, planSubagentInterruption } from "../subagent-executor";
 import {
 	interruptionContinuationLabel,
 	MAX_TURN_INTERRUPTION_RETRIES,
@@ -100,11 +99,11 @@ describe("planTurnInterruption", () => {
 	});
 });
 
-describe("planSubagentInterruption stays equivalent after delegation", () => {
+describe("shared interruption defaults preserve the delegated behavior", () => {
 	// The subagent wrapper is now a thin alias. These pin that the delegation did not change
 	// what its own callers and tests observe.
 	test("bounds match", () => {
-		expect(MAX_SUBAGENT_INTERRUPTION_RETRIES).toBe(MAX_TURN_INTERRUPTION_RETRIES);
+		expect(MAX_TURN_INTERRUPTION_RETRIES).toBe(3);
 	});
 
 	test("agrees with the shared function on every branch", () => {
@@ -115,10 +114,10 @@ describe("planSubagentInterruption stays equivalent after delegation", () => {
 			{ interrupted: true, shouldReplayInterruptedToolResultTurn: true },
 		];
 		for (const result of cases) {
-			for (const retries of [0, 1, MAX_SUBAGENT_INTERRUPTION_RETRIES]) {
-				expect(planSubagentInterruption(result, retries)).toEqual(
+			for (const retries of [0, 1, MAX_TURN_INTERRUPTION_RETRIES]) {
+				expect(planTurnInterruption(result, retries)).toEqual(
 					planTurnInterruption(result, retries, {
-						maxRetries: MAX_SUBAGENT_INTERRUPTION_RETRIES,
+						maxRetries: MAX_TURN_INTERRUPTION_RETRIES,
 					}),
 				);
 			}

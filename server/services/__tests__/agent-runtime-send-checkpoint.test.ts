@@ -168,7 +168,7 @@ test("COW-restored Send navigates by stable delivery while retaining captured or
 		projectedByteSize: 8,
 	});
 	if (!("delivery" in accepted)) throw new Error("full");
-	const owner = tryClaimExecution("recipient", "primary");
+	const owner = tryClaimExecution("recipient", "run");
 	if (!owner) throw new Error("owner missing");
 	const row = store.claimBatch("recipient", { token: "claim", epoch: owner.epoch })[0];
 	if (!row) throw new Error("claim missing");

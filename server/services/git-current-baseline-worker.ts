@@ -49,28 +49,35 @@ export type CurrentBaselineResponse = CurrentGitBaseline | string[];
 const port = parentPort;
 if (port) {
 	const controller = new AbortController();
-	port.on("message", async (message: CurrentBaselineRequest | { action: "cancel" }) => {
-		if (message.action === "cancel") {
-			controller.abort();
-			return;
-		}
-		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]);
-		try {
-			const value =
-				message.action === "snapshot"
-					? await snapshot(message, signal)
-					: await verifyBlobs(message, signal);
-			port.postMessage({ value });
-		} catch (error) {
-			port.postMessage({
-				error: signal.aborted
-					? "cancelled"
-					: error instanceof Error
-						? error.message.slice(0, 100)
-						: "unavailable",
-			});
-		}
-	});
+	port.on(
+		"message",
+		async (message: CurrentBaselineRequest | { action: "cancel" } | { action: "ping" }) => {
+			if (message.action === "ping") {
+				port.postMessage({ ready: true });
+				return;
+			}
+			if (message.action === "cancel") {
+				controller.abort();
+				return;
+			}
+			const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]);
+			try {
+				const value =
+					message.action === "snapshot"
+						? await snapshot(message, signal)
+						: await verifyBlobs(message, signal);
+				port.postMessage({ value });
+			} catch (error) {
+				port.postMessage({
+					error: signal.aborted
+						? "cancelled"
+						: error instanceof Error
+							? error.message.slice(0, 100)
+							: "unavailable",
+				});
+			}
+		},
+	);
 }
 
 async function canonicalPath(path: string, signal: AbortSignal): Promise<string> {

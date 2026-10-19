@@ -1,5 +1,6 @@
 import { Alert, Badge, Button, Divider, Group, Loader, Modal, Stack, Text } from "@mantine/core";
-import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import {
@@ -7,10 +8,12 @@ import {
 	useActualResolvedModelCard,
 	useModelCatalog,
 } from "../../../hooks/useModelCatalog";
+import { api } from "../../../lib/api";
 import type { ModelOption } from "../../../lib/constants";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { resolveCatalogEntry } from "../../../lib/model-catalog-view";
 import { Z } from "../../../lib/z-index";
+import type { CustomApiProtocol } from "../../providers/types";
 import { ModelCardDetails } from "../../settings/ModelCardDetails";
 import {
 	type CatalogEditorTarget,
@@ -65,11 +68,38 @@ export function ModelPriceModal({
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
 	const { data: user } = useCurrentUser();
+	const qc = useQueryClient();
 	const catalog = useModelCatalog(opened);
 	const actual = useActualResolvedModel(opened ? model?.value : undefined);
 	const card = useActualResolvedModelCard(opened ? model?.value : undefined);
 	const [editor, setEditor] = useState<CatalogEditorTarget | null>(null);
 	const readOnly = user?.role !== "admin";
+	// 协议分两层，都与 catalog 快照无关，因此在这里读写：
+	// provider 层（设置页模型行写的 modelProtocols）与本地覆盖层（本对话框单独保存的
+	// modelProtocolOverrides，优先级更高；删除键即恢复继承 provider 层）。
+	const { data: settingsData } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		enabled: opened,
+	});
+	const agentSettings = (settingsData?.agent ?? {}) as {
+		modelProtocols?: Record<string, CustomApiProtocol>;
+		modelProtocolOverrides?: Record<string, CustomApiProtocol>;
+	};
+	const providerProtocols = agentSettings.modelProtocols ?? {};
+	const localProtocols = agentSettings.modelProtocolOverrides ?? {};
+	const modelValue = model?.value;
+	const saveModelProtocol = useCallback(
+		async (protocol: CustomApiProtocol | null) => {
+			if (!modelValue) return;
+			const next = { ...localProtocols };
+			if (protocol) next[modelValue] = protocol;
+			else delete next[modelValue];
+			await api.updateSettings({ agent: { modelProtocolOverrides: next } });
+			await qc.invalidateQueries({ queryKey: ["settings"] });
+		},
+		[localProtocols, modelValue, qc],
+	);
 	const pricing = model?.pricing;
 	const referencePrice = (value: string | null | undefined) =>
 		value === undefined
@@ -269,6 +299,16 @@ export function ModelPriceModal({
 					snapshot={catalog.data}
 					readOnly={readOnly}
 					onClose={() => setEditor(null)}
+					protocol={
+						modelValue
+							? {
+									modelValue,
+									value: localProtocols[modelValue] ?? null,
+									inheritedValue: providerProtocols[modelValue] ?? null,
+									onSave: saveModelProtocol,
+								}
+							: undefined
+					}
 				/>
 			)}
 		</Modal>

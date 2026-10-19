@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { isRuntimeToolAllowed, resolveRuntimePolicy } from "../../../services/agent-runtime/policy";
+import {
+	compileDelegationPolicy,
+	isRuntimeToolAllowed,
+	resolveRuntimePolicy,
+} from "../../../services/agent-runtime/policy";
 import { webSearchTool } from "../../agent/tools/web-search";
 import type { ToolContext } from "../../agent/types";
 import { settings } from "../../settings";
@@ -110,7 +114,7 @@ describe("search execution scope", () => {
 	});
 
 	test("search runtime allows WebSearch but fails closed outside a supported native provider", async () => {
-		const runtimePolicy = resolveRuntimePolicy({ variant: "subagent", subagentType: "search" });
+		const runtimePolicy = resolveRuntimePolicy([compileDelegationPolicy({ template: "search" })]);
 		expect(runtimePolicy.searchOnly).toBe(true);
 		expect(isRuntimeToolAllowed(runtimePolicy, "WebSearch")).toBe(true);
 		const result = await webSearchTool.execute({ query: "test" }, {
@@ -147,7 +151,7 @@ describe("search execution scope", () => {
 				{ query: "runtime query" },
 				{
 					...ctx,
-					runtimePolicy: resolveRuntimePolicy({ variant: "subagent", subagentType: "search" }),
+					runtimePolicy: resolveRuntimePolicy([compileDelegationPolicy({ template: "search" })]),
 				},
 			);
 			expect(searchOnly.output).toBe("native result");

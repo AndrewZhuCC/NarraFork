@@ -368,6 +368,8 @@ describe("PluginProviderSection model area", () => {
 			],
 			hiddenModels: new Set<string>(),
 			onToggleHidden: () => {},
+			modelProtocols: {},
+			onModelProtocolChange: () => {},
 			modelContextWindows: {},
 			onContextWindowChange: () => {},
 			customModels: [],

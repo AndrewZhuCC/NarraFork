@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "934c938b-f9b6-43b8-bc63-5b08d22e8152",
+  "id": "887c0e87-bf13-4952-b878-d3f7fa996b32",
   "prevId": "f0595443-2883-42b4-9694-d17fdd6fad96",
   "tables": {
     "acl_events": {
@@ -9399,13 +9399,6 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
-        },
-        "previous_json": {
-          "name": "previous_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
         }
       },
       "indexes": {
@@ -12656,6 +12649,20 @@
           "notNull": false,
           "autoincrement": false
         },
+        "runtime_registration_json": {
+          "name": "runtime_registration_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "policy_source_narrator_id": {
+          "name": "policy_source_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -12727,6 +12734,13 @@
           "name": "idx_narrators_acl_root",
           "columns": [
             "acl_root_narrator_id"
+          ],
+          "isUnique": false
+        },
+        "idx_narrators_policy_source": {
+          "name": "idx_narrators_policy_source",
+          "columns": [
+            "policy_source_narrator_id"
           ],
           "isUnique": false
         },
@@ -12912,6 +12926,19 @@
           "tableTo": "narrators",
           "columnsFrom": [
             "acl_root_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrators_policy_source_narrator_id_narrators_id_fk": {
+          "name": "narrators_policy_source_narrator_id_narrators_id_fk",
+          "tableFrom": "narrators",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "policy_source_narrator_id"
           ],
           "columnsTo": [
             "id"

@@ -212,7 +212,15 @@ describe("explicit Dynamic Spec goal continuation", () => {
 		providerCalls.length = 0;
 		disableContinuationNarratorId = narratorId;
 		try {
-			await sendMessage(narratorId, "disable auto continuation", undefined, "en");
+			await sendMessage(
+				narratorId,
+				"disable auto continuation",
+				undefined,
+				"en",
+				false,
+				null,
+				null,
+			);
 			await waitFor(async () => {
 				const narrator = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),

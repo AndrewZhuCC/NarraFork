@@ -87,9 +87,8 @@ describe("continuation registry shape", () => {
 		// and adds the per-run pass cap that a subagent needs (its run holds the parent's
 		// tool call open, so "eventually stops" is not good enough).
 		//
-		// `permission-feedback` closed next, but as `handledVia` rather than `handled`: a
-		// subagent's approval text is queued by `bufferSubagentUserMessage` and consumed at
-		// the `buffered-message` boundary, so it has no branch of its own to mark.
+		// `permission-feedback` is handled by the one orchestrator branch for every
+		// session: a delegated run adopts it through `pendingFeedback` like any session.
 		expect(gaps).toEqual([]);
 	});
 
@@ -100,13 +99,9 @@ describe("continuation registry shape", () => {
 		expect(findDanglingHandledVia()).toEqual([]);
 	});
 
-	test("handledVia is excluded from the marker expectation but counts as implemented", () => {
-		// The two queries answer different questions on purpose. Merging them would either
-		// demand a marker that does not exist, or loosen the marker check for every source.
-		expect(isHandledBy("permission-feedback", "subagent")).toBe(false);
+	test("permission feedback has one branch for every session", () => {
+		expect(isHandledBy("permission-feedback", "subagent")).toBe(true);
 		expect(isImplementedBy("permission-feedback", "subagent")).toBe(true);
-		expect(listHandledContinuationSourceIds("subagent")).not.toContain("permission-feedback");
-		// The primary still owns it in its own branch, which is what the marker check reads.
 		expect(isHandledBy("permission-feedback", "primary")).toBe(true);
 	});
 

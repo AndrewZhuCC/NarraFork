@@ -6,14 +6,23 @@ import { generateId } from "../../lib/id";
 import { parseSubstatus } from "../../lib/narrator-utils";
 import { settings } from "../../lib/settings";
 import * as websocket from "../../websocket/narrator-ws";
+import {
+	getExecutionOwner,
+	getRunControl,
+	getRunHold,
+	setRunHold,
+} from "../agent-runtime/ownership";
 import * as completionQueue from "../bg-completion-queue";
+import * as passExecutor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
 import { drainPendingInjections, takePendingInjectionBatch } from "../parent-injection-queue";
 import { clearAliasRegistry } from "../subagent-alias";
-import { getBackgroundAbortControllers } from "../subagent-detach";
-import * as executor from "../subagent-executor";
-import { listRunningSubagentExecutions, runSubagent } from "../subagent-runner";
-import { clearTakenOver, isBackgroundTakenOver, isTakenOver } from "../subagent-takeover";
+import { runSubagent } from "../subagent-runner";
+
+const isTakenOver = (id: string) => !!getRunHold(id);
+const clearTakenOver = (id: string) => setRunHold(id, undefined);
+/** No run of `id` is live: the run service released its owner. */
+const runEnded = (id: string) => !getExecutionOwner(id) && !getRunControl(id);
 
 // tests/preload.ts gives this real DB a temporary NARRAFORK_HOME. Only delete
 // rows owned by this fixture; never sweep a shared DB or touch a running service.
@@ -90,9 +99,8 @@ afterEach(async () => {
 	// runner's finally block before removing its rows or restoring the executor.
 	releaseExecution?.();
 	if (activeChildId) {
-		await until(
-			() => !listRunningSubagentExecutions().some((run) => run.subagentId === activeChildId),
-		);
+		const child = activeChildId;
+		await until(() => runEnded(child));
 	}
 	for (const restore of restoreSpies.reverse()) restore();
 	settings.anthropicProviders = originalProviders;
@@ -118,23 +126,24 @@ async function launch(takeoverByUser: boolean, outcome: "success" | "error" | "t
 		settle = resolve;
 	});
 	releaseExecution = () => settle?.();
-	let observedAtStart: { held: boolean; backgroundHeld: boolean; substatus: unknown } | undefined;
-	const execute = spyOn(executor, "executeSubagent").mockImplementation(async (options) => {
-		activeChildId = options.narratorId;
+	let observedAtStart: { held: boolean; substatus: unknown } | undefined;
+	// Only the model pass is simulated; the run service, hold and finalizer are real.
+	const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async (options) => {
+		activeChildId = options.config.narratorId as string;
 		ids.push(activeChildId);
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, activeChildId) });
 		observedAtStart = {
 			held: isTakenOver(activeChildId),
-			backgroundHeld: isBackgroundTakenOver(activeChildId),
 			substatus: parseSubstatus(row?.substatus),
 		};
 		await held;
 		if (outcome === "throw") throw new Error("Simulated initial execution exception");
 		return {
 			finalText: outcome === "error" ? "Simulated initial turn error" : "Initial turn completed",
-			finalUserId: null,
 			hasError: outcome === "error",
-			allowInboxWake: false,
+			shouldUpdateTitle: false,
+			completedNaturally: outcome === "success",
+			completedAssistantTurn: outcome === "success",
 		};
 	});
 	restoreSpies.push(() => execute.mockRestore());
@@ -169,11 +178,9 @@ describe("Agent creation in user takeover mode", () => {
 	for (const outcome of ["success", "error", "throw"] as const) {
 		test(`initial ${outcome} parks idle[taken_over] without parent completion`, async () => {
 			const { output, observedAtStart, childId } = await launch(true, outcome);
-			expect(observedAtStart).toEqual({
-				held: true,
-				backgroundHeld: true,
-				substatus: ["taken_over"],
-			});
+			// The hold exists before the first turn starts.
+			expect(observedAtStart?.held).toBe(true);
+			expect(observedAtStart?.substatus).toContain("taken_over");
 			expect(output).toMatch(/user takeover/i);
 			expect(output).not.toContain("Await({");
 			expect(broadcasts).toContainEqual({
@@ -190,17 +197,23 @@ describe("Agent creation in user takeover mode", () => {
 			expect(running?.traits).toContain("background");
 
 			releaseExecution?.();
-			await until(() => !listRunningSubagentExecutions().some((run) => run.subagentId === childId));
+			// The first turn ends (whatever its outcome) and the same run parks at its
+			// hold: owner retained, nothing delivered to the caller.
+			await until(async () => {
+				const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
+				return row?.status === "idle" && !!getRunControl(childId)?.wake;
+			});
 			const idle = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
-			expect(idle?.status).toBe("idle");
-			expect(parseSubstatus(idle?.substatus)).toEqual(["taken_over"]);
-			expect(idle?.isBackground).toBe(false);
-			expect(idle?.backgroundStatus).toBeNull();
+			const tags = parseSubstatus(idle?.substatus);
+			expect(tags).toEqual(["taken_over"]);
+			expect(idle?.backgroundStatus).toBe("running");
 			expect(idle?.backgroundResult).toBeNull();
-			expect(idle?.traits).not.toContain("background");
 			expect(isTakenOver(childId)).toBe(true);
 			expect(await takePendingInjectionBatch(parentId)).toBeNull();
 			expect(completionQueue.pushBgCompletionNotification).not.toHaveBeenCalled();
+			// Ending the parked run (the hold's cancellation) lets afterEach observe it end.
+			const { controlRun } = await import("../agent-runtime/run");
+			await controlRun(childId, { kind: "cancel", reason: "test cleanup" });
 		});
 	}
 
@@ -211,7 +224,7 @@ describe("Agent creation in user takeover mode", () => {
 			ids.push(id);
 			throw new Error("Simulated takeover persistence failure");
 		});
-		const execute = spyOn(executor, "executeSubagent");
+		const execute = spyOn(passExecutor, "executeAgentLoop");
 		restoreSpies.push(
 			() => addSubstatus.mockRestore(),
 			() => execute.mockRestore(),
@@ -232,8 +245,7 @@ describe("Agent creation in user takeover mode", () => {
 		expect(failedChildId).toBeDefined();
 		const childId = failedChildId as string;
 		expect(isTakenOver(childId)).toBe(false);
-		expect(isBackgroundTakenOver(childId)).toBe(false);
-		expect(getBackgroundAbortControllers().has(childId)).toBe(false);
+		expect(getExecutionOwner(childId)).toBeUndefined();
 		expect(execute).not.toHaveBeenCalled();
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
 		expect(row?.status).toBe("idle");
@@ -246,23 +258,28 @@ describe("Agent creation in user takeover mode", () => {
 	test("ordinary background creation still completes and publishes a parent notice", async () => {
 		const { output, observedAtStart, childId } = await launch(false, "success");
 		expect(observedAtStart?.held).toBe(false);
-		expect(observedAtStart?.backgroundHeld).toBe(false);
 		expect(output).toContain("Background task started.");
 		expect(output).toContain("Await({");
 		releaseExecution?.();
-		await until(() => !listRunningSubagentExecutions().some((run) => run.subagentId === childId));
+		await until(() => runEnded(childId));
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
 		expect(row?.backgroundStatus).toBe("completed");
 		expect(row?.backgroundResult).toContain("Initial turn completed");
 		expect(row?.substatus).not.toContain("taken_over");
 		expect(isTakenOver(childId)).toBe(false);
-		expect(completionQueue.pushBgCompletionNotification).toHaveBeenCalledWith(
-			parentId,
-			expect.objectContaining({
-				id: childId,
-				status: "completed",
-				result: "Initial turn completed",
-			}),
-		);
+		// The parent's notice is the durable terminal publication of this run.
+		const { runtimePublicationOutbox, narratorBufferedMessages } = await import("../../db/schema");
+		const outbox = await db
+			.select()
+			.from(runtimePublicationOutbox)
+			.where(eq(runtimePublicationOutbox.taskId, childId));
+		const delivered = await db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.narratorId, parentId));
+		expect(
+			outbox.some((row) => row.eventKind === "completed" && row.recipientId === parentId) ||
+				delivered.some((row) => JSON.stringify(row).includes(childId)),
+		).toBe(true);
 	});
 });

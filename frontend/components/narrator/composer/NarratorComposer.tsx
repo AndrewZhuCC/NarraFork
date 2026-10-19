@@ -2,6 +2,7 @@ import { Box, Button, Group, Text } from "@mantine/core";
 import { useDisclosure, useFocusTrap } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
+	type ComposerAsset,
 	type ComposerDocument,
 	type ComposerInlineNode,
 	composerDocumentText,
@@ -34,6 +35,7 @@ import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
+import { ComposerTextAttachmentPreview } from "./ComposerTextAttachmentPreview";
 import {
 	composerAssetsFromFiles,
 	composerInputFromDocument,
@@ -246,12 +248,25 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					])
 				: null;
 
+		const attachmentPreviewScope = JSON.stringify([currentUserId, narratorId]);
+		const [attachmentPreview, setAttachmentPreview] = useState<{
+			scope: string;
+			asset: ComposerAsset;
+		} | null>(null);
+		const activeAttachmentPreview =
+			attachmentPreview?.scope === attachmentPreviewScope ? attachmentPreview : null;
+		useEffect(() => {
+			setAttachmentPreview((current) =>
+				current?.scope === attachmentPreviewScope ? current : null,
+			);
+		}, [attachmentPreviewScope]);
+
 		// Fullscreen modal state
 		const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] =
 			useDisclosure(false);
-		const fullscreenTrap = useFocusTrap(fullscreenOpened);
+		const fullscreenTrap = useFocusTrap(fullscreenOpened && !activeAttachmentPreview);
 		useEffect(() => {
-			if (!fullscreenOpened) return;
+			if (!fullscreenOpened || activeAttachmentPreview) return;
 			const owner = textareaRef.current?.ownerDocument;
 			const close = (event: KeyboardEvent) => {
 				if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
@@ -269,7 +284,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			};
 			owner?.addEventListener("keydown", close, true);
 			return () => owner?.removeEventListener("keydown", close, true);
-		}, [fullscreenOpened, closeFullscreen]);
+		}, [fullscreenOpened, closeFullscreen, activeAttachmentPreview]);
 
 		// Text and reference occurrences have one source of truth, local to this subtree.
 		const [inputState, setInputState] = useState<FileReferenceInput>({
@@ -1525,10 +1540,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				return;
 			}
-			// Up/down follow visual lines, including soft wraps. History runs only when that
-			// press leaves the caret on the same line (start of the text going up, end going
-			// down). Editor state still has the pre-key caret until selectionchange, which can
-			// land after this frame and make every ArrowUp look like the boundary.
+			// Up/down follow visual lines, including soft wraps. History runs only from the
+			// first line upward or the last line downward. Prevent that press before the
+			// browser handles it: contenteditable otherwise jumps to the end of the last line
+			// when history does not replace the text. Editor state is still the pre-key caret
+			// here; selectionchange applies the browser move later.
 			if (
 				(e.key === "ArrowUp" || e.key === "ArrowDown") &&
 				!e.shiftKey &&
@@ -1536,27 +1552,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				!e.metaKey &&
 				(!documentRef.current.assets.length || inputHistory.isBrowsing)
 			) {
-				const before = editorRef.current?.readLiveCaret() ?? null;
 				const direction = e.key === "ArrowUp" ? "up" : "down";
-				const recallIfCaretStayed = () => {
-					if (!editorRef.current?.caretStayedOnLine(before)) return;
-					const result = inputHistory.navigateEntry(
-						direction,
-						inputRef.current,
-						inputStateRef.current.fileReferences,
-						readPersistableDocument(inputStateRef.current.composerDocument),
-					);
-					if (result) {
-						restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
-						syncAttachedFiles(documentRef.current);
-						requestAnimationFrame(() =>
-							editorRef.current?.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
-						);
-					}
-				};
-				const frame = editorRef.current?.getElement()?.ownerDocument.defaultView;
-				if (frame) frame.requestAnimationFrame(recallIfCaretStayed);
-				else requestAnimationFrame(recallIfCaretStayed);
+				if (!editorRef.current?.isCaretOnVerticalEdge(direction)) return;
+				e.preventDefault();
+				const result = inputHistory.navigateEntry(
+					direction,
+					inputRef.current,
+					inputStateRef.current.fileReferences,
+					readPersistableDocument(inputStateRef.current.composerDocument),
+				);
+				if (!result) return;
+				restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
+				syncAttachedFiles(documentRef.current);
+				// Layout measures on the next frame; scroll once that height is committed.
+				const reveal = () => editorRef.current?.revealCaretAtEnd();
+				const win = editorRef.current?.getElement()?.ownerDocument.defaultView;
+				if (win) win.requestAnimationFrame(() => win.requestAnimationFrame(reveal));
+				else requestAnimationFrame(() => requestAnimationFrame(reveal));
 			}
 		};
 
@@ -1618,6 +1630,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				aria-modal={fullscreenOpened || undefined}
 				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}
 			>
+				{activeAttachmentPreview && (
+					<ComposerTextAttachmentPreview
+						key={`${attachmentPreviewScope}:${activeAttachmentPreview.asset.id}`}
+						file={resourceCacheRef.current.get(activeAttachmentPreview.asset.id)}
+						name={activeAttachmentPreview.asset.name}
+						onClose={() => setAttachmentPreview(null)}
+					/>
+				)}
 				<CommandPopover
 					anchorRef={textareaRef}
 					commands={commandsList ?? []}
@@ -1746,6 +1766,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onPasteFiles={onPasteImages}
 					onOpenQuote={(quote) => revealComposerQuote(dock, quote, editorElement)}
 					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
+					onOpenAttachment={(asset) => {
+						if (asset.kind !== "textFile") return;
+						setAttachmentPreview({ scope: attachmentPreviewScope, asset });
+					}}
 					onOpenImage={(asset) => {
 						const file = resourceCacheRef.current.get(asset.id);
 						if (!file) return;

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
-import { buildSubagentSystemPrompt } from "../subagent-tools";
+import { buildDelegationBasePrompt } from "../subagent-tools";
 import { countRuntimeSystemCharacters } from "./prompt-characters";
 
 describe("actual runtime system prompt characters", () => {
@@ -21,16 +21,20 @@ describe("actual runtime system prompt characters", () => {
 	test("custom subagent counts its actual generated prompt and excludes exact summary text", async () => {
 		const summary = "此前工作😀";
 		const custom = "实际自定义角色指令";
-		const prompt = await buildSubagentSystemPrompt(
-			"character-count-fixture",
-			"/tmp",
-			"en",
-			summary,
-			custom,
-		);
+		const basePrompt = await buildDelegationBasePrompt("character-count-fixture", "en", custom);
+		const result = await buildEffectiveSystemPrompt({
+			basePrompt,
+			cwd: "/tmp",
+			locale: "en",
+			contextSummary: summary,
+		});
+		const prompt = result.prompt ?? "";
 		expect(prompt).toContain(custom);
 		expect(prompt.length).toBeGreaterThan(custom.length + summary.length);
 		expect(countRuntimeSystemCharacters(prompt, summary)).toBe(prompt.length - summary.length);
+		expect(countRuntimeSystemCharacters(prompt, summary, result.summaryRange)).toBe(
+			prompt.length - summary.length,
+		);
 		expect(countRuntimeSystemCharacters("## Conversation Context\n没有那个摘要", summary)).toBe(
 			"## Conversation Context\n没有那个摘要".length,
 		);

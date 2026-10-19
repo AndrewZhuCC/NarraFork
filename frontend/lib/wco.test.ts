@@ -204,4 +204,31 @@ describe("floating overlays above the WCO drag surface", () => {
 		expect(versionBanner).toContain("nf-top-banner");
 		expect(connectionAlert).toContain("nf-top-banner");
 	});
+
+	/*
+	 * The browser folds the reported rects into the hit-test region in list order,
+	 * later rects winning where they overlap (gfx::DraggableRegionsToSkRegion), and
+	 * that list is the layout-tree order. A banner emitted while the header row
+	 * still lies ahead of it in the tree is therefore cancelled by nothing: the
+	 * row's `drag` rect comes later and reclaims the strip. Both banners must
+	 * therefore be emitted after every drag surface — the header row (and the
+	 * navbar's WCO spacer, which lives in the navbar and so comes after the
+	 * header). Nesting them inside the row would only survive the row itself.
+	 */
+	test("the fixed top banners are emitted after every drag surface", async () => {
+		const layout = await Bun.file(
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
+		).text();
+		const after = (marker: string) => layout.lastIndexOf(marker);
+		const headerEnd = layout.indexOf("</AppShell.Header>");
+		const navbarEnd = after("</AppShell.Navbar>");
+		expect(headerEnd).toBeGreaterThan(0);
+		expect(navbarEnd).toBeGreaterThan(0);
+
+		for (const banner of ["<WSConnectionAlert />", "<VersionUpdateBanner />"]) {
+			const at = after(banner);
+			expect(at).toBeGreaterThan(headerEnd);
+			expect(at).toBeGreaterThan(navbarEnd);
+		}
+	});
 });

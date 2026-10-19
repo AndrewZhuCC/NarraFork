@@ -1,23 +1,49 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { inArray } from "drizzle-orm";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
+import { type ProviderAdapter, registerExternalProviderResolver } from "../../lib/agent/provider";
 import { generateId } from "../../lib/id";
+import { getExecutionOwner } from "../agent-runtime/ownership";
+import * as passExecutor from "../narrator-executor";
+import { activeNarrators } from "../narrator-session-state";
 import { drainPendingInjections, takePendingInjectionBatch } from "../parent-injection-queue";
-import * as executor from "../subagent-executor";
-import { clearManualOverrideRuntimes } from "../subagent-manual-override";
-import { startForegroundRun } from "../subagent-runner";
-import { clearTakenOver } from "../subagent-takeover";
+
+/*
+ * Attribution of a run's result notice: the run executes as its own registered
+ * principal (never borrowed from a related session) and its detached result notice is
+ * attributed to the principal the run ended with. Same rule for every session.
+ */
+const provider: ProviderAdapter = {
+	formatTools: () => [],
+	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	injectSystemPrompt: () => {},
+	chat() {
+		throw new Error("Attribution test must never call a model");
+	},
+	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
+	pushUserTurn: () => {},
+	pushAssistantTurn: () => {},
+	generate: async () => "",
+	generateWithMeta: async () => ({ text: "" }),
+	generateWithHistory: async () => "",
+};
+const unregisterProvider = registerExternalProviderResolver({
+	resolve: (name) => (name === "attrtest" ? provider : null),
+	listReadiness: () => [],
+});
+afterAll(() => unregisterProvider());
 
 const ids: string[] = [];
 afterEach(async () => {
-	clearManualOverrideRuntimes();
 	for (const id of ids) {
-		clearTakenOver(id);
+		getExecutionOwner(id)?.release();
+		activeNarrators.delete(id);
 		drainPendingInjections(id);
 	}
 	if (ids.length) {
-		// Foreground/announcement delivery now owns durable result snapshots too.
+		const { backgroundTasks } = await import("../../db/schema");
+		await db.delete(backgroundTasks).where(inArray(backgroundTasks.id, ids));
 		await db.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.narratorId, ids));
 		await db.delete(narratorMessages).where(inArray(narratorMessages.narratorId, ids));
 		await db.delete(narrators).where(inArray(narrators.id, ids));
@@ -25,7 +51,7 @@ afterEach(async () => {
 	ids.length = 0;
 });
 
-async function fixture() {
+async function fixture(principal: string | null) {
 	const parentId = generateId();
 	const childId = generateId();
 	ids.push(childId, parentId);
@@ -38,159 +64,92 @@ async function fixture() {
 			type: "subagent",
 			parentNarratorId: parentId,
 			status: "idle",
-			model: "claude-sonnet-4-6",
+			model: "attrtest:model",
+			cwd: process.env.HOME,
+			autoContinuationOverride: "off",
 			createdAt: now,
 			updatedAt: now,
 		},
 	]);
-	return { parentId, childId };
+	// A detached run as Agent(background) registers it: task row + run relations.
+	const { backgroundTaskService } = await import("../background-task-service");
+	const task = await backgroundTaskService.createAgentTask({
+		id: childId,
+		subagentNarratorId: childId,
+		subagentType: "general",
+		binding: {
+			deliverTo: { narratorId: parentId, toolUseId: "origin-tool" },
+			principal: { userId: principal },
+		},
+	});
+	return { parentId, childId, runId: task.logicalRunId ?? undefined };
 }
 
-// Attribution contract on the modern runtime: executor returns finalUserId, and
-// durable task notices project that principal through the mailbox ledger.
-describe("background result user attribution", () => {
-	for (const finalUserId of ["B", null] as const) {
-		test(`executor finalUserId ${finalUserId} is projected onto the parent batch`, async () => {
-			const { parentId, childId } = await fixture();
-			const { recordTaskNoticeUser } = await import("../parent-injection-queue");
-			const { createMailboxStore } = await import("../agent-runtime/mailbox");
-			const execute = spyOn(executor, "executeSubagent").mockResolvedValue({
-				finalText: "final result",
-				finalUserId,
-				hasError: false,
-				allowInboxWake: true,
+describe("run result attribution", () => {
+	for (const principal of ["B", null] as const) {
+		test(`a detached run's notice is attributed to its principal (${principal})`, async () => {
+			const { parentId, childId, runId } = await fixture(principal);
+			const users: Array<string | null | undefined> = [];
+			const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async () => {
+				users.push(activeNarrators.get(childId)?._currentUserId);
+				return {
+					finalText: "final result",
+					hasError: false,
+					shouldUpdateTitle: false,
+					completedNaturally: true,
+					completedAssistantTurn: true,
+				};
 			});
 			try {
-				const result = await executeSubagentForTest({
+				const { startNarratorRun } = await import("../agent-runtime/run");
+				const handle = await startNarratorRun({
 					narratorId: childId,
-					parentNarratorId: parentId,
-					userId: "A",
+					locale: "en",
+					text: "finish",
+					resumeRunId: runId,
 				});
-				expect(result.finalUserId).toBe(finalUserId);
-				// Production finalize/announce write the durable attribution ledger.
-				recordTaskNoticeUser(childId, result.finalUserId);
-				const store = createMailboxStore(db);
-				const enqueued = store.enqueue({
-					kind: "task_notice",
-					noticeKind: "agent",
-					narratorId: parentId,
-					text: `[System] Background agent "${childId}" completed.`,
-					projectedByteSize: 128,
-					sourceKey: `test-notice:${childId}:attribution`,
-					metadata: {
-						producerKind: "agent",
-						taskId: childId,
-						logicalRunId: "run-attr",
-						eventKind: "completed",
-					},
-				});
-				expect(enqueued.status).toBe("accepted");
+				expect(handle.started).toBe(true);
+				await handle.terminal;
+				// The run executed as its own registered principal.
+				expect(users).toEqual([principal]);
+				// The notice reaches the destination's inbox once published.
+				const { runtimePublication } = await import("../agent-runtime/publication");
+				runtimePublication.flushRecipient(parentId);
 				const batch = await takePendingInjectionBatch(parentId);
-				expect(batch?.userId).toBe(finalUserId);
-				expect(batch?.entries).toHaveLength(1);
+				expect(batch?.entries.length).toBeGreaterThan(0);
+				expect(batch?.userId).toBe(principal);
 			} finally {
 				execute.mockRestore();
 			}
 		});
 	}
 
-	test("runner forwards the dispatch user into executeSubagent", async () => {
-		const { parentId, childId } = await fixture();
-		const execute = spyOn(executor, "executeSubagent").mockResolvedValue({
-			finalText: "ok",
-			finalUserId: "B",
-			hasError: false,
-			allowInboxWake: true,
+	test("an explicit principal of a new input wins over the registered one", async () => {
+		const { childId, runId } = await fixture("B");
+		const users: Array<string | null | undefined> = [];
+		const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async () => {
+			users.push(activeNarrators.get(childId)?._currentUserId);
+			return {
+				finalText: "ok",
+				hasError: false,
+				shouldUpdateTitle: false,
+				completedNaturally: true,
+				completedAssistantTurn: true,
+			};
 		});
 		try {
-			const run = startForegroundRun(
-				{
-					publicationRun: {
-						producerKind: "agent",
-						taskId: childId,
-						logicalRunId: "run-fwd",
-						recipientId: parentId,
-					},
-					subagentId: childId,
-					parentNarratorId: parentId,
-					toolUseId: "origin-tool",
-					subagentType: "general",
-					prompt: "finish",
-					userId: "A",
-					cwd: process.env.HOME as string,
-					model: "anthropic:claude-sonnet-4-6",
-					provider: "anthropic",
-					locale: "en",
-					signal: new AbortController().signal,
-					systemPrompt: "test",
-					initialHistory: [],
-					customDef: null,
-				},
-				undefined,
-			);
-			await run.terminal.catch(() => undefined);
-			expect(execute.mock.calls[0]?.[0].userId).toBe("A");
-			expect((await run.terminal.catch(() => null))?.finalUserId).toBe("B");
+			const { startNarratorRun } = await import("../agent-runtime/run");
+			const handle = await startNarratorRun({
+				narratorId: childId,
+				locale: "en",
+				text: "finish",
+				resumeRunId: runId,
+				principal: "A",
+			});
+			await handle.terminal;
+			expect(users).toEqual(["A"]);
 		} finally {
 			execute.mockRestore();
 		}
-	});
-});
-
-async function executeSubagentForTest(opts: {
-	narratorId: string;
-	parentNarratorId: string;
-	userId: string | null;
-}) {
-	const { executeSubagent } = await import("../subagent-executor");
-	return executeSubagent({
-		narratorId: opts.narratorId,
-		parentNarratorId: opts.parentNarratorId,
-		toolUseId: "origin-tool",
-		subagentType: "general",
-		prompt: "finish",
-		userId: opts.userId,
-		cwd: process.env.HOME as string,
-		model: "anthropic:claude-sonnet-4-6",
-		provider: "anthropic",
-		locale: "en",
-		signal: new AbortController().signal,
-		systemPrompt: "test",
-		initialHistory: [],
-		initialTrailingToolResults: [],
-	});
-}
-
-describe("continued subagent completion ownership", () => {
-	test("announceResumedBackgroundTask records the resuming user on the notice ledger", async () => {
-		const { parentId, childId } = await fixture();
-		const { announceResumedBackgroundTask } = await import("../subagent-runner");
-		await announceResumedBackgroundTask({
-			subagentId: childId,
-			parentNarratorId: parentId,
-			userId: "A",
-			status: "completed",
-			wakeParent: true,
-			locale: "en",
-		});
-		const { createMailboxStore } = await import("../agent-runtime/mailbox");
-		const store = createMailboxStore(db);
-		store.enqueue({
-			kind: "task_notice",
-			noticeKind: "agent",
-			narratorId: parentId,
-			text: "[System] pointer",
-			projectedByteSize: 64,
-			sourceKey: `test-notice:${childId}:announce`,
-			metadata: {
-				producerKind: "agent",
-				taskId: childId,
-				logicalRunId: "run-ann",
-				eventKind: "completed",
-			},
-		});
-		const batch = await takePendingInjectionBatch(parentId);
-		expect(batch?.userId).toBe("A");
-		expect(await takePendingInjectionBatch(parentId, "B")).toBeNull();
 	});
 });

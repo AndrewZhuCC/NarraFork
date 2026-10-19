@@ -107,6 +107,53 @@ function shell(script: string, env: Record<string, string> = {}, cwd?: string) {
 	);
 }
 
+// All kernel-policy commands below are strict shell functions: never call host sudo/sysctl/ulimit.
+const corePolicyStubs = `
+test_original_core_pattern='|/usr/lib/systemd/systemd-coredump %P %u'
+test_core_pattern="$test_original_core_pattern"
+test_core_soft=8192
+sysctl() {
+  if [[ "$#" == 2 && "$1" == -n && "$2" == kernel.core_pattern ]]; then
+    printf '%s\\n' "$test_core_pattern"
+  elif [[ "$#" == 3 && "$1" == -q && "$2" == -w && "$3" == kernel.core_pattern=core ]]; then
+    test_core_pattern=core
+    printf 'STUB set core_pattern=core\\n' >&2
+  elif [[ "$#" == 3 && "$1" == -q && "$2" == -w && "$3" == "kernel.core_pattern=$test_original_core_pattern" ]]; then
+    printf 'STUB restore core_pattern=%s\\n' "$test_original_core_pattern" >&2
+    if [[ "\${CORE_RESTORE_FAIL:-0}" == 1 ]]; then return 31; fi
+    test_core_pattern="$test_original_core_pattern"
+  else
+    printf 'Unexpected sysctl arguments\\n' >&2
+    return 99
+  fi
+}
+sudo() {
+  if [[ "$#" == 4 && "$1" == sysctl ]]; then
+    shift
+    sysctl "$@"
+  else
+    printf 'Unexpected sudo arguments\\n' >&2
+    return 98
+  fi
+}
+ulimit() {
+  if [[ "$#" == 3 && "$1" == -S && "$2" == -c && "$3" == 0 ]]; then
+    test_core_soft=0
+  elif [[ "$#" == 2 && "$1" == -S && "$2" == -c ]]; then
+    printf '%s\\n' "$test_core_soft"
+  else
+    printf 'Unexpected ulimit arguments\\n' >&2
+    return 97
+  fi
+}
+`;
+
+const hostedCorePolicyEnv = {
+	CI_TEST_RUNNER_ENVIRONMENT: "github-hosted",
+	RUNNER_OS: "Linux",
+	CORE_RESTORE_FAIL: "0",
+};
+
 describe("generic CI workflow", () => {
 	test("runs for every PR, main push and manual dispatch without paths or branch exclusions", () => {
 		expect(Object.keys(workflow.on).sort()).toEqual([
@@ -246,6 +293,41 @@ describe("generic CI workflow", () => {
 			expect(step["continue-on-error"]).toBeUndefined();
 	});
 
+	test("Linux executor Go tests install and verify real ripgrep before the unchanged full suite", () => {
+		const auxiliary = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/remote-executor.yml"), "utf8"),
+		) as Workflow;
+		const linux = auxiliary.jobs["executor-go"];
+		const install = linux.steps.find(
+			(value) => value.name === "Install Go test system dependencies",
+		);
+		const tests = linux.steps.find((value) => value.name === "Run Go tests");
+		if (!install || !tests) throw new Error("Missing Linux executor test preparation");
+		expect(linux["runs-on"]).toBe("ubuntu-latest");
+		expect(
+			install.run
+				?.trim()
+				.split("\n")
+				.map((line) => line.trim()),
+		).toEqual([
+			"sudo apt-get update",
+			"sudo apt-get install --yes ripgrep",
+			"command -v rg",
+			"rg --version",
+		]);
+		expect(linux.steps.indexOf(install)).toBeLessThan(linux.steps.indexOf(tests));
+		expect(tests.run?.trim()).toBe("go test ./...");
+		expect(linux["continue-on-error"]).toBeUndefined();
+		expect(linux.if).toBeUndefined();
+		for (const value of [install, tests]) {
+			expect(value.if).toBeUndefined();
+			expect(value["continue-on-error"]).toBeUndefined();
+		}
+		expect(
+			auxiliary.jobs["executor-native-files"].steps.some((value) => value.run?.includes("apt-get")),
+		).toBe(false);
+	});
+
 	test("executor dry-run uses the shared component pin instead of a fabricated CI version", () => {
 		const auxiliary = Bun.YAML.parse(
 			readFileSync(join(repository, ".github/workflows/remote-executor.yml"), "utf8"),
@@ -348,50 +430,70 @@ describe("generic CI workflow", () => {
 		}
 	});
 
-	test("requires executable Chrome and probes a real headless launch before tests", () => {
-		const locate = step("tests", (value) => !!value.run?.includes("command -v google-chrome"));
-		expect(locate.run).toContain('"$CHROME_PATH" --version');
-		for (const variable of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"]) {
-			expect(locate.run).toContain(`${variable}=%s`);
-		}
-		expect(locate.run).toContain('"$GITHUB_ENV"');
+	test("installs the exact official Chrome146 build and probes a real headless launch before tests", () => {
+		const install = step("tests", (value) => value.name === "Install and verify pinned Chrome");
+		for (const required of [
+			'from "@puppeteer/browsers"',
+			'const buildId = "146.0.7680.31"',
+			"browser: Browser.CHROME",
+			"process.env.RUNNER_TEMP",
+			'cacheDir: join(temp, "narrafork-ci-chrome")',
+			'baseUrl: "https://storage.googleapis.com/chrome-for-testing-public"',
+			'spawnSync(executablePath, ["--version"]',
+			"version.error || version.status !== 0",
+			"version.stdout.trim() !== expectedVersion",
+			"Google Chrome for Testing",
+			"process.env.GITHUB_ENV",
+		])
+			expect(install.run).toContain(required);
+		for (const variable of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"])
+			expect(install.run).toContain(`${variable}=\${executablePath}`);
+		expect(install.run?.indexOf("version.stdout.trim() !== expectedVersion")).toBeLessThan(
+			install.run?.indexOf("appendFileSync(environmentFile") ?? -1,
+		);
+		expect(install.run).not.toMatch(/command -v|latest|buildIdAlias|forceFallback|providers:/);
+		expect(install.if).toBeUndefined();
 		const probe = step("tests", (value) => !!value.run?.includes("puppeteer.launch"));
 		expect(probe.run).toContain("process.env.PUPPETEER_EXECUTABLE_PATH");
 		expect(probe.run).toContain('args: ["--no-sandbox", "--disable-setuid-sandbox"]');
+		expect(probe.run).toContain("146\\.0\\.7680\\.31");
+		for (const required of [
+			"Browser.getVersion",
+			"Tracing.getCategories",
+			"devtools.timeline",
+			"disabled-by-default-v8.gc",
+			"blink.user_timing",
+		])
+			expect(probe.run).toContain(required);
 		expect(probe.run).toContain("await page.goto(");
 		expect(probe.run).toContain("await browser.close()");
 		expect(probe.if).toBeUndefined();
 		const steps = job("tests").steps;
-		expect(steps.indexOf(locate)).toBeLessThan(steps.indexOf(probe));
+		expect(steps.indexOf(command("tests", "bun install --frozen-lockfile"))).toBeLessThan(
+			steps.indexOf(install),
+		);
+		expect(steps.indexOf(install)).toBeLessThan(steps.indexOf(probe));
 		expect(steps.indexOf(probe)).toBeLessThan(
 			steps.indexOf(command("tests", "bun test --isolate tests/preload-isolation.test.ts")),
 		);
 	});
 
-	test("fails Chrome preflight on missing binaries or a broken version command", () => {
-		const locate = step("tests", (value) => !!value.run?.includes("command -v google-chrome"));
+	test("a missing or failing pinned Chrome installer cannot export a browser environment", () => {
+		const install = step("tests", (value) => value.name === "Install and verify pinned Chrome");
 		const root = mkdtempSync(join(tmpdir(), "ci-chrome-guard-"));
 		roots.push(root);
 		const githubEnv = join(root, "github-env");
-		const missing = shell(locate.run ?? "", { PATH: root, GITHUB_ENV: githubEnv });
+		const missing = shell(install.run ?? "", { PATH: root, GITHUB_ENV: githubEnv });
 		expect(missing.error).toBeUndefined();
 		expect(missing.status).not.toBe(0);
-		const broken = shell(`google-chrome() { return 42; }\n${locate.run}`, {
+		expect(existsSync(githubEnv)).toBe(false);
+		const broken = shell(`bun() { return 42; }\n${install.run}`, {
 			PATH: root,
 			GITHUB_ENV: githubEnv,
 		});
 		expect(broken.error).toBeUndefined();
 		expect(broken.status).toBe(42);
-		const ready = shell(`google-chrome() { printf 'Chrome 123\\n'; }\n${locate.run}`, {
-			PATH: root,
-			GITHUB_ENV: githubEnv,
-		});
-		expect(ready.error).toBeUndefined();
-		expect(ready.status).toBe(0);
-		expect(readFileSync(githubEnv, "utf8").trim().split("\n")).toEqual([
-			"NF_TEST_CHROMIUM_PATH=google-chrome",
-			"PUPPETEER_EXECUTABLE_PATH=google-chrome",
-		]);
+		expect(existsSync(githubEnv)).toBe(false);
 	});
 
 	test("covers all four native shards without fail-fast or artifact name collisions", () => {
@@ -421,10 +523,9 @@ describe("generic CI workflow", () => {
 
 	test("runs isolated sharded full discovery after preload verification and always publishes JUnit", () => {
 		const isolation = command("tests", "bun test --isolate tests/preload-isolation.test.ts");
-		const run = command(
-			"tests",
-			`bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${expression("matrix.shard")}/4 --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings --reporter=junit --reporter-outfile=artifacts/ci-tests.xml`,
-		);
+		const run = step("tests", (value) => value.name === "Run repository tests");
+		expect(run.env).toEqual({ CI_TEST_RUNNER_ENVIRONMENT: expression("runner.environment") });
+		expect(job("tests")).not.toHaveProperty("container");
 		expect(isolation.if).toBeUndefined();
 		expect(run.if).toBeUndefined();
 		expect(job("tests").steps.indexOf(isolation)).toBeLessThan(job("tests").steps.indexOf(run));
@@ -445,10 +546,14 @@ describe("generic CI workflow", () => {
 		// Render Actions expressions first: a shell substitution error is not test failure evidence.
 		for (const shard of [1, 2, 3, 4]) {
 			const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), String(shard));
-			const failure = shell(`bun() { printf '%s\\n' "$@"; return 23; }\n${rendered}`);
+			const failure = shell(
+				`${corePolicyStubs}\nbun() { [[ "$test_core_pattern" == core && "$test_core_soft" == 0 ]] || return 94; printf '%s\\n' "$@"; return 23; }\n${rendered}`,
+				hostedCorePolicyEnv,
+			);
 			expect(failure.error).toBeUndefined();
 			expect(failure.status).toBe(23);
 			expect(failure.stdout.trim().split("\n")).toEqual([
+				"Native test crash policy: core_pattern=core core_soft=0",
 				"scripts/run-ci-tests.ts",
 				"--isolate",
 				"--only-failures",
@@ -459,14 +564,67 @@ describe("generic CI workflow", () => {
 				"--reporter=junit",
 				"--reporter-outfile=artifacts/ci-tests.xml",
 			]);
-			const success = shell(`bun() { return 0; }\n${rendered}`);
+			expect(failure.stderr).toContain(
+				"STUB restore core_pattern=|/usr/lib/systemd/systemd-coredump %P %u",
+			);
+			const success = shell(
+				`${corePolicyStubs}\nbun() { [[ "$test_core_pattern" == core && "$test_core_soft" == 0 ]]; }\n${rendered}`,
+				hostedCorePolicyEnv,
+			);
 			expect(success.error).toBeUndefined();
 			expect(success.status).toBe(0);
+			expect(success.stderr).toContain(
+				"STUB restore core_pattern=|/usr/lib/systemd/systemd-coredump %P %u",
+			);
 		}
 		for (const value of job("tests").steps) {
 			expect(value.run ?? "").not.toMatch(
 				/PG_INTEGRATION|--retr(?:y|ies)|--bail|--path-ignore-patterns|--parallel(?![=]2(?:\s|$))|--concurrent|--no-isolate|--timeout|--(?:exclude|filter|test-name-pattern|rerun-each)/,
 			);
+		}
+	});
+
+	test("rejects non-hosted or non-Linux core policy before touching even the stubs", () => {
+		const run = step("tests", (value) => value.name === "Run repository tests");
+		const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), "1");
+		for (const env of [
+			{ ...hostedCorePolicyEnv, CI_TEST_RUNNER_ENVIRONMENT: "self-hosted" },
+			{ ...hostedCorePolicyEnv, RUNNER_OS: "Windows" },
+		]) {
+			const result = shell(`${corePolicyStubs}\nbun() { return 94; }\n${rendered}`, env);
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe(1);
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toContain("Core policy requires a GitHub-hosted Linux VM");
+			expect(result.stderr).not.toContain("STUB");
+		}
+	});
+
+	test("core restoration failure cannot hide a native test failure or turn success green", () => {
+		const run = step("tests", (value) => value.name === "Run repository tests");
+		const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), "1");
+		for (const testExit of [0, 23]) {
+			const result = shell(
+				`${corePolicyStubs}\nbun() { [[ "$test_core_pattern" == core && "$test_core_soft" == 0 ]] || return 94; return ${testExit}; }\n${rendered}`,
+				{ ...hostedCorePolicyEnv, CORE_RESTORE_FAIL: "1" },
+			);
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe(testExit || 1);
+			expect(result.stderr).toContain(
+				"STUB restore core_pattern=|/usr/lib/systemd/systemd-coredump %P %u",
+			);
+			expect(result.stderr).toContain("Failed to restore runner core_pattern");
+		}
+		// Unknown options must fail inside the stubs, never fall through to host commands.
+		for (const [script, status] of [
+			["sysctl -w kernel.core_pattern=unknown", 99],
+			["sudo echo unknown", 98],
+			["ulimit -c unlimited", 97],
+		] as const) {
+			const result = shell(`${corePolicyStubs}\n${script}`, hostedCorePolicyEnv);
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe(status);
+			expect(result.stderr).toContain("Unexpected");
 		}
 	});
 

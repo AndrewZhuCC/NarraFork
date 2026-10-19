@@ -13,20 +13,24 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
-const takeover = { ...(await import("../subagent-takeover")) };
-const taken = new Set<string>();
-mock.module("../subagent-takeover", () => ({
-	...takeover,
-	isTakenOver: (id: string) => taken.has(id),
-}));
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
-const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
-const { getForegroundAbortControllers } = await import("../subagent-detach");
+const { getExecutionOwner, setRunHold, tryClaimExecution } = await import(
+	"../agent-runtime/ownership"
+);
+const { activeNarrators } = await import("../narrator-session-state");
 const { registerAgentReplyWait, clearPendingAgentReplyWaits, getPendingAgentReplyCount } =
 	await import("../agent-reply-waiter");
 const { sendTool } = await import("../../lib/agent/tools/send");
 const store = createMailboxStore(db);
+/** A turn in flight: the session's live abort controller (the same for every session). */
+function liveTurn(narratorId: string, controller: AbortController) {
+	activeNarrators.set(narratorId, {
+		narratorId,
+		alive: true,
+		abortController: controller,
+	} as unknown as import("../narrator-session-state").ActiveNarrator);
+}
 const ids = [
 	"parent-root",
 	"sender-child",
@@ -39,9 +43,11 @@ const time = "2026-09-09T00:00:00.000Z";
 let serial = 0;
 beforeEach(() => {
 	clearPendingAgentReplyWaits();
-	taken.clear();
-	for (const id of ids) getExecutionOwner(id)?.release();
-	getForegroundAbortControllers().clear();
+	for (const id of ids) {
+		setRunHold(id, undefined);
+		getExecutionOwner(id)?.release();
+		activeNarrators.delete(id);
+	}
 	cleanDb(sqlite);
 	for (const id of ids) {
 		const primary = id.endsWith("root");
@@ -60,12 +66,15 @@ beforeEach(() => {
 			})
 			.run();
 	}
-	tryClaimExecution("parent-root", "primary");
+	tryClaimExecution("parent-root", "run");
 });
 afterAll(() => {
 	clearPendingAgentReplyWaits();
-	for (const id of ids) getExecutionOwner(id)?.release();
-	getForegroundAbortControllers().clear();
+	for (const id of ids) {
+		setRunHold(id, undefined);
+		getExecutionOwner(id)?.release();
+		activeNarrators.delete(id);
+	}
 	sqlite.close();
 });
 function input(
@@ -201,7 +210,7 @@ test("full parent queue does not prevent sibling delivery and no old entry is ev
 test("a taken-over target still receives the message, alongside parent and later sibling", async () => {
 	// Rejecting a Send to a taken-over subagent silently dropped the instruction:
 	// nothing was queued. It must be delivered like to any running subagent.
-	taken.add("sibling-a");
+	setRunHold("sibling-a", { released: false });
 	const result = await sendSubagentMessageDetailed(
 		input("sender-child", ["sibling-a", "parent", "sibling-b"]),
 	);
@@ -212,10 +221,10 @@ test("a taken-over target still receives the message, alongside parent and later
 });
 
 test("doInterrupt is ignored for a taken-over child: queued, user's turn untouched", async () => {
-	taken.add("sibling-a");
+	setRunHold("sibling-a", { released: false });
 	const turn = new AbortController();
-	getForegroundAbortControllers().set("sibling-a", turn);
-	tryClaimExecution("sibling-a", "subagent");
+	liveTurn("sibling-a", turn);
+	tryClaimExecution("sibling-a", "run");
 	const request = input("parent-root", ["sibling-a"]);
 	const result = await sendSubagentMessageDetailed({ ...request, doInterrupt: true });
 	expect(result.targets.map((target) => target.status)).toEqual(["queued"]);
@@ -331,12 +340,12 @@ test("same attempt fanout retry reuses each delivery and never re-interrupts chi
 	);
 	expect(rows()).toHaveLength(2);
 	const controller = new AbortController();
-	getForegroundAbortControllers().set("sibling-b", controller);
+	liveTurn("sibling-b", controller);
 	const primary = { ...input("parent-root", ["sibling-b"]), doInterrupt: true };
 	await sendSubagentMessageDetailed(primary);
 	expect(controller.signal.aborted).toBe(true);
 	const replacement = new AbortController();
-	getForegroundAbortControllers().set("sibling-b", replacement);
+	liveTurn("sibling-b", replacement);
 	await sendSubagentMessageDetailed(primary);
 	expect(replacement.signal.aborted).toBe(false);
 });

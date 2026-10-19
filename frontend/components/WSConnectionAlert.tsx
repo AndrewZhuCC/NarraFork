@@ -55,8 +55,10 @@ export function WSConnectionAlert() {
 			style={{
 				position: "fixed",
 				...TOP_BANNER_SAFE_AREA_STYLE,
-				left: "50%",
-				transform: "translateX(-50%)",
+				// Centred with auto margins, not a transform — see VersionUpdateBanner.
+				left: 0,
+				right: 0,
+				marginInline: "auto",
 				zIndex: Z.toast,
 				maxWidth: 500,
 				width: "calc(100% - 32px)",

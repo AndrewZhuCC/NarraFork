@@ -9,8 +9,8 @@
  * `runAtomicWrite` per operation; on PostgreSQL each of those same operations is a
  * NAMED composite here, executed as ONE `withPgRetry` whole-section transaction:
  *
- *   - `startAgentRun`      — logical run + slot reservation + `source_after` result
- *                            boundary + `background_tasks.logical_run_id` link.
+ *   - `startRun`           — logical run + registration (+ slots, `source_after` result
+ *                            boundary, task row) for a run with a destination.
  *   - `startBashRun`       — new Bash run identity + slot reservation.
  *   - `persistResult`      — the per-run result snapshot message + ref (agent kind).
  *   - `commit`             — a single publication intent.
@@ -69,12 +69,19 @@ import {
 	narratorBufferedMessages as mailbox,
 	narratorMessages as messages,
 	narrators,
+	narratorToolCalls,
 	runtimePublicationOutbox as outbox,
 	narratorMessageRefs as refs,
 } from "../../db/postgres-schema";
 import { ValidationError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import { policySourceIdOf, registrationBeforeRun } from "../../lib/runtime-source";
+import {
+	type RunBindingInput,
+	type RuntimeRunBinding,
+	registerRun,
+} from "../../lib/validators/runtime-registration";
 import type { RefMessageInput } from "../narrator-refs/port";
 import {
 	lockPgNarratorRefs,
@@ -83,6 +90,7 @@ import {
 	persistPgMessageWithRef,
 } from "../narrator-refs/postgres-store";
 import { MAILBOX_LIMITS as L } from "./limits";
+import type { PublicationTerminalCommit, StartedRun, StartRunInput } from "./publication";
 import {
 	type LegacyCompletionAdmission,
 	type LegacyCompletionRegistration,
@@ -242,6 +250,7 @@ export interface PgTerminalCommitInput {
 	readonly text: string;
 	readonly summary: string;
 	readonly delivery?: "background" | "foreground";
+	readonly toolConclusion?: PublicationTerminalCommit["toolConclusion"];
 }
 
 export interface PgLegacyTaskNoticeInput {
@@ -476,6 +485,7 @@ export function createPostgresRuntimePublication(
 		tx: PgRuntimeTx,
 		run: PublicationRun,
 		text: string,
+		eventKind?: Exclude<PublicationEvent, "started">,
 	): Promise<{ resultRef: string; needsSeqFloorMark: boolean }> {
 		// Bash has one durable task per actual attempt; its output is already normalized
 		// to the existing 512 KiB budget. Never copy raw stdout into a message row.
@@ -548,6 +558,7 @@ export function createPostgresRuntimePublication(
 					type: "text",
 					text: storedText,
 					publicationResult: {
+						...(eventKind ? { eventKind } : {}),
 						logicalRunId: run.logicalRunId,
 						truncated,
 						originalBytes,
@@ -643,11 +654,9 @@ export function createPostgresRuntimePublication(
 				),
 			)
 			.limit(1);
-		if (
-			(intent && intent.state !== "reserved" && intent.eventKind !== "terminal") ||
-			deliveries[0] ||
-			consumed[0]
-		) {
+		const terminalIntent =
+			!!intent && intent.state !== "reserved" && intent.eventKind !== "terminal";
+		if (terminalIntent || deliveries[0] || consumed[0]) {
 			const receipt = await db
 				.select({
 					json: sql<
@@ -663,8 +672,18 @@ export function createPostgresRuntimePublication(
 					),
 				)
 				.limit(1);
-			const result = decodeAgentTerminalSnapshot(receipt[0]?.json ?? null, run.logicalRunId);
-			if (result) return result;
+			const result = decodeAgentTerminalSnapshot(
+				receipt[0]?.json ?? null,
+				run.logicalRunId,
+				readOptions.includeEventKind,
+			);
+			if (result)
+				return readOptions.includeEventKind && terminalIntent
+					? {
+							...result,
+							eventKind: intent.eventKind as NonNullable<AgentTerminalResult["eventKind"]>,
+						}
+					: result;
 			const exactSource = agentSourceResultRef(consumed[0]?.sourceResultRef);
 			return exactSource ? readAssistantSource(run, exactSource.slice(8)) : null;
 		}
@@ -713,25 +732,17 @@ export function createPostgresRuntimePublication(
 	return {
 		readAgentTerminalResult,
 		/**
-		 * Agent start admission: logical run, slot reservation, the `source_after`
-		 * result boundary and the task-row link commit in ONE section.
-		 *
-		 * When `taskRow` is supplied, the `background_tasks` INSERT (new task
-		 * projection) is included in the same section — the same atomicity the
-		 * SQLite producer has (reserve + task row in one transaction). The
+		 * Run registration: logical run and relationship facts, plus (for a run with a
+		 * destination) slot reservation, the `source_after` result boundary and the
+		 * task-row projection, in ONE section, exactly like the SQLite producer. The
 		 * (tool_call_id, execution_attempt) unique index guards against a second
 		 * process for the same actual attempt.
 		 */
-		async startAgentRun(input: {
-			narratorId: string;
-			parentNarratorId: string;
-			resumeRunId?: string;
-			started?: boolean;
-			taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
-		}): Promise<PublicationRun> {
-			return runComposite("publication.startAgentRun", async (tx) => {
+		async startRun(input: StartRunInput): Promise<StartedRun> {
+			return runComposite("publication.startRun", async (tx) => {
+				const recipientId = input.binding.deliverTo?.narratorId;
 				let resumeRunId = input.resumeRunId;
-				if (input.taskRow && resumeRunId === undefined) {
+				if (input.taskRow && recipientId && resumeRunId === undefined) {
 					// Actor first: serialize with explicit run starts before adopting its identity.
 					// Do not use getAgentRun here: a missing id is a new start, not legacy admission.
 					await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
@@ -747,7 +758,7 @@ export function createPostgresRuntimePublication(
 						await tx
 							.select({ id: narrators.id })
 							.from(narrators)
-							.where(eq(narrators.id, input.parentNarratorId))
+							.where(eq(narrators.id, recipientId))
 							.for("update");
 						const reservation = await tx
 							.select({ id: outbox.id })
@@ -757,7 +768,7 @@ export function createPostgresRuntimePublication(
 									eq(outbox.producerKind, "agent"),
 									eq(outbox.taskId, input.narratorId),
 									eq(outbox.logicalRunId, currentRunId),
-									eq(outbox.recipientId, input.parentNarratorId),
+									eq(outbox.recipientId, recipientId),
 									eq(outbox.eventKind, "terminal"),
 									eq(outbox.state, "reserved"),
 								),
@@ -771,7 +782,7 @@ export function createPostgresRuntimePublication(
 									eq(consumptions.producerKind, "agent"),
 									eq(consumptions.taskId, input.narratorId),
 									eq(consumptions.logicalRunId, currentRunId),
-									eq(consumptions.recipientId, input.parentNarratorId),
+									eq(consumptions.recipientId, recipientId),
 								),
 							)
 							.limit(1);
@@ -781,17 +792,44 @@ export function createPostgresRuntimePublication(
 				const logicalRunId = await primitives.persistLogicalRun(tx, input.narratorId, {
 					...(resumeRunId === undefined ? {} : { resumeRunId }),
 				});
-				const run: PublicationRun = {
-					producerKind: "agent",
-					taskId: input.narratorId,
+				const publication: PublicationRun | undefined = recipientId
+					? { producerKind: "agent", taskId: input.narratorId, logicalRunId, recipientId }
+					: undefined;
+				if (publication) {
+					const reservation = await primitives.reserveRunSlots(tx, publication, {
+						started: input.started,
+					});
+					if (reservation.status === "full") throw capacityError();
+				}
+				const topSeq = (await readTopRefSeqPg(tx, input.narratorId)) ?? PG_REF_SEQ_EMPTY_TOP;
+				// The run's relationships commit with its id (same rule as SQLite).
+				const [source] = await tx
+					.select({
+						policySourceNarratorId: narrators.policySourceNarratorId,
+						runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+						type: narrators.type,
+						variant: narrators.variant,
+						parentNarratorId: narrators.parentNarratorId,
+						subagentType: narrators.subagentType,
+					})
+					.from(narrators)
+					.where(eq(narrators.id, input.narratorId))
+					.limit(1);
+				const registration = registerRun(
+					source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
 					logicalRunId,
-					recipientId: input.parentNarratorId,
-				};
-				const reservation = await primitives.reserveRunSlots(tx, run, {
-					started: input.started,
-				});
-				if (reservation.status === "full") throw capacityError();
-				if (!resumeRunId) {
+					input.binding,
+					topSeq + 1,
+				);
+				await tx
+					.update(narrators)
+					.set({
+						runtimeRegistrationJson: registration,
+						// Same rule as SQLite: a registration ends the legacy inference.
+						policySourceNarratorId: source ? policySourceIdOf(source) : null,
+					})
+					.where(eq(narrators.id, input.narratorId));
+				if (publication && !resumeRunId) {
 					// A stable ref boundary, not millisecond timestamps: two runs may start in
 					// the same ms. An empty narrator's watermark is the EMPTY_TOP sentinel
 					// (= base 0 minus one), NOT 0 — the first ref of an empty narrator claims
@@ -799,16 +837,16 @@ export function createPostgresRuntimePublication(
 					await tx
 						.update(outbox)
 						.set({
-							resultRef: `source_after:${(await readTopRefSeqPg(tx, input.narratorId)) ?? PG_REF_SEQ_EMPTY_TOP}`,
+							resultRef: `source_after:${topSeq}`,
 						})
 						.where(
 							and(
-								eq(outbox.dedupeKey, publicationDedupeKey(run, "terminal")),
+								eq(outbox.dedupeKey, publicationDedupeKey(publication, "terminal")),
 								eq(outbox.state, "reserved"),
 							),
 						);
 				}
-				if (input.taskRow) {
+				if (publication && input.taskRow) {
 					const inserted = await tx
 						.insert(backgroundTasks)
 						.values({ ...input.taskRow, logicalRunId })
@@ -821,11 +859,14 @@ export function createPostgresRuntimePublication(
 							"Background agent task already exists for this execution attempt",
 						);
 				}
+				// Same rule as SQLite: only a live projection follows the run here.
 				await tx
 					.update(backgroundTasks)
 					.set({ logicalRunId })
-					.where(eq(backgroundTasks.id, input.narratorId));
-				return run;
+					.where(
+						and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")),
+					);
+				return { binding: registration.run, ...(publication ? { publication } : {}) };
 			});
 		},
 
@@ -937,6 +978,32 @@ export function createPostgresRuntimePublication(
 			const composite = await runComposite("publication.commitAgentTerminal", async (tx) => {
 				// Narrators precede outbox/mailbox locks, in the same order as refs append.
 				await lockPgNarratorRefs(tx, [input.run.taskId, input.run.recipientId]);
+				if (input.toolConclusion) {
+					const conclusion = input.toolConclusion;
+					const updated = await tx
+						.update(narratorToolCalls)
+						.set({
+							outputJson: conclusion.output,
+							outputChars: conclusion.output.length,
+							status: conclusion.status,
+							resultMessageId: conclusion.resultMessageId,
+							errorMessage: conclusion.status === "fail" ? input.text : null,
+							completedAt: new Date().toISOString(),
+						})
+						.where(
+							and(
+								eq(narratorToolCalls.id, conclusion.toolCallId),
+								eq(narratorToolCalls.narratorId, input.run.recipientId),
+								eq(narratorToolCalls.messageId, conclusion.messageId),
+								eq(narratorToolCalls.toolUseId, conclusion.toolUseId),
+								conclusion.attempt === undefined
+									? undefined
+									: eq(narratorToolCalls.executionAttempt, conclusion.attempt),
+							),
+						)
+						.returning({ id: narratorToolCalls.id });
+					if (updated.length !== 1) throw new Error("Detached terminal tool conclusion is stale");
+				}
 				const existing =
 					input.delivery === "foreground"
 						? await tx
@@ -945,7 +1012,7 @@ export function createPostgresRuntimePublication(
 								.where(eq(messages.id, `publication-result:${input.run.logicalRunId}`))
 								.limit(1)
 						: [];
-				const section = await persistResultSection(tx, input.run, input.text);
+				const section = await persistResultSection(tx, input.run, input.text, input.eventKind);
 				if (input.delivery === "foreground") {
 					await primitives.consumeAwaitedTerminal(tx, input.run);
 					return {
@@ -974,7 +1041,7 @@ export function createPostgresRuntimePublication(
 			if (input.run.producerKind !== "bash")
 				throw new Error("Bash terminal commit requires a bash run");
 			return runComposite("publication.commitBashTerminal", async (tx) => {
-				const section = await persistResultSection(tx, input.run, input.text);
+				const section = await persistResultSection(tx, input.run, input.text, input.eventKind);
 				return primitives.commitIntent(tx, {
 					...input.run,
 					eventKind: input.eventKind,

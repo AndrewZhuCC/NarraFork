@@ -188,6 +188,9 @@ export const ARCHIVE_COLUMNS: Readonly<Record<ArchiveTable, readonly string[]>> 
 		"context_char_revision",
 		"updated_at",
 		"context_project_id",
+		// Strict portable projection only: controller/model pool/history, never live run facts.
+		"runtime_registration_json",
+		"policy_source_narrator_id",
 	],
 	narrator_messages: [
 		"id",
@@ -315,6 +318,7 @@ export const ARCHIVE_INTERNAL_REFERENCES: Partial<
 	narrators: {
 		chapter_id: "chapters",
 		parent_narrator_id: "narrators",
+		policy_source_narrator_id: "narrators",
 		fork_message_id: "narrator_messages",
 		context_project_id: "projects",
 	},

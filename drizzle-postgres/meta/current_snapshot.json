@@ -1,6 +1,6 @@
 {
-  "id": "8e4fd5fe-34f0-4d71-bec4-c08097a2cd15",
-  "prevId": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
+  "id": "db929d4c-7564-4214-8c8a-56f3465636eb",
+  "prevId": "c7aa010f-c918-4c1f-bd1f-9fd0548f3fe8",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -15185,6 +15185,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "runtime_registration_json": {
+          "name": "runtime_registration_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "policy_source_narrator_id": {
+          "name": "policy_source_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -15338,6 +15350,21 @@
           "columns": [
             {
               "expression": "acl_root_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_policy_source": {
+          "name": "idx_narrators_policy_source",
+          "columns": [
+            {
+              "expression": "policy_source_narrator_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -15627,6 +15654,19 @@
           "tableTo": "narrators",
           "columnsFrom": [
             "acl_root_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrators_policy_source_narrator_id_narrators_id_fk": {
+          "name": "narrators_policy_source_narrator_id_narrators_id_fk",
+          "tableFrom": "narrators",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "policy_source_narrator_id"
           ],
           "columnsTo": [
             "id"

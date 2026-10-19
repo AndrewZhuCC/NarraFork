@@ -37,7 +37,7 @@ export {
 } from "./prompts/setup-assistant";
 export type { BuiltinSubagentType, SubagentType } from "./prompts/subagents";
 export {
-	getSubagentParentReportingHint,
+	getRunDeliveryHint,
 	getSubagentPrompt,
 } from "./prompts/subagents";
 export {
