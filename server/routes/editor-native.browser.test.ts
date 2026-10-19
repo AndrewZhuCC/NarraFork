@@ -150,7 +150,11 @@ test.each([
 				? new EditorRemoteOperationStore(
 						join(root, "host-native-receipts"),
 						EDITOR_OPERATION_STORE_LIMITS,
-						{ root: getNarraforkHome(), stateDir: join(getNarraforkHome(), "editor-native") },
+						{
+							root: getNarraforkHome(),
+							stateDir: join(getNarraforkHome(), "editor-native"),
+							resolveHelper: fixture.resolveHelper,
+						},
 					)
 				: undefined;
 		const app = new Hono();
@@ -369,6 +373,20 @@ test.each([
 		});
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.edit("Z"));
 		const saved = await page.evaluate(() => (window as unknown as RawWindow).rawFixture.saveRaw());
+		if (saved.session?.phase !== "idle" || saved.dirty) {
+			console.error(
+				"EDITOR_NATIVE_SAVE_FAILURE",
+				JSON.stringify({
+					device,
+					dirty: saved.dirty,
+					phase: saved.session?.phase,
+					error: saved.session?.error?.slice(0, 512),
+					receiptError: saved.session?.receiptError?.slice(0, 512),
+					applies: fixture.applies,
+					childLogs: fixture.logs,
+				}),
+			);
+		}
 		expect(saved.session?.phase).toBe("idle");
 		expect(saved.dirty).toBe(false);
 		const expected = Buffer.concat([Buffer.from("Z"), original]);

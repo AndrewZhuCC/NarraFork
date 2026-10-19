@@ -24,6 +24,7 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 		`../../.narrafork/editor-phase8-executor${process.platform === "win32" ? ".exe" : ""}`,
 	);
 	const binary = await readFile(binaryPath);
+	const binarySha256 = createHash("sha256").update(binary).digest("hex");
 	const platform =
 		`${process.platform === "win32" ? "windows" : process.platform}-${process.arch === "x64" ? "amd64" : process.arch}` as "linux-amd64";
 	const manifest = buildExecutorManifest({
@@ -212,7 +213,19 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 		deviceId,
 		distributionUrl: `http://127.0.0.1:${server.port}`,
 		start,
-		binarySha256: createHash("sha256").update(binary).digest("hex"),
+		binarySha256,
+		// Native Host receipt metadata must use this same controlled binary, not a
+		// public Release download that may not contain this branch's editor features.
+		async resolveHelper(signal: AbortSignal) {
+			signal.throwIfAborted();
+			return {
+				path: binaryPath,
+				filename: "controlled-native-editor-fixture",
+				version: BUILD_EXECUTOR_DISTRIBUTION.version,
+				size: binary.length,
+				sha256: binarySha256,
+			};
+		},
 		get applies() {
 			return applies;
 		},

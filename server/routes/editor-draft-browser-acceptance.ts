@@ -1,7 +1,7 @@
 import { expect } from "bun:test";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Page } from "puppeteer-core";
+import type { CDPSession, Page } from "puppeteer-core";
 import type {} from "../../scripts/smoke-editor-cache-fixture";
 
 export async function editorDraftBrowserAcceptance(
@@ -110,7 +110,127 @@ export async function editorDraftBrowserAcceptance(
 	);
 	// Crash the fixture renderer, NOT the host/agent server. No unload checkpoint is assumed.
 	const session = await page.createCDPSession();
+	let browserSession: CDPSession | undefined;
+	let browserAttachExpired = false;
+	let browserAttachTimer: ReturnType<typeof setTimeout> | undefined;
+	const browserProcess = page.browser().process();
 	const crashStarted = performance.now();
+	// Temporary bounded evidence for the CI-only missing crash event; never a success signal.
+	const environment = {
+		bun: process.versions.bun,
+		platform: process.platform,
+		browserPid: browserProcess?.pid,
+		disableBreakpad: browserProcess?.spawnargs.includes("--disable-breakpad"),
+		disableCrashReporter: browserProcess?.spawnargs.includes("--disable-crash-reporter"),
+		target: {} as object,
+		coreLimit: "unavailable",
+		corePattern: "unavailable",
+		samples: [] as object[],
+		stderrBytes: 0,
+		crashStderr: "",
+		errors: [] as { stage: string; name: string }[],
+	};
+	const noteDiagnosticError = (stage: string, error: unknown) => {
+		if (environment.errors.length < 8)
+			environment.errors.push({ stage, name: error instanceof Error ? error.name : "unknown" });
+	};
+	const diagnostic = async <T>(stage: string, work: () => Promise<T>): Promise<T | undefined> => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				work(),
+				new Promise<undefined>((resolve) => {
+					timer = setTimeout(() => {
+						noteDiagnosticError(`${stage}.timeout`, new Error("Diagnostic read timed out"));
+						resolve(undefined);
+					}, 250);
+				}),
+			]);
+		} catch (error) {
+			noteDiagnosticError(stage, error);
+			return undefined;
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+	const detachBrowserSession = async (attached: CDPSession) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				attached.detach(),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(new Error("Diagnostic detach timed out")), 250);
+				}),
+			]);
+		} catch (error) {
+			noteDiagnosticError("browser.detach", error);
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+	let rendererProcesses: { id: number; cpuTime: number }[] = [];
+	const sampleProcesses = async (stage: string) => {
+		if (process.platform !== "linux" || !browserSession) return;
+		try {
+			if (stage === "before-send") {
+				const { processInfo } = await browserSession.send("SystemInfo.getProcessInfo", undefined, {
+					timeout: 250,
+				});
+				rendererProcesses = processInfo.filter((info) => info.type === "renderer").slice(0, 8);
+			}
+			// Later proc reads must not depend on the browser's DevTools queue staying responsive.
+			const renderers = await diagnostic(`proc.${stage}`, () =>
+				Promise.all(
+					rendererProcesses.map(async (info) => {
+						try {
+							const status = await Bun.file(`/proc/${info.id}/status`).slice(0, 4096).text();
+							return {
+								pid: info.id,
+								cpuSecondsAtSetup: info.cpuTime,
+								status: status
+									.split("\n")
+									.filter((line) => /^(State|CoreDumping|TracerPid|VmRSS|Threads):/.test(line)),
+							};
+						} catch (error) {
+							return {
+								pid: info.id,
+								readError:
+									error instanceof Error && "code" in error ? String(error.code) : "unknown",
+							};
+						}
+					}),
+				),
+			);
+			if (renderers)
+				environment.samples.push({
+					stage,
+					ms: Math.round(performance.now() - crashStarted),
+					renderers,
+				});
+		} catch (error) {
+			noteDiagnosticError(stage, error);
+		}
+	};
+	const onBrowserStderr = (chunk: Buffer | string) => {
+		environment.stderrBytes += Buffer.byteLength(chunk);
+		const remaining = 2048 - Buffer.byteLength(environment.crashStderr);
+		if (remaining <= 0) return;
+		const text =
+			typeof chunk === "string" ? chunk.slice(0, 4096) : chunk.subarray(0, 4096).toString();
+		const summary = text
+			.split("\n")
+			.filter((line) =>
+				/NOTREACHED|Check failed|FATAL|Received signal|crashpad.*(?:error|failed)/i.test(line),
+			)
+			.map((line) =>
+				line.replace(/(?:https?|file):\/\/\S+/g, "[url]").replace(/[^\x20-\x7e]/g, "?"),
+			)
+			.join("\n");
+		environment.crashStderr += summary.slice(0, remaining);
+	};
+	browserProcess?.stderr?.on("data", onBrowserStderr);
+	const diagnosticTimers: ReturnType<typeof setTimeout>[] = [];
+	const diagnosticReads: Promise<void>[] = [];
 	const crashDiagnostics: { event: string; ms: number; error?: string }[] = [];
 	const recordCrash = (event: string, error?: unknown) => {
 		if (crashDiagnostics.length < 10)
@@ -135,12 +255,84 @@ export async function editorDraftBrowserAcceptance(
 	session.on("Inspector.targetCrashed", onTargetCrashed);
 	page.on("error", onPageError);
 	let crashTimeout: ReturnType<typeof setTimeout> | undefined;
+	for (const ms of [1000, 4900])
+		diagnosticTimers.push(
+			setTimeout(
+				() => {
+					diagnosticReads.push(sampleProcesses(`${ms}ms`));
+				},
+				Math.max(0, ms - (performance.now() - crashStarted)),
+			),
+		);
 	try {
 		await Promise.race([
 			new Promise<never>((_, reject) => {
-				crashTimeout = setTimeout(() => reject(new Error("Renderer did not crash")), 5000);
+				crashTimeout = setTimeout(
+					() => reject(new Error("Renderer did not crash")),
+					Math.max(0, 5000 - (performance.now() - crashStarted)),
+				);
 			}),
 			(async () => {
+				try {
+					await Promise.race([
+						page
+							.browser()
+							.target()
+							.createCDPSession()
+							.then(
+								async (attached) => {
+									if (browserAttachExpired || !observing) await detachBrowserSession(attached);
+									else browserSession = attached;
+								},
+								(error) => noteDiagnosticError("browser.attach", error),
+							),
+						new Promise<void>((resolve) => {
+							browserAttachTimer = setTimeout(() => {
+								browserAttachExpired = true;
+								noteDiagnosticError(
+									"browser.attach-timeout",
+									new Error("Diagnostic attach timed out"),
+								);
+								resolve();
+							}, 250);
+						}),
+					]);
+				} catch (error) {
+					noteDiagnosticError("browser.attach", error);
+				} finally {
+					clearTimeout(browserAttachTimer);
+				}
+				await session
+					.send("Target.getTargetInfo", undefined, { timeout: 250 })
+					.then(({ targetInfo }) => {
+						const contextId = page.browserContext().id;
+						environment.target = {
+							id: targetInfo.targetId,
+							type: targetInfo.type,
+							matchesPageUrl: targetInfo.url === page.url(),
+							contextIdComparable: contextId !== undefined,
+							...(contextId === undefined
+								? {}
+								: { matchesContext: targetInfo.browserContextId === contextId }),
+						};
+					})
+					.catch((error) => noteDiagnosticError("target", error));
+				if (process.platform === "linux") {
+					const core = await diagnostic("core-config", () =>
+						Promise.all([
+							Bun.file("/proc/self/limits").slice(0, 4096).text(),
+							Bun.file("/proc/sys/kernel/core_pattern").slice(0, 256).text(),
+						]),
+					);
+					if (core) {
+						environment.coreLimit =
+							core[0].split("\n").find((line) => line.startsWith("Max core file size")) ??
+							"missing";
+						environment.corePattern = core[1].trim();
+					}
+				}
+				await sampleProcesses("before-send");
+				if (!observing) return await crashed;
 				// Preparation and injection share the original five-second observation window.
 				await session.send("Inspector.enable");
 				recordCrash("Inspector.enabled");
@@ -159,11 +351,18 @@ export async function editorDraftBrowserAcceptance(
 		});
 	} finally {
 		observing = false;
+		browserAttachExpired = true;
 		clearTimeout(crashTimeout);
+		clearTimeout(browserAttachTimer);
+		for (const timer of diagnosticTimers) clearTimeout(timer);
 		session.off("Inspector.targetCrashed", onTargetCrashed);
 		page.off("error", onPageError);
+		browserProcess?.stderr?.off("data", onBrowserStderr);
 		await session.detach().catch((error) => recordCrash("session.detach.rejected", error));
+		if (browserSession) await detachBrowserSession(browserSession);
+		await diagnostic("cleanup", () => Promise.allSettled(diagnosticReads));
 		console.info("[editor-renderer-crash]", JSON.stringify(crashDiagnostics));
+		console.info("[editor-renderer-environment]", JSON.stringify(environment));
 	}
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await ready();
