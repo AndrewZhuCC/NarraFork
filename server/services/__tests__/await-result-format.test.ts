@@ -487,10 +487,9 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("resume");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "origin-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "origin-tool" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
 		const timedOut = await backgroundTaskService.getById(subagentNarratorId);
@@ -514,10 +513,9 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("summary");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "summary-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "summary-tool" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "stale timeout");
 		await db
@@ -542,10 +540,9 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("reuse");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "first-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "first-tool" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "first timeout");
 		const oldVersion = getBackgroundTaskTerminalVersion(
@@ -555,10 +552,9 @@ describe("background agent task lifecycle", () => {
 
 		const restarted = await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "second-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "second-tool" } },
 		});
 		expect(restarted.status).toBe("running");
 		expect(restarted.output).toBeNull();
@@ -586,9 +582,9 @@ describe("background agent task lifecycle", () => {
 		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 		const staleController = new AbortController();
 		const controller = new AbortController();
@@ -620,9 +616,9 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("cleanup-guard");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
 		backgroundTaskService.beginAgentContinuation(subagentNarratorId);
@@ -648,9 +644,9 @@ describe("background agent task lifecycle", () => {
 		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 
 		expect(
@@ -836,9 +832,9 @@ describe("background agent task lifecycle", () => {
 		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 
 		expect(await backgroundTaskService.recoverStaleAgentTasksAfterRestart()).toBe(1);

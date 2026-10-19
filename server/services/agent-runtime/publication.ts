@@ -22,7 +22,21 @@ import {
 } from "../../lib/validators/runtime-registration";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 
-export type StartedAgentRun = PublicationRun & { binding: RuntimeRunBinding };
+export interface StartRunInput {
+	narratorId: string;
+	/** Relationship facts of this run; `deliverTo` names the result's recipient. */
+	binding: RunBindingInput;
+	resumeRunId?: string;
+	started?: boolean;
+	legacyToolUseId?: string | null;
+	/** Task projection of a delivered run; adopts the actor's pre-registered run. */
+	taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
+}
+/** A registered run; `publication` exists exactly when the run delivers a result. */
+export interface StartedRun {
+	binding: RuntimeRunBinding;
+	publication?: PublicationRun;
+}
 
 import {
 	claimNextRefSeq,
@@ -147,20 +161,18 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		}
 	}
 
-	function startAgentRun(input: {
-		narratorId: string;
-		parentNarratorId: string;
-		resumeRunId?: string;
-		started?: boolean;
-		/** Relationship facts of this run; written with the run id in one transaction. */
-		binding?: RunBindingInput;
-		legacyToolUseId?: string | null;
-		/** Task projection registration adopts the actor's existing run, never starts a second one. */
-		taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
-	}): StartedAgentRun {
-		return runAtomicWrite(database, "publication.startAgentRun", (tx) => {
+	/**
+	 * Register a run: its logical id and relationship facts commit together, so nothing
+	 * can observe the run without also seeing who it delivers to, who cancels it and its
+	 * deadline. A run with a destination also reserves its publication slots (recipient =
+	 * `deliverTo.narratorId`) and the `source_after` result boundary; `taskRow` projects
+	 * it as a background task in the same transaction.
+	 */
+	function startRun(input: StartRunInput): StartedRun {
+		return runAtomicWrite(database, "publication.startRun", (tx) => {
+			const recipientId = input.binding.deliverTo?.narratorId;
 			let resumeRunId = input.resumeRunId;
-			if (input.taskRow && resumeRunId === undefined) {
+			if (input.taskRow && recipientId && resumeRunId === undefined) {
 				const actor = tx
 					.select({ logicalRunId: narrators.logicalRunId })
 					.from(narrators)
@@ -171,7 +183,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 						producerKind: "agent",
 						taskId: input.narratorId,
 						logicalRunId: actor.logicalRunId,
-						recipientId: input.parentNarratorId,
+						recipientId,
 					};
 					// Only a pre-registered start is adopted. An old terminal/consumed run is
 					// not an admission token for the next task.
@@ -183,7 +195,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 								eq(runtimePublicationOutbox.producerKind, "agent"),
 								eq(runtimePublicationOutbox.taskId, input.narratorId),
 								eq(runtimePublicationOutbox.logicalRunId, actor.logicalRunId),
-								eq(runtimePublicationOutbox.recipientId, input.parentNarratorId),
+								eq(runtimePublicationOutbox.recipientId, recipientId),
 								eq(runtimePublicationOutbox.eventKind, "terminal"),
 								eq(runtimePublicationOutbox.state, "reserved"),
 							),
@@ -195,79 +207,11 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				}
 			}
 			const logicalRunId = store.persistLogicalRun(input.narratorId, { resumeRunId }, tx);
-			const run: PublicationRun = {
-				producerKind: "agent",
-				taskId: input.narratorId,
-				logicalRunId,
-				recipientId: input.parentNarratorId,
-			};
-			reserve(run, tx, input.started);
+			const publication: PublicationRun | undefined = recipientId
+				? { producerKind: "agent", taskId: input.narratorId, logicalRunId, recipientId }
+				: undefined;
+			if (publication) reserve(publication, tx, input.started);
 			const topSeq = readTopRefSeq(tx, input.narratorId) ?? NARRATOR_REF_SEQ_EMPTY_TOP;
-			// The run's relationships commit with its id: nothing can observe the new run
-			// without also seeing who it delivers to, who cancels it and its deadline.
-			const source = tx
-				.select({
-					policySourceNarratorId: narrators.policySourceNarratorId,
-					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
-					type: narrators.type,
-					variant: narrators.variant,
-					parentNarratorId: narrators.parentNarratorId,
-					subagentType: narrators.subagentType,
-				})
-				.from(narrators)
-				.where(eq(narrators.id, input.narratorId))
-				.get();
-			const registration = registerRun(
-				source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
-				logicalRunId,
-				input.binding ?? {},
-				topSeq + 1,
-			);
-			tx.update(narrators)
-				.set({
-					runtimeRegistrationJson: registration,
-					// Writing a registration ends the legacy inference, so the source it
-					// inferred must become an explicit column in the same write.
-					policySourceNarratorId: source ? policySourceIdOf(source) : null,
-				})
-				.where(eq(narrators.id, input.narratorId))
-				.run();
-			if (!resumeRunId) {
-				// A stable ref boundary, not millisecond timestamps: two runs may start in
-				// the same ms. An empty narrator's watermark is NARRATOR_REF_SEQ_EMPTY_TOP
-				// (= base 0 minus one), NOT 0 — the first ref of an empty narrator claims
-				// seq 0, and `source_after:0` would exclude it from the run's result.
-				tx.update(runtimePublicationOutbox)
-					.set({
-						resultRef: `source_after:${topSeq}`,
-					})
-					.where(
-						and(
-							eq(runtimePublicationOutbox.dedupeKey, publicationDedupeKey(run, "terminal")),
-							eq(runtimePublicationOutbox.state, "reserved"),
-						),
-					)
-					.run();
-			}
-			// Only a live projection follows the run here; an ended task row is reopened
-			// (status and run together) by the run service, never relinked half-way.
-			tx.update(backgroundTasks)
-				.set({ logicalRunId })
-				.where(and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")))
-				.run();
-			return { ...run, binding: registration.run };
-		});
-	}
-
-	/** Same run registration without optional result publication reservations. */
-	function registerUndeliveredRun(input: {
-		narratorId: string;
-		resumeRunId?: string;
-		binding: RunBindingInput;
-		legacyToolUseId?: string | null;
-	}): RuntimeRunBinding {
-		return runAtomicWrite(database, "publication.registerUndeliveredRun", (tx) => {
-			const logicalRunId = store.persistLogicalRun(input.narratorId, input, tx);
 			const source = tx
 				.select({
 					policySourceNarratorId: narrators.policySourceNarratorId,
@@ -284,16 +228,45 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
 				logicalRunId,
 				input.binding,
-				(readTopRefSeq(tx, input.narratorId) ?? NARRATOR_REF_SEQ_EMPTY_TOP) + 1,
+				topSeq + 1,
 			);
 			tx.update(narrators)
 				.set({
 					runtimeRegistrationJson: registration,
+					// Writing a registration ends the legacy inference, so the source it
+					// inferred must become an explicit column in the same write.
 					policySourceNarratorId: source ? policySourceIdOf(source) : null,
 				})
 				.where(eq(narrators.id, input.narratorId))
 				.run();
-			return registration.run;
+			if (publication && !resumeRunId) {
+				// A stable ref boundary, not millisecond timestamps: two runs may start in
+				// the same ms. An empty narrator's watermark is NARRATOR_REF_SEQ_EMPTY_TOP
+				// (= base 0 minus one), NOT 0 — the first ref of an empty narrator claims
+				// seq 0, and `source_after:0` would exclude it from the run's result.
+				tx.update(runtimePublicationOutbox)
+					.set({
+						resultRef: `source_after:${topSeq}`,
+					})
+					.where(
+						and(
+							eq(runtimePublicationOutbox.dedupeKey, publicationDedupeKey(publication, "terminal")),
+							eq(runtimePublicationOutbox.state, "reserved"),
+						),
+					)
+					.run();
+			}
+			if (publication && input.taskRow)
+				tx.insert(backgroundTasks)
+					.values({ ...input.taskRow, logicalRunId })
+					.run();
+			// Only a live projection follows the run here; an ended task row is reopened
+			// (status and run together) by the run service, never relinked half-way.
+			tx.update(backgroundTasks)
+				.set({ logicalRunId })
+				.where(and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")))
+				.run();
+			return { binding: registration.run, ...(publication ? { publication } : {}) };
 		});
 	}
 
@@ -674,8 +647,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	return {
 		store,
 		reserve,
-		startAgentRun,
-		registerUndeliveredRun,
+		startRun,
 		getAgentRun,
 		persistResult,
 		readAgentTerminalResult,
@@ -866,8 +838,7 @@ export function createUnwiredPublicationFacade(
 			return unavailable("store");
 		},
 		reserve: () => unavailable("reserve"),
-		startAgentRun: () => unavailable("startAgentRun"),
-		registerUndeliveredRun: () => unavailable("registerUndeliveredRun"),
+		startRun: () => unavailable("startRun"),
 		getAgentRun: () => unavailable("getAgentRun"),
 		persistResult: () => unavailable("persistResult"),
 		readAgentTerminalResult: () => unavailable("readAgentTerminalResult"),
@@ -934,22 +905,7 @@ export interface PublicationTerminalCommit {
 
 export interface AsyncRuntimePublicationService {
 	readonly backend: "sqlite" | "postgres";
-	startAgentRun(input: {
-		narratorId: string;
-		parentNarratorId: string;
-		resumeRunId?: string;
-		started?: boolean;
-		binding?: RunBindingInput;
-		legacyToolUseId?: string | null;
-		/** PG-only: insert background_tasks row + reserve publication slots in one section. */
-		taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
-	}): Promise<StartedAgentRun>;
-	registerUndeliveredRun(input: {
-		narratorId: string;
-		resumeRunId?: string;
-		binding: RunBindingInput;
-		legacyToolUseId?: string | null;
-	}): Promise<RuntimeRunBinding>;
+	startRun(input: StartRunInput): Promise<StartedRun>;
 	getAgentRun(narratorId: string, recipientId: string): Promise<PublicationRun>;
 	newBashRun(taskId: string, recipientId: string): PublicationRun;
 	startBashRun(input: {
@@ -1091,8 +1047,7 @@ function createSqliteAsyncPublicationService(
 		);
 	return {
 		backend: "sqlite",
-		startAgentRun: async (input) => legacy.startAgentRun(input),
-		registerUndeliveredRun: async (input) => legacy.registerUndeliveredRun(input),
+		startRun: async (input) => legacy.startRun(input),
 		getAgentRun: async (narratorId, recipientId) => legacy.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => legacy.newBashRun(taskId, recipientId),
 		startBashRun: async (input) => {
@@ -1577,8 +1532,7 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 
 	return {
 		backend: "postgres",
-		startAgentRun: (input) => engine.startAgentRun(input),
-		registerUndeliveredRun: (input) => engine.registerUndeliveredRun(input),
+		startRun: (input) => engine.startRun(input),
 		getAgentRun: (narratorId, recipientId) => engine.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => ({
 			producerKind: "bash",

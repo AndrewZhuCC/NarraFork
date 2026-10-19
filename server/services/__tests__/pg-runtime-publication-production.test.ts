@@ -69,7 +69,7 @@ describe("SQLite async publication facade wiring", () => {
 		expect(pub.backend).toBe("sqlite");
 	});
 
-	test("startAgentRun via async facade creates logical run + reserves slots", async () => {
+	test("startRun via async facade creates logical run + reserves slots", async () => {
 		const parent = generateId();
 		const child = generateId();
 		const now = new Date().toISOString();
@@ -89,10 +89,12 @@ describe("SQLite async publication facade wiring", () => {
 			])
 			.run();
 		const pub = getRuntimePublicationService();
-		const run = await pub.startAgentRun({
-			narratorId: child,
-			parentNarratorId: parent,
-		});
+		const run = (
+			await pub.startRun({
+				narratorId: child,
+				binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+			})
+		).publication!;
 		expect(run.producerKind).toBe("agent");
 		expect(run.taskId).toBe(child);
 		expect(run.recipientId).toBe(parent);
@@ -203,7 +205,12 @@ describe("SQLite async publication facade wiring", () => {
 			.values({ id: generateId(), narratorId: child, messageId, seq: 0 })
 			.run();
 		const pub = getRuntimePublicationService();
-		const run = await pub.startAgentRun({ narratorId: child, parentNarratorId: parent });
+		const run = (
+			await pub.startRun({
+				narratorId: child,
+				binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+			})
+		).publication!;
 		const result = await pub.commitAgentTerminal({
 			run,
 			eventKind: "completed",

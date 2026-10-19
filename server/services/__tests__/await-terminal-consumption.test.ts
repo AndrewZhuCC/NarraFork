@@ -512,7 +512,10 @@ test("taken-over foreground result is not final", async () => {
 
 test("native startup with new runId and old idle cannot consume the prior assistant", async () => {
 	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
+	const next = runtimePublication.startRun({
+		narratorId: child,
+		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+	}).publication!;
 	const consume = spyOn(
 		getRuntimePublicationService(),
 		"consumeAwaitedTerminal",
@@ -544,7 +547,10 @@ test("a pre-run compact fallback cannot become the continuation result", async (
 			isCompact: 1,
 		})
 		.run();
-	runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
+	runtimePublication.startRun({
+		narratorId: child,
+		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+	}).publication!;
 	const consume = spyOn(
 		getRuntimePublicationService(),
 		"consumeAwaitedTerminal",
@@ -556,7 +562,10 @@ test("a pre-run compact fallback cannot become the continuation result", async (
 
 test("early failed continuation without a new assistant never consumes old text", async () => {
 	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
+	const next = runtimePublication.startRun({
+		narratorId: child,
+		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+	}).publication!;
 	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child));
 	const consume = spyOn(
 		getRuntimePublicationService(),
@@ -596,7 +605,10 @@ test("early failed continuation without a new assistant never consumes old text"
 test("deferred continuation requires a post-boundary assistant and observed same-run settlement", async () => {
 	runtimePublication.stop();
 	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
+	const next = runtimePublication.startRun({
+		narratorId: child,
+		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+	}).publication!;
 	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child));
 	const waiting = awaitTool.execute({ type: "agent", id: child }, ctx());
 	await new Promise((resolve) => setTimeout(resolve, 10));
@@ -660,13 +672,19 @@ test("background agent waiter sourceResultRef is forwarded without a new result 
 test("Await forwards the exact deferred source even when another run starts before consume", async () => {
 	runtimePublication.stop();
 	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
+	const next = runtimePublication.startRun({
+		narratorId: child,
+		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+	}).publication!;
 	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child));
 	const publication = getRuntimePublicationService();
 	const consume = publication.consumeAwaitedTerminal.bind(publication);
 	const observer = spyOn(publication, "consumeAwaitedTerminal").mockImplementation(
 		async (source, options) => {
-			runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
+			runtimePublication.startRun({
+				narratorId: child,
+				binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
+			}).publication!;
 			appendAssistant("later-run-answer", "later run answer", 2);
 			await consume(source, options);
 		},

@@ -36,6 +36,11 @@ const deliverToSchema = z.strictObject({
 	toolUseId: recordId,
 	toolCallId: recordId.optional(),
 	attempt: attempt.optional(),
+	/**
+	 * The result lands on the run's background task row (Await, task card, completion
+	 * notice), never on the tool call. A later run inheriting the destination keeps it.
+	 */
+	viaTask: z.literal(true).optional(),
 });
 
 const runBindingSchema = z.strictObject({

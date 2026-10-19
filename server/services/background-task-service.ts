@@ -43,6 +43,7 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus, parseTraits } from "../lib/narrator-utils";
 import { escapeLikeNeedle } from "../lib/sql-like";
+import type { RunBindingInput, RunDeliverTo } from "../lib/validators/runtime-registration";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
 import {
 	getRuntimePublicationService,
@@ -806,17 +807,28 @@ class BackgroundTaskService {
 		return row as BackgroundTaskRecord;
 	}
 
-	async createAgentTask(opts: {
+	async createAgentTask(input: {
 		id: string;
-		parentNarratorId: string;
 		subagentNarratorId: string;
 		subagentType: string;
-		toolUseId?: string;
 		alias?: string;
 		title?: string;
-		/** Relations of the run this task projects (new run, or a re-registration on adopt). */
-		binding?: import("../lib/validators/runtime-registration").RunBindingInput;
+		/**
+		 * Relations of the run this task projects (new run, or a re-registration on adopt).
+		 * Its destination is the task's parent and card.
+		 */
+		binding: RunBindingInput & { deliverTo: RunDeliverTo };
 	}): Promise<BackgroundTaskRecord> {
+		const opts = {
+			...input,
+			// A task projection is exactly a destination reached through the task row.
+			binding: {
+				...input.binding,
+				deliverTo: { ...input.binding.deliverTo, viaTask: true as const },
+			},
+			parentNarratorId: input.binding.deliverTo.narratorId,
+			toolUseId: input.binding.deliverTo.toolUseId,
+		};
 		const now = new Date().toISOString();
 		const pub = getRuntimePublicationService();
 
@@ -896,14 +908,8 @@ class BackgroundTaskService {
 		}
 
 		// ── New task: atomic run + task projection ───────────────────────
-		// startAgentRun handles BOTH cases internally: if the narrator already
-		// has a logicalRunId it reuses it; otherwise it creates a new run.
-		// With taskRow, the background_tasks INSERT is in the SAME section as
-		// the slot reservation — no double logical-run creation.
-		// On PG: one withPgRetry composite transaction.
-		// On SQLite: startAgentRun wraps runAtomicWrite; taskRow is accepted
-		// but the SQLite wrapper ignores it (callers insert via their own
-		// runAtomicWrite for backward compat with the sync path).
+		// One registration section: an actor with a pre-registered undelivered run
+		// adopts it, otherwise a new run starts; the task row commits with it.
 		const taskRow: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId"> = {
 			id: opts.id,
 			parentNarratorId: opts.parentNarratorId,
@@ -922,21 +928,12 @@ class BackgroundTaskService {
 			createdAt: now,
 			updatedAt: now,
 		};
-		const publicationRun = await pub.startAgentRun({
+		const { binding } = await pub.startRun({
 			narratorId: opts.subagentNarratorId,
-			parentNarratorId: opts.parentNarratorId,
-			taskRow,
 			binding: opts.binding,
+			taskRow,
 		});
-		// On SQLite, startAgentRun ignores taskRow — insert the task row
-		// in the legacy sync path.
-		if (pub.backend === "sqlite") {
-			runAtomicWrite(db, "background-task.createAgentTask", (tx) => {
-				tx.insert(backgroundTasks)
-					.values({ ...taskRow, logicalRunId: publicationRun.logicalRunId })
-					.run();
-			});
-		}
+		const publicationRun = { logicalRunId: binding.logicalRunId };
 		this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 		this.queueTaskUpsert(opts.parentNarratorId, opts.id);
 		this.maybeCleanup();

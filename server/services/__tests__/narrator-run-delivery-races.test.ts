@@ -31,6 +31,7 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { readRuntimeRegistrationColumn } from "../../lib/validators/runtime-registration";
 
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 
@@ -171,6 +172,12 @@ const binding = (extra: Record<string, unknown> = {}) => ({
 	principal: { userId: null },
 	...extra,
 });
+
+/** A background session: its runs deliver through the task row. */
+const backgroundBinding = () => {
+	const base = binding({ cancelWith: undefined });
+	return { ...base, deliverTo: { ...base.deliverTo, viaTask: true as const } };
+};
 
 /** Scripted model passes: each step may block, then replies with a persisted answer. */
 function scriptPasses(
@@ -435,10 +442,8 @@ describe("background and detached terminal source transactions", () => {
 			if (!detached) {
 				const task = await backgroundTaskService.createAgentTask({
 					id: RUN,
-					parentNarratorId: CALLER,
 					subagentNarratorId: RUN,
 					subagentType: "general",
-					toolUseId: ORIGIN,
 					alias: "retry-task",
 					binding: binding({ cancelWith: undefined }),
 				});
@@ -569,17 +574,15 @@ describe("C. a new run of an ended background task", () => {
 		scriptPasses([async () => ({ finalText: "first run answer" })]);
 		const task = await backgroundTaskService.createAgentTask({
 			id: RUN,
-			parentNarratorId: CALLER,
 			subagentNarratorId: RUN,
 			subagentType: "general",
-			toolUseId: ORIGIN,
 			alias: "race-alias",
 			binding: binding({ cancelWith: undefined }),
 		});
-		db.update(narrators)
-			.set({ isBackground: true, backgroundStatus: "running" })
-			.where(eq(narrators.id, RUN))
-			.run();
+		// The registration alone makes later runs deliver through the task row.
+		expect(
+			readRuntimeRegistrationColumn(sessionRow()?.runtimeRegistrationJson)?.run?.deliverTo?.viaTask,
+		).toBe(true);
 		const first = await startNarratorRun({
 			narratorId: RUN,
 			locale: "en",
@@ -1133,11 +1136,12 @@ describe("hold protocol regressions", () => {
 	test("C4 cold release owns delivery while a new start and duplicate release race it", async () => {
 		seed();
 		const pub = getRuntimePublicationService();
-		const old = await pub.startAgentRun({
-			narratorId: RUN,
-			parentNarratorId: CALLER,
-			binding: binding(),
-		});
+		const old = (
+			await pub.startRun({
+				narratorId: RUN,
+				binding: backgroundBinding(),
+			})
+		).publication!;
 		db.insert(backgroundTasks)
 			.values({
 				id: RUN,
@@ -1172,7 +1176,7 @@ describe("hold protocol regressions", () => {
 					narratorId: RUN,
 					locale: "en",
 					text: "new work",
-					binding: binding(),
+					binding: backgroundBinding(),
 				})
 			).started,
 		).toBe(false);
@@ -1201,7 +1205,7 @@ describe("hold protocol regressions", () => {
 			narratorId: RUN,
 			locale: "en",
 			text: "new work",
-			binding: binding(),
+			binding: backgroundBinding(),
 		});
 		await settle(() => !!getRunControl(RUN)?.logicalRunId);
 		expect(getRunControl(RUN)?.logicalRunId).not.toBe(old.logicalRunId);
@@ -1218,9 +1222,8 @@ describe("hold protocol regressions", () => {
 
 	test("R6 input accepted during a failing cold release runs without a second external wake and keeps the hold", async () => {
 		seed();
-		await getRuntimePublicationService().startAgentRun({
+		await getRuntimePublicationService().startRun({
 			narratorId: RUN,
-			parentNarratorId: CALLER,
 			binding: binding(),
 		});
 		await controlRun(RUN, { kind: "hold" });
@@ -1254,11 +1257,12 @@ describe("hold protocol regressions", () => {
 	test("M4 recovery uses committed terminal without executing the model again", async () => {
 		seed();
 		const pub = getRuntimePublicationService();
-		const registered = await pub.startAgentRun({
-			narratorId: RUN,
-			parentNarratorId: CALLER,
-			binding: binding(),
-		});
+		const registered = (
+			await pub.startRun({
+				narratorId: RUN,
+				binding: binding(),
+			})
+		).publication!;
 		await pub.commitAgentTerminal({
 			run: registered,
 			eventKind: "completed",
@@ -1287,11 +1291,12 @@ describe("hold protocol regressions", () => {
 			test(`M4 recovered ${eventKind} preserves its immutable classification (foreground=${foreground})`, async () => {
 				seed();
 				const pub = getRuntimePublicationService();
-				const registered = await pub.startAgentRun({
-					narratorId: RUN,
-					parentNarratorId: CALLER,
-					binding: binding(),
-				});
+				const registered = (
+					await pub.startRun({
+						narratorId: RUN,
+						binding: binding(),
+					})
+				).publication!;
 				const text = `immutable ${eventKind} before crash`;
 				await pub.commitAgentTerminal({
 					run: registered,
@@ -1355,9 +1360,8 @@ describe("F. a parked held result", () => {
 			.run();
 		// After a restart only the durable facts are left: the registered run (with its
 		// reserved terminal), its last answer and the `taken_over` mirror.
-		await getRuntimePublicationService().startAgentRun({
+		await getRuntimePublicationService().startRun({
 			narratorId: RUN,
-			parentNarratorId: CALLER,
 			binding: binding({ principal: { userId: "registered-user" } }),
 		});
 		db.insert(narratorMessages)

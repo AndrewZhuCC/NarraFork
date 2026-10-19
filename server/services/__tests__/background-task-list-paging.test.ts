@@ -342,9 +342,9 @@ describe("subagents remain discoverable without a background projection", () => 
 		await seedLegacyTask({ id, createdAt: old });
 		await backgroundTaskService.createAgentTask({
 			id,
-			parentNarratorId: PARENT,
 			subagentNarratorId: id,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markTakenOver(id);
 		const { eq } = await import("drizzle-orm");
@@ -524,10 +524,10 @@ describe("background task list row size", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
 			alias: "detached-worker",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 
 		const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 30 });
@@ -576,9 +576,9 @@ describe("background task active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "first pass done");
 
@@ -608,9 +608,9 @@ describe("background task active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "done");
 
@@ -734,9 +734,9 @@ describe("background task batch active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "first pass done");
 
@@ -826,9 +826,9 @@ describe("background task batch active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "done");
 
@@ -848,9 +848,9 @@ describe("derived status notification identity", () => {
 		await seedLegacyTask({ id: narratorId, createdAt: new Date().toISOString() });
 		await backgroundTaskService.createAgentTask({
 			id: taskId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: narratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		const { eq } = await import("drizzle-orm");
 		await db
@@ -893,9 +893,9 @@ describe("derived status notification identity", () => {
 		await seedLegacyTask({ id: "scoped-narrator", createdAt: now });
 		await backgroundTaskService.createAgentTask({
 			id: "scoped-projection",
-			parentNarratorId: PARENT,
 			subagentNarratorId: "scoped-narrator",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await seedBashTaskAt("scoped-bash", now);
 		await flushDeltas();
@@ -919,9 +919,9 @@ describe("derived status notification identity", () => {
 		await seedLegacyTask({ id: "direct-id", createdAt: now });
 		await backgroundTaskService.createAgentTask({
 			id: "indirect-id",
-			parentNarratorId: PARENT,
 			subagentNarratorId: "direct-id",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await seedBashTaskAt("direct-id", now);
 		await seedLegacyTask({ id: "plain-legacy", createdAt: now });
@@ -1665,9 +1665,9 @@ describe("background task list deltas", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markTakenOver(subagentId);
 		await flushDeltas();
@@ -1712,10 +1712,10 @@ describe("resolveSubagentNarratorId", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
 			alias: "map-the-providers",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 
 		for (const target of [subagentId, "map-the-providers"]) {

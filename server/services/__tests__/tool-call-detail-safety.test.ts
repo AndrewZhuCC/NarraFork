@@ -955,9 +955,8 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 		test(`stop takeover retains the hold after ${failure} failure, then retries after COW`, async () => {
 			const f = fixture();
 			share(f.parent.messageId, narrator(f.own.ownerUserId).id);
-			const run = runtimePublication.startAgentRun({
+			const run = runtimePublication.startRun({
 				narratorId: f.subagent.id,
-				parentNarratorId: f.own.id,
 				binding: {
 					deliverTo: {
 						narratorId: f.own.id,
@@ -965,7 +964,7 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 						toolCallId: f.parent.id,
 					},
 				},
-			});
+			}).publication!;
 			await controlRun(f.subagent.id, { kind: "hold" });
 			if (failure === "binding") removeRef(f.parent.messageId, f.own.id);
 			else

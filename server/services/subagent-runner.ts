@@ -300,12 +300,12 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			toolCallId: input.toolCallBinding.toolCallId,
 			attempt: input.toolCallBinding.attempt,
 		};
-		const binding: RunBindingInput = {
+		const binding = {
 			deliverTo: { narratorId: parentNarratorId, toolUseId, ...exact },
 			...(exact && !background ? { cancelWith: { narratorId: parentNarratorId, ...exact } } : {}),
 			principal: { userId: userId ?? null },
 			deadlineAt: runDeadlineAt(timeoutMs),
-		};
+		} satisfies RunBindingInput;
 
 		// The caller's prompt is this session's first user turn, placed under the call.
 		await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId, {
@@ -330,10 +330,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			// The task projection registers this run (and its relations) in one start.
 			const task = await backgroundTaskService.createAgentTask({
 				id: subagentId,
-				parentNarratorId,
 				subagentNarratorId: subagentId,
 				subagentType,
-				toolUseId,
 				alias: aliasRegistration.alias,
 				title,
 				binding,

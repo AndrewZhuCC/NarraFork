@@ -75,10 +75,8 @@ async function fixture(principal: string | null) {
 	const { backgroundTaskService } = await import("../background-task-service");
 	const task = await backgroundTaskService.createAgentTask({
 		id: childId,
-		parentNarratorId: parentId,
 		subagentNarratorId: childId,
 		subagentType: "general",
-		toolUseId: "origin-tool",
 		binding: {
 			deliverTo: { narratorId: parentId, toolUseId: "origin-tool" },
 			principal: { userId: principal },
