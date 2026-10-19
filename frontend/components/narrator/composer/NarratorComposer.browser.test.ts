@@ -1810,6 +1810,20 @@ for (const width of [1440, 390]) {
 					document.documentElement.setAttribute("data-mantine-color-scheme", theme);
 				}, scheme);
 				await selectQuotableSource(page);
+				const settleChipLayout = async () => {
+					await settle(page);
+					// Measure settled geometry, not an intermediate frame of the adaptive layout.
+					await page.waitForFunction(() =>
+						[
+							...document.querySelectorAll(
+								'[data-inline-composer], [data-inline-composer] [role="textbox"]',
+							),
+						].every((element) =>
+							element.getAnimations().every((animation) => animation.playState !== "running"),
+						),
+					);
+				};
+				await settleChipLayout();
 				const measure = (selector: string) =>
 					page.$eval(selector, (chip) => {
 						const body = chip.querySelector("button");
@@ -1849,7 +1863,7 @@ for (const width of [1440, 390]) {
 				expect(Math.abs(before.keyOffset)).toBeLessThanOrEqual(1);
 				expect(before.keyHeight).toBeLessThanOrEqual(16);
 				await page.keyboard.press("Tab");
-				await settle(page);
+				await settleChipLayout();
 				if (process.env.NF_COMPOSER_SCREENSHOTS)
 					await page.screenshot({
 						path: `.narrafork/quote-${width}-${scheme}-after.png`,
