@@ -31,13 +31,7 @@ export function snapshotComposerFiles(
 	const snapshot = { images: [] as File[], textFiles: [] as File[] };
 	for (const asset of document.assets) {
 		const file = byId.get(asset.id);
-		if (
-			!file ||
-			file.name !== asset.name ||
-			file.size !== asset.size ||
-			file.type !== asset.mimeType
-		)
-			return undefined;
+		if (!file || file.name !== asset.name || file.size !== asset.size) return undefined;
 		if (asset.kind === "image" ? !images.includes(file) : !textFiles.includes(file))
 			return undefined;
 		(asset.kind === "image" ? snapshot.images : snapshot.textFiles).push(file);

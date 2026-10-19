@@ -150,6 +150,53 @@ test("composer layout survives cold durable queue projection, summary stays smal
 	await removeBufferedMessage(NARRATOR_ID, result.id);
 });
 
+test("ZIP MIME alias survives durable queue reload and editing a kept attachment", async () => {
+	const zip = new File(["PK archive bytes"], "archive.zip", {
+		type: "application/x-zip-compressed",
+	});
+	const body = new FormData();
+	body.append("textFiles", zip);
+	const parsed = await new Request("http://localhost", { method: "POST", body }).formData();
+	const files = parsed.getAll("textFiles") as File[];
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "attachment" as const, id: "node", assetId: "asset" }] }],
+		assets: [
+			{
+				id: "asset",
+				kind: "textFile" as const,
+				name: zip.name,
+				size: zip.size,
+				mimeType: zip.type,
+			},
+		],
+	};
+	const result = await enqueueBufferedMessage(
+		NARRATOR_ID,
+		"",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		files,
+		"back",
+		undefined,
+		undefined,
+		"fifo",
+		undefined,
+		undefined,
+		document,
+	);
+	const [reloaded] = getBufferedMessages(NARRATOR_ID);
+	expect(reloaded.composerDocument).toEqual(document);
+	expect(reloaded.textFiles?.[0].type).toBe("application/zip");
+	expect(
+		await updateBufferedMessage(NARRATOR_ID, result.id, "", { composerDocument: document }),
+	).toBe(true);
+	expect(getBufferedMessages(NARRATOR_ID)[0].composerDocument).toEqual(document);
+	await removeBufferedMessage(NARRATOR_ID, result.id);
+});
+
 const NARRATOR_ID = "buffer-attach-narrator";
 const SUBAGENT_ID = "buffer-attach-subagent";
 for (const id of [NARRATOR_ID, SUBAGENT_ID]) {

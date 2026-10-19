@@ -14,6 +14,7 @@ import type { CommandItem } from "../composer/CommandPopover";
 import { getComposerAssetId } from "../composer/draft-image-attachments";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import {
+	snapshotComposerFiles,
 	type UseNarratorSendOptions,
 	type UseNarratorSendResult,
 	useNarratorSend,
@@ -214,6 +215,28 @@ describe("structured send snapshots", () => {
 		expect(options.updateAttachedTextFiles).toHaveBeenCalledWith(textFiles);
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 		expect(options.sendingRef.current).toBe(false);
+	});
+	test("advisory MIME changes do not falsely report missing resources", async () => {
+		const { doc, images, textFiles } = richDraft();
+		doc.assets[0].mimeType = "image/x-png";
+		doc.assets[1].mimeType = "application/octet-stream";
+		await render({ attachedImages: images, attachedTextFiles: textFiles });
+		await act(async () => actions.handleSend());
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls[0]?.[2]).toEqual([images[1], images[0]]);
+		expect(send.mock.calls[0]?.[3]).toEqual(textFiles);
+	});
+	test("snapshot still requires the matching resource identity, name, size and kind", () => {
+		const { doc, images, textFiles } = richDraft();
+		for (const change of [
+			{ id: "missing" },
+			{ name: "other.png" },
+			{ size: 99 },
+			{ kind: "textFile" as const },
+		]) {
+			const changed = { ...doc, assets: [{ ...doc.assets[0], ...change }, ...doc.assets.slice(1)] };
+			expect(snapshotComposerFiles(changed, images, textFiles)).toBeUndefined();
+		}
 	});
 	test("missing resources block sends without clearing the document", async () => {
 		richDraft();
