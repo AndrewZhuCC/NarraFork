@@ -1201,10 +1201,14 @@ describe("TeamStatus actions", () => {
 			broadcast: true,
 			await: false,
 			targetCount: 1,
+			// A successful broadcast states the working-only rule by CODE — the bubble
+			// translates it — and carries no failure detail.
+			warningCodes: ["broadcastWorkingOnly"],
 			targetNames: ["Worker"],
 			recentIdle: [],
 			targets: [{ id: "sub-1", label: "worker", title: "Worker", status: "queued" }],
 		});
+		expect(result.metadata).not.toHaveProperty("warningDetails");
 		expect(deliveredMessages).toHaveLength(1);
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
@@ -1321,6 +1325,10 @@ describe("TeamStatus actions", () => {
 			broadcast: false,
 			await: false,
 			targetCount: 1,
+			// The status is reported as a raw value: the bubble builds the sentence from
+			// its own `communicationWarning_*` / `status_*` translations.
+			warningCodes: ["sendTargetNotWorking"],
+			warningStatus: "idle",
 			targets: [
 				{
 					id: "sub-1",
@@ -1330,7 +1338,6 @@ describe("TeamStatus actions", () => {
 					status: "queued",
 				},
 			],
-			warning: "(warning: target is idle, message may not be received)",
 		});
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
@@ -1455,6 +1462,10 @@ describe("TeamStatus broadcast status scope", () => {
 		expect(result.isError).toBe(true);
 		expect(result.metadata).toMatchObject({
 			targetCount: 1,
+			// Per-target failures stay free text (they name a target and an error, which
+			// has no translation), while the rule itself is a code.
+			warningCodes: ["broadcastWorkingOnly"],
+			warningDetails: ["name-failed: Error: queue full"],
 			targets: [{ id: "ok" }],
 			targetNames: ["Name ending", "Name failed", "Name ok"],
 		});
@@ -1479,7 +1490,11 @@ describe("TeamStatus broadcast status scope", () => {
 		);
 		expect(peak).toBe(4);
 		expect(deliveredMessages).toHaveLength(4);
-		expect(result.metadata).toMatchObject({ targetCount: 4 });
+		expect(result.metadata).toMatchObject({
+			targetCount: 4,
+			// Cancellation is a code too: the bubble owns the sentence.
+			warningCodes: ["broadcastWorkingOnly", "broadcastCancelled"],
+		});
 		expect(result.output).toContain("Broadcast cancelled");
 	});
 });

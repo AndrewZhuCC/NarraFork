@@ -361,6 +361,51 @@ describe("communication bubbles", () => {
 		).toEqual([{ label: "Primary", title: "Primary" }]);
 	});
 
+	it("composes the footer warning from codes, details and the injected sentences", () => {
+		// The tool never ships these sentences: the reader's language lives in the shell,
+		// so the code is looked up through `ctx.labels` (`communicationWarning_<code>`).
+		const labels = {
+			communicationWarning_broadcastWorkingOnly: "广播只发给工作中/等待中的成员。",
+			communicationWarning_broadcastCancelled: "广播已取消。",
+			communicationWarning_sendTargetNotWorking: "目标当前为{status}，消息可能收不到",
+			status_idle: "空闲",
+		};
+		const ctx: AdapterContext = { lod: 5, labels };
+		expect(
+			data(
+				{ action: "broadcast", message: "request" },
+				{
+					toolName: "TeamStatus",
+					_metadata: {
+						warningCodes: ["broadcastWorkingOnly", "broadcastCancelled"],
+						warningDetails: ["worker: delivery failed"],
+					},
+				},
+				ctx,
+			).warning,
+		).toBe("广播只发给工作中/等待中的成员。\n广播已取消。\nworker: delivery failed");
+		// The status word comes from the shared `status_*` wording, not a copy of it.
+		expect(
+			data(
+				{ action: "send", message: "request" },
+				{
+					toolName: "TeamStatus",
+					_metadata: { warningCodes: ["sendTargetNotWorking"], warningStatus: "idle" },
+				},
+				ctx,
+			).warning,
+		).toBe("目标当前为空闲，消息可能收不到");
+		// A code this build does not know has no sentence, so the footer stays empty
+		// instead of painting the label key at the reader.
+		expect(
+			data(
+				{ action: "broadcast", message: "request" },
+				{ toolName: "TeamStatus", _metadata: { warningCodes: ["nope"] } },
+				ctx,
+			).warning,
+		).toBeUndefined();
+	});
+
 	it("retains errors and normalized timing without substituting output for sent text", () => {
 		expect(
 			data(

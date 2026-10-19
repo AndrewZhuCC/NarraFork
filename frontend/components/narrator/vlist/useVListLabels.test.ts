@@ -194,7 +194,10 @@ describe("adapter chrome keys — every fallback has an injected translation", (
 			adapterSrc.indexOf("const SYSTEM_LABEL_FALLBACKS"),
 			adapterSrc.indexOf("/** Resolve a system-card chrome label"),
 		);
-		const fallbackKeys = [...table.matchAll(/^\t([A-Za-z][A-Za-z0-9]*):/gm)].map((m) => m[1]);
+		// Underscored keys (`reviewVerdict_*`, `communicationWarning_*`, `status_*`) are
+		// matched too: they are built by concatenation in the adapter, which makes a
+		// dropped injection MORE likely to go unnoticed, not less.
+		const fallbackKeys = [...table.matchAll(/^\t([A-Za-z][A-Za-z0-9_]*):/gm)].map((m) => m[1]);
 		// Sanity-check the extraction itself before asserting on it.
 		expect(fallbackKeys.length).toBeGreaterThan(20);
 		expect(fallbackKeys).toContain("activityTraceCount");
