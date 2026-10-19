@@ -1239,7 +1239,6 @@
 	"overviewHiddenPreviewTruncated": "Showing {{shown}} hidden models in this preview; {{hidden}} more hidden.",
 	"overviewFinalList": "Model List Preview",
 	"providerNames": {
-		"commandcode": "Command Code",
 		"silicon": "SiliconFlow",
 		"ovms": "OpenVINO Model Server",
 		"ocoolai": "ocoolAI",

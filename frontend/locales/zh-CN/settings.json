@@ -1241,7 +1241,6 @@
 	"overviewHiddenPreviewTruncated": "此预览已显示 {{shown}} 个隐藏模型；另有 {{hidden}} 个已隐藏。",
 	"overviewFinalList": "模型列表预览",
 	"providerNames": {
-		"commandcode": "Command Code",
 		"silicon": "硅基流动",
 		"ovms": "OpenVINO Model Server",
 		"ocoolai": "ocoolAI",
