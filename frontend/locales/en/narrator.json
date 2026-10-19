@@ -416,7 +416,10 @@
 		"fileUnavailable": "This preview cannot verify saved content. Open the full file before quoting.",
 		"addFailed": "Could not add quote",
 		"placeholder": "Ask about the quoted content…",
-		"open": "Show quoted text"
+		"open": "Show quoted text",
+		"detailTitle": "Quoted text",
+		"jump": "Jump to source",
+		"jumpUnavailable": "This quote has no source to jump to"
 	},
 	"fileReferences": {
 		"title": "File references",

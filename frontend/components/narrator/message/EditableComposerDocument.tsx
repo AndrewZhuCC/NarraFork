@@ -12,12 +12,14 @@ import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../
 import { apiUrl } from "../../../lib/base-path";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { composerOptimizeTarget } from "../composer/composer-optimize-target";
+import type { ComposerQuote } from "../composer/composer-quotes";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import {
 	InlineComposerEditor,
 	type InlineComposerEditorHandle,
 } from "../composer/InlineComposerEditor";
 import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "../composer/image-clipboard";
+import { QuoteDetailModal } from "../composer/QuoteDetailModal";
 import { revealComposerQuote, revealQuotedFile } from "../composer/quote-jump";
 import { TextareaOptimizeControls } from "../composer/TextareaOptimizeControls";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
@@ -81,6 +83,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 		[],
 	);
 	const [fullscreen, setFullscreen] = useState(false);
+	const [quoteDetail, setQuoteDetail] = useState<ComposerQuote | null>(null);
 	const unusedTextarea = useRef<HTMLTextAreaElement>(null);
 	const optimize = usePromptOptimize({
 		narratorId: props.narratorId ?? "",
@@ -352,6 +355,11 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					: undefined
 			}
 		>
+			<QuoteDetailModal
+				quote={quoteDetail}
+				onClose={() => setQuoteDetail(null)}
+				onJump={(quote) => revealComposerQuote(dock, quote, editor.current?.getElement() ?? null)}
+			/>
 			{fullscreen && (
 				<Group justify="flex-end" mb="xs">
 					<Button size="xs" variant="subtle" onClick={() => setFullscreen(false)}>
@@ -374,9 +382,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					props.onKeyDown?.(event);
 				}}
 				onPasteFiles={(files) => void addFiles(files)}
-				onOpenQuote={(quote) =>
-					revealComposerQuote(dock, quote, editor.current?.getElement() ?? null)
-				}
+				onOpenQuote={setQuoteDetail}
 				onOpenFile={(reference) => {
 					if (fileScope.openFile) fileScope.openFile(reference);
 					else revealQuotedFile(dock, reference);
