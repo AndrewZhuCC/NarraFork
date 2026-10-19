@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -11,12 +10,6 @@ import {
 } from "../../lib/agent/file-reference-projection";
 import type { DbMessage } from "../../lib/agent/provider";
 import { settings } from "../../lib/settings";
-import { modelHistoryFixtureSql } from "../agent-runtime/model-history-fixture";
-import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
-import {
-	loadModelHistorySource,
-	markModelHistoryRows,
-} from "../agent-runtime/model-history-source";
 
 if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	test("isolated file reference message flow suite", () => {
@@ -35,22 +28,6 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 } else {
 	// A serialization fixture, not the application DB. Mock persistence writes the
 	// exact text/blocks the REAL send/edit/queue services supply, then reads JSON back.
-	// saved_messages JSON and standing-sys below are synthetic: the application revision
-	// cannot sign them. The mock loader explicitly tracks them as unversioned using a real
-	// source load from a private legacy fixture, never a trusted stamp or a guard mock.
-	const legacy = new Database(":memory:");
-	let syntheticSource: Awaited<ReturnType<typeof loadModelHistorySource>>;
-	try {
-		legacy.run(modelHistoryFixtureSql);
-		legacy.run("INSERT INTO narrators (id,title) VALUES ('synthetic','Synthetic')");
-		expect(readSqliteModelHistorySignature(legacy, "synthetic").trusted).toBe(false);
-		syntheticSource = await loadModelHistorySource(
-			{ backend: "sqlite", sqlite: legacy },
-			"synthetic",
-		);
-	} finally {
-		legacy.close();
-	}
 	const { sqlite, db: fixtureDb } = getTestDb();
 	sqlite.exec("CREATE TABLE saved_messages (id TEXT PRIMARY KEY, row_json TEXT NOT NULL)");
 	for (const id of ["n", "child", "resume-official", "resume-child", "resume-followup"]) {
@@ -223,7 +200,6 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 						parentToolUseId: null,
 						messageUuid: null,
 					});
-				markModelHistoryRows(history, syntheticSource);
 				return history;
 			},
 			deleteMessagesAfter: async () => ({ deletedMessageIds: [] }),

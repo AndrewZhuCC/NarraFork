@@ -2883,8 +2883,6 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
 			: undefined;
-		const { verifyModelHistoryRowsCurrent } = await import("./agent-runtime/model-history-source");
-		await verifyModelHistoryRowsCurrent(rawMsgs, { signal, deadline });
 		signal?.throwIfAborted();
 		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 		return {

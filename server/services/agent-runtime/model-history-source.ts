@@ -15,6 +15,7 @@ import {
 	sqliteHistoryQuery,
 } from "./model-history-query";
 import {
+	type ModelHistorySignature,
 	readPostgresModelHistorySignature,
 	readSqliteModelHistorySignature,
 } from "./model-history-revision";
@@ -92,13 +93,11 @@ const state = hotSafe("narrator.modelHistorySource.v1", () => {
 		lastCounters: null as ModelHistoryCounters | null,
 		workerSpecifier: null as string | null,
 		sourceSignatures: new WeakMap<ModelHistorySource, SourceSignatureRecord>(),
-		rowSignatures: new WeakMap<object, SourceSignatureRecord>(),
 	};
 });
 // Upgrade a legacy process pin without re-signing its unknown cached snapshots. Such entries
 // miss these maps and must take the fully validated cold path before they can be reused.
 state.sourceSignatures ??= new WeakMap<ModelHistorySource, SourceSignatureRecord>();
-state.rowSignatures ??= new WeakMap<object, SourceSignatureRecord>();
 state.workerSpecifier ??= null;
 export function modelHistorySourceStats() {
 	return {
@@ -119,43 +118,11 @@ export type ModelHistoryBackend =
 	| { backend: "sqlite"; sqlite: Database }
 	| { backend: "postgres"; sql: SQL; url: string };
 type SourceSignatureRecord = {
-	backend: ModelHistoryBackend;
 	narratorId: string;
 	revision: string;
 	trusted: boolean;
 	catalogIdentity?: string;
 };
-export function markModelHistoryRows(rows: object, source: ModelHistorySource): void {
-	const record = state.sourceSignatures.get(source);
-	if (!record) throw new Error("Model history source signature missing; request not sent");
-	state.rowSignatures.set(rows, record);
-}
-export async function verifyModelHistoryRowsCurrent(
-	rows: object,
-	options: { signal?: AbortSignal; deadline?: number } = {},
-): Promise<void> {
-	options.signal?.throwIfAborted();
-	if (options.deadline != null && Date.now() >= options.deadline)
-		throw new Error("Model history preparation exceeded 10s budget");
-	const record = state.rowSignatures.get(rows);
-	if (!record) throw new Error("Model history rows signature missing; request not sent");
-	// Only an explicitly recorded unversioned source can take the compatibility path.
-	if (!record.trusted) return;
-	const current =
-		record.backend.backend === "sqlite"
-			? readSqliteModelHistorySignature(record.backend.sqlite, record.narratorId)
-			: await readPostgresModelHistorySignature(record.backend.sql, record.narratorId, options);
-	options.signal?.throwIfAborted();
-	if (options.deadline != null && Date.now() >= options.deadline)
-		throw new Error("Model history preparation exceeded 10s budget");
-	if (
-		!current.trusted ||
-		current.revision !== record.revision ||
-		current.catalogIdentity !== record.catalogIdentity
-	)
-		throw new Error("Model history changed after provider preparation; request not sent");
-}
-
 export type LoadModelHistoryOptions = {
 	limit?: number;
 	signal?: AbortSignal;
@@ -226,8 +193,8 @@ async function readWorker(
 	options: LoadModelHistoryOptions,
 	deadline: number,
 	versioned: boolean,
-	previous?: ModelHistorySource,
-): Promise<ModelHistorySource> {
+	previous?: { source: ModelHistorySource; catalogIdentity?: string },
+): Promise<{ source: ModelHistorySource; signature?: ModelHistorySignature }> {
 	while (state.workers >= 2) {
 		options.signal?.throwIfAborted();
 		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
@@ -250,12 +217,15 @@ async function readWorker(
 			// worker always communicates before dying. That difference gates the probe.
 			let received = false;
 			try {
-				const source = await new Promise<ModelHistorySource>((resolve, reject) => {
+				const loaded = await new Promise<{
+					source: ModelHistorySource;
+					signature?: ModelHistorySignature;
+				}>((resolve, reject) => {
 					const messages: ModelSourceRow[] = [];
 					const byId = new Map<string, ModelSourceRow>();
-					const previousById = new Map(previous?.messages.map((row) => [row.id, row]));
+					const previousById = new Map(previous?.source.messages.map((row) => [row.id, row]));
 					const previousTools = new Map(
-						previous?.messages.flatMap((row) =>
+						previous?.source.messages.flatMap((row) =>
 							row.toolCalls.map((tool) => [tool.id, tool] as const),
 						),
 					);
@@ -264,6 +234,7 @@ async function readWorker(
 						error?: Error,
 						counters?: ModelHistoryCounters,
 						compactSeq?: number | null,
+						signature?: ModelHistorySignature,
 					) => {
 						if (finished) return;
 						finished = true;
@@ -275,7 +246,7 @@ async function readWorker(
 						else {
 							for (const row of messages)
 								row.toolCalls.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-							resolve({ messages, counters, compactSeq });
+							resolve({ source: { messages, counters, compactSeq }, signature });
 						}
 					};
 					const abort = () => finish(new Error("Model history preparation cancelled"));
@@ -329,7 +300,7 @@ async function readWorker(
 								messages.push(byId.get(id) as ModelSourceRow);
 							worker.postMessage({ type: "ack" });
 						} else if (event.data.type === "done")
-							finish(undefined, event.data.counters, event.data.compactSeq);
+							finish(undefined, event.data.counters, event.data.compactSeq, event.data.signature);
 						else if (event.data.type === "error") finish(new Error(event.data.message));
 					};
 					worker.postMessage({
@@ -338,14 +309,15 @@ async function readWorker(
 						limit: options.limit,
 						maxBytes: MODEL_HISTORY_MAX_BYTES,
 						versioned,
-						previous: previous ? modelHistoryManifest(previous) : undefined,
+						previous: previous ? modelHistoryManifest(previous.source) : undefined,
+						previousCatalogIdentity: previous?.catalogIdentity,
 						...(backend.backend === "sqlite"
 							? { backend: "sqlite", path: backend.sqlite.filename }
 							: { backend: "postgres", url: backend.url }),
 					});
 				});
 				state.workerSpecifier = specifier;
-				return source;
+				return loaded;
 			} catch (error) {
 				// Only a candidate that never started is probed against the next path shape;
 				// a worker that died mid-query must surface its real error unchanged.
@@ -414,9 +386,12 @@ export async function loadModelHistorySource(
 		candidate &&
 		candidateRecord?.trusted &&
 		candidateRecord.catalogIdentity === before.catalogIdentity
-			? candidate
+			? { source: candidate, catalogIdentity: before.catalogIdentity }
 			: undefined;
 	let source: ModelHistorySource;
+	// The worker labels its rows with the signature read inside the same snapshot. A write
+	// landing during the read is simply newer than this snapshot, never a reason to fail.
+	let after = before;
 	if (inMemory && backend.backend === "sqlite")
 		source = await queryModelHistory(sqliteHistoryQuery(backend.sqlite), {
 			narratorId,
@@ -427,8 +402,9 @@ export async function loadModelHistorySource(
 			versioned: before.trusted,
 		});
 	else {
+		let loaded: Awaited<ReturnType<typeof readWorker>>;
 		try {
-			source = await readWorker(backend, narratorId, options, deadline, before.trusted, previous);
+			loaded = await readWorker(backend, narratorId, options, deadline, before.trusted, previous);
 		} catch (error) {
 			if (
 				!previous ||
@@ -438,25 +414,19 @@ export async function loadModelHistorySource(
 				throw error;
 			// Ref deletion/reorder/COW, compact, segment/lazy range changes: one full rebuild,
 			// sharing the SAME deadline. No partial delta or indefinite retries are accepted.
-			source = await readWorker(backend, narratorId, options, deadline, before.trusted);
+			loaded = await readWorker(backend, narratorId, options, deadline, before.trusted);
 		}
+		source = loaded.source;
+		after = loaded.signature ?? before;
 	}
 	options.signal?.throwIfAborted();
-	const after = await signature();
+	// Rows were read with or without revision columns according to `before`.
 	if (before.trusted !== after.trusted)
 		throw new Error("Model history revision trust changed during preparation; request not sent");
-	if (
-		before.trusted &&
-		(before.revision !== after.revision ||
-			before.catalogIdentity !== after.catalogIdentity ||
-			!after.trusted)
-	)
-		throw new Error("Model history changed during preparation; retry with a fresh source snapshot");
 	await freezeModelHistorySource(source, deadline, options.signal);
 	check();
 	state.lastCounters = source.counters;
 	state.sourceSignatures.set(source, {
-		backend,
 		narratorId,
 		revision: after.revision,
 		catalogIdentity: after.catalogIdentity,
@@ -464,7 +434,7 @@ export async function loadModelHistorySource(
 	});
 	if (cacheable && after.trusted)
 		state.cache.set(
-			key,
+			`${identity}\u0000${narratorId}\u0000${after.catalogIdentity ?? "unversioned"}:${after.revision}`,
 			source,
 			source.counters.preparedBytes ??
 				source.counters.sourceBytes * 4 +

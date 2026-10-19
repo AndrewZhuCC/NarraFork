@@ -447,7 +447,7 @@ describe("subagent signed source projection", () => {
 				.get()?.parentToolUseId,
 		).toBe("origin-agent");
 	});
-	test("a body edit during detached provider projection is refused before a model pass", async () => {
+	test("a body edit during detached provider projection sends the loaded snapshot", async () => {
 		seed();
 		const build = adapter.buildHistory;
 		let projected = false;
@@ -463,11 +463,9 @@ describe("subagent signed source projection", () => {
 			return build(...args);
 		});
 		const h = fixture(profiles[1], [finished]);
-		const result = await h.run();
-		expect(result.hasError).toBe(true);
+		expect((await h.run()).hasError).toBe(false);
 		expect(projected).toBe(true);
-		expect(h.calls).toHaveLength(0);
-		expect(result.finalText).toContain("changed after provider preparation");
+		expect(h.calls).toHaveLength(1);
 	});
 });
 

@@ -47,9 +47,6 @@ import {
 				expect(await loadModelHistorySource(backend, "fork")).toBe(original);
 				const reloaded = await import(`./model-history-source.ts?pg-hot=${Date.now()}`);
 				expect(await reloaded.loadModelHistorySource(backend, "fork")).toBe(original);
-				const projectedRows = original.messages.map((row) => ({ ...row }));
-				reloaded.markModelHistoryRows(projectedRows, original);
-				await reloaded.verifyModelHistoryRowsCurrent(projectedRows);
 				for (const mutation of [
 					`UPDATE narrator_messages SET content_json='[{"type":"text","text":"body edit"}]' WHERE id='shared'`,
 					"UPDATE narrator_messages SET sdk_message_uuid='final-uuid' WHERE id='shared'",
@@ -61,9 +58,6 @@ import {
 					const before = await signature();
 					await second.unsafe(mutation);
 					expect((await signature()).revision).not.toBe(before.revision);
-					await expect(reloaded.verifyModelHistoryRowsCurrent(projectedRows)).rejects.toThrow(
-						"request not sent",
-					);
 				}
 				const changed = await loadModelHistorySource(backend, "fork");
 				expect(changed).not.toBe(original);

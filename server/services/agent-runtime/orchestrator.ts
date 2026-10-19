@@ -221,7 +221,6 @@ import { createRuntimeEventContext, createRuntimeMessageWriters } from "./contex
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
-import { verifyModelHistoryRowsCurrent } from "./model-history-source";
 import { type RuntimePolicy, runtimeInteractionHint } from "./policy";
 import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
@@ -1015,12 +1014,6 @@ export async function runAgentLoopUnlocked(
 				currentInput: runState.input.text,
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
-				deadline: historyDeadline,
-			});
-			// The subagent view is detached, but freshness belongs to the original signed rows.
-			// Fail explicitly rather than sending a mixed revision or re-registering receipts forever.
-			await verifyModelHistoryRowsCurrent(rawMessages, {
-				signal: active.abortController.signal,
 				deadline: historyDeadline,
 			});
 			const { history, trailingToolResults } = preparedHistory;

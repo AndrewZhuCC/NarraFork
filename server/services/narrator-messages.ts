@@ -76,7 +76,6 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	type LoadModelHistoryOptions,
 	loadModelHistorySource,
-	markModelHistoryRows,
 } from "./agent-runtime/model-history-source";
 import { isRunHeldForDisplay, listRunHolds } from "./agent-runtime/ownership";
 import {
@@ -3590,7 +3589,7 @@ const narratorMessageQueriesUnlocked = {
 				: { backend: "sqlite" as const, sqlite: modelHistoryDatabase.sqlite };
 		const source = await loadModelHistorySource(backend, narratorId, { ...options, limit });
 		// Lifecycle/metadata-only rows are control-plane data, never provider boundaries.
-		const messages = source.messages
+		return source.messages
 			.filter(
 				(message) =>
 					!isCompactLifecycleMessage(message) &&
@@ -3600,8 +3599,6 @@ const narratorMessageQueriesUnlocked = {
 				...message,
 				toolCalls: latestToolCallAttempts(message.toolCalls),
 			}));
-		markModelHistoryRows(messages, source);
-		return messages;
 	},
 
 	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
