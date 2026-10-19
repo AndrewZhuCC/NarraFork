@@ -24,6 +24,16 @@ test("production compile spreads the worker registry instead of listing worker p
 	}
 });
 
+test("both editor IO workers remain production compile entries", () => {
+	for (const entry of [
+		"./server/services/editor-document-worker.ts",
+		"./server/services/editor-document-stream-worker.ts",
+	]) {
+		expect(COMPILED_WORKER_ENTRIES.map((path) => `./server/${path}`)).toContain(entry);
+	}
+	expect(existsSync(join(root, "shared/compiled-worker-entries.ts"))).toBe(false);
+});
+
 test("worker spawns go through the shared resolver", () => {
 	const offenders: string[] = [];
 	for (const path of serverSources()) {

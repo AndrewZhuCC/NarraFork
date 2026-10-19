@@ -1,21 +1,193 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { lstat } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { and, eq } from "drizzle-orm";
+import { EDITOR_FILE_MAX_BYTES, type EditorOperationResult } from "../../shared/editor-document";
+import type { EditorQueryResult } from "../../shared/editor-provider-contracts";
+import { resolveBackend } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
+import { RemoteBackend } from "./device-remote-backend";
 import {
 	type EditorDocumentDependencies,
 	EditorDocumentError,
 	EditorDocumentService,
 } from "./editor-document-service";
+import { createEditorFileAtomicIo } from "./editor-file-atomic-io";
+import {
+	EditorHelperSession,
+	editorHostReceiptAvailable,
+	resolveEditorHelper,
+	withEditorHelperMetadata,
+} from "./editor-helper";
+import {
+	type EditorDurableOperation,
+	EditorRemoteOperationStore,
+	editorReceiptStorageSupported,
+} from "./editor-remote-operation-store";
+import { createFileChangeLocalIo } from "./file-change-local-io";
 import {
 	EditorFileChangeUncertainError,
 	executeEditorFileChange,
+	getCurrentLocalFileChangeRuntime,
 	getDefaultLocalFileChangeRuntime,
+	localFileChangeRuntimeBinding,
 } from "./file-change-runtime";
+import { workspaceContextService } from "./workspace-context-service";
+import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 import { closeClaim, openClaim, sealClaim } from "./worktree-write-claims";
+
+function hostReceiptStorageAvailable() {
+	return editorReceiptStorageSupported(
+		process.platform,
+		process.platform === "win32" && editorHostReceiptAvailable(),
+	);
+}
+const operationStoreContext = hotSafe(
+	"editor.operation-store.context.v1",
+	() => new AsyncLocalStorage<EditorRemoteOperationStore>(),
+);
+/** Trusted fixture/platform integration seam; never selected by an HTTP field or environment path. */
+export function withEditorOperationStore<T>(store: EditorRemoteOperationStore, run: () => T): T {
+	return operationStoreContext.run(store, run);
+}
+export function editorOperationStore() {
+	return (
+		operationStoreContext.getStore() ??
+		new EditorRemoteOperationStore(join(getNarraforkHome(), "editor-native-operations"))
+	);
+}
+async function openEditorReceiptRpc(record: EditorDurableOperation, signal?: AbortSignal) {
+	if (record.deviceId !== "local") {
+		const backend = resolveBackend({ requested: record.deviceId });
+		if (!(backend instanceof RemoteBackend)) throw new Error("Original editor device unavailable");
+		const rpc = backend.editorWriteRpc();
+		return {
+			...rpc,
+			call: <T>(method: string, params: object, supplied?: AbortSignal) =>
+				rpc.call<T>(method, params, supplied ?? signal),
+		};
+	}
+	const runtime = localFileChangeRuntimeBinding();
+	if (!runtime) throw new Error("Local editor runtime unavailable");
+	const helper = await EditorHelperSession.open(
+		resolveEditorHelper,
+		getNarraforkHome(),
+		join(getNarraforkHome(), "editor-native"),
+		runtime.runtimeEpoch,
+		{ signal },
+	);
+	try {
+		await helper.capabilities();
+		return helper;
+	} catch (error) {
+		await helper.close();
+		throw error;
+	}
+}
+async function acknowledgeEditorReceipt(operationId: string, authorize?: () => Promise<void>) {
+	if (!authorize) return;
+	const record = await editorOperationStore().get(operationId);
+	if (!record) return;
+	const runtime = await getCurrentLocalFileChangeRuntime();
+	// Failed-but-positively-rejected attempts transfer proof too. Unknown executions
+	// are left for the explicit query path, never auto-promoted by this cleanup.
+	if (runtime.evidence.getOperation(record.hostOperationId)?.settlement !== "settled") return;
+	await authorize();
+	const rpc = await openEditorReceiptRpc(record);
+	try {
+		const request = {
+			namespace: record.namespace,
+			resourceKey: record.resourceKey,
+			operationId,
+			requestDigest: record.requestDigest,
+		};
+		const proof = await rpc.call<EditorQueryResult>("editor.query", request);
+		if (!proof.result || proof.outcome !== proof.result.outcome)
+			throw new Error("Terminal editor proof unavailable");
+		const receipt = proof.result;
+		await authorize();
+		runtime.settleEditorReceipt(record, receipt);
+		await withEditorHelperMetadata(rpc, () =>
+			editorOperationStore().markSettled(operationId, receipt),
+		);
+		await rpc.call("editor.query", { ...request, acknowledgeTerminal: true });
+	} finally {
+		await rpc.close();
+	}
+}
+/** Historical export name. Only real remote providers use atomic apply; Host
+ * writes are ordinary bounded FD writes with sync/close and verified evidence. */
+export const executeAtomicEditorFileChange: EditorDocumentDependencies["execute"] = async (
+	request,
+) => {
+	const { resourceKey, remote } = request;
+	if (remote && !(remote.backend instanceof RemoteBackend))
+		throw new AppError("Unsupported editor backend", 503, "EDITOR_PROVIDER_UNSUPPORTED");
+	if (remote && !hostReceiptStorageAvailable())
+		throw new AppError(
+			"Host durable editor receipt storage unavailable",
+			503,
+			"EDITOR_PROVIDER_UNSUPPORTED",
+		);
+	if (!resourceKey)
+		throw new AppError("Editor resource binding unavailable", 503, "EDITOR_PROVIDER_UNSUPPORTED");
+	const backend = remote?.backend;
+	const io = !remote
+		? createFileChangeLocalIo(undefined, {
+				maxBytes: EDITOR_FILE_MAX_BYTES,
+				createParents: false,
+				cancelledMutationIsUnknown: true,
+			})
+		: createEditorFileAtomicIo({
+				resourceKey,
+				store: editorOperationStore(),
+				...(remote && backend instanceof RemoteBackend
+					? {
+							open: async () => backend.editorWriteRpc(),
+							read: (path: string, signal?: AbortSignal) =>
+								backend.editorObservation(
+									{
+										deviceId: backend.deviceId,
+										pathFlavor: backend.pathFlavor,
+										canonicalPath: path,
+										workspaceIdentity: remote.rootIdentity,
+										...remote.runtime,
+										fencingToken: backend.runtimeGeneration,
+									},
+									resourceKey,
+									signal,
+								),
+						}
+					: {}),
+			});
+	const run = () =>
+		withWorkspaceAdmission(
+			{ deviceId: backend?.deviceId ?? "local", path: request.cwd },
+			async () => {
+				await request.authorize();
+				return executeEditorFileChange({ ...request, io });
+			},
+		);
+	if (request.workspaceRevision === undefined)
+		throw new AppError("Editor workspace revision unavailable", 409, "EDITOR_IDENTITY_CHANGED");
+	try {
+		return await workspaceContextService.withRevision(
+			request.narratorId,
+			request.workspaceRevision,
+			undefined,
+			run,
+		);
+	} finally {
+		if (remote)
+			await acknowledgeEditorReceipt(request.requestId, request.authorizeReceipt).catch((error) =>
+				logger.debug("Editor engine ACK deferred", { error: String(error) }),
+			);
+	}
+};
 
 export function getEditorDocumentService(): EditorDocumentService {
 	// A hot module reload must not clean up the live previous generation's pinned objects.
@@ -24,9 +196,25 @@ export function getEditorDocumentService(): EditorDocumentService {
 		() =>
 			new EditorDocumentService({
 				root: join(getNarraforkHome(), "editor-transfers"),
-				execute: executeEditorFileChange,
+				execute: executeAtomicEditorFileChange,
+				writerUnavailableReason: (binding) =>
+					binding.writeTarget?.backend instanceof RemoteBackend && !hostReceiptStorageAvailable()
+						? "host_receipt_storage_unavailable"
+						: "durable_executor_unavailable",
+				writerAvailable: (binding) => {
+					if (binding.writeTarget)
+						return (
+							binding.writeTarget.backend instanceof RemoteBackend &&
+							hostReceiptStorageAvailable() &&
+							binding.writeTarget.backend.supportsEditorDurableWrite
+						);
+					return !binding.rawSource && (!binding.deviceId || binding.deviceId === "local");
+				},
+				atomicWriter: (binding) => binding.writeTarget?.backend instanceof RemoteBackend,
+				rawWriter: { execute: executeAtomicEditorFileChange, queryOperation: queryEditorOperation },
 				queryOperation: queryEditorOperation,
 				async afterWrite(binding, narratorId, requestId, run, actor) {
+					if (binding.deviceId && binding.deviceId !== "local") return run();
 					const rel = relative(binding.cwd, binding.canonicalPath);
 					const claimPath =
 						rel && rel !== ".." && !rel.startsWith(`..${sep}`) ? rel.split(sep).join("/") : null;
@@ -89,12 +277,125 @@ export function getEditorDocumentService(): EditorDocumentService {
 export const queryEditorOperation: NonNullable<
 	EditorDocumentDependencies["queryOperation"]
 > = async (actor, operationId, recovery) => {
+	actor.signal?.throwIfAborted();
+	// Probe only the exact historical association names. In particular, Windows
+	// store.get itself may launch a helper, so never call it for a fresh Host save.
+	const legacyQuery = async (): Promise<EditorOperationResult | null> => {
+		if (!/^[a-zA-Z0-9_-]{1,128}$/.test(operationId)) return null;
+		const root =
+			operationStoreContext.getStore()?.root ??
+			join(getNarraforkHome(), "editor-native-operations");
+		let identified = false;
+		for (const suffix of [".json", ".json.settled"]) {
+			try {
+				const stat = await lstat(join(root, `${operationId}${suffix}`));
+				if (!stat.isFile() || stat.isSymbolicLink())
+					throw new Error("Unsafe historical editor association");
+				identified = true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		if (!identified) return null;
+		const record = await editorOperationStore().get(operationId, actor.signal);
+		if (record) {
+			if (
+				record.userId !== actor.userId ||
+				record.narratorId !== actor.narratorId ||
+				!actor.authorizeOperation
+			)
+				throw new EditorDocumentError(
+					"EDITOR_OPERATION_UNKNOWN",
+					"No owned operation receipt",
+					404,
+				);
+			await actor.authorizeOperation(record.deviceId);
+			if (record.receipt) {
+				try {
+					(await getDefaultLocalFileChangeRuntime()).settleEditorReceipt(record, record.receipt);
+				} catch {
+					await actor.authorizeOperation(record.deviceId);
+					return { status: "uncertain", operationId };
+				}
+				await actor.authorizeOperation(record.deviceId);
+				return record.receipt.outcome === "committed"
+					? {
+							status: "saved",
+							operationId,
+							result: { status: "saved", operationId, ...record.saved },
+						}
+					: { status: "failed", operationId };
+			}
+			const rpc = await openEditorReceiptRpc(record, actor.signal);
+			try {
+				const result = await rpc.call<EditorQueryResult>("editor.query", {
+					namespace: record.namespace,
+					resourceKey: record.resourceKey,
+					operationId,
+					requestDigest: record.requestDigest,
+				});
+				await actor.authorizeOperation(record.deviceId);
+				if (
+					result?.operationId !== operationId ||
+					!["committed", "rejected", "uncertain", "not_found", "proven_not_executed"].includes(
+						result.outcome,
+					)
+				)
+					throw new Error("Invalid editor query result");
+				if (result.outcome !== "committed" && result.outcome !== "rejected")
+					return { status: "uncertain", operationId };
+				if (!result.result || result.result.outcome !== result.outcome)
+					throw new Error("Missing durable editor receipt");
+				const receipt = result.result;
+				const runtime = await getDefaultLocalFileChangeRuntime();
+				try {
+					runtime.settleEditorReceipt(record, receipt);
+					await withEditorHelperMetadata(rpc, () =>
+						editorOperationStore().markSettled(operationId, receipt, actor.signal),
+					);
+					await rpc
+						.call("editor.query", {
+							namespace: record.namespace,
+							resourceKey: record.resourceKey,
+							operationId,
+							requestDigest: record.requestDigest,
+							acknowledgeTerminal: true,
+						})
+						.catch(() => {});
+				} catch (error) {
+					logger.warn("Editor receipt recovery retains original barrier", {
+						operationId,
+						error: String(error),
+					});
+					return { status: "uncertain", operationId };
+				}
+				await actor.authorizeOperation(record.deviceId);
+				return result.outcome === "committed"
+					? {
+							status: "saved",
+							operationId,
+							result: { status: "saved", operationId, ...record.saved },
+						}
+					: { status: "failed", operationId };
+			} finally {
+				await rpc.close();
+			}
+		}
+		return null;
+	};
 	const [{ db }, { fileChangeOperations }] = await Promise.all([
 		import("../db"),
 		import("../db/schema"),
 	]);
 	const runtime = await getDefaultLocalFileChangeRuntime();
-	const namespace = await runtime.verifyNamespace();
+	const namespace = await runtime.verifyNamespace(actor.signal).catch(async (error) => {
+		// A historical receipt can outlive the Host evidence namespace. It is still
+		// queried only when its exact association exists, never for a new operation.
+		const legacy = await legacyQuery();
+		if (legacy) return legacy;
+		throw error;
+	});
+	if (!("sourceInstanceId" in namespace)) return namespace;
 	// Unique source-instance/kind/id/attempt lookup, never a journal scan.
 	const row = db
 		.select({
@@ -114,20 +415,39 @@ export const queryEditorOperation: NonNullable<
 			),
 		)
 		.get();
+	if (!row) {
+		const legacy = await legacyQuery();
+		if (legacy) return legacy;
+	}
 	if (!row || row.owner !== actor.userId || row.narrator !== actor.narratorId)
 		throw new EditorDocumentError(
 			"EDITOR_OPERATION_UNKNOWN",
 			"No owned durable receipt is available; verify before retrying",
 			404,
 		);
-	if (row.settlement !== "settled") return { status: "uncertain", operationId };
+	const effects = runtime.evidence.listEffects(row.id, { limit: 2 }).items;
+	const deviceId = effects[0]?.identityJson.deviceId ?? "local";
+	if (actor.authorizeOperation) await actor.authorizeOperation(deviceId);
+	else if (deviceId !== "local")
+		throw new EditorDocumentError(
+			"EDITOR_OPERATION_UNKNOWN",
+			"Original receipt device authorization unavailable",
+			403,
+		);
+	if (row.settlement !== "settled" || deviceId !== "local") {
+		const legacy = await legacyQuery();
+		if (legacy) return legacy;
+		return { status: "uncertain", operationId };
+	}
 	if (row.status !== "succeeded") return { status: "failed", operationId };
 	if (
 		!recovery ||
 		recovery.operationId !== operationId ||
 		recovery.userId !== actor.userId ||
 		recovery.narratorId !== actor.narratorId
-	)
+	) {
+		const legacy = await legacyQuery();
+		if (legacy) return legacy;
 		return {
 			status: "uncertain",
 			operationId,
@@ -137,7 +457,7 @@ export const queryEditorOperation: NonNullable<
 					"The write settled, but its saved snapshot metadata is unavailable; verify before retrying",
 			},
 		};
-	const effects = runtime.evidence.listEffects(row.id, { limit: 2 }).items;
+	}
 	const after = effects[0]?.observedAfterStateJson;
 	if (
 		effects.length !== 1 ||
@@ -152,6 +472,7 @@ export const queryEditorOperation: NonNullable<
 		result: {
 			status: "saved",
 			operationId,
+			...(recovery.hashKind ? { hashKind: recovery.hashKind } : {}),
 			hash: recovery.hash,
 			bytes: recovery.bytes,
 			snapshotRevision: recovery.snapshotRevision,
