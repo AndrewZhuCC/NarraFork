@@ -52,6 +52,7 @@ const { executionPolicyEngine } = await import("../execution-policy/engine");
 const { createExecutionTargetContext } = await import("../execution-policy/target-context");
 const { permissionRuleService } = await import("../permission-rule-service");
 const { reviewService } = await import("../review-service");
+const { materializeLegacyDelegations } = await import("../legacy-delegation-materializer");
 
 const skillBody = mock(async () => ({ output: "skill ran" }));
 toolRegistry.register(writeTool);
@@ -246,6 +247,7 @@ describe("S6 source restrictions refreshed after real approval", () => {
 								aclRootNarratorId: root,
 							},
 				);
+				if (!explicit) await materializeLegacyDelegations([id]);
 				const isSkill = restriction !== "disabled-tools";
 				const f = await fixture(
 					id,
@@ -326,6 +328,7 @@ describe("S5 both fork entry points preserve policy and model sources", () => {
 								},
 							}),
 				});
+				if (legacy) await materializeLegacyDelegations([id]);
 				const f = await fixture(id, "Read", { file_path: join(cwd, "unused") });
 				const before = await resolveNarratorCapabilities(id, owner);
 				const fork =

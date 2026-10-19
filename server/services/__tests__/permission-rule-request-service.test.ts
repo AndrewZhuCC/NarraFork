@@ -84,6 +84,7 @@ mock.module("../narrator-service", () => ({
 	narratorService: { ...narratorModule.narratorService, updateStatus: async () => {} },
 }));
 const service = await import("../permission-rule-request-service");
+const { materializeLegacyDelegations } = await import("../legacy-delegation-materializer");
 const permission = await import("../narrator-permission");
 test("explicit worktree tools enforce destination write ACLs without expanding receipt paths", () => {
 	for (const toolName of ["ListWorktrees", "GetWorktreeOperation"]) {
@@ -361,6 +362,8 @@ async function seed(
 		createdAt: now(),
 		updatedAt: now(),
 	});
+	// A delegated row stores its source, controller and ceiling.
+	if (parent) await materializeLegacyDelegations([narratorId]);
 	return call(narratorId);
 }
 async function call(narratorId: string) {
@@ -2328,6 +2331,7 @@ describe("attempt-bound permission requests", () => {
 				.update(schema.narrators)
 				.set(update)
 				.where(eq(schema.narrators.id, identity.narratorId));
+			await materializeLegacyDelegations([identity.narratorId]);
 			await expect(
 				service.preparePermissionRuleRequest(identity, proposal, identity.context),
 			).rejects.toThrow("ceilings");

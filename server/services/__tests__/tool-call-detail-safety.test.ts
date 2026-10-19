@@ -13,6 +13,7 @@ import {
 } from "../../db/schema";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { narratorRoutes } from "../../routes/narrators";
 import { getRunHold, setRunHold } from "../agent-runtime/ownership";
 import { runtimePublication } from "../agent-runtime/publication";
@@ -876,8 +877,20 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 		const other = tool(own.id, parent.toolUseId, { toolName: "Agent" });
 		const foreign = tool(narrator().id, parent.toolUseId, { toolName: "Agent" });
 		const subagent = child(own, parent);
+		// The spawning call is the registered delivery target, pinned to its exact row.
 		db.update(narrators)
-			.set({ aclRootNarratorId: own.id, status: "idle" })
+			.set({
+				aclRootNarratorId: own.id,
+				status: "idle",
+				runtimeRegistrationJson: {
+					...delegationRegistration(own.id, "general"),
+					historyPlacement: { toolUseId: parent.toolUseId },
+					run: {
+						logicalRunId: generateId(),
+						deliverTo: { narratorId: own.id, toolUseId: parent.toolUseId, toolCallId: parent.id },
+					},
+				},
+			})
 			.where(eq(narrators.id, subagent.id))
 			.run();
 		let resultMessageId = "";
