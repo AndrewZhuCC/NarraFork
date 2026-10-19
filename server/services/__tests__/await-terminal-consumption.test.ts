@@ -384,7 +384,7 @@ test("foreground output read racing a continuation never guesses the later run",
 			.where(eq(narrators.id, child));
 		return { output: "old output", source: "terminal" as const };
 	});
-	const result = await waitForSubagentResult({ subagentId: child, parentNarratorId: parent });
+	const result = await waitForSubagentResult({ subagentId: child, recipientId: parent });
 	expect(result.output).toBe("old output");
 	expect(result.publicationRun).toBeUndefined();
 });
@@ -397,7 +397,7 @@ for (const event of ["completion", "status"] as const) {
 			.where(eq(narrators.id, child));
 		const waiting = waitForSubagentResult({
 			subagentId: child,
-			parentNarratorId: parent,
+			recipientId: parent,
 			timeoutMs: 1000,
 		});
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -478,7 +478,7 @@ test("foreground subscribe recheck binds the terminal continuation", async () =>
 	const current = await narratorService.getById(child);
 	spyOn(narratorService, "getById").mockResolvedValueOnce({ ...current, status: "working" });
 	expect(
-		await waitForSubagentResult({ subagentId: child, parentNarratorId: parent, timeoutMs: 1000 }),
+		await waitForSubagentResult({ subagentId: child, recipientId: parent, timeoutMs: 1000 }),
 	).toMatchObject({ terminalResultReceived: true, publicationRun: agentRun });
 });
 
@@ -487,7 +487,7 @@ test("interrupt during foreground result read wins without consumption", async (
 	const controller = new AbortController();
 	const waiting = waitForSubagentResult({
 		subagentId: child,
-		parentNarratorId: parent,
+		recipientId: parent,
 		signal: controller.signal,
 		timeoutMs: 1000,
 	});
@@ -505,7 +505,7 @@ test("interrupt during foreground result read wins without consumption", async (
 
 test("taken-over foreground result is not final", async () => {
 	markTakenOver(child);
-	const result = await waitForSubagentResult({ subagentId: child, parentNarratorId: parent });
+	const result = await waitForSubagentResult({ subagentId: child, recipientId: parent });
 	expect(result.status).toBe("taken_over");
 	expect(result.publicationRun).toBeUndefined();
 });

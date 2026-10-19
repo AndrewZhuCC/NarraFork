@@ -100,6 +100,7 @@ import {
 	modelPoolKeyOf,
 	policySourceIdOf,
 	type RuntimeSourceRow,
+	teamMembersWhere,
 } from "../lib/runtime-source";
 import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
 import { escapeLikeNeedle } from "../lib/sql-like";
@@ -1965,11 +1966,7 @@ export const narratorService = {
 			variant: narrators.variant,
 			status: narrators.status,
 		};
-		const scope = and(
-			eq(narrators.parentNarratorId, parentNarratorId),
-			notInArray(narrators.id, [senderId]),
-			sql`${narrators.variant} LIKE 'subagent:%'`,
-		);
+		const scope = and(teamMembersWhere(parentNarratorId), notInArray(narrators.id, [senderId]));
 		// Match the existing last-activity convention, not incidental title/settings edits.
 		const lastActivity = sql<string>`COALESCE(${narrators.lastMessageAt}, ${narrators.updatedAt}, ${narrators.createdAt})`;
 		const targets = await db
@@ -2003,9 +2000,9 @@ export const narratorService = {
 	 * Unbounded on purpose for explicit Send/Await/ContextAsk selector resolution.
 	 * Display uses listSubagentsForTeamView; broadcast uses listSubagentsForBroadcast.
 	 */
-	async listSubagentsByParent(parentNarratorId: string) {
+	async listTeamMembers(rootId: string) {
 		return db.query.narrators.findMany({
-			where: eq(narrators.parentNarratorId, parentNarratorId),
+			where: teamMembersWhere(rootId),
 			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
 	},
@@ -2044,7 +2041,7 @@ export const narratorService = {
 	}> {
 		const limit = Math.max(1, Math.trunc(input.limit));
 		const needle = escapeLikeNeedle(input.query);
-		const conditions = [eq(narrators.parentNarratorId, input.parentNarratorId)];
+		const conditions = [teamMembersWhere(input.parentNarratorId)];
 		if (needle) {
 			const like = `%${needle}%`;
 			const match = or(
