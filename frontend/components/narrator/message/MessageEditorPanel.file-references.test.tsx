@@ -685,6 +685,44 @@ describe("structured edit layout details", () => {
 		);
 		expect(load).toHaveBeenCalledTimes(1);
 	});
+	test("fullscreen edit Enter only newlines; ctrl+Enter still submits", async () => {
+		spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("image", { headers: { "content-type": "image/png" } }),
+		);
+		spyOn(api, "getMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [
+				{
+					imageId: "server-image",
+					filename: "image.png",
+					mediaType: "image/png",
+					size: 3,
+					uploadNarratorId: owner,
+				},
+			],
+			textFiles: [],
+		});
+		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
+			affectedFiles: [],
+			deletedMessageCount: 0,
+		});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(
+			editor({ narratorId: owner, initialText: "stale legacy body", onEditAndRegenerate: save }),
+		);
+		const expand = document.querySelector(".tabler-icon-arrows-maximize")?.closest("button");
+		if (!expand) throw new Error("Fullscreen action missing");
+		await click(expand);
+		// 全屏编辑:Enter(无论是否按 Shift)只换行,不提交。
+		await editorKey("Enter");
+		expect(save).not.toHaveBeenCalled();
+		// mod+Enter 仍然提交。
+		await editorKey("Enter", true);
+		expect(save).toHaveBeenCalledTimes(1);
+	});
 	test("queued detail uses its own endpoint and forwards the unchanged layout with kept resources", async () => {
 		spyOn(globalThis, "fetch").mockResolvedValue(
 			new Response("image", { headers: { "content-type": "image/png" } }),

@@ -17,8 +17,8 @@
  * <Combobox>/<Popover>=300、<Notifications>=400)整体处于 100~400 低区间。
  * 本 token 体系的视口级浮层刻意抬高到 1000 起步,确保手写视口级浮层稳定盖过这些
  * Mantine 默认组件;各档之间留有间隔,便于未来在不重排全局的前提下插入新层级。
- * 例外:`raised`/`stickyHeader` 两档刻意贴近或低于 Mantine 自管层级,供 isolate
- * 内抬升元素与"不得盖住菜单"的内容边缘导航辅助使用。
+ * 例外:`raised`/`stickyHeader`/`fullscreenEditor` 刻意贴近或低于 Mantine 自管层级,供 isolate
+ * 内抬升元素、"不得盖住菜单"的内容边缘导航辅助、以及"弹层在编辑器内部"的全屏编辑器使用。
  *
  * 对齐策略:凡是需要参与本体系排序的 Mantine portal 组件(如全局 <Notifications>、
  * 需压过手写浮层的 Modal),都应显式传入对应的 Z token(见 main.tsx 的
@@ -34,6 +34,13 @@ export const Z = {
 	 * 刻意低于 Mantine 自管 Menu/Modal(200~300):这些内容边缘 chrome 不得盖住读者正在操作的菜单。
 	 */
 	stickyHeader: 100,
+	/**
+	 * CSS 全屏编辑器(聊天输入框 / 消息编辑;DOM 必须留在原地以保住光标与撤销栈,不能走 portal)。
+	 * 刻意低于 dropdown(1000):编辑器内部的 mention/命令/文件引用弹层与优化菜单要画在它上面;
+	 * 又必须高于 App chrome(Navbar/Header 100、WCO 200、Mantine 默认浮层 ≤300)。
+	 * 该值只有配合 fullscreen-escape(中和祖先层叠上下文/包含块)才能真正盖过导航层。
+	 */
+	fullscreenEditor: 400,
 	/** 下拉、combobox、命令浮层、输入框上方的浮层。 */
 	dropdown: 1000,
 	/** 右键上下文菜单的遮罩层(置于菜单之下)。 */

@@ -1,3 +1,4 @@
+import { Z } from "@frontend/lib/z-index";
 import { CloseButton, Group, Kbd, Text, Tooltip, UnstyledButton } from "@mantine/core";
 import type { FileReference } from "@shared/file-reference";
 import { IconFileText, IconQuote } from "@tabler/icons-react";
@@ -99,6 +100,8 @@ export function ComposerQuoteChips({
 					w={360}
 					openDelay={300}
 					withinPortal
+					// 高于全屏编辑器(Z.fullscreenEditor),全屏时 chip 悬停预览仍可见。
+					zIndex={Z.dropdown}
 				>
 					<span style={solidChipStyle} data-composer-quote>
 						<UnstyledButton
@@ -176,6 +179,7 @@ export function ComposerQuoteChips({
 					w={candidate.kind === "text" ? 360 : undefined}
 					openDelay={300}
 					withinPortal
+					zIndex={Z.dropdown}
 				>
 					<span
 						style={{ ...pendingChipStyle, ...(unavailable ? { opacity: 0.6 } : null) }}
