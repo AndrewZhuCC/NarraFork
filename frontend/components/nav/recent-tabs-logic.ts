@@ -95,3 +95,25 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	// narrator and subagent both route to /narrators/:id
 	return pathname === `/narrators/${tab.id}`;
 }
+
+/**
+ * Whether a status event must stay silent (no notification sound, no PWA
+ * browser notification) even though it is an attention state.
+ *
+ * True only for the done-transition (`status === "idle"`) that the server
+ * flagged with `backgroundWorkActive`: the narrator's background work whose
+ * completion wakes it (bash tasks / subagents — never transfers or services)
+ * is still running, so the session is not actually finished, and the wake-up
+ * turn after the last such task completes emits a fresh, unflagged done which
+ * notifies normally. Permission waits (`waiting`) always stay audible — the
+ * agent is blocked on the user, background work or not.
+ *
+ * The favicon alert and unread badge are deliberately NOT gated by this — they
+ * are in-app state indicators, not notifications.
+ */
+export function isBackgroundWorkSilencedStatus(event: {
+	status?: string;
+	backgroundWorkActive?: boolean;
+}): boolean {
+	return event.backgroundWorkActive === true && event.status === "idle";
+}

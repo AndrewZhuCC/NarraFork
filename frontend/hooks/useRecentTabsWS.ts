@@ -47,6 +47,10 @@ function dispatchListStateItem(
 				? state.substatus.filter((value): value is string => typeof value === "string")
 				: undefined,
 			turnStartedAt: typeof state.turnStartedAt === "string" ? state.turnStartedAt : undefined,
+			// Snapshot replay of the done-transition suppression flag (see
+			// sendListStateSnapshot server-side) — suppresses sound/PWA on resubscribe
+			// the same way the live status_change flag does.
+			...(state.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 		});
 	}
 	if (Array.isArray(state.viewers)) {
@@ -142,6 +146,7 @@ export function useRecentTabsWS(
 						status: data.status as string,
 						substatus: data.substatus as string[] | undefined,
 						turnStartedAt: data.turnStartedAt as string | undefined,
+						...(data.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 					});
 				} else if (data.type === "substatus_change") {
 					onUpdateRef.current(narratorId, {

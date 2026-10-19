@@ -123,6 +123,7 @@ export class BackgroundOccupancyIndex {
 	private activeServiceTasks = new Map<string, string[]>();
 	private activeLegacy = new Map<string, string[]>();
 	private counts = new Map<string, BackgroundTaskActiveCounts>();
+	private wakeWorkCounts = new Map<string, number>();
 	private childCounts = new Map<string, number>();
 
 	upsertNarrator(row: OccupancyNarrator): void {
@@ -272,6 +273,7 @@ export class BackgroundOccupancyIndex {
 		}
 		const work = new Map<string, number>();
 		const services = new Map<string, number>();
+		const wakeWork = new Map<string, number>();
 		const activeTasks = new Map<string, Set<string>>();
 		const activeWorkTasks = new Map<string, Set<string>>();
 		const activeServiceTasks = new Map<string, Set<string>>();
@@ -283,6 +285,14 @@ export class BackgroundOccupancyIndex {
 			add(isService(task) ? activeServiceTasks : activeWorkTasks, task.parentNarratorId, task.id);
 			const bucket = isService(task) ? services : work;
 			bucket.set(task.parentNarratorId, (bucket.get(task.parentNarratorId) ?? 0) + 1);
+			// Wake-work: only task kinds whose terminal commit publishes a parent
+			// wake-up (bash tasks, subagents). A transfer's terminal commit skips
+			// publication entirely (commitTerminalTask returns early), so a transfer
+			// must never count here — nothing would ever re-raise the attention it
+			// suppressed. Services are not work at all.
+			if (!isService(task) && task.type !== "transfer") {
+				wakeWork.set(task.parentNarratorId, (wakeWork.get(task.parentNarratorId) ?? 0) + 1);
+			}
 		}
 		for (const row of this.narrators.values()) {
 			if (
@@ -293,6 +303,9 @@ export class BackgroundOccupancyIndex {
 			) {
 				add(activeLegacy, row.parentNarratorId, row.id);
 				work.set(row.parentNarratorId, (work.get(row.parentNarratorId) ?? 0) + 1);
+				// A legacy projection-less background narrator is still a subagent: its
+				// completion wakes the parent, so it qualifies as wake-work.
+				wakeWork.set(row.parentNarratorId, (wakeWork.get(row.parentNarratorId) ?? 0) + 1);
 			}
 		}
 		const counts = new Map<string, BackgroundTaskActiveCounts>();
@@ -315,6 +328,7 @@ export class BackgroundOccupancyIndex {
 		this.activeServiceTasks = orderedBuckets(activeServiceTasks, taskCreatedAt);
 		this.activeLegacy = orderedBuckets(activeLegacy, narratorCreatedAt);
 		this.counts = counts;
+		this.wakeWorkCounts = wakeWork;
 		this.childCounts = childCounts;
 	}
 
@@ -358,6 +372,17 @@ export class BackgroundOccupancyIndex {
 					? this.activeServiceTasks
 					: this.activeWorkTasks;
 		return limitedIds(buckets.get(parentId), opts.limit);
+	}
+
+	/**
+	 * Active per-parent count of background work whose completion WAKES the
+	 * parent narrator (background bash tasks and subagents, including legacy
+	 * projection-less ones). Transfers are deliberately excluded: their terminal
+	 * commit skips publication, so nothing would re-raise an attention they
+	 * suppressed. Services are excluded by the work bucket already.
+	 */
+	getActiveWakeWorkCount(parentId: string): number {
+		return this.wakeWorkCounts.get(parentId) ?? 0;
 	}
 
 	getOccupiedChildIds(parentId: string, limit?: number): string[] {

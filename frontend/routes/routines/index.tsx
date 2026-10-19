@@ -400,6 +400,7 @@ const HOOK_EVENT_FIELDS: Record<string, ReadonlyArray<readonly [string, string]>
 	Attention: [
 		["attention_reason", "hookFieldAttentionReason"],
 		["attention_detail", "hookFieldAttentionDetail"],
+		["background_work_active", "hookFieldBackgroundWorkActive"],
 	],
 	AttentionResolved: [
 		["attention_reason", "hookFieldAttentionReason"],

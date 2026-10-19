@@ -222,6 +222,36 @@ describe("background occupancy coordinator", () => {
 		await store.start();
 	});
 
+	test("wake-work counts only tasks whose completion wakes the parent", async () => {
+		const { source, store } = fixture();
+		// bash task — wakes the parent on completion.
+		source.tasks.set("bash-task", task("bash-task", "root"));
+		// background subagent — wakes the parent on completion.
+		source.tasks.set(
+			"agent-task",
+			task("agent-task", "root", { type: "agent", subagentNarratorId: "child" }),
+		);
+		// legacy projection-less background narrator — still a subagent, wakes the parent.
+		source.narrators.set(
+			"legacy-bg",
+			narrator("legacy-bg", "root", { isBackground: true, backgroundStatus: "running" }),
+		);
+		// service — not work at all.
+		source.tasks.set("svc", task("svc", "root", { backgroundKind: "service" }));
+		// transfer — work for the badge, but its terminal commit skips publication,
+		// so no wake-up turn would ever re-raise a suppressed done notification.
+		source.tasks.set("xfer", task("xfer", "root", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(3);
+		// The badge work count still includes the transfer (and the service sits apart).
+		expect(store.snapshot(["root"]).counts.get("root")).toEqual({
+			activeCount: 5,
+			activeWorkCount: 4,
+			activeServiceCount: 1,
+		});
+	});
+
 	test("dirty events arriving during shadow rebuild are replayed before publish", async () => {
 		const { source, store } = fixture();
 		source.tasks.set("work", task("work", "leaf"));

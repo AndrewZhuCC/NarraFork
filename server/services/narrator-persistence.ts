@@ -1183,6 +1183,44 @@ function mergeReasoningMetadata(
 	return merged;
 }
 
+/**
+ * Whether the narrator still has active background work whose completion WAKES
+ * it — background bash tasks and background subagents. Two kinds of activity
+ * deliberately do NOT count:
+ *
+ * - services (`bash` + `backgroundKind: "service"`), which are long-lived by
+ *   definition and never part of "the turn's work";
+ * - transfers, whose terminal commit skips publication entirely
+ *   (`commitTerminalTask` returns early), so a transfer completing never
+ *   produces a wake-up turn. Counting transfers here would suppress the done
+ *   notification with no compensating re-raise — the exact leak this flag
+ *   exists to avoid would become a notification that never arrives at all.
+ *
+ * Consulted only on the done-transition (`idle` + `unread`): a turn that
+ * finished while its background work is still running is not worth pinging the
+ * user about — the wake-up turn after the last background task completes emits
+ * a fresh, unflagged "done". The occupancy store is flushed first so a task
+ * started during the final turn is already indexed when we read. Note this
+ * makes the done-path `status_change` broadcast wait for one occupancy
+ * maintenance pass (a few small indexed reads); other transitions never pay it.
+ *
+ * Fail-open (false) before the store's startup scan completes or on error: the
+ * fallback is simply today's behaviour (notify), never a swallowed attention.
+ */
+async function hasActiveBackgroundWork(narratorId: string): Promise<boolean> {
+	try {
+		if (!backgroundOccupancyStore.isReady) return false;
+		await backgroundOccupancyStore.flush();
+		return backgroundOccupancyStore.countActiveWakeWork(narratorId) > 0;
+	} catch (err) {
+		logger.warn("Failed to resolve background work occupancy; notifying as usual", {
+			narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return false;
+	}
+}
+
 const sqliteNarratorPersistence = {
 	/**
 	 * Persist a `role: "user"` message.
@@ -2752,8 +2790,19 @@ const sqliteNarratorPersistence = {
 		// "alert the user" states. `waiting` is intentionally excluded — its
 		// attention intent is decided by the producer (handlePermission), not
 		// re-derived here, because `waiting` is also reused for reflection states.
+		// A "done" raised while non-service background work is still running carries
+		// `backgroundWorkActive` so notification channels suppress the ping while
+		// hooks still observe the event; the flag also rides the status_change
+		// broadcast below so the client's sound/PWA decision uses the same value.
+		let backgroundWorkActive = false;
 		if (status === "idle" && actualSubstatus?.includes("unread")) {
-			eventBus.emit({ type: "narrator:attention", narratorId, reason: "done" });
+			backgroundWorkActive = await hasActiveBackgroundWork(narratorId);
+			eventBus.emit({
+				type: "narrator:attention",
+				narratorId,
+				reason: "done",
+				...(backgroundWorkActive ? { backgroundWorkActive } : {}),
+			});
 		} else if (actualSubstatus?.includes("error")) {
 			eventBus.emit({
 				type: "narrator:attention",
@@ -2874,6 +2923,7 @@ const sqliteNarratorPersistence = {
 			status,
 			substatus: actualSubstatus,
 			turnStartedAt: broadcastTurnStartedAt,
+			...(backgroundWorkActive ? { backgroundWorkActive } : {}),
 		});
 	},
 
@@ -2959,8 +3009,15 @@ const sqliteNarratorPersistence = {
 		// Emit the semantic attention intent for done/error (see updateStatus for
 		// why `waiting` is excluded). compareAndSetStatus is the path that marks a
 		// finished turn idle+unread, so this is the primary "done" emit point.
+		let backgroundWorkActive = false;
 		if (newStatus === "idle" && actualSubstatus?.includes("unread")) {
-			eventBus.emit({ type: "narrator:attention", narratorId, reason: "done" });
+			backgroundWorkActive = await hasActiveBackgroundWork(narratorId);
+			eventBus.emit({
+				type: "narrator:attention",
+				narratorId,
+				reason: "done",
+				...(backgroundWorkActive ? { backgroundWorkActive } : {}),
+			});
 		} else if (actualSubstatus?.includes("error")) {
 			eventBus.emit({
 				type: "narrator:attention",
@@ -2983,6 +3040,7 @@ const sqliteNarratorPersistence = {
 			status: newStatus,
 			substatus: actualSubstatus,
 			turnStartedAt: broadcastTurnStartedAt,
+			...(backgroundWorkActive ? { backgroundWorkActive } : {}),
 		});
 		return true;
 	},

@@ -239,6 +239,17 @@ export class BackgroundOccupancyStore {
 		return this.index.getActiveTaskIds(parentId, opts);
 	}
 
+	/**
+	 * Active background work whose completion wakes the parent narrator
+	 * (background bash tasks and subagents — never transfers or services).
+	 * The done-notification suppression keys on this count: every suppressing
+	 * task kind must guarantee a compensating wake-up turn after it completes.
+	 */
+	countActiveWakeWork(parentId: string): number {
+		this.assertReadable();
+		return this.index.getActiveWakeWorkCount(parentId);
+	}
+
 	getOccupiedChildIds(parentId: string, limit?: number): string[] {
 		this.assertReadable();
 		return this.index.getOccupiedChildIds(parentId, limit);

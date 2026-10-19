@@ -5,7 +5,14 @@ import {
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
 } from "../../shared/recent-tabs";
 import { cleanDb, getTestDb } from "../../tests/setup";
-import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
+import {
+	backgroundTasks,
+	chapters,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	projects,
+} from "../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../db")) };
@@ -647,5 +654,168 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 			revision: 4,
 		});
 		expect(broken.sent).toHaveLength(0);
+	});
+});
+
+describe("narrator WebSocket backgroundWorkActive snapshot flag", () => {
+	/** Idle + unread narrator whose background occupancy we control per test. */
+	function seedUnreadNarrator(id: string) {
+		const now = "2026-07-19T00:00:00.000Z";
+		db.insert(narrators)
+			.values({
+				id,
+				status: "idle",
+				substatus: '["unread"]',
+				visibility: "public",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+	}
+
+	async function seedRunningTask(id: string, parentNarratorId: string, kind: "task" | "service") {
+		const now = new Date().toISOString();
+		db.insert(backgroundTasks)
+			.values({
+				id,
+				parentNarratorId,
+				type: "bash",
+				backgroundKind: kind,
+				status: "running",
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		backgroundOccupancyStore.refreshTask(id);
+		await settleOccupancy();
+	}
+
+	async function seedRunningTransfer(id: string, parentNarratorId: string) {
+		const now = new Date().toISOString();
+		db.insert(backgroundTasks)
+			.values({
+				id,
+				parentNarratorId,
+				type: "transfer",
+				status: "running",
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		backgroundOccupancyStore.refreshTask(id);
+		await settleOccupancy();
+	}
+
+	it("flags an idle+unread list snapshot item whose background work is still running", async () => {
+		await seedNarrators();
+		seedUnreadNarrator("narrator-unread-work");
+		await seedRunningTask("snapshot-flag-task", "narrator-unread-work", "task");
+
+		const { ws, sent } = openFakeWs();
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "list",
+			narratorIds: ["narrator-unread-work"],
+		});
+
+		expect(sent[0]).toMatchObject({
+			type: "list_state_snapshot",
+			items: [
+				{
+					narratorId: "narrator-unread-work",
+					status: "idle",
+					substatus: ["unread"],
+					activeBackgroundWorkCount: 1,
+					backgroundWorkActive: true,
+				},
+			],
+		});
+	});
+
+	it("does not flag an idle+unread list snapshot item with only a service running", async () => {
+		await seedNarrators();
+		seedUnreadNarrator("narrator-unread-service");
+		await seedRunningTask("snapshot-flag-service", "narrator-unread-service", "service");
+
+		const { ws, sent } = openFakeWs();
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "list",
+			narratorIds: ["narrator-unread-service"],
+		});
+
+		const item = (sent[0]?.items as Record<string, unknown>[])[0];
+		expect(item).toMatchObject({
+			narratorId: "narrator-unread-service",
+			status: "idle",
+			activeBackgroundServiceCount: 1,
+		});
+		expect(item).not.toHaveProperty("backgroundWorkActive");
+	});
+
+	it("flags the panel status_change snapshot for a done narrator with running work", async () => {
+		await seedNarrators();
+		seedUnreadNarrator("narrator-unread-panel");
+		await seedRunningTask("snapshot-flag-panel-task", "narrator-unread-panel", "task");
+
+		const { ws, sent } = openFakeWs();
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "panel",
+			narratorIds: ["narrator-unread-panel"],
+		});
+
+		const statusFrame = sent.find((message) => message.type === "status_change");
+		expect(statusFrame).toMatchObject({
+			narratorId: "narrator-unread-panel",
+			status: "idle",
+			substatus: ["unread"],
+			backgroundWorkActive: true,
+		});
+	});
+
+	it("omits the flag on panel snapshots when nothing runs in the background", async () => {
+		await seedNarrators();
+		seedUnreadNarrator("narrator-unread-quiet");
+
+		const { ws, sent } = openFakeWs();
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "panel",
+			narratorIds: ["narrator-unread-quiet"],
+		});
+
+		const statusFrame = sent.find((message) => message.type === "status_change");
+		expect(statusFrame).toMatchObject({
+			narratorId: "narrator-unread-quiet",
+			status: "idle",
+			substatus: ["unread"],
+		});
+		expect(statusFrame).not.toHaveProperty("backgroundWorkActive");
+	});
+
+	it("never flags a running transfer — its completion has no wake-up turn to re-raise", async () => {
+		await seedNarrators();
+		seedUnreadNarrator("narrator-unread-transfer");
+		await seedRunningTransfer("snapshot-flag-transfer", "narrator-unread-transfer");
+
+		const { ws, sent } = openFakeWs();
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "list",
+			narratorIds: ["narrator-unread-transfer"],
+		});
+
+		const item = (sent[0]?.items as Record<string, unknown>[])[0];
+		expect(item).toMatchObject({
+			narratorId: "narrator-unread-transfer",
+			status: "idle",
+			// The badge still shows the transfer as work; only the notification
+			// suppression flag must not.
+			activeBackgroundWorkCount: 1,
+		});
+		expect(item).not.toHaveProperty("backgroundWorkActive");
 	});
 });

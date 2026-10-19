@@ -1995,6 +1995,13 @@ export interface NarratorListWSEvent {
 	substatus?: string[];
 	/** Execution generation for the current/last turn — used to dedup notifications per turn. */
 	turnStartedAt?: string;
+	/**
+	 * `status` only, done-transition (idle + unread): non-service background work
+	 * is still running. The narrator still renders unread and the favicon still
+	 * alerts, but the sound/PWA notification is suppressed — the wake-up turn
+	 * after the last background task completes notifies normally.
+	 */
+	backgroundWorkActive?: boolean;
 	title?: string;
 	permissionMode?: string;
 	viewers?: Array<{
@@ -2081,6 +2088,7 @@ export function useNarratorsListWS(
 							type: "status",
 							status: data.status as string,
 							substatus: data.substatus as string[] | undefined,
+							...(data.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 						});
 				} else if (data.type === "substatus_change") {
 					if (nId)
