@@ -148,7 +148,7 @@ func (e *EditorEngine) stageOpen(ctx context.Context, req EditorStageOpen) (any,
 	if err := editorBinding(req.Namespace, req.ResourceKey); err != nil {
 		return nil, err
 	}
-	if req.MaxBytes < 0 || req.MaxBytes > EditorMaxBytes || req.IdleTimeoutMs < 1 || req.IdleTimeoutMs > 30000 {
+	if req.MaxBytes < 0 || req.MaxBytes > EditorMaxBytes || req.IdleTimeoutMs < 1 || req.IdleTimeoutMs > editorMaxStageIdle.Milliseconds() {
 		return nil, fmt.Errorf("invalid editor stage budget")
 	}
 	count, total, err := e.stageBudget()

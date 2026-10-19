@@ -120,6 +120,40 @@ const TOOL_COLUMNS = {
 	segmentId: narratorToolCalls.executionSegmentId,
 };
 
+/** The original remote editor intent, shared by settlement, query and status mapping.
+ * Null means the row lacks a field remote receipts are bound to; it never proves non-execution. */
+export function remoteEditorIntent(
+	operation: FileChangeOperationRecord,
+	effect: FileChangeEffectRecord,
+) {
+	const binding = operation.executionBindingJson;
+	const intended = effect.intendedAfterStateJson;
+	if (
+		operation.sourceKind !== "editor" ||
+		!binding ||
+		!operation.ownerUserId ||
+		!operation.narratorId ||
+		!operation.requestDigest ||
+		!operation.workspaceLeaseId ||
+		operation.editorRawSnapshotRevision === null ||
+		intended.kind !== "regular" ||
+		effect.identityJson.deviceId === LOCAL_DEVICE_ID ||
+		effect.identityJson.deviceId !== binding.deviceId ||
+		effect.requestDigest !== operation.requestDigest
+	)
+		return null;
+	return {
+		ownerUserId: operation.ownerUserId,
+		narratorId: operation.narratorId,
+		requestDigest: operation.requestDigest,
+		workspaceLeaseId: operation.workspaceLeaseId,
+		snapshotRevision: operation.editorRawSnapshotRevision,
+		deviceId: binding.deviceId,
+		executionBinding: binding,
+		intended,
+	};
+}
+
 /** Process identity survives --hot but is never reused across an actual restart. */
 export function localFileChangeRuntimeBinding(
 	deviceId = LOCAL_DEVICE_ID,
@@ -347,40 +381,22 @@ export class LocalFileChangeRuntime {
 		const operation = this.evidence.getOperation(operationId);
 		const effects = this.evidence.listEffects(operationId, { limit: 2 }).items;
 		const effect = effects.length === 1 ? effects[0] : undefined;
+		const intent = operation && effect ? remoteEditorIntent(operation, effect) : null;
 		const verify = () => {
 			if (
-				!operation ||
-				!effect ||
-				!operation.executionBindingJson ||
-				operation.sourceKind !== "editor" ||
-				!operation.ownerUserId ||
-				!operation.narratorId ||
-				!operation.workspaceLeaseId ||
-				operation.editorRawSnapshotRevision === null ||
-				effect.identityJson.deviceId === "local" ||
-				effect.identityJson.deviceId !== operation.executionBindingJson.deviceId ||
-				effect.requestDigest !== operation.requestDigest ||
-				result.operationId !== operation.sourceId ||
+				!intent ||
+				result.operationId !== operation?.sourceId ||
 				!["committed", "rejected"].includes(result.outcome) ||
 				(result.outcome === "committed" &&
-					(effect.intendedAfterStateJson.kind !== "regular" ||
-						effect.intendedAfterStateJson.blob.digest !== result.rawDigest ||
-						effect.intendedAfterStateJson.blob.sizeBytes !== result.totalBytes)) ||
+					(intent.intended.blob.digest !== result.rawDigest ||
+						intent.intended.blob.sizeBytes !== result.totalBytes)) ||
 				(result.outcome === "rejected" && (result.rawDigest !== null || result.totalBytes !== null))
 			)
 				throw new Error("Editor receipt does not match its original owned intent");
 		};
 		verify();
-		if (
-			!operation ||
-			!effect ||
-			!operation.executionBindingJson ||
-			!operation.workspaceLeaseId ||
-			!operation.requestDigest
-		)
-			throw new Error("Editor intent unavailable");
-		const executionBinding = operation.executionBindingJson;
-		const requestDigest = operation.requestDigest;
+		if (!operation || !effect || !intent) throw new Error("Editor intent unavailable");
+		const { executionBinding, requestDigest } = intent;
 		if (effect.settlement === "settled") {
 			if (
 				!effect.executionConfirmed ||
@@ -394,7 +410,7 @@ export class LocalFileChangeRuntime {
 		if (!scope) throw new Error("Original editor scope unavailable");
 		this.coordinator.acknowledgeEditorReceipt(
 			{
-				leaseId: operation.workspaceLeaseId,
+				leaseId: intent.workspaceLeaseId,
 				operationId: operation.id,
 				effectId: effect.id,
 				mutationId: effect.mutationId,
@@ -403,7 +419,7 @@ export class LocalFileChangeRuntime {
 		);
 		const reservation = this.coordinator.reserveRecovery({
 			scope,
-			leaseId: operation.workspaceLeaseId,
+			leaseId: intent.workspaceLeaseId,
 		});
 		try {
 			reservation.complete((tx) => {

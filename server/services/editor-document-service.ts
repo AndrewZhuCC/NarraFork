@@ -1678,8 +1678,15 @@ export class EditorDocumentService {
 			if (operation.deviceId && actor.authorizeOperation)
 				await actor.authorizeOperation(operation.deviceId);
 			// Remote receipts are canonical in SQLite, including live terminal results
-			// whose direct ACK may have failed. Do not bypass reconciliation via cache.
-			if (operation.deviceId && operation.deviceId !== "local" && this.deps.queryOperation)
+			// whose direct ACK may have failed. A live commit must not race its own apply,
+			// and a pre-dispatch rejection has no SQLite row, so both stay cache-only.
+			if (
+				operation.deviceId &&
+				operation.deviceId !== "local" &&
+				this.deps.queryOperation &&
+				operation.value.status !== "committing" &&
+				operation.value.status !== "failed"
+			)
 				return this.deps.queryOperation(actor, operationId);
 			if (operation.recovery?.hashKind === "raw-sha256" && this.deps.rawWriter)
 				return this.deps.rawWriter.queryOperation(actor, operationId, operation.recovery);

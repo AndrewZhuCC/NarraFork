@@ -1189,6 +1189,38 @@ describe("large editor objects and real durable pipeline", () => {
 		);
 		expect((await create()).encoding).toBe("utf-16le");
 	});
+	test("remote live commit and pre-dispatch failure answer from cache; terminal saves reconcile", async () => {
+		const queried: string[] = [];
+		await service.dispose();
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: (request) => runtime.executeEditor(request),
+			queryOperation: async (_actor, operationId) => {
+				queried.push(operationId);
+				return { status: "saved", operationId };
+			},
+		});
+		actor.authorizeOperation = async () => {};
+		await service.operation(actor, "warm-up").catch(() => {});
+		queried.length = 0;
+		const operations = Reflect.get(service, "operations") as Map<string, unknown>;
+		const seed = (operationId: string, status: "committing" | "failed" | "saved") =>
+			operations.set(operationId, {
+				deviceId: "remote-device",
+				userId: actor.userId,
+				narratorId: actor.narratorId,
+				value: { status, operationId },
+				expires: Date.now() + 60_000,
+			});
+		seed("live", "committing");
+		seed("stale", "failed");
+		seed("settled", "saved");
+		expect((await service.operation(actor, "live")).status).toBe("committing");
+		expect((await service.operation(actor, "stale")).status).toBe("failed");
+		expect((await service.operation(actor, "settled")).status).toBe("saved");
+		expect(queried).toEqual(["settled"]);
+		operations.clear();
+	});
 	test("restart recovery combines bounded metadata with the real settled receipt", async () => {
 		const doc = await create(),
 			id = await upload(doc, "persisted\n");
