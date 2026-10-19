@@ -141,8 +141,13 @@
 	color: var(--mantine-color-text);
 	box-sizing: border-box;
 	user-select: none;
-	max-width: min(240px, 100%);
-	margin-inline: 2px;
+	/*
+	 * Keep clickable empty space around chips: 4px margins separate neighbours, and
+	 * the 32px max-width reserve guarantees a trailing gap even when one chip would
+	 * fill a narrow row — tapping the gap focuses the editor instead of the remove ✕.
+	 */
+	max-width: min(240px, calc(100% - 32px));
+	margin-inline: 4px;
 }
 
 .chip {
@@ -276,7 +281,8 @@
 
 .candidate {
 	gap: 3px;
-	max-width: min(260px, 100%);
+	/* Same 32px row-end reserve as .atom keeps the row end tappable on narrow screens. */
+	max-width: min(260px, calc(100% - 32px));
 	border-style: dashed;
 	border-color: var(--mantine-primary-color-filled);
 	white-space: nowrap;
