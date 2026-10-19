@@ -24,6 +24,12 @@ const editorReceiptCleanupBatch = 16
 const editorReceiptRetention = 7 * 24 * time.Hour
 const editorMaxStateFiles = editorMaxReceipts + editorMaxFences + editorMaxStages*2 + 16
 const editorMaxMetadata = 128 * 1024
+const editorMaxStageIdle = 30 * time.Second
+
+// A stage's ExpiresAt is at most one idle window past its last append (open
+// creates, append writes) plus one more for seal. Bodies of another engine
+// incarnation sharing this root are only reclaimed once that bound has passed.
+const editorForeignStageGrace = 2*editorMaxStageIdle + 5*time.Second
 
 // Stages are volatile, including sealed stages. Only operation receipts are
 // durable. Root locking serializes intent/replace/query and protects referenced
@@ -242,6 +248,18 @@ func (e *EditorEngine) receiptPath(namespace, op string) string {
 func validEditorStageID(id string) bool {
 	return len(id) == 97 && id[48] == '-' && editorValidStageToken(id[:48]) && editorValidStageToken(id[49:])
 }
+
+// Receipts written before stage epochs (bare 48-hex stage, no body metadata)
+// stay readable so an upgrade never strands durable proof or blocks admission.
+func editorKnownStageID(id string) bool {
+	return validEditorStageID(id) || editorValidStageToken(id)
+}
+func editorReceiptBodyValid(r *editorReceipt) bool {
+	if validEditorStageID(r.Request.StageID) {
+		return editorValidDigest(r.StageRawDigest) && r.StageBytes >= 0 && r.StageBytes <= EditorMaxBytes
+	}
+	return editorValidStageToken(r.Request.StageID) && r.StageRawDigest == "" && r.StageBytes == 0
+}
 func editorValidStageToken(id string) bool {
 	if len(id) != 48 {
 		return false
@@ -279,7 +297,7 @@ func (e *EditorEngine) dropStage(s *editorStage) error {
 	return nil
 }
 func (e *EditorEngine) removeBody(id string) error {
-	if !validEditorStageID(id) {
+	if !editorKnownStageID(id) {
 		return fmt.Errorf("invalid receipt stage binding")
 	}
 	if s := e.stages[id]; s != nil {
@@ -325,7 +343,7 @@ func (e *EditorEngine) scanState() ([]os.DirEntry, map[string]*editorReceipt, er
 		if r.Version != 1 || !editorValidKey(r.Request.Namespace) || !editorValidKey(r.Request.ResourceKey) || !editorValidKey(r.Request.OperationID) || !editorValidDigest(r.Request.RequestDigest) || entry.Name() != filepath.Base(e.receiptPath(r.Request.Namespace, r.Request.OperationID)) {
 			return nil, nil, fmt.Errorf("invalid editor receipt binding")
 		}
-		if !validEditorStageID(r.Request.StageID) || !editorValidDigest(r.StageRawDigest) || r.StageBytes < 0 || r.StageBytes > EditorMaxBytes {
+		if !editorReceiptBodyValid(&r) {
 			return nil, nil, fmt.Errorf("invalid editor receipt body metadata")
 		}
 		switch r.State {
@@ -349,24 +367,27 @@ func (e *EditorEngine) stageBudget() (int, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	count, total, err := e.collectStages(entries, receipts)
+	count, total, foreign, err := e.collectStages(entries, receipts)
 	if err != nil {
 		return 0, 0, err
 	}
 	// Orphan ceilings have no operation or live-stage owner. Their removal is
 	// cache cleanup; no receipt transition or durability barrier is published.
-	if err = e.cleanupOrphanFences(entries, receipts); err != nil {
+	if err = e.cleanupOrphanFences(entries, receipts, foreign); err != nil {
 		return 0, 0, err
 	}
 	return count, total, nil
 }
-func (e *EditorEngine) collectStages(entries []os.DirEntry, receipts map[string]*editorReceipt) (int, int64, error) {
+
+// The third result reports a live body owned by another engine incarnation.
+// Its namespace is unknown here, so orphan fence cleanup must stand down.
+func (e *EditorEngine) collectStages(entries []os.DirEntry, receipts map[string]*editorReceipt) (int, int64, bool, error) {
 	refs := make(map[string]bool)
 	required := make(map[string]int64)
 	for _, r := range receipts {
 		id := r.Request.StageID
-		if !validEditorStageID(id) {
-			return 0, 0, fmt.Errorf("invalid receipt stage binding")
+		if !editorKnownStageID(id) {
+			return 0, 0, false, fmt.Errorf("invalid receipt stage binding")
 		}
 		refs[id] = true
 		if e.bodyRequired(r) {
@@ -375,19 +396,20 @@ func (e *EditorEngine) collectStages(entries []os.DirEntry, receipts map[string]
 	}
 	count := 0
 	var total int64
+	foreign := false
 	counted := make(map[string]bool)
 	for id, s := range e.stages {
 		if refs[id] {
 			if _, keep := required[id]; !keep {
 				if err := e.dropStage(s); err != nil {
-					return 0, 0, err
+					return 0, 0, false, err
 				}
 			}
 			continue
 		}
 		if s.OperationID != "" || s.ExpiresAt < time.Now().UnixMilli() {
 			if err := e.dropStage(s); err != nil {
-				return 0, 0, err
+				return 0, 0, false, err
 			}
 			continue
 		}
@@ -396,30 +418,50 @@ func (e *EditorEngine) collectStages(entries []os.DirEntry, receipts map[string]
 		counted[id] = true
 	}
 	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".body") {
+		name := entry.Name()
+		if stem, ok := strings.CutSuffix(name, ".stage.json"); ok && editorValidStageToken(stem) {
+			// Pre-epoch stage metadata never proves an operation; receipts do.
+			if err := os.Remove(filepath.Join(e.root, name)); err != nil && !os.IsNotExist(err) {
+				return 0, 0, false, err
+			}
 			continue
 		}
-		id := strings.TrimSuffix(entry.Name(), ".body")
-		if !validEditorStageID(id) {
-			return 0, 0, fmt.Errorf("invalid staging body inventory")
+		if !strings.HasSuffix(name, ".body") {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".body")
+		if !editorKnownStageID(id) {
+			return 0, 0, false, fmt.Errorf("invalid staging body inventory")
 		}
 		if counted[id] {
 			continue
 		}
+		info, err := entry.Info()
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return 0, 0, false, err
+		}
 		if _, keep := required[id]; !keep {
+			// Another incarnation may still be appending to or sealing an
+			// undispatched body; leave it alone until its idle bound has passed.
+			if !refs[id] && !strings.HasPrefix(id, e.stageEpoch+"-") && time.Since(info.ModTime()) < editorForeignStageGrace {
+				foreign = true
+				count++
+				total += info.Size()
+				counted[id] = true
+				continue
+			}
 			// No receipt ever dispatched this body, or durable terminal proof no
-			// longer needs it. An engine may invalidate another's volatile stages.
+			// longer needs it.
 			if err := e.removeBody(id); err != nil {
-				return 0, 0, err
+				return 0, 0, false, err
 			}
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return 0, 0, err
-		}
 		if !info.Mode().IsRegular() || info.Size() > EditorMaxBytes {
-			return 0, 0, fmt.Errorf("invalid staging body size/type")
+			return 0, 0, false, fmt.Errorf("invalid staging body size/type")
 		}
 		count++
 		total += info.Size()
@@ -431,7 +473,7 @@ func (e *EditorEngine) collectStages(entries []os.DirEntry, receipts map[string]
 			total += size
 		}
 	}
-	return count, total, nil
+	return count, total, foreign, nil
 }
 
 // Recovery and retention run only on the durable-operation path, never open /
@@ -457,11 +499,11 @@ func (e *EditorEngine) inventory() (int, int64, int, error) {
 	if err = e.pruneReceipts(receipts, protected); err != nil {
 		return 0, 0, 0, err
 	}
-	count, total, err := e.collectStages(entries, receipts)
+	count, total, foreign, err := e.collectStages(entries, receipts)
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	if err = e.cleanupOrphanFences(entries, receipts); err != nil {
+	if err = e.cleanupOrphanFences(entries, receipts, foreign); err != nil {
 		return 0, 0, 0, err
 	}
 	for _, entry := range entries {
@@ -473,7 +515,10 @@ func (e *EditorEngine) inventory() (int, int64, int, error) {
 	}
 	return count, total, len(receipts), syncEditorDirectory(e.root)
 }
-func (e *EditorEngine) cleanupOrphanFences(entries []os.DirEntry, receipts map[string]*editorReceipt) error {
+func (e *EditorEngine) cleanupOrphanFences(entries []os.DirEntry, receipts map[string]*editorReceipt, foreignStages bool) error {
+	if foreignStages {
+		return nil
+	}
 	live := make(map[string]bool)
 	for _, r := range receipts {
 		live[editorKey(r.Request.Namespace, r.Request.Identity.WorkspaceIdentity)+".fence.json"] = true
@@ -578,7 +623,7 @@ func (e *EditorEngine) loadReceipt(namespace, resource, op, digest string) (*edi
 	if r.Request.RequestDigest != digest {
 		return nil, fmt.Errorf("EDITOR_APPLY_REJECTED: operation digest mismatch")
 	}
-	if !validEditorStageID(r.Request.StageID) || !editorValidDigest(r.StageRawDigest) || r.StageBytes < 0 || r.StageBytes > EditorMaxBytes {
+	if !editorReceiptBodyValid(&r) {
 		return nil, fmt.Errorf("invalid editor receipt body metadata")
 	}
 	// Holding the root lock proves no writer is live in this incomplete journal.

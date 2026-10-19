@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func volatileOpen(t *testing.T, f *editorFixture, max int64) EditorStageHandle {
@@ -294,5 +296,99 @@ func TestEditorTerminalBodiesDoNotFillStagingBudget(t *testing.T) {
 	receipts, err := filepath.Glob(filepath.Join(f.state, "*.op.json"))
 	if err != nil || len(receipts) != 8 {
 		t.Fatal("body cleanup discarded unacknowledged terminal receipts", len(receipts), err)
+	}
+}
+func TestEditorLegacyStateStaysQueryableAndIsReclaimed(t *testing.T) {
+	f := newEditorFixture(t, []byte("before"))
+	request := f.request(t, "current", []byte("before"), []byte("after"))
+	if result := f.call(t, "editor.apply", request).(EditorApplyResult); result.Outcome != "committed" {
+		t.Fatal(result)
+	}
+	var r editorReceipt
+	if err := editorReadJSON(f.e.receiptPath(request.Namespace, request.OperationID), &r); err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite it as a pre-epoch receipt: bare 48-hex stage, no body metadata.
+	legacy := r
+	legacy.Request.OperationID = "legacy"
+	legacy.Request.RequestDigest = editorDigest([]byte("legacy"))
+	legacy.Request.StageID = strings.Repeat("ab", 24)
+	result := *r.Result
+	result.OperationID = "legacy"
+	legacy.Result = &result
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "stageRawDigest")
+	delete(fields, "stageBytes")
+	if err = f.e.save(f.e.receiptPath("owner", "legacy"), fields); err != nil {
+		t.Fatal(err)
+	}
+	orphan := strings.Repeat("cd", 24)
+	old := time.Now().Add(-time.Hour)
+	for _, name := range []string{orphan + ".body", orphan + ".stage.json"} {
+		path := filepath.Join(f.state, name)
+		if err = os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	volatileOpen(t, f, 1)
+	query := EditorQueryRequest{Namespace: "owner", ResourceKey: "resource", OperationID: "legacy", RequestDigest: legacy.Request.RequestDigest}
+	if q := f.call(t, "editor.query", query).(EditorQueryResult); q.Outcome != "committed" {
+		t.Fatal("legacy receipt became unreadable", q)
+	}
+	for _, name := range []string{orphan + ".body", orphan + ".stage.json"} {
+		if _, err = os.Stat(filepath.Join(f.state, name)); !os.IsNotExist(err) {
+			t.Fatal("legacy stage state was not reclaimed", name, err)
+		}
+	}
+	if _, _, _, err = f.e.inventory(); err != nil {
+		t.Fatal("legacy receipt blocked inventory", err)
+	}
+}
+func TestEditorSharedRootKeepsForeignLiveStage(t *testing.T) {
+	f := newEditorFixture(t, nil)
+	stage := volatileOpen(t, f, 6)
+	volatileAppend(t, f, stage.StageID, 0, 0, []byte("abc"))
+	ceiling := filepath.Join(f.state, editorKey("owner", "retired-root")+".fence.json")
+	if err := f.e.save(ceiling, editorFence{Version: 1, Token: 4, Namespace: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	h := New(NewPathGuard([]string{f.root}), 128*1024)
+	other, err := NewEditorEngine(h, f.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetEditorEngine(other)
+	open := EditorStageOpen{Namespace: "other", ResourceKey: "resource", MaxBytes: 0, IdleTimeoutMs: 30000}
+	if _, err = h.EditorDispatch(context.Background(), "editor.stage.open", editorParams(t, open)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(f.e.bodyPath(stage.StageID)); err != nil {
+		t.Fatal("another engine discarded a live body", err)
+	}
+	if _, err = os.Stat(ceiling); err != nil {
+		t.Fatal("another engine dropped a live stage's fence ceiling", err)
+	}
+	volatileAppend(t, f, stage.StageID, 1, 3, []byte("def"))
+	f.call(t, "editor.stage.seal", EditorStageSeal{Namespace: "owner", ResourceKey: "resource", StageID: stage.StageID, TotalBytes: 6, RawDigest: editorDigest([]byte("abcdef"))})
+	// Once its idle bound has passed, the abandoned body is reclaimable.
+	old := time.Now().Add(-editorForeignStageGrace - time.Second)
+	if err = os.Chtimes(f.e.bodyPath(stage.StageID), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.EditorDispatch(context.Background(), "editor.stage.open", editorParams(t, open)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(f.e.bodyPath(stage.StageID)); !os.IsNotExist(err) {
+		t.Fatal("expired foreign body leaked", err)
 	}
 }
