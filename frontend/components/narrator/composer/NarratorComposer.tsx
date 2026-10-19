@@ -1,5 +1,5 @@
 import { Box, Button, Group, Text } from "@mantine/core";
-import { useDisclosure, useFocusTrap } from "@mantine/hooks";
+import { useDisclosure, useFocusTrap, useMergedRef } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
 	type ComposerAsset,
@@ -29,8 +29,10 @@ import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInp
 import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { ApiError, api } from "../../../lib/api";
+import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
+import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
@@ -265,6 +267,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] =
 			useDisclosure(false);
 		const fullscreenTrap = useFocusTrap(fullscreenOpened && !activeAttachmentPreview);
+		// 全屏是原地 position: fixed(见 NarratorComposer.module.css 的 .fullscreen),
+		// 必须把焦点陷阱以外的 ref 也挂到同一个 Box 上,供祖先层叠逃逸使用。
+		const fullscreenBoxRef = useRef<HTMLDivElement>(null);
+		const fullscreenBoxMergedRef = useMergedRef(fullscreenTrap, fullscreenBoxRef);
+		useFullscreenEscape(fullscreenBoxRef, fullscreenOpened);
 		useEffect(() => {
 			if (!fullscreenOpened || activeAttachmentPreview) return;
 			const owner = textareaRef.current?.ownerDocument;
@@ -1522,6 +1529,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			if (mentionPopoverVisible && e.key !== "Enter") return;
 
 			if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+				// 全屏编辑模式下 Enter/Shift+Enter 一律只换行,不发送(发送走按钮或 mod+Enter)。
+				// stopPropagation 挡住 window 级的权限审批 Enter 快捷键:它只在输入框为空时
+				// 生效,而全屏里审批按钮被遮罩盖住,误触发审批比少一个快捷键严重得多。
+				if (fullscreenOpened && !e.ctrlKey && !e.metaKey) {
+					e.stopPropagation();
+					return;
+				}
+
 				// Permission shortcut: when the composer holds nothing to send and a
 				// permission is pending, the panel's global keydown handler owns Enter.
 				// preventDefault here to stop the textarea from inserting a newline.
@@ -1635,9 +1650,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		return (
 			<Box
-				ref={fullscreenTrap}
+				ref={fullscreenBoxMergedRef}
 				className={fullscreenOpened ? classes.fullscreen : undefined}
-				style={fullscreenOpened ? undefined : { position: "relative", flex: 1, minWidth: 0 }}
+				style={
+					fullscreenOpened
+						? { zIndex: Z.fullscreenEditor }
+						: { position: "relative", flex: 1, minWidth: 0 }
+				}
 				role={fullscreenOpened ? "dialog" : undefined}
 				aria-modal={fullscreenOpened || undefined}
 				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}

@@ -1,7 +1,13 @@
+/*
+ * 原地 CSS 全屏:DOM 留在 composer 树内,保住 ProseMirror 的光标与撤销栈(见
+ * InlineComposerEditor.browser.test.ts 的 "CSS fullscreen retains DOM identity")。
+ * z-index 不在此处:它必须取全局 token Z.fullscreenEditor(见 lib/z-index.ts),
+ * 由 NarratorComposer 以 inline style 应用;同时 useFullscreenEscape 中和祖先的
+ * 层叠上下文/fixed 包含块,否则本框会画在 AppShell 导航栏/顶栏之下。
+ */
 .fullscreen {
 	position: fixed;
 	inset: 16px;
-	z-index: 400;
 	padding: var(--mantine-spacing-md);
 	background: var(--mantine-color-body);
 	border: 1px solid var(--mantine-color-default-border);

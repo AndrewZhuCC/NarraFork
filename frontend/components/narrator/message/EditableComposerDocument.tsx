@@ -10,6 +10,8 @@ import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../../lib/api";
 import { apiUrl } from "../../../lib/base-path";
+import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
+import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { composerOptimizeTarget } from "../composer/composer-optimize-target";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
@@ -81,6 +83,10 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 		[],
 	);
 	const [fullscreen, setFullscreen] = useState(false);
+	// 原地 position: fixed 全屏(保住光标/撤销栈);中和祖先层叠上下文,
+	// 否则全屏框会画在 AppShell 导航栏/顶栏之下。
+	const fullscreenBoxRef = useRef<HTMLDivElement>(null);
+	useFullscreenEscape(fullscreenBoxRef, fullscreen);
 	const unusedTextarea = useRef<HTMLTextAreaElement>(null);
 	const optimize = usePromptOptimize({
 		narratorId: props.narratorId ?? "",
@@ -337,17 +343,20 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 		);
 	return (
 		<Box
+			ref={fullscreenBoxRef}
 			style={
 				fullscreen
 					? {
 							position: "fixed",
 							inset: 16,
-							zIndex: 400,
+							zIndex: Z.fullscreenEditor,
 							background: "var(--mantine-color-body)",
 							padding: 16,
 							overflow: "auto",
 							borderRadius: 8,
-							boxShadow: "var(--mantine-shadow-xl)",
+							// 与 NarratorComposer 全屏一致的 100vmax 遮罩:盖住被中和祖先在
+							// 16px 边带内的重绘差异,也统一两个全屏编辑器的视觉。
+							boxShadow: "var(--mantine-shadow-xl), 0 0 0 100vmax rgb(0 0 0 / 55%)",
 						}
 					: undefined
 			}
@@ -371,6 +380,9 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 						setFullscreen(false);
 						return;
 					}
+					// 全屏编辑模式下 Enter/Shift+Enter 一律只换行,不提交编辑;
+					// 提交走按钮或 mod+Enter(后者继续透传给调用方的 onKeyDown)。
+					if (fullscreen && event.key === "Enter" && !event.ctrlKey && !event.metaKey) return;
 					props.onKeyDown?.(event);
 				}}
 				onPasteFiles={(files) => void addFiles(files)}
