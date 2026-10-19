@@ -20,18 +20,25 @@ export interface NarratorDraftState {
 	updatedAt: string | null;
 	updatedBy: string | null;
 	sourceId: string | null;
+	/** True when a previous version was kept after the last overwrite and can be restored. */
+	hasPrevious: boolean;
 }
 
 export interface NarratorDraftUpdate extends NarratorDraftState {
 	previousHasDraft: boolean;
 }
 
-export interface NarratorDraftConflict {
-	conflict: true;
-	current: NarratorDraftState;
+/**
+ * The single undo slot: the version a write overwrote. Stored verbatim (raw
+ * column values) so a restore never round-trips through validation drift.
+ */
+interface NarratorDraftPreviousSnapshot {
+	text: string;
+	fileReferencesJson: string | null;
+	composerDocument: ComposerDocument | null;
+	revision: number;
+	updatedAt: string;
 }
-
-export type NarratorDraftUpdateResult = NarratorDraftUpdate | NarratorDraftConflict;
 
 function emptyDraftState(): NarratorDraftState {
 	return {
@@ -42,6 +49,7 @@ function emptyDraftState(): NarratorDraftState {
 		updatedAt: null,
 		updatedBy: null,
 		sourceId: null,
+		hasPrevious: false,
 	};
 }
 
@@ -54,6 +62,7 @@ function rowToDraftState(
 				revision: number;
 				updatedAt: string;
 				sourceId: string | null;
+				previousJson?: string | null;
 		  }
 		| undefined,
 	userId: string,
@@ -72,7 +81,47 @@ function rowToDraftState(
 		updatedAt: row.updatedAt,
 		updatedBy: userId,
 		sourceId: row.sourceId,
+		hasPrevious: !!row.previousJson,
 	};
+}
+
+function snapshotRow(row: {
+	text: string;
+	fileReferencesJson?: string | null;
+	composerDocument?: ComposerDocument | null;
+	revision: number;
+	updatedAt: string;
+}): string {
+	const snapshot: NarratorDraftPreviousSnapshot = {
+		text: row.text,
+		fileReferencesJson: row.fileReferencesJson ?? null,
+		composerDocument: row.composerDocument ?? null,
+		revision: row.revision,
+		updatedAt: row.updatedAt,
+	};
+	return JSON.stringify(snapshot);
+}
+
+/** The undo slot is ours alone, but a corrupt blob must cost the slot, not the draft. */
+function readPreviousSnapshot(value: unknown): NarratorDraftPreviousSnapshot | null {
+	try {
+		const raw =
+			typeof value === "string"
+				? (JSON.parse(value) as Partial<NarratorDraftPreviousSnapshot>)
+				: null;
+		if (!raw || typeof raw.text !== "string") return null;
+		if (raw.fileReferencesJson !== null && typeof raw.fileReferencesJson !== "string") return null;
+		if (typeof raw.revision !== "number" || typeof raw.updatedAt !== "string") return null;
+		return {
+			text: raw.text,
+			fileReferencesJson: raw.fileReferencesJson ?? null,
+			composerDocument: readComposerDocument(raw.composerDocument) ?? null,
+			revision: raw.revision,
+			updatedAt: raw.updatedAt,
+		};
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -108,6 +157,7 @@ const draftColumns = {
 	revision: narratorDrafts.revision,
 	updatedAt: narratorDrafts.updatedAt,
 	sourceId: narratorDrafts.sourceId,
+	previousJson: narratorDrafts.previousJson,
 };
 
 export async function getNarratorDraft(
@@ -144,18 +194,24 @@ export async function getNarratorDraftMetadata(
 	};
 }
 
+/**
+ * Last-writer-wins save. A draft is a per-user scratchpad, so "conflicts" are
+ * always the same person racing their own other tab or a stale base — rejecting
+ * the write forced that person to arbitrate against themselves. The overwritten
+ * version lands in the undo slot whenever it had content and actually changed,
+ * so the replaced version stays recoverable (see restoreNarratorDraftPrevious).
+ */
 export async function updateNarratorDraft(
 	userId: string,
 	narratorId: string,
 	text: string,
 	sourceId?: string,
-	baseRevision?: number,
 	fileReferences?: FileReference[],
 	composerDocument?: ComposerDocument,
-): Promise<NarratorDraftUpdateResult> {
+): Promise<NarratorDraftUpdate> {
 	composerDocument = parseOptionalComposerDocument(composerDocument);
 	validateComposerProjection(composerDocument, text, fileReferences);
-	// Capture metadata before awaiting the lock: text and references are one CAS value.
+	// Capture metadata before awaiting the lock: text and references are one value.
 	const suppliedReferences = fileReferences?.map(copyFileReference);
 	return narratorDraftLock.acquire(`${userId.length}:${userId}:${narratorId}`, async () => {
 		const previous = await db
@@ -164,10 +220,6 @@ export async function updateNarratorDraft(
 			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
 			.get();
 		const current = rowToDraftState(previous, userId);
-		const expectedRevision = baseRevision ?? current.revision;
-		if (expectedRevision !== current.revision) {
-			return { conflict: true, current };
-		}
 
 		const now = new Date().toISOString();
 		const storedText = text.trim() || composerDocument?.assets.length ? text : "";
@@ -182,6 +234,17 @@ export async function updateNarratorDraft(
 			storedText.trim() || storedReferences.length || composerDocument?.assets.length
 				? composerDocument
 				: undefined;
+		// Keep the undo slot unless this write replaces real content with something
+		// different; an unchanged re-save must not bury the recoverable version.
+		const contentChanged =
+			storedText !== current.text ||
+			JSON.stringify(storedReferences) !== JSON.stringify(current.fileReferences) ||
+			JSON.stringify(storedComposerDocument ?? null) !==
+				JSON.stringify(current.composerDocument ?? null);
+		const previousJson =
+			current.hasDraft && contentChanged && previous
+				? snapshotRow(previous)
+				: (previous?.previousJson ?? null);
 		const fields = {
 			text: storedText,
 			fileReferencesJson,
@@ -189,6 +252,7 @@ export async function updateNarratorDraft(
 			sourceId: storedSourceId,
 			revision: nextRevision,
 			updatedAt: now,
+			previousJson,
 		};
 		await db
 			.insert(narratorDrafts)
@@ -211,6 +275,61 @@ export async function updateNarratorDraft(
 			updatedAt: now,
 			updatedBy: userId,
 			sourceId: storedSourceId,
+			hasPrevious: !!previousJson,
+		};
+	});
+}
+
+/**
+ * Swap the current draft with the undo slot. The swap is symmetric — the
+ * replaced version becomes the new undo slot — so restoring twice returns to
+ * the state before the first restore. Returns null when nothing was ever kept.
+ */
+export async function restoreNarratorDraftPrevious(
+	userId: string,
+	narratorId: string,
+	sourceId?: string,
+): Promise<NarratorDraftUpdate | null> {
+	return narratorDraftLock.acquire(`${userId.length}:${userId}:${narratorId}`, async () => {
+		const row = await db
+			.select(draftColumns)
+			.from(narratorDrafts)
+			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
+			.get();
+		const snapshot = readPreviousSnapshot(row?.previousJson);
+		if (!row || !snapshot) return null;
+		const current = rowToDraftState(row, userId);
+		const now = new Date().toISOString();
+		const fields = {
+			text: snapshot.text,
+			fileReferencesJson: snapshot.fileReferencesJson,
+			composerDocument: snapshot.composerDocument,
+			sourceId: sourceId ?? row.sourceId,
+			revision: row.revision + 1,
+			updatedAt: now,
+			previousJson: snapshotRow(row),
+		};
+		await db
+			.update(narratorDrafts)
+			.set(fields)
+			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)));
+		const fileReferences: FileReference[] = snapshot.fileReferencesJson
+			? (JSON.parse(snapshot.fileReferencesJson) as FileReference[]).map(copyFileReference)
+			: [];
+		return {
+			previousHasDraft: current.hasDraft,
+			hasDraft:
+				!!snapshot.text.trim() ||
+				fileReferences.length > 0 ||
+				!!snapshot.composerDocument?.assets.length,
+			text: snapshot.text,
+			fileReferences,
+			composerDocument: snapshot.composerDocument ?? undefined,
+			revision: fields.revision,
+			updatedAt: now,
+			updatedBy: userId,
+			sourceId: fields.sourceId,
+			hasPrevious: true,
 		};
 	});
 }

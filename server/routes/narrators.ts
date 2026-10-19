@@ -202,6 +202,7 @@ import {
 	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
+	restoreNarratorDraftSchema,
 	retryFailedCompactSchema,
 	revertFilesSchema,
 	revertScopeSchema,
@@ -309,6 +310,7 @@ import {
 	getNarratorDraft,
 	getNarratorIdsWithDraft,
 	narratorHasDraft,
+	restoreNarratorDraftPrevious,
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
@@ -1743,20 +1745,9 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		id,
 		parsed.data.text,
 		parsed.data.sourceId,
-		parsed.data.baseRevision,
 		parsed.data.fileReferences,
 		parsed.data.composerDocument,
 	);
-	if ("conflict" in update) {
-		return c.json(
-			{
-				error: "Draft changed on another client",
-				code: "DRAFT_REVISION_CONFLICT",
-				current: update.current,
-			},
-			409,
-		);
-	}
 
 	broadcastToUser(userId, {
 		type: "draft_changed",
@@ -1785,6 +1776,43 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		updatedAt: update.updatedAt,
 		updatedBy: update.updatedBy,
 		sourceId: update.sourceId,
+		hasPrevious: update.hasPrevious,
+	});
+});
+
+narratorRoutes.post("/:id/draft/restore", async (c) => {
+	const id = c.req.param("id");
+	const userId = c.get("user").sub;
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = restoreNarratorDraftSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await narratorService.getById(id);
+	const update = await restoreNarratorDraftPrevious(userId, id, parsed.data.sourceId);
+	if (!update) throw new NotFoundError("Draft undo slot", id);
+	broadcastToUser(userId, {
+		type: "draft_changed",
+		narratorId: id,
+		hasDraft: update.hasDraft,
+		text: update.text,
+		fileReferences: update.fileReferences,
+		hasComposerDocument: !!update.composerDocument,
+		revision: update.revision,
+		updatedAt: update.updatedAt,
+		updatedBy: update.updatedBy,
+		sourceId: update.sourceId,
+	});
+	return c.json({
+		ok: true,
+		composerDocument: update.composerDocument,
+		hasDraft: update.hasDraft,
+		text: update.text,
+		fileReferences: update.fileReferences,
+		hasComposerDocument: !!update.composerDocument,
+		revision: update.revision,
+		updatedAt: update.updatedAt,
+		updatedBy: update.updatedBy,
+		sourceId: update.sourceId,
+		hasPrevious: update.hasPrevious,
 	});
 });
 

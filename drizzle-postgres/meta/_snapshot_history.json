@@ -200,6 +200,14 @@
 			"prevId": "db796e37-a6d9-48f5-bb09-4d51967795a5",
 			"version": "7",
 			"snapshotDigest": "f5a511f0aa3f502c75f9e8d5bd322051c8d275fb23a9255322b2df1b47da1443"
+		},
+		{
+			"idx": 25,
+			"tag": "0025_draft_previous",
+			"id": "8e4fd5fe-34f0-4d71-bec4-c08097a2cd15",
+			"prevId": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
+			"version": "7",
+			"snapshotDigest": "6d62a4fb563815d7a6b1120994fa42899e320edb7e47f6d6ec87e0a99b06b7a3"
 		}
 	]
 }

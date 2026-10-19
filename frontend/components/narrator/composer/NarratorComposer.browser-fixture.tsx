@@ -596,14 +596,7 @@ export function rejectAttachmentReads() {
 }
 export async function seedLegacyTextDraft(text: string) {
 	const id = owner() ?? "persist-a";
-	const previous = readNarratorInputDraft(currentUser, id);
-	const stored = await api.updateNarratorDraft(
-		id,
-		text,
-		previous.serverRevision ?? 1,
-		"legacy-fixture",
-		[],
-	);
+	const stored = await api.updateNarratorDraft(id, text, "legacy-fixture", []);
 	persistNarratorInputDraft(currentUser, id, text, stored.revision, stored.updatedAt, [], {
 		text,
 		fileReferences: [],

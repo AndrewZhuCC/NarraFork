@@ -40,7 +40,7 @@ export interface StoredNarratorInputDraft {
 	serverUpdatedAt: string | null;
 	/** Present only when this exact text/reference snapshot was acknowledged by the server. */
 	syncedRevision?: number;
-	/** Dirty snapshots keep their CAS base but cannot claim that their content is synchronized. */
+	/** Dirty snapshots keep their revision base but cannot claim that their content is synchronized. */
 	unsynced?: true;
 }
 
@@ -58,19 +58,6 @@ export interface ResolvedNarratorDraft {
 	text: string;
 	fileReferences?: FileReference[];
 	composerDocument?: ComposerDocument;
-	conflict: boolean;
-}
-
-export type DraftRevisionConflictAction = "ignore" | "retry" | "conflict";
-
-export function classifyDraftRevisionConflict(options: {
-	requestSequence: number;
-	latestSequence: number;
-	requestSourceId: string;
-	currentSourceId: string | null;
-}): DraftRevisionConflictAction {
-	if (options.requestSequence !== options.latestSequence) return "ignore";
-	return options.currentSourceId === options.requestSourceId ? "retry" : "conflict";
 }
 
 function emptyStoredDraft(): StoredNarratorInputDraft {
@@ -340,7 +327,7 @@ export function persistNarratorInputDraft(
 	return true;
 }
 
-/** A revision alone is a CAS base, not proof that the local contents were acknowledged. */
+/** A revision alone is a sync base, not proof that the local contents were acknowledged. */
 export function isAcknowledgedNarratorDraft(local: StoredNarratorInputDraft): boolean {
 	return (
 		!local.unsynced &&
@@ -395,22 +382,21 @@ export function resolveHydratedNarratorDraft(options: {
 		options.currentFileReferences,
 		options.currentComposerDocument,
 	);
-	const result = (value: typeof local, conflict: boolean): ResolvedNarratorDraft => ({
+	const result = (value: typeof local): ResolvedNarratorDraft => ({
 		text: value.text,
 		...(value.fileReferences.length ? { fileReferences: value.fileReferences } : {}),
 		...(value.composerDocument ? { composerDocument: value.composerDocument } : {}),
-		conflict,
 	});
-	if (options.localChangedSinceRequest) {
-		return result(
-			current,
-			!sameFileReferenceInput(current, server) &&
-				options.local.serverRevision !== options.serverRevision,
-		);
-	}
+	/*
+	 * Local keystrokes always win hydration. The draft is a per-user scratchpad:
+	 * whatever was typed here is fresher than any server version, and once the
+	 * local text overwrites the server the replaced version stays restorable
+	 * from the server's undo slot — so there is never anything to arbitrate.
+	 */
+	if (options.localChangedSinceRequest) return result(current);
 	if (options.local.serverRevision === options.serverRevision) {
 		// Text AND references share one revision; metadata-only changes are edits too.
-		return result(local, false);
+		return result(local);
 	}
 	if (
 		(options.local.unsynced || options.local.serverRevision === null) &&
@@ -420,9 +406,9 @@ export function resolveHydratedNarratorDraft(options: {
 			options.local.unsynced) &&
 		!sameFileReferenceInput(local, server)
 	) {
-		// Version-1 browser storage has no trustworthy base revision.
-		return result(local, true);
+		// Version-1 browser storage has no trustworthy base revision; keep it anyway.
+		return result(local);
 	}
 	// A newer server clear tombstone removes both text and references.
-	return result(server, false);
+	return result(server);
 }

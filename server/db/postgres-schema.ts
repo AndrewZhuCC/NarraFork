@@ -1600,6 +1600,7 @@ export const narratorDrafts = pgTable(
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
+		previousJson: text("previous_json"),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_drafts_user_narrator").on(table.userId, table.narratorId),
@@ -3870,7 +3871,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 122,
-  "columnCount": 1711,
+  "columnCount": 1712,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -13345,6 +13346,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "kind": "text",
           "pgType": "text",
           "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "previousJson",
+          "name": "previous_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
           "primary": false,
           "unique": false
         }
