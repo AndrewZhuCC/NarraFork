@@ -379,97 +379,103 @@ export async function loadModelHistorySource(
 			? readSqliteModelHistorySignature(backend.sqlite, narratorId)
 			: readPostgresModelHistorySignature(backend.sql, narratorId, { ...options, deadline });
 	};
-	const before = await signature();
-	check();
 	const identity =
 		backend.backend === "sqlite" ? backend.sqlite.filename : `postgres:${Bun.hash(backend.url)}`;
 	// An in-memory connection has no cross-thread read-only identity; never cache its shared name.
 	const inMemory = backend.backend === "sqlite" && (identity === ":memory:" || !identity);
-	const key = `${identity}\u0000${narratorId}\u0000${before.catalogIdentity ?? "unversioned"}:${before.revision}`;
-	const cacheable = before.trusted && !inMemory && options.limit == null;
-	if (cacheable) {
-		const cached = state.cache.get(key);
-		const record = cached && state.sourceSignatures.get(cached);
-		if (
-			cached &&
-			record?.trusted &&
-			record.narratorId === narratorId &&
-			record.revision === before.revision &&
-			record.catalogIdentity === before.catalogIdentity
-		) {
-			state.hits++;
-			return cached;
-		}
-	}
-	state.loads++;
-	// Test-only in-memory fixtures cannot be opened by a worker. The query's metadata preflight
-	// still bounds rows/bytes; production file/PG reads NEVER fall back to inline JSON parsing.
-	const candidate = cacheable
-		? state.cache.previous(`${identity}\u0000${narratorId}\u0000`)
-		: undefined;
-	// A trigger disable/re-enable or reinstall can leave body/tool counters unchanged.
-	// Catalog epoch changes MUST discard delta reuse and read complete current source rows.
-	const candidateRecord = candidate && state.sourceSignatures.get(candidate);
-	const previous =
-		candidate &&
-		candidateRecord?.trusted &&
-		candidateRecord.catalogIdentity === before.catalogIdentity
-			? candidate
-			: undefined;
-	let source: ModelHistorySource;
-	if (inMemory && backend.backend === "sqlite")
-		source = await queryModelHistory(sqliteHistoryQuery(backend.sqlite), {
-			narratorId,
-			limit: options.limit,
-			deadline,
-			maxBytes: 1024 * 1024,
-			inlineRowBytes: 64 * 1024,
-			versioned: before.trusted,
-		});
-	else {
-		try {
-			source = await readWorker(backend, narratorId, options, deadline, before.trusted, previous);
-		} catch (error) {
-			if (
-				!previous ||
-				!(error instanceof Error) ||
-				error.message !== "Model history delta structure changed"
-			)
-				throw error;
-			// Ref deletion/reorder/COW, compact, segment/lazy range changes: one full rebuild,
-			// sharing the SAME deadline. No partial delta or indefinite retries are accepted.
-			source = await readWorker(backend, narratorId, options, deadline, before.trusted);
-		}
-	}
-	options.signal?.throwIfAborted();
-	const after = await signature();
-	if (before.trusted !== after.trusted)
-		throw new Error("Model history revision trust changed during preparation; request not sent");
-	if (
-		before.trusted &&
-		(before.revision !== after.revision ||
-			before.catalogIdentity !== after.catalogIdentity ||
-			!after.trusted)
-	)
-		throw new Error("Model history changed during preparation; retry with a fresh source snapshot");
-	await freezeModelHistorySource(source, deadline, options.signal);
+	let before = await signature();
 	check();
-	state.lastCounters = source.counters;
-	state.sourceSignatures.set(source, {
-		backend,
-		narratorId,
-		revision: after.revision,
-		catalogIdentity: after.catalogIdentity,
-		trusted: after.trusted,
-	});
-	if (cacheable && after.trusted)
-		state.cache.set(
-			key,
-			source,
-			source.counters.preparedBytes ??
-				source.counters.sourceBytes * 4 +
-					source.counters.refs * 1024 +
-					source.counters.toolRows * 1024,
-		);
-	return source;
+	for (;;) {
+		const key = `${identity}\u0000${narratorId}\u0000${before.catalogIdentity ?? "unversioned"}:${before.revision}`;
+		const cacheable = before.trusted && !inMemory && options.limit == null;
+		if (cacheable) {
+			const cached = state.cache.get(key);
+			const record = cached && state.sourceSignatures.get(cached);
+			if (
+				cached &&
+				record?.trusted &&
+				record.narratorId === narratorId &&
+				record.revision === before.revision &&
+				record.catalogIdentity === before.catalogIdentity
+			) {
+				state.hits++;
+				return cached;
+			}
+		}
+		state.loads++;
+		// Test-only in-memory fixtures cannot be opened by a worker. The query's metadata preflight
+		// still bounds rows/bytes; production file/PG reads NEVER fall back to inline JSON parsing.
+		const candidate = cacheable
+			? state.cache.previous(`${identity}\u0000${narratorId}\u0000`)
+			: undefined;
+		// A trigger disable/re-enable or reinstall can leave body/tool counters unchanged.
+		// Catalog epoch changes MUST discard delta reuse and read complete current source rows.
+		const candidateRecord = candidate && state.sourceSignatures.get(candidate);
+		const previous =
+			candidate &&
+			candidateRecord?.trusted &&
+			candidateRecord.catalogIdentity === before.catalogIdentity
+				? candidate
+				: undefined;
+		let source: ModelHistorySource;
+		if (inMemory && backend.backend === "sqlite")
+			source = await queryModelHistory(sqliteHistoryQuery(backend.sqlite), {
+				narratorId,
+				limit: options.limit,
+				deadline,
+				maxBytes: 1024 * 1024,
+				inlineRowBytes: 64 * 1024,
+				versioned: before.trusted,
+			});
+		else {
+			try {
+				source = await readWorker(backend, narratorId, options, deadline, before.trusted, previous);
+			} catch (error) {
+				if (
+					!previous ||
+					!(error instanceof Error) ||
+					error.message !== "Model history delta structure changed"
+				)
+					throw error;
+				// Ref deletion/reorder/COW, compact, segment/lazy range changes: one full rebuild,
+				// sharing the SAME deadline. No partial delta or indefinite retries are accepted.
+				source = await readWorker(backend, narratorId, options, deadline, before.trusted);
+			}
+		}
+		options.signal?.throwIfAborted();
+		const after = await signature();
+		if (before.trusted !== after.trusted)
+			throw new Error("Model history revision trust changed during preparation; request not sent");
+		// Live narrators keep writing rows (tool status, titles, child sessions) while a read runs.
+		// A moved revision only means this read is stale: take a fresh snapshot under the SAME
+		// deadline, reusing the cached delta base, instead of failing the turn.
+		if (
+			before.trusted &&
+			(before.revision !== after.revision || before.catalogIdentity !== after.catalogIdentity)
+		) {
+			before = after;
+			check();
+			continue;
+		}
+		await freezeModelHistorySource(source, deadline, options.signal);
+		check();
+		state.lastCounters = source.counters;
+		state.sourceSignatures.set(source, {
+			backend,
+			narratorId,
+			revision: after.revision,
+			catalogIdentity: after.catalogIdentity,
+			trusted: after.trusted,
+		});
+		if (cacheable && after.trusted)
+			state.cache.set(
+				key,
+				source,
+				source.counters.preparedBytes ??
+					source.counters.sourceBytes * 4 +
+						source.counters.refs * 1024 +
+						source.counters.toolRows * 1024,
+			);
+		return source;
+	}
 }

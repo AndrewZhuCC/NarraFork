@@ -196,6 +196,35 @@ describe("complete bounded model source", () => {
 		db.run("UPDATE narrator_messages SET sdk_message_uuid='late-final' WHERE id='small'");
 		await expect(verifyModelHistoryRowsCurrent(view)).rejects.toThrow("request not sent");
 	});
+	test("a write landing during the read takes a fresh snapshot instead of failing", async () => {
+		const db = fixture(true);
+		message(db, "first", 0);
+		const realRead = revisionModule.readSqliteModelHistorySignature;
+		let reads = 0;
+		const barrier = spyOn(revisionModule, "readSqliteModelHistorySignature").mockImplementation(
+			(connection, id) => {
+				if (++reads === 2) {
+					const writer = new Database(db.filename);
+					try {
+						message(writer, "late", 1);
+					} finally {
+						writer.close();
+					}
+				}
+				return realRead(connection, id);
+			},
+		);
+		try {
+			const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
+			expect(source.messages.map((row) => row.id)).toEqual(["first", "late"]);
+			expect(reads).toBe(3);
+			const view = source.messages.map((row) => ({ ...row }));
+			markModelHistoryRows(view, source);
+			await verifyModelHistoryRowsCurrent(view);
+		} finally {
+			barrier.mockRestore();
+		}
+	});
 	test("an untrusted snapshot cannot be promoted when triggers return between read and signing", async () => {
 		const db = fixture(true);
 		message(db, "shared", 0);
