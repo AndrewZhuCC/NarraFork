@@ -256,7 +256,7 @@ def main():
             ['0012_curved_bloodstorm.sql'], ['0013_omniscient_dormammu.sql'],
             ['0014_blue_tomorrow_man.sql'], ['0015_nifty_magma.sql'],
             ['0016_high_shiva.sql'], ['0017_merge_opensource_083.sql'],
-            ['0018_merge_upstream_090.sql'],
+            ['0018_merge_upstream_090.sql'], ['0205_merge_upstream_093.sql'],
             ['0016_high_shiva.sql', '0017_merge_opensource_083.sql'],
             ['0196_narrator_model_history_revision.sql', '0197_fluffy_the_professor.sql',
              '0198_broken_viper.sql', '0199_sudden_richard_fisk.sql', '0200_faithful_major_mapleleaf.sql',

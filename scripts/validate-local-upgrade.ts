@@ -16,6 +16,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0017_merge_opensource_083",
 	"0018_merge_upstream_090",
 	"0204_merge_selfuse_092",
+	"0205_merge_upstream_093",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -25,6 +26,7 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0017_merge_opensource_083",
 	"0018_merge_upstream_090",
 	"0204_merge_selfuse_092",
+	"0205_merge_upstream_093",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
 const MERGE_090_NEW_TABLES = ["user_git_identities", "narrator_git_identity_bindings"];
@@ -38,6 +40,22 @@ const MERGE_092_NEW_TABLES = [
 	"model_history_revision_contracts", "usage_token_repair_candidates", "usage_token_repair_jobs",
 	"resource_protection_paths", "resource_protection_sources",
 ];
+const MERGE_093_NEW_TABLES = ["narrator_context_pins", "narrator_message_context_stats"];
+const MERGE_093_REMOVED_TABLES = [
+	"narrator_context_char_pages",
+	"usage_token_repair_candidates",
+	"usage_token_repair_jobs",
+];
+const MERGE_093_REMOVED_API_COLUMNS = [
+	"token_accounting_version",
+	"token_accounting_review_version",
+	"raw_dump_json",
+];
+const MERGE_093_ADDED_COLUMNS: Record<string, string[]> = {
+	api_requests: ["diagnostics_json", "recording_request_id"],
+	narrator_drafts: ["composer_document"],
+	narrator_messages: ["composer_document"],
+};
 const LEGACY_GIT_IDENTITY_FILTER = `u.git_username IS NOT NULL AND trim(u.git_username) <> ''
 	AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
 	AND instr(u.git_username, '<') = 0 AND instr(u.git_username, '>') = 0
@@ -185,6 +203,17 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0205_merge_upstream_093") {
+		return Object.fromEntries(
+			Object.entries(MERGE_093_ADDED_COLUMNS).map(([table, added]) => [
+				table,
+				tableDigest(db, table, new Set([
+					...(table === "api_requests" ? MERGE_093_REMOVED_API_COLUMNS : []),
+					...(excludeNew ? added : []),
+				])),
+			]),
+		);
+	}
 	if (targetTag === "0204_merge_selfuse_092") {
 		return {
 			narrators: tableDigest(db, "narrators", excludeNew ? new Set(["model_history_revision"]) : new Set()),
@@ -327,6 +356,32 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0205_merge_upstream_093") {
+		for (const table of MERGE_093_NEW_TABLES) shape[table] = tableSchemaShape(db, table);
+		for (const [table, added] of Object.entries(MERGE_093_ADDED_COLUMNS)) {
+			for (const column of added) shape[`${table}.${column}`] = columnShape(db, table, column);
+		}
+		for (const table of MERGE_093_REMOVED_TABLES) {
+			if (tableExists(db, table)) throw new Error(`Removed table still exists: ${table}`);
+		}
+		const apiColumns = columns(db, "api_requests");
+		for (const column of MERGE_093_REMOVED_API_COLUMNS) {
+			if (apiColumns.includes(column)) throw new Error(`Removed API column still exists: ${column}`);
+		}
+		for (const name of ["idx_api_requests_token_repair_pending", "idx_api_requests_token_repair_reviewed"]) {
+			if (db.query("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name)) {
+				throw new Error(`Removed index still exists: ${name}`);
+			}
+		}
+		for (const name of ["idx_api_requests_recording", "idx_toolcalls_context_id"]) {
+			const index = db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?").get(name);
+			if (!index) throw new Error(`Missing index: ${name}`);
+			shape[name] = index;
+		}
+		const triggers = db.query("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name IN ('narrator_message_context_stats_insert', 'narrator_message_context_stats_update') ORDER BY name").all();
+		if (triggers.length !== 2) throw new Error("Message context stats triggers missing");
+		shape.messageContextStatsTriggers = triggers;
+	}
 	if (targetTag === "0204_merge_selfuse_092") {
 		for (const table of [...MERGE_092_NEW_TABLES, "file_attributions", "knowledge_injection_events"]) shape[table] = tableSchemaShape(db, table);
 		for (const [table, names] of [
@@ -536,8 +591,20 @@ async function main() {
 							? MERGE_083_NEW_TABLES
 							: target.tag === "0018_merge_upstream_090"
 								? MERGE_090_NEW_TABLES
-								: target.tag === "0204_merge_selfuse_092" ? MERGE_092_NEW_TABLES : [];
+								: target.tag === "0204_merge_selfuse_092" ? MERGE_092_NEW_TABLES
+									: target.tag === "0205_merge_upstream_093" ? MERGE_093_NEW_TABLES : [];
 		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
+		if (target.tag === "0205_merge_upstream_093") {
+			for (const table of MERGE_093_REMOVED_TABLES) delete expectedCounts[table];
+			expectedCounts.narrator_message_context_stats = beforeCounts.narrator_messages ?? 0;
+			const mismatchedStats = db.query(`SELECT 1 FROM narrator_messages m
+				LEFT JOIN narrator_message_context_stats s ON s.message_id = m.id
+				WHERE s.message_id IS NULL OR s.role IS NOT m.role
+				OR s.parent_tool_use_id IS NOT m.parent_tool_use_id
+				OR s.segments_json IS NOT COALESCE(m.context_chars_json, '{"segments":[]}')
+				LIMIT 1`).get();
+			if (mismatchedStats) throw new Error("Message context stats backfill changed original values");
+		}
 		if (merge092Chain) {
 			if (!("model_history_revision_contracts" in beforeCounts)) expectedCounts.model_history_revision_contracts = 1;
 			const contract = db.query("SELECT installed_version FROM model_history_revision_contracts WHERE id='model-history'").get() as { installed_version: string } | null;
