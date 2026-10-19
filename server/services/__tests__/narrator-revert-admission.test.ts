@@ -9,6 +9,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
@@ -92,6 +93,8 @@ beforeEach(() => {
 			type: "subagent",
 			variant: "subagent:general",
 			parentNarratorId: ROOT,
+			policySourceNarratorId: ROOT,
+			runtimeRegistrationJson: delegationRegistration(ROOT, "general"),
 			status: "idle",
 			createdAt: now,
 			updatedAt: now,

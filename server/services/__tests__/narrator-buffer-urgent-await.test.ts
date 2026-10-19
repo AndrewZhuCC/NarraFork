@@ -13,6 +13,7 @@ import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { ToolResult } from "../../lib/agent/types";
 import { AppError, ValidationError } from "../../lib/errors";
 import { updateBufferedMessageModeSchema } from "../../lib/validators/narrators";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 // tests/preload.ts isolates HOME before imports; never load the production DB singleton.
 const { db, sqlite } = getTestDb();
@@ -227,6 +228,8 @@ beforeAll(async () => {
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: parent,
+				policySourceNarratorId: parent,
+				runtimeRegistrationJson: delegationRegistration(parent, "general"),
 				aclRootNarratorId: parent,
 				status: "working",
 				createdAt: now,

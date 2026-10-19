@@ -49,13 +49,7 @@ import {
 	getToolMessageWithParams,
 	type Locale,
 } from "../../lib/prompt-i18n";
-import {
-	needsLegacyDeliverTo,
-	policySourceIdOf,
-	type RuntimeSourceRow,
-	runDeliverToOf,
-	storedBasePromptOf,
-} from "../../lib/runtime-source";
+import { policySourceIdOf, type RuntimeSourceRow, runDeliverToOf } from "../../lib/runtime-source";
 import {
 	getSearchExecutionScope,
 	SearchExecutionBudgetExceededError,
@@ -161,7 +155,6 @@ import {
 	filterOAuthSessionDevices,
 	finalizeInterruptedRun,
 	finalizeOrCleanupPartialMessage,
-	getLatestSubagentParentToolUseId,
 	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
@@ -324,7 +317,7 @@ export function runtimeBasePrompt(
 	locale: Locale,
 	policy: RuntimePolicy,
 ): string | null {
-	const base = storedBasePromptOf(row);
+	const base = row.systemPrompt;
 	const sections: string[] = [];
 	const deliverTo = runDeliverToOf(row);
 	if (deliverTo) {
@@ -442,12 +435,7 @@ export async function runAgentLoopUnlocked(
 				.where(eq(narrators.id, narratorId))
 				.run();
 		const initNarrator = await narratorService.getById(narratorId);
-		deliverTo = runDeliverToOf(
-			initNarrator,
-			needsLegacyDeliverTo(initNarrator)
-				? await getLatestSubagentParentToolUseId(narratorId)
-				: undefined,
-		);
+		deliverTo = runDeliverToOf(initNarrator);
 		placement = deliverTo
 			? { parentNarratorId: deliverTo.narratorId, parentToolUseId: deliverTo.toolUseId }
 			: undefined;

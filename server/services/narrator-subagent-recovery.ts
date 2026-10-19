@@ -50,12 +50,7 @@ import {
 	parseTraits,
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import {
-	controllerOf,
-	needsLegacyDeliverTo,
-	RUNTIME_SOURCE_COLUMNS,
-	runDeliverToOf,
-} from "../lib/runtime-source";
+import { controllerOf, RUNTIME_SOURCE_COLUMNS, runDeliverToOf } from "../lib/runtime-source";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
@@ -447,23 +442,9 @@ async function loadSubagentsByOriginToolUse(
 	return map;
 }
 
-async function resolveOriginToolUseId(subagentId: string): Promise<string | null> {
-	const row = await db.query.narratorMessages.findFirst({
-		where: and(
-			eq(narratorMessages.narratorId, subagentId),
-			eq(narratorMessages.role, "user"),
-			sql`${narratorMessages.parentToolUseId} IS NOT NULL`,
-		),
-		columns: { parentToolUseId: true },
-		orderBy: [asc(narratorMessages.createdAt)],
-	});
-	return row?.parentToolUseId ?? null;
-}
-
 /**
- * Batched form of {@link resolveOriginToolUseId} for the card path, which resolves origins
- * for up to 50 subagents at once and would otherwise issue one SELECT per subagent.
- * Earliest message wins, matching the single-id ordering.
+ * The earliest linked parent tool use of each subagent, for the card path: up to 50
+ * subagents at once in one SELECT.
  */
 async function resolveOriginToolUseIds(subagentIds: string[]): Promise<Map<string, string>> {
 	const origins = new Map<string, string>();
@@ -1132,6 +1113,7 @@ export async function resumeRecoverySubagents(input: {
 						backgroundCompletedAt: true,
 						isBackground: true,
 						title: true,
+						subagentType: true,
 						traits: true,
 					},
 				});
@@ -1165,10 +1147,7 @@ export async function resumeRecoverySubagents(input: {
 					skipped.push({ id: subagentId, reason: "already_resuming" });
 					continue;
 				}
-				const deliverTo = runDeliverToOf(
-					subagent,
-					needsLegacyDeliverTo(subagent) ? await resolveOriginToolUseId(subagentId) : undefined,
-				);
+				const deliverTo = runDeliverToOf(subagent);
 				if (!deliverTo || deliverTo.narratorId !== input.narratorId) {
 					skipped.push({ id: subagentId, reason: "origin_tool_call_missing" });
 					continue;

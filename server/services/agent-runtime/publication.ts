@@ -14,7 +14,6 @@ import { ValidationError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import { policySourceIdOf, registrationBeforeRun } from "../../lib/runtime-source";
 import {
 	type RunBindingInput,
 	type RuntimeRunBinding,
@@ -28,7 +27,6 @@ export interface StartRunInput {
 	binding: RunBindingInput;
 	resumeRunId?: string;
 	started?: boolean;
-	legacyToolUseId?: string | null;
 	/** Task projection of a delivered run; adopts the actor's pre-registered run. */
 	taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
 }
@@ -213,19 +211,12 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			if (publication) reserve(publication, tx, input.started);
 			const topSeq = readTopRefSeq(tx, input.narratorId) ?? NARRATOR_REF_SEQ_EMPTY_TOP;
 			const source = tx
-				.select({
-					policySourceNarratorId: narrators.policySourceNarratorId,
-					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
-					type: narrators.type,
-					variant: narrators.variant,
-					parentNarratorId: narrators.parentNarratorId,
-					subagentType: narrators.subagentType,
-				})
+				.select({ runtimeRegistrationJson: narrators.runtimeRegistrationJson })
 				.from(narrators)
 				.where(eq(narrators.id, input.narratorId))
 				.get();
 			const registration = registerRun(
-				source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
+				source?.runtimeRegistrationJson,
 				logicalRunId,
 				input.binding,
 				topSeq + 1,
@@ -233,9 +224,6 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			tx.update(narrators)
 				.set({
 					runtimeRegistrationJson: registration,
-					// Writing a registration ends the legacy inference, so the source it
-					// inferred must become an explicit column in the same write.
-					policySourceNarratorId: source ? policySourceIdOf(source) : null,
 				})
 				.where(eq(narrators.id, input.narratorId))
 				.run();

@@ -80,7 +80,6 @@ import { getHome } from "../lib/platform";
 import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
-	needsLegacyDeliverTo,
 	type OwnTurnPlacement,
 	ownTurnSql,
 	policySourceIdOf,
@@ -2030,12 +2029,7 @@ export async function maybeStartContinuation(
 	);
 	// Preserve the ordinary suppression guard before consuming flags or promoting queued tasks.
 	if (active._continuationSuppressed && policy.continuation.maxPasses === null) return null;
-	const deliverTo = runDeliverToOf(
-		latestNarrator,
-		needsLegacyDeliverTo(latestNarrator)
-			? await getLatestSubagentParentToolUseId(active.narratorId)
-			: undefined,
-	);
+	const deliverTo = runDeliverToOf(latestNarrator);
 	const placement =
 		options?.placement ??
 		(deliverTo
@@ -2757,36 +2751,6 @@ export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]):
 	return false;
 }
 
-/**
- * LEGACY COMPATIBILITY (delete in step 5): the tool call an unregistered delegated row
- * delivers to — its latest linked user turn, or before it wrote any, the Agent call
- * that created it.
- */
-export async function getLatestSubagentParentToolUseId(
-	narratorId: string,
-): Promise<string | undefined> {
-	const latestSubMsg = await db.query.narratorMessages.findFirst({
-		where: and(
-			eq(narratorMessages.narratorId, narratorId),
-			eq(narratorMessages.role, "user"),
-			isNotNull(narratorMessages.parentToolUseId),
-		),
-		columns: { parentToolUseId: true },
-		orderBy: [desc(narratorMessages.createdAt)],
-	});
-	if (latestSubMsg?.parentToolUseId) return latestSubMsg.parentToolUseId;
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { originToolCallId: true },
-	});
-	if (!row?.originToolCallId) return undefined;
-	const origin = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, row.originToolCallId),
-		columns: { toolUseId: true },
-	});
-	return origin?.toolUseId ?? undefined;
-}
-
 // === Shared context management hooks ===
 
 export interface ContextManagementOptions {
@@ -3047,20 +3011,9 @@ export async function readSessionDeliverTo(
 ): Promise<import("../lib/validators/runtime-registration").RunDeliverTo | undefined> {
 	const row = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: {
-			runtimeRegistrationJson: true,
-			policySourceNarratorId: true,
-			type: true,
-			variant: true,
-			parentNarratorId: true,
-			subagentType: true,
-		},
+		columns: { runtimeRegistrationJson: true },
 	});
-	if (!row) return undefined;
-	return runDeliverToOf(
-		row,
-		needsLegacyDeliverTo(row) ? await getLatestSubagentParentToolUseId(narratorId) : undefined,
-	);
+	return row ? runDeliverToOf(row) : undefined;
 }
 
 /** Historical transcript ownership is independent of whether any run still delivers there. */

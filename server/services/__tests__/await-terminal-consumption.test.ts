@@ -11,6 +11,7 @@ import {
 	runtimePublicationOutbox,
 } from "../../db/schema";
 import type { ToolContext } from "../../lib/agent/types";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -53,6 +54,8 @@ beforeEach(async () => {
 			variant: "subagent:general",
 			type: "subagent",
 			parentNarratorId: parent,
+			policySourceNarratorId: parent,
+			runtimeRegistrationJson: delegationRegistration(parent, "general"),
 			title: "Receipt child",
 			status: "idle",
 			logicalRunId: agentRun.logicalRunId,

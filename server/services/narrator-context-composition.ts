@@ -34,9 +34,6 @@ import { readContextSegments } from "./context-composition-projection";
 const SEGMENT_CAP = 4096;
 
 type Meta = {
-	type: string;
-	variant: string;
-	parentNarratorId: string | null;
 	registration: string | null;
 	systemChars: number;
 	summaryChars: number;
@@ -47,9 +44,6 @@ type Meta = {
 /** The session's own-turn placement (`ownTurnPlacementOf`, the `isTopLevelMessage` rule). */
 function placementOf(meta: Meta): OwnTurnPlacement {
 	return ownTurnPlacementOf({
-		type: meta.type,
-		variant: meta.variant,
-		parentNarratorId: meta.parentNarratorId,
 		runtimeRegistrationJson: meta.registration ? JSON.parse(meta.registration) : null,
 	});
 }
@@ -85,8 +79,7 @@ export function createContextCharacterService(database: Database) {
 export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 	const metadata = (id: string) =>
 		query.get<Meta>(
-			`SELECT type AS "type", variant AS "variant", parent_narrator_id AS "parentNarratorId",
-			 runtime_registration_json AS "registration", context_system_chars AS "systemChars",
+			`SELECT runtime_registration_json AS "registration", context_system_chars AS "systemChars",
 			 context_summary_chars AS "summaryChars", context_tools_chars AS "toolsChars",
 			 context_usage_snapshot_json AS "usage" FROM narrators WHERE id = ?`,
 			[id],

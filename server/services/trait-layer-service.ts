@@ -19,14 +19,8 @@ import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { getSubagentType } from "../lib/narrator-utils";
+import { parseRuntimePolicyTraits } from "../lib/runtime-policy-trait";
 import {
-	hasRuntimePolicyTrait,
-	parseRuntimePolicyTraits,
-	withRuntimePolicyTrait,
-} from "../lib/runtime-policy-trait";
-import {
-	hasLegacyDelegatedShape,
 	MAX_POLICY_SOURCE_DEPTH,
 	policySourceIdOf,
 	RUNTIME_SOURCE_COLUMNS,
@@ -38,7 +32,6 @@ import {
 	resolveLayeredTraits,
 } from "../lib/trait-resolution";
 import { type RuntimePolicy, resolveRuntimePolicy } from "./agent-runtime/policy";
-import { compileDelegationCeiling } from "./custom-subagent-service";
 import { resolveNarratorProjectId } from "./narrator-project";
 
 /**
@@ -208,27 +201,6 @@ async function resolveLayers(
 	});
 }
 
-/**
- * The narrator's own trait layer as capability resolution must see it.
- *
- * Every creation path (live delegation, review conversion, session import) stores the
- * compiled template ceiling in the row's traits, once, and it is never re-read from the
- * template afterwards. Compatibility (single place, step 5 deletes it): delegated rows
- * written before that carry no ceiling, so one is compiled here from the legacy
- * columns. Any delegated shape counts, so no legacy row resolves unrestricted; a
- * missing custom definition fails closed to read-only.
- */
-async function ownCapabilityTraits(row: {
-	traits: unknown;
-	type: string;
-	variant: string;
-	subagentType: string | null;
-}): Promise<unknown> {
-	if (!hasLegacyDelegatedShape(row) || hasRuntimePolicyTrait(row.traits)) return row.traits;
-	const template = getSubagentType(row.variant) || row.subagentType || "general";
-	return withRuntimePolicyTrait(row.traits, await compileDelegationCeiling(template));
-}
-
 async function resolveNarratorTraitsInChain(
 	narratorId: string,
 	actingUserId: string | null,
@@ -248,7 +220,8 @@ async function resolveNarratorTraitsInChain(
 	if (!row) throw new NotFoundError("Narrator", narratorId);
 	return resolveLayers(
 		{
-			narratorTraits: await ownCapabilityTraits(row),
+			// Every delegation stores its compiled template ceiling here at creation.
+			narratorTraits: row.traits,
 			projectId: await resolveNarratorProjectId(row),
 			actingUserId,
 			policySourceId: policySourceIdOf(row),

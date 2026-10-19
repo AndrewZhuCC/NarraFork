@@ -76,12 +76,7 @@ import {
 import { ValidationError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import { policySourceIdOf, registrationBeforeRun } from "../../lib/runtime-source";
-import {
-	type RunBindingInput,
-	type RuntimeRunBinding,
-	registerRun,
-} from "../../lib/validators/runtime-registration";
+import { registerRun } from "../../lib/validators/runtime-registration";
 import type { RefMessageInput } from "../narrator-refs/port";
 import {
 	lockPgNarratorRefs,
@@ -804,19 +799,12 @@ export function createPostgresRuntimePublication(
 				const topSeq = (await readTopRefSeqPg(tx, input.narratorId)) ?? PG_REF_SEQ_EMPTY_TOP;
 				// The run's relationships commit with its id (same rule as SQLite).
 				const [source] = await tx
-					.select({
-						policySourceNarratorId: narrators.policySourceNarratorId,
-						runtimeRegistrationJson: narrators.runtimeRegistrationJson,
-						type: narrators.type,
-						variant: narrators.variant,
-						parentNarratorId: narrators.parentNarratorId,
-						subagentType: narrators.subagentType,
-					})
+					.select({ runtimeRegistrationJson: narrators.runtimeRegistrationJson })
 					.from(narrators)
 					.where(eq(narrators.id, input.narratorId))
 					.limit(1);
 				const registration = registerRun(
-					source ? registrationBeforeRun(source, input.legacyToolUseId) : null,
+					source?.runtimeRegistrationJson,
 					logicalRunId,
 					input.binding,
 					topSeq + 1,
@@ -825,8 +813,6 @@ export function createPostgresRuntimePublication(
 					.update(narrators)
 					.set({
 						runtimeRegistrationJson: registration,
-						// Same rule as SQLite: a registration ends the legacy inference.
-						policySourceNarratorId: source ? policySourceIdOf(source) : null,
 					})
 					.where(eq(narrators.id, input.narratorId));
 				if (publication && !resumeRunId) {

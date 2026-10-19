@@ -34,6 +34,7 @@ const { readSessionDeliverTo } = await import("../narrator-session");
 const { narratorRoutes } = await import("../../routes/narrators");
 const { importInterchangeSession } = await import("../session-interchange/import");
 const { narratorService } = await import("../narrator-service");
+const { materializeLegacyDelegations } = await import("../legacy-delegation-materializer");
 const { narratorToInterchange } = await import("../session-interchange/export");
 const { NARRATOR_EXPORT_DEFAULTS, streamNarratorExport, resolveTranscriptScope } = await import(
 	"../narrator-export"
@@ -234,7 +235,7 @@ async function expectExports(id: string) {
 	expectPriorHistory(interchange);
 	expect(interchange).not.toContain("unrelated nested transcript");
 }
-test("legacy standalone continues through real executor/provider with all mounted history and no delivery target", async () => {
+test("materialized legacy standalone continues through real executor/provider with its mounted history and no delivery target", async () => {
 	narrator("parent");
 	narrator("worker", {
 		type: "subagent",
@@ -243,6 +244,7 @@ test("legacy standalone continues through real executor/provider with all mounte
 		runtimeRegistrationJson: null,
 	});
 	history("worker", "standalone-worker");
+	expect(await materializeLegacyDelegations(["worker"])).toBe(1);
 	await expectExports("worker");
 	expect(await readSessionDeliverTo("worker")).toBeUndefined();
 	await run("worker");

@@ -50,12 +50,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
-import {
-	needsLegacyDeliverTo,
-	policyDependentsWhere,
-	RUNTIME_SOURCE_COLUMNS,
-	runDeliverToOf,
-} from "../lib/runtime-source";
+import { policyDependentsWhere, runDeliverToOf } from "../lib/runtime-source";
 import { settings } from "../lib/settings";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -3272,71 +3267,24 @@ const sqliteNarratorPersistence = {
 	) {
 		const child = await db.query.narrators.findFirst({
 			where: eq(narrators.id, subagentId),
-			columns: { ...RUNTIME_SOURCE_COLUMNS, originToolCallId: true },
+			columns: { runtimeRegistrationJson: true },
 		});
 		const deliverTo = child ? runDeliverToOf(child) : undefined;
-		if (deliverTo) {
-			if (
-				deliverTo.narratorId !== parentNarratorId ||
-				deliverTo.toolUseId !== toolUseId ||
-				!deliverTo.toolCallId ||
-				(expectedOriginToolCallId && expectedOriginToolCallId !== deliverTo.toolCallId)
-			) {
-				throw new ValidationError(
-					"Conclusion watcher does not match the registered delivery tool-call",
-				);
-			}
-			const target = await this.resolveToolCallConclusionReference(parentNarratorId, toolUseId, {
-				toolCallId: deliverTo.toolCallId,
-			});
-			return { ...target, originToolCallId: deliverTo.toolCallId };
-		}
-		// LEGACY COMPATIBILITY (step 5): only unregistered delegated rows may
-		// resolve their destination from the historical creation origin.
 		if (
-			!child ||
-			!needsLegacyDeliverTo(child) ||
-			child.parentNarratorId !== parentNarratorId ||
-			!child.originToolCallId
+			!deliverTo ||
+			deliverTo.narratorId !== parentNarratorId ||
+			deliverTo.toolUseId !== toolUseId ||
+			!deliverTo.toolCallId ||
+			(expectedOriginToolCallId && expectedOriginToolCallId !== deliverTo.toolCallId)
 		) {
-			throw new ValidationError("Subagent has no trusted parent tool-call origin");
-		}
-		if (expectedOriginToolCallId && expectedOriginToolCallId !== child.originToolCallId) {
 			throw new ValidationError(
-				"Conclusion watcher does not match the subagent's original Agent row",
+				"Conclusion watcher does not match the registered delivery tool-call",
 			);
 		}
-		const original = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, child.originToolCallId),
-			columns: {
-				narratorId: true,
-				toolUseId: true,
-				toolName: true,
-				executionIdentityVersion: true,
-				executionOriginToolCallId: true,
-			},
-		});
-		if (
-			original &&
-			(original.narratorId !== parentNarratorId ||
-				original.toolUseId !== toolUseId ||
-				original.toolName !== "Agent" ||
-				original.executionIdentityVersion !== 1 ||
-				original.executionOriginToolCallId !== null)
-		) {
-			throw new ValidationError("Subagent origin is not the parent's original Agent row");
-		}
 		const target = await this.resolveToolCallConclusionReference(parentNarratorId, toolUseId, {
-			toolCallId: child.originToolCallId,
+			toolCallId: deliverTo.toolCallId,
 		});
-		const visible = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, target.toolCallId),
-			columns: { toolName: true, executionIdentityVersion: true },
-		});
-		if (!visible || visible.toolName !== "Agent" || visible.executionIdentityVersion !== 1) {
-			throw new ValidationError("Subagent conclusion target is not a trusted Agent history slot");
-		}
-		return { ...target, originToolCallId: child.originToolCallId };
+		return { ...target, originToolCallId: deliverTo.toolCallId };
 	},
 
 	/** Resolve an existing history slot, including its COW copy. Never execution authority. */

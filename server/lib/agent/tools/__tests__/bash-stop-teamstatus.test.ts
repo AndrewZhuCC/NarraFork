@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { delegationRegistration } from "@server/lib/validators/runtime-registration";
 import {
 	compileDelegationPolicy,
 	resolveRuntimePolicy,
@@ -194,9 +195,29 @@ type FakeNarrator = {
 	title: string | null;
 	lastActivityAt?: string;
 	traits?: string[];
+	runtimeRegistrationJson?: unknown;
 };
 
-const narrators = new Map<string, FakeNarrator>();
+/** Delegated rows are stored registered: their creator holds the control grant. */
+class NarratorFixtures extends Map<string, FakeNarrator> {
+	override set(id: string, narrator: FakeNarrator) {
+		const delegated = narrator.parentNarratorId && narrator.variant.startsWith("subagent");
+		return super.set(
+			id,
+			delegated && narrator.runtimeRegistrationJson === undefined
+				? {
+						...narrator,
+						runtimeRegistrationJson: delegationRegistration(
+							narrator.parentNarratorId as string,
+							narrator.variant.slice("subagent:".length) || "general",
+						),
+					}
+				: narrator,
+		);
+	}
+}
+
+const narrators = new NarratorFixtures();
 
 const fakeNarratorService = {
 	async listSubagentsForBroadcast(parentNarratorId: string, senderId: string, now = Date.now()) {
@@ -955,8 +976,14 @@ describe("Stop tool", () => {
 				task.parentNarratorId = "other-parent";
 				task.type = "bash";
 			}
-			if (invalid === "foreign-child") child.parentNarratorId = "other-parent";
-			if (invalid === "primary-child") child.variant = "primary";
+			if (invalid === "foreign-child") {
+				child.parentNarratorId = "other-parent";
+				child.runtimeRegistrationJson = delegationRegistration("other-parent", "general");
+			}
+			if (invalid === "primary-child") {
+				child.variant = "primary";
+				child.runtimeRegistrationJson = null;
+			}
 			if (invalid === "missing-child") narrators.clear();
 			const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
 			expect(result.isError).toBe(true);

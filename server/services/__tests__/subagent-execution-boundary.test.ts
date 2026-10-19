@@ -12,6 +12,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
@@ -37,6 +38,14 @@ async function fixture() {
 			title: "c",
 			parentNarratorId: "parent",
 			logicalRunId: "run-1",
+			policySourceNarratorId: "parent",
+			runtimeRegistrationJson: {
+				...delegationRegistration("parent", "general"),
+				run: {
+					logicalRunId: "run-1",
+					deliverTo: { narratorId: "parent", toolUseId: "provider-id", toolCallId: "call" },
+				},
+			},
 			createdAt: now,
 			updatedAt: now,
 		},

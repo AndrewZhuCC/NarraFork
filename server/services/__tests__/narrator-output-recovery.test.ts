@@ -390,6 +390,13 @@ describe("cold recovery output boundary", () => {
 				variant: "subagent:general",
 				parentNarratorId: "owner",
 				originToolCallId: origin.id,
+				runtimeRegistrationJson: {
+					version: 1,
+					run: {
+						logicalRunId: "child-run",
+						deliverTo: { narratorId: "owner", toolUseId: "origin-agent", toolCallId: origin.id },
+					},
+				},
 				status: "working",
 				logicalRunId: "child-run",
 				createdAt: now,

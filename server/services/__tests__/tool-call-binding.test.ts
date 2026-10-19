@@ -821,7 +821,7 @@ describe("真实工具行执行绑定", () => {
 			.where(eq(narrators.id, "other"));
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference("other", "n", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
+		).rejects.toThrow("registered delivery tool-call");
 		await db
 			.update(narrators)
 			.set({
@@ -831,7 +831,7 @@ describe("真实工具行执行绑定", () => {
 			.where(eq(narrators.id, child.id));
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference(child.id, "n", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
+		).rejects.toThrow("registered delivery tool-call");
 	});
 
 	test("实际Agent工具经runner创建子代理时保留ctx主键", async () => {

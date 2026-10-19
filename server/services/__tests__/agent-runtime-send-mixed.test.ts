@@ -7,6 +7,8 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -22,6 +24,8 @@ const { activeNarrators } = await import("../narrator-session-state");
 const { registerAgentReplyWait, clearPendingAgentReplyWaits, getPendingAgentReplyCount } =
 	await import("../agent-reply-waiter");
 const { sendTool } = await import("../../lib/agent/tools/send");
+const { compileDelegationCeiling } = await import("../custom-subagent-service");
+const ceiling = await compileDelegationCeiling("general");
 const store = createMailboxStore(db);
 /** A turn in flight: the session's live abort controller (the same for every session). */
 function liveTurn(narratorId: string, controller: AbortController) {
@@ -51,14 +55,20 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	for (const id of ids) {
 		const primary = id.endsWith("root");
+		const parent = primary ? null : id === "foreign-child" ? "foreign-root" : "parent-root";
 		db.insert(narrators)
 			.values({
 				id,
 				title: id === "sibling-a" ? "Alpha analyst" : id,
 				type: primary ? "primary" : "subagent",
 				variant: primary ? "primary" : "subagent:general",
-				parentNarratorId: primary ? null : id === "foreign-child" ? "foreign-root" : "parent-root",
-				traits: id === "sibling-a" ? ["subagent-alias:alpha"] : [],
+				parentNarratorId: parent,
+				policySourceNarratorId: parent,
+				runtimeRegistrationJson: parent ? delegationRegistration(parent, "general") : null,
+				traits: withRuntimePolicyTrait(
+					id === "sibling-a" ? ["subagent-alias:alpha"] : [],
+					parent ? ceiling : null,
+				),
 				status: "working",
 				isBackground: false,
 				createdAt: time,
