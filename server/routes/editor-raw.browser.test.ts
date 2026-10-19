@@ -462,7 +462,14 @@ test("Chrome146 production raw path: 20MiB, dual-view candidate swap, digests, e
 		await page.waitForFunction(
 			() => (window as unknown as RawWindow).rawFixture.state().registry.visibleConsumers === 1,
 		);
-		expect(service.streams.diagnostics.active).toBe(1);
+		// Stream registration settles asynchronously around the body gate: CI saw
+		// both 0 (not registered yet) and 2 (prior stream not torn down yet) here.
+		let activeStreams = -1;
+		for (let attempt = 0; attempt < 100 && activeStreams !== 1; attempt++) {
+			activeStreams = service.streams.diagnostics.active;
+			if (activeStreams !== 1) await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		expect(activeStreams).toBe(1);
 		expect(
 			await page.evaluate(() => (window as unknown as RawWindow).rawFixture.state().codecs.workers),
 		).toBe(1);
