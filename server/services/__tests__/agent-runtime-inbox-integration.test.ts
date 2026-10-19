@@ -12,6 +12,7 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import { projectMessageSenderText } from "../../lib/agent/sender-projection";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
@@ -113,6 +114,9 @@ beforeEach(async () => {
 				type: id === "parent" ? "primary" : "subagent",
 				variant: id === "parent" ? "primary" : "subagent:general",
 				parentNarratorId: id === "parent" ? null : "parent",
+				policySourceNarratorId: id === "parent" ? null : "parent",
+				runtimeRegistrationJson:
+					id === "parent" ? null : delegationRegistration("parent", "general"),
 				createdAt: time,
 				updatedAt: time,
 			})
