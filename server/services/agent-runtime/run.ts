@@ -447,10 +447,12 @@ async function executeRun(
 			removeCallerListener = () => signal.removeEventListener("abort", onCancel);
 			run.detachCaller = removeCallerListener;
 		}
-		// Whole-run cancellation always reaches the turn in flight.
+		// Whole-run cancellation always reaches the turn in flight. The map itself is a
+		// module singleton, so resolving it here (this caller is async) is equivalent to
+		// resolving it inside the listener — and `require` is not an option: the transitive
+		// dependency reaches `db/index.ts`, whose top-level await `require` cannot carry.
+		const { activeNarrators } = await import("../narrator-session-state");
 		const onRunCancel = () => {
-			const { activeNarrators } =
-				require("../narrator-session-state") as typeof import("../narrator-session-state");
 			activeNarrators.get(id)?.abortController.abort(run.cancel.signal.reason);
 		};
 		run.cancel.signal.addEventListener("abort", onRunCancel, { once: true });
