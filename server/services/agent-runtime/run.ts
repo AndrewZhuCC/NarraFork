@@ -25,7 +25,6 @@ import { parseSubstatus } from "../../lib/narrator-utils";
 import type { Locale } from "../../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
-	needsLegacyDeliverTo,
 	RUNTIME_SOURCE_COLUMNS,
 	runDeliverToOf,
 } from "../../lib/runtime-source";
@@ -132,9 +131,9 @@ async function readRunSource(narratorId: string) {
 			title: true,
 			model: true,
 			reasoningEffort: true,
-			isBackground: true,
+			variant: true,
+			subagentType: true,
 			ownerUserId: true,
-			originToolCallId: true,
 		},
 	});
 	if (!row) throw new AppError("Narrator not found", 404, "NOT_FOUND");
@@ -162,36 +161,7 @@ async function prepareLogicalRun(
 	req: StartNarratorRunRequest,
 	principal: string | null,
 ): Promise<{ binding: RuntimeRunBinding; publicationRun?: PublicationRun }> {
-	const { getLatestSubagentParentToolUseId } = await session();
-	const legacyToolUseId = needsLegacyDeliverTo(row)
-		? await getLatestSubagentParentToolUseId(narratorId)
-		: undefined;
-	const previous = runDeliverToOf(row, legacyToolUseId);
-	let deliverTo = req.binding ? req.binding.deliverTo : previous;
-	// LEGACY COMPATIBILITY (delete in step 5): first registration must preserve
-	// the old row's exact origin proof. A provider tool-use id alone grants nothing.
-	if (
-		row.runtimeRegistrationJson == null &&
-		deliverTo &&
-		!deliverTo.toolCallId &&
-		row.originToolCallId
-	) {
-		const origin = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, row.originToolCallId),
-			columns: { narratorId: true, toolUseId: true, toolName: true },
-		});
-		if (
-			origin?.narratorId === deliverTo.narratorId &&
-			origin.toolUseId === deliverTo.toolUseId &&
-			origin.toolName === "Agent"
-		) {
-			deliverTo = { ...deliverTo, toolCallId: row.originToolCallId };
-		}
-	}
-	// LEGACY COMPATIBILITY (delete in step 5): an unregistered background session
-	// delivers through its task row.
-	if (row.runtimeRegistrationJson == null && row.isBackground && deliverTo)
-		deliverTo = { ...deliverTo, viaTask: true };
+	const deliverTo = req.binding ? req.binding.deliverTo : runDeliverToOf(row);
 	// A result destination is optional; every run registers the same durable facts.
 	const binding: RunBindingInput = {
 		...req.binding,
@@ -203,7 +173,6 @@ async function prepareLogicalRun(
 			narratorId,
 			resumeRunId: req.resumeRunId,
 			binding,
-			legacyToolUseId,
 		});
 	if (!deliverTo || !publicationRun) return { binding: registered };
 	// A caller waiting in the foreground receives the result itself, never via a task.
@@ -1332,12 +1301,6 @@ async function deliverHeldResult(
 		columns: { substatus: true, logicalRunId: true },
 	});
 	const registered = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
-	if (needsLegacyDeliverTo(row)) {
-		const { getLatestSubagentParentToolUseId } = await session();
-		if (!runDeliverToOf(row, await getLatestSubagentParentToolUseId(narratorId)))
-			throw new Error("Held result destination could not be resolved");
-	}
-	// Legacy rows use the very same materialization/admission as an ordinary run start.
 	const prepared = registered
 		? {
 				binding: registered,
@@ -1362,8 +1325,6 @@ async function deliverHeldResult(
 				},
 				registeredPrincipalOf(row) ?? null,
 			);
-	if (needsLegacyDeliverTo(row) && !prepared.binding.deliverTo)
-		throw new Error("Held result destination could not be resolved");
 	run.binding = prepared.binding;
 	run.logicalRunId = prepared.binding.logicalRunId;
 	const { getSubagentFinalText } = await session();

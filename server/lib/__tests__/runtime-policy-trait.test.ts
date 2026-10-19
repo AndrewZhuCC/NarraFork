@@ -9,7 +9,7 @@ import {
 	RUNTIME_POLICY_TRAIT_PREFIX,
 	withRuntimePolicyTrait,
 } from "../runtime-policy-trait";
-import { needsLegacyDeliverTo, registrationBeforeRun, runDeliverToOf } from "../runtime-source";
+import { runDeliverToOf } from "../runtime-source";
 import { resolveLayeredTraits } from "../trait-resolution";
 import {
 	parseRuntimeRegistration,
@@ -223,43 +223,15 @@ describe("run registration", () => {
 		});
 	});
 
-	test("a legacy delegated row derives delivery once; a registered run is authoritative", () => {
-		const legacy = { type: "subagent", variant: "subagent:general", parentNarratorId: "p" };
-		expect(needsLegacyDeliverTo(legacy)).toBe(true);
-		expect(runDeliverToOf(legacy, "linked")).toEqual({ narratorId: "p", toolUseId: "linked" });
-		expect(registrationBeforeRun(legacy)?.controller?.narratorId).toBe("p");
-		const registered = {
-			...legacy,
-			runtimeRegistrationJson: registerRun(null, "r", {}, 0),
+	test("delivery is read from the registered run only", () => {
+		expect(runDeliverToOf({ runtimeRegistrationJson: null })).toBeUndefined();
+		// A registered row without a run (plugin standalone worker) delivers nowhere.
+		const worker = {
+			runtimeRegistrationJson: { version: 1, controller: { narratorId: "p", actions: ["stop"] } },
 		};
-		expect(needsLegacyDeliverTo(registered)).toBe(false);
-		expect(runDeliverToOf(registered, "linked")).toBeUndefined();
-		// An ordinary session with the same registration behaves the same.
+		expect(runDeliverToOf(worker)).toBeUndefined();
 		expect(
 			runDeliverToOf({ runtimeRegistrationJson: registerRun(null, "r", { deliverTo }, 0) }),
 		).toEqual(deliverTo);
-	});
-
-	test("a registered row without a run delivers nowhere (plugin standalone worker)", () => {
-		// Created through the delegation entry, so it has a delegated shape and a
-		// registration — but no run has registered a destination yet.
-		const worker = {
-			type: "subagent",
-			variant: "subagent:general",
-			parentNarratorId: "p",
-			runtimeRegistrationJson: { version: 1, controller: { narratorId: "p", actions: ["stop"] } },
-		};
-		expect(needsLegacyDeliverTo(worker)).toBe(false);
-		expect(runDeliverToOf(worker, "linked")).toBeUndefined();
-	});
-
-	test("a legacy standalone transport link is never a delivery destination", () => {
-		const legacyWorker = { type: "subagent", variant: "subagent:general", parentNarratorId: "p" };
-		expect(runDeliverToOf(legacyWorker, "standalone-worker-1")).toBeUndefined();
-		// A real linked tool call of an unregistered legacy delegation still derives.
-		expect(runDeliverToOf(legacyWorker, "toolu_real")).toEqual({
-			narratorId: "p",
-			toolUseId: "toolu_real",
-		});
 	});
 });

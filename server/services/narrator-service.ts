@@ -71,7 +71,6 @@ import {
 	upsertEncodedTrait,
 } from "../lib/narrator-custom-traits";
 import {
-	getSubagentType,
 	isSubagentVariant,
 	KNOWLEDGE_KIND_TRAIT,
 	type NarratorTrait,
@@ -90,13 +89,11 @@ import {
 } from "../lib/prompt-i18n";
 import {
 	appendRuntimePolicyTrait,
-	hasRuntimePolicyTrait,
 	parseRuntimePolicyTraits,
 	type RuntimePolicyTrait,
 	withRuntimePolicyTrait,
 } from "../lib/runtime-policy-trait";
 import {
-	hasLegacyDelegatedShape,
 	modelPoolKeyOf,
 	policySourceIdOf,
 	type RuntimeSourceRow,
@@ -1262,12 +1259,6 @@ async function forkTraits(
 		...(chapterId ? [] : ["standalone"]),
 		...parseTraits(parent.traits).filter((trait) => !excluded.has(trait)),
 	];
-	// Step-5 compatibility: primary forks no longer have the legacy delegated shape
-	// which inferred this ceiling at read time. Materialize it before losing that shape.
-	if (hasLegacyDelegatedShape(parent) && !hasRuntimePolicyTrait(parent.traits)) {
-		const template = getSubagentType(parent.variant) || parent.subagentType || "general";
-		return appendRuntimePolicyTrait(traits, await compileDelegationCeiling(template));
-	}
 	return traits;
 }
 
