@@ -18,7 +18,6 @@
 	"commandcodeQuotaWindow": "{{label}}: {{usedOfTotal}}% / {{capOfTotal}}% ({{usedInWindow}}% used)",
 	"commandcodeQuotaFiveHour": "5h limit",
 	"commandcodeQuotaWeekly": "Weekly limit",
-	"commandcodeQuotaRawTitle": "Raw data",
 	"commandcodeQuotaRawMonthly": "Monthly window: {{used}} / {{total}}",
 	"commandcodeQuotaRawWindow": "{{label}}: {{used}} / {{cap}}",
 	"commandcodeQuotaRawWeekly": "Weekly window",

@@ -813,9 +813,19 @@ export function hasConfiguredCommandCodeProvider(): boolean {
  * 逐模型协议：`modelProtocolOverrides`（「编辑此连接覆盖」里单独保存的那层）优先于
  * `modelProtocols`（设置页模型行写的 provider 层）；两层都没有时由各 provider 的默认规则决定。
  */
+/**
+ * 协议表的键是带前缀的完整模型 id（`openai:gpt-4o`）。
+ * 调用方有时传入裸模型名，有时传入已经带前缀的 id；两种都收成同一把键。
+ */
+export function modelProtocolKey(prefix: string, model: string): string {
+	const parsed = parseModelId(model);
+	const bare = !parsed.provider || parsed.provider === prefix ? parsed.model : model;
+	return `${prefix}:${bare}`;
+}
+
 export function resolveModelProtocol(prefix: string, model?: string): ModelProtocol | undefined {
 	if (!model) return undefined;
-	const key = `${prefix}:${model}`;
+	const key = modelProtocolKey(prefix, model);
 	const agent = s().agent;
 	return agent?.modelProtocolOverrides?.[key] ?? agent?.modelProtocols?.[key];
 }

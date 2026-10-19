@@ -448,12 +448,30 @@ function SettingsProvidersPage() {
 	// Holds the latest auto-fetch implementation so handleSave keeps a stable identity.
 	const autoFetchAndFillRef = useRef<(() => Promise<void>) | null>(null);
 
-	/** 刷新 Command Code 模型：草稿未保存时先落盘，否则后端用的是旧凭据。 */
+	/**
+	 * 刷新 Command Code 模型。未保存的新 API key 只随这次请求带上，不把整份设置草稿一起提交。
+	 * 已保存的 key 则等服务端缓存更新后重新读取设置。
+	 */
 	const refreshCommandCodeModels = useCallback(async () => {
-		if (providerSettingsDirty) await saveProvidersState();
-		await api.commandCodeRefreshModels();
+		const draftKey = state.commandCode.apiKey.trim();
+		const savedKey = savedSnapshot.current.commandCode.apiKey.trim();
+		const unsavedKey =
+			draftKey && draftKey !== savedKey && !draftKey.startsWith("*") ? draftKey : undefined;
+		const models = await api.commandCodeRefreshModels(
+			unsavedKey ? { apiKey: unsavedKey } : undefined,
+		);
+		if (unsavedKey) {
+			const patch = (current: unknown) =>
+				current && typeof current === "object"
+					? { ...current, commandcodeModels: models, commandcodeModelsPending: false }
+					: current;
+			qc.setQueryData(["settings"], patch);
+			qc.setQueryData(["admin", "settings"], patch);
+			return;
+		}
 		await qc.invalidateQueries({ queryKey: ["settings"] });
-	}, [providerSettingsDirty, saveProvidersState, qc]);
+		await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+	}, [state.commandCode.apiKey, qc]);
 
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);

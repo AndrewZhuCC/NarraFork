@@ -1,10 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
 	COMMAND_CODE_PROVIDER_BASE,
+	commandCodeApiOrigin,
+	endpointFromSupported,
 	parseCommandCodeModels,
 	resolveCommandCodeEndpoint,
+	selectCommandCodeEndpoint,
 } from "../commandcode-protocol";
-import { parseCommandCodeCredits, parseCommandCodeSummary } from "../commandcode-usage";
+import {
+	parseCommandCodeCredits,
+	parseCommandCodeSummary,
+	readResponseJsonLimited,
+} from "../commandcode-usage";
 
 describe("Command Code 端点选择（规则与实测 supported_endpoints 一致）", () => {
 	test("claude 系只支持 /messages", () => {
@@ -22,6 +29,34 @@ describe("Command Code 端点选择（规则与实测 supported_endpoints 一致
 
 	test("大小写与首尾空格不敏感", () => {
 		expect(resolveCommandCodeEndpoint("  CLAUDE-opus-5  ")).toBe("messages");
+	});
+
+	test("带 CommandCode 前缀的 claude 模型仍走 /messages", () => {
+		expect(selectCommandCodeEndpoint("CommandCode:claude-haiku-5-5")).toBe("messages");
+		expect(selectCommandCodeEndpoint("CommandCode:gpt-5.6-luna")).toBe("completions");
+	});
+
+	test("目录里的 supported_endpoints 优先于模型名，显式协议再优先于目录", () => {
+		expect(endpointFromSupported(["/messages"])).toBe("messages");
+		expect(selectCommandCodeEndpoint("foo-model", { supportedEndpoints: ["/messages"] })).toBe(
+			"messages",
+		);
+		expect(
+			selectCommandCodeEndpoint("claude-haiku-5-5", {
+				protocol: "completions-compatible",
+				supportedEndpoints: ["/messages"],
+			}),
+		).toBe("completions");
+	});
+
+	test("gemini 协议没有 Command Code 端点，退回模型名规则", () => {
+		expect(
+			selectCommandCodeEndpoint("CommandCode:claude-haiku-5-5", {
+				protocol: "gemini-compatible",
+			}),
+		).toBe("messages");
+		expect(commandCodeApiOrigin("https://proxy.example/provider/v1")).toBe("https://proxy.example");
+		expect(commandCodeApiOrigin(undefined)).toBe("https://api.commandcode.ai");
 	});
 
 	test("逐模型覆盖优先于默认规则", () => {
@@ -56,6 +91,11 @@ describe("Command Code 模型列表解析（结构取自实测响应）", () => 
 		expect(parseCommandCodeModels({})).toEqual([]);
 		expect(parseCommandCodeModels({ data: [{ noId: 1 }] })).toEqual([]);
 		expect(parseCommandCodeModels({ data: "x" })).toEqual([]);
+	});
+
+	test("响应体超过上限时取消读取", async () => {
+		const response = new Response("x".repeat(8 * 1024));
+		await expect(readResponseJsonLimited(response, 1024)).rejects.toThrow("response_too_large");
 	});
 
 	test("Provider API 根地址取自实测", () => {

@@ -110,6 +110,7 @@ export {
 	LARGE_CONTEXT_BOUNDARY,
 	type ModelContextWindowResolution,
 	type ModelContextWindowSource,
+	modelProtocolKey,
 	nugProviderPrefix,
 	openaiProviderPrefix,
 	parseAggModelValue,

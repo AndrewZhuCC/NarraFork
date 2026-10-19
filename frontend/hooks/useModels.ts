@@ -221,6 +221,13 @@ export function useAllModels() {
 	// settings (which carry the NUG model list + `available` flags) so the picker
 	// reflects recovery/outage live.
 	useEffect(() => {
+		if (settingsData?.commandcodeModelsPending !== true) return;
+		const timer = setTimeout(() => {
+			void qc.invalidateQueries({ queryKey: ["settings"] });
+		}, 1_500);
+		return () => clearTimeout(timer);
+	}, [settingsData?.commandcodeModelsPending, qc]);
+	useEffect(() => {
 		const onAvailabilityChanged = () => {
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		};

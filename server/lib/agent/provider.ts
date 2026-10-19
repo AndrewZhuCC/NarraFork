@@ -16,6 +16,7 @@ import type { ProviderReadiness } from "@shared/provider-readiness";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
+import { logger } from "../logger";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
@@ -37,6 +38,11 @@ import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
+import {
+	connectionForProtocolSwitch,
+	type ProtocolConnectionFields,
+	protocolMatchesConnection,
+} from "./protocol-override";
 import { type ProviderSource, ProviderSourceRegistry } from "./provider-source-registry";
 import type { ApiRequestDumpCollector } from "./request-dump";
 import { TokenDanceProvider } from "./tokendance-provider";
@@ -373,34 +379,24 @@ function registerCredentialProviderSource<
 		resolve: (prefix, model) => {
 			const config = getConfig(prefix);
 			if (!config) return null;
-			// 逐模型协议覆盖：把同一份连接配置交给另一族适配器。构造失败则回退默认，避免影响其它模型。
+			// 逐模型协议覆盖：协议和这条连接本来的适配器不同时，换一族适配器，但留下代理和指纹。
 			const protocol = resolveModelProtocol(prefix, model);
-			if (protocol) {
+			const connection = config as ProtocolConnectionFields;
+			if (protocol && !protocolMatchesConnection(kind, connection, protocol)) {
 				try {
-					const base = config as unknown as {
-						id: string;
-						name: string;
-						prefix: string;
-						apiKey: string;
-						baseUrl?: string;
-						defaultModel?: string;
-					};
-					const shared = {
-						id: base.id,
-						name: base.name,
-						prefix: base.prefix,
-						apiKey: base.apiKey,
-						baseUrl: base.baseUrl ?? "",
-						defaultModel: base.defaultModel ?? model ?? "default",
-					};
+					const shared = connectionForProtocolSwitch(connection, model);
 					if (protocol === "anthropic-messages") return new AnthropicProvider(shared);
-					if (protocol === "gemini-compatible") return createGeminiProvider(shared as never);
+					if (protocol === "gemini-compatible") return createGeminiProvider(shared);
 					return new OpenAIProvider({
 						...shared,
 						apiMode: protocol === "openai-responses" ? "responses" : "completions",
 					});
-				} catch {
-					// 落到默认构造
+				} catch (error) {
+					logger.warn("Model protocol override fell back to the provider default", {
+						prefix,
+						protocol,
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
 			}
 			return create(config);

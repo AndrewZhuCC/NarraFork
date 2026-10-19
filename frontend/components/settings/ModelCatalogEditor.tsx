@@ -27,7 +27,11 @@ import {
 } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
 import { Z } from "../../lib/z-index";
-import { ModelProtocolSelect, modelProtocolLabel } from "../providers/ModelProtocolSelect";
+import {
+	COMMAND_CODE_PROTOCOL_OPTIONS,
+	ModelProtocolSelect,
+	modelProtocolLabel,
+} from "../providers/ModelProtocolSelect";
 import type { CustomApiProtocol } from "../providers/types";
 import { ModelCardDetails } from "./ModelCardDetails";
 import {
@@ -472,10 +476,14 @@ export function ModelCatalogEditor({
 						<Text size="xs" c="dimmed">
 							{t("catalog.protocolHint", { model: protocol.modelValue })}
 						</Text>
-						{/* 下拉默认停在 popover 层，比本 Modal 低，所以要显式抬高（见 EDITOR_COMBOBOX_PROPS）。
-						    选中项写着「本地覆盖」，选「跟随默认」等于清掉本层覆盖。 */}
+						{/* 下拉绑定本层草稿。null 显示「跟随默认」；上面的摘要行才展示继承后的有效协议。 */}
 						<ModelProtocolSelect
-							value={effectiveProtocol}
+							value={protocolDraft}
+							protocols={
+								protocol.modelValue.startsWith("CommandCode:")
+									? COMMAND_CODE_PROTOCOL_OPTIONS
+									: undefined
+							}
 							onChange={setProtocolDraft}
 							size="xs"
 							dropdownZIndex={Z.modal + 2}

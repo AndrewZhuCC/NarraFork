@@ -2681,6 +2681,11 @@
 		"tokens": "Token 数",
 		"successRate": "成功率",
 		"modelsTitle": "模型",
-		"modelsDesc": "从 Provider API 拉取并缓存 10 分钟；默认协议不对时可为单个模型指定协议。"
+		"modelsDesc": "从 Provider API 拉取并缓存 10 分钟；默认协议不对时可为单个模型指定协议。",
+		"usageFailed": "暂时读不到 Command Code 的额度。",
+		"reasonNotConfigured": "还没有配置 Command Code。请在下方填入 Studio 生成的 API key。",
+		"reasonMissingApiKey": "Command Code CLI 的登录文件里没有 API key。",
+		"reasonReadFailed": "读取 Command Code CLI 的登录文件失败。",
+		"reasonUnauthorized": "Command Code 凭据被拒绝。请重新填写 API key，或在 CLI 里重新登录。"
 	}
 }

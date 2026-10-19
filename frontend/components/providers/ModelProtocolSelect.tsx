@@ -18,6 +18,13 @@ export const MODEL_PROTOCOL_OPTIONS = [
 	"gemini-compatible",
 ] as const satisfies readonly CustomApiProtocol[];
 
+/** Command Code 没有 Gemini 端点，模型行不提供这一项。 */
+export const COMMAND_CODE_PROTOCOL_OPTIONS = [
+	"anthropic-messages",
+	"openai-responses",
+	"completions-compatible",
+] as const satisfies readonly CustomApiProtocol[];
+
 const PROTOCOL_LABEL_KEYS: Record<CustomApiProtocol, string> = {
 	"anthropic-messages": "customApiProtocolAnthropicMessages",
 	"openai-responses": "customApiProtocolOpenAIResponses",
@@ -31,10 +38,11 @@ const PROTOCOL_LABEL_KEYS: Record<CustomApiProtocol, string> = {
  */
 export function modelProtocolOptionsData(
 	t: (key: string) => string,
+	protocols: readonly CustomApiProtocol[] = MODEL_PROTOCOL_OPTIONS,
 ): Array<{ value: string; label: string }> {
 	return [
 		{ value: "inherit", label: t("modelProtocolInherit") },
-		...MODEL_PROTOCOL_OPTIONS.map((protocol) => ({
+		...protocols.map((protocol) => ({
 			value: protocol,
 			label: t(PROTOCOL_LABEL_KEYS[protocol]),
 		})),
@@ -57,8 +65,9 @@ export function ModelProtocolSelect({
 	disabled,
 	ariaLabel,
 	dropdownZIndex,
+	protocols,
 }: {
-	/** 当前协议；`null` 表示「跟随默认」，即 modelProtocols 里没有这个键。 */
+	/** 当前层自己的协议；`null` 表示这一层没有覆盖，下拉显示「跟随默认」。 */
 	value: CustomApiProtocol | null;
 	onChange: (protocol: CustomApiProtocol | null) => void;
 	size?: MantineSize;
@@ -67,6 +76,8 @@ export function ModelProtocolSelect({
 	ariaLabel?: string;
 	/** 下拉层 zIndex；嵌在被显式抬高的 Modal 里时必须高于该 Modal，否则下拉会被遮住。 */
 	dropdownZIndex?: number;
+	/** 省略时提供全部协议。Command Code 去掉没有端点的 Gemini。 */
+	protocols?: readonly CustomApiProtocol[];
 }) {
 	const { t } = useTranslation("settings");
 	return (
@@ -79,7 +90,7 @@ export function ModelProtocolSelect({
 			aria-label={ariaLabel ?? t("modelProtocol")}
 			comboboxProps={{ withinPortal: true, zIndex: dropdownZIndex }}
 			value={value ?? "inherit"}
-			data={modelProtocolOptionsData(t)}
+			data={modelProtocolOptionsData(t, protocols)}
 			onChange={(next) => onChange(next && next !== "inherit" ? (next as CustomApiProtocol) : null)}
 		/>
 	);

@@ -6,6 +6,7 @@ import {
 	TOKENDANCE_APP_URL,
 	TOKENDANCE_ORIGIN,
 } from "@shared/tokendance";
+import { resolveModelProtocol } from "../settings/provider";
 import { readWithTimeout } from "../stream-timeout";
 import {
 	assertTokenDanceConnection,
@@ -216,7 +217,10 @@ export class TokenDanceProvider implements ProviderAdapter {
 		if (parsed.provider && parsed.provider !== "tokendance")
 			throw new Error("Invalid TokenDance model namespace.");
 		const catalog = getTokenDanceCatalogModels().find((entry) => entry.id === parsed.model);
-		const protocol = catalog && selectTokenDanceProtocol(catalog.supported_protocols);
+		// 设置页为这个模型显式选的协议优先于目录推荐。模型仍必须在目录里，否则没有上下文长度。
+		const override = resolveModelProtocol("tokendance", model);
+		const recommended = catalog && selectTokenDanceProtocol(catalog.supported_protocols);
+		const protocol = override ?? recommended;
 		if (!catalog || !protocol)
 			throw new Error(
 				"TokenDance model is missing or has no supported protocol. Refresh the model catalog.",

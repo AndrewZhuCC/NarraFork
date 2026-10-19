@@ -7,11 +7,13 @@
  */
 
 import { resolveCommandCodeToken } from "../commandcode-manager";
+import { getCachedCommandCodeModel } from "../commandcode-models";
 import {
+	bareCommandCodeModelId,
 	COMMAND_CODE_PREFIX,
-	COMMAND_CODE_PROVIDER_BASE,
 	type CommandCodeEndpoint,
-	resolveCommandCodeEndpoint,
+	commandCodeProviderBase,
+	selectCommandCodeEndpoint,
 } from "../commandcode-protocol";
 import { resolveModelProtocol } from "../settings";
 import type { ProxyOverride } from "../settings/types";
@@ -21,22 +23,6 @@ import { OpenAIProvider } from "./openai-provider";
 import type { ProviderAdapter } from "./provider";
 
 export { COMMAND_CODE_PREFIX };
-
-/** 设置页的通用协议值映射到 Command Code 的端点；gemini 在上游没有对应端点，按 responses 处理。 */
-function protocolToEndpoint(protocol?: string): CommandCodeEndpoint | undefined {
-	switch (protocol) {
-		case "anthropic-messages":
-			return "messages";
-		case "openai-responses":
-			return "responses";
-		case "completions-compatible":
-			return "completions";
-		case "gemini-compatible":
-			return "responses";
-		default:
-			return undefined;
-	}
-}
 
 export interface CommandCodeProviderSettings {
 	disabled?: boolean;
@@ -62,23 +48,27 @@ export function buildCommandCodeProvider(
 	if (config?.disabled) return undefined;
 	const auth = resolveCommandCodeToken(config?.apiKey);
 	if (!auth.credential) return undefined;
+	const bare = bareCommandCodeModelId(model);
 	const shared = {
 		id: "CommandCode",
 		name: "Command Code",
 		prefix: COMMAND_CODE_PREFIX,
 		apiKey: auth.credential.token,
-		defaultModel: model,
-		baseUrl: (config?.baseUrl ?? COMMAND_CODE_PROVIDER_BASE).replace(/\/+$/, ""),
+		defaultModel: bare || model,
+		baseUrl: commandCodeProviderBase(config?.baseUrl),
 		proxy: config?.proxy,
 		userAgentMode: config?.userAgentMode,
 		customUserAgent: config?.customUserAgent,
 		extraHeaders: config?.extraHeaders,
 	};
 	// 逐模型协议：优先取设置页里为该模型显式选择的协议（「编辑此连接覆盖」保存的那层优先），
-	// 其次用 commandCode.endpoints，最后按模型名推断。
+	// 其次用 commandCode.endpoints、目录里的 supported_endpoints，最后按裸模型名推断。
 	const chosen = resolveModelProtocol(COMMAND_CODE_PREFIX, model);
-	const endpoint =
-		protocolToEndpoint(chosen) ?? resolveCommandCodeEndpoint(model, config?.endpoints);
+	const endpoint = selectCommandCodeEndpoint(model, {
+		protocol: chosen,
+		overrides: config?.endpoints,
+		supportedEndpoints: getCachedCommandCodeModel(bare)?.endpoints,
+	});
 	if (endpoint === "messages") {
 		return new AnthropicProvider(shared);
 	}

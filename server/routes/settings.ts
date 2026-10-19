@@ -27,7 +27,7 @@ import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
-import { listCommandCodeModels } from "../lib/commandcode-models";
+import { peekCommandCodeModels } from "../lib/commandcode-models";
 import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
@@ -943,6 +943,10 @@ async function buildSettingsResponse(
 	const codexManager = getCodexManager();
 	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
 	stripObsoleteSettingsKeys(safeSource);
+	const commandCodeCatalog = peekCommandCodeModels(
+		source.commandCode?.apiKey,
+		source.commandCode?.baseUrl,
+	);
 	return {
 		...safeSource,
 		providerReadiness: await listProviderReadiness(),
@@ -1014,7 +1018,8 @@ async function buildSettingsResponse(
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		commandcodeAvailable: hasConfiguredCommandCodeProvider(),
-		commandcodeModels: await listCommandCodeModels(source.commandCode?.apiKey),
+		commandcodeModels: commandCodeCatalog.models,
+		commandcodeModelsPending: commandCodeCatalog.pending,
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
 		lanAddresses: getLanAddresses(),
 		summaryModelAvailable: checkSummaryModelAvailable(source.agent.summaryModel),

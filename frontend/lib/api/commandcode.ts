@@ -77,13 +77,20 @@ export const commandCodeApi = {
 		return (await response.json()) as CommandCodeUsageResponse;
 	},
 
-	/** 丢弃服务端的模型缓存并重新拉取；返回模型 id 列表。 */
-	async commandCodeRefreshModels(): Promise<string[]> {
+	/**
+	 * 丢弃服务端的模型缓存并重新拉取。
+	 * `apiKey` 只在设置页有尚未保存的新 key 时传入，服务端不会把它写进 settings。
+	 */
+	async commandCodeRefreshModels(draft?: { apiKey?: string; baseUrl?: string }): Promise<string[]> {
 		const response = await fetch(`${apiBase()}/commandcode/models/refresh`, {
 			method: "POST",
-			headers: authHeaders(),
+			headers: { ...authHeaders(), "Content-Type": "application/json" },
+			body: JSON.stringify(draft ?? {}),
 		});
-		const body = (await response.json()) as { models?: string[] };
+		const body = (await response.json()) as { models?: string[]; error?: string };
+		if (!response.ok) {
+			throw new Error(body.error ?? `command code model refresh failed: ${response.status}`);
+		}
 		return body.models ?? [];
 	},
 };

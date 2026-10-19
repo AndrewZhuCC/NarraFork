@@ -429,7 +429,7 @@ describe("real catalog editor form", () => {
 		// 本层有覆盖：有效值取本层，来源标为 Override（与「能力」字段同一套说法）。
 		expect(text()).toContain("Legacy Completions Compatible");
 		expect(text()).toContain("Override");
-		// 下拉本身就是当前有效值（选中态由它体现；它曾被 Modal 的层级盖住过）。
+		// 下拉显示本层覆盖，不显示继承来的协议。
 		const select = document.querySelector(
 			'input[aria-label="Model protocol"]',
 		) as HTMLInputElement | null;
@@ -441,6 +441,9 @@ describe("real catalog editor form", () => {
 		await click(button("Inherit"));
 		expect(text()).toContain("OpenAI Responses");
 		expect(text()).toContain("Provider setting");
+		expect(
+			(document.querySelector('input[aria-label="Model protocol"]') as HTMLInputElement).value,
+		).toBe("Use default");
 		await click(button("Save"));
 		await waitFor(() => saved.length === 1);
 		expect(saved[0]).toBeNull();

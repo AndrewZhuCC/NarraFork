@@ -39,10 +39,27 @@ import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { type CustomModelEntry, InlineCustomModels } from "./InlineCustomModels";
 import { ModelList, type ModelListItem } from "./ModelList";
+import { COMMAND_CODE_PROTOCOL_OPTIONS } from "./ModelProtocolSelect";
 import type { CommandCodeState } from "./providers-reducer";
 import type { CustomApiProtocol } from "./types";
 
 const STUDIO_API_KEYS_URL = "https://commandcode.ai/studio/";
+
+const COMMAND_CODE_REASONS = {
+	not_configured: "commandcode.reasonNotConfigured",
+	missing_api_key: "commandcode.reasonMissingApiKey",
+	read_failed: "commandcode.reasonReadFailed",
+	unauthorized: "commandcode.reasonUnauthorized",
+} as const;
+
+function commandCodeReasonText(
+	t: (key: string) => string,
+	reason: string | undefined,
+): string | null {
+	if (!reason) return null;
+	const key = COMMAND_CODE_REASONS[reason as keyof typeof COMMAND_CODE_REASONS];
+	return key ? t(key) : null;
+}
 
 export interface CommandCodeSectionProps {
 	/** settings.commandCode 的草稿镜像。 */
@@ -240,14 +257,14 @@ export function CommandCodeSection({
 					onChange={(next) => onChange({ ...value, ...next })}
 				/>
 
-				{!isLoading && !data?.loggedIn && data?.reason && (
+				{!isLoading && !data?.loggedIn && commandCodeReasonText(t, data?.reason) && (
 					<Alert color="yellow" variant="light">
-						{data.reason}
+						{commandCodeReasonText(t, data?.reason)}
 					</Alert>
 				)}
-				{data?.error && (
+				{data?.error === "usage_unavailable" && (
 					<Alert color="red" variant="light">
-						{data.error}
+						{t("commandcode.usageFailed")}
 					</Alert>
 				)}
 
@@ -339,6 +356,7 @@ export function CommandCodeSection({
 							onBatchToggleHidden={onBatchToggleHidden}
 							modelProtocols={modelProtocols}
 							onModelProtocolChange={onModelProtocolChange}
+							protocols={COMMAND_CODE_PROTOCOL_OPTIONS}
 							modelContextWindows={modelContextWindows ?? {}}
 							onContextWindowChange={onContextWindowChange ?? (() => {})}
 							onTestModel={onTestModel}

@@ -10,6 +10,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	DEFAULTS,
+	modelProtocolKey,
 	narraforkDir,
 	reloadSettings,
 	resolveModelProtocol,
@@ -38,7 +39,9 @@ describe("model protocol override precedence", () => {
 		withBoth.agent.modelProtocolOverrides = { "CommandCode:demo": "completions-compatible" };
 		saveSettings(withBoth);
 		reloadSettings();
+		expect(modelProtocolKey("CommandCode", "CommandCode:demo")).toBe("CommandCode:demo");
 		expect(resolveModelProtocol("CommandCode", "demo")).toBe("completions-compatible");
+		expect(resolveModelProtocol("CommandCode", "CommandCode:demo")).toBe("completions-compatible");
 
 		const inherited = structuredClone(settings);
 		delete inherited.agent.modelProtocolOverrides?.["CommandCode:demo"];

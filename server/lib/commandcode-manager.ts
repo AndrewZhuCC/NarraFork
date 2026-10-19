@@ -9,6 +9,10 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { logger } from "./logger";
+
+/** 给前端翻译的稳定原因码，不把本机路径或文件系统错误原文回给浏览器。 */
+export type CommandCodeAuthReason = "not_configured" | "missing_api_key" | "read_failed";
 
 export interface CommandCodeCredential {
 	/** 访问令牌，用作 `Authorization: Bearer`。 */
@@ -22,8 +26,8 @@ export interface CommandCodeCredential {
 
 export interface CommandCodeAuthState {
 	credential?: CommandCodeCredential;
-	/** 未登录或文件不可用时给出的可操作提示。 */
-	reason?: string;
+	/** 未登录或文件不可用时的原因码，由前端按界面语言显示。 */
+	reason?: CommandCodeAuthReason;
 }
 
 /** CLI 固定把凭据写在这里，与 NARRAFORK_HOME 无关。 */
@@ -53,7 +57,7 @@ export function readCommandCodeAuth(): CommandCodeAuthState {
 		};
 		const token = typeof raw.apiKey === "string" ? raw.apiKey.trim() : "";
 		if (!token) {
-			return { reason: "~/.commandcode/auth.json 里没有 apiKey" };
+			return { reason: "missing_api_key" };
 		}
 		return {
 			credential: {
@@ -65,11 +69,11 @@ export function readCommandCodeAuth(): CommandCodeAuthState {
 		};
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException)?.code;
-		return {
-			reason:
-				code === "ENOENT"
-					? "未配置 Command Code：请在下方填入 Studio 生成的 API key"
-					: `读取 ~/.commandcode/auth.json 失败：${error instanceof Error ? error.message : String(error)}`,
-		};
+		if (code !== "ENOENT") {
+			logger.warn("Failed to read Command Code CLI auth file", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		return { reason: code === "ENOENT" ? "not_configured" : "read_failed" };
 	}
 }

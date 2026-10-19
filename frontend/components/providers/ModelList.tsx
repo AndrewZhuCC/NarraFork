@@ -26,6 +26,8 @@ export interface ModelListProps {
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 	showContextWindow?: boolean;
+	/** 这一列模型可选的协议。省略时是全部四种。 */
+	protocols?: readonly CustomApiProtocol[];
 	/** Provider-specific control appended to each row (e.g. a protocol picker). */
 	renderExtraForModel?: (modelValue: string) => React.ReactNode;
 }
@@ -42,6 +44,7 @@ export const ModelList = React.memo(function ModelList({
 	onContextWindowChange,
 	onTestModel,
 	showContextWindow = true,
+	protocols,
 	renderExtraForModel,
 }: ModelListProps) {
 	const { t } = useTranslation("settings");
@@ -52,6 +55,7 @@ export const ModelList = React.memo(function ModelList({
 			value={modelProtocols[modelValue] ?? null}
 			onChange={(protocol) => onModelProtocolChange(modelValue, protocol)}
 			width={190}
+			protocols={protocols}
 		/>
 	);
 	const normalizedQuery = query.trim().toLowerCase();

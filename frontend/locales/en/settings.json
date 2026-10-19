@@ -2679,6 +2679,11 @@
 		"tokens": "Tokens",
 		"successRate": "Success rate",
 		"modelsTitle": "Models",
-		"modelsDesc": "Fetched from the Provider API and cached for 10 minutes. Set a protocol per model when the default is wrong."
+		"modelsDesc": "Fetched from the Provider API and cached for 10 minutes. Set a protocol per model when the default is wrong.",
+		"usageFailed": "Command Code usage could not be loaded.",
+		"reasonNotConfigured": "Command Code is not configured. Paste an API key from Studio below.",
+		"reasonMissingApiKey": "The Command Code CLI auth file has no API key.",
+		"reasonReadFailed": "The Command Code CLI auth file could not be read.",
+		"reasonUnauthorized": "The Command Code credential was rejected. Paste a new API key or sign in again with the CLI."
 	}
 }

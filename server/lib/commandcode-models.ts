@@ -2,41 +2,136 @@
  * Command Code 模型列表（带缓存）。
  *
  * Provider API 的 `GET /provider/v1/models` 是运行时数据（上游随时增删模型），所以不像 codex
- * 那样硬编码，而是拉取后缓存；失败时退回到上次结果或空列表，绝不让 settings 响应因此报错。
+ * 那样硬编码，而是拉取后缓存。设置读取只看缓存并在后台补拉，不把上游延迟算进这次响应。
  */
 
 import { resolveCommandCodeToken } from "./commandcode-manager";
-import { COMMAND_CODE_PROVIDER_BASE, parseCommandCodeModels } from "./commandcode-protocol";
+import {
+	type CommandCodeModelInfo,
+	commandCodeProviderBase,
+	parseCommandCodeModels,
+} from "./commandcode-protocol";
+import { readResponseJsonLimited } from "./commandcode-usage";
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
+const NEGATIVE_TTL_MS = 30 * 1000;
 const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_BODY_BYTES = 256 * 1024;
 
-let cache: { models: string[]; fetchedAt: number; token: string } | undefined;
+interface ModelCache {
+	models: CommandCodeModelInfo[];
+	fetchedAt: number;
+	token: string;
+	base: string;
+	/** 上游失败。短时间内不再打，避免设置页每次读取都等满超时。 */
+	negative: boolean;
+}
 
-/** 列出可用模型 id；未配置凭据或请求失败时返回缓存（可能为空）。 */
-export async function listCommandCodeModels(apiKey?: string): Promise<string[]> {
+let cache: ModelCache | undefined;
+let generation = 0;
+let inflight: { key: string; task: Promise<void> } | undefined;
+
+export interface CommandCodeModelSnapshot {
+	models: string[];
+	/** 缓存过期或还没有，后台正在拉。调用方可以过一会儿再读一次。 */
+	pending: boolean;
+}
+
+function cacheKey(token: string, base: string): string {
+	return `${base}\n${token}`;
+}
+
+function sameSlot(entry: ModelCache, token: string, base: string): boolean {
+	return entry.token === token && entry.base === base;
+}
+
+function fresh(entry: ModelCache): boolean {
+	const ttl = entry.negative ? NEGATIVE_TTL_MS : CACHE_TTL_MS;
+	return Date.now() - entry.fetchedAt < ttl;
+}
+
+/** 丢弃缓存，让下一次拉取重新向上游请求（设置页的「刷新模型」）。 */
+export function invalidateCommandCodeModelsCache(): void {
+	generation += 1;
+	cache = undefined;
+	inflight = undefined;
+}
+
+export function getCachedCommandCodeModel(modelId: string): CommandCodeModelInfo | undefined {
+	return cache?.models.find((model) => model.id === modelId);
+}
+
+/**
+ * 设置响应用：有新鲜缓存就返回，否则启动一次去重的后台拉取并立刻返回已有结果（可能为空）。
+ */
+export function peekCommandCodeModels(apiKey?: string, baseUrl?: string): CommandCodeModelSnapshot {
 	const auth = resolveCommandCodeToken(apiKey);
-	if (!auth.credential) return [];
+	if (!auth.credential) return { models: [], pending: false };
 	const token = auth.credential.token;
-	// 换过凭据就必须重拉：上一个 key 的可见模型集合可能完全不同。
-	if (cache && cache.token === token && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
-		return cache.models;
+	const base = commandCodeProviderBase(baseUrl);
+	if (cache && sameSlot(cache, token, base) && fresh(cache)) {
+		return { models: cache.models.map((model) => model.id), pending: false };
 	}
+	void loadCommandCodeModels(token, base);
+	const stale = cache && sameSlot(cache, token, base) ? cache.models.map((model) => model.id) : [];
+	return { models: stale, pending: true };
+}
+
+/** 等到这次拉取结束。刷新按钮走这里；失败时 `ok` 为 false，并留下短负缓存。 */
+export async function listCommandCodeModels(
+	apiKey?: string,
+	baseUrl?: string,
+): Promise<{ models: string[]; ok: boolean }> {
+	const auth = resolveCommandCodeToken(apiKey);
+	if (!auth.credential) return { models: [], ok: false };
+	const token = auth.credential.token;
+	const base = commandCodeProviderBase(baseUrl);
+	if (cache && sameSlot(cache, token, base) && fresh(cache)) {
+		return { models: cache.models.map((model) => model.id), ok: !cache.negative };
+	}
+	await loadCommandCodeModels(token, base);
+	if (!cache || !sameSlot(cache, token, base)) return { models: [], ok: false };
+	return { models: cache.models.map((model) => model.id), ok: !cache.negative };
+}
+
+function loadCommandCodeModels(token: string, base: string): Promise<void> {
+	const key = cacheKey(token, base);
+	if (inflight?.key === key) return inflight.task;
+	const gen = generation;
+	const task = fetchCommandCodeModels(token, base, gen).finally(() => {
+		if (inflight?.task === task) inflight = undefined;
+	});
+	inflight = { key, task };
+	return task;
+}
+
+async function fetchCommandCodeModels(token: string, base: string, gen: number): Promise<void> {
+	const previous = cache && sameSlot(cache, token, base) ? cache.models : [];
 	try {
-		const response = await fetch(`${COMMAND_CODE_PROVIDER_BASE}/models`, {
+		const response = await fetch(`${base}/models`, {
 			headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
 			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
-		if (!response.ok) return cache?.token === token ? cache.models : [];
-		const models = parseCommandCodeModels(await response.json()).map((model) => model.id);
-		cache = { models, fetchedAt: Date.now(), token };
-		return models;
+		if (gen !== generation) return;
+		if (!response.ok) {
+			rememberFailure(token, base, previous);
+			return;
+		}
+		const models = parseCommandCodeModels(await readResponseJsonLimited(response, MAX_BODY_BYTES));
+		if (gen !== generation) return;
+		cache = { models, fetchedAt: Date.now(), token, base, negative: false };
 	} catch {
-		return cache?.token === token ? cache.models : [];
+		if (gen !== generation) return;
+		rememberFailure(token, base, previous);
 	}
 }
 
-/** 丢弃缓存，让下一次 `listCommandCodeModels` 重新向上游拉取（设置页的「刷新模型」）。 */
-export function invalidateCommandCodeModelsCache(): void {
-	cache = undefined;
+function rememberFailure(token: string, base: string, previous: CommandCodeModelInfo[]): void {
+	cache = {
+		models: previous,
+		fetchedAt: Date.now(),
+		token,
+		base,
+		negative: true,
+	};
 }

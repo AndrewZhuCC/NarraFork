@@ -8,10 +8,11 @@
  * 两者都用 CLI 登录后的凭据鉴权（`Authorization: Bearer <auth.json 的 apiKey>`）。
  */
 
-const API_BASE = "https://api.commandcode.ai";
+import { commandCodeApiOrigin } from "./commandcode-protocol";
+
 const REQUEST_TIMEOUT_MS = 15_000;
-/** 额度接口不该有巨大响应；超限直接放弃，避免把未知体积的响应读进内存。 */
-const MAX_BODY_CHARS = 256 * 1024;
+/** 额度接口不该有巨大响应；超过这个字节数就取消读取。 */
+const MAX_BODY_BYTES = 256 * 1024;
 
 export interface CommandCodeCredits {
 	/** 月度额度余额。 */
@@ -87,28 +88,66 @@ function bool(value: unknown): boolean {
 	return value === true;
 }
 
-/** 读取响应体并限制大小；超限或非法 JSON 都按额度接口异常处理。 */
-async function readJsonLimited(response: Response): Promise<unknown> {
-	const text = await response.text();
-	if (text.length > MAX_BODY_CHARS) {
-		throw new CommandCodeUsageError(response.status, "额度接口响应过大，已放弃解析");
+/**
+ * 按块读取响应体，超过 `maxBytes` 就取消，不再把剩余内容读进内存。
+ * 超限或非法 JSON 都按额度接口异常处理，message 是稳定错误码。
+ */
+export async function readResponseJsonLimited(
+	response: Response,
+	maxBytes = MAX_BODY_BYTES,
+): Promise<unknown> {
+	const reader = response.body?.getReader();
+	if (!reader) throw new CommandCodeUsageError(response.status, "invalid_json");
+	const chunks: Uint8Array[] = [];
+	let received = 0;
+	let cancelled = false;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value?.byteLength) continue;
+			if (received + value.byteLength > maxBytes) {
+				cancelled = true;
+				await reader.cancel();
+				throw new CommandCodeUsageError(response.status, "response_too_large");
+			}
+			received += value.byteLength;
+			chunks.push(value);
+		}
+	} finally {
+		if (!cancelled) {
+			try {
+				reader.releaseLock();
+			} catch {
+				// 读取结束时锁可能已经放开。
+			}
+		}
+	}
+	const bytes = new Uint8Array(received);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
 	}
 	try {
-		return JSON.parse(text) as unknown;
+		return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
 	} catch {
-		throw new CommandCodeUsageError(response.status, "额度接口返回的不是合法 JSON");
+		throw new CommandCodeUsageError(response.status, "invalid_json");
 	}
 }
 
-async function getJson(path: string, token: string): Promise<unknown> {
-	const response = await fetch(`${API_BASE}${path}`, {
+async function getJson(path: string, token: string, origin: string): Promise<unknown> {
+	const response = await fetch(`${origin}${path}`, {
 		headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
 		signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 	});
 	if (!response.ok) {
-		throw new CommandCodeUsageError(response.status, `额度接口返回 ${response.status}`);
+		throw new CommandCodeUsageError(
+			response.status,
+			response.status === 401 ? "unauthorized" : "upstream_error",
+		);
 	}
-	return readJsonLimited(response);
+	return readResponseJsonLimited(response);
 }
 
 /** 解析 credits 响应；字段缺失一律降级为 0/false，避免上游改动让整个额度卡报错。 */
@@ -171,13 +210,17 @@ export function parseCommandCodeSummary(value: unknown): CommandCodeUsageSummary
 }
 
 /** 查询额度：credits 必取；usage summary 失败不影响整体结果。 */
-export async function fetchCommandCodeUsage(token: string): Promise<CommandCodeUsage> {
+export async function fetchCommandCodeUsage(
+	token: string,
+	baseUrl?: string,
+): Promise<CommandCodeUsage> {
+	const origin = commandCodeApiOrigin(baseUrl);
 	const { credits, windowLimits, sandboxAccess } = parseCommandCodeCredits(
-		await getJson("/alpha/billing/credits", token),
+		await getJson("/alpha/billing/credits", token, origin),
 	);
 	let summary: CommandCodeUsageSummary | undefined;
 	try {
-		summary = parseCommandCodeSummary(await getJson("/alpha/usage/summary", token));
+		summary = parseCommandCodeSummary(await getJson("/alpha/usage/summary", token, origin));
 	} catch {
 		// 用量摘要失败不阻塞额度展示。
 	}

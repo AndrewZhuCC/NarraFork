@@ -22,6 +22,34 @@ export const COMMAND_CODE_PREFIX = "CommandCode";
 
 export type CommandCodeEndpoint = "messages" | "completions" | "responses";
 
+/** Provider API 根。自定义 base 去掉末尾斜杠；缺省是官方 Provider API。 */
+export function commandCodeProviderBase(baseUrl?: string): string {
+	const trimmed = baseUrl?.trim();
+	return (trimmed || COMMAND_CODE_PROVIDER_BASE).replace(/\/+$/, "");
+}
+
+/**
+ * 额度接口挂在站点根（`/alpha/...`），不在 `/provider/v1` 下面。
+ * 自定义 provider base 时改用同一 origin，这样代理可以同时接到模型和额度。
+ */
+export function commandCodeApiOrigin(baseUrl?: string): string {
+	try {
+		return new URL(commandCodeProviderBase(baseUrl)).origin;
+	} catch {
+		return COMMAND_CODE_API_BASE;
+	}
+}
+
+/** `CommandCode:claude-haiku` 与裸 id `claude-haiku` 都收成裸模型名。 */
+export function bareCommandCodeModelId(modelRef: string): string {
+	const trimmed = modelRef.trim();
+	const separator = trimmed.indexOf(":");
+	if (separator <= 0) return trimmed;
+	const prefix = trimmed.slice(0, separator);
+	if (prefix !== COMMAND_CODE_PREFIX) return trimmed;
+	return trimmed.slice(separator + 1);
+}
+
 export interface CommandCodeModelInfo {
 	id: string;
 	name?: string;
@@ -42,6 +70,62 @@ export function resolveCommandCodeEndpoint(
 	const override = overrides?.[modelId];
 	if (override) return override;
 	return modelId.trim().toLowerCase().startsWith("claude") ? "messages" : "completions";
+}
+
+/**
+ * 设置页协议到 Command Code 端点。
+ * `gemini-compatible` 在上游没有对应端点，返回 undefined，交给能力列表或模型名规则。
+ */
+export function mapCommandCodeProtocol(protocol?: string): CommandCodeEndpoint | undefined {
+	switch (protocol) {
+		case "anthropic-messages":
+			return "messages";
+		case "openai-responses":
+			return "responses";
+		case "completions-compatible":
+			return "completions";
+		default:
+			return undefined;
+	}
+}
+
+/** 用模型目录里的 `supported_endpoints` 选端点。只有 `/messages` 的模型走 Anthropic。 */
+export function endpointFromSupported(
+	endpoints: readonly string[],
+): CommandCodeEndpoint | undefined {
+	const normalized = new Set(endpoints.map((endpoint) => endpoint.trim().toLowerCase()));
+	const messages = normalized.has("/messages");
+	const completions = normalized.has("/chat/completions");
+	const responses = normalized.has("/responses");
+	if (messages && !completions && !responses) return "messages";
+	if (completions) return "completions";
+	if (responses) return "responses";
+	if (messages) return "messages";
+	return undefined;
+}
+
+/**
+ * 端点优先级：显式协议、`commandCode.endpoints`、目录里的 supported_endpoints、模型名。
+ * `modelRef` 可以是裸 id，也可以是 `CommandCode:` 前缀的完整 id。
+ */
+export function selectCommandCodeEndpoint(
+	modelRef: string,
+	options?: {
+		protocol?: string;
+		overrides?: Record<string, CommandCodeEndpoint>;
+		supportedEndpoints?: readonly string[];
+	},
+): CommandCodeEndpoint {
+	const bare = bareCommandCodeModelId(modelRef);
+	const mapped = mapCommandCodeProtocol(options?.protocol);
+	if (mapped) return mapped;
+	const override = options?.overrides?.[bare] ?? options?.overrides?.[modelRef];
+	if (override) return override;
+	const fromCatalog = options?.supportedEndpoints
+		? endpointFromSupported(options.supportedEndpoints)
+		: undefined;
+	if (fromCatalog) return fromCatalog;
+	return resolveCommandCodeEndpoint(bare);
 }
 
 /** 解析 `/provider/v1/models` 的响应；字段缺失时保守地返回空列表。 */
