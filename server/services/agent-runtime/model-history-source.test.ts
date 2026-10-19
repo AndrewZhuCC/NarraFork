@@ -12,10 +12,8 @@ import {
 	clearModelHistorySourceCacheForTest,
 	loadModelHistorySource,
 	ModelHistorySourceCache,
-	markModelHistoryRows,
 	modelHistorySourceStats,
 	modelHistoryWorkerSpecifiers,
-	verifyModelHistoryRowsCurrent,
 } from "./model-history-source";
 
 const connections: Database[] = [];
@@ -199,16 +197,6 @@ describe("complete bounded model source", () => {
 		expect(reordered.counters.reusedBodies ?? 0).toBe(0);
 		expect(reordered.messages.at(-1)?.id).toBe("m0");
 	});
-	test("a source revision changed after projection is rejected before request adoption", async () => {
-		const db = fixture(true);
-		message(db, "small", 0);
-		const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
-		const view = source.messages.map((row) => ({ ...row }));
-		markModelHistoryRows(view, source);
-		await verifyModelHistoryRowsCurrent(view);
-		db.run("UPDATE narrator_messages SET sdk_message_uuid='late-final' WHERE id='small'");
-		await expect(verifyModelHistoryRowsCurrent(view)).rejects.toThrow("request not sent");
-	});
 	test("a write landing between the signature and the read is labelled by the worker snapshot", async () => {
 		const db = fixture(true);
 		message(db, "first", 0);
@@ -223,9 +211,7 @@ describe("complete bounded model source", () => {
 		try {
 			const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
 			expect(source.messages.map((row) => row.id)).toEqual(["first", "late"]);
-			const view = source.messages.map((row) => ({ ...row }));
-			markModelHistoryRows(view, source);
-			await verifyModelHistoryRowsCurrent(view);
+			expect(await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner")).toBe(source);
 		} finally {
 			restore();
 		}
@@ -321,7 +307,7 @@ describe("hot source signature lifecycle", () => {
 	test.each([
 		`UPDATE narrator_messages SET content_json='[{"type":"text","text":"late-body"}]' WHERE id='shared'`,
 		`UPDATE narrator_tool_calls SET output_json='"late-tool"' WHERE id='tool'`,
-	])("a real reevaluation preserves warm-cache and projected-row guards: %s", async (mutation) => {
+	])("a real reevaluation keeps the warm cache and invalidates it on a model-visible write: %s", async (mutation) => {
 		const db = fixture(true);
 		message(db, "shared", 0);
 		db.run(
@@ -329,21 +315,13 @@ describe("hot source signature lifecycle", () => {
 		);
 		const backend = { backend: "sqlite" as const, sqlite: db };
 		const source = await loadModelHistorySource(backend, "owner");
-		const earlierRows = source.messages.map((row) => ({ ...row }));
-		markModelHistoryRows(earlierRows, source);
 		const loadedBefore = modelHistorySourceStats().loads;
 		const reloaded = await reevaluate();
 		const warm = await reloaded.loadModelHistorySource(backend, "owner");
 		expect(warm).toBe(source);
 		expect(reloaded.modelHistorySourceStats().loads).toBe(loadedBefore);
-		const rows = warm.messages.map((row) => ({ ...row }));
-		reloaded.markModelHistoryRows(rows, warm);
-		await reloaded.verifyModelHistoryRowsCurrent(rows);
 		db.run(mutation);
-		await expect(reloaded.verifyModelHistoryRowsCurrent(rows)).rejects.toThrow("request not sent");
-		await expect(reloaded.verifyModelHistoryRowsCurrent(earlierRows)).rejects.toThrow(
-			"request not sent",
-		);
+		expect(await reloaded.loadModelHistorySource(backend, "owner")).not.toBe(source);
 	});
 	test("legacy cache without metadata cold-reads and never stamps unknown stale source", async () => {
 		const db = fixture(true);
@@ -363,12 +341,10 @@ describe("hot source signature lifecycle", () => {
 				{
 					cache: ModelHistorySourceCache;
 					sourceSignatures?: unknown;
-					rowSignatures?: unknown;
 				}
 			>
 		)[Symbol.for("narrator.modelHistorySource.v1")];
 		delete state.sourceSignatures;
-		delete state.rowSignatures;
 		const signature = readSqliteModelHistorySignature(db, "owner");
 		state.cache.set(
 			`${db.filename}\u0000owner\u0000${signature.catalogIdentity}:${signature.revision}`,
@@ -383,50 +359,18 @@ describe("hot source signature lifecycle", () => {
 		expect(current.counters.reusedBodies ?? 0).toBe(0);
 		expect(reloaded.modelHistorySourceStats().loads).toBe(before.loads + 1);
 		expect(reloaded.modelHistorySourceStats().signatureReads).toBe(before.signatureReads + 1);
-		expect(() => reloaded.markModelHistoryRows([], unknown)).toThrow(/signature/i);
-		const rows = current.messages.map((row) => ({ ...row }));
-		reloaded.markModelHistoryRows(rows, current);
-		db.run(
-			`UPDATE narrator_messages SET content_json='[{"type":"text","text":"changed"}]' WHERE id='shared'`,
-		);
-		await expect(reloaded.verifyModelHistoryRowsCurrent(rows)).rejects.toThrow("request not sent");
-	});
-	test("missing row provenance rejects, explicit unversioned rows retain compatibility but obey cancellation", async () => {
-		await expect(verifyModelHistoryRowsCurrent([])).rejects.toThrow(/signature/i);
-		const db = fixture(true);
-		message(db, "shared", 0);
-		db.run("DROP TRIGGER model_history_v1_tool_update");
-		const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
-		const rows = source.messages.map((row) => ({ ...row }));
-		markModelHistoryRows(rows, source);
-		await verifyModelHistoryRowsCurrent(rows);
-		expect(modelHistorySourceStats().cacheEntries).toBe(0);
-		await expect(
-			verifyModelHistoryRowsCurrent(rows, { signal: AbortSignal.abort() }),
-		).rejects.toThrow();
-		await expect(verifyModelHistoryRowsCurrent(rows, { deadline: Date.now() - 1 })).rejects.toThrow(
-			"10s budget",
-		);
 	});
 	test("reloaded warm hits preserve caller cancellation and absolute deadline", async () => {
 		const db = fixture(true);
 		message(db, "shared", 0);
 		const backend = { backend: "sqlite" as const, sqlite: db };
-		const source = await loadModelHistorySource(backend, "owner");
+		await loadModelHistorySource(backend, "owner");
 		const reloaded = await reevaluate();
 		await expect(
 			reloaded.loadModelHistorySource(backend, "owner", { signal: AbortSignal.abort() }),
 		).rejects.toThrow();
 		await expect(
 			reloaded.loadModelHistorySource(backend, "owner", { deadline: Date.now() - 1 }),
-		).rejects.toThrow("10s budget");
-		const rows = source.messages.map((row) => ({ ...row }));
-		reloaded.markModelHistoryRows(rows, source);
-		await expect(
-			reloaded.verifyModelHistoryRowsCurrent(rows, { signal: AbortSignal.abort() }),
-		).rejects.toThrow();
-		await expect(
-			reloaded.verifyModelHistoryRowsCurrent(rows, { deadline: Date.now() - 1 }),
 		).rejects.toThrow("10s budget");
 	});
 });

@@ -14,7 +14,6 @@ import {
 	type SenderMessage,
 } from "../../lib/agent/sender-projection";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
-import { verifyModelHistoryRowsCurrent } from "./model-history-source";
 
 export type RuntimeHistoryMessage = SenderMessage & {
 	injectionConsumedAt?: Date | string | null;
@@ -220,11 +219,6 @@ export async function buildRuntimeHistory(
 		modelMessages.map(projectMessageSenderForModel),
 		built.trailingUserText,
 	);
-	await verifyModelHistoryRowsCurrent(sourceMessages, {
-		signal: options.attachmentSignal,
-		deadline,
-	});
-	checkBudget();
 	const input = projectCurrentInput(modelMessages, currentInput ?? "");
 	const combined = built.trailingUserText?.trim()
 		? input.trim()

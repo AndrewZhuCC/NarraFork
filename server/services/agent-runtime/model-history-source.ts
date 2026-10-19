@@ -93,13 +93,11 @@ const state = hotSafe("narrator.modelHistorySource.v1", () => {
 		lastCounters: null as ModelHistoryCounters | null,
 		workerSpecifier: null as string | null,
 		sourceSignatures: new WeakMap<ModelHistorySource, SourceSignatureRecord>(),
-		rowSignatures: new WeakMap<object, SourceSignatureRecord>(),
 	};
 });
 // Upgrade a legacy process pin without re-signing its unknown cached snapshots. Such entries
 // miss these maps and must take the fully validated cold path before they can be reused.
 state.sourceSignatures ??= new WeakMap<ModelHistorySource, SourceSignatureRecord>();
-state.rowSignatures ??= new WeakMap<object, SourceSignatureRecord>();
 state.workerSpecifier ??= null;
 export function modelHistorySourceStats() {
 	return {
@@ -120,43 +118,11 @@ export type ModelHistoryBackend =
 	| { backend: "sqlite"; sqlite: Database }
 	| { backend: "postgres"; sql: SQL; url: string };
 type SourceSignatureRecord = {
-	backend: ModelHistoryBackend;
 	narratorId: string;
 	revision: string;
 	trusted: boolean;
 	catalogIdentity?: string;
 };
-export function markModelHistoryRows(rows: object, source: ModelHistorySource): void {
-	const record = state.sourceSignatures.get(source);
-	if (!record) throw new Error("Model history source signature missing; request not sent");
-	state.rowSignatures.set(rows, record);
-}
-export async function verifyModelHistoryRowsCurrent(
-	rows: object,
-	options: { signal?: AbortSignal; deadline?: number } = {},
-): Promise<void> {
-	options.signal?.throwIfAborted();
-	if (options.deadline != null && Date.now() >= options.deadline)
-		throw new Error("Model history preparation exceeded 10s budget");
-	const record = state.rowSignatures.get(rows);
-	if (!record) throw new Error("Model history rows signature missing; request not sent");
-	// Only an explicitly recorded unversioned source can take the compatibility path.
-	if (!record.trusted) return;
-	const current =
-		record.backend.backend === "sqlite"
-			? readSqliteModelHistorySignature(record.backend.sqlite, record.narratorId)
-			: await readPostgresModelHistorySignature(record.backend.sql, record.narratorId, options);
-	options.signal?.throwIfAborted();
-	if (options.deadline != null && Date.now() >= options.deadline)
-		throw new Error("Model history preparation exceeded 10s budget");
-	if (
-		!current.trusted ||
-		current.revision !== record.revision ||
-		current.catalogIdentity !== record.catalogIdentity
-	)
-		throw new Error("Model history changed after provider preparation; request not sent");
-}
-
 export type LoadModelHistoryOptions = {
 	limit?: number;
 	signal?: AbortSignal;
@@ -461,7 +427,6 @@ export async function loadModelHistorySource(
 	check();
 	state.lastCounters = source.counters;
 	state.sourceSignatures.set(source, {
-		backend,
 		narratorId,
 		revision: after.revision,
 		catalogIdentity: after.catalogIdentity,
