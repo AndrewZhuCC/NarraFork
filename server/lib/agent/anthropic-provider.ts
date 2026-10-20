@@ -69,6 +69,7 @@ import {
 	mapDeepSeekEffort,
 	type ResolvedToolDefinition,
 } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 // === Claude Code protocol constants ===
 
@@ -1603,35 +1604,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (params.content && params.content !== ".") {
 			if (toolResultParts.length > 0) {
 				const parts: AnthropicContentPart[] = [...toolResultParts];
-				if (params.images?.length) {
-					for (const img of params.images) {
-						parts.push({
-							type: "image",
-							source: {
-								type: "base64",
-								media_type: `image/${img.format}`,
-								data: img.base64,
-							},
-						});
-					}
-				}
-				parts.push({ type: "text", text: params.content });
+				parts.push(...anthropicUserParts(params.content, params.images));
 				history.push({ role: "user", content: parts });
 			} else {
 				const parts: AnthropicContentPart[] = [];
-				if (params.images?.length) {
-					for (const img of params.images) {
-						parts.push({
-							type: "image",
-							source: {
-								type: "base64",
-								media_type: `image/${img.format}`,
-								data: img.base64,
-							},
-						});
-					}
-				}
-				parts.push({ type: "text", text: params.content });
+				parts.push(...anthropicUserParts(params.content, params.images));
 				history.push({ role: "user", content: parts });
 			}
 		} else if (toolResultParts.length > 0) {
@@ -1951,22 +1928,11 @@ export class AnthropicProvider implements ProviderAdapter {
 			});
 		}
 
-		for (const img of images ?? []) {
-			parts.push({
-				type: "image",
-				source: {
-					type: "base64",
-					media_type: `image/${img.format}`,
-					data: img.base64,
-				},
-			});
-		}
-
 		const hasText = !!content && content !== ".";
 		if (hasText) {
-			parts.push({ type: "text", text: content });
+			parts.push(...anthropicUserParts(content, images));
 		} else if (images?.length) {
-			parts.push({ type: "text", text: "[user sent image(s)]" });
+			parts.push(...anthropicUserParts("[user sent image(s)]", images));
 		}
 
 		if (parts.length > 0) {
@@ -3375,12 +3341,13 @@ async function buildAnthropicHistory(
 			const images = await resolveHistoryImages(msg, narratorId);
 
 			const role = msg.role === "sys" && useMidConversationSystemRole ? "system" : "user";
-			if (images.length > 0) {
+			if (images.some((image) => image !== null)) {
 				// A mid-conversation system message cannot carry image parts, so an
 				// image forces the user role. That only affects `sys` rows, which do
 				// not carry uploads in practice.
-				const parts: AnthropicContentPart[] = [...images];
-				if (text) parts.unshift({ type: "text", text });
+				const parts: AnthropicContentPart[] = orderUserContent(text, images, "after").map((part) =>
+					part.type === "text" ? { type: "text", text: part.text } : part.image,
+				);
 				history.push({ role: "user", content: parts });
 				emittedMessages.push(msg);
 			} else if (text) {
@@ -3425,7 +3392,12 @@ function dbMessageVisibleText(msg: DbMessage): string {
 async function resolveHistoryImages(
 	msg: DbMessage,
 	narratorId?: string,
-): Promise<Array<{ type: "image"; source: { type: "base64"; media_type: string; data: string } }>> {
+): Promise<
+	Array<{
+		type: "image";
+		source: { type: "base64"; media_type: string; data: string };
+	} | null>
+> {
 	const ownerNarratorId = msg.narratorId ?? narratorId;
 	if (!ownerNarratorId || !Array.isArray(msg.contentJson)) return [];
 
@@ -3434,10 +3406,11 @@ async function resolveHistoryImages(
 	);
 	if (blocks.length === 0) return [];
 
+	// Index-aligned with the stored image blocks: `[image #N]` placeholders name positions.
 	const parts: Array<{
 		type: "image";
 		source: { type: "base64"; media_type: string; data: string };
-	}> = [];
+	} | null> = [];
 	for (const block of blocks) {
 		const imageId = block.imageId as string;
 		const uploadNarratorId =
@@ -3449,6 +3422,7 @@ async function resolveHistoryImages(
 				uploadNarratorId,
 				imageId,
 			});
+			parts.push(null);
 			continue;
 		}
 		try {
@@ -3470,12 +3444,32 @@ async function resolveHistoryImages(
 				imageId,
 				error: error instanceof Error ? error.message : String(error),
 			});
+			parts.push(null);
 		}
 	}
 	return parts;
 }
 
 // === Helpers ===
+
+/** Current-turn user parts: placed images follow their placeholder, the rest lead as before. */
+function anthropicUserParts(
+	content: string,
+	images?: Array<{ format: string; base64: string }>,
+): AnthropicContentPart[] {
+	return orderUserContent(content, images ?? [], "before").map((part) =>
+		part.type === "text"
+			? { type: "text", text: part.text }
+			: {
+					type: "image",
+					source: {
+						type: "base64",
+						media_type: `image/${part.image.format}`,
+						data: part.image.base64,
+					},
+				},
+	);
+}
 
 /**
  * Flatten a mid-conversation system message down to its text.

@@ -1597,7 +1597,8 @@ describe("real queued panel composition", () => {
 			expect(host?.textContent).toContain("draft.txt");
 			await editorKey("Enter");
 			expect(save).toHaveBeenCalledTimes(1);
-			expect(save.mock.calls[0][1]).toBe("Unsaved body");
+			// Attachments inserted after the body keep their position as placeholders.
+			expect(save.mock.calls[0][1]).toBe("Unsaved body[image #1: draft.gif][file #1: draft.txt]");
 			expect(save.mock.calls[0][2].newImages).toEqual([image]);
 			expect(save.mock.calls[0][2].newTextFiles).toEqual([textFile]);
 			// Attachments and text now share native history: first undo removes the

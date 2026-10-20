@@ -1,15 +1,20 @@
+import {
+	COMPOSER_ATTACHMENT_PLACEHOLDER,
+	composerAttachmentPlaceholderName,
+} from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import type { FileReferenceInput } from "./file-reference-input";
 
 /**
  * A quoted excerpt of conversation content (message text or tool output).
  *
- * Quotes are NOT a separate draft/message field: they live at the very start of
- * the composer text as canonical blockquotes, and the composer only presents
- * that leading prefix as chips. Draft sync, the local draft mirror, input
+ * Quotes are NOT a separate draft/message field: they live in the composer text
+ * as canonical blockquotes. Quotes ahead of all typed text form a leading prefix;
+ * a quote placed after typed text is projected where it stands, on its own line
+ * (see composerDocumentProjection). Draft sync, the local draft mirror, input
  * history, queued-message edits, failed-send restore and the model all see the
- * same plain text, so no transport needs to know quotes exist. User bubbles
- * render plain pre-wrap text, which is why the header is readable as-is.
+ * same plain text, so no transport needs to know quotes exist. Sent bubbles turn
+ * the blocks back into chips; the header is still readable as plain text.
  *
  *   > [quote] Selecting text in a message @@m:msgId
  *   > Selecting text in a message
@@ -133,6 +138,37 @@ function lineEnd(text: string, from: number): number {
 }
 
 /**
+ * One quote block starting at `pos`: a header, at least one `>` content line, then a blank
+ * line, another header, or the end of the text. `end` is past the terminator.
+ */
+function parseQuoteBlockAt(
+	text: string,
+	pos: number,
+): { quote: ComposerQuote; end: number } | null {
+	const headerEnd = lineEnd(text, pos);
+	const header = HEADER.exec(text.slice(pos, headerEnd));
+	if (!header || headerEnd >= text.length) return null;
+	let cursor = headerEnd + 1;
+	const lines: string[] = [];
+	while (cursor < text.length && text[cursor] === ">") {
+		const end = lineEnd(text, cursor);
+		const raw = text.slice(cursor, end);
+		if (HEADER.test(raw)) break;
+		lines.push(unescapeContentLine(raw));
+		cursor = end < text.length ? end + 1 : text.length;
+	}
+	if (!lines.length) return null;
+	const { label, anchor } = splitQuoteHeader(header[1]);
+	if (!label) return null;
+	const quote: ComposerQuote = { label, text: lines.join("\n") };
+	if (anchor) quote.anchor = anchor;
+	if (cursor >= text.length) return { quote, end: text.length };
+	if (text[cursor] === "\n") return { quote, end: cursor + 1 };
+	if (text.startsWith(HEADER_PREFIX, cursor)) return { quote, end: cursor };
+	return null;
+}
+
+/**
  * Parse the leading quote blocks. A block must be a header, at least one `>`
  * content line, then a blank line, another header, or the end of the text; a
  * block that is not terminated that way is left in the body untouched.
@@ -143,45 +179,83 @@ export function parseComposerQuotePrefix(text: string): {
 } {
 	const quotes: ComposerQuote[] = [];
 	let prefixLength = 0;
-	let pos = 0;
-	while (pos < text.length && quotes.length < MAX_COMPOSER_QUOTES) {
-		const headerEnd = lineEnd(text, pos);
-		const header = HEADER.exec(text.slice(pos, headerEnd));
-		if (!header || headerEnd >= text.length) break;
-		let cursor = headerEnd + 1;
-		const lines: string[] = [];
-		while (cursor < text.length && text[cursor] === ">") {
-			const end = lineEnd(text, cursor);
-			const raw = text.slice(cursor, end);
-			if (HEADER.test(raw)) break;
-			lines.push(unescapeContentLine(raw));
-			cursor = end < text.length ? end + 1 : text.length;
-		}
-		if (!lines.length) break;
-		const { label, anchor } = splitQuoteHeader(header[1]);
-		if (!label) break;
-		const quote: ComposerQuote = { label, text: lines.join("\n") };
-		if (anchor) quote.anchor = anchor;
-		if (cursor >= text.length) {
-			quotes.push(quote);
-			prefixLength = text.length;
-			break;
-		}
-		if (text[cursor] === "\n") {
-			quotes.push(quote);
-			prefixLength = cursor + 1;
-			pos = prefixLength;
-			continue;
-		}
-		if (text.startsWith(HEADER_PREFIX, cursor)) {
-			quotes.push(quote);
-			prefixLength = cursor;
-			pos = cursor;
-			continue;
-		}
-		break;
+	while (prefixLength < text.length && quotes.length < MAX_COMPOSER_QUOTES) {
+		const block = parseQuoteBlockAt(text, prefixLength);
+		if (!block) break;
+		quotes.push(block.quote);
+		prefixLength = block.end;
 	}
 	return { quotes, prefixLength };
+}
+
+/** Attachment names as the bubble knows them, in upload order per kind. */
+export interface ComposerSegmentAttachments {
+	images: readonly string[];
+	files: readonly string[];
+}
+
+export type ComposerTextSegment =
+	| { type: "text"; text: string }
+	| { type: "quote"; quote: ComposerQuote }
+	| { type: "attachment"; kind: "image" | "file"; index: number };
+
+/**
+ * A sent message's projection, back in document order: quote blocks wherever they start a
+ * line, and attachment placeholders that name a real attachment (first occurrence only).
+ * Anything else, including look-alike placeholders, stays literal text.
+ */
+export function parseComposerSegments(
+	text: string,
+	attachments: ComposerSegmentAttachments = { images: [], files: [] },
+): ComposerTextSegment[] {
+	const segments: ComposerTextSegment[] = [];
+	const pushText = (value: string) => {
+		if (!value) return;
+		const last = segments[segments.length - 1];
+		if (last?.type === "text") last.text += value;
+		else segments.push({ type: "text", text: value });
+	};
+	const used = new Set<string>();
+	let quotes = 0;
+	let pos = 0;
+	let textStart = 0;
+	const placeholder = new RegExp(COMPOSER_ATTACHMENT_PLACEHOLDER.source, "uy");
+	while (pos < text.length) {
+		if ((pos === 0 || text[pos - 1] === "\n") && quotes < MAX_COMPOSER_QUOTES) {
+			const block = parseQuoteBlockAt(text, pos);
+			if (block) {
+				pushText(text.slice(textStart, pos));
+				segments.push({ type: "quote", quote: block.quote });
+				quotes++;
+				pos = textStart = block.end;
+				continue;
+			}
+		}
+		if (text[pos] === "[") {
+			placeholder.lastIndex = pos;
+			const match = placeholder.exec(text);
+			if (match) {
+				const kind = match[1] === "image" ? "image" : "file";
+				const index = Number(match[2]) - 1;
+				const names = kind === "image" ? attachments.images : attachments.files;
+				const key = `${kind}:${index}`;
+				if (
+					index < names.length &&
+					!used.has(key) &&
+					composerAttachmentPlaceholderName(names[index] ?? "") === match[3]
+				) {
+					used.add(key);
+					pushText(text.slice(textStart, pos));
+					segments.push({ type: "attachment", kind, index });
+					pos = textStart = pos + match[0].length;
+					continue;
+				}
+			}
+		}
+		pos++;
+	}
+	pushText(text.slice(textStart));
+	return segments;
 }
 
 function shiftReferences(

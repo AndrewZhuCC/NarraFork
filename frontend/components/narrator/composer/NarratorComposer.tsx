@@ -5,7 +5,7 @@ import {
 	type ComposerAsset,
 	type ComposerDocument,
 	type ComposerInlineNode,
-	composerDocumentText,
+	legacyComposerDocumentText,
 	parseComposerDocument,
 	readComposerDocument,
 } from "@shared/composer-document";
@@ -99,7 +99,7 @@ function isDraftWithinSyncLimit(input: string): boolean {
 }
 
 function splitDocumentInput(document: ComposerDocument) {
-	// The model prefix is a projection of quote atoms, not a second parser for literal text.
+	// Quote blocks are a projection of quote atoms, not a second parser for literal text.
 	// A quote-looking text node after a real quote must remain in the editable body.
 	const quotes = document.paragraphs.flatMap((paragraph) =>
 		paragraph.children.filter((node) => node.type === "quote"),
@@ -110,7 +110,9 @@ function splitDocumentInput(document: ComposerDocument) {
 			children: paragraph.children.filter((node) => node.type !== "quote"),
 		})),
 	};
-	return { quotes, body: composerDocumentText(bodyDocument) };
+	// The editor's body offsets exclude attachments, so read the placeholder-free projection.
+	const { text, fileReferences } = legacyComposerDocumentText(bodyDocument);
+	return { quotes, body: { text, fileReferences } };
 }
 
 export interface NarratorRemoteDraft {

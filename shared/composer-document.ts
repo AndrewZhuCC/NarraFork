@@ -233,37 +233,165 @@ export function composerFileReferenceToken(ref: FileReference): string {
 			: s.endLineNumber;
 	return `#file:${ref.label}:${s.startLineNumber}-${end}`;
 }
-/** Compatibility projection; positions always measure the final UTF-16 string. */
+function composerQuoteBlock(node: Extract<ComposerInlineNode, { type: "quote" }>): string {
+	const body = node.text
+		.split("\n")
+		.map((line) => {
+			const escaped = /^\\*\[quote\]/u.test(line) ? `\\${line}` : line;
+			return escaped ? `> ${escaped}` : ">";
+		})
+		.join("\n");
+	return `> [quote] ${node.label}${node.anchor ? ` @@${node.anchor}` : ""}\n${body}\n\n`;
+}
+
+export type ComposerAttachmentPlaceholderKind = "image" | "file";
+/** `[image #2: shot.png]`: the number is the 1-based upload order within its kind. */
+export const COMPOSER_ATTACHMENT_PLACEHOLDER = /\[(image|file) #([1-9]\d{0,3}): ([^[\]\n]*)\]/gu;
+export function composerAttachmentPlaceholderName(name: string): string {
+	return name.replace(/[[\]\r\n]/gu, "_");
+}
+export function composerAttachmentPlaceholder(
+	kind: ComposerAttachmentPlaceholderKind,
+	index: number,
+	name: string,
+): string {
+	return `[${kind} #${index + 1}: ${composerAttachmentPlaceholderName(name)}]`;
+}
+
+/** Where each node landed in the projection, so edits can be mapped back to text nodes. */
+export interface ComposerProjectionSpan {
+	paragraph: number;
+	node: number;
+	start: number;
+	end: number;
+}
+
+function isComposerContentNode(node: ComposerInlineNode): boolean {
+	return (node.type === "text" && /\S/u.test(node.text)) || node.type === "fileReference";
+}
+
+/**
+ * Model-visible projection, positions measured on the final UTF-16 string.
+ *
+ * Quotes and attachments before the first typed content keep the historical layout: quote
+ * blocks as a leading prefix, attachments without any text. Once one of them follows typed
+ * content its position carries meaning, so quotes are emitted where they stand and every
+ * attachment gets a numbered placeholder at its position.
+ */
+export function composerDocumentProjection(doc: ComposerDocument): {
+	text: string;
+	fileReferences: FileReference[];
+	spans: ComposerProjectionSpan[];
+} {
+	const nodes = doc.paragraphs.flatMap((paragraph, p) =>
+		paragraph.children.map((node, n) => ({ node, p, n })),
+	);
+	const firstContent = nodes.findIndex(({ node }) => isComposerContentNode(node));
+	const leading = (index: number) => firstContent < 0 || index < firstContent;
+	const placeholders = nodes.some(
+		({ node }, index) => node.type === "attachment" && !leading(index),
+	);
+	const kindIndex = new Map<string, number>();
+	for (const kind of ["image", "textFile"] as const) {
+		let index = 0;
+		for (const asset of doc.assets) if (asset.kind === kind) kindIndex.set(asset.id, index++);
+	}
+	const assets = new Map(doc.assets.map((asset) => [asset.id, asset]));
+	const spans: ComposerProjectionSpan[] = [];
+	let text = "";
+	nodes.forEach(({ node, p, n }, index) => {
+		if (node.type === "quote" && leading(index)) {
+			const start = text.length;
+			text += composerQuoteBlock(node);
+			spans.push({ paragraph: p, node: n, start, end: text.length });
+		}
+	});
+	const fileReferences: FileReference[] = [];
+	let previousParagraph = -1;
+	nodes.forEach(({ node, p, n }, index) => {
+		for (; previousParagraph < p; previousParagraph++) if (previousParagraph >= 0) text += "\n";
+		if (node.type === "quote" && leading(index)) return;
+		const start = text.length;
+		if (node.type === "text") text += node.text;
+		if (node.type === "break") text += "\n";
+		if (node.type === "fileReference") {
+			text += composerFileReferenceToken(node.reference);
+			fileReferences.push({ ...node.reference, inputRange: [start, text.length] });
+		}
+		if (node.type === "quote") {
+			// A quote block is only recognizable from the start of a line.
+			if (text && !text.endsWith("\n")) text += "\n";
+			const blockStart = text.length;
+			text += composerQuoteBlock(node);
+			spans.push({ paragraph: p, node: n, start: blockStart, end: text.length });
+			return;
+		}
+		if (node.type === "attachment" && placeholders) {
+			const asset = assets.get(node.assetId);
+			if (asset)
+				text += composerAttachmentPlaceholder(
+					asset.kind === "image" ? "image" : "file",
+					kindIndex.get(asset.id) ?? 0,
+					asset.name,
+				);
+		}
+		spans.push({ paragraph: p, node: n, start, end: text.length });
+	});
+	// Empty trailing paragraphs still contribute their separators.
+	for (; previousParagraph < doc.paragraphs.length - 1; previousParagraph++)
+		if (previousParagraph >= 0) text += "\n";
+	return { text, fileReferences, spans };
+}
+
 export function composerDocumentText(doc: ComposerDocument): {
 	text: string;
 	fileReferences: FileReference[];
 } {
-	let prefix = "";
-	for (const p of doc.paragraphs)
-		for (const n of p.children)
-			if (n.type === "quote") {
-				const body = n.text
-					.split("\n")
-					.map((line) => {
-						const escaped = /^\\*\[quote\]/u.test(line) ? `\\${line}` : line;
-						return escaped ? `> ${escaped}` : ">";
-					})
-					.join("\n");
-				prefix += `> [quote] ${n.label}${n.anchor ? ` @@${n.anchor}` : ""}\n${body}\n\n`;
-			}
-	let text = prefix;
+	const { text, fileReferences } = composerDocumentProjection(doc);
+	return { text, fileReferences };
+}
+
+/**
+ * The projection written before positional quotes and attachment placeholders existed: every
+ * quote hoisted into the prefix, attachments invisible. Still accepted from stale clients,
+ * queued rows and drafts, and still the editor's body offset space once quotes are removed.
+ */
+export function legacyComposerDocumentText(doc: ComposerDocument): {
+	text: string;
+	fileReferences: FileReference[];
+	spans: ComposerProjectionSpan[];
+} {
+	const spans: ComposerProjectionSpan[] = [];
+	let text = "";
+	doc.paragraphs.forEach((paragraph, p) => {
+		paragraph.children.forEach((node, n) => {
+			if (node.type !== "quote") return;
+			const start = text.length;
+			text += composerQuoteBlock(node);
+			spans.push({ paragraph: p, node: n, start, end: text.length });
+		});
+	});
 	const fileReferences: FileReference[] = [];
-	doc.paragraphs.forEach((paragraph, index) => {
-		if (index) text += "\n";
-		for (const node of paragraph.children) {
+	doc.paragraphs.forEach((paragraph, p) => {
+		if (p) text += "\n";
+		paragraph.children.forEach((node, n) => {
+			if (node.type === "quote") return;
+			const start = text.length;
 			if (node.type === "text") text += node.text;
 			if (node.type === "break") text += "\n";
 			if (node.type === "fileReference") {
-				const start = text.length;
 				text += composerFileReferenceToken(node.reference);
 				fileReferences.push({ ...node.reference, inputRange: [start, text.length] });
 			}
-		}
+			spans.push({ paragraph: p, node: n, start, end: text.length });
+		});
 	});
-	return { text, fileReferences };
+	return { text, fileReferences, spans };
+}
+
+/** Both projections a stored document may legitimately be paired with, current first. */
+export function composerDocumentTextCandidates(doc: ComposerDocument) {
+	const current = composerDocumentProjection(doc);
+	const legacy = legacyComposerDocumentText(doc);
+	return current.text === legacy.text ? [current] : [current, legacy];
 }

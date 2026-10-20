@@ -33,6 +33,7 @@ import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 // === Gemini identity prompt ===
 const GEMINI_IDENTITY: Record<string, string> = {
@@ -261,14 +262,8 @@ export class GeminiProvider implements ProviderAdapter {
 		}));
 
 		// Append current user message (skip "." continuation markers).
-		const userParts: GeminiPart[] = [];
 		const hasText = !!params.content && params.content !== ".";
-		if (hasText) userParts.push({ text: params.content });
-		if (params.images?.length) {
-			for (const img of params.images) {
-				userParts.push({ inlineData: { mimeType: `image/${img.format}`, data: img.base64 } });
-			}
-		}
+		const userParts = geminiUserParts(hasText ? params.content : "", params.images);
 
 		if (toolResultParts.length > 0) {
 			contents.push({ role: "user", parts: toolResultParts });
@@ -399,14 +394,10 @@ export class GeminiProvider implements ProviderAdapter {
 			h.push({ role: "user", parts: toolParts });
 		}
 		const hasText = !!content && content !== ".";
-		const userParts: GeminiPart[] = [];
-		if (hasText) userParts.push({ text: content });
-		else if (images?.length) userParts.push({ text: "[user sent image(s)]" });
-		if (images?.length) {
-			for (const img of images) {
-				userParts.push({ inlineData: { mimeType: `image/${img.format}`, data: img.base64 } });
-			}
-		}
+		const userParts = geminiUserParts(
+			hasText ? content : images?.length ? "[user sent image(s)]" : "",
+			images,
+		);
 		if (userParts.length > 0) {
 			h.push({ role: "user", parts: userParts });
 		}
@@ -1042,6 +1033,18 @@ async function readResponseTextWithLimit(response: Response, limit: number): Pro
 }
 
 // === Helpers ===
+
+/** Placed images follow their `[image #N]` placeholder; the rest trail the text as before. */
+function geminiUserParts(
+	text: string,
+	images?: Array<{ format: string; base64: string }>,
+): GeminiPart[] {
+	return orderUserContent(text, images ?? [], "after").map((part) =>
+		part.type === "text"
+			? { text: part.text }
+			: { inlineData: { mimeType: `image/${part.image.format}`, data: part.image.base64 } },
+	);
+}
 
 /**
  * Recursively sanitize a JSON Schema for Gemini's function-declaration format.

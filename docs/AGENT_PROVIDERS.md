@@ -14,3 +14,9 @@
 
 - **gateway 事件**：NUG 用自有事件名下发排队状态、配额余额、模型目录与图片缓存确认，在 `shared/agent-protocol/gateway-events.ts` 里解析。`AnthropicProvider` / `OpenAIProvider` 的 SSE 循环有泛化的 gateway 事件短路（走 `isGatewayEventType`），新增事件名无需改动它们。
 - **图片去重的形状按 delegate 判定，不按渠道名**：`chat()` 里的 `dedupHistory` 分派用 `delegate instanceof AnthropicProvider` 而非渠道名。按渠道名分派会让某些组合走错形状的遍历器，**找不到任何图片从而静默停用去重**，症状是每轮重传全部图片——看起来像网关问题。
+
+## 用户消息里的图片位置
+
+- composer 投影在图片附件跟在文字之后时，会在原位置写入 `[image #N: 文件名]` / `[file #N: 文件名]`（N 为该类附件的上传序号，从 1 开始）；附件全部在文字前面时不写占位符，保持历史投影。
+- 各 provider 的用户 parts 统一经 `server/lib/agent/user-content-order.ts` 的 `orderUserContent` 排列：被占位符点名的图片紧跟在占位符文本之后（占位符兼作官方建议的 `Image N:` 标签），未被点名的图片保持该 provider 原来的位置（Anthropic/Responses 当前轮在前，其余在后）。
+- **图片序号必须与占位符对齐。** 历史重建时读不到的图片要留 `null` 槽位，当前轮转 base64 失败时用 `position` 记录原序号；直接丢弃会让后面的图片错位到别的占位符上。

@@ -1,6 +1,6 @@
 import {
 	type ComposerDocument,
-	composerDocumentText,
+	composerDocumentTextCandidates,
 	MAX_COMPOSER_DOCUMENT_BYTES,
 	parseComposerDocument,
 } from "@shared/composer-document";
@@ -30,8 +30,10 @@ export function restoreMultipartComposerText(
 	document: ComposerDocument | undefined,
 ): string {
 	if (!document) return value;
-	const { text } = composerDocumentText(document);
-	return value !== text && text.replace(/\r\n|\r|\n/g, "\r\n") === value ? text : value;
+	for (const { text } of composerDocumentTextCandidates(document)) if (value === text) return value;
+	for (const { text } of composerDocumentTextCandidates(document))
+		if (text.replace(/\r\n|\r|\n/g, "\r\n") === value) return text;
+	return value;
 }
 export function validateComposerProjection(
 	document: ComposerDocument | undefined,
@@ -39,7 +41,6 @@ export function validateComposerProjection(
 	references: readonly FileReference[] = [],
 ): void {
 	if (!document) return;
-	const projected = composerDocumentText(document);
 	const canonical = (ref: FileReference) => [
 		ref.id,
 		ref.deviceId,
@@ -56,10 +57,14 @@ export function validateComposerProjection(
 		ref.inputRange ?? null,
 		ref.expectedHash ?? null,
 	];
+	const expected = JSON.stringify(references.map(canonical));
+	// Stale clients, queued rows and drafts may still carry the legacy quote-prefix projection.
 	if (
-		projected.text !== text ||
-		JSON.stringify(projected.fileReferences.map(canonical)) !==
-			JSON.stringify(references.map(canonical))
+		!composerDocumentTextCandidates(document).some(
+			(projected) =>
+				projected.text === text &&
+				JSON.stringify(projected.fileReferences.map(canonical)) === expected,
+		)
 	)
 		throw new ValidationError("Composer document does not match text or file references");
 }

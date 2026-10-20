@@ -809,7 +809,9 @@ describe("composer rich document contract", () => {
 		await act(async () => editor.view.dispatch(editor.state.tr.delete(position, position + 1)));
 		expect(handle.current?.getDocument()?.assets).toEqual([]);
 		expect(documentAssetsChange).toHaveBeenLastCalledWith([]);
-		expect(handle.current?.getText()).toBe(input.text);
+		// The removed image takes its positional placeholder with it.
+		expect(input.text).toContain("[image #1: a.png]");
+		expect(handle.current?.getText()).toBe(input.text.replace("[image #1: a.png]", ""));
 		attachmentsHydrating = false;
 		await render();
 		expect(handle.current?.getDocument()?.assets).toEqual([]);
