@@ -1,6 +1,7 @@
 import { probeHost } from "@shared/server-host";
 import { MANAGER_TOKEN_ENV } from "../lib/manager-token";
 import { getLanAddresses } from "../lib/net/lan-addresses";
+import { HANDOFF_COMPLETE_MESSAGE } from "../lib/restart-handoff";
 import { isCompiledRuntime } from "../lib/runtime-target";
 import { parseServiceLogLine } from "./listen-log";
 import { managerFetch } from "./manager-fetch";
@@ -113,10 +114,16 @@ export class BackendProcess {
 		this.options.onState(state, detail);
 	}
 
-	/** 启动后端；已在运行时直接返回。 */
-	async start(): Promise<void> {
+	/**
+	 * 启动后端；已在运行时直接返回。
+	 *
+	 * `handoffEnv` 是更新交接的一次性环境变量：子进程会先让旧服务退出再绑定端口。
+	 * 交接完成前旧服务仍在应答健康检查，所以此期间不探测端口。
+	 */
+	async start(options?: { handoffEnv?: Record<string, string> }): Promise<void> {
 		if (this.child || this.disposed) return;
 		this.lockConflictPid = undefined;
+		this.awaitingHandoff = options?.handoffEnv !== undefined;
 		this.observedHost = undefined;
 		this.observedPort = 0;
 		this.observedProtocol = undefined;
@@ -130,6 +137,7 @@ export class BackendProcess {
 				stderr: "pipe",
 				env: {
 					...process.env,
+					...options?.handoffEnv,
 					NARRAFORK_MANAGER_MANAGED: "1",
 					[MANAGER_TOKEN_ENV]: this.options.managerToken,
 				},
@@ -173,6 +181,12 @@ export class BackendProcess {
 	 */
 	private lockConflictPid: number | undefined;
 
+	/** 更新交接进行中：旧服务还占着端口，健康检查会误判成新进程已就绪。 */
+	private awaitingHandoff = false;
+
+	/** 交接完成（或非交接启动）的时间，监听地址等待从这里起算。 */
+	private addressWaitStartedAt = 0;
+
 	/** 健康检查应使用的端口。 */
 	private probePort(): number {
 		return this.observedPort > 0 ? this.observedPort : this.target.port;
@@ -180,6 +194,11 @@ export class BackendProcess {
 
 	/** 从服务输出里解析实际监听地址与实例锁冲突。 */
 	private observeListenerAddress(line: string): void {
+		if (this.awaitingHandoff && line.includes(HANDOFF_COMPLETE_MESSAGE)) {
+			this.awaitingHandoff = false;
+			this.addressWaitStartedAt = Date.now();
+			return;
+		}
 		const event = parseServiceLogLine(line);
 		if (!event) return;
 		if (event.kind === "lock") {
@@ -194,7 +213,7 @@ export class BackendProcess {
 	/** 轮询健康检查直到就绪；超时只报状态，不杀进程（服务可能仍在慢启动）。 */
 	private async waitUntilReady(): Promise<void> {
 		const deadline = Date.now() + READY_TIMEOUT_MS;
-		const startedAt = Date.now();
+		this.addressWaitStartedAt = Date.now();
 		while (Date.now() < deadline) {
 			// 实例锁冲突：服务会立即退出，直接给出原因，不必等超时。
 			if (this.lockConflictPid !== undefined) {
@@ -202,10 +221,14 @@ export class BackendProcess {
 				return;
 			}
 			if (!this.child) return;
+			if (this.awaitingHandoff) {
+				await this.sleep(READY_POLL_MS);
+				continue;
+			}
 			// 先等服务自己报告监听地址再探测端口：直接探测会把"已在运行的外部实例"
 			// 误当成刚启动的这个（表现为瞬间 running，随后子进程因锁冲突退出）。
 			// 等待有上限：地址解析失败时必须回退到配置端口，否则会悬空到启动超时。
-			if (this.observedPort <= 0 && Date.now() - startedAt < ADDRESS_WAIT_MS) {
+			if (this.observedPort <= 0 && Date.now() - this.addressWaitStartedAt < ADDRESS_WAIT_MS) {
 				await this.sleep(READY_POLL_MS);
 				continue;
 			}

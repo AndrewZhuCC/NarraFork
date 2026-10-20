@@ -98,6 +98,10 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "外部服务已停止，面板开始接管启动...",
 		en: "The external service stopped; the manager is taking over...",
 	},
+	"log.updateHandoff": {
+		"zh-CN": "更新已就绪：正在启动新版本服务，由它接替旧服务...",
+		en: "Update ready: starting the new server, which takes over from the old one...",
+	},
 	"log.handoverWait": {
 		"zh-CN": "已进入接管等待：请在终端中停止外部服务（Ctrl+C），面板会在其退出后自动启动托管实例。",
 		en: "Waiting to take over: stop the external service in its terminal (Ctrl+C); the manager starts its own instance once it exits.",
