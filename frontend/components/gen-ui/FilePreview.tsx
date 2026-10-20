@@ -7,7 +7,7 @@ import type { GenUiFileReference } from "@shared/gen-ui-files";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { PreviewBundle } from "./preview-loader";
-import { createPreviewShell, readPreviewTheme } from "./preview-shell";
+import { createPreviewShell, readPreviewContentHeight, readPreviewTheme } from "./preview-shell";
 
 /** This component's entire lifetime is the open modal's lifetime. */
 export function FilePreview({
@@ -75,7 +75,7 @@ export function AppFrame({
 	const { bundle, error, reload } = useGenUI(narratorId, file);
 	if (error)
 		return (
-			<Alert color="red" p="xs" style={{ height, overflow: "auto" }}>
+			<Alert color="red" p="xs" style={{ overflow: "auto" }}>
 				<Text size="xs" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
 					{t("genUi.loadFailed")}
 					{"\n"}
@@ -102,6 +102,7 @@ export function AppFrame({
 			title={file.title}
 			failureMessage={t("genUi.renderFailed")}
 			height={height}
+			autoHeight
 		/>
 	);
 }
@@ -121,16 +122,19 @@ function PreviewFrame({
 	title,
 	failureMessage,
 	height,
+	autoHeight = false,
 }: {
 	narratorId: string;
 	bundle: PreviewBundle;
 	title: string;
 	failureMessage: string;
 	height: number | string;
+	autoHeight?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	// An app is code the agent wrote, running in the reader's session: nothing it sends
 	// reaches the conversation, and no link opens, until the reader has seen it and said so.
+	const [contentHeight, setContentHeight] = useState<number | null>(null);
 	const [request, setRequest] = useState<{ kind: "prompt" | "link"; text: string } | null>(null);
 	const [sendFailed, setSendFailed] = useState(false);
 	const pending = useRef(false);
@@ -140,7 +144,10 @@ function PreviewFrame({
 	const [navigated, setNavigated] = useState(false);
 	// Theme changes update only tokens/provider state, never recreate the user's open UI.
 	const [srcDoc] = useState(() =>
-		createPreviewShell(bundle, readPreviewTheme(), failureMessage, { kit: bundle.kitRuntime }),
+		createPreviewShell(bundle, readPreviewTheme(), failureMessage, {
+			kit: bundle.kitRuntime,
+			autoHeight,
+		}),
 	);
 	const sendTheme = () =>
 		frame.current?.contentWindow?.postMessage(
@@ -156,6 +163,11 @@ function PreviewFrame({
 			);
 		const onNavigation = (event: MessageEvent) => {
 			if (event.source !== frame.current?.contentWindow) return;
+			if (autoHeight && event.data?.type === "narrafork:preview-height") {
+				const next = readPreviewContentHeight(event.data.height);
+				if (next !== null) setContentHeight(next);
+				return;
+			}
 			if (event.data?.type === "narrafork:preview-focus-composer") {
 				focusComposerFromFrame(frame.current);
 				return;
@@ -189,7 +201,7 @@ function PreviewFrame({
 			window.removeEventListener("message", onNavigation);
 			unsubscribe();
 		};
-	}, [navigated]);
+	}, [navigated, autoHeight]);
 	const done = () => {
 		pending.current = false;
 		setRequest(null);
@@ -201,7 +213,7 @@ function PreviewFrame({
 	};
 	if (navigated) return <Alert color="orange">{t("genUi.navigationStopped")}</Alert>;
 	const bar = {
-		position: "absolute",
+		position: autoHeight ? "relative" : "absolute",
 		insetInline: 0,
 		bottom: 0,
 		minHeight: 34,
@@ -217,7 +229,7 @@ function PreviewFrame({
 		overflowWrap: "anywhere",
 	} as const;
 	return (
-		<Box style={{ position: "relative", height }}>
+		<Box style={{ position: "relative", height: autoHeight ? undefined : height }}>
 			{frameElement()}
 			{request?.kind === "link" ? (
 				<Group gap="xs" wrap="nowrap" px="xs" style={bar}>
@@ -281,7 +293,12 @@ function PreviewFrame({
 						sendTheme();
 					}
 				}}
-				style={{ width: "100%", height: "100%", border: 0, display: "block" }}
+				style={{
+					width: "100%",
+					height: autoHeight ? (contentHeight ?? height) : "100%",
+					border: 0,
+					display: "block",
+				}}
 			/>
 		);
 	}

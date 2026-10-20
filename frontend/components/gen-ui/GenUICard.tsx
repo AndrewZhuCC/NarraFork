@@ -20,7 +20,7 @@ const KitNoticeBar = lazy(() =>
 	import("./KitNoticeBar").then((module) => ({ default: module.KitNoticeBar })),
 );
 
-/** Header row of an inline card; the frame gets the rest of the reserved height. */
+/** Header row of an inline card; the chat frame follows its actual content height. */
 const INLINE_HEADER = 28;
 /** Reserved for the kit confirmation row, so it never moves the frame when it appears. */
 const NOTICE_ROW = 26;
@@ -173,7 +173,7 @@ function InlineCard({
 		</Suspense>
 	) : null;
 	return (
-		<Box h={height} style={{ overflow: "hidden" }}>
+		<Box style={{ overflow: "hidden" }}>
 			<Group h={INLINE_HEADER} px="xs" gap="xs" wrap="nowrap" justify="space-between">
 				<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
 					{inline.live && <Loader size={12} />}
@@ -209,12 +209,13 @@ function InlineCard({
 					</Suspense>
 				</Box>
 			)}
-			<Suspense fallback={null}>
+			<Suspense fallback={<Box h={Math.max(60, height - INLINE_HEADER - notice)} />}>
 				<InlineRender
 					narratorId={narratorId}
 					source={inline.source}
 					live={inline.live}
 					height={Math.max(60, height - INLINE_HEADER - notice)}
+					autoHeight
 					title={title}
 					runtime={inline.runtime}
 					formToolUseId={form}
@@ -401,7 +402,7 @@ function AppCard({
 		</Suspense>
 	) : null;
 	return (
-		<Box h={height} style={{ overflow: "hidden" }}>
+		<Box style={{ overflow: "hidden" }}>
 			<Group h={INLINE_HEADER} px="xs" gap="xs" wrap="nowrap" justify="space-between">
 				<Text fw={600} size="xs" truncate title={title} style={{ minWidth: 0 }}>
 					{title}
@@ -431,11 +432,11 @@ function AppCard({
 				</Box>
 			)}
 			{running ? (
-				<Suspense fallback={null}>
+				<Suspense fallback={<Box h={bodyHeight} />}>
 					<AppFrame key={run} narratorId={narratorId} file={file} height={bodyHeight} />
 				</Suspense>
 			) : (
-				<Box px="xs" h={bodyHeight}>
+				<Box px="xs">
 					<Text size="xs" c="dimmed" truncate title={path}>
 						{path}
 					</Text>

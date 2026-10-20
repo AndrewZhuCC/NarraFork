@@ -29,12 +29,26 @@ export interface PreviewShellSource {
 	css?: string;
 }
 
+// ponytail: Above 100k px keep native scrolling; larger apps can paginate or use the
+// expanded viewer instead of allocating an unbounded iframe.
+export const MAX_PREVIEW_HEIGHT = 100_000;
+
+export function readPreviewContentHeight(value: unknown): number | null {
+	return typeof value === "number" &&
+		Number.isFinite(value) &&
+		value > 0 &&
+		value <= MAX_PREVIEW_HEIGHT
+		? Math.ceil(value)
+		: null;
+}
 export interface PreviewShellOptions {
 	/**
 	 * `app` mounts a compiled App.tsx. `markup` mounts nothing of its own and renders the
 	 * element trees the host posts, so UI can appear while its markup is still streaming.
 	 */
 	mode?: "app" | "markup";
+	/** Chat previews grow with their contents; expanded viewers keep a fixed viewport. */
+	autoHeight?: boolean;
 	/** `runtimeJs` is a project component kit (`globalThis.__nfKit`), not the built-in runtime. */
 	kit?: boolean;
 }
@@ -74,6 +88,8 @@ export function createPreviewShell(
 		failureMessage,
 		kit,
 		mode,
+		autoHeight: options.autoHeight === true,
+		maxHeight: MAX_PREVIEW_HEIGHT,
 		intrinsic: UI_INTRINSIC_TAGS,
 		actionProps: UI_ACTION_PROPS,
 		tagProps: UI_TAG_PROPS,
@@ -143,6 +159,65 @@ export function createPreviewShell(
   try {
     style(config.runtimeCss);
     style(config.css);
+    if (config.autoHeight) {
+      // A viewport-sized root can grow but can never shrink to its actual content.
+      style("html,body,#root{height:auto;min-height:0}html{overflow-y:hidden}");
+      const content = document.getElementById("root");
+      let queued = 0;
+      let previous = 0;
+      let viewportWidth = innerWidth;
+      let viewportHeight = innerHeight;
+      const report = () => {
+        queued = 0;
+        const bounds = content.getBoundingClientRect();
+        const naturalHeight = Math.max(bounds.bottom, bounds.top + content.scrollHeight,
+          failure.hidden ? 0 : failure.getBoundingClientRect().bottom) + scrollY;
+        let height = naturalHeight;
+        // A menu that fits above its trigger needs no space below the content.
+        // Only make room to flip below when the upward menu is actually clipped.
+        for (const trigger of document.querySelectorAll('[aria-expanded="true"][aria-controls]')) {
+          const owned = document.getElementById(trigger.getAttribute("aria-controls"));
+          const popup = owned?.closest("[data-portal] > *, [data-position]");
+          if (!popup || !popup.getClientRects().length) continue;
+          const popupBounds = popup.getBoundingClientRect();
+          if (popupBounds.top < 0)
+            height = Math.max(height, trigger.getBoundingClientRect().bottom + popup.offsetHeight + 8 + scrollY);
+          else if (popupBounds.bottom + scrollY > naturalHeight)
+            height = Math.max(height, popupBounds.bottom + 8 + scrollY);
+        }
+        const next = Math.min(config.maxHeight, Math.max(1, Math.ceil(height)));
+        document.documentElement.style.overflowY = height > config.maxHeight ? "auto" : "hidden";
+        if (next === previous) return;
+        previous = next;
+        parent.postMessage({type: "narrafork:preview-height", height: next}, "*");
+      };
+      const schedule = () => { if (!queued) queued = requestAnimationFrame(report); };
+      const observer = new ResizeObserver(() => {
+        const widthChanged = viewportWidth !== innerWidth;
+        const viewportDelta = innerHeight - viewportHeight;
+        const followsViewport = !widthChanged && viewportDelta !== 0 &&
+          Math.abs(content.scrollHeight - previous - viewportDelta) < 1;
+        viewportWidth = innerWidth;
+        viewportHeight = innerHeight;
+        // Applying our own height is not new content. Viewport-sized app layouts
+        // retain native scrolling instead of repeatedly enlarging themselves.
+        if (followsViewport) {
+          if (content.scrollHeight > innerHeight) document.documentElement.style.overflowY = "auto";
+          return;
+        }
+        schedule();
+      });
+      observer.observe(content);
+      observer.observe(failure);
+      new MutationObserver(schedule).observe(document.body, {
+        subtree: true, childList: true, characterData: true, attributes: true,
+      });
+      document.addEventListener("load", schedule, true);
+      document.addEventListener("transitionend", schedule, true);
+      document.fonts.ready.then(schedule);
+      window.addEventListener("resize", () => { if (viewportWidth !== innerWidth) schedule(); });
+      schedule();
+    }
     // Host tokens restyle the built-in Mantine runtime; a project kit brings its own look.
     const tokens = style(config.kit ? "" : config.theme.tokenCss);
     if (!config.kit) document.documentElement.dataset.mantineColorScheme = config.theme.colorScheme;

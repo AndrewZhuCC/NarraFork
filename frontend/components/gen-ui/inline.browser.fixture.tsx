@@ -76,7 +76,7 @@ function Fixture() {
 				forceColorScheme="light"
 			>
 				<RenderLodCtx.Provider value={{ lod: 5, interactive: true }}>
-					<div id="card" style={{ width: 720 }}>
+					<div id="card" style={{ width: "min(720px, 100%)" }}>
 						<GenUICard
 							narratorId="n1"
 							file={null}

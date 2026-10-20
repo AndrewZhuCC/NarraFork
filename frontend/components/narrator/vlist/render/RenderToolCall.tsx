@@ -84,6 +84,7 @@ import {
 } from "@tabler/icons-react";
 import type { ComponentType, ReactNode } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { hasGenUiPreview } from "../vlist-unpredictable-blocks";
 import { resolveToolRowStatusMark, TraceRowStatusGlyph } from "./trace-row-status";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
@@ -1949,19 +1950,26 @@ function DetailRegion({
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
 }) {
+	const flowing = hasGenUiPreview(detail);
 	return (
-		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
-			{detail.sections.map((section) => {
+		<div
+			style={{
+				position: "relative",
+				width: availableWidth,
+				height: flowing ? undefined : detail.height,
+			}}
+		>
+			{detail.sections.map((section, index) => {
 				const part = quoteSectionPart(section.key);
-				return (
-					<Fragment key={section.key}>
+				const content = (
+					<>
 						{section.label ? (
 							<Text
 								size="xs"
 								fw={500}
 								style={{
-									position: "absolute",
-									top: section.top,
+									position: flowing ? "relative" : "absolute",
+									top: flowing ? undefined : section.top,
 									left: 0,
 									width: availableWidth,
 									height: typographyMetrics().line.xs,
@@ -1973,11 +1981,19 @@ function DetailRegion({
 						<div
 							{...(part ? { [QUOTE_PART_ATTR]: part } : {})}
 							style={{
-								position: "absolute",
-								top: section.bodyTop,
+								position: flowing ? "relative" : "absolute",
+								top: flowing ? undefined : section.bodyTop,
 								left: 0,
 								width: availableWidth,
-								height: section.bodyHeight,
+								height:
+									flowing && section.measuredBody.model.kind === "gen-ui"
+										? undefined
+										: section.bodyHeight,
+								marginTop: flowing
+									? section.bodyTop -
+										section.top -
+										(section.label ? typographyMetrics().line.xs : 0)
+									: undefined,
 							}}
 						>
 							<RenderToolBody
@@ -1994,7 +2010,20 @@ function DetailRegion({
 								specTasksLive={specTasksLive}
 							/>
 						</div>
-					</Fragment>
+					</>
+				);
+				const previous = detail.sections[index - 1];
+				return flowing ? (
+					<div
+						key={section.key}
+						style={{
+							paddingTop: section.top - (previous ? previous.bodyTop + previous.bodyHeight : 0),
+						}}
+					>
+						{content}
+					</div>
+				) : (
+					<Fragment key={section.key}>{content}</Fragment>
 				);
 			})}
 		</div>

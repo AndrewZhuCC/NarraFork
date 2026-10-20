@@ -1759,8 +1759,8 @@ export function measureToolBody(
 ): MeasuredToolBody {
 	switch (detail.kind) {
 		case "gen-ui":
-			// Inline UI reserves the height its declared size maps to; the file card and
-			// the kit prompt are three fixed text rows. Neither is ever measured.
+			// A preview's declared size is only its loading placeholder; the row's DOM
+			// height reporter corrects it once rendered. Static file/kit cards stay fixed.
 			return finishRegion(
 				detail,
 				[makeFixed(detail.contentPx ?? 88, "gen-ui", 0)],

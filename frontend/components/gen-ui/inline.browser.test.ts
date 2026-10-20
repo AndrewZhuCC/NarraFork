@@ -142,6 +142,167 @@ async function cardText(page: Page): Promise<string> {
 }
 
 browserTest(
+	"upward dropdown does not reserve blank space below a tall card",
+	async () => {
+		await withFixturePage(
+			(path) =>
+				path.endsWith("/gen-ui/kit")
+					? Response.json({ status: { state: "builtin", components: [] }, request: null })
+					: null,
+			async (page) => {
+				await page.evaluate(() =>
+					window.inlineFixture.stream(
+						'<Stack gap="sm"><Box h={640}>Content above the menu</Box><Select id="upward-menu" data={["One", "Two", "Three"]} placeholder="Menu" /></Stack>',
+						false,
+					),
+				);
+				const element = await page.waitForSelector('#card iframe[title="Plans"]');
+				const frame = await element?.contentFrame();
+				if (!element || !frame) throw new Error("Missing preview frame");
+				await frame.waitForSelector("#upward-menu");
+				await frame.waitForFunction(
+					() => (document.getElementById("root")?.scrollHeight ?? Infinity) <= innerHeight + 1,
+				);
+				const initial = await element.evaluate((node) => node.clientHeight);
+				await frame.click("#upward-menu");
+				await frame.waitForSelector('[role="listbox"]', { visible: true });
+				await page.evaluate(async () => {
+					for (let i = 0; i < 4; i++)
+						await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+				});
+				expect(await element.evaluate((node) => node.clientHeight)).toBe(initial);
+				expect(
+					await frame.evaluate(() => {
+						const popup = document.querySelector('[role="listbox"]')?.closest("[data-portal] > *");
+						const input = document.querySelector("#upward-menu");
+						if (!popup || !input) throw new Error("Missing dropdown");
+						return popup.getBoundingClientRect().bottom - input.getBoundingClientRect().top;
+					}),
+				).toBeLessThanOrEqual(1);
+			},
+		);
+	},
+	30000,
+);
+
+browserTest(
+	"inline card fits content, shrinks after folding, and leaves page scrolling to the chat",
+	async () => {
+		await withFixturePage(
+			(path) =>
+				path.endsWith("/gen-ui/kit")
+					? Response.json({ status: { state: "builtin", components: [] }, request: null })
+					: null,
+			async (page) => {
+				const rows = Array.from(
+					{ length: 64 },
+					(_, i) => `<tr><td>Row ${i}</td><td>Detail ${i}</td></tr>`,
+				).join("");
+				const source = `<Stack gap="sm">
+<TextInput id="kept" label="Name" />
+<Accordion defaultValue="details" transitionDuration={0}><Accordion.Item value="details">
+<Accordion.Control id="fold">Details</Accordion.Control>
+<Accordion.Panel><table><tbody>${rows}</tbody></table></Accordion.Panel>
+</Accordion.Item></Accordion>
+<Text>${"Responsive content should wrap without clipping. ".repeat(8)}</Text>
+</Stack>`;
+				await page.evaluate((text) => window.inlineFixture.stream(text, false), source);
+				const handle = await page.waitForSelector('#card iframe[title="Plans"]');
+				if (!handle) throw new Error("Missing preview");
+				const frame = await handle.contentFrame();
+				if (!frame) throw new Error("Missing preview frame");
+				await frame.waitForSelector("#kept");
+				await frame.type("#kept", "preserved");
+				await page.waitForFunction(
+					() => (document.querySelector("#card iframe") as HTMLElement)?.offsetHeight > 1200,
+				);
+				await frame.waitForFunction(
+					() => (document.getElementById("root")?.scrollHeight ?? Infinity) <= innerHeight + 1,
+				);
+				const box = await handle?.boundingBox();
+				if (!box) throw new Error("Missing preview bounds");
+				await page.mouse.move(box.x + 20, box.y + 20);
+				await page.mouse.wheel({ deltaY: 400 });
+				await page.waitForFunction(() => scrollY > 20);
+				await page.evaluate(() => scrollTo(0, 0));
+				await frame.click("#fold");
+				await page.waitForFunction(
+					() => (document.querySelector("#card iframe") as HTMLElement)?.offsetHeight < 400,
+				);
+				const shortHeight = await handle.evaluate((node) => node.clientHeight);
+				expect(await frame.$eval("#kept", (node) => (node as HTMLInputElement).value)).toBe(
+					"preserved",
+				);
+				await page.setViewport({ width: 390, height: 800 });
+				await frame.waitForFunction(
+					() =>
+						innerWidth < 400 &&
+						(document.getElementById("root")?.scrollHeight ?? Infinity) <= innerHeight + 1,
+				);
+				expect(await handle.evaluate((node) => node.clientHeight)).toBeGreaterThan(shortHeight);
+				expect(await page.$$("#card iframe")).toHaveLength(1);
+
+				// A very short card still makes room for its portaled Select dropdown.
+				await page.evaluate(() =>
+					window.inlineFixture.stream(
+						'<Select id="size" data={["Small", "Medium", "Large"]} placeholder="Size" />',
+						false,
+					),
+				);
+				await frame.waitForSelector("#size");
+				await page.waitForFunction(
+					() => (document.querySelector("#card iframe") as HTMLElement)?.offsetHeight < 120,
+				);
+				await frame.click("#size");
+				await frame.waitForSelector('[role="listbox"]');
+				await frame.waitForFunction(() => {
+					const popup = document.querySelector('[role="listbox"]')?.closest("[data-portal] > *");
+					if (!popup) return false;
+					const bounds = popup.getBoundingClientRect();
+					return bounds.top >= -1 && bounds.bottom <= innerHeight + 1;
+				});
+				await frame.click('[role="option"]');
+				await page.waitForFunction(
+					() => (document.querySelector("#card iframe") as HTMLElement)?.offsetHeight < 120,
+				);
+				const settled = await handle.evaluate((node) => node.clientHeight);
+				await frame.evaluate(() =>
+					parent.postMessage({ type: "narrafork:preview-height", height: 1e9 }, "*"),
+				);
+				await page.evaluate(
+					() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+				);
+				expect(await handle.evaluate((node) => node.clientHeight)).toBe(settled);
+
+				// A tiny preview must not clip the host's potentially taller confirmation bar.
+				const url = `https://example.com/${"long-path-".repeat(35)}`;
+				await page.evaluate(
+					(href) =>
+						window.inlineFixture.stream(`<a id="long-link" href="${href}">Open docs</a>`, false),
+					url,
+				);
+				await frame.waitForSelector("#long-link");
+				await frame.click("#long-link");
+				await page.waitForSelector('#card a[target="_blank"]');
+				const dimensions = await page.evaluate(() => {
+					const card = document.querySelector("#card > div");
+					const preview = document.querySelector("#card iframe") as HTMLIFrameElement;
+					const bar = document.querySelector('#card a[target="_blank"]')?.parentElement;
+					if (!card || !bar) throw new Error("Missing link confirmation");
+					return {
+						card: card.getBoundingClientRect().height,
+						frame: preview.clientHeight,
+						bar: bar.getBoundingClientRect().height,
+					};
+				});
+				expect(dimensions.card - dimensions.frame).toBeGreaterThanOrEqual(28 + dimensions.bar - 1);
+			},
+		);
+	},
+	45000,
+);
+
+browserTest(
 	"inline card: streams into one frame, sends the reader's click as a chat message, gates the kit build",
 	async () => {
 		let request: GenUiKitRequest | null = {
@@ -188,9 +349,9 @@ browserTest(
 			expect(await frame.$eval("#name", (node) => (node as HTMLInputElement).value)).toBe("kept");
 			expect((await page.$$("#card iframe")).length).toBe(1);
 			expect(await page.$eval("#card", (node) => node.textContent)).not.toContain("Generating");
-			// The card never outgrew the height its row reserved.
-			expect(await page.$eval("#card > div", (node) => (node as HTMLElement).offsetHeight)).toBe(
-				400,
+			// The requested size is a placeholder, not permanent empty space below a short UI.
+			await page.waitForFunction(
+				() => (document.querySelector("#card > div") as HTMLElement)?.offsetHeight < 400,
 			);
 
 			// A click on generated UI becomes the user's next chat message, sent as the user.

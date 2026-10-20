@@ -96,6 +96,21 @@ describe("hostsUnpredictableBlock", () => {
 		expect(hostsUnpredictableBlock("subagent-card", measured([unknown("mermaid")]))).toBe(false);
 	});
 
+	it("marks only GenUI preview tool bodies for natural-height correction", () => {
+		for (const preview of [{ text: "<p>hello</p>" }, { appShownAt: "2026-10-20T00:00:00Z" }]) {
+			const element = {
+				...measured([]),
+				detail: { sections: [{ measuredBody: { model: { kind: "gen-ui", ...preview } } }] },
+			};
+			expect(hostsUnpredictableBlock("tool-call", element)).toBe(true);
+		}
+		const staticCard = {
+			...measured([]),
+			detail: { sections: [{ measuredBody: { model: { kind: "gen-ui" } } }] },
+		};
+		expect(hostsUnpredictableBlock("tool-call", staticCard)).toBe(false);
+	});
+
 	it("does not mark a forwarding kind with no unpredictable block", () => {
 		expect(hostsUnpredictableBlock("markdown", measured([rule()]))).toBe(false);
 	});

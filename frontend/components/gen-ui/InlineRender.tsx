@@ -6,7 +6,7 @@ import { parseUiMarkup } from "@shared/gen-ui-markup";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { answerGenUiForm, loadUiRuntime, type UiRuntime } from "./kit-client";
-import { createPreviewShell, readPreviewTheme } from "./preview-shell";
+import { createPreviewShell, readPreviewContentHeight, readPreviewTheme } from "./preview-shell";
 import { readUiState, subscribeUiState, writeUiState } from "./shared-state";
 
 function httpUrl(value: string): string | null {
@@ -102,6 +102,7 @@ export function InlineRender({
 	source,
 	live,
 	height,
+	autoHeight = false,
 	title,
 	runtime: recorded,
 	formToolUseId,
@@ -112,6 +113,7 @@ export function InlineRender({
 	/** The markup is still streaming: an unfinished tail is expected, not an error. */
 	live: boolean;
 	height: number | string;
+	autoHeight?: boolean;
 	title: string;
 	/** The runtime the finished call was drawn with; absent while it is still streaming. */
 	runtime?: "builtin" | "project";
@@ -121,6 +123,7 @@ export function InlineRender({
 	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
+	const [contentHeight, setContentHeight] = useState<number | null>(null);
 	const [runtime, setRuntime] = useState<UiRuntime | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [link, setLink] = useState<string | null>(null);
@@ -176,9 +179,10 @@ export function InlineRender({
 				? createPreviewShell(runtime, readPreviewTheme(), failureMessage, {
 						mode: "markup",
 						kit: runtime.kit,
+						autoHeight,
 					})
 				: null,
-		[runtime, failureMessage],
+		[runtime, failureMessage, autoHeight],
 	);
 	// A new document has not announced itself yet, whatever the previous one did.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: srcDoc is the trigger, not an input.
@@ -187,6 +191,7 @@ export function InlineRender({
 		loads.current = 0;
 		confirming.current = false;
 		setNavigated(false);
+		setContentHeight(null);
 		setLink(null);
 		setPrompt(null);
 		promptForm.current = null;
@@ -308,9 +313,15 @@ export function InlineRender({
 				value?: unknown;
 				message?: unknown;
 				fields?: unknown;
+				height?: unknown;
 			} | null;
 			if (data?.type === "narrafork:preview-focus-composer") {
 				focusComposerFromFrame(frame.current);
+				return;
+			}
+			if (autoHeight && data?.type === "narrafork:preview-height") {
+				const next = readPreviewContentHeight(data.height);
+				if (next !== null) setContentHeight(next);
 				return;
 			}
 			if (data?.type === "narrafork:ui-ready") {
@@ -364,7 +375,7 @@ export function InlineRender({
 			window.removeEventListener("message", onMessage);
 			unsubscribe();
 		};
-	}, [srcDoc, onReady, sendTheme, deliver, stateKey]);
+	}, [srcDoc, onReady, sendTheme, deliver, stateKey, autoHeight]);
 
 	useEffect(() => {
 		if (!sendFailed) return;
@@ -374,13 +385,21 @@ export function InlineRender({
 
 	if (navigated)
 		return (
-			<Alert color="orange" p="xs" style={{ height, overflow: "auto" }}>
+			<Alert
+				color="orange"
+				p="xs"
+				style={{ height: autoHeight ? undefined : height, overflow: "auto" }}
+			>
 				<Text size="xs">{t("genUi.navigationStopped")}</Text>
 			</Alert>
 		);
 	if (error && !srcDoc)
 		return (
-			<Alert color="red" p="xs" style={{ height, overflow: "auto" }}>
+			<Alert
+				color="red"
+				p="xs"
+				style={{ height: autoHeight ? undefined : height, overflow: "auto" }}
+			>
 				<Text size="xs" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
 					{t("genUi.loadFailed")}
 					{"\n"}
@@ -398,7 +417,7 @@ export function InlineRender({
 			</Group>
 		);
 	const bar = {
-		position: "absolute",
+		position: autoHeight ? "relative" : "absolute",
 		insetInline: 0,
 		bottom: 0,
 		minHeight: 34,
@@ -414,7 +433,7 @@ export function InlineRender({
 		overflowWrap: "anywhere",
 	} as const;
 	return (
-		<Box style={{ position: "relative", height }}>
+		<Box style={{ position: "relative", height: autoHeight ? undefined : height }}>
 			<iframe
 				ref={frame}
 				// A different runtime is a different document: remount instead of reusing a
@@ -425,7 +444,12 @@ export function InlineRender({
 				referrerPolicy="no-referrer"
 				srcDoc={srcDoc}
 				onLoad={onLoad}
-				style={{ width: "100%", height: "100%", border: 0, display: "block" }}
+				style={{
+					width: "100%",
+					height: autoHeight ? (contentHeight ?? height) : "100%",
+					border: 0,
+					display: "block",
+				}}
 			/>
 			{link ? (
 				<Group gap="xs" wrap="nowrap" px="xs" style={bar}>

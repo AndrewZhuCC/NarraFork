@@ -138,6 +138,14 @@ browserTest(
 			});
 			await page.evaluate(() => window.previewFixture.mount(true));
 			const frame = await appFrame(page);
+			await page.waitForFunction(
+				() =>
+					(document.querySelector('iframe[title="Demo preview"]') as HTMLIFrameElement)
+						?.clientHeight < 200,
+			);
+			await frame.waitForFunction(
+				() => (document.getElementById("root")?.scrollHeight ?? Infinity) <= innerHeight + 1,
+			);
 			expect(builds).toBe(2);
 
 			// The app asks to send: nothing goes out until the reader confirms.

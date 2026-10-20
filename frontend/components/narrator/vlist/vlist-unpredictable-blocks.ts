@@ -18,7 +18,18 @@
  * let a ResizeObserver move a committed row with no user action behind it.
  */
 
+import type { MeasuredToolCall, MeasuredToolDetail } from "./measure/measure-tool-call";
 import type { MeasuredElement, PreparedBlock, PreparedUnknownBlock } from "./prepared-block";
+
+/** Only live inline/app previews depart from the tool body's arithmetic geometry. */
+export function hasGenUiPreview(detail?: MeasuredToolDetail | null): boolean {
+	return (
+		detail?.sections.some(
+			({ measuredBody: { model } }) =>
+				model.kind === "gen-ui" && (model.text !== undefined || model.appShownAt !== undefined),
+		) ?? false
+	);
+}
 
 /**
  * True when this unknown block's geometry was in fact measured exactly, so no
@@ -48,11 +59,13 @@ export function hasUnpredictableBlock(blocks: readonly PreparedBlock[]): boolean
  * The kind gate matters: only the explicit forwarding kinds below participate
  * (see render-registry). Expanded trace bodies use their own local reflow before
  * reporting the whole row. A tool card holds its bodies in capped, internally
- * scrolling boxes and deliberately does NOT forward it
- * — marking such a row dynamic would drop its fixed-height clip and let the card
- * decide its own height, which is exactly what the cap exists to prevent.
+ * scrolling boxes and deliberately does NOT forward it. GenUI previews are the
+ * exception: their iframe reports content height and ExactRow observes the whole card.
+ * Other tool bodies must retain their fixed-height clips and intentional caps.
  */
 export function hostsUnpredictableBlock(kind: string, measured: MeasuredElement): boolean {
+	// The iframe reports its natural content height; ExactRow observes the whole tool card.
+	if (kind === "tool-call") return hasGenUiPreview((measured as MeasuredToolCall).detail);
 	if (!UNKNOWN_HEIGHT_FORWARDING_KINDS.has(kind)) return false;
 	if (kind === "activity-trace" || kind === "reasoning-steps") {
 		// Tool cards deliberately keep their own capped geometry. Only a reader's
