@@ -1920,10 +1920,10 @@ export async function runAgentLoopUnlocked(
 			};
 
 			// Convert images to base64 for the agent loop (first iteration only)
-			let loopImages: Array<{ format: string; base64: string }> | undefined;
+			let loopImages: Array<{ format: string; base64: string; position?: number }> | undefined;
 			if (runState.input.images?.length) {
-				const resolved: Array<{ format: string; base64: string }> = [];
-				for (const img of runState.input.images) {
+				const resolved: Array<{ format: string; base64: string; position: number }> = [];
+				for (const [position, img] of runState.input.images.entries()) {
 					const uploadNarratorId = img.uploadNarratorId ?? narratorId;
 					const filePath = getImagePath(uploadNarratorId, img.imageId);
 					if (filePath) {
@@ -1937,9 +1937,11 @@ export async function runAgentLoopUnlocked(
 							};
 							// Prefer detected real format over stored mediaType
 							const effectiveMime = result.detectedMediaType ?? img.mediaType;
+							// A skipped image must not shift later ones onto the wrong `[image #N]`.
 							resolved.push({
 								format: mimeToFormat[effectiveMime] ?? "png",
 								base64: result.base64,
+								position,
 							});
 						} catch {
 							// Image file may have been deleted — skip silently

@@ -169,6 +169,63 @@ describe("measureMessageBubble — user", () => {
 		expect(bodyHeight).toBe(c.BODY_LINE_HEIGHT * 3);
 	});
 
+	it("stacks attachments placed after all text below the body", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "look[image #1: a.png]",
+				attachments: [{ type: "image", imageId: "i", filename: "a.png", width: 40, height: 20 }],
+			},
+			440,
+		);
+		expect(r.blocks.map((block) => (block.kind === "fixed" ? block.tag : block.kind))).toEqual([
+			"code",
+			"user-image",
+		]);
+	});
+
+	it("flows interleaved quotes and attachments inline with the text", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const text =
+			"> [quote] first @@m:msg1234\n> one\n\n怎样算？\n> [quote] second\n> two\n\n怎样算[image #1: a.png]";
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text,
+				attachments: [{ type: "image", imageId: "i", filename: "a.png", width: 40, height: 20 }],
+			},
+			440,
+		);
+		const block = r.blocks.find(
+			(candidate) => candidate.kind === "fixed" && candidate.tag === "user-inline-flow",
+		);
+		if (block?.kind !== "fixed") throw new Error("Expected an inline flow block");
+		const flow = block as unknown as {
+			data: { lines: Array<Array<{ text?: string; atom?: number }>>; atoms: unknown[] };
+		};
+		expect(r.blocks).toHaveLength(1);
+		expect(flow.data.atoms).toHaveLength(3);
+		// One line: quote, text, quote, text, image — the projection's line padding is gone.
+		expect(flow.data.lines).toHaveLength(1);
+		expect(flow.data.lines[0].map((fragment) => fragment.text ?? fragment.atom)).toEqual([
+			0,
+			"怎样算？",
+			1,
+			"怎样算",
+			2,
+		]);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		expect(r.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				c.BODY_LINE_HEIGHT,
+		);
+	});
+
 	it("shows sent quotes as chips and leaves the typed body", async () => {
 		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
 			"./measure-message-bubble"

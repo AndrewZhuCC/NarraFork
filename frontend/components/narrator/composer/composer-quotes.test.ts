@@ -6,6 +6,7 @@ import {
 	MAX_COMPOSER_QUOTE_LABEL_CHARS,
 	normalizeComposerQuote,
 	parseComposerQuotePrefix,
+	parseComposerSegments,
 	quoteDisplayText,
 	quoteJumpForLine,
 	quotePreviewLabel,
@@ -180,5 +181,30 @@ describe("split/join with file references", () => {
 			fileReferences: [],
 		});
 		expect(trimFileReferenceInput(full).text).toBe("> [quote] L\n> q");
+	});
+});
+
+describe("parseComposerSegments", () => {
+	test("recovers interleaved quotes and named attachments in document order", () => {
+		const text =
+			"> [quote] A @@m:abcd\n> first\n\n怎样算？\n> [quote] B\n> second\n\n看[image #1: a.png]和[file #1: n.txt]";
+		expect(parseComposerSegments(text, { images: ["a.png"], files: ["n.txt"] })).toEqual([
+			{ type: "quote", quote: { label: "A", text: "first", anchor: "m:abcd" } },
+			{ type: "text", text: "怎样算？\n" },
+			{ type: "quote", quote: { label: "B", text: "second" } },
+			{ type: "text", text: "看" },
+			{ type: "attachment", kind: "image", index: 0 },
+			{ type: "text", text: "和" },
+			{ type: "attachment", kind: "file", index: 0 },
+		]);
+	});
+	test("leaves look-alike placeholders and mid-line quote headers literal", () => {
+		const text =
+			"x > [quote] A\n> y\n[image #1: other.png][image #2: a.png][image #1: a.png][image #1: a.png]";
+		expect(parseComposerSegments(text, { images: ["a.png"], files: [] })).toEqual([
+			{ type: "text", text: "x > [quote] A\n> y\n[image #1: other.png][image #2: a.png]" },
+			{ type: "attachment", kind: "image", index: 0 },
+			{ type: "text", text: "[image #1: a.png]" },
+		]);
 	});
 });

@@ -48,6 +48,7 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 function getCodexProviderErrorMessage(err: unknown): string {
 	if (err instanceof Error) return err.message;
@@ -810,15 +811,16 @@ export class CodexProvider implements ProviderAdapter {
 		}
 		if ((params.content && params.content !== ".") || params.images?.length) {
 			if (params.images?.length) {
-				const parts: OAIContentPart[] = [];
-				if (params.content && params.content !== ".")
-					parts.push({ type: "text", text: params.content });
-				for (const img of params.images) {
-					parts.push({
-						type: "image_url",
-						image_url: { url: `data:image/${img.format};base64,${img.base64}` },
-					});
-				}
+				const text = params.content && params.content !== "." ? params.content : "";
+				const parts = orderUserContent(text, params.images, "after").map(
+					(part): OAIContentPart =>
+						part.type === "text"
+							? { type: "text", text: part.text }
+							: {
+									type: "image_url",
+									image_url: { url: `data:image/${part.image.format};base64,${part.image.base64}` },
+								},
+				);
 				messages.push({ role: "user", content: parts });
 			} else {
 				messages.push({ role: "user", content: params.content });

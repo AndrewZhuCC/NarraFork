@@ -108,6 +108,35 @@ describe("anthropic history image replay", () => {
 		expect(images[0].source?.media_type).toBe("image/png");
 	});
 
+	test("interleaves images at their placeholders, even when one is missing", async () => {
+		registerTestImage("narr-1", "img-b");
+
+		const { history } = await provider().buildHistory(
+			withTail([
+				userMessage({
+					id: "past",
+					contentJson: [
+						{ type: "image", imageId: "img-missing", mediaType: "image/png" },
+						{ type: "image", imageId: "img-b", mediaType: "image/png" },
+						{ type: "text", text: "看[image #1: a.png]和[image #2: b.png]有何不同" },
+					],
+				}),
+				{ ...userMessage({ id: "reply", role: "assistant", contentText: "ok" }) },
+			]),
+			"anthro:claude-sonnet-4.5",
+			"narr-1",
+		);
+
+		const turn = (history as Array<{ content: unknown }>).find((message) =>
+			Array.isArray(message.content),
+		);
+		expect(
+			(turn?.content as Array<{ type: string; text?: string }>).map((part) =>
+				part.type === "text" ? part.text : part.type,
+			),
+		).toEqual(["看[image #1: a.png]和[image #2: b.png]", "image", "有何不同"]);
+	});
+
 	test("keeps the turn's text alongside the image", async () => {
 		registerTestImage("narr-1", "img-a");
 

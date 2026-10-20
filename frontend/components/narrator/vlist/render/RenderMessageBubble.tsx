@@ -17,7 +17,7 @@
 import { layoutWithLines } from "@chenglou/pretext";
 import { Tooltip } from "@mantine/core";
 import type { FileReference } from "@shared/file-reference";
-import { IconChevronDown, IconChevronRight, IconQuote } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronRight, IconFileText, IconQuote } from "@tabler/icons-react";
 import { useId, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -37,7 +37,11 @@ import {
 	USER_BUBBLE_PADDING,
 	USER_HEADER_BODY_GAP,
 	USER_HEADER_HEIGHT,
+	USER_INLINE_CHIP_HEIGHT,
+	USER_INLINE_CHIP_MARGIN,
 	USER_QUOTE_CHIP_HEIGHT,
+	type UserInlineAtom,
+	type UserInlineFragment,
 } from "../measure/measure-message-bubble";
 import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
@@ -479,10 +483,24 @@ function UserBubble({
 					if (block.tag === "user-quote-chips") {
 						return (
 							<UserQuoteChips
-								key="user-quote-chips"
+								// biome-ignore lint/suspicious/noArrayIndexKey: chip rows sit before or after the body
+								key={`user-quote-chips-${index}`}
 								block={block}
 								top={top}
 								left={USER_BUBBLE_PADDING}
+							/>
+						);
+					}
+					if (block.tag === "user-inline-flow") {
+						return (
+							<UserInlineFlow
+								key="user-inline-flow"
+								block={block}
+								top={top}
+								left={USER_BUBBLE_PADDING}
+								narratorId={narratorId}
+								onOpenAttachment={onOpenAttachment}
+								onFetchAttachment={onFetchAttachment}
 							/>
 						);
 					}
@@ -639,6 +657,184 @@ function UserQuoteChips({
 					</Tooltip>
 				);
 			})}
+		</div>
+	);
+}
+
+/** Inline chip look, matching the stacked quote chips. */
+const CHIP_STYLE = {
+	boxSizing: "border-box",
+	display: "flex",
+	alignItems: "center",
+	gap: 4,
+	border: "1px solid var(--mantine-color-default-border)",
+	borderRadius: "var(--mantine-radius-sm)",
+	background: "var(--mantine-color-default-hover)",
+	color: "inherit",
+	overflow: "hidden",
+	textAlign: "left",
+} as const;
+
+/**
+ * An interleaved body: text and chips at the positions the measure pass laid out, one
+ * absolutely positioned line at a time. Quote chips jump to their source; attachment
+ * chips open the image viewer or the file.
+ */
+function UserInlineFlow({
+	block,
+	top,
+	left,
+	narratorId,
+	onOpenAttachment,
+	onFetchAttachment,
+}: {
+	block: PreparedFixedBlock;
+	top: number;
+	left: number;
+	narratorId?: string;
+	onOpenAttachment?: (filePath: string) => void;
+	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	const data = block.data ?? {};
+	const lines = Array.isArray(data.lines) ? (data.lines as UserInlineFragment[][]) : [];
+	const atoms = Array.isArray(data.atoms) ? (data.atoms as UserInlineAtom[]) : [];
+	const lineHeight = typeof data.lineHeight === "number" ? data.lineHeight : 20;
+	const chipTop = Math.max(0, (lineHeight - USER_INLINE_CHIP_HEIGHT) / 2);
+	const renderAtom = (atom: UserInlineAtom, width: number) => {
+		const label = (
+			<span
+				style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}
+			>
+				{atom.label}
+			</span>
+		);
+		const style = {
+			...CHIP_STYLE,
+			width: width - USER_INLINE_CHIP_MARGIN * 2,
+			height: USER_INLINE_CHIP_HEIGHT,
+			padding: "0 5px",
+			font: typographyMetrics().font.xs,
+		};
+		if (atom.kind === "quote") {
+			const { quote } = atom;
+			const preview = quote.text.length > 600 ? `${quote.text.slice(0, 600)}…` : quote.text;
+			return (
+				<Tooltip
+					label={<span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{preview}</span>}
+					multiline
+					w={360}
+					openDelay={300}
+					withinPortal
+				>
+					<button
+						type="button"
+						aria-label={t("quote.open")}
+						disabled={!quote.anchor}
+						onClick={(event) => {
+							if (!quote.anchor) return;
+							if (window.getSelection()?.isCollapsed === false) return;
+							event.stopPropagation();
+							revealComposerQuote(
+								dock,
+								{ label: quote.label, text: quote.text, anchor: quote.anchor },
+								event.currentTarget,
+							);
+						}}
+						style={{ ...style, cursor: quote.anchor ? "pointer" : "default" }}
+					>
+						<IconQuote size={14} style={{ flexShrink: 0 }} />
+						{label}
+					</button>
+				</Tooltip>
+			);
+		}
+		const attachment = atom.attachment;
+		if (atom.kind === "image") {
+			return (
+				<span style={style} title={attachment.filename ?? undefined}>
+					<span style={{ flexShrink: 0, display: "flex" }}>
+						<VListImage
+							media={{
+								previewUrl: attachment.previewUrl ?? undefined,
+								imageId: attachment.imageId ?? undefined,
+								filename: attachment.filename ?? undefined,
+								uploadNarratorId: attachment.uploadNarratorId ?? undefined,
+								fetchUrl: attachment.fetchUrl ?? undefined,
+							}}
+							narratorId={narratorId}
+							maxHeight={14}
+							displayWidth={14}
+							displayHeight={14}
+						/>
+					</span>
+					{label}
+				</span>
+			);
+		}
+		const filename = attachment.filename ?? "";
+		const open =
+			attachment.fetchUrl && onFetchAttachment
+				? () => onFetchAttachment(attachment.fetchUrl ?? "", filename)
+				: attachment.filePath && onOpenAttachment
+					? () => onOpenAttachment(attachment.filePath ?? "")
+					: undefined;
+		return (
+			<button
+				type="button"
+				disabled={!open}
+				title={filename}
+				onClick={(event) => {
+					if (!open || window.getSelection()?.isCollapsed === false) return;
+					event.stopPropagation();
+					open();
+				}}
+				style={{ ...style, cursor: open ? "pointer" : "default" }}
+			>
+				<IconFileText size={14} style={{ flexShrink: 0 }} />
+				{label}
+			</button>
+		);
+	};
+	return (
+		<div
+			style={{
+				position: "absolute",
+				top,
+				left,
+				width: block.displayWidth,
+				height: block.height,
+			}}
+		>
+			{lines.map((fragments, lineIndex) => (
+				<div
+					// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
+					key={lineIndex}
+					style={{ position: "absolute", top: lineIndex * lineHeight, left: 0, height: lineHeight }}
+				>
+					{fragments.map((fragment, index) => {
+						const atom = fragment.atom === undefined ? undefined : atoms[fragment.atom];
+						return (
+							<div
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={index}
+								style={{
+									position: "absolute",
+									left: fragment.x + (atom ? USER_INLINE_CHIP_MARGIN : 0),
+									top: atom ? chipTop : 0,
+									height: atom ? USER_INLINE_CHIP_HEIGHT : lineHeight,
+									whiteSpace: "pre",
+									font: typographyMetrics().font.body,
+									color: "var(--mantine-color-text)",
+								}}
+							>
+								{atom ? renderAtom(atom, fragment.width) : fragment.text}
+							</div>
+						);
+					})}
+				</div>
+			))}
 		</div>
 	);
 }

@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
 	type ComposerDocument,
+	composerDocumentProjection,
 	composerDocumentText,
+	composerDocumentTextCandidates,
+	legacyComposerDocumentText,
 	parseComposerDocument,
 	readComposerDocument,
 } from "./composer-document";
@@ -38,13 +41,76 @@ describe("semantic composer document", () => {
 		};
 		const accepted = parseComposerDocument(doc);
 		const { text, fileReferences } = composerDocumentText(accepted);
-		expect(text).toBe("> [quote] 来源 @@m:abcd\n> \\[quote] hi\n>\n\n😀 #file:a.ts:2-4\nend");
+		// The quote and the image follow typed content, so both stay where they stand.
+		expect(text).toBe(
+			"😀 #file:a.ts:2-4[image #1: x.png]\n> [quote] 来源 @@m:abcd\n> \\[quote] hi\n>\n\n\nend",
+		);
+		expect(legacyComposerDocumentText(accepted).text).toBe(
+			"> [quote] 来源 @@m:abcd\n> \\[quote] hi\n>\n\n😀 #file:a.ts:2-4\nend",
+		);
 		const range = fileReferences[0].inputRange;
 		if (!range) throw new Error("Expected token offsets");
 		const [start, end] = range;
 		expect(text.slice(start, end)).toBe("#file:a.ts:2-4");
 		expect(start).toBe(text.indexOf("#file"));
 		expect(accepted).toEqual(doc);
+	});
+	test("keeps the historical projection while quotes and attachments lead", () => {
+		const doc = parseComposerDocument({
+			version: 1,
+			assets: [
+				{ id: "a", kind: "image", name: "a.png", size: 1, mimeType: "image/png" },
+				{ id: "f", kind: "textFile", name: "n.txt", size: 1, mimeType: "text/plain" },
+			],
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "an", assetId: "a" },
+						{ type: "quote", id: "q", label: "Q", text: "quoted" },
+						{ type: "text", text: " " },
+						{ type: "attachment", id: "fn", assetId: "f" },
+					],
+				},
+				{ children: [{ type: "text", text: "body" }] },
+			],
+		});
+		const current = composerDocumentText(doc);
+		const legacy = legacyComposerDocumentText(doc);
+		expect(current).toEqual({ text: legacy.text, fileReferences: legacy.fileReferences });
+		expect(current.text).toBe("> [quote] Q\n> quoted\n\n \nbody");
+		expect(composerDocumentTextCandidates(doc)).toHaveLength(1);
+	});
+	test("numbers attachments per kind in upload order once one follows text", () => {
+		const doc = parseComposerDocument({
+			version: 1,
+			assets: [
+				{ id: "b", kind: "image", name: "b[1].png", size: 1, mimeType: "image/png" },
+				{ id: "f", kind: "textFile", name: "n.txt", size: 1, mimeType: "text/plain" },
+				{ id: "a", kind: "image", name: "a.png", size: 1, mimeType: "image/png" },
+			],
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "an", assetId: "a" },
+						{ type: "text", text: "看" },
+						{ type: "attachment", id: "bn", assetId: "b" },
+						{ type: "quote", id: "q", label: "Q", text: "x" },
+						{ type: "text", text: "和" },
+						{ type: "attachment", id: "fn", assetId: "f" },
+					],
+				},
+			],
+		});
+		const { text, spans } = composerDocumentProjection(doc);
+		expect(text).toBe(
+			"[image #2: a.png]看[image #1: b_1_.png]\n> [quote] Q\n> x\n\n和[file #1: n.txt]",
+		);
+		const textSpan = spans.find((span) => span.node === 4);
+		expect(textSpan && text.slice(textSpan.start, textSpan.end)).toBe("和");
+		expect(composerDocumentTextCandidates(doc).map((candidate) => candidate.text)).toEqual([
+			text,
+			"> [quote] Q\n> x\n\n看和",
+		]);
 	});
 	test("rejects arbitrary editor/html/path fields and unknown versions", () => {
 		for (const value of [

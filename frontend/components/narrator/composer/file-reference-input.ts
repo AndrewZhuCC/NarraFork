@@ -1,6 +1,6 @@
 import {
 	type ComposerDocument,
-	composerDocumentText,
+	composerDocumentTextCandidates,
 	readComposerDocument,
 } from "@shared/composer-document";
 import {
@@ -30,9 +30,11 @@ export function readInputComposerDocument(
 ): ComposerDocument | undefined {
 	const document = readComposerDocument(value);
 	if (!document) return undefined;
-	const projection = composerDocumentText(document);
-	return projection.text === text &&
-		JSON.stringify(projection.fileReferences) === JSON.stringify(fileReferences)
+	const references = JSON.stringify(fileReferences);
+	return composerDocumentTextCandidates(document).some(
+		(projection) =>
+			projection.text === text && JSON.stringify(projection.fileReferences) === references,
+	)
 		? document
 		: undefined;
 }
@@ -270,53 +272,35 @@ export function editFileReferenceInput(
 	let composerDocument: ComposerDocument | undefined;
 	const document = input.composerDocument;
 	if (document) {
-		// Quote prefixes are model-only projection; map edits only into a single real text node.
-		const quoteNodes = document.paragraphs.flatMap((p) =>
-			p.children.filter((n) => n.type === "quote"),
+		// Quote blocks and attachment placeholders are projection-only; map edits only into a
+		// single real text node, in whichever projection the current text was written with.
+		const projection = composerDocumentTextCandidates(document).find(
+			(candidate) => candidate.text === input.text,
 		);
-		let offset = composerDocumentText({ ...document, paragraphs: [{ children: quoteNodes }] }).text
-			.length;
-		for (let p = 0; p < document.paragraphs.length; p++) {
-			if (p) offset++;
-			for (let n = 0; n < document.paragraphs[p].children.length; n++) {
-				const node = document.paragraphs[p].children[n];
-				const length =
-					node.type === "text"
-						? node.text.length
-						: node.type === "break"
-							? 1
-							: node.type === "fileReference"
-								? fileReferenceToken(node.reference).length
-								: 0;
-				if (
-					!composerDocument &&
-					node.type === "text" &&
-					start >= offset &&
-					end <= offset + length
-				) {
-					const replacement = {
-						...node,
-						text:
-							node.text.slice(0, start - offset) +
-							text.slice(start, nextEnd) +
-							node.text.slice(end - offset),
-					};
-					const candidate: ComposerDocument = {
-						...document,
-						paragraphs: document.paragraphs.map((paragraph, pi) =>
-							pi === p
-								? {
-										children: paragraph.children.map((child, ni) =>
-											ni === n ? replacement : child,
-										),
-									}
-								: paragraph,
-						),
-					};
-					composerDocument = readInputComposerDocument(candidate, text, fileReferences);
-				}
-				offset += length;
-			}
+		for (const span of projection?.spans ?? []) {
+			const node = document.paragraphs[span.paragraph].children[span.node];
+			if (node.type !== "text" || start < span.start || end > span.end) continue;
+			const replacement = {
+				...node,
+				text:
+					node.text.slice(0, start - span.start) +
+					text.slice(start, nextEnd) +
+					node.text.slice(end - span.start),
+			};
+			const candidate: ComposerDocument = {
+				...document,
+				paragraphs: document.paragraphs.map((paragraph, pi) =>
+					pi === span.paragraph
+						? {
+								children: paragraph.children.map((child, ni) =>
+									ni === span.node ? replacement : child,
+								),
+							}
+						: paragraph,
+				),
+			};
+			composerDocument = readInputComposerDocument(candidate, text, fileReferences);
+			if (composerDocument) break;
 		}
 	}
 	return { text, fileReferences, ...(composerDocument ? { composerDocument } : {}) };
