@@ -1390,133 +1390,6 @@ async function discardAttemptPersistedBlocks(
 	}
 }
 
-/**
- * Erase the `tool_use` blocks of calls a guidance stop reached before they could start.
- *
- * Streaming persists a block the moment its input completes, so a response that was still
- * streaming when guidance arrived leaves behind calls the loop then refused to run. They
- * must not stay: a `tool_use` with no `tool_result` is rejected by every provider (the
- * next request simply fails), and keeping the row would also claim work that never
- * happened. Unlike `discardAttemptPersistedBlocks` this keeps every non-tool block — the
- * text and reasoning of that response are exactly what live guidance promises to deliver
- * intact — and it drops only the ids the loop reports.
- *
- * A call that did execute is kept even when listed: its block carries a real result, and
- * dropping it would leave that result with no call. Tool-call rows are deleted only while
- * still `initializing`/`pending`, the same rule the replay cleanup uses.
- *
- * The durable row is located from the call's own row when `partialId` is unknown, which is
- * the case for drops reported after the turn's message was finalized.
- */
-async function dropUnstartedToolUseBlocks(
-	ctx: EventHandlerContext,
-	narratorId: string,
-	toolUseIds: readonly string[],
-): Promise<void> {
-	if (toolUseIds.length === 0) return;
-	// The rows belong to the message that owns the blocks, so they are the honest way to
-	// find it once the turn's live pointer has been retired.
-	const ownerRows = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			inArray(narratorToolCalls.toolUseId, [...toolUseIds]),
-		),
-		columns: { messageId: true },
-	});
-	const messageIds = new Set<string>();
-	for (const row of ownerRows) if (row.messageId) messageIds.add(row.messageId);
-	for (const messageId of messageIds) {
-		await dropUnstartedToolUseBlocksInMessage(ctx, narratorId, messageId, toolUseIds);
-	}
-}
-
-async function dropUnstartedToolUseBlocksInMessage(
-	ctx: EventHandlerContext,
-	narratorId: string,
-	partialId: string,
-	toolUseIds: readonly string[],
-): Promise<string> {
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, partialId),
-		columns: { contentJson: true },
-	});
-	const blocks = Array.isArray(message?.contentJson)
-		? (message.contentJson as Array<Record<string, unknown>>)
-		: [];
-	const targetIds = new Set(toolUseIds);
-	const affected = blocks.some(
-		(block) => block.type === "tool_use" && typeof block.id === "string" && targetIds.has(block.id),
-	);
-	if (!affected) return partialId;
-
-	try {
-		// Isolate a forked partial before mutating: execution/approval identity stays on the
-		// real owner, and the sibling keeps its own copy of the row and its tool calls.
-		const ownedId = await narratorPersistence.copyOnWriteMessage(narratorId, partialId, undefined, {
-			preserveExecutionOwner: true,
-		});
-		ctx.setPartialMessageId(ownedId);
-
-		const rows = await db.query.narratorToolCalls.findMany({
-			where: and(
-				eq(narratorToolCalls.messageId, ownedId),
-				inArray(narratorToolCalls.toolUseId, [...targetIds]),
-			),
-			columns: { id: true, toolUseId: true, status: true },
-		});
-		const executed = new Set<string>();
-		const removableRowIds: string[] = [];
-		for (const row of rows) {
-			if (row.status === "initializing" || row.status === "pending") removableRowIds.push(row.id);
-			else executed.add(row.toolUseId);
-		}
-		if (removableRowIds.length > 0) {
-			await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.id, removableRowIds));
-			for (const toolUseId of targetIds) {
-				if (!executed.has(toolUseId)) ctx.toolCallIdsMap?.delete(toolUseId);
-			}
-		}
-
-		const nextBlocks = blocks.filter(
-			(block) =>
-				!(
-					block.type === "tool_use" &&
-					typeof block.id === "string" &&
-					targetIds.has(block.id) &&
-					!executed.has(block.id)
-				),
-		);
-		const contentText = nextBlocks
-			.flatMap((block) =>
-				block.type === "text" && typeof block.text === "string" ? [block.text] : [],
-			)
-			.join("\n");
-		const savedId = await narratorPersistence.copyOnWriteMessage(
-			narratorId,
-			ownedId,
-			{
-				contentJson: nextBlocks,
-				contentText: contentText || null,
-				contextCharsJson: measureMessageCharacters("assistant", nextBlocks, contentText),
-			},
-			{ preserveExecutionOwner: true },
-		);
-		ctx.setPartialMessageId(savedId);
-		await bumpNarratorMessageVersion(narratorId);
-		queueContextCharacterRefresh(narratorId, savedId);
-		return savedId;
-	} catch (err) {
-		// Best-effort, like the replay cleanup: a missed drop leaves extra blocks in one
-		// message rather than breaking the turn. The call already did not run.
-		logger.warn("Failed to drop tool blocks of a guided soft stop", {
-			narratorId,
-			partialId,
-			error: String(err),
-		});
-		return ctx.getPartialMessageId() ?? partialId;
-	}
-}
-
 // === Reasoning translation ===
 
 const LOCALE_NAMES: Record<string, string> = {
@@ -2392,18 +2265,7 @@ export async function processEvent(
 					}
 				: undefined;
 			let savedId: string;
-			let partialId = ctx.getPartialMessageId();
-			// A guidance stop can land while the response is still streaming, leaving calls the
-			// loop refused to start. Streaming already persisted their blocks, so erase them
-			// before this row is finalized, reconciled and broadcast.
-			if (partialId && event.droppedToolUseIds?.length) {
-				partialId = await dropUnstartedToolUseBlocksInMessage(
-					ctx,
-					narratorId,
-					partialId,
-					event.droppedToolUseIds,
-				);
-			}
+			const partialId = ctx.getPartialMessageId();
 
 			if (partialId) {
 				// Partial message was already created incrementally via block_complete —
@@ -3643,15 +3505,6 @@ export async function processEvent(
 			// arrive after that), the existing baseline is kept rather than re-measured
 			// against the already-truncated message.
 			await recordAttemptBlockBaseline(ctx, event.requestId);
-			return null;
-		}
-
-		case "tool_calls_dropped": {
-			// A guidance stop that landed while earlier tools were still running: those calls
-			// never began, so their already-persisted blocks and rows go too. Same rule as
-			// `assistant_message.droppedToolUseIds`, only reported after the message was
-			// finalized, which is why the owning message is resolved from the rows.
-			await dropUnstartedToolUseBlocks(ctx, narratorId, event.toolUseIds);
 			return null;
 		}
 

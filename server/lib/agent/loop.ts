@@ -504,6 +504,18 @@ function hasPersistableStreamContent(parsed: ParsedStreamEvent): boolean {
 }
 
 /**
+ * Whether this event starts a tool call the stream has not announced yet: the block boundary
+ * where live guidance may end a response without cutting text or reasoning. An event that also
+ * carries text/reasoning is never a cut point, so no model prose is dropped with it.
+ */
+function opensNewToolCall(parsed: ParsedStreamEvent, known: ReadonlyMap<string, unknown>): boolean {
+	if (parsed.text || parsed.reasoning || parsed.redactedThinking) return false;
+	const chunkId = parsed.toolUseChunk?.toolUseId;
+	if (chunkId && !known.has(chunkId)) return true;
+	return parsed.toolUses?.some((tu) => !known.has(tu.toolUseId)) ?? false;
+}
+
+/**
  * Any parsed provider event proves that the upstream response stream is alive.
  *
  * This is deliberately broader than isMeaningfulStreamEvent(): Anthropic's
@@ -519,12 +531,6 @@ function isProviderActivityEvent(parsed: ParsedStreamEvent): boolean {
 // Named for the legacy todo reminder it replaced; still the spec-reminder interval.
 export const TODO_REMINDER_TOOL_INTERVAL = 15;
 const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 50;
-
-/**
- * Default window for the one case live guidance may cancel a provider request: it has not
- * produced a single event yet (see `guidanceFirstEventFallbackMs` in AgentConfig).
- */
-const DEFAULT_GUIDANCE_FIRST_EVENT_FALLBACK_MS = 10_000;
 
 const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"Read",
@@ -3456,16 +3462,6 @@ async function* agentLoopInMetadataSnapshot(
 			// Only fully persisted AND announced calls are candidates. A preceding input
 			// still streaming remains an ordering barrier even if a later call is ready.
 			const streamReadyTools = new Set<string>();
-			/**
-			 * Calls whose body actually began, recorded at the single synchronous boundary
-			 * before `tool.execute`.
-			 *
-			 * This is the only honest answer to "did this call run?" — a call can appear in
-			 * the stream, be queued for execution, and still never start because a guidance
-			 * stop cancelled its preparation. Everything not in here when the turn ends on a
-			 * guidance stop is dropped from the transcript instead of being reported as run.
-			 */
-			const invokedToolUseIds = new Set<string>();
 			let streamExecutionOpen = false;
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
 				const existing = earlyExecMap.get(tu.toolUseId);
@@ -3492,7 +3488,6 @@ async function* agentLoopInMetadataSnapshot(
 								// No await between this synchronous boundary and tool.execute.
 								preparationSignal.throwIfAborted();
 								removeGuidance();
-								invokedToolUseIds.add(tool.toolUseId);
 								target.onToolExecutionInvoking?.(tool);
 							};
 						}
@@ -3707,30 +3702,10 @@ async function* agentLoopInMetadataSnapshot(
 				};
 			}
 
-			/**
-			 * Whether a guidance stop reached this call before its body began.
-			 *
-			 * Such a call is dropped from the turn entirely: not run, no result published, and
-			 * its `tool_use` block erased from the transcript. The check is deliberately based on
-			 * `invokedToolUseIds` (the boundary right before `tool.execute`) rather than on
-			 * preparation state, because preparation can be cancelled while a body is already
-			 * running elsewhere in the same batch.
-			 */
-			const isDroppedByGuidance = (tu: AgentToolUse): boolean =>
-				guidanceSignal?.aborted === true && !invokedToolUseIds.has(tu.toolUseId);
-
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
 					const settled = settledResults.get(tu.toolUseId);
 					if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
-					if (isDroppedByGuidance(tu)) {
-						// A call a guidance stop reached before its body began is dropped whole.
-						// Its preparation-cancelled settlement must not surface as a result: that
-						// would persist a row for work that never happened and turn the drop into
-						// a "skipped" answer the model never produced.
-						yieldedToolResults.add(tu.toolUseId);
-						continue;
-					}
 					yieldedToolResults.add(tu.toolUseId);
 					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
 					if (settled.updatedInput && tu.name !== "AskUserQuestion")
@@ -3809,11 +3784,6 @@ async function* agentLoopInMetadataSnapshot(
 				// Completed/persisted calls that never started still need a terminal result.
 				for (const tu of toolUses) {
 					if (earlyExecMap.has(tu.toolUseId) || yieldedToolResults.has(tu.toolUseId)) continue;
-					if (isDroppedByGuidance(tu)) {
-						// Dropped calls get no terminal result: the turn's drop set removes them.
-						yieldedToolResults.add(tu.toolUseId);
-						continue;
-					}
 					yieldedToolResults.add(tu.toolUseId);
 					yield earlyToolResultEvent(tu, {
 						output: locale === "zh-CN" ? "工具执行已取消。" : "Tool execution cancelled.",
@@ -4470,64 +4440,25 @@ async function* agentLoopInMetadataSnapshot(
 				let updateReasoningInterrupted = false;
 				const updateReasoningStop = new Error("Reasoning paused for graceful restart");
 				const guidanceStop = new Error("Stopped for immediate guidance");
-				// Watchdog/liveness state lives above `onGuidanceAbort` because that handler
-				// both reads and disarms the guidance fallback.
-				let firstTokenTimeoutTriggered = false;
-				let streamIdleTimeoutTriggered = false;
-				let providerActivitySeen = false;
-				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
-				let streamIdleTimer: ReturnType<typeof setTimeout> | undefined;
-				let guidanceFallbackTimer: ReturnType<typeof setTimeout> | undefined;
-				const clearGuidanceFallback = () => {
-					if (!guidanceFallbackTimer) return;
-					clearTimeout(guidanceFallbackTimer);
-					guidanceFallbackTimer = undefined;
-				};
-				/**
-				 * Arm the only cancel live guidance is allowed to make: a request that has not
-				 * emitted a single event yet, so cancelling it cannot truncate output the user
-				 * is reading. Disarmed for good by the first parsed event.
-				 */
-				const armGuidanceFallback = () => {
-					if (guidanceFallbackTimer || providerActivitySeen) return;
-					const fallbackMs =
-						config.guidanceFirstEventFallbackMs ?? DEFAULT_GUIDANCE_FIRST_EVENT_FALLBACK_MS;
-					if (fallbackMs <= 0 || attemptAbort.signal.aborted) return;
-					guidanceFallbackTimer = setTimeout(() => {
-						guidanceFallbackTimer = undefined;
-						if (config.signal.aborted || attemptAbort.signal.aborted) return;
-						// Anything that arrived in the meantime makes the cut costly again.
-						if (providerActivitySeen) return;
-						attemptAbort.abort(guidanceStop);
-					}, fallbackMs);
-				};
+				// Live guidance must not truncate output the user is reading. Until this attempt
+				// has streamed content, cancelling loses nothing; afterwards the response is cut
+				// only where a new tool call starts, so every text/reasoning block before it is
+				// complete. Urgent guidance keeps cancelling immediately.
+				let attemptStreamedContent = false;
+				const guidanceCutsNow = () =>
+					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
 				const onGuidanceAbort = () => {
 					observeSoftStopForTurn();
-					// Never open another call from a response the user has already steered away
-					// from; the ones already running are drained, not cancelled.
 					streamExecutionOpen = false;
-					// Deliberately no `attemptAbort.abort()`: cutting the provider here truncates
-					// the text/reasoning being streamed. The turn ends at the response boundary
-					// instead (see the post-stream `guidanceSignal?.aborted` check), which is
-					// lossless. Only a request that produced nothing at all falls back to a cancel.
-					armGuidanceFallback();
+					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
-				/**
-				 * Urgent guidance keeps the old contract: cancel the current activity now,
-				 * including the provider request that is streaming, and adopt the input next.
-				 * `guidanceSignal` is the union of both channels, so this needs its own listener —
-				 * the live-guidance handler above deliberately does not cancel.
-				 */
-				const onUrgentAbort = () => {
-					observeSoftStopForTurn();
-					streamExecutionOpen = false;
-					clearGuidanceFallback();
-					attemptAbort.abort(guidanceStop);
-				};
+				// Urgent guidance can follow live guidance whose combined signal already fired.
+				const onUrgentGuidanceAbort = () => attemptAbort.abort(guidanceStop);
 				if (guidanceSignal?.aborted) onGuidanceAbort();
 				else guidanceSignal?.addEventListener("abort", onGuidanceAbort, { once: true });
-				if (config.urgentGuidanceSignal?.aborted) onUrgentAbort();
-				else config.urgentGuidanceSignal?.addEventListener("abort", onUrgentAbort, { once: true });
+				config.urgentGuidanceSignal?.addEventListener("abort", onUrgentGuidanceAbort, {
+					once: true,
+				});
 				const configuredToolLimit = config.maxToolCallsPerResponse ?? 32;
 				const toolCallLimit = Number.isFinite(configuredToolLimit)
 					? Math.min(128, Math.max(1, Math.floor(configuredToolLimit)))
@@ -4556,6 +4487,11 @@ async function* agentLoopInMetadataSnapshot(
 					}
 					throw toolLimitStop;
 				};
+				let firstTokenTimeoutTriggered = false;
+				let streamIdleTimeoutTriggered = false;
+				let providerActivitySeen = false;
+				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+				let streamIdleTimer: ReturnType<typeof setTimeout> | undefined;
 				const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
 					firstTokenTimeoutMs / 1000,
 				)}s without upstream activity`;
@@ -4588,9 +4524,6 @@ async function* agentLoopInMetadataSnapshot(
 				const markProviderActivity = () => {
 					providerActivitySeen = true;
 					clearFirstTokenTimer();
-					// Upstream is demonstrably talking, so a pending guidance stop must let this
-					// response finish even if it later stalls: cutting it would discard output.
-					clearGuidanceFallback();
 					armStreamIdleTimer();
 				};
 				startFirstTokenTimerForAttempt = () => {
@@ -4727,9 +4660,15 @@ async function* agentLoopInMetadataSnapshot(
 						) {
 							responseActivity.setReasoningAbort(null);
 						}
-						// A pending guidance stop does NOT cancel this response: truncating the
-						// stream would discard text/reasoning the user is already reading. The
-						// turn stops at the response boundary instead.
+						if (
+							guidanceSignal?.aborted &&
+							(guidanceCutsNow() || opensNewToolCall(parsed, toolOrderIdentities))
+						) {
+							attemptAbort.abort(guidanceStop);
+							throw guidanceStop;
+						}
+						if (parsed.redactedThinking || hasPersistableStreamContent(parsed))
+							attemptStreamedContent = true;
 						throwIfUserAborted();
 						// Stop dispatch before yielding/awaiting error publication. A finishing
 						// tool must not release more queued work while failure handling runs.
@@ -5215,13 +5154,6 @@ async function* agentLoopInMetadataSnapshot(
 										for (const prevTu of toolUses) {
 											const sr = settledResults.get(prevTu.toolUseId);
 											if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
-											if (isDroppedByGuidance(prevTu)) {
-												// A guidance stop reached this call before its body began, so
-												// its preparation-cancelled settlement must not be published
-												// as a result: the turn drops the call whole.
-												yieldedToolResults.add(prevTu.toolUseId);
-												continue;
-											}
 											yieldedToolResults.add(prevTu.toolUseId);
 											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
 											if (sr.updatedInput && prevTu.name !== "AskUserQuestion")
@@ -6334,10 +6266,9 @@ async function* agentLoopInMetadataSnapshot(
 					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					clearStreamIdleTimer();
-					clearGuidanceFallback();
 					config.signal.removeEventListener("abort", onParentAbort);
 					guidanceSignal?.removeEventListener("abort", onGuidanceAbort);
-					config.urgentGuidanceSignal?.removeEventListener("abort", onUrgentAbort);
+					config.urgentGuidanceSignal?.removeEventListener("abort", onUrgentGuidanceAbort);
 					startFirstTokenTimerForAttempt = undefined;
 				}
 
@@ -7057,13 +6988,6 @@ async function* agentLoopInMetadataSnapshot(
 			for (const tu of toolUses) {
 				const sr = settledResults.get(tu.toolUseId);
 				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
-				if (isDroppedByGuidance(tu)) {
-					// A guidance stop reached this call before its body began. Its settlement is
-					// only the cancelled preparation, which the turn drops instead of publishing:
-					// a result row here would also make the call look executed to the host.
-					yieldedToolResults.add(tu.toolUseId);
-					continue;
-				}
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
 				if (sr.updatedInput && tu.name !== "AskUserQuestion") tu.input = sr.updatedInput;
@@ -7118,28 +7042,15 @@ async function* agentLoopInMetadataSnapshot(
 
 			// Yield the complete assistant message on every successful turn. Event consumers
 			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
-			//
-			// A guidance stop that landed while this response streamed leaves calls the user
-			// steered away from before they could start. They are dropped here — not run, and
-			// not written into the transcript — so they never appear as a `tool_use` without a
-			// result, and never as a fabricated "skipped" result the model never produced.
-			const droppedToolUseIds = guidanceSignal?.aborted
-				? toolUses.filter((tu) => !invokedToolUseIds.has(tu.toolUseId)).map((tu) => tu.toolUseId)
-				: [];
-			const adoptedToolUses =
-				droppedToolUseIds.length > 0
-					? toolUses.filter((tu) => invokedToolUseIds.has(tu.toolUseId))
-					: toolUses;
 			yield {
 				type: "assistant_message",
 				outputCompleted: !pendingResumableError,
 				onToolPersisted: (toolUseId, binding) => {
-					const tu = adoptedToolUses.find((tool) => tool.toolUseId === toolUseId);
+					const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
 					if (tu) bindExecution(tu, binding);
 				},
 				text: assistantText,
-				toolUses: adoptedToolUses,
-				...(droppedToolUseIds.length > 0 ? { droppedToolUseIds } : {}),
+				toolUses,
 				messageId,
 				credentialId,
 				...(turnCitations.length > 0 ? { citations: turnCitations } : {}),
@@ -7155,19 +7066,18 @@ async function* agentLoopInMetadataSnapshot(
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
-				// Only calls that actually began carry history. Calls the guidance stop reached
-				// before their turn are dropped whole: they are not run, and `droppedToolUseIds`
-				// above already told the consumer to erase the blocks streaming persisted for
-				// them. Fabricating a "skipped" result would put words in the model's own
-				// transcript that it never produced; and a `tool_use` left without a result is
-				// rejected by every provider, so the block has to go with the call.
-				const adoptedTools = toolUses.filter((tu) => invokedToolUseIds.has(tu.toolUseId));
+				// Still-running detached calls retain their real pending rows. Do not fabricate
+				// skipped results or replay their incomplete pairs into model-facing history.
+				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
 				const guidanceResults: unknown[] = [];
-				for (const tu of adoptedTools) {
-					const result = settledResults.get(tu.toolUseId);
-					// A call whose body is still running keeps its real pending row and publishes
-					// through the detached-result path; a synthetic result here would contradict it.
-					if (!result) continue;
+				for (const tu of guidanceTools) {
+					const result = settledResults.get(tu.toolUseId) ?? {
+						output: getToolMessage("skippedForSoftStop", locale),
+						isError: true,
+						durationMs: 0,
+						completedAt: Date.now(),
+						metadata: { skippedForSoftStop: true },
+					};
 					if (!yieldedToolResults.has(tu.toolUseId)) {
 						yieldedToolResults.add(tu.toolUseId);
 						yield earlyToolResultEvent(tu, result);
@@ -7189,18 +7099,22 @@ async function* agentLoopInMetadataSnapshot(
 					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
-				if (assistantText || adoptedTools.length > 0 || collectReasoningBlocks(reasoningBlockMap)) {
+				if (
+					assistantText ||
+					guidanceTools.length > 0 ||
+					collectReasoningBlocks(reasoningBlockMap)
+				) {
 					provider.pushAssistantTurn(
 						history,
 						assistantText,
-						toHistoryToolUses(adoptedTools),
+						toHistoryToolUses(guidanceTools),
 						collectReasoningBlocks(reasoningBlockMap),
 						collectCompletedWebSearches(webSearchAccum),
 						messageId,
 						collectCompletedImageGenerations(imageGenAccum),
 						textOutputIndex,
 						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(adoptedTools)),
+						orderedAssistantContent(toHistoryToolUses(guidanceTools)),
 					);
 				}
 				if (guidanceResults.length > 0)
@@ -7557,22 +7471,13 @@ async function* agentLoopInMetadataSnapshot(
 
 				// Check after every serial tool and complete parallel-safe group. Once a soft
 				// stop is observed, never start another tool: only await promises that were
-				// already registered in earlyExecMap and drop or skip every other remaining call.
+				// already registered in earlyExecMap and mark every other remaining call skipped.
 				if (observeSoftStopForTurn()) {
 					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
 					let fatalOutput: string | undefined;
-					// Calls a live-guidance stop reached before they began are dropped from the
-					// transcript entirely, exactly like the ones dropped at the response boundary:
-					// one rule for "never started", no matter when the stop landed.
-					const droppedByGuidanceHere: string[] = [];
 					for (const remainingTool of toolUses.slice(toolIndex)) {
 						const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
 						if (!earlyPromise) {
-							if (isDroppedByGuidance(remainingTool)) {
-								yieldedToolResults.add(remainingTool.toolUseId);
-								droppedByGuidanceHere.push(remainingTool.toolUseId);
-								continue;
-							}
 							pendingToolResults.push(
 								provider.formatToolResult(
 									remainingTool.toolUseId,
@@ -7655,27 +7560,17 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "error", message: fatalOutput };
 						return;
 					}
-					// The host already persisted these blocks while the response streamed, so it
-					// needs to be told now — the turn's `assistant_message` went out before this
-					// phase and cannot carry the ids.
-					if (droppedByGuidanceHere.length > 0) {
-						yield { type: "tool_calls_dropped", toolUseIds: droppedByGuidanceHere };
-					}
-					const keptToolUses =
-						droppedByGuidanceHere.length > 0
-							? toolUses.filter((tu) => !droppedByGuidanceHere.includes(tu.toolUseId))
-							: toolUses;
 					provider.pushAssistantTurn(
 						history,
 						assistantText,
-						toHistoryToolUses(keptToolUses),
+						toHistoryToolUses(toolUses),
 						collectReasoningBlocks(reasoningBlockMap),
 						collectCompletedWebSearches(webSearchAccum),
 						messageId,
 						collectCompletedImageGenerations(imageGenAccum),
 						textOutputIndex,
 						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(keptToolUses)),
+						orderedAssistantContent(toHistoryToolUses(toolUses)),
 					);
 					yield { type: "turn_complete", turnIndex };
 					return;

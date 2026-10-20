@@ -168,14 +168,7 @@ export interface ActiveNarrator {
 	_bufferSoftStop?: boolean;
 	/** Authoritative pending-guidance snapshot for synchronous PostgreSQL stop checks. */
 	_bufferGuidancePending?: boolean;
-	/**
-	 * Live-guidance stop request for the current pass: stop at the next safe boundary.
-	 *
-	 * Aborting it never cancels a response that is already streaming (that would truncate
-	 * the text/reasoning the user is reading) and never cancels a running tool. The loop
-	 * stops opening new calls and ends the turn when the response finishes; only a request
-	 * that has produced no event at all is cancelled, after a short fallback window.
-	 */
+	/** Per-pass request-only cancellation; never cancels already-running tools. */
 	_guidanceAbortController?: AbortController;
 	/** Urgent guidance cancels tools without ending the child runner/takeover. */
 	_urgentGuidanceAbortController?: AbortController;
