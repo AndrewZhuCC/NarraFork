@@ -24,7 +24,6 @@ func runEditorStdio(args []string) error {
 	root := flags.String("root", "", "Host-authorized execution scope")
 	state := flags.String("state-dir", "", "private durable editor directory")
 	epoch := flags.String("epoch", "", "trusted Host runtime epoch (local only)")
-	hostReceipts := flags.String("host-receipts-dir", "", "trusted Host private receipt directory (stdio only)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -52,11 +51,6 @@ func runEditorStdio(args []string) error {
 	if *epoch != "" {
 		if err = engine.SetLocalEpoch(*epoch); err != nil {
 			return err
-		}
-	}
-	if *hostReceipts != "" {
-		if err = engine.ConfigureHostReceipts(*hostReceipts); err != nil {
-			return fmt.Errorf("native Host receipt store: %w", err)
 		}
 	}
 	h.SetEditorEngine(engine)
@@ -131,15 +125,10 @@ func runEditorStdio(args []string) error {
 		}
 		var result any
 		var callErr error
-		switch req.Method {
-		case "editor.hostReceipt.put", "editor.hostReceipt.get", "editor.hostReceipt.settle":
-			result, callErr = h.EditorHostReceiptDispatch(ctx, req.Method, req.Params)
-		default:
-			if allowed {
-				result, callErr = dispatcher.Dispatch(ctx, req.Method, req.Params, nil)
-			} else {
-				callErr = fmt.Errorf("method unavailable in editor-stdio")
-			}
+		if allowed {
+			result, callErr = dispatcher.Dispatch(ctx, req.Method, req.Params, nil)
+		} else {
+			callErr = fmt.Errorf("method unavailable in editor-stdio")
 		}
 		response := rpc.ResultFrame{Type: "rpc_result", ID: req.ID, OK: callErr == nil, Result: result}
 		if callErr != nil {

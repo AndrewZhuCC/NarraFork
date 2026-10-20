@@ -2686,6 +2686,8 @@ export const fileChangeOperations = pgTable(
 		attempt: integer("attempt").notNull(),
 		requestDigest: text("request_digest"),
 		expectedEffectCount: integer("expected_effect_count"),
+		workspaceLeaseId: text("workspace_lease_id"),
+		editorRawSnapshotRevision: doublePrecision("editor_raw_snapshot_revision"),
 		preparedEffectCount: integer("prepared_effect_count").notNull().default(0),
 		evidenceBytes: integer("evidence_bytes").notNull().default(0),
 		settledEffectCount: integer("settled_effect_count").notNull().default(0),
@@ -3877,7 +3879,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 122,
-  "columnCount": 1714,
+  "columnCount": 1716,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -19948,6 +19950,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "expected_effect_count",
           "kind": "integer",
           "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "workspaceLeaseId",
+          "name": "workspace_lease_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "editorRawSnapshotRevision",
+          "name": "editor_raw_snapshot_revision",
+          "kind": "real",
+          "pgType": "double precision",
           "notNull": false,
           "primary": false,
           "unique": false

@@ -127,14 +127,8 @@ async function readHandle(
 export interface EditorFileApplyContext {
 	sourceId: string;
 	userId: string;
-	narratorId: string;
 	operationId: string;
 	effectId: string;
-	mutationId: string;
-	leaseId: string;
-	preparedResult: unknown;
-	snapshotRevision: number;
-	hashKind?: "raw-sha256";
 	requestDigest: string;
 	executionBinding: FileChangeExecutionBinding;
 	scope: FileChangeScopeIdentity;

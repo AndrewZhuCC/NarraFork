@@ -139,6 +139,12 @@ export const updateNarratorHandleSchema = z.object({
 	handle: narratorHandleSchema.nullable(),
 });
 
+export const codexUpdateCredentialSchema = z.object({
+	displayName: z.string().optional(),
+	priority: z.number().optional(),
+	useCreditQuota: z.boolean().optional(),
+});
+
 export const codexUseWebSocketSchema = z.object({
 	useWebSocket: z.boolean().optional(),
 });

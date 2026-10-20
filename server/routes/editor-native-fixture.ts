@@ -1,5 +1,7 @@
+import childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import type { ServerWebSocket } from "bun";
 import { buildExecutorManifest } from "../../scripts/lib/executor-manifest";
@@ -15,6 +17,43 @@ import {
 	initDeviceConnectionService,
 } from "../services/device-connection-service";
 import { hashDeviceToken } from "../services/device-service";
+
+/** Test-only Host guard; independent --server peers, Git, workers and Chrome remain legal. */
+export function denyHostEditorHelpers() {
+	let starts = 0;
+	const originalSpawn = childProcess.spawn,
+		originalBunSpawn = Bun.spawn;
+	const check = (binary: unknown, supplied: unknown) => {
+		const argv = Array.isArray(supplied) ? supplied.map(String) : [];
+		if (
+			!argv.includes("--server") &&
+			(String(binary).includes("executor") || argv.includes("editor-stdio"))
+		) {
+			starts++;
+			throw new Error("Host must not launch an editor helper");
+		}
+	};
+	childProcess.spawn = ((...args: unknown[]) => {
+		check(args[0], args[1]);
+		return Reflect.apply(originalSpawn, childProcess, args);
+	}) as typeof childProcess.spawn;
+	syncBuiltinESMExports();
+	Bun.spawn = ((...args: unknown[]) => {
+		const supplied = Array.isArray(args[0]) ? args[0] : (args[0] as { cmd?: unknown[] })?.cmd;
+		check(supplied?.[0], supplied?.slice(1));
+		return Reflect.apply(originalBunSpawn, Bun, args);
+	}) as typeof Bun.spawn;
+	return {
+		get starts() {
+			return starts;
+		},
+		restore() {
+			childProcess.spawn = originalSpawn;
+			syncBuiltinESMExports();
+			Bun.spawn = originalBunSpawn;
+		},
+	};
+}
 
 /** Test-only real executor + authenticated WS. Never controls an installed user executor. */
 export async function nativeEditorFixture(root: string, workspace: string) {
@@ -62,7 +101,11 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 		rawOpens = 0,
 		rawChunks = 0,
 		maxRawCredit = 0,
-		applies = 0;
+		applies = 0,
+		queries = 0,
+		acks = 0;
+	let failAck = false;
+	let queryOutcome: "not_found" | "uncertain" | undefined;
 	const applyIds = new Set<string>();
 	type Data = { adapter?: Parameters<typeof handleDeviceWS.message>[0] };
 	function adapter(ws: ServerWebSocket<Data>) {
@@ -81,6 +124,36 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 			send(data: string | Uint8Array) {
 				if (typeof data === "string") {
 					const frame = JSON.parse(data);
+					if (frame.type === "rpc" && frame.method === "editor.query") {
+						if (frame.params.acknowledgeTerminal) acks++;
+						else queries++;
+						if (
+							(frame.params.acknowledgeTerminal && failAck) ||
+							(!frame.params.acknowledgeTerminal && queryOutcome)
+						) {
+							const outcome = queryOutcome;
+							if (frame.params.acknowledgeTerminal) failAck = false;
+							queueMicrotask(() => {
+								void handleDeviceWS.message(
+									adapter(ws),
+									frame.params.acknowledgeTerminal
+										? {
+												type: "rpc_result",
+												id: frame.id,
+												ok: false,
+												error: "Fixture ACK unavailable",
+											}
+										: {
+												type: "rpc_result",
+												id: frame.id,
+												ok: true,
+												result: { operationId: frame.params.operationId, outcome, result: null },
+											},
+								);
+							});
+							return 0;
+						}
+					}
 					if (frame.type === "rpc" && frame.method === "fs.read") reads++;
 					if (frame.type === "rpc" && frame.method === "editor.read.open") rawOpens++;
 					if (frame.type === "rpc" && frame.method === "editor.read.chunk") {
@@ -214,20 +287,20 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 		distributionUrl: `http://127.0.0.1:${server.port}`,
 		start,
 		binarySha256,
-		// Native Host receipt metadata must use this same controlled binary, not a
-		// public Release download that may not contain this branch's editor features.
-		async resolveHelper(signal: AbortSignal) {
-			signal.throwIfAborted();
-			return {
-				path: binaryPath,
-				filename: "controlled-native-editor-fixture",
-				version: BUILD_EXECUTOR_DISTRIBUTION.version,
-				size: binary.length,
-				sha256: binarySha256,
-			};
-		},
 		get applies() {
 			return applies;
+		},
+		get queries() {
+			return queries;
+		},
+		get acks() {
+			return acks;
+		},
+		failAckOnce() {
+			failAck = true;
+		},
+		forceQueryOutcome(value?: "not_found" | "uncertain") {
+			queryOutcome = value;
 		},
 		get reads() {
 			return reads;

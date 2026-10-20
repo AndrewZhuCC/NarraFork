@@ -13,10 +13,7 @@
  */
 
 export interface EditorProviderCapabilities {
-	readonly writeUnavailableReason?:
-		| "verified_helper_unavailable"
-		| "durable_executor_unavailable"
-		| "host_receipt_storage_unavailable";
+	readonly writeUnavailableReason?: "durable_executor_unavailable";
 	/** Bounded, identity-verified read of the complete current source (never truncated). */
 	readonly boundedRead: boolean;
 	/** Existing v1 upload/commit save. Not a durable/atomic apply. */
@@ -133,7 +130,8 @@ export interface EditorStageOpen extends EditorWriteOwner {
 	readonly maxBytes: number;
 	readonly idleTimeoutMs: number;
 }
-/** Private, resource-bound handle. Requests never name a staging path. */
+/** Private resource-bound handle for one executor incarnation, including after seal.
+ * Restart invalidates undispatched stages; it never permits replaying a dispatched operation. */
 export interface EditorStageHandle {
 	readonly stageId: string;
 	readonly resourceKey: string;
@@ -196,43 +194,6 @@ export interface EditorQueryResult {
 	readonly outcome: (typeof EDITOR_QUERY_OUTCOMES)[number];
 	/** Required. null when no durable result exists. */
 	readonly result: EditorApplyResult | null;
-}
-
-/** Host-only bounded recovery metadata; stdio bootstrap fixes its private directory.
- * These methods are intentionally unavailable to remote WebSocket RPC clients. */
-export interface EditorHostReceiptRecord {
-	version: 1;
-	createdAt: number;
-	userId: string;
-	narratorId: string;
-	deviceId: string;
-	operationId: string;
-	hostOperationId: string;
-	leaseId: string;
-	effectId: string;
-	saved: { hash: string; bytes: number; snapshotRevision: number; hashKind?: "raw-sha256" };
-	requestDigest: string;
-	namespace: string;
-	resourceKey: string;
-	root: string;
-	identity: EditorResourceIdentity;
-	rawDigest: string;
-	bytes: number;
-	receipt?: EditorApplyResult;
-}
-// Native Host store H3 (VALUE): authoritative shape; earlier RECORD proposals are not wire contracts.
-export interface EditorHostReceiptPut {
-	value: EditorHostReceiptRecord;
-}
-export interface EditorHostReceiptGet {
-	operationId: string;
-}
-export interface EditorHostReceiptValue {
-	value: EditorHostReceiptRecord | null;
-}
-export interface EditorHostReceiptSettle {
-	operationId: string;
-	receipt: EditorApplyResult;
 }
 
 // ── Phase 9: watch ───────────────────────────────────────────────────────────

@@ -48,6 +48,7 @@ import {
 	resolveFilePanel,
 } from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
+import type { MessageJumpOptions, ScrollToMessageFn } from "../message/message-list-handle";
 import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
@@ -95,7 +96,7 @@ const EMPTY_SHARD: NarratorDockShard = emptyShard();
 interface NarratorDockBridges {
 	appendChatInput: ((text: string) => void) | null;
 	writeTerminalStdin: ((text: string) => void) | null;
-	scrollToMessage: ((messageId: string) => void) | null;
+	scrollToMessage: ScrollToMessageFn | null;
 	/**
 	 * Submit text as a real user message through the narrator's own composer path
 	 * (used by the user-chat panel's "send to narrator"). See the note on the same
@@ -300,7 +301,7 @@ export class WorkspaceDockStore {
 		this.getBridges(narratorId).writeTerminalStdin?.(text);
 	}
 
-	registerScrollToMessage(narratorId: string, fn: (messageId: string) => void): () => void {
+	registerScrollToMessage(narratorId: string, fn: ScrollToMessageFn): () => void {
 		const b = this.getBridges(narratorId);
 		b.scrollToMessage = fn;
 		return () => {
@@ -320,8 +321,11 @@ export class WorkspaceDockStore {
 		this.getBridges(narratorId).submitToNarrator?.(text);
 	}
 
-	scrollToMessage(narratorId: string, messageId: string) {
-		this.getBridges(narratorId).scrollToMessage?.(messageId);
+	scrollToMessage(narratorId: string, messageId: string, options?: MessageJumpOptions) {
+		const scroll = this.getBridges(narratorId).scrollToMessage;
+		// Plain jumps keep the one-argument call the bridge has always received.
+		if (options) scroll?.(messageId, options);
+		else scroll?.(messageId);
 	}
 
 	/**
@@ -1211,9 +1215,10 @@ export function useWorkspaceNarratorDockValue(
 			registerWriteTerminalStdin: (fn: (text: string) => void) =>
 				store.registerWriteTerminalStdin(narratorId, fn),
 			writeTerminalStdin: (text: string) => store.writeTerminalStdin(narratorId, text),
-			registerScrollToMessage: (fn: (messageId: string) => void) =>
+			registerScrollToMessage: (fn: ScrollToMessageFn) =>
 				store.registerScrollToMessage(narratorId, fn),
-			scrollToMessage: (messageId: string) => store.scrollToMessage(narratorId, messageId),
+			scrollToMessage: (messageId: string, options?: MessageJumpOptions) =>
+				store.scrollToMessage(narratorId, messageId, options),
 			registerSubmitToNarrator: (fn: (text: string) => void) =>
 				store.registerSubmitToNarrator(narratorId, fn),
 			submitToNarrator: (text: string) => store.submitToNarrator(narratorId, text),

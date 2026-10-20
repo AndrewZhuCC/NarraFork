@@ -216,6 +216,14 @@
 			"prevId": "c7aa010f-c918-4c1f-bd1f-9fd0548f3fe8",
 			"version": "7",
 			"snapshotDigest": "cbb2cc08782852abec1ec2110741b5c24c82c66053fba2fed22d53f03e405148"
+		},
+		{
+			"idx": 27,
+			"tag": "0027_editor_operation_recovery",
+			"id": "8b50bffe-308c-45db-9e1c-64c73f06c646",
+			"prevId": "db929d4c-7564-4214-8c8a-56f3465636eb",
+			"version": "7",
+			"snapshotDigest": "279ef67736f7b0f75fdc6d6b68f68424a50bcab52828617b85c58aa35900f1c7"
 		}
 	]
 }

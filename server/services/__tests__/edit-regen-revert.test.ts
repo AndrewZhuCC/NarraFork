@@ -77,9 +77,7 @@ mock.module("../../lib/uploads", () => ({
 	}),
 }));
 
-const { closeNarrator, editAndRegenerate, interruptAndWaitForIdle, rollbackToBlock } = await import(
-	"../narrator-session"
-);
+const { editAndRegenerate, rollbackToBlock } = await import("../narrator-session");
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
 
 afterAll(() => {
@@ -123,16 +121,13 @@ function seed(cwd: string) {
 		.run();
 }
 
-/** The agent loop cannot run in this harness; everything asserted happens before it. */
+/** Exercise the complete edit without starting an unrelated provider/agent loop. */
 async function runEdit(opts?: Parameters<typeof editAndRegenerate>[5]) {
-	try {
-		await editAndRegenerate("n1", "m1", "new", "en", false, opts);
-	} catch {
-		/* expected: no provider is reachable */
-	}
-	closeNarrator("n1");
-	// close only signals abort; do not reseed n1 while its full finalizer owns it.
-	expect(await interruptAndWaitForIdle("n1", { timeoutMs: 5_000 })).toBe(true);
+	const result = await editAndRegenerate("n1", "m1", "new", "en", false, {
+		...opts,
+		deferContinuation: true,
+	});
+	expect(result.ok).toBe(true);
 }
 
 describe("edit-and-regenerate file rollback", () => {

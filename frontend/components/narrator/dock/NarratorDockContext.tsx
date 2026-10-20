@@ -34,6 +34,7 @@ import {
 	type PluginUiHostSurface,
 	PluginUiSurfaceProvider,
 } from "../../plugins/PluginUiSurfaceContext";
+import type { ScrollToMessageFn } from "../message/message-list-handle";
 import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
@@ -69,7 +70,7 @@ interface NarratorDockBridges {
 	/** Registered by the terminal panel; called by chat to write to terminal stdin. */
 	writeTerminalStdin: ((text: string) => void) | null;
 	/** Registered by the chat panel; called by the search panel to jump to a message. */
-	scrollToMessage: ((messageId: string) => void) | null;
+	scrollToMessage: ScrollToMessageFn | null;
 	/**
 	 * Registered by the chat panel; called by the user-chat panel to SUBMIT text as
 	 * a real user message.
@@ -147,7 +148,7 @@ export interface NarratorDockContextValue {
 	writeTerminalStdin: (text: string) => void;
 
 	/** Register the message-jump handler (returns an unregister fn). */
-	registerScrollToMessage: (fn: (messageId: string) => void) => () => void;
+	registerScrollToMessage: (fn: ScrollToMessageFn) => () => void;
 	/**
 	 * Scroll to + highlight a message in the chat panel.
 	 *
@@ -157,7 +158,7 @@ export interface NarratorDockContextValue {
 	 * Consumers must treat absence as "disable the control" rather than calling it
 	 * through a `?.` that silently does nothing.
 	 */
-	scrollToMessage?: (messageId: string) => void;
+	scrollToMessage?: ScrollToMessageFn;
 
 	/** Register the user-message submitter (returns an unregister fn). */
 	registerSubmitToNarrator: (fn: (text: string) => void) => () => void;
@@ -691,7 +692,8 @@ export function NarratorDockProvider({
 					if (bridgesRef.current.scrollToMessage === fn) bridgesRef.current.scrollToMessage = null;
 				};
 			},
-			scrollToMessage: (messageId) => bridgesRef.current.scrollToMessage?.(messageId),
+			scrollToMessage: (messageId, options) =>
+				bridgesRef.current.scrollToMessage?.(messageId, options),
 			registerSubmitToNarrator: (fn) => {
 				bridgesRef.current.submitToNarrator = fn;
 				return () => {

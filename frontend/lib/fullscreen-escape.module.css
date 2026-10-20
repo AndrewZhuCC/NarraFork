@@ -1,0 +1,25 @@
+/*
+ * position: fixed 的全屏浮层(全屏编辑器)必须相对视口定位并参与根层叠上下文排序,
+ * 但祖先上的 isolation: isolate、transform、contain、z-index 等会把后代困在面板级
+ * 层叠上下文/包含块里 —— 浮层随即画在 AppShell 的导航栏/顶栏之下(z-index 再高也无用,
+ * 层叠上下文内的 z-index 出不来),或被重定基到面板区域。
+ *
+ * useFullscreenEscape 在全屏期间给产生这些效果的祖先打上本类中和它们;
+ * !important 用于压过内联样式(如 Mantine style 属性里的 isolation: "isolate")。
+ * 只在中和,不改布局:全屏本身用 box-shadow 遮罩盖住整个视口,祖先期间的绘制差异不可见。
+ *
+ * 注意 opacity < 1、position: fixed/sticky 这类中和会改变视觉/布局的来源不在此列,
+ * hook 也不会标记它们(面板祖先链上不存在这种形态)。
+ */
+.escape {
+	isolation: auto !important;
+	transform: none !important;
+	filter: none !important;
+	backdrop-filter: none !important;
+	perspective: none !important;
+	contain: none !important;
+	content-visibility: visible !important;
+	container-type: normal !important;
+	will-change: auto !important;
+	z-index: auto !important;
+}

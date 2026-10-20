@@ -849,6 +849,88 @@ test("fullscreen Escape dismisses completion before closing the editor", async (
 	}
 });
 
+test("fullscreen Enter only newlines; mod+Enter sends", async () => {
+	const page = await open();
+	try {
+		await loadDocument(page, textDocument("hello"));
+		await page.click('[role="textbox"]');
+		await page.keyboard.press("Enter");
+		await settle(page);
+		// 非全屏基线:Enter 发送。
+		expect((await snapshot(page)).sends).toBe(1);
+		await page.click("button:has(svg.tabler-icon-arrows-maximize)");
+		await settle(page);
+		await page.click('[role="textbox"]');
+		// 全屏:Enter 与 Shift+Enter 都只换行。
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(1);
+		expect((await snapshot(page)).text).toContain("\n");
+		await page.keyboard.down("Shift");
+		await page.keyboard.press("Enter");
+		await page.keyboard.up("Shift");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(1);
+		// mod+Enter 仍然发送。
+		await page.keyboard.down("Control");
+		await page.keyboard.press("Enter");
+		await page.keyboard.up("Control");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(2);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("fullscreen escapes an isolate ancestor and paints above app chrome", async () => {
+	const page = await open();
+	try {
+		// 复刻生产结构:面板容器 isolation: isolate(AppShell Main/路由页),加上一条
+		// z-index 100 的视口级 chrome(导航栏/顶栏)。困在 isolate 里的浮层 z-index 再高
+		// 也画不到 chrome 上面 —— 这正是"全屏被导航挡住"的最小复现。
+		await page.evaluate(() => {
+			const panel = document.getElementById("panel");
+			if (!panel) throw new Error("Missing fixture panel");
+			panel.style.isolation = "isolate";
+			const chrome = document.createElement("div");
+			chrome.id = "fake-chrome";
+			Object.assign(chrome.style, {
+				position: "fixed",
+				inset: "0 0 auto 0",
+				height: "120px",
+				zIndex: "100",
+				background: "red",
+			});
+			document.body.append(chrome);
+		});
+		await page.click("button:has(svg.tabler-icon-arrows-maximize)");
+		await settle(page);
+		const open1 = await page.evaluate(() => {
+			const panel = document.getElementById("panel");
+			if (!panel) throw new Error("Missing fixture panel");
+			const hit = document.elementFromPoint(window.innerWidth / 2, 40);
+			return {
+				hit: hit?.closest('[role="dialog"]') ? "dialog" : (hit?.id ?? hit?.tagName ?? null),
+				isolation: getComputedStyle(panel).isolation,
+			};
+		});
+		expect(open1.hit).toBe("dialog");
+		expect(open1.isolation).toBe("auto");
+		// 退出全屏后祖先样式恢复。
+		await page.keyboard.press("Escape");
+		await settle(page);
+		expect(
+			await page.evaluate(() => {
+				const panel = document.getElementById("panel");
+				if (!panel) throw new Error("Missing fixture panel");
+				return getComputedStyle(panel).isolation;
+			}),
+		).toBe("isolate");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
 function nodeCount(doc: ComposerDocument | undefined, type: string) {
 	return (
 		doc?.paragraphs.flatMap((paragraph) => paragraph.children).filter((node) => node.type === type)
@@ -1173,14 +1255,18 @@ async function layoutSnapshot(page: Page) {
 		const root = document.querySelector<HTMLElement>("[data-inline-composer]");
 		const textbox = root?.querySelector<HTMLElement>('[role="textbox"]');
 		if (!root || !textbox) throw new Error("Missing input");
+		const frame = root.getBoundingClientRect();
+		const controls = root.querySelector("[data-composer-controls]")?.getBoundingClientRect();
 		return {
 			mode: root.dataset.layout,
-			height: root.getBoundingClientRect().height,
+			height: frame.height,
 			target: Number.parseFloat(root.style.height),
 			width: root.clientWidth,
 			scrollWidth: root.scrollWidth,
 			contentHeight:
 				root.querySelector("[data-composer-scroll]")?.getBoundingClientRect().height ?? 0,
+			controlGapAbove: controls ? controls.top - frame.top : Number.NaN,
+			controlGapBelow: controls ? frame.bottom - controls.bottom : Number.NaN,
 			placeholder: getComputedStyle(textbox, "::before").content,
 			focused: root.ownerDocument.activeElement === textbox,
 		};
@@ -1204,6 +1290,8 @@ test("empty, short text and regular chips use a compact single line; long conten
 		const empty = await layoutSnapshot(page);
 		expect(empty.mode).toBe("compact");
 		expect(empty.height).toBeLessThanOrEqual(54);
+		// Single-line controls keep symmetric vertical gaps (8px above and below).
+		expect(Math.abs(empty.controlGapAbove - empty.controlGapBelow)).toBeLessThanOrEqual(1);
 		for (const doc of [
 			shortLayoutDocument,
 			{
@@ -1948,3 +2036,50 @@ for (const input of ["mouse", "touch"] as const)
 			await close(page);
 		}
 	});
+test("a quote chip click opens its full text; the jump is an explicit button", async () => {
+	const page = await open();
+	const text = "Intro **bold** line\n\n```ts\nconst answer = 42;\n```";
+	try {
+		await loadDocument(page, {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "Ask " },
+						{
+							type: "quote",
+							id: "q-detail",
+							label: "Intro bold line",
+							text,
+							anchor: "m:message-source",
+						},
+					],
+				},
+			],
+		});
+		await page.click('[data-composer-atom="quote"] > button');
+		await page.waitForSelector("[data-quote-detail-body]", { visible: true });
+		const body = await page.$eval("[data-quote-detail-body]", (node) => ({
+			text: node.textContent ?? "",
+			bold: node.querySelector("strong")?.textContent,
+			code: !!node.querySelector("pre, code"),
+		}));
+		expect(body.text).toContain("const answer = 42;");
+		expect(body.bold).toBe("bold");
+		expect(body.code).toBe(true);
+		// Opening the detail neither jumped away nor touched the draft.
+		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);
+		expect(
+			await page.$eval(
+				"[data-quote-detail-jump]",
+				(button) => (button as HTMLButtonElement).disabled,
+			),
+		).toBe(false);
+		await page.click("[data-quote-detail-jump]");
+		await page.waitForSelector("[data-quote-detail-body]", { hidden: true });
+		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);
+	} finally {
+		await close(page);
+	}
+});

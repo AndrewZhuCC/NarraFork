@@ -1263,6 +1263,67 @@ test("single-line height remains content-driven for images and wrapped text", as
 	}
 });
 
+test("chips keep tappable gaps on narrow rows instead of filling the whole width", async () => {
+	const page = await open();
+	try {
+		await page.setViewport({ width: 280, height: 800 });
+		await load(page, {
+			...empty,
+			paragraphs: [
+				{
+					children: [
+						{
+							type: "quote",
+							id: "wide",
+							label: "A very long quote label that would fill a narrow row completely",
+							text: "source",
+						},
+					],
+				},
+			],
+		});
+		const wide = await page.evaluate(() => {
+			const editor = document.querySelector<HTMLElement>('[role="textbox"]');
+			const atom = document.querySelector<HTMLElement>("[data-composer-atom]");
+			if (!editor || !atom) throw new Error("Missing chip");
+			const style = getComputedStyle(editor);
+			const contentRight =
+				editor.getBoundingClientRect().right - Number.parseFloat(style.paddingRight);
+			const rect = atom.getBoundingClientRect();
+			return {
+				trailingGap: contentRight - rect.right,
+				margin: Number.parseFloat(getComputedStyle(atom).marginRight),
+			};
+		});
+		// 32px max-width reserve minus the 4px margin: the row end always stays tappable.
+		expect(wide.trailingGap).toBeGreaterThanOrEqual(27);
+		expect(wide.margin).toBe(4);
+		// Adjacent chips keep an 8px gutter (4px margin on each side).
+		await load(page, {
+			...empty,
+			paragraphs: [
+				{
+					children: [
+						{ type: "quote", id: "a", label: "A", text: "a" },
+						{ type: "quote", id: "b", label: "B", text: "b" },
+					],
+				},
+			],
+		});
+		const gutter = await page.evaluate(() => {
+			const atoms = [...document.querySelectorAll<HTMLElement>("[data-composer-atom]")];
+			if (atoms.length < 2) throw new Error("Missing chips");
+			const first = atoms[0].getBoundingClientRect();
+			const second = atoms[1].getBoundingClientRect();
+			if (Math.abs(first.top - second.top) > 1) throw new Error("Chips must share a row");
+			return second.left - first.right;
+		});
+		expect(Math.abs(gutter - 8)).toBeLessThan(0.1);
+	} finally {
+		await close(page);
+	}
+});
+
 test("placeholder follows the real document, including restored trailing newlines and atoms", async () => {
 	const page = await open();
 	try {
@@ -1323,8 +1384,9 @@ const previewDocument: ComposerDocument = {
 		{ id: "text-1", kind: "textFile", name: "notes.txt", size: 20, mimeType: "text/plain" },
 	],
 };
+const quoteBody = '[data-composer-atom="quote"] > button';
 const previewBodies = [
-	'[data-composer-atom="quote"] > button',
+	quoteBody,
 	'[data-composer-atom="fileReference"] > button',
 	'[data-composer-asset-id="image-1"] > button',
 	'[data-composer-asset-id="text-1"] > button',
@@ -1340,7 +1402,7 @@ async function loadPreviews(page: Page) {
 	await settle(page);
 }
 
-test("chip bodies select on mouse click, preview once on double click or keyboard; close never opens", async () => {
+test("chip bodies select on mouse click (quotes also open), preview once on double click or keyboard; close never opens", async () => {
 	const page = await open();
 	try {
 		await loadPreviews(page);
@@ -1350,6 +1412,8 @@ test("chip bodies select on mouse click, preview once on double click or keyboar
 				await page.$eval(selector, (body) => body.parentElement?.querySelectorAll("button").length),
 			).toBe(2);
 			await page.click(selector);
+			// A quote chip opens its detail on a single click; other atoms only select.
+			if (selector === quoteBody) opened++;
 			expect((await snapshot(page)).opened).toBe(opened);
 			expect((await snapshot(page)).nativeSelection.type).toBe("node");
 			await page.click(selector, { clickCount: 2 });
@@ -1387,6 +1451,7 @@ test("touch taps preview once on a hybrid device while mouse keeps single-click 
 			await page.touchscreen.tap(point.x, point.y);
 			expect((await snapshot(page)).opened).toBe(++opened);
 			await page.click(selector);
+			if (selector === quoteBody) opened++;
 			expect((await snapshot(page)).opened).toBe(opened);
 			await page.click(selector, { clickCount: 2 });
 			expect((await snapshot(page)).opened).toBe(++opened);

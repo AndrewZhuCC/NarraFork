@@ -138,7 +138,9 @@ export function revealComposerQuote(
 ) {
 	const anchor = quote.anchor;
 	if (!anchor) return;
-	dock?.scrollToMessage?.(anchor.slice(2));
+	// The excerpt picks which of the message's rows to land on: the one showing it,
+	// not the thinking / tool rows that share the message id above it.
+	dock?.scrollToMessage?.(anchor.slice(2), { needle: quoteHighlightNeedle(quote.text) });
 	const panel = quoteJumpPanel(source);
 	if (!panel) return;
 	clearTimeout(highlightTimer);

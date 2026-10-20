@@ -23,6 +23,11 @@ export function editorWorkerSpecifierCandidates(
 	);
 }
 const WORKER_READY_TIMEOUT_MS = 5_000;
+// One running task per user; a user's extra windows queue behind it and can never
+// take the whole queue from other users. Remote saves are mostly network wait.
+const IO_ACTIVE = 4;
+const IO_QUEUE = 32;
+const IO_USER_QUEUE = 2;
 
 type Permit = { userId: string; signal: AbortSignal };
 type Waiting = { userId: string; start(): void; cancel(): void };
@@ -109,7 +114,10 @@ export class EditorDocumentJobs {
 		if (inherited?.userId === userId)
 			return body(external ? AbortSignal.any([external, inherited.signal]) : inherited.signal);
 		if (external?.aborted) return Promise.reject(external.reason);
-		if (this.queue.length >= 8)
+		if (
+			this.queue.length >= IO_QUEUE ||
+			this.queue.filter((entry) => entry.userId === userId).length >= IO_USER_QUEUE
+		)
 			return Promise.reject(new AppError("Editor IO queue is full", 429, "EDITOR_BUSY"));
 		return new Promise<T>((resolve, reject) => {
 			const controller = new AbortController();
@@ -153,7 +161,7 @@ export class EditorDocumentJobs {
 		});
 	}
 	private pump() {
-		while (this.active.size < 2) {
+		while (this.active.size < IO_ACTIVE) {
 			const index = this.queue.findIndex((entry) => !this.active.has(entry.userId));
 			if (index < 0) return;
 			this.queue.splice(index, 1)[0].start();
