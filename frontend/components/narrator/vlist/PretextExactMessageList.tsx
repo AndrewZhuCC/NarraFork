@@ -4549,10 +4549,12 @@ export const PretextExactMessageList = memo(
 					domIds,
 					targetIds,
 					highlightId,
+					needle,
 				}: {
 					domIds: string[];
 					targetIds: string[];
 					highlightId?: string;
+					needle?: string;
 				}) => {
 					// One jump at a time. A second jump (another search hit clicked while the
 					// first is still paging through history) invalidates the first, which must
@@ -4570,7 +4572,7 @@ export const PretextExactMessageList = memo(
 					const revealMounted = () => {
 						const node = viewportRef.current;
 						if (!node) return false;
-						const element = mountedJumpTarget(node, domIds, targetIds);
+						const element = mountedJumpTarget(node, domIds, targetIds, { needle });
 						if (!element) return false;
 						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
@@ -4593,22 +4595,31 @@ export const PretextExactMessageList = memo(
 							if (!index || !node) return false;
 							const itemIndex = jumpTargetItemIndex(index, messageId);
 							if (itemIndex == null) continue;
-							const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
-							interactionAdmissionRef.current?.markHistoryIntent();
-							pinnedToBottomRef.current = false;
-							visibleViewportRef.current.setPinned(false);
-							setPinnedToBottom(false);
-							writeScrollTop(targetTop);
-							await waitAnimationFrame();
-							if (cancelled()) return false;
+							// Already mounted: reveal in place, no intermediate scroll write.
+							const itemKey = index.manifest.items[itemIndex]?.itemKey;
+							const mounted =
+								itemKey &&
+								node.querySelector(`[data-nf-row-key="${CSS.escape(itemKey)}"]`) !== null;
+							if (!mounted) {
+								const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+								interactionAdmissionRef.current?.markHistoryIntent();
+								pinnedToBottomRef.current = false;
+								visibleViewportRef.current.setPinned(false);
+								setPinnedToBottom(false);
+								writeScrollTop(targetTop);
+								await waitAnimationFrame();
+								if (cancelled()) return false;
+							}
 							if (revealMounted()) return true;
 						}
 						return false;
 					};
-					if (revealMounted()) return true;
+					// Layout first: it knows which of the message's rows is its prose even
+					// when only an earlier thinking / tool row of it is mounted.
 					const localIds = targetIds.map(messageIdFromTarget);
 					if (await revealByLayout(localIds)) return true;
 					if (cancelled()) return false;
+					if (revealMounted()) return true;
 
 					// Not in the loaded window.
 					//

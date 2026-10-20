@@ -318,7 +318,8 @@ describe("editor providers with independent history", () => {
 						lexicalPath: path,
 						canonicalPath: path,
 						signal: new AbortController().signal,
-						input: { digest, snapshotRevision: 1 },
+						// Remote editor saves are raw-v2 and carry their exact snapshot revision.
+						input: { digest, hashKind: "raw-sha256", snapshotRevision: 1 },
 						authorize: async () => {},
 						remote: {
 							backend,
@@ -333,7 +334,7 @@ describe("editor providers with independent history", () => {
 							deviceId: backend.deviceId,
 							read: async (target) => {
 								expect(target).toBe(path);
-								if (++reads % 2 === 0) throw new Error("remote observation unavailable");
+								reads++;
 								return { bytes: Buffer.from("old"), mode: 0o644, identity: "remote-object" };
 							},
 							apply: async (input) => {
@@ -368,6 +369,8 @@ describe("editor providers with independent history", () => {
 				expect(await run()).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
 				expect(await run()).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
 				expect(writes).toBe(2);
+				// The committed receipt is the proof: only the before read, never an after re-read.
+				expect(reads).toBe(2);
 				expect(parentChecks).toBeGreaterThan(0);
 				expect(hostFootprint).not.toHaveBeenCalled();
 				expect(hostRead).not.toHaveBeenCalled();

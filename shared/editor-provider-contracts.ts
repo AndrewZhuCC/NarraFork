@@ -13,10 +13,7 @@
  */
 
 export interface EditorProviderCapabilities {
-	readonly writeUnavailableReason?:
-		| "verified_helper_unavailable"
-		| "durable_executor_unavailable"
-		| "host_receipt_storage_unavailable";
+	readonly writeUnavailableReason?: "durable_executor_unavailable";
 	/** Bounded, identity-verified read of the complete current source (never truncated). */
 	readonly boundedRead: boolean;
 	/** Existing v1 upload/commit save. Not a durable/atomic apply. */
@@ -133,7 +130,8 @@ export interface EditorStageOpen extends EditorWriteOwner {
 	readonly maxBytes: number;
 	readonly idleTimeoutMs: number;
 }
-/** Private, resource-bound handle. Requests never name a staging path. */
+/** Private resource-bound handle for one executor incarnation, including after seal.
+ * Restart invalidates undispatched stages; it never permits replaying a dispatched operation. */
 export interface EditorStageHandle {
 	readonly stageId: string;
 	readonly resourceKey: string;
@@ -179,7 +177,7 @@ export interface EditorApplyResult {
 	readonly error?: { readonly code: string; readonly message: string };
 }
 export interface EditorQueryRequest extends EditorWriteOwner {
-	/** Host has durably received the terminal proof; permits bounded terminal retention. */
+	/** Host holds the terminal proof as its real outcome; permits bounded terminal retention. */
 	readonly acknowledgeTerminal?: boolean;
 	readonly operationId: string;
 	readonly requestDigest: string;
@@ -201,54 +199,6 @@ export interface EditorQueryResult {
 
 /** A new writer must negotiate actual target-queue ownership, not legacy persistent fences. */
 export const EDITOR_TARGET_QUEUE_FEATURE = "editor.target-queue.v1";
-
-/** Host-only bounded recovery metadata; stdio bootstrap fixes its private directory.
- * These methods are intentionally unavailable to remote WebSocket RPC clients. */
-interface EditorHostReceiptFields {
-	createdAt: number;
-	userId: string;
-	narratorId: string;
-	deviceId: string;
-	operationId: string;
-	saved: { hash: string; bytes: number; snapshotRevision: number; hashKind?: "raw-sha256" };
-	requestDigest: string;
-	namespace: string;
-	resourceKey: string;
-	root: string;
-	identity: EditorResourceIdentity;
-	rawDigest: string;
-	bytes: number;
-	receipt?: EditorApplyResult;
-}
-/** Read-only legacy recovery. New dispatch never invents these retired lease fields. */
-export interface EditorLegacyHostReceiptRecord extends EditorHostReceiptFields {
-	version: 1;
-	hostOperationId: string;
-	leaseId: string;
-	effectId: string;
-}
-export interface EditorCurrentHostReceiptRecord extends EditorHostReceiptFields {
-	version: 2;
-	/** Optional history association; its absence never changes a provider's real result. */
-	historyOperationId?: string;
-}
-export type EditorHostReceiptRecord =
-	| EditorLegacyHostReceiptRecord
-	| EditorCurrentHostReceiptRecord;
-// Native Host store H3 (VALUE): authoritative shape; earlier RECORD proposals are not wire contracts.
-export interface EditorHostReceiptPut {
-	value: EditorHostReceiptRecord;
-}
-export interface EditorHostReceiptGet {
-	operationId: string;
-}
-export interface EditorHostReceiptValue {
-	value: EditorHostReceiptRecord | null;
-}
-export interface EditorHostReceiptSettle {
-	operationId: string;
-	receipt: EditorApplyResult;
-}
 
 // ── Phase 9: watch ───────────────────────────────────────────────────────────
 

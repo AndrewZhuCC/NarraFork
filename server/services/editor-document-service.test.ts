@@ -1466,6 +1466,38 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		);
 		expect((await create()).encoding).toBe("utf-16le");
 	});
+	test("remote live commit and pre-dispatch failure answer from cache; terminal saves reconcile", async () => {
+		const queried: string[] = [];
+		await service.dispose();
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: (request) => runtime.executeEditor(request),
+			queryOperation: async (_actor, operationId) => {
+				queried.push(operationId);
+				return { status: "saved", operationId };
+			},
+		});
+		actor.authorizeOperation = async () => {};
+		await service.operation(actor, "warm-up").catch(() => {});
+		queried.length = 0;
+		const operations = Reflect.get(service, "operations") as Map<string, unknown>;
+		const seed = (operationId: string, status: "committing" | "failed" | "saved") =>
+			operations.set(operationId, {
+				deviceId: "remote-device",
+				userId: actor.userId,
+				narratorId: actor.narratorId,
+				value: { status, operationId },
+				expires: Date.now() + 60_000,
+			});
+		seed("live", "committing");
+		seed("stale", "failed");
+		seed("settled", "saved");
+		expect((await service.operation(actor, "live")).status).toBe("committing");
+		expect((await service.operation(actor, "stale")).status).toBe("failed");
+		expect((await service.operation(actor, "settled")).status).toBe("saved");
+		expect(queried).toEqual(["settled"]);
+		operations.clear();
+	});
 	test("restart recovery combines bounded metadata with the real settled receipt", async () => {
 		const doc = await create(),
 			id = await upload(doc, "persisted\n");
@@ -1829,7 +1861,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		});
 		expect(Reflect.get(jobs, "transfers")).toBe(0);
 	});
-	test("IO admission bounds complete commits to two globally and one per user", async () => {
+	test("IO admission runs four users at once, one task each, and caps each user's queue", async () => {
 		const jobs = new EditorDocumentJobs(),
 			release = deferred();
 		const active = new Set<string>();
@@ -1842,13 +1874,14 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 				await release.promise;
 				active.delete(user);
 			});
-		const a = work("a"),
-			b = work("b");
-		const queued = Array.from({ length: 8 }, (_, i) => work(i % 2 ? "a" : "c"));
-		await expect(work("extra")).rejects.toThrow("queue is full");
+		const running = ["a", "b", "c", "d", "e"].map(work);
+		// One user's extra windows queue behind its own task and cannot starve others.
+		const queued = [work("a"), work("a")];
+		await expect(work("a")).rejects.toThrow("queue is full");
+		const other = work("f");
 		release.resolve();
-		await Promise.all([a, b, ...queued]);
-		expect(peak).toBe(2);
+		await Promise.all([...running, ...queued, other]);
+		expect(peak).toBe(4);
 	});
 	test("startup retains oversize and malformed descriptions without claiming recovery receipts", async () => {
 		const jobs = new EditorDocumentJobs(),

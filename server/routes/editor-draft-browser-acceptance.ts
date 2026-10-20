@@ -9,6 +9,7 @@ export async function editorDraftBrowserAcceptance(
 	fixture: {
 		path: string;
 		origin: string;
+		signal: AbortSignal;
 		original: string;
 		downloadDirectory: string;
 		writeDisk(text: string): Promise<void>;
@@ -109,64 +110,56 @@ export async function editorDraftBrowserAcceptance(
 			window.__editorCache.snapshot().drafts.queued === 0,
 	);
 	// Crash the fixture renderer, NOT the host/agent server. No unload checkpoint is assumed.
+	fixture.signal.throwIfAborted();
 	const session = await page.createCDPSession();
-	const crashStarted = performance.now();
-	const crashDiagnostics: { event: string; ms: number; error?: string }[] = [];
-	const recordCrash = (event: string, error?: unknown) => {
-		if (crashDiagnostics.length < 10)
-			crashDiagnostics.push({
-				event,
-				ms: Math.round(performance.now() - crashStarted),
-				// These are controlled CDP command errors, never document content or URLs.
-				...(error === undefined ? {} : { error: String(error).slice(0, 240) }),
-			});
-	};
-	let observedCrash!: () => void;
-	const crashed = new Promise<void>((resolve) => {
-		observedCrash = resolve;
-	});
-	let observing = true;
+	const crashed = Promise.withResolvers<void>();
+	let active = true;
 	const onTargetCrashed = () => {
-		recordCrash("Inspector.targetCrashed");
-		if (observing && performance.now() - crashStarted <= 5000) observedCrash();
+		active = false;
+		console.info("EDITOR_DRAFT_RENDERER_CRASH_CONFIRMED");
+		crashed.resolve();
 	};
-	// Puppeteer's primary session is diagnostic only; success requires our enabled session.
-	const onPageError = () => recordCrash("page.error");
+	const onAbort = () => crashed.reject(fixture.signal.reason);
 	session.on("Inspector.targetCrashed", onTargetCrashed);
-	page.on("error", onPageError);
-	let crashTimeout: ReturnType<typeof setTimeout> | undefined;
+	fixture.signal.addEventListener("abort", onAbort, { once: true });
 	try {
+		fixture.signal.throwIfAborted();
+		// Crash notification and recovery share the existing overall work budget.
 		await Promise.race([
-			new Promise<never>((_, reject) => {
-				crashTimeout = setTimeout(
-					() => reject(new Error("Renderer did not crash")),
-					Math.max(0, 5000 - (performance.now() - crashStarted)),
-				);
-			}),
+			crashed.promise,
 			(async () => {
-				// Preparation and injection share the original five-second observation window.
 				await session.send("Inspector.enable");
-				recordCrash("Inspector.enabled");
-				if (!observing || performance.now() - crashStarted > 5000) return await crashed;
-				recordCrash("Page.crash.sent");
-				void session.send("Page.crash").then(
-					() => recordCrash("Page.crash.resolved"),
-					(error) => recordCrash("Page.crash.rejected", error),
-				);
-				await crashed;
+				fixture.signal.throwIfAborted();
+				if (!active) return;
+				const browserPid = page.browser().process()?.pid;
+				const connection = session.connection();
+				if (!browserPid || !connection) throw new Error("Expected fixture-owned Chrome");
+				const { processInfo } = await connection.send("SystemInfo.getProcessInfo");
+				fixture.signal.throwIfAborted();
+				if (!active) return;
+				const pids = processInfo.filter((info) => info.type === "renderer").map((info) => info.id);
+				if (
+					pids.length < 1 ||
+					pids.length > 8 ||
+					pids.some(
+						(pid) =>
+							!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || pid === browserPid,
+					)
+				)
+					throw new Error("Invalid fixture renderer process set");
+				console.info("EDITOR_DRAFT_RENDERER_TERMINATION", { rendererCount: pids.length });
+				for (const pid of pids) process.kill(pid, "SIGKILL");
+				await crashed.promise;
 			})(),
 		]);
 	} catch (error) {
-		throw new Error(`Renderer crash observation failed: ${JSON.stringify(crashDiagnostics)}`, {
-			cause: error,
-		});
+		throw new Error("Renderer crash was not confirmed", { cause: error });
 	} finally {
-		observing = false;
-		clearTimeout(crashTimeout);
+		active = false;
 		session.off("Inspector.targetCrashed", onTargetCrashed);
-		page.off("error", onPageError);
-		await session.detach().catch((error) => recordCrash("session.detach.rejected", error));
-		console.info("[editor-renderer-crash]", JSON.stringify(crashDiagnostics));
+		fixture.signal.removeEventListener("abort", onAbort);
+		// Overall-budget teardown may already have detached this session.
+		await session.detach().catch(() => {});
 	}
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await ready();

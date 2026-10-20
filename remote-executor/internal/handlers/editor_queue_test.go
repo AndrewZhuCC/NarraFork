@@ -304,7 +304,7 @@ func TestEditorLegacyApplyRejectedWhileHistoricalReceiptRemainsQueryable(t *test
 	}
 	raw, size := editorDigest([]byte("after")), int64(5)
 	encoded, _ := json.Marshal(req)
-	receipt := editorReceipt{Version: 1, Request: req, Fingerprint: editorDigest(encoded), State: "committed", Result: &EditorApplyResult{OperationID: req.OperationID, Outcome: "committed", RawDigest: &raw, TotalBytes: &size}}
+	receipt := editorReceipt{Version: 1, Request: req, Fingerprint: editorDigest(encoded), State: "committed", Result: &EditorApplyResult{OperationID: req.OperationID, Outcome: "committed", RawDigest: &raw, TotalBytes: &size}, StageRawDigest: raw, StageBytes: size}
 	if err := f.e.save(f.e.receiptPath(req.Namespace, req.OperationID), receipt); err != nil {
 		t.Fatal(err)
 	}

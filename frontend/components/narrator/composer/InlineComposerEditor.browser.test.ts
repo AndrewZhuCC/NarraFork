@@ -1384,8 +1384,9 @@ const previewDocument: ComposerDocument = {
 		{ id: "text-1", kind: "textFile", name: "notes.txt", size: 20, mimeType: "text/plain" },
 	],
 };
+const quoteBody = '[data-composer-atom="quote"] > button';
 const previewBodies = [
-	'[data-composer-atom="quote"] > button',
+	quoteBody,
 	'[data-composer-atom="fileReference"] > button',
 	'[data-composer-asset-id="image-1"] > button',
 	'[data-composer-asset-id="text-1"] > button',
@@ -1401,7 +1402,7 @@ async function loadPreviews(page: Page) {
 	await settle(page);
 }
 
-test("chip bodies select on mouse click, preview once on double click or keyboard; close never opens", async () => {
+test("chip bodies select on mouse click (quotes also open), preview once on double click or keyboard; close never opens", async () => {
 	const page = await open();
 	try {
 		await loadPreviews(page);
@@ -1411,6 +1412,8 @@ test("chip bodies select on mouse click, preview once on double click or keyboar
 				await page.$eval(selector, (body) => body.parentElement?.querySelectorAll("button").length),
 			).toBe(2);
 			await page.click(selector);
+			// A quote chip opens its detail on a single click; other atoms only select.
+			if (selector === quoteBody) opened++;
 			expect((await snapshot(page)).opened).toBe(opened);
 			expect((await snapshot(page)).nativeSelection.type).toBe("node");
 			await page.click(selector, { clickCount: 2 });
@@ -1448,6 +1451,7 @@ test("touch taps preview once on a hybrid device while mouse keeps single-click 
 			await page.touchscreen.tap(point.x, point.y);
 			expect((await snapshot(page)).opened).toBe(++opened);
 			await page.click(selector);
+			if (selector === quoteBody) opened++;
 			expect((await snapshot(page)).opened).toBe(opened);
 			await page.click(selector, { clickCount: 2 });
 			expect((await snapshot(page)).opened).toBe(++opened);

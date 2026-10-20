@@ -56,6 +56,8 @@ export interface BeginFileChangeOperation {
 	attempt: number;
 	requestDigest: string;
 	expectedEffectCount: number;
+	/** Editor raw-v2 save only: the snapshot revision returned on recovery. */
+	editorRawSnapshotRevision?: number | null;
 	actor: FileChangeActor;
 	/** Historical routing metadata, never a write permit. */
 	executionBinding?: FileChangeExecutionBinding | null;
@@ -393,6 +395,27 @@ export class FileChangeEvidenceService {
 				.get() ?? null
 		);
 	}
+
+	/** Unique installation/editor/request/attempt lookup; never a journal scan. */
+	getEditorOperation(sourceInstanceId: string, sourceId: string): FileChangeOperationRecord | null {
+		assertString(sourceInstanceId, "sourceInstanceId");
+		assertString(sourceId, "sourceId");
+		return (
+			this.database
+				.select()
+				.from(fileChangeOperations)
+				.where(
+					and(
+						eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
+						eq(fileChangeOperations.sourceKind, "editor"),
+						eq(fileChangeOperations.sourceId, sourceId),
+						eq(fileChangeOperations.attempt, 1),
+					),
+				)
+				.get() ?? null
+		);
+	}
+
 	getEffect(operationId: string, mutationId: string): FileChangeEffectRecord | null {
 		assertString(operationId, "operationId");
 		assertString(mutationId, "mutationId");
@@ -637,6 +660,12 @@ function normalizeOperation(input: BeginFileChangeOperation) {
 		1,
 		FILE_CHANGE_LIMITS.revertFiles,
 	);
+	const revision = input.editorRawSnapshotRevision ?? null;
+	if (revision !== null) {
+		assertInteger(revision, "editorRawSnapshotRevision", 0, Number.MAX_SAFE_INTEGER);
+		if (input.sourceKind !== "editor")
+			throw fail("INVALID_INPUT", "Only an editor save records a raw snapshot revision");
+	}
 	return boundedRecord({
 		evidenceVersion: FILE_CHANGE_EVIDENCE_VERSION,
 		sourceInstanceId: input.sourceInstanceId,
@@ -645,6 +674,9 @@ function normalizeOperation(input: BeginFileChangeOperation) {
 		attempt: input.attempt,
 		requestDigest: input.requestDigest,
 		expectedEffectCount: input.expectedEffectCount,
+		// Published column, retired meaning: the per-file queue has no lease to record.
+		workspaceLeaseId: null,
+		editorRawSnapshotRevision: revision,
 		actorSubjectKey: input.actor.subjectKey,
 		actorJson: normalizeActor(input.actor),
 		executionBindingJson:

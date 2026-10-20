@@ -107,53 +107,6 @@ function shell(script: string, env: Record<string, string> = {}, cwd?: string) {
 	);
 }
 
-// All kernel-policy commands below are strict shell functions: never call host sudo/sysctl/ulimit.
-const corePolicyStubs = `
-test_original_core_pattern='|/usr/lib/systemd/systemd-coredump %P %u'
-test_core_pattern="$test_original_core_pattern"
-test_core_soft=8192
-sysctl() {
-  if [[ "$#" == 2 && "$1" == -n && "$2" == kernel.core_pattern ]]; then
-    printf '%s\\n' "$test_core_pattern"
-  elif [[ "$#" == 3 && "$1" == -q && "$2" == -w && "$3" == kernel.core_pattern=core ]]; then
-    test_core_pattern=core
-    printf 'STUB set core_pattern=core\\n' >&2
-  elif [[ "$#" == 3 && "$1" == -q && "$2" == -w && "$3" == "kernel.core_pattern=$test_original_core_pattern" ]]; then
-    printf 'STUB restore core_pattern=%s\\n' "$test_original_core_pattern" >&2
-    if [[ "\${CORE_RESTORE_FAIL:-0}" == 1 ]]; then return 31; fi
-    test_core_pattern="$test_original_core_pattern"
-  else
-    printf 'Unexpected sysctl arguments\\n' >&2
-    return 99
-  fi
-}
-sudo() {
-  if [[ "$#" == 4 && "$1" == sysctl ]]; then
-    shift
-    sysctl "$@"
-  else
-    printf 'Unexpected sudo arguments\\n' >&2
-    return 98
-  fi
-}
-ulimit() {
-  if [[ "$#" == 3 && "$1" == -S && "$2" == -c && "$3" == 0 ]]; then
-    test_core_soft=0
-  elif [[ "$#" == 2 && "$1" == -S && "$2" == -c ]]; then
-    printf '%s\\n' "$test_core_soft"
-  else
-    printf 'Unexpected ulimit arguments\\n' >&2
-    return 97
-  fi
-}
-`;
-
-const hostedCorePolicyEnv = {
-	CI_TEST_RUNNER_ENVIRONMENT: "github-hosted",
-	RUNNER_OS: "Linux",
-	CORE_RESTORE_FAIL: "0",
-};
-
 describe("generic CI workflow", () => {
 	test("runs for every PR, main push and manual dispatch without paths or branch exclusions", () => {
 		expect(Object.keys(workflow.on).sort()).toEqual([
@@ -531,9 +484,10 @@ describe("generic CI workflow", () => {
 
 	test("runs isolated sharded full discovery after preload verification and always publishes JUnit", () => {
 		const isolation = command("tests", "bun test --isolate tests/preload-isolation.test.ts");
-		const run = step("tests", (value) => value.name === "Run repository tests");
-		expect(run.env).toEqual({ CI_TEST_RUNNER_ENVIRONMENT: expression("runner.environment") });
-		expect(job("tests")).not.toHaveProperty("container");
+		const run = command(
+			"tests",
+			`bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${expression("matrix.shard")}/4 --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings --reporter=junit --reporter-outfile=artifacts/ci-tests.xml`,
+		);
 		expect(isolation.if).toBeUndefined();
 		expect(run.if).toBeUndefined();
 		expect(job("tests").steps.indexOf(isolation)).toBeLessThan(job("tests").steps.indexOf(run));
@@ -554,14 +508,10 @@ describe("generic CI workflow", () => {
 		// Render Actions expressions first: a shell substitution error is not test failure evidence.
 		for (const shard of [1, 2, 3, 4]) {
 			const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), String(shard));
-			const failure = shell(
-				`${corePolicyStubs}\nbun() { [[ "$test_core_pattern" == core && "$test_core_soft" == 0 ]] || return 94; printf '%s\\n' "$@"; return 23; }\n${rendered}`,
-				hostedCorePolicyEnv,
-			);
+			const failure = shell(`bun() { printf '%s\\n' "$@"; return 23; }\n${rendered}`);
 			expect(failure.error).toBeUndefined();
 			expect(failure.status).toBe(23);
 			expect(failure.stdout.trim().split("\n")).toEqual([
-				"Native test crash policy: core_pattern=core core_soft=0",
 				"scripts/run-ci-tests.ts",
 				"--isolate",
 				"--only-failures",
@@ -572,67 +522,14 @@ describe("generic CI workflow", () => {
 				"--reporter=junit",
 				"--reporter-outfile=artifacts/ci-tests.xml",
 			]);
-			expect(failure.stderr).toContain(
-				"STUB restore core_pattern=|/usr/lib/systemd/systemd-coredump %P %u",
-			);
-			const success = shell(
-				`${corePolicyStubs}\nbun() { [[ "$test_core_pattern" == core && "$test_core_soft" == 0 ]]; }\n${rendered}`,
-				hostedCorePolicyEnv,
-			);
+			const success = shell(`bun() { return 0; }\n${rendered}`);
 			expect(success.error).toBeUndefined();
 			expect(success.status).toBe(0);
-			expect(success.stderr).toContain(
-				"STUB restore core_pattern=|/usr/lib/systemd/systemd-coredump %P %u",
-			);
 		}
 		for (const value of job("tests").steps) {
 			expect(value.run ?? "").not.toMatch(
 				/PG_INTEGRATION|--retr(?:y|ies)|--bail|--path-ignore-patterns|--parallel(?![=]2(?:\s|$))|--concurrent|--no-isolate|--timeout|--(?:exclude|filter|test-name-pattern|rerun-each)/,
 			);
-		}
-	});
-
-	test("rejects non-hosted or non-Linux core policy before touching even the stubs", () => {
-		const run = step("tests", (value) => value.name === "Run repository tests");
-		const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), "1");
-		for (const env of [
-			{ ...hostedCorePolicyEnv, CI_TEST_RUNNER_ENVIRONMENT: "self-hosted" },
-			{ ...hostedCorePolicyEnv, RUNNER_OS: "Windows" },
-		]) {
-			const result = shell(`${corePolicyStubs}\nbun() { return 94; }\n${rendered}`, env);
-			expect(result.error).toBeUndefined();
-			expect(result.status).toBe(1);
-			expect(result.stdout).toBe("");
-			expect(result.stderr).toContain("Core policy requires a GitHub-hosted Linux VM");
-			expect(result.stderr).not.toContain("STUB");
-		}
-	});
-
-	test("core restoration failure cannot hide a native test failure or turn success green", () => {
-		const run = step("tests", (value) => value.name === "Run repository tests");
-		const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), "1");
-		for (const testExit of [0, 23]) {
-			const result = shell(
-				`${corePolicyStubs}\nbun() { [[ "$test_core_pattern" == core && "$test_core_soft" == 0 ]] || return 94; return ${testExit}; }\n${rendered}`,
-				{ ...hostedCorePolicyEnv, CORE_RESTORE_FAIL: "1" },
-			);
-			expect(result.error).toBeUndefined();
-			expect(result.status).toBe(testExit || 1);
-			expect(result.stderr).toContain(
-				"STUB restore core_pattern=|/usr/lib/systemd/systemd-coredump %P %u",
-			);
-			expect(result.stderr).toContain("Failed to restore runner core_pattern");
-		}
-		// Unknown options must fail inside the stubs, never fall through to host commands.
-		for (const [script, status] of [
-			["sysctl -w kernel.core_pattern=unknown", 99],
-			["sudo echo unknown", 98],
-			["ulimit -c unlimited", 97],
-		] as const) {
-			const result = shell(`${corePolicyStubs}\n${script}`, hostedCorePolicyEnv);
-			expect(result.error).toBeUndefined();
-			expect(result.status).toBe(status);
-			expect(result.stderr).toContain("Unexpected");
 		}
 	});
 

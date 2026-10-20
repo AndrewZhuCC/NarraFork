@@ -373,10 +373,15 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 					const type = (event.nativeEvent as PointerEvent).pointerType || start?.type;
 					if ((!type && event.detail === 0) || (start && !start.moved && type !== "mouse"))
 						preview();
-					else select();
+					else {
+						select();
+						// A quote chip opens its detail on a plain click; other atoms keep
+						// click-to-select and open on double-click.
+						if (value.type === "quote" && type === "mouse" && !start?.moved) preview();
+					}
 				}}
 				onDoubleClick={() => {
-					if (pointerType.current === "mouse") preview();
+					if (pointerType.current === "mouse" && value.type !== "quote") preview();
 				}}
 				onKeyDown={(event) => {
 					if (event.key === "Enter" || event.key === " ") {

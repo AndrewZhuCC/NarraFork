@@ -1,6 +1,6 @@
 {
-  "id": "d01b7310-b4c4-435c-9d93-2a2e7e0aae59",
-  "prevId": "db929d4c-7564-4214-8c8a-56f3465636eb",
+  "id": "99ad7e81-08d6-415e-85c1-b0a350926f04",
+  "prevId": "8b50bffe-308c-45db-9e1c-64c73f06c646",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -5194,6 +5194,18 @@
         "expected_effect_count": {
           "name": "expected_effect_count",
           "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "workspace_lease_id": {
+          "name": "workspace_lease_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "editor_raw_snapshot_revision": {
+          "name": "editor_raw_snapshot_revision",
+          "type": "double precision",
           "primaryKey": false,
           "notNull": false
         },

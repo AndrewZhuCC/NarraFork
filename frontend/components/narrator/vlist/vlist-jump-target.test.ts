@@ -15,12 +15,31 @@ import {
 	jumpTargetMessageId,
 	jumpTargetScrollTop,
 	mountedJumpTarget,
+	pickJumpRow,
 	resolveJumpTargetSeq,
 } from "./vlist-jump-target";
 
-// Minimal DOM surface: these tests need identity/scope, not browser layout.
+// Minimal DOM surface: these tests need identity/scope, not browser layout. An
+// array entry stands for several matches of one selector, in document order.
 function fakeRoot(entries: Record<string, unknown>): HTMLElement {
-	return { querySelector: (selector: string) => entries[selector] ?? null } as HTMLElement;
+	const all = (selector: string) => {
+		const entry = entries[selector];
+		return entry == null ? [] : Array.isArray(entry) ? entry : [entry];
+	};
+	return {
+		querySelector: (selector: string) => all(selector)[0] ?? null,
+		querySelectorAll: all,
+	} as unknown as HTMLElement;
+}
+
+// A mounted row: its kind and text, and itself as the closest row.
+function fakeRow(kind: string, text: string): HTMLElement {
+	const row = {
+		textContent: text,
+		getAttribute: (name: string) => (name === "data-nf-row-kind" ? kind : null),
+		closest: () => row,
+	};
+	return row as unknown as HTMLElement;
 }
 
 describe("exact Send row navigation", () => {
@@ -80,6 +99,74 @@ describe("exact Send row navigation", () => {
 		const row = {} as HTMLElement;
 		const root = fakeRoot({ '[id="msg-owner"]': { closest: () => row } });
 		expect(mountedJumpTarget(root, [], ["owner"])).toBe(row);
+	});
+});
+
+describe("multi-row message jumps", () => {
+	const originalCss = Object.getOwnPropertyDescriptor(globalThis, "CSS");
+	beforeAll(() => {
+		if (!originalCss) {
+			Object.defineProperty(globalThis, "CSS", {
+				configurable: true,
+				value: { escape: (value: string) => value },
+			});
+		}
+	});
+	afterAll(() => {
+		if (!originalCss) Reflect.deleteProperty(globalThis, "CSS");
+	});
+
+	// One assistant turn: thinking, a tool call, then the answer text. A preceding
+	// activity fold can also carry this message's id as an alias.
+	const thinking = fakeRow("reasoning", "Confirmed. Now summarize for the user:");
+	const tool = fakeRow("tool-call", "Bash verify the outcome");
+	const intro = fakeRow("markdown", "查清楚了。结论如下：");
+	const detail = fakeRow("markdown", "知识库通知故意不落 notifications 表");
+
+	it("lands on the message text, not the thinking / tool rows above it", () => {
+		const root = fakeRoot({ '[id="msg-m1"]': [thinking, tool, intro, detail] });
+		expect(mountedJumpTarget(root, ["msg-m1"], ["m1"])).toBe(intro);
+	});
+
+	it("lands on the row that shows the quoted text", () => {
+		const root = fakeRoot({ '[id="msg-m1"]': [thinking, tool, intro, detail] });
+		expect(
+			mountedJumpTarget(root, ["msg-m1"], ["m1"], { needle: "知识库通知故意不落notifications" }),
+		).toBe(detail);
+		// Line breaks / spacing in the excerpt do not defeat the match.
+		expect(pickJumpRow([thinking, intro, detail], "知识库通知\n故意不落  notifications 表")).toBe(
+			detail,
+		);
+	});
+
+	it("falls back to the first row when the message has only ancillary rows", () => {
+		expect(pickJumpRow([thinking, tool])).toBe(thinking);
+		expect(pickJumpRow([thinking, tool], "not on screen")).toBe(thinking);
+		expect(pickJumpRow([])).toBeNull();
+	});
+
+	it("layout lookup skips thinking / tool items of the message", () => {
+		const index = buildPretextLayoutIndex({
+			layoutRevision: "1",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: 800,
+			metrics: { topPadding: 0, itemGap: 4, bottomPadding: 0 },
+			items: [
+				["m1-b0", "reasoning"],
+				["tool-t1", "tool-call"],
+				["m1-b2", "markdown"],
+			].map(([itemKey, kind]) => ({
+				itemKey,
+				firstSeq: 10,
+				lastSeq: 10,
+				sourceMessageIds: ["m1"],
+				kind,
+				height: 100,
+			})),
+		});
+		expect(jumpTargetItemIndex(index, "m1")).toBe(2);
+		expect(jumpTargetItemIndex(index, "t1")).toBe(1);
 	});
 });
 

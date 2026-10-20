@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -43,17 +42,12 @@ func editorBinding(namespace, resource string) error {
 	}
 	return nil
 }
-
 func (e *EditorEngine) Capabilities() any {
 	features := []string{FeatureEditorDurableWriteV1, FeatureEditorTargetQueueV1}
-	if e.hostReceipts != nil {
-		features = append(features, FeatureEditorHostReceiptV1)
-	}
 	return map[string]any{"protocolVersion": 1, "features": features, "maxChunkBytes": e.chunkBytes, "maxBytes": EditorMaxBytes, "runtimeEpoch": e.epoch}
 }
 
-// Trusted bootstrap reserves selected state paths even if ACL/IO initialization
-// fails. A degraded writer must never expose old recovery evidence to legacy FS.
+// Reserve even failed initialization paths: old recovery evidence is never public.
 func (h *Handlers) ReserveEditorPrivateRoot(root string) error {
 	if !filepath.IsAbs(root) {
 		return fmt.Errorf("editor private directory must be absolute")
@@ -64,20 +58,15 @@ func (h *Handlers) ReserveEditorPrivateRoot(root string) error {
 	}
 	return nil
 }
-
 func (h *Handlers) SetEditorEngine(e *EditorEngine) {
 	if e != nil {
 		h.guard.protectPrivateRoot(e.root)
 		h.guard.protectPrivateRoot(e.lexicalRoot)
-		if e.hostReceipts != nil {
-			h.guard.protectPrivateRoot(e.hostReceipts.io.root)
-			h.guard.protectPrivateRoot(e.hostReceipts.io.lexicalRoot)
-		}
 	}
 	h.editor = e
 }
 
-// Only the trusted local stdio bootstrap calls this; it is not an RPC method.
+// A fixture's work epoch is not the engine incarnation that owns RAM stages.
 func (e *EditorEngine) SetLocalEpoch(epoch string) error {
 	if !editorValidKey(epoch) {
 		return fmt.Errorf("invalid local editor epoch")
@@ -159,10 +148,10 @@ func (e *EditorEngine) stageOpen(ctx context.Context, req EditorStageOpen) (any,
 	if err := editorBinding(req.Namespace, req.ResourceKey); err != nil {
 		return nil, err
 	}
-	if req.MaxBytes < 0 || req.MaxBytes > EditorMaxBytes || req.IdleTimeoutMs < 1 || req.IdleTimeoutMs > 30000 {
+	if req.MaxBytes < 0 || req.MaxBytes > EditorMaxBytes || req.IdleTimeoutMs < 1 || req.IdleTimeoutMs > editorMaxStageIdle.Milliseconds() {
 		return nil, fmt.Errorf("invalid editor stage budget")
 	}
-	count, total, _, err := e.inventory()
+	count, total, err := e.stageBudget()
 	if err != nil {
 		return nil, err
 	}
@@ -172,22 +161,26 @@ func (e *EditorEngine) stageOpen(ctx context.Context, req EditorStageOpen) (any,
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
-	id, err := editorRandomID()
+	nonce, err := editorRandomID()
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(e.bodyPath(id), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	id := e.stageEpoch + "-" + nonce
+	file, err := os.OpenFile(e.bodyPath(id), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err = f.Close(); err != nil {
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
 		return nil, err
 	}
-	s := editorStage{Version: 1, EditorStageHandle: EditorStageHandle{StageID: id, ResourceKey: req.ResourceKey, ExpiresAt: time.Now().UnixMilli() + req.IdleTimeoutMs}, Namespace: req.Namespace, MaxBytes: req.MaxBytes, IdleTimeoutMs: req.IdleTimeoutMs, Chunks: []editorChunk{}}
-	if err = e.save(e.stagePath(id), &s); err != nil {
-		os.Remove(e.bodyPath(id))
+	if err = file.Close(); err != nil {
+		_ = removeConditionalTemporary(file.Name(), info)
 		return nil, err
 	}
+	s := &editorStage{EditorStageHandle: EditorStageHandle{StageID: id, ResourceKey: req.ResourceKey, ExpiresAt: time.Now().UnixMilli() + req.IdleTimeoutMs}, Namespace: req.Namespace, MaxBytes: req.MaxBytes, IdleTimeoutMs: req.IdleTimeoutMs, BodyInfo: info}
+	e.stages[id] = s
 	return s.EditorStageHandle, nil
 }
 func (e *EditorEngine) stageAppend(ctx context.Context, req EditorStageAppend) (any, error) {
@@ -212,34 +205,31 @@ func (e *EditorEngine) stageAppend(ctx context.Context, req EditorStageAppend) (
 		}
 		return map[string]any{"accepted": true, "nextOffset": s.Size}, nil
 	}
-	if s.RawDigest != "" || req.Seq != int64(len(s.Chunks)) || req.Offset != s.Size || s.Size+req.Bytes > s.MaxBytes || len(s.Chunks) >= int(EditorMaxBytes/EditorChunkBytes)+1 {
+	if s.Sealing || req.Seq != int64(len(s.Chunks)) || req.Offset != s.Size || s.Size+req.Bytes > s.MaxBytes || len(s.Chunks) >= int(EditorMaxBytes/EditorChunkBytes)+1 {
 		return nil, fmt.Errorf("editor chunk sequence/offset/quota mismatch")
 	}
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(e.bodyPath(s.StageID), os.O_RDWR, 0)
+	file, err := os.OpenFile(e.bodyPath(s.StageID), os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	// A crash before metadata publication may leave an extra suffix; overwrite
-	// only the unacknowledged suffix, never an acknowledged chunk.
-	if err = f.Truncate(s.Size); err != nil {
+	defer file.Close()
+	// RAM records only acknowledged prefixes. A failed/cancelled write may leave
+	// a suffix; retry overwrites it and seal truncates to the accepted length.
+	if _, err = file.WriteAt(b, s.Size); err != nil {
 		return nil, err
 	}
-	if _, err = f.WriteAt(b, s.Size); err != nil {
+	if err = e.inject("stage-written"); err != nil {
 		return nil, err
 	}
-	if err = f.Sync(); err != nil {
+	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
 	s.Size += req.Bytes
 	s.Chunks = append(s.Chunks, chunk)
 	s.ExpiresAt = time.Now().UnixMilli() + s.IdleTimeoutMs
-	if err = e.save(e.stagePath(s.StageID), s); err != nil {
-		return nil, err
-	}
 	return map[string]any{"accepted": true, "nextOffset": s.Size}, nil
 }
 func (e *EditorEngine) stageSeal(ctx context.Context, req EditorStageSeal) (any, error) {
@@ -253,26 +243,36 @@ func (e *EditorEngine) stageSeal(ctx context.Context, req EditorStageSeal) (any,
 	if !editorValidDigest(req.RawDigest) || req.TotalBytes != s.Size || s.RawDigest != "" && s.RawDigest != req.RawDigest {
 		return nil, fmt.Errorf("EDITOR_STAGE_SEAL_FAILED: seal identity mismatch")
 	}
-	f, err := os.OpenFile(e.bodyPath(s.StageID), os.O_RDWR, 0)
+	if s.Sealed {
+		return s.EditorStageHandle, nil
+	}
+	s.Sealing = true
+	file, err := os.OpenFile(e.bodyPath(s.StageID), os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	digest, size, err := hashEditorFile(ctx, f)
+	defer file.Close()
+	if err = file.Truncate(s.Size); err != nil {
+		return nil, err
+	}
+	digest, size, err := hashEditorFile(ctx, file)
 	if err != nil {
 		return nil, err
 	}
 	if size != req.TotalBytes || digest != req.RawDigest {
 		return nil, fmt.Errorf("EDITOR_STAGE_SEAL_FAILED: body digest mismatch")
 	}
-	if err = f.Sync(); err != nil {
+	if err = e.inject("stage-sync"); err != nil {
+		return nil, err
+	}
+	if err = file.Sync(); err != nil {
 		return nil, err
 	}
 	s.RawDigest = digest
+	// No directory or stage-metadata sync: the handle is engine-local. Apply's
+	// durable intent syncs this same directory BEFORE any target mutation.
+	s.Sealed = true
 	s.ExpiresAt = time.Now().UnixMilli() + s.IdleTimeoutMs
-	if err = e.save(e.stagePath(s.StageID), s); err != nil {
-		return nil, err
-	}
 	return s.EditorStageHandle, nil
 }
 func (e *EditorEngine) stageAbort(req EditorStageAbort) (any, error) {
@@ -282,41 +282,13 @@ func (e *EditorEngine) stageAbort(req EditorStageAbort) (any, error) {
 	if req.Reason != "cancel" && req.Reason != "idle_timeout" && req.Reason != "superseded" {
 		return nil, fmt.Errorf("invalid editor abort reason")
 	}
+	// readStage refuses a dispatched stage: apply binds it before publishing intent.
 	s, err := e.readStage(req.Namespace, req.ResourceKey, req.StageID)
 	if err != nil {
 		return nil, err
 	}
-	// A crash can occur between intent and the stage's consumed marker. Receipt
-	// inventory is bounded and protects every pending/uncertain body's evidence.
-	d, err := os.Open(e.root)
-	if err != nil {
+	if err = e.dropStage(s); err != nil {
 		return nil, err
 	}
-	defer d.Close()
-	entries, err := d.ReadDir(editorMaxStateFiles + 1)
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-	if len(entries) > editorMaxStateFiles {
-		return nil, fmt.Errorf("editor inventory quota exceeded")
-	}
-	for _, entry := range entries {
-		if len(entry.Name()) < 8 || entry.Name()[len(entry.Name())-8:] != ".op.json" {
-			continue
-		}
-		var r editorReceipt
-		if err := editorReadJSON(e.root+string(os.PathSeparator)+entry.Name(), &r); err != nil {
-			return nil, err
-		}
-		if r.Request.StageID == s.StageID {
-			return nil, fmt.Errorf("cannot abort a dispatched editor stage")
-		}
-	}
-	if err = os.Remove(e.bodyPath(s.StageID)); err != nil {
-		return nil, err
-	}
-	if err = os.Remove(e.stagePath(s.StageID)); err != nil {
-		return nil, err
-	}
-	return map[string]any{"aborted": true}, syncEditorDirectory(e.root)
+	return map[string]any{"aborted": true}, nil
 }

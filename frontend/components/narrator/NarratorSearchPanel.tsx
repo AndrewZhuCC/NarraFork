@@ -26,6 +26,7 @@ import { useNarratorMessageSearch } from "../../hooks/useNarratorMessageSearch";
 import { formatSmartTime } from "../../lib/format";
 import { highlightSearchText } from "../../lib/search-utils";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import type { ScrollToMessageFn } from "./message/message-list-handle";
 
 /** Role → badge color, mirroring the message-role palette used elsewhere. */
 function roleColor(role: string): string {
@@ -50,7 +51,7 @@ export interface NarratorSearchPanelProps {
 	 * surfaces. Without it, mobile search would list results and refuse to open
 	 * any of them, which is the least useful half of a search panel.
 	 */
-	onJumpToMessage?: (messageId: string) => void;
+	onJumpToMessage?: ScrollToMessageFn;
 }
 
 export function NarratorSearchPanel({ narratorId, onJumpToMessage }: NarratorSearchPanelProps) {
@@ -74,9 +75,11 @@ export function NarratorSearchPanel({ narratorId, onJumpToMessage }: NarratorSea
 	const canJump = !!scrollToMessage;
 	const handleJump = useCallback(
 		(messageId: string) => {
-			scrollToMessage?.(messageId);
+			// The query is what the reader is looking for: land on the row showing it,
+			// not on the thinking / tool rows the same message renders above it.
+			scrollToMessage?.(messageId, { needle: debouncedQuery });
 		},
-		[scrollToMessage],
+		[scrollToMessage, debouncedQuery],
 	);
 
 	return (

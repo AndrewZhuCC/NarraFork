@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "9d7eb64e-4810-4d1b-8310-2f1907ee7d6f",
+  "id": "bbd63ff9-f523-41bf-937a-966553fdc621",
   "prevId": "934e970e-45d7-48c4-b715-7914d12a11a7",
   "tables": {
     "acl_events": {
@@ -3890,7 +3890,7 @@
           "name": "scope_revision",
           "type": "integer",
           "primaryKey": false,
-          "notNull": false,
+          "notNull": true,
           "autoincrement": false
         },
         "mutation_id": {
@@ -3951,13 +3951,6 @@
         },
         "observed_after_blob_digest": {
           "name": "observed_after_blob_digest",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "disk_outcome": {
-          "name": "disk_outcome",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -4067,17 +4060,6 @@
           "columns": [
             "scope_id",
             "file_key",
-            "scope_revision",
-            "id"
-          ],
-          "isUnique": false
-        },
-        "idx_fc_effect_journal": {
-          "name": "idx_fc_effect_journal",
-          "columns": [
-            "scope_id",
-            "file_key",
-            "journal_seq",
             "scope_revision",
             "id"
           ],
@@ -4344,6 +4326,20 @@
         "expected_effect_count": {
           "name": "expected_effect_count",
           "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "workspace_lease_id": {
+          "name": "workspace_lease_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "editor_raw_snapshot_revision": {
+          "name": "editor_raw_snapshot_revision",
+          "type": "real",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -15570,14 +15566,14 @@
           "name": "compensate_mutation_id",
           "type": "text",
           "primaryKey": false,
-          "notNull": false,
+          "notNull": true,
           "autoincrement": false
         },
         "compensate_request_digest": {
           "name": "compensate_request_digest",
           "type": "text",
           "primaryKey": false,
-          "notNull": false,
+          "notNull": true,
           "autoincrement": false
         },
         "status": {

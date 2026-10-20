@@ -210,33 +210,10 @@ jobs:
       - name: Verify test preload isolation
         run: bun test --isolate tests/preload-isolation.test.ts
       - name: Run repository tests
-        env:
-          CI_TEST_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        # Piped core collectors ignore RLIMIT_CORE and delay renderer-crash notification.
-        # Change only this disposable hosted VM, restoring its policy when this step exits.
-        run: |
-          if [[ "${CI_TEST_RUNNER_ENVIRONMENT:-}" != github-hosted || "${RUNNER_OS:-}" != Linux ]]; then
-            printf 'Core policy requires a GitHub-hosted Linux VM\n' >&2
-            exit 1
-          fi
-          original_core_pattern="$(sysctl -n kernel.core_pattern)"
-          restore_core_pattern() {
-            local status=$?
-            trap - EXIT
-            if ! sudo sysctl -q -w "kernel.core_pattern=$original_core_pattern"; then
-              printf 'Failed to restore runner core_pattern\n' >&2
-              if (( status == 0 )); then status=1; fi
-            fi
-            exit "$status"
-          }
-          trap restore_core_pattern EXIT
-          sudo sysctl -q -w kernel.core_pattern=core
-          ulimit -S -c 0
-          [[ "$(sysctl -n kernel.core_pattern)" == core && "$(ulimit -S -c)" == 0 ]]
-          printf 'Native test crash policy: core_pattern=core core_soft=0\n'
-          bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${{ matrix.shard }}/4 \
-            --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings \
-            --reporter=junit --reporter-outfile=artifacts/ci-tests.xml
+        run: >-
+          bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${{ matrix.shard }}/4
+          --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings
+          --reporter=junit --reporter-outfile=artifacts/ci-tests.xml
       - name: Verify test report
         run: test -s artifacts/ci-tests.xml
       - name: Upload test report

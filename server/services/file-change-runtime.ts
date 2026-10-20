@@ -80,6 +80,7 @@ const TOOL_COLUMNS = {
 	segmentId: narratorToolCalls.executionSegmentId,
 };
 
+/** Process identity survives --hot but is never reused across an actual restart. */
 export function localFileChangeRuntimeBinding(deviceId = LOCAL_DEVICE_ID): RuntimeBinding | null {
 	return deviceId === LOCAL_DEVICE_ID
 		? hotSafe("narrafork.local-file-change-runtime.epoch.v1", () =>
@@ -119,8 +120,7 @@ export interface EditorFileChangeRequest<Result> {
 	signal: AbortSignal;
 	input: Record<string, unknown>;
 	authorize(): Promise<void>;
-	/** Receipt-only authorization must not reopen an old target. */
-	authorizeReceipt?(): Promise<void>;
+	/** Pure construction from the raw before captured inside this file's write queue. */
 	construct(
 		before: LocalFileObservation,
 	): PreparedFileChange<Result> | Promise<PreparedFileChange<Result>>;
@@ -686,6 +686,13 @@ export class LocalFileChangeRuntime {
 		request: EditorFileChangeRequest<Result>,
 	): Promise<FileChangeCompletion<Result>> {
 		request = Object.freeze({ ...request, input: snapshotFileToolInput(request.input) });
+		if (
+			request.remote &&
+			(request.input.hashKind !== "raw-sha256" ||
+				!Number.isSafeInteger(request.input.snapshotRevision) ||
+				Number(request.input.snapshotRevision) < 0)
+		)
+			throw new LocalFileValidationError("Remote editor requires its raw snapshot revision");
 		const runtime = request.remote?.runtime ?? this.readRuntime(LOCAL_DEVICE_ID);
 		const backend = request.remote?.backend ?? localBackend;
 		if (request.remote && (!request.io || request.io.deviceId !== backend.deviceId))
@@ -859,8 +866,20 @@ export class LocalFileChangeRuntime {
 								attempt: request.attempt,
 								requestDigest: digest,
 								expectedEffectCount: 1,
+								// Recovery returns this exact revision; NULL is never inferred later.
+								editorRawSnapshotRevision:
+									request.remote && request.input.hashKind === "raw-sha256"
+										? Number(request.input.snapshotRevision)
+										: null,
 								actor: request.actor,
-								executionBinding: null,
+								executionBinding: request.remote
+									? {
+											deviceId: backend.deviceId,
+											runtimeEpoch: request.runtime.runtimeEpoch,
+											runtimeGeneration: request.runtime.runtimeGeneration,
+											fencingToken: request.runtime.runtimeGeneration,
+										}
+									: null,
 								toolCallId:
 									request.sourceKind === "tool" && request.linkOperation ? request.sourceId : null,
 								toolUseId: request.toolUseId,
@@ -929,12 +948,9 @@ export class LocalFileChangeRuntime {
 									? {
 											sourceId: request.sourceId,
 											userId: request.userId as string,
-											narratorId: request.narratorId,
 											sourceInstanceId: namespace?.sourceInstanceId,
-											historyOperationId: operation?.id,
-											preparedResult: prepared.result,
+											operationId: operation?.id,
 											snapshotRevision: Number(request.input.snapshotRevision),
-											hashKind: request.input.hashKind === "raw-sha256" ? "raw-sha256" : undefined,
 											requestDigest: digest,
 											root: request.cwd,
 											rootIdentity: request.remote?.rootIdentity,
@@ -965,8 +981,18 @@ export class LocalFileChangeRuntime {
 					)
 						diskOutcome = "conflict";
 					observed = execution.result.observedAfter;
-					// A legacy/injected adapter may omit its observation; only that case rereads.
-					if (!observed) {
+					// A remote terminal receipt is the executor's durable proof of the target bytes.
+					// Re-reading up to 20 MiB over RPC adds no evidence, only an "unknown" path.
+					const receipt = execution.result.editorReceipt;
+					if (!observed && request.remote && receipt && receipt.outcome !== "uncertain")
+						observed =
+							receipt.outcome === "committed"
+								? { bytes: prepared.nextBytes, mode: intendedMode(intendedAfter), identity: null }
+								: before;
+					// A legacy/injected local adapter may omit its observation; only that case rereads.
+					// A remote unknown outcome stays unknown: current bytes never prove a save, and
+					// only the executor's exact-op query may settle it later.
+					if (!observed && !request.remote) {
 						try {
 							observed = await io.read(canonicalPath, AbortSignal.timeout(5_000));
 						} catch (cause) {
@@ -1680,6 +1706,10 @@ async function persistentSourceId(root: string, createIfMissing = true): Promise
 	return read();
 }
 
+/** The intended mode, so a receipt-proven observation never reports a spurious mode change. */
+function intendedMode(state: FileChangeState): number | null {
+	return state.kind === "regular" ? state.mode : null;
+}
 function stateModeMatches(state: FileChangeState, mode: number | null): boolean {
 	return state.kind !== "regular" || state.mode === mode;
 }

@@ -118,13 +118,11 @@ async function readHandle(
 export interface EditorFileApplyContext {
 	sourceId: string;
 	userId: string;
-	narratorId: string;
-	/** Backup provenance, independent of blob/history availability. */
+	/** Installation identity for the executor namespace; independent of blob availability. */
 	sourceInstanceId?: string;
-	historyOperationId?: string;
-	preparedResult: unknown;
+	/** Host history operation, when history is available. Never required for dispatch. */
+	operationId?: string;
 	snapshotRevision: number;
-	hashKind?: "raw-sha256";
 	requestDigest: string;
 	root: string;
 	rootIdentity?: string;

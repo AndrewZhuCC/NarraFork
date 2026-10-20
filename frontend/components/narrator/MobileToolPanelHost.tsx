@@ -29,6 +29,7 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../lib/safe-area";
+import type { ScrollToMessageFn } from "./message/message-list-handle";
 
 const GitPanel = lazy(() => import("../chapter/GitPanel").then((m) => ({ default: m.GitPanel })));
 const NarratorSearchPanel = lazy(() =>
@@ -103,7 +104,7 @@ export interface MobileToolPanelHostProps {
 	 * `scrollToMessage` bridge, which does not exist off-dock. Closing the drawer
 	 * is the caller's job: the target is behind it.
 	 */
-	onJumpToMessage?: (messageId: string) => void;
+	onJumpToMessage?: ScrollToMessageFn;
 	/** Submit text to the narrator's composer, replacing the dock's submit bridge. */
 	onForwardToNarrator?: (text: string) => void;
 	/**
@@ -174,9 +175,9 @@ export function MobileToolPanelHost({
 						// underneath it, so leaving it open would look like nothing happened.
 						onJumpToMessage={
 							onJumpToMessage
-								? (messageId) => {
+								? (messageId, options) => {
 										onClose();
-										onJumpToMessage(messageId);
+										onJumpToMessage(messageId, options);
 									}
 								: undefined
 						}

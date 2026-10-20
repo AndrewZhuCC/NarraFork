@@ -416,7 +416,10 @@
 		"fileUnavailable": "This preview cannot verify saved content. Open the full file before quoting.",
 		"addFailed": "Could not add quote",
 		"placeholder": "Ask about the quoted content…",
-		"open": "Show quoted text"
+		"open": "Show quoted text",
+		"detailTitle": "Quoted text",
+		"jump": "Jump to source",
+		"jumpUnavailable": "This quote has no source to jump to"
 	},
 	"fileReferences": {
 		"title": "File references",
@@ -1569,8 +1572,6 @@
 	"fileEditor.receiptNotApplied": "The previous upload was confirmed not applied. The retained draft is unchanged.",
 	"fileEditor.receiptFailed": "The previous save was not applied: {{message}}",
 	"fileEditor.readOnly": "Read-only",
-	"fileEditor.verified_helper_unavailable": "Atomic editor helper unavailable. The pinned executor is prepared from your configured update source in the background; reopen this file after preparation. No unsafe write fallback is used.",
-	"fileEditor.host_receipt_storage_unavailable": "The verified helper cannot yet provide private durable receipt storage on this host. Prepare or upgrade the pinned executor from the configured update source, then reopen this file. No unsafe write fallback is used.",
 	"fileEditor.durable_executor_unavailable": "Upgrade the remote executor to enable durable editor saves. This file remains read-only.",
 	"fileEditor.missingContext": "This file needs a narrator context to open safely.",
 	"fileEditor.search": "Find / replace",

@@ -535,7 +535,7 @@ export class EditorDocumentService {
 		if (need === "write" && this.deps.writerAvailable && !this.deps.writerAvailable(binding))
 			throw new EditorDocumentError(
 				"EDITOR_PROVIDER_UNSUPPORTED",
-				"Verified editor helper unavailable; prepare the pinned executor from the configured update source and reopen this file",
+				"Editor provider is not writable; upgrade the authorized remote executor if required",
 				503,
 			);
 		assertSameEditorBinding(actor, session.input, session.binding, binding);
@@ -601,9 +601,7 @@ export class EditorDocumentService {
 							? {
 									writeUnavailableReason:
 										this.deps.writerUnavailableReason?.(binding) ??
-										(binding.rawSource
-											? ("durable_executor_unavailable" as const)
-											: ("verified_helper_unavailable" as const)),
+										("durable_executor_unavailable" as const),
 								}
 							: {}),
 						rawRead: true,
@@ -646,7 +644,7 @@ export class EditorDocumentService {
 						? {
 								writeUnavailableReason:
 									this.deps.writerUnavailableReason?.(binding) ??
-									("verified_helper_unavailable" as const),
+									("durable_executor_unavailable" as const),
 							}
 						: {}),
 				},
@@ -1534,15 +1532,6 @@ export class EditorDocumentService {
 							hashKind: upload.hashKind,
 							snapshotRevision: upload.snapshotRevision,
 						},
-						authorizeReceipt: async () => {
-							if (!actor.authorizeOperation)
-								throw new EditorDocumentError(
-									"EDITOR_OPERATION_UNKNOWN",
-									"Receipt metadata authorization unavailable",
-									403,
-								);
-							await actor.authorizeOperation(binding.deviceId ?? session.input.deviceId ?? "local");
-						},
 						authorize: async () => {
 							// Cancellation/DELETE may mark closing after commit began; pin keeps the bound bytes alive.
 							const fresh = await actor.authorize(session.input, "write");
@@ -1724,6 +1713,17 @@ export class EditorDocumentService {
 			operation.userId === actor.userId &&
 			operation.narratorId === actor.narratorId
 		) {
+			// Remote receipts are canonical in SQLite (the query authorizes the device), including
+			// terminal results whose direct ACK may have failed. A live commit must not race its
+			// own apply, and a pre-dispatch rejection has no SQLite row: both stay cache-only.
+			if (
+				operation.deviceId &&
+				operation.deviceId !== "local" &&
+				this.deps.queryOperation &&
+				operation.value.status !== "committing" &&
+				operation.value.status !== "failed"
+			)
+				return this.deps.queryOperation(actor, operationId);
 			if (operation.deviceId && actor.authorizeOperation)
 				await actor.authorizeOperation(operation.deviceId);
 			if (operation.recovery?.hashKind === "raw-sha256" && this.deps.rawWriter)

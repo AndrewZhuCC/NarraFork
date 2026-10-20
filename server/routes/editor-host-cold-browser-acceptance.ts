@@ -299,7 +299,13 @@ export async function editorHostColdBrowserAcceptance(options: {
 		type PendingInfo = {
 			operations: { id: string; sourceId: string; settlement: string }[];
 			leases: { id: string; status: string }[];
-			nativeCalls: { apply: number; query: number; helperStarts: number; network: number };
+			nativeCalls: {
+				apply: number;
+				query: number;
+				ack: number;
+				helperStarts: number;
+				network: number;
+			};
 			faultCounts: { historyFailures: number; droppedReplies: number };
 		};
 		const info = async (token: string): Promise<PendingInfo> => {
@@ -353,7 +359,13 @@ export async function editorHostColdBrowserAcceptance(options: {
 		const pendingAfter = await info(third.token);
 		expect(pendingAfter.operations).toEqual(pendingBefore.operations);
 		expect(pendingAfter.leases).toEqual(pendingBefore.leases);
-		expect(pendingAfter.nativeCalls).toEqual({ apply: 0, query: 0, helperStarts: 0, network: 0 });
+		expect(pendingAfter.nativeCalls).toEqual({
+			apply: 0,
+			query: 0,
+			ack: 0,
+			helperStarts: 0,
+			network: 0,
+		});
 		expect(hash(await readFile(target))).toBe(hash(pendingBytes));
 		console.info(
 			"EDITOR_HOST_PENDING_COLD_CHROMIUM",

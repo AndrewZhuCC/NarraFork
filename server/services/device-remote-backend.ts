@@ -232,7 +232,6 @@ export class RemoteBackend implements ExecutionBackend {
 					},
 				)) as T;
 			},
-			close: async () => {},
 		};
 	}
 	async editorObservation(

@@ -15,11 +15,63 @@
  */
 
 import type { PretextLayoutIndex } from "@shared/pretext-layout/index";
+import type { MessageJumpOptions } from "../message/message-list-handle";
 
-/** Prefer an exact tool row over the first row of its owning assistant message. */
+/**
+ * Rows that annotate a message rather than carry its prose: thinking, tool calls,
+ * activity folds, usage. One assistant message renders as several rows that all
+ * resolve to its id (and an activity fold can also carry the NEXT message's id),
+ * so the first row of a message is usually its thinking or a tool card. A jump
+ * to the message means its text, so these only win when nothing else matches.
+ */
+const ANCILLARY_JUMP_ROW_KINDS: ReadonlySet<string> = new Set([
+	"reasoning",
+	"reasoning-steps",
+	"reasoning-count",
+	"tool-call",
+	"tool-call-group",
+	"tool-run-count",
+	"activity-trace",
+	"turn-usage",
+	"inline-permission",
+	"ask-user-question",
+]);
+
+function isAncillaryJumpRowKind(kind: string | null | undefined): boolean {
+	return !!kind && ANCILLARY_JUMP_ROW_KINDS.has(kind);
+}
+
+/** Whitespace-free form, so block boundaries and selection line breaks do not matter. */
+function compactText(text: string): string {
+	return text.replace(/\s+/gu, "");
+}
+
+const NEEDLE_PROBE_CHARS = 32;
+
+/** The row whose text shows `needle`, else the first prose row, else the first row. */
+export function pickJumpRow(rows: readonly HTMLElement[], needle?: string): HTMLElement | null {
+	if (rows.length <= 1) return rows[0] ?? null;
+	const probe = needle ? compactText(needle).slice(0, NEEDLE_PROBE_CHARS) : "";
+	if (probe.length >= 2) {
+		const hit = rows.find((row) => compactText(row.textContent ?? "").includes(probe));
+		if (hit) return hit;
+	}
+	return (
+		rows.find((row) => !isAncillaryJumpRowKind(row.getAttribute("data-nf-row-kind"))) ?? rows[0]
+	);
+}
+
+/**
+ * Prefer an exact tool row; otherwise the message's first prose row, not the
+ * thinking / tool rows that precede it.
+ */
 export function jumpTargetItemIndex(index: PretextLayoutIndex, target: string): number | undefined {
 	const id = jumpTargetMessageId(target);
-	return index.itemByKey(`tool-${id}`)?.index ?? index.itemIndicesForSourceMessageId(id)[0];
+	const tool = index.itemByKey(`tool-${id}`);
+	if (tool) return tool.index;
+	const indices = index.itemIndicesForSourceMessageId(id);
+	const items = index.manifest.items;
+	return indices.find((at) => !isAncillaryJumpRowKind(items[at]?.kind)) ?? indices[0];
 }
 
 /** Center inside this viewport only; native scrollIntoView also moves ancestors. */
@@ -42,11 +94,19 @@ export function jumpTargetScrollTop(viewport: HTMLElement, target: HTMLElement):
 	);
 }
 
-/** Look only inside this list: docked sessions can render the same message ids. */
+/**
+ * Look only inside this list: docked sessions can render the same message ids.
+ *
+ * Every row of a message carries its `msg-` id (and a fold spanning messages
+ * carries the later ones as zero-size aliases), so the FIRST match in document
+ * order is often the thinking / tool row above the text. All matching rows are
+ * collected and ranked by `pickJumpRow` instead.
+ */
 export function mountedJumpTarget(
 	root: HTMLElement,
 	domIds: readonly string[],
 	targetIds: readonly string[],
+	options: MessageJumpOptions = {},
 ): HTMLElement | null {
 	for (const target of targetIds) {
 		const key = `tool-${jumpTargetMessageId(target)}`;
@@ -58,8 +118,12 @@ export function mountedJumpTarget(
 		...targetIds.flatMap((target) => [target, `msg-${jumpTargetMessageId(target)}`]),
 	];
 	for (const id of candidates) {
-		const element = root.querySelector<HTMLElement>(`[id="${CSS.escape(id)}"]`);
-		if (element) return element.closest<HTMLElement>("[data-nf-row-key]") ?? element;
+		const rows: HTMLElement[] = [];
+		for (const element of root.querySelectorAll<HTMLElement>(`[id="${CSS.escape(id)}"]`)) {
+			const row = element.closest<HTMLElement>("[data-nf-row-key]") ?? element;
+			if (!rows.includes(row)) rows.push(row);
+		}
+		if (rows.length) return pickJumpRow(rows, options.needle);
 	}
 	return null;
 }

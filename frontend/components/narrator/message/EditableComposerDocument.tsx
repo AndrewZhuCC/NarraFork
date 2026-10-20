@@ -14,12 +14,14 @@ import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { composerOptimizeTarget } from "../composer/composer-optimize-target";
+import type { ComposerQuote } from "../composer/composer-quotes";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import {
 	InlineComposerEditor,
 	type InlineComposerEditorHandle,
 } from "../composer/InlineComposerEditor";
 import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "../composer/image-clipboard";
+import { QuoteDetailModal } from "../composer/QuoteDetailModal";
 import { revealComposerQuote, revealQuotedFile } from "../composer/quote-jump";
 import { TextareaOptimizeControls } from "../composer/TextareaOptimizeControls";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
@@ -83,6 +85,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 		[],
 	);
 	const [fullscreen, setFullscreen] = useState(false);
+	const [quoteDetail, setQuoteDetail] = useState<ComposerQuote | null>(null);
 	// 原地 position: fixed 全屏(保住光标/撤销栈);中和祖先层叠上下文,
 	// 否则全屏框会画在 AppShell 导航栏/顶栏之下。
 	const fullscreenBoxRef = useRef<HTMLDivElement>(null);
@@ -361,6 +364,11 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					: undefined
 			}
 		>
+			<QuoteDetailModal
+				quote={quoteDetail}
+				onClose={() => setQuoteDetail(null)}
+				onJump={(quote) => revealComposerQuote(dock, quote, editor.current?.getElement() ?? null)}
+			/>
 			{fullscreen && (
 				<Group justify="flex-end" mb="xs">
 					<Button size="xs" variant="subtle" onClick={() => setFullscreen(false)}>
@@ -386,9 +394,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					props.onKeyDown?.(event);
 				}}
 				onPasteFiles={(files) => void addFiles(files)}
-				onOpenQuote={(quote) =>
-					revealComposerQuote(dock, quote, editor.current?.getElement() ?? null)
-				}
+				onOpenQuote={setQuoteDetail}
 				onOpenFile={(reference) => {
 					if (fileScope.openFile) fileScope.openFile(reference);
 					else revealQuotedFile(dock, reference);

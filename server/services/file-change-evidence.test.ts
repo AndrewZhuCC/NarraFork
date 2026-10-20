@@ -75,6 +75,39 @@ function operationInput(
 		...overrides,
 	};
 }
+
+test("editor operation persists the full safe-integer snapshot revision and never a lease", () => {
+	const input = operationInput({
+		executionBinding: {
+			deviceId: "remote-fixture",
+			runtimeEpoch: "epoch",
+			runtimeGeneration: 3,
+			fencingToken: 3,
+		},
+		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
+	});
+	const recorded = service.beginOperation(input);
+	expect(service.getEditorOperation("source", input.sourceId)).toMatchObject({
+		id: recorded.id,
+		workspaceLeaseId: null,
+		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
+	});
+	const ordinary = service.beginOperation(operationInput());
+	expect(ordinary.workspaceLeaseId).toBeNull();
+	expect(ordinary.editorRawSnapshotRevision).toBeNull();
+	for (const revision of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1])
+		expect(() =>
+			service.beginOperation(
+				operationInput({ ...input, sourceId: generateId(), editorRawSnapshotRevision: revision }),
+			),
+		).toThrow();
+	expect(() =>
+		service.beginOperation(
+			operationInput({ ...input, sourceId: generateId(), sourceKind: "tool" }),
+		),
+	).toThrow();
+});
+
 function known(mode = 0o644, status: "ready" | "missing" = "ready"): FileChangeState {
 	const digest = hash(generateId());
 	db.insert(schema.fileChangeBlobs)

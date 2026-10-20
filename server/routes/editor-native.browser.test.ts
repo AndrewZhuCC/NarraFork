@@ -17,21 +17,13 @@ import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { getDeviceConnectionGeneration } from "../services/device-connection-service";
 import { createRemoteBackend } from "../services/device-remote-backend";
-import {
-	getEditorDocumentService,
-	withEditorOperationStore,
-} from "../services/editor-document-runtime";
+import { getEditorDocumentService } from "../services/editor-document-runtime";
 import { editorFileSubscriptions } from "../services/editor-file-subscription";
-import { editorHelperDiagnostics } from "../services/editor-helper";
-import {
-	EDITOR_OPERATION_STORE_LIMITS,
-	EditorRemoteOperationStore,
-} from "../services/editor-remote-operation-store";
 import { handleNarratorWS, type NarratorClientMessage } from "../websocket/narrator-ws";
 import { resolveWSData, type WSData } from "../websocket/ws-handler";
 import { createEditorDocumentRoutes } from "./editor-documents";
 import { editorHostColdBrowserAcceptance } from "./editor-host-cold-browser-acceptance";
-import { nativeEditorFixture } from "./editor-native-fixture";
+import { denyHostEditorHelpers, nativeEditorFixture } from "./editor-native-fixture";
 import { createFileReferenceRoutes } from "./narrator-file-references";
 
 type RawWindow = Window & { rawFixture: typeof Fixture };
@@ -75,6 +67,13 @@ test.each([
 	"local",
 	"remote",
 ] as const)("Chrome production writer, ordinary Host or verified authenticated executor WS (%s)", async (device) => {
+	const processGuard = denyHostEditorHelpers();
+	const hostHelperDiagnostics = () => ({
+		processes: processGuard.starts,
+		peak: processGuard.starts,
+		roots: processGuard.starts,
+		queued: 0,
+	});
 	const project = resolve(import.meta.dir, "../.."),
 		root = await mkdtemp(join(testEnvironment.isolatedHome, "native-browser-"));
 	const bundleRoot = await mkdtemp(join(project, ".tmp-narrafork-home.native-browser-"));
@@ -131,7 +130,7 @@ test.each([
 		tempBytes: number;
 		retainedStageBytes: number;
 		reservedBytes: number;
-		helpers: ReturnType<typeof editorHelperDiagnostics>;
+		helpers: ReturnType<typeof hostHelperDiagnostics>;
 		subscriptions: typeof editorFileSubscriptions.diagnostics;
 		streams: {
 			active: number;
@@ -145,18 +144,6 @@ test.each([
 		if (device === "remote") await fixture.start();
 		// Local uses the production Host writer; no helper preparation/probe.
 		const service = getEditorDocumentService();
-		const nativeStore =
-			device === "remote"
-				? new EditorRemoteOperationStore(
-						join(root, "host-native-receipts"),
-						EDITOR_OPERATION_STORE_LIMITS,
-						{
-							root: getNarraforkHome(),
-							stateDir: join(getNarraforkHome(), "editor-native"),
-							resolveHelper: fixture.resolveHelper,
-						},
-					)
-				: undefined;
 		const app = new Hono();
 		// Same synthetic HTTP identity boundary as existing browser fixtures; WS authentication is real.
 		app.use("*", async (c, next) => {
@@ -231,9 +218,7 @@ test.each([
 					if (path.endsWith("/content")) contentReads++;
 					if (path.endsWith("/page")) pageReads++;
 					if (path.endsWith("/commit")) commits++;
-					return nativeStore
-						? withEditorOperationStore(nativeStore, () => app.fetch(request))
-						: app.fetch(request);
+					return app.fetch(request);
 				}
 				if (path === "/")
 					return new Response(data.html, { headers: { "Content-Type": "text/html" } });
@@ -292,7 +277,7 @@ test.each([
 					(await fixtureBytes(getNarraforkHome(), 0, "stage")) +
 					(await fixtureBytes(root, 0, "stage")),
 				reservedBytes: service.diagnostics.reservedBytes,
-				helpers: editorHelperDiagnostics(),
+				helpers: hostHelperDiagnostics(),
 				subscriptions: editorFileSubscriptions.diagnostics,
 				streams: service.diagnostics.streams,
 			});
@@ -395,7 +380,7 @@ test.each([
 		else {
 			expect((await lstat(target)).ino).toBe(initialInode);
 			expect(fixture.applies).toBe(0);
-			expect(editorHelperDiagnostics()).toMatchObject({ processes: 0, roots: 0, queued: 0 });
+			expect(hostHelperDiagnostics()).toMatchObject({ processes: 0, roots: 0, queued: 0 });
 		}
 		expect((await lstat(target)).mode & 0o777).toBe(0o640);
 		expect(commits).toBe(1);
@@ -753,7 +738,7 @@ test.each([
 		);
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.close());
 		const end = Date.now() + 5000;
-		while (editorFileSubscriptions.diagnostics.references || editorHelperDiagnostics().processes) {
+		while (editorFileSubscriptions.diagnostics.references || hostHelperDiagnostics().processes) {
 			if (Date.now() > end) throw new Error("Native subscription/helper cleanup did not settle");
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
@@ -832,6 +817,7 @@ test.each([
 		await browser?.close();
 		await server?.stop(true);
 		await fixture.dispose();
+		processGuard.restore();
 		await rm(root, { recursive: true, force: true });
 		await rm(bundleRoot, { recursive: true, force: true });
 	}

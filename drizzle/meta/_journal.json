@@ -1482,8 +1482,15 @@
     {
       "idx": 211,
       "version": "6",
-      "when": 1792427450600,
-      "tag": "0211_file_write_redesign",
+      "when": 1792413738571,
+      "tag": "0211_editor_operation_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 212,
+      "version": "6",
+      "when": 1792460157591,
+      "tag": "0212_file_write_redesign",
       "breakpoints": true
     }
   ]
