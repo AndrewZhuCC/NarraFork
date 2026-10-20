@@ -1,44 +1,21 @@
 import type {
 	FieldSource,
-	MatchRules,
-	MetadataSource,
-	ResolvedModelMetadata,
+	JSONValue,
+	MatchedVia,
+	RawCatalog,
+	RawMetadata,
+	RawModel,
+	RawVariant,
 } from "./schema/catalog";
-import { validateCatalog } from "./src/validation";
+import { validateRawCatalog } from "./src/validation";
 
-export type JSONValue =
-	| null
-	| boolean
-	| number
-	| string
-	| JSONValue[]
-	| { [key: string]: JSONValue };
-export type RawMetadata = { [key: string]: JSONValue };
-export interface RawModel {
-	id: string;
-	name?: string;
-	vendor?: string;
-	family?: string;
-	notes?: string;
-	matches?: MatchRules;
-	metadata: RawMetadata;
-	status?: "verified" | "unverified" | "legacy-unverified" | "deprecated";
-	sources?: MetadataSource[];
-}
-export interface RawVariant extends RawModel {
-	modelId: string;
-	providerKey: string;
-	upstreamModelIds: string[];
-}
-export interface RawCatalog {
-	schemaVersion: 2;
-	/** Format-qualified storage key; pinning uses sourceVersion, not this key. */
-	catalogVersion: string;
-	sourceVersion: string;
-	publishedAt: string;
-	models: RawModel[];
-	variants: RawVariant[];
-}
+export type {
+	JSONValue,
+	RawCatalog,
+	RawMetadata,
+	RawModel,
+	RawVariant,
+} from "./schema/catalog";
 export interface CardField {
 	key: string;
 	group: "identity" | "limits" | "modalities" | "capabilities" | "reasoning";
@@ -193,7 +170,7 @@ export interface ModelCard {
 	modelId?: string;
 	variantId?: string;
 	bindingId?: string;
-	matchedVia: ResolvedModelMetadata["matchedVia"];
+	matchedVia: MatchedVia;
 	metadata: RawMetadata;
 	provenance: Record<string, FieldSource>;
 	view: ModelCardView;
@@ -524,28 +501,12 @@ export function rawCatalogFromModelFiles(
 			variants.push({ ...child, modelId: model.id, metadata: validateRawMetadata(child.metadata) });
 		}
 	}
-	if (!models.length || models.length + variants.length > 20000)
-		throw new Error("Invalid model count");
-	// Reuse the existing identity/reference validation; raw field validation is separate.
-	const identity = (entry: RawModel) => ({
-		...entry,
-		metadata: {},
-		status:
-			entry.status === "unverified" ? "legacy-unverified" : (entry.status ?? "legacy-unverified"),
-	});
-	validateCatalog({
-		schemaVersion: 1,
-		catalogVersion: sourceVersion,
-		publishedAt,
-		models: models.map(identity),
-		variants: variants.map(identity),
-	});
-	return {
+	return validateRawCatalog({
 		schemaVersion: 2,
 		catalogVersion: `v2:${sourceVersion}`,
 		sourceVersion,
 		publishedAt,
 		models,
 		variants,
-	};
+	});
 }

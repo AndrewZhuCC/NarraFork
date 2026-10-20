@@ -1,5 +1,5 @@
 import { validateRawMetadata } from "../card";
-import type { CatalogDocument, ModelMetadata } from "../schema/catalog";
+import type { RawCatalog, RawLocalState, RawMetadata, RawModel } from "../schema/catalog";
 import schema from "../schema/catalog.schema.json";
 
 type Schema = {
@@ -102,46 +102,35 @@ export function validateShape(value: unknown, name: string): void {
 	}
 	check(value, defs[name] ?? fail(`Unknown schema ${name}`), name);
 }
-export function validateMetadata(value: unknown): ModelMetadata {
-	validateShape(value, "ModelMetadata");
-	const m = value as ModelMetadata;
-	if (
-		m.limits?.contextWindow != null &&
-		m.limits.maxOutputTokens != null &&
-		m.limits.maxOutputTokens > m.limits.contextWindow
-	)
-		fail("maxOutputTokens exceeds contextWindow");
-	const r = m.reasoning;
-	if (r?.levels?.some((x) => ["none", "off", "disabled"].includes(x)))
-		fail("Reasoning disable is not a level");
-	if (r?.defaultLevel != null && Array.isArray(r.levels) && !r.levels.includes(r.defaultLevel))
-		fail("defaultLevel is not in levels");
-	if (
-		r?.supported === false &&
-		((r.levels?.length ?? 0) > 0 ||
-			r.defaultLevel != null ||
-			(r.mode != null && r.mode !== "unknown"))
-	)
-		fail("Unsupported reasoning has active settings");
-	return JSON.parse(JSON.stringify(m)) as ModelMetadata;
-}
-export const leafPaths = new Set([
+
+/**
+ * Field groups that `matches.fields` and `sources[].fields` may name. This is the
+ * public catalog's grouping vocabulary, not a metadata shape: `fieldAllowed` in
+ * card-resolver.ts maps each group onto the raw keys it covers.
+ */
+export const MATCH_FIELD_GROUPS: ReadonlySet<string> = new Set([
+	"limits",
 	"limits.contextWindow",
 	"limits.maxOutputTokens",
+	"modalities",
 	"modalities.input",
 	"modalities.output",
+	"nativeSearch",
 	"nativeSearch.supported",
+	"reasoning",
 	"reasoning.supported",
 	"reasoning.mode",
 	"reasoning.levels",
 	"reasoning.canDisable",
 	"reasoning.defaultLevel",
+	"referencePricing",
 	"referencePricing.currency",
 	"referencePricing.unit",
 	"referencePricing.input",
 	"referencePricing.output",
 	"referencePricing.cacheRead",
 	"referencePricing.cacheWrite",
+	"referencePricing.longContext",
 	"referencePricing.longContext.thresholdTokens",
 	"referencePricing.longContext.basis",
 	"referencePricing.longContext.mode",
@@ -150,29 +139,50 @@ export const leafPaths = new Set([
 	"referencePricing.longContext.cacheRead",
 	"referencePricing.longContext.cacheWrite",
 ]);
-export function validField(path: string): boolean {
-	return leafPaths.has(path) || [...leafPaths].some((p) => p.startsWith(`${path}.`));
+
+/** Leaf overlay used only to check that a variant composes validly with its model. */
+function overlay(base: RawMetadata, patch: RawMetadata): RawMetadata {
+	const out = structuredClone(base);
+	for (const [key, value] of Object.entries(patch)) {
+		const before = out[key];
+		if (
+			value &&
+			typeof value === "object" &&
+			!Array.isArray(value) &&
+			before &&
+			typeof before === "object" &&
+			!Array.isArray(before)
+		)
+			out[key] = overlay(before, value);
+		else out[key] = structuredClone(value);
+	}
+	return out;
 }
-export function validateCatalog(value: unknown): CatalogDocument {
-	validateShape(value, "CatalogDocument");
-	const c = value as CatalogDocument;
-	const modelIds = new Set<string>();
+
+/**
+ * Identity and metadata checks for a set of model/variant definitions: unique ids,
+ * unambiguous match keys per provider scope, known parents, valid field groups,
+ * and verified entries that cite a verified source.
+ */
+function validateEntries(models: RawModel[], variants: RawCatalog["variants"]): void {
+	const modelIds = new Map<string, RawModel>();
 	const variantIds = new Set<string>();
 	const matches = new Map<string, string>();
-	for (const [entries, ids] of [
-		[c.models, modelIds],
-		[c.variants, variantIds],
+	for (const [entries, isVariant] of [
+		[models, false],
+		[variants, true],
 	] as const) {
 		for (const entry of entries) {
-			if (ids.has(entry.id)) fail(`Duplicate id ${entry.id}`);
-			ids.add(entry.id);
-			validateMetadata(entry.metadata);
-			if (entry.rawMetadata !== undefined) validateRawMetadata(entry.rawMetadata);
+			if (isVariant ? variantIds.has(entry.id) : modelIds.has(entry.id))
+				fail(`Duplicate id ${entry.id}`);
+			if (isVariant) variantIds.add(entry.id);
+			else modelIds.set(entry.id, entry);
+			validateRawMetadata(entry.metadata);
 			for (const path of entry.matches?.fields ?? [])
-				if (!validField(path)) fail(`Invalid match field ${path}`);
+				if (!MATCH_FIELD_GROUPS.has(path)) fail(`Invalid match field ${path}`);
 			for (const source of entry.sources ?? [])
 				for (const path of source.fields ?? [])
-					if (!validField(path)) fail(`Invalid source field ${path}`);
+					if (!MATCH_FIELD_GROUPS.has(path)) fail(`Invalid source field ${path}`);
 			if (entry.status === "verified" && !entry.sources?.some((s) => s.url && s.verifiedAt))
 				fail(`Verified entry lacks verified source: ${entry.id}`);
 			const scope = "providerKey" in entry ? entry.providerKey : "";
@@ -195,22 +205,34 @@ export function validateCatalog(value: unknown): CatalogDocument {
 			}
 		}
 	}
-	for (const variant of c.variants) {
-		if (!modelIds.has(variant.modelId))
-			fail(`Unknown model ${variant.modelId} for variant ${variant.id}`);
-		const base = c.models.find((m) => m.id === variant.modelId)!;
-		const merged = JSON.parse(JSON.stringify(base.metadata)) as Record<string, unknown>;
-		const overlay = (target: Record<string, unknown>, patch: Record<string, unknown>): void => {
-			for (const [key, value] of Object.entries(patch)) {
-				if (value === undefined) continue;
-				if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-					target[key] ??= {};
-					overlay(target[key] as Record<string, unknown>, value as Record<string, unknown>);
-				} else target[key] = value;
-			}
-		};
-		overlay(merged, variant.metadata as Record<string, unknown>);
-		validateMetadata(merged);
+	for (const variant of variants) {
+		const base = modelIds.get(variant.modelId);
+		if (!base) fail(`Unknown model ${variant.modelId} for variant ${variant.id}`);
+		validateRawMetadata(overlay(base.metadata, variant.metadata));
 	}
-	return JSON.parse(JSON.stringify(c)) as CatalogDocument;
+}
+
+export function validateRawCatalog(value: unknown): RawCatalog {
+	validateShape(value, "RawCatalog");
+	const catalog = value as RawCatalog;
+	if (catalog.catalogVersion !== `v2:${catalog.sourceVersion}`)
+		fail("Catalog version does not match its source version");
+	if (!catalog.models.length || catalog.models.length + catalog.variants.length > 20000)
+		fail("Invalid model count");
+	validateEntries(catalog.models, catalog.variants);
+	return structuredClone(catalog);
+}
+
+/**
+ * The local layer composed over a catalog: local definitions replace catalog entries
+ * of the same id, and the result must still be an unambiguous identity set.
+ */
+export function validateComposedEntries(catalog: RawCatalog, local: RawLocalState): void {
+	validateShape(local, "RawLocalState");
+	const localModels = new Set((local.models ?? []).map((m) => m.id));
+	const localVariants = new Set((local.variants ?? []).map((v) => v.id));
+	validateEntries(
+		[...catalog.models.filter((m) => !localModels.has(m.id)), ...(local.models ?? [])],
+		[...catalog.variants.filter((v) => !localVariants.has(v.id)), ...(local.variants ?? [])],
+	);
 }

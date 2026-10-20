@@ -8,21 +8,20 @@ import {
 import type { ModelCatalogSettings } from "../../../server/lib/model-catalog";
 import {
 	applyModelCatalogUpdate,
+	applyWindowSettings,
 	bindModelCatalogSettings,
 	checkModelCatalogUpdate,
 	getEffectiveModelCard,
-	getEffectiveModelMetadata,
-	getModelCatalogSnapshot,
-	markLegacyWindowSettingsSaved,
-	mutateModelCatalog,
-	previewModelCatalogDowngrade,
-	reconcileLegacyWindowSettings,
+	getEffectiveModelProfile,
+	getModelCardSnapshot,
+	legacyWindowProjection,
+	mutateModelCard,
 	rollbackModelCatalog,
-	saveLegacyModelCard,
 	setModelCatalogUpdateSettings,
 	withModelMetadataSnapshot,
 	withModelMetadataSnapshotIterator,
 } from "../../../server/lib/model-catalog";
+import type { LegacyResolvedEnvelope } from "../../../server/lib/model-catalog/legacy-v1";
 import {
 	CATALOG_ARCHIVE_BASE,
 	CATALOG_REVISION_URL,
@@ -45,9 +44,9 @@ import {
 } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
 import { modelCatalogRoutes } from "../../../server/routes/model-catalog";
-import type { ModelCatalogMutation } from "../../../shared/model-catalog/schema/api";
-import type { ResolvedModelMetadata } from "../../../shared/model-catalog/schema/catalog";
-import * as metadataResolvers from "../../../shared/model-catalog/src/index";
+import { decimalValue } from "../../../shared/model-catalog/card";
+import type { ModelCardMutation } from "../../../shared/model-catalog/card-local";
+import * as cardResolvers from "../../../shared/model-catalog/card-resolver";
 
 let local: NarraForkSettings;
 let presetContextWindow: number;
@@ -56,30 +55,33 @@ let restoreVersion: string | undefined;
 beforeEach(() => {
 	local = getDefaults();
 	local.agent.modelCatalog = {
-		schemaVersion: 1,
-		migrationVersion: 1,
+		schemaVersion: 2,
+		migrationVersion: 2,
 		local: { revision: 0 },
 		autoApply: false,
 		pinnedVersion: null,
 	};
 	bindModelCatalogSettings(local, () => {});
 	_bindSettings(local);
-	const window = getEffectiveModelMetadata("codex:gpt-5.5").metadata.limits?.contextWindow;
+	const window = profile("codex:gpt-5.5").contextWindow;
 	if (typeof window !== "number") throw new Error("Expected GPT-5.5 preset context window");
 	presetContextWindow = window;
 	restoreVersion = undefined;
 });
 afterEach(() => {
 	globalThis.fetch = originalFetch;
-	if (restoreVersion && getModelCatalogSnapshot().catalog.catalogVersion !== restoreVersion)
+	if (restoreVersion && getModelCardSnapshot().catalog.catalogVersion !== restoreVersion)
 		rollbackModelCatalog(restoreVersion);
 	deleteNugCachedModels("nug-test");
 	deleteNugCachedModels("nug-card-test");
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 	_bindSettings(settings);
 });
-function mutate(value: Omit<Extract<ModelCatalogMutation, { action: "patch" }>, "baseRevision">) {
-	return mutateModelCatalog({ ...value, baseRevision: getModelCatalogSnapshot().local.revision });
+const profile = (model: string) => getEffectiveModelProfile(model);
+/** Fixture prices are written per million tokens; the catalog stores per-token decimals. */
+const perToken = (perMillion: string) => decimalValue(perMillion, -6);
+function mutate(value: Omit<Extract<ModelCardMutation, { action: "patch" }>, "baseRevision">) {
+	return mutateModelCard({ ...value, baseRevision: getModelCardSnapshot().local.revision });
 }
 function app(role: "admin" | "user" = "admin") {
 	const app = new Hono();
@@ -92,9 +94,9 @@ function app(role: "admin" | "user" = "admin") {
 }
 async function mockCatalog(
 	label: string,
-	modify?: (doc: ReturnType<typeof getModelCatalogSnapshot>["catalog"]) => void,
+	modify?: (doc: ReturnType<typeof getModelCardSnapshot>["catalog"]) => void,
 ) {
-	const catalog = structuredClone(getModelCatalogSnapshot().catalog);
+	const catalog = structuredClone(getModelCardSnapshot().catalog);
 	const version = createHash("sha1").update(label).digest("hex");
 	modify?.(catalog);
 	const files: Record<string, string> = {};
@@ -142,9 +144,7 @@ describe("unified metadata storage and runtime", () => {
 		expect(model?.name).toBeUndefined();
 		expect(model?.family).toBeUndefined();
 		expect(model?.notes).toBeUndefined();
-		expect(getEffectiveModelMetadata("custom-empty-label").metadata.limits?.contextWindow).toBe(
-			16000,
-		);
+		expect(profile("custom-empty-label").contextWindow).toBe(16000);
 		expect(local.agent.modelCatalog!.legacyArchive?.modelCards[0]?.displayName).toBe("");
 	});
 	test("new patch changes runtime limits and reset really restores inheritance", () => {
@@ -154,40 +154,42 @@ describe("unified metadata storage and runtime", () => {
 			targetId: "gpt-5.5",
 			patch: {
 				set: {
-					"limits.contextWindow": 240000,
-					"limits.maxOutputTokens": 1234,
-					"referencePricing.input": "0",
-					"nativeSearch.supported": false,
-					"modalities.input": [],
+					working_context_tokens: 240000,
+					max_output_tokens: 1234,
+					input_cost_per_token: "0",
+					supports_web_search: false,
+					supported_modalities: [],
 				},
 			},
 		});
 		expect(getModelContextWindow("gpt-5.5", "codex")).toBe(240000);
 		expect(getModelMaxCompletionTokens("gpt-5.5", "codex")).toBe(1234);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing?.input).toBe("0");
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.modalities?.input).toEqual([]);
+		expect(profile("codex:gpt-5.5").referencePricing?.input).toBe("0");
+		expect(profile("codex:gpt-5.5").inputModalities).toEqual([]);
+		expect(profile("codex:gpt-5.5").nativeSearch).toBe(false);
 		mutate({
 			action: "patch",
 			target: "model",
 			targetId: "gpt-5.5",
-			patch: { reset: ["limits.contextWindow", "limits.maxOutputTokens"] },
+			patch: { reset: ["working_context_tokens", "max_output_tokens"] },
 		});
 		expect(getModelContextWindow("gpt-5.5", "codex")).toBe(presetContextWindow);
 	});
 	test("no-op patch does not increment revision; stale patch and invalid effective values fail", () => {
 		mutate({ action: "patch", target: "model", targetId: "gpt-5.5", patch: {} });
-		expect(getModelCatalogSnapshot().local.revision).toBe(0);
+		expect(getModelCardSnapshot().local.revision).toBe(0);
+		// A total below the inherited output ceiling makes the effective card invalid.
 		expect(() =>
 			mutate({
 				action: "patch",
 				target: "model",
 				targetId: "gpt-5.5",
-				patch: { set: { "limits.contextWindow": 1 } },
+				patch: { set: { context_window: 1 } },
 			}),
 		).toThrow();
-		expect(getModelCatalogSnapshot().local.revision).toBe(0);
+		expect(getModelCardSnapshot().local.revision).toBe(0);
 		expect(() =>
-			mutateModelCatalog({
+			mutateModelCard({
 				action: "hide",
 				target: "model",
 				targetId: "gpt-5.5",
@@ -196,7 +198,7 @@ describe("unified metadata storage and runtime", () => {
 		).toThrow();
 	});
 	test("failed settings persistence never publishes a local mutation", () => {
-		const initial = getModelCatalogSnapshot();
+		const initial = getModelCardSnapshot();
 		bindModelCatalogSettings(local, () => {
 			throw new Error("disk unavailable");
 		});
@@ -205,29 +207,27 @@ describe("unified metadata storage and runtime", () => {
 				action: "patch",
 				target: "model",
 				targetId: "gpt-5.5",
-				patch: { set: { "referencePricing.input": "0" } },
+				patch: { set: { input_cost_per_token: "0" } },
 			}),
 		).toThrow("disk unavailable");
-		expect(getModelCatalogSnapshot()).toEqual(initial);
+		expect(getModelCardSnapshot()).toEqual(initial);
 	});
-	test("legacy settings window edits create binding patches without re-pinning unchanged inputs", () => {
+	test("provider-page window edits become bindings and a catalog reset is never re-pinned", () => {
 		local.agent.modelContextWindows = { "codex:gpt-5.5": 230000 };
-		reconcileLegacyWindowSettings(local);
-		markLegacyWindowSettingsSaved(local);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.limits?.contextWindow).toBe(230000);
+		applyWindowSettings(local);
+		expect(profile("codex:gpt-5.5").contextWindow).toBe(230000);
 		mutate({
 			action: "patch",
 			target: "binding",
 			targetId: "legacy-window:codex:gpt-5.5",
-			patch: { reset: ["limits.contextWindow"] },
+			patch: { reset: ["working_context_tokens"] },
 		});
-		reconcileLegacyWindowSettings(local);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.limits?.contextWindow).toBe(
-			presetContextWindow,
-		);
-		local.agent.modelContextWindows = {};
-		reconcileLegacyWindowSettings(local);
-		expect(getModelCatalogSnapshot().local.bindings).toEqual([]);
+		// The page's map is a view: the reset is visible there, so saving it again
+		// cannot resurrect the old value.
+		expect(local.agent.modelContextWindows).toEqual({});
+		applyWindowSettings(local);
+		expect(profile("codex:gpt-5.5").contextWindow).toBe(presetContextWindow);
+		expect(legacyWindowProjection(getModelCardSnapshot().local)).toEqual({});
 	});
 	test.each([
 		"migrated",
@@ -239,7 +239,7 @@ describe("unified metadata storage and runtime", () => {
 			local.agent.modelContextWindows = { "codex:gpt-5.5": 199999 };
 			bindModelCatalogSettings(local, () => {});
 		} else {
-			mutateModelCatalog({
+			mutateModelCard({
 				action: "upsert-binding",
 				baseRevision: 0,
 				binding: { id, upstreamModelId: "gpt-5.5", providerId: "codex", modelId: "gpt-5.5" },
@@ -248,16 +248,16 @@ describe("unified metadata storage and runtime", () => {
 				action: "patch",
 				target: "binding",
 				targetId: id,
-				patch: { set: { "limits.contextWindow": 199999 } },
+				patch: { set: { working_context_tokens: 199999 } },
 			});
 		}
 		mutate({
 			action: "patch",
 			target: "model",
 			targetId: "gpt-5.5",
-			patch: { set: { "referencePricing.input": "0" } },
+			patch: { set: { input_cost_per_token: "0" } },
 		});
-		const before = getModelCatalogSnapshot();
+		const before = getModelCardSnapshot();
 		bindModelCatalogSettings(local, () => {
 			throw new Error("disk unavailable");
 		});
@@ -267,37 +267,35 @@ describe("unified metadata storage and runtime", () => {
 			targetId: id,
 			baseRevision: before.local.revision,
 		} as const;
-		expect(() => mutateModelCatalog(deletion)).toThrow("disk unavailable");
-		expect(getModelCatalogSnapshot()).toEqual(before);
+		expect(() => mutateModelCard(deletion)).toThrow("disk unavailable");
+		expect(getModelCardSnapshot()).toEqual(before);
 		let saves = 0;
 		bindModelCatalogSettings(local, () => saves++);
-		const after = mutateModelCatalog(deletion);
+		const after = mutateModelCard(deletion);
 		expect(saves).toBe(1);
 		expect(after.local.revision).toBe(before.local.revision + 1);
 		expect(after.local.bindings?.some((b) => b.id === id)).toBe(false);
 		expect(after.local.overrides?.some((o) => o.target === "binding" && o.targetId === id)).toBe(
 			false,
 		);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.limits?.contextWindow).toBe(
-			presetContextWindow,
-		);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing?.input).toBe("0");
+		expect(profile("codex:gpt-5.5").contextWindow).toBe(presetContextWindow);
+		expect(profile("codex:gpt-5.5").referencePricing?.input).toBe("0");
 	});
 	test("form create/edit/inherit clears embedded metadata and resolves binding to variant to parent", () => {
 		const form = (window: number) =>
 			metadataFromPatch(
 				buildCatalogPatch({
-					"limits.contextWindow": { mode: "set", value: String(window) },
-					"nativeSearch.supported": { mode: "set", value: "false" },
-					"referencePricing.input": { mode: "set", value: "0" },
+					working_context_tokens: { mode: "set", value: String(window) },
+					supports_web_search: { mode: "set", value: "false" },
+					input_cost_per_token: { mode: "set", value: "0" },
 				}),
 			);
-		mutateModelCatalog({
+		mutateModelCard({
 			action: "upsert-model",
 			baseRevision: 0,
 			model: { id: "parent", metadata: form(600000) },
 		});
-		mutateModelCatalog({
+		mutateModelCard({
 			action: "upsert-variant",
 			baseRevision: 1,
 			variant: {
@@ -308,7 +306,7 @@ describe("unified metadata storage and runtime", () => {
 				metadata: form(500000),
 			},
 		});
-		mutateModelCatalog({
+		mutateModelCard({
 			action: "upsert-binding",
 			baseRevision: 2,
 			binding: {
@@ -321,7 +319,7 @@ describe("unified metadata storage and runtime", () => {
 		});
 		const edit = (target: "model" | "variant" | "binding", targetId: string, window?: number) => {
 			const patch = buildCatalogPatch({
-				"limits.contextWindow":
+				working_context_tokens:
 					window === undefined ? { mode: "reset" } : { mode: "set", value: String(window) },
 			});
 			if (!patch) throw new Error("Expected form edit");
@@ -333,96 +331,90 @@ describe("unified metadata storage and runtime", () => {
 			["binding", "connection", 550000],
 		] as const)
 			edit(target, id, window);
-		expect(getEffectiveModelMetadata("codex:connected").metadata.limits?.contextWindow).toBe(
-			550000,
-		);
+		expect(profile("codex:connected").contextWindow).toBe(550000);
 		for (const [target, id, window, layer] of [
 			["binding", "connection", 650000, "local-variant"],
 			["variant", "child", 700000, "local-model"],
 			["model", "parent", undefined, undefined],
 		] as const) {
-			const before = getModelCatalogSnapshot();
+			const before = getModelCardSnapshot();
 			const after = edit(target, id);
 			expect(after.local.revision).toBe(before.local.revision + 1);
-			const resolved = getEffectiveModelMetadata("codex:connected");
-			expect(resolved.metadata.limits?.contextWindow).toBe(window);
-			if (layer) expect(resolved.provenance["limits.contextWindow"]?.layer).toBe(layer);
-			else expect(resolved.provenance["limits.contextWindow"]).toBeUndefined();
+			const resolved = profile("codex:connected");
+			expect(resolved.contextWindow).toBe(window);
+			expect(resolved.contextWindowSource?.layer).toBe(layer);
 			// Reset only the requested field; false and zero are still explicit values.
-			expect(resolved.metadata.nativeSearch?.supported).toBe(false);
-			expect(resolved.metadata.referencePricing?.input).toBe("0");
+			expect(resolved.nativeSearch).toBe(false);
+			expect(resolved.referencePricing?.input).toBe("0");
 		}
-		expect(getModelCatalogSnapshot().local.models?.[0]?.metadata.limits).toBeUndefined();
-		expect(getModelCatalogSnapshot().local.variants?.[0]?.metadata.limits).toBeUndefined();
-		expect(getModelCatalogSnapshot().local.bindings?.[0]?.overrides?.limits).toBeUndefined();
+		const snapshot = getModelCardSnapshot();
+		expect(snapshot.local.models?.[0]?.metadata.working_context_tokens).toBeUndefined();
+		expect(snapshot.local.variants?.[0]?.metadata.working_context_tokens).toBeUndefined();
+		expect(snapshot.local.bindings?.[0]?.overrides?.working_context_tokens).toBeUndefined();
 	});
-	test("inherit without an intermediate patch clears creation values atomically and restores preset", () => {
-		mutateModelCatalog({
-			action: "upsert-model",
-			baseRevision: 0,
-			model: {
-				id: "gpt-5.5",
-				metadata: { limits: { contextWindow: 300000 } },
-			},
+	test("inherit clears a local value atomically and restores the preset", () => {
+		mutate({
+			action: "patch",
+			target: "model",
+			targetId: "gpt-5.5",
+			patch: { set: { working_context_tokens: 300000 } },
 		});
-		const before = getModelCatalogSnapshot();
+		const before = getModelCardSnapshot();
 		const reset = () =>
 			mutate({
 				action: "patch",
 				target: "model",
 				targetId: "gpt-5.5",
-				patch: { reset: ["limits.contextWindow"] },
+				patch: { reset: ["working_context_tokens"] },
 			});
 		bindModelCatalogSettings(local, () => {
 			throw new Error("disk unavailable");
 		});
 		expect(reset).toThrow("disk unavailable");
-		expect(getModelCatalogSnapshot()).toEqual(before);
+		expect(getModelCardSnapshot()).toEqual(before);
 		let saves = 0;
 		bindModelCatalogSettings(local, () => saves++);
 		reset();
 		expect(saves).toBe(1);
-		expect(getEffectiveModelMetadata("gpt-5.5").metadata.limits?.contextWindow).toBe(
-			presetContextWindow,
-		);
-		const inherited = getModelCatalogSnapshot();
+		expect(profile("gpt-5.5").contextWindow).toBe(presetContextWindow);
+		const inherited = getModelCardSnapshot();
 		reset();
-		expect(getModelCatalogSnapshot()).toEqual(inherited);
+		expect(getModelCardSnapshot()).toEqual(inherited);
 		expect(saves).toBe(1);
 	});
 	test("hide and restore preserve callable models but remove and restore metadata", () => {
-		mutateModelCatalog({ action: "hide", target: "model", targetId: "gpt-5.5", baseRevision: 0 });
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing).toBeUndefined();
-		mutateModelCatalog({
+		mutateModelCard({ action: "hide", target: "model", targetId: "gpt-5.5", baseRevision: 0 });
+		expect(profile("codex:gpt-5.5").referencePricing).toBeUndefined();
+		mutateModelCard({
 			action: "restore",
 			target: "model",
 			targetId: "gpt-5.5",
 			baseRevision: 1,
 		});
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing).toBeDefined();
+		expect(profile("codex:gpt-5.5").referencePricing).toBeDefined();
 	});
 	test("request snapshot does not change under concurrent metadata edits", async () => {
 		await withModelMetadataSnapshot(async () => {
-			const initial = getEffectiveModelMetadata("codex:gpt-5.5");
+			const initial = profile("codex:gpt-5.5");
 			mutate({
 				action: "patch",
 				target: "model",
 				targetId: "gpt-5.5",
-				patch: { set: { "limits.maxOutputTokens": 999 } },
+				patch: { set: { max_output_tokens: 999 } },
 			});
 			await Promise.resolve();
-			expect(getEffectiveModelMetadata("codex:gpt-5.5")).toEqual(initial);
+			expect(profile("codex:gpt-5.5")).toEqual(initial);
 		});
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.limits?.maxOutputTokens).toBe(999);
+		expect(profile("codex:gpt-5.5").maxOutputTokens).toBe(999);
 	});
 	test("concurrent lazy generators retain independent snapshots across await/yield/return/throw and restore caller context", async () => {
-		const price = () => getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing?.input;
+		const price = () => profile("codex:gpt-5.5").referencePricing?.input;
 		const setPrice = (value: string) =>
 			mutate({
 				action: "patch",
 				target: "model",
 				targetId: "gpt-5.5",
-				patch: { set: { "referencePricing.input": value } },
+				patch: { set: { input_cost_per_token: perToken(value) } },
 			});
 		let release: (() => void) | undefined;
 		const gate = new Promise<void>((resolve) => {
@@ -472,10 +464,10 @@ describe("unified metadata storage and runtime", () => {
 			["gpt-5.5-20260901", 180000, undefined],
 			["gpt-5.5-budget", undefined, "0"],
 		] as const) {
-			const result = getEffectiveModelMetadata(id);
-			expect(result.modelId).toBe(id);
-			expect(result.metadata.limits?.contextWindow).toBe(window);
-			expect(result.metadata.referencePricing?.input).toBe(price);
+			const result = profile(id);
+			expect(result.card.modelId).toBe(id);
+			expect(result.contextWindow).toBe(window);
+			expect(result.referencePricing?.input).toBe(price);
 		}
 		// Resolving and mutating both validate the complete migrated override set.
 		mutate({ action: "patch", target: "model", targetId: "gpt-5.5-mini", patch: {} });
@@ -489,12 +481,12 @@ describe("unified metadata storage and runtime", () => {
 			delete local.agent.modelCatalog;
 			bindModelCatalogSettings(local, () => {});
 		} else {
-			reconcileLegacyWindowSettings(local);
+			applyWindowSettings(local);
 		}
-		const resolved = getEffectiveModelMetadata("codex:gpt-5.5-mini");
-		expect(resolved.metadata.limits?.contextWindow).toBe(160000);
-		expect(resolved.metadata.referencePricing).toBeUndefined();
-		expect(getModelCatalogSnapshot().local.bindings?.[0]?.modelId).toBeUndefined();
+		const resolved = profile("codex:gpt-5.5-mini");
+		expect(resolved.contextWindow).toBe(160000);
+		expect(resolved.referencePricing).toBeUndefined();
+		expect(getModelCardSnapshot().local.bindings?.[0]?.modelId).toBeUndefined();
 	});
 	test("migration merges alias and duplicate cards once with canonical fields winning independent of order", () => {
 		delete local.agent.modelCatalog;
@@ -509,15 +501,16 @@ describe("unified metadata storage and runtime", () => {
 			{ modelKey: "claude-opus-4-6", officialPricing: { input: 3 } },
 		];
 		bindModelCatalogSettings(local, () => {});
-		const result = getEffectiveModelMetadata("claude-opus-4.6");
-		expect(result.modelId).toBe("claude-opus-4-6");
-		expect(result.metadata.limits).toEqual({ contextWindow: 350000, maxOutputTokens: 1234 });
-		expect(result.metadata.referencePricing?.input).toBe("3");
-		const migrated = getModelCatalogSnapshot().local;
+		const result = profile("claude-opus-4.6");
+		expect(result.card.modelId).toBe("claude-opus-4-6");
+		expect(result.contextWindow).toBe(350000);
+		expect(result.maxOutputTokens).toBe(1234);
+		expect(result.referencePricing?.input).toBe("3");
+		const migrated = getModelCardSnapshot().local;
 		expect(migrated.overrides?.filter((o) => o.targetId === "claude-opus-4-6")).toHaveLength(0);
 		expect(
-			migrated.models?.find((m) => m.id === "claude-opus-4-6")?.metadata.referencePricing?.input,
-		).toBe("3");
+			migrated.models?.find((m) => m.id === "claude-opus-4-6")?.metadata.input_cost_per_token,
+		).toBe(perToken("3"));
 		expect(migrated.models?.filter((m) => m.id === "claude-opus-4-6")).toHaveLength(1);
 		expect(migrated.models?.find((m) => m.id === "claude-opus-4-6")?.name).toBe("Canonical");
 		mutate({ action: "patch", target: "model", targetId: "claude-opus-4-6", patch: {} });
@@ -526,10 +519,8 @@ describe("unified metadata storage and runtime", () => {
 		delete local.agent.modelCatalog;
 		local.agent.modelCards = [{ modelKey: "gpt-5.5-mini", deleted: true }];
 		bindModelCatalogSettings(local, () => {});
-		expect(getEffectiveModelMetadata("gpt-5.5").metadata.limits?.contextWindow).toBe(
-			presetContextWindow,
-		);
-		expect(getEffectiveModelMetadata("gpt-5.5-mini").metadata).toEqual({});
+		expect(profile("gpt-5.5").contextWindow).toBe(presetContextWindow);
+		expect(getEffectiveModelCard("gpt-5.5-mini").metadata).toEqual({});
 	});
 	test("migration preserves zero semantics, legacy windows and archive; second bind is idempotent", () => {
 		delete local.agent.modelCatalog;
@@ -540,8 +531,8 @@ describe("unified metadata storage and runtime", () => {
 		local.agent.modelContextWindows = { "codex:gpt-5.5": 199999 };
 		let saves = 0;
 		bindModelCatalogSettings(local, () => saves++);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.limits?.contextWindow).toBe(199999);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing?.input).toBe("0");
+		expect(profile("codex:gpt-5.5").contextWindow).toBe(199999);
+		expect(profile("codex:gpt-5.5").referencePricing?.input).toBe("0");
 		expect(
 			(local.agent.modelCatalog as ModelCatalogSettings | undefined)?.legacyArchive?.modelCards,
 		).toEqual(local.agent.modelCards);
@@ -560,7 +551,7 @@ describe("unified metadata storage and runtime", () => {
 			defaultModel: "",
 		};
 		local.nugProviders = [config];
-		const metadata: ResolvedModelMetadata = {
+		const metadata: LegacyResolvedEnvelope = {
 			schemaVersion: 1,
 			catalogVersion: "gateway-v1",
 			localRevision: 2,
@@ -593,22 +584,22 @@ describe("unified metadata storage and runtime", () => {
 		expect(
 			resolveNugModelMeta(config.id, config.prefix, "gateway:channel:gpt-5.5").metadata,
 		).toEqual(metadata);
-		expect(
-			getEffectiveModelMetadata("gateway:channel:gpt-5.5").metadata.limits?.contextWindow,
-		).toBe(333333);
+		expect(profile("gateway:channel:gpt-5.5").contextWindow).toBe(333333);
+		expect(profile("gateway:channel:gpt-5.5").maxOutputTokens).toBe(321);
+		expect(profile("gateway:channel:gpt-5.5").nativeSearch).toBe(false);
 		expect(getModelContextWindow("channel:gpt-5.5", "gateway")).toBe(333333);
 		mutate({
 			action: "patch",
 			target: "model",
 			targetId: "gpt-5.5",
-			patch: { set: { "limits.contextWindow": 250000 } },
+			patch: { set: { working_context_tokens: 250000 } },
 		});
 		expect(getModelContextWindow("channel:gpt-5.5", "gateway")).toBe(250000);
 		mutate({
 			action: "patch",
 			target: "model",
 			targetId: "gpt-5.5",
-			patch: { reset: ["limits.contextWindow"] },
+			patch: { reset: ["working_context_tokens"] },
 		});
 		expect(getModelContextWindow("channel:gpt-5.5", "gateway")).toBe(333333);
 		applyNugModelCatalogUpdate(
@@ -625,9 +616,7 @@ describe("unified metadata storage and runtime", () => {
 			"hash-v2",
 			{ saveCache: false },
 		);
-		expect(
-			getEffectiveModelMetadata("gateway:channel:gpt-5.5").metadata.limits?.contextWindow,
-		).toBe(444444);
+		expect(profile("gateway:channel:gpt-5.5").contextWindow).toBe(444444);
 	});
 	test("NUG modelCard is returned on resolve and rejects operational metadata", () => {
 		const config = {
@@ -664,8 +653,9 @@ describe("unified metadata storage and runtime", () => {
 		);
 		const meta = resolveNugModelMeta(config.id, config.prefix, "gw:ch:m");
 		expect(meta.modelCard).toEqual(card);
-		// queryForModel projects the card into v1 when no envelope is present.
-		expect(getEffectiveModelMetadata("gw:ch:m").metadata.limits?.maxOutputTokens).toBe(32000);
+		// The gateway's complete card is the discovered layer as-is.
+		expect(profile("gw:ch:m").maxOutputTokens).toBe(32000);
+		expect(getEffectiveModelCard("gw:ch:m").provenance.max_input_tokens?.layer).toBe("discovered");
 
 		applyNugModelCatalogUpdate(
 			config,
@@ -694,39 +684,10 @@ describe("unified metadata storage and runtime", () => {
 		);
 		const rejected = resolveNugModelMeta(config.id, config.prefix, "gw:ch:m");
 		expect(rejected.modelCard).toBeUndefined();
-		// The v1 projection remains usable when the card is discarded.
-		expect(rejected.metadata?.metadata.limits?.contextWindow).toBe(333333);
+		// An old gateway's envelope still applies when the card is discarded.
+		expect(rejected.metadata?.metadata).toEqual({ limits: { contextWindow: 333333 } });
+		expect(profile("gw:ch:m").contextWindow).toBe(333333);
 		expect(getNugCachedModelsByProvider(config.id)[0]?.modelCard).toBeUndefined();
-	});
-	test("downgrade preflight rejects unknown metadata without writing and representable export re-upgrades losslessly", () => {
-		mutate({
-			action: "patch",
-			target: "model",
-			targetId: "gpt-5.5",
-			patch: { set: { "referencePricing.input": "0", "limits.maxOutputTokens": 4321 } },
-		});
-		const preview = previewModelCatalogDowngrade();
-		expect(preview.supported).toBe(true);
-		const prior = getEffectiveModelMetadata("codex:gpt-5.5").metadata;
-		const downgraded = getDefaults();
-		downgraded.agent.modelCards = preview.legacy!.modelCards;
-		downgraded.agent.modelContextWindows = preview.legacy!.modelContextWindows;
-		downgraded.pricing = { overrides: preview.legacy!.pricingOverrides };
-		bindModelCatalogSettings(downgraded, () => {});
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.limits).toEqual(prior.limits);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing).toEqual(
-			prior.referencePricing,
-		);
-		bindModelCatalogSettings(local, () => {});
-		mutate({
-			action: "patch",
-			target: "model",
-			targetId: "gpt-5.5",
-			patch: { set: { "nativeSearch.supported": null } },
-		});
-		const unchanged = getModelCatalogSnapshot();
-		expect(previewModelCatalogDowngrade().supported).toBe(false);
-		expect(getModelCatalogSnapshot()).toEqual(unchanged);
 	});
 	test("scope retains opaque colon ids on custom non-NUG providers", () => {
 		local.openaiProviders = [
@@ -739,29 +700,27 @@ describe("unified metadata storage and runtime", () => {
 				defaultModel: "",
 			},
 		];
-		mutateModelCatalog({
+		mutateModelCard({
 			action: "upsert-model",
 			baseRevision: 0,
 			model: {
 				id: "opaque-model",
 				matches: { ids: ["namespace:model:thinking"] },
-				metadata: { limits: { contextWindow: 77777 } },
+				metadata: { working_context_tokens: 77777 },
 			},
 		});
-		expect(
-			getEffectiveModelMetadata("relay:namespace:model:thinking").metadata.limits?.contextWindow,
-		).toBe(77777);
+		expect(profile("relay:namespace:model:thinking").contextWindow).toBe(77777);
 	});
 });
 
 describe("catalog update and API boundary", () => {
 	test("deleting a base referenced by a local variant is rejected without revision or state changes", () => {
-		mutateModelCatalog({
+		mutateModelCard({
 			action: "upsert-model",
 			baseRevision: 0,
 			model: { id: "local-parent", metadata: {} },
 		});
-		mutateModelCatalog({
+		mutateModelCard({
 			action: "upsert-variant",
 			baseRevision: 1,
 			variant: {
@@ -772,21 +731,21 @@ describe("catalog update and API boundary", () => {
 				metadata: {},
 			},
 		});
-		const before = getModelCatalogSnapshot();
+		const before = getModelCardSnapshot();
 		expect(() =>
-			mutateModelCatalog({
+			mutateModelCard({
 				action: "delete",
 				baseRevision: 2,
 				target: "model",
 				targetId: "local-parent",
 			}),
 		).toThrow();
-		expect(getModelCatalogSnapshot()).toEqual(before);
+		expect(getModelCardSnapshot()).toEqual(before);
 	});
 	test("preset removals retain locally referenced definitions through apply and rollback", async () => {
-		const initial = getModelCatalogSnapshot();
+		const initial = getModelCardSnapshot();
 		restoreVersion = initial.catalog.catalogVersion;
-		mutateModelCatalog({
+		mutateModelCard({
 			action: "upsert-variant",
 			baseRevision: 0,
 			variant: {
@@ -804,28 +763,28 @@ describe("catalog update and API boundary", () => {
 		const checked = await checkModelCatalogUpdate();
 		expect(checked.update.lastError).toBeUndefined();
 		applyModelCatalogUpdate();
-		expect(getModelCatalogSnapshot().local.models?.find((m) => m.id === "gpt-5.5")?.status).toBe(
+		expect(getModelCardSnapshot().local.models?.find((m) => m.id === "gpt-5.5")?.status).toBe(
 			"deprecated",
 		);
-		expect(
-			getModelCatalogSnapshot().local.variants?.some((v) => v.id === "local-preset-child"),
-		).toBe(true);
+		expect(getModelCardSnapshot().local.variants?.some((v) => v.id === "local-preset-child")).toBe(
+			true,
+		);
 		rollbackModelCatalog(initial.catalog.catalogVersion);
-		expect(
-			getModelCatalogSnapshot().local.variants?.some((v) => v.id === "local-preset-child"),
-		).toBe(true);
+		expect(getModelCardSnapshot().local.variants?.some((v) => v.id === "local-preset-child")).toBe(
+			true,
+		);
 	});
 	test("check stages only, apply preserves overlays, pin blocks and rollback preserves edits", async () => {
-		const initial = getModelCatalogSnapshot();
+		const initial = getModelCardSnapshot();
 		restoreVersion = initial.catalog.catalogVersion;
 		mutate({
 			action: "patch",
 			target: "model",
 			targetId: "gpt-5.5",
-			patch: { set: { "referencePricing.input": "0" } },
+			patch: { set: { input_cost_per_token: "0" } },
 		});
 		const updateVersion = await mockCatalog("integration-update", (c) => {
-			c.models.find((m) => m.id === "gpt-5.5")!.metadata.referencePricing!.input = "999";
+			c.models.find((m) => m.id === "gpt-5.5")!.metadata.input_cost_per_token = 0.000999;
 		});
 		const checked = await checkModelCatalogUpdate();
 		expect(checked.update.lastError).toBeUndefined();
@@ -839,28 +798,28 @@ describe("catalog update and API boundary", () => {
 			checked.update.pendingDiff?.fields?.some(
 				(field) =>
 					field.id === "gpt-5.5" &&
-					field.path === "referencePricing.input" &&
-					field.after === "999",
+					field.path === "input_cost_per_token" &&
+					field.after === 0.000999,
 			),
 		).toBe(true);
 		setModelCatalogUpdateSettings({ pinnedVersion: "different" });
 		expect(() => applyModelCatalogUpdate()).toThrow();
 		setModelCatalogUpdateSettings({ pinnedVersion: updateVersion });
 		applyModelCatalogUpdate(updateVersion);
-		expect(getModelCatalogSnapshot().update.pinnedVersion).toBe(updateVersion);
+		expect(getModelCardSnapshot().update.pinnedVersion).toBe(updateVersion);
 		setModelCatalogUpdateSettings({ pinnedVersion: null });
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing?.input).toBe("0");
+		expect(profile("codex:gpt-5.5").referencePricing?.input).toBe("0");
 		mutate({
 			action: "patch",
 			target: "model",
 			targetId: "gpt-5.5",
-			patch: { set: { "referencePricing.output": "1" } },
+			patch: { set: { output_cost_per_token: perToken("1") } },
 		});
 		rollbackModelCatalog(initial.catalog.catalogVersion);
-		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing?.output).toBe("1");
+		expect(profile("codex:gpt-5.5").referencePricing?.output).toBe("1");
 	});
 	test("download corruption retains last good; concurrent checks are single flight", async () => {
-		const initial = getModelCatalogSnapshot().catalog.catalogVersion;
+		const initial = getModelCardSnapshot().catalog.catalogVersion;
 		let calls = 0;
 		globalThis.fetch = (async () => {
 			calls++;
@@ -871,8 +830,8 @@ describe("catalog update and API boundary", () => {
 		expect(a).toBe(b);
 		await a;
 		expect(calls).toBe(1);
-		expect(getModelCatalogSnapshot().catalog.catalogVersion).toBe(initial);
-		expect(getModelCatalogSnapshot().update.lastError).toBeDefined();
+		expect(getModelCardSnapshot().catalog.catalogVersion).toBe(initial);
+		expect(getModelCardSnapshot().update.lastError).toBeDefined();
 	});
 	test("lastError and non-AppError bodies never contain host absolute paths", async () => {
 		const home = "/home/someone-private/.narrafork/model-catalog/snapshots.json";
@@ -885,7 +844,7 @@ describe("catalog update and API boundary", () => {
 		expect(checked.update.lastError).not.toContain(".narrafork");
 		// Basename is retained so the failure stays diagnosable without the host path.
 		expect(checked.update.lastError).toContain("snapshots.json");
-		const member = await app("user").request("/api/model-catalog");
+		const member = await app("user").request("/api/model-catalog/v2");
 		const body = await member.json();
 		expect(JSON.stringify(body.update.lastError)).not.toContain("/home/someone-private");
 		expect(JSON.stringify(body)).not.toContain("someone-private");
@@ -893,15 +852,15 @@ describe("catalog update and API boundary", () => {
 		bindModelCatalogSettings(local, () => {
 			throw new Error("EACCES: permission denied, open '/home/someone-private/.narrafork/x'");
 		});
-		const failed = await app().request("/api/model-catalog/mutate", {
+		const failed = await app().request("/api/model-catalog/v2/mutate", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({
 				action: "patch",
 				target: "model",
 				targetId: "gpt-5.5",
-				patch: { set: { "referencePricing.input": "0" } },
-				baseRevision: getModelCatalogSnapshot().local.revision,
+				patch: { set: { input_cost_per_token: "0" } },
+				baseRevision: getModelCardSnapshot().local.revision,
 			}),
 		});
 		expect(failed.status).toBe(400);
@@ -910,7 +869,7 @@ describe("catalog update and API boundary", () => {
 		expect(errorBody.error).toBe("Model catalog operation failed");
 		expect(JSON.stringify(errorBody)).not.toContain("someone-private");
 		// Intentional validation prose without paths is preserved.
-		const missing = await app().request("/api/model-catalog/resolve");
+		const missing = await app().request("/api/model-catalog/v2/resolve");
 		expect(missing.status).toBe(400);
 		expect((await missing.json()).error).toContain("model is required");
 	});
@@ -920,7 +879,7 @@ describe("catalog update and API boundary", () => {
 	])("accepts 1 MiB branch metadata without requesting commit patches (Content-Length: %s)", async (includeLength) => {
 		expect(MAX_CATALOG_REVISION_BYTES).toBe(1024 * 1024);
 		expect(MAX_CATALOG_BYTES).toBe(16 * 1024 * 1024);
-		const initial = getModelCatalogSnapshot();
+		const initial = getModelCardSnapshot();
 		const version = await mockCatalog(`large-branch-${includeLength}`);
 		const fixture = globalThis.fetch;
 		const urls: string[] = [];
@@ -983,7 +942,7 @@ describe("catalog update and API boundary", () => {
 		["revision", MAX_CATALOG_REVISION_BYTES],
 		["archive", MAX_CATALOG_BYTES],
 	] as const)("rejects oversized %s Content-Length even when cancellation fails", async (kind, max) => {
-		const before = getModelCatalogSnapshot();
+		const before = getModelCardSnapshot();
 		const version = await mockCatalog(`oversized-header-${kind}`);
 		const fixture = globalThis.fetch;
 		const rejectedUrl =
@@ -1015,7 +974,7 @@ describe("catalog update and API boundary", () => {
 		["revision", MAX_CATALOG_REVISION_BYTES],
 		["archive", MAX_CATALOG_BYTES],
 	] as const)("cancels oversized %s streams without Content-Length", async (kind, max) => {
-		const before = getModelCatalogSnapshot();
+		const before = getModelCardSnapshot();
 		const version = await mockCatalog(`oversized-stream-${kind}`);
 		const fixture = globalThis.fetch;
 		const rejectedUrl =
@@ -1045,7 +1004,7 @@ describe("catalog update and API boundary", () => {
 		expect(checked.update.pendingVersion).toBe(before.update.pendingVersion);
 	});
 	test("invalid revisions, corrupt archives and redirects retain last good", async () => {
-		const version = getModelCatalogSnapshot().catalog.catalogVersion;
+		const version = getModelCardSnapshot().catalog.catalogVersion;
 		const urls: string[] = [];
 		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
 			urls.push(String(url));
@@ -1074,10 +1033,10 @@ describe("catalog update and API boundary", () => {
 				headers: { location: "http://127.0.0.1/secrets" },
 			})) as unknown as typeof fetch;
 		expect((await checkModelCatalogUpdate()).update.lastError).toContain("HTTP 302");
-		expect(getModelCatalogSnapshot().catalog.catalogVersion).toBe(version);
+		expect(getModelCardSnapshot().catalog.catalogVersion).toBe(version);
 	});
 	test("forbidden patch paths are rejected without mutating local state", () => {
-		const before = getModelCatalogSnapshot().local;
+		const before = getModelCardSnapshot().local;
 		expect(() =>
 			mutate({
 				action: "patch",
@@ -1086,30 +1045,24 @@ describe("catalog update and API boundary", () => {
 				patch: { set: { "__proto__.polluted": true } },
 			}),
 		).toThrow();
-		expect(getModelCatalogSnapshot().local).toEqual(before);
+		expect(getModelCardSnapshot().local).toEqual(before);
 		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
 	});
-	test("legacy identity edits never turn complete preset metadata into local overrides", () => {
-		saveLegacyModelCard("gpt-5.5", { modelKey: "gpt-5.5", displayName: "Local label" });
-		expect(
-			getModelCatalogSnapshot().local.models?.find((m) => m.id === "gpt-5.5")?.rawMetadata,
-		).toEqual({});
-		expect(getEffectiveModelCard("codex:gpt-5.5").provenance.input_cost_per_token?.layer).not.toBe(
-			"local-model",
-		);
+	test("imported identity edits never turn complete preset metadata into local overrides", () => {
 		const migrated = getDefaults();
 		delete migrated.agent.modelCatalog;
 		migrated.agent.modelCards = [{ modelKey: "gpt-5.5", displayName: "Migrated label" }];
 		bindModelCatalogSettings(migrated, () => {});
-		expect(
-			getModelCatalogSnapshot().local.models?.find((m) => m.id === "gpt-5.5")?.rawMetadata,
-		).toEqual({});
+		const model = getModelCardSnapshot().local.models?.find((m) => m.id === "gpt-5.5");
+		expect(model?.name).toBe("Migrated label");
+		expect(model?.metadata).toEqual({});
 		expect(getEffectiveModelCard("codex:gpt-5.5").provenance.input_cost_per_token?.layer).not.toBe(
 			"local-model",
 		);
 	});
 	test("API allows member reads, denies writes, reports conflicts and returns actual scope", async () => {
-		expect((await app("user").request("/api/model-catalog")).status).toBe(200);
+		// The v1 surface is gone; only the raw contract is served.
+		expect((await app("user").request("/api/model-catalog/resolve?model=x")).status).toBe(404);
 		const v2 = await app("user").request("/api/model-catalog/v2");
 		expect(v2.status).toBe(200);
 		const snapshot = await v2.json();
@@ -1134,10 +1087,10 @@ describe("catalog update and API boundary", () => {
 			baseRevision: 99,
 		});
 		const init = { method: "POST", headers: { "content-type": "application/json" }, body };
-		expect((await app("user").request("/api/model-catalog/mutate", init)).status).toBe(403);
-		expect((await app().request("/api/model-catalog/mutate", init)).status).toBe(409);
+		expect((await app("user").request("/api/model-catalog/v2/mutate", init)).status).toBe(403);
+		expect((await app().request("/api/model-catalog/v2/mutate", init)).status).toBe(409);
 		const resolved = await (
-			await app().request("/api/model-catalog/resolve?model=codex:gpt-5.5")
+			await app().request("/api/model-catalog/v2/resolve?model=codex:gpt-5.5")
 		).json();
 		expect(resolved.resolvedQuery).toEqual({
 			upstreamModelId: "gpt-5.5",
@@ -1149,11 +1102,12 @@ describe("catalog update and API boundary", () => {
 
 describe("protected-field batch resolution", () => {
 	test("hundreds of bindings prepare only three resolvers and preserve protection counts", async () => {
-		const initial = getModelCatalogSnapshot();
+		const initial = getModelCardSnapshot();
 		const version = await mockCatalog("batch-protection-398-bindings", (catalog) => {
 			const model = catalog.models.find((entry) => entry.id === "gpt-5.5");
-			if (!model?.metadata.limits) throw new Error("Expected model limits");
-			model.metadata.limits.contextWindow = presetContextWindow + 1;
+			if (typeof model?.metadata.max_input_tokens !== "number")
+				throw new Error("Expected model limits");
+			model.metadata.max_input_tokens = presetContextWindow + 1;
 		});
 		await checkModelCatalogUpdate();
 		const cfg = local.agent.modelCatalog;
@@ -1163,35 +1117,33 @@ describe("protected-field batch resolution", () => {
 			upstreamModelId: "gpt-5.5",
 			providerId: `batch-provider-${i}`,
 			modelId: "gpt-5.5",
-			overrides: { limits: { contextWindow: presetContextWindow * 2 } },
+			overrides: { max_input_tokens: presetContextWindow * 2 },
 		}));
 		cfg.local.revision++;
-		const prepare = spyOn(metadataResolvers, "createModelMetadataResolver");
-		const single = spyOn(metadataResolvers, "resolveModelMetadata");
+		const prepare = spyOn(cardResolvers, "createModelCardResolver");
 		try {
-			const checked = getModelCatalogSnapshot();
+			const checked = getModelCardSnapshot();
 			expect(checked.catalog.catalogVersion).toBe(initial.catalog.catalogVersion);
 			expect(checked.update.pendingVersion).toBe(`v2:${version}`);
 			expect(checked.update.protectedFieldCount).toBe(398);
 			expect(prepare).toHaveBeenCalledTimes(3);
-			expect(single).not.toHaveBeenCalled();
-			const again = getModelCatalogSnapshot();
+			const again = getModelCardSnapshot();
 			expect(again).toEqual(checked);
 			expect(prepare).toHaveBeenCalledTimes(3);
 			// Neither a caller's view nor a cache hit may mutate future snapshots.
 			if (again.update.pendingDiff?.fields) again.update.pendingDiff.fields.length = 0;
-			expect(getModelCatalogSnapshot()).toEqual(checked);
+			expect(getModelCardSnapshot()).toEqual(checked);
 		} finally {
 			prepare.mockRestore();
-			single.mockRestore();
 		}
 	});
 
 	test("rebinding different local settings at the same revision invalidates the count", async () => {
 		await mockCatalog("rebound-protection-cache", (catalog) => {
 			const model = catalog.models.find((entry) => entry.id === "gpt-5.5");
-			if (!model?.metadata.limits) throw new Error("Expected model limits");
-			model.metadata.limits.contextWindow = presetContextWindow + 1;
+			if (typeof model?.metadata.max_input_tokens !== "number")
+				throw new Error("Expected model limits");
+			model.metadata.max_input_tokens = presetContextWindow + 1;
 		});
 		const checked = await checkModelCatalogUpdate();
 		expect(checked.update.protectedFieldCount).toBe(0);
@@ -1204,11 +1156,11 @@ describe("protected-field batch resolution", () => {
 				upstreamModelId: "gpt-5.5",
 				providerId: "rebound-provider",
 				modelId: "gpt-5.5",
-				overrides: { limits: { contextWindow: presetContextWindow * 2 } },
+				overrides: { max_input_tokens: presetContextWindow * 2 },
 			},
 		];
 		bindModelCatalogSettings(rebound, () => {});
-		const after = getModelCatalogSnapshot();
+		const after = getModelCardSnapshot();
 		expect(after.local.revision).toBe(checked.local.revision);
 		expect(after.update.pendingVersion).toBe(checked.update.pendingVersion);
 		expect(after.update.protectedFieldCount).toBe(1);

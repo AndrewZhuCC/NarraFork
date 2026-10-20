@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
 	bindModelCatalogSettings,
-	getEffectiveModelMetadata,
-	getModelCatalogSnapshot,
-	mutateModelCatalog,
+	getEffectiveModelProfile,
+	getModelCardSnapshot,
+	mutateModelCard,
 } from "../../model-catalog";
 import { type OpenAIProviderConfig, saveSettings, settings } from "../../settings";
 import type { NarraForkSettings } from "../../settings/types";
@@ -84,8 +84,8 @@ function installReasoningLevels(): void {
 			openaiProviders: [config({})],
 			agent: {
 				modelCatalog: {
-					schemaVersion: 1,
-					migrationVersion: 1,
+					schemaVersion: 2,
+					migrationVersion: 2,
 					local: { revision: 0 },
 					autoApply: false,
 					pinnedVersion: null,
@@ -94,23 +94,21 @@ function installReasoningLevels(): void {
 		} as NarraForkSettings,
 		() => {},
 	);
-	mutateModelCatalog({
-		baseRevision: getModelCatalogSnapshot().local.revision,
+	mutateModelCard({
+		baseRevision: getModelCardSnapshot().local.revision,
 		action: "upsert-model",
 		model: {
 			id: "glm-5.1",
 			matches: { aliases: ["responses:glm-5.1", "openai:glm-5.1"] },
 			metadata: {
-				reasoning: {
-					supported: true,
-					levels: ["low", "medium", "high", "max"],
-					canDisable: true,
-				},
+				supports_reasoning: true,
+				reasoning_effort_levels: ["low", "medium", "high", "max"],
+				can_disable_reasoning: true,
 			},
 		},
 	});
 	for (const model of ["p1:glm-5.1", "p1:responses:glm-5.1"]) {
-		expect(getEffectiveModelMetadata(model).metadata.reasoning?.levels).toEqual([
+		expect(getEffectiveModelProfile(model).reasoning.levels).toEqual([
 			"low",
 			"medium",
 			"high",

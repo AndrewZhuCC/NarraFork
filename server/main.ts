@@ -55,7 +55,7 @@ import {
 	registerServerRestart,
 	scheduleServerRestart,
 } from "./lib/server-restart";
-import { reloadSettings, settings } from "./lib/settings";
+import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { shellExecute } from "./lib/shell-exec";
@@ -1322,8 +1322,9 @@ startServerAddressWatcher({
 
 // 其余配置（实例名、主题色、打开方式等）由管理器面板直接写文件，没有地址那样的重绑回路：
 // 文件变化时重载配置即可，运行时组件按需读取新值。地址变化由上面的监听单独处理。
+// 本进程自己的保存同样会触发文件事件，内容与上次写入一致时无需重载。
 startSettingsFileWatcher(() => {
-	reloadSettings();
+	reloadSettingsIfChanged();
 });
 
 /** Open a URL in the user's default browser. */

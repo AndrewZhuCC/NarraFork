@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { ModelMetadata } from "@shared/model-catalog/schema/catalog";
-import {
-	bindModelCatalogSettings,
-	getEffectiveModelMetadata,
-	getModelCatalogSnapshot,
-	mutateModelCatalog,
-} from "../../model-catalog";
+import type { RawMetadata } from "@shared/model-catalog/card";
+import bundledCatalog from "@shared/model-catalog/dist/catalog.json";
+import { bindModelCatalogSettings, getEffectiveModelCard } from "../../model-catalog";
 import { type AnthropicProviderConfig, saveSettings, settings } from "../../settings";
 import type { NarraForkSettings } from "../../settings/types";
 import { AnthropicProvider, mapEffortParam } from "../anthropic-provider";
@@ -84,16 +80,29 @@ afterEach(() => {
 
 function installClaudeReasoningMetadata(
 	modelId = "claude-opus-5",
-	reasoning: ModelMetadata["reasoning"] = { supported: true },
+	reasoning: RawMetadata = { supports_reasoning: true },
 ): void {
+	const preset = bundledCatalog.models.some((model) => model.id === modelId);
 	bindModelCatalogSettings(
 		{
 			anthropicProviders: [config()],
 			agent: {
 				modelCatalog: {
-					schemaVersion: 1,
-					migrationVersion: 1,
-					local: { revision: 0 },
+					schemaVersion: 2,
+					migrationVersion: 2,
+					local: {
+						revision: 0,
+						models: preset ? [] : [{ id: modelId, metadata: reasoning }],
+						bindings: [
+							{
+								id: "claude-channel-fixture",
+								providerId: "relay",
+								upstreamModelId: `anthropic:${modelId}`,
+								modelId,
+								overrides: reasoning,
+							},
+						],
+					},
 					autoApply: false,
 					pinnedVersion: null,
 				},
@@ -101,25 +110,7 @@ function installClaudeReasoningMetadata(
 		} as NarraForkSettings,
 		() => {},
 	);
-	mutateModelCatalog({
-		baseRevision: getModelCatalogSnapshot().local.revision,
-		action: "upsert-model",
-		model: { id: modelId, metadata: { reasoning } },
-	});
-	mutateModelCatalog({
-		baseRevision: getModelCatalogSnapshot().local.revision,
-		action: "upsert-binding",
-		binding: {
-			id: "claude-channel-fixture",
-			providerId: "relay",
-			upstreamModelId: `anthropic:${modelId}`,
-			modelId,
-			overrides: { reasoning },
-		},
-	});
-	expect(getEffectiveModelMetadata(`relay:anthropic:${modelId}`).metadata.reasoning).toMatchObject(
-		reasoning ?? {},
-	);
+	expect(getEffectiveModelCard(`relay:anthropic:${modelId}`).metadata).toMatchObject(reasoning);
 }
 
 type RequestPath = "chat" | "generate" | "history";
@@ -141,12 +132,12 @@ async function capturePath(
 	return capturedBody as Record<string, unknown>;
 }
 
-const OPUS_45_BUDGET_REASONING: ModelMetadata["reasoning"] = {
-	supported: true,
-	mode: "budget",
-	levels: null,
-	canDisable: true,
-	defaultLevel: null,
+const OPUS_45_BUDGET_REASONING: RawMetadata = {
+	supports_reasoning: true,
+	reasoning_mode: "budget",
+	reasoning_effort_levels: null,
+	can_disable_reasoning: true,
+	default_reasoning_effort: null,
 };
 
 const REQUEST_PATHS: RequestPath[] = ["chat", "generate", "history"];
@@ -189,7 +180,7 @@ describe("AnthropicProvider Opus 4.5 budget-mode effort", () => {
 	test("explicit metadata levels retain ownership of tier mapping", async () => {
 		installClaudeReasoningMetadata("claude-opus-4-5", {
 			...OPUS_45_BUDGET_REASONING,
-			levels: ["low", "max"],
+			reasoning_effort_levels: ["low", "max"],
 		});
 		const model = "relay:anthropic:claude-opus-4-5";
 		expect(mapEffortParam(model, "xhigh")).toBe("max");

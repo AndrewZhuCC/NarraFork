@@ -1,8 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ModelCard, validateRawMetadata } from "@shared/model-catalog/card";
-import type { ResolvedModelMetadata } from "@shared/model-catalog/schema/catalog";
-import { validateMetadata } from "@shared/model-catalog/src/index";
+import { type LegacyResolvedEnvelope, legacyMetadataToRaw } from "./model-catalog/legacy-v1";
 import { getNarraforkHome } from "./narrafork-home";
 import type { NUGProviderConfig } from "./settings/types";
 
@@ -24,7 +23,8 @@ export interface NugModelInfo extends Record<string, unknown> {
 	 * list is authoritative, `[]` asserts the model has none, and an absent field
 	 * means the gateway did not report them. */
 	effortLevels?: string[];
-	metadata?: ResolvedModelMetadata;
+	/** Old gateways only: the grouped envelope, imported by the catalog at query time. */
+	metadata?: LegacyResolvedEnvelope;
 	/** Optional complete v2 card from a new NUG; old NUG responses omit it. */
 	modelCard?: ModelCard;
 }
@@ -41,7 +41,8 @@ export interface ResolvedNugModelMeta {
 	available?: boolean;
 	contextWindow?: number;
 	effortLevels?: string[];
-	metadata?: ResolvedModelMetadata;
+	/** Old gateways only: the grouped envelope, imported by the catalog at query time. */
+	metadata?: LegacyResolvedEnvelope;
 	modelCard?: ModelCard;
 }
 
@@ -88,17 +89,22 @@ function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 	delete info.metadata;
 	delete info.modelCard;
 	if (raw.metadata && typeof raw.metadata === "object") {
-		const envelope = raw.metadata as ResolvedModelMetadata;
-		if (envelope.schemaVersion === 1) {
+		const envelope = raw.metadata as LegacyResolvedEnvelope;
+		if (
+			envelope.schemaVersion === 1 &&
+			envelope.metadata &&
+			typeof envelope.metadata === "object"
+		) {
 			try {
-				info.metadata = { ...envelope, metadata: validateMetadata(envelope.metadata) };
+				legacyMetadataToRaw(envelope.metadata);
+				info.metadata = structuredClone(envelope);
 			} catch {
-				/* compatibility projection remains usable */
+				/* an unreadable envelope reports nothing rather than a wrong capability */
 			}
 		}
 	}
-	// Prefer the complete v2 card when a new NUG provides it; keep the v1
-	// projection so old readers and fallbacks stay unchanged.
+	// Prefer the complete card when a new NUG provides it; an old NUG's envelope is
+	// kept only so the catalog can import it when no card exists.
 	// `validateRawMetadata` rejects operational/credential keys and structural abuse;
 	// a rejected card is dropped (same catch strategy as the metadata envelope) rather
 	// than cached and written to disk.
@@ -108,7 +114,7 @@ function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 			try {
 				info.modelCard = { ...card, metadata: validateRawMetadata(card.metadata) };
 			} catch {
-				/* discard the card; the v1 projection remains usable */
+				/* discard the card; an envelope, if any, still applies */
 			}
 		}
 	}

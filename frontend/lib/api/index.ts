@@ -9,7 +9,6 @@ import { grammarsApi } from "./grammars";
 import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
-import { modelCardsApi } from "./model-cards";
 import { narratorsApi } from "./narrators";
 import { notificationsApi } from "./notifications";
 import { oauthAppsApi } from "./oauth-apps";
@@ -44,7 +43,6 @@ export const api = {
 	...grammarsApi,
 	...integrationsApi,
 	...miscApi,
-	...modelCardsApi,
 	...knowledgeApi,
 	...specApi,
 	...systemLifecycleApi,

@@ -52,7 +52,7 @@ import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
-import { useModelCardIndex } from "../../hooks/useModelCards";
+import { useActualResolvedModelCard } from "../../hooks/useModelCatalog";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
@@ -409,7 +409,6 @@ function NarratorPanelBody({
 		providerLabels,
 		nugProviderIdByPrefix,
 	} = useAllModels();
-	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
 	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
@@ -697,6 +696,8 @@ function NarratorPanelBody({
 			aggregations,
 			allModels,
 		);
+	// The catalog card a request for this model resolves to; feeds the reasoning tiers.
+	const { data: modelCard } = useActualResolvedModelCard(resolvedModel || undefined);
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -3646,7 +3647,7 @@ function NarratorPanelBody({
 							resolvedModelOption,
 							narratorReasoningEffort: narrator.reasoningEffort,
 							settingsData,
-							modelCardIndex,
+							modelCard,
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,

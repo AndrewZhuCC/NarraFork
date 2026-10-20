@@ -1,18 +1,18 @@
-import type { ModelMetadata } from "@shared/model-catalog/schema/catalog";
+import type { ModelProfile } from "@shared/model-catalog/profile";
 import {
 	clampReasoningEffort,
 	REASONING_EFFORT_VALUES,
 	type ReasoningEffort,
 } from "@shared/reasoning-effort";
-import { getEffectiveModelCard, getEffectiveModelMetadata } from "../model-catalog";
+import { getEffectiveModelCard, getEffectiveModelProfile } from "../model-catalog";
 
-export function effectiveProviderMetadata(model: string): ModelMetadata {
-	return getEffectiveModelMetadata(model).metadata;
+export function effectiveModelProfile(model: string): ModelProfile {
+	return getEffectiveModelProfile(model);
 }
 
 /** Explicit requests replace defaults, but never exceed a declared model ceiling. */
 export function resolveOutputTokenLimit(
-	metadata: ModelMetadata,
+	profile: Pick<ModelProfile, "maxOutputTokens">,
 	requested?: number,
 	fallback?: number,
 ): number | undefined {
@@ -20,7 +20,7 @@ export function resolveOutputTokenLimit(
 		typeof value === "number" && Number.isFinite(value) && value > 0
 			? Math.max(1, Math.floor(value))
 			: undefined;
-	const limit = positive(metadata.limits?.maxOutputTokens);
+	const limit = positive(profile.maxOutputTokens);
 	const desired = positive(requested) ?? positive(fallback);
 	return desired === undefined ? limit : limit === undefined ? desired : Math.min(desired, limit);
 }
@@ -109,10 +109,10 @@ export function resolveOutputTokenBudget(
 
 /** Metadata validates semantic levels; adapters retain ownership of the wire mapping. */
 export function resolveMetadataReasoning(
-	metadata: ModelMetadata,
+	profile: Pick<ModelProfile, "reasoning">,
 	requested?: string,
 ): string | undefined {
-	const reasoning = metadata.reasoning;
+	const reasoning = profile.reasoning;
 	if (reasoning?.supported === false) return undefined;
 	let effort = requested ?? reasoning?.defaultLevel ?? undefined;
 	if (!effort) return undefined;
@@ -142,9 +142,9 @@ export function resolveMetadataReasoning(
 export function assertModelInputModalities(
 	model: string,
 	values: unknown,
-	metadata = effectiveProviderMetadata(model),
+	profile: Pick<ModelProfile, "inputModalities"> = effectiveModelProfile(model),
 ): void {
-	const inputs = metadata.modalities?.input;
+	const inputs = profile.inputModalities;
 	if (!Array.isArray(inputs)) return;
 	const visit = (value: unknown): void => {
 		if (!value || typeof value !== "object") return;

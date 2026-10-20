@@ -478,8 +478,8 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 		]);
 		delete settings.customApiProviders;
 		settings.agent.modelCatalog = {
-			schemaVersion: 1,
-			migrationVersion: 1,
+			schemaVersion: 2,
+			migrationVersion: 2,
 			local: { revision: 0 },
 			autoApply: false,
 			pinnedVersion: null,
