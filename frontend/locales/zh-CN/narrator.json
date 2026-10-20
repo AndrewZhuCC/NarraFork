@@ -1044,6 +1044,7 @@
 	"subagentRecoveryResumeAndWait": "恢复运行并等待",
 	"subagentRecoveryResolvedNotify": "已恢复 {{count}} 个子代理，并已告知叙述者去等待结果。",
 	"subagentRecoveryResolvedWait": "已恢复 {{count}} 个子代理，并等待全部结果返回。",
+	"subagentRecoveryDismiss": "忽略（不恢复运行）",
 	"branches": "分支",
 	"branchRoot": "主线",
 	"branchActive": "活跃",

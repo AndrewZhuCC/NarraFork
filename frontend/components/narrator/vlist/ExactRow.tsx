@@ -269,6 +269,11 @@ export interface ExactRowProps {
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
 	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
 	/**
+	 * Close the subagent-recovery card without resuming anything (mutation lives
+	 * outside vlist/). Absent → the card paints no close button at all.
+	 */
+	onDismissSubagentRecovery?: (messageId: string) => void;
+	/**
 	 * Live handlers for a Dynamic Spec notice card's buttons (view tasks / clear
 	 * tasks / reset spec). Present only on those rows; absent → the buttons render
 	 * disabled instead of silently inert.
@@ -383,6 +388,7 @@ export const ExactRow = memo(
 		onTogglePromptForKey,
 		resolveRowToolActions,
 		onResumeSubagentRecovery,
+		onDismissSubagentRecovery,
 		specCarryoverActions,
 		errorNoticeActions,
 		injectionGuardActions,
@@ -647,8 +653,8 @@ export const ExactRow = memo(
 			};
 		}
 		// The recovery card owns a checkbox list plus two submit buttons. Its rows
-		// reuse the generic per-row toggle; the submit itself is a mutation living
-		// outside vlist/, injected by the panel.
+		// reuse the generic per-row toggle; the submit and the dismiss are mutations
+		// living outside vlist/, injected by the panel.
 		if (kind === "subagent-recovery") {
 			extra.onToggleRow = toggles.onToggleRow;
 			// System cards carry no `-b{n}` suffix, so they never get a RowInteraction.
@@ -658,6 +664,9 @@ export const ExactRow = memo(
 				const specKey = item.spec.key;
 				extra.onResume = (mode: "notify" | "await") =>
 					onResumeSubagentRecovery(messageId, specKey, mode);
+			}
+			if (messageId && onDismissSubagentRecovery) {
+				extra.onDismiss = () => onDismissSubagentRecovery(messageId);
 			}
 		}
 		// Dynamic Spec notice cards (fork carryover / context cleared / goal added)
@@ -1075,6 +1084,7 @@ export const ExactRow = memo(
 		prev.onTogglePromptForKey === next.onTogglePromptForKey &&
 		prev.resolveRowToolActions === next.resolveRowToolActions &&
 		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery &&
+		prev.onDismissSubagentRecovery === next.onDismissSubagentRecovery &&
 		prev.specCarryoverActions === next.specCarryoverActions &&
 		prev.errorNoticeActions === next.errorNoticeActions &&
 		prev.injectionGuardActions === next.injectionGuardActions &&

@@ -2216,6 +2216,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	subagentRecoveryResolvedNotify:
 		"Restarted {count} subagent(s); the narrator was told to await them.",
 	subagentRecoveryResolvedWait: "Restarted {count} subagent(s) and waited for every result.",
+	subagentRecoveryDismiss: "Dismiss without restarting",
 	// Reflection notice titles: `${kind}Reflection${Status}` (see
 	// reflectionTitleKeyPrefix / reflectionTitleKeySuffix). The title participates
 	// in the measured height, so it must flow through the adapter, not the render
@@ -3304,6 +3305,9 @@ function adaptSystemBlock(
 				notifyLabel: sysLabel(ctx, "subagentRecoveryResumeAndNotify"),
 				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWait"),
 				backgroundBadge: sysLabel(ctx, "subagentRecoveryToBackground"),
+				// Close button (aria-label + tooltip). Height-neutral: it sits inside
+				// the header lane the measure layer already reserves.
+				dismissLabel: sysLabel(ctx, "subagentRecoveryDismiss"),
 			},
 		};
 	}

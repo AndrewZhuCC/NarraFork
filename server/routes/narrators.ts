@@ -4152,6 +4152,19 @@ narratorRoutes.delete("/:id/interrupt-task-guard-messages/:messageId", async (c)
 	return c.json({ ok: true, deletedMessageIds: [messageId] });
 });
 
+// Dismiss the post-error subagent recovery card ("leave them stopped")
+narratorRoutes.delete("/:id/subagent-recovery-messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.dismissSubagentRecoveryMessage(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	return c.json({ ok: true, deletedMessageIds: [messageId] });
+});
+
 // Dismiss a single error system message
 narratorRoutes.delete("/:id/error-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");

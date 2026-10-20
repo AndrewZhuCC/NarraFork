@@ -2016,6 +2016,18 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
+	/**
+	 * Close the post-error subagent recovery card without restarting anything.
+	 * Neither resumes nor records a selection: the offer is simply withdrawn, and
+	 * the server's per-subagent watermark keeps it from being offered again.
+	 */
+	dismissSubagentRecoveryMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedMessageIds: string[] }>(
+			`/narrators/${narratorId}/subagent-recovery-messages/${messageId}`,
+			{
+				method: "DELETE",
+			},
+		),
 	/** What deleting one tool_use block would roll back, for the confirm dialog. */
 	blockDeletePreview: (narratorId: string, messageId: string, blockIndex: number) =>
 		request<BlockDeletePreview>(

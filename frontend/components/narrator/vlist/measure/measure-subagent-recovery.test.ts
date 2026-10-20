@@ -186,6 +186,16 @@ describe("measureSubagentRecovery", () => {
 		expect(measured.height).toBe(subagentRecoveryPendingHeight(C.ROWS_MAX));
 		expect(payloadOf<{ subagents: unknown[] }>(measured).subagents).toHaveLength(C.ROWS_MAX);
 	});
+
+	it("carries the close button caption without changing the height", () => {
+		const bare = measureSubagentRecovery(data(2), WIDTH);
+		const labelled = measureSubagentRecovery(
+			data(2, { dismissLabel: "忽略（不恢复运行）" }),
+			WIDTH,
+		);
+		expect(labelled.height).toBe(bare.height);
+		expect(payloadOf<{ dismissLabel?: string }>(labelled).dismissLabel).toBe("忽略（不恢复运行）");
+	});
 });
 
 describe("chrome constants", () => {
@@ -200,5 +210,14 @@ describe("chrome constants", () => {
 		expect(C.HEADER_HEIGHT).toBe(36); // 17×2 + 2
 		expect(C.PENDING_HEIGHT_PER_ROW).toBe(24); // 20 + 4
 		expect(C.RESOLVED_HEIGHT).toBe(37); // 10×2 + 17
+	});
+
+	it("fits the close button inside the header lane it is painted in", () => {
+		// This is the whole reason the dismiss affordance is height-neutral: the
+		// button rides in the header row, whose reserved height already covers it.
+		// A bigger button (or a slimmer header) would silently grow the card past
+		// `measured.height`, which the committed row can never reflow.
+		expect(C.CLOSE_BUTTON_SIZE).toBe(22); // Mantine CloseButton xs box
+		expect(C.HEADER_HEIGHT).toBeGreaterThanOrEqual(C.CLOSE_BUTTON_SIZE);
 	});
 });

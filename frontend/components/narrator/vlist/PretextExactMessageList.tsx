@@ -320,6 +320,7 @@ import {
 } from "./vlist-spec-carryover-actions";
 import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-live";
 import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
+import { useSubagentRecoveryDismiss } from "./vlist-subagent-recovery-dismiss";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { installVListTextDragGuard } from "./vlist-text-drag";
@@ -1605,6 +1606,10 @@ export const PretextExactMessageList = memo(
 				},
 				[],
 			);
+			// Closing the recovery card is the third answer — "leave them stopped". It
+			// deletes the display row server-side, so identity stability matters here for
+			// the same reason as above: every mounted row receives this callback.
+			const dismissSubagentRecovery = useSubagentRecoveryDismiss(narratorId);
 
 			// Dynamic Spec notice cards: "View tasks" opens the Spec task board. The panel
 			// owns that panel, and the chunked card reaches it by bubbling a DOM
@@ -5316,6 +5321,7 @@ export const PretextExactMessageList = memo(
 							? getUnknownHeightReporter(item.spec.key, item.contentWidth ?? contentWidth)
 							: undefined,
 						onResumeSubagentRecovery: handleResumeSubagentRecovery,
+						onDismissSubagentRecovery: dismissSubagentRecovery,
 						specCarryoverActions: resolveSpecCarryoverActions(item, sourceIds, resolveSpecActions),
 						errorNoticeActions: resolveErrorNoticeActions(item, sourceIds, errorNotice.resolve),
 						injectionGuardActions: resolveInterruptGuardActions(
