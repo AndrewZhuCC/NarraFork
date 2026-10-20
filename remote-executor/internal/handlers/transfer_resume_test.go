@@ -14,12 +14,6 @@ import (
 	"time"
 )
 
-// nopSender discards frames (upload direction receives, never sends).
-type nopSender struct{}
-
-func (nopSender) SendBinary([]byte) error { return nil }
-func (nopSender) BufferedAmount() int     { return 0 }
-
 type slowCountingSender struct {
 	count atomic.Int64
 }

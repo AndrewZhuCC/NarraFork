@@ -405,9 +405,12 @@ describe("batch-delete rollback feedback", () => {
 		const notification = show.mock.calls[0][0];
 		expect(notification.color).toBe("red");
 		expect(notification.autoClose).toBe(false);
-		expect(notification.message).toContain("/repo/a.ts: revertFileStatus.applied");
+		// Exceptions are listed per file; the successful write is reported as a count,
+		// so a partial result still states that a.ts was actually restored.
+		expect(notification.message).not.toContain("/repo/a.ts");
+		expect(notification.message).toContain("revertResultSuccessCount");
 		expect(notification.message).toContain("/repo/b.ts: revertFileStatus.failed (EACCES)");
-		expect(notification.message).toContain("/repo/c.ts: revertFileStatus.unknown");
+		expect(notification.message).toContain("[remote] /repo/c.ts: revertFileStatus.unknown");
 		expect(notification.message).toContain("revertHistoryUnchanged");
 		expect(options.chunkListRef.current?.refreshStructure).toHaveBeenCalledTimes(1);
 		for (const resource of resources) {

@@ -98,23 +98,18 @@ async function runProbe(
 		const second = join(directory, "b");
 		await io.writeFile(first, "probe");
 		const entry = await io.lstat(first, { bigint: true });
-		let identity: string;
-		try {
-			identity = localObjectIdentity(entry);
-		} catch {
-			return unsupported("object_identity_unavailable");
-		}
+		// Per-file restore compares operation-local identities and degrades gracefully, so
+		// localObjectIdentity no longer throws on these. Volume admission still needs the
+		// real properties: FAT/exFAT and many shares report zero dev/ino or no creation time.
+		if (!realObjectIdentity(entry)) return unsupported("object_identity_unavailable");
+		const identity = localObjectIdentity(entry);
 		if (!entry.isFile() || entry.nlink !== 1n) return unsupported("link_count_unreliable");
 		const handle = await io.open(first, "r");
 		try {
 			const opened = await handle.stat({ bigint: true });
-			let openedIdentity: string;
-			try {
-				openedIdentity = localObjectIdentity(opened);
-			} catch {
-				return unsupported("object_identity_unavailable");
-			}
-			if (openedIdentity !== identity) return unsupported("descriptor_identity_mismatch");
+			if (!realObjectIdentity(opened)) return unsupported("object_identity_unavailable");
+			if (localObjectIdentity(opened) !== identity)
+				return unsupported("descriptor_identity_mismatch");
 		} finally {
 			await handle.close();
 		}
@@ -127,13 +122,15 @@ async function runProbe(
 		const alias = await io.lstat(second, { bigint: true });
 		// nlink must be real: a constant 1 would let multiply-linked files pass `regular()`.
 		if (linked.nlink !== 2n || alias.nlink !== 2n) return unsupported("link_count_unreliable");
-		try {
-			if (localObjectIdentity(alias) !== identity) return unsupported("object_identity_unstable");
-		} catch {
-			return unsupported("object_identity_unavailable");
-		}
+		if (!realObjectIdentity(alias)) return unsupported("object_identity_unavailable");
+		if (localObjectIdentity(alias) !== identity) return unsupported("object_identity_unstable");
 		return { supported: true, platform };
 	} finally {
 		await io.rm(directory, { recursive: true, force: true }).catch(() => {});
 	}
+}
+
+/** A volume exposes a usable object identity only with a nonzero dev/ino and a creation time. */
+function realObjectIdentity(stat: BigIntStats): boolean {
+	return !(stat.dev === 0n && stat.ino === 0n) && stat.birthtimeNs > 0n;
 }

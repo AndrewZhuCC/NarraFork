@@ -26,6 +26,7 @@ import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import { fileChangeLocalIo } from "./file-change-local-io";
+import { fileChangePlatformCapability } from "./file-change-platform-capability";
 import {
 	getDefaultLocalFileChangeRuntime,
 	type LocalFileChangeRuntime,
@@ -316,6 +317,15 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 function stale(message: string) {
 	return new RevertPlannerError("STALE", message);
 }
+/** Volume-level admission (e.g. FAT/exFAT on Windows) before any history is read. */
+async function assertLocalRevertPlatform() {
+	const capability = await fileChangePlatformCapability();
+	if (!capability.supported)
+		throw new RevertPlannerError(
+			"PLATFORM_UNSUPPORTED",
+			`Local filesystem cannot provide verified rollback identities (${capability.reason})`,
+		);
+}
 async function verifiedNamespace(signal: AbortSignal) {
 	signal.throwIfAborted();
 	const runtime = await getDefaultLocalFileChangeRuntime();
@@ -458,7 +468,7 @@ export async function prepareLocalRevertAction(
 				"UNSUPPORTED_TARGET",
 				"This action requires a local filesystem narrator",
 			);
-
+		await assertLocalRevertPlatform();
 		let selector: RevertPlannerRequest["selector"];
 		let kind: RevertPlannerRequest["kind"];
 		if (input.action === "revert_files") {
@@ -646,7 +656,7 @@ export async function applyLocalRevertPlan(
 	signal: AbortSignal,
 ) {
 	const owner = await access.owner(principal, narratorId, signal);
-
+	await assertLocalRevertPlatform();
 	const { plans, transactions } = await services(signal);
 	const plan = plans.getSummary(owner, planId);
 	if (plan.planHash !== input.planHash)

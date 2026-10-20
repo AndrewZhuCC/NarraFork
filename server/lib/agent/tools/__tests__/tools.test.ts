@@ -61,6 +61,14 @@ function makeTruncatedBackend(onWrite: () => void): ExecutionBackend {
 		pathFlavor: "posix",
 		runtimeGeneration: 1,
 		statFile: async () => ({ isDirectory: false, isFile: true, size: 20_000_000 }),
+		// Every real backend resolves the queue identity before IO; the truncated read
+		// is what this fixture exercises, so the identity itself is a fixed path.
+		resolvePathIdentity: async (path: string) => ({
+			lexicalPath: path,
+			canonicalPath: path,
+			exists: true,
+			runtimeGeneration: 1,
+		}),
 		readFileBytes: async () => ({
 			bytes: new TextEncoder().encode("truncated prefix"),
 			truncated: true,

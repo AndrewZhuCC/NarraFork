@@ -1496,6 +1496,13 @@ function planMessageRangeDeletion(
 	};
 }
 
+/** Every file effect hangs off a tool call (own or delegated). A range with none owns
+ * no file history: there is nothing to restore and no principal to require. Kept out of
+ * the plan object, whose serialized form is the stale-history check. */
+function ownsFileHistory(plan: ReturnType<typeof planMessageRangeDeletion>): boolean {
+	return plan.tools.length > 0 || plan.derived.toolCallIds.length > 0;
+}
+
 async function deleteMessageRange(
 	narratorId: string,
 	messageId: string,
@@ -1574,7 +1581,8 @@ async function deleteMessageRange(
 					planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
 				);
 				// History-only deletion needs no async gap: plan and mutation share this tx.
-				if (opts?.skipRevert) apply(tx, plan);
+				// A range with no file history needs no restore, so it commits the same way.
+				if (opts?.skipRevert || !ownsFileHistory(plan)) apply(tx, plan);
 				return plan;
 			}),
 		);
@@ -1582,7 +1590,7 @@ async function deleteMessageRange(
 		const messageIds = planned.refs.map((ref) => ref.messageId);
 		let revertWarnings: RevertWarning[] = [];
 		let revertResult: RevertResult | undefined;
-		if (!opts?.skipRevert && messageIds.length > 0) {
+		if (!opts?.skipRevert && messageIds.length > 0 && ownsFileHistory(planned)) {
 			const version = JSON.stringify(planned);
 			const result = await measureAsync("fileRevert", () =>
 				revertForDeletedMessages(narratorId, messageIds, opts?.scope, opts),
