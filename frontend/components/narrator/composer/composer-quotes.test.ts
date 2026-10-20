@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { FileReference } from "@shared/file-reference";
 import {
+	composerPreviewText,
 	joinQuotedComposerInput,
 	MAX_COMPOSER_QUOTE_CHARS,
 	MAX_COMPOSER_QUOTE_LABEL_CHARS,
@@ -206,5 +207,22 @@ describe("parseComposerSegments", () => {
 			{ type: "attachment", kind: "image", index: 0 },
 			{ type: "text", text: "[image #1: a.png]" },
 		]);
+	});
+	test("treats escaped look-alikes as literal text and removes the escape", () => {
+		const text = "see \\[image #1: a.png]";
+		expect(parseComposerSegments(text, { images: ["a.png"], files: [] })).toEqual([
+			{ type: "text", text: "see [image #1: a.png]" },
+		]);
+	});
+});
+
+describe("composerPreviewText", () => {
+	test("reads as one plain line in composed order", () => {
+		const text =
+			"> [quote] 来源 @@m:abcd\n> 内容\n\n怎样算？\n> [quote] 第二\n> 二\n\n看[image #1: a.png]";
+		expect(composerPreviewText(text, { images: ["a.png"], files: [] })).toBe(
+			"[❝ 来源] 怎样算？ [❝ 第二] 看[a.png]",
+		);
+		expect(composerPreviewText("plain\ntext")).toBe("plain\ntext");
 	});
 });

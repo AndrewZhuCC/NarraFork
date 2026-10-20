@@ -279,7 +279,14 @@ export function editFileReferenceInput(
 		);
 		for (const span of projection?.spans ?? []) {
 			const node = document.paragraphs[span.paragraph].children[span.node];
-			if (node.type !== "text" || start < span.start || end > span.end) continue;
+			// An escaped text node no longer maps 1:1 onto its projected characters.
+			if (
+				node.type !== "text" ||
+				node.text.length !== span.end - span.start ||
+				start < span.start ||
+				end > span.end
+			)
+				continue;
 			const replacement = {
 				...node,
 				text:

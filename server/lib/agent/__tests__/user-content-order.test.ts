@@ -57,4 +57,12 @@ describe("orderUserContent", () => {
 			{ type: "image", image: "A" },
 		]);
 	});
+	test("skips placeholders the projection escaped", () => {
+		expect(orderUserContent("\\[image #1: a.png] then [image #1: a.png]", ["A"], "before")).toEqual(
+			[
+				{ type: "text", text: "\\[image #1: a.png] then [image #1: a.png]" },
+				{ type: "image", image: "A" },
+			],
+		);
+	});
 });
