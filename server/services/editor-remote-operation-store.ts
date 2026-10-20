@@ -2,10 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import type {
-	EditorApplyResult,
-	EditorHostReceiptRecord,
-	EditorHostReceiptValue,
+import {
+	EDITOR_TARGET_QUEUE_FEATURE,
+	type EditorApplyResult,
+	type EditorHostReceiptRecord,
+	type EditorHostReceiptValue,
 } from "../../shared/editor-provider-contracts";
 import { FEATURE_EDITOR_HOST_RECEIPT_V1 } from "../lib/agent/execution/rpc-types";
 import { getNarraforkHome } from "../lib/narrafork-home";
@@ -65,7 +66,10 @@ export class EditorRemoteOperationStore {
 		);
 		try {
 			const capabilities = await session.capabilities();
-			if (!capabilities.features.includes(FEATURE_EDITOR_HOST_RECEIPT_V1))
+			if (
+				!capabilities.features.includes(FEATURE_EDITOR_HOST_RECEIPT_V1) ||
+				(method === "put" && !capabilities.features.includes(EDITOR_TARGET_QUEUE_FEATURE))
+			)
 				throw new Error("Verified helper lacks native private Host receipt support");
 			return await session.call<T>(`editor.hostReceipt.${method}`, params);
 		} finally {
@@ -91,6 +95,11 @@ export class EditorRemoteOperationStore {
 		return join(this.root, `${operationId}.json`);
 	}
 	async put(value: EditorDurableOperation) {
+		if (value.version !== 2 || value.receipt)
+			throw new Error("New editor intents require version 2; legacy receipts are read-only");
+		if (Buffer.byteLength(JSON.stringify(value)) > MAX_BYTES)
+			throw new Error("Editor recovery metadata exceeds budget");
+		this.validate(value, value.operationId);
 		if (this.native) {
 			if (value.receipt || Buffer.byteLength(JSON.stringify(value)) > MAX_BYTES)
 				throw new Error("Invalid native editor intent metadata");
@@ -117,6 +126,11 @@ export class EditorRemoteOperationStore {
 				if (++scanned > this.limits.records + 2)
 					throw new Error("Editor recovery inventory exceeds budget");
 				if (!entry.isFile()) throw new Error("Unsafe editor recovery inventory");
+				if (
+					entry.name === `${value.operationId}.json` ||
+					entry.name === `${value.operationId}.json.settled`
+				)
+					throw new Error("Editor operation was already attempted; query its receipt instead");
 				// Only a host-settled receipt is eligible; pending/unknown sole proof never expires into not-found.
 				if (/^[a-zA-Z0-9_-]{1,128}\.json\.settled$/.test(entry.name)) {
 					const path = join(this.root, entry.name),
@@ -173,7 +187,7 @@ export class EditorRemoteOperationStore {
 			await unlink(temporary).catch(() => {});
 		}
 	}
-	/** Called only after host evidence + lease settlement, never on a mere transport success. */
+	/** Transfer a verified terminal execution proof; history availability is independent. */
 	async markSettled(operationId: string, receipt: EditorApplyResult, signal?: AbortSignal) {
 		signal?.throwIfAborted();
 		if (this.native) {
@@ -191,7 +205,13 @@ export class EditorRemoteOperationStore {
 			receipt.operationId !== operationId ||
 			!["committed", "rejected"].includes(receipt.outcome) ||
 			(receipt.outcome === "committed" &&
-				(receipt.rawDigest !== record.rawDigest || receipt.totalBytes !== record.bytes))
+				(receipt.rawDigest !== record.rawDigest || receipt.totalBytes !== record.bytes)) ||
+			(receipt.outcome === "rejected" &&
+				(receipt.rawDigest !== null || receipt.totalBytes !== null)) ||
+			(record.receipt &&
+				(record.receipt.outcome !== receipt.outcome ||
+					record.receipt.rawDigest !== receipt.rawDigest ||
+					record.receipt.totalBytes !== receipt.totalBytes))
 		)
 			throw new Error("Cannot take over unmatched editor proof");
 		const directoryIdentity = await this.directory();
@@ -231,7 +251,7 @@ export class EditorRemoteOperationStore {
 	private validate(value: EditorDurableOperation, operationId: string): EditorDurableOperation {
 		if (
 			!value ||
-			value.version !== 1 ||
+			(value.version !== 1 && value.version !== 2) ||
 			value.operationId !== operationId ||
 			!Number.isFinite(value.createdAt) ||
 			value.createdAt > Date.now() ||
@@ -241,7 +261,6 @@ export class EditorRemoteOperationStore {
 				value.userId,
 				value.narratorId,
 				value.deviceId,
-				value.hostOperationId,
 				value.namespace,
 				value.resourceKey,
 				value.root,
@@ -254,8 +273,15 @@ export class EditorRemoteOperationStore {
 			!value.identity ||
 			value.identity.deviceId !== value.deviceId ||
 			!/^[a-f0-9]{64}$/.test(value.rawDigest) ||
-			!validId(value.leaseId) ||
-			!validId(value.effectId) ||
+			!validId(operationId) ||
+			!/^[a-f0-9]{64}$/.test(value.requestDigest) ||
+			(value.version === 1 &&
+				(!validId(value.hostOperationId) || !validId(value.leaseId) || !validId(value.effectId))) ||
+			(value.version === 2 &&
+				("leaseId" in value ||
+					"effectId" in value ||
+					"hostOperationId" in value ||
+					(value.historyOperationId !== undefined && !validId(value.historyOperationId)))) ||
 			!value.saved ||
 			!/^[a-f0-9]{64}$/.test(value.saved.hash) ||
 			value.saved.bytes !== value.bytes ||

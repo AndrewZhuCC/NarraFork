@@ -7,6 +7,7 @@ import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { boundedFileHistory } from "./file-change-runtime";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 
 /** Legacy evidence only: remote execution has no local tree/v2 settlement. */
@@ -16,7 +17,7 @@ export async function prepareRemoteStructSedChange(
 	filePath: string,
 	input: Record<string, unknown>,
 	before: { content: string | null; encoding: string },
-): Promise<void> {
+): Promise<"complete" | "unavailable"> {
 	const binding = ctx.toolCallBinding;
 	const target = ctx.executionTarget;
 	if (
@@ -84,38 +85,49 @@ export async function prepareRemoteStructSedChange(
 		ctx.signal?.throwIfAborted();
 	};
 	assertBinding();
-	await ensureFileSnapshot(
-		ctx.narratorId,
-		backend.deviceId,
-		filePath,
-		async () => before,
-		"required",
-	);
+	const snapshot = await boundedFileHistory(() =>
+		ensureFileSnapshot(
+			ctx.narratorId,
+			backend.deviceId,
+			filePath,
+			async () => before,
+			"best-effort",
+		),
+	).catch(() => "failed" as const);
 	assertBinding();
 	// Persist ALL resolved operations before dispatch, including the device identity.
 	// The RPC may finish after a transport failure; retained input is recovery evidence,
 	// not a claim that the mutation succeeded.
-	const changed = await db
-		.update(narratorToolCalls)
-		.set({
-			inputJson: {
-				...input,
-				device: backend.deviceId,
-				file_path: filePath,
-			},
-			inputChars: measureSerializedCharacters({
-				...input,
-				device: backend.deviceId,
-				file_path: filePath,
-			}),
-		})
-		.where(
-			and(
-				eq(narratorToolCalls.id, binding.toolCallId),
-				eq(narratorToolCalls.executionAttempt, binding.attempt),
-			),
-		)
-		.returning({ messageId: narratorToolCalls.messageId });
-	for (const row of changed) queueContextCharacterRefresh(ctx.narratorId, row.messageId);
+	let historyStatus: "complete" | "unavailable" =
+		snapshot === "failed" ? "unavailable" : "complete";
+	try {
+		const changed = await db
+			.update(narratorToolCalls)
+			.set({
+				inputJson: {
+					...input,
+					device: backend.deviceId,
+					file_path: filePath,
+				},
+				inputChars: measureSerializedCharacters({
+					...input,
+					device: backend.deviceId,
+					file_path: filePath,
+				}),
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.id, binding.toolCallId),
+					eq(narratorToolCalls.executionAttempt, binding.attempt),
+				),
+			)
+			.returning({ messageId: narratorToolCalls.messageId });
+		for (const row of changed) queueContextCharacterRefresh(ctx.narratorId, row.messageId);
+	} catch {
+		historyStatus = "unavailable";
+	}
 	assertBinding();
+	await ctx.recheckAuthorization?.();
+	ctx.assertFinalExecutionPermission?.();
+	return historyStatus;
 }

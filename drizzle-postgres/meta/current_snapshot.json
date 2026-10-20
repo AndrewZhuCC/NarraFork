@@ -1,6 +1,6 @@
 {
-  "id": "db929d4c-7564-4214-8c8a-56f3465636eb",
-  "prevId": "c7aa010f-c918-4c1f-bd1f-9fd0548f3fe8",
+  "id": "d01b7310-b4c4-435c-9d93-2a2e7e0aae59",
+  "prevId": "db929d4c-7564-4214-8c8a-56f3465636eb",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -4616,7 +4616,7 @@
           "name": "scope_revision",
           "type": "integer",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
         "mutation_id": {
           "name": "mutation_id",
@@ -4668,6 +4668,12 @@
         },
         "observed_after_blob_digest": {
           "name": "observed_after_blob_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "disk_outcome": {
+          "name": "disk_outcome",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -4797,6 +4803,45 @@
             },
             {
               "expression": "file_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "scope_revision",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_fc_effect_journal": {
+          "name": "idx_fc_effect_journal",
+          "columns": [
+            {
+              "expression": "scope_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "file_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "journal_seq",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -6191,21 +6236,21 @@
         },
         "used_bytes": {
           "name": "used_bytes",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true,
           "default": 0
         },
         "reserved_bytes": {
           "name": "reserved_bytes",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true,
           "default": 0
         },
         "quota_bytes": {
           "name": "quota_bytes",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
@@ -18723,13 +18768,13 @@
           "name": "compensate_mutation_id",
           "type": "text",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
         "compensate_request_digest": {
           "name": "compensate_request_digest",
           "type": "text",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
         "status": {
           "name": "status",

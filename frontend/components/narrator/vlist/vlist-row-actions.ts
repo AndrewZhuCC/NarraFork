@@ -17,7 +17,7 @@
  * the row's tool metadata (vlist-tool-meta.ts).
  */
 
-import type { RevertScope } from "../../../lib/api/narrators";
+import type { RevertActionConfirmOptions } from "../../../lib/api/narrators";
 import type {
 	CustomMessageMenuItem,
 	MessageContextMenuActions,
@@ -57,7 +57,7 @@ export interface VListRowHandlers {
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		revertOpts: { skipRevert: boolean; scope?: RevertScope },
+		revertOpts: RevertActionConfirmOptions,
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];

@@ -19,12 +19,8 @@ import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
 import { fileChangeIdentityKey } from "./file-change-identity";
-import { fileChangeLocalIo, localDirectoryIdentity } from "./file-change-local-io";
-import {
-	LocalFileChangeRuntime,
-	localFileChangeRuntimeBinding,
-	withLocalFileChangeRuntime,
-} from "./file-change-runtime";
+import { fileChangeLocalIo } from "./file-change-local-io";
+import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
 import { type RevertPlanFileCursor, RevertPlanService } from "./revert-plan-service";
 import {
@@ -33,10 +29,9 @@ import {
 	type RevertPlannerRequest,
 	RevertPlannerService,
 } from "./revert-planner-service";
-import type { RevertSelectionResult } from "./revert-selection-service";
+import { type RevertSelectionResult, RevertSelectionService } from "./revert-selection-service";
 import type { ValidatedTransactionManifest } from "./revert-transaction-manifest-worker";
 import { runRevertManifestWorker } from "./revert-transaction-worker";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 
 const principal: NarratorPrincipal = { userId: "alice", isAdmin: false };
 let root: string;
@@ -114,7 +109,6 @@ beforeEach(async () => {
 	runtime = new LocalFileChangeRuntime({
 		db,
 		privateRoot: join(root, "private"),
-		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 	namespace = await runtime.initialize();
@@ -167,48 +161,10 @@ beforeEach(async () => {
 			// Explicit local capability. A remote identity MUST NOT consult a local path,
 			// even if its display/canonical string happens to equal an existing file here.
 			if (identity.deviceId !== "local") throw new Error("Remote capability unavailable");
-			const scope = db
-				.select()
-				.from(schema.fileChangeScopes)
-				.where(eq(schema.fileChangeScopes.id, identity.scopeId))
-				.get();
-			const binding = localFileChangeRuntimeBinding(identity.deviceId);
-			if (!scope || !binding) throw new Error("Scope/runtime missing");
-			const executionBinding = {
-				deviceId: "local",
-				runtimeEpoch: binding.runtimeEpoch,
-				runtimeGeneration: binding.runtimeGeneration,
-				fencingToken: scope.fencingToken,
-			};
 			return {
 				identity,
-				executionBinding,
-				scopeRevision: scope.revision,
 				async assertCurrent({ signal: currentSignal }) {
 					currentSignal.throwIfAborted();
-					const live = db
-						.select()
-						.from(schema.fileChangeScopes)
-						.where(eq(schema.fileChangeScopes.id, scope.id))
-						.get();
-					const runtimeBinding = localFileChangeRuntimeBinding("local");
-					if (
-						!live ||
-						live.status !== "active" ||
-						live.activeMutationCount !== 0 ||
-						live.activeLeaseId ||
-						live.revision !== scope.revision ||
-						live.fencingToken !== scope.fencingToken ||
-						live.sourceInstanceId !== identity.sourceInstanceId ||
-						live.workspaceInstanceId !== identity.workspaceInstanceId ||
-						live.deviceId !== identity.deviceId ||
-						live.pathFlavor !== identity.pathFlavor ||
-						runtimeBinding?.runtimeEpoch !== executionBinding.runtimeEpoch ||
-						runtimeBinding?.runtimeGeneration !== executionBinding.runtimeGeneration
-					)
-						throw new Error("Scope/runtime drift");
-					if ((await localDirectoryIdentity(scope.canonicalRoot)) !== live.rootIdentityJson?.object)
-						throw new Error("Workspace incarnation changed");
 					const resolved = await localBackend.resolvePathIdentity(identity.lexicalPath);
 					if (resolved.canonicalPath !== identity.canonicalPath)
 						throw new Error("Canonical target drift");
@@ -444,12 +400,22 @@ describe("real tool evidence -> complete prepared preview", () => {
 		expect(result.plan.coverageComplete).toBe(true);
 		expect(result.plan.expectedFileCount).toBe(1);
 		const file = plans.listFiles(owner, result.plan.id).items[0];
-		expect(await bytes(file.expectedStateJson)).toEqual(disk);
+		expect(file.expectedStateJson).toMatchObject({
+			kind: "regular",
+			blob: { digest: hash(disk), sizeBytes: disk.byteLength },
+		});
+		// The merge overwrites late human bytes, so they are archived for a later undo.
+		expect(
+			namespace.catalog.getMetadata({
+				expectedGeneration: namespace.generation,
+				ref: { algorithm: "sha256", digest: hash(disk), sizeBytes: disk.byteLength },
+			}),
+		).toMatchObject({ status: "ready" });
 		expect((await bytes(file.desiredStateJson)).toString()).toBe(original.replace("H0", "H2"));
 		expect(await readFile(path)).toEqual(disk);
 		expect(historySnapshot()).toBe(history);
 		expect(reads).toBe(2);
-		expect(narratorAuthorizations).toBe(9);
+		expect(narratorAuthorizations).toBe(6);
 		expect(authentications).toBe(2);
 		const selected = await rawManifest<RevertSelectionResult>(result.plan.manifestDigests.history);
 		expect(selected.effects).toHaveLength(2);
@@ -458,11 +424,19 @@ describe("real tool evidence -> complete prepared preview", () => {
 		expect(selected.messageVersions).toEqual([{ narratorId: "root", messageVersion: 7 }]);
 		const manifest = await rawManifest<{
 			selectionMetadataDigest: string;
-			files: { steps: { scopeRevision: number }[] }[];
+			files: { steps: { effectId: string }[] }[];
 		}>(result.plan.manifestDigests.plan);
 		expect(manifest.selectionMetadataDigest).toBe(selected.metadataDigest);
-		expect(manifest.files[0].steps.map((step) => step.scopeRevision)).toEqual(
-			selected.effects.map((effect) => effect.scopeRevision).sort((a, b) => b - a),
+		const orderedEffects = [...selected.effects].sort(
+			(a, b) => (b.journalSeq ?? 0) - (a.journalSeq ?? 0),
+		);
+		expect(
+			orderedEffects.every(
+				(effect) => Number.isSafeInteger(effect.journalSeq) && (effect.journalSeq ?? 0) > 0,
+			),
+		).toBe(true);
+		expect(manifest.files[0].steps.map((step) => step.effectId)).toEqual(
+			orderedEffects.map((effect) => effect.id),
 		);
 		await rawManifest(result.plan.manifestDigests.selector);
 		// Original raw manifest pointers are FK-pinned, not a trimmed substitute.
@@ -573,7 +547,7 @@ describe("real tool evidence -> complete prepared preview", () => {
 	}, 30_000);
 });
 
-describe("no partial executable prefix", () => {
+describe("complete selection and per-file unavailable preview states", () => {
 	test("unmeasured mode and unknown current states cannot pass through a matching raw hash", async () => {
 		const { path } = await fixture();
 		const before = historySnapshot();
@@ -620,9 +594,24 @@ describe("no partial executable prefix", () => {
 			.where(eq(schema.fileChangeEffects.id, effect.id))
 			.run();
 		const before = historySnapshot();
-		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_STATE_UNKNOWN" });
-		assertUnprepared();
-		expect(reads).toBe(0);
+		const result = await prepare();
+		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson).toEqual({
+			kind: "unknown",
+			reason: "history_unavailable",
+		});
+		expect(result.plan).toMatchObject({
+			status: "prepared",
+			coverageComplete: false,
+			expectedFileCount: 1,
+		});
+		expect(result.diagnostics).toEqual([
+			{
+				code: "FILE_UNAVAILABLE",
+				filePath: "unknown-historical-mode.txt",
+				reason: "history_unavailable",
+			},
+		]);
+		expect(reads).toBe(2);
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path, "utf8")).toBe("new");
 	});
@@ -644,13 +633,24 @@ describe("no partial executable prefix", () => {
 			.run();
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
-		assertUnprepared();
-		expect(reads).toBe(0);
+		const result = await prepare();
+		expect(result.plan).toMatchObject({
+			status: "prepared",
+			coverageComplete: false,
+			expectedFileCount: 1,
+		});
+		expect(result.diagnostics).toContainEqual({
+			code: "OPERATION_UNRESOLVED",
+			operationId: operation.id,
+			reason: "history_unavailable",
+		});
+		const selected = await rawManifest<RevertSelectionResult>(result.plan.manifestDigests.history);
+		expect(selected.noDiskTools).toHaveLength(0);
+		expect(selected.effects).toHaveLength(2);
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
 	});
-	test("missing journal for any selected write candidate refuses the entire preview", async () => {
+	test("missing journal remains diagnostic while known targets retain their preview", async () => {
 		const { path } = await fixture();
 		const missing = await context("Write", path, { content: "unmeasured" });
 		db.update(schema.narratorToolCalls)
@@ -659,13 +659,25 @@ describe("no partial executable prefix", () => {
 			.run();
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
-		assertUnprepared();
-		expect(reads).toBe(0);
+		const result = await prepare();
+		expect(result.plan).toMatchObject({
+			status: "prepared",
+			coverageComplete: false,
+			expectedFileCount: 1,
+		});
+		expect(result.diagnostics).toEqual([
+			{
+				code: "FILE_JOURNAL_MISSING",
+				toolCallId: missing.toolCallId,
+				reason: "history_unavailable",
+			},
+		]);
+		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson.kind).toBe("regular");
+		expect(reads).toBe(2);
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
 	});
-	test("unknown receipt/outcome stays a rejected candidate rather than being filtered out", async () => {
+	test("unknown receipt/outcome stays visible as a per-file gap rather than being filtered out", async () => {
 		const { path } = await fixture();
 		const effect = db.select().from(schema.fileChangeEffects).get();
 		if (!effect) throw new Error("Missing effect");
@@ -675,13 +687,31 @@ describe("no partial executable prefix", () => {
 			.run();
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
-		assertUnprepared();
-		expect(reads).toBe(0);
+		const result = await prepare();
+		expect(result.plan).toMatchObject({
+			status: "prepared",
+			coverageComplete: false,
+			expectedFileCount: 1,
+		});
+		expect(result.diagnostics).toContainEqual({
+			code: "EFFECT_UNRESOLVED",
+			operationId: effect.operationId,
+			reason: "history_unavailable",
+		});
+		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson).toEqual({
+			kind: "unknown",
+			reason: "history_unavailable",
+		});
+		expect(result.diagnostics).toContainEqual({
+			code: "FILE_UNAVAILABLE",
+			filePath: "combined.txt",
+			reason: "history_unavailable",
+		});
+		expect(reads).toBe(2);
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
 	});
-	test("one overlapping conflict refuses otherwise reversible files without persisting a prefix", async () => {
+	test("one overlapping conflict stays visible while other files retain usable preview targets", async () => {
 		const first = join(workspace, "safe.txt");
 		const second = join(workspace, "conflict.txt");
 		await writeFile(first, "old");
@@ -690,9 +720,18 @@ describe("no partial executable prefix", () => {
 		await write(second, "new");
 		await writeFile(second, "human overwrite");
 		const before = historySnapshot();
-		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_REVERSAL_REFUSED" });
-		assertUnprepared();
-		expect(db.select().from(schema.revertOperationFiles).all()).toHaveLength(0);
+		const result = await prepare();
+		expect(result.plan.expectedFileCount).toBe(2);
+		const files = plans.listFiles(owner, result.plan.id).items;
+		const safe = files.find((file) => file.identityJson.canonicalPath === first);
+		const conflict = files.find((file) => file.identityJson.canonicalPath === second);
+		if (!safe || !conflict) throw new Error("Complete preview must contain both files");
+		expect((await bytes(safe.desiredStateJson)).toString()).toBe("old");
+		expect(conflict.desiredStateJson).toEqual({ kind: "unknown", reason: "content_changed" });
+		expect(conflict.expectedStateJson).toMatchObject({
+			kind: "regular",
+			blob: { digest: hash("human overwrite"), sizeBytes: Buffer.byteLength("human overwrite") },
+		});
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(first, "utf8")).toBe("new");
 		expect(await readFile(second, "utf8")).toBe("human overwrite");
@@ -708,12 +747,26 @@ describe("no partial executable prefix", () => {
 			.get();
 		if (!row) throw new Error("Missing blob");
 		await unlink(join(root, "private", "file-change-blobs", row.storageKey));
+		const safePath = join(workspace, "safe.txt");
+		await writeFile(safePath, "independent before");
+		await write(safePath, "independent after");
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		(await rejected(prepare())).toThrow();
-		assertUnprepared();
+		const result = await prepare();
+		const files = plans.listFiles(owner, result.plan.id).items;
+		expect(files).toHaveLength(2);
+		expect(
+			files.find((file) => file.identityJson.canonicalPath === path)?.desiredStateJson,
+		).toEqual({
+			kind: "unknown",
+			reason: "history_unavailable",
+		});
+		const safe = files.find((file) => file.identityJson.canonicalPath === safePath);
+		if (!safe) throw new Error("Independent file missing from partial preview");
+		expect((await bytes(safe.desiredStateJson)).toString()).toBe("independent before");
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
+		expect(await readFile(safePath, "utf8")).toBe("independent after");
 	});
 	test("remote identity with the same path does not resolve through a local capability", async () => {
 		const path = join(workspace, "same-path.txt");
@@ -724,8 +777,7 @@ describe("no partial executable prefix", () => {
 		const effect = db.select().from(schema.fileChangeEffects).get();
 		const operation = db.select().from(schema.fileChangeOperations).get();
 		const scope = db.select().from(schema.fileChangeScopes).get();
-		if (!effect || !operation || !scope || !effect.executionReceiptJson)
-			throw new Error("Missing source fixture");
+		if (!effect || !operation || !scope) throw new Error("Missing source fixture");
 		const remoteScopeId = generateId();
 		const remoteOperationId = generateId();
 		const call = await context("Write", path, { content: "remote" });
@@ -735,7 +787,9 @@ describe("no partial executable prefix", () => {
 			deviceId: "remote",
 			workspaceInstanceId: "remote-workspace",
 		};
-		const binding = { ...effect.executionReceiptJson.executionBinding, deviceId: "remote" };
+		const binding = operation.executionBindingJson
+			? { ...operation.executionBindingJson, deviceId: "remote" }
+			: null;
 		db.insert(schema.fileChangeScopes)
 			.values({
 				...scope,
@@ -762,11 +816,14 @@ describe("no partial executable prefix", () => {
 				fileKey: fileChangeIdentityKey(identity),
 				identityJson: identity,
 				mutationId: "remote-mutation",
-				executionReceiptJson: {
-					...effect.executionReceiptJson,
-					mutationId: "remote-mutation",
-					executionBinding: binding,
-				},
+				executionReceiptJson:
+					effect.executionReceiptJson && binding
+						? {
+								...effect.executionReceiptJson,
+								mutationId: "remote-mutation",
+								executionBinding: binding,
+							}
+						: null,
 			})
 			.run();
 		db.update(schema.narratorToolCalls)
@@ -916,16 +973,30 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path, "utf8")).toBe("later human contents");
 	});
-	test("scope/runtime revalidation cannot be replaced by matching bytes", async () => {
-		await fixture();
+	test("archived scope health never vetoes a fresh preview or a later independent write", async () => {
+		const { path } = await fixture();
 		const before = historySnapshot();
+		const disk = await readFile(path);
 		beforeAuthentication = (count) => {
 			if (count === 2)
-				db.update(schema.fileChangeScopes).set({ status: "needs_verification" }).run();
+				db.update(schema.fileChangeScopes)
+					.set({
+						status: "needs_verification",
+						activeLeaseId: "archived-lease",
+						activeMutationCount: 2,
+					})
+					.run();
 		};
-		(await rejected(prepare())).toThrow("Scope/runtime drift");
-		assertUnprepared();
+		const result = await prepare();
+		expect(result.plan.status).toBe("prepared");
+		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson.kind).toBe("regular");
+		expect(await readFile(path)).toEqual(disk);
 		expect(historySnapshot()).toBe(before);
+		await write(path, "independent new contents\n");
+		expect(await readFile(path, "utf8")).toBe("independent new contents\n");
+		expect((await prepare({ idempotencyKey: "after-archived-barrier" })).plan.status).toBe(
+			"prepared",
+		);
 	});
 	test("same complete request reuses its prepared ID; different raw selector order or kind conflicts", async () => {
 		const { first, second } = await fixture();
@@ -1065,7 +1136,184 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
 	});
-	test("all raw refs plus current/desired and original manifests share one cross-file cap", async () => {
+	test("only two complete collector scans are needed for a successful preview", async () => {
+		await fixture();
+		const collect = spyOn(RevertSelectionService.prototype, "collect");
+		try {
+			expect((await prepare()).plan.coverageComplete).toBe(true);
+			expect(collect).toHaveBeenCalledTimes(2);
+		} finally {
+			collect.mockRestore();
+		}
+	});
+	test("remaining catalog quota only fits manifests even when re-publishing existing current cannot reserve", async () => {
+		const path = join(workspace, "quota.txt");
+		await writeFile(path, "a".repeat(1024 * 1024));
+		await write(path, "b".repeat(1024 * 1024));
+		const disk = await readFile(path);
+		const budget = namespace.catalog.getBudget();
+		if (!budget) throw new Error("Missing catalog budget");
+		db.update(schema.fileChangeStorageBudgets)
+			.set({ quotaBytes: budget.usedBytes + 32 * 1024 })
+			.run();
+		// Real catalog admission reserves before deduplication; the old planner failed here.
+		await expect(
+			namespace.store.putBytes(disk, { expectedSize: disk.byteLength, expectedDigest: hash(disk) }),
+		).rejects.toThrow();
+		const result = await prepare();
+		expect(result.plan.coverageComplete).toBe(true);
+		const row = db
+			.select()
+			.from(schema.revertOperationFiles)
+			.where(eq(schema.revertOperationFiles.revertOperationId, result.plan.id))
+			.get();
+		expect(row?.beforeBlobDigest).toBe(hash(disk));
+		expect(
+			(await bytes(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson)).toString(),
+		).toBe("a".repeat(1024 * 1024));
+		expect(await readFile(path)).toEqual(disk);
+	});
+	test("low quota cannot archive an unarchived external current, yet the preview still succeeds", async () => {
+		const path = join(workspace, "quota-external.txt");
+		await writeFile(path, "a".repeat(1024 * 1024));
+		await write(path, "b".repeat(1024 * 1024));
+		const external = Buffer.from("c".repeat(1024 * 1024));
+		await writeFile(path, external);
+		const budget = namespace.catalog.getBudget();
+		if (!budget) throw new Error("Missing catalog budget");
+		db.update(schema.fileChangeStorageBudgets)
+			.set({ quotaBytes: budget.usedBytes + 32 * 1024 })
+			.run();
+		const result = await prepare({ uiAction: "revert_files", recoveryMode: "snapshot" });
+		expect(result.plan.status).toBe("prepared");
+		const row = db
+			.select()
+			.from(schema.revertOperationFiles)
+			.where(eq(schema.revertOperationFiles.revertOperationId, result.plan.id))
+			.get();
+		expect(row?.beforeBlobDigest).toBeNull();
+		expect(await readFile(path)).toEqual(external);
+	});
+	test("unarchived external current is archived best-effort before a real overwrite", async () => {
+		const { path } = await fixture();
+		const disk = await readFile(path);
+		const ref = { algorithm: "sha256" as const, digest: hash(disk), sizeBytes: disk.byteLength };
+		expect(
+			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+		).toBeNull();
+		const putting = spyOn(namespace.store, "putBytes");
+		try {
+			const result = await prepare();
+			expect(result.plan.coverageComplete).toBe(true);
+			const [file] = plans.listFiles(owner, result.plan.id).items;
+			const row = db
+				.select()
+				.from(schema.revertOperationFiles)
+				.where(eq(schema.revertOperationFiles.id, file.id))
+				.get();
+			expect(row?.beforeBlobDigest).toBe(ref.digest);
+			expect(Buffer.from(await namespace.store.readBytes(ref))).toEqual(disk);
+			expect(putting.mock.calls.filter(([raw]) => hash(raw) === ref.digest)).toHaveLength(1);
+			// A second preview reuses the ready object; it must not reserve or rewrite it.
+			putting.mockClear();
+			await prepare({ idempotencyKey: "second-preview" });
+			expect(putting.mock.calls.filter(([raw]) => hash(raw) === ref.digest)).toHaveLength(0);
+		} finally {
+			putting.mockRestore();
+		}
+		expect(await readFile(path)).toEqual(disk);
+	});
+	test("optional archive failure only degrades its own file and never another one", async () => {
+		const failedPath = join(workspace, "archive-fails.txt");
+		const okPath = join(workspace, "archive-ok.txt");
+		const base = "A0\n1\n2\n3\n4\nH0\n5\n6\n7\n8\nB0\n";
+		for (const path of [failedPath, okPath]) {
+			await writeFile(path, base);
+			await write(path, base.replace("A0", "A1"));
+		}
+		// A human edit in another hunk keeps both files mergeable, so both really overwrite.
+		const failedBody = base.replace("A0", "A1").replace("H0", "cannot archive");
+		const okBody = base.replace("A0", "A1").replace("H0", "archived");
+		await writeFile(failedPath, failedBody);
+		await writeFile(okPath, okBody);
+		const failed = hash(failedBody);
+		sqlite.exec(
+			`CREATE TRIGGER reject_one_archive BEFORE INSERT ON file_change_blobs WHEN NEW.digest='${failed}' BEGIN SELECT RAISE(ABORT,'archive IO failed'); END`,
+		);
+		const result = await prepare();
+		expect(result.plan.status).toBe("prepared");
+		const pins = new Map(
+			db
+				.select()
+				.from(schema.revertOperationFiles)
+				.where(eq(schema.revertOperationFiles.revertOperationId, result.plan.id))
+				.all()
+				.map((row) => [row.identityJson.canonicalPath, row.beforeBlobDigest]),
+		);
+		expect(result.plan.coverageComplete).toBe(true);
+		expect(pins.get(failedPath)).toBeNull();
+		expect(pins.get(okPath)).toBe(hash(okBody));
+	});
+	test("cancellation during the optional archive still cancels the preview", async () => {
+		await fixture();
+		const controller = new AbortController();
+		const putting = spyOn(namespace.store, "putBytes").mockImplementation(async (_raw, input) => {
+			controller.abort(new Error("user cancelled during archive"));
+			input.signal?.throwIfAborted();
+			throw new Error("unreachable");
+		});
+		try {
+			await rejected(prepare({ signal: controller.signal }));
+		} finally {
+			putting.mockRestore();
+		}
+		assertUnprepared();
+	});
+	test("unavailable current archive never blocks a merge using the already verified live bytes", async () => {
+		const { path, original } = await fixture();
+		const disk = await readFile(path);
+		const digest = hash(disk);
+		sqlite.exec(
+			`CREATE TRIGGER reject_current_archive BEFORE INSERT ON file_change_blobs WHEN NEW.digest='${digest}' BEGIN SELECT RAISE(ABORT,'current archive unavailable'); END`,
+		);
+		await expect(
+			namespace.store.putBytes(disk, { expectedSize: disk.byteLength, expectedDigest: hash(disk) }),
+		).rejects.toThrow();
+		const result = await prepare();
+		expect(result.plan.coverageComplete).toBe(true);
+		expect(
+			(await bytes(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson)).toString(),
+		).toBe(original.replace("H0", "H2"));
+		expect(await readFile(path)).toEqual(disk);
+	});
+	test("real unchanged Write keeps unarchived external bytes without a desired blob", async () => {
+		const path = join(workspace, "same.txt");
+		await writeFile(path, "A");
+		await write(path, "A");
+		const external = Buffer.from("unarchived external B");
+		await writeFile(path, external);
+		const ref = {
+			algorithm: "sha256" as const,
+			digest: hash(external),
+			sizeBytes: external.byteLength,
+		};
+		const result = await prepare({ uiAction: "revert_files" });
+		const [file] = plans.listFiles(owner, result.plan.id).items;
+		expect(result.plan.coverageComplete).toBe(true);
+		expect(file.expectedStateJson).toEqual(file.desiredStateJson);
+		expect(file.desiredStateJson).toMatchObject({ kind: "regular", blob: ref });
+		const row = db
+			.select()
+			.from(schema.revertOperationFiles)
+			.where(eq(schema.revertOperationFiles.revertOperationId, result.plan.id))
+			.get();
+		expect(row?.desiredBlobDigest).toBeNull();
+		expect(
+			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+		).toBeNull();
+		expect(await readFile(path)).toEqual(external);
+	});
+	test("historical/desired raw refs and original manifests share one cross-file cap", async () => {
 		for (let i = 0; i < 2; i++) {
 			const path = join(workspace, `${i}.txt`);
 			await writeFile(path, "a".repeat(4096));
@@ -1137,7 +1385,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 			}
 		}
 		for (const file of validated.files)
-			for (const state of [file.expected, file.desired]) {
+			for (const state of [file.desired]) {
 				if (state.kind === "regular") refs.set(state.blob.digest, state.blob.sizeBytes);
 			}
 		expect(validated.evidenceBytes).toBe([...refs.values()].reduce((sum, bytes) => sum + bytes, 0));
@@ -1156,7 +1404,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		const reading = spyOn(namespace.store, "readBytes");
 		try {
 			(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_BUDGET_EXCEEDED" });
-			expect(reading).toHaveBeenCalledTimes(9);
+			expect(reading).toHaveBeenCalledTimes(8);
 		} finally {
 			reading.mockRestore();
 		}
@@ -1222,8 +1470,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		});
 		const initialReads = reads;
 		(await rejected(prepare({ idempotencyKey: "limited" }))).toMatchObject({
-			code: "REVERT_PLANNER_REVERSAL_REFUSED",
-			message: "Complete reversal refused: budget_exceeded",
+			code: "REVERT_PLANNER_BUDGET_EXCEEDED",
 		});
 		expect(reads - initialReads).toBe(1);
 		expect(db.select().from(schema.revertOperations).all()).toHaveLength(1);

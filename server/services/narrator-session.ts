@@ -369,8 +369,21 @@ import {
 	recoverStaleCompactingMessages,
 } from "./narrator-persistence";
 import { ensureNarratorPlanFileId } from "./narrator-plan-mode";
+import {
+	revertNarratorScopedForEdit,
+	revertNarratorScopedToBlock,
+	revertPrincipalForUser,
+	type ScopedRevertOptions,
+} from "./narrator-scoped-revert";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
-import type { RevertScope, RevertWarning } from "./snapshot-revert";
+import {
+	assertSnapshotRevertComplete,
+	type RevertResult,
+	type RevertScope,
+	type RevertWarning,
+	SnapshotRevertError,
+	unavailableSnapshotRevert,
+} from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete.
 // Defined next to the snapshot hooks so both loops agree on the set.
 import { buildTreeSnapshotExecutionHooks } from "./tree-snapshot-loop-hooks";
@@ -6126,8 +6139,8 @@ async function rollbackToBlockUnlocked(
 	narratorId: string,
 	messageId: string,
 	blockIndex: number,
-	opts?: { skipRevert?: boolean; scope?: RevertScope },
-): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
+	opts?: ScopedRevertOptions & { skipRevert?: boolean; scope?: RevertScope },
+): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -6158,17 +6171,31 @@ async function rollbackToBlockUnlocked(
 		blocks.length,
 	);
 
-	// Step 1: Delete all messages after the target message (includes file revert
-	// unless skipRevert requests a history-only rollback).
-	const { deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
-		narratorId,
-		messageId,
-		{
+	if (!opts?.skipRevert) {
+		if (opts?.scope === "workspace") {
+			assertSnapshotRevertComplete(
+				unavailableSnapshotRevert("Workspace restore requires verified per-file evidence."),
+			);
+		}
+		// The target message's suffix and its later messages are one fixed selection.
+		// The executor commits their COW/history changes only after every necessary file succeeds.
+		const revertResult = await revertNarratorScopedToBlock(
+			narratorId,
+			messageId,
+			effectiveBlockIndex,
+			opts,
+		);
+		assertSnapshotRevertComplete(revertResult);
+		return { ok: true, revertResult };
+	}
+
+	// History-only rollback preserves the existing bounded deletion/COW path.
+	const { deletedMessageIds, revertWarnings, revertResult } =
+		await narratorService.deleteMessagesAfter(narratorId, messageId, {
 			preserveConversationId: true,
 			skipRevert: opts?.skipRevert,
 			...(opts?.scope ? { scope: opts.scope } : {}),
-		},
-	);
+		});
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",
@@ -6226,7 +6253,11 @@ async function rollbackToBlockUnlocked(
 	// Advisory only: the rollback already happened. Surfacing it lets the caller (and
 	// the model, via the tool result) verify the workspace instead of assuming the
 	// restored state contained only its own changes.
-	return revertWarnings?.length ? { ok: true, warnings: revertWarnings } : { ok: true };
+	return {
+		ok: true,
+		...(revertWarnings?.length ? { warnings: revertWarnings } : {}),
+		...(revertResult ? { revertResult } : {}),
+	};
 }
 
 /** Extract image refs from a message's contentJson. */
@@ -6439,12 +6470,9 @@ function buildEditedUserContentJson(
  * Edit a user message and regenerate the response.
  * Updates the message content, deletes everything after it, and re-runs the agent loop.
  *
- * `opts.revertFiles` (default true) decides whether the file changes the deleted
- * messages made are rolled back, and `opts.revertScope` how wide that rollback
- * reaches — the same two choices the rollback dialog offers. They are options, not
- * a fixed behaviour, because "edit this message again" and "undo what the assistant
- * wrote to my files" are separate intents that used to be welded together: the old
- * `rollback` flag was accepted and then ignored, so every edit reverted files.
+ * `opts.revertFiles` (default true) selects file recovery or history-only editing.
+ * File recovery requires `opts.revertPlan`: the exact plan reviewed by the user.
+ * The fixed target and history version are checked before any file or history write.
  *
  * `opts.keepImageIds` / `opts.newImages` let the caller manage attached images during
  * editing (keep a subset of existing images, drop the rest, and/or append new uploads).
@@ -6459,13 +6487,14 @@ export async function editAndRegenerate(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	opts?: EditAndRegenerateOptions,
-): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
+): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
 	return continuationStartLock.acquire(narratorId, () =>
 		editAndRegenerateUnlocked(narratorId, messageId, newContent, locale, replyInUserLanguage, opts),
 	);
 }
 
 export interface EditAndRegenerateOptions {
+	revertPlan?: ScopedRevertOptions["revertPlan"];
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
 	fileReferences?: FileReferenceSnapshot[];
@@ -6491,7 +6520,7 @@ async function editAndRegenerateUnlocked(
 	locale: Locale,
 	replyInUserLanguage: boolean,
 	opts?: EditAndRegenerateOptions,
-): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
+): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
 	// Every admission and attachment check must finish before the first file write.
 	if (isLoopRunning(narratorId)) {
 		logger.warn("editAndRegenerate blocked: loop already running", { narratorId });
@@ -6687,26 +6716,40 @@ async function editAndRegenerateUnlocked(
 		return { ok: false };
 	}
 
-	// Truncate (and optionally roll the files back) BEFORE materialising this edit's
-	// attachments. A workspace-scoped tree rollback deletes whatever the target tree
-	// does not contain, and files just written into `.narrafork/attached/` are exactly
-	// that — so writing them first meant the rollback silently ate the user's new
-	// uploads. The boundary is the ORIGINAL message id: copy-on-write below may hand
-	// the row a new id, but the ref keeps its `seq`, which is what selects the tail.
+	// Settle the confirmed file/history plan BEFORE materialising this edit's
+	// attachments. The boundary is the original message ID, before the user-input COW.
 	//
 	// The cost of this order is that a failure in the attachment/copy-on-write steps
 	// leaves the history truncated while the edit is unsaved. That is recoverable —
 	// the request fails, the client keeps the draft, and the user can resubmit —
 	// whereas destroying an attachment the user just added is not.
-	const { deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
-		narratorId,
-		messageId,
-		{
-			preserveConversationId: true,
-			skipRevert: opts?.revertFiles === false,
-			...(opts?.revertScope ? { scope: opts.revertScope } : {}),
-		},
-	);
+	if (opts?.revertScope === "workspace") throw new ValidationError("Workspace restore is retired");
+	let revertResult: RevertResult | undefined;
+	let revertWarnings: RevertWarning[] | undefined;
+	let deletedMessageIds: string[] = [];
+	if (opts?.revertFiles === false) {
+		({ deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
+			narratorId,
+			messageId,
+			{
+				preserveConversationId: true,
+				skipRevert: true,
+			},
+		));
+	} else {
+		revertResult = await revertNarratorScopedForEdit(
+			narratorId,
+			messageId,
+			Array.isArray(targetMsg.contentJson) ? targetMsg.contentJson.length - 1 : -1,
+			{
+				principal: await revertPrincipalForUser(opts?.userId),
+				revertPlan: opts?.revertPlan,
+			},
+		);
+		assertSnapshotRevertComplete(revertResult);
+		if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
+		revertWarnings = revertResult.warnings;
+	}
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",
@@ -6812,9 +6855,11 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const imageRefs = existingImages;
-	// Surfaced so the caller can pass the advice on: a rollback can reach past the
-	// chosen scope (subagent writes, a workspace restore).
-	const warnings = revertWarnings?.length ? { warnings: revertWarnings } : {};
+	// Preserve file/history recording advisories through primary and subagent callers.
+	const warnings = {
+		...(revertWarnings?.length ? { warnings: revertWarnings } : {}),
+		...(revertResult ? { revertResult } : {}),
+	};
 
 	if (opts?.deferContinuation) {
 		await narratorService.updateStatus(narratorId, "idle", { substatus: [] });

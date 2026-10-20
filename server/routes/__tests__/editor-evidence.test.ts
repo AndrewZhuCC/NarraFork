@@ -21,7 +21,6 @@ import {
 	narratorToolCalls,
 	projects,
 	users,
-	workspaceWriteLeases,
 } from "../../db/schema";
 import { localBackend } from "../../lib/agent/execution/local-backend";
 import { writeTool } from "../../lib/agent/tools/write";
@@ -34,7 +33,6 @@ import { type FileChangeLocalIo, fileChangeLocalIo } from "../../services/file-c
 import {
 	executeEditorFileChange,
 	LocalFileChangeRuntime,
-	localFileChangeRuntimeBinding,
 	withLocalFileChangeRuntime,
 } from "../../services/file-change-runtime";
 import * as fileEditInterject from "../../services/file-edit-interject";
@@ -162,53 +160,16 @@ async function bytes(state: FileChangeState) {
 	if (state.kind !== "regular") throw new Error("Expected regular raw evidence");
 	return (await runtime.initialize()).store.readBytes(state.blob);
 }
-function scope() {
-	const value = db
-		.select()
-		.from(fileChangeScopes)
-		.where(eq(fileChangeScopes.canonicalRoot, workspace))
-		.get();
-	if (!value) throw new Error("Expected real coordinator scope");
-	return value;
-}
-function expectQuarantinedFile(path: string, outcome: "pending" | "unknown") {
-	const currentScope = scope();
-	const effect = effects()[0];
-	expect(currentScope).toMatchObject({
-		status: "active",
-		activeLeaseId: null,
-		activeMutationCount: 0,
+async function afterHistoryPreparation(action: () => void | Promise<void>) {
+	const { store } = await runtime.initialize();
+	const publish = store.putBytes.bind(store);
+	let calls = 0;
+	const spy = spyOn(store, "putBytes").mockImplementation(async (...args) => {
+		const result = await publish(...args);
+		if (++calls === 2) await action();
+		return result;
 	});
-	const quarantined = db
-		.select()
-		.from(workspaceWriteLeases)
-		.where(eq(workspaceWriteLeases.scopeId, currentScope.id))
-		.limit(20)
-		.all()
-		.filter((lease) => lease.status === "quarantined");
-	expect(quarantined).toHaveLength(1);
-	expect(quarantined[0]).toMatchObject({
-		scopeId: currentScope.id,
-		status: "quarantined",
-		rangesJson: { version: 1, ranges: [{ kind: "file", canonicalPath: path }] },
-		mutationManifestJson: {
-			version: 1,
-			mutations: [
-				{
-					mutationId: effect.mutationId,
-					effectId: effect.id,
-					operationId: effect.operationId,
-					outcome,
-				},
-			],
-		},
-	});
-	expect(quarantined[0].executionEndedAt).toBeString();
-	expect(runtime.coordinator.capture(currentScope)).toMatchObject({
-		status: "needs_verification",
-		quarantinedLeaseCount: 1,
-		active: { retainedRecoveryHolds: 0 },
-	});
+	restorers.push(() => spy.mockRestore());
 }
 async function toolContext(path: string): Promise<ToolContext> {
 	const identity = await localBackend.resolvePathIdentity(path);
@@ -287,7 +248,7 @@ describe("real editor actual-byte evidence", () => {
 				);
 				expect(saved.status).toBe(200);
 				expect(saved.json.fileChangeEvidence).toMatchObject({
-					version: 2,
+					version: 3,
 					grade: "measured",
 					settlement: "settled",
 				});
@@ -468,7 +429,7 @@ describe("real editor actual-byte evidence", () => {
 	});
 });
 
-describe("editor/tool shared lease and authorization boundaries", () => {
+describe("editor/tool shared file queue and authorization boundaries", () => {
 	test("real Write wins concurrent save: editor baseHash conflicts, never consumes tool bytes", async () => {
 		const path = join(workspace, "concurrent.txt");
 		await writeFile(path, "baseline\n");
@@ -550,20 +511,14 @@ describe("editor/tool shared lease and authorization boundaries", () => {
 		await writeFile(original, "old");
 		await writeFile(replacement, "other");
 		await symlink(original, path);
-		const finalize = runtime.evidence.finalizePreparation.bind(runtime.evidence);
-		const spy = spyOn(runtime.evidence, "finalizePreparation").mockImplementation(
-			async (...args) => {
-				const result = await finalize(...args);
-				await rm(path);
-				await symlink(replacement, path);
-				return result;
-			},
-		);
-		restorers.push(() => spy.mockRestore());
+		await afterHistoryPreparation(async () => {
+			await rm(path);
+			await symlink(replacement, path);
+		});
 		expect((await save({ path, content: "human", baseHash: hash("old") })).status).toBe(403);
 		expect(await readFile(original, "utf8")).toBe("old");
 		expect(await readFile(replacement, "utf8")).toBe("other");
-		expect(effects()[0].executionReceiptJson?.outcome).toBe("not_applied");
+		expect(effects()[0].diskOutcome).toBe("not_applied");
 	});
 
 	test("owner access revoked after raw read cannot leak conflict content or dispatch", async () => {
@@ -617,19 +572,13 @@ describe("editor/tool shared lease and authorization boundaries", () => {
 			.run();
 		const path = join(workspace, "project.txt");
 		await writeFile(path, "old");
-		const finalize = runtime.evidence.finalizePreparation.bind(runtime.evidence);
-		const spy = spyOn(runtime.evidence, "finalizePreparation").mockImplementation(
-			async (...args) => {
-				const result = await finalize(...args);
-				db.delete(aclGrants).where(eq(aclGrants.id, grant)).run();
-				return result;
-			},
-		);
-		restorers.push(() => spy.mockRestore());
+		await afterHistoryPreparation(() => {
+			db.delete(aclGrants).where(eq(aclGrants.id, grant)).run();
+		});
 		expect((await save({ path, content: "new", baseHash: hash("old") })).status).toBe(404);
 		expect(await readFile(path, "utf8")).toBe("old");
 		expect(operations()[0]?.projectId).toBe(projectId);
-		expect(effects()[0].executionReceiptJson?.outcome).toBe("not_applied");
+		expect(effects()[0].diskOutcome).toBe("not_applied");
 	});
 
 	test("extra root permission revoked before dispatch cannot reuse the earlier boundary", async () => {
@@ -638,15 +587,9 @@ describe("editor/tool shared lease and authorization boundaries", () => {
 			settings.paths.extraWritableDirs = [outside];
 			const path = join(outside, "extra.txt");
 			await writeFile(path, "old");
-			const finalize = runtime.evidence.finalizePreparation.bind(runtime.evidence);
-			const spy = spyOn(runtime.evidence, "finalizePreparation").mockImplementation(
-				async (...args) => {
-					const result = await finalize(...args);
-					settings.paths.extraWritableDirs = [];
-					return result;
-				},
-			);
-			restorers.push(() => spy.mockRestore());
+			await afterHistoryPreparation(() => {
+				settings.paths.extraWritableDirs = [];
+			});
 			expect((await save({ path, content: "new", baseHash: hash("old") })).status).toBe(403);
 			expect(await readFile(path, "utf8")).toBe("old");
 		} finally {
@@ -656,7 +599,7 @@ describe("editor/tool shared lease and authorization boundaries", () => {
 });
 
 describe("editor evidence failures and immutable human projection", () => {
-	test("before blob publication failure prevents any target IO", async () => {
+	test("before blob publication failure returns applied with a local history gap", async () => {
 		const path = join(workspace, "before-failure.txt");
 		await writeFile(path, "old");
 		const { store } = await runtime.initialize();
@@ -664,20 +607,16 @@ describe("editor evidence failures and immutable human projection", () => {
 			new Error("injected before publication"),
 		);
 		restorers.push(() => spy.mockRestore());
-		expect((await save({ path, content: "new", baseHash: hash("old") })).status).toBe(500);
-		expect(applyCalls).toBe(0);
-		expect(operations()).toHaveLength(1);
-		expect(operations()[0]).toMatchObject({
-			executionOutcome: "failed",
-			settlement: "settled",
-			effectOutcome: "no_change",
-			unresolvedEffectCount: 0,
+		expect(await save({ path, content: "new", baseHash: hash("old") })).toMatchObject({
+			status: 200,
+			json: { diskOutcome: "applied", historyStatus: "unavailable" },
 		});
-		expect(effects()).toHaveLength(0);
-		expect(await readFile(path, "utf8")).toBe("old");
+		expect(applyCalls).toBe(1);
+		expect(await readFile(path, "utf8")).toBe("new");
+		expect(effects()[0].diskOutcome).toBe("applied");
 	});
 
-	test("real quota admission refusal prevents any target IO", async () => {
+	test("history quota refusal leaves ordinary saves available", async () => {
 		const path = join(workspace, "quota.txt");
 		await writeFile(path, `before-${narratorId}`);
 		const { catalog } = await runtime.initialize();
@@ -689,10 +628,13 @@ describe("editor evidence failures and immutable human projection", () => {
 			.run();
 		try {
 			expect(
-				(await save({ path, content: "new", baseHash: hash(`before-${narratorId}`) })).status,
-			).toBe(500);
-			expect(applyCalls).toBe(0);
-			expect(await readFile(path, "utf8")).toBe(`before-${narratorId}`);
+				await save({ path, content: "new", baseHash: hash(`before-${narratorId}`) }),
+			).toMatchObject({
+				status: 200,
+				json: { diskOutcome: "applied", historyStatus: "unavailable" },
+			});
+			expect(applyCalls).toBe(1);
+			expect(await readFile(path, "utf8")).toBe("new");
 		} finally {
 			db.update(fileChangeStorageBudgets)
 				.set({ quotaBytes: budget.quotaBytes })
@@ -701,43 +643,31 @@ describe("editor evidence failures and immutable human projection", () => {
 		}
 	});
 
-	test("effect preparation DB failure leaves target bytes untouched", async () => {
-		const path = join(workspace, "prepare-db.txt");
-		await writeFile(path, "old");
-		failSql(
-			"file_change_effects",
-			"INSERT",
-			`NEW.operation_id IN (SELECT id FROM file_change_operations WHERE owner_user_id = '${userId}')`,
-		);
-		expect((await save({ path, content: "new", baseHash: hash("old") })).status).toBe(500);
-		expect(applyCalls).toBe(0);
-		expect(await readFile(path, "utf8")).toBe("old");
-		expect(effects()).toHaveLength(0);
-	});
-
-	test("after-settlement DB failure retains intent, quarantined file lease and no blind retry", async () => {
-		const path = join(workspace, "settle-db.txt");
-		await writeFile(path, "old");
-		failSql(
-			"file_change_effects",
-			"UPDATE",
-			`NEW.execution_receipt_json IS NOT NULL AND NEW.operation_id IN (SELECT id FROM file_change_operations WHERE owner_user_id = '${userId}')`,
-		);
-		const response = await save({ path, content: "written", baseHash: hash("old") });
-		expect(response).toMatchObject({ status: 500, json: { code: "WRITE_RECONCILE_REQUIRED" } });
-		expect(await readFile(path, "utf8")).toBe("written");
-		expect(operations()[0]).toMatchObject({
-			sourceKind: "editor",
-			actorJson: { kind: "human", userId, narratorId: null },
+	for (const table of ["file_change_operations", "file_change_effects"]) {
+		test(`${table} insert failure preserves saved bytes and future requests`, async () => {
+			const path = join(workspace, `${table}.txt`);
+			await writeFile(path, "old");
+			failSql(
+				table,
+				"INSERT",
+				table === "file_change_operations"
+					? `NEW.owner_user_id = '${userId}'`
+					: `NEW.operation_id IN (SELECT id FROM file_change_operations WHERE owner_user_id = '${userId}')`,
+			);
+			expect(await save({ path, content: "written", baseHash: hash("old") })).toMatchObject({
+				status: 200,
+				json: { diskOutcome: "applied", historyStatus: "unavailable" },
+			});
+			expect(await readFile(path, "utf8")).toBe("written");
+			expect(await save({ path, content: "next", baseHash: hash("written") })).toMatchObject({
+				status: 200,
+				json: { diskOutcome: "applied", historyStatus: "unavailable" },
+			});
+			expect(applyCalls).toBe(2);
 		});
-		expect(effects()[0]).toMatchObject({ settlement: "applying", executionReceiptJson: null });
-		expect(await bytes(effects()[0].intendedAfterStateJson)).toEqual(Buffer.from("written"));
-		expectQuarantinedFile(path, "pending");
-		expect((await save({ path, content: "written", baseHash: hash("written") })).status).toBe(500);
-		expect(applyCalls).toBe(1);
-	});
+	}
 
-	test("operation-finish DB failure atomically retains intent and blocks a new save", async () => {
+	test("operation finish failure preserves the applied effect and accepts a new save", async () => {
 		const path = join(workspace, "finish-db.txt");
 		await writeFile(path, "old\n");
 		failSql(
@@ -746,88 +676,59 @@ describe("editor evidence failures and immutable human projection", () => {
 			`NEW.execution_outcome = 'succeeded' AND NEW.owner_user_id = '${userId}'`,
 		);
 		expect(await save({ path, content: "written\n", baseHash: hash("old\n") })).toMatchObject({
-			status: 500,
-			json: { code: "WRITE_RECONCILE_REQUIRED" },
+			status: 200,
+			json: { diskOutcome: "applied", historyStatus: "unavailable" },
 		});
-		const frozen = effects()[0];
-		// Receipt, operation and lease commit together: failure cannot publish a
-		// half-settled effect while the operation still says running.
-		expect(frozen).toMatchObject({
-			settlement: "applying",
-			executionReceiptJson: null,
-			attributionGrade: "unknown",
-			linesAdded: null,
-			linesRemoved: null,
-		});
-		expect(operations()[0].settlement).not.toBe("settled");
-		expectQuarantinedFile(path, "pending");
-		expect((await save({ path, content: "retry\n", baseHash: hash("written\n") })).status).toBe(
-			500,
-		);
-		expect(effects()[0]).toEqual(frozen);
-		expect(applyCalls).toBe(1);
-		expect(await readFile(path, "utf8")).toBe("written\n");
+		const first = effects()[0];
+		expect(first).toMatchObject({ diskOutcome: "applied", settlement: "settled" });
+		expect((await save({ path, content: "next\n", baseHash: hash("written\n") })).status).toBe(200);
+		expect(effects().find((effect) => effect.id === first.id)).toEqual(first);
+		expect(applyCalls).toBe(2);
 	});
 
-	test("projection DB failure is best-effort and cannot undo a successful receipt", async () => {
+	test("projection DB failure cannot undo an applied receipt", async () => {
 		const path = join(workspace, "projection-db.txt");
 		failSql("file_attributions", "INSERT", `NEW.user_id = '${userId}'`);
 		expect((await save({ path, content: "saved\n" })).status).toBe(200);
 		expect(await readFile(path, "utf8")).toBe("saved\n");
-		expect(operations()[0].settlement).toBe("settled");
-		expect(effects()[0]).toMatchObject({ settlement: "settled", linesAdded: 1, linesRemoved: 0 });
+		expect(effects()[0]).toMatchObject({ diskOutcome: "applied", linesAdded: 1, linesRemoved: 0 });
 		expect(projections()).toHaveLength(0);
 	});
 
-	test("post-write drift is quarantined, preserves foreign bytes and projects human unknown once", async () => {
-		const path = join(workspace, "after-drift.txt");
+	test("actual partial IO is unknown and a new save reads the current file", async () => {
+		const path = join(workspace, "partial.txt");
 		await writeFile(path, "old");
 		const apply = io.apply;
 		io.apply = async (input) => {
-			const result = await apply(input);
-			await writeFile(path, "foreign after");
-			return result;
+			applyCalls++;
+			await writeFile(input.canonicalPath, "partial");
+			return {
+				kind: "target_mutation_unknown",
+				error: new Error("partial IO"),
+				parentEffects: { createdPaths: [], possiblePaths: [] },
+			};
 		};
 		expect(await save({ path, content: "human", baseHash: hash("old") })).toMatchObject({
 			status: 500,
-			json: { code: "WRITE_RECONCILE_REQUIRED" },
+			json: { diskOutcome: "unknown" },
 		});
-		expect(await readFile(path, "utf8")).toBe("foreign after");
-		expect(effects()[0]).toMatchObject({
-			settlement: "reconcile_required",
-			linesAdded: null,
-			linesRemoved: null,
-		});
-		expect(projections()).toHaveLength(1);
-		expect(projections()[0]).toMatchObject({
-			action: "human",
-			narratorId: null,
-			userId,
-			linesAdded: null,
-			linesRemoved: null,
-		});
-		expectQuarantinedFile(path, "unknown");
-		const frozenEffect = effects()[0];
-		const frozenProjection = projections()[0];
-		expect((await save({ path, content: "retry", baseHash: hash("foreign after") })).status).toBe(
-			500,
-		);
-		expect(applyCalls).toBe(1);
-		expect(await readFile(path, "utf8")).toBe("foreign after");
-		expect(effects()).toEqual([frozenEffect]);
-		expect(projections()).toEqual([frozenProjection]);
+		expect(effects()[0].diskOutcome).toBe("unknown");
+		expect(await readFile(path, "utf8")).toBe("partial");
+		io.apply = apply;
+		expect((await save({ path, content: "next", baseHash: hash("partial") })).status).toBe(200);
+		expect(applyCalls).toBe(2);
 	});
 
-	test("late metadata activity does not downgrade the frozen human grade/counts", async () => {
+	test("metadata updates cannot downgrade the observed human byte counts", async () => {
 		const path = join(workspace, "frozen.txt");
 		await writeFile(path, "one\n");
-		const settle = runtime.evidence.settleEffect.bind(runtime.evidence);
-		const spy = spyOn(runtime.evidence, "settleEffect").mockImplementation((input, tx) => {
-			const result = settle(input, tx);
-			const binding = localFileChangeRuntimeBinding();
-			if (!binding) throw new Error("No runtime");
-			const activity = runtime.coordinator.registerActivity({ scope: scope(), runtime: binding });
-			runtime.coordinator.endActivity(activity);
+		const record = runtime.evidence.recordEffect.bind(runtime.evidence);
+		const spy = spyOn(runtime.evidence, "recordEffect").mockImplementation((input) => {
+			const result = record(input);
+			db.update(fileChangeScopes)
+				.set({ status: "needs_verification" })
+				.where(eq(fileChangeScopes.id, result.scopeId))
+				.run();
 			return result;
 		});
 		restorers.push(() => spy.mockRestore());

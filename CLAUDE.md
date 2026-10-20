@@ -121,7 +121,7 @@ server/
 - **终端管理**：Unix 用 `Bun.Terminal`，Windows 用 `bun-pty`，统一 `TerminalRuntime` 接口；可选 dtach；生命周期绑定服务器进程。
 - **故事网络图**：主界面 `/projects/$projectId`，两种流程模式：classic（React Flow 画布）和 ruler（**已弃用**），存于 `projects.flowMode`。
 - **Ruler 模式已弃用**：不再开发，已知问题不修复，新功能只加 classic 侧；涉及改动仅限"不破坏现状"的必要维护。
-- **快照系统**：两条路径，回退优先 tree 快照（`worktree-tree-snapshot.ts` 影子裸仓库写 tree 对象，捕获含 Bash/外部编辑器改动），缺失才回落逐文件重放（`file-state-rebuild.ts`，遇到无法应用的步骤抛 `ReplayDivergedError`）。热路径捕获有 4s 预算（`tryCaptureHot`），超预算升格后台暖捕获；`chapters.treeSnapshotsEnabled` 可整体关闭。回退走 `snapshot-revert.ts` 事务（commit/finalize/discard 三出口必调其一）。
+- **文件写入与回退**：受控文件 IO 使用 [server/services/file-write-queue.ts](server/services/file-write-queue.ts) 的进程内单文件队列；[server/services/file-change-runtime.ts](server/services/file-change-runtime.ts) 分别报告实际写入结果与历史可用性。文件恢复由 [server/services/revert-transaction-service.ts](server/services/revert-transaction-service.ts) 逐项执行，部分成功保留，消息 COW 在文件恢复完整成功后单独提交。旧持久屏障、管理员解锁及补偿链已退役。Tree 快照继续服务 Bash 观测和章节结构操作，热捕获保留 4s 预算及后台暖捕获；`chapters.treeSnapshotsEnabled` 可关闭。
 - **叙述者服务拆分**：narrator-service / -session / -executor / -subagent / -context / -prompt / -title / -recovery / -event-handler。
 - 其余服务：评审（review-service）、技能、例程、通知、项目数据库同步、worktree 监视、提交同步、合并摘要、输出统计、更新检查等，均在 `server/services/` 下。
 

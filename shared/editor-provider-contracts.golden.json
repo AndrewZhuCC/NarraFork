@@ -139,6 +139,7 @@
 		"reason": "idle_timeout"
 	},
 	"applyCreate": {
+		"coordination": "target-queue-v1",
 		"namespace": "editor-ns-a",
 		"resourceKey": "res-a",
 		"operationId": "op-1",
@@ -157,6 +158,7 @@
 		"metadataPolicy": "reject"
 	},
 	"applyReplace": {
+		"coordination": "target-queue-v1",
 		"namespace": "editor-ns-a",
 		"resourceKey": "res-a",
 		"operationId": "op-2",

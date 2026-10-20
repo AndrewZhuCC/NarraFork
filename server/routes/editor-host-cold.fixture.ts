@@ -55,6 +55,7 @@ settings.update = {
 	proxy: { mode: "direct" },
 };
 const nativeCalls = { apply: 0, query: 0, helperStarts: 0, network: 0 };
+const faultCounts = { historyFailures: 0, droppedReplies: 0 };
 // Process-local traps: leave worker/Git/browser subprocesses alone. Any local
 // executor bootstrap or network dependency is a fixture failure, not a fallback.
 EditorHelperSession.open = async () => {
@@ -107,13 +108,14 @@ let dropReply = false,
 // This is not a mock writer and never changes a global prototype or disk bytes.
 const { getDefaultLocalFileChangeRuntime } = await import("../services/file-change-runtime");
 const evidence = (await getDefaultLocalFileChangeRuntime()).evidence;
-const settleEffect = evidence.settleEffect.bind(evidence);
-evidence.settleEffect = (...args: Parameters<typeof settleEffect>) => {
-	if (failSettlement && args[0].receipt?.outcome === "applied") {
+const recordEffect = evidence.recordEffect.bind(evidence);
+evidence.recordEffect = (...args: Parameters<typeof recordEffect>) => {
+	if (failSettlement && args[0].outcome === "applied") {
 		failSettlement = false;
-		throw new Error("Fixture Host evidence settlement unavailable after write");
+		faultCounts.historyFailures++;
+		throw new Error("Fixture Host history unavailable after confirmed write");
 	}
-	return settleEffect(...args);
+	return recordEffect(...args);
 };
 const app = new Hono();
 app.use("*", requireAuth);
@@ -131,7 +133,11 @@ app.post("/fixture-fault", (c) => {
 app.get("/fixture-info", (c) =>
 	c.json({
 		operations: db
-			.select({ id: fileChangeOperations.id, settlement: fileChangeOperations.settlement })
+			.select({
+				id: fileChangeOperations.id,
+				sourceId: fileChangeOperations.sourceId,
+				settlement: fileChangeOperations.settlement,
+			})
 			.from(fileChangeOperations)
 			.where(eq(fileChangeOperations.sourceKind, "editor"))
 			.limit(4)
@@ -144,6 +150,7 @@ app.get("/fixture-info", (c) =>
 		helpers: editorHelperDiagnostics(),
 		editor: getEditorDocumentService().diagnostics,
 		nativeCalls,
+		faultCounts,
 		pid: process.pid,
 	}),
 );
@@ -193,6 +200,7 @@ const server = Bun.serve<WSData>({
 			const response = await app.fetch(request);
 			if (dropReply && path.endsWith("/commit") && response.ok) {
 				dropReply = false;
+				faultCounts.droppedReplies++;
 				await response.body?.cancel();
 				return Response.json({ error: "Fixture lost committed reply" }, { status: 503 });
 			}

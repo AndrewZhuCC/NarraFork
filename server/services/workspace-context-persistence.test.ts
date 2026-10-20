@@ -344,10 +344,14 @@ describe("real SQLite workspace CAS", () => {
 		const revert = await router.request(`/api/narrators/${id}/revert`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: "{}",
+			body: JSON.stringify({ messageId: "__all__", scope: "workspace" }),
 		});
 		expect(revert.status).toBe(409);
-		expect((await revert.json()).code).toBe("WORKSPACE_REVERT_UNSUPPORTED");
+		expect(await revert.json()).toMatchObject({
+			code: "SNAPSHOT_REVERT_FAILED",
+			status: "failed",
+			historyCommitted: false,
+		});
 	});
 	test("real HTTP busy/waiting records return 409 without incrementing revision", async () => {
 		const router = app(owner);
@@ -546,7 +550,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	async function forbidFileRollback() {
 		const preview = await import("./revert-planner-local-access");
 		const scoped = await import("./narrator-scoped-revert");
-		const snapshot = await import("./snapshot-revert");
+		const snapshot = await import("./worktree-tree-snapshot");
 		const forbidden = () => {
 			throw new Error("History-only operation accessed file rollback");
 		};
@@ -555,7 +559,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			spyOn(preview, "prepareLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(preview, "applyLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(scoped, "revertNarratorScopedForMessages").mockImplementation(forbidden),
-			spyOn(snapshot, "revertForMessagesTree").mockImplementation(forbidden),
+			spyOn(snapshot.worktreeTreeSnapshot, "restore").mockImplementation(forbidden),
 		];
 		for (const spy of spies) restorers.push(() => spy.mockRestore());
 		return spies;

@@ -45,7 +45,7 @@ func editorBinding(namespace, resource string) error {
 }
 
 func (e *EditorEngine) Capabilities() any {
-	features := []string{FeatureEditorDurableWriteV1}
+	features := []string{FeatureEditorDurableWriteV1, FeatureEditorTargetQueueV1}
 	if e.hostReceipts != nil {
 		features = append(features, FeatureEditorHostReceiptV1)
 	}

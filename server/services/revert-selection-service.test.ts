@@ -52,7 +52,7 @@ CREATE TABLE file_change_scopes (
 );
 INSERT INTO file_change_scopes VALUES('scope','installation','local','workspace','posix','/repo','active');
 CREATE TABLE file_change_operations (
- id TEXT PRIMARY KEY, execution_segment_id TEXT, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
+ id TEXT PRIMARY KEY, journal_seq INTEGER NOT NULL DEFAULT 1, execution_segment_id TEXT, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
  source_kind TEXT NOT NULL DEFAULT 'tool', source_id TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
  tool_call_id TEXT, narrator_id TEXT, project_id TEXT, request_digest TEXT,
  execution_binding_json TEXT DEFAULT '{"deviceId":"local","runtimeEpoch":"test","runtimeGeneration":1,"fencingToken":0}',
@@ -65,7 +65,7 @@ CREATE TABLE file_change_operations (
 CREATE TABLE file_change_effects (
  id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, scope_id TEXT NOT NULL, file_key TEXT NOT NULL, scope_revision INTEGER NOT NULL DEFAULT 1,
  mutation_id TEXT NOT NULL, request_digest TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'apply',
- outcome TEXT NOT NULL DEFAULT 'changed', settlement TEXT NOT NULL DEFAULT 'settled', attribution_grade TEXT NOT NULL DEFAULT 'measured',
+ outcome TEXT NOT NULL DEFAULT 'changed', disk_outcome TEXT, settlement TEXT NOT NULL DEFAULT 'settled', attribution_grade TEXT NOT NULL DEFAULT 'measured',
  execution_confirmed INTEGER NOT NULL DEFAULT 1, lines_added INTEGER, lines_removed INTEGER,
  before_blob_digest TEXT, intended_after_blob_digest TEXT, observed_after_blob_digest TEXT,
  identity_json TEXT NOT NULL, before_state_json TEXT NOT NULL, intended_after_state_json TEXT NOT NULL, observed_after_state_json TEXT NOT NULL, execution_receipt_json TEXT
@@ -616,18 +616,23 @@ describe("complete mutation candidates, not just successful writes", () => {
 			reason: "non_file_change",
 		});
 	});
-	test("an active file tool is deferred without vetoing settled earlier effects", async () => {
-		const write = tool(1, "Write");
-		journal(write);
-		const active = tool(2, "Write");
-		sqlite.query("UPDATE narrator_tool_calls SET status='running' WHERE id=?").run(active.id);
+	for (const status of ["initializing", "pending", "running"])
+		for (const identityVersion of [0, 1])
+			test(`${status} file attempt v${identityVersion} leaves settled effects available with partial coverage`, async () => {
+				const write = tool(1, "Write");
+				journal(write);
+				const active = tool(2, "Write");
+				sqlite
+					.query("UPDATE narrator_tool_calls SET status=?,execution_identity_version=? WHERE id=?")
+					.run(status, identityVersion, active.id);
 
-		const result = await collect({ kind: "from_seq", minSeq: 1 });
-		expect(result.evidenceComplete).toBe(true);
-		expect(result.issues).toEqual([]);
-		expect(result.effects).toHaveLength(1);
-		expect(result.noDiskTools).toContainEqual({ toolCallId: active.id, reason: "pending" });
-	});
+				const result = await collect({ kind: "from_seq", minSeq: 1 });
+				expect(result.selectionComplete).toBe(true);
+				expect(result.evidenceComplete).toBe(false);
+				expect(result.issues).toEqual([{ code: "FILE_TOOL_PENDING", toolCallId: active.id }]);
+				expect(result.effects).toHaveLength(1);
+				expect(result.noDiskTools.some((row) => row.toolCallId === active.id)).toBe(false);
+			});
 });
 
 for (const selector of [
@@ -731,7 +736,7 @@ test("operation binding/expected count and reverse pins are not silently trusted
 	expect(hasIssue(result, "OPERATION_UNRESOLVED")).toBe(true);
 	expect(hasIssue(result, "EFFECT_PIN_MISSING")).toBe(true);
 });
-test("active read tools and retired/mismatched scopes do not authorize history execution", async () => {
+test("read tools and retired scope metadata preserve settled historical evidence", async () => {
 	const read = tool(1, "Read");
 	const write = tool(2);
 	journal(write);
@@ -739,8 +744,10 @@ test("active read tools and retired/mismatched scopes do not authorize history e
 	sqlite.query("UPDATE file_change_scopes SET status='retired'").run();
 	const result = await collect();
 	expect(hasIssue(result, "TOOL_ACTIVE_OR_UNKNOWN")).toBe(false);
-	expect(hasIssue(result, "EFFECT_SCOPE_UNVERIFIED")).toBe(true);
-	expect(result.evidenceComplete).toBe(false);
+	expect(hasIssue(result, "EFFECT_SCOPE_UNVERIFIED")).toBe(false);
+	expect(result.evidenceComplete).toBe(true);
+	sqlite.query("UPDATE file_change_scopes SET workspace_instance_id='changed'").run();
+	expect(hasIssue(await collect(), "EFFECT_SCOPE_UNVERIFIED")).toBe(true);
 });
 
 test("a receipt from another runtime generation is not the selected attempt's evidence", async () => {

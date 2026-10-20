@@ -238,6 +238,17 @@ function FileEditorBinding(props: FileEditorContentProps) {
 					: {}),
 				origin: () => (referenceOrigin ? "reference" : "legacy"),
 				translate: (key, defaultValue) => latest.current(`fileEditor.${key}`, { defaultValue }),
+				// One receipt observer belongs to the shared copy, not to each rendered view.
+				onSaveReceipt: (result) => {
+					if (result.historyStatus === "unavailable") {
+						notifications.show({
+							title: filePanelBaseName(filePath),
+							message: latest.current("revertPlanHistoryUnavailable"),
+							color: "yellow",
+							autoClose: 10_000,
+						});
+					}
+				},
 				...(readOnly
 					? {
 							readOnlySource: async (signal: AbortSignal) => {

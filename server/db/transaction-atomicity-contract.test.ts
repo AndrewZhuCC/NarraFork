@@ -1001,9 +1001,9 @@ function classifyDeferredCall(
 /**
  * A callback forwarded by reference: what the gate can and cannot conclude.
  *
- * Five production wrappers forward a caller-supplied callback straight into
- * `db.transaction(work)` (`workspace-write-coordinator`, `revert-plan-service`,
- * `revert-mutation-journal`, `file-change-evidence`, `file-change-blob-catalog`). The gate cannot
+ * Production wrappers forward a caller-supplied callback straight into
+ * `db.transaction(work)` (`revert-plan-service`, `revert-mutation-journal`,
+ * `file-change-evidence`, `file-change-blob-catalog`). The gate cannot
  * see the callback's body, so it cannot decide atomicity there.
  *
  * ⚠️ AN EARLIER VERSION OF THIS FILE CLAIMED THE TYPE SYSTEM CLOSED THAT HOLE — that
@@ -1349,7 +1349,6 @@ describe("gate: no async SQLite atomic sections in production code", () => {
 		// in view: they are the positive side of the receiver-recognition rule, and a skip rule
 		// that silently exempted them would make that rule look healthier than it is.
 		expect(posix).toContain("server/services/knowledge/postgres-write-store.ts");
-		expect(posix).toContain("server/services/postgres-workspace-lease-store.ts");
 		expect(posix).toContain("server/services/agent-runtime/postgres-runtime-queue.ts");
 		// The `.probe.` exemption must stay a one-file convention, not a growing loophole.
 		expect(posix.filter((p) => p.includes(".probe."))).toEqual([]);
@@ -1697,13 +1696,12 @@ describe("gate: no async SQLite atomic sections in production code", () => {
 		expect(probe).not.toContain("bun:sqlite");
 	});
 
-	it("the five forwarding wrappers are still private, which is what actually protects them", () => {
+	it("transaction forwarding wrappers are private, which is what actually protects them", () => {
 		// The safety argument for the by-reference case is encapsulation, so it has to be checked
 		// rather than assumed. If one of these becomes non-private, the repo-wide gate above starts
 		// reporting it — this test names them so the failure is self-explanatory instead of
 		// arriving as an unattributed violation.
 		const forwarders = [
-			"server/services/workspace-write-coordinator.ts",
 			"server/services/revert-plan-service.ts",
 			"server/services/revert-mutation-journal.ts",
 			"server/services/file-change-evidence.ts",

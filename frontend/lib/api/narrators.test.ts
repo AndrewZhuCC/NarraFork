@@ -25,6 +25,41 @@ describe("narrators API", () => {
 		}
 	});
 
+	test.each([
+		false,
+		true,
+	])("edit transports the reviewed plan with actual content and uploads (%s)", async (multipart) => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: RequestInit[] = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: unknown, init: RequestInit) => {
+				requests.push(init);
+				return Response.json({ ok: true });
+			},
+		});
+		const revertPlan = {
+			planId: "reviewed-plan",
+			planHash: "a".repeat(64),
+			action: "edit_and_regenerate" as const,
+		};
+		await api.editAndRegenerate("n", "m", "  actual new prompt  ", {
+			skipRevert: false,
+			revertPlan,
+			newTextFiles: multipart ? [new File(["attachment"], "notes.txt")] : undefined,
+		});
+		const body = requests[0].body;
+		const parsed =
+			body instanceof FormData
+				? { content: body.get("content"), revertPlan: JSON.parse(String(body.get("revertPlan"))) }
+				: JSON.parse(String(body));
+		expect(parsed.content).toBe("  actual new prompt  ");
+		expect(parsed.revertPlan).toEqual(revertPlan);
+	});
+
 	describe("composer document transport", () => {
 		const doc: ComposerDocument = {
 			version: 1,

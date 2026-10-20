@@ -43,7 +43,11 @@ import { EditorDocumentJobs } from "./editor-document-jobs";
 import { EditorDocumentStreams, type EditorRemoteRawSource } from "./editor-document-streams";
 import type { EditorVersionMetadata } from "./editor-document-worker";
 import { EditorDraftAnchorStore } from "./editor-draft-anchor-store";
-import type { EditorFileChangeRequest, FileChangeCompletion } from "./file-change-runtime";
+import {
+	type EditorFileChangeRequest,
+	type FileChangeCompletion,
+	fileWriteOutcomeMetadata,
+} from "./file-change-runtime";
 
 export interface EditorBinding {
 	workspaceRevision?: number;
@@ -249,6 +253,8 @@ const expired = () =>
 		410,
 	);
 const invalid = (message: string) => new EditorDocumentError("EDITOR_INVALID_STATE", message);
+// Optional restart metadata must not consume the target write's full IO budget.
+const RECOVERY_BUDGET_MS = 1_000;
 
 function storageUnavailable(message: string): AppError {
 	return new AppError(message, 503, "EDITOR_STORAGE_UNAVAILABLE");
@@ -428,6 +434,10 @@ export class EditorDocumentService {
 			root: this.deps.root,
 		});
 		if (cleaned.kind !== "cleaned") throw invalid("Unexpected recovery worker response");
+		if (cleaned.unavailableRecoveryCount)
+			logger.warn("Editor recovery descriptions unavailable at startup; files retained", {
+				count: cleaned.unavailableRecoveryCount,
+			});
 		for (const recovery of cleaned.operations)
 			this.addOperation(recovery.operationId, {
 				userId: recovery.userId,
@@ -1554,13 +1564,6 @@ export class EditorDocumentService {
 								encoding: upload.encoding,
 								hashKind: upload.hashKind,
 								digest: upload.digest as string,
-								recovery: {
-									path: join(this.deps.root, `ed-${operationId}.json`),
-									userId: actor.userId,
-									narratorId: actor.narratorId,
-									operationId,
-									snapshotRevision: upload.snapshotRevision,
-								},
 							});
 							if (result.kind === "conflict") {
 								if (session.conflict?.readers)
@@ -1602,8 +1605,50 @@ export class EditorDocumentService {
 								);
 							}
 							if (result.kind !== "prepared") throw invalid("Unexpected preparation response");
+							try {
+								const recovery = await this.jobs.run(
+									actor.userId,
+									{
+										action: "recovery",
+										path: join(this.deps.root, `ed-${operationId}.json`),
+										metadata: {
+											version: 1,
+											...(upload.hashKind ? { hashKind: upload.hashKind } : {}),
+											userId: actor.userId,
+											narratorId: actor.narratorId,
+											operationId,
+											snapshotRevision: upload.snapshotRevision,
+											hash: result.hash,
+											rawDigest: result.rawDigest,
+											bytes: result.bytes,
+											createdAt: Date.now(),
+										},
+									},
+									AbortSignal.timeout(RECOVERY_BUDGET_MS),
+								);
+								if (recovery.kind !== "recovery") throw invalid("Unexpected recovery response");
+								if (recovery.status === "conflict")
+									throw new EditorDocumentError(
+										"EDITOR_IDENTITY_CHANGED",
+										"Recovery metadata does not match this preparation",
+									);
+							} catch (error) {
+								if (
+									error instanceof EditorDocumentError &&
+									error.code === "EDITOR_IDENTITY_CHANGED"
+								)
+									throw error;
+								// The worker is terminated before releasing its files on cancellation.
+								// This is only the editor's restart description, not file-change history.
+								logger.warn("Editor save recovery description unavailable", {
+									operationId,
+									error: String(error),
+								});
+							}
 							return {
 								nextBytes: result.nextBytes,
+								rawDigest: result.rawDigest,
+								beforeRawDigest: result.beforeRawDigest,
 								result: { hash: result.hash, bytes: result.bytes },
 								lineStats: null,
 							};
@@ -1614,6 +1659,8 @@ export class EditorDocumentService {
 						status: "saved",
 						operationId,
 						...completed.result,
+						diskOutcome: "applied",
+						historyStatus: completed.historyStatus,
 						snapshotRevision: upload.snapshotRevision,
 					};
 				});
@@ -1637,7 +1684,7 @@ export class EditorDocumentService {
 							error instanceof Error ? error.message.slice(0, 256) : "Editor save failed",
 							uncertain ? 500 : error instanceof AppError ? error.statusCode : 500,
 						);
-			upload.error.data.operationId = operationId;
+			Object.assign(upload.error.data, fileWriteOutcomeMetadata(error), { operationId });
 			operation.value = {
 				status: uncertain ? "uncertain" : "failed",
 				operationId,

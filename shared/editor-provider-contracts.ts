@@ -159,6 +159,7 @@ export interface EditorStageAbort extends EditorWriteOwner {
 }
 export const EDITOR_METADATA_POLICIES = ["preserve", "reject"] as const;
 export interface EditorApplyRequest extends EditorWriteOwner {
+	readonly coordination: "target-queue-v1";
 	readonly operationId: string;
 	readonly requestDigest: string;
 	readonly stageId: string;
@@ -178,7 +179,7 @@ export interface EditorApplyResult {
 	readonly error?: { readonly code: string; readonly message: string };
 }
 export interface EditorQueryRequest extends EditorWriteOwner {
-	/** Host has durably settled its original effect/lease; permits bounded terminal retention. */
+	/** Host has durably received the terminal proof; permits bounded terminal retention. */
 	readonly acknowledgeTerminal?: boolean;
 	readonly operationId: string;
 	readonly requestDigest: string;
@@ -198,18 +199,17 @@ export interface EditorQueryResult {
 	readonly result: EditorApplyResult | null;
 }
 
+/** A new writer must negotiate actual target-queue ownership, not legacy persistent fences. */
+export const EDITOR_TARGET_QUEUE_FEATURE = "editor.target-queue.v1";
+
 /** Host-only bounded recovery metadata; stdio bootstrap fixes its private directory.
  * These methods are intentionally unavailable to remote WebSocket RPC clients. */
-export interface EditorHostReceiptRecord {
-	version: 1;
+interface EditorHostReceiptFields {
 	createdAt: number;
 	userId: string;
 	narratorId: string;
 	deviceId: string;
 	operationId: string;
-	hostOperationId: string;
-	leaseId: string;
-	effectId: string;
 	saved: { hash: string; bytes: number; snapshotRevision: number; hashKind?: "raw-sha256" };
 	requestDigest: string;
 	namespace: string;
@@ -220,6 +220,21 @@ export interface EditorHostReceiptRecord {
 	bytes: number;
 	receipt?: EditorApplyResult;
 }
+/** Read-only legacy recovery. New dispatch never invents these retired lease fields. */
+export interface EditorLegacyHostReceiptRecord extends EditorHostReceiptFields {
+	version: 1;
+	hostOperationId: string;
+	leaseId: string;
+	effectId: string;
+}
+export interface EditorCurrentHostReceiptRecord extends EditorHostReceiptFields {
+	version: 2;
+	/** Optional history association; its absence never changes a provider's real result. */
+	historyOperationId?: string;
+}
+export type EditorHostReceiptRecord =
+	| EditorLegacyHostReceiptRecord
+	| EditorCurrentHostReceiptRecord;
 // Native Host store H3 (VALUE): authoritative shape; earlier RECORD proposals are not wire contracts.
 export interface EditorHostReceiptPut {
 	value: EditorHostReceiptRecord;

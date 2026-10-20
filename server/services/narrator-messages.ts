@@ -100,8 +100,10 @@ import {
 	hasUnmaterializedRefsBelow,
 } from "./narrator-refs-backfill";
 import {
+	authorizeRevertHistory,
 	revertNarratorScopedForMessages,
 	revertNarratorScopedForToolUses,
+	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import {
@@ -109,12 +111,12 @@ import {
 	attachSendTargetDetails,
 } from "./send-delivery-resolution";
 import {
-	commitSnapshotRevert,
+	assertSnapshotRevertComplete,
 	DEFAULT_REVERT_SCOPE,
 	type RevertResult,
 	type RevertScope,
 	type RevertWarning,
-	revertForMessagesTree,
+	snapshotHistoryFailure,
 	unavailableSnapshotRevert,
 } from "./snapshot-revert";
 // Pure in-memory state module (no imports of its own), so importing it here
@@ -151,17 +153,16 @@ async function revertForDeletedMessages(
 	narratorId: string,
 	messageIds: string[],
 	scope: RevertScope | undefined,
+	options?: ScopedRevertOptions,
 ): Promise<RevertResult> {
-	const selectedScope = scope ?? DEFAULT_REVERT_SCOPE;
-	const result =
-		selectedScope === "workspace"
-			? await revertForMessagesTree(narratorId, messageIds)
-			: await revertNarratorScopedForMessages(narratorId, messageIds);
+	if ((scope ?? DEFAULT_REVERT_SCOPE) === "workspace") {
+		return unavailableSnapshotRevert(
+			"Workspace-wide restore requires a verified per-file plan; original history was retained.",
+		);
+	}
 	return (
-		result ??
-		unavailableSnapshotRevert(
-			`No verified ${selectedScope} rollback is available for these messages; history was retained.`,
-		)
+		(await revertNarratorScopedForMessages(narratorId, messageIds, options)) ??
+		unavailableSnapshotRevert("Selected message history is unavailable.")
 	);
 }
 
@@ -169,7 +170,7 @@ async function revertForDeletedBlock(
 	narratorId: string,
 	removedBlock: { type: string; id?: string },
 	messageId: string,
-	opts?: { skipRevert?: boolean; scope?: RevertScope },
+	opts?: BlockDeleteOptions,
 ): Promise<RevertResult | null> {
 	if (opts?.skipRevert || removedBlock.type !== "tool_use") return null;
 	if (!removedBlock.id) {
@@ -179,6 +180,7 @@ async function revertForDeletedBlock(
 		narratorId,
 		[{ messageId, toolUseId: removedBlock.id }],
 		opts?.scope,
+		opts,
 	);
 }
 
@@ -186,6 +188,7 @@ async function revertForDeletedBlocks(
 	narratorId: string,
 	toolUses: Array<{ messageId: string; toolUseId: string }>,
 	scope: RevertScope | undefined,
+	options?: ScopedRevertOptions,
 ): Promise<RevertResult> {
 	// A message-wide workspace restore cannot express an arbitrary block selection.
 	// Replay is not a safe substitute, even when workspace scope was requested.
@@ -195,17 +198,15 @@ async function revertForDeletedBlocks(
 		);
 	}
 	return (
-		(await revertNarratorScopedForToolUses(narratorId, toolUses)) ??
-		unavailableSnapshotRevert(
-			"No verified narrator rollback is available for these tool blocks; history was retained.",
-		)
+		(await revertNarratorScopedForToolUses(narratorId, toolUses, options)) ??
+		unavailableSnapshotRevert("Selected tool history is unavailable.")
 	);
 }
 
 type MessageTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 type DeletableBlock = { type: string; id?: string; text?: string };
 type BlockSelection = { messageId: string; blockIndex: number };
-type BlockDeleteOptions = {
+type BlockDeleteOptions = ScopedRevertOptions & {
 	skipRevert?: boolean;
 	skipNarratorUpdate?: boolean;
 	preserveConversationId?: boolean;
@@ -909,7 +910,7 @@ function applyBlockDeletionTx(
 	}
 }
 
-/** One bounded history transaction, so SQL failure compensates the entire rollback. */
+/** File attempts finish first; a separate bounded history transaction retains COW and selection checks. */
 async function deleteBlockSelection(
 	narratorId: string,
 	blocks: BlockSelection[],
@@ -952,6 +953,7 @@ async function deleteBlockSelection(
 				narratorId,
 				toolUses as Array<{ messageId: string; toolUseId: string }>,
 				opts?.scope,
+				opts,
 			);
 		}
 	}
@@ -1001,8 +1003,16 @@ async function deleteBlockSelection(
 					.run();
 			}
 		});
-	if (snapshotRevert) await commitSnapshotRevert(snapshotRevert, mutate);
-	else mutate();
+	if (snapshotRevert) assertSnapshotRevertComplete(snapshotRevert);
+	try {
+		if (snapshotRevert && opts?.principal) await authorizeRevertHistory(narratorId, opts);
+		opts?.signal?.throwIfAborted();
+		mutate();
+	} catch (error) {
+		if (snapshotRevert) throw snapshotHistoryFailure(snapshotRevert, error);
+		throw error;
+	}
+	if (snapshotRevert) snapshotRevert = { ...snapshotRevert, historyCommitted: true };
 	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
 
 	// Persisted block edits must reach already-open narrators. Broadcast the exact
@@ -1058,6 +1068,7 @@ async function deleteBlockSelection(
 		deleted: results.length,
 		failed: 0,
 		results,
+		...(snapshotRevert ? { revertResult: snapshotRevert } : {}),
 		...(snapshotRevert?.warnings?.length ? { revertWarnings: snapshotRevert.warnings } : {}),
 		...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
 		...(planned.derived.subagentNarratorIds.length
@@ -1570,30 +1581,35 @@ async function deleteMessageRange(
 		selectedMessageCount = planned.refs.length;
 		const messageIds = planned.refs.map((ref) => ref.messageId);
 		let revertWarnings: RevertWarning[] = [];
+		let revertResult: RevertResult | undefined;
 		if (!opts?.skipRevert && messageIds.length > 0) {
 			const version = JSON.stringify(planned);
 			const result = await measureAsync("fileRevert", () =>
-				revertForDeletedMessages(narratorId, messageIds, opts?.scope),
+				revertForDeletedMessages(narratorId, messageIds, opts?.scope, opts),
 			);
-			await measureAsync("revertCommit", () =>
-				commitSnapshotRevert(result, () =>
-					measureSync("transaction", () =>
-						db.transaction((tx) => {
-							const current = measureSync("plan", () =>
-								planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+			assertSnapshotRevertComplete(result);
+			try {
+				if (opts?.principal) await authorizeRevertHistory(narratorId, opts);
+				opts?.signal?.throwIfAborted();
+				measureSync("transaction", () =>
+					db.transaction((tx) => {
+						const current = measureSync("plan", () =>
+							planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+						);
+						if (JSON.stringify(current) !== version) {
+							throw new AppError(
+								"Message history changed during deletion; retry the selection",
+								409,
+								"HISTORY_DELETE_STALE",
 							);
-							if (JSON.stringify(current) !== version) {
-								throw new AppError(
-									"Message history changed during deletion; retry the selection",
-									409,
-									"HISTORY_DELETE_STALE",
-								);
-							}
-							apply(tx, planned);
-						}),
-					),
-				),
-			);
+						}
+						apply(tx, planned);
+					}),
+				);
+			} catch (error) {
+				throw snapshotHistoryFailure(result, error);
+			}
+			revertResult = { ...result, historyCommitted: true };
 			revertWarnings = result.warnings ?? [];
 		}
 		await measureAsync("questionNotifications", () =>
@@ -1611,6 +1627,7 @@ async function deleteMessageRange(
 			deletedCount: planned.refs.length,
 			deletedMessageIds: messageIds,
 			revertWarnings,
+			...(revertResult ? { revertResult } : {}),
 			...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
 			...(planned.derived.subagentNarratorIds.length
 				? { archivedSubagentIds: planned.derived.subagentNarratorIds }
@@ -4710,14 +4727,11 @@ const narratorMessageQueriesUnlocked = {
 		return result;
 	},
 
-	async deleteMessage(
-		narratorId: string,
-		messageId: string,
-		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) {
+	async deleteMessage(narratorId: string, messageId: string, opts?: BlockDeleteOptions) {
 		const result = await deleteMessageRange(narratorId, messageId, true, opts);
 		return {
 			deletedCount: result.deletedCount,
+			...(result.revertResult ? { revertResult: result.revertResult } : {}),
 			...(result.historyWarnings ? { historyWarnings: result.historyWarnings } : {}),
 			...(result.archivedSubagentIds ? { archivedSubagentIds: result.archivedSubagentIds } : {}),
 		};
@@ -5095,11 +5109,7 @@ const narratorMessageQueriesUnlocked = {
 		});
 	},
 
-	async deleteMessagesAfter(
-		narratorId: string,
-		messageId: string,
-		opts?: { preserveConversationId?: boolean; skipRevert?: boolean; scope?: RevertScope },
-	) {
+	async deleteMessagesAfter(narratorId: string, messageId: string, opts?: BlockDeleteOptions) {
 		return deleteMessageRange(narratorId, messageId, false, opts);
 	},
 
@@ -5112,6 +5122,7 @@ const narratorMessageQueriesUnlocked = {
 		const result = await deleteBlockSelection(narratorId, [{ messageId, blockIndex }], opts);
 		return {
 			messageDeleted: result.results[0]?.messageDeleted ?? false,
+			...(result.revertResult ? { revertResult: result.revertResult } : {}),
 			...(result.historyWarnings ? { historyWarnings: result.historyWarnings } : {}),
 			...(result.archivedSubagentIds ? { archivedSubagentIds: result.archivedSubagentIds } : {}),
 		};
@@ -5120,7 +5131,7 @@ const narratorMessageQueriesUnlocked = {
 	async deleteMessageBlocks(
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
-		opts?: { preserveConversationId?: boolean; skipRevert?: boolean; scope?: RevertScope },
+		opts?: BlockDeleteOptions,
 	) {
 		return deleteBlockSelection(narratorId, blocks, opts);
 	},

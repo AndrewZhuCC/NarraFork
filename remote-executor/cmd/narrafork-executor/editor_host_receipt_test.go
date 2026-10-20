@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,7 +19,7 @@ func hostRecordFixture(t *testing.T, p *stdioPeer, root, id string) map[string]a
 	t.Helper()
 	stat := p.must(t, "fs.stat", map[string]any{"path": root, "editorIdentity": true})
 	digest := stdioDigest([]byte("saved"))
-	return map[string]any{"version": 1, "createdAt": time.Now().UnixMilli(), "userId": "user", "narratorId": "narrator", "deviceId": "local", "operationId": id, "hostOperationId": "host-" + id, "leaseId": "lease", "effectId": "effect", "saved": map[string]any{"hash": digest, "bytes": 5, "snapshotRevision": 1, "hashKind": "raw-sha256"}, "requestDigest": stdioDigest([]byte(id)), "namespace": "owner", "resourceKey": "resource", "root": root, "identity": map[string]any{"deviceId": "local", "pathFlavor": map[bool]string{true: "windows", false: "posix"}[runtime.GOOS == "windows"], "canonicalPath": filepath.Join(root, "document"), "workspaceIdentity": stat["rootIdentity"], "runtimeEpoch": stat["runtimeEpoch"], "runtimeGeneration": 1, "fencingToken": 1}, "rawDigest": digest, "bytes": 5}
+	return map[string]any{"version": 2, "createdAt": time.Now().UnixMilli(), "userId": "user", "narratorId": "narrator", "deviceId": "local", "operationId": id, "saved": map[string]any{"hash": digest, "bytes": 5, "snapshotRevision": 1, "hashKind": "raw-sha256"}, "requestDigest": stdioDigest([]byte(id)), "namespace": "owner", "resourceKey": "resource", "root": root, "identity": map[string]any{"deviceId": "local", "pathFlavor": map[bool]string{true: "windows", false: "posix"}[runtime.GOOS == "windows"], "canonicalPath": filepath.Join(root, "document"), "workspaceIdentity": stat["rootIdentity"], "runtimeEpoch": stat["runtimeEpoch"], "runtimeGeneration": 1, "fencingToken": 1}, "rawDigest": digest, "bytes": 5}
 }
 func hostProof(id string) map[string]any {
 	return map[string]any{"operationId": id, "outcome": "committed", "rawDigest": stdioDigest([]byte("saved")), "totalBytes": 5}
@@ -90,6 +91,38 @@ func testEditorHostReceiptBinary(t *testing.T, binary string) {
 			save(cold, "v1-next", first, "next\n")
 		})
 	}
+	t.Run("native-legacy-host-receipt-query-only", func(t *testing.T) {
+		root := t.TempDir()
+		store := filepath.Join(t.TempDir(), "legacy-host")
+		state := filepath.Join(t.TempDir(), "state")
+		peer := startEditorPeer(t, binary, root, state, true, store)
+		record := hostRecordFixture(t, peer, root, "legacy")
+		record["version"] = 1
+		record["hostOperationId"], record["leaseId"], record["effectId"] = "old-host", "old-lease", "old-effect"
+		if result := peer.call(t, "editor.hostReceipt.put", map[string]any{"value": record}); result.OK {
+			t.Fatal("native helper admitted a new v1 association")
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(store, "legacy.json"), encoded, 0600); err != nil {
+			t.Fatal(err)
+		}
+		got := peer.must(t, "editor.hostReceipt.get", map[string]any{"operationId": "legacy"})["value"].(map[string]any)
+		if got["version"] != float64(1) || got["leaseId"] != "old-lease" {
+			t.Fatal("legacy query rewrote its association", got)
+		}
+		peer.must(t, "editor.hostReceipt.settle", map[string]any{"operationId": "legacy", "receipt": hostProof("legacy")})
+		if err := peer.finish(); err != nil {
+			t.Fatal(err)
+		}
+		cold := startEditorPeer(t, binary, root, state, true, store)
+		got = cold.must(t, "editor.hostReceipt.get", map[string]any{"operationId": "legacy"})["value"].(map[string]any)
+		if got["version"] != float64(1) || got["receipt"].(map[string]any)["outcome"] != "committed" {
+			t.Fatal("legacy cold query lost terminal proof", got)
+		}
+	})
 	t.Run("native-host-receipt", func(t *testing.T) {
 		root := t.TempDir()
 		store := filepath.Join(t.TempDir(), "host-receipts")

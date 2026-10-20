@@ -95,7 +95,7 @@ import {
 	workspaceFileTarget,
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
-import type { RevertScope } from "../../lib/api/narrators";
+import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
@@ -105,6 +105,12 @@ import {
 } from "../../lib/format";
 import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
+import {
+	formatRevertFailure,
+	formatRevertSuccessWarning,
+	invalidateRevertQueries,
+	isRevertHistoryCommitted,
+} from "../../lib/revert-result";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -821,7 +827,7 @@ function NarratorPanelBody({
 		async (
 			messageId: string,
 			newContent: string,
-			revertOpts: { skipRevert: boolean; scope?: RevertScope },
+			revertOpts: RevertActionConfirmOptions,
 			opts?: {
 				keepImageIds: string[];
 				newImages: File[];
@@ -844,10 +850,16 @@ function NarratorPanelBody({
 					...revertOpts,
 					...opts,
 				});
-				// The rollback this edit performed can reach past the chosen scope
-				// (subagent writes, a workspace restore) — reported exactly as it is for
-				// rollback-to-block, so the outcome is verified rather than assumed.
-				const warningText = formatRevertWarnings(t, result.warnings);
+				if (!result.ok || (result.revertResult && !isRevertHistoryCommitted(result.revertResult))) {
+					throw new ApiError(t("editFailed"), 409, { ...result });
+				}
+				// File writes and the COW history update have independent outcomes.
+				const warningText = [
+					formatRevertSuccessWarning(t, result),
+					formatRevertWarnings(t, result.warnings),
+				]
+					.filter(Boolean)
+					.join("\n");
 				if (warningText) {
 					notifications.show({
 						title: t("rollbackPartialTitle"),
@@ -857,13 +869,23 @@ function NarratorPanelBody({
 					});
 				}
 				return result.ok;
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
-				notifications.show({ title: t("editFailed"), message, color: "red" });
+			} catch (error) {
+				notifications.show({
+					title: t("editFailed"),
+					message: formatRevertFailure(t, error, {
+						fallbackKey: "editFailed",
+						skipRevert: revertOpts.skipRevert,
+					}),
+					color: "red",
+					autoClose: false,
+				});
 				return false;
+			} finally {
+				invalidateRevertQueries(qc, narratorId);
+				chunkListRef.current?.refreshStructure("full");
 			}
 		},
-		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
+		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t, qc],
 	);
 
 	const handleEditAssistantMessage = useCallback(

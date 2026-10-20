@@ -24,16 +24,17 @@ const editorHostRecordTTL = 30 * 24 * time.Hour
 // record, not another mutation journal: no file bodies, user-selected paths,
 // transaction protocol, or remote RPC entry point.
 type EditorHostReceiptRecord struct {
-	Version         int    `json:"version"`
-	CreatedAt       int64  `json:"createdAt"`
-	UserID          string `json:"userId"`
-	NarratorID      string `json:"narratorId"`
-	DeviceID        string `json:"deviceId"`
-	OperationID     string `json:"operationId"`
-	HostOperationID string `json:"hostOperationId"`
-	LeaseID         string `json:"leaseId"`
-	EffectID        string `json:"effectId"`
-	Saved           struct {
+	Version            int    `json:"version"`
+	CreatedAt          int64  `json:"createdAt"`
+	UserID             string `json:"userId"`
+	NarratorID         string `json:"narratorId"`
+	DeviceID           string `json:"deviceId"`
+	OperationID        string `json:"operationId"`
+	HostOperationID    string `json:"hostOperationId,omitempty"` // Legacy v1 query association only.
+	LeaseID            string `json:"leaseId,omitempty"`
+	EffectID           string `json:"effectId,omitempty"`
+	HistoryOperationID string `json:"historyOperationId,omitempty"`
+	Saved              struct {
 		Hash             string `json:"hash"`
 		Bytes            int64  `json:"bytes"`
 		SnapshotRevision int64  `json:"snapshotRevision"`
@@ -105,10 +106,24 @@ func (e *EditorEngine) ConfigureHostReceipts(root string) error {
 }
 
 func validateHostReceipt(record *EditorHostReceiptRecord) error {
-	if record.Version != 1 || record.CreatedAt <= 0 || record.CreatedAt > time.Now().UnixMilli() || !editorHostID.MatchString(record.OperationID) || !editorHostID.MatchString(record.LeaseID) || !editorHostID.MatchString(record.EffectID) {
+	if (record.Version != 1 && record.Version != 2) || record.CreatedAt <= 0 || record.CreatedAt > time.Now().UnixMilli() || !editorHostID.MatchString(record.OperationID) {
 		return fmt.Errorf("invalid Host receipt identity/version")
 	}
-	for _, value := range []string{record.UserID, record.NarratorID, record.DeviceID, record.HostOperationID, record.RequestDigest, record.Namespace, record.ResourceKey, record.Root, record.Identity.CanonicalPath, record.Identity.WorkspaceIdentity, record.Identity.RuntimeEpoch} {
+	associations := []string{record.UserID, record.NarratorID, record.DeviceID, record.RequestDigest, record.Namespace, record.ResourceKey, record.Root, record.Identity.CanonicalPath, record.Identity.WorkspaceIdentity, record.Identity.RuntimeEpoch}
+	if record.Version == 1 {
+		if !editorHostID.MatchString(record.LeaseID) || !editorHostID.MatchString(record.EffectID) || record.HistoryOperationID != "" {
+			return fmt.Errorf("invalid legacy Host receipt association")
+		}
+		associations = append(associations, record.HostOperationID)
+	} else {
+		if record.HostOperationID != "" || record.LeaseID != "" || record.EffectID != "" {
+			return fmt.Errorf("Host receipt v2 cannot contain legacy lease/effect associations")
+		}
+		if record.HistoryOperationID != "" {
+			associations = append(associations, record.HistoryOperationID)
+		}
+	}
+	for _, value := range associations {
 		if len(value) == 0 || len(value) > 8192 || strings.ContainsRune(value, 0) {
 			return fmt.Errorf("invalid Host receipt association")
 		}
@@ -314,6 +329,9 @@ func (h *Handlers) EditorHostReceiptDispatch(parent context.Context, method stri
 			return nil, err
 		}
 		record := request.Value
+		if record.Version != 2 {
+			return nil, fmt.Errorf("new Host receipts require version 2; legacy receipts are query-only")
+		}
 		if err = validateHostReceipt(&record); err != nil {
 			return nil, err
 		}

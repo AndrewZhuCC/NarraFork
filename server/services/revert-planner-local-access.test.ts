@@ -9,6 +9,7 @@ import {
 	readFile,
 	rename,
 	rm,
+	symlink,
 	unlink,
 	writeFile,
 } from "node:fs/promises";
@@ -29,7 +30,6 @@ import { structSedTool } from "../lib/agent/tools/struct-sed";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { createToken } from "../lib/auth";
-import { AppError } from "../lib/errors";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { getNarraforkHome } from "../lib/narrafork-home";
@@ -41,13 +41,14 @@ import { fileChangeLocalIo } from "./file-change-local-io";
 import {
 	getDefaultLocalFileChangeRuntime,
 	type LocalFileChangeRuntime,
-	localFileChangeRuntimeBinding,
 } from "./file-change-runtime";
+import { withFileWrite } from "./file-write-queue";
 import { narratorService } from "./narrator-service";
 import * as narratorState from "./narrator-session-state";
 import { collectRevertBlockers } from "./revert-blockers";
 import type { RevertPlanFileMetadata, RevertPlanSummary } from "./revert-plan-service";
 import { RevertPlannerLocalAccess } from "./revert-planner-local-access";
+import type { RevertPreviewDiagnostic } from "./revert-planner-service";
 import type { RevertSelectionResult } from "./revert-selection-service";
 import {
 	type RevertTransactionExecution,
@@ -110,8 +111,6 @@ const test = new Proxy(nativeTest, ownedTest);
 async function closeFixture(owner: HttpFixtureLifetime) {
 	owner.controller.abort(new Error("HTTP test fixture finished"));
 	while (owner.pending.size) await Promise.allSettled([...owner.pending]);
-	// Preview cancellation may return before its real namespace work finishes.
-	await owner.runtime?.waitForNamespaceDrain();
 	while (owner.pending.size) await Promise.allSettled([...owner.pending]);
 	for (const restore of owner.restorers.splice(0).reverse()) await restore();
 	// Retain durable journals/pins. Remove only this fixture's workspace, after IO settles.
@@ -176,11 +175,11 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 	settings.chapters.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
 	owner.runtime = runtime;
-	const namespaceAccess = runtime.withNamespaceAccess;
-	// Transparent lifetime observers, not Bun spies: fault-injection cases may spy
-	// on these same methods and must retain their original forwarding target.
-	runtime.withNamespaceAccess = function <T>(body: () => Promise<T>, signal?: AbortSignal) {
-		return track(owner, namespaceAccess.bind(this)(body, signal));
+	const verifyNamespace = runtime.verifyNamespace;
+	// Track actual namespace checks and file execution through cancellation, without
+	// recreating the retired workspace-wide namespace lock.
+	runtime.verifyNamespace = function (signal?: AbortSignal) {
+		return track(owner, verifyNamespace.call(this, signal));
 	};
 	const execute = RevertTransactionService.prototype.execute;
 	RevertTransactionService.prototype.execute = function (input) {
@@ -190,7 +189,7 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 	};
 	owner.restorers.push(
 		() => {
-			if (owner.runtime) owner.runtime.withNamespaceAccess = namespaceAccess;
+			if (owner.runtime) owner.runtime.verifyNamespace = verifyNamespace;
 		},
 		() => {
 			RevertTransactionService.prototype.execute = execute;
@@ -247,14 +246,28 @@ async function http(
 async function prepare(extra: Record<string, unknown> = {}, bearer = token) {
 	return http("revert-plans", "POST", request(extra), bearer);
 }
-async function prepared(extra: Record<string, unknown> = {}) {
+interface PreviewExpectation {
+	coverageComplete: boolean;
+	diagnostics: RevertPreviewDiagnostic[];
+}
+function expectPreviewCoverage(
+	body: { plan: RevertPlanSummary; diagnostics?: RevertPreviewDiagnostic[] },
+	expected: PreviewExpectation = { coverageComplete: true, diagnostics: [] },
+) {
+	expect(body.plan.coverageComplete).toBe(expected.coverageComplete);
+	expect(body.diagnostics).toEqual(expected.diagnostics);
+	for (const diagnostic of body.diagnostics ?? []) {
+		expect(diagnostic.filePath ?? "").not.toContain(workspace);
+	}
+}
+async function prepared(extra: Record<string, unknown> = {}, expected?: PreviewExpectation) {
 	const response = await prepare(extra);
 	const body = await response.json();
 	expect(response.status, JSON.stringify(body)).toBe(200);
 	expect(response.headers.get("cache-control")).toBe("no-store");
 	expect(body.executable).toBe(false);
 	expect(body.plan.status).toBe("prepared");
-	expect(body.plan.coverageComplete).toBe(true);
+	expectPreviewCoverage(body, expected);
 	return body.plan as RevertPlanSummary;
 }
 function message(role: "user" | "assistant", blocks: unknown[]) {
@@ -500,6 +513,7 @@ async function actionPrepared(
 	messageId = "__all__",
 	extra: Record<string, unknown> = {},
 	expectedHistory?: { deletedMessageCount: number; deletedBlockCount: number },
+	expectedPreview?: PreviewExpectation,
 ) {
 	const response = await actionPreview(action, messageId, extra);
 	const body = await boundedJson(response);
@@ -508,9 +522,9 @@ async function actionPrepared(
 	expect(body.executable).toBe(false);
 	expect(body.plan, JSON.stringify(body)).toMatchObject({
 		status: "prepared",
-		coverageComplete: true,
 		expectedMessageVersion: messageVersion(),
 	});
+	expectPreviewCoverage(body, expectedPreview);
 	expect(body.plan.planHash).toMatch(/^[a-f0-9]{64}$/);
 	expect(body.historySummary).toEqual({
 		deletedMessageCount: expect.any(Number),
@@ -570,7 +584,6 @@ async function actionUnavailable(response: Response, action: RevertAction) {
 			toolCallId?: string;
 			toolName?: string;
 			operationId?: string;
-			leaseId?: string;
 			detail?: string;
 		}>;
 	};
@@ -629,7 +642,18 @@ async function committed(plan: RevertPlanSummary, action: RevertAction, extra = 
 		journalStatus: "committed",
 		settling: false,
 		reason: null,
+		files: journalFiles(plan).map((file) => ({
+			filePath: file.identityJson.displayPath,
+			deviceId: file.identityJson.deviceId,
+			status: file.status,
+			...(file.reason ? { reason: file.reason } : {}),
+		})),
+		historyStatus: "complete",
+		historyCommitted: action !== "revert_files",
 	});
+	expect(
+		body.files.every((file: { status: string }) => ["applied", "unchanged"].includes(file.status)),
+	).toBe(true);
 	expect(ownPlans().find((row) => row.id === plan.id)?.status).toBe("committed");
 	return body;
 }
@@ -765,13 +789,16 @@ describe("action-bound HTTP preview and real local execution", () => {
 		"Write",
 		"Edit",
 		"StructSed",
-	] as const)("namespace reset: triggering %s and later edits retain real rollback", async (tool) => {
+	] as const)("missing historical blob: %s and later edits retain independent rollback", async (tool) => {
 		const { path, call: oldCall } = await fixture();
 		const oldPlan = await actionPrepared("revert_files", oldCall.messageId);
 		const oldNamespace = await runtime.verifyNamespace();
-		const blobs = join(getNarraforkHome(), "file-change-blobs");
-		await rm(blobs, { recursive: true, force: true });
-		// The triggering mutation, not a sacrificial request, must acquire fresh evidence.
+		const missing = effects()[0].beforeBlobDigest;
+		if (!missing) throw new Error("Missing actual historical blob");
+		await unlink(
+			join(getNarraforkHome(), "file-change-blobs", "sha256", missing.slice(0, 2), missing),
+		);
+		// A missing historical blob affects its own target, while a fresh write still records evidence.
 		let current: { messageId: string };
 		if (tool === "Write") current = await write(path, "after-reset\n");
 		else if (tool === "Edit") current = await edit(path, "new", "after-reset");
@@ -795,16 +822,27 @@ describe("action-bound HTTP preview and real local execution", () => {
 		}
 		const recovered = await runtime.verifyNamespace();
 		expect(recovered.sourceInstanceId).toBe(oldNamespace.sourceInstanceId);
-		expect(recovered.generation).toBeGreaterThan(oldNamespace.generation);
-		const rejected = await prepare({ idempotencyKey: "old-evidence" });
-		expect(rejected.status).toBe(409);
+		expect(recovered.generation).toBe(oldNamespace.generation);
+		const partial = await prepared(
+			{ idempotencyKey: "old-evidence" },
+			{
+				coverageComplete: false,
+				diagnostics: [
+					{ code: "FILE_UNAVAILABLE", filePath: "file.txt", reason: "history_unavailable" },
+				],
+			},
+		);
+		expect(journalFiles(partial)[0].desiredStateJson).toEqual({
+			kind: "unknown",
+			reason: "history_unavailable",
+		});
 		expect(
 			db
 				.select()
 				.from(schema.revertOperations)
 				.where(eq(schema.revertOperations.id, oldPlan.id))
 				.get()?.status,
-		).toBe("expired");
+		).toBe("prepared");
 		const plan = await actionPrepared("revert_files", current.messageId, {
 			idempotencyKey: "reset-current",
 		});
@@ -853,8 +891,9 @@ describe("action-bound HTTP preview and real local execution", () => {
 		);
 		for (const file of journalFiles(plan))
 			expect(file.receiptJson).toMatchObject({
-				apply: { receipt: { confirmed: true, outcome: "applied" } },
-				compensate: null,
+				version: 3,
+				status: "applied",
+				historyStatus: "complete",
 			});
 	});
 	test("delete_tool_block resolves the real PK and preserves text plus other actual tool blocks", async () => {
@@ -1152,23 +1191,39 @@ describe("action-bound HTTP preview and real local execution", () => {
 		expect(await readFile(path, "utf8")).toBe("old\n");
 		expect(history()).toBe(before);
 	});
-	test("conflicting human changes make action preview unavailable without changing files or history", async () => {
+	test("conflicting human contents stay visible while independent files restore with a partial result", async () => {
 		const { path } = await fixture();
+		const safe = join(workspace, "safe.txt");
+		await writeFile(safe, "safe before\n");
+		await write(safe, "safe after\n");
 		await human(path, "human replaced the tool hunk\n");
 		const before = history();
 		const disk = await readFile(path);
-		const unavailable = await actionUnavailable(
-			await actionPreview("revert_files"),
-			"revert_files",
-		);
-		expect(unavailable.unavailable).toBe("file_conflict");
-		expect(unavailable.diagnostics[0]).toMatchObject({
-			code: "REVERT_PLANNER_REVERSAL_REFUSED",
-			reason: "merge_conflict",
-			filePath: "file.txt",
+		const plan = await actionPrepared("revert_files", "__all__", {}, undefined, {
+			coverageComplete: false,
+			diagnostics: [{ code: "FILE_UNAVAILABLE", filePath: "file.txt", reason: "content_changed" }],
 		});
-		expect(unavailable.diagnostics[0].effectId).toEqual(expect.any(String));
+		expect(
+			journalFiles(plan).find((file) => file.identityJson.displayPath === "file.txt")
+				?.desiredStateJson,
+		).toEqual({ kind: "unknown", reason: "content_changed" });
 		expect(await readFile(path)).toEqual(disk);
+		expect(await readFile(safe, "utf8")).toBe("safe after\n");
+		expect(history()).toBe(before);
+		const result = await boundedJson(await apply(plan, "revert_files"), 409);
+		expect(result).toMatchObject({
+			status: "partial",
+			historyCommitted: false,
+			historyStatus: "complete",
+		});
+		expect(result.files).toEqual(
+			expect.arrayContaining([
+				{ filePath: "file.txt", deviceId: "local", status: "failed", reason: "content_changed" },
+				{ filePath: "safe.txt", deviceId: "local", status: "applied", reason: "verified" },
+			]),
+		);
+		expect(await readFile(path)).toEqual(disk);
+		expect(await readFile(safe, "utf8")).toBe("safe before\n");
 		expect(history()).toBe(before);
 	});
 	test("physically missing historical snapshot reports the exact file and reason instead of HTTP 500", async () => {
@@ -1194,15 +1249,37 @@ describe("action-bound HTTP preview and real local execution", () => {
 				effect.digest,
 			),
 		);
+		const safe = join(workspace, "available.txt");
+		await writeFile(safe, "available before\n");
+		await write(safe, "available after\n");
 		const before = history();
-		const failed = await actionUnavailable(await actionPreview("revert_files"), "revert_files");
-		expect(failed.unavailable).toBe("snapshot_missing");
-		expect(failed.diagnostics[0]).toMatchObject({
-			code: "REVERT_PLANNER_BLOB_NOT_FOUND",
-			reason: "blob_unavailable",
-			filePath: "file.txt",
+		const plan = await actionPrepared("revert_files", "__all__", {}, undefined, {
+			coverageComplete: false,
+			diagnostics: [
+				{ code: "FILE_UNAVAILABLE", filePath: "file.txt", reason: "history_unavailable" },
+			],
 		});
+		expect(
+			journalFiles(plan).find((file) => file.identityJson.displayPath === "file.txt")
+				?.desiredStateJson,
+		).toEqual({ kind: "unknown", reason: "history_unavailable" });
 		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(history()).toBe(before);
+		const result = await boundedJson(await apply(plan, "revert_files"), 409);
+		expect(result).toMatchObject({ status: "partial", historyCommitted: false });
+		expect(result.files).toEqual(
+			expect.arrayContaining([
+				{
+					filePath: "file.txt",
+					deviceId: "local",
+					status: "failed",
+					reason: "history_unavailable",
+				},
+				{ filePath: "available.txt", deviceId: "local", status: "applied", reason: "verified" },
+			]),
+		);
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(await readFile(safe, "utf8")).toBe("available before\n");
 		expect(history()).toBe(before);
 	});
 
@@ -1213,14 +1290,21 @@ describe("action-bound HTTP preview and real local execution", () => {
 		await writeFile(path, original);
 		await edit(path, "value=1", "value=2");
 		await writeFile(path, "const value = 2; // formatter and later edit\n");
-		const conflict = await actionUnavailable(
-			await actionPreview("rollback_to_block", boundary, { blockIndex: 0 }),
+		const conflict = await actionPrepared(
 			"rollback_to_block",
+			boundary,
+			{ blockIndex: 0 },
+			undefined,
+			{
+				coverageComplete: false,
+				diagnostics: [
+					{ code: "FILE_UNAVAILABLE", filePath: "formatted.ts", reason: "content_changed" },
+				],
+			},
 		);
-		expect(conflict.unavailable).toBe("file_conflict");
-		expect(conflict.diagnostics[0]).toMatchObject({
-			reason: "merge_conflict",
-			filePath: "formatted.ts",
+		expect(journalFiles(conflict)[0]).toMatchObject({
+			identityJson: { displayPath: "formatted.ts" },
+			desiredStateJson: { kind: "unknown", reason: "content_changed" },
 		});
 		const response = await boundedJson(
 			await actionPreview("rollback_to_block", boundary, {
@@ -1260,39 +1344,46 @@ describe("action-bound HTTP preview and real local execution", () => {
 		const unrelated = join(workspace, "unrelated.txt");
 		await writeFile(unrelated, "initial\n");
 		const plan = await actionPrepared("revert_files", call.messageId);
-		const fence = scope().fencingToken;
+		const metadata = scope();
 		await human(unrelated, "human unrelated edit\n");
-		expect(scope().fencingToken).toBeGreaterThan(fence);
+		expect(scope().fencingToken).toBe(metadata.fencingToken);
+		expect(scope().revision).toBe(metadata.revision);
 		await committed(plan, "revert_files");
 		expect(await readFile(path, "utf8")).toBe("old\n");
 		expect(await readFile(unrelated, "utf8")).toBe("human unrelated edit\n");
 	});
-	test("untracked target edits during activity still conflict instead of being overwritten", async () => {
+	test("untracked target edits conflict and a fresh independent write remains available", async () => {
 		const { path } = await fixture();
 		const plan = await actionPrepared("revert_files");
-		const binding = localFileChangeRuntimeBinding();
-		if (!binding) throw new Error("Missing runtime");
-		const activity = runtime.coordinator.registerActivity({ scope: scope(), runtime: binding });
-		try {
-			await writeFile(path, "external target edit\n");
-			const before = history();
-			await boundedJson(await apply(plan, "revert_files"), 409);
-			expect(await readFile(path, "utf8")).toBe("external target edit\n");
-			expect(history()).toBe(before);
-			expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
-		} finally {
-			runtime.coordinator.endActivity(activity);
-		}
+		await writeFile(path, "external target edit\n");
+		const before = history();
+		const result = await boundedJson(await apply(plan, "revert_files"), 409);
+		expect(result.files).toEqual([
+			{ filePath: "file.txt", deviceId: "local", status: "conflict", reason: "expected_mismatch" },
+		]);
+		expect(result.historyCommitted).toBe(false);
+		expect(await readFile(path, "utf8")).toBe("external target edit\n");
+		expect(history()).toBe(before);
+		expect(journalFiles(plan)[0].status).toBe("conflict");
+		await human(path, "fresh independent edit\n");
+		expect(await readFile(path, "utf8")).toBe("fresh independent edit\n");
 	});
 	test("human edits after preview refuse the fixed plan rather than silently replanning", async () => {
 		const { path } = await fixture();
 		const plan = await actionPrepared("revert_files");
 		await human(path, "human after preview\n");
 		const before = history();
-		await boundedJson(await apply(plan, "revert_files"), 409);
+		const result = await boundedJson(await apply(plan, "revert_files"), 409);
+		expect(result.files).toEqual([
+			{ filePath: "file.txt", deviceId: "local", status: "conflict", reason: "expected_mismatch" },
+		]);
+		expect(result.historyCommitted).toBe(false);
 		expect(await readFile(path, "utf8")).toBe("human after preview\n");
 		expect(history()).toBe(before);
-		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+		expect(journalFiles(plan)[0].receiptJson).toMatchObject({
+			status: "conflict",
+			historyStatus: "complete",
+		});
 	});
 });
 
@@ -1336,10 +1427,24 @@ describe("action apply reauthorization and immutable admission", () => {
 		}
 		const before = history();
 		const response = await apply(plan, "revert_files");
-		expect([403, 404]).toContain(response.status);
+		if (gate === "path") {
+			const result = await boundedJson(response, 409);
+			expect(result.files).toEqual([
+				{
+					filePath: "file.txt",
+					deviceId: "local",
+					status: "failed",
+					reason: "REVERT_PREVIEW_FILE_ACCESS_DENIED",
+				},
+			]);
+			expect(result.historyCommitted).toBe(false);
+			expect(journalFiles(plan)[0].status).toBe("failed");
+		} else {
+			expect([403, 404]).toContain(response.status);
+			expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+		}
 		expect(await readFile(path, "utf8")).toBe("new\n");
 		expect(history()).toBe(before);
-		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
 	});
 	test("another authorized owner cannot inherit the original human plan capability", async () => {
 		const { path } = await fixture();
@@ -1463,44 +1568,37 @@ describe("action apply reauthorization and immutable admission", () => {
 		expect(active.alive).toBe(false);
 		expect(await readFile(path, "utf8")).toBe("old\n");
 	});
-	test("Bash tracking hot-upgrade state no longer disables explicit file recovery", async () => {
+	test("legacy Bash history never imposes a workspace-wide gate on explicit file recovery", async () => {
 		const { path, call } = await fixture();
+		const bash = unjournaledTool(path, "Bash");
+		const bashHistory = messageRow(bash.messageId);
 		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
-		const bash = await import("../lib/agent/tools/bash");
-		const guard = spyOn(bash, "assertBashActivityProtectionReady").mockImplementation(() => {
-			throw new AppError("Cold start required", 409, "REVERT_RUNTIME_RELOAD_REQUIRED");
-		});
-		try {
-			await actionPrepared("revert_files", "__all__", { idempotencyKey: "hot-upgrade-preview" });
-			await committed(plan, "delete_tool_block");
-			expect(guard).not.toHaveBeenCalled();
-			expect(await readFile(path, "utf8")).toBe("old\n");
-		} finally {
-			guard.mockRestore();
-		}
+		await actionPrepared("revert_files", "__all__", { idempotencyKey: "legacy-bash-preview" });
+		await committed(plan, "delete_tool_block");
+		expect(await readFile(path, "utf8")).toBe("old\n");
+		expect(messageRow(bash.messageId)).toEqual(bashHistory);
+		await human(path, "independent save after legacy Bash\n");
+		expect(await readFile(path, "utf8")).toBe("independent save after legacy Bash\n");
 	});
 
-	test("an unsupported data volume is reported as platform_unsupported and blocks apply", async () => {
+	test("missing historical root identity permits current-file verification and history apply", async () => {
 		const { path, call } = await fixture();
 		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
+		db.update(schema.fileChangeScopes)
+			.set({ rootIdentityJson: null })
+			.where(eq(schema.fileChangeScopes.id, scope().id))
+			.run();
 		const before = history();
-		const capability = await import("./file-change-platform-capability");
-		const probe = spyOn(capability, "fileChangePlatformCapability").mockResolvedValue({
-			supported: false,
-			platform: "win32",
-			reason: "object_identity_unavailable",
-		});
-		try {
-			const preview = await boundedJson(await actionPreview("revert_files"));
-			expect(preview).toMatchObject({ plan: null, unavailable: "platform_unsupported" });
-			const rejected = await boundedJson(await apply(plan, "delete_tool_block"), 409);
-			expect(rejected.code).toBe("REVERT_PLANNER_PLATFORM_UNSUPPORTED");
-			expect(await readFile(path, "utf8")).toBe("new\n");
-			expect(history()).toBe(before);
-			expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
-		} finally {
-			probe.mockRestore();
-		}
+		const repeated = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
+		expect(repeated.id).toBe(plan.id);
+		expect(history()).toBe(before);
+		await committed(plan, "delete_tool_block");
+		expect(await readFile(path, "utf8")).toBe("old\n");
+		expect(
+			(messageRow(call.messageId)?.contentJson as Array<{ type: string }>).some(
+				(block) => block.type === "tool_use",
+			),
+		).toBe(false);
 	});
 
 	test("multi-tool rollback cannot masquerade as a single-tool delete", async () => {
@@ -1585,8 +1683,9 @@ describe("action apply reauthorization and immutable admission", () => {
 		expect(history()).toBe(before);
 		expect(journalFiles(plan)).toHaveLength(1);
 		expect(journalFiles(plan)[0].receiptJson).toMatchObject({
-			apply: { receipt: { confirmed: true, outcome: "applied" } },
-			compensate: null,
+			version: 3,
+			status: "applied",
+			historyStatus: "complete",
 		});
 	});
 	test("source block drift without a version bump refuses the original history manifest", async () => {
@@ -1641,22 +1740,53 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 	test.each([
 		["Write", "local"],
 		["Write", "unsupported-remote"],
-	] as const)("unjournaled %s on %s is unavailable without legacy or local fallback", async (name, device) => {
+	] as const)("unjournaled %s on %s stays diagnostic without guessed local targets", async (name, device) => {
 		const { path } = await fixture();
 		const unknown = unjournaledTool(path, name, device);
 		const before = history();
+		const preparedActions: { action: RevertAction; plan: RevertPlanSummary }[] = [];
 		for (const action of ["revert_files", "delete_tool_block", "rollback_to_block"] as const) {
-			await actionUnavailable(
-				await actionPreview(
-					action,
-					action === "revert_files" ? "__all__" : unknown.messageId,
-					action === "revert_files" ? {} : { blockIndex: action === "delete_tool_block" ? 1 : 0 },
-				),
+			const plan = await actionPrepared(
 				action,
+				action === "revert_files" ? "__all__" : unknown.messageId,
+				{
+					idempotencyKey: `missing-journal-${action}`,
+					...(action === "revert_files"
+						? {}
+						: { blockIndex: action === "delete_tool_block" ? 1 : 0 }),
+				},
+				undefined,
+				{
+					coverageComplete: false,
+					diagnostics: [
+						{
+							code: "FILE_JOURNAL_MISSING",
+							reason: "history_unavailable",
+							toolCallId: unknown.toolCallId,
+						},
+					],
+				},
 			);
+			expect(plan.expectedFileCount).toBe(action === "revert_files" ? 1 : 0);
+			preparedActions.push({ action, plan });
 		}
 		expect(await readFile(path, "utf8")).toBe("new\n");
 		expect(history()).toBe(before);
+		for (const { action, plan } of preparedActions) {
+			const result = await boundedJson(await apply(plan, action), 409);
+			expect(result).toMatchObject({
+				status: "partial",
+				reason: "SELECTED_HISTORY_UNAVAILABLE",
+				historyCommitted: false,
+			});
+			expect(result.files).toEqual(
+				action === "revert_files"
+					? [{ filePath: "file.txt", deviceId: "local", status: "applied", reason: "verified" }]
+					: [],
+			);
+			expect(history()).toBe(before);
+		}
+		expect(await readFile(path, "utf8")).toBe("old\n");
 	});
 	test("an unmeasured Bash in a rollback range does not block other file effects", async () => {
 		const { path } = await fixture();
@@ -1716,6 +1846,9 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 				journalStatus: "committed",
 				settling: false,
 				reason: "POST_COMMIT_REFRESH_FAILED",
+				files: [{ filePath: "file.txt", deviceId: "local", status: "applied", reason: "verified" }],
+				historyStatus: "complete",
+				historyCommitted: false,
 			});
 			expect(failedRefreshes).toBeGreaterThan(0);
 		} finally {
@@ -1726,8 +1859,9 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		expect(history()).toBe(before);
 		const files = journalFiles(plan);
 		expect(files[0].receiptJson).toMatchObject({
-			apply: { receipt: { confirmed: true, outcome: "applied" } },
-			compensate: null,
+			version: 3,
+			status: "applied",
+			historyStatus: "complete",
 		});
 		await human(path, "human after lost refresh\n");
 		await committed(plan, "revert_files");
@@ -1735,7 +1869,7 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		expect(journalFiles(plan)).toEqual(files);
 		expect(history()).toBe(before);
 	});
-	test("SQL history commit failure returns actual compensated 409 and restores pre-apply bytes", async () => {
+	test("SQL history commit failure preserves restored files and the original message history", async () => {
 		const { path, call } = await fixture();
 		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
 		const before = history();
@@ -1745,25 +1879,33 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		const result = await boundedJson(await apply(plan, "delete_tool_block"), 409);
 		expect(result).toMatchObject({
 			planId: plan.id,
-			status: "compensated",
-			journalStatus: "compensated",
+			status: "partial",
+			journalStatus: "partial",
 			settling: false,
+			historyStatus: "unavailable",
+			historyCommitted: false,
+			files: [{ filePath: "file.txt", deviceId: "local", status: "applied", reason: "verified" }],
 		});
 		expect(result).toHaveProperty("reason");
 		expect(ownPlans().find((row) => row.id === plan.id)?.status).toBe(result.journalStatus);
-		expect(await readFile(path)).toEqual(disk);
+		expect(disk.toString()).toBe("new\n");
+		expect(await readFile(path, "utf8")).toBe("old\n");
 		expect(history()).toBe(before);
-		expect(events).toHaveLength(0);
+		expect(events.some((event) => event.message.type === "full_reload" && !event.committed)).toBe(
+			true,
+		);
 		const files = journalFiles(plan);
 		expect(files[0].receiptJson).toMatchObject({
-			apply: { receipt: { confirmed: true, outcome: "applied" } },
-			compensate: { receipt: { confirmed: true, outcome: "applied" } },
+			version: 3,
+			status: "applied",
+			historyStatus: "complete",
 		});
+		expect(files[0].receiptJson).not.toHaveProperty("compensate");
 		await boundedJson(await apply(plan, "delete_tool_block"), 409);
 		expect(journalFiles(plan)).toEqual(files);
 		expect(history()).toBe(before);
 	});
-	test("lost receipt persistence returns actual recovery_required 409 and never blindly retries IO", async () => {
+	test("lost result persistence reports applied files with unavailable history and never replays IO", async () => {
 		const { path, call } = await fixture();
 		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
 		const before = history();
@@ -1772,23 +1914,31 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		const result = await boundedJson(await apply(plan, "delete_tool_block"), 409);
 		expect(result).toMatchObject({
 			planId: plan.id,
-			status: "recovery_required",
-			journalStatus: "recovery_required",
+			status: "partial",
+			journalStatus: "partial",
 			settling: false,
+			historyStatus: "unavailable",
+			historyCommitted: false,
+			files: [{ filePath: "file.txt", deviceId: "local", status: "applied", reason: "verified" }],
 		});
 		expect(result).toHaveProperty("reason");
 		expect(ownPlans().find((row) => row.id === plan.id)?.status).toBe(result.journalStatus);
 		expect(history()).toBe(before);
-		expect(events).toHaveLength(0);
+		expect(await readFile(path, "utf8")).toBe("old\n");
+		expect(events.some((event) => event.message.type === "full_reload" && !event.committed)).toBe(
+			true,
+		);
 		const files = journalFiles(plan);
 		await writeFile(path, "external after uncertain receipt\n");
 		const repeated = await boundedJson(await apply(plan, "delete_tool_block"), 409);
-		expect(repeated.status).toBe("recovery_required");
+		expect(repeated.status).toBe("partial");
+		expect(repeated.historyCommitted).toBe(false);
+		expect(repeated.files).toMatchObject([{ status: "unknown" }]);
 		expect(await readFile(path, "utf8")).toBe("external after uncertain receipt\n");
 		expect(journalFiles(plan)).toEqual(files);
 		expect(history()).toBe(before);
 	});
-	test("HTTP abort after real dispatch returns settling 409 with the actual journal and retains its lease", async () => {
+	test("HTTP abort after dispatch reports executing and holds only the file queue until IO settles", async () => {
 		const { path, call } = await fixture();
 		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
 		const before = history();
@@ -1805,6 +1955,8 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		});
 		let held = false;
 		let execution: RevertTransactionExecution | undefined;
+		let followingWrite: Promise<void> | undefined;
+		let followingEntered = false;
 		// The settling 409 is produced only after the cleanup budget elapses with IO still
 		// pending. Production's 30 s budget made this one case ~31 s of pure waiting; a 3 s
 		// budget exercises the identical path. The route caches its service across tests, so
@@ -1853,20 +2005,28 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 			const result = await boundedJson(await pending, 409);
 			expect(result).toMatchObject({
 				planId: plan.id,
-				status: "recovery_required",
+				status: "executing",
 				journalStatus: "applying",
 				settling: true,
+				historyCommitted: false,
+				files: [{ status: "unknown", reason: "IO_PENDING" }],
 			});
 			expect(result.reason).toBeString();
 			expect(ownPlans().find((row) => row.id === plan.id)?.status).toBe("applying");
-			expect(scope().activeLeaseId).toBeTruthy();
-			expect(scope().activeMutationCount).toBe(1);
+			expect(scope().activeLeaseId).toBeNull();
+			expect(scope().activeMutationCount).toBe(0);
+			followingWrite = withFileWrite(journalFiles(plan)[0].identityJson, () => {
+				followingEntered = true;
+			});
+			await Promise.resolve();
+			expect(followingEntered).toBe(false);
 			expect(history()).toBe(before);
 			expect(events).toHaveLength(0);
 		} finally {
 			release();
 			await pending.catch(() => {});
 			await execution?.whenSettled.catch(() => {});
+			await followingWrite;
 			guard.mockRestore();
 			executeObserver.mockRestore();
 			if (budgeted) Reflect.set(budgeted.service, "cleanupMs", budgeted.original);
@@ -1875,9 +2035,18 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		// went back to waiting the production 30 s.
 		expect(budgeted).toBeDefined();
 		const settled = await execution?.whenSettled;
-		expect(settled).toMatchObject({ status: "recovery_required", settling: false });
+		expect(settled).toMatchObject({
+			status: "partial",
+			settling: false,
+			reason: "CANCELLED_BEFORE_HISTORY",
+			historyCommitted: false,
+			files: [{ status: "applied" }],
+		});
+		expect(followingEntered).toBe(true);
 		expect(history()).toBe(before);
-		expect(events).toHaveLength(0);
+		expect(events.some((event) => event.message.type === "full_reload" && !event.committed)).toBe(
+			true,
+		);
 		expect(await readFile(path, "utf8")).toBe("old\n");
 	}, 45_000);
 	test("action preview and apply reject malformed inputs and never accept caller authority", async () => {
@@ -2313,8 +2482,8 @@ describe("backend scope and namespace guards", () => {
 		await switchWorkspace(other, 0);
 		const before = history();
 		const response = await apply(plan, "revert_files");
-		expect(response.status).toBe(403);
-		expect((await response.json()).code).toBe("REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		expect(response.status).toBe(409);
+		expect((await response.json()).code).toBe("REVERT_SELECTION_STALE");
 		expect(await readFile(path, "utf8")).toBe("new\n");
 		expect(history()).toBe(before);
 		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
@@ -2366,7 +2535,7 @@ describe("backend scope and namespace guards", () => {
 			.where(eq(schema.fileChangeOperations.id, effect.operationId))
 			.get();
 		const localScope = scope();
-		if (!operation || !effect.executionReceiptJson) throw new Error("Missing actual evidence");
+		if (!operation) throw new Error("Missing actual evidence");
 		const call = await toolContext("Write", path, { file_path: path, content: "remote" });
 		const scopeId = generateId();
 		const operationId = generateId();
@@ -2377,7 +2546,9 @@ describe("backend scope and namespace guards", () => {
 			deviceId: "remote",
 			workspaceInstanceId: generateId(),
 		};
-		const binding = { ...effect.executionReceiptJson.executionBinding, deviceId: "remote" };
+		const binding = operation.executionBindingJson
+			? { ...operation.executionBindingJson, deviceId: "remote" }
+			: null;
 		db.insert(schema.fileChangeScopes)
 			.values({
 				...localScope,
@@ -2404,11 +2575,14 @@ describe("backend scope and namespace guards", () => {
 				identityJson: identity,
 				fileKey: fileChangeIdentityKey(identity),
 				mutationId,
-				executionReceiptJson: {
-					...effect.executionReceiptJson,
-					mutationId,
-					executionBinding: binding,
-				},
+				executionReceiptJson:
+					effect.executionReceiptJson && binding
+						? {
+								...effect.executionReceiptJson,
+								mutationId,
+								executionBinding: binding,
+							}
+						: null,
 			})
 			.run();
 		db.update(schema.narratorToolCalls)
@@ -2451,7 +2625,7 @@ describe("backend scope and namespace guards", () => {
 			expect((await prepared()).status).toBe("prepared");
 		},
 	);
-	test("workspace directory replacement cannot reuse a matching current text", async () => {
+	test("a replacement workspace is verified from current files rather than historical directory birthtime", async () => {
 		const { path } = await fixture();
 		const old = `${workspace}-old`;
 		await rename(workspace, old);
@@ -2459,11 +2633,34 @@ describe("backend scope and namespace guards", () => {
 		await writeFile(path, "new\n");
 		restorers.push(() => rm(old, { recursive: true, force: true }));
 		const before = history();
-		await refused(await prepare(), "REVERT_PLANNER_STALE");
+		const plan = await actionPrepared("revert_files");
+		await committed(plan, "revert_files");
 		expect(history()).toBe(before);
-		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(await readFile(path, "utf8")).toBe("old\n");
+		expect(await readFile(join(old, "file.txt"), "utf8")).toBe("new\n");
 	});
-	test("legacy tool evidence and retired scopes cannot produce prepared plans", async () => {
+	test.skipIf(process.platform === "win32")(
+		"canonical target redirection after preview conflicts even when contents match",
+		async () => {
+			const { path } = await fixture();
+			const plan = await actionPrepared("revert_files");
+			const original = join(workspace, "original-file.txt");
+			const redirected = join(workspace, "redirected-file.txt");
+			await rename(path, original);
+			await writeFile(redirected, "new\n");
+			await symlink(redirected, path);
+			const before = history();
+			const result = await boundedJson(await apply(plan, "revert_files"), 409);
+			expect(result.historyCommitted).toBe(false);
+			expect(result.files).toMatchObject([{ filePath: "file.txt", status: "conflict" }]);
+			expect((await lstat(path)).isSymbolicLink()).toBe(true);
+			expect(await readFile(original, "utf8")).toBe("new\n");
+			expect(await readFile(redirected, "utf8")).toBe("new\n");
+			expect(history()).toBe(before);
+		},
+	);
+
+	test("legacy evidence stays unavailable while retired scope metadata permits verified preview", async () => {
 		const { call } = await fixture();
 		const tool = db
 			.select()
@@ -2475,7 +2672,21 @@ describe("backend scope and namespace guards", () => {
 			.set({ fileChangeOperationId: null })
 			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
 			.run();
-		await refused(await prepare(), "REVERT_PLANNER_EVIDENCE_INCOMPLETE");
+		const missing = await prepared(
+			{ idempotencyKey: "legacy-missing" },
+			{
+				coverageComplete: false,
+				diagnostics: [
+					{
+						code: "FILE_JOURNAL_MISSING",
+						toolCallId: call.toolCallId,
+						reason: "history_unavailable",
+					},
+				],
+			},
+		);
+		expect(missing.expectedFileCount).toBe(0);
+		expect(journalFiles(missing)).toEqual([]);
 		db.update(schema.narratorToolCalls)
 			.set({ fileChangeOperationId: tool.fileChangeOperationId })
 			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
@@ -2485,11 +2696,15 @@ describe("backend scope and namespace guards", () => {
 			.set({ status: "retired" })
 			.where(eq(schema.fileChangeScopes.id, ownScope.id))
 			.run();
-		await refused(await prepare(), "REVERT_PLANNER_EVIDENCE_INCOMPLETE");
+		const before = history();
+		expect((await prepared()).status).toBe("prepared");
+		const plan = await actionPrepared("revert_files");
+		await committed(plan, "revert_files");
+		expect(history()).toBe(before);
 	});
 });
 
-describe("live/durable coordinator checks and unchanged state", () => {
+describe("per-file queues, archived metadata and unchanged state", () => {
 	test("HTTP abort during real local read never saves a prepared plan", async () => {
 		const { path } = await fixture();
 		const before = history();
@@ -2516,11 +2731,9 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		expect(history()).toBe(before);
 		expect(await readFile(path, "utf8")).toBe("new\n");
 	});
-	test("a live write lease does not block read-only preview or consume another fence", async () => {
+	test("a running file queue keeps read-only preview available without creating durable leases", async () => {
 		const { path } = await fixture();
-		const ownScope = scope();
-		const binding = localFileChangeRuntimeBinding();
-		if (!binding) throw new Error("Missing runtime");
+		const identity = effects()[0].identityJson;
 		let release!: () => void;
 		let entered!: () => void;
 		const gate = new Promise<void>((resolve) => {
@@ -2530,13 +2743,10 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		const started = new Promise<void>((resolve) => {
 			entered = resolve;
 		});
-		const writer = runtime.coordinator.withWrite(
-			{ scope: ownScope, runtime: binding },
-			async () => {
-				entered();
-				await gate;
-			},
-		);
+		const writer = withFileWrite(identity, async () => {
+			entered();
+			await gate;
+		});
 		await started;
 		const fence = scope().fencingToken;
 		let plan: RevertPlanSummary;
@@ -2547,44 +2757,49 @@ describe("live/durable coordinator checks and unchanged state", () => {
 			release();
 			await writer;
 		}
-		// Settlement advances the scope, but it did not change this file.
+		// Releasing an in-memory queue leaves historical scope metadata untouched.
 		await committed(plan, "revert_files");
 		expect(await readFile(path, "utf8")).toBe("old\n");
 	});
-	test("single Edit preview stays available but rollback safely refuses registered Bash activity", async () => {
+	test("single Edit rollback proceeds while another file still has active queued IO", async () => {
 		const boundary = message("user", [{ type: "text", text: "edit one file" }]);
 		const path = join(workspace, "one-edit.txt");
 		await writeFile(path, "before\n");
 		await edit(path, "before", "after");
-		const ownScope = scope();
-		const binding = localFileChangeRuntimeBinding();
-		if (!binding) throw new Error("Missing runtime");
-		const activity = runtime.coordinator.registerActivity({ scope: ownScope, runtime: binding });
-		let plan: RevertPlanSummary;
+		let release!: () => void;
+		let entered!: () => void;
+		let finished = false;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		lifetime?.controller.signal.addEventListener("abort", release, { once: true });
+		const writer = withFileWrite(
+			{
+				deviceId: "local",
+				pathFlavor: effects()[0].identityJson.pathFlavor,
+				canonicalPath: join(workspace, "other.txt"),
+			},
+			async () => {
+				entered();
+				await gate;
+				finished = true;
+			},
+		);
+		await started;
 		try {
-			plan = await actionPrepared("rollback_to_block", boundary, { blockIndex: 0 });
+			const plan = await actionPrepared("rollback_to_block", boundary, { blockIndex: 0 });
 			expect(plan.expectedFileCount).toBe(1);
-			const before = history();
-			const files = journalFiles(plan);
-			await boundedJson(await apply(plan, "rollback_to_block"), 409);
-			expect(await readFile(path, "utf8")).toBe("after\n");
-			expect(history()).toBe(before);
-			expect(journalFiles(plan)).toEqual(files);
-			expect(
-				db
-					.select()
-					.from(schema.revertOperations)
-					.where(eq(schema.revertOperations.id, plan.id))
-					.get()?.status,
-			).toBe("prepared");
-			expect(runtime.coordinator.capture(ownScope).active.uncoordinatedActivities).toBe(1);
+			await committed(plan, "rollback_to_block");
+			expect(finished).toBe(false);
+			expect(await readFile(path, "utf8")).toBe("before\n");
+			expect(messageRefs().map((ref) => ref.messageId)).toEqual([boundary]);
 		} finally {
-			runtime.coordinator.endActivity(activity);
+			release();
+			await writer;
 		}
-		// Rejection leaves the same prepared intent usable once the known writer settles.
-		await committed(plan, "rollback_to_block");
-		expect(await readFile(path, "utf8")).toBe("before\n");
-		expect(messageRefs().map((ref) => ref.messageId)).toEqual([boundary]);
 	});
 	test("running tools remain diagnostic information rather than a blanket preview veto", async () => {
 		await fixture();
@@ -2597,11 +2812,11 @@ describe("live/durable coordinator checks and unchanged state", () => {
 			(item) => item.toolCallId === call.toolCallId,
 		);
 		expect(named).toMatchObject({ kind: "running_tool", toolName: "Bash" });
-		expect(named?.detail).toContain("fixture activity");
+		expect(named?.detail).toBeUndefined();
 		expect(named?.detail ?? "").not.toContain(workspace);
 		await actionPrepared("revert_files");
 	});
-	test("durable recovery barriers are checked at apply rather than disabling preview", async () => {
+	test("legacy recovery metadata never blocks a current-file preview or apply", async () => {
 		const { path } = await fixture();
 		const previous = {
 			...scope(),
@@ -2618,27 +2833,34 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		});
 		const before = history();
 		const plan = await actionPrepared("revert_files");
-		await boundedJson(await apply(plan, "revert_files"), 409);
-		expect(await readFile(path, "utf8")).toBe("new\n");
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("old\n");
 		expect(history()).toBe(before);
-		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+		expect(
+			db
+				.select()
+				.from(schema.fileChangeScopes)
+				.where(eq(schema.fileChangeScopes.id, previous.id))
+				.get()?.status,
+		).toBe("needs_verification");
 	});
-	test("brief activity between read and final guard does not invalidate unchanged file bytes", async () => {
+	test("brief unrelated IO between read and final guard does not invalidate unchanged file bytes", async () => {
 		const { path } = await fixture();
-		const ownScope = scope();
-		const binding = localFileChangeRuntimeBinding();
-		if (!binding) throw new Error("Missing runtime");
+		const unrelated = join(workspace, "unrelated-between-reads.txt");
 		const read = fileChangeLocalIo.read;
 		let observed = false;
 		const spy = spyOn(fileChangeLocalIo, "read").mockImplementation(async (...args) => {
 			const result = await read(...args);
 			if (!observed) {
 				observed = true;
-				const activity = runtime.coordinator.registerActivity({
-					scope: ownScope,
-					runtime: binding,
-				});
-				runtime.coordinator.endActivity(activity);
+				await withFileWrite(
+					{
+						deviceId: "local",
+						pathFlavor: effects()[0].identityJson.pathFlavor,
+						canonicalPath: unrelated,
+					},
+					() => writeFile(unrelated, "unrelated IO\n"),
+				);
 			}
 			return result;
 		});

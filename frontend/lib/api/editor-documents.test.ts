@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { EDITOR_METADATA_MAX_BYTES, EDITOR_TRANSFER_MAX_BYTES } from "@shared/editor-document";
+import {
+	EDITOR_METADATA_MAX_BYTES,
+	EDITOR_TRANSFER_MAX_BYTES,
+	type EditorSaveResult,
+} from "@shared/editor-document";
 import { EditorStreamCodec } from "@shared/editor-stream-codec";
 import { editorDocumentApi, readEditorBody } from "./editor-documents";
 
@@ -466,6 +470,48 @@ describe("bounded editor document transport", () => {
 		await editorDocumentApi.operation("n", "op");
 		expect(requests[1]).toEndWith("GET /api/narrators/n/editor-operations/op");
 	});
+	for (const diskOutcome of ["not_applied", "unknown"] as const)
+		test(`structured ${diskOutcome} write outcomes survive bounded commit error transport`, async () => {
+			const status = diskOutcome === "not_applied" ? 500 : 409;
+			const data = {
+				code: diskOutcome === "not_applied" ? "WRITE_NOT_APPLIED" : "WRITE_RECONCILE_REQUIRED",
+				diskOutcome,
+				historyStatus: "unavailable",
+				operationId: "original-operation",
+			};
+			mockFetch(() => Response.json({ error: "Disk result", ...data }, { status }));
+			await expect(editorDocumentApi.commit("n", "d", "u")).rejects.toMatchObject({
+				status,
+				message: "Disk result",
+				data,
+			});
+		});
+	test("saved history gaps survive both direct commit and operation polling responses", async () => {
+		const result: EditorSaveResult = {
+			status: "saved",
+			diskOutcome: "applied",
+			historyStatus: "unavailable",
+			operationId: "op",
+			hash: "saved-hash",
+			bytes: 12,
+			snapshotRevision: 2,
+		};
+		const requests: string[] = [];
+		mockFetch((url, options) => {
+			requests.push(`${options?.method} ${url}`);
+			return Response.json(
+				url.endsWith("/commit") ? result : { status: "saved", operationId: "op", result },
+			);
+		});
+		expect(await editorDocumentApi.commit("n", "d", "u")).toEqual(result);
+		expect(await editorDocumentApi.operation("n", "op")).toEqual({
+			status: "saved",
+			operationId: "op",
+			result,
+		});
+		expect(requests).toHaveLength(2);
+	});
+
 	test("editor transfer limits do not silently become unbounded", () => {
 		expect(EDITOR_TRANSFER_MAX_BYTES).toBe(64 * 1024 * 1024);
 	});

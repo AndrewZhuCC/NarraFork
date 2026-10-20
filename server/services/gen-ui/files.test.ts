@@ -128,7 +128,7 @@ describe("ordinary GenUI workspace files", () => {
 			...deps,
 			change: async () => undefined,
 		});
-		expect(result.output).toContain("cannot be reverted through message history");
+		expect(result.output).toContain("File saved; history is unavailable for this operation.");
 		expect(result.metadata?.fileChangeHistoryUnavailable).toBe(true);
 		expect(result.metadata?.fileChangeHistoryReason).toBe("remote_journal_unsupported");
 		expect(result.metadata?.fileChangeEvidence).toBeUndefined();

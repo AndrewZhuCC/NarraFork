@@ -192,8 +192,6 @@ async function raceWithTimeout(promise: Promise<unknown>, timeoutMs: number): Pr
  *     `gitService` at all — it spawns git directly against a scratch index — so the
  *     tempting `shadow → git` edge does not exist.
  *
- * `worktreeWriteLock` sits outside this hierarchy: see its own note below.
- *
  * No runtime assertion enforces this. Detecting "which locks does this async call stack
  * hold" needs `AsyncLocalStorage` context threaded through `AsyncMutex`, and `AsyncMutex`
  * backs 20+ instances with unrelated semantics (narrator traits, drafts, plugins, user
@@ -214,17 +212,6 @@ export const chapterLock = new AsyncMutex();
  * worktree path was spelled in the row it came from.
  */
 export const worktreeLock = new PathKeyedMutex();
-
-/**
- * Per-worktree mutex for tool file writes, keyed by normalized worktree path.
- *
- * Separate from {@link worktreeLock} on purpose: git operations (merge, rebase)
- * can legitimately run for a long time, and making short tool writes queue behind
- * them — or vice versa — would either stall narrators or make merges wait on every
- * edit. Write/Edit hold this for their millisecond-long write window; Bash only
- * attempts it with a deadline and proceeds unserialized on timeout.
- */
-export const worktreeWriteLock = new AsyncMutex();
 
 /** Per-chapter mutex — guards container lifecycle operations (start, stop, pause, remove). */
 export const containerLock = new AsyncMutex();

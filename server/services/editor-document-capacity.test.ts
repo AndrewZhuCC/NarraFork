@@ -19,7 +19,8 @@ import type { EditorWorkerRequest, EditorWorkerResult } from "./editor-document-
 class MetadataJobs extends EditorDocumentJobs {
 	calls = 0;
 	override async run(_userId: string, request: EditorWorkerRequest): Promise<EditorWorkerResult> {
-		if (request.action === "cleanup") return { kind: "cleaned", operations: [] };
+		if (request.action === "cleanup")
+			return { kind: "cleaned", operations: [], unavailableRecoveryCount: 0 };
 		if (request.action !== "metadata") throw new Error(`Unexpected job: ${request.action}`);
 		this.calls++;
 		return {

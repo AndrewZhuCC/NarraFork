@@ -1,5 +1,9 @@
 import { expect, mock, test } from "bun:test";
-import type { EditorCommitResult, EditorDocumentDescriptor } from "@shared/editor-document";
+import type {
+	EditorCommitResult,
+	EditorDocumentDescriptor,
+	EditorSaveResult,
+} from "@shared/editor-document";
 import {
 	EDITOR_BOUNDED_READ_CAPABILITIES,
 	EDITOR_LOCAL_V1_CAPABILITIES,
@@ -111,6 +115,8 @@ async function setup(load = true) {
 			},
 		};
 	});
+	const onSaveReceipt = mock((_result: EditorSaveResult) => {});
+	const onSaved = mock((_revision: number, _modelLifetime?: string) => {});
 	const session = new EditorDocumentSession({
 		narratorId: "child",
 		path: "/work/a.txt",
@@ -123,6 +129,8 @@ async function setup(load = true) {
 		encodedHash: (blob) => hashes.get(blob) ?? null,
 		applyContent,
 		onChange: () => {},
+		onSaved,
+		onSaveReceipt,
 	});
 	if (load) await session.load();
 	snapshot.mockClear();
@@ -132,7 +140,18 @@ async function setup(load = true) {
 		alternativeVersionId = alt ?? revision;
 		session.change({ revision, alternativeVersionId, length: text.length });
 	};
-	return { session, api, encode, hash, applyContent, snapshot, change, text: () => text };
+	return {
+		session,
+		api,
+		encode,
+		hash,
+		applyContent,
+		snapshot,
+		onSaved,
+		onSaveReceipt,
+		change,
+		text: () => text,
+	};
 }
 
 test("a background reauthorization completing during upload cannot release its active document", async () => {
@@ -640,6 +659,69 @@ test("save snapshots once, binds original hash/encoding, and guards simultaneous
 	const args = api.upload.mock.calls[0] as unknown as [string, string, string, Blob];
 	expect(await args[3].text()).toBe("latest keystroke");
 	expect(sessionDirty(session.state)).toBe(false);
+});
+
+for (const recovery of [false, true]) {
+	test(`${recovery ? "polled" : "direct"} saved history gap notifies once and preserves later input`, async () => {
+		const { session, api, change, text, onSaved, onSaveReceipt } = await setup();
+		change("sent snapshot");
+		const saved: EditorSaveResult = {
+			status: "saved",
+			historyStatus: "unavailable",
+			hash: "saved-with-history-gap",
+			operationId: "op",
+			snapshotRevision: 2,
+			bytes: 13,
+		};
+		const pending = deferred<EditorCommitResult>();
+		api.commit.mockImplementation(() =>
+			recovery ? Promise.reject(new TypeError("Lost receipt")) : pending.promise,
+		);
+		const saving = session.save();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		change("input after dispatch");
+		if (recovery) {
+			await saving;
+			api.operation.mockResolvedValue({ status: "saved", operationId: "op", result: saved });
+			await session.reconcile();
+		} else {
+			pending.resolve(saved);
+			await saving;
+		}
+		expect(onSaved).toHaveBeenCalledWith(2, undefined);
+		expect(onSaved).toHaveBeenCalledTimes(1);
+		expect(onSaveReceipt).toHaveBeenCalledWith(saved);
+		expect(onSaveReceipt).toHaveBeenCalledTimes(1);
+		expect(session.state.baseHash).toBe("saved-with-history-gap");
+		expect(session.state.phase).toBe("idle");
+		expect(session.state.error).toBeNull();
+		expect(text()).toBe("input after dispatch");
+		expect(sessionDirty(session.state)).toBe(true);
+		expect(sessionCanSave(session.state)).toBe(true);
+		await session.reconcile();
+		expect(onSaveReceipt).toHaveBeenCalledTimes(1);
+		expect(api.commit).toHaveBeenCalledTimes(1);
+		session.dispose();
+	});
+}
+
+test("a mismatched saved receipt cannot emit a successful history-gap notice", async () => {
+	const { session, api, change, onSaved, onSaveReceipt } = await setup();
+	change("sent");
+	api.commit.mockResolvedValue({
+		status: "saved",
+		operationId: "op",
+		hash: "wrong",
+		snapshotRevision: 99,
+		bytes: 4,
+		historyStatus: "unavailable",
+	});
+	await session.save();
+	expect(onSaved).not.toHaveBeenCalled();
+	expect(onSaveReceipt).not.toHaveBeenCalled();
+	expect(session.state.phase).toBe("unknown");
+	expect(session.state.baseHash).toBe("original-hash");
+	session.dispose();
 });
 
 for (const undo of [false, true])
@@ -1297,6 +1379,107 @@ test("one queued save intent during an in-flight commit serializes with the next
 	const uploaded = (await api.upload.mock.calls[1]?.[3].text()) ?? "";
 	expect(uploaded).toBe("second draft");
 });
+
+for (const observerThrows of [false, true])
+	test(`history gap receipt preserves draft retirement and queued save when observer throws=${observerThrows}`, async () => {
+		const { session, api, change, onSaved, onSaveReceipt } = await setup();
+		if (observerThrows)
+			onSaveReceipt.mockImplementation(() => {
+				throw new Error("UI notice failed");
+			});
+		change("first draft");
+		const firstCommit = deferred<EditorCommitResult>();
+		api.commit.mockImplementationOnce(() => firstCommit.promise);
+		const saving = session.save();
+		for (let step = 0; step < 20 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+		change("queued draft");
+		await session.save();
+		firstCommit.resolve({
+			status: "saved",
+			diskOutcome: "applied",
+			historyStatus: "unavailable",
+			operationId: "op-first",
+			hash: "first-hash",
+			snapshotRevision: 2,
+			bytes: 11,
+		});
+		await saving;
+		for (let step = 0; step < 30 && session.state.phase !== "idle"; step++) await Promise.resolve();
+		expect(onSaved.mock.calls).toEqual([
+			[2, undefined],
+			[3, undefined],
+		]);
+		expect(onSaveReceipt).toHaveBeenCalledTimes(2);
+		expect(onSaveReceipt.mock.calls[0]?.[0].historyStatus).toBe("unavailable");
+		expect(api.commit).toHaveBeenCalledTimes(2);
+		expect(api.createUpload.mock.calls[1]?.[2].baseHash).toBe("first-hash");
+		expect(await api.upload.mock.calls[1]?.[3].text()).toBe("queued draft");
+		expect(sessionDirty(session.state)).toBe(false);
+		expect(session.state.error).toBeNull();
+		session.dispose();
+	});
+
+test("verified not_applied 500 keeps the draft editable but drops queued save intent", async () => {
+	const { session, api, change, text, onSaved, onSaveReceipt } = await setup();
+	change("sent draft");
+	const firstCommit = deferred<EditorCommitResult>();
+	api.commit.mockImplementationOnce(() => firstCommit.promise);
+	const saving = session.save();
+	for (let step = 0; step < 20 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	change("newer draft");
+	await session.save();
+	firstCommit.reject(
+		new ApiError("Disk write was not applied", 500, {
+			code: "WRITE_NOT_APPLIED",
+			diskOutcome: "not_applied",
+			historyStatus: "unavailable",
+			operationId: "op-first",
+		}),
+	);
+	await saving;
+	expect(session.state.phase).toBe("idle");
+	expect(sessionCanSave(session.state)).toBe(true);
+	expect(text()).toBe("newer draft");
+	expect(session.state.baseHash).toBe("original-hash");
+	expect(session.state.error).toBe("Disk write was not applied");
+	expect(onSaved).not.toHaveBeenCalled();
+	expect(onSaveReceipt).not.toHaveBeenCalled();
+	expect(api.operation).not.toHaveBeenCalled();
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	await session.save();
+	expect(api.commit).toHaveBeenCalledTimes(2);
+	expect(await api.upload.mock.calls[1]?.[3].text()).toBe("newer draft");
+	session.dispose();
+});
+
+for (const diskOutcome of ["unknown", "applied"] as const)
+	test(`structured ${diskOutcome} 409 remains query-first without assuming failure`, async () => {
+		const { session, api, change, text, onSaved, onSaveReceipt } = await setup();
+		change("preserved draft");
+		api.commit.mockRejectedValueOnce(
+			new ApiError("Write needs verification", 409, {
+				code: "WRITE_RECONCILE_REQUIRED",
+				diskOutcome,
+				historyStatus: "unavailable",
+				operationId: "original-operation",
+			}),
+		);
+		await session.save();
+		expect(session.state.phase).toBe("unknown");
+		expect(sessionCanSave(session.state)).toBe(false);
+		expect(session.state.baseHash).toBe("original-hash");
+		expect(text()).toBe("preserved draft");
+		expect(api.operation).toHaveBeenCalledWith("child", "original-operation");
+		expect(api.getUpload).not.toHaveBeenCalled();
+		expect(api.cancelUpload).not.toHaveBeenCalled();
+		expect(onSaved).not.toHaveBeenCalled();
+		expect(onSaveReceipt).not.toHaveBeenCalled();
+		await session.save();
+		await session.load();
+		expect(api.commit).toHaveBeenCalledTimes(1);
+		expect(api.source).toHaveBeenCalledTimes(1);
+		session.dispose();
+	});
 
 test("intents while committing do not accumulate: only the final visible edit is saved", async () => {
 	const { session, api, change } = await setup();

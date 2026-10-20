@@ -31,7 +31,7 @@ func startEditorWriteLoopback(t *testing.T, root, stateRoot string) (*testServer
 	}
 	h.SetEditorEngine(engine)
 	cfg := &config.Config{ServerURL: strings.Replace(server.URL, "http", "ws", 1), DeviceRef: "device", Token: "rdev_fixture", DefaultCwd: root, ReconnectMaxSeconds: 1}
-	client := NewClient(cfg, rpc.NewDispatcher(h), rpc.Platform{}, rpc.Capabilities{Features: []string{handlers.FeatureEditorDurableWriteV1}})
+	client := NewClient(cfg, rpc.NewDispatcher(h), rpc.Platform{}, rpc.Capabilities{Features: []string{handlers.FeatureEditorDurableWriteV1, handlers.FeatureEditorTargetQueueV1}})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	done := make(chan struct{})
 	go func() { _ = client.Run(ctx); close(done) }()
@@ -84,29 +84,28 @@ func TestEditorWriteFullLoopbackSizesAndLostSuccessQuery(t *testing.T) {
 				t.Fatal(err)
 			}
 			peer, ctx := startEditorWriteLoopback(t, root, stateRoot)
-			found := false
+			found := map[string]bool{}
 			for _, feature := range peer.hello.Capabilities.Features {
-				if feature == handlers.FeatureEditorDurableWriteV1 {
-					found = true
-				}
+				found[feature] = true
 			}
-			if !found {
-				t.Fatal("writer hello feature missing")
+			if !found[handlers.FeatureEditorDurableWriteV1] || !found[handlers.FeatureEditorTargetQueueV1] {
+				t.Fatal("writer hello is missing explicit target-queue coordination")
 			}
 			meta := editorWireCall(t, peer, ctx, "stat", "fs.stat", map[string]any{"path": path, "editorRoot": root, "editorIdentity": true})
 			body := bytes.Repeat([]byte("a"), size)
 			stage := editorWireStage(t, peer, ctx, body)
-			req := map[string]any{"namespace": "stable-owner", "resourceKey": "resource", "operationId": "op", "requestDigest": editorWireDigest([]byte("op")), "stageId": stage, "expectedRawHash": editorWireDigest([]byte("before")), "metadataPolicy": "preserve", "identity": map[string]any{"deviceId": "device", "pathFlavor": handlers.EditorPathFlavor(), "canonicalPath": meta["resolvedPath"], "workspaceIdentity": meta["rootIdentity"], "runtimeEpoch": meta["runtimeEpoch"], "runtimeGeneration": 1, "fencingToken": 1}}
+			req := map[string]any{"coordination": handlers.EditorTargetQueueCoordination, "namespace": "stable-owner", "resourceKey": "resource", "operationId": "op", "requestDigest": editorWireDigest([]byte("op")), "stageId": stage, "expectedRawHash": editorWireDigest([]byte("before")), "metadataPolicy": "preserve", "identity": map[string]any{"deviceId": "device", "pathFlavor": handlers.EditorPathFlavor(), "canonicalPath": meta["resolvedPath"], "workspaceIdentity": meta["rootIdentity"], "runtimeEpoch": meta["runtimeEpoch"], "runtimeGeneration": 1, "fencingToken": 1}}
 			// Send apply but deliberately never consume its success result. The next
 			// RPC collector drops that unmatched frame and recovers solely by query.
 			if err := writeJSON(ctx, peer.conn, rpc.RequestFrame{Type: "rpc", ID: "lost-success", Method: "editor.apply", Params: req}); err != nil {
 				t.Fatal(err)
 			}
 			query := map[string]any{"namespace": "stable-owner", "resourceKey": "resource", "operationId": "op", "requestDigest": req["requestDigest"]}
-			// Use a ping barrier plus response collection: a query that enters first
-			// may honestly be not_found, which is never permission to reapply.
+			// A query that enters before apply obtains the kernel journal lock may
+			// honestly be not_found. Wait within the RPC context budget, not a fixed
+			// number of fast polls that can finish before the lock's retry interval.
 			var q map[string]any
-			for i := 0; i < 32; i++ {
+			for i := 0; ctx.Err() == nil; i++ {
 				q = editorWireCall(t, peer, ctx, fmt.Sprintf("query-%d", i), "editor.query", query)
 				if q["outcome"] != "not_found" {
 					break
@@ -199,7 +198,7 @@ func TestEditorPrivateStateLoopback(t *testing.T) {
 	identity["canonicalPath"] = meta["resolvedPath"]
 	body := []byte("STATE_NEEDLE saved")
 	writeStage := editorWireStage(t, peer, ctx, body)
-	req := map[string]any{"namespace": "stable-owner", "resourceKey": "resource", "operationId": "normal", "requestDigest": editorWireDigest([]byte("normal")), "stageId": writeStage, "expectedRawHash": editorWireDigest([]byte("STATE_NEEDLE before")), "metadataPolicy": "preserve", "identity": identity}
+	req := map[string]any{"coordination": handlers.EditorTargetQueueCoordination, "namespace": "stable-owner", "resourceKey": "resource", "operationId": "normal", "requestDigest": editorWireDigest([]byte("normal")), "stageId": writeStage, "expectedRawHash": editorWireDigest([]byte("STATE_NEEDLE before")), "metadataPolicy": "preserve", "identity": identity}
 	if result := editorWireCall(t, peer, ctx, "apply", "editor.apply", req); result["outcome"] != "committed" {
 		t.Fatal("normal apply was blocked by private deny", result)
 	}

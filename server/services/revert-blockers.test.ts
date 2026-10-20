@@ -91,9 +91,7 @@ describe("collectRevertBlockers", () => {
 		await started;
 		try {
 			await withNarratorWorkAdmission(ids.narrator, async () => {
-				expect(collectRevertBlockers(ids.narrator)).toEqual([
-					{ kind: "narrator_busy", detail: "admission work still settling" },
-				]);
+				expect(collectRevertBlockers(ids.narrator)).toEqual([{ kind: "narrator_busy" }]);
 			});
 		} finally {
 			release();
@@ -106,12 +104,12 @@ describe("collectRevertBlockers", () => {
 		expect(blockers).toEqual([
 			{
 				kind: "planner_busy",
-				detail: "Another revert preview preparation is already running",
+				detail: "Another preview is running",
 			},
 		]);
 	});
 
-	test("names this narrator's running tool and a same-workspace foreign writer", () => {
+	test("names this narrator's running tool without treating a foreign writer as a barrier", () => {
 		const timestamp = now();
 		const mine = generateId();
 		const foreign = generateId();
@@ -141,22 +139,20 @@ describe("collectRevertBlockers", () => {
 			})
 			.run();
 		const blockers = collectRevertBlockers(ids.narrator);
-		expect(blockers.find((item) => item.toolCallId === mine)).toMatchObject({
-			kind: "running_tool",
-			toolName: "Bash",
-			detail: "long bash",
-		});
-		const foreignBlocker = blockers.find((item) => item.toolCallId === foreign);
-		expect(foreignBlocker).toMatchObject({
-			kind: "uncoordinated_activity",
-			toolName: "Edit",
-		});
-		// Same-workspace concurrent writer is kept, but never via file_path text.
-		expect(foreignBlocker?.detail ?? "").not.toContain("shared.ts");
+		expect(blockers).toEqual([
+			{
+				kind: "running_tool",
+				toolCallId: mine,
+				toolName: "Bash",
+				messageId: ids.message,
+			},
+		]);
+		expect(blockers.find((item) => item.toolCallId === foreign)).toBeUndefined();
+		expect(JSON.stringify(blockers)).not.toContain("shared.ts");
 		expect(JSON.stringify(blockers)).not.toContain("sleep 30");
 	});
 
-	test("names unsettled file-change operations and open write leases", () => {
+	test("archived pending operations and quarantined leases never block new narrator work", async () => {
 		const timestamp = now();
 		const operationId = generateId();
 		const leaseId = generateId();
@@ -219,18 +215,33 @@ describe("collectRevertBlockers", () => {
 				updatedAt: timestamp,
 			})
 			.run();
-		const blockers = collectRevertBlockers(ids.narrator);
-		expect(blockers.find((item) => item.operationId === operationId)).toMatchObject({
-			kind: "pending_operation",
+		db.update(workspaceWriteLeases)
+			.set({ status: "quarantined" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		db.update(fileChangeScopes)
+			.set({ status: "needs_verification" })
+			.where(eq(fileChangeScopes.id, scopeId))
+			.run();
+		const archived = JSON.stringify({
+			leases: db.select().from(workspaceWriteLeases).all(),
+			scopes: db.select().from(fileChangeScopes).all(),
+			operations: db.select().from(fileChangeOperations).all(),
 		});
+		expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+		let continued = false;
+		await withNarratorWorkAdmission(ids.narrator, async () => {
+			continued = true;
+			expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+		});
+		expect(continued).toBe(true);
 		expect(
-			blockers.find((item) => item.leaseId === leaseId && item.kind === "write_lease"),
-		).toBeTruthy();
-		expect(
-			blockers.find((item) => item.kind === "pending_mutation" && item.detail?.includes("2")),
-		).toBeTruthy();
-		// Scope identity is the leaseId, not the absolute workspace root.
-		expect(JSON.stringify(blockers)).not.toContain("/tmp/revert-blockers-workspace");
+			JSON.stringify({
+				leases: db.select().from(workspaceWriteLeases).all(),
+				scopes: db.select().from(fileChangeScopes).all(),
+				operations: db.select().from(fileChangeOperations).all(),
+			}),
+		).toBe(archived);
 	});
 
 	test("settled history is not reported as a blocker", () => {
@@ -334,8 +345,8 @@ describe("collectRevertBlockers", () => {
 		const descriptionBlocker = blockers.find((item) => item.toolCallId === longDescription);
 		expect(pathBlocker?.detail).toBeUndefined();
 		expect(commandBlocker?.detail).toBeUndefined();
-		expect(descriptionBlocker?.detail?.length).toBeLessThanOrEqual(160);
-		expect(descriptionBlocker?.detail?.startsWith("d")).toBe(true);
+		expect(descriptionBlocker).toMatchObject({ kind: "running_tool", toolName: "Grep" });
+		expect(descriptionBlocker?.detail).toBeUndefined();
 		const wire = JSON.stringify(blockers);
 		expect(wire).not.toContain("/secret/elsewhere");
 		expect(wire).not.toContain("TOKEN=abc123");
@@ -422,8 +433,9 @@ describe("collectRevertBlockers", () => {
 		expect(wire).not.toContain("other-workspace-secret");
 		expect(wire).not.toContain(foreignLeaseId);
 		expect(wire).not.toContain(foreignScopeId);
-		expect(blockers.some((item) => item.leaseId === relatedLeaseId)).toBe(true);
-		// Related scope is reported, but never through its absolute displayRoot.
+		expect(blockers).toEqual([]);
+		expect(wire).not.toContain(relatedLeaseId);
+		// Archived scope metadata is never exposed as a live-work diagnostic.
 		expect(wire).not.toContain("/tmp/revert-blockers-workspace");
 	});
 
@@ -446,5 +458,6 @@ describe("collectRevertBlockers", () => {
 			.run();
 		const row = db.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, id)).get();
 		expect(row?.status).toBe("needs_verification");
+		expect(collectRevertBlockers(ids.narrator)).toEqual([]);
 	});
 });

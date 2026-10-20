@@ -8,6 +8,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import { useToolCallDetail } from "../../../hooks/useNarrator";
 import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
+import en from "../../../locales/en/narrator.json";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { TraceRowInteraction } from "../trace/TraceRowInteraction";
@@ -222,6 +223,44 @@ describe("ToolCallInspector timing", () => {
 		expect(document.body.textContent).toContain("OPERATION 366ms");
 		expect(document.body.textContent).not.toContain("SPAN 8.4s");
 	});
+});
+
+describe("ToolCallInspector file history advisory", () => {
+	for (const source of ["persisted", "live"] as const) {
+		test.each([
+			["applied", "unavailable", true],
+			["not_applied", "unavailable", false],
+			["unknown", "unavailable", false],
+			["conflict", "unavailable", false],
+			[undefined, "unavailable", false],
+			["applied", "complete", false],
+			["applied", undefined, false],
+		] as const)(`${source} %s/%s warns only for confirmed disk writes with missing history`, async (diskOutcome, historyStatus, warned) => {
+			i18n.addResource(
+				"en",
+				"narrator",
+				"revertPlanHistoryUnavailable",
+				en.revertPlanHistoryUnavailable,
+			);
+			const metadata = {
+				...(diskOutcome === undefined ? {} : { diskOutcome }),
+				...(historyStatus === undefined ? {} : { historyStatus }),
+			};
+			await render({
+				...base,
+				detail: {
+					toolName: "Write",
+					status: "completed",
+					...(source === "persisted"
+						? { outputJson: { _text: "result", _metadata: metadata } }
+						: { outputJson: "result", _metadata: metadata }),
+				},
+			});
+			expect(document.body.textContent?.includes(en.revertPlanHistoryUnavailable)).toBe(warned);
+			expect(document.body.textContent).toContain("completed");
+			expect(calls).toHaveLength(0);
+		});
+	}
 });
 
 describe("ToolCallInspector exact refs", () => {

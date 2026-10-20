@@ -3,32 +3,33 @@ import { parentPort } from "node:worker_threads";
 import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	type FileChangeBlobRef,
-	type FileChangeExecutionBinding,
 	type FileChangeRevertAction,
+	type FileChangeRevertSelector,
 	type FileChangeState,
 	fileChangeRevertActionMatches,
 	hasConfirmedNoFileChange,
 	hasSettledMeasuredFileEffect,
-	type KnownFileChangeState,
 	FILE_CHANGE_LIMITS as LIMIT,
 } from "@shared/file-change-protocol";
-import { fileChangeIdentityKey } from "./file-change-identity";
+import { fileChangeIdentityKey, fileChangePhysicalIdentityKey } from "./file-change-identity";
 import type { RevertJournalFile, RevertJournalOperation } from "./revert-mutation-journal";
 import {
 	type AppendRevertPlanFile,
 	fingerprintRevertPlanFiles,
+	isRevertPlanFileNoOp,
 	type RevertPlanHeader,
 	type RevertPlanManifestProof,
 	revertPlanHeaderDigest,
 } from "./revert-plan-service";
-import type { RevertSelectionResult } from "./revert-selection-service";
+import {
+	isSnapshotSelectionComplete,
+	type RevertSelectionResult,
+} from "./revert-selection-service";
 
 /** Private worker protocol. Raw manifests never get parsed/stringified on the HTTP thread. */
 export interface TransactionManifestFile extends AppendRevertPlanFile {
-	expected: KnownFileChangeState;
-	desired: KnownFileChangeState;
-	executionBinding: FileChangeExecutionBinding;
-	scopeRevision: number;
+	expected: FileChangeState;
+	desired: FileChangeState;
 }
 export interface ValidatedTransactionManifest {
 	header: RevertPlanHeader;
@@ -37,6 +38,7 @@ export interface ValidatedTransactionManifest {
 	files: TransactionManifestFile[];
 	rawRefs: FileChangeBlobRef[];
 	evidenceBytes: number;
+	snapshotRecovery: boolean;
 }
 export type TransactionManifestRequest =
 	| {
@@ -54,6 +56,7 @@ export type TransactionManifestRequest =
 			operation: RevertJournalOperation;
 			userId: string;
 			expectedAction?: FileChangeRevertAction;
+			expectedSelector?: FileChangeRevertSelector;
 			acceptSnapshotRestore?: true;
 	  };
 
@@ -128,6 +131,10 @@ function validateEntrypoint(input: Extract<TransactionManifestRequest, { action:
 	);
 	if (input.expectedAction !== undefined)
 		check(selector.request.uiAction === input.expectedAction, "ACTION_MISMATCH");
+	if (input.expectedSelector !== undefined) {
+		selectorValid(input.expectedSelector);
+		check(equal(selector.request.selector, input.expectedSelector), "ACTION_MISMATCH");
+	}
 	validateRecoveryPolicy(selector.request, input.acceptSnapshotRestore);
 }
 
@@ -220,11 +227,12 @@ function validate(
 	]);
 	check(
 		proof.source === "trusted_published_planner_v1" &&
-			proof.computation === "complete" &&
+			["complete", "partial"].includes(proof.computation) &&
 			proof.selectorCoverage === "complete" &&
-			proof.historyCoverage === "complete" &&
+			["complete", "partial"].includes(proof.historyCoverage) &&
 			proof.omittedFiles === 0 &&
-			proof.unknownFiles === 0,
+			Number.isSafeInteger(proof.unknownFiles) &&
+			proof.unknownFiles >= 0,
 		"INCOMPLETE_PROOF",
 	);
 	check(proof.headerDigest === revertPlanHeaderDigest(header), "HEADER_DIGEST");
@@ -301,10 +309,18 @@ function validate(
 	check(
 		selection.version === 1 &&
 			selection.selectionComplete === true &&
-			selection.evidenceComplete === true &&
+			typeof selection.evidenceComplete === "boolean" &&
 			selection.executable === false &&
 			Array.isArray(selection.issues) &&
-			selection.issues.length === 0,
+			selection.issues.every((issue: { code: string }) =>
+				[
+					"FILE_JOURNAL_MISSING",
+					"FILE_TOOL_PENDING",
+					"EFFECT_UNRESOLVED",
+					"OPERATION_UNRESOLVED",
+					"EFFECT_PIN_MISSING",
+				].includes(issue.code),
+			),
 		"INCOMPLETE_SELECTION",
 	);
 	check(
@@ -390,12 +406,14 @@ function validate(
 	for (const effect of selection.effects as RevertSelectionResult["effects"]) {
 		check(!effects.has(effect.id), "DUPLICATE_EFFECT");
 		effects.set(effect.id, effect);
-		for (const state of [
-			effect.before,
-			effect.intendedAfter,
-			effect.observedAfter,
-			...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
-		])
+		for (const state of selector.request.recoveryMode === "snapshot"
+			? [effect.before]
+			: [
+					effect.before,
+					effect.intendedAfter,
+					effect.observedAfter,
+					...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
+				])
 			chargeState(state);
 	}
 	for (const operation of selection.operations as RevertSelectionResult["operations"])
@@ -404,19 +422,17 @@ function validate(
 	const files: TransactionManifestFile[] = manifest.files.map(
 		(
 			file: TransactionManifestFile & {
-				steps: { effectId: string; mutationId: string; scopeRevision: number; method: string }[];
+				steps: {
+					effectId: string;
+					mutationId: string;
+					scopeRevision: number | null;
+					journalSeq?: number;
+					method: string;
+				}[];
 			},
 			index: number,
 		) => {
-			keys(file, [
-				"sequence",
-				"identity",
-				"expected",
-				"desired",
-				"executionBinding",
-				"scopeRevision",
-				"steps",
-			]);
+			keys(file, ["sequence", "identity", "expected", "desired", "steps"]);
 			check(file.sequence === index, "FILE_ORDER");
 			const row = bySequence.get(index);
 			check(
@@ -441,23 +457,22 @@ function validate(
 					file.identity.objectRole === "referent",
 				"UNSUPPORTED_TARGET",
 			);
-			keys(file.executionBinding, [
-				"deviceId",
-				"runtimeEpoch",
-				"runtimeGeneration",
-				"fencingToken",
-			]);
+			// Expected is checked against live IO, not an archive prerequisite.
+			stateValid(file.expected);
+			stateValid(file.desired);
+			const noOp = isRevertPlanFileNoOp(file);
+			if (!noOp) chargeState(file.desired);
 			check(
-				file.executionBinding.deviceId === "local" &&
-					typeof file.executionBinding.runtimeEpoch === "string" &&
-					file.executionBinding.runtimeEpoch.length > 0,
-				"RUNTIME",
+				row?.beforeBlobDigest === null ||
+					row?.beforeBlobDigest ===
+						(file.expected.kind === "regular" ? file.expected.blob.digest : null),
+				"EXPECTED_PIN",
 			);
-			integer(file.scopeRevision, Number.MAX_SAFE_INTEGER - 1);
-			integer(file.executionBinding.fencingToken, Number.MAX_SAFE_INTEGER - 1);
-			integer(file.executionBinding.runtimeGeneration, Number.MAX_SAFE_INTEGER);
-			chargeState(file.expected);
-			chargeState(file.desired);
+			check(
+				row?.desiredBlobDigest ===
+					(!noOp && file.desired.kind === "regular" ? file.desired.blob.digest : null),
+				"DESIRED_PIN",
+			);
 			const binding = [
 				operation.id,
 				operation.requestDigest,
@@ -465,34 +480,32 @@ function validate(
 				fileChangeIdentityKey(file.identity),
 				index,
 			];
-			for (const phase of ["apply", "compensate"] as const) {
-				const states =
-					phase === "apply" ? [file.expected, file.desired] : [file.desired, file.expected];
-				check(
-					row?.[phase === "apply" ? "applyMutationId" : "compensateMutationId"] ===
-						digest(["revert-mutation-v1", ...binding, phase]),
-					"PHASE_ID",
-				);
-				check(
-					row?.[phase === "apply" ? "applyRequestDigest" : "compensateRequestDigest"] ===
-						digest(["revert-request-v1", ...binding, phase, ...states]),
-					"PHASE_DIGEST",
-				);
-			}
+			check(
+				row?.applyMutationId === digest(["revert-mutation-v1", ...binding, "apply"]),
+				"ATTEMPT_ID",
+			);
+			check(
+				row?.applyRequestDigest ===
+					digest(["revert-request-v1", ...binding, "apply", file.expected, file.desired]),
+				"ATTEMPT_DIGEST",
+			);
 			array(file.steps, LIMIT.historyToolRelatedChanges);
 			let previous = Number.MAX_SAFE_INTEGER;
 			let snapshotDesired: FileChangeState = file.expected;
 			let previousChanged = Number.MAX_SAFE_INTEGER;
 			for (const step of file.steps) {
-				keys(step, ["effectId", "mutationId", "scopeRevision", "method"]);
+				keys(step, ["effectId", "mutationId", "scopeRevision", "method"], ["journalSeq"]);
 				const effect = effects.get(step.effectId);
+				const order = step.journalSeq ?? step.scopeRevision;
+				check(typeof order === "number" && Number.isSafeInteger(order), "EFFECT_ORDER");
 				check(
 					!!effect &&
 						!usedEffects.has(step.effectId) &&
-						equal(effect.identity, file.identity) &&
+						sameTarget(effect.identity, file.identity) &&
 						effect.mutationId === step.mutationId &&
 						effect.scopeRevision === step.scopeRevision &&
-						step.scopeRevision <= previous,
+						(effect.journalSeq ?? effect.scopeRevision) === order &&
+						(order as number) <= previous,
 					"EFFECT_BINDING",
 				);
 				check(
@@ -510,31 +523,46 @@ function validate(
 						);
 					} else {
 						check(
-							hasSettledMeasuredFileEffect(effect) && step.method === "restore_snapshot",
+							effect.before.kind !== "unknown" && step.method === "restore_snapshot",
 							"STEP_METHOD",
 						);
-						check(step.scopeRevision < previousChanged, "EFFECT_BINDING");
-						previousChanged = step.scopeRevision;
+						check((order as number) < previousChanged, "EFFECT_BINDING");
+						previousChanged = order as number;
 						snapshotDesired = effect.before;
 					}
 				} else check(step.method !== "restore_snapshot", "STEP_METHOD");
-				previous = step.scopeRevision;
+				previous = order as number;
 				usedEffects.add(step.effectId);
 			}
-			check(file.steps.length > 0, "EMPTY_FILE_SELECTION");
-			if (selector.request.recoveryMode === "snapshot")
+			if (file.desired.kind === "unknown") {
+				for (const effect of effects.values())
+					if (sameTarget(effect.identity, file.identity)) usedEffects.add(effect.id);
+			} else check(file.steps.length > 0, "EMPTY_FILE_SELECTION");
+			if (selector.request.recoveryMode === "snapshot" && file.desired.kind !== "unknown")
 				check(equal(file.desired, snapshotDesired), "SNAPSHOT_TARGET_CONFLICT");
 			return {
 				sequence: file.sequence,
 				identity: file.identity,
 				expected: file.expected,
 				desired: file.desired,
-				executionBinding: file.executionBinding,
-				scopeRevision: file.scopeRevision,
 			};
 		},
 	);
 	check(usedEffects.size === effects.size, "OMITTED_EFFECT");
+	const unavailableCount = files.filter((file) => file.desired.kind === "unknown").length;
+	check(proof.unknownFiles === unavailableCount, "UNKNOWN_FILE_COUNT");
+	const snapshotRecovery = selector.request.recoveryMode === "snapshot";
+	const completeSelection =
+		(selection.evidenceComplete && selection.issues.length === 0) ||
+		(snapshotRecovery && isSnapshotSelectionComplete(selection));
+	check(
+		operation.coverageComplete ===
+			(completeSelection &&
+				unavailableCount === 0 &&
+				proof.computation === "complete" &&
+				proof.historyCoverage === "complete"),
+		"COVERAGE_MISMATCH",
+	);
 	const fingerprint = fingerprintRevertPlanFiles(
 		files.map(({ sequence, identity, expected, desired }) => ({
 			sequence,
@@ -548,10 +576,17 @@ function validate(
 			fingerprint.fileEvidenceBytes === proof.fileEvidenceBytes,
 		"FILE_FINGERPRINT",
 	);
-	// Expected/desired are already charged above. Matching apply/compensation observations
-	// reuse those typed states; only later independent third-state evidence grows the budget.
+	// Only historical/desired raw materials are charged; expected carries a live fingerprint.
 	integer(evidenceBytes, LIMIT.operationEvidenceBytes);
-	return { header, proof, selection, files, rawRefs: [...refs.values()], evidenceBytes };
+	return {
+		header,
+		proof,
+		selection,
+		files,
+		rawRefs: [...refs.values()],
+		evidenceBytes,
+		snapshotRecovery,
+	};
 }
 
 function validateRecoveryPolicy(
@@ -571,8 +606,9 @@ function validateRecoveryPolicy(
 	);
 	if (request.uiAction !== undefined)
 		check(
-			["revert_files", "rollback_to_block", "delete_tool_block"].includes(request.uiAction) &&
-				fileChangeRevertActionMatches(request.uiAction, request.kind, request.selector),
+			["revert_files", "rollback_to_block", "delete_tool_block", "edit_and_regenerate"].includes(
+				request.uiAction,
+			) && fileChangeRevertActionMatches(request.uiAction, request.kind, request.selector),
 			"ACTION_MISMATCH",
 		);
 	check(
@@ -607,7 +643,18 @@ function selectorValid(value: RevertSelectionResult["selector"]) {
 			throw new Error("SELECTOR");
 	}
 }
+function sameTarget(
+	left: TransactionManifestFile["identity"],
+	right: TransactionManifestFile["identity"],
+): boolean {
+	return fileChangePhysicalIdentityKey(left) === fileChangePhysicalIdentityKey(right);
+}
 function stateValid(state: FileChangeState) {
+	if (state?.kind === "unknown") {
+		keys(state, ["kind", "reason"]);
+		check(typeof state.reason === "string" && state.reason.length <= 256, "UNKNOWN_REASON");
+		return;
+	}
 	if (state?.kind === "absent") {
 		keys(state, ["kind"]);
 		return;

@@ -274,15 +274,22 @@ export function EditorReceiptNotice({ state }: { state: EditorSessionState }) {
 	)
 		return null;
 	return (
-		<Text size="xs" data-editor-retired-receipt={receipt.status}>
-			{receipt.status === "saved"
-				? t("fileEditor.receiptSaved")
-				: receipt.status === "not-applied"
-					? t("fileEditor.receiptNotApplied")
-					: t("fileEditor.receiptFailed", {
-							message: receipt.error?.message ?? receipt.error?.code ?? "",
-						})}
-		</Text>
+		<>
+			<Text size="xs" data-editor-retired-receipt={receipt.status}>
+				{receipt.status === "saved"
+					? t("fileEditor.receiptSaved")
+					: receipt.status === "not-applied"
+						? t("fileEditor.receiptNotApplied")
+						: t("fileEditor.receiptFailed", {
+								message: receipt.error?.message ?? receipt.error?.code ?? "",
+							})}
+			</Text>
+			{receipt.status === "saved" && receipt.result?.historyStatus === "unavailable" && (
+				<Text size="xs" c="yellow" data-editor-history-unavailable>
+					{t("revertPlanHistoryUnavailable")}
+				</Text>
+			)}
+		</>
 	);
 }
 /** Kept separate from the newly authorized editor: neither querying nor exporting installs its draft. */

@@ -108,6 +108,8 @@ import {
 	boundedJson,
 	mailboxDedupeKey,
 	pointer,
+	recipientDeletedReceiptPatch,
+	semanticEditReceiptPatch,
 } from "./mailbox-shared";
 import type {
 	MailboxClaim,
@@ -2450,22 +2452,19 @@ export function createPostgresRuntimeQueue(
 			}
 			const updated = await tx
 				.update(mailbox)
-				.set({
-					currentMessageId: change.kind === "deleted" ? null : change.messageId,
-					...(change.kind === "semantic_edit"
-						? {
-								receiptDisposition: "superseded" as const,
-								// PG has no scalar max(); GREATEST is the two-argument form. Both columns
-								// are NOT NULL, so GREATEST's null-skipping cannot change the result.
-								currentRevision: sql`greatest(${mailbox.currentRevision}, ${mailbox.contentRevision}) + 1`,
-								currentAdoptedRevision: null,
-								currentAdoptedAt: null,
-							}
-						: change.kind === "deleted"
-							? { receiptDisposition: "recipient_deleted" as const }
-							: {}),
-					updatedAt: now(),
-				})
+				.set(
+					change.kind === "deleted"
+						? recipientDeletedReceiptPatch(now())
+						: change.kind === "semantic_edit"
+							? semanticEditReceiptPatch(
+									change.messageId,
+									// PG has no scalar max(); GREATEST is the two-argument form. Both columns
+									// are NOT NULL, so GREATEST's null-skipping cannot change the result.
+									sql`greatest(${mailbox.currentRevision}, ${mailbox.contentRevision}) + 1`,
+									now(),
+								)
+							: { currentMessageId: change.messageId, updatedAt: now() },
+				)
 				.where(
 					and(
 						eq(mailbox.narratorId, narratorId),

@@ -11,10 +11,14 @@ import * as relations from "../db/relations";
 import * as schema from "../db/schema";
 import { safeSpawn } from "../lib/spawn";
 import { nativeEditorFixture } from "../routes/editor-native-fixture";
-import { executeAtomicEditorFileChange } from "./editor-document-runtime";
+import {
+	executeAtomicEditorFileChange,
+	queryEditorOperation,
+	withEditorOperationStore,
+} from "./editor-document-runtime";
 import { EditorDocumentService } from "./editor-document-service";
 import { createEditorFileAtomicIo } from "./editor-file-atomic-io";
-import { EditorHelperSession, type EditorRpc } from "./editor-helper";
+import { EditorHelperSession, type EditorRpc, editorHelperDiagnostics } from "./editor-helper";
 import { EditorRemoteOperationStore } from "./editor-remote-operation-store";
 import { fileChangeLocalIo, type LocalFileApplyInput } from "./file-change-local-io";
 import {
@@ -24,7 +28,6 @@ import {
 	withLocalFileChangeRuntime,
 } from "./file-change-runtime";
 import { workspaceContextService } from "./workspace-context-service";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 import { withProtectionReservation } from "./worktree-lifecycle-guard";
 
 const hash = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
@@ -89,7 +92,6 @@ function makeRuntime() {
 	return new LocalFileChangeRuntime({
 		db,
 		privateRoot: join(root, "evidence"),
-		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 }
@@ -269,15 +271,19 @@ test("committed reply followed only by Host after-read failure recovers the orig
 		},
 	});
 	await withLocalFileChangeRuntime(runtime, async () => {
-		await expect(runtime.executeEditor(req)).rejects.toThrow();
+		expect(await runtime.executeEditor(req)).toMatchObject({
+			diskOutcome: "applied",
+			historyStatus: "unavailable",
+		});
 		expect(committedReplies).toBe(1);
 		expect(await readFile(target, "utf8")).toBe("after");
 		const record = await store.get(req.requestId);
-		if (!record) throw new Error("Missing original receipt association");
-		expect(runtime.evidence.listEffects(record.hostOperationId).items[0]).toMatchObject({
-			executionReceiptJson: null,
-			settlement: "reconcile_required",
+		if (!record || record.version !== 2 || !record.historyOperationId)
+			throw new Error("Missing original receipt association");
+		expect(runtime.evidence.listEffects(record.historyOperationId).items[0]).toMatchObject({
+			diskOutcome: "applied",
 		});
+		expect(record.receipt?.outcome).toBe("committed");
 		const session = await peer();
 		try {
 			const proof = await session.call<EditorQueryResult>("editor.query", {
@@ -288,16 +294,8 @@ test("committed reply followed only by Host after-read failure recovers the orig
 			});
 			expect(proof.outcome).toBe("committed");
 			if (!proof.result) throw new Error("Missing committed receipt");
-			runtime.settleEditorReceipt(record, proof.result);
 			await store.markSettled(record.operationId, proof.result);
-			expect(runtime.evidence.getOperation(record.hostOperationId)).toMatchObject({
-				executionOutcome: "succeeded",
-				settlement: "settled",
-			});
-			expect(runtime.evidence.listEffects(record.hostOperationId).items[0]).toMatchObject({
-				executionReceiptJson: { outcome: "applied", confirmed: true },
-				settlement: "settled",
-			});
+			expect(db.select().from(schema.workspaceWriteLeases).all()).toEqual([]);
 		} finally {
 			await session.close();
 		}
@@ -307,7 +305,7 @@ test("committed reply followed only by Host after-read failure recovers the orig
 	});
 });
 
-test("lost success reply: only query recovers original quarantine; cold host/helper then another save works", async () => {
+test("lost success reply: query recovers the original result without quarantining the target", async () => {
 	await writeFile(target, "before");
 	let applies = 0;
 	const lost = request(new TextEncoder().encode("saved"), hash("before"));
@@ -315,9 +313,9 @@ test("lost success reply: only query recovers original quarantine; cold host/hel
 		if (!input.editor) throw new Error("Missing editor context");
 		const session = await EditorHelperSession.open(
 			resolver,
-			input.editor.scope.canonicalRoot,
+			input.editor.root,
 			state,
-			input.editor.executionBinding.runtimeEpoch,
+			input.editor.runtime.runtimeEpoch,
 		);
 		await session.capabilities();
 		return {
@@ -341,12 +339,184 @@ test("lost success reply: only query recovers original quarantine; cold host/hel
 	expect(applies).toBe(1);
 	const { record, result } = await query(lost.requestId);
 	expect(result.outcome).toBe("committed");
-	// Recreate Host coordinator/runtime, not the live NarraFork service. Same private namespace/database.
+	// A cold runtime does not need a target unlock, nor available history, to use real proof.
 	runtime = makeRuntime();
-	runtime.settleEditorReceipt(record, result.result as EditorApplyResult);
+	await store.markSettled(record.operationId, result.result as EditorApplyResult);
 	await runtime.executeEditor(request(new TextEncoder().encode("again"), hash("saved")));
 	expect(await readFile(target, "utf8")).toBe("again");
 	expect(applies).toBe(1);
+});
+
+test("RPC failure retains the same-file slot until real helper close while another file progresses", async () => {
+	await writeFile(target, "before");
+	await runtime.initialize();
+	const closing = Promise.withResolvers<void>(),
+		drain = Promise.withResolvers<void>();
+	let firstSettled = false,
+		secondRead = false;
+	const lost = request(Buffer.from("saved"), hash("before"), {
+		io: createEditorFileAtomicIo({
+			resourceKey: "fixture-resource",
+			store,
+			open: async () => {
+				const session = await peer();
+				return {
+					withMetadata: (run) => session.withMetadata(run),
+					call: async <T>(method: string, params: object, signal?: AbortSignal) => {
+						const result = await session.call<T>(method, params, signal);
+						if (method === "editor.apply") throw new Error("Host apply reply timed out");
+						return result;
+					},
+					close: async () => {
+						closing.resolve();
+						await drain.promise;
+						await session.close();
+					},
+				};
+			},
+		}),
+	});
+	const first = runtime
+		.executeEditor(lost)
+		.then(
+			() => "unexpected-success",
+			(error: Error) => error.name,
+		)
+		.finally(() => {
+			firstSettled = true;
+		});
+	await closing.promise;
+	const next = request(Buffer.from("next"), hash("saved"));
+	if (!next.io) throw new Error("Missing provider fixture");
+	const read = next.io.read;
+	next.io.read = async (...args) => {
+		secondRead = true;
+		return read(...args);
+	};
+	const second = runtime.executeEditor(next);
+	try {
+		const other = join(workspace, "other.txt");
+		await writeFile(other, "other-before");
+		await runtime.executeEditor(
+			request(Buffer.from("other-after"), hash("other-before"), {
+				canonicalPath: other,
+				lexicalPath: other,
+			}),
+		);
+		expect(editorHelperDiagnostics().processes).toBe(1);
+		expect(firstSettled).toBe(false);
+		expect(secondRead).toBe(false);
+		expect(await readFile(target, "utf8")).toBe("saved");
+	} finally {
+		drain.resolve();
+		await first;
+		await second;
+	}
+	expect(await first).toBe("EditorFileChangeUncertainError");
+	expect(await readFile(target, "utf8")).toBe("next");
+	expect(editorHelperDiagnostics().processes).toBe(0);
+});
+
+test("real helper saves and cold metadata-only query succeeds without any file history", async () => {
+	await writeFile(target, "before");
+	const history = spyOn(runtime, "initialize").mockRejectedValue(new Error("blob history offline"));
+	const req = request(Buffer.from("saved"), hash("before"));
+	try {
+		expect(await runtime.executeEditor(req)).toMatchObject({
+			diskOutcome: "applied",
+			historyStatus: "unavailable",
+		});
+		const receipt = await store.get(req.requestId);
+		expect(receipt).toMatchObject({ version: 2, receipt: { outcome: "committed" } });
+		for (const field of ["leaseId", "effectId", "hostOperationId", "historyOperationId"])
+			expect(receipt).not.toHaveProperty(field);
+		expect(db.select().from(schema.fileChangeOperations).all()).toEqual([]);
+		await rm(target);
+		let checks = 0;
+		const result = await withEditorOperationStore(new EditorRemoteOperationStore(store.root), () =>
+			queryEditorOperation(
+				{
+					userId: "native-user",
+					narratorId: "native-narrator",
+					authorizeOperation: async (device) => {
+						expect(device).toBe("local");
+						checks++;
+					},
+					authorize: async () => {
+						throw new Error("Receipt query must not reopen its target");
+					},
+				},
+				req.requestId,
+			),
+		);
+		expect(result).toMatchObject({
+			status: "saved",
+			result: { diskOutcome: "applied", historyStatus: "unavailable", hash: hash("saved") },
+		});
+		expect(checks).toBeGreaterThan(0);
+	} finally {
+		history.mockRestore();
+	}
+});
+
+test("unacknowledged committed proof remains applied when Host receipt persistence fails", async () => {
+	await writeFile(target, "before");
+	const persistence = spyOn(store, "markSettled").mockRejectedValue(
+		new Error("Host receipt temporarily unavailable"),
+	);
+	const req = request(Buffer.from("saved"), hash("before"));
+	try {
+		expect(await runtime.executeEditor(req)).toMatchObject({ diskOutcome: "applied" });
+		expect((await store.get(req.requestId))?.receipt).toBeUndefined();
+		expect((await query(req.requestId)).result.outcome).toBe("committed");
+		expect(await readFile(target, "utf8")).toBe("saved");
+	} finally {
+		persistence.mockRestore();
+	}
+});
+
+test("an incomplete remote provider never falls back to a Host path read", async () => {
+	const host = spyOn(fileChangeLocalIo, "read").mockRejectedValue(new Error("Host IO forbidden"));
+	try {
+		const io = createEditorFileAtomicIo({
+			deviceId: "remote-device",
+			resourceKey: "fixture-resource",
+			store,
+		});
+		await expect(io.read("/remote-only/target.txt")).rejects.toThrow(
+			"Remote editor read provider unavailable",
+		);
+		expect(host).not.toHaveBeenCalled();
+	} finally {
+		host.mockRestore();
+	}
+});
+
+test("legacy durable capability cannot dispatch the new target-queue protocol", async () => {
+	await writeFile(target, "before");
+	let applies = 0;
+	const io = createEditorFileAtomicIo({
+		resourceKey: "fixture-resource",
+		store,
+		open: async () => {
+			const session = await peer();
+			return {
+				close: () => session.close(),
+				call: async <T>(method: string, params: object, signal?: AbortSignal) => {
+					if (method === "editor.apply") applies++;
+					const value = await session.call<T>(method, params, signal);
+					if (method === "editor.capabilities")
+						return { ...value, features: ["editor.durable-write.v1"] } as T;
+					return value;
+				},
+			};
+		},
+	});
+	await expect(
+		runtime.executeEditor(request(Buffer.from("saved"), hash("before"), { io })),
+	).rejects.toThrow("editor.target-queue.v1");
+	expect(applies).toBe(0);
+	expect(await readFile(target, "utf8")).toBe("before");
 });
 
 test("metadata failure rejects before replacement; pre-dispatch cancellation and missing helper never truncate", async () => {
@@ -375,6 +545,32 @@ test("metadata failure rejects before replacement; pre-dispatch cancellation and
 	await expect(runtime.executeEditor(missing)).rejects.toThrow("verified helper missing");
 	expect(await readFile(target, "utf8")).toBe("before");
 	expect((await lstat(target)).ino).toBe(initial.ino);
+});
+
+test("permission revoked after staging is rechecked before real helper dispatch", async () => {
+	await writeFile(target, "before");
+	let authorized = true;
+	const original = store.put.bind(store);
+	const publication = spyOn(store, "put").mockImplementation(async (value) => {
+		await original(value);
+		authorized = false;
+	});
+	const req = request(Buffer.from("never"), hash("before"), {
+		authorize: async () => {
+			if (!authorized) throw new Error("editor permission revoked");
+		},
+	});
+	try {
+		await expect(runtime.executeEditor(req)).rejects.toThrow("permission revoked");
+	} finally {
+		publication.mockRestore();
+	}
+	expect(await readFile(target, "utf8")).toBe("before");
+	expect((await store.get(req.requestId))?.receipt).toMatchObject({
+		outcome: "rejected",
+		error: { code: "EDITOR_NOT_DISPATCHED" },
+	});
+	expect((await query(req.requestId)).result.outcome).toBe("not_found");
 });
 
 test("cancellation after Host intent but before apply retains positive no-dispatch proof", async () => {
@@ -422,7 +618,7 @@ test("forced native Host receipt store takes durable proof, cold query survives,
 	await runtime.executeEditor(req);
 	const intent = await native.get(req.requestId);
 	if (!intent) throw new Error("Native host intent missing");
-	expect(intent.receipt).toBeUndefined();
+	expect(intent.receipt?.outcome).toBe("committed");
 	const session = await peer();
 	try {
 		const input = {
@@ -447,7 +643,7 @@ test("forced native Host receipt store takes durable proof, cold query survives,
 	const proof = await cold.get(req.requestId);
 	if (!proof?.receipt) throw new Error("Native cold proof missing");
 	runtime = makeRuntime();
-	runtime.settleEditorReceipt(proof, proof.receipt);
+	expect(proof.receipt.outcome).toBe("committed");
 	const next = request(new TextEncoder().encode("after-cold"), hash("saved"));
 	next.io = createEditorFileAtomicIo({
 		resourceKey: "fixture-resource",
@@ -479,9 +675,9 @@ test("UTF16 v1 through native Host store preserves separate text/raw hashes afte
 			if (!input.editor) throw new Error("Missing editor metadata");
 			const session = await EditorHelperSession.open(
 				resolver,
-				input.editor.scope.canonicalRoot,
+				input.editor.root,
 				state,
-				input.editor.executionBinding.runtimeEpoch,
+				input.editor.runtime.runtimeEpoch,
 			);
 			await session.capabilities();
 			return {
@@ -548,7 +744,7 @@ test("UTF16 v1 through native Host store preserves separate text/raw hashes afte
 			const queried = await session.call<EditorQueryResult>("editor.query", input);
 			if (!queried.result) throw new Error("Missing v1 durable receipt");
 			runtime = makeRuntime();
-			runtime.settleEditorReceipt(intent, queried.result);
+			expect(queried.result.outcome).toBe("committed");
 			const positive = queried.result;
 			await session.withMetadata(() => native.markSettled(intent.operationId, positive));
 			await session.call("editor.query", { ...input, acknowledgeTerminal: true });

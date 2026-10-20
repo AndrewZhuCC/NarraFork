@@ -133,7 +133,7 @@ func run(ctx context.Context, ready func()) error {
 	}
 
 	if h.EditorEnabled() {
-		caps.Features = append(caps.Features, handlers.FeatureEditorDurableWriteV1)
+		caps.Features = append(caps.Features, handlers.FeatureEditorDurableWriteV1, handlers.FeatureEditorTargetQueueV1)
 	}
 
 	// Signal handling belongs to the console path only. Under the SCM, shutdown

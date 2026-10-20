@@ -112,10 +112,15 @@ function setup(factory: IDBFactory | null = new IDBFactory()) {
 			};
 		}),
 		cancelUpload: mock(async (_n, _d, uploadId) => ({ uploadId, state: "cancelled" as const })),
-		operation: mock(async (_n, operationId) => ({ operationId, status: "uncertain" as const })),
+		operation: mock<typeof editorDocumentApi.operation>(async (_n, operationId) => ({
+			operationId,
+			status: "uncertain" as const,
+		})),
 		getUpload: mock(async (_n, _d, uploadId) => ({ uploadId, state: "committing" as const })),
 	} satisfies typeof editorDocumentApi;
 	let prepare = async () => ({ install: () => version(), dispose() {} });
+	const onSaved = mock((_revision: number, _lifetime?: string) => {});
+	const onSaveReceipt = mock((_result: EditorSaveResult) => {});
 	const session = new EditorDocumentSession({
 		narratorId: "n",
 		path: "/file",
@@ -134,11 +139,15 @@ function setup(factory: IDBFactory | null = new IDBFactory()) {
 			throw new Error("v1 install forbidden");
 		},
 		onChange() {},
+		onSaved,
+		onSaveReceipt,
 		api,
 	});
 	return {
 		session,
 		api,
+		onSaved,
+		onSaveReceipt,
 		doc,
 		sent,
 		snapshot,
@@ -224,6 +233,50 @@ test("410 pre-dispatch retry reuses identical attempt spool and original raw bas
 	expect(sessionDirty(value.session.state)).toBe(true);
 	value.session.dispose();
 });
+for (const recovery of [false, true])
+	test(`raw ${recovery ? "polled" : "direct"} saved history gap preserves bytes, draft lifetime and later input`, async () => {
+		const value = setup();
+		await value.session.load();
+		value.edit("A\nb\nc\n");
+		const commit = value.api.commit.getMockImplementation();
+		if (!commit) throw new Error("No fixture commit");
+		let receipt: EditorSaveResult | undefined;
+		value.api.commit.mockImplementationOnce(async (...args) => {
+			receipt = {
+				...(await commit(...args)),
+				operationId: "op-1",
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
+			};
+			value.edit("later\nb\nc\n");
+			if (recovery) {
+				value.api.operation.mockResolvedValue({
+					status: "saved",
+					operationId: "op-1",
+					result: receipt,
+				});
+				throw new ApiError("Receipt lost", 503, { operationId: "op-1", diskOutcome: "unknown" });
+			}
+			return receipt;
+		});
+		await value.session.save();
+		expect(value.sent[0]?.text).toBe("A\r\nb\nc\n");
+		expect(value.encodeRaw).toHaveBeenCalledTimes(1);
+		expect(value.api.commit).toHaveBeenCalledTimes(1);
+		expect(value.api.operation).toHaveBeenCalledTimes(recovery ? 1 : 0);
+		expect(value.onSaved).toHaveBeenCalledWith(2, "A");
+		expect(value.onSaved).toHaveBeenCalledTimes(1);
+		expect(value.onSaveReceipt).toHaveBeenCalledWith(receipt);
+		expect(value.onSaveReceipt).toHaveBeenCalledTimes(1);
+		expect(value.session.state.baseHash).toBe(receipt?.hash ?? "missing");
+		expect(value.session.state.phase).toBe("idle");
+		expect(sessionDirty(value.session.state)).toBe(true);
+		expect(sessionCanSave(value.session.state)).toBe(true);
+		await value.session.reconcile();
+		expect(value.onSaveReceipt).toHaveBeenCalledTimes(1);
+		value.session.dispose();
+	});
+
 for (const field of ["hashKind", "hash", "bytes"] as const)
 	test(`raw receipt mismatch (${field}) stays unknown and never cleans or reapplies`, async () => {
 		const value = setup();
@@ -241,6 +294,8 @@ for (const field of ["hashKind", "hash", "bytes"] as const)
 		});
 		await value.session.save();
 		expect(value.session.state.phase).toBe("unknown");
+		expect(value.onSaved).not.toHaveBeenCalled();
+		expect(value.onSaveReceipt).not.toHaveBeenCalled();
 		expect(sessionDirty(value.session.state)).toBe(true);
 		await value.session.save();
 		expect(value.api.commit).toHaveBeenCalledTimes(1);

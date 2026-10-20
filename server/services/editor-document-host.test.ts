@@ -298,13 +298,17 @@ test.each([
 				.where(eq(fileChangeOperations.sourceId, large.result.operationId))
 				.get();
 			if (!row) throw new Error("missing Host evidence");
+			// A stale aggregate label cannot erase the independently recorded, verified
+			// applied effect. Query still uses its receipt, never today's unrelated disk.
 			db.update(fileChangeOperations)
 				.set({ settlement: "applying" })
 				.where(eq(fileChangeOperations.id, row.id))
 				.run();
 			expect(await cold.operation(actor, large.result.operationId)).toMatchObject({
-				status: "uncertain",
+				status: "saved",
+				result: { hash: hash(large.next), diskOutcome: "applied", historyStatus: "complete" },
 			});
+			expect(await readFile(scenarioTarget, "utf8")).toBe("unrelated-current-disk");
 			db.update(fileChangeOperations)
 				.set({ settlement: "settled" })
 				.where(eq(fileChangeOperations.id, row.id))
@@ -336,7 +340,6 @@ test.each([
 const profile = {
 	maxBytes: EDITOR_FILE_MAX_BYTES,
 	createParents: false,
-	cancelledMutationIsUnknown: true,
 };
 async function input(next = Buffer.from("replacement")) {
 	return {
@@ -467,7 +470,7 @@ test.each([
 	else expect((await readFile(target)).length).toBe(0);
 });
 
-test("Host positive short writes complete; cancellation after mutation drains sync/close but remains unknown", async () => {
+test("Host positive short writes complete; cancellation after mutation retains verified applied IO", async () => {
 	await writeFile(target, "original");
 	for (const cancel of [false, true]) {
 		const controller = new AbortController();
@@ -506,9 +509,7 @@ test("Host positive short writes complete; cancellation after mutation drains sy
 		);
 		const request = await input();
 		request.signal = controller.signal;
-		expect(await io.apply(request)).toMatchObject({
-			kind: cancel ? "target_mutation_unknown" : "applied",
-		});
+		expect(await io.apply(request)).toMatchObject({ kind: "applied" });
 		expect(await readFile(target)).toEqual(request.nextBytes);
 		expect(writes).toBe(4);
 		expect(synced && closed).toBe(true);

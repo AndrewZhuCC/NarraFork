@@ -74,7 +74,16 @@ func (d *Dispatcher) Dispatch(
 	switch method {
 	case "system.ping":
 		return map[string]any{"ok": true}, nil
-	case "editor.capabilities", "editor.stage.open", "editor.stage.append", "editor.stage.seal", "editor.stage.abort", "editor.apply", "editor.query":
+	case "editor.capabilities", "editor.stage.open", "editor.stage.append", "editor.stage.seal", "editor.stage.abort", "editor.query":
+		return d.h.EditorDispatch(ctx, method, params)
+	case "editor.apply":
+		var req EditorApplyRequest
+		if err := decodeEditorParams(params, &req); err != nil {
+			return nil, err
+		}
+		if err := d.editorReads.bind(req.Identity); err != nil {
+			return nil, err
+		}
 		return d.h.EditorDispatch(ctx, method, params)
 	case "editor.read.open":
 		var req EditorRawReadPreflight
@@ -150,7 +159,7 @@ func (d *Dispatcher) Dispatch(
 		if d.transfers == nil {
 			return nil, fmt.Errorf("transfers not available")
 		}
-		return d.transfers.Complete(params)
+		return d.transfers.Complete(ctx, params)
 	case "transfer.abort":
 		if d.transfers == nil {
 			return nil, fmt.Errorf("transfers not available")

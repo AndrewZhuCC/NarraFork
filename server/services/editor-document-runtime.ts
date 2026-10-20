@@ -3,20 +3,24 @@ import { lstat } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { EDITOR_FILE_MAX_BYTES, type EditorOperationResult } from "../../shared/editor-document";
-import type { EditorQueryResult } from "../../shared/editor-provider-contracts";
+import {
+	EDITOR_TARGET_QUEUE_FEATURE,
+	type EditorQueryResult,
+} from "../../shared/editor-provider-contracts";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
+import { hasDeviceProtocolFeature } from "./device-connection-service";
 import { RemoteBackend } from "./device-remote-backend";
 import {
 	type EditorDocumentDependencies,
 	EditorDocumentError,
 	EditorDocumentService,
 } from "./editor-document-service";
-import { createEditorFileAtomicIo } from "./editor-file-atomic-io";
+import { createEditorFileAtomicIo, validateEditorApplyResult } from "./editor-file-atomic-io";
 import {
 	EditorHelperSession,
 	editorHostReceiptAvailable,
@@ -32,7 +36,6 @@ import { createFileChangeLocalIo } from "./file-change-local-io";
 import {
 	EditorFileChangeUncertainError,
 	executeEditorFileChange,
-	getCurrentLocalFileChangeRuntime,
 	getDefaultLocalFileChangeRuntime,
 	localFileChangeRuntimeBinding,
 } from "./file-change-runtime";
@@ -88,37 +91,6 @@ async function openEditorReceiptRpc(record: EditorDurableOperation, signal?: Abo
 		throw error;
 	}
 }
-async function acknowledgeEditorReceipt(operationId: string, authorize?: () => Promise<void>) {
-	if (!authorize) return;
-	const record = await editorOperationStore().get(operationId);
-	if (!record) return;
-	const runtime = await getCurrentLocalFileChangeRuntime();
-	// Failed-but-positively-rejected attempts transfer proof too. Unknown executions
-	// are left for the explicit query path, never auto-promoted by this cleanup.
-	if (runtime.evidence.getOperation(record.hostOperationId)?.settlement !== "settled") return;
-	await authorize();
-	const rpc = await openEditorReceiptRpc(record);
-	try {
-		const request = {
-			namespace: record.namespace,
-			resourceKey: record.resourceKey,
-			operationId,
-			requestDigest: record.requestDigest,
-		};
-		const proof = await rpc.call<EditorQueryResult>("editor.query", request);
-		if (!proof.result || proof.outcome !== proof.result.outcome)
-			throw new Error("Terminal editor proof unavailable");
-		const receipt = proof.result;
-		await authorize();
-		runtime.settleEditorReceipt(record, receipt);
-		await withEditorHelperMetadata(rpc, () =>
-			editorOperationStore().markSettled(operationId, receipt),
-		);
-		await rpc.call("editor.query", { ...request, acknowledgeTerminal: true });
-	} finally {
-		await rpc.close();
-	}
-}
 /** Historical export name. Only real remote providers use atomic apply; Host
  * writes are ordinary bounded FD writes with sync/close and verified evidence. */
 export const executeAtomicEditorFileChange: EditorDocumentDependencies["execute"] = async (
@@ -127,6 +99,12 @@ export const executeAtomicEditorFileChange: EditorDocumentDependencies["execute"
 	const { resourceKey, remote } = request;
 	if (remote && !(remote.backend instanceof RemoteBackend))
 		throw new AppError("Unsupported editor backend", 503, "EDITOR_PROVIDER_UNSUPPORTED");
+	if (remote && !hasDeviceProtocolFeature(remote.backend.deviceId, EDITOR_TARGET_QUEUE_FEATURE))
+		throw new AppError(
+			"Upgrade the executor: editor.target-queue.v1 is required",
+			503,
+			"EDITOR_PROVIDER_UNSUPPORTED",
+		);
 	if (remote && !hostReceiptStorageAvailable())
 		throw new AppError(
 			"Host durable editor receipt storage unavailable",
@@ -140,9 +118,9 @@ export const executeAtomicEditorFileChange: EditorDocumentDependencies["execute"
 		? createFileChangeLocalIo(undefined, {
 				maxBytes: EDITOR_FILE_MAX_BYTES,
 				createParents: false,
-				cancelledMutationIsUnknown: true,
 			})
 		: createEditorFileAtomicIo({
+				deviceId: backend?.deviceId,
 				resourceKey,
 				store: editorOperationStore(),
 				...(remote && backend instanceof RemoteBackend
@@ -174,19 +152,12 @@ export const executeAtomicEditorFileChange: EditorDocumentDependencies["execute"
 		);
 	if (request.workspaceRevision === undefined)
 		throw new AppError("Editor workspace revision unavailable", 409, "EDITOR_IDENTITY_CHANGED");
-	try {
-		return await workspaceContextService.withRevision(
-			request.narratorId,
-			request.workspaceRevision,
-			undefined,
-			run,
-		);
-	} finally {
-		if (remote)
-			await acknowledgeEditorReceipt(request.requestId, request.authorizeReceipt).catch((error) =>
-				logger.debug("Editor engine ACK deferred", { error: String(error) }),
-			);
-	}
+	return workspaceContextService.withRevision(
+		request.narratorId,
+		request.workspaceRevision,
+		undefined,
+		run,
+	);
 };
 
 export function getEditorDocumentService(): EditorDocumentService {
@@ -206,7 +177,11 @@ export function getEditorDocumentService(): EditorDocumentService {
 						return (
 							binding.writeTarget.backend instanceof RemoteBackend &&
 							hostReceiptStorageAvailable() &&
-							binding.writeTarget.backend.supportsEditorDurableWrite
+							binding.writeTarget.backend.supportsEditorDurableWrite &&
+							hasDeviceProtocolFeature(
+								binding.writeTarget.backend.deviceId,
+								EDITOR_TARGET_QUEUE_FEATURE,
+							)
 						);
 					return !binding.rawSource && (!binding.deviceId || binding.deviceId === "local");
 				},
@@ -280,7 +255,7 @@ export const queryEditorOperation: NonNullable<
 	actor.signal?.throwIfAborted();
 	// Probe only the exact historical association names. In particular, Windows
 	// store.get itself may launch a helper, so never call it for a fresh Host save.
-	const legacyQuery = async (): Promise<EditorOperationResult | null> => {
+	const providerQuery = async (): Promise<EditorOperationResult | null> => {
 		if (!/^[a-zA-Z0-9_-]{1,128}$/.test(operationId)) return null;
 		const root =
 			operationStoreContext.getStore()?.root ??
@@ -311,18 +286,19 @@ export const queryEditorOperation: NonNullable<
 				);
 			await actor.authorizeOperation(record.deviceId);
 			if (record.receipt) {
-				try {
-					(await getDefaultLocalFileChangeRuntime()).settleEditorReceipt(record, record.receipt);
-				} catch {
-					await actor.authorizeOperation(record.deviceId);
-					return { status: "uncertain", operationId };
-				}
+				validateEditorApplyResult(record.receipt, record, record.rawDigest, record.bytes);
 				await actor.authorizeOperation(record.deviceId);
 				return record.receipt.outcome === "committed"
 					? {
 							status: "saved",
 							operationId,
-							result: { status: "saved", operationId, ...record.saved },
+							result: {
+								status: "saved",
+								operationId,
+								...record.saved,
+								diskOutcome: "applied",
+								historyStatus: "unavailable",
+							},
 						}
 					: { status: "failed", operationId };
 			}
@@ -346,10 +322,13 @@ export const queryEditorOperation: NonNullable<
 					return { status: "uncertain", operationId };
 				if (!result.result || result.result.outcome !== result.outcome)
 					throw new Error("Missing durable editor receipt");
-				const receipt = result.result;
-				const runtime = await getDefaultLocalFileChangeRuntime();
+				const receipt = validateEditorApplyResult(
+					result.result,
+					record,
+					record.rawDigest,
+					record.bytes,
+				);
 				try {
-					runtime.settleEditorReceipt(record, receipt);
 					await withEditorHelperMetadata(rpc, () =>
 						editorOperationStore().markSettled(operationId, receipt, actor.signal),
 					);
@@ -363,18 +342,23 @@ export const queryEditorOperation: NonNullable<
 						})
 						.catch(() => {});
 				} catch (error) {
-					logger.warn("Editor receipt recovery retains original barrier", {
+					logger.warn("Editor terminal proof acknowledgement deferred", {
 						operationId,
 						error: String(error),
 					});
-					return { status: "uncertain", operationId };
 				}
 				await actor.authorizeOperation(record.deviceId);
 				return result.outcome === "committed"
 					? {
 							status: "saved",
 							operationId,
-							result: { status: "saved", operationId, ...record.saved },
+							result: {
+								status: "saved",
+								operationId,
+								...record.saved,
+								diskOutcome: "applied",
+								historyStatus: "unavailable",
+							},
 						}
 					: { status: "failed", operationId };
 			} finally {
@@ -383,20 +367,15 @@ export const queryEditorOperation: NonNullable<
 		}
 		return null;
 	};
+	// The owned provider receipt is authoritative even when the history DB/blobs are unavailable.
+	const provider = await providerQuery();
+	if (provider) return provider;
 	const [{ db }, { fileChangeOperations }] = await Promise.all([
 		import("../db"),
 		import("../db/schema"),
 	]);
 	const runtime = await getDefaultLocalFileChangeRuntime();
-	const namespace = await runtime.verifyNamespace(actor.signal).catch(async (error) => {
-		// A historical receipt can outlive the Host evidence namespace. It is still
-		// queried only when its exact association exists, never for a new operation.
-		const legacy = await legacyQuery();
-		if (legacy) return legacy;
-		throw error;
-	});
-	if (!("sourceInstanceId" in namespace)) return namespace;
-	// Unique source-instance/kind/id/attempt lookup, never a journal scan.
+	// History availability never determines the truth of an already-observed save.
 	const row = db
 		.select({
 			id: fileChangeOperations.id,
@@ -408,7 +387,8 @@ export const queryEditorOperation: NonNullable<
 		.from(fileChangeOperations)
 		.where(
 			and(
-				eq(fileChangeOperations.sourceInstanceId, namespace.sourceInstanceId),
+				eq(fileChangeOperations.ownerUserId, actor.userId),
+				eq(fileChangeOperations.narratorId, actor.narratorId),
 				eq(fileChangeOperations.sourceKind, "editor"),
 				eq(fileChangeOperations.sourceId, operationId),
 				eq(fileChangeOperations.attempt, 1),
@@ -416,7 +396,7 @@ export const queryEditorOperation: NonNullable<
 		)
 		.get();
 	if (!row) {
-		const legacy = await legacyQuery();
+		const legacy = await providerQuery();
 		if (legacy) return legacy;
 	}
 	if (!row || row.owner !== actor.userId || row.narrator !== actor.narratorId)
@@ -426,7 +406,8 @@ export const queryEditorOperation: NonNullable<
 			404,
 		);
 	const effects = runtime.evidence.listEffects(row.id, { limit: 2 }).items;
-	const deviceId = effects[0]?.identityJson.deviceId ?? "local";
+	const effect = effects.length === 1 ? effects[0] : undefined;
+	const deviceId = effect?.identityJson.deviceId ?? "local";
 	if (actor.authorizeOperation) await actor.authorizeOperation(deviceId);
 	else if (deviceId !== "local")
 		throw new EditorDocumentError(
@@ -434,19 +415,20 @@ export const queryEditorOperation: NonNullable<
 			"Original receipt device authorization unavailable",
 			403,
 		);
-	if (row.settlement !== "settled" || deviceId !== "local") {
-		const legacy = await legacyQuery();
-		if (legacy) return legacy;
-		return { status: "uncertain", operationId };
-	}
-	if (row.status !== "succeeded") return { status: "failed", operationId };
+	const confirmed = effect?.diskOutcome === "applied";
+	// Only a recorded not_applied outcome proves the target was left untouched. An unknown
+	// IO result may already be on disk, so the client must verify instead of discarding.
+	if (!confirmed)
+		return effect?.diskOutcome === "not_applied" && row.settlement === "settled"
+			? { status: "failed", operationId }
+			: { status: "uncertain", operationId };
 	if (
 		!recovery ||
 		recovery.operationId !== operationId ||
 		recovery.userId !== actor.userId ||
 		recovery.narratorId !== actor.narratorId
 	) {
-		const legacy = await legacyQuery();
+		const legacy = await providerQuery();
 		if (legacy) return legacy;
 		return {
 			status: "uncertain",
@@ -458,12 +440,13 @@ export const queryEditorOperation: NonNullable<
 			},
 		};
 	}
-	const after = effects[0]?.observedAfterStateJson;
+	const after = effect?.observedAfterStateJson;
+	const historyAvailable = after?.kind === "regular";
 	if (
-		effects.length !== 1 ||
-		after?.kind !== "regular" ||
-		after.blob.digest !== recovery.rawDigest ||
-		after.blob.sizeBytes !== recovery.bytes
+		!effect ||
+		(after?.kind === "regular"
+			? after.blob.digest !== recovery.rawDigest || after.blob.sizeBytes !== recovery.bytes
+			: !confirmed || after?.kind !== "unknown")
 	)
 		return { status: "uncertain", operationId };
 	return {
@@ -476,6 +459,8 @@ export const queryEditorOperation: NonNullable<
 			hash: recovery.hash,
 			bytes: recovery.bytes,
 			snapshotRevision: recovery.snapshotRevision,
+			diskOutcome: "applied",
+			historyStatus: historyAvailable && row.status === "succeeded" ? "complete" : "unavailable",
 		},
 	};
 };

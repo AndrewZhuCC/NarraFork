@@ -70,41 +70,6 @@ func (e *EditorEngine) verifyIdentity(i EditorResourceIdentity) error {
 	}
 	return nil
 }
-func (e *EditorEngine) fence(req EditorApplyRequest) error {
-	path := filepath.Join(e.root, editorKey(req.Namespace, req.Identity.WorkspaceIdentity)+".fence.json")
-	var prior editorFence
-	err := editorReadJSON(path, &prior)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if os.IsNotExist(err) {
-		dir, err := os.Open(e.root)
-		if err != nil {
-			return err
-		}
-		entries, err := dir.ReadDir(editorMaxStateFiles + 1)
-		dir.Close()
-		if err != nil && err != io.EOF {
-			return err
-		}
-		count := 0
-		for _, entry := range entries {
-			if strings.HasSuffix(entry.Name(), ".fence.json") {
-				count++
-			}
-		}
-		if count >= editorMaxFences || len(entries) > editorMaxStateFiles {
-			return fmt.Errorf("EDITOR_FENCING_REJECTED: active fence inventory quota exceeded")
-		}
-	}
-	if err == nil && (prior.Version != 1 || req.Identity.FencingToken < prior.Token) {
-		return fmt.Errorf("EDITOR_FENCING_REJECTED: stale editor fence")
-	}
-	if err == nil && req.Identity.FencingToken == prior.Token {
-		return nil
-	}
-	return e.save(path, editorFence{Version: 1, Token: req.Identity.FencingToken, Namespace: req.Namespace})
-}
 func editorErrorCode(err error) string {
 	for _, code := range []string{"EDITOR_IDENTITY_CHANGED", "EDITOR_RUNTIME_CHANGED", "EDITOR_FENCING_REJECTED", "EDITOR_STAGE_DIGEST_MISMATCH", "EDITOR_STAGE_SEAL_FAILED", "EDITOR_PROVIDER_UNSUPPORTED"} {
 		if strings.HasPrefix(err.Error(), code+":") {
@@ -115,6 +80,9 @@ func editorErrorCode(err error) string {
 }
 
 func (e *EditorEngine) apply(ctx context.Context, req EditorApplyRequest) (any, error) {
+	if req.Coordination != EditorTargetQueueCoordination {
+		return nil, fmt.Errorf("EDITOR_PROVIDER_UNSUPPORTED: editor.apply requires target-queue-v1 coordination")
+	}
 	if err := editorBinding(req.Namespace, req.ResourceKey); err != nil {
 		return nil, err
 	}
@@ -176,10 +144,23 @@ func (e *EditorEngine) apply(ctx context.Context, req EditorApplyRequest) (any, 
 	if err = e.verifyIdentity(req.Identity); err != nil {
 		return reject(err)
 	}
-	if err = e.fence(req); err != nil {
+	path, err := e.h.guard.CheckCreate(req.Identity.CanonicalPath)
+	if err != nil {
 		return reject(err)
 	}
-	path := req.Identity.CanonicalPath
+	release, err := acquireFileMutation(ctx, path)
+	if err != nil {
+		return reject(err)
+	}
+	// Registered before all handle/temporary cleanup defers: release runs last,
+	// including after native replace, directory sync and durable receipt writes.
+	defer release()
+	if err = e.verifyIdentity(req.Identity); err != nil {
+		return reject(err)
+	}
+	if !samePath(path, req.Identity.CanonicalPath) {
+		return reject(fmt.Errorf("EDITOR_IDENTITY_CHANGED: target changed while waiting for commit"))
+	}
 	parentInfo, err := os.Stat(filepath.Dir(path))
 	if err != nil {
 		return reject(err)
@@ -326,9 +307,6 @@ func (e *EditorEngine) apply(ctx context.Context, req EditorApplyRequest) (any, 
 		return nil, err
 	}
 	if err = check(); err != nil {
-		return reject(err)
-	}
-	if err = e.fence(req); err != nil {
 		return reject(err)
 	}
 	if err = ctx.Err(); err != nil {

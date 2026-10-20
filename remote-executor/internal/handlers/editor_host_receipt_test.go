@@ -19,7 +19,7 @@ func newHostReceiptFixture(t *testing.T) (*editorFixture, *editorHostReceipts) {
 	return f, f.e.hostReceipts
 }
 func hostReceiptFixture(f *editorFixture, id string) EditorHostReceiptRecord {
-	r := EditorHostReceiptRecord{Version: 1, CreatedAt: time.Now().UnixMilli(), UserID: "user", NarratorID: "narrator", DeviceID: f.identity.DeviceID, OperationID: id, HostOperationID: "host-" + id, LeaseID: "lease", EffectID: "effect", RequestDigest: editorDigest([]byte(id)), Namespace: "owner", ResourceKey: "resource", Root: f.root, Identity: f.identity, RawDigest: editorDigest([]byte("saved")), Bytes: 5}
+	r := EditorHostReceiptRecord{Version: 2, CreatedAt: time.Now().UnixMilli(), UserID: "user", NarratorID: "narrator", DeviceID: f.identity.DeviceID, OperationID: id, RequestDigest: editorDigest([]byte(id)), Namespace: "owner", ResourceKey: "resource", Root: f.root, Identity: f.identity, RawDigest: editorDigest([]byte("saved")), Bytes: 5}
 	r.Saved.Hash = r.RawDigest
 	r.Saved.Bytes = r.Bytes
 	r.Saved.HashKind = "raw-sha256"
@@ -34,6 +34,34 @@ func hostReceiptCall(t *testing.T, f *editorFixture, method string, params any) 
 	}
 	return result.(map[string]any)
 }
+func TestEditorHostReceiptV2DoesNotFabricateHistoryOrLease(t *testing.T) {
+	for _, history := range []string{"", "optional-history"} {
+		t.Run(history, func(t *testing.T) {
+			f, _ := newHostReceiptFixture(t)
+			record := hostReceiptFixture(f, "v2")
+			record.HistoryOperationID = history
+			hostReceiptCall(t, f, "editor.hostReceipt.put", map[string]any{"value": record})
+			got := hostReceiptCall(t, f, "editor.hostReceipt.get", map[string]any{"operationId": "v2"})["value"].(*EditorHostReceiptRecord)
+			if got.Version != 2 || got.HistoryOperationID != history {
+				t.Fatal("v2 association changed", got)
+			}
+			encoded, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+			for _, retired := range []string{"leaseId", "effectId", "hostOperationId"} {
+				if _, ok := fields[retired]; ok {
+					t.Fatal("v2 fabricated legacy field", retired)
+				}
+			}
+		})
+	}
+}
+
 func TestEditorHostReceiptRetentionAndUnknownExpiry(t *testing.T) {
 	f, store := newHostReceiptFixture(t)
 	record := hostReceiptFixture(f, "terminal")
@@ -68,10 +96,21 @@ func TestEditorHostReceiptRetentionAndUnknownExpiry(t *testing.T) {
 }
 func TestEditorHostReceiptRejectsUnsafeAssociationAndOversizeIntent(t *testing.T) {
 	f, store := newHostReceiptFixture(t)
-	for _, kind := range []string{"owner", "device", "saved", "v1-invalid-hash", "initial-proof", "future", "oversize", "no-proof-room"} {
+	for _, kind := range []string{"owner", "device", "saved", "v1-invalid-hash", "initial-proof", "future", "oversize", "no-proof-room", "legacy-put", "fake-lease", "fake-effect", "fake-host-operation", "invalid-history"} {
 		t.Run(kind, func(t *testing.T) {
 			record := hostReceiptFixture(f, kind)
 			switch kind {
+			case "legacy-put":
+				record.Version = 1
+				record.HostOperationID, record.LeaseID, record.EffectID = "host", "lease", "effect"
+			case "fake-lease":
+				record.LeaseID = "pretend"
+			case "fake-effect":
+				record.EffectID = "pretend"
+			case "fake-host-operation":
+				record.HostOperationID = "pretend"
+			case "invalid-history":
+				record.HistoryOperationID = strings.Repeat("x", 8193)
 			case "owner":
 				record.UserID = ""
 			case "device":
@@ -112,6 +151,8 @@ func TestEditorHostReceiptV1SavedTextAndRawHashDomains(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f, store := newHostReceiptFixture(t)
 			record := hostReceiptFixture(f, name)
+			record.Version = 1
+			record.HostOperationID, record.LeaseID, record.EffectID = "legacy-host", "legacy-lease", "legacy-effect"
 			record.Saved.HashKind = ""
 			record.Saved.Hash = editorDigest([]byte("ok\n"))
 			record.RawDigest = editorDigest(raw)
@@ -120,7 +161,13 @@ func TestEditorHostReceiptV1SavedTextAndRawHashDomains(t *testing.T) {
 			if record.Saved.Hash == record.RawDigest {
 				t.Fatal("fixture did not separate hash domains")
 			}
-			hostReceiptCall(t, f, "editor.hostReceipt.put", map[string]any{"value": record})
+			if _, err := f.h.EditorHostReceiptDispatch(context.Background(), "editor.hostReceipt.put", editorParams(t, map[string]any{"value": record})); err == nil {
+				t.Fatal("new v1 receipt was admitted")
+			}
+			path, _ := store.path(record.OperationID)
+			if err := store.io.save(path, record); err != nil {
+				t.Fatal(err)
+			}
 			got := hostReceiptCall(t, f, "editor.hostReceipt.get", map[string]any{"operationId": name})["value"].(*EditorHostReceiptRecord)
 			if got.Saved.Hash != record.Saved.Hash || got.RawDigest != record.RawDigest {
 				t.Fatal("v1 hash domains were rewritten")

@@ -2,6 +2,8 @@ package handlers
 
 // Shared by the WebSocket dispatcher and the bounded, credential-free stdio entry.
 const FeatureEditorDurableWriteV1 = "editor.durable-write.v1"
+const FeatureEditorTargetQueueV1 = "editor.target-queue.v1"
+const EditorTargetQueueCoordination = "target-queue-v1"
 const EditorMaxBytes int64 = 20 * 1024 * 1024
 const EditorChunkBytes int64 = 64 * 1024
 
@@ -49,6 +51,7 @@ type EditorStageAbort struct {
 	Reason      string `json:"reason"`
 }
 type EditorApplyRequest struct {
+	Coordination    string                 `json:"coordination,omitempty"`
 	Namespace       string                 `json:"namespace"`
 	ResourceKey     string                 `json:"resourceKey"`
 	OperationID     string                 `json:"operationId"`

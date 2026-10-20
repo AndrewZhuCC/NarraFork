@@ -15,38 +15,29 @@
 import { eq } from "drizzle-orm";
 import type { db as appDb } from "../../../../server/db";
 import {
-	fileChangeScopes,
 	fileChangeStorageBudgets,
 	revertOperationFiles,
 	revertOperations,
-	workspaceWriteLeases,
 } from "../../../../server/db/schema";
-import { generateId } from "../../../../server/lib/id";
 import {
 	FILE_CHANGE_BLOB_BUDGET_ID,
 	FileChangeBlobCatalog,
 } from "../../../../server/services/file-change-blob-catalog";
 import type { FileChangeBlobRelease } from "../../../../server/services/file-change-blob-store";
 import { FileChangeEvidenceService } from "../../../../server/services/file-change-evidence";
-import type { FileChangeScopeIdentity } from "../../../../server/services/file-change-identity";
 import { RevertMutationJournal } from "../../../../server/services/revert-mutation-journal";
 import { RevertPlanService } from "../../../../server/services/revert-plan-service";
-import {
-	createWorkspaceWriteCoordinatorState,
-	WorkspaceWriteCoordinator,
-} from "../../../../server/services/workspace-write-coordinator";
 import type {
 	BlobCatalogFacade,
 	EquivalenceKit,
 	EvidenceFacade,
 	JournalFacade,
 	PlanFacade,
-	WorkspaceLeaseFacade,
 } from "./equivalence-suite";
 
 const NAMESPACE = "equivalence-sqlite";
 const OWNER_EPOCH = "sqlite-epoch-1";
-const RUNTIME = { runtimeEpoch: "sqlite-runtime-epoch", runtimeGeneration: 7 };
+const _RUNTIME = { runtimeEpoch: "sqlite-runtime-epoch", runtimeGeneration: 7 };
 
 let serial = 0;
 
@@ -55,17 +46,11 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 	const evidence = new FileChangeEvidenceService(db);
 	const plans = new RevertPlanService(db, { namespaceKey: NAMESPACE });
 	const journal = new RevertMutationJournal(db, { namespaceKey: NAMESPACE });
-	const coordinator = new WorkspaceWriteCoordinator({
-		db,
-		state: createWorkspaceWriteCoordinatorState(),
-		readRuntime: () => RUNTIME,
-	});
 
 	const blob: BlobCatalogFacade = {
 		getBudget: async () => blobCatalog.getBudget(),
 		initializeNamespace: async (input) => blobCatalog.initializeNamespace(input),
-		beginReconciliation: async (input) => blobCatalog.beginReconciliation(input),
-		completeReconciliation: async (input) => blobCatalog.completeReconciliation(input),
+
 		reserve: async (input) => {
 			const lease = blobCatalog.reserve(input);
 			return {
@@ -76,53 +61,12 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 			};
 		},
 		getMetadata: async (input) => blobCatalog.getMetadata(input),
-		reconcileBlob: async (input) => blobCatalog.reconcileBlob(input),
-	};
-
-	const scopeRow = async (scope: Readonly<FileChangeScopeIdentity>) => {
-		const row = await db.query.fileChangeScopes.findFirst({
-			where: eq(fileChangeScopes.id, scope.id),
-		});
-		if (!row) throw new Error("scope vanished");
-		return row as unknown as Record<string, unknown>;
-	};
-
-	const workspace: WorkspaceLeaseFacade = {
-		runCleanWrite: async (scope, ranges) => {
-			let counterDuringWrite: unknown;
-			await coordinator.withWrite({ scope, runtime: RUNTIME, ranges }, async (lease) => {
-				lease.registerMutation("mutation-1");
-				counterDuringWrite = (await scopeRow(scope)).activeMutationCount;
-				lease.settle("mutation-1", "applied");
-			});
-			return { counterDuringWrite };
-		},
-		runUncertainWrite: async (scope, ranges) => {
-			await coordinator.withWrite({ scope, runtime: RUNTIME, ranges }, async (lease) => {
-				lease.registerMutation("mutation-uncertain");
-				lease.markUncertain();
-			});
-		},
-		admitLease: async (scope) => {
-			await coordinator.withWrite({ scope, runtime: RUNTIME, waitTimeoutMs: 0 }, async () => {});
-		},
-		readLeases: async (scope) =>
-			db
-				.select()
-				.from(workspaceWriteLeases)
-				.where(eq(workspaceWriteLeases.scopeId, scope.id))
-				.all(),
-		readScope: scopeRow,
 	};
 
 	const evidenceFacade: EvidenceFacade = {
 		prepareScope: async (input) => evidence.prepareScope(input),
-		recordScopeVerification: async (input) => evidence.recordScopeVerification(input),
 		beginOperation: async (input) => evidence.beginOperation(input),
-		prepareEffects: async (operationId, inputs) => evidence.prepareEffects(operationId, inputs),
-		finalizePreparation: async (operationId) => evidence.finalizePreparation(operationId),
-		markApplying: async (input) => evidence.markApplying(input),
-		settleEffect: async (input) => evidence.settleEffect(input),
+		recordEffect: async (input) => evidence.recordEffect(input),
 		finishOperation: async (operationId, outcome) => evidence.finishOperation(operationId, outcome),
 		getOperation: async (operationId) => evidence.getOperation(operationId),
 		getEffect: async (operationId, mutationId) => evidence.getEffect(operationId, mutationId),
@@ -136,10 +80,10 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 
 	const journalFacade: JournalFacade = {
 		startExecution: async (ctx, proof) => journal.startExecution(ctx, proof),
-		claimApply: async (ctx, fixed, lease) => journal.claimApply(ctx, fixed, lease),
-		recordApplyReceipt: async (ctx, fileId, receipt) =>
-			journal.recordApplyReceipt(ctx, fileId, receipt),
-		finishFiles: async (ctx) => journal.finishFiles(ctx),
+		startFile: async (ctx, fileId) => journal.startFile(ctx, fileId),
+		recordResult: async (ctx, fileId, result) => journal.recordResult(ctx, fileId, result),
+		finishFiles: async (ctx, options) => journal.finishFiles(ctx, options),
+		failHistory: async (ctx, reason) => journal.failHistory(ctx, reason),
 		commit: async (ctx, probe) =>
 			journal.commit(ctx, {
 				db,
@@ -151,23 +95,16 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 						.run();
 				},
 			}),
-		beginCompensation: async (ctx) => journal.beginCompensation(ctx),
-		claimCompensate: async (ctx, fixed, lease) => journal.claimCompensate(ctx, fixed, lease),
-		recordCompensateReceipt: async (ctx, fileId, receipt) =>
-			journal.recordCompensateReceipt(ctx, fileId, receipt),
-		finishCompensation: async (ctx) => journal.finishCompensation(ctx),
 	};
 
 	return {
 		blob,
-		workspace,
 		evidence: evidenceFacade,
 		plan,
 		journal: journalFacade,
 		namespaceKey: NAMESPACE,
 		ownerEpoch: OWNER_EPOCH,
-		runtime: RUNTIME,
-		seedVerifiedScope: async (overrides = {}) => {
+		seedScope: async (overrides = {}) => {
 			const n = ++serial;
 			const canonicalRoot = overrides.canonicalRoot ?? `/equiv/${n}`;
 			const workspaceInstanceId = overrides.workspaceInstanceId ?? `workspace-${n}`;
@@ -178,11 +115,6 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 				pathFlavor: "posix",
 				canonicalRoot,
 			});
-			evidence.recordScopeVerification({
-				scopeId: prepared.id,
-				canonicalRoot,
-				rootIdentity: { marker: "verified" },
-			});
 			return {
 				id: prepared.id,
 				sourceInstanceId: prepared.sourceInstanceId,
@@ -191,27 +123,6 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 				pathFlavor: prepared.pathFlavor,
 				canonicalRoot: prepared.canonicalRoot,
 			};
-		},
-		seedLeasedScope: async (scope) => {
-			const current = await db.query.fileChangeScopes.findFirst({
-				where: eq(fileChangeScopes.id, scope.id),
-			});
-			if (!current) throw new Error("scope vanished");
-			const leaseId = `durable-lease-${generateId(6)}`;
-			const fencingToken = current.fencingToken + 1;
-			const revision = current.revision + 1;
-			await db
-				.update(fileChangeScopes)
-				.set({
-					activeLeaseId: leaseId,
-					activeLeaseEpoch: OWNER_EPOCH,
-					activeLeaseStartedAt: new Date().toISOString(),
-					fencingToken,
-					revision,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(fileChangeScopes.id, scope.id));
-			return { revision, fencingToken, leaseId };
 		},
 		fixedFileMetadata: async (planId, fileId) => {
 			const row = await db.query.revertOperationFiles.findFirst({

@@ -3,24 +3,24 @@ import type { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
-	createWorkspaceProcessProbe,
-	runWorkspaceIdentityCommand,
-	type WorkspaceProcessProbeDependencies,
-} from "../../../server/lib/workspace-process-identity";
+	createInstanceProcessProbe,
+	type InstanceProcessProbeDependencies,
+	runInstanceIdentityCommand,
+} from "../../../server/lib/instance-process-identity";
 
 const machine = "1234567890abcdef1234567890abcdef";
 const boot = "12345678-1234-1234-1234-123456789012";
 function stat(pid: number, birth = "98765432198765432") {
 	return `${pid} (name (with) spaces) S ${Array(18).fill("0").join(" ")} ${birth} 0\n`;
 }
-function linux(overrides: Partial<WorkspaceProcessProbeDependencies> = {}) {
+function linux(overrides: Partial<InstanceProcessProbeDependencies> = {}) {
 	const files: Record<string, string> = {
 		"/etc/machine-id": machine,
 		"/proc/sys/kernel/random/boot_id": boot,
 		"/proc/self/stat": stat(12),
 		"/proc/42/stat": stat(42),
 	};
-	const deps: WorkspaceProcessProbeDependencies = {
+	const deps: InstanceProcessProbeDependencies = {
 		platform: "linux",
 		selfPid: 12,
 		read: async (path) => {
@@ -32,7 +32,7 @@ function linux(overrides: Partial<WorkspaceProcessProbeDependencies> = {}) {
 		windowsQuery: async () => null,
 		...overrides,
 	};
-	return { files, deps, probe: createWorkspaceProcessProbe(deps) };
+	return { files, deps, probe: createInstanceProcessProbe(deps) };
 }
 function windows(raw: unknown) {
 	return linux({
@@ -176,12 +176,7 @@ function fakeChild() {
 describe("bounded identity child process", () => {
 	it("accepts bounded stdout on successful close", async () => {
 		const { child, spawnChild } = fakeChild();
-		const result = runWorkspaceIdentityCommand(
-			"test",
-			[],
-			new AbortController().signal,
-			spawnChild,
-		);
+		const result = runInstanceIdentityCommand("test", [], new AbortController().signal, spawnChild);
 		child.stdout.write("ok");
 		child.emit("close", 0);
 		expect(await result).toBe("ok");
@@ -189,12 +184,7 @@ describe("bounded identity child process", () => {
 	});
 	it("caps combined stdout/stderr at 64KiB and stops without waiting for child close", async () => {
 		const { child, spawnChild } = fakeChild();
-		const result = runWorkspaceIdentityCommand(
-			"test",
-			[],
-			new AbortController().signal,
-			spawnChild,
-		);
+		const result = runInstanceIdentityCommand("test", [], new AbortController().signal, spawnChild);
 		child.stdout.write(Buffer.alloc(32 * 1024));
 		child.stderr.write(Buffer.alloc(32 * 1024 + 1));
 		expect(await result).toBeNull();
@@ -203,7 +193,7 @@ describe("bounded identity child process", () => {
 	it("a child that never closes is terminated at the hard deadline", async () => {
 		const { child, spawnChild } = fakeChild();
 		const started = performance.now();
-		const result = await runWorkspaceIdentityCommand(
+		const result = await runInstanceIdentityCommand(
 			"test",
 			[],
 			new AbortController().signal,
@@ -217,12 +207,12 @@ describe("bounded identity child process", () => {
 	it("abort and spawn errors are unknown, without inspecting or killing real PIDs", async () => {
 		const { child, spawnChild } = fakeChild();
 		const abort = new AbortController();
-		const result = runWorkspaceIdentityCommand("test", [], abort.signal, spawnChild);
+		const result = runInstanceIdentityCommand("test", [], abort.signal, spawnChild);
 		abort.abort();
 		expect(await result).toBeNull();
 		expect(child.kills).toBe(1);
 		const failed = fakeChild();
-		const next = runWorkspaceIdentityCommand(
+		const next = runInstanceIdentityCommand(
 			"test",
 			[],
 			new AbortController().signal,

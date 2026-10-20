@@ -147,20 +147,23 @@ function narratorState(narratorId: string) {
 	return db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) }).sync();
 }
 
-/**
- * Only the rollback planner is stubbed: history/COW/SQL and file compensation are
- * real. M0 refuses legacy evidence, so these tests must not manufacture tree hashes
- * to pretend the legacy planner has trustworthy ownership evidence.
- */
+/** File execution is the seam; all message selection, COW and SQL below are real. */
+async function appliedTestFiles(paths: string[]): Promise<snapshotRevert.RevertResult> {
+	for (const path of paths) await Bun.write(path, "base\n");
+	return {
+		...snapshotRevert.emptyRevertResult(),
+		planId: generateId(),
+		files: paths.map((filePath) => ({ deviceId: "local", filePath, status: "applied" })),
+	};
+}
 function allowTestRollback(paths: Map<string, string>) {
 	return spyOn(scopedRevert, "revertNarratorScopedForToolUses").mockImplementation(
-		async (narratorId, toolUses) =>
-			snapshotRevert.applyDeviceFileStates(
-				narratorId,
+		async (_narratorId, toolUses) =>
+			appliedTestFiles(
 				toolUses.map(({ toolUseId }) => {
-					const filePath = paths.get(toolUseId);
-					if (!filePath) throw new Error(`Unexpected rollback target: ${toolUseId}`);
-					return { deviceId: "local", filePath, pathFlavor: "posix", content: "base\n" };
+					const path = paths.get(toolUseId);
+					if (!path) throw new Error(`Unexpected rollback target: ${toolUseId}`);
+					return path;
 				}),
 			),
 	);
@@ -867,7 +870,7 @@ describe("fixed block selection and shared-message COW", () => {
 	});
 });
 
-describe("history rollback refusal and transaction compensation", () => {
+describe("history rollback refusal and independent file outcomes", () => {
 	for (const entry of ["messages", "block", "blocks"] as const) {
 		test(`${entry}: unavailable narrator rollback never becomes workspace or replay`, async () => {
 			const { narratorId, cwd } = fixture();
@@ -876,21 +879,18 @@ describe("history rollback refusal and transaction compensation", () => {
 			const path = join(cwd, "human.txt");
 			writeFileSync(path, "user's later bytes\n");
 			addTool(narratorId, messageId, toolUseId, path);
-			const workspace = spyOn(snapshotRevert, "revertForMessagesTree");
-			const replayMessages = spyOn(snapshotRevert, "revertPatchesForMessages");
-			const replayBlock = spyOn(snapshotRevert, "revertPatchForToolUse");
-			const replayBlocks = spyOn(snapshotRevert, "revertPatchForToolUses");
+			const unavailable = snapshotRevert.unavailableSnapshotRevert("history_unavailable", path);
+			spyOn(scopedRevert, "revertNarratorScopedForMessages").mockResolvedValue(unavailable);
+			spyOn(scopedRevert, "revertNarratorScopedForToolUses").mockResolvedValue(unavailable);
+			const restore = spyOn(worktreeTreeSnapshot, "restore");
 			const action =
 				entry === "messages"
 					? narratorService.deleteMessage(narratorId, messageId)
 					: entry === "block"
 						? narratorService.deleteMessageBlock(narratorId, messageId, 0)
 						: narratorService.deleteMessageBlocks(narratorId, [{ messageId, blockIndex: 0 }]);
-			await expect(action).rejects.toThrow(/REVERT_UNAVAILABLE/);
-			expect(workspace).not.toHaveBeenCalled();
-			expect(replayMessages).not.toHaveBeenCalled();
-			expect(replayBlock).not.toHaveBeenCalled();
-			expect(replayBlocks).not.toHaveBeenCalled();
+			await expect(action).rejects.toMatchObject({ result: unavailable });
+			expect(restore).not.toHaveBeenCalled();
 			expect(readFileSync(path, "utf8")).toBe("user's later bytes\n");
 			expect(messageBlocks(messageId)).toEqual([{ type: "tool_use", id: toolUseId }]);
 			expect(narratorState(narratorId)?.messageVersion).toBe(0);
@@ -906,9 +906,9 @@ describe("history rollback refusal and transaction compensation", () => {
 		spyOn(scopedRevert, "revertNarratorScopedForToolUses").mockResolvedValue(
 			null as unknown as snapshotRevert.RevertResult,
 		);
-		await expect(narratorService.deleteMessageBlock(narratorId, messageId, 0)).rejects.toThrow(
-			/REVERT_UNAVAILABLE/,
-		);
+		await expect(
+			narratorService.deleteMessageBlock(narratorId, messageId, 0),
+		).rejects.toMatchObject({ code: "SNAPSHOT_REVERT_FAILED" });
 		expect(messageBlocks(messageId)).toEqual([{ type: "tool_use", id: toolUseId }]);
 	});
 
@@ -917,23 +917,22 @@ describe("history rollback refusal and transaction compensation", () => {
 		const toolUseId = generateId();
 		const messageId = addMessage(narratorId, [{ type: "tool_use", id: toolUseId }]);
 		addTool(narratorId, messageId, toolUseId, join(cwd, "workspace.txt"));
-		const workspace = spyOn(snapshotRevert, "revertForMessagesTree").mockResolvedValue(null);
-		const replay = spyOn(snapshotRevert, "revertPatchesForMessages");
+		const restore = spyOn(worktreeTreeSnapshot, "restore");
+		const scoped = spyOn(scopedRevert, "revertNarratorScopedForMessages");
 		await expect(
 			narratorService.deleteMessage(narratorId, messageId, { scope: "workspace" }),
-		).rejects.toThrow(/REVERT_UNAVAILABLE/);
-		expect(workspace).toHaveBeenCalledTimes(1);
-		expect(replay).not.toHaveBeenCalled();
+		).rejects.toMatchObject({ code: "SNAPSHOT_REVERT_FAILED" });
 		await expect(
 			narratorService.deleteMessageBlocks(narratorId, [{ messageId, blockIndex: 0 }], {
 				scope: "workspace",
 			}),
-		).rejects.toThrow(/REVERT_UNAVAILABLE/);
-		expect(workspace).toHaveBeenCalledTimes(1);
+		).rejects.toMatchObject({ code: "SNAPSHOT_REVERT_FAILED" });
+		expect(restore).not.toHaveBeenCalled();
+		expect(scoped).not.toHaveBeenCalled();
 		expect(messageBlocks(messageId)).toEqual([{ type: "tool_use", id: toolUseId }]);
 	});
 
-	test("SQL failure after the first deletion rolls back every history row and every file", async () => {
+	test("SQL failure retains all history and reports the successful file restores", async () => {
 		const { narratorId, cwd } = fixture();
 		const paths = new Map<string, string>();
 		const selection = [1, 2].map((seq) => {
@@ -947,11 +946,20 @@ describe("history rollback refusal and transaction compensation", () => {
 		});
 		allowTestRollback(paths);
 		failSecondMessageDelete(selection[1].messageId);
-		await expect(narratorService.deleteMessageBlocks(narratorId, selection)).rejects.toThrow(
-			/injected history failure/,
-		);
+		await expect(narratorService.deleteMessageBlocks(narratorId, selection)).rejects.toMatchObject({
+			result: {
+				status: "partial",
+				historyCommitted: false,
+				historyStatus: "unavailable",
+				files: [...paths.values()].map((filePath) => ({
+					deviceId: "local",
+					filePath,
+					status: "applied",
+				})),
+			},
+		});
 		for (const { messageId } of selection) expect(messageBlocks(messageId)).toBeDefined();
-		for (const path of paths.values()) expect(readFileSync(path, "utf8")).toBe("changed\n");
+		for (const path of paths.values()) expect(readFileSync(path, "utf8")).toBe("base\n");
 		expect(
 			db.query.narratorToolCalls
 				.findMany({ where: eq(narratorToolCalls.narratorId, narratorId) })
@@ -961,7 +969,7 @@ describe("history rollback refusal and transaction compensation", () => {
 		expect(narratorState(narratorId)?.apiConversationId).toBe("keep-until-commit");
 	});
 
-	test("a content change during rollback rejects the stale selection and compensates files", async () => {
+	test("a content change rejects the stale selection while retaining successful files", async () => {
 		const { narratorId, cwd } = fixture();
 		const toolUseId = generateId();
 		const messageId = addMessage(narratorId, [
@@ -976,9 +984,7 @@ describe("history rollback refusal and transaction compensation", () => {
 			{ type: "tool_use", id: toolUseId },
 		];
 		spyOn(scopedRevert, "revertNarratorScopedForToolUses").mockImplementation(async () => {
-			const result = await snapshotRevert.applyDeviceFileStates(narratorId, [
-				{ deviceId: "local", filePath: path, content: "base\n" },
-			]);
+			const result = await appliedTestFiles([path]);
 			db.update(narratorMessages)
 				.set({ contentJson: changed })
 				.where(eq(narratorMessages.id, messageId))
@@ -987,9 +993,11 @@ describe("history rollback refusal and transaction compensation", () => {
 		});
 		await expect(
 			narratorService.deleteMessageBlocks(narratorId, [{ messageId, blockIndex: 0 }]),
-		).rejects.toThrow(/history changed/);
+		).rejects.toMatchObject({
+			result: { reason: "HISTORY_DELETE_STALE", historyCommitted: false },
+		});
 		expect(messageBlocks(messageId)).toEqual(changed);
-		expect(readFileSync(path, "utf8")).toBe("changed\n");
+		expect(readFileSync(path, "utf8")).toBe("base\n");
 	});
 
 	test("skipRevert preserves a removed child tool's file evidence as a hidden checkpoint", async () => {
@@ -1233,101 +1241,4 @@ describe("keep-files range snapshot diagnostics", () => {
 			});
 		});
 	}
-});
-
-describe("editor preview is separate from keep-files regeneration", () => {
-	test("an unchanged Bash boundary triggers preview capture but creates no history checkpoint", async () => {
-		const { narratorId, cwd } = fixture();
-		const boundary = addMessage(narratorId, [{ type: "text", text: "user turn" }], 1);
-		const toolUseId = generateId();
-		const tail = addMessage(narratorId, [{ type: "tool_use", id: toolUseId, name: "Bash" }], 2);
-		const path = join(cwd, "kept-workspace.txt");
-		writeFileSync(path, "current workspace bytes\n");
-		const call = addTool(narratorId, tail, toolUseId, path);
-		db.update(narratorToolCalls)
-			.set({
-				toolName: "Bash",
-				inputJson: { command: "read-only fixture" },
-				treeHashBefore: "a".repeat(40),
-				treeHashAfter: "a".repeat(40),
-			})
-			.where(eq(narratorToolCalls.id, call))
-			.run();
-		spyOn(logger, "info").mockImplementation(() => {});
-		spyOn(logger, "warn").mockImplementation(() => {});
-		spyOn(worktreeTreeSnapshot, "hasTree").mockResolvedValue(true);
-		const capture = spyOn(worktreeTreeSnapshot, "capture").mockResolvedValue("b".repeat(40));
-		const hotCapture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
-		spyOn(worktreeTreeSnapshot, "diffPaths").mockResolvedValue(["kept-workspace.txt"]);
-		const restore = spyOn(worktreeTreeSnapshot, "restore");
-		const reverse = spyOn(worktreeTreeSnapshot, "reverseAndRestore");
-
-		// The editor starts this comparison before it knows the user's eventual choice.
-		const preview = await snapshotRevert.previewSeqTreeRevert(narratorId, 1);
-		expect(preview?.files).toHaveLength(1);
-		expect(capture).toHaveBeenCalledTimes(1);
-		expect(hotCapture).not.toHaveBeenCalled();
-
-		await narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true });
-		expect(capture).toHaveBeenCalledTimes(1);
-		expect(restore).not.toHaveBeenCalled();
-		expect(reverse).not.toHaveBeenCalled();
-		expect(readFileSync(path, "utf8")).toBe("current workspace bytes\n");
-		const checkpoints = db
-			.select({ id: narratorToolCalls.id })
-			.from(narratorToolCalls)
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.isFileHistoryCheckpoint, true),
-				),
-			)
-			.all();
-		expect(checkpoints).toHaveLength(0);
-	});
-});
-
-describe("revert-preview timing diagnostics", () => {
-	test("a missing historical boundary does not capture the workspace", async () => {
-		const { narratorId } = fixture();
-		addMessage(narratorId, [{ type: "text", text: "no tools" }], 1);
-		const info = spyOn(logger, "info").mockImplementation(() => {});
-		const capture = spyOn(worktreeTreeSnapshot, "capture");
-		expect(await snapshotRevert.previewSeqTreeRevert(narratorId, 1)).toBeNull();
-		expect(capture).not.toHaveBeenCalled();
-		const timing = info.mock.calls.find(
-			([message]) => message === "Sequence revert preview completed",
-		)?.[1];
-		expect(timing).toMatchObject({ narratorId, minSeq: 1, hasBoundary: false, success: true });
-		expect(timing?.boundaryLookupMs).toBeGreaterThanOrEqual(0);
-	});
-
-	test("a failed preview capture remains read-only and logs its capture phase", async () => {
-		const { narratorId, cwd } = fixture();
-		const toolUseId = generateId();
-		const messageId = addMessage(
-			narratorId,
-			[{ type: "tool_use", id: toolUseId, name: "Bash" }],
-			1,
-		);
-		const call = addTool(narratorId, messageId, toolUseId, join(cwd, "kept.txt"));
-		db.update(narratorToolCalls)
-			.set({ treeHashBefore: "a".repeat(40) })
-			.where(eq(narratorToolCalls.id, call))
-			.run();
-		spyOn(logger, "info").mockImplementation(() => {});
-		const warn = spyOn(logger, "warn").mockImplementation(() => {});
-		spyOn(worktreeTreeSnapshot, "hasTree").mockResolvedValue(true);
-		spyOn(worktreeTreeSnapshot, "capture").mockRejectedValue(
-			new Error("diagnostic capture failure"),
-		);
-		const restore = spyOn(worktreeTreeSnapshot, "restore");
-		expect(await snapshotRevert.previewSeqTreeRevert(narratorId, 1)).toBeNull();
-		expect(restore).not.toHaveBeenCalled();
-		const timing = warn.mock.calls.find(
-			([message]) => message === "Tree revert preview completed",
-		)?.[1];
-		expect(timing).toMatchObject({ narratorId, outcome: "unavailable", captureMode: "structural" });
-		expect((timing?.phaseDurationsMs as Record<string, number>).capture).toBeGreaterThanOrEqual(0);
-	});
 });

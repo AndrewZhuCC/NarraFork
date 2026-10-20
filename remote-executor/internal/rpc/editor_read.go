@@ -71,7 +71,7 @@ func editorTimeout(ms int64) (time.Duration, error) {
 }
 
 func (m *editorReads) verify(identity EditorResourceIdentity) error {
-	if identity.RuntimeEpoch != handlers.EditorRuntimeEpoch() {
+	if identity.RuntimeEpoch != m.h.EditorEpoch() {
 		return fmt.Errorf("EDITOR_RUNTIME_CHANGED: executor epoch changed")
 	}
 	if identity.PathFlavor != handlers.EditorPathFlavor() || identity.DeviceID == "" || identity.RuntimeGeneration < 0 || identity.FencingToken < 0 {
@@ -83,6 +83,23 @@ func (m *editorReads) verify(identity EditorResourceIdentity) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.bindingError(identity)
+}
+
+// bind also admits editor.apply on this connection. The tuple is a real
+// connection identity, not a persistent mutation lease or a numeric ceiling.
+func (m *editorReads) bind(identity EditorResourceIdentity) error {
+	if err := m.verify(identity); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.bindingError(identity); err != nil {
+		return err
+	}
+	if m.binding == nil {
+		m.binding = &identity
+	}
+	return nil
 }
 
 // Caller holds m.mu, including during admission, so concurrent first opens
@@ -108,12 +125,22 @@ func (m *editorReads) open(ctx context.Context, req EditorRawReadPreflight) (any
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancelOpen := context.WithTimeout(ctx, timeout)
+	defer cancelOpen()
 	if req.MaxBytes <= 0 || req.MaxBytes > editorReadMaxBytes || req.ResourceKey == "" {
 		return nil, fmt.Errorf("invalid editor read budget or resource key")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := m.verify(req.Identity); err != nil {
+		return nil, err
+	}
+	release, err := m.h.AcquireEditorFileRead(ctx, req.Identity.CanonicalPath)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if err := m.verify(req.Identity); err != nil {
 		return nil, err
 	}
@@ -298,6 +325,18 @@ func (m *editorReads) chunk(parent context.Context, req EditorRawReadChunkReques
 	if req.Offset != r.offset {
 		return nil, fmt.Errorf("editor chunk offset must equal %d", r.offset)
 	}
+	stopLifetime := context.AfterFunc(r.ctx, cancel)
+	defer stopLifetime()
+	release, err := m.h.AcquireEditorFileRead(ctx, r.open.Identity.CanonicalPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if !success {
+			m.remove(r)
+		}
+		release()
+	}()
 	if err := m.check(r); err != nil {
 		return nil, err
 	}

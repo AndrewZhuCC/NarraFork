@@ -527,7 +527,7 @@ export class RemoteBackend implements ExecutionBackend {
 				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
 				...(opts?.exclusive ? { exclusive: true, timeoutMs: budget?.timeoutMs } : {}),
 			},
-			{ ...budget, requiredFeatures },
+			{ signal: opts?.signal, timeoutMs: opts?.timeoutMs, ...budget, requiredFeatures },
 		);
 	}
 
@@ -562,7 +562,10 @@ export class RemoteBackend implements ExecutionBackend {
 				},
 			)) as { applied: boolean; conflict?: boolean };
 			if (result.conflict)
-				throw new Error("Conditional write conflict: file changed; preview again before retrying");
+				throw Object.assign(
+					new Error("Conditional write conflict: file changed; preview again before retrying"),
+					{ diskOutcome: "conflict" as const },
+				);
 			if (!result.applied) throw new Error("Conditional write returned an invalid result");
 		} catch (error) {
 			if (error instanceof Error && error.message.startsWith("Conditional write conflict:"))

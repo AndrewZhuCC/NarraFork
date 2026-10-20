@@ -66,23 +66,28 @@ export type EditorWorkerRequest =
 			encoding: string;
 			digest: string;
 			hashKind?: "raw-sha256";
-			recovery?: {
-				path: string;
-				userId: string;
-				narratorId: string;
-				operationId: string;
-				snapshotRevision: number;
-			};
 	  }
+	| { action: "recovery"; path: string; metadata: EditorOperationMetadata }
 	| { action: "cleanup"; root: string };
 export type EditorWorkerResult =
 	| { kind: "source"; metadata: EditorVersionMetadata }
 	| { kind: "disk-state"; metadata: EditorVersionMetadata | null }
 	| { kind: "content"; bytes: Uint8Array }
 	| { kind: "sealed"; bytes: number; digest: string }
-	| { kind: "prepared"; nextBytes: Uint8Array; hash: string; bytes: number }
+	| {
+			kind: "prepared";
+			nextBytes: Uint8Array;
+			hash: string;
+			rawDigest: string;
+			beforeRawDigest: string | null;
+			bytes: number;
+	  }
+	| { kind: "recovery"; status: "stored" | "conflict" }
 	| { kind: "conflict"; metadata: EditorVersionMetadata; absent: boolean }
-	| { kind: "cleaned"; operations: EditorOperationMetadata[] };
+	| { kind: "cleaned"; operations: EditorOperationMetadata[]; unavailableRecoveryCount: number };
+
+/** Only recovery publication is injectable; preparation and target IO remain real. */
+export type EditorRecoveryIo = Pick<typeof import("node:fs/promises"), "open" | "link" | "unlink">;
 
 function fail(message: string): never {
 	throw new Error(message);
@@ -196,7 +201,82 @@ async function writeVersion(
 		utf8Bytes: utf8.byteLength,
 	};
 }
-export async function runEditorWorker(request: EditorWorkerRequest): Promise<EditorWorkerResult> {
+async function persistRecovery(
+	request: Extract<EditorWorkerRequest, { action: "recovery" }>,
+	io: EditorRecoveryIo,
+): Promise<EditorWorkerResult> {
+	const { path } = request;
+	const metadata = editorOperationMetadataSchema.parse(request.metadata);
+	const existingStatus = async (): Promise<"stored" | "conflict" | null> => {
+		let bytes: Uint8Array;
+		try {
+			bytes = await boundedRead(path, EDITOR_METADATA_MAX_BYTES);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw error;
+		}
+		let existing: EditorOperationMetadata;
+		try {
+			existing = editorOperationMetadataSchema.parse(
+				JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+			);
+		} catch {
+			// Unreadable optional metadata proves neither an identity nor a content conflict.
+			// Keep it untouched and let the caller report recovery as unavailable.
+			fail("Existing editor recovery description is unreadable or incompatible");
+		}
+		return existing.operationId === metadata.operationId &&
+			existing.userId === metadata.userId &&
+			existing.narratorId === metadata.narratorId &&
+			existing.snapshotRevision === metadata.snapshotRevision &&
+			existing.hash === metadata.hash &&
+			existing.hashKind === metadata.hashKind &&
+			existing.rawDigest === metadata.rawDigest &&
+			existing.bytes === metadata.bytes
+			? "stored"
+			: "conflict";
+	};
+	// A failed temporary-file open must not hide an already-present identity conflict.
+	const existing = await existingStatus();
+	if (existing) return { kind: "recovery", status: existing };
+	const body = new TextEncoder().encode(JSON.stringify(metadata));
+	if (body.byteLength > EDITOR_METADATA_MAX_BYTES)
+		fail("Recovery metadata exceeds its byte budget");
+	const temporary = join(dirname(path), `ed-${metadata.operationId}`);
+	const file = await io.open(temporary, "wx", 0o600);
+	try {
+		await file.writeFile(body);
+		await file.sync();
+		await file.close();
+		try {
+			await io.link(temporary, path); // Exclusive publication; never replace an existing identity.
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const status = await existingStatus();
+			if (status) return { kind: "recovery", status };
+			throw error;
+		}
+	} finally {
+		// Cleanup cannot turn a discovered conflict into a tolerated storage failure.
+		await file.close().catch(() => {});
+		await io.unlink(temporary).catch(() => {});
+	}
+	if (process.platform !== "win32") {
+		const directory = await io.open(dirname(path), constants.O_RDONLY);
+		try {
+			await directory.sync();
+		} finally {
+			await directory.close();
+		}
+	}
+	return { kind: "recovery", status: "stored" };
+}
+
+export async function runEditorWorker(
+	request: EditorWorkerRequest,
+	recoveryIo: EditorRecoveryIo = { open, link, unlink },
+): Promise<EditorWorkerResult> {
+	if (request.action === "recovery") return persistRecovery(request, recoveryIo);
 	if (request.action === "cleanup") {
 		// Startup only, before admitting sessions. Directory inventory and deletion are off-thread.
 		// Cover every session's uploads, conflict and in-flight objects plus recovery receipts.
@@ -206,6 +286,7 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 			EDITOR_MAX_SESSIONS * (EDITOR_MAX_UPLOADS_PER_SESSION + 3) + EDITOR_MAX_OPERATIONS * 2;
 		const dir = await opendir(request.root);
 		let count = 0;
+		let unavailableRecoveryCount = 0;
 		const operations: EditorOperationMetadata[] = [];
 		const users = new Map<string, number>();
 		try {
@@ -214,10 +295,18 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 					fail("Editor orphan inventory exceeds startup budget; maintenance required");
 				const path = join(request.root, entry.name);
 				if (/^ed-[a-f0-9-]+\.json$/.test(entry.name) && entry.isFile()) {
-					const bytes = await boundedRead(path, EDITOR_METADATA_MAX_BYTES);
-					const metadata = editorOperationMetadataSchema.parse(
-						JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
-					);
+					let metadata: EditorOperationMetadata;
+					try {
+						const bytes = await boundedRead(path, EDITOR_METADATA_MAX_BYTES);
+						metadata = editorOperationMetadataSchema.parse(
+							JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+						);
+					} catch {
+						// Keep unknown/old descriptions for inspection, without poisoning startup
+						// or claiming an owned receipt. Operation lookup can still return uncertain.
+						unavailableRecoveryCount++;
+						continue;
+					}
 					if (`ed-${metadata.operationId}.json` !== entry.name)
 						fail("Editor operation metadata identity mismatch");
 					if (metadata.createdAt > Date.now() + 60_000) fail("Invalid editor recovery timestamp");
@@ -245,7 +334,7 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 				/* Async iteration already closed it. */
 			}
 		}
-		return { kind: "cleaned", operations };
+		return { kind: "cleaned", operations, unavailableRecoveryCount };
 	}
 	if (request.action === "disk-state") {
 		// Bounded identity probe only. Never allocates a session; never streams body bytes
@@ -408,65 +497,19 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 			fail("The selected encoding cannot represent all characters losslessly");
 		savedHash = hash(persisted);
 	}
-	if (request.recovery) {
-		const { path, ...recovery } = request.recovery;
-		const metadata = editorOperationMetadataSchema.parse({
-			...recovery,
-			version: 1,
-			...(request.hashKind ? { hashKind: request.hashKind } : {}),
-			hash: savedHash,
-			rawDigest: hash(nextBytes),
-			bytes: nextBytes.byteLength,
-			createdAt: Date.now(),
-		});
-		const body = new TextEncoder().encode(JSON.stringify(metadata));
-		if (body.byteLength > EDITOR_METADATA_MAX_BYTES)
-			fail("Recovery metadata exceeds its byte budget");
-		const temporary = join(dirname(path), `ed-${recovery.operationId}`);
-		const file = await open(temporary, "wx", 0o600);
-		try {
-			await file.writeFile(body);
-			await file.sync();
-			await file.close();
-			try {
-				await link(temporary, path); // Exclusive atomic publication; never replace a recovery record.
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				// The runtime may recapture/reconstruct before dispatch after losing blob history.
-				// Reuse only the same operation and exact output; keep the original creation time.
-				const existing = editorOperationMetadataSchema.parse(
-					JSON.parse(
-						new TextDecoder("utf-8", { fatal: true }).decode(
-							await boundedRead(path, EDITOR_METADATA_MAX_BYTES),
-						),
-					),
-				);
-				if (
-					existing.operationId !== metadata.operationId ||
-					existing.userId !== metadata.userId ||
-					existing.narratorId !== metadata.narratorId ||
-					existing.snapshotRevision !== metadata.snapshotRevision ||
-					existing.hash !== metadata.hash ||
-					existing.hashKind !== metadata.hashKind ||
-					existing.rawDigest !== metadata.rawDigest ||
-					existing.bytes !== metadata.bytes
-				)
-					fail("Recovery metadata does not match this preparation");
-			}
-		} finally {
-			await file.close();
-			await unlink(temporary);
-		}
-		if (process.platform !== "win32") {
-			const directory = await open(dirname(path), constants.O_RDONLY);
-			try {
-				await directory.sync();
-			} finally {
-				await directory.close();
-			}
-		}
-	}
-	return { kind: "prepared", nextBytes, bytes: nextBytes.byteLength, hash: savedHash };
+	return {
+		kind: "prepared",
+		nextBytes,
+		bytes: nextBytes.byteLength,
+		hash: savedHash,
+		rawDigest: request.hashKind === "raw-sha256" ? savedHash : hash(nextBytes),
+		beforeRawDigest:
+			request.before === null
+				? null
+				: request.hashKind === "raw-sha256"
+					? currentHash
+					: hash(request.before),
+	};
 }
 if (parentPort) {
 	const port = parentPort;

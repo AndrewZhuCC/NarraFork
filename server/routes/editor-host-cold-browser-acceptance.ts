@@ -174,8 +174,10 @@ export async function editorHostColdBrowserAcceptance(options: {
 			operations: { id: string }[];
 			helpers: { processes: number };
 			nativeCalls: { apply: number; query: number };
+			faultCounts: { historyFailures: number; droppedReplies: number };
 		};
 		expect(before.operations).toHaveLength(1);
+		expect(before.faultCounts).toEqual({ historyFailures: 0, droppedReplies: 1 });
 		expect(before.nativeCalls).toMatchObject({ apply: 0, query: 0, helperStarts: 0, network: 0 });
 		expect(before.helpers.processes).toBe(0);
 		await stop();
@@ -253,8 +255,9 @@ export async function editorHostColdBrowserAcceptance(options: {
 				reapply: 0,
 			}),
 		);
-		// A separate real Host mutation succeeds at the FD layer, then its first
-		// evidence settlement fails. Never manufacture pending by editing settled SQL.
+		// A separate real Host mutation succeeds at the FD layer, then recording its
+		// effect fails. The successful reply is still delivered; history is not a save gate.
+		// Never manufacture an unproven cold operation by editing settled SQL.
 		const pendingArmed = await fetch(`${origin}/fixture-fault?pending=1`, {
 			method: "POST",
 			headers: { Authorization: `Bearer ${second.token}` },
@@ -270,17 +273,34 @@ export async function editorHostColdBrowserAcceptance(options: {
 				},
 			]),
 		);
-		const pending = await page.evaluate(() =>
-			(window as unknown as RawWindow).rawFixture.saveRaw(),
-		);
-		expect(pending.session?.phase).toBe("unknown");
-		expect(pending.dirty).toBe(true);
+		const [saveResponse, savedWithHistoryGap] = await Promise.all([
+			page.waitForResponse(
+				(response) => response.url().endsWith("/commit") && response.request().method() === "POST",
+				{ timeout: 30_000 },
+			),
+			page.evaluate(() => (window as unknown as RawWindow).rawFixture.saveRaw()),
+		]);
+		expect(saveResponse.ok()).toBe(true);
+		const saveReceipt = (await saveResponse.json()) as {
+			operationId: string;
+			status: string;
+			diskOutcome: string;
+			historyStatus: string;
+		};
+		expect(saveReceipt).toMatchObject({
+			status: "saved",
+			diskOutcome: "applied",
+			historyStatus: "unavailable",
+		});
+		expect(savedWithHistoryGap.session?.phase).toBe("idle");
+		expect(savedWithHistoryGap.dirty).toBe(false);
 		const pendingBytes = Buffer.concat([Buffer.from("Q"), options.original]);
 		expect(hash(await readFile(target))).toBe(hash(pendingBytes));
 		type PendingInfo = {
-			operations: { id: string; settlement: string }[];
+			operations: { id: string; sourceId: string; settlement: string }[];
 			leases: { id: string; status: string }[];
 			nativeCalls: { apply: number; query: number; helperStarts: number; network: number };
+			faultCounts: { historyFailures: number; droppedReplies: number };
 		};
 		const info = async (token: string): Promise<PendingInfo> => {
 			const response = await fetch(`${origin}/fixture-info`, {
@@ -296,8 +316,9 @@ export async function editorHostColdBrowserAcceptance(options: {
 			(operation) => operation.settlement !== "settled",
 		);
 		expect(unresolved).toHaveLength(1);
-		const quarantined = pendingBefore.leases.filter((lease) => lease.status === "quarantined");
-		expect(quarantined).toHaveLength(1);
+		expect(unresolved[0]?.sourceId).toBe(saveReceipt.operationId);
+		expect(pendingBefore.faultCounts).toEqual({ historyFailures: 1, droppedReplies: 0 });
+		expect(pendingBefore.leases).toEqual([]);
 		await stop();
 		const third = await start();
 		expect(third.pid).not.toBe(second.pid);
@@ -306,16 +327,28 @@ export async function editorHostColdBrowserAcceptance(options: {
 			() => (window as unknown as RawWindow).rawFixture.state().connected,
 			{ timeout: 30_000 },
 		);
-		const stillUnknown = await page.evaluate(() =>
-			(window as unknown as RawWindow).rawFixture.reconcileRaw(),
+		const coldQuery = await fetch(
+			`${origin}/api/narrators/${config.narratorId}/editor-operations/${saveReceipt.operationId}`,
+			{
+				headers: { Authorization: `Bearer ${third.token}` },
+				signal: AbortSignal.timeout(5000),
+			},
 		);
-		expect(stillUnknown.session?.phase).toBe("unknown");
-		expect(stillUnknown.dirty).toBe(true);
-		expect(stillUnknown.lifetime).toBe(pending.lifetime);
-		expect(stillUnknown.session?.version).toEqual(pending.session?.version);
-		expect(stillUnknown.session?.baseHash).toBe(hash(edited));
-		// Even identical current disk bytes cannot promote pending evidence or open
-		// the old lease. A save gesture in unknown is query-only, never another apply.
+		expect(coldQuery.ok).toBe(true);
+		const coldReceipt = (await coldQuery.json()) as { status: string; operationId: string };
+		// The old process confirmed the write, but its effect never persisted. A fresh
+		// process cannot infer that proof from matching current bytes or the descriptor.
+		expect(coldReceipt).toMatchObject({
+			status: "uncertain",
+			operationId: saveReceipt.operationId,
+		});
+		const retained = await page.evaluate(() => (window as unknown as RawWindow).rawFixture.state());
+		expect(retained.lifetime).toBe(savedWithHistoryGap.lifetime);
+		expect(retained.session?.version).toEqual(savedWithHistoryGap.session?.version);
+		expect(retained.session?.baseHash).toBe(hash(pendingBytes));
+		expect(retained.dirty).toBe(false);
+		// The already-delivered saved reply remains valid for this live draft. A clean
+		// save gesture and the cold metadata query must not replay the old write.
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.saveRaw());
 		const pendingAfter = await info(third.token);
 		expect(pendingAfter.operations).toEqual(pendingBefore.operations);
@@ -328,10 +361,11 @@ export async function editorHostColdBrowserAcceptance(options: {
 				hostProcesses: [second.pid, third.pid],
 				operations: pendingAfter.operations.length,
 				pendingOperation: unresolved[0]?.id,
-				barrier: quarantined[0]?.id,
-				phase: stillUnknown.session?.phase,
+				savedReply: saveReceipt.status,
+				historyStatus: saveReceipt.historyStatus,
+				coldQueryStatus: coldReceipt.status,
 				sameCurrentDiskDoesNotProveSaved: true,
-				barrierUnchanged: true,
+				noWorkspaceBarrier: pendingAfter.leases.length === 0,
 				reapply: 0,
 				helperStarts: 0,
 				network: 0,

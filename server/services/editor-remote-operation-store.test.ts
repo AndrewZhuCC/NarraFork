@@ -20,15 +20,12 @@ afterEach(async () => {
 const digest = "a".repeat(64);
 function record(id: string): EditorDurableOperation {
 	return {
-		version: 1,
+		version: 2,
 		createdAt: Date.now(),
 		userId: "user",
 		narratorId: "narrator",
 		deviceId: "local",
 		operationId: id,
-		hostOperationId: `host-${id}`,
-		leaseId: `lease-${id}`,
-		effectId: `effect-${id}`,
 		saved: { hash: digest, bytes: 1, snapshotRevision: 1, hashKind: "raw-sha256" },
 		requestDigest: digest,
 		namespace: "owner-source-device",
@@ -64,6 +61,42 @@ test("terminal takeover is a private durable file readable after cold store cons
 	await expect(cold.markSettled("op", committed("different"))).rejects.toThrow("unmatched");
 });
 
+test("v2 has no lease and terminal proof cannot be replaced or replayed", async () => {
+	const store = new EditorRemoteOperationStore(root);
+	await store.put(record("current"));
+	await store.markSettled("current", committed("current"));
+	const saved = await store.get("current");
+	expect(saved).toMatchObject({ version: 2 });
+	for (const field of ["leaseId", "effectId", "hostOperationId"])
+		expect(saved).not.toHaveProperty(field);
+	await expect(store.put(record("current"))).rejects.toThrow("already attempted");
+	await expect(
+		store.markSettled("current", {
+			operationId: "current",
+			outcome: "rejected",
+			rawDigest: null,
+			totalBytes: null,
+		}),
+	).rejects.toThrow("unmatched");
+	expect((await store.get("current"))?.receipt?.outcome).toBe("committed");
+});
+
+test("legacy v1 is readable for query but cannot authorize a new dispatch", async () => {
+	const store = new EditorRemoteOperationStore(root);
+	const legacy = {
+		...record("legacy"),
+		version: 1 as const,
+		leaseId: "old-lease",
+		effectId: "old-effect",
+		hostOperationId: "old-operation",
+	};
+	await writeFile(join(root, "legacy.json"), JSON.stringify(legacy), { mode: 0o600 });
+	expect(await store.get("legacy")).toEqual(legacy);
+	await expect(store.put(legacy)).rejects.toThrow("read-only");
+	await store.markSettled("legacy", committed("legacy"));
+	expect((await store.get("legacy"))?.receipt?.outcome).toBe("committed");
+});
+
 test("pressure releases transferred terminal proof, never pending/unknown sole proof", async () => {
 	const limits = { ...EDITOR_OPERATION_STORE_LIMITS, records: 2 };
 	const store = new EditorRemoteOperationStore(root, limits);
@@ -85,7 +118,11 @@ test("expired unknown remains on disk and cannot become proven-not-executed", as
 		...EDITOR_OPERATION_STORE_LIMITS,
 		ttlMs: 1,
 	});
-	await store.put({ ...record("unknown"), createdAt: Date.now() - 100 });
+	await writeFile(
+		join(root, "unknown.json"),
+		JSON.stringify({ ...record("unknown"), createdAt: Date.now() - 100 }),
+		{ mode: 0o600 },
+	);
 	await expect(store.get("unknown")).rejects.toThrow("expired");
 	expect(await readdir(root)).toContain("unknown.json");
 });

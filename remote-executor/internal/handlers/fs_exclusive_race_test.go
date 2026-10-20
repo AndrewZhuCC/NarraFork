@@ -185,7 +185,7 @@ func TestExclusiveInputAndBudgetGuards(t *testing.T) {
 
 func TestExclusiveWriteBudgetIncludesMutationQueue(t *testing.T) {
 	f := newExclusiveFixture(t)
-	release, err := acquireFileMutation(context.Background())
+	release, err := acquireFileMutation(context.Background(), f.path)
 	if err != nil {
 		t.Fatal(err)
 	}

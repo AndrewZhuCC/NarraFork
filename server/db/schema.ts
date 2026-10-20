@@ -4406,6 +4406,7 @@ export const fileChangeStorageBudgets = sqliteTable(
 		status: text("status", { enum: ["unverified", "reconciling", "ready"] })
 			.notNull()
 			.default("unverified"),
+		/** 64-bit aggregate byte totals; PostgreSQL emits these as bigint(number). */
 		usedBytes: integer("used_bytes").notNull().default(0),
 		reservedBytes: integer("reserved_bytes").notNull().default(0),
 		quotaBytes: integer("quota_bytes").notNull(),
@@ -4558,7 +4559,8 @@ export const fileChangeEffects = sqliteTable(
 			.references(() => fileChangeScopes.id),
 		fileKey: text("file_key").notNull(),
 		identityJson: text("identity_json", { mode: "json" }).$type<FileChangeIdentity>().notNull(),
-		scopeRevision: integer("scope_revision").notNull(),
+		/** Historical v2 scope ordering; v3 uses journalSeq and the actual file state. */
+		scopeRevision: integer("scope_revision"),
 		mutationId: text("mutation_id").notNull(),
 		requestDigest: text("request_digest").notNull(),
 		phase: text("phase", { enum: ["apply", "compensate"] }).notNull(),
@@ -4577,6 +4579,8 @@ export const fileChangeEffects = sqliteTable(
 		observedAfterBlobDigest: text("observed_after_blob_digest").references(
 			() => fileChangeBlobs.digest,
 		),
+		/** v3 records the actual IO result independently of historical receipts. */
+		diskOutcome: text("disk_outcome", { enum: ["applied", "not_applied", "unknown"] }),
 		outcome: text("outcome", { enum: ["pending", "no_change", "changed", "unknown"] })
 			.notNull()
 			.default("pending"),
@@ -4610,6 +4614,13 @@ export const fileChangeEffects = sqliteTable(
 		uniqueIndex("idx_fc_effect_mutation").on(table.mutationId),
 		uniqueIndex("idx_fc_effect_operation_file").on(table.operationId, table.fileKey, table.phase),
 		index("idx_fc_effect_file").on(table.scopeId, table.fileKey, table.scopeRevision, table.id),
+		index("idx_fc_effect_journal").on(
+			table.scopeId,
+			table.fileKey,
+			table.journalSeq,
+			table.scopeRevision,
+			table.id,
+		),
 		index("idx_fc_effect_pending").on(table.settlement, table.updatedAt),
 		index("idx_fc_effect_before_blob").on(table.beforeBlobDigest),
 		index("idx_fc_effect_intended_blob").on(table.intendedAfterBlobDigest),
@@ -4685,6 +4696,8 @@ export const revertOperations = sqliteTable(
 				"applying",
 				"files_verified",
 				"committed",
+				"partial",
+				"failed",
 				"compensating",
 				"compensated",
 				"recovery_required",
@@ -4761,14 +4774,19 @@ export const revertOperationFiles = sqliteTable(
 		),
 		applyMutationId: text("apply_mutation_id").notNull(),
 		applyRequestDigest: text("apply_request_digest").notNull(),
-		compensateMutationId: text("compensate_mutation_id").notNull(),
-		compensateRequestDigest: text("compensate_request_digest").notNull(),
+		/** Retained for historical compensation records. New restores record per-file results. */
+		compensateMutationId: text("compensate_mutation_id"),
+		compensateRequestDigest: text("compensate_request_digest"),
 		status: text("status", {
 			enum: [
 				"prepared",
 				"applying",
 				"applied",
 				"verified",
+				"unchanged",
+				"conflict",
+				"failed",
+				"not_attempted",
 				"compensating",
 				"compensated",
 				"unknown",

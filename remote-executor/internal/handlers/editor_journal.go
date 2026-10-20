@@ -19,10 +19,12 @@ import (
 const editorMaxStages = 32
 const editorMaxStageBytes int64 = 128 * 1024 * 1024
 const editorMaxReceipts = 4096
-const editorMaxFences = 4096
 const editorReceiptCleanupBatch = 16
 const editorReceiptRetention = 7 * 24 * time.Hour
-const editorMaxStateFiles = editorMaxReceipts + editorMaxFences + editorMaxStages*2 + 16
+
+// Preserve bounded scan headroom for retired metadata without interpreting it
+// as admission state or creating any new persistent fences.
+const editorMaxStateFiles = editorMaxReceipts*2 + editorMaxStages*2 + 16
 const editorMaxMetadata = 128 * 1024
 
 // EditorEngine is editor-only: no network, credentials, daemon, or general
@@ -68,11 +70,6 @@ type editorReceipt struct {
 	TemporaryPath     string             `json:"temporaryPath"`
 	TemporaryIdentity string             `json:"temporaryIdentity"`
 	AcknowledgedAt    int64              `json:"acknowledgedAt,omitempty"`
-}
-type editorFence struct {
-	Version   int    `json:"version"`
-	Token     int64  `json:"token"`
-	Namespace string `json:"namespace"`
 }
 
 func editorDigest(b []byte) string     { v := sha256.Sum256(b); return hex.EncodeToString(v[:]) }
@@ -126,26 +123,24 @@ func NewEditorEngine(h *Handlers, root string) (*EditorEngine, error) {
 }
 
 func (e *EditorEngine) lock(ctx context.Context) (func(), error) {
-	release, err := acquireFileMutation(ctx)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	info, err := os.Lstat(e.root)
 	if err != nil || !os.SameFile(e.rootInfo, info) {
-		release()
 		return nil, fmt.Errorf("editor private directory identity changed")
 	}
 	f, err := os.OpenFile(filepath.Join(e.root, "engine.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		release()
 		return nil, err
 	}
 	if err = lockEditorFile(ctx, f); err != nil {
 		f.Close()
-		release()
 		return nil, err
 	}
-	return func() { unlockEditorFile(f); f.Close(); release() }, nil
+	// This kernel lock protects the private journal across processes. It is
+	// deliberately not a file-target queue slot; apply owns that separately.
+	return func() { unlockEditorFile(f); f.Close() }, nil
 }
 
 func editorReadJSON(path string, out any) error {
@@ -295,7 +290,6 @@ func (e *EditorEngine) inventory() (int, int64, int, error) {
 	stages := 0
 	var total int64
 	known := map[string]bool{}
-	unappliedNamespaces := map[string]bool{}
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".stage.json") {
 			continue
@@ -320,30 +314,17 @@ func (e *EditorEngine) inventory() (int, int64, int, error) {
 			}
 			continue
 		}
-		if s.OperationID == "" {
-			unappliedNamespaces[s.Namespace] = true
-		}
 		stages++
 		total += s.MaxBytes // reserve promised bytes, not only uploaded prefix
 	}
-	liveFences := map[string]bool{}
-	for _, receipt := range receipts {
-		liveFences[editorKey(receipt.Request.Namespace, receipt.Request.Identity.WorkspaceIdentity)+".fence.json"] = true
-	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if strings.HasSuffix(name, ".fence.json") && !liveFences[name] {
-			var fence editorFence
-			if err := editorReadJSON(filepath.Join(e.root, name), &fence); err != nil {
-				return 0, 0, 0, err
-			}
-			// A not-yet-dispatched stage can still carry an older fence. Retain
-			// this namespace's ceilings until its bounded stage TTL is resolved.
-			if !unappliedNamespaces[fence.Namespace] {
-				if err := os.Remove(filepath.Join(e.root, name)); err != nil {
-					return 0, 0, 0, err
-				}
-			}
+		// Retired fences carry no authority, even if their contents are corrupt.
+		// Reclaim them under engine.lock without interpreting any token/namespace.
+		if strings.HasSuffix(name, ".fence.json") {
+			// Unremovable legacy garbage must not become a new admission barrier.
+			_ = os.Remove(filepath.Join(e.root, name))
+			continue
 		}
 		if strings.HasPrefix(name, ".metadata-") || strings.HasSuffix(name, ".body") && !known[strings.TrimSuffix(name, ".body")] && !protected[strings.TrimSuffix(name, ".body")] {
 			if err := os.Remove(filepath.Join(e.root, name)); err != nil && !os.IsNotExist(err) {

@@ -1,6 +1,6 @@
 /** Current content/evidence correspondence, never blame or exclusive net-diff ownership. */
 import { createHash } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import {
 	type FileChangeActor,
 	type FileChangeBlobRef,
@@ -98,55 +98,34 @@ export interface CurrentDiffOptions {
 function hash(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
-function incarnation(source: string, root: string, object: string): string {
+function incarnation(source: string, root: string, object?: string): string {
 	const digest = createHash("sha256");
-	for (const part of [source, root, object])
+	for (const part of object === undefined ? [source, root] : [source, root, object])
 		digest.update(`${Buffer.byteLength(part)}:`).update(part);
 	return digest.digest("hex");
 }
 function scopeFor(baseline: CurrentGitBaseline) {
 	if (!baseline.sourceInstanceId) return undefined;
-	const scope = db
+	return db
 		.select()
 		.from(fileChangeScopes)
 		.where(
 			and(
 				eq(fileChangeScopes.sourceInstanceId, baseline.sourceInstanceId),
 				eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
-				eq(
-					fileChangeScopes.workspaceInstanceId,
+				eq(fileChangeScopes.canonicalRoot, baseline.canonicalRoot),
+				inArray(fileChangeScopes.workspaceInstanceId, [
+					incarnation(baseline.sourceInstanceId, baseline.canonicalRoot),
 					incarnation(baseline.sourceInstanceId, baseline.canonicalRoot, baseline.rootIdentity),
-				),
+				]),
 			),
 		)
+		.orderBy(desc(fileChangeScopes.updatedAt), desc(fileChangeScopes.id))
 		.limit(1)
 		.get();
-	if (
-		!scope ||
-		scope.status !== "active" ||
-		scope.canonicalRoot !== baseline.canonicalRoot ||
-		scope.rootIdentityJson?.object !== baseline.rootIdentity ||
-		scope.activeMutationCount !== 0 ||
-		scope.activeLeaseId !== null
-	)
-		return undefined;
-	return scope;
 }
 function scopeVersion(scope: ReturnType<typeof scopeFor>): string {
-	return hash(
-		scope
-			? [
-					scope.id,
-					scope.sourceInstanceId,
-					scope.workspaceInstanceId,
-					scope.revision,
-					scope.fencingToken,
-					scope.activeLeaseId,
-					scope.activeMutationCount,
-					scope.status,
-				]
-			: null,
-	);
+	return hash(scope ? [scope.id, scope.sourceInstanceId, scope.workspaceInstanceId] : null);
 }
 function target(
 	target: CurrentDiffTarget["target"],
@@ -236,7 +215,7 @@ function candidate(
 				sql`length(cast(${fileChangeEffects.beforeStateJson} as blob)) <= ${METADATA_BYTES}`,
 				sql`length(cast(${fileChangeEffects.intendedAfterStateJson} as blob)) <= ${METADATA_BYTES}`,
 				sql`length(cast(${fileChangeEffects.observedAfterStateJson} as blob)) <= ${METADATA_BYTES}`,
-				sql`length(cast(${fileChangeEffects.executionReceiptJson} as blob)) <= ${METADATA_BYTES}`,
+				sql`(${fileChangeEffects.executionReceiptJson} IS NULL OR length(cast(${fileChangeEffects.executionReceiptJson} as blob)) <= ${METADATA_BYTES})`,
 			),
 		)
 		.limit(1)
@@ -301,7 +280,6 @@ function candidate(
 		identity.canonicalPath !== file.canonicalPath ||
 		identity.objectRole !== "referent" ||
 		identity.pathFlavor !== scope.pathFlavor ||
-		row.scopeRevision > scope.revision ||
 		row.phase !== "apply" ||
 		row.outcome !== "changed"
 	)
@@ -318,6 +296,7 @@ function candidate(
 		intendedAfter: row.intendedAfterStateJson,
 		observedAfter: row.observedAfterStateJson,
 		outcome: row.outcome,
+		diskOutcome: row.diskOutcome,
 		settlement: row.settlement,
 		attribution: row.attributionGrade,
 		executionConfirmed: row.executionConfirmed,
@@ -451,6 +430,7 @@ export async function getGitCurrentDiffView(
 					id: fileChangeEffects.id,
 					digest: fileChangeEffects.observedAfterBlobDigest,
 					revision: fileChangeEffects.scopeRevision,
+					journalSeq: fileChangeEffects.journalSeq,
 					settlement: fileChangeEffects.settlement,
 					confirmed: fileChangeEffects.executionConfirmed,
 					grade: fileChangeEffects.attributionGrade,
@@ -458,7 +438,11 @@ export async function getGitCurrentDiffView(
 				})
 				.from(fileChangeEffects)
 				.where(and(eq(fileChangeEffects.scopeId, scope.id), eq(fileChangeEffects.fileKey, fileKey)))
-				.orderBy(desc(fileChangeEffects.scopeRevision), desc(fileChangeEffects.id))
+				.orderBy(
+					desc(fileChangeEffects.journalSeq),
+					desc(fileChangeEffects.scopeRevision),
+					desc(fileChangeEffects.id),
+				)
 				.limit(EFFECT_WINDOW + 1)
 				.all();
 			// Conservative until an exact indexed v2 projection replaces this bounded sample.
@@ -467,7 +451,13 @@ export async function getGitCurrentDiffView(
 					if (result.status !== "clean") result.reason = "history_incomplete";
 				continue;
 			}
-			if (new Set(summaries.map((row) => row.revision)).size !== summaries.length) {
+			if (
+				new Set(
+					summaries.map((row) =>
+						row.journalSeq == null ? `scope:${row.revision}` : `journal:${row.journalSeq}`,
+					),
+				).size !== summaries.length
+			) {
 				for (const result of [entry.index, entry.worktree])
 					if (result.status !== "clean") result.reason = "ambiguous_order";
 				continue;

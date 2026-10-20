@@ -225,3 +225,36 @@ test("file, history, streaming, and retention budgets remain independently bound
 		FILE_CHANGE_LIMITS.planLifetimeMs,
 	);
 });
+
+describe("v3 IO results", () => {
+	test("confirmed applied result uses recorded state without a legacy receipt", () => {
+		expect(
+			hasSettledMeasuredFileEffect(effect({ diskOutcome: "applied", executionReceipt: null })),
+		).toBe(true);
+		expect(
+			hasSettledMeasuredFileEffect(effect({ diskOutcome: "unknown", executionReceipt: null })),
+		).toBe(false);
+		expect(
+			hasSettledMeasuredFileEffect(
+				effect({ diskOutcome: "applied", executionConfirmed: false, executionReceipt: null }),
+			),
+		).toBe(false);
+		expect(
+			hasSettledMeasuredFileEffect(
+				effect({ diskOutcome: "applied", observedAfter: unknown, executionReceipt: null }),
+			),
+		).toBe(false);
+	});
+
+	test("not-applied is operation-local rather than a workspace assertion", () => {
+		const entry = effect({
+			diskOutcome: "not_applied",
+			outcome: "no_change",
+			intendedAfter: before,
+			observedAfter: before,
+			executionReceipt: null,
+		});
+		expect(hasConfirmedNoFileChange(entry)).toBe(true);
+		expect(hasConfirmedNoFileChange({ ...entry, diskOutcome: "unknown" })).toBe(false);
+	});
+});

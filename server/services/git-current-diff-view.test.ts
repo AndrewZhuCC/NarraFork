@@ -50,7 +50,6 @@ import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-chang
 import { gitCurrentBaselineReader } from "./git-current-baseline";
 import { getGitCurrentDiffView } from "./git-current-diff-view";
 import { getWorkspaceModificationView } from "./workspace-modification-view";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 
 let root: string;
 let workspace: string;
@@ -65,7 +64,6 @@ beforeAll(() => {
 	runtime = new LocalFileChangeRuntime({
 		db,
 		privateRoot: getNarraforkHome(),
-		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 });
@@ -176,7 +174,7 @@ async function aiWrite(content: string, path = join(workspace, "a.txt"), cwd = w
 	);
 	expect(result.isError).not.toBe(true);
 	expect(result.metadata?.fileChangeEvidence).toMatchObject({
-		version: 2,
+		version: 3,
 		grade: "measured",
 		settlement: "settled",
 		outcome: "changed",
@@ -215,7 +213,7 @@ async function view() {
 	return getGitCurrentDiffView(workspace, { filePaths: ["a.txt"] });
 }
 
-describe("current Git targets matched against actual v2 writes", () => {
+describe("current Git targets matched against recorded writes", () => {
 	test("real AI Write and editor another hunk name only the latest matching after, not all contributors", async () => {
 		await aiWrite(initial.replace("first: initial", "first: AI"));
 		const ai = await view();
@@ -334,7 +332,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		});
 	});
 
-	test("recreated workspace at the same path and remote device never inherit local evidence", async () => {
+	test("recreated paths remain usable while remote devices keep separate evidence", async () => {
 		await aiWrite("matching bytes\n");
 		expect((await view()).scope).not.toBeNull();
 		await rename(workspace, join(root, "old-workspace"));
@@ -342,8 +340,10 @@ describe("current Git targets matched against actual v2 writes", () => {
 		await git("init", "--initial-branch=main");
 		await writeFile(join(workspace, "a.txt"), "matching bytes\n");
 		const replaced = await view();
-		expect(replaced.scope).toBeNull();
-		expect(replaced.byFile[0]?.worktree.reason).toBe("scope_unknown");
+		expect(replaced.scope).not.toBeNull();
+		expect(replaced.byFile[0]?.worktree.continuity).toBe("unverified");
+		await aiWrite("fresh write in replacement directory\n");
+		expect((await view()).byFile[0]?.worktree.status).toBe("matching_evidence");
 		const snapshot = spyOn(gitCurrentBaselineReader, "snapshot");
 		const remote = await getGitCurrentDiffView(workspace, {
 			deviceId: "not-local",
@@ -379,11 +379,11 @@ describe("current Git targets matched against actual v2 writes", () => {
 		return { effect, store, observed };
 	}
 
-	test("missing execution receipt can never become a matching actor", async () => {
+	test("missing execution result can never become a matching actor", async () => {
 		const { effect } = await matchingRawFixture();
 		await db
 			.update(fileChangeEffects)
-			.set({ executionReceiptJson: null })
+			.set({ executionReceiptJson: null, diskOutcome: null })
 			.where(eq(fileChangeEffects.id, effect.id));
 		try {
 			expect((await view()).byFile[0]?.worktree).toMatchObject({
@@ -393,7 +393,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		} finally {
 			await db
 				.update(fileChangeEffects)
-				.set({ executionReceiptJson: effect.executionReceiptJson })
+				.set({ executionReceiptJson: effect.executionReceiptJson, diskOutcome: effect.diskOutcome })
 				.where(eq(fileChangeEffects.id, effect.id));
 		}
 	});
@@ -523,7 +523,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		expect(current.byFile[0]?.worktree.reason).toBe("cancelled");
 	});
 
-	test("a real applying Write never falls back to earlier measured evidence", async () => {
+	test("a pending write preserves evidence for unchanged indexed bytes", async () => {
 		await aiWrite("previous evidence\n");
 		await git("add", "a.txt");
 		let release!: () => void;
@@ -537,7 +537,6 @@ describe("current Git targets matched against actual v2 writes", () => {
 		const pendingRuntime = new LocalFileChangeRuntime({
 			db,
 			privateRoot: getNarraforkHome(),
-			coordinatorState: createWorkspaceWriteCoordinatorState(),
 			blobStoreOptions: { minimumFreeBytes: 0 },
 			io: {
 				...fileChangeLocalIo,
@@ -556,7 +555,10 @@ describe("current Git targets matched against actual v2 writes", () => {
 		try {
 			await entered;
 			const current = await view();
-			expect(current.byFile[0]?.index).toMatchObject({ status: "unknown", actor: null });
+			expect(current.byFile[0]?.index).toMatchObject({
+				status: "matching_evidence",
+				actor: { narratorId },
+			});
 		} finally {
 			release();
 			await pending;
@@ -608,7 +610,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		expect((await view()).byFile[0]?.worktree.reason).toBe("legacy_or_external");
 	});
 
-	test("repeated effect scope revisions are unknown rather than sorted by nanoid", async () => {
+	test("repeated journal sequences are unknown rather than sorted by nanoid", async () => {
 		await aiWrite("revision one\n");
 		const first = (await view()).byFile[0]?.worktree.effectId;
 		await human("revision two\n");
@@ -621,7 +623,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		if (!row || !next) throw new Error("missing real effects");
 		await db
 			.update(fileChangeEffects)
-			.set({ scopeRevision: row.scopeRevision })
+			.set({ journalSeq: row.journalSeq })
 			.where(eq(fileChangeEffects.id, next));
 		expect((await view()).byFile[0]?.worktree).toMatchObject({
 			status: "unknown",
@@ -629,7 +631,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		});
 	});
 
-	test("a second-pass index or scope revision change invalidates all candidate actors", async () => {
+	test("physical index changes invalidate a view while legacy scope metadata does not", async () => {
 		await aiWrite("initial evidence\n");
 		for (const change of ["index", "scope"] as const) {
 			let calls = 0;
@@ -651,7 +653,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 				}
 				return originalSnapshot(...args);
 			};
-			expect((await view()).baselineStatus).toBe("stale");
+			expect((await view()).baselineStatus).toBe(change === "index" ? "stale" : "stable");
 			gitCurrentBaselineReader.snapshot = originalSnapshot;
 		}
 	});

@@ -2608,9 +2608,9 @@ export const fileChangeStorageBudgets = pgTable(
 		id: text("id").primaryKey().notNull(),
 		namespaceKey: text("namespace_key").notNull(),
 		status: text("status").notNull().default("unverified"),
-		usedBytes: integer("used_bytes").notNull().default(0),
-		reservedBytes: integer("reserved_bytes").notNull().default(0),
-		quotaBytes: integer("quota_bytes").notNull(),
+		usedBytes: bigint("used_bytes", { mode: "number" }).notNull().default(0),
+		reservedBytes: bigint("reserved_bytes", { mode: "number" }).notNull().default(0),
+		quotaBytes: bigint("quota_bytes", { mode: "number" }).notNull(),
 		generation: integer("generation").notNull().default(0),
 		reconciledAt: text("reconciled_at"),
 		updatedAt: text("updated_at").notNull(),
@@ -2746,7 +2746,7 @@ export const fileChangeEffects = pgTable(
 			.references((): PgColumn => fileChangeScopes.id, {}),
 		fileKey: text("file_key").notNull(),
 		identityJson: jsonText("identity_json").notNull(),
-		scopeRevision: integer("scope_revision").notNull(),
+		scopeRevision: integer("scope_revision"),
 		mutationId: text("mutation_id").notNull(),
 		requestDigest: text("request_digest").notNull(),
 		phase: text("phase").notNull(),
@@ -2756,6 +2756,7 @@ export const fileChangeEffects = pgTable(
 		beforeBlobDigest: text("before_blob_digest"),
 		intendedAfterBlobDigest: text("intended_after_blob_digest"),
 		observedAfterBlobDigest: text("observed_after_blob_digest"),
+		diskOutcome: text("disk_outcome"),
 		outcome: text("outcome").notNull().default("pending"),
 		settlement: text("settlement").notNull().default("preparing"),
 		attributionGrade: text("attribution_grade").notNull().default("unknown"),
@@ -2772,6 +2773,13 @@ export const fileChangeEffects = pgTable(
 		uniqueIndex("idx_fc_effect_mutation").on(table.mutationId),
 		uniqueIndex("idx_fc_effect_operation_file").on(table.operationId, table.fileKey, table.phase),
 		index("idx_fc_effect_file").on(table.scopeId, table.fileKey, table.scopeRevision, table.id),
+		index("idx_fc_effect_journal").on(
+			table.scopeId,
+			table.fileKey,
+			table.journalSeq,
+			table.scopeRevision,
+			table.id,
+		),
 		index("idx_fc_effect_pending").on(table.settlement, table.updatedAt),
 		index("idx_fc_effect_before_blob").on(table.beforeBlobDigest),
 		index("idx_fc_effect_intended_blob").on(table.intendedAfterBlobDigest),
@@ -2911,8 +2919,8 @@ export const revertOperationFiles = pgTable(
 		compensationAfterBlobDigest: text("compensation_after_blob_digest"),
 		applyMutationId: text("apply_mutation_id").notNull(),
 		applyRequestDigest: text("apply_request_digest").notNull(),
-		compensateMutationId: text("compensate_mutation_id").notNull(),
-		compensateRequestDigest: text("compensate_request_digest").notNull(),
+		compensateMutationId: text("compensate_mutation_id"),
+		compensateRequestDigest: text("compensate_request_digest"),
 		status: text("status").notNull().default("prepared"),
 		receiptJson: jsonText("receipt_json"),
 		reason: text("reason"),
@@ -3877,7 +3885,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 122,
-  "columnCount": 1714,
+  "columnCount": 1715,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -19501,7 +19509,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "usedBytes",
           "name": "used_bytes",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false,
@@ -19512,7 +19520,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "reservedBytes",
           "name": "reserved_bytes",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false,
@@ -19523,7 +19531,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "quotaBytes",
           "name": "quota_bytes",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false
@@ -20371,7 +20379,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "scope_revision",
           "kind": "integer",
           "pgType": "integer",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false
         },
@@ -20476,6 +20484,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "file_change_effects_observed_after_blob_digest_fi_eb9b90860e_fk"
           },
           "emitAsTableConstraint": true
+        },
+        {
+          "property": "diskOutcome",
+          "name": "disk_outcome",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "outcome",
@@ -20609,6 +20626,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "scopeId",
             "fileKey",
+            "scopeRevision",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_fc_effect_journal",
+          "columns": [
+            "scopeId",
+            "fileKey",
+            "journalSeq",
             "scopeRevision",
             "id"
           ],
@@ -21383,7 +21411,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "compensate_mutation_id",
           "kind": "text",
           "pgType": "text",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false
         },
@@ -21392,7 +21420,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "compensate_request_digest",
           "kind": "text",
           "pgType": "text",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false
         },

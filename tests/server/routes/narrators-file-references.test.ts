@@ -203,6 +203,7 @@ function fixture(
 		fileReferenceRoutes: child,
 		requestRecordingRoutes: new Hono(),
 		requireNarratorAccess: acl,
+		AppError,
 		ValidationError,
 		NotFoundError,
 		parseFileReferenceInput,
@@ -327,7 +328,7 @@ function fixture(
 	app.onError((error) => {
 		// Missing injected bindings are harness bugs, not expected HTTP failures.
 		if (!(error instanceof AppError)) throw error;
-		return Response.json({ error: error.message }, { status: error.statusCode });
+		return Response.json({ error: error.message, code: error.code }, { status: error.statusCode });
 	});
 	app.route("/api/narrators", routes);
 	const request = (path: string, body: unknown, method = "POST", signal?: AbortSignal) =>
@@ -568,6 +569,7 @@ describe("HTTP file reference display boundaries", () => {
 	])("edit acknowledgement cannot expose internal user message snapshots (subagent=%s)", async (subagent) => {
 		const f = fixture({ subagent });
 		const response = await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
 			content: "edited text",
 			fileReferences: [reference],
 		});
@@ -593,6 +595,19 @@ describe("HTTP file reference display boundaries", () => {
 });
 
 describe("file reference edits", () => {
+	test("file restore without a reviewed plan refuses before capture or history interruption", async () => {
+		const f = fixture();
+		const response = await f.request("edit-and-regenerate/message", {
+			content: "changed",
+			fileReferences: [reference],
+		});
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect(f.captures).toHaveLength(0);
+		expect(f.rewrite).not.toHaveBeenCalled();
+		expect(f.edit).not.toHaveBeenCalled();
+	});
+
 	test.each([
 		false,
 		true,
@@ -600,20 +615,33 @@ describe("file reference edits", () => {
 		const f = fixture({ subagent });
 		f.state.captureError = new ValidationError("source was deleted");
 		expect(
-			(await f.request("edit-and-regenerate/message", { content: "", fileReferences: [reference] }))
-				.status,
+			(
+				await f.request("edit-and-regenerate/message", {
+					skipRevert: true,
+					content: "",
+					fileReferences: [reference],
+				})
+			).status,
 		).toBe(200);
 		expect(f.captures).toHaveLength(0);
 		expect(f.edit.mock.calls[0][5]).toMatchObject({ fileReferences: [snapshot()] });
 	});
 	test("message omission preserves, [] deletes, and changed target is recaptured", async () => {
 		const f = fixture();
-		await f.request("edit-and-regenerate/message", { content: "text only" });
+		await f.request("edit-and-regenerate/message", { skipRevert: true, content: "text only" });
 		expect(f.edit.mock.calls[0][5]).toMatchObject({ fileReferences: undefined });
-		await f.request("edit-and-regenerate/message", { content: "text", fileReferences: [] });
+		await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
+			content: "text",
+			fileReferences: [],
+		});
 		expect(f.edit.mock.calls[1][5]).toMatchObject({ fileReferences: [] });
 		const changed = { ...reference, path: "/workspace/b.ts" };
-		await f.request("edit-and-regenerate/message", { content: "text", fileReferences: [changed] });
+		await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
+			content: "text",
+			fileReferences: [changed],
+		});
 		expect(f.captures[0].refs).toEqual([changed]);
 	});
 	test("unknown message refuses before capture or history interruption", async () => {
@@ -621,6 +649,7 @@ describe("file reference edits", () => {
 		expect(
 			(
 				await f.request("edit-and-regenerate/someone-elses-message", {
+					skipRevert: true,
 					content: "",
 					fileReferences: [reference],
 				})
@@ -632,7 +661,11 @@ describe("file reference edits", () => {
 	test("a foreign occurrence ID is captured, not borrowed from another message", async () => {
 		const f = fixture();
 		const other = { ...reference, id: "other-message-occurrence" };
-		await f.request("edit-and-regenerate/message", { content: "", fileReferences: [other] });
+		await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
+			content: "",
+			fileReferences: [other],
+		});
 		expect(f.captures[0].refs).toEqual([other]);
 		expect(f.edit.mock.calls[0][5]).toMatchObject({
 			fileReferences: [snapshot(other, "freshly read bytes")],
@@ -642,6 +675,7 @@ describe("file reference edits", () => {
 		const f = fixture();
 		const form = new FormData();
 		form.set("content", "updated");
+		form.set("skipRevert", "true");
 		form.set("fileReferences", JSON.stringify([{ ...reference, id: "added" }]));
 		f.state.captureError = new ValidationError("Read denied");
 		expect((await f.request("edit-and-regenerate/message", form)).status).toBe(400);
