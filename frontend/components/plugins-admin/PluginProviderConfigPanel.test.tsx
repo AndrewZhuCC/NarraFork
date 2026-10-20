@@ -266,7 +266,8 @@ describe("PluginProviderConfigPanel", () => {
 			(input) => (input as HTMLInputElement).type === "password",
 		) as HTMLInputElement | undefined;
 		expect(password?.value).toBe(SECRET_PLACEHOLDER);
-		expect(container?.innerHTML ?? "").not.toContain("sk-");
+		// Mantine ids are random base36 (`mantine-…sk` + `-label`), so drop them first.
+		expect((container?.innerHTML ?? "").replace(/mantine-[a-z0-9]+/g, "")).not.toContain("sk-");
 	});
 
 	test("sends a prefix change to the prefix endpoint, not the config one", async () => {
