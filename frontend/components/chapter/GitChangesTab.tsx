@@ -635,11 +635,27 @@ function StatusFilterBar({
 			role="group"
 			aria-label={t("filter.label")}
 		>
-			<IconFilter
-				size={12}
-				style={{ flexShrink: 0, opacity: 0.6 }}
-				color={active ? "var(--mantine-color-indigo-4)" : undefined}
-			/>
+			{/*
+			 * The leading filter glyph doubles as the clear control. A separate
+			 * trailing "clear" button only appeared while filtering, and an
+			 * ActionIcon is taller than the chips — the whole bar jumped in height
+			 * every time the filter toggled. One fixed-size slot that only changes
+			 * state keeps the bar's shape identical in both modes.
+			 */}
+			<Tooltip label={active ? t("filter.clear") : t("filter.label")}>
+				<ActionIcon
+					size="sm"
+					variant="subtle"
+					color={active ? "indigo" : "gray"}
+					aria-label={active ? t("filter.clear") : t("filter.label")}
+					aria-pressed={active}
+					disabled={!active}
+					onClick={onClear}
+					style={{ flexShrink: 0 }}
+				>
+					{active ? <IconFilterOff size={12} /> : <IconFilter size={12} />}
+				</ActionIcon>
+			</Tooltip>
 			{chars.map((char) => {
 				const entry = statusRegistry.gitFileStatus(char);
 				const on = selected.has(char);
@@ -669,19 +685,6 @@ function StatusFilterBar({
 					</Badge>
 				);
 			})}
-			{active && (
-				<Tooltip label={t("filter.clear")}>
-					<ActionIcon
-						size="sm"
-						variant="subtle"
-						aria-label={t("filter.clear")}
-						onClick={onClear}
-						style={{ flexShrink: 0 }}
-					>
-						<IconFilterOff size={12} />
-					</ActionIcon>
-				</Tooltip>
-			)}
 		</Group>
 	);
 }

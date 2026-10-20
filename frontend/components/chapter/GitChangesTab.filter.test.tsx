@@ -906,17 +906,38 @@ describe("GitChangesTab status filter", () => {
 		client.clear();
 	});
 
-	test("the clear control appears only while a filter is on", async () => {
+	test("the leading filter icon doubles as the clear control", async () => {
+		// A SEPARATE clear button used to appear next to the chips while filtering.
+		// It was taller than the chips, so the whole bar changed height on every
+		// toggle — the regression this guards. The contract now: the bar holds the
+		// chips plus exactly ONE icon button, and only that button's state changes.
 		const chapterId = "chapter-filter-clear-icon";
 		const client = makeClient();
 		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
 		const container = renderTab(chapterId, client);
 		await flushRender();
 
+		const bar = () => {
+			const group = container.querySelector('[role="group"][aria-label="Filter by file status"]');
+			if (!group) throw new Error("Filter bar missing");
+			return group;
+		};
+		const barButtonCount = () => bar().querySelectorAll("button").length;
+
+		// Inactive: one disabled indicator icon, no clear button anywhere.
+		expect(barButtonCount()).toBe(4); // 3 chips + 1 icon slot
 		expect(container.querySelector('button[aria-label="Clear filter"]')).toBeNull();
+		expect(buttonByLabel(container, "Filter by file status").disabled).toBe(true);
+
 		await click(chipByLetter(container, "A"));
+		// Same button count — nothing was appended — and the icon slot became the
+		// clear control.
+		expect(barButtonCount()).toBe(4);
+		expect(buttonByLabel(container, "Clear filter").disabled).toBe(false);
+
 		await click(buttonByLabel(container, "Clear filter"));
 		expect(chips(container)).toEqual({ A: false, M: false, D: false });
+		expect(barButtonCount()).toBe(4);
 
 		client.clear();
 	});
