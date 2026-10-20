@@ -12,7 +12,7 @@
  * Every mutating probe runs against a FRESH fixture, so one probe cannot change what the next
  * sees. Grants are collection-scoped so nothing leaks into other test files.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, setSystemTime, test } from "bun:test";
 import { Hono } from "hono";
 import { db } from "../../db";
 import { knowledgeTags, users } from "../../db/schema";
@@ -312,6 +312,22 @@ describe("submission detail: visibility and display metadata", () => {
 		expect(d.body.previousSubmissionId).toBe(f.submissionId);
 		const ids = d.body.history.map((h: { id: string }) => h.id);
 		expect(ids).toEqual([next.id, f.submissionId]);
+	});
+
+	test("resubmit rounds in the same millisecond keep the newest round first", async () => {
+		// Freeze the clock so both rounds share one createdAt, as a fast resubmit can.
+		setSystemTime(new Date());
+		let submissionId: string;
+		try {
+			const f = await makeFixture("changes_requested");
+			submissionId = f.submissionId;
+			await knowledgeBranchService.resubmit(principalFor("submitter"), submissionId);
+		} finally {
+			setSystemTime();
+		}
+		const d = await detailVia("submitter", submissionId);
+		const rounds = d.body.history.map((h: { round: number }) => h.round);
+		expect(rounds).toEqual([2, 1]);
 	});
 
 	test("standalone detail names the target collection and has no main", async () => {

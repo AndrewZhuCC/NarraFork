@@ -273,20 +273,29 @@ export async function editorHostColdBrowserAcceptance(options: {
 				},
 			]),
 		);
-		const [saveResponse, savedWithHistoryGap] = await Promise.all([
-			page.waitForResponse(
-				(response) => response.url().endsWith("/commit") && response.request().method() === "POST",
-				{ timeout: 30_000 },
-			),
-			page.evaluate(() => (window as unknown as RawWindow).rawFixture.saveRaw()),
-		]);
-		expect(saveResponse.ok()).toBe(true);
-		const saveReceipt = (await saveResponse.json()) as {
+		type SaveReceipt = {
 			operationId: string;
 			status: string;
 			diskOutcome: string;
 			historyStatus: string;
 		};
+		// Read the body as soon as the response arrives. Chrome may evict a buffered body
+		// while the save's later multi-MiB traffic runs ("No data found for resource").
+		const [saveResult, savedWithHistoryGap] = await Promise.all([
+			page
+				.waitForResponse(
+					(response) =>
+						response.url().endsWith("/commit") && response.request().method() === "POST",
+					{ timeout: 30_000 },
+				)
+				.then(async (response) => ({
+					ok: response.ok(),
+					receipt: (await response.json()) as SaveReceipt,
+				})),
+			page.evaluate(() => (window as unknown as RawWindow).rawFixture.saveRaw()),
+		]);
+		expect(saveResult.ok).toBe(true);
+		const saveReceipt = saveResult.receipt;
 		expect(saveReceipt).toMatchObject({
 			status: "saved",
 			diskOutcome: "applied",
