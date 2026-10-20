@@ -17,6 +17,7 @@ import { createWriteStream, existsSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { urlHost } from "@shared/server-host";
 import { decodeRgbaPng, getBrandIcons } from "../lib/branding";
+import { hasHandoffEnv, takeHandoffEnv } from "../lib/restart-handoff";
 import {
 	BackendProcess,
 	type BackendState,
@@ -1069,19 +1070,30 @@ async function openSettings(): Promise<void> {
 
 // ── 启动 ────────────────────────────────────────────────────────────────────
 
-export async function runManager(): Promise<void> {
+/**
+ * 运行面板。返回 `"serve"` 表示面板无法接手本次更新交接，调用方应改走服务模式自己完成交接。
+ */
+export async function runManager(): Promise<"done" | "serve"> {
 	if (!isNativeAvailable()) {
+		if (hasHandoffEnv()) return "serve";
 		console.error(t("error.nativeUnavailable"));
 		process.exit(1);
 	}
 
 	// 单实例：再次双击 exe 时通知已有托盘进程打开前端，不把隐藏的管理器窗口显示出来。
 	if (!acquireSingleInstanceMutex("Local\\NarraFork.Manager")) {
+		// 更新拉起的替换进程撞上已有面板：已有面板不知道这次交接，旧服务会一直等到看门狗超时。
+		// 直接以服务身份完成交接，保证更新不中断。
+		if (hasHandoffEnv()) return "serve";
 		const existing = findWindowByTitle(WINDOW_TITLE);
 		if (existing) postMessage(existing, WM_OPEN_FRONTEND);
 		else console.error(t("error.alreadyRunning"));
-		return;
+		return "done";
 	}
+
+	// 更新交接的一次性环境变量只给接下来那一个替换子进程；留在 process.env 里会被之后每次
+	// 启动（接管、重启）继承，子进程就会去等一个永远不会出现的交接标记。
+	let pendingHandoff = takeHandoffEnv();
 
 	// 地址与品牌都来自 NarraFork 的 settings；地址的读写与回显由 manager-config 负责。
 	preferences = readPreferences();
@@ -1464,6 +1476,15 @@ export async function runManager(): Promise<void> {
 		});
 	};
 	const launchOnStartup = async (): Promise<void> => {
+		if (pendingHandoff) {
+			// 更新拉起的面板：旧服务还在跑，但它正等着本次替换进程来交接，不是"外部实例"。
+			const handoffEnv = pendingHandoff;
+			pendingHandoff = null;
+			firstProbeDone = true;
+			appendLog("RUN", t("log.updateHandoff"));
+			await backend?.start({ handoffEnv });
+			return;
+		}
 		const alive = await probeServiceHealth(settings.host, settings.port, settings.tls);
 		firstProbeDone = true;
 		if (backend?.current !== "stopped") return;
@@ -1519,4 +1540,5 @@ export async function runManager(): Promise<void> {
 			process.exit(0);
 		}
 	}, 50);
+	return "done";
 }

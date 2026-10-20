@@ -45,10 +45,16 @@ if (parseRevealActivation(process.argv)) {
 	})
 ) {
 	// 图形化管理器不监听端口，所以不做"上一次服务退出等待"。
-	// 真正的服务由管理器以 `--serve` 子进程拉起，那一步会做该等待。
-	await import("./manager/main").then((manager) => manager.runManager());
+	// 真正的服务由管理器以 `--serve` 子进程拉起（更新交接环境只交给第一个子进程），那一步会做该等待。
+	// 管理器接不了这次交接（已有面板实例等）时返回 "serve"，本进程改走服务模式完成交接。
+	const mode = await import("./manager/main").then((manager) => manager.runManager());
+	if (mode === "serve") await runServer();
 } else {
 	// 源码启动（bun run dev / start）以及 `--serve` 子进程走服务模式。
+	await runServer();
+}
+
+async function runServer(): Promise<void> {
 	const handoffOk = await waitForPreviousServerShutdown();
 	if (!handoffOk) {
 		process.exit(1);
