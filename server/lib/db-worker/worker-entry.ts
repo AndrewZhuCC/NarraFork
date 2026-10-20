@@ -1,7 +1,7 @@
 /**
  * Database read-worker entry point.
  *
- * Runs whole-database read tasks (currently the storage-settings scan) on its OWN read-only
+ * Runs heavy read tasks (storage scan, bounded SELECTs, display pages) on its OWN read-only
  * `bun:sqlite` connection, so the seconds-long scans never block the main thread's event loop.
  *
  * ## Import discipline (enforced by a test)
@@ -37,8 +37,7 @@ import type {
 	StorageScanTablesParams,
 	StorageScanTablesResult,
 } from "./protocol";
-import { runSearchQuery } from "./search-query";
-import { runUsageHistoryQuery } from "./usage-history-query";
+import { runSelectRows } from "./select-rows";
 
 declare const self: Worker;
 
@@ -187,27 +186,25 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 					)
 				: params.kind === "displayPageMessages"
 					? runDisplayPageQuery(getConnection(message.dbPath), params)
-					: params.kind === "searchQuery"
-						? runSearchQuery(getConnection(message.dbPath), params)
-						: params.kind === "usageHistoryQuery"
-							? runUsageHistoryQuery(getConnection(message.dbPath), params)
-							: params.kind === "storageScanContext"
-								? runStorageScanContext(message.dbPath)
-								: params.kind === "storageScanSerial"
-									? runStorageScanSerial(
+					: params.kind === "selectRows"
+						? runSelectRows(getConnection(message.dbPath), params)
+						: params.kind === "storageScanContext"
+							? runStorageScanContext(message.dbPath)
+							: params.kind === "storageScanSerial"
+								? runStorageScanSerial(
+										message.dbPath,
+										message.requestId,
+										params.mainBytes,
+										controller.signal,
+									)
+								: params.kind === "storageScanCleanupSummaries"
+									? runStorageScanCleanupSummaries(message.dbPath, params)
+									: runStorageScanTables(
 											message.dbPath,
 											message.requestId,
-											params.mainBytes,
+											params,
 											controller.signal,
-										)
-									: params.kind === "storageScanCleanupSummaries"
-										? runStorageScanCleanupSummaries(message.dbPath, params)
-										: runStorageScanTables(
-												message.dbPath,
-												message.requestId,
-												params,
-												controller.signal,
-											);
+										);
 		post({
 			type: "result",
 			requestId: message.requestId,

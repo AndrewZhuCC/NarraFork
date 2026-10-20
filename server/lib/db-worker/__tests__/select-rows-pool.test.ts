@@ -10,9 +10,10 @@ import {
 	shutdownDbWorkerPool,
 } from "../pool";
 import {
-	SEARCH_QUERY_MAX_BYTES,
-	SEARCH_QUERY_MAX_PARAMS_BYTES,
-	type SearchQueryParams,
+	SELECT_ROWS_MAX_BYTES,
+	SELECT_ROWS_MAX_PARAMS_BYTES,
+	type SelectRowsParams,
+	type SelectRowsResult,
 } from "../protocol";
 
 const SLOW_SQL =
@@ -22,13 +23,16 @@ let dbPath: string;
 let writer: Database;
 let previousConcurrency: string | undefined;
 
-function query(sql: string, params: SearchQueryParams["params"] = [], maxRows = 10_000) {
-	return runReadTask<Record<string, unknown>[]>(dbPath, {
-		kind: "searchQuery",
+async function query(sql: string, params: SelectRowsParams["params"] = [], maxRows = 10_000) {
+	const { columns, rows } = await runReadTask<SelectRowsResult>(dbPath, {
+		kind: "selectRows",
 		sql,
 		params,
 		maxRows,
 	});
+	return rows.map((row) =>
+		Object.fromEntries(columns.map((column, index) => [column, row[index]])),
+	);
 }
 
 beforeEach(() => {
@@ -53,7 +57,7 @@ afterEach(() => {
 	rmSync(home, { recursive: true, force: true });
 });
 
-describe("real search read-worker pool", () => {
+describe("real selectRows read-worker pool", () => {
 	test("cached readonly worker sees new committed WAL data and preserves FTS snippet", async () => {
 		expect(await query("SELECT id, content FROM messages ORDER BY id")).toHaveLength(1);
 		writer.transaction(() => {
@@ -83,15 +87,14 @@ describe("real search read-worker pool", () => {
 
 	test("input/output rejection does not poison the cached worker", async () => {
 		await expect(
-			query("SELECT ? AS value", ["a".repeat(SEARCH_QUERY_MAX_PARAMS_BYTES)]),
+			query("SELECT ? AS value", ["a".repeat(SELECT_ROWS_MAX_PARAMS_BYTES)]),
 		).rejects.toThrow("oversized");
 		await expect(query("SELECT ? AS value", [Infinity])).rejects.toThrow("oversized");
 		await expect(query("SELECT 1; SELECT 2")).rejects.toThrow("oversized");
 		await expect(query("SELECT 1 UNION ALL SELECT 2", [], 1)).rejects.toThrow("row budget");
 		await expect(
-			query("SELECT printf('%.*c', ?, 'x') AS value", [SEARCH_QUERY_MAX_BYTES]),
+			query("SELECT printf('%.*c', ?, 'x') AS value", [SELECT_ROWS_MAX_BYTES + 1]),
 		).rejects.toThrow("byte budget");
-		await expect(query("SELECT x'ff' AS value")).rejects.toThrow("Unexpected");
 		expect(await query("SELECT 42 AS value")).toEqual([{ value: 42 }]);
 		expect(getDbWorkerPoolStats().busy).toBe(0);
 		expect(getDbWorkerPoolStats().queued).toBe(0);
@@ -115,7 +118,7 @@ describe("real search read-worker pool", () => {
 			runReadTask(
 				dbPath,
 				{
-					kind: "searchQuery",
+					kind: "selectRows",
 					sql: SLOW_SQL,
 					params: [10_000_000],
 					maxRows: 1,
@@ -135,7 +138,7 @@ describe("real search read-worker pool", () => {
 		const task = runReadTask(
 			dbPath,
 			{
-				kind: "searchQuery",
+				kind: "selectRows",
 				sql: SLOW_SQL,
 				params: [10_000_000],
 				maxRows: 1,

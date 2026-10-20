@@ -4,6 +4,7 @@ import { apiRequests, chapters, narrators, users } from "@server/db/schema";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
 import { runReadTask } from "@server/lib/db-worker/pool";
+import type { SelectRowsResult } from "@server/lib/db-worker/protocol";
 import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import {
@@ -402,16 +403,20 @@ export class UsageHistoryService {
 		const startedAt = Date.now();
 		const compiled = query.toSQL();
 		try {
-			return await runReadTask<Row[]>(
+			const result = await runReadTask<SelectRowsResult>(
 				this.workerDbPath,
 				{
-					kind: "usageHistoryQuery",
+					kind: "selectRows",
 					sql: compiled.sql,
 					params: compiled.params as (string | number | null)[],
-					columns: Object.keys(query._.selectedFields),
 					maxRows,
 				},
 				{ timeoutMs: 30_000, signal: execution.signal },
+			);
+			// Flat selections only: Drizzle emits fields in key order, so map positionally.
+			const fields = Object.keys(query._.selectedFields);
+			return result.rows.map(
+				(row) => Object.fromEntries(fields.map((field, index) => [field, row[index]])) as Row,
 			);
 		} catch (error) {
 			logger.warn("Usage history aggregation worker failed", {
