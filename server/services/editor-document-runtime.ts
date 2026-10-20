@@ -366,7 +366,9 @@ export const queryEditorOperation: NonNullable<
 					snapshotRevision: intent.snapshotRevision,
 				}
 			: null;
-	if (effect && effect.diskOutcome !== "unknown") {
+	// An applied effect whose intended blob was not recorded (history unavailable) cannot
+	// restore the saved result itself; the executor's exact-op receipt below can.
+	if (effect && effect.diskOutcome !== "unknown" && (saved || effect.diskOutcome !== "applied")) {
 		const result = effectResult(operation, effect, operationId, saved);
 		// Retry only the terminal ACK; an offline executor never downgrades recorded proof.
 		if (result.status !== "uncertain")
