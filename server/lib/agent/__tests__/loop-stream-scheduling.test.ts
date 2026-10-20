@@ -222,8 +222,9 @@ describe("event-driven immediate guidance", () => {
 		});
 	}
 
+	// Urgent guidance keeps the cancelling contract; live guidance below deliberately does not.
 	for (const phase of ["before-first-token", "text", "reasoning", "tool-input"] as const) {
-		test(`cancels a silent provider during ${phase} without retry or whole-run abort`, async () => {
+		test(`urgent guidance cancels a silent provider during ${phase} without retry or whole-run abort`, async () => {
 			const guidance = new AbortController();
 			const parent = new AbortController();
 			script = async function* (params) {
@@ -235,7 +236,7 @@ describe("event-driven immediate guidance", () => {
 				await waitForAbort(params.signal);
 			};
 			const events = await run({
-				guidanceSignal: guidance.signal,
+				urgentGuidanceSignal: guidance.signal,
 				signal: parent.signal,
 				maxTransientRetries: 10,
 			});
@@ -257,7 +258,76 @@ describe("event-driven immediate guidance", () => {
 		});
 	}
 
-	test("preserves running parallel signals and drains every result exactly once", async () => {
+	test("live guidance lets the streaming response finish and stops at its boundary", async () => {
+		const guidance = new AbortController();
+		let providerSignal: AbortSignal | undefined;
+		script = async function* (params) {
+			providerSignal = params.signal;
+			yield { text: "before guidance " };
+			guidance.abort();
+			// Everything below must still be produced: live guidance never truncates output.
+			yield { reasoning: "thinking after guidance", reasoningOutputIndex: 0 };
+			yield { text: "after guidance" };
+		};
+		const events = await run({ guidanceSignal: guidance.signal });
+		expect(attempts).toBe(1);
+		expect(providerSignal?.aborted).toBe(false);
+		expectSuccess(events);
+		const assistant = events.filter((event) => event.type === "assistant_message");
+		expect(assistant).toHaveLength(1);
+		expect(assistant[0]).toMatchObject({ text: "before guidance after guidance" });
+		expect(events.some((e) => e.type === "block_complete" && e.block.type === "reasoning")).toBe(
+			true,
+		);
+		expect(events.at(-1)?.type).toBe("turn_complete");
+	});
+
+	test("live guidance cancels a request that produced no event within the fallback window", async () => {
+		const guidance = new AbortController();
+		const parent = new AbortController();
+		script = async function* (params) {
+			queueMicrotask(() => guidance.abort());
+			// Upstream never speaks: cancelling loses nothing, so the fallback may cut it.
+			await waitForAbort(params.signal);
+		};
+		const events = await run({
+			guidanceSignal: guidance.signal,
+			signal: parent.signal,
+			guidanceFirstEventFallbackMs: 20,
+			maxTransientRetries: 10,
+		});
+		expect(attempts).toBe(1);
+		expect(parent.signal.aborted).toBe(false);
+		expectSuccess(events);
+		// Nothing streamed, so no empty assistant turn is persisted.
+		expect(events.filter((e) => e.type === "assistant_message")).toEqual([]);
+		expect(events.at(-1)?.type).toBe("turn_complete");
+	});
+
+	test("live guidance never cuts a stream that already produced an event", async () => {
+		const guidance = new AbortController();
+		let providerSignal: AbortSignal | undefined;
+		script = async function* (params) {
+			providerSignal = params.signal;
+			yield { reasoning: "already speaking", reasoningOutputIndex: 0 };
+			guidance.abort();
+			// Longer than the fallback window on purpose: once upstream spoke, the window is
+			// disarmed for good, because cutting now would discard output the user can read.
+			await new Promise((resolve) => setTimeout(resolve, 80));
+			expect(params.signal.aborted).toBe(false);
+			yield { text: "late but intact" };
+		};
+		const events = await run({ guidanceSignal: guidance.signal, guidanceFirstEventFallbackMs: 20 });
+		expect(providerSignal?.aborted).toBe(false);
+		expectSuccess(events);
+		expect(
+			events.some(
+				(event) => event.type === "assistant_message" && event.text === "late but intact",
+			),
+		).toBe(true);
+	});
+
+	test("preserves running parallel signals and drops calls guidance reached first", async () => {
 		const guidance = new AbortController();
 		const a = watch("a", true);
 		const b = watch("b", true);
@@ -267,22 +337,26 @@ describe("event-driven immediate guidance", () => {
 			yield { toolUses: [tool("Read", "a", 0), tool("Read", "b", 1), tool("Write", "queued", 2)] };
 			await Promise.all([a.started, b.started]);
 			guidance.abort();
+			// A guidance stop never cancels a running tool body.
 			expect(toolSignals.get("a")?.aborted).toBe(false);
 			expect(toolSignals.get("b")?.aborted).toBe(false);
 			a.release();
 			b.release();
-			await waitForAbort(params.signal);
 		};
 		const events = await run({ guidanceSignal: guidance.signal });
-		expect(providerSignal?.aborted).toBe(true);
+		expect(providerSignal?.aborted).toBe(false);
 		expect(started).toEqual(["a", "b"]);
 		for (const id of ["a", "b"])
 			expect(
 				events.filter((e) => e.type === "tool_result" && e.toolUseId === id && !e.isError),
 			).toHaveLength(1);
-		expect(events.find((e) => e.type === "tool_result" && e.toolUseId === "queued")).toMatchObject({
-			metadata: { skippedForSoftStop: true },
-		});
+		// The call guidance reached before it could start is dropped whole: not run, and no
+		// fabricated "skipped" result standing in for work the model never did.
+		expect(events.filter((e) => e.type === "tool_result" && e.toolUseId === "queued")).toEqual([]);
+		const assistant = events.filter((e) => e.type === "assistant_message");
+		expect(assistant).toHaveLength(1);
+		expect(assistant[0]).toMatchObject({ droppedToolUseIds: ["queued"] });
+		expect(assistant[0]?.type === "assistant_message" && assistant[0].toolUses).toHaveLength(2);
 		expectSuccess(events);
 	});
 
@@ -290,11 +364,10 @@ describe("event-driven immediate guidance", () => {
 		const guidance = new AbortController();
 		const permissionEntered = gate();
 		let permissionSignal: AbortSignal | undefined;
-		script = async function* (params) {
+		script = async function* () {
 			yield { toolUses: [tool("Read", "permission", 0)] };
 			await permissionEntered.promise;
 			guidance.abort();
-			await waitForAbort(params.signal);
 		};
 		const events = await run({
 			guidanceSignal: guidance.signal,
@@ -305,11 +378,14 @@ describe("event-driven immediate guidance", () => {
 				return waitForAbort(options.signal);
 			},
 		});
+		// Revoking preparation is still allowed: the body never began, so nothing is truncated.
 		expect(permissionSignal?.aborted).toBe(true);
 		expect(started).toEqual([]);
 		expect(
 			events.filter((e) => e.type === "tool_result" && e.toolUseId === "permission"),
-		).toHaveLength(1);
+		).toHaveLength(0);
+		const assistant = events.filter((e) => e.type === "assistant_message");
+		expect(assistant[0]).toMatchObject({ droppedToolUseIds: ["permission"] });
 		expectSuccess(events);
 	});
 
@@ -317,12 +393,11 @@ describe("event-driven immediate guidance", () => {
 		const guidance = new AbortController();
 		const beforeEntered = gate();
 		const releaseBefore = gate();
-		script = async function* (params) {
+		script = async function* () {
 			yield { toolUses: [tool("Read", "snapshot", 0)] };
 			await beforeEntered.promise;
 			guidance.abort();
 			releaseBefore.resolve();
-			await waitForAbort(params.signal);
 		};
 		const events = await run({
 			guidanceSignal: guidance.signal,
@@ -334,11 +409,63 @@ describe("event-driven immediate guidance", () => {
 		expect(started).toEqual([]);
 		expect(
 			events.filter((e) => e.type === "tool_result" && e.toolUseId === "snapshot"),
-		).toHaveLength(1);
+		).toHaveLength(0);
 		expectSuccess(events);
 	});
 
-	test("guidance commits matched assistant/tool results to model history", async () => {
+	test("guidance landing while a tool runs drops the calls it reached first", async () => {
+		// Reaches the tool phase with an unstarted call: deferred eager execution (subagents use
+		// it) keeps every call queued until the execution phase, and the response is already
+		// complete — so the turn's `assistant_message` cannot carry the dropped ids and the loop
+		// reports them separately. The outcome must still match the response-boundary case.
+		const guidance = new AbortController();
+		const started: string[] = [];
+		toolRegistry.register({
+			name: "GuidanceDuringTool",
+			description: "Starts the guidance stop from inside its own body",
+			parameters: z.object({ value: z.string() }),
+			execute: async () => {
+				started.push("running");
+				guidance.abort();
+				return { output: "ok:running" };
+			},
+		});
+		const assistantTurns: Parameters<ProviderAdapter["pushAssistantTurn"]>[] = [];
+		const originalAssistant = provider.pushAssistantTurn;
+		provider.pushAssistantTurn = (...args) => {
+			assistantTurns.push(args);
+		};
+		script = async function* () {
+			yield { text: "plan" };
+			yield {
+				toolUses: [tool("GuidanceDuringTool", "running", 0), tool("Write", "untouched", 1)],
+			};
+		};
+		try {
+			const result = await run({
+				guidanceSignal: guidance.signal,
+				deferEagerToolsForSafeStop: true,
+			});
+			expect(started).toEqual(["running"]);
+			expect(result.filter((e) => e.type === "tool_result" && e.toolUseId === "untouched")).toEqual(
+				[],
+			);
+			const dropped = result.filter((e) => e.type === "tool_calls_dropped");
+			expect(dropped).toHaveLength(1);
+			expect(dropped[0]?.type === "tool_calls_dropped" && dropped[0].toolUseIds).toEqual([
+				"untouched",
+			]);
+			// History keeps the reply and the call that ran, never the one that did not.
+			expect(assistantTurns).toHaveLength(1);
+			expect(assistantTurns[0]?.[2]?.map((tu) => tu.toolUseId)).toEqual(["running"]);
+			expectSuccess(result);
+		} finally {
+			provider.pushAssistantTurn = originalAssistant;
+			toolRegistry.unregister("GuidanceDuringTool");
+		}
+	});
+
+	test("guidance commits only the calls that actually ran to model history", async () => {
 		const guidance = new AbortController();
 		const a = watch("history", true);
 		const assistantTurns: Parameters<ProviderAdapter["pushAssistantTurn"]>[] = [];
@@ -351,23 +478,22 @@ describe("event-driven immediate guidance", () => {
 		provider.pushUserTurn = (...args) => {
 			userTurns.push(args);
 		};
-		script = async function* (params) {
+		script = async function* () {
 			yield { text: "partial" };
 			yield { toolUses: [tool("Read", "history", 0), tool("Write", "queued", 1)] };
 			await a.started;
 			guidance.abort();
 			a.release();
-			await waitForAbort(params.signal);
 		};
 		try {
 			await run({ guidanceSignal: guidance.signal });
 			expect(assistantTurns).toHaveLength(1);
 			expect(assistantTurns[0]?.[1]).toBe("partial");
-			expect(assistantTurns[0]?.[2]?.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
+			// The dropped call must not appear as a call the model made and got answered.
+			expect(assistantTurns[0]?.[2]?.map((tu) => tu.toolUseId)).toEqual(["history"]);
 			expect(userTurns).toHaveLength(2);
 			expect(userTurns[1]?.[3]).toEqual([
 				expect.objectContaining({ toolUseId: "history", output: "ok:history", isError: false }),
-				expect.objectContaining({ toolUseId: "queued", isError: true }),
 			]);
 		} finally {
 			provider.pushAssistantTurn = originalAssistant;
@@ -387,9 +513,13 @@ describe("event-driven immediate guidance", () => {
 				yield { toolUses: [tool("Read", "ignores-cancellation", 0), tool("Write", "queued", 1)] };
 				await held.started;
 				if (mode === "urgent-post-stream") return;
-				if (mode === "urgent") urgent.abort();
-				else guidance.abort();
-				await waitForAbort(params.signal);
+				if (mode === "urgent") {
+					urgent.abort();
+					await waitForAbort(params.signal);
+				}
+				// Live guidance no longer cancels the response, so this response ends on its own
+				// and the hard parent abort lands during finalization instead.
+				guidance.abort();
 			};
 			try {
 				const startedAt = Date.now();

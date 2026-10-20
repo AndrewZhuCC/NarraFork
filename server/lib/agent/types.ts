@@ -434,10 +434,31 @@ export type AgentEvent =
 			toolUses: AgentToolUse[];
 			/** Internal persistence receipt for tools missing an incremental block. */
 			onToolPersisted?: (toolUseId: string, binding: ToolCallBinding) => void;
+			/**
+			 * Calls this response streamed but never started, because a guidance stop landed
+			 * before their turn to execute.
+			 *
+			 * They are absent from `toolUses`: they must not run, and they must not enter the
+			 * transcript either. The consumer therefore has to remove the `tool_use` blocks
+			 * that streaming already persisted for them — a `tool_use` block with no
+			 * `tool_result` is rejected by every provider, and a synthetic "skipped" result
+			 * would attribute words to the model it never produced.
+			 */
+			droppedToolUseIds?: string[];
 			messageId?: string;
 			credentialId?: string;
 			/** Source citations for `text`, when the provider reported any. */
 			citations?: import("@shared/citations").TextCitation[];
+	  }
+	/**
+	 * Calls a live-guidance stop reached before they began, discovered after the turn's
+	 * `assistant_message` was already emitted (the stop landed while earlier tools were
+	 * still running). The consumer erases their `tool_use` blocks and rows exactly like
+	 * `assistant_message.droppedToolUseIds` — the same rule, reported later.
+	 */
+	| {
+			type: "tool_calls_dropped";
+			toolUseIds: string[];
 	  }
 	| {
 			type: "stream_text";
@@ -1267,9 +1288,30 @@ export interface AgentConfig {
 	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
-	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
-	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
+	/**
+	 * Event-driven live guidance: fold the queued input into this task at the next safe
+	 * boundary.
+	 *
+	 * Aborting this signal asks the loop to stop, but it deliberately does NOT cancel a
+	 * response that is already streaming: cutting the provider mid-flight truncates the
+	 * text and reasoning the model is producing. Instead the loop stops opening new tool
+	 * calls immediately, lets the running response finish, and ends the turn right after
+	 * it — so everything the user can already see completes, and calls that never began
+	 * are dropped rather than executed. Supply a fresh signal for each loop invocation.
+	 */
 	guidanceSignal?: AbortSignal;
+	/**
+	 * How long a guidance stop tolerates a provider request that has not produced a single
+	 * event before the request is cancelled instead.
+	 *
+	 * This is the only place live guidance may cut a request. Nothing has been streamed yet,
+	 * so the cancel cannot truncate visible output, while the alternative is waiting for the
+	 * much longer transport idle timeout (`firstTokenTimeoutMs` based, minutes). Once ANY
+	 * parsed event arrives the window is disarmed for good: from then on the response is
+	 * allowed to finish even if it stalls, since cutting it would discard model output the
+	 * user is already reading. Defaults to 10_000; `0` disables the fallback.
+	 */
+	guidanceFirstEventFallbackMs?: number;
 	/** Urgent guidance: cancel provider and tool IO, then persist results and soft-stop.
 	 * Unlike signal, this does not mark the whole narrator run as user-interrupted. */
 	urgentGuidanceSignal?: AbortSignal;
