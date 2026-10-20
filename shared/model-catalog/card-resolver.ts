@@ -37,14 +37,19 @@ const limitKeys = [...contextKeys, "max_output_tokens"];
 const longContextKey = (path: string) =>
 	/_above_\d+(?:k)?_tokens/.test(path) ||
 	path.startsWith("long_context_") ||
-	path === "reference_pricing_long_context";
+	path === "reference_pricing_long_context" ||
+	path.startsWith("reference_pricing_long_context.");
 /** Whether a raw key belongs to a field group a weak match is allowed to borrow. */
 export function fieldAllowed(path: string, group: string): boolean {
 	if (path === group || path.startsWith(`${group}.`)) return true;
 	if (group === "limits") return limitKeys.includes(path);
 	if (group === "limits.contextWindow") return contextKeys.includes(path);
 	if (group === "referencePricing") return isRawPriceField(path) || path === "currency";
-	if (group === "referencePricing.longContext") return longContextKey(path);
+	if (group.startsWith("referencePricing.longContext")) return longContextKey(path);
+	if (group === "referencePricing.currency" || group === "referencePricing.unit")
+		return path === "currency";
+	if ((group === "modalities" || group === "modalities.input") && path === "supports_vision")
+		return true;
 	if (group === "reasoning.canDisable" && path === "supports_none_reasoning_effort") return true;
 	if (group === "reasoning" && path === "supports_none_reasoning_effort") return true;
 	return Object.entries(groupKeys).some(

@@ -10,8 +10,11 @@ import {
 	bindModelCatalogSettings,
 	getEffectiveModelProfile,
 	getModelCardSnapshot,
+	legacyWindowProjection,
 	type ModelCatalogSettings,
 	mutateModelCard,
+	normalizeModelCatalogSettings,
+	resolveEffectiveModelCard,
 	settingsForDisk,
 } from "../../../server/lib/model-catalog";
 import { _bindSettings, getDefaults, saveSettings, settings } from "../../../server/lib/settings";
@@ -312,4 +315,71 @@ test("provider-page windows are written into bindings and read back as a view", 
 		max_output_tokens: 4096,
 	});
 	expect(again.agent.modelContextWindows).toEqual({});
+});
+
+test("an old window map never stops startup: clashing or malformed keys are skipped", () => {
+	const stored = getDefaults();
+	stored.agent.modelCatalog = {
+		schemaVersion: 2,
+		migrationVersion: 2,
+		autoApply: false,
+		pinnedVersion: null,
+		local: {
+			revision: 3,
+			bindings: [
+				{
+					id: "editor-binding",
+					providerId: "codex",
+					upstreamModelId: "gpt-5.5",
+					overrides: { max_output_tokens: 1000 },
+				},
+			],
+		},
+	};
+	stored.agent.modelContextWindows = {
+		"codex:gpt-5.5": 150000,
+		"codex:gpt-5.4": "200000",
+	} as unknown as Record<string, number>;
+	expect(() => normalizeModelCatalogSettings(stored)).not.toThrow();
+	const bindings = stored.agent.modelCatalog!.local.bindings!;
+	expect(bindings.find((b) => b.id === "editor-binding")?.overrides).toEqual({
+		max_output_tokens: 1000,
+	});
+	expect(bindings.some((b) => b.id === "legacy-window:codex:gpt-5.5")).toBe(false);
+	expect(stored.agent.modelContextWindows).toEqual({ "codex:gpt-5.4": 200000 });
+
+	// A live save of the same clash is refused with a reason rather than corrupting the layer.
+	bindModelCatalogSettings(stored, () => {});
+	stored.agent.modelContextWindows = { "codex:gpt-5.5": 150000 };
+	expect(() => applyWindowSettings(stored)).toThrow("editor-binding");
+
+	const preCatalog = getDefaults();
+	delete preCatalog.agent.modelCatalog;
+	preCatalog.agent.modelContextWindows = { "codex:gpt-5.5": "120000" } as unknown as Record<
+		string,
+		number
+	>;
+	expect(() => normalizeModelCatalogSettings(preCatalog)).not.toThrow();
+	expect(preCatalog.agent.modelContextWindows).toEqual({ "codex:gpt-5.5": 120000 });
+});
+
+test("a save from a copy taken before a catalog edit applies its window without undoing the edit", () => {
+	const stale = structuredClone(local);
+	patch({ supports_vision: false });
+	stale.agent.modelContextWindows = { "codex:gpt-5.4": 99000 };
+	applyWindowSettings(stale);
+	const live = stale.agent.modelCatalog!.local;
+	expect(live.revision).toBe(revision() + 1);
+	expect(live.models!.find((m) => m.id === "local-image")!.metadata.supports_vision).toBe(false);
+	expect(legacyWindowProjection(live)).toEqual({ "codex:gpt-5.4": 99000 });
+});
+
+test("gateway metadata that contradicts the catalog is ignored rather than failing requests", () => {
+	const query = { upstreamModelId: "gpt-5.5", providerKey: "codex" };
+	const card = resolveEffectiveModelCard(query, { context_window: 1000 });
+	expect(card.metadata.context_window).toBeUndefined();
+	expect(card.metadata.max_output_tokens).toBeGreaterThan(1000);
+	expect(resolveEffectiveModelCard(query, { context_window: 900000 }).metadata.context_window).toBe(
+		900000,
+	);
 });

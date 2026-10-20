@@ -2560,8 +2560,6 @@
 	"traitLayerToggleInherit": "Inherit",
 	"traitLayerToggleOn": "Show",
 	"traitLayerToggleOff": "Hide",
-	"modelCardsTitle": "Model cards",
-	"modelCardsDesc": "A card is a reusable template for one model: context window, max completion tokens, reasoning tiers and official reference prices. Fields left empty inherit NarraFork's builtin values, and only your changes are saved — so untouched fields keep tracking builtin updates across releases.",
 	"modelCardAdd": "Add card",
 	"modelCardEdit": "Edit",
 	"modelCardDelete": "Delete",

@@ -71,6 +71,6 @@ export function resolveModelPricing(model?: string): ResolvedModelPricing | null
 		cacheRead: referencePriceNumber(prices.cacheRead),
 		cacheWrite: referencePriceNumber(prices.cacheWrite),
 		longContext: prices.longContext,
-		provenance: profile.card.provenance,
+		provenance: structuredClone(profile.card.provenance),
 	};
 }

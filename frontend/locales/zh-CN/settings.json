@@ -2562,8 +2562,6 @@
 	"traitLayerToggleInherit": "继承",
 	"traitLayerToggleOn": "显示",
 	"traitLayerToggleOff": "隐藏",
-	"modelCardsTitle": "模型卡",
-	"modelCardsDesc": "一张卡是某个模型的可复用模板：上下文窗口、最大输出 token、思考强度档位与官方参考价。留空的字段沿用 NarraFork 内置值，保存时只写入你改过的部分 —— 未改动的字段会随版本更新跟进内置值。",
 	"modelCardAdd": "新增模型卡",
 	"modelCardEdit": "编辑",
 	"modelCardDelete": "删除",
