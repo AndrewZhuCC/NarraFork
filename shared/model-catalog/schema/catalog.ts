@@ -1,33 +1,19 @@
-/** Public model metadata contract. No instance credentials or billing policy. */
-export const MODEL_CATALOG_SCHEMA_VERSION = 1 as const;
-export type Modality = "text" | "image" | "audio" | "video";
-export interface ReferencePrices {
-	input?: string | null;
-	output?: string | null;
-	cacheRead?: string | null;
-	cacheWrite?: string | null;
-}
-export interface ModelMetadata {
-	limits?: { contextWindow?: number | null; maxOutputTokens?: number | null };
-	modalities?: { input?: Modality[] | null; output?: Modality[] | null };
-	nativeSearch?: { supported?: boolean | null };
-	reasoning?: {
-		supported?: boolean | null;
-		mode?: "levels" | "fixed" | "budget" | "unknown" | null;
-		levels?: string[] | null;
-		canDisable?: boolean | null;
-		defaultLevel?: string | null;
-	};
-	referencePricing?: ReferencePrices & {
-		currency?: "USD";
-		unit?: "perMillionTokens";
-		longContext?: ReferencePrices & {
-			thresholdTokens?: number | null;
-			basis?: "promptTokens";
-			mode?: "full" | "marginal" | null;
-		};
-	};
-}
+/**
+ * Model catalog contract. There is exactly one metadata representation: the open raw
+ * map of source keys (LiteLLM style, e.g. `max_input_tokens`, `input_cost_per_token`).
+ * It is what the public catalog publishes, what settings.json stores, what the runtime
+ * keeps in memory and what every editor patches. Typed reads go through
+ * `../profile`, which derives values and is never stored or converted back.
+ */
+export type JSONValue =
+	| null
+	| boolean
+	| number
+	| string
+	| JSONValue[]
+	| { [key: string]: JSONValue };
+export type RawMetadata = { [key: string]: JSONValue };
+
 export interface MetadataSource {
 	label: string;
 	url?: string;
@@ -39,68 +25,58 @@ export interface MatchRules {
 	aliases?: string[];
 	prefixes?: string[];
 	volatileSuffixes?: boolean;
-	/** Narrow compatibility rules must not silently lend prices to other models. */
+	/** Field groups a weak (prefix/suffix) match may borrow; see `MATCH_FIELD_GROUPS`. */
 	fields?: string[];
 }
-export interface ModelDefinition {
+export type EntryStatus = "verified" | "unverified" | "legacy-unverified" | "deprecated";
+export interface RawModel {
 	id: string;
 	name?: string;
 	vendor?: string;
 	family?: string;
 	notes?: string;
 	matches?: MatchRules;
-	metadata: ModelMetadata;
-	/** Complete source; metadata is the derived v1 compatibility view. v2 storage writes this only. */
-	rawMetadata?: Record<string, unknown>;
-	status?: "verified" | "legacy-unverified" | "deprecated";
+	metadata: RawMetadata;
+	status?: EntryStatus;
 	sources?: MetadataSource[];
 }
-export interface ModelVariant {
-	id: string;
+export interface RawVariant extends RawModel {
 	modelId: string;
 	providerKey: string;
 	upstreamModelIds: string[];
-	name?: string;
-	matches?: MatchRules;
-	metadata: ModelMetadata;
-	/** Complete source; metadata is the derived v1 compatibility view. v2 storage writes this only. */
-	rawMetadata?: Record<string, unknown>;
-	status?: "verified" | "legacy-unverified" | "deprecated";
-	sources?: MetadataSource[];
 }
-export interface CatalogDocument {
-	schemaVersion: 1;
+export interface RawCatalog {
+	schemaVersion: 2;
+	/** Format-qualified storage key; pinning uses sourceVersion, not this key. */
 	catalogVersion: string;
+	sourceVersion: string;
 	publishedAt: string;
-	models: ModelDefinition[];
-	variants: ModelVariant[];
+	models: RawModel[];
+	variants: RawVariant[];
 }
-export interface ModelBinding {
+export interface RawBinding {
 	id: string;
 	providerId?: string;
 	channelId?: string;
 	upstreamModelId: string;
 	modelId?: string;
 	variantId?: string;
-	overrides?: ModelMetadata;
-	/** Read-only original behind the v1 compatibility projection. */
-	rawMetadata?: Record<string, unknown>;
+	overrides?: RawMetadata;
 }
-export interface ModelOverride {
+export interface RawOverride {
 	target: "model" | "variant" | "binding";
 	targetId: string;
-	metadata: ModelMetadata;
-	rawMetadata?: Record<string, unknown>;
+	metadata: RawMetadata;
 	source?: "user" | "legacy-local";
 }
-export interface LocalCatalogState {
+export interface RawLocalState {
 	revision: number;
-	/** Read-only migration provenance, not another value store. */
+	/** Read-only migration provenance, keyed by target:id; edits clear only their own paths. */
 	legacyFields?: Record<string, string[]>;
-	models?: ModelDefinition[];
-	variants?: ModelVariant[];
-	bindings?: ModelBinding[];
-	overrides?: ModelOverride[];
+	models?: RawModel[];
+	variants?: RawVariant[];
+	bindings?: RawBinding[];
+	overrides?: RawOverride[];
 	hiddenModelIds?: string[];
 	hiddenVariantIds?: string[];
 }
@@ -112,40 +88,19 @@ export interface ModelQuery {
 	modelId?: string;
 	variantId?: string;
 }
+export type MetadataLayer =
+	| "default"
+	| "preset-model"
+	| "preset-variant"
+	| "discovered"
+	| "local-model"
+	| "local-variant"
+	| "local-binding";
 export interface FieldSource {
-	layer:
-		| "default"
-		| "preset-model"
-		| "preset-variant"
-		| "discovered"
-		| "local-model"
-		| "local-variant"
-		| "local-binding";
+	layer: MetadataLayer;
 	id?: string;
 	catalogVersion?: string;
 	explicit?: boolean;
 	legacy?: boolean;
 }
-export interface ResolvedModelMetadata {
-	schemaVersion: 1;
-	catalogVersion: string;
-	localRevision: number;
-	modelId?: string;
-	variantId?: string;
-	bindingId?: string;
-	matchedVia: "binding" | "exact" | "alias" | "suffix" | "prefix" | "none";
-	metadata: ModelMetadata;
-	provenance: Record<string, FieldSource>;
-}
-export interface ResolveModelMetadataInput {
-	catalog: CatalogDocument;
-	query: ModelQuery;
-	local?: LocalCatalogState;
-	discovered?: ModelMetadata;
-	defaults?: ModelMetadata;
-}
-export interface MetadataPatch {
-	/** Dot-path leaf values; keys are validated against the metadata contract. */
-	set?: Record<string, unknown>;
-	reset?: string[];
-}
+export type MatchedVia = "binding" | "exact" | "alias" | "suffix" | "prefix" | "none";

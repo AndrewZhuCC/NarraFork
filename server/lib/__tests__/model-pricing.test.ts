@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { db } from "@server/db";
 import { apiRequests } from "@server/db/schema";
-import type { LocalCatalogState, ModelMetadata } from "@shared/model-catalog/schema/catalog";
+import { decimalValue, type RawMetadata } from "@shared/model-catalog/card";
+import type { RawLocalState } from "@shared/model-catalog/schema/catalog";
 import { eq } from "drizzle-orm";
 import { finishApiRequest, startApiRequest, trackApiRequest } from "../api-request-tracker";
 import {
 	bindModelCatalogSettings,
-	getEffectiveModelMetadata,
-	getModelCatalogSnapshot,
-	mutateModelCatalog,
+	getEffectiveModelProfile,
+	getModelCardSnapshot,
+	mutateModelCard,
 	withModelMetadataSnapshotIterator,
 } from "../model-catalog";
 import { captureReferencePricingSnapshot, resolveModelPricing } from "../model-pricing";
@@ -57,17 +58,28 @@ describe("normalized usage snapshot conversion", () => {
 		});
 	});
 });
-function install(
-	pricing?: ModelMetadata["referencePricing"],
-	extra: Partial<LocalCatalogState> = {},
-) {
-	const local: LocalCatalogState = {
+type Prices = Partial<Record<"input" | "output" | "cacheRead" | "cacheWrite", string | null>>;
+const PRICE_KEYS = {
+	input: "input_cost_per_token",
+	output: "output_cost_per_token",
+	cacheRead: "cache_read_input_token_cost",
+	cacheWrite: "cache_creation_input_token_cost",
+} as const;
+/** Fixture prices are written per million tokens, as people read them; the catalog stores per token. */
+function perToken(prices: Prices, suffix = ""): RawMetadata {
+	const raw: RawMetadata = {};
+	for (const [field, value] of Object.entries(prices) as Array<[keyof Prices, string | null]>)
+		raw[PRICE_KEYS[field] + suffix] = value === null ? null : decimalValue(value, -6);
+	return raw;
+}
+function install(metadata?: RawMetadata, extra: Partial<RawLocalState> = {}) {
+	const local: RawLocalState = {
 		revision: 1,
 		models: [
 			{
 				id: "cost-fixture",
 				matches: { aliases: ["cost-alias"] },
-				metadata: pricing ? { referencePricing: pricing } : {},
+				metadata: metadata ?? {},
 			},
 		],
 		...extra,
@@ -76,8 +88,8 @@ function install(
 		{
 			agent: {
 				modelCatalog: {
-					schemaVersion: 1,
-					migrationVersion: 1,
+					schemaVersion: 2,
+					migrationVersion: 2,
 					local,
 					autoApply: false,
 					pinnedVersion: null,
@@ -88,8 +100,8 @@ function install(
 	);
 }
 function patchFixture(set: Record<string, string | number | boolean | null>, reset?: string[]) {
-	return mutateModelCatalog({
-		baseRevision: getModelCatalogSnapshot().local.revision,
+	return mutateModelCard({
+		baseRevision: getModelCardSnapshot().local.revision,
 		action: "patch",
 		target: "model",
 		targetId: "cost-fixture",
@@ -99,22 +111,22 @@ function patchFixture(set: Record<string, string | number | boolean | null>, res
 function usage(partial: Partial<UsageData> = {}): UsageData {
 	return { inputTokens: 1_000_000, outputTokens: 1_000_000, ...partial };
 }
-const allPrices = { input: "2", output: "8", cacheRead: "0.5", cacheWrite: "2.5" };
+const allPrices = perToken({ input: "2", output: "8", cacheRead: "0.5", cacheWrite: "2.5" });
 const estimate = (data = usage(), provider = "openai", model = "cost-fixture") =>
 	calculateCostDetailed(data, provider, model);
 
 describe("reference costs use effective catalog metadata", () => {
 	test("stream start price snapshots survive external consumers and preserve captured unknown", async () => {
 		const cases: Array<{
-			pricing?: ModelMetadata["referencePricing"];
+			pricing?: RawMetadata;
 			status: string;
 			cost: number | null;
 		}> = [
 			{ pricing: allPrices, status: "complete", cost: 10 },
-			{ pricing: { input: "2" }, status: "partial", cost: 2 },
+			{ pricing: perToken({ input: "2" }), status: "partial", cost: 2 },
 			{ status: "unknown", cost: null },
 			{
-				pricing: { input: "0", output: "0", cacheRead: "0", cacheWrite: "0" },
+				pricing: perToken({ input: "0", output: "0", cacheRead: "0", cacheWrite: "0" }),
 				status: "complete",
 				cost: 0,
 			},
@@ -132,12 +144,12 @@ describe("reference costs use effective catalog metadata", () => {
 			const event = (await producer.next()).value;
 			if (!event) throw new Error("Missing start event");
 			// The consumer runs outside producer ALS, after a concurrent settings edit.
-			patchFixture({
-				"referencePricing.input": "20",
-				"referencePricing.output": "8",
-				"referencePricing.cacheRead": "0.5",
-				"referencePricing.cacheWrite": "2.5",
-			});
+			patchFixture(
+				perToken({ input: "20", output: "8", cacheRead: "0.5", cacheWrite: "2.5" }) as Record<
+					string,
+					string
+				>,
+			);
 			expect(estimate().knownCost).toBe(28);
 			const handle = startApiRequest(event);
 			const next = startApiRequest({ provider: "openai", model: "cost-fixture" });
@@ -161,7 +173,7 @@ describe("reference costs use effective catalog metadata", () => {
 	});
 	test("tracked request and completion pricing share one snapshot across deferred edits", async () => {
 		install(allPrices);
-		patchFixture({ "limits.contextWindow": 100_000 });
+		patchFixture({ working_context_tokens: 100_000 });
 		let release = () => {};
 		let entered = () => {};
 		const deferred = new Promise<void>((resolve) => {
@@ -172,25 +184,23 @@ describe("reference costs use effective catalog metadata", () => {
 		});
 		const options = { provider: "openai", model: "cost-fixture" };
 		const pending = trackApiRequest(options, async () => {
-			expect(getEffectiveModelMetadata(options.model).metadata.limits?.contextWindow).toBe(100_000);
+			expect(getEffectiveModelProfile(options.model).contextWindow).toBe(100_000);
 			entered();
 			await deferred;
-			expect(getEffectiveModelMetadata(options.model).metadata.limits?.contextWindow).toBe(100_000);
+			expect(getEffectiveModelProfile(options.model).contextWindow).toBe(100_000);
 			expect(estimate().knownCost).toBe(10);
 			return { usage: usage() };
 		});
 		try {
 			await started;
-			patchFixture({ "referencePricing.input": "20", "limits.contextWindow": 200_000 });
-			expect(getEffectiveModelMetadata(options.model).metadata.limits?.contextWindow).toBe(200_000);
+			patchFixture({ input_cost_per_token: "0.00002", working_context_tokens: 200_000 });
+			expect(getEffectiveModelProfile(options.model).contextWindow).toBe(200_000);
 			release();
 			await pending;
 			const first = db.select().from(apiRequests).where(eq(apiRequests.model, options.model)).all();
 			expect(first.map((row) => row.costUsd)).toEqual([10]);
 			await trackApiRequest(options, async () => {
-				expect(getEffectiveModelMetadata(options.model).metadata.limits?.contextWindow).toBe(
-					200_000,
-				);
+				expect(getEffectiveModelProfile(options.model).contextWindow).toBe(200_000);
 				return { usage: usage() };
 			});
 			const both = db.select().from(apiRequests).where(eq(apiRequests.model, options.model)).all();
@@ -202,7 +212,7 @@ describe("reference costs use effective catalog metadata", () => {
 		}
 	});
 	test("new request records persist partial coverage without altering NUG metering", async () => {
-		install({ input: "2" });
+		install(perToken({ input: "2" }));
 		const request = startApiRequest({ provider: "nug", model: "cost-fixture" });
 		try {
 			await finishApiRequest(request, { usage: usage(), meterUsage: 17, meterUnit: "credits" });
@@ -219,7 +229,7 @@ describe("reference costs use effective catalog metadata", () => {
 		}
 	});
 	test("input-only prices retain known amount but cannot claim full cost", () => {
-		install({ input: "2" });
+		install(perToken({ input: "2" }));
 		expect(estimate()).toMatchObject({
 			status: "partial",
 			knownCost: 2,
@@ -228,7 +238,7 @@ describe("reference costs use effective catalog metadata", () => {
 		expect(calculateCost(usage(), "openai", "cost-fixture")).toBeNull();
 	});
 	test("actual cache usage requires its own price; unused missing fields do not", () => {
-		install({ input: "2", output: "8" });
+		install(perToken({ input: "2", output: "8" }));
 		expect(estimate()).toMatchObject({ status: "complete", knownCost: 10 });
 		expect(
 			estimate(usage({ cachedInputTokens: 500_000, cacheCreationInputTokens: 100_000 })),
@@ -244,17 +254,17 @@ describe("reference costs use effective catalog metadata", () => {
 				{
 					target: "model",
 					targetId: "cost-fixture",
-					metadata: { referencePricing: { input: null } },
+					metadata: perToken({ input: null }),
 				},
 			],
 		});
 		expect(resolveModelPricing("cost-alias")?.input).toBeNull();
 		expect(estimate()).toMatchObject({ status: "partial", knownCost: 8, missingFields: ["input"] });
-		install({ input: null, output: null });
+		install(perToken({ input: null, output: null }));
 		expect(estimate()).toMatchObject({ status: "unknown", knownCost: 0 });
 	});
 	test("explicit all-zero prices are complete and free including caches", () => {
-		install({ input: "0", output: "0", cacheRead: "0", cacheWrite: "0" });
+		install(perToken({ input: "0", output: "0", cacheRead: "0", cacheWrite: "0" }));
 		expect(
 			estimate(usage({ cachedInputTokens: 100, cacheCreationInputTokens: 100 })),
 		).toMatchObject({ status: "complete", knownCost: 0, missingFields: [] });
@@ -266,7 +276,7 @@ describe("reference costs use effective catalog metadata", () => {
 				{
 					target: "model",
 					targetId: "cost-fixture",
-					metadata: { referencePricing: { input: "9" } },
+					metadata: perToken({ input: "9" }),
 				},
 			],
 		});
@@ -274,7 +284,7 @@ describe("reference costs use effective catalog metadata", () => {
 			status: "complete",
 			knownCost: 17,
 		});
-		const reset = patchFixture({}, ["referencePricing.input"]);
+		const reset = patchFixture({}, ["input_cost_per_token"]);
 		expect(reset.local.overrides).toEqual([]);
 		// Reset means inheritance even for creation-time fields; a local-only model has no input base.
 		expect(estimate(usage(), "openai", "cost-alias")).toMatchObject({
@@ -284,24 +294,24 @@ describe("reference costs use effective catalog metadata", () => {
 		});
 		const model = reset.local.models?.find((entry) => entry.id === "cost-fixture");
 		if (!model) throw new Error("Missing fixture model");
-		mutateModelCatalog({
+		mutateModelCard({
 			baseRevision: reset.local.revision,
 			action: "upsert-model",
-			model: { ...model, metadata: { referencePricing: allPrices } },
+			model: { ...model, metadata: allPrices },
 		});
 		expect(estimate(usage(), "openai", "cost-alias").knownCost).toBe(10);
 	});
 	test("tombstone suppresses pricing immediately and restoration recovers it", () => {
 		install(allPrices);
-		mutateModelCatalog({
-			baseRevision: getModelCatalogSnapshot().local.revision,
+		mutateModelCard({
+			baseRevision: getModelCardSnapshot().local.revision,
 			action: "hide",
 			target: "model",
 			targetId: "cost-fixture",
 		});
 		expect(estimate(usage(), "openai", "cost-alias").status).toBe("unknown");
-		mutateModelCatalog({
-			baseRevision: getModelCatalogSnapshot().local.revision,
+		mutateModelCard({
+			baseRevision: getModelCardSnapshot().local.revision,
 			action: "restore",
 			target: "model",
 			targetId: "cost-fixture",
@@ -316,14 +326,14 @@ describe("reference costs use effective catalog metadata", () => {
 					modelId: "cost-fixture",
 					providerKey: "openai",
 					upstreamModelIds: ["variant-cost"],
-					metadata: { referencePricing: { input: "5" } },
+					metadata: perToken({ input: "5" }),
 				},
 			],
 			overrides: [
 				{
 					target: "variant",
 					targetId: "cost-fixture-variant",
-					metadata: { referencePricing: { output: "0" } },
+					metadata: perToken({ output: "0" }),
 				},
 			],
 		});
@@ -362,19 +372,14 @@ describe("reference costs use effective catalog metadata", () => {
 	test("long context full mode uses prompt threshold and respects sparse/unknown/zero tiers", () => {
 		install({
 			...allPrices,
-			longContext: {
-				thresholdTokens: 1_000_000,
-				basis: "promptTokens",
-				mode: "full",
-				input: "4",
-				output: "16",
-			},
+			long_context_input_token_threshold: 1_000_000,
+			...perToken({ input: "4", output: "16" }, "_above_1000k_tokens"),
 		});
 		expect(estimate().knownCost).toBe(10); // exactly threshold stays base
 		expect(estimate(usage({ inputTokens: 1_000_001 })).knownCost).toBeCloseTo(20.000004);
 		patchFixture({
-			"referencePricing.longContext.input": null,
-			"referencePricing.longContext.output": "0",
+			input_cost_per_token_above_1000k_tokens: null,
+			output_cost_per_token_above_1000k_tokens: "0",
 		});
 		expect(estimate(usage({ inputTokens: 1_000_001 }))).toMatchObject({
 			status: "partial",
@@ -383,7 +388,7 @@ describe("reference costs use effective catalog metadata", () => {
 		});
 	});
 	test("cache TTL details still require cache-write pricing when aggregate is omitted", () => {
-		install({ input: "2", output: "8" });
+		install(perToken({ input: "2", output: "8" }));
 		expect(estimate(usage({ cacheCreation1hInputTokens: 100 }))).toMatchObject({
 			status: "partial",
 			missingFields: ["cacheWrite"],
@@ -392,7 +397,8 @@ describe("reference costs use effective catalog metadata", () => {
 	test("unknown long-context threshold cannot silently use base price", () => {
 		install({
 			...allPrices,
-			longContext: { thresholdTokens: null, basis: "promptTokens", mode: "full", input: "4" },
+			long_context_input_token_threshold: null,
+			long_context_input_cost_multiplier: 2,
 		});
 		expect(estimate().status).toBe("unknown");
 		expect(estimate().missingFields).toContain("longContext.thresholdTokens");
@@ -406,7 +412,8 @@ describe("reference costs use effective catalog metadata", () => {
 	])("%s threshold includes disjoint cache read and write tokens", (provider) => {
 		install({
 			...allPrices,
-			longContext: { thresholdTokens: 100, basis: "promptTokens", mode: "full", input: "4" },
+			long_context_input_token_threshold: 100,
+			...perToken({ input: "4" }, "_above_100_tokens"),
 		});
 		const result = estimate(
 			usage({
@@ -423,13 +430,9 @@ describe("reference costs use effective catalog metadata", () => {
 	test("marginal rules without verified reference allocation stay unknown", () => {
 		install({
 			...allPrices,
-			longContext: {
-				thresholdTokens: 100,
-				basis: "promptTokens",
-				mode: "marginal",
-				input: "4",
-				output: "16",
-			},
+			long_context_input_token_threshold: 100,
+			long_context_pricing_basis: "marginal",
+			...perToken({ input: "4", output: "16" }, "_above_100_tokens"),
 		});
 		expect(estimate().status).toBe("unknown");
 		expect(estimate().missingFields).toContain("longContext.mode");

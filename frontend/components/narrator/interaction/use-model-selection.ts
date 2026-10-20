@@ -1,5 +1,10 @@
-import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ModelCard } from "@shared/model-catalog/card";
+import { modelProfile } from "@shared/model-catalog/profile";
+import {
+	clampReasoningEffort,
+	REASONING_EFFORT_VALUES,
+	type ReasoningEffort,
+} from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
 	GENERIC_REASONING_EFFORT_TIERS,
@@ -8,10 +13,20 @@ import {
 	type ReasoningEffortBlocklistEntry,
 } from "@shared/reasoning-effort-support";
 import { useCallback, useMemo } from "react";
-import type { useModelCardIndex } from "../../../hooks/useModelCards";
 import type { ModelOption } from "../../../lib/constants";
 
-type ModelCardIndex = ReturnType<typeof useModelCardIndex>;
+/**
+ * Reasoning tiers a resolved catalog card declares, ascending, never `none`. A card that
+ * matched nothing, or declares no tier, is not evidence about the model's tiers.
+ */
+export function catalogEffortTiers(card: ModelCard | null | undefined): ReasoningEffort[] | null {
+	if (!card || card.matchedVia === "none") return null;
+	const tiers = modelProfile(card).reasoning.levels?.filter(
+		(level): level is ReasoningEffort =>
+			level !== "none" && REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
+	);
+	return tiers?.length ? tiers : null;
+}
 
 type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -261,7 +276,8 @@ export interface UseModelSelectionOptions {
 	 */
 	inheritedReasoningEffort?: string | null;
 	settingsData: ModelSelectionSettings | undefined;
-	modelCardIndex: ModelCardIndex;
+	/** The catalog card the effective model resolves to (server-side, provider-aware). */
+	modelCard: ModelCard | null | undefined;
 	reasoningEffortMutation: ReasoningEffortMutation;
 	updateSettingsMutation: UpdateSettingsMutation;
 }
@@ -299,7 +315,7 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		narratorReasoningEffort,
 		inheritedReasoningEffort,
 		settingsData,
-		modelCardIndex,
+		modelCard,
 		reasoningEffortMutation,
 		updateSettingsMutation,
 	} = options;
@@ -376,21 +392,15 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		// hides the menu entirely for it.
 		const gatewayOptions = getGatewayReportedEffortOptions(resolvedModelOption);
 		if (gatewayOptions) return gatewayOptions;
-		const card = modelCardIndex
-			? lookupModelCard(
-					getBareModelForReasoning(resolvedModel, resolvedModelOption),
-					modelCardIndex,
-				)?.card
-			: undefined;
 		// Missing catalog data is not evidence that a new model lacks a tier.
-		if (!card) return GENERIC_REASONING_EFFORT_TIERS;
+		if (!modelCard || modelCard.matchedVia === "none") return GENERIC_REASONING_EFFORT_TIERS;
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
-		// Model cards: the editable replacement for the hardcoded per-model tables.
-		// `none` is appended here rather than stored on the card, because on a card
-		// it would become a clamp target able to silently turn a requested `low`
-		// into thinking switched off.
-		const cardTiers = cardEffortLevels(card);
+		// Catalog tiers: the editable replacement for the hardcoded per-model tables.
+		// `none` is appended here rather than stored in the catalog, because there it
+		// would become a clamp target able to silently turn a requested `low` into
+		// thinking switched off.
+		const cardTiers = catalogEffortTiers(modelCard);
 		if (cardTiers?.length) {
 			return codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
 				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
@@ -429,7 +439,7 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	}, [
 		codexCapableProviders,
 		isCodexChannelModel,
-		modelCardIndex,
+		modelCard,
 		resolvedModel,
 		resolvedModelOption,
 		settingsData?.anthropicProviders,

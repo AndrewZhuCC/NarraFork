@@ -242,7 +242,7 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 	});
 
 	test("declared output limits clip large requests without raising small requests", async () => {
-		const { bindModelCatalogSettings, getModelCatalogSnapshot, mutateModelCatalog } = await import(
+		const { bindModelCatalogSettings, getModelCardSnapshot, mutateModelCard } = await import(
 			"../../model-catalog"
 		);
 		const { settings, saveSettings } = await import("../../settings");
@@ -250,8 +250,8 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 		const local = {
 			agent: {
 				modelCatalog: {
-					schemaVersion: 1,
-					migrationVersion: 1,
+					schemaVersion: 2,
+					migrationVersion: 2,
 					local: { revision: 0 },
 					autoApply: false,
 					pinnedVersion: null,
@@ -260,10 +260,10 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 		};
 		bindModelCatalogSettings(local as typeof settings, () => {});
 		try {
-			mutateModelCatalog({
-				baseRevision: getModelCatalogSnapshot().local.revision,
+			mutateModelCard({
+				baseRevision: getModelCardSnapshot().local.revision,
 				action: "upsert-model",
-				model: { id: "output-fixture", metadata: { limits: { maxOutputTokens: 64_000 } } },
+				model: { id: "output-fixture", metadata: { max_output_tokens: 64_000 } },
 			});
 			setOutboundFetchOverrideForTest(async (_input, init) => {
 				bodies.push(JSON.parse(String(init?.body)));

@@ -91,7 +91,6 @@ import {
 	codexTierOrderSchema,
 	commandBlacklistEntrySchema,
 	commandWhitelistEntrySchema,
-	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import {
@@ -530,7 +529,6 @@ export const updateSettingsSchema = z
 						z.number().int().min(MIN_MODEL_CONTEXT_WINDOW).max(MAX_MODEL_CONTEXT_WINDOW),
 					),
 				),
-				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),

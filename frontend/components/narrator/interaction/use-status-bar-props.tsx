@@ -1,6 +1,6 @@
+import type { ModelCard } from "@shared/model-catalog/card";
 import type { TFunction } from "i18next";
 import type React from "react";
-import type { useModelCardIndex } from "../../../hooks/useModelCards";
 import { FOLLOW_PARENT_MODEL, type ModelOption } from "../../../lib/constants";
 import type { NarratorInteractionStatusBarProps } from "./NarratorInteractionStatusBar";
 import { useFastModeControl } from "./use-fast-mode-control";
@@ -54,7 +54,7 @@ export interface UseStatusBarPropsOptions {
 	narratorReasoningEffort: string | null | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: settings passthrough shared with useModelSelection.
 	settingsData: any;
-	modelCardIndex: ReturnType<typeof useModelCardIndex>;
+	modelCard: ModelCard | null | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
 	reasoningEffortMutation: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
@@ -112,7 +112,7 @@ export function useStatusBarProps(
 				? options.narrator.modelInheritance?.parentReasoningEffort
 				: undefined,
 		settingsData: options.settingsData,
-		modelCardIndex: options.modelCardIndex,
+		modelCard: options.modelCard,
 		reasoningEffortMutation: options.reasoningEffortMutation,
 		updateSettingsMutation: options.updateSettingsMutation,
 	});

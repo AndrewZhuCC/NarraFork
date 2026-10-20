@@ -1,6 +1,6 @@
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
-import { getEffectiveModelMetadata, withModelMetadataSnapshot } from "@server/lib/model-catalog";
+import { getEffectiveModelCard, withModelMetadataSnapshot } from "@server/lib/model-catalog";
 import { calculateCostDetailed, type UsageData } from "@server/lib/usage-tracking";
 import { sliceToUtf8Budget, withinUtf8Budget } from "@server/lib/utf8-budget";
 import { recordCredentialUsage } from "@server/services/credential-usage-totals";
@@ -195,7 +195,7 @@ export async function trackApiRequest<T>(
 	return withModelMetadataSnapshot(() => {
 		// Capture discovered metadata as well as catalog/local revisions before any
 		// adapter work. The same ALS scope survives fn's awaits through cost recording.
-		getEffectiveModelMetadata(options.model);
+		getEffectiveModelCard(options.model);
 		return trackApiRequestInSnapshot(options, fn);
 	});
 }

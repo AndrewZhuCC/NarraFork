@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import type {
-	ModelCatalogMutation,
-	ModelCatalogSnapshot,
-	ResolvedModelMetadata,
-} from "@shared/model-catalog";
+import { type ModelCard, modelCardView, type RawMetadata } from "@shared/model-catalog/card";
+import type { ModelCardMutation } from "@shared/model-catalog/card-local";
+import type { ModelCardSnapshot } from "@shared/model-catalog/schema/api";
+import type { FieldSource } from "@shared/model-catalog/schema/catalog";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -22,17 +21,20 @@ import {
 	type ModelProtocolDraft,
 } from "./ModelCatalogEditor";
 
-const snapshot: ModelCatalogSnapshot = {
+const snapshot: ModelCardSnapshot = {
+	schemaVersion: 2,
 	catalog: {
-		schemaVersion: 1,
-		catalogVersion: "test-v1",
+		schemaVersion: 2,
+		catalogVersion: "v2:test-v1",
+		sourceVersion: "test-v1",
 		publishedAt: "2026-01-01T00:00:00Z",
 		models: [
 			{
 				id: "base",
 				metadata: {
-					limits: { contextWindow: 1000 },
-					referencePricing: { input: "2", output: "4" },
+					working_context_tokens: 1000,
+					input_cost_per_token: "0.000002",
+					output_cost_per_token: "0.000004",
 				},
 			},
 		],
@@ -55,22 +57,30 @@ const snapshot: ModelCatalogSnapshot = {
 		history: [],
 	},
 };
-const resolved: ResolvedModelMetadata = {
-	schemaVersion: 1,
-	catalogVersion: "test-v1",
-	localRevision: 7,
-	matchedVia: "exact",
-	modelId: "base",
-	metadata: snapshot.catalog.models[0].metadata,
-	provenance: {
-		"limits.contextWindow": { layer: "preset-model", id: "base" },
-		"referencePricing.input": { layer: "preset-model", id: "base" },
-	},
-};
+function resolvedCard(
+	metadata: RawMetadata,
+	provenance: Record<string, FieldSource> = {},
+	localRevision = 7,
+): ModelCard {
+	return {
+		schemaVersion: 2,
+		catalogVersion: "v2:test-v1",
+		localRevision,
+		matchedVia: "exact",
+		modelId: "base",
+		metadata,
+		provenance,
+		view: modelCardView(metadata),
+	};
+}
+const resolved = resolvedCard(snapshot.catalog.models[0].metadata, {
+	working_context_tokens: { layer: "preset-model", id: "base" },
+	input_cost_per_token: { layer: "preset-model", id: "base" },
+});
 const i18n = i18next.createInstance();
 let root: Root;
 let qc: QueryClient;
-let mutations: ModelCatalogMutation[];
+let mutations: ModelCardMutation[];
 let closed: number;
 const originalApi = { ...modelCatalogApi };
 
@@ -204,7 +214,7 @@ afterEach(async () => {
 
 async function render(
 	readOnly = false,
-	target: CatalogEditorTarget = { kind: "model", id: "base", resolved },
+	target: CatalogEditorTarget = { kind: "model", id: "base", card: resolved },
 	protocol?: ModelProtocolDraft,
 ) {
 	await act(async () => {
@@ -234,7 +244,7 @@ async function render(
 			</I18nextProvider>,
 		);
 	});
-	await waitFor(() => !!document.querySelector('[data-catalog-field="limits.contextWindow"]'));
+	await waitFor(() => !!document.querySelector('[data-catalog-field="working_context_tokens"]'));
 }
 
 describe("real catalog editor form", () => {
@@ -242,24 +252,22 @@ describe("real catalog editor form", () => {
 		await render(true, {
 			kind: "model",
 			id: "base",
-			resolved: {
-				...resolved,
-				metadata: {
-					limits: { contextWindow: null },
-					nativeSearch: { supported: false },
-					modalities: { input: [] },
-					referencePricing: { input: "0" },
-				},
-			},
+			card: resolvedCard({
+				working_context_tokens: null,
+				supports_web_search: false,
+				supported_modalities: [],
+				input_cost_per_token: "0",
+				output_cost_per_token: 1.5e-5,
+			}),
 		});
-		expect(field("limits.contextWindow").textContent).toContain("Effective: Unknown");
-		expect(field("limits.maxOutputTokens").textContent).toContain(
-			"Effective: Not reported / inherited",
-		);
-		expect(field("nativeSearch.supported").textContent).toContain("Effective: Not supported");
-		expect(field("modalities.input").textContent).toContain("[] (explicit empty)");
+		expect(field("working_context_tokens").textContent).toContain("Effective: Unknown");
+		expect(field("max_output_tokens").textContent).toContain("Effective: Not reported / inherited");
+		expect(field("supports_web_search").textContent).toContain("Effective: Not supported");
+		expect(field("supported_modalities").textContent).toContain("[] (explicit empty)");
 		await click(button("Reference prices"));
-		expect(field("referencePricing.input").textContent).toContain("0 (free)");
+		expect(field("input_cost_per_token").textContent).toContain("0 (free)");
+		// Stored per token, shown per million.
+		expect(field("output_cost_per_token").textContent).toContain("Effective: 15");
 	});
 	test("new variants do not freeze inherited effective cards", async () => {
 		await render(false, {
@@ -268,7 +276,7 @@ describe("real catalog editor form", () => {
 			isNew: true,
 			modelId: "base",
 			query: { upstreamModelId: "opaque:upstream", providerKey: "public-provider" },
-			resolved,
+			card: resolved,
 		});
 		await click(button("Save"));
 		await waitFor(() => closed === 1);
@@ -315,10 +323,7 @@ describe("real catalog editor form", () => {
 	test("blanking a price is invalid, not a free price or an inherited value", async () => {
 		await render();
 		await click(button("Reference prices"));
-		await inputValue(
-			field("referencePricing.input").querySelector("input") as HTMLInputElement,
-			"",
-		);
+		await inputValue(field("input_cost_per_token").querySelector("input") as HTMLInputElement, "");
 		await click(button("Save"));
 		expect(closed).toBe(0);
 		expect(mutations).toEqual([]);
@@ -333,16 +338,15 @@ describe("real catalog editor form", () => {
 	test("unknown and reset produce only leaf operations and invalidate every consumer", async () => {
 		for (const key of [
 			["settings"],
-			["model-cards"],
 			["model-pricing"],
-			["model-catalog", "actual", "provider:base"],
+			["model-catalog", "card-actual", "provider:base"],
 		])
 			qc.setQueryData(key, { old: true });
 		await render();
-		await click(button("Unknown", field("limits.contextWindow")));
+		await click(button("Unknown", field("working_context_tokens")));
 		await click(button("Reference prices"));
-		await waitFor(() => !!field("referencePricing.input").querySelector("input"));
-		await click(button("Inherit", field("referencePricing.input")));
+		await waitFor(() => !!field("input_cost_per_token").querySelector("input"));
+		await click(button("Inherit", field("input_cost_per_token")));
 		await click(button("Save"));
 		await waitFor(() => closed === 1);
 		expect(mutations).toEqual([
@@ -351,25 +355,21 @@ describe("real catalog editor form", () => {
 				action: "patch",
 				target: "model",
 				targetId: "base",
-				patch: { set: { "limits.contextWindow": null }, reset: ["referencePricing.input"] },
+				patch: { set: { working_context_tokens: null }, reset: ["input_cost_per_token"] },
 			},
 		]);
 		for (const key of [
 			["settings"],
-			["model-cards"],
 			["model-pricing"],
-			["model-catalog", "actual", "provider:base"],
+			["model-catalog", "card-actual", "provider:base"],
 		])
 			expect(qc.getQueryState(key)?.isInvalidated).toBe(true);
 	});
 	test("typing a free price remains a decimal string rather than null/reset", async () => {
 		await render();
 		await click(button("Reference prices"));
-		await waitFor(() => !!field("referencePricing.input").querySelector("input"));
-		await inputValue(
-			field("referencePricing.input").querySelector("input") as HTMLInputElement,
-			"0",
-		);
+		await waitFor(() => !!field("input_cost_per_token").querySelector("input"));
+		await inputValue(field("input_cost_per_token").querySelector("input") as HTMLInputElement, "0");
 		await click(button("Save"));
 		await waitFor(() => closed === 1);
 		expect(mutations[0]).toEqual({
@@ -377,12 +377,12 @@ describe("real catalog editor form", () => {
 			action: "patch",
 			target: "model",
 			targetId: "base",
-			patch: { set: { "referencePricing.input": "0" } },
+			patch: { set: { input_cost_per_token: "0" } },
 		});
 	});
 	test("a newer snapshot cannot silently rebase an older effective detail view", async () => {
-		await render(false, { kind: "model", id: "base", resolved: { ...resolved, localRevision: 6 } });
-		await click(button("Unknown", field("limits.contextWindow")));
+		await render(false, { kind: "model", id: "base", card: { ...resolved, localRevision: 6 } });
+		await click(button("Unknown", field("working_context_tokens")));
 		await click(button("Save"));
 		await waitFor(() => closed === 1);
 		expect(mutations[0].baseRevision).toBe(6);
@@ -393,27 +393,27 @@ describe("real catalog editor form", () => {
 			throw new ApiError("stale", 409);
 		};
 		await render();
-		await click(button("Unknown", field("limits.contextWindow")));
+		await click(button("Unknown", field("working_context_tokens")));
 		await click(button("Save"));
 		await waitFor(() => document.body.textContent?.includes("snapshot is stale") ?? false);
 		expect(closed).toBe(0);
 		expect(button("Save").disabled).toBe(true);
 		expect(mutations).toHaveLength(1);
-		expect(field("limits.contextWindow").textContent).toContain("Unknown");
+		expect(field("working_context_tokens").textContent).toContain("Unknown");
 	});
 	test("read-only form has no save or per-field mutation controls", async () => {
 		await render(true);
 		expect([...document.querySelectorAll("button")].some((b) => b.textContent === "Save")).toBe(
 			false,
 		);
-		expect(field("limits.contextWindow").querySelector("input")?.disabled).toBe(true);
+		expect(field("working_context_tokens").querySelector("input")?.disabled).toBe(true);
 		expect(mutations).toEqual([]);
 	});
 	test("keeps the protocol override on its own layer and inherits the provider value back", async () => {
 		const saved: Array<CustomApiProtocol | null> = [];
 		await render(
 			false,
-			{ kind: "binding", id: "binding-1", resolved },
+			{ kind: "binding", id: "binding-1", card: resolved },
 			{
 				modelValue: "CommandCode:demo-model",
 				value: "completions-compatible",
@@ -450,7 +450,7 @@ describe("real catalog editor form", () => {
 	});
 
 	test("omits the protocol field when the caller does not provide one", async () => {
-		await render(true, { kind: "binding", id: "binding-1", resolved });
+		await render(true, { kind: "binding", id: "binding-1", card: resolved });
 		expect(document.body.textContent ?? "").not.toContain("Applies to");
 	});
 });

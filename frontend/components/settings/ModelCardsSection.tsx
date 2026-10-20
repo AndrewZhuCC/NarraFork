@@ -14,12 +14,9 @@ import {
 	Text,
 	TextInput,
 } from "@mantine/core";
-import {
-	type ModelDefinition,
-	type ModelVariant,
-	type ResolvedModelMetadata,
-	resolveModelMetadata,
-} from "@shared/model-catalog";
+import type { ModelCard, RawModel, RawVariant } from "@shared/model-catalog/card";
+import { createModelCardResolver } from "@shared/model-catalog/card-resolver";
+import { modelProfile } from "@shared/model-catalog/profile";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -45,7 +42,7 @@ export function ModelCardsSection() {
 	const [rollbackVersion, setRollbackVersion] = useState<string | null>(null);
 	const data = query.data;
 	const resolvedCache = useMemo(
-		() => ({ data, entries: new Map<string, ResolvedModelMetadata | undefined>() }),
+		() => ({ data, entries: new Map<string, ModelCard | undefined>() }),
 		[data],
 	);
 	const models = useMemo(
@@ -69,19 +66,19 @@ export function ModelCardsSection() {
 		(kind === "model" ? data?.local.models : data?.local.variants)?.some(
 			(entry) => entry.id === id,
 		) ?? false;
-	const isHidden = (entry: ModelDefinition | ModelVariant) =>
+	const isHidden = (entry: RawModel | RawVariant) =>
 		"modelId" in entry
 			? !!data?.local.hiddenVariantIds?.includes(entry.id) ||
 				!!data?.local.hiddenModelIds?.includes(entry.modelId)
 			: !!data?.local.hiddenModelIds?.includes(entry.id);
-	const hasBinding = (entry: ModelDefinition | ModelVariant) =>
+	const hasBinding = (entry: RawModel | RawVariant) =>
 		data?.local.bindings?.some((b) =>
 			"modelId" in entry
 				? b.variantId === entry.id
 				: b.modelId === entry.id ||
 					variants.some((v) => v.modelId === entry.id && v.id === b.variantId),
 		);
-	const matches = (entry: ModelDefinition | ModelVariant) => {
+	const matches = (entry: RawModel | RawVariant) => {
 		const kind = "modelId" in entry ? "variant" : "model";
 		if (source === "hidden" ? !isHidden(entry) : isHidden(entry)) return false;
 		if (source === "local" && !isLocal(kind, entry.id)) return false;
@@ -100,11 +97,11 @@ export function ModelCardsSection() {
 		.filter(({ model, children }) => matches(model) || children.length);
 	const totalPages = Math.max(1, Math.ceil(groups.length / 30));
 	const currentPage = Math.min(page, totalPages);
-	const safeResolved = (entry: ModelDefinition | ModelVariant) => {
+	const safeResolved = (entry: RawModel | RawVariant) => {
 		if (!resolvedCache.data) return undefined;
 		const key = `${"modelId" in entry ? "variant" : "model"}:${entry.id}`;
 		if (resolvedCache.entries.has(key)) return resolvedCache.entries.get(key);
-		let resolved: ResolvedModelMetadata | undefined;
+		let resolved: ModelCard | undefined;
 		try {
 			resolved = resolveCatalogEntry(resolvedCache.data, entry);
 		} catch {
@@ -113,13 +110,13 @@ export function ModelCardsSection() {
 		resolvedCache.entries.set(key, resolved);
 		return resolved;
 	};
-	const openEntry = (entry: ModelDefinition | ModelVariant) =>
+	const openEntry = (entry: RawModel | RawVariant) =>
 		setEditor({
 			kind: "modelId" in entry ? "variant" : "model",
 			id: entry.id,
-			resolved: safeResolved(entry),
+			card: safeResolved(entry),
 		});
-	async function remove(entry: ModelDefinition | ModelVariant) {
+	async function remove(entry: RawModel | RawVariant) {
 		if (!data) return;
 		const target = "modelId" in entry ? "variant" : "model";
 		const action = isLocal(target, entry.id) ? "delete" : isHidden(entry) ? "restore" : "hide";
@@ -146,10 +143,10 @@ export function ModelCardsSection() {
 						: value === "0"
 							? t("catalog.free")
 							: String(value);
-	function row(entry: ModelDefinition | ModelVariant) {
+	function row(entry: RawModel | RawVariant) {
 		const variant = "modelId" in entry;
 		const resolved = safeResolved(entry);
-		const metadata = resolved?.metadata;
+		const profile = resolved ? modelProfile(resolved) : undefined;
 		const hiddenByParent =
 			variant &&
 			!!data?.local.hiddenModelIds?.includes(entry.modelId) &&
@@ -201,19 +198,18 @@ export function ModelCardsSection() {
 						{entry.status === "verified" ? t("catalog.verified") : t("catalog.unverified")}
 					</Text>
 				</Table.Td>
-				<Table.Td>{display(metadata?.limits?.contextWindow)}</Table.Td>
-				<Table.Td>{display(metadata?.modalities?.input)}</Table.Td>
-				<Table.Td>{display(metadata?.nativeSearch?.supported)}</Table.Td>
+				<Table.Td>{display(profile?.contextWindow)}</Table.Td>
+				<Table.Td>{display(profile?.inputModalities)}</Table.Td>
+				<Table.Td>{display(profile?.nativeSearch)}</Table.Td>
 				<Table.Td>
-					{metadata?.reasoning?.supported === false
+					{profile?.reasoning.supported === false
 						? display(false)
-						: metadata?.reasoning?.levels
-							? display(metadata.reasoning.levels)
-							: display(metadata?.reasoning?.mode)}
+						: profile?.reasoning.levels
+							? display(profile.reasoning.levels)
+							: display(profile?.reasoning.mode)}
 				</Table.Td>
 				<Table.Td>
-					{display(metadata?.referencePricing?.input)} /{" "}
-					{display(metadata?.referencePricing?.output)}
+					{display(profile?.referencePricing?.input)} / {display(profile?.referencePricing?.output)}
 				</Table.Td>
 				<Table.Td>
 					{!readOnly && (
@@ -478,12 +474,15 @@ export function ModelCardsSection() {
 												<Button
 													variant="subtle"
 													onClick={() => {
-														let resolved: ResolvedModelMetadata | undefined;
+														let resolved: ModelCard | undefined;
 														try {
-															resolved = resolveModelMetadata({
-																catalog: data.catalog,
-																local: data.local,
-																query: binding,
+															resolved = createModelCardResolver(
+																data.catalog,
+																data.local,
+															)({
+																upstreamModelId: binding.upstreamModelId,
+																providerId: binding.providerId,
+																channelId: binding.channelId,
 															});
 														} catch {
 															/* Archived/hidden identities remain inspectable. */
@@ -491,8 +490,12 @@ export function ModelCardsSection() {
 														setEditor({
 															kind: "binding",
 															id: binding.id,
-															resolved,
-															query: binding,
+															card: resolved,
+															query: {
+																upstreamModelId: binding.upstreamModelId,
+																providerId: binding.providerId,
+																channelId: binding.channelId,
+															},
 														});
 													}}
 												>
@@ -551,9 +554,9 @@ function CatalogGroup({
 	renderRow,
 	forceExpanded,
 }: {
-	model: ModelDefinition;
-	variants: ModelVariant[];
-	renderRow: (entry: ModelDefinition | ModelVariant) => React.ReactNode;
+	model: RawModel;
+	variants: RawVariant[];
+	renderRow: (entry: RawModel | RawVariant) => React.ReactNode;
 	forceExpanded: boolean;
 }) {
 	const { t } = useTranslation("settings");
