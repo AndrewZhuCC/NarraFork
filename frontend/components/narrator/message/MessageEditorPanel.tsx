@@ -91,9 +91,10 @@ export function MessageEditorPanel({
 		textareaRef: textarea,
 		onOptimized: setEditContent,
 	});
+	// Load while editing so a submit that restores nothing can skip the dialog.
 	const previewTarget = useMemo(
-		() => (isUser && showConfirmModal ? { messageId } : null),
-		[isUser, showConfirmModal, messageId],
+		() => (isUser && narratorId ? { messageId } : null),
+		[isUser, narratorId, messageId],
 	);
 	const preview = useRevertActionPreview(narratorId ?? "", "edit_and_regenerate", previewTarget);
 	const revertPreview = preview.data;
@@ -124,12 +125,23 @@ export function MessageEditorPanel({
 					onClose();
 				}
 			} finally {
+				// The submitted plan is spent either way. Load a fresh one so a retry
+				// after a failed save is judged against current state, never the old plan.
 				preview.invalidate();
+				preview.reload();
 				submitting.current = false;
 				setIsSubmittingEdit(false);
 			}
 		},
-		[messageId, onEditAndRegenerate, canSubmitEdit, snapshot, onClose, preview.invalidate],
+		[
+			messageId,
+			onEditAndRegenerate,
+			canSubmitEdit,
+			snapshot,
+			onClose,
+			preview.invalidate,
+			preview.reload,
+		],
 	);
 	const confirm = useCallback(() => {
 		if (!isUser) {
@@ -139,8 +151,40 @@ export function MessageEditorPanel({
 			return;
 		}
 		if (!canSubmitEdit || submitting.current) return;
+		// A complete, reviewed plan that restores no files and removes no later
+		// messages has nothing to confirm; submit it as-is. Anything else asks.
+		const plan = revertPreview?.revertPlan;
+		const noop =
+			!revertPreviewLoading &&
+			!revertPreview?.previewIssue &&
+			plan?.status === "prepared" &&
+			!!plan.planHash &&
+			plan.coverageComplete &&
+			plan.filesComplete &&
+			plan.expectedFileCount === 0 &&
+			plan.previewKey === preview.previewKey &&
+			preview.historySummary?.deletedMessageCount === 0;
+		if (noop && plan?.planHash) {
+			void submitUserEdit({
+				skipRevert: false,
+				revertPlan: { planId: plan.planId, planHash: plan.planHash, action: plan.action },
+			});
+			return;
+		}
 		setShowConfirmModal(true);
-	}, [isUser, messageId, onEditAssistantMessage, editContent, onClose, canSubmitEdit]);
+	}, [
+		isUser,
+		messageId,
+		onEditAssistantMessage,
+		editContent,
+		onClose,
+		canSubmitEdit,
+		revertPreview,
+		revertPreviewLoading,
+		preview.previewKey,
+		preview.historySummary,
+		submitUserEdit,
+	]);
 	const editingCtx = useContext(EditingMessageCtx);
 	const confirmRef = useRef(confirm);
 	confirmRef.current = confirm;
