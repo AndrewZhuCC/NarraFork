@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { normalizeModelContextWindowOverrides } from "@shared/model-context-window";
 import { Hono } from "hono";
+import { legacyWindowProjection } from "../../../server/lib/model-catalog";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import { getDefaults, reloadSettings, saveSettings, settings } from "../../../server/lib/settings";
 import { normalizeModelContextWindows } from "../../../server/lib/settings/model-context-windows";
@@ -25,6 +26,12 @@ app.use("*", async (c, next) => {
 });
 app.onError((error, c) => c.json({ error: error.message }, 400));
 app.route("/settings", settingsRoutes);
+/** The windows settings.json holds: in the catalog's bindings, never as a separate map. */
+function diskWindows() {
+	const disk = JSON.parse(readFileSync(settingsPath, "utf8"));
+	expect(disk.agent.modelContextWindows).toBeUndefined();
+	return legacyWindowProjection(disk.agent.modelCatalog.local);
+}
 function patch(windows: unknown) {
 	return app.request("/settings", {
 		method: "PATCH",
@@ -101,9 +108,9 @@ async function coldStartContextWindows(home: string, models: string[]) {
 	}
 }
 
-describe("context-window cold-start reconciliation", () => {
+describe("context-window cold-start import", () => {
 	for (const schemaVersion of [1, 2]) {
-		it(`repairs stored v${schemaVersion} windows without replaying untouched legacy values`, async () => {
+		it(`imports a stored v${schemaVersion} page map once and stops storing it`, async () => {
 			const home = mkdtempSync(resolve(tmpdir(), "narrafork-context-cold-start-"));
 			const path = resolve(home, "settings.json");
 			const windows = {
@@ -159,23 +166,30 @@ describe("context-window cold-start reconciliation", () => {
 					}),
 				);
 				const first = await coldStartContextWindows(home, Object.keys(windows));
+				// Where the stored map and a binding disagree, the map is what the provider
+				// page showed (older builds dropped page edits after a hot reload), so it is
+				// applied once. A key the map lacks is not a deletion: its binding stays and
+				// the page now shows it. Afterwards the map is a view of the bindings.
 				expect(first.windows).toEqual({
 					"openai:cold-large": 10_000_000,
 					"openai:cold-small": 256,
+					"openai:cold-invalid": 64_000,
 					"openai:cold-edited": 128_000,
 					"openai:cold-reset": 128_000,
 				});
 				expect(first.budgets).toEqual({
 					"openai:cold-large": { workingContextTokens: 10_000_000 },
 					"openai:cold-small": { workingContextTokens: 256 },
-					"openai:cold-invalid": {},
-					"openai:cold-edited": { workingContextTokens: 96_000 },
-					"openai:cold-reset": {},
+					"openai:cold-invalid": { workingContextTokens: 64_000 },
+					"openai:cold-edited": { workingContextTokens: 128_000 },
+					"openai:cold-reset": { workingContextTokens: 128_000 },
 				});
 				const persisted = readFileSync(path, "utf8");
 				const disk = JSON.parse(persisted);
-				expect(disk.agent.modelContextWindows).toEqual(first.windows);
+				expect(disk.agent.modelContextWindows).toBeUndefined();
+				expect(legacyWindowProjection(disk.agent.modelCatalog.local)).toEqual(first.windows);
 				expect(disk.agent.modelCatalog.schemaVersion).toBe(2);
+				expect(JSON.stringify(disk.agent.modelCatalog)).not.toContain("limits.contextWindow");
 				const second = await coldStartContextWindows(home, Object.keys(windows));
 				expect(second).toEqual(first);
 				expect(readFileSync(path, "utf8")).toBe(persisted);
@@ -244,9 +258,7 @@ describe("context-window automatic normalization", () => {
 		const loaded = reloadSettings();
 		const result = { "retired:large": 10_000_000, "offline:valid": 128_000 };
 		expect(loaded.agent.modelContextWindows).toEqual(result);
-		expect(JSON.parse(readFileSync(settingsPath, "utf8")).agent.modelContextWindows).toEqual(
-			result,
-		);
+		expect(diskWindows()).toEqual(result);
 		expect(normalizeModelContextWindows(loaded)).toBe(false);
 	});
 
@@ -258,9 +270,7 @@ describe("context-window automatic normalization", () => {
 		expect(body.agent.modelContextWindows).toEqual(expected);
 		expect(settings.agent.modelContextWindows).toEqual(expected);
 		expect(settings.agent.providerOrder).toEqual(["test"]);
-		expect(JSON.parse(readFileSync(settingsPath, "utf8")).agent.modelContextWindows).toEqual(
-			expected,
-		);
+		expect(diskWindows()).toEqual(expected);
 		const again = await patch(expected);
 		expect(again.status).toBe(200);
 		expect(settings.agent.modelContextWindows).toEqual(expected);
@@ -291,8 +301,6 @@ describe("context-window automatic normalization", () => {
 		saveSettings(local);
 		const result = { "discovered:large": 10_000_000, "discovered:good": 4096 };
 		expect(settings.agent.modelContextWindows).toEqual(result);
-		expect(JSON.parse(readFileSync(settingsPath, "utf8")).agent.modelContextWindows).toEqual(
-			result,
-		);
+		expect(diskWindows()).toEqual(result);
 	});
 });

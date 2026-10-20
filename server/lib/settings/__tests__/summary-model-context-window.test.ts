@@ -18,6 +18,7 @@ import {
 	getSummaryModelContextWindowDetail,
 	parseModelId,
 	resolveModelContextWindow,
+	saveSettings,
 	settings,
 } from "../index";
 
@@ -134,17 +135,19 @@ describe("getSummaryModelContextWindowDetail", () => {
 		const parsed = parseModelId(SUMMARY_MODEL);
 		const key = `anthropic:${parsed.model}`;
 		settings.agent.summaryModel = SUMMARY_MODEL;
-		// The catalog overlay keeps its own local-binding layer and would otherwise
-		// shadow `modelContextWindows` inside tests that mutate settings in place.
+		// The window map is the provider page's view of catalog bindings; saving it
+		// is what writes the binding, exactly as the settings page does.
 		const originalCatalog = settings.agent.modelCatalog;
-		settings.agent.modelCatalog = undefined;
 		try {
-			settings.agent.modelContextWindows = { [key]: 50_000 };
+			settings.agent.modelContextWindows = { ...original.modelContextWindows, [key]: 50_000 };
+			saveSettings(settings);
 			const detail = getSummaryModelContextWindowDetail();
 			expect(detail.contextWindow).toBe(50_000);
 			expect(detail.source).toBe("user");
 		} finally {
 			settings.agent.modelCatalog = originalCatalog;
+			settings.agent.modelContextWindows = original.modelContextWindows;
+			saveSettings(settings);
 		}
 	});
 

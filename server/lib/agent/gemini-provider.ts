@@ -23,7 +23,7 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
@@ -279,7 +279,7 @@ export class GeminiProvider implements ProviderAdapter {
 		const tools = params.tools as Array<{ functionDeclarations: GeminiFunctionDeclaration[] }>;
 
 		const generationConfig: Record<string, unknown> = {};
-		const metadata = effectiveProviderMetadata(params.model);
+		const metadata = effectiveModelProfile(params.model);
 		const maxOutputTokens = resolveOutputTokenLimit(metadata, params.maxOutputTokens);
 		if (maxOutputTokens !== undefined) generationConfig.maxOutputTokens = maxOutputTokens;
 		const thinkingConfig = mapReasoningEffortToThinking(
@@ -563,7 +563,7 @@ export class GeminiProvider implements ProviderAdapter {
 		if (opts.systemInstruction) {
 			body.systemInstruction = { parts: [{ text: opts.systemInstruction }] };
 		}
-		const metadata = effectiveProviderMetadata(opts.model);
+		const metadata = effectiveModelProfile(opts.model);
 		const thinkingConfig = mapReasoningEffortToThinking(
 			resolveMetadataReasoning(metadata, opts.reasoningEffort),
 			metadata.reasoning?.mode,

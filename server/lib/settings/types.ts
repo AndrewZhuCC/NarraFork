@@ -4,7 +4,6 @@
  */
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
-import type { ModelCard } from "@shared/model-card";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
@@ -13,6 +12,7 @@ import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { DiskSafetySettings } from "../disk-safety-config";
 import type { ModelCatalogSettings } from "../model-catalog";
+import type { LegacyModelCard } from "../model-catalog/legacy-v1";
 import type { PermissionMode } from "../permission-modes";
 import type { UserAgentMode } from "../user-agent";
 
@@ -691,25 +691,18 @@ export interface NarraForkSettings {
 		 */
 		legacyEncoding: boolean;
 		/**
-		 * Per-model context window overrides (tokens).
-		 * Key is the full model value ("provider:modelId"), value is the context window size.
-		 * Takes highest priority in getModelContextWindow().
+		 * Per-model working context windows (tokens), keyed by full model value
+		 * ("provider:modelId"). A derived view of the model catalog's provider-page
+		 * bindings: saving an edited map writes those bindings, and the map itself is
+		 * never stored in settings.json.
 		 */
 		modelContextWindows: Record<string, number>;
 		/**
-		 * Model cards — per-model metadata templates (context window, max
-		 * completion tokens, reasoning tiers, official USD prices).
-		 *
-		 * Stores only the DIFFERENCE from NarraFork's builtin cards: an entry
-		 * carries its `modelKey` plus the fields the user changed, and a card
-		 * matching its builtin is not stored. So untouched fields track builtin
-		 * updates across releases while edited fields stay pinned.
-		 *
-		 * Distinct from `modelContextWindows`, which stays higher priority: a card
-		 * describes a *class* of model ids (via aliases and prefixes), whereas that
-		 * map force-overrides one exact `provider:model` value.
+		 * Pre-catalog model card deltas. Read once, when a settings file without
+		 * `modelCatalog` is first loaded, and archived in `modelCatalog.legacyArchive`;
+		 * nothing reads them afterwards.
 		 */
-		modelCards?: ModelCard[];
+		modelCards?: LegacyModelCard[];
 		/** Versioned public metadata overlays; never stores the public catalog itself. */
 		modelCatalog?: ModelCatalogSettings;
 		/** Translate reasoning/thinking blocks via translationModel after each block completes. */

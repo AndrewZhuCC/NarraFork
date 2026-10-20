@@ -1,13 +1,10 @@
 import { Alert, Badge, Button, Divider, Group, Loader, Modal, Stack, Text } from "@mantine/core";
+import { modelProfile } from "@shared/model-catalog/profile";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
-import {
-	useActualResolvedModel,
-	useActualResolvedModelCard,
-	useModelCatalog,
-} from "../../../hooks/useModelCatalog";
+import { useActualResolvedModelCard, useModelCatalog } from "../../../hooks/useModelCatalog";
 import { api } from "../../../lib/api";
 import type { ModelOption } from "../../../lib/constants";
 import { formatLocaleNumber } from "../../../lib/intl-format";
@@ -15,11 +12,7 @@ import { resolveCatalogEntry } from "../../../lib/model-catalog-view";
 import { Z } from "../../../lib/z-index";
 import type { CustomApiProtocol } from "../../providers/types";
 import { ModelCardDetails } from "../../settings/ModelCardDetails";
-import {
-	type CatalogEditorTarget,
-	CatalogMetadataFields,
-	ModelCatalogEditor,
-} from "../../settings/ModelCatalogEditor";
+import { type CatalogEditorTarget, ModelCatalogEditor } from "../../settings/ModelCatalogEditor";
 
 /** Format a per-1M-token RMB price, trimming trailing zeros (max 6 decimals). */
 function fmtPrice(value: number | string | undefined, unit: string): string {
@@ -70,8 +63,8 @@ export function ModelPriceModal({
 	const { data: user } = useCurrentUser();
 	const qc = useQueryClient();
 	const catalog = useModelCatalog(opened);
-	const actual = useActualResolvedModel(opened ? model?.value : undefined);
-	const card = useActualResolvedModelCard(opened ? model?.value : undefined);
+	const actual = useActualResolvedModelCard(opened ? model?.value : undefined);
+	const reference = actual.data ? modelProfile(actual.data).referencePricing : undefined;
 	const [editor, setEditor] = useState<CatalogEditorTarget | null>(null);
 	const readOnly = user?.role !== "admin";
 	// 协议分两层，都与 catalog 快照无关，因此在这里读写：
@@ -122,7 +115,7 @@ export function ModelPriceModal({
 	let discount = "";
 	let circleMultiplier = "";
 	if (!isCredit) {
-		const usd = Number(actual.data?.metadata.referencePricing?.input);
+		const usd = Number(reference?.input);
 		const rmb = Number(pricing?.input ?? 0);
 		if (usd > 0 && usdRate > 0) {
 			const d = (rmb * mult) / (usd * usdRate);
@@ -159,22 +152,10 @@ export function ModelPriceModal({
 						</Text>
 						{actual.data.matchedVia === "none" && <Text size="sm">{ts("catalog.noMatch")}</Text>}
 						<Text size="sm">
-							{ts("catalog.reference")}:{" "}
-							{referencePrice(actual.data.metadata.referencePricing?.input)} /{" "}
-							{referencePrice(actual.data.metadata.referencePricing?.output)}
+							{ts("catalog.reference")}: {referencePrice(reference?.input)} /{" "}
+							{referencePrice(reference?.output)}
 						</Text>
-						{/* Complete v2 card when available; the v1 field list stays the fallback
-						    so a model whose card cannot resolve is still inspectable. */}
-						{card.data ? (
-							<ModelCardDetails card={card.data} />
-						) : (
-							<CatalogMetadataFields
-								resolved={actual.data}
-								edits={{}}
-								onChange={() => {}}
-								readOnly
-							/>
-						)}
+						<ModelCardDetails card={actual.data} />
 						<Group>
 							<Button
 								size="xs"
@@ -187,7 +168,7 @@ export function ModelPriceModal({
 										kind: "binding",
 										id: resolved.bindingId ?? "",
 										isNew: !resolved.bindingId,
-										resolved,
+										card: resolved,
 										query: resolved.resolvedQuery,
 									});
 								}}
@@ -211,7 +192,7 @@ export function ModelPriceModal({
 												kind: "variant",
 												id: variant.id,
 												modelId: variant.modelId,
-												resolved: resolveCatalogEntry(snapshot, variant),
+												card: resolveCatalogEntry(snapshot, variant),
 											});
 									}}
 								>
