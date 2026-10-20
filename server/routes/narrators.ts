@@ -3974,19 +3974,32 @@ async function prepareHistoryRewrite(narratorId: string): Promise<void> {
 	}
 }
 
+/**
+ * HTTP deletions only rewrite history. File restores must execute a reviewed plan
+ * (rollback preview, or the single-block delete plan), and multi-block or
+ * message-range deletions have no previewable plan, so they never restore files.
+ */
+function requireHistoryOnlyDeletion(historyOnly: boolean): void {
+	if (!historyOnly)
+		throw new AppError(
+			"Deleting history does not restore files; send skipRevert or review a rollback preview",
+			409,
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
+}
+
 // Batch-delete multiple content blocks across messages
 narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	const narratorId = c.req.param("id");
 	const body = await c.req.json();
 	const { batchDeleteBlocksSchema } = await import("../lib/validators");
-	const { blocks, skipRevert, scope } = batchDeleteBlocksSchema.parse(body);
-	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(narratorId);
+	const { blocks, skipRevert } = batchDeleteBlocksSchema.parse(body);
+	requireHistoryOnlyDeletion(skipRevert === true);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
-		skipRevert,
+		skipRevert: true,
 		principal: narratorPrincipalOf(c),
 		signal: c.req.raw.signal,
-		...(scope ? { scope } : {}),
 	});
 	return c.json({ ok: true, ...result });
 });
@@ -3999,17 +4012,12 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 	if (Number.isNaN(blockIndex) || blockIndex < 0) {
 		throw new ValidationError("Invalid block index");
 	}
-	const skipRevert = c.req.query("skipRevert") === "1";
-	// The narrator scope is the default and refuses on conflict, so the caller needs
-	// a way to ask for the wider one its error suggests.
-	const scope = revertScopeSchema.parse(c.req.query("scope"));
-	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
+	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
-		skipRevert,
+		skipRevert: true,
 		principal: narratorPrincipalOf(c),
 		signal: c.req.raw.signal,
-		...(scope ? { scope } : {}),
 	});
 	return c.json({ ok: true, ...result });
 });
@@ -4018,17 +4026,12 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const skipRevert = c.req.query("skipRevert") === "1";
-	// The narrator scope is the default and can refuse on conflict; the caller needs a
-	// way to act on that refusal, so the widening choice must be expressible here too.
-	const scope = revertScopeSchema.parse(c.req.query("scope"));
-	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
+	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
-		skipRevert,
+		skipRevert: true,
 		principal: narratorPrincipalOf(c),
 		signal: c.req.raw.signal,
-		...(scope ? { scope } : {}),
 	});
 	return c.json({ ok: true, ...result });
 });

@@ -4,6 +4,7 @@ import { hotSafe } from "../lib/hot-safe";
 
 export const FILE_WRITE_QUEUE_LIMITS = Object.freeze({
 	waitTimeoutMs: 30_000,
+	maxWaitTimeoutMs: 60_000,
 	maxWaitersPerFile: 64,
 	maxWaiters: 1024,
 });
@@ -87,9 +88,15 @@ export class FileWriteQueue {
 
 	private acquire(key: string, options: FileWriteOptions): Promise<() => void> {
 		const { signal, waitTimeoutMs = FILE_WRITE_QUEUE_LIMITS.waitTimeoutMs } = options;
-		if (!Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs < 0 || waitTimeoutMs > 60_000) {
+		if (
+			!Number.isSafeInteger(waitTimeoutMs) ||
+			waitTimeoutMs < 0 ||
+			waitTimeoutMs > FILE_WRITE_QUEUE_LIMITS.maxWaitTimeoutMs
+		) {
 			return Promise.reject(
-				new TypeError("File write wait timeout must be between 0 and 60000 ms"),
+				new TypeError(
+					`File write wait timeout must be between 0 and ${FILE_WRITE_QUEUE_LIMITS.maxWaitTimeoutMs} ms`,
+				),
 			);
 		}
 		if (signal?.aborted) return Promise.reject(signal.reason);

@@ -15,7 +15,7 @@ import { logger } from "../lib/logger";
 import { fileChangeIdentityKey, fileChangePhysicalIdentityKey } from "./file-change-identity";
 import { type LocalFileRestoreResult, restoreLocalFile } from "./file-change-local-restore";
 import type { LocalFileChangeRuntime } from "./file-change-runtime";
-import { withFileWrite } from "./file-write-queue";
+import { FILE_WRITE_QUEUE_LIMITS, withFileWrite } from "./file-write-queue";
 import type { NarratorPrincipal } from "./narrator-acl";
 import { type RevertHistoryApplyResult, RevertHistoryCommitService } from "./revert-history-commit";
 import {
@@ -364,7 +364,11 @@ export class RevertTransactionService {
 						await restored.whenSettled;
 						return restoreResult(restored);
 					},
-					{ signal: run.signal, waitTimeoutMs: this.timeoutMs },
+					{
+						signal: run.signal,
+						// The run budget may exceed the queue's admission ceiling; IO keeps its own.
+						waitTimeoutMs: Math.min(this.timeoutMs, FILE_WRITE_QUEUE_LIMITS.maxWaitTimeoutMs),
+					},
 				);
 			} catch (error) {
 				result = run.results.has(row.id)

@@ -1965,24 +1965,14 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "DELETE",
 		}),
-	deleteMessage: (
-		narratorId: string,
-		messageId: string,
-		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) => {
-		const query = new URLSearchParams();
-		if (opts?.skipRevert) query.set("skipRevert", "1");
-		// A narrator-scoped revert can refuse on conflict; widening the scope is the
-		// remedy the error suggests, so it has to be reachable from the client.
-		if (opts?.scope) query.set("scope", opts.scope);
-		const suffix = query.size > 0 ? `?${query}` : "";
-		return request<{ ok: boolean; deletedCount: number }>(
-			`/narrators/${narratorId}/messages/${messageId}${suffix}`,
+	/** History-only: file restores go through a reviewed revert plan instead. */
+	deleteMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedCount: number }>(
+			`/narrators/${narratorId}/messages/${messageId}?skipRevert=1`,
 			{
 				method: "DELETE",
 			},
-		);
-	},
+		),
 	dismissSpecCarryoverMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/spec-carryover-messages/${messageId}`,
@@ -2033,27 +2023,16 @@ export const narratorsApi = {
 				messageId,
 			)}&blockIndex=${blockIndex}`,
 		),
-	deleteMessageBlock: (
-		narratorId: string,
-		messageId: string,
-		blockIndex: number,
-		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) => {
-		const params = new URLSearchParams();
-		if (opts?.skipRevert) params.set("skipRevert", "1");
-		if (opts?.scope) params.set("scope", opts.scope);
-		const query = params.toString();
-		return request<{ ok: boolean; messageDeleted: boolean }>(
-			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}${
-				query ? `?${query}` : ""
-			}`,
+	/** History-only: deleting a tool block with its files uses `applyRevertPlan`. */
+	deleteMessageBlock: (narratorId: string, messageId: string, blockIndex: number) =>
+		request<{ ok: boolean; messageDeleted: boolean }>(
+			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}?skipRevert=1`,
 			{ method: "DELETE" },
-		);
-	},
+		),
+	/** History-only: a multi-block selection has no previewable file restore plan. */
 	deleteMessageBlocks: (
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
-		opts?: { skipRevert?: boolean },
 	) =>
 		request<{
 			ok: boolean;
@@ -2062,7 +2041,7 @@ export const narratorsApi = {
 			revertResult?: FileChangeRevertApplyResponse;
 		}>(`/narrators/${narratorId}/messages/batch-blocks`, {
 			method: "DELETE",
-			body: JSON.stringify({ blocks, skipRevert: opts?.skipRevert === true }),
+			body: JSON.stringify({ blocks, skipRevert: true }),
 		}),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {

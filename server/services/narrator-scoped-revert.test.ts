@@ -638,17 +638,15 @@ describe("narrator-scoped per-file recovery consumers", () => {
 		});
 		expect(content(call.messageId)).toHaveLength(2);
 		const next = await write("http-delete.txt");
+		// HTTP deletions are history-only; restoring files without a reviewed plan is refused.
 		const deleted = await app.request(`/api/narrators/${narratorId}/messages/${next.messageId}`, {
 			method: "DELETE",
 			headers,
 		});
-		const deletedResult = await deleted.json();
-		expect(deleted.status, JSON.stringify(deletedResult)).toBe(200);
-		expect(deletedResult.revertResult).toMatchObject({
-			status: "committed",
-			historyCommitted: true,
-			files: [{ filePath: "http-delete.txt", status: "applied" }],
-		});
+		expect(deleted.status).toBe(409);
+		expect(await deleted.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect(await readFile(next.path, "utf8")).toBe("changed\n");
+		expect(content(next.messageId)).toBeDefined();
 	}, 30_000);
 
 	test("HTTP partial failures retain file outcomes in the error response", async () => {
@@ -677,7 +675,7 @@ describe("narrator-scoped per-file recovery consumers", () => {
 				authorization: `Bearer ${await createToken(userId, "user")}`,
 				"content-type": "application/json",
 			},
-			body: JSON.stringify({ blocks: [{ messageId, blockIndex: 0 }] }),
+			body: JSON.stringify({ blocks: [{ messageId, blockIndex: 0 }], skipRevert: true }),
 		});
 		expect(response.status).toBe(409);
 		expect(await response.json()).toMatchObject({ code: "SNAPSHOT_REVERT_FAILED", ...result });

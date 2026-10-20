@@ -9,12 +9,15 @@ import {
 	failHistoryCommit,
 	history,
 	journalFiles,
+	makeFixtureTransaction,
 	namespace,
 	operation,
+	options,
 	prepare,
 	principal,
 	service,
 	setFileHook,
+	setService,
 	test,
 	twoFiles,
 	workspace,
@@ -33,6 +36,13 @@ describe("independent file restoration", () => {
 		} finally {
 			collect.mockRestore();
 		}
+	});
+	test("a run budget above the queue admission ceiling still restores files", async () => {
+		setService(makeFixtureTransaction(db, { ...options, timeoutMs: 120_000 }));
+		const { plan } = await twoFiles();
+		const result = await execution(plan).whenSettled;
+		expect(result.status).toBe("committed");
+		expect(result.files.map((file) => file.status)).toEqual(["applied", "applied"]);
 	});
 	test("file-only success keeps its post-IO collector because it does not prepare history", async () => {
 		const path = join(workspace, "file-only.txt");

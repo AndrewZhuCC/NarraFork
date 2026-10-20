@@ -26,8 +26,7 @@ await i18n.init({
 				"historyRecovery.candidateTitle":
 					"seq {{seq}} · {{role}} · {{toolCount}} tool calls · {{size}}",
 				"historyRecovery.latest": "latest",
-				"historyRecovery.skipRevert": "Keep workspace files as-is",
-				"historyRecovery.skipRevertDesc": "Only remove the message",
+				"historyRecovery.historyOnly": "Only removes the message history",
 				"historyRecovery.delete": "Delete selected message and after",
 				"historyRecovery.deleteFailed": "Delete failed",
 				"historyRecovery.scanFailed": "Could not list",
