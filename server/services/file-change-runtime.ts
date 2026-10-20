@@ -33,7 +33,6 @@ import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
-import type { EditorDurableOperation } from "./editor-remote-operation-store";
 import { applyLocalFileChange } from "./file-change-apply-result";
 import { FileChangeBlobCatalog, FileChangeBlobCatalogError } from "./file-change-blob-catalog";
 import {
@@ -121,6 +120,40 @@ const TOOL_COLUMNS = {
 	segmentId: narratorToolCalls.executionSegmentId,
 };
 
+/** The original remote editor intent, shared by settlement, query and status mapping.
+ * Null means the row lacks a field remote receipts are bound to; it never proves non-execution. */
+export function remoteEditorIntent(
+	operation: FileChangeOperationRecord,
+	effect: FileChangeEffectRecord,
+) {
+	const binding = operation.executionBindingJson;
+	const intended = effect.intendedAfterStateJson;
+	if (
+		operation.sourceKind !== "editor" ||
+		!binding ||
+		!operation.ownerUserId ||
+		!operation.narratorId ||
+		!operation.requestDigest ||
+		!operation.workspaceLeaseId ||
+		operation.editorRawSnapshotRevision === null ||
+		intended.kind !== "regular" ||
+		effect.identityJson.deviceId === LOCAL_DEVICE_ID ||
+		effect.identityJson.deviceId !== binding.deviceId ||
+		effect.requestDigest !== operation.requestDigest
+	)
+		return null;
+	return {
+		ownerUserId: operation.ownerUserId,
+		narratorId: operation.narratorId,
+		requestDigest: operation.requestDigest,
+		workspaceLeaseId: operation.workspaceLeaseId,
+		snapshotRevision: operation.editorRawSnapshotRevision,
+		deviceId: binding.deviceId,
+		executionBinding: binding,
+		intended,
+	};
+}
+
 /** Process identity survives --hot but is never reused across an actual restart. */
 export function localFileChangeRuntimeBinding(
 	deviceId = LOCAL_DEVICE_ID,
@@ -167,8 +200,6 @@ export interface EditorFileChangeRequest<Result> {
 	input: Record<string, unknown>;
 	/** Reauthorize the SAME frozen target; cannot return a replacement path. */
 	authorize(): Promise<void>;
-	/** Receipt metadata ACL only; does not reopen the original file/root. */
-	authorizeReceipt?(): Promise<void>;
 	/** Pure construction from the raw before captured inside the shared lease. */
 	construct(
 		before: LocalFileObservation,
@@ -344,36 +375,26 @@ export class LocalFileChangeRuntime {
 
 	/** Reconcile only a positively terminal engine receipt against its ORIGINAL intent.
 	 * No target read/write, current-hash inference, new runtime adoption, or rollback claim. */
-	settleEditorReceipt(record: EditorDurableOperation, result: EditorApplyResult): void {
-		const operation = this.evidence.getOperation(record.hostOperationId);
-		const effect = this.evidence.listEffects(record.hostOperationId, { limit: 2 }).items[0];
-		const verify = () => {
-			if (
-				!operation ||
-				!effect ||
-				!operation.executionBindingJson ||
-				operation.sourceKind !== "editor" ||
-				operation.sourceId !== record.operationId ||
-				operation.ownerUserId !== record.userId ||
-				operation.narratorId !== record.narratorId ||
-				operation.requestDigest !== record.requestDigest ||
-				effect.id !== record.effectId ||
-				effect.identityJson.deviceId !== record.deviceId ||
-				effect.identityJson.canonicalPath !== record.identity.canonicalPath ||
-				result.operationId !== record.operationId ||
-				!["committed", "rejected"].includes(result.outcome) ||
-				(result.outcome === "committed" &&
-					(result.rawDigest !== record.rawDigest ||
-						result.totalBytes !== record.bytes ||
-						effect.intendedAfterStateJson.kind !== "regular" ||
-						effect.intendedAfterStateJson.blob.digest !== result.rawDigest))
-			)
-				throw new Error("Editor receipt does not match its original owned intent");
-		};
-		verify();
-		if (!operation || !effect || !operation.executionBindingJson)
-			throw new Error("Editor intent unavailable");
-		const executionBinding = operation.executionBindingJson;
+	settleEditorReceipt(operationId: string, result: EditorApplyResult): void {
+		const operation = this.evidence.getOperation(operationId);
+		const effects = this.evidence.listEffects(operationId, { limit: 2 }).items;
+		const effect = effects.length === 1 ? effects[0] : undefined;
+		const intent = operation && effect ? remoteEditorIntent(operation, effect) : null;
+		// Operation/effect are immutable intent rows; one check covers the coordinator and
+		// settle transactions, which guard lease manifest and requestDigest themselves.
+		if (
+			!operation ||
+			!effect ||
+			!intent ||
+			result.operationId !== operation.sourceId ||
+			!["committed", "rejected"].includes(result.outcome) ||
+			(result.outcome === "committed" &&
+				(intent.intended.blob.digest !== result.rawDigest ||
+					intent.intended.blob.sizeBytes !== result.totalBytes)) ||
+			(result.outcome === "rejected" && (result.rawDigest !== null || result.totalBytes !== null))
+		)
+			throw new Error("Editor receipt does not match its original owned intent");
+		const { executionBinding, requestDigest } = intent;
 		if (effect.settlement === "settled") {
 			if (
 				!effect.executionConfirmed ||
@@ -385,28 +406,27 @@ export class LocalFileChangeRuntime {
 		}
 		const scope = this.evidence.getScope(effect.identityJson.scopeId);
 		if (!scope) throw new Error("Original editor scope unavailable");
-		this.coordinator.acknowledgeEditorReceipt(
-			{
-				leaseId: record.leaseId,
-				operationId: operation.id,
-				effectId: effect.id,
-				mutationId: effect.mutationId,
-			},
-			verify,
-		);
-		const reservation = this.coordinator.reserveRecovery({ scope, leaseId: record.leaseId });
+		this.coordinator.acknowledgeEditorReceipt({
+			leaseId: intent.workspaceLeaseId,
+			operationId: operation.id,
+			effectId: effect.id,
+			mutationId: effect.mutationId,
+		});
+		const reservation = this.coordinator.reserveRecovery({
+			scope,
+			leaseId: intent.workspaceLeaseId,
+		});
 		try {
 			reservation.complete((tx) => {
-				verify();
 				this.evidence.settleEffect(
 					{
 						operationId: operation.id,
 						mutationId: effect.mutationId,
-						requestDigest: record.requestDigest,
+						requestDigest,
 						receipt: {
 							receiptId: generateId(),
 							mutationId: effect.mutationId,
-							requestDigest: record.requestDigest,
+							requestDigest,
 							executionBinding,
 							confirmed: true,
 							outcome: result.outcome === "committed" ? "applied" : "not_applied",
@@ -1029,6 +1049,13 @@ export class LocalFileChangeRuntime {
 		request: EditorFileChangeRequest<Result>,
 	): Promise<FileChangeCompletion<Result>> {
 		request = Object.freeze({ ...request, input: snapshotFileToolInput(request.input) });
+		if (
+			request.remote &&
+			(request.input.hashKind !== "raw-sha256" ||
+				!Number.isSafeInteger(request.input.snapshotRevision) ||
+				Number(request.input.snapshotRevision) < 0)
+		)
+			throw new LocalFileValidationError("Remote editor requires its raw snapshot revision");
 		const runtime = request.remote?.runtime ?? this.readRuntime(LOCAL_DEVICE_ID);
 		const backend = request.remote?.backend ?? localBackend;
 		if (request.remote) {
@@ -1670,6 +1697,10 @@ export class LocalFileChangeRuntime {
 											attempt: request.attempt,
 											requestDigest,
 											expectedEffectCount: 1,
+											workspaceLeaseId: request.remote ? lease.leaseId : null,
+											editorRawSnapshotRevision: request.remote
+												? Number(request.input.snapshotRevision)
+												: null,
 											actor: request.actor,
 											narratorId: request.narratorId,
 											projectId: request.projectId,
@@ -1875,18 +1906,9 @@ export class LocalFileChangeRuntime {
 														? {
 																sourceId: request.sourceId,
 																userId: request.userId as string,
-																narratorId: request.narratorId,
 																operationId: operation.id,
 																effectId: effect.id,
-																mutationId: effect.mutationId,
 																requestDigest,
-																leaseId: lease.leaseId,
-																preparedResult: prepared.result,
-																snapshotRevision: Number(request.input.snapshotRevision),
-																hashKind:
-																	request.input.hashKind === "raw-sha256"
-																		? "raw-sha256"
-																		: undefined,
 																executionBinding: lease.executionBinding,
 																scope,
 																before: beforeState,
@@ -1915,16 +1937,21 @@ export class LocalFileChangeRuntime {
 										const applied = execution.result.kind === "applied";
 										let ioError: unknown = execution.result.error;
 										let observed: LocalFileObservation | undefined;
+										// A remote editor commit/reject receipt is the executor's durable proof of
+										// the target outcome, the same proof recovery uses. Re-reading up to 20 MiB
+										// over RPC adds no evidence, only a timeout path into "uncertain".
+										const receiptProven = !!request.io && execution.receiptOutcome !== "unknown";
 										// Cancellation cannot suppress the bounded after observation/settlement.
-										try {
-											diagnostics.enter("after_validate");
-											await assertTarget();
-											diagnostics.enter("after_read");
-											observed = await io.read(canonicalPath, AbortSignal.timeout(5_000));
-										} catch (error) {
-											diagnostics.fail(error);
-											ioError ??= error;
-										}
+										if (!receiptProven)
+											try {
+												diagnostics.enter("after_validate");
+												await assertTarget();
+												diagnostics.enter("after_read");
+												observed = await io.read(canonicalPath, AbortSignal.timeout(5_000));
+											} catch (error) {
+												diagnostics.fail(error);
+												ioError ??= error;
+											}
 										// Sample once at the IO boundary. Metadata callbacks never resample or
 										// downgrade the grade or line counts of an immutable settled receipt.
 										// The exact before/after observation remains reversible even when a nearby
@@ -1933,7 +1960,9 @@ export class LocalFileChangeRuntime {
 										const attributionCeiling = "measured";
 										try {
 											let observedAfter: FileChangeState;
-											if (!observed) {
+											if (receiptProven) {
+												observedAfter = applied ? afterState : beforeState;
+											} else if (!observed) {
 												observedAfter = { kind: "unknown", reason: "missing_after" };
 											} else if (
 												observed.bytes !== null &&
@@ -1951,13 +1980,10 @@ export class LocalFileChangeRuntime {
 													AbortSignal.timeout(5_000),
 												);
 											}
-											// A committed helper reply does not make a failed Host observation
-											// immutable evidence. Leave it recoverable by the original query,
+											// An unknown remote outcome stays recoverable by the original query,
 											// just as for a lost reply; generic tool receipts remain unchanged.
 											const deferredEditorReceipt =
-												!!request.io &&
-												(execution.receiptOutcome === "unknown" ||
-													(applied && !fileChangeStatesEqual(afterState, observedAfter)));
+												!!request.io && execution.receiptOutcome === "unknown";
 											if (deferredEditorReceipt) lease.markUncertain(true);
 											if (deferredEditorReceipt)
 												observedAfter = { kind: "unknown", reason: "result_unknown" };

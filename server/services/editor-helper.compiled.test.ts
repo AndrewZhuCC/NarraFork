@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { testEnvironment } from "../../tests/preload";
 import { safeSpawn } from "../lib/spawn";
 
-test("compiled Host bridge and actual native helper save 20 MiB and recover a lost v1 reply", async () => {
+test("compiled remote IO adapter and controlled native executor save 0/3/20 MiB and recover a lost raw reply", async () => {
 	const project = resolve(import.meta.dir, "../.."),
 		root = await mkdtemp(join(testEnvironment.isolatedHome, "compiled-editor-"));
 	const binary = resolve(
@@ -39,6 +39,10 @@ test("compiled Host bridge and actual native helper save 20 MiB and recover a lo
 			timeout: 60_000,
 			maxOutputBytes: 64 * 1024,
 		});
+		if (run.exitCode !== 0)
+			throw new Error(
+				`Compiled native fixture exited ${run.exitCode}: ${run.stderr.slice(0, 4096)}\n${run.stdout.slice(0, 1024)}`,
+			);
 		expect(run.exitCode).toBe(0);
 		const line = run.stdout.split(/\r?\n/).find((line) => line.includes('"gate":"EDITOR_'));
 		if (!line) throw new Error(`Compiled helper proof missing: ${run.stderr.slice(0, 1024)}`);
@@ -49,8 +53,8 @@ test("compiled Host bridge and actual native helper save 20 MiB and recover a lo
 			binarySha256: digest,
 			lostReplyApplies: 1,
 			coldProof: "committed",
-			v1SeparateHashDomains: true,
-			privateRootReplacementRejected: true,
+			separateTextRawHashes: true,
+			rootReplacementRejected: true,
 		});
 		console.info("EDITOR_COMPILED_NATIVE_PROOF", JSON.stringify(proof));
 	} finally {

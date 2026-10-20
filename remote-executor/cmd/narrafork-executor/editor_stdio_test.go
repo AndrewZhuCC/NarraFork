@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,13 +39,10 @@ func (p *stdioPeer) finish() error {
 	return p.waitErr
 }
 
-func startEditorPeer(t *testing.T, binary, root, state string, epoch bool, hostReceipts ...string) *stdioPeer {
+func startEditorPeer(t *testing.T, binary, root, state string, epoch bool) *stdioPeer {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	args := []string{"editor-stdio", "--root", root, "--state-dir", state}
-	if len(hostReceipts) > 0 {
-		args = append(args, "--host-receipts-dir", hostReceipts[0])
-	}
 	if epoch {
 		args = append(args, "--epoch", "host-fixture-epoch")
 	}
@@ -135,7 +133,7 @@ func TestEditorStdioCompiledBinary(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("compile real helper: %v %s", err, output)
 	}
-	testEditorHostReceiptBinary(t, binary)
+	testEditorNativeBinary(t, binary)
 	for _, size := range []int{0, 3 * 1024 * 1024, 20 * 1024 * 1024} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			root := t.TempDir()
@@ -171,39 +169,29 @@ func TestEditorStdioCompiledBinary(t *testing.T) {
 			}
 		})
 	}
-	t.Run("concurrent-short-processes", func(t *testing.T) {
+	t.Run("restart-rejects-sealed-stage", func(t *testing.T) {
 		root := t.TempDir()
 		state := filepath.Join(t.TempDir(), "private-state")
 		path := filepath.Join(root, "document")
 		if err := os.WriteFile(path, []byte("base"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		a := startEditorPeer(t, binary, root, state, true)
-		b := startEditorPeer(t, binary, root, state, true)
-		ra := prepareStdio(t, a, root, path, "a", []byte("base"), []byte("one"))
-		rb := prepareStdio(t, b, root, path, "b", []byte("base"), []byte("two"))
-		var wg sync.WaitGroup
-		outcomes := make(chan string, 2)
-		for _, item := range []struct {
-			p *stdioPeer
-			r map[string]any
-		}{{a, ra}, {b, rb}} {
-			wg.Add(1)
-			go func(p *stdioPeer, r map[string]any) {
-				defer wg.Done()
-				outcomes <- p.must(t, "editor.apply", r)["outcome"].(string)
-			}(item.p, item.r)
+		first := startEditorPeer(t, binary, root, state, true)
+		req := prepareStdio(t, first, root, path, "never-dispatched", []byte("base"), []byte("one"))
+		if err := first.finish(); err != nil {
+			t.Fatal(err)
 		}
-		wg.Wait()
-		close(outcomes)
-		success := 0
-		for outcome := range outcomes {
-			if outcome == "committed" {
-				success++
-			}
+		cold := startEditorPeer(t, binary, root, state, true) // same work epoch, different engine incarnation
+		if r := cold.call(t, "editor.apply", req); r.OK || !strings.Contains(r.Error, "EDITOR_RUNTIME_CHANGED") {
+			t.Fatal("sealed stage crossed an engine restart", r)
 		}
-		if success != 1 {
-			t.Fatal("cross-process lock did not serialize source baseline", success)
+		query := map[string]any{"namespace": req["namespace"], "resourceKey": req["resourceKey"], "operationId": req["operationId"], "requestDigest": req["requestDigest"]}
+		if q := cold.must(t, "editor.query", query); q["outcome"] != "not_found" {
+			t.Fatal("stale-stage refusal fabricated historical execution evidence", q)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil || string(body) != "base" {
+			t.Fatal("restart replayed the old stage", err)
 		}
 	})
 	t.Run("limited-surfaces", func(t *testing.T) {

@@ -190,6 +190,13 @@
 			"when": 1792402612753,
 			"tag": "0026_draft_previous",
 			"breakpoints": true
+		},
+		{
+			"idx": 27,
+			"version": "7",
+			"when": 1792413740206,
+			"tag": "0027_editor_operation_recovery",
+			"breakpoints": true
 		}
   ]
 }

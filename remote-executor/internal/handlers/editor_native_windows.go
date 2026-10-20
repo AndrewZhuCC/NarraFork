@@ -102,7 +102,6 @@ func validateEditorSourceWritable(file *os.File) error {
 	}
 	return nil
 }
-func validateEditorHostRecordFile(file *os.File) error { return validateWindowsConditionalFile(file) }
 
 // Windows does not offer POSIX directory fsync. Files/journal are flushed; native
 // ReplaceFileW and handle no-replace retain their documented NTFS guarantees.

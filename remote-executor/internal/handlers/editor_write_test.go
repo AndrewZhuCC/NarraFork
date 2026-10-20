@@ -187,10 +187,8 @@ func TestEditorFailureBoundariesNeverInferSuccess(t *testing.T) {
 			if q2 := f.query(t, req); q2.Outcome != expected {
 				t.Fatal("unstable recovery")
 			}
-			if point == "applying" || written {
-				if _, err := os.Stat(f.e.bodyPath(req.StageID)); err != nil {
-					t.Fatal("uncertain evidence deleted", err)
-				}
+			if _, err := os.Stat(f.e.bodyPath(req.StageID)); !os.IsNotExist(err) {
+				t.Fatal("recovered receipt retained the stage body", err)
 			}
 		})
 	}
@@ -439,20 +437,13 @@ func TestEditorExpiredUndispatchedCleanupPreservesUncertain(t *testing.T) {
 	if _, err := f.h.EditorDispatch(context.Background(), "editor.apply", editorParams(t, req)); err == nil {
 		t.Fatal("fault not reached")
 	}
-	var stage editorStage
-	if err := editorReadJSON(f.e.stagePath(req.StageID), &stage); err != nil {
-		t.Fatal(err)
-	}
-	stage.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
-	if err := f.e.save(f.e.stagePath(req.StageID), &stage); err != nil {
-		t.Fatal(err)
-	}
+	f.e.stages[req.StageID].ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
 	f.restart(t)
 	if f.query(t, req).Outcome != "uncertain" {
 		t.Fatal("interrupted pending not uncertain")
 	}
 	f.call(t, "editor.stage.open", EditorStageOpen{Namespace: "owner", ResourceKey: "resource", MaxBytes: 1, IdleTimeoutMs: 30000})
-	if _, err := os.Stat(f.e.bodyPath(req.StageID)); err != nil {
+	if f.query(t, req).Outcome != "uncertain" {
 		t.Fatal("TTL destroyed uncertain evidence")
 	}
 	if _, err := f.h.EditorDispatch(context.Background(), "editor.stage.abort", editorParams(t, EditorStageAbort{Namespace: "owner", ResourceKey: "resource", StageID: req.StageID, Reason: "cancel"})); err == nil {
@@ -464,7 +455,7 @@ func TestEditorReceiptQuotaAndExpiredStageCleanup(t *testing.T) {
 	f := newEditorFixture(t, []byte("before"))
 	req := f.request(t, "at-quota", []byte("before"), []byte("after"))
 	for i := 0; i < editorMaxReceipts; i++ {
-		r := editorReceipt{Version: 1, State: "rejected", Request: EditorApplyRequest{Namespace: "inventory", ResourceKey: "other", OperationID: fmt.Sprint(i), RequestDigest: editorDigest([]byte(fmt.Sprint(i)))}, Result: editorFailure(fmt.Sprint(i), "rejected", "EDITOR_APPLY_REJECTED", "fixture")}
+		r := editorReceipt{Version: 1, State: "rejected", StageRawDigest: editorDigest([]byte("fixture")), StageBytes: 7, Request: EditorApplyRequest{Namespace: "inventory", ResourceKey: "other", OperationID: fmt.Sprint(i), RequestDigest: editorDigest([]byte(fmt.Sprint(i))), StageID: fmt.Sprintf("%s-%048x", f.e.stageEpoch, i)}, Result: editorFailure(fmt.Sprint(i), "rejected", "EDITOR_APPLY_REJECTED", "fixture")}
 		b, _ := json.Marshal(r)
 		if err := os.WriteFile(f.e.receiptPath("inventory", r.Request.OperationID), b, 0600); err != nil {
 			t.Fatal(err)
@@ -482,14 +473,7 @@ func TestEditorReceiptQuotaAndExpiredStageCleanup(t *testing.T) {
 	}
 	g := newEditorFixture(t, nil)
 	s := g.call(t, "editor.stage.open", EditorStageOpen{Namespace: "owner", ResourceKey: "resource", MaxBytes: 1, IdleTimeoutMs: 30000}).(EditorStageHandle)
-	var expired editorStage
-	if err := editorReadJSON(g.e.stagePath(s.StageID), &expired); err != nil {
-		t.Fatal(err)
-	}
-	expired.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
-	if err := g.e.save(g.e.stagePath(s.StageID), &expired); err != nil {
-		t.Fatal(err)
-	}
+	g.e.stages[s.StageID].ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
 	g.call(t, "editor.stage.open", EditorStageOpen{Namespace: "owner", ResourceKey: "resource", MaxBytes: 1, IdleTimeoutMs: 30000})
 	if _, err := os.Stat(g.e.bodyPath(s.StageID)); !os.IsNotExist(err) {
 		t.Fatal("expired undispatched stage leaked")

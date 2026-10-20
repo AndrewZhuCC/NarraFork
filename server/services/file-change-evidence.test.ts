@@ -191,6 +191,35 @@ function operationInput(
 	};
 }
 
+test("editor operation persists its original lease and full safe-integer remote snapshot revision", () => {
+	const input = operationInput({
+		sourceKind: "editor",
+		executionBinding: { ...binding, deviceId: "remote-fixture" },
+		workspaceLeaseId: "original-lease",
+		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
+	});
+	const recorded = service.beginOperation(input);
+	expect(service.getEditorOperation(source, input.sourceId)).toMatchObject({
+		id: recorded.id,
+		workspaceLeaseId: "original-lease",
+		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
+	});
+	const ordinary = service.beginOperation(operationInput());
+	expect(ordinary.workspaceLeaseId).toBeNull();
+	expect(ordinary.editorRawSnapshotRevision).toBeNull();
+	for (const revision of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1])
+		expect(() =>
+			service.beginOperation(
+				operationInput({ ...input, sourceId: generateId(), editorRawSnapshotRevision: revision }),
+			),
+		).toThrow();
+	expect(() =>
+		service.beginOperation(
+			operationInput({ ...input, sourceId: generateId(), executionBinding: binding }),
+		),
+	).toThrow();
+});
+
 function effectInput(
 	before: FileChangeState = ABSENT,
 	intendedAfter: FileChangeState = known(),

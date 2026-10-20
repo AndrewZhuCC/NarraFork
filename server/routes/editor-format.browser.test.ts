@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -17,15 +17,15 @@ import { narrators, users } from "../db/schema";
 import { generateId } from "../lib/id";
 import { safeSpawn } from "../lib/spawn";
 import {
-	executeAtomicEditorFileChange,
+	executeEditorDocumentFileChange,
 	queryEditorOperation,
 } from "../services/editor-document-runtime";
 import {
 	type EditorDocumentDependencies,
 	EditorDocumentService,
 } from "../services/editor-document-service";
-import { EditorHelperSession, editorHelperDiagnostics } from "../services/editor-helper";
 import { createEditorDocumentRoutes } from "./editor-documents";
+import { denyHostEditorHelpers } from "./editor-native-fixture";
 
 const CHROME =
 	process.env.NF_TEST_CHROMIUM_PATH ??
@@ -69,9 +69,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 	let pause:
 		| { entered: ReturnType<typeof deferred>; released: ReturnType<typeof deferred> }
 		| undefined;
-	const helperOpen = spyOn(EditorHelperSession, "open").mockImplementation(async () => {
-		throw new Error("Host format saves must not launch an editor helper");
-	});
+	const processGuard = denyHostEditorHelpers();
 	// Production Host IO; the HTTP identity is synthetic like the existing fixture.
 	const execute: EditorDocumentDependencies["execute"] = async (request) => {
 		const gate = pause;
@@ -80,7 +78,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 			gate.entered.resolve();
 			await gate.released.promise;
 		}
-		const completed = await executeAtomicEditorFileChange(request);
+		const completed = await executeEditorDocumentFileChange(request);
 		writes++;
 		return completed;
 	};
@@ -604,8 +602,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		const final = await call("state");
 		expect(final.save.activeWorkers).toBe(0);
 		expect(final.codecs.workers).toBe(0);
-		expect(helperOpen).toHaveBeenCalledTimes(0);
-		expect(editorHelperDiagnostics()).toMatchObject({ processes: 0, roots: 0, queued: 0 });
+		expect(processGuard.starts).toBe(0);
 		console.info(
 			"EDITOR_FORMAT_CHROME146",
 			JSON.stringify({
@@ -624,7 +621,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		await browser?.close();
 		server?.stop(true);
 		await service.dispose();
-		helperOpen.mockRestore();
+		processGuard.restore();
 		await rm(bundleRoot, { recursive: true, force: true });
 		await rm(root, { recursive: true, force: true });
 	}

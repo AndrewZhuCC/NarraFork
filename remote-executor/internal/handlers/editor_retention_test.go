@@ -64,7 +64,7 @@ func TestEditorAcknowledgedReceiptRetentionAndPressure(t *testing.T) {
 				r := old
 				r.Request.OperationID = fmt.Sprintf("history-%d", i)
 				r.Request.RequestDigest = editorDigest([]byte(r.Request.OperationID))
-				r.Request.StageID = fmt.Sprintf("%048x", i)
+				r.Request.StageID = fmt.Sprintf("%s-%048x", f.e.stageEpoch, i)
 				r.Result = &EditorApplyResult{OperationID: r.Request.OperationID, Outcome: "committed", RawDigest: old.Result.RawDigest, TotalBytes: old.Result.TotalBytes}
 				if policy == "full-inventory-pressure" {
 					r.AcknowledgedAt = old.AcknowledgedAt + 1
@@ -79,17 +79,8 @@ func TestEditorAcknowledgedReceiptRetentionAndPressure(t *testing.T) {
 			}
 			f.restart(t)
 			next := f.request(t, "next-save", []byte("same"), []byte("next"))
-			if q := f.query(t, req); q.Outcome != "not_found" {
-				t.Fatalf("acknowledged history not retired: %+v", q)
-			}
-			if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-				t.Fatal("unreferenced fence inventory leaked", err)
-			}
-			if _, err := os.Stat(f.e.stagePath(req.StageID)); !os.IsNotExist(err) {
-				t.Fatal("retired stage capability survived receipt removal")
-			}
-			if _, err := os.Stat(f.e.bodyPath(req.StageID)); !os.IsNotExist(err) {
-				t.Fatal("retired body survived receipt removal")
+			if q := f.query(t, req); q.Outcome != "committed" {
+				t.Fatal("upload performed hidden durable receipt maintenance", q)
 			}
 			renamed := 0
 			f.e.fault = func(point string) error {
@@ -98,17 +89,26 @@ func TestEditorAcknowledgedReceiptRetentionAndPressure(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := f.h.EditorDispatch(context.Background(), "editor.apply", editorParams(t, req)); err == nil {
-				t.Fatal("expired immutable attempt was installed again")
-			}
-			if renamed != 0 {
-				t.Fatal("old digest coincidence caused replay")
-			}
 			if got := f.call(t, "editor.apply", next).(EditorApplyResult); got.Outcome != "committed" {
 				t.Fatal("normal save remained quota blocked", got)
 			}
+			if q := f.query(t, req); q.Outcome != "not_found" {
+				t.Fatalf("acknowledged history not retired on durable operation: %+v", q)
+			}
+			if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+				t.Fatal("unreferenced fence inventory leaked", err)
+			}
+			if _, ok := f.e.stages[req.StageID]; ok {
+				t.Fatal("retired stage capability survived receipt removal")
+			}
+			if _, err := os.Stat(f.e.bodyPath(req.StageID)); !os.IsNotExist(err) {
+				t.Fatal("retired body survived receipt removal")
+			}
+			if _, err := f.h.EditorDispatch(context.Background(), "editor.apply", editorParams(t, req)); err == nil {
+				t.Fatal("expired immutable attempt was installed again")
+			}
 			if renamed != 1 {
-				t.Fatal("next save did not perform exactly one install", renamed)
+				t.Fatal("old attempt caused a second installation", renamed)
 			}
 			f.restart(t)
 			if q := f.query(t, req); q.Outcome != "not_found" {
@@ -162,9 +162,6 @@ func TestEditorRetentionNeverDeletesSoleProofOrUncertain(t *testing.T) {
 	if got := g.query(t, unknown); got.Outcome != "uncertain" {
 		t.Fatal("unknown proof expired", got)
 	}
-	if _, err := os.Stat(g.e.bodyPath(unknown.StageID)); err != nil {
-		t.Fatal("unknown body evidence expired", err)
-	}
 }
 
 func TestEditorFenceBudgetDoesNotPermanentlyBlockCleanup(t *testing.T) {
@@ -205,14 +202,7 @@ func TestEditorFenceCleanupKeepsOutstandingStageCeiling(t *testing.T) {
 	if _, err := os.Stat(ceiling); err != nil {
 		t.Fatal("outstanding stage lost its fence ceiling", err)
 	}
-	var stage editorStage
-	if err := editorReadJSON(f.e.stagePath(s.StageID), &stage); err != nil {
-		t.Fatal(err)
-	}
-	stage.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
-	if err := f.e.save(f.e.stagePath(s.StageID), stage); err != nil {
-		t.Fatal(err)
-	}
+	f.e.stages[s.StageID].ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
 	if _, _, _, err := f.e.inventory(); err != nil {
 		t.Fatal(err)
 	}

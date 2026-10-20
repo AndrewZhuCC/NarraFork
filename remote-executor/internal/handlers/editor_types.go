@@ -20,6 +20,9 @@ type EditorStageOpen struct {
 	MaxBytes      int64  `json:"maxBytes"`
 	IdleTimeoutMs int64  `json:"idleTimeoutMs"`
 }
+
+// Opaque engine-local capability, including after seal. Never parse it or
+// recover it in another engine; a dispatched operation is recovered by query.
 type EditorStageHandle struct {
 	StageID     string `json:"stageId"`
 	ResourceKey string `json:"resourceKey"`
