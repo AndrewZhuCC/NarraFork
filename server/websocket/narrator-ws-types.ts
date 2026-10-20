@@ -42,6 +42,13 @@ export interface NarratorListStateSnapshotItem {
 	activeBackgroundTaskCount?: number;
 	activeBackgroundWorkCount?: number;
 	activeBackgroundServiceCount?: number;
+	/**
+	 * Present when this snapshot shows a done-state (idle + unread) whose
+	 * wake-capable background work is still running (bash tasks / subagents —
+	 * never transfers or services). The client marks unread but suppresses the
+	 * sound/PWA notification, mirroring the live status_change flag.
+	 */
+	backgroundWorkActive?: boolean;
 }
 
 /** Reflection gate families that report live progress. */
@@ -284,6 +291,14 @@ export type NarratorServerMessage =
 			status: string;
 			substatus?: string[];
 			turnStartedAt?: string;
+			/**
+			 * Present on the done-transition (idle + unread) when background work
+			 * whose completion wakes the narrator (bash tasks / subagents — never
+			 * transfers or services) is still running: the client still marks the
+			 * narrator unread but suppresses the sound/PWA notification. Mirrors
+			 * the flag on the `narrator:attention` bus event.
+			 */
+			backgroundWorkActive?: boolean;
 	  }
 	| { type: "substatus_change"; narratorId: string; substatus: string[] }
 	| {

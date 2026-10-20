@@ -168,7 +168,7 @@ type PublicEvent = {
 | `narrafork.chapter.commits.changed` | `chapterId`, `newCount`, `headCommitSha?` | 不含完整 diff | user-scoped |
 | `narrafork.review.lifecycle` | `reviewChapterId`, `sourceChapterId`, `status`, `verdict?` | review created/concluded/converted/dismissed | user-scoped |
 | `narrafork.narrator.lifecycle` | `narratorId`, `chapterId?`, `type`, `status`, `substatus`, `messageVersion?` | `narrator:status_changed` 等 | user-scoped |
-| `narrafork.narrator.attention` | `narratorId`, `reason`, `detail?` | `narrator:attention`/resolved | user-scoped |
+| `narrafork.narrator.attention` | `narratorId`, `reason`, `detail?`, `backgroundWorkActive?` | `narrator:attention`/resolved；`backgroundWorkActive=true` 表示 done 时仍有完成即唤醒的后台任务（后台 bash/子代理，不含传输与服务）在跑，通知渠道自行抑制，插件自行决定 | user-scoped |
 | `narrafork.narrator.message.changed` | `narratorId`, `messageId`, `role`, `createdAt`, `messageVersion` | 只给元数据，不给正文 | user-scoped |
 | `narrafork.narrator.tool.changed` | `narratorId`, `toolUseId`, `toolName`, `status`, `durationMs`, `outputBytes?` | 不给 input/output JSON | user-scoped |
 | `narrafork.narrator.permission.changed` | `narratorId`, `requestId`, `state`, `toolName?`, `decision?` | 不给完整请求参数 | user-scoped |

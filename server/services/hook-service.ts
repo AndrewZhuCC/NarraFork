@@ -45,6 +45,15 @@ export interface HookInput {
 	attention_reason?: AttentionReason;
 	/** Extra context — e.g. the user's decision ("allow" / "deny") for a resolved permission. */
 	attention_detail?: string;
+	/**
+	 * `done` only: the turn finished but background work whose completion wakes
+	 * the narrator (background bash tasks / subagents — never transfers or
+	 * services) is still running. IM/sound/browser notifications suppress
+	 * themselves on this flag; hooks receive it and decide for themselves — the
+	 * wake-up turn after the last background task completes raises a fresh `done`
+	 * WITHOUT the flag.
+	 */
+	background_work_active?: boolean;
 }
 
 export interface HookResult {

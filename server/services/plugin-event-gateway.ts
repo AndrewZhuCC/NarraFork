@@ -587,6 +587,9 @@ export const defaultPluginEventMapper: PluginEventMapper = (event, context) => {
 				reason: String(value.reason),
 				state: type.endsWith("resolved") ? "resolved" : "raised",
 				...(boundedText(value.detail) ? { detail: boundedText(value.detail) as string } : {}),
+				// Done with background work still running: notification channels
+				// suppress on this flag; plugin receivers decide for themselves.
+				...(value.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 			},
 			"user_scoped",
 			context,

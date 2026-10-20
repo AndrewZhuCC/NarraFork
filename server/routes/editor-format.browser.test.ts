@@ -178,10 +178,20 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 			...args: Parameters<(typeof Fixture)[K]>
 		) {
 			return (await page.evaluate(
-				({ method, args }) =>
-					((window as unknown as RawWindow).rawFixture[method] as (...args: unknown[]) => unknown)(
-						...args,
-					),
+				async ({ method, args }) => {
+					const pending = (
+						(window as unknown as RawWindow).rawFixture[method] as (...args: unknown[]) => unknown
+					)(...args);
+					// Puppeteer drops a page promise it does not see the page retain
+					// ("Promise was collected") when Monaco keeps the renderer busy.
+					const hold = window as unknown as { __rawHeld?: unknown };
+					hold.__rawHeld = pending;
+					try {
+						return await pending;
+					} finally {
+						if (hold.__rawHeld === pending) hold.__rawHeld = undefined;
+					}
+				},
 				{ method, args },
 			)) as Awaited<ReturnType<(typeof Fixture)[K]>>;
 		}

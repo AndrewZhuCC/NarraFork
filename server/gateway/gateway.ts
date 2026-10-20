@@ -961,6 +961,11 @@ class Gateway {
 		// rather than re-derived from status/substatus, so reflection mid-states
 		// and takeover fallbacks never trigger a spurious IM ping.
 		eventBus.on("narrator:attention", async (event) => {
+			// Done with background work still running: the session is not actually
+			// finished, so the recent-tab IM ping is suppressed. The wake-up turn
+			// after the last background task emits a fresh unflagged "done".
+			// The reason check is defensive — the flag is only produced for done.
+			if (event.backgroundWorkActive && event.reason === "done") return;
 			await this.notifyRecentTabStatusChange(event.narratorId, event.reason);
 		});
 

@@ -231,7 +231,8 @@ describe("PluginConfigForm rendering", () => {
 		expect(password).toBeDefined();
 		expect(password?.value).toBe(SECRET_PLACEHOLDER);
 		// Nothing in the DOM should ever contain a real credential; the server never sent one.
-		expect(container?.innerHTML ?? "").not.toContain("sk-");
+		// Mantine ids are random base36 (`mantine-…sk` + `-label`), so drop them first.
+		expect((container?.innerHTML ?? "").replace(/mantine-[a-z0-9]+/g, "")).not.toContain("sk-");
 	});
 
 	test("shows an empty secret input when no secret is stored", async () => {

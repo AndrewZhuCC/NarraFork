@@ -1055,9 +1055,39 @@ function toListStateSnapshotItem(row: NarratorStatusRow): NarratorListStateSnaps
 // Panel snapshots retain the existing per-narrator status_change behavior.
 async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
 	const rows = await loadStatusRows(narratorIds);
+	// Replay the done-transition suppression flag: an idle+unread narrator whose
+	// background work is still running must not re-trigger the client's sound/PWA
+	// on (re)subscribe. Consumed by RecentTabs' shared-connection listener, which
+	// also sees panel snapshot frames for narrators in its window. Materialized
+	// read only — a snapshot path never flushes.
+	let workActiveIds: Set<string> | undefined;
+	try {
+		const { backgroundOccupancyStore } = await import("../services/background-occupancy-store");
+		if (backgroundOccupancyStore.isReady) {
+			workActiveIds = new Set(
+				rows
+					.filter((row) => backgroundOccupancyStore.countActiveWakeWork(row.id) > 0)
+					.map((row) => row.id),
+			);
+		}
+	} catch {
+		// Occupancy may be incomplete during startup: omit the flag, notify as usual.
+	}
 	for (const row of rows) {
 		if (!connections.has(ws)) return;
-		if (!safeSend(ws, { type: "status_change", ...toListStateSnapshotItem(row) })) return;
+		const item = toListStateSnapshotItem(row);
+		const backgroundWorkActive =
+			item.status === "idle" &&
+			item.substatus?.includes("unread") &&
+			workActiveIds?.has(row.id) === true;
+		if (
+			!safeSend(ws, {
+				type: "status_change",
+				...item,
+				...(backgroundWorkActive ? { backgroundWorkActive } : {}),
+			})
+		)
+			return;
 	}
 }
 
@@ -1075,12 +1105,21 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 			| Map<string, import("@shared/background-task-list").BackgroundTaskActiveCounts>
 			| undefined;
 		const freshCountIds = new Set<string>();
+		const wakeWorkActiveIds = new Set<string>();
 		try {
 			const { backgroundTaskService } = await import("../services/background-task-service");
+			const { backgroundOccupancyStore } = await import("../services/background-occupancy-store");
 			const versionsAtRead = new Map(
 				rows.map((row) => [row.id, backgroundTaskService.getListVersion(row.id)]),
 			);
 			counts = await backgroundTaskService.countActiveKindsByParentBatch(rows.map((row) => row.id));
+			// The batch count read flushed the store, so the wake-work read below is
+			// materialized and free. Wake-work (bash tasks + subagents) is a STRICTER
+			// set than the badge's work count: transfers count as work but never wake
+			// the parent, so they must not suppress the notification.
+			for (const row of rows) {
+				if (backgroundOccupancyStore.countActiveWakeWork(row.id) > 0) wakeWorkActiveIds.add(row.id);
+			}
 			// List subscriptions are already live. A count frame delivered during
 			// this read must win over the older snapshot, independently per narrator.
 			for (const row of rows) {
@@ -1099,20 +1138,34 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 		const rowsById = new Map(rows.map((row) => [row.id, row]));
 		const items = batchIds.flatMap((id) => {
 			const row = rowsById.get(id);
-			return row
-				? [
-						{
-							...toListStateSnapshotItem(row),
-							...(counts && freshCountIds.has(id)
-								? {
-										activeBackgroundTaskCount: counts.get(id)?.activeCount ?? 0,
-										activeBackgroundWorkCount: counts.get(id)?.activeWorkCount ?? 0,
-										activeBackgroundServiceCount: counts.get(id)?.activeServiceCount ?? 0,
-									}
-								: {}),
-						},
-					]
-				: [];
+			if (!row) return [];
+			const item = toListStateSnapshotItem(row);
+			const freshCounts = counts && freshCountIds.has(id) ? counts.get(id) : undefined;
+			return [
+				{
+					...item,
+					...(freshCounts
+						? {
+								activeBackgroundTaskCount: freshCounts.activeCount,
+								activeBackgroundWorkCount: freshCounts.activeWorkCount,
+								activeBackgroundServiceCount: freshCounts.activeServiceCount,
+							}
+						: {}),
+					// Snapshot replay of the done-transition flag (see sendStatusSnapshot).
+					// The flag comes from the flushed wake-work read above. It must not
+					// depend on the badge counts being fresh: a list-version bump during
+					// this read correctly drops the counts (a newer count frame wins),
+					// but nothing else carries the suppression flag. Dropping it here
+					// makes a resubscribe play sound/PWA for a done that is still waiting
+					// on wake-capable background work.
+					...(counts &&
+					wakeWorkActiveIds.has(id) &&
+					item.status === "idle" &&
+					item.substatus?.includes("unread")
+						? { backgroundWorkActive: true }
+						: {}),
+				},
+			];
 		});
 		if (!safeSend(ws, { type: "list_state_snapshot", items })) return;
 	}
