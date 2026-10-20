@@ -8,6 +8,7 @@ import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response"
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "./lib/cors-origin";
 import { DiskSpaceError, isDiskFullError } from "./lib/disk-safety";
 import { catalogError } from "./lib/errors";
+import { stallTimeBetween, trackInFlight } from "./lib/event-loop-monitor";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
@@ -211,16 +212,22 @@ app.use("/api/*", async (c, next) => {
 
 app.use("/api/*", async (c, next) => {
 	const startedAt = performance.now();
+	const done = trackInFlight(`${c.req.method} ${c.req.path}`);
 	try {
 		await next();
 	} finally {
-		const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+		done();
+		const endedAt = performance.now();
+		const durationMs = Math.round((endedAt - startedAt) * 100) / 100;
 		if (durationMs >= SLOW_API_REQUEST_MS) {
+			// stalledMs ≈ durationMs: the main thread was blocked (by this request or another, see
+			// "Event loop lag detected"). stalledMs ≈ 0: the request itself awaited slow work.
 			logger.warn("Slow API request", {
 				method: c.req.method,
 				path: c.req.path,
 				status: c.res.status,
 				durationMs,
+				...stallTimeBetween(startedAt, endedAt),
 			});
 		}
 	}
