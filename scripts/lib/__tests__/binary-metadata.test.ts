@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { createHelperDistributionDependencies } from "../../../shared/helper-distribution";
+import {
+	COMPONENT_VERSIONS,
+	createHelperDistributionDependencies,
+} from "../../../shared/helper-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../../../shared/update-identity";
 import {
 	type BinaryMetadata,
@@ -44,8 +47,10 @@ describe("computeBinaryMetadataFromBuffer", () => {
 			);
 			expect(meta.version).toBe(version);
 			expect(JSON.parse(formatMetadataJson(meta)).helperDistribution).toEqual(helperDistribution);
-			expect(meta.helperDistribution?.executor.version).toBe("0.9.3");
-			expect(meta.helperDistribution?.executor.tag).toBe("executor-v0.9.3");
+			expect(meta.helperDistribution?.executor).toEqual({
+				...COMPONENT_VERSIONS.executor,
+				tag: `executor-v${COMPONENT_VERSIONS.executor.version}`,
+			});
 		}
 	});
 
