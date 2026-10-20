@@ -59,8 +59,15 @@ beforeEach(async () => {
 	root = createRoot(host);
 });
 
-afterEach(() => {
-	act(() => root.unmount());
+afterEach(async () => {
+	// Unmount and drain React's scheduler while the fake `window` still exists:
+	// the Popover's passive effects are scheduled as macrotasks, and one firing
+	// after the globals are restored reads `window.event` and throws
+	// "window is not defined" as an unhandled error in the NEXT test file.
+	await act(async () => root.unmount());
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
 	host.remove();
 	for (const [key, descriptor] of previousGlobals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -92,7 +99,7 @@ function mount(props: Parameters<typeof OpencodeQuotaIndicator>[0]) {
 		root.render(
 			<I18nextProvider i18n={instance}>
 				<MantineProvider env="test">
-					<OpencodeQuotaIndicator {...props} />
+					<OpencodeQuotaIndicator transitionDuration={0} {...props} />
 				</MantineProvider>
 			</I18nextProvider>,
 		);

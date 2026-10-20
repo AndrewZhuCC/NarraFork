@@ -171,6 +171,8 @@ export interface OpencodeQuotaIndicatorProps {
 	/** Status text of that wait, e.g. "Waiting for quota · <time>". */
 	waitingText?: string | null;
 	isMobile?: boolean;
+	/** Popover open/close animation in ms; tests pass 0 so no transition is scheduled. */
+	transitionDuration?: number;
 }
 
 /**
@@ -186,6 +188,7 @@ export function OpencodeQuotaIndicator({
 	waitingForQuota = false,
 	waitingText = null,
 	isMobile = false,
+	transitionDuration,
 }: OpencodeQuotaIndicatorProps) {
 	const { t } = useTranslation("narrator");
 	const [opened, setOpened] = useState(false);
@@ -215,7 +218,17 @@ export function OpencodeQuotaIndicator({
 	const ariaLabel = [t("opencode.title"), ...formatOpencodeSummaryLines(view, now, t)].join(". ");
 
 	return (
-		<Popover opened={opened} onChange={setOpened} position="top" withArrow withinPortal shadow="md">
+		<Popover
+			opened={opened}
+			onChange={setOpened}
+			position="top"
+			withArrow
+			withinPortal
+			shadow="md"
+			{...(transitionDuration === undefined
+				? {}
+				: { transitionProps: { duration: transitionDuration } })}
+		>
 			<Popover.Target>
 				<UnstyledButton
 					aria-label={ariaLabel}
