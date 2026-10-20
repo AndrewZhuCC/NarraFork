@@ -1778,7 +1778,8 @@ async function getSubmissionForViewer(principal: Principal, submissionId: string
 			reviewedAt: true,
 			createdAt: true,
 		},
-		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		// Rounds can share a millisecond timestamp; round then id keeps the order total.
+		orderBy: (s, { desc: d }) => [d(s.createdAt), d(s.round), d(s.id)],
 		limit: SUBMISSION_HISTORY_LIMIT,
 	});
 	const sameTarget = history.filter(
