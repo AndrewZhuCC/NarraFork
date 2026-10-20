@@ -1,7 +1,11 @@
 import { getDbPath } from "../../db/connection";
 import { runReadTask } from "../../lib/db-worker/pool";
-import { SEARCH_QUERY_MAX_ROWS, type SearchQueryParams } from "../../lib/db-worker/protocol";
-import { validateSearchQuery } from "../../lib/db-worker/search-query";
+import {
+	SELECT_ROWS_MAX_ROWS,
+	type SelectRowsParams,
+	type SelectRowsResult,
+} from "../../lib/db-worker/protocol";
+import { validateSelectRows } from "../../lib/db-worker/select-rows";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { logger } from "../../lib/logger";
@@ -22,9 +26,9 @@ export type SearchQueryExecutor = (
 
 type SearchTaskRunner = (
 	dbPath: string,
-	query: SearchQueryParams,
+	query: SelectRowsParams,
 	options: { timeoutMs: number; signal?: AbortSignal },
-) => Promise<Record<string, unknown>[]>;
+) => Promise<SelectRowsResult>;
 
 interface AdmissionState {
 	outstanding: number;
@@ -48,14 +52,14 @@ export function createSqliteSearchQueryExecutor(
 		if (execution.signal?.aborted) {
 			throw new AppError("Search was cancelled", 499, "SEARCH_QUERY_CANCELLED");
 		}
-		const query: SearchQueryParams = {
-			kind: "searchQuery",
+		const query: SelectRowsParams = {
+			kind: "selectRows",
 			sql,
 			params,
-			maxRows: SEARCH_QUERY_MAX_ROWS,
+			maxRows: SELECT_ROWS_MAX_ROWS,
 		};
 		try {
-			validateSearchQuery(query);
+			validateSelectRows(query);
 		} catch {
 			throw new AppError("Invalid or oversized search query", 413, "SEARCH_QUERY_BUDGET_EXCEEDED");
 		}
@@ -81,15 +85,17 @@ export function createSqliteSearchQueryExecutor(
 		try {
 			// The pool observes aborts while queued/running. The race also bounds cold-worker
 			// readiness, which can outlive a caller's deadline before any SQL is dispatched.
-			const rows = await Promise.race([
+			const result = await Promise.race([
 				runTask(typeof dbPath === "function" ? dbPath() : dbPath, query, {
 					timeoutMs,
 					signal: controller.signal,
 				}),
 				cancelled,
 			]);
-			rowCount = rows.length;
-			return rows;
+			rowCount = result.rows.length;
+			return result.rows.map((row) =>
+				Object.fromEntries(result.columns.map((column, index) => [column, row[index]])),
+			);
 		} catch {
 			// Never log SQL, bound values, or raw driver errors: they may contain transcript text.
 			const cancelled = execution.signal?.aborted;

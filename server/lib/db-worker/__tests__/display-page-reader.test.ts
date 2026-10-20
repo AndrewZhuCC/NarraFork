@@ -999,7 +999,7 @@ describe("real readonly display page worker", () => {
 			runReadTask(
 				dbPath,
 				{
-					kind: "searchQuery",
+					kind: "selectRows",
 					sql: "WITH RECURSIVE scan(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM scan WHERE n < ?) SELECT sum(n) FROM scan",
 					params: [20_000_000],
 					maxRows: 1,
