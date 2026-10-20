@@ -141,7 +141,7 @@ test.skipIf(process.platform === "win32")(
 			expect(created).toMatchObject({
 				output: `Wrote 10 bytes to ${filePath}`,
 				metadata: {
-					fileChangeEvidence: { version: 2, grade: "measured", settlement: "settled" },
+					fileChangeEvidence: { version: 3, grade: "measured", settlement: "settled" },
 				},
 			});
 			expect(created.isError).not.toBe(true);
@@ -153,7 +153,8 @@ test.skipIf(process.platform === "win32")(
 				.from(fileChangeStorageBudgets)
 				.where(eq(fileChangeStorageBudgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
 				.get();
-			expect(budgetAfterWrite?.status).toBe("ready");
+			expect(budgetAfterWrite?.status).toBe("unverified");
+			expect(created.metadata?.historyStatus).toBe("complete");
 
 			const edited = await editTool.execute(
 				{ file_path: filePath, old_string: "original", new_string: "edited" },
@@ -164,7 +165,7 @@ test.skipIf(process.platform === "win32")(
 				metadata: {
 					linesAdded: 1,
 					linesRemoved: 1,
-					fileChangeEvidence: { version: 2, grade: "measured", settlement: "settled" },
+					fileChangeEvidence: { version: 3, grade: "measured", settlement: "settled" },
 				},
 			});
 			expect(edited.isError).not.toBe(true);
@@ -190,7 +191,7 @@ test.skipIf(process.platform === "win32")(
 			expect(effects).toHaveLength(2);
 			for (const operation of operations) {
 				expect(operation).toMatchObject({
-					evidenceVersion: 2,
+					evidenceVersion: 3,
 					attempt: 1,
 					settlement: "settled",
 					executionOutcome: "succeeded",
@@ -213,7 +214,8 @@ test.skipIf(process.platform === "win32")(
 					attributionGrade: "measured",
 					executionConfirmed: true,
 					outcome: "changed",
-					executionReceiptJson: { confirmed: true, outcome: "applied" },
+					executionReceiptJson: null,
+					diskOutcome: "applied",
 				});
 				expect(effect.observedAfterStateJson).toEqual(effect.intendedAfterStateJson);
 				const state = effect.intendedAfterStateJson;
@@ -231,7 +233,12 @@ test.skipIf(process.platform === "win32")(
 				);
 				expect(
 					db.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, effect.scopeId)).get(),
-				).toMatchObject({ status: "active", activeLeaseId: null, activeMutationCount: 0 });
+				).toMatchObject({
+					status: "needs_verification",
+					activeLeaseId: null,
+					activeMutationCount: 0,
+					rootIdentityJson: null,
+				});
 			}
 			expect(
 				db

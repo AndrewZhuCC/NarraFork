@@ -10,6 +10,8 @@ import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as schema from "../db/schema";
 import { measureMessageCharacters } from "../lib/context-characters";
+import { createMailboxStore } from "./agent-runtime/mailbox";
+import type { RuntimeDb } from "./agent-runtime/mailbox-types";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
@@ -19,6 +21,7 @@ import {
 	RevertHistoryCommitService,
 } from "./revert-history-commit";
 import { RevertSelectionService } from "./revert-selection-service";
+import { loadSendTargetDetails } from "./send-delivery-resolution";
 
 // Actual schema/FKs/generated columns, with a real independent root and actual collector.
 // The template is test-preload-isolated; no production data, old deletion service, file
@@ -249,6 +252,23 @@ async function prepare(selector: FileChangeRevertSelector = { kind: "all" }, nar
 }
 function apply(token: PreparedRevertHistory) {
 	return db.transaction((tx) => service.applyToTransaction(tx, token));
+}
+/** Mutate on the next await after a real synchronous read has returned its original row. */
+function mutateAfterRead(matches: (text: string) => boolean, mutation: () => void) {
+	let scheduled = false;
+	const state = { mutated: false };
+	const realQuery = sqlite.query.bind(sqlite);
+	const trace = spyOn(sqlite, "query").mockImplementation(((text: string) => {
+		if (!scheduled && matches(text)) {
+			scheduled = true;
+			queueMicrotask(() => {
+				mutation();
+				state.mutated = true;
+			});
+		}
+		return realQuery(text);
+	}) as typeof sqlite.query);
+	return { state, restore: () => trace.mockRestore() };
 }
 function operation(toolId: string, mode: "effect" | "no_dispatch" = "effect") {
 	const toolRow = db
@@ -1161,12 +1181,18 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 						throw Error("rollback");
 					}),
 				).toThrow("rollback");
-			expect(() => apply(token)).toThrow("Database changed");
+			if (kind === "unrelated" || kind === "rollback") {
+				apply(token);
+				expect(count("narrator_messages")).toBe(0);
+				expect(version()).toBe(8);
+				return;
+			}
+			expect(() => apply(token)).toThrow("Selected history changed");
 			expect(count("narrator_messages")).toBe(1);
 			expect(count("narrator_tool_calls")).toBe(2);
 			expect(version()).toBe(7);
 		});
-	test("external connection data_version rejects an unrelated committed write", async () => {
+	test("external metadata-only writes preserve selected message versions", async () => {
 		const filename = join(process.env.HOME as string, `history-${Date.now()}.sqlite`);
 		const fileDb = new Database(filename);
 		connections.push(fileDb);
@@ -1204,9 +1230,10 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 		const external = new Database(filename);
 		connections.push(external);
 		external.query("UPDATE narrators SET title='external' WHERE id='root'").run();
-		expect(() => fileRoot.transaction((tx) => fileService.applyToTransaction(tx, token))).toThrow(
-			"Database changed",
-		);
+		fileRoot.transaction((tx) => fileService.applyToTransaction(tx, token));
+		expect(
+			fileDb.query<{ n: number }, []>("SELECT count(*) AS n FROM narrator_messages").get()?.n,
+		).toBe(0);
 	});
 	test("ACL reauthorization failure and writes inside await reject prepare", async () => {
 		withTools();
@@ -1218,7 +1245,7 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 		onAuthorize = () => {
 			sqlite.query("UPDATE narrators SET title='during-ACL' WHERE id='other'").run();
 		};
-		await expect(service.prepare({ principal, fixedSelection })).rejects.toBeDefined();
+		expect(await service.prepare({ principal, fixedSelection })).toBeDefined();
 		expect(count("narrator_messages")).toBe(1);
 	});
 	test("fake/mutable prepared, root-as-tx, different root and reused capabilities are rejected", async () => {
@@ -1272,7 +1299,7 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 		withTools();
 		const token = await prepare();
 		sqlite.exec("PRAGMA busy_timeout=1000;");
-		expect(() => apply(token)).toThrow("Database changed");
+		expect(() => apply(token)).toThrow("short SQLite waits");
 		expect(count("narrator_messages")).toBe(1);
 		expect(query<{ timeout: number }>("PRAGMA busy_timeout")[0].timeout).toBe(1000);
 	});
@@ -1307,6 +1334,628 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 		controller.abort();
 		expect(() => apply(token)).toThrow();
 		expect(count("narrator_messages")).toBe(1);
+	});
+});
+
+describe("batched consumed history guards", () => {
+	for (const index of [31, 32, 64])
+		test(`message/ref equality covers page boundary index ${index}`, async () => {
+			const ids = Array.from({ length: 65 }, (_, i) => message(i));
+			const token = await prepare();
+			sqlite
+				.query("UPDATE narrator_message_refs SET is_compact=1 WHERE message_id=?")
+				.run(ids[index]);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(65);
+			expect(count("narrator_message_refs")).toBe(65);
+			expect(version()).toBe(7);
+		});
+	for (const kind of ["empty", "replace", "retarget", "swap-across-page"] as const)
+		test(`association ${kind} drift cannot hide behind a batch count`, async () => {
+			const ids = Array.from({ length: 65 }, (_, i) => message(i));
+			const add = (id: string, messageId: string) =>
+				sqlite
+					.query(
+						"INSERT INTO api_requests(id,message_id,created_at,provider,model) VALUES(?,?,?,?,?)",
+					)
+					.run(id, messageId, time, "fixture", "fixture");
+			if (kind !== "empty") add("first", ids[0]);
+			if (kind === "swap-across-page") add("second", ids[32]);
+			const token = await prepare();
+			if (kind === "empty") add("new", ids[32]);
+			if (kind === "replace") {
+				sqlite.query("DELETE FROM api_requests WHERE id='first'").run();
+				add("replacement", ids[0]);
+			}
+			if (kind === "retarget")
+				sqlite.query("UPDATE api_requests SET message_id=? WHERE id='first'").run(ids[1]);
+			if (kind === "swap-across-page") {
+				sqlite.query("UPDATE api_requests SET message_id=? WHERE id='first'").run(ids[32]);
+				sqlite.query("UPDATE api_requests SET message_id=? WHERE id='second'").run(ids[0]);
+			}
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(65);
+			expect(version()).toBe(7);
+		});
+	test("an originally tool-free message remains a membership target after page 32", async () => {
+		const ids = Array.from({ length: 33 }, (_, i) => message(i));
+		const token = await prepare();
+		tool(ids[32], "new");
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(count("narrator_messages")).toBe(33);
+		expect(count("narrator_tool_calls")).toBe(1);
+	});
+	for (const kind of ["replace", "retarget"] as const)
+		test(`tool ${kind} with unchanged inventory count is rejected`, async () => {
+			const first = withTools(1, ["first"]);
+			const second = withTools(2, ["second"]);
+			const token = await prepare();
+			if (kind === "replace") {
+				sqlite.query("DELETE FROM narrator_tool_calls WHERE id=?").run(first.tools[0]);
+				tool(first.messageId, "first");
+			} else {
+				sqlite
+					.query("UPDATE narrator_tool_calls SET message_id=? WHERE id=?")
+					.run(second.messageId, first.tools[0]);
+				sqlite
+					.query("UPDATE narrator_tool_calls SET message_id=? WHERE id=?")
+					.run(first.messageId, second.tools[0]);
+			}
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(2);
+			expect(count("narrator_tool_calls")).toBe(2);
+		});
+	test("shared true to false is rejected without fixing an arbitrary other ref ID", async () => {
+		const id = message(1);
+		const other = ref(id, "fork", 1);
+		const token = await prepare();
+		sqlite.query("DELETE FROM narrator_message_refs WHERE id=?").run(other);
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(body(id)).toBeDefined();
+		expect(version()).toBe(7);
+	});
+	test("replacing the other owner ref preserves an unchanged shared predicate", async () => {
+		const id = message(1);
+		const other = ref(id, "fork", 1);
+		const token = await prepare();
+		sqlite.query("DELETE FROM narrator_message_refs WHERE id=?").run(other);
+		ref(id, "other", 1);
+		apply(token);
+		expect(body(id)).toBeDefined();
+		expect(count("narrator_message_refs")).toBe(1);
+		expect(version()).toBe(8);
+	});
+	for (const action of ["rewrite", "copy_on_write", "unlink"] as const)
+		test(`new hidden compact refs reject ${action} after preparation`, async () => {
+			const target = withTools();
+			if (action !== "rewrite") ref(target.messageId, "fork", 1);
+			const hidden = message(2, undefined, action === "unlink" ? "root" : "other");
+			const selector: FileChangeRevertSelector =
+				action === "unlink"
+					? { kind: "messages", messageIds: [target.messageId] }
+					: { kind: "tool_calls", toolCallIds: [target.tools[0]] };
+			const token = await prepare(selector);
+			sqlite
+				.query("UPDATE narrator_message_refs SET segment_compact_id=? WHERE message_id=?")
+				.run(target.messageId, hidden);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(2);
+			expect(version()).toBe(7);
+		});
+	test("unlink compact guard only fixes the selected owner's hidden refs", async () => {
+		const id = message(1);
+		ref(id, "fork", 1);
+		const hidden = message(2, undefined, "other");
+		const token = await prepare({ kind: "messages", messageIds: [id] });
+		sqlite
+			.query("UPDATE narrator_message_refs SET segment_compact_id=? WHERE message_id=?")
+			.run(id, hidden);
+		apply(token);
+		expect(body(id)).toBeDefined();
+		expect(version()).toBe(8);
+	});
+	for (const table of ["message", "tool"] as const)
+		test(`complete COW ${table} fields reject equal-byte extra-field edits`, async () => {
+			const target = withTools();
+			ref(target.messageId, "fork", 1);
+			const update =
+				table === "message"
+					? "UPDATE narrator_messages SET turn_usage_json=? WHERE id=?"
+					: "UPDATE narrator_tool_calls SET error_message=? WHERE id=?";
+			const id = table === "message" ? target.messageId : target.tools[1];
+			sqlite.query(update).run("old", id);
+			const token = await prepare({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+			sqlite.query(update).run("new", id);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(1);
+			expect(count("narrator_tool_calls")).toBe(2);
+			expect(version()).toBe(7);
+		});
+	for (const table of ["message", "tool"] as const)
+		test(`COW ${table} full read cannot rebaseline earlier consumed metadata`, async () => {
+			const target = withTools();
+			ref(target.messageId, "fork", 1);
+			const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+			const injection = mutateAfterRead(
+				(text) =>
+					table === "message"
+						? text.startsWith("SELECT id,role,tree_hash_after,snapshot_commit_sha,")
+						: text.includes(
+								"is_file_history_checkpoint,status,execution_attempt,file_change_operation_id,tool_name,",
+							),
+				() =>
+					table === "message"
+						? sqlite
+								.query("UPDATE narrator_messages SET role='different' WHERE id=?")
+								.run(target.messageId)
+						: sqlite
+								.query("UPDATE narrator_tool_calls SET tool_name='Glob' WHERE id=?")
+								.run(target.tools[1]),
+			);
+			try {
+				const error = await service
+					.prepare({ principal, fixedSelection })
+					.catch((error: unknown) => error);
+				expect(injection.state.mutated).toBe(true);
+				expect(error).toMatchObject({
+					code: "REVERT_HISTORY_STALE",
+					message: "Selected history changed during preparation",
+				});
+			} finally {
+				injection.restore();
+			}
+			expect(count("narrator_messages")).toBe(1);
+			expect(version()).toBe(7);
+		});
+	for (const table of ["message", "tool"] as const)
+		test(`COW ${table} full row consumed before await stays fixed through compilation`, async () => {
+			const target = withTools();
+			ref(target.messageId, "fork", 1);
+			const update =
+				table === "message"
+					? "UPDATE narrator_messages SET turn_usage_json=? WHERE id=?"
+					: "UPDATE narrator_tool_calls SET error_message=? WHERE id=?";
+			const id = table === "message" ? target.messageId : target.tools[1];
+			sqlite.query(update).run("old", id);
+			const fixedSelection = await select({ kind: "tool_calls", toolCallIds: [target.tools[0]] });
+			const injection = mutateAfterRead(
+				(text) =>
+					text.startsWith('SELECT "id",') &&
+					text.includes(table === "message" ? '"turn_usage_json"' : '"error_message"'),
+				() => {
+					sqlite.query(update).run("new", id);
+				},
+			);
+			let token: PreparedRevertHistory;
+			try {
+				token = await service.prepare({ principal, fixedSelection });
+				expect(injection.state.mutated).toBe(true);
+			} finally {
+				injection.restore();
+			}
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(1);
+			expect(count("narrator_tool_calls")).toBe(2);
+			expect(version()).toBe(7);
+		});
+});
+
+describe("materialized Send recipient receipts", () => {
+	/** Real runtime mailbox: enqueue → claim → materialize into a recipient message/ref. */
+	function materializeSend(
+		recipient = "root",
+		source = "sender",
+		key = `send-${serial++}`,
+		blocks: unknown[] = [{ type: "text", text: "hello" }],
+		seq = serial,
+	) {
+		const store = createMailboxStore(db as unknown as RuntimeDb);
+		const accepted = store.enqueue({
+			kind: "agent_message",
+			narratorId: recipient,
+			text: "hello",
+			projectedByteSize: 5,
+			sourceNarratorId: source,
+			sourceToolCallId: "source-tool",
+			sourceAttempt: 1,
+			sourceKey: key,
+		});
+		if (accepted.status !== "accepted") throw new Error(accepted.status);
+		const [row] = store.claimBatch(recipient, { token: key, epoch: "epoch" });
+		if (!row?.recipientMessageId) throw new Error("claim missing");
+		const refId = `ref-${serial++}`;
+		const materialized = store.materialize(
+			{ id: row.id, narratorId: recipient, token: key, epoch: "epoch" },
+			(tx) => {
+				tx.insert(schema.narratorMessages)
+					.values({
+						id: row.recipientMessageId as string,
+						narratorId: recipient,
+						role: "user",
+						contentJson: blocks as typeof schema.narratorMessages.$inferInsert.contentJson,
+						createdAt: time,
+					})
+					.run();
+				tx.insert(schema.narratorMessageRefs)
+					.values({
+						id: refId,
+						narratorId: recipient,
+						messageId: row.recipientMessageId as string,
+						// Distinct per delivery so selectors can order received messages.
+						seq,
+					})
+					.run();
+				return { messageId: row.recipientMessageId as string, refId };
+			},
+		);
+		if (materialized?.state !== "materialized") throw new Error("not materialized");
+		return {
+			deliveryId: row.deliveryId as string,
+			messageId: row.recipientMessageId,
+			refId,
+			id: row.id,
+		};
+	}
+	function receipt(id: string) {
+		return query<{ receipt_disposition: string; current_message_id: string | null; state: string }>(
+			"SELECT receipt_disposition,current_message_id,state FROM narrator_buffered_messages WHERE id=?",
+			id,
+		)[0];
+	}
+	test("confirmed revert deletion leaves a recipient_deleted receipt and refreshes the source", async () => {
+		narrator("sender");
+		const send = materializeSend();
+		const sourceBefore = version("sender");
+		const token = await prepare();
+		expect(receipt(send.id)).toMatchObject({
+			receipt_disposition: "active",
+			current_message_id: send.messageId,
+		});
+		const result = apply(token);
+		expect(receipt(send.id)).toEqual({
+			receipt_disposition: "recipient_deleted",
+			current_message_id: null,
+			state: "materialized",
+		});
+		expect(count("narrator_message_refs")).toBe(0);
+		expect(count("narrator_messages")).toBe(0);
+		expect(version()).toBe(8);
+		expect(version("sender")).toBe(sourceBefore + 1);
+		expect(result.affectedNarratorIds).toEqual(["root"]);
+		expect(result.refreshedNarratorIds).toEqual(["sender"]);
+		// The sender's page-local Send lookup now observes the negative receipt.
+		const [target] = await loadSendTargetDetails(
+			[{ id: "root", deliveryId: send.deliveryId, deliveryMessageId: send.messageId, revision: 1 }],
+			db as never,
+		);
+		expect(target).toMatchObject({ receiptDisposition: "recipient_deleted" });
+	});
+	test("a subagent source also refreshes its parent once; selected owners are not double counted", async () => {
+		narrator("parent");
+		narrator("child", "alice", {
+			type: "subagent",
+			parentNarratorId: "parent",
+			aclRootNarratorId: "parent",
+		});
+		// The child sends to root; the parent is ALSO a removed recipient owner below.
+		const send = materializeSend("root", "child");
+		const parentBefore = version("parent");
+		const childBefore = version("child");
+		const token = await prepare();
+		const result = apply(token);
+		expect(receipt(send.id)?.receipt_disposition).toBe("recipient_deleted");
+		expect(version("child")).toBe(childBefore + 1);
+		expect(version("parent")).toBe(parentBefore + 1);
+		expect(result.refreshedNarratorIds.sort()).toEqual(["child", "parent"]);
+	});
+	test("a source that is also an affected owner gets exactly one CAS increment", async () => {
+		// root sends to itself: root is both the recipient owner and the source.
+		const send = materializeSend("root", "root");
+		const token = await prepare();
+		const result = apply(token);
+		expect(receipt(send.id)?.receipt_disposition).toBe("recipient_deleted");
+		expect(version()).toBe(8);
+		expect(result.refreshedNarratorIds).toEqual([]);
+	});
+	test("unlink of the current owner updates only its receipt; another owner's ref and receipt stay active", async () => {
+		narrator("sender");
+		const mine = materializeSend("root");
+		const theirs = materializeSend("fork");
+		// root's received message is also shared into fork; fork's own delivery is independent.
+		ref(mine.messageId as string, "fork", 2);
+		const token = await prepare({ kind: "messages", messageIds: [mine.messageId as string] });
+		apply(token);
+		expect(receipt(mine.id)?.receipt_disposition).toBe("recipient_deleted");
+		expect(receipt(theirs.id)).toMatchObject({
+			receipt_disposition: "active",
+			current_message_id: theirs.messageId,
+		});
+		expect(body(mine.messageId as string)).toBeDefined();
+		expect(version("fork")).toBe(7);
+	});
+	test("a source already deleted at preparation is a fixed empty target; the receipt is still marked", async () => {
+		narrator("gone");
+		const send = materializeSend("root", "gone");
+		// Senders may be deleted while their receipt survives (mailbox has no source FK).
+		sqlite.query("DELETE FROM narrators WHERE id='gone'").run();
+		const token = await prepare();
+		const result = apply(token);
+		expect(receipt(send.id)?.receipt_disposition).toBe("recipient_deleted");
+		expect(result.refreshedNarratorIds).toEqual([]);
+		expect(version()).toBe(8);
+	});
+	for (const drift of ["vanish", "appear"] as const)
+		test(`a source that ${drift === "vanish" ? "vanishes" : "appears"} after preparation is drift`, async () => {
+			if (drift === "vanish") narrator("gone");
+			const send = materializeSendWithSource("gone");
+			const token = await prepare();
+			if (drift === "vanish") sqlite.query("DELETE FROM narrators WHERE id='gone'").run();
+			else narrator("gone");
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(receipt(send.id)?.receipt_disposition).toBe("active");
+			expect(version()).toBe(7);
+		});
+	/** enqueue needs a live source; restore the requested absence afterwards. */
+	function materializeSendWithSource(source: string) {
+		const absent = !query("SELECT id FROM narrators WHERE id=?", source).length;
+		if (absent) narrator(source);
+		const send = materializeSend("root", source);
+		if (absent) sqlite.query("DELETE FROM narrators WHERE id=?").run(source);
+		return send;
+	}
+	for (const drift of ["new-receipt", "rebind", "state", "source", "source-parent"] as const)
+		test(`receipt ${drift} drift after preparation is rejected with no mutation`, async () => {
+			narrator("sender");
+			narrator("other-parent");
+			narrator("parent-x");
+			narrator("child", "alice", {
+				type: "subagent",
+				parentNarratorId: "parent-x",
+				aclRootNarratorId: "root",
+			});
+			const plain = message(1);
+			const send =
+				drift === "new-receipt"
+					? undefined
+					: materializeSend("root", drift === "source-parent" ? "child" : "sender");
+			const token = await prepare();
+			if (drift === "new-receipt") {
+				// A delivery bound to an originally receipt-free ref after preparation.
+				const late = materializeSend();
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET recipient_ref_id=? WHERE id=?")
+					.run(
+						query<{ id: string }>(
+							"SELECT id FROM narrator_message_refs WHERE message_id=?",
+							plain,
+						)[0].id,
+						late.id,
+					);
+			}
+			if (drift === "rebind" && send)
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET recipient_ref_id='elsewhere' WHERE id=?")
+					.run(send.id);
+			if (drift === "state" && send)
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET state='cancelled' WHERE id=?")
+					.run(send.id);
+			if (drift === "source" && send)
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET source_narrator_id='other' WHERE id=?")
+					.run(send.id);
+			if (drift === "source-parent")
+				sqlite
+					.query("UPDATE narrators SET parent_narrator_id='other-parent' WHERE id='child'")
+					.run();
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(version()).toBe(7);
+			if (send) expect(receipt(send.id)?.receipt_disposition).toBe("active");
+			expect(count("narrator_message_refs")).toBeGreaterThan(0);
+		});
+	test("unrelated source metadata and version changes do not veto the recipient revert", async () => {
+		narrator("sender");
+		const send = materializeSend();
+		const token = await prepare();
+		sqlite
+			.query(
+				"UPDATE narrators SET title='renamed',message_version=message_version+5 WHERE id='sender'",
+			)
+			.run();
+		apply(token);
+		expect(receipt(send.id)?.receipt_disposition).toBe("recipient_deleted");
+		expect(version("sender")).toBe(13);
+	});
+	/** A received message whose last block is a removable tool_use with its tool row. */
+	function receivedWithTool(recipient = "root") {
+		const send = materializeSend(recipient, "sender", `send-${serial++}`, [
+			{ type: "text", text: "keep" },
+			{ type: "tool_use", id: "drop", name: "Read", input: {} },
+		]);
+		const toolId = tool(send.messageId as string, "drop", "Read", { narratorId: recipient });
+		// The original delivery and the current content were both adopted before revert.
+		sqlite
+			.query(
+				"UPDATE narrator_buffered_messages SET adopted_revision=1,adopted_at=?,current_revision=3,current_adopted_revision=3,current_adopted_at=? WHERE id=?",
+			)
+			.run(time, time, send.id);
+		sqlite
+			.query("UPDATE narrator_message_refs SET injection_consumed_at=? WHERE id=?")
+			.run(Date.parse(time), send.refId);
+		return { ...send, toolId };
+	}
+	function semantic(id: string) {
+		return query<{
+			receipt_disposition: string;
+			current_message_id: string | null;
+			current_revision: number;
+			current_adopted_revision: number | null;
+			current_adopted_at: string | null;
+			adopted_revision: number | null;
+			adopted_at: string | null;
+		}>(
+			"SELECT receipt_disposition,current_message_id,current_revision,current_adopted_revision,current_adopted_at,adopted_revision,adopted_at FROM narrator_buffered_messages WHERE id=?",
+			id,
+		)[0];
+	}
+	function consumed(refId: string) {
+		return query<{ injection_consumed_at: number | null }>(
+			"SELECT injection_consumed_at FROM narrator_message_refs WHERE id=?",
+			refId,
+		)[0]?.injection_consumed_at;
+	}
+	const superseded = (messageId: string) => ({
+		receipt_disposition: "superseded",
+		current_message_id: messageId,
+		// max(current_revision=3, content_revision=1) + 1
+		current_revision: 4,
+		current_adopted_revision: null,
+		current_adopted_at: null,
+		// The original delivery's adoption fact is retained.
+		adopted_revision: 1,
+		adopted_at: time,
+	});
+	test("in-place rewrite of a received message supersedes its receipt and keeps the message ID", async () => {
+		narrator("sender");
+		const send = receivedWithTool();
+		const sourceBefore = version("sender");
+		const result = apply(await prepare({ kind: "tool_calls", toolCallIds: [send.toolId] }));
+		expect(JSON.parse(body(send.messageId as string))).toEqual([{ type: "text", text: "keep" }]);
+		expect(semantic(send.id)).toEqual(superseded(send.messageId as string));
+		expect(consumed(send.refId)).toBeNull();
+		expect(version()).toBe(8);
+		expect(version("sender")).toBe(sourceBefore + 1);
+		expect(result.refreshedNarratorIds).toEqual(["sender"]);
+		const [target] = await loadSendTargetDetails(
+			[{ id: "root", deliveryId: send.deliveryId, deliveryMessageId: send.messageId, revision: 1 }],
+			db as never,
+		);
+		expect(target).toMatchObject({ receiptDisposition: "superseded", injectionConsumedAt: time });
+	});
+	test("COW of a shared received message points the receipt at the new copy only", async () => {
+		narrator("sender");
+		const send = receivedWithTool();
+		// The fork shares the received message; its ref has no delivery of its own.
+		const forkRef = ref(send.messageId as string, "fork", 2);
+		sqlite
+			.query("UPDATE narrator_message_refs SET injection_consumed_at=? WHERE id=?")
+			.run(Date.parse(time), forkRef);
+		const result = apply(await prepare({ kind: "tool_calls", toolCallIds: [send.toolId] }));
+		const [replacement] = result.replacements;
+		expect(replacement).toMatchObject({ refId: send.refId, previousMessageId: send.messageId });
+		expect(replacement.messageId).not.toBe(send.messageId);
+		// The receipt and the owner's ref share the newly inserted copy's identity.
+		expect(semantic(send.id)).toEqual(superseded(replacement.messageId));
+		expect(
+			query<{ message_id: string }>(
+				"SELECT message_id FROM narrator_message_refs WHERE id=?",
+				send.refId,
+			)[0].message_id,
+		).toBe(replacement.messageId);
+		expect(JSON.parse(body(replacement.messageId))).toEqual([{ type: "text", text: "keep" }]);
+		expect(consumed(send.refId)).toBeNull();
+		// The fork's shared original, its ref and its adoption fact are untouched.
+		expect(JSON.parse(body(send.messageId as string))).toHaveLength(2);
+		expect(consumed(forkRef)).toBe(Date.parse(time));
+		expect(version("fork")).toBe(7);
+		expect(result.refreshedNarratorIds).toEqual(["sender"]);
+	});
+	test("after_block truncation of a received message supersedes in the same apply as later deletes", async () => {
+		narrator("sender");
+		const send = receivedWithTool();
+		const later = materializeSend();
+		apply(
+			await prepare({
+				kind: "after_block",
+				messageId: send.messageId as string,
+				keepThroughBlockIndex: 0,
+			}),
+		);
+		expect(JSON.parse(body(send.messageId as string))).toEqual([{ type: "text", text: "keep" }]);
+		expect(semantic(send.id)).toEqual(superseded(send.messageId as string));
+		expect(receipt(later.id)).toMatchObject({
+			receipt_disposition: "recipient_deleted",
+			current_message_id: null,
+		});
+		expect(version("sender")).toBe(8);
+	});
+	test("an edited ref without a mailbox still clears its legacy ref adoption fact", async () => {
+		const target = withTools();
+		const refId = query<{ id: string }>(
+			"SELECT id FROM narrator_message_refs WHERE message_id=?",
+			target.messageId,
+		)[0].id;
+		sqlite
+			.query("UPDATE narrator_message_refs SET injection_consumed_at=? WHERE id=?")
+			.run(Date.parse(time), refId);
+		const result = apply(await prepare({ kind: "tool_calls", toolCallIds: [target.tools[0]] }));
+		// Legacy updateRecipientRef clears it for every semantic edit, mailbox or not.
+		expect(consumed(refId)).toBeNull();
+		// No mailbox row changed, so no source page needs a refresh.
+		expect(result.refreshedNarratorIds).toEqual([]);
+		expect(version()).toBe(8);
+	});
+	for (const drift of [
+		"new-receipt",
+		"current-revision",
+		"content-revision",
+		"rebind",
+		"state",
+	] as const)
+		test(`edited receipt ${drift} drift after preparation is rejected with no mutation`, async () => {
+			narrator("sender");
+			const send = receivedWithTool();
+			const plain = withTools(2, ["plain"]);
+			const token = await prepare({
+				kind: "tool_calls",
+				toolCallIds: [send.toolId, plain.tools[0]],
+			});
+			if (drift === "new-receipt") {
+				// A delivery bound after preparation to an edited ref that had no receipt.
+				const late = materializeSend();
+				const plainRef = query<{ id: string }>(
+					"SELECT id FROM narrator_message_refs WHERE message_id=?",
+					plain.messageId,
+				)[0].id;
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET recipient_ref_id=? WHERE id=?")
+					.run(plainRef, late.id);
+			}
+			if (drift === "current-revision")
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET current_revision=9 WHERE id=?")
+					.run(send.id);
+			if (drift === "content-revision")
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET content_revision=2 WHERE id=?")
+					.run(send.id);
+			if (drift === "rebind")
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET recipient_ref_id='elsewhere' WHERE id=?")
+					.run(send.id);
+			if (drift === "state")
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET state='cancelled' WHERE id=?")
+					.run(send.id);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(JSON.parse(body(send.messageId as string))).toHaveLength(2);
+			expect(consumed(send.refId)).toBe(Date.parse(time));
+			expect(version()).toBe(7);
+			if (drift !== "state" && drift !== "rebind")
+				expect(semantic(send.id)?.receipt_disposition).toBe("active");
+		});
+	test("a receipt failure rolls back with the caller journal", async () => {
+		narrator("sender");
+		const send = materializeSend();
+		sqlite.exec(
+			"CREATE TRIGGER fail_receipt BEFORE UPDATE OF receipt_disposition ON narrator_buffered_messages BEGIN SELECT RAISE(ABORT,'receipt fault'); END",
+		);
+		const token = await prepare();
+		expect(() => apply(token)).toThrow("receipt fault");
+		expect(receipt(send.id)?.receipt_disposition).toBe("active");
+		expect(count("narrator_message_refs")).toBe(1);
+		expect(version()).toBe(7);
+		expect(version("sender")).toBe(7);
 	});
 });
 
@@ -1447,6 +2096,30 @@ describe("prepared question lifecycle", () => {
 		).toBe("answered");
 		expect(count("narrator_question_events")).toBe(1);
 	});
+	test("a materialized answer notice on a removed ref is cancelled once, not also receipt-updated", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		const inbox = receipt(event);
+		const refId = query<{ id: string }>(
+			"SELECT id FROM narrator_message_refs WHERE message_id=?",
+			event,
+		)[0].id;
+		// Bound to the removed ref exactly as the runtime materializes a question notice.
+		sqlite
+			.query(
+				"UPDATE narrator_buffered_messages SET state='materialized',recipient_ref_id=?,current_message_id=? WHERE id=?",
+			)
+			.run(refId, event, inbox);
+		apply(await prepare({ kind: "messages", messageIds: [event] }));
+		expect(
+			query<{ state: string; receipt_disposition: string }>(
+				"SELECT state,receipt_disposition FROM narrator_buffered_messages WHERE id=?",
+				inbox,
+			)[0],
+		).toEqual({ state: "cancelled", receipt_disposition: "recipient_deleted" });
+		expect(count("narrator_question_events")).toBe(0);
+	});
 	test("original-owner creation unlink withdraws the retained question and cancels pending receipts", async () => {
 		const creation = withTools(1, ["ask"]);
 		const q = question(creation.tools[0]);
@@ -1520,6 +2193,210 @@ describe("prepared question lifecycle", () => {
 		});
 		expect(count("narrator_question_events")).toBe(1);
 	}, 20_000);
+	for (const action of ["unlink", "copy_on_write"] as const)
+		test(`empty request candidates remain fixed for ${action}`, async () => {
+			const creation = withTools(1, ["ask", "keep"]);
+			ref(creation.messageId, "fork", 1);
+			const token = await prepare(
+				action === "unlink"
+					? { kind: "messages", messageIds: [creation.messageId] }
+					: { kind: "tool_calls", toolCallIds: [creation.tools[0]] },
+			);
+			question(creation.tools[0]);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(1);
+			expect(version()).toBe(7);
+		});
+	for (const entry of ["event", "answer"] as const)
+		test(`empty ${entry} candidates remain fixed for owner unlink`, async () => {
+			const creation = withTools(1, ["ask"]);
+			const q = question(creation.tools[0]);
+			const selected = message(2);
+			ref(selected, "fork", 2);
+			const token = await prepare({ kind: "messages", messageIds: [selected] });
+			if (entry === "event")
+				sqlite
+					.query(
+						"INSERT INTO narrator_question_events(question_id,message_id,kind,created_at) VALUES(?,?,'answer',?)",
+					)
+					.run(q, selected, time);
+			else
+				sqlite
+					.query("UPDATE narrator_questions SET answer_message_id=? WHERE id=?")
+					.run(selected, q);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_message_refs")).toBe(3);
+			expect(version()).toBe(7);
+		});
+	test("empty event sets of a fixed question cannot gain an unselected event", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		ref(creation.messageId, "fork", 1);
+		const event = message(2);
+		const token = await prepare({ kind: "messages", messageIds: [creation.messageId] });
+		sqlite
+			.query(
+				"INSERT INTO narrator_question_events(question_id,message_id,kind,created_at) VALUES(?,?,'answer',?)",
+			)
+			.run(q, event, time);
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(
+			query<{ status: string }>("SELECT status FROM narrator_questions WHERE id=?", q)[0].status,
+		).toBe("open");
+		expect(version()).toBe(7);
+	});
+	for (const kind of ["resolution", "cursor", "question"] as const)
+		test(`old event ${kind} drift is checked even when only the latest event is selected`, async () => {
+			const creation = withTools(1, ["ask", "other"]);
+			const q = question(creation.tools[0]);
+			const another = question(creation.tools[1]);
+			const previous = answer(q, 2, "answer", { note: "old" });
+			const latest = answer(q, 3, "supplement");
+			const token = await prepare({ kind: "messages", messageIds: [latest] });
+			if (kind === "resolution")
+				sqlite
+					.query("UPDATE narrator_question_events SET resolution_json=? WHERE message_id=?")
+					.run('{"note":"new"}', previous);
+			if (kind === "cursor")
+				sqlite
+					.query("UPDATE narrator_question_events SET rowid=rowid+1000 WHERE message_id=?")
+					.run(previous);
+			if (kind === "question")
+				sqlite
+					.query("UPDATE narrator_question_events SET question_id=? WHERE message_id=?")
+					.run(another, previous);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_question_events")).toBe(2);
+			expect(count("narrator_messages")).toBe(3);
+			expect(version()).toBe(7);
+		});
+	test("question event projection and membership span more than 32 historical rows", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const events = Array.from({ length: 34 }, (_, i) =>
+			answer(q, i + 2, "supplement", { note: "old" }),
+		);
+		const token = await prepare({ kind: "messages", messageIds: [events[33]] });
+		sqlite
+			.query("UPDATE narrator_question_events SET resolution_json=? WHERE message_id=?")
+			.run('{"note":"new"}', events[32]);
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(count("narrator_question_events")).toBe(34);
+		expect(version()).toBe(7);
+	});
+	for (const drift of ["pk", "cursor", "bytes"] as const)
+		test(`event byte preflight binds the actual raw read to ${drift}`, async () => {
+			const creation = withTools(1, ["ask"]);
+			const q = question(creation.tools[0]);
+			const previous = answer(q, 2, "answer", { note: "old" });
+			const latest = answer(q, 3, "supplement");
+			const replacement = message(4);
+			const fixedSelection = await select({ kind: "messages", messageIds: [latest] });
+			const injection = mutateAfterRead(
+				(text) =>
+					text.startsWith(
+						"SELECT question_id,message_id,coalesce(octet_length(resolution_json),0) AS resolutionBytes,",
+					),
+				() => {
+					if (drift === "pk")
+						sqlite
+							.query("UPDATE narrator_question_events SET message_id=? WHERE message_id=?")
+							.run(replacement, previous);
+					if (drift === "cursor")
+						sqlite
+							.query("UPDATE narrator_question_events SET rowid=rowid+1000 WHERE message_id=?")
+							.run(previous);
+					if (drift === "bytes")
+						sqlite
+							.query("UPDATE narrator_question_events SET resolution_json=? WHERE message_id=?")
+							.run("x".repeat(4 * 1024 * 1024 + 1), previous);
+				},
+			);
+			try {
+				const error = await service
+					.prepare({ principal, fixedSelection })
+					.catch((error: unknown) => error);
+				expect(injection.state.mutated).toBe(true);
+				expect(error).toMatchObject({
+					code: "REVERT_HISTORY_STALE",
+					message: "A fixed row disappeared",
+				});
+			} finally {
+				injection.restore();
+			}
+			expect(count("narrator_question_events")).toBe(2);
+			expect(version()).toBe(7);
+		});
+	test("raw historical resolution consumed before an await is never rebaselined", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const previous = answer(q, 2, "answer", { note: "old" });
+		const latest = answer(q, 3, "supplement");
+		const fixedSelection = await select({ kind: "messages", messageIds: [latest] });
+		const injection = mutateAfterRead(
+			(text) =>
+				text.startsWith(
+					"SELECT question_id,message_id,kind,created_at,resolution_json,rowid AS cursor,",
+				),
+			() => {
+				sqlite
+					.query("UPDATE narrator_question_events SET resolution_json=? WHERE message_id=?")
+					.run('{"note":"new"}', previous);
+			},
+		);
+		let token: PreparedRevertHistory;
+		try {
+			token = await service.prepare({ principal, fixedSelection });
+			expect(injection.state.mutated).toBe(true);
+		} finally {
+			injection.restore();
+		}
+		expect(() => apply(token)).toThrow("Selected history changed");
+		expect(count("narrator_question_events")).toBe(2);
+		expect(version()).toBe(7);
+	});
+	for (const kind of ["empty", "replace", "source", "kind"] as const)
+		test(`question inbox ${kind} changes are fixed by owner/event and source predicate`, async () => {
+			const creation = withTools(1, ["ask"]);
+			const q = question(creation.tools[0]);
+			const event = answer(q, 2);
+			const existing = kind === "empty" ? undefined : receipt(event);
+			const token = await prepare({ kind: "messages", messageIds: [event] });
+			if (kind === "replace")
+				sqlite.query("DELETE FROM narrator_buffered_messages WHERE id=?").run(existing ?? "");
+			if (kind === "empty" || kind === "replace") receipt(event);
+			if (kind === "source")
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET source_key='unrelated' WHERE id=?")
+					.run(existing ?? "");
+			if (kind === "kind")
+				sqlite
+					.query("UPDATE narrator_buffered_messages SET kind='user' WHERE id=?")
+					.run(existing ?? "");
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_question_events")).toBe(1);
+			expect(count("narrator_messages")).toBe(2);
+			expect(version()).toBe(7);
+		});
+	test("unrelated inbox sources and kinds remain independent", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		const token = await prepare({ kind: "messages", messageIds: [event] });
+		const unrelated = receipt(event);
+		sqlite
+			.query("UPDATE narrator_buffered_messages SET source_key='unrelated' WHERE id=?")
+			.run(unrelated);
+		const user = receipt(event);
+		sqlite.query("UPDATE narrator_buffered_messages SET kind='user' WHERE id=?").run(user);
+		apply(token);
+		expect(
+			query<{ state: string }>("SELECT state FROM narrator_buffered_messages ORDER BY id").map(
+				(row) => row.state,
+			),
+		).toEqual(["claimed", "claimed"]);
+		expect(version()).toBe(8);
+	});
 	test("ordinary transaction helper restores answers and cancels only their question receipts", () => {
 		const creation = withTools(1, ["ask"]);
 		const q = question(creation.tools[0]);
@@ -1604,19 +2481,47 @@ describe("prepared question lifecycle", () => {
 		const event = answer(q, 2);
 		const token = await prepare({ kind: "messages", messageIds: [event] });
 		receipt(event);
-		expect(() => apply(token)).toThrow("Database changed after preparation");
+		expect(() => apply(token)).toThrow("Selected history changed after preparation");
 		expect(count("narrator_question_events")).toBe(1);
 	});
 });
 
 describe("bounded preparation and synchronous atomic commit", () => {
+	test("1000 messages use bounded batched commit checks", async () => {
+		db.transaction(() => {
+			for (let i = 0; i < 1000; i++) message(i);
+		});
+		const token = await prepare();
+		let checks = 0;
+		let mutations = 0;
+		let directCounts = 0;
+		const realQuery = sqlite.query.bind(sqlite);
+		const trace = spyOn(sqlite, "query").mockImplementation(((text: string) => {
+			if (/^(SELECT|WITH|PRAGMA)\b/i.test(text) && !text.startsWith("SELECT changes()")) checks++;
+			if (/^(INSERT|UPDATE|DELETE)\b/i.test(text)) mutations++;
+			if (text.startsWith("SELECT changes()")) directCounts++;
+			return realQuery(text);
+		}) as typeof sqlite.query);
+		try {
+			apply(token);
+		} finally {
+			trace.mockRestore();
+		}
+		// 451 history checks + 32 fixed (owner,ref) recipient-receipt membership batches.
+		expect(checks).toBeLessThanOrEqual(483);
+		expect(mutations).toBe(2001);
+		expect(directCounts).toBe(mutations);
+		expect(count("narrator_messages")).toBe(0);
+		expect(count("narrator_message_refs")).toBe(0);
+		expect(version()).toBe(8);
+	}, 30_000);
 	test("expired prepared cannot execute even without intervening writes", async () => {
 		withTools();
 		const token = await prepare();
 		const future = Date.now() + 60_000;
 		const clock = spyOn(Date, "now").mockReturnValue(future);
 		try {
-			expect(() => apply(token)).toThrow("Database changed");
+			expect(() => apply(token)).toThrow("History preparation expired");
 		} finally {
 			clock.mockRestore();
 		}
@@ -1784,17 +2689,15 @@ describe("bounded preparation and synchronous atomic commit", () => {
 			expect(count("narrator_messages")).toBe(rollback ? 1 : 0);
 			expect(version()).toBe(rollback ? 7 : 8);
 		});
-	test("writes before apply, even to caller journal in same tx, are conservatively rejected", async () => {
+	test("unrelated journal writes can share the short history transaction", async () => {
 		withTools();
 		sqlite.exec("CREATE TABLE test_journal(status TEXT)");
 		const token = await prepare();
-		expect(() =>
-			db.transaction((tx) => {
-				tx.run(sql`INSERT INTO test_journal VALUES('committed')`);
-				service.applyToTransaction(tx, token);
-			}),
-		).toThrow("Database changed");
-		expect(count("test_journal")).toBe(0);
-		expect(count("narrator_messages")).toBe(1);
+		db.transaction((tx) => {
+			tx.run(sql`INSERT INTO test_journal VALUES('committed')`);
+			service.applyToTransaction(tx, token);
+		});
+		expect(count("test_journal")).toBe(1);
+		expect(count("narrator_messages")).toBe(0);
 	});
 });

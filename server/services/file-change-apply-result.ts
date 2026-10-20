@@ -14,7 +14,6 @@ export interface LocalFileApplySummary {
 	readonly result: LocalFileApplyResult;
 	readonly receiptOutcome: FileChangeExecutionReceipt["outcome"];
 	readonly confirmed: boolean;
-	readonly leaseOutcome: "applied" | "not_applied" | "unknown";
 	readonly diagnostics: FileChangeLocalIoEvidence;
 }
 
@@ -29,6 +28,24 @@ export async function applyLocalFileChange(
 	try {
 		result = await io.apply(input);
 		if (!result?.parentEffects) throw new Error("Missing local IO execution proof");
+		const receipt = result.editorReceipt;
+		if (
+			receipt &&
+			(!input.editor ||
+				receipt.operationId !== input.editor.sourceId ||
+				(receipt.outcome === "committed"
+					? result.kind !== "applied" ||
+						receipt.totalBytes !== input.nextBytes.length ||
+						typeof receipt.rawDigest !== "string" ||
+						!/^[a-f0-9]{64}$/.test(receipt.rawDigest) ||
+						(input.editor.rawDigest !== undefined && input.editor.rawDigest !== receipt.rawDigest)
+					: receipt.rawDigest !== null ||
+						receipt.totalBytes !== null ||
+						(receipt.outcome === "rejected"
+							? result.kind !== "not_applied"
+							: receipt.outcome !== "uncertain" || result.kind !== "target_mutation_unknown")))
+		)
+			throw new Error("Invalid editor IO execution proof");
 		const { createdPaths, possiblePaths } = result.parentEffects;
 		if (
 			!Array.isArray(createdPaths) ||
@@ -75,14 +92,6 @@ export async function applyLocalFileChange(
 		result,
 		receiptOutcome: applied ? "applied" : targetUnchanged ? "not_applied" : "unknown",
 		confirmed: applied || targetUnchanged,
-		leaseOutcome:
-			result.parentEffects.possiblePaths.length > 0
-				? "unknown"
-				: applied
-					? "applied"
-					: targetUnchanged
-						? "not_applied"
-						: "unknown",
 		diagnostics: {
 			version: 1,
 			outcome: result.kind,

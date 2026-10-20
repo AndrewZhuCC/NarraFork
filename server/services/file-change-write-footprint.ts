@@ -1,8 +1,7 @@
 import { dirname } from "node:path";
 import { LocalFileValidationError, localDirectoryIdentity } from "./file-change-local-io";
 
-/** Identity anchor is not the modification range. A missing parent reserves only
- * its first missing subtree, never the existing ancestor (which may be `/`). */
+/** Operation-local parent identity and the bounded directory effects a write may create. */
 export interface LocalWriteFootprint {
 	readonly anchor: string;
 	readonly anchorIdentity: string;
@@ -44,9 +43,8 @@ export async function captureLocalWriteFootprint(
 	throw new LocalFileValidationError("Write parent depth exceeds the admission budget");
 }
 
-/** Losing/replacing the anchor must not broaden a granted file reservation into
- * mkdir work outside that reservation. Recheck before every mutating phase. */
+/** Recheck the existing parent before each mkdir or target mutation. */
 export async function assertLocalWriteFootprint(footprint: LocalWriteFootprint): Promise<void> {
 	if ((await localDirectoryIdentity(footprint.anchor)) !== footprint.anchorIdentity)
-		throw new LocalFileValidationError("Write parent identity changed after range admission");
+		throw new LocalFileValidationError("Write parent identity changed during the operation");
 }

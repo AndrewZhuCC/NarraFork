@@ -34,7 +34,6 @@ import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 import { treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 let root: string;
@@ -82,7 +81,6 @@ beforeEach(async () => {
 	runtime = new LocalFileChangeRuntime({
 		db,
 		privateRoot,
-		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 	receipts = new SnapshotCaptureReceiptService({ db, privateRoot });
@@ -436,19 +434,21 @@ describe("actual tree-scan observation receipts", () => {
 		expect(rows().filter((row) => row.coverage === "unavailable")).toHaveLength(1);
 	});
 
-	test("recreated workspace cannot inherit the old scope; real runtime rebinds a new incarnation", async () => {
+	test("a recreated directory gets a fresh observation without a verification barrier", async () => {
 		await capture();
-		const oldScope = rows()[0].scopeId;
+		const first = rows()[0];
 		await rename(workspace, join(root, "previous"));
 		await mkdir(workspace);
 		await spawn.safeSpawn({ cmd: ["git", "init"], cwd: workspace, timeout: 5000 });
-		await writeFile(join(workspace, "a.txt"), "new incarnation\n");
-		await capture();
-		expect(rows()).toHaveLength(1);
-		await editorWrite("new verified incarnation\n");
+		await writeFile(join(workspace, "a.txt"), "new directory\n");
 		await capture();
 		expect(rows()).toHaveLength(2);
-		expect(rows()[1].scopeId).not.toBe(oldScope);
+		expect(rows()[1].treeHash).not.toBe(first.treeHash);
+		expect(rows()[0]).toEqual(first);
+		await editorWrite("new recorded write\n");
+		await capture();
+		expect(rows()).toHaveLength(3);
+		expect(rows()[2].scopeId).toBe(first.scopeId);
 	});
 
 	test("root replaced mid-scan invalidates only that receipt", async () => {

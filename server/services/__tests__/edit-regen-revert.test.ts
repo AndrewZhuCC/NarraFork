@@ -13,7 +13,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -79,6 +79,8 @@ mock.module("../../lib/uploads", () => ({
 
 const { editAndRegenerate, rollbackToBlock } = await import("../narrator-session");
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
+const scopedRevert = await import("../narrator-scoped-revert");
+const { emptyRevertResult } = await import("../snapshot-revert");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -90,6 +92,10 @@ afterAll(() => {
 const now = new Date().toISOString();
 
 function seed(cwd: string) {
+	db.insert(schema.users)
+		.values({ id: "u1", username: "u1", role: "user", passwordHash: "test", createdAt: now })
+		.onConflictDoNothing()
+		.run();
 	sqlite.run("DELETE FROM narrator_message_refs");
 	sqlite.run("DELETE FROM narrator_messages");
 	sqlite.run("DELETE FROM narrators");
@@ -121,14 +127,11 @@ function seed(cwd: string) {
 		.run();
 }
 
-/** Exercise the complete edit without starting an unrelated provider/agent loop. */
-async function runEdit(opts?: Parameters<typeof editAndRegenerate>[5]) {
-	const result = await editAndRegenerate("n1", "m1", "new", "en", false, {
-		...opts,
-		deferContinuation: true,
-	});
-	expect(result.ok).toBe(true);
-}
+const confirmedPlan = {
+	planId: "confirmed-plan",
+	planHash: "a".repeat(64),
+	action: "edit_and_regenerate" as const,
+};
 
 describe("edit-and-regenerate file rollback", () => {
 	let cwd: string;
@@ -138,50 +141,91 @@ describe("edit-and-regenerate file rollback", () => {
 		eventLog.length = 0;
 		seed(cwd);
 	});
-
-	test("reverts files by default, matching the behaviour every edit had", async () => {
-		await runEdit({ userId: null });
-		expect(deleteCalls).toHaveLength(1);
-		expect(deleteCalls[0]?.opts?.skipRevert).toBeFalsy();
-		expect(deleteCalls[0]?.opts?.preserveConversationId).toBe(true);
-	});
-
-	test("skips the file rollback when the caller keeps its changes", async () => {
-		await runEdit({ userId: null, revertFiles: false });
-		expect(deleteCalls[0]?.opts?.skipRevert).toBe(true);
-	});
-
-	test("forwards the requested scope", async () => {
-		await runEdit({ userId: null, revertFiles: true, revertScope: "workspace" });
-		expect(deleteCalls[0]?.opts?.scope).toBe("workspace");
-	});
-
-	test("omits scope entirely when the caller did not choose one", async () => {
-		// Absent, not null: the server's own default has to stay in charge.
-		await runEdit({ userId: null });
-		expect(deleteCalls[0]?.opts && "scope" in deleteCalls[0].opts).toBe(false);
-	});
-
-	test("truncates the tail at the original message id", async () => {
-		// Copy-on-write may hand the row a new id, but the ref keeps its seq — so the
-		// boundary must be the id the caller passed, not the post-COW one.
-		await runEdit({ userId: null });
-		expect(deleteCalls[0]?.messageId).toBe("m1");
-	});
-
-	test("reverts before writing this edit's attachments", async () => {
-		// The ordering IS the fix: reversed, a workspace rollback deletes the file
-		// that was just saved into the worktree.
-		await runEdit({
-			userId: null,
-			keepTextFilePaths: [],
-			newTextFiles: [new File(["notes"], "added.txt", { type: "text/plain" })],
+	const edit = (opts: Parameters<typeof editAndRegenerate>[5] = {}) =>
+		editAndRegenerate("n1", "m1", "new", "en", false, {
+			userId: "u1",
+			deferContinuation: true,
+			...opts,
 		});
-		expect(eventLog).toEqual(["deleteMessagesAfter", "saveTextFileToWorktree"]);
+
+	test("file recovery requires a reviewed plan instead of silently replanning", async () => {
+		await expect(edit()).rejects.toThrow("Review a fresh edit preview");
+		expect(deleteCalls).toHaveLength(0);
+		expect(eventLog).toHaveLength(0);
+	});
+	test("missing requester cannot borrow narrator ownership", async () => {
+		await expect(edit({ userId: null, revertPlan: confirmedPlan })).rejects.toThrow(
+			"authenticated",
+		);
+		expect(deleteCalls).toHaveLength(0);
+	});
+	test("keep-files explicitly truncates at the original message and does not execute a plan", async () => {
+		const restore = spyOn(scopedRevert, "revertNarratorScopedForEdit");
+		try {
+			await edit({ revertFiles: false });
+			expect(deleteCalls).toEqual([
+				{ messageId: "m1", opts: { preserveConversationId: true, skipRevert: true } },
+			]);
+			expect(restore).not.toHaveBeenCalled();
+		} finally {
+			restore.mockRestore();
+		}
+	});
+	test("retired workspace scope is rejected even for history-only requests", async () => {
+		await expect(edit({ revertFiles: false, revertScope: "workspace" })).rejects.toThrow("retired");
+		expect(deleteCalls).toHaveLength(0);
+	});
+	test("executes the confirmed plan before attachments and retains the history advisory", async () => {
+		const revertResult = {
+			...emptyRevertResult(),
+			planId: confirmedPlan.planId,
+			historyCommitted: true,
+			historyStatus: "unavailable" as const,
+		};
+		const restore = spyOn(scopedRevert, "revertNarratorScopedForEdit").mockImplementation(
+			async () => {
+				eventLog.push("confirmedRestore");
+				return revertResult;
+			},
+		);
+		try {
+			const result = await edit({
+				revertPlan: confirmedPlan,
+				keepTextFilePaths: [],
+				newTextFiles: [new File(["notes"], "added.txt", { type: "text/plain" })],
+			});
+			expect(result).toEqual({ ok: true, revertResult });
+			expect(restore).toHaveBeenCalledWith("n1", "m1", 0, {
+				principal: { userId: "u1", isAdmin: false },
+				revertPlan: confirmedPlan,
+			});
+			expect(eventLog).toEqual(["confirmedRestore", "saveTextFileToWorktree"]);
+			expect(deleteCalls).toHaveLength(0);
+		} finally {
+			restore.mockRestore();
+		}
+	});
+	test("partial restore does not save attachments or rewrite the user prompt", async () => {
+		const restore = spyOn(scopedRevert, "revertNarratorScopedForEdit").mockResolvedValue({
+			...emptyRevertResult(),
+			status: "partial",
+			historyCommitted: false,
+		});
+		try {
+			await expect(
+				edit({ revertPlan: confirmedPlan, newTextFiles: [new File(["notes"], "added.txt")] }),
+			).rejects.toThrow();
+			expect(eventLog).toHaveLength(0);
+			expect(
+				sqlite.query("SELECT content_text FROM narrator_messages WHERE id = ?").get("m1"),
+			).toEqual({ content_text: "old" });
+		} finally {
+			restore.mockRestore();
+		}
 	});
 });
 
-describe("right-click rollback also truncates through deleteMessagesAfter", () => {
+describe("right-click rollback uses one fixed block-boundary plan", () => {
 	let cwd: string;
 	beforeEach(() => {
 		cwd = mkdtempSync(join(tmpdir(), "nf-rollback-path-"));
@@ -190,11 +234,18 @@ describe("right-click rollback also truncates through deleteMessagesAfter", () =
 		seed(cwd);
 	});
 
-	test("rollbackToBlock forwards the same delete-after selector as edit-retry", async () => {
-		await rollbackToBlock("n1", "m1", 0).catch(() => {});
-		expect(deleteCalls).toHaveLength(1);
-		expect(deleteCalls[0]?.messageId).toBe("m1");
-		expect(deleteCalls[0]?.opts?.skipRevert).toBeFalsy();
-		expect(deleteCalls[0]?.opts?.preserveConversationId).toBe(true);
+	test("rollbackToBlock freezes the effective block boundary with the requester", async () => {
+		const restore = spyOn(scopedRevert, "revertNarratorScopedToBlock").mockResolvedValue({
+			...emptyRevertResult(),
+			historyCommitted: true,
+		});
+		const principal = { userId: "u1", isAdmin: false };
+		try {
+			await rollbackToBlock("n1", "m1", 0, { principal });
+			expect(restore).toHaveBeenCalledWith("n1", "m1", 0, { principal });
+			expect(deleteCalls).toHaveLength(0);
+		} finally {
+			restore.mockRestore();
+		}
 	});
 });

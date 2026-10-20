@@ -1,12 +1,17 @@
 import { join, relative, sep } from "node:path";
 import { EDITOR_FILE_MAX_BYTES, type EditorOperationResult } from "../../shared/editor-document";
-import type { EditorQueryResult } from "../../shared/editor-provider-contracts";
+import {
+	EDITOR_TARGET_QUEUE_FEATURE,
+	type EditorApplyResult,
+	type EditorQueryResult,
+} from "../../shared/editor-provider-contracts";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
+import { hasDeviceProtocolFeature } from "./device-connection-service";
 import { RemoteBackend } from "./device-remote-backend";
 import {
 	type EditorDocumentDependencies,
@@ -24,70 +29,75 @@ import { createFileChangeLocalIo } from "./file-change-local-io";
 import {
 	EditorFileChangeUncertainError,
 	executeEditorFileChange,
-	getCurrentLocalFileChangeRuntime,
 	getDefaultLocalFileChangeRuntime,
-	remoteEditorIntent,
 } from "./file-change-runtime";
 import { workspaceContextService } from "./workspace-context-service";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 import { closeClaim, openClaim, sealClaim } from "./worktree-write-claims";
 
-function remoteQueryRequest(operation: FileChangeOperationRecord, effect: FileChangeEffectRecord) {
-	const intent = remoteEditorIntent(operation, effect);
-	if (!intent) throw new Error("Original remote editor intent unavailable");
+/** The original remote raw-v2 save as persisted. Null is never inferred: it only
+ * means the row lacks a field the executor query is bound to, not non-execution. */
+function remoteEditorIntent(operation: FileChangeOperationRecord) {
+	const binding = operation.executionBindingJson;
+	if (
+		operation.sourceKind !== "editor" ||
+		operation.attempt !== 1 ||
+		!binding ||
+		binding.deviceId === "local" ||
+		!operation.ownerUserId ||
+		!operation.requestDigest ||
+		operation.editorRawSnapshotRevision === null
+	)
+		return null;
 	const namespace = editorOperationNamespace(
 		operation.sourceInstanceId,
-		intent.ownerUserId,
-		intent.deviceId,
+		operation.ownerUserId,
+		binding.deviceId,
 	);
 	return {
-		namespace,
-		resourceKey: editorWriterResourceKey(namespace, operation.id, effect.id),
-		operationId: operation.sourceId,
-		requestDigest: intent.requestDigest,
+		deviceId: binding.deviceId,
+		snapshotRevision: operation.editorRawSnapshotRevision,
+		// The executor's exact-op binding is the stable correlation key. No lease is needed.
+		query: {
+			namespace,
+			resourceKey: editorWriterResourceKey(namespace, operation.sourceId),
+			operationId: operation.sourceId,
+			requestDigest: operation.requestDigest,
+		} satisfies EditorReceiptQuery,
 	};
 }
-function remoteResult(
-	operation: FileChangeOperationRecord,
-	effect: FileChangeEffectRecord,
+function remoteRpc(deviceId: string) {
+	const backend = resolveBackend({ requested: deviceId });
+	if (!(backend instanceof RemoteBackend)) throw new Error("Original editor device unavailable");
+	return backend.editorWriteRpc();
+}
+/** ACK lets the executor retire terminal proof it no longer needs to hold. Idempotent;
+ * a failed ACK is retried by the next explicit operation query, never by a reapply. */
+async function acknowledgeEditorReceipt(deviceId: string, query: EditorReceiptQuery) {
+	await remoteRpc(deviceId).call("editor.query", { ...query, acknowledgeTerminal: true });
+}
+type SavedSnapshot = {
+	hashKind?: "raw-sha256";
+	hash: string;
+	bytes: number;
+	snapshotRevision: number;
+};
+function savedResult(
+	operationId: string,
+	saved: SavedSnapshot,
+	historyAvailable: boolean,
 ): EditorOperationResult {
-	const operationId = operation.sourceId;
-	const intent = remoteEditorIntent(operation, effect);
-	if (
-		!intent ||
-		operation.settlement !== "settled" ||
-		effect.settlement !== "settled" ||
-		!effect.executionConfirmed
-	)
-		return { status: "uncertain", operationId };
-	if (effect.executionReceiptJson?.outcome === "not_applied")
-		return { status: "failed", operationId };
-	const after = effect.observedAfterStateJson;
-	if (
-		effect.executionReceiptJson?.outcome !== "applied" ||
-		after.kind !== "regular" ||
-		after.blob.digest !== intent.intended.blob.digest ||
-		after.blob.sizeBytes !== intent.intended.blob.sizeBytes
-	)
-		return { status: "uncertain", operationId };
 	return {
 		status: "saved",
 		operationId,
 		result: {
 			status: "saved",
 			operationId,
-			hashKind: "raw-sha256",
-			hash: after.blob.digest,
-			bytes: after.blob.sizeBytes,
-			snapshotRevision: intent.snapshotRevision,
+			...saved,
+			diskOutcome: "applied",
+			historyStatus: historyAvailable ? "complete" : "unavailable",
 		},
 	};
-}
-/** ACK lets the executor retire terminal proof once the Host holds it durably. Idempotent. */
-async function acknowledgeEditorReceipt(deviceId: string, query: EditorReceiptQuery) {
-	const backend = resolveBackend({ requested: deviceId });
-	if (!(backend instanceof RemoteBackend)) throw new Error("Original editor device unavailable");
-	await backend.editorWriteRpc().call("editor.query", { ...query, acknowledgeTerminal: true });
 }
 
 export const executeEditorDocumentFileChange: EditorDocumentDependencies["execute"] = async (
@@ -96,13 +106,20 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 	const { remote, resourceKey } = request;
 	if (remote && !(remote.backend instanceof RemoteBackend))
 		throw new AppError("Unsupported editor backend", 503, "EDITOR_PROVIDER_UNSUPPORTED");
+	if (remote && !hasDeviceProtocolFeature(remote.backend.deviceId, EDITOR_TARGET_QUEUE_FEATURE))
+		throw new AppError(
+			"Upgrade the executor: editor.target-queue.v1 is required",
+			503,
+			"EDITOR_PROVIDER_UNSUPPORTED",
+		);
 	if (!resourceKey)
 		throw new AppError("Editor resource binding unavailable", 503, "EDITOR_PROVIDER_UNSUPPORTED");
 	const backend = remote?.backend;
-	let terminal: { query: EditorReceiptQuery; hostOperationId: string } | undefined;
+	let terminal: { query: EditorReceiptQuery; receipt: EditorApplyResult } | undefined;
 	const io =
 		remote && backend instanceof RemoteBackend
 			? createEditorFileAtomicIo({
+					deviceId: backend.deviceId,
 					rpc: backend.editorWriteRpc(),
 					read: (path, signal) =>
 						backend.editorObservation(
@@ -117,14 +134,13 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 							resourceKey,
 							signal,
 						),
-					onReceipt: (receipt, query, hostOperationId) => {
-						if (receipt.outcome !== "uncertain") terminal = { query, hostOperationId };
+					onReceipt: (receipt, query) => {
+						if (receipt.outcome !== "uncertain") terminal = { query, receipt };
 					},
 				})
 			: createFileChangeLocalIo(undefined, {
 					maxBytes: EDITOR_FILE_MAX_BYTES,
 					createParents: false,
-					cancelledMutationIsUnknown: true,
 				});
 	const run = () =>
 		withWorkspaceAdmission(
@@ -144,22 +160,17 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 			run,
 		);
 	} finally {
-		// The runtime settles a terminal receipt itself; ACK only once that is durable.
-		// A failed ACK is retried by the next operation query, never by a reapply.
-		if (backend && terminal) {
-			const { query, hostOperationId } = terminal;
-			try {
-				const runtime = await getCurrentLocalFileChangeRuntime();
-				if (runtime.evidence.getOperation(hostOperationId)?.settlement === "settled")
-					await acknowledgeEditorReceipt(backend.deviceId, query);
-			} catch (error) {
-				logger.debug("Editor engine ACK deferred", { error: String(error) });
-			}
-		}
+		// The Host already holds this terminal proof as the returned real outcome. ACK
+		// only shortens executor retention; history settlement is never a precondition.
+		if (backend && terminal)
+			await acknowledgeEditorReceipt(backend.deviceId, terminal.query).catch((error) =>
+				logger.debug("Editor engine ACK deferred", { error: String(error) }),
+			);
 	}
 };
 
 export function getEditorDocumentService(): EditorDocumentService {
+	// A hot module reload must not clean up the live previous generation's pinned objects.
 	return hotSafe(
 		"narrafork.editor-documents.v1",
 		() =>
@@ -170,7 +181,11 @@ export function getEditorDocumentService(): EditorDocumentService {
 				writerAvailable: (binding) =>
 					binding.writeTarget
 						? binding.writeTarget.backend instanceof RemoteBackend &&
-							binding.writeTarget.backend.supportsEditorDurableWrite
+							binding.writeTarget.backend.supportsEditorDurableWrite &&
+							hasDeviceProtocolFeature(
+								binding.writeTarget.backend.deviceId,
+								EDITOR_TARGET_QUEUE_FEATURE,
+							)
 						: !binding.rawSource && (!binding.deviceId || binding.deviceId === "local"),
 				atomicWriter: (binding) => binding.writeTarget?.backend instanceof RemoteBackend,
 				rawWriter: {
@@ -239,6 +254,45 @@ export function getEditorDocumentService(): EditorDocumentService {
 	);
 }
 
+/** A recorded effect's real IO outcome. History blobs only add the optional complete status. */
+function effectResult(
+	operation: FileChangeOperationRecord,
+	effect: FileChangeEffectRecord | undefined,
+	operationId: string,
+	saved: SavedSnapshot | null,
+	/** The raw byte digest to compare with history; differs from a v1 text `hash`. */
+	rawDigest = saved?.hash,
+): EditorOperationResult {
+	// Only a recorded not_applied outcome proves the target was left untouched. An unknown
+	// IO result may already be on disk, so the client must verify instead of discarding.
+	if (effect?.diskOutcome !== "applied")
+		return effect?.diskOutcome === "not_applied" && operation.settlement === "settled"
+			? { status: "failed", operationId }
+			: { status: "uncertain", operationId };
+	if (!saved)
+		return {
+			status: "uncertain",
+			operationId,
+			error: {
+				code: "EDITOR_RESULT_UNAVAILABLE",
+				message:
+					"The write settled, but its saved snapshot metadata is unavailable; verify before retrying",
+			},
+		};
+	const after = effect.observedAfterStateJson;
+	if (
+		after.kind === "regular"
+			? after.blob.digest !== rawDigest || after.blob.sizeBytes !== saved.bytes
+			: after.kind !== "unknown"
+	)
+		return { status: "uncertain", operationId };
+	return savedResult(
+		operationId,
+		saved,
+		after.kind === "regular" && operation.executionOutcome === "succeeded",
+	);
+}
+
 export const queryEditorOperation: NonNullable<
 	EditorDocumentDependencies["queryOperation"]
 > = async (actor, operationId, recovery) => {
@@ -257,8 +311,9 @@ export const queryEditorOperation: NonNullable<
 			404,
 		);
 	const effects = runtime.evidence.listEffects(operation.id, { limit: 2 }).items;
+	const effect = effects.length === 1 ? effects[0] : undefined;
 	const deviceId =
-		operation.executionBindingJson?.deviceId ?? effects[0]?.identityJson.deviceId ?? "local";
+		operation.executionBindingJson?.deviceId ?? effect?.identityJson.deviceId ?? "local";
 	const authorize = actor.authorizeOperation?.bind(actor, deviceId);
 	if (authorize) await authorize();
 	else if (deviceId !== "local")
@@ -267,100 +322,108 @@ export const queryEditorOperation: NonNullable<
 			"Original receipt device authorization unavailable",
 			403,
 		);
-	if (authorize && deviceId !== "local") {
-		const effect = effects.length === 1 ? effects[0] : undefined;
-		if (!effect || !remoteEditorIntent(operation, effect))
-			return {
-				status: "uncertain",
-				operationId,
-				error: {
-					code: "EDITOR_RESULT_UNAVAILABLE",
-					message:
-						"This remote save has no durable receipt binding; verify the file before retrying",
-				},
-			};
-		const query = remoteQueryRequest(operation, effect);
-		if (operation.settlement === "settled") {
-			const result = remoteResult(operation, effect);
-			// Retry only the terminal ACK; an offline executor never downgrades SQLite proof.
-			if (result.status !== "uncertain")
-				await acknowledgeEditorReceipt(deviceId, query).catch((error) =>
-					logger.debug("Editor engine ACK deferred", { error: String(error) }),
-				);
-			return result;
-		}
-		// Lost reply or cold recovery: adopt only a positively terminal executor receipt.
-		try {
-			const backend = resolveBackend({ requested: deviceId });
-			if (!(backend instanceof RemoteBackend))
-				throw new Error("Original editor device unavailable");
-			const rpc = backend.editorWriteRpc();
-			const proof = await rpc.call<EditorQueryResult>("editor.query", query, actor.signal);
-			if (
-				proof?.result &&
-				proof.result.outcome === proof.outcome &&
-				(proof.outcome === "committed" || proof.outcome === "rejected")
-			) {
-				try {
-					runtime.settleEditorReceipt(operation.id, proof.result);
-				} catch (error) {
-					logger.warn("Editor receipt contradicts original intent", {
-						operationId,
-						error: String(error),
-					});
-					return { status: "uncertain", operationId };
-				}
-				await rpc.call("editor.query", { ...query, acknowledgeTerminal: true }, actor.signal);
-			}
-		} catch (error) {
-			actor.signal?.throwIfAborted();
-			logger.debug("Editor remote query unavailable", { operationId, error: String(error) });
-		}
-		// Access may have been revoked while the RPC was in flight.
-		await authorize();
-		const latest = runtime.evidence.getOperation(operation.id);
-		const observed = runtime.evidence.getEffect(operation.id, effect.mutationId);
-		return latest && observed
-			? remoteResult(latest, observed)
-			: { status: "uncertain", operationId };
-	}
-	if (operation.settlement !== "settled") return { status: "uncertain", operationId };
-	if (operation.executionOutcome !== "succeeded") return { status: "failed", operationId };
-	if (
-		!recovery ||
-		recovery.operationId !== operationId ||
-		recovery.userId !== actor.userId ||
-		recovery.narratorId !== actor.narratorId
-	)
+	const ownedRecovery =
+		recovery &&
+		recovery.operationId === operationId &&
+		recovery.userId === actor.userId &&
+		recovery.narratorId === actor.narratorId
+			? recovery
+			: undefined;
+	if (deviceId === "local")
+		return effectResult(
+			operation,
+			effect,
+			operationId,
+			ownedRecovery
+				? {
+						...(ownedRecovery.hashKind ? { hashKind: ownedRecovery.hashKind } : {}),
+						hash: ownedRecovery.hash,
+						bytes: ownedRecovery.bytes,
+						snapshotRevision: ownedRecovery.snapshotRevision,
+					}
+				: null,
+			ownedRecovery?.rawDigest,
+		);
+	const intent = remoteEditorIntent(operation);
+	if (!intent)
 		return {
 			status: "uncertain",
 			operationId,
 			error: {
 				code: "EDITOR_RESULT_UNAVAILABLE",
-				message:
-					"The write settled, but its saved snapshot metadata is unavailable; verify before retrying",
+				message: "This remote save has no durable receipt binding; verify the file before retrying",
 			},
 		};
-	const after = effects[0]?.observedAfterStateJson;
+	// A raw-v2 save's saved hash is its raw digest, so the recorded intent restores the
+	// result even after the editor's own restart description was removed.
+	const intended = effect?.intendedAfterStateJson;
+	const saved =
+		intended?.kind === "regular"
+			? {
+					hashKind: "raw-sha256" as const,
+					hash: intended.blob.digest,
+					bytes: intended.blob.sizeBytes,
+					snapshotRevision: intent.snapshotRevision,
+				}
+			: null;
+	// An applied effect whose intended blob was not recorded (history unavailable) cannot
+	// restore the saved result itself; the executor's exact-op receipt below can.
+	if (effect && effect.diskOutcome !== "unknown" && (saved || effect.diskOutcome !== "applied")) {
+		const result = effectResult(operation, effect, operationId, saved);
+		// Retry only the terminal ACK; an offline executor never downgrades recorded proof.
+		if (result.status !== "uncertain")
+			await acknowledgeEditorReceipt(deviceId, intent.query).catch((error) =>
+				logger.debug("Editor engine ACK deferred", { error: String(error) }),
+			);
+		return result;
+	}
+	// Lost reply or cold recovery: only the executor's exact-op terminal receipt decides.
+	// not_found/uncertain never prove non-execution and never permit a re-apply.
+	let proof: EditorQueryResult | undefined;
+	try {
+		proof = await remoteRpc(deviceId).call<EditorQueryResult>(
+			"editor.query",
+			intent.query,
+			actor.signal,
+		);
+	} catch (error) {
+		actor.signal?.throwIfAborted();
+		logger.debug("Editor remote query unavailable", { operationId, error: String(error) });
+	}
+	// Access may have been revoked while the RPC was in flight.
+	await authorize?.();
+	const receipt = proof?.result;
 	if (
-		effects.length !== 1 ||
-		after?.kind !== "regular" ||
-		after.blob.digest !== recovery.rawDigest ||
-		after.blob.sizeBytes !== recovery.bytes
+		!proof ||
+		proof.operationId !== operationId ||
+		!receipt ||
+		receipt.operationId !== operationId ||
+		receipt.outcome !== proof.outcome ||
+		(proof.outcome !== "committed" && proof.outcome !== "rejected")
 	)
 		return { status: "uncertain", operationId };
-	return {
-		status: "saved",
-		operationId,
-		result: {
-			status: "saved",
-			operationId,
-			...(recovery.hashKind ? { hashKind: recovery.hashKind } : {}),
-			hash: recovery.hash,
-			bytes: recovery.bytes,
-			snapshotRevision: recovery.snapshotRevision,
-		},
-	};
+	let committed: SavedSnapshot | undefined;
+	if (proof.outcome === "committed") {
+		if (typeof receipt.rawDigest !== "string" || !Number.isSafeInteger(receipt.totalBytes))
+			return { status: "uncertain", operationId };
+		// The executor bound this receipt to the original requestDigest. Without a recorded
+		// effect (history unavailable) its proven raw digest is the saved raw-v2 hash.
+		committed = saved ?? {
+			hashKind: "raw-sha256",
+			hash: receipt.rawDigest,
+			bytes: receipt.totalBytes as number,
+			snapshotRevision: intent.snapshotRevision,
+		};
+		if (receipt.rawDigest !== committed.hash || receipt.totalBytes !== committed.bytes) {
+			logger.warn("Editor receipt contradicts original intent", { operationId });
+			return { status: "uncertain", operationId };
+		}
+	} else if (receipt.rawDigest !== null || receipt.totalBytes !== null)
+		return { status: "uncertain", operationId };
+	await acknowledgeEditorReceipt(deviceId, intent.query).catch((error) =>
+		logger.debug("Editor engine ACK deferred", { error: String(error) }),
+	);
+	return committed ? savedResult(operationId, committed, false) : { status: "failed", operationId };
 };
 
 export function editorRuntimeUnavailable(error: unknown): never {

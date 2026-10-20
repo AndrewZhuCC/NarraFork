@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import type { EditorCommitResult, EditorDocumentDescriptor } from "@shared/editor-document";
+import { notifications } from "@mantine/notifications";
+import type {
+	EditorCommitResult,
+	EditorDocumentDescriptor,
+	EditorOperationResult,
+	EditorSaveResult,
+} from "@shared/editor-document";
 import type { FileReferenceEditorSelection, FileSelection } from "@shared/file-reference";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DockviewApi, IDockviewPanelProps, SerializedDockview } from "dockview-react";
@@ -1062,6 +1068,8 @@ for (const currentFailure of ["none", "deleted", "forbidden"] as const)
 			operationId: "old-operation",
 			result: {
 				status: "saved",
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
 				operationId: "old-operation",
 				hash: "old-save-hash",
 				snapshotRevision: old.revision,
@@ -1102,6 +1110,9 @@ for (const currentFailure of ["none", "deleted", "forbidden"] as const)
 		await click(check as HTMLButtonElement);
 		expect(receipt).toHaveBeenCalledWith("receipt-source", "old-operation");
 		expect(host.querySelector('[data-editor-retired-receipt="saved"]')).not.toBeNull();
+		expect(host.querySelector("[data-editor-history-unavailable]")?.textContent).toBe(
+			en.revertPlanHistoryUnavailable,
+		);
 		expect(old.text).toBe("retained unsaved body");
 		expect(old.disposed).toBe(false);
 		if (current) {
@@ -2357,6 +2368,81 @@ test("search-panel save delegates to the same immutable snapshot handler", async
 	});
 	expect(await upload.mock.calls[0]?.[3].text()).toBe("draft from search");
 	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
+});
+
+for (const large of [false, true]) {
+	for (const recovery of [false, true]) {
+		test(`${large ? "large" : "small"} ${recovery ? "polled" : "direct"} save warns about missing history while keeping saved state`, async () => {
+			const show = spyOn(notifications, "show").mockReturnValue("history-gap");
+			restores.push(() => show.mockRestore());
+			const pendingCommit = deferred<EditorCommitResult>();
+			const pendingOperation = deferred<EditorOperationResult>();
+			commit.mockImplementation(() =>
+				recovery
+					? Promise.resolve({ status: "committing", operationId: "op" })
+					: pendingCommit.promise,
+			);
+			const operation = spyOn(editorDocumentApi, "operation").mockImplementation(
+				() => pendingOperation.promise,
+			);
+			restores.push(() => operation.mockRestore());
+			const model = await mount();
+			const text = large ? "x".repeat(1024 * 1024 + 1) : "saved snapshot";
+			await edit(model, text);
+			await click(iconButton("device-floppy"));
+			expect(show).not.toHaveBeenCalled();
+			const result: EditorSaveResult = {
+				status: "saved",
+				historyStatus: "unavailable",
+				operationId: "op",
+				hash: "history-gap-hash",
+				snapshotRevision: uploadedRevision,
+				bytes: text.length,
+			};
+			await act(async () => {
+				if (recovery) pendingOperation.resolve({ status: "saved", operationId: "op", result });
+				else pendingCommit.resolve(result);
+			});
+			expectClean("history-gap-hash");
+			expect(model.text).toBe(text);
+			expect(await upload.mock.calls[0]?.[3].text()).toBe(text);
+			expect(show).toHaveBeenCalledTimes(1);
+			expect(show.mock.calls[0][0]).toMatchObject({
+				title: "a.txt",
+				color: "yellow",
+				message: en.revertPlanHistoryUnavailable,
+			});
+			expect(commit).toHaveBeenCalledTimes(1);
+			expect(operation).toHaveBeenCalledTimes(recovery ? 1 : 0);
+			await edit(model, "next draft");
+			expect(model.text).toBe("next draft");
+			expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+			expect(iconButton("device-floppy").disabled).toBe(false);
+			expect(show).toHaveBeenCalledTimes(1);
+			expect(legacyWrite).not.toHaveBeenCalled();
+		});
+	}
+}
+
+test.each([
+	"complete",
+	undefined,
+] as const)("saved %s history avoids a fabricated history warning", async (historyStatus) => {
+	const show = spyOn(notifications, "show").mockReturnValue("unused");
+	restores.push(() => show.mockRestore());
+	commit.mockImplementation(async () => ({
+		status: "saved",
+		historyStatus,
+		operationId: "op",
+		hash: "saved",
+		snapshotRevision: uploadedRevision,
+		bytes: 5,
+	}));
+	const model = await mount();
+	await edit(model, "saved");
+	await click(iconButton("device-floppy"));
+	expectClean("saved");
+	expect(show).not.toHaveBeenCalled();
 });
 
 test("input immediately followed by two save shortcuts captures newest version once", async () => {

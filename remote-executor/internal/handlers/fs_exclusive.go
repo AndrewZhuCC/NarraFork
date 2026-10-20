@@ -167,14 +167,21 @@ func (h *Handlers) fsWriteExclusiveWithParent(parent context.Context, params map
 	if err != nil || len(data) > exclusiveCreateMaxBytes || int64(len(data)) > h.maxRpcBytes {
 		return nil, fmt.Errorf("invalid or oversized exclusive content")
 	}
-	release, err := acquireFileMutation(ctx)
+	path, err := h.exclusiveCreatePath(params)
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireFileMutation(ctx, path)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	path, err := h.exclusiveCreatePath(params)
+	resolved, err := h.exclusiveCreatePath(params)
 	if err != nil {
 		return nil, err
+	}
+	if !samePath(resolved, path) {
+		return nil, fmt.Errorf("exclusive create canonical identity changed while waiting")
 	}
 	root, leaf, err := bind(ctx, path)
 	if err != nil {

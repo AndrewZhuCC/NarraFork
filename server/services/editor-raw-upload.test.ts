@@ -56,14 +56,21 @@ beforeEach(async () => {
 	// Explicit test writer: exercises host stage/prepare/receipt, NOT production atomic IO.
 	const execute: EditorDocumentDependencies["execute"] = async (request) => {
 		await request.authorize();
+		const before = new Uint8Array(await readFile(target));
 		const prepared = await request.construct({
-			bytes: new Uint8Array(await readFile(target)),
+			bytes: before,
 		} as Parameters<typeof request.construct>[0]);
+		expect(prepared.beforeRawDigest).toBe(hash(before));
+		expect(prepared.rawDigest).toBe(hash(prepared.nextBytes));
 		writes++;
 		await writeFile(target, prepared.nextBytes);
-		return { result: prepared.result } as Awaited<
-			ReturnType<EditorDocumentDependencies["execute"]>
-		>;
+		return {
+			result: prepared.result,
+			diskOutcome: "applied",
+			historyStatus: "complete",
+			linesAdded: null,
+			linesRemoved: null,
+		};
 	};
 	jobs = new EditorDocumentJobs();
 	service = new EditorDocumentService({
@@ -353,6 +360,71 @@ for (const queued of [false, true])
 			await outcome;
 		}
 	});
+test("prepare returns raw before/after digests without changing either public hash domain", async () => {
+	const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+	const before = Buffer.concat([bom, Buffer.from("before\r\n")]);
+	const expected = Buffer.concat([bom, Buffer.from("after\r\n")]);
+	const uploadPath = join(root, "summary-upload");
+	for (const raw of [false, true]) {
+		const uploaded = raw ? expected : Buffer.from("after\n");
+		await writeFile(uploadPath, uploaded);
+		const prepared = await jobs.run(actor.userId, {
+			action: "prepare",
+			before,
+			uploadPath,
+			conflictPath: join(root, "unexpected-conflict"),
+			baseHash: hash(raw ? before : Buffer.from("before\r\n")),
+			encoding: "utf-8",
+			digest: hash(uploaded),
+			...(raw ? { hashKind: "raw-sha256" as const } : {}),
+		});
+		if (prepared.kind !== "prepared") throw new Error("Expected prepared bytes");
+		expect(Buffer.from(prepared.nextBytes)).toEqual(expected);
+		expect(prepared.rawDigest).toBe(hash(expected));
+		expect(prepared.beforeRawDigest).toBe(hash(before));
+		expect(prepared.hash).toBe(hash(raw ? expected : Buffer.from("after\r\n")));
+	}
+	const created = Buffer.from("new\n");
+	await writeFile(uploadPath, created);
+	const prepared = await jobs.run(actor.userId, {
+		action: "prepare",
+		before: null,
+		uploadPath,
+		conflictPath: join(root, "unexpected-conflict"),
+		baseHash: null,
+		encoding: "utf-8",
+		digest: hash(created),
+		hashKind: "raw-sha256",
+	});
+	expect(prepared).toMatchObject({
+		kind: "prepared",
+		rawDigest: hash(created),
+		beforeRawDigest: null,
+		hash: hash(created),
+	});
+});
+
+for (const description of ["{", JSON.stringify({ version: 0 })]) {
+	test(`raw save preserves an unusable recovery description (${description})`, async () => {
+		const value = await setup();
+		const path = join(root, "transfers", `ed-${value.upload.operationId}.json`);
+		await writeFile(path, description);
+		await put(value, 0, 0, value.bytes);
+		await service.sealRaw(actor, value.doc.docId, value.upload.uploadId, value.seal);
+		const result = await service.commit(actor, value.doc.docId, value.upload.uploadId, {});
+		expect(result).toMatchObject({
+			status: "saved",
+			hashKind: "raw-sha256",
+			hash: value.seal.rawDigest,
+			diskOutcome: "applied",
+			historyStatus: "complete",
+		});
+		expect(await readFile(target)).toEqual(Buffer.from("A\r\nb\rc\n"));
+		expect(await readFile(path, "utf8")).toBe(description);
+		expect(writes).toBe(1);
+	});
+}
+
 test("raw preparation cannot reuse an otherwise identical v1-domain recovery marker", async () => {
 	const value = await setup(),
 		path = join(root, "transfers", `ed-${value.upload.operationId}.json`);

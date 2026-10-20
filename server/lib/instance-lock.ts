@@ -16,15 +16,15 @@ import {
 } from "node:fs";
 import { hostname, uptime } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { logger } from "./logger";
 import {
-	isWorkspaceProcessIdentity,
-	observeWorkspaceProcess,
-	sameWorkspaceProcessDomain,
-	type WorkspaceProcessIdentity,
-	type WorkspaceProcessObservation,
-	workspaceProcessEndReason,
-} from "./workspace-process-identity";
+	type InstanceProcessIdentity,
+	type InstanceProcessObservation,
+	instanceProcessEndReason,
+	isInstanceProcessIdentity,
+	observeInstanceProcess,
+	sameInstanceProcessDomain,
+} from "./instance-process-identity";
+import { logger } from "./logger";
 
 /**
  * Single-instance guard for the NarraFork data directory.
@@ -96,7 +96,7 @@ interface InstanceLockPayload {
 	hostname: string;
 	uid: number | null;
 	/** Written only after asynchronous startup identity registration, never guessed from v1/v2. */
-	maintenanceIdentity?: WorkspaceProcessIdentity;
+	maintenanceIdentity?: InstanceProcessIdentity;
 	/** Propagates exclusive provenance: an unsafe takeover must not become trusted next boot. */
 	maintenanceQualified?: boolean;
 }
@@ -115,7 +115,7 @@ interface InstanceLockState {
 		| "cleared_lock"
 		| "lost_token";
 	/** Immutable snapshot of the actual cleared owner, not a stale-verdict string. */
-	maintenancePredecessor?: WorkspaceProcessIdentity;
+	maintenancePredecessor?: InstanceProcessIdentity;
 }
 
 /** What we could observe about a pid right now. Three states, never a bare boolean. */
@@ -639,7 +639,7 @@ function readLockPayload(path: string, bounded = false): InstanceLockPayload | n
 			execPath: String(payload.execPath ?? ""),
 			hostname: String(payload.hostname ?? ""),
 			uid: typeof payload.uid === "number" ? payload.uid : null,
-			maintenanceIdentity: isWorkspaceProcessIdentity(payload.maintenanceIdentity)
+			maintenanceIdentity: isInstanceProcessIdentity(payload.maintenanceIdentity)
 				? payload.maintenanceIdentity
 				: undefined,
 			maintenanceQualified: payload.maintenanceQualified === true,
@@ -845,7 +845,7 @@ export function acquireInstanceLock(dbPath: string): void {
 	let maintenancePath: InstanceLockState["maintenancePath"] = forceUnlock
 		? "override"
 		: (state.maintenancePath ?? "fresh");
-	let maintenancePredecessor: WorkspaceProcessIdentity | undefined;
+	let maintenancePredecessor: InstanceProcessIdentity | undefined;
 
 	// Budget: one pass to claim a free lock, one more after clearing a lock we proved stale, plus a
 	// small allowance for passes that decided nothing because a competitor changed the file first.
@@ -955,11 +955,11 @@ export function acquireInstanceLock(dbPath: string): void {
 
 function captureMaintenancePredecessor(
 	payload: InstanceLockPayload | null,
-): WorkspaceProcessIdentity | undefined {
+): InstanceProcessIdentity | undefined {
 	const identity = payload?.maintenanceIdentity;
 	if (
 		!payload?.maintenanceQualified ||
-		!isWorkspaceProcessIdentity(identity) ||
+		!isInstanceProcessIdentity(identity) ||
 		identity.pid !== payload.pid
 	)
 		return undefined;
@@ -971,17 +971,17 @@ interface LockIdentityRegistrationDependencies {
 	pid: number;
 	env: NodeJS.ProcessEnv;
 	readCurrent(): InstanceLockPayload | null;
-	persist(identity: WorkspaceProcessIdentity, qualified: boolean): boolean;
-	observe(pid: number): Promise<WorkspaceProcessObservation>;
+	persist(identity: InstanceProcessIdentity, qualified: boolean): boolean;
+	observe(pid: number): Promise<InstanceProcessObservation>;
 }
 
 /** Startup only. A permissive stale decision is replaced by independent, exact OS evidence. */
 async function registerLockIdentity(
-	identity: WorkspaceProcessIdentity,
+	identity: InstanceProcessIdentity,
 	deps: LockIdentityRegistrationDependencies,
 ): Promise<void> {
 	const { state } = deps;
-	if (!isWorkspaceProcessIdentity(identity) || identity.pid !== deps.pid || !state.acquired) return;
+	if (!isInstanceProcessIdentity(identity) || identity.pid !== deps.pid || !state.acquired) return;
 	const token = state.token;
 	const path = state.path;
 	const ownsCurrent = () => {
@@ -1014,8 +1014,8 @@ async function registerLockIdentity(
 					: observation.domain;
 		qualified =
 			!!observedDomain &&
-			sameWorkspaceProcessDomain(identity.domain, observedDomain) &&
-			workspaceProcessEndReason(previous, observation) !== null;
+			sameInstanceProcessDomain(identity.domain, observedDomain) &&
+			instanceProcessEndReason(previous, observation) !== null;
 	}
 	// Environment and token may have changed while the asynchronous probe was running.
 	if (!ownsCurrent()) {
@@ -1046,7 +1046,7 @@ async function registerLockIdentity(
 }
 
 /** Update the opened inode, never rename over a competitor's replacement lock. */
-function persistLockIdentity(identity: WorkspaceProcessIdentity, qualified: boolean): boolean {
+function persistLockIdentity(identity: InstanceProcessIdentity, qualified: boolean): boolean {
 	const state = lockState();
 	if (!state.path || !state.token) return false;
 	let fd: number | undefined;
@@ -1077,17 +1077,21 @@ function persistLockIdentity(identity: WorkspaceProcessIdentity, qualified: bool
 	}
 }
 
-export async function registerInstanceLockProcessIdentity(
-	identity: WorkspaceProcessIdentity,
-): Promise<void> {
+/** Startup provenance for ordinary cold continuation recovery; no workspace state is involved. */
+export async function initializeInstanceLockProcessIdentity(): Promise<void> {
 	const state = lockState();
-	await registerLockIdentity(identity, {
+	if (!state.acquired) return;
+	const observation = await observeInstanceProcess(process.pid);
+	if (observation.kind !== "present") {
+		throw new Error("Could not verify the current instance process identity");
+	}
+	await registerLockIdentity(observation.identity, {
 		state,
 		pid: process.pid,
 		env: process.env,
 		readCurrent: () => (state.path ? readLockPayload(state.path, true) : null),
 		persist: persistLockIdentity,
-		observe: observeWorkspaceProcess,
+		observe: observeInstanceProcess,
 	});
 }
 
@@ -1115,7 +1119,7 @@ function evaluateMaintenanceAuthority(
 	return { allowed: true, reason: "exclusive_instance_lock" };
 }
 
-/** Recheck environment and on-disk token on EVERY maintenance use; never probe the OS here. */
+/** Recheck exclusive authority for cold continuation takeover; never probe the OS on this path. */
 export function getInstanceMaintenanceAuthority(): InstanceMaintenanceAuthority {
 	const state = lockState();
 	let payload: InstanceLockPayload | null = null;

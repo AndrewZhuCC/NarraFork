@@ -70,50 +70,26 @@ async function input(bytes: Uint8Array): Promise<LocalFileApplyInput> {
 		editor: {
 			sourceId: id,
 			userId: "fixture-user",
-			operationId: `host-${id}`,
-			effectId: `effect-${id}`,
+			sourceInstanceId: "fixture-source",
+			snapshotRevision: ++fence,
 			requestDigest: hash(id),
-			executionBinding: {
-				deviceId: "local",
-				runtimeEpoch: epoch,
-				runtimeGeneration: 0,
-				fencingToken: ++fence,
-			},
-			scope: {
-				id: "fixture-scope",
-				sourceInstanceId: "fixture-source",
-				deviceId: "local",
-				workspaceInstanceId: "fixture-workspace",
-				canonicalRoot: canonical,
-				pathFlavor: flavor,
-			},
-			before: {
-				kind: "regular",
-				mode: before.mode,
-				blob: { algorithm: "sha256", digest: hash(before.bytes), sizeBytes: before.bytes.length },
-			},
-			intended: {
-				kind: "regular",
-				mode: before.mode,
-				blob: { algorithm: "sha256", digest: hash(bytes), sizeBytes: bytes.length },
-			},
+			root: canonical,
+			runtime: { runtimeEpoch: epoch, runtimeGeneration: 0 },
+			rawDigest: hash(bytes),
+			beforeRawDigest: hash(before.bytes),
 		},
 	};
 }
 function owner(value: LocalFileApplyInput) {
-	assert(value.editor);
+	assert(value.editor?.sourceInstanceId);
 	const namespace = editorOperationNamespace(
-		value.editor.scope.sourceInstanceId,
+		value.editor.sourceInstanceId,
 		value.editor.userId,
 		"local",
 	);
 	return {
 		namespace,
-		resourceKey: editorWriterResourceKey(
-			namespace,
-			value.editor.operationId,
-			value.editor.effectId,
-		),
+		resourceKey: editorWriterResourceKey(namespace, value.editor.sourceId),
 		operationId: value.editor.sourceId,
 		requestDigest: value.editor.requestDigest,
 	};
@@ -132,6 +108,7 @@ async function apply(value: LocalFileApplyInput, drop = false) {
 	};
 	try {
 		return await createEditorFileAtomicIo({
+			deviceId: "local",
 			read: fileChangeLocalIo.read,
 			rpc,
 		}).apply(value);
@@ -224,6 +201,7 @@ if (windows) {
 		});
 		const result = await readonlyPeer.call<EditorApplyResult>("editor.apply", {
 			...binding,
+			coordination: "target-queue-v1",
 			stageId: stage.stageId,
 			operationId: randomUUID(),
 			requestDigest: hash("readonly"),
@@ -278,8 +256,9 @@ try {
 	await rename(workspace, `${workspace}-retired`);
 	await mkdir(workspace);
 	await writeFile(target, "replacement");
-	const rejected = await rootPeer.call<EditorApplyResult>("editor.apply", {
+	const replacedRequest = {
 		...binding,
+		coordination: "target-queue-v1",
 		stageId: stage.stageId,
 		operationId: randomUUID(),
 		requestDigest: hash("root-replaced"),
@@ -294,8 +273,16 @@ try {
 			runtimeGeneration: 0,
 			fencingToken: ++fence,
 		},
-	});
-	assert.equal(rejected.outcome, "rejected");
+	};
+	// The connection binding refuses a replaced root before any intent is recorded;
+	// a rejected receipt is equally acceptable. Neither may touch the new target.
+	const rejected = await rootPeer
+		.call<EditorApplyResult>("editor.apply", replacedRequest)
+		.catch((error: Error) => {
+			assert.match(error.message, /EDITOR_IDENTITY_CHANGED/);
+			return { outcome: "refused" as const };
+		});
+	assert.ok(rejected.outcome === "rejected" || rejected.outcome === "refused");
 	assert.equal((await readFile(target)).toString(), "replacement");
 } finally {
 	await rootPeer.close();

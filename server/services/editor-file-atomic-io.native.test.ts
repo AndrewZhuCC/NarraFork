@@ -309,11 +309,9 @@ test("lost apply reply stays unknown until original executor proof; no second ap
 		saved.upload.operationId,
 	);
 	if (!operation) throw new Error("Missing original operation");
-	for (const patch of [
-		{ workspaceLeaseId: randomUUID() },
-		{ requestDigest: hash("wrong") },
-		{ editorRawSnapshotRevision: null },
-	]) {
+	// The target queue records no lease; the exact executor operation is the only key.
+	expect(operation.workspaceLeaseId).toBeNull();
+	for (const patch of [{ requestDigest: hash("wrong") }, { editorRawSnapshotRevision: null }]) {
 		db.update(fileChangeOperations)
 			.set(patch)
 			.where(eq(fileChangeOperations.id, operation.id))
@@ -323,7 +321,6 @@ test("lost apply reply stays unknown until original executor proof; no second ap
 		});
 		db.update(fileChangeOperations)
 			.set({
-				workspaceLeaseId: operation.workspaceLeaseId,
 				requestDigest: operation.requestDigest,
 				editorRawSnapshotRevision: operation.editorRawSnapshotRevision,
 			})
@@ -490,6 +487,109 @@ test("cancellation after sealed stage but before apply has positive no-dispatch 
 	expect(fixture.applies).toBe(0);
 	expect(fixture.acks).toBe(0);
 	expect(await readFile(target, "utf8")).toBe("before");
+});
+
+test("permission revoked after staging is rechecked before real executor dispatch", async () => {
+	const binding = await actor.authorize(
+		{ path: target, deviceId: fixture.deviceId, origin: "legacy", protocol: "raw-v2" },
+		"write",
+	);
+	let authorized = true;
+	const original = backend.editorWriteRpc.bind(backend);
+	const fault = spyOn(backend, "editorWriteRpc").mockImplementation(() => {
+		const rpc = original();
+		return {
+			...rpc,
+			call: async <T>(method: string, params: object, signal?: AbortSignal) => {
+				const value = await rpc.call<T>(method, params, signal);
+				if (method === "editor.stage.seal") authorized = false;
+				return value;
+			},
+		};
+	});
+	try {
+		await expect(
+			executeEditorDocumentFileChange({
+				requestId: randomUUID(),
+				resourceKey: "revoked-before-apply",
+				workspaceRevision: 0,
+				remote: binding.writeTarget,
+				cwd: workspace,
+				lexicalPath: target,
+				canonicalPath: target,
+				userId: actor.userId,
+				narratorId: actor.narratorId,
+				signal: new AbortController().signal,
+				input: { hashKind: "raw-sha256", snapshotRevision: 1 },
+				authorize: async () => {
+					if (!authorized) throw new Error("editor permission revoked");
+				},
+				construct: () => ({
+					nextBytes: Buffer.from("forbidden"),
+					result: { hash: hash("forbidden"), bytes: 9 },
+					lineStats: null,
+				}),
+			}),
+		).rejects.toThrow("permission revoked");
+	} finally {
+		fault.mockRestore();
+	}
+	expect(fixture.applies).toBe(0);
+	expect(await readFile(target, "utf8")).toBe("before");
+});
+
+test("an executor without editor.target-queue.v1 never dispatches", async () => {
+	const doc = await document(),
+		saved = await stage(doc, "after");
+	const original = backend.editorWriteRpc.bind(backend);
+	const legacy = spyOn(backend, "editorWriteRpc").mockImplementation(() => {
+		const rpc = original();
+		return {
+			...rpc,
+			call: async <T>(method: string, params: object, signal?: AbortSignal) => {
+				const value = await rpc.call<T>(method, params, signal);
+				return method === "editor.capabilities"
+					? ({ ...value, features: ["editor.durable-write.v1"] } as T)
+					: value;
+			},
+		};
+	});
+	try {
+		await expect(saved.commit()).rejects.toThrow("editor.target-queue.v1");
+	} finally {
+		legacy.mockRestore();
+	}
+	expect(fixture.applies).toBe(0);
+	expect(await readFile(target, "utf8")).toBe("before");
+});
+
+test("committed remote save survives an unavailable history; the receipt is the outcome", async () => {
+	const runtime = await getDefaultLocalFileChangeRuntime();
+	const history = spyOn(runtime.evidence, "recordEffect").mockImplementation(() => {
+		throw new Error("history offline");
+	});
+	const doc = await document();
+	let saved: Awaited<ReturnType<typeof stage>>;
+	let result: Awaited<ReturnType<Awaited<ReturnType<typeof stage>>["commit"]>>;
+	try {
+		saved = await stage(doc, "after", new Uint8Array(), 11);
+		result = await saved.commit();
+	} finally {
+		history.mockRestore();
+	}
+	expect(result).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
+	expect(await readFile(target)).toEqual(saved.bytes);
+	expect(fixture.applies).toBe(1);
+	// Cold query has no recorded effect: only the executor's exact-op receipt decides.
+	await rm(
+		join(testEnvironment.narraforkHome, "editor-transfers", `ed-${result.operationId}.json`),
+	);
+	expect(await service.operation(actor, result.operationId)).toMatchObject({
+		status: "saved",
+		result: { hash: hash(saved.bytes), snapshotRevision: 11, diskOutcome: "applied" },
+	});
+	expect(fixture.applies).toBe(1);
+	expect(fixture.queries).toBe(1);
 });
 
 test("production Host wrapper retains workspace revision and retirement admission through settlement", async () => {

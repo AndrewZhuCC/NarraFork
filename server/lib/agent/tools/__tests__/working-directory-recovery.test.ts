@@ -7,7 +7,6 @@ import {
 	LocalFileChangeRuntime,
 	withLocalFileChangeRuntime,
 } from "../../../../services/file-change-runtime";
-import { createWorkspaceWriteCoordinatorState } from "../../../../services/workspace-write-coordinator";
 import type { ExecutionBackend } from "../../execution/backend";
 import { localBackend } from "../../execution/local-backend";
 import { windowsPathSemantics } from "../../execution/path-semantics";
@@ -38,7 +37,6 @@ describe("missing working directory recovery", () => {
 		const runtime = new LocalFileChangeRuntime({
 			db,
 			privateRoot: join(workspace, "private"),
-			coordinatorState: createWorkspaceWriteCoordinatorState(),
 			blobStoreOptions: { minimumFreeBytes: 0 },
 		});
 		const backend = Object.assign(Object.create(localBackend), {
@@ -84,13 +82,7 @@ describe("missing working directory recovery", () => {
 			expect(result.isError).toBeFalsy();
 			expect(executedCwd).toBe(windowsCwd);
 			const scopes = await db.query.fileChangeScopes.findMany();
-			expect(scopes).toHaveLength(1);
-			expect(scopes[0]).toMatchObject({
-				deviceId: "local",
-				pathFlavor: "windows",
-				activeMutationCount: 0,
-			});
-			expect(scopes[0]?.rootIdentityJson).not.toBeNull();
+			expect(scopes).toHaveLength(0);
 		} finally {
 			process.chdir(originalCwd);
 			sqlite.close();

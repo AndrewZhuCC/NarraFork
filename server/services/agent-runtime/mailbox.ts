@@ -9,7 +9,14 @@ import { generateId } from "../../lib/id";
 import { MAILBOX_LIMITS as L } from "./limits";
 // The dialect-neutral kernel lives in mailbox-shared.ts so the PostgreSQL adapter never
 // runtime-imports this SQLite module. The re-export below keeps existing call sites stable.
-import { boundedError, boundedJson, mailboxDedupeKey, pointer } from "./mailbox-shared";
+import {
+	boundedError,
+	boundedJson,
+	mailboxDedupeKey,
+	pointer,
+	recipientDeletedReceiptPatch,
+	semanticEditReceiptPatch,
+} from "./mailbox-shared";
 
 export { boundedError, boundedJson, mailboxDedupeKey };
 
@@ -869,20 +876,17 @@ export function createMailboxStore(db: RuntimeDb) {
 			}
 			return tx
 				.update(mailbox)
-				.set({
-					currentMessageId: change.kind === "deleted" ? null : change.messageId,
-					...(change.kind === "semantic_edit"
-						? {
-								receiptDisposition: "superseded" as const,
-								currentRevision: sql`max(${mailbox.currentRevision}, ${mailbox.contentRevision}) + 1`,
-								currentAdoptedRevision: null,
-								currentAdoptedAt: null,
-							}
-						: change.kind === "deleted"
-							? { receiptDisposition: "recipient_deleted" as const }
-							: {}),
-					updatedAt: now(),
-				})
+				.set(
+					change.kind === "deleted"
+						? recipientDeletedReceiptPatch(now())
+						: change.kind === "semantic_edit"
+							? semanticEditReceiptPatch(
+									change.messageId,
+									sql`max(${mailbox.currentRevision}, ${mailbox.contentRevision}) + 1`,
+									now(),
+								)
+							: { currentMessageId: change.messageId, updatedAt: now() },
+				)
 				.where(
 					and(
 						eq(mailbox.narratorId, narratorId),

@@ -13,6 +13,7 @@ import {
 	type EditorProviderCapabilities,
 	editorProviderCanRawSave,
 } from "@shared/editor-provider-contracts";
+import type { FileWriteOutcome } from "@shared/file-change-protocol";
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import type { EditorAttemptSpool } from "./editor-attempt-spool";
@@ -136,7 +137,10 @@ export interface EditorSessionOptions {
 		snapshotRevision: number;
 		status: "query-first";
 	}) => Promise<undefined | { draftWriterId?: string; draftModelLifetime?: string }>;
+	/** Draft retirement stays tied to the exact captured revision and model lifetime. */
 	onSaved?: (revision: number, modelLifetime?: string) => void;
+	/** Verified direct/polled receipt observer; independent of draft retirement. */
+	onSaveReceipt?: (result: EditorSaveResult) => void;
 	api?: typeof editorDocumentApi;
 	translate?: (key: string, fallback: string) => string;
 	readOnlySource?: (
@@ -720,6 +724,11 @@ export class EditorDocumentSession {
 			confirmation: null,
 			conflict: null,
 		});
+		try {
+			this.options.onSaveReceipt?.(result);
+		} catch {
+			// A UI notice cannot turn a verified save into failure or drop a queued intent.
+		}
 		// One queued user intent may chain only after a confirmed receipt updates the
 		// baseline. A fresh snapshot captures the newest keystrokes; nothing is replayed.
 		if (this.pendingIntent) {
@@ -866,7 +875,9 @@ export class EditorDocumentSession {
 			if (this.attempt !== attempt || this.disposed) return;
 			const data =
 				error instanceof ApiError
-					? (error.data as { code?: string; operationId?: string } | undefined)
+					? (error.data as
+							| { code?: string; operationId?: string; diskOutcome?: FileWriteOutcome }
+							| undefined)
 					: undefined;
 			if (data?.operationId) attempt.operationId = data.operationId;
 			if (
@@ -894,6 +905,14 @@ export class EditorDocumentSession {
 				return;
 			}
 			if (this.state.invalidated || this.authorizationFailed(error)) return;
+			if (data?.diskOutcome === "unknown" || data?.diskOutcome === "applied") {
+				// HTTP 4xx does not prove non-application. Keep this exact operation until
+				// its receipt is verified; never resend an uncertain snapshot automatically.
+				this.clearPendingIntent();
+				this.update({ phase: "unknown", error: message(error) });
+				await this.reconcile();
+				return;
+			}
 			if (
 				data?.code === "EDITOR_DRAFT_WRITER_RETIRED" ||
 				data?.code === "EDITOR_DRAFT_PROVENANCE_UNAVAILABLE" ||
@@ -934,6 +953,14 @@ export class EditorDocumentSession {
 					phase: "idle",
 					conflict: { ...(data as EditorConflictData), docId: attempt.docId },
 				});
+				return;
+			}
+			if (data?.diskOutcome === "not_applied") {
+				// A verified no-write result, even a 5xx, leaves the draft editable. This
+				// retires only the failed attempt; a later explicit save takes a fresh snapshot.
+				this.clearPendingIntent();
+				this.cancel(true);
+				this.update({ error: message(error) });
 				return;
 			}
 			// After dispatch, a transport/5xx/expiry failure is not proof that the disk was untouched.

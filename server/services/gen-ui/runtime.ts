@@ -7,9 +7,12 @@ import { createExecutionTargetContext } from "@server/services/execution-policy/
 import { LocalFileValidationError } from "@server/services/file-change-local-io";
 import {
 	assertLocalFileChangeAdmission,
+	boundedFileHistory,
 	executeLocalFileChange,
 	type LocalFileChangeRequest,
+	withFileHistoryNotice,
 } from "@server/services/file-change-runtime";
+import { withFileWrite } from "@server/services/file-write-queue";
 import { GEN_UI_DIRECTORY, GEN_UI_ENTRY, type GenUiFileReference } from "@shared/gen-ui-files";
 import { checkedIdentity, uiError, validateDirectory, workspaceKey, workspaceRoot } from "./files";
 import { executeKitAction, type KitToolEnvironment, kitNoticeFor } from "./kit-runtime";
@@ -230,22 +233,38 @@ export async function executeGenUiTool(
 				throw uiError("UI creation requires a bound local file-change journal", 409);
 			// Same explicit compatibility boundary as remote Write/Edit: no v2
 			// journal or exact rollback capability is claimed for this backend.
-			await deps.snapshot(ctx, backend, entry);
-			await check();
-			await backend.writeFileBytes(entry, new TextEncoder().encode(TEMPLATE), {
-				expectedResolvedPath: entry,
-				exclusive: true,
-				signal: ctx.signal,
-				timeoutMs: 30_000,
-			});
+			await withFileWrite(
+				{
+					deviceId: backend.deviceId,
+					pathFlavor: backend.pathFlavor as "posix" | "windows",
+					canonicalPath: entry,
+				},
+				async () => {
+					await boundedFileHistory(() => deps.snapshot(ctx, backend, entry)).catch(() => {});
+					await check();
+					await backend.writeFileBytes(entry, new TextEncoder().encode(TEMPLATE), {
+						expectedResolvedPath: entry,
+						exclusive: true,
+						signal: ctx.signal,
+						timeoutMs: 30_000,
+					});
+				},
+				{ signal: ctx.signal },
+			);
 			fileMetadata = {
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
 				fileChangeHistoryUnavailable: true,
 				fileChangeHistoryReason: "remote_journal_unsupported",
 			};
 		}
-		await deps.track(ctx, backend, entry, Boolean(recorded));
+		try {
+			await deps.track(ctx, backend, entry, Boolean(recorded));
+		} catch {
+			fileMetadata = { ...fileMetadata, historyStatus: "unavailable" };
+		}
 	}
-	await check();
+	if (input.action === "show") await check();
 	// Which kit the preview will compile against, and whether the user is being asked
 	// to build one. Advisory: a kit problem must never fail a file preview.
 	const kitNotice = await kitNoticeFor(kitEnvironment);
@@ -260,25 +279,28 @@ export async function executeGenUiTool(
 		entry: GEN_UI_ENTRY,
 		title: backend.paths.basename(directory),
 	};
-	return {
-		output:
-			input.action === "create"
-				? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory. The user sees nothing until you show it.${fileMetadata?.fileChangeHistoryUnavailable ? " Remote file-change journal is unavailable; this creation cannot be reverted through message history." : ""}`
-				: `Shown: ${directory}/App.tsx. The user's browser builds the app from the files on disk when the card displays it, and runs it in the chat: build errors appear in the card and are not reported to you, and later edits change what a reopened card shows. Only the latest app starts by itself; an older one waits for the user to click Run. Calls to genUI.sendPrompt / submit / openLink reach you only after the user confirms them.`,
-		title: reference.title,
-		metadata: {
-			...fileMetadata,
-			genUi: reference,
-			...(input.action === "show"
-				? {
-						genUiShow: {
-							version: 1,
-							shownAt: new Date().toISOString(),
-							size: input.size ?? "md",
-						},
-					}
-				: {}),
-			...(kitNotice ? { genUiKit: kitNotice } : {}),
+	return withFileHistoryNotice(
+		{
+			output:
+				input.action === "create"
+					? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory. The user sees nothing until you show it.`
+					: `Shown: ${directory}/App.tsx. The user's browser builds the app from the files on disk when the card displays it, and runs it in the chat: build errors appear in the card and are not reported to you, and later edits change what a reopened card shows. Only the latest app starts by itself; an older one waits for the user to click Run. Calls to genUI.sendPrompt / submit / openLink reach you only after the user confirms them.`,
+			title: reference.title,
+			metadata: {
+				...fileMetadata,
+				genUi: reference,
+				...(input.action === "show"
+					? {
+							genUiShow: {
+								version: 1,
+								shownAt: new Date().toISOString(),
+								size: input.size ?? "md",
+							},
+						}
+					: {}),
+				...(kitNotice ? { genUiKit: kitNotice } : {}),
+			},
 		},
-	};
+		ctx.locale,
+	);
 }

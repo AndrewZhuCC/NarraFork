@@ -7,7 +7,7 @@ import {
 } from "@shared/file-change-protocol";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
 
-/** The durable workspace instance, not the current connection to it. */
+/** Historical workspace grouping; live root-object verification is not required. */
 export interface FileChangeScopeIdentity {
 	id: string;
 	sourceInstanceId: string;
@@ -119,6 +119,38 @@ export function fileChangeIdentityKey(identity: FileChangeIdentity): string {
 		.digest("hex");
 }
 
+/** Plan-local physical grouping only. Persistent historical fileKey values stay unchanged. */
+export function fileChangePhysicalIdentityKey(
+	identity: Pick<FileChangeIdentity, "deviceId" | "pathFlavor" | "canonicalPath" | "objectRole">,
+): string {
+	assertBoundedIdentityValue(identity.deviceId, "deviceId", 256);
+	if (identity.pathFlavor !== "posix" && identity.pathFlavor !== "windows") {
+		throw new Error("File-change grouping requires an explicit disk path flavor");
+	}
+	if (identity.objectRole !== "entry" && identity.objectRole !== "referent") {
+		throw new Error("File-change grouping requires an explicit object role");
+	}
+	assertBoundedIdentityValue(
+		identity.canonicalPath,
+		"canonicalPath",
+		FILE_CHANGE_LIMITS.metadataBytes,
+	);
+	const paths = targetPathSemantics(identity.pathFlavor);
+	if (!paths.isAbsolute(identity.canonicalPath)) {
+		throw new Error("File-change canonicalPath must be absolute on its recorded device");
+	}
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				identity.deviceId,
+				identity.pathFlavor,
+				paths.identityKey(identity.canonicalPath),
+				identity.objectRole,
+			]),
+		)
+		.digest("hex");
+}
+
 /** null means the parent's workspace is unknown, never a claim that the file is inside it. */
 export function isOutsideFileChangeWorkspace(
 	identity: FileChangeIdentity,
@@ -135,7 +167,7 @@ export function isOutsideFileChangeWorkspace(
 	);
 }
 
-/** Revalidation must fail on a stale connection or lease, even for the same path. */
+/** Exact comparison for decoding archived v2 receipts only. New history never grants IO authority. */
 export function fileChangeExecutionBindingMatches(
 	expected: FileChangeExecutionBinding,
 	current: FileChangeExecutionBinding,

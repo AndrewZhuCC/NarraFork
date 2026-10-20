@@ -20,22 +20,17 @@
 
 import { expect } from "bun:test";
 import { createHash } from "node:crypto";
-import type {
-	FileChangeBlobRef,
-	FileChangeExecutionBinding,
-	FileChangeExecutionReceipt,
-	FileChangeState,
-} from "@shared/file-change-protocol";
+import type { FileChangeBlobRef, FileChangeState } from "@shared/file-change-protocol";
 import type { FileChangeBlobRelease } from "../../../../server/services/file-change-blob-store";
 import type {
 	BeginFileChangeOperation,
 	PrepareFileChangeScope,
-	SettleFileChangeEffect,
+	RecordFileChangeEffect,
 } from "../../../../server/services/file-change-evidence";
 import type { FileChangeScopeIdentity } from "../../../../server/services/file-change-identity";
 import { createFileChangeIdentity } from "../../../../server/services/file-change-identity";
 import type {
-	RevertJournalClaim,
+	RevertFileResult,
 	RevertJournalContext,
 } from "../../../../server/services/revert-mutation-journal";
 import type {
@@ -48,8 +43,6 @@ import {
 	fingerprintRevertPlanFiles,
 	revertPlanHeaderDigest,
 } from "../../../../server/services/revert-plan-service";
-import type { WorkspaceWriteLease } from "../../../../server/services/workspace-write-coordinator";
-import type { WorkspaceWriteRange } from "../../../../server/services/workspace-write-ranges";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Facades (one per domain, uniform async shape over both backends)
@@ -60,17 +53,6 @@ export interface BlobCatalogFacade {
 	initializeNamespace(input: {
 		expectedGeneration: number | null;
 		quotaBytes?: number;
-	}): Promise<Record<string, unknown>>;
-	beginReconciliation(input: { expectedGeneration: number }): Promise<Record<string, unknown>>;
-	completeReconciliation(input: {
-		expectedGeneration: number;
-		verifiedUsedBytes: number;
-		verification: {
-			namespaceIdentityVerified: true;
-			writersQuiescent: true;
-			physicalInventoryComplete: true;
-			catalogMatchesInventory: true;
-		};
 	}): Promise<Record<string, unknown>>;
 	reserve(input: {
 		expectedGeneration: number;
@@ -87,53 +69,12 @@ export interface BlobCatalogFacade {
 		expectedGeneration: number;
 		ref: FileChangeBlobRef;
 	}): Promise<Record<string, unknown> | null>;
-	reconcileBlob(input: {
-		expectedGeneration: number;
-		ref: FileChangeBlobRef;
-		physicalState: "verified" | "missing";
-	}): Promise<Record<string, unknown>>;
-}
-
-export interface WorkspaceLeaseFacade {
-	/**
-	 * A complete clean write: admit, register one mutation, settle it, release.
-	 * The probe reads the durable mutation counter while the write is in flight.
-	 */
-	runCleanWrite(
-		scope: Readonly<FileChangeScopeIdentity>,
-		ranges?: readonly WorkspaceWriteRange[],
-	): Promise<{ counterDuringWrite: unknown }>;
-	/** A write that marks its outcome uncertain: quarantine, durable lease retained. */
-	runUncertainWrite(
-		scope: Readonly<FileChangeScopeIdentity>,
-		ranges?: readonly WorkspaceWriteRange[],
-	): Promise<void>;
-	/** Admit on the scope, surfacing the domain error code. */
-	admitLease(scope: Readonly<FileChangeScopeIdentity>): Promise<unknown>;
-	readLeases(scope: Readonly<FileChangeScopeIdentity>): Promise<Record<string, unknown>[]>;
-	readScope(scope: Readonly<FileChangeScopeIdentity>): Promise<Record<string, unknown>>;
 }
 
 export interface EvidenceFacade {
 	prepareScope(input: PrepareFileChangeScope): Promise<Record<string, unknown>>;
-	recordScopeVerification(input: {
-		scopeId: string;
-		canonicalRoot: string;
-		rootIdentity: Record<string, string>;
-	}): Promise<Record<string, unknown>>;
 	beginOperation(input: BeginFileChangeOperation): Promise<Record<string, unknown>>;
-	prepareEffects(
-		operationId: string,
-		inputs: import("../../../../server/services/file-change-evidence").PrepareFileChangeEffect[],
-	): Promise<Record<string, unknown>[]>;
-	finalizePreparation(operationId: string): Promise<Record<string, unknown>>;
-	markApplying(input: {
-		operationId: string;
-		mutationId: string;
-		requestDigest: string;
-		executionBinding: FileChangeExecutionBinding;
-	}): Promise<{ effect: Record<string, unknown>; mayExecute: boolean }>;
-	settleEffect(input: SettleFileChangeEffect): Promise<Record<string, unknown>>;
+	recordEffect(input: RecordFileChangeEffect): Promise<Record<string, unknown>>;
 	finishOperation(
 		operationId: string,
 		outcome: "succeeded" | "failed" | "interrupted",
@@ -163,30 +104,18 @@ export interface JournalFacade {
 		ctx: RevertJournalContext,
 		proof: RevertPlanManifestProof,
 	): Promise<{ operation: Record<string, unknown>; started: boolean }>;
-	claimApply(
-		ctx: RevertJournalContext,
-		fixed: import("../../../../server/services/revert-plan-service").RevertPlanFileMetadata,
-		lease: WorkspaceWriteLease,
-	): Promise<RevertJournalClaim>;
-	recordApplyReceipt(
+	startFile(ctx: RevertJournalContext, fileId: string): Promise<boolean>;
+	recordResult(
 		ctx: RevertJournalContext,
 		fileId: string,
-		receipt: FileChangeExecutionReceipt,
+		result: RevertFileResult,
 	): Promise<Record<string, unknown>>;
-	finishFiles(ctx: RevertJournalContext): Promise<Record<string, unknown>>;
+	finishFiles(
+		ctx: RevertJournalContext,
+		options?: { cancelled?: boolean; reason?: string | null },
+	): Promise<Record<string, unknown>>;
+	failHistory(ctx: RevertJournalContext, reason: string): Promise<Record<string, unknown>>;
 	commit(ctx: RevertJournalContext, history: HistoryProbe): Promise<Record<string, unknown>>;
-	beginCompensation(ctx: RevertJournalContext): Promise<Record<string, unknown>>;
-	claimCompensate(
-		ctx: RevertJournalContext,
-		fixed: import("../../../../server/services/revert-plan-service").RevertPlanFileMetadata,
-		lease: WorkspaceWriteLease,
-	): Promise<RevertJournalClaim>;
-	recordCompensateReceipt(
-		ctx: RevertJournalContext,
-		fileId: string,
-		receipt: FileChangeExecutionReceipt,
-	): Promise<Record<string, unknown>>;
-	finishCompensation(ctx: RevertJournalContext): Promise<Record<string, unknown>>;
 }
 
 /** The commit probe: the suite counts invocations; the facade adapts sync/async. */
@@ -202,7 +131,6 @@ export interface HistoryProbe {
 
 export interface EquivalenceKit {
 	blob: BlobCatalogFacade;
-	workspace: WorkspaceLeaseFacade;
 	evidence: EvidenceFacade;
 	plan: PlanFacade;
 	journal: JournalFacade;
@@ -210,22 +138,11 @@ export interface EquivalenceKit {
 	namespaceKey: string;
 	/** The owner epoch every lease claim is made under. */
 	ownerEpoch: string;
-	/** The runtime authority every claim checks against. */
-	runtime: { runtimeEpoch: string; runtimeGeneration: number };
 	/** Install a scope row directly (prepareScope + verify shape), returning its identity. */
-	seedVerifiedScope(overrides?: {
+	seedScope(overrides?: {
 		canonicalRoot?: string;
 		workspaceInstanceId?: string;
 	}): Promise<FileChangeScopeIdentity>;
-	/**
-	 * Give a scope a durable lease owned by `ownerEpoch` (the journal claim's
-	 * precondition), returning the scope row's revision and fencing token.
-	 */
-	seedLeasedScope(scope: Readonly<FileChangeScopeIdentity>): Promise<{
-		revision: number;
-		fencingToken: number;
-		leaseId: string;
-	}>;
 	/** The fixed plan file's metadata row, as the journal's claim requires it. */
 	fixedFileMetadata(
 		planId: string,
@@ -268,45 +185,6 @@ function identityOf(
 	});
 }
 
-function bindingOf(
-	deviceId: string,
-	fencingToken: number,
-	runtime: { runtimeEpoch: string; runtimeGeneration: number },
-): FileChangeExecutionBinding {
-	return {
-		deviceId,
-		runtimeEpoch: runtime.runtimeEpoch,
-		runtimeGeneration: runtime.runtimeGeneration,
-		fencingToken,
-	};
-}
-
-function fakeRollbackLease(
-	scope: Readonly<FileChangeScopeIdentity>,
-	binding: FileChangeExecutionBinding,
-	scopeRevision: number,
-): WorkspaceWriteLease {
-	return {
-		token: Object.freeze({ id: Symbol("equivalence-lease") }),
-		kind: "rollback",
-		leaseId: "equivalence-rollback-fixture",
-		ranges: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
-		scope,
-		scopeRevision,
-		executionBinding: binding,
-		overlappedUncoordinatedActivity: false,
-		pendingMutationCount: 0,
-		assertCurrent: () => {},
-		registerMutation: () => {},
-		assertMutationPending: () => {},
-		settle: () => {},
-		settleWith: () => {
-			throw new Error("Native atomic settlement is not used by this rollback fixture");
-		},
-		markUncertain: () => {},
-	};
-}
-
 /** Publish a ready blob through the catalog's own reserve→release flow. */
 export async function publishBlob(
 	blob: BlobCatalogFacade,
@@ -326,33 +204,13 @@ export async function publishBlob(
 	return ref;
 }
 
-const VERIFICATION = {
-	namespaceIdentityVerified: true,
-	writersQuiescent: true,
-	physicalInventoryComplete: true,
-	catalogMatchesInventory: true,
-} as const;
-
-/** Bring up (or re-attest) a ready namespace, returning its generation. */
+/** Idempotent metadata initialization, without invalidating historical bodies. */
 export async function readyNamespace(blob: BlobCatalogFacade): Promise<number> {
-	const existing = await blob.getBudget();
-	if (!existing) {
-		await blob.initializeNamespace({ expectedGeneration: null, quotaBytes: 1_000_000 });
-	}
-	const current = (await blob.getBudget()) as { generation: number; usedBytes: number };
-	// Re-attestation is the startup path: the existing row is invalidated, never
-	// trusted, and reconciliation must run to completion before admissions.
-	const gen = current.generation;
-	await blob.initializeNamespace({ expectedGeneration: gen, quotaBytes: 1_000_000 });
-	await blob.beginReconciliation({ expectedGeneration: gen + 1 });
-	await blob.completeReconciliation({
-		expectedGeneration: gen + 2,
-		verifiedUsedBytes: current.usedBytes,
-		verification: VERIFICATION,
+	const current = await blob.initializeNamespace({
+		expectedGeneration: null,
+		quotaBytes: 1_000_000,
 	});
-	// completeReconciliation does NOT bump the generation; read it back rather than
-	// arithmetic-guessing it.
-	return ((await blob.getBudget()) as { generation: number }).generation;
+	return Number(current.generation);
 }
 
 /** The error's comparable identity, never its message. */
@@ -377,98 +235,55 @@ async function captureError(fn: () => Promise<unknown> | unknown): Promise<strin
 export async function blobCatalogScenario(kit: EquivalenceKit): Promise<unknown> {
 	const { blob, ownerEpoch } = kit;
 	const projection: Record<string, unknown> = {};
-
-	// A fresh namespace: unverified, generation 0, zero counters.
 	const initial = await blob.initializeNamespace({ expectedGeneration: null, quotaBytes: 1000 });
-	expect(initial.status).toBe("unverified");
-	expect(initial.generation).toBe(0);
-	// Reinitialization with a stale expectation is a generation fence.
-	projection.staleInit = await captureError(() =>
-		blob.initializeNamespace({ expectedGeneration: 99 }),
-	);
-
-	const reconciling = await blob.beginReconciliation({ expectedGeneration: 0 });
-	expect(reconciling.status).toBe("reconciling");
-	expect(reconciling.generation).toBe(1);
-
-	// Admissions are fenced while reconciling.
-	projection.reserveWhileReconciling = await captureError(() =>
-		blob.reserve({
-			expectedGeneration: 1,
-			ownerEpoch,
-			expectedSize: 10,
-			signal: new AbortController().signal,
-		}),
-	);
-
-	const ready = await blob.completeReconciliation({
-		expectedGeneration: 1,
-		verifiedUsedBytes: 0,
-		verification: VERIFICATION,
-	});
-	expect(ready.status).toBe("ready");
-	// completeReconciliation does NOT bump the generation; beginReconciliation's is
-	// the last fence movement.
-	expect(ready.generation).toBe(1);
-
-	// Quota accounting through the full reserve → release flow.
+	expect(await blob.initializeNamespace({ expectedGeneration: 99 })).toEqual(initial);
 	const lease = await blob.reserve({
-		expectedGeneration: 1,
+		expectedGeneration: 99,
 		ownerEpoch,
 		expectedSize: 400,
 		signal: new AbortController().signal,
 	});
-	expect(lease.generation).toBe(1);
-	let budget = await blob.getBudget();
-	expect(budget?.reservedBytes).toBe(400);
-
 	projection.overQuota = await captureError(() =>
 		blob.reserve({
-			expectedGeneration: 1,
+			expectedGeneration: 0,
 			ownerEpoch,
 			expectedSize: 601,
 			signal: new AbortController().signal,
 		}),
 	);
-
+	expect(projection.overQuota).toBe("quota_exceeded");
 	const ref = blobRef("blob-catalog-scenario", 400);
 	await lease.release({ ref, published: true });
-	budget = await blob.getBudget();
-	expect(budget?.usedBytes).toBe(400);
-	expect(budget?.reservedBytes).toBe(0);
-	const metadata = await blob.getMetadata({ expectedGeneration: 1, ref });
-	expect(metadata?.status).toBe("ready");
-	expect(metadata?.sizeBytes).toBe(400);
-	// Releasing again with the SAME result is an idempotent no-op.
 	await lease.release({ ref, published: true });
+	expect((await blob.getBudget())?.usedBytes).toBe(400);
+	expect((await blob.getMetadata({ expectedGeneration: 100, ref }))?.status).toBe("ready");
 	projection.conflictingRelease = await captureError(() =>
 		lease.release({ ref: null, published: false }),
 	);
-
-	// Worker-side metadata correction is a maintenance-mode operation: it belongs
-	// to a reconciliation window, so open one. The generation moves with it.
-	await blob.beginReconciliation({ expectedGeneration: 1 });
-	const corrected = await blob.reconcileBlob({
-		expectedGeneration: 2,
-		ref: blobRef("blob-catalog-reconciled", 5),
-		physicalState: "verified",
+	const duplicate = await blob.reserve({
+		expectedGeneration: 0,
+		ownerEpoch,
+		expectedSize: 400,
+		signal: new AbortController().signal,
 	});
-	expect(corrected.status).toBe("ready");
-	await blob.completeReconciliation({
-		expectedGeneration: 2,
-		verifiedUsedBytes: 400,
-		verification: VERIFICATION,
+	await duplicate.release({ ref, published: false });
+	expect((await blob.getBudget())?.usedBytes).toBe(400);
+	const failed = await blob.reserve({
+		expectedGeneration: 0,
+		ownerEpoch,
+		expectedSize: 600,
+		signal: new AbortController().signal,
 	});
-
-	projection.staleReserve = await captureError(() =>
-		blob.reserve({
-			expectedGeneration: 1,
-			ownerEpoch,
-			expectedSize: 1,
-			signal: new AbortController().signal,
-		}),
-	);
+	await failed.release({ ref: null, published: false });
+	const later = await blob.reserve({
+		expectedGeneration: 0,
+		ownerEpoch,
+		expectedSize: 600,
+		signal: new AbortController().signal,
+	});
+	await later.release({ ref: blobRef("later-publication", 600), published: true });
 	projection.finalBudget = summarizeBudget(await blob.getBudget());
+	expect((await blob.getBudget())?.usedBytes).toBe(1000);
 	return projection;
 }
 
@@ -488,60 +303,6 @@ function summarizeBudget(budget: Record<string, unknown> | null) {
 // Scenario 2: the workspace durable lease lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function workspaceLeaseScenario(kit: EquivalenceKit): Promise<unknown> {
-	const { workspace } = kit;
-	const projection: Record<string, unknown> = {};
-	const scope = await kit.seedVerifiedScope({ canonicalRoot: "/equiv/lease" });
-
-	// A clean write: the counter is visible while the write is in flight, and the
-	// finalizer releases everything — lease cleared, counter zero, revision bumped
-	// once for the claim and once for the release.
-	const { counterDuringWrite } = await workspace.runCleanWrite(scope);
-	projection.counterDuringWrite = counterDuringWrite;
-	let row = await workspace.readScope(scope);
-	expect(row.activeLeaseId).toBeNull();
-	expect(row.activeMutationCount).toBe(0);
-	expect(row.fencingToken).toBe(1);
-	expect(row.revision).toBe(2);
-	expect(row.status).toBe("active");
-
-	// Ended A keeps only its physical file barrier, not the scope-wide owner.
-	const rangesA = [{ kind: "file" as const, canonicalPath: `${scope.canonicalRoot}/A.txt` }];
-	await workspace.runUncertainWrite(scope, rangesA);
-	row = await workspace.readScope(scope);
-	expect(row.status).toBe("active");
-	expect(row.activeLeaseId).toBeNull();
-	expect(row.activeMutationCount).toBe(0);
-	projection.admitOnBarrier = await captureError(() => workspace.admitLease(scope));
-	const quarantined = (await workspace.readLeases(scope)).filter(
-		(lease) => lease.status === "quarantined",
-	);
-	expect(quarantined).toHaveLength(1);
-	expect(quarantined[0]?.executionEndedAt).not.toBeNull();
-	expect(quarantined[0]?.rangesJson).toEqual({ version: 1, ranges: rangesA });
-	projection.quarantineRanges = quarantined[0]?.rangesJson;
-	// Sibling B in the SAME scope can complete without recovering A first.
-	await workspace.runCleanWrite(scope, [
-		{ kind: "file", canonicalPath: `${scope.canonicalRoot}/B.txt` },
-	]);
-	row = await workspace.readScope(scope);
-	expect(row.status).toBe("active");
-	expect(row.activeLeaseId).toBeNull();
-	expect(row.activeMutationCount).toBe(0);
-	expect(row.fencingToken).toBe(3);
-	expect(row.revision).toBe(6);
-	projection.admitAfterSibling = await captureError(() => workspace.admitLease(scope));
-	// Recovery equivalence is NOT claimed here: PG exposes durable sections,
-	// not SQLite's scheduler/reservation or external observation orchestration.
-	projection.finalScope = {
-		status: row.status,
-		revision: row.revision,
-		fencingToken: row.fencingToken,
-		activeMutationCount: row.activeMutationCount,
-	};
-	return projection;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Scenario 3: the evidence store
 // ─────────────────────────────────────────────────────────────────────────────
@@ -550,181 +311,102 @@ export async function evidenceScenario(kit: EquivalenceKit): Promise<unknown> {
 	const { evidence, blob, ownerEpoch } = kit;
 	const projection: Record<string, unknown> = {};
 	const generation = await readyNamespace(blob);
-	const scopeN = `evidence-${digestOf(`${ownerEpoch}-evidence-scope`).slice(0, 8)}`;
-	const scopeInput = {
+	const scopeInput: PrepareFileChangeScope = {
 		sourceInstanceId: "source-1",
 		deviceId: "device-1",
-		workspaceInstanceId: `ws-${scopeN}`,
-		pathFlavor: "posix" as const,
-		canonicalRoot: `/equiv/${scopeN}`,
+		workspaceInstanceId: "evidence-workspace",
+		pathFlavor: "posix",
+		canonicalRoot: "/equiv/evidence",
 	};
-	const before = regularState("evidence-before", 10);
-	const intended = regularState("evidence-intended", 12);
+	const scopeRow = await evidence.prepareScope(scopeInput);
+	expect((await evidence.prepareScope(scopeInput)).id).toBe(scopeRow.id);
+	projection.conflictingScopeId = await captureError(() =>
+		evidence.prepareScope({ ...scopeInput, id: "different-id" }),
+	);
+	const scope: FileChangeScopeIdentity = { ...scopeInput, id: String(scopeRow.id) };
 	await publishBlob(blob, generation, ownerEpoch, "evidence-before", 10);
 	await publishBlob(blob, generation, ownerEpoch, "evidence-intended", 12);
-
-	const binding = bindingOf(scopeInput.deviceId, 0, kit.runtime);
-	const operationInput: BeginFileChangeOperation = {
-		sourceInstanceId: scopeInput.sourceInstanceId,
-		sourceKind: "tool",
-		sourceId: "tool-call-1",
+	const input: BeginFileChangeOperation = {
+		sourceInstanceId: "source-1",
+		sourceKind: "editor",
+		sourceId: "request-1",
 		attempt: 1,
 		requestDigest: digestOf("evidence-request"),
 		expectedEffectCount: 1,
+		executionBinding: null,
 		actor: {
-			kind: "primary",
-			subjectKey: "narrator:test",
+			kind: "human",
+			subjectKey: "user:test",
 			narratorId: null,
 			userId: null,
 			label: null,
 			deleted: false,
 			parentSubjectKey: null,
 		},
-		executionBinding: binding,
-		toolCallId: "tool-call-1",
-		toolUseId: "toolu_1",
-		narratorId: null,
-		projectId: null,
-		ownerUserId: null,
-		initiatorSubjectKey: null,
-		parentOperationId: null,
-		executionSegmentId: null,
 	};
-
-	const scopeRow = await evidence.prepareScope(scopeInput);
-	expect(scopeRow.status).toBe("needs_verification");
-	// Idempotent: the same workspace instance returns the same row.
-	expect((await evidence.prepareScope(scopeInput)).id).toBe(scopeRow.id);
-	projection.conflictingScopeId = await captureError(() =>
-		evidence.prepareScope({ ...scopeInput, id: "different-id" }),
-	);
-	// Verification is recorded, not performed: the scope becomes executable.
-	const scopeId = String(scopeRow.id);
-	const verifiedScope = await evidence.recordScopeVerification({
-		scopeId,
-		canonicalRoot: scopeInput.canonicalRoot,
-		rootIdentity: { marker: "verified" },
+	const operation = await evidence.beginOperation(input);
+	expect(operation).toMatchObject({
+		evidenceVersion: 3,
+		journalSeq: 1,
+		replayed: false,
+		executionBindingJson: null,
 	});
-	expect(verifiedScope.status).toBe("active");
-	const scope: FileChangeScopeIdentity = {
-		id: scopeId,
-		sourceInstanceId: scopeInput.sourceInstanceId,
-		deviceId: scopeInput.deviceId,
-		workspaceInstanceId: scopeInput.workspaceInstanceId,
-		pathFlavor: scopeInput.pathFlavor,
-		canonicalRoot: scopeInput.canonicalRoot,
-	};
-	const identity = identityOf(scope, "file.txt");
-
-	const operation = await evidence.beginOperation(operationInput);
-	expect(operation.journalSeq).toBe(1);
-	const operationId = String(operation.id);
-	expect((await evidence.beginOperation(operationInput)).id).toBe(operation.id);
+	const replay = await evidence.beginOperation(input);
+	expect(replay).toMatchObject({ id: operation.id, journalSeq: 1, replayed: true });
 	projection.conflictingOperation = await captureError(() =>
-		evidence.beginOperation({ ...operationInput, requestDigest: digestOf("changed") }),
+		evidence.beginOperation({ ...input, requestDigest: digestOf("changed") }),
 	);
-	const second = await evidence.beginOperation({
-		...operationInput,
-		sourceId: "tool-call-2",
-		toolCallId: "tool-call-2",
-		attempt: 2,
-		requestDigest: digestOf("evidence-request-2"),
-	});
-	expect(second.journalSeq).toBe(2);
-
-	const effects = await evidence.prepareEffects(operationId, [
-		{
-			identity,
-			scopeRevision: 0,
-			requestDigest: operationInput.requestDigest,
-			before,
-			intendedAfter: intended,
-		},
-	]);
-	expect(effects).toHaveLength(1);
-	// Repeating the exact batch is safe.
-	const repeated = await evidence.prepareEffects(operationId, [
-		{
-			identity,
-			scopeRevision: 0,
-			requestDigest: operationInput.requestDigest,
-			before,
-			intendedAfter: intended,
-		},
-	]);
-	expect(repeated[0].id).toBe(effects[0].id);
-	projection.overDeclared = await captureError(() =>
-		evidence.prepareEffects(operationId, [
-			{
-				identity: identityOf(scope, "other.txt"),
-				scopeRevision: 0,
-				requestDigest: operationInput.requestDigest,
-				before,
-				intendedAfter: intended,
-			},
-		]),
-	);
-
-	const durable = await evidence.finalizePreparation(operationId);
-	expect(durable.settlement).toBe("intent_durable");
-
-	const mutationId = String(effects[0].mutationId);
-	const first = await evidence.markApplying({
+	const operationId = String(operation.id);
+	const result: RecordFileChangeEffect = {
 		operationId,
-		mutationId,
-		requestDigest: operationInput.requestDigest,
-		executionBinding: binding,
-	});
-	expect(first.mayExecute).toBe(true);
-	const second2 = await evidence.markApplying({
-		operationId,
-		mutationId,
-		requestDigest: operationInput.requestDigest,
-		executionBinding: binding,
-	});
-	expect(second2.mayExecute).toBe(false);
-	expect(second2.effect.id).toBe(first.effect.id);
-
-	const receipt: FileChangeExecutionReceipt = {
-		receiptId: "receipt-1",
-		mutationId,
-		requestDigest: operationInput.requestDigest,
-		executionBinding: binding,
-		confirmed: true,
-		observedAfter: intended,
+		identity: identityOf(scope, "file.txt"),
+		before: regularState("evidence-before", 10),
+		intendedAfter: regularState("evidence-intended", 12),
+		observedAfter: regularState("evidence-intended", 12),
 		outcome: "applied",
 	};
-	const settled = await evidence.settleEffect({
-		operationId,
-		mutationId,
-		requestDigest: operationInput.requestDigest,
-		receipt,
+	const recorded = await evidence.recordEffect(result);
+	expect(recorded).toMatchObject({
+		diskOutcome: "applied",
+		outcome: "changed",
+		settlement: "settled",
+		scopeRevision: null,
+		executionReceiptJson: null,
 	});
-	expect(settled.settlement).toBe("settled");
-	expect(settled.outcome).toBe("changed");
-	expect(settled.attributionGrade).toBe("measured");
-	// The immutable receipt cannot be overwritten.
-	projection.overwriteReceipt = await captureError(() =>
-		evidence.settleEffect({
-			operationId,
-			mutationId,
-			requestDigest: operationInput.requestDigest,
-			receipt: { ...receipt, receiptId: "receipt-2" },
-		}),
+	expect((await evidence.recordEffect(result)).id).toBe(recorded.id);
+	projection.overwriteResult = await captureError(() =>
+		evidence.recordEffect({ ...result, outcome: "unknown" }),
 	);
-
-	const finished = await evidence.finishOperation(operationId, "succeeded");
-	expect(finished.executionOutcome).toBe("succeeded");
-	expect(finished.settlement).toBe("settled");
-	expect(finished.effectOutcome).toBe("changed");
+	projection.overDeclared = await captureError(() =>
+		evidence.recordEffect({ ...result, identity: identityOf(scope, "other.txt") }),
+	);
+	await evidence.finishOperation(operationId, "succeeded");
 	projection.conflictingFinish = await captureError(() =>
 		evidence.finishOperation(operationId, "failed"),
 	);
-
+	const second = await evidence.beginOperation({ ...input, sourceId: "request-2" });
+	expect(second.journalSeq).toBe(2);
+	const unknown = await evidence.recordEffect({
+		...result,
+		operationId: String(second.id),
+		outcome: "unknown",
+	});
+	expect(unknown).toMatchObject({
+		outcome: "unknown",
+		diskOutcome: "unknown",
+		executionConfirmed: false,
+	});
+	await evidence.finishOperation(String(second.id), "failed");
+	expect((await evidence.beginOperation({ ...input, sourceId: "request-2" })).replayed).toBe(true);
+	const independent = await evidence.beginOperation({ ...input, sourceId: "request-3" });
+	expect(
+		(await evidence.recordEffect({ ...result, operationId: String(independent.id) })).diskOutcome,
+	).toBe("applied");
 	projection.operation = summarizeOperation(await evidence.getOperation(operationId));
 	projection.effect = summarizeEffect(
-		(await evidence.getEffect(operationId, mutationId)) as Record<string, unknown>,
+		await evidence.getEffect(operationId, String(recorded.mutationId)),
 	);
+	projection.unknown = summarizeEffect(unknown);
 	return projection;
 }
 
@@ -759,53 +441,40 @@ function summarizeEffect(effect: Record<string, unknown> | null) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function revertFlowScenario(kit: EquivalenceKit): Promise<unknown> {
-	const { blob, plan, journal, ownerEpoch, runtime } = kit;
+	const { blob, plan, journal, ownerEpoch } = kit;
 	const projection: Record<string, unknown> = {};
 	const generation = await readyNamespace(blob);
-	const scope = await kit.seedVerifiedScope({ canonicalRoot: "/equiv/revert" });
-
-	// Publish the manifest blobs and the file-state blobs through the catalog.
+	const scope = await kit.seedScope({ canonicalRoot: "/equiv/revert" });
 	const selector = await publishBlob(blob, generation, ownerEpoch, "revert-selector", 20);
 	const planRef = await publishBlob(blob, generation, ownerEpoch, "revert-plan", 30);
 	const history = await publishBlob(blob, generation, ownerEpoch, "revert-history", 40);
 	const expectedBlob = await publishBlob(blob, generation, ownerEpoch, "revert-expected", 10);
 	const desiredBlob = await publishBlob(blob, generation, ownerEpoch, "revert-desired", 12);
-
-	const identity = identityOf(scope, "file.txt");
 	const owner: RevertPlanOwner = {
 		subjectKey: "narrator:revert-test",
-		// Null lineage: the FK-targeted narrator/project rows deliberately do not
-		// exist — the journal's owner context is vocabulary, not a database
-		// reference, on both backends.
 		narratorId: null,
 		projectId: null,
 	};
-
-	// Bring one plan all the way to files_verified; used twice: once for the commit
-	// path, once for the compensation path (a COMMITTED plan cannot compensate).
-	const toFilesVerified = async (idempotencyKey: string) => {
+	const make = async (idempotencyKey: string) => {
 		const header = {
 			...owner,
 			idempotencyKey,
-			requestDigest: digestOf(`revert-flow-request-${idempotencyKey}`),
+			requestDigest: digestOf(idempotencyKey),
 			kind: "revert" as const,
 			revertScope: "workspace" as const,
 			selectorKind: "all" as const,
 			selector,
 			historyManifest: history,
 			expectedMessageVersion: 1,
-			expectedFileCount: 1,
-			parentRevertId: null,
+			expectedFileCount: 2,
 		};
-		const file = {
-			sequence: 0,
-			identity,
-			expected: { kind: "regular" as const, blob: expectedBlob, mode: null },
-			desired: { kind: "regular" as const, blob: desiredBlob, mode: null },
-		};
-		// The proof the trusted planner would supply, built with the production
-		// digest helpers so both backends verify the same commitment.
-		const fingerprint = fingerprintRevertPlanFiles([file]);
+		const entries = [0, 1].map((sequence) => ({
+			sequence,
+			identity: identityOf(scope, `${sequence}.txt`),
+			expected: { kind: "regular" as const, blob: expectedBlob, mode: 0o644 },
+			desired: { kind: "regular" as const, blob: desiredBlob, mode: 0o644 },
+		}));
+		const fingerprint = fingerprintRevertPlanFiles(entries);
 		const proof: RevertPlanManifestProof = {
 			source: "trusted_published_planner_v1",
 			headerDigest: revertPlanHeaderDigest(header),
@@ -817,118 +486,266 @@ export async function revertFlowScenario(kit: EquivalenceKit): Promise<unknown> 
 			omittedFiles: 0,
 			unknownFiles: 0,
 		};
-
 		const summary = await plan.begin({ ...header, plan: planRef, manifestProof: proof });
-		expect(summary.status).toBe("planned");
-		const appended = await plan.appendFiles(owner, summary.id, [file]);
-		expect(appended).toHaveLength(1);
-		// Re-appending the same batch is an idempotent no-op returning the same row.
-		expect((await plan.appendFiles(owner, summary.id, [file]))[0].id).toBe(appended[0].id);
-		const prepared = await plan.finalize(owner, summary.id, proof);
-		expect(prepared.status).toBe("prepared");
-		// Re-finalizing returns the winner's state, not an error.
-		expect((await plan.finalize(owner, summary.id, proof)).status).toBe("prepared");
-
-		const ctx: RevertJournalContext = {
-			owner,
-			planId: summary.id,
-			planHash: summary.planHash ?? "",
-		};
-		const started = await journal.startExecution(ctx, proof);
-		expect(started.started).toBe(true);
-		// startExecution is idempotent against an already-applying plan.
-		expect((await journal.startExecution(ctx, proof)).started).toBe(false);
-		const leased = await kit.seedLeasedScope(scope);
-		const leaseBinding = bindingOf(scope.deviceId, leased.fencingToken, runtime);
-		const lease = fakeRollbackLease(scope, leaseBinding, leased.revision);
-		const fixedMetadata = await kit.fixedFileMetadata(summary.id, appended[0].id);
-		const claim = await journal.claimApply(ctx, fixedMetadata, lease);
-		expect(claim.mayExecute).toBe(true);
-		const applyReceipt: FileChangeExecutionReceipt = {
-			receiptId: `receipt-apply-${idempotencyKey}`,
-			mutationId: claim.mutationId,
-			requestDigest: claim.requestDigest,
-			executionBinding: leaseBinding,
-			confirmed: true,
-			observedAfter: file.desired,
-			outcome: "applied",
-		};
-		expect((await journal.recordApplyReceipt(ctx, claim.file.id, applyReceipt)).status).toBe(
-			"verified",
+		const appended = await plan.appendFiles(owner, summary.id, entries);
+		expect((await plan.appendFiles(owner, summary.id, entries)).map((file) => file.id)).toEqual(
+			appended.map((file) => file.id),
 		);
-		expect((await journal.finishFiles(ctx)).status).toBe("files_verified");
-		return {
-			header,
-			file,
-			proof,
-			summary,
-			ctx,
-			claim,
-			applyReceipt,
-			lease,
-			fixedMetadata,
-			appended,
-			started,
-			leaseBinding,
-		};
+		expect((await plan.finalize(owner, summary.id, proof)).status).toBe("prepared");
+		expect((await plan.finalize(owner, summary.id, proof)).status).toBe("prepared");
+		const ctx = { owner, planId: summary.id, planHash: summary.planHash as string };
+		expect((await journal.startExecution(ctx, proof)).started).toBe(true);
+		expect((await journal.startExecution(ctx, proof)).started).toBe(false);
+		return { ctx, entries, appended, header, summary, proof };
 	};
-
-	// ── plan A: idempotency and the commit path ──
-	const a = await toFilesVerified("revert-flow-A");
-	// Idempotent begin: same input, same row.
-	expect((await plan.begin({ ...a.header, plan: planRef, manifestProof: a.proof })).id).toBe(
-		a.summary.id,
-	);
-	projection.conflictingBegin = await captureError(() =>
-		plan.begin({
-			...a.header,
-			requestDigest: digestOf("changed-request"),
-			plan: planRef,
-			manifestProof: { ...a.proof, headerDigest: digestOf("else") },
-		}),
-	);
-	// Re-claiming returns the original binding, never a second dispatch grant.
-	const reclaim = await journal.claimApply(a.ctx, a.fixedMetadata, a.lease);
-	expect(reclaim.mayExecute).toBe(false);
-	expect(reclaim.file.id).toBe(a.claim.file.id);
-	// A DIFFERENT receipt over the durable one is a conflict, on both backends.
-	projection.conflictingReceipt = await captureError(() =>
-		journal.recordApplyReceipt(a.ctx, a.claim.file.id, {
-			...a.applyReceipt,
-			receiptId: "other",
-		}),
-	);
-
-	const historyProbe: HistoryProbe = { calls: () => probe.calls, apply: () => probe.calls++ };
-	const probe = { calls: 0 };
-	const committed = await journal.commit(a.ctx, historyProbe);
-	expect(committed.status).toBe("committed");
-	expect(probe.calls).toBe(1);
-	// An already committed retry never calls history a second time.
+	const a = await make("commit");
+	for (const [index, file] of a.appended.entries()) {
+		expect(await journal.startFile(a.ctx, file.id)).toBe(true);
+		expect(await journal.startFile(a.ctx, file.id)).toBe(false);
+		const recorded = await journal.recordResult(a.ctx, file.id, {
+			status: "applied",
+			reason: null,
+			historyStatus: "complete",
+			observedAfter: a.entries[index].desired,
+		});
+		expect(recorded.beforeBlobDigest).toBe(expectedBlob.digest);
+		expect(recorded.receiptJson).toMatchObject({ historyStatus: "complete" });
+	}
+	expect((await journal.finishFiles(a.ctx)).status).toBe("files_verified");
+	let calls = 0;
+	const historyProbe: HistoryProbe = {
+		calls: () => calls,
+		apply: () => {
+			calls++;
+		},
+	};
 	expect((await journal.commit(a.ctx, historyProbe)).status).toBe("committed");
-	expect(probe.calls).toBe(1);
+	expect((await journal.commit(a.ctx, historyProbe)).status).toBe("committed");
+	expect(calls).toBe(1);
 	projection.historyWritesCommitted = await kit.historyWriteVisible();
-
-	// ── plan B: the compensation path (never committed) ──
-	const b = await toFilesVerified("revert-flow-B");
-	await journal.beginCompensation(b.ctx);
-	const claimC = await journal.claimCompensate(b.ctx, b.fixedMetadata, b.lease);
-	expect(claimC.mayExecute).toBe(true);
-	const compensateReceipt: FileChangeExecutionReceipt = {
-		receiptId: "receipt-compensate",
-		mutationId: claimC.mutationId,
-		requestDigest: claimC.requestDigest,
-		executionBinding: b.leaseBinding,
-		confirmed: true,
-		observedAfter: b.file.expected,
-		outcome: "applied",
-	};
-	expect(
-		(await journal.recordCompensateReceipt(b.ctx, claimC.file.id, compensateReceipt)).status,
-	).toBe("compensated");
-	expect((await journal.finishCompensation(b.ctx)).status).toBe("compensated");
-
 	projection.operationA = await kit.readRevertOperation(a.summary.id);
+	const b = await make("partial");
+	expect(await journal.startFile(b.ctx, b.appended[0].id)).toBe(true);
+	await journal.recordResult(b.ctx, b.appended[0].id, {
+		status: "applied",
+		reason: null,
+		historyStatus: "complete",
+		observedAfter: b.entries[0].desired,
+	});
+	await journal.recordResult(b.ctx, b.appended[1].id, {
+		status: "conflict",
+		reason: "content_changed",
+		historyStatus: "complete",
+	});
+	expect((await journal.finishFiles(b.ctx)).status).toBe("partial");
+	projection.partialCommitRejected = await captureError(() => journal.commit(b.ctx, historyProbe));
+	expect(calls).toBe(1);
 	projection.operationB = await kit.readRevertOperation(b.summary.id);
+	const c = await make("unknown");
+	await journal.startFile(c.ctx, c.appended[0].id);
+	await journal.recordResult(c.ctx, c.appended[0].id, {
+		status: "unknown",
+		reason: "timeout",
+		historyStatus: "complete",
+	});
+	expect(
+		(
+			await journal.recordResult(c.ctx, c.appended[0].id, {
+				status: "applied",
+				reason: null,
+				historyStatus: "complete",
+			})
+		).status,
+	).toBe("unknown");
+	await journal.recordResult(c.ctx, c.appended[1].id, {
+		status: "not_attempted",
+		reason: "cancelled",
+		historyStatus: "complete",
+	});
+	expect((await journal.finishFiles(c.ctx, { cancelled: true })).status).toBe("partial");
+	projection.operationC = await kit.readRevertOperation(c.summary.id);
+	const d = await make("history-failed");
+	for (const file of d.appended)
+		await journal.recordResult(d.ctx, file.id, {
+			status: "unchanged",
+			reason: null,
+			historyStatus: "complete",
+		});
+	await journal.finishFiles(d.ctx);
+	projection.historyFailure = await captureError(() =>
+		journal.commit(d.ctx, {
+			calls: () => 0,
+			apply: () => {
+				throw new Error("history failure");
+			},
+		}),
+	);
+	expect((await kit.readRevertOperation(d.summary.id)).status).toBe("files_verified");
+	await journal.failHistory(d.ctx, "message_version_changed");
+	projection.operationD = await kit.readRevertOperation(d.summary.id);
+	projection.compensationId = (
+		await kit.fixedFileMetadata(a.summary.id, a.appended[0].id)
+	).compensateMutationId;
+	expect(projection.compensationId).toBeNull();
+	return projection;
+}
+
+/** The same bounded-query regression runs on real SQLite and real PostgreSQL. */
+export async function revertPlanBatchScenario(kit: EquivalenceKit, queries: string[]) {
+	const generation = await readyNamespace(kit.blob);
+	const scope = await kit.seedScope({ canonicalRoot: "/equiv/plan-batches" });
+	const selector = await publishBlob(kit.blob, generation, kit.ownerEpoch, "batch-selector", 20);
+	const planRef = await publishBlob(kit.blob, generation, kit.ownerEpoch, "batch-plan", 30);
+	const history = await publishBlob(kit.blob, generation, kit.ownerEpoch, "batch-history", 40);
+	const desired = {
+		kind: "regular" as const,
+		mode: 0o644,
+		blob: await publishBlob(kit.blob, generation, kit.ownerEpoch, "batch-desired", 12),
+	};
+	// Deliberately absent from the catalog; a live fingerprint is not an archival dependency.
+	const expected = {
+		kind: "regular" as const,
+		mode: 0o644,
+		blob: blobRef("batch-unarchived-current", 32 * 1024 * 1024),
+	};
+	const owner: RevertPlanOwner = {
+		subjectKey: "human:batch-test",
+		narratorId: null,
+		projectId: null,
+	};
+	const projection = [];
+	for (const count of [32, 1000]) {
+		const fileExpected =
+			count === 32 ? { ...expected, blob: blobRef("batch-late-current", 10) } : expected;
+		const entries = Array.from({ length: count }, (_, sequence) => ({
+			sequence,
+			identity: identityOf(scope, `${sequence}.txt`),
+			expected: fileExpected,
+			desired,
+		}));
+		const header = {
+			...owner,
+			idempotencyKey: `batches-${count}`,
+			requestDigest: digestOf(`batches-${count}`),
+			kind: "revert" as const,
+			revertScope: "workspace" as const,
+			selectorKind: "all" as const,
+			selector,
+			historyManifest: history,
+			expectedMessageVersion: 1,
+			expectedFileCount: count,
+		};
+		const fingerprint = fingerprintRevertPlanFiles(entries);
+		expect(fingerprint.fileEvidenceBytes).toBe(count * desired.blob.sizeBytes);
+		const proof: RevertPlanManifestProof = {
+			source: "trusted_published_planner_v1",
+			headerDigest: revertPlanHeaderDigest(header),
+			orderedFilesDigest: fingerprint.orderedFilesDigest,
+			fileEvidenceBytes: fingerprint.fileEvidenceBytes,
+			computation: "complete",
+			selectorCoverage: "complete",
+			historyCoverage: "complete",
+			omittedFiles: 0,
+			unknownFiles: 0,
+		};
+		const summary = await kit.plan.begin({ ...header, plan: planRef, manifestProof: proof });
+		queries.length = 0;
+		let first: { id: string; fileKey: string; sequence: number }[] = [];
+		for (let index = 0; index < count; index += 32) {
+			const appended = await kit.plan.appendFiles(
+				owner,
+				summary.id,
+				entries.slice(index, index + 32),
+			);
+			if (index === 0) first = appended;
+		}
+		const fileQueries = () =>
+			queries.filter(
+				(query) => query.startsWith("select ") && query.includes('from "revert_operation_files"'),
+			);
+		const appendQueries = fileQueries();
+		expect(appendQueries).toHaveLength(Math.ceil(count / 32));
+		expect(
+			appendQueries.every(
+				(query) =>
+					query.includes('"sequence" in (') &&
+					query.includes('"file_key" in (') &&
+					query.includes("limit "),
+			),
+		).toBe(true);
+		if (count === 32)
+			await publishBlob(kit.blob, generation, kit.ownerEpoch, "batch-late-current", 10);
+		expect(await kit.plan.appendFiles(owner, summary.id, entries.slice(0, 32))).toEqual(first);
+		expect(
+			await captureError(() =>
+				kit.plan.appendFiles(owner, summary.id, [{ ...entries[1], sequence: 0 }]),
+			),
+		).toBe("REVERT_PLAN_REQUEST_CONFLICT");
+		expect(
+			await captureError(() =>
+				kit.plan.appendFiles(owner, summary.id, [
+					{ ...entries[0], identity: identityOf(scope, "collision.txt") },
+				]),
+			),
+		).toBe("REVERT_PLAN_DUPLICATE_FILE");
+		expect(
+			await captureError(() =>
+				kit.plan.appendFiles(owner, summary.id, [{ ...entries[0], expected: { kind: "absent" } }]),
+			),
+		).toBe("REVERT_PLAN_REQUEST_CONFLICT");
+		queries.length = 0;
+		expect((await kit.plan.finalize(owner, summary.id, proof)).status).toBe("prepared");
+		const finalPages = fileQueries().filter((query) => query.includes("order by"));
+		expect(finalPages).toHaveLength(Math.ceil(count / 32));
+		const ctx = { owner, planId: summary.id, planHash: summary.planHash as string };
+		await kit.journal.startExecution(ctx, proof);
+		if (count === 32) {
+			const noOpState = {
+				kind: "regular" as const,
+				mode: 0o644,
+				blob: blobRef("batch-no-op-unarchived", 64),
+			};
+			const noOpEntry = {
+				sequence: 0,
+				identity: identityOf(scope, "no-op.txt"),
+				expected: noOpState,
+				desired: noOpState,
+			};
+			const noOpFingerprint = fingerprintRevertPlanFiles([noOpEntry]);
+			expect(noOpFingerprint.fileEvidenceBytes).toBe(0);
+			const noOpHeader = {
+				...header,
+				idempotencyKey: "batch-no-op",
+				requestDigest: digestOf("batch-no-op"),
+				expectedFileCount: 1,
+			};
+			const noOpProof = {
+				...proof,
+				headerDigest: revertPlanHeaderDigest(noOpHeader),
+				orderedFilesDigest: noOpFingerprint.orderedFilesDigest,
+				fileEvidenceBytes: 0,
+			};
+			const noOp = await kit.plan.begin({ ...noOpHeader, plan: planRef, manifestProof: noOpProof });
+			const [noOpFile] = await kit.plan.appendFiles(owner, noOp.id, [noOpEntry]);
+			expect((await kit.plan.finalize(owner, noOp.id, noOpProof)).status).toBe("prepared");
+			expect((await kit.fixedFileMetadata(noOp.id, noOpFile.id)).desiredStateJson).toEqual(
+				noOpState,
+			);
+		}
+		const recorded = await kit.journal.recordResult(ctx, first[0].id, {
+			status: "applied",
+			reason: null,
+			historyStatus: "complete",
+			observedAfter: desired,
+		});
+		expect(recorded.beforeBlobDigest).toBeNull();
+		expect(recorded.receiptJson).toMatchObject({ historyStatus: "unavailable" });
+		projection.push({
+			count,
+			appendQueries: appendQueries.length,
+			finalizeQueries: finalPages.length,
+			fileEvidenceBytes: fingerprint.fileEvidenceBytes,
+		});
+	}
 	return projection;
 }

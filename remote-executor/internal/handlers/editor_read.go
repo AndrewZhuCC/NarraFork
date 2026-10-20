@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -64,8 +65,32 @@ func (h *Handlers) VerifyEditorRoot(identity string) error {
 	return nil
 }
 
+// AcquireEditorFileRead joins the same bounded target queue as controlled writes.
+// Resolve without opening first: a queued writer may still be creating the file.
+func (h *Handlers) AcquireEditorFileRead(ctx context.Context, path string) (func(), error) {
+	resolved, err := h.guard.CheckCreate(path)
+	if err != nil {
+		return nil, err
+	}
+	if !samePath(resolved, path) {
+		return nil, fmt.Errorf("EDITOR_IDENTITY_CHANGED: editor path is not canonical")
+	}
+	release, err := acquireFileMutation(ctx, resolved)
+	if err != nil {
+		return nil, err
+	}
+	current, err := h.guard.CheckCreate(path)
+	if err != nil || !samePath(current, resolved) {
+		release()
+		return nil, fmt.Errorf("EDITOR_IDENTITY_CHANGED: editor read target changed while waiting")
+	}
+	return release, nil
+}
+
 // OpenEditorReadFile reuses the guarded atomic read primitive, always activating
 // its nonblocking FIFO-race protection and requiring an already canonical path.
+// Queue admission belongs to the caller. apply already owns the write slot and
+// must not recursively acquire it for its baseline/metadata checks.
 func (h *Handlers) OpenEditorReadFile(path string) (*os.File, os.FileInfo, string, error) {
 	if !filepath.IsAbs(path) {
 		return nil, nil, "", fmt.Errorf("editor path must be absolute")

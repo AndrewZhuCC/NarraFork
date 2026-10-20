@@ -1,9 +1,8 @@
 /**
- * CAPABILITY BOUNDARY: this module depends on SQLite's connection-scoped
- * preparation stamp (`total_changes()` + `PRAGMA data_version` +
- * `PRAGMA schema_version` + `PRAGMA foreign_keys` + `PRAGMA busy_timeout`),
- * `INDEXED BY`/`rowid` keyset scans, and direct `SELECT changes()` row counts.
- * The stamp conservatively rejects every intervening write.
+ * CAPABILITY BOUNDARY: SQLite indexed/rowid scans capture bounded, explicit history
+ * projections and fixed membership targets. Batched checks reject changes to those
+ * consumed values, not unrelated database writes. Foreign keys, short busy waits,
+ * selected narrator versions and direct `SELECT changes()` row counts remain required.
  *
  * History uses ordinary row-level DML in the caller's real transaction. Enabled
  * SQLite foreign keys and application-owned triggers execute normally, including
@@ -16,9 +15,14 @@ import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { getTableColumns } from "drizzle-orm";
 import { type BunSQLiteDatabase, SQLiteBunTransaction } from "drizzle-orm/bun-sqlite";
-import { narratorMessages, narratorToolCalls } from "../db/schema";
+import { narratorBufferedMessages, narratorMessages, narratorToolCalls } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import {
+	nextCurrentRevision,
+	recipientDeletedReceiptPatch,
+	semanticEditReceiptPatch,
+} from "./agent-runtime/mailbox-shared";
 import type { NarratorPrincipal } from "./narrator-acl";
 import {
 	buildQuestionHistoryInboxProgram,
@@ -31,6 +35,7 @@ import {
 	type QuestionHistoryRow,
 } from "./narrator-question-history";
 import {
+	isSnapshotSelectionComplete,
 	REVERT_SELECTION_PAGE_ITEMS,
 	type RevertSelectionBlock,
 	type RevertSelectionMessage,
@@ -51,6 +56,8 @@ export interface PrepareRevertHistory {
 	/** Complete original selection recovered from the trusted, verified plan manifest.
 	 * NOT a new selector supplied by the client after files have already been changed. */
 	fixedSelection: RevertSelectionResult;
+	/** Trusted executor verified explicit snapshot consent and every enumerated target. */
+	snapshotRecovery?: boolean;
 	signal?: AbortSignal;
 }
 export interface RevertHistoryCommitOptions {
@@ -68,6 +75,8 @@ export interface RevertHistoryCommitOptions {
 export interface RevertHistoryApplyResult {
 	/** Only emit context invalidations/broadcasts AFTER the caller commits. */
 	affectedNarratorIds: string[];
+	/** Send sources whose receipt pages changed; refresh only, never reset upstream sessions. */
+	refreshedNarratorIds: string[];
 	affectedQuestionIds: string[];
 	replacements: { refId: string; previousMessageId: string; messageId: string }[];
 }
@@ -75,11 +84,14 @@ export interface RevertHistoryApplyResult {
 type Value = string | number | null;
 type Row = Record<string, Value>;
 type Statement = { text: string; values: SQLQueryBindings[] };
+type Check = Statement & { count: number };
+type Target = { row: Row; count: number };
 type Snapshot = {
-	stamp: string;
+	versions: { narratorId: string; messageVersion: number }[];
 	signal: AbortSignal;
 	expiresAt: number;
 	statements: Statement[];
+	checks: Check[];
 	result: RevertHistoryApplyResult;
 };
 type Ref = {
@@ -88,6 +100,7 @@ type Ref = {
 	message_id: string;
 	seq: number;
 	segment_compact_id: string | null;
+	is_compact: number;
 };
 type Narrator = {
 	id: string;
@@ -100,8 +113,27 @@ type Tool = {
 	narrator_id: string;
 	tool_use_id: string;
 	is_file_history_checkpoint: number;
+	status: string;
+	execution_attempt: number | null;
+	file_change_operation_id: string | null;
+	tool_name: string;
+	inputBytes: number | null;
+	outputBytes: number | null;
 };
 type Association = RevertSelectionResult["history"]["associations"][number];
+type RecipientMailbox = {
+	id: string;
+	narrator_id: string;
+	recipient_ref_id: string;
+	state: "materialized";
+	source_narrator_id: string | null;
+	/** Consumed by the semantic-edit max(current, content)+1 rule; A-checked like the rest. */
+	current_revision: number;
+	content_revision: number;
+};
+/** A received ref's fixed fate: removed, or edited to the given current message ID. */
+type RecipientChange = { ref: Ref } & ({ kind: "deleted" } | { kind: "edited"; messageId: string });
+type SourceNarrator = { id: string; type: string; parent_narrator_id: string | null };
 type AssociationRule = {
 	table: string;
 	column: string;
@@ -206,27 +238,22 @@ const TOOL_COLUMNS = Object.values(getTableColumns(narratorToolCalls))
 	.filter((column) => !column.generated)
 	.map((column) => column.name);
 const PAGE = REVERT_SELECTION_PAGE_ITEMS;
+const MAILBOX_FIELDS: Record<string, { name: string }> = getTableColumns(narratorBufferedMessages);
+/** The shared runtime patch uses schema field names; map them to stored SQL columns. */
+function mailboxPatch(patch: Record<string, Value>): Row {
+	return Object.fromEntries(
+		Object.entries(patch).map(([field, value]) => {
+			const column = MAILBOX_FIELDS[field];
+			if (!column) throw fail("UNSUPPORTED_SCHEMA", "Unknown mailbox receipt field");
+			return [column.name, value];
+		}),
+	);
+}
 
-/** Dormant M3 history component. It does NOT apply/replay files, claim files_verified,
- * commit a revert journal, invoke old async deletion adapters, or start a transaction.
- *
- * Caller contract: verify ALL files under coordination, THEN await prepare(); immediately
- * enter a same-root synchronous transaction, call applyToTransaction FIRST, and mark the
- * revert journal committed in that SAME callback. No await inside the callback. Propagate
- * any error out of the transaction, then let the caller's compensation protocol run.
- * No broadcast/context reset/generation is safe until that transaction actually commits.
- *
- * total_changes/data_version/schema_version conservatively reject EVERY intervening write
- * (including unrelated sessions, ACL changes and rolled-back root writes). A WAL snapshot
- * that loses a writer race cannot upgrade to a write transaction; SQLite must fail it.
- * The capability is one-shot even if the caller later rolls back: prepare again, don't
- * replay a partially used program. No mutation material or original body escapes WeakMap.
- *
- * Collector policy still applies: running tools/compacts, ambiguous legacy subagents,
- * unmaterialized inherited refs and incomplete evidence are refused. Compact rewrites
- * requiring refs outside the fixed collector manifest are refused too. Additional schema
- * associations and triggers are enforced by SQLite, not a hand-maintained whitelist.
- * File effects/operations/attributions are retained, never duplicated or re-attributed.
+/** Prepare bounded COW/history SQL outside the transaction. The caller applies it only
+ * after every required file succeeds. Selected message versions and bounded read predicates
+ * protect the program; unrelated database writes remain independent. Applying is synchronous,
+ * one-shot and shares the journal commit transaction. File effects stay as original history.
  */
 export class RevertHistoryCommitService {
 	private readonly root: Database;
@@ -263,7 +290,8 @@ export class RevertHistoryCommitService {
 		if (this.active >= 2) throw fail("BUSY", "Too many history preparations");
 		// Capture only bounded scalar commitments before the first await. Subsequent caller
 		// mutations of its manifest/principal cannot alter our selector or comparisons.
-		const fixed = fixSelection(request.fixedSelection);
+		const snapshotRecovery = request.snapshotRecovery === true;
+		const fixed = fixSelection(request.fixedSelection, snapshotRecovery);
 		const principal = { ...request.principal };
 		if (fixed.userId !== principal.userId)
 			throw fail("STALE", "The fixed plan belongs to a different principal");
@@ -272,11 +300,17 @@ export class RevertHistoryCommitService {
 			AbortSignal.timeout(this.timeoutMs),
 		]);
 		const snapshot: Snapshot = {
-			stamp: this.stamp(),
+			versions: request.fixedSelection.messageVersions.map((row) => ({ ...row })),
 			signal,
 			expiresAt: Date.now() + this.timeoutMs,
 			statements: [],
-			result: { affectedNarratorIds: [], affectedQuestionIds: [], replacements: [] },
+			checks: [],
+			result: {
+				affectedNarratorIds: [],
+				refreshedNarratorIds: [],
+				affectedQuestionIds: [],
+				replacements: [],
+			},
 		};
 		const worker = new RewriteWorker(signal);
 		this.active++;
@@ -289,11 +323,22 @@ export class RevertHistoryCommitService {
 				signal,
 			});
 			this.check(snapshot);
-			if (!current.evidenceComplete || current.issues.length)
+			if (
+				(!current.evidenceComplete || current.issues.length) &&
+				!(snapshotRecovery && isSnapshotSelectionComplete(current))
+			)
 				throw fail("EVIDENCE_INCOMPLETE", "The complete fixed selection is not settled");
 			await compareSelection(fixed, current, () => this.pause(snapshot));
 			await this.verifyCopyProjection(snapshot);
 			await this.build(snapshot, current, worker);
+			const latest = await this.selection.collect({
+				principal,
+				narratorId: fixed.narratorId,
+				expectedMessageVersion: fixed.rootVersion,
+				selector: fixed.selector,
+				signal,
+			});
+			await compareSelection(fixed, latest, () => this.pause(snapshot));
 		} finally {
 			await worker.close();
 			this.active--;
@@ -325,8 +370,24 @@ export class RevertHistoryCommitService {
 				"Use the caller's active transaction on the injected root",
 			);
 		snapshot.signal.throwIfAborted();
-		if (Date.now() >= snapshot.expiresAt || this.stamp() !== snapshot.stamp)
-			throw fail("STALE", "Database changed after preparation; rebuild the fixed selection");
+		if (Date.now() >= snapshot.expiresAt) throw fail("STALE", "History preparation expired");
+		this.checkVersions(snapshot);
+		const timeout = this.root.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()?.timeout;
+		if (timeout === undefined || timeout > 250)
+			throw fail("UNSAFE_CONNECTION", "History commit requires short SQLite waits");
+		let checked = 0;
+		for (const check of snapshot.checks) {
+			if (checked++ % PAGE === 0) {
+				snapshot.signal.throwIfAborted();
+				if (Date.now() >= snapshot.expiresAt)
+					throw fail("TIMEOUT", "History checks exceeded their deadline");
+			}
+			const actual = this.root
+				.query<{ n: number }, SQLQueryBindings[]>(check.text)
+				.get(...check.values);
+			if (actual?.n !== check.count)
+				throw fail("STALE", "Selected history changed after preparation");
+		}
 		this.#prepared.delete(prepared);
 		try {
 			// No select of history, JSON mapping, async ACL, root transaction, file IO or
@@ -348,6 +409,7 @@ export class RevertHistoryCommitService {
 			}
 			return {
 				affectedNarratorIds: [...snapshot.result.affectedNarratorIds],
+				refreshedNarratorIds: [...snapshot.result.refreshedNarratorIds],
 				affectedQuestionIds: [...snapshot.result.affectedQuestionIds],
 				replacements: snapshot.result.replacements.map((row) => ({ ...row })),
 			};
@@ -370,24 +432,21 @@ export class RevertHistoryCommitService {
 		)
 			throw fail("FOREIGN_KEYS_REQUIRED", "Foreign key enforcement is mandatory");
 	}
-	private stamp() {
-		const changes = this.root.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
-		const data = this.root
-			.query<{ data_version: number }, []>("PRAGMA data_version")
-			.get()?.data_version;
-		const schema = this.root
-			.query<{ schema_version: number }, []>("PRAGMA schema_version")
-			.get()?.schema_version;
-		const fk = this.root
-			.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys")
-			.get()?.foreign_keys;
-		const timeout = this.root.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()?.timeout;
-		return `${changes}:${data}:${schema}:${fk}:${timeout}`;
+	private checkVersions(work: Snapshot) {
+		for (const expected of work.versions) {
+			const current = this.root
+				.query<{ version: number }, [string]>(
+					"SELECT message_version AS version FROM narrators WHERE id=? LIMIT 1",
+				)
+				.get(expected.narratorId);
+			if (current?.version !== expected.messageVersion)
+				throw fail("STALE", "Selected message history changed");
+		}
 	}
 	private check(work: Snapshot) {
 		work.signal.throwIfAborted();
 		this.assertRoot();
-		if (this.stamp() !== work.stamp) throw fail("STALE", "Database changed during preparation");
+		this.checkVersions(work);
 	}
 	private async pause(work: Snapshot) {
 		await yieldToEventLoop(0);
@@ -398,6 +457,10 @@ export class RevertHistoryCommitService {
 		const row = this.root.query<T, SQLQueryBindings[]>(text).get(...values);
 		if (!row) throw fail("STALE", "A fixed row disappeared");
 		return row;
+	}
+	private rows<T>(work: Snapshot, text: string, values: SQLQueryBindings[]): T[] {
+		this.check(work);
+		return this.root.query<T, SQLQueryBindings[]>(text).all(...values);
 	}
 	private async page<T>(
 		work: Snapshot,
@@ -410,11 +473,11 @@ export class RevertHistoryCommitService {
 		let cursor = 0;
 		for (;;) {
 			this.check(work);
-			const rows = this.root
-				.query<T & { cursor: number }, SQLQueryBindings[]>(
-					`${select} INDEXED BY ${index} WHERE ${column} = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
-				)
-				.all(target, cursor, PAGE + 1);
+			const rows = this.rows<T & { cursor: number }>(
+				work,
+				`${select} INDEXED BY ${index} WHERE ${column} = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
+				[target, cursor, PAGE + 1],
+			);
 			for (const row of rows.slice(0, PAGE)) result.push(row);
 			bound(result.length, FILE_CHANGE_LIMITS.historyToolRelatedChanges, "association rows");
 			if (rows.length <= PAGE) return result;
@@ -476,6 +539,15 @@ export class RevertHistoryCommitService {
 		if (changes.size !== selection.history.toolChanges.length)
 			throw fail("MANIFEST_INVALID", "Repeated tool mutation");
 		const allTools = new Map<string, Tool>();
+		// These maps live only for preparation. Checks are compiled from the values at
+		// consumption, never from a fresh baseline after an await or the final collector.
+		const messageRows = new Map<string, Row>();
+		const refRows = new Map<string, Ref>();
+		const toolRows = new Map<string, Row>();
+		const toolTargets: Target[] = [];
+		const sharedTargets: Target[] = [];
+		const hiddenGlobal: Target[] = [];
+		const hiddenOwner: Target[] = [];
 		const copies = new Map<string, Row>();
 		const bodies = new Map<string, Row>();
 		let rowBytes = 0;
@@ -489,10 +561,15 @@ export class RevertHistoryCommitService {
 			affected.add(id);
 		};
 		const refFor = (id: string) =>
-			this.one<Ref>(
-				work,
-				"SELECT id,narrator_id,message_id,seq,segment_compact_id FROM narrator_message_refs WHERE id=? LIMIT 1",
-				[id],
+			refRows.get(id) ??
+			capture(
+				refRows,
+				id,
+				this.one<Ref>(
+					work,
+					"SELECT id,narrator_id,message_id,seq,segment_compact_id,is_compact FROM narrator_message_refs WHERE id=? LIMIT 1",
+					[id],
+				),
 			);
 		const patchRef = (ref: Ref) => {
 			let entry = refPatches.get(ref.id);
@@ -505,12 +582,7 @@ export class RevertHistoryCommitService {
 		// Full row lengths are checked before fetching ANY copy body. Include every stored
 		// field (error text, owned paths, permission suggestions, usage JSON, etc.), not just
 		// the collector's content/input/output estimates. Generated columns are never read.
-		const reserveRow = (table: string, columns: string[], id: string) => {
-			const { bytes } = this.one<{ bytes: number }>(
-				work,
-				`SELECT ${rowLength(columns)} AS bytes FROM ${table} WHERE id=? LIMIT 1`,
-				[id],
-			);
+		const reserveRow = (bytes: number) => {
 			rowBytes += bytes;
 			bound(rowBytes, FILE_CHANGE_LIMITS.historyCowBytes, "complete rewrite/COW row bytes");
 			return bytes;
@@ -518,15 +590,19 @@ export class RevertHistoryCommitService {
 		const messageSizes = new Map<string, number>();
 		const toolSizes = new Map<string, number>();
 		for (const message of messages) {
-			// FTS maintenance triggers also touch OLD.content_text on update/delete. Gate its
-			// complete size without selecting the text, including for full deletions.
-			const textSize = this.one<{ bytes: number }>(
+			const whole = message.action === "delete" || message.action === "unlink";
+			if (whole) reserveRow(message.contentBytes);
+			// Combine the consumed message metadata and FTS size observation. Copy bodies
+			// remain deferred until every full-row admission check has passed.
+			const observed = this.one<Row & { ftsBytes: number; rowBytes: number }>(
 				work,
-				"SELECT coalesce(octet_length(content_text),0) AS bytes FROM narrator_messages WHERE id=? LIMIT 1",
-				[message.id],
+				`SELECT id,role,tree_hash_after,snapshot_commit_sha,coalesce(octet_length(content_text),0) AS ftsBytes,${whole ? "content_json" : `${rowLength(MESSAGE_COLUMNS)} AS rowBytes`} FROM narrator_messages WHERE id=?${whole ? " AND octet_length(content_json)=?" : ""} LIMIT 1`,
+				whole ? [message.id, message.contentBytes] : [message.id],
 			);
-			indexBytes += textSize.bytes;
+			capture(messageRows, message.id, observed);
+			indexBytes += observed.ftsBytes;
 			bound(indexBytes, FILE_CHANGE_LIMITS.blobBytes, "search-index source bytes");
+			if (!whole) messageSizes.set(message.id, reserveRow(observed.rowBytes));
 			addAffected(message.narratorId);
 			const ref = refFor(message.refId);
 			if (
@@ -537,37 +613,50 @@ export class RevertHistoryCommitService {
 			)
 				throw fail("STALE", "The fixed owner ref changed");
 			patchRef(ref).remove = message.action === "delete" || message.action === "unlink";
-			const other = this.root
-				.query<{ id: string }, [string, string]>(
-					"SELECT id FROM narrator_message_refs INDEXED BY idx_narrator_refs_message WHERE message_id=? AND narrator_id!=? LIMIT 1",
-				)
-				.get(message.id, message.narratorId);
-			if (!!other !== message.isShared) throw fail("STALE", "Shared ownership changed");
-			const toolRows = await this.page<Tool>(
+			const { shared } = this.one<{ shared: number }>(
 				work,
-				"SELECT id,message_id,narrator_id,tool_use_id,is_file_history_checkpoint,rowid AS cursor FROM narrator_tool_calls",
+				"SELECT EXISTS(SELECT 1 FROM narrator_message_refs INDEXED BY idx_narrator_refs_message WHERE message_id=? AND narrator_id!=?) AS shared",
+				[message.id, message.narratorId],
+			);
+			if (!!shared !== message.isShared) throw fail("STALE", "Shared ownership changed");
+			sharedTargets.push({
+				row: { message_id: message.id, owner_id: message.narratorId, shared },
+				count: 1,
+			});
+			const inventory = await this.page<Tool & { cursor: number }>(
+				work,
+				"SELECT id,message_id,narrator_id,tool_use_id,is_file_history_checkpoint,status,execution_attempt,file_change_operation_id,tool_name,octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,rowid AS cursor FROM narrator_tool_calls",
 				"idx_toolcalls_message",
 				"message_id",
 				message.id,
 			);
-			for (const tool of toolRows) {
-				allTools.set(tool.id, tool);
+			toolTargets.push({ row: { message_id: message.id }, count: inventory.length });
+			for (const { cursor: _cursor, ...tool } of inventory) {
+				capture(allTools, tool.id, tool);
+				capture(toolRows, tool.id, tool);
 				bound(allTools.size, FILE_CHANGE_LIMITS.historyToolRelatedChanges, "inspected tool rows");
 				const action = changes.get(tool.id);
 				if (!action)
 					throw fail("MANIFEST_INVALID", "A message tool is absent from the fixed manifest");
-				if (action === "copy")
-					toolSizes.set(tool.id, reserveRow("narrator_tool_calls", TOOL_COLUMNS, tool.id));
+				if (action === "copy") {
+					const size = this.one<{ id: string; rowBytes: number }>(
+						work,
+						`SELECT id,${rowLength(TOOL_COLUMNS)} AS rowBytes FROM narrator_tool_calls WHERE id=? LIMIT 1`,
+						[tool.id],
+					);
+					capture(toolRows, tool.id, size);
+					toolSizes.set(tool.id, reserveRow(size.rowBytes));
+				}
 			}
 			if (message.action === "rewrite" || message.action === "copy_on_write") {
-				messageSizes.set(message.id, reserveRow("narrator_messages", MESSAGE_COLUMNS, message.id));
 				// Partial compact edits/COW would have to retarget other hidden refs, an action
 				// the current collector does not authorize. Do not guess a larger selection.
-				const hidden = this.root
-					.query<{ id: string }, [string]>(
-						"SELECT id FROM narrator_message_refs INDEXED BY idx_narrator_refs_segment_compact WHERE segment_compact_id=? LIMIT 1",
-					)
-					.get(message.id);
+				const { hidden } = this.one<{ hidden: number }>(
+					work,
+					"SELECT EXISTS(SELECT 1 FROM narrator_message_refs INDEXED BY idx_narrator_refs_segment_compact WHERE segment_compact_id=?) AS hidden",
+					[message.id],
+				);
+				hiddenGlobal.push({ row: { message_id: message.id }, count: 1 });
 				if (hidden)
 					throw fail(
 						"UNSUPPORTED_COMPACT",
@@ -575,11 +664,15 @@ export class RevertHistoryCommitService {
 					);
 			}
 			if (message.action === "unlink") {
-				const hidden = this.root
-					.query<{ id: string }, [string, string]>(
-						"SELECT id FROM narrator_message_refs INDEXED BY idx_narrator_refs_segment_compact WHERE segment_compact_id=? AND narrator_id=? LIMIT 1",
-					)
-					.get(message.id, message.narratorId);
+				const { hidden } = this.one<{ hidden: number }>(
+					work,
+					"SELECT EXISTS(SELECT 1 FROM narrator_message_refs INDEXED BY idx_narrator_refs_segment_compact WHERE segment_compact_id=? AND narrator_id=?) AS hidden",
+					[message.id, message.narratorId],
+				);
+				hiddenOwner.push({
+					row: { message_id: message.id, owner_id: message.narratorId },
+					count: 1,
+				});
 				if (hidden)
 					throw fail("UNSUPPORTED_COMPACT", "Unlinking this compact would leave hidden owner refs");
 			}
@@ -611,31 +704,31 @@ export class RevertHistoryCommitService {
 			list.push(edge);
 			associations.set(rowKey, list);
 		}
-		// Re-enumerate only the fixed indexed target edges. New cascades cannot slip through
-		// by being absent from the collector manifest, and no unrelated ID expansion is used.
-		let actualEdges = 0;
+		// The authorized manifest already contains every member. Compile identity and
+		// bounded membership checks directly; do not re-enumerate each target here.
 		for (const rule of ASSOCIATIONS) {
-			const targets =
-				rule.target === "narrator_messages"
-					? messages.filter((m) => m.action === "delete").map((m) => m.id)
-					: [...changes].filter(([, action]) => action === "delete").map(([id]) => id);
-			for (const targetId of targets) {
-				const rows = await this.page<{ id: string }>(
-					work,
-					`SELECT ${rule.idColumn ?? "id"} AS id,rowid AS cursor FROM ${rule.table}`,
-					rule.index,
-					rule.column,
-					targetId,
-				);
-				for (const row of rows) {
-					if (!manifestEdges.has(edgeKey({ ...rule, id: row.id, targetId })))
-						throw fail("STALE", "An unplanned cascade or pointer appeared");
-					actualEdges++;
-				}
-				await this.pause(work);
+			const targets = new Map<string, Target>();
+			for (const id of rule.target === "narrator_messages"
+				? messages.filter((m) => m.action === "delete").map((m) => m.id)
+				: [...changes].filter(([, action]) => action === "delete").map(([id]) => id))
+				targets.set(id, { row: { target_id: id }, count: 0 });
+			const members: Row[] = [];
+			const key = rule.idColumn ?? "id";
+			for (const edge of selection.history.associations) {
+				if (edge.table !== rule.table || edge.column !== rule.column) continue;
+				const target = targets.get(edge.targetId);
+				if (!target) throw fail("MANIFEST_INVALID", "Unbound association target");
+				target.count++;
+				members.push({ [key]: edge.id, [rule.column]: edge.targetId });
 			}
+			work.checks.push(
+				...rowChecks(rule.table, key, members),
+				...targetChecks(
+					targets.values(),
+					`CROSS JOIN ${quote(rule.table)} a INDEXED BY ${quote(rule.index)} ON a.${quote(rule.column)}=t.target_id`,
+				),
+			);
 		}
-		if (actualEdges !== manifestEdges.size) throw fail("STALE", "The fixed associations changed");
 		const associationProgram: Statement[] = [];
 		for (const edges of associations.values()) {
 			const edge = edges[0];
@@ -661,7 +754,34 @@ export class RevertHistoryCommitService {
 				);
 			}
 		}
-		const questionProgram = await this.prepareQuestions(work, selection);
+		const { program: questionProgram, inboxIds } = await this.prepareQuestions(
+			work,
+			selection,
+			allTools,
+		);
+		// Every fixed owner ref this program changes is a recipient target: removed refs become
+		// deletions; a rewrite keeps its message ID and a COW retargets its same ref to a new
+		// one (allocated here so the receipt and the inserted copy share one identity).
+		const cowIds = new Map<string, string>();
+		const recipientChanges: RecipientChange[] = [];
+		for (const message of messages) {
+			const entry = refPatches.get(message.refId);
+			if (!entry) throw fail("MANIFEST_INVALID", "A fixed message has no owner ref");
+			if (entry.remove) recipientChanges.push({ ref: entry.ref, kind: "deleted" });
+			else if (message.action === "rewrite")
+				recipientChanges.push({ ref: entry.ref, kind: "edited", messageId: message.id });
+			else if (message.action === "copy_on_write") {
+				const id = generateId();
+				cowIds.set(message.id, id);
+				recipientChanges.push({ ref: entry.ref, kind: "edited", messageId: id });
+			}
+		}
+		const recipient = await this.prepareRecipientReceipts(
+			work,
+			recipientChanges,
+			affected,
+			inboxIds,
+		);
 		for (const id of affected) {
 			const narrator = this.one<Narrator>(
 				work,
@@ -680,26 +800,26 @@ export class RevertHistoryCommitService {
 			const message = messageById.get(id);
 			if (!message) throw fail("MANIFEST_INVALID", "Unknown rewrite");
 			const columns =
-				message.action === "copy_on_write" ? MESSAGE_COLUMNS : ["content_json", "role"];
-			bodies.set(
-				id,
-				this.one<Row>(
-					work,
-					`SELECT ${columns.map(quote).join(",")} FROM narrator_messages WHERE id=? AND ${rowLength(MESSAGE_COLUMNS)}=? LIMIT 1`,
-					[id, bytes],
-				),
+				message.action === "copy_on_write"
+					? MESSAGE_COLUMNS
+					: ["id", "content_json", "role", "tree_hash_after", "snapshot_commit_sha"];
+			const body = this.one<Row>(
+				work,
+				`SELECT ${columns.map(quote).join(",")},coalesce(octet_length(content_text),0) AS ftsBytes,${rowLength(MESSAGE_COLUMNS)} AS rowBytes FROM narrator_messages WHERE id=? AND ${rowLength(MESSAGE_COLUMNS)}=? LIMIT 1`,
+				[id, bytes],
 			);
+			capture(messageRows, id, body);
+			bodies.set(id, body);
 			await this.pause(work);
 		}
 		for (const [id, bytes] of toolSizes) {
-			copies.set(
-				id,
-				this.one<Row>(
-					work,
-					`SELECT ${TOOL_COLUMNS.map(quote).join(",")} FROM narrator_tool_calls WHERE id=? AND ${rowLength(TOOL_COLUMNS)}=? LIMIT 1`,
-					[id, bytes],
-				),
+			const copy = this.one<Row>(
+				work,
+				`SELECT ${TOOL_COLUMNS.map(quote).join(",")},octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,${rowLength(TOOL_COLUMNS)} AS rowBytes FROM narrator_tool_calls WHERE id=? AND ${rowLength(TOOL_COLUMNS)}=? LIMIT 1`,
+				[id, bytes],
 			);
+			capture(toolRows, id, copy);
+			copies.set(id, copy);
 			await this.pause(work);
 		}
 		const messageProgram: Statement[] = [];
@@ -731,7 +851,8 @@ export class RevertHistoryCommitService {
 			if (message.action === "rewrite") {
 				messageProgram.push(update("narrator_messages", patch, { id: message.id }));
 			} else {
-				const id = generateId();
+				const id = cowIds.get(message.id);
+				if (!id) throw fail("MANIFEST_INVALID", "COW has no allocated identity");
 				// Keep message role, historical narrator/actor and every other raw field.
 				// Ref ownership moves; historical authorship does NOT move to the fork owner.
 				messageProgram.push(
@@ -778,6 +899,14 @@ export class RevertHistoryCommitService {
 			bound(materialBytes, FILE_CHANGE_LIMITS.historyCowBytes, "prepared rewrite/COW row bytes");
 			if ((i + 1) % PAGE === 0) await this.pause(work);
 		}
+		// As the legacy semantic_edit rule: every edited ref needs a fresh input-adoption
+		// fact, with or without a mailbox row (pre-mailbox Send receipts live on the ref).
+		for (const change of recipientChanges) {
+			if (change.kind !== "edited") continue;
+			const entry = refPatches.get(change.ref.id);
+			if (!entry || entry.remove) throw fail("MANIFEST_INVALID", "An edited ref is not kept");
+			entry.patch.injection_consumed_at = null;
+		}
 		const refProgram: Statement[] = [];
 		for (const { ref, patch, remove } of refPatches.values()) {
 			const where = { id: ref.id, narrator_id: ref.narrator_id, message_id: ref.message_id };
@@ -806,6 +935,7 @@ export class RevertHistoryCommitService {
 		const relatedChanges =
 			associationProgram.length +
 			questionProgram.length +
+			recipient.program.length +
 			narratorProgram.length +
 			[...changes.values()].filter((action) => action !== "retain").length;
 		bound(
@@ -822,8 +952,12 @@ export class RevertHistoryCommitService {
 			...questionProgram,
 			...associationProgram,
 			...messageProgram,
+			// Same order as deleteRecipientMessageRefs: receipt first, while the ref exists.
+			...recipient.program,
 			...refProgram,
 			...narratorProgram,
+			// Source refresh is a metadata side effect, never a CAS on the sender's version.
+			...recipient.refreshes,
 		);
 		for (const [id, action] of changes)
 			if (action === "delete") {
@@ -835,15 +969,163 @@ export class RevertHistoryCommitService {
 			if (message.action === "delete")
 				work.statements.push(deletion("narrator_messages", { id: message.id }));
 		work.result.affectedNarratorIds = [...affected];
+		work.result.refreshedNarratorIds = recipient.refreshedIds;
+		work.checks.push(
+			...rowChecks("narrator_messages", "id", messageRows.values(), {
+				ftsBytes: "coalesce(octet_length(a.content_text),0)",
+				rowBytes: rowLength(MESSAGE_COLUMNS, "a."),
+			}),
+			...rowChecks("narrator_message_refs", "id", refRows.values()),
+			...rowChecks("narrator_tool_calls", "id", toolRows.values(), {
+				inputBytes: "octet_length(a.input_json)",
+				outputBytes: "octet_length(a.output_json)",
+				rowBytes: rowLength(TOOL_COLUMNS, "a."),
+			}),
+			...rowChecks("narrators", "id", narrators.values()),
+			...targetChecks(
+				toolTargets,
+				"CROSS JOIN narrator_tool_calls a INDEXED BY idx_toolcalls_message ON a.message_id=t.message_id",
+			),
+			...targetChecks(
+				sharedTargets,
+				"WHERE EXISTS(SELECT 1 FROM narrator_message_refs a INDEXED BY idx_narrator_refs_message WHERE a.message_id=t.message_id AND a.narrator_id!=t.owner_id) IS t.shared",
+			),
+			...targetChecks(
+				hiddenGlobal,
+				"WHERE NOT EXISTS(SELECT 1 FROM narrator_message_refs a INDEXED BY idx_narrator_refs_segment_compact WHERE a.segment_compact_id=t.message_id)",
+			),
+			...targetChecks(
+				hiddenOwner,
+				"WHERE NOT EXISTS(SELECT 1 FROM narrator_message_refs a INDEXED BY idx_narrator_refs_segment_compact WHERE a.segment_compact_id=t.message_id AND a.narrator_id=t.owner_id)",
+			),
+		);
+		bound(
+			work.checks.length,
+			FILE_CHANGE_LIMITS.historyToolRelatedChanges * 8,
+			"history read checks",
+		);
 		this.check(work);
+	}
+	/** Equivalent of updateRecipientMessageRef for every fixed owner ref this program
+	 * removes (deleted) or edits (rewrite keeps its ID; COW retargets the same ref). Each
+	 * (owner, ref) is a membership target even when it has no mailbox, so a receipt bound
+	 * after preparation is rejected; captured receipts are then updated by exact PK. */
+	private async prepareRecipientReceipts(
+		work: Snapshot,
+		changes: RecipientChange[],
+		affected: ReadonlySet<string>,
+		cancelled: ReadonlySet<string>,
+	) {
+		const receipts = new Map<string, RecipientMailbox & { change: RecipientChange }>();
+		const projections = new Map<string, RecipientMailbox>();
+		const refTargets: Target[] = [];
+		const sources = new Map<string, SourceNarrator>();
+		const sourceTargets: Target[] = [];
+		for (let i = 0; i < changes.length; i++) {
+			const change = changes[i];
+			const { ref } = change;
+			const rows = this.rows<RecipientMailbox>(
+				work,
+				"SELECT id,narrator_id,recipient_ref_id,state,source_narrator_id,current_revision,content_revision FROM narrator_buffered_messages INDEXED BY idx_nbm_ref WHERE narrator_id=? AND recipient_ref_id=? AND state='materialized' LIMIT ?",
+				[ref.narrator_id, ref.id, PAGE + 1],
+			);
+			bound(rows.length, PAGE, "recipient receipts per ref");
+			refTargets.push({ row: { owner_id: ref.narrator_id, ref_id: ref.id }, count: rows.length });
+			for (const row of rows) {
+				bound(row.current_revision, Number.MAX_SAFE_INTEGER - 1, "receipt current revision", 1);
+				bound(row.content_revision, Number.MAX_SAFE_INTEGER - 1, "receipt content revision", 1);
+				capture(projections, row.id, row);
+				receipts.set(row.id, { ...row, change });
+			}
+			bound(receipts.size, FILE_CHANGE_LIMITS.historyToolRelatedChanges, "recipient receipts");
+			if ((i + 1) % PAGE === 0) await this.pause(work);
+		}
+		// The question program runs first and leaves its notices non-materialized, so the
+		// helper's state='materialized' update is then a no-op for exactly those rows: they
+		// neither change nor trigger a source refresh. Skip them rather than match zero rows.
+		const updated = [...receipts.values()].filter((row) => !cancelled.has(row.id));
+		// The legacy helper refreshes each source of a CHANGED receipt and, for a subagent
+		// source, its parent. Capture only that relationship and existence, never a version
+		// or body. A missing narrator is a fixed empty target, as the helper's inArray skip.
+		const refreshed = new Set<string>();
+		const seen = new Set<string>();
+		const resolve = (id: string) => {
+			if (seen.has(id)) return sources.get(id);
+			seen.add(id);
+			const row = this.rows<SourceNarrator>(
+				work,
+				"SELECT id,type,parent_narrator_id FROM narrators WHERE id=? LIMIT 1",
+				[id],
+			)[0];
+			sourceTargets.push({ row: { source_id: id }, count: row ? 1 : 0 });
+			if (!row) return undefined;
+			capture(sources, row.id, row);
+			refreshed.add(row.id);
+			return row;
+		};
+		for (const row of updated) {
+			const source = row.source_narrator_id ? resolve(row.source_narrator_id) : undefined;
+			if (source?.type === "subagent" && source.parent_narrator_id)
+				resolve(source.parent_narrator_id);
+			bound(seen.size, FILE_CHANGE_LIMITS.historyToolRelatedChanges, "receipt source narrators");
+		}
+		// Owners already in this program get exactly one CAS increment of their own.
+		for (const id of affected) refreshed.delete(id);
+		const refreshedIds = [...refreshed];
+		const at = new Date().toISOString();
+		const program = updated.map((row) =>
+			update(
+				"narrator_buffered_messages",
+				mailboxPatch(
+					row.change.kind === "deleted"
+						? recipientDeletedReceiptPatch(at)
+						: semanticEditReceiptPatch(
+								row.change.messageId,
+								nextCurrentRevision(row.current_revision, row.content_revision),
+								at,
+							),
+				),
+				{
+					id: row.id,
+					narrator_id: row.narrator_id,
+					recipient_ref_id: row.recipient_ref_id,
+					state: "materialized",
+				},
+			),
+		);
+
+		const refreshes = refreshedIds.map((id) => ({
+			text: 'UPDATE "narrators" SET "message_version"="message_version"+1,"updated_at"=? WHERE "id" IS ?',
+			values: [at, id],
+		}));
+		work.checks.push(
+			...rowChecks("narrator_buffered_messages", "id", projections.values()),
+			...rowChecks("narrators", "id", sources.values()),
+			...targetChecks(
+				refTargets,
+				"CROSS JOIN narrator_buffered_messages a INDEXED BY idx_nbm_ref ON a.narrator_id=t.owner_id AND a.recipient_ref_id=t.ref_id AND a.state='materialized'",
+			),
+			...targetChecks(sourceTargets, "CROSS JOIN narrators a ON a.id=t.source_id"),
+		);
+		return { program, refreshes, refreshedIds };
 	}
 	/** Materialize every question/event write before issuing the capability. Apply does
 	 * not call the ordinary reconciliation helper or discover any new history rows. */
-	private async prepareQuestions(work: Snapshot, selection: RevertSelectionResult) {
+	private async prepareQuestions(
+		work: Snapshot,
+		selection: RevertSelectionResult,
+		allTools: ReadonlyMap<string, Tool>,
+	) {
 		const questions = new Map<string, QuestionHistoryRow>();
+		const eventRows = new Map<string, Row>();
 		const requests = new Set<string>();
 		const physicallyDeleted = new Set<string>();
 		const deletedByOwner = new Map<string, Set<string>>();
+		const requestTargets: Target[] = [];
+		const eventTargets: Target[] = [];
+		const answerTargets: Target[] = [];
+		const historyTargets: Target[] = [];
+		const inboxTargets = new Map<string, Target>();
 		const authorized = new Set(selection.messageVersions.map((row) => row.narratorId));
 		const add = (row: QuestionHistoryRow, requestRemoved = false) => {
 			if (!authorized.has(row.narrator_id))
@@ -851,55 +1133,89 @@ export class RevertHistoryCommitService {
 					"UNAUTHORIZED_ASSOCIATION",
 					"Question owner is outside the fixed history manifest",
 				);
-			questions.set(row.id, row);
-			if (requestRemoved) requests.add(row.id);
+			const { id, narrator_id, tool_call_id, answer_message_id, status } = row;
+			capture(questions, id, { id, narrator_id, tool_call_id, answer_message_id, status });
+			if (requestRemoved) requests.add(id);
 			bound(questions.size, QUESTION_HISTORY_LIMIT, "question history rows");
 		};
-		const read = (text: string, values: SQLQueryBindings[]) => {
-			this.check(work);
-			const rows = this.root.query<QuestionHistoryRow, SQLQueryBindings[]>(text).all(...values);
+		type EventCandidate = QuestionHistoryRow & { eventMessageId: string; eventCursor: number };
+		const addEvent = (row: EventCandidate) => {
+			add(row);
+			capture(eventRows, row.eventMessageId, {
+				question_id: row.id,
+				message_id: row.eventMessageId,
+				cursor: row.eventCursor,
+			});
+		};
+		const read = <T>(text: string, values: SQLQueryBindings[]) => {
+			const rows = this.rows<T>(work, text, values);
 			bound(rows.length, QUESTION_HISTORY_LIMIT, "question candidates");
 			return rows;
 		};
+		const toolsByMessage = new Map<string, Tool[]>();
+		for (const tool of allTools.values()) {
+			const tools = toolsByMessage.get(tool.message_id) ?? [];
+			tools.push(tool);
+			toolsByMessage.set(tool.message_id, tools);
+		}
+		const removedBlocks = new Map<string, Set<string>>();
+		for (const block of selection.history.blocks) {
+			if (block.action !== "remove" || block.type !== "tool_use" || !block.toolUseId) continue;
+			const ids = removedBlocks.get(block.messageId) ?? new Set<string>();
+			ids.add(block.toolUseId);
+			removedBlocks.set(block.messageId, ids);
+		}
+		const deletedTools = new Set(
+			selection.history.toolChanges.filter((row) => row.action === "delete").map((row) => row.id),
+		);
 		for (const message of selection.history.messages) {
-			if (message.action === "delete" || message.action === "unlink") {
+			const whole = message.action === "delete" || message.action === "unlink";
+			// Full inventory, not only physical deletes: unlink and COW must also withdraw
+			// the original owner's request when its creation block disappears.
+			for (const tool of toolsByMessage.get(message.id) ?? []) {
+				if (!whole && !removedBlocks.get(message.id)?.has(tool.tool_use_id)) continue;
+				const physical = Number(deletedTools.has(tool.id));
+				const rows = read<QuestionHistoryRow>(
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q INDEXED BY idx_narrator_questions_tool_call WHERE q.tool_call_id=? AND (q.narrator_id=? OR ?=1) LIMIT ?`,
+					[tool.id, message.narratorId, physical, QUESTION_HISTORY_LIMIT + 1],
+				);
+				requestTargets.push({
+					row: { owner_id: message.narratorId, tool_call_id: tool.id, physical_delete: physical },
+					count: rows.length,
+				});
+				for (const row of rows) {
+					add(row, true);
+					if (physical) physicallyDeleted.add(row.id);
+				}
+			}
+			if (whole) {
 				const ids = deletedByOwner.get(message.narratorId) ?? new Set<string>();
 				ids.add(message.id);
 				deletedByOwner.set(message.narratorId, ids);
-				for (const row of read(
-					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_tool_calls t INDEXED BY idx_toolcalls_message CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_tool_call ON q.tool_call_id=t.id WHERE q.narrator_id=? AND t.message_id=? LIMIT ?`,
-					[message.narratorId, message.id, QUESTION_HISTORY_LIMIT + 1],
-				))
-					add(row, true);
-				for (const row of read(
-					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE q.narrator_id=? AND e.message_id=? LIMIT 1`,
-					[message.narratorId, message.id],
-				))
-					add(row);
-				for (const row of read(
+				const physical = Number(message.action === "delete");
+				const events = read<EventCandidate>(
+					`SELECT ${QUESTION_HISTORY_COLUMNS},e.message_id AS eventMessageId,e.rowid AS eventCursor FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE e.message_id=? AND (q.narrator_id=? OR ?=1) LIMIT 1`,
+					[message.id, message.narratorId, physical],
+				);
+				eventTargets.push({
+					row: { owner_id: message.narratorId, message_id: message.id, physical_delete: physical },
+					count: events.length,
+				});
+				for (const row of events) addEvent(row);
+				const answers = read<QuestionHistoryRow>(
 					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q INDEXED BY idx_narrator_questions_answer_message WHERE q.narrator_id=? AND q.answer_message_id=? LIMIT ?`,
 					[message.narratorId, message.id, QUESTION_HISTORY_LIMIT + 1],
-				))
-					add(row);
-			} else {
-				for (const block of selection.history.blocks) {
-					if (
-						block.messageId !== message.id ||
-						block.action !== "remove" ||
-						block.type !== "tool_use"
-					)
-						continue;
-					for (const row of read(
-						`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_tool_calls t INDEXED BY idx_toolcalls_message CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_tool_call ON q.tool_call_id=t.id WHERE q.narrator_id=? AND t.message_id=? AND t.tool_use_id=? LIMIT ?`,
-						[message.narratorId, message.id, block.toolUseId, QUESTION_HISTORY_LIMIT + 1],
-					))
-						add(row, true);
-				}
+				);
+				answerTargets.push({
+					row: { owner_id: message.narratorId, message_id: message.id },
+					count: answers.length,
+				});
+				for (const row of answers) add(row);
 			}
 			await this.pause(work);
 		}
-		// Explicitly include all cascade leaves, including a question's older events.
-		// A FK whitelist is not permission to let SQLite discover an unbounded write set.
+		// Physical cascade leaves may belong to another authorized owner; preserve the
+		// explicit manifest path and its ACL check rather than guessing ownership.
 		for (const edge of selection.history.associations) {
 			if (edge.table === "narrator_questions") {
 				const row = this.one<QuestionHistoryRow>(
@@ -910,12 +1226,12 @@ export class RevertHistoryCommitService {
 				add(row, true);
 				physicallyDeleted.add(row.id);
 			} else if (edge.table === "narrator_question_events") {
-				const row = this.one<QuestionHistoryRow>(
+				const row = this.one<EventCandidate>(
 					work,
-					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE e.message_id=? LIMIT 1`,
+					`SELECT ${QUESTION_HISTORY_COLUMNS},e.message_id AS eventMessageId,e.rowid AS eventCursor FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE e.message_id=? LIMIT 1`,
 					[edge.id],
 				);
-				add(row);
+				addEvent(row);
 				const ids = deletedByOwner.get(row.narrator_id) ?? new Set<string>();
 				ids.add(edge.id);
 				deletedByOwner.set(row.narrator_id, ids);
@@ -926,24 +1242,38 @@ export class RevertHistoryCommitService {
 		let count = 0;
 		let bytes = 0;
 		for (const question of questions.values()) {
-			const sizes = await this.page<{ bytes: number }>(
+			const sizes = await this.page<{
+				question_id: string;
+				message_id: string;
+				cursor: number;
+				resolutionBytes: number;
+			}>(
 				work,
-				"SELECT coalesce(octet_length(resolution_json),0) AS bytes,rowid AS cursor FROM narrator_question_events",
+				"SELECT question_id,message_id,coalesce(octet_length(resolution_json),0) AS resolutionBytes,rowid AS cursor FROM narrator_question_events",
 				"idx_question_events_question_rowid",
 				"question_id",
 				question.id,
 			);
 			count += sizes.length;
-			bytes += sizes.reduce((sum, row) => sum + row.bytes, 0);
+			bytes += sizes.reduce((sum, row) => sum + row.resolutionBytes, 0);
 			bound(count, QUESTION_HISTORY_LIMIT, "question history events");
 			bound(bytes, QUESTION_HISTORY_BYTES, "question resolution bytes");
-			const events = await this.page<QuestionHistoryEvent>(
-				work,
-				"SELECT question_id,message_id,kind,created_at,resolution_json,rowid AS cursor FROM narrator_question_events",
-				"idx_question_events_question_rowid",
-				"question_id",
-				question.id,
-			);
+			historyTargets.push({ row: { question_id: question.id }, count: sizes.length });
+			for (const size of sizes) capture(eventRows, size.message_id, size);
+			const events: QuestionHistoryEvent[] = [];
+			for (const size of sizes) {
+				// Bind the preflight to this exact PK, insertion order and byte count before
+				// materializing resolution_json. Equal length is admission, not equality:
+				// capture the actual full value for the subsequent commit check.
+				const event = this.one<QuestionHistoryEvent & { cursor: number; resolutionBytes: number }>(
+					work,
+					"SELECT question_id,message_id,kind,created_at,resolution_json,rowid AS cursor,coalesce(octet_length(resolution_json),0) AS resolutionBytes FROM narrator_question_events WHERE question_id=? AND message_id=? AND rowid=? AND coalesce(octet_length(resolution_json),0)=? LIMIT 1",
+					[question.id, size.message_id, size.cursor, size.resolutionBytes],
+				);
+				capture(eventRows, event.message_id, event);
+				events.push(event);
+				if (events.length % PAGE === 0) await this.pause(work);
+			}
 			const deleted = deletedByOwner.get(question.narrator_id) ?? new Set<string>();
 			for (const eventId of new Set([
 				...events
@@ -959,18 +1289,18 @@ export class RevertHistoryCommitService {
 					? [question.answer_message_id]
 					: []),
 			])) {
-				this.check(work);
-				const rows = this.root
-					.query<QuestionHistoryInboxRow, SQLQueryBindings[]>(
-						"SELECT id,narrator_id,recipient_message_id FROM narrator_buffered_messages INDEXED BY idx_nbm_reserved WHERE narrator_id=? AND recipient_message_id=? AND kind='task_notice' AND source_key=? LIMIT ?",
-					)
-					.all(
-						question.narrator_id,
-						eventId,
-						`question-answer:${eventId}`,
-						QUESTION_HISTORY_LIMIT + 1,
-					);
-				for (const row of rows) inboxRows.set(row.id, row);
+				const key = JSON.stringify([question.narrator_id, eventId]);
+				if (inboxTargets.has(key)) continue;
+				const rows = this.rows<QuestionHistoryInboxRow>(
+					work,
+					"SELECT id,narrator_id,recipient_message_id FROM narrator_buffered_messages INDEXED BY idx_nbm_reserved WHERE narrator_id=? AND recipient_message_id=? AND kind='task_notice' AND source_key=? LIMIT ?",
+					[question.narrator_id, eventId, `question-answer:${eventId}`, QUESTION_HISTORY_LIMIT + 1],
+				);
+				inboxTargets.set(key, {
+					row: { owner_id: question.narrator_id, event_message_id: eventId },
+					count: rows.length,
+				});
+				for (const row of rows) capture(inboxRows, row.id, row);
 				bound(inboxRows.size, QUESTION_HISTORY_LIMIT, "question inbox rows");
 			}
 			const plan = buildQuestionHistoryProgram(
@@ -985,8 +1315,44 @@ export class RevertHistoryCommitService {
 			program.push(...plan.statements);
 			await this.pause(work);
 		}
+		work.checks.push(
+			...rowChecks("narrator_questions", "id", questions.values()),
+			...rowChecks("narrator_question_events", "message_id", eventRows.values(), {
+				cursor: "a.rowid",
+				resolutionBytes: "coalesce(octet_length(a.resolution_json),0)",
+			}),
+			...rowChecks(
+				"narrator_buffered_messages",
+				"id",
+				[...inboxRows.values()].map((row) => ({
+					...row,
+					kind: "task_notice",
+					source_key: `question-answer:${row.recipient_message_id}`,
+				})),
+			),
+			...targetChecks(
+				requestTargets,
+				"CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_tool_call ON q.tool_call_id=t.tool_call_id AND (q.narrator_id=t.owner_id OR t.physical_delete=1)",
+			),
+			...targetChecks(
+				eventTargets,
+				"CROSS JOIN narrator_question_events e ON e.message_id=t.message_id CROSS JOIN narrator_questions q ON q.id=e.question_id AND (q.narrator_id=t.owner_id OR t.physical_delete=1)",
+			),
+			...targetChecks(
+				answerTargets,
+				"CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_answer_message ON q.answer_message_id=t.message_id AND q.narrator_id=t.owner_id",
+			),
+			...targetChecks(
+				historyTargets,
+				"CROSS JOIN narrator_question_events e INDEXED BY idx_question_events_question_rowid ON e.question_id=t.question_id",
+			),
+			...targetChecks(
+				inboxTargets.values(),
+				"CROSS JOIN narrator_buffered_messages a INDEXED BY idx_nbm_reserved ON a.narrator_id=t.owner_id AND a.recipient_message_id=t.event_message_id AND a.kind='task_notice' AND a.source_key='question-answer:'||t.event_message_id",
+			),
+		);
 		program.push(...buildQuestionHistoryInboxProgram([...inboxRows.values()]));
-		return program;
+		return { program, inboxIds: new Set(inboxRows.keys()) as ReadonlySet<string> };
 	}
 
 	private report(phase: "prepare" | "apply", started: number, statements: number) {
@@ -1014,10 +1380,76 @@ function clientOf(session: object) {
 function quote(name: string) {
 	return `"${name.replaceAll('"', '""')}"`;
 }
-function rowLength(columns: string[]) {
+function rowLength(columns: string[], prefix = "") {
 	// octet_length(column) can use SQLite record metadata for TEXT/BLOB without loading
 	// the whole value. length(CAST(column AS BLOB)) would unnecessarily materialize it.
-	return columns.map((name) => `coalesce(octet_length(${quote(name)}),0)`).join("+");
+	return columns.map((name) => `coalesce(octet_length(${prefix}${quote(name)}),0)`).join("+");
+}
+/** Only add newly consumed fields; a later read must never rebaseline an earlier value. */
+function capture<T extends Row>(records: Map<string, T>, key: string, row: T): T {
+	const previous = records.get(key);
+	if (previous) {
+		for (const [column, value] of Object.entries(row))
+			if (Object.hasOwn(previous, column) && previous[column] !== value)
+				throw fail("STALE", "Selected history changed during preparation");
+	}
+	const captured = { ...previous, ...row };
+	records.set(key, captured);
+	return captured;
+}
+/** A: exact, null-safe projection equality by the fixed primary key. Expressions are
+ * explicit local aliases (byte lengths/rowid), never parsed from a remembered query. */
+function rowChecks(
+	table: string,
+	key: string,
+	rows: Iterable<Row>,
+	expressions: Record<string, string> = {},
+): Check[] {
+	const groups = new Map<string, { columns: string[]; rows: Row[] }>();
+	for (const row of rows) {
+		const columns = Object.keys(row).sort();
+		const signature = columns.join(",");
+		const group = groups.get(signature) ?? { columns, rows: [] };
+		group.rows.push(row);
+		groups.set(signature, group);
+	}
+	const checks: Check[] = [];
+	for (const { columns, rows: expected } of groups.values()) {
+		bound(columns.length, 32_000, "history projection columns", 1);
+		const size = Math.min(PAGE, Math.floor(32_000 / columns.length));
+		for (let i = 0; i < expected.length; i += size) {
+			const batch = expected.slice(i, i + size);
+			const tuple = `(${columns.map(() => "?").join(",")})`;
+			checks.push({
+				text: `WITH expected(${columns.map(quote).join(",")}) AS (VALUES ${batch.map(() => tuple).join(",")}) SELECT count(*) AS n FROM expected e CROSS JOIN ${quote(table)} a ON a.${quote(key)} IS e.${quote(key)} WHERE ${columns.map((column) => `${expressions[column] ?? `a.${quote(column)}`} IS e.${quote(column)}`).join(" AND ")}`,
+				values: batch.flatMap((row) => columns.map((column) => row[column])),
+				count: batch.length,
+			});
+		}
+	}
+	return checks;
+}
+/** B: bounded membership over fixed targets, including targets whose original count was
+ * zero. Pair with A for identity/pointer equality so a same-count replacement also fails. */
+function targetChecks(targets: Iterable<Target>, join: string): Check[] {
+	const expected = [...targets];
+	if (!expected.length) return [];
+	const columns = Object.keys(expected[0].row);
+	bound(columns.length, 32_000, "history target columns", 1);
+	const size = Math.min(PAGE, Math.floor(32_000 / columns.length));
+	const checks: Check[] = [];
+	for (let i = 0; i < expected.length; i += size) {
+		const batch = expected.slice(i, i + size);
+		const count = batch.reduce((sum, target) => sum + target.count, 0);
+		bound(count, FILE_CHANGE_LIMITS.historyToolRelatedChanges, "history target members");
+		const tuple = `(${columns.map(() => "?").join(",")})`;
+		checks.push({
+			text: `WITH targets(${columns.map(quote).join(",")}) AS (VALUES ${batch.map(() => tuple).join(",")}) SELECT count(*) AS n FROM (SELECT 1 FROM targets t ${join} LIMIT ${count + 1})`,
+			values: batch.flatMap(({ row }) => columns.map((column) => row[column])),
+			count,
+		});
+	}
+	return checks;
 }
 function conditions(where: Row) {
 	return Object.keys(where)
@@ -1127,12 +1559,12 @@ function smallCommitment(row: unknown) {
 	bound(Buffer.byteLength(text), FILE_CHANGE_LIMITS.metadataBytes, "commitment row");
 	return text;
 }
-function fixSelection(selection: RevertSelectionResult) {
+function fixSelection(selection: RevertSelectionResult, snapshotRecovery = false) {
 	if (
 		selection.version !== 1 ||
 		!selection.selectionComplete ||
-		!selection.evidenceComplete ||
-		selection.issues.length
+		((!selection.evidenceComplete || selection.issues.length) &&
+			!(snapshotRecovery && isSnapshotSelectionComplete(selection)))
 	)
 		throw fail("MANIFEST_INVALID", "A complete original plan selection is required");
 	bound(

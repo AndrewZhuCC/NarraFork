@@ -4,8 +4,8 @@
  * run delivers to the destination the session registered — exactly once, through the
  * one run finalizer. There is no separate "resume" engine, manual-override runner, or
  * suspended-runner hand-off: a user hold is a run hold (`controlRun`), and input wakes
- * that same run. Only the model pass is scripted; database, run service, publication
- * and the session entries are real.
+ * that same run. The model pass and explicit restore-result faults are scripted;
+ * database, run service, publication and the session entries are real.
  *
  * Replaces the deleted resumeSubagent / subagent-manual-override contract tests. Each
  * behavioural guarantee those tests carried is kept below against the unified entries.
@@ -24,6 +24,7 @@ import {
 	narrators,
 	narratorToolCalls,
 	runtimePublicationOutbox,
+	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 
@@ -43,6 +44,8 @@ const { createAgentMessageDelivery } = await import("../agent-message-delivery")
 const session = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
+const scopedRevert = await import("../narrator-scoped-revert");
+const { emptyRevertResult, SnapshotRevertError } = await import("../snapshot-revert");
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
@@ -345,6 +348,98 @@ for (const shape of shapes) {
 			// Plain retry is not consent to roll back files.
 			expect(truncation.mock.calls.at(-1)?.[2]).toMatchObject({ skipRevert: true });
 			expect(readFileSync(path, "utf8")).toBe("kept file bytes\n");
+		});
+
+		test("a confirmed edit returns its history advisory and uses the registered runtime destination", async () => {
+			seed(shape);
+			db.insert(users)
+				.values({
+					id: "edit-actor",
+					username: "edit-actor",
+					passwordHash: "test",
+					role: "admin",
+					createdAt: NOW,
+				})
+				.run();
+			scriptPasses();
+			const revertPlan = {
+				planId: "confirmed-edit-plan",
+				planHash: "a".repeat(64),
+				action: "edit_and_regenerate" as const,
+			};
+			// Fault injection at the restore boundary only: file/plan execution is covered
+			// by narrator-scoped-revert.test; this suite keeps the unified run service real.
+			const revertResult = {
+				...emptyRevertResult(),
+				planId: revertPlan.planId,
+				historyCommitted: true,
+				historyStatus: "unavailable" as const,
+			};
+			const restore = spyOn(scopedRevert, "revertNarratorScopedForEdit").mockResolvedValue(
+				revertResult,
+			);
+			const start = spyOn(runModule, "startNarratorRun");
+			const result = await session.editAndRegenerate(
+				CHILD,
+				"task",
+				"confirmed edited task",
+				"en",
+				false,
+				{
+					userId: "edit-actor",
+					revertPlan,
+				},
+			);
+			expect(result).toEqual({ ok: true, revertResult });
+			expect(restore).toHaveBeenCalledWith(CHILD, "task", 0, {
+				principal: { userId: "edit-actor", isAdmin: true },
+				revertPlan,
+			});
+			await settle(() => passes.length === 1 && !getExecutionOwner(CHILD));
+			await settle(() => task()?.status === "completed");
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(start.mock.calls[0][0]).toMatchObject({ narratorId: CHILD, principal: "edit-actor" });
+			expect(passes[0]).toContain("confirmed edited task");
+			expect(task()).toMatchObject({ parentNarratorId: PARENT, toolUseId: ORIGIN });
+			expect(toolOutput()).toBe("FIRST RESULT");
+		});
+
+		test("a partial edit restore does not start a unified run or replace the user's input", async () => {
+			seed(shape);
+			db.insert(users)
+				.values({
+					id: "edit-actor",
+					username: "edit-actor",
+					passwordHash: "test",
+					role: "admin",
+					createdAt: NOW,
+				})
+				.run();
+			scriptPasses();
+			const start = spyOn(runModule, "startNarratorRun");
+			const revertResult = {
+				...emptyRevertResult(),
+				status: "partial" as const,
+				historyCommitted: false,
+			};
+			spyOn(scopedRevert, "revertNarratorScopedForEdit").mockResolvedValue(revertResult);
+			await expect(
+				session.editAndRegenerate(CHILD, "task", "must not save", "en", false, {
+					userId: "edit-actor",
+					revertPlan: {
+						planId: "confirmed-edit-plan",
+						planHash: "a".repeat(64),
+						action: "edit_and_regenerate",
+					},
+				}),
+			).rejects.toBeInstanceOf(SnapshotRevertError);
+			expect(start).not.toHaveBeenCalled();
+			expect(passes).toHaveLength(0);
+			expect(
+				db.select().from(narratorMessages).where(eq(narratorMessages.id, "task")).get()
+					?.contentText,
+			).toBe("the task");
+			expect(toolOutput()).toBe("FIRST RESULT");
 		});
 
 		test("an edit regenerates through the same session path and keeps the user's revert choice", async () => {

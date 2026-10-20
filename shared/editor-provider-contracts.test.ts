@@ -79,11 +79,13 @@ const typed = {
 	},
 	applyCreate: {
 		...golden.applyCreate,
+		coordination: member(["target-queue-v1"] as const, golden.applyCreate.coordination),
 		identity: identity(golden.applyCreate.identity),
 		metadataPolicy: member(EDITOR_METADATA_POLICIES, golden.applyCreate.metadataPolicy),
 	},
 	applyReplace: {
 		...golden.applyReplace,
+		coordination: member(["target-queue-v1"] as const, golden.applyReplace.coordination),
 		identity: identity(golden.applyReplace.identity),
 		metadataPolicy: member(EDITOR_METADATA_POLICIES, golden.applyReplace.metadataPolicy),
 	},

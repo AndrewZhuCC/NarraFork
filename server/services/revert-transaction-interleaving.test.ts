@@ -11,7 +11,6 @@ import { generateId } from "../lib/id";
 import {
 	access,
 	allowedFiles,
-	coordinatorState,
 	db,
 	execution,
 	history,
@@ -165,8 +164,10 @@ describe("deterministic actor interleaving model", () => {
 			expect((await execution(plan).whenSettled).status).toBe("committed");
 			expect(await fs.readFile(paths[0], "utf8")).toBe("external-after-commit");
 			expect(history()).toBe(finalHistory);
-			expect(coordinatorState.leases.size).toBe(0);
-			expect(coordinatorState.activities.size).toBe(0);
+			expect(
+				result.files.every((file) => file.status === "applied" || file.status === "unchanged"),
+			).toBe(true);
+			expect(result.historyCommitted).toBe(kind !== "revert");
 		}, 20_000);
 	}
 });

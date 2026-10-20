@@ -4,11 +4,14 @@ import {
 	fileChangeDiagnosticSuffix,
 } from "../../../services/file-change-diagnostics";
 import {
+	boundedFileHistory,
 	executeLocalFileChange,
 	FileNoDispatchEvidenceError,
+	fileWriteOutcomeMetadata,
 	withFileToolNoDispatch,
 } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
+import { withFileWrite } from "../../../services/file-write-queue";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { toolSpecPathError } from "../../spec-uri";
@@ -30,7 +33,6 @@ import {
 import { lineStatsMetadata, wholeFileLineStats } from "./file-diff-stats";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
-import { withWorkspaceWriteLock } from "./write-serialization";
 
 /**
  * A spec file's current content, or null when it does not exist yet.
@@ -164,6 +166,7 @@ export const writeTool: ToolDefinition = {
 			ctx.executionTarget?.lexicalPath ?? resolveBackendPath(backend, baseCwd, file_path);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
+		let remoteDispatched = false;
 		try {
 			flow.writing();
 			const recorded = await executeLocalFileChange({
@@ -199,81 +202,104 @@ export const writeTool: ToolDefinition = {
 				await trackFileChange(ctx, ioPath, "write", backend, null, { evidenceRecorded: true });
 				return recorded;
 			}
-			// The runtime explicitly declined without performing IO (remote/unbound only).
 			flow.declined();
-			// Legacy/remote compatibility only: no v2 evidence or exact remote capability.
-			// The whole read-modify-write window runs under the workspace write lock, so
-			// a concurrent narrator sharing this worktree cannot interleave between the
-			// baseline read and the write. It is milliseconds long, so holding it is free.
-			return await withWorkspaceWriteLock(backend, baseCwd, async () => {
-				// Read an existing file exactly once. The same complete content drives both
-				// the required snapshot and encoding preservation, avoiding TOCTOU drift.
-				const stat = await backend.statFile(ioPath);
-				if (stat && !stat.isFile)
-					throw new Error(`Write target is not a regular file: ${resolvedPath}`);
-				let existingContent: string | null = null;
-				let existingEncoding = "utf-8";
-				let existingIsBinary = false;
-				if (stat) {
-					const { bytes } = await readCompleteFileBytes(backend, ioPath, {
-						expectedResolvedPath: canonicalPath,
-					});
-					const decoded = decodeFileBytes(bytes);
-					existingContent = decoded.text;
-					existingEncoding = decoded.encoding;
-					existingIsBinary = looksBinary(bytes);
-				}
-				await ensureFileSnapshot(
-					ctx.narratorId,
-					backend.deviceId,
-					ioPath,
-					async () => ({
-						content: existingContent,
-						encoding: existingEncoding,
-						isBinary: existingIsBinary,
-					}),
-					"required",
-				);
+			const queuePath = canonicalPath ?? (await backend.resolvePathIdentity(ioPath)).canonicalPath;
+			return await withFileWrite(
+				{
+					deviceId: backend.deviceId,
+					pathFlavor: backend.pathFlavor as "posix" | "windows",
+					canonicalPath: queuePath,
+				},
+				async () => {
+					// Read an existing file exactly once. The same complete content drives both
+					// the required snapshot and encoding preservation, avoiding TOCTOU drift.
+					const stat = await backend.statFile(ioPath);
+					if (stat && !stat.isFile)
+						throw new Error(`Write target is not a regular file: ${resolvedPath}`);
+					let existingContent: string | null = null;
+					let existingEncoding = "utf-8";
+					let existingIsBinary = false;
+					if (stat) {
+						const { bytes } = await readCompleteFileBytes(backend, ioPath, {
+							expectedResolvedPath: queuePath,
+						});
+						const decoded = decodeFileBytes(bytes);
+						existingContent = decoded.text;
+						existingEncoding = decoded.encoding;
+						existingIsBinary = looksBinary(bytes);
+					}
+					const snapshot = await boundedFileHistory(() =>
+						ensureFileSnapshot(
+							ctx.narratorId,
+							backend.deviceId,
+							ioPath,
+							async () => ({
+								content: existingContent,
+								encoding: existingEncoding,
+								isBinary: existingIsBinary,
+							}),
+							"best-effort",
+						),
+					).catch(() => "failed" as const);
 
-				flow.writing();
-				await backend.mkdirp(backendDirname(backend, ioPath));
-				// A rewrite keeps the file's own line endings, the same way it keeps its
-				// encoding: a model writes LF, so overwriting a CRLF file with the raw
-				// string converted the whole file and made `git diff` show every line as
-				// changed. A file that did not exist keeps whatever the model wrote.
-				const lineEnding = detectLineEnding(existingContent ?? content);
-				const normalizedContent = normalizeLineEndings(content);
-				await backend.writeFileBytes(
-					resolvedPath,
-					encodeFileBytes(applyLineEnding(normalizedContent, lineEnding), existingEncoding),
-					{ expectedResolvedPath: canonicalPath },
+					flow.writing();
+					await backend.mkdirp(backendDirname(backend, ioPath));
+					// A rewrite keeps the file's own line endings, the same way it keeps its
+					// encoding: a model writes LF, so overwriting a CRLF file with the raw
+					// string converted the whole file and made `git diff` show every line as
+					// changed. A file that did not exist keeps whatever the model wrote.
+					const lineEnding = detectLineEnding(existingContent ?? content);
+					const normalizedContent = normalizeLineEndings(content);
+					ctx.signal.throwIfAborted();
+					await ctx.recheckAuthorization?.();
+					ctx.assertFinalExecutionPermission?.();
+					remoteDispatched = true;
+					await backend.writeFileBytes(
+						resolvedPath,
+						encodeFileBytes(applyLineEnding(normalizedContent, lineEnding), existingEncoding),
+						{ expectedResolvedPath: queuePath, signal: ctx.signal },
+					);
+					// `existingContent` is null exactly when the file did not exist, which is
+					// the distinction the client cannot make: a Write's input carries only the
+					// NEW content, so nothing downstream can tell a fresh file from a rewrite.
+					// A binary baseline is skipped — a line count over binary bytes is noise.
+					//
+					// Computed BEFORE the attribution call so ONE value feeds both the result
+					// metadata (the card header) and the persisted attribution row (the
+					// parent-facing aggregate). Two separate computations could disagree, and a
+					// header contradicting the summary is unresolvable for the reader.
+					// Both sides normalized, or a CRLF baseline against LF input reported every
+					// line as replaced — a one-line rewrite would have claimed the whole file.
+					const diffStats = existingIsBinary
+						? null
+						: wholeFileLineStats(
+								existingContent === null ? null : normalizeLineEndings(existingContent),
+								normalizedContent,
+							);
+					return {
+						output: `Wrote ${content.length} bytes to ${file_path}`,
+						title: file_path,
+						metadata: {
+							...lineStatsMetadata(diffStats),
+							diskOutcome: "applied",
+							historyStatus: snapshot === "failed" ? "unavailable" : "complete",
+							fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
+						},
+					};
+				},
+				{ signal: ctx.signal },
+			).then(async (result) => {
+				const { linesAdded, linesRemoved } = result.metadata ?? {};
+				await trackFileChange(
+					ctx,
+					ioPath,
+					"write",
+					backend,
+					typeof linesAdded === "number" && typeof linesRemoved === "number"
+						? { added: linesAdded, removed: linesRemoved }
+						: null,
 				);
-				// `existingContent` is null exactly when the file did not exist, which is
-				// the distinction the client cannot make: a Write's input carries only the
-				// NEW content, so nothing downstream can tell a fresh file from a rewrite.
-				// A binary baseline is skipped — a line count over binary bytes is noise.
-				//
-				// Computed BEFORE the attribution call so ONE value feeds both the result
-				// metadata (the card header) and the persisted attribution row (the
-				// parent-facing aggregate). Two separate computations could disagree, and a
-				// header contradicting the summary is unresolvable for the reader.
-				// Both sides normalized, or a CRLF baseline against LF input reported every
-				// line as replaced — a one-line rewrite would have claimed the whole file.
-				const diffStats = existingIsBinary
-					? null
-					: wholeFileLineStats(
-							existingContent === null ? null : normalizeLineEndings(existingContent),
-							normalizedContent,
-						);
-				await trackFileChange(ctx, ioPath, "write", backend, diffStats);
-				return {
-					output: `Wrote ${content.length} bytes to ${file_path}`,
-					title: file_path,
-					metadata: {
-						...lineStatsMetadata(diffStats),
-						fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
-					},
-				};
+				return result;
 			});
 		} catch (err) {
 			if (err instanceof FileNoDispatchEvidenceError) throw err;
@@ -281,7 +307,12 @@ export const writeTool: ToolDefinition = {
 			return {
 				output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
 				isError: true,
-				metadata: fileChangeDiagnosticMetadata(err),
+				metadata: {
+					diskOutcome: remoteDispatched ? "unknown" : "not_applied",
+					historyStatus: "unavailable",
+					...fileChangeDiagnosticMetadata(err),
+					...fileWriteOutcomeMetadata(err),
+				},
 			};
 		}
 	}),

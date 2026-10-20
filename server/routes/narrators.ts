@@ -25,8 +25,6 @@ import {
 	eq,
 	exists,
 	gt,
-	gte,
-	inArray,
 	isNotNull,
 	isNull,
 	lt,
@@ -204,7 +202,6 @@ import {
 	reorderBufferSchema,
 	restoreNarratorDraftSchema,
 	retryFailedCompactSchema,
-	revertFilesSchema,
 	revertScopeSchema,
 	rollbackToBlockSchema,
 	segmentCompactSchema,
@@ -274,13 +271,9 @@ import { captureFileReferences } from "../services/file-reference-service";
 import {
 	applyToolCall,
 	type DeviceFileIdentity,
-	type DeviceFileState,
-	deviceFileKey,
 	FileHistoryError,
-	getAffectedDeviceFilesStrict,
 	getToolCallFileIdentityStrict,
 	rebuildDeviceFileState,
-	rebuildDeviceFileStatesExcluding,
 } from "../services/file-state-rebuild";
 import {
 	getNarratorGitIdentityPick,
@@ -349,11 +342,7 @@ import {
 	requireSqliteLazyRefsBackfill,
 	resolveLazyLineage,
 } from "../services/narrator-refs-backfill";
-import {
-	previewNarratorScopedForToolUses,
-	previewNarratorScopedFromSeq,
-	revertNarratorScopedFromSeq,
-} from "../services/narrator-scoped-revert";
+import { previewNarratorScopedForToolUses } from "../services/narrator-scoped-revert";
 import {
 	handleBashCommand,
 	handleBlockAllSkillsCommand,
@@ -452,16 +441,11 @@ import { resolveSessionLocation } from "../services/session-interchange/location
 import { buildSessionDownload, writeSessionExport } from "../services/session-interchange/sinks";
 import { skillService } from "../services/skill-service";
 import {
-	buildImpreciseRevertWarnings,
 	DEFAULT_REVERT_SCOPE,
-	finalizeSnapshotRevert,
-	loadTreePreviewContents,
-	previewSeqTreeRevert,
 	type RevertResult,
 	type RevertScope,
-	type RevertWarning,
 	resolveNarratorCwd,
-	revertFromSeqTree,
+	SnapshotRevertError,
 	unavailableSnapshotRevert,
 } from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
@@ -616,6 +600,13 @@ export async function parseMessageRequest(
 }
 
 export const narratorRoutes = new Hono();
+narratorRoutes.onError((error, c) => {
+	if (error instanceof SnapshotRevertError) {
+		c.header("Cache-Control", "no-store");
+		return c.json(revertConflictBody(error.result), 409);
+	}
+	throw error;
+});
 
 /**
  * The narrator HTTP surface still depends on the SQLite-shaped narrator domain, session, ACL, and
@@ -814,6 +805,7 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 	// Mixed history/file handlers below check only after parsing skipRevert; their
 	// history-only branch (and retry) must never depend on file restoration support.
 	const scopedRevert =
+		subPath === "revert" ||
 		subPath === "revert-action-preview" ||
 		subPath === "revert-plans" ||
 		/^revert-plans\/[^/]+\/apply$/.test(subPath);
@@ -826,7 +818,7 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 	// Apply owns its exclusive admission through whenSettled; wrapping it in shared
 	// work would deadlock it. Preview remains a shared read/selection operation and
 	// must not interrupt an active narrator before confirmation.
-	if (need === "write" && !/^revert-plans\/[^/]+\/apply$/.test(subPath))
+	if (need === "write" && subPath !== "revert" && !/^revert-plans\/[^/]+\/apply$/.test(subPath))
 		return withNarratorWorkAdmission(id, next);
 	return next();
 });
@@ -2776,7 +2768,15 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const { blockIndex, skipRevert, scope } = rollbackToBlockSchema.parse(await c.req.json());
+	const { blockIndex, skipRevert, scope, revertPlan } = rollbackToBlockSchema.parse(
+		await c.req.json(),
+	);
+	if (skipRevert !== true && !revertPlan)
+		throw new AppError(
+			"Review a fresh rollback preview before restoring files",
+			409,
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
 	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
 
 	const narrator = await narratorService.getById(id);
@@ -2793,7 +2793,10 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	}
 
 	const result = await rollbackToBlock(id, messageId, blockIndex, {
+		revertPlan,
 		skipRevert: skipRevert === true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 		...(scope ? { scope } : {}),
 	});
 	return c.json(result);
@@ -2843,6 +2846,9 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	// Undefined => the legacy `rollback` field decides (see below), then default true.
 	let skipRevert: boolean | undefined;
 	let legacyRollback: boolean | undefined;
+	let revertPlan:
+		| import("../services/narrator-scoped-revert").ConfirmedScopedRevertPlan
+		| undefined;
 	let scope: RevertScope | undefined;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
@@ -2880,6 +2886,15 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		if (typeof rawRollback === "string") legacyRollback = rawRollback === "true";
 		const rawScope = formData.get("scope");
 		scope = revertScopeSchema.parse(typeof rawScope === "string" ? rawScope : undefined);
+		const rawPlan = formData.get("revertPlan");
+		if (rawPlan !== null) {
+			if (typeof rawPlan !== "string") throw new ValidationError("Invalid confirmed revert plan");
+			try {
+				revertPlan = editAndRegenerateJsonSchema.shape.revertPlan.parse(JSON.parse(rawPlan));
+			} catch {
+				throw new ValidationError("Invalid confirmed revert plan");
+			}
+		}
 		if (typeof formData.get("keepImageIds") === "string") {
 			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
 		}
@@ -2921,6 +2936,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		composerDocument = body.composerDocument;
 		skipRevert = body.skipRevert;
 		legacyRollback = body.rollback;
+		revertPlan = body.revertPlan;
 		scope = body.scope;
 		keepImageIds = body.keepImageIds;
 		keepTextFilePaths = body.keepTextFilePaths;
@@ -2931,6 +2947,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	// what the old UI offered and the server then ignored. Neither present => revert,
 	// preserving the behaviour every edit actually had.
 	const revertFiles = skipRevert !== undefined ? !skipRevert : (legacyRollback ?? true);
+	if (revertFiles && !revertPlan)
+		throw new AppError(
+			"Review a fresh edit preview before restoring files",
+			409,
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
 
 	const narrator = await narratorService.getById(id);
 	const userId = c.get("user").sub;
@@ -2969,12 +2991,14 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
 		userId,
 		revertFiles,
+		revertPlan,
 		...(scope ? { revertScope: scope } : {}),
 	});
 	// Editing acknowledges the rewrite; refreshed message bubbles arrive separately.
 	// Do not expose internal message/snapshot fields if the service result grows.
 	return c.json({
 		ok: result.ok,
+		...(result.revertResult ? { revertResult: result.revertResult } : {}),
 		...(result.warnings?.length ? { warnings: result.warnings } : {}),
 	});
 });
@@ -3960,6 +3984,8 @@ narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
 		skipRevert,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 		...(scope ? { scope } : {}),
 	});
 	return c.json({ ok: true, ...result });
@@ -3981,6 +4007,8 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
 		skipRevert,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 		...(scope ? { scope } : {}),
 	});
 	return c.json({ ok: true, ...result });
@@ -3998,6 +4026,8 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
 		skipRevert,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 		...(scope ? { scope } : {}),
 	});
 	return c.json({ ok: true, ...result });
@@ -5870,7 +5900,7 @@ function revertConflictBody(result: RevertResult) {
 	return {
 		error: "File operation could not be completed safely",
 		code: "SNAPSHOT_REVERT_FAILED",
-		failures: result.failures,
+		...result,
 	};
 }
 
@@ -5880,89 +5910,6 @@ function fileHistoryConflictBody(error: unknown) {
 		error: error instanceof Error ? error.message : String(error),
 		code: historyError?.code ?? "FILE_HISTORY_PREPARE_FAILED",
 	};
-}
-
-/**
- * Expose both scopes' availability without choosing a wider fallback. Legacy tree
- * differences are read-only inspection material, not permission to execute them.
- */
-async function buildRevertScopePreviews(narratorId: string, minSeq: number, withContents = false) {
-	const [narratorScope, treePreview] = await Promise.all([
-		previewNarratorScopedFromSeq(narratorId, minSeq, { withContents }),
-		previewSeqTreeRevert(narratorId, minSeq),
-	]);
-	// Always return the unavailable reasons. Dropping them here used to make the
-	// route advertise a legacy replay as though there were no protection gap.
-
-	const workspaceFiles = treePreview
-		? withContents
-			? (await loadTreePreviewContents(treePreview)).map(({ relPath: _relPath, ...file }) => file)
-			: treePreview.files.map(({ relPath: _relPath, ...file }) => file)
-		: [];
-	const narratorFiles = narratorScope.files.map(({ relPath: _relPath, ...file }) => file);
-
-	// A workspace rollback restores everything in the window, so anything another
-	// actor wrote there goes with it. This advice already existed but was only
-	// computed while performing the rollback — too late to inform the choice.
-	let workspaceWarnings: RevertWarning[] = [];
-	if (treePreview) {
-		const boundaryStartedAt = await resolveSeqBoundaryStartedAt(narratorId, minSeq);
-		if (boundaryStartedAt) {
-			workspaceWarnings = await buildImpreciseRevertWarnings(
-				treePreview.worktreePath,
-				narratorId,
-				boundaryStartedAt,
-			);
-		}
-	}
-
-	const scope: RevertScope = DEFAULT_REVERT_SCOPE;
-
-	return {
-		scope,
-		// Kept for older clients: the default scope's files.
-		affectedFiles: scope === "narrator" ? narratorFiles : workspaceFiles,
-		narratorScope: {
-			available: narratorScope.available,
-			...(narratorScope.reason ? { reason: narratorScope.reason } : {}),
-			files: narratorFiles,
-			conflicts: narratorScope.conflicts,
-			...(narratorScope.subagentWarning ? { subagentWarning: narratorScope.subagentWarning } : {}),
-		},
-		workspaceScope: {
-			available: false,
-			reason: treePreview ? "legacy_unverified" : "no_boundaries",
-			files: workspaceFiles,
-			warnings: workspaceWarnings,
-		},
-	};
-}
-
-/** When the earliest reversible change in a window started, for warning lookups. */
-async function resolveSeqBoundaryStartedAt(
-	narratorId: string,
-	minSeq: number,
-): Promise<string | null> {
-	const [earliest] = await db
-		.select({ createdAt: narratorToolCalls.createdAt })
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "success"),
-				gte(narratorMessageRefs.seq, minSeq),
-			),
-		)
-		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
-		.limit(1);
-	return earliest?.createdAt ?? null;
 }
 
 /** Durable preview only: these endpoints do not apply files or mutate history. */
@@ -6063,50 +6010,13 @@ narratorRoutes.get("/:id/revert-plans/:planId/files", async (c) => {
 	return revertPreviewJson(c, result);
 });
 
-/** Revert file changes from a specific message onwards */
-narratorRoutes.post("/:id/revert", async (c) => {
-	const narratorId = c.req.param("id");
-	const body = revertFilesSchema.parse(await c.req.json());
-
-	// Prevent revert while narrator is actively running
-	if (isNarratorActive(narratorId)) {
-		return c.json({ error: "Cannot revert while narrator is running" }, 409);
-	}
-
-	let targetSeq = 0;
-	if (body.messageId !== "__all__") {
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, body.messageId),
-			),
-			columns: { seq: true },
-		});
-		if (!targetRef) return c.json({ error: "Message not found" }, 404);
-		targetSeq = targetRef.seq;
-	}
-
-	if (isNarratorActive(narratorId)) {
-		return c.json({ error: "Narrator became active during revert" }, 409);
-	}
-	// Scope is a user decision, not a strategy fallback. In particular, missing
-	// narrator evidence cannot authorize a workspace restore or whole-file replay.
-	const scope = body.scope ?? DEFAULT_REVERT_SCOPE;
-	const result =
-		scope === "narrator"
-			? await revertNarratorScopedFromSeq(narratorId, targetSeq)
-			: ((await revertFromSeqTree(narratorId, targetSeq)) ??
-				unavailableSnapshotRevert("no_boundaries: no verified workspace snapshot is available."));
-	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
-	// No history mutation follows: the reverted files are the intended end state.
-	finalizeSnapshotRevert(result);
-	return c.json({
-		fileCount: result.fileCount,
-		files: result.files,
-		// Advisory: a workspace rollback also discards other actors' changes in the
-		// same window, so the caller is told to verify rather than assume.
-		...(result.warnings?.length ? { warnings: result.warnings } : {}),
-	});
+/** Retired immediate execution: file restores require a reviewed durable plan. */
+narratorRoutes.post("/:id/revert", async () => {
+	throw new AppError(
+		"Review a fresh action preview and submit its plan ID and hash before restoring files",
+		409,
+		"REVERT_CONFIRMATION_REQUIRED",
+	);
 });
 
 /** Unrevert requires the real pre-revert states in a durable revert journal. */
@@ -6220,155 +6130,53 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 			? blocks.length - 1
 			: normalizeRollbackBlockIndexForMessage(targetMsg.role, requestedBlockIndex, blocks.length);
 
-	// Collect tool_use IDs from blocks after the effective boundary in the target message
-	const truncatedToolUseIds: string[] = [];
-	for (let i = effectiveBlockIndex + 1; i < blocks.length; i++) {
-		const b = blocks[i];
-		if (b.type === "tool_use" && b.id) {
-			truncatedToolUseIds.push(b.id);
-		}
-	}
-
-	const deletedBlockCount = blocks.length - effectiveBlockIndex - 1;
-
-	// Count subsequent messages
-	const subsequentMsgCount = await db
-		.select({ cnt: sql<number>`count(*)` })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				gt(narratorMessageRefs.seq, targetRef.seq),
-			),
-		);
-	const deletedMessageCount = subsequentMsgCount[0]?.cnt ?? 0;
-
-	const subsequentFilter = and(
-		eq(narratorToolCalls.narratorId, narratorId),
-		eq(narratorToolCalls.status, "success"),
-		gt(narratorMessageRefs.seq, targetRef.seq),
+	const principal = narratorPrincipalOf(c);
+	const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(60_000)]);
+	const prepared = await prepareLocalRevertAction(
+		principal,
+		narratorId,
+		{
+			action: requestedBlockIndex === null ? "edit_and_regenerate" : "rollback_to_block",
+			messageId,
+			...(requestedBlockIndex === null ? {} : { blockIndex: effectiveBlockIndex }),
+			idempotencyKey: generateId(),
+		},
+		signal,
 	);
-	const subsequentJoin = and(
-		eq(narratorMessageRefs.narratorId, narratorId),
-		eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-	);
-	const truncatedFilter = and(
-		eq(narratorToolCalls.narratorId, narratorId),
-		eq(narratorToolCalls.status, "success"),
-		inArray(narratorToolCalls.toolUseId, truncatedToolUseIds),
-	);
-
-	// Both scopes are described so the dialog can show what each one would do.
-	// Every file list comes from the same comparison its rollback performs — deriving
-	// one from recorded Write/Edit inputs would omit files touched by Bash or
-	// external tools, and promise a scope the rollback does not honour.
-	const scopes = await buildRevertScopePreviews(narratorId, targetRef.seq);
-	if (scopes) {
-		// Count-only: loading the rows to call `.length` would pull every `input_json`,
-		// and Write calls carry whole file bodies.
-		const [subsequentCount] = await db
-			.select({ value: countFn() })
-			.from(narratorToolCalls)
-			.innerJoin(narratorMessageRefs, subsequentJoin)
-			.where(subsequentFilter);
-		let truncatedCount = 0;
-		if (truncatedToolUseIds.length > 0) {
-			const [counted] = await db
-				.select({ value: countFn() })
-				.from(narratorToolCalls)
-				.where(truncatedFilter);
-			truncatedCount = counted?.value ?? 0;
-		}
-		return c.json({
-			...scopes,
-			toolCallCount: (subsequentCount?.value ?? 0) + truncatedCount,
-			deletedBlockCount,
-			deletedMessageCount,
-		});
-	}
-
-	// Find tool calls from subsequent messages (seq > targetRef.seq). Only the replay
-	// path needs the recorded inputs, so these stay behind the tree-snapshot branch.
-	const subsequentToolCalls = await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			executionDeviceId: narratorToolCalls.executionDeviceId,
-			executionCwd: narratorToolCalls.executionCwd,
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: narratorToolCalls.resolvedFilePath,
-			canonicalFilePath: narratorToolCalls.canonicalFilePath,
-			runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			executionTargetsJson: narratorToolCalls.executionTargetsJson,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(narratorMessageRefs, subsequentJoin)
-		.where(subsequentFilter);
-
-	// Find tool calls from truncated blocks in the target message
-	const truncatedToolCalls =
-		truncatedToolUseIds.length > 0
-			? await db.query.narratorToolCalls.findMany({
-					where: truncatedFilter,
-					columns: {
-						toolUseId: true,
-						toolName: true,
-						inputJson: true,
-						executionDeviceId: true,
-						executionCwd: true,
-						executionPathFlavor: true,
-						resolvedFilePath: true,
-						canonicalFilePath: true,
-						runtimeGeneration: true,
-						executionTargetsJson: true,
-					},
-				})
-			: [];
-
-	const allToolCalls = [...truncatedToolCalls, ...subsequentToolCalls];
-
-	let affectedFiles: DeviceFileIdentity[];
-	try {
-		affectedFiles = getAffectedDeviceFilesStrict(
-			allToolCalls,
-			await resolveNarratorCwd(narratorId),
-		);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	if (affectedFiles.length === 0) {
-		return c.json({
-			affectedFiles: [],
-			toolCallCount: 0,
-			deletedBlockCount,
-			deletedMessageCount,
-		});
-	}
-
-	// Only compute willBeDeleted (skip expensive content rebuild for the modal)
-	let revertedStates: Map<string, DeviceFileState>;
-	try {
-		revertedStates = await rebuildDeviceFileStatesExcluding(
-			narratorId,
-			affectedFiles,
-			new Set(allToolCalls.map((tc) => tc.toolUseId)),
-		);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	const affectedFilePreviews = affectedFiles.map((identity) => ({
-		...identity,
-		willBeDeleted: revertedStates.get(deviceFileKey(identity))?.content === null,
+	const page = prepared.plan
+		? await listLocalRevertPlanFiles(principal, narratorId, prepared.plan.id, {
+				limit: 100,
+				signal,
+			})
+		: null;
+	const files = (page?.items ?? []).map((file) => ({
+		deviceId: file.identityJson.deviceId,
+		filePath: file.identityJson.displayPath,
+		willBeDeleted: file.desiredStateJson.kind === "absent",
 	}));
-
-	return c.json({
-		affectedFiles: affectedFilePreviews,
-		toolCallCount: allToolCalls.length,
-		deletedBlockCount,
-		deletedMessageCount,
+	const preview = {
+		available: prepared.plan?.coverageComplete === true,
+		plan: prepared.plan,
+		reason:
+			"unavailable" in prepared
+				? prepared.unavailable
+				: prepared.plan?.coverageComplete === false
+					? "incomplete_coverage"
+					: undefined,
+		files,
+		conflicts: [],
+		hasMore: page?.hasMore,
+		totalFileCount: prepared.plan?.expectedFileCount,
+		historySummary: prepared.historySummary,
+	};
+	return revertPreviewJson(c, {
+		scope: DEFAULT_REVERT_SCOPE,
+		affectedFiles: files,
+		narratorScope: { ...preview, files },
+		workspaceScope: { available: false, reason: "legacy_unverified", files: [], warnings: [] },
+		deletedBlockCount:
+			preview.historySummary?.deletedBlockCount ?? blocks.length - effectiveBlockIndex - 1,
+		deletedMessageCount: preview.historySummary?.deletedMessageCount ?? 0,
 	});
 });
 
@@ -6421,14 +6229,20 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 	const preview = await previewNarratorScopedForToolUses(
 		narratorId,
 		[{ messageId, toolUseId: block.id }],
-		{ withContents: true },
+		{ withContents: true, principal: narratorPrincipalOf(c), signal: c.req.raw.signal },
 	);
-	return c.json({
-		available: preview.available,
-		...(preview.reason ? { reason: preview.reason } : {}),
+	return revertPreviewJson(c, {
+		available: preview.available && preview.plan?.coverageComplete === true,
+		...(preview.reason
+			? { reason: preview.reason }
+			: preview.plan?.coverageComplete === false
+				? { reason: "incomplete_coverage" }
+				: {}),
 		files: preview.files.map(({ relPath: _relPath, ...file }) => file),
 		conflicts: preview.conflicts,
-		...(preview.subagentWarning ? { subagentWarning: preview.subagentWarning } : {}),
+		plan: preview.plan,
+		totalFileCount: preview.totalFileCount,
+		hasMore: preview.hasMore,
 	});
 });
 

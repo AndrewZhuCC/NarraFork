@@ -96,14 +96,16 @@ function operationMatches(row: ToolRow, operation: FileChangeOperationRecord): b
 	if (
 		row.executionIdentityVersion !== 1 ||
 		row.executionAttempt < 1 ||
-		operation.evidenceVersion !== FILE_CHANGE_EVIDENCE_VERSION ||
+		(operation.evidenceVersion !== 2 &&
+			operation.evidenceVersion !== FILE_CHANGE_EVIDENCE_VERSION) ||
 		operation.sourceKind !== "tool" ||
 		operation.sourceId !== originId ||
 		operation.toolCallId !== originId ||
 		operation.toolUseId !== row.toolUseId ||
 		operation.attempt !== row.executionAttempt ||
-		operation.executionBindingJson?.deviceId !== row.executionDeviceId ||
-		operation.executionBindingJson?.runtimeGeneration !== row.runtimeGeneration
+		(operation.evidenceVersion === 2 &&
+			(operation.executionBindingJson?.deviceId !== row.executionDeviceId ||
+				operation.executionBindingJson?.runtimeGeneration !== row.runtimeGeneration))
 	)
 		return false;
 	// COW retains the immutable original PK even after the original row is deleted.

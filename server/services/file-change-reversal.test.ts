@@ -181,6 +181,28 @@ async function chain() {
 }
 
 describe("raw per-file reverse deltas", () => {
+	test("live current bytes can be a verified merge input without a stored current object", async () => {
+		const before = await regular(text());
+		const after = await regular(text("actor-a"));
+		const raw = Buffer.from(text("actor-a", "human"));
+		const current = { kind: "regular" as const, mode: 0o644, blob: refFor(raw) };
+		await expect(store.readBytes(current.blob)).rejects.toThrow();
+		const core = calculator({
+			readBlob: (ref, options) =>
+				ref.digest === current.blob.digest ? Promise.resolve(raw) : store.readBytes(ref, options),
+		});
+		const result = success(
+			await core.calculate({ identity, current, effects: [effect(before, after)] }),
+		);
+		expect(await desiredBytes(result)).toEqual(Buffer.from(text("base-a", "human")));
+		expect(result.evidenceBytes).toBe(
+			before.blob.sizeBytes +
+				after.blob.sizeBytes +
+				(result.desired.kind === "regular" ? result.desired.blob.sizeBytes : 0),
+		);
+		await expect(store.readBytes(current.blob)).rejects.toThrow();
+		expect(publishes).toBe(1);
+	});
 	test("A -> human different hunk -> B: undo B, then A preserves human bytes", async () => {
 		const fixture = await chain();
 		const core = calculator();
@@ -284,7 +306,7 @@ describe("explicit historical snapshot recovery", () => {
 		expect(result.expected).toEqual(current);
 		expect(result.desired).toEqual(before);
 		expect(result.steps.map(({ scopeRevision, method }) => [scopeRevision, method])).toEqual([
-			[40, "no_change"],
+			[40, "restore_snapshot"],
 			[30, "restore_snapshot"],
 			[10, "restore_snapshot"],
 		]);
@@ -327,7 +349,7 @@ describe("explicit historical snapshot recovery", () => {
 		expect(publishes).toBe(0);
 	});
 
-	test("snapshot respects absent baseline; no-change-only selection preserves current", async () => {
+	test("explicit snapshots restore the saved version including absence and prior no-ops", async () => {
 		const after = await regular("created\n");
 		const current = await regular("human changed created file\n");
 		const changed = effect(absent, after, 10);
@@ -351,10 +373,10 @@ describe("explicit historical snapshot recovery", () => {
 					recoveryMode: "snapshot",
 				}),
 			).desired,
-		).toEqual(current);
+		).toEqual(after);
 	});
 
-	test("snapshot still rejects missing/corrupt blobs, unmeasured effects and identity changes", async () => {
+	test("snapshot validates saved bytes and target while ignoring old execution confidence", async () => {
 		const before = await regular("original\n");
 		const after = await regular("selected\n");
 		const current = await regular("conflicting\n");
@@ -375,11 +397,11 @@ describe("explicit historical snapshot recovery", () => {
 				...input,
 				effects: [{ ...selected, executionConfirmed: false }],
 			}),
-		).toMatchObject({ ok: false, reason: "effect_unverified" });
+		).toMatchObject({ ok: true, desired: before });
 		expect(
 			await calculator().calculate({
 				...input,
-				effects: [{ ...selected, identity: { ...identity, workspaceInstanceId: "other" } }],
+				effects: [{ ...selected, identity: { ...identity, deviceId: "other" } }],
 			}),
 		).toMatchObject({ ok: false, reason: "identity_mismatch" });
 	});
@@ -479,10 +501,7 @@ describe("complete evidence before all shortcuts", () => {
 	});
 
 	test.each([
-		"sourceInstanceId",
 		"deviceId",
-		"workspaceInstanceId",
-		"scopeId",
 		"objectRole",
 		"canonicalPath",
 	] as const)("does not cross %s", async (field) => {
@@ -1122,4 +1141,123 @@ describe("bounded admission and cancellation", () => {
 			expect(result).toEqual({ ok: false, reason: "cancelled" });
 		expect(active).toBe(0);
 	});
+});
+
+describe("v3 recorded file results", () => {
+	test("restores journal-ordered results without workspace revisions or receipts", async () => {
+		const before = await regular("before\n");
+		const middle = await regular("middle\n");
+		const after = await regular("after\n");
+		const first: FileChangeReversalEffect = {
+			...effect(before, middle),
+			scopeRevision: null,
+			journalSeq: 10,
+			diskOutcome: "applied",
+			executionReceipt: null,
+		};
+		const last: FileChangeReversalEffect = {
+			...effect(middle, after),
+			scopeRevision: null,
+			journalSeq: 11,
+			diskOutcome: "applied",
+			executionReceipt: null,
+		};
+		const result = await calculator().calculate({
+			identity,
+			current: after,
+			effects: [first, last],
+		});
+		expect(await desiredBytes(result)).toEqual(Buffer.from("before\n"));
+		expect(success(result).steps.map((step) => step.journalSeq)).toEqual([11, 10]);
+		expect(success(result).steps.every((step) => step.scopeRevision === null)).toBe(true);
+	});
+
+	test("reads sequenced legacy history together with new results", async () => {
+		const before = await regular("first\n");
+		const middle = await regular("second\n");
+		const after = await regular("third\n");
+		const legacy = {
+			...effect(before, middle, 500),
+			identity: { ...identity, workspaceInstanceId: "legacy-workspace", scopeId: "legacy-scope" },
+			journalSeq: 20,
+		};
+		const current: FileChangeReversalEffect = {
+			...effect(middle, after),
+			journalSeq: 21,
+			scopeRevision: null,
+			diskOutcome: "applied",
+			executionReceipt: null,
+		};
+		const result = await calculator().calculate({
+			identity,
+			current: after,
+			effects: [current, legacy],
+		});
+		expect(await desiredBytes(result)).toEqual(Buffer.from("first\n"));
+	});
+
+	test("unknown IO remains an unavailable history item", async () => {
+		const before = await regular("old\n");
+		const after = await regular("new\n");
+		const entry: FileChangeReversalEffect = {
+			...effect(before, after),
+			scopeRevision: null,
+			journalSeq: 30,
+			diskOutcome: "unknown",
+			executionConfirmed: false,
+			executionReceipt: null,
+		};
+		await expect(
+			calculator().calculate({ identity, current: after, effects: [entry] }),
+		).resolves.toMatchObject({ ok: false, reason: "effect_unverified" });
+	});
+
+	test("never invents sequence for an unsequenced new result", async () => {
+		const before = await regular("old\n");
+		const after = await regular("new\n");
+		const entry: FileChangeReversalEffect = {
+			...effect(before, after),
+			scopeRevision: null,
+			diskOutcome: "applied",
+			executionReceipt: null,
+		};
+		await expect(
+			calculator().calculate({ identity, current: after, effects: [entry] }),
+		).resolves.toMatchObject({ ok: false, reason: "order_unverified" });
+	});
+});
+
+test("explicit snapshot restores known before after unknown IO without loading unused after", async () => {
+	const before = await regular("saved version\n");
+	const current = await regular("current version\n");
+	const unreadableAfter: FileChangeState = {
+		kind: "regular",
+		mode: 0o644,
+		blob: refFor(Buffer.from("missing after\n")),
+	};
+	const entry: FileChangeReversalEffect = {
+		...effect(before, unreadableAfter),
+		journalSeq: 42,
+		scopeRevision: null,
+		diskOutcome: "unknown",
+		outcome: "unknown",
+		executionConfirmed: false,
+		executionReceipt: null,
+		observedAfter: unknown,
+	};
+	const result = await calculator().calculate({
+		identity,
+		current,
+		effects: [entry],
+		recoveryMode: "snapshot",
+	});
+	expect(await desiredBytes(result)).toEqual(Buffer.from("saved version\n"));
+	await expect(
+		calculator().calculate({
+			identity,
+			current,
+			effects: [{ ...entry, before: unknown }],
+			recoveryMode: "snapshot",
+		}),
+	).resolves.toMatchObject({ ok: false, reason: "state_unknown" });
 });

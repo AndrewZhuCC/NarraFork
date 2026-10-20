@@ -3,7 +3,10 @@
  * attribution. Only actual, settled file effects may authorize an automatic undo.
  * No filesystem bytes, host-only storage paths, or provider payloads belong here.
  */
-export const FILE_CHANGE_EVIDENCE_VERSION = 2;
+export const FILE_CHANGE_EVIDENCE_VERSION = 3;
+
+export type FileWriteOutcome = "applied" | "not_applied" | "conflict" | "unknown";
+export type FileHistoryStatus = "complete" | "unavailable";
 
 export interface FileHistoryTarget {
 	deviceId: string;
@@ -65,7 +68,7 @@ export interface FileChangeIdentity {
 	displayPath: string;
 }
 
-/** A connection generation guards execution but does not split persistent identity. */
+/** Legacy v2 execution metadata, retained for reading previously stored receipts. */
 export interface FileChangeExecutionBinding {
 	deviceId: string;
 	runtimeEpoch: string;
@@ -95,6 +98,7 @@ export interface FileChangeBlobRef {
 export type FileChangeUnavailableReason =
 	| "legacy_unverified"
 	| "capture_failed"
+	| "history_unavailable"
 	| "capture_incomplete"
 	| "capture_concurrent"
 	| "missing_before"
@@ -229,6 +233,8 @@ export interface FileChangeEffect {
 	/** Read/receipt result; may include an intervening external write. */
 	observedAfter: FileChangeState;
 	outcome: FileChangeEffectOutcome;
+	/** Actual IO result in v3. Historical effects retain their original receipt. */
+	diskOutcome?: FileWriteOutcome | null;
 	settlement: FileChangeSettlement;
 	attribution: FileChangeAttributionGrade;
 	/** A matching current hash is not a substitute for this execution receipt. */
@@ -246,11 +252,31 @@ export type FileChangeRevertStatus =
 	| "applying"
 	| "files_verified"
 	| "committed"
+	| "partial"
+	| "failed"
 	| "compensating"
 	| "compensated"
 	| "recovery_required"
 	| "cancelled"
 	| "expired";
+
+export interface FileChangeRevertFileResult {
+	filePath: string;
+	deviceId: string;
+	status: "applied" | "unchanged" | "conflict" | "failed" | "unknown" | "not_attempted";
+	reason?: string;
+}
+
+export interface FileChangeRevertApplyResponse {
+	planId: string;
+	status: "committed" | "partial" | "failed" | "cancelled" | "executing";
+	journalStatus: FileChangeRevertStatus;
+	settling: boolean;
+	reason: string | null;
+	files: FileChangeRevertFileResult[];
+	historyStatus: FileHistoryStatus;
+	historyCommitted: boolean;
+}
 
 export type FileChangeRevertSelector =
 	| { kind: "all" }
@@ -259,7 +285,11 @@ export type FileChangeRevertSelector =
 	| { kind: "tool_calls"; toolCallIds: string[] }
 	| { kind: "after_block"; messageId: string; keepThroughBlockIndex: number };
 
-export type FileChangeRevertAction = "revert_files" | "rollback_to_block" | "delete_tool_block";
+export type FileChangeRevertAction =
+	| "revert_files"
+	| "rollback_to_block"
+	| "delete_tool_block"
+	| "edit_and_regenerate";
 
 /** Bind a UI consent action to its immutable journal program, not an apply-time selector. */
 export function fileChangeRevertActionMatches(
@@ -269,7 +299,7 @@ export function fileChangeRevertActionMatches(
 ): boolean {
 	if (action === "revert_files")
 		return kind === "revert" && (selector.kind === "all" || selector.kind === "from_seq");
-	if (action === "rollback_to_block")
+	if (action === "rollback_to_block" || action === "edit_and_regenerate")
 		return kind === "rollback_to_block" && selector.kind === "after_block";
 	return (
 		action === "delete_tool_block" &&
@@ -323,17 +353,16 @@ function blobRefsEqual(left: FileChangeBlobRef, right: FileChangeBlobRef): boole
 	);
 }
 
-/**
- * A positive, bound acknowledgement that THIS mutation never wrote. It proves
- * neither that the workspace stayed unchanged nor that the desired state exists.
- * In particular, a missing receipt or matching current bytes is not this proof.
- */
 export function hasConfirmedNoFileChange(effect: FileChangeEffect): boolean {
+	if (
+		effect.settlement !== "settled" ||
+		effect.outcome !== "no_change" ||
+		!effect.executionConfirmed
+	)
+		return false;
+	if (effect.diskOutcome != null) return effect.diskOutcome === "not_applied";
 	const receipt = effect.executionReceipt;
 	return (
-		effect.settlement === "settled" &&
-		effect.outcome === "no_change" &&
-		effect.executionConfirmed === true &&
 		receipt?.confirmed === true &&
 		receipt.outcome === "not_applied" &&
 		receipt.mutationId === effect.mutationId &&
@@ -342,22 +371,25 @@ export function hasConfirmedNoFileChange(effect: FileChangeEffect): boolean {
 	);
 }
 
-/** Necessary evidence prerequisites, not permission or a replacement for current-state checks. */
 export function hasSettledMeasuredFileEffect(effect: FileChangeEffect): boolean {
+	if (
+		effect.settlement !== "settled" ||
+		!effect.executionConfirmed ||
+		effect.attribution !== "measured" ||
+		(effect.outcome !== "changed" && effect.outcome !== "no_change") ||
+		!isKnownFileChangeState(effect.before) ||
+		!fileChangeStatesEqual(effect.intendedAfter, effect.observedAfter) ||
+		(effect.outcome === "no_change") !== fileChangeStatesEqual(effect.before, effect.observedAfter)
+	)
+		return false;
+	if (effect.diskOutcome != null) return effect.diskOutcome === "applied";
 	const receipt = effect.executionReceipt;
 	return (
-		effect.settlement === "settled" &&
-		effect.executionConfirmed === true &&
 		receipt?.confirmed === true &&
 		receipt.outcome === "applied" &&
 		receipt.mutationId === effect.mutationId &&
 		receipt.requestDigest === effect.requestDigest &&
 		receipt.executionBinding.deviceId === effect.identity.deviceId &&
-		fileChangeStatesEqual(receipt.observedAfter, effect.observedAfter) &&
-		effect.attribution === "measured" &&
-		(effect.outcome === "changed" || effect.outcome === "no_change") &&
-		isKnownFileChangeState(effect.before) &&
-		fileChangeStatesEqual(effect.intendedAfter, effect.observedAfter) &&
-		(effect.outcome === "no_change") === fileChangeStatesEqual(effect.before, effect.observedAfter)
+		fileChangeStatesEqual(receipt.observedAfter, effect.observedAfter)
 	);
 }

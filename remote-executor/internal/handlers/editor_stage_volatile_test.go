@@ -103,7 +103,7 @@ func TestEditorFailedSealCannotDispatch(t *testing.T) {
 		t.Fatal("failed body sync was acknowledged")
 	}
 	before := editorDigest([]byte("before"))
-	request := EditorApplyRequest{Namespace: "owner", ResourceKey: "resource", OperationID: "failed-seal", RequestDigest: editorDigest([]byte("failed-seal")), StageID: stage.StageID, ExpectedRawHash: &before, Identity: f.identity, MetadataPolicy: "preserve"}
+	request := EditorApplyRequest{Coordination: EditorTargetQueueCoordination, Namespace: "owner", ResourceKey: "resource", OperationID: "failed-seal", RequestDigest: editorDigest([]byte("failed-seal")), StageID: stage.StageID, ExpectedRawHash: &before, Identity: f.identity, MetadataPolicy: "preserve"}
 	if _, err := f.h.EditorDispatch(context.Background(), "editor.apply", editorParams(t, request)); err == nil {
 		t.Fatal("unflushed stage was dispatched")
 	}
@@ -136,7 +136,7 @@ func TestEditorVolatileStagesCannotCrossEngineIncarnation(t *testing.T) {
 				t.Fatal("stale stage was restored", err)
 			}
 			before := editorDigest([]byte("before"))
-			apply := EditorApplyRequest{Namespace: "owner", ResourceKey: "resource", OperationID: "not-dispatched", RequestDigest: editorDigest([]byte("not-dispatched")), StageID: stage.StageID, ExpectedRawHash: &before, Identity: f.identity, MetadataPolicy: "preserve"}
+			apply := EditorApplyRequest{Coordination: EditorTargetQueueCoordination, Namespace: "owner", ResourceKey: "resource", OperationID: "not-dispatched", RequestDigest: editorDigest([]byte("not-dispatched")), StageID: stage.StageID, ExpectedRawHash: &before, Identity: f.identity, MetadataPolicy: "preserve"}
 			if _, err := f.h.EditorDispatch(context.Background(), "editor.apply", editorParams(t, apply)); err == nil {
 				t.Fatal("old engine stage was applied")
 			}
@@ -293,8 +293,9 @@ func TestEditorSharedRootKeepsForeignLiveStage(t *testing.T) {
 	f := newEditorFixture(t, nil)
 	stage := volatileOpen(t, f, 6)
 	volatileAppend(t, f, stage.StageID, 0, 0, []byte("abc"))
+	// A retired legacy fence carries no authority, even beside a foreign live stage.
 	ceiling := filepath.Join(f.state, editorKey("owner", "retired-root")+".fence.json")
-	if err := f.e.save(ceiling, editorFence{Version: 1, Token: 4, Namespace: "owner"}); err != nil {
+	if err := os.WriteFile(ceiling, []byte(`{"version":1,"token":4,"namespace":"owner"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	h := New(NewPathGuard([]string{f.root}), 128*1024)
@@ -310,8 +311,8 @@ func TestEditorSharedRootKeepsForeignLiveStage(t *testing.T) {
 	if _, err = os.Stat(f.e.bodyPath(stage.StageID)); err != nil {
 		t.Fatal("another engine discarded a live body", err)
 	}
-	if _, err = os.Stat(ceiling); err != nil {
-		t.Fatal("another engine dropped a live stage's fence ceiling", err)
+	if _, err = os.Stat(ceiling); !os.IsNotExist(err) {
+		t.Fatal("retired fence survived as an admission ceiling", err)
 	}
 	volatileAppend(t, f, stage.StageID, 1, 3, []byte("def"))
 	f.call(t, "editor.stage.seal", EditorStageSeal{Namespace: "owner", ResourceKey: "resource", StageID: stage.StageID, TotalBytes: 6, RawDigest: editorDigest([]byte("abcdef"))})

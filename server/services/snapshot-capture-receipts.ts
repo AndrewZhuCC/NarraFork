@@ -4,7 +4,7 @@ import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { FILE_CHANGE_LIMITS, type FileChangeUnavailableReason } from "@shared/file-change-protocol";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { fileChangeScopes, snapshotCaptures } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -143,44 +143,38 @@ export class SnapshotCaptureReceiptService {
 		if (Buffer.byteLength(root) > MAX_PATH_BYTES) throw new Error("target_unverified");
 		signal.throwIfAborted();
 		const rootObject = await localDirectoryIdentity(root);
-		signal.throwIfAborted();
 		const source = await readExistingSource(this.options.privateRoot, signal);
-		// Exactly the existing local runtime's length-prefixed incarnation key.
-		// Never select an old/remote/imported scope merely because its path matches.
-		const hash = createHash("sha256");
-		for (const text of [source.id, root, rootObject])
-			hash.update(`${Buffer.byteLength(text)}:`).update(text);
-		const workspaceInstanceId = hash.digest("hex");
+		const keys = [
+			[source.id, root],
+			[source.id, root, rootObject],
+		].map((parts) => {
+			const hash = createHash("sha256");
+			for (const text of parts) hash.update(`${Buffer.byteLength(text)}:`).update(text);
+			return hash.digest("hex");
+		});
 		signal.throwIfAborted();
 		this.assertConnection();
 		const row = this.options.db
 			.select({
 				id: sql<string>`substr(${fileChangeScopes.id}, 1, 257)`,
 				root: sql<string>`substr(${fileChangeScopes.canonicalRoot}, 1, 8193)`,
-				object: sql<string | null>`substr(${fileChangeScopes.rootIdentityJson}, 1, 1025)`,
-				status: fileChangeScopes.status,
 				flavor: fileChangeScopes.pathFlavor,
+				workspaceInstanceId: fileChangeScopes.workspaceInstanceId,
 			})
 			.from(fileChangeScopes)
 			.where(
 				and(
 					eq(fileChangeScopes.sourceInstanceId, source.id),
 					eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
-					eq(fileChangeScopes.workspaceInstanceId, workspaceInstanceId),
+					inArray(fileChangeScopes.workspaceInstanceId, keys),
 				),
+			)
+			.orderBy(
+				sql`CASE WHEN ${fileChangeScopes.workspaceInstanceId} = ${keys[0]} THEN 0 ELSE 1 END`,
 			)
 			.limit(1)
 			.get();
-		if (
-			!row ||
-			row.id.length > 256 ||
-			row.root !== root ||
-			row.status !== "active" ||
-			row.flavor !== PATH_FLAVOR ||
-			!row.object ||
-			row.object.length > 1024 ||
-			JSON.parse(row.object).object !== rootObject
-		)
+		if (!row || row.id.length > 256 || row.root !== root || row.flavor !== PATH_FLAVOR)
 			throw new Error("target_unverified");
 		signal.throwIfAborted();
 		return {
@@ -190,7 +184,7 @@ export class SnapshotCaptureReceiptService {
 			rootObject,
 			source: source.id,
 			sourceObject: source.object,
-			workspaceInstanceId,
+			workspaceInstanceId: row.workspaceInstanceId,
 		};
 	}
 

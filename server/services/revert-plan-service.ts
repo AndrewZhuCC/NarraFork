@@ -7,9 +7,9 @@ import {
 	type FileChangeBlobRef,
 	type FileChangeIdentity,
 	type FileChangeState,
-	type KnownFileChangeState,
+	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { alias } from "drizzle-orm/sqlite-core";
 import {
@@ -32,6 +32,20 @@ type PlanDatabase = Executor & {
 };
 type PlanRecord = typeof revertOperations.$inferSelect;
 type FileRecord = typeof revertOperationFiles.$inferSelect;
+// Keep this portable list aligned with the schema; PG's generated text column has no enumValues.
+const fileStatuses: FileRecord["status"][] = [
+	"prepared",
+	"applying",
+	"applied",
+	"verified",
+	"unchanged",
+	"conflict",
+	"failed",
+	"not_attempted",
+	"compensating",
+	"compensated",
+	"unknown",
+];
 
 /** The trusted caller authorizes this exact context before EVERY call; this is not an ACL. */
 export interface RevertPlanOwner {
@@ -66,7 +80,7 @@ export interface RevertPlanManifestProof {
 	source: "trusted_published_planner_v1";
 	headerDigest: string;
 	orderedFilesDigest: string;
-	/** Sum of every expected + desired raw ref, conservatively counting repeats. */
+	/** Sum of required desired raw refs, conservatively counting repeats; expected is metadata. */
 	fileEvidenceBytes: number;
 	computation: "complete" | "partial";
 	selectorCoverage: "complete" | "partial";
@@ -163,7 +177,8 @@ export class RevertPlanError extends AppError {
  * original refs INCLUDING their sizes. Finalization recomputes the full ordered-list digest.
  *
  * Catalog ready is meaningful only after trusted IO has verified/published those bytes.
- * SQL FKs pin selector, plan, history and raw expected/desired objects; TTL, cancellation,
+ * SQL FKs pin selector, plan, history and raw desired objects; expected is only a fingerprint.
+ * Legacy before pins remain readable. TTL, cancellation,
  * and failures NEVER remove pins. An executor must separately reauthorize/revalidate TTL,
  * history, coordination fences, current files and physical objects. There is deliberately
  * no execution-admission API here, including for prepared plans.
@@ -229,7 +244,7 @@ export class RevertPlanService {
 			.from(fileChangeStorageBudgets)
 			.where(eq(fileChangeStorageBudgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
 			.get();
-		if (budget?.status !== "ready" || budget.namespaceKey !== this.namespaceKey)
+		if (!budget || budget.namespaceKey !== this.namespaceKey)
 			throw fail("CATALOG_UNVERIFIED", "The physical blob namespace must be reconciled and ready");
 	}
 
@@ -353,31 +368,6 @@ export class RevertPlanService {
 		const original = requireOwner(this.database, context, planId);
 		assertPlanned(original);
 		this.assertFresh(original);
-		const refs = this.refs(this.database, original);
-		let bytes = refBytes(refs);
-		let count = 0;
-		const sequences = new Map<number, string>();
-		let cursor: RevertPlanFileCursor | undefined;
-		for (;;) {
-			options.signal?.throwIfAborted();
-			this.assertRoot();
-			const page = selectFiles(this.database, planId, cursor, REVERT_PLAN_BATCH_ITEMS + 1);
-			for (const row of page.slice(0, REVERT_PLAN_BATCH_ITEMS)) {
-				metadata(row);
-				if (sequences.has(row.sequence))
-					throw fail("DUPLICATE_FILE", "Stored sequence values repeat");
-				sequences.set(row.sequence, row.fileKey);
-				count++;
-				integer(count, "appended files", 0, original.fileCount);
-				bytes +=
-					stateBytes(normalizeState(row.expectedStateJson)) +
-					stateBytes(normalizeState(row.desiredStateJson));
-				evidenceBudget(bytes);
-			}
-			if (page.length <= REVERT_PLAN_BATCH_ITEMS) break;
-			cursor = fileCursor(page[REVERT_PLAN_BATCH_ITEMS - 1]);
-			await yieldToEventLoop();
-		}
 		options.signal?.throwIfAborted();
 		return this.transaction((tx) => {
 			const operation = requireOwner(tx, context, planId);
@@ -386,24 +376,50 @@ export class RevertPlanService {
 			this.assertFresh(operation);
 			this.refs(tx, operation);
 			assertParent(tx, operation);
+			// Only inspect keys/positions touched by this batch. Finalize performs the single
+			// full count, budget and ordered-digest pass; no persistent counters are needed.
+			const matches = tx
+				.select()
+				.from(revertOperationFiles)
+				.where(
+					or(
+						and(
+							eq(revertOperationFiles.revertOperationId, planId),
+							inArray(
+								revertOperationFiles.fileKey,
+								files.map((file) => file.fileKey),
+							),
+						),
+						and(
+							eq(revertOperationFiles.revertOperationId, planId),
+							// Supply the middle column of idx_revert_file_pending, including invalid
+							// preparation states so they cannot steal a position unnoticed.
+							inArray(revertOperationFiles.status, fileStatuses),
+							inArray(
+								revertOperationFiles.sequence,
+								files.map((file) => file.sequence),
+							),
+						),
+					),
+				)
+				.limit(2 * REVERT_PLAN_BATCH_ITEMS + 1)
+				.all();
+			const existingFiles = new Map(matches.map((row) => [row.fileKey, row]));
+			const sequences = new Map<number, string>();
+			for (const row of matches) {
+				if (sequences.has(row.sequence))
+					throw fail("DUPLICATE_FILE", "Stored sequence values repeat");
+				sequences.set(row.sequence, row.fileKey);
+			}
 			const results: Pick<FileRecord, "id" | "fileKey" | "sequence">[] = [];
 			let changed = false;
 			for (const file of files) {
 				integer(file.sequence, "sequence", 0, operation.fileCount - 1);
 				assertScope(tx, file.identity);
-				for (const ref of [stateRef(file.expected), stateRef(file.desired)])
-					if (ref) requireReadyRef(tx, ref);
+				const desiredRef = requiredDesiredRef(file);
+				if (desiredRef) requireReadyRef(tx, desiredRef);
 				const values = fileValues(operation, file);
-				const existing = tx
-					.select()
-					.from(revertOperationFiles)
-					.where(
-						and(
-							eq(revertOperationFiles.revertOperationId, planId),
-							eq(revertOperationFiles.fileKey, file.fileKey),
-						),
-					)
-					.get();
+				const existing = existingFiles.get(file.fileKey);
 				if (existing) {
 					assertFileValues(existing, values);
 					results.push({ id: existing.id, fileKey: existing.fileKey, sequence: existing.sequence });
@@ -411,12 +427,11 @@ export class RevertPlanService {
 				}
 				if (sequences.has(file.sequence))
 					throw fail("DUPLICATE_FILE", "Another file owns this manifest position");
-				integer(++count, "appended files", 0, operation.fileCount);
-				bytes += stateBytes(file.expected) + stateBytes(file.desired);
-				evidenceBudget(bytes);
 				sequences.set(file.sequence, file.fileKey);
 				const row = {
 					...values,
+					// Reuse already-admitted bytes only; never publish or reserve current here.
+					beforeBlobDigest: optionalBeforePin(tx, file.expected),
 					id: generateId(),
 					observedAfterStateJson: null,
 					observedAfterBlobDigest: null,
@@ -457,7 +472,7 @@ export class RevertPlanService {
 		if (
 			(original.status !== "planned" && original.status !== "prepared") ||
 			original.appliedFileCount !== 0 ||
-			original.coverageComplete !== (original.status === "prepared")
+			(original.status === "planned" && original.coverageComplete)
 		)
 			throw fail("INVALID_TRANSITION", "Only an unattempted plan can be prepared");
 		const entries = new Map<number, string>();
@@ -482,13 +497,13 @@ export class RevertPlanService {
 					integer(file.sequence, "sequence", 0, operation.fileCount - 1);
 					assertFileValues(row, fileValues(operation, file));
 					assertScope(tx, file.identity);
-					for (const ref of [stateRef(file.expected), stateRef(file.desired)])
-						if (ref) requireReadyRef(tx, ref);
+					const desiredRef = requiredDesiredRef(file);
+					if (desiredRef) requireReadyRef(tx, desiredRef);
 					if (entries.has(file.sequence))
 						throw fail("DUPLICATE_FILE", "Stored manifest positions repeat");
 					entries.set(file.sequence, digest(file));
 					integer(entries.size, "verified files", 0, operation.fileCount);
-					fileBytes += stateBytes(file.expected) + stateBytes(file.desired);
+					fileBytes += requiredDesiredRef(file)?.sizeBytes ?? 0;
 					evidenceBudget(fileBytes);
 				}
 				return rows;
@@ -516,15 +531,17 @@ export class RevertPlanService {
 			this.assertProof(tx, operation, proof);
 			assertParent(tx, operation);
 			assertPinnedRefsStillReady(tx, planId);
-			if (operation.status === "prepared" && operation.coverageComplete)
-				return this.summary(operation);
+			if (operation.status === "prepared") return this.summary(operation);
 			assertPlanned(operation);
 			return this.summary(
 				tx
 					.update(revertOperations)
 					.set({
 						status: "prepared",
-						coverageComplete: true,
+						coverageComplete:
+							proof.computation === "complete" &&
+							proof.historyCoverage === "complete" &&
+							proof.unknownFiles === 0,
 						updatedAt: this.timestamp(operation.updatedAt),
 					})
 					.where(
@@ -706,7 +723,7 @@ function fingerprintNormalizedFiles(files: ReturnType<typeof normalizeFile>[]) {
 			throw fail("DUPLICATE_FILE", "The complete file list contains duplicates");
 		entries.set(file.sequence, digest(file));
 		identities.add(file.fileKey);
-		fileEvidenceBytes += stateBytes(file.expected) + stateBytes(file.desired);
+		fileEvidenceBytes += requiredDesiredRef(file)?.sizeBytes ?? 0;
 		evidenceBudget(fileEvidenceBytes);
 	}
 	return { fileCount: files.length, orderedFilesDigest: orderedDigest(entries), fileEvidenceBytes };
@@ -797,9 +814,13 @@ function normalizeRef(ref: FileChangeBlobRef): FileChangeBlobRef {
 	integer(ref.sizeBytes, "blob size", 0, FILE_CHANGE_LIMITS.blobBytes);
 	return { algorithm: "sha256", digest: ref.digest, sizeBytes: ref.sizeBytes };
 }
-function normalizeState(state: FileChangeState): KnownFileChangeState {
-	if (!state || state.kind === "unknown")
-		throw fail("UNKNOWN_STATE", "Unknown/null states cannot enter a fixed plan");
+function normalizeState(state: FileChangeState): FileChangeState {
+	if (!state) throw fail("UNKNOWN_STATE", "Missing file state");
+	if (state.kind === "unknown") {
+		keys(state, ["kind", "reason"]);
+		text(state.reason, "unavailable reason");
+		return { kind: "unknown", reason: state.reason };
+	}
 	if (state.kind === "absent") {
 		keys(state, ["kind"]);
 		return { kind: "absent" };
@@ -890,10 +911,11 @@ function fileValues(operation: PlanRecord, file: ReturnType<typeof normalizeFile
 		sequence: file.sequence,
 		expectedStateJson: file.expected,
 		desiredStateJson: file.desired,
-		beforeBlobDigest: stateRef(file.expected)?.digest ?? null,
-		desiredBlobDigest: stateRef(file.desired)?.digest ?? null,
+		// v3 expected is a live conflict fingerprint, not a mandatory undo snapshot.
+		beforeBlobDigest: null,
+		desiredBlobDigest: requiredDesiredRef(file)?.digest ?? null,
 		applyMutationId: digest(["revert-mutation-v1", ...binding, "apply"]),
-		compensateMutationId: digest(["revert-mutation-v1", ...binding, "compensate"]),
+		compensateMutationId: null,
 		applyRequestDigest: digest([
 			"revert-request-v1",
 			...binding,
@@ -901,19 +923,20 @@ function fileValues(operation: PlanRecord, file: ReturnType<typeof normalizeFile
 			file.expected,
 			file.desired,
 		]),
-		compensateRequestDigest: digest([
-			"revert-request-v1",
-			...binding,
-			"compensate",
-			file.desired,
-			file.expected,
-		]),
+		compensateRequestDigest: null,
 	};
 }
 function assertFileValues(row: FileRecord, values: ReturnType<typeof fileValues>) {
 	for (const key of Object.keys(values) as (keyof typeof values)[])
-		if (!equal(row[key], values[key]))
+		if (key !== "beforeBlobDigest" && !equal(row[key], values[key]))
 			throw fail("REQUEST_CONFLICT", "A file's immutable metadata or phase binding changed");
+	// The optional archive is selected only on the first append. Its later arrival or
+	// loss must not change idempotency or turn a fingerprint into a restore prerequisite.
+	if (
+		row.beforeBlobDigest !== null &&
+		row.beforeBlobDigest !== stateRef(values.expectedStateJson)?.digest
+	)
+		throw fail("REQUEST_CONFLICT", "The optional before snapshot does not match expected");
 	if (
 		row.status !== "prepared" ||
 		row.observedAfterStateJson !== null ||
@@ -938,8 +961,7 @@ function assertScope(tx: Executor, identity: FileChangeIdentity) {
 		.from(fileChangeScopes)
 		.where(eq(fileChangeScopes.id, identity.scopeId))
 		.get();
-	if (!scope || scope.status !== "active")
-		throw fail("TARGET_UNVERIFIED", "A verified active scope is required");
+	if (!scope) throw fail("TARGET_UNVERIFIED", "Recorded scope metadata is required");
 	if (!equal(createFileChangeIdentity(scope, identity), identity))
 		throw fail(
 			"IDENTITY_CONFLICT",
@@ -1040,24 +1062,36 @@ function requireReadyRef(tx: Executor, ref: FileChangeBlobRef) {
 	if (!equal(catalogRef(tx, ref.digest), ref))
 		throw fail("BLOB_NOT_READY", "Published object size does not match the fixed reference");
 }
+function optionalBeforePin(tx: Executor, state: FileChangeState): string | null {
+	const ref = stateRef(state);
+	if (!ref) return null;
+	const row = tx
+		.select({ digest: fileChangeBlobs.digest })
+		.from(fileChangeBlobs)
+		.where(
+			and(
+				eq(fileChangeBlobs.digest, ref.digest),
+				eq(fileChangeBlobs.sizeBytes, ref.sizeBytes),
+				eq(fileChangeBlobs.status, "ready"),
+			),
+		)
+		.get();
+	return row?.digest ?? null;
+}
 function assertPinnedRefsStillReady(tx: Executor, planId: string) {
 	// Scoped EXISTS, <=1000 admitted files; no body materialization or global aggregate.
 	// Recheck readiness changed during a page yield, not just the last visited page.
-	const before = alias(fileChangeBlobs, "revert_expected_blob");
 	const desired = alias(fileChangeBlobs, "revert_desired_blob");
 	const row = tx
 		.select({ id: revertOperationFiles.id })
 		.from(revertOperationFiles)
-		.leftJoin(before, eq(revertOperationFiles.beforeBlobDigest, before.digest))
 		.leftJoin(desired, eq(revertOperationFiles.desiredBlobDigest, desired.digest))
 		.leftJoin(fileChangeScopes, eq(revertOperationFiles.scopeId, fileChangeScopes.id))
 		.where(
 			and(
 				eq(revertOperationFiles.revertOperationId, planId),
 				sql`(
-			${revertOperationFiles.status} != 'prepared' OR ${fileChangeScopes.status} IS NOT 'active'
-			OR (${revertOperationFiles.beforeBlobDigest} IS NOT NULL AND (${before.status} IS NOT 'ready'
-				OR ${before.sizeBytes} IS NOT coalesce(json_extract(${revertOperationFiles.expectedStateJson}, '$.blob.sizeBytes'), json_extract(${revertOperationFiles.expectedStateJson}, '$.target.sizeBytes'))))
+			${revertOperationFiles.status} != 'prepared' OR ${fileChangeScopes.id} IS NULL
 			OR (${revertOperationFiles.desiredBlobDigest} IS NOT NULL AND (${desired.status} IS NOT 'ready'
 				OR ${desired.sizeBytes} IS NOT coalesce(json_extract(${revertOperationFiles.desiredStateJson}, '$.blob.sizeBytes'), json_extract(${revertOperationFiles.desiredStateJson}, '$.target.sizeBytes'))))
 		)`,
@@ -1093,10 +1127,25 @@ function selectFiles(
 function fileCursor(row: FileRecord): RevertPlanFileCursor {
 	return { fileKey: row.fileKey };
 }
-function stateRef(state: KnownFileChangeState) {
+/** Only fully measured, equal states prove that execution needs no restore bytes. */
+export function isRevertPlanFileNoOp(
+	file: Pick<AppendRevertPlanFile, "expected" | "desired">,
+): boolean {
+	return (
+		[file.expected, file.desired].every(
+			(state) =>
+				state.kind === "absent" ||
+				((state.kind === "regular" || state.kind === "symlink") && state.mode !== null),
+		) && fileChangeStatesEqual(file.expected, file.desired)
+	);
+}
+function requiredDesiredRef(file: Pick<AppendRevertPlanFile, "expected" | "desired">) {
+	return isRevertPlanFileNoOp(file) ? null : stateRef(file.desired);
+}
+function stateRef(state: FileChangeState) {
 	return state.kind === "regular" ? state.blob : state.kind === "symlink" ? state.target : null;
 }
-function stateBytes(state: KnownFileChangeState) {
+function stateBytes(state: FileChangeState) {
 	return stateRef(state)?.sizeBytes ?? 0;
 }
 function refBytes(refs: {
@@ -1189,6 +1238,7 @@ function fail(code: string, message: string) {
  * — the same validations in the same order — rather than diverging copies of it.
  */
 export const revertPlanInternals = {
+	fileStatuses,
 	normalizeOwner,
 	normalizeHeader,
 	normalizeProof,
@@ -1202,6 +1252,7 @@ export const revertPlanInternals = {
 	selectFiles,
 	fileCursor,
 	stateRef,
+	requiredDesiredRef,
 	stateBytes,
 	refBytes,
 	boundedPage,

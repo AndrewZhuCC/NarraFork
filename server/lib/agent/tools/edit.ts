@@ -5,11 +5,14 @@ import {
 } from "../../../services/file-change-diagnostics";
 import { LocalFileValidationError } from "../../../services/file-change-local-io";
 import {
+	boundedFileHistory,
 	executeLocalFileChange,
 	FileNoDispatchEvidenceError,
+	fileWriteOutcomeMetadata,
 	withFileToolNoDispatch,
 } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
+import { withFileWrite } from "../../../services/file-write-queue";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { toolSpecPathError } from "../../spec-uri";
@@ -36,7 +39,6 @@ import {
 } from "./file-diff-stats";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
-import { withWorkspaceWriteLock } from "./write-serialization";
 
 // ── Replacer types & implementations ────────────────────────────
 // Sourced from opencode's cascading replacer approach:
@@ -607,6 +609,7 @@ export const editTool: ToolDefinition = {
 			ctx.executionTarget?.lexicalPath ?? resolveBackendPath(backend, baseCwd, file_path);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
+		let remoteDispatched = false;
 
 		try {
 			flow.writing();
@@ -686,116 +689,146 @@ export const editTool: ToolDefinition = {
 				};
 			}
 
-			// The whole read-match-write window runs under the workspace write lock. An
-			// interleaved write from another narrator sharing this worktree would both
-			// corrupt attribution and make `old_string` match stale content.
-			return await withWorkspaceWriteLock(backend, baseCwd, async () => {
-				// Both replacement and overwrite mode use one complete read. The decoded
-				// content is then reused for the required snapshot and the replacement.
-				const stat = await backend.statFile(ioPath);
-				if (stat && !stat.isFile)
-					throw new Error(`Edit target is not a regular file: ${resolvedPath}`);
-				if (!stat && old_string !== "") {
-					return {
-						output: `File not found: ${file_path}`,
-						isError: true,
-					};
-				}
-				const existingBytes = stat
-					? (
-							await readCompleteFileBytes(backend, ioPath, {
-								expectedResolvedPath: canonicalPath,
-							})
-						).bytes
-					: null;
-				const decoded = existingBytes
-					? decodeFileBytes(existingBytes)
-					: { text: "", encoding: "utf-8" };
-				await ensureFileSnapshot(
-					ctx.narratorId,
-					backend.deviceId,
-					ioPath,
-					async () => ({
-						content: existingBytes ? decoded.text : null,
-						encoding: decoded.encoding,
-						isBinary: existingBytes ? looksBinary(existingBytes) : false,
-					}),
-					"required",
-				);
+			const queuePath = canonicalPath ?? (await backend.resolvePathIdentity(ioPath)).canonicalPath;
+			return await withFileWrite(
+				{
+					deviceId: backend.deviceId,
+					pathFlavor: backend.pathFlavor as "posix" | "windows",
+					canonicalPath: queuePath,
+				},
+				async () => {
+					// Both replacement and overwrite mode use one complete read. The decoded
+					// content is then reused for the required snapshot and the replacement.
+					const stat = await backend.statFile(ioPath);
+					if (stat && !stat.isFile)
+						throw new Error(`Edit target is not a regular file: ${resolvedPath}`);
+					if (!stat && old_string !== "") {
+						return {
+							output: `File not found: ${file_path}`,
+							isError: true,
+						};
+					}
+					const existingBytes = stat
+						? (
+								await readCompleteFileBytes(backend, ioPath, {
+									expectedResolvedPath: queuePath,
+								})
+							).bytes
+						: null;
+					const decoded = existingBytes
+						? decodeFileBytes(existingBytes)
+						: { text: "", encoding: "utf-8" };
+					const snapshot = await boundedFileHistory(() =>
+						ensureFileSnapshot(
+							ctx.narratorId,
+							backend.deviceId,
+							ioPath,
+							async () => ({
+								content: existingBytes ? decoded.text : null,
+								encoding: decoded.encoding,
+								isBinary: existingBytes ? looksBinary(existingBytes) : false,
+							}),
+							"best-effort",
+						),
+					).catch(() => "failed" as const);
 
-				// Create-new-file mode: old_string is empty. Preserve an existing file's
-				// encoding AND its line endings; a genuinely new file keeps whatever the
-				// model wrote, which is what detecting on `new_string` amounts to.
-				if (old_string === "") {
-					const overwriteEnding = detectLineEnding(existingBytes ? decoded.text : new_string);
+					// Create-new-file mode: old_string is empty. Preserve an existing file's
+					// encoding AND its line endings; a genuinely new file keeps whatever the
+					// model wrote, which is what detecting on `new_string` amounts to.
+					if (old_string === "") {
+						const overwriteEnding = detectLineEnding(existingBytes ? decoded.text : new_string);
+						flow.writing();
+						ctx.signal.throwIfAborted();
+						await ctx.recheckAuthorization?.();
+						ctx.assertFinalExecutionPermission?.();
+						remoteDispatched = true;
+						await backend.writeFileBytes(
+							resolvedPath,
+							encodeFileBytes(
+								applyLineEnding(normalizeLineEndings(new_string), overwriteEnding),
+								decoded.encoding,
+							),
+							{ expectedResolvedPath: queuePath, signal: ctx.signal },
+						);
+						// This mode OVERWRITES an existing file as readily as it creates a new
+						// one, so the previous content (when there was any) is the baseline. A
+						// missing file has none, and every line then counts as an addition.
+						//
+						// Computed before the attribution call so ONE value feeds both the result
+						// metadata and the persisted row (see write.ts for the full rationale).
+						const overwriteStats = wholeFileLineStats(
+							existingBytes ? normalizeLineEndings(decoded.text) : null,
+							normalizeLineEndings(new_string),
+						);
+						return {
+							output: `Created/overwritten ${file_path}`,
+							title: file_path,
+							metadata: {
+								...lineStatsMetadata(overwriteStats),
+								diskOutcome: "applied",
+								historyStatus: snapshot === "failed" ? "unavailable" : "complete",
+								fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
+							},
+						};
+					}
+
+					const content = normalizeLineEndings(decoded.text);
+					const encoding = decoded.encoding;
+					// Matching happens on LF, writing happens on the file's own ending. Skipping
+					// the second half turned every edit of a CRLF file into a whole-file rewrite.
+					const lineEnding = detectLineEnding(decoded.text);
+					const normalizedOld = normalizeLineEndings(old_string);
+					const normalizedNew = normalizeLineEndings(new_string);
+
+					const result = replace(content, normalizedOld, normalizedNew, replace_all);
 					flow.writing();
+					ctx.signal.throwIfAborted();
+					await ctx.recheckAuthorization?.();
+					ctx.assertFinalExecutionPermission?.();
+					remoteDispatched = true;
 					await backend.writeFileBytes(
 						resolvedPath,
-						encodeFileBytes(
-							applyLineEnding(normalizeLineEndings(new_string), overwriteEnding),
-							decoded.encoding,
-						),
-						{ expectedResolvedPath: canonicalPath },
+						encodeFileBytes(applyLineEnding(result.content, lineEnding), encoding),
+						{ expectedResolvedPath: queuePath, signal: ctx.signal },
 					);
-					// This mode OVERWRITES an existing file as readily as it creates a new
-					// one, so the previous content (when there was any) is the baseline. A
-					// missing file has none, and every line then counts as an addition.
-					//
-					// Computed before the attribution call so ONE value feeds both the result
-					// metadata and the persisted row (see write.ts for the full rationale).
-					const overwriteStats = wholeFileLineStats(
-						existingBytes ? normalizeLineEndings(decoded.text) : null,
-						normalizeLineEndings(new_string),
+					// Diffed against the text actually matched (not the model's `old_string`) and
+					// scaled by the replacement count — see `ReplaceResult.matchedText` /
+					// `replacementLineStats`. Computed once, then shared by the result metadata
+					// and the attribution row.
+					const editStats = replacementLineStats(
+						result.matchedText,
+						normalizedNew,
+						result.occurrences,
 					);
-					await trackFileChange(ctx, ioPath, "edit", backend, overwriteStats);
+					const oldLines = normalizedOld.split("\n").length;
+					const newLines = normalizedNew.split("\n").length;
 					return {
-						output: `Created/overwritten ${file_path}`,
+						output: `Edited ${file_path}`,
 						title: file_path,
 						metadata: {
-							...lineStatsMetadata(overwriteStats),
+							startLine: result.startLine,
+							endLine: result.startLine + oldLines - 1,
+							newEndLine: result.startLine + newLines - 1,
+							...lineStatsMetadata(editStats),
+							diskOutcome: "applied",
+							historyStatus: snapshot === "failed" ? "unavailable" : "complete",
 							fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
 						},
 					};
-				}
-
-				const content = normalizeLineEndings(decoded.text);
-				const encoding = decoded.encoding;
-				// Matching happens on LF, writing happens on the file's own ending. Skipping
-				// the second half turned every edit of a CRLF file into a whole-file rewrite.
-				const lineEnding = detectLineEnding(decoded.text);
-				const normalizedOld = normalizeLineEndings(old_string);
-				const normalizedNew = normalizeLineEndings(new_string);
-
-				const result = replace(content, normalizedOld, normalizedNew, replace_all);
-				flow.writing();
-				await backend.writeFileBytes(
-					resolvedPath,
-					encodeFileBytes(applyLineEnding(result.content, lineEnding), encoding),
-					{ expectedResolvedPath: canonicalPath },
+				},
+				{ signal: ctx.signal },
+			).then(async (result) => {
+				const { linesAdded, linesRemoved } = result.metadata ?? {};
+				await trackFileChange(
+					ctx,
+					ioPath,
+					"edit",
+					backend,
+					typeof linesAdded === "number" && typeof linesRemoved === "number"
+						? { added: linesAdded, removed: linesRemoved }
+						: null,
 				);
-				// Diffed against the text actually matched (not the model's `old_string`) and
-				// scaled by the replacement count — see `ReplaceResult.matchedText` /
-				// `replacementLineStats`. Computed once, then shared by the result metadata
-				// and the attribution row.
-				const editStats = replacementLineStats(
-					result.matchedText,
-					normalizedNew,
-					result.occurrences,
-				);
-				await trackFileChange(ctx, ioPath, "edit", backend, editStats);
-				const oldLines = normalizedOld.split("\n").length;
-				const newLines = normalizedNew.split("\n").length;
-				return {
-					output: `Edited ${file_path}`,
-					title: file_path,
-					metadata: {
-						startLine: result.startLine,
-						endLine: result.startLine + oldLines - 1,
-						newEndLine: result.startLine + newLines - 1,
-						...lineStatsMetadata(editStats),
-						fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
-					},
-				};
+				return result;
 			});
 		} catch (err) {
 			if (err instanceof FileNoDispatchEvidenceError) throw err;
@@ -806,7 +839,12 @@ export const editTool: ToolDefinition = {
 						? err.toolOutput
 						: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
 				isError: true,
-				metadata: fileChangeDiagnosticMetadata(err),
+				metadata: {
+					diskOutcome: remoteDispatched ? "unknown" : "not_applied",
+					historyStatus: "unavailable",
+					...fileChangeDiagnosticMetadata(err),
+					...fileWriteOutcomeMetadata(err),
+				},
 			};
 		}
 	}),

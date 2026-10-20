@@ -1,4 +1,5 @@
 import type { EditorProviderCapabilities } from "./editor-provider-contracts";
+import type { FileHistoryStatus } from "./file-change-protocol";
 import type { FileTarget } from "./file-reference";
 
 /** Editor transfer budgets are deliberately independent of chat file-reference budgets. */
@@ -161,6 +162,9 @@ export interface EditorDraftAnchorDescriptor {
 export interface EditorSaveResult {
 	hashKind?: "raw-sha256";
 	status: "saved";
+	/** Present for new saves; historical operation responses may omit these fields. */
+	diskOutcome?: "applied";
+	historyStatus?: FileHistoryStatus;
 	operationId: string;
 	hash: string;
 	bytes: number;

@@ -19,10 +19,12 @@ import (
 const editorMaxStages = 32
 const editorMaxStageBytes int64 = 128 * 1024 * 1024
 const editorMaxReceipts = 4096
-const editorMaxFences = 4096
 const editorReceiptCleanupBatch = 16
 const editorReceiptRetention = 7 * 24 * time.Hour
-const editorMaxStateFiles = editorMaxReceipts + editorMaxFences + editorMaxStages*2 + 16
+
+// Preserve bounded scan headroom for retired metadata without interpreting it
+// as admission state or creating any new persistent fences.
+const editorMaxStateFiles = editorMaxReceipts*2 + editorMaxStages*2 + 16
 const editorMaxMetadata = 128 * 1024
 const editorMaxStageIdle = 30 * time.Second
 
@@ -75,11 +77,6 @@ type editorReceipt struct {
 	AcknowledgedAt    int64              `json:"acknowledgedAt,omitempty"`
 	StageRawDigest    string             `json:"stageRawDigest"`
 	StageBytes        int64              `json:"stageBytes"`
-}
-type editorFence struct {
-	Version   int    `json:"version"`
-	Token     int64  `json:"token"`
-	Namespace string `json:"namespace"`
 }
 
 func editorDigest(b []byte) string     { v := sha256.Sum256(b); return hex.EncodeToString(v[:]) }
@@ -136,25 +133,23 @@ func NewEditorEngine(h *Handlers, root string) (*EditorEngine, error) {
 	return &EditorEngine{h: h, root: canonical, lexicalRoot: filepath.Clean(root), rootInfo: info, chunkBytes: chunk, epoch: EditorRuntimeEpoch(), stageEpoch: stageEpoch, stages: make(map[string]*editorStage)}, nil
 }
 func (e *EditorEngine) lock(ctx context.Context) (func(), error) {
-	release, err := acquireFileMutation(ctx)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err = e.verifyPrivateRoot(); err != nil {
-		release()
+	if err := e.verifyPrivateRoot(); err != nil {
 		return nil, err
 	}
 	file, err := os.OpenFile(filepath.Join(e.root, "engine.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		release()
 		return nil, err
 	}
 	if err = lockEditorFile(ctx, file); err != nil {
 		file.Close()
-		release()
 		return nil, err
 	}
-	return func() { unlockEditorFile(file); file.Close(); release() }, nil
+	// This kernel lock protects the private journal across processes. It is
+	// deliberately not a file-target queue slot; apply owns that separately.
+	return func() { unlockEditorFile(file); file.Close() }, nil
 }
 func editorReadJSON(path string, out any) error {
 	file, err := os.Open(path)
@@ -364,17 +359,17 @@ func (e *EditorEngine) stageBudget() (int, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	count, total, foreign, err := e.collectStages(entries, receipts)
+	count, total, _, err := e.collectStages(entries, receipts)
 	if err != nil {
 		return 0, 0, err
 	}
-	// Orphan ceilings have no operation or live-stage owner. Their removal is
-	// cache cleanup; no receipt transition or durability barrier is published.
-	return count, total, e.cleanupOrphanFences(entries, receipts, foreign)
+	// Cache cleanup only; no receipt transition or durability barrier is published.
+	e.cleanupRetiredFences(entries)
+	return count, total, nil
 }
 
-// The third result reports a live body owned by another engine incarnation.
-// Its namespace is unknown here, so orphan fence cleanup must stand down.
+// The third result reports a live body owned by another engine incarnation,
+// which is counted against the stage budget until its idle bound has passed.
 func (e *EditorEngine) collectStages(entries []os.DirEntry, receipts map[string]*editorReceipt) (int, int64, bool, error) {
 	refs := make(map[string]bool)
 	required := make(map[string]int64)
@@ -486,13 +481,11 @@ func (e *EditorEngine) inventory() (int, int64, int, error) {
 	if err = e.pruneReceipts(receipts, protected); err != nil {
 		return 0, 0, 0, err
 	}
-	count, total, foreign, err := e.collectStages(entries, receipts)
+	count, total, _, err := e.collectStages(entries, receipts)
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	if err = e.cleanupOrphanFences(entries, receipts, foreign); err != nil {
-		return 0, 0, 0, err
-	}
+	e.cleanupRetiredFences(entries)
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), ".metadata-") {
 			if err := os.Remove(filepath.Join(e.root, entry.Name())); err != nil && !os.IsNotExist(err) {
@@ -502,36 +495,17 @@ func (e *EditorEngine) inventory() (int, int64, int, error) {
 	}
 	return count, total, len(receipts), syncEditorDirectory(e.root)
 }
-func (e *EditorEngine) cleanupOrphanFences(entries []os.DirEntry, receipts map[string]*editorReceipt, foreignStages bool) error {
-	if foreignStages {
-		return nil
-	}
-	live := make(map[string]bool)
-	for _, r := range receipts {
-		live[editorKey(r.Request.Namespace, r.Request.Identity.WorkspaceIdentity)+".fence.json"] = true
-	}
-	unapplied := make(map[string]bool)
-	for _, s := range e.stages {
-		if s.OperationID == "" {
-			unapplied[s.Namespace] = true
-		}
-	}
+
+// Retired fences carry no authority, even if their contents are corrupt or a
+// stage of another incarnation is live: target-queue-v1 apply never reads them.
+// Reclaim them under engine.lock without interpreting any token/namespace;
+// unremovable legacy garbage must not become a new admission barrier.
+func (e *EditorEngine) cleanupRetiredFences(entries []os.DirEntry) {
 	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".fence.json") || live[name] {
-			continue
-		}
-		var fence editorFence
-		if err := editorReadJSON(filepath.Join(e.root, name), &fence); err != nil {
-			return err
-		}
-		if !unapplied[fence.Namespace] {
-			if err := os.Remove(filepath.Join(e.root, name)); err != nil {
-				return err
-			}
+		if strings.HasSuffix(entry.Name(), ".fence.json") {
+			_ = os.Remove(filepath.Join(e.root, entry.Name()))
 		}
 	}
-	return nil
 }
 func (e *EditorEngine) pruneReceipts(receipts map[string]*editorReceipt, protected map[string]bool) error {
 	names := make([]string, 0, len(receipts))

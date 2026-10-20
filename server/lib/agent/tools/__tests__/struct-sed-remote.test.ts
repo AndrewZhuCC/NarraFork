@@ -25,6 +25,11 @@ function context(windows = false) {
 		pathFlavor: paths.flavor,
 		runtimeGeneration: 1,
 		defaultCwd: paths.dirname(path),
+		resolvePathIdentity: async (value: string) => ({
+			lexicalPath: value,
+			canonicalPath: value,
+			runtimeGeneration: 1,
+		}),
 		statFile: async () => ({ isDirectory: false, isFile: true, size: 12 }),
 		readFileBytes: async () => ({
 			bytes: Buffer.from("alpha\nbravo\n"),
@@ -284,7 +289,7 @@ test("mismatched persisted binding never dispatches a write", async () => {
 	}
 });
 
-test("required snapshot persistence failure prevents dispatch", async () => {
+test("snapshot failure reports the successful disk write with a history gap", async () => {
 	const { ctx, backend, path } = context();
 	const fixture = bind(ctx, backend, path);
 	let writes = 0;
@@ -299,11 +304,50 @@ test("required snapshot persistence failure prevents dispatch", async () => {
 			{ file_path: path, command: "delete", address: "1", dry_run: false },
 			ctx,
 		);
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("snapshot storage unavailable");
-		expect(writes).toBe(0);
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
+		expect(writes).toBe(1);
 	} finally {
 		insert.mockRestore();
+		fixture.cleanup();
+	}
+});
+
+test("an unknown remote attempt cannot be dispatched again", async () => {
+	const { ctx, backend, path } = context();
+	const fixture = bind(ctx, backend, path);
+	let writes = 0;
+	backend.conditionalWriteFileBytes = async () => {
+		writes++;
+		throw new Error("RPC timeout");
+	};
+	const input = { file_path: path, command: "delete", address: "1", dry_run: false };
+	try {
+		const first = await structSedTool.execute(input, ctx);
+		expect(first.metadata?.diskOutcome).toBe("unknown");
+		const repeated = await structSedTool.execute(input, ctx);
+		expect(repeated.isError).toBe(true);
+		expect(repeated.output).toContain("already attempted");
+		expect(writes).toBe(1);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("trusted conditional conflict remains distinct from transport uncertainty", async () => {
+	const { ctx, backend, path } = context();
+	const fixture = bind(ctx, backend, path);
+	backend.conditionalWriteFileBytes = async () => {
+		throw Object.assign(new Error("Conditional write conflict"), { diskOutcome: "conflict" });
+	};
+	try {
+		const result = await structSedTool.execute(
+			{ file_path: path, command: "delete", address: "1", dry_run: false },
+			ctx,
+		);
+		expect(result.isError).toBe(true);
+		expect(result.metadata?.diskOutcome).toBe("conflict");
+	} finally {
 		fixture.cleanup();
 	}
 });

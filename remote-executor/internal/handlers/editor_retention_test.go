@@ -71,10 +71,9 @@ func TestEditorAcknowledgedReceiptRetentionAndPressure(t *testing.T) {
 				}
 				writeEditorReceiptFixture(t, f, r)
 			}
-			// An orphan ceiling is reclaimable. Live receipt/pending stage ceilings
-			// are separately checked below, so namespace/root turnover is bounded.
+			// Retired fence artifacts are reclaimable without interpreting tokens.
 			orphan := filepath.Join(f.state, editorKey("retired-owner", "old-root")+".fence.json")
-			if err := f.e.save(orphan, editorFence{Version: 1, Token: 99, Namespace: "retired-owner"}); err != nil {
+			if err := f.e.save(orphan, map[string]any{"version": 1, "token": 99, "namespace": "retired-owner"}); err != nil {
 				t.Fatal(err)
 			}
 			f.restart(t)
@@ -164,43 +163,42 @@ func TestEditorRetentionNeverDeletesSoleProofOrUncertain(t *testing.T) {
 	}
 }
 
-func TestEditorFenceBudgetDoesNotPermanentlyBlockCleanup(t *testing.T) {
+func TestEditorRetiredFencesDoNotBlockTargetQueueAdmission(t *testing.T) {
 	f := newEditorFixture(t, []byte("before"))
 	req := f.request(t, "fence-cap", []byte("before"), []byte("after"))
-	b, _ := json.Marshal(editorFence{Version: 1, Token: 1, Namespace: "owner"})
-	for i := 0; i < editorMaxFences; i++ {
+	b := []byte("malformed retired fence")
+	for i := 0; i < 4096; i++ {
 		path := filepath.Join(f.state, editorKey("owner", fmt.Sprint(i))+".fence.json")
 		if err := os.WriteFile(path, b, 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	result := f.call(t, "editor.apply", req).(EditorApplyResult)
-	if result.Outcome != "rejected" || result.Error.Code != "EDITOR_FENCING_REJECTED" {
-		t.Fatalf("fence ceiling did not bound admission: %+v", result)
+	if result.Outcome != "committed" {
+		t.Fatalf("retired fence contents blocked admission: %+v", result)
 	}
 	if _, err := os.Stat(filepath.Join(f.state, editorKey(req.Namespace, req.Identity.WorkspaceIdentity)+".fence.json")); !os.IsNotExist(err) {
 		t.Fatal("fence limit was exceeded")
 	}
-	// The rejected stage no longer pins ceilings. Inventory can run and free
-	// orphan fences; it never overflows its scan cap and locks itself out.
-	next := f.request(t, "after-cleanup", []byte("before"), []byte("after"))
+	// Bounded inventory reclaims retired artifacts and the next save stays usable.
+	next := f.request(t, "after-cleanup", []byte("after"), []byte("next"))
 	if result := f.call(t, "editor.apply", next).(EditorApplyResult); result.Outcome != "committed" {
 		t.Fatal("bounded cleanup failed to reopen admission", result)
 	}
 }
 
-func TestEditorFenceCleanupKeepsOutstandingStageCeiling(t *testing.T) {
+func TestEditorRetiredFenceCleanupPreservesOutstandingStage(t *testing.T) {
 	f := newEditorFixture(t, nil)
 	s := f.call(t, "editor.stage.open", EditorStageOpen{Namespace: "owner", ResourceKey: "resource", MaxBytes: 0, IdleTimeoutMs: 30000}).(EditorStageHandle)
 	ceiling := filepath.Join(f.state, editorKey("owner", "retired-root")+".fence.json")
-	if err := f.e.save(ceiling, editorFence{Version: 1, Token: 4, Namespace: "owner"}); err != nil {
+	if err := f.e.save(ceiling, map[string]any{"version": 1, "token": 4, "namespace": "owner"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := f.e.inventory(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(ceiling); err != nil {
-		t.Fatal("outstanding stage lost its fence ceiling", err)
+	if _, err := os.Stat(ceiling); !os.IsNotExist(err) {
+		t.Fatal("retired fence retained admission authority", err)
 	}
 	f.e.stages[s.StageID].ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
 	if _, _, _, err := f.e.inventory(); err != nil {

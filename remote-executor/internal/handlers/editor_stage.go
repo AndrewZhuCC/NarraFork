@@ -43,7 +43,8 @@ func editorBinding(namespace, resource string) error {
 	return nil
 }
 func (e *EditorEngine) Capabilities() any {
-	return map[string]any{"protocolVersion": 1, "features": []string{FeatureEditorDurableWriteV1}, "maxChunkBytes": e.chunkBytes, "maxBytes": EditorMaxBytes, "runtimeEpoch": e.epoch}
+	features := []string{FeatureEditorDurableWriteV1, FeatureEditorTargetQueueV1}
+	return map[string]any{"protocolVersion": 1, "features": features, "maxChunkBytes": e.chunkBytes, "maxBytes": EditorMaxBytes, "runtimeEpoch": e.epoch}
 }
 
 // Reserve even failed initialization paths: old recovery evidence is never public.

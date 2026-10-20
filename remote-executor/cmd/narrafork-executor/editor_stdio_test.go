@@ -121,7 +121,7 @@ func prepareStdio(t *testing.T, p *stdioPeer, root, path, operation string, befo
 	if before != nil {
 		expected = stdioDigest(before)
 	}
-	return map[string]any{"namespace": "stdio-owner", "resourceKey": "stdio-resource", "operationId": operation, "requestDigest": stdioDigest([]byte(operation)), "stageId": s["stageId"], "expectedRawHash": expected, "metadataPolicy": "preserve", "identity": map[string]any{"deviceId": "local", "pathFlavor": handlers.EditorPathFlavor(), "canonicalPath": stat["resolvedPath"], "workspaceIdentity": stat["rootIdentity"], "runtimeEpoch": stat["runtimeEpoch"], "runtimeGeneration": 1, "fencingToken": 1}}
+	return map[string]any{"coordination": handlers.EditorTargetQueueCoordination, "namespace": "stdio-owner", "resourceKey": "stdio-resource", "operationId": operation, "requestDigest": stdioDigest([]byte(operation)), "stageId": s["stageId"], "expectedRawHash": expected, "metadataPolicy": "preserve", "identity": map[string]any{"deviceId": "local", "pathFlavor": handlers.EditorPathFlavor(), "canonicalPath": stat["resolvedPath"], "workspaceIdentity": stat["rootIdentity"], "runtimeEpoch": stat["runtimeEpoch"], "runtimeGeneration": 1, "fencingToken": 1}}
 }
 func TestEditorStdioCompiledBinary(t *testing.T) {
 	ext := ""
@@ -134,6 +134,28 @@ func TestEditorStdioCompiledBinary(t *testing.T) {
 		t.Fatalf("compile real helper: %v %s", err, output)
 	}
 	testEditorNativeBinary(t, binary)
+	t.Run("legacy-apply-is-query-only", func(t *testing.T) {
+		root := t.TempDir()
+		state := filepath.Join(t.TempDir(), "state")
+		path := filepath.Join(root, "document")
+		if err := os.WriteFile(path, []byte("before"), 0640); err != nil {
+			t.Fatal(err)
+		}
+		peer := startEditorPeer(t, binary, root, state, true)
+		req := prepareStdio(t, peer, root, path, "legacy", []byte("before"), []byte("after"))
+		delete(req, "coordination")
+		result := peer.call(t, "editor.apply", req)
+		if result.OK || !strings.Contains(result.Error, "target-queue-v1") {
+			t.Fatalf("legacy apply was not explicitly rejected: %+v", result)
+		}
+		if data, err := os.ReadFile(path); err != nil || string(data) != "before" {
+			t.Fatal("legacy apply changed the target", string(data), err)
+		}
+		query := map[string]any{"namespace": req["namespace"], "resourceKey": req["resourceKey"], "operationId": req["operationId"], "requestDigest": req["requestDigest"]}
+		if result := peer.must(t, "editor.query", query); result["outcome"] != "not_found" {
+			t.Fatal("legacy apply recorded a new intent", result)
+		}
+	})
 	for _, size := range []int{0, 3 * 1024 * 1024, 20 * 1024 * 1024} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			root := t.TempDir()

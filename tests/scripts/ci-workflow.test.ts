@@ -48,7 +48,7 @@ type Job = {
 	env?: Record<string, string>;
 };
 type Workflow = {
-	on: Record<string, { branches?: string[] } | null>;
+	on: Record<string, { branches?: string[]; paths?: string[] } | null>;
 	permissions: Record<string, string>;
 	concurrency: { group: string; "cancel-in-progress": string };
 	defaults: { run: { shell: string } };
@@ -191,6 +191,10 @@ describe("generic CI workflow", () => {
 		const workflow = Bun.YAML.parse(
 			readFileSync(join(repository, ".github/workflows/file-revert-cross-platform.yml"), "utf8"),
 		) as Workflow;
+		for (const event of ["push", "pull_request"]) {
+			expect(workflow.on[event]?.paths).toContain("server/services/file-write-*.ts");
+			expect(workflow.on[event]?.paths).not.toContain("server/services/workspace-write-*.ts");
+		}
 		const fileRevert = workflow.jobs["file-revert"];
 		const steps = fileRevert.steps;
 		const volumes = steps.find((step) => step.name === "Verify Windows scratch volumes");
@@ -230,15 +234,19 @@ describe("generic CI workflow", () => {
 			"./server/services/file-change-platform-capability.test.ts",
 			"./server/services/file-change-local-restore.test.ts",
 			"./server/services/file-change-runtime.test.ts",
-			"./server/services/file-change-namespace-cleanup.test.ts",
+			"./server/services/file-change-runtime-default.test.ts",
+			"./server/services/file-write-queue.test.ts",
 			"./server/services/revert-transaction-service.test.ts",
 			"./server/services/revert-transaction-interleaving.test.ts",
 			"./server/services/revert-transaction-real-tools.test.ts",
+			"./server/services/revert-history-commit.test.ts",
 			"./server/services/revert-planner-local-access.test.ts",
 			"./server/services/revert-mutation-journal.test.ts",
 			"./server/services/narrator-scoped-revert.test.ts",
 			"./server/lib/agent/tools/__tests__/bash-workspace-activity.test.ts",
 		]);
+		for (const file of tests.run?.trim().split(/\s+/).slice(3) ?? [])
+			expect(existsSync(join(repository, file))).toBe(true);
 		expect(steps.indexOf(volumes)).toBeLessThan(steps.indexOf(profile));
 		expect(steps.indexOf(profile)).toBeLessThan(steps.indexOf(record));
 		expect(steps.indexOf(record)).toBeLessThan(steps.indexOf(tests));
