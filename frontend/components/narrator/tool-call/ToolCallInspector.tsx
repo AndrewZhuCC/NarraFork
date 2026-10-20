@@ -56,6 +56,8 @@ interface ToolCallLike {
 	inputJson?: any;
 	// biome-ignore lint/suspicious/noExplicitAny: tool call JSON is dynamic by design
 	outputJson?: any;
+	/** Live tool_completed events carry the same bag outside the persisted output wrapper. */
+	_metadata?: Record<string, unknown>;
 }
 
 interface ToolCallInspectorProps {
@@ -414,6 +416,9 @@ export function ToolCallInspector({
 		toolCall?.toolName === "RequestPermissionRule"
 			? readPermissionRuleReceipt(toolCall.outputJson)
 			: null;
+	const fileOutcome = toolCall?.outputJson?._metadata ?? toolCall?._metadata;
+	const historyUnavailable =
+		fileOutcome?.diskOutcome === "applied" && fileOutcome?.historyStatus === "unavailable";
 	const executionTarget = useMemo<ExecutionTargetIdentity | null>(() => {
 		if (!toolCall) return null;
 		const canonical = toolCall.executionTarget ?? toolCall.executionTargets?.[0];
@@ -564,6 +569,11 @@ export function ToolCallInspector({
 						receipt={ruleReceipt}
 						narratorId={toolCall?.narratorId ?? narratorId}
 					/>
+				)}
+				{historyUnavailable && (
+					<Text size="sm" c="yellow" role="status">
+						{t("revertPlanHistoryUnavailable")}
+					</Text>
 				)}
 				<JsonSection title={t("toolCallInspector.input")} value={toolCall?.inputJson} />
 				<JsonSection title={t("toolCallInspector.output")} value={toolCall?.outputJson} />

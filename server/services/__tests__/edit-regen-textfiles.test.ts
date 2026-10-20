@@ -67,6 +67,16 @@ const now = new Date().toISOString();
 type Block = Record<string, unknown>;
 
 function seed(cwd: string, blocks: Block[]) {
+	db.insert(schema.users)
+		.values({
+			id: "attachment-user",
+			username: "attachment-user",
+			role: "user",
+			passwordHash: "test",
+			createdAt: now,
+		})
+		.onConflictDoNothing()
+		.run();
 	sqlite.run("DELETE FROM narrator_message_refs");
 	sqlite.run("DELETE FROM narrator_messages");
 	sqlite.run("DELETE FROM narrators");
@@ -112,7 +122,11 @@ async function runEdit(opts: Parameters<typeof editAndRegenerate>[5]) {
 	// editAndRegenerate persists the rebuilt contentJson before the (failing in
 	// this bare harness) agent loop runs, so we can inspect the persisted result.
 	try {
-		await editAndRegenerate("n1", "m1", "new", "en", false, opts);
+		await editAndRegenerate("n1", "m1", "new", "en", false, {
+			userId: "attachment-user",
+			revertFiles: false,
+			...opts,
+		});
 	} catch {
 		/* expected: agent loop cannot run without a real provider */
 	}
@@ -129,22 +143,22 @@ test("history editing persists semantic layout and legacy editing clears stale l
 		assets: [],
 	};
 	await editAndRegenerate("n1", "m1", "new", "en", false, {
+		userId: "attachment-user",
+		revertFiles: false,
 		composerDocument: document,
 		deferContinuation: true,
-		revertFiles: false,
 	});
 	const read = () => db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "m1") });
 	expect((await read())?.composerDocument).toEqual(document);
 	await editAndRegenerate("n1", "m1", "legacy", "en", false, {
-		deferContinuation: true,
 		revertFiles: false,
+		deferContinuation: true,
 	});
 	expect((await read())?.composerDocument).toBeNull();
 	await expect(
 		editAndRegenerate("n1", "m1", "mismatch", "en", false, {
 			composerDocument: document,
 			deferContinuation: true,
-			revertFiles: false,
 		}),
 	).rejects.toThrow("does not match");
 });
@@ -189,7 +203,7 @@ describe("editAndRegenerate text_file management", () => {
 			{ type: "text_file", filename: "a.md", size: 1, filePath: "/x/.narrafork/attached/a.md" },
 			{ type: "text", text: "old" },
 		]);
-		const blocks = await runEdit({ userId: null });
+		const blocks = await runEdit({ userId: "attachment-user" });
 		expect(blocks.filter((b) => b.type === "text_file")).toHaveLength(1);
 	});
 
@@ -203,7 +217,7 @@ describe("editAndRegenerate text_file management", () => {
 			{ type: "text_file", filename: "b.md", size: 2, filePath: secondPath },
 			{ type: "text", text: "old" },
 		]);
-		const blocks = await runEdit({ keepTextFilePaths: [firstPath], userId: null });
+		const blocks = await runEdit({ keepTextFilePaths: [firstPath], userId: "attachment-user" });
 		const files = blocks.filter((b) => b.type === "text_file");
 		expect(files).toHaveLength(1);
 		expect(files[0].filePath).toBe(firstPath);
@@ -214,7 +228,11 @@ describe("editAndRegenerate text_file management", () => {
 			{ type: "text_file", fileId: "F1", filename: "a.js", size: 3, filePath: "n1/text/F1.js" },
 			{ type: "text", text: "old" },
 		]);
-		const blocks = await runEdit({ keepTextFilePaths: ["n1/text/F1.js"], userId: null });
+		const blocks = await runEdit({
+			keepTextFilePaths: ["n1/text/F1.js"],
+			userId: "attachment-user",
+			revertFiles: false,
+		});
 		const file = blocks.find((b) => b.type === "text_file");
 		expect(file?.fileId).toBe("F1");
 	});
@@ -225,7 +243,8 @@ describe("editAndRegenerate text_file management", () => {
 		const blocks = await runEdit({
 			keepTextFilePaths: [],
 			newTextFiles: [newFile],
-			userId: null,
+			userId: "attachment-user",
+			revertFiles: false,
 		});
 		const files = blocks.filter((b) => b.type === "text_file");
 		expect(files).toHaveLength(1);
@@ -252,7 +271,7 @@ describe("editAndRegenerate text_file management", () => {
 			},
 			{ type: "text", text: "old" },
 		]);
-		const blocks = await runEdit({ keepImageIds: ["existing"], userId: null });
+		const blocks = await runEdit({ keepImageIds: ["existing"], userId: "attachment-user" });
 		expect(blocks.find((block) => block.type === "image")).toMatchObject({
 			imageId: "existing",
 			width: 320,
@@ -268,7 +287,8 @@ describe("editAndRegenerate text_file management", () => {
 		const blocks = await runEdit({
 			keepImageIds: [],
 			newImages: [createPngFile("fresh.png", 640, 480)],
-			userId: null,
+			userId: "attachment-user",
+			revertFiles: false,
 		});
 		const image = blocks.find((block) => block.type === "image");
 		expect(image).toMatchObject({
@@ -292,6 +312,8 @@ describe("editAndRegenerate text_file management", () => {
 		);
 		await expect(
 			editAndRegenerate("n1", "m1", "new", "en", false, {
+				userId: "attachment-user",
+				revertFiles: false,
 				keepTextFilePaths: ["legacy/a", "legacy/b"],
 				newTextFiles,
 			}),
@@ -314,6 +336,8 @@ describe("editAndRegenerate text_file management", () => {
 
 		await expect(
 			editAndRegenerate("n1", "m1", "new", "en", false, {
+				userId: "attachment-user",
+				revertFiles: false,
 				keepImageIds: [],
 				keepTextFilePaths: [],
 				newImages: [image],
@@ -357,11 +381,15 @@ describe("editAndRegenerate text_file management", () => {
 		});
 
 		const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, {
+			userId: "attachment-user",
+			revertFiles: false,
 			keepTextFilePaths: [],
 			newTextFiles: [firstFile],
 		});
 		await firstEntered;
 		const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, {
+			userId: "attachment-user",
+			revertFiles: false,
 			keepTextFilePaths: [],
 			newTextFiles: [secondFile],
 		});
@@ -402,6 +430,8 @@ describe("editAndRegenerate text_file management", () => {
 			.run();
 
 		const result = await editAndRegenerate("n2", "m1", "new", "en", false, {
+			userId: "attachment-user",
+			revertFiles: false,
 			keepTextFilePaths: [sourcePath],
 		});
 		expect(result.ok).toBe(true);
@@ -430,6 +460,8 @@ describe("editAndRegenerate text_file management", () => {
 		]);
 		await expect(
 			editAndRegenerate("n1", "m1", "new", "en", false, {
+				userId: "attachment-user",
+				revertFiles: false,
 				keepTextFilePaths: [sourcePath],
 			}),
 		).rejects.toThrow("attachments exceed the 128 MiB limit");

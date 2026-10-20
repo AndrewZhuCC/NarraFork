@@ -18,8 +18,11 @@
  *   - the container is the harness' own random name and only it is cleaned up.
  */
 import { afterAll, describe, expect, it, mock } from "bun:test";
-import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
+import { type BunSQLDatabase, drizzle as postgresDrizzle } from "drizzle-orm/bun-sql";
+import { drizzle as sqliteDrizzle } from "drizzle-orm/bun-sqlite";
 import { createPostgresClient } from "../../../../server/db/postgres-client";
+import * as relations from "../../../../server/db/relations";
+import * as schema from "../../../../server/db/schema";
 import { withPostgres } from "../../../db/pg-test-harness";
 import { getTestDb } from "../../../setup";
 import { migrationSql } from "../read/pg-parity-matrix";
@@ -27,7 +30,7 @@ import {
 	blobCatalogScenario,
 	evidenceScenario,
 	revertFlowScenario,
-	workspaceLeaseScenario,
+	revertPlanBatchScenario,
 } from "./equivalence-suite";
 import { makePostgresKit } from "./pg-kit";
 
@@ -88,18 +91,28 @@ describe("PostgreSQL wrapper equivalence", () => {
 					connectTimeout: 10,
 				});
 				try {
-					const pgDb: BunSQLDatabase = client.db;
+					const pgQueries: string[] = [];
+					const sqliteQueries: string[] = [];
+					const pgDb: BunSQLDatabase = postgresDrizzle({
+						client: client.sql,
+						logger: {
+							logQuery(query) {
+								if (pgQueries.length < 20_000) pgQueries.push(query);
+							},
+						},
+					});
 					const problems: string[] = [];
 					const check = async (label: string, fn: () => Promise<unknown>): Promise<unknown> => {
 						try {
 							return await fn();
 						} catch (error) {
-							problems.push(
-								`${label}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`.slice(
-									0,
-									900,
-								),
-							);
+							const causes: string[] = [];
+							let current: unknown = error;
+							for (let depth = 0; depth < 4 && current !== undefined; depth++) {
+								causes.push(String(current).slice(0, 1000));
+								current = current instanceof Error ? current.cause : undefined;
+							}
+							problems.push(`${label}: ${causes.join("\nCaused by: ")}`);
 							return undefined;
 						}
 					};
@@ -107,16 +120,25 @@ describe("PostgreSQL wrapper equivalence", () => {
 					const pgKit = makePostgresKit(pgDb);
 					const pgProjections: Record<string, unknown> = {};
 					pgProjections.blob = await check("blob", () => blobCatalogScenario(pgKit));
-					pgProjections.workspace = await check("workspace", () => workspaceLeaseScenario(pgKit));
 					pgProjections.evidence = await check("evidence", () => evidenceScenario(pgKit));
 					pgProjections.revert = await check("revert", () => revertFlowScenario(pgKit));
+					pgProjections.batches = await check("batch queries", () =>
+						revertPlanBatchScenario(pgKit, pgQueries),
+					);
 
-					const sqliteKit = makeSqliteKit(sqliteDb as never);
+					const sqliteKit = makeSqliteKit(
+						sqliteDrizzle({
+							client: sqlite,
+							schema: { ...schema, ...relations },
+							logger: {
+								logQuery(query) {
+									if (sqliteQueries.length < 20_000) sqliteQueries.push(query);
+								},
+							},
+						}) as never,
+					);
 					const sqliteProjections: Record<string, unknown> = {};
 					sqliteProjections.blob = await check("sqlite blob", () => blobCatalogScenario(sqliteKit));
-					sqliteProjections.workspace = await check("sqlite workspace", () =>
-						workspaceLeaseScenario(sqliteKit),
-					);
 					sqliteProjections.evidence = await check("sqlite evidence", () =>
 						evidenceScenario(sqliteKit),
 					);
@@ -124,6 +146,9 @@ describe("PostgreSQL wrapper equivalence", () => {
 						revertFlowScenario(sqliteKit),
 					);
 
+					sqliteProjections.batches = await check("sqlite batch queries", () =>
+						revertPlanBatchScenario(sqliteKit, sqliteQueries),
+					);
 					return { problems, pgProjections, sqliteProjections };
 				} finally {
 					await client.close();

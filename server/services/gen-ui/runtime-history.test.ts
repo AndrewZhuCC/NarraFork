@@ -15,17 +15,12 @@ import { localBackend } from "../../lib/agent/execution/local-backend";
 import type { GenUiInput } from "../../lib/agent/tools/gen-ui";
 import type { ToolContext } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
-import { fileChangeLocalIo, localDirectoryIdentity } from "../file-change-local-io";
-import {
-	LocalFileChangeRuntime,
-	localFileChangeRuntimeBinding,
-	withLocalFileChangeRuntime,
-} from "../file-change-runtime";
+import { fileChangeLocalIo } from "../file-change-local-io";
+import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "../file-change-runtime";
 import type { RevertPlannerAccess } from "../revert-planner-service";
 import { RevertPlannerService } from "../revert-planner-service";
 import { RevertSelectionService } from "../revert-selection-service";
 import { RevertTransactionService } from "../revert-transaction-service";
-import { createWorkspaceWriteCoordinatorState } from "../workspace-write-coordinator";
 import { executeGenUiTool, type UiToolDependencies } from "./runtime";
 
 const principal = { userId: "owner", isAdmin: false };
@@ -79,7 +74,6 @@ beforeEach(async () => {
 	runtime = new LocalFileChangeRuntime({
 		db,
 		privateRoot: join(root, "private"),
-		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 	serial = 0;
@@ -218,26 +212,16 @@ function access(): RevertPlannerAccess {
 				throw new Error("File denied");
 		},
 		async resolveFile({ identity }) {
-			const scope = runtime.evidence.getScope(identity.scopeId);
-			const binding = localFileChangeRuntimeBinding(identity.deviceId);
-			if (!scope || !binding) throw new Error("Unknown scope");
 			return {
 				identity,
-				executionBinding: { deviceId: "local", ...binding, fencingToken: scope.fencingToken },
-				scopeRevision: scope.revision,
 				async assertCurrent({ signal }) {
 					signal.throwIfAborted();
-					const live = runtime.evidence.getScope(scope.id);
+					const target = await localBackend.resolvePathIdentity(identity.canonicalPath, { signal });
 					if (
-						!live ||
-						live.status !== "active" ||
-						live.activeLeaseId ||
-						live.activeMutationCount ||
-						live.revision !== scope.revision ||
-						live.fencingToken !== scope.fencingToken ||
-						(await localDirectoryIdentity(scope.canonicalRoot)) !== scope.rootIdentityJson?.object
+						!localBackend.paths.equals(target.canonicalPath, identity.canonicalPath) ||
+						identity.deviceId !== "local"
 					)
-						throw new Error("Scope changed");
+						throw new Error("Authorized file target changed");
 				},
 				async readCurrent({ signal, maxBytes }) {
 					const observed = await fileChangeLocalIo.read(identity.canonicalPath, signal);
@@ -287,7 +271,7 @@ describe("GenUI ordinary file history", () => {
 					.where(eq(schema.narratorToolCalls.id, created.toolCallId))
 					.get();
 				expect(row?.fileChangeOperationId).toBeString();
-				expect(db.select().from(schema.fileChangeEffects).all()).toHaveLength(1);
+				expect(db.select().from(schema.fileChangeEffects).all()).toHaveLength(0);
 				await write(path, bytes, opts);
 			},
 		);
@@ -306,7 +290,7 @@ describe("GenUI ordinary file history", () => {
 		const entry = join(ref.directory, "App.tsx");
 		expect(await readFile(entry, "utf8")).toContain("export default function App");
 		expect(result.metadata?.fileChangeEvidence).toMatchObject({
-			version: 2,
+			version: 3,
 			outcome: "changed",
 			settlement: "settled",
 		});
@@ -405,12 +389,15 @@ describe("GenUI ordinary file history", () => {
 		expect(db.select().from(schema.fileChangeOperations).all()).toEqual([]);
 	});
 
-	test("unavailable local history never falls back to an unjournaled App.tsx write", async () => {
+	test("unavailable local history preserves exclusive App.tsx creation", async () => {
 		await mkdir(join(root, "private"), { mode: 0o700 });
 		await writeFile(join(root, "private/file-change-blobs"), "not a blob directory");
 		const created = await call({ action: "create", prefix: "demo" });
-		await expect(created.execute()).rejects.toThrow();
-		expect(await readdir(join(workspace, ".narrafork/gen_ui/demo-unique"))).toEqual([]);
+		const result = await created.execute();
+		expect(result.metadata).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
+		expect(
+			await readFile(join(workspace, ".narrafork/gen_ui/demo-unique/App.tsx"), "utf8"),
+		).toContain("export default function App");
 		expect(db.select().from(schema.fileChangeEffects).all()).toEqual([]);
 	});
 
@@ -435,6 +422,6 @@ describe("GenUI ordinary file history", () => {
 		restores.push(() => dispatch.mockRestore());
 		await expect(created.execute()).rejects.toThrow();
 		expect(await readFile(entry, "utf8")).toBe("foreign content");
-		expect(db.select().from(schema.fileChangeEffects).all()[0].settlement).not.toBe("settled");
+		expect(db.select().from(schema.fileChangeEffects).all()[0].diskOutcome).toBe("unknown");
 	});
 });

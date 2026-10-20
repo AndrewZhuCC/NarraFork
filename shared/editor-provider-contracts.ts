@@ -157,6 +157,7 @@ export interface EditorStageAbort extends EditorWriteOwner {
 }
 export const EDITOR_METADATA_POLICIES = ["preserve", "reject"] as const;
 export interface EditorApplyRequest extends EditorWriteOwner {
+	readonly coordination: "target-queue-v1";
 	readonly operationId: string;
 	readonly requestDigest: string;
 	readonly stageId: string;
@@ -176,7 +177,7 @@ export interface EditorApplyResult {
 	readonly error?: { readonly code: string; readonly message: string };
 }
 export interface EditorQueryRequest extends EditorWriteOwner {
-	/** Host has durably settled its original effect/lease; permits bounded terminal retention. */
+	/** Host holds the terminal proof as its real outcome; permits bounded terminal retention. */
 	readonly acknowledgeTerminal?: boolean;
 	readonly operationId: string;
 	readonly requestDigest: string;
@@ -195,6 +196,9 @@ export interface EditorQueryResult {
 	/** Required. null when no durable result exists. */
 	readonly result: EditorApplyResult | null;
 }
+
+/** A new writer must negotiate actual target-queue ownership, not legacy persistent fences. */
+export const EDITOR_TARGET_QUEUE_FEATURE = "editor.target-queue.v1";
 
 // ── Phase 9: watch ───────────────────────────────────────────────────────────
 

@@ -38,6 +38,37 @@ export function isAwaitedTerminalConsumption(
 	);
 }
 
+/** Materialized recipient deletion keeps the original delivery receipt, but no current ref. */
+export function recipientDeletedReceiptPatch(updatedAt: string) {
+	return {
+		currentMessageId: null,
+		receiptDisposition: "recipient_deleted" as const,
+		updatedAt,
+	};
+}
+
+/**
+ * Receiver-side content edit of a materialized delivery. The original delivery keeps its
+ * adopted revision; the edited current content needs a fresh adoption fact. `nextRevision`
+ * is each caller's form of max(current_revision, content_revision) + 1: a dialect SQL
+ * expression in the queue adapters, or {@link nextCurrentRevision} over verified values.
+ */
+export function semanticEditReceiptPatch<R>(messageId: string, nextRevision: R, updatedAt: string) {
+	return {
+		currentMessageId: messageId,
+		receiptDisposition: "superseded" as const,
+		currentRevision: nextRevision,
+		currentAdoptedRevision: null,
+		currentAdoptedAt: null,
+		updatedAt,
+	};
+}
+
+/** Value form of the adapters' SQL max/greatest(current_revision, content_revision) + 1. */
+export function nextCurrentRevision(currentRevision: number, contentRevision: number): number {
+	return Math.max(currentRevision, contentRevision) + 1;
+}
+
 /** JSON-encode with a hard byte ceiling; oversized metadata is rejected, never truncated. */
 export function boundedJson(value: unknown, limit: number): string {
 	const json = JSON.stringify(value);

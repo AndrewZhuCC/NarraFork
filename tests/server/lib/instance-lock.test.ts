@@ -7,12 +7,14 @@ import {
 	__testing,
 	acquireInstanceLock,
 	getInstanceLockPath,
+	getInstanceMaintenanceAuthority,
+	initializeInstanceLockProcessIdentity,
 	releaseInstanceLock,
 } from "../../../server/lib/instance-lock";
 import type {
-	WorkspaceProcessIdentity,
-	WorkspaceProcessObservation,
-} from "../../../server/lib/workspace-process-identity";
+	InstanceProcessIdentity,
+	InstanceProcessObservation,
+} from "../../../server/lib/instance-process-identity";
 
 /**
  * These tests exist because the previous implementation refused to start whenever the recorded pid
@@ -111,6 +113,28 @@ afterEach(() => {
 });
 
 describe("instance lock", () => {
+	it.skipIf(!IS_LINUX)(
+		"registers cold recovery identity without initializing workspace state",
+		async () => {
+			const dbPath = createTempDbPath();
+			acquireInstanceLock(dbPath);
+			await initializeInstanceLockProcessIdentity();
+			const payload = JSON.parse(readFileSync(getInstanceLockPath(dbPath), "utf8"));
+			expect(payload.maintenanceIdentity).toMatchObject({ version: 1, pid: process.pid });
+			expect(payload.maintenanceIdentity.birth).toBe(String(realStartTicks(process.pid)));
+			expect(payload.maintenanceQualified).toBe(true);
+			expect(getInstanceMaintenanceAuthority()).toEqual({
+				allowed: true,
+				reason: "exclusive_instance_lock",
+			});
+			expect(existsSync(dbPath)).toBe(false);
+
+			// Hot startup registration keeps the same token and exact process identity.
+			await initializeInstanceLockProcessIdentity();
+			expect(JSON.parse(readFileSync(getInstanceLockPath(dbPath), "utf8"))).toEqual(payload);
+		},
+	);
+
 	it("removes a stale lock when the recorded pid is no longer alive", () => {
 		const dbPath = createTempDbPath();
 		const lockPath = writeLock(dbPath, {
@@ -420,7 +444,7 @@ describe("instance lock", () => {
 	});
 });
 
-describe("strict maintenance qualification (independent of startup fail-open)", () => {
+describe("strict cold continuation authority (independent of startup fail-open)", () => {
 	const state = {
 		path: "/virtual/instance.lock",
 		token: "ours",
@@ -477,7 +501,7 @@ describe("strict maintenance qualification (independent of startup fail-open)", 
 });
 
 describe("strict asynchronous crash-lock reclamation", () => {
-	const previous: WorkspaceProcessIdentity = {
+	const previous: InstanceProcessIdentity = {
 		version: 1,
 		pid: 42,
 		birth: "123456789",
@@ -489,9 +513,9 @@ describe("strict asynchronous crash-lock reclamation", () => {
 			timeNamespace: "time:[456]",
 		},
 	};
-	const self: WorkspaceProcessIdentity = { ...previous, pid: 77, birth: "987654321" };
+	const self: InstanceProcessIdentity = { ...previous, pid: 77, birth: "987654321" };
 	function fixture(
-		observation: WorkspaceProcessObservation = { kind: "absent", domain: previous.domain },
+		observation: InstanceProcessObservation = { kind: "absent", domain: previous.domain },
 	) {
 		let payload = {
 			version: 2,
@@ -506,7 +530,7 @@ describe("strict asynchronous crash-lock reclamation", () => {
 			hostname: "host",
 			uid: null,
 		};
-		let persisted: { identity: WorkspaceProcessIdentity; qualified: boolean } | null = null;
+		let persisted: { identity: InstanceProcessIdentity; qualified: boolean } | null = null;
 		const deps: Parameters<typeof __testing.registerLockIdentity>[1] = {
 			state: {
 				path: "/virtual/lock",
@@ -534,7 +558,7 @@ describe("strict asynchronous crash-lock reclamation", () => {
 		};
 	}
 
-	it("enables maintenance after independent exact proof, rather than requiring another restart", async () => {
+	it("enables cold continuation takeover after independent exact proof", async () => {
 		const f = fixture();
 		expect(f.authority().allowed).toBe(false);
 		await __testing.registerLockIdentity(self, f.deps);

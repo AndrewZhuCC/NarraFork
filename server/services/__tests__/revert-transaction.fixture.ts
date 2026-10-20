@@ -26,13 +26,8 @@ import { structSedTool } from "../../lib/agent/tools/struct-sed/tool";
 import { writeTool } from "../../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
-import { fileChangeLocalIo, localDirectoryIdentity } from "../file-change-local-io";
-import { waitForRetiredFileChangeCleanup } from "../file-change-namespace-reset";
-import {
-	LocalFileChangeRuntime,
-	localFileChangeRuntimeBinding,
-	withLocalFileChangeRuntime,
-} from "../file-change-runtime";
+import { fileChangeLocalIo } from "../file-change-local-io";
+import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "../file-change-runtime";
 import type { NarratorAclRow, NarratorPrincipal } from "../narrator-acl";
 import { RevertPlanService, type RevertPlanSummary } from "../revert-plan-service";
 import {
@@ -46,11 +41,6 @@ import {
 	type RevertTransactionOptions,
 	RevertTransactionService,
 } from "../revert-transaction-service";
-import {
-	createWorkspaceWriteCoordinatorState,
-	type WorkspaceWriteLease,
-	type WorkspaceWriteRequest,
-} from "../workspace-write-coordinator";
 
 export const principal: NarratorPrincipal = { userId: "alice", isAdmin: false };
 export const owner = { subjectKey: "human:alice", narratorId: "narrator", projectId: "project" };
@@ -65,7 +55,6 @@ export function database(client: Database) {
 	return drizzle({ client, schema: { ...schema, ...relations } });
 }
 export let runtime: LocalFileChangeRuntime;
-export let coordinatorState: ReturnType<typeof createWorkspaceWriteCoordinatorState>;
 export let namespace: Awaited<ReturnType<LocalFileChangeRuntime["initialize"]>>;
 export let access: RevertPlannerAccess;
 export let planner: RevertPlannerService;
@@ -130,17 +119,7 @@ export function own<T>(work: Promise<T>, pending = ownedWork): Promise<T> {
 	return work;
 }
 export function makeFixtureRuntime(...args: ConstructorParameters<typeof LocalFileChangeRuntime>) {
-	const instance = new LocalFileChangeRuntime(...args);
-	const pending = ownedWork;
-	const namespaceAccess = instance.withNamespaceAccess.bind(instance);
-	instance.withNamespaceAccess = <T>(body: () => Promise<T>, signal?: AbortSignal) =>
-		own(namespaceAccess(body, signal), pending);
-	const write = instance.coordinator.withWrite.bind(instance.coordinator);
-	instance.coordinator.withWrite = <T>(
-		request: WorkspaceWriteRequest,
-		body: (lease: WorkspaceWriteLease) => T | Promise<T>,
-	) => own(write(request, body), pending);
-	return instance;
+	return new LocalFileChangeRuntime(...args);
 }
 export function makeFixtureTransaction(
 	...args: ConstructorParameters<typeof RevertTransactionService>
@@ -234,11 +213,9 @@ export async function seedFixture(owner: FixtureLifetime) {
 				})
 				.run();
 	})();
-	coordinatorState = createWorkspaceWriteCoordinatorState();
 	runtime = makeFixtureRuntime({
 		db,
 		privateRoot: join(root, "private"),
-		coordinatorState,
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 	namespace = await runtime.initialize();
@@ -287,29 +264,14 @@ export async function seedFixture(owner: FixtureLifetime) {
 			signal.throwIfAborted();
 			if (identity.deviceId !== "local") throw new Error("No remote fallback");
 			const scope = runtime.evidence.getScope(identity.scopeId);
-			const binding = localFileChangeRuntimeBinding(identity.deviceId);
-			if (!scope || !binding) throw new Error("No scope/runtime");
-			const executionBinding = { deviceId: "local", ...binding, fencingToken: scope.fencingToken };
+			if (!scope) throw new Error("No scope metadata");
 			return {
 				identity,
-				executionBinding,
-				scopeRevision: scope.revision,
 				async assertCurrent({ signal }) {
 					signal.throwIfAborted();
-					const live = runtime.evidence.getScope(scope.id);
-					if (
-						!live ||
-						live.activeLeaseId ||
-						live.activeMutationCount ||
-						live.status !== "active" ||
-						live.revision !== scope.revision ||
-						live.fencingToken !== scope.fencingToken
-					)
-						throw new Error("Preview idle assertion refused");
-					if (
-						(await localDirectoryIdentity(scope.canonicalRoot)) !== scope.rootIdentityJson?.object
-					)
-						throw new Error("Root changed");
+					const target = await localBackend.resolvePathIdentity(identity.lexicalPath);
+					if (!localBackend.paths.equals(target.canonicalPath, identity.canonicalPath))
+						throw new Error("Target changed");
 				},
 				async readCurrent({ signal, maxBytes }) {
 					const observed = await fileChangeLocalIo.read(identity.canonicalPath, signal);
@@ -360,7 +322,6 @@ export async function closeFixture(closing: FixtureLifetime) {
 	// Include the original body and setup promise, not just the response/worker.
 	// Partial setup can still publish its own root/database to this fixed owner.
 	while (closing.work.size) await Promise.allSettled([...closing.work]);
-	if (closing.root) await waitForRetiredFileChangeCleanup(join(closing.root, "private"));
 	expect(closing.holds.size).toBe(0);
 	expect(closing.work.size).toBe(0);
 	for (const restore of closing.restores.splice(0).reverse()) restore();

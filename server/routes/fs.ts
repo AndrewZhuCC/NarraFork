@@ -704,6 +704,8 @@ fsRoutes.post("/write", async (c) => {
 					error: err.message,
 					code: "WRITE_RECONCILE_REQUIRED",
 					operationId: err.operationId,
+					diskOutcome: err.diskOutcome,
+					historyStatus: err.historyStatus,
 				},
 				500,
 			);
@@ -783,6 +785,8 @@ fsRoutes.post("/write", async (c) => {
 		ok: true,
 		path: target,
 		...completed.result,
+		diskOutcome: completed.diskOutcome,
+		historyStatus: completed.historyStatus,
 		fileChangeEvidence: completed.fileChangeEvidence,
 		// Echoed so a client can keep its round trip honest without having to remember
 		// what it sent — and so a save that fell back to UTF-8 for an unknown name says so.

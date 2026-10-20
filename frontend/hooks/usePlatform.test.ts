@@ -33,7 +33,6 @@ const originalStorageHealthApi = {
 	getSettings: api.getSettings,
 	getCachedStorage: api.getCachedStorage,
 	me: api.me,
-	getWorkspaceBarriers: api.getWorkspaceBarriers,
 };
 const STORAGE_DOM_GLOBALS = [
 	"window",
@@ -216,7 +215,6 @@ describe("StorageSection health states", () => {
 			({ id: "storage-admin", username: "admin", role: "admin" }) as Awaited<
 				ReturnType<typeof api.me>
 			>;
-		api.getWorkspaceBarriers = async () => ({ items: [], nextCursor: null });
 		storageContainer = document.createElement("div");
 		document.body.appendChild(storageContainer);
 		storageRoot = createRoot(storageContainer);
@@ -236,7 +234,6 @@ describe("StorageSection health states", () => {
 		api.getSettings = originalStorageHealthApi.getSettings;
 		api.getCachedStorage = originalStorageHealthApi.getCachedStorage;
 		api.me = originalStorageHealthApi.me;
-		api.getWorkspaceBarriers = originalStorageHealthApi.getWorkspaceBarriers;
 		restoreStorageTestDom();
 	});
 

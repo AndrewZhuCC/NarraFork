@@ -4,59 +4,21 @@
 它们都卡在同一个根因，已明确搁置。放在源码树里而非 `.narrafork/`，是为了进 git 管理、
 重启这块工作时一眼可见。
 
-## 根因：写入管线没有跨文件设计
+## 当前边界：单调用仍绑定单目标
 
-`executeLocalFileChange`（`server/services/file-change-runtime.ts`）是**单文件**原语：
+[server/services/file-change-runtime.ts](../../../../services/file-change-runtime.ts) 已使用单文件队列。旧持久租约和工作区屏障已经删除。
 
-- `validateCall`（约 L378-427）硬性校验 `request.filePath` 必须 resolve 到工具调用**冻结的
-  单一** `executionTarget.lexicalPath`。用另一个路径再调一次会抛
-  `Tool input changed its frozen path`。
-- `executionTarget` 在工具分发时绑定一次，对应 `file_path` 这一个文件。
-- 因此**从一次 StructSed 调用里对第二个文件发起合法写入是不可能的**，"两次顺序写入"方案
-  在现有管线里走不通。
+跨文件操作仍需明确以下接口语义：
 
-多 endpoint 机制存在（`ToolExecutionRouting` 的 `kind: "multi"`，`server/lib/agent/types.ts`），
-但唯一使用者是 `transfer-file.ts`，语义是**跨设备**分发同一逻辑操作，不是"一次调用写两个
-本地文件"。把 StructSed 改成 multi 路由需要让写入管线支持多目标租约，那会触碰
-`workspace-write-coordinator.ts` 的 durable-lease 核心——本会话已两次因进程崩溃留下未回收
-租约、堵死所有写入并需要人工清理，风险等级高。
+- 工具授权冻结具体路径，每个实际写入须匹配已授权目标。
+- 当前一次文件工具调用对应一个操作身份和一个文件效果；同一 attempt 重发受去重约束。
+- 跨文件修改需要明确各目标及逐项结果，普通单文件入口保持现有契约。
 
-### multi 路由复查（已完成，结论：不改核心就走不通）
+现阶段使用下方三步路径：先捕获源代码，再写目标文件，最后删除源段。目标成功而源删除失败时保留两份代码，用户可以继续处理。
 
-后续专门复查过「能否借 multi 路由绕开」，结论是**不能**，且卡点比原先记录的更靠底层。四个
-独立障碍，任一存在就足以否决，全部有行号：
+## 回退
 
-1. **`validateCall` 比对的是 tool-call 行的扁平列，不是执行计划。**
-   `file-change-runtime.ts` 约 L403-426 逐字段核对 `row.lexical`/`row.canonical`/`row.cwd`
-   与 `target`，再校验 `resolve(target.cwd, request.filePath)` 必须等于 `target.lexicalPath`，
-   否则抛 `Tool input changed its frozen path`。**一行只能存一个路径**。
-2. **`expectedEffectCount: 1`**（约 L726）——operation 契约就是「一次调用一个效果」。
-3. **`sourceId: frozen.row.id`**（L506）对同一次调用是**同一个值**，而 `executeBound` 入口
-   （L678）和写锁内（L715）都会用它查 `existingOperation`，命中即抛 `alreadyAttempted`。
-   所以「同一次调用里顺序写第二个文件」会被去重逻辑当成重复尝试直接拒绝。
-4. **租约 scope 是按文件各自的 root 推导的**（`prepareWorkspaceScope`，L648-654：
-   `canonicalRoot: root` + `workspaceInstanceId: hash([...root, rootIdentity])`）。两个文件
-   若不在同一 root 下，就是两个 scope、两把锁，跨 scope 原子性需要协调器支持多 scope 事务。
-
-值得记下的一点：**`executionTargetsJson` 列已经持久化完整 `ToolExecutionPlan`**
-（`schema.ts` L1478-1481），所以「存不下两个目标」并不是障碍——障碍是 `validateCall` 只读扁平
-列、以及 2/3/4 三条 operation 与租约层的单效果假设。真要做 Plan A，改动面是
-`validateCall` + operation 效果计数 + sourceId 去重键 + 多 scope 租约，全在写入管线核心。
-
-**因此按计划的决策规则选择方案 B：不改核心，接受非原子的三步路径**（下方「三步替代路径」
-一节）。失败方向是安全的那一侧——留下两份，不会丢代码。
-
-## 回退（revert）可行性：两条机制的结论
-
-1. **Tree 快照（首选路径）——支持跨文件。**
-   `narrator-tree-snapshot-hooks.ts` 的 `declaredWorktreePaths` 已能声明两个路径（读
-   `args.file_path` 和 `args.to_file`）。它基于真实字节 diff，天然支持"一个工具改两个
-   文件"：只要两个路径都声明了，两边的 tree delta 都会被捕获和回退。
-
-2. **逐文件重放（回落路径）——不支持跨文件。**
-   `file-state-rebuild.ts` 的 `groupByDeviceFile` 按单文件分组，一个工具调用只能归属一个
-   文件。另外 `getToolCallFileIdentity`（约 L339）**只认 Write/Edit**，StructSed 不产生文件
-   身份——即 StructSed 的编辑本来就不走重放分组路径，只在 tree 快照缺失时才需要重放。
+文件恢复使用已保存的原始内容和当前版本校验，逐项报告结果。快照提供历史材料；实际恢复通过单文件写入执行。后续跨文件功能应为每个目标记录实际 before/after，并明确部分完成情况。
 
 ## 已确定的设计决定（重启时直接沿用）
 

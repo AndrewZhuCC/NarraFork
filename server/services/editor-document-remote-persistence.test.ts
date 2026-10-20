@@ -365,14 +365,25 @@ test.each([
 			await fault(scenario === "lost-apply-cold" ? "lost-apply" : "settlement");
 			const bytes = Buffer.from("written"),
 				saved = await save(bytes, 37);
-			expect(saved.ok).toBe(false);
+			// The real IO outcome is reported separately from history: a lost reply is
+			// unknown, while a history failure after a committed receipt is still a save.
+			if (scenario === "settlement-cold")
+				expect(saved.body).toMatchObject({
+					status: "saved",
+					diskOutcome: "applied",
+					historyStatus: "unavailable",
+				});
+			else expect(saved.ok).toBe(false);
 			expect(await readFile(target)).toEqual(bytes);
 			await waitOnline();
 			const pending = await info();
 			expect(pending.nativeCalls.apply).toBe(1);
-			expect(pending.operations[0]?.settlement).not.toBe("settled");
-			const barrier = pending.leases.find((lease) => lease.status === "quarantined");
-			expect(barrier).toBeDefined();
+			if (scenario === "settlement-cold")
+				expect(pending.operations[0]?.settlement).not.toBe("settled");
+			// No workspace barrier and no fabricated lease: the exact executor operation is the key.
+			expect(pending.leases).toEqual([]);
+			expect(pending.operations[0]?.workspaceLeaseId).toBeNull();
+			expect(pending.operations[0]?.snapshotRevision).toBe(37);
 			for (const mode of ["not_found", "uncertain"]) {
 				await fault(mode);
 				expect(await query(saved.operationId)).toMatchObject({ status: "uncertain" });
@@ -397,15 +408,17 @@ test.each([
 				helperStarts: 0,
 				network: 0,
 			});
-			expect(settled.leases.find((lease) => lease.id === barrier?.id)?.status).toBe("recovered");
+			expect(settled.leases).toEqual([]);
 			await stopHost();
 			await startHost();
 			await waitOnline();
+			// The recorded effect stays immutably unknown; each cold query re-reads the
+			// executor's retained exact-op receipt and never reapplies.
 			expect(await query(saved.operationId)).toMatchObject({
 				status: "saved",
 				result: { snapshotRevision: 37 },
 			});
-			expect((await info()).nativeCalls).toMatchObject({ apply: 0, query: 0, ack: 1 });
+			expect((await info()).nativeCalls).toMatchObject({ apply: 0, query: 1, ack: 1 });
 			const next = await save(Buffer.from("next"), 38);
 			expect(next.ok).toBe(true);
 			expect((await info()).nativeCalls.apply).toBe(1);

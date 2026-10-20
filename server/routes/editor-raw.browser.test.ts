@@ -522,6 +522,14 @@ test("Chrome146 production raw path: 20MiB, dual-view candidate swap, digests, e
 			hidden,
 		);
 		await rapidBody.entered.promise;
+		// Both panels must finish acquiring before the hide. A panel still inside
+		// readMode has no lease; hiding aborts that controller, and the later reveal
+		// posts a new document. Monaco views stay at 0 until the held raw body
+		// installs a model, so the signal is visible consumers, not view count.
+		await page.waitForFunction(() => {
+			const state = (window as unknown as RawWindow).rawFixture.state();
+			return state.registry.workingCopies >= 1 && state.registry.visibleConsumers === 2;
+		});
 		await page.evaluate(() =>
 			(window as unknown as RawWindow).rawFixture.loadingViews(false, false),
 		);

@@ -301,11 +301,11 @@ const CAPABILITIES: readonly Capability[] = [
 	},
 	{
 		id: "sessionFn",
-		what: "connection-scoped counter (`total_changes()`, `last_insert_rowid()`)",
+		what: "connection-scoped counter (`changes()`, `total_changes()`, `last_insert_rowid()`)",
 		why: "per-connection state; with a pooled/networked client the value belongs to whichever session served the call",
-		// These back the revert stack's mutation-detection fingerprints, so the semantics
-		// (counts my connection's changes) are load-bearing, not cosmetic.
-		pattern: /\b(?:total_changes|last_insert_rowid)\s*\(\s*\)/i,
+		// The generic name changes() also occurs in ordinary TypeScript helpers. Anchor that
+		// branch to the SELECT form used by affected-row queries, rather than matching helpers.
+		pattern: /\b(?:total_changes|last_insert_rowid)\s*\(\s*\)|\bSELECT\s+changes\s*\(\s*\)/i,
 	},
 	{
 		id: "errorCode",
@@ -423,7 +423,7 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	],
 	["server/lib/db-resilience.ts", "WAL recovery and `sqlite3 .recover` CLI fallback"],
 	["server/lib/db-worker/worker-entry.ts", "read-only SQLite worker connection"],
-	["server/lib/db-worker/search-query.ts", "bounded read-only SQLite search worker execution"],
+	["server/lib/db-worker/select-rows.ts", "bounded read-only SQLite SELECT worker execution"],
 	["server/lib/db-worker/storage-scan-runner.ts", "SQLite storage scan budgets"],
 	["server/services/storage-scan-queries.ts", "`dbstat`/page-level SQLite storage accounting"],
 	["server/services/database-cleanup-service.ts", "SQLite VACUUM / page accounting maintenance"],
@@ -490,7 +490,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
-	"server/lib/db-worker/search-query.ts": ["driver"],
+	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
 	"server/lib/project-db.ts": ["driver", "pragma"],
 	"server/lib/runtime-source.ts": ["json1"],
@@ -518,7 +518,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
-	"server/services/file-change-evidence.ts": ["nativeClient"],
+	"server/services/file-change-evidence.ts": ["driver", "nativeClient", "drizzleDialect"],
 	"server/services/file-change-physical-audit-worker.ts": [
 		"driver",
 		"pragma",
@@ -544,10 +544,11 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
-	"server/services/narrator-scoped-revert.ts": ["json1"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
 	"server/services/narrator-subagent-recovery.ts": ["handle"],
+	"server/services/notification-center-maintenance.ts": ["sessionFn"],
+	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	"server/services/parent-injection-queue.ts": ["json1"],
 	// The archive seam. Three files below are SQLite-only (the portable FILE), one is not:
@@ -572,13 +573,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 		"sessionFn",
 	],
-	"server/services/revert-mutation-journal.ts": [
-		"driver",
-		"nativeClient",
-		"drizzleDialect",
-		"pragma",
-		"json1",
-	],
+	"server/services/revert-mutation-journal.ts": ["driver", "nativeClient", "drizzleDialect"],
 	"server/services/revert-plan-service.ts": [
 		"driver",
 		"nativeClient",
@@ -595,7 +590,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 		"json1",
 	],
-	"server/services/revert-transaction-service.ts": ["nativeClient", "pragma", "sessionFn"],
 	"server/services/routine-service.ts": ["handle"],
 	// The whole search surface, in one file behind `services/search/port.ts`. NOT SQLite-only: a
 	// second backend implements the same `SearchStore` contract and this file stops being the
@@ -617,16 +611,13 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
 	"server/services/workspace-modification-view.ts": ["rowid"],
-	"server/services/workspace-write-coordinator.ts": ["nativeClient", "drizzleDialect", "pragma"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
 	// SQLite-only exemptions. Mixed archive workers also support PG main stores; only
 	// their portable archive file uses SQLite. Fixture detach uses a private memory DB,
 	// not the main database, but stays explicitly registered rather than widening the scan.
-	"server/lib/db-worker/usage-history-query.ts": ["driver"],
 	"server/lib/disk-safety.ts": ["driver", "errorCode"],
 	"server/services/context-composition-history.ts": ["driver"],
 	"server/services/file-change-diagnostics.ts": ["errorCode"],
-	"server/services/file-change-namespace-reset.ts": ["rowid"],
 	"server/services/local-session-detach/store.ts": ["driver"],
 	"server/services/narrator-context-composition.ts": ["driver", "handle"],
 	"server/services/narrator-permission.ts": ["json1"],
@@ -647,9 +638,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-import.ts": ["connectionModule"],
 	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
 	"server/services/usage-history-service.ts": ["connectionModule"],
-	"server/services/workspace-execution-owner.ts": ["nativeClient", "drizzleDialect"],
-	"server/services/workspace-metadata-retry.ts": ["errorCode"],
-	"server/services/workspace-write-lease-store.ts": ["json1"],
 	"server/services/worktree-lifecycle-guard.ts": ["json1"],
 	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
 	"shared/subagent-tool-summary.ts": ["json1"],
@@ -954,20 +942,79 @@ describe("SQLite dialect inventory guard", () => {
 		}
 	});
 
-	it("self-check: every capability has at least one live user", () => {
-		// A pattern that matches nothing is indistinguishable from a broken one. Any capability
-		// listed in the ledger must therefore be observed by the scan somewhere.
-		//
-		// The exception is deliberate and named: `handle`'s namespace-import branch (case 4 in
-		// HANDLE_PATTERN) has no call site today and is covered by the detection self-check
-		// below instead. That is an over-approximating branch of an already-live capability,
-		// not a capability of its own, so it is not listed here.
-		const live = new Set(
-			[...scanRepository().values()].flatMap((findings) => findings.map((f) => f.capability.id)),
-		);
+	it("self-check: every capability detects source usage and rejects a near miss", () => {
+		// A detector must remain effective after its last production caller is removed. Pin
+		// both directions with fixtures instead of forcing the application to retain usage.
+		// Exact key coverage makes adding a capability without a detector test fail explicitly.
+		const fixtures: Readonly<Record<string, readonly [usage: string, nearMiss: string]>> = {
+			driver: [
+				'import { Database } from "bun:sqlite";',
+				'import { DatabaseSync } from "node:sqlite";',
+			],
+			handle: ['import { sqlite } from "../db";', 'import { db } from "../db";'],
+			nativeClient: ["db.$client.query(sql);", "const id = db.$clientId;"],
+			connectionModule: [
+				'import { openDatabase } from "../db/connection";',
+				'import { getDbDir } from "../db/connection";',
+			],
+			drizzleDialect: [
+				'import { drizzle } from "drizzle-orm/bun-sqlite";',
+				'import { drizzle } from "drizzle-orm/bun-sql";',
+			],
+			sqliteCli: ['const cmd = `sqlite3 "db" ".recover"`;', 'const extension = "sqlite3";'],
+			pragma: ['q("PRAGMA busy_timeout");', "const pragmaTimeout = 250;"],
+			pragmaFn: ['q("SELECT * FROM pragma_table_info(?)");', "pragmaTableInfo();"],
+			sqliteCatalog: ['q("SELECT name FROM sqlite_schema");', "const sqliteSchema = {};"],
+			dbstat: ['q("SELECT pgsize FROM dbstat");', 'const scanMode = "dbstat";'],
+			rowid: ['q("SELECT rowid FROM records");', "const rowId = record.id;"],
+			indexHint: ['q("SELECT id FROM records INDEXED BY records_id");', "const INDEXED_BY = true;"],
+			json1: ['q("SELECT json_valid(?)");', "const value = JSON.parse(raw);"],
+			fts5: [
+				'q("SELECT * FROM messages_fts WHERE messages_fts MATCH ?");',
+				"const messageFts = [];",
+			],
+			insertOr: [
+				'q("INSERT OR IGNORE INTO records (id) VALUES (?)");',
+				'q("INSERT INTO records (id) VALUES (?) ON CONFLICT DO NOTHING");',
+			],
+			glob: ['q("SELECT id FROM records WHERE name GLOB ?");', "const GLOBAL_SCOPE = {};"],
+			blobFn: ['q("SELECT randomblob(16)");', "const randomBlobSize = 16;"],
+			timeFn: ['q("SELECT unixepoch()");', "const time = unixEpochMillis();"],
+			sessionFn: ['q("SELECT total_changes()");', "const count = changes();"],
+			errorCode: ['const code = "SQLITE_BUSY";', 'const note = "SQLITE_BACKUP_NOTE";'],
+			collate: ['q("SELECT name COLLATE NOCASE FROM records");', "collateResults(rows);"],
+			vacuum: ["await vacuumDatabase();", "const vacuuming = false;"],
+		};
+		expect(Object.keys(fixtures).sort()).toEqual([...CAPABILITY_IDS].sort());
 		for (const capability of CAPABILITIES) {
-			expect(live.has(capability.id), `capability "${capability.id}" matches nothing`).toBe(true);
+			const [usage, nearMiss] = fixtures[capability.id];
+			const detect = (source: string) => scanSource(source).map((finding) => finding.capability.id);
+			expect(detect(usage), `${capability.id} must detect its source fixture`).toContain(
+				capability.id,
+			);
+			expect(detect(nearMiss), `${capability.id} must reject a near miss`).not.toContain(
+				capability.id,
+			);
+			expect(detect(`// ${usage}`), `${capability.id} must ignore commented-out usage`).toEqual([]);
 		}
+	});
+
+	it("self-check: removed session counters still require registration when reintroduced", () => {
+		const file = "fake/session-counter.ts";
+		const removed = liveFromSources({ [file]: "export const count = 0;" });
+		expect(diffAgainstLedger(removed, {})).toEqual({
+			unregistered: [],
+			vanishedFiles: [],
+			vanishedCapabilities: [],
+		});
+		for (const counter of ["changes()", "total_changes()", "last_insert_rowid()"] as const) {
+			const reintroduced = liveFromSources({ [file]: `q("SELECT ${counter}");` });
+			const diff = diffAgainstLedger(reintroduced, {});
+			expect(diff.unregistered.map(({ finding }) => finding.capability.id)).toEqual(["sessionFn"]);
+			expect(diff.unregistered[0]?.file).toBe(file);
+			expect(diffAgainstLedger(reintroduced, { [file]: ["sessionFn"] }).unregistered).toEqual([]);
+		}
+		expect(diffAgainstLedger(removed, { [file]: ["sessionFn"] }).vanishedFiles).toEqual([file]);
 	});
 
 	it("self-check: detects each capability in live code and ignores prose", () => {
@@ -1113,9 +1160,12 @@ describe("SQLite dialect inventory guard", () => {
 		expect(detect("q(\"SELECT strftime('%s', 'now')\");")).toContain("timeFn");
 		expect(detect("const julian = calendarDay(1);")).toEqual([]);
 
+		expect(detect('q("SELECT changes() AS value");')).toContain("sessionFn");
 		expect(detect('q("SELECT total_changes() AS value");')).toContain("sessionFn");
 		expect(detect('q("SELECT last_insert_rowid()");')).toContain("sessionFn");
 		expect(detect("const n = countTotalChanges();")).toEqual([]);
+		expect(detect("const n = changes();")).toEqual([]);
+		expect(detect("const n = state.changes();")).toEqual([]);
 
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: intentional fixture, not a template
 		expect(detect("`WHERE ${column} COLLATE BINARY = ?`")).toContain("collate");

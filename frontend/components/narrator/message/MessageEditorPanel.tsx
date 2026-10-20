@@ -1,14 +1,14 @@
 /** Shared historical editor: user messages use the semantic inline document;
  * assistant messages deliberately remain a plain-text edit. */
-import { useEditRegeneratePreview } from "@frontend/hooks/useNarrator";
+import { useRevertActionPreview } from "@frontend/hooks/useNarrator";
 import { usePromptOptimize } from "@frontend/hooks/usePromptOptimize";
 import { Button, Group, Paper, Stack, Text, Textarea } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import type { ComposerDocument } from "@shared/composer-document";
-import { useCallback, useContext, useEffect, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../../lib/api";
-import { type RevertScope, shouldClearEditDraft } from "../../../lib/api/narrators";
+import { type RevertActionConfirmOptions, shouldClearEditDraft } from "../../../lib/api/narrators";
 import { UserAvatar } from "../../UserAvatar";
 import { ComposerFullscreenModal } from "../composer/ComposerFullscreenModal";
 import { readFileReferences } from "../composer/file-reference-input";
@@ -23,7 +23,6 @@ import type {
 import { RevertScopeConfirmModal } from "../permission/RevertScopeConfirmModal";
 import { EditableComposerDocument } from "./EditableComposerDocument";
 import { EditingMessageCtx } from "./EditingMessageCtx";
-import { editRevertNeedsConfirm } from "./message-edit-text";
 
 export {
 	collectTextBlocksPreview,
@@ -53,7 +52,7 @@ export interface MessageEditorPanelProps {
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		revertOpts: { skipRevert: boolean; scope?: RevertScope },
+		revertOpts: RevertActionConfirmOptions,
 		opts?: Omit<ComposerEditSnapshot, "text" | "keepTextFiles" | "composerDocument"> & {
 			composerDocument?: ComposerDocument;
 		},
@@ -92,11 +91,14 @@ export function MessageEditorPanel({
 		textareaRef: textarea,
 		onOptimized: setEditContent,
 	});
-	const { data: revertPreview, isLoading: revertPreviewLoading } = useEditRegeneratePreview(
-		narratorId ?? "",
-		messageId,
-		isUser && !!narratorId && !!messageId,
+	// Load while editing so a submit that restores nothing can skip the dialog.
+	const previewTarget = useMemo(
+		() => (isUser && narratorId ? { messageId } : null),
+		[isUser, narratorId, messageId],
 	);
+	const preview = useRevertActionPreview(narratorId ?? "", "edit_and_regenerate", previewTarget);
+	const revertPreview = preview.data;
+	const revertPreviewLoading = preview.isLoading;
 	const canSubmitEdit = isUser
 		? !!snapshot &&
 			(!!snapshot.text.trim() ||
@@ -105,7 +107,7 @@ export function MessageEditorPanel({
 		: !!editContent.trim();
 
 	const submitUserEdit = useCallback(
-		async (revertOpts: { skipRevert: boolean; scope?: RevertScope }) => {
+		async (revertOpts: RevertActionConfirmOptions) => {
 			if (!messageId || !onEditAndRegenerate || !canSubmitEdit || !snapshot || submitting.current)
 				return;
 			submitting.current = true;
@@ -123,11 +125,23 @@ export function MessageEditorPanel({
 					onClose();
 				}
 			} finally {
+				// The submitted plan is spent either way. Load a fresh one so a retry
+				// after a failed save is judged against current state, never the old plan.
+				preview.invalidate();
+				preview.reload();
 				submitting.current = false;
 				setIsSubmittingEdit(false);
 			}
 		},
-		[messageId, onEditAndRegenerate, canSubmitEdit, snapshot, onClose],
+		[
+			messageId,
+			onEditAndRegenerate,
+			canSubmitEdit,
+			snapshot,
+			onClose,
+			preview.invalidate,
+			preview.reload,
+		],
 	);
 	const confirm = useCallback(() => {
 		if (!isUser) {
@@ -137,8 +151,27 @@ export function MessageEditorPanel({
 			return;
 		}
 		if (!canSubmitEdit || submitting.current) return;
-		if (!editRevertNeedsConfirm(revertPreview)) void submitUserEdit({ skipRevert: false });
-		else setShowConfirmModal(true);
+		// A complete, reviewed plan that restores no files and removes no later
+		// messages has nothing to confirm; submit it as-is. Anything else asks.
+		const plan = revertPreview?.revertPlan;
+		const noop =
+			!revertPreviewLoading &&
+			!revertPreview?.previewIssue &&
+			plan?.status === "prepared" &&
+			!!plan.planHash &&
+			plan.coverageComplete &&
+			plan.filesComplete &&
+			plan.expectedFileCount === 0 &&
+			plan.previewKey === preview.previewKey &&
+			preview.historySummary?.deletedMessageCount === 0;
+		if (noop && plan?.planHash) {
+			void submitUserEdit({
+				skipRevert: false,
+				revertPlan: { planId: plan.planId, planHash: plan.planHash, action: plan.action },
+			});
+			return;
+		}
+		setShowConfirmModal(true);
 	}, [
 		isUser,
 		messageId,
@@ -147,6 +180,9 @@ export function MessageEditorPanel({
 		onClose,
 		canSubmitEdit,
 		revertPreview,
+		revertPreviewLoading,
+		preview.previewKey,
+		preview.historySummary,
 		submitUserEdit,
 	]);
 	const editingCtx = useContext(EditingMessageCtx);
@@ -358,11 +394,16 @@ export function MessageEditorPanel({
 				opened={showConfirmModal}
 				title={t("editRevertConfirmTitle")}
 				description={
-					(revertPreview?.deletedMessageCount ?? 0) > 0
-						? t("editRevertConfirmDesc", { messageCount: revertPreview?.deletedMessageCount ?? 0 })
+					(preview.historySummary?.deletedMessageCount ?? 0) > 0
+						? t("editRevertConfirmDesc", {
+								messageCount: preview.historySummary?.deletedMessageCount ?? 0,
+							})
 						: t("editRevertConfirmDescNoMessages")
 				}
 				data={revertPreview}
+				previewKey={preview.previewKey}
+				onReload={preview.reload}
+				onRequestSnapshotRestore={preview.requestSnapshotRestore}
 				isLoading={revertPreviewLoading}
 				submitting={isSubmittingEdit}
 				confirmWithRevertLabel={t("editRevertConfirmWithRevert")}

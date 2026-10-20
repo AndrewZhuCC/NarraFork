@@ -33,8 +33,10 @@ import { LocalFileValidationError } from "../../../../services/file-change-local
 import {
 	executeLocalFileChange,
 	FileNoDispatchEvidenceError,
+	fileWriteOutcomeMetadata,
 	withFileToolNoDispatch,
 } from "../../../../services/file-change-runtime";
+import { withFileWrite } from "../../../../services/file-write-queue";
 import { prepareRemoteStructSedChange } from "../../../../services/struct-sed-remote-change";
 import { toolSpecPathError } from "../../../spec-uri";
 import { rethrowConfirmedToolDiskError } from "../../disk-safety";
@@ -419,461 +421,483 @@ export const structSedTool: ToolDefinition = {
 		// silently produce a new file instead of reporting that the target is missing,
 		// and the caller would go on believing they edited something real.
 		const createIfMissing = args.create_if_missing === true;
-
-		let originalText: string;
-		let originalBytes: Uint8Array | null = null;
-		let originalEncoding = "utf-8";
-		try {
-			const stat = await backend.statFile(ioPath);
-			if (stat?.isDirectory) {
-				return { output: `${filePath} is a directory.`, isError: true };
-			}
-			if (stat === null && createIfMissing) {
-				// Only commands that supply their own complete content can build a file from
-				// nothing. `delete`/`substitute`/`move` describe a transformation of existing
-				// text, so on a missing file they have nothing to transform and are refused
-				// rather than quietly creating an empty file.
-				const offending = validated.find(
-					(spec) =>
-						spec.command !== "replace" && spec.command !== "insert" && spec.command !== "append",
-				);
-				if (offending) {
-					return {
-						output:
-							`${filePath} does not exist. create_if_missing can only build a new file with ` +
-							`replace/insert/append, which carry their own content; \`${offending.command}\` needs existing text to act on.`,
-						isError: true,
-					};
+		let remoteDispatched = false;
+		const execute = async (): Promise<ToolResult> => {
+			let originalText: string;
+			let originalBytes: Uint8Array | null = null;
+			let originalEncoding = "utf-8";
+			try {
+				const stat = await backend.statFile(ioPath);
+				if (stat?.isDirectory) {
+					return { output: `${filePath} is a directory.`, isError: true };
 				}
-				originalText = "";
-			} else {
-				const read = await backend.readFileBytes(ioPath, {
-					maxBytes: MAX_FILE_BYTES,
-					...(canonicalPath ? { expectedResolvedPath: canonicalPath } : {}),
-					signal: ctx.signal,
-				});
-				if (read.truncated) {
-					return {
-						output: `${filePath} is larger than ${MAX_FILE_BYTES} bytes; StructSed will not edit a partially read file.`,
-						isError: true,
-					};
-				}
-				originalBytes = read.bytes;
-				({ text: originalText, encoding: originalEncoding } = decodeFileBytes(read.bytes));
-			}
-		} catch (err) {
-			return {
-				output: `Error reading ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
-				isError: true,
-			};
-		}
-
-		const normalized = normalizeLineEndings(originalText);
-
-		// `kind` is per-operation: a batch may filter each address differently.
-		const resolveOne = (
-			symbol: string,
-			address: string,
-			role: "source" | "destination",
-			kind: unknown,
-		) =>
-			resolveToRange({
-				symbol,
-				address,
-				role,
-				filePath,
-				resolvedPath,
-				text: normalized,
-				kind,
-				...(ctx.signal ? { signal: ctx.signal } : {}),
-			});
-
-		// Resolve every operation's addresses against the ORIGINAL text. That is what makes
-		// batch addresses predictable: no address shifts because of another operation.
-		interface ResolvedOp {
-			spec: ValidatedSpec;
-			range: LineRange;
-			anchor?: LineRange;
-			label: string;
-		}
-		const resolvedOps: ResolvedOp[] = [];
-		const relocationNotes: string[] = [];
-		for (const spec of validated) {
-			const stashed = stashRanges.get(spec.index);
-			if (stashed) {
-				// Legacy stashes were local. Text equality alone never identifies a source file.
-				if (
-					(stashed.deviceId ?? "local") !== backend.deviceId ||
-					(stashed.pathFlavor !== undefined && stashed.pathFlavor !== backend.pathFlavor) ||
-					!backend.paths.equals(stashed.filePath, ioPath)
-				) {
-					return {
-						output: `stash ${spec.fromStash} can only delete its source file on device ${stashed.deviceId ?? "local"}: ${stashed.filePath}. Nothing changed; the stash is retained.`,
-						isError: true,
-						title: filePath,
-					};
-				}
-				// The recorded line numbers are only a hint; they are verified against the file as
-				// it is NOW. Acting on a stale range would delete whatever moved into those lines.
-				const located = locateStashRange(normalized, stashed);
-				if (located.kind === "ambiguous") {
-					return {
-						output:
-							`stash ${spec.fromStash} holds text that appears ${located.candidates.length} ` +
-							`times in ${filePath} (lines ${located.candidates.join(", ")}), so the original ` +
-							"occurrence cannot be identified. Delete by explicit `address` instead.",
-						isError: true,
-						title: filePath,
-					};
-				}
-				if (located.kind === "missing") {
-					return {
-						output:
-							`stash ${spec.fromStash} was taken from ${stashed.filePath}:` +
-							`${stashed.startLine}-${stashed.endLine}, but that text is no longer in ` +
-							`${filePath} — it was probably rewritten or already removed. Nothing was ` +
-							"changed. Re-stash the current range, or delete by explicit `address`.",
-						isError: true,
-						title: filePath,
-					};
-				}
-				if (located.kind === "relocated") {
-					relocationNotes.push(
-						`stash range moved: L${located.fromStartLine}-${located.fromEndLine} → ` +
-							`L${located.startLine}-${located.endLine} (lines shifted since it was stashed).`,
+				if (stat === null && createIfMissing) {
+					// Only commands that supply their own complete content can build a file from
+					// nothing. `delete`/`substitute`/`move` describe a transformation of existing
+					// text, so on a missing file they have nothing to transform and are refused
+					// rather than quietly creating an empty file.
+					const offending = validated.find(
+						(spec) =>
+							spec.command !== "replace" && spec.command !== "insert" && spec.command !== "append",
 					);
+					if (offending) {
+						return {
+							output:
+								`${filePath} does not exist. create_if_missing can only build a new file with ` +
+								`replace/insert/append, which carry their own content; \`${offending.command}\` needs existing text to act on.`,
+							isError: true,
+						};
+					}
+					originalText = "";
+				} else {
+					const read = await backend.readFileBytes(ioPath, {
+						maxBytes: MAX_FILE_BYTES,
+						...(canonicalPath ? { expectedResolvedPath: canonicalPath } : {}),
+						signal: ctx.signal,
+					});
+					if (read.truncated) {
+						return {
+							output: `${filePath} is larger than ${MAX_FILE_BYTES} bytes; StructSed will not edit a partially read file.`,
+							isError: true,
+						};
+					}
+					originalBytes = read.bytes;
+					({ text: originalText, encoding: originalEncoding } = decodeFileBytes(read.bytes));
 				}
-				const range: LineRange = { startLine: located.startLine, endLine: located.endLine };
-				resolvedOps.push({ spec, range, label: `L${range.startLine}-${range.endLine}` });
-				continue;
-			}
-			const source = await resolveOne(spec.symbol, spec.address, "source", spec.kind);
-			if ("error" in source) return source.error;
-			let anchor: LineRange | undefined;
-			let anchorLabel = "end of file";
-			if (spec.isRelocation && (spec.toSymbol || spec.toAddress)) {
-				const destination = await resolveOne(
-					spec.toSymbol,
-					spec.toAddress,
-					"destination",
-					spec.kind,
-				);
-				if ("error" in destination) return destination.error;
-				anchor = destination.range;
-				anchorLabel = destination.label;
-			}
-			// A relocation names both ends. Reporting only the source would leave the reader
-			// unable to tell where the block actually went.
-			const label = spec.isRelocation
-				? `${source.label} → ${spec.placement} ${anchorLabel}`
-				: source.label;
-			resolvedOps.push({ spec, range: source.range, ...(anchor ? { anchor } : {}), label });
-		}
-
-		const first = resolvedOps[0];
-		if (!first) return { output: "No operation to apply.", isError: true };
-		const addressLabel = isBatch
-			? `${resolvedOps.length} operations`
-			: `${first.spec.command} on ${first.label}`;
-
-		// Substitute reports how many replacements it made. Summed across the batch, since a
-		// batch reports one figure for the whole call.
-		let replacements: number | undefined;
-		const runOne = (op: ResolvedOp, text: string, range: LineRange): string => {
-			const applied = applyCommand(op.spec.command, text, range, {
-				...(op.spec.content !== undefined ? { content: op.spec.content } : {}),
-				...(op.spec.pattern !== undefined ? { pattern: op.spec.pattern } : {}),
-				...(op.spec.replacement !== undefined ? { replacement: op.spec.replacement } : {}),
-				...(op.spec.flags !== undefined ? { flags: op.spec.flags } : {}),
-				...(op.anchor ? { anchor: op.anchor } : {}),
-				...(op.spec.isRelocation ? { placement: op.spec.placement } : {}),
-			});
-			if (applied.replacements != null) {
-				replacements = (replacements ?? 0) + applied.replacements;
-			}
-			return applied.text;
-		};
-
-		// Built from one function so the preview and the write cannot disagree about what the
-		// call does — an earlier version assembled the arguments separately and the copy/move
-		// anchor was missing from both, so the block would have appended at EOF while the card
-		// reported the requested destination.
-		const buildOperations = (): BatchOperation[] =>
-			resolvedOps.map((op) => ({
-				index: op.spec.index,
-				label: op.spec.command,
-				range: op.range,
-				apply: (text: string, range: LineRange) => runOne(op, text, range),
-			}));
-
-		let nextText: string;
-		try {
-			nextText = applyBatch(normalized, buildOperations());
-		} catch (err) {
-			return {
-				output:
-					err instanceof EditOpError
-						? err.message
-						: `Error applying ${addressLabel}: ${err instanceof Error ? err.message : String(err)}`,
-				isError: true,
-				title: filePath,
-			};
-		}
-
-		if (nextText === normalized) {
-			flow.preview();
-			return {
-				output: `No changes: ${addressLabel} produced identical content.`,
-				title: filePath,
-			};
-		}
-
-		const range = first.range;
-		const command = first.spec.command;
-
-		/** One operation's replayable record: selector for readability, range for replay. */
-		const recordOne = (op: (typeof resolvedOps)[number]): Record<string, unknown> => ({
-			command: op.spec.command,
-			...(op.spec.symbol ? { symbol: op.spec.symbol } : {}),
-			...(op.spec.address ? { address: op.spec.address } : {}),
-			...(op.spec.content !== undefined ? { content: op.spec.content } : {}),
-			...(op.spec.pattern !== undefined ? { pattern: op.spec.pattern } : {}),
-			...(op.spec.replacement !== undefined ? { replacement: op.spec.replacement } : {}),
-			...(op.spec.flags !== undefined ? { flags: op.spec.flags } : {}),
-			resolvedStartLine: op.range.startLine,
-			resolvedEndLine: op.range.endLine,
-			// The destination is recorded resolved for the same reason as the source: replay
-			// must not re-run `locate` against content that has since changed.
-			...(op.anchor
-				? { resolvedToStartLine: op.anchor.startLine, resolvedToEndLine: op.anchor.endLine }
-				: {}),
-			...(op.spec.isRelocation ? { placement: op.spec.placement } : {}),
-		});
-
-		// A single call keeps the flat shape it has always had, so existing recorded history
-		// stays replayable by the same branch.
-		//
-		// A batch cannot: the recorded input admits only SCALAR fields (see
-		// `file-change-runtime`), so an `operations` ARRAY was rejected outright — every
-		// batched write failed with "File-change input must contain only JSON scalar fields",
-		// which made the whole batch feature unusable outside a dry run.
-		//
-		// So each operation travels as ONE JSON string. Per-operation scalar columns
-		// (`op1_command`, `op1_start`…) would blow the 16-field budget at five operations,
-		// while this stays at `operations` + N and keeps every field's value a string.
-		const recordedInput: Record<string, unknown> = isBatch
-			? {
-					operations: resolvedOps.length,
-					...Object.fromEntries(
-						resolvedOps.map((op) => [`op${op.spec.index}`, JSON.stringify(recordOne(op))]),
-					),
-				}
-			: (recordOne(first) as Record<string, unknown>);
-
-		// Default-on preview. The model sees the resolved range and the result before
-		// anything is written, which is the check a structural address does not carry.
-		const dryRun = args.dry_run !== false;
-		if (dryRun) {
-			flow.preview();
-			// Approval preview (see `previewStructSedChange`): hand over the whole before/after
-			// pair computed by THIS pipeline, so what the reviewer sees cannot drift from what
-			// the approved call will write.
-			(ctx as PreviewCaptureContext)[PREVIEW_CAPTURE]?.({
-				filePath: ioPath,
-				before: normalized,
-				after: nextText,
-			});
-			const afterRange: LineRange =
-				command === "delete"
-					? { startLine: Math.max(1, range.startLine - 1), endLine: range.startLine }
-					: { startLine: range.startLine, endLine: range.endLine + 4 };
-			// A batch lists every operation, because the whole point of previewing one is
-			// seeing all of what it will do before any of it happens.
-			const plan = isBatch
-				? `${resolvedOps.map((op) => `  ${op.spec.index}. ${op.spec.command} → ${op.label}`).join("\n")}\n`
-				: `${addressLabel}\n`;
-			// The card renders this as one diff per changed region. Computed from the two texts
-			// (not the command's range) so it is correct for move/copy and batches too.
-			// `dryRun: true` tells the card to mark the diff as a PREVIEW: the applied write
-			// below carries the same diff WITHOUT this flag, so identical-looking diffs are
-			// told apart by the banner rather than being mistaken for one another.
-			return {
-				output:
-					`DRY RUN — nothing written. Pass dry_run: false to apply.\n\n` +
-					// A silently corrected range would hide that the file shifted underneath the
-					// stash, which is exactly what the caller needs to know before applying.
-					(relocationNotes.length > 0 ? `${relocationNotes.join("\n")}\n\n` : "") +
-					(stashSummaries.length > 0 ? `${stashSummaries.join("\n")}\n\n` : "") +
-					plan +
-					(replacements != null ? `${replacements} replacement(s)\n` : "") +
-					`\nBefore:\n${previewRegion(normalized, range)}\n` +
-					`\nAfter:\n${previewRegion(nextText, afterRange)}`,
-				title: filePath,
-				metadata: {
-					dryRun: true,
-					command,
-					startLine: range.startLine,
-					endLine: range.endLine,
-					...(isBatch ? { operations: resolvedOps.length } : {}),
-					...(replacements != null ? { replacements } : {}),
-					...diffMetadata(normalized, nextText),
-				},
-			};
-		}
-
-		try {
-			if (backend.kind !== "local") {
-				if (!backend.conditionalWriteFileBytes) {
-					return {
-						output:
-							"Remote StructSed preview is supported, but applying requires an executor upgrade with conditional-write support.",
-						isError: true,
-						title: filePath,
-					};
-				}
-				const nextBytes = encodeFileBytes(
-					applyLineEnding(
-						nextText,
-						detectLineEnding(originalBytes === null ? nextText : originalText),
-					),
-					originalEncoding,
-				);
-				if (nextBytes.byteLength > MAX_FILE_BYTES) {
-					return {
-						output: `StructSed output exceeds ${MAX_FILE_BYTES} bytes. Nothing written.`,
-						isError: true,
-						title: filePath,
-					};
-				}
-				flow.writing();
-				await prepareRemoteStructSedChange(ctx, backend, ioPath, recordedInput, {
-					content: originalBytes === null ? null : originalText,
-					encoding: originalEncoding,
-				});
-				await backend.conditionalWriteFileBytes(ioPath, nextBytes, {
-					expectedBytes: originalBytes,
-					expectedResolvedPath: ioPath,
-					signal: ctx.signal,
-					timeoutMs: 30_000,
-				});
-				await trackFileChange(ctx, ioPath, "edit", backend, changeLineStats(normalized, nextText), {
-					evidenceRecorded: false,
-					toolName: "StructSed",
-				});
-				if (args.keep !== true) {
-					for (const handle of consumedHandles) dropStash(handle, ctx.narratorId);
-				}
+			} catch (err) {
 				return {
-					output: `${command} applied to ${filePath} → ${addressLabel}`,
-					title: filePath,
-					metadata: {
-						command,
-						startLine: range.startLine,
-						endLine: range.endLine,
-						...diffMetadata(normalized, nextText),
-						fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
-						deviceId: backend.deviceId,
-					},
+					output: `Error reading ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
 				};
 			}
-			flow.writing();
-			const recorded = await executeLocalFileChange({
-				ctx,
-				backend,
-				toolName: "StructSed",
-				filePath,
-				// Every operation is recorded with its RESOLVED range so rebuild can replay by
-				// line number without re-running `locate` against changed content. A batch
-				// records ALL of them: recording only the first would replay a multi-operation
-				// call as a single edit, silently dropping the rest.
-				input: recordedInput,
-				construct(before) {
-					// Absent under the write lock but present at read time (or vice versa) is a
-					// real race, so the creation decision is re-made here rather than trusting
-					// the earlier stat.
-					if (before.bytes === null && !createIfMissing) {
-						throw new LocalFileValidationError(`File not found: ${filePath}`);
+
+			const normalized = normalizeLineEndings(originalText);
+
+			// `kind` is per-operation: a batch may filter each address differently.
+			const resolveOne = (
+				symbol: string,
+				address: string,
+				role: "source" | "destination",
+				kind: unknown,
+			) =>
+				resolveToRange({
+					symbol,
+					address,
+					role,
+					filePath,
+					resolvedPath,
+					text: normalized,
+					kind,
+					...(ctx.signal ? { signal: ctx.signal } : {}),
+				});
+
+			// Resolve every operation's addresses against the ORIGINAL text. That is what makes
+			// batch addresses predictable: no address shifts because of another operation.
+			interface ResolvedOp {
+				spec: ValidatedSpec;
+				range: LineRange;
+				anchor?: LineRange;
+				label: string;
+			}
+			const resolvedOps: ResolvedOp[] = [];
+			const relocationNotes: string[] = [];
+			for (const spec of validated) {
+				const stashed = stashRanges.get(spec.index);
+				if (stashed) {
+					// Legacy stashes were local. Text equality alone never identifies a source file.
+					if (
+						(stashed.deviceId ?? "local") !== backend.deviceId ||
+						(stashed.pathFlavor !== undefined && stashed.pathFlavor !== backend.pathFlavor) ||
+						!backend.paths.equals(stashed.filePath, ioPath)
+					) {
+						return {
+							output: `stash ${spec.fromStash} can only delete its source file on device ${stashed.deviceId ?? "local"}: ${stashed.filePath}. Nothing changed; the stash is retained.`,
+							isError: true,
+							title: filePath,
+						};
 					}
-					const decoded =
-						before.bytes === null
-							? { text: "", encoding: "utf-8" as const }
-							: decodeFileBytes(before.bytes);
-					const current = normalizeLineEndings(decoded.text);
-					// Re-apply against the bytes observed under the write lock rather than
-					// trusting the earlier read: the file may have changed in between, and
-					// writing the stale result would clobber that change.
-					// The SAME batch the preview ran, so the two cannot disagree, and so a batch
-					// is applied as one unit here too: `applyBatch` returns a single string, so
-					// a failure part-way through throws and nothing is written.
-					let appliedText: string;
-					try {
-						appliedText = applyBatch(current, buildOperations());
-					} catch (error) {
-						throw new LocalFileValidationError(
-							error instanceof Error ? error.message : String(error),
+					// The recorded line numbers are only a hint; they are verified against the file as
+					// it is NOW. Acting on a stale range would delete whatever moved into those lines.
+					const located = locateStashRange(normalized, stashed);
+					if (located.kind === "ambiguous") {
+						return {
+							output:
+								`stash ${spec.fromStash} holds text that appears ${located.candidates.length} ` +
+								`times in ${filePath} (lines ${located.candidates.join(", ")}), so the original ` +
+								"occurrence cannot be identified. Delete by explicit `address` instead.",
+							isError: true,
+							title: filePath,
+						};
+					}
+					if (located.kind === "missing") {
+						return {
+							output:
+								`stash ${spec.fromStash} was taken from ${stashed.filePath}:` +
+								`${stashed.startLine}-${stashed.endLine}, but that text is no longer in ` +
+								`${filePath} — it was probably rewritten or already removed. Nothing was ` +
+								"changed. Re-stash the current range, or delete by explicit `address`.",
+							isError: true,
+							title: filePath,
+						};
+					}
+					if (located.kind === "relocated") {
+						relocationNotes.push(
+							`stash range moved: L${located.fromStartLine}-${located.fromEndLine} → ` +
+								`L${located.startLine}-${located.endLine} (lines shifted since it was stashed).`,
 						);
 					}
-					// A new file has no existing text to inherit from, so the written content
-					// decides its own ending — matching Write, rather than forcing LF onto a
-					// file whose sibling modules all use CRLF.
-					const ending = detectLineEnding(before.bytes === null ? appliedText : decoded.text);
-					return {
-						nextBytes: encodeFileBytes(applyLineEnding(appliedText, ending), decoded.encoding),
-						// Measured from the bytes under the write lock, not the earlier read:
-						// the figure must describe what was actually written.
-						lineStats: changeLineStats(current, appliedText),
-						result: {
-							output:
-								`${command} applied to ${filePath} → ${addressLabel}` +
-								(replacements != null ? ` (${replacements} replacement(s))` : "") +
-								(relocationNotes.length > 0 ? `\n${relocationNotes.join("\n")}` : ""),
-							title: filePath,
-							metadata: {
-								command,
-								startLine: range.startLine,
-								endLine: range.endLine,
-								...(replacements != null ? { replacements } : {}),
-								// Same diff the preview showed, so an applied edit is not a bare
-								// one-line summary. Computed from the bytes observed under the write
-								// lock (`current`), not the earlier read, so it reflects what was
-								// actually written. No `dryRun` flag: the card shows this diff
-								// without the PREVIEW banner.
-								...diffMetadata(current, appliedText),
-							},
-						},
-					};
-				},
-			});
-			// `undefined` means the pipeline declined: no tool-call binding, so the change
-			// would carry no snapshot, attribution or tree boundary. Edit has a legacy
-			// fallback that writes anyway; StructSed deliberately refuses instead. A
-			// structural rewrite with no recorded evidence is not revertable, and this tool
-			// exists to make large edits, which is exactly when revert matters.
-			if (!recorded) {
+					const range: LineRange = { startLine: located.startLine, endLine: located.endLine };
+					resolvedOps.push({ spec, range, label: `L${range.startLine}-${range.endLine}` });
+					continue;
+				}
+				const source = await resolveOne(spec.symbol, spec.address, "source", spec.kind);
+				if ("error" in source) return source.error;
+				let anchor: LineRange | undefined;
+				let anchorLabel = "end of file";
+				if (spec.isRelocation && (spec.toSymbol || spec.toAddress)) {
+					const destination = await resolveOne(
+						spec.toSymbol,
+						spec.toAddress,
+						"destination",
+						spec.kind,
+					);
+					if ("error" in destination) return destination.error;
+					anchor = destination.range;
+					anchorLabel = destination.label;
+				}
+				// A relocation names both ends. Reporting only the source would leave the reader
+				// unable to tell where the block actually went.
+				const label = spec.isRelocation
+					? `${source.label} → ${spec.placement} ${anchorLabel}`
+					: source.label;
+				resolvedOps.push({ spec, range: source.range, ...(anchor ? { anchor } : {}), label });
+			}
+
+			const first = resolvedOps[0];
+			if (!first) return { output: "No operation to apply.", isError: true };
+			const addressLabel = isBatch
+				? `${resolvedOps.length} operations`
+				: `${first.spec.command} on ${first.label}`;
+
+			// Substitute reports how many replacements it made. Summed across the batch, since a
+			// batch reports one figure for the whole call.
+			let replacements: number | undefined;
+			const runOne = (op: ResolvedOp, text: string, range: LineRange): string => {
+				const applied = applyCommand(op.spec.command, text, range, {
+					...(op.spec.content !== undefined ? { content: op.spec.content } : {}),
+					...(op.spec.pattern !== undefined ? { pattern: op.spec.pattern } : {}),
+					...(op.spec.replacement !== undefined ? { replacement: op.spec.replacement } : {}),
+					...(op.spec.flags !== undefined ? { flags: op.spec.flags } : {}),
+					...(op.anchor ? { anchor: op.anchor } : {}),
+					...(op.spec.isRelocation ? { placement: op.spec.placement } : {}),
+				});
+				if (applied.replacements != null) {
+					replacements = (replacements ?? 0) + applied.replacements;
+				}
+				return applied.text;
+			};
+
+			// Built from one function so the preview and the write cannot disagree about what the
+			// call does — an earlier version assembled the arguments separately and the copy/move
+			// anchor was missing from both, so the block would have appended at EOF while the card
+			// reported the requested destination.
+			const buildOperations = (): BatchOperation[] =>
+				resolvedOps.map((op) => ({
+					index: op.spec.index,
+					label: op.spec.command,
+					range: op.range,
+					apply: (text: string, range: LineRange) => runOne(op, text, range),
+				}));
+
+			let nextText: string;
+			try {
+				nextText = applyBatch(normalized, buildOperations());
+			} catch (err) {
 				return {
 					output:
-						"StructSed requires a recorded tool call to write (for snapshot and revert evidence) and this call has none. Use Edit if you need to write without it.",
+						err instanceof EditOpError
+							? err.message
+							: `Error applying ${addressLabel}: ${err instanceof Error ? err.message : String(err)}`,
 					isError: true,
 					title: filePath,
 				};
 			}
-			// Released only now, after the bytes are actually on disk. Releasing earlier would
-			// discard the only copy of the text if the write then failed. `keep: true` holds it
-			// so one stash can be written to several places.
-			if (args.keep !== true) {
-				for (const handle of consumedHandles) dropStash(handle, ctx.narratorId);
+
+			if (nextText === normalized) {
+				flow.preview();
+				return {
+					output: `No changes: ${addressLabel} produced identical content.`,
+					title: filePath,
+				};
 			}
-			return recorded;
-		} catch (err) {
-			if (err instanceof FileNoDispatchEvidenceError) throw err;
-			rethrowConfirmedToolDiskError(err, ctx, true);
-			return {
-				output: `Error editing ${filePath}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
-				isError: true,
-				title: filePath,
-				metadata: fileChangeDiagnosticMetadata(err),
-			};
-		}
+
+			const range = first.range;
+			const command = first.spec.command;
+
+			/** One operation's replayable record: selector for readability, range for replay. */
+			const recordOne = (op: (typeof resolvedOps)[number]): Record<string, unknown> => ({
+				command: op.spec.command,
+				...(op.spec.symbol ? { symbol: op.spec.symbol } : {}),
+				...(op.spec.address ? { address: op.spec.address } : {}),
+				...(op.spec.content !== undefined ? { content: op.spec.content } : {}),
+				...(op.spec.pattern !== undefined ? { pattern: op.spec.pattern } : {}),
+				...(op.spec.replacement !== undefined ? { replacement: op.spec.replacement } : {}),
+				...(op.spec.flags !== undefined ? { flags: op.spec.flags } : {}),
+				resolvedStartLine: op.range.startLine,
+				resolvedEndLine: op.range.endLine,
+				// The destination is recorded resolved for the same reason as the source: replay
+				// must not re-run `locate` against content that has since changed.
+				...(op.anchor
+					? { resolvedToStartLine: op.anchor.startLine, resolvedToEndLine: op.anchor.endLine }
+					: {}),
+				...(op.spec.isRelocation ? { placement: op.spec.placement } : {}),
+			});
+
+			// A single call keeps the flat shape it has always had, so existing recorded history
+			// stays replayable by the same branch.
+			//
+			// A batch cannot: the recorded input admits only SCALAR fields (see
+			// `file-change-runtime`), so an `operations` ARRAY was rejected outright — every
+			// batched write failed with "File-change input must contain only JSON scalar fields",
+			// which made the whole batch feature unusable outside a dry run.
+			//
+			// So each operation travels as ONE JSON string. Per-operation scalar columns
+			// (`op1_command`, `op1_start`…) would blow the 16-field budget at five operations,
+			// while this stays at `operations` + N and keeps every field's value a string.
+			const recordedInput: Record<string, unknown> = isBatch
+				? {
+						operations: resolvedOps.length,
+						...Object.fromEntries(
+							resolvedOps.map((op) => [`op${op.spec.index}`, JSON.stringify(recordOne(op))]),
+						),
+					}
+				: (recordOne(first) as Record<string, unknown>);
+
+			// Default-on preview. The model sees the resolved range and the result before
+			// anything is written, which is the check a structural address does not carry.
+			const dryRun = args.dry_run !== false;
+			if (dryRun) {
+				flow.preview();
+				// Approval preview (see `previewStructSedChange`): hand over the whole before/after
+				// pair computed by THIS pipeline, so what the reviewer sees cannot drift from what
+				// the approved call will write.
+				(ctx as PreviewCaptureContext)[PREVIEW_CAPTURE]?.({
+					filePath: ioPath,
+					before: normalized,
+					after: nextText,
+				});
+				const afterRange: LineRange =
+					command === "delete"
+						? { startLine: Math.max(1, range.startLine - 1), endLine: range.startLine }
+						: { startLine: range.startLine, endLine: range.endLine + 4 };
+				// A batch lists every operation, because the whole point of previewing one is
+				// seeing all of what it will do before any of it happens.
+				const plan = isBatch
+					? `${resolvedOps.map((op) => `  ${op.spec.index}. ${op.spec.command} → ${op.label}`).join("\n")}\n`
+					: `${addressLabel}\n`;
+				// The card renders this as one diff per changed region. Computed from the two texts
+				// (not the command's range) so it is correct for move/copy and batches too.
+				// `dryRun: true` tells the card to mark the diff as a PREVIEW: the applied write
+				// below carries the same diff WITHOUT this flag, so identical-looking diffs are
+				// told apart by the banner rather than being mistaken for one another.
+				return {
+					output:
+						`DRY RUN — nothing written. Pass dry_run: false to apply.\n\n` +
+						// A silently corrected range would hide that the file shifted underneath the
+						// stash, which is exactly what the caller needs to know before applying.
+						(relocationNotes.length > 0 ? `${relocationNotes.join("\n")}\n\n` : "") +
+						(stashSummaries.length > 0 ? `${stashSummaries.join("\n")}\n\n` : "") +
+						plan +
+						(replacements != null ? `${replacements} replacement(s)\n` : "") +
+						`\nBefore:\n${previewRegion(normalized, range)}\n` +
+						`\nAfter:\n${previewRegion(nextText, afterRange)}`,
+					title: filePath,
+					metadata: {
+						dryRun: true,
+						command,
+						startLine: range.startLine,
+						endLine: range.endLine,
+						...(isBatch ? { operations: resolvedOps.length } : {}),
+						...(replacements != null ? { replacements } : {}),
+						...diffMetadata(normalized, nextText),
+					},
+				};
+			}
+
+			try {
+				if (backend.kind !== "local") {
+					if (!backend.conditionalWriteFileBytes) {
+						return {
+							output:
+								"Remote StructSed preview is supported, but applying requires an executor upgrade with conditional-write support.",
+							isError: true,
+							title: filePath,
+						};
+					}
+					const nextBytes = encodeFileBytes(
+						applyLineEnding(
+							nextText,
+							detectLineEnding(originalBytes === null ? nextText : originalText),
+						),
+						originalEncoding,
+					);
+					if (nextBytes.byteLength > MAX_FILE_BYTES) {
+						return {
+							output: `StructSed output exceeds ${MAX_FILE_BYTES} bytes. Nothing written.`,
+							isError: true,
+							title: filePath,
+						};
+					}
+					flow.writing();
+					const historyStatus = await prepareRemoteStructSedChange(
+						ctx,
+						backend,
+						ioPath,
+						recordedInput,
+						{
+							content: originalBytes === null ? null : originalText,
+							encoding: originalEncoding,
+						},
+					);
+					remoteDispatched = true;
+					await backend.conditionalWriteFileBytes(ioPath, nextBytes, {
+						expectedBytes: originalBytes,
+						expectedResolvedPath: ioPath,
+						signal: ctx.signal,
+						timeoutMs: 30_000,
+					});
+					if (args.keep !== true) {
+						for (const handle of consumedHandles) dropStash(handle, ctx.narratorId);
+					}
+					return {
+						output: `${command} applied to ${filePath} → ${addressLabel}`,
+						title: filePath,
+						metadata: {
+							command,
+							startLine: range.startLine,
+							endLine: range.endLine,
+							...diffMetadata(normalized, nextText),
+							diskOutcome: "applied",
+							historyStatus,
+							fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
+							deviceId: backend.deviceId,
+						},
+					};
+				}
+				flow.writing();
+				const recorded = await executeLocalFileChange({
+					ctx,
+					backend,
+					toolName: "StructSed",
+					filePath,
+					// Every operation is recorded with its RESOLVED range so rebuild can replay by
+					// line number without re-running `locate` against changed content. A batch
+					// records ALL of them: recording only the first would replay a multi-operation
+					// call as a single edit, silently dropping the rest.
+					input: recordedInput,
+					construct(before) {
+						// Absent under the write lock but present at read time (or vice versa) is a
+						// real race, so the creation decision is re-made here rather than trusting
+						// the earlier stat.
+						if (before.bytes === null && !createIfMissing) {
+							throw new LocalFileValidationError(`File not found: ${filePath}`);
+						}
+						if (
+							before.bytes === null
+								? originalBytes !== null
+								: originalBytes === null || !Buffer.from(before.bytes).equals(originalBytes)
+						)
+							throw new LocalFileValidationError(
+								"File changed after resolving structural ranges; retry with the current file",
+							);
+						// Byte identity is now verified under the write lock. Reuse the resolved
+						// transformation, encoding and counts instead of applying the batch twice.
+						// A newly created file inherits its ending from the written content.
+						const ending = detectLineEnding(originalBytes === null ? nextText : originalText);
+						return {
+							nextBytes: encodeFileBytes(applyLineEnding(nextText, ending), originalEncoding),
+							lineStats: changeLineStats(normalized, nextText),
+							result: {
+								output:
+									`${command} applied to ${filePath} → ${addressLabel}` +
+									(replacements != null ? ` (${replacements} replacement(s))` : "") +
+									(relocationNotes.length > 0 ? `\n${relocationNotes.join("\n")}` : ""),
+								title: filePath,
+								metadata: {
+									command,
+									startLine: range.startLine,
+									endLine: range.endLine,
+									...(replacements != null ? { replacements } : {}),
+									// The verified bytes match the preview source. No `dryRun` flag:
+									// the card shows this applied diff without the PREVIEW banner.
+									...diffMetadata(normalized, nextText),
+								},
+							},
+						};
+					},
+				});
+				// `undefined` means the pipeline declined: no tool-call binding, so the change
+				// would carry no snapshot, attribution or tree boundary. Edit has a legacy
+				// fallback that writes anyway; StructSed deliberately refuses instead. A
+				// structural rewrite with no recorded evidence is not revertable, and this tool
+				// exists to make large edits, which is exactly when revert matters.
+				if (!recorded) {
+					return {
+						output:
+							"StructSed requires a recorded tool call to write (for snapshot and revert evidence) and this call has none. Use Edit if you need to write without it.",
+						isError: true,
+						title: filePath,
+					};
+				}
+				// Released only now, after the bytes are actually on disk. Releasing earlier would
+				// discard the only copy of the text if the write then failed. `keep: true` holds it
+				// so one stash can be written to several places.
+				if (args.keep !== true) {
+					for (const handle of consumedHandles) dropStash(handle, ctx.narratorId);
+				}
+				return recorded;
+			} catch (err) {
+				if (err instanceof FileNoDispatchEvidenceError) throw err;
+				rethrowConfirmedToolDiskError(err, ctx, true);
+				return {
+					output: `Error editing ${filePath}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
+					isError: true,
+					title: filePath,
+					metadata: {
+						diskOutcome: remoteDispatched ? "unknown" : "not_applied",
+						historyStatus: "unavailable",
+						...fileChangeDiagnosticMetadata(err),
+						...fileWriteOutcomeMetadata(err),
+					},
+				};
+			}
+		};
+		if (backend.kind === "local" || args.dry_run !== false) return execute();
+		const queuePath = canonicalPath ?? (await backend.resolvePathIdentity(ioPath)).canonicalPath;
+		return withFileWrite(
+			{
+				deviceId: backend.deviceId,
+				pathFlavor: backend.pathFlavor as "posix" | "windows",
+				canonicalPath: queuePath,
+			},
+			execute,
+			{ signal: ctx.signal },
+		).then(async (result) => {
+			if (result.metadata?.diskOutcome === "applied") {
+				const { linesAdded, linesRemoved } = result.metadata;
+				await trackFileChange(
+					ctx,
+					ioPath,
+					"edit",
+					backend,
+					typeof linesAdded === "number" && typeof linesRemoved === "number"
+						? { added: linesAdded, removed: linesRemoved }
+						: null,
+					{ evidenceRecorded: false, toolName: "StructSed" },
+				);
+			}
+			return result;
+		});
 	}),
 };
 

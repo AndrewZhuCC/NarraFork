@@ -20,10 +20,12 @@ mock.module("../../websocket/narrator-ws", () => ({
 }));
 
 const { gateway } = await import("../gateway");
+const { eventBus } = await import("../../lib/event-bus");
 const NOW = "2026-07-19T00:00:00.000Z";
 
 interface GatewayTestAccess {
 	adapters: Map<string, PlatformAdapter>;
+	subscribeToEvents(): void;
 	notifyRecentTabStatusChange(
 		narratorId: string,
 		reason: "waiting_permission" | "done" | "error",
@@ -211,5 +213,31 @@ describe("gateway normalized recent-tabs consumers", () => {
 		expect(output).toContain("Project One");
 		expect(output.indexOf("Workspace One")).toBeLessThan(output.indexOf("Target narrator"));
 		expect(output.indexOf("Target narrator")).toBeLessThan(output.indexOf("Project One"));
+	});
+
+	it("suppresses the recent-tab IM ping when the done event carries backgroundWorkActive", async () => {
+		seedFixture();
+		const sent: Array<{ chatId: string; text: string }> = [];
+		const instance = gateway as unknown as GatewayTestAccess;
+		instance.adapters.set("webhook", createAdapter(sent));
+		// The attention listener is registered from start() in production; the test
+		// gateway is never started, so register it explicitly.
+		instance.subscribeToEvents();
+
+		eventBus.emit({
+			type: "narrator:attention",
+			narratorId: "gateway-target",
+			reason: "done",
+			backgroundWorkActive: true,
+		});
+		for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(sent).toHaveLength(0);
+
+		// The unflagged done (e.g. the wake-up turn after the last background task)
+		// still pings exactly as before.
+		eventBus.emit({ type: "narrator:attention", narratorId: "gateway-target", reason: "done" });
+		for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.text).toContain("Target narrator");
 	});
 });

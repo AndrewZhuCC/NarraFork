@@ -52,12 +52,6 @@ let store: FileChangeBlobStore;
 const namespaceKey = "isolated-audit-namespace";
 const generation = 1;
 const timers = new Set<ReturnType<typeof setInterval>>();
-const verification = {
-	namespaceIdentityVerified: true,
-	writersQuiescent: true,
-	physicalInventoryComplete: true,
-	catalogMatchesInventory: true,
-} as const;
 
 beforeAll(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
@@ -78,13 +72,13 @@ beforeEach(async () => {
 	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	catalog = new FileChangeBlobCatalog({ db: drizzle(sqlite), namespaceKey });
 	catalog.initializeNamespace({ expectedGeneration: null });
-	catalog.beginReconciliation({ expectedGeneration: 0 });
-	// Empty, privately owned test namespace: fixture setup only, never an audit outcome.
-	catalog.completeReconciliation({
-		expectedGeneration: generation,
-		verifiedUsedBytes: 0,
-		verification,
-	});
+	// Seed archived v2 metadata directly. The read-only audit still checks this
+	// snapshot; new captures have no maintenance admission state machine.
+	sqlite
+		.query(
+			"UPDATE file_change_storage_budgets SET status = 'ready', generation = ? WHERE id = 'file-change-blobs'",
+		)
+		.run(generation);
 	store = new FileChangeBlobStore({
 		root: blobRoot,
 		minimumFreeBytes: 0,
@@ -100,6 +94,21 @@ afterEach(async () => {
 afterAll(() => {
 	template = new Uint8Array();
 });
+
+function insertLegacyReservation(size: number, ownerEpoch = "archived-writer"): void {
+	sqlite.transaction(() => {
+		sqlite
+			.query(
+				"INSERT INTO file_change_blob_reservations (id,budget_id,owner_epoch,generation,expected_size,created_at) VALUES (?, 'file-change-blobs', ?, ?, ?, ?)",
+			)
+			.run(randomUUID(), ownerEpoch, generation, size, new Date().toISOString());
+		sqlite
+			.query(
+				"UPDATE file_change_storage_budgets SET reserved_bytes = reserved_bytes + ? WHERE id = 'file-change-blobs'",
+			)
+			.run(size);
+	})();
+}
 
 async function identity(path: string): Promise<FileChangeAuditIdentity> {
 	const info = await lstat(path, { bigint: true });
@@ -440,13 +449,7 @@ describe("physical audit: actual migrated file DB and BlobStore/Catalog", () => 
 	});
 
 	test("pending zero-byte and nonzero reservations are observed, never refunded or settled", async () => {
-		for (const size of [0, 7])
-			catalog.reserve({
-				expectedGeneration: generation,
-				ownerEpoch: "test-writer",
-				expectedSize: size,
-				signal: new AbortController().signal,
-			});
+		for (const size of [0, 7]) insertLegacyReservation(size);
 		const original = await readFile(databasePath);
 		const summary = await auditFileChangePhysical(await options());
 		expect(summary.start?.pendingReservations).toBe("present");
@@ -767,12 +770,7 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		const summary = await auditDuringMetadataMutation(
 			() => {
 				changed = true;
-				catalog.reserve({
-					expectedGeneration: generation,
-					ownerEpoch: "late-writer",
-					expectedSize: 0,
-					signal: new AbortController().signal,
-				});
+				insertLegacyReservation(0, "late-legacy-writer");
 			},
 			{ chunkBytes: 1024 },
 		);
@@ -802,7 +800,11 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 				const currentBudget = catalog.getBudget();
 				if (!currentBudget) throw new Error("Observed hash progress has no catalog budget");
 				generationBeforeMutation = currentBudget.generation;
-				catalog.beginReconciliation({ expectedGeneration: generation });
+				sqlite
+					.query(
+						"UPDATE file_change_storage_budgets SET status = 'reconciling', generation = generation + 1 WHERE id = 'file-change-blobs'",
+					)
+					.run();
 			} finally {
 				release();
 			}

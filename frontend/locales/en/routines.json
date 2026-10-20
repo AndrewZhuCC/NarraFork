@@ -311,5 +311,6 @@
 	"hookFieldDurationMs": "Total duration of this turn (milliseconds)",
 	"hookFieldTotalTokens": "Tokens consumed this turn (non-cached input + output)",
 	"hookFieldAttentionReason": "Attention reason (waiting_permission / done / error)",
-	"hookFieldAttentionDetail": "Extra context (e.g. the user's decision \"allow\" / \"deny\" for a resolved permission)"
+	"hookFieldAttentionDetail": "Extra context (e.g. the user's decision \"allow\" / \"deny\" for a resolved permission)",
+	"hookFieldBackgroundWorkActive": "Present (true) only for done while background work that wakes the narrator on completion is still running (background bash tasks / subagents; never transfers or services); IM/sound/browser notifications suppress themselves, hooks decide"
 }

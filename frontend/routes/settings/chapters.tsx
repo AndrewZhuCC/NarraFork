@@ -2,7 +2,6 @@ import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { ChaptersContainersSection } from "../../components/settings/ChaptersContainersSection";
-import { WorkspaceBarriersCard } from "../../components/settings/WorkspaceBarriersCard";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 
 export const Route = createFileRoute("/settings/chapters")({
@@ -38,7 +37,6 @@ function SettingsChaptersPage() {
 				proxyPort={is.proxyPort}
 				setProxyPort={is.setProxyPort}
 			/>
-			<WorkspaceBarriersCard />
 		</Stack>
 	);
 }

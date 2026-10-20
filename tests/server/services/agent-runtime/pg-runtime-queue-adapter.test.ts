@@ -444,6 +444,45 @@ describe("PostgreSQL runtime queue adapter (scratch schema, real engine)", () =>
 								99,
 							),
 						).toBe(false);
+						// A receiver-side edit uses the shared semantic patch with PG's GREATEST:
+						// the original adoption stays, current content needs a fresh fact.
+						const reservedMessage = materialized.recipientMessageId ?? "";
+						const edited = await client.db.transaction((tx) =>
+							store.mailbox.updateRecipientRef(tx, "n-d", refId, {
+								kind: "semantic_edit",
+								messageId: reservedMessage,
+							}),
+						);
+						expect(edited).toBe(1);
+						const editedRow = await client.sql.unsafe(
+							`SELECT receipt_disposition, current_message_id, current_revision, current_adopted_revision, adopted_revision FROM narrator_buffered_messages WHERE id = '${materialized.id}'`,
+						);
+						expect(editedRow[0]).toMatchObject({
+							receipt_disposition: "superseded",
+							current_message_id: reservedMessage,
+							current_revision: 2,
+							current_adopted_revision: null,
+							adopted_revision: 1,
+						});
+						const editedRef = await client.sql.unsafe(
+							`SELECT injection_consumed_at FROM narrator_message_refs WHERE id = '${refId}'`,
+						);
+						expect(editedRef[0]?.injection_consumed_at).toBeNull();
+						// Recipient deletion uses the shared receipt patch on the real engine: it
+						// keeps the original delivery but drops the current ref pointer.
+						const deleted = await client.db.transaction((tx) =>
+							store.mailbox.updateRecipientRef(tx, "n-d", refId, { kind: "deleted" }),
+						);
+						expect(deleted).toBe(1);
+						const deletedRow = await client.sql.unsafe(
+							`SELECT receipt_disposition, current_message_id, state, delivery_id FROM narrator_buffered_messages WHERE id = '${materialized.id}'`,
+						);
+						expect(deletedRow[0]).toMatchObject({
+							receipt_disposition: "recipient_deleted",
+							current_message_id: null,
+							state: "materialized",
+							delivery_id: materialized.deliveryId,
+						});
 
 						// ── E. outbox: reserve → commit → duplicate → transfer, and failRecipient ──
 						stage = "E-outbox";

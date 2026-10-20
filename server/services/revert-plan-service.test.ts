@@ -29,6 +29,7 @@ import {
 	RevertPlanService,
 	type RevertPlanSummaryCursor,
 	revertPlanHeaderDigest,
+	revertPlanInternals,
 } from "./revert-plan-service";
 
 // Standalone schema fixtures only: no application DB, migrations, runtime or production IO.
@@ -87,7 +88,7 @@ CREATE TABLE revert_operation_files (
  desired_blob_digest TEXT REFERENCES file_change_blobs(digest),
  observed_after_blob_digest TEXT REFERENCES file_change_blobs(digest),
  apply_mutation_id TEXT NOT NULL, apply_request_digest TEXT NOT NULL,
- compensate_mutation_id TEXT NOT NULL, compensate_request_digest TEXT NOT NULL,
+ compensate_mutation_id TEXT, compensate_request_digest TEXT,
  status TEXT NOT NULL DEFAULT 'prepared', receipt_json TEXT, reason TEXT, updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX idx_revert_file_identity ON revert_operation_files(revert_operation_id, file_key);
@@ -111,6 +112,7 @@ let service: RevertPlanService;
 let clock: number;
 let serial: number;
 let queries: string[];
+let lookups: { query: string; params: unknown[] }[];
 let published: Map<string, string>;
 let scope: typeof fileChangeScopes.$inferSelect;
 
@@ -121,12 +123,15 @@ beforeEach(() => {
 	serial = 0;
 	published = new Map();
 	queries = [];
+	lookups = [];
 	sqlite = new Database(":memory:");
 	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	sqlite.exec(DDL);
 	db = drizzle(sqlite, {
 		logger: {
-			logQuery: (query) => {
+			logQuery: (query, params) => {
+				if (query.startsWith("select ") && query.includes('"sequence" in ('))
+					lookups.push({ query, params });
 				if (queries.length < 10_000) queries.push(query);
 			},
 		},
@@ -425,6 +430,9 @@ describe("bounded fixed-file append and publication validation", () => {
 		);
 		expect(storedFiles(result.id)[0]).toEqual(row);
 		incomplete(result.id);
+		expect(row.beforeBlobDigest).toBe(
+			row.expectedStateJson.kind === "regular" ? row.expectedStateJson.blob.digest : null,
+		);
 		for (const digest of [row.beforeBlobDigest, row.desiredBlobDigest])
 			expect(() =>
 				db
@@ -465,7 +473,7 @@ describe("bounded fixed-file append and publication validation", () => {
 	test("unknown state, unsupported object and raw-body metadata are never persisted", async () => {
 		const input = plan();
 		const result = service.begin(input);
-		for (const bad of [{ kind: "unknown", reason: "missing_before" }, null, { kind: "directory" }])
+		for (const bad of [null, { kind: "directory" }])
 			await rejected(
 				service.appendFiles(owner, result.id, [{ ...file(), expected: bad as FileChangeState }]),
 				"UNKNOWN_STATE",
@@ -484,6 +492,20 @@ describe("bounded fixed-file append and publication validation", () => {
 			"INVALID_INPUT",
 		);
 		expect(storedFiles(result.id)).toHaveLength(0);
+	});
+
+	test("an unavailable target remains visible in a prepared partial plan", async () => {
+		const target = file(0, known("current"), { kind: "unknown", reason: "history_unavailable" });
+		const input = plan([target]);
+		input.manifestProof.computation = "partial";
+		input.manifestProof.unknownFiles = 1;
+		const result = await service.prepare(input, [target]);
+		expect(result.status).toBe("prepared");
+		expect(result.coverageComplete).toBe(false);
+		expect(service.listFiles(owner, result.id).items[0].desiredStateJson).toEqual({
+			kind: "unknown",
+			reason: "history_unavailable",
+		});
 	});
 
 	test("undeclared inputJson is rejected before any getter/body copy", async () => {
@@ -524,8 +546,8 @@ describe("bounded fixed-file append and publication validation", () => {
 			.set({ status: "needs_verification" })
 			.where(eq(fileChangeScopes.id, scope.id))
 			.run();
-		await rejected(service.appendFiles(owner, result.id, [f]), "TARGET_UNVERIFIED");
-		expect(storedFiles(result.id)).toHaveLength(0);
+		expect(await service.appendFiles(owner, result.id, [f])).toHaveLength(1);
+		expect(storedFiles(result.id)).toHaveLength(1);
 	});
 
 	test("manifest refs reject nonexistent, staging, expired, missing and wrong-size catalog entries", () => {
@@ -553,7 +575,7 @@ describe("bounded fixed-file append and publication validation", () => {
 		const f = file();
 		const input = plan([f]);
 		const result = service.begin(input);
-		const expectedRef = f.expected.kind === "regular" ? f.expected.blob : publish("unreachable");
+		const expectedRef = f.desired.kind === "regular" ? f.desired.blob : publish("unreachable");
 		db.update(fileChangeBlobs)
 			.set({ status: "staging" })
 			.where(eq(fileChangeBlobs.digest, expectedRef.digest))
@@ -583,14 +605,14 @@ describe("bounded fixed-file append and publication validation", () => {
 		);
 		for (const status of ["unverified", "reconciling"] as const) {
 			db.update(fileChangeStorageBudgets).set({ status }).run();
-			await rejected(service.appendFiles(owner, result.id, [f]), "CATALOG_UNVERIFIED");
-			code(() => service.begin(plan()), "CATALOG_UNVERIFIED");
+			expect(await service.appendFiles(owner, result.id, [f])).toHaveLength(1);
+			expect(service.begin(plan()).status).toBe("planned");
 		}
 		db.update(fileChangeStorageBudgets)
 			.set({ status: "ready", namespaceKey: "another-physical-store" })
 			.run();
 		await rejected(service.appendFiles(owner, result.id, [f]), "CATALOG_UNVERIFIED");
-		expect(storedFiles(result.id)).toHaveLength(0);
+		expect(storedFiles(result.id)).toHaveLength(1);
 	});
 
 	test("symlink targets stay raw refs and absence remains distinct from empty regular content", async () => {
@@ -718,6 +740,125 @@ describe("complete preparation, bounds and failures", () => {
 		).toBe(false);
 	}, 20_000);
 
+	for (const count of [32, 1000]) {
+		test(`${count} files use one bounded lookup per append batch and one final paginated pass`, async () => {
+			const files = Array.from({ length: count }, (_, i) => file(i, ABSENT, ABSENT));
+			const input = plan(files);
+			queries = [];
+			const result = await appendAll(input, files);
+			const batches = Math.ceil(count / REVERT_PLAN_BATCH_ITEMS);
+			const fileQueries = () =>
+				queries.filter(
+					(query) => query.startsWith("select ") && query.includes('from "revert_operation_files"'),
+				);
+			expect(fileQueries()).toHaveLength(batches);
+			expect(revertPlanInternals.fileStatuses).toEqual(revertOperationFiles.status.enumValues);
+			const lookup = lookups[lookups.length - 1];
+			const queryPlan = sqlite
+				.query(`EXPLAIN QUERY PLAN ${lookup.query}`)
+				.all(...(lookup.params as (string | number | null)[]))
+				.map((row) => (row as { detail: string }).detail)
+				.join("\n");
+			expect(queryPlan).toContain("MULTI-INDEX OR");
+			expect(queryPlan).toContain(
+				"idx_revert_file_identity (revert_operation_id=? AND file_key=?)",
+			);
+			expect(queryPlan).toContain(
+				"idx_revert_file_pending (revert_operation_id=? AND status=? AND sequence=?)",
+			);
+			expect(
+				fileQueries().every(
+					(query) =>
+						query.includes('"sequence" in (') &&
+						query.includes('"file_key" in (') &&
+						query.includes("limit ?"),
+				),
+			).toBe(true);
+			queries = [];
+			await service.finalize(owner, result.id, input.manifestProof);
+			expect(fileQueries().filter((query) => query.includes("order by"))).toHaveLength(batches);
+		});
+	}
+	test("expected fingerprints need no catalog row while desired remains pinned and budgeted", async () => {
+		const expected: FileChangeState = {
+			kind: "regular",
+			mode: 0o644,
+			blob: {
+				algorithm: "sha256",
+				digest: hash("unarchived current"),
+				sizeBytes: FILE_CHANGE_LIMITS.blobBytes,
+			},
+		};
+		const files = [file(0, expected, known("desired"))];
+		const input = plan(files);
+		expect(input.manifestProof.fileEvidenceBytes).toBe(Buffer.byteLength("desired"));
+		const result = await service.prepare(input, files);
+		const row = storedFiles(result.id)[0];
+		expect(row.expectedStateJson).toEqual(expected);
+		expect(row.beforeBlobDigest).toBeNull();
+		expect(row.desiredBlobDigest).toBe(hash("desired"));
+		expect(result.coverageComplete).toBe(true);
+	});
+	test("optional current material arriving later cannot change append idempotency", async () => {
+		const body = "late current archive";
+		const expected: FileChangeState = {
+			kind: "regular",
+			mode: 0o644,
+			blob: { algorithm: "sha256", digest: hash(body), sizeBytes: Buffer.byteLength(body) },
+		};
+		const files = [file(0, expected, known("restore target"))];
+		const input = plan(files);
+		const summary = service.begin(input);
+		const first = await service.appendFiles(owner, summary.id, files);
+		expect(storedFiles(summary.id)[0].beforeBlobDigest).toBeNull();
+		publish(body);
+		expect(await service.appendFiles(owner, summary.id, files)).toEqual(first);
+		expect(storedFiles(summary.id)[0].beforeBlobDigest).toBeNull();
+		expect((await service.finalize(owner, summary.id, input.manifestProof)).status).toBe(
+			"prepared",
+		);
+	});
+	test("optional before readiness loss never becomes an append or finalize prerequisite", async () => {
+		const files = [file()];
+		const input = plan(files);
+		const summary = service.begin(input);
+		const first = await service.appendFiles(owner, summary.id, files);
+		const before = storedFiles(summary.id)[0].beforeBlobDigest;
+		expect(before).not.toBeNull();
+		db.update(fileChangeBlobs)
+			.set({ status: "missing" })
+			.where(eq(fileChangeBlobs.digest, before as string))
+			.run();
+		expect(await service.appendFiles(owner, summary.id, files)).toEqual(first);
+		expect(storedFiles(summary.id)[0].beforeBlobDigest).toBe(before);
+		expect((await service.finalize(owner, summary.id, input.manifestProof)).status).toBe(
+			"prepared",
+		);
+	});
+	test("measured no-op does not pin desired bytes, while unmeasured and changed states still require materials", async () => {
+		const body = "external no-op bytes";
+		const same: FileChangeState = {
+			kind: "regular",
+			mode: 0o644,
+			blob: { algorithm: "sha256", digest: hash(body), sizeBytes: Buffer.byteLength(body) },
+		};
+		const noOp = [file(0, same, same)];
+		const noOpPlan = plan(noOp);
+		expect(noOpPlan.manifestProof.fileEvidenceBytes).toBe(0);
+		const prepared = await service.prepare(noOpPlan, noOp);
+		expect(storedFiles(prepared.id)[0]).toMatchObject({
+			desiredBlobDigest: null,
+			expectedStateJson: same,
+			desiredStateJson: same,
+		});
+		const unmeasured = { ...same, mode: null } as FileChangeState;
+		const unmeasuredFile = [file(0, unmeasured, unmeasured)];
+		const unmeasuredPlan = plan(unmeasuredFile);
+		expect(unmeasuredPlan.manifestProof.fileEvidenceBytes).toBe(Buffer.byteLength(body));
+		await rejected(service.prepare(unmeasuredPlan, unmeasuredFile), "BLOB_NOT_READY");
+		const changedFile = [file(0, ABSENT, same)];
+		await rejected(service.prepare(plan(changedFile), changedFile), "BLOB_NOT_READY");
+	});
 	test("no last-page success if an earlier declared file is missing", async () => {
 		const files = Array.from({ length: 70 }, (_, i) => file(i, ABSENT, ABSENT));
 		const input = plan(files);
@@ -767,7 +908,7 @@ describe("complete preparation, bounds and failures", () => {
 		incomplete(result.id);
 	});
 
-	test("cumulative raw budget is checked across append batches, not per file only", async () => {
+	test("finalization checks the cumulative desired budget once after all append batches", async () => {
 		const bigRef = publish("budget-fixture");
 		// Simulated already-published metadata: budget tests intentionally do not allocate 32MiB.
 		bigRef.sizeBytes = FILE_CHANGE_LIMITS.blobBytes;
@@ -776,13 +917,13 @@ describe("complete preparation, bounds and failures", () => {
 			.where(eq(fileChangeBlobs.digest, bigRef.digest))
 			.run();
 		const big: FileChangeState = { kind: "regular", blob: bigRef, mode: 0o644 };
-		const placeholder = Array.from({ length: 8 }, (_, i) => file(i, ABSENT, ABSENT));
+		const placeholder = Array.from({ length: 9 }, (_, i) => file(i, ABSENT, ABSENT));
 		const input = plan(placeholder);
 		const result = service.begin(input);
-		for (let i = 0; i < 3; i++) await service.appendFiles(owner, result.id, [file(i, big, big)]);
-		await rejected(service.appendFiles(owner, result.id, [file(3, big, big)]), "BUDGET_OR_INPUT");
-		expect(storedFiles(result.id)).toHaveLength(3);
-		await rejected(service.finalize(owner, result.id, input.manifestProof), "INCOMPLETE_SET");
+		// Real changes require desired material; an equal expected/desired pair is a no-op.
+		for (let i = 0; i < 9; i++) await service.appendFiles(owner, result.id, [file(i, ABSENT, big)]);
+		expect(storedFiles(result.id)).toHaveLength(9);
+		await rejected(service.finalize(owner, result.id, input.manifestProof), "BUDGET_OR_INPUT");
 		incomplete(result.id);
 	});
 
@@ -889,7 +1030,7 @@ describe("complete preparation, bounds and failures", () => {
 		const result = await appendAll(input, files);
 		const first = service.listFiles(owner, result.id, { limit: 1 }).items[0];
 		const pending = service.finalize(owner, result.id, input.manifestProof);
-		const ref = first.expectedStateJson.kind === "regular" ? first.expectedStateJson.blob : null;
+		const ref = first.desiredStateJson.kind === "regular" ? first.desiredStateJson.blob : null;
 		expect(ref).not.toBeNull();
 		db.update(fileChangeBlobs)
 			.set({ status: "missing" })
@@ -899,12 +1040,12 @@ describe("complete preparation, bounds and failures", () => {
 		incomplete(result.id);
 	});
 
-	test("unknown status, duplicate sequence, phase corruption and missing reverse pins block finalization", async () => {
+	test("unknown status, duplicate sequence, phase corruption and missing desired pins block finalization", async () => {
 		const changes = [
 			{ status: "unknown" as const },
 			{ applyMutationId: hash("toolUseId-only") },
 			{ compensateMutationId: hash("wrong-phase") },
-			{ beforeBlobDigest: null },
+			{ desiredBlobDigest: null },
 			{ compensationAfterStateJson: { kind: "absent" } as FileChangeState },
 			{ expectedStateJson: { kind: "unknown", reason: "missing_before" } as FileChangeState },
 			{ sequence: 1 },

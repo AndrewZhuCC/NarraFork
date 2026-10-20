@@ -139,6 +139,12 @@ export const updateNarratorHandleSchema = z.object({
 	handle: narratorHandleSchema.nullable(),
 });
 
+export const codexUpdateCredentialSchema = z.object({
+	displayName: z.string().optional(),
+	priority: z.number().optional(),
+	useCreditQuota: z.boolean().optional(),
+});
+
 export const codexUseWebSocketSchema = z.object({
 	useWebSocket: z.boolean().optional(),
 });
@@ -205,7 +211,7 @@ export const restoreNarratorDraftSchema = z.object({
  * narrator's own changes — a shared worktree makes discarding another actor's work
  * the more dangerous default.
  */
-export const revertScopeSchema = z.enum(["narrator", "workspace"]).optional();
+export const revertScopeSchema = z.literal("narrator").optional();
 
 const revertPlanIdentifierSchema = z
 	.string()
@@ -272,6 +278,7 @@ export const revertActionSchema = z.enum([
 	"revert_files",
 	"rollback_to_block",
 	"delete_tool_block",
+	"edit_and_regenerate",
 ]);
 export const createRevertActionPreviewSchema = z
 	.object({
@@ -289,15 +296,24 @@ export const createRevertActionPreviewSchema = z
 	.strict()
 	.refine(
 		(value) =>
-			value.action === "revert_files"
+			value.action === "revert_files" || value.action === "edit_and_regenerate"
 				? value.blockIndex === undefined
 				: value.messageId !== "__all__" && value.blockIndex !== undefined,
 		"The action requires an exact message/block boundary",
 	);
+const confirmedRevertPlanSchema = z
+	.object({
+		planId: revertPlanIdSchema,
+		planHash: z.string().regex(/^[a-f0-9]{64}$/),
+		action: revertActionSchema,
+		acceptSnapshotRestore: z.literal(true).optional(),
+	})
+	.strict();
+
 export const applyRevertPlanSchema = z
 	.object({
 		planHash: z.string().regex(/^[a-f0-9]{64}$/),
-		action: revertActionSchema,
+		action: revertActionSchema.exclude(["edit_and_regenerate"]),
 		acceptSnapshotRestore: z.literal(true).optional(),
 	})
 	.strict();
@@ -318,6 +334,9 @@ export const revertFilesSchema = z.object({
 });
 
 export const rollbackToBlockSchema = z.object({
+	revertPlan: confirmedRevertPlanSchema
+		.extend({ action: z.literal("rollback_to_block") })
+		.optional(),
 	blockIndex: z.number().int().min(0),
 	skipRevert: z.boolean().optional(),
 	scope: revertScopeSchema,
@@ -749,6 +768,9 @@ export const editAndRegenerateJsonSchema = z.object({
 	skipRevert: z.boolean().optional(),
 	scope: revertScopeSchema,
 	rollback: z.boolean().optional(),
+	revertPlan: confirmedRevertPlanSchema
+		.extend({ action: z.literal("edit_and_regenerate") })
+		.optional(),
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

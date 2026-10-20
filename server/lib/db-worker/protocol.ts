@@ -32,34 +32,29 @@ export type DbReadTaskName =
 	| "storageScanTables"
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
-	| "usageHistoryQuery"
-	| "searchQuery"
+	| "selectRows"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres";
 
-/** Shared search budgets; importing these must never bootstrap a database. */
-export const SEARCH_QUERY_MAX_SQL_BYTES = 64 * 1024;
-export const SEARCH_QUERY_MAX_PARAMS_BYTES = 128 * 1024;
-export const SEARCH_QUERY_MAX_PARAMS = 256;
-export const SEARCH_QUERY_MAX_ROWS = 10_000;
-export const SEARCH_QUERY_MAX_BYTES = 4 * 1024 * 1024;
+/** Shared read-query budgets; importing these must never bootstrap a database. */
+export const SELECT_ROWS_MAX_SQL_BYTES = 64 * 1024;
+export const SELECT_ROWS_MAX_PARAMS_BYTES = 128 * 1024;
+export const SELECT_ROWS_MAX_PARAMS = 256;
+export const SELECT_ROWS_MAX_ROWS = 10_000;
+export const SELECT_ROWS_MAX_BYTES = 4 * 1024 * 1024;
 
 /** Internal server-built SELECT (optionally WITH); never caller-provided SQL. */
-export interface SearchQueryParams {
-	kind: "searchQuery";
+export interface SelectRowsParams {
+	kind: "selectRows";
 	sql: string;
 	params: Array<string | number | null>;
 	maxRows: number;
 }
 
-/** Internal, server-built SELECT only. Never accepts SQL from an HTTP caller. */
-export interface UsageHistoryQueryParams {
-	kind: "usageHistoryQuery";
-	sql: string;
-	params: Array<string | number | null>;
-	/** Selected field names in Drizzle selection order. */
+/** Rows in selection order; `columns` are the SQL result names (possibly duplicated). */
+export interface SelectRowsResult {
 	columns: string[];
-	maxRows: number;
+	rows: unknown[][];
 }
 
 export interface StorageScanContextParams {
@@ -160,8 +155,7 @@ export type DbReadTaskParams =
 	| StorageScanTablesParams
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
-	| UsageHistoryQueryParams
-	| SearchQueryParams
+	| SelectRowsParams
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;
 

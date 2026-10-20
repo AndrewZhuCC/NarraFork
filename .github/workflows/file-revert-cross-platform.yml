@@ -11,8 +11,8 @@ on:
       - "server/services/file-change-*.ts"
       - "server/services/editor-document-*.ts"
       - "shared/editor-provider-contracts*"
+      - "server/services/file-write-*.ts"
       - "server/services/revert-*.ts"
-      - "server/services/workspace-write-*.ts"
       - "server/services/narrator-scoped-revert.ts"
       - "server/lib/agent/execution/local-backend.ts"
       - "server/lib/agent/execution/path-semantics.ts"
@@ -27,8 +27,8 @@ on:
       - "server/services/file-change-*.ts"
       - "server/services/editor-document-*.ts"
       - "shared/editor-provider-contracts*"
+      - "server/services/file-write-*.ts"
       - "server/services/revert-*.ts"
-      - "server/services/workspace-write-*.ts"
       - "server/services/narrator-scoped-revert.ts"
       - "server/lib/agent/execution/local-backend.ts"
       - "server/lib/agent/execution/path-semantics.ts"
@@ -137,10 +137,12 @@ jobs:
           ./server/services/file-change-platform-capability.test.ts
           ./server/services/file-change-local-restore.test.ts
           ./server/services/file-change-runtime.test.ts
-          ./server/services/file-change-namespace-cleanup.test.ts
+          ./server/services/file-change-runtime-default.test.ts
+          ./server/services/file-write-queue.test.ts
           ./server/services/revert-transaction-service.test.ts
           ./server/services/revert-transaction-interleaving.test.ts
           ./server/services/revert-transaction-real-tools.test.ts
+          ./server/services/revert-history-commit.test.ts
           ./server/services/revert-planner-local-access.test.ts
           ./server/services/revert-mutation-journal.test.ts
           ./server/services/narrator-scoped-revert.test.ts

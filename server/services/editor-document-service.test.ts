@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
 	chmod,
+	link,
 	lstat,
 	mkdir,
 	mkdtemp,
@@ -30,6 +31,7 @@ import { testEnvironment } from "../../tests/preload";
 import { db } from "../db";
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import { EditorDocumentJobs, editorWorkerSpecifierCandidates } from "./editor-document-jobs";
 import { queryEditorOperation } from "./editor-document-runtime";
 import {
@@ -37,10 +39,11 @@ import {
 	EditorDocumentError,
 	EditorDocumentService,
 } from "./editor-document-service";
-import type {
-	EditorVersionMetadata,
-	EditorWorkerRequest,
-	EditorWorkerResult,
+import {
+	type EditorVersionMetadata,
+	type EditorWorkerRequest,
+	type EditorWorkerResult,
+	runEditorWorker,
 } from "./editor-document-worker";
 import { type FileChangeLocalIo, fileChangeLocalIo } from "./file-change-local-io";
 import { LocalFileChangeRuntime } from "./file-change-runtime";
@@ -574,7 +577,8 @@ describe("large editor objects and real durable pipeline", () => {
 		};
 		const run = spyOn(jobs, "run").mockImplementation(
 			async (_user, request): Promise<EditorWorkerResult> => {
-				if (request.action === "cleanup") return { kind: "cleaned", operations: [] };
+				if (request.action === "cleanup")
+					return { kind: "cleaned", operations: [], unavailableRecoveryCount: 0 };
 				if (request.action === "metadata") return { kind: "source", metadata };
 				if (request.action === "content") return { kind: "content", bytes: new Uint8Array([120]) };
 				throw new Error("Unexpected action");
@@ -776,7 +780,7 @@ describe("large editor objects and real durable pipeline", () => {
 		expect((await service.operation(actor, result.operationId)).status).toBe("saved");
 		expect((await bodies()).length).toBe(0);
 	});
-	test("corrupt existing blob retries editor preparation and saves exactly once", async () => {
+	test("corrupt existing blob is retained and saves with one construction", async () => {
 		await service.dispose();
 		// Keep the database's existing instance identity when running after other saves.
 		const privateRoot = testEnvironment.narraforkHome;
@@ -787,103 +791,327 @@ describe("large editor objects and real durable pipeline", () => {
 			join(privateRoot, "file-change-blobs", "sha256", blob.digest.slice(0, 2), blob.digest),
 			"corrupt",
 		);
-		let preparations = 0;
-		let recoveryBody: string | undefined;
+		try {
+			let preparations = 0;
+			let recoveryBody: string | undefined;
+			service = new EditorDocumentService({
+				root: join(root, "transfers"),
+				execute: (request) =>
+					runtime.executeEditor({
+						...request,
+						construct: async (observation) => {
+							preparations++;
+							const prepared = await request.construct(observation);
+							const body = await readFile(
+								join(root, "transfers", `ed-${request.requestId}.json`),
+								"utf8",
+							);
+							if (recoveryBody !== undefined) expect(body).toBe(recoveryBody);
+							recoveryBody = body;
+							return prepared;
+						},
+					}),
+			});
+			const doc = await create();
+			const id = await upload(doc, "after\n中文🙂\n");
+			const saved = await service.commit(actor, doc.docId, id, {});
+			expect(saved).toMatchObject({
+				status: "saved",
+				hash: hash("after\r\n中文🙂\r\n"),
+				snapshotRevision: 7,
+			});
+			expect(preparations).toBe(1);
+			expect(saved).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
+			expect(
+				await readFile(
+					join(privateRoot, "file-change-blobs", "sha256", blob.digest.slice(0, 2), blob.digest),
+					"utf8",
+				),
+			).toBe("corrupt");
+			expect(dispatches).toBe(1);
+			expect(await readFile(target, "utf8")).toBe("after\r\n中文🙂\r\n");
+			expect(operations()).toHaveLength(1);
+			expect(operations()[0]).toMatchObject({
+				sourceId: saved.operationId,
+				settlement: "settled",
+				executionOutcome: "succeeded",
+			});
+			expect(await service.commit(actor, doc.docId, id, {})).toEqual(saved);
+			expect(dispatches).toBe(1);
+			expect(await bodies()).toHaveLength(0);
+		} finally {
+			await writeFile(
+				join(privateRoot, "file-change-blobs", "sha256", blob.digest.slice(0, 2), blob.digest),
+				before,
+			);
+		}
+	});
+	for (const stage of [
+		"open",
+		"write",
+		"sync",
+		"link",
+		"directory-open",
+		"directory-sync",
+	] as const) {
+		test.skipIf(process.platform === "win32" && stage.startsWith("directory-"))(
+			`recovery ${stage} failure still saves real target bytes and keeps file history complete`,
+			async () => {
+				await service.dispose();
+				const jobs = new EditorDocumentJobs();
+				const run = jobs.run.bind(jobs);
+				let failures = 0;
+				const fail = () => {
+					failures++;
+					throw Object.assign(new Error(`recovery ${stage} failed`), { code: "EIO" });
+				};
+				const spy = spyOn(jobs, "run").mockImplementation((user, request, signal) => {
+					if (request.action !== "recovery") return run(user, request, signal);
+					expect(signal).toBeDefined();
+					return runEditorWorker(request, {
+						async open(path, flags, mode) {
+							const directory = String(path) === join(root, "transfers");
+							if (stage === (directory ? "directory-open" : "open")) fail();
+							const file = await open(path, flags, mode);
+							if (stage === "write") file.writeFile = async () => fail();
+							if (stage === (directory ? "directory-sync" : "sync")) file.sync = async () => fail();
+							return file;
+						},
+						async link(...args) {
+							if (stage === "link") fail();
+							return link(...args);
+						},
+						unlink,
+					});
+				});
+				service = new EditorDocumentService({
+					root: join(root, "transfers"),
+					jobs,
+					execute: (request) => runtime.executeEditor(request),
+				});
+				try {
+					const doc = await create();
+					const id = await upload(doc, "saved\n中文🙂\n");
+					const saved = await service.commit(actor, doc.docId, id, {});
+					if (saved.status !== "saved") throw new Error("Expected settled save");
+					expect(saved).toMatchObject({
+						status: "saved",
+						diskOutcome: "applied",
+						historyStatus: "complete",
+						hash: hash("saved\r\n中文🙂\r\n"),
+					});
+					expect(failures).toBe(1);
+					expect(dispatches).toBe(1);
+					expect(await readFile(target, "utf8")).toBe("saved\r\n中文🙂\r\n");
+					expect(operations()).toHaveLength(1);
+					expect(operations()[0].executionOutcome).toBe("succeeded");
+					expect(await service.commit(actor, doc.docId, id, {})).toEqual(saved);
+					expect(dispatches).toBe(1);
+					await service.dispose();
+					service = new EditorDocumentService({
+						root: join(root, "transfers"),
+						execute: (request) => runtime.executeEditor(request),
+						queryOperation: queryEditorOperation,
+					});
+					const recovered = await service.operation(actor, saved.operationId);
+					if (stage.startsWith("directory-")) {
+						// Publication succeeded; a real surviving descriptor is usable after restart.
+						expect(recovered).toEqual({
+							status: "saved",
+							operationId: saved.operationId,
+							result: saved,
+						});
+					} else {
+						expect(recovered).toMatchObject({
+							status: "uncertain",
+							error: { code: "EDITOR_RESULT_UNAVAILABLE" },
+						});
+					}
+				} finally {
+					spy.mockRestore();
+				}
+			},
+		);
+	}
+
+	test("a stalled recovery worker is terminated within its budget without cancelling target IO", async () => {
+		await service.dispose();
+		const fixture = join(root, "stalled-recovery.ts");
+		const marker = join(root, "recovery-started");
+		await writeFile(
+			fixture,
+			`import { parentPort } from "node:worker_threads";
+import { writeFile } from "node:fs/promises";
+parentPort.once("message", async () => {
+ await writeFile(${JSON.stringify(marker)}, "started");
+ setInterval(() => {}, 1000);
+});
+parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
+		);
+		const jobs = new EditorDocumentJobs();
+		const stalled = new EditorDocumentJobs([pathToFileURL(fixture).href]);
+		const run = jobs.run.bind(jobs);
+		let recoverySignal: AbortSignal | undefined;
+		let preparationMs = 0;
+		const spy = spyOn(jobs, "run").mockImplementation(async (user, request, signal) => {
+			if (request.action !== "recovery") return run(user, request, signal);
+			recoverySignal = signal;
+			const started = performance.now();
+			try {
+				return await stalled.run(user, request, signal);
+			} finally {
+				preparationMs = performance.now() - started;
+			}
+		});
 		service = new EditorDocumentService({
 			root: join(root, "transfers"),
-			execute: (request) =>
-				runtime.executeEditor({
-					...request,
-					construct: async (observation) => {
-						preparations++;
-						const prepared = await request.construct(observation);
-						const body = await readFile(
-							join(root, "transfers", `ed-${request.requestId}.json`),
-							"utf8",
-						);
-						if (recoveryBody !== undefined) expect(body).toBe(recoveryBody);
-						recoveryBody = body;
-						return prepared;
-					},
-				}),
+			jobs,
+			execute: (request) => runtime.executeEditor(request),
 		});
-		const doc = await create();
-		const id = await upload(doc, "after\n中文🙂\n");
-		const saved = await service.commit(actor, doc.docId, id, {});
-		expect(saved).toMatchObject({
-			status: "saved",
-			hash: hash("after\r\n中文🙂\r\n"),
-			snapshotRevision: 7,
-		});
-		expect(preparations).toBe(2);
-		expect(dispatches).toBe(1);
-		expect(await readFile(target, "utf8")).toBe("after\r\n中文🙂\r\n");
-		expect(operations()).toHaveLength(1);
-		expect(operations()[0]).toMatchObject({
-			sourceId: saved.operationId,
-			settlement: "settled",
-			executionOutcome: "succeeded",
-		});
-		expect(await service.commit(actor, doc.docId, id, {})).toEqual(saved);
-		expect(dispatches).toBe(1);
-		expect(await bodies()).toHaveLength(0);
+		try {
+			const doc = await create();
+			const id = await upload(doc, "after timeout");
+			const saved = await service.commit(actor, doc.docId, id, {});
+			expect(await readFile(marker, "utf8")).toBe("started");
+			expect(recoverySignal?.aborted).toBe(true);
+			expect(preparationMs).toBeLessThan(2_500);
+			expect(saved).toMatchObject({
+				status: "saved",
+				diskOutcome: "applied",
+				historyStatus: "complete",
+			});
+			expect(await readFile(target, "utf8")).toBe("after timeout");
+			expect(dispatches).toBe(1);
+		} finally {
+			spy.mockRestore();
+		}
 	});
-	test("different recovery content prevents editor dispatch and is never overwritten", async () => {
-		const doc = await create();
-		const id = await upload(doc, "mine");
-		const { operationId } = await service.uploadStatus(actor, doc.docId, id);
-		const path = join(root, "transfers", `ed-${operationId}.json`);
-		const original = JSON.stringify({
-			version: 1,
-			operationId,
-			userId: actor.userId,
-			narratorId: actor.narratorId,
-			snapshotRevision: 7,
-			hash: hash("else"),
-			rawDigest: hash("else"),
-			bytes: 4,
-			createdAt: Date.now(),
+
+	for (const format of ["malformed JSON", "incompatible schema"] as const) {
+		test(`existing ${format} description permits a real save and recovers as uncertain`, async () => {
+			const doc = await create();
+			const id = await upload(doc, "saved despite description\n");
+			const { operationId } = await service.uploadStatus(actor, doc.docId, id);
+			const path = join(root, "transfers", `ed-${operationId}.json`);
+			const original =
+				format === "malformed JSON"
+					? '{"version":'
+					: JSON.stringify({
+							version: 0,
+							operationId,
+							userId: "legacy-owner",
+							narratorId: actor.narratorId,
+							snapshotRevision: 7,
+							hash: hash("legacy"),
+							rawDigest: hash("legacy"),
+							bytes: 6,
+							createdAt: Date.now(),
+						});
+			await writeFile(path, original);
+			const warnings = spyOn(logger, "warn");
+			try {
+				const saved = await service.commit(actor, doc.docId, id, {});
+				expect(saved).toMatchObject({
+					status: "saved",
+					operationId,
+					diskOutcome: "applied",
+					historyStatus: "complete",
+				});
+				expect(dispatches).toBe(1);
+				expect(await readFile(target, "utf8")).toBe("saved despite description\r\n");
+				expect(await readFile(path, "utf8")).toBe(original);
+				expect(operations()).toHaveLength(1);
+				expect(operations()[0].executionOutcome).toBe("succeeded");
+				expect(warnings).toHaveBeenCalledWith("Editor save recovery description unavailable", {
+					operationId,
+					error: expect.stringContaining("unreadable or incompatible"),
+				});
+				await service.dispose();
+				service = new EditorDocumentService({
+					root: join(root, "transfers"),
+					execute: (request) => runtime.executeEditor(request),
+					queryOperation: queryEditorOperation,
+				});
+				expect(await service.operation(actor, saved.operationId)).toMatchObject({
+					status: "uncertain",
+					operationId,
+					error: { code: "EDITOR_RESULT_UNAVAILABLE" },
+				});
+				expect(warnings).toHaveBeenCalledWith(
+					"Editor recovery descriptions unavailable at startup; files retained",
+					{ count: 1 },
+				);
+				expect(await readFile(path, "utf8")).toBe(original);
+				expect(await create()).toMatchObject({ baseHash: hash("saved despite description\r\n") });
+				expect(dispatches).toBe(1);
+			} finally {
+				warnings.mockRestore();
+			}
 		});
-		await writeFile(path, original);
-		const error = await failure(() => service.commit(actor, doc.docId, id, {}));
-		expect(error.message).toContain("Recovery metadata does not match this preparation");
-		expect(dispatches).toBe(0);
-		expect(operations()).toHaveLength(0);
-		expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
-		expect(await readFile(path, "utf8")).toBe(original);
-		expect(await bodies()).toHaveLength(0);
-	});
+	}
+
+	for (const mismatch of ["content", "identity"] as const) {
+		test(`different recovery ${mismatch} prevents editor dispatch and is never overwritten`, async () => {
+			const doc = await create();
+			const id = await upload(doc, "mine");
+			const { operationId } = await service.uploadStatus(actor, doc.docId, id);
+			const path = join(root, "transfers", `ed-${operationId}.json`);
+			const original = JSON.stringify({
+				version: 1,
+				operationId,
+				userId: mismatch === "identity" ? "other-user" : actor.userId,
+				narratorId: actor.narratorId,
+				snapshotRevision: 7,
+				hash: hash(mismatch === "content" ? "else" : "mine"),
+				rawDigest: hash(mismatch === "content" ? "else" : "mine"),
+				bytes: 4,
+				createdAt: Date.now(),
+			});
+			await writeFile(path, original);
+			const error = await failure(() => service.commit(actor, doc.docId, id, {}));
+			expect(error.message).toContain("Recovery metadata does not match this preparation");
+			expect(dispatches).toBe(0);
+			expect(operations()).toHaveLength(0);
+			expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
+			expect(await readFile(path, "utf8")).toBe(original);
+			expect(await bodies()).toHaveLength(0);
+		});
+	}
 	test("worker reuses only identical recovery content and preserves its original timestamp", async () => {
 		const jobs = new EditorDocumentJobs();
 		const operationId = randomUUID();
 		const path = join(root, `ed-${operationId}.json`);
-		const uploadPath = join(root, "uploaded");
-		await writeFile(uploadPath, "same");
-		const request: Extract<EditorWorkerRequest, { action: "prepare" }> = {
-			action: "prepare",
-			before: null,
-			baseHash: null,
-			encoding: "utf-8",
-			digest: hash("same"),
-			uploadPath,
-			conflictPath: join(root, "conflict"),
-			recovery: {
-				path,
+		const request: Extract<EditorWorkerRequest, { action: "recovery" }> = {
+			action: "recovery",
+			path,
+			metadata: {
+				version: 1,
 				operationId,
 				userId: actor.userId,
 				narratorId: actor.narratorId,
 				snapshotRevision: 7,
+				hash: hash("same"),
+				rawDigest: hash("same"),
+				bytes: 4,
+				createdAt: Date.now(),
 			},
 		};
 		const first = await jobs.run(actor.userId, request);
-		expect(first.kind).toBe("prepared");
+		expect(first).toEqual({ kind: "recovery", status: "stored" });
 		const original = await readFile(path, "utf8");
-		expect(await jobs.run(actor.userId, request)).toEqual(first);
+		expect(
+			await jobs.run(actor.userId, {
+				...request,
+				metadata: { ...request.metadata, createdAt: request.metadata.createdAt + 1 },
+			}),
+		).toEqual(first);
 		expect(await readFile(path, "utf8")).toBe(original);
-		await writeFile(uploadPath, "different");
-		await expect(jobs.run(actor.userId, { ...request, digest: hash("different") })).rejects.toThrow(
-			"Recovery metadata does not match this preparation",
-		);
+		expect(
+			await jobs.run(actor.userId, {
+				...request,
+				metadata: { ...request.metadata, hash: hash("different") },
+			}),
+		).toEqual({ kind: "recovery", status: "conflict" });
 		expect(await readFile(path, "utf8")).toBe(original);
 		expect(await Bun.file(join(root, `ed-${operationId}`)).exists()).toBe(false);
 	});
@@ -891,22 +1119,19 @@ describe("large editor objects and real durable pipeline", () => {
 		const jobs = new EditorDocumentJobs();
 		const operationId = randomUUID();
 		const path = join(root, `ed-${operationId}.json`);
-		const uploadPath = join(root, "uploaded");
-		await writeFile(uploadPath, "same");
-		const request: Extract<EditorWorkerRequest, { action: "prepare" }> = {
-			action: "prepare",
-			before: null,
-			baseHash: null,
-			encoding: "utf-8",
-			digest: hash("same"),
-			uploadPath,
-			conflictPath: join(root, "conflict"),
-			recovery: {
-				path,
+		const request: Extract<EditorWorkerRequest, { action: "recovery" }> = {
+			action: "recovery",
+			path,
+			metadata: {
+				version: 1,
 				operationId,
 				userId: actor.userId,
 				narratorId: actor.narratorId,
 				snapshotRevision: 7,
+				hash: hash("same"),
+				rawDigest: hash("same"),
+				bytes: 4,
+				createdAt: Date.now(),
 			},
 		};
 		await jobs.run(actor.userId, request);
@@ -922,13 +1147,64 @@ describe("large editor objects and real durable pipeline", () => {
 		]) {
 			const body = JSON.stringify({ ...metadata, ...mismatch });
 			await writeFile(path, body);
-			await expect(jobs.run(actor.userId, request)).rejects.toThrow(
-				"Recovery metadata does not match this preparation",
-			);
+			expect(await jobs.run(actor.userId, request)).toEqual({
+				kind: "recovery",
+				status: "conflict",
+			});
 			expect(await readFile(path, "utf8")).toBe(body);
 			expect(await Bun.file(join(root, `ed-${operationId}`)).exists()).toBe(false);
 		}
 	});
+	test("recovery publication races retain the conflicting identity even when cleanup fails", async () => {
+		const operationId = randomUUID();
+		const path = join(root, `ed-${operationId}.json`);
+		const metadata = {
+			version: 1 as const,
+			operationId,
+			userId: actor.userId,
+			narratorId: actor.narratorId,
+			snapshotRevision: 7,
+			hash: hash("same"),
+			rawDigest: hash("same"),
+			bytes: 4,
+			createdAt: Date.now(),
+		};
+		const conflicting = JSON.stringify({ ...metadata, userId: "different-owner" });
+		let links = 0;
+		const result = await runEditorWorker(
+			{ action: "recovery", path, metadata },
+			{
+				open,
+				async link(...args) {
+					links++;
+					await writeFile(path, conflicting);
+					return link(...args);
+				},
+				async unlink() {
+					throw new Error("cleanup failed");
+				},
+			},
+		);
+		expect(links).toBe(1);
+		expect(result).toEqual({ kind: "recovery", status: "conflict" });
+		expect(await readFile(path, "utf8")).toBe(conflicting);
+		let opens = 0;
+		expect(
+			await runEditorWorker(
+				{ action: "recovery", path, metadata },
+				{
+					async open() {
+						opens++;
+						throw new Error("temporary open unavailable");
+					},
+					link,
+					unlink,
+				},
+			),
+		).toEqual({ kind: "recovery", status: "conflict" });
+		expect(opens).toBe(0);
+	});
+
 	test("confirmation does not consume sealed upload or create a durable operation", async () => {
 		outside = true;
 		const doc = await create(),
@@ -1084,7 +1360,8 @@ describe("large editor objects and real durable pipeline", () => {
 		};
 		const run = spyOn(jobs, "run").mockImplementation(
 			async (_user, request): Promise<EditorWorkerResult> => {
-				if (request.action === "cleanup") return { kind: "cleaned", operations: [] };
+				if (request.action === "cleanup")
+					return { kind: "cleaned", operations: [], unavailableRecoveryCount: 0 };
 				if (request.action === "metadata") return { kind: "source", metadata };
 				throw new Error("Unexpected action");
 			},
@@ -1248,6 +1525,51 @@ describe("large editor objects and real durable pipeline", () => {
 			queryOperation: queryEditorOperation,
 		});
 		expect((await service.operation(actor, saved.operationId)).status).toBe("uncertain");
+	});
+	test("an unknown local IO outcome stays uncertain after restart instead of failed", async () => {
+		const doc = await create(),
+			id = await upload(doc, "maybe written\n");
+		io.apply = async (input) => {
+			dispatches++;
+			const applied = await fileChangeLocalIo.apply(input);
+			// The bytes reached the target, but the adapter cannot prove its final sync.
+			return { ...applied, kind: "target_mutation_unknown", error: new Error("sync failed") };
+		};
+		const error = await failure(() => service.commit(actor, doc.docId, id, {}));
+		expect(error.code).toBe("WRITE_RECONCILE_REQUIRED");
+		// The new bytes really reached the target, so discarding the save would lose them.
+		expect((await readFile(target, "utf8")).startsWith("maybe written")).toBe(true);
+		const operationId = error.data.operationId as string;
+		expect((await service.operation(actor, operationId)).status).toBe("uncertain");
+		await service.dispose();
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: (request) => runtime.executeEditor(request),
+			queryOperation: queryEditorOperation,
+		});
+		expect((await service.operation(actor, operationId)).status).toBe("uncertain");
+	});
+	test("a recorded not_applied outcome is still reported as failed after restart", async () => {
+		const doc = await create(),
+			id = await upload(doc, "never written\n");
+		io.apply = async () => {
+			dispatches++;
+			return {
+				kind: "not_applied",
+				error: new Error("target busy"),
+				parentEffects: { createdPaths: [], possiblePaths: [] },
+			};
+		};
+		const error = await failure(() => service.commit(actor, doc.docId, id, {}));
+		expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
+		const operationId = error.data.operationId as string;
+		await service.dispose();
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: (request) => runtime.executeEditor(request),
+			queryOperation: queryEditorOperation,
+		});
+		expect((await service.operation(actor, operationId)).status).toBe("failed");
 	});
 	test("slow conflict download prevents replacement and preserves the sealed retry", async () => {
 		const doc = await create(),
@@ -1561,17 +1883,20 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		await Promise.all([...running, ...queued, other]);
 		expect(peak).toBe(4);
 	});
-	test("oversize or malformed recovery metadata is rejected before unbounded parsing", async () => {
+	test("startup retains oversize and malformed descriptions without claiming recovery receipts", async () => {
 		const jobs = new EditorDocumentJobs(),
 			folder = join(root, "recovery-check");
 		await mkdir(folder, { mode: 0o700 });
 		const path = join(folder, "ed-00000000-0000-4000-8000-000000000000.json");
-		await writeFile(path, Buffer.alloc(32769, 32));
-		await expect(jobs.run(actor.userId, { action: "cleanup", root: folder })).rejects.toThrow(
-			"budget",
-		);
-		await writeFile(path, "{}");
-		await expect(jobs.run(actor.userId, { action: "cleanup", root: folder })).rejects.toThrow();
+		for (const bytes of [Buffer.alloc(32769, 32), Buffer.from("{"), Buffer.from("{}")]) {
+			await writeFile(path, bytes);
+			expect(await jobs.run(actor.userId, { action: "cleanup", root: folder })).toEqual({
+				kind: "cleaned",
+				operations: [],
+				unavailableRecoveryCount: 1,
+			});
+			expect((await readFile(path)).equals(bytes)).toBe(true);
+		}
 	});
 	test("final encoding byte expansion fails before any durable intent or dispatch", async () => {
 		const doc = await create(),
@@ -1593,21 +1918,24 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		expect(await readFile(target, "utf8")).toBe("external during evidence publication");
 		expect(operations()).toHaveLength(1);
 	}, 30_000);
-	test("preparation infrastructure failure never writes the target", async () => {
+	test("history infrastructure failure preserves the saved result", async () => {
 		const doc = await create(),
 			id = await upload(doc, "mine");
-		const prepare = runtime.evidence.finalizePreparation.bind(runtime.evidence);
-		runtime.evidence.finalizePreparation = async () => {
+		const prepare = runtime.evidence.recordEffect.bind(runtime.evidence);
+		runtime.evidence.recordEffect = () => {
 			throw new Error("Injected evidence failure");
 		};
 		try {
-			await expect(service.commit(actor, doc.docId, id, {})).rejects.toThrow(
-				"Injected evidence failure",
-			);
-			expect(dispatches).toBe(0);
-			expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
+			const result = await service.commit(actor, doc.docId, id, {});
+			expect(result).toMatchObject({
+				status: "saved",
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
+			});
+			expect(dispatches).toBe(1);
+			expect(await readFile(target, "utf8")).toBe("mine");
 		} finally {
-			runtime.evidence.finalizePreparation = prepare;
+			runtime.evidence.recordEffect = prepare;
 		}
 	}, 30_000);
 	test("startup cleans bounded orphan objects without touching arbitrary files", async () => {

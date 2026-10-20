@@ -1,21 +1,19 @@
 import { type BigIntStats, constants } from "node:fs";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
-import {
-	FILE_CHANGE_LIMITS,
-	type FileChangeExecutionBinding,
-	type FileChangeState,
-} from "@shared/file-change-protocol";
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import type { EditorApplyResult } from "../../shared/editor-provider-contracts";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { guardDiskWrite } from "../lib/disk-safety";
 import type { FileChangeDiagnostics } from "./file-change-diagnostics";
-import type { FileChangeScopeIdentity } from "./file-change-identity";
 
 export interface LocalFileObservation {
 	bytes: Uint8Array | null;
 	mode: number | null;
 	/** Not a content version: checked in addition to bytes, mode and canonical path. */
 	identity: string | null;
+	/** Version of the exact descriptor read; lets the writer validate without rereading bytes. */
+	version?: string;
 }
 
 export class LocalFileValidationError extends Error {
@@ -28,27 +26,13 @@ export class LocalFileValidationError extends Error {
 	}
 }
 
-/**
- * The VOLUME cannot identify objects at all (e.g. FAT/exFAT or some network shares
- * on Windows), as opposed to one object failing validation. Callers that only need
- * evidence as an optional extra can tell "nothing is recordable here" from a real
- * mismatch by this type. `name` stays "LocalFileValidationError": diagnostics
- * whitelist error names, and every existing handler treats it as that class.
- */
-export class LocalObjectIdentityUnavailableError extends LocalFileValidationError {}
-
 export function localObjectIdentity(stat: BigIntStats): string {
-	if (stat.ino === 0n && stat.dev === 0n)
-		throw new LocalObjectIdentityUnavailableError(
-			"Local filesystem does not expose an object identity",
-		);
-	// Without a creation timestamp, recycled dev/ino values cannot distinguish
-	// workspace incarnations. Do not invent continuity from mtime/ctime instead.
-	if (stat.birthtimeNs <= 0n)
-		throw new LocalObjectIdentityUnavailableError(
-			"Local filesystem does not expose a valid creation time",
-		);
-	return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+	// An operation-local check, never a persistent workspace-incarnation credential.
+	return `${stat.dev}:${stat.ino}:${stat.birthtimeNs > 0n ? stat.birthtimeNs : 0n}`;
+}
+
+function fileVersion(stat: BigIntStats): string {
+	return `${localObjectIdentity(stat)}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.mode}`;
 }
 
 export async function localDirectoryIdentity(path: string): Promise<string> {
@@ -121,19 +105,31 @@ async function readHandle(
 	)
 		throw new LocalFileValidationError("File changed during complete read");
 	signal?.throwIfAborted();
-	return { bytes, mode: Number(final.mode & 0o7777n), identity: localObjectIdentity(final) };
+	return {
+		bytes,
+		mode: Number(final.mode & 0o7777n),
+		identity: localObjectIdentity(final),
+		...((final.dev !== 0n || final.ino !== 0n) && final.mtimeNs > 0n && final.ctimeNs > 0n
+			? { version: fileVersion(final) }
+			: {}),
+	};
 }
 
 export interface EditorFileApplyContext {
 	sourceId: string;
 	userId: string;
-	operationId: string;
-	effectId: string;
+	/** Installation identity for the executor namespace; independent of blob availability. */
+	sourceInstanceId?: string;
+	/** Host history operation, when history is available. Never required for dispatch. */
+	operationId?: string;
+	snapshotRevision: number;
 	requestDigest: string;
-	executionBinding: FileChangeExecutionBinding;
-	scope: FileChangeScopeIdentity;
-	before: FileChangeState;
-	intended: FileChangeState;
+	root: string;
+	rootIdentity?: string;
+	runtime: { runtimeEpoch: string; runtimeGeneration: number };
+	/** Digests prepared from actual bytes, not references to history blobs. */
+	rawDigest?: string;
+	beforeRawDigest?: string | null;
 }
 export interface LocalFileApplyInput {
 	/** Trusted editor-only adapter metadata; ordinary tools retain their native IO. */
@@ -147,8 +143,7 @@ export interface LocalFileApplyInput {
 	exclusiveCreate?: boolean;
 	signal: AbortSignal;
 	diagnostics?: FileChangeDiagnostics;
-	/** Includes the frozen runtime, workspace incarnation and coordinator fence.
-	 * Must not reject merely because the caller cancelled: used after dispatch too. */
+	/** Rechecks authorization and the frozen canonical path, including after dispatch. */
 	assertTarget(): Promise<void>;
 	/** Registration only, immediately before the first potentially mutating syscall. */
 	onDispatch(): void;
@@ -166,19 +161,23 @@ export interface LocalFileParentEffects {
 /**
  * not_applied: no target mutation and both parent lists empty.
  * parent_only: target untouched; runtime must evaluate BOTH parent lists against
- * its admitted scope before treating this as safely releasable.
+ * the bounded parent effects while releasing the ordinary file queue.
  * target_mutation_unknown: target mutation started or its completion is uncertain.
  * applied: all writes, sync, validation and close completed successfully.
  */
-export type LocalFileApplyResult =
-	| {
-			kind: "not_applied" | "parent_only" | "target_mutation_unknown";
-			error: unknown;
-			parentEffects: LocalFileParentEffects;
-	  }
-	| { kind: "applied"; error: null; parentEffects: LocalFileParentEffects };
+export type LocalFileApplyResult = {
+	kind: "not_applied" | "parent_only" | "target_mutation_unknown" | "applied";
+	error: unknown;
+	parentEffects: LocalFileParentEffects;
+	/** Collected before releasing the file queue; callers reuse these exact bytes. */
+	observedAfter?: LocalFileObservation;
+	/** Verified durable provider proof of this operation, not a claim about current file bytes. */
+	editorReceipt?: EditorApplyResult;
+};
 
 export interface FileChangeLocalIo {
+	/** Trusted provider binding. Omission is local-only, never a remote filesystem fallback. */
+	readonly deviceId?: string;
 	read(path: string, signal?: AbortSignal, maxBytes?: number): Promise<LocalFileObservation>;
 	/** Failures are returned, not swallowed. The caller must throw result.error. */
 	apply(input: LocalFileApplyInput): Promise<LocalFileApplyResult>;
@@ -220,11 +219,11 @@ function directory(stat: BigIntStats): void {
 /**
  * A bounded, descriptor-based local writer. It does NOT promise filesystem CAS or
  * OS atomicity: an external writer may race any check. Such observed mismatches
- * are quarantined by the runtime; no old state is automatically written back.
+ * are returned as this operation's conflict or unknown result.
  */
 export function createFileChangeLocalIo(
 	syscalls: LocalFileSyscalls = { lstat, mkdir, open },
-	profile: { maxBytes: number; createParents: boolean; cancelledMutationIsUnknown?: boolean } = {
+	profile: { maxBytes: number; createParents: boolean } = {
 		maxBytes: FILE_CHANGE_LIMITS.blobBytes,
 		createParents: true,
 	},
@@ -273,6 +272,7 @@ export function createFileChangeLocalIo(
 			let registered = false;
 			let writtenIdentity: string | undefined;
 			let writtenMode: number | undefined;
+			let observedAfter: LocalFileObservation | undefined;
 			const beforeMutation = () => {
 				signal.throwIfAborted();
 				if (!registered) {
@@ -291,10 +291,10 @@ export function createFileChangeLocalIo(
 				// entire new content (not just growth; rewrites can allocate fresh blocks).
 				await guardDiskWrite(canonicalPath, nextBytes.byteLength);
 				signal.throwIfAborted();
-				input.diagnostics?.enter("io_read_before");
-				if (!equal(before, await this.read(canonicalPath, signal)))
-					throw new LocalFileValidationError("Content/object changed before dispatch");
 				if (before.bytes === null) {
+					input.diagnostics?.enter("io_read_before");
+					if (!equal(before, await this.read(canonicalPath, signal)))
+						throw new LocalFileValidationError("Content/object changed before dispatch");
 					input.diagnostics?.enter("io_prepare_parents");
 					// Bound the whole ancestor chain before any mutation, then discover
 					// missing entries without recursive mkdir's opaque partial effects.
@@ -363,7 +363,13 @@ export function createFileChangeLocalIo(
 				}
 				if (before.bytes !== null) {
 					input.diagnostics?.enter("io_read_descriptor");
-					if (!equal(before, await readHandle(file, signal, profile.maxBytes)))
+					const current = await file.stat({ bigint: true });
+					regular(current);
+					if (
+						before.version
+							? before.version !== fileVersion(current)
+							: !equal(before, await readHandle(file, signal, profile.maxBytes))
+					)
 						throw new LocalFileValidationError("Opened content/object changed before dispatch");
 				}
 				input.diagnostics?.enter("io_validate_before_mutation");
@@ -375,7 +381,12 @@ export function createFileChangeLocalIo(
 				const pathBeforeDispatch = await syscalls.lstat(canonicalPath, { bigint: true });
 				regular(openedBeforeDispatch);
 				regular(pathBeforeDispatch);
-				if (localObjectIdentity(openedBeforeDispatch) !== localObjectIdentity(pathBeforeDispatch))
+				if (
+					fileVersion(openedBeforeDispatch) !== fileVersion(pathBeforeDispatch) ||
+					(before.bytes !== null &&
+						before.version !== undefined &&
+						before.version !== fileVersion(openedBeforeDispatch))
+				)
 					throw new LocalFileValidationError(
 						"Opened object no longer matches the target before dispatch",
 					);
@@ -441,6 +452,7 @@ export function createFileChangeLocalIo(
 					await input.assertTarget();
 					input.diagnostics?.enter("io_final_read");
 					const observed = await this.read(canonicalPath, AbortSignal.timeout(5_000));
+					observedAfter = observed;
 					if (
 						observed.bytes === null ||
 						!Buffer.from(observed.bytes).equals(nextBytes) ||
@@ -454,13 +466,7 @@ export function createFileChangeLocalIo(
 					failure = error;
 				}
 			}
-			if (!failed && profile.cancelledMutationIsUnknown && signal.aborted) {
-				// Still drain write/sync/close and verification. A cancelled editor
-				// response cannot establish successful save acknowledgement.
-				failed = true;
-				failure = signal.reason;
-			}
-			if (!failed) return { kind: "applied", error: null, parentEffects };
+			if (!failed) return { kind: "applied", error: null, parentEffects, observedAfter };
 			return {
 				kind: targetMutation
 					? "target_mutation_unknown"
@@ -469,6 +475,7 @@ export function createFileChangeLocalIo(
 						: "not_applied",
 				error: failure,
 				parentEffects,
+				observedAfter,
 			};
 		},
 	};
@@ -501,7 +508,10 @@ async function applyExclusiveFileCreate(
 			timeoutMs: 30_000,
 		});
 		await input.assertTarget();
-		return { kind: "applied", error: null, parentEffects };
+		const observedAfter = await io.read(input.canonicalPath, AbortSignal.timeout(5_000));
+		if (observedAfter.bytes === null || !Buffer.from(observedAfter.bytes).equals(input.nextBytes))
+			throw new LocalFileValidationError("Exclusive create content differs from completed write");
+		return { kind: "applied", error: null, parentEffects, observedAfter };
 	} catch (error) {
 		return {
 			kind: dispatched ? "target_mutation_unknown" : "not_applied",

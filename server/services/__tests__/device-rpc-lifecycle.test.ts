@@ -207,6 +207,44 @@ describe("device RPC lifecycle", () => {
 		});
 	}
 
+	for (const mode of ["abort", "timeout"] as const) {
+		test(`ordinary remote writes propagate ${mode} into an RPC cancel frame`, async () => {
+			const backend = createRemoteBackend(deviceId, {
+				connectionGeneration: getDeviceConnectionGeneration(deviceId) ?? 0,
+			});
+			const controller = new AbortController();
+			const promise = backend.writeFileBytes("/work/file", new Uint8Array([1]), {
+				signal: controller.signal,
+				timeoutMs: mode === "timeout" ? 5 : 1000,
+			});
+			outstanding.push(promise.catch(() => {}));
+			const requestId = lastId();
+			expect(sent.at(-1)).toMatchObject({ type: "rpc", method: "fs.write", id: requestId });
+			if (mode === "abort") controller.abort();
+			await expect(promise).rejects.toThrow(
+				mode === "abort" ? "RPC aborted" : "timed out after 5ms",
+			);
+			expect(sent.filter((frame) => frame.type === "rpc_cancel")).toEqual([
+				{ type: "rpc_cancel", id: requestId },
+			]);
+			expect((await getDeviceConnectionDiagnostics(deviceId))?.rpc?.total).toBe(0);
+			await roundTrip();
+		});
+	}
+
+	test("ordinary remote writes reject an already aborted signal before dispatch", async () => {
+		const backend = createRemoteBackend(deviceId, {
+			connectionGeneration: getDeviceConnectionGeneration(deviceId) ?? 0,
+		});
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			backend.writeFileBytes("/work/file", new Uint8Array([1]), { signal: controller.signal }),
+		).rejects.toThrow("RPC aborted");
+		expect(sent.filter((frame) => frame.type === "rpc")).toHaveLength(0);
+		expect((await getDeviceConnectionDiagnostics(deviceId))?.rpc?.total).toBe(0);
+	});
+
 	test("disconnect rejects all calls and unbinds the shared owner signal", async () => {
 		const controller = new AbortController();
 		const remove = spyOn(controller.signal, "removeEventListener");

@@ -2,10 +2,10 @@ import { spawn } from "node:child_process";
 import { open, readlink } from "node:fs/promises";
 import { win32 } from "node:path";
 
-/** Not the fail-open startup lock probe. No image-name or wall-clock tolerances. */
-export const WORKSPACE_PROCESS_PROBE_LIMITS = Object.freeze({ timeoutMs: 1_500, bytes: 64 * 1024 });
+/** Strict instance provenance for cold continuation recovery, separate from startup's fail-open probe. */
+export const INSTANCE_PROCESS_PROBE_LIMITS = Object.freeze({ timeoutMs: 1_500, bytes: 64 * 1024 });
 
-export type WorkspaceProcessDomain = Readonly<{
+export type InstanceProcessDomain = Readonly<{
 	platform: "linux" | "win32";
 	machine: string;
 	boot: string;
@@ -13,16 +13,16 @@ export type WorkspaceProcessDomain = Readonly<{
 	/** /proc starttime includes the reader's time-namespace boot offset. */
 	timeNamespace: string;
 }>;
-export type WorkspaceProcessIdentity = Readonly<{
+export type InstanceProcessIdentity = Readonly<{
 	version: 1;
-	domain: WorkspaceProcessDomain;
+	domain: InstanceProcessDomain;
 	pid: number;
 	/** Linux start ticks or Windows CIM CreationDate UTC FILETIME, NEVER JS milliseconds. */
 	birth: string;
 }>;
-export type WorkspaceProcessObservation =
-	| { kind: "present"; identity: WorkspaceProcessIdentity }
-	| { kind: "absent"; domain: WorkspaceProcessDomain }
+export type InstanceProcessObservation =
+	| { kind: "present"; identity: InstanceProcessIdentity }
+	| { kind: "absent"; domain: InstanceProcessDomain }
 	| { kind: "unknown" };
 
 const UNKNOWN = { kind: "unknown" } as const;
@@ -30,9 +30,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MACHINE = /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const DIGITS = /^\d{1,24}$/;
 
-export function isWorkspaceProcessIdentity(value: unknown): value is WorkspaceProcessIdentity {
+export function isInstanceProcessIdentity(value: unknown): value is InstanceProcessIdentity {
 	if (!value || typeof value !== "object") return false;
-	const v = value as WorkspaceProcessIdentity;
+	const v = value as InstanceProcessIdentity;
 	const d = v.domain;
 	return (
 		v.version === 1 &&
@@ -58,9 +58,9 @@ export function isWorkspaceProcessIdentity(value: unknown): value is WorkspacePr
 	);
 }
 
-export function sameWorkspaceProcessDomain(
-	a: WorkspaceProcessDomain,
-	b: WorkspaceProcessDomain,
+export function sameInstanceProcessDomain(
+	a: InstanceProcessDomain,
+	b: InstanceProcessDomain,
 ): boolean {
 	return (
 		a.platform === b.platform &&
@@ -71,16 +71,16 @@ export function sameWorkspaceProcessDomain(
 	);
 }
 
-export type WorkspaceProcessEndReason = "pid_absent" | "pid_reused" | "boot_changed";
+export type InstanceProcessEndReason = "pid_absent" | "pid_reused" | "boot_changed";
 
 /** Shared strict comparison; this is a decision helper, not an execution-death capability. */
-export function workspaceProcessEndReason(
-	identity: WorkspaceProcessIdentity,
-	observed: WorkspaceProcessObservation,
-): WorkspaceProcessEndReason | null {
-	if (!isWorkspaceProcessIdentity(identity) || observed.kind === "unknown") return null;
+export function instanceProcessEndReason(
+	identity: InstanceProcessIdentity,
+	observed: InstanceProcessObservation,
+): InstanceProcessEndReason | null {
+	if (!isInstanceProcessIdentity(identity) || observed.kind === "unknown") return null;
 	const domain = observed.kind === "present" ? observed.identity.domain : observed.domain;
-	if (!isWorkspaceProcessIdentity({ ...identity, domain })) return null;
+	if (!isInstanceProcessIdentity({ ...identity, domain })) return null;
 	const changedLinuxBoot =
 		identity.domain.platform === "linux" &&
 		domain.platform === "linux" &&
@@ -100,12 +100,12 @@ export function workspaceProcessEndReason(
 	if (
 		!changedLinuxBoot &&
 		!sameWindowsMachine &&
-		!sameWorkspaceProcessDomain(identity.domain, domain)
+		!sameInstanceProcessDomain(identity.domain, domain)
 	)
 		return null;
 	if (
 		observed.kind === "present" &&
-		(!isWorkspaceProcessIdentity(observed.identity) ||
+		(!isInstanceProcessIdentity(observed.identity) ||
 			observed.identity.pid !== identity.pid ||
 			(!changedLinuxBoot && observed.identity.birth === identity.birth))
 	)
@@ -121,14 +121,14 @@ export function workspaceProcessEndReason(
 async function readBounded(path: string): Promise<string> {
 	const file = await open(path, "r");
 	try {
-		const bytes = Buffer.alloc(WORKSPACE_PROCESS_PROBE_LIMITS.bytes + 1);
+		const bytes = Buffer.alloc(INSTANCE_PROCESS_PROBE_LIMITS.bytes + 1);
 		let offset = 0;
 		while (offset < bytes.length) {
 			const result = await file.read(bytes, offset, bytes.length - offset, null);
 			if (result.bytesRead === 0) break;
 			offset += result.bytesRead;
 		}
-		if (offset > WORKSPACE_PROCESS_PROBE_LIMITS.bytes) throw new Error("identity input too large");
+		if (offset > INSTANCE_PROCESS_PROBE_LIMITS.bytes) throw new Error("identity input too large");
 		return bytes.subarray(0, offset).toString("utf8");
 	} finally {
 		await file.close();
@@ -136,7 +136,7 @@ async function readBounded(path: string): Promise<string> {
 }
 
 /** Combined stdout/stderr hard cap. Timeout resolves immediately, not after a child's close. */
-export function runWorkspaceIdentityCommand(
+export function runInstanceIdentityCommand(
 	command: string,
 	args: string[],
 	signal: AbortSignal,
@@ -170,13 +170,13 @@ export function runWorkspaceIdentityCommand(
 			resolve(result);
 		};
 		const abort = () => finish(null, true);
-		const timer = setTimeout(abort, WORKSPACE_PROCESS_PROBE_LIMITS.timeoutMs);
+		const timer = setTimeout(abort, INSTANCE_PROCESS_PROBE_LIMITS.timeoutMs);
 		signal.addEventListener("abort", abort, { once: true });
 		const receive = (chunk: Buffer | string, stdout: boolean) => {
 			if (done) return;
 			const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 			total += data.length;
-			if (total > WORKSPACE_PROCESS_PROBE_LIMITS.bytes) return finish(null, true);
+			if (total > INSTANCE_PROCESS_PROBE_LIMITS.bytes) return finish(null, true);
 			if (stdout) output.push(data);
 		};
 		child.stdout?.on("data", (chunk) => receive(chunk, true));
@@ -188,7 +188,7 @@ export function runWorkspaceIdentityCommand(
 	});
 }
 
-export interface WorkspaceProcessProbeDependencies {
+export interface InstanceProcessProbeDependencies {
 	platform: NodeJS.Platform;
 	selfPid: number;
 	read(path: string): Promise<string>;
@@ -217,14 +217,14 @@ async function windowsQuery(pid: number, signal: AbortSignal): Promise<string | 
 	// CreationDate and LastBootUpTime stay exact decimal strings, with no JS floating-point loss.
 	// ErrorAction=Stop distinguishes failed CIM access from a successful empty process result.
 	const script = `$ErrorActionPreference='Stop'; $m=(Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid; $o=Get-CimInstance Win32_OperatingSystem -ErrorAction Stop; $p=@(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop); if($p.Count -gt 1){throw 'ambiguous process'}; $b=$null; if($p.Count -eq 1){if($null -eq $p[0].CreationDate){throw 'missing birth'}; $b=$p[0].CreationDate.ToUniversalTime().ToFileTimeUtc().ToString()}; @{machine=$m; boot=$o.LastBootUpTime.ToUniversalTime().ToFileTimeUtc().ToString(); pid=${pid}; found=($p.Count -eq 1); birth=$b} | ConvertTo-Json -Compress`;
-	return runWorkspaceIdentityCommand(
+	return runInstanceIdentityCommand(
 		win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
 		["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
 		signal,
 	);
 }
 
-const defaults: WorkspaceProcessProbeDependencies = {
+const defaults: InstanceProcessProbeDependencies = {
 	platform: process.platform,
 	selfPid: process.pid,
 	read: readBounded,
@@ -241,11 +241,11 @@ const defaults: WorkspaceProcessProbeDependencies = {
 };
 
 /** Dependency injection is for tests; production uses only local OS observations. */
-export function createWorkspaceProcessProbe(deps: WorkspaceProcessProbeDependencies = defaults) {
-	async function observe(pid: number, signal: AbortSignal): Promise<WorkspaceProcessObservation> {
+export function createInstanceProcessProbe(deps: InstanceProcessProbeDependencies = defaults) {
+	async function observe(pid: number, signal: AbortSignal): Promise<InstanceProcessObservation> {
 		if (!Number.isSafeInteger(pid) || pid <= 0) return UNKNOWN;
 		if (deps.platform === "linux") {
-			const domain = async (): Promise<WorkspaceProcessDomain> => {
+			const domain = async (): Promise<InstanceProcessDomain> => {
 				const [machine, boot, pidNamespace, self, timeNamespace] = await Promise.all([
 					deps.read("/etc/machine-id"),
 					deps.read("/proc/sys/kernel/random/boot_id"),
@@ -274,17 +274,17 @@ export function createWorkspaceProcessProbe(deps: WorkspaceProcessProbeDependenc
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT" || deps.checkPid(pid) !== "absent")
 					return UNKNOWN;
 			}
-			if (signal.aborted || !sameWorkspaceProcessDomain(before, await domain())) return UNKNOWN;
+			if (signal.aborted || !sameInstanceProcessDomain(before, await domain())) return UNKNOWN;
 			const identity = { version: 1 as const, domain: before, pid, birth: birth ?? "1" };
-			if (!isWorkspaceProcessIdentity(identity)) return UNKNOWN;
+			if (!isInstanceProcessIdentity(identity)) return UNKNOWN;
 			return birth === null ? { kind: "absent", domain: before } : { kind: "present", identity };
 		}
 		if (deps.platform === "win32") {
 			const raw = await deps.windowsQuery(pid, signal);
-			if (!raw || Buffer.byteLength(raw) > WORKSPACE_PROCESS_PROBE_LIMITS.bytes) return UNKNOWN;
+			if (!raw || Buffer.byteLength(raw) > INSTANCE_PROCESS_PROBE_LIMITS.bytes) return UNKNOWN;
 			const value = JSON.parse(raw);
 			if (value.pid !== pid || typeof value.found !== "boolean") return UNKNOWN;
-			const domain: WorkspaceProcessDomain = {
+			const domain: InstanceProcessDomain = {
 				platform: "win32",
 				machine: typeof value.machine === "string" ? value.machine.toLowerCase() : "",
 				boot: value.boot,
@@ -292,20 +292,20 @@ export function createWorkspaceProcessProbe(deps: WorkspaceProcessProbeDependenc
 				timeNamespace: "windows-system",
 			};
 			const identity = { version: 1 as const, domain, pid, birth: value.found ? value.birth : "1" };
-			if (!isWorkspaceProcessIdentity(identity) || (!value.found && value.birth !== null))
+			if (!isInstanceProcessIdentity(identity) || (!value.found && value.birth !== null))
 				return UNKNOWN;
 			return value.found ? { kind: "present", identity } : { kind: "absent", domain };
 		}
 		return UNKNOWN;
 	}
-	return async (pid: number): Promise<WorkspaceProcessObservation> => {
+	return async (pid: number): Promise<InstanceProcessObservation> => {
 		const controller = new AbortController();
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<WorkspaceProcessObservation>((resolve) => {
+		const timeout = new Promise<InstanceProcessObservation>((resolve) => {
 			timer = setTimeout(() => {
 				controller.abort();
 				resolve(UNKNOWN);
-			}, WORKSPACE_PROCESS_PROBE_LIMITS.timeoutMs);
+			}, INSTANCE_PROCESS_PROBE_LIMITS.timeoutMs);
 		});
 		try {
 			return await Promise.race([observe(pid, controller.signal).catch(() => UNKNOWN), timeout]);
@@ -315,4 +315,4 @@ export function createWorkspaceProcessProbe(deps: WorkspaceProcessProbeDependenc
 	};
 }
 
-export const observeWorkspaceProcess = createWorkspaceProcessProbe();
+export const observeInstanceProcess = createInstanceProcessProbe();

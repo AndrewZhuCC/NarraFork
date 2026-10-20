@@ -24,6 +24,7 @@ const settingsState: {
 let saveSettingsCalls = 0;
 let codexImportedCredentials: unknown[] = [];
 let codexRemoveUnhealthyCalls = 0;
+let codexCredentialUpdates: Array<{ id: string; fields: unknown }> = [];
 let managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 let browserCallbackUrls: string[] = [];
 let browserCallbackError: string | Error | null = null;
@@ -76,6 +77,9 @@ mock.module("../../../server/lib/codex-manager", () => ({
 			tierOrder: [...managerTierOrder],
 			effectiveTierOrder: getEffectiveTierOrder(),
 		}),
+		updateCredential: (id: string, fields: unknown) => {
+			codexCredentialUpdates.push({ id, fields });
+		},
 		setLoadBalancingMode: () => {},
 		setTierOrder: (tierOrder: CodexTier[]) => {
 			managerTierOrder = [...tierOrder];
@@ -183,6 +187,7 @@ beforeEach(() => {
 	saveSettingsCalls = 0;
 	codexImportedCredentials = [];
 	codexRemoveUnhealthyCalls = 0;
+	codexCredentialUpdates = [];
 	managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 	browserCallbackUrls = [];
 	browserCallbackError = null;
@@ -198,6 +203,77 @@ afterAll(() => {
 });
 
 describe("codex routes validation", () => {
+	it.each([
+		true,
+		false,
+	])("accepts useCreditQuota=%s and forwards the validated patch", async (useCreditQuota) => {
+		const fields = { displayName: "Credit account", priority: 1.5, useCreditQuota };
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(fields),
+		});
+		expect(res.status).toBe(200);
+		expect(codexCredentialUpdates).toEqual([{ id: "credit-account", fields }]);
+	});
+
+	it.each([
+		{},
+		{ displayName: "Renamed" },
+		{ priority: -2 },
+	])("preserves optional patch fields %j", async (fields) => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(fields),
+		});
+		expect(res.status).toBe(200);
+		expect(codexCredentialUpdates).toEqual([{ id: "credit-account", fields }]);
+	});
+
+	it.each([
+		["true"],
+		["false"],
+		[1],
+		[0],
+		[null],
+		[[]],
+		[{}],
+	])("rejects non-boolean useCreditQuota=%j without mutating manager", async (useCreditQuota) => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ useCreditQuota }),
+		});
+		expect(res.status).toBe(400);
+		expect(codexCredentialUpdates).toEqual([]);
+	});
+
+	it.each([
+		{ displayName: 123 },
+		{ displayName: null },
+		{ priority: "2" },
+		{ priority: null },
+	])("rejects malformed legacy patch fields %j", async (fields) => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(fields),
+		});
+		expect(res.status).toBe(400);
+		expect(codexCredentialUpdates).toEqual([]);
+	});
+
+	it("rejects non-finite JSON priority without mutating manager", async () => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: '{"priority":1e9999}',
+		});
+		expect(res.status).toBe(400);
+		expect(codexCredentialUpdates).toEqual([]);
+	});
+
 	it("defaults websocket mode to enabled when unset", async () => {
 		const res = await app.request("/status");
 

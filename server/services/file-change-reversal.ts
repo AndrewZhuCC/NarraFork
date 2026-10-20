@@ -11,7 +11,11 @@ import {
 	hasSettledMeasuredFileEffect,
 	type KnownFileChangeState,
 } from "@shared/file-change-protocol";
-import { fileChangeExecutionBindingMatches, fileChangeIdentityKey } from "./file-change-identity";
+import {
+	fileChangeExecutionBindingMatches,
+	fileChangeIdentityKey,
+	fileChangePhysicalIdentityKey,
+} from "./file-change-identity";
 import {
 	FileChangeMergeError,
 	type FileChangeMergeFailure,
@@ -22,9 +26,10 @@ import {
 const DIGEST = /^[a-f0-9]{64}$/;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/** This must be the durable scope revision, not a timestamp or an ID sort key. */
+/** v3 uses the operation journal sequence; legacy records retain their recorded ordering. */
 export interface FileChangeReversalEffect extends FileChangeEffect {
-	scopeRevision: number;
+	scopeRevision: number | null;
+	journalSeq?: number;
 }
 
 export interface FileChangeReversalInput {
@@ -74,7 +79,8 @@ export type FileChangeReversalFailure =
 export interface FileChangeReversalStep {
 	effectId: string;
 	mutationId: string;
-	scopeRevision: number;
+	scopeRevision: number | null;
+	journalSeq?: number;
 	method: "restore_before" | "restore_snapshot" | "merge" | "already_before" | "no_change";
 }
 
@@ -185,13 +191,12 @@ export class FileChangeReversalCalculator {
 		for (const effect of prepared.effects) {
 			budget.check();
 			let method: FileChangeReversalStep["method"];
-			if (effect.outcome === "no_change") {
-				method = "no_change";
-			} else if (input.recoveryMode === "snapshot") {
-				// Effects are ordered newest to oldest by durable scope revision. Every
-				// changed effect contributes its own measured before, including absence/mode.
+			if (input.recoveryMode === "snapshot") {
+				// Explicit consent selects the saved version, independently of the old IO result.
 				desired = known(effect.before);
 				method = "restore_snapshot";
+			} else if (effect.outcome === "no_change") {
+				method = "no_change";
 			} else if (fileChangeStatesEqual(desired, effect.before)) {
 				method = "already_before";
 			} else if (fileChangeStatesEqual(desired, effect.observedAfter)) {
@@ -253,6 +258,7 @@ export class FileChangeReversalCalculator {
 				effectId: effect.id,
 				mutationId: effect.mutationId,
 				scopeRevision: effect.scopeRevision,
+				...(effect.journalSeq === undefined ? {} : { journalSeq: effect.journalSeq }),
 				method,
 			});
 			if (steps.length % FILE_CHANGE_LIMITS.historyPageItems === 0) await yieldToEventLoop();
@@ -347,7 +353,7 @@ function snapshotInput(input: FileChangeReversalInput): FileChangeReversalInput 
 		if (!original) throw new Refusal("invalid_input");
 		let copy = copies.get(original);
 		if (!copy) {
-			copy = snapshotEffect(original);
+			copy = snapshotEffect(original, input.recoveryMode === "snapshot");
 			copies.set(original, copy);
 		}
 		effects[index] = copy;
@@ -389,24 +395,34 @@ function cloneIdentity(identity: FileChangeIdentity): FileChangeIdentity {
 }
 
 async function prepare(input: FileChangeReversalInput, budget: Budget) {
+	if (
+		input.effects.some((effect) => effect.diskOutcome != null) &&
+		input.effects.some((effect) => effect.journalSeq === undefined)
+	) {
+		throw new Refusal("order_unverified");
+	}
 	const identity = input.identity;
-	const identityKey = fileChangeIdentityKey(identity);
+	const identityKey = fileChangePhysicalIdentityKey(identity);
 	const current = known(cloneState(input.current));
 	const refs = new Map<string, FileChangeBlobRef>();
+	const charged = new Set<string>();
 	let evidenceBytes = 0;
-	const addState = (state: FileChangeState) => {
+	const addState = (state: FileChangeState, archive = true) => {
 		const ref =
 			state.kind === "regular" ? state.blob : state.kind === "symlink" ? state.target : null;
 		if (!ref) return;
 		const prior = refs.get(ref.digest);
 		if (prior && !refsEqual(prior, ref)) throw new Refusal("blob_integrity");
-		if (prior) return;
-		evidenceBytes += ref.sizeBytes;
-		if (evidenceBytes > FILE_CHANGE_LIMITS.operationEvidenceBytes)
-			throw new Refusal("budget_exceeded");
+		if (archive && !charged.has(ref.digest)) {
+			charged.add(ref.digest);
+			evidenceBytes += ref.sizeBytes;
+			if (evidenceBytes > FILE_CHANGE_LIMITS.operationEvidenceBytes)
+				throw new Refusal("budget_exceeded");
+		}
 		refs.set(ref.digest, ref);
 	};
-	addState(current);
+	// Verify current through the caller's live-byte adapter without requiring an archive.
+	addState(current, false);
 	const ids = new Map<string, { effect: FileChangeReversalEffect; serialized: string }>();
 	const mutations = new Map<string, string>();
 	const revisions = new Set<number>();
@@ -415,23 +431,23 @@ async function prepare(input: FileChangeReversalInput, budget: Budget) {
 		if (processed++ % FILE_CHANGE_LIMITS.historyPageItems === 0) await yieldToEventLoop();
 		budget.check();
 		validateEffect(effect);
-		if (
-			fileChangeIdentityKey(effect.identity) !== identityKey ||
-			effect.identity.scopeId !== identity.scopeId
-		) {
+		if (fileChangePhysicalIdentityKey(effect.identity) !== identityKey) {
 			throw new Refusal("identity_mismatch", effect.id);
 		}
+		const snapshotOnly = input.recoveryMode === "snapshot";
 		const receipt = effect.executionReceipt;
 		if (
-			!receipt?.receiptId ||
-			!fileChangeExecutionBindingMatches(receipt.executionBinding, receipt.executionBinding)
+			!snapshotOnly &&
+			effect.diskOutcome == null &&
+			(!receipt?.receiptId ||
+				!fileChangeExecutionBindingMatches(receipt.executionBinding, receipt.executionBinding))
 		) {
 			throw new Refusal("effect_unverified", effect.id);
 		}
-		const noDispatch = hasConfirmedNoFileChange(effect);
-		// These shared predicates include the original bound execution receipt; no
-		// current/intended byte comparison may fabricate a missing acknowledgement.
-		if (!noDispatch && !hasSettledMeasuredFileEffect(effect)) {
+		const noDispatch = !snapshotOnly && hasConfirmedNoFileChange(effect);
+		if (snapshotOnly) known(effect.before);
+		// Normal undo uses execution results. Explicit version restoration uses saved before bytes.
+		if (!snapshotOnly && !noDispatch && !hasSettledMeasuredFileEffect(effect)) {
 			throw new Refusal("effect_unverified", effect.id);
 		}
 		const serialized = JSON.stringify(effect);
@@ -445,9 +461,10 @@ async function prepare(input: FileChangeReversalInput, budget: Budget) {
 		if (mutations.has(effect.mutationId)) throw new Refusal("duplicate_unverified", effect.id);
 		mutations.set(effect.mutationId, effect.id);
 		ids.set(effect.id, { effect, serialized });
-		if (effect.outcome === "changed") {
-			if (revisions.has(effect.scopeRevision)) throw new Refusal("order_unverified", effect.id);
-			revisions.add(effect.scopeRevision);
+		if (snapshotOnly || effect.outcome === "changed") {
+			const sequence = effectSequence(effect);
+			if (revisions.has(sequence)) throw new Refusal("order_unverified", effect.id);
+			revisions.add(sequence);
 		}
 		if (!noDispatch) {
 			addState(effect.before);
@@ -457,11 +474,22 @@ async function prepare(input: FileChangeReversalInput, budget: Budget) {
 		}
 	}
 	const effects = Array.from(ids.values(), ({ effect }) => effect).sort(
-		(a, b) => b.scopeRevision - a.scopeRevision,
+		(a, b) => effectSequence(b) - effectSequence(a),
 	);
 	return { identity, current, refs, effects, evidenceBytes };
 }
 
+function effectSequence(effect: FileChangeReversalEffect): number {
+	const sequence = effect.journalSeq ?? effect.scopeRevision;
+	if (
+		typeof sequence !== "number" ||
+		!Number.isSafeInteger(sequence) ||
+		sequence < 0 ||
+		(effect.diskOutcome != null && (effect.journalSeq === undefined || effect.journalSeq < 1))
+	)
+		throw new Refusal("order_unverified", effect.id);
+	return sequence;
+}
 function validateEffect(effect: FileChangeReversalEffect): void {
 	for (const value of [effect.id, effect.operationId, effect.mutationId, effect.requestDigest])
 		assertString(value);
@@ -471,8 +499,7 @@ function validateEffect(effect: FileChangeReversalEffect): void {
 		effect.attempt < 1
 	)
 		throw new Refusal("invalid_input", effect.id);
-	if (!Number.isSafeInteger(effect.scopeRevision) || effect.scopeRevision < 0)
-		throw new Refusal("order_unverified", effect.id);
+	effectSequence(effect);
 	if (effect.phase !== "apply" && effect.phase !== "compensate")
 		throw new Refusal("effect_unverified", effect.id);
 	if (
@@ -503,8 +530,11 @@ function validateEffect(effect: FileChangeReversalEffect): void {
 	cloneState(effect.observedAfter);
 }
 
-function snapshotEffect(effect: FileChangeReversalEffect): FileChangeReversalEffect {
-	const receipt = effect.executionReceipt;
+function snapshotEffect(
+	effect: FileChangeReversalEffect,
+	snapshotOnly = false,
+): FileChangeReversalEffect {
+	const receipt = snapshotOnly ? null : effect.executionReceipt;
 	return {
 		id: effect.id,
 		operationId: effect.operationId,
@@ -514,9 +544,15 @@ function snapshotEffect(effect: FileChangeReversalEffect): FileChangeReversalEff
 		phase: effect.phase,
 		identity: cloneIdentity(effect.identity),
 		scopeRevision: effect.scopeRevision,
+		journalSeq: effect.journalSeq,
+		diskOutcome: effect.diskOutcome,
 		before: snapshotState(effect.before),
-		intendedAfter: snapshotState(effect.intendedAfter),
-		observedAfter: snapshotState(effect.observedAfter),
+		intendedAfter: snapshotOnly
+			? { kind: "unknown", reason: "result_unknown" }
+			: snapshotState(effect.intendedAfter),
+		observedAfter: snapshotOnly
+			? { kind: "unknown", reason: "result_unknown" }
+			: snapshotState(effect.observedAfter),
 		outcome: effect.outcome,
 		settlement: effect.settlement,
 		attribution: effect.attribution,

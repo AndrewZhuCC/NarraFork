@@ -72,6 +72,11 @@ import {
 	getCodexDisplayTierOrder,
 	getCodexTierLabel,
 } from "../../lib/codex-tiers";
+import {
+	type CodexCredentialEditForm,
+	codexCredentialEditForm,
+	saveCodexCredentialEdit,
+} from "../../lib/codex-use-credit-quota";
 import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
@@ -492,10 +497,9 @@ export const CodexSection = React.memo(function CodexSection({
 		verificationUrl: string;
 	} | null>(null);
 	const [editingId, setEditingId] = useState<string | null>(null);
-	const [editForm, setEditForm] = useState<{
-		displayName: string;
-		priority: number;
-	}>({ displayName: "", priority: 0 });
+	const [editForm, setEditForm] = useState<CodexCredentialEditForm>(
+		codexCredentialEditForm({ priority: 0 }),
+	);
 	const [useWebSocket, setUseWebSocket] = useState(true);
 	const [useWebSocketInitialized, setUseWebSocketInitialized] = useState(false);
 	const [useWebSearch, setUseWebSearch] = useState(true);
@@ -780,7 +784,7 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
 	});
 	const updateMut = useMutation({
-		mutationFn: ({ id, data }: { id: string; data: { displayName?: string; priority?: number } }) =>
+		mutationFn: ({ id, data }: { id: string; data: CodexCredentialEditForm }) =>
 			api.codexCredentialUpdate(id, data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
@@ -1163,23 +1167,27 @@ export const CodexSection = React.memo(function CodexSection({
 		}, 3000);
 	};
 
-	const handleEdit = (entry: (typeof entries)[0]) => {
+	const handleEdit = (entry: CodexCredentialListEntry) => {
 		setEditingId(entry.id);
-		setEditForm({
-			displayName: entry.displayName ?? "",
-			priority: entry.priority,
-		});
+		setEditForm(codexCredentialEditForm(entry));
 	};
 
-	const handleSaveEdit = () => {
-		if (!editingId || !canUpdateCredential) return;
-		// Send "" (not undefined) so clearing the name actually persists — the
-		// backend skips undefined fields, and JSON.stringify drops them anyway.
-		const data: { displayName?: string; priority?: number } = {
-			displayName: editForm.displayName,
-			priority: editForm.priority,
-		};
-		updateMut.mutate({ id: editingId, data });
+	const handleSaveEdit = async () => {
+		if (!editingId || !canUpdateCredential || updateMut.isPending) return;
+		const entry = entries.find((entry) => entry.id === editingId);
+		if (!entry) return;
+		await saveCodexCredentialEdit(
+			entry.useCreditQuota,
+			editForm,
+			() =>
+				confirm({
+					message: t("codexUseCreditQuotaConfirm"),
+					confirmLabel: t("codexUseCreditQuotaConfirmAction"),
+					confirmColor: "orange",
+				}),
+			// Keep the empty display name so clearing it actually persists.
+			(data) => updateMut.mutate({ id: editingId, data }),
+		);
 	};
 
 	const handleTierOrderDragEnd = (event: DragEndEvent) => {
@@ -1947,9 +1955,29 @@ export const CodexSection = React.memo(function CodexSection({
 	);
 });
 
+function CodexCreditQuotaSwitch({
+	form,
+	onChange,
+}: {
+	form: CodexCredentialEditForm;
+	onChange: (form: CodexCredentialEditForm) => void;
+}) {
+	const { t } = useTranslation("settings");
+	return (
+		<Switch
+			size="xs"
+			label={t("codexUseCreditQuota")}
+			description={t("codexUseCreditQuotaDescription")}
+			checked={form.useCreditQuota}
+			onChange={(event) => onChange({ ...form, useCreditQuota: event.currentTarget.checked })}
+		/>
+	);
+}
+
 // Credential list wrapper (responsive)
 interface CodexCredentialListEntry {
 	id: string;
+	useCreditQuota?: boolean;
 	displayName?: string;
 	authMode?: CodexAuthMode;
 	accountId?: string;
@@ -1975,11 +2003,11 @@ interface CodexCredentialListProps {
 	/** Lifetime token/cost totals keyed by credential id. */
 	lifetimeTotals: Record<string, CredentialUsageTotals>;
 	editingId: string | null;
-	editForm: { displayName: string; priority: number };
+	editForm: CodexCredentialEditForm;
 	onEdit: (entry: CodexCredentialListEntry) => void;
 	onSaveEdit: () => void;
 	onCancelEdit: () => void;
-	onEditFormChange: (form: { displayName: string; priority: number }) => void;
+	onEditFormChange: (form: CodexCredentialEditForm) => void;
 
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	usageMut: any;
@@ -2158,20 +2186,28 @@ function CredentialList(props: CodexCredentialListProps) {
 								</Table.Td>
 								<Table.Td>
 									{isEditing ? (
-										<TextInput
-											size="xs"
-											value={editForm.displayName}
-											onChange={(e) =>
-												onEditFormChange({ ...editForm, displayName: e.target.value })
-											}
-											placeholder={entry.accountId ?? entry.id}
-										/>
+										<Stack gap="xs">
+											<TextInput
+												size="xs"
+												value={editForm.displayName}
+												onChange={(e) =>
+													onEditFormChange({ ...editForm, displayName: e.target.value })
+												}
+												placeholder={entry.accountId ?? entry.id}
+											/>
+											<CodexCreditQuotaSwitch form={editForm} onChange={onEditFormChange} />
+										</Stack>
 									) : (
 										<Group gap={6} wrap="nowrap">
 											<Text size="sm" fw={isCurrent ? 700 : 400}>
 												{entry.displayName || entry.accountId || entry.id.slice(0, 8)}
 											</Text>
 											<CodexAuthModeBadge authMode={entry.authMode} />
+											{entry.useCreditQuota && (
+												<Badge size="xs" color="teal">
+													{t("codexUseCreditQuotaBadge")}
+												</Badge>
+											)}
 										</Group>
 									)}
 								</Table.Td>
@@ -2541,6 +2577,11 @@ function CredentialCards(props: CodexCredentialListProps) {
 										{displayLabel}
 									</Text>
 									<CodexAuthModeBadge authMode={entry.authMode} />
+									{entry.useCreditQuota && (
+										<Badge size="xs" color="teal">
+											{t("codexUseCreditQuotaBadge")}
+										</Badge>
+									)}
 								</Group>
 								<Group gap="xs">
 									<CodexCredentialStatusBadge entry={entry} t={t} />
@@ -2564,6 +2605,7 @@ function CredentialCards(props: CodexCredentialListProps) {
 										min={0}
 										step={1}
 									/>
+									<CodexCreditQuotaSwitch form={editForm} onChange={onEditFormChange} />
 									<Group gap="xs">
 										<Button
 											size="compact-xs"

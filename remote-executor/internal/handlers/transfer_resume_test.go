@@ -14,12 +14,6 @@ import (
 	"time"
 )
 
-// nopSender discards frames (upload direction receives, never sends).
-type nopSender struct{}
-
-func (nopSender) SendBinary([]byte) error { return nil }
-func (nopSender) BufferedAmount() int     { return 0 }
-
 type slowCountingSender struct {
 	count atomic.Int64
 }
@@ -75,24 +69,11 @@ func TestUploadResume(t *testing.T) {
 		off := i * chunkSize
 		transfers.WriteChunk("resume1", i, content[off:off+chunkSize])
 	}
-	// Simulate an interruption: drop the session without completing. The manifest
-	// + .part remain on disk.
-	sess := transfers.get("resume1")
-	if sess != nil && sess.recvFile != nil {
-		_ = sess.recvFile.Sync()
-		saveManifest(
-			sess.manifestPath,
-			sess.manifestTmpPath,
-			sess.chunkSize,
-			sess.fileSize,
-			sess.contentIdentity,
-			sess.received,
-		)
-		_ = sess.recvFile.Close()
+	// A real pause closes the receiver and releases its process-local checkpoint
+	// ownership while leaving the manifest and .part available to the next begin.
+	if _, err := transfers.Abort(map[string]any{"transferId": "resume1", "preservePartial": true}); err != nil {
+		t.Fatal(err)
 	}
-	transfers.mu.Lock()
-	delete(transfers.sessions, "resume1")
-	transfers.mu.Unlock()
 
 	// Manifest must exist and report >= 32 completed chunks.
 	if _, err := os.Stat(dst + ".nfmeta"); err != nil {
@@ -123,7 +104,7 @@ func TestUploadResume(t *testing.T) {
 		transfers.WriteChunk("resume2", i, content[off:off+chunkSize])
 	}
 
-	completeRes, err := transfers.Complete(map[string]any{"transferId": "resume2"})
+	completeRes, err := transfers.Complete(context.Background(), map[string]any{"transferId": "resume2"})
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
@@ -191,7 +172,7 @@ func TestUploadResumeRejectsMismatchedContentIdentity(t *testing.T) {
 	}
 	transfers.WriteChunk("identity-b", 0, contentB[:chunkSize])
 	transfers.WriteChunk("identity-b", 1, contentB[chunkSize:])
-	complete, err := transfers.Complete(map[string]any{
+	complete, err := transfers.Complete(context.Background(), map[string]any{
 		"transferId": "identity-b",
 		"sha256":     digestB,
 	})
@@ -397,7 +378,7 @@ func TestOutOfOrderChunks(t *testing.T) {
 		off := i * chunkSize
 		transfers.WriteChunk("ooo", i, content[off:off+chunkSize])
 	}
-	if _, err := transfers.Complete(map[string]any{"transferId": "ooo"}); err != nil {
+	if _, err := transfers.Complete(context.Background(), map[string]any{"transferId": "ooo"}); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	got, _ := os.ReadFile(dst)

@@ -208,11 +208,22 @@ export type NarraForkEvent =
 	// change actually warrants alerting the user. Notification consumers (IM /
 	// gateway) listen to this instead of re-deriving intent from status+substatus.
 	// Reflection mid-states (danger/plan/goal) and takeover fallbacks never emit it.
+	//
+	// `backgroundWorkActive` (only ever set for reason "done"): the turn finished
+	// but background work WHOSE COMPLETION WAKES THE NARRATOR (background bash
+	// tasks, background subagents) is still running. Notification channels (IM
+	// webhooks, recent-tab IM pings, browser PWA, sound) suppress on it — the
+	// wake-up turn after the last such task completes emits a fresh, unflagged
+	// "done" which notifies normally. Transfers and services never set it: a
+	// transfer's terminal commit skips publication (no wake-up turn exists to
+	// re-raise the attention), and a service is not work. Hooks still receive
+	// the event with this flag so the receiver decides.
 	| {
 			type: "narrator:attention";
 			narratorId: string;
 			reason: "waiting_permission" | "done" | "error";
 			detail?: string;
+			backgroundWorkActive?: boolean;
 	  }
 	// Semantic "a previously-raised attention was resolved" intent — the mirror of
 	// `narrator:attention`. Emitted only when an attention that actually alerted the

@@ -68,7 +68,7 @@ import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeBlobRef,
 } from "@shared/file-change-protocol";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { alias } from "drizzle-orm/pg-core";
 import type {
@@ -190,9 +190,14 @@ export class PostgresRevertPlanStore {
 
 	// ── in-section guards (PG spellings of the SQLite service's private helpers) ──
 
-	private async requireOwner(tx: Tx, owner: RevertPlanOwner, planId: string): Promise<PlanRecord> {
+	private async requireOwner(
+		tx: Tx,
+		owner: RevertPlanOwner,
+		planId: string,
+		lock = false,
+	): Promise<PlanRecord> {
 		I.text(planId, "planId");
-		const rows = (await tx
+		const query = tx
 			.select()
 			.from(revertOperations)
 			.where(
@@ -202,7 +207,9 @@ export class PostgresRevertPlanStore {
 					isNotDistinctFrom(revertOperations.narratorId, owner.narratorId),
 					isNotDistinctFrom(revertOperations.projectId, owner.projectId),
 				),
-			)) as PlanRecord[];
+			)
+			.limit(1);
+		const rows = (lock ? await query.for("update") : await query) as PlanRecord[];
 		const row = rows[0];
 		if (!row) throw I.fail("NOT_FOUND", "Plan not found in the owning context");
 		I.metadata(row);
@@ -218,7 +225,7 @@ export class PostgresRevertPlanStore {
 			.from(fileChangeStorageBudgets)
 			.where(eq(fileChangeStorageBudgets.id, FILE_CHANGE_BLOB_BUDGET_ID));
 		const budget = rows[0];
-		if (budget?.status !== "ready" || budget.namespaceKey !== this.namespaceKey) {
+		if (!budget || budget.namespaceKey !== this.namespaceKey) {
 			throw I.fail(
 				"CATALOG_UNVERIFIED",
 				"The physical blob namespace must be reconciled and ready",
@@ -328,8 +335,8 @@ export class PostgresRevertPlanStore {
 		const scope = rows[0] as
 			| (Parameters<typeof createFileChangeIdentity>[0] & { status: string })
 			| undefined;
-		if (!scope || scope.status !== "active") {
-			throw I.fail("TARGET_UNVERIFIED", "A verified active scope is required");
+		if (!scope) {
+			throw I.fail("TARGET_UNVERIFIED", "Recorded scope metadata is required");
 		}
 		if (!I.equal(createFileChangeIdentity(scope, identity), identity)) {
 			throw I.fail(
@@ -346,21 +353,17 @@ export class PostgresRevertPlanStore {
 	 * becomes `IS DISTINCT FROM`.
 	 */
 	private async assertPinnedRefsStillReady(tx: Tx, planId: string): Promise<void> {
-		const before = alias(fileChangeBlobs, "revert_expected_blob");
 		const desired = alias(fileChangeBlobs, "revert_desired_blob");
 		const rows = await tx
 			.select({ id: revertOperationFiles.id })
 			.from(revertOperationFiles)
-			.leftJoin(before, eq(revertOperationFiles.beforeBlobDigest, before.digest))
 			.leftJoin(desired, eq(revertOperationFiles.desiredBlobDigest, desired.digest))
 			.leftJoin(fileChangeScopes, eq(revertOperationFiles.scopeId, fileChangeScopes.id))
 			.where(
 				and(
 					eq(revertOperationFiles.revertOperationId, planId),
 					sql`(
-				${revertOperationFiles.status} != 'prepared' OR ${fileChangeScopes.status} IS DISTINCT FROM 'active'
-				OR (${revertOperationFiles.beforeBlobDigest} IS NOT NULL AND (${before.status} IS DISTINCT FROM 'ready'
-					OR ${before.sizeBytes} IS DISTINCT FROM coalesce((${revertOperationFiles.expectedStateJson}::jsonb #>> '{blob,sizeBytes}')::bigint, (${revertOperationFiles.expectedStateJson}::jsonb #>> '{target,sizeBytes}')::bigint)))
+				${revertOperationFiles.status} != 'prepared' OR ${fileChangeScopes.id} IS NULL
 				OR (${revertOperationFiles.desiredBlobDigest} IS NOT NULL AND (${desired.status} IS DISTINCT FROM 'ready'
 					OR ${desired.sizeBytes} IS DISTINCT FROM coalesce((${revertOperationFiles.desiredStateJson}::jsonb #>> '{blob,sizeBytes}')::bigint, (${revertOperationFiles.desiredStateJson}::jsonb #>> '{target,sizeBytes}')::bigint)))
 			)`,
@@ -550,41 +553,11 @@ export class PostgresRevertPlanStore {
 		);
 		this.assertPlanned(original);
 		this.assertFresh(original);
-		const manifestRefs = await this.refs(this.database as unknown as RootQueryable, original);
-		let bytes = I.refBytes(manifestRefs);
-		let count = 0;
-		const sequences = new Map<number, string>();
-		let cursor: RevertPlanFileCursor | undefined;
-		for (;;) {
-			options.signal?.throwIfAborted();
-			const page = await this.selectFiles(
-				this.database,
-				planId,
-				cursor,
-				REVERT_PLAN_BATCH_ITEMS + 1,
-			);
-			for (const row of page.slice(0, REVERT_PLAN_BATCH_ITEMS)) {
-				I.metadata(row);
-				if (sequences.has(row.sequence)) {
-					throw I.fail("DUPLICATE_FILE", "Stored sequence values repeat");
-				}
-				sequences.set(row.sequence, row.fileKey);
-				count++;
-				I.integer(count, "appended files", 0, original.fileCount);
-				bytes +=
-					I.stateBytes(I.normalizeState(row.expectedStateJson)) +
-					I.stateBytes(I.normalizeState(row.desiredStateJson));
-				I.evidenceBudget(bytes);
-			}
-			if (page.length <= REVERT_PLAN_BATCH_ITEMS) break;
-			cursor = I.fileCursor(page[REVERT_PLAN_BATCH_ITEMS - 1]);
-			await yieldToEventLoop();
-		}
 		options.signal?.throwIfAborted();
 		return withPgRetry(
 			() =>
 				this.database.transaction((tx) =>
-					this.appendSection(tx, context, planId, original, files, sequences, count, bytes),
+					this.appendSection(tx, context, planId, original, files, options.signal),
 				),
 			{ label: "revertPlan.appendFiles" },
 		);
@@ -596,35 +569,56 @@ export class PostgresRevertPlanStore {
 		planId: string,
 		original: PlanRecord,
 		files: NormalizedFile[],
-		sequences: Map<number, string>,
-		count: number,
-		bytes: number,
+		signal?: AbortSignal,
 	): Promise<Pick<FileRecord, "id" | "fileKey" | "sequence">[]> {
-		const operation = await this.requireOwner(tx, context, planId);
+		signal?.throwIfAborted();
+		// Serialize appenders on the parent so different identities cannot race for a position.
+		const operation = await this.requireOwner(tx, context, planId, true);
 		I.assertSameRevision(original, operation);
 		this.assertPlanned(operation);
 		this.assertFresh(operation);
 		await this.refs(tx, operation);
 		await this.assertParent(tx, operation);
+		const matches = (await tx
+			.select()
+			.from(revertOperationFiles)
+			.where(
+				or(
+					and(
+						eq(revertOperationFiles.revertOperationId, planId),
+						inArray(
+							revertOperationFiles.fileKey,
+							files.map((file) => file.fileKey),
+						),
+					),
+					and(
+						eq(revertOperationFiles.revertOperationId, planId),
+						inArray(revertOperationFiles.status, I.fileStatuses),
+						inArray(
+							revertOperationFiles.sequence,
+							files.map((file) => file.sequence),
+						),
+					),
+				),
+			)
+			.limit(2 * REVERT_PLAN_BATCH_ITEMS + 1)) as FileRecord[];
+		const existingFiles = new Map(matches.map((row) => [row.fileKey, row]));
+		const sequences = new Map<number, string>();
+		for (const row of matches) {
+			if (sequences.has(row.sequence))
+				throw I.fail("DUPLICATE_FILE", "Stored sequence values repeat");
+			sequences.set(row.sequence, row.fileKey);
+		}
 		const results: Pick<FileRecord, "id" | "fileKey" | "sequence">[] = [];
 		let changed = false;
 		for (const file of files) {
 			I.integer(file.sequence, "sequence", 0, operation.fileCount - 1);
 			await this.assertScope(tx, file.identity);
-			for (const ref of [I.stateRef(file.expected), I.stateRef(file.desired)]) {
-				if (ref) await this.requireReadyRef(tx, ref);
-			}
+			signal?.throwIfAborted();
+			const desiredRef = I.requiredDesiredRef(file);
+			if (desiredRef) await this.requireReadyRef(tx, desiredRef);
 			const values = I.fileValues(operation, file);
-			const existingRows = (await tx
-				.select()
-				.from(revertOperationFiles)
-				.where(
-					and(
-						eq(revertOperationFiles.revertOperationId, planId),
-						eq(revertOperationFiles.fileKey, file.fileKey),
-					),
-				)) as FileRecord[];
-			const existing = existingRows[0];
+			const existing = existingFiles.get(file.fileKey);
 			if (existing) {
 				I.assertFileValues(existing, values);
 				results.push({ id: existing.id, fileKey: existing.fileKey, sequence: existing.sequence });
@@ -633,12 +627,27 @@ export class PostgresRevertPlanStore {
 			if (sequences.has(file.sequence)) {
 				throw I.fail("DUPLICATE_FILE", "Another file owns this manifest position");
 			}
-			I.integer(++count, "appended files", 0, operation.fileCount);
-			bytes += I.stateBytes(file.expected) + I.stateBytes(file.desired);
-			I.evidenceBudget(bytes);
 			sequences.set(file.sequence, file.fileKey);
+			const beforeRef = I.stateRef(file.expected);
+			const before = beforeRef
+				? (
+						await tx
+							.select({ digest: fileChangeBlobs.digest })
+							.from(fileChangeBlobs)
+							.where(
+								and(
+									eq(fileChangeBlobs.digest, beforeRef.digest),
+									eq(fileChangeBlobs.sizeBytes, beforeRef.sizeBytes),
+									eq(fileChangeBlobs.status, "ready"),
+								),
+							)
+							.limit(1)
+							.for("key share", { skipLocked: true })
+					)[0]
+				: undefined;
 			const row = {
 				...values,
+				beforeBlobDigest: before?.digest ?? null,
 				id: generateId(),
 				observedAfterStateJson: null,
 				observedAfterBlobDigest: null,
@@ -682,7 +691,7 @@ export class PostgresRevertPlanStore {
 		if (
 			(original.status !== "planned" && original.status !== "prepared") ||
 			original.appliedFileCount !== 0 ||
-			original.coverageComplete !== (original.status === "prepared")
+			(original.status === "planned" && original.coverageComplete)
 		) {
 			throw I.fail("INVALID_TRANSITION", "Only an unattempted plan can be prepared");
 		}
@@ -698,7 +707,10 @@ export class PostgresRevertPlanStore {
 					),
 				{ label: "revertPlan.finalize.verify" },
 			);
+			// Only publish page verification state after the retryable transaction commits.
+			for (const [sequence, digest] of page.entries) entries.set(sequence, digest);
 			fileBytes += page.fileBytes;
+			I.evidenceBudget(fileBytes);
 			if (page.rows.length <= REVERT_PLAN_BATCH_ITEMS) break;
 			cursor = I.fileCursor(page.rows[REVERT_PLAN_BATCH_ITEMS - 1]);
 			await yieldToEventLoop();
@@ -733,12 +745,13 @@ export class PostgresRevertPlanStore {
 		proof: RevertPlanManifestProof,
 		entries: Map<number, string>,
 		cursor: RevertPlanFileCursor | undefined,
-	): Promise<{ rows: FileRecord[]; fileBytes: number }> {
+	): Promise<{ rows: FileRecord[]; fileBytes: number; entries: Map<number, string> }> {
 		const operation = await this.requireOwner(tx, context, planId);
 		I.assertSameRevision(original, operation);
 		this.assertFresh(operation);
 		await this.assertProof(tx, operation, proof);
 		const rows = await this.selectFiles(tx, planId, cursor, REVERT_PLAN_BATCH_ITEMS + 1);
+		const pageEntries = new Map<number, string>();
 		let fileBytes = 0;
 		for (const row of rows.slice(0, REVERT_PLAN_BATCH_ITEMS)) {
 			I.metadata(row);
@@ -751,18 +764,17 @@ export class PostgresRevertPlanStore {
 			I.integer(file.sequence, "sequence", 0, operation.fileCount - 1);
 			I.assertFileValues(row, I.fileValues(operation, file));
 			await this.assertScope(tx, file.identity);
-			for (const ref of [I.stateRef(file.expected), I.stateRef(file.desired)]) {
-				if (ref) await this.requireReadyRef(tx, ref);
-			}
-			if (entries.has(file.sequence)) {
+			const desiredRef = I.requiredDesiredRef(file);
+			if (desiredRef) await this.requireReadyRef(tx, desiredRef);
+			if (entries.has(file.sequence) || pageEntries.has(file.sequence)) {
 				throw I.fail("DUPLICATE_FILE", "Stored manifest positions repeat");
 			}
-			entries.set(file.sequence, I.digest(file));
-			I.integer(entries.size, "verified files", 0, operation.fileCount);
-			fileBytes += I.stateBytes(file.expected) + I.stateBytes(file.desired);
+			pageEntries.set(file.sequence, I.digest(file));
+			I.integer(entries.size + pageEntries.size, "verified files", 0, operation.fileCount);
+			fileBytes += I.requiredDesiredRef(file)?.sizeBytes ?? 0;
 			I.evidenceBudget(fileBytes);
 		}
-		return { rows, fileBytes };
+		return { rows, fileBytes, entries: pageEntries };
 	}
 
 	private async finalizeCommitSection(
@@ -778,7 +790,7 @@ export class PostgresRevertPlanStore {
 		await this.assertProof(tx, operation, proof);
 		await this.assertParent(tx, operation);
 		await this.assertPinnedRefsStillReady(tx, planId);
-		if (operation.status === "prepared" && operation.coverageComplete) {
+		if (operation.status === "prepared") {
 			return this.summary(operation);
 		}
 		this.assertPlanned(operation);
@@ -786,7 +798,10 @@ export class PostgresRevertPlanStore {
 			.update(revertOperations)
 			.set({
 				status: "prepared",
-				coverageComplete: true,
+				coverageComplete:
+					proof.computation === "complete" &&
+					proof.historyCoverage === "complete" &&
+					proof.unknownFiles === 0,
 				updatedAt: this.timestamp(operation.updatedAt),
 			})
 			.where(

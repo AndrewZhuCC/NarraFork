@@ -83,7 +83,7 @@ func (f *editorFixture) request(t *testing.T, id string, before, body []byte) Ed
 		d := editorDigest(before)
 		expected = &d
 	}
-	return EditorApplyRequest{Namespace: "owner", ResourceKey: "resource", OperationID: id, RequestDigest: editorDigest([]byte(id)), StageID: f.stage(t, body), ExpectedRawHash: expected, Identity: f.identity, MetadataPolicy: "preserve"}
+	return EditorApplyRequest{Coordination: EditorTargetQueueCoordination, Namespace: "owner", ResourceKey: "resource", OperationID: id, RequestDigest: editorDigest([]byte(id)), StageID: f.stage(t, body), ExpectedRawHash: expected, Identity: f.identity, MetadataPolicy: "preserve"}
 }
 func (f *editorFixture) query(t *testing.T, req EditorApplyRequest) EditorQueryResult {
 	t.Helper()
@@ -280,17 +280,15 @@ func TestEditorManagedSameBaselineAndAbsentNoReplace(t *testing.T) {
 	}
 }
 func TestEditorBindingsAndFinalRechecks(t *testing.T) {
-	for _, kind := range []string{"epoch", "fence", "root", "parent", "source", "metadata", "canonical", "outside", "missing-parent"} {
+	for _, kind := range []string{"epoch", "generation", "root", "parent", "source", "metadata", "canonical", "outside", "missing-parent"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newEditorFixture(t, []byte("before"))
 			req := f.request(t, "bound", []byte("before"), []byte("after"))
 			switch kind {
 			case "epoch":
 				req.Identity.RuntimeEpoch = "stale"
-			case "fence":
-				if err := f.e.save(filepath.Join(f.e.root, editorKey(req.Namespace, req.Identity.WorkspaceIdentity)+".fence.json"), editorFence{Version: 1, Token: 2, Namespace: req.Namespace}); err != nil {
-					t.Fatal(err)
-				}
+			case "generation":
+				req.Identity.RuntimeGeneration = -1
 			case "root":
 				req.Identity.WorkspaceIdentity = strings.Replace(req.Identity.WorkspaceIdentity, "[", "[\"bad\",", 1)
 			case "canonical":

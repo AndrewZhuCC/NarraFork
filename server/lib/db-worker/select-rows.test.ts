@@ -1,14 +1,14 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
-	SEARCH_QUERY_MAX_BYTES,
-	SEARCH_QUERY_MAX_PARAMS,
-	SEARCH_QUERY_MAX_PARAMS_BYTES,
-	SEARCH_QUERY_MAX_ROWS,
-	SEARCH_QUERY_MAX_SQL_BYTES,
-	type SearchQueryParams,
+	SELECT_ROWS_MAX_BYTES,
+	SELECT_ROWS_MAX_PARAMS,
+	SELECT_ROWS_MAX_PARAMS_BYTES,
+	SELECT_ROWS_MAX_ROWS,
+	SELECT_ROWS_MAX_SQL_BYTES,
+	type SelectRowsParams,
 } from "./protocol";
-import { runSearchQuery } from "./search-query";
+import { runSelectRows } from "./select-rows";
 
 let sqlite: Database;
 beforeEach(() => {
@@ -16,9 +16,9 @@ beforeEach(() => {
 });
 afterEach(() => sqlite.close());
 
-function query(overrides: Partial<SearchQueryParams> = {}) {
-	return runSearchQuery(sqlite, {
-		kind: "searchQuery",
+function result(overrides: Partial<SelectRowsParams> = {}) {
+	return runSelectRows(sqlite, {
+		kind: "selectRows",
 		sql: "SELECT ? AS title, 42 AS total, null AS optional",
 		params: ["search result"],
 		maxRows: 1,
@@ -26,7 +26,27 @@ function query(overrides: Partial<SearchQueryParams> = {}) {
 	});
 }
 
-describe("bounded worker search queries", () => {
+/** Object view for assertions; duplicate names collapse here, not in the worker result. */
+function query(overrides: Partial<SelectRowsParams> = {}) {
+	const { columns, rows } = result(overrides);
+	return rows.map((row) =>
+		Object.fromEntries(columns.map((column, index) => [column, row[index]])),
+	);
+}
+
+describe("bounded worker SELECT rows", () => {
+	test("returns positional rows that keep duplicate column names apart", () => {
+		expect(result({ sql: "SELECT ?, ?, null AS name", params: ["alice", 12] })).toEqual({
+			columns: ["?", "?", "name"],
+			rows: [["alice", 12, null]],
+		});
+		sqlite.run("CREATE TABLE t (id INTEGER)");
+		sqlite.run("INSERT INTO t VALUES (1)");
+		expect(
+			result({ sql: "SELECT a.id, b.id FROM t a JOIN t b ON a.id = b.id", params: [] }),
+		).toEqual({ columns: ["id", "id"], rows: [[1, 1]] });
+	});
+
 	test("preserves named fields and scalar types", () => {
 		expect(query()).toEqual([{ title: "search result", total: 42, optional: null }]);
 		expect(query({ sql: "WITH data AS (SELECT ? AS value) SELECT value FROM data" })).toEqual([
@@ -50,35 +70,35 @@ describe("bounded worker search queries", () => {
 	});
 
 	test("validates SQL, parameter counts, scalar types and finite numbers", () => {
-		expect(() => query({ sql: `SELECT 1 ${" ".repeat(SEARCH_QUERY_MAX_SQL_BYTES)}` })).toThrow();
-		expect(() => query({ params: Array(SEARCH_QUERY_MAX_PARAMS + 1).fill(null) })).toThrow();
+		expect(() => query({ sql: `SELECT 1 ${" ".repeat(SELECT_ROWS_MAX_SQL_BYTES)}` })).toThrow();
+		expect(() => query({ params: Array(SELECT_ROWS_MAX_PARAMS + 1).fill(null) })).toThrow();
 		for (const value of [NaN, Infinity, -Infinity, true, {}, undefined, 1n]) {
-			expect(() => query({ params: [value] as SearchQueryParams["params"] })).toThrow();
+			expect(() => query({ params: [value] as SelectRowsParams["params"] })).toThrow();
 		}
 		expect(() => query({ params: Array(1) })).toThrow();
-		for (const maxRows of [0, -1, 1.5, NaN, Infinity, SEARCH_QUERY_MAX_ROWS + 1])
+		for (const maxRows of [0, -1, 1.5, NaN, Infinity, SELECT_ROWS_MAX_ROWS + 1])
 			expect(() => query({ maxRows })).toThrow();
 	});
 
 	test("enforces UTF-8 and serialized parameter byte budgets separately", () => {
-		expect(() => query({ params: ["界".repeat(SEARCH_QUERY_MAX_PARAMS_BYTES / 2)] })).toThrow();
-		expect(() => query({ params: ["\\".repeat(SEARCH_QUERY_MAX_PARAMS_BYTES / 2)] })).toThrow();
-		expect(() => query({ params: ["a".repeat(SEARCH_QUERY_MAX_PARAMS_BYTES)] })).toThrow();
+		expect(() => query({ params: ["界".repeat(SELECT_ROWS_MAX_PARAMS_BYTES / 2)] })).toThrow();
+		expect(() => query({ params: ["\\".repeat(SELECT_ROWS_MAX_PARAMS_BYTES / 2)] })).toThrow();
+		expect(() => query({ params: ["a".repeat(SELECT_ROWS_MAX_PARAMS_BYTES)] })).toThrow();
 		// This deliberately exceeds the older usage-task's 64 KiB parameter ceiling.
 		expect(query({ params: ["a".repeat(70_000)] })[0]?.title).toHaveLength(70_000);
 	});
 
 	test("accepts the maximum parameter count and row budget", () => {
-		const params = Array(SEARCH_QUERY_MAX_PARAMS).fill(1);
+		const params = Array(SELECT_ROWS_MAX_PARAMS).fill(1);
 		const sql = `SELECT ${params.map(() => "?").join(" + ")} AS total`;
-		expect(query({ sql, params })).toEqual([{ total: SEARCH_QUERY_MAX_PARAMS }]);
+		expect(query({ sql, params })).toEqual([{ total: SELECT_ROWS_MAX_PARAMS }]);
 		const rows = query({
 			sql: "WITH RECURSIVE data(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM data WHERE n < ?) SELECT n FROM data",
-			params: [SEARCH_QUERY_MAX_ROWS],
-			maxRows: SEARCH_QUERY_MAX_ROWS,
+			params: [SELECT_ROWS_MAX_ROWS],
+			maxRows: SELECT_ROWS_MAX_ROWS,
 		});
-		expect(rows).toHaveLength(SEARCH_QUERY_MAX_ROWS);
-		expect(rows.at(-1)).toEqual({ n: SEARCH_QUERY_MAX_ROWS });
+		expect(rows).toHaveLength(SELECT_ROWS_MAX_ROWS);
+		expect(rows.at(-1)).toEqual({ n: SELECT_ROWS_MAX_ROWS });
 	});
 
 	test("rejects overflow rows rather than truncating", () => {
@@ -86,28 +106,27 @@ describe("bounded worker search queries", () => {
 		expect(query({ sql: "SELECT 1 AS value WHERE 0", params: [] })).toEqual([]);
 	});
 
-	test("enforces aggregate serialized byte budget, including keys and JSON escaping", () => {
+	test("enforces the aggregate value byte budget", () => {
 		expect(() =>
-			query({ sql: "SELECT printf('%.*c', ?, 'x') AS content", params: [SEARCH_QUERY_MAX_BYTES] }),
+			query({
+				sql: "SELECT printf('%.*c', ?, 'x') AS content",
+				params: [SELECT_ROWS_MAX_BYTES + 1],
+			}),
 		).toThrow("byte budget");
 		expect(() =>
 			query({
 				sql: "SELECT printf('%.*c', ?, 'x') AS content UNION ALL SELECT printf('%.*c', ?, 'x')",
-				params: [SEARCH_QUERY_MAX_BYTES / 2, SEARCH_QUERY_MAX_BYTES / 2],
+				params: [SELECT_ROWS_MAX_BYTES / 2, SELECT_ROWS_MAX_BYTES / 2 + 1],
 				maxRows: 2,
-			}),
-		).toThrow("byte budget");
-		expect(() =>
-			query({
-				sql: "SELECT printf('%.*c', ?, char(10)) AS content",
-				params: [SEARCH_QUERY_MAX_BYTES / 2],
 			}),
 		).toThrow("byte budget");
 	});
 
-	test("rejects blobs and non-finite returned numbers and releases errored statements", () => {
-		for (const sql of ["SELECT x'ff' AS value", "SELECT 1e999 AS value"])
-			expect(() => query({ sql, params: [] })).toThrow("Unexpected search query value");
+	test("returns blobs and releases errored statements", () => {
+		expect(query({ sql: "SELECT x'ff' AS value", params: [] })).toEqual([
+			{ value: new Uint8Array([255]) },
+		]);
+		expect(() => query({ sql: "SELECT 1 UNION ALL SELECT 2", params: [] })).toThrow();
 		expect(query()).toHaveLength(1);
 	});
 

@@ -43,6 +43,7 @@ export type WorkingCopyOptions = Pick<
 	| "deviceId"
 	| "origin"
 	| "translate"
+	| "onSaveReceipt"
 	| "readOnlySource"
 	| "protocol"
 	| "encodingHint"

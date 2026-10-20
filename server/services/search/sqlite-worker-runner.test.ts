@@ -14,10 +14,10 @@ describe("search worker admission and cancellation", () => {
 			runTask: async (path, task, options) => {
 				calls++;
 				expect(path).toBe("/isolated/fixture.db");
-				expect(task).toEqual({ kind: "searchQuery", sql, params: [50], maxRows: 10_000 });
+				expect(task).toEqual({ kind: "selectRows", sql, params: [50], maxRows: 10_000 });
 				expect(options.timeoutMs).toBe(SEARCH_QUERY_TIMEOUT_MS);
 				expect(options.signal).toBeInstanceOf(AbortSignal);
-				return [{ id: "latest" }];
+				return { columns: ["id"], rows: [["latest"]] };
 			},
 		});
 		expect(await execute(sql, [50])).toEqual([{ id: "latest" }]);
@@ -31,7 +31,7 @@ describe("search worker admission and cancellation", () => {
 	});
 
 	test("bounds outstanding work and releases admission after success", async () => {
-		let finish: (rows: Record<string, unknown>[]) => void = () => {};
+		let finish: (result: { columns: string[]; rows: unknown[][] }) => void = () => {};
 		const execute = createSqliteSearchQueryExecutor("/isolated/fixture.db", {
 			maxOutstanding: 1,
 			runTask: () =>
@@ -41,10 +41,10 @@ describe("search worker admission and cancellation", () => {
 		});
 		const first = execute(sql, [1]);
 		await expect(execute(sql, [1])).rejects.toMatchObject({ code: "SEARCH_QUERY_BUSY" });
-		finish([]);
+		finish({ columns: [], rows: [] });
 		await first;
 		const next = execute(sql, [1]);
-		finish([{ id: "second" }]);
+		finish({ columns: ["id"], rows: [["second"]] });
 		expect(await next).toEqual([{ id: "second" }]);
 		expect(SEARCH_MAX_OUTSTANDING).toBe(32);
 	});
@@ -71,7 +71,7 @@ describe("search worker admission and cancellation", () => {
 		const execute = createSqliteSearchQueryExecutor("/isolated/fixture.db", {
 			runTask: async () => {
 				calls++;
-				return [];
+				return { columns: [], rows: [] };
 			},
 		});
 		await expect(execute(sql, [1], { signal: controller.signal })).rejects.toMatchObject({

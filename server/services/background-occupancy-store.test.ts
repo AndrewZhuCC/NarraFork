@@ -222,6 +222,85 @@ describe("background occupancy coordinator", () => {
 		await store.start();
 	});
 
+	test("wake-work counts only tasks whose completion wakes the parent", async () => {
+		const { source, store } = fixture();
+		// bash task — wakes the parent on completion.
+		source.tasks.set("bash-task", task("bash-task", "root"));
+		// background subagent — wakes the parent on completion.
+		source.tasks.set(
+			"agent-task",
+			task("agent-task", "root", { type: "agent", subagentNarratorId: "child" }),
+		);
+		// legacy projection-less background narrator — still a subagent, wakes the parent.
+		source.narrators.set(
+			"legacy-bg",
+			narrator("legacy-bg", "root", { isBackground: true, backgroundStatus: "running" }),
+		);
+		// service — not work at all.
+		source.tasks.set("svc", task("svc", "root", { backgroundKind: "service" }));
+		// transfer — work for the badge, but its terminal commit skips publication,
+		// so no wake-up turn would ever re-raise a suppressed done notification.
+		source.tasks.set("xfer", task("xfer", "root", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(3);
+		// The badge work count still includes the transfer (and the service sits apart).
+		expect(store.snapshot(["root"]).counts.get("root")).toEqual({
+			activeCount: 5,
+			activeWorkCount: 4,
+			activeServiceCount: 1,
+		});
+	});
+
+	test("a finished agent projection kept alive by a transfer does not swallow the parent", async () => {
+		const { source, store } = fixture();
+		// The agent session already published its terminal wake. The row stays
+		// indexed only because the child is still occupied — here, by a transfer
+		// that will never publish. Counting it would suppress the parent's done
+		// with no later turn to re-raise it.
+		source.tasks.set(
+			"agent-done",
+			task("agent-done", "root", {
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: "child",
+			}),
+		);
+		source.tasks.set("xfer", task("xfer", "child", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(0);
+		expect(store.countActiveWakeWork("child")).toBe(0);
+		// The badge still shows the retained projection as work on the parent.
+		expect(store.snapshot(["root"]).counts.get("root")?.activeWorkCount).toBe(1);
+	});
+
+	test("a running subagent still counts while its only child task is a transfer", async () => {
+		const { source, store } = fixture();
+		source.tasks.set(
+			"agent-task",
+			task("agent-task", "root", { type: "agent", subagentNarratorId: "child" }),
+		);
+		source.tasks.set("xfer", task("xfer", "child", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(1);
+		expect(store.countActiveWakeWork("child")).toBe(0);
+	});
+
+	test("a legacy narrator occupied only by a transfer does not count as wake-work", async () => {
+		const { source, store } = fixture();
+		source.narrators.set(
+			"legacy-bg",
+			narrator("legacy-bg", "root", { isBackground: true, status: "idle" }),
+		);
+		source.tasks.set("xfer", task("xfer", "legacy-bg", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(0);
+		expect(store.snapshot(["root"]).counts.get("root")?.activeWorkCount).toBeGreaterThan(0);
+	});
+
 	test("dirty events arriving during shadow rebuild are replayed before publish", async () => {
 		const { source, store } = fixture();
 		source.tasks.set("work", task("work", "leaf"));

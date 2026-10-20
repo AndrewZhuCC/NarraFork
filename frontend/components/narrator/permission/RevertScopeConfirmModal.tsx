@@ -1,7 +1,6 @@
 /**
  * Shared file/history confirmation. The new action host reviews one durable plan
- * and its complete paged file list. The presentational dialog also retains the
- * legacy scope display for edit/regenerate, whose executor remains unavailable.
+ * and its complete paged file list. Legacy previews remain read-only.
  * No path widens the scope or interprets missing evidence as an empty file set.
  */
 
@@ -9,10 +8,9 @@ import { useRevertActionPreview } from "@frontend/hooks/useNarrator";
 import type {
 	RevertActionConfirmOptions,
 	RevertPlanReview,
-	RevertScope,
 	RevertScopePreviews,
 } from "@frontend/lib/api/narrators";
-import { formatRevertWarning, formatRevertWarnings } from "@frontend/lib/revert-warnings";
+import { formatRevertWarning } from "@frontend/lib/revert-warnings";
 import {
 	Alert,
 	Badge,
@@ -22,7 +20,6 @@ import {
 	Group,
 	Loader,
 	Modal,
-	SegmentedControl,
 	Stack,
 	Text,
 } from "@mantine/core";
@@ -55,9 +52,7 @@ export interface RevertScopeConfirmModalProps {
 	onCancel: () => void;
 }
 
-type ScopePreview = NonNullable<
-	RevertScopePreviews["narratorScope"] | RevertScopePreviews["workspaceScope"]
->;
+type ScopePreview = NonNullable<RevertScopePreviews["narratorScope"]>;
 
 /** Missing, unknown and partial evidence must never look like an empty change set. */
 function scopeUnavailableKey(preview: ScopePreview | undefined): string | null {
@@ -130,7 +125,7 @@ function planUnavailableKey(
 		return "revertPlanExpired";
 	}
 	if (!plan.planId || !plan.planHash || plan.status !== "prepared") return "revertPlanNotPrepared";
-	if (plan.coverageComplete !== true) return "revertScopeIncompleteCoverage";
+	if (typeof plan.coverageComplete !== "boolean") return "revertScopeIncompleteCoverage";
 	if (
 		!plan.filesComplete ||
 		!Number.isSafeInteger(plan.expectedFileCount) ||
@@ -160,19 +155,6 @@ export function RevertScopeConfirmModal({
 	onCancel,
 }: RevertScopeConfirmModalProps) {
 	const { t } = useTranslation("narrator");
-	const [selection, setSelection] = useState<{
-		preview: RevertScopePreviews;
-		scope: RevertScope;
-	} | null>(null);
-
-	// Workspace consent belongs to this preview and this opening of the dialog.
-	// Ignore the server's recommendation: an unavailable narrator scope must never
-	// silently widen to workspace. The identity check also revokes stale consent
-	// during render, before the reset effect runs for a changed preview.
-	useEffect(() => {
-		setSelection((current) => (opened && !isLoading && current?.preview === data ? current : null));
-	}, [opened, data, isLoading]);
-	const scope = selection && selection.preview === data ? selection.scope : "narrator";
 	const plan = data?.revertPlan;
 	const snapshotPlan = plan?.recoveryMode === "snapshot";
 	const [snapshotConsent, setSnapshotConsent] = useState<{
@@ -211,21 +193,17 @@ export function RevertScopeConfirmModal({
 	}, [opened, plan]);
 
 	const narratorScope = data?.narratorScope;
-	const workspaceScope = data?.workspaceScope;
 	const conflicts = narratorScope?.conflicts ?? [];
-	const hasKnownScope = data?.scope === "narrator" || data?.scope === "workspace";
+	const hasKnownScope = data?.scope === "narrator";
 	const narratorUnavailable = scopeUnavailableKey(narratorScope);
-	const workspaceUnavailable = scopeUnavailableKey(workspaceScope);
 	const narratorUsable =
 		hasKnownScope &&
 		narratorUnavailable === null &&
 		Array.isArray(narratorScope?.conflicts) &&
 		conflicts.length === 0;
-	const workspaceUsable = hasKnownScope && workspaceUnavailable === null;
-	const hasScopeChoice = !!narratorScope || !!workspaceScope;
-	const selectedPreview = scope === "workspace" ? workspaceScope : narratorScope;
+	const selectedPreview = narratorScope;
 	// Legacy file lists remain viewable, but are not executable rollback plans.
-	const listedFiles = hasScopeChoice ? selectedPreview?.files : data?.affectedFiles;
+	const listedFiles = narratorScope?.files ?? data?.affectedFiles;
 	const activeFiles = Array.isArray(listedFiles) ? listedFiles : [];
 	const planUnavailable = data?.previewIssue
 		? planIssueKeys[data.previewIssue]
@@ -234,12 +212,7 @@ export function RevertScopeConfirmModal({
 				? "revertPlanReloadRequired"
 				: planUnavailableKey(plan, previewKey, activeFiles.length)
 			: null;
-	const revertBlocked =
-		!opened ||
-		isLoading ||
-		(!!previewKey && !plan) ||
-		!!planUnavailable ||
-		!(scope === "workspace" ? workspaceUsable : narratorUsable);
+	const revertBlocked = !opened || isLoading || !plan || !!planUnavailable || !narratorUsable;
 	useEffect(() => {
 		if (!opened || isLoading || submitting) {
 			if (lastReadyPlan.current) setRetiredPlanId(lastReadyPlan.current);
@@ -254,13 +227,15 @@ export function RevertScopeConfirmModal({
 			? data.scope === undefined
 				? "revertScopeLegacyUnverified"
 				: "revertScopeUnavailable"
-			: ((scope === "workspace" ? workspaceUnavailable : narratorUnavailable) ??
+			: (narratorUnavailable ??
 				(revertBlocked && conflicts.length === 0 ? "revertScopeUnavailable" : null));
 	const diagnostics = data?.diagnostics ?? [];
 	const fileConflict =
 		selectedPreview?.reason === "file_conflict" ||
 		diagnostics.some((diagnostic) =>
-			["merge_conflict", "state_conflict"].includes(diagnostic.reason ?? diagnostic.code),
+			["merge_conflict", "state_conflict", "content_changed"].includes(
+				diagnostic.reason ?? diagnostic.code,
+			),
 		);
 	const changedTargetDiagnostic = diagnostics.find((diagnostic) =>
 		["current_file_changed", "target_changed"].includes(diagnostic.reason ?? diagnostic.code),
@@ -279,11 +254,9 @@ export function RevertScopeConfirmModal({
 		!isLoading &&
 		!submitting &&
 		!snapshotPlan &&
-		!plan &&
 		fileConflict &&
 		!data?.previewIssue &&
 		!!onRequestSnapshotRestore;
-	const workspaceWarningText = formatRevertWarnings(t, workspaceScope?.warnings);
 	const blockers = data?.blockers ?? [];
 	const subagentWarningText = narratorScope?.subagentWarning
 		? formatRevertWarning(t, {
@@ -292,8 +265,6 @@ export function RevertScopeConfirmModal({
 				sampleFilePaths: narratorScope.subagentWarning.sampleFiles,
 			})
 		: null;
-
-	const showScopeChoice = !!data && hasScopeChoice && !previewKey;
 
 	return (
 		<Modal
@@ -323,6 +294,19 @@ export function RevertScopeConfirmModal({
 						{plan && !revertBlocked && (
 							<Alert color="yellow" variant="light">
 								<Text size="xs">{t("revertPlanExternalWritesWarning")}</Text>
+								{!plan.coverageComplete && (
+									<>
+										<Text size="xs">{t("revertPlanIncompleteWarning")}</Text>
+										{diagnostics.map((item) => (
+											<Text size="xs" key={JSON.stringify(item)}>
+												{item.filePath ?? item.toolCallId ?? item.operationId}:{" "}
+												{t(`revertDiagnosticReason.${item.reason ?? item.code}`, {
+													defaultValue: item.reason ?? item.code,
+												})}
+											</Text>
+										))}
+									</>
+								)}
 							</Alert>
 						)}
 
@@ -342,36 +326,6 @@ export function RevertScopeConfirmModal({
 									}}
 								/>
 							</Alert>
-						)}
-
-						{showScopeChoice && (
-							<SegmentedControl
-								size="xs"
-								fullWidth
-								value={scope}
-								disabled={submitting}
-								onChange={(value) => {
-									if (!data || isLoading || submitting) return;
-									if (
-										(value === "narrator" && narratorUsable) ||
-										(value === "workspace" && workspaceUsable)
-									) {
-										setSelection({ preview: data, scope: value });
-									}
-								}}
-								data={[
-									{
-										value: "narrator",
-										label: t("revertScopeNarrator"),
-										disabled: !narratorUsable,
-									},
-									{
-										value: "workspace",
-										label: t("revertScopeWorkspace"),
-										disabled: !workspaceUsable,
-									},
-								]}
-							/>
 						)}
 
 						{unavailableKey && (
@@ -394,17 +348,6 @@ export function RevertScopeConfirmModal({
 										{diagnostic.effectId && <Text size="xs">effect: {diagnostic.effectId}</Text>}
 									</Stack>
 								))}
-								{canRequestSnapshot && (
-									<Button
-										size="xs"
-										mt="xs"
-										variant="light"
-										color="yellow"
-										onClick={onRequestSnapshotRestore}
-									>
-										{t("revertSnapshotRequest")}
-									</Button>
-								)}
 								{(data?.previewErrorKey || data?.previewError) && (
 									<Text size="xs">
 										{data.previewErrorKey ? t(data.previewErrorKey) : data.previewError}
@@ -421,14 +364,12 @@ export function RevertScopeConfirmModal({
 											});
 											const who = blocker.toolName
 												? `${blocker.toolName}${blocker.toolCallId ? ` (${blocker.toolCallId.slice(0, 8)})` : ""}`
-												: blocker.leaseId
-													? blocker.leaseId.slice(0, 12)
-													: blocker.operationId
-														? blocker.operationId.slice(0, 12)
-														: null;
+												: blocker.operationId
+													? blocker.operationId.slice(0, 12)
+													: null;
 											return (
 												<Text
-													key={`${blocker.kind}-${blocker.toolCallId ?? blocker.operationId ?? blocker.leaseId ?? index}`}
+													key={`${blocker.kind}-${blocker.toolCallId ?? blocker.operationId ?? index}`}
 													size="xs"
 												>
 													• {kindLabel}
@@ -448,13 +389,13 @@ export function RevertScopeConfirmModal({
 							</Alert>
 						)}
 
-						{scope === "narrator" && workspaceUsable && (
-							<Text size="xs" c="dimmed">
-								{t("revertScopeWorkspaceExplicit")}
-							</Text>
+						{canRequestSnapshot && (
+							<Button size="xs" variant="light" color="yellow" onClick={onRequestSnapshotRestore}>
+								{t("revertSnapshotRequest")}
+							</Button>
 						)}
 
-						{scope === "narrator" && conflicts.length > 0 && (
+						{conflicts.length > 0 && (
 							<Alert color="red" variant="light" title={t("revertScopeConflictTitle")}>
 								<Text size="xs">
 									{t("revertScopeConflictDesc", { files: conflicts.slice(0, 5).join(", ") })}
@@ -462,16 +403,9 @@ export function RevertScopeConfirmModal({
 							</Alert>
 						)}
 
-						{scope === "narrator" && subagentWarningText && (
+						{subagentWarningText && (
 							<Alert color="yellow" variant="light" title={t("revertScopeSubagentTitle")}>
 								<Text size="xs">{subagentWarningText}</Text>
-							</Alert>
-						)}
-
-						{scope === "workspace" && (
-							<Alert color="red" variant="light" title={t("revertScopeWorkspaceWarnTitle")}>
-								<Text size="xs">{t("revertScopeWorkspaceWarning")}</Text>
-								{workspaceWarningText && <Text size="xs">{workspaceWarningText}</Text>}
 							</Alert>
 						)}
 
@@ -499,9 +433,11 @@ export function RevertScopeConfirmModal({
 													variant="light"
 													color={file.willBeDeleted ? "red" : "orange"}
 												>
-													{file.willBeDeleted
-														? t("fileMod_willBeDeleted")
-														: t("fileMod_willBeReverted")}
+													{file.unavailable
+														? t("revertFileUnavailable")
+														: file.willBeDeleted
+															? t("fileMod_willBeDeleted")
+															: t("fileMod_willBeReverted")}
 												</Badge>
 											)}
 										</Group>
@@ -510,7 +446,7 @@ export function RevertScopeConfirmModal({
 							</>
 						) : !revertBlocked ? (
 							<Text size="sm" c="dimmed">
-								{scope === "narrator" && narratorScope?.reason === "nothing_owned"
+								{narratorScope?.reason === "nothing_owned"
 									? t("revertScopeNothingOwned")
 									: t("rollbackConfirmNoFiles")}
 							</Text>
@@ -569,8 +505,6 @@ export function RevertScopeConfirmModal({
 											: {}),
 									},
 								});
-							} else {
-								onConfirm({ skipRevert: false, scope });
 							}
 						}}
 						loading={isLoading || submitting}
@@ -579,9 +513,11 @@ export function RevertScopeConfirmModal({
 							? t("revertScopeUnavailableTitle")
 							: snapshotPlan
 								? t("revertSnapshotConfirm")
-								: activeFiles.length > 0
-									? confirmWithRevertLabel
-									: confirmNoFilesLabel}
+								: plan && !plan.coverageComplete
+									? t("revertPartialConfirm")
+									: activeFiles.length > 0
+										? confirmWithRevertLabel
+										: confirmNoFilesLabel}
 					</Button>
 				</Group>
 			</Stack>
@@ -589,7 +525,7 @@ export function RevertScopeConfirmModal({
 	);
 }
 
-/** New history actions share the fixed-plan flow; edit/regenerate stays on its legacy preview. */
+/** History actions share the same fixed-plan flow as edit/regenerate. */
 export function RevertActionConfirmModal({
 	narratorId,
 	action,

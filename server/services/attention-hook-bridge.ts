@@ -19,7 +19,12 @@ import { type AttentionReason, type HookEvent, hookService } from "./hook-servic
 
 async function runAttentionHook(
 	event: Extract<HookEvent, "Attention" | "AttentionResolved">,
-	payload: { narratorId: string; reason: AttentionReason; detail?: string },
+	payload: {
+		narratorId: string;
+		reason: AttentionReason;
+		detail?: string;
+		backgroundWorkActive?: boolean;
+	},
 ): Promise<void> {
 	// Resolve narrator context (chapter / cwd) for the hook input. The project
 	// scope for hook matching comes from the chapter (narrators have no direct
@@ -49,6 +54,9 @@ async function runAttentionHook(
 			cwd: narrator.cwd ?? undefined,
 			attention_reason: payload.reason,
 			attention_detail: payload.detail,
+			// Hooks keep receiving the event even when notification channels
+			// suppress it (background work still running) — the receiver decides.
+			...(payload.backgroundWorkActive ? { background_work_active: true } : {}),
 		},
 		projectId,
 		// Matcher key: filter by reason (empty matcher matches all reasons).
@@ -61,6 +69,7 @@ eventBus.on("narrator:attention", (event) => {
 		narratorId: event.narratorId,
 		reason: event.reason,
 		detail: event.detail,
+		backgroundWorkActive: event.backgroundWorkActive,
 	}).catch((err) => {
 		logger.error("Attention hook bridge error", {
 			narratorId: event.narratorId,

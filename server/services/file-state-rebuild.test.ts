@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import iconv from "iconv-lite";
 import { db, sqlite } from "../db";
 import {
+	fileChangeEffects,
+	fileChangeOperations,
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
@@ -13,11 +15,15 @@ import {
 	narratorToolCalls,
 	projects,
 	remoteDevices,
+	users,
 } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-resolve";
 import { setRemoteBackendResolver } from "../lib/agent/execution/registry";
-import { executeTool, freezeToolExecutionTarget } from "../lib/agent/tool-executor";
+import {
+	executeTool as executeToolWithPermissions,
+	freezeToolExecutionTarget,
+} from "../lib/agent/tool-executor";
 import {
 	confirmTaskReflection,
 	createTaskReflectionDecision,
@@ -27,6 +33,7 @@ import {
 import type { AgentConfig, AgentToolUse } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
+import { getDefaultLocalFileChangeRuntime } from "./file-change-runtime";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 import {
 	applyToolCall,
@@ -47,13 +54,6 @@ import {
 import { reconstructToolExecutionTarget } from "./narrator-persistence";
 import { narratorService } from "./narrator-service";
 import { TOOL_CALL_RERUN_RESET_FIELDS } from "./narrator-session";
-import {
-	commitSnapshotRevert,
-	discardSnapshotRevert,
-	finalizeSnapshotRevert,
-	revertPatchForToolUse,
-	revertPatchForToolUses,
-} from "./snapshot-revert";
 import { readSpecFile, writeSpecFile } from "./spec-vfs-service";
 
 for (const statement of [
@@ -67,6 +67,38 @@ for (const statement of [
 	} catch (err) {
 		if (!String(err).includes("duplicate column name")) throw err;
 	}
+}
+
+// These fixtures exercise real target freezing and IO with a test authorization
+// adapter. The executor and queued writer still check the final synchronous ticket.
+const executeTool: typeof executeToolWithPermissions = (toolUse, config, options) =>
+	executeToolWithPermissions(
+		toolUse,
+		{
+			...config,
+			onToolExecutionFinalAuthorization:
+				config.onToolExecutionFinalAuthorization ??
+				(async (context) => {
+					expect(context.approvedPermission.behavior).toBe("allow");
+					expect(context.toolUse.toolUseId).toBe(toolUse.toolUseId);
+					return { assertStillCurrent: () => config.signal.throwIfAborted() };
+				}),
+		},
+		options,
+	);
+
+async function recordedBeforeBytes(narratorId: string) {
+	const effect = db
+		.select({ before: fileChangeEffects.beforeStateJson })
+		.from(fileChangeEffects)
+		.innerJoin(fileChangeOperations, eq(fileChangeOperations.id, fileChangeEffects.operationId))
+		.where(eq(fileChangeOperations.narratorId, narratorId))
+		.limit(1)
+		.get();
+	if (effect?.before.kind !== "regular") throw new Error("Missing measured before-file history");
+	const runtime = await getDefaultLocalFileChangeRuntime();
+	const namespace = await runtime.verifyNamespace();
+	return Buffer.from(await namespace.store.readBytes(effect.before.blob));
 }
 
 const createdNarrators: string[] = [];
@@ -1349,7 +1381,7 @@ describe("tool execution target persistence", () => {
 
 		expect(result.output).not.toContain("already frozen");
 		expect(result.output).not.toContain("Tool routing error");
-		expect(result.isError).toBeFalsy();
+		expect(result.isError, String(result.output)).toBeFalsy();
 		expect(drifted.readText("/remote/relocated/draft.md")).toBe("world");
 
 		// The audit columns describe the path that was really written, and the audit-only
@@ -1506,7 +1538,7 @@ describe("tool execution target persistence", () => {
 		);
 
 		expect(result.output).not.toContain("Tool routing error");
-		expect(result.isError).toBeFalsy();
+		expect(result.isError, String(result.output)).toBeFalsy();
 		expect(readFileSync(join(cwd, "draft.md"), "utf8")).toBe("world");
 
 		const stored = await db.query.narratorToolCalls.findFirst({
@@ -1606,7 +1638,7 @@ describe("tool execution target persistence", () => {
 
 		expect(result.output).not.toContain("already frozen");
 		expect(result.output).not.toContain("Execution target drift");
-		expect(result.isError).toBeFalsy();
+		expect(result.isError, String(result.output)).toBeFalsy();
 
 		const stored = await db.query.narratorToolCalls.findFirst({
 			where: and(
@@ -1825,7 +1857,7 @@ describe("legacy replay EOL parity with the real file tools", () => {
 					permissionHandler: async () => ({ behavior: "allow" }),
 				},
 			);
-			expect(result.isError).toBeFalsy();
+			expect(result.isError, String(result.output)).toBeFalsy();
 			const actual = readFileSync(filePath, "utf8");
 			expect(actual).toBe(scenario.expected);
 			expect(
@@ -2001,6 +2033,8 @@ describe("device-aware file state rebuild", () => {
 		const filePath = join(cwd, "failed.txt");
 		const original = "original before failed Edit\r\n";
 		writeFileSync(filePath, original);
+		// Exercise persisted legacy history explicitly; new tools record raw per-operation blobs.
+		await ensureFileSnapshot(narratorId, "local", filePath, async () => original);
 		const failedId = await addInitializingToolCall(narratorId);
 		const input = { file_path: filePath, old_string: "not present", new_string: "replacement" };
 		const failure = await executeTool(
@@ -2461,86 +2495,6 @@ describe("device-aware file state rebuild", () => {
 });
 
 describe("device-aware snapshot revert", () => {
-	for (const pathFlavor of ["posix", undefined] as const) {
-		test.skipIf(process.platform === "win32")(
-			`internal first-Write revert preserves a POSIX literal backslash baseline (flavor=${pathFlavor})`,
-			async () => {
-				const cwd = mkdtempSync(join(tmpdir(), "nf-posix-backslash-revert-"));
-				tempDirs.push(cwd);
-				const narratorId = await createNarrator(cwd);
-				const filePath = join(cwd, "a\\b.txt");
-				const original = "original POSIX filename content\r\n";
-				writeFileSync(filePath, original);
-				mkdirSync(join(cwd, "a"));
-				const differentPath = join(cwd, "a", "b.txt");
-				writeFileSync(differentPath, "different file must remain untouched");
-				// Model an old text-only row, with no pathFlavor/encoding/raw bytes.
-				await db.insert(narratorFileSnapshots).values({
-					id: generateId(),
-					narratorId,
-					deviceId: "local",
-					filePath,
-					originalContent: readFileSync(filePath, "utf8"),
-					createdAt: new Date().toISOString(),
-				});
-				const toolUseId = await addToolCall(
-					narratorId,
-					1,
-					{ file_path: filePath, content: "first Write\n" },
-					{ deviceId: "local", filePath, pathFlavor },
-				);
-				writeFileSync(filePath, "first Write\r\n");
-
-				// This calls the internal compatibility helper, not a user-route replay
-				// fallback. Text-only history remains legacy_unverified under M0.
-				const result = await revertPatchForToolUse(narratorId, toolUseId);
-				try {
-					expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
-					expect(existsSync(filePath)).toBe(true);
-					expect(readFileSync(filePath, "utf8")).toBe(original);
-					expect(readFileSync(differentPath, "utf8")).toBe("different file must remain untouched");
-				} finally {
-					finalizeSnapshotRevert(result);
-				}
-			},
-		);
-	}
-
-	test.skipIf(process.platform === "win32")(
-		"internal revert refuses conflicting legacy snapshot path flavors before writing",
-		async () => {
-			const cwd = mkdtempSync(join(tmpdir(), "nf-ambiguous-baseline-revert-"));
-			tempDirs.push(cwd);
-			const narratorId = await createNarrator(cwd);
-			const filePath = join(cwd, "a\\b.txt");
-			writeFileSync(filePath, "current must survive");
-			await ensureFileSnapshot(narratorId, "local", filePath, async () => "old baseline");
-			const toolUseId = await addToolCall(
-				narratorId,
-				1,
-				{ file_path: filePath, content: "current must survive" },
-				{ deviceId: "local", filePath, pathFlavor: "posix" },
-			);
-			await addToolCall(
-				narratorId,
-				2,
-				{ file_path: filePath, content: "unrelated Windows history" },
-				{
-					deviceId: "local",
-					filePath: "C:\\Other\\a\\b.txt",
-					pathFlavor: "windows",
-					lexicalPath: filePath,
-					canonicalPath: "C:\\Other\\a\\b.txt",
-				},
-			);
-			const result = await revertPatchForToolUse(narratorId, toolUseId);
-			expect(result.reverted).toBe(false);
-			expect(result.failures[0]?.code).toBe("MISSING_EXECUTION_PATH");
-			expect(result.failures[0]?.message).toContain("recorded path flavors disagree");
-			expect(readFileSync(filePath, "utf8")).toBe("current must survive");
-		},
-	);
-
 	test("skipRevert checkpoints preserve deleted file history for a later rollback", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-skip-revert-checkpoint-"));
 		tempDirs.push(cwd);
@@ -2585,9 +2539,14 @@ describe("device-aware snapshot revert", () => {
 		);
 		writeFileSync(filePath, "second");
 
-		const result = await revertPatchForToolUse(narratorId, secondToolUseId);
-		expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
-		expect(readFileSync(filePath, "utf8")).toBe("first");
+		const identity = { deviceId: "local", filePath };
+		const states = await rebuildDeviceFileStatesExcluding(
+			narratorId,
+			[identity],
+			new Set([secondToolUseId]),
+		);
+		expect(states.get(deviceFileKey(identity))?.content).toBe("first");
+		expect(readFileSync(filePath, "utf8")).toBe("second");
 	});
 
 	test("deleteMessageBlock skipRevert preserves the removed tool call as a checkpoint", async () => {
@@ -2633,373 +2592,14 @@ describe("device-aware snapshot revert", () => {
 			{ deviceId: "local", filePath },
 		);
 		writeFileSync(filePath, "second");
-		const result = await revertPatchForToolUse(narratorId, secondToolUseId);
-		expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
-		expect(readFileSync(filePath, "utf8")).toBe("first");
-	});
-
-	test("reverting a spec:// tool call is a no-op that never touches the filesystem", async () => {
-		// Regression: spec:// Write/Edit calls persist executionDeviceId="local" and
-		// resolvedFilePath="spec://…". Before the fix, revert treated them as real local
-		// files, writing junk to `<cwd>/spec:/…` (or failing) instead of ignoring them.
-		const cwd = mkdtempSync(join(tmpdir(), "nf-spec-revert-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const toolUseId = await addSpecToolCall(narratorId, 1, {
-			file_path: "spec://tasks.json",
-			content: '{"tasks":[]}',
-		});
-
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-
-		expect(result.reverted).toBe(false);
-		expect(result.fileCount).toBe(0);
-		expect(result.failures).toHaveLength(0);
-		// No literal spec:// path was ever materialized on disk.
-		expect(existsSync(join(cwd, "spec:"))).toBe(false);
-		expect(existsSync(join(cwd, "spec://tasks.json"))).toBe(false);
-	});
-
-	test("a mixed message still reverts the real local file and ignores the spec:// call", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-spec-mixed-revert-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const localPath = join(cwd, "real.txt");
-		writeFileSync(localPath, "current");
-		await db.insert(narratorFileSnapshots).values({
-			id: generateId(),
+		const identity = { deviceId: "local", filePath };
+		const states = await rebuildDeviceFileStatesExcluding(
 			narratorId,
-			deviceId: "local",
-			filePath: localPath,
-			originalContent: "original",
-			createdAt: new Date().toISOString(),
-		});
-		const localToolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: localPath, content: "current" },
-			{ deviceId: "local", filePath: localPath },
+			[identity],
+			new Set([secondToolUseId]),
 		);
-		const specToolUseId = await addSpecToolCall(narratorId, 2, {
-			file_path: "spec://tasks.json",
-			content: '{"tasks":[]}',
-		});
-
-		const result = await revertPatchForToolUses(narratorId, [localToolUseId, specToolUseId]);
-
-		expect(result.reverted).toBe(true);
-		expect(result.failures).toHaveLength(0);
-		expect(readFileSync(localPath, "utf8")).toBe("original");
-		expect(existsSync(join(cwd, "spec:"))).toBe(false);
-	});
-
-	test("refuses legacy remote history whose target path was never persisted", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-legacy-remote-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const localPath = join(cwd, "shared.txt");
-		writeFileSync(localPath, "local-untouched");
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: "shared.txt", content: "remote-new", device: "remote-a" },
-			{ deviceId: "remote-a", filePath: "/remote/work/shared.txt" },
-		);
-		await db
-			.update(narratorToolCalls)
-			.set({ executionDeviceId: null, executionCwd: null, resolvedFilePath: null })
-			.where(eq(narratorToolCalls.toolUseId, toolUseId));
-
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-
-		expect(result.reverted).toBe(false);
-		expect(result.failures[0]).toMatchObject({
-			deviceId: "remote-a",
-			filePath: "shared.txt",
-			code: "UNSAFE_LEGACY_REMOTE_TARGET",
-		});
-		expect(readFileSync(localPath, "utf8")).toBe("local-untouched");
-	});
-
-	test("rejects a project-scoped remote device for standalone narrator history", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-unauthorized-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const projectId = generateId();
-		const now = new Date().toISOString();
-		await db.insert(projects).values({
-			id: projectId,
-			name: "Other project",
-			createdAt: now,
-			updatedAt: now,
-		});
-		createdProjects.push(projectId);
-		const filePath = "/remote/work/forbidden.txt";
-		await db.insert(narratorFileSnapshots).values({
-			id: generateId(),
-			narratorId,
-			deviceId: "project-remote",
-			filePath,
-			originalContent: "original",
-			createdAt: now,
-		});
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: "forbidden.txt", content: "current" },
-			{ deviceId: "project-remote", filePath },
-		);
-		const memory = await createMemoryBackend(
-			"project-remote",
-			{ [filePath]: "current" },
-			undefined,
-			{ scope: "project", projectId },
-		);
-		setRemoteBackendResolver((deviceId) => (deviceId === "project-remote" ? memory.backend : null));
-
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-
-		expect(result.reverted).toBeFalse();
-		expect(result.failures).toHaveLength(1);
-		expect(result.failures[0]).toMatchObject({
-			deviceId: "project-remote",
-			filePath,
-			code: "REMOTE_DEVICE_UNAUTHORIZED",
-		});
-		expect(memory.readText(filePath)).toBe("current");
-	});
-
-	test("offline remote revert reports failure without touching the local same path", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-offline-"));
-		tempDirs.push(cwd);
-		const localPath = join(cwd, "shared.txt");
-		writeFileSync(localPath, "local-untouched");
-		const narratorId = await createNarrator(cwd);
-		await db.insert(narratorFileSnapshots).values({
-			id: generateId(),
-			narratorId,
-			deviceId: "offline-remote",
-			filePath: localPath,
-			originalContent: "remote-original",
-			createdAt: new Date().toISOString(),
-		});
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: localPath, content: "remote-new" },
-			{ deviceId: "offline-remote", filePath: localPath },
-		);
-		setRemoteBackendResolver(() => null);
-
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-
-		expect(result.reverted).toBe(false);
-		expect(result.failures).toHaveLength(1);
-		expect(result.failures[0]).toMatchObject({
-			deviceId: "offline-remote",
-			filePath: localPath,
-			code: "REMOTE_DEVICE_UNAVAILABLE",
-		});
-		expect(readFileSync(localPath, "utf8")).toBe("local-untouched");
-
-		const storedCall = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			columns: { messageId: true },
-		});
-		expect(storedCall).toBeDefined();
-		await db
-			.update(narratorMessages)
-			.set({ contentJson: [{ type: "tool_use", id: toolUseId }] })
-			.where(eq(narratorMessages.id, storedCall?.messageId ?? "missing"));
-		await expect(
-			narratorService.deleteMessageBlock(narratorId, storedCall?.messageId ?? "missing", 0),
-		).rejects.toMatchObject({ code: "SNAPSHOT_REVERT_FAILED", statusCode: 409 });
-		const preserved = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			columns: { id: true },
-		});
-		expect(preserved).toBeDefined();
-	});
-
-	test("reverts a lexical snapshot through its canonical target identity", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-canonical-remote-revert-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const lexicalPath = "/remote/work/link/file.txt";
-		const canonicalPath = "/remote/work/real/file.txt";
-		await db.insert(narratorFileSnapshots).values({
-			id: generateId(),
-			narratorId,
-			deviceId: "remote-a",
-			filePath: lexicalPath,
-			originalContent: "remote-original",
-			createdAt: new Date().toISOString(),
-		});
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: lexicalPath, content: "remote-new" },
-			{
-				deviceId: "remote-a",
-				filePath: canonicalPath,
-				pathFlavor: "posix",
-				lexicalPath,
-				canonicalPath,
-				runtimeGeneration: 4,
-			},
-		);
-		const memory = await createMemoryBackend("remote-a", { [canonicalPath]: "remote-new" });
-		setRemoteBackendResolver((deviceId) => (deviceId === "remote-a" ? memory.backend : null));
-
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-
-		expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
-		expect(memory.readText(canonicalPath)).toBe("remote-original");
-		expect(memory.has(lexicalPath)).toBe(false);
-	});
-
-	test("restores a remote file through its recorded backend", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-remote-revert-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const filePath = "/remote/work/file.txt";
-		await db.insert(narratorFileSnapshots).values({
-			id: generateId(),
-			narratorId,
-			deviceId: "remote-a",
-			filePath,
-			originalContent: "remote-original",
-			createdAt: new Date().toISOString(),
-		});
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: "file.txt", content: "remote-new" },
-			{ deviceId: "remote-a", filePath },
-		);
-		const memory = await createMemoryBackend("remote-a", { [filePath]: "remote-new" });
-		setRemoteBackendResolver((deviceId) => (deviceId === "remote-a" ? memory.backend : null));
-
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-
-		expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
-		expect(memory.readText(filePath)).toBe("remote-original");
-	});
-
-	test("restores pre-rollback bytes when the history transaction fails", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-history-compensate-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const filePath = "/remote/work/file.txt";
-		await db.insert(narratorFileSnapshots).values({
-			id: generateId(),
-			narratorId,
-			deviceId: "remote-a",
-			filePath,
-			originalContent: "remote-original",
-			createdAt: new Date().toISOString(),
-		});
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: "file.txt", content: "remote-current" },
-			{ deviceId: "remote-a", filePath },
-		);
-		const memory = await createMemoryBackend("remote-a", { [filePath]: "remote-current" });
-		setRemoteBackendResolver((deviceId) => (deviceId === "remote-a" ? memory.backend : null));
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-		expect(memory.readText(filePath)).toBe("remote-original");
-
-		await expect(
-			commitSnapshotRevert(result, () => {
-				throw new Error("injected history transaction failure");
-			}),
-		).rejects.toThrow("injected history transaction failure");
-		expect(memory.readText(filePath)).toBe("remote-current");
-	});
-
-	test("removes a newly created remote file without using the shell", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-remote-delete-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const filePath = "/remote/work/new.txt";
-		await db.insert(narratorFileSnapshots).values({
-			id: generateId(),
-			narratorId,
-			deviceId: "remote-a",
-			filePath,
-			originalContent: null,
-			createdAt: new Date().toISOString(),
-		});
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: "new.txt", content: "created" },
-			{ deviceId: "remote-a", filePath },
-		);
-		const memory = await createMemoryBackend("remote-a", { [filePath]: "created" });
-		setRemoteBackendResolver((deviceId) => (deviceId === "remote-a" ? memory.backend : null));
-
-		const result = await revertPatchForToolUse(narratorId, toolUseId);
-
-		expect(result.failures).toEqual([]);
-		expect(memory.has(filePath)).toBe(false);
-		expect(memory.removeCalls).toEqual([filePath]);
-	});
-
-	test("preflights every device before changing any file", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-preflight-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const firstPath = "/remote-a/work/file.txt";
-		const secondPath = "/remote-b/work/file.txt";
-		await db.insert(narratorFileSnapshots).values([
-			{
-				id: generateId(),
-				narratorId,
-				deviceId: "remote-a",
-				filePath: firstPath,
-				originalContent: "a-original",
-				createdAt: new Date().toISOString(),
-			},
-			{
-				id: generateId(),
-				narratorId,
-				deviceId: "remote-b",
-				filePath: secondPath,
-				originalContent: "b-original",
-				createdAt: new Date().toISOString(),
-			},
-		]);
-		const firstToolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: "file.txt", content: "a-current" },
-			{ deviceId: "remote-a", filePath: firstPath },
-		);
-		const secondToolUseId = await addToolCall(
-			narratorId,
-			2,
-			{ file_path: "file.txt", content: "b-current" },
-			{ deviceId: "remote-b", filePath: secondPath },
-		);
-		const memory = await createMemoryBackend("remote-a", { [firstPath]: "a-current" });
-		setRemoteBackendResolver((deviceId) => (deviceId === "remote-a" ? memory.backend : null));
-
-		const result = await revertPatchForToolUses(narratorId, [firstToolUseId, secondToolUseId]);
-
-		expect(result.reverted).toBe(false);
-		expect(result.failures[0]).toMatchObject({
-			deviceId: "remote-b",
-			code: "REMOTE_DEVICE_UNAVAILABLE",
-		});
-		expect(memory.readText(firstPath)).toBe("a-current");
+		expect(states.get(deviceFileKey(identity))?.content).toBe("first");
+		expect(readFileSync(filePath, "utf8")).toBe("second");
 	});
 
 	test("skipRevert deletes subsequent messages without reverting the file", async () => {
@@ -3093,9 +2693,22 @@ describe("device-aware snapshot revert", () => {
 		// The original replay fallback would overwrite a later external save even
 		// though this narrator has no operation-level evidence for that save.
 		writeFileSync(localPath, "current plus a later external edit");
-		await expect(narratorService.deleteMessagesAfter(narratorId, boundaryId)).rejects.toThrow(
-			"REVERT_UNAVAILABLE",
-		);
+		const userId = generateId();
+		db.insert(users)
+			.values({
+				id: userId,
+				username: userId,
+				role: "user",
+				passwordHash: "test",
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		db.update(narrators).set({ ownerUserId: userId }).where(eq(narrators.id, narratorId)).run();
+		await expect(
+			narratorService.deleteMessagesAfter(narratorId, boundaryId, {
+				principal: { userId, isAdmin: false },
+			}),
+		).rejects.toMatchObject({ code: "SNAPSHOT_REVERT_FAILED" });
 
 		expect(readFileSync(localPath, "utf8")).toBe("current plus a later external edit");
 		const refs = await db.query.narratorMessageRefs.findMany({
@@ -3107,62 +2720,6 @@ describe("device-aware snapshot revert", () => {
 			columns: { toolUseId: true },
 		});
 		expect(retainedCalls).toHaveLength(1);
-	});
-
-	test("compensates earlier files when a later remote write fails", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-device-compensate-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const firstPath = "/remote/work/a.txt";
-		const secondPath = "/remote/work/b.txt";
-		await db.insert(narratorFileSnapshots).values([
-			{
-				id: generateId(),
-				narratorId,
-				deviceId: "remote-a",
-				filePath: firstPath,
-				originalContent: "a-original",
-				createdAt: new Date().toISOString(),
-			},
-			{
-				id: generateId(),
-				narratorId,
-				deviceId: "remote-a",
-				filePath: secondPath,
-				originalContent: "b-original",
-				createdAt: new Date().toISOString(),
-			},
-		]);
-		const firstToolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: "a.txt", content: "a-current" },
-			{ deviceId: "remote-a", filePath: firstPath },
-		);
-		const secondToolUseId = await addToolCall(
-			narratorId,
-			2,
-			{ file_path: "b.txt", content: "b-current" },
-			{ deviceId: "remote-a", filePath: secondPath },
-		);
-		const memory = await createMemoryBackend(
-			"remote-a",
-			{ [firstPath]: "a-current", [secondPath]: "b-current" },
-			secondPath,
-		);
-		setRemoteBackendResolver((deviceId) => (deviceId === "remote-a" ? memory.backend : null));
-
-		const result = await revertPatchForToolUses(narratorId, [firstToolUseId, secondToolUseId]);
-
-		expect(result.reverted).toBe(false);
-		expect(result.failures[0]).toMatchObject({
-			deviceId: "remote-a",
-			filePath: secondPath,
-			code: "WRITE_FAILED",
-		});
-		expect(result.failures.some((item) => item.code === "COMPENSATION_FAILED")).toBe(false);
-		expect(memory.readText(firstPath)).toBe("a-current");
-		expect(memory.readText(secondPath)).toBe("b-current");
 	});
 });
 
@@ -3218,40 +2775,6 @@ describe("replay divergence is never silently absorbed", () => {
 		});
 	});
 
-	test("a diverged replay reports a failure rather than writing a hybrid file", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-replay-diverge-revert-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const filePath = join(cwd, "a.txt");
-		writeFileSync(filePath, "second\n");
-
-		await ensureFileSnapshot(narratorId, "local", filePath, async () => "original\n");
-		const firstToolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: filePath, old_string: "original", new_string: "first" },
-			{ deviceId: "local", filePath },
-			"Edit",
-		);
-		// The second Edit consumes the text produced by the first one.
-		await addToolCall(
-			narratorId,
-			2,
-			{ file_path: filePath, old_string: "first", new_string: "second" },
-			{ deviceId: "local", filePath },
-			"Edit",
-		);
-
-		// Removing the *earlier* call strands the later one: replaying it against the
-		// untouched baseline can no longer find "first". Previously this silently kept
-		// the baseline and wrote "original", losing the second edit; it must fail and
-		// leave the file alone instead.
-		const result = await revertPatchForToolUses(narratorId, [firstToolUseId]);
-		expect(result.reverted).toBe(false);
-		expect(result.failures[0]).toMatchObject({ code: "REPLAY_DIVERGED", filePath });
-		expect(readFileSync(filePath, "utf8")).toBe("second\n");
-	});
-
 	test("an Edit with an empty old_string still overwrites the whole file", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-replay-create-mode-"));
 		tempDirs.push(cwd);
@@ -3301,48 +2824,7 @@ describe("replay divergence is never silently absorbed", () => {
  * charset of a legacy-encoded file.
  */
 describe("snapshot encoding round trip", () => {
-	test.each([
-		true,
-		false,
-	])("internal revert honors the recorded GBK charset (legacyEncoding=%s)", async (legacyEncoding) => {
-		settings.agent.legacyEncoding = legacyEncoding;
-		try {
-			const cwd = mkdtempSync(join(tmpdir(), "nf-encoding-revert-"));
-			tempDirs.push(cwd);
-			const narratorId = await createNarrator(cwd);
-			const filePath = join(cwd, "gbk.txt");
-			const original = "你好世界\n这是GBK编码的文件\n";
-			const originalBytes = iconv.encode(original, "gbk");
-			writeFileSync(filePath, originalBytes);
-
-			await ensureFileSnapshot(narratorId, "local", filePath, async () => ({
-				content: original,
-				encoding: "gbk",
-				isBinary: false,
-			}));
-			const toolUseId = await addToolCall(
-				narratorId,
-				1,
-				{ file_path: filePath, content: "overwritten" },
-				{ deviceId: "local", filePath },
-			);
-			writeFileSync(filePath, "overwritten");
-
-			const result = await revertPatchForToolUses(narratorId, [toolUseId]);
-			finalizeSnapshotRevert(result);
-			expect(result.failures).toEqual([]);
-
-			// This well-formed GBK fixture round-trips; legacy text without raw bytes
-			// still cannot prove exact recovery for arbitrary historical content.
-			const restored = readFileSync(filePath);
-			expect(Buffer.compare(restored, originalBytes)).toBe(0);
-			expect(iconv.decode(restored, "gbk")).toBe(original);
-		} finally {
-			settings.agent.legacyEncoding = false;
-		}
-	});
-
-	test("Write records the detected charset on the first-touch snapshot", async () => {
+	test("Write records exact GBK bytes in the independent operation history", async () => {
 		settings.agent.legacyEncoding = true;
 		try {
 			const cwd = mkdtempSync(join(tmpdir(), "nf-encoding-capture-"));
@@ -3367,25 +2849,20 @@ describe("snapshot encoding round trip", () => {
 			};
 			await addInitializingToolCall(narratorId, toolUse.toolUseId);
 			const result = await executeTool(toolUse, config);
-			expect(result.isError).toBeFalsy();
+			expect(result.isError, String(result.output)).toBeFalsy();
 
-			const snap = await db.query.narratorFileSnapshots.findFirst({
-				where: and(
-					eq(narratorFileSnapshots.narratorId, narratorId),
-					eq(narratorFileSnapshots.filePath, filePath),
+			expect(
+				Buffer.compare(
+					await recordedBeforeBytes(narratorId),
+					iconv.encode("你好世界，这是一个中文文件。\n", "gbk"),
 				),
-				columns: { originalEncoding: true, isBinary: true },
-			});
-			// chardet may report any member of the GB family (gbk / gb18030); what
-			// matters is that a non-UTF-8 charset was persisted for the round trip.
-			expect(snap?.originalEncoding).toMatch(/^gb/);
-			expect(snap?.isBinary).toBe(false);
+			).toBe(0);
 		} finally {
 			settings.agent.legacyEncoding = false;
 		}
 	});
 
-	test("Write flags a binary first-touch snapshot", async () => {
+	test("Write preserves binary before bytes without a text round trip", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-encoding-binary-"));
 		tempDirs.push(cwd);
 		const narratorId = await createNarrator(cwd);
@@ -3408,70 +2885,10 @@ describe("snapshot encoding round trip", () => {
 		};
 		await addInitializingToolCall(narratorId, toolUse.toolUseId);
 		const result = await executeTool(toolUse, config);
-		expect(result.isError).toBeFalsy();
+		expect(result.isError, String(result.output)).toBeFalsy();
 
-		const snap = await db.query.narratorFileSnapshots.findFirst({
-			where: and(
-				eq(narratorFileSnapshots.narratorId, narratorId),
-				eq(narratorFileSnapshots.filePath, filePath),
-			),
-			columns: { isBinary: true },
-		});
-		expect(snap?.isBinary).toBe(true);
-	});
-});
-
-/**
- * A revert that already touched the filesystem owns a compensation plan. Dropping
- * the result without resolving it would leave files rolled back while the history
- * they belong to is still present.
- */
-describe("compensation plan lifecycle", () => {
-	test("discarding a revert restores the pre-revert bytes", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-compensate-discard-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const filePath = join(cwd, "a.txt");
-		writeFileSync(filePath, "current\n");
-
-		await ensureFileSnapshot(narratorId, "local", filePath, async () => "original\n");
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: filePath, content: "current\n" },
-			{ deviceId: "local", filePath },
+		expect(await recordedBeforeBytes(narratorId)).toEqual(
+			Buffer.from([0x00, 0x01, 0x02, 0xff, 0x00]),
 		);
-
-		const result = await revertPatchForToolUses(narratorId, [toolUseId]);
-		expect(result.failures).toEqual([]);
-		expect(readFileSync(filePath, "utf8")).toBe("original\n");
-
-		// Abandoning the revert must put the file back the way it was.
-		const failures = await discardSnapshotRevert(result);
-		expect(failures).toEqual([]);
-		expect(readFileSync(filePath, "utf8")).toBe("current\n");
-	});
-
-	test("finalizing a revert keeps the reverted state and releases the plan", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "nf-compensate-finalize-"));
-		tempDirs.push(cwd);
-		const narratorId = await createNarrator(cwd);
-		const filePath = join(cwd, "a.txt");
-		writeFileSync(filePath, "current\n");
-
-		await ensureFileSnapshot(narratorId, "local", filePath, async () => "original\n");
-		const toolUseId = await addToolCall(
-			narratorId,
-			1,
-			{ file_path: filePath, content: "current\n" },
-			{ deviceId: "local", filePath },
-		);
-
-		const result = await revertPatchForToolUses(narratorId, [toolUseId]);
-		finalizeSnapshotRevert(result);
-
-		// The plan is gone, so a later discard is a no-op and the file stays reverted.
-		expect(await discardSnapshotRevert(result)).toEqual([]);
-		expect(readFileSync(filePath, "utf8")).toBe("original\n");
 	});
 });

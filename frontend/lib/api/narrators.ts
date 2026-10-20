@@ -6,7 +6,11 @@ import type {
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { ComposerDocument } from "@shared/composer-document";
-import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
+import type {
+	FileChangeEvidenceUncertaintyWarning,
+	FileChangeRevertAction,
+	FileChangeRevertApplyResponse,
+} from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
 import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import type { HumanAttentionPage } from "@shared/human-attention";
@@ -345,7 +349,7 @@ export type RevertWarning =
 			sampleFilePaths: string[];
 	  };
 
-export type RevertAction = "rollback_to_block" | "delete_tool_block" | "revert_files";
+export type RevertAction = FileChangeRevertAction;
 
 export interface RevertActionTarget {
 	messageId: string;
@@ -388,21 +392,11 @@ export interface RevertHistorySummary {
  * Advisory only: listing a blocker never authorizes a wider plan.
  */
 export interface RevertBlocker {
-	kind:
-		| "running_tool"
-		| "uncoordinated_activity"
-		| "write_lease"
-		| "pending_mutation"
-		| "recovery_hold"
-		| "narrator_busy"
-		| "planner_busy"
-		| "scope_not_active"
-		| "pending_operation";
+	kind: "running_tool" | "narrator_busy" | "planner_busy";
 	toolCallId?: string;
 	toolName?: string;
 	operationId?: string;
 	messageId?: string;
-	leaseId?: string;
 	detail?: string;
 }
 
@@ -439,7 +433,7 @@ export interface RevertPlanFile {
 		canonicalPath: string;
 	};
 	expectedStateJson: { kind: "absent" | "regular" | "symlink" | "unknown" };
-	desiredStateJson: { kind: "absent" | "regular" | "symlink" };
+	desiredStateJson: { kind: "absent" | "regular" | "symlink" | "unknown"; reason?: string };
 }
 
 export interface RevertPlanFilesPage {
@@ -449,13 +443,7 @@ export interface RevertPlanFilesPage {
 	executable: false;
 }
 
-export interface RevertPlanApplyResult {
-	planId: string;
-	status: "committed" | "compensated" | "recovery_required";
-	journalStatus: string;
-	settling: boolean;
-	reason: string | null;
-}
+export type RevertPlanApplyResult = FileChangeRevertApplyResponse;
 
 export type RevertPlanPreviewIssue =
 	| "expired"
@@ -479,6 +467,7 @@ export interface RevertPreviewFile {
 	deviceId: string;
 	filePath: string;
 	willBeDeleted: boolean;
+	unavailable?: boolean;
 }
 
 export interface RevertPreviewFileWithContent extends RevertPreviewFile {
@@ -504,12 +493,8 @@ export interface BlockDeletePreview {
 }
 
 /**
- * Both rollback scopes for one window, so the dialog can compare them.
- *
- * Scope metadata remains optional for older preview responses. Missing metadata
- * is unverified, not permission to replay `affectedFiles` or proof of no changes.
- * `scope` is only a recommendation; workspace rollback always needs an explicit
- * user choice and an available, complete preview.
+ * A fixed narrator plan, with optional metadata for read-only legacy previews.
+ * Missing plan metadata never authorizes replay or implies no file changes.
  */
 export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreviewFile> {
 	/** Present only for the new action-preview + paged-files flow. */
@@ -1864,6 +1849,7 @@ export const narratorsApi = {
 		opts?: {
 			skipRevert?: boolean;
 			scope?: RevertScope;
+			revertPlan?: RevertPlanConfirmation;
 			keepImageIds?: string[];
 			newImages?: File[];
 			keepTextFilePaths?: string[];
@@ -1886,6 +1872,7 @@ export const narratorsApi = {
 				formData.append("skipRevert", opts.skipRevert ? "true" : "false");
 			}
 			if (opts.scope) formData.append("scope", opts.scope);
+			if (opts.revertPlan) formData.append("revertPlan", JSON.stringify(opts.revertPlan));
 			if (opts.keepImageIds) {
 				formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
 			}
@@ -1907,6 +1894,7 @@ export const narratorsApi = {
 				content,
 				...(opts?.skipRevert !== undefined ? { skipRevert: opts.skipRevert } : {}),
 				...(opts?.scope ? { scope: opts.scope } : {}),
+				...(opts?.revertPlan ? { revertPlan: opts.revertPlan } : {}),
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
 				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
 				fileReferences: opts?.fileReferences,
@@ -1931,10 +1919,15 @@ export const narratorsApi = {
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
-		const result = (await res.json()) as { ok?: unknown; warnings?: RevertWarning[] };
+		const result = (await res.json()) as {
+			ok?: unknown;
+			warnings?: RevertWarning[];
+			revertResult?: FileChangeRevertApplyResponse;
+		};
 		return {
 			ok: result.ok === true,
 			...(result.warnings?.length ? { warnings: result.warnings } : {}),
+			...(result.revertResult ? { revertResult: result.revertResult } : {}),
 		};
 	},
 	editAssistantMessage: (narratorId: string, messageId: string, content: string) =>
@@ -2062,13 +2055,15 @@ export const narratorsApi = {
 		blocks: Array<{ messageId: string; blockIndex: number }>,
 		opts?: { skipRevert?: boolean },
 	) =>
-		request<{ ok: boolean; deleted: number; failed: number }>(
-			`/narrators/${narratorId}/messages/batch-blocks`,
-			{
-				method: "DELETE",
-				body: JSON.stringify({ blocks, skipRevert: opts?.skipRevert === true }),
-			},
-		),
+		request<{
+			ok: boolean;
+			deleted: number;
+			failed: number;
+			revertResult?: FileChangeRevertApplyResponse;
+		}>(`/narrators/${narratorId}/messages/batch-blocks`, {
+			method: "DELETE",
+			body: JSON.stringify({ blocks, skipRevert: opts?.skipRevert === true }),
+		}),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "PATCH",
@@ -2130,22 +2125,6 @@ export const narratorsApi = {
 		>(
 			`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}&blockIndex=${blockIndex}`,
 		),
-	/**
-	 * What editing this user message and regenerating would roll back.
-	 *
-	 * Same endpoint as the rollback preview, with no `blockIndex`: editing keeps the
-	 * whole user turn and truncates what follows, which is exactly the window the
-	 * server computes when no index is given. Sharing it is what keeps the dialog's
-	 * promise identical to the rollback that runs.
-	 */
-	getEditRegeneratePreview: (narratorId: string, messageId: string) =>
-		request<
-			RevertScopePreviews<RevertPreviewFile> & {
-				toolCallCount: number;
-				deletedBlockCount: number;
-				deletedMessageCount: number;
-			}
-		>(`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}`),
 	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>
 		request<{
 			deviceId: string;
