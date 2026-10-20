@@ -311,6 +311,8 @@ export type NarratorServerMessage =
 			waitKind?: "credentials" | "quota";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 			quotaProvider?: "kimi" | "opencode";
+			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
+			quotaBucket?: string;
 			/** Epoch ms the blocked window resets at. `quota` waits only. */
 			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
@@ -1086,6 +1088,7 @@ export type NarratorServerMessage =
 			nugModelId?: string;
 			waitKind?: "credentials" | "quota";
 			quotaProvider?: "kimi" | "opencode";
+			quotaBucket?: string;
 			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
