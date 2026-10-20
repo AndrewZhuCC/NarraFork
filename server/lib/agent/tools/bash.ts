@@ -1,5 +1,4 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
-import { registerLocalBashActivity } from "@server/services/file-change-runtime";
 import { beginBashCaptureWindow } from "@server/services/narrator-tree-snapshot-hooks";
 import { z } from "zod/v4";
 import { AppError } from "../../errors";
@@ -100,26 +99,10 @@ export async function detachBashProcess(
 	return entry.detach();
 }
 
-let preexistingBashRegistry = true;
-const runningBashProcesses = hotSafe("narrafork:runningBashProcesses", () => {
-	preexistingBashRegistry = false;
-	return new Map<string, RunningBashEntry>();
-});
-// A hot upgrade cannot prove that older loops discarded their old tool closures,
-// even when their process registry is momentarily empty. This one-time data flag
-// is false on a clean boot and survives later hot reloads without storing old code.
-const bashActivityMigration = hotSafe("narrafork:bashActivityMigration:v1", () =>
-	Object.freeze({ requiresColdStart: preexistingBashRegistry }),
+const runningBashProcesses = hotSafe(
+	"narrafork:runningBashProcesses",
+	() => new Map<string, RunningBashEntry>(),
 );
-
-export function assertBashActivityProtectionReady(): void {
-	if (bashActivityMigration.requiresColdStart)
-		throw new AppError(
-			"File rollback protection was enabled by a hot upgrade. Finish current work and restart the service before reverting files.",
-			409,
-			"REVERT_RUNTIME_RELOAD_REQUIRED",
-		);
-}
 
 /**
  * Kill all running bash processes spawned by the Bash tool.
@@ -201,33 +184,29 @@ async function prepareBashExecution(
 	ctx: ToolContext,
 	env?: Record<string, string> | null,
 ): Promise<BashExecution> {
-	const activity = await registerLocalBashActivity({
-		backend,
-		cwd,
-		target: ctx.executionTarget,
-		signal: ctx.signal,
-	});
+	const target = ctx.executionTarget;
+	if (
+		target &&
+		(target.backendKind !== backend.kind ||
+			target.deviceId !== backend.deviceId ||
+			target.pathFlavor !== backend.pathFlavor ||
+			target.runtimeGeneration !== backend.runtimeGeneration ||
+			!backend.paths.equals(target.cwd, cwd))
+	)
+		throw new Error("Bash execution target does not match its frozen backend/cwd");
+	ctx.signal.throwIfAborted();
 	let started = false;
 	let ended = false;
 	let bashWindow: { end(): void } | undefined;
-	const end = (outcome: "finished" | "unknown") => {
+	const end = () => {
 		if (ended) return;
 		ended = true;
-		bashWindow?.end();
-		bashWindow = undefined;
-		if (!activity) return;
 		try {
-			activity.end(outcome);
+			bashWindow?.end();
 		} catch (error) {
-			// The coordinator retains its recovery hold on persistence failure.
-			// Never retry an uncertain outcome as "finished" or let a detached
-			// callback's rejection discard the only lifecycle observer.
-			logger.warn("Bash workspace activity settlement requires recovery", {
-				scopeId: activity.scope.id,
-				outcome,
-				error: String(error),
-			});
+			logger.warn("Bash snapshot observation failed", { error: String(error) });
 		}
+		bashWindow = undefined;
 	};
 	return {
 		async start(signal) {
@@ -236,28 +215,33 @@ async function prepareBashExecution(
 			let handle: ExecHandle;
 			try {
 				signal.throwIfAborted();
-				if (backend.kind === "local")
-					bashWindow = beginBashCaptureWindow(cwd, ctx.currentToolUseId ?? "__anonymous__");
+				if (backend.kind === "local") {
+					try {
+						bashWindow = beginBashCaptureWindow(cwd, ctx.currentToolUseId ?? "__anonymous__");
+					} catch (error) {
+						logger.warn("Bash snapshot observation unavailable", { error: String(error) });
+					}
+				}
 				handle = await backend.execCommand({
 					command,
-					cwd: activity?.cwd ?? cwd,
+					cwd,
 					signal,
 					env: env ?? undefined,
 				});
 			} catch (error) {
 				// LocalBackend rejects dispatch only before spawning. Asynchronous
 				// spawn/process errors always come with a handle and its real barrier.
-				end("finished");
+				end();
 				throw error;
 			}
 			void (handle.whenSettled ?? handle.exited).then(
-				() => end("finished"),
-				() => end("unknown"),
+				() => end(),
+				() => end(),
 			);
 			return handle;
 		},
 		cancelUndispatched() {
-			if (!started) end("finished");
+			if (!started) end();
 		},
 	};
 }
@@ -913,8 +897,7 @@ export const bashTool: ToolDefinition = {
 				};
 			};
 
-			// Race only the HTTP/tool result, not the process collector. Bash never
-			// holds a workspace write lock; activity protection lasts until settlement.
+			// Detaching the HTTP/tool result leaves the process collector running until settlement.
 			const lifecycle = runForeground()
 				// Release after terminal output/status publication, just like Bash
 				// started in background mode, not immediately upon process exit.

@@ -203,11 +203,43 @@
 		},
 		{
 			"idx": 25,
-			"tag": "0025_merge_selfuse_093",
-			"id": "0df527be-c9be-4537-ae5f-3533e4a5148b",
+			"tag": "0025_unified-runtime-registration",
+			"id": "c7aa010f-c918-4c1f-bd1f-9fd0548f3fe8",
 			"prevId": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
 			"version": "7",
-			"snapshotDigest": "1218e99b89bdd53587747166a392bae6f31a58540fcf833b10fbfc0fae440785"
+			"snapshotDigest": "609d364919742b1c67eee672481fc63b9a4c3cbd90b93268743b396ba5cefb3a"
+		},
+		{
+			"idx": 26,
+			"tag": "0026_draft_previous",
+			"id": "db929d4c-7564-4214-8c8a-56f3465636eb",
+			"prevId": "c7aa010f-c918-4c1f-bd1f-9fd0548f3fe8",
+			"version": "7",
+			"snapshotDigest": "cbb2cc08782852abec1ec2110741b5c24c82c66053fba2fed22d53f03e405148"
+		},
+		{
+			"idx": 27,
+			"tag": "0027_editor_operation_recovery",
+			"id": "8b50bffe-308c-45db-9e1c-64c73f06c646",
+			"prevId": "db929d4c-7564-4214-8c8a-56f3465636eb",
+			"version": "7",
+			"snapshotDigest": "279ef67736f7b0f75fdc6d6b68f68424a50bcab52828617b85c58aa35900f1c7"
+		},
+		{
+			"idx": 28,
+			"tag": "0028_file_write_redesign",
+			"id": "99ad7e81-08d6-415e-85c1-b0a350926f04",
+			"prevId": "8b50bffe-308c-45db-9e1c-64c73f06c646",
+			"version": "7",
+			"snapshotDigest": "ec7d2682b1a4c006cfeb6c8997022f6a15972e0629ef5bdfe4b646b0d802ae90"
+		},
+		{
+			"idx": 29,
+			"tag": "0029_merge_selfuse_095",
+			"id": "da7625a5-5fd6-4a3e-a829-49db44c216cc",
+			"prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
+			"version": "7",
+			"snapshotDigest": "f3ded58d2bb637f2da283f3e30391457f5977645940883bbe54d95dd3354f40e"
 		}
 	]
 }

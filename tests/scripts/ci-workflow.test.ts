@@ -48,7 +48,7 @@ type Job = {
 	env?: Record<string, string>;
 };
 type Workflow = {
-	on: Record<string, { branches?: string[] } | null>;
+	on: Record<string, { branches?: string[]; paths?: string[] } | null>;
 	permissions: Record<string, string>;
 	concurrency: { group: string; "cancel-in-progress": string };
 	defaults: { run: { shell: string } };
@@ -191,6 +191,10 @@ describe("generic CI workflow", () => {
 		const workflow = Bun.YAML.parse(
 			readFileSync(join(repository, ".github/workflows/file-revert-cross-platform.yml"), "utf8"),
 		) as Workflow;
+		for (const event of ["push", "pull_request"]) {
+			expect(workflow.on[event]?.paths).toContain("server/services/file-write-*.ts");
+			expect(workflow.on[event]?.paths).not.toContain("server/services/workspace-write-*.ts");
+		}
 		const fileRevert = workflow.jobs["file-revert"];
 		const steps = fileRevert.steps;
 		const volumes = steps.find((step) => step.name === "Verify Windows scratch volumes");
@@ -230,20 +234,59 @@ describe("generic CI workflow", () => {
 			"./server/services/file-change-platform-capability.test.ts",
 			"./server/services/file-change-local-restore.test.ts",
 			"./server/services/file-change-runtime.test.ts",
-			"./server/services/file-change-namespace-cleanup.test.ts",
+			"./server/services/file-change-runtime-default.test.ts",
+			"./server/services/file-write-queue.test.ts",
 			"./server/services/revert-transaction-service.test.ts",
 			"./server/services/revert-transaction-interleaving.test.ts",
 			"./server/services/revert-transaction-real-tools.test.ts",
+			"./server/services/revert-history-commit.test.ts",
 			"./server/services/revert-planner-local-access.test.ts",
 			"./server/services/revert-mutation-journal.test.ts",
 			"./server/services/narrator-scoped-revert.test.ts",
 			"./server/lib/agent/tools/__tests__/bash-workspace-activity.test.ts",
 		]);
+		for (const file of tests.run?.trim().split(/\s+/).slice(3) ?? [])
+			expect(existsSync(join(repository, file))).toBe(true);
 		expect(steps.indexOf(volumes)).toBeLessThan(steps.indexOf(profile));
 		expect(steps.indexOf(profile)).toBeLessThan(steps.indexOf(record));
 		expect(steps.indexOf(record)).toBeLessThan(steps.indexOf(tests));
 		for (const step of [volumes, profile, record, tests])
 			expect(step["continue-on-error"]).toBeUndefined();
+	});
+
+	test("Linux executor Go tests install and verify real ripgrep before the unchanged full suite", () => {
+		const auxiliary = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/remote-executor.yml"), "utf8"),
+		) as Workflow;
+		const linux = auxiliary.jobs["executor-go"];
+		const install = linux.steps.find(
+			(value) => value.name === "Install Go test system dependencies",
+		);
+		const tests = linux.steps.find((value) => value.name === "Run Go tests");
+		if (!install || !tests) throw new Error("Missing Linux executor test preparation");
+		expect(linux["runs-on"]).toBe("ubuntu-latest");
+		expect(
+			install.run
+				?.trim()
+				.split("\n")
+				.map((line) => line.trim()),
+		).toEqual([
+			"sudo apt-get update",
+			"sudo apt-get install --yes ripgrep",
+			"command -v rg",
+			"rg --version",
+		]);
+		expect(linux.steps.indexOf(install)).toBeLessThan(linux.steps.indexOf(tests));
+		expect(tests.run?.trim()).toBe("go test ./...");
+		expect(linux["continue-on-error"]).toBeUndefined();
+		expect(linux.if).toBeUndefined();
+		for (const value of [install, tests]) {
+			expect(value.if).toBeUndefined();
+			expect(value["continue-on-error"]).toBeUndefined();
+		}
+		expect(
+			auxiliary.jobs["executor-native-files"].steps.some((value) => value.run?.includes("apt-get")),
+		).toBe(false);
 	});
 
 	test("executor dry-run uses the shared component pin instead of a fabricated CI version", () => {
@@ -348,50 +391,70 @@ describe("generic CI workflow", () => {
 		}
 	});
 
-	test("requires executable Chrome and probes a real headless launch before tests", () => {
-		const locate = step("tests", (value) => !!value.run?.includes("command -v google-chrome"));
-		expect(locate.run).toContain('"$CHROME_PATH" --version');
-		for (const variable of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"]) {
-			expect(locate.run).toContain(`${variable}=%s`);
-		}
-		expect(locate.run).toContain('"$GITHUB_ENV"');
+	test("installs the exact official Chrome146 build and probes a real headless launch before tests", () => {
+		const install = step("tests", (value) => value.name === "Install and verify pinned Chrome");
+		for (const required of [
+			'from "@puppeteer/browsers"',
+			'const buildId = "146.0.7680.31"',
+			"browser: Browser.CHROME",
+			"process.env.RUNNER_TEMP",
+			'cacheDir: join(temp, "narrafork-ci-chrome")',
+			'baseUrl: "https://storage.googleapis.com/chrome-for-testing-public"',
+			'spawnSync(executablePath, ["--version"]',
+			"version.error || version.status !== 0",
+			"version.stdout.trim() !== expectedVersion",
+			"Google Chrome for Testing",
+			"process.env.GITHUB_ENV",
+		])
+			expect(install.run).toContain(required);
+		for (const variable of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"])
+			expect(install.run).toContain(`${variable}=\${executablePath}`);
+		expect(install.run?.indexOf("version.stdout.trim() !== expectedVersion")).toBeLessThan(
+			install.run?.indexOf("appendFileSync(environmentFile") ?? -1,
+		);
+		expect(install.run).not.toMatch(/command -v|latest|buildIdAlias|forceFallback|providers:/);
+		expect(install.if).toBeUndefined();
 		const probe = step("tests", (value) => !!value.run?.includes("puppeteer.launch"));
 		expect(probe.run).toContain("process.env.PUPPETEER_EXECUTABLE_PATH");
 		expect(probe.run).toContain('args: ["--no-sandbox", "--disable-setuid-sandbox"]');
+		expect(probe.run).toContain("146\\.0\\.7680\\.31");
+		for (const required of [
+			"Browser.getVersion",
+			"Tracing.getCategories",
+			"devtools.timeline",
+			"disabled-by-default-v8.gc",
+			"blink.user_timing",
+		])
+			expect(probe.run).toContain(required);
 		expect(probe.run).toContain("await page.goto(");
 		expect(probe.run).toContain("await browser.close()");
 		expect(probe.if).toBeUndefined();
 		const steps = job("tests").steps;
-		expect(steps.indexOf(locate)).toBeLessThan(steps.indexOf(probe));
+		expect(steps.indexOf(command("tests", "bun install --frozen-lockfile"))).toBeLessThan(
+			steps.indexOf(install),
+		);
+		expect(steps.indexOf(install)).toBeLessThan(steps.indexOf(probe));
 		expect(steps.indexOf(probe)).toBeLessThan(
 			steps.indexOf(command("tests", "bun test --isolate tests/preload-isolation.test.ts")),
 		);
 	});
 
-	test("fails Chrome preflight on missing binaries or a broken version command", () => {
-		const locate = step("tests", (value) => !!value.run?.includes("command -v google-chrome"));
+	test("a missing or failing pinned Chrome installer cannot export a browser environment", () => {
+		const install = step("tests", (value) => value.name === "Install and verify pinned Chrome");
 		const root = mkdtempSync(join(tmpdir(), "ci-chrome-guard-"));
 		roots.push(root);
 		const githubEnv = join(root, "github-env");
-		const missing = shell(locate.run ?? "", { PATH: root, GITHUB_ENV: githubEnv });
+		const missing = shell(install.run ?? "", { PATH: root, GITHUB_ENV: githubEnv });
 		expect(missing.error).toBeUndefined();
 		expect(missing.status).not.toBe(0);
-		const broken = shell(`google-chrome() { return 42; }\n${locate.run}`, {
+		expect(existsSync(githubEnv)).toBe(false);
+		const broken = shell(`bun() { return 42; }\n${install.run}`, {
 			PATH: root,
 			GITHUB_ENV: githubEnv,
 		});
 		expect(broken.error).toBeUndefined();
 		expect(broken.status).toBe(42);
-		const ready = shell(`google-chrome() { printf 'Chrome 123\\n'; }\n${locate.run}`, {
-			PATH: root,
-			GITHUB_ENV: githubEnv,
-		});
-		expect(ready.error).toBeUndefined();
-		expect(ready.status).toBe(0);
-		expect(readFileSync(githubEnv, "utf8").trim().split("\n")).toEqual([
-			"NF_TEST_CHROMIUM_PATH=google-chrome",
-			"PUPPETEER_EXECUTABLE_PATH=google-chrome",
-		]);
+		expect(existsSync(githubEnv)).toBe(false);
 	});
 
 	test("covers all four native shards without fail-fast or artifact name collisions", () => {

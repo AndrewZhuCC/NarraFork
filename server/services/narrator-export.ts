@@ -45,6 +45,12 @@ import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
+import {
+	type OwnTurnPlacement,
+	ownTurnPlacementOf,
+	ownTurnSql,
+	RUNTIME_SOURCE_COLUMNS,
+} from "../lib/runtime-source";
 import { resolveLazyLineage } from "./narrator-refs-backfill";
 import { projectPublicNarratorPayload } from "./public-narrator-share-gen-ui";
 
@@ -373,10 +379,11 @@ async function hasHistoryBelow(
 	// biome-ignore lint/suspicious/noExplicitAny: drizzle SQL predicate union
 	scopeClause: any,
 	boundarySeq: number,
-	isSubagent: boolean,
+	ownPlacement: OwnTurnPlacement,
 ): Promise<boolean> {
 	const conditions = [scopeClause, sql`${narratorMessageRefs.seq} < ${boundarySeq}`];
-	if (!isSubagent) conditions.push(isNull(narratorMessages.parentToolUseId));
+	const own = ownTurnSql(ownPlacement);
+	if (own) conditions.push(own);
 	const rows = await db
 		.select({ seq: narratorMessageRefs.seq })
 		.from(narratorMessageRefs)
@@ -408,7 +415,7 @@ async function loadRefPage(
 	scopeClause: any,
 	cursor: { seq: number; refId: string } | null,
 	latestCompactSeq: number | null,
-	isSubagent: boolean,
+	ownPlacement: OwnTurnPlacement,
 ): Promise<ExportRefRow[]> {
 	const conditions = [scopeClause];
 	if (cursor) {
@@ -416,9 +423,8 @@ async function loadRefPage(
 			sql`(${narratorMessageRefs.seq}, ${narratorMessageRefs.id}) > (${cursor.seq}, ${cursor.refId})`,
 		);
 	}
-	// Subagent transcripts ARE the child messages, so their top level is not
-	// filtered by parentToolUseId; a primary narrator's is.
-	if (!isSubagent) conditions.push(isNull(narratorMessages.parentToolUseId));
+	const own = ownTurnSql(ownPlacement);
+	if (own) conditions.push(own);
 	if (latestCompactSeq != null) {
 		conditions.push(gt(narratorMessageRefs.seq, latestCompactSeq));
 	}
@@ -458,7 +464,7 @@ export interface TranscriptScope {
 	// biome-ignore lint/suspicious/noExplicitAny: drizzle SQL predicate union
 	clause: any;
 	latestCompactSeq: number | null;
-	isSubagent: boolean;
+	ownTurnPlacement: OwnTurnPlacement;
 	/** True only when `visible` genuinely hides messages older than the last compact. */
 	earlierHistoryOmitted: boolean;
 }
@@ -466,13 +472,19 @@ export interface TranscriptScope {
 export async function resolveTranscriptScope(
 	narratorId: string,
 	scope: NarratorExportScope,
-	isSubagent: boolean,
 ): Promise<TranscriptScope> {
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: RUNTIME_SOURCE_COLUMNS,
+	});
+	const ownTurnPlacement = row ? ownTurnPlacementOf(row) : null;
 	const clause = await buildRefScope(narratorId, scope);
 	const latestCompactSeq = scope === "visible" ? await loadLatestCompactSeq(narratorId) : null;
 	const earlierHistoryOmitted =
-		latestCompactSeq != null ? await hasHistoryBelow(clause, latestCompactSeq, isSubagent) : false;
-	return { clause, latestCompactSeq, isSubagent, earlierHistoryOmitted };
+		latestCompactSeq != null
+			? await hasHistoryBelow(clause, latestCompactSeq, ownTurnPlacement)
+			: false;
+	return { clause, latestCompactSeq, ownTurnPlacement, earlierHistoryOmitted };
 }
 
 export interface TranscriptRefPage {
@@ -508,7 +520,12 @@ export async function* iterateNarratorTranscript(
 		if (signal?.aborted) return;
 		const pageStart = Date.now();
 
-		const refs = await loadRefPage(scope.clause, cursor, scope.latestCompactSeq, scope.isSubagent);
+		const refs = await loadRefPage(
+			scope.clause,
+			cursor,
+			scope.latestCompactSeq,
+			scope.ownTurnPlacement,
+		);
 		if (refs.length === 0) return;
 		const lastRef = refs[refs.length - 1];
 		cursor = { seq: lastRef.seq, refId: lastRef.refId };
@@ -1600,7 +1617,7 @@ export async function* streamNarratorExport(
 	// parseable "incomplete" document the failure contract promises.
 	let scope: TranscriptScope | null = null;
 	try {
-		scope = await resolveTranscriptScope(narratorId, options.scope, header.isSubagent);
+		scope = await resolveTranscriptScope(narratorId, options.scope);
 		stats.earlierHistoryOmitted = scope.earlierHistoryOmitted;
 	} catch (error) {
 		failure = error instanceof Error ? error.message : String(error);

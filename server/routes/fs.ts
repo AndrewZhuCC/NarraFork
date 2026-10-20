@@ -24,6 +24,7 @@ import {
 	normalizeLineEndings,
 } from "../lib/agent/tools/encoding";
 import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
+import { getClientIp } from "../lib/client-ip";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
 import { AppError, ValidationError } from "../lib/errors";
 import {
@@ -36,6 +37,10 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { isLoopbackHostname } from "../lib/public-origin";
+import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
+import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
+import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { fsWriteSchema } from "../lib/validators/fs";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
@@ -197,6 +202,10 @@ fsRoutes.post("/mkdir", async (c) => {
  * - macOS: `open <path>`
  * - Windows: `explorer <path>`
  * - Linux desktop: `xdg-open <path>` (requires xdg-utils)
+ *
+ * On Windows, for a browser on this machine, nothing is launched here: the response carries a
+ * one-time `protocolUrl` for the browser to open, so Explorer is started by a process the user's
+ * click activated and can take the foreground (see lib/reveal-protocol.ts).
  */
 fsRoutes.post("/reveal", async (c) => {
 	const body = await c.req.json<{ path?: string }>();
@@ -209,6 +218,14 @@ fsRoutes.post("/reveal", async (c) => {
 	const absPath = resolve(rawPath);
 	if (!existsSync(absPath) || !statSync(absPath).isDirectory()) {
 		throw new ValidationError(`Directory does not exist: ${absPath}`);
+	}
+
+	// A remote browser would activate the protocol on its own machine, so it keeps the direct launch.
+	if (IS_WINDOWS && isLoopbackHostname(getClientIp(c))) {
+		const origin = getLocalServerOrigin();
+		if (origin && ensureRevealProtocolRegistered(origin)) {
+			return c.json({ ok: true, protocolUrl: buildRevealUri(issueRevealToken(absPath)) });
+		}
 	}
 
 	let cmd: string;
@@ -687,6 +704,8 @@ fsRoutes.post("/write", async (c) => {
 					error: err.message,
 					code: "WRITE_RECONCILE_REQUIRED",
 					operationId: err.operationId,
+					diskOutcome: err.diskOutcome,
+					historyStatus: err.historyStatus,
 				},
 				500,
 			);
@@ -766,6 +785,8 @@ fsRoutes.post("/write", async (c) => {
 		ok: true,
 		path: target,
 		...completed.result,
+		diskOutcome: completed.diskOutcome,
+		historyStatus: completed.historyStatus,
 		fileChangeEvidence: completed.fileChangeEvidence,
 		// Echoed so a client can keep its round trip honest without having to remember
 		// what it sent — and so a save that fell back to UTF-8 for an unknown name says so.

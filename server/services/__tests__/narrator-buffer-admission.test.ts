@@ -353,7 +353,6 @@ describe("durable queue modes", () => {
 			undefined,
 			undefined,
 			"stack",
-			false,
 			undefined,
 			mode,
 		);

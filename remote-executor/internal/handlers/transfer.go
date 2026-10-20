@@ -20,6 +20,32 @@ import (
 // crc32cTable is the Castagnoli table, matching the server's crc32c.ts.
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
+// A fixed upload checkpoint belongs to one live receiver across all connections.
+// This admission protects only the .nfpart lifetime, not ordinary target writes.
+var uploadCheckpoints = struct {
+	sync.Mutex
+	paths map[string]struct{}
+}{paths: make(map[string]struct{})}
+
+func claimUploadCheckpoint(path string) (func(), error) {
+	key := fileMutationPathKey(path)
+	uploadCheckpoints.Lock()
+	if _, occupied := uploadCheckpoints.paths[key]; occupied {
+		uploadCheckpoints.Unlock()
+		return nil, fmt.Errorf("upload checkpoint is busy for %q", path)
+	}
+	uploadCheckpoints.paths[key] = struct{}{}
+	uploadCheckpoints.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			uploadCheckpoints.Lock()
+			delete(uploadCheckpoints.paths, key)
+			uploadCheckpoints.Unlock()
+		})
+	}, nil
+}
+
 // BinarySender lets the transfer handler push binary chunk frames back to the
 // server. Provided by the transport layer.
 type BinarySender interface {
@@ -47,9 +73,16 @@ type transferSession struct {
 	cancel context.CancelFunc
 
 	// Receiver (upload) state.
-	recvFile *os.File
-	received map[int]bool
-	recvMu   sync.Mutex
+	recvFile                *os.File
+	received                map[int]bool
+	recvMu                  sync.Mutex
+	releaseUploadCheckpoint func()
+}
+
+func (sess *transferSession) releaseCheckpoint() {
+	if sess.releaseUploadCheckpoint != nil {
+		sess.releaseUploadCheckpoint()
+	}
 }
 
 // Transfers holds active sessions and the binary sender. A single Transfers is
@@ -144,6 +177,12 @@ func (h *Handlers) TransferStat(params map[string]any) (any, error) {
 		if err != nil {
 			return nil // skip unreadable entries
 		}
+		if _, guardErr := h.guard.CheckExisting(p); guardErr != nil {
+			if fi.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if fi.IsDir() {
 			return nil
 		}
@@ -186,7 +225,10 @@ func (h *Handlers) TransferStat(params map[string]any) (any, error) {
 //
 // The passed ctx bounds only the begin RPC itself; the transfer runs under its
 // own session context so streaming survives after begin returns.
-func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error) {
+func (t *Transfers) Begin(ctx context.Context, params map[string]any) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	transferId := stringParam(params, "transferId")
 	direction := stringParam(params, "direction")
 	rawRemotePath, err := requiredAbsoluteTransferPath(params, "remotePath")
@@ -247,7 +289,7 @@ func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error)
 				}
 			}
 		}
-		if registerErr := t.register(sess); registerErr != nil {
+		if registerErr := t.register(ctx, sess); registerErr != nil {
 			sessCancel()
 			return nil, registerErr
 		}
@@ -269,9 +311,29 @@ func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error)
 			sessCancel()
 			return nil, err
 		}
+		releaseCheckpoint, claimErr := claimUploadCheckpoint(sess.partPath)
+		if claimErr != nil {
+			sessCancel()
+			return nil, claimErr
+		}
+		sess.releaseUploadCheckpoint = releaseCheckpoint
+		registered := false
+		defer func() {
+			if !registered {
+				sess.releaseCheckpoint()
+			}
+		}()
 		if mkErr := os.MkdirAll(filepath.Dir(remotePath), 0o755); mkErr != nil {
 			sessCancel()
 			return nil, mkErr
+		}
+		currentPart, pathErr := t.h.guard.CheckCreate(sess.partPath)
+		if pathErr != nil || !samePath(currentPart, sess.partPath) {
+			sessCancel()
+			if pathErr != nil {
+				return nil, pathErr
+			}
+			return nil, fmt.Errorf("upload checkpoint path changed before opening")
 		}
 		_, partStatErr := os.Stat(sess.partPath)
 		_, manifestStatErr := os.Stat(sess.manifestPath)
@@ -302,12 +364,13 @@ func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error)
 				}
 			}
 		}
-		if registerErr := t.register(sess); registerErr != nil {
+		if registerErr := t.register(ctx, sess); registerErr != nil {
 			_ = f.Close()
 			sess.recvFile = nil
 			sessCancel()
 			return nil, registerErr
 		}
+		registered = true
 		return map[string]any{
 			"completedChunks": completed,
 			"restarted":       manifest == nil && hadSidecars,
@@ -317,9 +380,17 @@ func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error)
 	return map[string]any{"completedChunks": completed, "restarted": false}, nil
 }
 
-func (t *Transfers) register(sess *transferSession) error {
+func (t *Transfers) register(ctx context.Context, sess *transferSession) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// The begin RPC owns setup until this handoff. In particular, a cancel +
+	// abort that arrived before registration must not leave a live receiver.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := t.ctx.Err(); err != nil {
+		return err
+	}
 	if t.closed {
 		return fmt.Errorf("transfer manager is closed")
 	}
@@ -374,22 +445,25 @@ func (t *Transfers) Close() {
 
 	for _, sess := range sessions {
 		sess.cancel()
-		if sess.direction != "upload" || sess.recvFile == nil {
+		if sess.direction != "upload" {
 			continue
 		}
 		sess.recvMu.Lock()
-		_ = sess.recvFile.Sync()
-		saveManifest(
-			sess.manifestPath,
-			sess.manifestTmpPath,
-			sess.chunkSize,
-			sess.fileSize,
-			sess.contentIdentity,
-			sess.received,
-		)
-		_ = sess.recvFile.Close()
-		sess.recvFile = nil
+		if sess.recvFile != nil {
+			_ = sess.recvFile.Sync()
+			saveManifest(
+				sess.manifestPath,
+				sess.manifestTmpPath,
+				sess.chunkSize,
+				sess.fileSize,
+				sess.contentIdentity,
+				sess.received,
+			)
+			_ = sess.recvFile.Close()
+			sess.recvFile = nil
+		}
 		sess.recvMu.Unlock()
+		sess.releaseCheckpoint()
 	}
 }
 
@@ -418,8 +492,13 @@ func (t *Transfers) sendFile(ctx context.Context, sess *transferSession) {
 		if remaining := sess.fileSize - offset; remaining < length {
 			length = remaining
 		}
+		if length <= 0 {
+			return
+		}
 		buf := make([]byte, length)
-		if _, readErr := f.ReadAt(buf, offset); readErr != nil && readErr != io.EOF {
+		// ReadAt must fill the entire advertised chunk, including the smaller
+		// final chunk. A source truncated mid-transfer must never send its tail.
+		if n, readErr := f.ReadAt(buf, offset); readErr != nil || n != len(buf) {
 			return
 		}
 		// Backpressure: wait for the send buffer to drain.
@@ -493,14 +572,19 @@ func (t *Transfers) Ack(_ map[string]any) (any, error) {
 	return map[string]any{}, nil
 }
 
-// Complete finalizes a transfer. For upload the executor renames .part → dst
-// and verifies size/sha256.
-func (t *Transfers) Complete(params map[string]any) (any, error) {
+// Complete verifies the upload and renames .part → dst. The RPC context is a
+// child of the connection context, so it already observes both cancellation
+// and disconnects. A started rename holds its slot until real IO returns.
+func (t *Transfers) Complete(ctx context.Context, params map[string]any) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	transferId := stringParam(params, "transferId")
 	sess := t.take(transferId)
 	if sess == nil {
 		return map[string]any{"ok": true, "fileSize": 0}, nil
 	}
+	defer sess.releaseCheckpoint()
 	sess.cancel()
 
 	if sess.direction != "upload" {
@@ -546,7 +630,7 @@ func (t *Transfers) Complete(params map[string]any) (any, error) {
 		wantHash = sess.contentIdentity.Digest
 	}
 	if wantHash != "" {
-		got, hashErr := hashFileSha256(t.ctx, partPath)
+		got, hashErr := hashFileSha256(ctx, partPath)
 		if hashErr != nil {
 			return map[string]any{"ok": false, "fileSize": info.Size(), "error": hashErr.Error()}, nil
 		}
@@ -555,15 +639,21 @@ func (t *Transfers) Complete(params map[string]any) (any, error) {
 		}
 	}
 
-	release, lockErr := acquireFileMutation(t.ctx)
+	release, lockErr := acquireFileMutation(ctx, destinationPath)
 	if lockErr != nil {
 		return nil, lockErr
 	}
 	defer release()
-	// Revalidate after waiting for other executor-managed file mutations.
-	destinationPath, pathErr = t.h.guard.CheckCreate(sess.path)
+	// Revalidate without moving this operation into another path's queue.
+	resolved, pathErr := t.h.guard.CheckCreate(sess.path)
 	if pathErr != nil {
 		return nil, pathErr
+	}
+	if !samePath(resolved, destinationPath) {
+		return nil, fmt.Errorf("transfer destination identity changed while waiting for commit")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if renErr := os.Rename(partPath, destinationPath); renErr != nil {
 		return map[string]any{"ok": false, "fileSize": info.Size(), "error": renErr.Error()}, nil
@@ -581,6 +671,7 @@ func (t *Transfers) Abort(params map[string]any) (any, error) {
 	if sess == nil {
 		return map[string]any{}, nil
 	}
+	defer sess.releaseCheckpoint()
 	sess.cancel()
 	sess.recvMu.Lock()
 	if sess.recvFile != nil {

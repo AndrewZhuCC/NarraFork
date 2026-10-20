@@ -1,4 +1,5 @@
 import type { OptimizeStyle } from "@frontend/hooks/usePromptOptimize";
+import { Z } from "@frontend/lib/z-index";
 import { ActionIcon, Group, Menu, NumberInput, Text, Tooltip } from "@mantine/core";
 import {
 	IconArrowsMaximize,
@@ -88,7 +89,14 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 					</ActionIcon>
 				</Tooltip>
 			) : (
-				<Menu position="top-end" withArrow withinPortal offset={{ mainAxis: 8, crossAxis: 8 }}>
+				<Menu
+					position="top-end"
+					withArrow
+					withinPortal
+					offset={{ mainAxis: 8, crossAxis: 8 }}
+					// 必须高于全屏编辑器(Z.fullscreenEditor),否则全屏时本菜单画在编辑器下面。
+					zIndex={Z.dropdown}
+				>
 					<Menu.Target>
 						<Tooltip label={t("optimizePrompt")} position="top">
 							<ActionIcon

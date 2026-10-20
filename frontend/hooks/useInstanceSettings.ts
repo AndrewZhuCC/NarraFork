@@ -193,7 +193,7 @@ function makeDefaults(): InstanceSettingsState {
 		// fallback, so an unconfigured instance never displays a model the user
 		// never selected as if it were active.
 		defaultModel: "",
-		permissionMode: "acceptEdits",
+		permissionMode: "bypassPermissions",
 		summaryModel: "",
 		translationModel: "__summary__",
 		promptOptimizeModel: "__summary__",

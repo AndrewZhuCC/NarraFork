@@ -27,6 +27,7 @@ import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
+import { peekCommandCodeModels } from "../lib/commandcode-models";
 import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
@@ -67,6 +68,7 @@ import {
 	getBuiltinModelContextWindows,
 	getContextThresholds,
 	getProviderPrefixChanges,
+	hasConfiguredCommandCodeProvider,
 	isAnthropicCustomApiProtocol,
 	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
@@ -431,6 +433,30 @@ export const updateSettingsSchema = z
 				promptOptimizeContextMaxMessages: z.number().int().min(1).max(50),
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
+				/** 逐模型的协议覆盖，键为带前缀的完整模型 ID。 */
+				modelProtocols: z
+					.record(
+						z.string(),
+						z.enum([
+							"anthropic-messages",
+							"openai-responses",
+							"completions-compatible",
+							"gemini-compatible",
+						]),
+					)
+					.optional(),
+				/** 「编辑此连接覆盖」里单独保存的协议，优先级高于 modelProtocols。 */
+				modelProtocolOverrides: z
+					.record(
+						z.string(),
+						z.enum([
+							"anthropic-messages",
+							"openai-responses",
+							"completions-compatible",
+							"gemini-compatible",
+						]),
+					)
+					.optional(),
 				maxTurns: z.number().int().min(1).max(1000),
 				subagentModels: z
 					.object({
@@ -700,6 +726,21 @@ export const updateSettingsSchema = z
 		nugProviders: z.array(nugProviderSchema).optional(),
 		grokProviders: z.array(grokProviderSchema).optional(),
 		geminiProviders: z.array(geminiProviderSchema).optional(),
+		commandCode: z
+			.object({
+				disabled: z.boolean().optional(),
+				apiKey: z.string().optional(),
+				baseUrl: z.string().optional(),
+				endpoints: z
+					.record(z.string(), z.enum(["messages", "completions", "responses"]))
+					.optional(),
+				proxy: proxyOverrideSchema,
+				userAgentMode: userAgentModeSchema,
+				customUserAgent: customUserAgentSchema,
+				extraHeaders: extraHeadersSchema,
+			})
+			.partial()
+			.optional(),
 		codex: z
 			.object({
 				proxy: proxyOverrideSchema,
@@ -945,6 +986,10 @@ async function buildSettingsResponse(
 	const codexManager = getCodexManager();
 	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
 	stripObsoleteSettingsKeys(safeSource);
+	const commandCodeCatalog = peekCommandCodeModels(
+		source.commandCode?.apiKey,
+		source.commandCode?.baseUrl,
+	);
 	return {
 		...safeSource,
 		providerReadiness: await listProviderReadiness(),
@@ -980,6 +1025,11 @@ async function buildSettingsResponse(
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
 		})),
+		// 与其它 provider 一致：只回传脱敏值，前端据此提示"已保存"。
+		commandCode: {
+			...source.commandCode,
+			apiKey: source.commandCode?.apiKey ? maskApiKey(source.commandCode.apiKey) : "",
+		},
 		geminiProviders: (source.geminiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
@@ -1015,6 +1065,9 @@ async function buildSettingsResponse(
 		opencodeUsageGenerations: getOpencodeUsageGenerations(),
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
+		commandcodeAvailable: hasConfiguredCommandCodeProvider(),
+		commandcodeModels: commandCodeCatalog.models,
+		commandcodeModelsPending: commandCodeCatalog.pending,
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
 		lanAddresses: getLanAddresses(),
 		summaryModelAvailable: checkSummaryModelAvailable(source.agent.summaryModel),
@@ -1652,6 +1705,12 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 					p.oauthClientSecret = existing?.oauthClientSecret ?? "";
 				}
 			}
+		}
+
+		// Preserve the real Command Code API key when the client echoes back the masked
+		// display value (the settings page submits the whole draft, edited or not).
+		if (validated.commandCode?.apiKey?.startsWith("*")) {
+			validated.commandCode.apiKey = current.commandCode?.apiKey ?? "";
 		}
 
 		// Preserve real API keys and sensitive headers for custom search providers.

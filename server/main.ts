@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-
 import { eq } from "drizzle-orm";
 
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
@@ -131,6 +130,7 @@ import { initDeviceConnectionService } from "./services/device-connection-servic
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
+import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -225,18 +225,14 @@ if (activeDatabaseBackend === "sqlite") {
 	}
 }
 
-// Record the actual local process owner once, before HTTP/agent writes can start.
-// Identity probe failure never invents proof; unavailable registration disables reconciliation.
-const {
-	initializeWorkspaceOwnerOnStartup,
-	startWorkspaceStartupReconciliation,
-	stopWorkspaceStartupReconciliation,
-} = await import("./services/workspace-startup-reconciliation");
+// Ordinary cold continuation recovery requires strict single-instance provenance.
+// Register it directly, independently of file history and workspace writes.
 if (activeDatabaseBackend === "sqlite") {
 	try {
-		await initializeWorkspaceOwnerOnStartup();
+		const { initializeInstanceLockProcessIdentity } = await import("./lib/instance-lock");
+		await initializeInstanceLockProcessIdentity();
 	} catch (error) {
-		logger.warn("Workspace execution owner registration unavailable; barriers remain protected", {
+		logger.warn("Strict instance identity unavailable for cold continuation recovery", {
 			error: String(error),
 		});
 	}
@@ -1126,8 +1122,8 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 					// when it lapses; the upgrade is the only place the token is verified.
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
+						sessionTokenVersion: payload[SESSION_VERSION_CLAIM] ?? 0,
 						sessionUserId: payload.sub,
-						sessionTokenVersion: payload[SESSION_VERSION_CLAIM],
 					});
 					if (!wsData) {
 						return new Response("Unknown WebSocket endpoint", { status: 404 });
@@ -1486,7 +1482,6 @@ async function openAsApp(url: string) {
 // there is the "cannot skip verification" answer). A server-managed engine verifies itself.
 if (activeDatabaseBackend === "sqlite") {
 	scheduleBackgroundIntegrityCheck(startupShutdownState);
-	startWorkspaceStartupReconciliation();
 }
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
@@ -1502,6 +1497,10 @@ initDeviceTransferService();
 if (activeDatabaseBackend === "postgres") {
 	logger.warn("OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated");
 } else {
+	// Narrators written before runtime registrations store their relations from now on.
+	await materializeLegacyDelegations().catch((error) =>
+		logger.warn("Legacy delegation materialization failed", { error: String(error) }),
+	);
 	try {
 		await backfillOAuthGrantAuthoritiesOnStartup();
 		await backfillIntegrationResourceBindingsOnStartup();
@@ -1945,12 +1944,6 @@ async function performGracefulShutdown(
 		if (options.reason === "signal") {
 			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
 		}
-		await shutdownStep(
-			tracker,
-			"workspaceReconciliation.stop",
-			stopWorkspaceStartupReconciliation,
-			5_000,
-		);
 		const shutdownRequestId = httpRequestContext.getStore();
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design

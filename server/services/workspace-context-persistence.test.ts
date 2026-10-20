@@ -341,13 +341,30 @@ describe("real SQLite workspace CAS", () => {
 		});
 		expect(legacy.status).toBe(200);
 		expect((await legacy.json()).current.revision).toBe(2);
+		const versionBefore = (
+			await db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { messageVersion: true },
+			})
+		)?.messageVersion;
 		const revert = await router.request(`/api/narrators/${id}/revert`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: "{}",
+			body: JSON.stringify({ messageId: "__all__", scope: "workspace" }),
 		});
+		// The retired immediate restore entry point refuses before any file or history IO;
+		// a restore now requires a confirmed plan ID and hash from an action preview.
 		expect(revert.status).toBe(409);
-		expect((await revert.json()).code).toBe("WORKSPACE_REVERT_UNSUPPORTED");
+		expect(await revert.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect((await workspaceContextService.get(id)).revision).toBe(2);
+		expect(
+			(
+				await db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { messageVersion: true },
+				})
+			)?.messageVersion,
+		).toBe(versionBefore);
 	});
 	test("real HTTP busy/waiting records return 409 without incrementing revision", async () => {
 		const router = app(owner);
@@ -546,7 +563,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	async function forbidFileRollback() {
 		const preview = await import("./revert-planner-local-access");
 		const scoped = await import("./narrator-scoped-revert");
-		const snapshot = await import("./snapshot-revert");
+		const snapshot = await import("./worktree-tree-snapshot");
 		const forbidden = () => {
 			throw new Error("History-only operation accessed file rollback");
 		};
@@ -555,7 +572,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			spyOn(preview, "prepareLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(preview, "applyLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(scoped, "revertNarratorScopedForMessages").mockImplementation(forbidden),
-			spyOn(snapshot, "revertForMessagesTree").mockImplementation(forbidden),
+			spyOn(snapshot.worktreeTreeSnapshot, "restore").mockImplementation(forbidden),
 		];
 		for (const spy of spies) restorers.push(() => spy.mockRestore());
 		return spies;
@@ -625,7 +642,9 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			const req = request(f, action, skipRevert);
 			const response = await app(owner).request(req.path, req.init);
 			expect(response.status).toBe(409);
-			expect((await response.json()).code).toBe("WORKSPACE_REVERT_UNSUPPORTED");
+			// A file-restoring rollback needs a confirmed plan and HTTP deletions are
+			// history-only, so every action is refused at that gate before any IO.
+			expect((await response.json()).code).toBe("REVERT_CONFIRMATION_REQUIRED");
 			expect(interrupt).not.toHaveBeenCalled();
 			expect(await refs()).toEqual(before);
 			await assertFiles(f);

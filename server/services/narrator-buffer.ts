@@ -633,10 +633,10 @@ export async function enqueueBufferedMessage(
 	bashCommand?: string | null,
 	fileReferences?: FileReferenceSnapshot[],
 	frontOrder: "stack" | "fifo" = "stack",
-	preserveWorkTurn = false,
 	executionIntent?: BufferedMessage["executionIntent"],
 	queueMode?: BufferQueueMode,
 	composerDocument?: ComposerDocument,
+	preserveWorkTurn = false,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	composerDocument = parseOptionalComposerDocument(composerDocument);
 	validateComposerProjection(

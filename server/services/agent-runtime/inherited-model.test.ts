@@ -29,10 +29,11 @@ function fixture() {
 		_modelUnavailableWaitCancel: mock(() => {}),
 	} as unknown as ActiveNarrator;
 	const sessions = new Map([[active.narratorId, active]]);
-	const childRow = {
+	// No parent link or template: the follow relation is only the registered source.
+	const childRow: InheritedModelNarrator = {
 		model: FOLLOW_PARENT_MODEL,
-		parentNarratorId: "parent",
-		subagentType: "general",
+		policySourceNarratorId: "parent",
+		runtimeRegistrationJson: { version: 1, modelPool: "general" },
 	};
 	const rows = new Map<string, InheritedModelNarrator>([["child", childRow]]);
 	const resolutions: ReturnType<typeof deferred<InheritedModelResolution>>[] = [];
@@ -97,7 +98,7 @@ describe("inherited runtime model refresh", () => {
 		}
 	});
 
-	test("parent updates only resolve active followers, including nested followers", async () => {
+	test("source updates only resolve active followers, including nested followers", async () => {
 		const f = fixture();
 		for (const [id, parentId, ref] of [
 			["grandchild", "child", FOLLOW_PARENT_MODEL],
@@ -108,10 +109,10 @@ describe("inherited runtime model refresh", () => {
 			const active = { ...f.active, narratorId: id, alive: id !== "dead" };
 			f.runtime.select(active, ref, parentId);
 			f.sessions.set(id, active);
-			f.rows.set(id, { model: ref, parentNarratorId: parentId });
+			f.rows.set(id, { model: ref, policySourceNarratorId: parentId });
 		}
-		f.rows.set("historical", { model: FOLLOW_PARENT_MODEL, parentNarratorId: "parent" });
-		f.runtime.parentChanged("parent");
+		f.rows.set("historical", { model: FOLLOW_PARENT_MODEL, policySourceNarratorId: "parent" });
+		f.runtime.sourceChanged("parent");
 		await Promise.resolve();
 		expect(f.readNarrator.mock.calls.map(([id]) => id)).toEqual(["child", "grandchild"]);
 		expect(f.resolve).toHaveBeenCalledTimes(2);
@@ -120,12 +121,12 @@ describe("inherited runtime model refresh", () => {
 		expect(f.applied).toHaveLength(2);
 	});
 
-	test("a later parent update wins even when the first resolution completes last", async () => {
+	test("a later source update wins even when the first resolution completes last", async () => {
 		const f = fixture();
-		f.runtime.parentChanged("parent");
+		f.runtime.sourceChanged("parent");
 		await Promise.resolve();
 		const oldPending = f.active._modelRefreshPending;
-		f.runtime.parentChanged("parent");
+		f.runtime.sourceChanged("parent");
 		await Promise.resolve();
 		f.resolutions[1].resolve(selected("provider:latest"));
 		await f.runtime.settle(f.active);
@@ -143,7 +144,7 @@ describe("inherited runtime model refresh", () => {
 		const boundary = f.runtime.settle(f.active).then(() => {
 			settled = true;
 		});
-		f.runtime.parentChanged("parent");
+		f.runtime.sourceChanged("parent");
 		await Promise.resolve();
 		f.resolutions[0].resolve(selected("provider:stale"));
 		await Promise.resolve();
@@ -165,9 +166,28 @@ describe("inherited runtime model refresh", () => {
 		f.resolutions[0].resolve(selected("provider:obsolete"));
 		await pending;
 		expect(f.active.model).toBe("provider:manual");
-		expect(f.active._followParentNarratorId).toBeUndefined();
+		expect(f.active._modelSourceNarratorId).toBeUndefined();
 		expect(f.applied).toHaveLength(0);
 		expect(f.active.abortController.signal.aborted).toBe(false);
+	});
+
+	test("a re-registered source or pool during resolution is rejected", async () => {
+		for (const change of [
+			(row: InheritedModelNarrator) => {
+				row.policySourceNarratorId = "other-source";
+			},
+			(row: InheritedModelNarrator) => {
+				row.runtimeRegistrationJson = { version: 1, modelPool: "explore" };
+			},
+		]) {
+			const f = fixture();
+			f.runtime.refresh(f.active);
+			await Promise.resolve();
+			change(f.childRow);
+			f.resolutions[0].resolve(selected("provider:obsolete"));
+			await expect(f.runtime.settle(f.active)).rejects.toThrow("selection changed during");
+			expect(f.applied).toHaveLength(0);
+		}
 	});
 
 	test("DB selection changes are rejected even before their notification arrives", async () => {
@@ -204,7 +224,7 @@ describe("inherited runtime model refresh", () => {
 		f.runtime.refresh(f.active);
 		await Promise.resolve();
 		const oldPending = f.active._modelRefreshPending;
-		f.runtime.parentChanged("parent");
+		f.runtime.sourceChanged("parent");
 		await Promise.resolve();
 		f.resolutions[1].resolve(selected("provider:latest"));
 		await f.runtime.settle(f.active);
@@ -233,17 +253,17 @@ describe("inherited runtime model refresh", () => {
 			f.runtime.refresh(f.active);
 			await Promise.resolve();
 			f.resolutions[0].resolve(result);
-			await expect(f.runtime.settle(f.active)).rejects.toThrow("unresolved parent reference");
+			await expect(f.runtime.settle(f.active)).rejects.toThrow("unresolved source reference");
 			expect(f.applied).toHaveLength(0);
 		}
 	});
 
 	test("temporary pin and restoration rejoin inheritance without stale writes", async () => {
 		const f = fixture();
-		const restoreRef = f.childRow.model;
+		const restoreRef = FOLLOW_PARENT_MODEL;
 		f.childRow.model = "provider:temporary";
 		f.runtime.select(f.active, "provider:temporary");
-		f.runtime.parentChanged("parent");
+		f.runtime.sourceChanged("parent");
 		expect(f.resolve).not.toHaveBeenCalled();
 		f.childRow.model = restoreRef;
 		f.runtime.select(f.active, restoreRef);

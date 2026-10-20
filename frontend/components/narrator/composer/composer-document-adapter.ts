@@ -3,10 +3,16 @@ import {
 	type ComposerDocument,
 	type ComposerInlineNode,
 	composerDocumentText,
+	legacyComposerDocumentText,
 	readComposerDocument,
 } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
-import { parseComposerQuotePrefix } from "./composer-quotes";
+import {
+	fileReferenceQuote,
+	parseComposerQuotePrefix,
+	parseComposerSegments,
+	serializeComposerQuotes,
+} from "./composer-quotes";
 import { getComposerAssetId } from "./draft-image-attachments";
 import { type FileReferenceInput, readFileReferences } from "./file-reference-input";
 
@@ -43,7 +49,7 @@ export function importComposerInput(input: FileReferenceInput): ComposerDocument
 				],
 				assets: [],
 			});
-	const projection = quoteDocument && composerDocumentText(quoteDocument);
+	const projection = quoteDocument && legacyComposerDocumentText(quoteDocument);
 	// File-comment nodes also project a body token. The legacy prefix itself must
 	// still match exactly: do not replace a different excerpt or invent a reference.
 	const projectedPrefix = projection?.text.slice(
@@ -105,8 +111,89 @@ export function importComposerInput(input: FileReferenceInput): ComposerDocument
 	const imported = prefixLength
 		? importChildren(prefixLength, quoteDocument?.paragraphs[0].children ?? [])
 		: undefined;
-	const children = imported?.complete ? imported.children : importChildren(0, []).children;
+	const positional = importPositionalQuotes(input.text, refs);
+	const children =
+		positional ?? (imported?.complete ? imported.children : importChildren(0, []).children);
 	return { version: 1, paragraphs: [{ children }], assets: [] };
+}
+
+/** Current text-only records may contain quote/comment blocks after typed content. */
+function importPositionalQuotes(
+	text: string,
+	refs: FileReference[],
+): ComposerInlineNode[] | undefined {
+	const segments = parseComposerSegments(text);
+	const firstText = segments.findIndex(
+		(segment) => segment.type === "text" && /\S/u.test(segment.text),
+	);
+	if (
+		!segments.some(
+			(segment, index) => segment.type === "quote" && firstText >= 0 && index > firstText,
+		)
+	)
+		return;
+	const comments = new Map<string, string>();
+	for (const segment of segments) {
+		if (segment.type !== "quote" || !segment.quote.anchor?.startsWith("f:")) continue;
+		const ref = refs.find((ref) => segment.quote.anchor === `f:${ref.id}`);
+		if (
+			!ref ||
+			!segment.quote.comment ||
+			comments.has(ref.id) ||
+			serializeComposerQuotes([{ ...fileReferenceQuote(ref), comment: segment.quote.comment }]) !==
+				serializeComposerQuotes([segment.quote])
+		)
+			return;
+		comments.set(ref.id, segment.quote.comment);
+	}
+	const children: ComposerInlineNode[] = [];
+	const used = new Set<string>();
+	const ranges = refs
+		.filter((ref) => ref.inputRange)
+		.sort((a, b) => (a.inputRange?.[0] ?? 0) - (b.inputRange?.[0] ?? 0));
+	const appendText = (value: string) => {
+		if (!value) return;
+		const last = children[children.length - 1];
+		if (last?.type === "text") last.text += value;
+		else children.push({ type: "text", text: value });
+	};
+	let cursor = 0;
+	for (const segment of segments) {
+		if (segment.type === "quote") {
+			const block = serializeComposerQuotes([segment.quote]);
+			if (!text.startsWith(block, cursor)) return;
+			const last = children[children.length - 1];
+			// Drop exactly the padding break the projection adds before a positional block.
+			if (last?.type === "text" && last.text.endsWith("\n")) {
+				last.text = last.text.slice(0, -1);
+				if (!last.text) children.pop();
+			}
+			if (!segment.quote.anchor?.startsWith("f:"))
+				children.push({ type: "quote", id: composerNodeId(), ...segment.quote });
+			cursor += block.length;
+		} else if (segment.type === "text") {
+			const end = cursor + segment.text.length;
+			for (const ref of ranges) {
+				const range = ref.inputRange;
+				if (!range || range[0] < cursor || range[1] > end) continue;
+				appendText(text.slice(cursor, range[0]));
+				children.push({
+					type: "fileReference",
+					id: ref.id,
+					reference: ref,
+					comment: comments.get(ref.id),
+				});
+				used.add(ref.id);
+				cursor = range[1];
+			}
+			appendText(text.slice(cursor, end));
+			cursor = end;
+		}
+	}
+	if (used.size !== refs.length) return;
+	const doc = readComposerDocument({ version: 1, paragraphs: [{ children }], assets: [] });
+	if (!doc || composerDocumentText(doc).text !== text) return;
+	return children;
 }
 
 export function composerInputFromDocument(composerDocument: ComposerDocument): FileReferenceInput {

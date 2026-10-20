@@ -52,7 +52,9 @@ export function useComposerLayout({
 				Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
 			const singleHeight = lineHeight + verticalPadding;
 			const controlsHeight = Math.max(leading?.height ?? 0, trailing?.height ?? 0);
-			const compactHeight = Math.max(singleHeight, controlsHeight + 14) + 2;
+			// Adaptive CSS pins the controls 8px above the bottom border; reserve the
+			// same 8px above them so single-line gaps around the buttons are symmetric.
+			const compactHeight = Math.max(singleHeight, controlsHeight + 16) + 2;
 			const available = root.clientWidth - 24 - leadingSpace - trailingSpace;
 			const oneLine = editable.scrollHeight <= Math.ceil(singleHeight) + 1;
 			const expanded = available < MIN_INPUT_WIDTH || !oneLine;

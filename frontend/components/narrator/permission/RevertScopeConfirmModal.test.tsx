@@ -121,7 +121,8 @@ function installDom() {
 
 function completePreview(overrides: Partial<RevertScopePreviews> = {}): RevertScopePreviews {
 	const ours = { deviceId: "local", filePath: "/workspace/ours.ts", willBeDeleted: false };
-	const other = { deviceId: "local", filePath: "/workspace/other.ts", willBeDeleted: true };
+	const plan = preparedActionPreview().plan;
+	if (!plan) throw new Error("Missing fixture plan");
 	return {
 		scope: "narrator",
 		affectedFiles: [ours],
@@ -132,16 +133,16 @@ function completePreview(overrides: Partial<RevertScopePreviews> = {}): RevertSc
 			totalFileCount: 1,
 			hasMore: false,
 		},
-		workspaceScope: { available: true, files: [ours, other], warnings: [] },
+		revertPlan: {
+			...plan,
+			planId: "plan-1",
+			action: "rollback_to_block",
+			previewKey: "review-key",
+			filesComplete: true,
+			expectedFileCount: overrides.narratorScope?.files.length ?? 1,
+		},
 		...overrides,
 	};
-}
-
-function workspaceOnlyPreview(): RevertScopePreviews {
-	return completePreview({
-		scope: "workspace",
-		narratorScope: { available: false, reason: "legacy_unverified", files: [], conflicts: [] },
-	});
 }
 
 async function flush() {
@@ -168,24 +169,9 @@ function button(label: string): HTMLButtonElement {
 	return element;
 }
 
-function scopeRadio(scope: RevertScope): HTMLInputElement {
-	const element = document.body.querySelector(`input[type="radio"][value="${scope}"]`);
-	if (!(element instanceof HTMLInputElement)) throw new Error(`Missing scope: ${scope}`);
-	return element;
-}
-
 async function click(element: HTMLElement) {
 	element.dispatchEvent(new Event("click", { bubbles: true }));
 	await flush();
-}
-
-async function selectScope(scope: RevertScope) {
-	const radio = scopeRadio(scope);
-	expect(radio.disabled).toBe(false);
-	// linkedom has no radio activation behaviour. React listens to the click,
-	// rather than a synthetic change event, just as it does for checkboxes.
-	radio.checked = true;
-	await click(radio);
 }
 
 function assertUnavailable(locale: typeof en | typeof zh = en) {
@@ -242,6 +228,7 @@ beforeEach(async () => {
 		title: "Confirm rollback",
 		description: "Delete the selected history.",
 		data: undefined,
+		previewKey: "review-key",
 		isLoading: false,
 		confirmWithRevertLabel: en.rollbackConfirmWithRevert,
 		confirmNoFilesLabel: en.rollbackConfirm,
@@ -288,11 +275,11 @@ describe("RevertScopeConfirmModal evidence gating", () => {
 	});
 
 	test("legacy files stay viewable without promising to revert or delete them", async () => {
-		await render({ data: { affectedFiles: completePreview().workspaceScope?.files ?? [] } });
+		await render({ data: { affectedFiles: completePreview().narratorScope?.files ?? [] } });
 		assertUnavailable();
 		expect(document.body.textContent).toContain(en.revertScopeLegacyUnverified);
 		expect(document.body.textContent).toContain(en.revertScopeRecordedFiles);
-		expect(document.body.textContent).toContain("/workspace/other.ts");
+		expect(document.body.textContent).toContain("/workspace/ours.ts");
 		expect(document.body.textContent).not.toContain(en.rollbackConfirmFiles);
 		expect(document.body.textContent).not.toContain(en.fileMod_willBeDeleted);
 		expect(document.body.textContent).not.toContain(en.fileMod_willBeReverted);
@@ -304,8 +291,7 @@ describe("RevertScopeConfirmModal evidence gating", () => {
 		test(`missing or unknown scope metadata blocks otherwise available previews (${scope})`, async () => {
 			await render({ data: completePreview({ scope }) });
 			assertUnavailable();
-			expect(scopeRadio("narrator").disabled).toBe(true);
-			expect(scopeRadio("workspace").disabled).toBe(true);
+			expect(document.body.querySelector("input[type=radio]")).toBeNull();
 		});
 	}
 
@@ -339,7 +325,7 @@ describe("RevertScopeConfirmModal evidence gating", () => {
 		if (data.narratorScope) data.narratorScope.conflicts = ["/workspace/ours.ts"];
 		await render({ data });
 		assertUnavailable();
-		expect(scopeRadio("workspace").checked).toBe(false);
+		expect(document.body.querySelector("input[type=radio]")).toBeNull();
 		expect(document.body.textContent).toContain(en.revertScopeConflictTitle);
 	});
 
@@ -348,7 +334,12 @@ describe("RevertScopeConfirmModal evidence gating", () => {
 		expect(button(props.confirmWithRevertLabel).disabled).toBe(false);
 		expect(document.body.textContent).toContain(en.rollbackConfirmFiles);
 		await click(button(props.confirmWithRevertLabel));
-		expect(confirmations).toEqual([{ skipRevert: false, scope: "narrator" }]);
+		expect(confirmations).toEqual([
+			{
+				skipRevert: false,
+				revertPlan: { planId: "plan-1", planHash: "hash-plan-1", action: "rollback_to_block" },
+			},
+		]);
 	});
 
 	for (const reason of [undefined, "nothing_owned"] as const) {
@@ -362,7 +353,12 @@ describe("RevertScopeConfirmModal evidence gating", () => {
 				reason ? en.revertScopeNothingOwned : en.rollbackConfirmNoFiles,
 			);
 			await click(button(props.confirmNoFilesLabel));
-			expect(confirmations).toEqual([{ skipRevert: false, scope: "narrator" }]);
+			expect(confirmations).toEqual([
+				{
+					skipRevert: false,
+					revertPlan: { planId: "plan-1", planHash: "hash-plan-1", action: "rollback_to_block" },
+				},
+			]);
 		});
 	}
 
@@ -376,103 +372,13 @@ describe("RevertScopeConfirmModal evidence gating", () => {
 	});
 });
 
-describe("RevertScopeConfirmModal explicit workspace consent", () => {
-	test("an unavailable narrator and a workspace recommendation do not widen the selection", async () => {
-		await render({ data: workspaceOnlyPreview() });
-		assertUnavailable();
-		expect(scopeRadio("narrator").checked).toBe(true);
-		expect(scopeRadio("narrator").disabled).toBe(true);
-		expect(scopeRadio("workspace").checked).toBe(false);
-		expect(document.body.textContent).toContain(en.revertScopeWorkspaceExplicit);
-		await click(button(en.revertScopeUnavailableTitle));
-		expect(confirmations).toEqual([]);
-
-		await selectScope("workspace");
-		expect(document.body.textContent).toContain(en.revertScopeWorkspaceWarning);
-		expect(document.body.textContent).toContain("/workspace/other.ts");
-		await click(button(props.confirmWithRevertLabel));
-		expect(confirmations).toEqual([{ skipRevert: false, scope: "workspace" }]);
-	});
-
-	test("an unavailable workspace cannot be selected even if recommended", async () => {
-		await render({
-			data: workspaceOnlyPreviewWithUnavailableWorkspace(),
-		});
-		assertUnavailable();
-		expect(scopeRadio("workspace").disabled).toBe(true);
-		await click(scopeRadio("workspace"));
-		assertUnavailable();
-	});
-
-	test("the selected workspace becoming unavailable blocks confirmation immediately", async () => {
-		const data = workspaceOnlyPreview();
-		await render({ data });
-		await selectScope("workspace");
-		if (data.workspaceScope) {
-			data.workspaceScope.available = false;
-			data.workspaceScope.reason = "snapshot_missing";
-		}
-		// Same object to exercise the execution guard independently of consent reset.
-		await render({ data });
-		assertUnavailable();
-		expect(document.body.textContent).toContain(en.revertScopeSnapshotMissing);
-		await click(button(en.revertScopeUnavailableTitle));
-		expect(confirmations).toEqual([]);
-	});
-
-	test("a new preview invalidates workspace consent even if its recommendation is unchanged", async () => {
-		await render({ data: workspaceOnlyPreview() });
-		await selectScope("workspace");
-		await render({ data: workspaceOnlyPreview() });
-		assertUnavailable();
-		expect(scopeRadio("workspace").checked).toBe(false);
-		await selectScope("workspace");
-		await click(button(props.confirmWithRevertLabel));
-		expect(confirmations).toEqual([{ skipRevert: false, scope: "workspace" }]);
-	});
-
-	test("closing and reopening with the same preview requires workspace consent again", async () => {
-		const data = workspaceOnlyPreview();
-		await render({ data });
-		await selectScope("workspace");
-		await render({ opened: false });
-		await render({ opened: true });
-		assertUnavailable();
-		expect(scopeRadio("workspace").checked).toBe(false);
-	});
-
-	test("a loading cycle invalidates an earlier workspace choice", async () => {
-		await render({ data: workspaceOnlyPreview() });
-		await selectScope("workspace");
-		await render({ isLoading: true });
-		assertUnavailable();
-		await render({ isLoading: false });
-		assertUnavailable();
-		expect(scopeRadio("workspace").checked).toBe(false);
-	});
-
-	test("switching back to narrator uses its own file set and confirmation scope", async () => {
-		await render({ data: completePreview() });
-		await selectScope("workspace");
-		expect(document.body.textContent).toContain("/workspace/other.ts");
-		await selectScope("narrator");
-		expect(document.body.textContent).not.toContain("/workspace/other.ts");
-		await click(button(props.confirmWithRevertLabel));
-		expect(confirmations).toEqual([{ skipRevert: false, scope: "narrator" }]);
-	});
+test("legacy scope-only preview cannot authorize a restore", async () => {
+	await render({ data: completePreview({ revertPlan: undefined }) });
+	assertUnavailable();
+	expect(document.body.querySelector("input[type=radio]")).toBeNull();
+	await click(button(en.revertScopeUnavailableTitle));
+	expect(confirmations).toEqual([]);
 });
-
-function workspaceOnlyPreviewWithUnavailableWorkspace(): RevertScopePreviews {
-	return {
-		...workspaceOnlyPreview(),
-		workspaceScope: {
-			available: false,
-			reason: "incomplete_coverage",
-			files: [],
-			warnings: [],
-		},
-	};
-}
 
 function preparedActionPreview(overrides: Partial<RevertActionPlan> = {}): RevertActionPreview {
 	return {
@@ -535,6 +441,9 @@ function normalResponse(request: CapturedRequest): Response {
 			planId: "plan-1",
 			status: "committed",
 			journalStatus: "committed",
+			historyCommitted: true,
+			historyStatus: "complete",
+			files: [],
 			settling: false,
 			reason: null,
 		});
@@ -635,23 +544,21 @@ describe("fixed plan external-write boundary", () => {
 			}
 		});
 
-		test(`${language}: the new boundary notice does not leak into legacy scope dialogs`, async () => {
+		test(`${language}: legacy previews remain read-only`, async () => {
 			await i18n.changeLanguage(language);
-			await render({ data: completePreview() });
+			await render({ data: completePreview({ revertPlan: undefined }) });
 			expect(document.body.textContent).not.toContain(locale.revertPlanExternalWritesWarning);
-			await selectScope("workspace");
-			expect(document.body.textContent).not.toContain(locale.revertPlanExternalWritesWarning);
-			await render({ data: { affectedFiles: completePreview().affectedFiles } });
-			expect(document.body.textContent).not.toContain(locale.revertPlanExternalWritesWarning);
+			expect(document.body.querySelector("input[type=radio]")).toBeNull();
 		});
 
-		test(`${language}: an incomplete plan is not presented as an available review`, async () => {
+		test(`${language}: a prepared partial plan explains that message history is kept`, async () => {
 			await i18n.changeLanguage(language);
 			const data = fixedPreview();
 			if (data.revertPlan) data.revertPlan.coverageComplete = false;
 			await render({ data, previewKey: "opening-1" });
-			assertUnavailable(locale);
-			expect(document.body.textContent).not.toContain(locale.revertPlanExternalWritesWarning);
+			expect(document.body.textContent).toContain(locale.revertPlanIncompleteWarning);
+			expect(document.body.textContent).toContain(locale.revertPlanExternalWritesWarning);
+			expect(button(locale.revertPartialConfirm).disabled).toBe(false);
 		});
 	}
 });
@@ -683,7 +590,7 @@ describe("fixed plan confirmation guards", () => {
 
 	for (const patch of [
 		{ status: "planned" },
-		{ coverageComplete: false },
+		{ coverageComplete: undefined },
 		{ planHash: null },
 		{ expired: true },
 		{ expiresAt: new Date(0).toISOString() },
@@ -830,6 +737,24 @@ describe("fixed action preview HTTP flow", () => {
 			expect(requestsTo("/files")).toHaveLength(1);
 		});
 	}
+
+	test("an unavailable target is shown while other planned files remain actionable", async () => {
+		respond = (request) =>
+			request.url.pathname.endsWith("/files")
+				? filesReply([
+						{
+							...planFile(0),
+							desiredStateJson: { kind: "unknown", reason: "history_unavailable" },
+						},
+						planFile(1),
+					])
+				: request.url.pathname.endsWith("/revert-action-preview")
+					? reply(preparedActionPreview({ coverageComplete: false }))
+					: normalResponse(request);
+		await renderAction();
+		expect(document.body.textContent).toContain(en.revertFileUnavailable);
+		expect(button(en.revertPartialConfirm).disabled).toBe(false);
+	});
 
 	test("the shared file count limit refuses loading an oversized plan", async () => {
 		respond = () =>
@@ -1014,6 +939,9 @@ describe("fixed plan apply and history-only branches", () => {
 						planId: "plan-1",
 						status: "committed",
 						journalStatus: "committed",
+						historyCommitted: true,
+						historyStatus: "complete",
+						files: [],
 						settling: false,
 						reason: "fixture advisory",
 					})
@@ -1130,21 +1058,33 @@ describe("fixed plan apply and history-only branches", () => {
 	}
 
 	for (const [status, explanation] of [
-		["compensated", en.revertPlanCompensated],
-		["recovery_required", en.revertPlanRecoveryRequired],
+		["partial", en.revertPlanPartial],
+		["cancelled", en.revertPlanCancelled],
 		["settling", en.revertPlanSettling],
 		["runtime_reload_required", en.revertScopeRuntimeReloadRequired],
 	]) {
 		test(`${status} is not reported as successful and never retries apply or preview`, async () => {
 			execute = true;
+			for (const resource of ["messages", "file-tree-status", "tool-calls"])
+				queryClient.setQueryData(["narrators", "narrator-test", resource], {});
 			respond = (request) =>
 				request.url.pathname.endsWith("/apply")
 					? reply(
 							{
 								planId: "plan-1",
-								status: status === "settling" ? "recovery_required" : status,
+								status: status === "settling" ? "executing" : status,
 								journalStatus: status === "settling" ? "applying" : status,
 								settling: status === "settling",
+								historyCommitted: false,
+								historyStatus: "complete",
+								files: [
+									{ deviceId: "local", filePath: "done.txt", status: "applied" },
+									{
+										deviceId: "local",
+										filePath: "pending.txt",
+										status: status === "settling" ? "unknown" : "not_attempted",
+									},
+								],
 								reason: "fixture journal reason",
 								code:
 									status === "runtime_reload_required"
@@ -1161,6 +1101,18 @@ describe("fixed plan apply and history-only branches", () => {
 			expect(requestsTo("/apply")).toHaveLength(1);
 			expect(requestsTo("/revert-action-preview")).toHaveLength(1);
 			expect(notificationsStore.getState().notifications.at(-1)?.message).toContain(explanation);
+			if (status !== "runtime_reload_required") {
+				expect(notificationsStore.getState().notifications.at(-1)?.message).toContain(
+					"1 file(s): Restored",
+				);
+				expect(notificationsStore.getState().notifications.at(-1)?.message).toContain(
+					"pending.txt",
+				);
+			}
+			for (const resource of ["messages", "file-tree-status", "tool-calls"])
+				expect(
+					queryClient.getQueryState(["narrators", "narrator-test", resource])?.isInvalidated,
+				).toBe(true);
 			expect(notificationsStore.getState().notifications.at(-1)?.message).toContain(
 				"fixture journal reason",
 			);
@@ -1204,6 +1156,9 @@ function snapshotResponse(request: CapturedRequest): Response {
 			planId: request.url.pathname.split("/").at(-2),
 			status: "committed",
 			journalStatus: "committed",
+			historyCommitted: true,
+			historyStatus: "complete",
+			files: [],
 			settling: false,
 			reason: null,
 		});
@@ -1243,6 +1198,36 @@ describe("explicit historical snapshot recovery", () => {
 			});
 		}
 	}
+
+	test("an existing partial conflict plan can request a separately confirmed snapshot", async () => {
+		respond = (request) => {
+			if (
+				request.url.pathname.endsWith("/revert-action-preview") &&
+				request.body?.recoveryMode !== "snapshot"
+			)
+				return reply({
+					...preparedActionPreview({ coverageComplete: false }),
+					diagnostics: [
+						{
+							code: "FILE_UNAVAILABLE",
+							reason: "content_changed",
+							filePath: "/workspace/file-0.ts",
+						},
+					],
+				});
+			return snapshotResponse(request);
+		};
+		execute = true;
+		await renderAction();
+		expect(document.body.textContent).toContain(en.revertPlanIncompleteWarning);
+		expect(button(en.revertSnapshotRequest).disabled).toBe(false);
+		await click(button(en.revertSnapshotRequest));
+		expect(requestsTo("/revert-action-preview")[1]?.body?.recoveryMode).toBe("snapshot");
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(true);
+		await acceptSnapshot();
+		await click(button(en.revertSnapshotConfirm));
+		expect(requestsTo("/apply")[0]?.body?.acceptSnapshotRestore).toBe(true);
+	});
 
 	test("snapshot request has a separate key; consent gates apply and forwards only true", async () => {
 		respond = snapshotResponse;

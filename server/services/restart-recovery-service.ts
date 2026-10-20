@@ -1,14 +1,15 @@
 import { closeSync, openSync, readSync } from "node:fs";
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { and, asc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
-import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import { backgroundTasks, narrators, narratorToolCalls } from "../db/schema";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
-import { isSubagentVariant, parseSubstatus } from "../lib/narrator-utils";
+import { parseSubstatus } from "../lib/narrator-utils";
+import type { RunDeliverTo } from "../lib/validators/runtime-registration";
 import { narratorPersistence } from "./narrator-persistence";
 import {
 	getRecoverySource,
@@ -161,23 +162,36 @@ async function removeManifest(epoch: string): Promise<void> {
 	manifestIdentities.delete(epoch);
 }
 
-async function loadActiveRows() {
+/**
+ * Where the row's current run delivers its result, if anywhere: the one rule for
+ * "this session is delegated" (`runDeliverToOf`), never its type or variant.
+ */
+async function deliverToOf(narratorId: string): Promise<RunDeliverTo | undefined> {
+	const { readSessionDeliverTo } = await import("./narrator-session");
+	return readSessionDeliverTo(narratorId);
+}
+
+async function withDeliverTo<T extends { id: string }>(
+	rows: T[],
+): Promise<Array<T & { deliverTo?: RunDeliverTo }>> {
+	const out: Array<T & { deliverTo?: RunDeliverTo }> = [];
+	for (const row of rows) out.push({ ...row, deliverTo: await deliverToOf(row.id) });
+	return out;
+}
+
+async function loadActiveRows(includeTerminalCandidates = false) {
 	const rows = await db.query.narrators.findMany({
 		where: inArray(narrators.status, ["working", "waiting"]),
 		columns: {
 			id: true,
 			status: true,
 			substatus: true,
-			variant: true,
-			type: true,
 			logicalRunId: true,
-			parentNarratorId: true,
-			originToolCallId: true,
 		},
 		limit: MAX_TARGETS + 1,
 	});
 	if (rows.length > MAX_TARGETS) throw new Error("Too many active restart recovery targets");
-	return rows.filter(restartEligible);
+	return includeTerminalCandidates ? rows : rows.filter(restartEligible);
 }
 
 async function loadRetainedRestartRows(previous: RestartManifest | null) {
@@ -202,11 +216,7 @@ async function loadRetainedRestartRows(previous: RestartManifest | null) {
 			id: true,
 			status: true,
 			substatus: true,
-			variant: true,
-			type: true,
 			logicalRunId: true,
-			parentNarratorId: true,
-			originToolCallId: true,
 		},
 		limit: MAX_TARGETS + 1,
 	});
@@ -275,6 +285,71 @@ export function mergeStartupProtection(
 	};
 }
 
+/** A restored user hold protects facts, not permission to automatically execute them. */
+export async function protectHeldRunFacts(
+	protection: ToolContinuationProtectionSets,
+): Promise<Set<string>> {
+	const { hydrateRunHolds } = await import("./agent-runtime/run");
+	const held = await hydrateRunHolds();
+	for (const id of held) {
+		protection.narratorIds.add(id);
+		for (let after = ""; ; ) {
+			const calls = await db
+				.select({ id: narratorToolCalls.id })
+				.from(narratorToolCalls)
+				.where(
+					and(
+						eq(narratorToolCalls.narratorId, id),
+						gt(narratorToolCalls.id, after),
+						inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
+					),
+				)
+				.orderBy(asc(narratorToolCalls.id))
+				.limit(100);
+			for (const call of calls) protection.toolCallIds.add(call.id);
+			if (calls.length < 100) break;
+			after = calls[calls.length - 1].id;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		for (let after = ""; ; ) {
+			const tasks = await db
+				.select({ id: backgroundTasks.id })
+				.from(backgroundTasks)
+				.where(
+					and(
+						gt(backgroundTasks.id, after),
+						eq(backgroundTasks.status, "running"),
+						or(
+							eq(backgroundTasks.subagentNarratorId, id),
+							eq(backgroundTasks.id, id),
+							eq(backgroundTasks.parentNarratorId, id),
+						),
+					),
+				)
+				.orderBy(asc(backgroundTasks.id))
+				.limit(100);
+			for (const task of tasks) protection.backgroundTaskIds.add(task.id);
+			if (tasks.length < 100) break;
+			after = tasks[tasks.length - 1].id;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		const deliverTo = await deliverToOf(id);
+		if (deliverTo) {
+			const call = await db.query.narratorToolCalls.findFirst({
+				where: deliverTo.toolCallId
+					? eq(narratorToolCalls.id, deliverTo.toolCallId)
+					: and(
+							eq(narratorToolCalls.narratorId, deliverTo.narratorId),
+							eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
+						),
+				columns: { id: true },
+			});
+			if (call) protection.toolCallIds.add(call.id);
+		}
+	}
+	return held;
+}
+
 /** Runs under the database instance lock, before generic startup cleanup touches any rows. */
 export async function prepareOrdinaryRestartRecovery(
 	plannedProtection: ToolContinuationProtectionSets,
@@ -286,6 +361,7 @@ export async function prepareOrdinaryRestartRecovery(
 	};
 	if (processState.prepared) return empty; // Hot reload must not mount duplicate runtimes.
 	processState.prepared = true;
+	const held = await protectHeldRunFacts(empty.protection);
 	const saved = await readManifest();
 	// A v3 planned root already owns this source; never load the ordinary file a second time.
 	const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
@@ -300,20 +376,20 @@ export async function prepareOrdinaryRestartRecovery(
 					.map((record) => record.narratorId)
 			: [],
 	);
-	const active = await loadActiveRows();
+	const active = await loadActiveRows(true);
 	for (const row of await loadRetainedRestartRows(previous)) {
 		if (!active.some((entry) => entry.id === row.id)) active.push(row);
 	}
 	if (active.length > MAX_TARGETS) throw new Error("Too many restart recovery targets");
-	const rows = active.filter((row) => !plannedProtection.narratorIds.has(row.id));
-	const children = [] as typeof rows;
-	for (const row of rows) {
-		if (row.type !== "subagent" && !isSubagentVariant(row.variant)) continue;
-		const origin = row.originToolCallId
-			? await toolContinuationService.getByToolCallId(row.originToolCallId)
+	const candidates = [] as Awaited<ReturnType<typeof withDeliverTo<(typeof active)[number]>>>;
+	for (const row of await withDeliverTo(
+		active.filter((row) => !plannedProtection.narratorIds.has(row.id) && !held.has(row.id)),
+	)) {
+		const origin = row.deliverTo?.toolCallId
+			? await toolContinuationService.getByToolCallId(row.deliverTo.toolCallId)
 			: null;
 		// A dead process can leave an active status behind after a durable cancellation/delivery.
-		// It is not new ordinary authorization for that same child run.
+		// It is not new ordinary authorization for that same delivering run.
 		if (
 			origin &&
 			isToolContinuationOwnerMounted(origin) &&
@@ -322,18 +398,69 @@ export async function prepareOrdinaryRestartRecovery(
 			origin.payloadJson?.logicalRunId === row.logicalRunId
 		)
 			continue;
-		children.push(row);
+		candidates.push(row);
 	}
+	const { getRuntimePublicationService } = await import("./agent-runtime/publication");
+	const publication = getRuntimePublicationService();
+	const rows: typeof candidates = [];
+	for (const row of candidates) {
+		const result =
+			row.logicalRunId && row.deliverTo
+				? await publication.readAgentTerminalResult(
+						{
+							producerKind: "agent",
+							taskId: row.id,
+							logicalRunId: row.logicalRunId,
+							recipientId: row.deliverTo.narratorId,
+						},
+						{ includeEventKind: true },
+					)
+				: null;
+		if (!result) {
+			// Idle rows entered this set only through the verified retained manifest.
+			if (restartEligible(row) || row.status === "idle") rows.push(row);
+			continue;
+		}
+		// A crash after the terminal transaction but before idle needs delivery only.
+		// The durable snapshot/intent is authoritative; never execute the model again.
+		await db
+			.update(narrators)
+			.set({
+				status: "idle",
+				substatus: JSON.stringify([
+					result.eventKind === "failed"
+						? "error"
+						: result.eventKind === "timed_out"
+							? "timeout"
+							: result.eventKind === "cancelled"
+								? "interrupted"
+								: "unread",
+				]),
+			})
+			.where(and(eq(narrators.id, row.id), eq(narrators.logicalRunId, row.logicalRunId as string)));
+		publication.schedule();
+		// A foreground caller may have crashed before saving its tool result. Preserve
+		// its continuation; run.ts observes this committed snapshot before any model pass.
+		if (row.deliverTo?.toolCallId) {
+			const call = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, row.deliverTo.toolCallId),
+				columns: { status: true },
+			});
+			if (call && call.status !== "success" && call.status !== "fail") rows.push(row);
+		}
+	}
+	// A run that delivers its result is resumed; the session it delivers to (and so on
+	// up) is selected too, because it waits for that result exactly once.
+	const delegated = rows.filter((row) => row.deliverTo);
 	const selectedIds = new Set([
-		...children.map((row) => row.id),
+		...delegated.map((row) => row.id),
 		...rows.filter((row) => unfinishedOwners.has(row.id)).map((row) => row.id),
 	]);
-	// A parent waiting for a foreground Agent is required to settle that Agent result once.
-	for (const child of children) {
-		let parent = rows.find((row) => row.id === child.parentNarratorId);
-		while (parent && !selectedIds.has(parent.id)) {
-			selectedIds.add(parent.id);
-			parent = rows.find((row) => row.id === parent?.parentNarratorId);
+	for (const row of delegated) {
+		let caller = rows.find((entry) => entry.id === row.deliverTo?.narratorId);
+		while (caller && !selectedIds.has(caller.id)) {
+			selectedIds.add(caller.id);
+			caller = rows.find((entry) => entry.id === caller?.deliverTo?.narratorId);
 		}
 	}
 	if (!selectedIds.size) {
@@ -380,25 +507,14 @@ export async function prepareOrdinaryRestartRecovery(
 	for (const id of selectedIds) protection.narratorIds.add(id);
 
 	const representedChildren = new Set<string>();
-	for (const child of children) {
-		const legacyOrigin =
-			!child.originToolCallId && child.parentNarratorId
-				? await db.query.narratorMessages.findFirst({
-						where: and(
-							eq(narratorMessages.narratorId, child.id),
-							isNotNull(narratorMessages.parentToolUseId),
-						),
-						columns: { parentToolUseId: true },
-						orderBy: [asc(narratorMessages.createdAt)],
-					})
-				: null;
-		if (!child.originToolCallId && !legacyOrigin?.parentToolUseId) continue;
+	for (const child of delegated) {
+		const deliverTo = child.deliverTo as RunDeliverTo;
 		const call = await db.query.narratorToolCalls.findFirst({
-			where: child.originToolCallId
-				? eq(narratorToolCalls.id, child.originToolCallId)
+			where: deliverTo.toolCallId
+				? eq(narratorToolCalls.id, deliverTo.toolCallId)
 				: and(
-						eq(narratorToolCalls.narratorId, child.parentNarratorId as string),
-						eq(narratorToolCalls.toolUseId, legacyOrigin?.parentToolUseId as string),
+						eq(narratorToolCalls.narratorId, deliverTo.narratorId),
+						eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
 					),
 			columns: { id: true, narratorId: true, status: true },
 		});
@@ -507,7 +623,7 @@ export async function prepareOrdinaryRestartRecovery(
 			.map((record) => record.narratorId),
 	);
 	for (const row of selected) {
-		if (row.type !== "subagent" && !isSubagentVariant(row.variant) && !queuedOwners.has(row.id)) {
+		if (!row.deliverTo && !queuedOwners.has(row.id)) {
 			protection.narratorIds.delete(row.id);
 		}
 	}
@@ -523,7 +639,7 @@ export async function prepareOrdinaryRestartRecovery(
 		processState.pausedRecovery = prepared;
 		// A disabled recovery has no runtime owner: show an honest interrupted/resting state,
 		// while keeping permission/tool records protected and available for a manual resume.
-		return { manifest, protection: { ...protection, narratorIds: new Set<string>() } };
+		return { manifest, protection: { ...protection, narratorIds: held } };
 	}
 	return prepared;
 }
@@ -616,7 +732,7 @@ export async function restoreCarriedOrdinaryTargets(
 	driven: ReadonlySet<string>,
 	includedNarratorIds?: ReadonlySet<string>,
 ): Promise<void> {
-	const { resumeSubagent } = await import("./subagent-resume");
+	const { continueNarrator } = await import("./narrator-session");
 	const failures: string[] = [];
 	for (const target of source.logicalRuns ?? []) {
 		if (
@@ -630,49 +746,27 @@ export async function restoreCarriedOrdinaryTargets(
 				if (!current?.pendingNarratorIds.includes(target.narratorId)) return;
 				const row = await db.query.narrators.findFirst({
 					where: eq(narrators.id, target.narratorId),
-					columns: {
-						id: true,
-						variant: true,
-						type: true,
-						logicalRunId: true,
-						status: true,
-						substatus: true,
-					},
+					columns: { id: true, logicalRunId: true, status: true, substatus: true },
 				});
 				const valid =
 					row &&
 					row.logicalRunId === target.logicalRunId &&
-					(row.type === "subagent" || isSubagentVariant(row.variant)) &&
+					!!(await deliverToOf(row.id)) &&
 					(restartEligible(row) ||
 						(row.status === "idle" &&
 							parseSubstatus(row.substatus).includes("interrupted") &&
 							!parseSubstatus(row.substatus).some((tag) =>
-								["error", "taken_over", "manual_override", "cancelled"].includes(tag),
+								["error", "taken_over", "cancelled"].includes(tag),
 							)));
 				if (valid) {
-					const background = await db.query.backgroundTasks.findFirst({
-						where: and(
-							eq(backgroundTasks.type, "agent"),
-							eq(backgroundTasks.status, "running"),
-							eq(backgroundTasks.subagentNarratorId, row.id),
-							row.logicalRunId
-								? eq(backgroundTasks.logicalRunId, row.logicalRunId)
-								: isNull(backgroundTasks.logicalRunId),
-						),
-						columns: { id: true },
+					// The same persisted run continues (deadline kept); its result was already
+					// owed through its own task/tool call, so recovery does not deliver it again.
+					const resumed = await continueNarrator(row.id, "en", false, undefined, {
+						resumeRunId: row.logicalRunId ?? undefined,
+						recovered: true,
+						deliver: false,
 					});
-					const resumed = await resumeSubagent({
-						subagentId: row.id,
-						intent: "continue_tool_results",
-						actor: "parent_agent",
-						locale: "en",
-						resumeLogicalRunId: row.logicalRunId ?? undefined,
-						allowRunningRestart: true,
-						skipStaleAttach: true,
-						skipConclusionDelivery: true,
-						preserveBackground: Boolean(background),
-					});
-					if (!resumed.started) throw new Error("Standalone child recovery did not start");
+					if (!resumed.ok) throw new Error("Standalone delivering run recovery did not start");
 				}
 				const original = getRegisteredRecoverySource(source.updateEpoch);
 				if (original)
@@ -746,18 +840,15 @@ export async function manuallyResumeRestartRecovery(narratorId: string): Promise
 	const prepared = processState.pausedRecovery;
 	if (!prepared?.manifest?.targets.some((target) => target.narratorId === narratorId)) return false;
 	const ids = new Set([narratorId]);
-	const rows = await db.query.narrators.findMany({
-		where: inArray(
-			narrators.id,
-			prepared.manifest.targets.map((target) => target.narratorId),
-		),
-		columns: { id: true, parentNarratorId: true },
-		limit: MAX_TARGETS + 1,
-	});
+	const rows = await withDeliverTo(
+		prepared.manifest.targets.slice(0, MAX_TARGETS).map((target) => ({ id: target.narratorId })),
+	);
+	// The chosen session plus every run that (transitively) delivers to it.
 	for (let changed = true; changed; ) {
 		changed = false;
 		for (const row of rows) {
-			if (row.parentNarratorId && ids.has(row.parentNarratorId) && !ids.has(row.id)) {
+			const caller = row.deliverTo?.narratorId;
+			if (caller && ids.has(caller) && !ids.has(row.id)) {
 				ids.add(row.id);
 				changed = true;
 			}

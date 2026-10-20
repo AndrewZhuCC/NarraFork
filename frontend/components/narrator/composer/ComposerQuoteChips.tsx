@@ -1,3 +1,4 @@
+import { Z } from "@frontend/lib/z-index";
 import {
 	ActionIcon,
 	Box,
@@ -54,6 +55,7 @@ function ChipLabel({ children }: { children: ReactNode }) {
 export function QuoteChip({
 	label,
 	comment,
+	compactComment = false,
 	file = false,
 	onOpen,
 	onComment,
@@ -65,6 +67,7 @@ export function QuoteChip({
 }: {
 	label: string;
 	comment?: string;
+	compactComment?: boolean;
 	file?: boolean;
 	onOpen?: (event: MouseEvent<HTMLButtonElement>) => void;
 	onComment?: (event: MouseEvent<HTMLButtonElement>) => void;
@@ -126,7 +129,7 @@ export function QuoteChip({
 					}}
 				>
 					<IconMessageCircle size={13} style={{ flexShrink: 0 }} />
-					{comment && <ChipLabel>{comment}</ChipLabel>}
+					{comment && !compactComment && <ChipLabel>{comment}</ChipLabel>}
 				</UnstyledButton>
 			)}
 			{onRemove && (
@@ -178,6 +181,7 @@ export function ComposerQuoteComment({
 			hideDetached={false}
 			middlewares={{ flip: false, shift: { padding: 12, crossAxis: true, limiter: undefined } }}
 			width="min(420px, calc(100vw - 24px))"
+			zIndex={Z.dropdown}
 			withinPortal
 			withArrow
 			shadow="md"

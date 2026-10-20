@@ -146,12 +146,13 @@
 	color: var(--mantine-color-text);
 	box-sizing: border-box;
 	user-select: none;
-	max-width: min(240px, calc(100% - 5px));
-	margin-inline: 2px;
+	/* Keep a tappable row-end gap even when a chip fills a narrow screen. */
+	max-width: min(240px, calc(100% - 32px));
+	margin-inline: 4px;
 }
 
 .atom[data-has-comment] {
-	max-width: min(380px, calc(100% - 5px));
+	max-width: min(380px, calc(100% - 32px));
 }
 
 .chip {
@@ -161,6 +162,7 @@
 	padding-inline: 4px 2px;
 	gap: 3px;
 	font-size: var(--mantine-font-size-xs);
+	line-height: 18px;
 }
 
 .selected {
@@ -173,7 +175,9 @@
 	align-items: center;
 	gap: 4px;
 	padding: 0;
+	height: 100%;
 	min-width: 0;
+	flex: 1 1 auto;
 	border: 0;
 	background: transparent;
 	font: inherit;
@@ -303,40 +307,18 @@
 }
 
 .candidate {
-	margin-inline: 2px;
-	min-width: 0;
-	display: inline-flex;
-	align-items: center;
-	vertical-align: bottom;
-	height: var(--composer-chip-height);
-	box-sizing: border-box;
-	gap: 4px;
-	/* Leave room for both margins and ProseMirror's trailing caret separator. */
-	max-width: min(260px, calc(100% - 5px));
-	padding-inline: 4px 2px;
-	border: 1px dashed var(--mantine-primary-color-filled);
-	border-radius: var(--mantine-radius-sm);
-	background: var(--mantine-color-default-hover);
-	color: var(--mantine-color-text);
-	font: var(--mantine-font-size-xs) var(--mantine-font-family);
+	gap: 3px;
+	/* Same 32px row-end reserve as .atom keeps the row end tappable on narrow screens. */
+	max-width: min(260px, calc(100% - 32px));
+	border-style: dashed;
+	border-color: var(--mantine-primary-color-filled);
 	white-space: nowrap;
-	user-select: none;
 }
 
 .candidateAccept {
-	display: inline-flex;
-	align-items: center;
-	gap: 5px;
-	min-width: 0;
 	max-width: 100%;
-	border: 0;
-	background: transparent;
-	color: inherit;
-	font: inherit;
-	cursor: pointer;
 }
 
-.candidateAction,
 .candidateAccept > svg {
 	flex-shrink: 0;
 }
@@ -349,16 +331,15 @@
 	gap: 3px;
 	height: 18px;
 	box-sizing: border-box;
-	padding-inline: 4px;
+	padding: 0 4px;
 	border: 1px solid var(--mantine-color-dimmed);
-	border-bottom-width: 2px;
 	border-radius: 4px;
 	background: var(--mantine-color-body);
 	color: var(--mantine-color-text);
 	font-family: var(--mantine-font-family-monospace);
 	font-size: 10px;
 	font-weight: 600;
-	line-height: 1;
+	line-height: 14px;
 }
 
 .candidateAccept:disabled {

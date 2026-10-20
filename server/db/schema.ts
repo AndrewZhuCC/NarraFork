@@ -938,6 +938,29 @@ export const narrators = sqliteTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): any => narrators.id, {
 			onDelete: "set null",
 		}),
+		/**
+		 * Bounded runtime relationships of this narrator: policy source, controller
+		 * grant and the current run binding (cancel source, result delivery, principal,
+		 * deadline, history boundary). Facts only — capabilities live in traits and
+		 * model/permission settings in their own columns. Validated by
+		 * `lib/validators/runtime-registration.ts`; null = nothing registered.
+		 */
+		runtimeRegistrationJson: text("runtime_registration_json", { mode: "json" }).$type<
+			import("../lib/validators/runtime-registration").RuntimeRegistration
+		>(),
+		/**
+		 * Session this narrator takes its capability ceiling, execution rules, permission
+		 * mode updates and followed model from. Any narrator may be a source; no parent/
+		 * child relationship is implied. A column (not part of the registration JSON) so
+		 * dependents are an index lookup. Removing a source first freezes its effective
+		 * ceiling into each dependent's traits (`narratorService.remove`), so the SET NULL
+		 * never widens a dependent.
+		 */
+		policySourceNarratorId: text("policy_source_narrator_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: self-module forward reference
+			(): any => narrators.id,
+			{ onDelete: "set null" },
+		),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -975,6 +998,8 @@ export const narrators = sqliteTable(
 		// Join key for the subagent -> root delegation in the readable predicate, and the
 		// FK covering index for root deletion (ON DELETE SET NULL).
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
+		// Dependents of a policy source (permission-mode propagation, deletion guard).
+		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
@@ -2882,6 +2907,15 @@ export const narratorDrafts = sqliteTable(
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
+		/**
+		 * Snapshot of the version overwritten by the latest write (single undo slot).
+		 *
+		 * Drafts are a per-user resource, so writes are last-writer-wins instead of
+		 * CAS-rejected; this JSON blob (`{text,fileReferencesJson,composerDocument,
+		 * revision,updatedAt}`) is the only safety net, letting the user restore the
+		 * version their other tab/device just replaced.
+		 */
+		previousJson: text("previous_json"),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_drafts_user_narrator").on(table.userId, table.narratorId),
@@ -4376,6 +4410,7 @@ export const fileChangeStorageBudgets = sqliteTable(
 		status: text("status", { enum: ["unverified", "reconciling", "ready"] })
 			.notNull()
 			.default("unverified"),
+		/** 64-bit aggregate byte totals; PostgreSQL emits these as bigint(number). */
 		usedBytes: integer("used_bytes").notNull().default(0),
 		reservedBytes: integer("reserved_bytes").notNull().default(0),
 		quotaBytes: integer("quota_bytes").notNull(),
@@ -4454,6 +4489,10 @@ export const fileChangeOperations = sqliteTable(
 		/** Nullable only for pre-journal rows, which cannot authorize execution. */
 		requestDigest: text("request_digest"),
 		expectedEffectCount: integer("expected_effect_count"),
+		/** Original editor admission; terminal lease pruning must not delete the operation. */
+		workspaceLeaseId: text("workspace_lease_id"),
+		/** Present only for a new trusted remote raw-v2 save; NULL is never inferred. */
+		editorRawSnapshotRevision: real("editor_raw_snapshot_revision"),
 		preparedEffectCount: integer("prepared_effect_count").notNull().default(0),
 		evidenceBytes: integer("evidence_bytes").notNull().default(0),
 		settledEffectCount: integer("settled_effect_count").notNull().default(0),
@@ -4528,7 +4567,8 @@ export const fileChangeEffects = sqliteTable(
 			.references(() => fileChangeScopes.id),
 		fileKey: text("file_key").notNull(),
 		identityJson: text("identity_json", { mode: "json" }).$type<FileChangeIdentity>().notNull(),
-		scopeRevision: integer("scope_revision").notNull(),
+		/** Historical v2 scope ordering; v3 uses journalSeq and the actual file state. */
+		scopeRevision: integer("scope_revision"),
 		mutationId: text("mutation_id").notNull(),
 		requestDigest: text("request_digest").notNull(),
 		phase: text("phase", { enum: ["apply", "compensate"] }).notNull(),
@@ -4547,6 +4587,8 @@ export const fileChangeEffects = sqliteTable(
 		observedAfterBlobDigest: text("observed_after_blob_digest").references(
 			() => fileChangeBlobs.digest,
 		),
+		/** v3 records the actual IO result independently of historical receipts. */
+		diskOutcome: text("disk_outcome", { enum: ["applied", "not_applied", "unknown"] }),
 		outcome: text("outcome", { enum: ["pending", "no_change", "changed", "unknown"] })
 			.notNull()
 			.default("pending"),
@@ -4580,6 +4622,13 @@ export const fileChangeEffects = sqliteTable(
 		uniqueIndex("idx_fc_effect_mutation").on(table.mutationId),
 		uniqueIndex("idx_fc_effect_operation_file").on(table.operationId, table.fileKey, table.phase),
 		index("idx_fc_effect_file").on(table.scopeId, table.fileKey, table.scopeRevision, table.id),
+		index("idx_fc_effect_journal").on(
+			table.scopeId,
+			table.fileKey,
+			table.journalSeq,
+			table.scopeRevision,
+			table.id,
+		),
 		index("idx_fc_effect_pending").on(table.settlement, table.updatedAt),
 		index("idx_fc_effect_before_blob").on(table.beforeBlobDigest),
 		index("idx_fc_effect_intended_blob").on(table.intendedAfterBlobDigest),
@@ -4655,6 +4704,8 @@ export const revertOperations = sqliteTable(
 				"applying",
 				"files_verified",
 				"committed",
+				"partial",
+				"failed",
 				"compensating",
 				"compensated",
 				"recovery_required",
@@ -4731,14 +4782,19 @@ export const revertOperationFiles = sqliteTable(
 		),
 		applyMutationId: text("apply_mutation_id").notNull(),
 		applyRequestDigest: text("apply_request_digest").notNull(),
-		compensateMutationId: text("compensate_mutation_id").notNull(),
-		compensateRequestDigest: text("compensate_request_digest").notNull(),
+		/** Retained for historical compensation records. New restores record per-file results. */
+		compensateMutationId: text("compensate_mutation_id"),
+		compensateRequestDigest: text("compensate_request_digest"),
 		status: text("status", {
 			enum: [
 				"prepared",
 				"applying",
 				"applied",
 				"verified",
+				"unchanged",
+				"conflict",
+				"failed",
+				"not_attempted",
 				"compensating",
 				"compensated",
 				"unknown",

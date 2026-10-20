@@ -1,820 +1,711 @@
-/**
- * M0 deliberately retires the old v1 success assertions: whole-tree boundaries and
- * declared paths are not operation-content evidence. These tests keep real capture
- * hooks and mutations, but require rejection before either files or history move.
- * In particular, no helper clears the session tree cache after a foreign write.
- */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
+import { testEnvironment } from "../../tests/preload";
+import { app } from "../app";
 import { db } from "../db";
-import {
-	fileAttributions,
-	fileChangeOperations,
-	narratorMessageRefs,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-} from "../db/schema";
-import { localPathSemantics } from "../lib/agent/execution/path-semantics";
+import * as schema from "../db/schema";
+import { localBackend } from "../lib/agent/execution/local-backend";
+import { writeTool } from "../lib/agent/tools/write";
+import type { ToolExecutionTarget } from "../lib/agent/types";
+import { createToken } from "../lib/auth";
 import { generateId } from "../lib/id";
-import { safeSpawn } from "../lib/spawn";
+import { settings } from "../lib/settings";
+import * as narratorWs from "../websocket/narrator-ws";
+import { getDefaultLocalFileChangeRuntime } from "./file-change-runtime";
+import * as scopedRevert from "./narrator-scoped-revert";
 import {
-	dedupeBoundaryRows,
 	previewNarratorScopedForMessages,
 	previewNarratorScopedForToolUses,
-	previewNarratorScopedFromSeq,
 	revertNarratorScopedForMessages,
 	revertNarratorScopedForToolUses,
-	revertNarratorScopedFromSeq,
-	type ScopedRevertUnavailableReason,
+	revertPrincipalForUser,
 } from "./narrator-scoped-revert";
 import { narratorService } from "./narrator-service";
-import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
-import type { TreeSnapshotSession } from "./narrator-tree-snapshot-hooks";
-import { commitSnapshotRevert, discardSnapshotRevert } from "./snapshot-revert";
-import { buildTreeSnapshotEventHooks } from "./tree-snapshot-loop-hooks";
-import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import * as session from "./narrator-session";
+import { editAndRegenerate, rollbackToBlock } from "./narrator-session";
+import { hasNarratorAdmissionWork } from "./narrator-session-state";
+import * as access from "./revert-planner-local-access";
+import type { RevertTransactionOutcome } from "./revert-transaction-service";
+import { emptyRevertResult, SnapshotRevertError } from "./snapshot-revert";
 
-const ids: string[] = [];
-const dirs: string[] = [];
+let cwd: string;
+let narratorId: string;
+let userId: string;
+let seq: number;
+const now = () => new Date().toISOString();
+const options = () => ({ principal: { userId, isAdmin: false } });
 
-async function fixture() {
-	const repo = mkdtempSync(join(tmpdir(), "nf-scoped-m0-"));
-	dirs.push(repo);
-	const initialized = await safeSpawn({ cmd: ["git", "init"], cwd: repo, timeout: 2_000 });
-	expect(initialized.exitCode).toBe(0);
-	const narratorId = generateId();
-	const now = new Date().toISOString();
-	await db.insert(narrators).values({ id: narratorId, cwd: repo, createdAt: now, updatedAt: now });
-	ids.push(narratorId);
-	const session: TreeSnapshotSession = { cwd: repo };
-	return { repo, narratorId, session };
-}
-
-type Fixture = Awaited<ReturnType<typeof fixture>>;
-type CallOptions = {
-	seq?: number;
-	toolName?: string;
-	input?: Record<string, unknown>;
-	status?: "success" | "fail" | "running" | "pending" | "initializing";
-	capture?: "both" | "before" | "none";
-	recordOperation?: boolean;
-	isBackground?: boolean;
-	executionDeviceId?: string;
-	resolvedFilePath?: string;
-	messageId?: string;
-};
-
-async function call(f: Fixture, mutate: () => void | Promise<void>, opts: CallOptions = {}) {
-	const messageId = opts.messageId ?? generateId();
-	const toolUseId = generateId();
-	const toolName = opts.toolName ?? "Write";
-	const input = opts.input ?? { file_path: join(f.repo, "a.txt"), content: "changed\n" };
-	const createdAt = new Date().toISOString();
-	if (!opts.messageId) {
-		await db.insert(narratorMessages).values({
-			id: messageId,
-			narratorId: f.narratorId,
-			role: "assistant",
-			contentJson: [{ type: "tool_use", id: toolUseId, name: toolName, input }],
-			createdAt,
-		});
-		await db.insert(narratorMessageRefs).values({
-			id: generateId(),
-			narratorId: f.narratorId,
-			messageId,
-			seq: opts.seq ?? 1,
-		});
-	}
-	const hooks = buildTreeSnapshotEventHooks({
-		session: f.session,
-		narratorId: f.narratorId,
-		isInGitRepo: true,
-	});
-	// The production event handler captures before inserting the tool-call row.
-	if (opts.capture !== "none") await hooks.onSnapshotBefore?.(toolUseId, toolName, input);
-	const toolCallId = generateId();
-	const operationId = opts.recordOperation ? generateId() : null;
-	if (operationId) {
-		// A real FK-bound pointer, deliberately WITHOUT settled/complete evidence.
-		// The diagnostic must not treat its existence as permission to revert.
-		await db.insert(fileChangeOperations).values({
-			id: operationId,
-			sourceInstanceId: "test-installation",
-			sourceKind: "tool",
-			sourceId: toolCallId,
-			attempt: 1,
-			narratorId: f.narratorId,
-			actorSubjectKey: `primary:${f.narratorId}`,
-			actorJson: {
-				kind: "primary",
-				subjectKey: `primary:${f.narratorId}`,
-				narratorId: f.narratorId,
-				userId: null,
-				label: null,
-				deleted: false,
-				parentSubjectKey: null,
-			},
-			startedAt: createdAt,
-			updatedAt: createdAt,
-		});
-	}
-	await db.insert(narratorToolCalls).values({
-		id: toolCallId,
-		fileChangeOperationId: operationId,
-		narratorId: f.narratorId,
-		messageId,
-		toolUseId,
-		toolName,
-		inputJson: input,
-		status: "running",
-		createdAt,
-		executionDeviceId: opts.executionDeviceId ?? "local",
-		executionCwd: f.repo,
-		executionPathFlavor: localPathSemantics.flavor,
-		resolvedFilePath:
-			opts.resolvedFilePath ?? (typeof input.file_path === "string" ? input.file_path : null),
-		isBackground: opts.isBackground ?? false,
-	});
-	await mutate();
-	await db
-		.update(narratorToolCalls)
-		.set({
-			status: opts.status ?? "success",
-			completedAt:
-				opts.status === "running" || opts.status === "pending" || opts.status === "initializing"
-					? null
-					: new Date().toISOString(),
-		})
-		.where(eq(narratorToolCalls.toolUseId, toolUseId));
-	if (!opts.capture || opts.capture === "both") await hooks.onSnapshotAfter?.(toolUseId, toolName);
-	return { messageId, toolUseId };
-}
-
-async function expectRefused(f: Fixture, reason: ScopedRevertUnavailableReason, minSeq = 1) {
-	const preview = await previewNarratorScopedFromSeq(f.narratorId, minSeq);
-	expect(preview.available).toBe(false);
-	expect(preview.reason).toBe(reason);
-	const result = await revertNarratorScopedFromSeq(f.narratorId, minSeq);
-	expect(result).toMatchObject({ reverted: false, fileCount: 0, files: [] });
-	expect(result?.failures.map((failure) => failure.code)).toEqual(["REVERT_UNAVAILABLE"]);
-	expect(result?.failures[0]?.message).toContain(reason);
-	return result;
-}
-
+beforeEach(async () => {
+	cwd = await mkdtemp(join(testEnvironment.isolatedHome, "scoped-per-file-"));
+	userId = generateId();
+	narratorId = generateId();
+	seq = 0;
+	db.insert(schema.users)
+		.values({ id: userId, username: userId, passwordHash: "test", role: "user", createdAt: now() })
+		.run();
+	db.insert(schema.narrators)
+		.values({ id: narratorId, cwd, ownerUserId: userId, createdAt: now(), updatedAt: now() })
+		.run();
+	settings.chapters.treeSnapshotsEnabled = false;
+});
 afterEach(async () => {
-	for (const id of ids.splice(0).reverse()) {
-		activeNarrators.delete(id);
-		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, id));
-		await db.delete(fileChangeOperations).where(eq(fileChangeOperations.narratorId, id));
-		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
-		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
-		await db.delete(fileAttributions).where(eq(fileAttributions.narratorId, id));
-		await db.delete(narrators).where(eq(narrators.id, id));
-	}
-	for (const dir of dirs.splice(0)) {
-		await worktreeTreeSnapshot.destroy(dir);
-		rmSync(dir, { recursive: true, force: true });
-	}
+	mock.restore();
+	await rm(cwd, { recursive: true, force: true });
 });
 
-describe("M0 complete operation coverage", () => {
-	test("native fixture captures a real tree without hiding initialization errors", async () => {
-		const f = await fixture();
-		writeFileSync(join(f.repo, "a.txt"), "native capture\n");
-		// Unlike the hot-path hook, capture throws the original error. Keep this
-		// cold-start check separate so every M0 case need not scan an extra tree.
-		const tree = await worktreeTreeSnapshot.capture(f.repo);
-		expect(tree).toMatch(/^[a-f0-9]{40}$/);
-		expect(await worktreeTreeSnapshot.readFileAtTree(f.repo, tree, "a.txt")).toBe(
-			"native capture\n",
-		);
-	});
-
-	test.each([
-		"success",
-		"fail",
-		"running",
-		"pending",
-		"initializing",
-	] as const)("does not omit a %s call missing its after boundary from a mixed window", async (status) => {
-		const f = await fixture();
-		writeFileSync(join(f.repo, "a.txt"), "base\n");
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "first\n"));
-		const incomplete = await call(f, () => writeFileSync(join(f.repo, "b.txt"), "partial\n"), {
-			seq: 2,
-			status,
-			capture: "before",
-			input: { file_path: join(f.repo, "b.txt"), content: "partial\n" },
-		});
-		// A historical non-terminal row is not proof that an operation is still alive.
-		await expectRefused(f, "incomplete_coverage");
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("first\n");
-		expect(readFileSync(join(f.repo, "b.txt"), "utf8")).toBe("partial\n");
-		expect(
-			await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.toolUseId, incomplete.toolUseId),
-			}),
-		).toMatchObject({ status });
-	});
-
-	test("a nonzero shell exit cannot erase the write it already made", async () => {
-		const f = await fixture();
-		const windows = process.platform === "win32";
-		const command = windows
-			? ">a.txt (echo partial) & exit /b 7"
-			: "printf 'partial\\n' > a.txt; exit 7";
-		await call(
-			f,
-			async () => {
-				const result = await safeSpawn({
-					cmd: windows
-						? [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", command]
-						: ["sh", "-c", command],
-					cwd: f.repo,
-					timeout: 2_000,
-				});
-				expect(result.exitCode).toBe(7);
-			},
-			{
-				toolName: "Bash",
-				input: { command },
-				status: "fail",
-				capture: "before",
-			},
-		);
-		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			available: true,
-			reason: "nothing_owned",
-		});
-		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			reverted: false,
-			fileCount: 0,
-			failures: [],
-		});
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe(windows ? "partial\r\n" : "partial\n");
-	});
-
-	test("background success and equal trees do not settle a late writer", async () => {
-		const f = await fixture();
-		await call(f, () => {}, {
-			toolName: "Bash",
-			input: { command: "background task", run_in_background: true },
-			isBackground: true,
-		});
-		writeFileSync(join(f.repo, "a.txt"), "written after tool result\n");
-		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			available: true,
-			reason: "nothing_owned",
-		});
-		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			reverted: false,
-			fileCount: 0,
-			failures: [],
-		});
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("written after tool result\n");
-	});
-
-	test("local equal trees cannot prove a cwd-external Write was a no-op", async () => {
-		const f = await fixture();
-		const outside = mkdtempSync(join(tmpdir(), "nf-outside-m0-"));
-		dirs.push(outside);
-		const file = join(outside, "outside.txt");
-		await call(f, () => writeFileSync(file, "outside changed\n"), {
-			input: { file_path: file, content: "outside changed\n" },
-		});
-		await expectRefused(f, "unsupported_target");
-		expect(readFileSync(file, "utf8")).toBe("outside changed\n");
-	});
-
-	test.each([
-		true,
-		false,
-	])("a per-call remote override is not a local no-op (frozen target=%s)", async (frozen) => {
-		const f = await fixture();
-		await call(f, () => {}, {
-			input: { file_path: "/remote/a.txt", device: "remote-device", content: "remote mutation" },
-			executionDeviceId: frozen ? "remote-device" : "local",
-		});
-		await expectRefused(f, "unsupported_target");
-	});
-
-	test("an equal-tree disk Edit still needs actual operation evidence", async () => {
-		const f = await fixture();
-		writeFileSync(join(f.repo, "a.txt"), "unchanged\n");
-		await call(f, () => {}, { toolName: "Edit" });
-		await expectRefused(f, "legacy_unverified");
-	});
-
-	test("only a genuine spec URI is a no-disk no-op, even without tree boundaries", async () => {
-		const f = await fixture();
-		await call(f, () => {}, {
-			input: { file_path: "spec://tasks.json", content: "{}" },
-			capture: "none",
-		});
-		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			reverted: false,
-			fileCount: 0,
-			failures: [],
-		});
-		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			available: true,
-			reason: "nothing_owned",
-		});
-	});
-
-	test("a spec call cannot hide a second disk call without evidence", async () => {
-		const f = await fixture();
-		await call(f, () => {}, { input: { file_path: "spec://tasks.json" }, capture: "none" });
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"), {
-			seq: 2,
-			capture: "none",
-		});
-		await expectRefused(f, "incomplete_coverage");
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
-	});
-
-	test("a read-only call needs no filesystem restore", async () => {
-		const f = await fixture();
-		await call(f, () => {}, { toolName: "Read", capture: "none" });
-		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			failures: [],
-			fileCount: 0,
-		});
-	});
-
-	test("unrecorded history is unavailable, not silently successful", async () => {
-		const f = await fixture();
-		await expectRefused(f, "no_boundaries");
-	});
-
-	test("a system / user injection window has nothing to roll back", async () => {
-		const f = await fixture();
-		const now = new Date().toISOString();
-		for (const [id, role, seq] of [
-			["sys1", "sys", 1],
-			["user1", "user", 2],
-		] as const) {
-			await db.insert(narratorMessages).values({
-				id,
-				narratorId: f.narratorId,
-				role,
-				contentJson: [{ type: "text", text: role }],
-				createdAt: now,
-			});
-			await db.insert(narratorMessageRefs).values({
-				id: generateId(),
-				narratorId: f.narratorId,
-				messageId: id,
-				seq,
-			});
-		}
-		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			reverted: false,
-			fileCount: 0,
-			failures: [],
-		});
-		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			available: true,
-			reason: "nothing_owned",
-		});
-		expect(await revertNarratorScopedForMessages(f.narratorId, ["sys1", "user1"])).toMatchObject({
-			failures: [],
-		});
-	});
-
-	test("system / user cards in a mixed window do not veto file-rollback coverage", async () => {
-		const f = await fixture();
-		writeFileSync(join(f.repo, "a.txt"), "base\n");
-		const write = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"));
-		const now = new Date().toISOString();
-		for (const [id, role, seq] of [
-			["sys-card", "sys", 2],
-			["user-card", "user", 3],
-			["disp-card", "disp", 4],
-		] as const) {
-			await db.insert(narratorMessages).values({
-				id,
-				narratorId: f.narratorId,
-				role,
-				contentJson: [{ type: "system_injection", source: "interrupt_task_guard" }],
-				createdAt: now,
-			});
-			await db.insert(narratorMessageRefs).values({
-				id: generateId(),
-				narratorId: f.narratorId,
-				messageId: id,
-				seq,
-			});
-		}
-		// The write is still legacy; leftover cards must not rewrite that into unknown coverage.
-		await expectRefused(f, "legacy_unverified");
-		expect(
-			(
-				await revertNarratorScopedForMessages(f.narratorId, [
-					write.messageId,
-					"sys-card",
-					"user-card",
-				])
-			).failures[0]?.message,
-		).toContain("legacy_unverified");
-		expect(await previewNarratorScopedFromSeq(f.narratorId, 2)).toMatchObject({
-			available: true,
-			reason: "nothing_owned",
-		});
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
-	});
-
-	test("a leftover window past the operation-row budget is too large, not a no-op", async () => {
-		const f = await fixture();
-		const now = new Date().toISOString();
-		const messages = Array.from({ length: 1001 }, (_, index) => {
-			const seq = index + 1;
-			return {
-				id: `sys-${seq}`,
-				narratorId: f.narratorId,
-				role: "sys" as const,
-				contentJson: [{ type: "text", text: "injection" }],
-				createdAt: now,
-			};
-		});
-		const refs = messages.map((message, index) => ({
-			id: generateId(),
-			narratorId: f.narratorId,
-			messageId: message.id,
-			seq: index + 1,
-		}));
-		for (let i = 0; i < messages.length; i += 50) {
-			await db.insert(narratorMessages).values(messages.slice(i, i + 50));
-			await db.insert(narratorMessageRefs).values(refs.slice(i, i + 50));
-		}
-		await expectRefused(f, "window_too_large");
-	});
-
-	test("content-only assistant and provider-specific injection cards do not add coverage blockers", async () => {
-		const f = await fixture();
-		writeFileSync(join(f.repo, "a.txt"), "base\n");
-		const write = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"));
-		const now = new Date().toISOString();
-		await db.insert(narratorMessages).values([
-			{
-				id: "assistant-gap",
-				narratorId: f.narratorId,
-				role: "assistant",
-				contentJson: [{ type: "text", text: "no recorded calls" }],
-				createdAt: now,
-			},
-			{
-				id: "future-injection",
-				narratorId: f.narratorId,
-				role: "assistant",
-				contentJson: [{ type: "system_injection", source: "future-provider" }],
-				createdAt: now,
-			},
-		]);
-		await db.insert(narratorMessageRefs).values([
-			{ id: generateId(), narratorId: f.narratorId, messageId: "assistant-gap", seq: 2 },
-			{ id: generateId(), narratorId: f.narratorId, messageId: "future-injection", seq: 3 },
-		]);
-		await expectRefused(f, "legacy_unverified");
-		expect(
-			(
-				await revertNarratorScopedForMessages(f.narratorId, [
-					write.messageId,
-					"assistant-gap",
-					"future-injection",
-				])
-			).failures[0]?.message,
-		).toContain("legacy_unverified");
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
-	});
-
-	test("a content-only assistant row is an empty rollback window", async () => {
-		const f = await fixture();
-		const now = new Date().toISOString();
-		await db.insert(narratorMessages).values({
-			id: "a1",
-			narratorId: f.narratorId,
-			role: "assistant",
-			contentJson: [{ type: "text", text: "partial" }],
-			createdAt: now,
-		});
-		await db.insert(narratorMessageRefs).values({
-			id: generateId(),
-			narratorId: f.narratorId,
-			messageId: "a1",
-			seq: 1,
-		});
-		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			available: true,
-			reason: "nothing_owned",
-		});
-		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			reverted: false,
-			fileCount: 0,
-			failures: [],
-		});
-	});
-
-	test("the operation cap includes unsuccessful calls with no hashes", async () => {
-		const f = await fixture();
-		const first = await call(f, () => {}, { toolName: "Read", capture: "none" });
-		for (let index = 0; index < 1_001; index++) {
-			await db.insert(narratorToolCalls).values({
-				id: generateId(),
-				narratorId: f.narratorId,
-				messageId: first.messageId,
-				toolUseId: `missing-${index}`,
-				toolName: "Bash",
-				status: "fail",
-				createdAt: new Date().toISOString(),
-			});
-		}
-		await expectRefused(f, "window_too_large");
-	});
-});
-
-describe("M0 rejects unverified ownership without mutation", () => {
-	test("AI1 -> human same-file hunk -> AI2 preserves all bytes without clearing cache", async () => {
-		const f = await fixture();
-		writeFileSync(join(f.repo, "a.txt"), "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\n");
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "AI1\nB\nC\nD\nE\nF\nG\nH\nI\nJ\n"));
-		expect(f.session._lastTreeHash).toBeTruthy();
-		writeFileSync(join(f.repo, "a.txt"), "AI1\nB\nC\nD\nE\nF\nG\nH\nI\nHUMAN\n");
-		await call(
-			f,
-			() => writeFileSync(join(f.repo, "a.txt"), "AI2\nB\nC\nD\nE\nF\nG\nH\nI\nHUMAN\n"),
-			{ seq: 2 },
-		);
-		await expectRefused(f, "legacy_unverified", 2);
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe(
-			"AI2\nB\nC\nD\nE\nF\nG\nH\nI\nHUMAN\n",
-		);
-	});
-
-	test("chained pairs cannot union declared paths and roll back a neighbour's earlier b", async () => {
-		const f = await fixture();
-		writeFileSync(join(f.repo, "a.txt"), "base a\n");
-		writeFileSync(join(f.repo, "b.txt"), "base b\n");
-		await call(f, () => {
-			writeFileSync(join(f.repo, "a.txt"), "AI a\n");
-			writeFileSync(join(f.repo, "b.txt"), "HUMAN b\n");
-		});
-		await call(f, () => writeFileSync(join(f.repo, "b.txt"), "AI over HUMAN b\n"), {
-			seq: 2,
-			input: { file_path: join(f.repo, "b.txt"), content: "AI over HUMAN b\n" },
-		});
-		await expectRefused(f, "legacy_unverified");
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("AI a\n");
-		expect(readFileSync(join(f.repo, "b.txt"), "utf8")).toBe("AI over HUMAN b\n");
-	});
-
-	test("legacy rejection registers no compensation capable of overwriting later work", async () => {
-		const f = await fixture();
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "AI\n"));
-		const result = await expectRefused(f, "legacy_unverified");
-		if (!result) throw new Error("expected a refusal result");
-		let historyCommitted = false;
-		await expect(
-			commitSnapshotRevert(result, () => {
-				historyCommitted = true;
-			}),
-		).rejects.toThrow("REVERT_UNAVAILABLE");
-		expect(historyCommitted).toBe(false);
-		writeFileSync(join(f.repo, "a.txt"), "later human\n");
-		expect(await discardSnapshotRevert(result)).toEqual([]);
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("later human\n");
-	});
-
-	test.each([
-		true,
-		false,
-	])("an active loop does not mask permanent legacy refusal (same narrator=%s)", async (sameNarrator) => {
-		const f = await fixture();
-		const active = sameNarrator ? f : await fixture();
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "AI\n"));
-		// A live loop may just be thinking/reading. Even a real writer does not
-		// make waiting sufficient to turn legacy evidence into an executable plan.
-		activeNarrators.set(active.narratorId, {
-			cwd: f.repo,
-			alive: true,
-			_loopRunning: true,
-		} as ActiveNarrator);
-		await expectRefused(f, "legacy_unverified");
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("AI\n");
-	});
-
-	test("active incomplete writes remain blocked without claiming waiting will enable rollback", async () => {
-		const f = await fixture();
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "partial\n"), {
+function message(blocks: unknown[] = [{ type: "text", text: "keep" }]) {
+	const id = generateId();
+	db.insert(schema.narratorMessages)
+		.values({ id, narratorId, role: "assistant", contentJson: blocks, createdAt: now() })
+		.run();
+	db.insert(schema.narratorMessageRefs)
+		.values({ id: generateId(), narratorId, messageId: id, seq: ++seq })
+		.run();
+	return id;
+}
+function content(messageId: string) {
+	return db
+		.select({ content: schema.narratorMessages.contentJson })
+		.from(schema.narratorMessages)
+		.where(eq(schema.narratorMessages.id, messageId))
+		.get()?.content;
+}
+async function write(name: string, before = "original\n", after = "changed\n", existing?: string) {
+	const path = join(cwd, name);
+	await writeFile(path, before);
+	const toolUseId = generateId();
+	const toolCallId = generateId();
+	const messageId = existing ?? message();
+	const input = { file_path: path, content: after };
+	const old = content(messageId) as unknown[];
+	db.update(schema.narratorMessages)
+		.set({ contentJson: [...old, { type: "tool_use", id: toolUseId, name: "Write", input }] })
+		.where(eq(schema.narratorMessages.id, messageId))
+		.run();
+	const resolved = await localBackend.resolvePathIdentity(path);
+	const executionTarget: ToolExecutionTarget = {
+		deviceId: "local",
+		backendKind: "local",
+		cwd,
+		pathFlavor: localBackend.pathFlavor,
+		lexicalPath: resolved.lexicalPath,
+		canonicalPath: resolved.canonicalPath,
+		runtimeGeneration: localBackend.runtimeGeneration,
+		selectionSource: "local_default",
+	};
+	db.insert(schema.narratorToolCalls)
+		.values({
+			id: toolCallId,
+			narratorId,
+			messageId,
+			toolUseId,
+			toolName: "Write",
+			inputJson: input,
 			status: "running",
-			capture: "before",
-		});
-		activeNarrators.set(f.narratorId, {
-			cwd: f.repo,
-			alive: true,
-			_loopRunning: true,
-		} as ActiveNarrator);
-		await expectRefused(f, "incomplete_coverage");
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("partial\n");
+			executionIdentityVersion: 1,
+			executionAttempt: 1,
+			executionStartedAt: now(),
+			executionDeviceId: "local",
+			executionCwd: cwd,
+			executionPathFlavor: executionTarget.pathFlavor,
+			resolvedFilePath: path,
+			canonicalFilePath: resolved.canonicalPath,
+			runtimeGeneration: executionTarget.runtimeGeneration,
+			createdAt: now(),
+		})
+		.run();
+	const result = await writeTool.execute(input, {
+		narratorId,
+		userId,
+		cwd,
+		locale: "en",
+		currentToolUseId: toolUseId,
+		signal: AbortSignal.timeout(30_000),
+		toolCallBinding: { toolCallId, attempt: 1 },
+		executionTarget,
+		requestPermission: async () => ({ behavior: "allow" }),
 	});
+	expect(result.isError, String(result.output)).not.toBe(true);
+	db.update(schema.narratorToolCalls)
+		.set({ status: "success" })
+		.where(eq(schema.narratorToolCalls.id, toolCallId))
+		.run();
+	return { path, messageId, toolUseId, toolCallId, blockIndex: old.length };
+}
 
-	test.each([
-		"none",
-		"both",
-	] as const)("an operation pointer identifies the unconnected entrypoint without authorizing rollback (trees=%s)", async (capture) => {
-		const f = await fixture();
-		const target = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "AI\n"), {
-			recordOperation: true,
-			capture,
+function userMessage() {
+	const id = message([{ type: "text", text: "old prompt" }]);
+	db.update(schema.narratorMessages)
+		.set({ role: "user", contentText: "old prompt" })
+		.where(eq(schema.narratorMessages.id, id))
+		.run();
+	return id;
+}
+
+async function editPreview(
+	messageId: string,
+	action: "edit_and_regenerate" | "rollback_to_block" = "edit_and_regenerate",
+) {
+	const result = await access.prepareLocalRevertAction(
+		options().principal,
+		narratorId,
+		{
+			action,
+			messageId,
+			idempotencyKey: generateId(),
+			...(action === "rollback_to_block" ? { blockIndex: 0 } : {}),
+		},
+		AbortSignal.timeout(30_000),
+	);
+	if (!result.plan?.planHash) throw new Error(`Missing edit plan: ${JSON.stringify(result)}`);
+	return {
+		planId: result.plan.id,
+		planHash: result.plan.planHash,
+		action: "edit_and_regenerate" as const,
+	};
+}
+
+describe("edit regeneration executes only the reviewed plan", () => {
+	test("same plan restores the tail and retains the actual new prompt", async () => {
+		const target = userMessage();
+		const call = await write("edit.txt");
+		const revertPlan = await editPreview(target);
+		const prepare = spyOn(access, "prepareLocalRevertPlan");
+		const result = await editAndRegenerate(
+			narratorId,
+			target,
+			"actual edited prompt",
+			"en",
+			false,
+			{ userId, deferContinuation: true, revertPlan },
+		);
+		expect(result).toMatchObject({
+			ok: true,
+			revertResult: { planId: revertPlan.planId, status: "committed", historyCommitted: true },
 		});
-		await expectRefused(f, "execution_unavailable");
-		for (const preview of [
-			await previewNarratorScopedForMessages(f.narratorId, [target.messageId]),
-			await previewNarratorScopedForToolUses(f.narratorId, [target]),
-		]) {
-			expect(preview).toMatchObject({ available: false, reason: "execution_unavailable" });
-		}
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("AI\n");
-		expect(
-			await db.query.fileChangeOperations.findFirst({
-				where: eq(fileChangeOperations.narratorId, f.narratorId),
-				columns: { settlement: true, coverage: true },
+		expect(prepare).not.toHaveBeenCalled();
+		expect(await readFile(call.path, "utf8")).toBe("original\n");
+		expect(content(target)).toEqual([{ type: "text", text: "actual edited prompt" }]);
+		await expect(
+			editAndRegenerate(narratorId, target, "must not reuse committed authorization", "en", false, {
+				userId,
+				deferContinuation: true,
+				revertPlan,
 			}),
-		).toMatchObject({ settlement: "preparing", coverage: "unavailable" });
-	});
+		).rejects.toThrow();
+		expect(content(target)).toEqual([{ type: "text", text: "actual edited prompt" }]);
+		expect(
+			db
+				.select()
+				.from(schema.narratorMessageRefs)
+				.where(eq(schema.narratorMessageRefs.messageId, call.messageId))
+				.all(),
+		).toHaveLength(0);
+	}, 30_000);
 
-	test.each([
-		true,
-		false,
-	])("a new operation pointer cannot mask another legacy call (new operation first=%s)", async (newFirst) => {
-		const f = await fixture();
-		const first = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "first\n"), {
-			recordOperation: newFirst,
-			capture: "both",
-		});
-		const second = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "second\n"), {
-			seq: 2,
-			recordOperation: !newFirst,
-			capture: "both",
-		});
-		for (const [target, isOperation] of [
-			[first, newFirst],
-			[second, !newFirst],
-		] as const) {
-			const boundary = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.toolUseId, target.toolUseId),
-				columns: { fileChangeOperationId: true, treeHashBefore: true, treeHashAfter: true },
-			});
-			expect(Boolean(boundary?.fileChangeOperationId)).toBe(isOperation);
-			expect(boundary?.treeHashBefore).toMatch(/^[a-f0-9]{40}$/);
-			expect(boundary?.treeHashAfter).toMatch(/^[a-f0-9]{40}$/);
-		}
-		await expectRefused(f, "legacy_unverified");
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("second\n");
-		// One git-init (2s), four real hot captures (4s each), plus 2s for DAO/cleanup.
-		// A capture that degrades to null still fails the four hash assertions above.
-	}, 20_000);
+	for (const drift of [
+		"appended_message",
+		"external_file",
+		"expired",
+		"wrong_operation",
+		"wrong_target",
+		"wrong_actor",
+	] as const) {
+		test(`${drift} refuses without replanning or saving the edited prompt`, async () => {
+			const target = userMessage();
+			const other = userMessage();
+			const call = await write("protected.txt");
+			const revertPlan = await editPreview(
+				target,
+				drift === "wrong_operation" ? "rollback_to_block" : "edit_and_regenerate",
+			);
+			let actor = userId;
+			if (drift === "appended_message") {
+				message();
+				db.update(schema.narrators)
+					.set({ messageVersion: 1 })
+					.where(eq(schema.narrators.id, narratorId))
+					.run();
+			}
+			if (drift === "external_file") await writeFile(call.path, "external user save\n");
+			if (drift === "expired")
+				db.update(schema.revertOperations)
+					.set({ expiresAt: "1970-01-01T00:00:00.000Z" })
+					.where(eq(schema.revertOperations.id, revertPlan.planId))
+					.run();
+			if (drift === "wrong_actor") {
+				actor = generateId();
+				db.insert(schema.users)
+					.values({
+						id: actor,
+						username: actor,
+						passwordHash: "test",
+						role: "admin",
+						createdAt: now(),
+					})
+					.run();
+			}
+			const prepare = spyOn(access, "prepareLocalRevertPlan");
+			const failure = await editAndRegenerate(
+				narratorId,
+				drift === "wrong_target" ? other : target,
+				"must not be saved",
+				"en",
+				false,
+				{ userId: actor, deferContinuation: true, revertPlan },
+			).catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(SnapshotRevertError);
+			const result = (failure as SnapshotRevertError).result;
+			if (drift === "external_file") {
+				expect(result.files).toContainEqual(
+					expect.objectContaining({ status: "conflict", reason: "expected_mismatch" }),
+				);
+			} else {
+				expect(result.reason).toMatch(
+					drift === "appended_message"
+						? /STALE/
+						: drift === "wrong_actor"
+							? /PLAN_NOT_FOUND/
+							: /ACTION_MISMATCH/,
+				);
+			}
+			expect(prepare).not.toHaveBeenCalled();
+			expect(content(target)).toEqual([{ type: "text", text: "old prompt" }]);
+			expect(await readFile(call.path, "utf8")).toBe(
+				drift === "external_file" ? "external user save\n" : "changed\n",
+			);
+			expect(content(call.messageId)).toHaveLength(2);
+		}, 30_000);
+	}
 });
 
-describe("M0 selector and history safety", () => {
-	test("all three selectors refuse the same legacy call", async () => {
-		const f = await fixture();
-		const target = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"));
-		for (const result of [
-			await revertNarratorScopedForMessages(f.narratorId, [target.messageId]),
-			await revertNarratorScopedForToolUses(f.narratorId, [target]),
-		]) {
-			expect(result?.failures[0]?.code).toBe("REVERT_UNAVAILABLE");
-			expect(result?.failures[0]?.message).toContain("legacy_unverified");
+describe("HTTP edit confirmation keeps primary/subagent semantics", () => {
+	for (const variant of ["primary", "subagent:general"] as const) {
+		for (const multipart of [false, true]) {
+			test(`${variant} forwards the exact plan and new content (${multipart ? "multipart" : "json"})`, async () => {
+				const parentNarratorId = variant === "primary" ? null : generateId();
+				if (parentNarratorId)
+					db.insert(schema.narrators)
+						.values({
+							id: parentNarratorId,
+							cwd,
+							ownerUserId: userId,
+							createdAt: now(),
+							updatedAt: now(),
+						})
+						.run();
+				db.update(schema.narrators)
+					.set({
+						variant,
+						parentNarratorId,
+						aclRootNarratorId: parentNarratorId,
+						type: parentNarratorId ? "subagent" : "primary",
+					})
+					.where(eq(schema.narrators.id, narratorId))
+					.run();
+				const target = userMessage();
+				const call = await write("http-edit.txt");
+				const token = await createToken(userId, "user");
+				const headers = { Authorization: `Bearer ${token}` };
+				const previewResponse = await app.request(
+					`/api/narrators/${narratorId}/revert-action-preview`,
+					{
+						method: "POST",
+						headers: { ...headers, "Content-Type": "application/json" },
+						body: JSON.stringify({
+							action: "edit_and_regenerate",
+							messageId: target,
+							idempotencyKey: generateId(),
+						}),
+					},
+				);
+				const preview = await previewResponse.json();
+				expect(previewResponse.status, JSON.stringify(preview)).toBe(200);
+				expect(preview.plan?.planHash).toBeTruthy();
+				const revertPlan = {
+					planId: preview.plan.id,
+					planHash: preview.plan.planHash,
+					action: "edit_and_regenerate" as const,
+				};
+				const realEdit = session.editAndRegenerate;
+				const edit = spyOn(session, "editAndRegenerate").mockImplementation(
+					async (n, m, text, locale, reply, opts) => {
+						const result = await realEdit(n, m, text, locale, reply, {
+							...opts,
+							deferContinuation: true,
+						});
+						return {
+							...result,
+							revertResult: result.revertResult
+								? { ...result.revertResult, historyStatus: "unavailable" }
+								: undefined,
+						};
+					},
+				);
+				const body = multipart
+					? new FormData()
+					: JSON.stringify({ content: "actual HTTP edited prompt", skipRevert: false, revertPlan });
+				if (body instanceof FormData) {
+					body.set("content", "actual HTTP edited prompt");
+					body.set("skipRevert", "false");
+					body.set("revertPlan", JSON.stringify(revertPlan));
+					body.set(
+						"textFiles",
+						new File(["new attachment"], "attached.txt", { type: "text/plain" }),
+					);
+				}
+				const response = await app.request(
+					`/api/narrators/${narratorId}/edit-and-regenerate/${target}`,
+					{
+						method: "POST",
+						headers: multipart ? headers : { ...headers, "Content-Type": "application/json" },
+						body,
+					},
+				);
+				const result = await response.json();
+				expect(response.status, JSON.stringify(result)).toBe(200);
+				expect(result).toMatchObject({
+					ok: true,
+					revertResult: {
+						planId: revertPlan.planId,
+						status: "committed",
+						historyCommitted: true,
+						historyStatus: "unavailable",
+					},
+				});
+				expect(edit.mock.calls[0][5]?.revertPlan).toEqual(revertPlan);
+				expect(edit.mock.calls).toHaveLength(1);
+				expect(edit.mock.calls[0].slice(0, 3)).toEqual([
+					narratorId,
+					target,
+					"actual HTTP edited prompt",
+				]);
+				expect(await readFile(call.path, "utf8")).toBe("original\n");
+				expect(content(target)).toContainEqual({ type: "text", text: "actual HTTP edited prompt" });
+			}, 30_000);
 		}
-		expect((await previewNarratorScopedForToolUses(f.narratorId, [target])).reason).toBe(
-			"legacy_unverified",
-		);
-		expect((await previewNarratorScopedForMessages(f.narratorId, [target.messageId])).reason).toBe(
-			"legacy_unverified",
-		);
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
-	});
+	}
+});
 
-	test("an explicitly empty selector is a no-op rather than all history", async () => {
-		const f = await fixture();
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"));
-		for (const result of [
-			await revertNarratorScopedForMessages(f.narratorId, []),
-			await revertNarratorScopedForToolUses(f.narratorId, []),
-		]) {
-			expect(result).toMatchObject({ fileCount: 0, failures: [] });
-		}
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
-	});
-
-	test("a missing selected tool is not covered by a neighbouring spec no-op", async () => {
-		const f = await fixture();
-		const spec = await call(f, () => {}, {
-			input: { file_path: "spec://tasks.json" },
-			capture: "none",
+// Real Write evidence, local ACL/planner/executor and SQLite COW; only fault injection is mocked.
+describe("narrator-scoped per-file recovery consumers", () => {
+	test("preview contains measured files and execution preserves the file-only history", async () => {
+		const call = await write("one.txt");
+		const before = content(call.messageId);
+		const preview = await previewNarratorScopedForToolUses(narratorId, [call], {
+			...options(),
+			withContents: true,
 		});
-		const result = await revertNarratorScopedForToolUses(f.narratorId, [
-			spec,
-			{ messageId: spec.messageId, toolUseId: "missing" },
+		expect(preview.available).toBe(true);
+		expect(preview.plan?.planHash).toBeTruthy();
+		expect(preview.files).toMatchObject([
+			{ filePath: "one.txt", currentContent: "changed\n", revertedContent: "original\n" },
 		]);
-		expect(result?.failures[0]?.message).toContain("incomplete_coverage");
-	});
+		const result = await revertNarratorScopedForToolUses(narratorId, [call], options());
+		expect(result).toMatchObject({
+			status: "committed",
+			historyCommitted: false,
+			files: [{ filePath: "one.txt", status: "applied" }],
+		});
+		expect(await readFile(call.path, "utf8")).toBe("original\n");
+		expect(content(call.messageId)).toEqual(before);
+	}, 30_000);
 
-	test("a missing selected message cannot hide behind a spec-only neighbour", async () => {
-		const f = await fixture();
-		const spec = await call(f, () => {}, {
-			input: { file_path: "spec://tasks.json" },
-			capture: "none",
+	test("partial files retain successful writes and all selected history", async () => {
+		const a = await write("a.txt");
+		const b = await write("b.txt");
+		const original = access.RevertPlannerLocalAccess.prototype.resolveFile;
+		let executing = false;
+		const execute = access.executeLocalRevertPlan;
+		spyOn(access, "executeLocalRevertPlan").mockImplementation((input) => {
+			executing = true;
+			return execute(input);
 		});
-		const result = await revertNarratorScopedForMessages(f.narratorId, [
-			spec.messageId,
-			"missing-message",
-		]);
-		expect(result.failures[0]?.message).toContain("incomplete_coverage");
-	});
-
-	test("an unknown plugin call is ignored by file rollback coverage", async () => {
-		const f = await fixture();
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "plugin\n"), {
-			toolName: "plugin-write",
-			capture: "none",
+		spyOn(access.RevertPlannerLocalAccess.prototype, "resolveFile").mockImplementation(function (
+			this: access.RevertPlannerLocalAccess,
+			input,
+		) {
+			if (executing && input.identity.canonicalPath === b.path)
+				return Promise.reject(new Error("second file denied"));
+			return original.call(this, input);
 		});
-		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			available: true,
-			reason: "nothing_owned",
-		});
-		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
-			reverted: false,
-			fileCount: 0,
-			failures: [],
-		});
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("plugin\n");
-	});
-
-	test("shared-message tools cannot disappear because their author differs from the ref owner", async () => {
-		const owner = await fixture();
-		const fork = await fixture();
-		const target = await call(owner, () => writeFileSync(join(owner.repo, "a.txt"), "owner\n"), {
-			capture: "none",
-		});
-		await db.insert(narratorMessageRefs).values({
-			id: generateId(),
-			narratorId: fork.narratorId,
-			messageId: target.messageId,
-			seq: 1,
-		});
-		await expectRefused(fork, "unsupported_target");
-		expect(readFileSync(join(owner.repo, "a.txt"), "utf8")).toBe("owner\n");
-	});
-
-	test("rejection keeps every batch block and file; explicit skipRevert still deletes history only", async () => {
-		const f = await fixture();
-		const first = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "first\n"));
-		const second = await call(f, () => writeFileSync(join(f.repo, "b.txt"), "partial\n"), {
-			seq: 2,
-			capture: "before",
-			status: "fail",
-			input: { file_path: join(f.repo, "b.txt") },
-		});
-		const blocks = [first, second].map(({ messageId }) => ({ messageId, blockIndex: 0 }));
-		await expect(narratorService.deleteMessageBlocks(f.narratorId, blocks)).rejects.toThrow(
-			"REVERT_UNAVAILABLE",
-		);
-		for (const target of [first, second]) {
-			expect(
-				await db.query.narratorMessageRefs.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, f.narratorId),
-						eq(narratorMessageRefs.messageId, target.messageId),
-					),
-				}),
-			).toBeTruthy();
+		const notify = spyOn(narratorWs, "broadcastToNarrator");
+		let failure: unknown;
+		try {
+			await narratorService.deleteMessageBlocks(
+				narratorId,
+				[a, b].map((item) => ({ messageId: item.messageId, blockIndex: item.blockIndex })),
+				options(),
+			);
+		} catch (error) {
+			failure = error;
 		}
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("first\n");
-		expect(readFileSync(join(f.repo, "b.txt"), "utf8")).toBe("partial\n");
-		const skipped = await narratorService.deleteMessageBlocks(f.narratorId, blocks, {
-			skipRevert: true,
-		});
-		expect(skipped.deleted).toBe(2);
-		expect(readFileSync(join(f.repo, "b.txt"), "utf8")).toBe("partial\n");
-	});
+		expect(failure).toBeInstanceOf(SnapshotRevertError);
+		const result = (failure as SnapshotRevertError).result;
+		expect(result.status).toBe("partial");
+		expect(result.historyCommitted).toBe(false);
+		expect(result.files.find((item) => item.filePath === "a.txt")?.status).toBe("applied");
+		expect(result.files.find((item) => item.filePath === "b.txt")?.status).toBe("failed");
+		expect(await readFile(a.path, "utf8")).toBe("original\n");
+		expect(await readFile(b.path, "utf8")).toBe("changed\n");
+		expect(content(a.messageId)).toHaveLength(2);
+		expect(content(b.messageId)).toHaveLength(2);
+		expect(
+			notify.mock.calls.some(([id, event]) => id === narratorId && event.type === "full_reload"),
+		).toBe(true);
+	}, 30_000);
 
-	test("legacy preview deduplication never turns different claims into one", () => {
-		const row = {
-			toolUseId: "tool",
-			messageId: "msg",
-			seq: 1,
-			before: "a",
-			after: "b",
-			ownedPaths: ["a.txt"],
+	test("a missing history blob reports its file while the other file restores", async () => {
+		const a = await write("good.txt", "good-before", "good-after");
+		const b = await write("missing.txt", "bad-before", "bad-after");
+		const effect = db
+			.select({ beforeBlobDigest: schema.fileChangeEffects.beforeBlobDigest })
+			.from(schema.fileChangeEffects)
+			.innerJoin(
+				schema.fileChangeOperations,
+				eq(schema.fileChangeOperations.id, schema.fileChangeEffects.operationId),
+			)
+			.where(eq(schema.fileChangeOperations.toolCallId, b.toolCallId))
+			.get();
+		const runtime = await getDefaultLocalFileChangeRuntime();
+		const { store } = await runtime.verifyNamespace();
+		const read = store.readBytes.bind(store);
+		spyOn(store, "readBytes").mockImplementation((ref, opts) =>
+			ref.digest === effect?.beforeBlobDigest
+				? Promise.reject(new Error("missing blob"))
+				: read(ref, opts),
+		);
+		const result = await revertNarratorScopedForMessages(
+			narratorId,
+			[a.messageId, b.messageId],
+			options(),
+		);
+		expect(result.status).toBe("partial");
+		expect(result.files.find((item) => item.filePath === "missing.txt")).toMatchObject({
+			status: "failed",
+		});
+		expect(result.historyCommitted).toBe(false);
+		expect(await readFile(a.path, "utf8")).toBe("good-before");
+		expect(await readFile(b.path, "utf8")).toBe("bad-after");
+	}, 30_000);
+
+	test("message-block deletion preserves the fork's original and unselected blocks", async () => {
+		const call = await write("cow.txt");
+		const fork = generateId();
+		db.insert(schema.narrators)
+			.values({ id: fork, cwd, ownerUserId: userId, createdAt: now(), updatedAt: now() })
+			.run();
+		db.insert(schema.narratorMessageRefs)
+			.values({ id: generateId(), narratorId: fork, messageId: call.messageId, seq: 1 })
+			.run();
+		const original = content(call.messageId);
+		const result = await narratorService.deleteMessageBlock(
+			narratorId,
+			call.messageId,
+			call.blockIndex,
+			options(),
+		);
+		expect(result.revertResult?.historyCommitted).toBe(true);
+		expect(content(call.messageId)).toEqual(original);
+		const ref = db
+			.select()
+			.from(schema.narratorMessageRefs)
+			.where(eq(schema.narratorMessageRefs.narratorId, narratorId))
+			.get();
+		expect(ref?.messageId).not.toBe(call.messageId);
+		if (!ref) throw new Error("missing current narrator reference");
+		expect(content(ref.messageId)).toEqual([{ type: "text", text: "keep" }]);
+		expect(await readFile(call.path, "utf8")).toBe("original\n");
+	}, 30_000);
+
+	test("pending IO returns its unknown file and retains admission until actual settlement", async () => {
+		const call = await write("pending.txt");
+		const terminal = Promise.withResolvers<RevertTransactionOutcome>();
+		const pending: RevertTransactionOutcome = {
+			...emptyRevertResult(),
+			planId: "pending-plan",
+			status: "executing",
+			journalStatus: "applying",
+			settling: true,
+			files: [
+				{ deviceId: "local", filePath: "pending.txt", status: "unknown", reason: "IO_PENDING" },
+			],
 		};
-		expect(dedupeBoundaryRows([row, { ...row, messageId: "clone" }])).toEqual([row]);
-		const other = { ...row, ownedPaths: ["b.txt"] };
-		expect(dedupeBoundaryRows([row, other])).toEqual([row, other]);
+		spyOn(access, "executeLocalRevertPlan").mockResolvedValue({
+			result: Promise.resolve(pending),
+			whenSettled: terminal.promise,
+		});
+		const notify = spyOn(narratorWs, "broadcastToNarrator");
+		try {
+			await expect(
+				narratorService.deleteMessageBlock(narratorId, call.messageId, call.blockIndex, options()),
+			).rejects.toMatchObject({ result: pending });
+			expect(hasNarratorAdmissionWork(narratorId)).toBe(true);
+			expect(content(call.messageId)).toHaveLength(2);
+			expect(
+				notify.mock.calls.some(([id, event]) => id === narratorId && event.type === "full_reload"),
+			).toBe(true);
+		} finally {
+			terminal.resolve({ ...pending, status: "failed", settling: false });
+			await terminal.promise;
+			await Promise.resolve();
+		}
+		expect(hasNarratorAdmissionWork(narratorId)).toBe(false);
 	});
+
+	test("permission revoked after file restoration retains history and the applied outcome", async () => {
+		const call = await write("revoked-after-io.txt");
+		const authorize = scopedRevert.authorizeRevertHistory;
+		spyOn(scopedRevert, "authorizeRevertHistory").mockImplementation(async (...args) => {
+			db.update(schema.narrators)
+				.set({ ownerUserId: null, visibility: "private" })
+				.where(eq(schema.narrators.id, narratorId))
+				.run();
+			await authorize(...args);
+		});
+		await expect(
+			narratorService.deleteMessageBlock(narratorId, call.messageId, call.blockIndex, options()),
+		).rejects.toMatchObject({
+			result: {
+				status: "partial",
+				historyCommitted: false,
+				files: [{ filePath: "revoked-after-io.txt", status: "applied" }],
+			},
+		});
+		expect(await readFile(call.path, "utf8")).toBe("original\n");
+		expect(content(call.messageId)).toHaveLength(2);
+	}, 30_000);
+
+	test("rollback includes the selected message suffix and later messages in one plan", async () => {
+		const a = await write("boundary.txt");
+		const b = await write("later.txt");
+		const result = await rollbackToBlock(narratorId, a.messageId, 0, options());
+		expect(result.revertResult?.historyCommitted).toBe(true);
+		expect(await readFile(a.path, "utf8")).toBe("original\n");
+		expect(await readFile(b.path, "utf8")).toBe("original\n");
+		const refs = db
+			.select()
+			.from(schema.narratorMessageRefs)
+			.where(eq(schema.narratorMessageRefs.narratorId, narratorId))
+			.all();
+		expect(refs).toHaveLength(1);
+		expect(content(refs[0].messageId)).toEqual([{ type: "text", text: "keep" }]);
+	}, 30_000);
+
+	test("confirmed HTTP file restore and message deletion expose the per-file result", async () => {
+		const { app } = await import("../app");
+		const { createToken } = await import("../lib/auth");
+		const headers = {
+			authorization: `Bearer ${await createToken(userId, "user")}`,
+			"content-type": "application/json",
+		};
+		const call = await write("http-revert.txt");
+		const legacy = await app.request(`/api/narrators/${narratorId}/revert`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ messageId: call.messageId }),
+		});
+		expect(legacy.status).toBe(409);
+		expect(await legacy.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect(await readFile(call.path, "utf8")).toBe("changed\n");
+		const preview = await access.prepareLocalRevertAction(
+			options().principal,
+			narratorId,
+			{
+				action: "revert_files",
+				messageId: call.messageId,
+				idempotencyKey: generateId(),
+			},
+			AbortSignal.timeout(30_000),
+		);
+		if (!preview.plan?.planHash) throw new Error("Missing confirmed file plan");
+		const response = await app.request(
+			`/api/narrators/${narratorId}/revert-plans/${preview.plan.id}/apply`,
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify({ action: "revert_files", planHash: preview.plan.planHash }),
+			},
+		);
+		const result = await response.json();
+		expect(response.status, JSON.stringify(result)).toBe(200);
+		expect(result).toMatchObject({
+			status: "committed",
+			historyCommitted: false,
+			files: [{ filePath: "http-revert.txt", status: "applied" }],
+		});
+		expect(content(call.messageId)).toHaveLength(2);
+		const next = await write("http-delete.txt");
+		// HTTP deletions are history-only; restoring files without a reviewed plan is refused.
+		const deleted = await app.request(`/api/narrators/${narratorId}/messages/${next.messageId}`, {
+			method: "DELETE",
+			headers,
+		});
+		expect(deleted.status).toBe(409);
+		expect(await deleted.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect(await readFile(next.path, "utf8")).toBe("changed\n");
+		expect(content(next.messageId)).toBeDefined();
+	}, 30_000);
+
+	test("HTTP partial failures retain file outcomes in the error response", async () => {
+		const { app } = await import("../app");
+		const { createToken } = await import("../lib/auth");
+		const messageId = message();
+		const result = {
+			...emptyRevertResult(),
+			status: "partial" as const,
+			files: [
+				{ deviceId: "local", filePath: "a.txt", status: "applied" as const },
+				{
+					deviceId: "local",
+					filePath: "b.txt",
+					status: "failed" as const,
+					reason: "permission_revoked",
+				},
+			],
+		};
+		spyOn(narratorService, "deleteMessageBlocks").mockRejectedValue(
+			new SnapshotRevertError(result),
+		);
+		const response = await app.request(`/api/narrators/${narratorId}/messages/batch-blocks`, {
+			method: "DELETE",
+			headers: {
+				authorization: `Bearer ${await createToken(userId, "user")}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({ blocks: [{ messageId, blockIndex: 0 }], skipRevert: true }),
+		});
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({ code: "SNAPSHOT_REVERT_FAILED", ...result });
+		expect(content(messageId)).toHaveLength(1);
+	});
+
+	test("authentication is the actual requester, and tool ids cannot cross message boundaries", async () => {
+		const call = await write("private.txt");
+		await expect(revertNarratorScopedForToolUses(narratorId, [call])).rejects.toMatchObject({
+			statusCode: 401,
+		});
+		const other = generateId();
+		db.insert(schema.users)
+			.values({ id: other, username: other, passwordHash: "test", role: "user", createdAt: now() })
+			.run();
+		await expect(
+			previewNarratorScopedForMessages(narratorId, [call.messageId], {
+				principal: { userId: other, isAdmin: false },
+			}),
+		).rejects.toMatchObject({ statusCode: 404 });
+		const foreignMessage = message();
+		const result = await revertNarratorScopedForToolUses(
+			narratorId,
+			[{ messageId: foreignMessage, toolUseId: call.toolUseId }],
+			options(),
+		);
+		expect(result.status).toBe("failed");
+		expect(result.reason).toContain("EVIDENCE_INCOMPLETE");
+		expect(await readFile(call.path, "utf8")).toBe("changed\n");
+		expect(await revertPrincipalForUser(userId)).toEqual(options().principal);
+		await expect(revertPrincipalForUser(null)).rejects.toMatchObject({ statusCode: 401 });
+	}, 30_000);
 });

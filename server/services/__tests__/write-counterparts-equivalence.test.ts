@@ -17,7 +17,6 @@ import {
 	blobCatalogScenario,
 	evidenceScenario,
 	revertFlowScenario,
-	workspaceLeaseScenario,
 } from "../../../tests/server/services/write-counterparts/equivalence-suite";
 import { makeSqliteKit } from "../../../tests/server/services/write-counterparts/sqlite-kit";
 import { db } from "../../db";
@@ -25,10 +24,6 @@ import { db } from "../../db";
 describe("wrapper equivalence (SQLite baseline)", () => {
 	test("blob catalog", async () => {
 		await blobCatalogScenario(makeSqliteKit(db));
-	});
-
-	test("workspace lease lifecycle", async () => {
-		await workspaceLeaseScenario(makeSqliteKit(db));
 	});
 
 	test("evidence store", async () => {

@@ -519,6 +519,12 @@ function readNonEmptyString(record: Record<string, unknown>, key: string): strin
 	return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
+/** Read a string-array field from a record; drops entries that are not strings. */
+function readStringArray(record: Record<string, unknown>, key: string): string[] {
+	const v = record[key];
+	return Array.isArray(v) ? v.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
 /** Trim a possibly-null string; undefined when absent or blank. */
 function nonEmptyTrimmed(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
@@ -2276,6 +2282,18 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
 	// routine digest reads differently from a turn-end continuation in the header.
 	cadenceEveryNTools: "every {n} tool calls",
+	// ── communication bubble footer warning ───────────────────────────────────
+	// The tools report these sentences as codes (`metadata.warningCodes`) instead of
+	// prose because only the shell can translate them: `communicationWarning_<code>` is
+	// the key the adapter looks up, and `{status}` is the resolved target's `status_*`
+	// word — the same words the narrator status chip shows.
+	communicationWarning_broadcastWorkingOnly:
+		"Only working/waiting members receive broadcasts. Idle and archived members are excluded and never woken.",
+	communicationWarning_broadcastCancelled: "Broadcast cancelled; no further recipients admitted.",
+	communicationWarning_sendTargetNotWorking: "Target is {status} — the message may not be received",
+	status_idle: "Idle",
+	status_waiting: "Waiting",
+	status_archived: "Archived",
 };
 
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
@@ -3690,6 +3708,38 @@ function communicationRecipients(
 	return selectors.map((label) => ({ label }));
 }
 
+/**
+ * The footer warning under a communication bubble. `metadata.warningCodes` are the
+ * tool's fixed sentences — localized here, because the server cannot know the reader's
+ * language — and `metadata.warningDetails` are per-target failure lines that have no
+ * translation at all. `interrupted` keeps the interruption fallback the bubble already
+ * derived, and results persisted before the code channel carry the whole text in
+ * `metadata.warning`, which is still read when no code arrives.
+ */
+function communicationWarning(
+	ctx: AdapterContext,
+	metadata: Record<string, unknown>,
+	interrupted: string | undefined,
+): string | undefined {
+	const codes = readStringArray(metadata, "warningCodes");
+	const details = readStringArray(metadata, "warningDetails");
+	if (codes.length === 0 && details.length === 0) {
+		return readNonEmptyString(metadata, "warning") ?? interrupted;
+	}
+	// Only the send warning names a status, and it always arrives with one; a template
+	// without the placeholder ignores the params anyway.
+	const status = readNonEmptyString(metadata, "warningStatus");
+	const params = status ? { status: sysLabel(ctx, `status_${status}`) } : undefined;
+	const sentences = codes.flatMap((code) => {
+		const key = `communicationWarning_${code}`;
+		// A code this build does not know (a stale frontend bundle reading a newer tool
+		// result) has no sentence: skip it rather than paint its key at the reader.
+		if (!ctx.labels?.[key] && !SYSTEM_LABEL_FALLBACKS[key]) return [];
+		return [formatSysLabel(ctx, key, params)];
+	});
+	return [...sentences, ...details].join("\n");
+}
+
 function buildCommunicationBubbleData(
 	item: AdapterToolItem,
 	ctx: AdapterContext,
@@ -3731,11 +3781,13 @@ function buildCommunicationBubbleData(
 		(status === "fail" || status === "error" || status === "failed"
 			? (readLeafText(item.tc.outputJson) ?? readLeafText(asObject(item.tc.outputJson)._text))
 			: undefined);
-	const warning =
-		readNonEmptyString(metadata, "warning") ??
-		(interruptedTarget
+	const warning = communicationWarning(
+		ctx,
+		metadata,
+		interruptedTarget
 			? interruptedTarget.error?.trim() || String(interruptedTarget.status)
-			: undefined);
+			: undefined,
+	);
 	return {
 		toolUseId: item.tc.toolUseId,
 		toolName: item.tc.toolName,

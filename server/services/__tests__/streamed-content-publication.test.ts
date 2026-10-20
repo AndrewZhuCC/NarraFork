@@ -150,6 +150,7 @@ mock.module("../../lib/agent/provider", () => ({
 	}),
 }));
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
+const { withRuntimePolicyTrait } = await import("../../lib/runtime-policy-trait");
 const { agentLoop } = await import("../../lib/agent/loop");
 await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
@@ -179,18 +180,27 @@ toolRegistry.register({
 	},
 });
 
+const childCeiling = withRuntimePolicyTrait([], {
+	version: 1,
+	tools: ["PublicationHold"],
+	deny: ["spawnAgent", "awaitAgent", "sendAwait", "askUserQuestion"],
+});
+
 function seed(subagent: boolean) {
 	const now = new Date().toISOString();
 	for (const id of subagent ? ["parent", "child"] : ["main"]) {
 		sqlite
 			.prepare(
-				"INSERT INTO narrators (id, type, variant, parent_narrator_id, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO narrators (id, type, variant, parent_narrator_id, traits, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				id,
 				id === "child" ? "subagent" : "primary",
 				id === "child" ? "subagent:general" : "primary",
 				id === "child" ? "parent" : null,
+				// The final start gate enforces the stored ceiling; the delegated fixture's
+				// ceiling must admit this file's test tool like any other allowed tool.
+				JSON.stringify(id === "child" ? childCeiling : []),
 				"bypassPermissions",
 				now,
 				now,

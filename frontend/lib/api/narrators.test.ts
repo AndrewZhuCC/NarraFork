@@ -25,6 +25,65 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("message and block deletions are always history-only", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json({ ok: true });
+			},
+		});
+		await api.deleteMessage("n", "m");
+		await api.deleteMessageBlock("n", "m", 2);
+		await api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0 }]);
+		expect(requests[0].url).toEndWith("/narrators/n/messages/m?skipRevert=1");
+		expect(requests[1].url).toEndWith("/narrators/n/messages/m/blocks/2?skipRevert=1");
+		expect(JSON.parse(String(requests[2].init.body))).toEqual({
+			blocks: [{ messageId: "m", blockIndex: 0 }],
+			skipRevert: true,
+		});
+	});
+
+	test.each([
+		false,
+		true,
+	])("edit transports the reviewed plan with actual content and uploads (%s)", async (multipart) => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: RequestInit[] = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: unknown, init: RequestInit) => {
+				requests.push(init);
+				return Response.json({ ok: true });
+			},
+		});
+		const revertPlan = {
+			planId: "reviewed-plan",
+			planHash: "a".repeat(64),
+			action: "edit_and_regenerate" as const,
+		};
+		await api.editAndRegenerate("n", "m", "  actual new prompt  ", {
+			skipRevert: false,
+			revertPlan,
+			newTextFiles: multipart ? [new File(["attachment"], "notes.txt")] : undefined,
+		});
+		const body = requests[0].body;
+		const parsed =
+			body instanceof FormData
+				? { content: body.get("content"), revertPlan: JSON.parse(String(body.get("revertPlan"))) }
+				: JSON.parse(String(body));
+		expect(parsed.content).toBe("  actual new prompt  ");
+		expect(parsed.revertPlan).toEqual(revertPlan);
+	});
+
 	describe("composer document transport", () => {
 		const doc: ComposerDocument = {
 			version: 1,
@@ -119,7 +178,7 @@ describe("narrators API", () => {
 					return Response.json({ composerDocument: doc });
 				},
 			});
-			await api.updateNarratorDraft("n", "hello", 1, "source", [], doc);
+			await api.updateNarratorDraft("n", "hello", "source", [], doc);
 			expect(JSON.parse(String(requests[0].init.body)).composerDocument).toEqual(doc);
 			const controller = new AbortController();
 			expect(await api.getMessageComposerDocument("n/a", "m/a", controller.signal)).toEqual({
@@ -914,7 +973,7 @@ describe("narrators API", () => {
 			}
 		});
 
-		test("reference-only drafts share the text CAS request", async () => {
+		test("reference-only drafts share the text sync request", async () => {
 			Object.defineProperty(g, "localStorage", {
 				value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
 				configurable: true,
@@ -932,10 +991,9 @@ describe("narrators API", () => {
 				},
 				configurable: true,
 			});
-			const result = await api.updateNarratorDraft("n", "", 3, "tab", [reference]);
+			const result = await api.updateNarratorDraft("n", "", "tab", [reference]);
 			expect(sent).toEqual({
 				text: "",
-				baseRevision: 3,
 				sourceId: "tab",
 				fileReferences: [reference],
 			});

@@ -344,10 +344,19 @@ afterAll(() => {
 });
 
 describe("narratorService message query regressions", () => {
-	it("subagent narrator 的 compact 边界计算应包含 child 消息", async () => {
+	it("compact 边界计算包含放在本会话运行交付目标下的消息（按登记，不按身份）", async () => {
 		seedBase("n-sub");
 		db.update(narrators)
-			.set({ type: "subagent", subagentType: "general", variant: "subagent:general" })
+			.set({
+				type: "subagent",
+				subagentType: "general",
+				variant: "subagent:general",
+				// Own turns are the rows placed under the call this session's run delivers to.
+				runtimeRegistrationJson: {
+					version: 1,
+					run: { logicalRunId: "run-sub", deliverTo: { narratorId: "n1", toolUseId: "tu-parent" } },
+				},
+			})
 			.where(eq(narrators.id, "n-sub"))
 			.run();
 

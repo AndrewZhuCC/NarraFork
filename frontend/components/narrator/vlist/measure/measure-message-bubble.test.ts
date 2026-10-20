@@ -169,6 +169,63 @@ describe("measureMessageBubble — user", () => {
 		expect(bodyHeight).toBe(c.BODY_LINE_HEIGHT * 3);
 	});
 
+	it("stacks attachments placed after all text below the body", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "look[image #1: a.png]",
+				attachments: [{ type: "image", imageId: "i", filename: "a.png", width: 40, height: 20 }],
+			},
+			440,
+		);
+		expect(r.blocks.map((block) => (block.kind === "fixed" ? block.tag : block.kind))).toEqual([
+			"code",
+			"user-image",
+		]);
+	});
+
+	it("flows interleaved quotes and attachments inline with the text", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const text =
+			"> [quote] first @@m:msg1234\n> one\n\n怎样算？\n> [quote] second\n> two\n\n怎样算[image #1: a.png]";
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text,
+				attachments: [{ type: "image", imageId: "i", filename: "a.png", width: 40, height: 20 }],
+			},
+			440,
+		);
+		const block = r.blocks.find(
+			(candidate) => candidate.kind === "fixed" && candidate.tag === "user-inline-flow",
+		);
+		if (block?.kind !== "fixed") throw new Error("Expected an inline flow block");
+		const flow = block as unknown as {
+			data: { lines: Array<Array<{ text?: string; atom?: number }>>; atoms: unknown[] };
+		};
+		expect(r.blocks).toHaveLength(1);
+		expect(flow.data.atoms).toHaveLength(3);
+		// One line: quote, text, quote, text, image — the projection's line padding is gone.
+		expect(flow.data.lines).toHaveLength(1);
+		expect(flow.data.lines[0].map((fragment) => fragment.text ?? fragment.atom)).toEqual([
+			0,
+			"怎样算？",
+			1,
+			"怎样算",
+			2,
+		]);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		expect(r.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				c.BODY_LINE_HEIGHT,
+		);
+	});
+
 	it("shows sent quotes as chips and leaves the typed body", async () => {
 		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
 			"./measure-message-bubble"
@@ -226,6 +283,42 @@ describe("measureMessageBubble — user", () => {
 			{ label: "second", anchor: "m:second", comment: "second comment" },
 		]);
 		expect(chips.displayWidth).toBeLessThanOrEqual(320);
+	});
+
+	it("preserves comments and immutable file targets in stacked and inline quote layouts", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const { serializeComposerQuotes } = await import("../../composer/composer-quotes");
+		const reference = { id: "ref-1", deviceId: "local", path: "/a.ts", label: "a.ts" };
+		const quotes = [
+			{ label: "source", text: "original", anchor: "m:abcd", comment: "message note" },
+			{ label: "a.ts", text: "#file:a.ts", anchor: "f:ref-1", comment: "file note" },
+		];
+		const blocks = serializeComposerQuotes(quotes);
+		for (const inline of [false, true]) {
+			const measured = measureMessageBubble(
+				{
+					role: "user",
+					text: `${inline ? "before\n" : ""}${blocks}after`,
+					attachments: [{ type: "file_reference", reference }],
+				},
+				600,
+			);
+			const chips = measured.blocks.find(
+				(block) =>
+					block.kind === "fixed" &&
+					block.tag === (inline ? "user-inline-flow" : "user-quote-chips"),
+			);
+			if (chips?.kind !== "fixed") throw new Error("Missing comment chips");
+			expect(inline ? chips.data?.atoms : chips.data?.quotes).toMatchObject(
+				inline
+					? [
+							{ kind: "quote", quote: quotes[0] },
+							{ kind: "quote", quote: quotes[1], reference },
+						]
+					: [quotes[0], { ...quotes[1], reference }],
+			);
+			if (inline) expect(JSON.stringify(chips.data?.lines)).not.toContain("note");
+		}
 	});
 
 	it("shrink-wraps: narrow content uses less than full width", async () => {

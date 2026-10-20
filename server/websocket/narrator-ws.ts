@@ -56,6 +56,7 @@ import type {
 	UnloadToolResult,
 } from "../services/command-service";
 import { resolveCommand } from "../services/command-service";
+import { editorFileSubscriptions } from "../services/editor-file-subscription";
 import { canReadNarrator, canWriteNarrator, NARRATOR_ACL_COLUMNS } from "../services/narrator-acl";
 import { getStreamingSnapshot } from "../services/narrator-event-handler";
 import {
@@ -72,6 +73,7 @@ import {
 	clearBufferedMessages,
 	getBufferedMessagesAsync,
 	pushBufferedMessage,
+	removeBufferedMessage,
 	resolveDecisionNarratorId,
 	resolvePermissionOrDangerReflection,
 	toBufferSummary,
@@ -98,6 +100,7 @@ import {
 	createCatchUpBuffer,
 	drainCatchUpBuffer,
 } from "./catch-up-buffer";
+import { handleEditorFileMessage, releaseEditorFileSubscriptions } from "./editor-file-ws";
 import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
 import {
 	createCodexQuotaOverviewWsMessage,
@@ -128,6 +131,8 @@ export interface NarratorWSData {
 	 */
 	subscribedChatRooms: Set<string>;
 	userId?: string;
+	sessionExp?: number;
+	sessionTokenVersion?: number;
 	username?: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
@@ -153,6 +158,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages";
 // Client → Server messages
 export type NarratorClientMessage =
 	| GitWorkspaceClientMessage
+	| import("@shared/editor-file-events").EditorFileClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -247,6 +253,7 @@ function removeConnection(ws: NarratorWS): void {
 	ws.data.publicShareConnectionLease?.release();
 	removeAllChatSubscriptions(ws);
 	releaseGitWorkspaceSubscriptions(ws);
+	releaseEditorFileSubscriptions(ws);
 	const removed = connections.delete(ws);
 	if (removed && ws.data.publicShare) {
 		try {
@@ -680,6 +687,12 @@ function sendToolInputLane(ws: NarratorWS, message: ToolInputChunkMessage): bool
 
 export function broadcastToNarrator(narratorId: string, message: NarratorServerMessage): void {
 	if (
+		["workspace_context_changed", "workspace_paths_changed", "permission_policy_changed"].includes(
+			message.type,
+		)
+	)
+		editorFileSubscriptions.hint(narratorId);
+	if (
 		"toolUseId" in message &&
 		typeof message.toolUseId === "string" &&
 		"toolName" in message &&
@@ -1042,9 +1055,39 @@ function toListStateSnapshotItem(row: NarratorStatusRow): NarratorListStateSnaps
 // Panel snapshots retain the existing per-narrator status_change behavior.
 async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
 	const rows = await loadStatusRows(narratorIds);
+	// Replay the done-transition suppression flag: an idle+unread narrator whose
+	// background work is still running must not re-trigger the client's sound/PWA
+	// on (re)subscribe. Consumed by RecentTabs' shared-connection listener, which
+	// also sees panel snapshot frames for narrators in its window. Materialized
+	// read only — a snapshot path never flushes.
+	let workActiveIds: Set<string> | undefined;
+	try {
+		const { backgroundOccupancyStore } = await import("../services/background-occupancy-store");
+		if (backgroundOccupancyStore.isReady) {
+			workActiveIds = new Set(
+				rows
+					.filter((row) => backgroundOccupancyStore.countActiveWakeWork(row.id) > 0)
+					.map((row) => row.id),
+			);
+		}
+	} catch {
+		// Occupancy may be incomplete during startup: omit the flag, notify as usual.
+	}
 	for (const row of rows) {
 		if (!connections.has(ws)) return;
-		if (!safeSend(ws, { type: "status_change", ...toListStateSnapshotItem(row) })) return;
+		const item = toListStateSnapshotItem(row);
+		const backgroundWorkActive =
+			item.status === "idle" &&
+			item.substatus?.includes("unread") &&
+			workActiveIds?.has(row.id) === true;
+		if (
+			!safeSend(ws, {
+				type: "status_change",
+				...item,
+				...(backgroundWorkActive ? { backgroundWorkActive } : {}),
+			})
+		)
+			return;
 	}
 }
 
@@ -1062,12 +1105,21 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 			| Map<string, import("@shared/background-task-list").BackgroundTaskActiveCounts>
 			| undefined;
 		const freshCountIds = new Set<string>();
+		const wakeWorkActiveIds = new Set<string>();
 		try {
 			const { backgroundTaskService } = await import("../services/background-task-service");
+			const { backgroundOccupancyStore } = await import("../services/background-occupancy-store");
 			const versionsAtRead = new Map(
 				rows.map((row) => [row.id, backgroundTaskService.getListVersion(row.id)]),
 			);
 			counts = await backgroundTaskService.countActiveKindsByParentBatch(rows.map((row) => row.id));
+			// The batch count read flushed the store, so the wake-work read below is
+			// materialized and free. Wake-work (bash tasks + subagents) is a STRICTER
+			// set than the badge's work count: transfers count as work but never wake
+			// the parent, so they must not suppress the notification.
+			for (const row of rows) {
+				if (backgroundOccupancyStore.countActiveWakeWork(row.id) > 0) wakeWorkActiveIds.add(row.id);
+			}
 			// List subscriptions are already live. A count frame delivered during
 			// this read must win over the older snapshot, independently per narrator.
 			for (const row of rows) {
@@ -1086,20 +1138,34 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 		const rowsById = new Map(rows.map((row) => [row.id, row]));
 		const items = batchIds.flatMap((id) => {
 			const row = rowsById.get(id);
-			return row
-				? [
-						{
-							...toListStateSnapshotItem(row),
-							...(counts && freshCountIds.has(id)
-								? {
-										activeBackgroundTaskCount: counts.get(id)?.activeCount ?? 0,
-										activeBackgroundWorkCount: counts.get(id)?.activeWorkCount ?? 0,
-										activeBackgroundServiceCount: counts.get(id)?.activeServiceCount ?? 0,
-									}
-								: {}),
-						},
-					]
-				: [];
+			if (!row) return [];
+			const item = toListStateSnapshotItem(row);
+			const freshCounts = counts && freshCountIds.has(id) ? counts.get(id) : undefined;
+			return [
+				{
+					...item,
+					...(freshCounts
+						? {
+								activeBackgroundTaskCount: freshCounts.activeCount,
+								activeBackgroundWorkCount: freshCounts.activeWorkCount,
+								activeBackgroundServiceCount: freshCounts.activeServiceCount,
+							}
+						: {}),
+					// Snapshot replay of the done-transition flag (see sendStatusSnapshot).
+					// The flag comes from the flushed wake-work read above. It must not
+					// depend on the badge counts being fresh: a list-version bump during
+					// this read correctly drops the counts (a newer count frame wins),
+					// but nothing else carries the suppression flag. Dropping it here
+					// makes a resubscribe play sound/PWA for a done that is still waiting
+					// on wake-capable background work.
+					...(counts &&
+					wakeWorkActiveIds.has(id) &&
+					item.status === "idle" &&
+					item.substatus?.includes("unread")
+						? { backgroundWorkActive: true }
+						: {}),
+				},
+			];
 		});
 		if (!safeSend(ws, { type: "list_state_snapshot", items })) return;
 	}
@@ -1354,6 +1420,7 @@ async function sendCatchUpForAnchor(
 export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 	narratorId: string,
 ): Promise<void> {
+	editorFileSubscriptions.hint(narratorId);
 	const row = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: NARRATOR_ACL_COLUMNS,
@@ -1380,6 +1447,7 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 }
 
 export function broadcastToUser(userId: string, data: NarratorServerMessage): void {
+	if (data.type === "project_access_changed") editorFileSubscriptions.hint();
 	const userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) return;
 	const msg = JSON.stringify(data);
@@ -2056,6 +2124,10 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "editor_file_subscribe":
+			case "editor_file_unsubscribe":
+				await handleEditorFileMessage(ws, msg);
+				break;
 			case "git_workspace_subscribe":
 			case "git_workspace_unsubscribe":
 			case "git_workspace_refresh":
@@ -2276,7 +2348,7 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
-				let bufResult = await pushBufferedMessage(
+				let { ok } = await pushBufferedMessage(
 					msg.narratorId,
 					bufferText,
 					undefined,
@@ -2287,37 +2359,30 @@ export const handleNarratorWS = {
 					undefined,
 					preBashCommand,
 				);
-				// Fallback: try buffering for a running foreground subagent
-				let usedSubagent = false;
-				if (!bufResult.ok) {
+				// No live session to queue behind: the ordinary admission of any session
+				// (queues behind an owner, or starts a run that adopts the input).
+				if (!ok) {
 					try {
-						const { bufferSubagentUserMessage, isTakenOver } = await import(
-							"../services/narrator-subagent"
-						);
-						bufResult = await bufferSubagentUserMessage(msg.narratorId, bufferText, {
+						const { acceptUserMessage } = await import("../services/narrator-session");
+						await acceptUserMessage(msg.narratorId, bufferText, {
+							locale: userId ? await getUserLanguage(userId) : "en",
 							commandText,
-							createdBy: userId,
-							requestSoftStop: !isTakenOver(msg.narratorId),
+							userId,
+							preBashCommand,
 						});
-						usedSubagent = bufResult.ok;
-					} catch {
-						// ignore
+						ok = true;
+					} catch (err) {
+						logger.warn("Failed to admit buffered message", {
+							narratorId: msg.narratorId,
+							error: String(err),
+						});
 					}
 				}
-				if (bufResult.ok) {
-					let messages: ReturnType<typeof toBufferSummary>;
-					if (usedSubagent) {
-						const { getSubagentBufferedMessagesAsync } = await import(
-							"../services/subagent-executor"
-						);
-						messages = toBufferSummary(await getSubagentBufferedMessagesAsync(msg.narratorId));
-					} else {
-						messages = toBufferSummary(await getBufferedMessagesAsync(msg.narratorId));
-					}
+				if (ok) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",
 						narratorId: msg.narratorId,
-						messages,
+						messages: toBufferSummary(await getBufferedMessagesAsync(msg.narratorId)),
 					});
 				} else {
 					safeSend(ws, {
@@ -2331,14 +2396,8 @@ export const handleNarratorWS = {
 				await clearBufferedMessages(msg.narratorId);
 				// Cancelling queued input must also drop a pending post-tool soft stop,
 				// otherwise the running turn ends at the next tool boundary with nothing
-				// to resume (clearSubagentBufferedMessages does this for subagents).
+				// to resume.
 				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
-				try {
-					const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
-					await clearSubagentBufferedMessages(msg.narratorId);
-				} catch {
-					// ignore
-				}
 				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
 					narratorId: msg.narratorId,
@@ -2352,8 +2411,7 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "remove_buffer": {
-				const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
-				const ok = await removeSubagentBufferedMessage(msg.narratorId, msg.messageId);
+				const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
 					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					await broadcastBufferQueueForNarrator(msg.narratorId);

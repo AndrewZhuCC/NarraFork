@@ -610,6 +610,24 @@ describe("settings conditional admin guards", () => {
 		}
 	});
 
+	test("masked Command Code key patches keep the stored credential", async () => {
+		const original = structuredClone(settings);
+		try {
+			// 设置页的底部保存条每次都会带上整份草稿，Command Code 的 key 是脱敏回显值；
+			// 提交它必须保留已存凭据，否则一次无关的保存就会把用户的 key 换成星号串。
+			saveSettings({ ...settings, commandCode: { apiKey: "real-commandcode-key" } });
+			const patchResponse = await appForRole("admin").request("/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ commandCode: { apiKey: "********-key" } }),
+			});
+			expect(patchResponse.status).toBe(200);
+			expect(settings.commandCode?.apiKey).toBe("real-commandcode-key");
+		} finally {
+			saveSettings(original);
+		}
+	});
+
 	test("provider prefix changes migrate narrator model references atomically", async () => {
 		const original = structuredClone(settings);
 		const narratorId = "prefix-migration-narrator";

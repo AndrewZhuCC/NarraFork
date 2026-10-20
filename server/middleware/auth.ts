@@ -16,6 +16,7 @@ import {
 	verifyToken,
 } from "../lib/auth";
 import { AppError, catalogError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 // The two remaining raw AppErrors below are deliberate: `INVALID_SCOPE` is a programming
 // error that never reaches a browser, and `INSUFFICIENT_SCOPE` is read by third-party
@@ -89,6 +90,7 @@ function getVerifiedUser(userId: string): VerifiedUser | undefined {
  * access for a credential that was supposed to be dead).
  */
 export function invalidateUserCache(userId?: string) {
+	eventBus.emit({ type: "auth:changed", ...(userId ? { userId } : {}) });
 	if (userId) {
 		verifiedUsers.delete(userId);
 	} else {

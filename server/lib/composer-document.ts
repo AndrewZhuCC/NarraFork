@@ -1,6 +1,6 @@
 import {
 	type ComposerDocument,
-	composerDocumentText,
+	composerDocumentTextCandidates,
 	MAX_COMPOSER_DOCUMENT_BYTES,
 	parseComposerDocument,
 } from "@shared/composer-document";
@@ -30,8 +30,10 @@ export function restoreMultipartComposerText(
 	document: ComposerDocument | undefined,
 ): string {
 	if (!document) return value;
-	const { text } = composerDocumentText(document);
-	return value !== text && text.replace(/\r\n|\r|\n/g, "\r\n") === value ? text : value;
+	for (const { text } of composerDocumentTextCandidates(document)) if (value === text) return value;
+	for (const { text } of composerDocumentTextCandidates(document))
+		if (text.replace(/\r\n|\r|\n/g, "\r\n") === value) return text;
+	return value;
 }
 export function validateComposerProjection(
 	document: ComposerDocument | undefined,
@@ -39,7 +41,6 @@ export function validateComposerProjection(
 	references: readonly FileReference[] = [],
 ): void {
 	if (!document) return;
-	const projected = composerDocumentText(document);
 	const canonical = (ref: FileReference) => [
 		ref.id,
 		ref.deviceId,
@@ -56,10 +57,14 @@ export function validateComposerProjection(
 		ref.inputRange ?? null,
 		ref.expectedHash ?? null,
 	];
+	const expected = JSON.stringify(references.map(canonical));
+	// Stale clients, queued rows and drafts may still carry the legacy quote-prefix projection.
 	if (
-		projected.text !== text ||
-		JSON.stringify(projected.fileReferences.map(canonical)) !==
-			JSON.stringify(references.map(canonical))
+		!composerDocumentTextCandidates(document).some(
+			(projected) =>
+				projected.text === text &&
+				JSON.stringify(projected.fileReferences.map(canonical)) === expected,
+		)
 	)
 		throw new ValidationError("Composer document does not match text or file references");
 }
@@ -129,18 +134,11 @@ export function validateComposerAssets(
 		assets.forEach((asset, index) => {
 			const file = files[index];
 			const name = file.name ?? file.filename;
-			// File.type is a MIME, but persisted content blocks use type as a discriminator.
-			const mime =
-				file.sourceMimeType ??
-				file.mimeType ??
-				file.mediaType ??
-				(file.type?.includes("/") ? file.type : undefined);
+			// MIME is advisory, not identity: multipart may rewrite aliases/defaults,
+			// and image decoding may detect a different format. Upload validation owns type safety.
 			if (
 				(name !== undefined && asset.name !== name) ||
-				(file.size !== undefined && asset.size !== file.size) ||
-				(mime !== undefined &&
-					asset.mimeType.split(";")[0].trim().toLowerCase() !==
-						mime.split(";")[0].trim().toLowerCase())
+				(file.size !== undefined && asset.size !== file.size)
 			)
 				throw new ValidationError("Composer attachment metadata does not match uploads");
 		});

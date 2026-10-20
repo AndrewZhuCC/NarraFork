@@ -1,24 +1,17 @@
-/**
- * Two provider outcomes a subagent used to swallow.
- *
- * Both share a failure shape that is worse than an error: the pass sets no
- * `hasError`, no `finalText`, and no retryable flag, so the run reached the
- * end-of-loop finalText backfill and handed the parent the subagent's PREVIOUS
- * assistant text — or "(no output)" — as if the work had finished. A refused
- * payment and a dropped socket both silently became "done".
- *
- * The decisions are pure functions (the same seam `planSubagentInterruption` and
- * `planSubagentCompactRestart` use) so both branches are pinned without standing up
- * a loop and without `mock.module`, which is process-wide in Bun and leaks into
- * every later-loaded suite.
- */
-import { describe, expect, test } from "bun:test";
-import {
-	MAX_SUBAGENT_INTERRUPTION_RETRIES,
-	planSubagentPaymentRequired,
-	planSubagentSilentDisconnect,
-	SUBAGENT_SILENT_DISCONNECT_ERROR,
-} from "../subagent-executor";
+/** Provider failures are tested against the common runtime, never retired delegated helpers. */
+import { describe, expect, spyOn, test } from "bun:test";
+import { db } from "../../db";
+import { narrators } from "../../db/schema";
+import { generateId } from "../../lib/id";
+import { settings } from "../../lib/settings";
+import { executeRuntimeRetry } from "../agent-runtime/orchestrator";
+import { startNarratorRun } from "../agent-runtime/run";
+import { createRuntimeRecoveryState, selectRuntimeRecovery } from "../agent-runtime/transition";
+import type { ExecuteLoopResult } from "../narrator-executor";
+import * as executor from "../narrator-executor";
+import * as recovery from "../narrator-recovery";
+import { narratorService } from "../narrator-service";
+import { MAX_TURN_INTERRUPTION_RETRIES } from "../turn-continuation-decisions";
 
 const paymentRequired = {
 	message: "Balance exhausted; top up to continue.",
@@ -28,102 +21,164 @@ const paymentRequired = {
 	required: 120,
 	resumeAction: "retry" as const,
 };
+const completed = { finalText: "", hasError: false, shouldUpdateTitle: false };
+function select(
+	result: Partial<ExecuteLoopResult>,
+	previousRetries = 0,
+	maxRetries = 3,
+	aborted = false,
+) {
+	const state = { ...createRuntimeRecoveryState(), transientRetries: previousRetries };
+	return selectRuntimeRecovery(state, {
+		result: { ...completed, ...result },
+		aborted,
+		planApproved: false,
+		stateful: true,
+		maxTransientRetries: maxRetries,
+	});
+}
+async function runPayment(failure: Partial<ExecuteLoopResult> = { paymentRequired }) {
+	const id = generateId();
+	const now = new Date().toISOString();
+	const before = settings.anthropicProviders;
+	settings.anthropicProviders = [
+		{
+			id: "payment-test",
+			name: "Payment test",
+			prefix: "paymenttest",
+			apiKey: "test-only",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "claude-sonnet-4",
+		},
+	];
+	await db.insert(narrators).values({
+		id,
+		type: "primary",
+		variant: "primary",
+		traits: ["standalone"],
+		model: "paymenttest:claude-sonnet-4",
+		autoContinuationOverride: "off",
+		createdAt: now,
+		updatedAt: now,
+	});
+	const provider = spyOn(executor, "executeAgentLoop").mockResolvedValue({
+		...completed,
+		...failure,
+	});
+	try {
+		const run = await startNarratorRun({
+			narratorId: id,
+			locale: "en",
+			text: "finish work",
+			principal: null,
+			foreground: true,
+		});
+		const result = await run.terminal;
+		expect(provider).toHaveBeenCalledTimes(1);
+		return { result, row: await narratorService.getById(id) };
+	} finally {
+		provider.mockRestore();
+		settings.anthropicProviders = before;
+	}
+}
 
-describe("planSubagentPaymentRequired", () => {
+describe("common payment-required recovery", () => {
 	test("does nothing when the provider did not refuse", () => {
-		expect(planSubagentPaymentRequired({}, false)).toEqual({ action: "none" });
+		expect(select({})).toEqual({ kind: "completed" });
 	});
-
-	test("ends the run with a stated reason rather than an empty success", () => {
-		// The load-bearing assertion: finalText is non-empty and names the cause, so the
-		// end-of-run backfill cannot substitute a stale previous answer for it.
-		const plan = planSubagentPaymentRequired({ paymentRequired }, false);
-		expect(plan.action).toBe("fail");
-		if (plan.action !== "fail") throw new Error("expected a terminal plan");
-		expect(plan.finalText).toContain("Balance exhausted");
-		expect(plan.finalText.startsWith("Error:")).toBe(true);
+	test("ends the run with a stated reason rather than an empty success", async () => {
+		const { result } = await runPayment();
+		expect(result.finalText).toContain("Balance exhausted");
+		expect(result.finalText).toContain("Payment required:");
 	});
-
-	test("carries the payload shape the recharge prompt is parsed from", () => {
-		// The subagent's own panel decides between "recharge" and a generic failure by
-		// parsing this JSON; a plain message string would render as an unexplained error.
-		const plan = planSubagentPaymentRequired({ paymentRequired }, false);
-		if (plan.action !== "fail") throw new Error("expected a terminal plan");
-		expect(JSON.parse(plan.errorMessage)).toEqual({
+	test("carries the payload shape the recharge prompt is parsed from", async () => {
+		const { row } = await runPayment();
+		expect(JSON.parse(row.errorMessage ?? "{}")).toEqual({
 			type: "payment_required",
 			...paymentRequired,
 		});
 	});
-
 	test("stays quiet on an aborted run", () => {
-		// The run is already ending for a reason the caller owns; a recharge prompt on a
-		// session nobody is waiting for is noise.
-		expect(planSubagentPaymentRequired({ paymentRequired }, true)).toEqual({ action: "none" });
+		expect(select({ paymentRequired }, 0, 3, true)).toEqual({ kind: "aborted" });
 	});
 });
 
-describe("planSubagentSilentDisconnect", () => {
+test("ordinary run without deliverTo keeps the quota recovery JSON after terminal settlement", async () => {
+	const quotaResetAt = Date.now() + 86_400_000;
+	const { row, result } = await runPayment({
+		hasError: true,
+		modelUnavailable: {
+			message: "Quota exhausted",
+			model: "kimi-model",
+			provider: "anthropic",
+			providerPrefix: "paymenttest",
+			waitKind: "quota",
+			quotaResetAt,
+		},
+	});
+	expect(result.hasError).toBe(true);
+	expect(row.status).toBe("idle");
+	expect(JSON.parse(row.errorMessage ?? "{}")).toMatchObject({
+		type: "kimi_quota_exhausted",
+		reason: "reset-beyond-budget",
+		quotaResetAt,
+	});
+});
+
+describe("common silent-disconnect recovery", () => {
 	test("does nothing when the socket did not close quietly", () => {
-		expect(planSubagentSilentDisconnect({}, 0, 3, false)).toEqual({ action: "none" });
+		expect(select({})).toEqual({ kind: "completed" });
 	});
-
 	test("retries within the shared transient budget", () => {
-		expect(planSubagentSilentDisconnect({ silentDisconnect: true }, 0, 3, false)).toEqual({
-			action: "retry",
-			retries: 1,
+		expect(select({ silentDisconnect: true })).toMatchObject({
+			kind: "backoff",
+			retryCount: 1,
+			maxRetries: 3,
 		});
 	});
-
 	test("advances the shared counter instead of restarting it", () => {
-		// The regression this guards: the success path resets `transientRetries` to 0
-		// every pass. If the disconnect branch ran after that reset — or ignored the
-		// incoming count — each reconnect would look like the first and the bounded
-		// retry would become an unbounded loop against a dead socket.
-		expect(planSubagentSilentDisconnect({ silentDisconnect: true }, 2, 3, false)).toEqual({
-			action: "retry",
-			retries: 3,
-		});
+		expect(select({ silentDisconnect: true }, 2)).toMatchObject({ kind: "backoff", retryCount: 3 });
 	});
-
-	test("fails once the budget is spent", () => {
-		expect(planSubagentSilentDisconnect({ silentDisconnect: true }, 3, 3, false)).toEqual({
-			action: "fail",
-			retries: 4,
-		});
+	test("fails once the budget is spent", async () => {
+		const transition = select({ silentDisconnect: true }, 3);
+		if (transition.kind !== "backoff") throw new Error("expected shared retry effect");
+		const id = generateId();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		const handler = spyOn(recovery, "handleTransientError");
+		try {
+			const outcome = await executeRuntimeRetry(createRuntimeRecoveryState(), transition, {
+				narratorId: id,
+				locale: "en",
+				signal: new AbortController().signal,
+				finalizePartial: async () => false,
+			});
+			expect(outcome).toEqual({ kind: "failed", error: "Codex WebSocket silent disconnect" });
+			expect(handler).toHaveBeenCalledWith(
+				expect.objectContaining({ retryCount: 4, maxRetries: 3 }),
+			);
+		} finally {
+			handler.mockRestore();
+		}
 	});
-
 	test("honours the unlimited-retry sentinel", () => {
-		// -1 is handleTransientError's own "no limit" contract (Codex account failover).
-		expect(planSubagentSilentDisconnect({ silentDisconnect: true }, 99, -1, false)).toEqual({
-			action: "retry",
-			retries: 100,
+		expect(select({ silentDisconnect: true }, 99, -1)).toMatchObject({
+			kind: "backoff",
+			retryCount: 100,
+			maxRetries: -1,
 		});
 	});
-
 	test("stays quiet on an aborted run", () => {
-		// Nothing to retry into, and an abort must not pay for a backoff sleep before
-		// its transcript is written.
-		expect(planSubagentSilentDisconnect({ silentDisconnect: true }, 0, 3, true)).toEqual({
-			action: "none",
+		expect(select({ silentDisconnect: true }, 0, 3, true)).toEqual({ kind: "aborted" });
+	});
+	test("the exhausted error text is stated, not empty", () => {
+		expect(select({ silentDisconnect: true })).toMatchObject({
+			error: "Codex WebSocket silent disconnect",
 		});
 	});
-
-	test("the exhausted error text is stated, not empty", () => {
-		// What the parent receives as the tool_result when retries run out.
-		expect(SUBAGENT_SILENT_DISCONNECT_ERROR.length).toBeGreaterThan(0);
-		expect(`Error: ${SUBAGENT_SILENT_DISCONNECT_ERROR}`).toContain("silent disconnect");
-	});
-
 	test("the disconnect budget is independent of the interruption budget", () => {
-		// They are different failures with different counters; conflating them would
-		// make a run of interruptions shorten the reconnect allowance and vice versa.
-		expect(
-			planSubagentSilentDisconnect(
-				{ silentDisconnect: true },
-				MAX_SUBAGENT_INTERRUPTION_RETRIES + 1,
-				-1,
-				false,
-			).action,
-		).toBe("retry");
+		expect(select({ silentDisconnect: true }, MAX_TURN_INTERRUPTION_RETRIES + 1, -1)).toMatchObject(
+			{ kind: "backoff", maxRetries: -1 },
+		);
 	});
 });

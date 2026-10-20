@@ -109,6 +109,9 @@ interface CustomApiProviderSectionProps {
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	onBatchToggleHidden: (modelValues: string[], hidden: boolean) => void;
+	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
+	modelProtocols: Record<string, CustomApiProtocol>;
+	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
@@ -136,6 +139,8 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	hiddenModels,
 	onToggleHidden,
 	onBatchToggleHidden,
+	modelProtocols,
+	onModelProtocolChange,
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
@@ -674,6 +679,8 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						hiddenModels={hiddenModels}
 						onToggleHidden={onToggleHidden}
 						onBatchToggleHidden={onBatchToggleHidden}
+						modelProtocols={modelProtocols}
+						onModelProtocolChange={onModelProtocolChange}
 						modelContextWindows={modelContextWindows}
 						onContextWindowChange={onContextWindowChange}
 						onTestModel={onTestModel}

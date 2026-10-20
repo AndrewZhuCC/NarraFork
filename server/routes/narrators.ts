@@ -25,8 +25,6 @@ import {
 	eq,
 	exists,
 	gt,
-	gte,
-	inArray,
 	isNotNull,
 	isNull,
 	lt,
@@ -158,6 +156,7 @@ import {
 	type PromptOptimizeStyle,
 } from "../lib/prompts/prompt-optimize";
 import { saveRequestRecording } from "../lib/request-recorder";
+import { policySourceIdOf } from "../lib/runtime-source";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
@@ -203,8 +202,8 @@ import {
 	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
+	restoreNarratorDraftSchema,
 	retryFailedCompactSchema,
-	revertFilesSchema,
 	revertScopeSchema,
 	rollbackToBlockSchema,
 	segmentCompactSchema,
@@ -274,13 +273,9 @@ import { captureFileReferences } from "../services/file-reference-service";
 import {
 	applyToolCall,
 	type DeviceFileIdentity,
-	type DeviceFileState,
-	deviceFileKey,
 	FileHistoryError,
-	getAffectedDeviceFilesStrict,
 	getToolCallFileIdentityStrict,
 	rebuildDeviceFileState,
-	rebuildDeviceFileStatesExcluding,
 } from "../services/file-state-rebuild";
 import {
 	getNarratorGitIdentityPick,
@@ -314,6 +309,7 @@ import {
 	getNarratorDraft,
 	getNarratorIdsWithDraft,
 	narratorHasDraft,
+	restoreNarratorDraftPrevious,
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
@@ -353,11 +349,7 @@ import {
 	requireSqliteLazyRefsBackfill,
 	resolveLazyLineage,
 } from "../services/narrator-refs-backfill";
-import {
-	previewNarratorScopedForToolUses,
-	previewNarratorScopedFromSeq,
-	revertNarratorScopedFromSeq,
-} from "../services/narrator-scoped-revert";
+import { previewNarratorScopedForToolUses } from "../services/narrator-scoped-revert";
 import {
 	handleBashCommand,
 	handleBlockAllSkillsCommand,
@@ -372,7 +364,6 @@ import {
 } from "../services/narrator-service";
 import {
 	acceptUserMessage,
-	awaitCompactCompletion,
 	type BufferCreator,
 	cancelCompact,
 	cancelPendingExitPlanMode,
@@ -390,6 +381,7 @@ import {
 	isNarratorActive,
 	normalizeRollbackBlockIndexForMessage,
 	persistGoalAddedNotice,
+	readSessionDeliverTo,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
 	reorderBufferedMessages,
@@ -404,7 +396,6 @@ import {
 	runSegmentCompact,
 	sendMessage,
 	setNarratorDefaultDevice,
-	setTemporaryModelRestore,
 	startInjectionContinuationIfPossible,
 	startSpecContinuationIfPossible,
 	toBufferSummary,
@@ -457,16 +448,11 @@ import { resolveSessionLocation } from "../services/session-interchange/location
 import { buildSessionDownload, writeSessionExport } from "../services/session-interchange/sinks";
 import { skillService } from "../services/skill-service";
 import {
-	buildImpreciseRevertWarnings,
 	DEFAULT_REVERT_SCOPE,
-	finalizeSnapshotRevert,
-	loadTreePreviewContents,
-	previewSeqTreeRevert,
 	type RevertResult,
 	type RevertScope,
-	type RevertWarning,
 	resolveNarratorCwd,
-	revertFromSeqTree,
+	SnapshotRevertError,
 	unavailableSnapshotRevert,
 } from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
@@ -476,8 +462,6 @@ import {
 	resolveSubagentModelForRun,
 	resolveSubagentModelInheritance,
 } from "../services/subagent-model";
-import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
-import { TAKEN_OVER_SUBSTATUS } from "../services/subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
@@ -623,6 +607,13 @@ export async function parseMessageRequest(
 }
 
 export const narratorRoutes = new Hono();
+narratorRoutes.onError((error, c) => {
+	if (error instanceof SnapshotRevertError) {
+		c.header("Cache-Control", "no-store");
+		return c.json(revertConflictBody(error.result), 409);
+	}
+	throw error;
+});
 
 /**
  * The narrator HTTP surface still depends on the SQLite-shaped narrator domain, session, ACL, and
@@ -821,6 +812,7 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 	// Mixed history/file handlers below check only after parsing skipRevert; their
 	// history-only branch (and retry) must never depend on file restoration support.
 	const scopedRevert =
+		subPath === "revert" ||
 		subPath === "revert-action-preview" ||
 		subPath === "revert-plans" ||
 		/^revert-plans\/[^/]+\/apply$/.test(subPath);
@@ -833,7 +825,7 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 	// Apply owns its exclusive admission through whenSettled; wrapping it in shared
 	// work would deadlock it. Preview remains a shared read/selection operation and
 	// must not interrupt an active narrator before confirmation.
-	if (need === "write" && !/^revert-plans\/[^/]+\/apply$/.test(subPath))
+	if (need === "write" && subPath !== "revert" && !/^revert-plans\/[^/]+\/apply$/.test(subPath))
 		return withNarratorWorkAdmission(id, next);
 	return next();
 });
@@ -1119,6 +1111,7 @@ narratorRoutes.get("/", async (c) => {
 
 		const [list, countResult] = await Promise.all([
 			db.query.narrators.findMany({
+				columns: { runtimeRegistrationJson: false },
 				where: whereClause,
 				orderBy: [orderFn(column), orderFn(narrators.id)],
 				limit: limit + 1,
@@ -1389,11 +1382,6 @@ narratorRoutes.post("/", async (c) => {
 narratorRoutes.post("/:id/subagents", async (c) => {
 	const parentNarratorId = c.req.param("id");
 	const parent = await narratorService.getById(parentNarratorId);
-	const inheritedTraits = parseTraits(parent.traits).filter(
-		(trait) =>
-			trait.startsWith(DISABLED_TOOLS_TRAIT_PREFIX) ||
-			trait.startsWith(BLOCKED_SKILLS_TRAIT_PREFIX),
-	);
 	const child = await narratorService.createSubagent({
 		parentNarratorId,
 		subagentOriginKind: "standalone",
@@ -1401,10 +1389,9 @@ narratorRoutes.post("/:id/subagents", async (c) => {
 		cwd: parent.cwd ?? ".",
 		model: resolveEffectiveModel(parent.model),
 		reasoningEffort: parent.reasoningEffort ?? resolveDefaultReasoningEffort(),
-		inheritedTraits,
 	});
 	// createSubagent's tool-born default is working; a child without a run must be idle
-	// so its first user message starts the existing resume path instead of being queued.
+	// so its first user message starts the shared run entry instead of being queued.
 	await narratorService.updateStatus(child.id, "idle");
 	return c.json(publicNarratorResponse({ ...child, status: "idle" }), 201);
 });
@@ -1787,20 +1774,9 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		id,
 		parsed.data.text,
 		parsed.data.sourceId,
-		parsed.data.baseRevision,
 		parsed.data.fileReferences,
 		parsed.data.composerDocument,
 	);
-	if ("conflict" in update) {
-		return c.json(
-			{
-				error: "Draft changed on another client",
-				code: "DRAFT_REVISION_CONFLICT",
-				current: update.current,
-			},
-			409,
-		);
-	}
 
 	broadcastToUser(userId, {
 		type: "draft_changed",
@@ -1829,6 +1805,46 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		updatedAt: update.updatedAt,
 		updatedBy: update.updatedBy,
 		sourceId: update.sourceId,
+		hasPrevious: update.hasPrevious,
+	});
+});
+
+narratorRoutes.post("/:id/draft/restore", async (c) => {
+	const id = c.req.param("id");
+	const userId = c.get("user").sub;
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = restoreNarratorDraftSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await narratorService.getById(id);
+	const update = await restoreNarratorDraftPrevious(userId, id, parsed.data.sourceId);
+	if (!update) throw new NotFoundError("Draft undo slot", id);
+	broadcastToUser(userId, {
+		type: "draft_changed",
+		narratorId: id,
+		hasDraft: update.hasDraft,
+		text: update.text,
+		fileReferences: update.fileReferences,
+		hasComposerDocument: !!update.composerDocument,
+		revision: update.revision,
+		updatedAt: update.updatedAt,
+		updatedBy: update.updatedBy,
+		sourceId: update.sourceId,
+	});
+	await syncNarratorDraftToRecentTabs(userId, id, {
+		promote: !update.previousHasDraft && update.hasDraft,
+	});
+	return c.json({
+		ok: true,
+		composerDocument: update.composerDocument,
+		hasDraft: update.hasDraft,
+		text: update.text,
+		fileReferences: update.fileReferences,
+		hasComposerDocument: !!update.composerDocument,
+		revision: update.revision,
+		updatedAt: update.updatedAt,
+		updatedBy: update.updatedBy,
+		sourceId: update.sourceId,
+		hasPrevious: update.hasPrevious,
 	});
 });
 
@@ -2049,6 +2065,7 @@ async function updateNarratorTraits(id: string, update: (traits: string[]) => st
 		narratorTraits: traits,
 		projectId: await resolveNarratorProjectId(narratorRow),
 		actingUserId: null,
+		policySourceId: policySourceIdOf(narratorRow),
 	});
 	updateActiveDisabledTools(id, getDisabledToolSet(effective.traits));
 	const blocked = getBlockedSkills(effective.traits);
@@ -2193,7 +2210,7 @@ narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	let narrator = await narratorService.getById(id); // throws NotFoundError if missing
+	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
 
 	// Auto-unarchive on interaction
 	if (narrator.status === "archived") {
@@ -2212,11 +2229,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	} = await parseMessageRequest(c, id);
 	// Explicit mode wins over legacy booleans; omission retains existing callers.
 	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
-	const priority = queueMode
-		? queueMode !== "turn"
-		: isSubagentVariant(narrator.variant)
-			? requestedPriority
-			: requestedPriority || interrupt;
+	const priority = queueMode ? queueMode !== "turn" : requestedPriority || interrupt;
 	const userId = c.get("user").sub;
 	// Only a successfully persisted message/queue owns these uploads. In particular,
 	// a rejected reference must not strand images saved by multipart parsing.
@@ -2236,16 +2249,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// starting a turn right now. Evaluated up-front because two independent paths need
 		// the same answer: the `/goal` fast path (which would otherwise mutate tasks.json
 		// and start a Spec turn against the history being replaced) and the ordinary send
-		// path. `priority` is the user's explicit cut-in and opts out.
-		//
-		// Subagents are excluded, and not for lack of care: their queue lives in a separate
-		// map that only accepts input while a foreground runner is attached, and
-		// `resumeBufferedMessagesIfIdle` declines for subagents by design. Queuing an idle
-		// compacting subagent would therefore strand the message with no consumer, so that
-		// window keeps the blocking wait below.
+		// path. `priority` is the user's explicit cut-in and opts out. Every session —
+		// delegated or not — has the same mailbox and post-compact drain.
 		const compactionQueueEligible = !priority && getQueueDuringCompaction();
-		const queueBehindCompaction =
-			compactionQueueEligible && !isSubagentVariant(narrator.variant) && isCompactInProgress(id);
+		const queueBehindCompaction = compactionQueueEligible && isCompactInProgress(id);
 
 		// Resolve slash commands
 		let finalMessage = message;
@@ -2276,7 +2283,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// deliberately retain their existing live-session behavior.
 		if (
 			interrupt &&
-			!isSubagentVariant(narrator.variant) &&
 			cmdResult.resolved &&
 			!("expandedPrompt" in cmdResult) &&
 			!("loadSkill" in cmdResult) &&
@@ -2484,17 +2490,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// current history.
 		if (queueBehindCompaction) narratorBusy = true;
 
-		// A compacting SUBAGENT cannot use that queue (see `compactionQueueEligible`), so it
-		// keeps the original blocking wait: still better than racing the summary, just
-		// without the cancellable card.
-		if (!narratorBusy && compactionQueueEligible && isCompactInProgress(id)) {
-			await awaitCompactCompletion(id);
-			narrator = await narratorService.getById(id);
-			narratorBusy =
-				!isExecutionSuspended(id) &&
-				(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id));
-		}
-
 		if (queuedNewCommand && !narratorBusy) {
 			const currentCwd = narrator.cwd ?? undefined;
 			const newModel =
@@ -2541,97 +2536,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			return c.json({ newNarrator: publicNarratorResponse(newNarrator) }, 201);
 		}
 
-		// Running narrator: buffer the message for the next configured safe boundary.
-		if (narratorBusy) {
-			if (isSubagentVariant(narrator.variant)) {
-				if (queuedNewCommand) {
-					throw new ValidationError("/new cannot be queued from a running subagent");
-				}
-				if (prePromptBashCommand) {
-					throw new ValidationError(
-						"runBashFirst commands are not yet supported while resuming a subagent",
-					);
-				}
-
-				const { bufferSubagentUserMessage, isTakenOver } = await import(
-					"../services/narrator-subagent"
-				);
-				const { getSubagentBufferedMessagesAsync } = await import("../services/subagent-executor");
-				const takenOver = isTakenOver(id);
-				const result = await bufferSubagentUserMessage(id, finalMessage, {
-					images: images.length > 0 ? images : undefined,
-					textFiles: textFiles.length > 0 ? textFiles : undefined,
-					commandText,
-					createdBy: userId,
-					prePromptBashCommand,
-					priority,
-					queueMode,
-					requestSoftStop: !takenOver,
-					fileReferences: snapshots,
-					composerDocument: finalMessage === message ? composerDocument : undefined,
-				});
-				if (!result.ok) {
-					if (result.full) throw new ValidationError("Message queue is full");
-					throw new ValidationError("Subagent is not running in foreground");
-				}
-				uploadsAccepted = true;
-				const messages = toBufferSummary(await getSubagentBufferedMessagesAsync(id));
-				broadcastToNarrator(id, {
-					type: "buffer_set",
-					narratorId: id,
-					messages,
-				});
-				return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
-			}
-		}
-
 		const locale = await getUserLanguage(userId);
 		const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-		// Primary overrides belong to the accepted input, not the currently running turn.
-		// Subagent resume keeps its existing idle-only contract.
-		const applyModelOverride =
-			!!modelOverride?.model && !narratorBusy && isSubagentVariant(narrator.variant);
-		if (applyModelOverride && modelOverride?.model) {
-			if (modelOverride.mode === "temporary") {
-				// Persist the original model so it can be restored after the turn
-				// (survives server restarts). Must be written before admission to
-				// avoid a race with the agent loop's finally block.
-				await setTemporaryModelRestore(id, narrator.model ?? "__default__");
-			}
-			// Switch model in DB before admission starts an idle turn.
-			await narratorService.updateModel(id, modelOverride.model);
-		}
-
-		if (isSubagentVariant(narrator.variant)) {
-			if (prePromptBashCommand) {
-				throw new ValidationError(
-					"runBashFirst commands are not yet supported while resuming a subagent",
-				);
-			}
-			const resumed = await resumeSubagent({
-				subagentId: id,
-				intent: "follow_up",
-				actor: "user",
-				prompt: finalMessage,
-				fileReferences: snapshots,
-				composerDocument: finalMessage === message ? composerDocument : undefined,
-				images: images.length > 0 ? images : undefined,
-				textFiles: textFiles.length > 0 ? textFiles : undefined,
-				commandText,
-				createdBy: userId,
-				locale,
-			});
-			uploadsAccepted = true;
-			if (modelOverride?.model) {
-				updateNarratorModel(id, modelOverride.model);
-			}
-			return c.json(
-				resumed.userMessage ? fileReferenceMessageForDisplay(resumed.userMessage) : { ok: true },
-				201,
-			);
-		}
-
+		// Every session takes the same admission: a running one (including a run the
+		// user holds) queues the input for its next safe boundary, an idle one starts.
+		// Model overrides belong to the accepted input, not to the running turn.
 		const user = await db.query.users.findFirst({
 			where: eq(users.id, userId),
 			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
@@ -2699,29 +2609,12 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
 
-	if (
-		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
-	) {
-		throw new ValidationError("Cannot retry on a running subagent");
-	}
-
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
 	}
 
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
-	if (isSubagentVariant(narrator.variant)) {
-		await resumeSubagent({
-			subagentId: id,
-			intent: "retry_last_input",
-			actor: "user",
-			createdBy: userId,
-			locale,
-		});
-		return c.json({ ok: true });
-	}
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId);
@@ -2772,17 +2665,6 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
 		});
 	}
-	if (isSubagentVariant(narrator.variant)) {
-		await resumeSubagent({
-			subagentId: id,
-			intent: "continue_tool_results",
-			actor: "user",
-			createdBy: userId,
-			locale,
-		});
-		await dismissRecoveryMessage();
-		return c.json({ ok: true, deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [] });
-	}
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	// Seamless subagent recovery: when the latest assistant turn still holds
@@ -2819,9 +2701,6 @@ narratorRoutes.post("/:id/continue", async (c) => {
 narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	if (isSubagentVariant(narrator.variant)) {
-		throw new ValidationError("Subagent recovery is only available on a primary narrator");
-	}
 	// Reconcile FIRST, then judge. The recovery card is shown precisely when a turn
 	// died, and a subagent's permission gate used to mirror `working` onto this
 	// narrator afterwards — leaving a status with no runtime owner that rejected this
@@ -2916,26 +2795,6 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	if (isSubagentVariant(narrator.variant)) {
-		const resumed = await resumeSubagent({
-			subagentId: id,
-			intent: "retry_denied_tool",
-			actor: "user",
-			retryToolUseId: toolUseId,
-			createdBy: userId,
-			locale,
-			replyInUserLanguage,
-		});
-		if (!resumed.started && resumed.retryDeniedReason) {
-			const statusCode = resumed.retryDeniedReason === "not_found" ? 404 : 400;
-			return c.json(
-				{ error: "Cannot re-execute tool call", reason: resumed.retryDeniedReason },
-				statusCode,
-			);
-		}
-		return c.json({ ok: true });
-	}
-
 	const result = await reExecuteDeniedToolCall(id, toolUseId, locale, replyInUserLanguage, userId);
 	if (!result.ok) {
 		const statusCode = result.reason === "not_found" ? 404 : 400;
@@ -2948,7 +2807,15 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const { blockIndex, skipRevert, scope } = rollbackToBlockSchema.parse(await c.req.json());
+	const { blockIndex, skipRevert, scope, revertPlan } = rollbackToBlockSchema.parse(
+		await c.req.json(),
+	);
+	if (skipRevert !== true && !revertPlan)
+		throw new AppError(
+			"Review a fresh rollback preview before restoring files",
+			409,
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
 	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
 
 	const narrator = await narratorService.getById(id);
@@ -2965,7 +2832,10 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	}
 
 	const result = await rollbackToBlock(id, messageId, blockIndex, {
+		revertPlan,
 		skipRevert: skipRevert === true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 		...(scope ? { scope } : {}),
 	});
 	return c.json(result);
@@ -3015,6 +2885,9 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	// Undefined => the legacy `rollback` field decides (see below), then default true.
 	let skipRevert: boolean | undefined;
 	let legacyRollback: boolean | undefined;
+	let revertPlan:
+		| import("../services/narrator-scoped-revert").ConfirmedScopedRevertPlan
+		| undefined;
 	let scope: RevertScope | undefined;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
@@ -3052,6 +2925,15 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		if (typeof rawRollback === "string") legacyRollback = rawRollback === "true";
 		const rawScope = formData.get("scope");
 		scope = revertScopeSchema.parse(typeof rawScope === "string" ? rawScope : undefined);
+		const rawPlan = formData.get("revertPlan");
+		if (rawPlan !== null) {
+			if (typeof rawPlan !== "string") throw new ValidationError("Invalid confirmed revert plan");
+			try {
+				revertPlan = editAndRegenerateJsonSchema.shape.revertPlan.parse(JSON.parse(rawPlan));
+			} catch {
+				throw new ValidationError("Invalid confirmed revert plan");
+			}
+		}
 		if (typeof formData.get("keepImageIds") === "string") {
 			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
 		}
@@ -3093,6 +2975,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		composerDocument = body.composerDocument;
 		skipRevert = body.skipRevert;
 		legacyRollback = body.rollback;
+		revertPlan = body.revertPlan;
 		scope = body.scope;
 		keepImageIds = body.keepImageIds;
 		keepTextFilePaths = body.keepTextFilePaths;
@@ -3103,6 +2986,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	// what the old UI offered and the server then ignored. Neither present => revert,
 	// preserving the behaviour every edit actually had.
 	const revertFiles = skipRevert !== undefined ? !skipRevert : (legacyRollback ?? true);
+	if (revertFiles && !revertPlan)
+		throw new AppError(
+			"Review a fresh edit preview before restoring files",
+			409,
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
 
 	const narrator = await narratorService.getById(id);
 	const userId = c.get("user").sub;
@@ -3132,35 +3021,6 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	if (isSubagentVariant(narrator.variant)) {
-		// The revert choice has to be forwarded explicitly here. Editing a subagent
-		// message runs through resumeSubagent rather than calling editAndRegenerate
-		// directly, so a field left off this object is simply dropped — which is how
-		// the old `rollback` flag came to be ignored in the first place.
-		const resumed = await resumeSubagent({
-			subagentId: id,
-			intent: "regenerate_edited_message",
-			actor: "user",
-			editMessageId: messageId,
-			editContent: content,
-			editRevertFiles: revertFiles,
-			...(scope ? { editRevertScope: scope } : {}),
-			editKeepImageIds: keepImageIds,
-			editNewImages: newImages.length > 0 ? newImages : undefined,
-			editKeepTextFilePaths: keepTextFilePaths,
-			editNewTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
-			editFileReferences: snapshots,
-			editComposerDocument: composerDocument,
-			createdBy: userId,
-			locale,
-			replyInUserLanguage,
-		});
-		return c.json({
-			ok: resumed.started,
-			...(resumed.revertWarnings?.length ? { warnings: resumed.revertWarnings } : {}),
-		});
-	}
-
 	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage, {
 		fileReferences: snapshots,
 		composerDocument,
@@ -3170,12 +3030,14 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
 		userId,
 		revertFiles,
+		revertPlan,
 		...(scope ? { revertScope: scope } : {}),
 	});
 	// Editing acknowledges the rewrite; refreshed message bubbles arrive separately.
 	// Do not expose internal message/snapshot fields if the service result grows.
 	return c.json({
 		ok: result.ok,
+		...(result.revertResult ? { revertResult: result.revertResult } : {}),
 		...(result.warnings?.length ? { warnings: result.warnings } : {}),
 	});
 });
@@ -3191,13 +3053,6 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 	const { content } = editAssistantMessageSchema.parse(body);
 
 	const narrator = await narratorService.getById(id);
-
-	if (
-		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
-	) {
-		throw new ValidationError("Cannot edit on a running subagent");
-	}
 
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
@@ -3215,13 +3070,6 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 
 	const narrator = await narratorService.getById(id);
-
-	if (
-		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
-	) {
-		throw new ValidationError("Cannot restore on a running subagent");
-	}
 
 	if (narrator.status === "archived") {
 		await narratorService.updateStatus(id, "idle");
@@ -3251,10 +3099,8 @@ narratorRoutes.get("/:id/buffer", async (c) => {
 	return c.json(await resolveBufferQueue(id));
 });
 
-/** Actor policy is separate from the shared mailbox storage. */
 interface LocatedBufferedMessage {
 	message: BufferedMessage;
-	fromSubagentQueue: boolean;
 }
 
 async function locateBufferedMessage(
@@ -3262,9 +3108,7 @@ async function locateBufferedMessage(
 	messageId: string,
 ): Promise<LocatedBufferedMessage | null> {
 	const message = (await getBufferedMessagesAsync(narratorId)).find((m) => m.id === messageId);
-	if (!message) return null;
-	const narrator = await narratorService.getById(narratorId);
-	return { message, fromSubagentQueue: isSubagentVariant(narrator.variant) };
+	return message ? { message } : null;
 }
 
 /**
@@ -3311,8 +3155,7 @@ function resolveKeptBufferAttachments(
 /**
  * Filenames of a queued message's text files, in the order the summary reports.
  *
- * Mirrors `toBufferSummary`: persisted metadata first (it is what the primary
- * queue's DB row carries), then the in-memory File objects a subagent queue holds.
+ * Mirrors `toBufferSummary`: the persisted metadata the mailbox row carries.
  */
 function bufferedTextFileNames(located: LocatedBufferedMessage): string[] {
 	return (located.message._savedFiles ?? []).map((file) => file.filename);
@@ -3418,10 +3261,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	if (keptTextFileIndexes.length + newTextFiles.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
 	}
-	// The primary buffer consumer interprets /new and /goal rather than sending
-	// them as ordinary model turns. Editing must not bypass send-time rejection.
+	// The buffer consumer interprets /new and /goal rather than sending them as
+	// ordinary model turns. Editing must not bypass send-time rejection.
 	if (
-		!located.fromSubagentQueue &&
 		!composerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
 		) &&
@@ -3515,11 +3357,10 @@ async function applyPendingBufferModeControl(
 	id: string,
 	mid: string,
 	mode: import("@shared/buffer-queue-mode").BufferQueueMode,
-	child: boolean,
 ): Promise<boolean> {
-	const applyControl = child
-		? (await import("../services/subagent-executor")).applySubagentBufferedQueueModeControl
-		: (await import("../services/narrator-session")).applyBufferedQueueModeControl;
+	const { applyBufferedQueueModeControl: applyControl } = await import(
+		"../services/narrator-session"
+	);
 	// Always consult async authority: PostgreSQL must not fall into SQLite probes.
 	// Resolve imports first so there is no async gap between authority and signaling.
 	const remaining = await getBufferedMessagesAsync(id);
@@ -3542,7 +3383,6 @@ narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
 	const parsed = updateBufferedMessageModeSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
-	const narrator = await narratorService.getById(id);
 	let shouldWake = false;
 	let awaitDelivery = false;
 	await withNarratorStartAdmission(id, async () => {
@@ -3558,12 +3398,7 @@ narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
 			}
 			throw new AppError("Buffered message was claimed or is no longer pending", 409, "CONFLICT");
 		}
-		shouldWake = await applyPendingBufferModeControl(
-			id,
-			mid,
-			parsed.data.mode,
-			isSubagentVariant(narrator.variant),
-		);
+		shouldWake = await applyPendingBufferModeControl(id, mid, parsed.data.mode);
 		awaitDelivery = shouldWake && parsed.data.mode === "interrupt";
 	});
 	try {
@@ -3589,7 +3424,6 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
 	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
-	const narrator = await narratorService.getById(id);
 	let urgentRetry = false;
 	await withNarratorStartAdmission(id, async () => {
 		// Retain mode before the transition: the recovered row may be claimed immediately.
@@ -3621,7 +3455,6 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 			id,
 			mid,
 			resolveBufferQueueMode(previous?.queueMode, previous?.priority),
-			isSubagentVariant(narrator.variant),
 		);
 	});
 	try {
@@ -3642,10 +3475,8 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
-	// The wrapper cancels from the shared mailbox and clears subagent soft-stop
-	// state; the primary counterpart is cleared below for the same queue identity.
-	const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
-	const ok = await removeSubagentBufferedMessage(id, mid);
+	const { removeBufferedMessage } = await import("../services/narrator-buffer");
+	const ok = await removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	const remaining = await getBufferedMessagesAsync(id);
 	clearBufferedMessageSoftStopIfIdle(
@@ -3675,9 +3506,9 @@ narratorRoutes.put("/:id/buffer/reorder", async (c) => {
 // Clear entire buffer queue
 narratorRoutes.delete("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
-	// One persistent cancellation, plus each actor adapter's ephemeral soft stop.
-	const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
-	await clearSubagentBufferedMessages(id);
+	// One persistent cancellation, then the session's ephemeral soft stop.
+	const { clearBufferedMessages } = await import("../services/narrator-buffer");
+	await clearBufferedMessages(id);
 	const remaining = await getBufferedMessagesAsync(id);
 	clearBufferedMessageSoftStopIfIdle(
 		id,
@@ -4182,17 +4013,32 @@ async function prepareHistoryRewrite(narratorId: string): Promise<void> {
 	}
 }
 
+/**
+ * HTTP deletions only rewrite history. File restores must execute a reviewed plan
+ * (rollback preview, or the single-block delete plan), and multi-block or
+ * message-range deletions have no previewable plan, so they never restore files.
+ */
+function requireHistoryOnlyDeletion(historyOnly: boolean): void {
+	if (!historyOnly)
+		throw new AppError(
+			"Deleting history does not restore files; send skipRevert or review a rollback preview",
+			409,
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
+}
+
 // Batch-delete multiple content blocks across messages
 narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	const narratorId = c.req.param("id");
 	const body = await c.req.json();
 	const { batchDeleteBlocksSchema } = await import("../lib/validators");
-	const { blocks, skipRevert, scope } = batchDeleteBlocksSchema.parse(body);
-	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(narratorId);
+	const { blocks, skipRevert } = batchDeleteBlocksSchema.parse(body);
+	requireHistoryOnlyDeletion(skipRevert === true);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
-		skipRevert,
-		...(scope ? { scope } : {}),
+		skipRevert: true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 	});
 	return c.json({ ok: true, ...result });
 });
@@ -4205,15 +4051,12 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 	if (Number.isNaN(blockIndex) || blockIndex < 0) {
 		throw new ValidationError("Invalid block index");
 	}
-	const skipRevert = c.req.query("skipRevert") === "1";
-	// The narrator scope is the default and refuses on conflict, so the caller needs
-	// a way to ask for the wider one its error suggests.
-	const scope = revertScopeSchema.parse(c.req.query("scope"));
-	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
+	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
-		skipRevert,
-		...(scope ? { scope } : {}),
+		skipRevert: true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 	});
 	return c.json({ ok: true, ...result });
 });
@@ -4222,15 +4065,12 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const skipRevert = c.req.query("skipRevert") === "1";
-	// The narrator scope is the default and can refuse on conflict; the caller needs a
-	// way to act on that refusal, so the widening choice must be expressible here too.
-	const scope = revertScopeSchema.parse(c.req.query("scope"));
-	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
+	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
-		skipRevert,
-		...(scope ? { scope } : {}),
+		skipRevert: true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
 	});
 	return c.json({ ok: true, ...result });
 });
@@ -4516,69 +4356,22 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	// the runBashFirst pre-prompt flow), so the loop-level abort below cannot
 	// reach the underlying process on its own.
 	let interrupted = interruptManualBash(id);
-	// A TAKEN-OVER subagent owned by the foreground runner is stopped through its turn
-	// controller, never through `interruptNarrator`. A running subagent is always
-	// registered in `activeNarrators`, so `interruptNarrator` would succeed and abort
-	// the SESSION controller — bypassing `turnAbort`, so the runtime took the generic
-	// abort exit, cleared the takeover and settled the parent's blocked Agent call.
-	// Aborting `turnAbort` softly routes the stop into the control transition that
-	// drains the queue or re-suspends in `taken_over`. While SUSPENDED there is no turn
-	// controller and nothing is touched (see the EXCEPTION note below).
-	//
-	// Ownership is judged by the detach registry, which the foreground runner holds for
-	// its whole run (suspension included). A takeover continued on the session engine
-	// has no entry there and keeps the ordinary `interruptNarrator` stop.
-	const {
-		getDetachableMap,
-		getForegroundAbortControllers,
-		interruptForegroundSubagent,
-		interruptForegroundSubagentsForParent,
-		isTakenOver,
-	} = await import("../services/narrator-subagent");
-	const foregroundTakeover = isTakenOver(id) && getDetachableMap().has(id);
-	if (foregroundTakeover) {
-		if (getForegroundAbortControllers().has(id)) {
-			interrupted = interruptForegroundSubagent(id, { hard: false }) || interrupted;
-			// `interruptNarrator` would also have stopped this subagent's own child
-			// subagents; keep that fan-out. It only touches children whose owning Agent
-			// call was cancelled by the abort above.
-			void interruptForegroundSubagentsForParent(id).catch(() => {});
-		}
-	} else if (interruptNarrator(id)) interrupted = true;
-	if (!interrupted && !foregroundTakeover) {
-		// Fallback: the UI Stop button should hard-stop foreground/background subagents.
-		// The soft foreground interrupt is still used by Send({ doInterrupt: true }).
+	// Stop ends the current turn of any session. A run the user holds stays held: its
+	// stopped turn returns to the hold (only the run's own cancellation ends a hold).
+	// A held run parked between turns has no turn in flight, so nothing changes.
+	const { getRunControl, getRunHold } = await import("../services/agent-runtime/ownership");
+	const parked = !!getRunControl(id)?.wake;
+	if (!parked && interruptNarrator(id)) interrupted = true;
+	if (!interrupted && !parked && !getRunHold(id)) {
+		// A detached run with no live turn here is stopped through its task.
 		const { cancelBackgroundTask } = await import("../services/narrator-subagent");
-		// EXCEPTION — a taken-over subagent must never be HARD interrupted from here.
-		// A hard interrupt makes runForegroundLoop break out of its loop before the
-		// queue-drain and the takeover suspension, so `finalizeSubagent` discards
-		// every queued message and the parent's blocked tool call is resolved — the
-		// takeover silently ends and the user's message is lost. During a takeover the
-		// user drives this subagent like an independent narrator, so Stop means "stop
-		// the current turn", exactly as the soft interrupt does: the loop then drains
-		// the queue (or re-suspends in `taken_over`) and the parent stays blocked.
-		//
-		// CONSEQUENCE, deliberate: while a taken-over subagent is SUSPENDED (parked in
-		// idle[taken_over] awaiting the user's next command, no foreground controller),
-		// this reports false and changes nothing — including the zombie fallback below,
-		// which only fires for working/waiting. That is the honest answer: no turn is in
-		// flight to stop. The alternative is worse — the soft path's only other lever is
-		// `interruptManualOverride`, which SETTLES the subagent and hands a result to the
-		// parent, i.e. it would END the takeover rather than interrupt anything. Ending
-		// one is `POST /:id/stop-takeover`'s job. The UI matches: it shows "Stop takeover"
-		// rather than Stop while suspended, so the inert button is unreachable there; a
-		// direct API caller gets `{interrupted: false}`.
-		interrupted = interruptForegroundSubagent(id, { hard: !isTakenOver(id) });
-		if (!interrupted) {
-			interrupted = await cancelBackgroundTask(id);
-		}
+		interrupted = await cancelBackgroundTask(id);
 	}
 	// Fallback: if no active loop found but DB status is still working/waiting,
 	// the narrator is a zombie (loop ended without updating status, e.g. after
-	// hot reload or unhandled error). Force-reset to interrupted.
-	// A foreground takeover still owned by its runner is never a zombie: overwriting
-	// its status would erase `taken_over` while the parent is still blocked on it.
-	if (!interrupted && !foregroundTakeover) {
+	// hot reload or unhandled error). Force-reset to interrupted. A held run is
+	// never a zombie: overwriting its status would erase `taken_over`.
+	if (!interrupted && !parked && !getRunHold(id)) {
 		const narrator = await narratorService.getById(id);
 		if (narrator.status === "working" || narrator.status === "waiting") {
 			await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
@@ -4591,15 +4384,12 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	// finalizer (including interrupt_task_guard persistence) finishes before the
 	// replacement user message is accepted.
 	if (c.req.query("waitForIdle") === "1") {
-		const narrator = await narratorService.getById(id);
-		if (!isSubagentVariant(narrator.variant)) {
-			// The narrator may have become idle between the UI's active-state check
-			// and this request. That is already a safe boundary for replacement input.
-			if (!interrupted) return c.json({ interrupted: false, settled: true });
-			const settled = await interruptAndWaitForIdle(id);
-			if (!settled) return c.json({ interrupted: true, settled: false }, 409);
-			return c.json({ interrupted: true, settled: true });
-		}
+		// The narrator may have become idle between the UI's active-state check
+		// and this request. That is already a safe boundary for replacement input.
+		if (!interrupted) return c.json({ interrupted: false, settled: true });
+		const settled = await interruptAndWaitForIdle(id);
+		if (!settled) return c.json({ interrupted: true, settled: false }, 409);
+		return c.json({ interrupted: true, settled: true });
 	}
 	return c.json({ interrupted });
 });
@@ -4618,392 +4408,122 @@ narratorRoutes.post("/:id/tools/:toolUseId/detach", async (c) => {
 // Detach a foreground subagent to background mode (zero-interrupt)
 narratorRoutes.post("/:id/detach", async (c) => {
 	const id = c.req.param("id");
-	return withSubagentResumeLock(id, async () => {
-		const { detachSubagent, getManualOverrideRuntime } = await import(
-			"../services/narrator-subagent"
-		);
-		const detached = await detachSubagent(id);
-		if (!detached) {
-			const runtime = getManualOverrideRuntime(id);
-			if (runtime?.phase === "claimed") {
-				return c.json(
-					{
-						error: "Manual override transition is already in progress",
-						code: "MANUAL_OVERRIDE_CLAIMED",
-						retryable: true,
-					},
-					409,
-				);
-			}
-			return c.json({ error: "Subagent is not running in foreground mode" }, 400);
-		}
-		return c.json({ detached: true });
-	});
+	const { controlRun } = await import("../services/agent-runtime/run");
+	if (!(await controlRun(id, { kind: "detach" }))) {
+		return c.json({ error: "Subagent is not running in foreground mode" }, 400);
+	}
+	return c.json({ detached: true });
 });
 
 /**
- * Take over a running subagent WITHOUT stopping what it is doing.
+ * Take over a running run WITHOUT stopping what it is doing.
  *
  * Taking over is a claim on the RESULT, not on the current turn: the user says
- * "this conclusion goes through me before it reaches the parent". The turn in
- * flight is left alone and runs to its natural end; only then does the subagent
- * park in `idle[taken_over]` awaiting the user instead of handing its result
- * back. Every engine reaches that hold on its own (see the takeover branches in
- * `subagent-runner`'s foreground loop, `executeBackgroundTask`, and
- * narrator-session's post-turn handoff), so this route only has to record the
- * claim and tell the UI.
- *
- * It used to abort the turn — the hold was only reachable from the runner's
- * "subagent was interrupted" branch — which meant a user who wanted to inspect
- * the work before it was handed over first had to destroy the turn producing it.
- * Wanting to stop the turn is a separate wish with its own button: Stop is soft
- * during a takeover and keeps the hold (`POST /:id/interrupt`).
- *
- * Consequences of not interrupting, all intended:
- * - a background subagent stays in background mode until its turn ends, so the
- *   task row is still `running` and the parent's Await still waits — correct,
- *   nothing has been concluded yet.
- * - the badge appears while the subagent is visibly still working. That IS the
- *   state: taken over and mid-turn.
+ * "this conclusion goes through me before it reaches its destination". The turn in
+ * flight runs to its natural end; the run then parks in `idle[taken_over]` instead
+ * of delivering (the run service's hold), keeping its owner, destination and
+ * deadline. Stop during a hold ends only the current turn (`POST /:id/interrupt`).
+ * Any session whose run delivers somewhere can be held, however it was created.
  */
 narratorRoutes.post("/:id/takeover", async (c) => {
 	const id = c.req.param("id");
-	return withSubagentResumeLock(id, async () => {
-		const narrator = await narratorService.getById(id);
-
-		if (!isSubagentVariant(narrator.variant)) {
-			return c.json({ error: "Not a subagent" }, 400);
-		}
-		if (!narrator.parentNarratorId) {
-			return c.json({ error: "No parent narrator" }, 400);
-		}
-		if (narrator.status !== "working" && narrator.status !== "waiting") {
-			return c.json({ error: "Subagent is not running" }, 400);
-		}
-
-		const { getForegroundAbortControllers, getBackgroundAbortControllers, markTakenOver } =
-			await import("../services/narrator-subagent");
-
-		// Which engine is driving it decides only ONE thing here: whether the hold
-		// must be remembered as a background takeover (the parent holds a
-		// background_task_id rather than a blocked tool call, so stop-takeover has to
-		// finalize it as a background completion).
-		const background = narrator.isBackground && narrator.backgroundStatus === "running";
-		const running =
-			getForegroundAbortControllers().has(id) ||
-			(background && getBackgroundAbortControllers().has(id)) ||
-			isNarratorActive(id) ||
-			isLoopRunning(id);
-		if (!running) {
-			// The DB says working/waiting but no engine owns it: either a foreground
-			// subagent caught between turns, or a zombie row. Retry rather than
-			// recording a takeover nothing will ever honour.
-			return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
-		}
-
-		markTakenOver(id, background ? { background: true } : undefined);
-
-		// The tag is written now, while the turn is still running, so the page and
-		// the parent's card both show "taken over" immediately. The status itself is
-		// left untouched: the subagent really is still working.
-		await narratorService.addSubstatus(id, TAKEN_OVER_SUBSTATUS).catch(() => {});
-		broadcastToNarrator(narrator.parentNarratorId, {
-			type: "subagent_status_changed",
-			narratorId: narrator.parentNarratorId,
-			subagentNarratorId: id,
-			status: narrator.status,
-			substatus: [...parseSubstatus(narrator.substatus), TAKEN_OVER_SUBSTATUS],
-		});
-		// The parent's Agent/Task CARD is a separate consumer from the panel status
-		// chip above — without this frame the call keeps rendering as plain "running".
-		await broadcastSubagentTakeoverChanged({
-			parentNarratorId: narrator.parentNarratorId,
-			subagentNarratorId: id,
-			takenOver: true,
-		});
-		return c.json({ takenOver: true });
+	const narrator = await narratorService.getById(id);
+	const { readSessionDeliverTo } = await import("../services/narrator-session");
+	const deliverTo = await readSessionDeliverTo(id);
+	if (!deliverTo) return c.json({ error: "This session does not deliver a result" }, 400);
+	if (narrator.status !== "working" && narrator.status !== "waiting") {
+		return c.json({ error: "Subagent is not running" }, 400);
+	}
+	const { getRunControl } = await import("../services/agent-runtime/ownership");
+	if (!getRunControl(id) && !isLoopRunning(id)) {
+		// The DB says working/waiting but no run owns it: a run caught between passes,
+		// or a zombie row. Retry rather than recording a hold nothing will honour.
+		return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+	}
+	const { controlRun } = await import("../services/agent-runtime/run");
+	await controlRun(id, { kind: "hold" });
+	// Display adapters for the destination's panel chip and tool card.
+	broadcastToNarrator(deliverTo.narratorId, {
+		type: "subagent_status_changed",
+		narratorId: deliverTo.narratorId,
+		subagentNarratorId: id,
+		status: narrator.status,
+		substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
 	});
+	await broadcastSubagentTakeoverChanged({
+		parentNarratorId: deliverTo.narratorId,
+		subagentNarratorId: id,
+		takenOver: true,
+	});
+	return c.json({ takenOver: true });
 });
 
-// Stop taking over a subagent. Returns the result to the parent narrator: if the
-// subagent is idle (has a conclusion), the parent's blocked tool call resolves
-// immediately; if it is still working, the result is returned when its loop ends.
+// Let go of a hold. A parked result is delivered to the run's destination now; a
+// turn still in flight delivers when its run ends — exactly once either way.
 narratorRoutes.post("/:id/stop-takeover", async (c) => {
 	const id = c.req.param("id");
-	return withSubagentResumeLock(id, async () => {
-		const narrator = await narratorService.getById(id);
-
-		if (!isSubagentVariant(narrator.variant)) {
-			return c.json({ error: "Not a subagent" }, 400);
-		}
-		if (!narrator.parentNarratorId) {
-			return c.json({ error: "No parent narrator" }, 400);
-		}
-
-		const {
-			isTakenOver,
-			isBackgroundTakenOver,
-			clearTakenOver,
-			markPendingStopTakeover,
-			markPendingBackgroundFinalize,
-			finalizeTakenOverBackgroundSubagent,
-			isManualOverride,
-			resolveManualOverride,
-		} = await import("../services/narrator-subagent");
-
-		if (!isTakenOver(id)) {
-			return c.json({ error: "Subagent is not taken over" }, 400);
-		}
-
-		const wasBackground = isBackgroundTakenOver(id);
-		// Use the live in-memory loop presence (single-threaded JS = authoritative)
-		// rather than the DB status snapshot, which can go stale between read and the
-		// branch decision and strand the pending marker (loop ends seeing no marker).
-		//
-		// All THREE engines must be consulted, not just the session one. Taking over no
-		// longer stops the turn, so releasing during a turn the user never stopped is
-		// now an ordinary sequence rather than a narrow race — and a turn owned by the
-		// subagent foreground/background runner is invisible to `isNarratorActive`.
-		// Missing it takes the "idle" branch: a partial result is handed to the parent
-		// while the loop is still producing one, and the loop then concludes a second
-		// time.
-		const { getSubagentFinalText, isNarratorActive } = await import("../services/narrator-session");
-		const { getForegroundAbortControllers, getBackgroundAbortControllers } = await import(
-			"../services/narrator-subagent"
-		);
-		// Resolve the parent tool_use that originally spawned this subagent.
-		const firstMsg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.narratorId, id),
-				eq(narratorMessages.role, "user"),
-				isNotNull(narratorMessages.parentToolUseId),
-			),
-			columns: { parentToolUseId: true },
-			orderBy: narratorMessages.createdAt,
-		});
-		const parentToolUseId = firstMsg?.parentToolUseId ?? "";
-
-		// Publish release only once its handoff/deferral succeeded. In particular,
-		// a conclusion validation/write failure must keep the takeover retryable.
-		const parentNarratorId = narrator.parentNarratorId;
-		const broadcastReleased = () =>
-			broadcastSubagentTakeoverChanged({
-				parentNarratorId,
-				subagentNarratorId: id,
-				takenOver: false,
-				...(parentToolUseId ? { toolUseId: parentToolUseId } : {}),
-			});
-
-		// A suspended foreground runner retains its loop flag and abort controller.
-		// Settle its control wait before treating those as an executing turn; a pending
-		// stop alone cannot wake the runner to consume that marker.
-		if (isManualOverride(id)) {
-			const finalText = await getSubagentFinalText(id);
-			const hasError = parseSubstatus(narrator.substatus).includes("error");
-			if (resolveManualOverride(id, finalText, hasError)) {
-				clearTakenOver(id);
-				await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-				await broadcastReleased();
-				return c.json({ stopped: true, deferred: false });
-			}
-			// Resume may have claimed the wait during the lookup. Re-probe the live
-			// runner below and defer handoff to that turn instead of releasing twice.
-		}
-
-		// Probe after the awaited lookups, immediately before marking the
-		// handoff. A loop can finish while those awaits yield. Its CURRENT owner,
-		// not the mode it originally started in, decides who must settle the result.
-		const foregroundRunning = getForegroundAbortControllers().has(id);
-		const isRunning =
-			isNarratorActive(id) ||
-			isLoopRunning(id) ||
-			foregroundRunning ||
-			getBackgroundAbortControllers().has(id);
-		if (wasBackground && !foregroundRunning && !isManualOverride(id)) {
-			// Background takeover: the parent was never blocked (it holds the
-			// background_task_id). Restore background completion semantics so the
-			// result reaches the parent via Await / completion sidecar.
-			if (isRunning) {
-				// Still working — defer: when the loop ends, finalize as a background
-				// completion. Keep the takeover state until then so intermediate state
-				// stays consistent; only drop the visible tag.
-				markPendingBackgroundFinalize(id);
-				await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-				await broadcastReleased();
-				return c.json({ stopped: true, deferred: true });
-			}
-			// Idle — finalize as a background completion now.
-			const finalText = await getSubagentFinalText(id);
-			const hasError = parseSubstatus(narrator.substatus).includes("error");
-			const userId = c.get("user").sub;
-			const locale = await getUserLanguage(userId);
-			clearTakenOver(id);
-			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-			await finalizeTakenOverBackgroundSubagent(
-				id,
-				narrator.parentNarratorId,
-				parentToolUseId,
-				hasError,
-				finalText,
-				locale,
-				userId,
-			);
-			await broadcastReleased();
-			return c.json({ stopped: true, deferred: false });
-		}
-
-		// Foreground takeover: the parent is blocked in waitForManualOverride.
-		if (isRunning) {
-			// Still working — defer result handoff until the loop ends. Mark the stop
-			// so the loop's takeover-handoff resolves the parent's Promise exactly once
-			// (single write via the parent's finalizer). Do NOT clearTakenOver here:
-			// that would also wipe the pendingStopTakeover marker (clearTakenOver clears
-			// all takeover sets). The handoff clears takeover state after consuming it.
-			markPendingStopTakeover(id);
-			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-			await broadcastReleased();
-			return c.json({ stopped: true, deferred: true });
-		}
-
-		// Idle — resolve the parent's blocked Promise immediately with the current result.
-		const finalText = await getSubagentFinalText(id);
-		const hasError = parseSubstatus(narrator.substatus).includes("error");
-
-		// Session-engine takeover (e.g. continued from a manual_override): the parent
-		// was already unblocked when the user continued the subagent, and a conclusion
-		// watcher was registered to hand the result back. Trigger that handoff now.
-		const { getConclusionWatcher, removeConclusionWatcher } = await import(
-			"../services/narrator-subagent"
-		);
-		const watcher = getConclusionWatcher(id);
-		if (watcher) {
-			const {
-				getSubagentResultMessageId,
-				prepareSubagentConclusionReference,
-				updateToolCallConclusion,
-			} = await import("../services/narrator-session");
-			const resultMsgId = await getSubagentResultMessageId(id);
-			const reference = await prepareSubagentConclusionReference(
-				id,
-				narrator.parentNarratorId,
-				watcher.toolUseId,
-				watcher.originToolCallId,
-			);
-			await updateToolCallConclusion({
-				toolCallId: reference.toolCallId,
-				messageId: reference.messageId,
-				subagentId: id,
-				parentNarratorId: narrator.parentNarratorId,
-				toolUseId: watcher.toolUseId,
-				finalText,
-				hasError,
-				resultMessageId: resultMsgId,
-				refreshTiming: true,
-			});
-			// A failed write must leave both the watcher and takeover retryable.
-			if (getConclusionWatcher(id) === watcher) removeConclusionWatcher(id);
-			clearTakenOver(id);
-			await narratorService
-				.updateStatus(id, "idle", {
-					substatus: hasError ? ["error"] : ["unread"],
-					skipErrorMessage: true,
-				})
-				.catch(() => {});
-			await broadcastReleased();
-			return c.json({ stopped: true, deferred: false });
-		}
-
-		// Neither a blocked foreground loop nor a conclusion watcher: a foreground
-		// subagent whose takeover interrupt has fired but whose loop has not yet
-		// reached the suspension branch (the "settling" window). Instead of failing
-		// with a retry-me error, record a pending stop-takeover marker: when the loop
-		// reaches its suspension branch it consumes the marker, skips the manual
-		// override wait, and hands the current result straight back to the blocked
-		// parent. Drop only the visible tag now; clearTakenOver runs in the loop after
-		// the marker is consumed (clearing it here would wipe the marker too).
-		markPendingStopTakeover(id);
-		await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-		await broadcastReleased();
-		return c.json({ stopped: true, deferred: true });
+	const [{ readSessionDeliverTo }, { getRunControl, getRunHold }, { controlRun }] =
+		await Promise.all([
+			import("../services/narrator-session"),
+			import("../services/agent-runtime/ownership"),
+			import("../services/agent-runtime/run"),
+		]);
+	const deliverTo = await readSessionDeliverTo(id);
+	if (!deliverTo) return c.json({ error: "This session does not deliver a result" }, 400);
+	if (!getRunHold(id)) return c.json({ error: "Subagent is not taken over" }, 400);
+	const run = getRunControl(id);
+	const deferred = !!run && !run.wake;
+	await controlRun(id, { kind: "release" });
+	await broadcastSubagentTakeoverChanged({
+		parentNarratorId: deliverTo.narratorId,
+		subagentNarratorId: id,
+		takenOver: false,
+		toolUseId: deliverTo.toolUseId,
 	});
+	return c.json({ stopped: true, deferred });
 });
 
-// Update the conclusion of an already-completed subagent.
-// The user continued operating the subagent from its page and wants to
-// push the new result back to the parent narrator's tool_call outputJson.
-// If the subagent is in manual_override state (parent blocked waiting),
-// this resolves the blocked Promise so the parent narrator resumes.
+// Push a session's current conclusion to the tool call its run delivers to. A held
+// run is released (its result delivered once); otherwise the delivered conclusion
+// is refreshed with what the user produced since.
 narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	const id = c.req.param("id");
-	return withSubagentResumeLock(id, async () => {
-		const narrator = await narratorService.getById(id);
-
-		if (!isSubagentVariant(narrator.variant)) {
-			return c.json({ error: "Not a subagent" }, 400);
-		}
-		if (!narrator.parentNarratorId) {
-			return c.json({ error: "No parent narrator" }, 400);
-		}
-
-		// Find the tool_use that spawned this subagent by looking at the subagent's
-		// first user message's parentToolUseId
-		const firstMsg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.narratorId, id),
-				eq(narratorMessages.role, "user"),
-				isNotNull(narratorMessages.parentToolUseId),
-			),
-			columns: { parentToolUseId: true },
-			orderBy: narratorMessages.createdAt,
-		});
-		if (!firstMsg?.parentToolUseId) {
-			return c.json({ error: "Cannot find parent tool_use" }, 400);
-		}
-		const toolUseId = firstMsg.parentToolUseId;
-
-		const { getSubagentFinalText } = await import("../services/narrator-session");
-		const finalText = await getSubagentFinalText(id);
-		const hasError = narrator.substatus?.includes("error") ?? false;
-
-		// Check if the parent is blocked in manual_override — if so, resolve
-		// the Promise directly. The original foreground subagent runner will
-		// handle finalizeSubagent and tool_call updates when it resumes.
-		const { isManualOverride, resolveManualOverride } = await import(
-			"../services/narrator-subagent"
-		);
-		if (isManualOverride(id)) {
-			if (!resolveManualOverride(id, finalText, hasError)) {
-				return c.json(
-					{
-						error: "Manual override transition is already in progress",
-						code: "MANUAL_OVERRIDE_CLAIMED",
-						retryable: true,
-					},
-					409,
-				);
-			}
-			return c.json({ ok: true, toolUseId, outcome: "released_blocked_parent" });
-		}
-
-		const { prepareSubagentConclusionReference, updateToolCallConclusion } = await import(
-			"../services/narrator-session"
-		);
-		const reference = await prepareSubagentConclusionReference(
-			id,
-			narrator.parentNarratorId,
-			toolUseId,
-		);
-		await updateToolCallConclusion({
-			subagentId: id,
-			parentNarratorId: narrator.parentNarratorId,
-			toolUseId,
-			finalText,
-			hasError,
-			messageId: reference.messageId,
-			toolCallId: reference.toolCallId,
-		});
-
-		return c.json({ ok: true, toolUseId, outcome: "updated_existing_conclusion" });
+	const narrator = await narratorService.getById(id);
+	const {
+		getSubagentFinalText,
+		prepareSubagentConclusionReference,
+		readSessionDeliverTo,
+		updateToolCallConclusion,
+	} = await import("../services/narrator-session");
+	const deliverTo = await readSessionDeliverTo(id);
+	if (!deliverTo) return c.json({ error: "Cannot find parent tool_use" }, 400);
+	const { getRunHold } = await import("../services/agent-runtime/ownership");
+	if (getRunHold(id)) {
+		const { controlRun } = await import("../services/agent-runtime/run");
+		await controlRun(id, { kind: "release" });
+		return c.json({ ok: true, toolUseId: deliverTo.toolUseId, outcome: "released_blocked_parent" });
+	}
+	const finalText = await getSubagentFinalText(id);
+	const hasError = narrator.substatus?.includes("error") ?? false;
+	const reference = await prepareSubagentConclusionReference(
+		id,
+		deliverTo.narratorId,
+		deliverTo.toolUseId,
+		deliverTo.toolCallId,
+	);
+	await updateToolCallConclusion({
+		subagentId: id,
+		parentNarratorId: deliverTo.narratorId,
+		toolUseId: deliverTo.toolUseId,
+		finalText,
+		hasError,
+		messageId: reference.messageId,
+		toolCallId: reference.toolCallId,
+	});
+	return c.json({
+		ok: true,
+		toolUseId: deliverTo.toolUseId,
+		outcome: "updated_existing_conclusion",
 	});
 });
 
@@ -5185,8 +4705,9 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const narrator = await narratorService.getById(id);
 	if (parsed.data.model === FOLLOW_PARENT_MODEL) {
-		if (!isSubagentVariant(narrator.variant)) {
-			throw new ValidationError("Only subagents can follow a parent model");
+		// Following is relative to the registered source, whatever created the session.
+		if (!policySourceIdOf(narrator)) {
+			throw new ValidationError("Only a narrator with a registered source can follow its model");
 		}
 		await resolveSubagentModelForRun(
 			{ ...narrator, model: FOLLOW_PARENT_MODEL },
@@ -5613,24 +5134,13 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 // Archive narrator
 narratorRoutes.patch("/:id/archive", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
-	if (narrator.type === "subagent" || narrator.variant?.startsWith("subagent:")) {
-		// Same retire path as Agent archive / history-delete card removal.
-		const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
-		const result = await interruptAndArchiveSubagent(id);
-		if (!result.ok && result.error === "not_found") {
-			// Row vanished between getById and the lifecycle re-read (race delete).
-			throw new NotFoundError("Narrator", id);
-		}
-		if (!result.ok && result.error) {
-			// Fall through to the legacy path for non-subagent-shaped failures.
-			if (isNarratorActive(id)) closeNarrator(id);
-			await narratorService.updateStatus(id, "archived");
-		}
-		return c.json({ ok: true });
-	}
-	if (isNarratorActive(id)) closeNarrator(id);
-	await narratorService.updateStatus(id, "archived");
+	await narratorService.getById(id);
+	// HTTP write ACL and Agent controller authorization share the same mechanism:
+	// end the complete run (including a hold), then archive any kind of session.
+	const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
+	const result = await interruptAndArchiveSubagent(id);
+	if (!result.ok && result.error === "not_found") throw new NotFoundError("Narrator", id);
+	if (!result.ok) throw new ValidationError(result.error ?? "Failed to archive narrator");
 	return c.json({ ok: true });
 });
 
@@ -5656,11 +5166,12 @@ narratorRoutes.delete("/:id", async (c) => {
 
 // Mark narrator as read (clear unread substatus)
 // Error sessions are preserved because only unread substatus can transition.
-// Subagents are skipped — their done/error status must be preserved for follow-up Send.
+// A run that delivers to a caller is skipped — its done/error status is that run's
+// outcome and must be preserved for follow-up Send.
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	if (isSubagentVariant(narrator.variant)) return c.json({ ok: true });
+	if (await readSessionDeliverTo(id)) return c.json({ ok: true });
 	const currentSubstatus = parseSubstatus(narrator.substatus);
 	if (narrator.status === "idle" && currentSubstatus.includes("unread") && !narrator.errorMessage) {
 		// Only remove the unread tag. Other tags (e.g. compacting/suspended/manual_override)
@@ -6443,7 +5954,7 @@ function revertConflictBody(result: RevertResult) {
 	return {
 		error: "File operation could not be completed safely",
 		code: "SNAPSHOT_REVERT_FAILED",
-		failures: result.failures,
+		...result,
 	};
 }
 
@@ -6453,89 +5964,6 @@ function fileHistoryConflictBody(error: unknown) {
 		error: error instanceof Error ? error.message : String(error),
 		code: historyError?.code ?? "FILE_HISTORY_PREPARE_FAILED",
 	};
-}
-
-/**
- * Expose both scopes' availability without choosing a wider fallback. Legacy tree
- * differences are read-only inspection material, not permission to execute them.
- */
-async function buildRevertScopePreviews(narratorId: string, minSeq: number, withContents = false) {
-	const [narratorScope, treePreview] = await Promise.all([
-		previewNarratorScopedFromSeq(narratorId, minSeq, { withContents }),
-		previewSeqTreeRevert(narratorId, minSeq),
-	]);
-	// Always return the unavailable reasons. Dropping them here used to make the
-	// route advertise a legacy replay as though there were no protection gap.
-
-	const workspaceFiles = treePreview
-		? withContents
-			? (await loadTreePreviewContents(treePreview)).map(({ relPath: _relPath, ...file }) => file)
-			: treePreview.files.map(({ relPath: _relPath, ...file }) => file)
-		: [];
-	const narratorFiles = narratorScope.files.map(({ relPath: _relPath, ...file }) => file);
-
-	// A workspace rollback restores everything in the window, so anything another
-	// actor wrote there goes with it. This advice already existed but was only
-	// computed while performing the rollback — too late to inform the choice.
-	let workspaceWarnings: RevertWarning[] = [];
-	if (treePreview) {
-		const boundaryStartedAt = await resolveSeqBoundaryStartedAt(narratorId, minSeq);
-		if (boundaryStartedAt) {
-			workspaceWarnings = await buildImpreciseRevertWarnings(
-				treePreview.worktreePath,
-				narratorId,
-				boundaryStartedAt,
-			);
-		}
-	}
-
-	const scope: RevertScope = DEFAULT_REVERT_SCOPE;
-
-	return {
-		scope,
-		// Kept for older clients: the default scope's files.
-		affectedFiles: scope === "narrator" ? narratorFiles : workspaceFiles,
-		narratorScope: {
-			available: narratorScope.available,
-			...(narratorScope.reason ? { reason: narratorScope.reason } : {}),
-			files: narratorFiles,
-			conflicts: narratorScope.conflicts,
-			...(narratorScope.subagentWarning ? { subagentWarning: narratorScope.subagentWarning } : {}),
-		},
-		workspaceScope: {
-			available: false,
-			reason: treePreview ? "legacy_unverified" : "no_boundaries",
-			files: workspaceFiles,
-			warnings: workspaceWarnings,
-		},
-	};
-}
-
-/** When the earliest reversible change in a window started, for warning lookups. */
-async function resolveSeqBoundaryStartedAt(
-	narratorId: string,
-	minSeq: number,
-): Promise<string | null> {
-	const [earliest] = await db
-		.select({ createdAt: narratorToolCalls.createdAt })
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "success"),
-				gte(narratorMessageRefs.seq, minSeq),
-			),
-		)
-		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
-		.limit(1);
-	return earliest?.createdAt ?? null;
 }
 
 /** Durable preview only: these endpoints do not apply files or mutate history. */
@@ -6636,50 +6064,13 @@ narratorRoutes.get("/:id/revert-plans/:planId/files", async (c) => {
 	return revertPreviewJson(c, result);
 });
 
-/** Revert file changes from a specific message onwards */
-narratorRoutes.post("/:id/revert", async (c) => {
-	const narratorId = c.req.param("id");
-	const body = revertFilesSchema.parse(await c.req.json());
-
-	// Prevent revert while narrator is actively running
-	if (isNarratorActive(narratorId)) {
-		return c.json({ error: "Cannot revert while narrator is running" }, 409);
-	}
-
-	let targetSeq = 0;
-	if (body.messageId !== "__all__") {
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, body.messageId),
-			),
-			columns: { seq: true },
-		});
-		if (!targetRef) return c.json({ error: "Message not found" }, 404);
-		targetSeq = targetRef.seq;
-	}
-
-	if (isNarratorActive(narratorId)) {
-		return c.json({ error: "Narrator became active during revert" }, 409);
-	}
-	// Scope is a user decision, not a strategy fallback. In particular, missing
-	// narrator evidence cannot authorize a workspace restore or whole-file replay.
-	const scope = body.scope ?? DEFAULT_REVERT_SCOPE;
-	const result =
-		scope === "narrator"
-			? await revertNarratorScopedFromSeq(narratorId, targetSeq)
-			: ((await revertFromSeqTree(narratorId, targetSeq)) ??
-				unavailableSnapshotRevert("no_boundaries: no verified workspace snapshot is available."));
-	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
-	// No history mutation follows: the reverted files are the intended end state.
-	finalizeSnapshotRevert(result);
-	return c.json({
-		fileCount: result.fileCount,
-		files: result.files,
-		// Advisory: a workspace rollback also discards other actors' changes in the
-		// same window, so the caller is told to verify rather than assume.
-		...(result.warnings?.length ? { warnings: result.warnings } : {}),
-	});
+/** Retired immediate execution: file restores require a reviewed durable plan. */
+narratorRoutes.post("/:id/revert", async () => {
+	throw new AppError(
+		"Review a fresh action preview and submit its plan ID and hash before restoring files",
+		409,
+		"REVERT_CONFIRMATION_REQUIRED",
+	);
 });
 
 /** Unrevert requires the real pre-revert states in a durable revert journal. */
@@ -6820,155 +6211,53 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 			? blocks.length - 1
 			: normalizeRollbackBlockIndexForMessage(targetMsg.role, requestedBlockIndex, blocks.length);
 
-	// Collect tool_use IDs from blocks after the effective boundary in the target message
-	const truncatedToolUseIds: string[] = [];
-	for (let i = effectiveBlockIndex + 1; i < blocks.length; i++) {
-		const b = blocks[i];
-		if (b.type === "tool_use" && b.id) {
-			truncatedToolUseIds.push(b.id);
-		}
-	}
-
-	const deletedBlockCount = blocks.length - effectiveBlockIndex - 1;
-
-	// Count subsequent messages
-	const subsequentMsgCount = await db
-		.select({ cnt: sql<number>`count(*)` })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				gt(narratorMessageRefs.seq, targetRef.seq),
-			),
-		);
-	const deletedMessageCount = subsequentMsgCount[0]?.cnt ?? 0;
-
-	const subsequentFilter = and(
-		eq(narratorToolCalls.narratorId, narratorId),
-		eq(narratorToolCalls.status, "success"),
-		gt(narratorMessageRefs.seq, targetRef.seq),
+	const principal = narratorPrincipalOf(c);
+	const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(60_000)]);
+	const prepared = await prepareLocalRevertAction(
+		principal,
+		narratorId,
+		{
+			action: requestedBlockIndex === null ? "edit_and_regenerate" : "rollback_to_block",
+			messageId,
+			...(requestedBlockIndex === null ? {} : { blockIndex: effectiveBlockIndex }),
+			idempotencyKey: generateId(),
+		},
+		signal,
 	);
-	const subsequentJoin = and(
-		eq(narratorMessageRefs.narratorId, narratorId),
-		eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-	);
-	const truncatedFilter = and(
-		eq(narratorToolCalls.narratorId, narratorId),
-		eq(narratorToolCalls.status, "success"),
-		inArray(narratorToolCalls.toolUseId, truncatedToolUseIds),
-	);
-
-	// Both scopes are described so the dialog can show what each one would do.
-	// Every file list comes from the same comparison its rollback performs — deriving
-	// one from recorded Write/Edit inputs would omit files touched by Bash or
-	// external tools, and promise a scope the rollback does not honour.
-	const scopes = await buildRevertScopePreviews(narratorId, targetRef.seq);
-	if (scopes) {
-		// Count-only: loading the rows to call `.length` would pull every `input_json`,
-		// and Write calls carry whole file bodies.
-		const [subsequentCount] = await db
-			.select({ value: countFn() })
-			.from(narratorToolCalls)
-			.innerJoin(narratorMessageRefs, subsequentJoin)
-			.where(subsequentFilter);
-		let truncatedCount = 0;
-		if (truncatedToolUseIds.length > 0) {
-			const [counted] = await db
-				.select({ value: countFn() })
-				.from(narratorToolCalls)
-				.where(truncatedFilter);
-			truncatedCount = counted?.value ?? 0;
-		}
-		return c.json({
-			...scopes,
-			toolCallCount: (subsequentCount?.value ?? 0) + truncatedCount,
-			deletedBlockCount,
-			deletedMessageCount,
-		});
-	}
-
-	// Find tool calls from subsequent messages (seq > targetRef.seq). Only the replay
-	// path needs the recorded inputs, so these stay behind the tree-snapshot branch.
-	const subsequentToolCalls = await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			executionDeviceId: narratorToolCalls.executionDeviceId,
-			executionCwd: narratorToolCalls.executionCwd,
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: narratorToolCalls.resolvedFilePath,
-			canonicalFilePath: narratorToolCalls.canonicalFilePath,
-			runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			executionTargetsJson: narratorToolCalls.executionTargetsJson,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(narratorMessageRefs, subsequentJoin)
-		.where(subsequentFilter);
-
-	// Find tool calls from truncated blocks in the target message
-	const truncatedToolCalls =
-		truncatedToolUseIds.length > 0
-			? await db.query.narratorToolCalls.findMany({
-					where: truncatedFilter,
-					columns: {
-						toolUseId: true,
-						toolName: true,
-						inputJson: true,
-						executionDeviceId: true,
-						executionCwd: true,
-						executionPathFlavor: true,
-						resolvedFilePath: true,
-						canonicalFilePath: true,
-						runtimeGeneration: true,
-						executionTargetsJson: true,
-					},
-				})
-			: [];
-
-	const allToolCalls = [...truncatedToolCalls, ...subsequentToolCalls];
-
-	let affectedFiles: DeviceFileIdentity[];
-	try {
-		affectedFiles = getAffectedDeviceFilesStrict(
-			allToolCalls,
-			await resolveNarratorCwd(narratorId),
-		);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	if (affectedFiles.length === 0) {
-		return c.json({
-			affectedFiles: [],
-			toolCallCount: 0,
-			deletedBlockCount,
-			deletedMessageCount,
-		});
-	}
-
-	// Only compute willBeDeleted (skip expensive content rebuild for the modal)
-	let revertedStates: Map<string, DeviceFileState>;
-	try {
-		revertedStates = await rebuildDeviceFileStatesExcluding(
-			narratorId,
-			affectedFiles,
-			new Set(allToolCalls.map((tc) => tc.toolUseId)),
-		);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	const affectedFilePreviews = affectedFiles.map((identity) => ({
-		...identity,
-		willBeDeleted: revertedStates.get(deviceFileKey(identity))?.content === null,
+	const page = prepared.plan
+		? await listLocalRevertPlanFiles(principal, narratorId, prepared.plan.id, {
+				limit: 100,
+				signal,
+			})
+		: null;
+	const files = (page?.items ?? []).map((file) => ({
+		deviceId: file.identityJson.deviceId,
+		filePath: file.identityJson.displayPath,
+		willBeDeleted: file.desiredStateJson.kind === "absent",
 	}));
-
-	return c.json({
-		affectedFiles: affectedFilePreviews,
-		toolCallCount: allToolCalls.length,
-		deletedBlockCount,
-		deletedMessageCount,
+	const preview = {
+		available: prepared.plan?.coverageComplete === true,
+		plan: prepared.plan,
+		reason:
+			"unavailable" in prepared
+				? prepared.unavailable
+				: prepared.plan?.coverageComplete === false
+					? "incomplete_coverage"
+					: undefined,
+		files,
+		conflicts: [],
+		hasMore: page?.hasMore,
+		totalFileCount: prepared.plan?.expectedFileCount,
+		historySummary: prepared.historySummary,
+	};
+	return revertPreviewJson(c, {
+		scope: DEFAULT_REVERT_SCOPE,
+		affectedFiles: files,
+		narratorScope: { ...preview, files },
+		workspaceScope: { available: false, reason: "legacy_unverified", files: [], warnings: [] },
+		deletedBlockCount:
+			preview.historySummary?.deletedBlockCount ?? blocks.length - effectiveBlockIndex - 1,
+		deletedMessageCount: preview.historySummary?.deletedMessageCount ?? 0,
 	});
 });
 
@@ -7021,14 +6310,20 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 	const preview = await previewNarratorScopedForToolUses(
 		narratorId,
 		[{ messageId, toolUseId: block.id }],
-		{ withContents: true },
+		{ withContents: true, principal: narratorPrincipalOf(c), signal: c.req.raw.signal },
 	);
-	return c.json({
-		available: preview.available,
-		...(preview.reason ? { reason: preview.reason } : {}),
+	return revertPreviewJson(c, {
+		available: preview.available && preview.plan?.coverageComplete === true,
+		...(preview.reason
+			? { reason: preview.reason }
+			: preview.plan?.coverageComplete === false
+				? { reason: "incomplete_coverage" }
+				: {}),
 		files: preview.files.map(({ relPath: _relPath, ...file }) => file),
 		conflicts: preview.conflicts,
-		...(preview.subagentWarning ? { subagentWarning: preview.subagentWarning } : {}),
+		plan: preview.plan,
+		totalFileCount: preview.totalFileCount,
+		hasMore: preview.hasMore,
 	});
 });
 
@@ -7265,8 +6560,11 @@ narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 			isNarratorActive(subagent.id) ||
 			isLoopRunning(subagent.id));
 	if (subagent && hasActiveContinuation) {
-		const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
-		interruptedContinuation = interruptForegroundSubagent(subagent.id, { hard: true });
+		const { controlRun } = await import("../services/agent-runtime/run");
+		interruptedContinuation = await controlRun(subagent.id, {
+			kind: "cancel",
+			reason: "Cancelled",
+		});
 		if (!interruptedContinuation && (isNarratorActive(subagent.id) || isLoopRunning(subagent.id))) {
 			interruptedContinuation = interruptNarrator(subagent.id);
 		}

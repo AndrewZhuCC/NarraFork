@@ -33,7 +33,6 @@ export function HistoryRecoveryPanel({
 	onRecovered: () => void;
 }) {
 	const { t } = useTranslation("narrator");
-	const [skipRevert, setSkipRevert] = useState(true);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const showRecovery = isAggregateUnavailable(loadError);
 
@@ -46,7 +45,7 @@ export function HistoryRecoveryPanel({
 	});
 
 	const remove = useMutation({
-		mutationFn: (messageId: string) => api.deleteMessage(narratorId, messageId, { skipRevert }),
+		mutationFn: (messageId: string) => api.deleteMessage(narratorId, messageId),
 		onSuccess: () => {
 			setSelectedId(null);
 			void recovery.refetch();
@@ -86,12 +85,9 @@ export function HistoryRecoveryPanel({
 						))}
 					</Stack>
 				)}
-				<Checkbox
-					label={t("historyRecovery.skipRevert")}
-					description={t("historyRecovery.skipRevertDesc")}
-					checked={skipRevert}
-					onChange={(e) => setSkipRevert(e.currentTarget.checked)}
-				/>
+				<Text size="xs" c="dimmed">
+					{t("historyRecovery.historyOnly")}
+				</Text>
 				<Group>
 					<Button
 						color="red"

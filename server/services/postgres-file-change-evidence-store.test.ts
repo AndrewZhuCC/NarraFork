@@ -1,14 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	fileChangeBlobs,
 	fileChangeEffects,
 	fileChangeOperations,
+	fileChangeScopes,
+	fileHistoryClock,
 	narratorToolCalls,
 } from "@server/db/postgres-schema";
-import { getTableColumns, getTableName, type SQL, type Table } from "drizzle-orm";
+import { getTableColumns, getTableName, SQL, type Table } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { BeginFileChangeOperation, FileChangeNoDispatchProof } from "./file-change-evidence";
+import { createFileChangeIdentity } from "./file-change-identity";
 import { PostgresFileChangeEvidenceStore } from "./postgres-file-change-evidence-store";
 
 /** Adapter contract, NOT a live PostgreSQL integration test. No connection is opened.
@@ -120,12 +124,16 @@ class TransactionModel {
 		[getTableName(narratorToolCalls), [tool(), tool({ id: "other-pk" })]],
 		[getTableName(fileChangeOperations), []],
 		[getTableName(fileChangeEffects), []],
+		[getTableName(fileChangeScopes), []],
+		[getTableName(fileChangeBlobs), []],
+		[getTableName(fileHistoryClock), []],
 	]);
 	readonly cas: ReturnType<PgDialect["sqlToQuery"]>[] = [];
 	locks = 0;
 	commits = 0;
 	rollbacks = 0;
 	beforeCas?: (row: Row) => void;
+	beforeWrite?: (table: Table, values: Row) => void;
 	rows(table: Table) {
 		return this.tables.get(getTableName(table)) ?? [];
 	}
@@ -167,28 +175,70 @@ class TransactionModel {
 		return true;
 	}
 	private tx() {
+		const statement = (table: Table, execute: () => Row[]) => {
+			let result: Row[] | undefined;
+			const run = () => (result ??= execute());
+			return {
+				returning: async (projection?: Projection) =>
+					run().map((row) => this.project(table, row, projection)),
+				// biome-ignore lint/suspicious/noThenProperty: Model the awaitable Drizzle mutation builder.
+				then: <T = Row[], U = never>(
+					yes?: ((rows: Row[]) => T | PromiseLike<T>) | null,
+					no?: ((error: unknown) => U | PromiseLike<U>) | null,
+				) => Promise.resolve().then(run).then(yes, no),
+			};
+		};
 		return {
 			select: (projection?: Projection) => new Selection(this, projection),
 			insert: (table: Table) => ({
-				values: (values: Row) => ({
-					returning: async () => {
-						const row = structuredClone(values);
+				values: (values: Row) => {
+					let ignoreConflict = false;
+					const query = statement(table, () => {
+						if (ignoreConflict && this.rows(table).some((row) => row.id === values.id)) return [];
+						const defaults = Object.fromEntries(
+							Object.entries(getTableColumns(table)).map(([key, column]) => [
+								key,
+								column.default ?? null,
+							]),
+						);
+						const row = { ...defaults, ...structuredClone(values) };
 						this.rows(table).push(row);
-						return [structuredClone(row)];
-					},
-				}),
+						return [row];
+					});
+					return {
+						...query,
+						onConflictDoNothing: () => {
+							ignoreConflict = true;
+							return query;
+						},
+					};
+				},
 			}),
 			update: (table: Table) => ({
 				set: (values: Row) => ({
-					where: (condition: SQL) => ({
-						returning: async (projection?: Projection) => {
-							this.cas.push(dialect.sqlToQuery(condition));
-							this.beforeCas?.(this.tool);
+					where: (condition: SQL) =>
+						statement(table, () => {
+							this.beforeWrite?.(table, values);
+							if (table === narratorToolCalls) {
+								this.cas.push(dialect.sqlToQuery(condition));
+								this.beforeCas?.(this.tool);
+							}
 							const rows = this.rows(table).filter((row) => this.matches(table, row, condition));
-							for (const row of rows) Object.assign(row, values);
-							return rows.map((row) => this.project(table, row, projection));
-						},
-					}),
+							for (const row of rows)
+								for (const [key, value] of Object.entries(values)) {
+									if (value instanceof SQL) {
+										const query = dialect.sqlToQuery(value);
+										if (
+											table !== fileHistoryClock ||
+											key !== "lastSeq" ||
+											!query.sql.endsWith(" + 1")
+										)
+											throw new Error(`Unsupported expression: ${query.sql}`);
+										row[key] = Number(row[key]) + 1;
+									} else row[key] = value;
+								}
+							return rows;
+						}),
 				}),
 			}),
 		};
@@ -229,6 +279,124 @@ const preview: FileChangeNoDispatchProof = {
 	frozenTarget: target,
 };
 
+describe("PostgreSQL final-history adapter contract (transaction model, no live PostgreSQL)", () => {
+	test("old scope barriers allow new final records with null binding and immutable replay", async () => {
+		const { model, store } = setup();
+		const scope = await store.prepareScope({
+			sourceInstanceId: "installation",
+			deviceId: "local",
+			workspaceInstanceId: "workspace",
+			pathFlavor: "posix",
+			canonicalRoot: "/workspace",
+		});
+		Object.assign(model.rows(fileChangeScopes)[0], {
+			status: "retired",
+			revision: 91,
+			fencingToken: 86,
+			activeLeaseId: "old-owner",
+			activeMutationCount: 7,
+		});
+		const request = { ...input(), executionBinding: null };
+		const operation = await store.beginOperation(request);
+		expect(operation).toMatchObject({
+			evidenceVersion: 3,
+			executionBindingJson: null,
+			replayed: false,
+			journalSeq: 1,
+		});
+		expect(await store.beginOperation(request)).toMatchObject({
+			id: operation.id,
+			replayed: true,
+			journalSeq: 1,
+		});
+		const result = {
+			operationId: operation.id,
+			identity: createFileChangeIdentity(scope, {
+				deviceId: "local",
+				pathFlavor: "posix",
+				lexicalPath: target.lexicalPath,
+				canonicalPath: target.canonicalPath,
+				objectRole: "referent",
+			}),
+			before: { kind: "absent" } as const,
+			intendedAfter: { kind: "absent" } as const,
+			observedAfter: { kind: "absent" } as const,
+			outcome: "unknown" as const,
+		};
+		const recorded = await store.recordEffect(result);
+		expect(recorded).toMatchObject({
+			diskOutcome: "unknown",
+			outcome: "unknown",
+			scopeRevision: null,
+			executionConfirmed: false,
+		});
+		expect(await store.recordEffect(result)).toEqual(recorded);
+		await refusal(store.recordEffect({ ...result, outcome: "not_applied" }), "REQUEST_CONFLICT");
+		await store.finishOperation(operation.id, "failed");
+		const next = await store.beginOperation({ ...request, sourceId: "independent-request" });
+		expect(
+			(await store.recordEffect({ ...result, operationId: next.id, outcome: "not_applied" }))
+				.outcome,
+		).toBe("no_change");
+		expect(model.rows(fileChangeScopes)[0]).toMatchObject({
+			status: "retired",
+			revision: 91,
+			fencingToken: 86,
+			activeLeaseId: "old-owner",
+		});
+	});
+	test("failed counter update rolls back a result and the same final fact can be retried", async () => {
+		const { model, store } = setup();
+		const scope = await store.prepareScope({
+			sourceInstanceId: "installation",
+			deviceId: "local",
+			workspaceInstanceId: "workspace",
+			pathFlavor: "posix",
+			canonicalRoot: "/workspace",
+		});
+		const operation = await store.beginOperation({ ...input(), executionBinding: null });
+		const result = {
+			operationId: operation.id,
+			identity: createFileChangeIdentity(scope, {
+				deviceId: "local",
+				pathFlavor: "posix",
+				lexicalPath: target.lexicalPath,
+				canonicalPath: target.canonicalPath,
+				objectRole: "referent",
+			}),
+			before: { kind: "absent" } as const,
+			intendedAfter: { kind: "absent" } as const,
+			observedAfter: { kind: "absent" } as const,
+			outcome: "not_applied" as const,
+		};
+		model.beforeWrite = (table) => {
+			if (table === fileChangeOperations) throw new Error("accounting-fault");
+		};
+		await expect(store.recordEffect(result)).rejects.toThrow("accounting-fault");
+		expect(model.rows(fileChangeEffects)).toEqual([]);
+		expect(model.operations[0].preparedEffectCount).toBe(0);
+		model.beforeWrite = undefined;
+		expect((await store.recordEffect(result)).diskOutcome).toBe("not_applied");
+		expect(model.operations[0].preparedEffectCount).toBe(1);
+	});
+	test("binding-null no-dispatch requires the matching frozen host target", async () => {
+		const { model, store } = setup();
+		await refusal(
+			store.beginNoDispatchOperation(
+				{ ...input(), executionBinding: null },
+				{ targetDispatched: false, reason: "preview" },
+			),
+			"IDENTITY_CONFLICT",
+		);
+		const operation = await store.beginNoDispatchOperation(
+			{ ...input(), executionBinding: null },
+			preview,
+		);
+		expect(operation.executionBindingJson).toBeNull();
+		expect(model.tool.fileChangeOperationId).toBe(operation.id);
+	});
+});
+
 describe("PostgreSQL no_dispatch adapter contract (transaction model, no live PostgreSQL)", () => {
 	test("StructSed preview is succeeded, strictly zero-effect, bound and repeat-idempotent", async () => {
 		const { model, store } = setup();
@@ -254,7 +422,7 @@ describe("PostgreSQL no_dispatch adapter contract (transaction model, no live Po
 		expect(model.operations).toHaveLength(1);
 		expect(model.cas).toHaveLength(1);
 		expect(model.commits).toBe(2);
-		expect(model.locks).toBe(2);
+		expect(model.locks).toBe(3);
 	});
 
 	test.each([

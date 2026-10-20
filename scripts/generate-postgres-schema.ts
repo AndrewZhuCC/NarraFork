@@ -110,6 +110,12 @@ export class UnsupportedSchemaError extends Error {
 	}
 }
 
+/** SQLite integer byte totals are 64-bit; the default 5 GiB quota exceeds PostgreSQL int4. */
+const PG_BYTE_TOTAL_COLUMNS: ReadonlySet<string> = new Set([
+	"file_change_storage_budgets.used_bytes",
+	"file_change_storage_budgets.reserved_bytes",
+	"file_change_storage_budgets.quota_bytes",
+]);
 /**
  * PostgreSQL-only identity columns: capabilities PostgreSQL needs that SQLite provides
  * implicitly, so the SQLite schema deliberately does not declare them.
@@ -389,6 +395,13 @@ export function generatePostgresSchema(
 							primary: false,
 							unique: false,
 						};
+						if (
+							c.kind === "integer" &&
+							c.mode !== "boolean" &&
+							PG_BYTE_TOTAL_COLUMNS.has(`${table.name}.${c.name}`)
+						) {
+							c.pgType = "bigint";
+						}
 						for (const method of methods) {
 							const name = callName(method);
 							const [arg, second] = method.arguments;

@@ -32,6 +32,7 @@ import { captureDumpResponse, captureResponseStream, sanitizeHeaders } from "./r
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 const GEMINI_IDENTITY: Record<string, string> = {
 	en: "You are an AI coding assistant with access to tools for reading, writing, and editing files, running shell commands, searching codebases, and more. You MUST use your tools to accomplish tasks — do not just describe what you would do. When the user asks you to do something, take action by calling the appropriate tools.",
@@ -893,11 +894,12 @@ function appendCurrentUserInput(
 		steps.push({ type: "user_input", content });
 		return;
 	}
-	const parts: GeminiInputContent[] = [];
-	if (hasText) parts.push({ type: "text", text: content });
-	for (const image of images) {
-		parts.push({ type: "image", data: image.base64, mime_type: `image/${image.format}` });
-	}
+	const parts = orderUserContent(hasText ? content : "", images, "after").map(
+		(part): GeminiInputContent =>
+			part.type === "text"
+				? { type: "text", text: part.text }
+				: { type: "image", data: part.image.base64, mime_type: `image/${part.image.format}` },
+	);
 	steps.push({ type: "user_input", content: parts });
 }
 

@@ -76,7 +76,10 @@ afterAll(() => {
 
 describe("real task producers use publication outbox", () => {
 	test("task registration adopts the actor run and preserves its boundary; ordinary starts still replace it", async () => {
-		const first = publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
+		const first = publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
 		// Registration must not move the first run's boundary past already-produced output.
 		db.insert(narratorMessages)
 			.values({
@@ -93,8 +96,8 @@ describe("real task producers use publication outbox", () => {
 		const task = await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
-			parentNarratorId: "parent",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
 		});
 		expect(task.logicalRunId).toBe(first.logicalRunId);
 		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()?.logicalRunId).toBe(
@@ -111,15 +114,19 @@ describe("real task producers use publication outbox", () => {
 			createdAt: time,
 			updatedAt: time,
 		};
-		expect(() =>
-			publisher.startAgentRun({
-				narratorId: "child",
-				parentNarratorId: "parent",
-				taskRow,
-				resumeRunId: "explicit-stale-run",
-			}),
+		expect(
+			() =>
+				publisher.startRun({
+					narratorId: "child",
+					taskRow,
+					resumeRunId: "explicit-stale-run",
+					binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+				}).publication!,
 		).toThrow("Stale logical run recovery");
-		const second = publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
+		const second = publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
 		expect(second.logicalRunId).not.toBe(first.logicalRunId);
 		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()?.logicalRunId).toBe(
 			second.logicalRunId,
@@ -127,7 +134,10 @@ describe("real task producers use publication outbox", () => {
 		expect((await tasks.getById("child"))?.logicalRunId).toBe(second.logicalRunId);
 	});
 	test("new task admission does not adopt the actor's old terminal or consumed run", async () => {
-		const old = publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
+		const old = publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
 		db.transaction((tx) =>
 			publisher.commit(
 				{
@@ -143,8 +153,8 @@ describe("real task producers use publication outbox", () => {
 		const task = await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
-			parentNarratorId: "parent",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
 		});
 		if (!task.logicalRunId) throw new Error("New task needs a logical run");
 		expect(task.logicalRunId).not.toBe(old.logicalRunId);
@@ -234,25 +244,29 @@ describe("real task producers use publication outbox", () => {
 	});
 
 	test("new Agent logical runs preserve old source and planned recovery reuses its reservation", async () => {
-		const first = await tasks.createAgentTask({
+		const first = publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
+		await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
-			parentNarratorId: "parent",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
 		});
 		await tasks.markCompleted("child", "first result");
 		const oldIntent = db.select().from(runtimePublicationOutbox).all()[0];
-		const second = publisher.startAgentRun({
+		const second = publisher.startRun({
 			narratorId: "child",
-			parentNarratorId: "parent",
 			started: true,
-		});
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
 		expect(second.logicalRunId).not.toBe(first.logicalRunId);
 		await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
-			parentNarratorId: "parent",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
 		});
 		db.transaction((tx) =>
 			publisher.commit(
@@ -265,12 +279,12 @@ describe("real task producers use publication outbox", () => {
 				tx,
 			),
 		);
-		const restored = publisher.startAgentRun({
+		const restored = publisher.startRun({
 			narratorId: "child",
-			parentNarratorId: "parent",
 			resumeRunId: second.logicalRunId,
 			started: true,
-		});
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
 		expect(restored).toEqual(second);
 		await tasks.markCompleted("child", "second result");
 		publisher.flushRecipient("parent");
@@ -311,11 +325,15 @@ describe("real task producers use publication outbox", () => {
 	});
 
 	test("Agent retains full source and stores only a bounded immutable display receipt", async () => {
+		publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
 		await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
-			parentNarratorId: "parent",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
 		});
 		const text = "result".repeat(150000);
 		db.insert(narratorMessages)
@@ -347,11 +365,15 @@ describe("real task producers use publication outbox", () => {
 	});
 
 	test("Agent with no result message has a UTF8 bounded explicit fallback", async () => {
+		publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
 		await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
-			parentNarratorId: "parent",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
 		});
 		const text = "故障".repeat(50000);
 		await tasks.markFailed("child", text);

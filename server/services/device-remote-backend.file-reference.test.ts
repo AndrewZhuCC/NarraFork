@@ -18,6 +18,7 @@ let conditionalError = null;
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 1048576, rpcTimeoutMs: 10000 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
   hasDeviceProtocolFeature: (_id, feature) => features.has(feature),
+  getDeviceConnectionGeneration: () => currentGeneration,
   sendRpc: async (id, method, params, opts) => {
     calls.push({id, method, params, opts});
     assert.equal(opts.expectedConnectionGeneration, 7);
@@ -31,11 +32,12 @@ mock.module(${JSON.stringify(connectionPath)}, () => ({
     if (method === "glob") return { matches: ["file.ts"], truncated: true };
     if (method === "fs.stat") return { exists: true, isFile: true, isDirectory: false, size: 2, resolvedPath: "/work/file.ts" };
     if (method === "fs.read") return { dataB64: "b2s=", totalSize: 2, truncated: false, resolvedPath: "/work/file.ts" };
+    if (method === "fs.write") return {};
     throw new Error("Unexpected RPC " + method);
   }
 }));
 const { RemoteBackend } = await import(${JSON.stringify(backendPath)});
-const backend = new RemoteBackend("DeviceCase", { connectionGeneration: 7, defaultCwd: "/work", platform: {os: "linux", arch: "x64"}, supportsFsStatResolvedPath: true, supportsFsReadAtomicResolvedPath: true });
+const backend = new RemoteBackend("DeviceCase", { connectionGeneration: 7, defaultCwd: "/work", platform: {os: "linux", arch: "x64"}, supportsFsStatResolvedPath: true, supportsFsReadAtomicResolvedPath: true, supportsFsWriteAtomicResolvedPath: true });
 const abort = new AbortController();
 await assert.rejects(backend.glob("**/*", {cwd: "/work", timeoutMs: 1500}), /unsupported glob.bounded.v1/);
 features.add("glob.bounded.v1");
@@ -64,6 +66,37 @@ sent = calls.at(-1);
 assert.equal(sent.params.offset, 262144);
 assert.equal(sent.params.maxBytes, 262144);
 assert.deepEqual(sent.opts.requiredFeatures, ["fs.read.atomic-resolved-path.v1", "fs.read.bounded.v1", "fs.read.offset.v1"]);
+features.add("fs.write.atomic-resolved-path.v1");
+await backend.writeFileBytes("/work/file.ts", Buffer.from("raw"), { expectedResolvedPath: "/work/file.ts", signal: abort.signal, timeoutMs: 750 });
+sent = calls.at(-1);
+assert.equal(sent.method, "fs.write");
+assert.equal(sent.opts.signal, abort.signal);
+assert.equal(sent.opts.timeoutMs, 750);
+assert.equal(sent.params.expectedResolvedPath, "/work/file.ts");
+assert.equal(sent.params.dataB64, "cmF3");
+assert.equal(sent.params.exclusive, undefined);
+assert.deepEqual(sent.opts.requiredFeatures, ["fs.write.atomic-resolved-path.v1"]);
+await backend.writeFileBytes("/work/file.ts", Buffer.from("raw"));
+assert.equal(calls.at(-1).opts.signal, undefined);
+assert.equal(calls.at(-1).opts.timeoutMs, undefined);
+features.add("fs.mkdir.exclusive.v1");
+features.add("fs.create.bound-parent.v1");
+const exclusiveAbort = new AbortController();
+await backend.writeFileBytes("/work/new.ts", Buffer.from("new"), { exclusive: true, expectedResolvedPath: "/work/new.ts", signal: exclusiveAbort.signal, timeoutMs: 800 });
+sent = calls.at(-1);
+assert.notEqual(sent.opts.signal, exclusiveAbort.signal);
+assert.equal(sent.opts.signal.aborted, false);
+assert.equal(sent.opts.timeoutMs, 800);
+assert.equal(sent.params.timeoutMs, 800);
+assert.equal(sent.params.exclusive, true);
+exclusiveAbort.abort();
+assert.equal(sent.opts.signal.aborted, true);
+hang = true;
+const writeAbort = new AbortController();
+const pendingWrite = backend.writeFileBytes("/work/file.ts", Buffer.from("raw"), { signal: writeAbort.signal, timeoutMs: 600 });
+writeAbort.abort(new Error("cancel queued write"));
+await assert.rejects(pendingWrite, /cancel queued write/);
+hang = false;
 const writeOpts = { expectedBytes: Buffer.from("ok"), expectedResolvedPath: "/work/file.ts", signal: abort.signal, timeoutMs: 800 };
 await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), /upgrade/);
 features.add("fs.write.conditional.v1");
@@ -71,8 +104,26 @@ await backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), wr
 sent = calls.at(-1); assert.equal(sent.opts.timeoutMs, 800); assert.equal(sent.opts.signal, abort.signal);
 assert.equal(sent.params.expectedDataB64, "b2s="); assert.deepEqual(sent.opts.requiredFeatures, ["fs.write.conditional.v1"]);
 conditionalResult = { applied: false, conflict: true };
-await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), /conflict/);
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), (err) => {
+  assert.equal(err.message, "Conditional write conflict: file changed; preview again before retrying");
+  assert.equal(err.diskOutcome, "conflict");
+  assert.equal(err.code, undefined);
+  return true;
+});
 conditionalResult = { applied: true };
+conditionalError = new Error("RPC fs.writeConditional to device DeviceCase timed out after 800ms");
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), (err) => {
+  assert.match(err.message, /outcome is unknown/);
+  assert.equal(err.cause, conditionalError);
+  assert.equal(err.diskOutcome, undefined);
+  return true;
+});
+// Transport error wording is not a trusted conflict result from the executor.
+conditionalError = new Error("Conditional write conflict: untrusted transport error text");
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), (err) => {
+  assert.equal(err.diskOutcome, undefined);
+  return true;
+});
 conditionalError = new Error("conditional replacement cannot safely preserve complete Windows security metadata; original file retained");
 await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), (err) => {
   assert.match(err.message, /outcome is unknown/);

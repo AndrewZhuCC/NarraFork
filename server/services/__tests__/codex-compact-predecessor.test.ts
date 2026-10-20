@@ -163,9 +163,10 @@ for (const model of [null, "", "   ", "__default__", "test-relay:gpt-5.3-codex"]
 
 for (const kind of ["primary", "subagent", "stale-primary"] as const) {
 	test(`remote compact follows ${kind} runtime model, effort and conversation`, async () => {
-		const { activeNarrators, activeSubagentSettings } = await import("../narrator-session-state");
+		const { activeNarrators } = await import("../narrator-session-state");
 		const { getSettingsRevision } = await import("../../lib/settings");
-		await seedNarrator();
+		if (kind === "subagent") await seedNarrator("runtime-parent");
+		await seedNarrator("n1", kind === "subagent" ? "runtime-parent" : undefined);
 		await db
 			.update(narrators)
 			.set({ apiConversationId: "persisted-api-conversation" })
@@ -173,34 +174,27 @@ for (const kind of ["primary", "subagent", "stale-primary"] as const) {
 		await message("new", 1);
 		settings.agent.defaultModel = "test-relay:gpt-5.4";
 		settings.agent.defaultReasoningEffort = "high";
-		if (kind === "subagent") {
-			activeSubagentSettings.set("n1", { model: "test-relay:gpt-5.4", reasoningEffort: "low" });
-		} else {
-			activeNarrators.set("n1", {
-				narratorId: "n1",
-				conversationId: "live-api-conversation",
-				alive: true,
-				model: kind === "stale-primary" ? "test-relay:gpt-5.3-codex" : "test-relay:gpt-5.4",
-				provider: "openai",
-				reasoningEffort: "low",
-				_modelRef: "__default__",
-				_reasoningEffortRef: "medium",
-				_settingsRevision: getSettingsRevision() - (kind === "stale-primary" ? 1 : 0),
-				_substatus: new Set(),
-				events: new (await import("node:events")).EventEmitter(),
-			} as import("../narrator-session-state").ActiveNarrator);
-		}
+		activeNarrators.set("n1", {
+			narratorId: "n1",
+			conversationId: "live-api-conversation",
+			alive: true,
+			model: kind === "stale-primary" ? "test-relay:gpt-5.3-codex" : "test-relay:gpt-5.4",
+			provider: "openai",
+			reasoningEffort: "low",
+			_modelRef: "__default__",
+			_reasoningEffortRef: "medium",
+			_settingsRevision: getSettingsRevision() - (kind === "stale-primary" ? 1 : 0),
+			_substatus: new Set(),
+			events: new (await import("node:events")).EventEmitter(),
+		} as import("../narrator-session-state").ActiveNarrator);
 		try {
 			expect(await runCustomCompact("n1", "en", undefined, { mode: "background" })).toBe(true);
 			expect(requests[0].model).toBe("gpt-5.4");
 			expect(requests[0].reasoning.effort).toBe(kind === "stale-primary" ? "medium" : "low");
 			expect(compactRemote).toHaveBeenCalledTimes(1);
-			expect(compactRemote.mock.calls[0][2]?.conversationId).toBe(
-				kind === "subagent" ? "persisted-api-conversation" : "live-api-conversation",
-			);
+			expect(compactRemote.mock.calls[0][2]?.conversationId).toBe("live-api-conversation");
 		} finally {
 			activeNarrators.delete("n1");
-			activeSubagentSettings.delete("n1");
 		}
 	});
 }

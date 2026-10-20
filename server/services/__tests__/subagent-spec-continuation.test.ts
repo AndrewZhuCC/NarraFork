@@ -25,22 +25,43 @@ import { narrators, narratorToolCalls } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
 import { generateId } from "../../lib/id";
 import { deleteNugCachedModels, setNugCachedModels } from "../../lib/nug-model-cache";
+import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { settings, usesStatefulModel } from "../../lib/settings";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
+import { startNarratorRun } from "../agent-runtime/run";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import * as narratorExecutor from "../narrator-executor";
 import * as narratorRecovery from "../narrator-recovery";
 import { narratorService } from "../narrator-service";
+import { readSpecContinuationState } from "../narrator-session";
 import { writeSpecFile } from "../spec-vfs-service";
-import { executeSubagent, readSubagentSpecContinuationState } from "../subagent-executor";
 import {
-	buildSubagentContinuationPrompt,
+	buildSpecContinuationPrompt,
 	computeContinuationStallState,
-	createSubagentContinuationState,
-	MAX_SUBAGENT_CONTINUATION_PASSES,
-	planSubagentContinuation,
-	type SubagentContinuationCause,
-	subagentContinuationStopNote,
+	createSpecContinuationState as createSubagentContinuationState,
+	planSpecContinuation,
+	type SpecContinuationCause as SubagentContinuationCause,
+	specContinuationStopNote as subagentContinuationStopNote,
 } from "../turn-continuation-decisions";
+
+const delegationPolicy = resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]);
+const MAX_SUBAGENT_CONTINUATION_PASSES = delegationPolicy.continuation.maxPasses as number;
+const planSubagentContinuation = (input: Parameters<typeof planSpecContinuation>[0]) =>
+	planSpecContinuation({ ...input, maxPasses: MAX_SUBAGENT_CONTINUATION_PASSES });
+const buildSubagentContinuationPrompt = (
+	input: Omit<
+		Parameters<typeof buildSpecContinuationPrompt>[0],
+		"maxPasses" | "canAskUserQuestion"
+	>,
+) =>
+	buildSpecContinuationPrompt({
+		...input,
+		maxPasses: MAX_SUBAGENT_CONTINUATION_PASSES,
+		canAskUserQuestion: false,
+	});
+const readSubagentSpecContinuationState = (id: string) =>
+	readSpecContinuationState(id, delegationPolicy.continuation.promoteTodo);
 
 const DOING = { text: "Finish the migration", protected: false, status: "doing" as const };
 const BLOCKED = { text: "Needs a credential", protected: false, status: "blocked" as const };
@@ -323,7 +344,7 @@ describe("the stop note the parent receives", () => {
 
 	test("names the pass budget, including the number", () => {
 		const note = subagentContinuationStopNote(passLimit, "en");
-		expect(note).toContain(String(MAX_SUBAGENT_CONTINUATION_PASSES));
+		expect(note).toContain(String(passLimit.passes));
 		expect(note).toContain("dispatch again");
 	});
 
@@ -400,9 +421,9 @@ describe("the continuation prompt", () => {
 				locale,
 			});
 			if (locale === "en") {
-				expect(prompt).toContain("not the user and not your parent speaking");
+				expect(prompt).toContain("not the user speaking");
 			} else {
-				expect(prompt).toContain("不是用户或父级发言");
+				expect(prompt).toContain("不是用户发言");
 			}
 		}
 	});
@@ -421,7 +442,7 @@ describe("the continuation prompt", () => {
 		// The tool may be NAMED (saying "you don't have it" is the useful part, since the
 		// embedded blocked-task rule speaks of asking a question); what must not appear is an
 		// instruction to call it. The legal exit offered instead is ending the run.
-		expect(prompt).toContain("you have no AskUserQuestion");
+		expect(prompt).toContain("AskUserQuestion is unavailable");
 		expect(prompt).not.toMatch(/ask with AskUserQuestion|use AskUserQuestion/);
 		expect(prompt).toContain("end this run");
 		// And it must still carry the shared blocked-task rule rather than restating it.
@@ -738,12 +759,19 @@ describe("persisted continuation reaches the next executor request", () => {
 		const completedToolId = generateId();
 		const now = new Date().toISOString();
 		for (const id of [parentNarratorId, narratorId]) {
+			const delegated = id === narratorId;
 			await db.insert(narrators).values({
 				id,
-				type: id === narratorId ? "subagent" : "primary",
-				variant: id === narratorId ? "subagent:general" : "primary",
-				parentNarratorId: id === narratorId ? parentNarratorId : null,
-				traits: ["standalone"],
+				type: delegated ? "subagent" : "primary",
+				variant: delegated ? "subagent:general" : "primary",
+				parentNarratorId: delegated ? parentNarratorId : null,
+				...(delegated && {
+					policySourceNarratorId: parentNarratorId,
+					runtimeRegistrationJson: delegationRegistration(parentNarratorId, "general"),
+				}),
+				traits: delegated
+					? withRuntimePolicyTrait(["standalone"], compileDelegationPolicy({ template: "general" }))
+					: ["standalone"],
 				model,
 				autoContinuationOverride: "always",
 				createdAt: now,
@@ -822,20 +850,17 @@ describe("persisted continuation reaches the next executor request", () => {
 		);
 		try {
 			expect(process.env.NARRAFORK_TEST).toBe("1");
-			const result = await executeSubagent({
+			// A delegated run: the ordinary run entry plus a registered result destination.
+			const handle = await startNarratorRun({
 				narratorId,
-				parentNarratorId,
-				toolUseId,
-				subagentType: "general",
-				prompt,
-				cwd: process.env.HOME as string,
-				model,
-				provider: prefix,
 				locale: "en",
-				signal: new AbortController().signal,
-				systemPrompt: "Test subagent",
-				initialHistory: [],
+				text: "",
+				principal: null,
+				binding: { deliverTo: { narratorId: parentNarratorId, toolUseId } },
+				foreground: true,
 			});
+			expect(handle.started).toBe(true);
+			const result = await handle.terminal;
 			// Use the real configured provider classification, never a mocked identity:
 			// Anthropic exhausted its inner retries; Responses can rebuild a stateful session.
 			const stateful = usesStatefulModel(prefix, model);

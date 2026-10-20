@@ -10,6 +10,7 @@ import {
 
 import { useState } from "react";
 import { useInputMenu } from "../../../hooks/useInputMenu";
+import { Z } from "../../../lib/z-index";
 
 export type QueueMode = "turn" | "tool" | "interrupt";
 
@@ -206,7 +207,13 @@ export function SendOptionsSplitButton({
 	const inputMenu = useInputMenu();
 	return (
 		<Button.Group>
-			<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
+			<Menu
+				{...inputMenu.menuProps}
+				position="top-end"
+				withinPortal
+				// 高于全屏编辑器(Z.fullscreenEditor),否则全屏时发送选项菜单被编辑器盖住。
+				zIndex={Z.dropdown}
+			>
 				<Menu.Target>
 					<Button
 						{...inputMenu.targetProps}

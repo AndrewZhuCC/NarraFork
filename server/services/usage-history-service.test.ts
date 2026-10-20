@@ -1,10 +1,16 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { apiRequests, users } from "@server/db/schema";
-import { resetDbWorkerPoolForTest, shutdownDbWorkerPool } from "@server/lib/db-worker/pool";
+import {
+	getDbWorkerPoolStats,
+	resetDbWorkerPoolForTest,
+	shutdownDbWorkerPool,
+} from "@server/lib/db-worker/pool";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
+import { drizzle } from "drizzle-orm/bun-sqlite";
 import { cleanDb, getTestDb } from "../../tests/setup";
 import { UsageHistoryService } from "./usage-history-service";
 
@@ -335,7 +341,8 @@ describe("UsageHistoryService production worker", () => {
 		const path = join(directory, "usage.db");
 		try {
 			await writeFile(path, sqlite.serialize());
-			const workerService = new UsageHistoryService(db, path);
+			const fileDb = new Database(path);
+			const workerService = new UsageHistoryService(drizzle({ client: fileDb }) as typeof db);
 			const filters = { ...dateFilters, userId: "alice-id" };
 			expect(await workerService.getUsageStats(filters)).toEqual(
 				await service.getUsageStats(filters),
@@ -366,6 +373,8 @@ describe("UsageHistoryService production worker", () => {
 			// Clear only the injected main-thread fixture: subsequent totals must still come from disk.
 			cleanDb(sqlite);
 			expect((await workerService.getUsageStats(filters)).totalRequests).toBe(2);
+			expect(getDbWorkerPoolStats().workers).toBeGreaterThan(0);
+			fileDb.close();
 		} finally {
 			shutdownDbWorkerPool();
 			await rm(directory, { recursive: true, force: true });
@@ -374,13 +383,17 @@ describe("UsageHistoryService production worker", () => {
 
 	test("fails closed instead of performing a main-thread scan when workers are disabled", async () => {
 		seedUsers();
+		const directory = await mkdtemp(join(tmpdir(), "usage-history-worker-"));
+		const fileDb = new Database(join(directory, "usage.db"));
 		const original = process.env.NARRAFORK_DB_WORKER;
 		process.env.NARRAFORK_DB_WORKER = "off";
 		try {
 			await expect(
-				new UsageHistoryService(db, "unused.db").getUsageStats({}),
+				new UsageHistoryService(drizzle({ client: fileDb }) as typeof db).getUsageStats({}),
 			).rejects.toMatchObject({ statusCode: 503, code: "USAGE_QUERY_UNAVAILABLE" });
 		} finally {
+			fileDb.close();
+			await rm(directory, { recursive: true, force: true });
 			if (original === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = original;
 			resetDbWorkerPoolForTest();

@@ -529,7 +529,7 @@ func TestTransferPathsUseExistingAndCreateChecks(t *testing.T) {
 		t.Fatalf("upload through internal symlink failed: %v", err)
 	}
 	transfers.WriteChunk("upload-inside", 0, []byte("x"))
-	result, err := transfers.Complete(map[string]any{"transferId": "upload-inside"})
+	result, err := transfers.Complete(context.Background(), map[string]any{"transferId": "upload-inside"})
 	if err != nil || !result.(map[string]any)["ok"].(bool) {
 		t.Fatalf("internal upload completion failed: result=%#v err=%v", result, err)
 	}

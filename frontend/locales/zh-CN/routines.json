@@ -311,5 +311,6 @@
 	"hookFieldDurationMs": "本轮总耗时（毫秒）",
 	"hookFieldTotalTokens": "本轮消耗 token 量（非缓存输入 + 输出）",
 	"hookFieldAttentionReason": "关注原因（waiting_permission / done / error）",
-	"hookFieldAttentionDetail": "附加上下文（如权限解除时用户的决定 \"allow\" / \"deny\"）"
+	"hookFieldAttentionDetail": "附加上下文（如权限解除时用户的决定 \"allow\" / \"deny\"）",
+	"hookFieldBackgroundWorkActive": "仅在 done 且仍有会在完成时唤醒叙述者的后台任务（后台 bash 任务/子代理，不含传输与服务）运行时为 true；IM/通知音/浏览器通知会自行抑制，由 hook 接收方决定如何处理"
 }

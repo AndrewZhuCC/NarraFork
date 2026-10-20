@@ -13,26 +13,6 @@ import (
 	"time"
 )
 
-// Serializes executor-managed mutations, including ordinary writes and transfer commits.
-// External editors/processes do not participate; this is NOT an OS-level CAS.
-var fileMutationGate = make(chan struct{}, 1)
-
-func acquireFileMutation(ctx context.Context) (func(), error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	select {
-	case fileMutationGate <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			<-fileMutationGate
-			return nil, err
-		}
-		return func() { <-fileMutationGate }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 // FsStat returns existence + type + size for a path.
 func (h *Handlers) FsStat(params map[string]any) (any, error) {
 	path, err := h.guardedCreatePath(params, "path")
@@ -40,25 +20,32 @@ func (h *Handlers) FsStat(params map[string]any) (any, error) {
 		return nil, err
 	}
 	info, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string]any{
-				"exists":       false,
-				"isDirectory":  false,
-				"isFile":       false,
-				"size":         0,
-				"resolvedPath": path,
-			}, nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	return map[string]any{
-		"exists":       true,
-		"isDirectory":  info.IsDir(),
-		"isFile":       info.Mode().IsRegular(),
-		"size":         info.Size(),
-		"resolvedPath": path,
-	}, nil
+	result := map[string]any{"exists": false, "isDirectory": false, "isFile": false, "size": int64(0), "resolvedPath": path}
+	if err == nil {
+		result["exists"], result["isDirectory"], result["isFile"], result["size"] = true, info.IsDir(), info.Mode().IsRegular(), info.Size()
+	}
+	if boolParam(params, "editorIdentity") {
+		rootPath := stringParam(params, "editorRoot")
+		if rootPath == "" {
+			rootPath = path
+			if info == nil || !info.IsDir() {
+				rootPath = filepath.Dir(path)
+			}
+		}
+		root, identity, err := h.EditorRootIdentity(rootPath)
+		if err != nil {
+			return nil, err
+		}
+		result["canonicalRoot"], result["rootIdentity"], result["runtimeEpoch"] = root, identity, h.EditorEpoch()
+		result["mode"] = nil
+		if info != nil && info.Mode().IsRegular() {
+			result["mode"] = editorPermissionBits(info.Mode())
+		}
+	}
+	return result, nil
 }
 
 func (h *Handlers) FsExists(params map[string]any) (any, error) {
@@ -150,8 +137,9 @@ func (h *Handlers) FsRead(params map[string]any) (any, error) {
 	return h.FsReadContext(context.Background(), params)
 }
 
-// FsReadContext preserves the wire result while making protected reads cancellable.
-// The extra byte detects growth, and the final identity check precedes serialization.
+// FsReadContext waits for executor-controlled writes before opening the file.
+// The wire result and cancellation are preserved; external writers remain outside
+// this boundary. The final identity check precedes serialization of protected reads.
 func (h *Handlers) FsReadContext(parent context.Context, params map[string]any) (any, error) {
 	if err := parent.Err(); err != nil {
 		return nil, err
@@ -162,11 +150,25 @@ func (h *Handlers) FsReadContext(parent context.Context, params map[string]any) 
 	}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
+	// A pending writer may still be creating the file. Resolve its queue identity
+	// without opening a data handle that could become stale while we wait.
+	path, err := h.guardedCreatePath(params, "path")
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireFileMutation(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	f, resolvedPath, err := h.openReadFile(params)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	if !samePath(resolvedPath, path) {
+		return nil, fmt.Errorf("resolved path identity changed while waiting for read")
+	}
 	// Closing on cancellation also unblocks filesystems whose reads are pollable.
 	done := make(chan struct{})
 	defer close(done)
@@ -299,11 +301,9 @@ func (h *Handlers) FsWriteContext(ctx context.Context, params map[string]any) (a
 			return h.fsWriteExclusive(ctx, params)
 		}
 	}
-	release, err := acquireFileMutation(ctx)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer release()
 	rawPath, err := requiredPathParam(params, "path")
 	if err != nil {
 		return nil, err
@@ -330,6 +330,20 @@ func (h *Handlers) FsWriteContext(ctx context.Context, params map[string]any) (a
 			)
 		}
 		path = guardedExpected
+	}
+	release, err := acquireFileMutation(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	// A queued operation must never follow a changed alias into a different
+	// file's queue. Revalidate authorization and keep the admitted identity.
+	resolved, err := h.guard.CheckCreate(rawPath)
+	if err != nil {
+		return nil, err
+	}
+	if !samePath(resolved, path) {
+		return nil, fmt.Errorf("resolved path identity changed while waiting for write")
 	}
 	dataB64, _ := params["dataB64"].(string)
 	data, err := base64.StdEncoding.DecodeString(dataB64)
@@ -368,7 +382,29 @@ func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
-	release, err := acquireFileMutation(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	raw, err := requiredPathParam(params, "path")
+	if err != nil {
+		return nil, err
+	}
+	expectedPath, err := requiredPathParam(params, "expectedResolvedPath")
+	if err != nil {
+		return nil, err
+	}
+	expectedPath, err = absolutePath(expectedPath)
+	if err != nil {
+		return nil, err
+	}
+	path, err := h.guard.CheckCreate(raw)
+	if err != nil {
+		return nil, err
+	}
+	if !samePath(path, expectedPath) {
+		return map[string]any{"applied": false, "conflict": true}, nil
+	}
+	release, err := acquireFileMutation(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -398,25 +434,6 @@ func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any
 		if err != nil {
 			return nil, err
 		}
-	}
-	raw, err := requiredPathParam(params, "path")
-	if err != nil {
-		return nil, err
-	}
-	expectedPath, err := requiredPathParam(params, "expectedResolvedPath")
-	if err != nil {
-		return nil, err
-	}
-	expectedPath, err = absolutePath(expectedPath)
-	if err != nil {
-		return nil, err
-	}
-	path, err := h.guard.CheckCreate(raw)
-	if err != nil {
-		return nil, err
-	}
-	if !samePath(path, expectedPath) {
-		return map[string]any{"applied": false, "conflict": true}, nil
 	}
 	var originalMetadata conditionalMetadata
 	var originalInfo os.FileInfo
@@ -552,12 +569,34 @@ func (h *Handlers) FsRemove(params map[string]any) (any, error) {
 	return h.FsRemoveContext(context.Background(), params)
 }
 
-func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (any, error) {
-	release, err := acquireFileMutation(ctx)
+// fileRemovalMutationPath shares Windows 8.3 aliases of ordinary files with
+// writes. It is only a queue key: removal still unlinks the authorized directory
+// entry, and a final symlink/reparse point is never replaced by its referent.
+func fileRemovalMutationPath(path string) (string, error) {
+	if filepath.Separator != '\\' {
+		return path, nil
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return path, nil
+	}
 	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return path, nil
+	}
+	resolved, err := canonicalGuardPath(path)
+	if os.IsNotExist(err) {
+		return path, nil
+	}
+	return resolved, err
+}
+
+func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (any, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer release()
 	rawPath, err := requiredPathParam(params, "path")
 	if err != nil {
 		return nil, err
@@ -565,6 +604,22 @@ func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (
 	path, err := h.guard.CheckRemove(rawPath)
 	if err != nil {
 		return nil, err
+	}
+	queuePath, err := fileRemovalMutationPath(path)
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireFileMutation(ctx, queuePath)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	resolved, err := h.guard.CheckRemove(rawPath)
+	if err != nil {
+		return nil, err
+	}
+	if !samePath(resolved, path) {
+		return nil, fmt.Errorf("resolved path identity changed while waiting for remove")
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -575,6 +630,13 @@ func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (
 	}
 	if info.IsDir() {
 		return nil, fmt.Errorf("refusing to remove directory %q", path)
+	}
+	resolvedQueuePath, err := fileRemovalMutationPath(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if !samePath(resolvedQueuePath, queuePath) {
+		return nil, fmt.Errorf("remove target identity changed while waiting")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -658,6 +720,9 @@ func (h *Handlers) FsList(params map[string]any) (any, error) {
 	entries := make([]map[string]any, 0, len(dirEntries))
 	probesLeft := maxSymlinkProbes
 	for _, e := range dirEntries {
+		if h.guard.privatePath(filepath.Join(path, e.Name())) {
+			continue
+		}
 		if e.Type()&os.ModeSymlink == 0 {
 			entries = append(entries, map[string]any{
 				"name":        e.Name(),

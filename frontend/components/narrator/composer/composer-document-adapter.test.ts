@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
 	type ComposerDocument,
 	composerDocumentText,
+	legacyComposerDocumentText,
 	parseComposerDocument,
 } from "@shared/composer-document";
 import {
@@ -80,9 +81,55 @@ test("legacy file comments bind to the existing ranged file atom and keep the sa
 	]);
 	expect(document.paragraphs[0].children.some((node) => node.type === "quote")).toBe(false);
 	expect(parseComposerDocument(document)).toEqual(document);
-	expect(composerDocumentText(document)).toEqual(input);
-	expect(composerDocumentText(document).text).toContain("> #file:a.ts:2-4\n| [comment]\n");
+	expect(legacyComposerDocumentText(document)).toMatchObject(input);
+	const current = composerDocumentText(document);
+	expect(current.text).toStartWith("😀 before \n> [quote] a.ts:2-4 @@f:ref-1");
+	expect(current.text).toContain("> #file:a.ts:2-4\n| [comment]\n");
+	expect(current.fileReferences[0].inputRange?.[0]).toBe(
+		current.text.lastIndexOf("#file:a.ts:2-4"),
+	);
 	expect(importComposerInput(composerInputFromDocument(document))).toEqual(document);
+});
+
+test("positional message and file comments reimport without moving the source or duplicating files", () => {
+	const reference = { id: "ref-1", deviceId: "local", path: "/a.ts", label: "a.ts" };
+	const document: ComposerDocument = {
+		...empty,
+		paragraphs: [
+			{
+				children: [
+					{ type: "text", text: "before" },
+					{
+						type: "quote",
+						id: "q",
+						label: "source",
+						text: "original",
+						anchor: "m:abcd",
+						comment: "message note",
+					},
+					{ type: "text", text: "middle\n" },
+					{ type: "fileReference", id: "f", reference, comment: "file note" },
+					{ type: "text", text: "after" },
+				],
+			},
+		],
+	};
+	const projection = composerDocumentText(document);
+	const imported = importComposerInput(projection);
+	expect(imported.paragraphs[0].children.map((node) => node.type)).toEqual([
+		"text",
+		"quote",
+		"text",
+		"fileReference",
+		"text",
+	]);
+	expect(imported.paragraphs[0].children[1]).toMatchObject({
+		text: "original",
+		comment: "message note",
+	});
+	expect(imported.paragraphs[0].children[3]).toMatchObject({ reference, comment: "file note" });
+	expect(composerDocumentText(imported)).toEqual(projection);
+	expect(parseComposerDocument(imported)).toEqual(imported);
 });
 
 test("legacy detached file comments normalize once without duplicating attachments or source", () => {
@@ -125,11 +172,14 @@ test("legacy detached file comments normalize once without duplicating attachmen
 		getComposerAssetId(image),
 		getComposerAssetId(textFile),
 	]);
-	const projection = composerDocumentText(document);
-	expect(projection.text).toBe(`${input.text}#file:a.ts`);
-	expect(projection.fileReferences).toEqual([
+	const legacy = legacyComposerDocumentText(document);
+	expect(legacy.text).toBe(`${input.text}#file:a.ts`);
+	expect(legacy.fileReferences).toEqual([
 		{ ...reference, inputRange: [input.text.length, input.text.length + "#file:a.ts".length] },
 	]);
+	const projection = composerDocumentText(document);
+	expect(projection.text).toStartWith("😀 other body\nkeep everything\n> [quote] a.ts @@f:ref-1");
+	expect(projection.text).toContain("[image #1: image.png][file #1: note.txt]");
 	expect(reference).not.toHaveProperty("inputRange");
 	expect(parseComposerDocument(document)).toEqual(document);
 	const reimported = importComposerInput(projection);

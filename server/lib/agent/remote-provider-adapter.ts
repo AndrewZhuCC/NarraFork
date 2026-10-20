@@ -36,6 +36,7 @@ import type {
 	ReasoningProviderMetadata,
 	ResolvedToolDefinition,
 } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 type ProviderUsage = NonNullable<Extract<ProviderStreamEvent, { type: "usage" }>["usage"]>;
 
@@ -303,15 +304,16 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		const canonical = history as ProviderMessage[];
 		const results = toolResults.map(canonicalizeToolResult).filter(isProviderContentBlock);
 		if (results.length > 0) canonical.push({ role: "tool", content: results });
-		const blocks: ProviderContentBlock[] = [];
-		if (content) blocks.push({ type: "text", text: content });
-		for (const image of images ?? []) {
-			blocks.push({
-				type: "image",
-				mediaType: mediaTypeFor(image.format),
-				dataBase64: image.base64,
-			});
-		}
+		const blocks = orderUserContent(content, images ?? [], "after").map(
+			(part): ProviderContentBlock =>
+				part.type === "text"
+					? { type: "text", text: part.text }
+					: {
+							type: "image",
+							mediaType: mediaTypeFor(part.image.format),
+							dataBase64: part.image.base64,
+						},
+		);
 		if (blocks.length > 0) canonical.push({ role: "user", content: blocks });
 	}
 

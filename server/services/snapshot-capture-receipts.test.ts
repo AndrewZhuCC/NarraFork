@@ -34,7 +34,6 @@ import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 import { treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 let root: string;
@@ -82,7 +81,6 @@ beforeEach(async () => {
 	runtime = new LocalFileChangeRuntime({
 		db,
 		privateRoot,
-		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 	receipts = new SnapshotCaptureReceiptService({ db, privateRoot });
@@ -436,19 +434,21 @@ describe("actual tree-scan observation receipts", () => {
 		expect(rows().filter((row) => row.coverage === "unavailable")).toHaveLength(1);
 	});
 
-	test("recreated workspace cannot inherit the old scope; real runtime rebinds a new incarnation", async () => {
+	test("a recreated directory gets a fresh observation without a verification barrier", async () => {
 		await capture();
-		const oldScope = rows()[0].scopeId;
+		const first = rows()[0];
 		await rename(workspace, join(root, "previous"));
 		await mkdir(workspace);
 		await spawn.safeSpawn({ cmd: ["git", "init"], cwd: workspace, timeout: 5000 });
-		await writeFile(join(workspace, "a.txt"), "new incarnation\n");
-		await capture();
-		expect(rows()).toHaveLength(1);
-		await editorWrite("new verified incarnation\n");
+		await writeFile(join(workspace, "a.txt"), "new directory\n");
 		await capture();
 		expect(rows()).toHaveLength(2);
-		expect(rows()[1].scopeId).not.toBe(oldScope);
+		expect(rows()[1].treeHash).not.toBe(first.treeHash);
+		expect(rows()[0]).toEqual(first);
+		await editorWrite("new recorded write\n");
+		await capture();
+		expect(rows()).toHaveLength(3);
+		expect(rows()[2].scopeId).toBe(first.scopeId);
 	});
 
 	test("root replaced mid-scan invalidates only that receipt", async () => {
@@ -637,11 +637,19 @@ describe("actual tree-scan observation receipts", () => {
 
 	test("bounded begin metadata cannot insert a late receipt after the scan has returned", async () => {
 		const delayed = gate();
+		let releaseLate = () => {};
+		const lateSettled = new Promise<void>((resolve) => {
+			releaseLate = resolve;
+		});
 		const original = localIo.localDirectoryIdentity;
 		const identitySpy = spyOn(localIo, "localDirectoryIdentity").mockImplementation(
 			async (path) => {
-				await delayed.promise;
-				return original(path);
+				try {
+					await delayed.promise;
+					return await original(path);
+				} finally {
+					releaseLate();
+				}
 			},
 		);
 		cleanupSpies.push(identitySpy);
@@ -652,8 +660,14 @@ describe("actual tree-scan observation receipts", () => {
 		expect(rows()).toHaveLength(0);
 		identitySpy.mockRestore();
 		delayed.resolve();
+		// The timed-out identity read is still in flight. One setImmediate does not
+		// wait for it, and a later begin on the same 15ms budget loses to a loaded
+		// CI identity walk (begin_unavailable, no row). Settle the late read, prove
+		// it did not publish, then record with the production budget.
+		await lateSettled;
 		await new Promise<void>((done) => setImmediate(done));
 		expect(rows()).toHaveLength(0);
+		receipts = new SnapshotCaptureReceiptService({ db, privateRoot });
 		await capture();
 		expect(rows()).toHaveLength(1);
 	});

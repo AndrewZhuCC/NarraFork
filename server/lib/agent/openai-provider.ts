@@ -96,6 +96,7 @@ import {
 	stripUnsupportedParameter,
 	withUnsupportedParameterFallback,
 } from "./unsupported-parameter-fallback";
+import { orderUserContent } from "./user-content-order";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
 
@@ -4300,15 +4301,15 @@ function buildOAIUserMessage(
 	if (!hasText && !hasImages) return null;
 
 	if (hasImages) {
-		const parts: OAIContentPart[] = [
-			{ type: "text", text: hasText ? content : "[user sent image(s)]" },
-		];
-		for (const img of images) {
-			parts.push({
-				type: "image_url",
-				image_url: { url: `data:image/${img.format};base64,${img.base64}` },
-			});
-		}
+		const parts = orderUserContent(hasText ? content : "[user sent image(s)]", images, "after").map(
+			(part): OAIContentPart =>
+				part.type === "text"
+					? { type: "text", text: part.text }
+					: {
+							type: "image_url",
+							image_url: { url: `data:image/${part.image.format};base64,${part.image.base64}` },
+						},
+		);
 		return { role: "user", content: parts };
 	}
 
@@ -4457,21 +4458,28 @@ async function buildResponsesUserMessageFromDbMessage(
 ): Promise<OAIMessage | null> {
 	const ownerNarratorId = msg.narratorId ?? narratorId;
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	const content: OAIContentPart[] = [];
 	const retained: CodexRetainedUserMessage["contentJson"] = [];
+	// Keep image slots aligned with the placeholders, including missing images.
+	const images: Array<OAIContentPart | null> = [];
+	const texts: string[] = [];
 	let sawTextBlock = false;
 	for (const block of blocks as Array<Record<string, unknown>>) {
 		if (block.type === "text" && typeof block.text === "string") {
 			sawTextBlock = true;
-			if (block.text.length > 0) {
-				content.push({ type: "input_text", text: block.text });
-				retained.push({ type: "text", text: block.text });
-			}
+			texts.push(block.text);
+			retained.push({ type: "text", text: block.text });
 			continue;
 		}
 		if (block.type === "image" && typeof block.imageId === "string" && ownerNarratorId) {
 			const uploadNarratorId =
 				typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : ownerNarratorId;
+			const image = {
+				type: "image" as const,
+				imageId: block.imageId,
+				uploadNarratorId,
+				mediaType: typeof block.mediaType === "string" ? block.mediaType : "image/png",
+			};
+			retained.push(image);
 			const filePath = getImagePath(uploadNarratorId, block.imageId);
 			if (!filePath) {
 				logger.warn("Responses history image missing on disk; skipping replay", {
@@ -4482,6 +4490,7 @@ async function buildResponsesUserMessageFromDbMessage(
 					messageId: msg.id,
 					imageId: block.imageId,
 				});
+				images.push(null);
 				continue;
 			}
 			try {
@@ -4492,18 +4501,10 @@ async function buildResponsesUserMessageFromDbMessage(
 					"image/gif": "gif",
 					"image/webp": "webp",
 				};
-				const effectiveMime =
-					result.detectedMediaType ??
-					(typeof block.mediaType === "string" ? block.mediaType : "image/png");
-				content.push({
+				image.mediaType = result.detectedMediaType ?? image.mediaType;
+				images.push({
 					type: "input_image",
-					image_url: `data:image/${mimeToFormat[effectiveMime] ?? "png"};base64,${result.base64}`,
-				});
-				retained.push({
-					type: "image",
-					imageId: block.imageId,
-					uploadNarratorId,
-					mediaType: effectiveMime,
+					image_url: `data:image/${mimeToFormat[image.mediaType] ?? "png"};base64,${result.base64}`,
 				});
 			} catch (error) {
 				logger.warn("Failed to rebuild Responses history image; skipping replay", {
@@ -4515,9 +4516,14 @@ async function buildResponsesUserMessageFromDbMessage(
 					imageId: block.imageId,
 					error: error instanceof Error ? error.message : String(error),
 				});
+				images.push(null);
 			}
 		}
 	}
+	// Ordinary replay and retained compaction input use the same content ordering.
+	const content: OAIContentPart[] = orderUserContent(texts.join(""), images, "before").map(
+		(part) => (part.type === "text" ? { type: "input_text", text: part.text } : part.image),
+	);
 	const fallbackText = msg.contentText || "";
 	if (!content.length && fallbackText && !sawTextBlock) {
 		content.push({ type: "input_text", text: fallbackText });

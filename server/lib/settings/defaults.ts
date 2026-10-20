@@ -56,7 +56,9 @@ export const DEFAULTS: NarraForkSettings = {
 		// instead of the real cause ("no default model configured"). The setup
 		// wizard makes selecting one a hard gate before anything can run.
 		defaultModel: "",
-		defaultPermissionMode: "acceptEdits",
+		// 全部允许：新建叙述者默认不逐条审批工具调用，改为依赖危险反思档位
+		// （dangerReflectionLevel = standard）在真正高风险操作上暂停。
+		defaultPermissionMode: "bypassPermissions",
 		notificationPolicy: { allowSend: false },
 		defaultNarratorVisibility: "auto",
 		defaultNarratorWriteAudience: "auto",

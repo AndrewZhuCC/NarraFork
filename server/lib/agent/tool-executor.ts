@@ -824,24 +824,30 @@ export async function executeTool(
 		)
 			return;
 		try {
-			if (preparedNoDispatch) {
-				await preparedNoDispatch(reason, claimed);
-			} else if (config.recordToolNoDispatch) {
-				await config.recordToolNoDispatch(proofContext(), fileToolName, reason, claimed);
-			} else {
-				const { getDefaultLocalFileChangeRuntime } = await import(
-					"@server/services/file-change-runtime"
-				);
-				await (await getDefaultLocalFileChangeRuntime()).recordHostNoDispatch(
-					proofContext(),
-					fileToolName,
-					reason,
-					claimed,
-				);
-			}
+			const { boundedFileHistory } = await import("@server/services/file-change-runtime");
+			await boundedFileHistory(async () => {
+				if (preparedNoDispatch) {
+					await preparedNoDispatch(reason, claimed);
+				} else if (config.recordToolNoDispatch) {
+					await config.recordToolNoDispatch(proofContext(), fileToolName, reason, claimed);
+				} else {
+					const { getDefaultLocalFileChangeRuntime } = await import(
+						"@server/services/file-change-runtime"
+					);
+					await (await getDefaultLocalFileChangeRuntime()).recordHostNoDispatch(
+						proofContext(),
+						fileToolName,
+						reason,
+						claimed,
+					);
+				}
+			});
 		} catch (error) {
 			evidenceFailure = error;
-			throw error;
+			logger.warn("Tool no-dispatch history unavailable", {
+				toolUseId: tu.toolUseId,
+				error: String(error),
+			});
 		}
 	};
 
@@ -1249,7 +1255,10 @@ export async function executeTool(
 		const pipelinePreviewChars = pipelineState?.maxPreviewChars ?? 100;
 
 		const ctx: ToolContext = {
-			recordFileNoDispatch: (reason) => persistNoDispatch(reason, true),
+			recordFileNoDispatch: async (reason) => {
+				await persistNoDispatch(reason, true);
+				if (evidenceFailure) throw evidenceFailure;
+			},
 			narratorId: config.narratorId,
 			cwd: config.cwd,
 			signal: config.signal,
@@ -1752,8 +1761,6 @@ export async function executeTool(
 					: permissionRuleTerminationReason,
 			});
 		}
-		// biome-ignore lint/correctness/noUnsafeFinally: evidence persistence failure must override any tool result.
-		if (evidenceFailure) throw evidenceFailure;
 		if (!bodyInvoked) {
 			await persistNoDispatch(
 				config.signal.aborted ? "cancelled_before_dispatch" : "invocation_rejected",

@@ -28,9 +28,13 @@ import { listRunningAwaits } from "../lib/agent/tools/await";
 import { NotFoundError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { isSubagentVariant } from "../lib/narrator-utils";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { getObservedRestartHandoff } from "../lib/restart-handoff";
+import { executionPrincipalOf } from "../lib/runtime-source";
+import {
+	type RunBindingInput,
+	readRuntimeRegistrationColumn,
+} from "../lib/validators/runtime-registration";
 import {
 	type AgentReplyWaitRunSnapshot,
 	getRunningAgentReplyWaitRunSnapshot,
@@ -103,11 +107,6 @@ const EMPTY_PROTECTION: ToolContinuationProtectionSets = {
 function payloadString(payload: Record<string, unknown> | null, key: string): string | undefined {
 	const value = payload?.[key];
 	return typeof value === "string" && value ? value : undefined;
-}
-
-function payloadNumber(payload: Record<string, unknown> | null, key: string): number | undefined {
-	const value = payload?.[key];
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function timestampMs(value: string | number | Date | null | undefined): number | null {
@@ -470,14 +469,19 @@ export async function runContinuationRecoveryGroups(
 export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpdateRecoverySnapshot> {
 	const snapshot = capturePlannedUpdateRecoverySnapshot();
 	const runningAwaits = new Map(listRunningAwaits().map((entry) => [entry.toolUseId, entry]));
-	const { BACKGROUND_TASK_TIMEOUT_MS, listRunningSubagentExecutions } = await import(
-		"./subagent-runner"
-	);
-	const { listActiveSubagentResumeRuns } = await import("./subagent-resume");
-	const runningAgents = listRunningSubagentExecutions();
+	const [{ BACKGROUND_TASK_TIMEOUT_MS }, { listDeliveringRuns }] = await Promise.all([
+		import("./subagent-runner"),
+		import("./agent-runtime/run"),
+	]);
+	// The live run registry includes both initial and resumed child runs.
+	const runningAgents = listDeliveringRuns().map((run) => ({
+		...run,
+		subagentId: run.narratorId,
+		executionDeadlineAt: run.deadlineAt,
+		timeoutMs: null,
+	}));
 	const runningAgentByToolUseId = new Map(runningAgents.map((entry) => [entry.toolUseId, entry]));
 	const runningAgentBySubagentId = new Map(runningAgents.map((entry) => [entry.subagentId, entry]));
-	const checkpointedForegroundAgentIds = new Set<string>();
 	// Only rows owned by a narrator this process is still running may become continuations.
 	// See isLiveNarratorForCheckpoint: an unfiltered scan resurrects narrators whose turn
 	// ended long ago but left non-terminal tool rows behind.
@@ -578,11 +582,11 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 			continue;
 		}
 		if (toolCall.toolName === "Agent") {
-			const subagentId = subagentByOrigin.get(toolCall.toolUseId);
+			const registered = runningAgentByToolUseId.get(toolCall.toolUseId);
+			const currentRun = registered?.recipientId === toolCall.narratorId ? registered : undefined;
+			const subagentId = currentRun?.subagentId ?? subagentByOrigin.get(toolCall.toolUseId);
 			if (!subagentId) continue;
-			checkpointedForegroundAgentIds.add(subagentId);
-			const runtime =
-				runningAgentByToolUseId.get(toolCall.toolUseId) ?? runningAgentBySubagentId.get(subagentId);
+			const runtime = currentRun ?? runningAgentBySubagentId.get(subagentId);
 			const deadline = resolveAgentExecutionDeadline({
 				runtimeDeadlineAt: runtime?.executionDeadlineAt,
 				runtimeTimeoutMs: runtime?.timeoutMs,
@@ -627,58 +631,6 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 				payloadJson: { targetId, awaitDeadlineAt: deadlineAt },
 			});
 		}
-	}
-
-	// A resumed runner may not yet be linked in the message-origin map. Recover it only
-	// through a live parent's unfinished Agent call; never resurrect a completed parent.
-	for (const activeResume of listActiveSubagentResumeRuns()) {
-		if (checkpointedForegroundAgentIds.has(activeResume.subagentId)) continue;
-		const runtime = runningAgentBySubagentId.get(activeResume.subagentId);
-		if (!runtime || runtime.background) continue;
-		const [originToolCall] = await db
-			.select({
-				id: narratorToolCalls.id,
-				narratorId: narratorToolCalls.narratorId,
-				status: narratorToolCalls.status,
-				inputJson: narratorToolCalls.inputJson,
-				executionStartedAt: narratorToolCalls.executionStartedAt,
-				createdAt: narratorToolCalls.createdAt,
-			})
-			.from(narratorToolCalls)
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, runtime.parentNarratorId),
-					eq(narratorToolCalls.toolUseId, activeResume.originToolUseId),
-					eq(narratorToolCalls.toolName, "Agent"),
-				),
-			)
-			.limit(1);
-		if (
-			!originToolCall ||
-			!["initializing", "pending", "running"].includes(originToolCall.status) ||
-			!isLiveNarratorForCheckpoint(snapshot, originToolCall.narratorId)
-		) {
-			throw new Error(
-				`Active resumed subagent ${activeResume.subagentId} has no live unfinished origin Agent call; retry the update after it finishes`,
-			);
-		}
-		const deadline = resolveAgentExecutionDeadline({
-			runtimeDeadlineAt: runtime.executionDeadlineAt,
-			runtimeTimeoutMs: runtime.timeoutMs,
-			toolInput: originToolCall.inputJson as Record<string, unknown> | null,
-			startedAt: runtime.startedAt ?? originToolCall.executionStartedAt ?? originToolCall.createdAt,
-		});
-		await toolContinuationService.upsert({
-			toolCallId: originToolCall.id,
-			narratorId: originToolCall.narratorId,
-			updateEpoch: snapshot.updateEpoch,
-			kind: "foreground_agent",
-			payloadJson: {
-				subagentId: activeResume.subagentId,
-				logicalRunId: runtime.logicalRunId ?? readAgentLogicalRunId(activeResume.subagentId),
-				...deadline,
-			},
-		});
 	}
 
 	const runningBackgroundAgents = await db
@@ -1092,45 +1044,28 @@ async function continueOwnerWhenReady(
 		if (error instanceof NotFoundError) return "mounted";
 		throw error;
 	}
-	if (isSubagentVariant(owner.variant)) {
-		const epochRows = await toolContinuationService.listByEpoch(scope);
-		const owningAgentContinuation = epochRows.find(
-			(row) =>
-				(row.kind === "foreground_agent" || row.kind === "background_agent") &&
-				payloadString(row.payloadJson, "subagentId") === owner.id &&
-				row.state !== "cancelled",
-		);
-		if (
-			owningAgentContinuation &&
-			(!recoveringToolCallIds || recoveringToolCallIds.has(owningAgentContinuation.toolCallId))
-		) {
-			return hasPersistedToolContinuationResult(owningAgentContinuation) ? "mounted" : "deferred";
-		}
-		const { resumeSubagent } = await import("./subagent-resume");
-		try {
-			const resumed = await resumeSubagent({
-				subagentId: owner.id,
-				resumeLogicalRunId: owner.logicalRunId ?? undefined,
-				intent: "continue_tool_results",
-				actor: "parent_agent",
-				locale: "en",
-				allowRunningRestart: true,
-				skipStaleAttach: true,
-				skipConclusionDelivery:
-					record.payloadJson?.ordinaryRestart === true && !owningAgentContinuation,
-			});
-			if (resumed.started) return "started";
-		} catch (error) {
-			const current = await narratorService.getById(owner.id).catch(() => null);
-			if (current?.status === "working" || current?.status === "waiting") return "mounted";
-			throw error;
-		}
-		const current = await narratorService.getById(owner.id).catch(() => null);
-		if (current?.status === "working" || current?.status === "waiting") return "mounted";
-		throw new Error(`Subagent owner continuation did not start for ${owner.id}`);
+	// A session whose run another continuation re-drives (it owes that run's result to
+	// a recovering tool call) is mounted by that continuation, not here.
+	const epochRows = await toolContinuationService.listByEpoch(scope);
+	const owningAgentContinuation = epochRows.find(
+		(row) =>
+			(row.kind === "foreground_agent" || row.kind === "background_agent") &&
+			payloadString(row.payloadJson, "subagentId") === owner.id &&
+			row.state !== "cancelled",
+	);
+	if (
+		owningAgentContinuation &&
+		(!recoveringToolCallIds || recoveringToolCallIds.has(owningAgentContinuation.toolCallId))
+	) {
+		return hasPersistedToolContinuationResult(owningAgentContinuation) ? "mounted" : "deferred";
 	}
 	const { continueNarrator } = await import("./narrator-session");
-	const continued = await continueNarrator(owner.id);
+	const continued = await continueNarrator(owner.id, "en", false, undefined, {
+		resumeRunId: owner.logicalRunId ?? undefined,
+		recovered: true,
+		// An ordinary restart's own run already delivered (or never owed) its result.
+		deliver: !(record.payloadJson?.ordinaryRestart === true && !owningAgentContinuation),
+	});
 	if (continued.ok) return "started";
 	const current = await narratorService.getById(owner.id).catch(() => null);
 	if (current?.status === "working" || current?.status === "waiting") return "mounted";
@@ -1241,43 +1176,50 @@ async function restoreAgent(
 ): Promise<void> {
 	const subagentId = payloadString(record.payloadJson, "subagentId");
 	if (!subagentId) throw new Error("Agent continuation is missing subagentId");
-	const executionDeadlineAt = payloadString(record.payloadJson, "executionDeadlineAt") ?? null;
-	const executionTimeoutMs = payloadNumber(record.payloadJson, "executionTimeoutMs") ?? null;
-	const deadlineMs = timestampMs(executionDeadlineAt);
-	const remainingExecutionTimeoutMs =
-		deadlineMs === null ? undefined : Math.max(deadlineMs - Date.now(), 0);
 	await waitForChildContinuationResults(subagentId, scope, signal);
-	const { resumeSubagent } = await import("./subagent-resume");
 	const resumeLogicalRunId =
 		payloadString(record.payloadJson, "logicalRunId") ??
 		readAgentLogicalRunId(subagentId) ??
 		(await getRuntimePublicationService().getAgentRun(subagentId, record.narratorId)).logicalRunId;
+	// New registrations win. A pre-registration checkpoint still carries its original
+	// absolute deadline: materialize it once, never turn it back into a fresh timeout.
+	const source = await db.query.narrators.findFirst({
+		where: eq(narrators.id, subagentId),
+		columns: { runtimeRegistrationJson: true, ownerUserId: true },
+	});
+	let legacyBinding: RunBindingInput | undefined;
+	if (!readRuntimeRegistrationColumn(source?.runtimeRegistrationJson)?.run) {
+		const call = await toolContinuationService.getToolCallResult(record.toolCallId);
+		if (!call) throw new Error("Agent continuation's spawning call no longer exists");
+		legacyBinding = {
+			deliverTo: {
+				narratorId: record.narratorId,
+				toolUseId: call.toolUseId,
+				toolCallId: record.toolCallId,
+			},
+			principal: executionPrincipalOf(source ?? {}) ?? { userId: null },
+			deadlineAt: payloadString(record.payloadJson, "executionDeadlineAt"),
+		};
+	}
+	const { continueNarrator } = await import("./narrator-session");
 	const resumed = await withRecoveryAdvance(record.updateEpoch, () =>
-		resumeSubagent({
-			subagentId,
-			intent: "continue_tool_results",
-			actor: "parent_agent",
-			locale,
-			signal,
-			allowRunningRestart: true,
-			skipStaleAttach: true,
-			preserveBackground: background,
-			skipConclusionDelivery: background,
-			resumeLogicalRunId,
-			timeoutMs: remainingExecutionTimeoutMs,
-			executionDeadlineAt,
-			executionTimeoutMs,
+		continueNarrator(subagentId, locale, false, undefined, {
+			resumeRunId: resumeLogicalRunId,
+			recovered: true,
+			...(legacyBinding ? { binding: legacyBinding } : {}),
+			...(background ? {} : { cancelSignal: signal }),
 		}),
 	);
-	if (!resumed.started || !resumed.terminalCompletion) {
+	if (!resumed.ok || !resumed.terminal) {
 		throw new Error("Agent continuation did not expose terminal completion");
 	}
+	const terminalCompletion = resumed.terminal;
 	if (!(await toolContinuationService.markOwnerContinuationStartedForNarrator(subagentId, scope))) {
 		throw new Error(`Failed to persist mounted child continuation for ${subagentId}`);
 	}
 	if (background) {
 		await persistRecoveredBackgroundAgentStartResult(record, subagentId);
-		void resumed.terminalCompletion.catch((error) => {
+		void terminalCompletion.catch((error) => {
 			logger.error("Recovered background Agent terminal completion failed", {
 				subagentId,
 				toolCallId: record.toolCallId,
@@ -1288,7 +1230,7 @@ async function restoreAgent(
 		return;
 	}
 	onMounted();
-	await resumed.terminalCompletion;
+	await terminalCompletion;
 	if (signal.aborted) throw signal.reason ?? new Error("Agent continuation recovery was aborted");
 }
 
@@ -2114,7 +2056,7 @@ async function restoreLegacyNarrators(
 						if (controller.signal.aborted) return;
 						const narrator = await narratorService.getById(target.narratorId);
 						controller.signal.throwIfAborted();
-						if (isSubagentVariant(narrator.variant) || narrator.status === "archived") {
+						if (narrator.status === "archived") {
 							invalidateRecoveryTarget(target.narratorId);
 							return;
 						}
@@ -2131,6 +2073,7 @@ async function restoreLegacyNarrators(
 							target.locale as Locale,
 							target.replyInUserLanguage ?? false,
 							target.userId ?? null,
+							{ resumeRunId: narrator.logicalRunId ?? undefined, recovered: true },
 						);
 						controller.signal.throwIfAborted();
 						if (!continued.ok && !isLoopRunning(target.narratorId)) {

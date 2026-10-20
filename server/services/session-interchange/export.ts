@@ -438,12 +438,8 @@ async function rowsToMessages(
 }
 
 /** The narrator's own top-level transcript, full scope, in seq order. */
-async function readTopLevel(
-	narratorId: string,
-	isSubagent: boolean,
-	ctx: ReadContext,
-): Promise<InterchangeMessage[]> {
-	const scope = await resolveTranscriptScope(narratorId, "full", isSubagent);
+async function readTopLevel(narratorId: string, ctx: ReadContext): Promise<InterchangeMessage[]> {
+	const scope = await resolveTranscriptScope(narratorId, "full");
 	const out: InterchangeMessage[] = [];
 	for await (const page of iterateNarratorTranscript(narratorId, scope, ctx.signal)) {
 		if (page.refs.length === 0) continue;
@@ -534,7 +530,7 @@ export async function narratorToInterchange(
 	}
 	for (const child of children) ctx.subagentByToolUseId.set(child.toolUseId, child.id);
 
-	const messages = await readTopLevel(narratorId, isSubagent, ctx);
+	const messages = await readTopLevel(narratorId, ctx);
 
 	// A child whose spawning call never made it into the exported transcript (an
 	// unfinished call, or history outside this narrator's scope) has nothing to
@@ -553,7 +549,7 @@ export async function narratorToInterchange(
 			warnings.add("missing_subagent", child.id);
 			continue;
 		}
-		const childMessages = await readTopLevel(child.id, true, {
+		const childMessages = await readTopLevel(child.id, {
 			...ctx,
 			subagentByToolUseId: new Map(),
 		});

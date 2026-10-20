@@ -95,7 +95,7 @@ import {
 	workspaceFileTarget,
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
-import type { RevertScope } from "../../lib/api/narrators";
+import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
@@ -105,6 +105,12 @@ import {
 } from "../../lib/format";
 import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
+import {
+	formatRevertFailure,
+	formatRevertSuccessWarning,
+	invalidateRevertQueries,
+	isRevertHistoryCommitted,
+} from "../../lib/revert-result";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -176,6 +182,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { commandCodeQuotaView } from "./model/commandcode-quota-format";
 import { usageSourceFor } from "./model/custom-api-usage-source";
 import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import {
@@ -196,6 +203,7 @@ import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
+import { useNarratorPanelVisible } from "./narrator-panel-visibility";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -298,6 +306,7 @@ function NarratorPanelBody({
 	onToggleSpecPanel,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
+	const fileDrawerVisible = useNarratorPanelVisible();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
 	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
@@ -722,6 +731,16 @@ function NarratorPanelBody({
 		t,
 	);
 
+	// Command Code 额度：仅在当前模型走 commandcode 前缀时启用，避免无谓的接口调用。
+	const commandCodeEnabled = !!resolvedModel?.startsWith("CommandCode:");
+	const commandCodeUsageQuery = useQuery({
+		queryKey: ["commandcode", "usage"],
+		queryFn: () => api.commandCodeUsage(),
+		enabled: commandCodeEnabled,
+		refetchInterval: commandCodeEnabled ? 60_000 : false,
+	});
+	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
+
 	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
 	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
 	// stays disabled unless the current narrator's provider is a Kimi provider,
@@ -809,7 +828,7 @@ function NarratorPanelBody({
 		async (
 			messageId: string,
 			newContent: string,
-			revertOpts: { skipRevert: boolean; scope?: RevertScope },
+			revertOpts: RevertActionConfirmOptions,
 			opts?: {
 				keepImageIds: string[];
 				newImages: File[];
@@ -832,10 +851,16 @@ function NarratorPanelBody({
 					...revertOpts,
 					...opts,
 				});
-				// The rollback this edit performed can reach past the chosen scope
-				// (subagent writes, a workspace restore) — reported exactly as it is for
-				// rollback-to-block, so the outcome is verified rather than assumed.
-				const warningText = formatRevertWarnings(t, result.warnings);
+				if (!result.ok || (result.revertResult && !isRevertHistoryCommitted(result.revertResult))) {
+					throw new ApiError(t("editFailed"), 409, { ...result });
+				}
+				// File writes and the COW history update have independent outcomes.
+				const warningText = [
+					formatRevertSuccessWarning(t, result),
+					formatRevertWarnings(t, result.warnings),
+				]
+					.filter(Boolean)
+					.join("\n");
 				if (warningText) {
 					notifications.show({
 						title: t("rollbackPartialTitle"),
@@ -845,13 +870,23 @@ function NarratorPanelBody({
 					});
 				}
 				return result.ok;
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
-				notifications.show({ title: t("editFailed"), message, color: "red" });
+			} catch (error) {
+				notifications.show({
+					title: t("editFailed"),
+					message: formatRevertFailure(t, error, {
+						fallbackKey: "editFailed",
+						skipRevert: revertOpts.skipRevert,
+					}),
+					color: "red",
+					autoClose: false,
+				});
 				return false;
+			} finally {
+				invalidateRevertQueries(qc, narratorId);
+				chunkListRef.current?.refreshStructure("full");
 			}
 		},
-		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
+		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t, qc],
 	);
 
 	const handleEditAssistantMessage = useCallback(
@@ -937,6 +972,13 @@ function NarratorPanelBody({
 	// into the composer's draft state machine.
 	const forwardDraftChanged = useCallback(
 		(draft: NarratorRemoteDraft) => composerRef.current?.handleDraftChanged(draft),
+		[],
+	);
+	// Reconnect reconciles carry draft metadata (never a body): let the composer
+	// pull the body when the snapshot proves the live event stream was missed.
+	const forwardDraftMeta = useCallback(
+		(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) =>
+			composerRef.current?.handleDraftMeta(meta),
 		[],
 	);
 
@@ -1239,6 +1281,7 @@ function NarratorPanelBody({
 		nugProviderId: nugProviderInfo?.providerId,
 		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
 		onDraftChanged: forwardDraftChanged,
+		onDraftMeta: forwardDraftMeta,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
 		},
@@ -2310,10 +2353,12 @@ function NarratorPanelBody({
 			domIds,
 			targetIds,
 			highlightId,
+			needle,
 		}: {
 			domIds: string[];
 			targetIds: string[];
 			highlightId?: string;
+			needle?: string;
 		}): Promise<boolean> => {
 			// The virtual list owns the whole jump (reveal, flash, and paging upward into
 			// not-yet-loaded history). Short-circuiting on a mounted DOM node here would
@@ -2322,7 +2367,7 @@ function NarratorPanelBody({
 			// `highlightedId` state.
 			const handle = chunkListRef.current;
 			if (!handle) return false;
-			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId });
+			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId, needle });
 		},
 		[],
 	);
@@ -2332,13 +2377,14 @@ function NarratorPanelBody({
 	const registerScrollToMessage = dock?.registerScrollToMessage;
 	useEffect(() => {
 		if (!registerScrollToMessage) return;
-		return registerScrollToMessage((messageId: string) => {
+		return registerScrollToMessage((messageId, options) => {
 			// The dock callback is synchronous; the list reports an unreachable target to the
 			// user itself, so there is nothing for the search panel to do with the result.
 			void scrollToMessageTarget({
 				domIds: [`msg-${messageId}`],
 				targetIds: [messageId],
 				highlightId: messageId,
+				needle: options?.needle,
 			});
 		});
 	}, [registerScrollToMessage, scrollToMessageTarget]);
@@ -3580,9 +3626,13 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								balance: tokenDanceQuota?.balance ?? quotaBalance,
-								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
+								balance: commandCodeQuota?.balance ?? tokenDanceQuota?.balance ?? quotaBalance,
+								detailsText:
+									commandCodeQuota?.detailsText ?? tokenDanceQuota?.detailsText ?? quotaDetailsText,
+								hasDetailsPopover:
+									commandCodeQuota?.hasDetailsPopover ??
+									tokenDanceQuota?.hasDetailsPopover ??
+									hasQuotaDetailsPopover,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
@@ -3750,7 +3800,8 @@ function NarratorPanelBody({
 					    dock's `file` panel renders. */}
 					{internalFileViewerPath && (
 						<Drawer
-							opened
+							opened={fileDrawerVisible}
+							keepMounted
 							onClose={() => setInternalFileViewerPath(null)}
 							position="right"
 							size={isMobileViewport ? "100%" : 600}
@@ -3782,6 +3833,7 @@ function NarratorPanelBody({
 								}
 							>
 								<FilePanelContent
+									visible={fileDrawerVisible}
 									filePath={internalFileViewerPath}
 									narratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
@@ -3815,11 +3867,12 @@ function NarratorPanelBody({
 								// forward anything to the narrator. Forwarding goes through the SAME
 								// `forwardTextToNarrator` the dock bridge registers, so the mobile
 								// path preserves the in-progress draft and staged attachments too.
-								onJumpToMessage={(messageId) => {
+								onJumpToMessage={(messageId, options) => {
 									void scrollToMessageTarget({
 										domIds: [`msg-${messageId}`],
 										targetIds: [messageId],
 										highlightId: messageId,
+										needle: options?.needle,
 									});
 								}}
 								onForwardToNarrator={forwardTextToNarrator}

@@ -9,6 +9,7 @@ import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
+import { resolveCommandCodeToken } from "../commandcode-manager";
 import { AppError, ValidationError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { getEffectiveModelMetadata } from "../model-catalog";
@@ -19,6 +20,7 @@ import type {
 	GeminiProviderConfig,
 	GrokProviderConfig,
 	ModelAggregation,
+	ModelProtocol,
 	NarraForkSettings,
 	NUGProviderConfig,
 	OpenAIProviderConfig,
@@ -852,6 +854,33 @@ function hasConfiguredCodexProvider(): boolean {
 	}
 }
 
+/** Command Code 的凭据可以来自设置页手填的 API key，或 CLI 落盘的 auth.json。 */
+export function hasConfiguredCommandCodeProvider(): boolean {
+	const config = s().commandCode;
+	return !config?.disabled && !!resolveCommandCodeToken(config?.apiKey).credential;
+}
+
+/**
+ * 逐模型协议：`modelProtocolOverrides`（「编辑此连接覆盖」里单独保存的那层）优先于
+ * `modelProtocols`（设置页模型行写的 provider 层）；两层都没有时由各 provider 的默认规则决定。
+ */
+/**
+ * 协议表的键是带前缀的完整模型 id（`openai:gpt-4o`）。
+ * 调用方有时传入裸模型名，有时传入已经带前缀的 id；两种都收成同一把键。
+ */
+export function modelProtocolKey(prefix: string, model: string): string {
+	const parsed = parseModelId(model);
+	const bare = !parsed.provider || parsed.provider === prefix ? parsed.model : model;
+	return `${prefix}:${bare}`;
+}
+
+export function resolveModelProtocol(prefix: string, model?: string): ModelProtocol | undefined {
+	if (!model) return undefined;
+	const key = modelProtocolKey(prefix, model);
+	const agent = s().agent;
+	return agent?.modelProtocolOverrides?.[key] ?? agent?.modelProtocols?.[key];
+}
+
 export function hasConfiguredNugProvider(): boolean {
 	const providers = s().nugProviders ?? [];
 	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
@@ -881,6 +910,9 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
+	}
+	if (hasConfiguredCommandCodeProvider()) {
+		available.add("CommandCode");
 	}
 	if (hasConfiguredNugProvider()) {
 		for (const p of s().nugProviders ?? []) {

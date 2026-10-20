@@ -10,6 +10,10 @@ import {
 	ARCHIVE_TABLE_ORDER,
 	type ArchiveTable,
 } from "./manifest";
+import {
+	portableRuntimeControllerId,
+	projectPortableRuntimeRegistration,
+} from "./untrusted-policy";
 import { postgresArchiveConnection } from "./worker-postgres-store";
 import { sqliteArchiveConnection } from "./worker-sqlite-store";
 
@@ -104,6 +108,7 @@ export async function runLegacySyncWorker(
 							)[0];
 							if (!raw) throw new Error("Project snapshot row disappeared");
 							const row = projectRow ? projectRow(raw) : raw;
+							if (table === "narrators") projectPortableRuntimeRegistration(row);
 							if (typeof row.id !== "string") throw new Error("Invalid project row ID");
 							if (found.has(row.id)) continue;
 							if (table === "narrator_message_refs") {
@@ -262,7 +267,15 @@ export async function runLegacySyncWorker(
 			for (let offset = 0; offset < dependencyQueue.length; offset++) {
 				check();
 				const [table, row] = dependencyQueue[offset];
-				if (table === "narrators") await authorize(String(row.id));
+				if (table === "narrators") {
+					await authorize(String(row.id));
+					const controller = portableRuntimeControllerId(row);
+					if (controller) {
+						await read("narrators", "id", [controller]);
+						if (!rows.get("narrators")?.has(controller))
+							throw new Error("Missing self-contained runtime controller dependency");
+					}
+				}
 				for (const [field, dependency] of Object.entries(
 					ARCHIVE_INTERNAL_REFERENCES[table] ?? {},
 				)) {
@@ -333,6 +346,7 @@ export async function runLegacySyncWorker(
 							const row = archive
 								.prepare(`SELECT ${fields.map(q).join(",")} FROM ${q(table)} WHERE id=?`)
 								.get(info.id) as ArchiveRow;
+							if (table === "narrators") projectPortableRuntimeRegistration(row);
 							saved.set(info.id, row);
 							cursor = info.id;
 						}
@@ -386,6 +400,8 @@ export async function runLegacySyncWorker(
 					const references = Object.keys(ARCHIVE_INTERNAL_REFERENCES[table] ?? {}).filter((field) =>
 						available.has(field),
 					);
+					if (table === "narrators" && available.has("runtime_registration_json"))
+						references.push("runtime_registration_json");
 					const fields = ARCHIVE_COLUMNS[table].filter((field) => available.has(field));
 					let cursor = "";
 					for (;;) {
@@ -406,6 +422,13 @@ export async function runLegacySyncWorker(
 								archiveBytes > LIMITS.stateBytes
 							)
 								throw new Error("Project complete archive budget exceeded");
+							if (table === "narrators") {
+								projectPortableRuntimeRegistration(row);
+								if (available.has("runtime_registration_json"))
+									archive
+										.prepare("UPDATE narrators SET runtime_registration_json=? WHERE id=?")
+										.run(row.runtime_registration_json ?? null, row.id ?? null);
+							}
 							repairQueue.push([table, row]);
 							cursor = String(row.id);
 						}
@@ -414,10 +437,12 @@ export async function runLegacySyncWorker(
 				for (let offset = 0; offset < repairQueue.length; offset++) {
 					check();
 					const [table, row] = repairQueue[offset];
-					for (const [field, dependency] of Object.entries(
+					const dependencies: [ArchiveValue | undefined, ArchiveTable][] = Object.entries(
 						ARCHIVE_INTERNAL_REFERENCES[table] ?? {},
-					)) {
-						const id = row[field];
+					).map(([field, dependency]) => [row[field], dependency]);
+					if (table === "narrators")
+						dependencies.push([portableRuntimeControllerId(row), "narrators"]);
+					for (const [id, dependency] of dependencies) {
 						if (id == null) continue;
 						if (typeof id !== "string") throw new Error("Invalid historical project dependency");
 						if (archive.prepare(`SELECT id FROM ${q(dependency)} WHERE id=? LIMIT 1`).get(id))

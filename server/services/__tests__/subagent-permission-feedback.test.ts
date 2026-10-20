@@ -1,28 +1,31 @@
 /**
- * Approval/denial feedback text typed against a SUBAGENT's permission request.
+ * Approval/denial feedback text typed against a permission request.
  *
- * The user can write feedback into the InlinePermission form rendered inside the
- * parent's SubagentCard, so the text has to arrive somewhere the subagent's model
- * actually reads. It previously did not: the delivery mechanism was
- * `pendingFeedback` + `_feedbackSoftStop` on the `activeNarrators` entry, and a
- * subagent has no such entry (it registers only in `activeSubagentSettings`), so
- * the branch ran, found `undefined`, and dropped the text without a warning.
- *
- * These tests therefore assert the TEXT's final position — the buffered queue the
- * subagent loop drains, the prompt that drain returns, and the persisted user row
- * every provider's `buildHistory` replays — rather than that some function was
- * called.
+ * Every session — delegated (its run delivers to a tool call), ordinary, or held by
+ * the user — takes the same path: the text is kept in `pendingFeedback`, the live
+ * turn's `_feedbackSoftStop` is armed, and the run adopts it at its next safe
+ * boundary as the approver's own `role: "user"` turn. These tests assert that final
+ * position (the next pass's prompt and the persisted row), not which function ran.
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
-import { narratorMessages, narrators, narratorToolCalls, users } from "../../db/schema";
+import {
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	userPreferences,
+	users,
+} from "../../db/schema";
 import type { PermissionResult } from "../../lib/agent";
 import type { DbMessage, ProviderAdapter } from "../../lib/agent/provider";
-import { registerExternalProviderResolver } from "../../lib/agent/provider";
 
 const { db, sqlite } = getTestDb();
+const realDbModule = { ...(await import("../../db")) };
+// Bind the isolated DB before any runtime module (publication included) is loaded.
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 
 /**
  * Minimal provider adapter, registered through the real
@@ -56,11 +59,9 @@ const unregisterStubProvider = registerExternalProviderResolver({
 	listReadiness: () => [],
 });
 
-const realDbModule = { ...(await import("../../db")) };
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 mock.module("../../websocket/narrator-ws", () => ({
 	...realNarratorWsModule,
 	broadcastToNarrator: () => {},
@@ -73,20 +74,53 @@ mock.module("../narrator-service", () => ({
 	},
 }));
 
+const { DISABLED_TOOLS_TRAIT_PREFIX, upsertEncodedTrait } = await import(
+	"../../lib/narrator-custom-traits"
+);
+const { resetTraitLayerCaches } = await import("../trait-layer-service");
 const { resolvePermission } = await import("../narrator-permission");
-const {
-	activeNarrators,
-	pendingFeedback,
-	pendingPermissions,
-	registerActiveSubagent,
-	unregisterActiveSubagent,
-} = await import("../narrator-session-state");
-const {
-	clearSubagentBufferedMessages,
-	consumeNextBufferedSubagentMessage,
-	getSubagentBufferedMessages,
-	shouldStopSubagentForBufferedMessage,
-} = await import("../subagent-executor");
+const { activeNarrators, pendingFeedback, pendingPermissions } = await import(
+	"../narrator-session-state"
+);
+const { getExecutionOwner, setRunControl, setRunHold, tryClaimExecution } = await import(
+	"../agent-runtime/ownership"
+);
+type ActiveNarrator = import("../narrator-session-state").ActiveNarrator;
+type Subject = "delegated" | "ordinary" | "held";
+/**
+ * A live turn of the subject session; a delegated (or held) one also has the run the
+ * run service mounts, with its registered destination.
+ */
+function liveTurn(subject: Subject): ActiveNarrator {
+	if (subject !== "ordinary") {
+		const owner = tryClaimExecution(SUBJECT_ID, "run");
+		if (!owner) throw new Error("expected a free execution slot");
+		setRunControl(owner, {
+			startedAt: Date.now(),
+			cancel: new AbortController(),
+			timedOut: false,
+			terminal: new Promise(() => {}),
+			deliverTo: { narratorId: PARENT_ID, toolUseId: SPAWNING_TOOL_USE_ID },
+		});
+	}
+	if (subject === "held") setRunHold(SUBJECT_ID, { released: false });
+	const active = {
+		narratorId: SUBJECT_ID,
+		alive: true,
+		locale: "en",
+		abortController: new AbortController(),
+		_guidanceAbortController: new AbortController(),
+	} as unknown as ActiveNarrator;
+	activeNarrators.set(SUBJECT_ID, active);
+	return active;
+}
+function endLiveTurn(): void {
+	getExecutionOwner(SUBJECT_ID)?.release();
+	setRunHold(SUBJECT_ID, undefined);
+	activeNarrators.delete(SUBJECT_ID);
+}
+const { getModelHistorySinceLastCompact } = (await import("../narrator-service")).narratorService;
+const { listInboxRows } = await import("../agent-runtime/inbox");
 
 afterAll(() => {
 	unregisterStubProvider();
@@ -97,55 +131,73 @@ afterAll(() => {
 });
 
 const PARENT_ID = "feedback-parent-narrator";
-const SUBAGENT_ID = "feedback-subagent-narrator";
+const SUBJECT_ID = "feedback-subject-narrator";
 const SPAWNING_TOOL_USE_ID = "feedback-spawn-agent-tool";
 const REQUEST_ID = "feedback-request";
 const TOOL_USE_ID = "feedback-write-tool";
 const APPROVER_ID = "feedback-approver-user";
+const STARTER_ID = "feedback-starting-user";
 
 function now(): string {
 	return "2026-07-17T00:00:00.000Z";
 }
 
 /**
- * Seed the two narrator rows and the pending tool-call row a permission decision
- * writes back to. The subagent row carries a real `subagent:general` variant and
- * parent link so nothing under test has to be told what kind of narrator it is.
+ * Seed the narrator rows and the pending tool-call row a permission decision writes
+ * back to. A delegated subject carries the run registration (`deliverTo`); an
+ * ordinary one carries none. Nothing under test is told what kind it is.
  */
-async function seedSubagent(): Promise<void> {
+async function seedSubject(subject: Subject): Promise<void> {
 	// `createdBy` is a real FK: the approver has to exist for the feedback row to
 	// persist, and attribution to the approver is part of what is under test.
-	await db.insert(users).values({
-		id: APPROVER_ID,
-		username: "feedback-approver",
-		passwordHash: "x",
+	await db.insert(users).values([
+		{ id: APPROVER_ID, username: "feedback-approver", passwordHash: "x", createdAt: now() },
+		{ id: STARTER_ID, username: "feedback-starter", passwordHash: "x", createdAt: now() },
+	]);
+	await db.insert(userPreferences).values({
+		id: "feedback-approver-preferences",
+		userId: APPROVER_ID,
+		traits: upsertEncodedTrait([], DISABLED_TOOLS_TRAIT_PREFIX, { version: 1, tools: ["Write"] }),
 		createdAt: now(),
+		updatedAt: now(),
 	});
 	await db.insert(narrators).values({
 		id: PARENT_ID,
 		createdAt: now(),
 		updatedAt: now(),
 	});
+	const delegated = subject !== "ordinary";
 	await db.insert(narrators).values({
-		id: SUBAGENT_ID,
-		variant: "subagent:general",
-		parentNarratorId: PARENT_ID,
+		id: SUBJECT_ID,
+		...(delegated ? { variant: "subagent:general", parentNarratorId: PARENT_ID } : {}),
 		model: TEST_MODEL,
-		cwd: ".",
+		cwd: process.env.HOME,
+		autoContinuationOverride: "off",
+		...(delegated
+			? {
+					runtimeRegistrationJson: {
+						version: 1,
+						run: {
+							logicalRunId: "feedback-run",
+							deliverTo: { narratorId: PARENT_ID, toolUseId: SPAWNING_TOOL_USE_ID },
+						},
+					},
+				}
+			: {}),
 		createdAt: now(),
 		updatedAt: now(),
 	});
 	await db.insert(narratorMessages).values({
 		id: "feedback-assistant-message",
-		narratorId: SUBAGENT_ID,
+		narratorId: SUBJECT_ID,
 		role: "assistant",
 		contentJson: [],
-		parentToolUseId: SPAWNING_TOOL_USE_ID,
+		parentToolUseId: subject === "ordinary" ? null : SPAWNING_TOOL_USE_ID,
 		createdAt: now(),
 	});
 	await db.insert(narratorToolCalls).values({
 		id: REQUEST_ID,
-		narratorId: SUBAGENT_ID,
+		narratorId: SUBJECT_ID,
 		messageId: "feedback-assistant-message",
 		toolUseId: TOOL_USE_ID,
 		toolName: "Write",
@@ -156,15 +208,14 @@ async function seedSubagent(): Promise<void> {
 }
 
 /**
- * Register a pending permission exactly as `handlePermission` does for a subagent:
- * owned by the subagent, broadcast to the parent, and carrying the locale the
- * subagent run was started with.
+ * Register a pending permission the way `handlePermission` does: owned by the
+ * subject session and carrying the locale its run was started with.
  *
  * Built directly rather than through `handlePermission` so the assertions are about
  * the resolution path that had the bug, not about the permission policy that
  * decides whether to ask in the first place.
  */
-function registerPendingSubagentPermission(options?: {
+function registerPendingPermission(options?: {
 	toolName?: string;
 	locale?: "en" | "zh-CN";
 	planSubmittedFromFile?: boolean;
@@ -174,7 +225,7 @@ function registerPendingSubagentPermission(options?: {
 			resolve,
 			cleanup: () => pendingPermissions.delete(REQUEST_ID),
 			input: { file_path: "src/thing.ts", content: "x" },
-			narratorId: SUBAGENT_ID,
+			narratorId: SUBJECT_ID,
 			toolName: options?.toolName ?? "Write",
 			toolUseId: TOOL_USE_ID,
 			broadcastTargetId: PARENT_ID,
@@ -199,137 +250,156 @@ function clearPersistedFeedbackFixture(): void {
 			"narrator_messages",
 		])
 			sqlite.run(`DELETE FROM "${table}"`);
-		sqlite.run('DELETE FROM "narrators" WHERE id = ?', [SUBAGENT_ID]);
+		sqlite.run('DELETE FROM "narrators" WHERE id = ?', [SUBJECT_ID]);
 		sqlite.run('DELETE FROM "narrators" WHERE id = ?', [PARENT_ID]);
+		sqlite.run('DELETE FROM "user_preferences" WHERE user_id = ?', [APPROVER_ID]);
 		sqlite.run('DELETE FROM "users" WHERE id = ?', [APPROVER_ID]);
+		sqlite.run('DELETE FROM "users" WHERE id = ?', [STARTER_ID]);
+		resetTraitLayerCaches();
 	})();
 }
 
-beforeEach(async () => {
+beforeEach(() => {
 	clearPersistedFeedbackFixture();
 	pendingPermissions.clear();
 	pendingFeedback.clear();
-	activeNarrators.delete(SUBAGENT_ID);
-	clearSubagentBufferedMessages(SUBAGENT_ID);
-	unregisterActiveSubagent(SUBAGENT_ID);
-	await seedSubagent();
+	endLiveTurn();
 });
 
 afterEach(() => {
 	pendingPermissions.clear();
 	pendingFeedback.clear();
-	clearSubagentBufferedMessages(SUBAGENT_ID);
-	unregisterActiveSubagent(SUBAGENT_ID);
-	activeNarrators.delete(SUBAGENT_ID);
+	endLiveTurn();
 	clearPersistedFeedbackFixture();
 });
 
-describe("approval feedback for a subagent permission request", () => {
-	test("the typed text is queued for the subagent and arms its next safe stop", async () => {
-		// A running subagent registers here and nowhere else — this is precisely what
-		// made the `activeNarrators` lookup resolve to undefined.
-		registerActiveSubagent(SUBAGENT_ID, TEST_MODEL, null);
-		const permission = registerPendingSubagentPermission();
+const SUBJECTS: Subject[] = ["delegated", "ordinary", "held"];
 
-		expect(
-			await resolvePermission(REQUEST_ID, "allow", {
-				feedbackText: "  可以，但注意 X  ",
+describe("approval feedback takes one path for every session", () => {
+	for (const subject of SUBJECTS) {
+		test(`${subject}: the text is kept for the run and arms its next safe stop`, async () => {
+			await seedSubject(subject);
+			const active = liveTurn(subject);
+			const permission = registerPendingPermission();
+
+			expect(
+				await resolvePermission(REQUEST_ID, "allow", {
+					feedbackText: "  可以，但注意 X  ",
+					userId: APPROVER_ID,
+				}),
+			).toBe(true);
+			expect(await permission).toMatchObject({ behavior: "allow" });
+
+			// Trimmed and attributed to the approver; the turn stops at the next boundary.
+			expect(pendingFeedback.get(SUBJECT_ID)).toMatchObject({
+				feedbackText: "可以，但注意 X",
 				userId: APPROVER_ID,
-			}),
-		).toBe(true);
-		expect(await permission).toMatchObject({ behavior: "allow" });
-
-		// The text is in the queue the subagent loop drains, trimmed, attributed to
-		// the approver.
-		expect(getSubagentBufferedMessages(SUBAGENT_ID)).toMatchObject([
-			{ text: "可以，但注意 X", createdBy: APPROVER_ID, preserveWorkTurn: true },
-		]);
-		// And the loop is asked to stop at its next post-tool boundary so the text is
-		// taken up promptly instead of at the end of an arbitrarily long run. This is
-		// the pair `shouldStop` reads; without the queue entry it returns false.
-		expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
-
-		// The primary-narrator mechanism is NOT also used: a double delivery would
-		// replay the same feedback into whichever primary loop later owns this id.
-		expect(pendingFeedback.has(SUBAGENT_ID)).toBe(false);
-	});
-
-	test("the queued text becomes the subagent's next prompt and a persisted user row", async () => {
-		registerActiveSubagent(SUBAGENT_ID, TEST_MODEL, null);
-		const permission = registerPendingSubagentPermission();
-		await resolvePermission(REQUEST_ID, "allow", {
-			feedbackText: "记得同时更新迁移",
-			userId: APPROVER_ID,
+			});
+			expect(active._feedbackSoftStop).toBe(true);
+			// Not also queued as a mailbox row: one delivery, one consumer.
+			expect(await listInboxRows(SUBJECT_ID, ["user_input"])).toEqual([]);
 		});
-		await permission;
 
-		// Drain through the real consumer the subagent loop uses after a soft stop.
-		// `prompt` is sent as the current turn and the persisted row is what every
-		// provider's buildHistory replays — i.e. two positions the model reads.
-		const consumed = await consumeNextBufferedSubagentMessage({
-			narratorId: SUBAGENT_ID,
-			parentNarratorId: PARENT_ID,
-			toolUseId: SPAWNING_TOOL_USE_ID,
-			model: TEST_MODEL,
-			provider: TEST_PROVIDER,
-			cwd: ".",
+		test(`${subject}: the next pass is sent the approver's text as a persisted user turn`, async () => {
+			await seedSubject(subject);
+			if (subject === "held") setRunHold(SUBJECT_ID, { released: false });
+			const executor = await import("../narrator-executor");
+			const requests: string[] = [];
+			let reflectedWorkTurn: (() => string | undefined) | undefined;
+			const { spyOn } = await import("bun:test");
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				requests.push(options.userText);
+				if (requests.length === 1) {
+					const active = activeNarrators.get(SUBJECT_ID);
+					if (!active) throw new Error("Missing active feedback fixture");
+					active._upstreamWorkTurnId = "original-work-turn";
+					reflectedWorkTurn = options.config.getWorkTurnId;
+					expect(reflectedWorkTurn?.()).toBe("original-work-turn");
+					expect(options.config.userId).toBe(STARTER_ID);
+					expect(new Set(options.config.disabledTools).has("Write")).toBe(false);
+					// The permission is decided while the pass's tool is in flight.
+					const permission = registerPendingPermission();
+					await resolvePermission(REQUEST_ID, "allow", {
+						feedbackText: "记得同时更新迁移",
+						userId: APPROVER_ID,
+					});
+					await permission;
+					expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
+					// The next safe boundary stops the pass for the feedback.
+					expect(options.config.shouldStop?.()).toBe(true);
+					return {
+						finalText: "",
+						hasError: false,
+						shouldUpdateTitle: false,
+						completedNaturally: false,
+						hadToolUses: true,
+					};
+				}
+				expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
+				expect(reflectedWorkTurn?.()).toBe("original-work-turn");
+				// S7: the next pass observes B's actual user-level restriction, not A's.
+				expect(options.config.userId).toBe(APPROVER_ID);
+				expect(new Set(options.config.disabledTools).has("Write")).toBe(true);
+				expect(
+					(await db.query.narrators.findFirst({ where: eq(narrators.id, SUBJECT_ID) }))
+						?.runtimeRegistrationJson?.run?.principal,
+				).toEqual({ userId: APPROVER_ID });
+				// The user lets go of a held run, so the run ends instead of parking.
+				if (subject === "held") setRunHold(SUBJECT_ID, { released: true });
+				return { finalText: "ok", hasError: false, shouldUpdateTitle: false };
+			});
+			try {
+				const { startNarratorRun } = await import("../agent-runtime/run");
+				const handle = await startNarratorRun({
+					narratorId: SUBJECT_ID,
+					locale: "en",
+					text: "start",
+					principal: STARTER_ID,
+					deliver: false,
+				});
+				expect(handle.started).toBe(true);
+				expect(await handle.terminal).toMatchObject({ hasError: false });
+			} finally {
+				execute.mockRestore();
+			}
+			// Adopted at the next safe boundary of the same run, exactly once.
+			expect(requests).toHaveLength(2);
+			expect(requests[1]).toBe(
+				`<sender kind="human" id="${APPROVER_ID}" name="feedback-approver" />\n记得同时更新迁移`,
+			);
+			expect(pendingFeedback.has(SUBJECT_ID)).toBe(false);
+			expect(
+				(await getModelHistorySinceLastCompact(SUBJECT_ID)).some(
+					(row) => row.role === "user" && row.contentText === "记得同时更新迁移",
+				),
+			).toBe(true);
+			const rows = await db.query.narratorMessages.findMany({
+				where: eq(narratorMessages.narratorId, SUBJECT_ID),
+			});
+			const userRow = rows.find(
+				(row) => row.role === "user" && row.contentText === "记得同时更新迁移",
+			);
+			expect(userRow?.createdBy).toBe(APPROVER_ID);
+			// Placement follows the run's registered destination, not the session kind.
+			expect(userRow?.parentToolUseId ?? null).toBe(
+				subject === "ordinary" ? null : SPAWNING_TOOL_USE_ID,
+			);
 		});
-		const modelText =
-			'<sender kind="human" id="feedback-approver-user" name="feedback-approver" />\n记得同时更新迁移';
-		expect(consumed?.prompt).toBe(modelText);
-		expect(consumed?.prompt?.match(/记得同时更新迁移/g)).toHaveLength(1);
-		expect(consumed?.workTurnId).toBeUndefined();
-		// And it is present in the rebuilt model history, not just in the prompt: a
-		// drain that returned the text but rebuilt a history without it would still
-		// lose the feedback on any later pass.
-		expect(consumed?.history).toEqual(expect.arrayContaining([{ role: "user", text: modelText }]));
-
-		const rows = await db.query.narratorMessages.findMany({
-			where: eq(narratorMessages.narratorId, SUBAGENT_ID),
-		});
-		const userRow = rows.find((row) => row.role === "user");
-		expect(userRow?.contentText).toBe("记得同时更新迁移");
-		expect(userRow?.createdBy).toBe(APPROVER_ID);
-		// Filed under the spawning Agent tool call, the convention every subagent row
-		// follows, so the parent's tool card and the subagent's own page both find it.
-		expect(userRow?.parentToolUseId).toBe(SPAWNING_TOOL_USE_ID);
-	});
-
-	test("a primary narrator still uses pendingFeedback and its own soft-stop flag", async () => {
-		// No registerActiveSubagent: this id is an ordinary narrator with a live loop.
-		const active = { alive: true, narratorId: SUBAGENT_ID } as never as {
-			alive: boolean;
-			_feedbackSoftStop?: boolean;
-		};
-		activeNarrators.set(SUBAGENT_ID, active as never);
-		const permission = registerPendingSubagentPermission();
-
-		await resolvePermission(REQUEST_ID, "allow", {
-			feedbackText: "go ahead",
-			userId: APPROVER_ID,
-		});
-		await permission;
-
-		expect(pendingFeedback.get(SUBAGENT_ID)).toMatchObject({
-			feedbackText: "go ahead",
-			userId: APPROVER_ID,
-		});
-		expect(active._feedbackSoftStop).toBe(true);
-		// The subagent queue must stay empty: routing a primary narrator's feedback
-		// there would strand it (nothing drains that queue for a primary loop).
-		expect(getSubagentBufferedMessages(SUBAGENT_ID)).toEqual([]);
-	});
+	}
 
 	test("an empty or whitespace-only feedback text delivers nothing at all", async () => {
-		registerActiveSubagent(SUBAGENT_ID, TEST_MODEL, null);
-		const permission = registerPendingSubagentPermission();
+		await seedSubject("delegated");
+		const active = liveTurn("delegated");
+		active._currentUserId = STARTER_ID;
+		const permission = registerPendingPermission();
 
 		await resolvePermission(REQUEST_ID, "allow", { feedbackText: "   ", userId: APPROVER_ID });
 		await permission;
 
-		expect(getSubagentBufferedMessages(SUBAGENT_ID)).toEqual([]);
-		expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
-		expect(pendingFeedback.has(SUBAGENT_ID)).toBe(false);
+		expect(pendingFeedback.has(SUBJECT_ID)).toBe(false);
+		expect(active._currentUserId).toBe(STARTER_ID);
+		expect(active._feedbackSoftStop).not.toBe(true);
+		expect(await listInboxRows(SUBJECT_ID, ["user_input"])).toEqual([]);
 	});
 });
 
@@ -344,8 +414,10 @@ describe("denial feedback is worded in the locale the request was raised with", 
 	 * today, the locale lookup itself is the shared defect, so the assertion is
 	 * written against `pending.locale` being honoured rather than against plan mode.
 	 */
+	beforeEach(() => seedSubject("delegated"));
+
 	test("a zh-CN request gets the Chinese plan-denial message, with the feedback inlined", async () => {
-		const permission = registerPendingSubagentPermission({
+		const permission = registerPendingPermission({
 			toolName: "ExitPlanMode",
 			locale: "zh-CN",
 		});
@@ -364,7 +436,7 @@ describe("denial feedback is worded in the locale the request was raised with", 
 	});
 
 	test("an en request is unchanged", async () => {
-		const permission = registerPendingSubagentPermission({
+		const permission = registerPendingPermission({
 			toolName: "ExitPlanMode",
 			locale: "en",
 		});
@@ -377,7 +449,7 @@ describe("denial feedback is worded in the locale the request was raised with", 
 	});
 
 	test("a file-submitted plan keeps its own wording in zh-CN", async () => {
-		const permission = registerPendingSubagentPermission({
+		const permission = registerPendingPermission({
 			toolName: "ExitPlanMode",
 			locale: "zh-CN",
 			planSubmittedFromFile: true,

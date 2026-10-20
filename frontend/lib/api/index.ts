@@ -2,6 +2,7 @@ import { authApi } from "./auth";
 import { chaptersApi } from "./chapters";
 import { chatApi } from "./chat";
 import { apiBase } from "./client";
+import { commandCodeApi } from "./commandcode";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { grammarsApi } from "./grammars";
@@ -55,6 +56,7 @@ export const api = {
 	...scheduledTasksApi,
 	...pluginsApi,
 	...sessionInterchangeApi,
+	...commandCodeApi,
 };
 
 export {
@@ -284,9 +286,4 @@ export type {
 	TreeMessage,
 	WhitelistCmd,
 	WhitelistDir,
-	WorkspaceBarrier,
-	WorkspaceBarrierObservation,
-	WorkspaceBarrierObservationResult,
-	WorkspaceBarrierRecoveryResult,
-	WorkspaceBarrierVerdict,
 } from "./types";

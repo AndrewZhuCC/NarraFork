@@ -56,6 +56,7 @@ process.env.NARRAFORK_HOME = HOME;
 const {
 	cleanupBufferedTextFiles,
 	cleanupBufferedTextFilesAsync,
+	clearBufferedMessages,
 	enqueueBufferedMessage,
 	projectMailboxUserMessage,
 	releaseBufferedMessage,
@@ -75,12 +76,6 @@ const { activeNarrators } = await import("../narrator-session-state");
 const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
 	"../../lib/uploads"
 );
-const {
-	clearSubagentBufferedMessages,
-	getSubagentBufferedMessages,
-	pushSubagentBufferedMessage,
-	updateSubagentBufferedMessage,
-} = await import("../subagent-executor");
 
 test("composer layout survives cold durable queue projection, summary stays small, and legacy edits clear it", async () => {
 	const document = {
@@ -100,7 +95,6 @@ test("composer layout survives cold durable queue projection, summary stays smal
 		undefined,
 		undefined,
 		"fifo",
-		undefined,
 		undefined,
 		undefined,
 		document,
@@ -145,10 +139,56 @@ test("composer layout survives cold durable queue projection, summary stays smal
 			"fifo",
 			undefined,
 			undefined,
-			undefined,
 			document,
 		),
 	).rejects.toThrow("does not match");
+	await removeBufferedMessage(NARRATOR_ID, result.id);
+});
+
+test("ZIP MIME alias survives durable queue reload and editing a kept attachment", async () => {
+	const zip = new File(["PK archive bytes"], "archive.zip", {
+		type: "application/x-zip-compressed",
+	});
+	const body = new FormData();
+	body.append("textFiles", zip);
+	const parsed = await new Request("http://localhost", { method: "POST", body }).formData();
+	const files = parsed.getAll("textFiles") as File[];
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "attachment" as const, id: "node", assetId: "asset" }] }],
+		assets: [
+			{
+				id: "asset",
+				kind: "textFile" as const,
+				name: zip.name,
+				size: zip.size,
+				mimeType: zip.type,
+			},
+		],
+	};
+	const result = await enqueueBufferedMessage(
+		NARRATOR_ID,
+		"",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		files,
+		"back",
+		undefined,
+		undefined,
+		"fifo",
+		undefined,
+		undefined,
+		document,
+	);
+	const [reloaded] = getBufferedMessages(NARRATOR_ID);
+	expect(reloaded.composerDocument).toEqual(document);
+	expect(reloaded.textFiles?.[0].type).toBe("application/zip");
+	expect(
+		await updateBufferedMessage(NARRATOR_ID, result.id, "", { composerDocument: document }),
+	).toBe(true);
+	expect(getBufferedMessages(NARRATOR_ID)[0].composerDocument).toEqual(document);
 	await removeBufferedMessage(NARRATOR_ID, result.id);
 });
 
@@ -215,7 +255,7 @@ async function readTextFilePathsJson(
 afterEach(() => {
 	bindRuntimeQueue(undefined);
 	activeNarrators.clear();
-	clearSubagentBufferedMessages(SUBAGENT_ID);
+	clearBufferedMessages(SUBAGENT_ID);
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
 
@@ -260,12 +300,13 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 		expect(summary.textFiles).toEqual([{ index: 0, filename: "notes.md", size: 10 }]);
 	});
 
-	test("a subagent queue durably preserves same-named attachment contents", async () => {
-		await pushSubagentBufferedMessage(SUBAGENT_ID, "queued", {
-			textFiles: [textFile("dup.md", "aa"), textFile("dup.md", "bbbb")],
-		});
+	test("a queue durably preserves same-named attachment contents", async () => {
+		await enqueueBufferedMessage(SUBAGENT_ID, "queued", undefined, null, null, null, [
+			textFile("dup.md", "aa"),
+			textFile("dup.md", "bbbb"),
+		]);
 
-		const [summary] = toBufferSummary(getSubagentBufferedMessages(SUBAGENT_ID));
+		const [summary] = toBufferSummary(getBufferedMessages(SUBAGENT_ID));
 
 		// Same filename twice: only the index tells them apart, which is why the
 		// keep key is positional rather than name-based.
@@ -394,35 +435,43 @@ describe("updateBufferedMessage — editing attachments", () => {
 	});
 });
 
-describe("updateSubagentBufferedMessage — in-memory attachment overwrite", () => {
+describe("updateBufferedMessage — attachment overwrite", () => {
 	test("replaces images and text files", async () => {
-		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
-			images: [{ imageId: "old", filename: "old.png", mediaType: "image/png" }],
-			textFiles: [textFile("old.md")],
-		});
+		const queued = await enqueueBufferedMessage(
+			SUBAGENT_ID,
+			"before",
+			[{ imageId: "old", filename: "old.png", mediaType: "image/png" }],
+			null,
+			null,
+			null,
+			[textFile("old.md")],
+		);
 
-		const ok = await updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after", {
+		const savedFiles = await persistAdditionalBufferedTextFiles(
+			queued.id,
+			[textFile("new.md")],
+			[],
+		);
+		const ok = await updateBufferedMessage(SUBAGENT_ID, queued.id, "after", {
 			images: [{ imageId: "new", filename: "new.png", mediaType: "image/png" }],
-			textFiles: [textFile("new.md")],
+			savedFiles,
 		});
 
 		expect(ok).toBe(true);
-		const [message] = getSubagentBufferedMessages(SUBAGENT_ID);
+		const [message] = getBufferedMessages(SUBAGENT_ID);
 		expect(message.text).toBe("after");
 		expect(message.images?.map((i) => i.imageId)).toEqual(["new"]);
-		expect(message.textFiles?.map((f) => f.name)).toEqual(["new.md"]);
+		expect(message._savedFiles?.map((f) => f.filename)).toEqual(["new.md"]);
 	});
 
 	test("a text-only edit leaves attachments in place", async () => {
-		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
-			images: [{ imageId: "keep", filename: "keep.png", mediaType: "image/png" }],
-		});
-
-		await updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after");
-
-		expect(getSubagentBufferedMessages(SUBAGENT_ID)[0].images?.map((i) => i.imageId)).toEqual([
-			"keep",
+		const queued = await enqueueBufferedMessage(SUBAGENT_ID, "before", [
+			{ imageId: "keep", filename: "keep.png", mediaType: "image/png" },
 		]);
+
+		await updateBufferedMessage(SUBAGENT_ID, queued.id, "after");
+
+		expect(getBufferedMessages(SUBAGENT_ID)[0].images?.map((i) => i.imageId)).toEqual(["keep"]);
 	});
 });
 

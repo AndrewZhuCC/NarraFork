@@ -1,10 +1,11 @@
-import { Box, Button, Group, Stack, Text } from "@mantine/core";
-import { useDisclosure, useFocusTrap } from "@mantine/hooks";
+import { Box, Button, Group, Text } from "@mantine/core";
+import { useDisclosure, useFocusTrap, useMergedRef } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
+	type ComposerAsset,
 	type ComposerDocument,
 	type ComposerInlineNode,
-	composerDocumentText,
+	legacyComposerDocumentText,
 	parseComposerDocument,
 	readComposerDocument,
 } from "@shared/composer-document";
@@ -29,14 +30,17 @@ import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { useFocusComposerShortcut } from "../../../hooks/useReadFromStartShortcut";
 import { ApiError, api } from "../../../lib/api";
+import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
 import { isMobileViewportWidth } from "../../../lib/responsive";
+import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ComposerQuoteComment } from "./ComposerQuoteChips";
+import { ComposerTextAttachmentPreview } from "./ComposerTextAttachmentPreview";
 import {
 	composerAssetsFromFiles,
 	composerInputFromDocument,
@@ -47,6 +51,7 @@ import {
 import { getComposerFileOrder } from "./composer-file-order";
 import { composerOptimizeTarget } from "./composer-optimize-target";
 import {
+	type ComposerQuote,
 	fileReferenceQuote,
 	joinQuotedComposerInput,
 	MAX_COMPOSER_QUOTES,
@@ -70,7 +75,6 @@ import { getMentionQuery, type MentionCandidate, MentionPopover } from "./Mentio
 import classes from "./NarratorComposer.module.css";
 import {
 	canHydrateNarratorDraftFromMeta,
-	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
 	getNarratorDraftStorageId,
 	isAcknowledgedNarratorDraft,
@@ -79,6 +83,7 @@ import {
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
+import { QuoteDetailModal } from "./QuoteDetailModal";
 import { revealComposerQuote, revealQuotedFile } from "./quote-jump";
 import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
 import { type QuoteCandidate, useQuoteCandidate } from "./use-quote-candidate";
@@ -98,7 +103,7 @@ function isDraftWithinSyncLimit(input: string): boolean {
 }
 
 function splitDocumentInput(document: ComposerDocument) {
-	// The model prefix is a projection of quote atoms, not a second parser for literal text.
+	// Quote blocks are a projection of quote atoms, not a second parser for literal text.
 	// A quote-looking text node after a real quote must remain in the editable body.
 	const quotes = document.paragraphs.flatMap((paragraph) =>
 		paragraph.children.filter((node) => node.type === "quote"),
@@ -106,10 +111,14 @@ function splitDocumentInput(document: ComposerDocument) {
 	const bodyDocument: ComposerDocument = {
 		...document,
 		paragraphs: document.paragraphs.map((paragraph) => ({
-			children: paragraph.children.filter((node) => node.type !== "quote"),
+			children: paragraph.children
+				.filter((node) => node.type !== "quote")
+				.map((node) => (node.type === "fileReference" ? { ...node, comment: undefined } : node)),
 		})),
 	};
-	return { quotes, body: composerDocumentText(bodyDocument) };
+	// The editor's body offsets exclude attachments, so read the placeholder-free projection.
+	const { text, fileReferences } = legacyComposerDocumentText(bodyDocument);
+	return { quotes, body: { text, fileReferences } };
 }
 
 export interface NarratorRemoteDraft {
@@ -160,12 +169,14 @@ export interface NarratorComposerHandle {
 	/** Clear only the on-screen text for an in-flight send; the draft record is
 	 * left untouched so a failed send can restore it. */
 	hideTextForSend(): void;
-	/** Post-send draft bookkeeping (sync empty / adopt conflicting server draft). */
+	/** Post-send draft bookkeeping (sync the empty tombstone). */
 	commitDraftAfterSend(): void;
 	/** Record a sent message in the up-arrow input history. */
 	noteSent(text: string, refs?: FileReference[], document?: ComposerDocument): void;
 	/** Forward a WS `draft_changed` event into the draft state machine. */
 	handleDraftChanged(draft: NarratorRemoteDraft): void;
+	/** Forward reconnect/page-load draft metadata; the body is fetched only when newer. */
+	handleDraftMeta(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }): void;
 }
 
 export interface NarratorComposerProps {
@@ -196,7 +207,7 @@ export interface NarratorComposerProps {
 
 /**
  * The narrator chat text input and everything derived from it per keystroke:
- * draft hydration/sync/conflict, input history, slash-command and @mention
+ * draft hydration/sync, input history, slash-command and @mention
  * popovers, and the draft warning banners.
  *
  * WHY THIS EXISTS AS A SEPARATE COMPONENT
@@ -263,12 +274,35 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					])
 				: null;
 
+		const attachmentPreviewScope = JSON.stringify([currentUserId, narratorId]);
+		const [attachmentPreview, setAttachmentPreview] = useState<{
+			scope: string;
+			asset: ComposerAsset;
+		} | null>(null);
+		const activeAttachmentPreview =
+			attachmentPreview?.scope === attachmentPreviewScope ? attachmentPreview : null;
+		useEffect(() => {
+			setAttachmentPreview((current) =>
+				current?.scope === attachmentPreviewScope ? current : null,
+			);
+		}, [attachmentPreviewScope]);
+
 		// Fullscreen modal state
 		const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] =
 			useDisclosure(false);
-		const fullscreenTrap = useFocusTrap(fullscreenOpened);
+		// Quote chip click opens its full text; the jump is a button inside it.
+		const [quoteDetail, setQuoteDetail] = useState<ComposerQuote | null>(null);
+		const [editingCommentId, setEditingCommentId] = useState<string | null>(null);
+		const fullscreenTrap = useFocusTrap(
+			fullscreenOpened && !activeAttachmentPreview && !quoteDetail && !editingCommentId,
+		);
+		// 全屏是原地 position: fixed(见 NarratorComposer.module.css 的 .fullscreen),
+		// 必须把焦点陷阱以外的 ref 也挂到同一个 Box 上,供祖先层叠逃逸使用。
+		const fullscreenBoxRef = useRef<HTMLDivElement>(null);
+		const fullscreenBoxMergedRef = useMergedRef(fullscreenTrap, fullscreenBoxRef);
+		useFullscreenEscape(fullscreenBoxRef, fullscreenOpened);
 		useEffect(() => {
-			if (!fullscreenOpened) return;
+			if (!fullscreenOpened || activeAttachmentPreview || quoteDetail || editingCommentId) return;
 			const owner = textareaRef.current?.ownerDocument;
 			const close = (event: KeyboardEvent) => {
 				if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
@@ -286,7 +320,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			};
 			owner?.addEventListener("keydown", close, true);
 			return () => owner?.removeEventListener("keydown", close, true);
-		}, [fullscreenOpened, closeFullscreen]);
+		}, [fullscreenOpened, closeFullscreen, activeAttachmentPreview, quoteDetail, editingCommentId]);
 
 		// Text and reference occurrences have one source of truth, local to this subtree.
 		const [inputState, setInputState] = useState<FileReferenceInput>({
@@ -300,7 +334,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const { quotes, body: bodyInput } = useMemo(() => splitDocumentInput(document), [document]);
 		const bodyText = bodyInput.text;
 		const inputStateRef = useRef(inputState);
-		const [editingCommentId, setEditingCommentId] = useState<string | null>(null);
 		const editingNode = document.paragraphs
 			.flatMap((paragraph) => paragraph.children)
 			.find(
@@ -318,9 +351,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		}, [editingCommentId, editingQuote]);
 		const composingRef = useRef(false);
 		const [draftHydrated, setDraftHydrated] = useState(false);
-		const [draftSyncState, setDraftSyncState] = useState<
-			"loading" | "ready" | "error" | "conflict"
-		>("loading");
+		const [draftSyncState, setDraftSyncState] = useState<"loading" | "ready" | "error">("loading");
+		// A remote write replaced non-empty local content; the overwritten version
+		// sits in the server's undo slot until restored or the user edits again.
+		const [draftReplacedByRemote, setDraftReplacedByRemote] = useState(false);
 		const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
 		const inputRef = useRef(input);
 		const draftSourceIdRef = useRef(createDraftSourceId());
@@ -332,7 +366,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		} | null>(null);
 		const lastDraftRevisionRef = useRef<number | null>(null);
 		const lastDraftUpdatedAtRef = useRef<string | null>(null);
-		const draftConflictRef = useRef<NarratorRemoteDraft | null>(null);
 		const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 		const draftSyncSeqRef = useRef(0);
 		const draftReadEpochRef = useRef(0);
@@ -694,14 +727,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}));
 				if (editorRef.current?.getElement()) {
 					const selection = editorRef.current.captureSelectionBookmark();
-					editorRef.current.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+					// Their position was never recorded; ahead of the text is how they were sent.
+					editorRef.current.setSelection(0, 0);
 					editorRef.current.insertNodes(nodes, fresh);
 					selection.restore();
 				} else {
 					const paragraphs = current.paragraphs.map((paragraph) => ({
 						children: [...paragraph.children],
 					}));
-					paragraphs[paragraphs.length - 1].children.push(...nodes);
+					paragraphs[0].children.unshift(...nodes);
 					applyInput(
 						composerInputFromDocument({
 							...current,
@@ -741,6 +775,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				(unknown.unsynced || !sameFileReferenceInput(inputStateRef.current, unknown.input));
 			// Without a trusted server baseline, reverting to the restored value cannot acknowledge edits.
 			if (unknownEdited) unknown.unsynced = true;
+			// Editing resumes: the remote-replace notice and its undo offer are stale.
+			if (
+				lastSyncedDraftRef.current &&
+				!sameFileReferenceInput(inputState, lastSyncedDraftRef.current)
+			)
+				setDraftReplacedByRemote(false);
 			persistNarratorInputDraft(
 				currentUserId,
 				narratorId,
@@ -766,7 +806,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const syncDraftNow = useCallback(
 			async (
 				text: string,
-				baseRevision = lastDraftRevisionRef.current,
 				references = inputStateRef.current.fileReferences,
 				composerDocument: ComposerDocument | null = inputStateRef.current.composerDocument ?? null,
 			) => {
@@ -774,7 +813,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				if (!currentUserId) throw new Error("Current user is unavailable");
 				if (draftOwnerScopeRef.current !== currentDraftScope)
 					throw new Error("Draft belongs to a previous account or narrator");
-				if (baseRevision == null) throw new Error("Draft has not been loaded from the server");
+				if (lastDraftRevisionRef.current == null)
+					throw new Error("Draft has not been loaded from the server");
 				if (!isDraftWithinSyncLimit(text)) {
 					throw new Error(`Draft exceeds the ${MAX_NARRATOR_DRAFT_CHARS} character sync limit`);
 				}
@@ -783,106 +823,40 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					draftSyncTimerRef.current = null;
 				}
 				const seq = ++draftSyncSeqRef.current;
-				const sourceId = draftSourceIdRef.current;
-				let revision = baseRevision;
-				let retriedOwnRevision = false;
-				while (true) {
-					try {
-						const result = await api.updateNarratorDraft(
-							narratorId,
-							text,
-							revision,
-							sourceId,
-							refs,
-							readPersistableDocument(composerDocument),
-						);
-						if (
-							seq === draftSyncSeqRef.current &&
-							qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId
-						) {
-							const newerConflict = draftConflictRef.current;
-							if (newerConflict && newerConflict.revision > result.revision) return result;
-							lastSyncedDraftRef.current = {
-								text: result.text,
-								fileReferences: readFileReferences(result.fileReferences, result.text),
-								composerDocument: readComposerDocument(result.composerDocument),
-							};
-							lastDraftRevisionRef.current = result.revision;
-							lastDraftUpdatedAtRef.current = result.updatedAt;
-							draftConflictRef.current = null;
-							setDraftSyncState("ready");
-							persistNarratorInputDraft(
-								currentUserId,
-								narratorId,
-								inputRef.current,
-								result.revision,
-								result.updatedAt,
-								inputStateRef.current.fileReferences,
-								lastSyncedDraftRef.current,
-								readPersistableDocument(inputStateRef.current.composerDocument),
-							);
-							qc.setQueryData(
-								["narrators", narratorId],
-								(old: Record<string, unknown> | undefined) =>
-									old ? { ...old, traits: result.traits, hasDraft: result.hasDraft } : old,
-							);
-						}
-						return result;
-					} catch (err) {
-						if (
-							seq !== draftSyncSeqRef.current ||
-							qc.getQueryData<{ id?: string }>(["auth", "me"])?.id !== currentUserId
-						)
-							return;
-						const current =
-							err instanceof ApiError && err.status === 409
-								? (err.data?.current as
-										| {
-												hasDraft?: unknown;
-												text?: unknown;
-												fileReferences?: unknown;
-												composerDocument?: unknown;
-												revision?: unknown;
-												updatedAt?: unknown;
-												updatedBy?: unknown;
-												sourceId?: unknown;
-										  }
-										| undefined)
-								: undefined;
-						if (
-							current &&
-							typeof current.text === "string" &&
-							typeof current.revision === "number"
-						) {
-							const remote: NarratorRemoteDraft = {
-								hasDraft: !!current.hasDraft,
-								text: current.text,
-								fileReferences: readFileReferences(current.fileReferences, current.text),
-								composerDocument: readComposerDocument(current.composerDocument),
-								revision: current.revision,
-								updatedAt: typeof current.updatedAt === "string" ? current.updatedAt : null,
-								updatedBy: typeof current.updatedBy === "string" ? current.updatedBy : null,
-								sourceId: typeof current.sourceId === "string" ? current.sourceId : null,
-							};
-							const action = classifyDraftRevisionConflict({
-								requestSequence: seq,
-								latestSequence: draftSyncSeqRef.current,
-								requestSourceId: sourceId,
-								currentSourceId: remote.sourceId,
-							});
-							if (action === "retry" && !retriedOwnRevision) {
-								retriedOwnRevision = true;
-								revision = remote.revision;
-								continue;
-							}
-							if (action === "conflict") {
-								draftConflictRef.current = remote;
-								setDraftSyncState("conflict");
-							}
-						}
-						throw err;
-					}
+				const result = await api.updateNarratorDraft(
+					narratorId,
+					text,
+					draftSourceIdRef.current,
+					refs,
+					readPersistableDocument(composerDocument),
+				);
+				if (
+					seq === draftSyncSeqRef.current &&
+					qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId
+				) {
+					lastSyncedDraftRef.current = {
+						text: result.text,
+						fileReferences: readFileReferences(result.fileReferences, result.text),
+						composerDocument: readComposerDocument(result.composerDocument),
+					};
+					lastDraftRevisionRef.current = result.revision;
+					lastDraftUpdatedAtRef.current = result.updatedAt;
+					setDraftSyncState("ready");
+					persistNarratorInputDraft(
+						currentUserId,
+						narratorId,
+						inputRef.current,
+						result.revision,
+						result.updatedAt,
+						inputStateRef.current.fileReferences,
+						lastSyncedDraftRef.current,
+						readPersistableDocument(inputStateRef.current.composerDocument),
+					);
+					qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+						old ? { ...old, traits: result.traits, hasDraft: result.hasDraft } : old,
+					);
 				}
+				return result;
 			},
 			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument],
 		);
@@ -892,7 +866,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			declareDocumentAssets([]);
 			releaseUnusedResources();
 			attachmentStateRef.current.onChange?.([], []);
-			if (draftSyncState === "ready") void syncDraftNow("", undefined, [], null).catch(() => {});
+			if (draftSyncState === "ready") void syncDraftNow("", [], null).catch(() => {});
 		}, [draftSyncState, syncDraftNow, restoreInput, releaseUnusedResources, declareDocumentAssets]);
 
 		const hideTextForSend = useCallback(() => {
@@ -915,7 +889,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		useEffect(() => {
 			void draftLoadAttempt;
-			// An old account/narrator's in-flight CAS must not overwrite the newly hydrated pair.
+			// An old account/narrator's in-flight save must not overwrite the newly hydrated pair.
 			draftSyncSeqRef.current++;
 			const readEpoch = ++draftReadEpochRef.current;
 			draftOwnerScopeRef.current = null;
@@ -938,7 +912,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId;
 			setDraftHydrated(false);
 			setDraftSyncState("loading");
-			draftConflictRef.current = null;
+			setDraftReplacedByRemote(false);
 			lastSyncedDraftRef.current = null;
 			unacknowledgedDraftRef.current = null;
 			lastDraftRevisionRef.current = null;
@@ -1036,28 +1010,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						fileReferences: serverFileReferences,
 						composerDocument: readComposerDocument(draft.composerDocument),
 					};
-					lastDraftRevisionRef.current = resolved.conflict
-						? localDraft.serverRevision
-						: draft.revision;
-					lastDraftUpdatedAtRef.current = resolved.conflict
-						? localDraft.serverUpdatedAt
-						: draft.updatedAt;
+					lastDraftRevisionRef.current = draft.revision;
+					lastDraftUpdatedAtRef.current = draft.updatedAt;
 					persistNarratorInputDraft(
 						currentUserId,
 						narratorId,
 						resolved.text,
-						resolved.conflict ? localDraft.serverRevision : draft.revision,
-						resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
+						draft.revision,
+						draft.updatedAt,
 						resolved.fileReferences ?? [],
 						lastSyncedDraftRef.current,
 						readPersistableDocument(inputStateRef.current.composerDocument),
 					);
-					if (resolved.conflict) {
-						draftConflictRef.current = draft;
-						setDraftSyncState("conflict");
-					} else {
-						setDraftSyncState("ready");
-					}
+					setDraftSyncState("ready");
 				})
 				.catch(() => {
 					if (alive()) setDraftSyncState("error");
@@ -1108,33 +1073,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			setDraftLoadAttempt((attempt) => attempt + 1);
 		}, []);
 
-		const acceptServerDraft = useCallback(() => {
-			const remote = draftConflictRef.current;
-			if (!remote || !currentUserId) return;
-			const remoteText = remote.hasDraft ? remote.text : "";
-			const refs = remote.hasDraft ? readFileReferences(remote.fileReferences, remoteText) : [];
-			lastSyncedDraftRef.current = {
-				text: remoteText,
-				fileReferences: refs,
-				composerDocument: remote.composerDocument,
-			};
-			lastDraftRevisionRef.current = remote.revision;
-			lastDraftUpdatedAtRef.current = remote.updatedAt;
-			draftConflictRef.current = null;
-			restoreRemoteInput(remoteText, refs, remote.composerDocument);
-			setDraftSyncState("ready");
-			persistNarratorInputDraft(
-				currentUserId,
-				narratorId,
-				remoteText,
-				remote.revision,
-				remote.updatedAt,
-				refs,
-				lastSyncedDraftRef.current,
-				readPersistableDocument(inputStateRef.current.composerDocument),
-			);
-		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument]);
-
 		const commitDraftAfterSend = useCallback(() => {
 			// Commit the local mirror before a delayed clear can lose its callback on a panel switch.
 			if (currentUserId && draftOwnerScopeRef.current === currentDraftScope) {
@@ -1151,11 +1089,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			}
 			if (draftSyncState === "ready") {
 				setDraftSyncState("loading");
-				void syncDraftNow("", undefined, [], null).catch(() => setDraftSyncState("error"));
-			} else if (draftSyncState === "conflict") {
-				// The local text was sent, but another client owns a newer draft. Keep that
-				// remote draft rather than clearing it as a side effect of this send.
-				acceptServerDraft();
+				void syncDraftNow("", [], null).catch(() => setDraftSyncState("error"));
 			}
 			releaseUnusedResources();
 		}, [
@@ -1164,22 +1098,50 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			narratorId,
 			draftSyncState,
 			syncDraftNow,
-			acceptServerDraft,
 			releaseUnusedResources,
 			readPersistableDocument,
 		]);
 
-		const overwriteServerDraft = useCallback(() => {
-			const remote = draftConflictRef.current;
-			if (!remote) return;
-			void syncDraftNow(inputRef.current, remote.revision).catch((err) => {
-				notifications.show({
-					title: t("draftSyncFailed"),
-					message: err instanceof Error ? err.message : String(err),
-					color: "red",
+		/** Swap the draft back to the version the last remote write replaced. */
+		const restorePreviousDraft = useCallback(() => {
+			if (!currentUserId) return;
+			void api
+				.restoreNarratorDraftPrevious(narratorId, draftSourceIdRef.current)
+				.then((draft) => {
+					const text = draft.hasDraft ? draft.text : "";
+					const refs = draft.hasDraft ? readFileReferences(draft.fileReferences, text) : [];
+					const document = readComposerDocument(draft.composerDocument);
+					lastSyncedDraftRef.current = { text, fileReferences: refs, composerDocument: document };
+					lastDraftRevisionRef.current = draft.revision;
+					lastDraftUpdatedAtRef.current = draft.updatedAt;
+					restoreRemoteInput(text, refs, document);
+					setDraftSyncState("ready");
+					persistNarratorInputDraft(
+						currentUserId,
+						narratorId,
+						text,
+						draft.revision,
+						draft.updatedAt,
+						refs,
+						lastSyncedDraftRef.current,
+						readPersistableDocument(inputStateRef.current.composerDocument),
+					);
+					setDraftReplacedByRemote(false);
+				})
+				.catch((err) => {
+					// 404: the undo slot was already consumed elsewhere — drop the notice quietly.
+					// Other failures keep the notice so the restore can be retried.
+					if (err instanceof ApiError && err.status === 404) {
+						setDraftReplacedByRemote(false);
+						return;
+					}
+					notifications.show({
+						title: t("draftSyncFailed"),
+						message: err instanceof Error ? err.message : String(err),
+						color: "red",
+					});
 				});
-			});
-		}, [syncDraftNow, t]);
+		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument, t]);
 
 		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
@@ -1243,23 +1205,42 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							unknown?.unsynced ||
 							(unknown && !sameFileReferenceInput(inputStateRef.current, unknown.input))
 						);
-				if (
-					draft.sourceId !== draftSourceIdRef.current &&
-					hasLocalUnsyncedChanges &&
-					!sameFileReferenceInput(remoteInput, inputStateRef.current)
-				) {
-					draftConflictRef.current = draft;
-					setDraftSyncState("conflict");
+				const fromThisEditor = draft.sourceId === draftSourceIdRef.current;
+				if (!fromThisEditor && hasLocalUnsyncedChanges) {
+					/*
+					 * Local keystrokes win. The user is typing here, so the remote body is
+					 * left untouched on screen; the next debounced save overwrites it and
+					 * the server keeps the overwritten version in its undo slot. Only the
+					 * revision bookkeeping advances, keeping the out-of-order guard fresh.
+					 * "ready" matters when this event discarded the in-flight hydration:
+					 * without it the debounced save would stay gated on "loading" forever.
+					 */
+					lastDraftRevisionRef.current = draft.revision;
+					lastDraftUpdatedAtRef.current = draft.updatedAt;
+					setDraftSyncState("ready");
 					return;
 				}
-				const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
-				if (shouldApplyRemote) restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
+				if (!fromThisEditor) {
+					const replaced = lastSyncedDraftRef.current;
+					const hadContent = !!(
+						replaced &&
+						(replaced.text ||
+							replaced.fileReferences.length ||
+							replaced.composerDocument?.assets.length)
+					);
+					const remoteEmpty =
+						!remoteText && remoteRefs.length === 0 && !draft.composerDocument?.assets.length;
+					restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
+					// Only a remote CLEAR of real content earns the undo offer — anything
+					// noisier would fire on every routine cross-tab sync. A later non-empty
+					// write supersedes the offer (the undo slot holds the newest overwrite).
+					setDraftReplacedByRemote(hadContent && remoteEmpty);
+				}
 				lastSyncedDraftRef.current = remoteInput;
 				lastDraftRevisionRef.current = draft.revision;
 				lastDraftUpdatedAtRef.current = draft.updatedAt;
-				draftConflictRef.current = null;
 				setDraftSyncState("ready");
-				const nextInput = shouldApplyRemote ? remoteInput : inputStateRef.current;
+				const nextInput = fromThisEditor ? inputStateRef.current : remoteInput;
 				if (currentUserId) {
 					persistNarratorInputDraft(
 						currentUserId,
@@ -1277,6 +1258,34 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 
 		remoteDraftHandlerRef.current = handleDraftChanged;
+
+		/*
+		 * Reconnect reconcile entry point. The panel-state snapshot carries draft
+		 * metadata but never a body; when it proves the live event stream missed a
+		 * write (WS gap), pull the body and run it through the normal state machine.
+		 * The local-keystrokes-win rule inside handleDraftChanged still applies.
+		 */
+		const handleDraftMeta = useCallback(
+			(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) => {
+				const current = lastDraftRevisionRef.current;
+				if (current == null || meta.revision <= current) return;
+				const epoch = draftReadEpochRef.current;
+				const scope = draftOwnerScopeRef.current;
+				void api
+					.getNarratorDraft(narratorId, AbortSignal.timeout(15_000))
+					.then((detail) => {
+						if (
+							epoch !== draftReadEpochRef.current ||
+							scope !== draftOwnerScopeRef.current ||
+							detail.revision <= (lastDraftRevisionRef.current ?? 0)
+						)
+							return;
+						remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
+					})
+					.catch(() => {});
+			},
+			[narratorId],
+		);
 
 		// --- Command popover ---
 		// A quoted message is never a slash command: the quote prefix leads its text.
@@ -1654,6 +1663,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			}
 
 			if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+				// 全屏编辑模式下 Enter/Shift+Enter 一律只换行,不发送(发送走按钮或 mod+Enter)。
+				// stopPropagation 挡住 window 级的权限审批 Enter 快捷键:它只在输入框为空时
+				// 生效,而全屏里审批按钮被遮罩盖住,误触发审批比少一个快捷键严重得多。
+				if (fullscreenOpened && !e.ctrlKey && !e.metaKey) {
+					e.stopPropagation();
+					return;
+				}
+
 				// Permission shortcut: when the composer holds nothing to send and a
 				// permission is pending, the panel's global keydown handler owns Enter.
 				// preventDefault here to stop the textarea from inserting a newline.
@@ -1684,10 +1701,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				return;
 			}
-			// Up/down follow visual lines, including soft wraps. History runs only when that
-			// press leaves the caret on the same line (start of the text going up, end going
-			// down). Editor state still has the pre-key caret until selectionchange, which can
-			// land after this frame and make every ArrowUp look like the boundary.
+			// Up/down follow visual lines, including soft wraps. History runs only from the
+			// first line upward or the last line downward. Prevent that press before the
+			// browser handles it: contenteditable otherwise jumps to the end of the last line
+			// when history does not replace the text. Editor state is still the pre-key caret
+			// here; selectionchange applies the browser move later.
 			if (
 				(e.key === "ArrowUp" || e.key === "ArrowDown") &&
 				!e.shiftKey &&
@@ -1695,27 +1713,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				!e.metaKey &&
 				(!documentRef.current.assets.length || inputHistory.isBrowsing)
 			) {
-				const before = editorRef.current?.readLiveCaret() ?? null;
 				const direction = e.key === "ArrowUp" ? "up" : "down";
-				const recallIfCaretStayed = () => {
-					if (!editorRef.current?.caretStayedOnLine(before)) return;
-					const result = inputHistory.navigateEntry(
-						direction,
-						inputRef.current,
-						inputStateRef.current.fileReferences,
-						readPersistableDocument(inputStateRef.current.composerDocument),
-					);
-					if (result) {
-						restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
-						syncAttachedFiles(documentRef.current);
-						requestAnimationFrame(() =>
-							editorRef.current?.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
-						);
-					}
-				};
-				const frame = editorRef.current?.getElement()?.ownerDocument.defaultView;
-				if (frame) frame.requestAnimationFrame(recallIfCaretStayed);
-				else requestAnimationFrame(recallIfCaretStayed);
+				if (!editorRef.current?.isCaretOnVerticalEdge(direction)) return;
+				e.preventDefault();
+				const result = inputHistory.navigateEntry(
+					direction,
+					inputRef.current,
+					inputStateRef.current.fileReferences,
+					readPersistableDocument(inputStateRef.current.composerDocument),
+				);
+				if (!result) return;
+				restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
+				syncAttachedFiles(documentRef.current);
+				// Layout measures on the next frame; scroll once that height is committed.
+				const reveal = () => editorRef.current?.revealCaretAtEnd();
+				const win = editorRef.current?.getElement()?.ownerDocument.defaultView;
+				if (win) win.requestAnimationFrame(() => win.requestAnimationFrame(reveal));
+				else requestAnimationFrame(() => requestAnimationFrame(reveal));
 			}
 		};
 
@@ -1748,6 +1762,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				commitDraftAfterSend,
 				noteSent: (text, refs, document) => inputHistory.push(text, refs, document),
 				handleDraftChanged,
+				handleDraftMeta,
 			}),
 			[
 				captureAttachmentSelection,
@@ -1763,18 +1778,36 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				commitDraftAfterSend,
 				inputHistory,
 				handleDraftChanged,
+				handleDraftMeta,
 			],
 		);
 
 		return (
 			<Box
-				ref={fullscreenTrap}
+				ref={fullscreenBoxMergedRef}
 				className={fullscreenOpened ? classes.fullscreen : undefined}
-				style={fullscreenOpened ? undefined : { position: "relative", flex: 1, minWidth: 0 }}
+				style={
+					fullscreenOpened
+						? { zIndex: Z.fullscreenEditor }
+						: { position: "relative", flex: 1, minWidth: 0 }
+				}
 				role={fullscreenOpened ? "dialog" : undefined}
 				aria-modal={fullscreenOpened || undefined}
 				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}
 			>
+				<QuoteDetailModal
+					quote={quoteDetail}
+					onClose={() => setQuoteDetail(null)}
+					onJump={(quote) => revealComposerQuote(dock, quote, editorElement)}
+				/>
+				{activeAttachmentPreview && (
+					<ComposerTextAttachmentPreview
+						key={`${attachmentPreviewScope}:${activeAttachmentPreview.asset.id}`}
+						file={resourceCacheRef.current.get(activeAttachmentPreview.asset.id)}
+						name={activeAttachmentPreview.asset.name}
+						onClose={() => setAttachmentPreview(null)}
+					/>
+				)}
 				<CommandPopover
 					anchorRef={textareaRef}
 					commands={commandsList ?? []}
@@ -1838,20 +1871,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						</Button>
 					</Group>
 				)}
-				{draftSyncState === "conflict" && (
-					<Stack gap={4} mb={4}>
-						<Text size="xs" c="orange">
-							{t("draftConflict")}
+				{draftReplacedByRemote && (
+					<Group gap="xs" mb={4} wrap="nowrap">
+						<Text size="xs" c="orange" style={{ flex: 1 }}>
+							{t("draftReplacedByRemote")}
 						</Text>
-						<Group gap="xs">
-							<Button size="compact-xs" variant="light" onClick={acceptServerDraft}>
-								{t("draftUseServer")}
-							</Button>
-							<Button size="compact-xs" color="orange" onClick={overwriteServerDraft}>
-								{t("draftUseLocal")}
-							</Button>
-						</Group>
-					</Stack>
+						<Button size="compact-xs" variant="light" onClick={restorePreviousDraft}>
+							{t("draftRestorePrevious")}
+						</Button>
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							color="gray"
+							onClick={() => setDraftReplacedByRemote(false)}
+						>
+							{t("draftDismissReplace")}
+						</Button>
+					</Group>
 				)}
 				{!isDraftWithinSyncLimit(input) && (
 					<Text size="xs" c="orange" mb={4}>
@@ -1913,8 +1949,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						}}
 						onKeyDown={handleKeyDown}
 						onPasteFiles={onPasteImages}
-						onOpenQuote={(quote) => revealComposerQuote(dock, quote, editorElement)}
+						onOpenQuote={setQuoteDetail}
 						onOpenFile={(reference) => revealQuotedFile(dock, reference)}
+						onOpenAttachment={(asset) => {
+							if (asset.kind !== "textFile") return;
+							setAttachmentPreview({ scope: attachmentPreviewScope, asset });
+						}}
 						onOpenImage={(asset) => {
 							const file = resourceCacheRef.current.get(asset.id);
 							if (!file) return;

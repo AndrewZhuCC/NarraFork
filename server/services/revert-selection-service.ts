@@ -124,6 +124,7 @@ export interface RevertSelectionTool {
 }
 export interface RevertSelectionOperation {
 	id: string;
+	journalSeq: number;
 	executionSegmentId: string | null;
 	evidenceVersion: number;
 	sourceInstanceId: string;
@@ -787,7 +788,9 @@ export class RevertSelectionService {
 			return;
 		}
 		if (isFileTool && (!["success", "fail"].includes(tool.status) || Boolean(tool.isBackground))) {
-			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "pending" });
+			// An unfinished attempt is not proof of zero IO. Keep earlier settled effects
+			// available, but leave coverage partial until this file attempt has settled.
+			this.issue(state, { code: "FILE_TOOL_PENDING", toolCallId: tool.id });
 			return;
 		}
 		if (!["success", "fail"].includes(tool.status))
@@ -989,11 +992,12 @@ export class RevertSelectionService {
 			? JSON.parse(operation.executionBindingJson)
 			: null;
 		if (
-			!binding ||
-			binding.deviceId !== tool.executionDeviceId ||
-			binding.runtimeGeneration !== tool.runtimeGeneration ||
+			(operation.evidenceVersion === 2 &&
+				(!binding ||
+					binding.deviceId !== tool.executionDeviceId ||
+					binding.runtimeGeneration !== tool.runtimeGeneration)) ||
 			tool.executionIdentityVersion !== 1 ||
-			operation.evidenceVersion !== 2 ||
+			![2, 3].includes(operation.evidenceVersion) ||
 			operation.sourceKind !== "tool" ||
 			operation.sourceId !== origin ||
 			operation.toolCallId !== origin ||
@@ -1044,8 +1048,9 @@ export class RevertSelectionService {
 					FILE_CHANGE_LIMITS.historyToolRelatedChanges,
 					"selected effects",
 				);
-				const effect = decodeEffect(row, operation.attempt);
-				integer(effect.scopeRevision, 0, Number.MAX_SAFE_INTEGER, "scope revision");
+				const effect = decodeEffect(row, operation.attempt, operation.journalSeq);
+				if (effect.scopeRevision !== null)
+					integer(effect.scopeRevision, 0, Number.MAX_SAFE_INTEGER, "legacy scope revision");
 				const actualScope = this.one<{
 					id: string;
 					sourceInstanceId: string;
@@ -1061,7 +1066,6 @@ export class RevertSelectionService {
 				);
 				if (
 					!actualScope ||
-					actualScope.status !== "active" ||
 					JSON.stringify(
 						Object.entries(createFileChangeIdentity(actualScope, effect.identity)).sort(),
 					) !== JSON.stringify(Object.entries(effect.identity).sort())
@@ -1116,9 +1120,13 @@ export class RevertSelectionService {
 					this.issue(state, { code: "EFFECT_PIN_MISSING", operationId: operation.id });
 				if (
 					effect.phase !== "apply" ||
-					!binding ||
-					!effect.executionReceipt ||
-					!fileChangeExecutionBindingMatches(binding, effect.executionReceipt.executionBinding) ||
+					(operation.evidenceVersion === 2 &&
+						(!binding ||
+							!effect.executionReceipt ||
+							!fileChangeExecutionBindingMatches(
+								binding,
+								effect.executionReceipt.executionBinding,
+							))) ||
 					(!hasConfirmedNoFileChange(effect) && !hasSettledMeasuredFileEffect(effect))
 				)
 					this.issue(state, { code: "EFFECT_UNRESOLVED", operationId: operation.id });
@@ -1222,13 +1230,13 @@ const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS message
  coalesce(octet_length(input_json),0) + coalesce(octet_length(output_json),0) + coalesce(octet_length(execution_targets_json),0) AS copyBytes
  FROM narrator_tool_calls`;
 const OPERATION_SELECT = `SELECT id, execution_segment_id AS executionSegmentId, evidence_version AS evidenceVersion, source_instance_id AS sourceInstanceId, source_kind AS sourceKind, source_id AS sourceId,
- attempt, tool_call_id AS toolCallId, narrator_id AS narratorId, project_id AS projectId, request_digest AS requestDigest,
+ attempt, journal_seq AS journalSeq, tool_call_id AS toolCallId, narrator_id AS narratorId, project_id AS projectId, request_digest AS requestDigest,
  CASE WHEN octet_length(execution_binding_json) <= ${FILE_CHANGE_LIMITS.metadataBytes} THEN execution_binding_json END AS executionBindingJson,
  expected_effect_count AS expectedEffectCount, prepared_effect_count AS preparedEffectCount, settled_effect_count AS settledEffectCount,
  unresolved_effect_count AS unresolvedEffectCount, evidence_bytes AS evidenceBytes, execution_outcome AS executionOutcome,
  effect_outcome AS effectOutcome, settlement, coverage, attribution_grade AS attributionGrade, reason, finished_at AS finishedAt, updated_at AS updatedAt FROM file_change_operations`;
 const EFFECT_SELECT = `SELECT id, operation_id AS operationId, scope_id AS scopeId, file_key AS fileKey, scope_revision AS scopeRevision, mutation_id AS mutationId,
- request_digest AS requestDigest, phase, outcome, settlement, attribution_grade AS attribution, execution_confirmed AS executionConfirmed,
+ request_digest AS requestDigest, phase, outcome, disk_outcome AS diskOutcome, settlement, attribution_grade AS attribution, execution_confirmed AS executionConfirmed,
  lines_added AS linesAdded, lines_removed AS linesRemoved, before_blob_digest AS beforeBlobDigest, intended_after_blob_digest AS intendedAfterBlobDigest,
  observed_after_blob_digest AS observedAfterBlobDigest,
  CASE WHEN octet_length(identity_json) <= ${FILE_CHANGE_LIMITS.metadataBytes} THEN identity_json END AS identity,
@@ -1242,7 +1250,8 @@ interface EffectRow {
 	operationId: string;
 	scopeId: string;
 	fileKey: string;
-	scopeRevision: number;
+	scopeRevision: number | null;
+	diskOutcome: "applied" | "not_applied" | "unknown" | null;
 	mutationId: string;
 	requestDigest: string;
 	phase: FileChangeReversalEffect["phase"];
@@ -1261,7 +1270,11 @@ interface EffectRow {
 	observedAfter: string | null;
 	receipt: string | null;
 }
-function decodeEffect(row: EffectRow, attempt: number): FileChangeReversalEffect {
+function decodeEffect(
+	row: EffectRow,
+	attempt: number,
+	journalSeq: number,
+): FileChangeReversalEffect {
 	if (!row.identity || !row.beforeState || !row.intendedAfter || !row.observedAfter)
 		throw fail("METADATA_INVALID", "Missing or oversized effect metadata");
 	return {
@@ -1283,8 +1296,38 @@ function decodeEffect(row: EffectRow, attempt: number): FileChangeReversalEffect
 		linesAdded: row.linesAdded,
 		linesRemoved: row.linesRemoved,
 		scopeRevision: row.scopeRevision,
+		journalSeq,
+		diskOutcome: row.diskOutcome,
 	};
 }
+/** Explicit snapshots need a fully enumerated target set and each original before state. */
+export function isSnapshotSelectionComplete(selection: RevertSelectionResult): boolean {
+	if (
+		!selection.selectionComplete ||
+		selection.issues.some(
+			(issue) => !["EFFECT_UNRESOLVED", "OPERATION_UNRESOLVED"].includes(issue.code),
+		)
+	)
+		return false;
+	const counts = new Map<string, number>();
+	for (const effect of selection.effects) {
+		if (
+			effect.phase !== "apply" ||
+			effect.before.kind === "unknown" ||
+			effect.before.kind === "symlink" ||
+			(effect.before.kind === "regular" && effect.before.mode === null)
+		)
+			return false;
+		counts.set(effect.operationId, (counts.get(effect.operationId) ?? 0) + 1);
+	}
+	return selection.operations.every(
+		(operation) =>
+			operation.expectedEffectCount !== null &&
+			operation.expectedEffectCount === (counts.get(operation.id) ?? 0) &&
+			(operation.expectedEffectCount > 0 || isNoDispatch(operation)),
+	);
+}
+
 function isNoDispatch(op: RevertSelectionOperation) {
 	return (
 		op.expectedEffectCount === 0 &&

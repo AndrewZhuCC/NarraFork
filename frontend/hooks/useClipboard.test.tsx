@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -50,8 +50,7 @@ function ClipboardHarness({ timeout = 1000 }: { timeout?: number }) {
 	);
 }
 
-async function renderHarness(execCommand: () => boolean, timeout?: number) {
-	installDom(execCommand);
+async function renderHarness(timeout?: number) {
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -74,16 +73,52 @@ afterEach(async () => {
 
 describe("useClipboard", () => {
 	test("sets and resets copied state after a successful fallback", async () => {
-		await renderHarness(() => true, 10);
-		expect(container?.querySelector('[data-testid="copied"]')?.textContent).toBe("yes");
-		await act(async () => {
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		});
-		expect(container?.querySelector('[data-testid="copied"]')?.textContent).toBe("no");
+		installDom(() => true);
+		// linkedom forwards window timers to globalThis, so intercept that real boundary.
+		const schedule = globalThis.setTimeout;
+		const cancel = globalThis.clearTimeout;
+		let resetCopied: (() => void) | undefined;
+		// Control only this hook's 10ms timer; React's scheduling stays real.
+		const timerId = -1;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: () => void,
+			ms?: number,
+		) => {
+			if (ms !== 10) return schedule(callback, ms);
+			resetCopied = callback;
+			return timerId;
+		}) as typeof window.setTimeout);
+		const clear = spyOn(globalThis, "clearTimeout").mockImplementation(((
+			id: Parameters<typeof window.clearTimeout>[0],
+		) => {
+			if (id === timerId) resetCopied = undefined;
+			else cancel(id);
+		}) as typeof window.clearTimeout);
+		try {
+			await renderHarness(10);
+			expect(timer.mock.calls.filter(([, ms]) => ms === 10)).toHaveLength(1);
+			expect(resetCopied).toBeFunction();
+			expect(container?.querySelector('[data-testid="copied"]')?.textContent).toBe("yes");
+			await act(async () => resetCopied?.());
+			expect(container?.querySelector('[data-testid="copied"]')?.textContent).toBe("no");
+			await act(async () => root?.unmount());
+			root = undefined;
+			expect(clear).toHaveBeenCalledWith(timerId);
+			expect(resetCopied).toBeUndefined();
+		} finally {
+			try {
+				if (root) await act(async () => root?.unmount());
+				root = undefined;
+			} finally {
+				timer.mockRestore();
+				clear.mockRestore();
+			}
+		}
 	});
 
 	test("exposes an error when both clipboard paths fail", async () => {
-		await renderHarness(() => false);
+		installDom(() => false);
+		await renderHarness();
 		expect(container?.querySelector('[data-testid="copied"]')?.textContent).toBe("no");
 		expect(container?.querySelector('[data-testid="error"]')?.textContent).toContain(
 			"Clipboard copy command failed",

@@ -1,487 +1,364 @@
-/**
- * Rollback activity admission, bounded workspace ranges and the large fixed-plan case.
- * Shared fixture: ./__tests__/revert-transaction.fixture.ts (importing it registers the hooks).
- * Sibling suites: revert-transaction-interleaving.test.ts, revert-transaction-real-tools.test.ts.
- */
-import { Database } from "bun:sqlite";
 import { describe, expect, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import { join } from "node:path";
-import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
-import { localBackend } from "../lib/agent/execution/local-backend";
-import { generateId } from "../lib/id";
 import {
-	access,
-	coordinatorState,
 	db,
 	execution,
-	fixtureSetupMs,
-	hash,
+	failHistoryCommit,
 	history,
 	journalFiles,
 	makeFixtureTransaction,
 	namespace,
 	operation,
 	options,
-	owner,
 	prepare,
 	principal,
-	restores,
-	root,
-	runtime,
+	service,
+	setFileHook,
 	setService,
 	test,
 	twoFiles,
 	workspace,
 	write,
 } from "./__tests__/revert-transaction.fixture";
-import { localDirectoryIdentity, localObjectIdentity } from "./file-change-local-io";
-import { restoreLocalFile } from "./file-change-local-restore";
-import { localFileChangeRuntimeBinding } from "./file-change-runtime";
-import { buildRevertScopeRanges } from "./revert-transaction-service";
-import { freezeWorkspaceRanges, WORKSPACE_RANGE_LIMITS } from "./workspace-write-ranges";
 
-describe("rollback activity admission and bounded ranges", () => {
-	test("strict fixture close releases retained prepared statements before directory removal", async () => {
-		const directory = await fs.mkdtemp(join(root, "close-probe-"));
-		const client = new Database(join(directory, "owned.sqlite"));
-		client.exec("PRAGMA journal_mode=WAL; CREATE TABLE owned(value TEXT);");
-		const retained = client.prepare("SELECT value FROM owned");
+import { RevertSelectionService } from "./revert-selection-service";
+
+describe("independent file restoration", () => {
+	test("history-changing success uses five collector scans including preview and history.prepare", async () => {
+		const collect = spyOn(RevertSelectionService.prototype, "collect");
 		try {
-			expect(retained.all()).toEqual([]);
-			client.close(true);
-			expect(() => retained.all()).toThrow("Database has closed");
-			await fs.rm(directory, { recursive: true, force: true });
-			await expect(fs.access(directory)).rejects.toMatchObject({ code: "ENOENT" });
+			const { plan } = await twoFiles();
+			expect((await execution(plan).whenSettled).historyCommitted).toBe(true);
+			expect(collect).toHaveBeenCalledTimes(5);
 		} finally {
-			retained.finalize();
-			client.close(true);
+			collect.mockRestore();
 		}
 	});
-
-	test.each([
-		256, 257, 1000,
-	])("%s fixed targets keep scope admission within the global range budget", async (count) => {
-		await write(join(workspace, "scope-seed.txt"), "seed");
-		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
-		if (!scope) throw new Error("Missing scope");
-		const paths = Array.from({ length: count }, (_, i) => join(workspace, `range-${i}.txt`));
-		const ranges = buildRevertScopeRanges(scope, paths);
-		expect(ranges).toEqual(
-			count === 256
-				? paths.map((canonicalPath) => ({ kind: "file", canonicalPath }))
-				: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
-		);
-		expect(freezeWorkspaceRanges(scope, ranges)).toEqual(ranges);
-		expect(ranges.length).toBeLessThanOrEqual(WORKSPACE_RANGE_LIMITS.count);
-		expect(Buffer.byteLength(JSON.stringify({ version: 1, ranges }))).toBeLessThanOrEqual(
-			WORKSPACE_RANGE_LIMITS.jsonBytes,
-		);
-		expect(paths).toHaveLength(count);
-		expect(WORKSPACE_RANGE_LIMITS).toMatchObject({ count: 256, jsonBytes: 128 * 1024 });
-	});
-
-	test("serialized UTF-8 bytes include the version wrapper and trigger scope fallback", async () => {
-		await write(join(workspace, "scope-seed.txt"), "seed");
-		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
-		if (!scope) throw new Error("Missing scope");
-		const path = join(workspace, "字".repeat(200));
-		const padding = "字".repeat(80);
-		let ranges: { kind: "file"; canonicalPath: string }[] | undefined;
-		// Account for the actual canonical temporary prefix, without changing any
-		// count/byte/padding limit or deriving expectations from production output.
-		for (let count = 180; count > 0; count--) {
-			const candidate = Array.from({ length: count }, (_, i) => ({
-				kind: "file" as const,
-				canonicalPath: `${path}-${i}`,
-			}));
-			const compactJson = JSON.stringify({ version: 1, ranges: candidate });
-			const paddedJson = JSON.stringify({
-				version: 1,
-				ranges: candidate.map((range) => ({
-					...range,
-					canonicalPath: `${range.canonicalPath}${padding}`,
-				})),
-			});
-			if (
-				compactJson.length < WORKSPACE_RANGE_LIMITS.jsonBytes &&
-				Buffer.byteLength(compactJson) < WORKSPACE_RANGE_LIMITS.jsonBytes &&
-				paddedJson.length < WORKSPACE_RANGE_LIMITS.jsonBytes &&
-				Buffer.byteLength(paddedJson) > WORKSPACE_RANGE_LIMITS.jsonBytes
-			) {
-				ranges = candidate;
-				break;
-			}
-		}
-		if (!ranges) throw new Error("Cannot construct the UTF-8 range-boundary fixture");
-		// Stay under the count budget, cross bytes rather than UTF-16 characters.
-		const compact = JSON.stringify({ version: 1, ranges });
-		expect(compact.length).toBeLessThan(WORKSPACE_RANGE_LIMITS.jsonBytes);
-		expect(Buffer.byteLength(compact)).toBeLessThan(WORKSPACE_RANGE_LIMITS.jsonBytes);
-		const oversized = ranges.map((range) => ({
-			...range,
-			canonicalPath: `${range.canonicalPath}${padding}`,
-		}));
-		expect(oversized.length).toBeLessThan(WORKSPACE_RANGE_LIMITS.count);
-		expect(JSON.stringify({ version: 1, ranges: oversized }).length).toBeLessThan(
-			WORKSPACE_RANGE_LIMITS.jsonBytes,
-		);
-		expect(Buffer.byteLength(JSON.stringify({ version: 1, ranges: oversized }))).toBeGreaterThan(
-			WORKSPACE_RANGE_LIMITS.jsonBytes,
-		);
-		expect(
-			buildRevertScopeRanges(
-				scope,
-				ranges.map((range) => range.canonicalPath),
-			),
-		).toEqual(ranges);
-		const fallback = buildRevertScopeRanges(
-			scope,
-			oversized.map((range) => range.canonicalPath),
-		);
-		expect(fallback).toEqual([{ kind: "subtree", canonicalPath: scope.canonicalRoot }]);
-		expect(freezeWorkspaceRanges(scope, fallback)).toEqual(fallback);
-	});
-
-	test("exact 128 KiB serialized boundary stays precise and one extra byte falls back", async () => {
-		await write(join(workspace, "scope-seed.txt"), "seed");
-		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
-		if (!scope) throw new Error("Missing scope");
-		const ranges = Array.from({ length: 32 }, (_, i) => ({
-			kind: "file" as const,
-			canonicalPath: join(workspace, `long-${i}-`),
-		}));
-		const initialBytes = Buffer.byteLength(JSON.stringify({ version: 1, ranges }));
-		const padding = Math.floor((WORKSPACE_RANGE_LIMITS.jsonBytes - initialBytes) / ranges.length);
-		for (const range of ranges) range.canonicalPath += "x".repeat(padding);
-		ranges[0].canonicalPath += "x".repeat(
-			WORKSPACE_RANGE_LIMITS.jsonBytes - Buffer.byteLength(JSON.stringify({ version: 1, ranges })),
-		);
-		expect(Buffer.byteLength(JSON.stringify({ version: 1, ranges }))).toBe(
-			WORKSPACE_RANGE_LIMITS.jsonBytes,
-		);
-		expect(
-			buildRevertScopeRanges(
-				scope,
-				ranges.map((range) => range.canonicalPath),
-			),
-		).toEqual(ranges);
-		ranges[0].canonicalPath += "x";
-		expect(
-			buildRevertScopeRanges(
-				scope,
-				ranges.map((range) => range.canonicalPath),
-			),
-		).toEqual([{ kind: "subtree", canonicalPath: scope.canonicalRoot }]);
-	});
-
-	test("fallback never masks an invalid target outside its authorized scope", async () => {
-		await write(join(workspace, "scope-seed.txt"), "seed");
-		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
-		if (!scope) throw new Error("Missing scope");
-		const paths = Array.from({ length: 257 }, (_, i) => join(workspace, `range-${i}`));
-		paths[256] = join(root, "outside-scope");
-		expect(() => buildRevertScopeRanges(scope, paths)).toThrow("escapes");
-		expect(coordinatorState.leases.size).toBe(0);
-		expect(runtime.evidence.getScope(scope.id)?.activeLeaseId).toBeNull();
-	});
-
-	test.each([
-		"target",
-		"scope",
-	] as const)("existing %s activity rejects apply without consuming the prepared plan", async (kind) => {
-		const targetRoot = join(workspace, "target");
-		await fs.mkdir(targetRoot);
-		const path = join(targetRoot, "activity.txt");
-		await fs.writeFile(path, "original");
-		await write(path, "changed");
-		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
-		if (!scope) throw new Error("Missing scope");
-		const binding = localFileChangeRuntimeBinding("local");
-		if (!binding) throw new Error("Missing runtime");
-		const activityScope =
-			kind === "target"
-				? {
-						...scope,
-						id: generateId(),
-						workspaceInstanceId: generateId(),
-						canonicalRoot: targetRoot,
-						rootIdentityJson: { object: await localDirectoryIdentity(targetRoot) },
-					}
-				: scope;
-		if (kind === "target") db.insert(schema.fileChangeScopes).values(activityScope).run();
-		const activity = runtime.coordinator.registerActivity({
-			scope: activityScope,
-			runtime: binding,
-		});
-		try {
-			// Preview remains read-only and useful while Bash/unknown execution is active.
-			const plan = await prepare();
-			const before = history();
-			const files = journalFiles(plan);
-			await expect(execution(plan).result).rejects.toMatchObject({
-				code: "uncoordinated_activity",
-			});
-			expect(await fs.readFile(path, "utf8")).toBe("changed");
-			expect(history()).toBe(before);
-			expect(journalFiles(plan)).toEqual(files);
-			expect(operation(plan)?.status).toBe("prepared");
-			expect(coordinatorState.leases.size).toBe(0);
-			expect(runtime.evidence.getScope(scope.id)?.activeMutationCount).toBe(0);
-		} finally {
-			runtime.coordinator.endActivity(activity);
-		}
-	});
-
-	test("a real registered activity in the last dispatch barrier vetoes an observing native restore", async () => {
-		const { a, plan } = await twoFiles();
-		const file = journalFiles(plan)[0];
-		const scope = runtime.evidence.getScope(file.scopeId);
-		const binding = localFileChangeRuntimeBinding("local");
-		const expected = file.expectedStateJson;
-		const desired = file.desiredStateJson;
-		if (!scope || !binding || expected.kind !== "regular" || desired.kind !== "regular")
-			throw new Error("Missing regular-file fixture");
-		const before = history();
-		const files = journalFiles(plan);
-		const mutationId = generateId();
-		await runtime.coordinator.withRollback(
-			{
-				scope,
-				runtime: binding,
-				activityPolicy: "observe",
-				executionClass: "local_file_io",
-				ranges: [{ kind: "file", canonicalPath: a }],
-			},
-			async (lease) => {
-				let activity: ReturnType<typeof runtime.coordinator.registerActivity> | undefined;
-				try {
-					const result = await restoreLocalFile({
-						mutationId,
-						requestDigest: hash("last-dispatch-activity-regression"),
-						backend: localBackend,
-						lease,
-						scope,
-						identity: file.identityJson,
-						executionBinding: lease.executionBinding,
-						rootObjectIdentity: await localDirectoryIdentity(scope.canonicalRoot),
-						expectedObjectIdentity: localObjectIdentity(await fs.lstat(a, { bigint: true })),
-						expected,
-						desired,
-						signal: AbortSignal.timeout(30_000),
-						readRuntime: localFileChangeRuntimeBinding,
-						async authorize(guard) {
-							await access.authorizeFile({
-								principal,
-								owner,
-								identity: file.identityJson,
-								signal: guard.signal,
-							});
-						},
-						assertCurrent: () => lease.assertCurrent(),
-						readBlob: (ref, options) => namespace.store.readBytes(ref, options),
-						onDispatch() {
-							lease.registerMutation(mutationId);
-							activity = runtime.coordinator.registerActivity({ scope, runtime: binding });
-						},
-					});
-					await result.whenSettled;
-					expect(activity).toBeDefined();
-					expect(lease.overlappedUncoordinatedActivity).toBe(true);
-					expect(result).toMatchObject({
-						status: "not_dispatched",
-						reason: "guard_failed",
-						stats: { dispatches: 0, bytesWritten: 0 },
-					});
-					expect(await fs.readFile(a, "utf8")).toBe("changed");
-					expect(history()).toBe(before);
-					expect(journalFiles(plan)).toEqual(files);
-				} finally {
-					if (activity) runtime.coordinator.endActivity(activity);
-					if (lease.pendingMutationCount) lease.settle(mutationId, "not_applied");
-				}
-			},
-		);
-		expect(operation(plan)?.status).toBe("prepared");
-		expect(coordinatorState.leases.size).toBe(0);
-	});
-
-	test("strict rollback rejects new intersecting activity but allows sibling activity", async () => {
-		const { a, plan } = await twoFiles();
-		const fixed = journalFiles(plan)[0];
-		const scope = runtime.evidence.getScope(fixed.scopeId);
-		const binding = localFileChangeRuntimeBinding("local");
-		if (!scope || !binding) throw new Error("Missing scope/runtime");
-		const siblingRoot = join(workspace, "sibling");
-		await fs.mkdir(siblingRoot);
-		const siblingPath = join(siblingRoot, "untouched.txt");
-		await fs.writeFile(siblingPath, "sibling contents");
-		const siblingScope = {
-			...scope,
-			id: generateId(),
-			workspaceInstanceId: generateId(),
-			canonicalRoot: siblingRoot,
-			rootIdentityJson: { object: await localDirectoryIdentity(siblingRoot) },
-		};
-		db.insert(schema.fileChangeScopes).values(siblingScope).run();
-		const sibling = runtime.coordinator.registerActivity({ scope: siblingScope, runtime: binding });
-		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
-		let checked = false;
-		const spy = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation((request, body) =>
-			original(request, async (batch) => {
-				expect(batch.leases[0].activityPolicy).toBe("strict");
-				expect(() => runtime.coordinator.registerActivity({ scope, runtime: binding })).toThrow(
-					"rollback",
-				);
-				const brief = runtime.coordinator.registerActivity({
-					scope: siblingScope,
-					runtime: binding,
-				});
-				runtime.coordinator.endActivity(brief);
-				checked = true;
-				return body(batch);
-			}),
-		);
-		restores.push(() => spy.mockRestore());
-		try {
-			expect((await execution(plan).result).status).toBe("committed");
-			expect(checked).toBe(true);
-			expect(await fs.readFile(a, "utf8")).toBe("original");
-			expect(await fs.readFile(siblingPath, "utf8")).toBe("sibling contents");
-		} finally {
-			runtime.coordinator.endActivity(sibling);
-		}
-	});
-
-	test("activity on one member rejects a multi-scope plan without consuming partial leases", async () => {
-		const other = join(root, "other");
-		await fs.mkdir(other);
-		for (const cwd of [workspace, other]) {
-			const path = join(cwd, "file.txt");
-			await fs.writeFile(path, "original");
-			await write(path, "changed", cwd);
-		}
-		const scopes = db.select().from(schema.fileChangeScopes).limit(3).all();
-		expect(scopes).toHaveLength(2);
-		const target = scopes.find((scope) => scope.canonicalRoot === other);
-		const binding = localFileChangeRuntimeBinding("local");
-		if (!target || !binding) throw new Error("Missing scope/runtime");
-		const plan = await prepare();
-		const before = history();
-		const files = journalFiles(plan);
-		const activity = runtime.coordinator.registerActivity({ scope: target, runtime: binding });
-		try {
-			await expect(execution(plan).result).rejects.toMatchObject({
-				code: "uncoordinated_activity",
-			});
-			expect(history()).toBe(before);
-			expect(journalFiles(plan)).toEqual(files);
-			expect(operation(plan)?.status).toBe("prepared");
-			expect(coordinatorState.leases.size).toBe(0);
-			for (const scope of scopes) {
-				expect(runtime.evidence.getScope(scope.id)?.fencingToken).toBe(scope.fencingToken);
-				expect(runtime.evidence.getScope(scope.id)?.activeLeaseId).toBeNull();
-				expect(await fs.readFile(join(scope.canonicalRoot, "file.txt"), "utf8")).toBe("changed");
-			}
-		} finally {
-			runtime.coordinator.endActivity(activity);
-		}
-	});
-
-	test("real 257-file prepared plan applies under one bounded scope subtree lease", async () => {
-		const started = performance.now();
-		let previous = started;
-		const mark = (stage: string, result?: Awaited<ReturnType<typeof execution>["result"]>) => {
-			if (process.env.NF_REVERT_FIXTURE_TIMINGS !== "1") return;
-			const now = performance.now();
-			console.info("[fixture-257]", {
-				stage,
-				elapsedMs: Math.round(now - started),
-				stageMs: Math.round(now - previous),
-				fixtureSetupMs: Math.round(fixtureSetupMs),
-				...(result
-					? { status: result.status, reason: result.reason, settling: result.settling }
-					: {}),
-			});
-			previous = now;
-		};
-		mark("fixture_ready");
+	test("a run budget above the queue admission ceiling still restores files", async () => {
 		setService(makeFixtureTransaction(db, { ...options, timeoutMs: 120_000 }));
-		const paths = Array.from({ length: 257 }, (_, i) => join(workspace, `budget-${i}.txt`));
-		for (const path of paths) {
-			await fs.writeFile(path, "original");
-			await write(path, "changed");
-		}
-		mark("actual_tool_evidence_ready");
-		const siblingRoot = join(workspace, "unselected-sibling");
-		await fs.mkdir(siblingRoot);
-		const siblingPath = join(siblingRoot, "not-in-plan.txt");
-		await fs.writeFile(siblingPath, "keep this content");
-		const plan = await prepare();
-		mark("manifest_prepared");
-		expect(plan.expectedFileCount).toBe(257);
-		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
-		const binding = localFileChangeRuntimeBinding("local");
-		if (!scope || !binding) throw new Error("Missing scope/runtime");
-		const siblingScope = {
-			...scope,
-			id: generateId(),
-			workspaceInstanceId: generateId(),
-			canonicalRoot: siblingRoot,
-			rootIdentityJson: { object: await localDirectoryIdentity(siblingRoot) },
-		};
-		db.insert(schema.fileChangeScopes).values(siblingScope).run();
-		const activity = runtime.coordinator.registerActivity({
-			scope: siblingScope,
-			runtime: binding,
-		});
-		const before = history(FILE_CHANGE_LIMITS.revertFiles);
-		const files = journalFiles(plan, FILE_CHANGE_LIMITS.revertFiles);
-		expect(files).toHaveLength(257);
-		try {
-			// A large fixed plan tightens admission to its authorized scope, not its mutation set.
-			await expect(execution(plan).result).rejects.toMatchObject({
-				code: "uncoordinated_activity",
-			});
-			expect(history(FILE_CHANGE_LIMITS.revertFiles)).toBe(before);
-			expect(journalFiles(plan, FILE_CHANGE_LIMITS.revertFiles)).toEqual(files);
-			for (const path of paths) expect(await fs.readFile(path, "utf8")).toBe("changed");
-			expect(operation(plan)?.status).toBe("prepared");
-			expect(coordinatorState.leases.size).toBe(0);
-		} finally {
-			runtime.coordinator.endActivity(activity);
-		}
-		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
-		let entered = false;
-		const spy = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation((request, body) =>
-			original(request, async (batch) => {
-				expect(batch.leases).toHaveLength(1);
-				expect(batch.leases[0].ranges).toEqual([{ kind: "subtree", canonicalPath: workspace }]);
-				entered = true;
-				return body(batch);
-			}),
-		);
-		restores.push(() => spy.mockRestore());
-		mark("activity_rejection_verified");
-		const result = await execution(plan).result;
-		mark("apply_response", result);
+		const { plan } = await twoFiles();
+		const result = await execution(plan).whenSettled;
 		expect(result.status).toBe("committed");
-		expect(entered).toBe(true);
-		for (const path of paths) expect(await fs.readFile(path, "utf8")).toBe("original");
-		expect(await fs.readFile(siblingPath, "utf8")).toBe("keep this content");
-		expect(db.select().from(schema.narratorMessageRefs).limit(1).all()).toHaveLength(0);
+		expect(result.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+	});
+	test("file-only success keeps its post-IO collector because it does not prepare history", async () => {
+		const path = join(workspace, "file-only.txt");
+		await fs.writeFile(path, "before");
+		await write(path, "after");
+		const collect = spyOn(RevertSelectionService.prototype, "collect");
+		try {
+			const plan = await prepare({ kind: "revert" });
+			const result = await execution(plan).whenSettled;
+			expect(result.status).toBe("committed");
+			expect(result.historyCommitted).toBe(false);
+			expect(collect).toHaveBeenCalledTimes(4);
+		} finally {
+			collect.mockRestore();
+		}
+	});
+	test("real A to A effect leaves unarchived external B unchanged while history commits", async () => {
+		const path = join(workspace, "unchanged-effect.txt");
+		await fs.writeFile(path, "A");
+		await write(path, "A");
+		const external = "external unarchived B";
+		await fs.writeFile(path, external);
+		const plan = await prepare({ kind: "history_delete" });
+		expect(plan.coverageComplete).toBe(true);
+		const [row] = journalFiles(plan);
+		expect(row.expectedStateJson).toEqual(row.desiredStateJson);
+		expect(row.desiredBlobDigest).toBeNull();
+		const ref = row.desiredStateJson.kind === "regular" ? row.desiredStateJson.blob : null;
+		if (!ref) throw new Error("Missing measured B");
 		expect(
-			db
-				.select()
-				.from(schema.revertOperationFiles)
-				.where(eq(schema.revertOperationFiles.revertOperationId, plan.id))
-				.limit(1000)
-				.all()
-				.every((file) => file.status === "verified"),
-		).toBe(true);
-		expect(coordinatorState.leases.size).toBe(0);
-		mark("all_original_assertions_passed");
-	}, 120_000);
+			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+		).toBeNull();
+		const result = await execution(plan).whenSettled;
+		expect(result.status).toBe("committed");
+		expect(result.historyCommitted).toBe(true);
+		expect(result.historyStatus).toBe("complete");
+		expect(result.files.map((file) => file.status)).toEqual(["unchanged"]);
+		expect(await fs.readFile(path, "utf8")).toBe(external);
+		expect(
+			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+		).toBeNull();
+	});
+	test("A to A no-op still conflicts if the target changes after preview", async () => {
+		const path = join(workspace, "unchanged-conflict.txt");
+		await fs.writeFile(path, "A");
+		await write(path, "A");
+		await fs.writeFile(path, "external unarchived B");
+		const before = history();
+		const plan = await prepare({ kind: "history_delete" });
+		await fs.writeFile(path, "later external C");
+		const result = await execution(plan).whenSettled;
+		expect(result.status).toBe("failed");
+		expect(result.historyCommitted).toBe(false);
+		expect(result.files.map((file) => file.status)).toEqual(["conflict"]);
+		expect(await fs.readFile(path, "utf8")).toBe("later external C");
+		expect(history()).toBe(before);
+	});
+	test("manifest-only free quota still restores unarchived current and reports unavailable history", async () => {
+		const path = join(workspace, "unarchived-current.txt");
+		await fs.writeFile(path, "before");
+		await write(path, "after");
+		const current = Buffer.from("human content".repeat(32 * 1024));
+		await fs.writeFile(path, current);
+		const budget = namespace.catalog.getBudget();
+		if (!budget) throw new Error("Missing budget");
+		db.update(schema.fileChangeStorageBudgets)
+			.set({ quotaBytes: budget.usedBytes + 32 * 1024 })
+			.run();
+		await expect(
+			namespace.store.putBytes(current, { expectedSize: current.byteLength }),
+		).rejects.toThrow();
+		const plan = await prepare({
+			kind: "revert",
+			uiAction: "revert_files",
+			recoveryMode: "snapshot",
+		});
+		const execute = () =>
+			service.execute({
+				principal,
+				narratorId: "narrator",
+				planId: plan.id,
+				planHash: plan.planHash as string,
+				action: "revert_files",
+				acceptSnapshotRestore: true,
+			}).whenSettled;
+		const result = await execute();
+		expect(result.status).toBe("committed");
+		expect(result.files.map((file) => file.status)).toEqual(["applied"]);
+		expect(result.historyStatus).toBe("unavailable");
+		expect(await fs.readFile(path, "utf8")).toBe("before");
+		for (const file of journalFiles(plan)) {
+			expect(file.beforeBlobDigest).toBeNull();
+			expect(file.receiptJson).toMatchObject({ historyStatus: "unavailable" });
+		}
+		expect((await execute()).historyStatus).toBe("unavailable");
+	});
+	test("edit consent rejects a plan for another message or block before file dispatch", async () => {
+		const path = join(workspace, "edit-boundary.txt");
+		await fs.writeFile(path, "before");
+		const { messageId } = await write(path, "after");
+		const selector = { kind: "after_block" as const, messageId, keepThroughBlockIndex: 0 };
+		const plan = await prepare({
+			kind: "rollback_to_block",
+			uiAction: "edit_and_regenerate",
+			selector,
+		});
+		for (const wrong of [
+			{ ...selector, messageId: "different-message" },
+			{ ...selector, keepThroughBlockIndex: -1 },
+		]) {
+			const result = service.execute({
+				principal,
+				narratorId: "narrator",
+				planId: plan.id,
+				planHash: plan.planHash as string,
+				action: "edit_and_regenerate",
+				expectedSelector: wrong,
+			});
+			// Mutating the caller's object after dispatch must not change its captured consent.
+			Object.assign(wrong, selector);
+			await expect(result.whenSettled).rejects.toMatchObject({
+				code: "REVERT_TRANSACTION_ACTION_MISMATCH",
+			});
+			expect(operation(plan)?.status).toBe("prepared");
+			expect(await fs.readFile(path, "utf8")).toBe("after");
+		}
+		const run = (
+			expectedSelector = selector,
+			action: "edit_and_regenerate" | "rollback_to_block" = "edit_and_regenerate",
+		) =>
+			service.execute({
+				principal,
+				narratorId: "narrator",
+				planId: plan.id,
+				planHash: plan.planHash as string,
+				action,
+				expectedSelector,
+			}).whenSettled;
+		const first = await run();
+		expect(first.historyCommitted).toBe(true);
+		const terminalHistory = history();
+		await fs.writeFile(path, "after terminal response");
+		setFileHook(() => {
+			throw new Error("terminal replay must not dispatch target IO");
+		});
+		const replay = await run();
+		expect(replay).toMatchObject({ status: "committed", historyCommitted: true });
+		expect(replay.files.map((file) => file.status)).toEqual(first.files.map((file) => file.status));
+		expect(history()).toBe(terminalHistory);
+		expect(await fs.readFile(path, "utf8")).toBe("after terminal response");
+		for (const [wrongSelector, action] of [
+			[{ ...selector, messageId: "different-message" }, "edit_and_regenerate"],
+			[selector, "rollback_to_block"],
+		] as const)
+			await expect(run(wrongSelector, action)).rejects.toMatchObject({
+				code: "REVERT_TRANSACTION_ACTION_MISMATCH",
+			});
+		expect(history()).toBe(terminalHistory);
+		expect(await fs.readFile(path, "utf8")).toBe("after terminal response");
+	});
+	for (const snapshot of [false, true]) {
+		test(`${snapshot ? "snapshot" : "selective"} pending file tool retains settled file recovery without history commit`, async () => {
+			const settledPath = join(workspace, "settled.txt");
+			const pendingPath = join(workspace, "pending.txt");
+			await fs.writeFile(settledPath, "settled before");
+			await fs.writeFile(pendingPath, "pending before");
+			const settled = await write(settledPath, "settled after");
+			const pending = await write(pendingPath, "pending after");
+			// A still-running multi-step tool may already have a settled file effect;
+			// that prefix is not proof that its complete disk work has finished.
+			db.update(schema.narratorToolCalls)
+				.set({ status: "running" })
+				.where(eq(schema.narratorToolCalls.id, pending.toolCallId))
+				.run();
+			const originalHistory = history();
+			const plan = await prepare({
+				kind: "rollback_to_block",
+				uiAction: "rollback_to_block",
+				selector: { kind: "after_block", messageId: settled.messageId, keepThroughBlockIndex: 0 },
+				...(snapshot ? { recoveryMode: "snapshot" as const } : {}),
+			});
+			expect(plan.status).toBe("prepared");
+			expect(plan.coverageComplete).toBe(false);
+			expect(plan.expectedFileCount).toBe(1);
+			const result = await service.execute({
+				principal,
+				narratorId: "narrator",
+				planId: plan.id,
+				planHash: plan.planHash as string,
+				action: "rollback_to_block",
+				...(snapshot ? { acceptSnapshotRestore: true as const } : {}),
+			}).whenSettled;
+			expect(result.status).toBe("partial");
+			expect(result.files.map((file) => file.status)).toEqual(["applied"]);
+			expect(result.historyCommitted).toBe(false);
+			expect(await fs.readFile(settledPath, "utf8")).toBe("settled before");
+			expect(await fs.readFile(pendingPath, "utf8")).toBe("pending after");
+			expect(history()).toBe(originalHistory);
+		});
+	}
+	test("all files succeed before message history commits", async () => {
+		const { a, b, plan } = await twoFiles();
+		const result = await execution(plan).whenSettled;
+		expect(result.status).toBe("committed");
+		expect(result.historyCommitted).toBe(true);
+		expect(result.historyStatus).toBe("complete");
+		for (const file of journalFiles(plan)) {
+			expect(file.beforeBlobDigest).toBe(
+				file.expectedStateJson.kind === "regular" ? file.expectedStateJson.blob.digest : null,
+			);
+			expect(file.receiptJson).toMatchObject({ historyStatus: "complete" });
+		}
+		expect((await execution(plan).whenSettled).historyStatus).toBe("complete");
+		expect(result.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+		expect(await fs.readFile(b, "utf8")).toBe("original");
+		expect(db.select().from(schema.narratorMessageRefs).all()).toHaveLength(0);
+	});
+	test("second-file conflict keeps the first success and original message history", async () => {
+		const { a, b, plan } = await twoFiles();
+		const before = history();
+		await fs.writeFile(b, "external edit");
+		const result = await execution(plan).whenSettled;
+		expect(result.status).toBe("partial");
+		expect(result.historyCommitted).toBe(false);
+		expect(result.files.map((file) => file.status)).toEqual(["applied", "conflict"]);
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+		expect(await fs.readFile(b, "utf8")).toBe("external edit");
+		expect(history()).toBe(before);
+	});
+	test("message commit failure keeps successful files", async () => {
+		const { a, b, plan } = await twoFiles();
+		const before = history();
+		failHistoryCommit();
+		const result = await execution(plan).whenSettled;
+		expect(result.status).toBe("partial");
+		expect(result.historyCommitted).toBe(false);
+		expect(history()).toBe(before);
+		for (const path of [a, b]) expect(await fs.readFile(path, "utf8")).toBe("original");
+	});
+	test("terminal retry reports prior outcomes without writing again", async () => {
+		const { a, b, plan } = await twoFiles();
+		await fs.writeFile(b, "external edit");
+		expect((await execution(plan).whenSettled).status).toBe("partial");
+		await fs.writeFile(a, "later user work");
+		setFileHook(() => {
+			throw new Error("replay must not authorize target IO");
+		});
+		const replay = await execution(plan).whenSettled;
+		expect(replay.files.map((file) => file.status)).toEqual(["applied", "conflict"]);
+		expect(await fs.readFile(a, "utf8")).toBe("later user work");
+	});
+	test("archived scope health and recovery flags cannot block a fresh plan", async () => {
+		const path = join(workspace, "legacy.txt");
+		await fs.writeFile(path, "before");
+		await write(path, "after");
+		db.update(schema.fileChangeScopes)
+			.set({ status: "needs_verification", activeLeaseId: "old-owner", activeMutationCount: 1 })
+			.run();
+		const plan = await prepare({ kind: "revert" });
+		expect((await execution(plan).whenSettled).status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("before");
+	});
+	test("changed message version rejects before file dispatch", async () => {
+		const { a, plan } = await twoFiles();
+		db.update(schema.narrators)
+			.set({ messageVersion: 8 })
+			.where(eq(schema.narrators.id, "narrator"))
+			.run();
+		await expect(execution(plan).whenSettled).rejects.toThrow();
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+		expect(operation(plan)?.status).toBe("prepared");
+	});
+	test("concurrent duplicate returns current file results while the first attempt runs", async () => {
+		const { b, plan } = await twoFiles();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let waiting = true;
+		setFileHook(async (path) => {
+			if (path === b && waiting) {
+				waiting = false;
+				entered.resolve();
+				await release.promise;
+			}
+		});
+		const first = execution(plan);
+		await entered.promise;
+		try {
+			const duplicate = await execution(plan).whenSettled;
+			expect(duplicate.status).toBe("executing");
+			expect(duplicate.settling).toBe(true);
+			expect(duplicate.files[0].status).toBe("applied");
+			expect(duplicate.historyCommitted).toBe(false);
+		} finally {
+			release.resolve();
+		}
+		expect((await first.whenSettled).status).toBe("committed");
+		const replay = await execution(plan).whenSettled;
+		expect(replay.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+		expect(replay.status).toBe("committed");
+		expect(replay.settling).toBe(false);
+	});
+
+	test("lost-result pending attempt is read-only after a new service request", async () => {
+		const { a, plan } = await twoFiles();
+		db.update(schema.revertOperations)
+			.set({ status: "applying" })
+			.where(eq(schema.revertOperations.id, plan.id))
+			.run();
+		db.update(schema.revertOperationFiles)
+			.set({ status: "applying" })
+			.where(eq(schema.revertOperationFiles.id, journalFiles(plan)[0].id))
+			.run();
+		const result = await execution(plan).whenSettled;
+		expect(result.files[0].status).toBe("unknown");
+		expect(result.historyCommitted).toBe(false);
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+	});
 });

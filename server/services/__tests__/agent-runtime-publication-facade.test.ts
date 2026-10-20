@@ -78,7 +78,11 @@ test("every database operation fails closed with a precise error", () => {
 	const run = { producerKind: "bash" as const, taskId: "t", logicalRunId: "r", recipientId: "p" };
 	const invocations: Record<string, () => unknown> = {
 		store: () => facade.store,
-		startAgentRun: () => facade.startAgentRun({ narratorId: "n", parentNarratorId: "p" }),
+		startRun: () =>
+			facade.startRun({
+				narratorId: "n",
+				binding: { deliverTo: { narratorId: "p", toolUseId: "test-tool-use" } },
+			}).publication!,
 		getAgentRun: () => facade.getAgentRun("n", "p"),
 		newBashRun: () => facade.newBashRun("t", "p"),
 		reserve: () => facade.reserve(run, undefined as never),

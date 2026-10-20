@@ -362,7 +362,7 @@ async function journal(
 
 	// Claim + deliver through the injection consumer: message + ref + mailbox flip in one
 	// materialize section, broadcast after commit.
-	const sendOwner = tryClaimExecution("pgc-main", "primary");
+	const sendOwner = tryClaimExecution("pgc-main", "run");
 	if (!sendOwner) throw new Error("owner missing");
 	const agentRow = await inbox.claimInboxHead("pgc-main", (c) => c.kind === "agent_message");
 	if (!agentRow) throw new Error("agent message not claimed");
@@ -427,7 +427,7 @@ async function journal(
 		projectedByteSize: Buffer.byteLength("retry me"),
 	});
 	if (!("delivery" in failEnqueued)) throw new Error("user input not accepted");
-	const failOwner = tryClaimExecution("pgc-main", "primary");
+	const failOwner = tryClaimExecution("pgc-main", "run");
 	if (!failOwner) throw new Error("owner missing");
 	const failRow = await inbox.claimInboxHead("pgc-main", (c) => c.id === failEnqueued.delivery.id);
 	if (!failRow) throw new Error("row not claimed");
@@ -500,7 +500,7 @@ async function journal(
 	expect(await inbox.hasWakeEligibleInboxInput("pgc-broadcast")).toBe(false);
 	expect(await inbox.wakeInboxIfEligible("pgc-broadcast")).toBe(false);
 	// The same broadcast remains claimable by an already-running owner.
-	const broadcastOwner = tryClaimExecution("pgc-broadcast", "primary");
+	const broadcastOwner = tryClaimExecution("pgc-broadcast", "run");
 	if (!broadcastOwner) throw new Error("broadcast owner missing");
 	const broadcastClaim = await inbox.claimInboxHead("pgc-broadcast", () => true);
 	expect(broadcastClaim?.id).toBe(broadcast.delivery.id);
@@ -534,7 +534,7 @@ async function journal(
 
 	// ── 5. Wake eligibility: named PG reads only; ineligible cases never touch SQLite ──
 	// (a) A mounted execution owner declines before any queue read beyond the barrier.
-	const heldOwner = tryClaimExecution("pgc-owned", "primary");
+	const heldOwner = tryClaimExecution("pgc-owned", "run");
 	if (!heldOwner) throw new Error("owner missing");
 	expect(await inbox.wakeInboxIfEligible("pgc-owned")).toBe(false);
 	heldOwner.release();

@@ -16,6 +16,7 @@ import {
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
+	codexUpdateCredentialSchema,
 	codexUseImageGenerationSchema,
 	codexUseWebSearchSchema,
 	codexUseWebSocketSchema,
@@ -508,14 +509,15 @@ codexRoutes.get("/credentials/:id/usage-stats", (c) => {
 
 /**
  * PATCH /api/codex/credentials/:id
- * Update credential fields (displayName, priority).
+ * Update credential fields (displayName, priority, useCreditQuota).
  */
 codexRoutes.patch("/credentials/:id", async (c) => {
 	const id = c.req.param("id");
-	const body = (await c.req.json().catch(() => ({}))) as {
-		displayName?: string;
-		priority?: number;
-	};
+	const parsed = codexUpdateCredentialSchema.safeParse(await c.req.json().catch(() => null));
+	if (!parsed.success) {
+		return c.json({ error: "Invalid Codex credential update" }, 400);
+	}
+	const body = parsed.data;
 	const manager = getCodexManager();
 	try {
 		manager.updateCredential(id, body);

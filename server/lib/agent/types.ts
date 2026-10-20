@@ -1151,7 +1151,7 @@ export interface AgentConfig {
 		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
 		claimed: boolean,
 	) => Promise<void>;
-	/** Host evidence persistence (not an observer): failures must reject execution. */
+	/** Optional host no-dispatch history; failures preserve the actual tool outcome. */
 	recordToolNoDispatch?: (
 		ctx: ToolContext,
 		toolName: "Write" | "Edit" | "StructSed",

@@ -15,6 +15,7 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -33,6 +34,8 @@ afterEach(() => {
 });
 
 const PARENT = "team-parent";
+/** Delegated rows store their creator as controller; team membership is read from it. */
+const MEMBER = { runtimeRegistrationJson: delegationRegistration(PARENT, "general") };
 
 async function seedParent(): Promise<void> {
 	const now = new Date().toISOString();
@@ -55,6 +58,7 @@ async function seedSubagent(opts: {
 		type: "subagent",
 		variant: "subagent:general",
 		parentNarratorId: PARENT,
+		...MEMBER,
 		status: opts.status ?? "idle",
 		title: opts.title ?? `sub ${opts.id}`,
 		traits: opts.traits ?? [],
@@ -103,6 +107,7 @@ describe("listSubagentsForBroadcast", () => {
 					type: "subagent" as const,
 					variant: "subagent:general",
 					parentNarratorId: PARENT,
+					...MEMBER,
 					status: "idle" as const,
 					createdAt: isoAt(0),
 					updatedAt: isoAt(0),
@@ -332,6 +337,7 @@ describe("listSubagentsForTeamView", () => {
 			type: "subagent",
 			variant: "subagent:general",
 			parentNarratorId: "other-parent",
+			runtimeRegistrationJson: delegationRegistration("other-parent", "general"),
 			status: "working",
 			createdAt: now,
 			updatedAt: now,
@@ -393,9 +399,9 @@ describe("listTeamBashTasks", () => {
 		await seedSubagent({ id: "agent-sub", createdAt: isoAt(0), status: "working" });
 		await backgroundTaskService.createAgentTask({
 			id: "agent-sub",
-			parentNarratorId: PARENT,
 			subagentNarratorId: "agent-sub",
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await seedBashTask({ id: "bash-1", createdAt: isoAt(1) });
 

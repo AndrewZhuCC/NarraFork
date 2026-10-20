@@ -399,6 +399,21 @@ export function useVListLabels(): VListLabels {
 			communicationReceiptLegacy: t("communicationReceiptLegacy"),
 			communicationReceiptUnavailable: t("communicationReceiptUnavailable"),
 			communicationReceiptError: t("communicationReceiptError"),
+			// Fixed sentences a communication result reports by code (`warningCodes`), plus
+			// the narrator status words the send warning interpolates: these are the
+			// `status_*` entries this namespace already carries (the mention popover reads
+			// the same ones, so a status word is never translated twice).
+			communicationWarning_broadcastWorkingOnly: t("communicationWarning_broadcastWorkingOnly"),
+			communicationWarning_broadcastCancelled: t("communicationWarning_broadcastCancelled"),
+			// The status word is resolved at paint time (same literal-placeholder trick as
+			// COUNT_PLACEHOLDER), so the adapter substitutes `{status}` with the target's
+			// own `status_*` translation instead of a second copy of the wording.
+			communicationWarning_sendTargetNotWorking: t("communicationWarning_sendTargetNotWorking", {
+				status: "{status}",
+			}),
+			status_idle: t("status_idle"),
+			status_waiting: t("status_waiting"),
+			status_archived: t("status_archived"),
 			contextAskOutputChars: t("contextAskOutputChars", { count: COUNT_PLACEHOLDER }),
 			contextAskQuestions: t("contextAskQuestions", { count: COUNT_PLACEHOLDER }),
 			contextAskStatusSummary: t("contextAskStatusSummary"),

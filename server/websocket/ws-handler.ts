@@ -157,8 +157,8 @@ export function resolveWSData(
 			userRole: userInfo?.role,
 			...(publicShare ? { publicShare } : {}),
 			sessionExp: sessionAuth?.sessionExp,
-			sessionUserId: sessionAuth?.sessionUserId,
 			sessionTokenVersion: sessionAuth?.sessionTokenVersion,
+			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}
 	if (url.pathname === "/ws/terminal" || url.pathname.startsWith("/ws/terminal?")) {
@@ -168,6 +168,7 @@ export function resolveWSData(
 			lastPongAt: Date.now(),
 			subscribedTerminals: new Set(),
 			sessionExp: sessionAuth?.sessionExp,
+			sessionTokenVersion: sessionAuth?.sessionTokenVersion,
 			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}

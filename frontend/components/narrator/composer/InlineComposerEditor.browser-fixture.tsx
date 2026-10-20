@@ -60,6 +60,7 @@ let externalDocument: (document: ComposerDocument) => void;
 let toggleCandidate: (show: boolean) => void;
 let updateResources: (resources: ReadonlyMap<string, File | string>) => void;
 let toggleDisabled: (disabled: boolean) => void;
+let toggleHydrating: (hydrating: boolean) => void;
 let changes = 0;
 let sends = 0;
 let accepted = 0;
@@ -81,6 +82,8 @@ function Fixture() {
 	const [value, setValue] = useState(initial);
 	const [show, setShow] = useState(false);
 	const [disabled, setDisabled] = useState(false);
+	const [hydrating, setHydrating] = useState(false);
+	toggleHydrating = setHydrating;
 	const [resources, setResources] = useState<ReadonlyMap<string, File | string>>(new Map());
 	externalDocument = setValue;
 	toggleCandidate = setShow;
@@ -118,6 +121,7 @@ function Fixture() {
 								setValue(document);
 							}}
 							resources={resources}
+							attachmentsHydrating={hydrating}
 							disabled={disabled}
 							adaptive={location.search.includes("adaptive")}
 							placeholder={new URLSearchParams(location.search).get("placeholder") ?? "Message"}
@@ -148,6 +152,8 @@ function Fixture() {
 								document.getElementById("comment-input")?.focus();
 							}}
 							onOpenImage={() => opened++}
+							onOpenFile={() => opened++}
+							onOpenAttachment={() => opened++}
 							onPasteFiles={(files) => {
 								pasteCalls++;
 								pasted = files.map((file) => file.name);
@@ -208,6 +214,9 @@ export function showCandidate(show: boolean) {
 }
 export function disable(disabled: boolean) {
 	toggleDisabled(disabled);
+}
+export function hydrating(value: boolean) {
+	toggleHydrating(value);
 }
 export function resources(entries: [string, string][]) {
 	updateResources(new Map(entries));

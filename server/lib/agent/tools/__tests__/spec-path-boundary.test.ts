@@ -39,7 +39,8 @@ mock.module("../../../../services/file-change-runtime", () => ({
 				preview: dispatchControl,
 				suppressEvidence: dispatchControl,
 			}),
-	registerLocalBashActivity: scope,
+	boundedFileHistory: scope,
+	fileWriteOutcomeMetadata: () => ({}),
 	FileNoDispatchEvidenceError: class extends Error {},
 }));
 mock.module("../../../../services/file-snapshot-service", () => ({ ensureFileSnapshot: scope }));

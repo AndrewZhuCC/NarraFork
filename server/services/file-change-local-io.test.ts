@@ -247,8 +247,7 @@ describe("local file phase diagnostics (real IO)", () => {
 			expect(snapshot).toMatchObject({ version: 1, failures: [], droppedFailures: 0 });
 			expect(snapshot.phases.map(({ stage }) => stage)).toEqual([
 				"io_validate",
-				"io_read_before",
-				...(initial === null ? (["io_prepare_parents"] as const) : []),
+				...(initial === null ? (["io_read_before", "io_prepare_parents"] as const) : []),
 				"io_open",
 				...(initial === null ? [] : (["io_read_descriptor"] as const)),
 				"io_validate_before_mutation",
@@ -415,7 +414,7 @@ describe("local file phase diagnostics (real IO)", () => {
 			const timeoutSpy = spyOn(AbortSignal, "timeout");
 			let reads = 0;
 			const readSpy = spyOn(io, "read").mockImplementation(async (path, signal) => {
-				if (++reads === 2) {
+				if (++reads === 1) {
 					expect(signal).toBeInstanceOf(AbortSignal);
 					expect(signal).not.toBe(controller.signal);
 					await originalRead(path, signal);
@@ -427,7 +426,7 @@ describe("local file phase diagnostics (real IO)", () => {
 				const result = await io.apply(input);
 				expect(result.kind).toBe("target_mutation_unknown");
 				expect(result.error).toBe(error);
-				expect(reads).toBe(2);
+				expect(reads).toBe(1);
 				expect(timeoutSpy).toHaveBeenCalledWith(5_000);
 				expect(await readFile(input.canonicalPath, "utf8")).toBe("replacement");
 				const snapshot = diagnostics.snapshot();
@@ -806,7 +805,7 @@ describe("controlled syscall stage evidence", () => {
 		f.setHook((event) => {
 			if (event === "mkdir:/spec") f.dirs.add("/spec");
 		});
-		expect(await f.io.apply(f.input)).toEqual({
+		expect(await f.io.apply(f.input)).toMatchObject({
 			kind: "applied",
 			error: null,
 			parentEffects: { createdPaths: ["/spec/nested"], possiblePaths: [] },
@@ -987,9 +986,38 @@ function statFixture(birthtimeNs: bigint): BigIntStats {
 }
 
 describe("local object incarnation identity", () => {
-	test.each([0n, -1n])("rejects unavailable creation time %s even with dev/ino", (birthtimeNs) => {
-		expect(() => localObjectIdentity(statFixture(birthtimeNs))).toThrow(LocalFileValidationError);
-		expect(() => localObjectIdentity(statFixture(birthtimeNs))).toThrow("valid creation time");
+	test("real descriptor IO works without a filesystem creation timestamp", async () => {
+		await withFile("original", async (input) => {
+			const withoutBirthtime = (stat: BigIntStats): BigIntStats =>
+				Object.assign(Object.create(stat), { birthtimeNs: 0n });
+			const io = createFileChangeLocalIo({
+				lstat: async (...args) => withoutBirthtime(await lstat(...args)),
+				mkdir,
+				async open(...args) {
+					const file = await open(...args);
+					return {
+						stat: async (options) => withoutBirthtime(await file.stat(options)),
+						read: (buffer, offset, length, position) => file.read(buffer, offset, length, position),
+						write: (buffer, offset, length, position) =>
+							file.write(buffer, offset, length, position),
+						truncate: (length) => file.truncate(length),
+						sync: () => file.sync(),
+						close: () => file.close(),
+					};
+				},
+			});
+			input.before = await io.read(input.canonicalPath);
+			const result = await io.apply(input);
+			expect(result.kind).toBe("applied");
+			expect(result.observedAfter?.bytes).toEqual(input.nextBytes);
+			expect(await readFile(input.canonicalPath, "utf8")).toBe("replacement");
+		});
+	});
+	test.each([
+		0n,
+		-1n,
+	])("uses operation-local dev/ino when creation time is unavailable (%s)", (birthtimeNs) => {
+		expect(localObjectIdentity(statFixture(birthtimeNs))).toBe("7:23:0");
 	});
 
 	test("positive creation times distinguish reused device/inode pairs", () => {
@@ -1003,8 +1031,8 @@ describe("local object incarnation identity", () => {
 		expect(localObjectIdentity(changed)).not.toBe(localObjectIdentity(initial));
 	});
 
-	test("creation time does not replace a missing device/inode identity", () => {
+	test("a filesystem without inode identity remains usable with content/version checks", () => {
 		const stat = { ...statFixture(101n), dev: 0n, ino: 0n };
-		expect(() => localObjectIdentity(stat)).toThrow("does not expose an object identity");
+		expect(localObjectIdentity(stat)).toBe("0:0:101");
 	});
 });

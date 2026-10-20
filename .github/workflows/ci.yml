@@ -132,7 +132,7 @@ jobs:
       - name: Install test system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes zstd podman git ripgrep
+          sudo apt-get install --yes zstd podman git ripgrep acl python3
           command -v zstd
           zstd --version
           command -v podman
@@ -148,13 +148,32 @@ jobs:
           podman info
           podman pull docker.io/library/postgres:17-alpine
           podman image inspect docker.io/library/postgres:17-alpine
-      - name: Locate and verify Chrome
+      - name: Install and verify pinned Chrome
         run: |
-          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)"
-          test -n "$CHROME_PATH"
-          "$CHROME_PATH" --version
-          printf 'NF_TEST_CHROMIUM_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
-          printf 'PUPPETEER_EXECUTABLE_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+          bun --eval '
+            import { Browser, install } from "@puppeteer/browsers";
+            import { spawnSync } from "node:child_process";
+            import { appendFileSync } from "node:fs";
+            import { join } from "node:path";
+            const buildId = "146.0.7680.31";
+            const temp = process.env.RUNNER_TEMP;
+            const environmentFile = process.env.GITHUB_ENV;
+            if (!temp || !environmentFile) throw new Error("Chrome installation requires runner paths");
+            const { executablePath } = await install({
+              browser: Browser.CHROME,
+              buildId,
+              cacheDir: join(temp, "narrafork-ci-chrome"),
+              baseUrl: "https://storage.googleapis.com/chrome-for-testing-public",
+            });
+            const version = spawnSync(executablePath, ["--version"], {
+              encoding: "utf8", timeout: 15000, maxBuffer: 4096,
+            });
+            if (version.error || version.status !== 0) throw new Error("Chrome version command failed", { cause: version.error });
+            const expectedVersion = `Google Chrome for Testing ${buildId}`;
+            if (version.stdout.trim() !== expectedVersion) throw new Error(`Expected ${expectedVersion}; received ${version.stdout.trim()}`);
+            console.log(version.stdout.trim());
+            appendFileSync(environmentFile, `NF_TEST_CHROMIUM_PATH=${executablePath}\nPUPPETEER_EXECUTABLE_PATH=${executablePath}\n`);
+          '
       - name: Probe headless Chrome
         run: |
           bun --eval '
@@ -169,6 +188,7 @@ jobs:
               const client = await browser.target().createCDPSession();
               try {
                 const version = await client.send("Browser.getVersion");
+                if (!/^(?:Chrome|HeadlessChrome)\/146\.0\.7680\.31$/.test(version.product)) throw new Error("Headless Chrome build mismatch");
                 const { categories } = await client.send("Tracing.getCategories");
                 const required = ["devtools.timeline", "v8", "disabled-by-default-v8.gc", "blink.user_timing"];
                 console.log(JSON.stringify({
@@ -185,6 +205,8 @@ jobs:
               await browser.close();
             }
           '
+      - name: Prepare controlled native editor fixture
+        run: bun scripts/build-editor-test-helper.ts
       - name: Verify test preload isolation
         run: bun test --isolate tests/preload-isolation.test.ts
       - name: Run repository tests

@@ -33,6 +33,12 @@ import type {
 	DirectoryWhitelistRuleInput,
 	RuleTargetSelector,
 } from "../lib/api/types";
+import {
+	formatRevertFailure,
+	formatRevertSuccessWarning,
+	invalidateRevertQueries,
+	isRevertHistoryCommitted,
+} from "../lib/revert-result";
 import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
@@ -132,25 +138,6 @@ export function useRollbackPreview(
 	});
 }
 
-/**
- * What editing a user message and regenerating would roll back.
- *
- * Prefetched as soon as the editor opens, so the submit handler already knows
- * whether there is anything to confirm rather than deciding after the fact.
- */
-export function useEditRegeneratePreview(
-	narratorId: string,
-	messageId: string | null,
-	enabled = false,
-) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "edit-regenerate-preview", messageId],
-		queryFn: () => api.getEditRegeneratePreview(narratorId, messageId as string),
-		enabled: enabled && !!messageId,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
 /** What deleting one tool_use block would roll back, for its confirm dialog. */
 export function useBlockDeletePreview(
 	narratorId: string,
@@ -214,7 +201,8 @@ function validPlanFile(file: RevertPlanFile): boolean {
 		boundedText(identity?.lexicalPath) &&
 		boundedText(identity?.canonicalPath) &&
 		knownState(file?.expectedStateJson?.kind) &&
-		knownState(file?.desiredStateJson?.kind)
+		(knownState(file?.desiredStateJson?.kind) ||
+			(file?.desiredStateJson?.kind === "unknown" && boundedText(file.desiredStateJson.reason)))
 	);
 }
 
@@ -329,6 +317,7 @@ export function useRevertActionPreview(
 				);
 				const expectedKind = {
 					rollback_to_block: "rollback_to_block",
+					edit_and_regenerate: "rollback_to_block",
 					delete_tool_block: "history_delete",
 					revert_files: "revert",
 				}[request.action];
@@ -339,7 +328,7 @@ export function useRevertActionPreview(
 					typeof plan.planHash !== "string" ||
 					!plan.planHash ||
 					plan.kind !== expectedKind ||
-					plan.coverageComplete !== true
+					typeof plan.coverageComplete !== "boolean"
 				) {
 					update({ loading: false, issue: "not_prepared" });
 					return;
@@ -438,6 +427,7 @@ export function useRevertActionPreview(
 			deviceId: file.identityJson.deviceId,
 			filePath: file.identityJson.displayPath,
 			willBeDeleted: file.desiredStateJson.kind === "absent",
+			unavailable: file.desiredStateJson.kind === "unknown",
 		}));
 		const issue = revoked ? "reload_required" : current?.issue;
 		return {
@@ -516,9 +506,7 @@ export function useRevertHistoryAction(narratorId: string) {
 						? await api.rollbackToBlock(narratorId, target.messageId, target.blockIndex, {
 								skipRevert: true,
 							})
-						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex, {
-								skipRevert: true,
-							});
+						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex);
 				if (result.ok !== true) throw new Error(t("deleteMessageFailedDesc"));
 				return { reason: null };
 			}
@@ -527,54 +515,33 @@ export function useRevertHistoryAction(narratorId: string) {
 				throw new Error(t("revertPlanReloadRequired"));
 			}
 			const result = await api.applyRevertPlan(narratorId, plan);
-			if (
-				result.planId !== plan.planId ||
-				result.status !== "committed" ||
-				result.journalStatus !== "committed" ||
-				result.settling !== false
-			) {
+			if (result.planId !== plan.planId || !isRevertHistoryCommitted(result)) {
 				throw new ApiError(result.reason ?? t("revertPlanApplyFailed"), 409, { ...result });
 			}
 			return result;
 		},
 		onSuccess: (result) => {
-			if (result.reason) {
+			const warning = formatRevertSuccessWarning(t, result);
+			if (warning) {
 				notifications.show({
 					title: t("rollbackPartialTitle"),
-					message: result.reason,
+					message: warning,
 					color: "yellow",
 					autoClose: false,
 				});
 			}
 		},
 		onError: (error, { opts }) => {
-			const status = error instanceof ApiError ? error.data?.status : undefined;
-			const settling = error instanceof ApiError && error.data?.settling === true;
-			const reloadRequired =
-				error instanceof ApiError && error.data?.code === "REVERT_RUNTIME_RELOAD_REQUIRED";
-			const explanation = opts.skipRevert
-				? t("deleteMessageFailedDesc")
-				: reloadRequired
-					? t("revertScopeRuntimeReloadRequired")
-					: settling
-						? t("revertPlanSettling")
-						: status === "recovery_required"
-							? t("revertPlanRecoveryRequired")
-							: status === "compensated"
-								? t("revertPlanCompensated")
-								: t("revertPlanApplyFailed");
 			notifications.show({
 				title: t(opts.skipRevert ? "deleteMessageFailed" : "rollbackFailed"),
-				message: `${explanation}\n${error.message}`,
+				message: formatRevertFailure(t, error, { skipRevert: opts.skipRevert }),
 				color: "red",
 				autoClose: false,
 			});
 		},
 		onSettled: () => {
-			// A lost response or a compensated result can still change what is visible.
-			for (const resource of ["messages", "file-tree-status", "tool-calls"]) {
-				void qc.invalidateQueries({ queryKey: ["narrators", narratorId, resource] });
-			}
+			// Applied and unknown outcomes both invalidate files, including lost responses.
+			invalidateRevertQueries(qc, narratorId);
 		},
 	});
 }

@@ -17,6 +17,7 @@ import { act, type ComponentProps, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { api, type BufferMessageSummary } from "../../../lib/api";
+import type { RevertActionPreview } from "../../../lib/api/narrators";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
 import { ImageViewerContext } from "../../common/image-viewer-context";
@@ -193,6 +194,7 @@ function editor(overrides: Partial<MessageEditorPanelProps> = {}) {
 		<MessageEditorPanel
 			messageRole="user"
 			messageId="message"
+			narratorId="narrator"
 			blocks={[
 				{ type: "file_reference", reference, snapshotText: "must not reach edit payload" },
 				{ type: "file_reference", reference: secondReference },
@@ -220,12 +222,29 @@ beforeEach(async () => {
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
-	// The query is disabled without a narratorId; seed the no-op preview so the
-	// submit tests cannot accidentally send a request or open a rollback dialog.
-	qc.setQueryData(["narrators", "", "edit-regenerate-preview", "message"], {
-		affectedFiles: [],
-		deletedMessageCount: 0,
-	});
+	// A reviewed plan that restores nothing and removes no later messages: submit
+	// tests go straight through without a rollback dialog.
+	spyOn(api, "previewRevertAction").mockImplementation(async (_narratorId, input) => ({
+		action: input.action,
+		executable: false,
+		historySummary: { deletedMessageCount: 0, deletedBlockCount: 0 },
+		plan: {
+			id: "noop-plan",
+			planHash: "noop-hash",
+			status: "prepared",
+			coverageComplete: true,
+			expectedFileCount: 0,
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			expired: false,
+			kind: "rollback_to_block",
+		} as RevertActionPreview["plan"],
+	}));
+	spyOn(api, "getRevertPlanFiles").mockResolvedValue({
+		items: [],
+		hasMore: false,
+		nextCursor: null,
+		executable: false,
+	} as Awaited<ReturnType<typeof api.getRevertPlanFiles>>);
 	registered = null;
 	host = document.createElement("div");
 	document.body.appendChild(host);
@@ -606,6 +625,45 @@ describe("message reference attachment editor", () => {
 		await click(button(en.editSubmit));
 		expect(save.mock.calls[0][3]?.fileReferences).toEqual([]);
 	});
+
+	test.each([
+		["a plan that restores files", 1, 0],
+		["later messages that would be removed", 0, 2],
+	])("%s still asks for confirmation instead of submitting", async (_case, fileCount, messageCount) => {
+		spyOn(api, "previewRevertAction").mockImplementation(async (_narratorId, input) => ({
+			action: input.action,
+			executable: false,
+			historySummary: { deletedMessageCount: messageCount, deletedBlockCount: messageCount },
+			plan: {
+				id: "real-plan",
+				planHash: "real-hash",
+				status: "prepared",
+				coverageComplete: true,
+				expectedFileCount: fileCount,
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				expired: false,
+				kind: "rollback_to_block",
+			} as RevertActionPreview["plan"],
+		}));
+		spyOn(api, "getRevertPlanFiles").mockResolvedValue({
+			items: Array.from({ length: fileCount }, (_, index) => ({
+				fileKey: `file-${index}`,
+				identityJson: { deviceId: "local", displayPath: `/work/f${index}.ts` },
+				desiredStateJson: { kind: "present" },
+			})),
+			hasMore: false,
+			nextCursor: null,
+			executable: false,
+		} as unknown as Awaited<ReturnType<typeof api.getRevertPlanFiles>>);
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(editor({ initialText: "keep text", onEditAndRegenerate: save }));
+		await click(button(en.editSubmit));
+		expect(save).not.toHaveBeenCalled();
+		expect(document.body.textContent).toContain(en.editRevertConfirmTitle);
+	});
 });
 
 describe("structured edit layout details", () => {
@@ -684,6 +742,44 @@ describe("structured edit layout details", () => {
 			composerDocumentText(layout).fileReferences,
 		);
 		expect(load).toHaveBeenCalledTimes(1);
+	});
+	test("fullscreen edit Enter only newlines; ctrl+Enter still submits", async () => {
+		spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("image", { headers: { "content-type": "image/png" } }),
+		);
+		spyOn(api, "getMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [
+				{
+					imageId: "server-image",
+					filename: "image.png",
+					mediaType: "image/png",
+					size: 3,
+					uploadNarratorId: owner,
+				},
+			],
+			textFiles: [],
+		});
+		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
+			affectedFiles: [],
+			deletedMessageCount: 0,
+		});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(
+			editor({ narratorId: owner, initialText: "stale legacy body", onEditAndRegenerate: save }),
+		);
+		const expand = document.querySelector(".tabler-icon-arrows-maximize")?.closest("button");
+		if (!expand) throw new Error("Fullscreen action missing");
+		await click(expand);
+		// 全屏编辑:Enter(无论是否按 Shift)只换行,不提交。
+		await editorKey("Enter");
+		expect(save).not.toHaveBeenCalled();
+		// mod+Enter 仍然提交。
+		await editorKey("Enter", true);
+		expect(save).toHaveBeenCalledTimes(1);
 	});
 	test("queued detail uses its own endpoint and forwards the unchanged layout with kept resources", async () => {
 		spyOn(globalThis, "fetch").mockResolvedValue(
@@ -1559,7 +1655,8 @@ describe("real queued panel composition", () => {
 			expect(host?.textContent).toContain("draft.txt");
 			await editorKey("Enter");
 			expect(save).toHaveBeenCalledTimes(1);
-			expect(save.mock.calls[0][1]).toBe("Unsaved body");
+			// Attachments inserted after the body keep their position as placeholders.
+			expect(save.mock.calls[0][1]).toBe("Unsaved body[image #1: draft.gif][file #1: draft.txt]");
 			expect(save.mock.calls[0][2].newImages).toEqual([image]);
 			expect(save.mock.calls[0][2].newTextFiles).toEqual([textFile]);
 			// Attachments and text now share native history: first undo removes the

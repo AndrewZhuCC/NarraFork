@@ -221,6 +221,13 @@ export function useAllModels() {
 	// settings (which carry the NUG model list + `available` flags) so the picker
 	// reflects recovery/outage live.
 	useEffect(() => {
+		if (settingsData?.commandcodeModelsPending !== true) return;
+		const timer = setTimeout(() => {
+			void qc.invalidateQueries({ queryKey: ["settings"] });
+		}, 1_500);
+		return () => clearTimeout(timer);
+	}, [settingsData?.commandcodeModelsPending, qc]);
+	useEffect(() => {
 		const onAvailabilityChanged = () => {
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		};
@@ -516,6 +523,17 @@ export function useAllModels() {
 				}))
 			: [];
 
+		// --- Command Code models (fetched from the Provider API, cached server-side) ---
+		const commandcodeModelIds: string[] = settingsData?.commandcodeModels ?? [];
+		const commandcodeModels: ModelOption[] = settingsData?.commandcodeAvailable
+			? commandcodeModelIds.map((id) => ({
+					value: modelValue("CommandCode", id),
+					label: id,
+					provider: "CommandCode",
+					bareModel: id,
+				}))
+			: [];
+
 		// --- Plugin provider models (from the host provider registry) ---
 		// Values are already `prefix:modelId`. Models from a disabled plugin arrive with
 		// `available: false` so the picker can show them as temporarily unusable rather
@@ -619,6 +637,7 @@ export function useAllModels() {
 				})),
 			);
 		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
+		if (commandcodeModels.length > 0) addGroup("CommandCode", commandcodeModels, "CommandCode");
 		// Executable-plugin providers, after every builtin so a plugin never reorders
 		// the familiar provider list. Each group already carries fully-prefixed values.
 		for (const group of pluginProviderGroups) {
@@ -816,6 +835,7 @@ export function useAllModels() {
 			aggregations,
 			/** Codex models only. */
 			codexModels,
+			commandcodeModels,
 			/** OpenAI models grouped by provider. */
 			openaiByProvider,
 			/** Anthropic models grouped by provider. */

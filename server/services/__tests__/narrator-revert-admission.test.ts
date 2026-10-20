@@ -9,6 +9,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
@@ -18,12 +19,12 @@ const state = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
 const compact = await import("../narrator-compact");
 const { deliverInjection } = await import("../narrator-injection");
-const { resumeSubagent } = await import("../subagent-resume");
 const runner = await import("../subagent-runner");
 const pipeline = await import("../../lib/agent/pipeline-state");
 const uploads = await import("../../lib/uploads");
 const { pushBufferedMessage } = await import("../narrator-buffer");
-const { getBackgroundAbortControllers } = await import("../subagent-detach");
+const ownership = await import("../agent-runtime/ownership");
+const { startNarratorRun } = await import("../agent-runtime/run");
 const executor = await import("../../lib/agent/tool-executor");
 const agent = await import("../../lib/agent");
 const { narratorPersistence } = await import("../narrator-persistence");
@@ -35,6 +36,7 @@ const ROOT = "revert-admission-root";
 const CHILD = "revert-admission-child";
 const OTHER = "revert-admission-unrelated";
 const pendingReleases: Array<() => void> = [];
+const runOwners: Array<{ release(): unknown }> = [];
 const rejection = { statusCode: 409, code: "NARRATOR_REVERT_IN_PROGRESS" };
 
 function deferred() {
@@ -91,6 +93,8 @@ beforeEach(() => {
 			type: "subagent",
 			variant: "subagent:general",
 			parentNarratorId: ROOT,
+			policySourceNarratorId: ROOT,
+			runtimeRegistrationJson: delegationRegistration(ROOT, "general"),
 			status: "idle",
 			createdAt: now,
 			updatedAt: now,
@@ -98,11 +102,18 @@ beforeEach(() => {
 		.run();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	// A test that releases admission may start an ordinary run (drained input, automatic
+	// continuation). Let it reach its terminal before the next test reuses these ids.
+	for (const id of [ROOT, CHILD]) {
+		const terminal = ownership.getRunControl(id)?.terminal;
+		if (terminal) await Promise.race([terminal, Bun.sleep(5_000)]);
+		await state.waitForNarratorAdmissionWork(id, AbortSignal.timeout(5_000)).catch(() => {});
+	}
 	db.delete(narratorBufferedMessages).run();
 	for (const release of pendingReleases.splice(0)) release();
 	state.activeNarrators.clear();
-	getBackgroundAbortControllers().clear();
+	for (const owner of runOwners.splice(0)) owner.release();
 	drainPendingInjections(ROOT);
 	mock.restore();
 });
@@ -111,32 +122,25 @@ afterAll(() => {
 	mock.module("../../db", () => realDb);
 });
 
-function childExecutionInput() {
-	return {
-		narratorId: CHILD,
-		subagentId: CHILD,
-		parentNarratorId: ROOT,
-		toolUseId: "tool",
-		subagentType: "general",
-		prompt: "input",
-		cwd: ".",
-		model: "test:model",
-		provider: "test",
-		locale: "en",
-		signal: new AbortController().signal,
-		systemPrompt: "test",
-		initialHistory: [] as unknown[],
-		customDef: null,
-	};
-}
-
 const blockedEntries: Array<[string, () => Promise<unknown>]> = [
-	["direct background runner", () => runner.executeBackgroundTask(childExecutionInput())],
+	// The one run service: every session's run, delegated or not, starts here.
 	[
-		"direct foreground runner",
-		() => {
-			const run = runner.startForegroundRun(childExecutionInput());
-			return Promise.all([run.foreground, run.terminal]);
+		"child run",
+		async () => {
+			const run = await startNarratorRun({ narratorId: CHILD, locale: "en", text: "input" });
+			return Promise.all([run.terminal, run.completion]);
+		},
+	],
+	[
+		"child run with result destination",
+		async () => {
+			const run = await startNarratorRun({
+				narratorId: CHILD,
+				locale: "en",
+				text: "input",
+				binding: { deliverTo: { narratorId: ROOT, toolUseId: "tool" } },
+			});
+			return Promise.all([run.terminal, run.completion]);
 		},
 	],
 	["ensure", () => session.ensureNarrator(ROOT, "en")],
@@ -169,10 +173,6 @@ const blockedEntries: Array<[string, () => Promise<unknown>]> = [
 	["partial cleanup", () => session.cleanupPartialMessage("message", ROOT)],
 	["partial finalization", () => session.finalizeOrCleanupPartialMessage("message", ROOT)],
 	["tool interruption cleanup", () => session.markInterruptedToolCallsForMessage(ROOT, "message")],
-	[
-		"taken-over background publication",
-		() => runner.finalizeTakenOverBackgroundSubagent(CHILD, ROOT, "tool", false, "done"),
-	],
 	["segment compact", () => compact.runSegmentCompact(ROOT, "en", ["message"])],
 	["history compact", () => compact.runCustomCompact(ROOT, "en")],
 	["plan compact", () => compact.runPlanCompact(ROOT, "plan")],
@@ -188,17 +188,8 @@ const blockedEntries: Array<[string, () => Promise<unknown>]> = [
 	],
 	["delete compact", () => narratorService.deleteCompactMessage(ROOT, "message")],
 	["edit compact", () => narratorService.updateCompactSummary(ROOT, "message", "replacement")],
-	[
-		"resume child",
-		() =>
-			resumeSubagent({
-				subagentId: CHILD,
-				intent: "follow_up",
-				actor: "user",
-				prompt: "child input",
-				locale: "en",
-			}),
-	],
+	["continue child", () => session.continueNarrator(CHILD)],
+	["message child", () => session.sendMessage(CHILD, "child input")],
 	[
 		"create child",
 		() =>
@@ -208,18 +199,6 @@ const blockedEntries: Array<[string, () => Promise<unknown>]> = [
 				subagentType: "general",
 				prompt: "child input",
 				cwd: ".",
-				signal: new AbortController().signal,
-				locale: "en",
-			}),
-	],
-	[
-		"continue child",
-		() =>
-			runner.startContinuedSubagent({
-				subagentId: CHILD,
-				parentNarratorId: ROOT,
-				toolUseId: "tool",
-				prompt: "child input",
 				signal: new AbortController().signal,
 				locale: "en",
 			}),
@@ -325,6 +304,7 @@ test("release drains preserved buffered input exactly once", async () => {
 	release();
 	await committed.promise;
 	await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
+
 	expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
 	expectMaterializedUserInput();
 	expect(
@@ -597,7 +577,7 @@ test("cancellation retries the real loop finalizer's consumed waiting-gate wakeu
 	});
 	const active = makeActive(false);
 	state.activeNarrators.set(ROOT, active);
-	const running = session.runAgentLoop(active, "");
+	const running = session.runAgentLoop(active, "", undefined, { principal: null });
 	await entered.promise;
 	await pushBufferedMessage(ROOT, "after refused finalizer wakeup");
 	const controller = new AbortController();
@@ -801,7 +781,7 @@ test("complete finally remains busy after _loopRunning and alive clear", async (
 	});
 	const active = makeActive(false);
 	state.activeNarrators.set(ROOT, active);
-	const running = session.runAgentLoop(active, "");
+	const running = session.runAgentLoop(active, "", undefined, { principal: null });
 	await entered.promise;
 	const controller = new AbortController();
 	let granted = false;
@@ -830,8 +810,17 @@ test("complete finally remains busy after _loopRunning and alive clear", async (
 test("interrupt waits for background child publication without changing parent normal busy", async () => {
 	const entered = deferred();
 	const publish = deferred();
+	// A background child run of this root: the revert must cancel the run itself.
+	const owner = ownership.tryClaimExecution(CHILD, "run");
+	if (!owner) throw new Error("Missing child run owner");
+	runOwners.push(owner);
 	const controller = new AbortController();
-	getBackgroundAbortControllers().set(CHILD, controller);
+	ownership.setRunControl(owner, {
+		startedAt: Date.now(),
+		cancel: controller,
+		timedOut: false,
+		terminal: new Promise(() => {}),
+	});
 	const work = state.withNarratorWorkAdmission(CHILD, async () => {
 		entered.resolve();
 		await publish.promise;
@@ -850,6 +839,9 @@ test("interrupt waits for background child publication without changing parent n
 	await work;
 	await exclusive;
 	expect((await db.select().from(narratorMessages))[0]?.contentText).toBe("child publication");
+	// This fixture installs a control without a run finalizer; its publication work
+	// has finished, so end the fixture owner before afterEach waits for real runs.
+	owner.release();
 });
 
 test("cancellation before acquisition releases only the waiting reservation", async () => {
@@ -898,29 +890,6 @@ test("already aborted requests leak no reservation; acquired lease ignores abort
 	nextRelease();
 	await deliverInjection(ROOT, { source: "test", content: "released" });
 	expect((await db.select().from(narratorMessages))[0]?.contentText).toBe("released");
-});
-
-test("legacy resume-to-edit and start-to-resume orders share one reentrant mutex", async () => {
-	const { withSubagentResumeLock } = await import("../subagent-resume");
-	const entered = deferred();
-	const proceed = deferred();
-	const order: string[] = [];
-	const legacy = withSubagentResumeLock(CHILD, async () => {
-		entered.resolve();
-		await proceed.promise;
-		await state.withNarratorStartAdmission(CHILD, async () => {
-			order.push("legacy/edit");
-		});
-	});
-	await entered.promise;
-	const resume = state.withNarratorStartAdmission(CHILD, () =>
-		withSubagentResumeLock(CHILD, async () => {
-			order.push("start/resume");
-		}),
-	);
-	proceed.resolve();
-	await Promise.all([legacy, resume]);
-	expect(order).toEqual(["legacy/edit", "start/resume"]);
 });
 
 test("an outer request's work lease does not make interruptAndWaitForIdle wait for itself", async () => {

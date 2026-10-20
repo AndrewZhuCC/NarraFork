@@ -418,6 +418,8 @@ describe("source-bound helper runtime", () => {
 	});
 });
 describe("executor build identity integration", () => {
+	// Deliberately differ from the current pin, including after future component bumps.
+	const devAppVersion = `${Number(EXECUTOR_RELEASE_VERSION.split(".")[0]) + 1}.0.0`;
 	function fixture(mode: string) {
 		const root = mkdtempSync(resolve(".narrafork/executor-build-identity-"));
 		const path = join(root, "fixture.ts");
@@ -432,7 +434,7 @@ const originalRead = fs.readFileSync;
 const mode = ${JSON.stringify(mode)};
 mock.module("node:fs", () => ({ ...fs,
  existsSync: (path) => String(path).endsWith("package.json") ? mode === "dev" : originalExists(path),
- readFileSync: (path, ...args) => String(path).endsWith("package.json") ? '{"version":"0.9.2"}' : originalRead(path, ...args),
+ readFileSync: (path, ...args) => String(path).endsWith("package.json") ? '${JSON.stringify({ version: devAppVersion })}' : originalRead(path, ...args),
 }));
 const { createHelperDistributionDependencies } = await import(${module("shared/helper-distribution.ts")});
 const declaration = mode === "legacy" ? undefined : mode === "malformed" ? {} : mode === "null" ? null :
@@ -491,15 +493,15 @@ try {
 			rmSync(root, { recursive: true, force: true });
 		}
 	}
-	// Dev reads the repository pin; compiled reads the build declaration (0.9.1 in the fixture).
-	for (const [mode, executor] of [
-		["dev", EXECUTOR_RELEASE_VERSION],
-		["compiled", "0.9.1"],
+	// Dev reads the repository pin; compiled reads its historical build declaration.
+	for (const [mode, app, executor] of [
+		["dev", devAppVersion, EXECUTOR_RELEASE_VERSION],
+		["compiled", "0.9.2", "0.9.1"],
 	] as const) {
-		test(`${mode} APP 0.9.2 fetches and generates install script for executor ${executor}`, () => {
+		test(`${mode} APP ${app} fetches and generates install script for independent executor ${executor}`, () => {
 			const result = fixture(mode);
 			expect(result.error).toBeUndefined();
-			expect(result.app).toBe("0.9.2");
+			expect(result.app).toBe(app);
 			expect(result.pin).toEqual({
 				version: executor,
 				protocolVersion: 1,
@@ -511,7 +513,7 @@ try {
 				`https://github.com/fork/identity-fixture/releases/download/executor-v${executor}/narrafork-executor-${executor}-linux-amd64`,
 			]);
 			expect(result.script).toContain(`Executor v${executor}`);
-			expect(result.script).not.toContain("Executor v0.9.2");
+			expect(result.script).not.toContain(`Executor v${app}`);
 		}, 20_000);
 	}
 	test("compiled historical declaration retains its own executor release, not today's pin", () => {

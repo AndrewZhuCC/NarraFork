@@ -361,6 +361,12 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 // takeover fallbacks never emit attention, so they can never leak an IM.
 
 eventBus.on("narrator:attention", (event) => {
+	// A turn that finished while its background work is still running is not
+	// worth an IM ping — the wake-up turn after the last background task
+	// completes emits a fresh, unflagged "done" which notifies normally. Hooks
+	// still observe the flagged event via the attention-hook-bridge.
+	// The reason check is defensive — the flag is only produced for done.
+	if (event.backgroundWorkActive && event.reason === "done") return;
 	handleAttention(event.narratorId, event.reason).catch((err) => {
 		logger.error("Notification handler error", {
 			narratorId: event.narratorId,

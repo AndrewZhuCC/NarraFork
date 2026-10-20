@@ -1,12 +1,12 @@
 # 全实例文件版本与会话回退设计
 
-状态：**主体已实现**（提交 `a78b5166` 起）。本文为设计基线；设计符号与实现名对照：`InstanceFileWriter` → `LocalFileChangeRuntime`（`server/services/file-change-runtime.ts`），`FileRestoreService` → `file-change-local-restore.ts` + revert 服务簇。§10–12 的改造/验收清单反映目标态，实施进度见 `evidenceVersion=2` 与相关服务。
+当前写入路径采用 **v3 操作结果 + 进程内单文件队列**：写入结果与历史可用性分别报告，旧 v2 记录保留读取。实现入口为 [server/services/file-change-runtime.ts](../server/services/file-change-runtime.ts) 和 [server/services/file-write-queue.ts](../server/services/file-write-queue.ts)。本文的 Bash 差量归档等扩展仍是设计基线；实际可恢复范围以预览为准。
 
 ## 1. 决策与约束
 
 核心只有一句话：**可控写入线性记账，符合条件的 Bash 捕获差量，回退恢复已保存版本，不确定项明确跳过。**
 
-1. 所有会话、子代理及设备的 Edit/Write 共用全实例日志顺序；成功写入必须有可恢复的原始内容。同一文件串行，不同文件不必互相等待。
+1. Edit/Write 按设备与规范路径串行读改写，不同文件并行；可用历史使用全实例日志顺序。历史存储异常产生本次缺口，实际写入结果独立报告。
 2. 只有短时、边界明确、整个捕获窗口没有其他 Bash 重叠的 Bash，才生成可回退的快照差量。
 3. 长时、并发、边界不明的 Bash 只产生缺口提示，不取消其他记录的回退资格。
 4. 恢复某个文件的历史版本，可以覆盖其他会话在该文件上的后续修改；一次预览讲清影响，由用户确认。
@@ -99,16 +99,16 @@ FileState = 不存在 | 原始文件内容引用及必要模式 | 链接对象�
 
 按 `(fileKey, journalSeq)` 建索引即可查最新版本和后续修改，不另建一套版本 HEAD 状态表。记录可恢复与工具业务执行成功是两件事，例如 Bash 非零退出但边界内确实改了文件，仍应保存版本。
 
-## 4. Edit/Write：先有恢复材料，再发生写入
+## 4. Edit/Write：按文件执行，独立记账
 
 全局序号覆盖所有操作；实际读改写窗口只在同一文件内串行，不覆盖模型请求、权限等待、交互确认和完整工具生命周期。
 
 ```text
 1. 取得写入队列位置，核对目标设备与权限。
 2. 读取真实 before，生成本次实际写入字节。
-3. 持久化 before、拟写入内容和操作记录，分配 journalSeq。
-4. 执行实际文件写入。
-5. 登记实际结果，完成版本记录，释放队列。
+3. 有界尝试保存原始内容和 journalSeq；历史失败标记本次缺口。
+4. 执行实际文件写入，取得实际结果并释放队列。
+5. 完成历史记账及通知，分别报告 diskOutcome 和 historyStatus。
 ```
 
 主要复用 [server/services/file-change-runtime.ts](../server/services/file-change-runtime.ts) 的原始字节保存和先记意图再执行流程，替换其按 workspace 排队及 Bash 连带降级语义。
@@ -116,25 +116,18 @@ FileState = 不存在 | 原始文件内容引用及必要模式 | 链接对象�
 ### 正常写入的保证
 
 - 多个 Edit/Write 从同一个实例入口分配全局序号；同一文件按文件队列串行，不同文件可以并行，不再有主/子代理、本地/远程的旁路。
-- 内置编辑器及其他平台可控文件写入也必须进入相同协调点；只有处于同一 Bash 捕获根的写入才需要暂时让出该捕获窗口。
+- 内置编辑器及其他平台可控文件写入进入同一单文件队列；Bash 捕获结果保持独立。
 - after 已知但后来被别的操作覆盖，历史版本仍可恢复。
-- 记录或原始内容保存失败时，本次受控写入不能先执行再悄悄降为“不可回退”。
+- 记录或原始内容保存失败时，明确展示本次历史缺口；已确认的写入结果保持原样。
 - 已开始写入后异常，保留 before 和执行状态；不能因为缺少最终工具消息就丢掉恢复材料。
 
-### 远程接入只补必要能力
+### 远程接入
 
-远程沿用同一套服务器版本存储，新增的仅是设备侧幂等文件写入能力，不是第二套历史库：
+服务器与执行器分别按真实设备路径排队，复用现有 RPC。普通写入、条件写入、独占创建和传输提交保持原有能力。条件冲突明确返回 conflict；传输取消和超时透传执行器，执行器在实际 IO 收尾后释放队列。
 
-1. 服务器在该文件的写入队列内从实际设备读取原始 before，先把 before、拟写入内容和带 `operationId + journalSeq` 的操作持久化到服务器内容存储；其他文件不等待。
-2. 向执行器提交目标、预期 before 和拟写入字节。执行器在实际写入入口检查 before 是否仍一致；不一致则明确返回“未执行”，重新读取后形成新的写入尝试，不能用失真的 before 给一次成功写入记账。
-3. 执行器先持久登记该请求，再执行文件 IO，最后持久保存可按 operationId 查询的结果。不能只依赖连接内存中的 RPC 请求表。重复请求返回原结果，不重复写入。
-4. 结果由服务器收录后可以回收设备上的详细回执；设备保留已受理序号水位，已回收的旧请求只能返回“结果已过期”，不能当作新写入执行。
+连接中断时，本次操作报告 unknown，后续新请求重新读取实际目标。历史可用性按照实际设备能力展示，同一未知请求避免自动重发。
 
-before 的原始内容在发送写入前已位于服务器，因此设备写完即断线或执行器重启，也不会丢掉该操作的恢复材料。这一步的 before 校验是保证本次写入记录真实，不是要求历史恢复目标必须等于当前文件。
-
-正常队列持有到实际执行结束，而非持有到 HTTP 超时。响应丢失后查询原 operationId：仍在执行则等待该设备，终态存在则收录；若结果查无记录，但已确认旧执行结束，则以“执行结果未知”结束核实，不重放旧写入、不按当前 hash 伪造成功。before 仍可作为明确恢复目标，设备后续写入恢复派发。
-
-核实期间不继续向该设备派发后续受控写入，无关设备可继续；未知请求保留序号位置，不冒充已完成的 after 版本。这里保证的是文件版本的逻辑顺序，不声称网络分区下还能证明所有设备的物理写入绝不同时发生。设备离线只影响它当前的文件 IO，不形成实例级历史恢复禁令。
+远程编辑器的操作收据用于确认一次实际 IO 的结果，与可选文件历史分开。新保存使用显式目标队列能力协商，不再要求历史 lease/effect 或持久 fence；旧收据保留只读查询。执行器对编辑器、普通文件写入与传输提交使用同一目标路径队列，Host RPC 超时不代表执行端 IO 已结束。原始字节、编码、资源授权和草稿恢复继续沿用编辑器协议。
 
 ## 5. Bash：短捕获窗口，不是全实例 Shell 串行器
 
@@ -165,7 +158,7 @@ before 的原始内容在发送写入前已位于服务器，因此设备写完�
        → 成立则异步归档文件版本，否则 skip
 ```
 
-短窗口暂时占用捕获根范围内的文件写入锁。**其他 Bash 不等待这个窗口串行执行**：一旦第二个 Bash 进入，就使重叠候选失效；不会为了提高快照成功率而串行整个实例的命令。捕获根之外的 Edit/Write 不受影响。
+Bash 捕获保持观测性质，结果按实际覆盖与并发情况展示。文件写入使用独立的单文件队列，捕获失败只影响本次历史材料。
 
 判定覆盖 before 捕获开始到 after 捕获结束，不能只在命令开始和结束各检查一次活动数量。窗口中曾发生重叠，就不能因为另一个 Bash 已经退出而重新变成“独占”。
 
@@ -270,7 +263,7 @@ A 回退 102，目标为 v2：B 的 101 自然保留，B 的 103 会被覆盖。
 - Await、查看结果、只读 ContextAsk 本身不产生新委派：仅选中这些等待/查看消息，不撤销发生在范围外的原始调用。后台子代理属于发起它的调用，不按完成通知出现在哪条消息里归属。
 - 调用失败、取消或缺少最终回复，不抹去已记录的 Edit/Write。旧数据缺少某条委派关联时，只报告该来源的覆盖缺口，不能使整个主代理回退不可用。
 
-现有 [server/services/subagent-runner.ts](../server/services/subagent-runner.ts) 已记录初始 `originToolCallId`；[server/services/subagent-resume.ts](../server/services/subagent-resume.ts) 和 [server/services/agent-communication.ts](../server/services/agent-communication.ts) 的继续执行/输入投递需要补齐每次执行段关联。不能沿用当前选择器“找到子代理后选择它的全部历史”的语义。
+现有 [server/services/subagent-runner.ts](../server/services/subagent-runner.ts) 已记录初始 `originToolCallId`；[server/services/agent-runtime/run.ts](../server/services/agent-runtime/run.ts)（原 `subagent-resume.ts` 已合并于此）和 [server/services/agent-communication.ts](../server/services/agent-communication.ts) 的继续执行/输入投递需要补齐每次执行段关联。不能沿用当前选择器“找到子代理后选择它的全部历史”的语义。
 
 #### 仍在运行的子代理：只撤销选中的委派，不冻结整个团队
 
@@ -305,7 +298,7 @@ summary   { selectedFileCount, skippedOperationCount, affectedOtherSessions }
 - 一次确认汇总全部覆盖影响和 Bash 缺口，不逐工具弹窗。
 - 文件列表按需分页；用户不必滚动加载每一页才能确认，服务器负责保存完整目标清单。
 - 用户可以取消某个文件的勾选；提交集合必须是该预览文件集合的子集。
-- 保留 `planId + planHash` 绑定已确认的清单，但 hash 不再承担“所有历史证据完整”的证明。
+- 保留 `planId + planHash` 绑定已确认的清单；编辑重生、主/子代理入口均消费同一份计划，不在确认后重新规划。提交时核对操作、消息边界、身份和有效期；hash 不承担“所有历史证据完整”的证明。
 - 主按钮按情况显示“恢复 3 个文件（跳过 1 次 Bash）”，不统一变为“文件回退不可用”。
 - 没有可执行文件时明确显示零项；若该动作还包含消息处理，用户仍可选择只处理消息。
 
@@ -314,7 +307,7 @@ summary   { selectedFileCount, skippedOperationCount, affectedOtherSessions }
 每个已选文件通过 InstanceFileWriter 执行：
 
 1. 在队列内重新检查该文件的最新日志序号及当前实际内容是否仍与预览一致。
-2. 保存恢复前的当前原始状态。
+2. 当前状态以指纹参与冲突检查。内容不变的项不归档；已有匹配且 ready 的原文直接引用；其余情况在剩余预算内尽量归档当前内容，使这次覆盖仍可撤销。归档失败只降低该文件的历史可用性，不阻断预览或其他文件。
 3. 写入预览中指定的目标，追加新的文件版本，并记录恢复目标引用。
 4. 保存逐文件结果，发布版本变化事件。
 
@@ -328,13 +321,13 @@ summary   { selectedFileCount, skippedOperationCount, affectedOtherSessions }
 
 一次恢复请求是文件写入的分组，不是全实例文件系统事务：
 
-- 每个成功恢复的文件都已有新版本，可再次撤销。
-- 某文件 IO 失败、设备离线或预览过期，只影响该项；返回已完成、失败、待刷新和跳过清单。
-- 已开始但结果不确定的单个文件，沿用现有 capture-then-compensate 处理该文件；不把其他已成功文件自动写回去，避免补偿覆盖期间的新修改。
+- 每个成功恢复的文件都保留实际结果；所需历史材料可用时可再次恢复，材料缺口另行提示。
+- 某文件 IO 失败、设备离线或预览过期，只影响该项；返回已完成、失败、待刷新和跳过清单。展示空间有限时优先列出异常文件，成功项汇总计数。
+- 已开始但结果不确定的单个文件返回 unknown，队列等待真实 IO 收尾后释放；进一步恢复须刷新现场，不自动执行补偿写入。
 - 重试只执行尚未完成的项；已完成项不因为 HTTP 重试而再次覆盖文件。
 - 用户要撤销本次恢复，仍使用同一个文件版本恢复机制；不存在另一套 redo 引擎。
 
-这条决策只取消“一个候选缺口就让全批次不可用”的前置门槛，不取消已开始文件写入的逐文件补偿；章节 fork/merge 的结构性快照事务和现有 commit/finalize/discard 出口不在此次替换范围内。
+逐文件结果替代跨文件补偿链。章节 fork/merge 的结构性快照事务和现有 commit/finalize/discard 出口不在此次替换范围内。
 
 ### 7.4 会话历史最后处理
 
@@ -377,28 +370,40 @@ summary   { selectedFileCount, skippedOperationCount, affectedOtherSessions }
 2. Edit/Write 只处理本文件，不扫描工作区。文件大小和原始内容存储预算复用现有 `FILE_CHANGE_LIMITS`，不再叠加一组“证明预算”。
 3. 历史查询和后续修改列表走游标分页；同文件多个选中操作直接定位最早目标，不累计读取全部中间内容。
 4. Bash 采用单一有界捕获窗口；固定 tree 后的差量归档使用后台有界任务。扫描输入、路径数、输出字节、子进程超时沿用现有捕获预算，超过时该 Bash 标记 skip。
-5. 多文件恢复按文件推进，不把所有文件内容载入 JS 堆，也不把全批次历史查询放进全局写入锁。沿用现有文件、计划及队列的大小上限，超出单批容量时分页分批执行，不把巨大前缀冒充完整结果。
+5. 多文件恢复逐项读取和执行，沿用文件、计划及队列的大小上限。超出单批容量时分页分批处理，结果明确区分已处理项和缺口。
 6. 取消停止尚未开始的项；已经实际开始的短写入先登记终态，不把网络取消当作“没有写过”。所有已完成项可在该恢复请求中查询。
 7. 慢日志只记录操作类型、耗时、文件/字节数量和跳过原因，不复制文件正文。
-8. 仍被保留版本引用的内容不得被默认 TTL 静默清理。空间不足在新写入前告知；用户显式清理历史时，清楚说明哪些版本将不可再恢复。正文去重、孤立对象回收继续复用现有存储能力。
+8. 仍被保留版本引用的内容不得被默认 TTL 静默清理。历史空间不足提示本次缺口，目标磁盘不足按真实 IO 错误处理；用户显式清理历史时，清楚说明哪些版本将不可再恢复。正文去重、孤立对象回收继续复用现有存储能力。
+9. 计划按批定向追加并在末尾完成一次校验；COW 按固定行和包含空集合的关联目标批量核对，保留消费时原值。删除或改写已投递的消息时，收件回执在同一事务内更新，发送方只刷新消息版本、不重置会话。千条普通消息的提交前读取由 16,003 次降为 483 次（含回执目标检查）；逐条 DML 和 `SELECT changes()` 的真实行数校验保留。
+10. 未完成文件工具形成明确的部分覆盖提示，不能当作零 IO；已有完成效果仍可恢复，消息历史在覆盖完整后才提交。传输双方读满 chunk 后才发送，接收方以有效新 chunk 的进展维持有限空闲预算，失败后释放已结束 IO 的资源。
+
+### 写入基准
+
+Bun 1.4.3，同机 AB/BA 顺序；每版每种大小预热后测量 32 次。使用真实本地文件和完整 Write 历史路径，数据库为隔离内存 SQLite。旧版基线为 `35f722af5`，新版为重设计初版工作树；以下测量发生在后续审查修正与上游编辑器整合之前。
+
+| 文件大小 | 旧版 p50 / p95 | 新版 p50 / p95 |
+|---|---:|---:|
+| 4KiB | 40.026 / 54.587ms | 12.814 / 16.758ms |
+| 1MiB | 77.248 / 93.131ms | 44.593 / 61.562ms |
+
+每次 SQL 调用为 192 → 35，完整目标读取为 5 → 2，屏障表查询为 47 → 0。结果衡量本地写入管线；HTTP、远程设备与真实服务数据库延迟需分别测量。复现入口：[server/services/file-write-benchmark.test.ts](../server/services/file-write-benchmark.test.ts)，通过 `NF_FILE_WRITE_BENCH=1` 和 `NF_FILE_WRITE_BENCH_BASELINE` 显式运行。
 
 ## 10. 旧实现的复用与退出
 
 | 位置 | 处理 |
 |---|---|
 | [server/services/file-change-runtime.ts](../server/services/file-change-runtime.ts) | 复用原始内容与写入日志，统一实例排序，去掉 Bash 连带归因降级对恢复的影响 |
-| [server/lib/agent/tools/write-serialization.ts](../server/lib/agent/tools/write-serialization.ts) | 日常文件写入的旧 cwd 锁退出，避免与新队列双层等待 |
-| [server/services/workspace-write-coordinator.ts](../server/services/workspace-write-coordinator.ts) | 不再作为新会话恢复的作用域资格审查器；结构性调用先保留，清理无调用的旧能力 |
+| [server/services/file-write-queue.ts](../server/services/file-write-queue.ts) | 统一单文件 FIFO；旧 cwd 锁、持久租约、隔离恢复服务已删除 |
 | [server/services/narrator-tree-snapshot-hooks.ts](../server/services/narrator-tree-snapshot-hooks.ts) | 移除 Edit/Write 热路径 tree；Bash 边界移到真实执行驱动，消息钩子不证明执行结束 |
 | [server/lib/agent/tools/bash.ts](../server/lib/agent/tools/bash.ts) | 接入实例活动集合和有预算的捕获窗口，跳过不影响命令执行 |
 | [server/services/revert-selection-service.ts](../server/services/revert-selection-service.ts) | 只负责选择来源记录和消息边界；产出明确缺口，不要求每个工具证明无磁盘效果 |
 | [server/services/revert-planner-service.ts](../server/services/revert-planner-service.ts) | 改为每文件选择目标版本，不再逐效果逆算和完整性总否决 |
 | [server/services/file-change-reversal.ts](../server/services/file-change-reversal.ts) | 只保留为需要时的单文件合并辅助；不能继续作为所有已知 before 的隐藏准入门槛 |
 | [server/services/revert-plan-service.ts](../server/services/revert-plan-service.ts) / [server/services/revert-transaction-manifest-worker.ts](../server/services/revert-transaction-manifest-worker.ts) | 保留清单绑定和有界存储，移除零未知证明协议 |
-| [server/services/revert-transaction-service.ts](../server/services/revert-transaction-service.ts) / [server/services/revert-mutation-journal.ts](../server/services/revert-mutation-journal.ts) | 改为逐文件处置与结果；保留已开始单文件的补偿及现有事务出口，退出全批次补偿/隔离状态链 |
+| [server/services/revert-transaction-service.ts](../server/services/revert-transaction-service.ts) / [server/services/revert-mutation-journal.ts](../server/services/revert-mutation-journal.ts) | 逐文件执行并记录实际结果；已成功项保留，缺口逐项展示，消息提交由恢复结果决定 |
 | [server/services/revert-history-commit.ts](../server/services/revert-history-commit.ts) | 保留消息 COW 与选择边界校验，文件缺口不再否决明确的消息选择 |
 | [server/services/revert-planner-local-access.ts](../server/services/revert-planner-local-access.ts) | 去掉仅本地 POSIX 和全局不完整错误折叠；按真实设备能力逐项返回结果 |
-| [frontend/components/narrator/RevertScopeConfirmModal.tsx](../frontend/components/narrator/RevertScopeConfirmModal.tsx) | 一个确认框展示目标、覆盖与 skip，去掉双 scope 和全覆盖禁用条件 |
+| [frontend/components/narrator/permission/RevertScopeConfirmModal.tsx](../frontend/components/narrator/permission/RevertScopeConfirmModal.tsx) | 一个确认框展示目标、覆盖与 skip，去掉双 scope 和全覆盖禁用条件 |
 
 已有旧快照不删除。能定位到原始 before 的旧记录可作为明确版本来源；缺少每次操作原文的 first-touch 快照不能冒充任意中间时刻。旧记录按项说明，不阻断新记录；不通过重跑历史工具“补造证据”。
 

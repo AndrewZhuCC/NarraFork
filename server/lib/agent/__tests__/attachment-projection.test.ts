@@ -46,7 +46,7 @@ function prepare(messages: TestMessage[], currentInput?: string, worktree = cwd)
 	return projectAttachmentLocations(messages, { cwd: worktree, narratorId: "fork", currentInput });
 }
 
-test("attachment hints stay concise and do not direct tools or claim visual delivery", () => {
+test("attachment hints stay concise and do not direct tools", () => {
 	const file = { filename: "notes.txt", filePath: join(cwd, "notes.txt"), size: 12 };
 	const image = { filename: "logo.png", imageId: "image", file };
 	for (const hint of [
@@ -57,15 +57,25 @@ test("attachment hints stay concise and do not direct tools or claim visual deli
 		const lines = hint.trim().split("\n");
 		expect(lines[0]).toBe("<attached_files>");
 		expect(lines.at(-1)).toBe("</attached_files>");
-		for (const line of lines.slice(1, -1)) {
+		for (const line of lines.slice(1, -1).filter((line) => line.startsWith("- "))) {
 			expect(line).toMatch(/^- (file|image): /);
 			expect(line).toContain("device: local");
 		}
 		expect(hint).not.toContain("imageId");
 		expect(hint).not.toMatch(/NarraFork|metadata|worktree copies/);
 		expect(hint).not.toMatch(/\b(Read|transfer|Copy)\b/);
-		expect(hint).not.toMatch(/already|in context/);
 	}
+});
+
+test("image hints say the path is for using the file, not viewing it again", () => {
+	const file = { filename: "logo.png", filePath: join(cwd, "logo.png"), size: 12 };
+	expect(buildAttachedFilesHint([file])).not.toContain("already in this message");
+	expect(buildAttachedFilesHint([], [{ filename: "logo.png", imageId: "image" }])).not.toContain(
+		"already in this message",
+	);
+	const hint = buildAttachedFilesHint([], [{ filename: "logo.png", imageId: "image", file }]);
+	expect(hint).toContain("already in this message");
+	expect(hint).toContain("not for viewing it again");
 });
 
 test("Read description does not mandate reading screenshot paths", () => {

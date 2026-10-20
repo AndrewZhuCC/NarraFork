@@ -362,3 +362,25 @@ export const child = sqliteTable("child", { id: text("id").primaryKey(), p: text
 		expect(coverage.tables.find((t) => t.name === "parent")?.indexes).toEqual([]);
 	});
 });
+
+test("file history byte totals retain SQLite's 64-bit capacity in PostgreSQL", () => {
+	const { coverage, source } = generatePostgresSchema(`${HEAD}
+export const budgets = sqliteTable("file_change_storage_budgets", {
+  usedBytes: integer("used_bytes").notNull().default(0),
+  reservedBytes: integer("reserved_bytes").notNull().default(0),
+  quotaBytes: integer("quota_bytes").notNull(),
+  generation: integer("generation").notNull().default(0),
+});
+export const other = sqliteTable("other", { quotaBytes: integer("quota_bytes") });
+`);
+	for (const name of ["used_bytes", "reserved_bytes", "quota_bytes"]) {
+		expect(coverage.tables[0].columns.find((column) => column.name === name)?.pgType).toBe(
+			"bigint",
+		);
+		expect(source).toContain(`bigint("${name}", { mode: "number" })`);
+	}
+	expect(coverage.tables[0].columns.find((column) => column.name === "generation")?.pgType).toBe(
+		"integer",
+	);
+	expect(coverage.tables[1].columns[0].pgType).toBe("integer");
+});

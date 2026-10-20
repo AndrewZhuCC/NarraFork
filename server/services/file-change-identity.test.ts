@@ -5,6 +5,7 @@ import {
 	type FileChangeScopeIdentity,
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
+	fileChangePhysicalIdentityKey,
 	isOutsideFileChangeWorkspace,
 } from "./file-change-identity";
 
@@ -136,6 +137,85 @@ describe("file change identity", () => {
 	});
 });
 
+describe("plan-local physical identity", () => {
+	test("old and new scopes group the same physical target while historical keys stay distinct", () => {
+		const old = identity();
+		const current = createFileChangeIdentity(
+			{
+				...scope,
+				id: "new-scope",
+				sourceInstanceId: "new-source",
+				workspaceInstanceId: "new-workspace",
+				canonicalRoot: "/real",
+			},
+			{
+				deviceId: "local",
+				pathFlavor: "posix",
+				lexicalPath: "/another/cwd/a.txt",
+				canonicalPath: old.canonicalPath,
+				objectRole: "referent",
+			},
+		);
+		expect(current.displayPath).toBe("repo/a.txt");
+		expect(fileChangePhysicalIdentityKey(current)).toBe(fileChangePhysicalIdentityKey(old));
+		expect(fileChangeIdentityKey(current)).not.toBe(fileChangeIdentityKey(old));
+		expect(
+			fileChangePhysicalIdentityKey({
+				deviceId: old.deviceId,
+				pathFlavor: old.pathFlavor,
+				canonicalPath: old.canonicalPath,
+				objectRole: old.objectRole,
+			}),
+		).toBe(fileChangePhysicalIdentityKey(old));
+	});
+	test("Windows case and separator aliases share a physical key", () => {
+		const first = {
+			deviceId: "windows-device",
+			pathFlavor: "windows" as const,
+			canonicalPath: "C:\\Repo\\Src\\A.ts",
+			objectRole: "referent" as const,
+		};
+		expect(fileChangePhysicalIdentityKey(first)).toBe(
+			fileChangePhysicalIdentityKey({ ...first, canonicalPath: "c:/repo/src/./a.ts" }),
+		);
+	});
+	test("device and object role isolate physical groups", () => {
+		const first = identity();
+		for (const patch of [
+			{ deviceId: "remote" },
+			{ objectRole: "entry" },
+		] satisfies Partial<FileChangeIdentity>[]) {
+			expect(fileChangePhysicalIdentityKey({ ...first, ...patch })).not.toBe(
+				fileChangePhysicalIdentityKey(first),
+			);
+		}
+	});
+	test("POSIX case and backslashes remain significant while path segments normalize", () => {
+		const first = identity();
+		expect(fileChangePhysicalIdentityKey({ ...first, canonicalPath: "/real/repo/./a.txt" })).toBe(
+			fileChangePhysicalIdentityKey(first),
+		);
+		expect(fileChangePhysicalIdentityKey({ ...first, canonicalPath: "/real/repo/A.txt" })).not.toBe(
+			fileChangePhysicalIdentityKey(first),
+		);
+		expect(fileChangePhysicalIdentityKey({ ...first, canonicalPath: "/real/repo/a\\b" })).not.toBe(
+			fileChangePhysicalIdentityKey({ ...first, canonicalPath: "/real/repo/a/b" }),
+		);
+	});
+	test("invalid physical targets are rejected before hashing", () => {
+		expect(() => fileChangePhysicalIdentityKey(identity({ deviceId: "" }))).toThrow();
+		expect(() =>
+			fileChangePhysicalIdentityKey(identity({ canonicalPath: "relative.txt" })),
+		).toThrow("absolute");
+		expect(() =>
+			fileChangePhysicalIdentityKey(identity({ canonicalPath: "/repo/a\0b" })),
+		).toThrow();
+		expect(() => fileChangePhysicalIdentityKey(identity({ pathFlavor: "spec" as never }))).toThrow(
+			"disk path flavor",
+		);
+	});
+});
+
 test("workspace comparison preserves unknown and device differences", () => {
 	expect(isOutsideFileChangeWorkspace(identity(), scope)).toBe(false);
 	expect(isOutsideFileChangeWorkspace(identity(), null)).toBeNull();
@@ -143,7 +223,7 @@ test("workspace comparison preserves unknown and device differences", () => {
 	expect(isOutsideFileChangeWorkspace(identity({ workspaceInstanceId: "new" }), scope)).toBe(true);
 });
 
-test("execution generations and fencing tokens are checked separately from file identity", () => {
+test("archived v2 receipt comparison preserves its original execution binding", () => {
 	const binding: FileChangeExecutionBinding = {
 		deviceId: "local",
 		runtimeEpoch: "epoch",

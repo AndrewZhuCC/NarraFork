@@ -1,9 +1,8 @@
 import { db } from "@server/db";
-import { getDbPath } from "@server/db/connection";
 import { apiRequests, chapters, narrators, users } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
-import { runReadTask } from "@server/lib/db-worker/pool";
 import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import {
@@ -381,38 +380,18 @@ export interface UsageHistoryExecutionOptions {
 	signal?: AbortSignal;
 }
 
-interface UsageAggregateQuery<Row> extends PromiseLike<Row[]> {
-	toSQL(): { sql: string; params: unknown[] };
-	_: { selectedFields: Record<string, unknown> };
-}
-
 export class UsageHistoryService {
-	constructor(
-		private readonly database: typeof db = db,
-		private readonly workerDbPath: string | null = database === db ? getDbPath() : null,
-	) {}
+	constructor(private readonly database: typeof db = db) {}
 
-	/** Injected in-memory databases execute locally; production never falls back to a scan. */
+	/** Aggregates run on the read worker; they never fall back to a main-thread scan. */
 	private async aggregate<Row>(
-		query: UsageAggregateQuery<Row>,
+		query: Parameters<typeof readQuery<Row>>[0],
 		maxRows: number,
 		execution: UsageHistoryExecutionOptions = {},
 	): Promise<Row[]> {
-		if (!this.workerDbPath) return await query;
 		const startedAt = Date.now();
-		const compiled = query.toSQL();
 		try {
-			return await runReadTask<Row[]>(
-				this.workerDbPath,
-				{
-					kind: "usageHistoryQuery",
-					sql: compiled.sql,
-					params: compiled.params as (string | number | null)[],
-					columns: Object.keys(query._.selectedFields),
-					maxRows,
-				},
-				{ timeoutMs: 30_000, signal: execution.signal },
-			);
+			return await readQuery(query, { maxRows, signal: execution.signal, inlineFallback: false });
 		} catch (error) {
 			logger.warn("Usage history aggregation worker failed", {
 				error: error instanceof Error ? error.message : String(error),

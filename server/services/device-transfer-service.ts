@@ -17,7 +17,7 @@
  */
 import { createHash } from "node:crypto";
 import { constants as fsConstants, mkdirSync } from "node:fs";
-import { open, readdir, rename, rm, stat } from "node:fs/promises";
+import { lstat, open, readdir, rename, rm, stat } from "node:fs/promises";
 import {
 	basename,
 	dirname,
@@ -31,6 +31,7 @@ import {
 } from "node:path";
 import { formatProgressBytes } from "@shared/tool-progress";
 import { db } from "../db";
+import { localBackend } from "../lib/agent/execution/local-backend";
 import {
 	type ChunkFrameHeader,
 	decodeChunkFrame,
@@ -41,6 +42,7 @@ import {
 } from "../lib/agent/execution/rpc-types";
 import { crc32c } from "../lib/crc32c";
 import { eventBus } from "../lib/event-bus";
+import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -59,6 +61,7 @@ import {
 	type DeviceTransferTaskStopIntent,
 	DeviceTransferTaskStore,
 } from "./device-transfer-task-store";
+import { withFileWrite } from "./file-write-queue";
 
 const ACK_FLUSH_INTERVAL_MS = 200;
 const ACK_FLUSH_THRESHOLD = 16;
@@ -100,6 +103,13 @@ function transferConcurrency(): number {
 
 function maxTransfersPerDevice(): number {
 	return Math.max(1, settings.devices?.maxConcurrentTransfersPerDevice ?? 2);
+}
+
+function transferIdleTimeoutMs(): number {
+	const configured = settings.devices?.rpcTimeoutMs;
+	return typeof configured === "number" && Number.isFinite(configured) && configured > 0
+		? Math.min(2_147_483_647, Math.max(1, Math.floor(configured)))
+		: 120_000;
 }
 
 export type RemotePathSemantics = "windows" | "posix";
@@ -195,7 +205,7 @@ export function resolveDownloadManifestPath(localRoot: string, relPath: string):
 // than queueing) so a caller gets immediate feedback instead of a silent stall.
 
 /** deviceId → count of in-flight top-level transfers. */
-const activeTransfers = new Map<string, number>();
+const activeTransfers = hotSafe("deviceTransfer.activeTransfers", () => new Map<string, number>());
 
 /**
  * Run `fn` while holding a transfer slot for the device, releasing it on
@@ -243,7 +253,10 @@ interface ReceiveState {
 	pendingAckIndices: number[];
 	pendingAckCrc: number[];
 	ackTimer: ReturnType<typeof setInterval> | null;
-	onFileDone: (ok: boolean, error?: string) => void;
+	lastProgressAt: number;
+	idleTimeoutMs: number;
+	onFileDone: (ok: boolean, error?: string, discardPartial?: boolean) => void;
+	pendingChunks: Set<Promise<void>>;
 	abortSignal?: AbortSignal;
 	abortHandler?: () => void;
 	settled: boolean;
@@ -263,7 +276,7 @@ interface ReceiveState {
 }
 
 /** transferId → receive state (server is the receiver, i.e. download). */
-const receives = new Map<string, ReceiveState>();
+const receives = hotSafe("deviceTransfer.receives", () => new Map<string, ReceiveState>());
 
 // ── Public API: single-file transfers ──────────────────────────────────────
 
@@ -472,6 +485,31 @@ export async function downloadFile(args: {
 	return withTransferSlot(args.deviceId, args._slotHeld ?? false, () => downloadFileInner(args));
 }
 
+// Only a transfer's fixed checkpoint is occupied during network IO. Ordinary
+// file writes still coordinate exclusively with the short final-commit queue.
+const downloadCheckpoints = hotSafe<Set<string>>(
+	"narrafork.download-checkpoints.v1",
+	() => new Set(),
+);
+
+async function claimDownloadCheckpoint(partPath: string, signal?: AbortSignal) {
+	const identity = await localBackend.resolvePathIdentity(partPath, { signal });
+	const key = localBackend.paths.identityKey(identity.canonicalPath);
+	if (downloadCheckpoints.has(key)) {
+		throw new Error("Download checkpoint is busy for this local destination");
+	}
+	downloadCheckpoints.add(key);
+	let released = false;
+	return {
+		canonicalPath: identity.canonicalPath,
+		release() {
+			if (released) return;
+			released = true;
+			downloadCheckpoints.delete(key);
+		},
+	};
+}
+
 async function downloadFileInner(args: {
 	deviceId: string;
 	remotePath: string;
@@ -492,126 +530,166 @@ async function downloadFileInner(args: {
 	const totalChunks = remoteSize === 0 ? 0 : Math.ceil(remoteSize / cs);
 	const transferId = `tx_${generateId()}`;
 	const finalPath = validateLocalAbsolutePath(localDest, "Local download destination");
-	mkdirSync(dirname(finalPath), { recursive: true });
 	const partPath = `${finalPath}.nfpart`;
-
-	// Open (or reopen) the .part file for random-access writes. Use O_RDWR|O_CREAT
-	// (NOT "a+"): O_APPEND makes the kernel ignore the write offset and always
-	// append to EOF, which silently corrupts the file if chunks ever arrive out of
-	// order or in parallel. O_RDWR|O_CREAT preserves existing bytes (for resume),
-	// creates the file when absent, and honours the positional writes in writeChunk.
-	const fileHandle = await open(partPath, fsConstants.O_RDWR | fsConstants.O_CREAT);
-	// Aborts between opening the .nfpart and registering the receive state bypass
-	// stopReceive, so they must apply the same cancel-vs-pause cleanup themselves —
-	// the open above creates the file even when the transfer never sends a byte.
-	const abandonBeforeStart = async (): Promise<never> => {
-		await fileHandle.close().catch(() => {});
-		if (isTransferCancelAbort(args.signal)) {
-			await removeLocalPartial(partPath, finalPath);
-			throw new Error("transfer cancelled");
+	const checkpoint = await claimDownloadCheckpoint(partPath, args.signal);
+	try {
+		mkdirSync(dirname(finalPath), { recursive: true });
+		const currentCheckpoint = await localBackend.resolvePathIdentity(partPath, {
+			signal: args.signal,
+		});
+		if (!localBackend.paths.equals(currentCheckpoint.canonicalPath, checkpoint.canonicalPath)) {
+			throw new Error("Download checkpoint path changed before opening");
 		}
-		throw new Error("transfer paused");
-	};
-	if (args.signal?.aborted) await abandonBeforeStart();
 
-	// Resume: which chunks do we already have durably?
-	const existing = await loadLocalManifest(finalPath, {
-		chunkSize: cs,
-		fileSize: remoteSize,
-		mtimeMs: remoteMtimeMs,
-	});
-
-	// No valid resume manifest → start fresh. Because we no longer truncate on
-	// open, a stale .part left over from a previous (larger) download would keep
-	// its trailing bytes and fail the final size check. Truncate to 0 so the
-	// positional writes below produce exactly `remoteSize` bytes.
-	if (existing.length === 0) {
-		await fileHandle.truncate(0);
-	}
-
-	const verify = settings.devices?.transferVerify ?? "crc32c";
-	if (args.signal?.aborted) await abandonBeforeStart();
-
-	return await new Promise((resolvePromise, reject) => {
-		const state: ReceiveState = {
-			transferId,
-			deviceId,
-			direction: "download",
-			fileHandle,
-			partPath,
-			finalPath,
-			chunkSize: cs,
-			totalChunks,
-			fileSize: remoteSize,
-			mtimeMs: remoteMtimeMs,
-			received: new Set(existing),
-			bytesWritten: existing.reduce(
-				(sum, index) => sum + Math.max(0, Math.min(cs, remoteSize - index * cs)),
-				0,
-			),
-			pendingAckIndices: [],
-			pendingAckCrc: [],
-			ackTimer: null,
-			onFileDone: (ok, error) => {
-				if (ok) resolvePromise({ transferId, bytes: remoteSize });
-				else reject(new Error(error ?? "transfer failed"));
-			},
-			abortSignal: args.signal,
-			settled: false,
-			cleaned: false,
-			progress: args.progress,
-		};
-		receives.set(transferId, state);
-		if (args.signal) {
-			const signal = args.signal;
-			state.abortHandler = () => {
-				// Cancel is terminal, so drop both sides of the checkpoint. Pause keeps
-				// them: `resume` reopens the same .nfpart and replays only the missing chunks.
-				const cancelled = isTransferCancelAbort(signal);
-				void stopReceive(state, cancelled ? "transfer cancelled" : "transfer paused", {
-					preservePartial: !cancelled,
-				});
+		// Open (or reopen) the .part file for random-access writes. Use O_RDWR|O_CREAT
+		// (NOT "a+"): O_APPEND makes the kernel ignore the write offset and always
+		// append to EOF, which silently corrupts the file if chunks ever arrive out of
+		// order or in parallel. O_RDWR|O_CREAT preserves existing bytes (for resume),
+		// creates the file when absent, and honours the positional writes in writeChunk.
+		const fileHandle = await open(partPath, fsConstants.O_RDWR | fsConstants.O_CREAT);
+		const pendingChunks = new Set<Promise<void>>();
+		let completed = false;
+		let discardPartial = false;
+		try {
+			// Aborts between opening the .nfpart and registering the receive state bypass
+			// stopReceive, so they must apply the same cancel-vs-pause cleanup themselves —
+			// the open above creates the file even when the transfer never sends a byte.
+			const abandonBeforeStart = async (): Promise<never> => {
+				await fileHandle.close().catch(() => {});
+				if (isTransferCancelAbort(args.signal)) {
+					await removeLocalPartial(partPath, finalPath);
+					throw new Error("transfer cancelled");
+				}
+				throw new Error("transfer paused");
 			};
-			signal.addEventListener("abort", state.abortHandler, { once: true });
-			if (args.signal.aborted) {
-				state.abortHandler();
-				return;
-			}
-		}
-		state.ackTimer = setInterval(() => flushAcks(state), ACK_FLUSH_INTERVAL_MS);
+			if (args.signal?.aborted) await abandonBeforeStart();
 
-		// Begin the transfer; the executor will start sending chunk frames.
-		sendRpc(
-			deviceId,
-			"transfer.begin",
-			{
-				transferId,
-				direction: "download",
-				remotePath,
-				fileSize: remoteSize,
+			// Resume: which chunks do we already have durably?
+			const existing = await loadLocalManifest(finalPath, {
 				chunkSize: cs,
-				totalChunks,
+				fileSize: remoteSize,
 				mtimeMs: remoteMtimeMs,
-				completedChunks: existing,
-				verify,
-			},
-			{ signal: args.signal },
-		)
-			.then((res) => {
-				if (state.cleaned || receives.get(state.transferId) !== state) return;
-				const begin = res as TransferBeginResult;
-				// The executor may report additional already-sent chunks (unlikely
-				// for download, but harmless): merge them.
-				for (const idx of begin.completedChunks) state.received.add(idx);
-				// Painted at 0% (when a progress consumer exists) so the card shows
-				// something started before the first chunk lands.
-				emitProgress(state, args.progress);
-				if (state.received.size >= totalChunks) void finalizeReceive(state);
-			})
-			.catch((err) => {
-				void failReceive(state, err instanceof Error ? err.message : String(err));
 			});
-	});
+
+			// No valid resume manifest → start fresh. Because we no longer truncate on
+			// open, a stale .part left over from a previous (larger) download would keep
+			// its trailing bytes and fail the final size check. Truncate to 0 so the
+			// positional writes below produce exactly `remoteSize` bytes.
+			if (existing.length === 0) {
+				await fileHandle.truncate(0);
+			}
+
+			const verify = settings.devices?.transferVerify ?? "crc32c";
+			if (args.signal?.aborted) await abandonBeforeStart();
+
+			return await new Promise((resolvePromise, reject) => {
+				const state: ReceiveState = {
+					transferId,
+					deviceId,
+					direction: "download",
+					fileHandle,
+					partPath,
+					finalPath,
+					chunkSize: cs,
+					totalChunks,
+					fileSize: remoteSize,
+					mtimeMs: remoteMtimeMs,
+					received: new Set(existing),
+					bytesWritten: existing.reduce(
+						(sum, index) => sum + Math.max(0, Math.min(cs, remoteSize - index * cs)),
+						0,
+					),
+					pendingAckIndices: [],
+					pendingAckCrc: [],
+					ackTimer: null,
+					lastProgressAt: performance.now(),
+					idleTimeoutMs: transferIdleTimeoutMs(),
+					onFileDone: (ok, error, discard) => {
+						completed = ok;
+						discardPartial = discard === true;
+						if (ok) resolvePromise({ transferId, bytes: remoteSize });
+						else reject(new Error(error ?? "transfer failed"));
+					},
+					pendingChunks,
+					abortSignal: args.signal,
+					settled: false,
+					cleaned: false,
+					progress: args.progress,
+				};
+				receives.set(transferId, state);
+				if (args.signal) {
+					const signal = args.signal;
+					state.abortHandler = () => {
+						// Cancel is terminal, so drop both sides of the checkpoint. Pause keeps
+						// them: `resume` reopens the same .nfpart and replays only the missing chunks.
+						const cancelled = isTransferCancelAbort(signal);
+						void stopReceive(state, cancelled ? "transfer cancelled" : "transfer paused", {
+							preservePartial: !cancelled,
+						});
+					};
+					signal.addEventListener("abort", state.abortHandler, { once: true });
+					if (args.signal.aborted) {
+						state.abortHandler();
+						return;
+					}
+				}
+				state.ackTimer = setInterval(() => {
+					if (state.cleaned) return;
+					// The sender's begin RPC has already returned, so open/read failures
+					// can otherwise leave a receiver waiting forever. Use an idle budget,
+					// not a total duration: every successfully written new chunk renews it.
+					if (performance.now() - state.lastProgressAt >= state.idleTimeoutMs) {
+						void failReceive(state, `Download made no progress for ${state.idleTimeoutMs}ms`);
+						return;
+					}
+					flushAcks(state);
+				}, ACK_FLUSH_INTERVAL_MS);
+
+				// Begin the transfer; the executor will start sending chunk frames.
+				sendRpc(
+					deviceId,
+					"transfer.begin",
+					{
+						transferId,
+						direction: "download",
+						remotePath,
+						fileSize: remoteSize,
+						chunkSize: cs,
+						totalChunks,
+						mtimeMs: remoteMtimeMs,
+						completedChunks: existing,
+						verify,
+					},
+					{ signal: args.signal },
+				)
+					.then((res) => {
+						if (state.cleaned || receives.get(state.transferId) !== state) return;
+						const begin = res as TransferBeginResult;
+						// The executor may report additional already-sent chunks (unlikely
+						// for download, but harmless): merge them.
+						for (const idx of begin.completedChunks) state.received.add(idx);
+						// Painted at 0% (when a progress consumer exists) so the card shows
+						// something started before the first chunk lands.
+						emitProgress(state, args.progress);
+						if (state.received.size >= totalChunks) void finalizeReceive(state);
+					})
+					.catch((err) => {
+						void failReceive(state, err instanceof Error ? err.message : String(err));
+					});
+			});
+		} finally {
+			// Also close failures before a ReceiveState is registered. Releasing the
+			// checkpoint waits for actual handle IO, including an in-flight write.
+			await fileHandle.close().catch(() => {});
+			// Chunk handlers can still be finishing a manifest write after the FD
+			// closes. Drain them before freeing this checkpoint for another receiver.
+			await Promise.allSettled(pendingChunks);
+			if (discardPartial) await removeLocalPartial(partPath, finalPath);
+			else if (completed) await removeLocalManifest(finalPath);
+		}
+	} finally {
+		checkpoint.release();
+	}
 }
 
 /**
@@ -655,44 +733,42 @@ async function uploadFileInner(args: {
 		deviceId,
 		"transfer.upload-content-identity.v1",
 	);
-	if (!supportsContentIdentity) {
-		for (const path of [
-			`${remoteDest}.nfpart`,
-			`${remoteDest}.nfmeta`,
-			`${remoteDest}.nfmeta.tmp`,
-		]) {
-			await sendRpc(deviceId, "fs.remove", { path }, { signal: args.signal });
-		}
-	}
-
-	// Ask the executor to prepare the destination; it returns already-received
-	// chunks for resume.
-	const begin = (await sendRpc(
-		deviceId,
-		"transfer.begin",
-		{
-			transferId,
-			direction: "upload",
-			remotePath: remoteDest,
-			fileSize,
-			chunkSize: cs,
-			totalChunks,
-			mtimeMs: info.mtimeMs,
-			verify,
-			contentIdentity: { algorithm: "sha256", digest: contentDigest },
-		},
-		{ signal: args.signal },
-	)) as TransferBeginResult;
-
-	const already = new Set(begin.completedChunks);
+	// Own the local handle before starting any remote receiver. Even a failed or
+	// timed-out begin may have reached the executor, so it needs the same abort
+	// cleanup as a transfer that already started sending.
 	const fileHandle = await open(src, "r");
-	let bytesSent = [...already].reduce(
-		(sum, index) => sum + Math.max(0, Math.min(cs, fileSize - index * cs)),
-		0,
-	);
 	let completed = false;
-
 	try {
+		if (!supportsContentIdentity) {
+			for (const path of [
+				`${remoteDest}.nfpart`,
+				`${remoteDest}.nfmeta`,
+				`${remoteDest}.nfmeta.tmp`,
+			]) {
+				await sendRpc(deviceId, "fs.remove", { path }, { signal: args.signal });
+			}
+		}
+		const begin = (await sendRpc(
+			deviceId,
+			"transfer.begin",
+			{
+				transferId,
+				direction: "upload",
+				remotePath: remoteDest,
+				fileSize,
+				chunkSize: cs,
+				totalChunks,
+				mtimeMs: info.mtimeMs,
+				verify,
+				contentIdentity: { algorithm: "sha256", digest: contentDigest },
+			},
+			{ signal: args.signal },
+		)) as TransferBeginResult;
+		const already = new Set(begin.completedChunks);
+		let bytesSent = [...already].reduce(
+			(sum, index) => sum + Math.max(0, Math.min(cs, fileSize - index * cs)),
+			0,
+		);
 		if (totalChunks === 0) {
 			const complete = (await sendRpc(
 				deviceId,
@@ -711,12 +787,22 @@ async function uploadFileInner(args: {
 
 		const concurrency = transferConcurrency();
 		let next = 0;
+		let stopped = false;
 		const sendOne = async (chunkIndex: number) => {
 			const offset = chunkIndex * cs;
 			const len = Math.min(cs, fileSize - offset);
 			const buf = Buffer.allocUnsafe(len);
-			await fileHandle.read(buf, 0, len, offset);
+			let filled = 0;
+			while (filled < len) {
+				if (stopped) return;
+				if (args.signal?.aborted) throw new Error("upload aborted");
+				const { bytesRead } = await fileHandle.read(buf, filled, len - filled, offset + filled);
+				if (bytesRead === 0) throw new Error("Upload source ended before the chunk was complete");
+				filled += bytesRead;
+			}
 			await waitForDrain(deviceId, args.signal);
+			if (stopped) return;
+			if (args.signal?.aborted) throw new Error("upload aborted");
 			const frame = encodeChunkFrame(
 				{ transferId, chunkIndex },
 				new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
@@ -741,14 +827,26 @@ async function uploadFileInner(args: {
 		};
 
 		const worker = async () => {
-			while (true) {
-				if (args.signal?.aborted) throw new Error("upload aborted");
-				const i = next++;
-				if (i >= pending.length) break;
-				await sendOne(pending[i]);
+			try {
+				while (!stopped) {
+					if (args.signal?.aborted) throw new Error("upload aborted");
+					const i = next++;
+					if (i >= pending.length) break;
+					await sendOne(pending[i]);
+				}
+			} catch (error) {
+				stopped = true;
+				throw error;
 			}
 		};
-		await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, worker));
+		// A failed worker stops its siblings, but cannot release their handle/slot
+		// until all already-started reads have actually finished.
+		const results = await Promise.allSettled(
+			Array.from({ length: Math.min(concurrency, pending.length) }, worker),
+		);
+		for (const result of results) {
+			if (result.status === "rejected") throw result.reason;
+		}
 
 		// Signal completion with the same digest used to bind resume state. The
 		// executor hashes the received file, detecting source changes during upload.
@@ -765,14 +863,17 @@ async function uploadFileInner(args: {
 		completed = true;
 		return { transferId, bytes: fileSize };
 	} finally {
-		await fileHandle.close();
-		if (!completed) {
-			// A cancelled upload is terminal, so the executor must drop its partial and
-			// manifest too; anything else (pause, disconnect, error) stays resumable.
-			void sendRpc(deviceId, "transfer.abort", {
-				transferId,
-				preservePartial: !isTransferCancelAbort(args.signal),
-			}).catch(() => {});
+		// Neither cleanup may prevent the other. Await the remote abort as well,
+		// so a retry does not race the previous receiver's checkpoint release.
+		try {
+			await fileHandle.close();
+		} finally {
+			if (!completed) {
+				await sendRpc(deviceId, "transfer.abort", {
+					transferId,
+					preservePartial: !isTransferCancelAbort(args.signal),
+				}).catch(() => {});
+			}
 		}
 	}
 }
@@ -951,7 +1052,18 @@ async function handleChunkFrame(deviceId: string, bytes: Uint8Array): Promise<vo
 	if (!decoded) return;
 	const state = receives.get(decoded.header.transferId);
 	if (!state || state.deviceId !== deviceId) return;
-	await writeChunk(state, decoded.header, decoded.payload);
+	const chunk = writeChunk(state, decoded.header, decoded.payload);
+	state.pendingChunks.add(chunk);
+	try {
+		await chunk;
+	} finally {
+		state.pendingChunks.delete(chunk);
+	}
+	// Finalization may settle the outer download, which drains pending chunks.
+	// Remove this chunk first so completion never joins its own finalizer.
+	if (!state.cleaned && state.received.size >= state.totalChunks) {
+		await finalizeReceive(state);
+	}
 }
 
 async function writeChunk(
@@ -960,15 +1072,23 @@ async function writeChunk(
 	payload: Uint8Array,
 ): Promise<void> {
 	if (state.cleaned || state.received.has(header.chunkIndex)) return;
+	if (
+		!Number.isInteger(header.chunkIndex) ||
+		header.chunkIndex < 0 ||
+		header.chunkIndex >= state.totalChunks
+	)
+		return;
 	const offset = header.chunkIndex * state.chunkSize;
+	if (payload.byteLength !== Math.min(state.chunkSize, state.fileSize - offset)) return;
 	try {
 		await state.fileHandle.write(payload, 0, payload.length, offset);
-		if (state.cleaned) return;
+		if (state.cleaned || state.received.has(header.chunkIndex)) return;
 	} catch (err) {
 		await failReceive(state, err instanceof Error ? err.message : String(err));
 		return;
 	}
 	state.received.add(header.chunkIndex);
+	state.lastProgressAt = performance.now();
 	state.bytesWritten += payload.length;
 	state.pendingAckIndices.push(header.chunkIndex);
 	state.pendingAckCrc.push(crc32c(payload));
@@ -989,10 +1109,6 @@ async function writeChunk(
 			// best effort
 		}
 		await saveLocalManifest(state, state.mtimeMs);
-	}
-
-	if (state.received.size >= state.totalChunks) {
-		await finalizeReceive(state);
 	}
 }
 
@@ -1032,10 +1148,32 @@ function cleanupReceiveState(state: ReceiveState): boolean {
 	return true;
 }
 
-function settleReceive(state: ReceiveState, ok: boolean, error?: string): void {
+function settleReceive(
+	state: ReceiveState,
+	ok: boolean,
+	error?: string,
+	discardPartial = false,
+): void {
 	if (state.settled) return;
 	state.settled = true;
-	state.onFileDone(ok, error);
+	state.onFileDone(ok, error, discardPartial);
+}
+
+async function resolveDownloadCommitTarget(finalPath: string, signal?: AbortSignal) {
+	const path = validateLocalAbsolutePath(finalPath, "Local download destination");
+	const parent = await localBackend.resolvePathIdentity(dirname(path), { signal });
+	const entryPath = join(parent.canonicalPath, basename(path));
+	const entry = await lstat(entryPath).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return null;
+		throw error;
+	});
+	// rename replaces a final symlink itself, rather than writing its referent.
+	// Ordinary-file aliases still share the canonical queue used by local Write.
+	const canonicalPath = entry?.isSymbolicLink()
+		? entryPath
+		: (await localBackend.resolvePathIdentity(entryPath, { signal })).canonicalPath;
+	signal?.throwIfAborted();
+	return { entryPath, canonicalPath };
 }
 
 async function finalizeReceive(state: ReceiveState): Promise<void> {
@@ -1048,7 +1186,42 @@ async function finalizeReceive(state: ReceiveState): Promise<void> {
 		if (finalInfo && state.fileSize > 0 && finalInfo.size !== state.fileSize) {
 			throw new Error(`size mismatch: got ${finalInfo.size}, expected ${state.fileSize}`);
 		}
-		await rename(state.partPath, state.finalPath);
+		let commitStarted = false;
+		try {
+			const target = await resolveDownloadCommitTarget(state.finalPath, state.abortSignal);
+			await withFileWrite(
+				{
+					deviceId: localBackend.deviceId,
+					pathFlavor: localBackend.pathFlavor as "posix" | "windows",
+					canonicalPath: target.canonicalPath,
+				},
+				async () => {
+					const current = await resolveDownloadCommitTarget(state.finalPath, state.abortSignal);
+					if (
+						!localBackend.paths.equals(current.canonicalPath, target.canonicalPath) ||
+						!localBackend.paths.equals(current.entryPath, target.entryPath)
+					)
+						throw new Error("Local download destination changed while waiting for commit");
+					state.abortSignal?.throwIfAborted();
+					commitStarted = true;
+					await rename(state.partPath, target.entryPath);
+				},
+				{ signal: state.abortSignal },
+			);
+		} catch (error) {
+			if (commitStarted || !state.abortSignal?.aborted) throw error;
+			// finalize detached the streaming abort handler. The part is already
+			// synced/closed, so retain stopReceive's cancel-vs-pause semantics here.
+			const cancelled = isTransferCancelAbort(state.abortSignal);
+			if (cancelled) await removeLocalPartial(state.partPath, state.finalPath);
+			else await saveLocalManifest(state, state.mtimeMs);
+			void sendRpc(state.deviceId, "transfer.abort", {
+				transferId: state.transferId,
+				preservePartial: !cancelled,
+			}).catch(() => {});
+			settleReceive(state, false, cancelled ? "transfer cancelled" : "transfer paused", cancelled);
+			return;
+		}
 		await removeLocalManifest(state.finalPath);
 		eventBus.emit({
 			type: "transfer:done",
@@ -1107,11 +1280,22 @@ async function stopReceive(
 		transferId: state.transferId,
 		preservePartial: opts.preservePartial,
 	}).catch(() => {});
-	settleReceive(state, false, error);
+	settleReceive(state, false, error, !opts.preservePartial);
 }
 
 async function failReceive(state: ReceiveState, error: string): Promise<void> {
 	if (!cleanupReceiveState(state)) return;
+	// Best effort, bounded, and independent of the caller's cancelled signal.
+	// Remote acknowledgement must not hold our local checkpoint after IO drains.
+	void sendRpc(
+		state.deviceId,
+		"transfer.abort",
+		{
+			transferId: state.transferId,
+			preservePartial: true,
+		},
+		{ timeoutMs: Math.min(5_000, state.idleTimeoutMs) },
+	).catch(() => {});
 	try {
 		await state.fileHandle.close();
 	} catch {
@@ -1358,13 +1542,15 @@ function transferTaskSummary(task: DeviceTransferTask, result: DirectoryTransfer
 export function createDeviceTransferTaskManager(
 	store: DeviceTransferTaskStore,
 	operations: TransferTaskOperations,
+	runtime = {
+		activeRuns: new Map<string, ActiveTransferTaskRun>(),
+		recoveryPromise: null as Promise<void> | null,
+	},
 ) {
-	const activeRuns = new Map<string, ActiveTransferTaskRun>();
-	let recoveryPromise: Promise<void> | null = null;
-
+	const { activeRuns } = runtime;
 	const ensureRecovery = () => {
-		recoveryPromise ??= store.recoverInterrupted();
-		return recoveryPromise;
+		runtime.recoveryPromise ??= store.recoverInterrupted();
+		return runtime.recoveryPromise;
 	};
 
 	function createProgressWriter(taskId: string, generation: number) {
@@ -1725,48 +1911,55 @@ export function createDeviceTransferTaskManager(
 			}
 			return task;
 		},
-		recover: () => store.recoverInterrupted(),
+		recover: ensureRecovery,
 	};
 }
 
-const transferTaskManager = createDeviceTransferTaskManager(new DeviceTransferTaskStore(db), {
-	statRemote,
-	downloadFile,
-	uploadFile,
-	downloadDirectory,
-	uploadDirectory,
-	statLocal: stat,
-	// Lazily imported: background-task-service imports this module (for the restart
-	// pause notice), so a top-level import here would close the cycle.
-	onTransferClaimed: async (input) => {
-		const { backgroundTaskService } = await import("./background-task-service");
-		return backgroundTaskService.createTransferTask(input);
-	},
-	onTransferPaused: async (transferTaskId, reason) => {
-		const { backgroundTaskService } = await import("./background-task-service");
-		return backgroundTaskService.markTransferPaused(transferTaskId, reason);
-	},
-	onTransferProgress: (transferTaskId, progress) => {
-		void (async () => {
+const transferTaskManager = createDeviceTransferTaskManager(
+	new DeviceTransferTaskStore(db),
+	{
+		statRemote,
+		downloadFile,
+		uploadFile,
+		downloadDirectory,
+		uploadDirectory,
+		statLocal: stat,
+		// Lazily imported: background-task-service imports this module (for the restart
+		// pause notice), so a top-level import here would close the cycle.
+		onTransferClaimed: async (input) => {
 			const { backgroundTaskService } = await import("./background-task-service");
-			await backgroundTaskService.broadcastTransferProgress(transferTaskId, {
-				completed: progress.bytesTransferred,
-				...(progress.totalBytes > 0 ? { total: progress.totalBytes } : {}),
-				...(progress.totalFiles > 1
-					? { itemsDone: progress.filesDone, itemsTotal: progress.totalFiles }
-					: {}),
-				...(progress.currentFile ? { currentItem: progress.currentFile } : {}),
+			return backgroundTaskService.createTransferTask(input);
+		},
+		onTransferPaused: async (transferTaskId, reason) => {
+			const { backgroundTaskService } = await import("./background-task-service");
+			return backgroundTaskService.markTransferPaused(transferTaskId, reason);
+		},
+		onTransferProgress: (transferTaskId, progress) => {
+			void (async () => {
+				const { backgroundTaskService } = await import("./background-task-service");
+				await backgroundTaskService.broadcastTransferProgress(transferTaskId, {
+					completed: progress.bytesTransferred,
+					...(progress.totalBytes > 0 ? { total: progress.totalBytes } : {}),
+					...(progress.totalFiles > 1
+						? { itemsDone: progress.filesDone, itemsTotal: progress.totalFiles }
+						: {}),
+					...(progress.currentFile ? { currentItem: progress.currentFile } : {}),
+				});
+			})().catch(() => {
+				// A missed progress frame is self-correcting: the next one carries the
+				// complete state. Never surfaced as a transfer error.
 			});
-		})().catch(() => {
-			// A missed progress frame is self-correcting: the next one carries the
-			// complete state. Never surfaced as a transfer error.
-		});
+		},
+		onTransferFinished: async (transferTaskId, outcome) => {
+			const { backgroundTaskService } = await import("./background-task-service");
+			return backgroundTaskService.finishTransferTask(transferTaskId, outcome);
+		},
 	},
-	onTransferFinished: async (transferTaskId, outcome) => {
-		const { backgroundTaskService } = await import("./background-task-service");
-		return backgroundTaskService.finishTransferTask(transferTaskId, outcome);
-	},
-});
+	hotSafe("deviceTransfer.taskRuntime", () => ({
+		activeRuns: new Map<string, ActiveTransferTaskRun>(),
+		recoveryPromise: null as Promise<void> | null,
+	})),
+);
 
 export const startDeviceTransferTask = transferTaskManager.start;
 export const getDeviceTransferTask = transferTaskManager.get;
@@ -1787,6 +1980,9 @@ export const recoverInterruptedTransferTasks = transferTaskManager.recover;
 
 // ── Startup wiring ───────────────────────────────────────────────────────────
 
+const transferWiring = hotSafe("deviceTransfer.wiring", () => ({
+	unregisterStatus: null as (() => void) | null,
+}));
 let initialized = false;
 export function initDeviceTransferService(): void {
 	if (initialized) return;
@@ -1801,9 +1997,12 @@ export function initDeviceTransferService(): void {
 	// stop arriving with no RPC to reject). Fail them so callers unblock and
 	// timers are cleared. Revocation/token-rotation also flow through offline
 	// (the connection layer force-disconnects, which emits device:status).
-	eventBus.on("device:status", ({ deviceId, status }) => {
+	transferWiring.unregisterStatus?.();
+	const onStatus = ({ deviceId, status }: { deviceId: string; status: string }) => {
 		if (status === "offline") {
 			failReceivesForDevice(deviceId, `Device ${deviceId} went offline`);
 		}
-	});
+	};
+	eventBus.on("device:status", onStatus);
+	transferWiring.unregisterStatus = () => eventBus.off("device:status", onStatus);
 }

@@ -20,13 +20,25 @@ export function VersionUpdateBanner() {
 			onClose={dismiss}
 			styles={{
 				body: { minWidth: 0 },
-				closeButton: { flexShrink: 0 },
+				/*
+				 * Alert renders the close button as a flex item of its wrapper and gives
+				 * the part no rules of its own, so the default `align-items: stretch`
+				 * leaves it parked at the chain's top edge. Centre it on the cross axis.
+				 */
+				closeButton: { flexShrink: 0, alignSelf: "center" },
 			}}
 			style={{
 				position: "fixed",
 				...TOP_BANNER_SAFE_AREA_STYLE,
-				left: "50%",
-				transform: "translateX(-50%)",
+				/*
+				 * Centred with auto margins rather than `left: 50%` + translateX(-50%):
+				 * the WCO no-drag rect is derived from this element's *layout* box, so
+				 * the layout box is kept identical to the painted box instead of relying
+				 * on a transform to coincide with it.
+				 */
+				left: 0,
+				right: 0,
+				marginInline: "auto",
 				zIndex: Z.toast,
 				maxWidth: 500,
 				width: "calc(100% - 32px)",

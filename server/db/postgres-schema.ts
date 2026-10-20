@@ -459,6 +459,11 @@ export const narrators = pgTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "set null",
 		}),
+		runtimeRegistrationJson: jsonText("runtime_registration_json"),
+		policySourceNarratorId: text("policy_source_narrator_id").references(
+			(): PgColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 		insertSeq: bigint("insert_seq", { mode: "number" }).notNull().generatedByDefaultAsIdentity(),
@@ -476,6 +481,7 @@ export const narrators = pgTable(
 		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_write_audience").on(table.writeAudience),
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
+		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
@@ -1601,6 +1607,7 @@ export const narratorDrafts = pgTable(
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
+		previousJson: text("previous_json"),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_drafts_user_narrator").on(table.userId, table.narratorId),
@@ -2602,9 +2609,9 @@ export const fileChangeStorageBudgets = pgTable(
 		id: text("id").primaryKey().notNull(),
 		namespaceKey: text("namespace_key").notNull(),
 		status: text("status").notNull().default("unverified"),
-		usedBytes: integer("used_bytes").notNull().default(0),
-		reservedBytes: integer("reserved_bytes").notNull().default(0),
-		quotaBytes: integer("quota_bytes").notNull(),
+		usedBytes: bigint("used_bytes", { mode: "number" }).notNull().default(0),
+		reservedBytes: bigint("reserved_bytes", { mode: "number" }).notNull().default(0),
+		quotaBytes: bigint("quota_bytes", { mode: "number" }).notNull(),
 		generation: integer("generation").notNull().default(0),
 		reconciledAt: text("reconciled_at"),
 		updatedAt: text("updated_at").notNull(),
@@ -2680,6 +2687,8 @@ export const fileChangeOperations = pgTable(
 		attempt: integer("attempt").notNull(),
 		requestDigest: text("request_digest"),
 		expectedEffectCount: integer("expected_effect_count"),
+		workspaceLeaseId: text("workspace_lease_id"),
+		editorRawSnapshotRevision: doublePrecision("editor_raw_snapshot_revision"),
 		preparedEffectCount: integer("prepared_effect_count").notNull().default(0),
 		evidenceBytes: integer("evidence_bytes").notNull().default(0),
 		settledEffectCount: integer("settled_effect_count").notNull().default(0),
@@ -2740,7 +2749,7 @@ export const fileChangeEffects = pgTable(
 			.references((): PgColumn => fileChangeScopes.id, {}),
 		fileKey: text("file_key").notNull(),
 		identityJson: jsonText("identity_json").notNull(),
-		scopeRevision: integer("scope_revision").notNull(),
+		scopeRevision: integer("scope_revision"),
 		mutationId: text("mutation_id").notNull(),
 		requestDigest: text("request_digest").notNull(),
 		phase: text("phase").notNull(),
@@ -2750,6 +2759,7 @@ export const fileChangeEffects = pgTable(
 		beforeBlobDigest: text("before_blob_digest"),
 		intendedAfterBlobDigest: text("intended_after_blob_digest"),
 		observedAfterBlobDigest: text("observed_after_blob_digest"),
+		diskOutcome: text("disk_outcome"),
 		outcome: text("outcome").notNull().default("pending"),
 		settlement: text("settlement").notNull().default("preparing"),
 		attributionGrade: text("attribution_grade").notNull().default("unknown"),
@@ -2766,6 +2776,13 @@ export const fileChangeEffects = pgTable(
 		uniqueIndex("idx_fc_effect_mutation").on(table.mutationId),
 		uniqueIndex("idx_fc_effect_operation_file").on(table.operationId, table.fileKey, table.phase),
 		index("idx_fc_effect_file").on(table.scopeId, table.fileKey, table.scopeRevision, table.id),
+		index("idx_fc_effect_journal").on(
+			table.scopeId,
+			table.fileKey,
+			table.journalSeq,
+			table.scopeRevision,
+			table.id,
+		),
 		index("idx_fc_effect_pending").on(table.settlement, table.updatedAt),
 		index("idx_fc_effect_before_blob").on(table.beforeBlobDigest),
 		index("idx_fc_effect_intended_blob").on(table.intendedAfterBlobDigest),
@@ -2905,8 +2922,8 @@ export const revertOperationFiles = pgTable(
 		compensationAfterBlobDigest: text("compensation_after_blob_digest"),
 		applyMutationId: text("apply_mutation_id").notNull(),
 		applyRequestDigest: text("apply_request_digest").notNull(),
-		compensateMutationId: text("compensate_mutation_id").notNull(),
-		compensateRequestDigest: text("compensate_request_digest").notNull(),
+		compensateMutationId: text("compensate_mutation_id"),
+		compensateRequestDigest: text("compensate_request_digest"),
 		status: text("status").notNull().default("prepared"),
 		receiptJson: jsonText("receipt_json"),
 		reason: text("reason"),
@@ -3872,7 +3889,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 122,
-  "columnCount": 1713,
+  "columnCount": 1719,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6712,6 +6729,32 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "runtimeRegistrationJson",
+          "name": "runtime_registration_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "policySourceNarratorId",
+          "name": "policy_source_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_policy_source_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -6798,6 +6841,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_acl_root",
           "columns": [
             "aclRootNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_policy_source",
+          "columns": [
+            "policySourceNarratorId"
           ],
           "unique": false
         },
@@ -13358,6 +13408,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "previousJson",
+          "name": "previous_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         }
       ],
       "indexes": [
@@ -19463,7 +19522,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "usedBytes",
           "name": "used_bytes",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false,
@@ -19474,7 +19533,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "reservedBytes",
           "name": "reserved_bytes",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false,
@@ -19485,7 +19544,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "quotaBytes",
           "name": "quota_bytes",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false
@@ -19915,6 +19974,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "workspaceLeaseId",
+          "name": "workspace_lease_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "editorRawSnapshotRevision",
+          "name": "editor_raw_snapshot_revision",
+          "kind": "real",
+          "pgType": "double precision",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "preparedEffectCount",
           "name": "prepared_effect_count",
           "kind": "integer",
@@ -20333,7 +20410,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "scope_revision",
           "kind": "integer",
           "pgType": "integer",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false
         },
@@ -20438,6 +20515,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "file_change_effects_observed_after_blob_digest_fi_eb9b90860e_fk"
           },
           "emitAsTableConstraint": true
+        },
+        {
+          "property": "diskOutcome",
+          "name": "disk_outcome",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "outcome",
@@ -20571,6 +20657,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "scopeId",
             "fileKey",
+            "scopeRevision",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_fc_effect_journal",
+          "columns": [
+            "scopeId",
+            "fileKey",
+            "journalSeq",
             "scopeRevision",
             "id"
           ],
@@ -21345,7 +21442,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "compensate_mutation_id",
           "kind": "text",
           "pgType": "text",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false
         },
@@ -21354,7 +21451,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "compensate_request_digest",
           "kind": "text",
           "pgType": "text",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false
         },

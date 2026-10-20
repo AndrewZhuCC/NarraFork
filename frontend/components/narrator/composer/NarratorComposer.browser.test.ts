@@ -96,7 +96,7 @@ beforeAll(async () => {
 						...body,
 						ok: true,
 						traits: [],
-						revision: body.baseRevision + 1,
+						revision: row.revision + 1,
 						hasDraft:
 							!!body.text ||
 							!!body.fileReferences?.length ||
@@ -122,7 +122,7 @@ beforeAll(async () => {
 						...body,
 						ok: true,
 						traits: [],
-						revision: body.baseRevision + 1,
+						revision: emptyDraft.revision + 1,
 						hasDraft:
 							!!body.text ||
 							!!body.fileReferences?.length ||
@@ -684,6 +684,89 @@ test("arrow keys recall history from the first or last wrapped line, not from th
 		await close(page);
 	}
 }, 15000);
+test("boundary arrows keep the caret when history does not replace the text", async () => {
+	const page = await open();
+	try {
+		await loadDocument(page, textDocument("only one line"));
+		const start = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("only one line", 0),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowDown");
+		await settle(page);
+		const afterDown = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
+		expect(afterDown.text).toBe("only one line");
+		expect(afterDown.head).toBe(start.head);
+
+		const middle = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("only one line", 4),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowUp");
+		await settle(page);
+		const afterUp = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
+		expect(afterUp.text).toBe("only one line");
+		expect(afterUp.head).toBe(middle.head);
+
+		await loadDocument(page, linesDocument(["line1", "line2", "line3"]));
+		const lastLine = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("line3", 0),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowDown");
+		await settle(page);
+		const stayed = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
+		expect(stayed.text).toBe("line1\nline2\nline3");
+		expect(stayed.head).toBe(lastLine.head);
+	} finally {
+		await close(page);
+	}
+}, 15000);
+test("recalling a tall history entry scrolls its final caret into view", async () => {
+	const page = await open();
+	try {
+		const history = linesDocument(Array.from({ length: 16 }, (_, index) => `H${index + 1}`));
+		const historyText = history.paragraphs[0].children
+			.map((node) => (node.type === "text" ? node.text : "\n"))
+			.join("");
+		await page.evaluate(
+			(doc) => (window as unknown as FixtureWindow).fixture.remember(doc),
+			history,
+		);
+		await loadDocument(page, textDocument("draft"));
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("draft", 0),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowUp");
+		await page.waitForFunction(
+			(expected) => (window as unknown as FixtureWindow).fixture.snapshot().text === expected,
+			{},
+			historyText,
+		);
+		await settle(page);
+		await settle(page);
+		const visible = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.scrollProbe(),
+		);
+		expect(visible.text).toBe(historyText);
+		expect(visible.scrollHeight).toBeGreaterThan(visible.clientHeight + 8);
+		expect(visible.caretBottom).toBeLessThanOrEqual(visible.boxBottom + 2);
+		expect(visible.caretTop).toBeGreaterThanOrEqual(visible.boxTop - 2);
+		await page.keyboard.press("ArrowDown");
+		await page.waitForFunction(
+			() => (window as unknown as FixtureWindow).fixture.snapshot().text === "draft",
+		);
+	} finally {
+		await close(page);
+	}
+}, 15000);
 test("Down exits input history even when the recalled message has missing attachments", async () => {
 	const page = await open();
 	try {
@@ -766,6 +849,88 @@ test("fullscreen Escape dismisses completion before closing the editor", async (
 	}
 });
 
+test("fullscreen Enter only newlines; mod+Enter sends", async () => {
+	const page = await open();
+	try {
+		await loadDocument(page, textDocument("hello"));
+		await page.click('[role="textbox"]');
+		await page.keyboard.press("Enter");
+		await settle(page);
+		// 非全屏基线:Enter 发送。
+		expect((await snapshot(page)).sends).toBe(1);
+		await page.click("button:has(svg.tabler-icon-arrows-maximize)");
+		await settle(page);
+		await page.click('[role="textbox"]');
+		// 全屏:Enter 与 Shift+Enter 都只换行。
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(1);
+		expect((await snapshot(page)).text).toContain("\n");
+		await page.keyboard.down("Shift");
+		await page.keyboard.press("Enter");
+		await page.keyboard.up("Shift");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(1);
+		// mod+Enter 仍然发送。
+		await page.keyboard.down("Control");
+		await page.keyboard.press("Enter");
+		await page.keyboard.up("Control");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(2);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("fullscreen escapes an isolate ancestor and paints above app chrome", async () => {
+	const page = await open();
+	try {
+		// 复刻生产结构:面板容器 isolation: isolate(AppShell Main/路由页),加上一条
+		// z-index 100 的视口级 chrome(导航栏/顶栏)。困在 isolate 里的浮层 z-index 再高
+		// 也画不到 chrome 上面 —— 这正是"全屏被导航挡住"的最小复现。
+		await page.evaluate(() => {
+			const panel = document.getElementById("panel");
+			if (!panel) throw new Error("Missing fixture panel");
+			panel.style.isolation = "isolate";
+			const chrome = document.createElement("div");
+			chrome.id = "fake-chrome";
+			Object.assign(chrome.style, {
+				position: "fixed",
+				inset: "0 0 auto 0",
+				height: "120px",
+				zIndex: "100",
+				background: "red",
+			});
+			document.body.append(chrome);
+		});
+		await page.click("button:has(svg.tabler-icon-arrows-maximize)");
+		await settle(page);
+		const open1 = await page.evaluate(() => {
+			const panel = document.getElementById("panel");
+			if (!panel) throw new Error("Missing fixture panel");
+			const hit = document.elementFromPoint(window.innerWidth / 2, 40);
+			return {
+				hit: hit?.closest('[role="dialog"]') ? "dialog" : (hit?.id ?? hit?.tagName ?? null),
+				isolation: getComputedStyle(panel).isolation,
+			};
+		});
+		expect(open1.hit).toBe("dialog");
+		expect(open1.isolation).toBe("auto");
+		// 退出全屏后祖先样式恢复。
+		await page.keyboard.press("Escape");
+		await settle(page);
+		expect(
+			await page.evaluate(() => {
+				const panel = document.getElementById("panel");
+				if (!panel) throw new Error("Missing fixture panel");
+				return getComputedStyle(panel).isolation;
+			}),
+		).toBe("isolate");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
 function nodeCount(doc: ComposerDocument | undefined, type: string) {
 	return (
 		doc?.paragraphs.flatMap((paragraph) => paragraph.children).filter((node) => node.type === type)
@@ -811,7 +976,7 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 		expect(shortcut.shortcut).toBe("Tab");
 		expect(shortcut.icon).toBe(true);
 		expect(shortcut.topBorder).toBeGreaterThan(0);
-		expect(shortcut.bottomBorder).toBeGreaterThan(shortcut.topBorder);
+		expect(shortcut.bottomBorder).toBe(shortcut.topBorder);
 		expect(shortcut.shrink).toBe("0");
 		expect(shortcut.height).toBeLessThan(shortcut.chipHeight);
 		const consumed = await page.evaluate(() =>
@@ -1092,14 +1257,18 @@ async function layoutSnapshot(page: Page) {
 		const root = document.querySelector<HTMLElement>("[data-inline-composer]");
 		const textbox = root?.querySelector<HTMLElement>('[role="textbox"]');
 		if (!root || !textbox) throw new Error("Missing input");
+		const frame = root.getBoundingClientRect();
+		const controls = root.querySelector("[data-composer-controls]")?.getBoundingClientRect();
 		return {
 			mode: root.dataset.layout,
-			height: root.getBoundingClientRect().height,
+			height: frame.height,
 			target: Number.parseFloat(root.style.height),
 			width: root.clientWidth,
 			scrollWidth: root.scrollWidth,
 			contentHeight:
 				root.querySelector("[data-composer-scroll]")?.getBoundingClientRect().height ?? 0,
+			controlGapAbove: controls ? controls.top - frame.top : Number.NaN,
+			controlGapBelow: controls ? frame.bottom - controls.bottom : Number.NaN,
 			placeholder: getComputedStyle(textbox, "::before").content,
 			focused: root.ownerDocument.activeElement === textbox,
 		};
@@ -1123,6 +1292,8 @@ test("empty, short text and regular chips use a compact single line; long conten
 		const empty = await layoutSnapshot(page);
 		expect(empty.mode).toBe("compact");
 		expect(empty.height).toBeLessThanOrEqual(54);
+		// Single-line controls keep symmetric vertical gaps (8px above and below).
+		expect(Math.abs(empty.controlGapAbove - empty.controlGapBelow)).toBeLessThanOrEqual(1);
 		for (const doc of [
 			shortLayoutDocument,
 			{
@@ -1313,6 +1484,7 @@ test("height transitions reverse in flight without remounting the editor or queu
 		expect(result.sameElement).toBe(true);
 		expect(result.focused).toBe(true);
 		const max = Math.max(...result.frames.map((frame) => frame.target));
+		const span = Math.max(max - compact, 1);
 		expect(max).toBeGreaterThan(compact + 24);
 		expect(
 			result.frames.some((frame) => frame.height > compact + 1 && frame.height < max - 1),
@@ -1322,12 +1494,16 @@ test("height transitions reverse in flight without remounting the editor or queu
 			const previous = result.frames[index - 1];
 			expect(current.height).toBeGreaterThanOrEqual(compact - 1);
 			expect(current.height).toBeLessThanOrEqual(max + 1);
-			// The easing peaks at about four times linear, and one compositor frame of that
-			// peak is ~66px on this control. JS timestamps on CI can be closer than the
-			// vsync that produced the pixels, so the budget never shrinks below one 60Hz
-			// frame. A same-frame snap of the whole range still fails.
+			// cubic-bezier(0.2, 0, 0, 1) peaks near 4× linear over the 180ms height
+			// transition. Headless CI often composites more than one vsync between two
+			// close performance.now() samples, so the budget also covers a 30Hz gap.
+			// It still rejects a same-frame snap of the whole travel.
 			const frameMs = Math.max(current.time - previous.time, 1000 / 60);
-			const allowed = (((max - compact) * frameMs) / 180) * 4 + 2;
+			const step = (duration: number) => ((span * duration) / 180) * 4 + 2;
+			const allowed = Math.min(
+				span * 0.75,
+				Math.max(step(frameMs), step(Math.max(frameMs, 1000 / 30))),
+			);
 			expect(Math.abs(current.height - previous.height)).toBeLessThanOrEqual(allowed);
 		}
 		await layoutSettled(page);
@@ -1834,3 +2010,194 @@ test("reusing the mounted composer never exposes the previous account's live or 
 		await closePersistentAttachments(page);
 	}
 }, 20_000);
+
+for (const width of [1440, 390]) {
+	for (const scheme of ["light", "dark"] as const) {
+		test(`${width}px ${scheme}: quote confirmation keeps chip typography and vertical alignment`, async () => {
+			const page = await open();
+			try {
+				await page.setViewport({ width, height: 844 });
+				await page.evaluate((theme) => {
+					document.documentElement.setAttribute("data-mantine-color-scheme", theme);
+				}, scheme);
+				await selectQuotableSource(page);
+				const settleChipLayout = async () => {
+					await settle(page);
+					// Measure settled geometry, not an intermediate frame of the adaptive layout.
+					await page.waitForFunction(() =>
+						[
+							...document.querySelectorAll(
+								'[data-inline-composer], [data-inline-composer] [role="textbox"]',
+							),
+						].every((element) =>
+							element.getAnimations().every((animation) => animation.playState !== "running"),
+						),
+					);
+				};
+				await settleChipLayout();
+				const measure = (selector: string) =>
+					page.$eval(selector, (chip) => {
+						const body = chip.querySelector("button");
+						const label = body?.querySelector(":scope > span:last-child");
+						const icon = body?.querySelector(":scope > svg");
+						if (!body || !label || !icon) throw new Error("Missing chip content");
+						const box = chip.getBoundingClientRect();
+						const style = getComputedStyle(chip);
+						const textStyle = getComputedStyle(label);
+						const centerOffset = (element: Element) => {
+							const rect = element.getBoundingClientRect();
+							return rect.y + rect.height / 2 - box.y - box.height / 2;
+						};
+						const kbd = chip.querySelector("kbd");
+						const keyText = kbd?.querySelector("span");
+						return {
+							height: box.height,
+							y: box.y,
+							border: style.borderTopWidth,
+							font: textStyle.font,
+							textHeight: label.getBoundingClientRect().height,
+							labelOffset: centerOffset(label),
+							iconOffset: centerOffset(icon),
+							icon: icon.getAttribute("class"),
+							label: label.textContent,
+							keyOffset: kbd && keyText ? centerOffset(keyText) - centerOffset(kbd) : 0,
+							keyHeight: keyText?.getBoundingClientRect().height,
+						};
+					});
+				if (process.env.NF_COMPOSER_SCREENSHOTS)
+					await page.screenshot({
+						path: `.narrafork/quote-${width}-${scheme}-before.png`,
+						fullPage: true,
+					});
+				const before = await measure("[data-inline-quote-candidate]");
+				expect(before.height).toBe(24);
+				expect(Math.abs(before.keyOffset)).toBeLessThanOrEqual(1);
+				expect(before.keyHeight).toBeLessThanOrEqual(16);
+				await page.keyboard.press("Tab");
+				await settleChipLayout();
+				if (process.env.NF_COMPOSER_SCREENSHOTS)
+					await page.screenshot({
+						path: `.narrafork/quote-${width}-${scheme}-after.png`,
+						fullPage: true,
+					});
+				const after = await measure('[data-composer-atom="quote"]');
+				expect(after.height).toBe(before.height);
+				expect(after.border).toBe(before.border);
+				expect(after.font).toBe(before.font);
+				expect(after.textHeight).toBe(before.textHeight);
+				expect(after.label).toBe(before.label);
+				expect(after.icon).toBe(before.icon);
+				expect(Math.abs(after.y - before.y)).toBeLessThanOrEqual(1);
+				for (const geometry of [before, after]) {
+					expect(Math.abs(geometry.labelOffset)).toBeLessThanOrEqual(1);
+					expect(Math.abs(geometry.iconOffset)).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				await close(page);
+			}
+		});
+	}
+}
+
+for (const input of ["mouse", "touch"] as const)
+	test(`${input}: text attachment previews stay above fullscreen and Escape closes only the preview`, async () => {
+		const page = await open();
+		try {
+			if (input === "touch") {
+				await page.setViewport({ width: 390, height: 844, hasTouch: true });
+				await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
+			}
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.stageMixed());
+			await settle(page);
+			const before = await snapshot(page);
+			await page.click("button:has(svg.tabler-icon-arrows-maximize)");
+			await settle(page);
+			const body = '[data-composer-atom="attachment"] button[aria-label="console.log"]';
+			if (input === "mouse") {
+				await page.click(body);
+				expect(await page.$('pre[role="region"]')).toBeNull();
+				await page.click(body, { clickCount: 2 });
+			} else {
+				const point = await page.$eval(body, (element) => {
+					const rect = element.getBoundingClientRect();
+					return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+				});
+				await page.touchscreen.tap(point.x, point.y);
+			}
+			await page.waitForSelector('pre[role="region"]', { visible: true });
+			expect(
+				await page.$eval('pre[role="region"]', (preview) => {
+					const rect = preview.getBoundingClientRect();
+					return (
+						document
+							.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+							?.closest('pre[role="region"]') === preview
+					);
+				}),
+			).toBe(true);
+			expect(await page.$eval('pre[role="region"]', (preview) => preview.textContent)).toBe(
+				"console output",
+			);
+			expect((await snapshot(page)).document).toEqual(before.document);
+			if (process.env.NF_COMPOSER_SCREENSHOTS)
+				await page.screenshot({
+					path: `.narrafork/text-attachment-preview-fullscreen-${input}.png`,
+					fullPage: true,
+				});
+			await page.keyboard.press("Escape");
+			await page.waitForSelector('pre[role="region"]', { hidden: true });
+			expect(await page.$('[aria-label="Compose message"]')).not.toBeNull();
+			await page.keyboard.press("Escape");
+			await settle(page);
+			expect(await page.$('[aria-label="Compose message"]')).toBeNull();
+		} finally {
+			await close(page);
+		}
+	});
+test("a quote chip click opens its full text; the jump is an explicit button", async () => {
+	const page = await open();
+	const text = "Intro **bold** line\n\n```ts\nconst answer = 42;\n```";
+	try {
+		await loadDocument(page, {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "Ask " },
+						{
+							type: "quote",
+							id: "q-detail",
+							label: "Intro bold line",
+							text,
+							anchor: "m:message-source",
+						},
+					],
+				},
+			],
+		});
+		await page.click('[data-composer-atom="quote"] > button');
+		await page.waitForSelector("[data-quote-detail-body]", { visible: true });
+		const body = await page.$eval("[data-quote-detail-body]", (node) => ({
+			text: node.textContent ?? "",
+			bold: node.querySelector("strong")?.textContent,
+			code: !!node.querySelector("pre, code"),
+		}));
+		expect(body.text).toContain("const answer = 42;");
+		expect(body.bold).toBe("bold");
+		expect(body.code).toBe(true);
+		// Opening the detail neither jumped away nor touched the draft.
+		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);
+		expect(
+			await page.$eval(
+				"[data-quote-detail-jump]",
+				(button) => (button as HTMLButtonElement).disabled,
+			),
+		).toBe(false);
+		await page.click("[data-quote-detail-jump]");
+		await page.waitForSelector("[data-quote-detail-body]", { hidden: true });
+		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);
+	} finally {
+		await close(page);
+	}
+});

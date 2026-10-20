@@ -17,7 +17,7 @@ beforeEach(() => {
 	database = new Database(":memory:");
 	database.run(`CREATE TABLE narrators (
 		id TEXT PRIMARY KEY, type TEXT DEFAULT 'primary', variant TEXT DEFAULT 'primary',
-		context_char_revision INTEGER DEFAULT 0, context_system_chars INTEGER DEFAULT 0,
+		parent_narrator_id TEXT, runtime_registration_json TEXT, context_char_revision INTEGER DEFAULT 0, context_system_chars INTEGER DEFAULT 0,
 		context_summary_chars INTEGER DEFAULT 0, context_tools_chars INTEGER DEFAULT 0,
 		context_usage_snapshot_json TEXT);
 	 CREATE TABLE narrator_message_refs (
@@ -72,6 +72,36 @@ test("latest compact boundary drops older messages", async () => {
 	database.run("UPDATE narrator_message_refs SET is_compact=1 WHERE message_id='compact'");
 	message("next", 3, [{ category: "user", chars: 4 }]);
 	expect((await service.get("n")).totalChars).toBe(4);
+});
+
+const deliversTo = (toolUseId: string) =>
+	JSON.stringify({
+		version: 1,
+		run: { logicalRunId: "r", deliverTo: { narratorId: "caller", toolUseId } },
+	});
+
+test("only the session's own turns count: no placement, or placed under its run's destination", async () => {
+	message("top", 1, [{ category: "user", chars: 3 }]);
+	message("own-turn", 2, [{ category: "assistant", chars: 5 }], "assistant");
+	message("nested", 3, [{ category: "assistant", chars: 13 }], "assistant");
+	database.run(`UPDATE narrator_message_context_stats SET parent_tool_use_id='dest-tool' WHERE message_id='own-turn';
+	 UPDATE narrator_message_context_stats SET parent_tool_use_id='other-tool' WHERE message_id='nested';`);
+	// No registered destination: placed rows are nested, not own turns.
+	expect((await service.get("n")).totalChars).toBe(3);
+	// Registering a destination (no parent, ordinary type) makes rows under it own turns.
+	database
+		.query("UPDATE narrators SET runtime_registration_json=? WHERE id='n'")
+		.run(deliversTo("dest-tool"));
+	expect((await service.get("n")).totalChars).toBe(8);
+	// A delegated shape adds no placement: it counts exactly the rows the ordinary
+	// session does, before and after a destination is registered.
+	database.run(`INSERT INTO narrators(id,type,variant,parent_narrator_id) VALUES ('child','subagent','subagent:general','caller');
+	 INSERT INTO narrator_message_refs SELECT 'child',message_id,seq,is_compact,segment_compact_id FROM narrator_message_refs WHERE narrator_id='n';`);
+	expect((await service.get("child")).totalChars).toBe(3);
+	database
+		.query("UPDATE narrators SET runtime_registration_json=? WHERE id='child'")
+		.run(deliversTo("dest-tool"));
+	expect((await service.get("child")).totalChars).toBe(8);
 });
 
 test("a request pin stays put after later messages arrive", async () => {

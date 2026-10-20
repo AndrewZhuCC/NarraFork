@@ -20,6 +20,7 @@ import type { FileReference } from "@shared/file-reference";
 import {
 	IconChevronDown,
 	IconChevronRight,
+	IconFileText,
 	IconMessageCircle,
 	IconQuote,
 } from "@tabler/icons-react";
@@ -43,7 +44,11 @@ import {
 	USER_BUBBLE_PADDING,
 	USER_HEADER_BODY_GAP,
 	USER_HEADER_HEIGHT,
+	USER_INLINE_CHIP_HEIGHT,
+	USER_INLINE_CHIP_MARGIN,
 	USER_QUOTE_CHIP_HEIGHT,
+	type UserInlineAtom,
+	type UserInlineFragment,
 } from "../measure/measure-message-bubble";
 import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
@@ -520,6 +525,19 @@ function UserBubble({
 							/>
 						);
 					}
+					if (block.tag === "user-inline-flow") {
+						return (
+							<UserInlineFlow
+								key="user-inline-flow"
+								block={block}
+								top={top}
+								left={USER_BUBBLE_PADDING}
+								narratorId={narratorId}
+								onOpenAttachment={onOpenAttachment}
+								onFetchAttachment={onFetchAttachment}
+							/>
+						);
+					}
 					return (
 						<UserAttachmentView
 							// biome-ignore lint/suspicious/noArrayIndexKey: attachment blocks are a stable ordered list (message contentJson order)
@@ -562,103 +580,116 @@ function UserQuoteChips({
 	top: number;
 	left: number;
 }) {
-	const { t } = useTranslation("narrator");
-	const dock = useNarratorDockContext();
-	const [previewIndex, setPreviewIndex] = useState<number | null>(null);
 	const data = block.data ?? {};
 	const quotes = Array.isArray(data.quotes) ? (data.quotes as StoredQuoteChip[]) : [];
 	const chips = Array.isArray(data.chips) ? (data.chips as StoredQuoteChipBox[]) : [];
-	const activeQuote = previewIndex === null ? null : quotes[previewIndex];
+	return (
+		<div
+			style={{ position: "absolute", top, left, width: block.displayWidth, height: block.height }}
+		>
+			{quotes.map((quote, index) => {
+				const box = chips[index];
+				if (!box) return null;
+				return (
+					<ReadOnlyQuoteChip
+						// biome-ignore lint/suspicious/noArrayIndexKey: chip order is the stored quote order
+						key={index}
+						quote={quote}
+						style={{
+							position: "absolute",
+							left: box.x,
+							top: box.y,
+							width: box.width,
+							height: USER_QUOTE_CHIP_HEIGHT,
+							font: typographyMetrics().font.xs,
+						}}
+					/>
+				);
+			})}
+		</div>
+	);
+}
+
+/** One shared comment action for stacked and interleaved sent quotes. */
+function ReadOnlyQuoteChip({
+	quote,
+	label = quote.label,
+	compact = false,
+	style,
+}: {
+	quote: StoredQuoteChip;
+	label?: string;
+	compact?: boolean;
+	style: React.CSSProperties;
+}) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	const [commentOpened, setCommentOpened] = useState(false);
+	const preview = quote.text.length > 600 ? `${quote.text.slice(0, 600)}…` : quote.text;
+	const canOpen = !!quote.reference || (!!quote.anchor && !quote.anchor.startsWith("f:"));
 	return (
 		<Popover
-			opened={!!activeQuote?.comment}
-			onDismiss={() => setPreviewIndex(null)}
+			opened={commentOpened && !!quote.comment}
+			onDismiss={() => setCommentOpened(false)}
 			position="top-start"
 			width="min(420px, calc(100vw - 24px))"
 			withinPortal
 			withArrow
 			shadow="md"
+			returnFocus={false}
 		>
-			<Popover.Target>
-				<div
-					style={{
-						position: "absolute",
-						top,
-						left,
-						width: block.displayWidth,
-						height: block.height,
-					}}
-				>
-					{quotes.map((quote, index) => {
-						const box = chips[index];
-						if (!box) return null;
-						const preview = quote.text.length > 600 ? `${quote.text.slice(0, 600)}…` : quote.text;
-						const canOpen = !!quote.reference || (!!quote.anchor && !quote.anchor.startsWith("f:"));
-						return (
-							<Tooltip
-								// biome-ignore lint/suspicious/noArrayIndexKey: chip order is the stored quote order
-								key={index}
-								label={
-									<span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{preview}</span>
-								}
-								multiline
-								w={360}
-								openDelay={300}
-								withinPortal
-							>
-								<QuoteChip
-									label={quote.label}
-									comment={quote.comment}
-									file={!!quote.reference}
-									style={{
-										position: "absolute",
-										left: box.x,
-										top: box.y,
-										width: box.width,
-										height: USER_QUOTE_CHIP_HEIGHT,
-										font: typographyMetrics().font.xs,
-									}}
-									onOpen={
-										canOpen
-											? (event) => {
-													if (window.getSelection()?.isCollapsed === false) return;
-													event.stopPropagation();
-													if (quote.reference) revealQuotedFile(dock, quote.reference);
-													else if (quote.anchor)
-														revealComposerQuote(
-															dock,
-															{ label: quote.label, text: quote.text, anchor: quote.anchor },
-															event.currentTarget,
-														);
-												}
-											: undefined
+			<Tooltip
+				label={<span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{preview}</span>}
+				multiline
+				w={360}
+				openDelay={300}
+				withinPortal
+			>
+				<Popover.Target>
+					<QuoteChip
+						label={label}
+						comment={quote.comment}
+						compactComment={compact}
+						file={!!quote.reference}
+						style={style}
+						onOpen={
+							canOpen
+								? (event) => {
+										if (window.getSelection()?.isCollapsed === false) return;
+										event.stopPropagation();
+										if (quote.reference) revealQuotedFile(dock, quote.reference);
+										else if (quote.anchor)
+											revealComposerQuote(
+												dock,
+												{ ...quote, anchor: quote.anchor },
+												event.currentTarget,
+											);
 									}
-									commentLabel={t("quote.viewComment")}
-									onComment={
-										quote.comment
-											? (event) => {
-													event.stopPropagation();
-													setPreviewIndex((current) => (current === index ? null : index));
-												}
-											: undefined
+								: undefined
+						}
+						commentLabel={t("quote.viewComment")}
+						onComment={
+							quote.comment
+								? (event) => {
+										event.stopPropagation();
+										setCommentOpened((opened) => !opened);
 									}
-								/>
-							</Tooltip>
-						);
-					})}
-				</div>
-			</Popover.Target>
-			{activeQuote?.comment && (
+								: undefined
+						}
+					/>
+				</Popover.Target>
+			</Tooltip>
+			{quote.comment && (
 				<Popover.Dropdown p="xs" role="dialog" aria-label={t("quote.viewComment")}>
 					<Group gap={6} wrap="nowrap" mb={6}>
 						<IconQuote size={14} style={{ flexShrink: 0 }} />
 						<Text size="xs" truncate style={{ flex: 1 }}>
-							{activeQuote.label}
+							{quote.label}
 						</Text>
 						<CloseButton
 							size="sm"
 							aria-label={t("close", { ns: "common" })}
-							onClick={() => setPreviewIndex(null)}
+							onClick={() => setCommentOpened(false)}
 						/>
 					</Group>
 					<Group gap={6} align="flex-start" wrap="nowrap">
@@ -676,12 +707,165 @@ function UserQuoteChips({
 								minWidth: 0,
 							}}
 						>
-							{activeQuote.comment}
+							{quote.comment}
 						</Text>
 					</Group>
 				</Popover.Dropdown>
 			)}
 		</Popover>
+	);
+}
+
+/** Inline chip look, matching the stacked quote chips. */
+const CHIP_STYLE = {
+	boxSizing: "border-box",
+	display: "flex",
+	alignItems: "center",
+	gap: 4,
+	border: "1px solid var(--mantine-color-default-border)",
+	borderRadius: "var(--mantine-radius-sm)",
+	background: "var(--mantine-color-default-hover)",
+	color: "inherit",
+	overflow: "hidden",
+	textAlign: "left",
+} as const;
+
+/**
+ * An interleaved body: text and chips at the positions the measure pass laid out, one
+ * absolutely positioned line at a time. Quote chips jump to their source; attachment
+ * chips open the image viewer or the file.
+ */
+function UserInlineFlow({
+	block,
+	top,
+	left,
+	narratorId,
+	onOpenAttachment,
+	onFetchAttachment,
+}: {
+	block: PreparedFixedBlock;
+	top: number;
+	left: number;
+	narratorId?: string;
+	onOpenAttachment?: (filePath: string) => void;
+	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
+}) {
+	const data = block.data ?? {};
+	const lines = Array.isArray(data.lines) ? (data.lines as UserInlineFragment[][]) : [];
+	const atoms = Array.isArray(data.atoms) ? (data.atoms as UserInlineAtom[]) : [];
+	const lineHeight = typeof data.lineHeight === "number" ? data.lineHeight : 20;
+	const chipTop = Math.max(0, (lineHeight - USER_INLINE_CHIP_HEIGHT) / 2);
+	const renderAtom = (atom: UserInlineAtom, width: number) => {
+		const label = (
+			<span
+				style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}
+			>
+				{atom.label}
+			</span>
+		);
+		const style = {
+			...CHIP_STYLE,
+			width: width - USER_INLINE_CHIP_MARGIN * 2,
+			height: USER_INLINE_CHIP_HEIGHT,
+			padding: "0 5px",
+			font: typographyMetrics().font.xs,
+		};
+		if (atom.kind === "quote") {
+			return (
+				<ReadOnlyQuoteChip
+					quote={{ ...atom.quote, reference: atom.reference }}
+					label={atom.label}
+					compact
+					style={style}
+				/>
+			);
+		}
+		const attachment = atom.attachment;
+		if (atom.kind === "image") {
+			return (
+				<span style={style} title={attachment.filename ?? undefined}>
+					<span style={{ flexShrink: 0, display: "flex" }}>
+						<VListImage
+							media={{
+								previewUrl: attachment.previewUrl ?? undefined,
+								imageId: attachment.imageId ?? undefined,
+								filename: attachment.filename ?? undefined,
+								uploadNarratorId: attachment.uploadNarratorId ?? undefined,
+								fetchUrl: attachment.fetchUrl ?? undefined,
+							}}
+							narratorId={narratorId}
+							maxHeight={14}
+							displayWidth={14}
+							displayHeight={14}
+						/>
+					</span>
+					{label}
+				</span>
+			);
+		}
+		const filename = attachment.filename ?? "";
+		const open =
+			attachment.fetchUrl && onFetchAttachment
+				? () => onFetchAttachment(attachment.fetchUrl ?? "", filename)
+				: attachment.filePath && onOpenAttachment
+					? () => onOpenAttachment(attachment.filePath ?? "")
+					: undefined;
+		return (
+			<button
+				type="button"
+				disabled={!open}
+				title={filename}
+				onClick={(event) => {
+					if (!open || window.getSelection()?.isCollapsed === false) return;
+					event.stopPropagation();
+					open();
+				}}
+				style={{ ...style, cursor: open ? "pointer" : "default" }}
+			>
+				<IconFileText size={14} style={{ flexShrink: 0 }} />
+				{label}
+			</button>
+		);
+	};
+	return (
+		<div
+			style={{
+				position: "absolute",
+				top,
+				left,
+				width: block.displayWidth,
+				height: block.height,
+			}}
+		>
+			{lines.map((fragments, lineIndex) => (
+				<div
+					// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
+					key={lineIndex}
+					style={{ position: "absolute", top: lineIndex * lineHeight, left: 0, height: lineHeight }}
+				>
+					{fragments.map((fragment, index) => {
+						const atom = fragment.atom === undefined ? undefined : atoms[fragment.atom];
+						return (
+							<div
+								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+								key={index}
+								style={{
+									position: "absolute",
+									left: fragment.x + (atom ? USER_INLINE_CHIP_MARGIN : 0),
+									top: atom ? chipTop : 0,
+									height: atom ? USER_INLINE_CHIP_HEIGHT : lineHeight,
+									whiteSpace: "pre",
+									font: typographyMetrics().font.body,
+									color: "var(--mantine-color-text)",
+								}}
+							>
+								{atom ? renderAtom(atom, fragment.width) : fragment.text}
+							</div>
+						);
+					})}
+				</div>
+			))}
+		</div>
 	);
 }
 

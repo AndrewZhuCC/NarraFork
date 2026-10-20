@@ -15,6 +15,7 @@ import {
 	extractEmittedHtml,
 	filterAppShellManifest,
 } from "./build/app-shell-precache";
+import { editorCodecBuffer } from "./build/editor-codec-buffer";
 import {
 	buildPluginUiRuntime,
 	isMainApplicationBuild as isMainPluginRuntimeBuild,
@@ -515,7 +516,7 @@ export default defineConfig(({ mode, command }) => {
 			format: "es",
 			// Worker graphs have their own plugins: never inline Shiki's entire grammar registry.
 			// Editor-only workers do not import Shiki and need no substitution.
-			plugins: () => [shikiLanguageAliases(false)],
+			plugins: () => [shikiLanguageAliases(false), editorCodecBuffer()],
 		},
 		define: {
 			__NARRAFORK_BUILD_REPOSITORY__: JSON.stringify(
@@ -529,6 +530,7 @@ export default defineConfig(({ mode, command }) => {
 			__APP_VERSION__: JSON.stringify(appVersion),
 		},
 		plugins: [
+			editorCodecBuffer(),
 			watchSharedDirectory(),
 			devSpaBaseHref(),
 			shikiLanguageAliases(),

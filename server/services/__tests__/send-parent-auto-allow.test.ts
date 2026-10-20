@@ -11,6 +11,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -19,6 +20,14 @@ mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { shouldAutoAllowSendWithinScope } = await import("../narrator-permission");
 
 const PARENT = "auto-allow-parent";
+
+/** Relations a delegation stores when it is created. */
+function delegated(parent: string, pool = "general") {
+	return {
+		policySourceNarratorId: parent,
+		runtimeRegistrationJson: delegationRegistration(parent, pool),
+	};
+}
 const CHILD = "auto-allow-child";
 const SIBLING = "auto-allow-sibling";
 const PRIVILEGED = "auto-allow-privileged";
@@ -45,6 +54,7 @@ beforeEach(async () => {
 			variant: "subagent:explore",
 			type: "subagent",
 			parentNarratorId: PARENT,
+			...delegated(PARENT, "explore"),
 			permissionMode: "default",
 			createdAt: now,
 			updatedAt: now,
@@ -54,6 +64,7 @@ beforeEach(async () => {
 			variant: "subagent:general",
 			type: "subagent",
 			parentNarratorId: PARENT,
+			...delegated(PARENT),
 			permissionMode: "default",
 			createdAt: now,
 			updatedAt: now,
@@ -63,6 +74,7 @@ beforeEach(async () => {
 			variant: "subagent:general",
 			type: "subagent",
 			parentNarratorId: PARENT,
+			...delegated(PARENT),
 			permissionMode: "bypassPermissions",
 			createdAt: now,
 			updatedAt: now,

@@ -477,8 +477,6 @@ export function AuthenticatedLayout() {
 				openNav={openNav}
 				closeNav={closeNav}
 			/>
-			<WSConnectionAlert />
-			<VersionUpdateBanner />
 			<AppShell.Header ref={headerRef} style={APP_SHELL_SAFE_HEADER_STYLE}>
 				<HeaderPullToRefresh targetRef={headerRef} enabled={isTouchPointer && !wizardOpen} />
 				{wizardOpen && !opened && (
@@ -896,6 +894,25 @@ export function AuthenticatedLayout() {
 					</Suspense>
 				</LazyOverlayBoundary>
 			)}
+
+			{/*
+			 * The two fixed top banners are rendered LAST on purpose.
+			 *
+			 * Under WCO the whole title-bar strip is ours and the header row is the
+			 * drag surface (`styles/wco.css`), so the banners paint over a draggable
+			 * rect. `-webkit-app-region` hit-testing is purely geometric, and the
+			 * browser folds the rects the page reported into one region *in list
+			 * order, later rects winning where they overlap* — the list being the
+			 * layout-tree order. A banner emitted before the header row therefore
+			 * loses its clicks to window dragging: only its own `no-drag` rect, seen
+			 * after the row's `drag` rect, can cancel it. The header clusters work
+			 * because they are children of the row and so are collected after it;
+			 * these banners are siblings, so their place in the tree is what decides.
+			 * Emitted after the header row *and* the navbar's WCO spacer, they are
+			 * collected last and stay clickable.
+			 */}
+			<WSConnectionAlert />
+			<VersionUpdateBanner />
 		</AppShellWithNavWidth>
 	);
 }

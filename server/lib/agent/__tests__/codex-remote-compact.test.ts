@@ -809,7 +809,10 @@ describe("Codex retained user originals", () => {
 			new File([bytes], "pixel.png", { type: "image/png" }),
 		);
 		const imageMessage = message("image", "user", "caption");
-		imageMessage.contentJson = [{ type: "text", text: "caption" }, imageRefToContentBlock(upload)];
+		imageMessage.contentJson = [
+			{ type: "text", text: "caption [image #1: pixel.png] after" },
+			imageRefToContentBlock(upload),
+		];
 		try {
 			const result = await compact([imageMessage, message("reply", "assistant", "ok")]);
 			expect(JSON.stringify(result.retainedUsers)).not.toContain("base64");
@@ -824,6 +827,14 @@ describe("Codex retained user originals", () => {
 			);
 			expect(JSON.stringify(replay)).toContain("data:image/png;base64,");
 			expect(JSON.stringify(replay)).not.toContain("uploadNarratorId");
+			const normal = await provider.buildHistory(
+				[imageMessage, message("reply", "assistant", "ok")],
+				"relay:gpt-5.3-codex",
+			);
+			expect(replay[0]).toEqual(normal.history[0]);
+			expect(
+				(replay[0] as { content: Array<{ type: string }> }).content.map((part) => part.type),
+			).toEqual(["input_text", "input_image", "input_text"]);
 			const budgeted = await compact([
 				imageMessage,
 				message("new", "user", "B".repeat(63_000 * 4)),

@@ -12,7 +12,10 @@ import {
 	boundedJson,
 	isAwaitedTerminalConsumption,
 	mailboxDedupeKey,
+	nextCurrentRevision,
 	pointer,
+	recipientDeletedReceiptPatch,
+	semanticEditReceiptPatch,
 } from "./mailbox-shared";
 
 test("only exact Await cancellation of an unmaterialized task notice is a benign skip", () => {
@@ -33,6 +36,37 @@ test("only exact Await cancellation of an unmaterialized task notice is a benign
 		{ ...row, currentMessageId: "persisted-history" },
 	])
 		expect(isAwaitedTerminalConsumption(other)).toBe(false);
+});
+
+test("recipient deletion receipt is one shared, fixed three-field patch", () => {
+	const at = "2026-09-09T00:00:00.000Z";
+	const patch = recipientDeletedReceiptPatch(at);
+	expect(patch).toEqual({
+		currentMessageId: null,
+		receiptDisposition: "recipient_deleted",
+		updatedAt: at,
+	});
+	expect(recipientDeletedReceiptPatch(at)).not.toBe(patch);
+});
+
+test("semantic edit supersedes the current content without touching the original adoption", () => {
+	const at = "2026-09-09T00:00:00.000Z";
+	expect(semanticEditReceiptPatch("copy", 4, at)).toEqual({
+		currentMessageId: "copy",
+		receiptDisposition: "superseded",
+		currentRevision: 4,
+		currentAdoptedRevision: null,
+		currentAdoptedAt: null,
+		updatedAt: at,
+	});
+	// Original-delivery facts are deliberately absent from the patch.
+	const keys = Object.keys(semanticEditReceiptPatch("copy", 4, at));
+	for (const original of ["adoptedRevision", "adoptedAt", "contentRevision", "state"])
+		expect(keys).not.toContain(original);
+	// The value form matches the adapters' max/greatest(current, content) + 1.
+	expect(nextCurrentRevision(3, 1)).toBe(4);
+	expect(nextCurrentRevision(1, 5)).toBe(6);
+	expect(nextCurrentRevision(2, 2)).toBe(3);
 });
 
 test("boundedJson encodes within the byte budget and rejects overflow", () => {

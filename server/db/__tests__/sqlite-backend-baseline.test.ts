@@ -96,11 +96,9 @@ describe("SQLite is the default database backend", () => {
 			expect(conn.query("PRAGMA journal_mode").get()).toMatchObject({ journal_mode: "wal" });
 			expect(conn.query("PRAGMA foreign_keys").get()).toMatchObject({ foreign_keys: 1 });
 
-			// 0..250ms is the project-wide bound, not a rough sanity range. Three services
-			// REFUSE to run outside it — workspace-write-coordinator.ts:287,
-			// revert-mutation-journal.ts:145 and file-change-physical-audit-worker.ts:284 all
-			// throw above 250 — so a laxer bound here (this test first allowed up to 1000) would
-			// call a connection healthy that those services reject at startup.
+			// 0..250ms is the project-wide bound, not a rough sanity range. The synchronous
+			// driver blocks HTTP/WS handling while waiting on database locks; a longer wait
+			// would defeat the application-level asynchronous retry policy.
 			const { timeout } = conn.query("PRAGMA busy_timeout").get() as { timeout: number };
 			expect(Number.isInteger(timeout)).toBe(true);
 			expect(timeout).toBeGreaterThanOrEqual(0);

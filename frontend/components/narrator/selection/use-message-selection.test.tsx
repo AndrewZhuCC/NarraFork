@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { notifications } from "@mantine/notifications";
+import type { FileChangeRevertApplyResponse } from "@shared/file-change-protocol";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { NodeFilter, parseHTML } from "linkedom";
 import { act, memo, StrictMode, useContext, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { api } from "../../../lib/api";
+import { ApiError, api } from "../../../lib/api";
 import { MessageSelectionCtx, type MessageSelectionResolver } from "../message/MessageSelectionCtx";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { getGlobalOnSelectionRange } from "../scroll/swipeState";
@@ -21,6 +23,8 @@ const {
 
 type Selection = ReturnType<typeof useMessageSelection>;
 let root: Root | null;
+let queryClient: QueryClient;
+let show: ReturnType<typeof spyOn<typeof notifications, "show">>;
 let selection: Selection;
 let options: UseMessageSelectionOptions;
 let parentRenders: number;
@@ -90,6 +94,7 @@ beforeEach(() => {
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
 	root = createRoot(document.body.appendChild(document.createElement("div")));
+	queryClient = new QueryClient();
 	parentRenders = 0;
 	consumerRenders = 0;
 	const content = document.createElement("div");
@@ -120,7 +125,7 @@ beforeEach(() => {
 		compactUsesFallbackSummary: false,
 		compactFallbackSummaryReason: "",
 	};
-	const show = spyOn(notifications, "show").mockReturnValue("notification");
+	show = spyOn(notifications, "show").mockReturnValue("notification");
 	deleteBlocks = spyOn(api, "deleteMessageBlocks").mockResolvedValue({
 		ok: true,
 		deleted: 1,
@@ -139,6 +144,7 @@ beforeEach(() => {
 afterEach(async () => {
 	await act(async () => root?.unmount());
 	root = null;
+	queryClient.clear();
 	restoreSpies();
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -154,7 +160,11 @@ async function render(
 ) {
 	options = { ...options, narratorId };
 	await act(async () => {
-		const probe = <Probe resolver={resolver} />;
+		const probe = (
+			<QueryClientProvider client={queryClient}>
+				<Probe resolver={resolver} />
+			</QueryClientProvider>
+		);
 		root?.render(strict ? <StrictMode>{probe}</StrictMode> : probe);
 	});
 }
@@ -350,6 +360,75 @@ describe("selection resolver publication", () => {
 		await render("narrator-a", indexedResolver(["a", "strict", "c"]), true);
 		await act(async () => getGlobalOnSelectionRange()?.("msg-a-0", "msg-c-0"));
 		expect([...selection.selectedBlockIds]).toEqual(["msg-a-0", "msg-strict-0", "msg-c-0"]);
+	});
+});
+
+describe("batch-delete rollback feedback", () => {
+	const partial: FileChangeRevertApplyResponse = {
+		planId: "batch-plan",
+		status: "partial",
+		journalStatus: "partial",
+		settling: false,
+		reason: "restore failed after first file",
+		historyStatus: "complete",
+		historyCommitted: false,
+		files: [
+			{ filePath: "/repo/a.ts", deviceId: "local", status: "applied" },
+			{ filePath: "/repo/b.ts", deviceId: "local", status: "failed", reason: "EACCES" },
+			{ filePath: "/repo/c.ts", deviceId: "remote", status: "unknown" },
+		],
+	};
+
+	test.each([
+		"conflict",
+		"resolved-partial",
+		"missing-history-commit",
+	] as const)("%s shows actual file outcomes and refreshes history without reporting success", async (mode) => {
+		const result =
+			mode === "missing-history-commit"
+				? { ...partial, status: "committed" as const, journalStatus: "committed" as const }
+				: partial;
+		if (mode === "conflict") {
+			deleteBlocks.mockRejectedValue(new ApiError("history retained", 409, { result }));
+		} else {
+			deleteBlocks.mockResolvedValue({ ok: true, deleted: 0, failed: 0, revertResult: result });
+		}
+		const resources = ["messages", "file-tree-status", "tool-calls", "edit-regenerate-preview"];
+		for (const resource of resources)
+			queryClient.setQueryData(["narrators", "narrator-a", resource], {});
+		await render();
+		await publish(indexedResolver(["a"]));
+		await clickToggle();
+		await act(async () => selection.handleBatchDelete());
+		expect(deleteBlocks).toHaveBeenCalledTimes(1);
+		expect(show).toHaveBeenCalledTimes(1);
+		const notification = show.mock.calls[0][0];
+		expect(notification.color).toBe("red");
+		expect(notification.autoClose).toBe(false);
+		// Exceptions are listed per file; the successful write is reported as a count,
+		// so a partial result still states that a.ts was actually restored.
+		expect(notification.message).not.toContain("/repo/a.ts");
+		expect(notification.message).toContain("revertResultSuccessCount");
+		expect(notification.message).toContain("/repo/b.ts: revertFileStatus.failed (EACCES)");
+		expect(notification.message).toContain("[remote] /repo/c.ts: revertFileStatus.unknown");
+		expect(notification.message).toContain("revertHistoryUnchanged");
+		expect(options.chunkListRef.current?.refreshStructure).toHaveBeenCalledTimes(1);
+		for (const resource of resources) {
+			expect(queryClient.getQueryState(["narrators", "narrator-a", resource])?.isInvalidated).toBe(
+				true,
+			);
+		}
+	});
+
+	test("a lost response retains its error and still refreshes file and history state", async () => {
+		deleteBlocks.mockRejectedValue(new Error("connection lost"));
+		await render();
+		await clickToggle();
+		await act(async () => selection.handleBatchDelete());
+		expect(show.mock.calls[0][0].message).toContain("connection lost");
+		expect(show.mock.calls[0][0].message).not.toContain("revertHistoryUnchanged");
+		expect(options.chunkListRef.current?.refreshStructure).toHaveBeenCalledWith("full");
+		expect(deleteBlocks).toHaveBeenCalledTimes(1);
 	});
 });
 

@@ -478,51 +478,88 @@ async function main() {
 		}, narrator.id);
 		await page.reload({ waitUntil: "domcontentloaded", timeout: 20_000 });
 		await page.waitForSelector(".dv-dockview", { timeout: 15_000 }).catch(() => {});
-		await Bun.sleep(500);
-		await clickToolbarIcon("tabler-icon-notebook"); // open spec as a right split
-		await Bun.sleep(700);
-
-		const swapGeom = await page.evaluate(() => {
-			const grabs = Array.from(document.querySelectorAll<HTMLElement>("*")).filter(
-				(el) => getComputedStyle(el).cursor === "grab",
-			);
-			// always mode: headers live in the overlay container, not in .dv-groupview.
-			// Pick the visible Spec header, then map to a group by box containment.
-			const specHeader =
-				grabs.find((el) => {
-					if (!/(spec|outline)/i.test((el.textContent ?? "").trim())) return false;
-					const r = el.getBoundingClientRect();
-					return r.width > 20 && r.height > 8;
-				}) ?? null;
-			const groups = Array.from(document.querySelectorAll<HTMLElement>(".dv-groupview")).filter(
-				(g) => g.getBoundingClientRect().width > 10,
-			);
-			if (!specHeader || groups.length < 2) return { ok: false as const };
-			const sr = specHeader.getBoundingClientRect();
-			const scx = sr.left + sr.width / 2;
-			const scy = sr.top + sr.height / 2;
-			const specGroup =
-				groups.find((g) => {
-					const r = g.getBoundingClientRect();
-					return scx >= r.left && scx <= r.right && scy >= r.top && scy <= r.bottom;
-				}) ?? null;
-			const chatGroup = groups.find((g) => g !== specGroup) ?? null;
-			if (!specGroup || !chatGroup) return { ok: false as const };
-			const cr = chatGroup.getBoundingClientRect();
-			const specRect = specGroup.getBoundingClientRect();
-			return {
-				ok: true as const,
-				sx: scx,
-				sy: scy,
-				cx: cr.left + cr.width / 2,
-				cy: cr.top + cr.height / 2,
-				chatLeftBefore: cr.left,
-				specLeftBefore: specRect.left,
+		await page
+			.waitForSelector("svg.tabler-icon-notebook", { timeout: 15_000 })
+			.catch(() => undefined);
+		const tabsBeforeSwapOpen = await countPanels();
+		const reopenedSpec = await clickToolbarIcon("tabler-icon-notebook");
+		if (reopenedSpec) {
+			await page
+				.waitForFunction(
+					(before: number) => document.querySelectorAll(".dv-tab").length > before,
+					{ timeout: 15_000 },
+					tabsBeforeSwapOpen,
+				)
+				.catch(() => undefined);
+		}
+		// Dockview lays the second group out after the tab exists. A fixed sleep
+		// races that reflow on CI and then reports the panes as missing.
+		const readSplitGeometry = () =>
+			page.evaluate(() => {
+				const grabs = Array.from(document.querySelectorAll<HTMLElement>("*")).filter(
+					(el) => getComputedStyle(el).cursor === "grab",
+				);
+				const specHeader =
+					grabs.find((el) => {
+						if (!/(spec|outline)/i.test((el.textContent ?? "").trim())) return false;
+						const r = el.getBoundingClientRect();
+						return r.width > 20 && r.height > 8;
+					}) ?? null;
+				const groups = Array.from(document.querySelectorAll<HTMLElement>(".dv-groupview")).filter(
+					(g) => g.getBoundingClientRect().width > 10,
+				);
+				if (!specHeader || groups.length < 2) {
+					return {
+						ok: false as const,
+						reason: `groups=${groups.length}, specHeader=${!!specHeader}, tabs=${
+							document.querySelectorAll(".dv-tab").length
+						}, grabTexts=${grabs.map((g) => (g.textContent ?? "").trim().slice(0, 12)).join("|")}`,
+					};
+				}
+				const sr = specHeader.getBoundingClientRect();
+				const scx = sr.left + sr.width / 2;
+				const scy = sr.top + sr.height / 2;
+				const specGroup =
+					groups.find((g) => {
+						const r = g.getBoundingClientRect();
+						return scx >= r.left && scx <= r.right && scy >= r.top && scy <= r.bottom;
+					}) ?? null;
+				const chatGroup = groups.find((g) => g !== specGroup) ?? null;
+				if (!specGroup || !chatGroup) {
+					return {
+						ok: false as const,
+						reason: `specGroup=${!!specGroup}, chatGroup=${!!chatGroup}`,
+					};
+				}
+				const cr = chatGroup.getBoundingClientRect();
+				const specRect = specGroup.getBoundingClientRect();
+				return {
+					ok: true as const,
+					sx: scx,
+					sy: scy,
+					cx: cr.left + cr.width / 2,
+					cy: cr.top + cr.height / 2,
+					chatLeftBefore: cr.left,
+					specLeftBefore: specRect.left,
+				};
+			});
+		const waitForSplitGeometry = async () => {
+			const deadline = Date.now() + 15_000;
+			let last: Awaited<ReturnType<typeof readSplitGeometry>> = {
+				ok: false,
+				reason: "not sampled",
 			};
-		});
+			while (Date.now() < deadline) {
+				last = await readSplitGeometry();
+				if (last.ok) return last;
+				await Bun.sleep(200);
+			}
+			return last;
+		};
+		const swapGeom = await waitForSplitGeometry();
 
 		let swapOk = false;
-		let swapDetail = "geometry unresolved";
+		let swapDetail = swapGeom.ok ? "geometry unresolved" : swapGeom.reason;
 		if (swapGeom.ok) {
 			const groupsBeforeSwap = await countGroups();
 			// pointerdown directly on the resolved (visible) spec header, then real

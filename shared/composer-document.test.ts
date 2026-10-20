@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
 	type ComposerDocument,
+	composerDocumentProjection,
 	composerDocumentText,
+	composerDocumentTextCandidates,
+	legacyComposerDocumentText,
 	parseComposerDocument,
 	readComposerDocument,
 } from "./composer-document";
@@ -38,7 +41,13 @@ describe("semantic composer document", () => {
 		};
 		const accepted = parseComposerDocument(doc);
 		const { text, fileReferences } = composerDocumentText(accepted);
-		expect(text).toBe("> [quote] 来源 @@m:abcd\n> \\[quote] hi\n>\n\n😀 #file:a.ts:2-4\nend");
+		// The quote and the image follow typed content, so both stay where they stand.
+		expect(text).toBe(
+			"😀 #file:a.ts:2-4[image #1: x.png]\n> [quote] 来源 @@m:abcd\n> \\[quote] hi\n>\n\n\nend",
+		);
+		expect(legacyComposerDocumentText(accepted).text).toBe(
+			"> [quote] 来源 @@m:abcd\n> \\[quote] hi\n>\n\n😀 #file:a.ts:2-4\nend",
+		);
 		const range = fileReferences[0].inputRange;
 		if (!range) throw new Error("Expected token offsets");
 		const [start, end] = range;
@@ -86,6 +95,40 @@ describe("semantic composer document", () => {
 			label: "a.ts",
 			expectedHash: "saved-hash",
 		});
+	});
+	test("positional comments stay beside their source and keep current and legacy offset candidates", () => {
+		const doc = parseComposerDocument({
+			...empty(),
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "before" },
+						{ type: "quote", id: "q", label: "source", text: "original", comment: "message note" },
+						{ type: "text", text: "middle" },
+						{
+							type: "fileReference",
+							id: "f",
+							reference: { id: "ref-1", deviceId: "local", path: "/a.ts", label: "a.ts" },
+							comment: "file note",
+						},
+						{ type: "text", text: "after" },
+					],
+				},
+			],
+		});
+		const current = composerDocumentProjection(doc);
+		expect(current.text).toBe(
+			"before\n> [quote] source\n> original\n| [comment]\n| message note\n\nmiddle\n> [quote] a.ts @@f:ref-1\n> #file:a.ts\n| [comment]\n| file note\n\n#file:a.tsafter",
+		);
+		const file = current.fileReferences[0];
+		expect(file.inputRange).toEqual([
+			current.text.lastIndexOf("#file:a.ts"),
+			current.text.length - "after".length,
+		]);
+		const middle = current.spans.find((span) => span.node === 2);
+		expect(middle && current.text.slice(middle.start, middle.end)).toBe("middle");
+		expect(composerDocumentTextCandidates(doc)).toHaveLength(2);
+		expect(legacyComposerDocumentText(doc).text).toEndWith("beforemiddle#file:a.tsafter");
 	});
 	test("empty comments remain optional semantic fields without changing legacy projection", () => {
 		const doc: ComposerDocument = {
@@ -150,6 +193,63 @@ describe("semantic composer document", () => {
 			expect(() =>
 				parseComposerDocument({ ...empty(), paragraphs: [{ children: [node] }] }),
 			).toThrow("Unknown composer field");
+	});
+	test("keeps the historical projection while quotes and attachments lead", () => {
+		const doc = parseComposerDocument({
+			version: 1,
+			assets: [
+				{ id: "a", kind: "image", name: "a.png", size: 1, mimeType: "image/png" },
+				{ id: "f", kind: "textFile", name: "n.txt", size: 1, mimeType: "text/plain" },
+			],
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "an", assetId: "a" },
+						{ type: "quote", id: "q", label: "Q", text: "quoted" },
+						{ type: "text", text: " " },
+						{ type: "attachment", id: "fn", assetId: "f" },
+					],
+				},
+				{ children: [{ type: "text", text: "body" }] },
+			],
+		});
+		const current = composerDocumentText(doc);
+		const legacy = legacyComposerDocumentText(doc);
+		expect(current).toEqual({ text: legacy.text, fileReferences: legacy.fileReferences });
+		expect(current.text).toBe("> [quote] Q\n> quoted\n\n \nbody");
+		expect(composerDocumentTextCandidates(doc)).toHaveLength(1);
+	});
+	test("numbers attachments per kind in upload order once one follows text", () => {
+		const doc = parseComposerDocument({
+			version: 1,
+			assets: [
+				{ id: "b", kind: "image", name: "b[1].png", size: 1, mimeType: "image/png" },
+				{ id: "f", kind: "textFile", name: "n.txt", size: 1, mimeType: "text/plain" },
+				{ id: "a", kind: "image", name: "a.png", size: 1, mimeType: "image/png" },
+			],
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "an", assetId: "a" },
+						{ type: "text", text: "看" },
+						{ type: "attachment", id: "bn", assetId: "b" },
+						{ type: "quote", id: "q", label: "Q", text: "x" },
+						{ type: "text", text: "和" },
+						{ type: "attachment", id: "fn", assetId: "f" },
+					],
+				},
+			],
+		});
+		const { text, spans } = composerDocumentProjection(doc);
+		expect(text).toBe(
+			"[image #2: a.png]看[image #1: b_1_.png]\n> [quote] Q\n> x\n\n和[file #1: n.txt]",
+		);
+		const textSpan = spans.find((span) => span.node === 4);
+		expect(textSpan && text.slice(textSpan.start, textSpan.end)).toBe("和");
+		expect(composerDocumentTextCandidates(doc).map((candidate) => candidate.text)).toEqual([
+			text,
+			"> [quote] Q\n> x\n\n看和",
+		]);
 	});
 	test("rejects arbitrary editor/html/path fields and unknown versions", () => {
 		for (const value of [

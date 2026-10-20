@@ -123,6 +123,7 @@ export class BackgroundOccupancyIndex {
 	private activeServiceTasks = new Map<string, string[]>();
 	private activeLegacy = new Map<string, string[]>();
 	private counts = new Map<string, BackgroundTaskActiveCounts>();
+	private wakeWorkCounts = new Map<string, number>();
 	private childCounts = new Map<string, number>();
 
 	upsertNarrator(row: OccupancyNarrator): void {
@@ -272,10 +273,15 @@ export class BackgroundOccupancyIndex {
 		}
 		const work = new Map<string, number>();
 		const services = new Map<string, number>();
+		const wakeWork = new Map<string, number>();
 		const activeTasks = new Map<string, Set<string>>();
 		const activeWorkTasks = new Map<string, Set<string>>();
 		const activeServiceTasks = new Map<string, Set<string>>();
 		const activeLegacy = new Map<string, Set<string>>();
+		// Narrators that themselves have work whose terminal commit publishes a wake.
+		// Used to tell "this legacy subagent is still doing wake-capable work" apart
+		// from "it is only occupied because a transfer seeded it".
+		const directWakeIds = new Set<string>();
 		for (const task of this.tasks.values()) {
 			if (!isOccupancyTaskActive(task) && !(task.type === "agent" && occupied.has(childId(task))))
 				continue;
@@ -283,6 +289,17 @@ export class BackgroundOccupancyIndex {
 			add(isService(task) ? activeServiceTasks : activeWorkTasks, task.parentNarratorId, task.id);
 			const bucket = isService(task) ? services : work;
 			bucket.set(task.parentNarratorId, (bucket.get(task.parentNarratorId) ?? 0) + 1);
+			// Wake-work counts only a task that is still going to publish a wake.
+			// A completed agent row kept alive because its child is occupied must
+			// not count: that publication already happened, and the child's
+			// remaining occupancy may be a transfer, which never publishes. Counting
+			// it would suppress a done with nothing left to re-raise it. Transfers
+			// and services never publish a parent wake either.
+			if (isOccupancyTaskActive(task) && !isService(task) && task.type !== "transfer") {
+				wakeWork.set(task.parentNarratorId, (wakeWork.get(task.parentNarratorId) ?? 0) + 1);
+				directWakeIds.add(task.parentNarratorId);
+				if (task.type === "agent") directWakeIds.add(childId(task));
+			}
 		}
 		for (const row of this.narrators.values()) {
 			if (
@@ -293,6 +310,18 @@ export class BackgroundOccupancyIndex {
 			) {
 				add(activeLegacy, row.parentNarratorId, row.id);
 				work.set(row.parentNarratorId, (work.get(row.parentNarratorId) ?? 0) + 1);
+				// A projection-less background narrator wakes its parent when THAT
+				// narrator completes (background session, in-flight turn, or its own
+				// wake-capable task). Occupancy that exists only because a transfer
+				// seeded the row does not: the transfer's terminal commit skips
+				// publication, so counting it swallows the parent's done for good.
+				if (
+					isOccupancyNarratorSeed(row) ||
+					directWakeIds.has(row.id) ||
+					this.runtimeLive.has(row.id)
+				) {
+					wakeWork.set(row.parentNarratorId, (wakeWork.get(row.parentNarratorId) ?? 0) + 1);
+				}
 			}
 		}
 		const counts = new Map<string, BackgroundTaskActiveCounts>();
@@ -315,6 +344,7 @@ export class BackgroundOccupancyIndex {
 		this.activeServiceTasks = orderedBuckets(activeServiceTasks, taskCreatedAt);
 		this.activeLegacy = orderedBuckets(activeLegacy, narratorCreatedAt);
 		this.counts = counts;
+		this.wakeWorkCounts = wakeWork;
 		this.childCounts = childCounts;
 	}
 
@@ -358,6 +388,18 @@ export class BackgroundOccupancyIndex {
 					? this.activeServiceTasks
 					: this.activeWorkTasks;
 		return limitedIds(buckets.get(parentId), opts.limit);
+	}
+
+	/**
+	 * Active per-parent count of background work whose completion WAKES the
+	 * parent narrator: running/paused bash tasks and subagent projections, plus
+	 * legacy projection-less narrators that are themselves still in flight.
+	 * Transfers are excluded, and so is a finished agent projection that is only
+	 * still indexed because a descendant (often a transfer) remains occupied —
+	 * that publication already happened. Services are not work.
+	 */
+	getActiveWakeWorkCount(parentId: string): number {
+		return this.wakeWorkCounts.get(parentId) ?? 0;
 	}
 
 	getOccupiedChildIds(parentId: string, limit?: number): string[] {

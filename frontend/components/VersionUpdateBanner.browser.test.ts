@@ -104,9 +104,21 @@ for (const width of [320, 390, 1440]) {
 					const banner = document.querySelector<HTMLElement>(".nf-top-banner");
 					if (!banner) throw new Error("Missing banner");
 					const bounds = banner.getBoundingClientRect();
+					// Alert renders [body, CloseButton] inside its wrapper, so the close
+					// button is the last button in document order. (`:last-of-type` is
+					// per-parent and would select the refresh button instead.)
+					const buttons = [...banner.querySelectorAll<HTMLElement>("button")];
+					const closeRect = buttons[buttons.length - 1]?.getBoundingClientRect();
+					if (!closeRect) throw new Error("Missing close button");
 					return {
 						overflow: banner.scrollWidth > banner.clientWidth,
-						buttons: [...banner.querySelectorAll("button")].map((button) => {
+						bannerCentreOffset: bounds.left + bounds.width / 2 - innerWidth / 2,
+						buttonCount: buttons.length,
+						// The close button is a flex item of the Alert's wrapper, so it
+						// silently top-aligns unless it opts into cross-axis centring.
+						closeCentreOffset:
+							closeRect.top + closeRect.height / 2 - (bounds.top + bounds.height / 2),
+						buttons: buttons.map((button) => {
 							const rect = button.getBoundingClientRect();
 							return (
 								rect.width > 0 &&
@@ -124,14 +136,22 @@ for (const width of [320, 390, 1440]) {
 					};
 				});
 				expect(geometry.overflow).toBe(false);
+				expect(Math.abs(geometry.bannerCentreOffset)).toBeLessThanOrEqual(1);
+				expect(geometry.buttonCount).toBe(2);
+				expect(Math.abs(geometry.closeCentreOffset)).toBeLessThanOrEqual(1);
 				expect(geometry.buttons).toEqual([true, true]);
-				for (const button of await page.$$(".nf-top-banner button")) await button.click();
-				expect(
-					await page.evaluate(() => ({
+				const calls = () =>
+					page.evaluate(() => ({
 						refresh: Reflect.get(window, "refreshCalls"),
 						dismiss: Reflect.get(window, "dismissCalls"),
-					})),
-				).toEqual({ refresh: 1, dismiss: 1 });
+					}));
+				const [refreshButton, closeButton] = await page.$$(".nf-top-banner button");
+				// Pins which button is which, so the centring assertion above cannot
+				// drift onto the refresh button.
+				await closeButton?.click();
+				expect(await calls()).toEqual({ refresh: 0, dismiss: 1 });
+				await refreshButton?.click();
+				expect(await calls()).toEqual({ refresh: 1, dismiss: 1 });
 			} finally {
 				await page.close();
 			}

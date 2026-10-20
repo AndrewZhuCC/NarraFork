@@ -184,6 +184,8 @@ export interface UseNarratorPanelWSOptions {
 		updatedBy: string | null;
 		sourceId: string | null;
 	}) => void;
+	/** Reconnect/page-load reconciles carry draft metadata only; the composer fetches the body when newer. */
+	onDraftMeta?: (meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) => void;
 	onQueuedNewNarratorCreated?: (newNarratorId: string) => void;
 }
 
@@ -341,6 +343,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		quotaProviderKey,
 		narratorSubstatus,
 		onDraftChanged,
+		onDraftMeta,
 		onQueuedNewNarratorCreated,
 	} = opts;
 	const { t, i18n } = useTranslation("narrator");
@@ -1661,6 +1664,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// Keep refs in sync
 	sendPermissionDecisionRef.current = sendPermissionDecision;
 
+	// Ref-mirrored so the reconcile callback keeps its identity (its promise dedup
+	// depends on it) while always calling the latest handler.
+	const onDraftMetaRef = useRef(onDraftMeta);
+	onDraftMetaRef.current = onDraftMeta;
+
 	// --- Initial REST is shared with the composer; every WS connection edge closes its event gap. ---
 	const reconcilePanelState = useCallback(
 		(fresh = false) => {
@@ -1711,6 +1719,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						onDiscard,
 					);
 					applyBuffer(snapshot.buffer, !snapshot.hasMore.buffer);
+					// Draft metadata rides every page; the composer no-ops it unless it
+					// proves a live draft_changed was missed while disconnected.
+					onDraftMetaRef.current?.(snapshot.draft);
 				},
 				{ signal: controller.signal, fresh },
 			)
