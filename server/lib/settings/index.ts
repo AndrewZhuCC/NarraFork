@@ -21,12 +21,11 @@ import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
-import { invalidateModelCardCache } from "../model-cards";
 import {
+	applyWindowSettings,
 	bindModelCatalogSettings,
-	markLegacyWindowSettingsSaved,
-	reconcileLegacyWindowSettings,
-	settingsWithRawModelCatalog,
+	normalizeModelCatalogSettings,
+	settingsForDisk,
 	startModelCatalogDailyCheck,
 } from "../model-catalog";
 import { getNarraforkHome } from "../narrafork-home";
@@ -45,7 +44,6 @@ import {
 } from "../settings-manager-fields";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
-import { normalizeModelContextWindows } from "./model-context-windows";
 import { _bindSettings } from "./provider";
 import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
@@ -293,12 +291,42 @@ export function loadSettings(): NarraForkSettings {
 	return loadSettingsFromDisk();
 }
 
+/** The settings.json text this process last read or wrote. */
+let lastSettingsText: string | undefined;
+
+/**
+ * Reload only when settings.json differs from what this process last read or wrote.
+ * The file watcher also fires for our own saves; those need no reload.
+ */
+export function reloadSettingsIfChanged(): boolean {
+	let text: string | undefined;
+	try {
+		text = readFileSync(settingsPath, "utf-8");
+	} catch {
+		text = undefined;
+	}
+	if (text !== undefined && text === lastSettingsText) return false;
+	reloadSettings();
+	return true;
+}
+
 /**
  * Force re-read settings from disk, bypassing the in-memory cache.
  * Use this after external modifications to settings.json.
  */
 export function reloadSettings(): NarraForkSettings {
-	const fresh = loadSettingsFromDisk();
+	let fresh: NarraForkSettings;
+	try {
+		fresh = loadSettingsFromDisk();
+	} catch (error) {
+		// A reload is all-or-nothing: an unreadable or invalid file keeps the running
+		// configuration instead of half-applying it. Startup still fails loudly.
+		if (!_cache.current) throw error;
+		logger.error("Settings reload rejected; keeping the running configuration", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return _cache.current;
+	}
 	settingsRevision++;
 	if (_cache.current) {
 		for (const key of Object.keys(fresh) as Array<keyof NarraForkSettings>) {
@@ -319,7 +347,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (!existsSync(settingsPath)) {
 		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2), { mode: 0o600 });
 	}
-	const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
+	const text = existsSync(settingsPath) ? readFileSync(settingsPath, "utf-8") : undefined;
+	const raw = text === undefined ? {} : JSON.parse(text);
+	lastSettingsText = text;
 	const merged = deepMerge(DEFAULTS, raw);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
@@ -516,9 +546,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
-	// Existing catalogs must observe the original windows until binding/upgrade,
-	// so normalization can update only the changed legacy bindings as well.
-	if (!merged.agent.modelCatalog && normalizeModelContextWindows(merged)) {
+	// The model catalog has one stored and in-memory form; both startup and hot reload
+	// pass through this, so no reader can see a document that skipped the import.
+	if (normalizeModelCatalogSettings(merged)) {
 		needsSave = true;
 	}
 
@@ -580,8 +610,8 @@ function loadSettingsFromDisk(): NarraForkSettings {
  * revert a correction they cannot see being reverted. New edits go through cards
  * and land in the same place.
  */
-// Legacy pricing is migrated once by bindModelCatalogSettings. New estimates
-// read the same effective metadata as request construction, never a projection.
+// Legacy pricing is imported once by normalizeModelCatalogSettings. New estimates
+// read the same effective card as request construction.
 
 /** Simple 8-char random ID for migration (avoids importing nanoid at this level). */
 function generateMigrationId(): string {
@@ -861,7 +891,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
 	initializeTokenDanceModelCollection(newSettings);
-	reconcileLegacyWindowSettings(newSettings);
+	applyWindowSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	withSettingsFileLock(narraforkDir, () => {
@@ -876,23 +906,17 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		preserveExternalManagerFields(newSettings, readManagerOwnedFields(disk), lastDiskManagerFields);
 		const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 		try {
-			writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {
-				mode: 0o600,
-			});
+			const text = JSON.stringify(settingsForDisk(newSettings), null, 2);
+			writeFileSync(tempPath, text, { mode: 0o600 });
 			renameSync(tempPath, settingsPath);
+			lastSettingsText = text;
 		} catch (error) {
 			rmSync(tempPath, { force: true });
 			throw error;
 		}
 		lastDiskManagerFields = managerFieldsFromSettings(newSettings);
 	});
-	markLegacyWindowSettingsSaved(newSettings);
 	settingsRevision++;
-
-	// The card index is memoized on the identity of the cards array. A save that
-	// mutated the existing array in place would keep that identity, so the cache
-	// is dropped explicitly rather than relying on a new reference arriving.
-	invalidateModelCardCache();
 	if (_cache.current) {
 		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);
 		for (const key of Object.keys(_cache.current) as Array<keyof NarraForkSettings>) {

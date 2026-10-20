@@ -477,16 +477,25 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		}, badPath);
 		await call("open", badPath);
 		await call("dualViews");
-		await page.waitForSelector("[data-editor-draft-restore]:not([disabled])");
-		await page.click("[data-editor-draft-restore]");
-		await page.waitForFunction(() => {
-			const row = document.querySelector("[data-editor-local-draft]");
-			return (
-				row &&
-				!row.querySelector("[data-editor-draft-restore]") &&
-				!!row.querySelector("[data-editor-draft-export]")
-			);
-		});
+		// Each view authorizes independently: wait, click, and observe the same candidate.
+		// A generic click can hit the other view's still-disabled Restore button.
+		const restore = await page.waitForSelector("[data-editor-draft-restore]:not([disabled])");
+		if (!restore) throw new Error("Missing enabled corrupt draft restore button");
+		const candidate = await restore.evaluateHandle((button) =>
+			button.closest("[data-editor-local-draft]"),
+		);
+		await restore.click();
+		await page.waitForFunction(
+			(row) => {
+				return (
+					row &&
+					!row.querySelector("[data-editor-draft-restore]") &&
+					!!row.querySelector("[data-editor-draft-export]")
+				);
+			},
+			{},
+			candidate,
+		);
 		expect((await call("state")).dirty).toBe(false);
 		const downloads = join(root, "downloads");
 		await mkdir(downloads);

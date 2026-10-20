@@ -50,6 +50,7 @@ import type {
 	BufferMessageSummary,
 } from "../../../lib/api/types";
 import { UserAvatar } from "../../UserAvatar";
+import { composerPreviewText } from "../composer/composer-quotes";
 import { QueuedImageThumb } from "../composer/EditAttachmentChips";
 import { fileReferenceToken } from "../composer/file-reference-input";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
@@ -398,7 +399,10 @@ export function QueuedMessageRow({
 							cursor: "pointer",
 						}}
 					>
-						{msg.text}
+						{composerPreviewText(msg.text, {
+							images: (msg.images ?? []).map((image) => image.filename),
+							files: (msg.textFiles ?? []).map((file) => file.filename),
+						})}
 					</Text>
 					<QueuedAttachmentPreview
 						narratorId={narratorId}

@@ -208,8 +208,8 @@ describe("compact metadata lookup failure cleanup", () => {
 		// Exercise the real catalog query's empty upstream ID validation, not a
 		// fake provider failure or a replacement metadata resolver.
 		settings.agent.modelCatalog = {
-			schemaVersion: 1,
-			migrationVersion: 1,
+			schemaVersion: 2,
+			migrationVersion: 2,
 			local: { revision: 1, models: [] },
 			autoApply: false,
 			pinnedVersion: null,

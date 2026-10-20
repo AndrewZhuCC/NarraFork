@@ -6,15 +6,16 @@ import {
 	resolveOutputTokenBudget,
 } from "../../../server/lib/agent/provider-model-metadata";
 import {
+	applyWindowSettings,
 	bindModelCatalogSettings,
-	getEffectiveModelMetadata,
+	getEffectiveModelProfile,
 	getModelCardSnapshot,
-	getModelCatalogSnapshot,
+	legacyWindowProjection,
 	type ModelCatalogSettings,
 	mutateModelCard,
-	mutateModelCatalog,
-	reconcileLegacyWindowSettings,
-	settingsWithRawModelCatalog,
+	normalizeModelCatalogSettings,
+	resolveEffectiveModelCard,
+	settingsForDisk,
 } from "../../../server/lib/model-catalog";
 import { _bindSettings, getDefaults, saveSettings, settings } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
@@ -48,7 +49,7 @@ beforeEach(() => {
 	} as unknown as ModelCatalogSettings;
 	persisted = undefined;
 	bindModelCatalogSettings(local, () => {
-		persisted = JSON.stringify(settingsWithRawModelCatalog(local));
+		persisted = JSON.stringify(settingsForDisk(local));
 	});
 	_bindSettings(local);
 });
@@ -84,23 +85,15 @@ test("persists one raw v2 source and reloads all unknown fields", () => {
 	expect(getModelCardSnapshot().local).toEqual(before.local);
 });
 
-test("old field patches and replacement-shaped DTOs retain newer prices and attributes", () => {
-	mutateModelCatalog({
-		baseRevision: revision(),
-		action: "patch",
-		target: "model",
-		targetId: "local-image",
-		patch: { set: { "referencePricing.input": "1" } },
-	});
+test("field patches and replacement-shaped upserts retain prices and unknown attributes", () => {
+	patch({ input_cost_per_token: "0.000001" });
 	expect(model().metadata.input_cost_per_token).toBe("0.000001");
 	expect(model().metadata.output_cost_per_image).toBe(0.04);
 	expect(model().metadata.future).toEqual(future);
-	const legacy = getModelCatalogSnapshot().local.models!.find((m) => m.id === "local-image")!;
-	const { rawMetadata: _raw, ...oldClient } = legacy;
-	mutateModelCatalog({
+	mutateModelCard({
 		baseRevision: revision(),
 		action: "upsert-model",
-		model: { ...oldClient, name: "Renamed" },
+		model: { ...model(), name: "Renamed" },
 	});
 	expect(model().name).toBe("Renamed");
 	expect(model().metadata.future).toEqual(future);
@@ -143,9 +136,7 @@ test("independent input and output caps remain valid through write, read and rel
 	const m = getModelCardSnapshot().local.models!.find((m) => m.id === "independent-caps")!;
 	expect(m.metadata.max_input_tokens).toBe(128000);
 	expect(m.metadata.max_output_tokens).toBe(272000);
-	expect(getEffectiveModelMetadata("independent-caps").metadata.limits?.maxOutputTokens).toBe(
-		272000,
-	);
+	expect(getEffectiveModelProfile("independent-caps").maxOutputTokens).toBe(272000);
 	bindModelCatalogSettings(JSON.parse(persisted!), () => {});
 	expect(
 		getModelCardSnapshot().local.models!.find((m) => m.id === "independent-caps")!.metadata,
@@ -201,7 +192,7 @@ test("input and output budgets stay separate and never invent a total context", 
 	expect(resolveInputTokenBudget(unknown)).toBeUndefined();
 });
 
-test("working_context_tokens never clamps v1 maxOutput and does not overwrite total context", () => {
+test("working_context_tokens is the prompt window: it never caps output or replaces the total", () => {
 	mutateModelCard({
 		baseRevision: revision(),
 		action: "upsert-model",
@@ -214,13 +205,13 @@ test("working_context_tokens never clamps v1 maxOutput and does not overwrite to
 			},
 		},
 	});
-	// v1 projection must keep the independent output ceiling. The working window is
-	// not a total context and has nowhere to live in v1, so it is dropped rather than
-	// used as an output ceiling.
-	const v1 = getEffectiveModelMetadata("working-window").metadata.limits;
-	expect(v1?.maxOutputTokens).toBe(320000);
-	expect(v1?.contextWindow).toBeUndefined();
-	// v2 budgets keep the three facts distinct — contrast with the v1 clamp bug.
+	// The working window is this instance's prompt budget; the output ceiling stays
+	// independent of it.
+	const profile = getEffectiveModelProfile("working-window");
+	expect(profile.maxOutputTokens).toBe(320000);
+	expect(profile.contextWindow).toBe(150000);
+	expect(profile.contextWindowSource?.key).toBe("working_context_tokens");
+	// Budgets keep the three facts distinct.
 	const budgets = modelTokenBudgets("working-window");
 	expect(budgets).toEqual({ maxOutputTokens: 320000, workingContextTokens: 150000 });
 	expect(resolveOutputTokenBudget(budgets, 400000)).toBe(320000);
@@ -238,10 +229,10 @@ test("working_context_tokens never clamps v1 maxOutput and does not overwrite to
 			},
 		},
 	});
-	// A real total context wins over the working window and may keep a larger output.
-	const withTotal = getEffectiveModelMetadata("working-plus-total").metadata.limits;
-	expect(withTotal?.contextWindow).toBe(400000);
-	expect(withTotal?.maxOutputTokens).toBe(320000);
+	// The working window is still the prompt window; the total remains its own fact.
+	const withTotal = getEffectiveModelProfile("working-plus-total");
+	expect(withTotal.contextWindow).toBe(150000);
+	expect(withTotal.maxOutputTokens).toBe(320000);
 	expect(modelTokenBudgets("working-plus-total")).toEqual({
 		maxOutputTokens: 320000,
 		totalContextTokens: 400000,
@@ -261,9 +252,7 @@ test("working_context_tokens never clamps v1 maxOutput and does not overwrite to
 			},
 		},
 	});
-	expect(getEffectiveModelMetadata("legacy-total-clamp").metadata.limits?.maxOutputTokens).toBe(
-		100000,
-	);
+	expect(getEffectiveModelProfile("legacy-total-clamp").maxOutputTokens).toBe(100000);
 });
 
 test("v2 writes are admin-only, return v2 conflicts and enforce body limits", async () => {
@@ -301,50 +290,96 @@ test("v2 writes are admin-only, return v2 conflicts and enforce body limits", as
 	).toBe(413);
 });
 
-// Startup migrations (a generated JWT secret, a renamed key) call saveSettings
-// while agent.modelCatalog is still the raw v2 document read from disk, because
-// bindModelCatalogSettings runs later in the settings module. The legacy window
-// editor must stay out of that window: reconciling raw source fields through the
-// schema-v1 view rejected them as unknown and made the whole process fail to boot.
-test("legacy window reconciliation is inert before the catalog is bound", () => {
-	const stored = {
-		...getDefaults(),
-		agent: {
-			...getDefaults().agent,
-			modelContextWindows: { "foxcx:gpt-5.4": 256000 },
-			modelCatalog: {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				autoApply: false,
-				pinnedVersion: null,
-				local: {
-					revision: 1,
-					legacyFields: { "binding:legacy-window:foxcx:gpt-5.4": ["working_context_tokens"] },
-					bindings: [
-						{
-							id: "legacy-window:foxcx:gpt-5.4",
-							providerId: "m0hxkfw7",
-							upstreamModelId: "gpt-5.4",
-							overrides: { working_context_tokens: 256000 },
-						},
-					],
-				},
-			},
-		},
-	} as unknown as NarraForkSettings;
-	const before = structuredClone(stored.agent.modelCatalog);
-	// _bindSettings/bindModelCatalogSettings deliberately not called for `stored`:
-	// this reproduces the pre-bind save, where the raw document must pass through
-	// untouched rather than being read as a schema-v1 local layer.
-	expect(() => reconcileLegacyWindowSettings(stored)).not.toThrow();
-	expect(stored.agent.modelCatalog).toEqual(before);
-
-	// Once bound, the same editor still adapts a real change into the binding.
-	bindModelCatalogSettings(stored, () => {});
-	stored.agent.modelContextWindows = { "foxcx:gpt-5.4": 300000 };
-	reconcileLegacyWindowSettings(stored);
-	const binding = stored.agent.modelCatalog!.local.bindings!.find(
+// The provider page edits `agent.modelContextWindows`; a save turns that map into the
+// catalog's own bindings and the map becomes a view again. It is never stored.
+test("provider-page windows are written into bindings and read back as a view", () => {
+	const draft = structuredClone(local);
+	draft.agent.modelContextWindows = { "foxcx:gpt-5.4": 300000 };
+	applyWindowSettings(draft);
+	const binding = draft.agent.modelCatalog!.local.bindings!.find(
 		(b) => b.id === "legacy-window:foxcx:gpt-5.4",
 	)!;
-	expect(binding.rawMetadata).toEqual({ working_context_tokens: 300000 });
+	expect(binding.overrides).toEqual({ working_context_tokens: 300000 });
+	expect(draft.agent.modelCatalog!.local.revision).toBe(revision() + 1);
+	expect(draft.agent.modelContextWindows).toEqual({ "foxcx:gpt-5.4": 300000 });
+	expect(settingsForDisk(draft).agent).not.toHaveProperty("modelContextWindows");
+	// An unchanged map is not a write.
+	const again = structuredClone(draft);
+	applyWindowSettings(again);
+	expect(again.agent.modelCatalog).toEqual(draft.agent.modelCatalog);
+	// Removing the key removes only the working window the page owns.
+	again.agent.modelCatalog!.local.bindings![0]!.overrides!.max_output_tokens = 4096;
+	again.agent.modelContextWindows = {};
+	applyWindowSettings(again);
+	expect(again.agent.modelCatalog!.local.bindings![0]!.overrides).toEqual({
+		max_output_tokens: 4096,
+	});
+	expect(again.agent.modelContextWindows).toEqual({});
+});
+
+test("an old window map never stops startup: clashing or malformed keys are skipped", () => {
+	const stored = getDefaults();
+	stored.agent.modelCatalog = {
+		schemaVersion: 2,
+		migrationVersion: 2,
+		autoApply: false,
+		pinnedVersion: null,
+		local: {
+			revision: 3,
+			bindings: [
+				{
+					id: "editor-binding",
+					providerId: "codex",
+					upstreamModelId: "gpt-5.5",
+					overrides: { max_output_tokens: 1000 },
+				},
+			],
+		},
+	};
+	stored.agent.modelContextWindows = {
+		"codex:gpt-5.5": 150000,
+		"codex:gpt-5.4": "200000",
+	} as unknown as Record<string, number>;
+	expect(() => normalizeModelCatalogSettings(stored)).not.toThrow();
+	const bindings = stored.agent.modelCatalog!.local.bindings!;
+	expect(bindings.find((b) => b.id === "editor-binding")?.overrides).toEqual({
+		max_output_tokens: 1000,
+	});
+	expect(bindings.some((b) => b.id === "legacy-window:codex:gpt-5.5")).toBe(false);
+	expect(stored.agent.modelContextWindows).toEqual({ "codex:gpt-5.4": 200000 });
+
+	// A live save of the same clash is refused with a reason rather than corrupting the layer.
+	bindModelCatalogSettings(stored, () => {});
+	stored.agent.modelContextWindows = { "codex:gpt-5.5": 150000 };
+	expect(() => applyWindowSettings(stored)).toThrow("editor-binding");
+
+	const preCatalog = getDefaults();
+	delete preCatalog.agent.modelCatalog;
+	preCatalog.agent.modelContextWindows = { "codex:gpt-5.5": "120000" } as unknown as Record<
+		string,
+		number
+	>;
+	expect(() => normalizeModelCatalogSettings(preCatalog)).not.toThrow();
+	expect(preCatalog.agent.modelContextWindows).toEqual({ "codex:gpt-5.5": 120000 });
+});
+
+test("a save from a copy taken before a catalog edit applies its window without undoing the edit", () => {
+	const stale = structuredClone(local);
+	patch({ supports_vision: false });
+	stale.agent.modelContextWindows = { "codex:gpt-5.4": 99000 };
+	applyWindowSettings(stale);
+	const live = stale.agent.modelCatalog!.local;
+	expect(live.revision).toBe(revision() + 1);
+	expect(live.models!.find((m) => m.id === "local-image")!.metadata.supports_vision).toBe(false);
+	expect(legacyWindowProjection(live)).toEqual({ "codex:gpt-5.4": 99000 });
+});
+
+test("gateway metadata that contradicts the catalog is ignored rather than failing requests", () => {
+	const query = { upstreamModelId: "gpt-5.5", providerKey: "codex" };
+	const card = resolveEffectiveModelCard(query, { context_window: 1000 });
+	expect(card.metadata.context_window).toBeUndefined();
+	expect(card.metadata.max_output_tokens).toBeGreaterThan(1000);
+	expect(resolveEffectiveModelCard(query, { context_window: 900000 }).metadata.context_window).toBe(
+		900000,
+	);
 });

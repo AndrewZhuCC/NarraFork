@@ -1,6 +1,7 @@
 import { probeHost } from "@shared/server-host";
 import { MANAGER_TOKEN_ENV } from "../lib/manager-token";
 import { getLanAddresses } from "../lib/net/lan-addresses";
+import { HANDOFF_COMPLETE_MESSAGE } from "../lib/restart-handoff";
 import { isCompiledRuntime } from "../lib/runtime-target";
 import { parseServiceLogLine } from "./listen-log";
 import { managerFetch } from "./manager-fetch";
@@ -28,6 +29,11 @@ const READY_POLL_MS = 700;
 const READY_TIMEOUT_MS = 90_000;
 /** 等待服务自报监听地址的上限；超过后回退到配置端口探测，避免解析失败时一路悬空。 */
 const ADDRESS_WAIT_MS = 15_000;
+/**
+ * 实例锁冲突后等待旧进程退出的上限。旧服务关闭时先关监听、最后才释放实例锁，
+ * 接管/交接时新进程可能恰好落在这段窗口里。
+ */
+const LOCK_HOLDER_EXIT_WAIT_MS = 60_000;
 /** 优雅停止之后，进程仍在就结束整棵进程树。 */
 const GRACEFUL_STOP_MS = 15_000;
 
@@ -50,6 +56,16 @@ export async function probeServiceHealth(
 
 /** 数据目录：直接复用 server 侧实现 —— 环境变量约定只能有一处。 */
 export { getNarraforkHome as resolveNarraforkHome } from "../lib/narrafork-home";
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM：进程存在但无权发信号。
+		return (error as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
 
 export class BackendProcess {
 	private child?: Bun.Subprocess<"pipe", "pipe", "pipe">;
@@ -113,14 +129,38 @@ export class BackendProcess {
 		this.options.onState(state, detail);
 	}
 
-	/** 启动后端；已在运行时直接返回。 */
-	async start(): Promise<void> {
+	/**
+	 * 启动后端；已在运行时直接返回。
+	 *
+	 * `handoffEnv` 是更新交接的一次性环境变量：子进程会先让旧服务退出再绑定端口。
+	 * 交接完成前旧服务仍在应答健康检查，所以此期间不探测端口。
+	 */
+	async start(options?: { handoffEnv?: Record<string, string> }): Promise<void> {
 		if (this.child || this.disposed) return;
+		this.setState("starting");
+		// 实例锁冲突只重试一次：持有者若是正在关闭的旧服务，等它退出后再起；仍在运行就如实报错。
+		// 重试沿用同一份交接环境，否则替换进程认领不到本次更新的续跑清单。
+		this.lockRetryAvailable = true;
+		for (;;) {
+			if (!this.spawnChild(options?.handoffEnv)) return;
+			const holderPid = await this.waitUntilReady();
+			if (holderPid === undefined) return;
+			if (!(await this.waitForLockHolderExit(holderPid))) {
+				if (this.state === "starting") {
+					this.setState("error", t("error.instanceLockConflict", { pid: holderPid }));
+				}
+				return;
+			}
+		}
+	}
+
+	/** 拉起一个服务子进程；失败时已报告错误状态并返回 false。 */
+	private spawnChild(handoffEnv: Record<string, string> | undefined): boolean {
 		this.lockConflictPid = undefined;
+		this.awaitingHandoff = handoffEnv !== undefined;
 		this.observedHost = undefined;
 		this.observedPort = 0;
 		this.observedProtocol = undefined;
-		this.setState("starting");
 		const args = isCompiledRuntime() ? ["--serve"] : ["server/index.ts", "--serve"];
 		try {
 			this.child = Bun.spawn([process.execPath, ...args], {
@@ -130,13 +170,14 @@ export class BackendProcess {
 				stderr: "pipe",
 				env: {
 					...process.env,
+					...handoffEnv,
 					NARRAFORK_MANAGER_MANAGED: "1",
 					[MANAGER_TOKEN_ENV]: this.options.managerToken,
 				},
 			});
 		} catch (error) {
 			this.setState("error", error instanceof Error ? error.message : String(error));
-			return;
+			return false;
 		}
 
 		const child = this.child;
@@ -147,11 +188,35 @@ export class BackendProcess {
 			if (this.child !== child) return;
 			this.child = undefined;
 			if (this.disposed) return;
+			// 锁冲突且还能重试：由 start() 等旧进程退出后重新拉起，不当成启动失败。
+			if (this.lockConflictPid !== undefined && this.lockRetryAvailable) return;
 			// 主动停止走的是 stop() 的路径；这里只处理"自己退出"。
 			this.setState("stopped", code === 0 ? undefined : t("error.exitedWithCode", { code }));
 		});
+		return true;
+	}
 
-		await this.waitUntilReady();
+	/**
+	 * 等实例锁持有者退出。只在仍处于启动中且还有重试机会时等待；
+	 * 返回 true 表示可以重新拉起。
+	 */
+	private async waitForLockHolderExit(pid: number): Promise<boolean> {
+		if (!this.lockRetryAvailable) return false;
+		this.lockRetryAvailable = false;
+		const child = this.child;
+		this.child = undefined;
+		if (child) await child.exited.catch(() => undefined);
+		this.options.onLine(t("log.waitingLockHolder", { pid }));
+		const deadline = Date.now() + LOCK_HOLDER_EXIT_WAIT_MS;
+		while (Date.now() < deadline) {
+			if (this.disposed || this.state !== "starting") return false;
+			if (!isProcessAlive(pid)) {
+				this.options.onLine(t("log.lockHolderExited", { pid }));
+				return true;
+			}
+			await this.sleep(READY_POLL_MS);
+		}
+		return false;
 	}
 
 	/**
@@ -173,6 +238,15 @@ export class BackendProcess {
 	 */
 	private lockConflictPid: number | undefined;
 
+	/** 本次 start() 是否还能在锁冲突后重试。 */
+	private lockRetryAvailable = false;
+
+	/** 更新交接进行中：旧服务还占着端口，健康检查会误判成新进程已就绪。 */
+	private awaitingHandoff = false;
+
+	/** 交接完成（或非交接启动）的时间，监听地址等待从这里起算。 */
+	private addressWaitStartedAt = 0;
+
 	/** 健康检查应使用的端口。 */
 	private probePort(): number {
 		return this.observedPort > 0 ? this.observedPort : this.target.port;
@@ -180,6 +254,11 @@ export class BackendProcess {
 
 	/** 从服务输出里解析实际监听地址与实例锁冲突。 */
 	private observeListenerAddress(line: string): void {
+		if (this.awaitingHandoff && line.includes(HANDOFF_COMPLETE_MESSAGE)) {
+			this.awaitingHandoff = false;
+			this.addressWaitStartedAt = Date.now();
+			return;
+		}
 		const event = parseServiceLogLine(line);
 		if (!event) return;
 		if (event.kind === "lock") {
@@ -191,31 +270,36 @@ export class BackendProcess {
 		this.observedPort = event.port;
 	}
 
-	/** 轮询健康检查直到就绪；超时只报状态，不杀进程（服务可能仍在慢启动）。 */
-	private async waitUntilReady(): Promise<void> {
+	/**
+	 * 轮询健康检查直到就绪；超时只报状态，不杀进程（服务可能仍在慢启动）。
+	 * 遇到实例锁冲突时返回持有者 PID，由调用方决定是否等待后重试。
+	 */
+	private async waitUntilReady(): Promise<number | undefined> {
 		const deadline = Date.now() + READY_TIMEOUT_MS;
-		const startedAt = Date.now();
+		this.addressWaitStartedAt = Date.now();
 		while (Date.now() < deadline) {
 			// 实例锁冲突：服务会立即退出，直接给出原因，不必等超时。
-			if (this.lockConflictPid !== undefined) {
-				this.setState("error", t("error.instanceLockConflict", { pid: this.lockConflictPid }));
-				return;
+			if (this.lockConflictPid !== undefined) return this.lockConflictPid;
+			if (!this.child) return undefined;
+			if (this.awaitingHandoff) {
+				await this.sleep(READY_POLL_MS);
+				continue;
 			}
-			if (!this.child) return;
 			// 先等服务自己报告监听地址再探测端口：直接探测会把"已在运行的外部实例"
 			// 误当成刚启动的这个（表现为瞬间 running，随后子进程因锁冲突退出）。
 			// 等待有上限：地址解析失败时必须回退到配置端口，否则会悬空到启动超时。
-			if (this.observedPort <= 0 && Date.now() - startedAt < ADDRESS_WAIT_MS) {
+			if (this.observedPort <= 0 && Date.now() - this.addressWaitStartedAt < ADDRESS_WAIT_MS) {
 				await this.sleep(READY_POLL_MS);
 				continue;
 			}
 			if (await this.checkHealth()) {
 				this.setState("running");
-				return;
+				return undefined;
 			}
 			await this.sleep(READY_POLL_MS);
 		}
 		if (this.child) this.setState("error", t("error.readyTimeout"));
+		return undefined;
 	}
 
 	/** 可中断等待：stop/dispose 会立即唤醒，避免启动流程卡在定时器上。 */

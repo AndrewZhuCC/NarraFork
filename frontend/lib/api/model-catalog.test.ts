@@ -36,22 +36,25 @@ describe("model catalog wire contract", () => {
 			baseRevision: 4,
 			patch: {
 				set: {
-					"referencePricing.input": "0",
-					"nativeSearch.supported": false,
-					"modalities.output": [],
+					input_cost_per_token: "0",
+					supports_web_search: false,
+					supported_output_modalities: [],
 				},
-				reset: ["limits.contextWindow"],
+				reset: ["working_context_tokens"],
 			},
 		};
 		await modelCatalogApi.mutate(mutation);
 		await modelCatalogApi.resolveModel("my-provider:channel:model:opaque");
+		await modelCatalogApi.resolve({ upstreamModelId: "opaque" });
 		expect(calls.map((call) => [call.url, call.method])).toEqual([
-			["/api/model-catalog", "GET"],
-			["/api/model-catalog/mutate", "POST"],
-			["/api/model-catalog/resolve", "POST"],
+			["/api/model-catalog/v2", "GET"],
+			["/api/model-catalog/v2/mutate", "POST"],
+			["/api/model-catalog/v2/resolve", "POST"],
+			["/api/model-catalog/v2/resolve", "POST"],
 		]);
 		expect(calls[1].body).toEqual(mutation);
 		expect(calls[2].body).toEqual({ model: "my-provider:channel:model:opaque" });
+		expect(calls[3].body).toEqual({ query: { upstreamModelId: "opaque" } });
 	});
 	test("check/apply/rollback and pin/auto-apply preserve method and false/null", async () => {
 		await modelCatalogApi.update("check");

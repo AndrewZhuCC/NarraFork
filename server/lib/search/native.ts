@@ -1,4 +1,4 @@
-import { getEffectiveModelMetadata } from "../model-catalog";
+import { getEffectiveModelProfile } from "../model-catalog";
 import {
 	getAnthropicProviderConfig,
 	getOpenaiProviderConfig,
@@ -49,8 +49,8 @@ export function usesInlineNativeSearch(provider: string, model: string): boolean
 	if (provider === "codex" && settings.codex?.useWebSearch === false) return false;
 	if (getOpenaiProviderConfig(provider)?.codexWebSearch === false) return false;
 	return (
-		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
-			.metadata.nativeSearch?.supported !== false && usesCodexModel(provider, model)
+		getEffectiveModelProfile(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.nativeSearch !== false && usesCodexModel(provider, model)
 	);
 }
 
@@ -81,8 +81,8 @@ export function usesInlineNativeSearch(provider: string, model: string): boolean
 export function usesSideRequestNativeSearch(provider: string, model?: string): boolean {
 	if (
 		model &&
-		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
-			.metadata.nativeSearch?.supported === false
+		getEffectiveModelProfile(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.nativeSearch === false
 	)
 		return false;
 	if (!isAnthropicProvider(provider)) return false;

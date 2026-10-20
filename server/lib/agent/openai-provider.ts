@@ -52,7 +52,7 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
@@ -84,7 +84,7 @@ export function applyOpenAIModelMetadata(
 	apiMode: OpenAIApiMode,
 	requested?: number,
 ): void {
-	const metadata = effectiveProviderMetadata(model);
+	const metadata = effectiveModelProfile(model);
 	// Codex endpoints (including NUG Codex) do not accept max_output_tokens.
 	// Ordinary Responses and Chat Completions retain the configured output ceiling.
 	if (apiMode !== "codex") {
@@ -239,10 +239,7 @@ export function appendCodexNativeTools(
 	model: string,
 	options?: { webSearch?: boolean; imageGeneration?: boolean },
 ): void {
-	if (
-		options?.webSearch === false ||
-		effectiveProviderMetadata(model).nativeSearch?.supported === false
-	) {
+	if (options?.webSearch === false || effectiveModelProfile(model).nativeSearch === false) {
 		removeNativeTool(tools, "web_search");
 	} else if (!hasNativeTool(tools, "web_search")) {
 		tools.push({ type: "web_search" });
@@ -268,7 +265,7 @@ export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
-	return resolveMetadataReasoning(effectiveProviderMetadata(model), reasoningEffort);
+	return resolveMetadataReasoning(effectiveModelProfile(model), reasoningEffort);
 }
 
 /**
@@ -284,7 +281,7 @@ export function resolveCodexRequestReasoningEffort(
 		normalizeCodexReasoningEffort(
 			model,
 			reasoningEffort ??
-				effectiveProviderMetadata(model).reasoning?.defaultLevel ??
+				effectiveModelProfile(model).reasoning?.defaultLevel ??
 				settings.agent.defaultReasoningEffort ??
 				"max",
 		) ?? "none"
@@ -312,7 +309,7 @@ function applyGenericReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): void {
-	const metadata = effectiveProviderMetadata(model);
+	const metadata = effectiveModelProfile(model);
 	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 	if (!reasoningEffort) return;
 	const bareModel = parseModelId(model).model;

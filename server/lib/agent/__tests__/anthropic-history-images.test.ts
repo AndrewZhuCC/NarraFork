@@ -137,7 +137,7 @@ describe("anthropic history image replay", () => {
 		).toEqual(["看[image #1: a.png]和[image #2: b.png]", "image", "有何不同"]);
 	});
 
-	test("keeps the turn's text alongside the image", async () => {
+	test("keeps the turn's text alongside the image, in the live turn's order", async () => {
 		registerTestImage("narr-1", "img-a");
 
 		const { history } = await provider().buildHistory(
@@ -157,8 +157,9 @@ describe("anthropic history image replay", () => {
 
 		const first = history[0] as { role: string; content: Array<{ type: string; text?: string }> };
 		expect(first.role).toBe("user");
-		expect(first.content[0]).toEqual({ type: "text", text: "look at this" });
-		expect(first.content[1].type).toBe("image");
+		// The live turn sent unplaced images ahead of the text; replay must not reorder it.
+		expect(first.content[0].type).toBe("image");
+		expect(first.content[1]).toEqual({ type: "text", text: "look at this" });
 	});
 
 	test("resolves against the uploading narrator when it differs from the owner", async () => {

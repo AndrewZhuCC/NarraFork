@@ -1,6 +1,7 @@
 import {
 	COMPOSER_ATTACHMENT_PLACEHOLDER,
 	composerAttachmentPlaceholderName,
+	unescapeComposerText,
 } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import type { FileReferenceInput } from "./file-reference-input";
@@ -202,15 +203,17 @@ export type ComposerTextSegment =
 /**
  * A sent message's projection, back in document order: quote blocks wherever they start a
  * line, and attachment placeholders that name a real attachment (first occurrence only).
- * Anything else, including look-alike placeholders, stays literal text.
+ * Anything else, including look-alike placeholders, stays literal text, with the escapes the
+ * projection added to typed look-alikes removed.
  */
 export function parseComposerSegments(
 	text: string,
 	attachments: ComposerSegmentAttachments = { images: [], files: [] },
 ): ComposerTextSegment[] {
 	const segments: ComposerTextSegment[] = [];
-	const pushText = (value: string) => {
-		if (!value) return;
+	const pushText = (raw: string) => {
+		if (!raw) return;
+		const value = unescapeComposerText(raw);
 		const last = segments[segments.length - 1];
 		if (last?.type === "text") last.text += value;
 		else segments.push({ type: "text", text: value });
@@ -231,7 +234,8 @@ export function parseComposerSegments(
 				continue;
 			}
 		}
-		if (text[pos] === "[") {
+		// A backslash marks typed text that only looks like a placeholder.
+		if (text[pos] === "[" && text[pos - 1] !== "\\") {
 			placeholder.lastIndex = pos;
 			const match = placeholder.exec(text);
 			if (match) {
@@ -256,6 +260,30 @@ export function parseComposerSegments(
 	}
 	pushText(text.slice(textStart));
 	return segments;
+}
+
+/**
+ * One-glance plain text for places that show a sent or queued message as a single string:
+ * quote blocks shrink to their label and placeholders to the attachment's name.
+ */
+export function composerPreviewText(
+	text: string,
+	attachments: ComposerSegmentAttachments = { images: [], files: [] },
+): string {
+	const segments = parseComposerSegments(text, attachments);
+	return segments
+		.map((segment, index) => {
+			if (segment.type === "attachment")
+				return `[${(segment.kind === "image" ? attachments.images : attachments.files)[segment.index]}]`;
+			if (segment.type === "quote")
+				return `[❝ ${segment.quote.label}]${index < segments.length - 1 ? " " : ""}`;
+			// The projection puts every quote block on its own line; a preview keeps one line.
+			return segments[index + 1]?.type === "quote"
+				? segment.text.replace(/\n$/u, " ")
+				: segment.text;
+		})
+		.join("")
+		.trimEnd();
 }
 
 function shiftReferences(

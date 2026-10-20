@@ -1,13 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import {
-	catalogFromModelFiles,
-	catalogToRaw,
-	decodeCatalog,
-	encodeCatalog,
-} from "../../server/lib/model-catalog/source";
+import { legacyLocalToRaw } from "../../server/lib/model-catalog/legacy-v1";
+import { decodeCatalog } from "../../server/lib/model-catalog/source";
 import { type RawMetadata, rawCatalogFromModelFiles } from "./card";
 import { normalizeRawLocalState, patchLocalCardMetadata } from "./card-local";
-import { createModelCardResolver, legacyLocalToRaw, type RawLocalState } from "./card-resolver";
+import { createModelCardResolver, type RawLocalState } from "./card-resolver";
 
 const sourceVersion = "a".repeat(40);
 const date = "2026-01-01T00:00:00Z";
@@ -146,7 +142,7 @@ describe("raw card resolution and persistence", () => {
 		).toEqual({ input_cost_per_token_above_200k_tokens_priority: 4e-6 });
 	});
 
-	test("legacy local units and ambiguous windows convert without inventing vendor limits", () => {
+	test("old local units and ambiguous windows import without inventing vendor limits", () => {
 		const local = legacyLocalToRaw({
 			revision: 3,
 			bindings: [
@@ -171,14 +167,13 @@ describe("raw card resolution and persistence", () => {
 		});
 	});
 
-	test("v2 snapshots round-trip unknown-only metadata while old pinned snapshots stay v1", () => {
+	test("snapshots round-trip unknown-only metadata and old pinned snapshots import once", () => {
 		const metadata = { future: { zero: 0, empty: [], unknown: null, negative: false } };
-		const catalog = catalogFromModelFiles(files(metadata), sourceVersion, date);
-		const encoded = encodeCatalog(catalog);
-		expect(encoded.schemaVersion).toBe(2);
-		expect(
-			catalogToRaw(decodeCatalog(JSON.parse(JSON.stringify(encoded)))).models[0]?.metadata,
-		).toEqual(metadata);
+		const catalog = rawCatalogFromModelFiles(files(metadata), sourceVersion, date);
+		expect(catalog.schemaVersion).toBe(2);
+		expect(decodeCatalog(JSON.parse(JSON.stringify(catalog))).models[0]?.metadata).toEqual(
+			metadata,
+		);
 		const legacy = decodeCatalog({
 			schemaVersion: 1,
 			catalogVersion: "old-pinned",
@@ -186,11 +181,17 @@ describe("raw card resolution and persistence", () => {
 			models: [{ id: "old", metadata: { limits: { contextWindow: 2048 } } }],
 			variants: [],
 		});
-		expect(encodeCatalog(legacy).schemaVersion).toBe(1);
-		expect(catalogToRaw(legacy).models[0]?.metadata).toEqual({ legacy_context_window: 2048 });
-		expect(() => decodeCatalog({ ...encoded, sourceVersion: null })).toThrow();
+		expect(legacy.schemaVersion).toBe(2);
+		expect(legacy.sourceVersion).toBe("old-pinned");
+		expect(legacy.models[0]?.metadata).toEqual({ legacy_context_window: 2048 });
+		expect(decodeCatalog(JSON.parse(JSON.stringify(legacy)))).toEqual(legacy);
+		expect(() => decodeCatalog({ ...catalog, sourceVersion: null })).toThrow();
 		expect(() =>
-			catalogFromModelFiles(files({ nested: { api_key: "not-a-real-key" } }), sourceVersion, date),
+			rawCatalogFromModelFiles(
+				files({ nested: { api_key: "not-a-real-key" } }),
+				sourceVersion,
+				date,
+			),
 		).toThrow();
 	});
 });

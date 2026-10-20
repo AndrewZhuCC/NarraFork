@@ -23,11 +23,13 @@ export function orderUserContent<I>(
 	const pattern = new RegExp(COMPOSER_ATTACHMENT_PLACEHOLDER.source, "gu");
 	let textStart = 0;
 	for (const match of text.matchAll(pattern)) {
-		if (match[1] !== "image" || insideQuoteLine(text, match.index ?? 0)) continue;
+		const at = match.index ?? 0;
+		// `\[image #…` is typed text the projection escaped, not a placeholder.
+		if (match[1] !== "image" || text[at - 1] === "\\" || insideQuoteLine(text, at)) continue;
 		const index = Number(match[2]) - 1;
 		if (index >= images.length || placed.has(index)) continue;
 		placed.add(index);
-		const end = (match.index ?? 0) + match[0].length;
+		const end = at + match[0].length;
 		parts.push({ type: "text", text: text.slice(textStart, end) });
 		const image = images[index];
 		if (image != null) parts.push({ type: "image", image });

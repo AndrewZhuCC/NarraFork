@@ -23,7 +23,7 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
@@ -551,7 +551,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		};
 		if (options.systemInstruction) body.system_instruction = options.systemInstruction;
 		if (options.tools?.length) body.tools = options.tools;
-		const metadata = effectiveProviderMetadata(options.model);
+		const metadata = effectiveModelProfile(options.model);
 		const effort = resolveMetadataReasoning(metadata, options.reasoningEffort);
 		// This adapter has no verified Interactions disable mapping. Do not silently
 		// turn an explicit, supported disable request into low/minimal thinking.

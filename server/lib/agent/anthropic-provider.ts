@@ -46,7 +46,7 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
@@ -611,7 +611,7 @@ function buildThinkingConfig(
 	| { type: "enabled"; budget_tokens: number }
 	| { type: "disabled" }
 	| undefined {
-	const metadata = effectiveProviderMetadata(model);
+	const metadata = effectiveModelProfile(model);
 	if (metadata.reasoning?.supported === false) return undefined;
 	if (metadata.reasoning?.supported !== true && !supportsThinking(model)) return undefined;
 	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
@@ -671,7 +671,7 @@ export function mapEffortParam(
 ): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 	// Explicit exclusions take precedence over catalog capability and tier metadata.
 	if (!supportsEffort(parseModelId(model).model)) return undefined;
-	const metadata = effectiveProviderMetadata(model);
+	const metadata = effectiveModelProfile(model);
 	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
 	if (metadata.reasoning?.levels?.length)
@@ -1652,7 +1652,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// the supported range caps at or above it.
 		const maxTokens =
 			resolveOutputTokenLimit(
-				effectiveProviderMetadata(params.model),
+				effectiveModelProfile(params.model),
 				params.maxOutputTokens,
 				DEFAULT_MAX_TOKENS,
 			) ?? DEFAULT_MAX_TOKENS;
@@ -1789,7 +1789,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// (DeepSeek supports "high" and "max"; low/medium map to high)
 		if (isDeepSeek && thinkingEnabled && supportsEffort(model)) {
 			const effort = mapDeepSeekEffort(
-				resolveMetadataReasoning(effectiveProviderMetadata(params.model), params.reasoningEffort),
+				resolveMetadataReasoning(effectiveModelProfile(params.model), params.reasoningEffort),
 			);
 			if (effort) {
 				body.output_config = { effort };
@@ -2114,7 +2114,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: bareModel,
 			max_tokens:
 				resolveOutputTokenLimit(
-					effectiveProviderMetadata(model),
+					effectiveModelProfile(model),
 					options?.maxOutputTokens,
 					DEFAULT_GENERATE_MAX_TOKENS,
 				) ?? DEFAULT_GENERATE_MAX_TOKENS,
@@ -2124,9 +2124,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
 		const reasoningEffort =
-			options?.reasoningEffort ??
-			effectiveProviderMetadata(model).reasoning?.defaultLevel ??
-			undefined;
+			options?.reasoningEffort ?? effectiveModelProfile(model).reasoning?.defaultLevel ?? undefined;
 		if (reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
@@ -2213,7 +2211,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: bareModel,
 			max_tokens:
 				resolveOutputTokenLimit(
-					effectiveProviderMetadata(model),
+					effectiveModelProfile(model),
 					options?.maxOutputTokens,
 					DEFAULT_GENERATE_MAX_TOKENS,
 				) ?? DEFAULT_GENERATE_MAX_TOKENS,
@@ -2223,9 +2221,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
 		const reasoningEffort =
-			options?.reasoningEffort ??
-			effectiveProviderMetadata(model).reasoning?.defaultLevel ??
-			undefined;
+			options?.reasoningEffort ?? effectiveModelProfile(model).reasoning?.defaultLevel ?? undefined;
 		if (reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
@@ -2281,7 +2277,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		const metadataModel = params.model.startsWith(`${this.config.prefix}:`)
 			? params.model
 			: `${this.config.prefix}:${params.model}`;
-		if (effectiveProviderMetadata(metadataModel).nativeSearch?.supported === false) {
+		if (effectiveModelProfile(metadataModel).nativeSearch === false) {
 			throw new Error(`Model ${params.model} does not support native search.`);
 		}
 		const apiKey = this.config.apiKey;
@@ -2307,7 +2303,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: bareModel,
 			max_tokens:
 				resolveOutputTokenLimit(
-					effectiveProviderMetadata(metadataModel),
+					effectiveModelProfile(metadataModel),
 					undefined,
 					WEB_SEARCH_MAX_TOKENS,
 				) ?? WEB_SEARCH_MAX_TOKENS,
@@ -3344,9 +3340,10 @@ async function buildAnthropicHistory(
 			if (images.some((image) => image !== null)) {
 				// A mid-conversation system message cannot carry image parts, so an
 				// image forces the user role. That only affects `sys` rows, which do
-				// not carry uploads in practice.
-				const parts: AnthropicContentPart[] = orderUserContent(text, images, "after").map((part) =>
-					part.type === "text" ? { type: "text", text: part.text } : part.image,
+				// not carry uploads in practice. Unplaced images lead, exactly as the live turn
+				// sent them: a rebuilt turn that reorders its parts misses the prompt cache.
+				const parts: AnthropicContentPart[] = orderUserContent(text, images, "before").map(
+					(part) => (part.type === "text" ? { type: "text", text: part.text } : part.image),
 				);
 				history.push({ role: "user", content: parts });
 				emittedMessages.push(msg);

@@ -418,6 +418,8 @@ describe("source-bound helper runtime", () => {
 	});
 });
 describe("executor build identity integration", () => {
+	// Deliberately differ from the current pin, including after future component bumps.
+	const devAppVersion = `${Number(EXECUTOR_RELEASE_VERSION.split(".")[0]) + 1}.0.0`;
 	function fixture(mode: string) {
 		const root = mkdtempSync(resolve(".narrafork/executor-build-identity-"));
 		const path = join(root, "fixture.ts");
@@ -432,7 +434,7 @@ const originalRead = fs.readFileSync;
 const mode = ${JSON.stringify(mode)};
 mock.module("node:fs", () => ({ ...fs,
  existsSync: (path) => String(path).endsWith("package.json") ? mode === "dev" : originalExists(path),
- readFileSync: (path, ...args) => String(path).endsWith("package.json") ? '{"version":"0.9.4"}' : originalRead(path, ...args),
+ readFileSync: (path, ...args) => String(path).endsWith("package.json") ? '${JSON.stringify({ version: devAppVersion })}' : originalRead(path, ...args),
 }));
 const { createHelperDistributionDependencies } = await import(${module("shared/helper-distribution.ts")});
 const declaration = mode === "legacy" ? undefined : mode === "malformed" ? {} : mode === "null" ? null :
@@ -493,7 +495,7 @@ try {
 	}
 	// Dev reads the repository pin; compiled reads its historical build declaration.
 	for (const [mode, app, executor] of [
-		["dev", "0.9.4", EXECUTOR_RELEASE_VERSION],
+		["dev", devAppVersion, EXECUTOR_RELEASE_VERSION],
 		["compiled", "0.9.2", "0.9.1"],
 	] as const) {
 		test(`${mode} APP ${app} fetches and generates install script for independent executor ${executor}`, () => {

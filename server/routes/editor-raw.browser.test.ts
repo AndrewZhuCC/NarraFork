@@ -11,6 +11,7 @@ import type {
 	buildFixtureBundle,
 	FixtureAsset,
 } from "../../scripts/smoke-monaco-large-file-bundle";
+import { EDITOR_IO_TIMEOUT_MS } from "../../shared/editor-document";
 import { testEnvironment } from "../../tests/preload";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
@@ -147,6 +148,9 @@ test("Chrome146 production raw path: 20MiB, dual-view candidate swap, digests, e
 		server = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
+			// Production uses 255s; Bun's default 10s cuts off legal raw preflights under CI load.
+			// Keep this fixture bounded by the editor client's existing per-request deadline.
+			idleTimeout: EDITOR_IO_TIMEOUT_MS / 1000,
 			async fetch(request) {
 				const path = new URL(request.url).pathname;
 				if (path === "/fixture-config") return Response.json({ narratorId });

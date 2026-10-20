@@ -241,7 +241,6 @@ export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
-	modelCardSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabSchema,

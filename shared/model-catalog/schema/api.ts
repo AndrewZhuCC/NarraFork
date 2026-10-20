@@ -1,14 +1,5 @@
 import type { ModelCard } from "../card";
-import type {
-	CatalogDocument,
-	LocalCatalogState,
-	MetadataPatch,
-	ModelBinding,
-	ModelDefinition,
-	ModelQuery,
-	ModelVariant,
-	ResolvedModelMetadata,
-} from "./catalog";
+import type { ModelQuery, RawCatalog, RawLocalState } from "./catalog";
 
 /** Common wire shapes. API roots differ between the two applications. */
 export interface CatalogUpdateStatus {
@@ -35,30 +26,15 @@ export interface CatalogUpdateStatus {
 		}>;
 	};
 }
-export interface ModelCatalogSnapshot {
-	catalog: CatalogDocument;
-	local: LocalCatalogState;
+/** Complete source metadata plus the local layer, no derived defaults. */
+export interface ModelCardSnapshot {
+	schemaVersion: 2;
+	catalog: RawCatalog;
+	local: RawLocalState;
 	update: CatalogUpdateStatus;
 }
-export type ModelCatalogMutation =
-	| { baseRevision: number; action: "upsert-model"; model: ModelDefinition }
-	| { baseRevision: number; action: "upsert-variant"; variant: ModelVariant }
-	| { baseRevision: number; action: "upsert-binding"; binding: ModelBinding }
-	| {
-			baseRevision: number;
-			action: "patch";
-			target: "model" | "variant" | "binding";
-			targetId: string;
-			patch: MetadataPatch;
-	  }
-	| {
-			baseRevision: number;
-			action: "hide" | "restore" | "delete";
-			target: "model" | "variant" | "binding";
-			targetId: string;
-	  };
-/** GET root -> snapshot; POST root/mutate -> mutation -> snapshot.
- * POST root/resolve -> {query} -> resolved (includes actual discovery/defaults).
+/** GET root/v2 -> snapshot; POST root/v2/mutate -> ModelCardMutation -> snapshot.
+ * POST root/v2/resolve -> {query} | {model} -> card (includes actual discovery).
  * POST root/updates/check -> snapshot.
  * POST root/updates/apply -> {version?: string} -> snapshot (staged checked version only).
  * POST root/updates/rollback -> {version: string} -> snapshot (retained version only).
@@ -66,8 +42,7 @@ export type ModelCatalogMutation =
  * Stale baseRevision -> HTTP 409. Failed validation -> HTTP 400. Admin writes only.
  */
 export interface ModelCatalogResolveRequest {
-	query: ModelQuery;
+	query?: ModelQuery;
+	model?: string;
 }
-export type ModelCatalogResolveResponse = ResolvedModelMetadata;
-/** Optional complete card; old NUG responses omit this and keep the v1 projection. */
-export type ModelCatalogCardResolveResponse = ModelCard;
+export type ModelCatalogResolveResponse = ModelCard;
