@@ -94,10 +94,12 @@ function createUsageResponseWithWeekly(
 	primaryResetAtSec: number,
 	weeklyUsedPercent?: number,
 	weeklyResetAtSec?: number,
+	credits?: CodexUsageResult["credits"],
 ): Response {
 	return new Response(
 		JSON.stringify({
 			plan_type: "plus",
+			...(credits ? { credits } : {}),
 			rate_limit: {
 				allowed: true,
 				limit_reached: primaryUsedPercent >= 100 || (weeklyUsedPercent ?? 0) >= 100,
@@ -182,6 +184,185 @@ afterEach(() => {
 	for (const p of tempHomes.splice(0)) {
 		rmSync(p, { recursive: true, force: true });
 	}
+});
+
+describe("CodexManager credit quota", () => {
+	const credits = { has_credits: true, unlimited: false, balance: "1e-9999" };
+
+	function exhaustedUsage(): CodexUsageResult {
+		return {
+			plan_type: "plus",
+			queriedAt: new Date().toISOString(),
+			primary_window: {
+				used_percent: 100,
+				remaining_percent: 0,
+				reset_at: Math.floor(Date.now() / 1000) + 3_600,
+				reset_after_seconds: 3_600,
+				window_type: "5h",
+			},
+			credits,
+		};
+	}
+
+	function mockExhaustedUsage() {
+		globalThis.fetch = (async () =>
+			createUsageResponseWithWeekly(
+				100,
+				Math.floor(Date.now() / 1000) + 3_600,
+				undefined,
+				undefined,
+				credits,
+			)) as unknown as typeof fetch;
+	}
+
+	test("defaults legacy snapshots to false and persists updates across reload", () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("credit-settings");
+		tempHomes.push(tmpHome);
+		expect(manager.snapshot().entries[0]?.useCreditQuota).toBe(false);
+		manager.updateCredential("credit-settings", { useCreditQuota: true });
+		manager.updateCredential("credit-settings", { displayName: "Renamed", priority: 5 });
+		expect(manager.snapshot().entries[0]).toMatchObject({
+			useCreditQuota: true,
+			displayName: "Renamed",
+			priority: 5,
+		});
+		const saved = JSON.parse(
+			readFileSync(join(tmpHome, ".narrafork", "codex-credentials.json"), "utf-8"),
+		);
+		expect(saved[0].useCreditQuota).toBe(true);
+		const reloaded = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+		expect(reloaded.snapshot().entries[0]?.useCreditQuota).toBe(true);
+		manager.updateCredential("credit-settings", { useCreditQuota: false });
+		expect(manager.snapshot().entries[0]?.useCreditQuota).toBe(false);
+	});
+
+	test.each([
+		true,
+		false,
+	])("cached exhausted windows require opt-in=%s despite positive credits", async (useCreditQuota) => {
+		const { manager, tmpHome } = createManagerWithOneCredential("cached-credits", {
+			useCreditQuota,
+			usage: exhaustedUsage(),
+		});
+		tempHomes.push(tmpHome);
+		expect(manager.snapshot().entries[0]?.disabled).toBe(!useCreditQuota);
+		if (useCreditQuota) {
+			expect((await manager.acquireContext()).id).toBe("cached-credits");
+			manager.updateCredential("cached-credits", { useCreditQuota: false });
+			expect(manager.snapshot().entries[0]).toMatchObject({
+				disabled: true,
+				disabledReason: "quota_exhausted",
+				useCreditQuota: false,
+			});
+			expect(manager.snapshot().available).toBe(0);
+		}
+	});
+
+	test.each([
+		{ has_credits: false, unlimited: false, balance: "5" },
+		{ has_credits: true, unlimited: false, balance: "0" },
+	])("opt-in does not bypass exhausted quota with unspendable credits %j", (credits) => {
+		const { manager, tmpHome } = createManagerWithOneCredential("empty-credits", {
+			useCreditQuota: true,
+			usage: { ...exhaustedUsage(), credits },
+		});
+		tempHomes.push(tmpHome);
+		expect(manager.snapshot().entries[0]).toMatchObject({
+			disabled: true,
+			disabledReason: "quota_exhausted",
+		});
+	});
+
+	test.each([
+		undefined,
+		{ has_credits: true, unlimited: false, balance: "0" },
+	])("refresh disables a credit-funded credential when credits become %j", async (remainingCredits) => {
+		const { manager, tmpHome } = createManagerWithOneCredential("drained-credits", {
+			useCreditQuota: true,
+			usage: { ...exhaustedUsage(), reset_credits_available: 10 },
+		});
+		tempHomes.push(tmpHome);
+		expect(manager.snapshot().available).toBe(1);
+		globalThis.fetch = (async () =>
+			createUsageResponseWithWeekly(
+				100,
+				Math.floor(Date.now() / 1000) + 3_600,
+				undefined,
+				undefined,
+				remainingCredits,
+			)) as unknown as typeof fetch;
+		await manager.getUsage("drained-credits");
+		expect(manager.snapshot().entries[0]).toMatchObject({
+			disabled: true,
+			disabledReason: "quota_exhausted",
+		});
+	});
+
+	test("enabling does not revive stale quota state; a fresh credit balance does", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("recover-credits", {
+			disabled: true,
+			disabledReason: "quota_exhausted",
+			quotaResetsAt: Date.now() + 3_600_000,
+			usage: exhaustedUsage(),
+		});
+		tempHomes.push(tmpHome);
+		manager.updateCredential("recover-credits", { useCreditQuota: true });
+		expect(manager.snapshot().entries[0]?.disabled).toBe(true);
+		mockExhaustedUsage();
+		await manager.getUsage("recover-credits");
+		expect(manager.snapshot().entries[0]).toMatchObject({ disabled: false, useCreditQuota: true });
+		expect(manager.snapshot().entries[0]?.disabledReason).toBeUndefined();
+		expect(manager.snapshot().entries[0]?.quotaResetsAt).toBeUndefined();
+	});
+
+	test.each([
+		"manual",
+		"banned",
+		"too_many_failures",
+	])("fresh credits cannot recover %s disables", async (disabledReason) => {
+		const { manager, tmpHome } = createManagerWithOneCredential("disabled-credits", {
+			disabled: true,
+			disabledReason,
+		});
+		tempHomes.push(tmpHome);
+		manager.updateCredential("disabled-credits", { useCreditQuota: true });
+		mockExhaustedUsage();
+		await manager.getUsage("disabled-credits");
+		expect(manager.snapshot().entries[0]).toMatchObject({ disabled: true, disabledReason });
+	});
+
+	test("upstream quota exhaustion immediately disables even cached positive credits", () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("upstream-credits", {
+			useCreditQuota: true,
+			usage: exhaustedUsage(),
+		});
+		tempHomes.push(tmpHome);
+		expect(manager.reportQuotaExhausted("upstream-credits", Date.now() + 3_600_000)).toBe(false);
+		expect(manager.snapshot().entries[0]).toMatchObject({
+			disabled: true,
+			disabledReason: "quota_exhausted",
+		});
+	});
+
+	test("upstream-triggered refresh does not waive exhaustion on a fresh positive balance", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("upstream-refresh", {
+			useCreditQuota: true,
+			usage: exhaustedUsage(),
+		});
+		tempHomes.push(tmpHome);
+		mockExhaustedUsage();
+		const refresh = manager.reportQuotaExhaustedAndRefreshUsage(
+			"upstream-refresh",
+			Date.now() + 3_600_000,
+		);
+		expect(manager.snapshot().entries[0]?.disabled).toBe(true);
+		expect(await refresh).toBe(false);
+		expect(manager.snapshot().entries[0]).toMatchObject({
+			disabled: true,
+			disabledReason: "quota_exhausted",
+			usage: { credits },
+		});
+	});
 });
 
 describe("CodexManager usage quota state", () => {

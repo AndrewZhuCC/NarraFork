@@ -31,6 +31,7 @@ import {
 	type CodexUsageResult,
 	consumeCodexResetCredit,
 	fetchCodexUsage,
+	hasSpendableCodexCredits,
 	isUnauthorizedCodexUsageError,
 } from "./codex-usage";
 import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
@@ -126,6 +127,8 @@ export interface CodexCredential {
 	/** Agent Identity / PAT: whether the ChatGPT account is FedRAMP. */
 	fedramp?: boolean;
 	priority: number;
+	/** Opt in to spending paid credits after subscription windows are exhausted. */
+	useCreditQuota?: boolean;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
 	/** Epoch milliseconds when quota resets (from API error.resets_at). */
@@ -190,6 +193,8 @@ export interface CredentialSnapshot {
 	accountId?: string;
 	email?: string;
 	priority: number;
+	/** Opt in to spending paid credits after subscription windows are exhausted. */
+	useCreditQuota: boolean;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
 	/** Epoch milliseconds when archived; absent for active credentials. */
@@ -719,6 +724,8 @@ export class CodexManager {
 	private usageSchedulerNextRunAt?: number;
 	private usageSchedulerRetryAfter = new Map<string, number>();
 	private quotaOverviewBroadcastTimer?: ReturnType<typeof setTimeout>;
+	// An upstream-triggered refresh must not waive quota exhaustion on credits alone.
+	private readonly upstreamQuotaRefreshes = new Set<string>();
 
 	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
@@ -1151,6 +1158,7 @@ export class CodexManager {
 
 	async reportQuotaExhaustedAndRefreshUsage(id: string, resetsAt?: number): Promise<boolean> {
 		this.reportQuotaExhausted(id, resetsAt);
+		this.upstreamQuotaRefreshes.add(id);
 		try {
 			await this.refreshUsageDeduplicated(id);
 		} catch (err) {
@@ -1163,6 +1171,8 @@ export class CodexManager {
 				credentialId: id,
 				error: err instanceof Error ? err.message : String(err),
 			});
+		} finally {
+			this.upstreamQuotaRefreshes.delete(id);
 		}
 
 		return this.hasUsablePoolCredential();
@@ -1475,6 +1485,7 @@ export class CodexManager {
 				accountId: e.accountId,
 				email: e.email,
 				priority: e.priority,
+				useCreditQuota: e.useCreditQuota === true,
 				disabled: e.disabled,
 				disabledReason: e.disabledReason,
 				archivedAt: e.archivedAt,
@@ -1701,12 +1712,22 @@ export class CodexManager {
 		logger.info("Codex credential unarchived", { credentialId: id, accountId: entry.accountId });
 	}
 
-	updateCredential(id: string, fields: { displayName?: string; priority?: number }): void {
+	updateCredential(
+		id: string,
+		fields: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+	): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 		if (fields.displayName !== undefined) entry.displayName = fields.displayName;
 		if (fields.priority !== undefined) entry.priority = fields.priority;
+		if (fields.useCreditQuota !== undefined) entry.useCreditQuota = fields.useCreditQuota === true;
 		this.saveCredentials();
+		// Do not resurrect a credential on a stale balance when enabling: the next
+		// successful usage refresh can recover quota-disabled entries. Disabling
+		// takes effect immediately using cached windows, including affinity eviction.
+		this.applyCachedQuotaStates();
+		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
 	}
 
 	// ==================== OAuth Flows ====================
@@ -1890,7 +1911,11 @@ export class CodexManager {
 		for (const entry of this.poolEntries) {
 			if (entry.disabled || !entry.usage) continue;
 			const quotaState = this.evaluateQuotaFromUsage(entry.usage, now);
-			if (!quotaState.exhausted) continue;
+			if (
+				!quotaState.exhausted ||
+				(entry.useCreditQuota === true && hasSpendableCodexCredits(entry.usage.credits))
+			)
+				continue;
 			entry.disabled = true;
 			entry.disabledReason = "quota_exhausted";
 			entry.quotaResetsAt = quotaState.resetsAt ?? entry.quotaResetsAt;
@@ -2107,10 +2132,17 @@ export class CodexManager {
 		this.saveCredentials();
 
 		const quotaState = this.evaluateQuotaFromUsage(usage);
-		if (quotaState.exhausted) {
-			this.reportQuotaExhausted(id, quotaState.resetsAt);
-		} else {
-			this.clearQuotaExhaustedIfRecovered(id, entry);
+		const canSpendCredits =
+			!this.upstreamQuotaRefreshes.has(id) &&
+			entry.useCreditQuota === true &&
+			hasSpendableCodexCredits(usage.credits);
+		// Refreshes must not replace manual bans or other non-quota disables.
+		if (!entry.disabled || entry.disabledReason === "quota_exhausted") {
+			if (quotaState.exhausted && !canSpendCredits) {
+				this.reportQuotaExhausted(id, quotaState.resetsAt);
+			} else {
+				this.clearQuotaExhaustedIfRecovered(id, entry);
+			}
 		}
 		this.usageSchedulerRetryAfter.delete(id);
 		this.rescheduleUsageRefresh();

@@ -43,7 +43,8 @@ export interface CodexUsageWindow {
  * representation verbatim to preserve precision instead of parsing to float.
  */
 export interface CodexCredits {
-	has_credits: boolean;
+	/** Omission means unknown, not an authoritative zero. */
+	has_credits?: boolean;
 	unlimited: boolean;
 	balance: string | null;
 }
@@ -216,10 +217,22 @@ export function normalizeCodexCredits(value: unknown): CodexCredits | undefined 
 				? String(value.balance)
 				: null;
 	return {
-		has_credits: value.has_credits === true,
+		has_credits: typeof value.has_credits === "boolean" ? value.has_credits : undefined,
 		unlimited: value.unlimited === true,
 		balance,
 	};
+}
+
+/** Conservative, bounded decimal comparison without floating-point rounding or exponent expansion. */
+export function hasSpendableCodexCredits(credits?: CodexCredits | null): boolean {
+	if (!credits) return false;
+	if (credits.unlimited === true) return true;
+	if (credits.has_credits === false || typeof credits.balance !== "string") return false;
+	const balance = credits.balance.trim();
+	if (balance.length > 64) return false;
+	// Inspect only the mantissa: a finite decimal exponent cannot change its sign.
+	const match = /^\+?((?:\d+(?:\.\d*)?|\.\d+))(?:[eE][+-]?\d+)?$/.exec(balance);
+	return !!match && /[1-9]/.test(match[1]);
 }
 
 export function parseCodexUsagePayload(
