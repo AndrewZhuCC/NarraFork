@@ -34,7 +34,7 @@ import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { reportInputCharacters } from "./input-characters";
-import { buildOpencodeSessionHeader } from "./opencode-session";
+import { buildOpencodeSessionHeader, isOpencodeEndpoint } from "./opencode-session";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -1235,6 +1235,13 @@ export class AnthropicProvider implements ProviderAdapter {
 				extraHeaders: this.config.extraHeaders,
 			}),
 		);
+		// The official dialect authenticates with Bearer, but OpenCode's
+		// `/zen/go/v1/messages` reads only `x-api-key` and rejects a Bearer-only
+		// request as "Go requires a credential" (the `/inference/go` roots accept
+		// either). Sending both keeps one Anthropic config valid on every Go root.
+		if (isOfficial && !headers["x-api-key"] && isOpencodeEndpoint(this.config.baseUrl)) {
+			headers["x-api-key"] = apiKey;
+		}
 		return this.applyExtraHeaders(headers);
 	}
 

@@ -12,6 +12,15 @@ const DIAGNOSTIC_HEADER_ALLOWLIST = new Set([
 	"request-id",
 	"content-type",
 	"retry-after",
+	// Wait hints a quota/rate-limit recovery path reads back from the diagnostics
+	// (see `server/lib/opencode-quota-wait.ts`). Values are durations or instants,
+	// never credentials.
+	"retry-after-ms",
+	"x-ratelimit-reset",
+	"x-ratelimit-reset-requests",
+	"x-ratelimit-reset-tokens",
+	"ratelimit-reset",
+	"x-opencode-log-id",
 	"server",
 ]);
 
