@@ -744,7 +744,7 @@ function UserInlineFlow({
 						}}
 						style={{ ...style, cursor: quote.anchor ? "pointer" : "default" }}
 					>
-						<IconQuote size={12} style={{ flexShrink: 0 }} />
+						<IconQuote size={14} style={{ flexShrink: 0 }} />
 						{label}
 					</button>
 				</Tooltip>

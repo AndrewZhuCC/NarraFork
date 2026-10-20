@@ -93,7 +93,7 @@ export const USER_INLINE_CHIP_HEIGHT = 20;
 /** Clear space kept on each side of an inline chip. */
 export const USER_INLINE_CHIP_MARGIN = 2;
 /** Horizontal chrome inside an inline chip: padding, icon/thumbnail, and the gap before the text. */
-export const USER_INLINE_CHIP_CHROME = 5 + 14 + 4 + 5;
+export const USER_INLINE_CHIP_CHROME = 1 + 5 + 14 + 4 + 5 + 1;
 /** Inline chip labels are clipped to this many characters so one chip stays a short token. */
 const USER_INLINE_CHIP_LABEL_CHARS = 18;
 /** Stack gap between the reply quote strip and whatever follows it (Stack gap={4}). */
@@ -588,7 +588,7 @@ function inlineFlowBlock(
 	segments.forEach((segment, index) => {
 		if (segment.type === "text") {
 			let text = segment.text;
-			// A quote block is projected onto its own line; that break is not the user's.
+			// The projection always puts a line break before a quote block; drop just that one.
 			if (segments[index + 1]?.type === "quote" && text.endsWith("\n")) text = text.slice(0, -1);
 			text.split("\n").forEach((piece, line) => {
 				if (line) paragraphs.push([]);
@@ -618,6 +618,8 @@ function inlineFlowBlock(
 		}
 		paragraphs[paragraphs.length - 1].push({ atom: atoms.length - 1 });
 	});
+	// Trailing blank lines carry nothing to paint, matching the rows layout's trimEnd.
+	while (paragraphs.length > 1 && !paragraphs[paragraphs.length - 1].length) paragraphs.pop();
 	const lines: UserInlineFragment[][] = [];
 	let used = 0;
 	for (const paragraph of paragraphs) {

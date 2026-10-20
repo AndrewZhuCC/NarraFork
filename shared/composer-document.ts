@@ -213,7 +213,8 @@ export function parseComposerDocument(value: unknown): ComposerDocument {
 		new TextEncoder().encode(encoded).byteLength > MAX_COMPOSER_DOCUMENT_BYTES
 	)
 		throw new Error("Composer document too large");
-	if (composerDocumentText(doc).text.length > MAX_COMPOSER_DOCUMENT_TEXT)
+	// Placeholders lengthen the current projection; a document valid before them stays valid.
+	if (legacyComposerDocumentText(doc).text.length > MAX_COMPOSER_DOCUMENT_TEXT)
 		throw new Error("Composer projection too long");
 	return doc;
 }
@@ -319,8 +320,9 @@ export function composerDocumentProjection(doc: ComposerDocument): {
 			fileReferences.push({ ...node.reference, inputRange: [start, text.length] });
 		}
 		if (node.type === "quote") {
-			// A quote block is only recognizable from the start of a line.
-			if (text && !text.endsWith("\n")) text += "\n";
+			// A quote block is only recognizable from the start of a line. The break is always
+			// added, so a reader drops exactly one and keeps any line break the user typed.
+			if (text) text += "\n";
 			const blockStart = text.length;
 			text += composerQuoteBlock(node);
 			spans.push({ paragraph: p, node: n, start: blockStart, end: text.length });

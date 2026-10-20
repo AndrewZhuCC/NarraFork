@@ -675,14 +675,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}));
 				if (editorRef.current?.getElement()) {
 					const selection = editorRef.current.captureSelectionBookmark();
-					editorRef.current.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+					// Their position was never recorded; ahead of the text is how they were sent.
+					editorRef.current.setSelection(0, 0);
 					editorRef.current.insertNodes(nodes, fresh);
 					selection.restore();
 				} else {
 					const paragraphs = current.paragraphs.map((paragraph) => ({
 						children: [...paragraph.children],
 					}));
-					paragraphs[paragraphs.length - 1].children.push(...nodes);
+					paragraphs[0].children.unshift(...nodes);
 					applyInput(
 						composerInputFromDocument({
 							...current,

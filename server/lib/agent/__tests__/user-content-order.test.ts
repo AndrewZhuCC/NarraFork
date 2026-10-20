@@ -40,4 +40,21 @@ describe("orderUserContent", () => {
 			{ type: "image", image: "B" },
 		]);
 	});
+	test("never emits a whitespace-only text part", () => {
+		expect(orderUserContent("看[image #1: a.png]\n ", ["A"], "before")).toEqual([
+			{ type: "text", text: "看[image #1: a.png]\n " },
+			{ type: "image", image: "A" },
+		]);
+		expect(orderUserContent("[image #1: a.png]", ["A"], "after")).toEqual([
+			{ type: "text", text: "[image #1: a.png]" },
+			{ type: "image", image: "A" },
+		]);
+	});
+	test("ignores placeholder look-alikes inside quoted excerpts", () => {
+		const text = "> [quote] Q\n> see [image #1: a.png]\n\n看[image #1: a.png]";
+		expect(orderUserContent(text, ["A"], "before")).toEqual([
+			{ type: "text", text },
+			{ type: "image", image: "A" },
+		]);
+	});
 });

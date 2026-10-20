@@ -23,7 +23,7 @@ export function orderUserContent<I>(
 	const pattern = new RegExp(COMPOSER_ATTACHMENT_PLACEHOLDER.source, "gu");
 	let textStart = 0;
 	for (const match of text.matchAll(pattern)) {
-		if (match[1] !== "image") continue;
+		if (match[1] !== "image" || insideQuoteLine(text, match.index ?? 0)) continue;
 		const index = Number(match[2]) - 1;
 		if (index >= images.length || placed.has(index)) continue;
 		placed.add(index);
@@ -41,11 +41,21 @@ export function orderUserContent<I>(
 	const ordered: OrderedUserPart<I>[] = [];
 	for (const part of unplaced === "before" ? [...rest, ...parts] : [...parts, ...rest]) {
 		const last = ordered[ordered.length - 1];
-		if (part.type === "text" && !part.text) continue;
-		if (part.type === "text" && last?.type === "text") last.text += part.text;
-		else ordered.push(part.type === "text" ? { ...part } : part);
+		if (part.type === "image") ordered.push(part);
+		else if (last?.type === "text") last.text += part.text;
+		// Providers reject whitespace-only text parts; such a tail belongs to the text before.
+		else if (part.text.trim()) ordered.push({ ...part });
+		else {
+			const previous = ordered.findLast((candidate) => candidate.type === "text");
+			if (previous?.type === "text") previous.text += part.text;
+		}
 	}
 	return ordered;
+}
+
+/** Quoted excerpts (`> ` lines) are someone else's text; a placeholder there is literal. */
+function insideQuoteLine(text: string, index: number): boolean {
+	return text.startsWith(">", text.lastIndexOf("\n", index - 1) + 1);
 }
 
 function alignByPosition<I>(images: readonly (I | null | undefined)[]): (I | null | undefined)[] {
