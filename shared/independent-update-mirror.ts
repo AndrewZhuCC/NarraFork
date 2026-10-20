@@ -1,4 +1,5 @@
 import { isValidGitHubRepository } from "./github-repository";
+import { HELPER_BINARY_MAX_BYTES } from "./helper-distribution";
 import { MAX_RELEASE_PATCH_BYTES } from "./release-patch";
 import { isValidReleaseVersion } from "./release-version";
 import { parseUpdateIndex, updateJsonBytes } from "./update-index";
@@ -16,7 +17,13 @@ export const MIRROR_ASSET_HEADERS = {
 	version: "x-mirror-version",
 	platform: "x-mirror-platform",
 } as const;
-export type MirrorAssetKind = "binary-sidecar" | "patch" | "patch-meta" | "notes";
+export type MirrorAssetKind =
+	| "binary-sidecar"
+	| "patch"
+	| "patch-meta"
+	| "notes"
+	| "helpers-binary"
+	| "executor-binary";
 export interface MirrorAssetDescriptor extends UpdateIndexAsset {
 	kind: MirrorAssetKind;
 	version: string;
@@ -53,11 +60,13 @@ function repo(value: unknown, expected: string) {
 	);
 }
 export function mirrorAssetLimit(kind: MirrorAssetKind): number {
-	return kind === "patch"
-		? MAX_RELEASE_PATCH_BYTES
-		: kind === "notes"
-			? 1024 * 1024
-			: MAX_MIRROR_METADATA_BYTES;
+	return kind === "helpers-binary" || kind === "executor-binary"
+		? HELPER_BINARY_MAX_BYTES
+		: kind === "patch"
+			? MAX_RELEASE_PATCH_BYTES
+			: kind === "notes"
+				? 1024 * 1024
+				: MAX_MIRROR_METADATA_BYTES;
 }
 export function parseMirrorAssetDescriptor(value: unknown): MirrorAssetDescriptor {
 	const a = object(value);
@@ -68,8 +77,15 @@ export function parseMirrorAssetDescriptor(value: unknown): MirrorAssetDescripto
 		"unknown asset field",
 	);
 	check(
-		["binary-sidecar", "patch", "patch-meta", "notes"].includes(String(a.kind)),
-		"asset kind (binaries prohibited)",
+		[
+			"binary-sidecar",
+			"patch",
+			"patch-meta",
+			"notes",
+			"helpers-binary",
+			"executor-binary",
+		].includes(String(a.kind)),
+		"asset kind (main binaries prohibited)",
 	);
 	const kind = a.kind as MirrorAssetKind;
 	check(typeof a.version === "string" && isValidReleaseVersion(a.version), "asset version");

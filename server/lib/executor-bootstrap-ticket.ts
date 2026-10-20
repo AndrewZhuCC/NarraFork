@@ -44,7 +44,7 @@
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ExecutorPlatform } from "@shared/remote-executor";
-import { helperSourceIdentity } from "../../shared/helper-distribution";
+import { helperSourceIdentity, normalizeHelperSource } from "../../shared/helper-distribution";
 import { ValidationError } from "./errors";
 import type { ExecutorArtifactBinding } from "./executor-binaries";
 import { captureHelperSource } from "./helper-distribution-runtime";
@@ -209,7 +209,7 @@ export function issueExecutorTicket(
 		artifact: options.artifact
 			? Object.freeze({
 					...options.artifact,
-					source: Object.freeze({ ...options.artifact.source }),
+					source: Object.freeze(normalizeHelperSource(options.artifact.source)),
 				})
 			: null,
 		value,

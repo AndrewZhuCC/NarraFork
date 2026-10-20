@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import { parse as parseDomain } from "tldts";
+import { MAX_MIRROR_TRANSFER_TIMEOUT_MS } from "./mirror-relay";
 
 export type WebDavConfig = {
 	url: string;
 	feed: string;
 	auth: { username: string; password: string } | { bearerToken: string };
 	downloadRedirectHosts?: string[];
+	/** Internal millisecond budget derived from validated deployment configuration. */
+	transferTimeoutMs?: number;
 };
 export class WebDavError extends Error {
 	constructor(
@@ -120,7 +123,18 @@ export function validateWebDavConfig(input: WebDavConfig): WebDavConfig {
 		);
 		check(typeof input.feed === "string" && SEGMENT.test(input.feed));
 		const hosts = downloadHosts(input.downloadRedirectHosts);
-		const redirects = hosts ? { downloadRedirectHosts: hosts } : {};
+		if (input.transferTimeoutMs !== undefined)
+			check(
+				Number.isSafeInteger(input.transferTimeoutMs) &&
+					input.transferTimeoutMs > 0 &&
+					input.transferTimeoutMs <= MAX_MIRROR_TRANSFER_TIMEOUT_MS,
+			);
+		const redirects = {
+			...(hosts ? { downloadRedirectHosts: hosts } : {}),
+			...(input.transferTimeoutMs === undefined
+				? {}
+				: { transferTimeoutMs: input.transferTimeoutMs }),
+		};
 		const auth = input.auth;
 		check(auth && typeof auth === "object");
 		if ("bearerToken" in auth) {
@@ -409,7 +423,7 @@ export class WebDavClient {
 				expected.size <= MAX_OBJECT_BYTES &&
 				SHA.test(expected.sha256),
 		);
-		const life = lifetime(signal, STREAM_TIMEOUT_MS);
+		const life = lifetime(signal, this.config.transferTimeoutMs ?? STREAM_TIMEOUT_MS);
 		let complete = false;
 		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 		let outgoing: Uint8Array | ReadableStream<Uint8Array>;
@@ -585,7 +599,13 @@ export class WebDavClient {
 		expectedSize: number,
 		signal: AbortSignal,
 	): Promise<ReadableStream<Uint8Array> | null> {
-		return this.open(path, expectedSize, true, signal, STREAM_TIMEOUT_MS);
+		return this.open(
+			path,
+			expectedSize,
+			true,
+			signal,
+			this.config.transferTimeoutMs ?? STREAM_TIMEOUT_MS,
+		);
 	}
 	async list(
 		path: string,

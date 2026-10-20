@@ -35,7 +35,14 @@ const ORIGINAL_UPDATE = settings.update ?? {
 	checkIntervalMinutes: 60,
 	autoDownload: false,
 };
-const SOURCE = { source: "github", repository: "fixture/executor-tests" } as const;
+const SOURCE = {
+	source: "github",
+	repository: "fixture/executor-tests",
+	mirror: {
+		serverUrl: "https://mirror-unused.example",
+		product: ORIGINAL_UPDATE.product ?? "narrafork",
+	},
+} as const;
 const MANIFEST_PATH = distributionPath(
 	SOURCE,
 	`executor-v${EXECUTOR_VERSION}\0${EXECUTOR_VERSION}\0${1}\0manifest`,

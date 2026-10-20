@@ -12,10 +12,12 @@ import {
 	parseMirrorAssetDescriptor,
 	parseMirrorSnapshot,
 } from "../../shared/independent-update-mirror";
+import { MAX_MIRROR_UPLOAD_CONCURRENCY, mirrorTransferTimeoutMs } from "../../shared/mirror-relay";
 import { EXECUTOR_MANIFEST_FILENAME } from "../../shared/remote-executor";
 import { parseUpdateIndex } from "../../shared/update-index";
 import type { UpdateIndexV1 } from "../../shared/update-index-types";
 import { getConfig } from "../lib/config";
+import { logger } from "../lib/logger";
 import type { StorageBackend } from "../storage/types";
 import { objectPath, validateMirrorMetadata, verifyMirrorAsset } from "./mirror-ingest-io";
 
@@ -79,6 +81,8 @@ interface ToolProjection {
 	kind: "helpers" | "executor";
 	tag: string;
 	assets: ToolAsset[];
+	/** Descriptors only; executable bytes are separate streamed objects. */
+	binaries?: MirrorAssetDescriptor[];
 }
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const summary = ({ name, size, sha256 }: MirrorVerifiedAsset): MirrorVerifiedAsset => ({
@@ -94,7 +98,7 @@ function checkToolsIdentity(kind: string, tag: string) {
 	if (!/^(helpers|executor)$/.test(kind) || !/^[a-z0-9.-]{1,64}$/.test(tag))
 		throw new Error("Invalid component identity");
 }
-function parseTools(
+export function parseTools(
 	input: unknown,
 	repository: string,
 	kind: "helpers" | "executor",
@@ -117,7 +121,7 @@ function parseTools(
 		data.assets.length < 1 ||
 		data.assets.length > 16 ||
 		Object.keys(data).some(
-			(k) => !["schemaVersion", "repository", "kind", "tag", "assets"].includes(k),
+			(k) => !["schemaVersion", "repository", "kind", "tag", "assets", "binaries"].includes(k),
 		)
 	)
 		throw new Error("Invalid component metadata envelope");
@@ -170,12 +174,46 @@ function parseTools(
 		)
 			throw new Error("Missing or invalid declared licence metadata");
 	}
+	let binaries: MirrorAssetDescriptor[] | undefined;
+	if (data.binaries !== undefined) {
+		const expected =
+			"files" in manifest
+				? manifest.files
+				: Object.entries(manifest.manifest.platforms).map(([platform, file]) => ({
+						name: file.filename,
+						size: file.size,
+						sha256: file.sha256,
+						platform,
+					}));
+		if (
+			!Array.isArray(data.binaries) ||
+			data.binaries.length !== expected.length ||
+			data.binaries.length > 16
+		)
+			throw new Error("Complete bounded component binaries required");
+		binaries = (data.binaries as unknown[]).map(parseMirrorAssetDescriptor);
+		if (new Set(binaries.map((a) => a.name)).size !== binaries.length)
+			throw new Error("Duplicate component binary");
+		for (const binary of binaries) {
+			const file = expected.find((f) => f.name === binary.name);
+			if (
+				!file ||
+				binary.kind !== `${kind}-binary` ||
+				`${kind}-v${binary.version}` !== tag ||
+				binary.platform !== file.platform ||
+				binary.size !== file.size ||
+				binary.sha256 !== file.sha256
+			)
+				throw new Error("Component binary canonical identity mismatch");
+		}
+	}
 	return {
 		schemaVersion: 1,
 		repository,
 		kind,
 		tag,
 		assets,
+		...(binaries ? { binaries } : {}),
 	};
 }
 
@@ -275,19 +313,23 @@ export class MirrorIngestService {
 			(asset.kind === "patch-meta" && !asset.name.endsWith(".zstd-patch.meta.json")) ||
 			(asset.kind === "notes" && !/^notes\/[A-Za-z0-9.+-]+\.json$/.test(asset.name))
 		)
-			throw new Error("Only canonical metadata and patches may be uploaded");
+			throw new Error("Only canonical metadata, patches and component binaries may be uploaded");
 		if (!this.storage.saveVerifiedFile)
 			throw new MirrorIngestError(503, "STORAGE_VERIFICATION_UNAVAILABLE");
-		if (this.uploads.size >= 2 || this.uploads.has(asset.sha256))
+		if (this.uploads.size >= MAX_MIRROR_UPLOAD_CONCURRENCY || this.uploads.has(asset.sha256))
 			throw new MirrorIngestError(429, "MIRROR_UPLOAD_CONCURRENCY_LIMIT");
 		this.uploads.add(asset.sha256);
+		const started = Date.now();
 		try {
 			const limits = getConfig().mirrorLimits;
 			for (const [key, value] of Object.entries(limits ?? {})) {
 				if (!Number.isSafeInteger(value) || value < (key === "minFreeBytes" ? 0 : 1))
 					throw new Error("Invalid operator mirror limits");
 			}
-			const timeoutMs = delivery === "relay" ? 15 * 60_000 : 120_000;
+			const timeoutMs =
+				delivery === "relay"
+					? mirrorTransferTimeoutMs(getConfig().mirrorRelay?.transferTimeoutMinutes)
+					: 120_000;
 			signal.throwIfAborted();
 			await this.storage.saveVerifiedFile(objectPath(asset.sha256), stream, {
 				size: asset.size,
@@ -301,6 +343,13 @@ export class MirrorIngestService {
 			return { schemaVersion: 1, verification: "server-sha256", ...summary(asset) };
 		} finally {
 			this.uploads.delete(asset.sha256);
+			if (Date.now() - started >= 1000)
+				logger.info("Slow mirror asset ingest", {
+					kind: asset.kind,
+					bytes: asset.size,
+					delivery,
+					durationMs: Date.now() - started,
+				});
 		}
 	}
 
@@ -416,9 +465,14 @@ export class MirrorIngestService {
 					digest([...projection.assets].sort((a, b) => a.name.localeCompare(b.name)))
 			)
 				throw new MirrorIngestError(409, "TOOLS_METADATA_CONFLICT");
+			const requestedBinaries = projection.binaries ?? [];
+			// Metadata-only retries cannot erase already committed binary availability.
+			if (previous?.binaries && !projection.binaries) projection.binaries = previous.binaries;
+			for (const binary of projection.binaries ?? [])
+				await verifyMirrorAsset(this.storage, binary, deadline);
 			deadline.throwIfAborted();
 			const path = toolPath(product, kind, tag);
-			if (!(await this.storage.fileExists(path)))
+			if (!(await this.storage.fileExists(path)) || (!previous?.binaries && projection.binaries))
 				await this.storage.saveAtomicFile(path, Buffer.from(JSON.stringify(projection)), deadline);
 			return {
 				schemaVersion: 1,
@@ -426,7 +480,7 @@ export class MirrorIngestService {
 				repository: repo,
 				kind,
 				tag,
-				verified: projection.assets.map(summary),
+				verified: [...projection.assets, ...requestedBinaries].map(summary),
 			};
 		} finally {
 			this.commits.delete(key);

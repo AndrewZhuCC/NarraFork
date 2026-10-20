@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, sep } from "node:path";
 import { HELPER_RELEASE_TAG } from "../../../shared/helper-distribution";
 import type { GithubPatchStep } from "../../../shared/release-patch";
 import type { DownloadHelperBinaryOptions, HelperBinarySpec } from "../../lib/helper-binaries";
-import { distributionAssetUrl } from "../../lib/helper-distribution-runtime";
+import { captureHelperSource, distributionAssetUrl } from "../../lib/helper-distribution-runtime";
 import { settings } from "../../lib/settings";
 import { APP_VERSION } from "../../lib/version";
 import type { GithubUpdateDependencies } from "../github-release-patch-apply";
@@ -57,7 +57,7 @@ mock.module("../../lib/helper-binaries", () => ({
 	downloadHelperBinary: async (spec: HelperBinarySpec, options: DownloadHelperBinaryOptions) => {
 		helpers.push({ spec, options });
 		expect(options.signal).toBe(captured?.signal);
-		expect(options.context?.source).toEqual({ source: "github", repository });
+		expect(options.context?.source).toEqual(captureHelperSource());
 		if (!options.context || !options.signal) throw new Error("Helper context/signal was dropped");
 		options.signal.throwIfAborted();
 		if (helperMode === "cancel") {
@@ -243,7 +243,14 @@ describe("main downloadUpdate helper/transport wiring", () => {
 		seam = async (options, dependencies) => {
 			expect(options.release.sourceIdentity?.source).toBe("update-server");
 			expect(await dependencies.resolveZstd(options.signal)).toBe("/mock/verified/zstd");
-			expect(helpers[0]?.options.context?.source).toEqual({ source: "github", repository });
+			expect(helpers[0]?.options.context?.source).toEqual({
+				source: "github",
+				repository,
+				mirror: {
+					serverUrl: settings.update?.serverUrl ?? "https://narrafork-update.b.domexie.cn",
+					product: settings.update?.product ?? "narrafork",
+				},
+			});
 			await dependencies.downloadFull(options.release, options.outputPath, {
 				signal: options.signal,
 			});

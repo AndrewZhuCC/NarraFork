@@ -28,6 +28,18 @@ const options = (fixture: ReturnType<typeof mirrorFixture>) => ({
 	downloadAsset: fixture.downloadAsset,
 });
 describe("canonical independent main mirror", () => {
+	test("explicit overall deadline reaches main download instead of restarting the default budget", async () => {
+		const f = mirrorFixture(true);
+		const downloadAsset = async ({ signal }: { signal?: AbortSignal }) =>
+			new Promise<void>((_, reject) => {
+				if (signal?.aborted) return reject(signal.reason);
+				signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+			});
+		await expect(
+			mirrorPublishedGitHubRelease({ ...options(f), downloadAsset, totalTimeoutMs: 40 }),
+		).rejects.toThrow();
+		expect(f.httpCalls.some((r) => r.method === "POST")).toBe(false);
+	});
 	for (const withPatch of [true, false])
 		test(`empty real Hono and LocalStorage server commits ${withPatch ? "current raw patch" : "metadata-only"} with server verification and no GET readback`, async () => {
 			const root = await mkdtemp(join(tmpdir(), "nf-producer-server-e2e-"));
@@ -228,7 +240,7 @@ describe("canonical independent main mirror", () => {
 		const patch = f.assets.find((a) => a.name.endsWith("zstd-patch"));
 		f.failPath = patch?.digest.slice(7) as string;
 		try {
-			await mirrorPublishedGitHubRelease(options(f));
+			await mirrorPublishedGitHubRelease({ ...options(f), uploadConcurrency: 1 });
 			throw new Error("must reject");
 		} catch (error) {
 			expect(error).toBeInstanceOf(IndependentMirrorError);

@@ -4,6 +4,8 @@ import {
 	createRelayReady,
 	MAX_RELAY_PAYLOAD_BYTES,
 	MAX_RELAY_READY_BYTES,
+	mirrorJobTimeoutMs,
+	mirrorTransferTimeoutMs,
 	parseRelayReady,
 	RELAY_CLOCK_SKEW_MS,
 	RELAY_TTL_MS,
@@ -14,6 +16,7 @@ import {
 	relayReadyDirectory,
 	relayReadyPath,
 	relayScanDates,
+	validateMirrorJobTimeoutMs,
 } from "./mirror-relay";
 
 const key = Buffer.alloc(32, 7).toString("base64");
@@ -55,6 +58,34 @@ function signedUnknown(value: unknown) {
 		manifestHash: createHash("sha256").update(bytes).digest("hex"),
 	};
 }
+describe("bounded mirror timeout configuration", () => {
+	test("main stays 25 minutes, auxiliary defaults to 120 and explicit overrides are bounded", () => {
+		expect(mirrorJobTimeoutMs("main")).toBe(25 * 60_000);
+		expect(mirrorJobTimeoutMs("helpers")).toBe(120 * 60_000);
+		expect(mirrorJobTimeoutMs("executor")).toBe(120 * 60_000);
+		expect(mirrorJobTimeoutMs("main", "300")).toBe(300 * 60_000);
+		expect(mirrorTransferTimeoutMs()).toBe(15 * 60_000);
+		expect(mirrorTransferTimeoutMs("60")).toBe(60 * 60_000);
+		for (const value of [
+			"NaN",
+			"-1",
+			"0",
+			"301",
+			"1.5",
+			" 30",
+			"Infinity",
+			Number.NaN,
+			-1,
+			301,
+			1.5,
+		])
+			expect(() => mirrorJobTimeoutMs("main", value)).toThrow();
+		for (const value of ["61", "0", "NaN", "1e1", -1, 61, Number.POSITIVE_INFINITY])
+			expect(() => mirrorTransferTimeoutMs(value)).toThrow();
+		for (const value of [0, Number.NaN, 300 * 60_000 + 1])
+			expect(() => validateMirrorJobTimeoutMs(value)).toThrow();
+	});
+});
 describe("relay signed control envelope", () => {
 	test("roundtrips exact manifest bytes, not the large independent payload", () => {
 		const m = ready();

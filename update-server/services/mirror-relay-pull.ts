@@ -3,6 +3,7 @@ import { parseMirrorSnapshot } from "../../shared/independent-update-mirror";
 import {
 	MAX_RELAY_PAYLOAD_BYTES,
 	MAX_RELAY_READY_BYTES,
+	mirrorJobTimeoutMs,
 	parseRelayReady,
 	RELAY_CLOCK_SKEW_MS,
 	RELAY_TTL_MS,
@@ -11,11 +12,12 @@ import {
 	relayObjectPath,
 	relayReadyDirectory,
 	relayScanDates,
+	validateMirrorJobTimeoutMs,
 } from "../../shared/mirror-relay";
 import { WebDavClient } from "../../shared/webdav-transport";
 import type { MirrorRelaySettings } from "../lib/mirror-relay-config";
 import type { StorageBackend } from "../storage/types";
-import { MirrorIngestError, type MirrorIngestService } from "./mirror-ingest";
+import { MirrorIngestError, type MirrorIngestService, parseTools } from "./mirror-ingest";
 
 const STATE_MAX_BYTES = 512 * 1024;
 const STATE_MAX_ENTRIES = 1024;
@@ -103,7 +105,7 @@ function parseState(raw: Buffer, feed: string): PullState {
 export class MirrorRelayPuller {
 	readonly #client: WebDavClient;
 	readonly #now: () => number;
-	readonly #jobTimeoutMs: number;
+	readonly #jobTimeoutMs: number | undefined;
 	readonly #event: (event: RelayPullEvent) => void;
 	readonly #controller = new AbortController();
 	#timer: ReturnType<typeof setTimeout> | undefined;
@@ -118,13 +120,15 @@ export class MirrorRelayPuller {
 		private readonly settings: MirrorRelaySettings,
 		options: PullOptions = {},
 	) {
+		if (settings.totalTimeoutMs !== undefined) validateMirrorJobTimeoutMs(settings.totalTimeoutMs);
 		this.#client = new WebDavClient(settings.webdav, { fetchImpl: options.fetchImpl });
 		this.#now = options.now ?? Date.now;
-		this.#jobTimeoutMs = options.jobTimeoutMs ?? JOB_TIMEOUT_MS;
+		this.#jobTimeoutMs = options.jobTimeoutMs;
 		if (
-			!Number.isSafeInteger(this.#jobTimeoutMs) ||
-			this.#jobTimeoutMs < 1 ||
-			this.#jobTimeoutMs > JOB_TIMEOUT_MS
+			this.#jobTimeoutMs !== undefined &&
+			(!Number.isSafeInteger(this.#jobTimeoutMs) ||
+				this.#jobTimeoutMs < 1 ||
+				this.#jobTimeoutMs > (settings.totalTimeoutMs ?? JOB_TIMEOUT_MS))
 		)
 			throw new Error("Relay job budget may only shorten the fixed overall timeout");
 		this.#event = (event) => {
@@ -275,7 +279,9 @@ export class MirrorRelayPuller {
 			let expiresAt = Date.parse(`${job.date}T00:00:00.000Z`) + 24 * 60 * 60_000 + RELAY_TTL_MS;
 			const signal = AbortSignal.any([
 				this.#controller.signal,
-				AbortSignal.timeout(this.#jobTimeoutMs),
+				AbortSignal.timeout(
+					this.#jobTimeoutMs ?? this.settings.totalTimeoutMs ?? mirrorJobTimeoutMs(job.kind),
+				),
 			]);
 			try {
 				const readyPath = `${relayReadyDirectory(this.settings.webdav.feed, job.product, job.kind, job.date)}/${job.manifestHash}.json`;
@@ -341,9 +347,28 @@ export class MirrorRelayPuller {
 			throw new Error("Relay payload size/hash mismatch");
 		const payload: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
 		if (manifest.kind !== "main") {
-			// commitTools applies the same complete manifest/license validation as authenticated direct delivery.
+			// Validate the signed small payload before fetching any large component object.
+			const projection = parseTools(payload, manifest.repository, manifest.kind, manifest.tag);
+			const binaries = projection.binaries ?? [];
+			const bytes = binaries.reduce((sum, a) => sum + a.size, raw.byteLength);
+			if (!Number.isSafeInteger(bytes) || bytes > MAX_JOB_BYTES)
+				throw new Error("Relay component import byte budget exceeded");
+			for (const asset of binaries) {
+				signal.throwIfAborted();
+				const stream = await this.#client.getStream(
+					relayObjectPath(manifest, asset.sha256),
+					asset.size,
+					signal,
+				);
+				if (!stream) throw new Error("Relay component binary unavailable");
+				try {
+					await this.ingest.ingestAsset(manifest.product, asset, stream, signal, "relay");
+				} finally {
+					if (!stream.locked) await stream.cancel().catch(() => {});
+				}
+			}
 			await this.ingest.commitTools(manifest.product, manifest.kind, manifest.tag, payload, signal);
-			return raw.byteLength;
+			return bytes;
 		}
 		const snapshot = parseMirrorSnapshot(payload, manifest.repository);
 		if (`v${snapshot.targetVersion}` !== manifest.tag) throw new Error("Relay target tag mismatch");

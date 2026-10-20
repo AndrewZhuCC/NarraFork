@@ -97,6 +97,41 @@ describe("optional update server WebDAV configuration", () => {
 		expect(settings?.pollIntervalMs).toBe(120_000);
 	});
 
+	test("server timeout JSON fields reject strings rather than treating them like runner environment values", () => {
+		for (const value of ["", "30", null, true])
+			for (const field of ["totalTimeoutMinutes", "transferTimeoutMinutes"])
+				expect(() =>
+					resolveMirrorRelaySettings(
+						{
+							...config,
+							mirrorRelay: { ...relay, [field]: value } as unknown as MirrorRelayConfig,
+						},
+						env,
+					),
+				).toThrow();
+	});
+	test("explicit job and stream budgets share bounded producer limits", () => {
+		const selected = resolveMirrorRelaySettings(
+			{
+				...config,
+				mirrorRelay: { ...relay, totalTimeoutMinutes: 300, transferTimeoutMinutes: 60 },
+			},
+			env,
+		);
+		expect(selected?.totalTimeoutMs).toBe(300 * 60_000);
+		expect(selected?.webdav.transferTimeoutMs).toBe(60 * 60_000);
+		for (const patch of [
+			{ totalTimeoutMinutes: 301 },
+			{ totalTimeoutMinutes: -1 },
+			{ totalTimeoutMinutes: Number.NaN },
+			{ totalTimeoutMinutes: 1.5 },
+			{ transferTimeoutMinutes: 61 },
+			{ transferTimeoutMinutes: 0 },
+		])
+			expect(() =>
+				resolveMirrorRelaySettings({ ...config, mirrorRelay: { ...relay, ...patch } }, env),
+			).toThrow();
+	});
 	for (const [label, patch] of [
 		["invalid URL", { url: "http://webdav.fixture.invalid/private" }],
 		["inline credentials", { url: "https://user:pass@webdav.fixture.invalid/" }],

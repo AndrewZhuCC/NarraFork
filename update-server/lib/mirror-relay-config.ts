@@ -1,4 +1,5 @@
 import { isValidGitHubRepository } from "../../shared/github-repository";
+import { mirrorJobTimeoutMs, mirrorTransferTimeoutMs } from "../../shared/mirror-relay";
 import { validateWebDavConfig, type WebDavConfig } from "../../shared/webdav-transport";
 import type { ServerConfig } from "../types";
 
@@ -7,6 +8,7 @@ export interface MirrorRelaySettings {
 	/** Internal authentication only. Never log or persist resolved settings. */
 	signingKey: string;
 	pollIntervalMs: number;
+	totalTimeoutMs?: number;
 	products: { product: string; repository: string }[];
 }
 
@@ -40,10 +42,15 @@ export function resolveMirrorRelaySettings(
 					"signingKeyEnv",
 					"pollIntervalSeconds",
 					"downloadRedirectHosts",
+					"totalTimeoutMinutes",
+					"transferTimeoutMinutes",
 				].includes(key),
 		)
 	)
 		throw new Error("Invalid mirror relay configuration");
+	for (const minutes of [relay.totalTimeoutMinutes, relay.transferTimeoutMinutes])
+		if (minutes !== undefined && typeof minutes !== "number")
+			throw new Error("Mirror relay timeouts must be numeric whole minutes");
 	const pollSeconds = relay.pollIntervalSeconds ?? 60;
 	if (!Number.isSafeInteger(pollSeconds) || pollSeconds < 10 || pollSeconds > 3600)
 		throw new Error("Mirror relay poll interval must be between 10 and 3600 seconds");
@@ -63,6 +70,9 @@ export function resolveMirrorRelaySettings(
 	const webdav = validateWebDavConfig({
 		url: relay.url ?? "",
 		feed: relay.feed ?? "default",
+		...(relay.transferTimeoutMinutes === undefined
+			? {}
+			: { transferTimeoutMs: mirrorTransferTimeoutMs(relay.transferTimeoutMinutes) }),
 		...(relay.downloadRedirectHosts !== undefined
 			? { downloadRedirectHosts: relay.downloadRedirectHosts }
 			: {}),
@@ -70,6 +80,16 @@ export function resolveMirrorRelaySettings(
 			? { bearerToken: secret(relay.bearerTokenEnv, env) }
 			: { username: secret(relay.usernameEnv, env), password: secret(relay.passwordEnv, env) },
 	});
+	const totalTimeoutMs =
+		relay.totalTimeoutMinutes === undefined
+			? undefined
+			: mirrorJobTimeoutMs("main", relay.totalTimeoutMinutes);
+	if (
+		relay.transferTimeoutMinutes !== undefined &&
+		mirrorTransferTimeoutMs(relay.transferTimeoutMinutes) >
+			(totalTimeoutMs ?? mirrorJobTimeoutMs("main"))
+	)
+		throw new Error("Mirror relay job deadline must cover its streamed object budget");
 	const signingKey = secret(relay.signingKeyEnv, env);
 	if (
 		!/^[A-Za-z0-9+/]{43}=$/.test(signingKey) ||
@@ -77,7 +97,13 @@ export function resolveMirrorRelaySettings(
 		Buffer.from(signingKey, "base64").toString("base64") !== signingKey
 	)
 		throw new Error("Mirror relay signing key must encode exactly 32 random bytes");
-	const settings = { pollIntervalMs: pollSeconds * 1000, products } as MirrorRelaySettings;
+	const settings = {
+		pollIntervalMs: pollSeconds * 1000,
+		products,
+		...(relay.totalTimeoutMinutes === undefined
+			? {}
+			: { totalTimeoutMs: mirrorJobTimeoutMs("main", relay.totalTimeoutMinutes) }),
+	} as MirrorRelaySettings;
 	Object.defineProperties(settings, {
 		webdav: { value: webdav, enumerable: false },
 		signingKey: { value: signingKey, enumerable: false },

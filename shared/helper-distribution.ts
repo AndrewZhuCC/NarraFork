@@ -122,18 +122,34 @@ export function createHelperDistributionDependencies(
 	});
 }
 export type HelperSource =
-	| { source: "github"; repository: string }
+	| { source: "github"; repository: string; mirror?: { serverUrl: string; product: string } }
 	| { source: "update-server"; serverUrl: string };
 export function normalizeHelperSource(input: {
 	source?: string;
 	githubRepository?: string;
 	repository?: string;
 	serverUrl?: string;
+	mirror?: { serverUrl: string; product: string };
 }): HelperSource {
 	if (input.source === undefined || input.source === "github") {
 		const repository = input.repository ?? input.githubRepository ?? BUILD_GITHUB_REPOSITORY;
 		if (!isValidGitHubRepository(repository)) throw new Error("Invalid helper repository");
-		return { source: "github", repository: repository.toLowerCase() };
+		let mirror: { serverUrl: string; product: string } | undefined;
+		if (input.mirror) {
+			if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.mirror.product))
+				throw new Error("Invalid helper mirror product");
+			const server = normalizeHelperSource({
+				source: "update-server",
+				serverUrl: input.mirror.serverUrl,
+			});
+			if (server.source !== "update-server") throw new Error("Invalid helper mirror");
+			mirror = Object.freeze({ serverUrl: server.serverUrl, product: input.mirror.product });
+		}
+		return {
+			source: "github",
+			repository: repository.toLowerCase(),
+			...(mirror ? { mirror } : {}),
+		};
 	}
 	if (input.source !== "update-server") throw new Error("Invalid helper source");
 	const url = new URL(input.serverUrl?.trim() || "https://narrafork-update.b.domexie.cn");
@@ -151,7 +167,7 @@ export function normalizeHelperSource(input: {
 export function helperSourceIdentity(source: HelperSource): string {
 	const normalized = normalizeHelperSource(source);
 	return normalized.source === "github"
-		? `github:${normalized.repository}`
+		? `github:${normalized.repository}${normalized.mirror ? `\0mirror:${normalized.mirror.serverUrl}\0${normalized.mirror.product}` : ""}`
 		: `update-server:${normalized.serverUrl}`;
 }
 export function getHelperAssetName(tool: HelperTool, platform: HelperPlatform): string {

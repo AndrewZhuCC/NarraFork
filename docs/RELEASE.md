@@ -20,14 +20,14 @@
 
 ## GitHub 权威发布与独立更新服务器
 
-- **GitHub 是共同权威，默认直接交付**：官方包默认 `NarraFork/NarraFork`；fork 自行构建的包采用构建时注入的仓库，已有显式仓库不覆盖。运行时不依据 cwd/项目 origin 偷换仓库，公开分发需公开仓库。设置页可选择独立更新服务器交付 metadata/patch；两种模式共享明确的 GitHub authority，完整程序和附加组件二进制仍取 GitHub。**脚本默认 `update-server` 参数保留，但只表示已公开版本镜像**。
-- **配置与迁移**：已有来源与服务器地址保留，不删除用户历史配置。GitHub 仓库在直连和独立镜像模式都明确展示并生效；镜像 snapshot 必须匹配它，不能从响应自建信任。切换镜像/仓库需重新检查；rg/zstd/executor 始终使用该 canonical GitHub 仓库的固定组件 tag，不使用 unsigned 服务器二进制接口。
+- **GitHub 是共同权威，默认直接交付**：官方包默认 `NarraFork/NarraFork`；fork 自行构建的包采用构建时注入的仓库，已有显式仓库不覆盖。运行时不依据 cwd/项目 origin 偷换仓库，公开分发需公开仓库。设置页可选择独立更新服务器交付 metadata/patch 及 helper/executor 二进制；两种模式共享明确的 GitHub authority，主程序全量包仍取 GitHub。**脚本默认 `update-server` 参数保留，但只表示已公开版本镜像**。
+- **配置与迁移**：已有来源与服务器地址保留，不删除用户历史配置。GitHub 仓库在直连和独立镜像模式都明确展示并生效；镜像 snapshot 必须匹配它，不能从响应自建信任。切换镜像/仓库需重新检查；rg/zstd/executor 始终使用该 canonical GitHub 仓库的固定组件 tag 与 GitHub manifest 校验；镜像只交付匹配 size/SHA256 的字节，不使用 unsigned 旧 tools 接口。
 - **检测与下载**：stable 排除 draft/prerelease，beta 同时考虑 stable 与 prerelease，按语义版本排序；精确匹配平台（包括 x64-baseline），校验 sidecar 中的 SHA512 和大小。检测失败、限流、无 Release 和平台缺失不会显示为“已经最新”；元数据单请求 10 秒、检测总预算 30 秒，最多 5 页，每页 100 条。完整二进制流式下载最大 1 GiB、最长 15 分钟，可取消；下载前重新检查可信元数据，源/仓库或版本改变要求重新检测。
 - **配置与准备包身份**：检测开始冻结 GitHub repository、metadata delivery 方式、镜像 server/product、channel/platform；下载前及写入准备记录前再次核对。变化要求重新检查，不能把旧通道/产品/仓库的结果下载成新配置的包。保存设置不删除已准备包或取消调度；历史元数据缺 repository/来源时明确未知，不用当前配置补造身份。
 - **应用 API**：`GET /api/update/status` 的 `preparedIdentity.id` 绑定已验证文件及其来源；`POST /api/update/apply` 必须提交该 `preparedId`（可同时提交 `version`）。缺失或过期选择器返回 409，不再仅凭版本号选择文件。旧包仍可通过查询所得的选择器显式应用；已进入调度的准备包不能被另一次下载替换。选择器不是授权令牌，接口仍要求管理员权限。
 - `--target=github|update-server` 选择发布目标；GitHub 仓库可用 `--github-repository=owner/repo` 指定，否则优先采用可信 Actions 仓库或 GitHub origin，无法推导时才回退官方仓库。Actions 中显式仓库必须与当前仓库一致；同一身份注入前后端、sidecar 和 smoke。GitHub 认证使用已登录的 `gh` / `GH_TOKEN`；GitHub 路径不会读取独立更新服务器令牌或查询其基线。
 - **真实发布只能在主仓库工作区原地执行**，不能使用隔离 worktree。GitHub 路径额外检查这一点；本工作区只能开发代码和做模拟测试，不得真实发布。
-- GitHub 使用**完整主程序二进制 + 可选 zstd patch 对**；没有 patch 仍可公开并全量升级。独立服务器只复制当前 canonical metadata/patch，历史版本或 patch 缺失不能要求补包。helper/executor 使用同仓库独立辅助 Release，不混入主程序资产；历史 tools 数据保留读兼容，新客户端不经其下载二进制。
+- GitHub 使用**完整主程序二进制 + 可选 zstd patch 对**；没有 patch 仍可公开并全量升级。独立服务器只复制当前 canonical metadata/patch，历史版本或 patch 缺失不能要求补包。helper/executor 使用同仓库独立辅助 Release，不混入主程序资产；历史 tools 数据保留读兼容，新客户端只通过新的 canonical 精确 tag 路由下载辅助二进制。
 - 每个选定平台必须有 `dist/narrafork-<version>-<suffix>`（Windows 带 `.exe`）、同名 `.metadata.json`，以及版本化 `narrafork-<version>-SHA256SUMS`、`narrafork-<version>-checksums.txt`。缺少任何必需文件、size/hash 不一致、版本/平台/target/commit provenance 不符都会失败。sha256 为十六进制，sha512 为 base64，与构建的 binary-metadata schema 一致。
 - 上传前读取并验证原 `dist/`；只上传 `--platform` 选定的平台及其 patch 对（未指定则要求全部平台）。过滤后的聚合 checksum 只在独占临时 staging 生成，**不修改原构建产物**；上传使用校验后的 staging 快照。完整二进制最大 1 GiB、patch 最大 512 MiB、文本最大 1 MiB（binary/patch sidecar 各 64 KiB），哈希流式计算；每次发布最多 64 对 patch、200 个资产，目录扫描最多 4096 项。单次 `gh` 调用超时 5 分钟、stdout/stderr 各最多 1 MiB。
 - GitHub 的 `v<version>` tag 必须已存在，且解析出的 commit 与本地 tag 一致（支持 annotated tag）；脚本不会自动 push，也不会从 GitHub 默认分支偷偷创建 tag。仍保留 bump → build → tag 的原顺序；初次本地构建/tag 后若缺远端 tag，脚本安全失败，显式 push 后用 `--upload-only` 重试。
@@ -110,15 +110,16 @@ bundle artifact 命名为 `release-bundle-<runId>-<runAttempt>`，保留 30 天�
 
 ### 独立更新服务器：Release 完成后的纯镜像
 
-GitHub 是二进制、补丁、通道、摘要及说明的唯一权威。主程序 GitHub Release 已公开且 update-index 已读回、Core Release Gate 成功后，独立的 `update-server-mirror.yml` 才开始镜像。辅助 Release 公开后也只镜像 manifest/许可等 metadata。镜像 workflow 有自己的受保护 `release` Environment 审批、锁、截止与结果，绝不反向依赖主发布。
+GitHub 是二进制、补丁、通道、摘要及说明的唯一权威。主程序 GitHub Release 已公开且 update-index 已读回、Core Release Gate 成功后，独立的 `update-server-mirror.yml` 才开始镜像。辅助 Release 公开后镜像 manifest/许可等 metadata 及 manifest 声明的原始 helper/executor 二进制。镜像 workflow 有自己的受保护 `release` Environment 审批、锁、截止与结果，绝不反向依赖主发布。
 
 - 主 publisher 不注入 `NF_UPDATE_SERVER` / `NF_UPDATE_TOKEN`，不访问服务器、不准备兼容补丁，也不等待镜像配置或成功。镜像离线、失败、取消和超时只影响 Mirror Gate，不影响已经公开的 GitHub Release、index 或 Core Gate。
 - 自动镜像需要仓库变量 `NF_MIRROR_ENABLED=true`，仅接受可信 primary 发布完成 receipt；`publish=false` 的成功构建不是发布，不触发镜像。也可手动指定已公开的 `kind` 与精确 `tag`。
 - 镜像配置仍在既有受保护 `release` Environment 中。`vars.NF_MIRROR_TRANSPORT` 缺省为 `direct`，沿用 `vars.NF_UPDATE_SERVER`（HTTPS 根地址）、`secrets.NF_UPDATE_TOKEN`（上传令牌）；direct 两者均空为 `SKIPPED_UNCONFIGURED`，半配置失败。只有显式 `webdav` 才使用下节中转配置，不要求或注入服务器地址/token。未知模式或非法配置明确失败，不探测、不自动切换。秘密不写命令行、artifact、receipt 或日志，不创建无保护环境、不自动批准。
-- 镜像只读取当前 GitHub public Release 的原始 metadata/patch、当前说明和已确认的 canonical index 快照；不上传完整程序、rg/zstd/executor 二进制，不重新生成或还原补丁。
+- main 镜像只读取当前 GitHub public Release 的原始 metadata/patch、当前说明和已确认的 canonical index 快照，不上传主程序全量包、不重新生成或还原补丁。helpers/executor 镜像额外按原始 manifest 校验资产 ID、size/SHA256 后流式下载并上传二进制；GitHub tag/commit 与资产集合在上传前和提交前重验。
 - 不读取服务器版本列表、latest、fromVersion 元数据或旧二进制；历史不存在、版本号高低、旧补丁身份不再是上传门槛。无 patch 的 GitHub Release 可以成功 metadata-only。旧数据不扫描、迁移或删除。
 - 完整二进制只是 GitHub 下载描述。GitHub snapshot 中的历史条目不等于本地镜像了历史 patch；可用资产表只声明实际写入并校验的内容。服务器 latest 采用 canonical snapshot channel 指针，不通过历史记录的语义最大值选举。
-- 新镜像 API 按运营者配置的预期 GitHub 仓库验证 snapshot、tag、平台和文件身份。patch 真正流式计数/hash 后原子落盘，metadata 小请求分开提交，必要资产完成后才发布 snapshot。坏 hash、孤立 sidecar、截断、超限均拒绝；不能将错误伪装为无 patch。
+- 新镜像 API 按运营者配置的预期 GitHub 仓库验证 snapshot、tag、平台和文件身份。patch/辅助二进制真正流式计数/hash 后原子落盘，metadata 小请求分开提交，必要资产完成后才发布 snapshot/tag。辅助 projection 的可选 `binaries` 只含完整 manifest 对应的描述，不内嵌字节；最多16个、各32 MiB，沿用服务器磁盘配额/并发/空闲空间限制和单任务4 GiB预算。旧 metadata-only tag 可单调补入二进制；旧生产者重试不删除已有可用性，旧资产不扫描迁移。坏 hash、孤立 sidecar、截断、超限均拒绝；不能将错误伪装为无 patch。
+- 辅助客户端下载 manifest 仍只访问配置仓库固定 GitHub tag（及同仓库可信缓存）；镜像下载走 `/api/v3/products/<product>/mirror/tools/<kind>/<tag>/assets/<name>`，仅提交后的精确 tag 可见。字节校验失败、404或网络错误回退同仓库同 tag 的 GitHub，不回上游、不采用镜像 manifest 作为新权威；跨 origin 重定向拒绝，取消、整体 deadline、来源变更不启动 fallback。helper/executor 现有32 MiB、架构、协议、60/120秒客户端下载预算继续生效；一次操作冻结服务器/product/仓库与更新网络代理，安装票据保留原镜像身份。
 - 镜像模式的客户端优先使用已镜像 direct patch；无适用 patch、base 不匹配、404/坏 hash、zstd 缺失或重建失败，转同一已选 GitHub 目标的 full，仍验 size/SHA512。用户取消和整体 deadline 不触发 fallback。不能靠跨源302让历史客户端获得该新行为，需要升级客户端与服务器协议。
 - **两种模式都不回传资产给 runner 做 hash 校验**：服务器负责流式大小/SHA256 校验及提交；direct 仅返回 `server-sha256` 小回执，旧服务器缺少该回执须升级，不恢复大文件 GET 兼容。必要的服务器本地提交复核仍保留。
 - receipt 区分 direct 的 `MIRRORED` / `METADATA_ONLY`、WebDAV 的 `STAGED_FOR_PULL`，以及 `SKIPPED_UNCONFIGURED` / `FAILED` 与部分完成。`verified` 表示服务器已校验，不再表示 runner 读回；WebDAV 暂存时该数组为空、`snapshotCommitted=false`。缺失 receipt 不等于成功。Core Gate 不看镜像结果。
@@ -180,9 +181,19 @@ runner 需要专属前缀的 MKCOL/PUT/PROPFIND/DELETE 权限；它只删除满�
 3. 服务器自启动可取消的单并发拉取任务，验签、验证运营者配置仓库、拉取对象并校验大小/SHA256，复用 direct 的同一入库/提交锁。成功状态本地原子记录，重启重试幂等；同 catalog 不同 target 的 availability 不互相抹除，辅助 metadata 按精确 tag 不可变保存。
 4. workflow 成功只代表 `STAGED_FOR_PULL`（已暂存、待拉取），不等待服务器在线，不冒称 `MIRRORED`。服务器实际导入结果看本地 `Mirror relay pull` 日志及 `mirror-relay-state/<feed>/<product>.json`，不新增向 runner 回调或回传文件。
 
-容量与保留：ready 自创建起精确有效 7×24 小时，容许 5 分钟时钟偏差；离线超过期限需重新暂存。每产品/类型/日期最多 32 项，过大目录明确失败，不静默截断。轮询扫描通常 8 个、午夜偏差时最多 9 个 UTC 桶，每轮最多导入 4 项；失败退避不阻塞其他任务。单任务最长 25 分钟、单 patch 请求及 relay 流式入库最长 15 分钟；direct 上传仍限 120 秒。未配置时按各自预算执行，显式 `mirrorLimits.uploadTimeoutMs` 是额外的运营者上限（旧配置中的 120000 也保留生效），不能借 relay 放宽。总导入字节数最多 4 GiB，仍受服务器磁盘配额/空闲量限制。
+容量与保留：ready 自创建起精确有效 7×24 小时，容许 5 分钟时钟偏差；离线超过期限需重新暂存。每产品/类型/日期最多 32 项，过大目录明确失败，不静默截断。轮询扫描通常 8 个、午夜偏差时最多 9 个 UTC 桶，每轮最多导入 4 项；失败退避不阻塞其他任务。默认单任务 main 25 分钟、helpers/executor 120 分钟；单 DAV 对象上传/下载及 relay 流式入库默认15分钟，direct 上传仍限120秒。可用受保护 Environment/repository 变量 `NF_MIRROR_TOTAL_TIMEOUT_MINUTES`（整数1–300）和 `NF_MIRROR_TRANSFER_TIMEOUT_MINUTES`（整数1–60，仅DAV）显式覆盖；本地 CLI 使用同名环境变量。空值保留默认，NaN、负数、小数和越界值失败，不自动降级。总预算贯穿 CLI→main/tools→签名 ready，工作流硬限330分钟，较最大300分钟预留30分钟安装依赖、保存失败receipt与artifact；仍可能硬取消，缺失/partial receipt不代表成功。
+
+服务器独立配置 `mirrorRelay.totalTimeoutMinutes`（1–300）和 `mirrorRelay.transferTimeoutMinutes`（1–60），默认同上；不能从远端payload改变本地预算。显式单对象预算不得大于总任务预算（服务器不设置总预算时以兼容的main25分钟核对），只提高runner预算不能自动放宽服务器。显式 `mirrorLimits.uploadTimeoutMs` 始终是额外运营者上限（旧120000仍生效），调大relay配置不绕过它；旧主程序默认和direct120秒上限不变。GitHub原始资产下载仍各有15分钟预算。各层父取消贯穿流式读写；runner不原地重试取消/超时，客户端取消/整体deadline不fallback；relay保留既有失败退避/幂等重放，stop取消不继续轮询。不回传资产校验，也不因更大预算放宽大小/总量/签名/保留期约束。总导入字节数最多 4 GiB，仍受服务器磁盘配额/空闲量限制。
 
 runner 清理只在**该日期桶次日 UTC 零点 +7 天 +24 小时宽限 +10 分钟时钟余量**之后进行；每次最多 12 个日期桶、30 秒，任务对象独占避免误删新引用。权限不足、预算耗尽或部分失败记为 `RETENTION_INCOMPLETE`，并不表示清理成功或 WebDAV 配额必然有界；运营者仍需监测容量。WebDAV 实际厂商网络/权限兼容性与本地 fixture 验收分开报告。
+
+并行上传：独立 workflow 的受保护 Environment/repository 变量及本地 CLI 环境变量 `NF_MIRROR_UPLOAD_CONCURRENCY` 未显式配置时 **direct默认2、WebDAV默认3**，只接受整数 **1–8**（空值使用默认；0、负数、小数、NaN、越界或含空白的字符串拒绝）。同一个有界池覆盖 main 的 metadata/patch 与 helpers/executor 的完整“源下载→hash→上传”任务，不先把所有大文件下载落盘。临时文件逐任务独占；按最大N个去重物理文件之和 +64 MiB预留本地磁盘（N为并发数），单文件/总字节预算不变。相同SHA/size只传一次物理对象，逻辑资产仍完整校验；回执按canonical资产顺序输出，不依赖完成先后。
+
+任何任务失败即停止派发、取消在途传输并等待所有任务及临时文件清理settle；随后只报告真实已确认的部分成功，不提交snapshot、不发布ready。全部资产成功后才重新核验GitHub权威并提交；WebDAV共享初始化目录，对相同hash在途上传去重，存在失败或在途对象时拒绝生成payload/ready。新服务器认证上传和LocalStorage同时入库的全局硬上限为8，提交锁仍为2，磁盘配额/保留空间与timeout不放宽；relay后台仍单作业拉取，不因runner并发而无界扩张。**旧服务器只有2个上传槽**，direct缺省2保持兼容，不探测、不自动429重试；显式提高到3–8前需先部署新服务器，不能靠提高runner并发绕过服务器上限。服务器配额 admission 与最终rename共用短锁；临时物理磁盘预留与对象净配额增长分别记账，仅排除本进程精确登记的活动temp，崩溃遗留temp仍计费，满额同SHA对象重传不被重复预留拒绝。
+
+慢链路示例（仅说明配置，不自动执行生产操作）：设置受保护 Environment 的 `NF_MIRROR_TOTAL_TIMEOUT_MINUTES=120`、`NF_MIRROR_TRANSFER_TIMEOUT_MINUTES=45`，服务器同时配置 `mirrorRelay.totalTimeoutMinutes:120`、`mirrorRelay.transferTimeoutMinutes:45`；如旧 `mirrorLimits.uploadTimeoutMs:120000` 仍存在，需运营者明确决定是否调整，不能被新预算静默覆盖。main 未显式配置时仍是25分钟。
+
+生效需先将实现合并到仓库真实默认分支，独立 workflow 才会 checkout 新控制SHA；部署新的 `update-server/` 代码并由运营者加载配置后才支持二进制入库/精确tag下载与服务器预算。客户端需升级含新 `shared/helper-distribution.ts`、`server/lib/helper-distribution-runtime.ts` 的 NarraFork 构建；旧客户端保持原GitHub下载行为。仅改变量不能更新旧服务器/客户端代码。本功能不要求也不允许工具自行重启承载当前会话的 NarraFork。
 
 `NF_MIRROR_TRANSPORT` 选择目前用于独立 workflow 和 `scripts/mirror-update-server.ts`；原 `release.ts` / `release-executor.ts` 的兼容服务器目标仍按既有 direct 配置工作，不会因设置中转变量而自动切换。
 
@@ -190,7 +201,7 @@ runner 清理只在**该日期桶次日 UTC 零点 +7 天 +24 小时宽限 +10 �
 
 - rg 15.1.0 与 zstd 1.5.7 的六平台原始可执行文件、`helper-manifest-v1.json` 和许可附件放在同仓库不可变 `helpers-v1.0.0` Release。rg 由固定官方归档及归档/二进制双摘要制备；zstd 使用受控源码与工具链构建。新增 macOS zstd，Windows ARM64 使用原有确定性 recipe。Linux zstd 为 musl 静态包；rg Linux ARM64 是 glibc 包，不代表支持 Alpine/Termux。
 - executor 使用独立 `executor-v<组件版本>` Release 和 `narrafork-executor-manifest.json`。组件版本与协议由 `shared/component-versions.json` 显式锁定，不跟随主程序版本增长；例如主程序 0.9.2 或后续版本可以继续依赖 executor 0.9.1。仍校验外层仓库/tag/commit、组件版本、RPC 协议及六种 Go 平台，不通过 GitHub latest 选择工具，也不接受任意“同协议最新版”。两类辅助 Release 都不标记 latest、不写主 update-index、不占主程序资产预算。
-- 无论 metadata 选择 GitHub 直连还是独立镜像，helper/executor 二进制都来自配置的 canonical GitHub 仓库与固定tag，不使用 unsigned tools 接口、不默默回上游。fork 必须自行公开对应辅助 Release；独立服务器可镜像其 manifest/许可等 metadata，但不承载二进制。
+- 无论选择 GitHub 直连还是独立镜像，helper/executor 的权威都为配置的 canonical GitHub 仓库与固定tag，不使用 unsigned 旧tools接口、不默默回上游。fork 必须自行公开对应辅助 Release；独立服务器可承载 manifest/许可和经校验的真实二进制，选定镜像的客户端优先使用精确tag镜像，失败才转同仓库同tag GitHub。旧服务器/旧metadata-only镜像返回404时同样安全回退。
 - 系统 PATH 优先；托管缓存按来源/tag/版本/平台/摘要隔离，使用前核对 size/SHA256/架构。旧缓存仅可信摘要吻合才复制迁移，不删除旧文件。manifest 流式硬限 64 KiB/10 秒；helper 二进制 32 MiB/60 秒，executor 32 MiB/120 秒，父取消与独占 temp 清理贯穿下载。
 - executor 安装票据绑定选中的来源/tag/版本/平台/size/digest，下载不重新用最新 manifest 选包。目标机器从 NarraFork 获取验证后的产物，不接收服务端代理凭据。不安装系统包、不修改 PATH、不 sudo、不启动守护进程。
 - 新 build-info/sidecar/bundle 带 `helperDistribution` 依赖声明，构建开始时冻结，八平台必须一致；正常主程序 publisher 在远端写入前只读核验对应 helpers 和 executor 公开资产的完整集合、hash/size、许可及组件版本/协议。含独立组件配置的新目标还要比较实际 executor 构建输入，源码、依赖、生产嵌入资源、构建参数或固定 Go 工具链发生变化但未升级组件 pin 时拒绝复用；仅主程序、文档或纯测试变化不触发组件发布。build-only/dry-run 不因此联网或发布，旧 bundle 无声明时不凭当前代码编造新依赖；恢复原始 bundle 不采用控制脚本的当前 pin 改写旧产物。
@@ -209,7 +220,7 @@ gh workflow run helpers-release.yml --ref main -f kind=executor -f tag=executor-
 gh workflow run helpers-release.yml --ref main -f kind=executor -f tag=executor-v0.9.2 -F publish=true -f source_run_id=234567890
 ```
 
-本地 `scripts/release-helpers.ts preview --plan=<plan> --output=<bundle>` 校验原产物、不写 Release；`scripts/release-executor.ts --target=github` 消费原生验收封存包。默认 `server` 参数及配置地址为兼容保留，但只镜像已公开组件的 metadata，不 Go build、不上传 binary；使用 `--preview` 做在线只读预览、`--dry-run` 做明确离线意图检查。公开辅助资产不能 clobber、补传或覆盖，变更需新 tag；失败 draft 可恢复，但恢复必须核对原 run/attempt/artifact 和全部 native smoke，不用新的重编结果替代。checksum 只证明同源传输/缓存完整性，不宣称独立发布者签名。mock 不能代替托管 runner native smoke 或真实资产上线。
+本地 `scripts/release-helpers.ts preview --plan=<plan> --output=<bundle>` 校验原产物、不写 Release；`scripts/release-executor.ts --target=github` 消费原生验收封存包。默认 `server` 参数及配置地址为兼容保留，只镜像已公开组件的 metadata 和原始二进制，不 Go build、不重新发布 GitHub；使用 `--preview` 做在线只读预览、`--dry-run` 做明确离线意图检查。公开辅助资产不能 clobber、补传或覆盖，变更需新 tag；失败 draft 可恢复，但恢复必须核对原 run/attempt/artifact 和全部 native smoke，不用新的重编结果替代。checksum 只证明同源传输/缓存完整性，不宣称独立发布者签名。mock 不能代替托管 runner native smoke 或真实资产上线。
 
 ## 有界更新索引与修复
 

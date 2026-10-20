@@ -1,6 +1,12 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseArgs } from "node:util";
+import {
+	mirrorJobTimeoutMs,
+	mirrorTransferTimeoutMs,
+	mirrorUploadConcurrency,
+	validateMirrorJobTimeoutMs,
+} from "../shared/mirror-relay";
 import { validateWebDavConfig } from "../shared/webdav-transport";
 import { resolveMirrorRelayConfig, resolveMirrorTransport } from "./lib/mirror-relay-stage";
 import {
@@ -29,10 +35,17 @@ export async function mirrorPublishedGitHubRelease(
 	options: MirrorPublishedOptions,
 ): Promise<IndependentMirrorReceipt> {
 	try {
+		validateMirrorJobTimeoutMs(options.totalTimeoutMs ?? mirrorJobTimeoutMs(options.kind));
+		mirrorUploadConcurrency(options.uploadConcurrency);
 		const transport = resolveMirrorTransport({ NF_MIRROR_TRANSPORT: options.transport });
 		if (transport === "webdav" && !options.dryRun) {
 			if (!options.relay) throw new Error("Explicit WebDAV relay configuration required");
-			validateWebDavConfig(options.relay.config);
+			const delivery = validateWebDavConfig(options.relay.config);
+			if (
+				delivery.transferTimeoutMs !== undefined &&
+				delivery.transferTimeoutMs > (options.totalTimeoutMs ?? mirrorJobTimeoutMs(options.kind))
+			)
+				throw new Error("Mirror job deadline must cover its streamed object budget");
 			resolveMirrorRelayConfig({
 				NF_MIRROR_WEBDAV_URL: options.relay.config.url,
 				NF_MIRROR_WEBDAV_FEED: options.relay.config.feed,
@@ -140,7 +153,7 @@ async function main() {
 	const cancel = () => controller.abort();
 	process.once("SIGINT", cancel);
 	process.once("SIGTERM", cancel);
-	const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(25 * 60_000)]);
+	let signal: AbortSignal = controller.signal;
 	const options: MirrorPublishedOptions = {
 		kind: kind as MirrorPublishedOptions["kind"],
 		repository,
@@ -153,6 +166,17 @@ async function main() {
 	try {
 		try {
 			options.transport = resolveMirrorTransport(process.env);
+			options.uploadConcurrency = mirrorUploadConcurrency(
+				process.env.NF_MIRROR_UPLOAD_CONCURRENCY,
+				options.transport,
+			);
+			options.totalTimeoutMs = mirrorJobTimeoutMs(
+				options.kind,
+				process.env.NF_MIRROR_TOTAL_TIMEOUT_MINUTES,
+			);
+			mirrorTransferTimeoutMs(process.env.NF_MIRROR_TRANSFER_TIMEOUT_MINUTES);
+			signal = AbortSignal.any([controller.signal, AbortSignal.timeout(options.totalTimeoutMs)]);
+			options.signal = signal;
 			if (options.transport === "webdav") {
 				options.relay = values["dry-run"] ? undefined : resolveMirrorRelayConfig(process.env);
 			} else {

@@ -55,6 +55,7 @@ scripts/lib/*
 !scripts/lib/mirror-public-github.ts
 !scripts/lib/mirror-workflow.ts
 !scripts/lib/mirror-relay-stage.ts
+!scripts/lib/mirror-upload-pool.ts
 !scripts/lib/update-server-main-mirror-history.ts
 !scripts/smoke-release-binary.ts
 # Explicit 123 distribution operators; old server receives patches/metadata only.

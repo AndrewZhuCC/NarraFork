@@ -9,6 +9,51 @@ export const MAX_RELAY_PAYLOAD_BYTES = 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHA = /^[a-f0-9]{64}$/;
 export type RelayKind = "main" | "helpers" | "executor";
+export const MAX_MIRROR_UPLOAD_CONCURRENCY = 8;
+export const DEFAULT_MIRROR_UPLOAD_CONCURRENCY = 3;
+export const DEFAULT_MIRROR_DIRECT_UPLOAD_CONCURRENCY = 2;
+export function mirrorUploadConcurrency(
+	value?: unknown,
+	transport: "direct" | "webdav" = "webdav",
+): number {
+	if (value === undefined || value === "")
+		return transport === "direct"
+			? DEFAULT_MIRROR_DIRECT_UPLOAD_CONCURRENCY
+			: DEFAULT_MIRROR_UPLOAD_CONCURRENCY;
+	if (typeof value !== "number" && (typeof value !== "string" || !/^[1-8]$/.test(value)))
+		throw new Error("Mirror upload concurrency must be an integer between 1 and 8");
+	const concurrency = Number(value);
+	if (
+		!Number.isSafeInteger(concurrency) ||
+		concurrency < 1 ||
+		concurrency > MAX_MIRROR_UPLOAD_CONCURRENCY
+	)
+		throw new Error("Mirror upload concurrency must be an integer between 1 and 8");
+	return concurrency;
+}
+export const MAX_MIRROR_JOB_TIMEOUT_MS = 300 * 60_000;
+export const MAX_MIRROR_TRANSFER_TIMEOUT_MS = 60 * 60_000;
+/** Explicit deployment configuration, not data accepted from an unsigned relay payload. */
+export function mirrorTimeoutMinutes(value: unknown, fallback: number, maximum: number): number {
+	if (value === undefined || value === "") return fallback * 60_000;
+	if (typeof value !== "number" && (typeof value !== "string" || !/^[0-9]{1,3}$/.test(value)))
+		throw new Error("Mirror timeout must be whole bounded minutes");
+	const minutes = Number(value);
+	if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > maximum)
+		throw new Error(`Mirror timeout must be between 1 and ${maximum} minutes`);
+	return minutes * 60_000;
+}
+export function mirrorJobTimeoutMs(kind: RelayKind, value?: unknown): number {
+	return mirrorTimeoutMinutes(value, kind === "main" ? 25 : 120, 300);
+}
+export function mirrorTransferTimeoutMs(value?: unknown): number {
+	return mirrorTimeoutMinutes(value, 15, 60);
+}
+export function validateMirrorJobTimeoutMs(value: number): number {
+	if (!Number.isSafeInteger(value) || value < 1 || value > MAX_MIRROR_JOB_TIMEOUT_MS)
+		throw new Error("Mirror job timeout exceeds hard limit");
+	return value;
+}
 export type RelayReadyManifest = {
 	schemaVersion: 1;
 	feed: string;

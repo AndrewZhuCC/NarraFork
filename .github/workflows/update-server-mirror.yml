@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: Mirror metadata and current patches of an already-public GitHub release
+        description: Mirror main metadata/patches or helper/executor binaries of a public release
         type: choice
         options: [main, helpers, executor]
         required: true
@@ -16,6 +16,9 @@ on:
         type: string
         required: true
 
+# Optional repository/Environment variables: upload concurrency 1–8 (direct=2, DAV=3),
+# total 1–300 minutes; streamed DAV object 1–60.
+# Empty values retain main=25, helpers/executor=120, object=15 minute defaults.
 permissions:
   contents: read
   actions: read
@@ -79,7 +82,8 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.eligible == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    # At most 300 minutes of transfer, plus 30 minutes for setup and receipt/artifact cleanup.
+    timeout-minutes: 330
     # Existing Environment, new independent approval. Preflight fails if protection is missing.
     environment: release
     steps:
@@ -107,6 +111,9 @@ jobs:
         if: vars.NF_MIRROR_TRANSPORT == '' || vars.NF_MIRROR_TRANSPORT == 'direct'
         env:
           NF_MIRROR_TRANSPORT: direct
+          NF_MIRROR_UPLOAD_CONCURRENCY: ${{ vars.NF_MIRROR_UPLOAD_CONCURRENCY }}
+          NF_MIRROR_TOTAL_TIMEOUT_MINUTES: ${{ vars.NF_MIRROR_TOTAL_TIMEOUT_MINUTES }}
+          NF_MIRROR_TRANSFER_TIMEOUT_MINUTES: ${{ vars.NF_MIRROR_TRANSFER_TIMEOUT_MINUTES }}
           GH_TOKEN: ${{ github.token }}
           NF_UPDATE_SERVER: ${{ vars.NF_UPDATE_SERVER }}
           NF_UPDATE_TOKEN: ${{ secrets.NF_UPDATE_TOKEN }}
@@ -122,6 +129,9 @@ jobs:
         if: vars.NF_MIRROR_TRANSPORT == 'webdav'
         env:
           NF_MIRROR_TRANSPORT: webdav
+          NF_MIRROR_UPLOAD_CONCURRENCY: ${{ vars.NF_MIRROR_UPLOAD_CONCURRENCY }}
+          NF_MIRROR_TOTAL_TIMEOUT_MINUTES: ${{ vars.NF_MIRROR_TOTAL_TIMEOUT_MINUTES }}
+          NF_MIRROR_TRANSFER_TIMEOUT_MINUTES: ${{ vars.NF_MIRROR_TRANSFER_TIMEOUT_MINUTES }}
           GH_TOKEN: ${{ github.token }}
           NF_MIRROR_WEBDAV_URL: ${{ vars.NF_MIRROR_WEBDAV_URL }}
           NF_MIRROR_WEBDAV_FEED: ${{ vars.NF_MIRROR_WEBDAV_FEED || 'default' }}

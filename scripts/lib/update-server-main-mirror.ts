@@ -8,6 +8,11 @@ import {
 	mirrorAssetLimit,
 	mirrorAssetsForTarget,
 } from "../../shared/independent-update-mirror";
+import {
+	mirrorJobTimeoutMs,
+	mirrorUploadConcurrency,
+	validateMirrorJobTimeoutMs,
+} from "../../shared/mirror-relay";
 import { isValidReleaseVersion } from "../../shared/release-version";
 import { parseUpdateNotes } from "../../shared/update-index";
 import { WebDavError } from "../../shared/webdav-transport";
@@ -32,6 +37,12 @@ import {
 	type MirrorRelayStageOptions,
 	type MirrorRelayStageResult,
 } from "./mirror-relay-stage";
+import {
+	groupMirrorUploads,
+	MirrorUploadPool,
+	mirrorUploadDiskBytes,
+	orderMirrorUploads,
+} from "./mirror-upload-pool";
 import { preparePublishedUpdateIndexRelease } from "./update-index-github";
 import {
 	BridgeHttpError,
@@ -127,6 +138,10 @@ export interface MirrorPublishedOptions {
 	http?: UpdateServerMirrorHttp;
 	downloadAsset?: ReleaseAssetDownloader;
 	maxTotalBytes?: number;
+	/** Frozen overall wall-clock deadline, capped at 300 minutes. */
+	totalTimeoutMs?: number;
+	/** Complete tasks: direct defaults to 2 (old servers), WebDAV to 3; hard cap 8. */
+	uploadConcurrency?: number;
 }
 export function mirrorReceipt(
 	options: Pick<MirrorPublishedOptions, "kind" | "repository" | "tag" | "transport">,
@@ -153,10 +168,18 @@ export async function mirrorPublishedMainRelease(
 	options: MirrorPublishedOptions,
 ): Promise<IndependentMirrorReceipt> {
 	const receipt = mirrorReceipt(options);
-	const signal = AbortSignal.any([
-		AbortSignal.timeout(MAIN_MIRROR_TOTAL_TIMEOUT_MS),
+	const parentSignal = AbortSignal.any([
+		AbortSignal.timeout(
+			validateMirrorJobTimeoutMs(options.totalTimeoutMs ?? mirrorJobTimeoutMs("main")),
+		),
 		...(options.signal ? [options.signal] : []),
 	]);
+	const pool = new MirrorUploadPool(
+		mirrorUploadConcurrency(options.uploadConcurrency, options.transport ?? "direct"),
+		parentSignal,
+	);
+	const signal = pool.signal;
+	let uploadOrder: { name: string }[] = [];
 	let directory: string | undefined;
 	try {
 		const version = options.tag.slice(1);
@@ -226,65 +249,71 @@ export async function mirrorPublishedMainRelease(
 		const root = "/api/v3/products/narrafork/mirror";
 		directory = await mkdtemp(join(tmpdir(), "nf-public-mirror-"));
 		const disk = await statfs(directory);
-		const maximumPatch = Math.max(
-			0,
-			...assets.filter((a) => a.kind === "patch").map((a) => a.size),
-		);
-		if (disk.bavail * disk.bsize < maximumPatch + 64 * 1024 * 1024)
+		const groups = groupMirrorUploads(assets);
+		uploadOrder = assets;
+		if (
+			disk.bavail * disk.bsize <
+			mirrorUploadDiskBytes(
+				groups.map((g) => g.asset).filter((a) => a.kind === "patch"),
+				pool.concurrency,
+			)
+		)
 			throw new Error("Insufficient independent mirror disk budget");
-		for (const asset of assets) {
+		await pool.run(groups, async ({ asset, names }, index) => {
 			signal.throwIfAborted();
-			let stream: ReadableStream<Uint8Array>;
+			let stream: ReadableStream<Uint8Array> | undefined;
 			let path: string | undefined;
-			if (asset.kind === "patch") {
-				const github = matchPublicAsset(remote, asset);
-				path = join(directory, asset.sha256);
-				await timeReleasePhase(
-					"mirror.github-patch",
-					{ inputBytes: asset.size },
-					() =>
-						(options.downloadAsset ?? downloadReleaseAsset)({
-							repository: options.repository,
-							assetId: github.id,
-							size: asset.size,
-							outputPath: path as string,
-							signal,
-						}),
-					signal,
-				);
-				const actual = await hashReleaseFile(path, mirrorAssetLimit(asset.kind), signal);
-				if (actual.size !== asset.size || actual.sha256 !== asset.sha256)
-					throw new Error("Public patch raw bytes mismatch");
-				stream = Bun.file(path).stream();
-			} else {
-				const raw =
-					asset.kind === "notes"
-						? (notesRaw as string)
-						: await run([
-								"api",
-								`repos/${options.repository}/releases/assets/${matchPublicAsset(remote, asset).id}`,
-								"-H",
-								"Accept: application/octet-stream",
-							]);
-				if (
-					Buffer.byteLength(raw) !== asset.size ||
-					digest(raw) !== asset.sha256 ||
-					asset.size > mirrorAssetLimit(asset.kind)
-				)
-					throw new Error("Public metadata raw bytes mismatch");
-				if (asset.kind === "notes") parseUpdateNotes(JSON.parse(raw), options.repository, version);
-				stream = new Blob([raw]).stream();
-			}
 			try {
+				if (asset.kind === "patch") {
+					const github = matchPublicAsset(remote, asset);
+					path = join(directory as string, `${index}-${asset.sha256}`);
+					await timeReleasePhase(
+						"mirror.github-patch",
+						{ inputBytes: asset.size },
+						() =>
+							(options.downloadAsset ?? downloadReleaseAsset)({
+								repository: options.repository,
+								assetId: github.id,
+								size: asset.size,
+								outputPath: path as string,
+								signal,
+							}),
+						signal,
+					);
+					const actual = await hashReleaseFile(path, mirrorAssetLimit(asset.kind), signal);
+					if (actual.size !== asset.size || actual.sha256 !== asset.sha256)
+						throw new Error("Public patch raw bytes mismatch");
+					stream = Bun.file(path).stream();
+				} else {
+					const raw =
+						asset.kind === "notes"
+							? (notesRaw as string)
+							: await run([
+									"api",
+									`repos/${options.repository}/releases/assets/${matchPublicAsset(remote, asset).id}`,
+									"-H",
+									"Accept: application/octet-stream",
+								]);
+					if (
+						Buffer.byteLength(raw) !== asset.size ||
+						digest(raw) !== asset.sha256 ||
+						asset.size > mirrorAssetLimit(asset.kind)
+					)
+						throw new Error("Public metadata raw bytes mismatch");
+					if (asset.kind === "notes")
+						parseUpdateNotes(JSON.parse(raw), options.repository, version);
+					stream = new Blob([raw]).stream();
+				}
+				const body = stream;
 				if (stage) {
 					await timeReleasePhase(
 						"mirror.webdav-upload",
 						{ inputBytes: asset.size, platform: asset.platform, version },
-						() => stage.uploadObject(asset, stream),
+						() => stage.uploadObject(asset, body),
 						signal,
 					);
-					receipt.uploaded.push(asset.name);
-					continue;
+					receipt.uploaded.push(...names);
+					return;
 				}
 				const headers: Record<string, string> = {
 					[MIRROR_ASSET_HEADERS.kind]: asset.kind,
@@ -298,7 +327,7 @@ export async function mirrorPublishedMainRelease(
 					"mirror.upload",
 					{ inputBytes: asset.size },
 					() =>
-						(http as UpdateServerMirrorHttp).putRaw(`${root}/assets/${asset.sha256}`, stream, {
+						(http as UpdateServerMirrorHttp).putRaw(`${root}/assets/${asset.sha256}`, body, {
 							maxBytes: mirrorAssetLimit(asset.kind),
 							expected: asset,
 							headers,
@@ -324,11 +353,15 @@ export async function mirrorPublishedMainRelease(
 					throw new Error(
 						"Missing or mismatched server-sha256 upload receipt; upgrade the update server (asset GET fallback is disabled)",
 					);
-				receipt.uploaded.push(asset.name);
+				receipt.uploaded.push(...names);
+			} catch (error) {
+				pool.fail(error);
+				throw error;
 			} finally {
+				if (stream && !stream.locked) await stream.cancel().catch(() => {});
 				if (path) await rm(path, { force: true });
 			}
-		}
+		});
 		const revalidate = async () => {
 			if ((await publicTagCommit(run, options.repository, options.tag)) !== commit)
 				throw new Error("Public tag changed during mirror");
@@ -398,13 +431,14 @@ export async function mirrorPublishedMainRelease(
 		receipt.status = assets.some((a) => a.kind === "patch") ? "MIRRORED" : "METADATA_ONLY";
 		return receipt;
 	} catch (error) {
-		receipt.failureCode = signal.aborted
+		receipt.failureCode = parentSignal.aborted
 			? "CANCELLED"
 			: error instanceof Error && error.message.includes("upgrade the update server")
 				? "SERVER_RECEIPT_REQUIRED"
 				: "MIRROR_FAILED";
 		throw new IndependentMirrorError(receipt, error);
 	} finally {
+		orderMirrorUploads(receipt.uploaded, uploadOrder);
 		if (directory) await rm(directory, { recursive: true, force: true });
 	}
 }

@@ -42,6 +42,7 @@ const signal = () => AbortSignal.timeout(10_000);
 async function setup(
 	intercept?: NonNullable<Parameters<typeof createWebDavFixture>[0]>["intercept"],
 	mirrorLimits?: ServerConfig["mirrorLimits"],
+	relayBudgets: { totalTimeoutMinutes?: number; transferTimeoutMinutes?: number } = {},
 ) {
 	const directory = mkdtempSync(join(tmpdir(), "nf-relay-pull-"));
 	const path = join(directory, "config.json");
@@ -57,6 +58,7 @@ async function setup(
 			storage: { type: "local" },
 			cors: { enabled: false, origins: [] },
 			mirrorRelay: {
+				...relayBudgets,
 				enabled: true,
 				url: "https://dav.example.test/private/",
 				feed: "default",
@@ -75,6 +77,7 @@ async function setup(
 		{
 			mirrorRepositories: { narrafork: repository },
 			mirrorRelay: {
+				...relayBudgets,
 				enabled: true,
 				url: dav.baseUrl,
 				usernameEnv: "DAV_USER",
@@ -223,6 +226,33 @@ test("actual optional pull imports patch/metadata through WebDAV, server verifie
 		await ctx.close();
 	}
 });
+
+for (const cap of [undefined, 120_000])
+	test(`configured relay job/stream deadlines reach real ingest (operator cap=${cap})`, async () => {
+		const ctx = await setup(undefined, cap === undefined ? undefined : { uploadTimeoutMs: cap }, {
+			totalTimeoutMinutes: 30,
+			transferTimeoutMinutes: 20,
+		});
+		const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
+		const deadlines: number[] = [];
+		const selected = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+			deadlines.push(ms);
+			return nativeTimeout(ms);
+		});
+		const saved = spyOn(ctx.storage, "saveVerifiedFile");
+		try {
+			await stage(ctx);
+			expect(await pollUntilSeen(ctx)).toEqual({ committed: 1, failed: 0 });
+			expect(deadlines).toContain(30 * 60_000);
+			expect(deadlines).not.toContain(25 * 60_000);
+			expect(ctx.settings.webdav.transferTimeoutMs).toBe(20 * 60_000);
+			for (const call of saved.mock.calls) expect(call[2].timeoutMs).toBe(cap ?? 20 * 60_000);
+		} finally {
+			selected.mockRestore();
+			saved.mockRestore();
+			await ctx.close();
+		}
+	});
 
 for (const budget of [
 	{ label: "unset operator cap", operator: undefined, selected: 900_000, committed: 1 },
@@ -649,6 +679,81 @@ function executorPayload(commit: string) {
 			},
 		],
 	};
+}
+
+for (const corrupt of [false, true]) {
+	test(`relay streams executor binary objects before atomic tag commit (corrupt=${corrupt})`, async () => {
+		const ctx = await setup();
+		try {
+			const original = executorPayload("a".repeat(40));
+			const bytes = Buffer.alloc(128, 6);
+			const manifest = JSON.parse(original.assets[0].content);
+			for (const entry of Object.values(manifest.manifest.platforms) as { sha256: string }[])
+				entry.sha256 = hash(bytes);
+			const content = JSON.stringify(manifest);
+			const binaries = EXECUTOR_PLATFORMS.map((platform) => ({
+				kind: "executor-binary",
+				version: "1.2.0",
+				platform,
+				name: executorPublishedFilename("1.2.0", platform),
+				size: bytes.length,
+				sha256: hash(bytes),
+			}));
+			const payload = {
+				...original,
+				binaries,
+				assets: [
+					{
+						...original.assets[0],
+						content,
+						size: Buffer.byteLength(content),
+						sha256: hash(Buffer.from(content)),
+					},
+					original.assets[1],
+				],
+			};
+			const producer = new MirrorRelayStage(
+				{ kind: "executor", repository, tag: payload.tag },
+				{
+					config: ctx.settings.webdav,
+					signingKey: key,
+					client: ctx.client,
+					now: () => new Date(ctx.clock.now),
+					jobId: "executor-binary-stream",
+				},
+				signal(),
+			);
+			// The signed JSON stays small; the binary is its own object, never base64 in payload.
+			await producer.uploadObject(binaries[0], bytes);
+			await producer.preparePayload(payload, 1024 * 1024);
+			await producer.publish(async () => {});
+			if (corrupt) {
+				const objectRequest = ctx.dav.requests.find(
+					(r) => r.method === "PUT" && r.path.endsWith(hash(bytes)),
+				);
+				if (!objectRequest) throw new Error("Missing binary object");
+				ctx.dav.objects.set(objectRequest.path, Buffer.alloc(128, 9));
+			}
+			const result = { committed: 0, failed: 0 };
+			for (let i = 0; i < 3; i++) {
+				const poll = await ctx.puller.pollOnce();
+				result.committed += poll.committed;
+				result.failed += poll.failed;
+			}
+			expect(result.committed).toBe(corrupt ? 0 : 1);
+			expect(result.failed).toBe(corrupt ? 1 : 0);
+			const response = await ctx.app.request(
+				`${root}/tools/executor/${payload.tag}/assets/${binaries[0].name}`,
+			);
+			expect(response.status).toBe(corrupt ? 404 : 200);
+			if (!corrupt) expect(Buffer.from(await response.arrayBuffer()).equals(bytes)).toBe(true);
+			expect(ctx.dav.requests.some((r) => r.method === "GET" && r.path.endsWith(hash(bytes)))).toBe(
+				true,
+			);
+		} finally {
+			await ctx.close();
+		}
+	});
 }
 
 test("actual tools same-tag conflict becomes terminal CONFLICT instead of re-downloading forever", async () => {
