@@ -8,6 +8,7 @@
  *   │    <Group align="flex-start"> Icon(16)                                   │
  *   │      <Stack gap={2}>  title line (17)                                    │
  *   │                       description line (17)                              │
+ *   │      CloseButton size="xs" (22, inside the 36-header lane)               │
  *   │    <Checkbox.Group><Stack gap={4}>                                       │
  *   │        row #1 … row #N     (each max(checkbox 20, xs line 17) = 20)      │
  *   │    <Group justify="flex-end"> two Buttons size="compact-sm" (26)         │
@@ -67,6 +68,11 @@ export interface SubagentRecoveryData {
 	notifyLabel?: string;
 	waitLabel?: string;
 	backgroundBadge?: string;
+	/**
+	 * Close button caption (aria-label + tooltip). Height-neutral: the button sits
+	 * in the header row, which is already tall enough to hold it.
+	 */
+	dismissLabel?: string;
 }
 
 /**
@@ -115,6 +121,16 @@ export const HEADER_HEIGHT = XS_LINE_HEIGHT * 2 + HEADER_INNER_GAP; // 36 (basel
 export function headerHeight(): number {
 	return typographyMetrics().line.xs * 2 + HEADER_INNER_GAP;
 }
+/**
+ * `CloseButton size="xs"` box (Mantine `--cb-size-xs` = 22), painted at the end of
+ * the header row so the card can be dismissed without resuming anything.
+ *
+ * It rides INSIDE the header lane: the two header lines already reserve
+ * `headerHeight()` (≥ 34 at any supported typography), which is taller than the
+ * button, so the dismiss affordance is height-neutral and no formula changes.
+ * A larger button size would break that and must be measured.
+ */
+export const CLOSE_BUTTON_SIZE = 22;
 
 /** Pending height with zero rows: padding + header + button row. */
 export const PENDING_BASE_HEIGHT = CARD_PADDING * 2 + HEADER_HEIGHT + STACK_GAP + BUTTON_ROW_HEIGHT;
@@ -180,6 +196,7 @@ export function measureSubagentRecovery(
 			notifyLabel: data.notifyLabel,
 			waitLabel: data.waitLabel,
 			backgroundBadge: data.backgroundBadge,
+			dismissLabel: data.dismissLabel,
 			subagents: rows.map((row) => ({
 				id: row.id,
 				title: row.title,
@@ -218,6 +235,7 @@ export const MEASURE_SUBAGENT_RECOVERY_CONSTANTS = {
 	ROWS_MAX,
 	BUTTON_ROW_HEIGHT,
 	HEADER_HEIGHT,
+	CLOSE_BUTTON_SIZE,
 	PENDING_BASE_HEIGHT,
 	PENDING_HEIGHT_PER_ROW,
 	RESOLVED_HEIGHT,

@@ -7,15 +7,26 @@
  * SubagentRecoveryCard.tsx using Mantine primitives + @tabler icons WITHOUT
  * importing anything outside vlist/.
  *
- * The mutation itself lives outside vlist/, so callers inject `onToggleRow` and
- * `onResume`; without them the card renders as an inert visual copy. Zero DOM
- * measurement — all heights come from the measure layer.
+ * The mutation itself lives outside vlist/, so callers inject `onToggleRow`,
+ * `onResume` and `onDismiss`; without them the card renders as an inert visual
+ * copy. Zero DOM measurement — all heights come from the measure layer.
  */
 
-import { Badge, Button, Checkbox, Group, Paper, Stack, Text } from "@mantine/core";
+import {
+	Badge,
+	Button,
+	Checkbox,
+	CloseButton,
+	Group,
+	Paper,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
 import { IconRefreshAlert } from "@tabler/icons-react";
 import {
 	CARD_PADDING,
+	CLOSE_BUTTON_SIZE,
 	HEADER_INNER_GAP,
 	ROW_GAP,
 	ROW_HEIGHT,
@@ -33,12 +44,18 @@ interface RenderSubagentRecoveryProps {
 	onToggleRow?: (rowIndex: number) => void;
 	/** Submit the selection in the given mode. Omit to render read-only. */
 	onResume?: (mode: "notify" | "await") => void;
+	/**
+	 * Withdraw the offer without resuming anything. Omit to paint no close button at
+	 * all (read-only shares have nothing to dismiss).
+	 */
+	onDismiss?: () => void;
 }
 
 export function RenderSubagentRecovery({
 	measured,
 	onToggleRow,
 	onResume,
+	onDismiss,
 }: RenderSubagentRecoveryProps) {
 	const block = measured.blocks[0] as PreparedFixedBlock | undefined;
 	if (!block || block.kind !== "fixed") return null;
@@ -95,6 +112,22 @@ export function RenderSubagentRecovery({
 							{data.description}
 						</Text>
 					</Stack>
+					{onDismiss ? (
+						// Rides inside the header lane, which the measure layer already
+						// reserves taller than the button — no height change. The box is
+						// the measured CLOSE_BUTTON_SIZE, not a Mantine size token, so a
+						// resized button can never drift past what was reserved.
+						<Tooltip label={data.dismissLabel ?? ""} withArrow disabled={!data.dismissLabel}>
+							<CloseButton
+								size={CLOSE_BUTTON_SIZE}
+								variant="subtle"
+								color="orange.7"
+								style={{ flexShrink: 0 }}
+								aria-label={data.dismissLabel}
+								onClick={onDismiss}
+							/>
+						</Tooltip>
+					) : null}
 				</Group>
 
 				{rows.length > 0 && (
