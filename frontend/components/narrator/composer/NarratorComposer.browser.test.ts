@@ -1278,6 +1278,7 @@ test("height transitions reverse in flight without remounting the editor or queu
 		expect(result.sameElement).toBe(true);
 		expect(result.focused).toBe(true);
 		const max = Math.max(...result.frames.map((frame) => frame.target));
+		const span = Math.max(max - compact, 1);
 		expect(max).toBeGreaterThan(compact + 24);
 		expect(
 			result.frames.some((frame) => frame.height > compact + 1 && frame.height < max - 1),
@@ -1287,12 +1288,16 @@ test("height transitions reverse in flight without remounting the editor or queu
 			const previous = result.frames[index - 1];
 			expect(current.height).toBeGreaterThanOrEqual(compact - 1);
 			expect(current.height).toBeLessThanOrEqual(max + 1);
-			// The easing peaks at about four times linear, and one compositor frame of that
-			// peak is ~66px on this control. JS timestamps on CI can be closer than the
-			// vsync that produced the pixels, so the budget never shrinks below one 60Hz
-			// frame. A same-frame snap of the whole range still fails.
+			// cubic-bezier(0.2, 0, 0, 1) peaks near 4× linear over the 180ms height
+			// transition. Headless CI often composites more than one vsync between two
+			// close performance.now() samples, so the budget also covers a 30Hz gap.
+			// It still rejects a same-frame snap of the whole travel.
 			const frameMs = Math.max(current.time - previous.time, 1000 / 60);
-			const allowed = (((max - compact) * frameMs) / 180) * 4 + 2;
+			const step = (duration: number) => ((span * duration) / 180) * 4 + 2;
+			const allowed = Math.min(
+				span * 0.75,
+				Math.max(step(frameMs), step(Math.max(frameMs, 1000 / 30))),
+			);
 			expect(Math.abs(current.height - previous.height)).toBeLessThanOrEqual(allowed);
 		}
 		await layoutSettled(page);
