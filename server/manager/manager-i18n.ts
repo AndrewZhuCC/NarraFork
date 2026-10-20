@@ -293,6 +293,14 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "创建管理器窗口失败；请改用 `narrafork.exe --serve`。",
 		en: "Failed to create the manager window; use `narrafork.exe --serve` instead.",
 	},
+	"log.waitingLockHolder": {
+		"zh-CN": "数据目录仍被上一个 NarraFork 进程（PID {pid}）占用，等待它退出...",
+		en: "The data directory is still held by the previous NarraFork process (PID {pid}); waiting for it to exit...",
+	},
+	"log.lockHolderExited": {
+		"zh-CN": "上一个 NarraFork 进程（PID {pid}）已退出，重新启动服务...",
+		en: "The previous NarraFork process (PID {pid}) has exited; starting the server again...",
+	},
 	"error.instanceLockConflict": {
 		"zh-CN": "已有 NarraFork 实例在运行（PID {pid}）：同一数据目录只能运行一个，请先停止它",
 		en: "Another NarraFork instance is running (PID {pid}): only one process may use a data directory, stop it first",
