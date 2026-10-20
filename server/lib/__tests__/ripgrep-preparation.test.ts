@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import {
 	getHelperAssetName,
 	HELPER_CATALOG_VERSION,
+	HELPER_MANIFEST_FILENAME,
 	HELPER_PLATFORMS,
 	HELPER_RELEASE_TAG,
 	HELPER_TOOL_VERSIONS,
@@ -41,10 +42,10 @@ function binary(platform: HelperPlatform): Buffer<ArrayBuffer> {
 	}
 	return bytes;
 }
-function catalog() {
+function catalog(repository = "fork/repo") {
 	return {
 		schemaVersion: 1,
-		repository: "fork/repo",
+		repository,
 		tag: HELPER_RELEASE_TAG,
 		commit: "a".repeat(40),
 		catalogVersion: HELPER_CATALOG_VERSION,
@@ -79,12 +80,26 @@ let Backend: typeof import("../agent/execution/local-backend").LocalBackend;
 const spec = getCliHelperSpec("rg");
 if (!spec?.platform) throw new Error("This fixture requires a supported native helper platform");
 const nativeBinary = binary(spec.platform as HelperPlatform);
+const nativeAssetName = spec.toolName;
+const mirrorAssetUrl = `https://personal.example/api/v3/products/narrafork/mirror/tools/helpers/${HELPER_RELEASE_TAG}/assets/${nativeAssetName}`;
+const githubAssetUrl = (repository: string, name: string) =>
+	`https://github.com/${repository}/releases/download/${HELPER_RELEASE_TAG}/${name}`;
 function useRoutes(handler?: (url: string, init?: RequestInit) => Promise<Response>) {
 	setOutboundFetchOverrideForTest(async (input, init) => {
 		const url = String(input);
 		calls.push(url);
 		if (handler) return handler(url, init);
 		return url.endsWith(".json") ? Response.json(catalog()) : new Response(nativeBinary);
+	});
+}
+function useSelectedMirrorRoutes(repository = "fork/repo", mirrorAvailable = true) {
+	useRoutes(async (url) => {
+		if (url === githubAssetUrl(repository, HELPER_MANIFEST_FILENAME))
+			return Response.json(catalog(repository));
+		if (url === mirrorAssetUrl)
+			return mirrorAvailable ? new Response(nativeBinary) : new Response(null, { status: 404 });
+		if (url === githubAssetUrl(repository, nativeAssetName)) return new Response(nativeBinary);
+		throw new Error("Unexpected component source or non-pinned asset request");
 	});
 }
 function grep(signal: AbortSignal) {
@@ -114,6 +129,7 @@ beforeEach(async () => {
 		source: "github",
 		githubRepository: "fork/repo",
 		serverUrl: "https://personal.example",
+		product: "narrafork",
 		proxy: { mode: "direct" },
 	};
 	calls.length = 0;
@@ -155,6 +171,28 @@ function pendingProbe() {
 	return { started: started.promise, complete: exited.resolve };
 }
 describe("ripgrep preparation operation boundaries", () => {
+	for (const mirrorAvailable of [true, false]) {
+		test(`selected mirror ${mirrorAvailable ? "serves the native rg binary before probing" : "404 falls back to the same GitHub repository and pinned tag"}`, async () => {
+			switchSource();
+			useSelectedMirrorRoutes("fork/repo", mirrorAvailable);
+			subprocess.mockImplementation((() => ({
+				exited: Promise.resolve(0),
+			})) as unknown as typeof Bun.spawn);
+			const path = await resolver();
+			expect(path).not.toBeNull();
+			if (!path) throw new Error("Selected-source native preparation must succeed");
+			expect(fs.readFileSync(path)).toEqual(nativeBinary);
+			const expectedCalls = [
+				githubAssetUrl("fork/repo", HELPER_MANIFEST_FILENAME),
+				mirrorAssetUrl,
+				...(mirrorAvailable ? [] : [githubAssetUrl("fork/repo", nativeAssetName)]),
+			];
+			expect(calls).toEqual(expectedCalls);
+			expect(subprocess).toHaveBeenCalledTimes(1);
+			expect(await resolver()).toBe(path);
+			expect(calls).toEqual(expectedCalls); // Verified cache is reusable only under the same frozen source.
+		});
+	}
 	test("a proxy edit during the manifest does not recapture a new transport for download", async () => {
 		useRoutes(async (url) => {
 			if (url.endsWith(".json")) {
@@ -174,7 +212,7 @@ describe("ripgrep preparation operation boundaries", () => {
 		expect(calls.every((url) => url.startsWith("https://github.com/fork/repo/"))).toBe(true);
 	});
 	test.each([
-		["delivery only", undefined],
+		["mirror delivery", undefined],
 		["canonical repository", "other/repo"],
 	] as const)("an awaited GitHub manifest respects a %s change", async (_change, repository) => {
 		const response = deferred<Response>();
@@ -192,23 +230,28 @@ describe("ripgrep preparation operation boundaries", () => {
 		switchSource(repository);
 		response.resolve(Response.json(catalog()));
 		const path = await result;
-		if (repository) {
-			expect(path).toBeNull();
-			expect(calls).toHaveLength(1);
-			expect(subprocess).not.toHaveBeenCalled();
-		} else {
-			expect(path).not.toBeNull();
-			if (!path) throw new Error("Same-repository helper must remain ready");
-			expect(fs.readFileSync(path)).toEqual(nativeBinary);
-			expect(calls).toHaveLength(2);
-			expect(subprocess).toHaveBeenCalledTimes(1);
-		}
+		// Delivery is part of the frozen source identity, even when GitHub authority is unchanged.
+		expect(path).toBeNull();
+		expect(calls).toHaveLength(1);
+		expect(subprocess).not.toHaveBeenCalled();
 		expect(
 			calls.every((url) =>
 				url.startsWith(`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/`),
 			),
 		).toBe(true);
 		expect(calls.some((url) => url.includes("personal.example"))).toBe(false);
+		// A new preparation may capture the selected source; the stale operation must not recapture it.
+		const nextRepository = repository ?? "fork/repo";
+		useSelectedMirrorRoutes(nextRepository);
+		const freshPath = await resolver();
+		expect(freshPath).not.toBeNull();
+		if (!freshPath) throw new Error("New-source preparation must be retryable");
+		expect(fs.readFileSync(freshPath)).toEqual(nativeBinary);
+		expect(calls.slice(1)).toEqual([
+			githubAssetUrl(nextRepository, HELPER_MANIFEST_FILENAME),
+			mirrorAssetUrl,
+		]);
+		expect(subprocess).toHaveBeenCalledTimes(1);
 	});
 	test("an already canceled Grep starts no helper fetch or fallback process", async () => {
 		const controller = new AbortController();
@@ -274,7 +317,7 @@ describe("ripgrep preparation operation boundaries", () => {
 			expect(subprocess).toHaveBeenCalledTimes(1);
 		});
 		test.each([
-			["delivery only", undefined],
+			["mirror delivery", undefined],
 			["canonical repository", "other/repo"],
 		] as const)(`${cached ? "cached" : "downloaded"} version probe respects a %s change`, async (_change, repository) => {
 			const cachedPath = cached ? await downloadHelperBinary(spec) : null;
@@ -285,16 +328,8 @@ describe("ripgrep preparation operation boundaries", () => {
 			switchSource(repository);
 			probe.complete(0);
 			const path = await result;
-			if (repository) expect(path).toBeNull();
-			else {
-				expect(path).not.toBeNull();
-				if (!path) throw new Error("Same-repository helper must remain ready");
-				expect(fs.readFileSync(path)).toEqual(nativeBinary);
-				if (cached) {
-					if (!cachedPath) throw new Error("Verified cache fixture must have a path");
-					expect(path).toBe(cachedPath);
-				}
-			}
+			// A successful version probe cannot make its old delivery context current again.
+			expect(path).toBeNull();
 			expect(calls).toHaveLength(2);
 			expect(
 				calls.every((url) =>
@@ -303,6 +338,22 @@ describe("ripgrep preparation operation boundaries", () => {
 			).toBe(true);
 			expect(calls.some((url) => url.includes("personal.example"))).toBe(false);
 			expect(subprocess).toHaveBeenCalledTimes(1);
+			const nextRepository = repository ?? "fork/repo";
+			useSelectedMirrorRoutes(nextRepository);
+			subprocess.mockImplementation((() => ({
+				exited: Promise.resolve(0),
+			})) as unknown as typeof Bun.spawn);
+			const freshPath = await resolver();
+			expect(freshPath).not.toBeNull();
+			if (!freshPath)
+				throw new Error("New-source preparation must be retryable after the stale probe");
+			expect(fs.readFileSync(freshPath)).toEqual(nativeBinary);
+			if (cached) expect(freshPath).not.toBe(cachedPath);
+			expect(calls.slice(2)).toEqual([
+				githubAssetUrl(nextRepository, HELPER_MANIFEST_FILENAME),
+				mirrorAssetUrl,
+			]);
+			expect(subprocess).toHaveBeenCalledTimes(2);
 		});
 	}
 	test("the original 60s preparation deadline survives cache lookup, download and version probe", async () => {
