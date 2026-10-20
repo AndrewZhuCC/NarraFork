@@ -1286,7 +1286,10 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const release = hold();
 		const controller = new AbortController();
 		let held = false;
-		setService(makeFixtureTransaction(db, { ...options, cleanupTimeoutMs: 50 }));
+		// The cleanup budget also bounds the post-release observe/publish of the receipt.
+		// 50ms is exceeded on a loaded runner, leaving no receipt; the bounded early
+		// response still comes from this timer, just later.
+		setService(makeFixtureTransaction(db, { ...options, cleanupTimeoutMs: 1_000 }));
 		setFileHook(async (path) => {
 			if (
 				!held &&
