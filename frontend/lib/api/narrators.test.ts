@@ -25,6 +25,30 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("message and block deletions are always history-only", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json({ ok: true });
+			},
+		});
+		await api.deleteMessage("n", "m");
+		await api.deleteMessageBlock("n", "m", 2);
+		await api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0 }]);
+		expect(requests[0].url).toEndWith("/narrators/n/messages/m?skipRevert=1");
+		expect(requests[1].url).toEndWith("/narrators/n/messages/m/blocks/2?skipRevert=1");
+		expect(JSON.parse(String(requests[2].init.body))).toEqual({
+			blocks: [{ messageId: "m", blockIndex: 0 }],
+			skipRevert: true,
+		});
+	});
+
 	test.each([
 		false,
 		true,

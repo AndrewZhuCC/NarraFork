@@ -501,9 +501,7 @@ export function useRevertHistoryAction(narratorId: string) {
 						? await api.rollbackToBlock(narratorId, target.messageId, target.blockIndex, {
 								skipRevert: true,
 							})
-						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex, {
-								skipRevert: true,
-							});
+						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex);
 				if (result.ok !== true) throw new Error(t("deleteMessageFailedDesc"));
 				return { reason: null };
 			}

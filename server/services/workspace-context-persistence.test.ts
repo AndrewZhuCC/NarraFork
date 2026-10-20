@@ -642,11 +642,9 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			const req = request(f, action, skipRevert);
 			const response = await app(owner).request(req.path, req.init);
 			expect(response.status).toBe(409);
-			// A file-restoring rollback first needs a confirmed plan, so it is refused at
-			// that gate; deletions still reach the workspace check. Both refuse before IO.
-			expect((await response.json()).code).toBe(
-				action === "rollback" ? "REVERT_CONFIRMATION_REQUIRED" : "WORKSPACE_REVERT_UNSUPPORTED",
-			);
+			// A file-restoring rollback needs a confirmed plan and HTTP deletions are
+			// history-only, so every action is refused at that gate before any IO.
+			expect((await response.json()).code).toBe("REVERT_CONFIRMATION_REQUIRED");
 			expect(interrupt).not.toHaveBeenCalled();
 			expect(await refs()).toEqual(before);
 			await assertFiles(f);
