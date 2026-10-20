@@ -153,6 +153,7 @@ export {
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
+	codexUpdateCredentialSchema,
 	codexUseImageGenerationSchema,
 	codexUseWebSearchSchema,
 	codexUseWebSocketSchema,

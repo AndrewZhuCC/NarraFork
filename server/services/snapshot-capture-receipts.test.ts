@@ -637,11 +637,19 @@ describe("actual tree-scan observation receipts", () => {
 
 	test("bounded begin metadata cannot insert a late receipt after the scan has returned", async () => {
 		const delayed = gate();
+		let releaseLate = () => {};
+		const lateSettled = new Promise<void>((resolve) => {
+			releaseLate = resolve;
+		});
 		const original = localIo.localDirectoryIdentity;
 		const identitySpy = spyOn(localIo, "localDirectoryIdentity").mockImplementation(
 			async (path) => {
-				await delayed.promise;
-				return original(path);
+				try {
+					await delayed.promise;
+					return await original(path);
+				} finally {
+					releaseLate();
+				}
 			},
 		);
 		cleanupSpies.push(identitySpy);
@@ -652,8 +660,14 @@ describe("actual tree-scan observation receipts", () => {
 		expect(rows()).toHaveLength(0);
 		identitySpy.mockRestore();
 		delayed.resolve();
+		// The timed-out identity read is still in flight. One setImmediate does not
+		// wait for it, and a later begin on the same 15ms budget loses to a loaded
+		// CI identity walk (begin_unavailable, no row). Settle the late read, prove
+		// it did not publish, then record with the production budget.
+		await lateSettled;
 		await new Promise<void>((done) => setImmediate(done));
 		expect(rows()).toHaveLength(0);
+		receipts = new SnapshotCaptureReceiptService({ db, privateRoot });
 		await capture();
 		expect(rows()).toHaveLength(1);
 	});

@@ -100,4 +100,43 @@ describe("RecentTabs list-state snapshots", () => {
 			{ narratorId: "n2", type: "backgroundTaskCount", activeBackgroundTaskCount: 0 },
 		]);
 	});
+
+	test("forwards the backgroundWorkActive suppression flag on snapshot status items", () => {
+		const updates: Array<{
+			narratorId: string;
+			type: string;
+			status?: string;
+			substatus?: string[];
+			backgroundWorkActive?: boolean;
+		}> = [];
+		dispatchRecentTabsListStateSnapshot(
+			{
+				type: "list_state_snapshot",
+				items: [
+					// Done-transition replay while background work is still running.
+					{
+						narratorId: "n1",
+						status: "idle",
+						substatus: ["unread"],
+						backgroundWorkActive: true,
+					},
+					// Ordinary idle/unread replay — no flag.
+					{ narratorId: "n2", status: "idle", substatus: ["unread"] },
+				],
+			},
+			(narratorId, event) => updates.push({ narratorId, ...event }),
+		);
+
+		const statusEvents = updates.filter((event) => event.type === "status");
+		expect(statusEvents).toEqual([
+			{
+				narratorId: "n1",
+				type: "status",
+				status: "idle",
+				substatus: ["unread"],
+				backgroundWorkActive: true,
+			},
+			{ narratorId: "n2", type: "status", status: "idle", substatus: ["unread"] },
+		]);
+	});
 });

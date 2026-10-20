@@ -6,6 +6,7 @@ import {
 	consumeCodexResetCredit,
 	fetchCodexUsage,
 	getCodexUsageWindows,
+	hasSpendableCodexCredits,
 	identifyCodexUsageWindowType,
 	parseCodexUsagePayload,
 } from "../codex-usage";
@@ -45,6 +46,69 @@ function payload(overrides: Partial<CodexUsagePayload> = {}): CodexUsagePayload 
 		...overrides,
 	};
 }
+
+describe("Codex spendable credits", () => {
+	test("unlimited takes precedence and explicit has_credits=false vetoes a balance", () => {
+		expect(hasSpendableCodexCredits()).toBe(false);
+		expect(hasSpendableCodexCredits(null)).toBe(false);
+		expect(hasSpendableCodexCredits({ unlimited: true, has_credits: false, balance: null })).toBe(
+			true,
+		);
+		expect(hasSpendableCodexCredits({ unlimited: false, has_credits: false, balance: "100" })).toBe(
+			false,
+		);
+		expect(hasSpendableCodexCredits({ unlimited: false, has_credits: true, balance: null })).toBe(
+			false,
+		);
+	});
+
+	test.each([
+		"1",
+		"+1.5",
+		".5",
+		"1.",
+		" 0.000000000000000000000000000001 ",
+		"1e-9999",
+		"2E+9999",
+		"+.01e-2",
+		"9".repeat(64),
+	])("recognizes exact positive decimal balance %s", (balance) => {
+		expect(hasSpendableCodexCredits({ unlimited: false, has_credits: true, balance })).toBe(true);
+	});
+
+	test.each([
+		"",
+		" ",
+		"0",
+		"0.000",
+		"+0e9999",
+		"-1",
+		"-0.01",
+		"NaN",
+		"Infinity",
+		"0x10",
+		"1_000",
+		"1,000",
+		"1e",
+		"1e1.5",
+		".",
+		"1 2",
+		"1\n2",
+		"9".repeat(65),
+	])("rejects zero, malformed, negative or oversized balance %s", (balance) => {
+		expect(hasSpendableCodexCredits({ unlimited: false, has_credits: true, balance })).toBe(false);
+	});
+
+	test("parsing a missing has_credits flag preserves a positive balance", () => {
+		const usage = parseCodexUsagePayload({
+			...payload(),
+			credits: { balance: "1e-9999" },
+		});
+		expect(usage.credits?.balance).toBe("1e-9999");
+		expect(usage.credits?.has_credits).toBeUndefined();
+		expect(hasSpendableCodexCredits(usage.credits)).toBe(true);
+	});
+});
 
 describe("Codex usage window parsing", () => {
 	test("classifies exact short windows and bounded 28-31 day monthly windows", () => {
@@ -321,7 +385,7 @@ describe("Codex spendable credits", () => {
 			} as unknown as Partial<CodexUsagePayload>),
 			"2026-05-01T00:00:00.000Z",
 		);
-		expect(parsed.credits).toEqual({ has_credits: false, unlimited: false, balance: "42" });
+		expect(parsed.credits).toEqual({ has_credits: undefined, unlimited: false, balance: "42" });
 	});
 
 	test("a missing or non-record credits field leaves the field absent", () => {

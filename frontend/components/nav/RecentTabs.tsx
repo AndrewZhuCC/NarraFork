@@ -114,6 +114,7 @@ import type { RecentTabDropTarget } from "./recent-tab-drop-target";
 import {
 	clampSwipeTravel,
 	classifySwipeRelease,
+	isBackgroundWorkSilencedStatus,
 	isTabActive,
 	SWIPE_THRESHOLD,
 } from "./recent-tabs-logic";
@@ -370,7 +371,11 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 							? "waiting"
 							: "unread";
 					setFaviconAlert(narratorId, alertKind);
-					if (userPrefsRef.current) {
+					// Done while non-service background work is still running: keep the
+					// in-app unread + favicon state, but stay silent (no sound, no PWA
+					// browser notification). The wake-up turn after the last background
+					// task completes emits a fresh, unflagged done which notifies normally.
+					if (!isBackgroundWorkSilencedStatus(event) && userPrefsRef.current) {
 						const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
 						if (tab) {
 							triggerNotification(

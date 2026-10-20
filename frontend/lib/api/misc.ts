@@ -547,7 +547,10 @@ export const miscApi = {
 			"/codex/credentials/unhealthy",
 			{ method: "DELETE" },
 		),
-	codexCredentialUpdate: (id: string, data: { displayName?: string; priority?: number }) =>
+	codexCredentialUpdate: (
+		id: string,
+		data: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+	) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
 			method: "PATCH",
 			body: JSON.stringify(data),

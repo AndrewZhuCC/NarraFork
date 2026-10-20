@@ -1131,6 +1131,7 @@ export type CodexAuthMode = "oauth" | "personal_access_token" | "agent_identity"
 
 export interface CodexCredentialEntry {
 	id: string;
+	useCreditQuota: boolean;
 	displayName?: string;
 	authMode?: CodexAuthMode;
 	accountId?: string;
