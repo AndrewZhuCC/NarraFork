@@ -473,6 +473,9 @@ export function useVListLabels(): VListLabels {
 			subagentRecoveryResolvedWait: t("subagentRecoveryResolvedWait", {
 				count: COUNT_PLACEHOLDER,
 			}),
+			// The close button's aria-label + tooltip. Not measured, but it travels
+			// with the card payload so the render layer stays i18n-free.
+			subagentRecoveryDismiss: t("subagentRecoveryDismiss"),
 			// ── reflection notice titles (MEASURED, so they belong here) ─────────────
 			// Keys are `${kind}Reflection${Status}`, built by the adapter from
 			// reflectionTitleKeyPrefix/Suffix. The title wraps at narrow widths and

@@ -1045,6 +1045,7 @@
 	"subagentRecoveryResumeAndWait": "Resume and wait",
 	"subagentRecoveryResolvedNotify": "Restarted {{count}} subagent(s); the narrator was told to await them.",
 	"subagentRecoveryResolvedWait": "Restarted {{count}} subagent(s) and waited for every result.",
+	"subagentRecoveryDismiss": "Dismiss without restarting",
 	"branches": "Branches",
 	"branchRoot": "Main",
 	"branchActive": "active",
