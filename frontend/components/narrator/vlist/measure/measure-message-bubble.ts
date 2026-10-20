@@ -22,6 +22,7 @@ import {
 	prepareRichInline,
 	type RichInlineItem,
 } from "@chenglou/pretext/rich-inline";
+import { unescapeComposerText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
@@ -512,6 +513,7 @@ function userBodyLayout(input: MeasureMessageInput): UserBodyLayout {
 	};
 	// Chat bodies are markdown and never carry composer placeholders.
 	if (input.bodyFormat === "markdown") return legacy;
+	legacy.body = unescapeComposerText(legacy.body);
 	const images = attachments.filter((attachment) => attachment.type === "image");
 	const files = attachments.filter((attachment) => attachment.type === "text_file");
 	const segments = parseComposerSegments(input.text, {

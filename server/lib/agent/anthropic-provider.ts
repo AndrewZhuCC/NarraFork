@@ -3344,9 +3344,10 @@ async function buildAnthropicHistory(
 			if (images.some((image) => image !== null)) {
 				// A mid-conversation system message cannot carry image parts, so an
 				// image forces the user role. That only affects `sys` rows, which do
-				// not carry uploads in practice.
-				const parts: AnthropicContentPart[] = orderUserContent(text, images, "after").map((part) =>
-					part.type === "text" ? { type: "text", text: part.text } : part.image,
+				// not carry uploads in practice. Unplaced images lead, exactly as the live turn
+				// sent them: a rebuilt turn that reorders its parts misses the prompt cache.
+				const parts: AnthropicContentPart[] = orderUserContent(text, images, "before").map(
+					(part) => (part.type === "text" ? { type: "text", text: part.text } : part.image),
 				);
 				history.push({ role: "user", content: parts });
 				emittedMessages.push(msg);
