@@ -182,12 +182,11 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
 import { commandCodeQuotaView } from "./model/commandcode-quota-format";
-import { usageSourceFor } from "./model/custom-api-usage-source";
+import { customApiBalanceDisplayFor, usageSourceFor } from "./model/custom-api-usage-source";
 import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
 import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
-import { isSub2ApiSubscriptionSnapshot } from "./model/sub2api-subscription-quota-view";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
@@ -779,10 +778,12 @@ function NarratorPanelBody({
 		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
 		firstScreenActivity,
 	);
-	// The query already isolates provider/generation; this layer only selects the mode.
-	const sub2ApiSubscriptionSnapshot = isSub2ApiSubscriptionSnapshot(providerBalanceQuery.data)
-		? providerBalanceQuery.data
-		: null;
+	const { pushedQuota, subscriptionSnapshot: sub2ApiSubscriptionSnapshot } =
+		customApiBalanceDisplayFor({
+			providerId: currentBalanceProviderId,
+			pushedQuotas: settingsData?.customApiQuotas,
+			snapshot: providerBalanceQuery.data,
+		});
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1198,6 +1199,9 @@ function NarratorPanelBody({
 		if (usageSource === "kimi") {
 			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
+		if (cfg.id === currentBalanceProviderId && pushedQuota) {
+			return { providerId: cfg.id, ...pushedQuota };
+		}
 		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
 			// The shared window panel owns subscription amounts, including unknown/stale
 			// placeholders. Do not duplicate them in the generic balance text slot.
@@ -1230,6 +1234,7 @@ function NarratorPanelBody({
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,
 		currentBalanceProviderId,
+		pushedQuota,
 		sub2ApiSubscriptionSnapshot,
 		providerBalanceQuery.data,
 		providerBalanceQuery.isError,
