@@ -583,6 +583,8 @@
 	"draftRetry": "Retry",
 	"draftReplacedByRemote": "This draft was updated from another tab or device.",
 	"draftRestorePrevious": "Restore original",
+	"draftStaleLocalSetAside": "This device had an older unsynced draft; showing the newer one from another tab or device.",
+	"draftUseStaleLocal": "Use this device's version",
 	"draftDismissReplace": "Dismiss",
 	"draftTooLong": "This draft exceeds {{limit}} characters and is not being synced.",
 	"chapterMergedHint": "This chapter has been merged. Wake it up to continue editing.",
