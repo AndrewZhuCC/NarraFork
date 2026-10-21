@@ -187,6 +187,16 @@ const MAX_INHERITED_FULL_FORK_REFS = 500;
  * same thing an exact number would.
  */
 const TEAM_VIEW_OMITTED_COUNT_CAP = 500;
+/** Rows per keyset page of {@link narratorService.listTeamMembers}. */
+const TEAM_MEMBERS_PAGE_SIZE = 500;
+
+/** The selector handles of a team member — no prompt/summary columns. */
+export interface TeamMemberSelectorRow {
+	id: string;
+	title: string | null;
+	traits: string[];
+	createdAt: string;
+}
 export const TEAM_BROADCAST_MAX_TARGETS = 100;
 export const TEAM_BROADCAST_RECENT_IDLE_LIMIT = 100;
 
@@ -1988,14 +1998,54 @@ export const narratorService = {
 	},
 
 	/**
-	 * Unbounded on purpose for explicit Send/Await/ContextAsk selector resolution.
+	 * Every team member's selector handles, for explicit Send/Await/ContextAsk
+	 * selector resolution and the TeamStatus bash scope. The membership is unbounded
+	 * on purpose — dropping a member would resolve a selector wrongly — but each row
+	 * is not: only `id`/`title`/`traits` are read, which is all
+	 * `subagentMatchesSelector` and `agentLabelFromNarrator` look at. Callers re-read
+	 * the one matched target with `getById`. Reading full rows here pulled every
+	 * member's `systemPrompt`/`contextSummary` and blew the query result budget on
+	 * large teams.
+	 *
+	 * Pages are keyset-bounded on `(createdAt, id)` so no single query materializes
+	 * the whole team at once.
+	 *
 	 * Display uses listSubagentsForTeamView; broadcast uses listSubagentsForBroadcast.
 	 */
-	async listTeamMembers(rootId: string) {
-		return db.query.narrators.findMany({
-			where: teamMembersWhere(rootId),
-			orderBy: (n, { asc }) => [asc(n.createdAt)],
-		});
+	async listTeamMembers(rootId: string): Promise<TeamMemberSelectorRow[]> {
+		const members: TeamMemberSelectorRow[] = [];
+		let cursor: { createdAt: string; id: string } | null = null;
+		for (;;) {
+			const page: TeamMemberSelectorRow[] = await db
+				.select({
+					id: narrators.id,
+					title: narrators.title,
+					traits: narrators.traits,
+					createdAt: narrators.createdAt,
+				})
+				.from(narrators)
+				.where(
+					and(
+						teamMembersWhere(rootId),
+						cursor
+							? or(
+									sql`${narrators.createdAt} > ${cursor.createdAt}`,
+									and(
+										eq(narrators.createdAt, cursor.createdAt),
+										sql`${narrators.id} > ${cursor.id}`,
+									),
+								)
+							: undefined,
+					),
+				)
+				.orderBy(narrators.createdAt, narrators.id)
+				.limit(TEAM_MEMBERS_PAGE_SIZE)
+				.all();
+			members.push(...page);
+			if (page.length < TEAM_MEMBERS_PAGE_SIZE) return members;
+			const last = page[page.length - 1];
+			cursor = { createdAt: last.createdAt, id: last.id };
+		}
 	},
 
 	/**
