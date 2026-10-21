@@ -588,11 +588,46 @@ describe("GitChangesTab attribution hover card", () => {
 			const target = attributionTarget(container);
 			target.dispatchEvent(new Event("mouseleave", { bubbles: true }));
 			target.dispatchEvent(new Event("mouseout", { bubbles: true }));
-			await new Promise((resolve) => setTimeout(resolve, 200));
+			// closeDelay (120ms) plus the exit transition, after which Mantine unmounts children.
+			await new Promise((resolve) => setTimeout(resolve, 600));
 			await flushRender();
 			expect(signals[0]?.aborted).toBe(true);
 		} finally {
 			g.fetch = originalFetch;
+		}
+	});
+
+	test("hiding the page aborts the read, and returning reads again", async () => {
+		const g = globalThis as { fetch?: typeof fetch };
+		const originalFetch = g.fetch;
+		const signals: AbortSignal[] = [];
+		g.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.signal) signals.push(init.signal);
+			return new Promise<Response>((_, reject) =>
+				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+			);
+		}) as typeof fetch;
+		const doc = document as Document & { visibilityState: string };
+		try {
+			const container = await renderBadge("chapter-attr-hidden", null);
+			await hoverAttribution(container);
+			expect(signals).toHaveLength(1);
+
+			Object.defineProperty(doc, "visibilityState", { configurable: true, value: "hidden" });
+			document.dispatchEvent(new Event("visibilitychange"));
+			await flushRender();
+			expect(signals[0]?.aborted).toBe(true);
+
+			Object.defineProperty(doc, "visibilityState", { configurable: true, value: "visible" });
+			document.dispatchEvent(new Event("visibilitychange"));
+			await flushRender();
+			expect(signals).toHaveLength(2);
+			expect(document.querySelector(".mantine-HoverCard-dropdown")?.textContent).toContain(
+				gitLocale.attributionLoadingShort,
+			);
+		} finally {
+			g.fetch = originalFetch;
+			Reflect.deleteProperty(doc, "visibilityState");
 		}
 	});
 
@@ -618,6 +653,11 @@ describe("GitChangesTab attribution hover card", () => {
 			retry?.dispatchEvent(new Event("click", { bubbles: true }));
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			expect(calls).toBe(2);
+			// Enter on the focused button must not reach the row's Enter-to-open-diff handler.
+			retry?.dispatchEvent(
+				Object.assign(new Event("keydown", { bubbles: true, cancelable: true }), { key: "Enter" }),
+			);
+			await new Promise((resolve) => setTimeout(resolve, 20));
 			// React events cross the portal: retrying must not also open the row's diff.
 			expect(fetched.some((url) => url.includes("/diff"))).toBe(false);
 		} finally {

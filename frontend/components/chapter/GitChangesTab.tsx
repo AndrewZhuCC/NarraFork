@@ -969,25 +969,8 @@ function AttributionHoverCard({
 	t: Translate;
 	children: ReactNode;
 }) {
-	// Details mount only while the card is open and the page is in the foreground, so a
-	// closed row holds no query observer and closing the card aborts its in-flight read.
-	const [open, setOpen] = useState(false);
-	useEffect(
-		() => (open ? observePageLifecycle({ onHidden: () => setOpen(false) }) : undefined),
-		[open],
-	);
-
 	return (
-		<HoverCard
-			width={320}
-			shadow="md"
-			withArrow
-			openDelay={120}
-			closeDelay={120}
-			withinPortal
-			onOpen={() => setOpen(true)}
-			onClose={() => setOpen(false)}
-		>
+		<HoverCard width={320} shadow="md" withArrow openDelay={120} closeDelay={120} withinPortal>
 			<HoverCard.Target>
 				{/* The leading slot of every file row; folder rows reserve the same width. */}
 				<span
@@ -1002,11 +985,32 @@ function AttributionHoverCard({
 					{children}
 				</span>
 			</HoverCard.Target>
+			{/* Dropdown children mount only while the card is open, so a closed row holds no
+			    query observer and closing the card aborts its in-flight read. */}
 			<HoverCard.Dropdown p="xs">
-				{open && <AttributionDetails target={target} filePath={filePath} section={section} t={t} />}
+				<ForegroundAttributionDetails target={target} filePath={filePath} section={section} t={t} />
 			</HoverCard.Dropdown>
 		</HoverCard>
 	);
+}
+
+/** A hidden page unmounts the query (aborting its read) and remounts it on return. */
+function ForegroundAttributionDetails(props: {
+	target: GitTarget;
+	filePath: string;
+	section: GitFileSection;
+	t: Translate;
+}) {
+	const [hidden, setHidden] = useState(false);
+	useEffect(
+		() =>
+			observePageLifecycle({
+				onHidden: () => setHidden(true),
+				onForeground: () => setHidden(false),
+			}),
+		[],
+	);
+	return hidden ? null : <AttributionDetails {...props} />;
 }
 
 /**
@@ -1029,7 +1033,14 @@ function AttributionDetails({
 	if (!query.data) {
 		if (query.isError)
 			return (
-				<Group gap="xs" wrap="nowrap" justify="space-between">
+				// The dropdown is portalled, but React still bubbles click and Enter/Space to the
+				// row, whose handlers would open the diff instead of retrying.
+				<Group
+					gap="xs"
+					wrap="nowrap"
+					justify="space-between"
+					onKeyDown={(event) => event.stopPropagation()}
+				>
 					<Text size="xs" c="dimmed">
 						{t("attributionLoadFailedShort")}
 					</Text>
@@ -1037,7 +1048,6 @@ function AttributionDetails({
 						size="compact-xs"
 						variant="subtle"
 						onClick={(event) => {
-							// The dropdown is portalled, but React still bubbles to the row's open-diff.
 							event.stopPropagation();
 							void query.refetch();
 						}}
