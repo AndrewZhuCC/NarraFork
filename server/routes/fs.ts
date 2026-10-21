@@ -97,7 +97,8 @@ fsRoutes.get("/browse", (c) => {
 
 	const absPath = resolve(rawPath);
 	if (!existsSync(absPath)) {
-		throw new ValidationError(`Path does not exist: ${absPath}`);
+		// Distinct code: the directory browser steps up to an existing parent on it.
+		throw new ValidationError(`Path does not exist: ${absPath}`, "PATH_NOT_FOUND");
 	}
 
 	try {
