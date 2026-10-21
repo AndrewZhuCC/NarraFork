@@ -1013,18 +1013,25 @@ narrator_projection_overrides
 
 各策略的线上字段（占位工具的形状、追加方式、模型调用新工具时的 id 与结果回传）以参考实现为准，实现前逐一核实。
 
-**在 model catalog 里声明**
-- 模型卡增加一个元数据键，暂名 `tool_loading_modes`，值是按优先级排列的策略 id 列表，一个模型可以声明多种。例如：
-  - Claude：`["anthropic_tool_addition", "custom_injection"]`
-  - DeepSeek：`["anthropic_deferred_tail", "custom_injection"]`
-  - GPT：`["openai_additional_tools"]`
-- 走 catalog 现有的「上游 + 本地覆盖」机制（`shared/model-catalog/card.ts` 的 `metadata` 与 provenance），用户可以在本地改。
-- 没有声明的模型只用策略 5。
+**默认按模型名启用，用户可以禁用**
+
+为减少 catalog 的维护量，默认值按模型名决定，不要求 catalog 逐个声明（D21）：
+
+| 模型名包含（不区分大小写） | 默认启用 |
+|---|---|
+| `gpt` | `openai_additional_tools` |
+| `claude` | `anthropic_tool_addition` |
+| `deepseek` | `anthropic_deferred_tail` |
+| 其他 | `custom_injection` |
+
+- 匹配用去掉 provider 前缀之后的裸模型名，例如 `nug:claude-…` 按 `claude-…` 判断。去前缀的规则与 strict 判定共用同一个函数（§7.4）。
+- 优先级：用户配置 > catalog 显式声明（模型卡元数据键，暂名 `tool_loading_modes`，按优先级排列，可多种）> 按名称的默认值。
+- 用户可以按模型禁用其中的某种方案，也可以整体关闭；禁用后只剩策略 5。配置走 catalog 现有的本地覆盖机制（`shared/model-catalog/card.ts` 的 `metadata` 与 provenance）。
 
 **选择规则**
 - 每种策略有它要求的协议：策略 1、2 要求 `anthropic-messages`，策略 3 要求 `openai-responses`，策略 4 与 5 不限。
 - 加载时，在模型声明的列表里按顺序取第一个与当前 target 协议相容的策略。
-- 都不相容就用策略 5。
+- 都不相容就用策略 5。例如经 Chat Completions 协议访问的 Claude 模型，默认的 `anthropic_tool_addition` 不相容，会落到策略 5；需要的话可以在本地覆盖里给它加上 `custom_injection`。
 - 同一个模型经不同通道（例如 NUG 的 anthropic 通道与 responses 通道）可能走不同协议，所以选择发生在投影时，按当时的 target 判断，而不是在加载时写死。
 
 **存储与投影**
@@ -1354,6 +1361,7 @@ narrator_projection_overrides
 | D18 | mailbox 语义编辑 | 未被接收方采纳的原地改写；已采纳的追加修订通知 | **已定** |
 | D19 | 是否提供「按最新数据重建上下文」的手动操作 | 待定 | **待定** |
 | D20 | 纪元内加载工具 | 五种策略，由模型在 catalog 里声明（可多种），按当前协议选用；都不适用时直接改 tools[] 并开启新纪元；新纪元完全重新构建（§7.8） | **已定** |
+| D21 | 工具加载策略的默认值 | 按裸模型名匹配：含 gpt 用 `openai_additional_tools`，含 claude 用 `anthropic_tool_addition`，含 deepseek 用 `anthropic_deferred_tail`，其他用 `custom_injection`；catalog 声明可覆盖，用户可禁用（§7.8） | **已定** |
 
 ## 附录 A：现有块 type 到 kind 的映射
 
