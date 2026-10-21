@@ -26,6 +26,7 @@ import {
 	useSetModelWindow,
 } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
+import { formatLocaleNumber } from "../../lib/intl-format";
 
 /** Below this (but still saveable) the UI shows a non-blocking warning. */
 export const CONTEXT_WINDOW_WARN_BELOW = 4_096;
@@ -165,7 +166,7 @@ function WindowEditor({
 			</Text>
 			<Text size="xs" c="dimmed">
 				{t("contextWindowCurrent", {
-					value: info.contextWindow.toLocaleString(),
+					value: formatLocaleNumber(info.contextWindow),
 					source: t(`contextWindowSource.${info.source}`),
 				})}
 			</Text>
@@ -212,7 +213,7 @@ function WindowEditor({
 			{scope === "model" && info.own !== undefined && (
 				<Alert color="yellow" p="xs">
 					<Text size="xs">
-						{t("contextWindowOwnShadowsModel", { value: info.own.toLocaleString() })}
+						{t("contextWindowOwnShadowsModel", { value: formatLocaleNumber(info.own) })}
 					</Text>
 				</Alert>
 			)}
