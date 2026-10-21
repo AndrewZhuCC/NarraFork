@@ -1,11 +1,8 @@
-import { Stack, Text, Title } from "@mantine/core";
+import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-import { LiveNow } from "../components/dashboard/LiveNow";
-import { NeedsAttention } from "../components/dashboard/NeedsAttention";
-import { QuickActions } from "../components/dashboard/QuickActions";
-import { RecentNarrators } from "../components/dashboard/RecentNarrators";
-import { StatsRow } from "../components/dashboard/StatsRow";
+import { DashboardComposer } from "../components/dashboard/DashboardComposer";
+import { DashboardSessions, useDashboardSessions } from "../components/dashboard/DashboardSessions";
 
 export const Route = createFileRoute("/")({
 	component: DashboardPage,
@@ -13,26 +10,20 @@ export const Route = createFileRoute("/")({
 
 function DashboardPage() {
 	const { t } = useTranslation("dashboard");
+	const sessions = useDashboardSessions();
 
 	return (
-		<Stack>
-			<div>
-				<Title>{t("welcome")}</Title>
-				<Text c="dimmed">{t("subtitle")}</Text>
-			</div>
+		<Stack maw={760} w="100%" mx="auto" gap={40} pt={{ base: "md", sm: 56 }} pb="xl">
+			<Stack gap="md">
+				<Title order={2} ta="center" fw={600}>
+					{t("heading")}
+				</Title>
+				{/* 输入即开始：选目录/模型，回车创建独立会话并发送首条消息 */}
+				<DashboardComposer recentDirectories={sessions.recentDirectories} />
+			</Stack>
 
-			{/* ① 需要处理 — 等待权限 / 失败错误，行动导向置顶 */}
-			<NeedsAttention />
-
-			{/* ② 正在运行 — 当前工作中的叙述者卡片条 */}
-			<LiveNow />
-
-			{/* ③ 全局概览统计行 */}
-			<StatsRow />
-
-			{/* ④ 快速入口 + 最近活跃叙述者 */}
-			<QuickActions />
-			<RecentNarrators />
+			{/* 需要用户处理的会话置顶，其次是正在运行的会话 */}
+			<DashboardSessions data={sessions} />
 		</Stack>
 	);
 }

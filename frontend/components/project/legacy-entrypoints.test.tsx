@@ -64,8 +64,7 @@ mock.module("./ProjectAccessPanel", () => ({
 const { ProjectCompatibilityPanel } = await import("./ProjectCompatibilityPanel");
 const { LegacyResourceRecovery } = await import("./LegacyResourceRecovery");
 const { api } = await import("../../lib/api");
-const { QuickActions } = await import("../dashboard/QuickActions");
-const { StatsRow } = await import("../dashboard/StatsRow");
+const { DashboardSessions } = await import("../dashboard/DashboardSessions");
 const { NarratorListCard } = await import("../narrator/list/NarratorListCard");
 
 afterEach(() => {
@@ -173,17 +172,29 @@ describe("ordinary entry points and retained legacy sessions", () => {
 	});
 	test("dashboard no longer promotes project creation or project counts", () => {
 		const html = render(
-			<>
-				<QuickActions />
-				<StatsRow />
-			</>,
+			<DashboardSessions
+				data={
+					{
+						groups: {
+							attention: [],
+							running: [],
+							recent: [
+								{ narratorId: "recent-1", title: "recent", cwd: null, status: "idle", time: null },
+							],
+						},
+						recentDirectories: [],
+						attention: { isError: false, hasNextPage: false },
+						isLoading: false,
+						// biome-ignore lint/suspicious/noExplicitAny: only the fields the view reads
+					} as any
+				}
+			/>,
 		);
 		expect(html).not.toContain('href="/projects"');
 		expect(html).not.toContain("newProject");
 		expect(html).not.toContain("activeProjects");
 		expect(html).toContain('href="/narrators"');
-		expect(html).toContain("newSession");
-		expect(html).toContain('href="/narrators?create=true"');
+		expect(html).toContain('href="/narrators/recent-1"');
 	});
 	test("legacy chapter-bound cards remain visible on desktop/mobile and archived deep links target the narrator", () => {
 		const sideEffect = mock(() => {});
