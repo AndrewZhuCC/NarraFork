@@ -1,9 +1,22 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { invalidateUserCache } from "@server/middleware/auth";
 import {
 	createUsageHistoryRoutes,
 	type UsageHistoryRouteService,
 } from "@server/routes/usage-history";
+import type { AuthSessionStore } from "@server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "@server/services/auth/store";
 import { Hono } from "hono";
+
+/**
+ * The "real admin middleware" cases below use the default `requireAdmin`, which authorizes
+ * against the LIVE role read through the session store, never the token's `role` claim. The
+ * injected `requireAuth` only sets `c.get("user")`, so this seam makes the store report each
+ * acting user's role (admin → allowed, user → 403). Without it the lookup would hit the real
+ * (empty) database and 401 USER_GONE instead of 403.
+ */
+const ADMIN_ACTOR_IDS = new Set(["administrator"]);
+const SEEN_ACTOR_IDS = [...ADMIN_ACTOR_IDS, "ordinary"];
 
 const listUsageHistoryCursor = mock(async () => ({
 	records: [],
@@ -46,8 +59,23 @@ app.onError((error, c) => {
 app.route("/", usageHistoryRoutes);
 
 beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: ADMIN_ACTOR_IDS.has(id) ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 	listUsageHistoryCursor.mockClear();
 	listUsageHistory.mockClear();
+});
+
+afterEach(() => {
+	setAuthStores(undefined);
+	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 });
 
 function encodeRawCursor(createdAt: string): string {

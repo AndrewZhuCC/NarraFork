@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { extname } from "node:path";
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { isSecretPlatformPath, SECRET_PATH_TOOL_REFUSAL } from "../../fs-secret-paths";
 import { toolSpecPathError } from "../../spec-uri";
 import { imageBytesToBase64, imageToBase64, sanitizeParsedDimensions } from "../../uploads";
 import type { ExecutionBackend } from "../execution/backend";
@@ -198,6 +199,13 @@ export const readTool: ToolDefinition = {
 			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
+
+		// Application authorization guard, not an OS sandbox: refuse platform secrets on
+		// the NarraFork host in EVERY permission mode (bypassPermissions included). The
+		// real resolved path is checked so a symlink into ~/.narrafork is caught too.
+		if (backend.kind === "local" && isSecretPlatformPath(ioPath)) {
+			return { output: SECRET_PATH_TOOL_REFUSAL, isError: true };
+		}
 
 		// ── Directory handling: list contents instead of erroring ──
 		try {

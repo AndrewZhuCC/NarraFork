@@ -1126,6 +1126,66 @@ function classifyPackageRunner(tokens: string[], runner: string): PackageRunnerC
 }
 
 /**
+ * curl 的上传/外传长选项：读取本地文件或把本地数据发往远端。
+ * `--data-raw` 不读文件但仍把数据外发，保守起见同样计入。
+ */
+const CURL_UPLOAD_LONG_FLAGS = new Set([
+	"--form",
+	"--form-string",
+	"--data",
+	"--data-ascii",
+	"--data-binary",
+	"--data-raw",
+	"--data-urlencode",
+	"--upload-file",
+]);
+
+/** wget 的上传/外传长选项：读取本地文件或把本地数据 POST 到远端。 */
+const WGET_UPLOAD_LONG_FLAGS = new Set([
+	"--post-file",
+	"--post-data",
+	"--body-file",
+	"--body-data",
+]);
+
+/**
+ * curl 是否把本地文件/数据发往远端。
+ *
+ * 纯 GET 下载（无上传参数）视为安全；任何 `-F`/`--form`、`-d`/`--data*`、
+ * `-T`/`--upload-file`，或 `@file` 文件引用都算网络外传，交回危险反思/权限流程。
+ * 短选项按字符拆分，覆盖 `-d@file`、`-sT` 这类合并/附着形式。
+ */
+function classifyCurlDanger(tokens: string[]): string | null {
+	for (const token of tokens.slice(1)) {
+		if (token.startsWith("--")) {
+			const name = token.split("=")[0];
+			if (CURL_UPLOAD_LONG_FLAGS.has(name))
+				return `curl ${name} (sends local data to a remote host)`;
+		} else if (token.startsWith("-") && token.length > 1) {
+			for (const ch of token.slice(1)) {
+				if (ch === "F" || ch === "d" || ch === "T")
+					return `curl -${ch} (sends local data to a remote host)`;
+			}
+		} else if (/(?:^|[=,])@/.test(token)) {
+			// `@/path` / `name=@/path` reads a local file into the request body/form.
+			return "curl @file (reads a local file into the request)";
+		}
+	}
+	return null;
+}
+
+/** wget 是否把本地文件/数据 POST 到远端。纯下载安全；上传参数交回权限流程。 */
+function classifyWgetDanger(tokens: string[]): string | null {
+	for (const token of tokens.slice(1)) {
+		const name = token.startsWith("--") ? token.split("=")[0] : token;
+		if (WGET_UPLOAD_LONG_FLAGS.has(name)) return `wget ${name} (sends local data to a remote host)`;
+		if (!token.startsWith("-") && /(?:^|[=,])@/.test(token))
+			return "wget @file (reads a local file into the request)";
+	}
+	return null;
+}
+
+/**
  * 条件安全命令 — 在白名单中但某些参数组合是危险的。
  * key: 命令名, value: 危险参数检测函数
  */
@@ -1412,9 +1472,10 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			// tee 总是写文件，标记为危险
 			return "tee (writes to files)";
 		},
-		// curl/wget — 下载本身不危险，但 pipe 到 shell 是（在 pipeline 检测中处理）
-		curl: (_tokens) => null,
-		wget: (_tokens) => null,
+		// curl/wget — 纯下载不危险，但上传本地文件/数据是网络外传（pipe 到 shell 另在
+		// pipeline 检测中处理）。
+		curl: (tokens) => classifyCurlDanger(tokens),
+		wget: (tokens) => classifyWgetDanger(tokens),
 		// tar 可以覆盖文件
 		tar: (tokens) => {
 			if (

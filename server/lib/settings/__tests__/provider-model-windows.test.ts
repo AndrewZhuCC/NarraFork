@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelWindowsResponse } from "@shared/model-catalog/schema/api";
 import { Hono } from "hono";
+import { invalidateUserCache } from "../../../middleware/auth";
 import { modelCatalogRoutes } from "../../../routes/model-catalog";
+import type { AuthSessionStore } from "../../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../services/auth/store";
 import {
 	getEffectiveModelCard,
 	getEffectiveModelProfile,
@@ -31,7 +34,18 @@ import {
  */
 const path = join(narraforkDir, "settings.json");
 const original = readFileSync(path, "utf8");
+beforeEach(() => {
+	// assertAdmin reads the live store role, not the token claim, so the acting
+	// admin must be reported as admin by the session store.
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({ id, role: "admin", tokenVersion: 0 }),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+});
 afterEach(() => {
+	setAuthStores(undefined);
+	invalidateUserCache("window-test");
 	deleteNugCachedModels("window-nug");
 	writeFileSync(path, original);
 	reloadSettings();

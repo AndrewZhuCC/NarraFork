@@ -187,6 +187,52 @@ describe("escaping the home with traversal", () => {
 	});
 });
 
+describe("Windows / edge-case spellings of a secret filename", () => {
+	test.each([
+		["SETTINGS.JSON", "an all-uppercase spelling"],
+		["Settings.Json", "a mixed-case spelling"],
+		["settings.json.", "a trailing dot the Win32 layer discards"],
+		["settings.json ", "a trailing space the Win32 layer discards"],
+		["settings.json::$DATA", "the default NTFS data stream"],
+		["settings.json:hidden", "a named alternate data stream"],
+	])("refuses %s (%s)", (name) => {
+		expect(isSecretPlatformPath(join(HOME, name), HOME)).toBe(true);
+	});
+
+	test.each([
+		["NARRAFORK.DB", "an uppercase database spelling"],
+		["narrafork.db-wal::$DATA", "a WAL alternate data stream"],
+		["Narrafork.Db.bak", "a mixed-case backup"],
+	])("refuses %s (%s)", (name) => {
+		expect(isSecretPlatformPath(join(HOME, name), HOME)).toBe(true);
+	});
+
+	test("still allows an ordinary file whose name merely starts like a secret", () => {
+		// `settings.jsonc` is not `settings.json`; stripping must not fold it onto the secret.
+		expect(isSecretPlatformPath(join(HOME, "settings.jsonc"), HOME)).toBe(false);
+		expect(isSecretPlatformPath(join(HOME, "settings.json.backup-notes.md"), HOME)).toBe(false);
+	});
+});
+
+describe("symlinks whose real target is a credential file", () => {
+	test("a link that resolves into ~/.narrafork is caught by its real path", () => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-secret-symlink-"));
+		const home = join(temporary, "platform");
+		mkdirSync(home, { recursive: true });
+		const secret = join(home, "settings.json");
+		writeFileSync(secret, '{"auth":{"jwtSecret":"x"}}');
+		const innocentLink = join(temporary, "harmless-config.json");
+		try {
+			symlinkSync(secret, innocentLink, "file");
+			// Lexically the link is outside the home and innocuously named; the physical
+			// (realpath-resolved) check is what refuses it.
+			expect(isSecretPlatformPath(innocentLink, home)).toBe(true);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("third-party credential stores in the user's home", () => {
 	test.each([
 		".ssh/id_rsa",

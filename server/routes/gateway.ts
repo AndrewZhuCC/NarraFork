@@ -81,6 +81,12 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 		return c.json({ error: "Webhook adapter not configured" }, 404);
 	}
 
+	// Fail closed: a missing/empty secret means every request would pass an HMAC
+	// check computed with an empty key. Refuse rather than accept unauthenticated.
+	if (!whConfig.secret) {
+		return c.json({ error: "Webhook secret not configured" }, 503);
+	}
+
 	const rawBody = await c.req.text();
 
 	// Verify HMAC signature

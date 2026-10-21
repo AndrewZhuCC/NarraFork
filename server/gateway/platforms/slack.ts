@@ -175,11 +175,9 @@ export class SlackAdapter extends BaseAdapter {
 		const userId = message.user ?? "";
 		const username = message.user ?? "unknown";
 
-		// Check allowlist
-		if (this.config.allowedUsers?.length) {
-			if (!this.config.allowedUsers.includes(userId)) {
-				return;
-			}
+		// Check allowlist — fail closed: an empty/unset allowlist denies all users.
+		if (!this.config.allowedUsers?.length || !this.config.allowedUsers.includes(userId)) {
+			return;
 		}
 
 		// Strip bot mention from text
