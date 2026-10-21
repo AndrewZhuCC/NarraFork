@@ -17,6 +17,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0018_merge_upstream_090",
 	"0204_merge_selfuse_092",
 	"0205_merge_upstream_093",
+	"0212_file_write_redesign",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -27,6 +28,7 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0018_merge_upstream_090",
 	"0204_merge_selfuse_092",
 	"0205_merge_upstream_093",
+	"0212_file_write_redesign",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
 const MERGE_090_NEW_TABLES = ["user_git_identities", "narrator_git_identity_bindings"];
@@ -55,6 +57,19 @@ const MERGE_093_ADDED_COLUMNS: Record<string, string[]> = {
 	api_requests: ["diagnostics_json", "recording_request_id"],
 	narrator_drafts: ["composer_document"],
 	narrator_messages: ["composer_document"],
+};
+const MERGE_095_TAGS = [
+	"0209_unified-runtime-registration",
+	"0210_fresh_mephisto",
+	"0211_editor_operation_recovery",
+	"0212_file_write_redesign",
+];
+const MERGE_095_ADDED_COLUMNS: Record<string, string[]> = {
+	narrators: ["runtime_registration_json", "policy_source_narrator_id"],
+	narrator_drafts: ["previous_json"],
+	file_change_operations: ["workspace_lease_id", "editor_raw_snapshot_revision"],
+	file_change_effects: ["disk_outcome"],
+	revert_operation_files: [],
 };
 const LEGACY_GIT_IDENTITY_FILTER = `u.git_username IS NOT NULL AND trim(u.git_username) <> ''
 	AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
@@ -203,6 +218,14 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0212_file_write_redesign") {
+		return Object.fromEntries(
+			Object.entries(MERGE_095_ADDED_COLUMNS).map(([table, added]) => [
+				table,
+				tableDigest(db, table, excludeNew ? new Set(added) : new Set()),
+			]),
+		);
+	}
 	if (targetTag === "0205_merge_upstream_093") {
 		return Object.fromEntries(
 			Object.entries(MERGE_093_ADDED_COLUMNS).map(([table, added]) => [
@@ -356,6 +379,22 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0212_file_write_redesign") {
+		for (const [table, added] of Object.entries(MERGE_095_ADDED_COLUMNS)) {
+			for (const column of added) shape[`${table}.${column}`] = columnShape(db, table, column);
+		}
+		for (const table of ["file_change_effects", "revert_operation_files"]) {
+			shape[table] = tableSchemaShape(db, table);
+		}
+		const index = db.query(
+			"SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_narrators_policy_source'",
+		).get();
+		if (!index) throw new Error("Missing index: idx_narrators_policy_source");
+		shape.policySourceIndex = index;
+		shape.policySourceForeignKey = (
+			db.query("PRAGMA foreign_key_list(narrators)").all() as Array<{ from: string }>
+		).filter((key) => key.from === "policy_source_narrator_id");
+	}
 	if (targetTag === "0205_merge_upstream_093") {
 		for (const table of MERGE_093_NEW_TABLES) shape[table] = tableSchemaShape(db, table);
 		for (const [table, added] of Object.entries(MERGE_093_ADDED_COLUMNS)) {
@@ -540,17 +579,22 @@ async function main() {
 		const pending = migrationsWithTags.filter((migration) => !beforeLedger.has(migration.hash));
 		const target = pending.at(-1);
 		const merge092Chain = canonical(pending.map((migration) => migration.tag)) === canonical(MERGE_092_TAGS);
+		const merge095Chain =
+			canonical(pending.map((migration) => migration.tag)) === canonical(MERGE_095_TAGS);
 		const merge083Pair =
 			pending.length === 2 &&
 			pending[0].tag === "0016_high_shiva" &&
 			target?.tag === "0017_merge_opensource_083";
 		if (
-			(!merge083Pair && !merge092Chain && pending.length !== 1) ||
+			(!merge083Pair && !merge092Chain && !merge095Chain && pending.length !== 1) ||
 			!target?.tag ||
 			!ALLOWED_TARGET_TAGS.has(target.tag) ||
-			(target.tag === "0204_merge_selfuse_092" && !merge092Chain)
-			) {
-			throw new Error("Validation requires a reviewed single migration, 0016 + 0017 pair, or complete 0196–0204 chain");
+			(target.tag === "0204_merge_selfuse_092" && !merge092Chain) ||
+			(target.tag === "0212_file_write_redesign" && !merge095Chain)
+		) {
+			throw new Error(
+				"Validation requires a reviewed migration, pair, or complete migration chain",
+			);
 		}
 		const affectedForUpgrade = (excludeNew: boolean) => ({
 			...affectedSummary(db, target.tag, excludeNew),

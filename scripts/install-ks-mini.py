@@ -149,7 +149,7 @@ def main():
     migrations = config['migrations']
     assert isinstance(migrations, list) and 0 < len(migrations) < 1000
     assert len({item['name'] for item in migrations}) == len(migrations)
-    assert all(re.fullmatch(r'[0-9]{4}_[a-z0-9_]+\.sql', item['name']) and
+    assert all(re.fullmatch(r'[0-9]{4}_[a-z0-9_-]+\.sql', item['name']) and
                re.fullmatch(r'[0-9a-f]{64}', item['sha256']) for item in migrations)
     validator = None
     migrations_dir = bundle / 'drizzle'
@@ -257,6 +257,8 @@ def main():
             ['0014_blue_tomorrow_man.sql'], ['0015_nifty_magma.sql'],
             ['0016_high_shiva.sql'], ['0017_merge_opensource_083.sql'],
             ['0018_merge_upstream_090.sql'], ['0205_merge_upstream_093.sql'],
+            ['0209_unified-runtime-registration.sql', '0210_fresh_mephisto.sql',
+             '0211_editor_operation_recovery.sql', '0212_file_write_redesign.sql'],
             ['0016_high_shiva.sql', '0017_merge_opensource_083.sql'],
             ['0196_narrator_model_history_revision.sql', '0197_fluffy_the_professor.sql',
              '0198_broken_viper.sql', '0199_sudden_richard_fisk.sql', '0200_faithful_major_mapleleaf.sql',

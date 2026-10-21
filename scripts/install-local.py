@@ -231,6 +231,8 @@ def main():
             ['0014_blue_tomorrow_man'], ['0015_nifty_magma'], ['0016_high_shiva'],
             ['0017_merge_opensource_083'], ['0018_merge_upstream_090'],
             ['0205_merge_upstream_093'],
+            ['0209_unified-runtime-registration', '0210_fresh_mephisto',
+             '0211_editor_operation_recovery', '0212_file_write_redesign'],
             ['0196_narrator_model_history_revision', '0197_fluffy_the_professor',
              '0198_broken_viper', '0199_sudden_richard_fisk', '0200_faithful_major_mapleleaf',
              '0201_mute_white_tiger', '0202_personal_knowledge_injection',
