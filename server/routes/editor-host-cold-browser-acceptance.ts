@@ -265,6 +265,30 @@ export async function editorHostColdBrowserAcceptance(options: {
 		});
 		expect(pendingArmed.ok).toBe(true);
 		await pendingArmed.body?.cancel();
+		// Capture the commit receipt inside the page. Reading it back over CDP
+		// (`Network.getResponseBody`) is unreliable here: Chrome may evict the buffered
+		// body while the save's multi-MiB traffic runs ("No data found for resource"),
+		// even when the read starts as soon as the response arrives.
+		await page.evaluate(() => {
+			const target = window as unknown as {
+				fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+				commitReceipt?: Promise<{ ok: boolean; receipt: unknown }>;
+			};
+			const original = target.fetch.bind(window);
+			target.fetch = async (input, init) => {
+				const response = await original(input, init);
+				const url = input instanceof Request ? input.url : String(input);
+				const method = (
+					init?.method ?? (input instanceof Request ? input.method : "GET")
+				).toUpperCase();
+				if (url.endsWith("/commit") && method === "POST" && !target.commitReceipt) {
+					target.fetch = original;
+					const copy = response.clone();
+					target.commitReceipt = copy.json().then((receipt) => ({ ok: copy.ok, receipt }));
+				}
+				return response;
+			};
+		});
 		await page.evaluate(() =>
 			(window as unknown as RawWindow).rawFixture.rawBatch([
 				{
@@ -279,23 +303,18 @@ export async function editorHostColdBrowserAcceptance(options: {
 			diskOutcome: string;
 			historyStatus: string;
 		};
-		// Read the body as soon as the response arrives. Chrome may evict a buffered body
-		// while the save's later multi-MiB traffic runs ("No data found for resource").
-		const [saveResult, savedWithHistoryGap] = await Promise.all([
-			page
-				.waitForResponse(
-					(response) =>
-						response.url().endsWith("/commit") && response.request().method() === "POST",
-					{ timeout: 30_000 },
-				)
-				.then(async (response) => ({
-					ok: response.ok(),
-					receipt: (await response.json()) as SaveReceipt,
-				})),
-			page.evaluate(() => (window as unknown as RawWindow).rawFixture.saveRaw()),
-		]);
+		const savedWithHistoryGap = await page.evaluate(() =>
+			(window as unknown as RawWindow).rawFixture.saveRaw(),
+		);
+		const saveResult = await page.evaluate(() => {
+			const captured = (
+				window as unknown as { commitReceipt?: Promise<{ ok: boolean; receipt: unknown }> }
+			).commitReceipt;
+			if (!captured) throw new Error("save did not POST a commit");
+			return captured;
+		});
 		expect(saveResult.ok).toBe(true);
-		const saveReceipt = saveResult.receipt;
+		const saveReceipt = saveResult.receipt as SaveReceipt;
 		expect(saveReceipt).toMatchObject({
 			status: "saved",
 			diskOutcome: "applied",

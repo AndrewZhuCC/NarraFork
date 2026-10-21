@@ -6,8 +6,11 @@ import { logger } from "./logger";
  * Besides the snapshot for the admin page, every late tick is kept as a stall interval so a slow
  * request can tell whether its time went to awaiting I/O/workers or to a blocked main thread.
  * A blocked main thread may be the request itself or anything else running at that moment; the
- * lag warning therefore lists the requests that overlapped the stall. A synchronous blocker has
- * usually finished before the late tick fires, so recently finished requests count too.
+ * lag warning therefore lists the requests that could have caused the stall: nothing else can
+ * start while the thread is blocked, so a request that started in the stall's second half was
+ * served after it. A synchronous blocker has usually finished before the late tick fires,
+ * so recently finished requests count too. An empty list points at non-HTTP work (timers,
+ * narrator execution). Long-lived requests that were merely awaiting can still appear.
  */
 
 export interface EventLoopLagSnapshot {
@@ -108,11 +111,14 @@ export function getEventLoopLagSnapshot(): EventLoopLagSnapshot {
 	return { ...state };
 }
 
+/** Requests that overlap the stall and started no later than its first half. */
 function requestsDuring(start: number, now: number): string[] {
+	const latestStart = start + (now - start) / 2;
 	return [
 		...finished.filter((request) => request.endedAt >= start),
 		...[...inFlight.values()].map((request) => ({ ...request, endedAt: now })),
 	]
+		.filter((request) => request.startedAt <= latestStart)
 		.slice(-MAX_REQUESTS_LOGGED)
 		.map((request) => `${request.label} (${Math.round(request.endedAt - request.startedAt)}ms)`);
 }
@@ -129,14 +135,20 @@ export function trackInFlight(label: string): () => void {
 	};
 }
 
-/** How much of `[start, end]` (`performance.now()` clock) the main thread spent stalled. */
+/**
+ * How much of `[start, end]` (`performance.now()` clock) the main thread spent stalled.
+ *
+ * Includes a stall still in progress: a request that blocked the thread itself ends before the
+ * overdue tick records it, so the time since the tick was due counts as stalled as well.
+ */
 export function stallTimeBetween(
 	start: number,
 	end: number,
 ): { stalledMs: number; maxStallMs: number } {
 	let stalledMs = 0;
 	let maxStallMs = 0;
-	for (const stall of stalls) {
+	const pending = timer && end - expectedAt >= STALL_MIN_MS ? [{ start: expectedAt, end }] : [];
+	for (const stall of [...stalls, ...pending]) {
 		const overlap = Math.min(end, stall.end) - Math.max(start, stall.start);
 		if (overlap <= 0) continue;
 		stalledMs += overlap;
