@@ -46,6 +46,8 @@ import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
+import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
+import type { QuotaPanelView } from "../model/quota-panel-view";
 import { useOpencodeProviderBadges } from "../model/use-opencode-provider-badges";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
@@ -219,6 +221,15 @@ export interface NarratorInteractionStatusBarProps {
 		 */
 		opencode?: {
 			usage: OpencodeUsageCache | null | undefined;
+			waitingForQuota: boolean;
+			waitingText: string | null;
+		};
+		/**
+		 * Windowed allowance of another provider (Kimi, Command Code), shown with the
+		 * same progress-bar indicator as OpenCode Go. `undefined` when not applicable.
+		 */
+		panel?: {
+			view: QuotaPanelView | null;
 			waitingForQuota: boolean;
 			waitingText: string | null;
 		};
@@ -548,6 +559,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									usage={quota.opencode.usage}
 									waitingForQuota={quota.opencode.waitingForQuota}
 									waitingText={quota.opencode.waitingText}
+									isMobile={isMobileViewport}
+								/>
+							)}
+							{quota.panel && !isWorkspacePreview && (
+								<QuotaPanelIndicator
+									view={quota.panel.view}
+									waitingForQuota={quota.panel.waitingForQuota}
+									waitingText={quota.panel.waitingText}
 									isMobile={isMobileViewport}
 								/>
 							)}

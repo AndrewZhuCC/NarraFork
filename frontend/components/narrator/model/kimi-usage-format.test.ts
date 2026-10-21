@@ -1,11 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { KimiUsageCache } from "../../../lib/api/types";
-import {
-	formatKimiBarText,
-	formatKimiDetailsText,
-	isKimiProviderBaseUrl,
-	type KimiTFunction,
-} from "./kimi-usage-format";
+import { buildKimiQuotaView, isKimiProviderBaseUrl, type KimiTFunction } from "./kimi-usage-format";
 
 // Identity-style t: returns the key with interpolated params for assertions.
 const t: KimiTFunction = (key, options) => {
@@ -25,82 +20,79 @@ const BASE: KimiUsageCache = {
 	error: null,
 };
 
-describe("formatKimiBarText", () => {
-	test("shows the 5h window remaining percentage", () => {
-		expect(formatKimiBarText(BASE, t)).toBe("kimi.fiveHourShort[percent=29]");
+describe("buildKimiQuotaView", () => {
+	test("maps each reported window to a progress bar, limited by the least left", () => {
+		const view = buildKimiQuotaView(BASE, t);
+		expect(view?.title).toBe("kimi.title");
+		expect(view?.windows.map((w) => [w.id, w.usedPercent, w.remainingPercent])).toEqual([
+			["fiveHour", 71, 29],
+			["weekly", 34, 66],
+		]);
+		expect(view?.windows[0]?.used).toBe(71);
+		expect(view?.windows[0]?.limit).toBe(100);
+		expect(view?.windows[0]?.resetAt).toBe(Date.parse("2026-08-21T13:35:46.841Z"));
+		expect(view?.limiting?.id).toBe("fiveHour");
+		expect(view?.level).toBe("ok");
+		expect(view?.failed).toBe(false);
 	});
 
-	test("derives the percentage from used/limit when remaining is absent", () => {
+	test("derives used from remaining when upstream omits it", () => {
 		const usage: KimiUsageCache = {
 			...BASE,
-			fiveHour: { used: 71, limit: 100, remaining: null, resetTime: null },
+			fiveHour: { used: null, limit: 100, remaining: 8, resetTime: null },
 		};
-		expect(formatKimiBarText(usage, t)).toBe("kimi.fiveHourShort[percent=29]");
+		const window = buildKimiQuotaView(usage, t)?.windows[0];
+		expect(window?.remainingPercent).toBe(8);
+		expect(window?.level).toBe("critical");
 	});
 
-	test("clamps the percentage into 0-100", () => {
+	test("a window with no usable limit has no percentage", () => {
 		const usage: KimiUsageCache = {
 			...BASE,
-			fiveHour: { used: 150, limit: 100, remaining: null, resetTime: null },
-		};
-		expect(formatKimiBarText(usage, t)).toBe("kimi.fiveHourShort[percent=0]");
-	});
-
-	test("falls back to used/limit when the percentage cannot be computed", () => {
-		const usage: KimiUsageCache = {
-			...BASE,
-			fiveHour: { used: null, limit: 100, remaining: null, resetTime: null },
-		};
-		expect(formatKimiBarText(usage, t)).toBe("kimi.fiveHourRatio[used=?,limit=100]");
-	});
-
-	test("falls back to unavailable when only an error exists", () => {
-		const usage: KimiUsageCache = { ...BASE, fiveHour: null, weekly: null, error: "HTTP 401" };
-		expect(formatKimiBarText(usage, t)).toBe("kimi.unavailable");
-	});
-
-	test("returns null when there is nothing to show", () => {
-		const usage: KimiUsageCache = { ...BASE, fiveHour: null, weekly: null, error: null };
-		expect(formatKimiBarText(usage, t)).toBeNull();
-	});
-});
-
-describe("formatKimiDetailsText", () => {
-	test("lists 5h, weekly and monthly windows one per line", () => {
-		const usage: KimiUsageCache = {
-			...BASE,
-			monthly: { used: 500, limit: 1000, remaining: 500, resetTime: null },
-		};
-		const lines = formatKimiDetailsText(usage, t).split("\n");
-		expect(lines).toHaveLength(3);
-		expect(lines[0]).toContain("kimi.window5h");
-		expect(lines[0]).toContain("used=71");
-		expect(lines[0]).toContain("kimi.resetSuffix");
-		expect(lines[1]).toContain("kimi.windowWeekly");
-		expect(lines[2]).toContain("kimi.windowMonthly");
-		expect(lines[2]).not.toContain("kimi.resetSuffix");
-	});
-
-	test("appends extra windows and the fetch error", () => {
-		const usage: KimiUsageCache = {
-			...BASE,
+			fiveHour: { used: 5, limit: null, remaining: null, resetTime: "not-a-date" },
 			weekly: null,
-			extraWindows: [{ label: "30min", used: 3, limit: 50, remaining: 47, resetTime: null }],
-			error: "timeout",
 		};
-		const lines = formatKimiDetailsText(usage, t).split("\n");
-		expect(lines).toHaveLength(3);
-		expect(lines[1]).toContain("label=30min");
-		expect(lines[2]).toBe("kimi.fetchError[error=timeout]");
+		const window = buildKimiQuotaView(usage, t)?.windows[0];
+		expect(window?.usedPercent).toBeNull();
+		expect(window?.level).toBe("unknown");
+		expect(window?.resetAt).toBeNull();
 	});
 
-	test("ignores unparseable reset times", () => {
+	test("spent window is exhausted and bounds the account", () => {
 		const usage: KimiUsageCache = {
 			...BASE,
-			weekly: null,
-			fiveHour: { used: 1, limit: 10, remaining: 9, resetTime: "not-a-date" },
+			weekly: { used: 100, limit: 100, remaining: 0, resetTime: null },
 		};
-		expect(formatKimiDetailsText(usage, t)).not.toContain("resetSuffix");
+		const view = buildKimiQuotaView(usage, t);
+		expect(view?.limiting?.id).toBe("weekly");
+		expect(view?.level).toBe("exhausted");
+	});
+
+	test("extra windows keep their upstream label", () => {
+		const usage: KimiUsageCache = {
+			...BASE,
+			extraWindows: [{ label: "Daily", used: 1, limit: 4, remaining: 3, resetTime: null }],
+		};
+		const extra = buildKimiQuotaView(usage, t)?.windows.at(-1);
+		expect(extra?.label).toBe("Daily");
+		expect(extra?.remainingPercent).toBe(75);
+	});
+
+	test("a failed refresh is flagged; only admins get the reason", () => {
+		const nonAdmin = buildKimiQuotaView(
+			{ ...BASE, fiveHour: null, weekly: null, error: undefined, hasError: true },
+			t,
+		);
+		expect(nonAdmin?.failed).toBe(true);
+		expect(nonAdmin?.failureDetail).toBeNull();
+		const admin = buildKimiQuotaView({ ...BASE, error: "401 Unauthorized" }, t);
+		expect(admin?.failed).toBe(true);
+		expect(admin?.failureDetail).toBe("401 Unauthorized");
+	});
+
+	test("nothing to show for a cold cache", () => {
+		expect(buildKimiQuotaView({ ...BASE, fiveHour: null, weekly: null }, t)).toBeNull();
+		expect(buildKimiQuotaView(undefined, t)).toBeNull();
 	});
 });
 

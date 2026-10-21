@@ -7,7 +7,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import type { OpencodeUsageCache } from "../../../lib/api/types";
 import narratorLocale from "../../../locales/en/narrator.json";
+import { buildKimiQuotaView } from "./kimi-usage-format";
 import { OpencodeQuotaIndicator } from "./OpencodeQuotaIndicator";
+import { QuotaPanelIndicator } from "./QuotaPanelIndicator";
 
 let root: Root;
 let host: HTMLDivElement;
@@ -150,5 +152,58 @@ describe("OpencodeQuotaIndicator", () => {
 			usage: usage({ rolling: null, weekly: null, error: undefined, hasError: true }),
 		});
 		expect(trigger().textContent).toBe("OpenCode Go usage unavailable");
+	});
+});
+
+describe("QuotaPanelIndicator with a Kimi allowance", () => {
+	function mountKimi(waitingForQuota = false) {
+		const view = buildKimiQuotaView(
+			{
+				fiveHour: {
+					used: 92,
+					limit: 100,
+					remaining: 8,
+					resetTime: new Date(NOW + 3_600_000).toISOString(),
+				},
+				weekly: { used: 20, limit: 100, remaining: 80, resetTime: null },
+				monthly: null,
+				extraWindows: [],
+				fetchedAt: NOW,
+				error: null,
+			},
+			instance.t.bind(instance),
+		);
+		act(() => {
+			root.render(
+				<I18nextProvider i18n={instance}>
+					<MantineProvider env="test">
+						<QuotaPanelIndicator
+							view={view}
+							waitingForQuota={waitingForQuota}
+							waitingText="Waiting for quota"
+							transitionDuration={0}
+						/>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+		});
+	}
+
+	test("badge shows the limiting window; panel has bars, amounts and countdown", async () => {
+		mountKimi();
+		expect(trigger().textContent).toBe("5h 8%");
+		expect(trigger().querySelector("[data-variant]")?.getAttribute("data-variant")).toBe("filled");
+		const panel = await openPanel();
+		expect(panel).toContain("Kimi usage");
+		expect(panel).toContain("5-hour limit");
+		expect(panel).toContain("Weekly limit");
+		expect(panel).toContain("Used 92 / 100");
+		expect(panel).toContain("Resets in");
+		expect(document.body.querySelectorAll(".mantine-Progress-root").length).toBe(2);
+	});
+
+	test("a Kimi quota wait shows the wait text in the panel", async () => {
+		mountKimi(true);
+		expect(await openPanel()).toContain("Waiting for quota");
 	});
 });

@@ -213,6 +213,10 @@ export function opencodeWindowLabel(key: OpencodeWindowKey, t: OpencodeViewT): s
 	return t(LONG_LABEL_KEYS[key]);
 }
 
+export function opencodeWindowShortLabel(key: OpencodeWindowKey, t: OpencodeViewT): string {
+	return t(SHORT_LABEL_KEYS[key]);
+}
+
 /**
  * Compact text for the status bar and picker badge: the limiting window and
  * what is left of it ("5h 63%"), "exhausted" once spent, or the unavailable
