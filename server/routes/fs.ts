@@ -42,6 +42,7 @@ import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
 import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
+import { sanitizeSvg } from "../lib/svg-sanitize";
 import { fsWriteSchema } from "../lib/validators/fs";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import type { EditorActor } from "../services/editor-document-service";
@@ -386,9 +387,31 @@ fsRoutes.get("/preview", async (c) => {
 
 	const ext = extname(absPath).toLowerCase();
 	const mime = PREVIEW_MIME[ext];
+	// SVG is text that executes: it is served through the sanitizer below rather than
+	// streamed, and it gets the smaller TEXT cap (not the 20 MB binary cap) because the
+	// whole document is read and parsed on the server's single JS thread.
+	const isSvg = ext === ".svg";
 
-	if (stat.size > (mime ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)) {
+	if (stat.size > (mime && !isSvg ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)) {
 		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	if (isSvg) {
+		// An SVG runs as a document on this origin (directly or via the frontend's
+		// same-origin blob URL), so its bytes are sanitized before they leave the server;
+		// see lib/svg-sanitize.ts. `nosniff` keeps the declared type honest, and the CSP
+		// is a second line of defense for a DIRECT navigation to this endpoint — it cannot
+		// reach the blob case, which is exactly why the bytes themselves are cleaned.
+		const clean = sanitizeSvg(await Bun.file(absPath).text());
+		return new Response(clean, {
+			headers: {
+				"Content-Type": "image/svg+xml; charset=utf-8",
+				"Content-Disposition": "inline",
+				"Cache-Control": "private, max-age=60",
+				"X-Content-Type-Options": "nosniff",
+				"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+			},
+		});
 	}
 
 	if (mime) {

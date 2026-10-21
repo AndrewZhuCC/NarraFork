@@ -12,11 +12,32 @@ import { db } from "../../db";
 import { projects, userPreferences } from "../../db/schema";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
 import { generateId } from "../../lib/id";
+import { invalidateUserCache } from "../../middleware/auth";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { resetTraitLayerCaches } from "../../services/trait-layer-service";
 import { traitLayerRoutes } from "../trait-layers";
 
 const ADMIN = "user-admin-layers";
 const MEMBER = "user-member-layers";
+
+/**
+ * `assertAdmin` authorizes against the live role read through the session store, not the
+ * token's claim, so the store must report ADMIN as an admin and everyone else as a plain
+ * user. Without this the admin boundary would hit the empty database and 401.
+ */
+function installLiveRoleStore(): void {
+	const original = authSessionStore;
+	const store: AuthSessionStore = {
+		...original,
+		findSessionState: async (id) => ({
+			id,
+			role: id === ADMIN ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+}
 
 const createdProjects: string[] = [];
 const createdPrefs: string[] = [];
@@ -50,10 +71,13 @@ async function makeProject(): Promise<string> {
 
 beforeEach(() => {
 	resetTraitLayerCaches();
+	installLiveRoleStore();
 });
 
 afterEach(async () => {
 	resetTraitLayerCaches();
+	setAuthStores(undefined);
+	invalidateUserCache();
 	if (createdProjects.length > 0) {
 		await db.delete(projects).where(inArray(projects.id, createdProjects.splice(0)));
 	}

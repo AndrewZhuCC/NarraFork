@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { isParentSelector } from "@shared/communication-tool";
 import { isGenUiReadAction } from "@shared/gen-ui-tool-policy";
@@ -82,6 +82,7 @@ import {
 } from "../lib/context-characters";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
 import { isPlanModeTrait } from "../lib/narrator-utils";
 import {
@@ -1623,6 +1624,58 @@ function canonicalHostPath(path: string): string {
 	throw new Error("Host path identity budget exceeded");
 }
 
+/**
+ * A shell command token that reads/writes a NarraFork platform secret, or null.
+ *
+ * `extractPathArgs` only runs for PATH_COMMANDS and skips `-flag` args, so a read via
+ * jq/cat/type/sort/diff/… or `--file=<secret>` never lands in `bashAnalysis.filePaths`.
+ * This scans the already-resolved `filePaths` AND every token (plus the value half of
+ * `--flag=value`) of every command, resolving each against the target cwd with `~`
+ * expanded the way the shell would — so a literal secret path is caught whatever command
+ * reads it. Over-collection is harmless: only a token resolving inside the NarraFork home
+ * can match `isSecretPlatformPath`. Enforced for the local host target only, since the
+ * secrets belong to the NarraFork host.
+ */
+function findShellSecretPlatformPath(
+	analysis: BashAnalysis,
+	targetCwd: string,
+	targetPaths: TargetPathSemantics,
+): string | null {
+	const home = homedir();
+	const expandTilde = (value: string): string => {
+		if (value === "~") return home;
+		if (value.startsWith("~/") || value.startsWith("~\\")) return `${home}${value.slice(1)}`;
+		return value;
+	};
+	const isSecret = (resolvedPath: string): boolean => {
+		try {
+			return isSecretPlatformPath(resolvedPath);
+		} catch {
+			return false;
+		}
+	};
+	for (const resolvedPath of analysis.filePaths) {
+		if (isSecret(resolvedPath)) return resolvedPath;
+	}
+	for (const command of analysis.commands) {
+		for (const token of command.tokens.slice(1)) {
+			const candidates: string[] = [];
+			if (token.startsWith("-")) {
+				const eq = token.indexOf("=");
+				if (eq >= 0) candidates.push(token.slice(eq + 1));
+			} else {
+				candidates.push(token);
+			}
+			for (const candidate of candidates) {
+				if (!candidate || !/[/\\~]/.test(candidate)) continue;
+				const resolvedPath = targetPaths.resolve(targetCwd, expandTilde(candidate));
+				if (isSecret(resolvedPath)) return resolvedPath;
+			}
+		}
+	}
+	return null;
+}
+
 function resolveProtectedPathDeny(
 	toolName: string,
 	input: Record<string, unknown>,
@@ -1693,6 +1746,15 @@ function resolveProtectedPathDeny(
 				executionContext.target.deviceId === LOCAL_DEVICE_ID &&
 				executionContext.paths.flavor !== "spec"
 			: executionBackend?.kind !== "remote";
+		// Application authorization guard, not an OS sandbox: a shell command that reads or
+		// writes a NarraFork platform secret is denied in EVERY permission mode
+		// (bypassPermissions included), because this runs before the mode shortcuts below.
+		if (isLocalTarget) {
+			const secretPath = findShellSecretPlatformPath(bashAnalysis, targetCwd, targetPaths);
+			if (secretPath) {
+				return `Shell access to NarraFork platform secrets is forbidden: ${secretPath}`;
+			}
+		}
 		if (projectGitPath && isLocalTarget) {
 			for (const cmd of bashAnalysis.commands) {
 				const cmdName = cmd.tokens[0];

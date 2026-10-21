@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-import { SESSION_VERSION_CLAIM } from "@shared/session-auth";
+import { isSessionTokenVersionCurrent, SESSION_VERSION_CLAIM } from "@shared/session-auth";
 import { eq } from "drizzle-orm";
 
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
@@ -1086,8 +1086,20 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							// the next socket instead of riding along until the JWT expires. The
 							// narrator subscribe path uses it for the admin short-circuit.
 							role: true,
+							// The upgrade verifies only the JWT signature, so a revoked token (one left
+							// behind by a `token_version` bump — password change, "sign out everywhere")
+							// would otherwise still open a socket until its `exp`. Enforce the current
+							// generation here, exactly as the HTTP gate does, and fail the upgrade when
+							// it is stale (or the user row is gone).
+							tokenVersion: true,
 						},
 					});
+					if (
+						!user ||
+						!isSessionTokenVersionCurrent(payload[SESSION_VERSION_CLAIM], user.tokenVersion)
+					) {
+						return new Response("Invalid or expired token", { status: 401 });
+					}
 					const userInfo = user
 						? {
 								userId: user.id,

@@ -67,6 +67,12 @@ declare module "hono" {
 interface VerifiedUser {
 	at: number;
 	tokenVersion: number;
+	/**
+	 * The role as it stood in `users` when the row was last read. `assertAdmin` authorizes
+	 * against THIS live value, never the token's `role` claim, so a forged or stale token
+	 * carrying `role:"admin"` cannot grant administrative access on its own.
+	 */
+	role: string;
 }
 
 const verifiedUsers = new Map<string, VerifiedUser>();
@@ -322,7 +328,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 		if (!row) {
 			throw catalogError("USER_GONE");
 		}
-		verified = { at: Date.now(), tokenVersion: row.tokenVersion };
+		verified = { at: Date.now(), tokenVersion: row.tokenVersion, role: row.role };
 		verifiedUsers.set(payload.sub, verified);
 	}
 	if (!isSessionTokenVersionCurrent(payload[SESSION_VERSION_CLAIM], verified.tokenVersion)) {
@@ -376,7 +382,7 @@ export async function requireSessionAuth(c: Context, next: Next) {
 	await next();
 }
 
-export function assertAdmin(c: Context): void {
+export async function assertAdmin(c: Context): Promise<void> {
 	const principal = getAuthPrincipal(c);
 	if (principal?.type === "oauth" || c.get("oauth")) {
 		// OAuth grants are intentionally never accepted for administrative actions,
@@ -387,13 +393,33 @@ export function assertAdmin(c: Context): void {
 	if (!user) {
 		throw catalogError("AUTH_REQUIRED");
 	}
-	if (user.role !== "admin") {
+	// Authorize against the LIVE role, never the token's `role` claim: a forged or stale
+	// token carrying `role:"admin"` must not pass. The verified-user cache populated during
+	// authentication already holds the live role (and is dropped by `invalidateUserCache`
+	// on any role change), so the common path pays no extra query; on a miss — e.g. a caller
+	// that set `user` directly without authenticating — read the row now and fail closed if
+	// the user is gone.
+	let role = getVerifiedUser(user.sub)?.role;
+	if (role === undefined) {
+		const row = await authSessionStore.findSessionState(user.sub);
+		if (!row) {
+			invalidateUserCache(user.sub);
+			throw catalogError("USER_GONE");
+		}
+		verifiedUsers.set(user.sub, {
+			at: Date.now(),
+			tokenVersion: row.tokenVersion,
+			role: row.role,
+		});
+		role = row.role;
+	}
+	if (role !== "admin") {
 		throw catalogError("ADMIN_REQUIRED");
 	}
 }
 
 export async function requireAdmin(c: Context, next: Next) {
-	assertAdmin(c);
+	await assertAdmin(c);
 	await next();
 }
 
@@ -417,7 +443,7 @@ export async function requireAdminOrManagerToken(c: Context, next: Next) {
 		return;
 	}
 	await authenticateRequest(c);
-	assertAdmin(c);
+	await assertAdmin(c);
 	await next();
 }
 

@@ -238,11 +238,9 @@ export class FeishuAdapter extends BaseAdapter {
 		const userId = senderId ?? "";
 		const username = message.sender?.sender_id?.union_id ?? senderId ?? "unknown";
 
-		// Check allowlist
-		if (this.config.allowedUsers?.length) {
-			if (!this.config.allowedUsers.includes(userId)) {
-				return;
-			}
+		// Check allowlist — fail closed: an empty/unset allowlist denies all users.
+		if (!this.config.allowedUsers?.length || !this.config.allowedUsers.includes(userId)) {
+			return;
 		}
 
 		// Strip @mention
