@@ -1,13 +1,16 @@
 import { Badge, Group, Paper, ScrollArea, Stack, Text } from "@mantine/core";
-import { useMemo } from "react";
+import { type RefObject, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../../lib/z-index";
 import type { CommandItem, CommandParam } from "./CommandPopover";
+import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
 
 interface CommandParamHelperProps {
 	command: CommandItem;
 	input: string;
 	visible: boolean;
+	/** The composer editor; decides whether the helper opens above or below it. */
+	anchorRef?: RefObject<HTMLElement | null>;
 }
 
 const MAX_COMMAND_ARG_PARSE_CHARS = 50_000;
@@ -71,7 +74,12 @@ function buildPreview(
 	return capCommandPreview(result);
 }
 
-export function CommandParamHelper({ command, input, visible }: CommandParamHelperProps) {
+export function CommandParamHelper({
+	command,
+	input,
+	visible,
+	anchorRef,
+}: CommandParamHelperProps) {
 	const { t } = useTranslation("narrator");
 
 	const params = command.params ?? [];
@@ -101,6 +109,8 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 		[command.bashCommand, hasParams, params, args],
 	);
 
+	const popoverSide = useComposerPopoverSide(anchorRef, shouldShow, 160);
+
 	if (!shouldShow) return null;
 
 	const displayParams = (
@@ -122,10 +132,9 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 			withBorder
 			style={{
 				position: "absolute",
-				bottom: "100%",
+				...composerPopoverOffset(popoverSide),
 				left: 0,
 				right: 0,
-				marginBottom: 4,
 				zIndex: Z.dropdown,
 			}}
 		>
