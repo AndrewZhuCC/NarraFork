@@ -2775,6 +2775,8 @@ export interface ContextManagementOptions {
 	getProvider: () => string;
 	/** Server-local cwd for restoring model-visible attachment copies. */
 	getAttachmentCwd?: () => string | undefined;
+	/** Optional tool loading input for rebuilt histories (see `RuntimeHistoryOptions`). */
+	getToolLoading?: () => import("./agent-runtime/history").RuntimeHistoryOptions["toolLoading"];
 	attachmentSignal?: AbortSignal;
 	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
 	onCompactDone?: () => void;
@@ -2856,6 +2858,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			attachmentCwd: opts.getAttachmentCwd?.(),
 			attachmentSignal: signal,
 			deadline,
+			toolLoading: opts.getToolLoading?.(),
 		});
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
@@ -2866,6 +2869,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			pendingToolResults: result.trailingToolResults,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+			...(result.toolLoading ? { toolLoading: result.toolLoading } : {}),
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
 		};
 	};

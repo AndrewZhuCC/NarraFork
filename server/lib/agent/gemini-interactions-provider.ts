@@ -30,6 +30,7 @@ import {
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
+import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
@@ -242,6 +243,10 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			type: "system",
 			text: `${identity}\n\n${systemPrompt}`,
 		});
+	}
+
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "gemini-compatible" };
 	}
 
 	getActiveReasoningSource(): string | undefined {

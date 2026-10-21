@@ -43,6 +43,8 @@ export interface ModelProfile {
 	inputModalities?: Modality[] | null;
 	outputModalities?: Modality[] | null;
 	nativeSearch?: boolean | null;
+	/** Declared tool loading modes in priority order. undefined/null = use name defaults. */
+	toolLoadingModes?: string[] | null;
 	reasoning: ModelReasoning;
 	referencePricing?: ReferencePricing;
 	/** True when any reference price comes from a local (user) layer. */
@@ -235,6 +237,7 @@ export function modelProfile(card: {
 	if (has("supported_output_modalities"))
 		profile.outputModalities = modalities(raw.supported_output_modalities);
 	if (has("supports_web_search")) profile.nativeSearch = bool(raw.supports_web_search);
+	if (has("tool_loading_modes")) profile.toolLoadingModes = strings(raw.tool_loading_modes);
 	const reasoning = profile.reasoning;
 	if (has("supports_reasoning")) reasoning.supported = bool(raw.supports_reasoning);
 	if (has("reasoning_mode"))

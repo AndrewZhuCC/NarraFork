@@ -921,6 +921,26 @@ export async function runAgentLoopUnlocked(
 				? filterOAuthSessionDevices(resolvedTurnSessionDevices, oauthRuntime)
 				: resolvedTurnSessionDevices;
 
+			// Optional tools whose presence follows session loading this pass. An explicit
+			// ceiling allowlist is authoritative and admits them regardless of loading;
+			// otherwise only tools the other filters admit can be loaded into the request.
+			const managedOptionalTools = new Set(
+				runtimePolicy.tools.builtin === "all"
+					? [...OPTIONAL_TOOLS.values()]
+							.filter(
+								(tool) =>
+									profileToolFilter(tool) &&
+									(!oauthRuntime || oauthRuntime.allowedTools.has(tool.name)) &&
+									!active._disabledTools.has(tool.name),
+							)
+							.map((tool) => tool.name)
+					: [],
+			);
+			const toolLoadingInput = () => ({
+				managed: managedOptionalTools,
+				current: active._enabledOptionalTools,
+			});
+
 			// Preserve the original signed array. buildRuntimeHistory drops the placement under
 			// this run's destination on its detached model projection only; both freshness
 			// guards use these raw rows.
@@ -1003,6 +1023,7 @@ export async function runAgentLoopUnlocked(
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
 				deadline: historyDeadline,
+				toolLoading: toolLoadingInput(),
 			});
 			const { history, trailingToolResults } = preparedHistory;
 			const receipts = questionModelReceipts(preparedHistory.modelMessages);
@@ -1129,6 +1150,7 @@ export async function runAgentLoopUnlocked(
 				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
 				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
 				getAttachmentCwd: () => active.cwd,
+				getToolLoading: toolLoadingInput,
 				attachmentSignal: active.abortController.signal,
 				onCompactDone: () => {
 					compactDoneFlag = true;
@@ -1668,7 +1690,8 @@ export async function runAgentLoopUnlocked(
 				subagentModelRestrictionDescription: formatSubagentModelRestrictionDescription(
 					freshNarrator.traits,
 				),
-				// Exclude optional tools that haven't been loaded for this session.
+				toolLoading: preparedHistory.toolLoading,
+				isToolLoaded: (name) => active._enabledOptionalTools.has(name),
 				toolFilter: (tool) => {
 					if (!profileToolFilter(tool)) return false;
 					if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
@@ -1678,8 +1701,10 @@ export async function runAgentLoopUnlocked(
 					// An explicit ceiling allowlist is authoritative; session-level optional
 					// tool loading only narrows a session whose ceiling admits every tool.
 					if (runtimePolicy.tools.builtin !== "all") return true;
+					// Whether a loadable tool enters the request's array is decided by the
+					// loop from the history's loading state (`toolLoading` above).
 					if (OPTIONAL_TOOLS.has(tool.name)) {
-						return active._enabledOptionalTools.has(tool.name);
+						return managedOptionalTools.has(tool.name);
 					}
 					// Review tools: only available for review chapter narrators
 					if (REVIEW_TOOLS.has(tool.name)) {

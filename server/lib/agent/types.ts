@@ -941,6 +941,8 @@ export interface AgentHistoryReplacement {
 	systemPrompt?: string;
 	/** Persisted input rows retained in history, excluding rows lifted into current input. */
 	replayedInjectionMessageIds?: readonly string[];
+	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
+	toolLoading?: import("./tool-loading").ToolLoadingState;
 }
 
 export interface AgentConfig {
@@ -1137,6 +1139,14 @@ export interface AgentConfig {
 	resetUpstreamSessionOnFirstRequest?: boolean;
 	/** Filter tools available to this agent (subagent/tool-trait restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
+	/**
+	 * Optional-tool loading state of the history this pass was built from. The loop
+	 * keeps managed tools out of `toolFilter` and decides their place here instead
+	 * (see `tool-loading.ts`).
+	 */
+	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** Live loaded state of a managed tool; a call to an unloaded one is rejected. */
+	isToolLoaded?: (name: string) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
 	disabledTools?: Set<string> | string[];
 	/** Optional hard allow-list. Unlike toolFilter, this is enforced again at execution time. */

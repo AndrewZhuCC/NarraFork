@@ -86,6 +86,12 @@ import {
 	type ToolExecResult,
 } from "./tool-executor";
 import { ToolInputStream } from "./tool-input-stream";
+import {
+	formatRequestTools,
+	resolveAdapterToolLoadingStrategy,
+	sameToolLoadingLayout,
+	type ToolLoadingStrategy,
+} from "./tool-loading";
 import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
 import {
@@ -1283,6 +1289,7 @@ const requestToolSnapshots = new WeakMap<
 		provider: string;
 		model: string;
 		tools: unknown[];
+		toolLoadingStrategy: ToolLoadingStrategy;
 	}
 >();
 const inheritedPromptConfigs = new WeakSet<AgentConfig>();
@@ -2823,9 +2830,26 @@ async function* agentLoopInMetadataSnapshot(
 		}
 	}
 
-	let tools =
-		inheritedTools?.tools ??
-		provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+	/**
+	 * Format the request's tool array for the current adapter. Managed optional tools
+	 * follow the history's loading state and the adapter's tool loading strategy, so the
+	 * array stays fixed while tools are loaded inside the history.
+	 */
+	let toolLoadingStrategy: ToolLoadingStrategy =
+		inheritedTools?.toolLoadingStrategy ?? "replace_tools";
+	function formatRequestToolsForProvider(): unknown[] {
+		toolLoadingStrategy = config.toolLoading
+			? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
+			: "replace_tools";
+		return formatRequestTools(
+			(selected) => provider.formatTools(selected),
+			resolveToolsForProvider(effectiveProvider, effectiveModel),
+			config.toolLoading,
+			toolLoadingStrategy,
+		);
+	}
+
+	let tools = inheritedTools?.tools ?? formatRequestToolsForProvider();
 	await reportToolsCharacters(tools);
 	/**
 	 * The plan-mode tool-description state `tools` was formatted with.
@@ -3137,6 +3161,17 @@ async function* agentLoopInMetadataSnapshot(
 		}
 		pendingToolResults = replacement.pendingToolResults;
 		historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
+		// A rebuild after compact (or a load the old history did not contain) moves tools
+		// between the array and the history; keep the array in step with the new history.
+		if (
+			!inheritedTools &&
+			replacement.toolLoading &&
+			!sameToolLoadingLayout(config.toolLoading, replacement.toolLoading)
+		) {
+			config.toolLoading = replacement.toolLoading;
+			tools = formatRequestToolsForProvider();
+			void reportToolsCharacters(tools);
+		}
 	}
 
 	async function hasPendingRuntimeSettingsOverride(): Promise<boolean> {
@@ -3188,7 +3223,7 @@ async function* agentLoopInMetadataSnapshot(
 				config.model = newResolved.model;
 				config.provider = newResolved.provider;
 				if (providerChanged || modelChanged) {
-					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					tools = formatRequestToolsForProvider();
 					await reportToolsCharacters(tools);
 					// This re-format already applied the current plan-mode state; record it so the
 					// turn-boundary check does not immediately redo the same work.
@@ -3297,7 +3332,7 @@ async function* agentLoopInMetadataSnapshot(
 				const planModeDisabledNow = planModeDisablesTools();
 				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
 					toolsPlanModeDisabled = planModeDisabledNow;
-					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					tools = formatRequestToolsForProvider();
 					await reportToolsCharacters(tools);
 					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
 						narratorId: config.narratorId,
@@ -4650,6 +4685,7 @@ async function* agentLoopInMetadataSnapshot(
 						provider: effectiveProvider,
 						model: effectiveModel,
 						tools,
+						toolLoadingStrategy,
 					});
 					const toolSnapshot = requestToolSnapshots.get(config);
 					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
@@ -4675,6 +4711,7 @@ async function* agentLoopInMetadataSnapshot(
 						history: questionInput.history,
 						tools,
 						toolResults: questionInput.toolResults,
+						toolLoadingStrategy,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
 						reasoningEffort: config.reasoningEffort,

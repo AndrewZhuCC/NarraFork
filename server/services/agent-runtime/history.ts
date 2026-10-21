@@ -1,5 +1,5 @@
 import { modelTextFromContentBlocks } from "@shared/native-injection";
-import { buildHistory } from "../../lib/agent";
+import { buildHistory, resolveHistoryToolLoadingStrategy } from "../../lib/agent";
 import { projectAttachmentLocations } from "../../lib/agent/attachment-projection";
 import {
 	getFileReferenceSnapshots,
@@ -13,6 +13,12 @@ import {
 	projectSenderText,
 	type SenderMessage,
 } from "../../lib/agent/sender-projection";
+import {
+	deriveToolLoadingState,
+	projectToolLoadingHistory,
+	resolveLoadableToolDefinition,
+	type ToolLoadingState,
+} from "../../lib/agent/tool-loading";
 import { isTopLevelMessage, type OwnTurnPlacement } from "../../lib/runtime-source";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
 
@@ -42,6 +48,11 @@ export interface RuntimeHistoryOptions {
 	attachmentSignal?: AbortSignal;
 	/** Shared deadline, including source reads and provider projection. */
 	deadline?: number;
+	/**
+	 * Optional tools whose presence follows session loading, and the currently loaded
+	 * ones. When set, loads inside the history keep the request's tool array fixed.
+	 */
+	toolLoading?: { managed: ReadonlySet<string>; current: Iterable<string> };
 }
 
 export interface PreparedRuntimeHistory extends BuiltHistory {
@@ -56,6 +67,8 @@ export interface PreparedRuntimeHistory extends BuiltHistory {
 	currentInputText: string;
 	isPureToolResultReplay: boolean;
 	recoveredTrailingUserText: string | null;
+	/** Loading state of this history; the loop derives the tool array from it. */
+	toolLoading?: ToolLoadingState;
 }
 
 /** Recover only the final real user turn; neither a system injection nor a tool replay invents text. */
@@ -212,6 +225,26 @@ export async function buildRuntimeHistory(
 		currentInput = prepared.currentInput;
 	}
 	checkBudget();
+	const toolLoadingState = options.toolLoading
+		? deriveToolLoadingState(
+				modelMessages,
+				options.toolLoading.managed,
+				options.toolLoading.current,
+			)
+		: undefined;
+	const toolLoadingStrategy = toolLoadingState
+		? resolveHistoryToolLoadingStrategy(options.model, options.provider)
+		: undefined;
+	// Injected schemas are plain notice text, so they are written here: the receipt guards
+	// and a notice recovered as the current turn then carry the same bytes as a rebuild.
+	if (toolLoadingState && toolLoadingStrategy === "custom_injection") {
+		modelMessages = projectToolLoadingHistory(
+			modelMessages,
+			toolLoadingState,
+			toolLoadingStrategy,
+			resolveLoadableToolDefinition,
+		) as typeof modelMessages;
+	}
 	// Full Await outputs remain intact until the actual provider-input boundary.
 	// A builder may omit/move a user receipt (or a prebuilt child may replace
 	// this history), so row presence alone is not a safe deduplication decision.
@@ -222,6 +255,9 @@ export async function buildRuntimeHistory(
 		options.narratorId,
 		{
 			currentInput,
+			...(toolLoadingState && toolLoadingStrategy && toolLoadingStrategy !== "custom_injection"
+				? { toolLoading: { state: toolLoadingState, strategy: toolLoadingStrategy } }
+				: {}),
 		},
 	);
 	checkBudget();
@@ -264,5 +300,6 @@ export async function buildRuntimeHistory(
 				: (recoveredModelText ?? combined),
 		isPureToolResultReplay,
 		recoveredTrailingUserText,
+		...(toolLoadingState ? { toolLoading: toolLoadingState } : {}),
 	};
 }

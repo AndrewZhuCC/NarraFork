@@ -19,6 +19,13 @@ import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
 import { projectMessageSenderForModel } from "./sender-projection";
 import { stripCitationMarkersForModel } from "./strip-citation-markers";
 import { stripPlanBodyForModel } from "./strip-plan-body";
+import {
+	projectToolLoadingHistory,
+	resolveAdapterToolLoadingStrategy,
+	resolveLoadableToolDefinition,
+	type ToolLoadingState,
+	type ToolLoadingStrategy,
+} from "./tool-loading";
 import "./tools";
 import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
 import { initTruncateCleanup } from "./truncate";
@@ -58,6 +65,22 @@ export type {
 } from "./types";
 export { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
+/** The `prefix:id` a history build for `model` on `provider` resolves. */
+function prefixedHistoryModel(model: string, provider: string): string {
+	const requestedModel = model || settings.agent.defaultModel;
+	const parsed = parseModelId(requestedModel);
+	return parsed.provider ? requestedModel : `${provider}:${parsed.model || "default"}`;
+}
+
+/** Tool loading strategy a history build for `model` on `provider` will target. */
+export function resolveHistoryToolLoadingStrategy(
+	model: string,
+	provider: string,
+): ToolLoadingStrategy {
+	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
+	return resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
+}
+
 /**
  * Convert DB narrator messages into provider history format.
  * Routes to the correct provider based on the provider name.
@@ -71,14 +94,15 @@ export async function buildHistory(
 	// callers resolve the provider before calling, so there is nothing to guess.
 	provider: string,
 	narratorId?: string,
-	options?: FileReferenceProjectionOptions,
+	options?: FileReferenceProjectionOptions & {
+		/**
+		 * Loading state the request's `tools` array is built from, and the strategy
+		 * resolved for this model. Tool loads inside the history are rendered for it.
+		 */
+		toolLoading?: { state: ToolLoadingState; strategy: ToolLoadingStrategy };
+	},
 ): Promise<BuiltHistory> {
-	const requestedModel = model || settings.agent.defaultModel;
-	const parsed = parseModelId(requestedModel);
-	const prefixedModel = parsed.provider
-		? requestedModel
-		: `${provider}:${parsed.model || "default"}`;
-	const resolved = resolveProviderAndModel(prefixedModel);
+	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
 	// Replace file-based ExitPlanMode plan bodies with a short path reference so
 	// the model history does not carry the full plan text on every rebuild. The
 	// persisted DB rows keep the full plan for the UI; this only mutates the
@@ -107,7 +131,16 @@ export async function buildHistory(
 			model: resolved.model,
 		},
 	);
-	return resolved.adapter.buildHistory(uniqueMessages, resolved.model, narratorId);
+	// Last, so builders see exactly these row objects (changes are keyed by row).
+	const projectedMessages = options?.toolLoading
+		? projectToolLoadingHistory(
+				uniqueMessages,
+				options.toolLoading.state,
+				options.toolLoading.strategy,
+				resolveLoadableToolDefinition,
+			)
+		: uniqueMessages;
+	return resolved.adapter.buildHistory(projectedMessages, resolved.model, narratorId);
 }
 
 /**

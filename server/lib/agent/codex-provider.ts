@@ -1,4 +1,5 @@
 import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import type { ToolLoadingTarget } from "./tool-loading";
 
 // Codex Provider — uses the centralized CodexManager for multi-account OAuth
 // Wraps OpenAIProvider with dynamic credential selection
@@ -32,6 +33,7 @@ import {
 	applyOpenAIModelMetadata,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
+	isResponsesInputItem,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
@@ -474,6 +476,10 @@ export class CodexProvider implements ProviderAdapter {
 		return dummy.formatTools(tools);
 	}
 
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "openai-responses", codexBackend: true };
+	}
+
 	async buildHistory(
 		dbMessages: DbMessage[],
 		model: string,
@@ -834,7 +840,7 @@ export class CodexProvider implements ProviderAdapter {
 		for (const msg of messages) {
 			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
 			const role = (msg as any).role;
-			if (role === "system" || role === "developer") {
+			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
 				if (typeof msg.content === "string") {
 					instructions += (instructions ? "\n\n" : "") + msg.content;
 				}

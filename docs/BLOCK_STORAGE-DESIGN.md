@@ -1003,6 +1003,8 @@ narrator_projection_overrides
 
 `/load` 在纪元内加载工具时，按模型声明的能力与当前线上协议选一种策略（D20）。
 
+> 这部分已先于块存储重构，在现有消息结构上实现：纪元边界取最近一次 compact，加载事件来自现有的 `tool_loaded` / `tool_unloaded` 提示行。实现与线上字段见 `docs/AGENT_PROVIDERS.md`「会话中加载工具时保持缓存前缀」。块存储落地后，提示行改为本节所述的 `context` 块。
+
 | # | 策略 id | 做法 | 适用 | 参考实现 | 前缀 |
 |---|---|---|---|---|---|
 | 1 | `anthropic_tool_addition` | 先在 tools[] 里放一个 `defer_loading` 的占位工具；加载时按 Anthropic API 的官方方式追加工具 | Claude 模型，`anthropic-messages` 协议 | pi | 保持 |
