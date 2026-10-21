@@ -2,8 +2,9 @@ import { createContext, useContext } from "react";
 import type { AddProviderDraft } from "./provider-add-draft";
 
 // The providers parent route keeps its reducer mounted while the add route is open.
+// Resolves with the new provider's id when the page should open it afterwards.
 export const ProviderAddContext = createContext<
-	((draft: AddProviderDraft) => Promise<void>) | null
+	((draft: AddProviderDraft) => Promise<string | undefined>) | null
 >(null);
 
 export const TokenDanceAddContext = createContext<{

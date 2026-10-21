@@ -452,6 +452,41 @@ function expectNoSave() {
 	);
 }
 
+/** Read through a call so TS does not narrow the mock slot after a reset. */
+const currentCustomDetail = () => customDetail;
+const resetCustomDetail = () => {
+	customDetail = undefined;
+};
+
+describe("provider deep link", () => {
+	test("`?provider=` opens the provider and follows URL changes while mounted", async () => {
+		await mount("/settings/providers?provider=existing");
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+		expect(container.querySelector("button.mantine-ActionIcon-root")).not.toBeNull();
+
+		// Leaving the detail returns to the overview and clears the link.
+		await leaveDetail();
+		expect(router.state.location.search).toEqual({});
+		resetCustomDetail();
+
+		// A link arriving while the page is already mounted (the model picker's
+		// provider settings button) must still open the provider.
+		await act(async () => {
+			await router.navigate({ to: "/settings/providers", search: { provider: "existing" } });
+		});
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+
+		// Browser back closes it again.
+		resetCustomDetail();
+		await act(async () => {
+			router.history.back();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+		expect(router.state.location.search).toEqual({});
+		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+	});
+});
+
 describe("provider add nested route", () => {
 	test("overview Link opens a page, retaining outer navigation and hiding overview/save controls", async () => {
 		await mount();
@@ -644,7 +679,9 @@ describe("provider add nested route", () => {
 				providers.filter((provider) => provider.id !== "existing"),
 			),
 		);
-		await leaveDetail();
+		// The removed provider no longer resolves from `?provider=`, so the page is back
+		// on the overview instead of an empty detail view.
+		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
 		await openAdd();
 		await fillDraft();
 		await submit();

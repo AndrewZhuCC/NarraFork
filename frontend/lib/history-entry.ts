@@ -11,6 +11,8 @@ export interface AppHistoryState {
 	mobileNav?: true;
 	terminalDrawer?: true;
 	contentViewerFullscreen?: true;
+	/** A provider detail opened from the providers overview; closing it steps back. */
+	providerDetailFromOverview?: true;
 	__NF_history_key?: string;
 	__NF_scroll_key?: string;
 	__NF_sentinel_id?: string;
