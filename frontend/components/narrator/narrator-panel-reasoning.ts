@@ -1,17 +1,13 @@
 /**
  * narrator-panel-reasoning.ts — which reasoning-effort tiers a model actually accepts.
  *
- * Extracted from `NarratorPanel.tsx` unchanged. Every provider spells this differently:
- * Codex varies the set BY MODEL (and only some models accept "none"), DeepSeek and
- * Gemini have their own ladders, Anthropic gains an `xhigh` tier only from a certain
+ * Legacy fallback helpers. Active selection uses model cards in use-model-selection.
+ * Codex varies the set BY MODEL (and only some models accept "none"), while
+ * Gemini has its own ladder and Anthropic gains an `xhigh` tier only from a certain
  * Claude version onward. The panel needs one answer — "what may I offer for the model
  * this narrator is on" — and a wrong answer is not a crash: the menu simply offers a
  * tier the provider rejects at request time, which reads as the model ignoring the
  * setting.
- *
- * `normalizeReasoningEffortForModel` is the clamp the UI shows through: it maps a stored
- * value (possibly set while another model was selected) onto what the CURRENT model
- * supports, which is why the menu can always highlight a tier that will really be used.
  */
 
 import {
@@ -28,13 +24,6 @@ export type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" 
  */
 export const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] =
 	GENERIC_REASONING_EFFORT_TIERS;
-
-/** DeepSeek only supports two effective tiers: high and max (mapped from xhigh). */
-export const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"high",
-	"xhigh",
-];
 
 /**
  * Gemini exposes a three-tier thinking level (low/medium/high) plus "none" to
@@ -117,11 +106,6 @@ export function codexModelSupportsReasoningDisabled(
 	return getBareModelForReasoning(model, modelOption) !== "gpt-6-astra";
 }
 
-export function isDeepSeekModel(model?: string): boolean {
-	if (!model) return false;
-	return model.toLowerCase().includes("deepseek");
-}
-
 /**
  * Whether an Anthropic model has the `xhigh` tier (Opus 4.7+ / 5 series).
  * A tier question, not an access question — the parsing it relies on lives in
@@ -134,13 +118,4 @@ export function anthropicModelSupportsXhigh(model?: string): boolean {
 	if (parsed.family === "fable" || parsed.family === "mythos") return true;
 	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
 	return claudeVersionAtLeast(parsed, 4, 7);
-}
-
-export function normalizeReasoningEffortForModel(
-	model: string | undefined,
-	effort: string | null | undefined,
-): string {
-	if (!effort) return "";
-	if (isDeepSeekModel(model) && (effort === "low" || effort === "medium")) return "high";
-	return effort;
 }

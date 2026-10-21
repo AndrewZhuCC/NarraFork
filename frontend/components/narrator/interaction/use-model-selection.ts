@@ -2,6 +2,7 @@ import type { ModelCard } from "@shared/model-catalog/card";
 import { modelProfile } from "@shared/model-catalog/profile";
 import {
 	clampReasoningEffort,
+	migrateLegacyReasoningEffort,
 	REASONING_EFFORT_VALUES,
 	type ReasoningEffort,
 } from "@shared/reasoning-effort";
@@ -40,13 +41,6 @@ const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = 
 	"low",
 	"medium",
 	"high",
-];
-
-/** DeepSeek only supports two effective tiers: high and max (mapped from xhigh). */
-const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"high",
-	"xhigh",
 ];
 
 /**
@@ -213,11 +207,6 @@ function gatewayChannelCanDisableThinking(channelType?: string): boolean {
 	}
 }
 
-function isDeepSeekModel(model?: string): boolean {
-	if (!model) return false;
-	return model.toLowerCase().includes("deepseek");
-}
-
 /**
  * Whether an Anthropic model has the `xhigh` tier (Opus 4.7+ / 5 series).
  * A tier question, not an access question — the parsing it relies on lives in
@@ -230,15 +219,6 @@ function anthropicModelSupportsXhigh(model?: string): boolean {
 	if (parsed.family === "fable" || parsed.family === "mythos") return true;
 	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
 	return claudeVersionAtLeast(parsed, 4, 7);
-}
-
-function normalizeReasoningEffortForModel(
-	model: string | undefined,
-	effort: string | null | undefined,
-): string {
-	if (!effort) return "";
-	if (isDeepSeekModel(model) && (effort === "low" || effort === "medium")) return "high";
-	return effort;
 }
 
 /** Minimal settings surface this hook reads. */
@@ -384,8 +364,8 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	]);
 	const reasoningEffortOptions = useMemo(() => {
 		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
-		// Gateway-reported tiers win over every table below, including DeepSeek's and
-		// model cards: those infer capability from the model id, while the gateway
+		// Gateway-reported tiers win over every table below, including model
+		// cards: those infer capability from the model id, while the gateway
 		// states it per routed model. Checked first so a relay-hosted model whose id
 		// resembles a known vendor's still gets the tiers its actual upstream
 		// accepts. A model reporting [] never reaches here — supportsReasoningEffort
@@ -394,15 +374,14 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		if (gatewayOptions) return gatewayOptions;
 		// Missing catalog data is not evidence that a new model lacks a tier.
 		if (!modelCard || modelCard.matchedVia === "none") return GENERIC_REASONING_EFFORT_TIERS;
-		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
-		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
 		// Catalog tiers: the editable replacement for the hardcoded per-model tables.
 		// `none` is appended here rather than stored in the catalog, because there it
 		// would become a clamp target able to silently turn a requested `low` into
 		// thinking switched off.
 		const cardTiers = catalogEffortTiers(modelCard);
 		if (cardTiers?.length) {
-			return codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
+			return modelProfile(modelCard).reasoning.canDisable !== false &&
+				codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
 				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
 				: (cardTiers as readonly ReasoningEffortValue[]);
 		}
@@ -466,14 +445,18 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		const desired = reasoningFollowsDefault
 			? ((inheritedReasoningEffort as ReasoningEffort | null | undefined) ??
 				globalDefaultReasoningEffort)
-			: (normalizeReasoningEffortForModel(
-					resolvedModel,
-					narratorReasoningEffort,
-				) as ReasoningEffort);
+			: (narratorReasoningEffort as ReasoningEffort);
 		if (!desired) return "";
-		return clampReasoningEffort(desired, opts);
+		const source = modelCard?.provenance.reasoning_effort_levels?.layer;
+		const legacyModel =
+			!hasGatewayReportedEffortLevels(resolvedModelOption) &&
+			(source === "preset-model" || source === "preset-variant")
+				? modelCard?.modelId
+				: undefined;
+		return clampReasoningEffort(migrateLegacyReasoningEffort(legacyModel, desired, opts), opts);
 	}, [
-		resolvedModel,
+		resolvedModelOption,
+		modelCard,
 		narratorReasoningEffort,
 		reasoningEffortOptions,
 		reasoningFollowsDefault,

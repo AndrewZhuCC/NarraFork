@@ -1,6 +1,7 @@
 import type { ModelProfile } from "@shared/model-catalog/profile";
 import {
 	clampReasoningEffort,
+	migrateLegacyReasoningEffort,
 	REASONING_EFFORT_VALUES,
 	type ReasoningEffort,
 } from "@shared/reasoning-effort";
@@ -111,6 +112,7 @@ export function resolveOutputTokenBudget(
 export function resolveMetadataReasoning(
 	profile: Pick<ModelProfile, "reasoning">,
 	requested?: string,
+	model?: string,
 ): string | undefined {
 	const reasoning = profile.reasoning;
 	if (reasoning?.supported === false) return undefined;
@@ -129,8 +131,18 @@ export function resolveMetadataReasoning(
 		const known = levels.filter((level): level is ReasoningEffort =>
 			REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
 		);
-		if (known.length && REASONING_EFFORT_VALUES.includes(effort as ReasoningEffort))
-			return clampReasoningEffort(effort as ReasoningEffort, known);
+		if (known.length && REASONING_EFFORT_VALUES.includes(effort as ReasoningEffort)) {
+			// Only migrate the old UI value against preset tiers. Gateway and local
+			// declarations are authoritative, not an invitation to apply vendor aliases.
+			const card = model ? getEffectiveModelCard(model) : undefined;
+			const source = card?.provenance.reasoning_effort_levels?.layer;
+			const legacyModel =
+				source === "preset-model" || source === "preset-variant" ? card?.modelId : undefined;
+			return clampReasoningEffort(
+				migrateLegacyReasoningEffort(legacyModel, effort as ReasoningEffort, known),
+				known,
+			);
+		}
 		return reasoning?.defaultLevel && levels.includes(reasoning.defaultLevel)
 			? reasoning.defaultLevel
 			: levels[0];

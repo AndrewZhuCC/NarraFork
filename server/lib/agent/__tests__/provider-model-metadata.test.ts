@@ -334,6 +334,41 @@ describe("actual provider request bodies", () => {
 		expect(history).toEqual(snapshot);
 		expect(requests).toHaveLength(0);
 	});
+	for (const channelType of ["openai", "responses", "anthropic"]) {
+		test.each([
+			"low",
+			"xhigh",
+			"none",
+		] as const)(`NUG ${channelType} DeepSeek honors gateway tiers for %s`, async (effort) => {
+			const nugConfig = { ...config, id: "deepseek-nug", prefix: "deepseek-nug" };
+			settings.nugProviders = [...(savedNug ?? []), nugConfig];
+			setNugCachedModels(nugConfig.id, [
+				{
+					id: "channel:deepseek-v4-pro",
+					channel: "channel",
+					channelType,
+					model: "deepseek-v4-pro",
+					effortLevels: ["low", "medium", "high", "max"],
+				},
+			]);
+			const body = await captureChat(new NugProvider(nugConfig), {
+				model: "deepseek-nug:channel:deepseek-v4-pro",
+				reasoningEffort: effort,
+			});
+			const expected = effort === "xhigh" ? "max" : effort;
+			if (channelType === "responses") {
+				expect(body.reasoning.effort).toBe(expected);
+			} else if (effort === "none") {
+				expect(body.thinking).toEqual({ type: "disabled" });
+				expect(body.output_config).toBeUndefined();
+				expect(body.reasoning_effort).toBeUndefined();
+			} else if (channelType === "anthropic") {
+				expect(body.output_config).toEqual({ effort: expected });
+			} else {
+				expect(body.reasoning_effort).toBe(expected);
+			}
+		});
+	}
 	for (const channelType of ["openai", "responses", "codex", "anthropic"]) {
 		test(`NUG ${channelType} delegate retains channel binding capabilities`, async () => {
 			const nugConfig = { ...config, id: "runtime-nug", prefix: "runtime-nug" };

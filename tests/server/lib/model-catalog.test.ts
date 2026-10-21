@@ -135,6 +135,51 @@ async function mockCatalog(
 }
 
 describe("unified metadata storage and runtime", () => {
+	test("bundled DeepSeek cards declare effective effort levels without upgrading retired aliases", () => {
+		for (const model of [
+			"deepseek-flash",
+			"deepseek-v4.1-flash",
+			"deepseek-v4.1-flash-1017",
+			"deepseek-v4-flash",
+			"deepseek-v4-pro",
+			"deepseek-v4-flash-vision-exp",
+		]) {
+			const reasoning = profile(`openai:${model}`).reasoning;
+			expect(reasoning.levels).toEqual(["low", "high", "max"]);
+			expect(reasoning.canDisable).toBe(true);
+			expect(reasoning.defaultLevel).toBe("high");
+		}
+		for (const model of ["deepseek-chat", "deepseek-reasoner"]) {
+			expect(profile(`openai:${model}`).reasoning.levels).toBeUndefined();
+		}
+	});
+
+	test("bundled Haiku 5.5 declares its xhigh tier without relying on Claude name heuristics", () => {
+		expect(profile("anthropic:claude-haiku-5-5").reasoning.levels).toEqual([
+			"low",
+			"medium",
+			"high",
+			"xhigh",
+			"max",
+		]);
+	});
+
+	test("bundled catalog covers new sub2api models and existing routed aliases", () => {
+		for (const model of [
+			"claude-haiku-5-5",
+			"claude-opus-4-6-thinking",
+			"claude-sonnet-4-5-20250929-v1:0",
+			"gemini-3.1-pro-high",
+			"gemini-3.1-pro-low",
+			"gemini-4-argon",
+			"gemini-4-argon-cyber-permissive",
+			"gpt-image-2.5-flare-2026-09-08",
+			"gpt-image-2.5-sunburst-2026-09-08",
+		]) {
+			expect(profile(`openai:${model}`).card.matchedVia).not.toBe("none");
+		}
+	});
+
 	test("legacy empty optional card labels do not block startup migration", () => {
 		delete local.agent.modelCatalog;
 		local.agent.modelCards = [
