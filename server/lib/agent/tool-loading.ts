@@ -114,7 +114,8 @@ export function defaultToolLoadingModes(
 	const bare = bareModelForEffort(model).toLowerCase();
 	if (bare.includes("claude"))
 		return claudeSupportsToolChanges(bare) ? ["anthropic_tool_addition"] : [];
-	if (bare.includes("gpt"))
+	// Open-weights gpt-oss runs on third-party servers, not OpenAI's tool_search stack.
+	if (bare.includes("gpt") && !bare.includes("gpt-oss"))
 		return gptSupportsAdditionalTools(bare, !!target.codexBackend)
 			? ["openai_additional_tools"]
 			: [];
@@ -249,6 +250,15 @@ export function deriveToolLoadingState(
 		for (const name of event.tools) if (!loaded.includes(name)) loaded.push(name);
 	}
 	return { managed, base, loaded, current: currentSet };
+}
+
+/**
+ * Whether a state has anything to keep out of the array. A session with no loadable
+ * tools (an explicit ceiling, OAuth, subagents) keeps the plain request shape, so it
+ * never carries a placeholder tool or a tool-change beta.
+ */
+export function usesToolLoading(state: ToolLoadingState | undefined): state is ToolLoadingState {
+	return !!state && state.managed.size > 0;
 }
 
 /** Whether two states would produce the same `tools` array. */
@@ -404,8 +414,9 @@ export function projectToolLoadingHistory(
 	resolveDefinition: (name: string) => ResolvedToolDefinition | null,
 ): DbMessage[] {
 	if (strategy === "replace_tools") return [...messages];
-	// Under the additive modes a tool is only ever declared once per epoch.
-	const declared = new Set(state.base);
+	// Under the additive modes a tool is only ever declared once per epoch. A base tool
+	// that no longer resolves is not in the request's array either.
+	const declared = new Set([...state.base].filter((name) => resolveDefinition(name)));
 	return messages.map((message) => {
 		const event = toolLoadingEventOf(message, state.managed);
 		if (!event) return message;
@@ -429,15 +440,16 @@ export function projectToolLoadingHistory(
 			});
 			return projected;
 		}
-		// Anthropic modes surface every load (a removed tool needs re-adding) and send
-		// every removal. Inline definitions are self-contained; the deferred tail names
+		// Anthropic modes surface every load (a removed tool needs re-adding). Inline definitions are self-contained; the deferred tail names
 		// tools the request's array declares. Both reject a reference to a name that was
 		// never declared, so a tool that cannot be resolved is skipped on both sides.
 		const additions: ToolLoadingAddition[] = [];
 		const removals: string[] = [];
 		for (const name of event.tools) {
 			if (event.kind === "unload") {
-				if (declared.has(name)) removals.push(name);
+				// Only the inline mode sends removals: the deferred-tail endpoints are only
+				// known to read additions (deepseek-harness `addition-only`).
+				if (strategy === "anthropic_tool_addition" && declared.has(name)) removals.push(name);
 				continue;
 			}
 			const definition = resolveDefinition(name);

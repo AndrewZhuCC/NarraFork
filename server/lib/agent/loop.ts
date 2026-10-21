@@ -91,6 +91,7 @@ import {
 	resolveAdapterToolLoadingStrategy,
 	sameToolLoadingLayout,
 	type ToolLoadingStrategy,
+	usesToolLoading,
 } from "./tool-loading";
 import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
@@ -2838,7 +2839,7 @@ async function* agentLoopInMetadataSnapshot(
 	let toolLoadingStrategy: ToolLoadingStrategy =
 		inheritedTools?.toolLoadingStrategy ?? "replace_tools";
 	function formatRequestToolsForProvider(): unknown[] {
-		toolLoadingStrategy = config.toolLoading
+		toolLoadingStrategy = usesToolLoading(config.toolLoading)
 			? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
 			: "replace_tools";
 		return formatRequestTools(

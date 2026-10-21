@@ -77,6 +77,9 @@ describe("tool loading strategy resolution", () => {
 			"openai_additional_tools",
 		]);
 
+		// Open-weights gpt-oss is served by third parties and falls to the generic default.
+		expect(defaultToolLoadingModes("gpt-oss-120b")).toEqual(["custom_injection"]);
+
 		expect(defaultToolLoadingModes("deepseek-v4-pro")).toEqual(["anthropic_deferred_tail"]);
 		expect(defaultToolLoadingModes("anthropic:glm-5.1")).toEqual(["custom_injection"]);
 	});
@@ -229,10 +232,24 @@ describe("history projection", () => {
 		expect(changes[2]?.additions.map((a) => a.name)).toEqual(["Eval"]);
 	});
 
-	test("the deferred tail references tools by name", () => {
+	test("the deferred tail references tools by name and sends no removals", () => {
 		const changes = project("anthropic_deferred_tail").map(toolLoadingChangeOf);
 		expect(changes[0]?.additions).toEqual([{ name: "Eval" }]);
-		expect(changes[1]?.removals).toEqual(["Eval"]);
+		expect(changes[1]).toBeUndefined();
+		expect(changes[2]?.additions).toEqual([{ name: "Eval" }]);
+	});
+
+	test("a removal never names a base tool that no longer resolves", () => {
+		const messages = [notice("tool_unloaded", ["Terminal"])];
+		const loadingState = deriveToolLoadingState(messages, MANAGED, []);
+		expect([...loadingState.base]).toEqual(["Terminal"]);
+		const projected = projectToolLoadingHistory(
+			messages,
+			loadingState,
+			"anthropic_tool_addition",
+			(name) => (name === "Terminal" ? null : resolveDefinition(name)),
+		);
+		expect(toolLoadingChangeOf(projected[0])).toBeUndefined();
 	});
 
 	test("additional_tools declares a tool once per epoch", () => {

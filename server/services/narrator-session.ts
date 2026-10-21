@@ -8764,6 +8764,11 @@ export async function loadOptionalTool(
 	});
 	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
 	if (current.includes(toolName)) return "already_loaded";
+	// A resident tool is preloaded in memory only. Loading it again changes nothing the
+	// model sees, so no load notice may be written for it: the notice would move it out
+	// of the request's tool array (see lib/agent/tool-loading.ts).
+	const active = activeNarrators.get(narratorId);
+	const alreadyActive = active?._enabledOptionalTools.has(toolName) ?? false;
 
 	// Persist
 	await db
@@ -8772,13 +8777,12 @@ export async function loadOptionalTool(
 		.where(eq(narrators.id, narratorId));
 
 	// Also update in-memory session if active
-	const active = activeNarrators.get(narratorId);
 	if (active) {
 		active._enabledOptionalTools.add(toolName);
 	}
 
 	logger.info("Optional tool loaded", { narratorId, toolName });
-	return "loaded";
+	return alreadyActive ? "already_loaded" : "loaded";
 }
 
 /**

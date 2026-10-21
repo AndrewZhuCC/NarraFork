@@ -929,6 +929,7 @@ export async function runAgentLoopUnlocked(
 					? [...OPTIONAL_TOOLS.values()]
 							.filter(
 								(tool) =>
+									(!tool.isAvailable || tool.isAvailable()) &&
 									profileToolFilter(tool) &&
 									(!oauthRuntime || oauthRuntime.allowedTools.has(tool.name)) &&
 									!active._disabledTools.has(tool.name),

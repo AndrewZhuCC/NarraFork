@@ -18,6 +18,7 @@ import {
 	projectToolLoadingHistory,
 	resolveLoadableToolDefinition,
 	type ToolLoadingState,
+	usesToolLoading,
 } from "../../lib/agent/tool-loading";
 import { isTopLevelMessage, type OwnTurnPlacement } from "../../lib/runtime-source";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
@@ -232,7 +233,7 @@ export async function buildRuntimeHistory(
 				options.toolLoading.current,
 			)
 		: undefined;
-	const toolLoadingStrategy = toolLoadingState
+	const toolLoadingStrategy = usesToolLoading(toolLoadingState)
 		? resolveHistoryToolLoadingStrategy(options.model, options.provider)
 		: undefined;
 	// Injected schemas are plain notice text, so they are written here: the receipt guards

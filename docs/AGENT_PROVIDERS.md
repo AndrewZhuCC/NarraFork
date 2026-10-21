@@ -26,7 +26,8 @@
 `/load` 以前直接改请求的 `tools` 数组。`tools` 位于各家缓存前缀的最前面，所以每次加载都会让整个会话的 prompt cache 失效。现在在一个上下文纪元（最近一次 compact 之后的可见历史）内，`tools` 数组保持不变，加载在历史里按目标协议送达。实现集中在 `server/lib/agent/tool-loading.ts`。
 
 **数组与历史怎么分工**
-- `managed` 是受会话加载控制的可选工具：能力天花板允许全部工具时，取 `OPTIONAL_TOOLS` 中通过其他过滤（天花板、OAuth、trait 禁用）的那些。
+- `managed` 是受会话加载控制的可选工具：能力天花板允许全部工具时，取 `OPTIONAL_TOOLS` 中可用（`isAvailable`）且通过其他过滤（天花板、OAuth、trait 禁用）的那些。`managed` 为空的会话保持旧的请求形态，不带占位工具和 beta。
+- 已经在内存里预加载的工具（resident）再 `/load` 时返回 `already_loaded`，不写提示行；否则提示行会把它移出数组。
 - 从当前已加载集合出发，把可见历史里的加载/卸载提示行倒放，得到纪元开始时已加载的集合（`base`）。resident 预加载、创建时预加载、fork 继承的工具没有提示行，自然落在 `base` 里。
 - `tools` 数组只放非 managed 工具和 `base`；纪元内加载的工具在其提示行的位置送达。compact 之后可见历史变了，`base` 随之吸收之前的加载。
 - 卸载不缩小数组，执行器拒绝调用未加载的 managed 工具（`config.isToolLoaded`）。
@@ -37,12 +38,12 @@
 | 策略 | 协议 | `tools` 数组 | 加载位置写什么 |
 |---|---|---|---|
 | `anthropic_tool_addition` | Anthropic Messages | `base` + 末尾一个 `defer_loading` 占位工具 | `role:"system"` 消息：`tool_addition` 内联完整定义；卸载发 `tool_removal`；请求头加 `inline-tools-2026-09-15` |
-| `anthropic_deferred_tail` | Anthropic Messages | `base` + 占位工具 + 纪元内加载过的工具（`defer_loading`，按首次加载顺序追加在末尾） | `role:"system"` 消息：`tool_addition` 按名引用；请求头加 `mid-conversation-tool-changes-2026-07-01` |
+| `anthropic_deferred_tail` | Anthropic Messages | `base` + 占位工具 + 纪元内加载过的工具（`defer_loading`，按首次加载顺序追加在末尾） | `role:"system"` 消息：`tool_addition` 按名引用；不发 `tool_removal`（已知端点只读 addition）；请求头加 `mid-conversation-tool-changes-2026-07-01` |
 | `openai_additional_tools` | OpenAI Responses | `base` | 提示行之前插入一项 `{type:"additional_tools", role:"developer", tools}`；每个工具每纪元只声明一次；卸载只靠文本 |
 | `custom_injection` | 任意 | `base` | 提示行文本末尾追加 `<tool_definitions>` JSON schema；每个工具每纪元只追加一次 |
 
 **选择规则**
-- 模型卡字段 `tool_loading_modes`（按优先级排列）优先；未声明时按裸模型名取默认值：含 `claude` → `anthropic_tool_addition`（Opus 4.8+、Sonnet/Haiku 5.5+、Fable/Mythos；更早的版本不启用），含 `gpt` → `openai_additional_tools`（OpenAI API 需 5.4+，Codex 后端需 5.6+），含 `deepseek` → `anthropic_deferred_tail`，其他 → `custom_injection`。解析不出版本号的照常启用。
+- 模型卡字段 `tool_loading_modes`（按优先级排列）优先；未声明时按裸模型名取默认值：含 `claude` → `anthropic_tool_addition`（Opus 4.8+、Sonnet/Haiku 5.5+、Fable/Mythos；更早的版本不启用），含 `gpt` → `openai_additional_tools`（OpenAI API 需 5.4+，Codex 后端需 5.6+；开源权重的 `gpt-oss` 按"其他"处理），含 `deepseek` → `anthropic_deferred_tail`，其他 → `custom_injection`。解析不出版本号的照常启用。
 - 取列表里第一个与适配器 `toolLoadingTarget()` 报告的协议相容的方式，都不相容就用 `replace_tools`。NUG 按渠道类型报告协议，并用路由后的模型名匹配默认值。
 - 设为空列表 `[]` 即对该模型关闭，在设置页模型卡里编辑。
 

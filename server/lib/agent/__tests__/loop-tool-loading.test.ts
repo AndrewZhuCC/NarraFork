@@ -155,6 +155,17 @@ describe("loop tool loading", () => {
 		expect(toolOutputs[0]).toContain(`Tool is not loaded in this session: ${BASE}`);
 	});
 
+	test("a session with no loadable tools keeps the plain request shape", async () => {
+		reset([]);
+		await drain(
+			makeConfig({
+				toolLoading: { managed: new Set(), base: new Set(), loaded: [], current: new Set() },
+				isToolLoaded: () => true,
+			}),
+		);
+		expect(requests[0]).toEqual({ tools: [CORE, BASE, LOADED], strategy: "replace_tools" });
+	});
+
 	test("without a loading state every filtered tool is sent as before", async () => {
 		reset([]);
 		await drain(makeConfig({}));
