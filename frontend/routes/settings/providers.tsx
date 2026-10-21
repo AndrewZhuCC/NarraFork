@@ -459,12 +459,6 @@ function SettingsProvidersPage() {
 	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
 
 	useEffect(() => {
-		if (search.provider === "codex") setSelectedProvider("codex");
-		if (search.provider === "tokendance" && tokenDance?.connected)
-			setSelectedProvider("tokendance");
-	}, [search.provider, tokenDance?.connected]);
-
-	useEffect(() => {
 		if (providerSettingsDirty) {
 			setHighlight(true);
 			const timer = setTimeout(() => setHighlight(false), 1500);
@@ -938,6 +932,37 @@ function SettingsProvidersPage() {
 		tokenDanceDisabled,
 		t,
 	]);
+
+	// `?provider=` deep link (model picker's provider settings button, Codex quota
+	// indicator, TokenDance recovery). Accepts a provider id or a model prefix and
+	// opens that provider's config once per link, so going back to the overview
+	// afterwards is not undone by later state changes.
+	const consumedProviderLinkRef = useRef<string | null>(null);
+	useEffect(() => {
+		const target = search.provider;
+		if (!target) {
+			consumedProviderLinkRef.current = null;
+			return;
+		}
+		if (consumedProviderLinkRef.current === target) return;
+		if (target === "tokendance") {
+			if (!tokenDance?.connected) return;
+			consumedProviderLinkRef.current = target;
+			setSelectedProvider("tokendance");
+			return;
+		}
+		if (target === "codex") {
+			consumedProviderLinkRef.current = target;
+			setSelectedProvider("codex");
+			return;
+		}
+		const group =
+			providerGroups.find((item) => item.providerId === target) ??
+			providerGroups.find((item) => item.prefix === target);
+		if (!group) return;
+		consumedProviderLinkRef.current = target;
+		setSelectedProvider(group.providerId ?? group.prefix);
+	}, [search.provider, tokenDance?.connected, providerGroups]);
 
 	// ── Provider label for detail panel ──
 	/**
