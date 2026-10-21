@@ -85,6 +85,7 @@ const PROP_KEYS = {
 	onTogglePromptForKey: true,
 	resolveRowToolActions: true,
 	onResumeSubagentRecovery: true,
+	onDismissSubagentRecovery: true,
 	specCarryoverActions: true,
 	errorNoticeActions: true,
 	injectionGuardActions: true,

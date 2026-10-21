@@ -2,11 +2,6 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
-	MAX_MODEL_CONTEXT_WINDOW,
-	MIN_MODEL_CONTEXT_WINDOW,
-	normalizeModelContextWindowOverrides,
-} from "@shared/model-context-window";
-import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -55,6 +50,12 @@ import {
 	syncOpencodeUsageCache,
 } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import { getHome } from "../lib/platform";
+import {
+	discoverPendingProviderBalances,
+	getProviderBalanceGenerations,
+	syncProviderBalanceCache,
+} from "../lib/provider-balance-cache";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
@@ -91,7 +92,6 @@ import {
 	codexTierOrderSchema,
 	commandBlacklistEntrySchema,
 	commandWhitelistEntrySchema,
-	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import {
@@ -110,6 +110,7 @@ import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
 import { listPluginProviderModelGroups } from "../services/plugin-provider-model-source";
 import { pluginProviderRegistry } from "../services/plugin-provider-registry";
+import { getProjectDirStatus } from "../services/project-dir";
 import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
@@ -379,7 +380,8 @@ export const updateSettingsSchema = z
 		diskSafety: diskSafetySettingsSchema.optional(),
 		paths: z
 			.object({
-				defaultProjectDir: z.string().min(1),
+				// "" = unset; a non-empty value must name an existing directory (checked on save).
+				defaultProjectDir: z.string().trim(),
 				/**
 				 * Extra roots the in-browser editor may write to.
 				 *
@@ -562,14 +564,12 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.preprocess(
-					normalizeModelContextWindowOverrides,
-					z.record(
-						z.string(),
-						z.number().int().min(MIN_MODEL_CONTEXT_WINDOW).max(MAX_MODEL_CONTEXT_WINDOW),
-					),
-				),
-				modelCards: z.array(modelCardSchema).max(500).optional(),
+				// Windows are edited through the model catalog now. A page loaded before the
+				// upgrade still sends its old map; reject it rather than drop its edits silently.
+				modelContextWindows: z.unknown().refine(() => false, {
+					message:
+						"Context windows are now saved from each model row; reload the page and set them again",
+				}),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),
@@ -996,6 +996,7 @@ async function buildSettingsResponse(
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
 		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
+		providerBalanceGenerations: getProviderBalanceGenerations(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1274,7 +1275,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
-	// (summaryModel, hiddenModels, modelContextWindows, customModels) that reference stale models.
+	// (summaryModel, hiddenModels, provider-model overrides, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
 	const removedProviderGroups = [
 		{ ids: removedCustomApiIds, providers: prev.customApiProviders },
@@ -1602,6 +1603,21 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			validated.vnet.relayToken = current.vnet?.relayToken;
 		}
 
+		// A newly chosen default project directory must already exist: nothing creates it,
+		// and a missing default leaves every new session without a working directory.
+		// Re-saving an unchanged value is allowed even if it has since disappeared, so an
+		// unrelated settings save never fails on it.
+		const nextProjectDir = validated.paths?.defaultProjectDir;
+		if (nextProjectDir && nextProjectDir !== current.paths.defaultProjectDir) {
+			const status = getProjectDirStatus(nextProjectDir, getHome());
+			if (status.state !== "valid") {
+				throw new ValidationError(
+					`Default project directory is not an existing directory: ${status.path ?? nextProjectDir}`,
+					"PROJECT_DIR_NOT_FOUND",
+				);
+			}
+		}
+
 		// Validate TLS cert/key files exist when enabling TLS
 		if (validated.server?.tls?.enabled) {
 			const { certFile, keyFile } = validated.server.tls;
@@ -1817,8 +1833,10 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		}
 		// Invalidate account/transport identities immediately after a successful save.
 		syncDeepSeekBalanceCache();
+		syncProviderBalanceCache();
 		if (validated.customApiProviders || validated.proxy) {
 			void refreshAllDeepSeekBalances().catch(() => {});
+			discoverPendingProviderBalances();
 		}
 		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
@@ -2056,6 +2074,8 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 		geminiProviders: customApiProvidersToGemini(nextCustomApiProviders),
 	};
 	saveSettings(merged);
+	syncProviderBalanceCache();
+	discoverPendingProviderBalances();
 
 	logger.info("Provider base URL fixed with /v1 suffix", {
 		providerId: target.id,

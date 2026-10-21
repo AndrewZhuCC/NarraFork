@@ -18,6 +18,8 @@ import {
 import { maskSecretValues } from "../lib/agent/request-dump";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "../lib/cors-origin";
 import { AppError } from "../lib/errors";
+import { rewriteConnectionOverrides } from "../lib/model-catalog";
+import { createPersistedCredentialCache } from "../lib/persisted-credential-cache";
 import { saveSettings, settings } from "../lib/settings";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
 import { registerTokenDanceRuntime } from "../lib/tokendance-runtime";
@@ -53,6 +55,34 @@ interface PaymentEntry {
 	finalError?: boolean;
 }
 let balanceCache: BalanceCache | undefined;
+type PersistedBalance = Pick<
+	TokenDanceBalance,
+	"credits" | "creditsUsed" | "balance" | "updatedAt"
+>;
+// The last good balance survives restarts, restored only for the same key + generation.
+const persistedBalance = createPersistedCredentialCache<PersistedBalance>(
+	"tokendance-balance.json",
+	(raw) => {
+		const value = record(raw);
+		if (
+			!value ||
+			![value.credits, value.creditsUsed, value.balance, value.updatedAt].every(
+				Number.isSafeInteger,
+			)
+		)
+			return null;
+		return {
+			credits: value.credits as number,
+			creditsUsed: value.creditsUsed as number,
+			balance: value.balance as number,
+			updatedAt: value.updatedAt as number,
+		};
+	},
+);
+function balanceIdentity(): string | undefined {
+	const config = getTokenDanceRuntimeConfig();
+	return config ? JSON.stringify([config.apiKey, config.generation]) : undefined;
+}
 // Includes failed/uncertain creates: retrying the same confirmed request never POSTs twice.
 const payments = new Map<string, PaymentEntry>();
 const TTL = 10 * 60_000;
@@ -671,15 +701,17 @@ async function billingRequest(
 }
 function currentBalanceCache(): BalanceCache {
 	if (!balanceCache || balanceCache.generation !== generation()) {
+		const identity = balanceIdentity();
+		const restored = identity ? persistedBalance.restore("tokendance", identity) : undefined;
 		balanceCache = {
 			generation: generation(),
 			attemptedAt: -Infinity,
 			value: {
 				generation: generation(),
-				credits: null,
-				creditsUsed: null,
-				balance: null,
-				updatedAt: null,
+				credits: restored?.credits ?? null,
+				creditsUsed: restored?.creditsUsed ?? null,
+				balance: restored?.balance ?? null,
+				updatedAt: restored?.updatedAt ?? null,
 				loading: false,
 				hasError: false,
 			},
@@ -732,6 +764,14 @@ export async function refreshTokenDanceBalance(force = true): Promise<TokenDance
 				loading: false,
 				hasError: false,
 			};
+			const identity = JSON.stringify([config.apiKey, config.generation]);
+			const { credits, creditsUsed, balance, updatedAt } = cache.value;
+			persistedBalance.save("tokendance", identity, {
+				credits,
+				creditsUsed,
+				balance,
+				updatedAt,
+			});
 		} catch {
 			if (balanceCache === cache) cache.value.hasError = true;
 		} finally {
@@ -988,10 +1028,7 @@ export async function deleteTokenDanceConnection(): Promise<void> {
 				agent.customModels = agent.customModels.filter((model) => !isReference(model.value));
 			if (agent.modelCards)
 				agent.modelCards = agent.modelCards.filter((card) => !isReference(card.modelKey));
-			if (agent.modelContextWindows)
-				agent.modelContextWindows = Object.fromEntries(
-					Object.entries(agent.modelContextWindows).filter(([key]) => !isReference(key)),
-				);
+			rewriteConnectionOverrides(latest, (model) => (isReference(model) ? null : model));
 			if (agent.subagentModels) {
 				for (const key of Object.keys(
 					agent.subagentModels,
@@ -1021,5 +1058,6 @@ export async function deleteTokenDanceConnection(): Promise<void> {
 		models = [];
 		modelsGeneration = -1;
 		recoveryAction = undefined;
+		persistedBalance.remove("tokendance");
 	});
 }

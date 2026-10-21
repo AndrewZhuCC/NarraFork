@@ -21,8 +21,6 @@ interface GrokSectionProps {
 	settings: Record<string, unknown> | undefined;
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
-	modelContextWindows: Record<string, number>;
-	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 }
 
@@ -30,8 +28,6 @@ export const GrokSection = React.memo(function GrokSection({
 	settings: settingsData,
 	hiddenModels,
 	onToggleHidden,
-	modelContextWindows,
-	onContextWindowChange,
 	onTestModel,
 }: GrokSectionProps) {
 	const { t } = useTranslation("settings");

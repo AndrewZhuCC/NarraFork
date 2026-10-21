@@ -83,7 +83,7 @@ function insertMessage(params: {
 	id: string;
 	seq: number;
 	narratorId?: string;
-	role?: "user" | "assistant" | "system" | "sys";
+	role?: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown[];
 	contentText?: string | null;
 	parentToolUseId?: string | null;
@@ -3280,6 +3280,141 @@ describe("dismissInterruptTaskGuardMessage", () => {
 
 		expect(
 			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "g2") }),
+		).toBeDefined();
+		expect(await messageVersionOf("n1")).toBe(0);
+	});
+});
+
+/**
+ * Dismissing the post-error subagent recovery card.
+ *
+ * Closing the card means "leave these subagents stopped", so the DELETE must touch
+ * nothing but the display row that offered them: not the subagent narrators, not the
+ * transcript, and not a sibling narrator's ref to the same message.
+ */
+describe("dismissSubagentRecoveryMessage", () => {
+	const recoveryBlocks = [
+		{
+			type: "subagent_recovery",
+			status: "pending",
+			subagents: [{ id: "sub-1", title: "Investigate", subagentType: "explore" }],
+		},
+	];
+
+	function insertCard(id: string, seq: number, narratorId = "n1") {
+		insertMessage({ id, seq, narratorId, role: "disp", contentJson: recoveryBlocks });
+	}
+	async function messageVersionOf(narratorId: string) {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { messageVersion: true },
+		});
+		return row?.messageVersion ?? 0;
+	}
+
+	it("deletes the card and bumps messageVersion", async () => {
+		seedBase();
+		insertCard("r1", 1);
+		const before = await messageVersionOf("n1");
+
+		await narratorService.dismissSubagentRecoveryMessage("n1", "r1");
+
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "r1") }),
+		).toBeUndefined();
+		expect(
+			await db.query.narratorMessageRefs.findFirst({
+				where: eq(narratorMessageRefs.messageId, "r1"),
+			}),
+		).toBeUndefined();
+		// Without this the client's next page load is served the pre-delete document.
+		expect(await messageVersionOf("n1")).toBe(before + 1);
+	});
+
+	it("keeps the message row when ANOTHER narrator still references it", async () => {
+		seedBase();
+		db.insert(narrators)
+			.values({
+				id: "n2",
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "full",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+		insertCard("r1", 1);
+		db.insert(narratorMessageRefs)
+			.values({ id: "ref-n2-r1", narratorId: "n2", messageId: "r1", seq: 1 })
+			.run();
+
+		await narratorService.dismissSubagentRecoveryMessage("n1", "r1");
+
+		// The row survives for the fork…
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "r1") }),
+		).toBeDefined();
+		// …with exactly the fork's ref left.
+		const refs = await db.query.narratorMessageRefs.findMany({
+			where: eq(narratorMessageRefs.messageId, "r1"),
+		});
+		expect(refs.map((ref) => ref.narratorId)).toEqual(["n2"]);
+	});
+
+	it("refuses a display message that is not a recovery card", async () => {
+		seedBase();
+		// Same role, different card: every other display message must stay undeletable
+		// through this route.
+		insertMessage({
+			id: "other",
+			seq: 1,
+			role: "disp",
+			contentJson: [{ type: "spec_fork_carryover", openCount: 1 }],
+		});
+
+		await expect(narratorService.dismissSubagentRecoveryMessage("n1", "other")).rejects.toThrow(
+			/not a subagent recovery notice/,
+		);
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "other") }),
+		).toBeDefined();
+	});
+
+	it("refuses a recovery-shaped block on a non-disp message", async () => {
+		// Role is checked as well as the block: an assistant message could otherwise
+		// carry a matching block and become deletable.
+		seedBase();
+		insertMessage({ id: "a1", seq: 1, role: "assistant", contentJson: recoveryBlocks });
+		await expect(narratorService.dismissSubagentRecoveryMessage("n1", "a1")).rejects.toThrow();
+	});
+
+	it("is idempotent: a second dismissal is a no-op, not an error", async () => {
+		seedBase();
+		insertCard("r1", 1);
+		await narratorService.dismissSubagentRecoveryMessage("n1", "r1");
+		const afterFirst = await messageVersionOf("n1");
+		await narratorService.dismissSubagentRecoveryMessage("n1", "r1");
+		expect(await messageVersionOf("n1")).toBe(afterFirst);
+	});
+
+	it("ignores a message this narrator does not reference", async () => {
+		seedBase();
+		db.insert(narrators)
+			.values({
+				id: "n2",
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "fresh",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+		insertCard("r2", 1, "n2");
+
+		await narratorService.dismissSubagentRecoveryMessage("n1", "r2");
+
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "r2") }),
 		).toBeDefined();
 		expect(await messageVersionOf("n1")).toBe(0);
 	});

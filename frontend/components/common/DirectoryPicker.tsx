@@ -45,7 +45,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
@@ -104,7 +104,6 @@ export function DirectoryPicker({
 	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
 	const [opened, { open, close }] = useDisclosure(false);
 	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
-	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 
 	const handleOpen = () => {
 		if (!browseSupported) return;
@@ -163,23 +162,56 @@ export function DirectoryPicker({
 				rightSectionWidth={rightSectionExtra ? 64 : undefined}
 				dropdownPosition={dropdownPosition}
 			/>
-			<Modal
+			<DirectoryBrowserModal
 				opened={opened}
 				onClose={close}
-				title={t("selectDirectory")}
-				size={isWide ? 880 : "md"}
-				styles={DIRECTORY_BROWSER_MODAL_STYLES}
-			>
-				<DirectoryBrowser
-					mode={mode}
-					newTargetError={newTargetError}
-					initialPath={browsePath}
-					onSelect={handleSelect}
-					onCancel={close}
-					isWide={isWide}
-				/>
-			</Modal>
+				mode={mode}
+				newTargetError={newTargetError}
+				initialPath={browsePath}
+				onSelect={handleSelect}
+			/>
 		</>
+	);
+}
+
+/**
+ * The directory browser dialog on its own, for entry points that open it straight
+ * from a button instead of from a path field.
+ */
+export function DirectoryBrowserModal({
+	opened,
+	onClose,
+	onSelect,
+	initialPath,
+	mode = "existing",
+	newTargetError,
+}: {
+	opened: boolean;
+	onClose: () => void;
+	onSelect: (path: string) => void;
+	initialPath?: string;
+	mode?: "existing" | "newTarget";
+	newTargetError?: string;
+}) {
+	const { t } = useTranslation("common");
+	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
+	return (
+		<Modal
+			opened={opened}
+			onClose={onClose}
+			title={t("selectDirectory")}
+			size={isWide ? 880 : "md"}
+			styles={DIRECTORY_BROWSER_MODAL_STYLES}
+		>
+			<DirectoryBrowser
+				mode={mode}
+				newTargetError={newTargetError}
+				initialPath={initialPath}
+				onSelect={onSelect}
+				onCancel={onClose}
+				isWide={isWide}
+			/>
+		</Modal>
 	);
 }
 
@@ -270,6 +302,12 @@ function SortableFavoriteNav({
 
 // ── Directory Browser (modal content) ────────────────────────────────────────
 
+/** The browse route's "no such directory" rejection (an `ApiError` carrying its code). */
+function isPathNotFound(error: unknown): boolean {
+	const data = (error as { data?: { code?: unknown } } | null)?.data;
+	return data?.code === "PATH_NOT_FOUND";
+}
+
 interface DirectoryBrowserProps {
 	mode?: "existing" | "newTarget";
 	newTargetError?: string;
@@ -289,6 +327,7 @@ export function DirectoryBrowser({
 }: DirectoryBrowserProps) {
 	const { t } = useTranslation("common");
 	const [currentPath, setCurrentPath] = useState<string | undefined>(initialPath);
+	const initialPathRef = useRef(initialPath);
 	const [creatingFolder, setCreatingFolder] = useState(false);
 	const [newFolderName, setNewFolderName] = useState("");
 	const [showHidden, setShowHidden] = useState(false);
@@ -359,7 +398,22 @@ export function DirectoryBrowser({
 			}),
 		enabled: browseSupported,
 		gcTime: 30_000,
+		// A missing directory will not appear on retry; fail fast so the fallback below runs.
+		retry: (failures, err) => !isPathNotFound(err) && failures < 1,
 	});
+	// Opening on a directory that does not exist yet (typically the default
+	// `~/projects` on a fresh machine) steps up to its nearest existing parent instead
+	// of greeting the user with an error. Only the initial path does this; a path the
+	// user typed or navigated to keeps reporting the error.
+	const missingInitialPath =
+		currentPath !== undefined && currentPath === initialPathRef.current && isPathNotFound(error);
+	useEffect(() => {
+		if (!missingInitialPath || currentPath === undefined) return;
+		const parent = currentPath.replace(/[/\\]+$/, "").replace(/[/\\][^/\\]*$/, "");
+		const next = parent && parent !== currentPath ? parent : undefined;
+		initialPathRef.current = next;
+		setCurrentPath(next);
+	}, [missingInitialPath, currentPath]);
 	const directoryEntries = data?.entries.filter((entry) => entry.isDirectory !== false) ?? [];
 	const displayedEntries = directoryEntries.slice(0, MAX_DIRECTORY_ENTRIES);
 	const hiddenEntryCount = Math.max(0, directoryEntries.length - displayedEntries.length);

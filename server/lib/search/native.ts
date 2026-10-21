@@ -1,4 +1,4 @@
-import { getEffectiveModelMetadata } from "../model-catalog";
+import { getEffectiveModelProfile } from "../model-catalog";
 import {
 	getAnthropicProviderConfig,
 	getGrokProviderConfig,
@@ -40,7 +40,7 @@ export function isNativeSearchEnabled(config: NarraForkSettings = settings): boo
  * the main conversation request and the function-style `WebSearch` tool is hidden
  * from the model.
  *
- * Only Codex/Responses works this way. Its prompt caching is automatic prefix
+ * Codex/Responses and Grok work this way. Codex prompt caching is automatic prefix
  * caching computed upstream — the request carries no cache directives — so adding
  * a tool cannot cause cache *directives* to be dropped. Changing the tool list
  * still changes the prefix hash, but that is a one-time miss when the setting is
@@ -48,17 +48,15 @@ export function isNativeSearchEnabled(config: NarraForkSettings = settings): boo
  */
 export function usesInlineNativeSearch(provider: string, model: string): boolean {
 	if (
-		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
-			.metadata.nativeSearch?.supported === false
+		getEffectiveModelProfile(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.nativeSearch === false
 	)
 		return false;
 	if (usesCodexModel(provider, model)) {
 		if (provider === "codex" && settings.codex?.useWebSearch === false) return false;
 		return getOpenaiProviderConfig(provider)?.codexWebSearch !== false;
 	}
-	// Grok declares its own server-side search tools (web_search / x_search) in the
-	// main /responses request. Only counts as inline when at least one search switch
-	// is on, otherwise the function WebSearch tool stays visible.
+	// Grok declares server-side search tools in the main request only when enabled.
 	const config = getGrokProviderConfig(provider);
 	return !!config && (!!config.enableWebSearch || !!config.enableXSearch);
 }
@@ -90,8 +88,8 @@ export function usesInlineNativeSearch(provider: string, model: string): boolean
 export function usesSideRequestNativeSearch(provider: string, model?: string): boolean {
 	if (
 		model &&
-		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
-			.metadata.nativeSearch?.supported === false
+		getEffectiveModelProfile(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.nativeSearch === false
 	)
 		return false;
 	if (!isAnthropicProvider(provider)) return false;

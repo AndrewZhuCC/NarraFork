@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { isValidModelContextWindow } from "@shared/model-context-window";
 import { Hono } from "hono";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { registerListingWindows } from "../lib/model-catalog";
 import {
 	type GrokProviderConfig,
 	grokProviderPrefix,
@@ -112,47 +114,17 @@ export function getGrokCachedModels(): GrokModelInfo[] {
 	return result;
 }
 
-/**
- * Fill context window sizes into settings for newly added models, using cached
- * model data. Grok 4.x defaults to 500K when the gateway omits context sizes.
- */
-async function fillContextWindows(
-	newModels: string[],
-	provider: GrokProviderConfig,
-): Promise<void> {
-	let cached = getGrokCachedModels();
-	if (cached.length === 0) {
-		cached = await fetchGrokModels(provider);
-		cachedModelsByProvider.set(provider.id, cached);
-		saveCachedModels();
+// Listing limits are discovered metadata, below explicit user model/connection overrides.
+registerListingWindows((model) => {
+	for (const provider of settings.grokProviders ?? []) {
+		const prefix = grokProviderPrefix(provider);
+		if (!model.startsWith(`${prefix}:`)) continue;
+		const id = model.slice(prefix.length + 1);
+		const listed = cachedModelsByProvider.get(provider.id)?.find((entry) => entry.id === id);
+		if (listed && isValidModelContextWindow(listed.contextLength)) return listed.contextLength;
 	}
-	let contextMap = new Map(cached.map((m) => [m.id, m.contextLength]));
-
-	const missing = newModels.filter((id) => !contextMap.has(id));
-	if (missing.length > 0) {
-		try {
-			cached = await fetchGrokModels(provider);
-			cachedModelsByProvider.set(provider.id, cached);
-			saveCachedModels();
-			contextMap = new Map(cached.map((m) => [m.id, m.contextLength]));
-		} catch {
-			// Non-critical — proceed with whatever we have
-		}
-	}
-
-	let changed = false;
-	const windows = settings.agent.modelContextWindows ?? {};
-	settings.agent.modelContextWindows = windows;
-	for (const modelId of newModels) {
-		const ctx = contextMap.get(modelId);
-		const effective = ctx ?? (/grok-4/i.test(modelId) ? 500_000 : undefined);
-		if (effective != null && !windows[`${provider.prefix}:${modelId}`]) {
-			windows[`${provider.prefix}:${modelId}`] = effective;
-			changed = true;
-		}
-	}
-	if (changed) saveSettings(settings);
-}
+	return undefined;
+});
 
 /** Get enabled models grouped by provider. */
 export function getGrokModelsGrouped(): Array<{
@@ -252,10 +224,6 @@ grokRoutes.post("/refresh", async (c) => {
 		const models = await fetchGrokModels(provider);
 		cachedModelsByProvider.set(provider.id, models);
 		saveCachedModels();
-		await fillContextWindows(
-			models.map((m) => m.id),
-			provider,
-		);
 		return c.json({ providerId: provider.id, modelCount: models.length });
 	} catch (error) {
 		return c.json({ error: error instanceof Error ? error.message : String(error) }, 502);

@@ -13,6 +13,7 @@ import {
 	parseHelperManifest,
 } from "../../shared/helper-distribution";
 import { matchesWindowsPeArch } from "../../shared/windows-pe";
+import { logger } from "./logger";
 import { createUpdateFetchContext, type UpdateFetchContext } from "./net/update-fetch";
 import { narraforkDir, settings } from "./settings";
 
@@ -30,18 +31,36 @@ export function captureHelperSource(): HelperSource {
 	return normalizeHelperSource({
 		source: "github",
 		githubRepository: settings.update?.githubRepository,
+		...(settings.update?.source === "update-server"
+			? {
+					mirror: {
+						serverUrl: settings.update.serverUrl || "https://narrafork-update.b.domexie.cn",
+						product: settings.update.product ?? "narrafork",
+					},
+				}
+			: {}),
 	});
 }
 export function createDistributionContext(
-	source: HelperSource & { repository?: string } = captureHelperSource(),
+	source: HelperSource & { repository?: string; product?: string } = captureHelperSource(),
 	fetcher?: DistributionFetch,
 	transport: UpdateFetchContext = createUpdateFetchContext(),
 ): DistributionContext {
-	// Metadata delivery selection must never route auxiliary executable downloads to unsigned tools.
+	// GitHub remains authority; the optional mirror only delivers verified executable bytes.
 	const frozen = Object.freeze(
 		normalizeHelperSource({
 			source: "github",
 			repository: source.repository ?? settings.update?.githubRepository,
+			...(source.source === "github" && source.mirror
+				? { mirror: source.mirror }
+				: source.source === "update-server"
+					? {
+							mirror: {
+								serverUrl: source.serverUrl,
+								product: source.product ?? settings.update?.product ?? "narrafork",
+							},
+						}
+					: {}),
 		}),
 	);
 	const identity = helperSourceIdentity(frozen);
@@ -104,14 +123,26 @@ export async function fetchDistributionAsset(
 	name: string,
 	signal: AbortSignal,
 ): Promise<Response> {
-	let url = distributionAssetUrl(context.source, tag, name);
+	return fetchDistributionUrl(
+		context,
+		distributionAssetUrl(context.source, tag, name),
+		signal,
+		true,
+	);
+}
+async function fetchDistributionUrl(
+	context: DistributionContext,
+	url: string,
+	signal: AbortSignal,
+	github: boolean,
+): Promise<Response> {
 	const origin = new URL(url).origin;
 	for (let hop = 0; hop <= 5; hop++) {
 		const parsed = new URL(url);
 		if (
 			parsed.username ||
 			parsed.password ||
-			(context.source.source === "github"
+			(github
 				? parsed.protocol !== "https:" ||
 					parsed.port !== "" ||
 					!GITHUB_ASSET_HOSTS.has(parsed.hostname)
@@ -341,19 +372,78 @@ export async function verifyDistributionFile(
 		return false;
 	}
 }
+interface DistributionDownloadOptions {
+	signal?: AbortSignal;
+	timeoutMs: number;
+	maxBytes?: number;
+	allowUnsigned?: boolean;
+	allowFrozenSource?: boolean;
+}
 export async function downloadDistributionFile(
 	context: DistributionContext,
 	tag: string,
 	name: string,
 	path: string,
 	expected: { size?: number; sha256?: string; platform?: string },
-	options: {
-		signal?: AbortSignal;
-		timeoutMs: number;
-		maxBytes?: number;
-		allowUnsigned?: boolean;
-		allowFrozenSource?: boolean;
-	},
+	options: DistributionDownloadOptions,
+): Promise<string> {
+	// A single overall budget covers mirror + GitHub; timeout/cancel never restarts it.
+	const deadline = withDeadline(options.signal, options.timeoutMs);
+	const frozenOptions = { ...options, signal: deadline.signal };
+	try {
+		if (
+			context.source.source === "github" &&
+			context.source.mirror &&
+			expected.sha256 &&
+			expected.size
+		) {
+			const started = Date.now();
+			try {
+				return await downloadDistributionAttempt(
+					context,
+					tag,
+					name,
+					path,
+					expected,
+					frozenOptions,
+					true,
+				);
+			} catch (error) {
+				deadline.signal.throwIfAborted();
+				if (
+					error instanceof Error &&
+					(error.name === "AbortError" || error.name === "TimeoutError")
+				)
+					throw error;
+				if (!options.allowFrozenSource && !context.isCurrent())
+					throw new Error("Distribution source changed");
+				logger.info("Component mirror failed; falling back to pinned GitHub asset", {
+					durationMs: Date.now() - started,
+					bytes: expected.size,
+				});
+			}
+		}
+		return await downloadDistributionAttempt(
+			context,
+			tag,
+			name,
+			path,
+			expected,
+			frozenOptions,
+			false,
+		);
+	} finally {
+		deadline.dispose();
+	}
+}
+async function downloadDistributionAttempt(
+	context: DistributionContext,
+	tag: string,
+	name: string,
+	path: string,
+	expected: { size?: number; sha256?: string; platform?: string },
+	options: DistributionDownloadOptions,
+	mirror: boolean,
 ): Promise<string> {
 	const deadline = withDeadline(options.signal, options.timeoutMs);
 	const maxBytes = Math.min(options.maxBytes ?? HELPER_BINARY_MAX_BYTES, HELPER_BINARY_MAX_BYTES);
@@ -364,7 +454,24 @@ export async function downloadDistributionFile(
 		deadline.signal.throwIfAborted();
 		if (!Number.isFinite(maxBytes) || maxBytes < 1) throw new Error("Invalid binary size limit");
 		if (!expected.sha256 && !options.allowUnsigned) throw new Error("Unsigned distribution binary");
-		response = await fetchDistributionAsset(context, tag, name, deadline.signal);
+		// Validate the same fixed tag/name for both delivery paths.
+		distributionAssetUrl(context.source, tag, name);
+		const delivery = context.source.source === "github" ? context.source.mirror : undefined;
+		if (
+			mirror &&
+			(!delivery || !/^(helpers|executor)-v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(tag))
+		)
+			throw new Error("Invalid pinned component mirror identity");
+		const kind = tag.startsWith("helpers-v") ? "helpers" : "executor";
+		response =
+			mirror && delivery
+				? await fetchDistributionUrl(
+						context,
+						`${delivery.serverUrl}/api/v3/products/${encodeURIComponent(delivery.product)}/mirror/tools/${kind}/${encodeURIComponent(tag)}/assets/${encodeURIComponent(name)}`,
+						deadline.signal,
+						false,
+					)
+				: await fetchDistributionAsset(context, tag, name, deadline.signal);
 		if (!response.ok || Number(response.headers.get("content-length")) > maxBytes)
 			throw new Error("Distribution binary unavailable/oversized");
 		reader = response.body?.getReader();

@@ -77,8 +77,6 @@ export interface CommandCodeSectionProps {
 	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
 	modelProtocols: Record<string, CustomApiProtocol>;
 	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
-	modelContextWindows?: Record<string, number>;
-	onContextWindowChange?: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 	/** 丢弃服务端模型缓存并重拉；由页面负责在草稿未保存时先落盘。 */
 	onRefreshModels?: () => Promise<void>;
@@ -148,8 +146,6 @@ export function CommandCodeSection({
 	onCustomModelsChange,
 	modelProtocols,
 	onModelProtocolChange,
-	modelContextWindows,
-	onContextWindowChange,
 	onTestModel,
 	onRefreshModels,
 }: CommandCodeSectionProps) {
@@ -357,8 +353,6 @@ export function CommandCodeSection({
 							modelProtocols={modelProtocols}
 							onModelProtocolChange={onModelProtocolChange}
 							protocols={COMMAND_CODE_PROTOCOL_OPTIONS}
-							modelContextWindows={modelContextWindows ?? {}}
-							onContextWindowChange={onContextWindowChange ?? (() => {})}
 							onTestModel={onTestModel}
 						/>
 					)}
@@ -369,8 +363,6 @@ export function CommandCodeSection({
 							onCustomModelsChange={onCustomModelsChange}
 							hiddenModels={hiddenModels ?? new Set()}
 							onToggleHidden={onToggleHidden ?? (() => {})}
-							modelContextWindows={modelContextWindows ?? {}}
-							onContextWindowChange={onContextWindowChange ?? (() => {})}
 							onTestModel={onTestModel}
 						/>
 					)}

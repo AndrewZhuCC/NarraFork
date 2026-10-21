@@ -1,7 +1,29 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Hono } from "hono";
+import { invalidateUserCache } from "../../middleware/auth";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import * as outbound from "../net/outbound-fetch";
 import { type CustomApiProviderConfig, settings } from "../settings";
+
+/**
+ * The POST refresh route runs `requireAdmin`, which authorizes against the LIVE role read
+ * through the session store, never the token's `role` claim. The middleware below only sets
+ * `c.get("user")`, so this seam resolves each principal's role by actor id. The two roles
+ * carry distinct subs (below) so a single test can exercise both without the lookup (or its
+ * cache) colliding. Without the seam a non-admin would 401 USER_GONE instead of 403.
+ */
+const OPENCODE_ADMIN_ID = "opencode-admin";
+const OPENCODE_USER_ID = "opencode-user";
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === OPENCODE_ADMIN_ID ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
 
 const originalProviders = settings.customApiProviders;
 const originalProxy = settings.proxy;
@@ -29,8 +51,12 @@ let respond: () => Promise<Response> = async () => Response.json(body);
 
 const {
 	getAllOpencodeCachedUsages,
+	getOpencodeCachedUsage,
 	getOpencodeUsageGenerations,
 	isOpencodeCustomApiProvider,
+	isOpencodeUsageDue,
+	noteOpencodeUsageActivity,
+	OPENCODE_ACTIVITY_REFRESH_MIN_MS,
 	opencodeUsageUrl,
 	parseOpencodeUsageResponse,
 	refreshAllOpencodeUsages,
@@ -50,6 +76,9 @@ beforeEach(() => {
 });
 afterEach(() => mock.restore());
 afterAll(() => {
+	setAuthStores(undefined);
+	invalidateUserCache(OPENCODE_ADMIN_ID);
+	invalidateUserCache(OPENCODE_USER_ID);
 	settings.customApiProviders = originalProviders;
 	settings.proxy = originalProxy;
 	syncOpencodeUsageCache();
@@ -66,7 +95,8 @@ function deferred() {
 function appForRole(role: "admin" | "user") {
 	const app = new Hono();
 	app.use("*", async (c, next) => {
-		c.set("user", { sub: "test", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		const sub = role === "admin" ? OPENCODE_ADMIN_ID : OPENCODE_USER_ID;
+		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	app.onError((error) => {
@@ -167,7 +197,11 @@ describe("OpenCode Go usage", () => {
 		expect(fetchSpy).toHaveBeenCalledWith(
 			"https://opencode.ai/zen/go/v1/usage",
 			expect.objectContaining({
-				headers: { Authorization: "Bearer secret-test-key", Accept: "application/json" },
+				headers: {
+					Authorization: "Bearer secret-test-key",
+					"x-api-key": "secret-test-key",
+					Accept: "application/json",
+				},
 				redirect: "error",
 				signal: expect.any(AbortSignal),
 			}),
@@ -483,5 +517,110 @@ describe("OpenCode Go usage", () => {
 		// Generations are a runtime projection, never persisted into settings.
 		expect(settings).not.toHaveProperty("opencodeUsageGenerations");
 		expect(settings.customApiProviders?.[0]).not.toHaveProperty("generation");
+	});
+});
+
+describe("OpenCode Go usage: optional fields and refresh policy", () => {
+	test("reads absolute amounts and a balance when present, and derives percent only from them", () => {
+		const parsed = parseOpencodeUsageResponse({
+			usage: {
+				rolling: { status: "ok", used: 1.5, limit: 6, resetsAt: 1_792_500_000 },
+				weekly: { status: "rate-limited", percent: 100, used: "15", quota: "15" },
+				monthly: { percent: 40 },
+				balance: { amount: 12.34 },
+			},
+		});
+		expect(parsed.rolling).toEqual({
+			status: "ok",
+			percent: 25,
+			resetsAt: new Date(1_792_500_000 * 1000).toISOString(),
+			used: 1.5,
+			limit: 6,
+		});
+		expect(parsed.weekly).toMatchObject({ percent: 100, used: 15, limit: 15 });
+		expect(parsed.monthly).toEqual({ status: null, percent: 40, resetsAt: null });
+		expect(parsed.balance).toBe(12.34);
+	});
+
+	test("a zero limit or a lone amount never fabricates a ratio", () => {
+		const parsed = parseOpencodeUsageResponse({
+			usage: { rolling: { status: "ok", used: 3, limit: 0 }, weekly: { used: 3 } },
+		});
+		expect(parsed.rolling).toEqual({ status: "ok", percent: null, resetsAt: null });
+		expect(parsed.weekly).toBeNull();
+		expect(parsed).not.toHaveProperty("balance");
+	});
+
+	const cacheAt = (fetchedAt: number, rollingReset: string | null = null) => ({
+		generation: "g",
+		fetchedAt,
+		error: null,
+		rolling: { status: "ok" as const, percent: 10, resetsAt: rollingReset },
+		weekly: null,
+		monthly: null,
+	});
+
+	test("failures back off exponentially up to ten minutes", () => {
+		const fetchedAt = 1_000_000;
+		const due = (failures: number, after: number) =>
+			isOpencodeUsageDue({ cache: cacheAt(fetchedAt), failures }, fetchedAt + after);
+		expect(due(1, 59_999)).toBe(false);
+		expect(due(1, 60_000)).toBe(true);
+		expect(due(2, 119_999)).toBe(false);
+		expect(due(2, 120_000)).toBe(true);
+		expect(due(10, 599_999)).toBe(false);
+		expect(due(10, 600_000)).toBe(true);
+	});
+
+	test("a window that reset since the fetch makes the entry due early", () => {
+		const fetchedAt = Date.parse("2026-10-19T12:00:00Z");
+		const entry = { cache: cacheAt(fetchedAt, "2026-10-19T12:00:10Z"), failures: 0 };
+		expect(isOpencodeUsageDue(entry, fetchedAt + 5_000)).toBe(false);
+		expect(isOpencodeUsageDue(entry, fetchedAt + 10_000)).toBe(true);
+	});
+
+	test("request activity schedules one throttled refresh per provider", async () => {
+		const timers: Array<() => void> = [];
+		const delays: number[] = [];
+		const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => void,
+			delay: number,
+		) => {
+			timers.push(fn);
+			delays.push(delay);
+			return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+		}) as unknown as typeof setTimeout);
+		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
+		try {
+			noteOpencodeUsageActivity("ocg-test");
+			noteOpencodeUsageActivity("opencode-test");
+			noteOpencodeUsageActivity("not-a-provider");
+			expect(timers).toHaveLength(1);
+			// Never fetched: no throttle to wait out.
+			expect(delays[0]).toBe(0);
+			timeoutSpy.mockRestore();
+			timers[0]?.();
+			await Promise.resolve();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(fetchSpy).toHaveBeenCalledTimes(1);
+			expect(getOpencodeCachedUsage("opencode-test")?.fetchedAt).toBeGreaterThan(0);
+		} finally {
+			timeoutSpy.mockRestore();
+		}
+		// Right after a fetch the next nudge waits out the throttle.
+		const later: number[] = [];
+		const again = spyOn(globalThis, "setTimeout").mockImplementation(((
+			_fn: () => void,
+			delay: number,
+		) => {
+			later.push(delay);
+			return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+		}) as unknown as typeof setTimeout);
+		try {
+			noteOpencodeUsageActivity("ocg-test");
+			expect(later[0]).toBeGreaterThan(OPENCODE_ACTIVITY_REFRESH_MIN_MS - 1_000);
+		} finally {
+			again.mockRestore();
+		}
 	});
 });

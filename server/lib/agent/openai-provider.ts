@@ -68,7 +68,7 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
@@ -83,13 +83,7 @@ import {
 import { parseJsonTextWithBody } from "./response-body";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
-import {
-	type AgentToolUse,
-	ApiError,
-	isDeepSeekModel,
-	mapDeepSeekEffort,
-	type ResolvedToolDefinition,
-} from "./types";
+import { type AgentToolUse, ApiError, isDeepSeekModel, type ResolvedToolDefinition } from "./types";
 import {
 	omitUnsupportedParameters,
 	parseUnsupportedParameter,
@@ -106,7 +100,7 @@ export function applyOpenAIModelMetadata(
 	apiMode: OpenAIApiMode,
 	requested?: number,
 ): void {
-	const metadata = effectiveProviderMetadata(model);
+	const metadata = effectiveModelProfile(model);
 	// Codex endpoints (including NUG Codex) do not accept max_output_tokens.
 	// Ordinary Responses and Chat Completions retain the configured output ceiling.
 	if (apiMode !== "codex") {
@@ -261,10 +255,7 @@ export function appendCodexNativeTools(
 	model: string,
 	options?: { webSearch?: boolean; imageGeneration?: boolean },
 ): void {
-	if (
-		options?.webSearch === false ||
-		effectiveProviderMetadata(model).nativeSearch?.supported === false
-	) {
+	if (options?.webSearch === false || effectiveModelProfile(model).nativeSearch === false) {
 		removeNativeTool(tools, "web_search");
 	} else if (!hasNativeTool(tools, "web_search")) {
 		tools.push({ type: "web_search" });
@@ -338,7 +329,7 @@ export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
-	return resolveMetadataReasoning(effectiveProviderMetadata(model), reasoningEffort);
+	return resolveMetadataReasoning(effectiveModelProfile(model), reasoningEffort, model);
 }
 
 /**
@@ -354,7 +345,7 @@ export function resolveCodexRequestReasoningEffort(
 		normalizeCodexReasoningEffort(
 			model,
 			reasoningEffort ??
-				effectiveProviderMetadata(model).reasoning?.defaultLevel ??
+				effectiveModelProfile(model).reasoning?.defaultLevel ??
 				settings.agent.defaultReasoningEffort ??
 				"max",
 		) ?? "none"
@@ -369,8 +360,7 @@ export function resolveCodexRequestReasoningEffort(
  * all, which hid the tier menu for every other third-party model.
  *
  * Three shapes, because the field names are not interchangeable:
- *   - DeepSeek (completions): `thinking` block + `reasoning_effort`, and only
- *     high/max are accepted upstream.
+ *   - DeepSeek (completions): `thinking` block + metadata-resolved `reasoning_effort`.
  *   - Responses-compatible: `reasoning.effort`, matching the OpenAI Responses
  *     schema that these relays emulate. `encrypted_content` is NOT requested —
  *     that is a Codex-specific include handled on the Codex path.
@@ -382,21 +372,20 @@ function applyGenericReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): void {
-	const metadata = effectiveProviderMetadata(model);
-	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
+	const metadata = effectiveModelProfile(model);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort, model);
 	if (!reasoningEffort) return;
 	const bareModel = parseModelId(model).model;
 	const acceptsEffort = modelAcceptsReasoningEffort(bareModel, getReasoningEffortBlocklist());
 
-	// DeepSeek keeps its own wire shape (thinking block + two effective tiers).
+	// DeepSeek requires a thinking switch; effort tiers come from model metadata.
 	if (!usesResponsesEndpoint(apiMode) && isDeepSeekModel(bareModel)) {
 		if (reasoningEffort === "none") {
 			body.thinking = { type: "disabled" };
 			return;
 		}
 		body.thinking = { type: "enabled" };
-		const effort = mapDeepSeekEffort(reasoningEffort);
-		if (effort && acceptsEffort) body.reasoning_effort = effort;
+		if (acceptsEffort) body.reasoning_effort = reasoningEffort;
 		return;
 	}
 

@@ -47,6 +47,51 @@ async function simpleStage(f: ReturnType<typeof fixture>) {
 	return stage.publish(async () => {});
 }
 describe("WebDAV relay producer", () => {
+	test("concurrent same-hash objects share one conditional PUT and publication waits for settlement", async () => {
+		const f = fixture();
+		const stage = new MirrorRelayStage(identity, f.relay, AbortSignal.timeout(1000));
+		const bytes = Buffer.from("one immutable object");
+		const asset = { name: "first", size: bytes.length, sha256: sha(bytes) };
+		let duplicateCanceled = false;
+		const first = stage.uploadObject(asset, bytes);
+		const second = stage.uploadObject(
+			{ ...asset, name: "alias" },
+			new ReadableStream({
+				cancel() {
+					duplicateCanceled = true;
+				},
+			}),
+		);
+		await expect(stage.preparePayload({ assets: [] }, 1024)).rejects.toThrow("settle");
+		await Promise.all([first, second]);
+		expect(duplicateCanceled).toBe(true);
+		expect(
+			f.dav.requests.filter((r) => r.method === "PUT" && r.path.endsWith(asset.sha256)),
+		).toHaveLength(1);
+		expect(
+			f.dav.requests.filter((r) => r.method === "MKCOL" && /\/objects\/$/.test(r.path)),
+		).toHaveLength(1);
+		await stage.preparePayload({ assets: [asset] }, 1024);
+		await stage.publish(async () => {});
+		expect(readyObjects(f.dav)).toHaveLength(1);
+	});
+	test("failed object poisons the stage and cannot later publish a partial ready", async () => {
+		const f = fixture();
+		if (!f.relay.client) throw new Error("Missing fixture client");
+		const put = spyOn(f.relay.client, "put").mockRejectedValue(new WebDavError("HTTP_STATUS", 503));
+		try {
+			const stage = new MirrorRelayStage(identity, f.relay, AbortSignal.timeout(1000));
+			const bytes = Buffer.from("failure");
+			await expect(
+				stage.uploadObject({ name: "bad", size: bytes.length, sha256: sha(bytes) }, bytes),
+			).rejects.toThrow();
+			await expect(stage.preparePayload({}, 1024)).rejects.toThrow("settle");
+			await expect(stage.publish(async () => {})).rejects.toThrow("failed");
+			expect(readyObjects(f.dav)).toHaveLength(0);
+		} finally {
+			put.mockRestore();
+		}
+	});
 	test("default direct, explicit webdav, invalid mode fails closed", () => {
 		expect(resolveMirrorTransport({})).toBe("direct");
 		expect(resolveMirrorTransport({ NF_MIRROR_TRANSPORT: "webdav" })).toBe("webdav");
@@ -396,6 +441,7 @@ describe("safe independent mirror transport diagnostics", () => {
 					await mirrorPublishedGitHubRelease({
 						...identity,
 						transport: "webdav",
+						uploadConcurrency: 1,
 						relay: f.relay,
 						run: github.run,
 						downloadAsset: github.downloadAsset,

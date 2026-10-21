@@ -170,6 +170,7 @@ export function resolveRenderExtra(spec: {
 			// The measured block already carries the full payload; only the live
 			// callbacks come through opts (mutations live outside vlist/).
 			if (spec.opts?.onResume) extra.onResume = spec.opts.onResume;
+			if (spec.opts?.onDismiss) extra.onDismiss = spec.opts.onDismiss;
 			break;
 		case "plan-card":
 			if (typeof data.label === "string") extra.label = data.label;
@@ -451,6 +452,7 @@ export function renderElement(
 					measured={m}
 					onToggleRow={extra.onToggleRow as ((rowIndex: number) => void) | undefined}
 					onResume={extra.onResume as ((mode: "notify" | "await") => void) | undefined}
+					onDismiss={extra.onDismiss as (() => void) | undefined}
 				/>
 			);
 		case "tool-call":

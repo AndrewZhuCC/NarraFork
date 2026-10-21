@@ -19,6 +19,7 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useInputMenu } from "../../../hooks/useInputMenu";
 import type { SpecTaskItem } from "../../../lib/api/spec";
+import type { OpencodeUsageCache } from "../../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
@@ -44,6 +45,10 @@ import { ModelMenuItems } from "../model/ModelMenuItems";
 import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
+import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
+import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
+import type { QuotaPanelView } from "../model/quota-panel-view";
+import { useModelMenuProviderBadges } from "../model/use-model-menu-provider-badges";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
@@ -143,6 +148,8 @@ export interface NarratorInteractionStatusBarProps {
 		aggregations: any;
 		// biome-ignore lint/suspicious/noExplicitAny: provider label map passthrough.
 		providerLabels: any;
+		/** Settings projection, for the allowance/balance badges on provider groups. */
+		settingsData?: Parameters<typeof useModelMenuProviderBadges>[0];
 		defaultModelValue: string;
 		// biome-ignore lint/suspicious/noExplicitAny: refresh props are spread verbatim onto ModelMenuItems.
 		refreshProps: any;
@@ -209,6 +216,24 @@ export interface NarratorInteractionStatusBarProps {
 		balance: string | null;
 		detailsText: string | null;
 		hasDetailsPopover: boolean;
+		/**
+		 * OpenCode Go plan allowance for the current model's provider. Rendered by its
+		 * own structured indicator; `undefined` when the model is not on a Go endpoint.
+		 */
+		opencode?: {
+			usage: OpencodeUsageCache | null | undefined;
+			waitingForQuota: boolean;
+			waitingText: string | null;
+		};
+		/**
+		 * Windowed allowance of another provider (Kimi, Command Code), shown with the
+		 * same progress-bar indicator as OpenCode Go. `undefined` when not applicable.
+		 */
+		panel?: {
+			view: QuotaPanelView | null;
+			waitingForQuota: boolean;
+			waitingText: string | null;
+		};
 		shouldShowNugRechargeButton: boolean;
 		shouldShowNugRechargeInQuotaDetails: boolean;
 		onOpenNugRecharge: () => void;
@@ -297,6 +322,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	// (a click outside the menu) does not also close the model menu.
 	const [menuOpenDesktop, setMenuOpenDesktop] = useState(false);
 	const [menuOpenMobile, setMenuOpenMobile] = useState(false);
+	const { providerBadges: providerQuotaBadges, providerBalances } = useModelMenuProviderBadges(
+		model.settingsData,
+		menuOpenDesktop || menuOpenMobile,
+	);
 
 	// Quota-details popover open state + its delayed-close timer. Kept internal to
 	// the status bar since nothing else drives it; hovering the balance opens it and
@@ -527,6 +556,22 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 								isAdmin={currentUser?.role === "admin"}
 								compact={isMobileViewport}
 							/>
+							{quota.opencode && !isWorkspacePreview && (
+								<OpencodeQuotaIndicator
+									usage={quota.opencode.usage}
+									waitingForQuota={quota.opencode.waitingForQuota}
+									waitingText={quota.opencode.waitingText}
+									isMobile={isMobileViewport}
+								/>
+							)}
+							{quota.panel && !isWorkspacePreview && (
+								<QuotaPanelIndicator
+									view={quota.panel.view}
+									waitingForQuota={quota.panel.waitingForQuota}
+									waitingText={quota.panel.waitingText}
+									isMobile={isMobileViewport}
+								/>
+							)}
 							{/* Generic gateway/API quota balance */}
 							{quota.balance != null &&
 								(quota.hasDetailsPopover ? (
@@ -703,6 +748,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																}
 																onShowPrice={setPriceModel}
 																providerLabels={model.providerLabels}
+																providerBadges={providerQuotaBadges}
+																providerBalances={providerBalances}
 																onEditDefaultModel={model.onEditDefaultModel}
 																onEditSummaryModel={model.onEditSummaryModel}
 																onSetAsDefaultModel={model.onSetAsDefaultModel}
@@ -979,6 +1026,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															onSelect={(v) => model.mutation.mutate({ id: narratorId, model: v })}
 															onShowPrice={setPriceModel}
 															providerLabels={model.providerLabels}
+															providerBadges={providerQuotaBadges}
+															providerBalances={providerBalances}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
 															onSetAsDefaultModel={model.onSetAsDefaultModel}

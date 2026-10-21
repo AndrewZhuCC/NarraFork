@@ -41,7 +41,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../components/common/DirectoryPicker";
 import { useChapters } from "../../hooks/useChapters";
-import { useModelCardIndex } from "../../hooks/useModelCards";
+import { useActualResolvedModelCard } from "../../hooks/useModelCatalog";
 import { useAllModels } from "../../hooks/useModels";
 import { useNarrator, useNarrators } from "../../hooks/useNarrator";
 import { useProjects } from "../../hooks/useProjects";
@@ -556,7 +556,6 @@ function TaskFormModal({
 	);
 	const { groupedModels, allModels, defaultModelValue, aggregations, settingsData } =
 		useAllModels();
-	const modelCardIndex = useModelCardIndex();
 	const { data: chapterNarrators, isPending: chapterNarratorsPending } = useNarrators({
 		chapterId: opened && draft.runContext === "chapter" ? draft.chapterId : undefined,
 	});
@@ -578,12 +577,13 @@ function TaskFormModal({
 		reusable ? (reuseNarrator.effectiveModel ?? reuseNarrator.model) : draft.model,
 		{ defaultModelValue, aggregations },
 	);
+	const { data: modelCard } = useActualResolvedModelCard(opened ? resolvedModel : undefined);
 	const modelOption = allModels.find((option) => option.value === resolvedModel);
 	const effort = getModelReasoningEffort({
 		model: resolvedModel,
 		modelOption,
 		settings: settingsData,
-		modelCardIndex,
+		modelCard,
 	});
 	const effortDisabled =
 		!modelOption ||

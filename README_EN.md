@@ -153,6 +153,17 @@ bun run test
 
 When running a subset of tests, also use isolation mode: `bun test --isolate <test-file-path>`. See [Testing Guidelines](docs/TESTING.md) for testing conventions.
 
+### Release Checklist
+
+1. Check Git status in the primary repository workspace, then prepare the version and bilingual changelog.
+2. Review auxiliary component source changes, update component versions as needed, and run component identity and version tests with `--isolate`.
+3. Build, natively verify, approve, and publicly release updated auxiliary components. Confirm that the application's declared dependencies are available.
+4. Push the application version commit to the default branch, then create and push its version tag.
+5. Trigger the application release workflow and complete full CI, eight-platform builds, native verification, and release approval.
+6. Verify the public Release version, commit, and assets, then read back the update index target version, commit, and generation to confirm completion.
+
+See [Release Guidelines](docs/RELEASE.md) for commands, component version rules, and failure recovery.
+
 ### Repository Structure
 
 ```text

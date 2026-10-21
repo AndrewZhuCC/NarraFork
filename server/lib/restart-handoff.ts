@@ -24,6 +24,14 @@ const HANDOFF_TIMEOUT_MS = 60_000;
 const HANDOFF_POLL_INTERVAL_MS = 250;
 const HANDOFF_CONNECT_TIMEOUT_MS = 750;
 /**
+ * How long the handoff port must stay closed, after the handoff POST was refused outright, before
+ * the previous server is treated as already gone.
+ */
+const HANDOFF_ABSENT_GRACE_MS = 2_000;
+/** Printed once the previous server is confirmed gone; the Windows manager watches for it. */
+export const HANDOFF_COMPLETE_MESSAGE =
+	"Previous NarraFork server reported graceful shutdown complete.";
+/**
  * Socket-level budget for the handoff POST itself. Generous, because the old server only answers
  * after its teardown finished, and bounded so a wedged old process cannot hold the whole deadline
  * without the marker/port evidence paths getting their turn.
@@ -61,7 +69,7 @@ export function setObservedRestartHandoffForTests(handoff: ObservedRestartHandof
 type HandoffAttemptResult =
 	| { ok: true }
 	| { ok: false; kind: "http"; message: string }
-	| { ok: false; kind: "network"; message: string };
+	| { ok: false; kind: "network"; message: string; refused: boolean };
 
 type HandoffMarkerResult = { ok: true } | { ok: false; message: string };
 
@@ -114,6 +122,30 @@ async function waitForHandoffPortToClose(
 ): Promise<boolean> {
 	while (Date.now() < deadlineMs && !signal.aborted) {
 		if (!(await canConnectToHandoffPort(handoffUrl, signal))) return true;
+		await sleep(HANDOFF_POLL_INTERVAL_MS, signal);
+	}
+	return false;
+}
+
+/**
+ * Resolve true once the handoff port has stayed closed for the whole grace window.
+ *
+ * Only meaningful after the handoff POST was refused: the previous server never received the
+ * token, so it is not tearing down on our behalf and will never write the marker. A port that
+ * stays closed means it already exited on its own (stopped by hand, crashed, or a launcher handed
+ * this process a stale handoff environment). Resolves false if something is listening again, so
+ * the caller keeps relying on the marker. The instance lock in `./main` still refuses to start
+ * while a previous process holds the data directory.
+ */
+async function waitForAbsentPreviousServer(
+	handoffUrl: string,
+	deadlineMs: number,
+	signal: AbortSignal,
+): Promise<boolean> {
+	const closedSince = Date.now();
+	while (Date.now() < deadlineMs && !signal.aborted) {
+		if (await canConnectToHandoffPort(handoffUrl, signal)) return false;
+		if (Date.now() - closedSince >= HANDOFF_ABSENT_GRACE_MS) return true;
 		await sleep(HANDOFF_POLL_INTERVAL_MS, signal);
 	}
 	return false;
@@ -274,8 +306,37 @@ async function requestGracefulShutdown(
 			ok: false,
 			kind: "network",
 			message: err instanceof Error ? err.message : String(err),
+			refused: (err as { code?: unknown } | null)?.code === "ECONNREFUSED",
 		};
 	}
+}
+
+/** Whether this process was launched as an update replacement. */
+export function hasHandoffEnv(): boolean {
+	return Boolean(process.env[HANDOFF_URL_ENV] && process.env[HANDOFF_TOKEN_ENV]);
+}
+
+/**
+ * Remove the handoff environment from this process and return it.
+ *
+ * For the Windows manager, which launches the server as a child: only the replacement it starts
+ * for this update may carry these one-shot values. Left in `process.env`, every later start
+ * (takeover, restart) would inherit them and wait for a marker no server will ever write.
+ */
+export function takeHandoffEnv(): Record<string, string> | null {
+	const keys = [
+		HANDOFF_URL_ENV,
+		HANDOFF_TOKEN_ENV,
+		HANDOFF_MARKER_PATH_ENV,
+		HANDOFF_MARKER_NONCE_ENV,
+	];
+	const env: Record<string, string> = {};
+	for (const key of keys) {
+		const value = process.env[key];
+		if (value) env[key] = value;
+		delete process.env[key];
+	}
+	return env[HANDOFF_URL_ENV] && env[HANDOFF_TOKEN_ENV] ? env : null;
 }
 
 /**
@@ -356,14 +417,33 @@ export async function waitForPreviousServerShutdown(): Promise<boolean> {
 					error: first.result.message,
 					markerPath,
 				});
-				const marker = await markerWait;
-				if (!marker.ok) {
-					throw new Error(`${first.result.message}; ${marker.message}`);
+				// The exception is a refused connection: the request never reached anything, so no
+				// teardown is running that could write the marker. Waiting the full budget would only
+				// stall startup and then abort it, so a port that stays closed is accepted instead.
+				const refused = first.result.kind === "network" && first.result.refused;
+				const outcome: HandoffMarkerResult | "absent" = await Promise.race([
+					markerWait,
+					...(refused
+						? [
+								waitForAbsentPreviousServer(handoffUrl, deadlineMs, controller.signal).then(
+									(gone): HandoffMarkerResult | "absent" | Promise<HandoffMarkerResult> =>
+										gone ? "absent" : markerWait,
+								),
+							]
+						: []),
+				]);
+				if (outcome === "absent") {
+					logger.info("Previous NarraFork server is no longer listening; no handoff needed", {
+						markerPath,
+					});
+				} else if (!outcome.ok) {
+					throw new Error(`${first.result.message}; ${outcome.message}`);
+				} else {
+					logger.info("Previous NarraFork server shutdown marker confirmed after failed handoff", {
+						markerPath,
+					});
 				}
 				handoffSucceeded = true;
-				logger.info("Previous NarraFork server shutdown marker confirmed after failed handoff", {
-					markerPath,
-				});
 			}
 		} else {
 			// Compatibility path for updates started by older binaries that do not know
@@ -402,7 +482,7 @@ export async function waitForPreviousServerShutdown(): Promise<boolean> {
 			}
 		}
 
-		console.log("Previous NarraFork server reported graceful shutdown complete.");
+		console.log(HANDOFF_COMPLETE_MESSAGE);
 		logger.info("Previous NarraFork server shutdown confirmed");
 	} catch (err) {
 		console.error(

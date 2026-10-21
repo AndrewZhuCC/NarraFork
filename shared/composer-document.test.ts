@@ -4,9 +4,11 @@ import {
 	composerDocumentProjection,
 	composerDocumentText,
 	composerDocumentTextCandidates,
+	escapeComposerText,
 	legacyComposerDocumentText,
 	parseComposerDocument,
 	readComposerDocument,
+	unescapeComposerText,
 } from "./composer-document";
 import { fileReferenceMessageForDisplay } from "./file-reference";
 
@@ -305,6 +307,32 @@ describe("semantic composer document", () => {
 			text,
 			"> [quote] Q\n> x\n\n看和",
 		]);
+	});
+	test("escapes typed placeholder look-alikes once the document has attachments", () => {
+		const typed = "> [quote] mine\nsee [image #1: a.png] and \\[file #2: b]";
+		const textOnly = parseComposerDocument({
+			version: 1,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: typed }] }],
+		});
+		expect(composerDocumentText(textOnly).text).toBe(typed);
+		const withImage = parseComposerDocument({
+			version: 1,
+			assets: [{ id: "a", kind: "image", name: "a.png", size: 1, mimeType: "image/png" }],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: typed },
+						{ type: "attachment", id: "an", assetId: "a" },
+					],
+				},
+			],
+		});
+		const { text } = composerDocumentText(withImage);
+		expect(text).toBe(
+			"> [quote] mine\nsee \\[image #1: a.png] and \\\\[file #2: b][image #1: a.png]",
+		);
+		expect(unescapeComposerText(escapeComposerText(typed))).toBe(typed);
 	});
 	test("rejects arbitrary editor/html/path fields and unknown versions", () => {
 		for (const value of [

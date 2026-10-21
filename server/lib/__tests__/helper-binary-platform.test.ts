@@ -24,6 +24,12 @@ import { settings } from "../settings";
 
 const repository = "fixture/helper-platform";
 const releaseBase = `https://github.com/${repository}/releases/download/${HELPER_RELEASE_TAG}/`;
+const mirrorOrigin = "https://component-mirror.example";
+const mirrorBase = `${mirrorOrigin}/api/v3/products/narrafork/mirror/tools/helpers/${HELPER_RELEASE_TAG}/assets/`;
+function selectDelivery(source: "github" | "update-server") {
+	if (!settings.update) throw new Error("Missing fixture update settings");
+	settings.update.source = source;
+}
 
 const originalUpdate = settings.update ?? {
 	serverUrl: "https://legacy.example",
@@ -69,7 +75,8 @@ beforeEach(() => {
 		...originalUpdate,
 		source: "update-server",
 		githubRepository: repository,
-		serverUrl: "https://must-not-use-mirror.example",
+		serverUrl: mirrorOrigin,
+		product: "narrafork",
 		proxy: { mode: "direct" },
 	};
 	resetHelperBinaryDownloadCache();
@@ -145,96 +152,139 @@ describe("bounded PE architecture validation", () => {
 	});
 });
 
-describe("helper download architecture validation", () => {
-	test("rejects x64 served under ARM64 name, without caching it", async () => {
-		// Its digest matches the canonical fixture: rejection must reach PE architecture validation.
-		const payload = pe(0x8664);
+for (const delivery of ["github", "update-server"] as const) {
+	describe(`${delivery} helper download architecture validation`, () => {
+		test("rejects x64 served under ARM64 name, without caching it", async () => {
+			selectDelivery(delivery);
+			// Its digest matches the canonical fixture: rejection must reach PE architecture validation.
+			const payload = pe(0x8664);
+			const calls: string[] = [];
+			globalThis.fetch = (async (input: RequestInfo | URL) => {
+				const url = String(input);
+				calls.push(url);
+				return url.endsWith(HELPER_MANIFEST_FILENAME)
+					? Response.json(catalog(payload))
+					: new Response(Uint8Array.from(payload));
+			}) as unknown as typeof fetch;
+			const spec = getCliHelperSpec("zstd", "win32", "arm64");
+			if (!spec) throw new Error("Missing spec");
+			expect(
+				await downloadHelperBinary(
+					{ ...spec, expectedSha256: createHash("sha256").update(pe(0x8664)).digest("hex") },
+					{ bypassFailureCache: true },
+				),
+			).toBeNull();
+			expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
+			expect(
+				readdirSync(join(HELPER_BIN_DIR, "distribution")).filter(
+					(name) => name.endsWith(".exe") || name.endsWith(".tmp"),
+				),
+			).toEqual([]);
+			expect(calls).toEqual([
+				`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
+				...(delivery === "update-server" ? [`${mirrorBase}${spec.toolName}`] : []),
+				`${releaseBase}${spec.toolName}`,
+			]);
+		});
+		test("downloads native ARM64 even when legacy x64 cache exists", async () => {
+			selectDelivery(delivery);
+			writeFileSync(join(HELPER_BIN_DIR, "zstd.exe"), pe(0x8664));
+			const calls: string[] = [];
+			globalThis.fetch = (async (url: string | URL | Request) => {
+				calls.push(String(url));
+				return String(url).endsWith(HELPER_MANIFEST_FILENAME)
+					? Response.json(catalog(pe(0xaa64)))
+					: new Response(Uint8Array.from(pe(0xaa64)));
+			}) as unknown as typeof fetch;
+			const spec = getCliHelperSpec("zstd", "win32", "arm64");
+			if (!spec) throw new Error("Missing spec");
+			spec.expectedSha256 = createHash("sha256").update(pe(0xaa64)).digest("hex");
+			const path = await downloadHelperBinary(spec, { bypassFailureCache: true });
+			expect(path?.startsWith(join(HELPER_BIN_DIR, "distribution"))).toBe(true);
+			if (!path) throw new Error("Native ARM64 helper must be downloaded");
+			expect(path).toEndWith(".exe");
+			expect(await Bun.file(path).bytes()).toEqual(Uint8Array.from(pe(0xaa64)));
+			expect(calls).toEqual([
+				`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
+				`${delivery === "update-server" ? mirrorBase : releaseBase}${spec.toolName}`,
+			]);
+			expect(await downloadHelperBinary(spec)).toBe(path);
+			expect(calls.length).toBe(2);
+			expect(existsSync(join(HELPER_BIN_DIR, "zstd.exe"))).toBe(true);
+		});
+		test("limits chunked downloads without trusting content-length", async () => {
+			selectDelivery(delivery);
+			const cancelled: string[] = [];
+			const calls: string[] = [];
+			globalThis.fetch = (async (input: RequestInfo | URL) => {
+				const url = String(input);
+				calls.push(url);
+				if (url.endsWith(HELPER_MANIFEST_FILENAME)) return Response.json(catalog(pe(0xaa64)));
+				return new Response(
+					new ReadableStream({
+						pull(controller) {
+							controller.enqueue(new Uint8Array(128));
+						},
+						cancel() {
+							cancelled.push(url);
+						},
+					}),
+				);
+			}) as unknown as typeof fetch;
+			const spec = getCliHelperSpec("zstd", "win32", "arm64");
+			if (!spec) throw new Error("Missing spec");
+			expect(
+				await downloadHelperBinary(spec, { maxBytes: 64, bypassFailureCache: true }),
+			).toBeNull();
+			expect(cancelled).toEqual([
+				...(delivery === "update-server" ? [`${mirrorBase}${spec.toolName}`] : []),
+				`${releaseBase}${spec.toolName}`,
+			]);
+			expect(calls).toEqual([
+				`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
+				...(delivery === "update-server" ? [`${mirrorBase}${spec.toolName}`] : []),
+				`${releaseBase}${spec.toolName}`,
+			]);
+			expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
+			expect(
+				readdirSync(join(HELPER_BIN_DIR, "distribution")).filter(
+					(name) => name.endsWith(".exe") || name.endsWith(".tmp"),
+				),
+			).toEqual([]);
+		});
+	});
+}
+
+for (const failure of ["missing", "corrupt"] as const) {
+	test(`native ARM64 uses the same pinned GitHub asset after a ${failure} mirror response`, async () => {
+		selectDelivery("update-server");
+		const payload = pe(0xaa64);
+		const damaged = Uint8Array.from(payload);
+		damaged[200] = 1;
 		const calls: string[] = [];
 		globalThis.fetch = (async (input: RequestInfo | URL) => {
 			const url = String(input);
 			calls.push(url);
-			expect(url).toStartWith(releaseBase);
-			return url.endsWith(HELPER_MANIFEST_FILENAME)
-				? Response.json(catalog(payload))
-				: new Response(Uint8Array.from(payload));
+			if (url === `${releaseBase}${HELPER_MANIFEST_FILENAME}`)
+				return Response.json(catalog(payload));
+			if (url.startsWith(mirrorBase))
+				return failure === "missing" ? new Response(null, { status: 404 }) : new Response(damaged);
+			return new Response(Uint8Array.from(payload));
 		}) as unknown as typeof fetch;
 		const spec = getCliHelperSpec("zstd", "win32", "arm64");
 		if (!spec) throw new Error("Missing spec");
-		expect(
-			await downloadHelperBinary(
-				{ ...spec, expectedSha256: createHash("sha256").update(pe(0x8664)).digest("hex") },
-				{ bypassFailureCache: true },
-			),
-		).toBeNull();
-		expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
-		expect(
-			readdirSync(join(HELPER_BIN_DIR, "distribution")).filter(
-				(name) => name.endsWith(".exe") || name.endsWith(".tmp"),
-			),
-		).toEqual([]);
-		expect(calls).toEqual([
-			`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
-			`${releaseBase}${spec.toolName}`,
-		]);
-	});
-	test("downloads native ARM64 even when legacy x64 cache exists", async () => {
-		writeFileSync(join(HELPER_BIN_DIR, "zstd.exe"), pe(0x8664));
-		const calls: string[] = [];
-		globalThis.fetch = (async (url: string | URL | Request) => {
-			calls.push(String(url));
-			expect(String(url)).toStartWith(releaseBase);
-			return String(url).endsWith(HELPER_MANIFEST_FILENAME)
-				? Response.json(catalog(pe(0xaa64)))
-				: new Response(Uint8Array.from(pe(0xaa64)));
-		}) as unknown as typeof fetch;
-		const spec = getCliHelperSpec("zstd", "win32", "arm64");
-		if (!spec) throw new Error("Missing spec");
-		spec.expectedSha256 = createHash("sha256").update(pe(0xaa64)).digest("hex");
 		const path = await downloadHelperBinary(spec, { bypassFailureCache: true });
-		expect(path?.startsWith(join(HELPER_BIN_DIR, "distribution"))).toBe(true);
-		if (!path) throw new Error("Native ARM64 helper must be downloaded");
-		expect(path).toEndWith(".exe");
-		expect(await Bun.file(path).bytes()).toEqual(Uint8Array.from(pe(0xaa64)));
+		expect(path).not.toBeNull();
+		if (!path) throw new Error("Pinned GitHub fallback must preserve native ARM64 support");
+		expect(isWindowsPeFile(path, "arm64")).toBe(true);
+		expect(await Bun.file(path).bytes()).toEqual(Uint8Array.from(payload));
 		expect(calls).toEqual([
 			`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
+			`${mirrorBase}${spec.toolName}`,
 			`${releaseBase}${spec.toolName}`,
 		]);
-		expect(await downloadHelperBinary(spec)).toBe(path);
-		expect(calls.length).toBe(2);
-		expect(existsSync(join(HELPER_BIN_DIR, "zstd.exe"))).toBe(true);
-	});
-	test("limits chunked downloads without trusting content-length", async () => {
-		let cancelled = false;
-		const calls: string[] = [];
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
-			calls.push(url);
-			expect(url).toStartWith(releaseBase);
-			if (url.endsWith(HELPER_MANIFEST_FILENAME)) return Response.json(catalog(pe(0xaa64)));
-			return new Response(
-				new ReadableStream({
-					pull(controller) {
-						controller.enqueue(new Uint8Array(128));
-					},
-					cancel() {
-						cancelled = true;
-					},
-				}),
-			);
-		}) as unknown as typeof fetch;
-		const spec = getCliHelperSpec("zstd", "win32", "arm64");
-		if (!spec) throw new Error("Missing spec");
-		expect(await downloadHelperBinary(spec, { maxBytes: 64, bypassFailureCache: true })).toBeNull();
-		expect(cancelled).toBe(true);
-		expect(calls).toEqual([
-			`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
-			`${releaseBase}${spec.toolName}`,
-		]);
-		expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
 		expect(
-			readdirSync(join(HELPER_BIN_DIR, "distribution")).filter(
-				(name) => name.endsWith(".exe") || name.endsWith(".tmp"),
-			),
+			readdirSync(join(HELPER_BIN_DIR, "distribution")).filter((name) => name.endsWith(".tmp")),
 		).toEqual([]);
 	});
-});
+}

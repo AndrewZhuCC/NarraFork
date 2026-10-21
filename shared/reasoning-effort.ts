@@ -30,6 +30,24 @@ export const REASONING_EFFORT_VALUES: readonly ReasoningEffort[] = [
 ];
 
 /**
+ * Migrate the old DeepSeek UI's `xhigh` selection before applying declared tiers.
+ * This is not a capability table: unknown models and declarations that explicitly
+ * accept `xhigh` remain untouched. Gateway-reported tiers should bypass migration.
+ */
+export function migrateLegacyReasoningEffort(
+	model: string | undefined,
+	desired: ReasoningEffort,
+	supported: readonly ReasoningEffort[],
+): ReasoningEffort {
+	return desired === "xhigh" &&
+		model?.toLowerCase().includes("deepseek") &&
+		!supported.includes("xhigh") &&
+		supported.includes("high")
+		? "high"
+		: desired;
+}
+
+/**
  * Clamp a desired reasoning effort onto the tiers a model actually supports.
  *
  * Rules:

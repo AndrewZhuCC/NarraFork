@@ -15,8 +15,8 @@
  * ## Why the model area lives here rather than in the plugin
  *
  * Model visibility, context-window overrides and the model tester are host concerns: they
- * are stored in `settings.agent.hiddenModels` / `settings.agent.modelContextWindows` and
- * exercised through `/api/settings`, none of which a sandboxed iframe can reach
+ * are stored in `settings.agent.hiddenModels` and the model catalog and exercised through
+ * `/api/settings` and `/api/model-catalog`, none of which a sandboxed iframe can reach
  * (`connect-src 'none'`). A plugin panel therefore *cannot* implement them, and until this
  * existed a plugin provider simply had no model controls — unlike the built-in providers,
  * whose sections all render `ModelList` + `InlineCustomModels`.
@@ -86,8 +86,6 @@ export interface PluginProviderModelControls {
 	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
 	modelProtocols: Record<string, CustomApiProtocol>;
 	onModelProtocolChange: (modelValue: string, protocol: CustomApiProtocol | null) => void;
-	modelContextWindows: Record<string, number>;
-	onContextWindowChange: (modelValue: string, size: number | null) => void;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	onTestModel?: (model: string) => void;
@@ -371,16 +369,6 @@ function PluginProviderModels({
 	const [refreshing, setRefreshing] = useState(false);
 	const [outcome, setOutcome] = useState<CatalogRefreshOutcome | undefined>();
 
-	// Defaults come from the plugin's own catalog, so a model that reports its window shows
-	// that value as the placeholder instead of appearing unconfigured.
-	const defaultContextWindows = useMemo(() => {
-		const defaults: Record<string, number> = {};
-		for (const model of controls.models) {
-			if (typeof model.contextWindow === "number") defaults[model.value] = model.contextWindow;
-		}
-		return defaults;
-	}, [controls.models]);
-
 	const handleRefresh = async () => {
 		if (!providerInstanceId || refreshing) return;
 		setRefreshing(true);
@@ -448,9 +436,6 @@ function PluginProviderModels({
 					onBatchToggleHidden={controls.onBatchToggleHidden}
 					modelProtocols={controls.modelProtocols}
 					onModelProtocolChange={controls.onModelProtocolChange}
-					modelContextWindows={controls.modelContextWindows}
-					defaultContextWindows={defaultContextWindows}
-					onContextWindowChange={controls.onContextWindowChange}
 					onTestModel={controls.onTestModel}
 				/>
 			) : null}
@@ -460,8 +445,6 @@ function PluginProviderModels({
 				onCustomModelsChange={controls.onCustomModelsChange}
 				hiddenModels={controls.hiddenModels}
 				onToggleHidden={controls.onToggleHidden}
-				modelContextWindows={controls.modelContextWindows}
-				onContextWindowChange={controls.onContextWindowChange}
 				onTestModel={controls.onTestModel}
 			/>
 		</Stack>

@@ -10,6 +10,7 @@ import {
 	HANDOFF_URL_ENV,
 	postHandoffRequest,
 	setObservedRestartHandoffForTests,
+	takeHandoffEnv,
 	waitForPreviousServerShutdown,
 } from "../restart-handoff";
 
@@ -320,6 +321,26 @@ describe("waitForPreviousServerShutdown", () => {
 		expect(await waitForPreviousServerShutdown()).toBe(true);
 	});
 
+	test("proceeds when the previous server is already gone and refuses the handoff", async () => {
+		// Regression: the Windows manager passed a stale handoff environment to a server it started
+		// after the old one had been stopped by hand. Nothing could ever write the marker, so the
+		// replacement waited out the whole budget and then aborted startup.
+		cleanups.push(snapshotEnv(HANDOFF_ENV_KEYS));
+		const dir = tempMarkerDir();
+		const closed = Bun.serve({ port: 0, fetch: () => new Response("") });
+		const port = closed.port;
+		closed.stop(true);
+
+		process.env[HANDOFF_URL_ENV] = `http://127.0.0.1:${port}/api/gracefully_shutdown`;
+		process.env[HANDOFF_TOKEN_ENV] = "token";
+		process.env[HANDOFF_MARKER_PATH_ENV] = resolve(dir, "marker.json");
+		process.env[HANDOFF_MARKER_NONCE_ENV] = "nonce-absent";
+
+		const startedAt = Date.now();
+		expect(await waitForPreviousServerShutdown()).toBe(true);
+		expect(Date.now() - startedAt).toBeLessThan(10_000);
+	});
+
 	test("rejects a marker whose nonce belongs to a different handoff", async () => {
 		cleanups.push(snapshotEnv(HANDOFF_ENV_KEYS));
 		const dir = tempMarkerDir();
@@ -370,5 +391,24 @@ describe("waitForPreviousServerShutdown", () => {
 		delete process.env[HANDOFF_MARKER_NONCE_ENV];
 
 		expect(await waitForPreviousServerShutdown()).toBe(true);
+	});
+});
+
+describe("takeHandoffEnv", () => {
+	test("hands the handoff environment over once and clears it from the process", () => {
+		cleanups.push(snapshotEnv(HANDOFF_ENV_KEYS));
+		process.env[HANDOFF_URL_ENV] = "http://127.0.0.1:1/api/gracefully_shutdown";
+		process.env[HANDOFF_TOKEN_ENV] = "token";
+		process.env[HANDOFF_MARKER_PATH_ENV] = "/tmp/marker.json";
+		process.env[HANDOFF_MARKER_NONCE_ENV] = "nonce";
+
+		expect(takeHandoffEnv()).toEqual({
+			[HANDOFF_URL_ENV]: "http://127.0.0.1:1/api/gracefully_shutdown",
+			[HANDOFF_TOKEN_ENV]: "token",
+			[HANDOFF_MARKER_PATH_ENV]: "/tmp/marker.json",
+			[HANDOFF_MARKER_NONCE_ENV]: "nonce",
+		});
+		for (const key of HANDOFF_ENV_KEYS) expect(process.env[key]).toBeUndefined();
+		expect(takeHandoffEnv()).toBeNull();
 	});
 });

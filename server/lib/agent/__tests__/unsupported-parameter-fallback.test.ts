@@ -179,8 +179,8 @@ describe("OpenAI request paths", () => {
 		savedCatalog = settings.agent.modelCatalog;
 		settings.openaiProviders = [...(savedOpenAI ?? []), { ...config }];
 		settings.agent.modelCatalog = {
-			schemaVersion: 1,
-			migrationVersion: 1,
+			schemaVersion: 2,
+			migrationVersion: 2,
 			autoApply: false,
 			pinnedVersion: null,
 			local: {
@@ -192,7 +192,7 @@ describe("OpenAI request paths", () => {
 						providerId: config.id,
 						upstreamModelId: "gpt-6-astra",
 						modelId: "card",
-						overrides: { limits: { maxOutputTokens: 2300 } },
+						overrides: { max_output_tokens: 2300 },
 					},
 				],
 			},

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { ModelMetadata } from "@shared/model-catalog/schema/catalog";
+import type { RawMetadata } from "@shared/model-catalog/card";
+import { modelProfile } from "@shared/model-catalog/profile";
 import { setNugCachedModels } from "../../nug-model-cache";
 import { withSearchExecutionScope } from "../../search/execution-scope";
 import {
@@ -40,10 +41,10 @@ let savedNug: typeof settings.nugProviders;
 let savedFingerprint: typeof settings.clientFingerprint;
 let savedSearch: typeof settings.search;
 let requests: Record<string, any>[] = [];
-function setMetadata(metadata: ModelMetadata): void {
+function setMetadata(metadata: RawMetadata): void {
 	settings.agent.modelCatalog = {
-		schemaVersion: 1,
-		migrationVersion: 1,
+		schemaVersion: 2,
+		migrationVersion: 2,
 		autoApply: false,
 		pinnedVersion: null,
 		local: {
@@ -113,8 +114,11 @@ beforeEach(() => {
 	settings.anthropicProviders = [...(savedAnthropic ?? []), { ...config, officialApi: true }];
 	requests = [];
 	setMetadata({
-		limits: { maxOutputTokens: 2300 },
-		reasoning: { supported: true, levels: ["low", "high"], canDisable: false, defaultLevel: "low" },
+		max_output_tokens: 2300,
+		supports_reasoning: true,
+		reasoning_effort_levels: ["low", "high"],
+		can_disable_reasoning: false,
+		default_reasoning_effort: "low",
 	});
 	globalThis.fetch = (async (input, init) => {
 		const raw = init?.body ?? (input instanceof Request ? await input.text() : undefined);
@@ -134,15 +138,15 @@ afterEach(() => {
 
 describe("metadata policy", () => {
 	test("output caps preserve lower requests, defaults, and unknown limits", () => {
-		const metadata = { limits: { maxOutputTokens: 100 } };
+		const metadata = { maxOutputTokens: 100 };
 		expect(resolveOutputTokenLimit(metadata, 20, 4096)).toBe(20);
 		expect(resolveOutputTokenLimit(metadata, 200, 4096)).toBe(100);
 		expect(resolveOutputTokenLimit(metadata)).toBe(100);
 		expect(resolveOutputTokenLimit({})).toBeUndefined();
-		expect(resolveOutputTokenLimit({ limits: { maxOutputTokens: null } }, 20)).toBe(20);
+		expect(resolveOutputTokenLimit({ maxOutputTokens: null }, 20)).toBe(20);
 	});
 	test("reasoning supported, allowed levels and disable policy", () => {
-		expect(resolveMetadataReasoning({}, "xhigh")).toBe("xhigh");
+		expect(resolveMetadataReasoning({ reasoning: {} }, "xhigh")).toBe("xhigh");
 		expect(resolveMetadataReasoning({ reasoning: { supported: false } }, "max")).toBeUndefined();
 		expect(
 			resolveMetadataReasoning(
@@ -159,14 +163,20 @@ describe("metadata policy", () => {
 	});
 	test("output image capability does not imply input image capability", () => {
 		expect(() =>
-			assertModelInputModalities("opaque", [{ type: "input_image" }], {
-				modalities: { input: ["text"], output: ["image"] },
-			}),
+			assertModelInputModalities(
+				"opaque",
+				[{ type: "input_image" }],
+				modelProfile({
+					metadata: { supported_modalities: ["text"], supported_output_modalities: ["image"] },
+				}),
+			),
 		).toThrow("image input");
 		expect(() =>
-			assertModelInputModalities("opaque", [{ type: "input_image" }], {
-				modalities: { output: ["text"] },
-			}),
+			assertModelInputModalities(
+				"opaque",
+				[{ type: "input_image" }],
+				modelProfile({ metadata: { supported_output_modalities: ["text"] } }),
+			),
 		).not.toThrow();
 	});
 });
@@ -253,7 +263,11 @@ describe("actual provider request bodies", () => {
 		});
 	}
 	test("fixed reasoning never receives a fabricated effort or a forbidden disable", async () => {
-		setMetadata({ reasoning: { supported: true, mode: "fixed", canDisable: false } });
+		setMetadata({
+			supports_reasoning: true,
+			reasoning_mode: "fixed",
+			can_disable_reasoning: false,
+		});
 		const body = await captureChat(
 			new OpenAIProvider({ ...config, apiMode: "codex", codexWebSocket: false }),
 			{ reasoningEffort: "none" },
@@ -261,7 +275,7 @@ describe("actual provider request bodies", () => {
 		expect(body.reasoning?.effort).toBeUndefined();
 	});
 	test("fixed-but-disableable reasoning preserves an explicit disable", async () => {
-		setMetadata({ reasoning: { supported: true, mode: "fixed", canDisable: true } });
+		setMetadata({ supports_reasoning: true, reasoning_mode: "fixed", can_disable_reasoning: true });
 		const body = await captureChat(
 			new OpenAIProvider({ ...config, apiMode: "codex", codexWebSocket: false }),
 			{ reasoningEffort: "none" },
@@ -269,7 +283,11 @@ describe("actual provider request bodies", () => {
 		expect(body.reasoning.effort).toBe("none");
 	});
 	test("Gemini disable respects the adapter mapping rather than silently enabling thinking", async () => {
-		setMetadata({ reasoning: { supported: true, canDisable: true, mode: "budget" } });
+		setMetadata({
+			supports_reasoning: true,
+			can_disable_reasoning: true,
+			reasoning_mode: "budget",
+		});
 		const body = await captureChat(new GeminiProvider(config), { reasoningEffort: "none" });
 		expect(body.generationConfig.thinkingConfig).toEqual({ thinkingBudget: 0 });
 		const count = requests.length;
@@ -279,7 +297,7 @@ describe("actual provider request bodies", () => {
 		expect(requests).toHaveLength(count);
 	});
 	test("known unsupported reasoning sends no thinking configuration", async () => {
-		setMetadata({ reasoning: { supported: false } });
+		setMetadata({ supports_reasoning: false });
 		for (const provider of [
 			new OpenAIProvider({ ...config, apiMode: "codex", codexWebSocket: false }),
 			new AnthropicProvider(config),
@@ -295,7 +313,7 @@ describe("actual provider request bodies", () => {
 		}
 	});
 	test("known unsupported current and history images fail before transport without mutating history", async () => {
-		setMetadata({ modalities: { input: ["text"], output: ["image"] } });
+		setMetadata({ supported_modalities: ["text"], supported_output_modalities: ["image"] });
 		for (const provider of [
 			new OpenAIProvider({ ...config, apiMode: "responses" }),
 			new AnthropicProvider(config),
@@ -316,6 +334,41 @@ describe("actual provider request bodies", () => {
 		expect(history).toEqual(snapshot);
 		expect(requests).toHaveLength(0);
 	});
+	for (const channelType of ["openai", "responses", "anthropic"]) {
+		test.each([
+			"low",
+			"xhigh",
+			"none",
+		] as const)(`NUG ${channelType} DeepSeek honors gateway tiers for %s`, async (effort) => {
+			const nugConfig = { ...config, id: "deepseek-nug", prefix: "deepseek-nug" };
+			settings.nugProviders = [...(savedNug ?? []), nugConfig];
+			setNugCachedModels(nugConfig.id, [
+				{
+					id: "channel:deepseek-v4-pro",
+					channel: "channel",
+					channelType,
+					model: "deepseek-v4-pro",
+					effortLevels: ["low", "medium", "high", "max"],
+				},
+			]);
+			const body = await captureChat(new NugProvider(nugConfig), {
+				model: "deepseek-nug:channel:deepseek-v4-pro",
+				reasoningEffort: effort,
+			});
+			const expected = effort === "xhigh" ? "max" : effort;
+			if (channelType === "responses") {
+				expect(body.reasoning.effort).toBe(expected);
+			} else if (effort === "none") {
+				expect(body.thinking).toEqual({ type: "disabled" });
+				expect(body.output_config).toBeUndefined();
+				expect(body.reasoning_effort).toBeUndefined();
+			} else if (channelType === "anthropic") {
+				expect(body.output_config).toEqual({ effort: expected });
+			} else {
+				expect(body.reasoning_effort).toBe(expected);
+			}
+		});
+	}
 	for (const channelType of ["openai", "responses", "codex", "anthropic"]) {
 		test(`NUG ${channelType} delegate retains channel binding capabilities`, async () => {
 			const nugConfig = { ...config, id: "runtime-nug", prefix: "runtime-nug" };
@@ -329,7 +382,7 @@ describe("actual provider request bodies", () => {
 				channelId: "channel",
 				upstreamModelId: "opaque",
 				modelId: "runtime-card",
-				overrides: { limits: { maxOutputTokens: 101 }, reasoning: { supported: false } },
+				overrides: { max_output_tokens: 101, supports_reasoning: false },
 			});
 			const body = await captureChat(new NugProvider(nugConfig), {
 				model: "runtime-nug:channel:opaque",
@@ -373,7 +426,7 @@ describe("actual provider request bodies", () => {
 
 describe("native search and context policy", () => {
 	test("search scope injects native search into a direct Codex-compatible request with native disabled globally", async () => {
-		setMetadata({ nativeSearch: { supported: true } });
+		setMetadata({ supports_web_search: true });
 		settings.search = {
 			...settings.search,
 			customProviders: [],
@@ -416,7 +469,7 @@ describe("native search and context policy", () => {
 		expect(normal.tools.some((tool: { type: string }) => tool.type === "web_search")).toBe(false);
 	});
 	test("Codex model gating removes inline search but retains ordinary WebSearch", async () => {
-		setMetadata({ nativeSearch: { supported: false } });
+		setMetadata({ supports_web_search: false });
 		settings.search = {
 			...settings.search,
 			customProviders: settings.search?.customProviders ?? [],
@@ -432,7 +485,7 @@ describe("native search and context policy", () => {
 		expect(body.tools.some((tool: { name?: string }) => tool.name === "WebSearch")).toBe(true);
 	});
 	test("local provider opt-out wins over declared native search support", () => {
-		setMetadata({ nativeSearch: { supported: true } });
+		setMetadata({ supports_web_search: true });
 		settings.openaiProviders = [{ ...config, apiMode: "codex", codexWebSearch: false }];
 		expect(usesInlineNativeSearch(config.prefix, model)).toBe(false);
 	});
@@ -446,9 +499,9 @@ describe("native search and context policy", () => {
 			);
 			const grok = { ...config, enableWebSearch: true, enableXSearch: false };
 			settings.grokProviders = [grok];
-			setMetadata({ nativeSearch: { supported: false } });
+			setMetadata({ supports_web_search: false });
 			expect(usesInlineNativeSearch(config.prefix, model)).toBe(false);
-			setMetadata({ nativeSearch: { supported: true } });
+			setMetadata({ supports_web_search: true });
 			expect(usesInlineNativeSearch(config.prefix, model)).toBe(true);
 			grok.enableWebSearch = false;
 			expect(usesInlineNativeSearch(config.prefix, model)).toBe(false);
@@ -460,7 +513,7 @@ describe("native search and context policy", () => {
 		}
 	});
 	test("model-level native denial falls through to the next ordinary search channel", async () => {
-		setMetadata({ nativeSearch: { supported: false } });
+		setMetadata({ supports_web_search: false });
 		const fallbackId = "metadata-fallback";
 		settings.search = {
 			...settings.search,
@@ -498,7 +551,7 @@ describe("native search and context policy", () => {
 		expect(JSON.stringify(result)).toContain("Fallback result");
 	});
 	test("declared unsupported native search keeps the ordinary search entry point", async () => {
-		setMetadata({ nativeSearch: { supported: false } });
+		setMetadata({ supports_web_search: false });
 		expect(usesInlineNativeSearch(config.prefix, model)).toBe(false);
 		expect(usesSideRequestNativeSearch(config.prefix, model)).toBe(false);
 		expect(supportsNativeSearch(config.prefix, model)).toBe(false);
@@ -511,7 +564,7 @@ describe("native search and context policy", () => {
 		expect(requests).toHaveLength(0);
 	});
 	test("declared true does not invent an inline adapter for Gemini", () => {
-		setMetadata({ nativeSearch: { supported: true } });
+		setMetadata({ supports_web_search: true });
 		expect(usesInlineNativeSearch("gemini", model)).toBe(false);
 	});
 	test("user binding context window is not raised by the Anthropic official floor", () => {
@@ -520,7 +573,7 @@ describe("native search and context policy", () => {
 				id: "window",
 				providerId: config.id,
 				upstreamModelId: "claude-opus-4-8",
-				overrides: { limits: { contextWindow: 32000, maxOutputTokens: 16000 } },
+				overrides: { working_context_tokens: 32000, max_output_tokens: 16000 },
 			},
 		];
 		expect(

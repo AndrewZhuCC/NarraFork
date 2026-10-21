@@ -14,6 +14,9 @@ import {
 	stripObsoleteSettingsKeys,
 } from "../../../server/lib/settings";
 
+const ownWindow = (value: typeof liveSettings, model: string) =>
+	value.agent.modelCatalog?.local.connections?.[model]?.working_context_tokens;
+
 describe("TokenDance collection persistence", () => {
 	it("initializes legacy connections once and preserves manual choices across save and reload", () => {
 		const path = resolve(getNarraforkHome(), "settings.json");
@@ -23,14 +26,15 @@ describe("TokenDance collection persistence", () => {
 			const raw = getDefaults();
 			raw.tokendance = { apiKey: "collection-test-key", disabled: false, generation: 4 };
 			raw.agent.hiddenModels = [];
-			raw.agent.modelContextWindows = { "tokendance:glm-5": 64000 };
+			// A pre-catalog file: its window map is imported as the entry's own window.
+			(raw.agent as Record<string, unknown>).modelContextWindows = { "tokendance:glm-5": 64000 };
 			writeFileSync(path, JSON.stringify(raw));
 			const loaded = reloadSettings();
 			expect(loaded.tokendance?.modelCollectionInitialized).toBe(true);
 			expect(loaded.agent.hiddenModels).toHaveLength(66);
 			expect(loaded.agent.hiddenModels).not.toContain("tokendance:kimi-k3");
 			expect(loaded.agent.hiddenModels).toContain("tokendance:glm-5");
-			expect(loaded.agent.modelContextWindows?.["tokendance:glm-5"]).toBe(64000);
+			expect(ownWindow(loaded, "tokendance:glm-5")).toBe(64000);
 			const edited = structuredClone(loaded);
 			edited.agent.hiddenModels = edited.agent.hiddenModels?.filter(
 				(id) => id !== "tokendance:glm-5",
@@ -50,7 +54,7 @@ describe("TokenDance collection persistence", () => {
 			expect(again.agent.hiddenModels).not.toContain("tokendance:glm-5");
 			expect(again.agent.hiddenModels).toContain("tokendance:kimi-k3");
 			expect(again.agent.hiddenModels).not.toContain("tokendance:future-new-model");
-			expect(again.agent.modelContextWindows?.["tokendance:glm-5"]).toBe(64000);
+			expect(ownWindow(again, "tokendance:glm-5")).toBe(64000);
 			expect(JSON.parse(readFileSync(path, "utf8")).tokendance.modelCollectionInitialized).toBe(
 				true,
 			);

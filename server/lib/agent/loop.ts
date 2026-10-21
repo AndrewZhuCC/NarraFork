@@ -22,12 +22,13 @@ import {
 } from "../boolean-override";
 import { recordCacheDropDiagnostic, resetCacheDropBaseline } from "../cache-drop-diagnostics";
 import { matchContextComposition, validInputCharacters } from "../context-usage-snapshot";
-import { resolveKimiQuotaWait } from "../kimi-quota-wait";
 import { logger } from "../logger";
 import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
+import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
 	consumeSearchExecutionTurn,
@@ -4072,6 +4073,10 @@ async function* agentLoopInMetadataSnapshot(
 				if (requestFinished) return;
 				requestFinished = true;
 				streamExecutionOpen = false;
+				// An OpenCode Go request just spent (or was refused) allowance: schedule a
+				// throttled background `/usage` refresh so the status bar catches up.
+				// Fire-and-forget; a no-op for every other provider.
+				noteOpencodeUsageActivity(effectiveProvider);
 				if (!requestStarted) {
 					requestDump?.finish({
 						error: errorMessage,
@@ -4365,6 +4370,54 @@ async function* agentLoopInMetadataSnapshot(
 				!usesStatefulModel(effectiveProvider, effectiveModel) &&
 				!hasAnyPersistableOutput() &&
 				!hasStartedEarlyToolExecution();
+
+			/**
+			 * Suspend the turn on a plan-quota refusal that resets on a known clock
+			 * (Kimi coding plan, OpenCode Go) instead of failing or replaying it.
+			 *
+			 * Shared by both refusal paths — a thrown HTTP error and an in-stream
+			 * `invalidState` event — so they cannot drift. A wall whose reset is beyond
+			 * the wait budget (or unknown) is forwarded too, without `resumeAt`: the
+			 * caller then reports it with the recovery time, because "spent, returns at
+			 * T" is actionable and an opaque 403/429 is not.
+			 *
+			 * @returns true when the suspension was emitted and the pass must end.
+			 */
+			async function* tryQuotaSuspension(message: string): AsyncGenerator<AgentEvent, boolean> {
+				const quota = await resolveProviderQuotaWait(
+					effectiveProvider,
+					message,
+					requestDiagnostics,
+				);
+				if (quota.kind === "none") return false;
+				const decided = quota.kind === "wait" ? quota.wait : quota.refusal;
+				logger.info("Provider quota refusal resolved", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					quotaProvider: decided.quotaProvider,
+					bucket: decided.bucket,
+					decision: quota.kind,
+					resetAt: decided.resetAt,
+				});
+				yield* outputContent.flush();
+				yield* finishRequest(message);
+				yield {
+					type: "model_unavailable",
+					message,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					providerId: decided.providerId,
+					providerPrefix: decided.providerPrefix,
+					waitKind: "quota",
+					quotaProvider: decided.quotaProvider,
+					quotaBucket: decided.bucket,
+					resumeAt: quota.kind === "wait" ? quota.wait.resumeAt : undefined,
+					quotaResetAt: decided.resetAt,
+					diagnostics: requestDiagnostics,
+				};
+				return true;
+			}
 
 			/**
 			 * What the caller must do after {@link runMalformedReplay} finishes.
@@ -5755,39 +5808,14 @@ async function* agentLoopInMetadataSnapshot(
 							}
 							// Guard first, so a turn that already ran tools does not pay for a
 							// usage lookup it could never act on.
-							if (!hasStartedEarlyToolExecution()) {
-								// Kimi coding-plan allowance used up (403 "usage limit"). Unlike
-								// the NUG case above this is NOT unknowable: the window's reset
-								// instant is published, so the caller waits on the clock rather
-								// than on a poller.
-								//
-								// A wall whose reset is beyond the wait budget is forwarded too
-								// (`quotaResetAt` without `resumeAt`): the caller then reports it
-								// WITH the recovery time, because "spent, returns at T" is
-								// actionable and an opaque 403 is not.
-								const kimiQuota = await resolveKimiQuotaWait(
-									effectiveProvider,
-									`${message}\n${requestDiagnostics?.responseSnippet ?? ""}`,
-								);
-								if (kimiQuota.kind !== "none") {
-									const { providerId, providerPrefix, resetAt } =
-										kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
-									yield* outputContent.flush();
-									yield* finishRequest(message);
-									yield {
-										type: "model_unavailable",
-										message,
-										provider: effectiveProvider,
-										model: effectiveModel,
-										providerId,
-										providerPrefix,
-										waitKind: "quota",
-										resumeAt: kimiQuota.kind === "wait" ? kimiQuota.wait.resumeAt : undefined,
-										quotaResetAt: resetAt,
-										diagnostics: requestDiagnostics,
-									};
-									return;
-								}
+							//
+							// Plan allowance used up (Kimi 403 "usage limit", OpenCode Go 429
+							// GoUsageLimitError) or an OpenCode rate limit naming a long wait.
+							// Unlike the NUG case above this is NOT unknowable: the reset instant
+							// is published, so the caller waits on the clock rather than on a
+							// poller. See `tryQuotaSuspension`.
+							if (!hasStartedEarlyToolExecution() && (yield* tryQuotaSuspension(message))) {
+								return;
 							}
 							// Resumable: a transient failure the gateway flagged as safe to
 							// continue from (diagnostics.resumable). Recovery is NEVER an
@@ -6272,41 +6300,16 @@ async function* agentLoopInMetadataSnapshot(
 						};
 						return;
 					}
-					// Kimi coding-plan allowance used up (403 "usage limit"). Same suspend-
-					// and-replay contract as the NUG branch above, but the reset instant is
-					// published, so the caller waits on the clock rather than on a poller.
-					// Mirrors the invalidState branch earlier in this loop.
-					{
-						// Kimi coding-plan allowance used up (403 "usage limit"). Same
-						// contract as the NUG branch above, but the reset instant is
-						// published, so the caller waits on the clock rather than on a
-						// poller — or, when the reset is beyond the wait budget, reports the
-						// wall with that instant attached (`quotaResetAt` without `resumeAt`).
-						// Mirrors the invalidState branch earlier in this loop.
-						const kimiQuota = await resolveKimiQuotaWait(
-							effectiveProvider,
-							`${msg}\n${requestDiagnostics?.responseSnippet ?? ""}`,
-						);
-						if (kimiQuota.kind !== "none") {
-							const { providerId, providerPrefix, resetAt } =
-								kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
-							yield* outputContent.flush();
-							yield* finishRequest(msg);
-							yield {
-								type: "model_unavailable",
-								message: msg,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								providerId,
-								providerPrefix,
-								waitKind: "quota",
-								resumeAt: kimiQuota.kind === "wait" ? kimiQuota.wait.resumeAt : undefined,
-								quotaResetAt: resetAt,
-								diagnostics: requestDiagnostics,
-							};
-							return;
-						}
-					}
+					// Plan allowance used up (Kimi 403 "usage limit", OpenCode Go 429
+					// GoUsageLimitError) or an OpenCode rate limit naming a long wait. Same
+					// suspend-and-replay contract as the NUG branch above, but the reset instant
+					// is published, so the caller waits on the clock rather than on a poller —
+					// or, when the reset is beyond the wait budget, reports the wall with that
+					// instant attached (`quotaResetAt` without `resumeAt`). Checked BEFORE the
+					// generic retry classification: a quota 429 must never burn the transient
+					// retry budget re-uploading the whole history. Mirrors the invalidState
+					// branch earlier in this loop.
+					if (yield* tryQuotaSuspension(msg)) return;
 					// Detect upstream API context length exceeded (HTTP 400)
 					if (
 						err &&

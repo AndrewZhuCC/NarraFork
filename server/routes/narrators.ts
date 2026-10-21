@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
@@ -257,7 +257,11 @@ import type {
 	UnloadToolNotFound,
 	UnloadToolResult,
 } from "../services/command-service";
-import { getSlashMenuItems, resolveCommand } from "../services/command-service";
+import {
+	getDraftSlashMenuItems,
+	getSlashMenuItems,
+	resolveCommand,
+} from "../services/command-service";
 import {
 	type LiveCompactStreamEvent,
 	liveCompactProgress,
@@ -435,6 +439,7 @@ import {
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { permissionRuleService } from "../services/permission-rule-service";
+import { usableProjectDir } from "../services/project-dir";
 import {
 	applyLocalRevertPlan,
 	getLocalRevertPlan,
@@ -745,6 +750,8 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"questions",
 	// Every inbox row/detail is authorized against its actual owner by the service.
 	"human-attention",
+	// Session-less dashboard composer: resolves user-level commands and cwd skills only.
+	"draft-composer",
 	"whitelist-dirs",
 	"blacklist-dirs",
 	"cmd-whitelist",
@@ -1280,9 +1287,9 @@ narratorRoutes.get("/", async (c) => {
 /**
  * Bind the standalone-cwd decision to this process's real filesystem and settings.
  *
- * The decision itself lives in `standalone-narrator-cwd` so its branches (a `~` to
- * expand, a configured directory that cannot be created) are unit-testable without a
- * disk.
+ * The decision itself lives in `standalone-narrator-cwd` so its branches are
+ * unit-testable without a disk. Nothing is created: with no directory in the request
+ * and no existing default, creation is refused so the client asks the user to choose.
  */
 function standaloneNarratorCwd(
 	input: {
@@ -1292,23 +1299,26 @@ function standaloneNarratorCwd(
 	projectDir?: string | null,
 ): string | undefined {
 	// Project paths are metadata, not an invitation to create or validate a repository.
-	const explicit = input.cwd?.trim();
-	if (explicit) return explicit;
-	if (projectDir) return projectDir;
-	return resolveStandaloneNarratorCwd(input, {
+	if (!input.cwd?.trim() && projectDir) return projectDir;
+	const decision = resolveStandaloneNarratorCwd(input, {
 		home: getHome(),
 		configuredDir: settings.paths.defaultProjectDir,
-		ensureDir: (path) => {
-			mkdirSync(path, { recursive: true });
+		isDirectory: (path) => {
+			try {
+				return statSync(path).isDirectory();
+			} catch {
+				return false;
+			}
 		},
 		toAbsolute: (path) => resolve(path),
-		onEnsureFailed: (path, error) => {
-			logger.warn("Failed to ensure default project dir exists for narrator cwd", {
-				path,
-				error: String(error),
-			});
-		},
 	});
+	if (decision.kind === "required") {
+		throw new ValidationError(
+			"Choose a working directory: no default project directory is set, or it no longer exists",
+			"PROJECT_DIR_REQUIRED",
+		);
+	}
+	return decision.kind === "cwd" ? decision.cwd : undefined;
 }
 
 // Create narrator
@@ -1568,6 +1578,14 @@ narratorRoutes.get("/human-attention/:attentionId", async (c) => {
 			signal: c.req.raw.signal,
 		}),
 	);
+});
+
+// Slash menu for a composer with no session yet (dashboard): user commands and the
+// skills visible from the directory the session would be created in.
+narratorRoutes.get("/draft-composer/commands", async (c) => {
+	const cwd =
+		c.req.query("cwd")?.trim() || usableProjectDir(settings.paths.defaultProjectDir, getHome());
+	return c.json(await getDraftSlashMenuItems(c.get("user").sub, cwd));
 });
 
 narratorRoutes.get("/broken-models", requireAdmin, async (c) => {
@@ -4183,6 +4201,19 @@ narratorRoutes.delete("/:id/interrupt-task-guard-messages/:messageId", async (c)
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissInterruptTaskGuardMessage(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	return c.json({ ok: true, deletedMessageIds: [messageId] });
+});
+
+// Dismiss the post-error subagent recovery card ("leave them stopped")
+narratorRoutes.delete("/:id/subagent-recovery-messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.dismissSubagentRecoveryMessage(narratorId, messageId);
 	broadcastToNarrator(narratorId, {
 		type: "messages_deleted",
 		narratorId,

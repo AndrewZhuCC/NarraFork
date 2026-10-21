@@ -10,12 +10,12 @@
  * the host's `types.ts`.
  */
 
-import type { ModelMetadata } from "../model-catalog/schema/catalog";
+import type { ReferencePricing } from "../model-catalog/profile";
 
 /** Immutable reference-rate snapshot captured when the upstream request starts.
  * null means captured unknown, never permission to consult a later catalog. */
 export interface ReferencePricingSnapshot {
-	referencePricing: NonNullable<ModelMetadata["referencePricing"]> | null;
+	referencePricing: ReferencePricing | null;
 	catalogVersion: string;
 	localRevision: number;
 	modelId?: string;

@@ -5,8 +5,10 @@ import {
 } from "../../../server/lib/agent/anthropic-provider";
 import {
 	bindModelCatalogSettings,
-	getModelCatalogSnapshot,
-	mutateModelCatalog,
+	getModelCardSnapshot,
+	getModelCatalogRevision,
+	mutateModelCard,
+	setModelWindow,
 } from "../../../server/lib/model-catalog";
 import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/nug-model-cache";
 import type { AnthropicProviderConfig, NUGProviderConfig } from "../../../server/lib/settings";
@@ -47,8 +49,8 @@ function resetCatalog(): void {
 	// derive its canonical provider list instead of overwriting it with stale data.
 	delete settings.customApiProviders;
 	settings.agent.modelCatalog = {
-		schemaVersion: 1,
-		migrationVersion: 1,
+		schemaVersion: 2,
+		migrationVersion: 2,
 		local: { revision: 0 },
 		autoApply: false,
 		pinnedVersion: null,
@@ -56,11 +58,18 @@ function resetCatalog(): void {
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 }
 
+function setOwnWindow(model: string, contextWindow: number | null): void {
+	setModelWindow({
+		baseRevision: getModelCatalogRevision(),
+		scope: "connection",
+		target: model,
+		contextWindow,
+	});
+}
+
 function saveWindow(value: number): void {
-	settings.agent.modelContextWindows = { "relay:claude-opus-5": value };
-	// Exercise the same legacy-editor adapter as production, rather than mutating
-	// archived settings behind the catalog's back and skipping its save migration.
-	saveSettings(settings);
+	// The provider page's write: the entry's own window in the catalog.
+	setOwnWindow("relay:claude-opus-5", value);
 }
 
 function anthropicConfig(
@@ -84,7 +93,6 @@ describe("Anthropic effective context window respects explicit configuration", (
 	beforeEach(() => {
 		snapshot = cloneSettingsSnapshot();
 		settings.anthropicProviders = [anthropicConfig()];
-		settings.agent.modelContextWindows = {};
 		settings.agent.modelAggregations = [];
 		resetCatalog();
 	});
@@ -106,22 +114,22 @@ describe("Anthropic effective context window respects explicit configuration", (
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(400_000);
 	});
 
-	test("local model and saved binding windows outrank provider defaults; reset never re-pins archived values", () => {
+	test("model-wide and provider-entry windows outrank provider defaults; reset never re-pins archived values", () => {
 		const config = anthropicConfig({ defaultContextWindow: 400_000 });
 		settings.anthropicProviders = [config];
 		// Refresh the canonical provider projection before catalog mutations save it.
 		delete settings.customApiProviders;
 		saveSettings(settings);
-		const patch = (target: "model" | "binding", targetId: string, value?: number) =>
-			mutateModelCatalog({
+		const patch = (target: "model" | "connection", targetId: string, value?: number) =>
+			mutateModelCard({
 				action: "patch",
-				baseRevision: getModelCatalogSnapshot().local.revision,
+				baseRevision: getModelCardSnapshot().local.revision,
 				target,
 				targetId,
 				patch:
 					value === undefined
-						? { reset: ["limits.contextWindow"] }
-						: { set: { "limits.contextWindow": value } },
+						? { reset: ["working_context_tokens"] }
+						: { set: { working_context_tokens: value } },
 			});
 		patch("model", "claude-opus-5", 600_000);
 		expect(resolveModelContextWindow("claude-opus-5", "relay")).toEqual({
@@ -130,12 +138,13 @@ describe("Anthropic effective context window respects explicit configuration", (
 		});
 		saveWindow(300_000);
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(300_000);
-		patch("binding", "legacy-window:relay:claude-opus-5");
+		patch("connection", "relay:claude-opus-5");
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(600_000);
 		patch("model", "claude-opus-5");
 		saveSettings(settings);
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(400_000);
-		expect(settings.agent.modelContextWindows["relay:claude-opus-5"]).toBe(300_000);
+		// A reset window is gone from the entry, so nothing can pin it again.
+		expect(settings.agent.modelCatalog?.local.connections?.["relay:claude-opus-5"]).toBeUndefined();
 	});
 
 	test("a user override larger than 1M is kept as-is", () => {
@@ -175,7 +184,6 @@ describe("resolveModelContextWindow reports where the value came from", () => {
 		settings.openaiProviders = [];
 		settings.geminiProviders = [];
 		settings.nugProviders = [];
-		settings.agent.modelContextWindows = {};
 		settings.agent.modelAggregations = [];
 		resetCatalog();
 	});
@@ -253,7 +261,6 @@ describe("NUG anthropic delegate keeps the channel segment in the lookup key", (
 		snapshot = cloneSettingsSnapshot();
 		settings.nugProviders = [nugConfig];
 		settings.anthropicProviders = [anthropicConfig()];
-		settings.agent.modelContextWindows = {};
 		settings.agent.modelAggregations = [];
 		resetCatalog();
 		setNugCachedModels(nugConfig.id, [
@@ -289,10 +296,7 @@ describe("NUG anthropic delegate keeps the channel segment in the lookup key", (
 	});
 
 	test("per-model user override keyed on the full id applies on the delegate path", () => {
-		settings.agent.modelContextWindows = {
-			"gw:antigravity:gemini-3.8-flash-high": 700_000,
-		};
-		saveSettings(settings);
+		setOwnWindow("gw:antigravity:gemini-3.8-flash-high", 700_000);
 		expect(
 			getAnthropicEffectiveContextWindow("antigravity:gemini-3.8-flash-high", delegateConfig),
 		).toBe(700_000);

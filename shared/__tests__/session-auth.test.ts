@@ -156,9 +156,10 @@ describe("isSessionTokenVersionCurrent", () => {
 		}
 	});
 
-	test("accepts a claim ahead of the stored value", () => {
-		// The cached generation can lag a bump by up to the cache TTL, so a token minted
-		// against the newer value must not be rejected while that entry is still warm.
-		expect(isSessionTokenVersionCurrent(2, 1)).toBe(true);
+	test("rejects a claim ahead of the stored value", () => {
+		// Strict equality: a claim above the stored generation is a forged/inflated version
+		// that must not defeat revocation, so it fails closed exactly like a stale claim.
+		expect(isSessionTokenVersionCurrent(2, 1)).toBe(false);
+		expect(isSessionTokenVersionCurrent(5, 2)).toBe(false);
 	});
 });

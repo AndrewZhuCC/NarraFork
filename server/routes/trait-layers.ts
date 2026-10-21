@@ -70,7 +70,7 @@ function buildLayerTraitsResponse(view: {
 }
 
 /** Resolve and authorize the layer being edited. */
-function resolveTarget(c: Context): { layer: EditableTraitLayer; ownerId: string } {
+async function resolveTarget(c: Context): Promise<{ layer: EditableTraitLayer; ownerId: string }> {
 	const layer = c.req.param("layer");
 	const ownerId = c.req.param("ownerId");
 	if (layer !== "project" && layer !== "user") {
@@ -80,10 +80,10 @@ function resolveTarget(c: Context): { layer: EditableTraitLayer; ownerId: string
 
 	if (layer === "project") {
 		// No project membership model exists yet, so project policy stays admin-only.
-		assertAdmin(c);
+		await assertAdmin(c);
 	} else {
 		const user = c.get("user");
-		if (user.sub !== ownerId) assertAdmin(c);
+		if (user.sub !== ownerId) await assertAdmin(c);
 	}
 	return { layer, ownerId };
 }
@@ -122,13 +122,13 @@ function applyEnforced(
 }
 
 traitLayerRoutes.get("/:layer/:ownerId", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const view = await getLayerTraits(layer, ownerId);
 	return c.json(buildLayerTraitsResponse(view));
 });
 
 traitLayerRoutes.put("/:layer/:ownerId/disabled-tools", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const body = await parseJsonBody(c);
 	const disabledTools = normalizeDisabledTools(body);
 	const enforced = readEnforcedFlag(body);
@@ -143,7 +143,7 @@ traitLayerRoutes.put("/:layer/:ownerId/disabled-tools", async (c) => {
 });
 
 traitLayerRoutes.delete("/:layer/:ownerId/disabled-tools", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const view = await updateLayerTraits(layer, ownerId, (current) =>
 		applyEnforced(removeEncodedTrait(current, DISABLED_TOOLS_TRAIT_PREFIX), "disabledTools", false),
 	);
@@ -151,7 +151,7 @@ traitLayerRoutes.delete("/:layer/:ownerId/disabled-tools", async (c) => {
 });
 
 traitLayerRoutes.put("/:layer/:ownerId/blocked-skills", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const body = await parseJsonBody(c);
 	const blockedSkills = normalizeBlockedSkills(body);
 	const enforced = readEnforcedFlag(body);
@@ -166,7 +166,7 @@ traitLayerRoutes.put("/:layer/:ownerId/blocked-skills", async (c) => {
 });
 
 traitLayerRoutes.delete("/:layer/:ownerId/blocked-skills", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const view = await updateLayerTraits(layer, ownerId, (current) =>
 		applyEnforced(removeEncodedTrait(current, BLOCKED_SKILLS_TRAIT_PREFIX), "blockedSkills", false),
 	);
@@ -174,7 +174,7 @@ traitLayerRoutes.delete("/:layer/:ownerId/blocked-skills", async (c) => {
 });
 
 traitLayerRoutes.put("/:layer/:ownerId/subagent-model-restriction", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const body = await parseJsonBody(c);
 	validateSubagentModelRestrictionInput(body);
 	const restriction = normalizeSubagentModelRestriction(body);
@@ -192,7 +192,7 @@ traitLayerRoutes.put("/:layer/:ownerId/subagent-model-restriction", async (c) =>
 });
 
 traitLayerRoutes.delete("/:layer/:ownerId/subagent-model-restriction", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const view = await updateLayerTraits(layer, ownerId, (current) =>
 		applyEnforced(
 			removeEncodedTrait(current, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX),
@@ -208,7 +208,7 @@ traitLayerRoutes.delete("/:layer/:ownerId/subagent-model-restriction", async (c)
  * always be overridden by a higher one, and injection grants no access on its own.
  */
 traitLayerRoutes.put("/:layer/:ownerId/device-injection", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const body = await parseJsonBody(c);
 	const injection = normalizeDeviceInjectionTrait(body);
 	const view = await updateLayerTraits(layer, ownerId, (current) => [
@@ -219,7 +219,7 @@ traitLayerRoutes.put("/:layer/:ownerId/device-injection", async (c) => {
 });
 
 traitLayerRoutes.delete("/:layer/:ownerId/device-injection", async (c) => {
-	const { layer, ownerId } = resolveTarget(c);
+	const { layer, ownerId } = await resolveTarget(c);
 	const view = await updateLayerTraits(layer, ownerId, (current) =>
 		parseTraits(current).filter((t) => !t.startsWith(DEVICE_INJECTION_TRAIT_PREFIX)),
 	);

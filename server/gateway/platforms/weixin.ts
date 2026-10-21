@@ -1142,12 +1142,10 @@ export class WeixinAdapter extends BaseAdapter {
 			});
 		}
 
-		// Allowlist check
-		if (this.config.allowedUsers?.length) {
-			if (!this.config.allowedUsers.includes(senderId)) {
-				logger.debug(`[weixin] Ignoring message from unauthorized user ${senderId.slice(0, 8)}`);
-				return;
-			}
+		// Allowlist check — fail closed: an empty/unset allowlist denies all users.
+		if (!this.config.allowedUsers?.length || !this.config.allowedUsers.includes(senderId)) {
+			logger.debug(`[weixin] Ignoring message from unauthorized user ${senderId.slice(0, 8)}`);
+			return;
 		}
 
 		// Save context token

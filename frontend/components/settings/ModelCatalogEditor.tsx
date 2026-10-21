@@ -10,13 +10,9 @@ import {
 	Text,
 	TextInput,
 } from "@mantine/core";
-import type {
-	FieldSource,
-	ModelBinding,
-	ModelCatalogSnapshot,
-	ModelQuery,
-	ResolvedModelMetadata,
-} from "@shared/model-catalog";
+import type { ModelCard } from "@shared/model-catalog/card";
+import type { ModelCardSnapshot } from "@shared/model-catalog/schema/api";
+import type { FieldSource, ModelQuery, RawBinding } from "@shared/model-catalog/schema/catalog";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -27,6 +23,7 @@ import {
 } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
 import { Z } from "../../lib/z-index";
+import { ProviderWindowOverrides } from "../providers/ContextWindowField";
 import {
 	COMMAND_CODE_PROTOCOL_OPTIONS,
 	ModelProtocolSelect,
@@ -38,9 +35,9 @@ import {
 	buildCatalogPatch,
 	type CatalogEdits,
 	catalogFields,
+	fieldOptions,
 	fieldText,
 	metadataFromPatch,
-	metadataValue,
 } from "./model-catalog-form";
 
 export interface CatalogEditorTarget {
@@ -50,7 +47,8 @@ export interface CatalogEditorTarget {
 	modelId?: string;
 	variantId?: string;
 	query?: ModelQuery;
-	resolved?: ResolvedModelMetadata;
+	/** The resolved card the editor opened on; its revision authorizes the write. */
+	card?: ModelCard;
 }
 
 /**
@@ -72,12 +70,12 @@ export interface ModelProtocolDraft {
 }
 
 export function CatalogMetadataFields({
-	resolved,
+	card,
 	edits,
 	onChange,
 	readOnly,
 }: {
-	resolved?: ResolvedModelMetadata;
+	card?: ModelCard;
 	edits: CatalogEdits;
 	onChange: (edits: CatalogEdits) => void;
 	readOnly: boolean;
@@ -98,23 +96,17 @@ export function CatalogMetadataFields({
 							{catalogFields
 								.filter((field) => field.section === section)
 								.map((field) => {
-									const edit = edits[field.path];
-									const effective = metadataValue(resolved?.metadata ?? {}, field.path);
-									const source: FieldSource | undefined = resolved?.provenance[field.path];
-									const value = edit?.mode === "set" ? edit.value : fieldText(effective);
+									const edit = edits[field.key];
+									const effective = card?.metadata[field.key];
+									const source: FieldSource | undefined = card?.provenance[field.key];
+									const value =
+										edit?.mode === "set" ? edit.value : fieldText(effective, field.kind);
 									const setValue = (next: string) =>
-										onChange({ ...edits, [field.path]: { mode: "set", value: next } });
-									const options =
-										field.kind === "boolean"
-											? ["true", "false"]
-											: field.kind === "mode"
-												? ["levels", "fixed", "budget", "unknown"]
-												: field.kind === "longMode"
-													? ["full", "marginal"]
-													: null;
-									const label = t(`catalog.fields.${field.path.replaceAll(".", "_")}`);
+										onChange({ ...edits, [field.key]: { mode: "set", value: next } });
+									const options = fieldOptions[field.kind] ?? null;
+									const label = t(`catalog.fields.${field.key}`, { defaultValue: field.key });
 									return (
-										<Stack key={field.path} gap={4} data-catalog-field={field.path}>
+										<Stack key={field.key} gap={4} data-catalog-field={field.key}>
 											<Group justify="space-between">
 												<Text size="sm">{label}</Text>
 												{edit && <Badge size="xs">{t(`catalog.${edit.mode}`)}</Badge>}
@@ -129,9 +121,9 @@ export function CatalogMetadataFields({
 															? t(`catalog.values.${effective}`)
 															: Array.isArray(effective) && !effective.length
 																? t("catalog.emptyList")
-																: effective === "0" && field.kind === "price"
+																: Number(effective) === 0 && field.kind === "price"
 																	? t("catalog.free")
-																	: fieldText(effective)}{" "}
+																	: fieldText(effective, field.kind)}{" "}
 												·{" "}
 												{source
 													? `${t(`catalog.layers.${source.layer}`)}${source.id ? ` · ${source.id}` : ""}`
@@ -167,16 +159,14 @@ export function CatalogMetadataFields({
 													<Button
 														size="compact-xs"
 														variant="subtle"
-														onClick={() =>
-															onChange({ ...edits, [field.path]: { mode: "unknown" } })
-														}
+														onClick={() => onChange({ ...edits, [field.key]: { mode: "unknown" } })}
 													>
 														{t("catalog.unknown")}
 													</Button>
 													<Button
 														size="compact-xs"
 														variant="subtle"
-														onClick={() => onChange({ ...edits, [field.path]: { mode: "reset" } })}
+														onClick={() => onChange({ ...edits, [field.key]: { mode: "reset" } })}
 													>
 														{t("catalog.reset")}
 													</Button>
@@ -186,7 +176,7 @@ export function CatalogMetadataFields({
 															variant="subtle"
 															onClick={() => {
 																const next = { ...edits };
-																delete next[field.path];
+																delete next[field.key];
 																onChange(next);
 															}}
 														>
@@ -218,7 +208,7 @@ export function ModelCatalogEditor({
 	protocol,
 }: {
 	target: CatalogEditorTarget;
-	snapshot: ModelCatalogSnapshot;
+	snapshot: ModelCardSnapshot;
 	readOnly: boolean;
 	onClose: () => void;
 	/** 协议字段（可选）：模型级覆盖，与 catalog 快照分开保存。 */
@@ -230,7 +220,7 @@ export function ModelCatalogEditor({
 	// Snapshot and actual-resolution queries may finish in either order. Never authorize
 	// a stale effective view with the newer revision from the other query.
 	const [baseRevision] = useState(
-		Math.min(snapshot.local.revision, target.resolved?.localRevision ?? snapshot.local.revision),
+		Math.min(snapshot.local.revision, target.card?.localRevision ?? snapshot.local.revision),
 	);
 	// A new entry has no stored identity to resolve a card for yet.
 	const card = useResolvedModelCard(
@@ -244,8 +234,8 @@ export function ModelCatalogEditor({
 	const [edits, setEdits] = useState<CatalogEdits>({});
 	const [id, setId] = useState(target.id);
 	const [name, setName] = useState("");
-	const [modelId, setModelId] = useState(target.modelId ?? target.resolved?.modelId ?? "");
-	const [variantId, setVariantId] = useState(target.variantId ?? target.resolved?.variantId ?? "");
+	const [modelId, setModelId] = useState(target.modelId ?? target.card?.modelId ?? "");
+	const [variantId, setVariantId] = useState(target.variantId ?? target.card?.variantId ?? "");
 	const [providerKey, setProviderKey] = useState(target.query?.providerKey ?? "");
 	const [providerId, setProviderId] = useState(target.query?.providerId ?? "");
 	const [channelId, setChannelId] = useState(target.query?.channelId ?? "");
@@ -332,7 +322,7 @@ export function ModelCatalogEditor({
 				} else {
 					if (!upstream.trim() || (!providerId.trim() && !channelId.trim()))
 						throw new Error(t("catalog.bindingRequired"));
-					const binding: ModelBinding = {
+					const binding: RawBinding = {
 						id: id.trim(),
 						upstreamModelId: upstream.trim(),
 						...(providerId.trim() ? { providerId: providerId.trim() } : {}),
@@ -507,14 +497,17 @@ export function ModelCatalogEditor({
 						)}
 					</Stack>
 				)}
+				{target.kind === "model" && !target.isNew && (
+					<ProviderWindowOverrides modelId={target.id} />
+				)}
 				<CatalogMetadataFields
-					resolved={target.resolved}
+					card={target.card}
 					edits={edits}
 					onChange={setEdits}
 					readOnly={readOnly || mutation.isPending || conflict}
 				/>
-				{/* Read-only complete card next to the editable v1 fields: the editor writes
-				    only what v1 can express, so the full source view must not look editable. */}
+				{/* Read-only complete card next to the editable fields: attributes without a
+				    control stay visible but cannot be edited here. */}
 				{card.data && (
 					<Accordion>
 						<Accordion.Item value="card">

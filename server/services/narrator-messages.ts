@@ -2410,8 +2410,21 @@ function parseSubagentSummary(raw: unknown): SubagentToolInputSummary | null {
 	}
 }
 
+/**
+ * Latest tool calls of each narrator, oldest first, as short summary rows — the
+ * dashboard activity cards' snapshot. Same bounded projection as a subagent
+ * card's recent calls: never reads `input_json` or outputs into JS.
+ */
+export function loadRecentToolCallActivity(
+	narratorIds: string[],
+	limit: number,
+): Promise<Map<string, SubagentActivityToolCall[]>> {
+	return loadLatestSubagentToolCalls(narratorIds, limit);
+}
+
 async function loadLatestSubagentToolCalls(
 	narratorIds: string[],
+	limit = SUBAGENT_ACTIVITY_LIMIT,
 ): Promise<Map<string, SubagentActivityToolCall[]>> {
 	const result = new Map<string, SubagentActivityToolCall[]>();
 	const uniqueNarratorIds = [...new Set(narratorIds)];
@@ -2444,7 +2457,7 @@ async function loadLatestSubagentToolCalls(
 					),
 				)
 				.orderBy(desc(narratorToolCalls.createdAt), desc(narratorToolCalls.id))
-				.limit(SUBAGENT_ACTIVITY_LIMIT);
+				.limit(limit);
 			return { narratorId, rows: rows.reverse() };
 		}),
 	);
@@ -5071,6 +5084,69 @@ const narratorMessageQueriesUnlocked = {
 		});
 	},
 
+	/**
+	 * Dismiss the post-error subagent recovery card (role="disp", block type
+	 * `subagent_recovery`).
+	 *
+	 * The card's close button means "leave these subagents stopped, stop asking me":
+	 * nothing is resumed and no state outside this display row changes. Same
+	 * three-step pattern as dismissCwdRecoveryMessage — the row is UI-only (never
+	 * part of the model history), so removing this narrator's ref, and the message
+	 * itself when no other narrator references it, is all a dismissal needs.
+	 * Idempotent when the row or the ref is already gone.
+	 */
+	async dismissSubagentRecoveryMessage(narratorId: string, messageId: string) {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) return;
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true },
+		});
+		// Unreachable while foreign keys are on (a ref cannot outlive its message);
+		// treated as "already gone" rather than as an error, like the missing-ref case.
+		if (!msg) return;
+		const blocks = Array.isArray(msg.contentJson)
+			? (msg.contentJson as Array<{ type?: unknown }>)
+			: [];
+		const isSubagentRecovery = blocks.some((block) => block.type === "subagent_recovery");
+		// Role is checked as well as the block: an assistant message could otherwise
+		// carry a matching block and become deletable through this route.
+		if (msg.role !== "disp" || !isSubagentRecovery) {
+			throw new ValidationError("Message is not a subagent recovery notice");
+		}
+
+		db.transaction((tx) => {
+			deleteRecipientMessageRefs(tx)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				)
+				.run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+				.sync();
+			if (!otherRef) {
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
+	},
+
 	async dismissErrorMessage(narratorId: string, messageId: string) {
 		const msg = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, messageId),
@@ -5376,6 +5452,9 @@ export const narratorMessageQueries = {
 	),
 	dismissCwdRecoveryMessage: admittedMutation(
 		narratorMessageQueriesUnlocked.dismissCwdRecoveryMessage,
+	),
+	dismissSubagentRecoveryMessage: admittedMutation(
+		narratorMessageQueriesUnlocked.dismissSubagentRecoveryMessage,
 	),
 	dismissErrorMessage: admittedMutation(narratorMessageQueriesUnlocked.dismissErrorMessage),
 	markReviewFeedbackApplied: admittedMutation(

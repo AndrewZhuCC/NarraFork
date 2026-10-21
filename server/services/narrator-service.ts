@@ -3257,6 +3257,8 @@ export const narratorService = {
 		narratorMessageQueries.releaseReviewFeedbackClaim.bind(narratorMessageQueries),
 	dismissCwdRecoveryMessage:
 		narratorMessageQueries.dismissCwdRecoveryMessage.bind(narratorMessageQueries),
+	dismissSubagentRecoveryMessage:
+		narratorMessageQueries.dismissSubagentRecoveryMessage.bind(narratorMessageQueries),
 	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),
 	dismissInterruptTaskGuardMessage:
 		narratorMessageQueries.dismissInterruptTaskGuardMessage.bind(narratorMessageQueries),

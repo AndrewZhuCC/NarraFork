@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { gzipSync } from "node:zlib";
 import {
-	catalogFromArchive,
-	catalogFromModelFiles,
 	CATALOG_REVISION_URL,
+	catalogFromArchive,
 	MAX_CATALOG_BYTES,
 	parseCatalogRevision,
 } from "../../../server/lib/model-catalog/source";
-import { createModelMetadataResolver, resolveModelMetadata } from "../../../shared/model-catalog";
+import {
+	createModelCardResolver,
+	modelProfile,
+	type RawMetadata,
+	rawCatalogFromModelFiles,
+} from "../../../shared/model-catalog";
 
 const date = "2026-01-01T00:00:00Z";
 const version = "a".repeat(40);
@@ -17,22 +21,24 @@ function model() {
 		name: "M",
 		status: "unverified",
 		metadata: {
-			limits: { contextWindow: 2000 },
-			referencePricing: { input: "5", output: "10" },
-			modalities: { input: ["text", "image"] },
-			nativeSearch: { supported: true },
-			reasoning: { levels: ["low", "high"] },
-		},
+			max_input_tokens: 2000,
+			input_cost_per_token: 5e-6,
+			output_cost_per_token: 1e-5,
+			supported_modalities: ["text", "image"],
+			supports_web_search: true,
+			reasoning_effort_levels: ["low", "high"],
+		} as RawMetadata,
 		variants: [
 			{
 				id: "m@one",
 				providerKey: "one",
 				upstreamModelIds: ["up"],
 				metadata: {
-					referencePricing: { input: "0", output: null },
-					nativeSearch: { supported: false },
-					modalities: { input: [] },
-					reasoning: { levels: [] },
+					input_cost_per_token: 0,
+					output_cost_per_token: null,
+					supports_web_search: false,
+					supported_modalities: [],
+					reasoning_effort_levels: [],
 				},
 			},
 			{ id: "m@two", providerKey: "two", upstreamModelIds: ["up"], metadata: {} },
@@ -40,8 +46,12 @@ function model() {
 	};
 }
 function read(value: unknown, filename = "m.json") {
-	return catalogFromModelFiles(new Map([[filename, JSON.stringify(value)]]), version, date);
+	return rawCatalogFromModelFiles(new Map([[filename, JSON.stringify(value)]]), version, date);
 }
+const resolveProfile = (
+	catalog: ReturnType<typeof read>,
+	query: Parameters<ReturnType<typeof createModelCardResolver>>[0],
+) => modelProfile(createModelCardResolver(catalog)(query));
 
 describe("data-only model directory adapter", () => {
 	test("nested variants inherit defaults and retain explicit zero, null, false and empty arrays", () => {
@@ -49,27 +59,23 @@ describe("data-only model directory adapter", () => {
 		expect(catalog.models).toHaveLength(1);
 		expect(catalog.variants).toHaveLength(2);
 		expect(catalog.variants.every((variant) => variant.modelId === "m")).toBe(true);
-		const { metadata } = resolveModelMetadata({
-			catalog,
-			query: { upstreamModelId: "up", providerKey: "one" },
-		});
-		expect(metadata.limits?.contextWindow).toBe(2000);
-		expect(metadata.referencePricing).toEqual({ input: "0", output: null });
-		expect(metadata.nativeSearch?.supported).toBe(false);
-		expect(metadata.modalities?.input).toEqual([]);
-		expect(metadata.reasoning?.levels).toEqual([]);
+		const profile = resolveProfile(catalog, { upstreamModelId: "up", providerKey: "one" });
+		expect(profile.contextWindow).toBe(2000);
+		expect(profile.referencePricing).toMatchObject({ input: "0", output: null });
+		expect(profile.nativeSearch).toBe(false);
+		expect(profile.inputModalities).toEqual([]);
+		expect(profile.reasoning.levels).toEqual([]);
 	});
 	test("changing one default propagates to every inheriting channel, without altering channel overrides", () => {
 		const value = model();
-		value.metadata.referencePricing.input = "7";
+		value.metadata.input_cost_per_token = 7e-6;
 		const catalog = read(value);
 		for (const [providerKey, price] of [
 			["one", "0"],
 			["two", "7"],
 		]) {
 			expect(
-				resolveModelMetadata({ catalog, query: { upstreamModelId: "up", providerKey } }).metadata
-					.referencePricing?.input,
+				resolveProfile(catalog, { upstreamModelId: "up", providerKey }).referencePricing?.input,
 			).toBe(price);
 		}
 	});
@@ -87,7 +93,7 @@ describe("data-only model directory adapter", () => {
 			["m.json", JSON.stringify(model())],
 			["other.json", JSON.stringify({ ...model(), id: "other" })],
 		]);
-		expect(() => catalogFromModelFiles(files, version, date)).toThrow();
+		expect(() => rawCatalogFromModelFiles(files, version, date)).toThrow();
 	});
 	test("reads repository models only, without needing a manifest or build artifact", async () => {
 		const bytes = await new Bun.Archive(
@@ -107,18 +113,18 @@ describe("data-only model directory adapter", () => {
 			catalogFromArchive(gzipSync(Buffer.alloc(MAX_CATALOG_BYTES + 1)), version, date),
 		).rejects.toThrow();
 	});
-test("pins the branch head SHA and rejects malformed revisions", () => {
-	const revision = (sha: unknown, publishedAt: unknown) => ({
-		name: "main",
-		commit: { sha, commit: { committer: { date: publishedAt } } },
-	});
-	expect(new URL(CATALOG_REVISION_URL).pathname).toBe(
-		"/repos/NarraFork/narrafork-model-catalog/branches/main",
-	);
-	expect(parseCatalogRevision(revision(version, date))).toEqual({
-		version,
-		publishedAt: date,
-	});
+	test("pins the branch head SHA and rejects malformed revisions", () => {
+		const revision = (sha: unknown, publishedAt: unknown) => ({
+			name: "main",
+			commit: { sha, commit: { committer: { date: publishedAt } } },
+		});
+		expect(new URL(CATALOG_REVISION_URL).pathname).toBe(
+			"/repos/NarraFork/narrafork-model-catalog/branches/main",
+		);
+		expect(parseCatalogRevision(revision(version, date))).toEqual({
+			version,
+			publishedAt: date,
+		});
 		for (const value of [
 			null,
 			{},
@@ -147,20 +153,24 @@ test("batch resolution validates once and owns immutable catalog/local snapshots
 	const local = {
 		revision: 1,
 		overrides: [
-			{ target: "model" as const, targetId: "m", metadata: { limits: { contextWindow: 3000 } } },
+			{
+				target: "model" as const,
+				targetId: "m",
+				metadata: { max_input_tokens: 3000 } as RawMetadata,
+			},
 		],
 	};
-	const resolve = createModelMetadataResolver(catalog, local);
+	const resolve = createModelCardResolver(catalog, local);
 	const query = { upstreamModelId: "m", modelId: "m" };
-	catalog.models[0]!.metadata.limits!.contextWindow = 0;
-	local.overrides[0]!.metadata.limits.contextWindow = 0;
+	catalog.models[0]!.metadata.max_input_tokens = 0;
+	local.overrides[0]!.metadata.max_input_tokens = 0;
 	const first = resolve(query);
-	expect(first.metadata.limits?.contextWindow).toBe(3000);
-	first.metadata.modalities!.input!.push("audio");
-	expect(resolve(query).metadata.modalities?.input).toEqual(["text", "image"]);
-	expect(() => createModelMetadataResolver(catalog, local)).toThrow();
+	expect(first.metadata.max_input_tokens).toBe(3000);
+	(first.metadata.supported_modalities as string[]).push("audio");
+	expect(resolve(query).metadata.supported_modalities).toEqual(["text", "image"]);
+	expect(() => createModelCardResolver(catalog, local)).toThrow();
 	expect(() => resolve({ upstreamModelId: "" })).toThrow();
-	expect(() => resolve(query, { limits: { contextWindow: 0 } })).toThrow();
+	expect(() => resolve(query, { max_input_tokens: 0 })).toThrow();
 	expect(() => resolve(query, null as never)).toThrow();
 });
 
@@ -196,9 +206,10 @@ describe("sub2api source rows", () => {
 				},
 			],
 		});
-		const metadata = catalog.models[0]!.metadata;
-		expect(metadata.limits).toEqual({ contextWindow: 1050000, maxOutputTokens: 128000 });
-		expect(metadata.referencePricing).toEqual({
+		const profile = modelProfile(catalog.models[0]!);
+		expect(profile.contextWindow).toBe(1050000);
+		expect(profile.maxOutputTokens).toBe(128000);
+		expect(profile.referencePricing).toEqual({
 			currency: "USD",
 			unit: "perMillionTokens",
 			input: "2",
@@ -215,42 +226,52 @@ describe("sub2api source rows", () => {
 				cacheWrite: "5",
 			},
 		});
-		expect(metadata.modalities).toEqual({ input: ["text", "image"], output: ["text"] });
-		expect(metadata.reasoning).toEqual({ supported: true, canDisable: true });
-		expect(metadata.nativeSearch?.supported).toBe(true);
+		expect(profile.inputModalities).toEqual(["text", "image"]);
+		expect(profile.outputModalities).toEqual(["text"]);
+		expect(profile.reasoning).toEqual({ supported: true, canDisable: true });
+		expect(profile.nativeSearch).toBe(true);
 		expect(
-			resolveModelMetadata({ catalog, query: { upstreamModelId: "m", providerKey: "codex" } })
-				.metadata.limits?.contextWindow,
+			resolveProfile(catalog, { upstreamModelId: "m", providerKey: "codex" }).contextWindow,
 		).toBe(272000);
 	});
 	test("preserves explicit zero, unknown, false, empty arrays and absolute cache tiers", () => {
-		const metadata = read({
-			id: "m",
-			metadata: {
-				litellm_provider: "openai",
-				input_cost_per_token: 0,
-				output_cost_per_token: null,
-				cache_read_input_token_cost: 3e-7,
-				cache_read_input_token_cost_above_200k_tokens: 4.5e-7,
-				input_cost_per_token_above_200k_tokens: 0,
-				supports_web_search: false,
-				supported_modalities: [],
-				supported_output_modalities: [],
-			},
-			variants: [],
-		}).models[0]!.metadata;
-		expect(metadata.referencePricing?.input).toBe("0");
-		expect(metadata.referencePricing?.output).toBeNull();
-		expect(metadata.referencePricing?.longContext?.cacheRead).toBe("0.45");
-		expect(metadata.nativeSearch?.supported).toBe(false);
-		expect(metadata.modalities).toEqual({ input: [], output: [] });
+		const profile = modelProfile(
+			read({
+				id: "m",
+				metadata: {
+					litellm_provider: "openai",
+					input_cost_per_token: 0,
+					output_cost_per_token: null,
+					cache_read_input_token_cost: 3e-7,
+					cache_read_input_token_cost_above_200k_tokens: 4.5e-7,
+					input_cost_per_token_above_200k_tokens: 0,
+					supports_web_search: false,
+					supported_modalities: [],
+					supported_output_modalities: [],
+				},
+				variants: [],
+			}).models[0]!,
+		);
+		expect(profile.referencePricing?.input).toBe("0");
+		expect(profile.referencePricing?.output).toBeNull();
+		expect(profile.referencePricing?.longContext?.cacheRead).toBe("0.45");
+		expect(profile.nativeSearch).toBe(false);
+		expect(profile.inputModalities).toEqual([]);
+		expect(profile.outputModalities).toEqual([]);
 	});
 	test("does not confuse separate input and output caps with a total context limit", () => {
-		const metadata = read({
-			id: "m",
-			metadata: { litellm_provider: "openai", max_input_tokens: 128000, max_output_tokens: 272000 },
-			variants: [],
-		}).models[0]!.metadata;
-		expect(metadata.limits).toEqual({ maxOutputTokens: 272000 });
+		const profile = modelProfile(
+			read({
+				id: "m",
+				metadata: {
+					litellm_provider: "openai",
+					max_input_tokens: 128000,
+					max_output_tokens: 272000,
+				},
+				variants: [],
+			}).models[0]!,
+		);
+		expect(profile.contextWindow).toBeUndefined();
+		expect(profile.maxOutputTokens).toBe(272000);
 	});
 });

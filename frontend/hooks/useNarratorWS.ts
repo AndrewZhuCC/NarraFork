@@ -721,7 +721,7 @@ export interface NarratorWSCallbacks {
 	}) => void;
 	/**
 	 * The narrator is parked on a self-recovering block: a NUG model to recover
-	 * (credential pool exhausted), or a Kimi quota window to reset.
+	 * (credential pool exhausted), or a Kimi / OpenCode Go quota window to reset.
 	 */
 	onModelUnavailableWaiting?: (info: {
 		message: string;
@@ -730,6 +730,8 @@ export interface NarratorWSCallbacks {
 		providerPrefix?: string;
 		nugModelId?: string;
 		waitKind?: "credentials" | "quota";
+		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+		quotaProvider?: "kimi" | "opencode";
 		/** Epoch ms the quota window resets at (`quota` waits only). */
 		resumeAt?: number;
 	}) => void;
@@ -741,6 +743,8 @@ export interface NarratorWSCallbacks {
 		model: string;
 		nugModelId?: string;
 		waitKind?: "credentials" | "quota";
+		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+		quotaProvider?: "kimi" | "opencode";
 	}) => void;
 	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
@@ -1521,6 +1525,7 @@ export function useNarratorWS(
 							providerPrefix: data.providerPrefix as string | undefined,
 							nugModelId: data.nugModelId as string | undefined,
 							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 							resumeAt: data.resumeAt as number | undefined,
 						});
 						break;
@@ -1529,6 +1534,7 @@ export function useNarratorWS(
 							model: data.model as string,
 							nugModelId: data.nugModelId as string | undefined,
 							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 						});
 						break;
 					case "queue_status":

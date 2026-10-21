@@ -53,7 +53,11 @@ export async function verifyMirrorAsset(
 		throw new Error("Required mirror asset missing or truncated");
 	const stream = await storage.getFileStream(path);
 	if (!stream) throw new Error("Required mirror asset missing");
-	if (asset.kind !== "patch") {
+	if (
+		asset.kind !== "patch" &&
+		asset.kind !== "helpers-binary" &&
+		asset.kind !== "executor-binary"
+	) {
 		const bytes = await readMirrorBounded(stream, asset.size, signal);
 		if (
 			bytes.length !== asset.size ||

@@ -1,13 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import {
-	catalogFromModelFiles,
-	catalogToRaw,
-	decodeCatalog,
-	encodeCatalog,
-} from "../../server/lib/model-catalog/source";
+import { legacyLocalToRaw } from "../../server/lib/model-catalog/legacy-v1";
+import { decodeCatalog } from "../../server/lib/model-catalog/source";
 import { type RawMetadata, rawCatalogFromModelFiles } from "./card";
 import { normalizeRawLocalState, patchLocalCardMetadata } from "./card-local";
-import { createModelCardResolver, legacyLocalToRaw, type RawLocalState } from "./card-resolver";
+import { createModelCardResolver, type RawLocalState } from "./card-resolver";
 
 const sourceVersion = "a".repeat(40);
 const date = "2026-01-01T00:00:00Z";
@@ -146,7 +142,7 @@ describe("raw card resolution and persistence", () => {
 		).toEqual({ input_cost_per_token_above_200k_tokens_priority: 4e-6 });
 	});
 
-	test("legacy local units and ambiguous windows convert without inventing vendor limits", () => {
+	test("old local units and ambiguous windows import without inventing vendor limits", () => {
 		const local = legacyLocalToRaw({
 			revision: 3,
 			bindings: [
@@ -171,14 +167,13 @@ describe("raw card resolution and persistence", () => {
 		});
 	});
 
-	test("v2 snapshots round-trip unknown-only metadata while old pinned snapshots stay v1", () => {
+	test("snapshots round-trip unknown-only metadata and old pinned snapshots import once", () => {
 		const metadata = { future: { zero: 0, empty: [], unknown: null, negative: false } };
-		const catalog = catalogFromModelFiles(files(metadata), sourceVersion, date);
-		const encoded = encodeCatalog(catalog);
-		expect(encoded.schemaVersion).toBe(2);
-		expect(
-			catalogToRaw(decodeCatalog(JSON.parse(JSON.stringify(encoded)))).models[0]?.metadata,
-		).toEqual(metadata);
+		const catalog = rawCatalogFromModelFiles(files(metadata), sourceVersion, date);
+		expect(catalog.schemaVersion).toBe(2);
+		expect(decodeCatalog(JSON.parse(JSON.stringify(catalog))).models[0]?.metadata).toEqual(
+			metadata,
+		);
 		const legacy = decodeCatalog({
 			schemaVersion: 1,
 			catalogVersion: "old-pinned",
@@ -186,11 +181,17 @@ describe("raw card resolution and persistence", () => {
 			models: [{ id: "old", metadata: { limits: { contextWindow: 2048 } } }],
 			variants: [],
 		});
-		expect(encodeCatalog(legacy).schemaVersion).toBe(1);
-		expect(catalogToRaw(legacy).models[0]?.metadata).toEqual({ legacy_context_window: 2048 });
-		expect(() => decodeCatalog({ ...encoded, sourceVersion: null })).toThrow();
+		expect(legacy.schemaVersion).toBe(2);
+		expect(legacy.sourceVersion).toBe("old-pinned");
+		expect(legacy.models[0]?.metadata).toEqual({ legacy_context_window: 2048 });
+		expect(decodeCatalog(JSON.parse(JSON.stringify(legacy)))).toEqual(legacy);
+		expect(() => decodeCatalog({ ...catalog, sourceVersion: null })).toThrow();
 		expect(() =>
-			catalogFromModelFiles(files({ nested: { api_key: "not-a-real-key" } }), sourceVersion, date),
+			rawCatalogFromModelFiles(
+				files({ nested: { api_key: "not-a-real-key" } }),
+				sourceVersion,
+				date,
+			),
 		).toThrow();
 	});
 });
@@ -251,4 +252,65 @@ test("canonical local scopes preserve effective values and reset the only write 
 		patchLocalCardMetadata(catalog, edited, "model", "m", { set: { "future.keep": true } }),
 	).toThrow();
 	expect(input.models?.[0]?.metadata.input_cost_per_token).toBe(2e-6);
+});
+
+describe("provider-entry (connection) overrides", () => {
+	const catalog = () =>
+		rawCatalogFromModelFiles(files({ max_input_tokens: 128000 }), sourceVersion, date);
+	const query = { upstreamModelId: "m", providerId: "a" };
+
+	test("apply by model value above every other local layer and never assert identity", () => {
+		let local: RawLocalState = {
+			revision: 0,
+			bindings: [
+				{
+					id: "editor",
+					providerId: "a",
+					upstreamModelId: "m",
+					overrides: { working_context_tokens: 90000, max_output_tokens: 4000 },
+				},
+			],
+		};
+		local = patchLocalCardMetadata(catalog(), local, "model", "m", {
+			set: { working_context_tokens: 100000 },
+		});
+		local = patchLocalCardMetadata(catalog(), local, "connection", "a:m", {
+			set: { working_context_tokens: 64000 },
+		});
+		const resolve = createModelCardResolver(catalog(), local);
+		const own = resolve(query, undefined, undefined, "a:m");
+		expect(own.metadata.working_context_tokens).toBe(64000);
+		expect(own.metadata.max_output_tokens).toBe(4000);
+		expect(own.provenance.working_context_tokens).toEqual({
+			layer: "local-connection",
+			id: "a:m",
+			explicit: true,
+		});
+		expect(own.bindingId).toBe("editor");
+		// Another provider entry of the same connection, or none, does not see it.
+		expect(resolve(query, undefined, undefined, "b:m").metadata.working_context_tokens).toBe(90000);
+		expect(resolve(query).metadata.working_context_tokens).toBe(90000);
+	});
+
+	test("normalization validates keys and drops emptied entries; only delete removes one", () => {
+		expect(() =>
+			normalizeRawLocalState({
+				revision: 0,
+				connections: { " a:m": { working_context_tokens: 1 } },
+			}),
+		).toThrow("Invalid provider model key");
+		expect(() =>
+			normalizeRawLocalState({ revision: 0, connections: { "a:m": { api_key: "x" } } }),
+		).toThrow();
+		expect(
+			normalizeRawLocalState({ revision: 0, connections: { "a:m": {} } }).connections,
+		).toBeUndefined();
+		const set = patchLocalCardMetadata(catalog(), { revision: 0 }, "connection", "a:m", {
+			set: { working_context_tokens: 64000 },
+		});
+		const reset = patchLocalCardMetadata(catalog(), set, "connection", "a:m", {
+			reset: ["working_context_tokens"],
+		});
+		expect(reset.connections).toBeUndefined();
+	});
 });

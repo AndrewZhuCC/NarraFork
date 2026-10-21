@@ -9,6 +9,7 @@ import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
 import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
@@ -23,7 +24,7 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
@@ -279,7 +280,7 @@ export class GeminiProvider implements ProviderAdapter {
 		const tools = params.tools as Array<{ functionDeclarations: GeminiFunctionDeclaration[] }>;
 
 		const generationConfig: Record<string, unknown> = {};
-		const metadata = effectiveProviderMetadata(params.model);
+		const metadata = effectiveModelProfile(params.model);
 		const maxOutputTokens = resolveOutputTokenLimit(metadata, params.maxOutputTokens);
 		if (maxOutputTokens !== undefined) generationConfig.maxOutputTokens = maxOutputTokens;
 		const thinkingConfig = mapReasoningEffortToThinking(
@@ -346,7 +347,7 @@ export class GeminiProvider implements ProviderAdapter {
 					new Response(tap.stream),
 					GEMINI_GENERATE_MAX_SSE_EVENT_BYTES,
 				).catch(() => "");
-				throw new ApiError(response.status, `Gemini API error ${response.status}: ${errText}`);
+				throw createGeminiHttpError(response, errText);
 			}
 			yield* this.parseSSEStream(tap.stream);
 		} catch (error) {
@@ -566,7 +567,7 @@ export class GeminiProvider implements ProviderAdapter {
 		if (opts.systemInstruction) {
 			body.systemInstruction = { parts: [{ text: opts.systemInstruction }] };
 		}
-		const metadata = effectiveProviderMetadata(opts.model);
+		const metadata = effectiveModelProfile(opts.model);
 		const thinkingConfig = mapReasoningEffortToThinking(
 			resolveMetadataReasoning(metadata, opts.reasoningEffort),
 			metadata.reasoning?.mode,
@@ -603,7 +604,7 @@ export class GeminiProvider implements ProviderAdapter {
 				response,
 				GEMINI_GENERATE_MAX_STREAM_BYTES,
 			);
-			throw new ApiError(response.status, `Gemini API error ${response.status}: ${responseText}`);
+			throw createGeminiHttpError(response, responseText);
 		}
 		if (!response.body) throw new Error("Gemini API returned no body");
 
@@ -1236,6 +1237,47 @@ async function parseGenerateJsonFallback(
 		throw new ApiError(422, "Response truncated: model reached maximum token limit.");
 	}
 	return { text, usage: mapUsage(json.usageMetadata), ...(outputTruncated && { outputTruncated }) };
+}
+
+/**
+ * Build the error for a non-2xx Gemini response with structured diagnostics.
+ *
+ * The message keeps its historical `Gemini API error <status>: <body>` shape,
+ * but the status, the `{ error: { status, message } }` envelope and the
+ * response headers now travel in `diagnostics` too, like the OpenAI and
+ * Anthropic providers. Quota recovery needs exactly those: OpenCode Go's
+ * per-family Gemini root (`/inference/go/google/v1beta`) answers a spent plan
+ * with a 429 whose wait hint lives only in `retry-after`.
+ */
+function createGeminiHttpError(response: Response, rawBody: string): ApiError {
+	let payload: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(rawBody);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			payload = parsed as Record<string, unknown>;
+		}
+	} catch {
+		// Non-JSON body: the raw text below is still the message.
+	}
+	const nested =
+		payload.error && typeof payload.error === "object"
+			? (payload.error as Record<string, unknown>)
+			: undefined;
+	const message = typeof nested?.message === "string" ? nested.message : rawBody;
+	const diagnostics = parseErrorDiagnostics(
+		{
+			...payload,
+			statusCode: response.status,
+			message,
+			responseHeaders: Object.fromEntries(response.headers.entries()),
+		},
+		{ source: "provider", phase: "http_error", statusCode: response.status, message },
+	);
+	return new ApiError(
+		response.status,
+		`Gemini API error ${response.status}: ${rawBody}`,
+		diagnostics,
+	);
 }
 
 function invalidStateHttpStatus(reason: string): number {

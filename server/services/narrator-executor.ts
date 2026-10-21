@@ -46,8 +46,8 @@ export interface ExecuteLoopResult {
 	 * caller should suspend the turn and wait for recovery, then resume. Two causes
 	 * share this field: a NUG model whose credential pool is disabled
 	 * (`waitKind: "credentials"`, waited for via the availability poller) and an
-	 * exhausted Kimi coding-plan allowance (`waitKind: "quota"`, waited for until
-	 * the published `resumeAt`).
+	 * exhausted Kimi coding-plan or OpenCode Go allowance (`waitKind: "quota"`,
+	 * waited for until the published `resumeAt`).
 	 */
 	modelUnavailable?: {
 		message: string;
@@ -57,6 +57,9 @@ export interface ExecuteLoopResult {
 		providerPrefix?: string;
 		nugModelId?: string;
 		waitKind?: "credentials" | "quota";
+		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+		quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
+		quotaBucket?: string;
 		/** Epoch ms the turn may be replayed at. Absent for a too-far-out quota wall. */
 		resumeAt?: number;
 		/** Epoch ms the quota window resets at, whenever upstream published one. */
@@ -272,6 +275,8 @@ export async function executeAgentLoop(
 					providerPrefix: event.providerPrefix,
 					nugModelId: event.nugModelId,
 					waitKind: event.waitKind,
+					quotaProvider: event.quotaProvider,
+					quotaBucket: event.quotaBucket,
 					resumeAt: event.resumeAt,
 					quotaResetAt: event.quotaResetAt,
 					diagnostics: event.diagnostics,

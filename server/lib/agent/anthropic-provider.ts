@@ -34,7 +34,7 @@ import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { reportInputCharacters } from "./input-characters";
-import { buildOpencodeSessionHeader } from "./opencode-session";
+import { buildOpencodeSessionHeader, isOpencodeEndpoint } from "./opencode-session";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -46,7 +46,7 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
@@ -62,13 +62,7 @@ import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { flattenTopLevelUnion } from "./tool-schema-compat";
-import {
-	type AgentToolUse,
-	ApiError,
-	isDeepSeekModel,
-	mapDeepSeekEffort,
-	type ResolvedToolDefinition,
-} from "./types";
+import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
 
 // === Claude Code protocol constants ===
@@ -611,10 +605,10 @@ function buildThinkingConfig(
 	| { type: "enabled"; budget_tokens: number }
 	| { type: "disabled" }
 	| undefined {
-	const metadata = effectiveProviderMetadata(model);
+	const metadata = effectiveModelProfile(model);
 	if (metadata.reasoning?.supported === false) return undefined;
 	if (metadata.reasoning?.supported !== true && !supportsThinking(model)) return undefined;
-	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort, model);
 
 	// "none" explicitly disables thinking
 	if (reasoningEffort === "none") {
@@ -671,8 +665,8 @@ export function mapEffortParam(
 ): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 	// Explicit exclusions take precedence over catalog capability and tier metadata.
 	if (!supportsEffort(parseModelId(model).model)) return undefined;
-	const metadata = effectiveProviderMetadata(model);
-	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
+	const metadata = effectiveModelProfile(model);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort, model);
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
 	if (metadata.reasoning?.levels?.length)
 		return reasoningEffort as "low" | "medium" | "high" | "xhigh" | "max";
@@ -1236,6 +1230,13 @@ export class AnthropicProvider implements ProviderAdapter {
 				extraHeaders: this.config.extraHeaders,
 			}),
 		);
+		// The official dialect authenticates with Bearer, but OpenCode's
+		// `/zen/go/v1/messages` reads only `x-api-key` and rejects a Bearer-only
+		// request as "Go requires a credential" (the `/inference/go` roots accept
+		// either). Sending both keeps one Anthropic config valid on every Go root.
+		if (isOfficial && !headers["x-api-key"] && isOpencodeEndpoint(this.config.baseUrl)) {
+			headers["x-api-key"] = apiKey;
+		}
 		return this.applyExtraHeaders(headers);
 	}
 
@@ -1538,7 +1539,6 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const isOfficial = !!this.config.officialApi;
 		const model = parseModelId(params.model).model;
-		const isDeepSeek = isDeepSeekModel(model);
 		// Strict models (Claude families, gpt/o-series) mint server-bound reasoning
 		// credentials; an uncredentialed thinking block must be dropped for them.
 		// Every relay model keeps its plain-text reasoning instead — with an empty
@@ -1641,7 +1641,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// the supported range caps at or above it.
 		const maxTokens =
 			resolveOutputTokenLimit(
-				effectiveProviderMetadata(params.model),
+				effectiveModelProfile(params.model),
 				params.maxOutputTokens,
 				DEFAULT_MAX_TOKENS,
 			) ?? DEFAULT_MAX_TOKENS;
@@ -1772,17 +1772,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (supportsEffort(model)) {
 			const effort = mapEffortParam(params.model, params.reasoningEffort);
 			if (effort) body.output_config = { effort };
-		}
-
-		// DeepSeek effort: output_config.effort controls thinking intensity
-		// (DeepSeek supports "high" and "max"; low/medium map to high)
-		if (isDeepSeek && thinkingEnabled && supportsEffort(model)) {
-			const effort = mapDeepSeekEffort(
-				resolveMetadataReasoning(effectiveProviderMetadata(params.model), params.reasoningEffort),
-			);
-			if (effort) {
-				body.output_config = { effort };
-			}
 		}
 
 		body.system = systemBlocks;
@@ -2103,7 +2092,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: bareModel,
 			max_tokens:
 				resolveOutputTokenLimit(
-					effectiveProviderMetadata(model),
+					effectiveModelProfile(model),
 					options?.maxOutputTokens,
 					DEFAULT_GENERATE_MAX_TOKENS,
 				) ?? DEFAULT_GENERATE_MAX_TOKENS,
@@ -2113,16 +2102,14 @@ export class AnthropicProvider implements ProviderAdapter {
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
 		const reasoningEffort =
-			options?.reasoningEffort ??
-			effectiveProviderMetadata(model).reasoning?.defaultLevel ??
-			undefined;
+			options?.reasoningEffort ?? effectiveModelProfile(model).reasoning?.defaultLevel ?? undefined;
 		if (reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 			const effort = mapEffortParam(model, reasoningEffort);
 			if (effort) {
 				body.output_config = {
-					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
+					effort,
 				};
 			}
 		}
@@ -2203,7 +2190,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: bareModel,
 			max_tokens:
 				resolveOutputTokenLimit(
-					effectiveProviderMetadata(model),
+					effectiveModelProfile(model),
 					options?.maxOutputTokens,
 					DEFAULT_GENERATE_MAX_TOKENS,
 				) ?? DEFAULT_GENERATE_MAX_TOKENS,
@@ -2213,16 +2200,14 @@ export class AnthropicProvider implements ProviderAdapter {
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
 		const reasoningEffort =
-			options?.reasoningEffort ??
-			effectiveProviderMetadata(model).reasoning?.defaultLevel ??
-			undefined;
+			options?.reasoningEffort ?? effectiveModelProfile(model).reasoning?.defaultLevel ?? undefined;
 		if (reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 			const effort = mapEffortParam(model, reasoningEffort);
 			if (effort) {
 				body.output_config = {
-					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
+					effort,
 				};
 			}
 		}
@@ -2271,7 +2256,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		const metadataModel = params.model.startsWith(`${this.config.prefix}:`)
 			? params.model
 			: `${this.config.prefix}:${params.model}`;
-		if (effectiveProviderMetadata(metadataModel).nativeSearch?.supported === false) {
+		if (effectiveModelProfile(metadataModel).nativeSearch === false) {
 			throw new Error(`Model ${params.model} does not support native search.`);
 		}
 		const apiKey = this.config.apiKey;
@@ -2297,7 +2282,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: bareModel,
 			max_tokens:
 				resolveOutputTokenLimit(
-					effectiveProviderMetadata(metadataModel),
+					effectiveModelProfile(metadataModel),
 					undefined,
 					WEB_SEARCH_MAX_TOKENS,
 				) ?? WEB_SEARCH_MAX_TOKENS,
@@ -3334,9 +3319,10 @@ async function buildAnthropicHistory(
 			if (images.some((image) => image !== null)) {
 				// A mid-conversation system message cannot carry image parts, so an
 				// image forces the user role. That only affects `sys` rows, which do
-				// not carry uploads in practice.
-				const parts: AnthropicContentPart[] = orderUserContent(text, images, "after").map((part) =>
-					part.type === "text" ? { type: "text", text: part.text } : part.image,
+				// not carry uploads in practice. Unplaced images lead, exactly as the live turn
+				// sent them: a rebuilt turn that reorders its parts misses the prompt cache.
+				const parts: AnthropicContentPart[] = orderUserContent(text, images, "before").map(
+					(part) => (part.type === "text" ? { type: "text", text: part.text } : part.image),
 				);
 				history.push({ role: "user", content: parts });
 				emittedMessages.push(msg);

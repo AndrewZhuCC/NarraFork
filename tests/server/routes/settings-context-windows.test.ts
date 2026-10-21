@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -7,24 +7,60 @@ import { normalizeModelContextWindowOverrides } from "@shared/model-context-wind
 import { Hono } from "hono";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import { getDefaults, reloadSettings, saveSettings, settings } from "../../../server/lib/settings";
-import { normalizeModelContextWindows } from "../../../server/lib/settings/model-context-windows";
+import { invalidateUserCache } from "../../../server/middleware/auth";
 import { settingsRoutes, updateSettingsSchema } from "../../../server/routes/settings";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
+
+const ADMIN_SUB = "context-window-test-admin";
 
 const snapshot = structuredClone(settings);
 const settingsPath = resolve(getNarraforkHome(), "settings.json");
 const original = readFileSync(settingsPath, "utf8");
+
+// `assertAdmin` authorizes against the live store role, not the token claim, so the
+// acting administrator must be reported as an admin by the session store.
+beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === ADMIN_SUB ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+});
 afterEach(() => {
+	setAuthStores(undefined);
+	invalidateUserCache(ADMIN_SUB);
 	saveSettings(structuredClone(snapshot));
 	writeFileSync(settingsPath, original);
 });
 
 const app = new Hono<{ Variables: { user: { sub: string; role: string } } }>();
 app.use("*", async (c, next) => {
-	c.set("user", { sub: "context-window-test-admin", role: "admin" });
+	c.set("user", { sub: ADMIN_SUB, role: "admin" });
 	await next();
 });
 app.onError((error, c) => c.json({ error: error.message }, 400));
 app.route("/settings", settingsRoutes);
+/** Provider entries' own working windows in a catalog local layer. */
+function ownWindows(local: { connections?: Record<string, Record<string, unknown>> }) {
+	return Object.fromEntries(
+		Object.entries(local.connections ?? {}).flatMap(([model, metadata]) =>
+			typeof metadata.working_context_tokens === "number"
+				? [[model, metadata.working_context_tokens]]
+				: [],
+		),
+	);
+}
+/** The windows settings.json holds: in the catalog, never as a separate map. */
+function diskWindows() {
+	const disk = JSON.parse(readFileSync(settingsPath, "utf8"));
+	expect(disk.agent.modelContextWindows).toBeUndefined();
+	return ownWindows(disk.agent.modelCatalog.local);
+}
 function patch(windows: unknown) {
 	return app.request("/settings", {
 		method: "PATCH",
@@ -43,7 +79,9 @@ async function coldStartContextWindows(home: string, models: string[]) {
 			`const { settings } = await import(${JSON.stringify(settingsModule)});
 			const { modelTokenBudgets } = await import(${JSON.stringify(budgetsModule)});
 			console.log("COLD_START_RESULT=" + JSON.stringify({
-				windows: settings.agent.modelContextWindows,
+				map: settings.agent.modelContextWindows ?? null,
+				connections: settings.agent.modelCatalog.local.connections ?? {},
+				bindings: (settings.agent.modelCatalog.local.bindings ?? []).map((b) => b.id),
 				budgets: Object.fromEntries(${JSON.stringify(models)}.map(model => [model, modelTokenBudgets(model)])),
 			}));`,
 		],
@@ -101,9 +139,9 @@ async function coldStartContextWindows(home: string, models: string[]) {
 	}
 }
 
-describe("context-window cold-start reconciliation", () => {
+describe("context-window cold-start import", () => {
 	for (const schemaVersion of [1, 2]) {
-		it(`repairs stored v${schemaVersion} windows without replaying untouched legacy values`, async () => {
+		it(`imports a stored v${schemaVersion} page map once and stops storing it`, async () => {
 			const home = mkdtempSync(resolve(tmpdir(), "narrafork-context-cold-start-"));
 			const path = resolve(home, "settings.json");
 			const windows = {
@@ -159,23 +197,33 @@ describe("context-window cold-start reconciliation", () => {
 					}),
 				);
 				const first = await coldStartContextWindows(home, Object.keys(windows));
-				expect(first.windows).toEqual({
+				// Old window bindings become provider entries' own windows. Where the stored
+				// map and a binding disagree, the map is what the provider page showed (older
+				// builds dropped page edits after a hot reload), so it is applied once. A key
+				// the map lacks is not a deletion: its binding's value stays.
+				expect(first.map).toBeNull();
+				expect(first.bindings).toEqual([]);
+				expect(ownWindows(first)).toEqual({
 					"openai:cold-large": 10_000_000,
 					"openai:cold-small": 256,
+					"openai:cold-invalid": 64_000,
 					"openai:cold-edited": 128_000,
 					"openai:cold-reset": 128_000,
 				});
 				expect(first.budgets).toEqual({
 					"openai:cold-large": { workingContextTokens: 10_000_000 },
 					"openai:cold-small": { workingContextTokens: 256 },
-					"openai:cold-invalid": {},
-					"openai:cold-edited": { workingContextTokens: 96_000 },
-					"openai:cold-reset": {},
+					"openai:cold-invalid": { workingContextTokens: 64_000 },
+					"openai:cold-edited": { workingContextTokens: 128_000 },
+					"openai:cold-reset": { workingContextTokens: 128_000 },
 				});
 				const persisted = readFileSync(path, "utf8");
 				const disk = JSON.parse(persisted);
-				expect(disk.agent.modelContextWindows).toEqual(first.windows);
+				expect(disk.agent.modelContextWindows).toBeUndefined();
+				expect(ownWindows(disk.agent.modelCatalog.local)).toEqual(ownWindows(first));
+				expect(JSON.stringify(disk.agent.modelCatalog)).not.toContain("legacy-window:");
 				expect(disk.agent.modelCatalog.schemaVersion).toBe(2);
+				expect(JSON.stringify(disk.agent.modelCatalog)).not.toContain("limits.contextWindow");
 				const second = await coldStartContextWindows(home, Object.keys(windows));
 				expect(second).toEqual(first);
 				expect(readFileSync(path, "utf8")).toBe(persisted);
@@ -222,77 +270,42 @@ describe("context-window automatic normalization", () => {
 		expect(input.tooBig).toBe(20_000_000);
 	});
 
-	it("normalizes all request values rather than rejecting new or edited overrides", () => {
-		const parsed = updateSettingsSchema.parse({ agent: { modelContextWindows: input } });
-		expect(parsed.agent?.modelContextWindows).toEqual(expected);
-		for (const value of [null, [], "invalid", 100]) {
-			expect(
-				updateSettingsSchema.parse({ agent: { modelContextWindows: value } }).agent
-					?.modelContextWindows,
-			).toEqual({});
-		}
-		// Unrelated patches must not clear an omitted override map.
-		expect(
-			updateSettingsSchema.parse({ agent: { providerOrder: ["test"] } }).agent,
-		).not.toHaveProperty("modelContextWindows");
-	});
-
 	it("migrates stored values and preserves models absent from the current list", () => {
 		const raw = getDefaults();
-		raw.agent.modelContextWindows = { "retired:large": 20_000_000, "offline:valid": 128_000 };
+		(raw.agent as Record<string, unknown>).modelContextWindows = {
+			"retired:large": 20_000_000,
+			"offline:valid": 128_000,
+		};
 		writeFileSync(settingsPath, JSON.stringify(raw));
 		const loaded = reloadSettings();
 		const result = { "retired:large": 10_000_000, "offline:valid": 128_000 };
-		expect(loaded.agent.modelContextWindows).toEqual(result);
-		expect(JSON.parse(readFileSync(settingsPath, "utf8")).agent.modelContextWindows).toEqual(
-			result,
-		);
-		expect(normalizeModelContextWindows(loaded)).toBe(false);
+		expect(loaded.agent).not.toHaveProperty("modelContextWindows");
+		expect(ownWindows(loaded.agent.modelCatalog!.local)).toEqual(result);
+		expect(diskWindows()).toEqual(result);
 	});
 
-	it("saves new and edited invalid values and returns the normalized result to the page", async () => {
-		settings.agent.modelContextWindows = { tooBig: 128_000 };
+	it("a settings PATCH from a page loaded before the upgrade is rejected, not dropped", async () => {
+		const before = ownWindows(settings.agent.modelCatalog!.local);
+		const order = structuredClone(settings.agent.providerOrder);
 		const response = await patch(input);
-		expect(response.status).toBe(200);
-		const body = await response.json();
-		expect(body.agent.modelContextWindows).toEqual(expected);
-		expect(settings.agent.modelContextWindows).toEqual(expected);
+		expect(response.status).toBe(400);
+		expect((await response.json()).error).toContain("reload the page");
+		expect(settings.agent.providerOrder).toEqual(order);
+		expect(ownWindows(settings.agent.modelCatalog!.local)).toEqual(before);
+		const ok = await app.request("/settings", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ agent: { providerOrder: ["test"] } }),
+		});
+		expect(ok.status).toBe(200);
 		expect(settings.agent.providerOrder).toEqual(["test"]);
-		expect(JSON.parse(readFileSync(settingsPath, "utf8")).agent.modelContextWindows).toEqual(
-			expected,
-		);
-		const again = await patch(expected);
-		expect(again.status).toBe(200);
-		expect(settings.agent.modelContextWindows).toEqual(expected);
 	});
 
-	it("saves an old page replay without requiring historical-value tracking", async () => {
-		settings.agent.modelContextWindows = {};
-		const response = await patch({ "retired:large": 99_000_000 });
-		expect(response.status).toBe(200);
-		expect(settings.agent.modelContextWindows).toEqual({ "retired:large": 10_000_000 });
-	});
-
-	it("repairs malformed maps without blocking unrelated changes", async () => {
-		for (const value of [null, [], "invalid", 100]) {
-			const response = await patch(value);
-			expect(response.status).toBe(200);
-			expect(settings.agent.modelContextWindows).toEqual({});
-		}
-	});
-
-	it("also normalizes internal writes before persistence", () => {
+	it("internal writes never store a window map beside the catalog", () => {
 		const local = getDefaults();
-		local.agent.modelContextWindows = {
-			"discovered:large": 99_000_000,
-			"discovered:good": 4096,
-			invalid: -1,
-		};
+		(local.agent as Record<string, unknown>).modelContextWindows = { "discovered:good": 4096 };
 		saveSettings(local);
-		const result = { "discovered:large": 10_000_000, "discovered:good": 4096 };
-		expect(settings.agent.modelContextWindows).toEqual(result);
-		expect(JSON.parse(readFileSync(settingsPath, "utf8")).agent.modelContextWindows).toEqual(
-			result,
-		);
+		expect(settings.agent).not.toHaveProperty("modelContextWindows");
+		expect(diskWindows()["discovered:good"]).toBeUndefined();
 	});
 });

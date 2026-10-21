@@ -1,11 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import type { ModelMetadata } from "@shared/model-catalog/schema/catalog";
-import {
-	bindModelCatalogSettings,
-	getEffectiveModelMetadata,
-	getModelCatalogSnapshot,
-	mutateModelCatalog,
-} from "../../model-catalog";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { RawMetadata } from "@shared/model-catalog/card";
+import bundledCatalog from "@shared/model-catalog/dist/catalog.json";
+import { bindModelCatalogSettings, getEffectiveModelCard } from "../../model-catalog";
 import { type AnthropicProviderConfig, saveSettings, settings } from "../../settings";
 import type { NarraForkSettings } from "../../settings/types";
 import { AnthropicProvider, mapEffortParam } from "../anthropic-provider";
@@ -84,16 +80,29 @@ afterEach(() => {
 
 function installClaudeReasoningMetadata(
 	modelId = "claude-opus-5",
-	reasoning: ModelMetadata["reasoning"] = { supported: true },
+	reasoning: RawMetadata = { supports_reasoning: true },
 ): void {
+	const preset = bundledCatalog.models.some((model) => model.id === modelId);
 	bindModelCatalogSettings(
 		{
 			anthropicProviders: [config()],
 			agent: {
 				modelCatalog: {
-					schemaVersion: 1,
-					migrationVersion: 1,
-					local: { revision: 0 },
+					schemaVersion: 2,
+					migrationVersion: 2,
+					local: {
+						revision: 0,
+						models: preset ? [] : [{ id: modelId, metadata: reasoning }],
+						bindings: [
+							{
+								id: "claude-channel-fixture",
+								providerId: "relay",
+								upstreamModelId: `anthropic:${modelId}`,
+								modelId,
+								overrides: reasoning,
+							},
+						],
+					},
 					autoApply: false,
 					pinnedVersion: null,
 				},
@@ -101,25 +110,7 @@ function installClaudeReasoningMetadata(
 		} as NarraForkSettings,
 		() => {},
 	);
-	mutateModelCatalog({
-		baseRevision: getModelCatalogSnapshot().local.revision,
-		action: "upsert-model",
-		model: { id: modelId, metadata: { reasoning } },
-	});
-	mutateModelCatalog({
-		baseRevision: getModelCatalogSnapshot().local.revision,
-		action: "upsert-binding",
-		binding: {
-			id: "claude-channel-fixture",
-			providerId: "relay",
-			upstreamModelId: `anthropic:${modelId}`,
-			modelId,
-			overrides: { reasoning },
-		},
-	});
-	expect(getEffectiveModelMetadata(`relay:anthropic:${modelId}`).metadata.reasoning).toMatchObject(
-		reasoning ?? {},
-	);
+	expect(getEffectiveModelCard(`relay:anthropic:${modelId}`).metadata).toMatchObject(reasoning);
 }
 
 type RequestPath = "chat" | "generate" | "history";
@@ -141,15 +132,90 @@ async function capturePath(
 	return capturedBody as Record<string, unknown>;
 }
 
-const OPUS_45_BUDGET_REASONING: ModelMetadata["reasoning"] = {
-	supported: true,
-	mode: "budget",
-	levels: null,
-	canDisable: true,
-	defaultLevel: null,
+const OPUS_45_BUDGET_REASONING: RawMetadata = {
+	supports_reasoning: true,
+	reasoning_mode: "budget",
+	reasoning_effort_levels: null,
+	can_disable_reasoning: true,
+	default_reasoning_effort: null,
 };
 
 const REQUEST_PATHS: RequestPath[] = ["chat", "generate", "history"];
+
+describe("DeepSeek card reasoning reaches all Anthropic-compatible request paths", () => {
+	beforeEach(() => {
+		bindModelCatalogSettings(
+			{
+				anthropicProviders: [config()],
+				agent: {
+					modelCatalog: {
+						schemaVersion: 2,
+						migrationVersion: 2,
+						local: { revision: 0 },
+						autoApply: false,
+						pinnedVersion: null,
+					},
+				},
+			} as NarraForkSettings,
+			() => {},
+		);
+	});
+	for (const path of REQUEST_PATHS) {
+		test.each([
+			["none", "none"],
+			["low", "low"],
+			["medium", "high"],
+			["high", "high"],
+			["xhigh", "high"],
+			["max", "max"],
+		] as const)(`${path}: %s resolves to %s`, async (effort, expected) => {
+			const body = await capturePath(
+				new AnthropicProvider(config({ defaultModel: "deepseek-v4-pro" })),
+				path,
+				"relay:deepseek-v4-pro",
+				effort,
+			);
+			if (effort === "none") {
+				expect(body.thinking).toEqual({ type: "disabled" });
+				expect(body.output_config).toBeUndefined();
+			} else {
+				expect(body.output_config).toEqual({ effort: expected });
+			}
+		});
+	}
+
+	test.each(
+		REQUEST_PATHS,
+	)("%s honors local tiers without preset historical migration", async (path) => {
+		installClaudeReasoningMetadata("deepseek-v4-pro", {
+			supports_reasoning: true,
+			reasoning_effort_levels: ["low", "high", "max"],
+		});
+		const body = await capturePath(
+			new AnthropicProvider(config()),
+			path,
+			"relay:anthropic:deepseek-v4-pro",
+			"xhigh",
+		);
+		expect(body.output_config).toEqual({ effort: "max" });
+	});
+
+	test.each(
+		REQUEST_PATHS,
+	)("%s honors local tiers instead of the old vendor mapper", async (path) => {
+		installClaudeReasoningMetadata("deepseek-v4-pro", {
+			supports_reasoning: true,
+			reasoning_effort_levels: ["low", "medium", "high", "xhigh", "max"],
+		});
+		const body = await capturePath(
+			new AnthropicProvider(config()),
+			path,
+			"relay:anthropic:deepseek-v4-pro",
+			"xhigh",
+		);
+		expect(body.output_config).toEqual({ effort: "xhigh" });
+	});
+});
 
 // Legacy Opus uses catalog-declared budget thinking, not a guessed adaptive mode.
 // Effort is still valid independently of the thinking configuration.
@@ -189,7 +255,7 @@ describe("AnthropicProvider Opus 4.5 budget-mode effort", () => {
 	test("explicit metadata levels retain ownership of tier mapping", async () => {
 		installClaudeReasoningMetadata("claude-opus-4-5", {
 			...OPUS_45_BUDGET_REASONING,
-			levels: ["low", "max"],
+			reasoning_effort_levels: ["low", "max"],
 		});
 		const model = "relay:anthropic:claude-opus-4-5";
 		expect(mapEffortParam(model, "xhigh")).toBe("max");

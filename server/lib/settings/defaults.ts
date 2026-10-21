@@ -2,8 +2,6 @@
  * Default settings values and per-field documentation.
  * Extracted from the monolithic settings/index.ts.
  */
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -24,7 +22,9 @@ export const DEFAULTS: NarraForkSettings = {
 	// (see the `database` field comment in types.ts).
 	database: { backend: "sqlite" },
 	paths: {
-		defaultProjectDir: resolve(homedir(), "projects"),
+		// Unset until the user picks an existing directory (setup wizard / settings).
+		// Never guessed: `~/projects` does not exist on most machines.
+		defaultProjectDir: "",
 		// Empty by default, and that is the safe zero value: with no entry here the
 		// in-browser editor can only write inside a narrator's own worktree.
 		extraWritableDirs: [] as string[],
@@ -92,7 +92,6 @@ export const DEFAULTS: NarraForkSettings = {
 		legacyEncoding: false,
 		freshShellEnv: false,
 		cacheDropDumpEnabled: false,
-		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		planModeAllowInlinePlan: true,
@@ -359,7 +358,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── paths ───────────────────────────────────────────────────────────
 	"paths.defaultProjectDir": {
-		desc: "默认项目目录。新建项目时的默认父目录。",
+		desc: "默认项目目录：未指定目录时新会话的工作目录，也是新建项目时的默认父目录。必须是已存在的目录；为空表示未设置，此时需要用户手动选择目录。",
 		type: "string",
 	},
 	"paths.extraWritableDirs": {
@@ -618,10 +617,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.cacheDropDumpEnabled": {
 		desc: "缓存骤降时保留关联请求证据与诊断元数据，使用统一请求录制存储，不额外写入 JSON dump。包含敏感会话内容，默认关闭。",
 		type: "boolean",
-	},
-	"agent.modelContextWindows": {
-		desc: '按模型覆盖上下文窗口大小（tokens）。键为完整模型值 "provider:modelId"，值为 token 数。优先级最高。',
-		type: "Record<string, number>",
 	},
 	"agent.translateReasoning": {
 		desc: "启用后，每个 reasoning/thinking 块完成后自动通过 translationModel 翻译成用户语言（非英文时）。",

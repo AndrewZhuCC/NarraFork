@@ -1,13 +1,24 @@
-import { ActionIcon, Badge, Box, CloseButton, Group, Menu, Text, TextInput } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Box,
+	CloseButton,
+	Group,
+	Menu,
+	Text,
+	TextInput,
+	Tooltip,
+	useMenuContext,
+} from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import {
 	IconAlertTriangle,
 	IconCheck,
 	IconDotsVertical,
-	IconInfoCircle,
 	IconPencil,
 	IconRefresh,
 	IconSearch,
+	IconSettings,
 } from "@tabler/icons-react";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -27,17 +38,26 @@ import {
 	modelProviderPrefix,
 	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
+import { QuotaWindowBars } from "./QuotaWindowBars";
+import type { ProviderHeaderActions } from "./use-model-menu-refresh-props";
+import type { ProviderQuotaBadge } from "./use-opencode-provider-badges";
+import type { ProviderBalanceBadge } from "./use-provider-balance-badges";
+
+/** Model-menu meta groups; they are not providers, so they get no provider actions. */
+const META_GROUPS = new Set(["__default__", "__summary__", "__agg__", "unknown"]);
 
 /**
  * The provider-grouped model list rendered inside a narrator's model menu.
  *
- * Group headers can carry an action: the Default/Summary groups get an edit
- * pencil that opens the global model picker, and a NUG provider group gets a
- * refresh button that re-fetches that gateway's catalog (which is also what
- * clears a stale "temporarily unavailable" flag).
+ * Group headers can carry actions: the Default/Summary groups get an edit
+ * pencil that opens the global model picker. A provider group shows, right to
+ * left, a settings shortcut, a catalog refresh button (for NUG this is also what
+ * clears a stale "temporarily unavailable" flag), its pay-as-you-go balance and
+ * its subscription allowance bars.
  *
- * Each settable model row also gets a three-dot control that expands the
- * global-role actions (default / summary) inline below the row. Inline expansion
+ * Each model row also gets a three-dot control that expands its actions inline
+ * below the row: model details (metadata and prices) and the global-role
+ * actions (default / summary). Inline expansion
  * rather than a nested Menu on purpose: Mantine v7 has no Menu.Sub, and a
  * Menu/Popover nested inside this dropdown is unreliable (the outer menu
  * intercepts the trigger) — same reasoning as CompactMenuSub.
@@ -52,15 +72,16 @@ export function ModelMenuItems({
 	onShowPrice,
 	label,
 	providerLabels,
+	providerBadges,
+	providerBalances,
 	onEditDefaultModel,
 	onEditSummaryModel,
 	onSetAsDefaultModel,
 	onSetAsSummaryModel,
 	defaultModelValue,
 	summaryModelValue,
-	nugProviderIdByPrefix,
-	onRefreshProviderModels,
-	refreshingProviderId,
+	providerActions,
+	onOpenProviderSettings,
 	onPickerOpened,
 	canFollowParent = false,
 	inheritance,
@@ -76,6 +97,13 @@ export function ModelMenuItems({
 	label?: string;
 	/** Provider prefix → display name, used to label provider groups. */
 	providerLabels?: Record<string, string>;
+	/**
+	 * Provider prefix → a small status badge for the group header, e.g. what is
+	 * left of an OpenCode Go plan allowance. `tooltip` explains the badge.
+	 */
+	providerBadges?: Record<string, ProviderQuotaBadge>;
+	/** Provider prefix → pay-as-you-go balance shown in the group header. */
+	providerBalances?: Record<string, ProviderBalanceBadge>;
 	/** When provided, an edit button on the "Default" group opens the global default model picker. */
 	onEditDefaultModel?: () => void;
 	/** When provided, an edit button on the "Summary" group opens the global summary model picker. */
@@ -94,16 +122,10 @@ export function ModelMenuItems({
 	defaultModelValue?: string | null;
 	/** Current instance summary model, used to mark the three-dot menu action. */
 	summaryModelValue?: string | null;
-	/**
-	 * Provider prefix → NUG provider id. Groups are keyed by prefix, but the
-	 * refresh endpoint is keyed by provider id, so the mapping is what makes a
-	 * group header able to refresh the right gateway.
-	 */
-	nugProviderIdByPrefix?: Record<string, string>;
-	/** When provided together with a mapped provider id, the group header shows a refresh button. */
-	onRefreshProviderModels?: (providerId: string) => void;
-	/** Provider id whose refresh is in flight, used to show the spinner. */
-	refreshingProviderId?: string | null;
+	/** Provider prefix → header actions (catalog refresh). */
+	providerActions?: Record<string, ProviderHeaderActions>;
+	/** When provided, every provider group header gets a button to its settings page. */
+	onOpenProviderSettings?: (prefix: string) => void;
 	/**
 	 * Called once when the menu opens. Used to kick off an
 	 * opportunistic model-catalog refresh, which is what clears a stale
@@ -125,6 +147,7 @@ export function ModelMenuItems({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
+	const menu = useMenuContext();
 	const selection = modelMenuSelection(currentModel, aggregations);
 	const selectedItemRef = useRef<HTMLButtonElement>(null);
 	const footerRef = useRef<HTMLDivElement>(null);
@@ -277,65 +300,170 @@ export function ModelMenuItems({
 						: isSummaryGroup
 							? onEditSummaryModel
 							: undefined;
-					const refreshProviderId = onRefreshProviderModels
-						? nugProviderIdByPrefix?.[prov]
-						: undefined;
-					const headerAction = editHandler ? (
+					const isProviderGroup = !META_GROUPS.has(prov);
+					const actions = isProviderGroup ? providerActions?.[prov] : undefined;
+					const headerIcon = (props: {
+						key: string;
+						label: string;
+						onClick: () => void;
+						loading?: boolean;
+						icon: React.ReactNode;
+					}) => (
 						<ActionIcon
+							key={props.key}
 							component="div"
 							role="button"
 							tabIndex={0}
 							variant="subtle"
 							color="gray"
 							size="sm"
-							aria-label={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
-							title={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
+							loading={props.loading}
+							aria-label={props.label}
+							title={props.label}
 							onClick={(e) => {
 								e.stopPropagation();
 								e.preventDefault();
-								editHandler();
+								props.onClick();
+							}}
+							onKeyDown={(event) => {
+								if (event.key !== "Enter" && event.key !== " ") return;
+								event.preventDefault();
+								event.stopPropagation();
+								event.currentTarget.click();
 							}}
 						>
-							<IconPencil size={12} />
+							{props.icon}
 						</ActionIcon>
-					) : refreshProviderId ? (
-						<ActionIcon
-							component="div"
-							role="button"
-							tabIndex={0}
-							variant="subtle"
-							color="gray"
-							size="sm"
-							loading={refreshingProviderId === refreshProviderId}
-							aria-label={t("refreshProviderModels")}
-							title={t("refreshProviderModels")}
-							onClick={(e) => {
-								e.stopPropagation();
-								e.preventDefault();
-								onRefreshProviderModels?.(refreshProviderId);
-							}}
-						>
-							<IconRefresh size={12} />
-						</ActionIcon>
-					) : null;
+					);
+					const headerActions: React.ReactNode[] = [];
+					if (editHandler) {
+						headerActions.push(
+							headerIcon({
+								key: "edit",
+								label: isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel"),
+								onClick: editHandler,
+								icon: <IconPencil size={12} />,
+							}),
+						);
+					}
+					if (actions?.onRefresh) {
+						const onRefresh = actions.onRefresh;
+						headerActions.push(
+							headerIcon({
+								key: "refresh",
+								label: t("refreshProviderModels"),
+								onClick: onRefresh,
+								loading: actions.refreshing,
+								icon: <IconRefresh size={12} />,
+							}),
+						);
+					}
+					if (isProviderGroup && onOpenProviderSettings) {
+						headerActions.push(
+							headerIcon({
+								key: "settings",
+								label: t("openProviderSettings"),
+								onClick: () => {
+									// Leaving for the settings page: don't leave the dropdown open behind.
+									menu.closeDropdown();
+									onOpenProviderSettings(prov);
+								},
+								icon: <IconSettings size={12} />,
+							}),
+						);
+					}
 					return (
 						<span key={prov}>
 							{gi > 0 && <Menu.Divider />}
-							{headerAction ? (
-								<Menu.Label
-									style={{
-										display: "flex",
-										alignItems: "center",
-										justifyContent: "space-between",
-										gap: 4,
-									}}
-								>
-									<span>{provLabels[prov] ?? prov}</span>
-									{headerAction}
-								</Menu.Label>
-							) : (
-								<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-							)}
+							{(() => {
+								const badgeInfo = providerBadges?.[prov];
+								const badge = badgeInfo ? (
+									<Tooltip
+										label={badgeInfo.tooltip}
+										disabled={!badgeInfo.tooltip}
+										multiline
+										withinPortal
+										style={{ whiteSpace: "pre-line" }}
+									>
+										{badgeInfo.bars && badgeInfo.bars.length > 0 ? (
+											<span
+												role="img"
+												aria-label={badgeInfo.text}
+												style={{ display: "inline-flex", flexShrink: 0 }}
+											>
+												<QuotaWindowBars bars={badgeInfo.bars} size="xs" stale={badgeInfo.stale} />
+											</span>
+										) : (
+											<Badge
+												size="xs"
+												variant="light"
+												color={badgeInfo.color}
+												style={{ textTransform: "none", flexShrink: 0 }}
+											>
+												{badgeInfo.text}
+											</Badge>
+										)}
+									</Tooltip>
+								) : null;
+								const balanceInfo = isProviderGroup ? providerBalances?.[prov] : undefined;
+								const balance = balanceInfo ? (
+									<Tooltip
+										label={balanceInfo.tooltip}
+										disabled={!balanceInfo.tooltip}
+										multiline
+										withinPortal
+										maw={360}
+										style={{ whiteSpace: "pre-line" }}
+									>
+										<Text
+											span
+											size="xs"
+											c="dimmed"
+											data-provider-balance={prov}
+											style={{
+												maxWidth: 140,
+												overflow: "hidden",
+												textOverflow: "ellipsis",
+												whiteSpace: "nowrap",
+												opacity: balanceInfo.stale ? 0.6 : undefined,
+												textTransform: "none",
+												fontWeight: 400,
+											}}
+										>
+											{balanceInfo.text}
+										</Text>
+									</Tooltip>
+								) : null;
+								if (headerActions.length === 0 && !badge && !balance) {
+									return <Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>;
+								}
+								return (
+									<Menu.Label
+										style={{
+											display: "flex",
+											alignItems: "center",
+											justifyContent: "space-between",
+											gap: 4,
+										}}
+									>
+										<span
+											style={{
+												minWidth: 0,
+												overflow: "hidden",
+												textOverflow: "ellipsis",
+												whiteSpace: "nowrap",
+											}}
+										>
+											{provLabels[prov] ?? prov}
+										</span>
+										<Group gap={4} wrap="nowrap" style={{ minWidth: 0, flexShrink: 0 }}>
+											{badge}
+											{balance}
+											{headerActions}
+										</Group>
+									</Menu.Label>
+								);
+							})()}
 							{models.map((m) => {
 								// For aggregation items, check if the current model's aggId matches
 								const isAggItem = m.provider === "__agg__";
@@ -358,21 +486,35 @@ export function ModelMenuItems({
 								// A delisted-but-pinned model must not offer "set as default/summary" —
 								// that would just re-affirm the dead pin. Offer the role pickers instead.
 								const isCatalogMissing = m.catalogMissing === true;
-								const showActionsToggle =
-									(canAssignGlobalModelRole(m.value) &&
-										!!(onSetAsDefaultModel || onSetAsSummaryModel) &&
-										!isCatalogMissing) ||
-									(isCatalogMissing && !!(onEditDefaultModel || onEditSummaryModel));
-								const actionsOpen = showActionsToggle && actionsModelValue === m.value;
-								const globalRoleActions: Array<{
-									key: "default" | "summary";
+								const canAssignRole =
+									canAssignGlobalModelRole(m.value) &&
+									!!(onSetAsDefaultModel || onSetAsSummaryModel) &&
+									!isCatalogMissing;
+								const rowActions: Array<{
+									key: "details" | "default" | "summary";
 									label: string;
 									current: boolean;
 									onSelect: () => void;
 								}> = [];
+								if (onShowPrice && !m.value.startsWith(AGG_MODEL_PREFIX)) {
+									rowActions.push({
+										key: "details",
+										label: ts("catalog.details"),
+										current: false,
+										onSelect: () => {
+											const actualValue =
+												m.provider === "__default__"
+													? defaultModelValue
+													: m.provider === "__summary__"
+														? summaryModelValue
+														: m.value;
+											onShowPrice(actualValue ? { ...m, value: actualValue } : m);
+										},
+									});
+								}
 								if (isCatalogMissing) {
 									if (onEditDefaultModel) {
-										globalRoleActions.push({
+										rowActions.push({
 											key: "default",
 											label: t("editDefaultModel"),
 											current: !!defaultModelValue && defaultModelValue === m.value,
@@ -380,16 +522,16 @@ export function ModelMenuItems({
 										});
 									}
 									if (onEditSummaryModel) {
-										globalRoleActions.push({
+										rowActions.push({
 											key: "summary",
 											label: t("editSummaryModel"),
 											current: !!summaryModelValue && summaryModelValue === m.value,
 											onSelect: () => onEditSummaryModel(),
 										});
 									}
-								} else if (showActionsToggle) {
+								} else if (canAssignRole) {
 									if (onSetAsDefaultModel) {
-										globalRoleActions.push({
+										rowActions.push({
 											key: "default",
 											label: t("setAsDefaultModel"),
 											current: !!defaultModelValue && defaultModelValue === m.value,
@@ -397,7 +539,7 @@ export function ModelMenuItems({
 										});
 									}
 									if (onSetAsSummaryModel) {
-										globalRoleActions.push({
+										rowActions.push({
 											key: "summary",
 											label: t("setAsSummaryModel"),
 											current: !!summaryModelValue && summaryModelValue === m.value,
@@ -405,6 +547,8 @@ export function ModelMenuItems({
 										});
 									}
 								}
+								const showActionsToggle = rowActions.length > 0;
+								const actionsOpen = showActionsToggle && actionsModelValue === m.value;
 								const catalogMissingHint = isCatalogMissing
 									? m.pinnedAs?.length
 										? t("modelCatalogMissingHint", {
@@ -442,36 +586,6 @@ export function ModelMenuItems({
 														<Badge size="xs" variant="outline" color="gray">
 															×{m.rateMultiplier}
 														</Badge>
-													)}
-													{onShowPrice && !m.value.startsWith(AGG_MODEL_PREFIX) && (
-														<ActionIcon
-															component="div"
-															role="button"
-															tabIndex={0}
-															variant="subtle"
-															color="gray"
-															size="sm"
-															aria-label={ts("catalog.details")}
-															onClick={(e) => {
-																e.stopPropagation();
-																e.preventDefault();
-																const actualValue =
-																	m.provider === "__default__"
-																		? defaultModelValue
-																		: m.provider === "__summary__"
-																			? summaryModelValue
-																			: m.value;
-																onShowPrice?.(actualValue ? { ...m, value: actualValue } : m);
-															}}
-															onKeyDown={(event) => {
-																if (event.key !== "Enter" && event.key !== " ") return;
-																event.preventDefault();
-																event.stopPropagation();
-																event.currentTarget.click();
-															}}
-														>
-															<IconInfoCircle size={14} />
-														</ActionIcon>
 													)}
 													<IconCheck
 														size={14}
@@ -521,9 +635,9 @@ export function ModelMenuItems({
 												)}
 											</Box>
 										</Menu.Item>
-										{actionsOpen && globalRoleActions.length > 0 && (
+										{actionsOpen && (
 											<Box onClick={(e) => e.stopPropagation()} data-model-role-actions={m.value}>
-												{globalRoleActions.map((action) => (
+												{rowActions.map((action) => (
 													<Menu.Item
 														key={action.key}
 														rightSection={action.current ? <IconCheck size={14} /> : undefined}

@@ -98,6 +98,10 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "外部服务已停止，面板开始接管启动...",
 		en: "The external service stopped; the manager is taking over...",
 	},
+	"log.updateHandoff": {
+		"zh-CN": "更新已就绪：正在启动新版本服务，由它接替旧服务...",
+		en: "Update ready: starting the new server, which takes over from the old one...",
+	},
 	"log.handoverWait": {
 		"zh-CN": "已进入接管等待：请在终端中停止外部服务（Ctrl+C），面板会在其退出后自动启动托管实例。",
 		en: "Waiting to take over: stop the external service in its terminal (Ctrl+C); the manager starts its own instance once it exits.",
@@ -288,6 +292,14 @@ const MESSAGES: Record<string, Message> = {
 	"error.windowCreateFailed": {
 		"zh-CN": "创建管理器窗口失败；请改用 `narrafork.exe --serve`。",
 		en: "Failed to create the manager window; use `narrafork.exe --serve` instead.",
+	},
+	"log.waitingLockHolder": {
+		"zh-CN": "数据目录仍被上一个 NarraFork 进程（PID {pid}）占用，等待它退出...",
+		en: "The data directory is still held by the previous NarraFork process (PID {pid}); waiting for it to exit...",
+	},
+	"log.lockHolderExited": {
+		"zh-CN": "上一个 NarraFork 进程（PID {pid}）已退出，重新启动服务...",
+		en: "The previous NarraFork process (PID {pid}) has exited; starting the server again...",
 	},
 	"error.instanceLockConflict": {
 		"zh-CN": "已有 NarraFork 实例在运行（PID {pid}）：同一数据目录只能运行一个，请先停止它",

@@ -210,8 +210,11 @@ export async function loadGatewayConfig(): Promise<GatewayConfig> {
 
 	const rawDefaultPermissionMode =
 		process.env.GATEWAY_DEFAULT_PERMISSION_MODE ?? dbCfg.defaultPermissionMode;
+	// Fail safe: when nothing is configured, fall back to the normal interactive
+	// "default" (approval-requiring) mode — same as non-gateway sessions. Gateway
+	// sessions must never silently run in bypassPermissions when unconfigured.
 	const defaultPermissionMode: GatewayConfig["defaultPermissionMode"] =
-		normalizeLegacyPermissionMode(rawDefaultPermissionMode, "bypassPermissions");
+		normalizeLegacyPermissionMode(rawDefaultPermissionMode, "default");
 
 	return {
 		enabled,

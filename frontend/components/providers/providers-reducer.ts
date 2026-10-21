@@ -1,4 +1,3 @@
-import { isValidModelContextWindow } from "@shared/model-context-window";
 import { useCallback, useMemo } from "react";
 import type { ProxyOverride } from "../../lib/proxy";
 import type { NUGProviderState } from "./NUGProvidersSection";
@@ -57,7 +56,6 @@ export interface ProvidersState {
 	customModels: CustomModelEntry[];
 	/** 逐模型协议覆盖（`agent.modelProtocols`），键是带前缀的完整模型 ID。 */
 	modelProtocols: Record<string, CustomApiProtocol>;
-	modelContextWindows: Record<string, number>;
 	providerOrder: string[];
 	disabledProviders: Set<string>;
 	initialized: boolean;
@@ -73,7 +71,6 @@ export interface SavedSnapshot {
 	hiddenModels: string[];
 	customModels: CustomModelEntry[];
 	modelProtocols: Record<string, CustomApiProtocol>;
-	modelContextWindows: Record<string, number>;
 	providerOrder: string[];
 	disabledProviders: string[];
 }
@@ -94,10 +91,8 @@ export type ProvidersAction =
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
 	| { type: "SET_CUSTOM_MODELS"; models: CustomModelEntry[] }
 	| { type: "SET_MODEL_PROTOCOL"; modelVal: string; protocol: CustomApiProtocol | null }
-	| { type: "SET_CONTEXT_WINDOW"; modelVal: string; size: number | null }
 	| { type: "SET_PROVIDER_ORDER"; order: string[] }
 	| { type: "TOGGLE_PROVIDER_DISABLED"; prefix: string }
-	| { type: "MERGE_CONTEXT_WINDOWS"; windows: Record<string, number> }
 	| { type: "MARK_SAVED" }
 	| { type: "RESTORE_FROM_SNAPSHOT"; snapshot: SavedSnapshot }
 	| { type: "RESET_FOR_REINIT" };
@@ -301,7 +296,6 @@ export const initialProvidersState: ProvidersState = {
 	hiddenModels: new Set(),
 	customModels: [],
 	modelProtocols: {},
-	modelContextWindows: {},
 	providerOrder: [],
 	disabledProviders: new Set(),
 	initialized: false,
@@ -427,7 +421,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				provider: m.provider,
 			}));
 
-			const windows = (agent.modelContextWindows as Record<string, number>) ?? {};
 			const modelProtocols = (agent.modelProtocols as Record<string, CustomApiProtocol>) ?? {};
 
 			const providerOrder: string[] = (agent.providerOrder as string[]) ?? [];
@@ -459,7 +452,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				hiddenModels: new Set(hidden),
 				customModels: custom,
 				modelProtocols,
-				modelContextWindows: windows,
 				providerOrder,
 				disabledProviders,
 				initialized: true,
@@ -541,36 +533,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			return { ...state, modelProtocols: next };
 		}
 
-		case "SET_CONTEXT_WINDOW": {
-			if (action.size == null) {
-				const next = { ...state.modelContextWindows };
-				delete next[action.modelVal];
-				return { ...state, modelContextWindows: next };
-			}
-			return {
-				...state,
-				modelContextWindows: {
-					...state.modelContextWindows,
-					[action.modelVal]: action.size,
-				},
-			};
-		}
-
 		case "SET_PROVIDER_ORDER":
 			return { ...state, providerOrder: action.order };
-
-		case "MERGE_CONTEXT_WINDOWS": {
-			// Merge server-side context windows into local state without overwriting user edits
-			const merged = { ...state.modelContextWindows };
-			let changed = false;
-			for (const [key, value] of Object.entries(action.windows)) {
-				if (isValidModelContextWindow(value) && !(key in merged)) {
-					merged[key] = value;
-					changed = true;
-				}
-			}
-			return changed ? { ...state, modelContextWindows: merged } : state;
-		}
 
 		case "TOGGLE_PROVIDER_DISABLED": {
 			if (!action.prefix) return state;
@@ -631,7 +595,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
 				modelProtocols: { ...snap.modelProtocols },
-				modelContextWindows: { ...snap.modelContextWindows },
 				providerOrder: [...snap.providerOrder],
 				disabledProviders: new Set(snap.disabledProviders),
 			};
@@ -697,11 +660,6 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 			JSON.stringify([...savedSnapshot.disabledProviders].sort())
 		)
 			return true;
-		if (
-			JSON.stringify(state.modelContextWindows) !==
-			JSON.stringify(savedSnapshot.modelContextWindows)
-		)
-			return true;
 
 		return false;
 	}, [state, savedSnapshot]);
@@ -719,7 +677,6 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
 		modelProtocols: { ...state.modelProtocols },
-		modelContextWindows: { ...state.modelContextWindows },
 		providerOrder: [...state.providerOrder],
 		disabledProviders: [...state.disabledProviders],
 	};
@@ -791,12 +748,6 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
-	const handleContextWindowChange = useCallback(
-		(modelVal: string, size: number | null) =>
-			dispatch({ type: "SET_CONTEXT_WINDOW", modelVal, size }),
-		[dispatch],
-	);
-
 	const setProviderOrder = useCallback(
 		(order: string[]) => dispatch({ type: "SET_PROVIDER_ORDER", order }),
 		[dispatch],
@@ -804,11 +755,6 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 
 	const toggleProviderDisabled = useCallback(
 		(prefix: string) => dispatch({ type: "TOGGLE_PROVIDER_DISABLED", prefix }),
-		[dispatch],
-	);
-
-	const mergeContextWindows = useCallback(
-		(windows: Record<string, number>) => dispatch({ type: "MERGE_CONTEXT_WINDOWS", windows }),
 		[dispatch],
 	);
 
@@ -824,10 +770,8 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			batchToggleHidden,
 			setCustomModels,
 			setModelProtocol,
-			handleContextWindowChange,
 			setProviderOrder,
 			toggleProviderDisabled,
-			mergeContextWindows,
 		}),
 		[
 			setCustomApiProviders,
@@ -840,10 +784,8 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			batchToggleHidden,
 			setCustomModels,
 			setModelProtocol,
-			handleContextWindowChange,
 			setProviderOrder,
 			toggleProviderDisabled,
-			mergeContextWindows,
 		],
 	);
 }

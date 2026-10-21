@@ -300,6 +300,19 @@ export function composerAttachmentPlaceholder(
 	return `[${kind} #${index + 1}: ${composerAttachmentPlaceholderName(name)}]`;
 }
 
+/**
+ * Typed text that reads as an attachment placeholder gets one extra backslash, so only the
+ * projection's own placeholders can claim an image. `unescapeComposerText` reverses it for
+ * display. Only documents with attachments escape: text-only documents (including every
+ * legacy text import) must keep projecting byte for byte.
+ */
+export function escapeComposerText(value: string): string {
+	return value.replace(/\\*\[(?:image|file) #/gu, (match) => `\\${match}`);
+}
+export function unescapeComposerText(value: string): string {
+	return value.replace(/\\(\\*\[(?:image|file) #)/gu, "$1");
+}
+
 /** Where each node landed in the projection, so edits can be mapped back to text nodes. */
 export interface ComposerProjectionSpan {
 	paragraph: number;
@@ -360,7 +373,7 @@ export function composerDocumentProjection(doc: ComposerDocument): {
 			text += composerFileCommentBlock(node);
 		}
 		const start = text.length;
-		if (node.type === "text") text += node.text;
+		if (node.type === "text") text += doc.assets.length ? escapeComposerText(node.text) : node.text;
 		if (node.type === "break") text += "\n";
 		if (node.type === "fileReference") {
 			text += composerFileReferenceToken(node.reference);

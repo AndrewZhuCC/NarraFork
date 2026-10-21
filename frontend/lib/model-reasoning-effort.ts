@@ -1,5 +1,10 @@
-import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ModelCard } from "@shared/model-catalog/card";
+import { modelProfile } from "@shared/model-catalog/profile";
+import {
+	clampReasoningEffort,
+	REASONING_EFFORT_VALUES,
+	type ReasoningEffort,
+} from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
 	GENERIC_REASONING_EFFORT_TIERS,
@@ -53,17 +58,17 @@ const CODEX_OPTIONS: Record<string, readonly ReasoningEffort[]> = {
 	"gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
 };
 
-/** Shared narrator policy, including the legacy DeepSeek-before-model-card priority. */
+/** Shared narrator policy: declared model-card tiers precede legacy model-name fallbacks. */
 export function getModelReasoningEffort({
 	model,
 	modelOption,
 	settings,
-	modelCardIndex,
+	modelCard,
 }: {
 	model?: string;
 	modelOption?: ModelOption;
 	settings?: EffortSettings;
-	modelCardIndex?: Parameters<typeof lookupModelCard>[1] | null;
+	modelCard?: ModelCard | null;
 }): { supported: boolean; options: readonly ReasoningEffort[] } {
 	const prefix = model?.split(":")[0];
 	const bare = getBareModelForReasoning(model, modelOption);
@@ -75,14 +80,20 @@ export function getModelReasoningEffort({
 		(codex || modelAcceptsReasoningEffort(bare, settings?.agent?.reasoningEffortBlocklist));
 	let options: readonly ReasoningEffort[] = GENERIC_REASONING_EFFORT_TIERS;
 	if (!model) return { supported, options };
-	if (model.toLowerCase().includes("deepseek"))
-		return { supported, options: ["none", "high", "xhigh"] };
-	const cardTiers = modelCardIndex
-		? cardEffortLevels(lookupModelCard(bare, modelCardIndex)?.card)
-		: undefined;
+	const profile =
+		modelCard && modelCard.matchedVia !== "none" ? modelProfile(modelCard) : undefined;
+	const cardTiers = profile?.reasoning.levels?.filter(
+		(level): level is ReasoningEffort =>
+			level !== "none" && REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
+	);
 	// Cards omit `none` so clamping low cannot accidentally disable thinking.
-	// Append it only for models whose existing narrator policy allows reasoning off.
-	if (cardTiers?.length) options = bare !== "gpt-6-astra" ? ["none", ...cardTiers] : cardTiers;
+	// Append it only when the card and existing narrator policy allow reasoning off.
+	if (cardTiers?.length)
+		options =
+			profile?.reasoning.canDisable !== false && bare !== "gpt-6-astra"
+				? ["none", ...cardTiers]
+				: cardTiers;
+	else if (model.toLowerCase().includes("deepseek")) options = ["none", "high", "xhigh"];
 	else if (codex) options = CODEX_OPTIONS[bare] ?? ["none", "low", "medium", "high"];
 	else if (
 		modelOption?.channelType === "anthropic" ||
@@ -113,7 +124,8 @@ export function displayedModelReasoningEffort(
 	if (
 		desired &&
 		model?.toLowerCase().includes("deepseek") &&
-		(desired === "low" || desired === "medium")
+		(desired === "low" || desired === "medium") &&
+		!options.includes(desired)
 	)
 		effort = "high";
 	return clampReasoningEffort(effort, options);

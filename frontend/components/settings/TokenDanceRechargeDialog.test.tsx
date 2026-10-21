@@ -259,9 +259,7 @@ async function renderSection() {
 								hiddenModels={new Set()}
 								modelProtocols={{}}
 								onModelProtocolChange={() => {}}
-								modelContextWindows={{}}
 								onToggleHidden={() => {}}
-								onContextWindowChange={() => {}}
 							/>
 						</ConfirmDialogContext.Provider>
 					</MantineProvider>

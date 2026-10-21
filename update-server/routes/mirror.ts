@@ -156,6 +156,26 @@ export function createMirrorRoutes(
 		);
 		return metadata ? c.json(metadata) : c.json({ error: "Component metadata unavailable" }, 404);
 	});
+	routes.get("/:product/mirror/tools/:kind/:tag/assets/:name", async (c) => {
+		const metadata = await ingest.readTools(
+			c.req.param("product") as string,
+			c.req.param("kind") as "helpers" | "executor",
+			c.req.param("tag") as string,
+		);
+		const asset = metadata?.binaries?.find((a) => a.name === c.req.param("name"));
+		if (!asset || (await storage.getFileSize(objectPath(asset.sha256))) !== asset.size)
+			return c.json({ error: "Committed component binary unavailable" }, 404);
+		const stream = await storage.getFileStream(objectPath(asset.sha256));
+		return stream
+			? new Response(boundedDownload(stream, asset.size, c.req.raw.signal), {
+					headers: {
+						"Content-Type": "application/octet-stream",
+						"Content-Length": String(asset.size),
+						"X-Content-Type-Options": "nosniff",
+					},
+				})
+			: c.json({ error: "Component binary unavailable" }, 404);
+	});
 	routes.post("/:product/mirror/tools/:kind/:tag", requireAuth("upload"), async (c) => {
 		const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(120_000)]);
 		const input = JSON.parse(

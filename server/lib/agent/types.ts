@@ -682,7 +682,8 @@ export type AgentEvent =
 			 *  - `credentials` (default): a NUG model's entire credential pool is
 			 *    disabled. When it comes back is unknowable, so the caller parks on the
 			 *    shared availability poller and resumes when the model reports available.
-			 *  - `quota`: a Kimi coding-plan allowance is used up. The reset instant is
+			 *  - `quota`: a Kimi coding-plan or OpenCode Go allowance is used up (or an
+			 *    OpenCode rate limit named a long wait). The reset instant is
 			 *    published upstream, so `resumeAt` carries it and the caller sleeps to
 			 *    it instead of polling — unless the reset lies beyond the wait budget,
 			 *    in which case `resumeAt` is absent while `quotaResetAt` is not, and the
@@ -698,6 +699,10 @@ export type AgentEvent =
 			nugModelId?: string;
 			/** How recovery is awaited; `credentials` when omitted. */
 			waitKind?: "credentials" | "quota";
+			/** Which plan a `quota` wait belongs to; `kimi` when omitted (older events). */
+			quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
+			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
+			quotaBucket?: string;
 			/**
 			 * Epoch ms at which the turn may be replayed. Present for a `quota` wait
 			 * whose reset is inside the wait budget — its ABSENCE on a `quota` wall
@@ -914,7 +919,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 
 // Single source of truth for the reasoning-effort tier union (shared with the
 // frontend). Re-exported here so existing importers keep their import path.
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 
 export type { ReasoningEffort };
 
@@ -1384,18 +1389,6 @@ export interface AgentConfig {
 /** Whether a model name refers to a DeepSeek model. */
 export function isDeepSeekModel(model: string): boolean {
 	return model.toLowerCase().includes("deepseek");
-}
-
-/**
- * Map reasoning effort to DeepSeek effort value.
- * DeepSeek's reasoning_effort param only accepts "high" and "max". Uses the
- * shared clamp (就近、并列偏高): low/medium → high, xhigh/max → max.
- */
-export function mapDeepSeekEffort(reasoningEffort: string | undefined): "high" | "max" | undefined {
-	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	return clampReasoningEffort(reasoningEffort as ReasoningEffort, ["high", "max"]) as
-		| "high"
-		| "max";
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

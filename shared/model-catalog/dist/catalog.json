@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "catalogVersion": "v2:7653388e2edd077c6f1825e356107f7240b49ff8",
-  "sourceVersion": "7653388e2edd077c6f1825e356107f7240b49ff8",
-  "publishedAt": "2026-09-23T03:50:59Z",
+  "catalogVersion": "v2:bundled-b57cca20de6ca318228f034e7fecced365cf2cf94bb5aa7e401e143746970a87",
+  "sourceVersion": "bundled-b57cca20de6ca318228f034e7fecced365cf2cf94bb5aa7e401e143746970a87",
+  "publishedAt": "2026-10-21T10:54:22+08:00",
   "models": [
     {
       "id": "auto-smart",
       "name": "Cursor Auto",
       "family": "cursor",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {}
     },
     {
@@ -202,7 +202,7 @@
       "id": "claude-fable-5",
       "name": "Claude Fable 5",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "claude-fable-5"
@@ -292,10 +292,93 @@
       }
     },
     {
+      "id": "claude-haiku-5-5",
+      "name": "Claude Haiku 5.5",
+      "family": "claude",
+      "status": "verified",
+      "notes": "Thinking can be disabled only with low, medium or high effort. In sub2api's Responses bridge, none maps to disabled thinking with low effort; xhigh/max require adaptive thinking.",
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-haiku-5-5] @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/resources/model-pricing/model_prices_and_context_window.json#L384",
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: Haiku 5.5 accepts low/medium/high/xhigh/max @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/pkg/claude/effort_catalog.go#L8-L30",
+          "fields": [
+            "reasoning.levels"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: Haiku 5.5 Responses default medium; none maps to disabled thinking with low effort @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/pkg/apicompat/anthropic_responses_test.go#L1943-L1957",
+          "fields": [
+            "reasoning.defaultLevel",
+            "reasoning.canDisable"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: Haiku 5.5 disabled thinking accepts low/medium/high and rejects xhigh/max @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/service/gateway_request_haiku55_test.go#L22-L29",
+          "fields": [
+            "reasoning.canDisable"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        }
+      ],
+      "metadata": {
+        "cache_creation_input_token_cost": 1.25e-7,
+        "cache_creation_input_token_cost_above_1hr": 2e-7,
+        "cache_creation_input_token_cost_above_100k_tokens": 6.25e-7,
+        "cache_creation_input_token_cost_above_1hr_above_100k_tokens": 0.000001,
+        "cache_read_input_token_cost": 1e-8,
+        "cache_read_input_token_cost_above_100k_tokens": 5e-8,
+        "input_cost_per_token": 1e-7,
+        "input_cost_per_token_above_100k_tokens": 5e-7,
+        "litellm_provider": "anthropic",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "output_cost_per_token": 5e-7,
+        "output_cost_per_token_above_100k_tokens": 0.0000025,
+        "source": "https://platform.claude.com/docs/en/models/haiku-5-5/overview",
+        "supports_adaptive_thinking": true,
+        "supports_assistant_prefill": false,
+        "supports_computer_use": true,
+        "supports_function_calling": true,
+        "supports_max_reasoning_effort": true,
+        "supports_output_config": true,
+        "supports_pdf_input": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_reasoning_effort": "medium",
+        "can_disable_reasoning": true,
+        "supports_none_reasoning_effort": true,
+        "supports_response_schema": true,
+        "supports_sampling_params": false,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "supports_xhigh_reasoning_effort": true,
+        "input_cost_per_token_batches": 5e-8,
+        "output_cost_per_token_batches": 2.5e-7
+      }
+    },
+    {
       "id": "claude-mythos-5",
       "name": "Claude Mythos 5",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "claude-mythos-5"
@@ -310,7 +393,7 @@
       "id": "claude-mythos-preview",
       "name": "Claude Mythos Preview",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "claude-mythos-preview"
@@ -808,7 +891,7 @@
       "id": "claude-opus-5-5",
       "name": "Claude Opus 5.5",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "claude-opus-5-5"
@@ -1119,7 +1202,7 @@
       "id": "claude-sonnet-4-7",
       "name": "Claude Sonnet 4.7",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "claude-sonnet-4.7"
@@ -1138,7 +1221,7 @@
       "id": "claude-sonnet-4-8",
       "name": "Claude Sonnet 4.8",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "claude-sonnet-4.8"
@@ -1157,14 +1240,60 @@
       "id": "claude-sonnet-4",
       "name": "Sonnet 4",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {}
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "name": "Claude Sonnet 5.5",
+      "family": "claude",
+      "status": "verified",
+      "matches": {
+        "prefixes": [
+          "claude-sonnet-5-5"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-sonnet-5-5] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L924",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        }
+      ],
+      "metadata": {
+        "cache_creation_input_token_cost": 0.0000025,
+        "cache_creation_input_token_cost_above_1hr": 0.000004,
+        "cache_read_input_token_cost": 2e-7,
+        "input_cost_per_token": 0.000002,
+        "litellm_provider": "anthropic",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "output_cost_per_token": 0.00001,
+        "source": "https://platform.claude.com/docs/en/models/sonnet-5-5/overview",
+        "supports_adaptive_thinking": true,
+        "supports_assistant_prefill": false,
+        "supports_computer_use": true,
+        "supports_function_calling": true,
+        "supports_max_reasoning_effort": true,
+        "supports_output_config": true,
+        "supports_pdf_input": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_sampling_params": false,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "supports_xhigh_reasoning_effort": true
+      }
     },
     {
       "id": "claude-sonnet-5",
       "name": "Claude Sonnet 5",
       "family": "claude",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "claude-sonnet-5"
@@ -1228,14 +1357,14 @@
       "id": "composer-2.5",
       "name": "Composer 2.5",
       "family": "cursor",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {}
     },
     {
       "id": "deepseek-chat",
       "name": "DeepSeek Chat",
       "family": "deepseek",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "deepseek-chat"
@@ -1247,10 +1376,95 @@
       }
     },
     {
+      "id": "deepseek-flash",
+      "name": "DeepSeek Flash",
+      "family": "deepseek",
+      "status": "verified",
+      "matches": {
+        "aliases": [
+          "deepseek-v4.1-flash",
+          "deepseek-v4.1-flash-1017"
+        ],
+        "prefixes": [
+          "deepseek-flash",
+          "deepseek-v4.1-flash-"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [deepseek-flash] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L988",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        },
+        {
+          "label": "DeepSeek Thinking Mode: native low/high/max, default high; none disables thinking",
+          "url": "https://api-docs.deepseek.com/guides/thinking_mode",
+          "fields": [
+            "reasoning"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: distinct max retained for deepseek-flash and v4 families @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/service/openai_gateway_request_body.go#L2582-L2594",
+          "fields": [
+            "reasoning.levels"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "DeepSeek Models & Pricing: deepseek-flash is DeepSeek-V4.1-Flash-1017",
+          "url": "https://api-docs.deepseek.com/quick_start/pricing",
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: deepseek-v4.1-flash upstream identity regression test @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/service/openai_gateway_deepseek_chat_reasoning_test.go#L117-L121",
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        }
+      ],
+      "metadata": {
+        "cache_read_input_token_cost": 3e-9,
+        "input_cost_per_token": 1.5e-7,
+        "litellm_provider": "deepseek",
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 393216,
+        "max_tokens": 393216,
+        "mode": "chat",
+        "output_cost_per_token": 6e-7,
+        "source": "https://api-docs.deepseek.com/quick_start/pricing",
+        "supported_endpoints": [
+          "/v1/chat/completions"
+        ],
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "high",
+        "can_disable_reasoning": true,
+        "supports_none_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_response_schema": true,
+        "supports_system_messages": true,
+        "supports_tool_choice": true,
+        "supports_vision": true
+      }
+    },
+    {
       "id": "deepseek-reasoner",
       "name": "DeepSeek Reasoner",
       "family": "deepseek",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "deepseek-reasoner"
@@ -1265,22 +1479,44 @@
       "id": "deepseek-v4-flash-vision-exp",
       "name": "deepseek-v4-flash-vision-exp",
       "status": "verified",
+      "notes": "Legacy model name accepted by the official DeepSeek API and served by deepseek-flash.",
       "sources": [
         {
-          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [deepseek-v4-flash-vision-exp] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
-          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L770",
-          "verifiedAt": "2026-09-22T07:33:33Z"
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [deepseek-v4-flash-vision-exp] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L1033",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        },
+        {
+          "label": "DeepSeek Thinking Mode: native low/high/max, default high; none disables thinking",
+          "url": "https://api-docs.deepseek.com/guides/thinking_mode",
+          "fields": [
+            "reasoning"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "DeepSeek Models & Pricing: legacy deepseek-v4-flash and vision-exp names served by deepseek-flash",
+          "url": "https://api-docs.deepseek.com/quick_start/pricing",
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: distinct max retained for deepseek-flash and v4 families @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/service/openai_gateway_request_body.go#L2582-L2594",
+          "fields": [
+            "reasoning.levels"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
         }
       ],
       "metadata": {
-        "cache_read_input_token_cost": 7e-9,
-        "input_cost_per_token": 2.2e-7,
+        "cache_read_input_token_cost": 3e-9,
+        "input_cost_per_token": 1.5e-7,
         "litellm_provider": "deepseek",
         "max_input_tokens": 1048576,
         "max_output_tokens": 393216,
         "max_tokens": 393216,
         "mode": "chat",
-        "output_cost_per_token": 6.6e-7,
+        "output_cost_per_token": 6e-7,
         "source": "https://api-docs.deepseek.com/quick_start/pricing",
         "supported_endpoints": [
           "/v1/chat/completions"
@@ -1290,6 +1526,18 @@
         "supports_parallel_function_calling": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "high",
+        "can_disable_reasoning": true,
+        "supports_none_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
         "supports_response_schema": true,
         "supports_system_messages": true,
         "supports_tool_choice": true,
@@ -1301,28 +1549,44 @@
       "name": "DeepSeek V4 Flash",
       "family": "deepseek",
       "status": "verified",
-      "matches": {
-        "aliases": [
-          "deepseek-chat",
-          "deepseek-reasoner"
-        ]
-      },
+      "notes": "Legacy model name accepted by the official DeepSeek API and served by deepseek-flash. Retired deepseek-chat/deepseek-reasoner are separate historical identities, not aliases of this card.",
       "sources": [
         {
-          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [deepseek-v4-flash] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
-          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L748",
-          "verifiedAt": "2026-09-22T07:33:33Z"
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [deepseek-v4-flash] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L1011",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        },
+        {
+          "label": "DeepSeek Thinking Mode: native low/high/max, default high; none disables thinking",
+          "url": "https://api-docs.deepseek.com/guides/thinking_mode",
+          "fields": [
+            "reasoning"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "DeepSeek Models & Pricing: legacy deepseek-v4-flash and vision-exp names served by deepseek-flash",
+          "url": "https://api-docs.deepseek.com/quick_start/pricing",
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: distinct max retained for deepseek-flash and v4 families @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/service/openai_gateway_request_body.go#L2582-L2594",
+          "fields": [
+            "reasoning.levels"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
         }
       ],
       "metadata": {
-        "cache_read_input_token_cost": 7e-9,
-        "input_cost_per_token": 2.2e-7,
+        "cache_read_input_token_cost": 3e-9,
+        "input_cost_per_token": 1.5e-7,
         "litellm_provider": "deepseek",
         "max_input_tokens": 1048576,
         "max_output_tokens": 393216,
         "max_tokens": 393216,
         "mode": "chat",
-        "output_cost_per_token": 6.6e-7,
+        "output_cost_per_token": 6e-7,
         "source": "https://api-docs.deepseek.com/quick_start/pricing",
         "supported_endpoints": [
           "/v1/chat/completions"
@@ -1332,6 +1596,18 @@
         "supports_parallel_function_calling": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "high",
+        "can_disable_reasoning": true,
+        "supports_none_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
         "supports_response_schema": true,
         "supports_system_messages": true,
         "supports_tool_choice": true
@@ -1352,6 +1628,22 @@
           "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [deepseek-v4-pro] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
           "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L793",
           "verifiedAt": "2026-09-22T07:33:33Z"
+        },
+        {
+          "label": "DeepSeek Thinking Mode: native low/high/max, default high; none disables thinking",
+          "url": "https://api-docs.deepseek.com/guides/thinking_mode",
+          "fields": [
+            "reasoning"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        },
+        {
+          "label": "sub2api: distinct max retained for deepseek-flash and v4 families @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/internal/service/openai_gateway_request_body.go#L2582-L2594",
+          "fields": [
+            "reasoning.levels"
+          ],
+          "verifiedAt": "2026-10-21T02:30:58Z"
         }
       ],
       "metadata": {
@@ -1372,6 +1664,18 @@
         "supports_parallel_function_calling": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "high",
+        "can_disable_reasoning": true,
+        "supports_none_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
         "supports_response_schema": true,
         "supports_system_messages": true,
         "supports_tool_choice": true
@@ -3124,7 +3428,7 @@
       "id": "gemini-3.1-pro",
       "name": "Gemini 3.1 Pro",
       "family": "gemini",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "gemini-3.1-pro-high",
@@ -3137,7 +3441,7 @@
       "id": "gemini-3.5-flash-lite",
       "name": "Gemini 3.5 Flash Lite",
       "family": "gemini",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {}
     },
     {
@@ -3254,7 +3558,7 @@
       "id": "gemini-3.7-flash",
       "name": "Gemini 3.7 Flash",
       "family": "gemini",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "gemini-3.7-flash-high",
@@ -3269,7 +3573,7 @@
       "id": "gemini-3.8-flash",
       "name": "Gemini 3.8 Flash High",
       "family": "gemini",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "gemini-3.8-flash-high",
@@ -3279,6 +3583,66 @@
         ]
       },
       "metadata": {}
+    },
+    {
+      "id": "gemini-4-argon-cyber-permissive",
+      "name": "Gemini 4 Argon Cyber Permissive",
+      "family": "gemini",
+      "status": "verified",
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [gemini-4-argon-cyber-permissive] @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/resources/model-pricing/model_prices_and_context_window.json#L2686",
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        }
+      ],
+      "metadata": {
+        "cache_read_input_token_cost": 2e-7,
+        "cache_read_input_token_cost_priority": 3.6e-7,
+        "input_cost_per_token": 0.000004,
+        "input_cost_per_token_priority": 0.0000072,
+        "litellm_provider": "vertex_ai-language-models",
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "max_tokens": 65536,
+        "mode": "chat",
+        "output_cost_per_token": 0.00002,
+        "output_cost_per_token_priority": 0.000036,
+        "source": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing",
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_service_tier": true
+      }
+    },
+    {
+      "id": "gemini-4-argon",
+      "name": "Gemini 4 Argon",
+      "family": "gemini",
+      "status": "verified",
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [gemini-4-argon] @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/8f2cbb53d9d1c40e1865b07ac460571f7d4c48de/backend/resources/model-pricing/model_prices_and_context_window.json#L2669",
+          "verifiedAt": "2026-10-21T02:30:58Z"
+        }
+      ],
+      "metadata": {
+        "cache_read_input_token_cost": 1e-7,
+        "cache_read_input_token_cost_priority": 1.8e-7,
+        "input_cost_per_token": 0.000002,
+        "input_cost_per_token_priority": 0.0000036,
+        "litellm_provider": "gemini",
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "max_tokens": 65536,
+        "mode": "chat",
+        "output_cost_per_token": 0.00001,
+        "output_cost_per_token_priority": 0.000018,
+        "source": "https://ai.google.dev/gemini-api/docs/pricing",
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_service_tier": true
+      }
     },
     {
       "id": "gemini-embedding-001",
@@ -3748,7 +4112,7 @@
       "id": "glm-4.5",
       "name": "GLM-4.5",
       "family": "glm",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "glm-4-5"
@@ -3764,7 +4128,7 @@
       "id": "glm-4.6",
       "name": "GLM-4.6",
       "family": "glm",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "glm-4-6"
@@ -3780,7 +4144,7 @@
       "id": "glm-5.2",
       "name": "GLM 5.2",
       "family": "glm",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {}
     },
     {
@@ -7595,7 +7959,7 @@
       "id": "gpt-6-astra",
       "name": "GPT-6 Astra",
       "family": "gpt",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "gpt-6-astra"
@@ -7622,7 +7986,7 @@
       "id": "gpt-6-luna",
       "name": "GPT-6 Luna",
       "family": "gpt",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "gpt-6-luna"
@@ -7695,7 +8059,7 @@
       "id": "gpt-6-sol",
       "name": "GPT-6 Sol",
       "family": "gpt",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "prefixes": [
           "gpt-6-sol"
@@ -7751,6 +8115,79 @@
         "supports_minimal_reasoning_effort": false,
         "supports_native_streaming": true,
         "supports_none_reasoning_effort": true,
+        "supports_parallel_function_calling": true,
+        "supports_pdf_input": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_service_tier": true,
+        "supports_system_messages": true,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "supports_web_search": true,
+        "supports_xhigh_reasoning_effort": true
+      }
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "name": "GPT-6.1 Sol",
+      "family": "gpt",
+      "status": "verified",
+      "matches": {
+        "prefixes": [
+          "gpt-6.1-sol"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [gpt-6.1-sol] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L2",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        }
+      ],
+      "metadata": {
+        "cache_creation_input_token_cost": 0.0000025,
+        "cache_creation_input_token_cost_batches": 0.00000125,
+        "cache_creation_input_token_cost_flex": 0.00000125,
+        "cache_creation_input_token_cost_priority": 0.000005,
+        "cache_read_input_token_cost": 1e-7,
+        "cache_read_input_token_cost_batches": 5e-8,
+        "cache_read_input_token_cost_flex": 5e-8,
+        "cache_read_input_token_cost_priority": 2e-7,
+        "input_cost_per_token": 0.000002,
+        "input_cost_per_token_batches": 0.000001,
+        "input_cost_per_token_flex": 0.000001,
+        "input_cost_per_token_priority": 0.000004,
+        "long_context_input_token_threshold": 272000,
+        "long_context_input_cost_multiplier": 2,
+        "long_context_output_cost_multiplier": 1.5,
+        "litellm_provider": "openai",
+        "context_window": 1050000,
+        "max_input_tokens": 922000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "output_cost_per_token": 0.00001,
+        "output_cost_per_token_batches": 0.000005,
+        "output_cost_per_token_flex": 0.000005,
+        "output_cost_per_token_priority": 0.00002,
+        "supported_endpoints": [
+          "/v1/chat/completions",
+          "/v1/batch",
+          "/v1/responses"
+        ],
+        "supported_modalities": [
+          "text",
+          "image"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_function_calling": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_native_streaming": true,
+        "supports_none_reasoning_effort": false,
         "supports_parallel_function_calling": true,
         "supports_pdf_input": true,
         "supports_prompt_caching": true,
@@ -8182,6 +8619,76 @@
       }
     },
     {
+      "id": "gpt-image-2.5-flare",
+      "name": "GPT Image 2.5 Flare",
+      "family": "gpt",
+      "status": "verified",
+      "matches": {
+        "prefixes": [
+          "gpt-image-2.5-flare"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [gpt-image-2.5-flare] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L6591",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        }
+      ],
+      "metadata": {
+        "cache_read_input_image_token_cost": 0.000002,
+        "cache_read_input_token_cost": 0.00000125,
+        "input_cost_per_image_token": 0.000008,
+        "input_cost_per_token": 0.000005,
+        "litellm_provider": "openai",
+        "mode": "image_generation",
+        "output_cost_per_image_token": 0.00003,
+        "output_cost_per_token": 0,
+        "supported_endpoints": [
+          "/v1/images/generations",
+          "/v1/images/edits"
+        ],
+        "supports_prompt_caching": true,
+        "supports_vision": true
+      }
+    },
+    {
+      "id": "gpt-image-2.5-sunburst",
+      "name": "GPT Image 2.5 Sunburst",
+      "family": "gpt",
+      "status": "verified",
+      "matches": {
+        "prefixes": [
+          "gpt-image-2.5-sunburst"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [gpt-image-2.5-sunburst] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L6623",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        }
+      ],
+      "metadata": {
+        "cache_read_input_image_token_cost": 0.000002,
+        "cache_read_input_token_cost": 0.00000125,
+        "input_cost_per_image_token": 0.000008,
+        "input_cost_per_token": 0.000005,
+        "litellm_provider": "openai",
+        "mode": "image_generation",
+        "output_cost_per_image_token": 0.00003,
+        "output_cost_per_token": 0,
+        "supported_endpoints": [
+          "/v1/images/generations",
+          "/v1/images/edits"
+        ],
+        "supports_prompt_caching": true,
+        "supports_vision": true
+      }
+    },
+    {
       "id": "gpt-image-2",
       "name": "gpt-image-2",
       "status": "verified",
@@ -8213,7 +8720,7 @@
       "id": "gpt-oss-120b",
       "name": "GPT-OSS 120B",
       "family": "gpt",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "gpt-oss-120b-medium"
@@ -8534,7 +9041,7 @@
       "id": "grok-4.3",
       "name": "Grok 4.3",
       "family": "grok",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "grok-4.20-0309-reasoning",
@@ -8554,7 +9061,7 @@
       "id": "grok-4.5",
       "name": "Grok 4.5",
       "family": "grok",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "grok",
@@ -8572,7 +9079,7 @@
       "id": "grok-4.6",
       "name": "Grok 4.6",
       "family": "grok",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {
         "input_cost_per_token": 0.000002,
         "output_cost_per_token": 0.000006,
@@ -8583,23 +9090,36 @@
       "id": "grok-4.7",
       "name": "Grok 4.7",
       "family": "grok",
-      "status": "legacy-unverified",
+      "status": "verified",
       "matches": {
         "aliases": [
           "grok-4.7-latest"
         ]
       },
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [grok-4.7] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L56",
+          "verifiedAt": "2026-10-02T12:21:34Z"
+        }
+      ],
       "metadata": {
         "input_cost_per_token": 0.000002,
         "output_cost_per_token": 0.000006,
-        "cache_read_input_token_cost": 5e-7
+        "cache_read_input_token_cost": 5e-7,
+        "input_cost_per_token_above_200k_tokens": 0.000004,
+        "output_cost_per_token_above_200k_tokens": 0.000012,
+        "litellm_provider": "xai",
+        "max_input_tokens": 500000,
+        "mode": "chat",
+        "supports_prompt_caching": true
       }
     },
     {
       "id": "grok-build-0.1",
       "name": "Grok Build 0.1",
       "family": "grok",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "grok-build",
@@ -8619,21 +9139,21 @@
       "id": "kimi-k2.7-code",
       "name": "Kimi K2.7 Code",
       "family": "kimi",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {}
     },
     {
       "id": "kimi-k3",
       "name": "Kimi K3",
       "family": "kimi",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {}
     },
     {
       "id": "minimax-m2.7",
       "name": "MiniMax M2.7",
       "family": "minimax",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "minimax-m2-7"
@@ -8648,7 +9168,7 @@
       "id": "minimax-m2",
       "name": "MiniMax M2",
       "family": "minimax",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "matches": {
         "aliases": [
           "minimax-m2-her"
@@ -8663,7 +9183,7 @@
       "id": "minimax-m3",
       "name": "MiniMax M3",
       "family": "minimax",
-      "status": "legacy-unverified",
+      "status": "unverified",
       "metadata": {
         "input_cost_per_token": 3e-7,
         "output_cost_per_token": 0.0000012
@@ -9291,9 +9811,9 @@
       "upstreamModelIds": [
         "auto-smart"
       ],
-      "status": "legacy-unverified",
-      "modelId": "auto-smart",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "auto-smart"
     },
     {
       "id": "claude-fable-5@cursor",
@@ -9302,9 +9822,9 @@
       "upstreamModelIds": [
         "claude-fable-5"
       ],
-      "status": "legacy-unverified",
-      "modelId": "claude-fable-5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-fable-5"
     },
     {
       "id": "claude-haiku-4-5@cursor",
@@ -9318,9 +9838,9 @@
           "claude-haiku-4.5"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-haiku-4-5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-haiku-4-5"
     },
     {
       "id": "claude-opus-4-5@cursor",
@@ -9334,9 +9854,9 @@
           "claude-opus-4.5"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-opus-4-5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-opus-4-5"
     },
     {
       "id": "claude-opus-4-6-thinking@antigravity",
@@ -9345,15 +9865,6 @@
       "upstreamModelIds": [
         "claude-opus-4-6-thinking"
       ],
-      "status": "verified",
-      "sources": [
-        {
-          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-opus-4-6-thinking] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
-          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L380",
-          "verifiedAt": "2026-09-22T07:33:33Z"
-        }
-      ],
-      "modelId": "claude-opus-4-6",
       "metadata": {
         "cache_creation_input_token_cost": 0.00000625,
         "cache_creation_input_token_cost_above_1hr": 0.00001,
@@ -9388,7 +9899,16 @@
         "supports_tool_choice": true,
         "supports_vision": true,
         "tool_use_system_prompt_tokens": 346
-      }
+      },
+      "status": "verified",
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-opus-4-6-thinking] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L380",
+          "verifiedAt": "2026-09-22T07:33:33Z"
+        }
+      ],
+      "modelId": "claude-opus-4-6"
     },
     {
       "id": "claude-opus-4-6@cursor",
@@ -9402,9 +9922,9 @@
           "claude-opus-4.6"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-opus-4-6",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-opus-4-6"
     },
     {
       "id": "claude-opus-4-7@cursor",
@@ -9418,9 +9938,9 @@
           "claude-opus-4.7"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-opus-4-7",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-opus-4-7"
     },
     {
       "id": "claude-opus-4-8@cursor",
@@ -9434,9 +9954,9 @@
           "claude-opus-4.8"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-opus-4-8",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-opus-4-8"
     },
     {
       "id": "claude-opus-5@cursor",
@@ -9445,9 +9965,9 @@
       "upstreamModelIds": [
         "claude-opus-5"
       ],
-      "status": "legacy-unverified",
-      "modelId": "claude-opus-5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-opus-5"
     },
     {
       "id": "claude-sonnet-4-5-20250929-v1:0@bedrock",
@@ -9456,15 +9976,6 @@
         "claude-sonnet-4-5-20250929-v1:0"
       ],
       "name": "claude-sonnet-4-5-20250929-v1:0",
-      "status": "verified",
-      "sources": [
-        {
-          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-sonnet-4-5-20250929-v1:0] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
-          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L654",
-          "verifiedAt": "2026-09-22T07:33:33Z"
-        }
-      ],
-      "modelId": "claude-sonnet-4-5",
       "metadata": {
         "cache_creation_input_token_cost": 0.00000375,
         "cache_creation_input_token_cost_above_1hr": 0.000006,
@@ -9490,7 +10001,16 @@
         "supports_tool_choice": true,
         "supports_vision": true,
         "tool_use_system_prompt_tokens": 159
-      }
+      },
+      "status": "verified",
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-sonnet-4-5-20250929-v1:0] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L654",
+          "verifiedAt": "2026-09-22T07:33:33Z"
+        }
+      ],
+      "modelId": "claude-sonnet-4-5"
     },
     {
       "id": "claude-sonnet-4-5@cursor",
@@ -9504,9 +10024,9 @@
           "claude-sonnet-4.5"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-sonnet-4-5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-sonnet-4-5"
     },
     {
       "id": "claude-sonnet-4-6@antigravity",
@@ -9520,9 +10040,9 @@
           "claude-sonnet-4.6"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-sonnet-4-6",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-sonnet-4-6"
     },
     {
       "id": "claude-sonnet-4-6@cursor",
@@ -9536,9 +10056,9 @@
           "claude-sonnet-4.6"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "claude-sonnet-4-6",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-sonnet-4-6"
     },
     {
       "id": "claude-sonnet-4@cursor",
@@ -9547,9 +10067,9 @@
       "upstreamModelIds": [
         "claude-sonnet-4"
       ],
-      "status": "legacy-unverified",
-      "modelId": "claude-sonnet-4",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-sonnet-4"
     },
     {
       "id": "claude-sonnet-5@cursor",
@@ -9558,9 +10078,9 @@
       "upstreamModelIds": [
         "claude-sonnet-5"
       ],
-      "status": "legacy-unverified",
-      "modelId": "claude-sonnet-5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "claude-sonnet-5"
     },
     {
       "id": "composer-2.5@cursor",
@@ -9569,9 +10089,9 @@
       "upstreamModelIds": [
         "composer-2.5"
       ],
-      "status": "legacy-unverified",
-      "modelId": "composer-2.5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "composer-2.5"
     },
     {
       "id": "gemini-2.5-flash-lite@antigravity",
@@ -9580,9 +10100,9 @@
       "upstreamModelIds": [
         "gemini-2.5-flash-lite"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-2.5-flash-lite",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-2.5-flash-lite"
     },
     {
       "id": "gemini-2.5-flash-thinking@antigravity",
@@ -9591,9 +10111,9 @@
       "upstreamModelIds": [
         "gemini-2.5-flash-thinking"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-2.5-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-2.5-flash"
     },
     {
       "id": "gemini-2.5-flash@antigravity",
@@ -9602,9 +10122,9 @@
       "upstreamModelIds": [
         "gemini-2.5-flash"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-2.5-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-2.5-flash"
     },
     {
       "id": "gemini-2.5-flash@cursor",
@@ -9613,9 +10133,9 @@
       "upstreamModelIds": [
         "gemini-2.5-flash"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-2.5-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-2.5-flash"
     },
     {
       "id": "gemini-3-flash@antigravity",
@@ -9624,9 +10144,9 @@
       "upstreamModelIds": [
         "gemini-3-flash"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3-flash"
     },
     {
       "id": "gemini-3-flash@cursor",
@@ -9635,9 +10155,9 @@
       "upstreamModelIds": [
         "gemini-3-flash"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3-flash"
     },
     {
       "id": "gemini-3.1-flash-image@antigravity",
@@ -9646,9 +10166,9 @@
       "upstreamModelIds": [
         "gemini-3.1-flash-image"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.1-flash-image",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.1-flash-image"
     },
     {
       "id": "gemini-3.1-flash-lite@antigravity",
@@ -9657,9 +10177,9 @@
       "upstreamModelIds": [
         "gemini-3.1-flash-lite"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.1-flash-lite",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.1-flash-lite"
     },
     {
       "id": "gemini-3.1-pro-high@antigravity",
@@ -9668,6 +10188,73 @@
       "upstreamModelIds": [
         "gemini-3.1-pro-high"
       ],
+      "metadata": {
+        "cache_creation_input_token_cost": 0.000002,
+        "cache_creation_input_token_cost_above_200k_tokens": 0.000004,
+        "cache_creation_input_token_cost_above_200k_tokens_priority": 0.0000072,
+        "cache_creation_input_token_cost_priority": 0.0000036,
+        "cache_read_input_token_cost": 2e-7,
+        "cache_read_input_token_cost_above_200k_tokens": 4e-7,
+        "cache_read_input_token_cost_above_200k_tokens_priority": 7.2e-7,
+        "cache_read_input_token_cost_priority": 3.6e-7,
+        "input_cost_per_token": 0.000002,
+        "input_cost_per_token_above_200k_tokens": 0.000004,
+        "input_cost_per_token_above_200k_tokens_priority": 0.0000072,
+        "input_cost_per_token_batches": 0.000001,
+        "input_cost_per_token_priority": 0.0000036,
+        "litellm_provider": "vertex_ai-language-models",
+        "max_audio_length_hours": 8.4,
+        "max_audio_per_prompt": 1,
+        "max_images_per_prompt": 3000,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "max_pdf_size_mb": 30,
+        "max_tokens": 65536,
+        "max_video_length": 1,
+        "max_videos_per_prompt": 10,
+        "mode": "chat",
+        "output_cost_per_image": 0.00012,
+        "output_cost_per_token": 0.000012,
+        "output_cost_per_token_above_200k_tokens": 0.000018,
+        "output_cost_per_token_above_200k_tokens_priority": 0.0000324,
+        "output_cost_per_token_batches": 0.000006,
+        "output_cost_per_token_priority": 0.0000216,
+        "search_context_cost_per_query": {
+          "search_context_size_high": 0.014,
+          "search_context_size_low": 0.014,
+          "search_context_size_medium": 0.014
+        },
+        "source": "https://cloud.google.com/vertex-ai/generative-ai/pricing#gemini-models",
+        "supported_endpoints": [
+          "/v1/chat/completions",
+          "/v1/completions",
+          "/v1/batch"
+        ],
+        "supported_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_audio_input": true,
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_pdf_input": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_service_tier": true,
+        "supports_system_messages": true,
+        "supports_tool_choice": true,
+        "supports_url_context": true,
+        "supports_video_input": true,
+        "supports_vision": true,
+        "supports_web_search": true,
+        "web_search_billing_unit": "per_query"
+      },
       "status": "verified",
       "sources": [
         {
@@ -9676,74 +10263,7 @@
           "verifiedAt": "2026-09-22T07:33:33Z"
         }
       ],
-      "modelId": "gemini-3.1-pro",
-      "metadata": {
-        "cache_creation_input_token_cost": 0.000002,
-        "cache_creation_input_token_cost_above_200k_tokens": 0.000004,
-        "cache_creation_input_token_cost_above_200k_tokens_priority": 0.0000072,
-        "cache_creation_input_token_cost_priority": 0.0000036,
-        "cache_read_input_token_cost": 2e-7,
-        "cache_read_input_token_cost_above_200k_tokens": 4e-7,
-        "cache_read_input_token_cost_above_200k_tokens_priority": 7.2e-7,
-        "cache_read_input_token_cost_priority": 3.6e-7,
-        "input_cost_per_token": 0.000002,
-        "input_cost_per_token_above_200k_tokens": 0.000004,
-        "input_cost_per_token_above_200k_tokens_priority": 0.0000072,
-        "input_cost_per_token_batches": 0.000001,
-        "input_cost_per_token_priority": 0.0000036,
-        "litellm_provider": "vertex_ai-language-models",
-        "max_audio_length_hours": 8.4,
-        "max_audio_per_prompt": 1,
-        "max_images_per_prompt": 3000,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-        "max_pdf_size_mb": 30,
-        "max_tokens": 65536,
-        "max_video_length": 1,
-        "max_videos_per_prompt": 10,
-        "mode": "chat",
-        "output_cost_per_image": 0.00012,
-        "output_cost_per_token": 0.000012,
-        "output_cost_per_token_above_200k_tokens": 0.000018,
-        "output_cost_per_token_above_200k_tokens_priority": 0.0000324,
-        "output_cost_per_token_batches": 0.000006,
-        "output_cost_per_token_priority": 0.0000216,
-        "search_context_cost_per_query": {
-          "search_context_size_high": 0.014,
-          "search_context_size_low": 0.014,
-          "search_context_size_medium": 0.014
-        },
-        "source": "https://cloud.google.com/vertex-ai/generative-ai/pricing#gemini-models",
-        "supported_endpoints": [
-          "/v1/chat/completions",
-          "/v1/completions",
-          "/v1/batch"
-        ],
-        "supported_modalities": [
-          "text",
-          "image",
-          "audio",
-          "video"
-        ],
-        "supported_output_modalities": [
-          "text"
-        ],
-        "supports_audio_input": true,
-        "supports_function_calling": true,
-        "supports_native_streaming": true,
-        "supports_pdf_input": true,
-        "supports_prompt_caching": true,
-        "supports_reasoning": true,
-        "supports_response_schema": true,
-        "supports_service_tier": true,
-        "supports_system_messages": true,
-        "supports_tool_choice": true,
-        "supports_url_context": true,
-        "supports_video_input": true,
-        "supports_vision": true,
-        "supports_web_search": true,
-        "web_search_billing_unit": "per_query"
-      }
+      "modelId": "gemini-3.1-pro"
     },
     {
       "id": "gemini-3.1-pro-low@antigravity",
@@ -9752,15 +10272,6 @@
       "upstreamModelIds": [
         "gemini-3.1-pro-low"
       ],
-      "status": "verified",
-      "sources": [
-        {
-          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [gemini-3.1-pro-low] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
-          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L2104",
-          "verifiedAt": "2026-09-22T07:33:33Z"
-        }
-      ],
-      "modelId": "gemini-3.1-pro",
       "metadata": {
         "cache_creation_input_token_cost": 0.000002,
         "cache_creation_input_token_cost_above_200k_tokens": 0.000004,
@@ -9827,7 +10338,16 @@
         "supports_vision": true,
         "supports_web_search": true,
         "web_search_billing_unit": "per_query"
-      }
+      },
+      "status": "verified",
+      "sources": [
+        {
+          "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [gemini-3.1-pro-low] @ e2cfaa46e79241f34e52bf4781f7710cd511c5d2",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/e2cfaa46e79241f34e52bf4781f7710cd511c5d2/backend/resources/model-pricing/model_prices_and_context_window.json#L2104",
+          "verifiedAt": "2026-09-22T07:33:33Z"
+        }
+      ],
+      "modelId": "gemini-3.1-pro"
     },
     {
       "id": "gemini-3.1-pro@cursor",
@@ -9836,9 +10356,9 @@
       "upstreamModelIds": [
         "gemini-3.1-pro"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.1-pro",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.1-pro"
     },
     {
       "id": "gemini-3.5-flash-lite@antigravity",
@@ -9847,9 +10367,9 @@
       "upstreamModelIds": [
         "gemini-3.5-flash-lite"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.5-flash-lite",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.5-flash-lite"
     },
     {
       "id": "gemini-3.5-flash@cursor",
@@ -9858,9 +10378,9 @@
       "upstreamModelIds": [
         "gemini-3.5-flash"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.5-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.5-flash"
     },
     {
       "id": "gemini-3.6-flash-high@antigravity",
@@ -9869,9 +10389,9 @@
       "upstreamModelIds": [
         "gemini-3.6-flash-high"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.6-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.6-flash"
     },
     {
       "id": "gemini-3.6-flash-low@antigravity",
@@ -9880,9 +10400,9 @@
       "upstreamModelIds": [
         "gemini-3.6-flash-low"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.6-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.6-flash"
     },
     {
       "id": "gemini-3.6-flash-medium@antigravity",
@@ -9891,9 +10411,9 @@
       "upstreamModelIds": [
         "gemini-3.6-flash-medium"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.6-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.6-flash"
     },
     {
       "id": "gemini-3.6-flash@cursor",
@@ -9902,9 +10422,9 @@
       "upstreamModelIds": [
         "gemini-3.6-flash"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.6-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.6-flash"
     },
     {
       "id": "gemini-3.7-flash-high@antigravity",
@@ -9913,9 +10433,9 @@
       "upstreamModelIds": [
         "gemini-3.7-flash-high"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.7-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.7-flash"
     },
     {
       "id": "gemini-3.7-flash-low@antigravity",
@@ -9924,9 +10444,9 @@
       "upstreamModelIds": [
         "gemini-3.7-flash-low"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.7-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.7-flash"
     },
     {
       "id": "gemini-3.7-flash-medium@antigravity",
@@ -9935,9 +10455,9 @@
       "upstreamModelIds": [
         "gemini-3.7-flash-medium"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.7-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.7-flash"
     },
     {
       "id": "gemini-3.7-flash@cursor",
@@ -9946,9 +10466,9 @@
       "upstreamModelIds": [
         "gemini-3.7-flash"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.7-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.7-flash"
     },
     {
       "id": "gemini-3.8-flash-high@antigravity",
@@ -9957,9 +10477,9 @@
       "upstreamModelIds": [
         "gemini-3.8-flash-high"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.8-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.8-flash"
     },
     {
       "id": "gemini-3.8-flash-low@antigravity",
@@ -9968,9 +10488,9 @@
       "upstreamModelIds": [
         "gemini-3.8-flash-low"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.8-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.8-flash"
     },
     {
       "id": "gemini-3.8-flash-medium@antigravity",
@@ -9979,9 +10499,9 @@
       "upstreamModelIds": [
         "gemini-3.8-flash-medium"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gemini-3.8-flash",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gemini-3.8-flash"
     },
     {
       "id": "glm-5.2@cursor",
@@ -9990,9 +10510,9 @@
       "upstreamModelIds": [
         "glm-5.2"
       ],
-      "status": "legacy-unverified",
-      "modelId": "glm-5.2",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "glm-5.2"
     },
     {
       "id": "gpt-5-mini@cursor",
@@ -10001,9 +10521,9 @@
       "upstreamModelIds": [
         "gpt-5-mini"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5-mini",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5-mini"
     },
     {
       "id": "gpt-5.1@cursor",
@@ -10012,9 +10532,9 @@
       "upstreamModelIds": [
         "gpt-5.1"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.1",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.1"
     },
     {
       "id": "gpt-5.2@cursor",
@@ -10023,9 +10543,9 @@
       "upstreamModelIds": [
         "gpt-5.2"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.2",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.2"
     },
     {
       "id": "gpt-5.3-codex@cursor",
@@ -10034,9 +10554,9 @@
       "upstreamModelIds": [
         "gpt-5.3-codex"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.3-codex",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.3-codex"
     },
     {
       "id": "gpt-5.4-mini@codex",
@@ -10045,9 +10565,9 @@
       "upstreamModelIds": [
         "gpt-5.4-mini"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.4-mini",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.4-mini"
     },
     {
       "id": "gpt-5.4-mini@cursor",
@@ -10056,9 +10576,9 @@
       "upstreamModelIds": [
         "gpt-5.4-mini"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.4-mini",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.4-mini"
     },
     {
       "id": "gpt-5.4@codex",
@@ -10067,9 +10587,9 @@
       "upstreamModelIds": [
         "gpt-5.4"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.4",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.4"
     },
     {
       "id": "gpt-5.4@cursor",
@@ -10078,9 +10598,9 @@
       "upstreamModelIds": [
         "gpt-5.4"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.4",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.4"
     },
     {
       "id": "gpt-5.5@codex",
@@ -10089,9 +10609,9 @@
       "upstreamModelIds": [
         "gpt-5.5"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.5"
     },
     {
       "id": "gpt-5.5@cursor",
@@ -10100,9 +10620,9 @@
       "upstreamModelIds": [
         "gpt-5.5"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-5.5"
     },
     {
       "id": "gpt-5.6-luna@codex",
@@ -10111,11 +10631,11 @@
       "upstreamModelIds": [
         "gpt-5.6-luna"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.6-luna",
       "metadata": {
         "max_input_tokens": 272000
-      }
+      },
+      "status": "unverified",
+      "modelId": "gpt-5.6-luna"
     },
     {
       "id": "gpt-5.6-luna@cursor",
@@ -10124,11 +10644,11 @@
       "upstreamModelIds": [
         "gpt-5.6-luna"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.6-luna",
       "metadata": {
         "max_input_tokens": 272000
-      }
+      },
+      "status": "unverified",
+      "modelId": "gpt-5.6-luna"
     },
     {
       "id": "gpt-5.6-sol@codex",
@@ -10142,11 +10662,11 @@
           "gpt-5.6"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.6-sol",
       "metadata": {
         "max_input_tokens": 1000000
-      }
+      },
+      "status": "unverified",
+      "modelId": "gpt-5.6-sol"
     },
     {
       "id": "gpt-5.6-sol@cursor",
@@ -10160,11 +10680,11 @@
           "gpt-5.6"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.6-sol",
       "metadata": {
         "max_input_tokens": 1000000
-      }
+      },
+      "status": "unverified",
+      "modelId": "gpt-5.6-sol"
     },
     {
       "id": "gpt-5.6-terra@codex",
@@ -10173,11 +10693,11 @@
       "upstreamModelIds": [
         "gpt-5.6-terra"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.6-terra",
       "metadata": {
         "max_input_tokens": 272000
-      }
+      },
+      "status": "unverified",
+      "modelId": "gpt-5.6-terra"
     },
     {
       "id": "gpt-5.6-terra@cursor",
@@ -10186,11 +10706,11 @@
       "upstreamModelIds": [
         "gpt-5.6-terra"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-5.6-terra",
       "metadata": {
         "max_input_tokens": 272000
-      }
+      },
+      "status": "unverified",
+      "modelId": "gpt-5.6-terra"
     },
     {
       "id": "gpt-6-astra@codex",
@@ -10204,9 +10724,9 @@
           "gpt-6-astra"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "gpt-6-astra",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "gpt-6-astra"
     },
     {
       "id": "gpt-oss-120b-medium@antigravity",
@@ -10215,12 +10735,12 @@
       "upstreamModelIds": [
         "gpt-oss-120b-medium"
       ],
-      "status": "legacy-unverified",
-      "modelId": "gpt-oss-120b",
       "metadata": {
         "input_cost_per_token": 1.5e-7,
         "output_cost_per_token": 6e-7
-      }
+      },
+      "status": "unverified",
+      "modelId": "gpt-oss-120b"
     },
     {
       "id": "grok-4.5@cursor",
@@ -10236,9 +10756,9 @@
           "grok-4.5-latest"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "grok-4.5",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "grok-4.5"
     },
     {
       "id": "grok-4.6@cursor",
@@ -10247,9 +10767,9 @@
       "upstreamModelIds": [
         "grok-4.6"
       ],
-      "status": "legacy-unverified",
-      "modelId": "grok-4.6",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "grok-4.6"
     },
     {
       "id": "grok-4.6@grok",
@@ -10258,9 +10778,9 @@
       "upstreamModelIds": [
         "grok-4.6"
       ],
-      "status": "legacy-unverified",
-      "modelId": "grok-4.6",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "grok-4.6"
     },
     {
       "id": "grok-4.6@grokbot",
@@ -10269,9 +10789,9 @@
       "upstreamModelIds": [
         "grok-4.6"
       ],
-      "status": "legacy-unverified",
-      "modelId": "grok-4.6",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "grok-4.6"
     },
     {
       "id": "grok-4.7@cursor",
@@ -10285,9 +10805,9 @@
           "grok-4.7-latest"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "grok-4.7",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "grok-4.7"
     },
     {
       "id": "grok-4.7@grok",
@@ -10301,9 +10821,9 @@
           "grok-4.7-latest"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "grok-4.7",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "grok-4.7"
     },
     {
       "id": "grok-4.7@grokbot",
@@ -10317,9 +10837,9 @@
           "grok-4.7-latest"
         ]
       },
-      "status": "legacy-unverified",
-      "modelId": "grok-4.7",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "grok-4.7"
     },
     {
       "id": "kimi-k2.7-code@cursor",
@@ -10328,9 +10848,9 @@
       "upstreamModelIds": [
         "kimi-k2.7-code"
       ],
-      "status": "legacy-unverified",
-      "modelId": "kimi-k2.7-code",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "kimi-k2.7-code"
     },
     {
       "id": "kimi-k3@cursor",
@@ -10339,9 +10859,9 @@
       "upstreamModelIds": [
         "kimi-k3"
       ],
-      "status": "legacy-unverified",
-      "modelId": "kimi-k3",
-      "metadata": {}
+      "metadata": {},
+      "status": "unverified",
+      "modelId": "kimi-k3"
     }
   ]
 }

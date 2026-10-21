@@ -1,11 +1,62 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	resolveMirrorWorkflowTrigger,
 	verifyMirrorPublicationReceipt,
 	verifyProtectedMirrorEnvironment,
 } from "../../scripts/lib/mirror-workflow";
 import { commit, indexCommit, mirrorFixture, repository } from "./mirror-fixture";
+
+for (const [name, value] of [
+	["NF_MIRROR_TOTAL_TIMEOUT_MINUTES", "NaN"],
+	["NF_MIRROR_TOTAL_TIMEOUT_MINUTES", "-1"],
+	["NF_MIRROR_TOTAL_TIMEOUT_MINUTES", "301"],
+	["NF_MIRROR_TRANSFER_TIMEOUT_MINUTES", "61"],
+	["NF_MIRROR_UPLOAD_CONCURRENCY", "0"],
+	["NF_MIRROR_UPLOAD_CONCURRENCY", "9"],
+	["NF_MIRROR_UPLOAD_CONCURRENCY", "NaN"],
+])
+	test(`CLI rejects ${name}=${value} with an independent FAILED_CONFIG receipt before network`, () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-mirror-cli-budget-"));
+		try {
+			const receipt = join(directory, "receipt.json");
+			const result = spawnSync(
+				process.execPath,
+				[
+					"scripts/mirror-update-server.ts",
+					"--kind=main",
+					"--tag=v1.2.0",
+					`--repository=${repository}`,
+					"--dry-run",
+					`--receipt-output=${receipt}`,
+				],
+				{
+					env: {
+						...process.env,
+						NF_MIRROR_TOTAL_TIMEOUT_MINUTES: "",
+						NF_MIRROR_TRANSFER_TIMEOUT_MINUTES: "",
+						[name]: value,
+					},
+					timeout: 5000,
+					maxBuffer: 64 * 1024,
+					encoding: "utf8",
+				},
+			);
+			expect(result.status).toBe(1);
+			expect(JSON.parse(readFileSync(receipt, "utf8"))).toMatchObject({
+				status: "FAILED",
+				failureCode: "FAILED_CONFIG",
+				uploaded: [],
+				verified: [],
+				snapshotCommitted: false,
+			});
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 
 function sourceFixture(main = true) {
 	const path = main ? ".github/workflows/release.yml" : ".github/workflows/helpers-release.yml";
@@ -254,7 +305,10 @@ describe("independent mirror trigger provenance", () => {
 		expect(workflow).not.toContain("continue-on-error");
 		expect(workflow).toContain("environment: release");
 		expect(workflow).toContain("group: independent-update-server-mirror");
-		expect(workflow).toContain("timeout-minutes: 35");
+		expect(workflow).toContain("timeout-minutes: 330");
+		expect(workflow).toContain("NF_MIRROR_TOTAL_TIMEOUT_MINUTES");
+		expect(workflow).toContain("NF_MIRROR_TRANSFER_TIMEOUT_MINUTES");
+		expect(workflow).toContain("NF_MIRROR_UPLOAD_CONCURRENCY");
 		expect(workflow).toContain("github.event.repository.default_branch");
 		expect(workflow).toContain("needs.preflight.outputs.control-sha");
 		expect(workflow).not.toContain("control.js");

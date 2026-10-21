@@ -3,6 +3,7 @@ import type {
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
+import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
@@ -701,6 +702,21 @@ export const miscApi = {
 			>
 		>("/nug/relay-status"),
 
+	providerGetBalances: (options?: { providerId?: string; signal?: AbortSignal }) =>
+		request<Record<string, ProviderBalanceSnapshot>>(
+			`/provider-balances${options?.providerId ? `?providerId=${encodeURIComponent(options.providerId)}` : ""}`,
+			pickRequestOptions(options),
+		),
+	providerProbeBalance: (providerId: string) =>
+		request<ProviderBalanceSnapshot>(`/provider-balances/${encodeURIComponent(providerId)}/probe`, {
+			method: "POST",
+		}),
+	providerRefreshBalance: (providerId: string) =>
+		request<ProviderBalanceSnapshot>(
+			`/provider-balances/${encodeURIComponent(providerId)}/refresh`,
+			{ method: "POST" },
+		),
+
 	deepseekGetBalances: (options?: object) =>
 		request<Record<string, DeepSeekBalanceCache>>(
 			"/deepseek/balances",
@@ -862,7 +878,6 @@ export const miscApi = {
 			}>;
 			fromCache: boolean;
 			modelHash?: string;
-			modelContextWindows?: Record<string, number>;
 		}>(`/nug/providers/${providerId}/models/refresh`, {
 			method: "POST",
 			...pickRequestOptions(options),
@@ -885,7 +900,6 @@ export const miscApi = {
 			models: Array<{ id: string; name?: string; contextLength?: number }>;
 			count: number;
 			fromCache: boolean;
-			modelContextWindows?: Record<string, number>;
 		}>(`/gemini/providers/${providerId}/models/refresh`, {
 			method: "POST",
 			...pickRequestOptions(options),
@@ -993,6 +1007,18 @@ export const miscApi = {
 			drives?: Array<{ name: string; path: string }>;
 			sep: string;
 		}>("/fs/shortcuts"),
+	/** Whether the instance's default project directory is set and exists. */
+	fsProjectDirStatus: () =>
+		request<{
+			configured: string;
+			path: string | null;
+			state: "valid" | "unset" | "missing" | "not_directory";
+		}>("/fs/project-dir"),
+	/** Existing folders under home that look like where the user keeps code. */
+	fsProjectDirCandidates: () =>
+		request<{
+			candidates: Array<{ path: string; repoCount: number; conventional: boolean }>;
+		}>("/fs/project-dir/candidates"),
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",

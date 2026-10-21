@@ -1,37 +1,18 @@
-import {
-	decimalValue,
-	isRawPriceField,
-	type JSONValue,
-	type ModelCard,
-	modelCardView,
-	type RawCatalog,
-	type RawMetadata,
-	type RawModel,
-	type RawVariant,
-	validateRawMetadata,
-} from "./card";
-import { normalizeRawLocalState } from "./card-local";
+import { isRawPriceField, type ModelCard, modelCardView, validateRawMetadata } from "./card";
 import type {
 	FieldSource,
-	LocalCatalogState,
-	ModelBinding,
-	ModelOverride,
 	ModelQuery,
+	RawCatalog,
+	RawLocalState,
+	RawMetadata,
+	RawModel,
 } from "./schema/catalog";
-import { createModelMetadataResolver } from "./src/index";
+import { createModelIdentityResolver } from "./src/index";
 
-export interface RawLocalState {
-	revision: number;
-	/** Read-only migration provenance, keyed by target:id; edits clear only their own paths. */
-	legacyFields?: Record<string, string[]>;
-	models?: RawModel[];
-	variants?: RawVariant[];
-	bindings?: Array<Omit<ModelBinding, "overrides" | "rawMetadata"> & { overrides?: RawMetadata }>;
-	overrides?: Array<Omit<ModelOverride, "metadata" | "rawMetadata"> & { metadata: RawMetadata }>;
-	hiddenModelIds?: string[];
-	hiddenVariantIds?: string[];
-}
-export const legacyPaths: Readonly<Record<string, string>> = {
+export type { RawLocalState } from "./schema/catalog";
+
+/** Group names from MATCH_FIELD_GROUPS mapped onto the raw keys each one covers. */
+const groupKeys: Readonly<Record<string, string>> = {
 	"limits.maxOutputTokens": "max_output_tokens",
 	"modalities.input": "supported_modalities",
 	"modalities.output": "supported_output_modalities",
@@ -46,103 +27,37 @@ export const legacyPaths: Readonly<Record<string, string>> = {
 	"referencePricing.cacheRead": "cache_read_input_token_cost",
 	"referencePricing.cacheWrite": "cache_creation_input_token_cost",
 };
-export function legacyMetadataToRaw(metadata: object, local = false): RawMetadata {
-	const source = metadata as Record<string, unknown>;
-	const groups = new Set(["limits", "modalities", "nativeSearch", "reasoning", "referencePricing"]);
-	const raw: RawMetadata = Object.fromEntries(
-		Object.entries(source).filter(([key]) => !groups.has(key)),
-	) as RawMetadata;
-	for (const [path, key] of Object.entries(legacyPaths)) {
-		const [group, field] = path.split(".");
-		const values = source[group!] as Record<string, unknown> | undefined;
-		if (!values || !Object.hasOwn(values, field!)) continue;
-		const value = values[field!];
-		raw[key] =
-			path.startsWith("referencePricing.") && value !== null
-				? decimalValue(value, -6)
-				: (structuredClone(value) as JSONValue);
-	}
-	const limits = source.limits as Record<string, JSONValue> | undefined;
-	if (limits && Object.hasOwn(limits, "contextWindow"))
-		raw[local ? "working_context_tokens" : "legacy_context_window"] = limits.contextWindow!;
-	const prices = source.referencePricing as Record<string, JSONValue> | undefined;
-	if (prices?.currency !== undefined) raw.currency = prices.currency;
-	if (prices?.longContext !== undefined)
-		raw.reference_pricing_long_context = structuredClone(prices.longContext);
-	return validateRawMetadata(raw);
-}
-export function legacyLocalToRaw(local: LocalCatalogState): RawLocalState {
-	return normalizeRawLocalState({
-		...structuredClone(local),
-		models: local.models?.map(({ metadata, rawMetadata, ...entry }) => ({
-			...structuredClone(entry),
-			metadata:
-				rawMetadata === undefined
-					? legacyMetadataToRaw(metadata, true)
-					: validateRawMetadata(rawMetadata),
-		})),
-		variants: local.variants?.map(({ metadata, rawMetadata, ...entry }) => ({
-			...structuredClone(entry),
-			metadata:
-				rawMetadata === undefined
-					? legacyMetadataToRaw(metadata, true)
-					: validateRawMetadata(rawMetadata),
-		})),
-		bindings: local.bindings?.map(({ overrides, rawMetadata, ...entry }) => ({
-			...structuredClone(entry),
-			...(rawMetadata !== undefined
-				? { overrides: validateRawMetadata(rawMetadata) }
-				: overrides === undefined
-					? {}
-					: { overrides: legacyMetadataToRaw(overrides, true) }),
-		})),
-		overrides: local.overrides?.map(({ metadata, rawMetadata, ...entry }) => ({
-			...structuredClone(entry),
-			metadata:
-				rawMetadata === undefined
-					? legacyMetadataToRaw(metadata, true)
-					: validateRawMetadata(rawMetadata),
-		})),
-	});
-}
-function identityEntry(entry: RawModel) {
-	const { fields: _fields, ...matches } = entry.matches ?? {};
-	return {
-		...entry,
-		metadata: {},
-		matches,
-		status: entry.status === "unverified" ? ("legacy-unverified" as const) : entry.status,
-		sources: entry.sources?.map(({ fields: _, ...source }) => source),
-	};
-}
-function fieldAllowed(path: string, filter: string): boolean {
-	if (path === filter || path.startsWith(`${filter}.`)) return true;
-	if (filter === "limits.contextWindow")
-		return [
-			"max_input_tokens",
-			"context_window",
-			"working_context_tokens",
-			"legacy_context_window",
-		].includes(path);
-	if (filter === "referencePricing") return isRawPriceField(path);
-	if (filter === "limits")
-		return [
-			"max_input_tokens",
-			"max_output_tokens",
-			"context_window",
-			"working_context_tokens",
-			"legacy_context_window",
-		].includes(path);
-	if (filter === "referencePricing.longContext")
-		return (
-			/_above_\d+(?:k)?_tokens/.test(path) ||
-			path.startsWith("long_context_") ||
-			path === "reference_pricing_long_context"
-		);
-	return legacyPaths[filter] === path;
+const contextKeys = [
+	"max_input_tokens",
+	"context_window",
+	"working_context_tokens",
+	"legacy_context_window",
+];
+const limitKeys = [...contextKeys, "max_output_tokens"];
+const longContextKey = (path: string) =>
+	/_above_\d+(?:k)?_tokens/.test(path) ||
+	path.startsWith("long_context_") ||
+	path === "reference_pricing_long_context" ||
+	path.startsWith("reference_pricing_long_context.");
+/** Whether a raw key belongs to a field group a weak match is allowed to borrow. */
+export function fieldAllowed(path: string, group: string): boolean {
+	if (path === group || path.startsWith(`${group}.`)) return true;
+	if (group === "limits") return limitKeys.includes(path);
+	if (group === "limits.contextWindow") return contextKeys.includes(path);
+	if (group === "referencePricing") return isRawPriceField(path) || path === "currency";
+	if (group.startsWith("referencePricing.longContext")) return longContextKey(path);
+	if (group === "referencePricing.currency" || group === "referencePricing.unit")
+		return path === "currency";
+	if ((group === "modalities" || group === "modalities.input") && path === "supports_vision")
+		return true;
+	if (group === "reasoning.canDisable" && path === "supports_none_reasoning_effort") return true;
+	if (group === "reasoning" && path === "supports_none_reasoning_effort") return true;
+	return Object.entries(groupKeys).some(
+		([leaf, key]) => key === path && (leaf === group || leaf.startsWith(`${group}.`)),
+	);
 }
 
-/** Matching stays in the existing resolver; only metadata layering and view generation are v2. */
+/** Identity matching, local layering and the card view over one raw catalog/local pair. */
 export function createModelCardResolver(
 	catalogInput: RawCatalog,
 	localInput: RawLocalState = { revision: 0 },
@@ -159,62 +74,47 @@ export function createModelCardResolver(
 	for (const entry of local.overrides ?? []) entry.metadata = validateRawMetadata(entry.metadata);
 	for (const entry of local.bindings ?? [])
 		if (entry.overrides !== undefined) entry.overrides = validateRawMetadata(entry.overrides);
-	const skeleton = {
-		schemaVersion: 1 as const,
-		catalogVersion: catalog.catalogVersion,
-		publishedAt: catalog.publishedAt,
-		models: catalog.models.map(identityEntry),
-		variants: catalog.variants.map((entry) => ({
-			...identityEntry(entry),
-			modelId: entry.modelId,
-			providerKey: entry.providerKey,
-			upstreamModelIds: entry.upstreamModelIds,
-		})),
-	};
-	const { legacyFields: _legacyFields, ...localIdentity } = local;
-	const identityLocal: LocalCatalogState = {
-		...localIdentity,
-		models: local.models?.map(identityEntry),
-		variants: local.variants?.map((entry) => ({
-			...identityEntry(entry),
-			modelId: entry.modelId,
-			providerKey: entry.providerKey,
-			upstreamModelIds: entry.upstreamModelIds,
-		})),
-		bindings: local.bindings?.map((entry) => ({ ...entry, overrides: {} })),
-		overrides: local.overrides?.map((entry) => ({ ...entry, metadata: {} })),
-	};
-	const identify = createModelMetadataResolver(skeleton, identityLocal);
-	const identifyUnbound = (local.bindings ?? []).some(
-		(binding) => !binding.modelId && !binding.variantId,
-	)
-		? createModelMetadataResolver(skeleton, { ...identityLocal, bindings: [] })
-		: identify;
+	const connections = new Map(
+		Object.entries(local.connections ?? {}).map(([model, metadata]) => [
+			model,
+			validateRawMetadata(metadata),
+		]),
+	);
+	const identify = createModelIdentityResolver(catalog, local);
 	const baseModels = new Map(catalog.models.map((entry) => [entry.id, entry]));
 	const baseVariants = new Map(catalog.variants.map((entry) => [entry.id, entry]));
 	const localModels = new Map((local.models ?? []).map((entry) => [entry.id, entry]));
 	const localVariants = new Map((local.variants ?? []).map((entry) => [entry.id, entry]));
-	return (query: ModelQuery, discovered?: RawMetadata, defaults?: RawMetadata): ModelCard => {
+	/**
+	 * `connection` is the full model value (`provider:model`) the query was derived from;
+	 * that provider entry's own overrides apply by name, last.
+	 */
+	return (
+		query: ModelQuery,
+		discovered?: RawMetadata,
+		defaults?: RawMetadata,
+		connection?: string,
+	): ModelCard => {
 		const identity = identify(query);
-		const binding = local.bindings?.find((entry) => entry.id === identity.bindingId);
-		let via = identity.matchedVia;
-		if (binding && !binding.modelId && !binding.variantId && !query.modelId && !query.variantId)
-			via = identifyUnbound(query).matchedVia;
-		const matched = identity.variantId
-			? (localVariants.get(identity.variantId) ?? baseVariants.get(identity.variantId))
-			: identity.modelId
-				? (localModels.get(identity.modelId) ?? baseModels.get(identity.modelId))
-				: undefined;
-		const weak = via === "prefix" || via === "suffix";
+		const binding = identity.binding;
+		const matched = identity.matchedEntry;
+		const weak = identity.weakVia !== undefined;
+		const via = identity.weakVia;
 		const metadata: RawMetadata = {},
 			provenance: Record<string, FieldSource> = {};
 		const clearSources = (path: string) => {
 			for (const key of Object.keys(provenance))
 				if (key === path || key.startsWith(`${path}.`)) delete provenance[key];
 		};
-		const merge = (value: RawMetadata | undefined, source: FieldSource, restrict = false) => {
+		// Catalog and local layers were validated once above; only caller input is checked here.
+		const merge = (
+			value: RawMetadata | undefined,
+			source: FieldSource,
+			restrict = false,
+			trusted = true,
+		) => {
 			if (value === undefined) return;
-			const raw = validateRawMetadata(value);
+			const raw = trusted ? value : validateRawMetadata(value);
 			const walk = (target: RawMetadata, data: RawMetadata, prefix: string) => {
 				for (const [key, item] of Object.entries(data)) {
 					const path = prefix ? `${prefix}.${key}` : key;
@@ -272,12 +172,12 @@ export function createModelCardResolver(
 				? { legacy: true }
 				: {}),
 		});
-		merge(defaults, { layer: "default" });
+		merge(defaults, { layer: "default" }, false, false);
 		const model = identity.modelId && baseModels.get(identity.modelId),
 			variant = identity.variantId && baseVariants.get(identity.variantId);
 		if (model) merge(model.metadata, entrySource(model, "preset-model"), true);
 		if (variant) merge(variant.metadata, entrySource(variant, "preset-variant"), true);
-		merge(discovered, { layer: "discovered" });
+		merge(discovered, { layer: "discovered" }, false, false);
 		const applyOverride = (target: "model" | "variant" | "binding", id: string) => {
 			const entry = local.overrides?.find(
 				(override) => override.target === target && override.targetId === id,
@@ -310,7 +210,9 @@ export function createModelCardResolver(
 			merge(binding.overrides, { layer: "local-binding", id: binding.id, explicit: true });
 			applyOverride("binding", binding.id);
 		}
-		return {
+		const own = connection === undefined ? undefined : connections.get(connection);
+		if (own) merge(own, { layer: "local-connection", id: connection, explicit: true });
+		const card = {
 			schemaVersion: 2,
 			catalogVersion: catalog.catalogVersion,
 			localRevision: local.revision,
@@ -320,7 +222,19 @@ export function createModelCardResolver(
 			matchedVia: identity.matchedVia,
 			metadata: validateRawMetadata(metadata),
 			provenance,
-			view: modelCardView(metadata),
-		};
+		} as ModelCard;
+		// The display view (price rows, field groups) is derived on first read: validation
+		// and runtime reads resolve many cards and never look at it. JSON, spread and
+		// structuredClone all read it like a plain property.
+		let view: ModelCard["view"] | undefined;
+		Object.defineProperty(card, "view", {
+			enumerable: true,
+			configurable: true,
+			get: () => {
+				view ??= modelCardView(card.metadata);
+				return view;
+			},
+		});
+		return card;
 	};
 }

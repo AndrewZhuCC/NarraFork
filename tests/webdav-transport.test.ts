@@ -55,6 +55,47 @@ function xmlClient(xml: string, status = 207) {
 }
 const href = `/private/${day}/`;
 
+describe("configured streamed object budgets", () => {
+	test("rejects unbounded budgets and retains a validated 60-minute ceiling", () => {
+		expect(
+			validateWebDavConfig({ ...config, transferTimeoutMs: 60 * 60_000 }).transferTimeoutMs,
+		).toBe(60 * 60_000);
+		for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 60 * 60_000 + 1])
+			expect(() => validateWebDavConfig({ ...config, transferTimeoutMs: value })).toThrow();
+	});
+	for (const method of ["GET", "PUT"] as const)
+		test(`${method} applies configured deadline to stalled stream and does not retry`, async () => {
+			let cancelled = false;
+			let calls = 0;
+			const source = new ReadableStream<Uint8Array>({
+				start(c) {
+					c.enqueue(new Uint8Array([1]));
+				},
+				cancel() {
+					cancelled = true;
+				},
+			});
+			const client = new WebDavClient(
+				{ ...config, transferTimeoutMs: 25 },
+				{
+					fetchImpl: fake(async (_url, init) => {
+						calls++;
+						if (method === "GET") return new Response(source);
+						await new Response(init.body).arrayBuffer();
+						return new Response(null, { status: 201 });
+					}),
+				},
+			);
+			if (method === "GET")
+				await expect(read(await client.getStream(object, 2, signal()))).rejects.toThrow();
+			else
+				await expect(
+					client.put(object, source, digest(new Uint8Array([1, 2])), signal()),
+				).rejects.toThrow();
+			expect(cancelled).toBe(true);
+			expect(calls).toBe(1);
+		});
+});
 describe("WebDAV config and namespace fencing", () => {
 	test("validates HTTPS, isolated feed and exact mutually-exclusive credential shape", () => {
 		expect(validateWebDavConfig({ ...config, url: config.url.slice(0, -1) }).url).toBe(config.url);

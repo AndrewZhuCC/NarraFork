@@ -1417,7 +1417,7 @@ describe("composer atomic reference contract", () => {
 			if (nextText) handle.current?.restoreInput(nextText, []);
 			handle.current?.commitDraftAfterSend();
 		});
-		expect(updateSpy).toHaveBeenCalledWith("n1", "", 1, expect.any(String), [], undefined);
+		expect(updateSpy).toHaveBeenCalledWith("n1", "", expect.any(String), [], undefined);
 		expect(readNarratorInputDraft("u1", "n1").text).toBe(nextText);
 		expect(readNarratorInputDraft("u1", "n1").fileReferences ?? []).toEqual([]);
 

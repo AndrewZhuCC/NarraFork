@@ -2,74 +2,52 @@
  * standalone-narrator-cwd.ts — where a STANDALONE narrator starts when the client
  * sent no directory.
  *
- * The instance setting `paths.defaultProjectDir` is documented as the default parent
- * directory for new work, and the create modal shows it as the field placeholder —
- * but an empty submit used to land in the home directory instead, so the setting
- * appeared to do nothing. This resolves it for real.
+ * The answer is the instance setting `paths.defaultProjectDir`, but only when it names
+ * a directory that EXISTS. Nothing here creates it: the setting starts unset (see
+ * `project-dir.ts`), and silently `mkdir`-ing a guessed path — the old `~/projects` —
+ * put first sessions in a folder the user never chose. With no usable default the
+ * caller must refuse and ask for a directory instead of guessing one (home included).
  *
  * Chapter-bound narrators are deliberately excluded: an unset cwd there resolves to
  * the chapter worktree at session start (`resolveNarratorSessionCwd`), which is the
  * correct answer and must not be pre-empted.
  *
- * Filesystem effects are INJECTED rather than imported so the decision can be tested
- * without touching a real disk — including the branches that matter most (a
- * configured directory that cannot be created, a `~` that must expand), which are
- * awkward to provoke against a live filesystem and easy to get silently wrong.
+ * Filesystem effects are INJECTED so the decision can be tested without a real disk.
  */
+
+import { expandHomePath } from "./project-dir";
 
 export interface StandaloneNarratorCwdDeps {
 	/** Absolute home directory of the server process. */
 	home: string;
 	/** `settings.paths.defaultProjectDir`, possibly empty/undefined. */
 	configuredDir: string | undefined;
-	/** `mkdir -p`. Throws to signal "unusable". */
-	ensureDir: (path: string) => void;
+	/** Whether an absolute path is an existing directory. */
+	isDirectory: (path: string) => boolean;
 	/** Resolve to an absolute path (node:path `resolve`). */
 	toAbsolute: (path: string) => string;
-	/** Reports a configured directory that could not be used. */
-	onEnsureFailed?: (path: string, error: unknown) => void;
 }
 
-/**
- * The cwd to persist on a new narrator, or `undefined` to leave it unset.
- *
- * `undefined` is meaningful: it hands the decision to session start, which is what a
- * chapter-bound narrator needs.
- */
+export type StandaloneNarratorCwd =
+	/** Persist this cwd. */
+	| { kind: "cwd"; cwd: string }
+	/** Leave unset: session start binds the chapter worktree. */
+	| { kind: "session" }
+	/** No directory sent and no existing default: the user must choose one. */
+	| { kind: "required" };
+
 export function resolveStandaloneNarratorCwd(
 	input: { cwd?: string; chapterId?: string | null },
 	deps: StandaloneNarratorCwdDeps,
-): string | undefined {
+): StandaloneNarratorCwd {
 	const explicit = input.cwd?.trim();
-	if (explicit) return explicit;
-	// Chapter-bound: leave unset so the session binds it to the worktree.
-	if (input.chapterId) return undefined;
+	if (explicit) return { kind: "cwd", cwd: explicit };
+	if (input.chapterId) return { kind: "session" };
 
 	const configured = deps.configuredDir?.trim();
-	if (!configured) return deps.home;
-
-	let expanded = configured;
-	// Only a bare `~` or a `~/` prefix expands. `~user/x` is deliberately NOT treated
-	// as another user's home: this process cannot resolve that reliably, and guessing
-	// would create a directory named after the guess.
-	if (expanded === "~") {
-		expanded = deps.home;
-	} else if (expanded.startsWith("~/")) {
-		expanded = `${deps.home}${expanded.slice(1)}`;
-	} else if (expanded.startsWith("~")) {
-		// A `~other` form is unresolvable here; fall back rather than materialise a
-		// literal directory called "~other".
-		return deps.home;
-	}
-
+	if (!configured) return { kind: "required" };
+	const expanded = expandHomePath(configured, deps.home);
+	if (!expanded) return { kind: "required" };
 	const absolute = deps.toAbsolute(expanded);
-	try {
-		deps.ensureDir(absolute);
-	} catch (err) {
-		// A missing or forbidden default must not fail narrator creation outright:
-		// degrade to home, which always exists, and report it.
-		deps.onEnsureFailed?.(absolute, err);
-		return deps.home;
-	}
-	return absolute;
+	return deps.isDirectory(absolute) ? { kind: "cwd", cwd: absolute } : { kind: "required" };
 }

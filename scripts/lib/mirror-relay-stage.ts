@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
 	createRelayReady,
+	mirrorTransferTimeoutMs,
 	type RelayReadyManifest,
 	relayBucketExpired,
 	relayDate,
@@ -45,6 +46,9 @@ export function resolveMirrorRelayConfig(
 	const config: WebDavConfig = {
 		url: env.NF_MIRROR_WEBDAV_URL ?? "",
 		feed: env.NF_MIRROR_WEBDAV_FEED ?? "default",
+		...(env.NF_MIRROR_TRANSFER_TIMEOUT_MINUTES
+			? { transferTimeoutMs: mirrorTransferTimeoutMs(env.NF_MIRROR_TRANSFER_TIMEOUT_MINUTES) }
+			: {}),
 		auth: bearerToken
 			? { bearerToken }
 			: { username: username as string, password: password as string },
@@ -61,7 +65,10 @@ const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest(
 export class MirrorRelayStage {
 	private readonly client: NonNullable<MirrorRelayStageOptions["client"]>;
 	private readonly manifest: RelayReadyManifest;
-	private readonly uploaded = new Set<string>();
+	private readonly uploaded = new Map<string, number>();
+	private readonly inFlight = new Map<string, { size: number; pending: Promise<void> }>();
+	private objectsReady?: Promise<void>;
+	private failed = false;
 	private initialized?: Promise<void>;
 	private payloadReady = false;
 	private retention: MirrorRelayStageResult["retention"] = "RETENTION_INCOMPLETE";
@@ -159,20 +166,51 @@ export class MirrorRelayStage {
 		asset: { name: string; size: number; sha256: string },
 		body: ReadableStream<Uint8Array> | Uint8Array,
 	) {
-		await this.initialize();
-		this.signal.throwIfAborted();
-		if (this.uploaded.has(asset.sha256)) {
-			if (body instanceof ReadableStream) await body.cancel();
+		const existing = this.inFlight.get(asset.sha256);
+		const size = existing?.size ?? this.uploaded.get(asset.sha256);
+		if (size !== undefined) {
+			if (body instanceof ReadableStream) void body.cancel().catch(() => {});
+			if (size !== asset.size) {
+				this.failed = true;
+				throw new Error("Conflicting relay object size");
+			}
+			await existing?.pending;
 			return;
 		}
-		const path = relayObjectPath(this.manifest, asset.sha256);
-		await this.client.ensureCollection(path.slice(0, path.lastIndexOf("/")), this.signal);
-		const result = await this.client.put(path, body, asset, this.signal);
-		if (result !== "created")
-			throw new Error("Relay object conditional-create conflict; existence is not verification");
-		this.uploaded.add(asset.sha256);
+		const pending = (async () => {
+			try {
+				if (this.failed) throw new Error("Relay stage already failed");
+				await this.initialize();
+				this.signal.throwIfAborted();
+				const path = relayObjectPath(this.manifest, asset.sha256);
+				this.objectsReady ??= this.client.ensureCollection(
+					path.slice(0, path.lastIndexOf("/")),
+					this.signal,
+				);
+				await this.objectsReady;
+				const result = await this.client.put(path, body, asset, this.signal);
+				if (result !== "created")
+					throw new Error(
+						"Relay object conditional-create conflict; existence is not verification",
+					);
+				this.uploaded.set(asset.sha256, asset.size);
+			} catch (error) {
+				this.failed = true;
+				throw error;
+			} finally {
+				if (body instanceof ReadableStream && !body.locked) void body.cancel().catch(() => {});
+			}
+		})();
+		this.inFlight.set(asset.sha256, { size: asset.size, pending });
+		try {
+			await pending;
+		} finally {
+			this.inFlight.delete(asset.sha256);
+		}
 	}
 	async preparePayload(projection: unknown, maxBytes: number) {
+		if (this.failed || this.inFlight.size)
+			throw new Error("Relay assets must settle successfully before payload");
 		const bytes = new TextEncoder().encode(JSON.stringify(projection));
 		if (bytes.length > Math.min(maxBytes, 1024 * 1024))
 			throw new Error("Relay commit payload exceeds byte limit");
@@ -181,6 +219,8 @@ export class MirrorRelayStage {
 		this.payloadReady = true;
 	}
 	async publish(revalidate: () => Promise<void>): Promise<MirrorRelayStageResult> {
+		if (this.failed || this.inFlight.size)
+			throw new Error("Relay stage has failed or active uploads");
 		if (!this.payloadReady) throw new Error("Relay payload must be staged before ready");
 		await this.checkCapacity();
 		await revalidate();

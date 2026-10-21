@@ -1,5 +1,4 @@
 import type { ModelCardMutation } from "@shared/model-catalog/card-local";
-import type { ModelCatalogMutation } from "@shared/model-catalog/schema/api";
 import type { ModelQuery } from "@shared/model-catalog/schema/catalog";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -11,23 +10,19 @@ import {
 	checkModelCatalogUpdate,
 	exportModelCatalogUserLayer,
 	getEffectiveModelCard,
-	getEffectiveModelMetadata,
 	getModelCardSnapshot,
-	getModelCatalogSnapshot,
 	mutateModelCard,
-	mutateModelCatalog,
-	previewModelCatalogDowngrade,
-	queryForModel,
-	resolveEffectiveMetadata,
 	resolveEffectiveModelCard,
 	rollbackModelCatalog,
 	setModelCatalogUpdateSettings,
+	setModelWindow,
 } from "../lib/model-catalog";
 import {
 	CATALOG_IO_ERROR_BODY,
 	isHostIoError,
 	sanitizeCatalogErrorText,
 } from "../lib/model-catalog/error-text";
+import { describeModelWindows, MAX_WINDOW_MODELS } from "../lib/model-catalog/windows";
 import { requireAdmin } from "../middleware/auth";
 
 const resolveBodyLimit = bodyLimit({
@@ -44,7 +39,7 @@ modelCatalogRoutes.onError((error, c) => {
 			{
 				error: error.message,
 				code: "CATALOG_REVISION_CONFLICT",
-				snapshot: c.req.path.includes("/v2/") ? getModelCardSnapshot() : getModelCatalogSnapshot(),
+				snapshot: getModelCardSnapshot(),
 			},
 			409,
 		);
@@ -63,7 +58,6 @@ modelCatalogRoutes.onError((error, c) => {
 		400,
 	);
 });
-modelCatalogRoutes.get("/", (c) => c.json(getModelCatalogSnapshot()));
 modelCatalogRoutes.get("/v2", (c) => c.json(getModelCardSnapshot()));
 modelCatalogRoutes.get("/v2/resolve", (c) => {
 	const model = c.req.query("model");
@@ -77,35 +71,25 @@ modelCatalogRoutes.post("/v2/resolve", resolveBodyLimit, async (c) => {
 		throw new Error("query.upstreamModelId is required");
 	return c.json(resolveEffectiveModelCard(body.query));
 });
-modelCatalogRoutes.get("/export", requireAdmin, (c) => c.json(exportModelCatalogUserLayer()));
-modelCatalogRoutes.get("/downgrade-preview", requireAdmin, (c) =>
-	c.json(previewModelCatalogDowngrade()),
+/** Context windows of provider entries, with the scopes the provider page can set. */
+modelCatalogRoutes.post("/v2/windows", resolveBodyLimit, async (c) => {
+	const body = await c.req.json<{ models?: unknown }>();
+	if (
+		!Array.isArray(body.models) ||
+		body.models.length > MAX_WINDOW_MODELS ||
+		body.models.some((model) => typeof model !== "string")
+	)
+		throw new Error(`models must be an array of at most ${MAX_WINDOW_MODELS} model values`);
+	return c.json(await describeModelWindows(body.models as string[]));
+});
+/** Set or clear a working window for one provider entry (`connection`) or model-wide (`model`). */
+modelCatalogRoutes.post("/v2/windows/set", requireAdmin, resolveBodyLimit, async (c) =>
+	c.json(setModelWindow(await c.req.json())),
 );
-modelCatalogRoutes.get("/resolve", (c) => {
-	const model = c.req.query("model");
-	if (!model) throw new Error("model is required");
-	return c.json({ ...getEffectiveModelMetadata(model), resolvedQuery: queryForModel(model).query });
-});
-modelCatalogRoutes.post("/resolve", resolveBodyLimit, async (c) => {
-	const body = await c.req.json<{ query?: ModelQuery; model?: string }>();
-	if (body.model)
-		return c.json({
-			...getEffectiveModelMetadata(body.model),
-			resolvedQuery: queryForModel(body.model).query,
-		});
-	if (!body.query || typeof body.query.upstreamModelId !== "string")
-		throw new Error("query.upstreamModelId is required");
-	return c.json(resolveEffectiveMetadata(body.query));
-});
+modelCatalogRoutes.get("/export", requireAdmin, (c) => c.json(exportModelCatalogUserLayer()));
 modelCatalogRoutes.post("/v2/mutate", requireAdmin, resolveBodyLimit, async (c) =>
 	c.json(mutateModelCard(await c.req.json<ModelCardMutation>())),
 );
-modelCatalogRoutes.post("/mutate", requireAdmin, resolveBodyLimit, async (c) => {
-	const mutation = await c.req.json<ModelCatalogMutation>();
-	if (!Number.isInteger(mutation.baseRevision) || mutation.baseRevision < 0)
-		throw new Error("baseRevision is required");
-	return c.json(mutateModelCatalog(mutation));
-});
 modelCatalogRoutes.post("/updates/check", requireAdmin, async (c) =>
 	c.json(await checkModelCatalogUpdate()),
 );

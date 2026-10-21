@@ -10,6 +10,7 @@
  * model correctly. No mocks here: the resolution chain under test is the point.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { getModelCatalogRevision, setModelWindow } from "../../model-catalog";
 import type { ModelAggregation } from "../../settings/types";
 import {
 	DEFAULT_CONTEXT_WINDOW,
@@ -18,6 +19,7 @@ import {
 	getSummaryModelContextWindowDetail,
 	parseModelId,
 	resolveModelContextWindow,
+	saveSettings,
 	settings,
 } from "../index";
 
@@ -102,14 +104,12 @@ describe("getSummaryModelContextWindowDetail", () => {
 	let original: {
 		defaultModel: string;
 		summaryModel: string;
-		modelContextWindows: Record<string, number>;
 	};
 
 	beforeEach(() => {
 		original = {
 			defaultModel: settings.agent.defaultModel,
 			summaryModel: settings.agent.summaryModel,
-			modelContextWindows: settings.agent.modelContextWindows ?? {},
 		};
 		settings.agent.defaultModel = DEFAULT_MODEL;
 	});
@@ -117,7 +117,6 @@ describe("getSummaryModelContextWindowDetail", () => {
 	afterEach(() => {
 		settings.agent.defaultModel = original.defaultModel;
 		settings.agent.summaryModel = original.summaryModel;
-		settings.agent.modelContextWindows = original.modelContextWindows;
 	});
 
 	test("reports the same window as getSummaryModelContextWindow", () => {
@@ -134,24 +133,27 @@ describe("getSummaryModelContextWindowDetail", () => {
 		const parsed = parseModelId(SUMMARY_MODEL);
 		const key = `anthropic:${parsed.model}`;
 		settings.agent.summaryModel = SUMMARY_MODEL;
-		// The catalog overlay keeps its own local-binding layer and would otherwise
-		// shadow `modelContextWindows` inside tests that mutate settings in place.
+		// The provider page writes the entry's own window into the catalog.
 		const originalCatalog = settings.agent.modelCatalog;
-		settings.agent.modelCatalog = undefined;
 		try {
-			settings.agent.modelContextWindows = { [key]: 50_000 };
+			setModelWindow({
+				baseRevision: getModelCatalogRevision(),
+				scope: "connection",
+				target: key,
+				contextWindow: 50_000,
+			});
 			const detail = getSummaryModelContextWindowDetail();
 			expect(detail.contextWindow).toBe(50_000);
 			expect(detail.source).toBe("user");
 		} finally {
 			settings.agent.modelCatalog = originalCatalog;
+			saveSettings(settings);
 		}
 	});
 
 	test("when nothing resolves the source is fallback", () => {
 		settings.agent.summaryModel = "";
 		settings.agent.defaultModel = "";
-		settings.agent.modelContextWindows = {};
 		const detail = getSummaryModelContextWindowDetail();
 		expect(detail.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
 		expect(detail.source).toBe("fallback");

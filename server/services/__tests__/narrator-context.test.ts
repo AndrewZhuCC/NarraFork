@@ -137,7 +137,6 @@ describe("question inputs in actual summary provider requests", () => {
 	const normalOutput = { text: `NORMAL_OUTPUT_START${"x".repeat(50_000)}NORMAL_OUTPUT_END` };
 	const model = "anthropic:claude-haiku-4-5";
 	const originalSummary = settings.agent.summaryModel;
-	const originalWindows = settings.agent.modelContextWindows;
 	const originalCatalog = settings.agent.modelCatalog;
 	const generateText = mock(async (_text: string, _model: string, _system?: string) => ({
 		text: "Saved summary",
@@ -211,8 +210,7 @@ describe("question inputs in actual summary provider requests", () => {
 	beforeEach(() => {
 		generateText.mockClear();
 		settings.agent.summaryModel = model;
-		settings.agent.modelCatalog = undefined;
-		settings.agent.modelContextWindows = { [model]: 40_000 };
+		settings.agent.modelCatalog = catalogWithWindow(model, 40_000);
 		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
 			id: "n-question-summary",
 			contextSummary: "",
@@ -236,7 +234,6 @@ describe("question inputs in actual summary provider requests", () => {
 		tracking.mockRestore();
 		spec.mockRestore();
 		settings.agent.summaryModel = originalSummary;
-		settings.agent.modelContextWindows = originalWindows;
 		settings.agent.modelCatalog = originalCatalog;
 	});
 
@@ -328,6 +325,20 @@ describe("question inputs in actual summary provider requests", () => {
 	});
 });
 
+/** A provider entry's own working window, held where production holds it: the catalog. */
+function catalogWithWindow(model: string, window: number) {
+	return {
+		schemaVersion: 2 as const,
+		migrationVersion: 2 as const,
+		autoApply: false,
+		pinnedVersion: null,
+		local: {
+			revision: 0,
+			connections: { [model]: { working_context_tokens: window } },
+		},
+	};
+}
+
 describe("compact context-window budget guard", () => {
 	test("a window that leaves no content budget fails fast with a context-window hint", async () => {
 		const { settings } = await import("../../lib/settings");
@@ -348,15 +359,11 @@ describe("compact context-window budget guard", () => {
 
 			const originalDefault = settings.agent.defaultModel;
 			const originalSummary = settings.agent.summaryModel;
-			const originalWindows = settings.agent.modelContextWindows;
 			const originalCatalog = settings.agent.modelCatalog;
 			// 512 * 0.8 = 409 token budget — below the real fixed prompt overhead.
-			// Catalog overlay must be off or it
-			// shadows the in-place modelContextWindows override.
 			settings.agent.defaultModel = "anthropic:claude-haiku-4-5";
 			settings.agent.summaryModel = "anthropic:claude-haiku-4-5";
-			settings.agent.modelCatalog = undefined;
-			settings.agent.modelContextWindows = { "anthropic:claude-haiku-4-5": 512 };
+			settings.agent.modelCatalog = catalogWithWindow("anthropic:claude-haiku-4-5", 512);
 
 			try {
 				await expect(narratorContext.generateCompactSummary("n-budget", "en")).rejects.toThrow(
@@ -365,7 +372,6 @@ describe("compact context-window budget guard", () => {
 			} finally {
 				settings.agent.defaultModel = originalDefault;
 				settings.agent.summaryModel = originalSummary;
-				settings.agent.modelContextWindows = originalWindows;
 				settings.agent.modelCatalog = originalCatalog;
 			}
 		} finally {
@@ -378,7 +384,6 @@ describe("compact context-window budget guard", () => {
 describe("compact small positive budgets use actual request capacity", () => {
 	const model = "anthropic:claude-haiku-4-5";
 	const originalSummary = settings.agent.summaryModel;
-	const originalWindows = settings.agent.modelContextWindows;
 	const originalCatalog = settings.agent.modelCatalog;
 	let previousSummary = "";
 	let specContext = "";
@@ -393,8 +398,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 		previousSummary = "";
 		specContext = "";
 		settings.agent.summaryModel = model;
-		settings.agent.modelCatalog = undefined;
-		settings.agent.modelContextWindows = { [model]: 1_200 };
+		settings.agent.modelCatalog = catalogWithWindow(model, 1_200);
 		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
 			id: "n-small",
 			contextSummary: previousSummary,
@@ -414,7 +418,6 @@ describe("compact small positive budgets use actual request capacity", () => {
 		toolHint.mockRestore();
 		spec.mockRestore();
 		settings.agent.summaryModel = originalSummary;
-		settings.agent.modelContextWindows = originalWindows;
 		settings.agent.modelCatalog = originalCatalog;
 	});
 
@@ -444,7 +447,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("a positive budget still rejects an unsplittable entry that cannot fit", async () => {
-		settings.agent.modelContextWindows = { [model]: 250 };
+		settings.agent.modelCatalog = catalogWithWindow(model, 250);
 		const oversized = { ...message, contentText: "evidence".repeat(100) };
 		await expect(
 			narratorContext.generateCompactSummary("n-small", "en", [oversized]),
@@ -453,7 +456,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("fixed overhead that cannot fit fails with its context-window hint", async () => {
-		settings.agent.modelContextWindows = { [model]: 1 };
+		settings.agent.modelCatalog = catalogWithWindow(model, 1);
 		await expect(
 			narratorContext.generateCompactSummary("n-small", "en", [message]),
 		).rejects.toThrow(/context window/i);
@@ -476,7 +479,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("cancellation takes priority over an impossible budget or empty history", async () => {
-		settings.agent.modelContextWindows = { [model]: 1 };
+		settings.agent.modelCatalog = catalogWithWindow(model, 1);
 		const controller = new AbortController();
 		controller.abort();
 		for (const entries of [[message], []]) {

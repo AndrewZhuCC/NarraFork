@@ -58,6 +58,15 @@ export type ReflectionProgressKind =
 	| "task_reflection"
 	| "question_reflection";
 
+/** One row of an activity card's recent-tool list (`activity` subscriptions). */
+export interface NarratorActivityToolCall {
+	toolUseId: string;
+	toolName: string;
+	status: string;
+	createdAt: string | null;
+	inputSummary?: SubagentToolInputSummary;
+}
+
 export interface NarratorListStateSnapshotMessage {
 	type: "list_state_snapshot";
 	items: NarratorListStateSnapshotItem[];
@@ -302,6 +311,13 @@ export type NarratorServerMessage =
 			backgroundWorkActive?: boolean;
 	  }
 	| { type: "substatus_change"; narratorId: string; substatus: string[] }
+	/** Initial state of an `activity` subscription: the narrator's latest tool calls. */
+	| {
+			type: "activity_snapshot";
+			narratorId: string;
+			toolCalls: NarratorActivityToolCall[];
+			subscriptionRequestId?: string;
+	  }
 	| {
 			type: "payment_required";
 			narratorId: string;
@@ -325,6 +341,10 @@ export type NarratorServerMessage =
 			nugModelId?: string;
 			/** `credentials` when omitted. `quota` waits carry `resumeAt`. */
 			waitKind?: "credentials" | "quota";
+			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+			quotaProvider?: "kimi" | "opencode";
+			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
+			quotaBucket?: string;
 			/** Epoch ms the blocked window resets at. `quota` waits only. */
 			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
@@ -340,6 +360,8 @@ export type NarratorServerMessage =
 			model: string;
 			nugModelId?: string;
 			waitKind?: "credentials" | "quota";
+			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+			quotaProvider?: "kimi" | "opencode";
 	  }
 	| {
 			type: "queued_new_narrator_created";
@@ -1097,6 +1119,8 @@ export type NarratorServerMessage =
 			model: string;
 			nugModelId?: string;
 			waitKind?: "credentials" | "quota";
+			quotaProvider?: "kimi" | "opencode";
+			quotaBucket?: string;
 			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
@@ -1108,6 +1132,7 @@ export type NarratorServerMessage =
 			model: string;
 			nugModelId?: string;
 			waitKind?: "credentials" | "quota";
+			quotaProvider?: "kimi" | "opencode";
 	  }
 	| {
 			type: "subagent_conclusion_updated";

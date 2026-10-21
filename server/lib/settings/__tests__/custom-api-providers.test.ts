@@ -13,6 +13,22 @@ import {
 import { DEFAULTS } from "../defaults";
 import type { GeminiProviderConfig, NarraForkSettings, OpenAIProviderConfig } from "../types";
 
+/** Provider entries' own windows, as the provider page stores them in the catalog. */
+function withOwnWindows(settings: NarraForkSettings, windows: Record<string, number>): void {
+	settings.agent.modelCatalog = {
+		schemaVersion: 2,
+		migrationVersion: 2,
+		local: {
+			revision: 0,
+			connections: Object.fromEntries(
+				Object.entries(windows).map(([model, value]) => [model, { working_context_tokens: value }]),
+			),
+		},
+		autoApply: false,
+		pinnedVersion: null,
+	};
+}
+
 describe("custom API provider migration", () => {
 	test("preserves legacy responsesApi=false as completions-compatible", () => {
 		const provider: OpenAIProviderConfig = {
@@ -429,7 +445,7 @@ describe("custom API provider migration", () => {
 		];
 		settings.agent.hiddenModels = ["old:hidden"];
 		settings.agent.customModels = [{ value: "old:custom", label: "Custom", provider: "old" }];
-		settings.agent.modelContextWindows = { "old:model-a": 123, "other:model-b": 456 };
+		withOwnWindows(settings, { "old:model-a": 1230, "other:model-b": 4560 });
 		settings.agent.providerOrder = ["other", "old"];
 		settings.agent.disabledProviders = ["old"];
 
@@ -455,11 +471,14 @@ describe("custom API provider migration", () => {
 			},
 			hiddenModels: ["new:hidden"],
 			customModels: [{ value: "new:custom", label: "Custom", provider: "new" }],
-			modelContextWindows: { "new:model-a": 123, "other:model-b": 456 },
 			providerOrder: ["other", "new"],
 			disabledProviders: ["new"],
 		});
 		expect(settings.agent.modelAggregations?.[0]?.models).toEqual(["new:model-a", "other:model-b"]);
+		expect(settings.agent.modelCatalog?.local.connections).toEqual({
+			"new:model-a": { working_context_tokens: 1230 },
+			"other:model-b": { working_context_tokens: 4560 },
+		});
 	});
 
 	test("migrates effort keys including aggregate members and preserves per-type tiers", () => {
@@ -503,7 +522,7 @@ describe("custom API provider migration", () => {
 		const settings = structuredClone(DEFAULTS);
 		settings.agent.defaultModel = "old:default";
 		settings.agent.subagentAllowedModels.explore = ["old:model"];
-		settings.agent.modelContextWindows = { "old:model": 123 };
+		withOwnWindows(settings, { "old:model": 1230 });
 		settings.agent.subagentModelReasoningEfforts = {
 			explore: { "old:model": "high" },
 			review: { "old:model": "low", "new:model": "max" },
@@ -537,13 +556,13 @@ describe("custom API provider migration", () => {
 
 	test("rejects prefix migration when context-window targets conflict", () => {
 		const settings = structuredClone(DEFAULTS) as NarraForkSettings;
-		settings.agent.modelContextWindows = {
-			"old:model": 100,
-			"new:model": 200,
-		};
+		withOwnWindows(settings, { "old:model": 1000, "new:model": 2000 });
+		settings.agent.defaultModel = "old:default";
+		const before = structuredClone(settings);
 		expect(() =>
 			migrateProviderPrefixReferences(settings, [{ id: "stable", from: "old", to: "new" }]),
-		).toThrow("would overwrite context window");
+		).toThrow("would overwrite model overrides");
+		expect(settings).toEqual(before);
 	});
 
 	test("rejects prefix migration when custom-model targets conflict", () => {

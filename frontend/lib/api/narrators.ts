@@ -629,6 +629,36 @@ export interface NarratorCustomTraits {
 	availableTools: { name: string; description: string; category: string }[];
 }
 
+export type NarratorSlashMenuResponse = {
+	commands: Array<{
+		name: string;
+		prompt: string;
+		description?: string;
+		source: string;
+		runBashFirst?: boolean;
+		bashCommand?: string;
+		params?: Array<{
+			name: string;
+			description?: string;
+			required?: boolean;
+			defaultValue?: string;
+		}>;
+	}>;
+	skills: Array<{
+		name: string;
+		description: string;
+		source: string;
+		blocked?: boolean;
+	}>;
+	tools: Array<{
+		id: string;
+		toolName: string;
+		descriptionEn: string;
+		descriptionZh: string;
+	}>;
+	allSkillsBlocked?: boolean;
+};
+
 export const narratorsApi = {
 	getRequestRecordingDetail: (narratorId: string, requestId: string, signal?: AbortSignal) =>
 		request<RequestRecordingDetail>(
@@ -835,35 +865,12 @@ export const narratorsApi = {
 		return request<UsageHistoryStats>(`/narrators/${id}/usage-stats${qs ? `?${qs}` : ""}`);
 	},
 	getNarratorCommands: (id: string) =>
-		request<{
-			commands: Array<{
-				name: string;
-				prompt: string;
-				description?: string;
-				source: string;
-				runBashFirst?: boolean;
-				bashCommand?: string;
-				params?: Array<{
-					name: string;
-					description?: string;
-					required?: boolean;
-					defaultValue?: string;
-				}>;
-			}>;
-			skills: Array<{
-				name: string;
-				description: string;
-				source: string;
-				blocked?: boolean;
-			}>;
-			tools: Array<{
-				id: string;
-				toolName: string;
-				descriptionEn: string;
-				descriptionZh: string;
-			}>;
-			allSkillsBlocked?: boolean;
-		}>(`/narrators/${id}/commands`),
+		request<NarratorSlashMenuResponse>(`/narrators/${id}/commands`),
+	/** Slash menu for the session-less dashboard composer, resolved from `cwd`. */
+	getDraftComposerCommands: (cwd: string | null) =>
+		request<NarratorSlashMenuResponse>(
+			`/narrators/draft-composer/commands${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`,
+		),
 	getNarratorSkills: (id: string, opts?: { refresh?: boolean }) => {
 		const params = new URLSearchParams();
 		if (opts?.refresh) params.set("refresh", "true");
@@ -2025,6 +2032,18 @@ export const narratorsApi = {
 	dismissInterruptTaskGuardMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/interrupt-task-guard-messages/${messageId}`,
+			{
+				method: "DELETE",
+			},
+		),
+	/**
+	 * Close the post-error subagent recovery card without restarting anything.
+	 * Neither resumes nor records a selection: the offer is simply withdrawn, and
+	 * the server's per-subagent watermark keeps it from being offered again.
+	 */
+	dismissSubagentRecoveryMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedMessageIds: string[] }>(
+			`/narrators/${narratorId}/subagent-recovery-messages/${messageId}`,
 			{
 				method: "DELETE",
 			},

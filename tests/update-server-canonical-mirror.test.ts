@@ -31,6 +31,141 @@ import { LocalStorage } from "../update-server/storage/local";
 
 const repository = "my-fork/my-release";
 
+for (const kind of ["helpers", "executor"] as const) {
+	test(`${kind} binary commit is manifest-bound, atomic, exact-tag and metadata-only compatible`, async () => {
+		await withServer(async (ctx) => {
+			const version = kind === "helpers" ? "1.0.0" : "1.2.0";
+			const tag = `${kind}-v${version}`;
+			const bytes = Buffer.alloc(128, 7);
+			const sha256 = digest(bytes);
+			const license = { name: "LICENSE.txt", size: 7, sha256: digest(Buffer.from("License")) };
+			const manifest = {
+				schemaVersion: 1,
+				repository,
+				tag,
+				commit: "a".repeat(40),
+				licenses: [license],
+				...(kind === "helpers"
+					? {
+							catalogVersion: "1.0.0",
+							files: HELPER_TOOLS.flatMap((tool) =>
+								HELPER_PLATFORMS.map((platform) => ({
+									tool,
+									platform,
+									toolVersion: HELPER_TOOL_VERSIONS[tool],
+									name: getHelperAssetName(tool, platform),
+									size: bytes.length,
+									sha256,
+								})),
+							),
+						}
+					: {
+							manifest: {
+								version,
+								protocolVersion: 1,
+								releasedAt: "2026-07-01T00:00:00Z",
+								platforms: Object.fromEntries(
+									EXECUTOR_PLATFORMS.map((platform) => [
+										platform,
+										{
+											filename: executorPublishedFilename(version, platform),
+											size: bytes.length,
+											sha256,
+										},
+									]),
+								),
+							},
+						}),
+			};
+			const content = JSON.stringify(manifest);
+			const binaries: MirrorAssetDescriptor[] =
+				kind === "helpers"
+					? HELPER_TOOLS.flatMap((tool) =>
+							HELPER_PLATFORMS.map((platform) => ({
+								kind: "helpers-binary" as const,
+								version,
+								platform,
+								name: getHelperAssetName(tool, platform),
+								size: bytes.length,
+								sha256,
+							})),
+						)
+					: EXECUTOR_PLATFORMS.map((platform) => ({
+							kind: "executor-binary" as const,
+							version,
+							platform,
+							name: executorPublishedFilename(version, platform),
+							size: bytes.length,
+							sha256,
+						}));
+			const projection = {
+				schemaVersion: 1,
+				repository,
+				kind,
+				tag,
+				assets: [
+					{
+						name: kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME,
+						size: Buffer.byteLength(content),
+						sha256: digest(Buffer.from(content)),
+						content,
+					},
+					{ ...license, content: "License" },
+				],
+			};
+			const url = `${ctx.url}/tools/${kind}/${tag}`;
+			const submit = (payload: unknown) =>
+				ctx.app.request(url, {
+					method: "POST",
+					headers: { authorization: `Bearer ${ctx.token}`, "content-type": "application/json" },
+					body: JSON.stringify(payload),
+				});
+			const assetUrl = `${url}/assets/${binaries[0].name}`;
+			expect((await submit(projection)).status).toBe(200);
+			expect((await ctx.app.request(assetUrl)).status).toBe(404);
+			// Complete declarations cannot commit before their streamed objects exist.
+			expect((await submit({ ...projection, binaries })).status).toBe(400);
+			const descriptor = binaries[0];
+			expect(
+				(
+					await ctx.app.request(`${ctx.url}/assets/${sha256}`, {
+						method: "PUT",
+						headers: headers(ctx.token, descriptor),
+						body: Uint8Array.from(bytes),
+					})
+				).status,
+			).toBe(200);
+			expect((await ctx.app.request(assetUrl)).status).toBe(404);
+			for (const bad of [
+				binaries.slice(1),
+				binaries.map((b, i) => (i ? b : { ...b, platform: "wrong" })),
+				binaries.map((b, i) => (i ? b : { ...b, version: "9.9.9" })),
+				binaries.map((b, i) => (i ? b : { ...b, sha256: "f".repeat(64) })),
+				binaries.map((b, i) => (i ? b : { ...b, size: 32 * 1024 ** 2 + 1 })),
+			])
+				expect((await submit({ ...projection, binaries: bad })).status).toBe(400);
+			const response = await submit({ ...projection, binaries });
+			expect(response.status).toBe(200);
+			expect((await response.json()).verified).toHaveLength(binaries.length + 2);
+			expect(Buffer.from(await (await ctx.app.request(assetUrl)).arrayBuffer()).equals(bytes)).toBe(
+				true,
+			);
+			expect(
+				(await ctx.app.request(`${ctx.url}/tools/${kind}/${kind}-v9.9.9/assets/${descriptor.name}`))
+					.status,
+			).toBe(404);
+			// An old producer can still retry, without erasing binary availability or changing its receipt shape.
+			const legacy = await submit(projection);
+			expect((await legacy.json()).verified).toHaveLength(2);
+			expect((await ctx.app.request(assetUrl)).status).toBe(200);
+			const restarted = createApp(ctx.storage, new MirrorIngestService(ctx.storage));
+			expect((await restarted.request(assetUrl)).status).toBe(200);
+			await ctx.storage.saveFile(`mirror-objects/${sha256}`, Buffer.alloc(bytes.length, 9));
+			expect((await submit({ ...projection, binaries })).status).toBe(400);
+		});
+	});
+}
+
 test("canonical generation CAS rejects delayed N after N+1 and conflicting same-generation snapshots without consulting legacy v999", async () => {
 	await withServer(async (ctx) => {
 		await ctx.storage.saveFile(
@@ -584,12 +719,11 @@ test("LocalStorage stream writes chunks before EOF, bounds pending uploads and c
 			quotaBytes: 1024 * 1024,
 			minFreeBytes: 0,
 		};
-		const a = ctx.storage
-			.saveVerifiedFile(`mirror-objects/${"a".repeat(64)}`, new ReadableStream(), options)
-			.catch((error) => error);
-		const b = ctx.storage
-			.saveVerifiedFile(`mirror-objects/${"b".repeat(64)}`, new ReadableStream(), options)
-			.catch((error) => error);
+		const uploads = Array.from({ length: 8 }, (_, i) =>
+			ctx.storage
+				.saveVerifiedFile(`mirror-objects/${String(i).repeat(64)}`, new ReadableStream(), options)
+				.catch((error) => error),
+		);
 		await expect(
 			ctx.storage.saveVerifiedFile(
 				`mirror-objects/${"c".repeat(64)}`,
@@ -597,7 +731,7 @@ test("LocalStorage stream writes chunks before EOF, bounds pending uploads and c
 				options,
 			),
 		).rejects.toThrow("concurrency");
-		const results = await Promise.all([a, b]);
+		const results = await Promise.all(uploads);
 		for (const error of results) expect(error.message).toContain("deadline");
 	});
 });

@@ -12,7 +12,7 @@ import {
 } from "../frontend/plugin-runtime/paths";
 import { CHROMIUM_PATHS } from "../shared/browser-paths";
 import { urlHost } from "../shared/server-host";
-import { SESSION_VERSION_CLAIM } from "../shared/session-auth";
+import { isSessionTokenVersionCurrent, SESSION_VERSION_CLAIM } from "../shared/session-auth";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -55,7 +55,12 @@ import {
 	registerServerRestart,
 	scheduleServerRestart,
 } from "./lib/server-restart";
-import { reloadSettings, settings, subscribeSettingsChanges } from "./lib/settings";
+import {
+	reloadSettings,
+	reloadSettingsIfChanged,
+	settings,
+	subscribeSettingsChanges,
+} from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { shellExecute } from "./lib/shell-exec";
@@ -1106,8 +1111,20 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							// the next socket instead of riding along until the JWT expires. The
 							// narrator subscribe path uses it for the admin short-circuit.
 							role: true,
+							// The upgrade verifies only the JWT signature, so a revoked token (one left
+							// behind by a `token_version` bump — password change, "sign out everywhere")
+							// would otherwise still open a socket until its `exp`. Enforce the current
+							// generation here, exactly as the HTTP gate does, and fail the upgrade when
+							// it is stale (or the user row is gone).
+							tokenVersion: true,
 						},
 					});
+					if (
+						!user ||
+						!isSessionTokenVersionCurrent(payload[SESSION_VERSION_CLAIM], user.tokenVersion)
+					) {
+						return new Response("Invalid or expired token", { status: 401 });
+					}
 					const userInfo = user
 						? {
 								userId: user.id,
@@ -1368,8 +1385,9 @@ startServerAddressWatcher({
 
 // 其余配置（实例名、主题色、打开方式等）由管理器面板直接写文件，没有地址那样的重绑回路：
 // 文件变化时重载配置即可，运行时组件按需读取新值。地址变化由上面的监听单独处理。
+// 本进程自己的保存同样会触发文件事件，内容与上次写入一致时无需重载。
 startSettingsFileWatcher(() => {
-	reloadSettings();
+	reloadSettingsIfChanged();
 });
 
 /** Open a URL in the user's default browser. */

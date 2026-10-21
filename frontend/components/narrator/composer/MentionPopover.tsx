@@ -11,6 +11,7 @@ import { foldHandle, HANDLE_CHAR_RE, HANDLE_START_RE } from "@shared/narrator-ha
 import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../../lib/z-index";
+import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
 
 export interface MentionCandidate {
 	id: string;
@@ -143,6 +144,9 @@ export function MentionPopover({
 		}
 	}, [visible, handleKeyDown, anchorRef]);
 
+	// List cap (240) plus the gap to the composer.
+	const popoverSide = useComposerPopoverSide(anchorRef, visible, 248);
+
 	if (!visible || filtered.length === 0) return null;
 
 	return (
@@ -152,10 +156,9 @@ export function MentionPopover({
 			withBorder
 			style={{
 				position: "absolute",
-				bottom: "100%",
+				...composerPopoverOffset(popoverSide),
 				left: 0,
 				right: 0,
-				marginBottom: 4,
 				maxHeight: 240,
 				overflow: "auto",
 				zIndex: Z.dropdown,

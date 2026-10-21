@@ -52,7 +52,7 @@ import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
-import { useModelCardIndex } from "../../hooks/useModelCards";
+import { useActualResolvedModelCard } from "../../hooks/useModelCatalog";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
@@ -82,9 +82,8 @@ import {
 	useNarratorRetryRecoveryCapability,
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
-	useProviderModelRefreshCapability,
-	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
+import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
@@ -104,7 +103,7 @@ import {
 	formatFullLocaleDateTime,
 } from "../../lib/format";
 import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
-import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
+import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
@@ -185,18 +184,11 @@ import { useMockStreamActive } from "./mock/mock-stream-store";
 import { commandCodeQuotaView } from "./model/commandcode-quota-format";
 import { usageSourceFor } from "./model/custom-api-usage-source";
 import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
-import {
-	formatKimiBarText,
-	formatKimiDetailsText,
-	isKimiProviderBaseUrl,
-} from "./model/kimi-usage-format";
+import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import {
-	formatOpencodeBarText,
-	formatOpencodeDetailsText,
-	isOpencodeProviderBaseUrl,
-} from "./model/opencode-usage-format";
+import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
+import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
@@ -410,7 +402,6 @@ function NarratorPanelBody({
 		providerLabels,
 		nugProviderIdByPrefix,
 	} = useAllModels();
-	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
 	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
@@ -439,6 +430,7 @@ function NarratorPanelBody({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { t: balanceT } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -549,56 +541,7 @@ function NarratorPanelBody({
 		},
 		[mutateSettings, t],
 	);
-	// Re-fetch one NUG gateway's model catalog straight from the model menu. This
-	// is also how a stale "temporarily unavailable" flag gets cleared, since a
-	// refresh replaces the cached list wholesale.
-	const nugModelRefreshCapability = useProviderModelRefreshCapability("nug");
-	const nugRuntimeCapability = useProviderRuntimeCapability("nug");
-	const canRefreshNugModels =
-		nugModelRefreshCapability.supported &&
-		nugRuntimeCapability?.routes?.supported !== false &&
-		nugRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
-	const [refreshingNugProviderId, setRefreshingNugProviderId] = useState<string | null>(null);
-	const handleRefreshNugModels = useCallback(
-		async (providerId: string) => {
-			setRefreshingNugProviderId(providerId);
-			try {
-				await api.nugRefreshProviderModels(providerId);
-				await qc.invalidateQueries({ queryKey: ["settings"] });
-			} catch (error) {
-				notifications.show({
-					color: "red",
-					title: t("refreshProviderModelsErrorTitle"),
-					message: error instanceof Error ? error.message : String(error),
-				});
-			} finally {
-				setRefreshingNugProviderId(null);
-			}
-		},
-		[qc, t],
-	);
-	// Opening the picker also kicks off an opportunistic catalog refresh, so a
-	// model that recovered upstream stops showing as "temporarily unavailable"
-	// without the user having to find the per-provider refresh button. The real
-	// rate limit is a process-wide cooldown on the server; `requestNugModelRefresh…`
-	// only avoids redundant round-trips from this tab.
-	const handleModelPickerOpened = useCallback(() => {
-		void requestNugModelRefreshOnPickerOpen().then((refreshed) => {
-			if (refreshed) qc.invalidateQueries({ queryKey: ["settings"] });
-		});
-	}, [qc]);
-	const hasNugModelGroups = Object.keys(nugProviderIdByPrefix).length > 0;
-	const modelMenuRefreshProps = canRefreshNugModels
-		? {
-				nugProviderIdByPrefix,
-				onRefreshProviderModels: (providerId: string) => {
-					void handleRefreshNugModels(providerId);
-				},
-				refreshingProviderId: refreshingNugProviderId,
-				// No NUG gateway in the picker → nothing to refresh, so don't even ask.
-				...(hasNugModelGroups ? { onPickerOpened: handleModelPickerOpened } : {}),
-			}
-		: {};
+	const modelMenuRefreshProps = useModelMenuRefreshProps(nugProviderIdByPrefix);
 	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
 		settingsData?.agent?.dangerReflectionLevel,
 		settingsData?.agent?.dangerReflectionEnabled ?? true,
@@ -698,6 +641,8 @@ function NarratorPanelBody({
 			aggregations,
 			allModels,
 		);
+	// The catalog card a request for this model resolves to; feeds the reasoning tiers.
+	const { data: modelCard } = useActualResolvedModelCard(resolvedModel || undefined);
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -812,6 +757,26 @@ function NarratorPanelBody({
 	const deepseekBalancesQuery = useDeepSeekBalance(
 		currentDeepSeekProviderId,
 		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
+		firstScreenActivity,
+	);
+
+	const currentBalanceProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (settingsData?.customApiProviders ?? []).find(
+			(p: { id: string; prefix?: string; disabled?: boolean }) =>
+				p.prefix === prefix && !p.disabled,
+		);
+		return cfg && typeof settingsData?.providerBalanceGenerations?.[cfg.id] === "string"
+			? (cfg.id as string)
+			: null;
+	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.providerBalanceGenerations]);
+	const balanceGeneration = currentBalanceProviderId
+		? settingsData?.providerBalanceGenerations?.[currentBalanceProviderId]
+		: undefined;
+	const providerBalanceQuery = useProviderBalance(
+		currentBalanceProviderId,
+		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
 		firstScreenActivity,
 	);
 
@@ -1219,27 +1184,21 @@ function NarratorPanelBody({
 			opencodeProviderId: currentOpencodeProviderId,
 			kimiProviderId: currentKimiProviderId,
 		});
+		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
+		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
+		// generic text-balance slot — showing both would duplicate the 5h figure.
 		if (usageSource === "opencode") {
-			const usage = opencodeUsageQuery.data;
-			if (usage) {
-				const quotaBalance = formatOpencodeBarText(usage, t);
-				const detailedQuotaBalance = formatOpencodeDetailsText(usage, t);
-				if (quotaBalance || detailedQuotaBalance) {
-					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
-				}
-			}
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
-		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
-		// in the details popover) instead of the generic relay quota string.
+		// Kimi likewise has its own progress-bar indicator (`kimiQuotaView` below).
 		if (usageSource === "kimi") {
-			const kimiUsage = kimiUsagesData?.[cfg.id];
-			if (kimiUsage) {
-				const quotaBalance = formatKimiBarText(kimiUsage, t);
-				const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
-				if (quotaBalance || detailedQuotaBalance) {
-					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
-				}
-			}
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
+		}
+		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
+			return {
+				providerId: cfg.id,
+				...formatProviderBalance(providerBalanceQuery.data, balanceT, providerBalanceQuery.isError),
+			};
 		}
 		const quotas = settingsData?.customApiQuotas as
 			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
@@ -1256,13 +1215,15 @@ function NarratorPanelBody({
 		resolvedModel,
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
-		kimiUsagesData,
 		currentKimiProviderId,
 		currentOpencodeProviderId,
-		opencodeUsageQuery.data,
 		currentDeepSeekProviderId,
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,
+		currentBalanceProviderId,
+		providerBalanceQuery.data,
+		providerBalanceQuery.isError,
+		balanceT,
 		t,
 	]);
 
@@ -2921,6 +2882,65 @@ function NarratorPanelBody({
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
+	/**
+	 * Which plan the narrator is parked on, so only that provider's allowance
+	 * indicator turns red: the live event names the plan, and after a reload the
+	 * persisted waiting payload does (`errorMessage` carries `quotaProvider` while
+	 * parked). A Kimi wait never turns the OpenCode badge red, and vice versa.
+	 */
+	const quotaWaitProvider = (() => {
+		if (!isWaitingForQuota) return undefined;
+		if (quotaWaitInfo?.quotaProvider) return quotaWaitInfo.quotaProvider;
+		if (!narrator?.errorMessage) return undefined;
+		try {
+			const parsed = JSON.parse(narrator.errorMessage) as { quotaProvider?: unknown };
+			if (parsed.quotaProvider === "opencode" || parsed.quotaProvider === "kimi") {
+				return parsed.quotaProvider;
+			}
+		} catch {
+			// Not a waiting payload; leave the provider unknown.
+		}
+		return undefined;
+	})();
+
+	/**
+	 * Props for the OpenCode Go allowance indicator, or undefined when the current
+	 * model is not on a Go endpoint.
+	 */
+	const opencodeQuotaProps = (() => {
+		if (!currentOpencodeProviderId) return undefined;
+		const waitingForQuota = quotaWaitProvider === "opencode";
+		return {
+			usage: opencodeUsageQuery.data,
+			waitingForQuota,
+			waitingText: waitingForQuota ? quotaWaitText : null,
+		};
+	})();
+
+	/**
+	 * Kimi or Command Code allowance, drawn with the same progress-bar indicator
+	 * as OpenCode Go. Kimi is gated on the provider id it is CURRENTLY configured
+	 * for, like the generic quota slot above, so a disabled query's stale entry
+	 * for a re-pointed provider is never shown.
+	 */
+	const kimiQuotaView = currentKimiProviderId
+		? buildKimiQuotaView(kimiUsagesData?.[currentKimiProviderId], t)
+		: null;
+	const quotaPanelProps = (() => {
+		if (currentKimiProviderId) {
+			const waitingForQuota = quotaWaitProvider === "kimi";
+			return {
+				view: kimiQuotaView,
+				waitingForQuota,
+				waitingText: waitingForQuota ? quotaWaitText : null,
+			};
+		}
+		if (commandCodeEnabled) {
+			return { view: commandCodeQuota, waitingForQuota: false, waitingText: null };
+		}
+		return undefined;
+	})();
+
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
 	const contextIndicatorRadius = 9;
@@ -3616,6 +3636,7 @@ function NarratorPanelBody({
 								allModels,
 								aggregations,
 								providerLabels,
+								settingsData,
 								defaultModelValue,
 								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
@@ -3626,13 +3647,12 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								balance: commandCodeQuota?.balance ?? tokenDanceQuota?.balance ?? quotaBalance,
-								detailsText:
-									commandCodeQuota?.detailsText ?? tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover:
-									commandCodeQuota?.hasDetailsPopover ??
-									tokenDanceQuota?.hasDetailsPopover ??
-									hasQuotaDetailsPopover,
+								// Command Code renders through `panel`; its generic slot stays empty.
+								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
+								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
+								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
+								opencode: opencodeQuotaProps,
+								panel: quotaPanelProps,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
@@ -3674,7 +3694,7 @@ function NarratorPanelBody({
 							resolvedModelOption,
 							narratorReasoningEffort: narrator.reasoningEffort,
 							settingsData,
-							modelCardIndex,
+							modelCard,
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,

@@ -14,6 +14,7 @@
  */
 import { extname } from "node:path";
 import { z } from "zod/v4";
+import { isSecretPlatformPath, SECRET_PATH_TOOL_REFUSAL } from "../../../fs-secret-paths";
 import { toolSpecPathError } from "../../../spec-uri";
 import { withDeviceParam } from "../../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../../execution/path-resolve";
@@ -221,6 +222,12 @@ export const structViewTool: ToolDefinition = {
 			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), filePath);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
+
+		// Application authorization guard enforced in every permission mode: never let a
+		// structural read disclose a NarraFork platform secret on the host.
+		if (backend.kind === "local" && isSecretPlatformPath(ioPath)) {
+			return { output: SECRET_PATH_TOOL_REFUSAL, isError: true };
+		}
 
 		let text: string;
 		let encoding = "utf-8";

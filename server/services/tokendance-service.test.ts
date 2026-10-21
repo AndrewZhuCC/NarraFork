@@ -1071,7 +1071,19 @@ describe("TokenDance backend", () => {
 				{ modelKey: "tokendance:chat" },
 				{ modelKey: "other:chat", notes: "tokendance: keep this note" },
 			],
-			modelContextWindows: { "tokendance:chat": 200000, "other:chat": 100000 },
+			modelCatalog: {
+				schemaVersion: 2,
+				migrationVersion: 2,
+				local: {
+					revision: 3,
+					connections: {
+						"tokendance:chat": { working_context_tokens: 200000 },
+						"other:chat": { working_context_tokens: 100000 },
+					},
+				},
+				autoApply: false,
+				pinnedVersion: null,
+			},
 			subagentModels: { explore: "tokendance:chat", plan: "other:chat" },
 			subagentAllowedModels: {
 				explore: ["tokendance:chat", "other:chat"],
@@ -1111,7 +1123,9 @@ describe("TokenDance backend", () => {
 		expect(fakeSettings.agent.modelCards).toEqual([
 			{ modelKey: "other:chat", notes: "tokendance: keep this note" },
 		]);
-		expect(fakeSettings.agent.modelContextWindows).toEqual({ "other:chat": 100000 });
+		expect(fakeSettings.agent.modelCatalog?.local.connections).toEqual({
+			"other:chat": { working_context_tokens: 100000 },
+		});
 		expect(fakeSettings.agent.subagentModels).toEqual({ explore: "", plan: "other:chat" });
 		expect(fakeSettings.agent.subagentAllowedModels.explore).toEqual(["other:chat"]);
 		expect(fakeSettings.agent.providerOrder).toEqual(["other"]);

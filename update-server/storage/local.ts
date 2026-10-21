@@ -14,7 +14,14 @@ import {
 } from "node:fs";
 import { mkdir, open, opendir, rename, stat, statfs, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
+import { MAX_MIRROR_UPLOAD_CONCURRENCY } from "../../shared/mirror-relay";
 import type { StorageBackend, VerifiedFileOptions } from "./types";
+
+interface MirrorReservation {
+	size: number;
+	quotaGrowth: number;
+	physicalReserved: boolean;
+}
 
 /** Thrown when a storage path would escape the configured base directory. */
 export class UnsafeStoragePathError extends Error {
@@ -91,11 +98,43 @@ export class LocalStorage implements StorageBackend {
 		}
 	}
 
+	/** Physical temp-space reserve is distinct from projected committed-object quota growth. */
 	private reservedBytes = 0;
 	private activeUploads = 0;
+	private readonly mirrorReservations = new Map<string, MirrorReservation>();
+	private readonly activeMirrorTemporaries = new Set<string>();
+	private mirrorAdmission: Promise<void> = Promise.resolve();
+	/** Admission and final rename share this short lock; streamed writes never hold it. */
+	private async withMirrorLock<T>(operation: () => Promise<T>): Promise<T> {
+		const previous = this.mirrorAdmission;
+		let release = () => {};
+		this.mirrorAdmission = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			release();
+		}
+	}
+
+	/** Transfer temp ownership back to the scanner atomically with withdrawal of its reservations. */
+	private async releaseMirrorTemporary(
+		temporary: string,
+		reservation?: MirrorReservation,
+	): Promise<void> {
+		if (!reservation) return;
+		await this.withMirrorLock(async () => {
+			this.activeMirrorTemporaries.delete(temporary);
+			reservation.quotaGrowth = 0;
+			if (reservation.physicalReserved) this.reservedBytes -= reservation.size;
+			reservation.physicalReserved = false;
+		});
+	}
 
 	/** Only scan the new content-addressed mirror directory, never historical data. */
-	private async mirrorBytes(): Promise<number> {
+	private async mirrorBytes(signal: AbortSignal): Promise<number> {
 		const directory = this.resolve("mirror-objects");
 		const entries = await opendir(directory).catch((error) => {
 			if (error.code === "ENOENT") return null;
@@ -105,9 +144,13 @@ export class LocalStorage implements StorageBackend {
 		let count = 0;
 		if (entries)
 			for await (const entry of entries) {
+				signal.throwIfAborted();
 				if (++count > 4096) throw new Error("Mirror object quota exceeded");
 				if (!entry.isFile()) throw new Error("Invalid mirror object storage");
-				total += await stat(join(directory, entry.name))
+				const full = join(directory, entry.name);
+				// Only this process's exact owned temps are covered by reservations. Crash leftovers count.
+				if (this.activeMirrorTemporaries.has(full)) continue;
+				total += await stat(full)
 					.then((value) => value.size)
 					.catch((error) => {
 						if (error.code === "ENOENT") return 0;
@@ -122,25 +165,47 @@ export class LocalStorage implements StorageBackend {
 		data: ReadableStream<Uint8Array>,
 		options: VerifiedFileOptions,
 	): Promise<void> {
-		if (this.activeUploads >= 2) throw new Error("Mirror upload concurrency limit");
+		const full = this.resolve(path);
+		if (this.activeUploads >= MAX_MIRROR_UPLOAD_CONCURRENCY || this.mirrorReservations.has(full)) {
+			void data.cancel().catch(() => {});
+			throw new Error("Mirror upload concurrency limit or duplicate object");
+		}
 		const signal = AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs)]);
+		const reservation: MirrorReservation = {
+			size: options.size,
+			quotaGrowth: 0,
+			physicalReserved: false,
+		};
 		this.activeUploads++;
-		// Reserve before any asynchronous admission work, including concurrent quota probes.
-		this.reservedBytes += options.size;
+		this.mirrorReservations.set(full, reservation);
 		try {
-			const disk = await abortable(statfs(this.resolvedBaseDir), signal);
-			if (disk.bavail * disk.bsize < options.minFreeBytes + this.reservedBytes)
-				throw new Error("Mirror disk reserve exhausted");
-			const existing = (await this.getFileSize(path)) ?? 0;
-			if (
-				(await abortable(this.mirrorBytes(), signal)) + this.reservedBytes - existing >
-				options.quotaBytes
-			)
-				throw new Error("Mirror disk quota exceeded");
-			await this.writeStream(path, data, { ...options, signal });
+			await this.withMirrorLock(async () => {
+				signal.throwIfAborted();
+				const disk = await abortable(statfs(this.resolvedBaseDir), signal);
+				if (disk.bavail * disk.bsize < options.minFreeBytes + this.reservedBytes + options.size)
+					throw new Error("Mirror disk reserve exhausted");
+				const existing = (await this.getFileSize(path)) ?? 0;
+				// Do not borrow future shrinkage: that upload may fail before replacing the old object.
+				const growth = Math.max(0, options.size - existing);
+				const used = await abortable(this.mirrorBytes(signal), signal);
+				const pending = [...this.mirrorReservations.values()].reduce(
+					(sum, r) => sum + r.quotaGrowth,
+					0,
+				);
+				if (used + pending + growth > options.quotaBytes)
+					throw new Error("Mirror disk quota exceeded");
+				signal.throwIfAborted();
+				reservation.quotaGrowth = growth;
+				reservation.physicalReserved = true;
+				this.reservedBytes += options.size;
+			});
+			await this.writeStream(path, data, { ...options, signal }, reservation);
 		} finally {
-			this.reservedBytes -= options.size;
-			this.activeUploads--;
+			await this.withMirrorLock(async () => {
+				if (reservation.physicalReserved) this.reservedBytes -= options.size;
+				this.mirrorReservations.delete(full);
+				this.activeUploads--;
+			});
 			void data.cancel().catch(() => {});
 		}
 	}
@@ -149,12 +214,25 @@ export class LocalStorage implements StorageBackend {
 		path: string,
 		data: ReadableStream<Uint8Array>,
 		options: VerifiedFileOptions | undefined,
+		reservation?: MirrorReservation,
 	): Promise<void> {
 		const full = this.resolve(path);
 		await mkdir(dirname(full), { recursive: true });
 		const temporary = `${full}.${randomUUID()}.tmp`;
-		const file = await open(temporary, "wx", 0o600);
-		const reader = data.getReader();
+		if (reservation) this.activeMirrorTemporaries.add(temporary);
+		const file = await open(temporary, "wx", 0o600).catch(async (error) => {
+			await this.releaseMirrorTemporary(temporary, reservation);
+			throw error;
+		});
+		let reader: ReadableStreamDefaultReader<Uint8Array>;
+		try {
+			reader = data.getReader();
+		} catch (error) {
+			await file.close().catch(() => {});
+			await unlink(temporary).catch(() => {});
+			await this.releaseMirrorTemporary(temporary, reservation);
+			throw error;
+		}
 		const hash = createHash("sha256");
 		let bytes = 0;
 		let rejectAbort: (reason: Error) => void = () => {};
@@ -198,13 +276,25 @@ export class LocalStorage implements StorageBackend {
 			await Promise.race([file.sync(), interrupted]);
 			if (options?.signal.aborted) throw new Error("Mirror upload aborted");
 			await file.close();
-			await rename(temporary, full);
+			const commit = async () => {
+				options?.signal.throwIfAborted();
+				await rename(temporary, full);
+				if (reservation) {
+					reservation.quotaGrowth = 0;
+					if (reservation.physicalReserved) this.reservedBytes -= reservation.size;
+					reservation.physicalReserved = false;
+				}
+			};
+			if (reservation) await this.withMirrorLock(commit);
+			else await commit();
 		} finally {
 			clearTimeout(timer);
 			options?.signal.removeEventListener("abort", abort);
 			void reader.cancel().catch(() => {});
 			await file.close().catch(() => {});
 			await unlink(temporary).catch(() => {});
+			// Failed unlink leaves a crash-like orphan: subsequent scans charge its actual bytes.
+			await this.releaseMirrorTemporary(temporary, reservation);
 		}
 	}
 

@@ -102,8 +102,6 @@ interface CodexSectionProps {
 	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
 	modelProtocols: Record<string, CustomApiProtocol>;
 	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
-	modelContextWindows: Record<string, number>;
-	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 }
 
@@ -410,8 +408,6 @@ export const CodexSection = React.memo(function CodexSection({
 	onCustomModelsChange,
 	modelProtocols,
 	onModelProtocolChange,
-	modelContextWindows,
-	onContextWindowChange,
 	onTestModel,
 }: CodexSectionProps) {
 	const { t } = useTranslation("settings");
@@ -631,8 +627,6 @@ export const CodexSection = React.memo(function CodexSection({
 	}, [fingerprintData, fingerprintInitialized]);
 
 	const codexModelIds: string[] = settingsData?.codexModels ?? [];
-	const builtinContextWindows: Record<string, number> =
-		settingsData?.builtinModelContextWindows ?? {};
 	const entries = status?.entries ?? [];
 	const availableEntries = status?.availableEntries ?? [];
 	const unavailableEntries = status?.unavailableEntries ?? [];
@@ -2039,9 +2033,6 @@ export const CodexSection = React.memo(function CodexSection({
 								onToggleHidden={onToggleHidden}
 								modelProtocols={modelProtocols}
 								onModelProtocolChange={onModelProtocolChange}
-								modelContextWindows={modelContextWindows}
-								defaultContextWindows={builtinContextWindows}
-								onContextWindowChange={onContextWindowChange}
 								onTestModel={onTestModel}
 								showContextWindow
 							/>
@@ -2052,8 +2043,6 @@ export const CodexSection = React.memo(function CodexSection({
 							onCustomModelsChange={onCustomModelsChange}
 							hiddenModels={hiddenModels}
 							onToggleHidden={onToggleHidden}
-							modelContextWindows={modelContextWindows}
-							onContextWindowChange={onContextWindowChange}
 							onTestModel={onTestModel}
 						/>
 					</Stack>
