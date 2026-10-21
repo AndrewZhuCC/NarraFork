@@ -79,8 +79,13 @@ export function createModelCardResolver(
 	const baseVariants = new Map(catalog.variants.map((entry) => [entry.id, entry]));
 	const localModels = new Map((local.models ?? []).map((entry) => [entry.id, entry]));
 	const localVariants = new Map((local.variants ?? []).map((entry) => [entry.id, entry]));
-	return (query: ModelQuery, discovered?: RawMetadata, defaults?: RawMetadata): ModelCard => {
-		const identity = identify(query);
+	return (
+		query: ModelQuery,
+		discovered?: RawMetadata,
+		defaults?: RawMetadata,
+		options: { attach?: string[] } = {},
+	): ModelCard => {
+		const identity = identify(query, options);
 		const binding = identity.binding;
 		const matched = identity.matchedEntry;
 		const weak = identity.weakVia !== undefined;
@@ -191,9 +196,9 @@ export function createModelCardResolver(
 				merge(entry.metadata, { layer: "local-variant", id: entry.id, explicit: true }, true);
 			applyOverride("variant", identity.variantId);
 		}
-		if (binding) {
-			merge(binding.overrides, { layer: "local-binding", id: binding.id, explicit: true });
-			applyOverride("binding", binding.id);
+		for (const entry of identity.bindings) {
+			merge(entry.overrides, { layer: "local-binding", id: entry.id, explicit: true });
+			applyOverride("binding", entry.id);
 		}
 		const card = {
 			schemaVersion: 2,

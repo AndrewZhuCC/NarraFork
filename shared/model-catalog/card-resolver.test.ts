@@ -253,3 +253,65 @@ test("canonical local scopes preserve effective values and reset the only write 
 	).toThrow();
 	expect(input.models?.[0]?.metadata.input_cost_per_token).toBe(2e-6);
 });
+
+test("bindings for one connection compose; different selectors at one specificity stay ambiguous", () => {
+	const catalog = rawCatalogFromModelFiles(
+		files({ max_input_tokens: 1000, max_output_tokens: 500 }),
+		sourceVersion,
+		date,
+	);
+	const resolve = (bindings: RawLocalState["bindings"]) =>
+		createModelCardResolver(catalog, { revision: 1, bindings })({
+			upstreamModelId: "m",
+			providerId: "p",
+			channelId: "c",
+		});
+	const composed = resolve([
+		{
+			id: "legacy-window:p:m",
+			providerId: "p",
+			upstreamModelId: "m",
+			overrides: { working_context_tokens: 800 },
+		},
+		{
+			id: "editor",
+			providerId: "p",
+			upstreamModelId: "m",
+			modelId: "m",
+			overrides: { max_output_tokens: 100, working_context_tokens: 900 },
+		},
+	]);
+	expect(composed.bindingId).toBe("editor");
+	expect(composed.modelId).toBe("m");
+	expect(composed.metadata.max_output_tokens).toBe(100);
+	// The provider page's window merges last, so the page shows what is in effect.
+	expect(composed.metadata.working_context_tokens).toBe(800);
+	expect(composed.provenance.working_context_tokens?.id).toBe("legacy-window:p:m");
+	expect(() =>
+		resolve([
+			{ id: "by-provider", providerId: "p", upstreamModelId: "m" },
+			{ id: "by-channel", channelId: "c", upstreamModelId: "m" },
+		]),
+	).toThrow("Ambiguous binding");
+	expect(() =>
+		resolve([
+			{ id: "a", providerId: "p", upstreamModelId: "m", modelId: "m" },
+			{ id: "b", providerId: "p", upstreamModelId: "m", variantId: "m@p", modelId: "other" },
+		]),
+	).toThrow();
+	// An attached window applies by name even when its stored selector no longer matches.
+	const attached = createModelCardResolver(catalog, {
+		revision: 1,
+		bindings: [
+			{
+				id: "legacy-window:p:c:m",
+				upstreamModelId: "c:m",
+				overrides: { working_context_tokens: 700 },
+			},
+		],
+	})({ upstreamModelId: "m", providerId: "p", channelId: "c" }, undefined, undefined, {
+		attach: ["legacy-window:p:c:m"],
+	});
+	expect(attached.metadata.working_context_tokens).toBe(700);
+	expect(attached.bindingId).toBeUndefined();
+});

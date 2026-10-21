@@ -45,7 +45,10 @@ function choose<T>(items: T[], message: string): T | undefined {
 export interface ModelIdentity {
 	modelId?: string;
 	variantId?: string;
+	/** The binding a caller should edit for this connection: an editor binding if any. */
 	binding?: RawBinding;
+	/** Every binding for this connection, in merge order (later wins). */
+	bindings: RawBinding[];
 	matchedVia: MatchedVia;
 	/** The weak (prefix/suffix) rule that selected the definition, if any. */
 	weakVia?: "prefix" | "suffix";
@@ -84,7 +87,14 @@ export function createModelIdentityResolver(catalog: RawCatalog, local?: RawLoca
 		if (seenOverrides.has(key)) fail(`Duplicate override ${o.target}:${o.targetId}`);
 		seenOverrides.add(key);
 	}
-	return (query: ModelQuery, options: { ignoreBindings?: boolean } = {}): ModelIdentity => {
+	return (
+		query: ModelQuery,
+		options: {
+			ignoreBindings?: boolean;
+			/** Binding ids whose overrides apply to this request by name, not by selector. */
+			attach?: string[];
+		} = {},
+	): ModelIdentity => {
 		validateShape(query, "ModelQuery");
 		const matchingBindings = options.ignoreBindings
 			? []
@@ -97,20 +107,38 @@ export function createModelIdentityResolver(catalog: RawCatalog, local?: RawLoca
 		const specificity = (b: RawBinding) =>
 			Number(b.providerId !== undefined) + Number(b.channelId !== undefined);
 		const maxSpecificity = Math.max(-1, ...matchingBindings.map(specificity));
-		const binding = choose(
-			matchingBindings.filter((b) => specificity(b) === maxSpecificity),
-			"Ambiguous binding",
-		);
+		// Bindings that name exactly the same connection compose (e.g. the provider page's
+		// working window beside a catalog-editor binding). Different selectors that match
+		// at the same specificity are a genuine ambiguity.
+		const top = matchingBindings.filter((b) => specificity(b) === maxSpecificity);
+		const selector = (b: RawBinding) => JSON.stringify([b.providerId, b.channelId]);
+		if (top.some((b) => selector(b) !== selector(top[0]!))) fail("Ambiguous binding");
+		const agree = (field: "modelId" | "variantId") => {
+			const values = [...new Set(top.map((b) => b[field]).filter((v) => v !== undefined))];
+			if (values.length > 1) fail("Ambiguous binding");
+			return values[0];
+		};
+		const boundModel = agree("modelId");
+		const boundVariant = agree("variantId");
+		// Provider-page windows merge last, so the page shows what is in effect.
+		const window = (b: RawBinding) => Number(b.id.startsWith("legacy-window:"));
+		const composed = [...top].sort((a, b) => window(a) - window(b));
+		// Attached bindings add overrides only; identity stays with the selector match.
+		for (const id of options.attach ?? []) {
+			const attached = bindings.find((b) => b.id === id);
+			if (attached && !composed.includes(attached)) composed.push(attached);
+		}
+		const binding = top.length ? composed[0] : undefined;
 		let model: RawModel | undefined;
 		let variant: RawVariant | undefined;
 		let matchedVia: MatchedVia = "none";
 		let matchedEntry: Entry | undefined;
 		let weakVia: ModelIdentity["weakVia"];
-		const explicitVariant = binding?.variantId ?? query.variantId;
-		const explicitModel = binding?.modelId ?? query.modelId;
-		if (binding?.variantId && query.variantId && binding.variantId !== query.variantId)
+		const explicitVariant = boundVariant ?? query.variantId;
+		const explicitModel = boundModel ?? query.modelId;
+		if (boundVariant && query.variantId && boundVariant !== query.variantId)
 			fail("Binding conflicts with explicit variant");
-		if (binding?.modelId && query.modelId && binding.modelId !== query.modelId)
+		if (boundModel && query.modelId && boundModel !== query.modelId)
 			fail("Binding conflicts with explicit model");
 		if (explicitVariant !== undefined) {
 			const identified =
@@ -211,6 +239,7 @@ export function createModelIdentityResolver(catalog: RawCatalog, local?: RawLoca
 			...(model ? { modelId: model.id } : {}),
 			...(variant ? { variantId: variant.id } : {}),
 			...(binding ? { binding } : {}),
+			bindings: composed,
 			matchedVia: binding ? "binding" : matchedVia,
 			...(weakVia ? { weakVia } : {}),
 			...(matchedEntry ? { matchedEntry } : {}),

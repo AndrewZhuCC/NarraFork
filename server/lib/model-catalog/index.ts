@@ -216,8 +216,6 @@ function applyWindowEdits(
 	input: Record<string, number>,
 	options: {
 		removeMissing: boolean;
-		/** Import: skip a key that cannot be applied instead of failing the load. */
-		lenient?: boolean;
 		/** The view the edited map was taken from, when it is older than `local`. */
 		baseline?: Record<string, number>;
 	},
@@ -246,25 +244,21 @@ function applyWindowEdits(
 				throw new Error("Context window must be a positive integer");
 			if (!binding) {
 				const { query } = queryForModel(model, settings);
-				// Two bindings with one selector would make every query for it ambiguous.
-				const clash = next.bindings.find(
+				// Another binding for this connection already carries its identity; the
+				// window composes with it and must not assert a second one.
+				const shared = next.bindings.some(
 					(b) =>
 						b.upstreamModelId === query.upstreamModelId &&
 						b.providerId === query.providerId &&
 						b.channelId === query.channelId,
 				);
-				if (clash) {
-					const message = `${model} already has the model catalog binding "${clash.id}"; set its working window there`;
-					if (!options.lenient) throw new Error(message);
-					logger.warn("Skipped importing a provider-page context window", { model, message });
-					continue;
-				}
 				let identity: ReturnType<typeof identify> | undefined;
-				try {
-					identity = identify(query);
-				} catch {
-					/* An ambiguous identity stays an unbound connection override. */
-				}
+				if (!shared)
+					try {
+						identity = identify(query);
+					} catch {
+						/* An ambiguous identity stays an unbound connection override. */
+					}
 				binding = {
 					id,
 					providerId: query.providerId,
@@ -409,7 +403,6 @@ function importPreCatalogSettings(settings: NarraForkSettings): ModelCatalogSett
 	let imported = normalizeRawLocalState(local);
 	imported = applyWindowEdits(settings, imported, legacyArchive.modelContextWindows, {
 		removeMissing: false,
-		lenient: true,
 	});
 	// Window bindings imported from the archive keep their legacy provenance.
 	for (const key of Object.keys(legacyArchive.modelContextWindows)) {
@@ -474,7 +467,6 @@ export function normalizeModelCatalogSettings(settings: NarraForkSettings): bool
 		try {
 			const next = applyWindowEdits(settings, cfg.local, windows, {
 				removeMissing: false,
-				lenient: true,
 			});
 			if (next !== cfg.local) {
 				validateLocal(next);
@@ -590,14 +582,23 @@ function cardResolver(catalog: RawCatalog, local: RawLocalState) {
 	return cardResolverCache.resolve;
 }
 const rejectedDiscoveries = new Set<string>();
-export function resolveEffectiveModelCard(query: ModelQuery, discovered?: RawMetadata): ModelCard {
+export function resolveEffectiveModelCard(
+	query: ModelQuery,
+	discovered?: RawMetadata,
+	model?: string,
+): ModelCard {
 	const scope = requestSnapshots.getStore();
 	const catalog = scope?.catalog ?? active;
 	const local = scope?.local ?? settingsRef?.agent.modelCatalog?.local ?? { revision: 0 };
-	const resolve = cardResolver(catalog, local);
-	if (discovered === undefined) return resolve(query);
+	const card = cardResolver(catalog, local);
+	// A provider-page window belongs to the model value the page showed, not to whichever
+	// selector that value resolved to when it was saved (gateway caches and provider
+	// configs change), so it is attached by name.
+	const options = model ? { attach: [`${LEGACY_WINDOW_PREFIX}${model.trim()}`] } : {};
+	const resolve = (input?: RawMetadata) => card(query, input, undefined, options);
+	if (discovered === undefined) return resolve();
 	try {
-		return resolve(query, discovered);
+		return resolve(discovered);
 	} catch (error) {
 		// Gateway metadata is outside local validation. When it contradicts the catalog
 		// (e.g. a total below the preset output cap), requests keep the catalog's card.
@@ -609,14 +610,14 @@ export function resolveEffectiveModelCard(query: ModelQuery, discovered?: RawMet
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
-		return resolve(query);
+		return resolve();
 	}
 }
 /** One resolution per model and request snapshot. Callers must not mutate the result. */
 function effectiveCard(model: string): { card: ModelCard; query: ModelQuery } {
 	const cache = requestSnapshots.getStore()?.cards;
 	const { query, discovered } = queryForModel(model);
-	const card = cache?.get(model) ?? resolveEffectiveModelCard(query, discovered);
+	const card = cache?.get(model) ?? resolveEffectiveModelCard(query, discovered, model);
 	cache?.set(model, card);
 	return { card, query };
 }

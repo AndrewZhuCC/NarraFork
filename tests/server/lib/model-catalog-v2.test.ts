@@ -317,7 +317,7 @@ test("provider-page windows are written into bindings and read back as a view", 
 	expect(again.agent.modelContextWindows).toEqual({});
 });
 
-test("an old window map never stops startup: clashing or malformed keys are skipped", () => {
+test("an old window map imports beside editor bindings and never stops startup", () => {
 	const stored = getDefaults();
 	stored.agent.modelCatalog = {
 		schemaVersion: 2,
@@ -345,13 +345,24 @@ test("an old window map never stops startup: clashing or malformed keys are skip
 	expect(bindings.find((b) => b.id === "editor-binding")?.overrides).toEqual({
 		max_output_tokens: 1000,
 	});
-	expect(bindings.some((b) => b.id === "legacy-window:codex:gpt-5.5")).toBe(false);
-	expect(stored.agent.modelContextWindows).toEqual({ "codex:gpt-5.4": 200000 });
-
-	// A live save of the same clash is refused with a reason rather than corrupting the layer.
+	// The window composes with the editor's binding for the same connection.
+	const window = bindings.find((b) => b.id === "legacy-window:codex:gpt-5.5");
+	expect(window?.overrides).toEqual({ working_context_tokens: 150000 });
+	expect(window?.modelId).toBeUndefined();
+	expect(stored.agent.modelContextWindows).toEqual({
+		"codex:gpt-5.5": 150000,
+		"codex:gpt-5.4": 200000,
+	});
 	bindModelCatalogSettings(stored, () => {});
-	stored.agent.modelContextWindows = { "codex:gpt-5.5": 150000 };
-	expect(() => applyWindowSettings(stored)).toThrow("editor-binding");
+	expect(getEffectiveModelProfile("codex:gpt-5.5")).toMatchObject({
+		contextWindow: 150000,
+		maxOutputTokens: 1000,
+	});
+	stored.agent.modelContextWindows = {
+		...stored.agent.modelContextWindows,
+		"codex:gpt-5.5": 160000,
+	};
+	expect(() => applyWindowSettings(stored)).not.toThrow();
 
 	const preCatalog = getDefaults();
 	delete preCatalog.agent.modelCatalog;
