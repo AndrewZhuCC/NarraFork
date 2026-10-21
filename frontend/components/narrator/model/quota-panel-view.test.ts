@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	formatQuotaAmount,
 	formatQuotaBadgeText,
 	formatQuotaCountdown,
 	pickLimitingWindow,
@@ -27,6 +28,18 @@ function view(overrides: Partial<QuotaPanelView> = {}): QuotaPanelView {
 }
 
 describe("quota panel view", () => {
+	test.each([
+		[0, "0"],
+		[42, "42"],
+		[1.2, "1.2"],
+		[1.2345, "1.23"],
+		[0.004, "0.004"],
+		[0.001, "0.001"],
+		[1e-8, "0.00000001"],
+		[-0.004, "-0.004"],
+	] as const)("formats %s compactly without turning a nonzero allowance into zero", (value, expected) => {
+		expect(formatQuotaAmount(value)).toBe(expected);
+	});
 	test("levels follow the 25% / 10% remaining thresholds", () => {
 		expect(quotaLevelForRemaining(null)).toBe("unknown");
 		expect(quotaLevelForRemaining(26)).toBe("ok");
