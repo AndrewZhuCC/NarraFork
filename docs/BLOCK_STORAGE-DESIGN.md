@@ -949,7 +949,7 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 
 | 层 | 来源 | 纪元内的处理 |
 |---|---|---|
-| 工具定义 | `/load` 加载工具 | 能用 provider 的延迟加载机制时就用，前缀不变（各 provider 支持情况待核实）；不能用时，接受这一次失效，并直接开启新纪元 |
+| 工具定义 | `/load` 加载工具 | 按模型在 catalog 里声明的策略追加，前缀不变；没有可用策略时直接改 tools[] 并开启新纪元（§7.8） |
 | 工具定义 | `/unload` 卸载工具、MCP 工具消失 | 纪元内只增不减：定义留在前缀里，追加一条提醒说明该工具已不可用，执行器拒绝调用；下个纪元再移除 |
 | system prompt | 在线设备列表、默认设备是否可用（`narrator-prompt.ts:176-200`） | 冻结纪元开始时的文本；变化追加提醒，如「设备 X 已离线」 |
 | system prompt | AGENTS.md 等项目说明（`narrator-prompt.ts:248-262`） | 冻结；文件变化时追加提醒，说明已更新，并附新内容或差异（体积受同样的上限约束） |
@@ -998,6 +998,47 @@ narrator_projection_overrides
 **代价**
 - 模型在纪元内会看到旧的标题、旧的 system 文本，靠追加的提醒获知变化。纪元越长，提醒越多。compact 与冷缓存会定期截断这种积累。
 - 工具「只增不减」会让卸载后的定义继续占用 token，直到下个纪元。
+
+### 7.8 纪元内加载工具：五种策略
+
+`/load` 在纪元内加载工具时，按模型声明的能力与当前线上协议选一种策略（D20）。
+
+| # | 策略 id | 做法 | 适用 | 参考实现 | 前缀 |
+|---|---|---|---|---|---|
+| 1 | `anthropic_tool_addition` | 先在 tools[] 里放一个 `defer_loading` 的占位工具；加载时按 Anthropic API 的官方方式追加工具 | Claude 模型，`anthropic-messages` 协议 | pi | 保持 |
+| 2 | `anthropic_deferred_tail` | 精简版的 1：同样要占位工具；新增工具不在 system 消息里放完整定义，而是把定义放到 tools[] 末尾并加上 `defer_loading` | DeepSeek 模型，`anthropic-messages` 协议 | deepseek-harness | 保持 |
+| 3 | `openai_additional_tools` | Responses 的 additional tools 方式 | GPT 模型，`openai-responses` 协议 | codex 开源实现 | 保持 |
+| 4 | `custom_injection` | 注入一条自定义消息提供新工具的 schema，tools[] 不变 | 推理设施对 schema 校验不严格的其他模型，任意协议 | — | 保持 |
+| 5 | `replace_tools` | 直接改 tools[] | 都不支持时的兜底 | — | 失效；立即开启新纪元 |
+
+各策略的线上字段（占位工具的形状、追加方式、模型调用新工具时的 id 与结果回传）以参考实现为准，实现前逐一核实。
+
+**在 model catalog 里声明**
+- 模型卡增加一个元数据键，暂名 `tool_loading_modes`，值是按优先级排列的策略 id 列表，一个模型可以声明多种。例如：
+  - Claude：`["anthropic_tool_addition", "custom_injection"]`
+  - DeepSeek：`["anthropic_deferred_tail", "custom_injection"]`
+  - GPT：`["openai_additional_tools"]`
+- 走 catalog 现有的「上游 + 本地覆盖」机制（`shared/model-catalog/card.ts` 的 `metadata` 与 provenance），用户可以在本地改。
+- 没有声明的模型只用策略 5。
+
+**选择规则**
+- 每种策略有它要求的协议：策略 1、2 要求 `anthropic-messages`，策略 3 要求 `openai-responses`，策略 4 与 5 不限。
+- 加载时，在模型声明的列表里按顺序取第一个与当前 target 协议相容的策略。
+- 都不相容就用策略 5。
+- 同一个模型经不同通道（例如 NUG 的 anthropic 通道与 responses 通道）可能走不同协议，所以选择发生在投影时，按当时的 target 判断，而不是在加载时写死。
+
+**存储与投影**
+- 一次加载写一条 `context` 块，`subtype` 为 `tool_addition`，`payload` 存工具定义与加载时选定的策略。
+- 第二段投影按策略把它变成线上形态：追加的工具块、tools[] 末尾的 deferred 定义、Responses 的追加项，或注入的 schema 文本。这样它和别的历史一样只追加，前缀核对照常生效。
+- 占位工具属于纪元开始时冻结的工具定义（§7.7），只在模型声明了策略 1 或 2 时放入。
+- 卸载仍按 §7.7：纪元内定义不撤，追加提醒，执行器拒绝调用。
+
+**换纪元：完全重新构建**
+- 新纪元开始时，工具定义按当时已加载的全部工具重新生成，直接放进 tools[]。
+- 之前的 `tool_addition` 块与卸载提醒都是旧纪元的事件，投影时跳过。
+- 策略 5 改了 tools[]，本身就是一次失效，所以同时开启新纪元，按上述方式完全重建。
+
+**切换模型或 provider**：本来就开启新纪元（D16），新 target 不需要兼容旧策略的线上形态。
 
 ## 8. 前端与传输
 
@@ -1279,6 +1320,7 @@ narrator_projection_overrides
 | compact 与段压缩 | 生命周期与现状等价；CAS 不再使用 JSON 路径 | 现有 compact 测试迁移 |
 | 回退与块删除 | 以块 id 寻址；重跑过的工具也能删除并回退文件；预算按块字节计算；共享信封走 COW | 现有回退测试迁移 |
 | Codex WS | 有 assistant 输出之后的下一次请求仍能增量续写 | 用上游原始 item 的录制做测试 |
+| 工具加载策略 | 五种策略各自的线上形态与参考实现一致；按协议选择正确；策略 5 开启新纪元；新纪元不再投影旧的 `tool_addition` 块 | 单测 + 请求录制 |
 | 前缀保持 | 纪元内，已发送的工具定义、system 各节、信封投影哈希不变；违例被记录并带上原因；换纪元的三种条件都能触发重建；fork 的第一次请求与父叙述者前缀相同 | 前缀核对 + 单测 |
 | External API v1 | 现有契约测试不修改即通过 | 契约测试 |
 | project.db | 导出再导入，内容相等；旧归档可以导入 | 往返测试 |
@@ -1311,7 +1353,7 @@ narrator_projection_overrides
 | D17 | 哪些变化追加提醒 | 只对影响模型行为的变化提醒；纯展示性变化静默沿用旧值 | **已定** |
 | D18 | mailbox 语义编辑 | 未被接收方采纳的原地改写；已采纳的追加修订通知 | **已定** |
 | D19 | 是否提供「按最新数据重建上下文」的手动操作 | 待定 | **待定** |
-| D20 | `/load` 无法延迟加载时的处理 | 推荐直接开启新纪元（失效一次）；备选是预先把可选工具的定义全部放进前缀，代价是常驻 token | **待定** |
+| D20 | 纪元内加载工具 | 五种策略，由模型在 catalog 里声明（可多种），按当前协议选用；都不适用时直接改 tools[] 并开启新纪元；新纪元完全重新构建（§7.8） | **已定** |
 
 ## 附录 A：现有块 type 到 kind 的映射
 
