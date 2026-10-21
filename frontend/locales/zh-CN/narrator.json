@@ -583,6 +583,8 @@
 	"draftRetry": "重试",
 	"draftReplacedByRemote": "其他标签页或设备更新了此草稿。",
 	"draftRestorePrevious": "恢复原稿",
+	"draftStaleLocalSetAside": "此设备上有一份未同步的旧草稿，已显示其他标签页或设备上更新的版本。",
+	"draftUseStaleLocal": "使用此设备的版本",
 	"draftDismissReplace": "知道了",
 	"draftTooLong": "草稿超过 {{limit}} 个字符，当前不会同步。",
 	"chapterMergedHint": "本章节已合并，需重新唤醒后才能继续编辑。",
