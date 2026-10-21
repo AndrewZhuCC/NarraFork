@@ -835,6 +835,39 @@ test("text context respects every atom, UTF-16, hard breaks and paragraph bounda
 	}
 }, 15_000);
 
+test("a parent committing older onChange values late keeps the newer document and undo history", async () => {
+	const page = await open();
+	try {
+		await load(page, quoted);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.holdEchoes();
+			fixture.selection(0);
+			fixture.insert([{ type: "text", text: "NEW" }]);
+			fixture.selection(6);
+			fixture.insert([{ type: "text", text: "FILE" }]);
+		});
+		// Tiptap focuses on the next frame; keys sent earlier land on <body>.
+		await settle(page);
+		await chord(page, "z", "Control");
+		expect((await snapshot(page)).document?.paragraphs[0].children[0]).toEqual({
+			type: "text",
+			text: "NEWA😀",
+		});
+		// Every held emission lands as its own render, the inserts' only after the undo.
+		while (await page.evaluate(() => (window as unknown as FixtureWindow).fixture.releaseEcho()))
+			await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children[0]).toEqual({
+			type: "text",
+			text: "NEWA😀",
+		});
+		await chord(page, "z", "Control");
+		expect((await snapshot(page)).document).toEqual(quoted);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
 test("selection bookmarks map through transactions, preserve native atom affinity and restore once without undo effects", async () => {
 	const page = await open();
 	try {
