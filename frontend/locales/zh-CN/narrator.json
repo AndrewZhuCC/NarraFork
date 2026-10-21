@@ -19,15 +19,11 @@
 		"optimizeChanged": "草稿已变化，或优化结果无法保留文本分段。未替换任何内容，请重试。"
 	},
 	"tokendanceBalance": "余额 ¥{{balance}}",
-	"commandcodeQuota": "剩余额度: {{percent}}%",
-	"commandcodeQuotaUnknown": "剩余额度: —",
-	"commandcodeQuotaWindow": "{{label}}: {{usedOfTotal}}% / {{capOfTotal}}% (已用{{usedInWindow}}%)",
+	"commandcodeQuotaUnknown": "Command Code 用量不可用",
+	"commandcodeQuotaTitle": "Command Code 用量",
+	"commandcodeQuotaMonthly": "月限额",
 	"commandcodeQuotaFiveHour": "5h限额",
 	"commandcodeQuotaWeekly": "周限额",
-	"commandcodeQuotaRawMonthly": "月窗口: {{used}} / {{total}}",
-	"commandcodeQuotaRawWindow": "{{label}}: {{used}} / {{cap}}",
-	"commandcodeQuotaRawWeekly": "周窗口",
-	"commandcodeQuotaRawFiveHour": "5h窗口",
 	"tokendanceBalanceUnknown": "余额暂不可用",
 	"tokendanceBalanceDetails": "累计充值 ¥{{credits}}\n已消耗 ¥{{used}}\n剩余 ¥{{balance}}",
 	"tokendanceBalanceStale": "余额可能已过期，请刷新",
@@ -1368,16 +1364,11 @@
 		"updatedAt": "更新于 {{time}}"
 	},
 	"kimi": {
-		"fiveHourShort": "5h {{percent}}%",
-		"fiveHourRatio": "5h {{used}}/{{limit}}",
 		"unavailable": "Kimi 用量不可用",
 		"window5h": "5 小时限制",
 		"windowWeekly": "周限制",
 		"windowMonthly": "月限制",
-		"windowLine": "{{label}}：已用 {{used}}/{{limit}}",
-		"resetSuffix": "，{{time}} 重置",
-		"fetchError": "用量获取失败：{{error}}",
-		"fetchFailed": "用量获取失败（详情请联系管理员）"
+		"title": "Kimi 用量"
 	},
 	"recharge": {
 		"title": "NUG 充值",
@@ -2494,5 +2485,27 @@
 	"dangerDetail_requestedDevice": "请求的设备：{{value}}",
 	"dangerDetail_requestedWorkdir": "请求的工作目录：{{value}}",
 	"dangerDetail_targetPath": "目标路径：{{value}}",
-	"dangerDetail_tool": "工具：{{value}}"
+	"dangerDetail_tool": "工具：{{value}}",
+	"quotaPanel": {
+		"short5h": "5h",
+		"shortWeekly": "周",
+		"shortMonthly": "月",
+		"badgeRemaining": "{{label}} {{percent}}%",
+		"badgeExhausted": "{{label}} 已耗尽",
+		"exhaustedShort": "已耗尽",
+		"remainingPercent": "剩余 {{percent}}%",
+		"remainingUnknown": "剩余未知",
+		"usedPercent": "已用 {{percent}}%",
+		"usedUnknown": "用量未知",
+		"usedOfLimit": "已用 {{used}} / {{limit}}",
+		"resetsIn": "{{time}}后重置",
+		"resetDue": "即将",
+		"countdownDH": "{{d}}天{{h}}小时",
+		"countdownHM": "{{h}}小时{{m}}分",
+		"countdownM": "{{m}}分钟",
+		"noWindows": "暂未返回限额窗口。",
+		"fetchError": "用量获取失败：{{error}}",
+		"staleHint": "最近一次刷新失败，数据可能已过时。",
+		"updatedAt": "更新于 {{time}}"
+	}
 }
