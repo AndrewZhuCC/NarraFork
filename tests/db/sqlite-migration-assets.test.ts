@@ -10,12 +10,12 @@ afterEach(async () => {
 	await Promise.all(fixtures.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-async function fixture(count = 1): Promise<string> {
+async function fixture(count = 1, indexes?: readonly number[]): Promise<string> {
 	const root = await mkdtemp(join(tmpdir(), "sqlite-assets-test-"));
 	fixtures.push(root);
 	await mkdir(join(root, "meta"));
 	const entries = Array.from({ length: count }, (_, idx) => ({
-		idx,
+		idx: indexes?.[idx] ?? idx,
 		version: "6",
 		when: 1000 + idx,
 		tag: `${String(idx).padStart(4, "0")}_fixture`,
@@ -25,10 +25,10 @@ async function fixture(count = 1): Promise<string> {
 		join(root, "meta/_journal.json"),
 		JSON.stringify({ version: "7", dialect: "sqlite", entries }),
 	);
-	for (const entry of entries) {
+	for (const [index, entry] of entries.entries()) {
 		await writeFile(join(root, `${entry.tag}.sql`), "CREATE TABLE fixture (id TEXT);\n");
 		await writeFile(
-			join(root, `meta/${String(entry.idx).padStart(4, "0")}_snapshot.json`),
+			join(root, `meta/${String(index).padStart(4, "0")}_snapshot.json`),
 			JSON.stringify({ version: "6", dialect: "sqlite", tables: {} }),
 		);
 	}
@@ -47,6 +47,27 @@ describe("SQLite migration assets", () => {
 		const result = await checkSqliteMigrationAssets(await fixture());
 		expect(result).toMatchObject({ migrations: 1, snapshots: 1 });
 		expect(result.bytes).toBeGreaterThan(0);
+	});
+
+	test("accepts index gaps and snapshots named by migration tag rather than journal index", async () => {
+		expect(await checkSqliteMigrationAssets(await fixture(3, [0, 196, 209]))).toMatchObject({
+			migrations: 3,
+			snapshots: 3,
+		});
+	});
+
+	test("rejects invalid or non-increasing journal indexes", async () => {
+		for (const indexes of [[-1], [0, 0], [1, 0], [0, 1.5], [0, Number.MAX_SAFE_INTEGER + 1]]) {
+			await expect(
+				checkSqliteMigrationAssets(await fixture(indexes.length, indexes)),
+			).rejects.toThrow("invalid migration entry");
+		}
+	});
+
+	test("rejects a snapshot without a matching migration even below the latest index", async () => {
+		const root = await fixture(2, [0, 196]);
+		await writeFile(join(root, "meta/0002_snapshot.json"), '{"dialect":"sqlite"}');
+		await expect(checkSqliteMigrationAssets(root)).rejects.toThrow("snapshot has no journal entry");
 	});
 
 	test("custom historical migrations need not invent an intermediate snapshot", async () => {
@@ -105,7 +126,6 @@ describe("SQLite migration assets", () => {
 
 	test.each([
 		"../outside",
-		"0001_wrong_index",
 		"0000_fixture/elsewhere",
 		`0000_${"x".repeat(124)}`,
 	])("rejects journal tag %s", async (tag) => {

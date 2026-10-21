@@ -55,14 +55,16 @@ function parseJournal(value: unknown): JournalEntry[] {
 		throw new Error("meta/_journal.json: invalid SQLite journal");
 	}
 	const tags = new Set<string>();
+	let previousIndex = -1;
 	return value.entries.map((entry, index) => {
 		if (
 			!isRecord(entry) ||
-			entry.idx !== index ||
+			typeof entry.idx !== "number" ||
+			!Number.isSafeInteger(entry.idx) ||
+			entry.idx <= previousIndex ||
 			typeof entry.tag !== "string" ||
 			entry.tag.length > 128 ||
 			!/^\d{4,}_[\p{L}\p{N}_-]+$/u.test(entry.tag) ||
-			Number.parseInt(entry.tag, 10) !== index ||
 			tags.has(entry.tag) ||
 			typeof entry.when !== "number" ||
 			!Number.isSafeInteger(entry.when) ||
@@ -71,6 +73,8 @@ function parseJournal(value: unknown): JournalEntry[] {
 		) {
 			throw new Error(`meta/_journal.json: invalid migration entry ${index}`);
 		}
+		// Merged histories can have index gaps and filename prefixes independent of idx.
+		previousIndex = entry.idx;
 		tags.add(entry.tag);
 		return entry as unknown as JournalEntry;
 	});
@@ -120,15 +124,16 @@ export async function checkSqliteMigrationAssets(
 		if (!source.trim()) throw new Error(`${name}: empty migration SQL`);
 	}
 	if (expectedSql.size) throw new Error(`Missing migration SQL: ${[...expectedSql][0]}`);
-	const latest = entries[entries.length - 1];
-	const latestSnapshot = `${String(latest.idx).padStart(4, "0")}_snapshot.json`;
+	const migrationSnapshots = entries.map((entry) => `${entry.tag.split("_", 1)[0]}_snapshot.json`);
+	const expectedSnapshots = new Set(migrationSnapshots);
+	const latestSnapshot = migrationSnapshots[migrationSnapshots.length - 1];
 	if (!snapshotNames.includes(latestSnapshot)) {
 		throw new Error(`Missing latest snapshot: meta/${latestSnapshot}`);
 	}
 	// Custom migrations may have no snapshot; do not invent historical snapshots for them.
 	for (const name of snapshotNames) {
 		assertNoLegacyContent(name, name);
-		if (!/^\d{4,}_snapshot\.json$/.test(name) || Number.parseInt(name, 10) > latest.idx) {
+		if (!expectedSnapshots.has(name)) {
 			throw new Error(`meta/${name}: snapshot has no journal entry`);
 		}
 		const snapshot = await readJson(`meta/${name}`);
