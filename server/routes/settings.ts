@@ -2,11 +2,6 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
-	MAX_MODEL_CONTEXT_WINDOW,
-	MIN_MODEL_CONTEXT_WINDOW,
-	normalizeModelContextWindowOverrides,
-} from "@shared/model-context-window";
-import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -522,13 +517,6 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.preprocess(
-					normalizeModelContextWindowOverrides,
-					z.record(
-						z.string(),
-						z.number().int().min(MIN_MODEL_CONTEXT_WINDOW).max(MAX_MODEL_CONTEXT_WINDOW),
-					),
-				),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),
@@ -1219,7 +1207,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
-	// (summaryModel, hiddenModels, modelContextWindows, customModels) that reference stale models.
+	// (summaryModel, hiddenModels, provider-model overrides, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
 	const removedProviderGroups = [
 		{ ids: removedCustomApiIds, providers: prev.customApiProviders },

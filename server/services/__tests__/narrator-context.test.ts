@@ -325,12 +325,8 @@ describe("question inputs in actual summary provider requests", () => {
 	});
 });
 
-/** A provider-page working window, held where production holds it: a catalog binding. */
+/** A provider entry's own working window, held where production holds it: the catalog. */
 function catalogWithWindow(model: string, window: number) {
-	const [providerId, upstreamModelId] = [
-		model.slice(0, model.indexOf(":")),
-		model.slice(model.indexOf(":") + 1),
-	];
 	return {
 		schemaVersion: 2 as const,
 		migrationVersion: 2 as const,
@@ -338,14 +334,7 @@ function catalogWithWindow(model: string, window: number) {
 		pinnedVersion: null,
 		local: {
 			revision: 0,
-			bindings: [
-				{
-					id: `legacy-window:${model}`,
-					providerId,
-					upstreamModelId,
-					overrides: { working_context_tokens: window },
-				},
-			],
+			connections: { [model]: { working_context_tokens: window } },
 		},
 	};
 }

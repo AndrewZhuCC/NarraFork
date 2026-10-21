@@ -13,26 +13,28 @@ import { resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { decimalValue, type ModelCard, type RawMetadata } from "@shared/model-catalog/card";
 import {
+	isConnectionKey,
 	type ModelCardMutation,
 	mutateRawLocal,
 	normalizeRawLocalState,
+	patchLocalCardMetadata,
 } from "@shared/model-catalog/card-local";
 import { createModelCardResolver } from "@shared/model-catalog/card-resolver";
 import { type ModelProfile, modelProfile } from "@shared/model-catalog/profile";
 import type { CatalogUpdateStatus, ModelCardSnapshot } from "@shared/model-catalog/schema/api";
 import type {
 	ModelQuery,
-	RawBinding,
 	RawCatalog,
 	RawLocalState,
 	RawModel,
 } from "@shared/model-catalog/schema/catalog";
-import { createModelIdentityResolver } from "@shared/model-catalog/src/index";
-import { normalizeModelContextWindowOverrides } from "@shared/model-context-window";
+import {
+	isValidModelContextWindow,
+	normalizeModelContextWindowOverrides,
+} from "@shared/model-context-window";
 import { logger } from "../logger";
 import { getNarraforkHome } from "../narrafork-home";
 import { resolveNugModelMeta } from "../nug-model-cache";
-import { normalizeModelContextWindows } from "../settings/model-context-windows";
 import type { NarraForkSettings } from "../settings/types";
 import { sanitizeCatalogErrorText } from "./error-text";
 import {
@@ -41,6 +43,7 @@ import {
 	legacyCardMetadata,
 	legacyLocalToRaw,
 	legacyMetadataToRaw,
+	liftWindowBindings,
 } from "./legacy-v1";
 import {
 	CATALOG_ARCHIVE_BASE,
@@ -180,108 +183,40 @@ export function queryForModel(
 // Settings: decode once on every load (startup and hot reload alike)
 // ---------------------------------------------------------------------------
 
-/** Window overrides the provider settings page edits, keyed by full model id. */
-const LEGACY_WINDOW_PREFIX = "legacy-window:";
 const WORKING_WINDOW = "working_context_tokens";
 
-/**
- * `agent.modelContextWindows` is a view, not a store: it lists the working windows held
- * by the provider page's bindings. It is recomputed from the catalog whenever the local
- * layer changes and is never written to settings.json.
- */
-export function legacyWindowProjection(local: RawLocalState): Record<string, number> {
-	const windows: Record<string, number> = {};
-	for (const binding of local.bindings ?? []) {
-		if (!binding.id.startsWith(LEGACY_WINDOW_PREFIX)) continue;
-		const value = binding.overrides?.[WORKING_WINDOW];
-		if (typeof value === "number" && Number.isSafeInteger(value) && value > 0)
-			windows[binding.id.slice(LEGACY_WINDOW_PREFIX.length)] = value;
-	}
-	return windows;
-}
-function refreshWindowProjection(settings: NarraForkSettings): void {
-	const cfg = settings.agent.modelCatalog;
-	if (cfg) settings.agent.modelContextWindows = legacyWindowProjection(cfg.local);
+/** Set one provider entry's working window, or clear it with null. Returns a new state. */
+function withConnectionWindow(
+	local: RawLocalState,
+	model: string,
+	value: number | null,
+): RawLocalState {
+	return patchLocalCardMetadata(
+		active,
+		local,
+		"connection",
+		model.trim(),
+		value === null ? { reset: [WORKING_WINDOW] } : { set: { [WORKING_WINDOW]: value } },
+	);
 }
 
 /**
- * Write provider-page window edits into their bindings. Only keys whose value differs
- * from the catalog's own projection are touched, so values the catalog editor changed or
- * reset are never replayed from a stale copy. Returns the new local layer, or the same
- * object when nothing changed.
+ * The per-model window map older builds kept at `agent.modelContextWindows`. It is no
+ * longer part of the settings type; a file written before this version may carry it.
  */
-function applyWindowEdits(
-	settings: NarraForkSettings,
-	local: RawLocalState,
-	input: Record<string, number>,
-	options: {
-		removeMissing: boolean;
-		/** The view the edited map was taken from, when it is older than `local`. */
-		baseline?: Record<string, number>;
-	},
-): RawLocalState {
-	const windows = normalizeModelContextWindowOverrides(input);
-	const baseline = options.baseline ?? legacyWindowProjection(local);
-	const changed = [...new Set([...Object.keys(baseline), ...Object.keys(windows)])].filter(
-		(key) =>
-			baseline[key] !== windows[key] && (options.removeMissing || windows[key] !== undefined),
-	);
-	if (!changed.length) return local;
-	const next = normalizeRawLocalState(local);
-	next.bindings ??= [];
-	const identify = createModelIdentityResolver(active, { ...next, bindings: [] });
-	for (const model of changed) {
-		const id = `${LEGACY_WINDOW_PREFIX}${model}`;
-		const value = windows[model];
-		let binding: RawBinding | undefined = next.bindings.find((b) => b.id === id);
-		if (value === undefined) {
-			if (!binding) continue;
-			const { [WORKING_WINDOW]: _removed, ...rest } = binding.overrides ?? {};
-			if (Object.keys(rest).length) binding.overrides = rest;
-			else next.bindings = next.bindings.filter((b) => b.id !== id);
-		} else {
-			if (!Number.isSafeInteger(value) || value <= 0)
-				throw new Error("Context window must be a positive integer");
-			if (!binding) {
-				const { query } = queryForModel(model, settings);
-				// Another binding for this connection already carries its identity; the
-				// window composes with it and must not assert a second one.
-				const shared = next.bindings.some(
-					(b) =>
-						b.upstreamModelId === query.upstreamModelId &&
-						b.providerId === query.providerId &&
-						b.channelId === query.channelId,
-				);
-				let identity: ReturnType<typeof identify> | undefined;
-				if (!shared)
-					try {
-						identity = identify(query);
-					} catch {
-						/* An ambiguous identity stays an unbound connection override. */
-					}
-				binding = {
-					id,
-					providerId: query.providerId,
-					channelId: query.channelId,
-					upstreamModelId: query.upstreamModelId,
-					// A window override must not upgrade a weak match to an exact identity.
-					...((identity?.matchedVia === "exact" || identity?.matchedVia === "alias") && {
-						modelId: identity.modelId,
-						variantId: identity.variantId,
-					}),
-				};
-				for (const key of Object.keys(binding) as Array<keyof typeof binding>)
-					if (binding[key] === undefined) delete binding[key];
-				next.bindings.push(binding);
-			}
-			binding.overrides = { ...binding.overrides, [WORKING_WINDOW]: value };
-		}
-		const origins = next.legacyFields?.[`binding:${id}`];
-		if (origins) {
-			const kept = origins.filter((path) => path !== WORKING_WINDOW);
-			if (kept.length) next.legacyFields![`binding:${id}`] = kept;
-			else delete next.legacyFields![`binding:${id}`];
-		}
+function storedWindowMap(settings: NarraForkSettings): unknown {
+	return (settings.agent as { modelContextWindows?: unknown }).modelContextWindows;
+}
+
+/** Each entry of an old window map becomes its provider entry's working window. */
+function importWindowMap(local: RawLocalState, input: unknown, legacy: boolean): RawLocalState {
+	let next = local;
+	for (const [model, value] of Object.entries(normalizeModelContextWindowOverrides(input))) {
+		const key = model.trim();
+		if (!isConnectionKey(key)) continue;
+		next = withConnectionWindow(next, key, value);
+		if (legacy)
+			next.legacyFields = { ...next.legacyFields, [`connection:${key}`]: [WORKING_WINDOW] };
 	}
 	return next;
 }
@@ -296,7 +231,7 @@ function backupLegacyCatalog(stored: unknown): void {
 function importPreCatalogSettings(settings: NarraForkSettings): ModelCatalogSettings {
 	const legacyArchive = {
 		modelCards: structuredClone((settings.agent.modelCards ?? []) as LegacyModelCard[]),
-		modelContextWindows: structuredClone(settings.agent.modelContextWindows ?? {}),
+		modelContextWindows: normalizeModelContextWindowOverrides(storedWindowMap(settings)),
 		pricingOverrides: structuredClone(settings.pricing?.overrides ?? {}),
 	};
 	const backup = resolve(directory, "legacy-settings-backup.json");
@@ -400,16 +335,12 @@ function importPreCatalogSettings(settings: NarraForkSettings): ModelCatalogSett
 	}
 	for (const model of local.models ?? [])
 		for (const key of ["name", "family", "notes"] as const) if (!model[key]) delete model[key];
-	let imported = normalizeRawLocalState(local);
-	imported = applyWindowEdits(settings, imported, legacyArchive.modelContextWindows, {
-		removeMissing: false,
-	});
-	// Window bindings imported from the archive keep their legacy provenance.
-	for (const key of Object.keys(legacyArchive.modelContextWindows)) {
-		const id = `binding:${LEGACY_WINDOW_PREFIX}${key}`;
-		if (imported.bindings?.some((b) => `binding:${b.id}` === id))
-			imported.legacyFields = { ...imported.legacyFields, [id]: [WORKING_WINDOW] };
-	}
+	// Windows imported from the archive keep their legacy provenance.
+	const imported = importWindowMap(
+		normalizeRawLocalState(local),
+		legacyArchive.modelContextWindows,
+		true,
+	);
 	return {
 		schemaVersion: 2,
 		migrationVersion: 2,
@@ -435,6 +366,7 @@ export function normalizeModelCatalogSettings(settings: NarraForkSettings): bool
 	let changed = false;
 	if (!stored) {
 		settings.agent.modelCatalog = importPreCatalogSettings(settings);
+		delete (settings.agent as { modelContextWindows?: unknown }).modelContextWindows;
 		changed = true;
 	} else if (stored.schemaVersion === 1) {
 		backupLegacyCatalog(stored);
@@ -456,19 +388,21 @@ export function normalizeModelCatalogSettings(settings: NarraForkSettings): bool
 		if (stored.migrationVersion !== 2) changed = true;
 	} else throw new Error("Unsupported model catalog storage schema; refusing downgrade");
 	const cfg = settings.agent.modelCatalog!;
+	// Builds before provider-model overrides stored provider-page windows as bindings.
+	const lifted = liftWindowBindings(cfg.local);
+	if (lifted !== cfg.local) {
+		cfg.local = { ...lifted, revision: cfg.local.revision + 1 };
+		changed = true;
+	}
 	validateLocal(cfg.local);
-	// A pre-projection settings file still carries the provider page's window map. Where
-	// it disagrees with the bindings, the map is what the page showed the user, so it is
-	// applied once. Absent keys are left alone: absence is never evidence of a deletion.
-	normalizeModelContextWindows(settings);
-	const windows = settings.agent.modelContextWindows ?? {};
-	if (Object.keys(windows).length) {
+	// A file from a build that kept the window map beside the catalog: where the two
+	// disagree the map is what the page showed the user, so it is applied once. Absent
+	// keys are left alone: absence is never evidence of a deletion.
+	if (storedWindowMap(settings) !== undefined) {
 		// Importing the old map is best effort: it must never stop the server from starting.
 		try {
-			const next = applyWindowEdits(settings, cfg.local, windows, {
-				removeMissing: false,
-			});
-			if (next !== cfg.local) {
+			const next = importWindowMap(cfg.local, storedWindowMap(settings), false);
+			if (!isDeepStrictEqual(normalizeRawLocalState(cfg.local), next)) {
 				validateLocal(next);
 				cfg.local = { ...next, revision: cfg.local.revision + 1 };
 			}
@@ -477,50 +411,96 @@ export function normalizeModelCatalogSettings(settings: NarraForkSettings): bool
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		delete (settings.agent as { modelContextWindows?: unknown }).modelContextWindows;
 		changed = true;
 	}
-	refreshWindowProjection(settings);
 	return changed;
 }
 
-/** The settings document as it is written to disk: the window view is derived, never stored. */
-export function settingsForDisk(value: NarraForkSettings): NarraForkSettings {
-	if (!value.agent.modelCatalog) return value;
-	const { modelContextWindows: _derived, ...agent } = value.agent;
-	return { ...value, agent: agent as NarraForkSettings["agent"] };
+/**
+ * Called on every settings save. The catalog has its own revisioned writers; a document
+ * assembled without it (e.g. from defaults) or copied before a catalog edit landed must
+ * not erase or roll it back.
+ */
+export function keepLatestCatalog(nextSettings: NarraForkSettings): void {
+	const current = settingsRef?.agent.modelCatalog;
+	const cfg = nextSettings.agent.modelCatalog;
+	if (current && (!cfg || (cfg !== current && cfg.local.revision < current.local.revision)))
+		nextSettings.agent.modelCatalog = current;
+	delete (nextSettings.agent as { modelContextWindows?: unknown }).modelContextWindows;
+}
+
+/** Store a new local layer into a settings document (live or draft), bumping its revision. */
+function storeLocal(settings: NarraForkSettings, next: RawLocalState): void {
+	const cfg = settings.agent.modelCatalog;
+	if (!cfg) return;
+	validateLocal(next);
+	settings.agent.modelCatalog = { ...cfg, local: { ...next, revision: cfg.local.revision + 1 } };
 }
 
 /**
- * Called on every settings save: provider-page window edits become binding edits in the
- * same document before it is written. The window view is then recomputed from the result.
+ * Rename or drop provider entries' own overrides, e.g. when a provider prefix changes or
+ * its models disappear. `rename` returns the new model value, or null to drop the entry.
+ * Writes into `settings`, which may be a draft. Throws when two entries would land on one
+ * key with different values.
  */
-export function applyWindowSettings(nextSettings: NarraForkSettings): void {
-	normalizeModelContextWindows(nextSettings);
-	const current = settingsRef?.agent.modelCatalog;
-	let cfg = nextSettings.agent.modelCatalog;
-	// What the edited map was derived from; edits are the differences from it.
-	const baseline = cfg ? legacyWindowProjection(cfg.local) : undefined;
-	// A document assembled without the catalog (e.g. from defaults), or copied before a
-	// catalog edit landed, must not erase or roll back the live catalog.
-	if (current && (!cfg || (cfg !== current && cfg.local.revision < current.local.revision))) {
-		cfg = current;
-		nextSettings.agent.modelCatalog = current;
+export function rewriteConnectionOverrides(
+	settings: NarraForkSettings,
+	rename: (model: string) => string | null,
+): boolean {
+	const local = settings.agent.modelCatalog?.local;
+	if (!local?.connections) return false;
+	const connections: Record<string, RawMetadata> = {};
+	const origins: Record<string, string> = {};
+	const legacyFields = { ...local.legacyFields };
+	let changed = false;
+	for (const [model, metadata] of Object.entries(local.connections)) {
+		const target = rename(model);
+		const provenance = legacyFields[`connection:${model}`];
+		if (target === model) {
+			if (connections[target] && !isDeepStrictEqual(connections[target], metadata))
+				throw new Error(
+					`Provider model overrides for "${origins[target]}" and "${model}" would both become "${target}"`,
+				);
+			connections[target] = metadata;
+			origins[target] = model;
+			continue;
+		}
+		changed = true;
+		delete legacyFields[`connection:${model}`];
+		if (target === null) continue;
+		if (connections[target] && !isDeepStrictEqual(connections[target], metadata))
+			throw new Error(
+				`Provider model overrides for "${origins[target]}" and "${model}" would both become "${target}"`,
+			);
+		connections[target] = metadata;
+		origins[target] = model;
+		if (provenance) legacyFields[`connection:${target}`] = provenance;
 	}
-	if (!cfg) return;
-	const next = applyWindowEdits(
-		nextSettings,
-		cfg.local,
-		nextSettings.agent.modelContextWindows ?? {},
-		{ removeMissing: true, ...(baseline ? { baseline } : {}) },
-	);
-	if (next !== cfg.local) {
-		validateLocal(next);
-		nextSettings.agent.modelCatalog = {
-			...cfg,
-			local: { ...next, revision: cfg.local.revision + 1 },
-		};
+	if (!changed) return false;
+	storeLocal(settings, normalizeRawLocalState({ ...local, connections, legacyFields }));
+	return true;
+}
+
+/**
+ * Give provider entries a discovered window where they have none of their own (providers
+ * whose listing reports one but which have no discovered-metadata channel).
+ */
+export function fillConnectionWindows(
+	settings: NarraForkSettings,
+	windows: Record<string, number>,
+): boolean {
+	const cfg = settings.agent.modelCatalog;
+	if (!cfg) return false;
+	let next = cfg.local;
+	for (const [model, value] of Object.entries(normalizeModelContextWindowOverrides(windows))) {
+		if (!isConnectionKey(model) || next.connections?.[model]?.[WORKING_WINDOW] !== undefined)
+			continue;
+		next = withConnectionWindow(next, model, value);
 	}
-	refreshWindowProjection(nextSettings);
+	if (next === cfg.local) return false;
+	storeLocal(settings, next);
+	return true;
 }
 
 export function bindModelCatalogSettings(settings: NarraForkSettings, save: () => void): void {
@@ -536,17 +516,15 @@ function state(): ModelCatalogSettings {
 export function isModelCatalogBound(): boolean {
 	return !!settingsRef?.agent.modelCatalog;
 }
-/** Replace the local layer, keep the window view in step, persist, and roll back on failure. */
+/** Replace the local layer, persist, and roll back on failure. */
 function commitLocal(next: RawLocalState): void {
 	const cfg = state();
 	const previous = cfg.local;
 	cfg.local = next;
-	if (settingsRef) refreshWindowProjection(settingsRef);
 	try {
 		persistSettings?.();
 	} catch (error) {
 		cfg.local = previous;
-		if (settingsRef) refreshWindowProjection(settingsRef);
 		throw error;
 	}
 }
@@ -582,6 +560,11 @@ function cardResolver(catalog: RawCatalog, local: RawLocalState) {
 	return cardResolverCache.resolve;
 }
 const rejectedDiscoveries = new Set<string>();
+/**
+ * `model` is the full model value the query came from. That provider entry's own
+ * overrides apply by that name, not by whichever selector it resolves to today (gateway
+ * caches and provider configs change).
+ */
 export function resolveEffectiveModelCard(
 	query: ModelQuery,
 	discovered?: RawMetadata,
@@ -591,11 +574,8 @@ export function resolveEffectiveModelCard(
 	const catalog = scope?.catalog ?? active;
 	const local = scope?.local ?? settingsRef?.agent.modelCatalog?.local ?? { revision: 0 };
 	const card = cardResolver(catalog, local);
-	// A provider-page window belongs to the model value the page showed, not to whichever
-	// selector that value resolved to when it was saved (gateway caches and provider
-	// configs change), so it is attached by name.
-	const options = model ? { attach: [`${LEGACY_WINDOW_PREFIX}${model.trim()}`] } : {};
-	const resolve = (input?: RawMetadata) => card(query, input, undefined, options);
+	const connection = model?.trim();
+	const resolve = (input?: RawMetadata) => card(query, input, undefined, connection);
 	if (discovered === undefined) return resolve();
 	try {
 		return resolve(discovered);
@@ -613,11 +593,15 @@ export function resolveEffectiveModelCard(
 		return resolve();
 	}
 }
-/** One resolution per model and request snapshot. Callers must not mutate the result. */
-function effectiveCard(model: string): { card: ModelCard; query: ModelQuery } {
-	const cache = requestSnapshots.getStore()?.cards;
+/**
+ * One resolution per model and request snapshot. Callers must not mutate the result.
+ * `own: false` resolves without the provider entry's own overrides: what it inherits.
+ */
+function effectiveCard(model: string, own = true): { card: ModelCard; query: ModelQuery } {
+	const cache = own ? requestSnapshots.getStore()?.cards : undefined;
 	const { query, discovered } = queryForModel(model);
-	const card = cache?.get(model) ?? resolveEffectiveModelCard(query, discovered, model);
+	const card =
+		cache?.get(model) ?? resolveEffectiveModelCard(query, discovered, own ? model : undefined);
 	cache?.set(model, card);
 	return { card, query };
 }
@@ -628,10 +612,105 @@ export function getEffectiveModelCard(model: string): ModelCard & { resolvedQuer
 /** Typed runtime reads for a full model id (`provider:model`); `card` is read-only. */
 export function getEffectiveModelProfile(
 	model: string,
+	options: { own?: boolean } = {},
 ): ModelProfile & { card: Readonly<ModelCard> } {
-	const { card } = effectiveCard(model);
+	const { card } = effectiveCard(model, options.own ?? true);
 	return { ...modelProfile(card), card };
 }
+
+const positiveInteger = (value: unknown): number | undefined =>
+	typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+/** The model-wide working window the user set for a catalog or local model, if any. */
+function modelWideWindow(local: RawLocalState, modelId: string): number | undefined {
+	return positiveInteger(
+		local.models?.find((m) => m.id === modelId)?.metadata[WORKING_WINDOW] ??
+			local.overrides?.find((o) => o.target === "model" && o.targetId === modelId)?.metadata[
+				WORKING_WINDOW
+			],
+	);
+}
+
+/** The two places a working window can be set for a provider entry, as the editor shows them. */
+export interface ModelWindowScopes {
+	/** This provider entry's own working window. */
+	own?: number;
+	/**
+	 * The catalog model a model-wide window targets. Absent when the entry matches no
+	 * model, or only by prefix/suffix (a model-wide value may not reach it).
+	 */
+	modelId?: string;
+	/** The model-wide working window, when one is set. */
+	modelWide?: number;
+	/** Other provider entries of the same model that set their own window. */
+	others: Array<{ model: string; contextWindow: number }>;
+}
+/** Which catalog model each provider entry with its own window resolves to. */
+export function connectionModelIds(): Map<string, string | undefined> {
+	const ids = new Map<string, string | undefined>();
+	for (const [model, metadata] of Object.entries(state().local.connections ?? {})) {
+		if (positiveInteger(metadata[WORKING_WINDOW]) === undefined) continue;
+		try {
+			ids.set(model, effectiveCard(model, false).card.modelId);
+		} catch {
+			/* An entry that no longer resolves cannot shadow any model. */
+			ids.set(model, undefined);
+		}
+	}
+	return ids;
+}
+export function getModelWindowScopes(
+	model: string,
+	connections = connectionModelIds(),
+): ModelWindowScopes {
+	const key = model.trim();
+	const local = state().local;
+	const card = effectiveCard(key).card;
+	const strong =
+		card.modelId !== undefined && card.matchedVia !== "prefix" && card.matchedVia !== "suffix";
+	const scopes: ModelWindowScopes = { others: [] };
+	const own = positiveInteger(local.connections?.[key]?.[WORKING_WINDOW]);
+	if (own !== undefined) scopes.own = own;
+	if (!strong || !card.modelId) return scopes;
+	scopes.modelId = card.modelId;
+	const wide = modelWideWindow(local, card.modelId);
+	if (wide !== undefined) scopes.modelWide = wide;
+	for (const [other, modelId] of connections) {
+		const value = positiveInteger(local.connections?.[other]?.[WORKING_WINDOW]);
+		if (other !== key && value !== undefined && modelId === card.modelId)
+			scopes.others.push({ model: other, contextWindow: value });
+	}
+	return scopes;
+}
+
+/**
+ * Set a working window in one scope: a provider entry's own (`connection`, keyed by its
+ * model value) or model-wide (`model`, keyed by catalog id). `null` clears it.
+ */
+export function setModelWindow(input: {
+	baseRevision: number;
+	scope: "connection" | "model";
+	target: string;
+	contextWindow: number | null;
+}): ModelCardSnapshot {
+	const { contextWindow } = input;
+	if (
+		contextWindow !== null &&
+		(!Number.isSafeInteger(contextWindow) || !isValidModelContextWindow(contextWindow))
+	)
+		throw new Error("Context window is out of range");
+	if (input.scope !== "connection" && input.scope !== "model") throw new Error("Invalid scope");
+	return mutateModelCard({
+		baseRevision: input.baseRevision,
+		action: "patch",
+		target: input.scope,
+		targetId: input.target,
+		patch:
+			contextWindow === null
+				? { reset: [WORKING_WINDOW] }
+				: { set: { [WORKING_WINDOW]: contextWindow } },
+	});
+}
+
 /** Immutable request-local snapshot, including local overlays. */
 export function withModelMetadataSnapshot<T>(work: () => T): T {
 	// Nested request trackers keep the iterator's already captured snapshot.
@@ -821,6 +900,9 @@ function protectedFieldCount(next: RawCatalog, local: RawLocalState): number {
 	}
 	protectedCountCache = { active, next, local, revision: local.revision, count };
 	return count;
+}
+export function getModelCatalogRevision(): number {
+	return state().local.revision;
 }
 export function getModelCardSnapshot(): ModelCardSnapshot {
 	const started = performance.now();
@@ -1082,7 +1164,6 @@ function activate(next: RawCatalog): ModelCardSnapshot {
 		history = previous.history;
 		pending = previous.pending;
 		cfg.local = previous.local;
-		if (settingsRef) refreshWindowProjection(settingsRef);
 		try {
 			saveCache();
 		} catch {

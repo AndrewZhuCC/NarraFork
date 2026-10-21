@@ -5,10 +5,8 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { normalizeModelContextWindowOverrides } from "@shared/model-context-window";
 import { Hono } from "hono";
-import { legacyWindowProjection } from "../../../server/lib/model-catalog";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import { getDefaults, reloadSettings, saveSettings, settings } from "../../../server/lib/settings";
-import { normalizeModelContextWindows } from "../../../server/lib/settings/model-context-windows";
 import { settingsRoutes, updateSettingsSchema } from "../../../server/routes/settings";
 
 const snapshot = structuredClone(settings);
@@ -26,11 +24,21 @@ app.use("*", async (c, next) => {
 });
 app.onError((error, c) => c.json({ error: error.message }, 400));
 app.route("/settings", settingsRoutes);
-/** The windows settings.json holds: in the catalog's bindings, never as a separate map. */
+/** Provider entries' own working windows in a catalog local layer. */
+function ownWindows(local: { connections?: Record<string, Record<string, unknown>> }) {
+	return Object.fromEntries(
+		Object.entries(local.connections ?? {}).flatMap(([model, metadata]) =>
+			typeof metadata.working_context_tokens === "number"
+				? [[model, metadata.working_context_tokens]]
+				: [],
+		),
+	);
+}
+/** The windows settings.json holds: in the catalog, never as a separate map. */
 function diskWindows() {
 	const disk = JSON.parse(readFileSync(settingsPath, "utf8"));
 	expect(disk.agent.modelContextWindows).toBeUndefined();
-	return legacyWindowProjection(disk.agent.modelCatalog.local);
+	return ownWindows(disk.agent.modelCatalog.local);
 }
 function patch(windows: unknown) {
 	return app.request("/settings", {
@@ -50,7 +58,9 @@ async function coldStartContextWindows(home: string, models: string[]) {
 			`const { settings } = await import(${JSON.stringify(settingsModule)});
 			const { modelTokenBudgets } = await import(${JSON.stringify(budgetsModule)});
 			console.log("COLD_START_RESULT=" + JSON.stringify({
-				windows: settings.agent.modelContextWindows,
+				map: settings.agent.modelContextWindows ?? null,
+				connections: settings.agent.modelCatalog.local.connections ?? {},
+				bindings: (settings.agent.modelCatalog.local.bindings ?? []).map((b) => b.id),
 				budgets: Object.fromEntries(${JSON.stringify(models)}.map(model => [model, modelTokenBudgets(model)])),
 			}));`,
 		],
@@ -166,11 +176,13 @@ describe("context-window cold-start import", () => {
 					}),
 				);
 				const first = await coldStartContextWindows(home, Object.keys(windows));
-				// Where the stored map and a binding disagree, the map is what the provider
-				// page showed (older builds dropped page edits after a hot reload), so it is
-				// applied once. A key the map lacks is not a deletion: its binding stays and
-				// the page now shows it. Afterwards the map is a view of the bindings.
-				expect(first.windows).toEqual({
+				// Old window bindings become provider entries' own windows. Where the stored
+				// map and a binding disagree, the map is what the provider page showed (older
+				// builds dropped page edits after a hot reload), so it is applied once. A key
+				// the map lacks is not a deletion: its binding's value stays.
+				expect(first.map).toBeNull();
+				expect(first.bindings).toEqual([]);
+				expect(ownWindows(first)).toEqual({
 					"openai:cold-large": 10_000_000,
 					"openai:cold-small": 256,
 					"openai:cold-invalid": 64_000,
@@ -187,7 +199,8 @@ describe("context-window cold-start import", () => {
 				const persisted = readFileSync(path, "utf8");
 				const disk = JSON.parse(persisted);
 				expect(disk.agent.modelContextWindows).toBeUndefined();
-				expect(legacyWindowProjection(disk.agent.modelCatalog.local)).toEqual(first.windows);
+				expect(ownWindows(disk.agent.modelCatalog.local)).toEqual(ownWindows(first));
+				expect(JSON.stringify(disk.agent.modelCatalog)).not.toContain("legacy-window:");
 				expect(disk.agent.modelCatalog.schemaVersion).toBe(2);
 				expect(JSON.stringify(disk.agent.modelCatalog)).not.toContain("limits.contextWindow");
 				const second = await coldStartContextWindows(home, Object.keys(windows));
@@ -236,71 +249,36 @@ describe("context-window automatic normalization", () => {
 		expect(input.tooBig).toBe(20_000_000);
 	});
 
-	it("normalizes all request values rather than rejecting new or edited overrides", () => {
-		const parsed = updateSettingsSchema.parse({ agent: { modelContextWindows: input } });
-		expect(parsed.agent?.modelContextWindows).toEqual(expected);
-		for (const value of [null, [], "invalid", 100]) {
-			expect(
-				updateSettingsSchema.parse({ agent: { modelContextWindows: value } }).agent
-					?.modelContextWindows,
-			).toEqual({});
-		}
-		// Unrelated patches must not clear an omitted override map.
-		expect(
-			updateSettingsSchema.parse({ agent: { providerOrder: ["test"] } }).agent,
-		).not.toHaveProperty("modelContextWindows");
-	});
-
 	it("migrates stored values and preserves models absent from the current list", () => {
 		const raw = getDefaults();
-		raw.agent.modelContextWindows = { "retired:large": 20_000_000, "offline:valid": 128_000 };
+		(raw.agent as Record<string, unknown>).modelContextWindows = {
+			"retired:large": 20_000_000,
+			"offline:valid": 128_000,
+		};
 		writeFileSync(settingsPath, JSON.stringify(raw));
 		const loaded = reloadSettings();
 		const result = { "retired:large": 10_000_000, "offline:valid": 128_000 };
-		expect(loaded.agent.modelContextWindows).toEqual(result);
+		expect(loaded.agent).not.toHaveProperty("modelContextWindows");
+		expect(ownWindows(loaded.agent.modelCatalog!.local)).toEqual(result);
 		expect(diskWindows()).toEqual(result);
-		expect(normalizeModelContextWindows(loaded)).toBe(false);
 	});
 
-	it("saves new and edited invalid values and returns the normalized result to the page", async () => {
-		settings.agent.modelContextWindows = { tooBig: 128_000 };
+	it("a settings PATCH no longer writes windows; the map from an old page is ignored", async () => {
+		const before = ownWindows(settings.agent.modelCatalog!.local);
 		const response = await patch(input);
 		expect(response.status).toBe(200);
 		const body = await response.json();
-		expect(body.agent.modelContextWindows).toEqual(expected);
-		expect(settings.agent.modelContextWindows).toEqual(expected);
+		expect(body.agent).not.toHaveProperty("modelContextWindows");
 		expect(settings.agent.providerOrder).toEqual(["test"]);
-		expect(diskWindows()).toEqual(expected);
-		const again = await patch(expected);
-		expect(again.status).toBe(200);
-		expect(settings.agent.modelContextWindows).toEqual(expected);
+		expect(ownWindows(settings.agent.modelCatalog!.local)).toEqual(before);
+		expect(updateSettingsSchema.parse({ agent: { modelContextWindows: input } }).agent).toEqual({});
 	});
 
-	it("saves an old page replay without requiring historical-value tracking", async () => {
-		settings.agent.modelContextWindows = {};
-		const response = await patch({ "retired:large": 99_000_000 });
-		expect(response.status).toBe(200);
-		expect(settings.agent.modelContextWindows).toEqual({ "retired:large": 10_000_000 });
-	});
-
-	it("repairs malformed maps without blocking unrelated changes", async () => {
-		for (const value of [null, [], "invalid", 100]) {
-			const response = await patch(value);
-			expect(response.status).toBe(200);
-			expect(settings.agent.modelContextWindows).toEqual({});
-		}
-	});
-
-	it("also normalizes internal writes before persistence", () => {
+	it("internal writes never store a window map beside the catalog", () => {
 		const local = getDefaults();
-		local.agent.modelContextWindows = {
-			"discovered:large": 99_000_000,
-			"discovered:good": 4096,
-			invalid: -1,
-		};
+		(local.agent as Record<string, unknown>).modelContextWindows = { "discovered:good": 4096 };
 		saveSettings(local);
-		const result = { "discovered:large": 10_000_000, "discovered:good": 4096 };
-		expect(settings.agent.modelContextWindows).toEqual(result);
-		expect(diskWindows()).toEqual(result);
+		expect(settings.agent).not.toHaveProperty("modelContextWindows");
+		expect(diskWindows()["discovered:good"]).toBeUndefined();
 	});
 });

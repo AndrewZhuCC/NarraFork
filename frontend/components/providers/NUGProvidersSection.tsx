@@ -5,7 +5,6 @@ import {
 	Divider,
 	Group,
 	Modal,
-	NumberInput,
 	Paper,
 	PasswordInput,
 	Progress,
@@ -34,6 +33,7 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { modelCatalogKeys } from "../../hooks/useModelCatalog";
 import {
 	useProviderModelRefreshCapability,
 	useProviderQuotaCapability,
@@ -45,6 +45,7 @@ import { formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import type { ProxyOverride } from "../../lib/proxy";
 import { extractPrimaryDomainLabel } from "../../lib/url";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
+import { ContextWindowField } from "./ContextWindowField";
 import type { ChannelHealth } from "./channel-health";
 import { channelHealthKey, normalizeChannelHealth } from "./channel-health";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -118,9 +119,6 @@ interface NUGProvidersSectionProps {
 	providerModelsMap: Record<string, ModelOption[]>;
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
-	modelContextWindows: Record<string, number>;
-	onContextWindowChange: (modelVal: string, size: number | null) => void;
-	onMergeContextWindows?: (windows: Record<string, number>) => void;
 	isProviderDirty?: (providerId: string) => boolean;
 	onSaveBeforeRefresh?: () => Promise<boolean>;
 	onSaveBeforeNugAction?: () => Promise<boolean>;
@@ -827,9 +825,6 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 	providerModelsMap,
 	hiddenModels,
 	onToggleHidden,
-	modelContextWindows,
-	onContextWindowChange,
-	onMergeContextWindows,
 	isProviderDirty,
 	onSaveBeforeRefresh,
 	onSaveBeforeNugAction,
@@ -993,10 +988,11 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 			}
 			setRefreshingProvider(providerId);
 			try {
-				const result = await api.nugRefreshProviderModels(providerId);
-				if (result.modelContextWindows) onMergeContextWindows?.(result.modelContextWindows);
+				await api.nugRefreshProviderModels(providerId);
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
+				// Gateway metadata feeds the windows provider rows show.
+				qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 			} catch (err) {
 				notifications.show({
 					color: "red",
@@ -1007,14 +1003,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 				setRefreshingProvider(null);
 			}
 		},
-		[
-			canRefreshNugProviderModels,
-			qc,
-			t,
-			isProviderDirty,
-			onSaveBeforeRefresh,
-			onMergeContextWindows,
-		],
+		[canRefreshNugProviderModels, qc, t, isProviderDirty, onSaveBeforeRefresh],
 	);
 
 	const handleLoginSuccess = useCallback(
@@ -1314,18 +1303,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 													disabled
 													style={{ flex: 1, minWidth: 120 }}
 												/>
-												<NumberInput
-													size="xs"
-													placeholder={t("contextWindowPlaceholder")}
-													value={modelContextWindows[m.value] || ""}
-													onChange={(v) =>
-														onContextWindowChange(m.value, typeof v === "number" ? v : null)
-													}
-													min={256}
-													step={1000}
-													suffix={` ${t("contextWindowSuffix")}`}
-													w={180}
-												/>
+												<ContextWindowField modelValue={m.value} />
 												<Tooltip label={t("modelTestBtn")}>
 													<ActionIcon
 														variant="subtle"
@@ -1353,8 +1331,6 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 								onCustomModelsChange={onCustomModelsChange}
 								hiddenModels={hiddenModels}
 								onToggleHidden={onToggleHidden}
-								modelContextWindows={modelContextWindows}
-								onContextWindowChange={onContextWindowChange}
 								onTestModel={onTestModel}
 							/>
 						</Stack>

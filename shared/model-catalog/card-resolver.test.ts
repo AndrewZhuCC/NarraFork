@@ -254,64 +254,63 @@ test("canonical local scopes preserve effective values and reset the only write 
 	expect(input.models?.[0]?.metadata.input_cost_per_token).toBe(2e-6);
 });
 
-test("bindings for one connection compose; different selectors at one specificity stay ambiguous", () => {
-	const catalog = rawCatalogFromModelFiles(
-		files({ max_input_tokens: 1000, max_output_tokens: 500 }),
-		sourceVersion,
-		date,
-	);
-	const resolve = (bindings: RawLocalState["bindings"]) =>
-		createModelCardResolver(catalog, { revision: 1, bindings })({
-			upstreamModelId: "m",
-			providerId: "p",
-			channelId: "c",
+describe("provider-entry (connection) overrides", () => {
+	const catalog = () =>
+		rawCatalogFromModelFiles(files({ max_input_tokens: 128000 }), sourceVersion, date);
+	const query = { upstreamModelId: "m", providerId: "a" };
+
+	test("apply by model value above every other local layer and never assert identity", () => {
+		let local: RawLocalState = {
+			revision: 0,
+			bindings: [
+				{
+					id: "editor",
+					providerId: "a",
+					upstreamModelId: "m",
+					overrides: { working_context_tokens: 90000, max_output_tokens: 4000 },
+				},
+			],
+		};
+		local = patchLocalCardMetadata(catalog(), local, "model", "m", {
+			set: { working_context_tokens: 100000 },
 		});
-	const composed = resolve([
-		{
-			id: "legacy-window:p:m",
-			providerId: "p",
-			upstreamModelId: "m",
-			overrides: { working_context_tokens: 800 },
-		},
-		{
-			id: "editor",
-			providerId: "p",
-			upstreamModelId: "m",
-			modelId: "m",
-			overrides: { max_output_tokens: 100, working_context_tokens: 900 },
-		},
-	]);
-	expect(composed.bindingId).toBe("editor");
-	expect(composed.modelId).toBe("m");
-	expect(composed.metadata.max_output_tokens).toBe(100);
-	// The provider page's window merges last, so the page shows what is in effect.
-	expect(composed.metadata.working_context_tokens).toBe(800);
-	expect(composed.provenance.working_context_tokens?.id).toBe("legacy-window:p:m");
-	expect(() =>
-		resolve([
-			{ id: "by-provider", providerId: "p", upstreamModelId: "m" },
-			{ id: "by-channel", channelId: "c", upstreamModelId: "m" },
-		]),
-	).toThrow("Ambiguous binding");
-	expect(() =>
-		resolve([
-			{ id: "a", providerId: "p", upstreamModelId: "m", modelId: "m" },
-			{ id: "b", providerId: "p", upstreamModelId: "m", variantId: "m@p", modelId: "other" },
-		]),
-	).toThrow();
-	// An attached window applies by name even when its stored selector no longer matches.
-	const attached = createModelCardResolver(catalog, {
-		revision: 1,
-		bindings: [
-			{
-				id: "legacy-window:p:c:m",
-				upstreamModelId: "c:m",
-				overrides: { working_context_tokens: 700 },
-			},
-		],
-	})({ upstreamModelId: "m", providerId: "p", channelId: "c" }, undefined, undefined, {
-		attach: ["legacy-window:p:c:m"],
+		local = patchLocalCardMetadata(catalog(), local, "connection", "a:m", {
+			set: { working_context_tokens: 64000 },
+		});
+		const resolve = createModelCardResolver(catalog(), local);
+		const own = resolve(query, undefined, undefined, "a:m");
+		expect(own.metadata.working_context_tokens).toBe(64000);
+		expect(own.metadata.max_output_tokens).toBe(4000);
+		expect(own.provenance.working_context_tokens).toEqual({
+			layer: "local-connection",
+			id: "a:m",
+			explicit: true,
+		});
+		expect(own.bindingId).toBe("editor");
+		// Another provider entry of the same connection, or none, does not see it.
+		expect(resolve(query, undefined, undefined, "b:m").metadata.working_context_tokens).toBe(90000);
+		expect(resolve(query).metadata.working_context_tokens).toBe(90000);
 	});
-	expect(attached.metadata.working_context_tokens).toBe(700);
-	expect(attached.bindingId).toBeUndefined();
+
+	test("normalization validates keys and drops emptied entries; only delete removes one", () => {
+		expect(() =>
+			normalizeRawLocalState({
+				revision: 0,
+				connections: { " a:m": { working_context_tokens: 1 } },
+			}),
+		).toThrow("Invalid provider model key");
+		expect(() =>
+			normalizeRawLocalState({ revision: 0, connections: { "a:m": { api_key: "x" } } }),
+		).toThrow();
+		expect(
+			normalizeRawLocalState({ revision: 0, connections: { "a:m": {} } }).connections,
+		).toBeUndefined();
+		const set = patchLocalCardMetadata(catalog(), { revision: 0 }, "connection", "a:m", {
+			set: { working_context_tokens: 64000 },
+		});
+		const reset = patchLocalCardMetadata(catalog(), set, "connection", "a:m", {
+			reset: ["working_context_tokens"],
+		});
+		expect(reset.connections).toBeUndefined();
+	});
 });

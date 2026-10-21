@@ -861,7 +861,6 @@ export const miscApi = {
 			}>;
 			fromCache: boolean;
 			modelHash?: string;
-			modelContextWindows?: Record<string, number>;
 		}>(`/nug/providers/${providerId}/models/refresh`, {
 			method: "POST",
 			...pickRequestOptions(options),
@@ -877,7 +876,6 @@ export const miscApi = {
 			models: Array<{ id: string; name?: string; contextLength?: number }>;
 			count: number;
 			fromCache: boolean;
-			modelContextWindows?: Record<string, number>;
 		}>(`/gemini/providers/${providerId}/models/refresh`, {
 			method: "POST",
 			...pickRequestOptions(options),

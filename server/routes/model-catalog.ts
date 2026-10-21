@@ -15,12 +15,14 @@ import {
 	resolveEffectiveModelCard,
 	rollbackModelCatalog,
 	setModelCatalogUpdateSettings,
+	setModelWindow,
 } from "../lib/model-catalog";
 import {
 	CATALOG_IO_ERROR_BODY,
 	isHostIoError,
 	sanitizeCatalogErrorText,
 } from "../lib/model-catalog/error-text";
+import { describeModelWindows, MAX_WINDOW_MODELS } from "../lib/model-catalog/windows";
 import { requireAdmin } from "../middleware/auth";
 
 const resolveBodyLimit = bodyLimit({
@@ -69,6 +71,21 @@ modelCatalogRoutes.post("/v2/resolve", resolveBodyLimit, async (c) => {
 		throw new Error("query.upstreamModelId is required");
 	return c.json(resolveEffectiveModelCard(body.query));
 });
+/** Context windows of provider entries, with the scopes the provider page can set. */
+modelCatalogRoutes.post("/v2/windows", resolveBodyLimit, async (c) => {
+	const body = await c.req.json<{ models?: unknown }>();
+	if (
+		!Array.isArray(body.models) ||
+		body.models.length > MAX_WINDOW_MODELS ||
+		body.models.some((model) => typeof model !== "string")
+	)
+		throw new Error(`models must be an array of at most ${MAX_WINDOW_MODELS} model values`);
+	return c.json(describeModelWindows(body.models as string[]));
+});
+/** Set or clear a working window for one provider entry (`connection`) or model-wide (`model`). */
+modelCatalogRoutes.post("/v2/windows/set", requireAdmin, resolveBodyLimit, async (c) =>
+	c.json(setModelWindow(await c.req.json())),
+);
 modelCatalogRoutes.get("/export", requireAdmin, (c) => c.json(exportModelCatalogUserLayer()));
 modelCatalogRoutes.post("/v2/mutate", requireAdmin, resolveBodyLimit, async (c) =>
 	c.json(mutateModelCard(await c.req.json<ModelCardMutation>())),

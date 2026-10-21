@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { isValidModelContextWindow } from "@shared/model-context-window";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
+import { fillConnectionWindows } from "../lib/model-catalog";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
 	type GeminiProviderConfig,
@@ -375,18 +376,16 @@ export async function fetchGeminiModels(
 	return models;
 }
 
-/** Fill context window sizes into settings for a provider's fetched models. */
+/**
+ * Gemini's listing reports each model's input limit. Providers with no discovered-metadata
+ * channel record it as the provider entry's own window, where it has none yet.
+ */
 function fillContextWindows(models: GeminiModelInfo[], provider: GeminiProviderConfig): void {
-	let changed = false;
-	const windows = settings.agent.modelContextWindows ?? {};
-	settings.agent.modelContextWindows = windows;
-	for (const m of models) {
-		if (isValidModelContextWindow(m.contextLength) && !windows[`${provider.prefix}:${m.id}`]) {
+	const windows: Record<string, number> = {};
+	for (const m of models)
+		if (isValidModelContextWindow(m.contextLength))
 			windows[`${provider.prefix}:${m.id}`] = m.contextLength;
-			changed = true;
-		}
-	}
-	if (changed) saveSettings(settings);
+	if (fillConnectionWindows(settings, windows)) saveSettings(settings);
 }
 
 // === Routes ===
@@ -418,7 +417,6 @@ geminiRoutes.post("/models/refresh", async (c) => {
 		results,
 		models: getGeminiCachedModels(),
 		fromCache: false,
-		modelContextWindows: settings.agent.modelContextWindows ?? {},
 	});
 });
 
@@ -444,7 +442,6 @@ geminiRoutes.post("/providers/:id/models/refresh", async (c) => {
 			models,
 			count: models.length,
 			fromCache: false,
-			modelContextWindows: settings.agent.modelContextWindows ?? {},
 		});
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

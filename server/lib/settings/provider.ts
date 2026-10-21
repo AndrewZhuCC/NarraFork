@@ -1043,6 +1043,8 @@ export interface ModelContextWindowResolution {
 export function resolveModelContextWindow(
 	model: string,
 	provider: string,
+	/** `own: false` skips the provider entry's own window: what clearing it would leave. */
+	options: { own?: boolean } = {},
 ): ModelContextWindowResolution {
 	// Defensive: callers may pass a meta-model reference instead of a concrete
 	// model — either the follow-default sentinel or an aggregation value. When an
@@ -1062,7 +1064,7 @@ export function resolveModelContextWindow(
 		const concrete = resolveMetaModelForLookup(metaRef);
 		if (concrete && concrete !== metaRef) {
 			const parsed = parseModelId(concrete);
-			return resolveModelContextWindow(parsed.model, parsed.provider ?? "");
+			return resolveModelContextWindow(parsed.model, parsed.provider ?? "", options);
 		}
 	}
 
@@ -1075,8 +1077,15 @@ export function resolveModelContextWindow(
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
 
 	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
-		const userWindow = s().agent.modelContextWindows?.[fullModelValue];
-		if (userWindow && userWindow > 0) return { contextWindow: userWindow, source: "user" };
+		const user = getEffectiveModelProfile(fullModelValue, options);
+		if (
+			typeof user.contextWindow === "number" &&
+			user.contextWindowSource?.layer.startsWith("local-")
+		)
+			return {
+				contextWindow: user.contextWindow,
+				source: user.contextWindowSource.layer === "local-model" ? "card" : "user",
+			};
 		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
 		if (catalog && catalog.context_length > 0)
 			return { contextWindow: catalog.context_length, source: "catalog" };
@@ -1085,7 +1094,7 @@ export function resolveModelContextWindow(
 
 	const metadataModel =
 		provider && !model.startsWith(`${provider}:`) ? `${provider}:${model}` : model;
-	const profile = getEffectiveModelProfile(metadataModel);
+	const profile = getEffectiveModelProfile(metadataModel, options);
 	const window = profile.contextWindow;
 	const layer = profile.contextWindowSource?.layer;
 	// Explicit unknown blocks every lower fallback.
@@ -1093,7 +1102,12 @@ export function resolveModelContextWindow(
 	if (window !== undefined && (layer?.startsWith("local-") || layer === "discovered"))
 		return {
 			contextWindow: window,
-			source: layer === "local-binding" ? "user" : layer === "discovered" ? "catalog" : "card",
+			source:
+				layer === "local-binding" || layer === "local-connection"
+					? "user"
+					: layer === "discovered"
+						? "catalog"
+						: "card",
 		};
 	// A provider's explicit budget outranks presets, but not local model/binding
 	// decisions or the gateway's discovered window.

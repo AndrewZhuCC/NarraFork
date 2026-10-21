@@ -18,6 +18,7 @@ import {
 import { maskSecretValues } from "../lib/agent/request-dump";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "../lib/cors-origin";
 import { AppError } from "../lib/errors";
+import { rewriteConnectionOverrides } from "../lib/model-catalog";
 import { saveSettings, settings } from "../lib/settings";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
 import { registerTokenDanceRuntime } from "../lib/tokendance-runtime";
@@ -988,10 +989,7 @@ export async function deleteTokenDanceConnection(): Promise<void> {
 				agent.customModels = agent.customModels.filter((model) => !isReference(model.value));
 			if (agent.modelCards)
 				agent.modelCards = agent.modelCards.filter((card) => !isReference(card.modelKey));
-			if (agent.modelContextWindows)
-				agent.modelContextWindows = Object.fromEntries(
-					Object.entries(agent.modelContextWindows).filter(([key]) => !isReference(key)),
-				);
+			rewriteConnectionOverrides(latest, (model) => (isReference(model) ? null : model));
 			if (agent.subagentModels) {
 				for (const key of Object.keys(
 					agent.subagentModels,

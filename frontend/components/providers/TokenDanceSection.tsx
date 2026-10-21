@@ -22,7 +22,7 @@ export function TokenDanceSection({
 	onChanged,
 	onDeleted,
 	...modelListProps
-}: Omit<ModelListProps, "models" | "defaultContextWindows"> & {
+}: Omit<ModelListProps, "models"> & {
 	connection: TokenDancePublicConnection;
 	enabled: boolean;
 	onToggleEnabled: () => void;
@@ -187,9 +187,6 @@ export function TokenDanceSection({
 					value: `tokendance:${model.id}`,
 					label: model.name || model.id,
 				}))}
-				defaultContextWindows={Object.fromEntries(
-					connection.models.map((model) => [`tokendance:${model.id}`, model.context_length]),
-				)}
 			/>
 		</Stack>
 	);

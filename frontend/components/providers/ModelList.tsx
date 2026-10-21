@@ -21,9 +21,6 @@ export interface ModelListProps {
 	/** 逐模型协议覆盖（`agent.modelProtocols` 的草稿），由页面统一提交。 */
 	modelProtocols: Record<string, CustomApiProtocol>;
 	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
-	modelContextWindows: Record<string, number>;
-	defaultContextWindows?: Record<string, number>;
-	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 	showContextWindow?: boolean;
 	/** 这一列模型可选的协议。省略时是全部四种。 */
@@ -39,9 +36,6 @@ export const ModelList = React.memo(function ModelList({
 	onBatchToggleHidden,
 	modelProtocols,
 	onModelProtocolChange,
-	modelContextWindows,
-	defaultContextWindows,
-	onContextWindowChange,
 	onTestModel,
 	showContextWindow = true,
 	protocols,
@@ -118,8 +112,6 @@ export const ModelList = React.memo(function ModelList({
 					modelLabel={m.label}
 					isHidden={hiddenModels.has(m.value)}
 					onToggleHidden={() => onToggleHidden(m.value)}
-					contextWindow={modelContextWindows[m.value] ?? defaultContextWindows?.[m.value]}
-					onContextWindowChange={(size) => onContextWindowChange(m.value, size)}
 					onTestModel={onTestModel ? () => onTestModel(m.value) : undefined}
 					showContextWindow={showContextWindow}
 					extra={

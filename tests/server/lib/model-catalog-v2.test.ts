@@ -6,16 +6,15 @@ import {
 	resolveOutputTokenBudget,
 } from "../../../server/lib/agent/provider-model-metadata";
 import {
-	applyWindowSettings,
 	bindModelCatalogSettings,
 	getEffectiveModelProfile,
 	getModelCardSnapshot,
-	legacyWindowProjection,
+	keepLatestCatalog,
 	type ModelCatalogSettings,
 	mutateModelCard,
 	normalizeModelCatalogSettings,
 	resolveEffectiveModelCard,
-	settingsForDisk,
+	setModelWindow,
 } from "../../../server/lib/model-catalog";
 import { _bindSettings, getDefaults, saveSettings, settings } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
@@ -49,7 +48,7 @@ beforeEach(() => {
 	} as unknown as ModelCatalogSettings;
 	persisted = undefined;
 	bindModelCatalogSettings(local, () => {
-		persisted = JSON.stringify(settingsForDisk(local));
+		persisted = JSON.stringify(local);
 	});
 	_bindSettings(local);
 });
@@ -290,31 +289,43 @@ test("v2 writes are admin-only, return v2 conflicts and enforce body limits", as
 	).toBe(413);
 });
 
-// The provider page edits `agent.modelContextWindows`; a save turns that map into the
-// catalog's own bindings and the map becomes a view again. It is never stored.
-test("provider-page windows are written into bindings and read back as a view", () => {
-	const draft = structuredClone(local);
-	draft.agent.modelContextWindows = { "foxcx:gpt-5.4": 300000 };
-	applyWindowSettings(draft);
-	const binding = draft.agent.modelCatalog!.local.bindings!.find(
-		(b) => b.id === "legacy-window:foxcx:gpt-5.4",
-	)!;
-	expect(binding.overrides).toEqual({ working_context_tokens: 300000 });
-	expect(draft.agent.modelCatalog!.local.revision).toBe(revision() + 1);
-	expect(draft.agent.modelContextWindows).toEqual({ "foxcx:gpt-5.4": 300000 });
-	expect(settingsForDisk(draft).agent).not.toHaveProperty("modelContextWindows");
-	// An unchanged map is not a write.
-	const again = structuredClone(draft);
-	applyWindowSettings(again);
-	expect(again.agent.modelCatalog).toEqual(draft.agent.modelCatalog);
-	// Removing the key removes only the working window the page owns.
-	again.agent.modelCatalog!.local.bindings![0]!.overrides!.max_output_tokens = 4096;
-	again.agent.modelContextWindows = {};
-	applyWindowSettings(again);
-	expect(again.agent.modelCatalog!.local.bindings![0]!.overrides).toEqual({
-		max_output_tokens: 4096,
+// The provider page writes a provider entry's own window by its model value; nothing
+// beside the catalog stores it.
+test("provider-entry windows are stored by model value and reset only their own key", () => {
+	setModelWindow({
+		baseRevision: revision(),
+		scope: "connection",
+		target: "foxcx:gpt-5.4",
+		contextWindow: 300000,
 	});
-	expect(again.agent.modelContextWindows).toEqual({});
+	const stored = getModelCardSnapshot().local;
+	expect(stored.revision).toBe(8);
+	expect(stored.connections).toEqual({ "foxcx:gpt-5.4": { working_context_tokens: 300000 } });
+	expect(JSON.parse(persisted!).agent).not.toHaveProperty("modelContextWindows");
+	mutateModelCard({
+		baseRevision: revision(),
+		action: "patch",
+		target: "connection",
+		targetId: "foxcx:gpt-5.4",
+		patch: { set: { max_output_tokens: 4096 } },
+	});
+	setModelWindow({
+		baseRevision: revision(),
+		scope: "connection",
+		target: "foxcx:gpt-5.4",
+		contextWindow: null,
+	});
+	expect(getModelCardSnapshot().local.connections).toEqual({
+		"foxcx:gpt-5.4": { max_output_tokens: 4096 },
+	});
+	expect(() =>
+		mutateModelCard({
+			baseRevision: revision(),
+			action: "hide",
+			target: "connection",
+			targetId: "foxcx:gpt-5.4",
+		}),
+	).toThrow();
 });
 
 test("an old window map imports beside editor bindings and never stops startup", () => {
@@ -336,53 +347,58 @@ test("an old window map imports beside editor bindings and never stops startup",
 			],
 		},
 	};
-	stored.agent.modelContextWindows = {
+	(stored.agent as Record<string, unknown>).modelContextWindows = {
 		"codex:gpt-5.5": 150000,
 		"codex:gpt-5.4": "200000",
-	} as unknown as Record<string, number>;
-	expect(() => normalizeModelCatalogSettings(stored)).not.toThrow();
-	const bindings = stored.agent.modelCatalog!.local.bindings!;
-	expect(bindings.find((b) => b.id === "editor-binding")?.overrides).toEqual({
-		max_output_tokens: 1000,
+	};
+	expect(normalizeModelCatalogSettings(stored)).toBe(true);
+	const local = stored.agent.modelCatalog!.local;
+	expect(local.bindings).toEqual([
+		{
+			id: "editor-binding",
+			providerId: "codex",
+			upstreamModelId: "gpt-5.5",
+			overrides: { max_output_tokens: 1000 },
+		},
+	]);
+	expect(local.connections).toEqual({
+		"codex:gpt-5.5": { working_context_tokens: 150000 },
+		"codex:gpt-5.4": { working_context_tokens: 200000 },
 	});
-	// The window composes with the editor's binding for the same connection.
-	const window = bindings.find((b) => b.id === "legacy-window:codex:gpt-5.5");
-	expect(window?.overrides).toEqual({ working_context_tokens: 150000 });
-	expect(window?.modelId).toBeUndefined();
-	expect(stored.agent.modelContextWindows).toEqual({
-		"codex:gpt-5.5": 150000,
-		"codex:gpt-5.4": 200000,
-	});
+	expect(stored.agent).not.toHaveProperty("modelContextWindows");
 	bindModelCatalogSettings(stored, () => {});
 	expect(getEffectiveModelProfile("codex:gpt-5.5")).toMatchObject({
 		contextWindow: 150000,
 		maxOutputTokens: 1000,
 	});
-	stored.agent.modelContextWindows = {
-		...stored.agent.modelContextWindows,
-		"codex:gpt-5.5": 160000,
-	};
-	expect(() => applyWindowSettings(stored)).not.toThrow();
 
 	const preCatalog = getDefaults();
 	delete preCatalog.agent.modelCatalog;
-	preCatalog.agent.modelContextWindows = { "codex:gpt-5.5": "120000" } as unknown as Record<
-		string,
-		number
-	>;
+	(preCatalog.agent as Record<string, unknown>).modelContextWindows = {
+		"codex:gpt-5.5": "120000",
+	};
 	expect(() => normalizeModelCatalogSettings(preCatalog)).not.toThrow();
-	expect(preCatalog.agent.modelContextWindows).toEqual({ "codex:gpt-5.5": 120000 });
+	expect(preCatalog.agent.modelCatalog!.local.connections).toEqual({
+		"codex:gpt-5.5": { working_context_tokens: 120000 },
+	});
+	expect(preCatalog.agent.modelCatalog!.local.legacyFields).toMatchObject({
+		"connection:codex:gpt-5.5": ["working_context_tokens"],
+	});
+	expect(preCatalog.agent).not.toHaveProperty("modelContextWindows");
 });
 
-test("a save from a copy taken before a catalog edit applies its window without undoing the edit", () => {
+test("a settings save from a copy taken before a catalog edit does not undo the edit", () => {
 	const stale = structuredClone(local);
 	patch({ supports_vision: false });
-	stale.agent.modelContextWindows = { "codex:gpt-5.4": 99000 };
-	applyWindowSettings(stale);
+	keepLatestCatalog(stale);
 	const live = stale.agent.modelCatalog!.local;
-	expect(live.revision).toBe(revision() + 1);
+	expect(live.revision).toBe(revision());
 	expect(live.models!.find((m) => m.id === "local-image")!.metadata.supports_vision).toBe(false);
-	expect(legacyWindowProjection(live)).toEqual({ "codex:gpt-5.4": 99000 });
+	// A document assembled without the catalog keeps the live one too.
+	const bare = getDefaults();
+	delete bare.agent.modelCatalog;
+	keepLatestCatalog(bare);
+	expect(bare.agent.modelCatalog === local.agent.modelCatalog).toBe(true);
 });
 
 test("gateway metadata that contradicts the catalog is ignored rather than failing requests", () => {
