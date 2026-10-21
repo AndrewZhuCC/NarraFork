@@ -926,7 +926,7 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 | 类别 | 内容 | 处理 |
 |---|---|---|
 | 写入时冻结进块 | 附件提示与路径；`/bash` 等命令的模型文本；wire-safe 工具 id；turn nudge（作为 `context` 块）；broken 提醒与 loop 自造文本；ExitPlanMode 计划正文的引用形态（随 settle 冻结，现在随账本 status 变化，`strip-plan-body.ts:30-60`）；被采用的 attempt | 投影只读数据 |
-| 投影的显式输入 | target（协议、裸 model、strict、官方或中转、能力）；作者标题与用户名（纪元内读 pin，§7.7）；asset 字节是否可读 | 进 `targetFingerprint` 或 view |
+| 投影的显式输入 | target（协议、裸 model、strict、官方或中转、能力）；作者标题与用户名、system 各节、工具定义（纪元内读冻结值与变更日志，§7.7）；asset 字节是否可读 | 进 `targetFingerprint` 或 view |
 | 投影之后的传输层 | NUG 的图片 sha256 引用与网关 ack 剥离（`nug-provider.ts:444-507`）；Codex WS 的续写判定 | 不影响投影结果的缓存 |
 
 ### 7.6 字节稳定性约定
@@ -934,44 +934,70 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 - **同一版本内**：「从 DB 重建 == 实时发送」由构造保证，并由每个 provider 的等价测试兜底（§13）。
 - **跨越投影切换的那次发布**：允许一次性的 prompt cache 未命中。这与 compact 之后换 conversationId 重新起缓存（`narrator-session-state.ts:471-478`）的代价同级，在发布说明里写明即可。
 
-### 7.7 前缀保持：compact 之间不改写已发送的历史
+### 7.7 前缀保持：纪元内只追加，不改写
 
-已经发给模型的前缀，在下一次 compact 之前不因派生数据的变化而改写；变化改为在末尾追加一条简短的 `context` 提醒。compact 之后前缀本来就要重建，这时完全按最新数据投影。这样 prompt cache 只在 compact 时失效一次，而不是每次改名或状态变化都失效。
+**原则**：在一个纪元内，发给模型的请求前缀只追加、不改写。存储可以修改，但模型看到的那份按日志对待：派生数据变了，就在末尾追加一个事件，而不是回头改已经发过的字节。换纪元时，按最新数据完整重建一次。
 
-**投影纪元**
-- 一个叙述者的纪元从最近一次成功 compact（或叙述者创建）开始，到下一次 compact 为止。
-- 纪元内，投影要用到的派生输入在信封**第一次被投影**时固定下来，存进 pin 表；之后的请求都读 pin，不读最新值。
-- compact 成功后开启新纪元，旧 pin 作废，全部按最新数据重新投影。
+这样 prompt cache 只在换纪元时失效。前缀包含三层，按 Anthropic 的拼接顺序依次是工具定义、system prompt、历史（D15）。
 
-```
-narrator_projection_pins
-  narrator_id  text NOT NULL
-  epoch        text NOT NULL        开启该纪元的 compact 标记块 id（创建时为 'root'）
-  message_id   text NOT NULL
-  key          text NOT NULL        例如 sender_label
-  value        text NOT NULL
-  PRIMARY KEY (narrator_id, epoch, message_id, key)
-```
+**纪元边界**（D16）
+- compact 成功。
+- 切换 provider 或模型（`targetFingerprint` 变化）。
+- 缓存肯定已冷：距上次请求的空闲时间超过该 target 的缓存有效期。例如 Anthropic 按所用的缓存档位（5 分钟或 1 小时）判断。有效期不确定的 provider 不按这条换纪元，保守处理。
 
-- pin 按叙述者存，因为 fork 共享信封，但各自有各自的纪元和已发送前缀。
+**现在会改写前缀的来源，以及纪元内的处理**
 
-**受这条规则约束的派生输入**
-
-| 输入 | 纪元内的处理 | 现状 |
+| 层 | 来源 | 纪元内的处理 |
 |---|---|---|
-| sender 标记里的叙述者标题、用户名（D14） | 用 pin 的旧值；改名时追加一条提醒，如「叙述者 A 已更名为 B」 | 改名会让全部历史的 sender 标记变化，触发器让源缓存失效（`model-history-revision-sql.ts:84-101`） |
-| ExitPlanMode 计划正文的引用形态 | 已在 settle 时冻结（§7.5），不受影响 | 随账本 status 变化（`strip-plan-body.ts:30-60`） |
-| Await 问答回执的改写 | 按回执第一次被投影时的判断固定；后来到达的答复照常作为新内容追加 | 每次投影时按「同一请求里是否已有答复」重新判断（`question-model-input.ts:112-165`） |
-| 其他今后新增的、依赖可变外部数据的投影规则 | 默认按本节处理，进 pin 表 | — |
+| 工具定义 | `/load` 加载工具 | 能用 provider 的延迟加载机制时就用，前缀不变（各 provider 支持情况待核实）；不能用时，接受这一次失效，并直接开启新纪元 |
+| 工具定义 | `/unload` 卸载工具、MCP 工具消失 | 纪元内只增不减：定义留在前缀里，追加一条提醒说明该工具已不可用，执行器拒绝调用；下个纪元再移除 |
+| system prompt | 在线设备列表、默认设备是否可用（`narrator-prompt.ts:176-200`） | 冻结纪元开始时的文本；变化追加提醒，如「设备 X 已离线」 |
+| system prompt | AGENTS.md 等项目说明（`narrator-prompt.ts:248-262`） | 冻结；文件变化时追加提醒，说明已更新，并附新内容或差异（体积受同样的上限约束） |
+| system prompt | plan mode 开关、计划文件字节数（`narrator-prompt.ts:300-316`） | 冻结；进入或退出 plan mode、计划文件写入时追加提醒 |
+| system prompt | cwd | 冻结；cwd 变化追加提醒 |
+| 历史 | 叙述者标题、用户名（sender 标记） | 纪元内沿用旧值，**不提醒**（纯展示性变化，D17）；下个纪元生效 |
+| 历史 | Await 问答回执的改写（`question-model-input.ts:112-165`） | 按回执第一次被投影时的判断固定；后来到达的答复照常作为新内容追加 |
+| 历史 | ExitPlanMode 计划正文的引用形态 | 已在 settle 时冻结（§7.5） |
+| 历史 | 历史图片读不到、附件路径变成 unavailable | 图片按第一次投影时的结果固定（读到过就从缓存的 sha256 引用或重新读取，读不到时不再把已发送的图片改成空槽）；附件路径已在写入时冻结（§3.4） |
+| 历史 | agent 消息投递后被发送方修改（mailbox 语义编辑） | 接收方还没采纳的（`injection_consumed_at` 为空），原地改写；已经采纳的，原消息不动，追加一条「来自 X 的消息已修订为：……」（D18） |
 
-**不受约束的情况**（本来就改变前缀，接受 cache 未命中）
-- 用户显式的编辑、删除、回滚、段压缩：改的就是历史本身。
-- 切换 provider 或模型：`targetFingerprint` 变化，第二段整体重投。
-- 携带策略因 target 变化而不同：同上。
+**不受约束的情况**（本来就改变前缀，接受缓存失效）
+- 用户显式的编辑、删除、回滚、段压缩。
+- 用户手动「按最新数据重建上下文」（若提供该操作）。
 
-**提醒块**
-- 由触发变化的服务（改名、状态变更）写入，`subtype` 标明类别，`model_text` 简短。
-- 在叙述者 idle 时写入的提醒，随下一次运行的第一条请求发出；同一纪元内同一对象的多次变化，只保留最后一条未发送的提醒。
+**提醒的分级**（D17）
+- 影响模型行为的变化追加提醒：设备、项目说明、plan mode、cwd、工具可用性、消息修订。
+- 纯展示性的变化不提醒，纪元内静默沿用旧值：叙述者改名、用户改昵称。
+- 提醒是 `context` 块，`subtype` 标明类别，`model_text` 简短。
+- idle 时发生的变化，随下一次运行的第一条请求发出。同一纪元内同一对象变化多次，只保留最后一条未发送的提醒。
+- 提醒带上它所属的纪元。进入新纪元后，正文已按最新数据重建，这些提醒在投影时跳过，但不删除。
+
+**存储：变更日志，不逐条 pin**
+
+```
+narrator_projection_overrides
+  narrator_id   text NOT NULL
+  epoch         text NOT NULL     开启纪元的事件 id（compact 标记块 id、target 变化或冷缓存的记录 id）
+  subject       text NOT NULL     例如 sender:<narratorId>、system:devices、tools
+  upto_seq      integer           此 seq 及之前的投影沿用 frozen_value；系统层与工具层为空
+  frozen_value  text NOT NULL
+  created_at    text NOT NULL
+  PRIMARY KEY (narrator_id, epoch, subject)
+```
+
+- 只在变化发生时写一行；没有变化就没有行。
+- 纪元开始时冻结的 system prompt 各节与工具定义，存在纪元记录上（`narrator_projection_epochs`：叙述者、纪元 id、开始原因、冻结的 system 各节哈希与正文、工具定义哈希与列表）。
+- **fork 继承父叙述者当前的纪元与覆盖记录**，所以子叙述者第一次请求的前缀与父叙述者逐字节相同，可以命中父叙述者的缓存。
+
+**前缀核对**
+- 每次请求记录各段投影字节的哈希：工具定义、system 各节、每个信封。
+- 下一次请求时比对。纪元没换、已发送部分的哈希却变了，就记为前缀违例，写进慢操作日志与请求证据，附上是哪一段、哪个信封。
+- 这同时是测试网（§13），也是诊断缓存失效原因的工具。
+- Codex WS 增量续写本来就要求逐项前缀相同（§7.3），前缀保持直接提高它的命中率。
+
+**代价**
+- 模型在纪元内会看到旧的标题、旧的 system 文本，靠追加的提醒获知变化。纪元越长，提醒越多。compact 与冷缓存会定期截断这种积累。
+- 工具「只增不减」会让卸载后的定义继续占用 token，直到下个纪元。
 
 ## 8. 前端与传输
 
@@ -1230,7 +1256,7 @@ narrator_projection_pins
 - assistant 编辑只改被点的那一块（§5.5）；
 - `aborted` 块的重放规则（§3.5）；
 - turn nudge 从工具结果里移出，改为该步工具结果之后的一条独立文本（D12）；
-- 改名等派生数据变化，在 compact 之前不再改写已发送的历史，改为追加提醒（§7.7）；
+- 纪元内不再改写已发送的前缀（工具、system prompt、历史）：影响行为的变化改为追加提醒，改名等展示性变化延到下个纪元生效；已被采纳的 agent 消息修订改为追加通知（§7.7）；
 - 跨越投影切换的那次发布，会有一次 prompt cache 未命中（§7.6）。
 
 「轮」的定义一旦落库就很难再改，因此 D3 必须在 P1 之前定下来。
@@ -1253,6 +1279,7 @@ narrator_projection_pins
 | compact 与段压缩 | 生命周期与现状等价；CAS 不再使用 JSON 路径 | 现有 compact 测试迁移 |
 | 回退与块删除 | 以块 id 寻址；重跑过的工具也能删除并回退文件；预算按块字节计算；共享信封走 COW | 现有回退测试迁移 |
 | Codex WS | 有 assistant 输出之后的下一次请求仍能增量续写 | 用上游原始 item 的录制做测试 |
+| 前缀保持 | 纪元内，已发送的工具定义、system 各节、信封投影哈希不变；违例被记录并带上原因；换纪元的三种条件都能触发重建；fork 的第一次请求与父叙述者前缀相同 | 前缀核对 + 单测 |
 | External API v1 | 现有契约测试不修改即通过 | 契约测试 |
 | project.db | 导出再导入，内容相等；旧归档可以导入 | 往返测试 |
 | 搜索 | 结果与现状一致（content_text 规则逐条复刻） | 搜索测试 |
@@ -1267,7 +1294,7 @@ narrator_projection_pins
 |---|---|---|---|
 | D1 | tool 结果的文本是否复制进块 | 不复制。块只存被采用的 attempt、结果图片、附言；文本留在账本 | 推荐，未确认 |
 | D2 | tool 块的 `input` 以哪份为准 | 重放实际执行的输入（重定向或修复之后）；账本保留每个 attempt 的执行输入 | **已定** |
-| D3 | 「轮」的边界 | 推荐以一次运行为界（§3.6）：插话不开新轮。用途说明后再定 | **待定** |
+| D3 | 「轮」的边界 | 以一次运行为界（§3.6）：插话、注入、自动续跑都留在同一轮 | **已定** |
 | D4 | `aborted` 块是否重放 | text 重放，reasoning 不重放 | 推荐，未确认 |
 | D5 | 前端传输怎样演进 | P1 先给数组元素附加块 id，P2 再改成规范化结构 | 推荐，未确认 |
 | D6 | 是否做块级 FTS | 放在 P3，作为可选项、独立开关；先保留消息级 | 推荐，未确认 |
@@ -1278,7 +1305,13 @@ narrator_projection_pins
 | D11 | broken 调用在历史中的形态 | tool 块 `failed`、不可见，另加一条 `context` 说明，与实时路径一致 | **已定** |
 | D12 | turn nudge 放在哪里 | 单独一条 `context` 块（subtype `turn_nudge`），排在该步工具结果之后；不再拼进工具结果。这会改变发给模型的内容，列入 §12.6 | **已定** |
 | D13 | 引用锚点是否写进模型可见正文 | 保持写在正文里；锚点改为块 id（`b:<blockId>`），COW 后靠 lineage 解析 | **已定** |
-| D14 | sender 标记里的标题与用户名在改名后的处理 | compact 之间不改写已发送的前缀，用一条提醒代替；compact 后按最新数据完整重建（§7.7） | **已定** |
+| D14 | sender 标记里的标题与用户名在改名后的处理 | 纪元内沿用旧值、不提醒；换纪元时按最新数据重建（§7.7） | **已定** |
+| D15 | 前缀保持覆盖哪几层 | 工具定义、system prompt、历史三层都覆盖（§7.7） | **已定** |
+| D16 | 纪元边界 | compact 成功、切换 provider 或模型、缓存肯定已冷 | **已定** |
+| D17 | 哪些变化追加提醒 | 只对影响模型行为的变化提醒；纯展示性变化静默沿用旧值 | **已定** |
+| D18 | mailbox 语义编辑 | 未被接收方采纳的原地改写；已采纳的追加修订通知 | **已定** |
+| D19 | 是否提供「按最新数据重建上下文」的手动操作 | 待定 | **待定** |
+| D20 | `/load` 无法延迟加载时的处理 | 推荐直接开启新纪元（失效一次）；备选是预先把可选工具的定义全部放进前缀，代价是常驻 token | **待定** |
 
 ## 附录 A：现有块 type 到 kind 的映射
 
