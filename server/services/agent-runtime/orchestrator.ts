@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
+import { quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
@@ -31,7 +31,6 @@ import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
 import { resolveFastModeForUser } from "../../lib/fast-mode";
-import { MAX_QUOTA_WAITS_PER_RUN, waitForKimiQuotaReset } from "../../lib/kimi-quota-wait";
 import { logger } from "../../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
@@ -49,6 +48,7 @@ import {
 	getToolMessageWithParams,
 	type Locale,
 } from "../../lib/prompt-i18n";
+import { MAX_QUOTA_WAITS_PER_RUN, waitForQuotaReset } from "../../lib/provider-quota-wait";
 import { policySourceIdOf, type RuntimeSourceRow, runDeliverToOf } from "../../lib/runtime-source";
 import {
 	getSearchExecutionScope,
@@ -2072,6 +2072,8 @@ export async function runAgentLoopUnlocked(
 					nugModelId: mu.nugModelId,
 					diagnostics: mu.diagnostics,
 					waitKind: mu.waitKind,
+					quotaProvider: mu.quotaProvider,
+					quotaBucket: mu.quotaBucket,
 					resumeAt: quotaResumeAt,
 				});
 				if (placement)
@@ -2084,6 +2086,8 @@ export async function runAgentLoopUnlocked(
 						nugModelId: mu.nugModelId,
 						diagnostics: mu.diagnostics,
 						waitKind: mu.waitKind,
+						quotaProvider: mu.quotaProvider,
+						quotaBucket: mu.quotaBucket,
 						resumeAt: quotaResumeAt,
 					});
 
@@ -2101,7 +2105,7 @@ export async function runAgentLoopUnlocked(
 					subscribe: subscribeSettingsChanges,
 					wait: (signal) =>
 						quotaResumeAt
-							? waitForKimiQuotaReset(quotaResumeAt, signal)
+							? waitForQuotaReset(quotaResumeAt, signal)
 							: mu.providerId && mu.nugModelId
 								? nugAvailabilityPoller.waitForModelAvailable({
 										providerId: mu.providerId,
@@ -2131,6 +2135,7 @@ export async function runAgentLoopUnlocked(
 					model: mu.model,
 					nugModelId: mu.nugModelId,
 					waitKind: mu.waitKind,
+					quotaProvider: mu.quotaProvider,
 				});
 				if (placement)
 					broadcastToNarrator(placement.parentNarratorId, {
@@ -2140,6 +2145,7 @@ export async function runAgentLoopUnlocked(
 						model: mu.model,
 						nugModelId: mu.nugModelId,
 						waitKind: mu.waitKind,
+						quotaProvider: mu.quotaProvider,
 					});
 				await narratorService.updateStatus(narratorId, "working");
 				if (keptPartial) {
@@ -2415,20 +2421,22 @@ export async function runAgentLoopUnlocked(
 				/**
 				 * Why this quota wall is being reported instead of parked on.
 				 *
-				 * Two causes, one exit. `reset-beyond-budget` is the loop's verdict (the
-				 * reset is published but further out than the wait budget allows).
-				 * `wait-budget-spent` is this run's (every suspension costs a full history
-				 * re-upload, so a reset that keeps resolving to "soon" must not become a
-				 * replay loop).
+				 * Three causes, one exit. `reset-beyond-budget` and `reset-unknown` are the
+				 * loop's verdict (the reset is further out than the wait budget allows, or
+				 * nothing upstream said when it is). `wait-budget-spent` is this run's (every
+				 * suspension costs a full history re-upload, so a reset that keeps resolving
+				 * to "soon" must not become a replay loop).
 				 *
-				 * Both produce the same user-facing outcome, so they share a branch and
-				 * differ only by the reason code — a divergence here would mean one of them
-				 * silently loses the reset instant that makes the error actionable.
+				 * All produce the same user-facing outcome, so they share a branch and differ
+				 * only by the reason code — a divergence here would mean one of them silently
+				 * loses the reset instant that makes the error actionable.
 				 */
 				const quotaRefusalReason = !isQuota
 					? undefined
 					: quotaResumeAt === undefined
-						? "reset-beyond-budget"
+						? quotaResetAt === undefined
+							? "reset-unknown"
+							: "reset-beyond-budget"
 						: runState.recovery.quotaWaits >= MAX_QUOTA_WAITS_PER_RUN
 							? "wait-budget-spent"
 							: undefined;
@@ -2437,17 +2445,21 @@ export async function runAgentLoopUnlocked(
 					// the `payment_required` pattern: `errorMessage` is the only failure
 					// carrier that survives to the next page load, so the reset instant has
 					// to ride in it for the panel to explain the wall in the user's language
-					// after a refresh. `reason` lets the two non-waiting causes stay
+					// after a refresh. `reason` lets the non-waiting causes stay
 					// distinguishable in logs without changing what the user is told.
+					// `type` names the plan (KIMI_QUOTA_EXHAUSTED / OPENCODE_QUOTA_EXHAUSTED)
+					// so the message says whose allowance is spent.
+					const quotaCode = quotaExhaustedCode(mu.quotaProvider);
 					terminalStatus = {
 						substatus: ["error"],
-						errorCode: KIMI_QUOTA_EXHAUSTED,
+						errorCode: quotaCode,
 						errorMessage: JSON.stringify({
-							type: KIMI_QUOTA_EXHAUSTED,
+							type: quotaCode,
 							reason: quotaRefusalReason,
 							model: mu.model,
 							provider: mu.provider,
 							providerPrefix: mu.providerPrefix,
+							quotaBucket: mu.quotaBucket,
 							quotaResetAt,
 						}),
 					};
@@ -2463,11 +2475,13 @@ export async function runAgentLoopUnlocked(
 					// the client the block cleared and it is resuming, which is false here and
 					// would flash a green "quota restored" notice over the error. The client
 					// drops its waiting notice from the status change this write produces.
-					logger.warn("Kimi quota wall reported instead of waited on", {
+					logger.warn("Quota wall reported instead of waited on", {
 						narratorId,
+						quotaProvider: mu.quotaProvider ?? "kimi",
 						providerId: mu.providerId,
 						model: mu.model,
 						reason: quotaRefusalReason,
+						quotaBucket: mu.quotaBucket,
 						quotaResetAt,
 						quotaWaits: runState.recovery.quotaWaits,
 					});
@@ -2661,6 +2675,11 @@ export async function runAgentLoopUnlocked(
 			}
 			// Reset transient retry counter on success or after a non-retried silent disconnect.
 			runState.recovery.transientRetries = 0;
+			// The quota budget bounds CONSECUTIVE suspensions: a pass that got through
+			// proves the last wait actually recovered, so a long autonomous run may wait
+			// out a later window too instead of failing on its fourth wall in a day.
+			// Walls that keep refusing without any progress still hit the cap.
+			runState.recovery.quotaWaits = 0;
 
 			// "completion_limit" (provider hit its max output tokens) and "resumable_error"
 			// (a transient failure occurred after partial output was already produced, e.g. a

@@ -20,13 +20,14 @@ type Captured = { url: string; headers: Record<string, string>; body: Record<str
 async function capture(
 	official: boolean,
 	run: (p: AnthropicProvider) => Promise<unknown>,
+	baseUrl = "https://api.anthropic.com/v1",
 ): Promise<Captured> {
 	const provider = new AnthropicProvider({
 		name: "test",
 		prefix: "anthropic",
 		apiKey: "sk-test-key",
 		officialApi: official,
-		baseUrl: "https://api.anthropic.com/v1",
+		baseUrl,
 		// biome-ignore lint/suspicious/noExplicitAny: test config subset
 	} as any);
 
@@ -184,5 +185,30 @@ describe.each([
 		expect(system).toHaveLength(1);
 		expect(system?.[0].text).toBe("You are a title generator.");
 		expect(req.body.metadata).toBeUndefined();
+	});
+});
+
+/**
+ * OpenCode Go's `/zen/go/v1/messages` reads the key from `x-api-key` only and
+ * rejects a Bearer-only request ("Go requires a credential"); the
+ * `/inference/go` roots accept either. The official dialect must therefore send
+ * both on an OpenCode root, and nothing extra anywhere else.
+ */
+describe("OpenCode Go authentication", () => {
+	for (const baseUrl of [
+		"https://opencode.ai/zen/go/v1",
+		"https://opencode.ai/inference/go/anthropic/v1",
+	]) {
+		test(`official dialect also sends x-api-key to ${baseUrl}`, async () => {
+			const req = await capture(true, genMeta, baseUrl);
+			expect(req.headers.authorization).toBe("Bearer sk-test-key");
+			expect(req.headers["x-api-key"]).toBe("sk-test-key");
+			expect(req.headers["x-opencode-session"]).toBeTruthy();
+		});
+	}
+
+	test("other official hosts keep Bearer-only auth", async () => {
+		const req = await capture(true, genMeta);
+		expect(req.headers["x-api-key"]).toBeUndefined();
 	});
 });

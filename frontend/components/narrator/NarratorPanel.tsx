@@ -191,11 +191,7 @@ import {
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import {
-	formatOpencodeBarText,
-	formatOpencodeDetailsText,
-	isOpencodeProviderBaseUrl,
-} from "./model/opencode-usage-format";
+import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -1219,15 +1215,11 @@ function NarratorPanelBody({
 			opencodeProviderId: currentOpencodeProviderId,
 			kimiProviderId: currentKimiProviderId,
 		});
+		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
+		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
+		// generic text-balance slot — showing both would duplicate the 5h figure.
 		if (usageSource === "opencode") {
-			const usage = opencodeUsageQuery.data;
-			if (usage) {
-				const quotaBalance = formatOpencodeBarText(usage, t);
-				const detailedQuotaBalance = formatOpencodeDetailsText(usage, t);
-				if (quotaBalance || detailedQuotaBalance) {
-					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
-				}
-			}
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
 		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
 		// in the details popover) instead of the generic relay quota string.
@@ -1259,7 +1251,6 @@ function NarratorPanelBody({
 		kimiUsagesData,
 		currentKimiProviderId,
 		currentOpencodeProviderId,
-		opencodeUsageQuery.data,
 		currentDeepSeekProviderId,
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,
@@ -2894,6 +2885,34 @@ function NarratorPanelBody({
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
+	/**
+	 * Props for the OpenCode Go allowance indicator, or undefined when the current
+	 * model is not on a Go endpoint. The quota-wait flag is scoped to OpenCode:
+	 * the live event names the plan, and after a reload the persisted waiting
+	 * payload does (`errorMessage` carries `quotaProvider` while parked). A Kimi
+	 * wait on another narrator never turns this badge red.
+	 */
+	const opencodeQuotaProps = (() => {
+		if (!currentOpencodeProviderId) return undefined;
+		let waitProvider = quotaWaitInfo?.quotaProvider;
+		if (!waitProvider && isWaitingForQuota && narrator?.errorMessage) {
+			try {
+				const parsed = JSON.parse(narrator.errorMessage) as { quotaProvider?: unknown };
+				if (parsed.quotaProvider === "opencode" || parsed.quotaProvider === "kimi") {
+					waitProvider = parsed.quotaProvider;
+				}
+			} catch {
+				// Not a waiting payload; leave the provider unknown.
+			}
+		}
+		const waitingForQuota = isWaitingForQuota && waitProvider === "opencode";
+		return {
+			usage: opencodeUsageQuery.data,
+			waitingForQuota,
+			waitingText: waitingForQuota ? quotaWaitText : null,
+		};
+	})();
+
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
 	const contextIndicatorRadius = 9;
@@ -3589,6 +3608,7 @@ function NarratorPanelBody({
 								allModels,
 								aggregations,
 								providerLabels,
+								settingsData,
 								defaultModelValue,
 								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
@@ -3606,6 +3626,7 @@ function NarratorPanelBody({
 									commandCodeQuota?.hasDetailsPopover ??
 									tokenDanceQuota?.hasDetailsPopover ??
 									hasQuotaDetailsPopover,
+								opencode: opencodeQuotaProps,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,

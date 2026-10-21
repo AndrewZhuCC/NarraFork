@@ -1,3 +1,4 @@
+import { isOpencodeGoBaseUrl, parseOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { type CustomApiProviderConfig, settings } from "./settings";
@@ -5,9 +6,9 @@ import { type CustomApiProviderConfig, settings } from "./settings";
 /**
  * OpenCode Go subscription usage cache.
  *
- * OpenCode Go (`https://opencode.ai/zen/go/v1`, and the equivalent
- * `/inference/go/v1`) exposes the account's plan allowance at
- * `GET {base}/usage`:
+ * OpenCode Go (`https://opencode.ai/zen/go/v1`, the equivalent
+ * `/inference/go/v1`, and the inference service's per-family roots) exposes the
+ * account's plan allowance at `GET /zen/go/v1/usage` or `/inference/go/v1/usage`:
  *
  *   { "usage": { "rolling":  { "status", "percent", "resetsAt" },
  *                "weekly":   { ... },
@@ -46,6 +47,15 @@ export interface OpencodeUsageWindow {
 	percent: number | null;
 	/** ISO timestamp when the window resets, as reported upstream. */
 	resetsAt: string | null;
+	/**
+	 * Absolute amounts, when upstream reports them. The documented response only
+	 * carries `percent`, so these are optional extras read from whichever field
+	 * names a given deployment uses (`used`/`limit`, `usage`/`quota`, …). Units are
+	 * the plan's own (OpenCode meters Go in dollars); the UI shows them only as a
+	 * ratio and never invents them from `percent`.
+	 */
+	used?: number | null;
+	limit?: number | null;
 }
 
 export interface OpencodeUsagePayload {
@@ -54,6 +64,11 @@ export interface OpencodeUsagePayload {
 	weekly: OpencodeUsageWindow | null;
 	/** Billing-anniversary month, not a calendar month. */
 	monthly: OpencodeUsageWindow | null;
+	/**
+	 * Pay-as-you-go balance the account falls back to past its plan limits (the
+	 * Console's "Use balance" option), when upstream reports it. Absent otherwise.
+	 */
+	balance?: number | null;
 }
 
 export interface OpencodeUsageCache extends OpencodeUsagePayload {
@@ -63,59 +78,59 @@ export interface OpencodeUsageCache extends OpencodeUsagePayload {
 }
 
 export const OPENCODE_USAGES_STALE_MS = 60_000;
+/**
+ * Floor between refreshes after a FAILED fetch. Without it a broken key or an
+ * upstream outage would be retried on every read of the shared cache; with it,
+ * consecutive failures back off 60s → 2m → 4m → … up to {@link FAILURE_BACKOFF_MAX_MS}.
+ */
+const FAILURE_BACKOFF_MAX_MS = 10 * 60_000;
+/**
+ * Shortest gap between the post-request refreshes {@link noteOpencodeUsageActivity}
+ * schedules. A busy agent sends many requests a minute; the allowance does not
+ * need to be re-read after every one of them.
+ */
+export const OPENCODE_ACTIVITY_REFRESH_MIN_MS = 20_000;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const FETCH_TIMEOUT_MS = 15_000;
-
-/**
- * Paths that serve the Go plan. Both spellings are in use: the provider preset
- * writes `/zen/go/v1`, and deployments routed through the inference service use
- * `/inference/go/v1` (OpenCode's own docs list the former, its client the
- * latter). Only these two are accepted — a relay that merely resells OpenCode
- * models to a different host must not be probed with someone's key.
- */
-const GO_PATH = /^\/(?:zen|inference)\/go\/v1$/;
 
 interface Entry {
 	identity: string;
 	cache: OpencodeUsageCache;
 	inFlight?: Promise<OpencodeUsageCache | null>;
 	controller?: AbortController;
+	/** Consecutive failed refreshes, for the backoff. */
+	failures: number;
+	/** Pending post-request refresh, if one is scheduled. */
+	activityTimer?: ReturnType<typeof setTimeout>;
 }
-
 // Deliberately memory-only: a plan allowance describes one credential identity
 // and must not survive a restart or be restored under a different account.
 const entries = new Map<string, Entry>();
 
+/**
+ * Whether a provider points at an OpenCode Go plan root — `/zen/go/v1`,
+ * `/inference/go/v1`, or one of the inference service's per-family roots. See
+ * `shared/opencode-go-endpoint.ts` for the accepted set and why it is strict.
+ */
 export function isOpencodeCustomApiProvider(config: {
 	baseUrl?: string;
 	disabled?: boolean;
 }): boolean {
 	if (config.disabled || !config.baseUrl) return false;
-	try {
-		const url = new URL(config.baseUrl);
-		const host = url.hostname.toLowerCase();
-		return (
-			url.protocol === "https:" &&
-			(host === "opencode.ai" || host.endsWith(".opencode.ai")) &&
-			!url.port &&
-			!url.username &&
-			!url.password &&
-			!url.search &&
-			!url.hash &&
-			GO_PATH.test(url.pathname.replace(/\/$/, ""))
-		);
-	} catch {
-		return false;
-	}
+	return isOpencodeGoBaseUrl(config.baseUrl);
 }
 
-/** The usage endpoint for a configured Go base URL, e.g. `.../zen/go/v1/usage`. */
+/**
+ * The usage endpoint for a configured Go base URL.
+ *
+ * Every Go root reports the same account, so the per-family inference roots
+ * (`/inference/go/openai/v1`, …) map to `/inference/go/v1/usage`: they have no
+ * `/usage` of their own.
+ */
 export function opencodeUsageUrl(baseUrl: string): string {
-	const url = new URL(baseUrl);
-	url.pathname = `${url.pathname.replace(/\/+$/, "")}/usage`;
-	url.search = "";
-	url.hash = "";
-	return url.toString();
+	const endpoint = parseOpencodeGoBaseUrl(baseUrl);
+	if (!endpoint) throw new Error("Not an OpenCode Go endpoint");
+	return endpoint.usageUrl;
 }
 
 /**
@@ -156,6 +171,7 @@ export function syncOpencodeUsageCache(): void {
 		if (!config || identity(config) !== entry.identity) {
 			entries.delete(id);
 			entry.controller?.abort();
+			clearTimeout(entry.activityTimer);
 		}
 	}
 	for (const [id, config] of providers) {
@@ -170,6 +186,7 @@ export function syncOpencodeUsageCache(): void {
 					fetchedAt: 0,
 					error: null,
 				},
+				failures: 0,
 			});
 		}
 	}
@@ -181,33 +198,93 @@ function normalizePercent(value: unknown): number | null {
 }
 
 function normalizeResetsAt(value: unknown): string | null {
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+		// Epoch seconds or milliseconds.
+		return new Date(value < 1e12 ? value * 1000 : value).toISOString();
+	}
 	if (typeof value !== "string" || !value.trim()) return null;
 	const raw = value.trim();
 	return Number.isNaN(Date.parse(raw)) ? null : raw;
 }
 
+function normalizeAmount(value: unknown): number | null {
+	if (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())) {
+		return normalizeAmount(Number(value));
+	}
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+	return value;
+}
+
+/** First present field among aliases; upstream naming is not part of a published contract. */
+function pick(record: Record<string, unknown>, keys: string[]): unknown {
+	for (const key of keys) {
+		if (record[key] !== undefined && record[key] !== null) return record[key];
+	}
+	return undefined;
+}
+
+const USED_KEYS = ["used", "usage", "spent", "usedAmount", "used_amount", "cost"];
+const LIMIT_KEYS = ["limit", "quota", "total", "max", "limitAmount", "limit_amount"];
+const RESETS_KEYS = ["resetsAt", "resetAt", "resets_at", "reset_at", "resetTime"];
+const BALANCE_KEYS = ["balance", "credits", "creditBalance", "credit_balance"];
+
 function normalizeWindow(record: unknown): OpencodeUsageWindow | null {
 	if (!record || typeof record !== "object") return null;
 	const r = record as Record<string, unknown>;
 	const status = r.status === "ok" || r.status === "rate-limited" ? r.status : null;
-	const percent = normalizePercent(r.percent);
-	const resetsAt = normalizeResetsAt(r.resetsAt);
+	const resetsAt = normalizeResetsAt(pick(r, RESETS_KEYS));
+	const used = normalizeAmount(pick(r, USED_KEYS));
+	const limit = normalizeAmount(pick(r, LIMIT_KEYS));
+	const usableLimit = limit != null && limit > 0 ? limit : null;
+	// Derive the share only when upstream gave none and both amounts are real.
+	const percent =
+		normalizePercent(r.percent) ??
+		(used != null && usableLimit != null ? normalizePercent((used / usableLimit) * 100) : null);
 	if (status == null && percent == null && resetsAt == null) return null;
-	return { status, percent, resetsAt };
-}
-
-export function parseOpencodeUsageResponse(body: unknown): OpencodeUsagePayload {
-	if (!body || typeof body !== "object") throw new Error("Invalid usage response");
-	const usage = (body as Record<string, unknown>).usage;
-	if (!usage || typeof usage !== "object") throw new Error("Invalid usage response");
-	const record = usage as Record<string, unknown>;
 	return {
-		rolling: normalizeWindow(record.rolling),
-		weekly: normalizeWindow(record.weekly),
-		monthly: normalizeWindow(record.monthly),
+		status,
+		percent,
+		resetsAt,
+		...(used != null && usableLimit != null ? { used, limit: usableLimit } : {}),
 	};
 }
 
+function normalizeBalance(...sources: Record<string, unknown>[]): number | null {
+	for (const source of sources) {
+		const raw = pick(source, BALANCE_KEYS);
+		if (raw && typeof raw === "object") {
+			const nested = normalizeAmount(
+				pick(raw as Record<string, unknown>, ["amount", "value", "total"]),
+			);
+			if (nested != null) return nested;
+			continue;
+		}
+		const amount = normalizeAmount(raw);
+		if (amount != null) return amount;
+	}
+	return null;
+}
+
+/**
+ * Parse `GET …/go/v1/usage`. Tolerant by design: the endpoint is not a
+ * published contract, so a missing or renamed window costs that window's
+ * numbers (null) rather than the whole refresh, and optional extras (absolute
+ * amounts, a pay-as-you-go balance) are read only when present.
+ */
+export function parseOpencodeUsageResponse(body: unknown): OpencodeUsagePayload {
+	if (!body || typeof body !== "object") throw new Error("Invalid usage response");
+	const root = body as Record<string, unknown>;
+	const usage = root.usage;
+	if (!usage || typeof usage !== "object") throw new Error("Invalid usage response");
+	const record = usage as Record<string, unknown>;
+	const balance = normalizeBalance(record, root);
+	return {
+		rolling: normalizeWindow(record.rolling ?? record.fiveHour ?? record.five_hour),
+		weekly: normalizeWindow(record.weekly ?? record.week),
+		monthly: normalizeWindow(record.monthly ?? record.month),
+		...(balance != null ? { balance } : {}),
+	};
+}
 async function fetchUsage(
 	config: CustomApiProviderConfig,
 	controller: AbortController,
@@ -216,7 +293,15 @@ async function fetchUsage(
 	const response = await outboundFetch(
 		endpoint,
 		{
-			headers: { Authorization: `Bearer ${config.apiKey}`, Accept: "application/json" },
+			headers: {
+				// Both credential headers: the `zen` proxy and the `inference` service read
+				// the key from different headers depending on the route (`/messages` only
+				// honours `x-api-key` on zen), and a per-family Anthropic root is the one a
+				// user configured with that convention in mind. Same key either way.
+				Authorization: `Bearer ${config.apiKey}`,
+				"x-api-key": config.apiKey,
+				Accept: "application/json",
+			},
 			redirect: "error",
 			signal: controller.signal,
 		},
@@ -290,15 +375,18 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 				fetchedAt: Date.now(),
 				error: null,
 			};
+			entry.failures = 0;
 		} catch {
 			syncOpencodeUsageCache();
 			if (entries.get(providerId) !== entry) return null;
 			// Never copy transport exceptions, response text, or credentials to logs/API.
+			// The last good numbers stay so the UI can show them as stale.
 			entry.cache = {
 				...entry.cache,
 				fetchedAt: Date.now(),
 				error: "OpenCode usage request failed",
 			};
+			entry.failures += 1;
 		} finally {
 			clearTimeout(timer);
 			entry.inFlight = undefined;
@@ -307,6 +395,12 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 		return entry.cache;
 	})();
 	return entry.inFlight;
+}
+
+/** The cached allowance for one provider, or null when it is not a Go provider. */
+export function getOpencodeCachedUsage(providerId: string): OpencodeUsageCache | null {
+	syncOpencodeUsageCache();
+	return entries.get(providerId)?.cache ?? null;
 }
 
 export function getAllOpencodeCachedUsages(): Record<string, OpencodeUsageCache> {
@@ -325,6 +419,37 @@ export async function refreshAllOpencodeUsages(): Promise<void> {
 	await Promise.allSettled([...entries.keys()].map(refreshOpencodeUsage));
 }
 
+/**
+ * Whether one cache entry is due for a refresh.
+ *
+ *  - never fetched → due;
+ *  - last fetch failed → due only after an exponential backoff (60s, 2m, 4m, …
+ *    capped at 10m), so a broken key does not hammer upstream on every read;
+ *  - a window's `resetsAt` has passed since the fetch → due now, because the
+ *    numbers on screen describe a window that no longer exists;
+ *  - otherwise → due once older than `maxAgeMs`.
+ *
+ * Exported for tests; pure in its inputs.
+ */
+export function isOpencodeUsageDue(
+	entry: { cache: OpencodeUsageCache; failures: number },
+	now: number,
+	maxAgeMs = OPENCODE_USAGES_STALE_MS,
+): boolean {
+	const { cache, failures } = entry;
+	if (!cache.fetchedAt) return true;
+	const age = now - cache.fetchedAt;
+	if (failures > 0) {
+		const backoff = Math.min(maxAgeMs * 2 ** (failures - 1), FAILURE_BACKOFF_MAX_MS);
+		return age >= backoff;
+	}
+	for (const window of [cache.rolling, cache.weekly, cache.monthly]) {
+		const reset = window?.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
+		if (Number.isFinite(reset) && reset > cache.fetchedAt && reset <= now) return true;
+	}
+	return age >= maxAgeMs;
+}
+
 export async function refreshStaleOpencodeUsages(
 	maxAgeMs = OPENCODE_USAGES_STALE_MS,
 ): Promise<void> {
@@ -332,7 +457,42 @@ export async function refreshStaleOpencodeUsages(
 	const now = Date.now();
 	await Promise.allSettled(
 		[...entries]
-			.filter(([, entry]) => !entry.cache.fetchedAt || now - entry.cache.fetchedAt >= maxAgeMs)
+			.filter(([, entry]) => isOpencodeUsageDue(entry, now, maxAgeMs))
 			.map(([id]) => refreshOpencodeUsage(id)),
 	);
+}
+
+/**
+ * Note that a request just went to an OpenCode Go provider, so the allowance on
+ * screen is about to be out of date.
+ *
+ * Schedules ONE background refresh per provider, no sooner than
+ * {@link OPENCODE_ACTIVITY_REFRESH_MIN_MS} after the last fetch: a burst of
+ * agent requests collapses into a single `/usage` call, and an idle provider
+ * costs nothing. Fire-and-forget by contract: never awaited by the caller and
+ * never throws, so the inference path cannot be slowed or failed by it.
+ */
+export function noteOpencodeUsageActivity(providerRef: string): void {
+	try {
+		const config = (settings.customApiProviders ?? []).find(
+			(p) => p.prefix === providerRef || p.id === providerRef,
+		);
+		if (!config || !isOpencodeCustomApiProvider(config) || !config.apiKey) return;
+		syncOpencodeUsageCache();
+		const entry = entries.get(config.id);
+		if (!entry || entry.activityTimer || entry.inFlight) return;
+		const elapsed = Date.now() - entry.cache.fetchedAt;
+		const delay = Math.max(0, OPENCODE_ACTIVITY_REFRESH_MIN_MS - elapsed);
+		const timer = setTimeout(() => {
+			if (entry.activityTimer === timer) entry.activityTimer = undefined;
+			if (entries.get(config.id) !== entry) return;
+			if (entry.failures > 0 && !isOpencodeUsageDue(entry, Date.now())) return;
+			void refreshOpencodeUsage(config.id).catch(() => {});
+		}, delay);
+		// Never keep the process alive for a cosmetic refresh.
+		(timer as { unref?: () => void }).unref?.();
+		entry.activityTimer = timer;
+	} catch {
+		// Display-only bookkeeping; the request that triggered it must not care.
+	}
 }

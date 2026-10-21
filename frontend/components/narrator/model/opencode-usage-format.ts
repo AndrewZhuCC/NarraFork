@@ -1,3 +1,4 @@
+import { isOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
 import type { OpencodeUsageCache, OpencodeUsageWindow } from "../../../lib/api/types";
 import { formatLocaleDateTime } from "../../../lib/intl-format";
 
@@ -19,37 +20,17 @@ export function opencodeUsageFailed(usage: OpencodeUsageCache): boolean {
 }
 
 /**
- * Paths that serve the Go plan; the server accepts exactly the same two spellings.
- */
-const GO_PATH = /^\/(?:zen|inference)\/go\/v1$/;
-
-/**
- * True when the baseUrl points at an OpenCode Go plan endpoint (mirrors the server check).
+ * True when the baseUrl points at an OpenCode Go plan endpoint (same check as the server).
  *
- * Both the preset's `/zen/go/v1` and the inference-routed `/inference/go/v1` qualify. The
- * host check is not enough on its own: `https://opencode.ai/zen/v1` is the pay-as-you-go Zen
- * endpoint, which has no plan allowance to show. A relay serving OpenCode models from
- * another host does not qualify either, because its `/usage` path means nothing and probing
- * it would spend the user's key on a third party.
+ * The preset's `/zen/go/v1`, the inference-routed `/inference/go/v1` and the inference
+ * service's per-family roots all qualify. The host check is not enough on its own:
+ * `https://opencode.ai/zen/v1` is the pay-as-you-go Zen endpoint, which has no plan
+ * allowance to show. A relay serving OpenCode models from another host does not qualify
+ * either, because its `/usage` path means nothing and probing it would spend the user's
+ * key on a third party.
  */
 export function isOpencodeProviderBaseUrl(baseUrl?: string): boolean {
-	if (!baseUrl) return false;
-	try {
-		const url = new URL(baseUrl);
-		const host = url.hostname.toLowerCase();
-		return (
-			url.protocol === "https:" &&
-			(host === "opencode.ai" || host.endsWith(".opencode.ai")) &&
-			!url.port &&
-			!url.username &&
-			!url.password &&
-			!url.search &&
-			!url.hash &&
-			GO_PATH.test(url.pathname.replace(/\/$/, ""))
-		);
-	} catch {
-		return false;
-	}
+	return isOpencodeGoBaseUrl(baseUrl);
 }
 
 function formatResetTime(resetsAt: string | null): string | null {
