@@ -98,6 +98,11 @@ mock.module("@tanstack/react-router", () => ({
 mock.module("../../hooks/usePlatform", () => ({ usePlatform: () => "linux" }));
 mock.module("../../hooks/useSetupWizardGuard", () => ({ useSetupWizardGuard: () => () => true }));
 mock.module("../../hooks/useModels", () => ({ useAllModels: () => ({ groupedModels: [] }) }));
+const validProjectDir = { usablePath: "/instance" as string | null, needsChoice: false };
+let projectDirStatus = validProjectDir;
+mock.module("../../hooks/useProjectDirStatus", () => ({
+	useProjectDirStatus: () => ({ ...projectDirStatus, isLoading: false }),
+}));
 const create = mock((_data: unknown, _options?: unknown) => {});
 const update = mock((_data: unknown, _options?: unknown) => {});
 const createProject = mock((_data: unknown, _options?: unknown) => {});
@@ -148,6 +153,7 @@ let container: HTMLDivElement;
 const saved = new Map<string, PropertyDescriptor | undefined>();
 beforeEach(() => {
 	edits = {};
+	projectDirStatus = validProjectDir;
 	create.mockClear();
 	update.mockClear();
 	createProject.mockClear();
@@ -210,6 +216,20 @@ test("non-project narrator modal retains instance default and omits membership",
 	expect(create.mock.calls[0]?.[0]).toMatchObject({ cwd: "/instance" });
 	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("contextProjectId");
 	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("title");
+});
+test("without a usable default directory the modal requires one before creating", async () => {
+	projectDirStatus = { usablePath: null, needsChoice: true };
+	await act(async () => root.render(<CreateNarratorModal opened onClose={() => {}} />));
+	const createButton = () =>
+		Array.from(container.querySelectorAll("button")).find(
+			(node) => node.textContent === "createNarrator",
+		);
+	expect(createButton()?.hasAttribute("disabled")).toBe(true);
+	edits.workingDirectory = "/chosen";
+	await click("workingDirectory");
+	expect(createButton()?.hasAttribute("disabled")).toBe(false);
+	await click("createNarrator");
+	expect(create.mock.calls[0]?.[0]).toMatchObject({ cwd: "/chosen" });
 });
 test("a filled session title is trimmed and sent; blank or whitespace is omitted", async () => {
 	edits.sessionTitle = "  Sprint review  ";

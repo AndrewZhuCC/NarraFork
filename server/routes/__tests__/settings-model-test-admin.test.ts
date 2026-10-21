@@ -681,3 +681,35 @@ describe("settings conditional admin guards", () => {
 		}
 	});
 });
+
+describe("default project directory", () => {
+	async function patchProjectDir(defaultProjectDir: string) {
+		return appForRole("admin").request("/settings", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ paths: { defaultProjectDir } }),
+		});
+	}
+
+	test("accepts only an existing directory, and unchanged or empty values always save", async () => {
+		const original = structuredClone(settings);
+		const existing = mkdtempSync(join(testHome, "projects-"));
+		try {
+			const missing = await patchProjectDir(join(testHome, "no-such-dir"));
+			expect(missing.status).toBe(400);
+			expect((await missing.json()).code).toBe("PROJECT_DIR_NOT_FOUND");
+			expect(settings.paths.defaultProjectDir).toBe(original.paths.defaultProjectDir);
+
+			expect((await patchProjectDir(existing)).status).toBe(200);
+			expect(settings.paths.defaultProjectDir).toBe(existing);
+
+			// The chosen directory disappearing must not block re-saving the form.
+			rmSync(existing, { recursive: true, force: true });
+			expect((await patchProjectDir(existing)).status).toBe(200);
+			expect((await patchProjectDir("")).status).toBe(200);
+			expect(settings.paths.defaultProjectDir).toBe("");
+		} finally {
+			saveSettings(original);
+		}
+	});
+});

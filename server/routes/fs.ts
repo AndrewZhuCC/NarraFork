@@ -36,7 +36,7 @@ import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-bounda
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
-import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { getHome, IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { isLoopbackHostname } from "../lib/public-origin";
 import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
@@ -52,6 +52,7 @@ import {
 	type FileChangeCompletion,
 } from "../services/file-change-runtime";
 import { resolveNarratorProjectId } from "../services/narrator-project";
+import { findProjectDirCandidates, getProjectDirStatus } from "../services/project-dir";
 import { closeClaim, openClaim, sealClaim } from "../services/worktree-write-claims";
 
 export const fsRoutes = new Hono();
@@ -116,6 +117,28 @@ fsRoutes.get("/browse", (c) => {
 	const parent = getParent(absPath, isWin);
 
 	return c.json({ ...listing, path: absPath, drives, parent, sep });
+});
+
+/**
+ * GET /api/fs/project-dir
+ *
+ * Whether the instance's default project directory is set and exists. Clients use it
+ * to ask the user for a working directory instead of creating sessions in a folder
+ * that is unset or gone. One `stat`; safe to poll.
+ */
+fsRoutes.get("/project-dir", (c) => {
+	return c.json(getProjectDirStatus(settings.paths.defaultProjectDir, getHome()));
+});
+
+/**
+ * GET /api/fs/project-dir/candidates
+ *
+ * Existing folders under home that look like where the user keeps code (conventional
+ * names in any case, or folders already holding several git repositories), to offer
+ * when choosing the default project directory. Bounded async scan; see project-dir.ts.
+ */
+fsRoutes.get("/project-dir/candidates", async (c) => {
+	return c.json({ candidates: await findProjectDirCandidates(getHome()) });
 });
 
 /**

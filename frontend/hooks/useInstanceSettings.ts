@@ -25,6 +25,7 @@ import type {
 import { normalizeRuleTargetSelector } from "../lib/api/types";
 import { DEFAULT_GITHUB_REPOSITORY, type UpdateSource } from "../lib/update-source";
 import { normalizeUrlProtocol } from "../lib/url";
+import { PROJECT_DIR_STATUS_QUERY_KEY } from "./useProjectDirStatus";
 
 export type DefaultNarratorVisibility = "auto" | "private" | "public";
 export type DefaultNarratorWriteAudience = "auto" | "owner" | "project" | "public";
@@ -265,6 +266,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 			// Use setQueryData to synchronously update the cache instead of
 			// invalidateQueries which triggers cascading refetches.
 			qc.setQueryData(["settings"], data);
+			void qc.invalidateQueries({ queryKey: PROJECT_DIR_STATUS_QUERY_KEY });
 			// Drop stale recommendations and cancel in-flight checks, not prepared binaries/status.
 			void qc.resetQueries({ queryKey: ["update-check"] });
 			void qc.invalidateQueries({ queryKey: ["update-check"], refetchType: "none" });

@@ -114,14 +114,14 @@ describe("setup wizard step order and gating", () => {
 		).toBeNull();
 	});
 
-	test("the basic step still requires both models", () => {
+	test("the basic step requires the project directory and both models", () => {
 		expect(
 			wizardNextBlockedReasonKey({
 				step: wizardStepIndex("basic"),
 				providerCount: 1,
 				basicStepValid: false,
 			}),
-		).toBe("wizardModelsRequired");
+		).toBe("wizardBasicRequired");
 		expect(
 			wizardNextBlockedReasonKey({
 				step: wizardStepIndex("basic"),
