@@ -824,10 +824,19 @@ export function useGitBadgeRefresh() {
 	}, [qc]);
 }
 
-export function useGitModifications(target: GitTarget | undefined | null) {
+/** Git change events invalidate this sooner; the window only absorbs repeated hovers. */
+const GIT_FILE_ATTRIBUTION_STALE_MS = 10_000;
+
+/**
+ * One file's attribution, read only while its hover card is open. Mount it inside the
+ * open card: unmounting the last observer aborts the request through `signal`, without
+ * cancelling another open card that shares the key (index and worktree rows do).
+ * A failure stays local to the card: 503 does not re-probe the whole workspace.
+ */
+export function useGitFileModifications(target: GitTarget | undefined | null, filePath: string) {
 	const qc = useQueryClient();
 	return useQuery<WorkspaceModificationView>({
-		queryKey: ["gitModifications", gitTargetKey(target), "uncommitted"],
+		queryKey: ["gitModifications", gitTargetKey(target), "uncommitted", "byFile", filePath],
 		queryFn: ({ signal }) =>
 			readWorkspace(
 				qc,
@@ -835,15 +844,14 @@ export function useGitModifications(target: GitTarget | undefined | null) {
 				() =>
 					api.getGitModifications(
 						target as GitTarget,
-						{
-							scope: "uncommitted",
-							projection: "byFile",
-						},
+						{ scope: "uncommitted", projection: "byFile", filePath },
 						signal,
 					) as Promise<WorkspaceModificationView>,
+				false,
 			),
 		enabled: !!target,
 		retry: false,
+		staleTime: GIT_FILE_ATTRIBUTION_STALE_MS,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }

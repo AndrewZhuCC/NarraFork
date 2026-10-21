@@ -8,8 +8,8 @@
  * tooltip separately re-listed the very actor its first line already named.
  *
  * The existing GitPanel suite could not catch any of it: it only seeds `gitStatus`, so
- * `attrByPath` was always empty and no badge ever rendered. These tests seed the
- * attribution query too.
+ * no attribution ever rendered. These tests seed the per-file attribution query, which
+ * the card reads only once it opens.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
@@ -293,7 +293,7 @@ function flushRender() {
  */
 async function renderBadge(
 	chapterId: string,
-	modifications: WorkspaceModificationView,
+	modifications: WorkspaceModificationView | null,
 	path = "src/one.ts",
 	statusOverride?: GitStatusSummary,
 ): Promise<HTMLElement> {
@@ -310,7 +310,11 @@ async function renderBadge(
 		linesRemoved: 0,
 		complete: false,
 	});
-	queryClient.setQueryData(["gitModifications", chapterId, "uncommitted"], modifications);
+	if (modifications)
+		queryClient.setQueryData(
+			["gitModifications", chapterId, "uncommitted", "byFile", path],
+			modifications,
+		);
 
 	const container = document.createElement("div");
 	document.body.appendChild(container);
@@ -444,15 +448,17 @@ describe("GitChangesTab attribution hover card", () => {
 		expect(hoverText).not.toContain(gitLocale.attributionNotCurrentOwnership);
 	});
 
-	test("a clean target removes the attribution hover target", async () => {
+	test("a clean target with no recorded history shows a short empty note", async () => {
 		const clean = currentTarget({ status: "clean", actor: null });
 		const container = await renderBadge("chapter-attr-hover-clean", {
-			...view([group({ lastActor: narrator() })]),
+			...view([]),
 			currentDiff: currentView(clean, clean, { clean: true }),
 		});
 
 		expect(rowFor(container).querySelectorAll(".mantine-Badge-root")).toHaveLength(1);
-		expect(() => attributionTarget(container)).toThrow("Attribution hover target not rendered");
+		const hoverText = await hoverAttribution(container);
+		expect(hoverText).toContain(gitLocale.attributionEmptyShort);
+		expect(hoverText).not.toContain("Current diff evidence");
 	});
 
 	test("history incompleteness is treated as the norm and not nagged in the hover card", async () => {
@@ -535,8 +541,94 @@ describe("GitChangesTab attribution hover card", () => {
 		expect(hoverText).not.toContain("-0");
 	});
 
+	test("the panel reads no attribution until a card opens, then only that file", async () => {
+		const calls: string[] = [];
+		const g = globalThis as { fetch?: typeof fetch };
+		const originalFetch = g.fetch;
+		const last = narrator();
+		g.fetch = (async (input: RequestInfo | URL) => {
+			calls.push(String(input));
+			return Response.json(
+				view([group({ lastActor: last, recentEvents: [event(last, { id: "event-lazy" })] })]),
+			);
+		}) as typeof fetch;
+		try {
+			const container = await renderBadge("chapter-attr-lazy", null);
+			expect(calls.filter((url) => url.includes("/modifications"))).toEqual([]);
+
+			const hoverText = await hoverAttribution(container);
+			const reads = calls.filter((url) => url.includes("/modifications"));
+			expect(reads).toHaveLength(1);
+			const params = new URL(reads[0] ?? "", "http://localhost").searchParams;
+			expect(params.get("filePath")).toBe("src/one.ts");
+			expect(params.get("projection")).toBe("byFile");
+			expect(params.get("scope")).toBe("uncommitted");
+			expect(hoverText).toContain("Refactor auth");
+		} finally {
+			g.fetch = originalFetch;
+		}
+	});
+
+	test("closing the card aborts its in-flight read", async () => {
+		const g = globalThis as { fetch?: typeof fetch };
+		const originalFetch = g.fetch;
+		const signals: AbortSignal[] = [];
+		g.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.signal) signals.push(init.signal);
+			return new Promise<Response>((_, reject) =>
+				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+			);
+		}) as typeof fetch;
+		try {
+			const container = await renderBadge("chapter-attr-abort", null);
+			const hoverText = await hoverAttribution(container);
+			expect(hoverText).toContain(gitLocale.attributionLoadingShort);
+			expect(signals).toHaveLength(1);
+
+			const target = attributionTarget(container);
+			target.dispatchEvent(new Event("mouseleave", { bubbles: true }));
+			target.dispatchEvent(new Event("mouseout", { bubbles: true }));
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			await flushRender();
+			expect(signals[0]?.aborted).toBe(true);
+		} finally {
+			g.fetch = originalFetch;
+		}
+	});
+
+	test("a failed read stays inside the card and offers a retry", async () => {
+		const g = globalThis as { fetch?: typeof fetch };
+		const originalFetch = g.fetch;
+		let calls = 0;
+		const fetched: string[] = [];
+		g.fetch = (async (input: RequestInfo | URL) => {
+			fetched.push(String(input));
+			if (String(input).includes("/modifications")) calls++;
+			return Response.json({ error: "boom" }, { status: 500 });
+		}) as typeof fetch;
+		try {
+			const container = await renderBadge("chapter-attr-failed", null);
+			const hoverText = await hoverAttribution(container);
+			expect(hoverText).toContain(gitLocale.attributionLoadFailedShort);
+			expect(rowFor(container).textContent).toContain("one.ts");
+
+			const retry = Array.from(
+				document.querySelectorAll(".mantine-HoverCard-dropdown button"),
+			).find((button) => button.textContent === gitLocale.attributionRetry);
+			retry?.dispatchEvent(new Event("click", { bubbles: true }));
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(calls).toBe(2);
+			// React events cross the portal: retrying must not also open the row's diff.
+			expect(fetched.some((url) => url.includes("/diff"))).toBe(false);
+		} finally {
+			g.fetch = originalFetch;
+		}
+	});
+
 	test("the compact hover labels have Chinese translations", () => {
 		expect(zhGitLocale.attributionHistoryShort).toBe("最近修改");
 		expect(zhGitLocale.attributionCurrentUnknownShort).toBe("未知");
+		expect(zhGitLocale.attributionEmptyShort).toBe("此文件暂无修改记录");
+		expect(zhGitLocale.attributionLoadFailedShort).toBe("归因读取失败");
 	});
 });

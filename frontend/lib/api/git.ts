@@ -127,6 +127,8 @@ export const gitApi = {
 			limit?: number;
 			cursor?: { changedAt: string; rowId: string };
 			projection?: "byFile" | "all";
+			/** Git-root-relative; the server accepts it only with uncommitted + byFile. */
+			filePath?: string;
 		},
 		signal?: AbortSignal,
 	) => {
@@ -134,6 +136,7 @@ export const gitApi = {
 		if (opts?.scope) params.set("scope", opts.scope);
 		if (opts?.limit) params.set("limit", String(opts.limit));
 		if (opts?.projection) params.set("projection", opts.projection);
+		if (opts?.filePath !== undefined) params.set("filePath", opts.filePath);
 		if (opts?.cursor) {
 			params.set("cursorAt", opts.cursor.changedAt);
 			params.set("cursorRowId", opts.cursor.rowId);

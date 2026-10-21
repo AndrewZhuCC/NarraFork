@@ -1,6 +1,6 @@
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { AppError, ValidationError } from "../lib/errors";
+import { AppError, ValidationError, zodValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
@@ -29,7 +29,7 @@ import {
 	validateFilePaths,
 	validateGitFileTargets,
 } from "../services/git-management-service";
-import { withGitRequestContext } from "../services/git-service";
+import { type GitStatusSummary, withGitRequestContext } from "../services/git-service";
 import { getStatusSummaryCached } from "../services/git-status-cache";
 import { assertGitWorkspaceKey, type GitWorkspaceTarget } from "../services/git-workspace";
 import { authorizeGitTarget, requireReadyGitTarget } from "../services/git-workspace-access";
@@ -96,6 +96,26 @@ function cancelledCurrentDiff(filePaths: string[]) {
 	};
 }
 
+/**
+ * Uncommitted paths to read history for. A client-named path only selects an entry of
+ * this trusted status, whose rename source becomes the alias. A path absent from a
+ * truncated status is unknown, not clean: it is read without an alias and reported
+ * incomplete. Absent from a complete status, it has no uncommitted change to explain.
+ */
+function modificationFiles(status: GitStatusSummary, filePath: string | undefined) {
+	const files =
+		filePath === undefined ? status.files : status.files.filter((file) => file.path === filePath);
+	const pathAliases = new Map<string, string>();
+	for (const file of files) if (file.oldPath) pathAliases.set(file.oldPath, file.path);
+	if (filePath !== undefined && files.length === 0 && status.truncated === true)
+		return { filePaths: [filePath], pathAliases, truncated: true };
+	return {
+		filePaths: [...files.map((file) => file.path), ...pathAliases.keys()],
+		pathAliases,
+		truncated: filePath === undefined && status.truncated === true,
+	};
+}
+
 async function cancelledModificationResponse(c: Context, source: "chapter" | "narrator") {
 	const id = (source === "chapter" ? c.req.param("chapterId") : c.req.param("id")) ?? "";
 	const query = gitModificationsQuerySchema.parse(c.req.query());
@@ -125,7 +145,10 @@ async function cancelledModificationResponse(c: Context, source: "chapter" | "na
 	});
 }
 
-/** One implementation, two authenticated domain adapters. No path comes from the client. */
+/**
+ * One implementation, two authenticated domain adapters. No workspace path comes from the
+ * client; a client file path is validated as Git-root-relative before any use.
+ */
 export function createGitRoutes(source: "chapter" | "narrator") {
 	const routes = new Hono<GitEnv>();
 	const prefix = source === "chapter" ? "/:chapterId/git" : "/:id/git";
@@ -221,31 +244,30 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 	);
 	routes.get(`${prefix}/modifications`, async (c) => {
 		const { target, path, git } = access(c);
-		const query = gitModificationsQuerySchema.parse(c.req.query());
+		const parsed = gitModificationsQuerySchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const query = parsed.data;
 		if (query.narratorId && query.narratorId !== "external")
 			await requireNarratorAccess(c, query.narratorId, "read");
+		if (query.filePath !== undefined) validateFilePaths([query.filePath]);
 		const cursor = modificationCursor(c);
 		const status = query.scope === "uncommitted" ? await git.getStatusSummary(path) : null;
-		const pathAliases = new Map<string, string>();
-		for (const file of status?.files ?? [])
-			if (file.oldPath) pathAliases.set(file.oldPath, file.path);
-		const directScopes = gitAttributionScopes(target, status?.files.map((file) => file.path) ?? []);
+		const files = status ? modificationFiles(status, query.filePath) : null;
+		const directScopes = gitAttributionScopes(target, files?.filePaths ?? []);
 		const discoveredScopes = await collectGitAttributionScopes(target, c.req.raw.signal);
+		// Discovered cwd keys hold stored rows; ancestor-directory guesses come after them.
+		// The view drops spellings with no rows before applying its own scope cap.
 		const scopeMap = new Map(
-			[...directScopes.scopes, ...discoveredScopes.scopes].map((scope) => [
+			[...discoveredScopes.scopes, ...directScopes.scopes].map((scope) => [
 				scope.workspacePath,
 				scope,
 			]),
 		);
-		const mergedScopes = [...scopeMap.values()];
 		const scopesTruncated =
-			directScopes.truncated ||
-			discoveredScopes.truncated ||
-			status?.truncated === true ||
-			mergedScopes.length > 32;
+			directScopes.truncated || discoveredScopes.truncated || files?.truncated === true;
 		const view = await getWorkspaceModificationView(path, {
 			deviceId: target.workspace.deviceId,
-			additionalScopes: mergedScopes.slice(0, 32),
+			additionalScopes: [...scopeMap.values()],
 			additionalScopesTruncated: scopesTruncated,
 			currentDiff: query.scope === "uncommitted",
 			signal: c.req.raw.signal,
@@ -255,12 +277,7 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 			until: query.until,
 			narratorId: query.narratorId,
 			projection: query.projection,
-			...(status
-				? {
-						filePaths: [...status.files.map((file) => file.path), ...pathAliases.keys()],
-						pathAliases,
-					}
-				: {}),
+			...(files ? { filePaths: files.filePaths, pathAliases: files.pathAliases } : {}),
 		});
 		if (scopesTruncated) {
 			view.hasMore = true;

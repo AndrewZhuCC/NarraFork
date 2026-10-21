@@ -7,6 +7,7 @@ import {
 	Group,
 	HoverCard,
 	Loader,
+	rem,
 	ScrollArea,
 	Stack,
 	Text,
@@ -30,19 +31,16 @@ import {
 	IconSparkles,
 	IconTrash,
 } from "@tabler/icons-react";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useClipboard } from "../../hooks/useClipboard";
 import {
-	type CurrentDiffFile,
 	type CurrentDiffTarget,
-	type CurrentDiffView,
-	type FileModificationGroup,
 	useGitAiCommitMessage,
 	useGitCommit,
 	useGitDiscard,
+	useGitFileModifications,
 	useGitLineStats,
-	useGitModifications,
 	useGitStage,
 	useGitStatus,
 	useGitUnstage,
@@ -52,6 +50,7 @@ import { useGitStatusFilter } from "../../hooks/useGitStatusFilter";
 import { useGitViewMode } from "../../hooks/useGitViewMode";
 import { type GitTarget, gitCanWrite, gitTargetKey } from "../../lib/api/git";
 import { formatLocaleDateTime } from "../../lib/intl-format";
+import { observePageLifecycle } from "../../lib/page-lifecycle";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { buildAttributionLabels } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
@@ -126,9 +125,8 @@ interface TreeContext {
 	onAction: (files: string[]) => void;
 	onOpenFile: (path: string) => void;
 	onDiscard?: (path: string) => void;
-	attrByPath: Map<string, FileModificationGroup>;
-	currentByPath: Map<string, CurrentDiffFile>;
-	currentDiff?: CurrentDiffView;
+	/** Attribution is read per file when its hover card opens, never for the whole list. */
+	target: GitTarget;
 	t: Translate;
 }
 
@@ -162,7 +160,6 @@ export function GitChangesTab({
 			),
 		[lineStats.data, lineStats.error],
 	);
-	const { data: modifications } = useGitModifications(target);
 	const stage = useGitStage(target);
 	const unstage = useGitUnstage(target);
 	const commit = useGitCommit(target);
@@ -177,15 +174,6 @@ export function GitChangesTab({
 	const statusFilter = useGitStatusFilter(preferenceKey, legacyChapterId);
 	const stagedFolders = useGitFolderPrefs(preferenceKey, "staged", legacyChapterId);
 	const unstagedFolders = useGitFolderPrefs(preferenceKey, "unstaged", legacyChapterId);
-
-	const attrByPath = useMemo(
-		() => new Map((modifications?.byFile ?? []).map((g) => [g.filePath, g])),
-		[modifications?.byFile],
-	);
-	const currentByPath = useMemo(
-		() => new Map((modifications?.currentDiff?.byFile ?? []).map((file) => [file.filePath, file])),
-		[modifications?.currentDiff?.byFile],
-	);
 
 	if (isLoading) return <Loader size="sm" />;
 	if (error)
@@ -317,9 +305,7 @@ export function GitChangesTab({
 								discard.mutate({ files: [file] });
 						}
 					: undefined,
-			attrByPath,
-			currentByPath,
-			currentDiff: modifications?.currentDiff,
+			target,
 			t,
 		};
 	}
@@ -889,22 +875,6 @@ function FileRow({
 	const statusChar = gitFileBadgeChar(file.status, ctx.section);
 	const color = statusRegistry.gitFileStatus(statusChar).color;
 	const actionLabel = ctx.action === "stage" ? ctx.t("stageFile") : ctx.t("unstageFile");
-	const observedTarget = ctx.currentByPath.get(file.path)?.[
-		ctx.section === "staged" ? "index" : "worktree"
-	];
-	const currentTarget: CurrentDiffTarget | undefined =
-		ctx.currentDiff?.baselineStatus === "stable"
-			? observedTarget
-			: observedTarget
-				? {
-						...observedTarget,
-						status: "unknown",
-						actor: null,
-						effectId: null,
-						reason: ctx.currentDiff?.baselineStatus === "stale" ? "stale" : "unavailable",
-					}
-				: undefined;
-	const history = ctx.attrByPath.get(file.path);
 
 	return (
 		<TreeRow
@@ -912,7 +882,12 @@ function FileRow({
 			label={ctx.t("viewDiffOf", { path: file.path })}
 			onActivate={() => ctx.onOpenFile(file.path)}
 		>
-			<AttributionHoverCard current={currentTarget} history={history} t={ctx.t}>
+			<AttributionHoverCard
+				target={ctx.target}
+				filePath={file.path}
+				section={ctx.section}
+				t={ctx.t}
+			>
 				<Badge
 					size="xs"
 					color={color}
@@ -968,11 +943,6 @@ function FileRow({
 	);
 }
 
-/**
- * Latest observed actor plus historical participants. None is claimed to own the current
- * diff: v1 timestamp hints have no verified baseline fingerprint or workspace epoch.
- * Missing observations render no badge, not a claim that no one changed the file.
- */
 function formatAttributionTime(value: string): string {
 	try {
 		return formatLocaleDateTime(value, {
@@ -987,28 +957,147 @@ function formatAttributionTime(value: string): string {
 }
 
 function AttributionHoverCard({
-	current,
-	history,
+	target,
+	filePath,
+	section,
 	t,
 	children,
 }: {
-	current?: CurrentDiffTarget;
-	history?: FileModificationGroup;
+	target: GitTarget;
+	filePath: string;
+	section: GitFileSection;
 	t: Translate;
 	children: ReactNode;
 }) {
-	if (current?.status === "clean") return <>{children}</>;
+	// Details mount only while the card is open and the page is in the foreground, so a
+	// closed row holds no query observer and closing the card aborts its in-flight read.
+	const [open, setOpen] = useState(false);
+	useEffect(
+		() => (open ? observePageLifecycle({ onHidden: () => setOpen(false) }) : undefined),
+		[open],
+	);
+
+	return (
+		<HoverCard
+			width={320}
+			shadow="md"
+			withArrow
+			openDelay={120}
+			closeDelay={120}
+			withinPortal
+			onOpen={() => setOpen(true)}
+			onClose={() => setOpen(false)}
+		>
+			<HoverCard.Target>
+				{/* The leading slot of every file row; folder rows reserve the same width. */}
+				<span
+					data-attribution-hover-target="true"
+					style={{
+						display: "inline-flex",
+						flexShrink: 0,
+						width: rem(STATUS_BADGE_WIDTH),
+						cursor: "help",
+					}}
+				>
+					{children}
+				</span>
+			</HoverCard.Target>
+			<HoverCard.Dropdown p="xs">
+				{open && <AttributionDetails target={target} filePath={filePath} section={section} t={t} />}
+			</HoverCard.Dropdown>
+		</HoverCard>
+	);
+}
+
+/**
+ * Latest observed actor plus historical participants. None is claimed to own the current
+ * diff: v1 timestamp hints have no verified baseline fingerprint or workspace epoch.
+ * No recorded observation is a short empty note, not a claim that no one changed the file.
+ */
+function AttributionDetails({
+	target,
+	filePath,
+	section,
+	t,
+}: {
+	target: GitTarget;
+	filePath: string;
+	section: GitFileSection;
+	t: Translate;
+}) {
+	const query = useGitFileModifications(target, filePath);
+	if (!query.data) {
+		if (query.isError)
+			return (
+				<Group gap="xs" wrap="nowrap" justify="space-between">
+					<Text size="xs" c="dimmed">
+						{t("attributionLoadFailedShort")}
+					</Text>
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						onClick={(event) => {
+							// The dropdown is portalled, but React still bubbles to the row's open-diff.
+							event.stopPropagation();
+							void query.refetch();
+						}}
+					>
+						{t("attributionRetry")}
+					</Button>
+				</Group>
+			);
+		return (
+			<Group gap="xs" wrap="nowrap">
+				<Loader size="xs" />
+				<Text size="xs" c="dimmed">
+					{t("attributionLoadingShort")}
+				</Text>
+			</Group>
+		);
+	}
+
+	const currentDiff = query.data.currentDiff;
+	const observed = currentDiff?.byFile.find((file) => file.filePath === filePath)?.[
+		section === "staged" ? "index" : "worktree"
+	];
+	// Evidence being re-read after a Git change is no longer a confirmed current claim.
+	const refreshing = query.isFetching && query.isStale;
+	const current: CurrentDiffTarget | undefined =
+		observed && currentDiff?.baselineStatus === "stable" && !refreshing
+			? observed
+			: observed
+				? {
+						...observed,
+						status: "unknown",
+						actor: null,
+						effectId: null,
+						reason: refreshing
+							? null
+							: currentDiff?.baselineStatus === "stale"
+								? "stale"
+								: "unavailable",
+					}
+				: undefined;
+	const history = query.data.byFile.find((group) => group.filePath === filePath);
+	const showCurrent = !!current && current.status !== "clean";
+	const recentEvents = history?.recentEvents ?? [];
+	if (!showCurrent && recentEvents.length === 0)
+		return (
+			<Text size="xs" c="dimmed">
+				{t("attributionEmptyShort")}
+			</Text>
+		);
+
 	const hasCurrentEvidence =
 		current?.status === "matching_evidence" &&
 		current.actor &&
 		!!current.baselineVersion &&
 		!current.reason;
-	const hasContent = !!current || !!history;
-	if (!hasContent) return <>{children}</>;
-
 	const currentLabel = hasCurrentEvidence
 		? buildAttributionLabels(current.actor, t).detail
-		: t("attributionCurrentUnknownShort");
+		: refreshing && current
+			? t("attributionRefreshingShort")
+			: t("attributionCurrentUnknownShort");
 	const currentTitle = current
 		? t("attributionCurrentEvidenceShort")
 		: t("attributionLastObservedShort");
@@ -1017,93 +1106,81 @@ function AttributionHoverCard({
 		current?.reason && current.reason !== "history_incomplete"
 			? t(`attributionCurrentReasonShort.${current.reason}`)
 			: null;
-	const recentEvents = history?.recentEvents ?? [];
 
 	return (
-		<HoverCard width={320} shadow="md" withArrow openDelay={120} closeDelay={120} withinPortal>
-			<HoverCard.Target>
-				<span
-					data-attribution-hover-target="true"
-					style={{ display: "inline-flex", flexShrink: 0, cursor: "help" }}
-				>
-					{children}
-				</span>
-			</HoverCard.Target>
-			<HoverCard.Dropdown p="xs">
-				<Stack gap={6}>
-					<div>
-						<Text size="xs" c="dimmed">
-							{currentTitle}
+		<Stack gap={6}>
+			{current?.status !== "clean" && (
+				<div>
+					<Text size="xs" c="dimmed">
+						{currentTitle}
+					</Text>
+					<Text size="sm" fw={600} lineClamp={1} title={currentLabel}>
+						{currentLabel}
+					</Text>
+					{reason && (
+						<Text size="xs" c="dimmed" lineClamp={2}>
+							{reason}
 						</Text>
-						<Text size="sm" fw={600} lineClamp={1} title={currentLabel}>
-							{currentLabel}
-						</Text>
-						{reason && (
-							<Text size="xs" c="dimmed" lineClamp={2}>
-								{reason}
-							</Text>
-						)}
-					</div>
+					)}
+				</div>
+			)}
 
-					{recentEvents.length > 0 && (
-						<div>
-							<Text size="xs" c="dimmed" mb={2}>
-								{t("attributionHistoryShort")}
-							</Text>
-							{/* Mantine default item gap is spacing-xl; hover history wants a dense list. */}
-							<Timeline
-								bulletSize={8}
-								lineWidth={1}
-								styles={{
-									item: { marginTop: 4, paddingTop: 0, paddingBottom: 0 },
-									itemTitle: { marginBottom: 0, lineHeight: 1.3 },
-									itemBody: { paddingTop: 0, paddingBottom: 0 },
-								}}
-							>
-								{recentEvents.map((event) => {
-									const labels = buildAttributionLabels(event.actor, t);
-									const added = event.linesAdded;
-									const removed = event.linesRemoved;
-									const hasLineStats = typeof added === "number" || typeof removed === "number";
-									const showLineStats =
-										hasLineStats && !((added ?? 0) === 0 && (removed ?? 0) === 0);
-									return (
-										<Timeline.Item
-											key={event.id}
-											title={
-												<Text size="xs" fw={500} lineClamp={1} title={labels.detail}>
-													{labels.detail}
-												</Text>
-											}
-										>
-											<Group gap={6} wrap="nowrap" justify="space-between">
-												<Text size="xs" c="dimmed" lineClamp={1}>
-													{t(`attributionAction.${event.action}`)} ·{" "}
-													{formatAttributionTime(event.changedAt)}
-												</Text>
-												{showLineStats && (
-													<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-														{typeof added === "number" && added > 0 && (
-															<Text size="xs" c="green" ff="monospace">
-																+{added}
-															</Text>
-														)}
-														{typeof removed === "number" && removed > 0 && (
-															<Text size="xs" c="red" ff="monospace">
-																-{removed}
-															</Text>
-														)}
-													</Group>
+			{recentEvents.length > 0 && (
+				<div>
+					<Text size="xs" c="dimmed" mb={2}>
+						{t("attributionHistoryShort")}
+					</Text>
+					{/* Mantine default item gap is spacing-xl; hover history wants a dense list. */}
+					<Timeline
+						bulletSize={8}
+						lineWidth={1}
+						styles={{
+							item: { marginTop: 4, paddingTop: 0, paddingBottom: 0 },
+							itemTitle: { marginBottom: 0, lineHeight: 1.3 },
+							itemBody: { paddingTop: 0, paddingBottom: 0 },
+						}}
+					>
+						{recentEvents.map((event) => {
+							const labels = buildAttributionLabels(event.actor, t);
+							const added = event.linesAdded;
+							const removed = event.linesRemoved;
+							const hasLineStats = typeof added === "number" || typeof removed === "number";
+							const showLineStats = hasLineStats && !((added ?? 0) === 0 && (removed ?? 0) === 0);
+							return (
+								<Timeline.Item
+									key={event.id}
+									title={
+										<Text size="xs" fw={500} lineClamp={1} title={labels.detail}>
+											{labels.detail}
+										</Text>
+									}
+								>
+									<Group gap={6} wrap="nowrap" justify="space-between">
+										<Text size="xs" c="dimmed" lineClamp={1}>
+											{t(`attributionAction.${event.action}`)} ·{" "}
+											{formatAttributionTime(event.changedAt)}
+										</Text>
+										{showLineStats && (
+											<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+												{typeof added === "number" && added > 0 && (
+													<Text size="xs" c="green" ff="monospace">
+														+{added}
+													</Text>
+												)}
+												{typeof removed === "number" && removed > 0 && (
+													<Text size="xs" c="red" ff="monospace">
+														-{removed}
+													</Text>
 												)}
 											</Group>
-										</Timeline.Item>
-									);
-								})}
-							</Timeline>
-						</div>
-					)}
-				</Stack>
-			</HoverCard.Dropdown>
-		</HoverCard>
+										)}
+									</Group>
+								</Timeline.Item>
+							);
+						})}
+					</Timeline>
+				</div>
+			)}
+		</Stack>
 	);
 }

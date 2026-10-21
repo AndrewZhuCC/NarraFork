@@ -15,6 +15,41 @@ import type {
 const MAX_ATTRIBUTION_SCOPES = 32;
 const MAX_ATTRIBUTION_SCOPE_CANDIDATES = 64;
 const ATTRIBUTION_SCOPE_PROBE_BUDGET_MS = 5_000;
+/**
+ * Hover cards read history one file at a time, and each read repeats discovery. Probe
+ * outcomes (one Git process or RPC each) are reused briefly; the candidate keyset is
+ * still re-read every time, so a newly recorded cwd key is never missed.
+ */
+const SCOPE_PROBE_CACHE_TTL_MS = 30_000;
+const SCOPE_PROBE_CACHE_MAX_ENTRIES = 256;
+
+type ScopeProbe = { state?: string; rootPath?: string };
+const scopeProbeCache = new Map<string, { probe: ScopeProbe; expiresAt: number }>();
+
+/** Thrown probes are not cached: a timeout or cancellation says nothing about the path. */
+export async function cachedScopeProbe(
+	key: string,
+	probe: () => Promise<ScopeProbe>,
+	now = Date.now(),
+): Promise<ScopeProbe> {
+	const cached = scopeProbeCache.get(key);
+	if (cached && cached.expiresAt > now) return cached.probe;
+	scopeProbeCache.delete(key);
+	const { state, rootPath } = await probe();
+	if (scopeProbeCache.size >= SCOPE_PROBE_CACHE_MAX_ENTRIES) {
+		const oldest = scopeProbeCache.keys().next().value;
+		if (oldest !== undefined) scopeProbeCache.delete(oldest);
+	}
+	scopeProbeCache.set(key, {
+		probe: { state, rootPath },
+		expiresAt: now + SCOPE_PROBE_CACHE_TTL_MS,
+	});
+	return { state, rootPath };
+}
+
+export function resetScopeProbeCacheForTest(): void {
+	scopeProbeCache.clear();
+}
 
 function storedWorkspacePath(target: GitWorkspaceTarget, path: string): string {
 	return target.workspace.deviceId === LOCAL_DEVICE_ID
@@ -114,9 +149,9 @@ export async function collectGitAttributionScopes(
 		if (scopes.has(candidate)) continue;
 		try {
 			probeSignal.throwIfAborted();
-			const probe = remote
-				? await remote.probe(candidate)
-				: await probeLocalGitWorkspace(candidate, probeSignal);
+			const probe = await cachedScopeProbe(`${workspace.deviceId}\0${candidate}`, () =>
+				remote ? remote.probe(candidate) : probeLocalGitWorkspace(candidate, probeSignal),
+			);
 			if (probe.state !== "ready" || !probe.rootPath) {
 				truncated = true;
 				continue;
