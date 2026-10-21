@@ -29,7 +29,7 @@ import commonEn from "../../locales/en/common.json";
 import dashboardEn from "../../locales/en/dashboard.json";
 import narratorEn from "../../locales/en/narrator.json";
 import navEn from "../../locales/en/nav.json";
-import { NeedsAttention } from "../dashboard/NeedsAttention";
+import { DashboardSessions, useDashboardSessions } from "../dashboard/DashboardSessions";
 import { NotificationCenterDrawer } from "../notifications/NotificationCenterDrawer";
 import {
 	HumanAttentionInboxButton,
@@ -1119,7 +1119,7 @@ test("failed blocking question reflection keeps its draft and explicit retry", a
 	expect(readSession("ask-draft", blocking.toolCallId)).not.toBeNull();
 });
 
-test("Dashboard uses summaries only and View all opens notification center pending tab", async () => {
+test("Dashboard uses summaries only and Open inbox opens notification center pending tab", async () => {
 	addPermission(item("dashboard"));
 	const narrators = track(
 		spyOn(api, "listNarratorsPaginated").mockResolvedValue({
@@ -1131,12 +1131,19 @@ test("Dashboard uses summaries only and View all opens notification center pendi
 	);
 	const permissions = track(spyOn(api, "getPendingPermissions"));
 	const detail = spyOn(api, "getHumanAttentionDetail");
-	await render(<NeedsAttention />);
-	expect(narrators).toHaveBeenCalledTimes(1);
-	expect(narrators.mock.calls[0][0]?.status).toBeUndefined();
+	function Dashboard() {
+		return <DashboardSessions data={useDashboardSessions()} />;
+	}
+	await render(<Dashboard />);
+	// Live lists are status-filtered server-side; only the recent list is unfiltered.
+	expect(narrators.mock.calls.map((call) => call[0]?.status ?? "all").sort()).toEqual([
+		"all",
+		"waiting",
+		"working",
+	]);
 	expect(permissions).not.toHaveBeenCalled();
 	expect(detail).not.toHaveBeenCalled();
-	await click("View all");
+	await click("Open inbox");
 	expect(document.body.textContent).toContain("Notifications");
 	expect(document.body.textContent).not.toContain("Human attention center");
 	expect(document.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Pending");

@@ -1,0 +1,38 @@
+.row {
+	display: flex;
+	align-items: center;
+	gap: var(--mantine-spacing-sm);
+	width: 100%;
+	padding: 10px var(--mantine-spacing-sm);
+	border-radius: var(--mantine-radius-md);
+	text-decoration: none;
+	color: inherit;
+	transition: background-color 120ms ease;
+}
+
+.row:hover,
+.row:focus-visible {
+	background-color: var(--mantine-color-default-hover);
+}
+
+.indicator {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 28px;
+	height: 28px;
+	flex-shrink: 0;
+}
+
+.dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+}
+
+.attentionGroup {
+	border: 1px solid color-mix(in srgb, var(--mantine-color-yellow-filled) 35%, transparent);
+	background-color: var(--mantine-color-yellow-light);
+	border-radius: var(--mantine-radius-lg);
+	padding: 4px;
+}
