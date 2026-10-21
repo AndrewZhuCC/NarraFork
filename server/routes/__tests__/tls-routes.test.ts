@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { invalidateUserCache } from "../../middleware/auth";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-tls-routes-"));
@@ -13,7 +16,29 @@ process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = "1";
 const { settings } = await import("../../lib/settings");
 const { tlsRoutes } = await import("../tls");
 
+/**
+ * `requireAdmin` authorizes against the LIVE role read through the session store, never the
+ * token's `role` claim. The middleware below only sets `c.get("user")`, so this seam makes
+ * the store resolve each principal's role by actor id ("admin-id" → admin, anything else →
+ * user). Without it the lookup would hit the real database and a non-admin would surface as
+ * 401 USER_GONE instead of the expected 403 ADMIN_REQUIRED.
+ */
+const ADMIN_ACTOR_ID = "admin-id";
+const NON_ADMIN_ACTOR_ID = "user-id";
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === ADMIN_ACTOR_ID ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 afterAll(() => {
+	setAuthStores(undefined);
+	invalidateUserCache(ADMIN_ACTOR_ID);
+	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
