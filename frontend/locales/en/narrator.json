@@ -751,6 +751,7 @@
 	"quotaExhaustedWaitNotPossibleNoReset": "{{provider}} quota exhausted, and the reset time could not be read. Retry after the allowance restores.",
 	"modelTemporarilyUnavailable": "Temporarily unavailable",
 	"refreshProviderModels": "Refresh models",
+	"openProviderSettings": "Provider settings",
 	"refreshProviderModelsErrorTitle": "Failed to refresh models",
 	"leakedToolCaptureBadge": "Captured from stream",
 	"leakedToolCaptureTooltip": "This tool call was extracted from leaked XML in the model's streamed text rather than a native tool-call field.",

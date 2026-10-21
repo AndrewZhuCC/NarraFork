@@ -750,6 +750,7 @@
 	"quotaExhaustedWaitNotPossibleNoReset": "{{provider}} 额度已用尽，且未能读到重置时间 — 请等额度恢复后重试。",
 	"modelTemporarilyUnavailable": "暂时不可用",
 	"refreshProviderModels": "刷新模型列表",
+	"openProviderSettings": "供应商设置",
 	"refreshProviderModelsErrorTitle": "刷新模型列表失败",
 	"leakedToolCaptureBadge": "来自流式捕获",
 	"leakedToolCaptureTooltip": "此工具调用是从模型流式文本中泄漏的 XML 提取出来的，而非来自原生工具调用字段。",
