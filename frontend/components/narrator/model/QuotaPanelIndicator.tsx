@@ -11,6 +11,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { formatFullLocaleDateTime } from "../../../lib/format";
+import { QuotaWindowBars } from "./QuotaWindowBars";
 import {
 	formatQuotaAmount,
 	formatQuotaBadgeText,
@@ -178,8 +179,9 @@ export interface QuotaPanelIndicatorProps {
 }
 
 /**
- * Status-bar allowance indicator: a badge with the limiting window's remaining
- * share, opening a panel with one progress bar per window (remaining share,
+ * Status-bar allowance indicator: one Codex-style vertical bar per window
+ * (5-hour, weekly, monthly …) filled to its remaining share — or a text badge
+ * while no window is reported — opening a panel with one progress bar per window (remaining share,
  * used/total when known, reset countdown) plus provider-specific rows.
  */
 export function QuotaPanelIndicator({
@@ -214,7 +216,7 @@ export function QuotaPanelIndicator({
 	const level: QuotaLevel = waitingForQuota && view.level !== "exhausted" ? "critical" : view.level;
 	const color = QUOTA_LEVEL_COLORS[level];
 	const text = formatQuotaBadgeText(view, t);
-	const ariaLabel = [view.title, ...formatQuotaSummaryLines(view, now, t)].join(". ");
+	const ariaLabel = [view.title, text, ...formatQuotaSummaryLines(view, now, t)].join(". ");
 
 	return (
 		<Popover
@@ -245,17 +247,31 @@ export function QuotaPanelIndicator({
 					onPointerLeave={() => {
 						if (!isMobile) scheduleClose();
 					}}
-					style={{ flexShrink: 0 }}
+					style={{
+						flexShrink: 0,
+						display: "flex",
+						alignItems: "center",
+						height: 24,
+						cursor: "pointer",
+					}}
 				>
-					<Badge
-						size="sm"
-						radius="sm"
-						variant={level === "ok" || level === "unknown" ? "light" : "filled"}
-						color={color}
-						style={{ cursor: "pointer", textTransform: "none" }}
-					>
-						{text}
-					</Badge>
+					{view.windows.length > 0 ? (
+						<QuotaWindowBars
+							bars={view.windows}
+							forceLevel={waitingForQuota ? "critical" : undefined}
+							stale={view.failed}
+						/>
+					) : (
+						<Badge
+							size="sm"
+							radius="sm"
+							variant={level === "ok" || level === "unknown" ? "light" : "filled"}
+							color={color}
+							style={{ cursor: "pointer", textTransform: "none" }}
+						>
+							{text}
+						</Badge>
+					)}
 				</UnstyledButton>
 			</Popover.Target>
 			<Popover.Dropdown

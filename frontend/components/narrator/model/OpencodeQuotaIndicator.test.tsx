@@ -129,8 +129,14 @@ describe("OpencodeQuotaIndicator", () => {
 
 	test("badge names the limiting window; the panel lists only reported windows", async () => {
 		mount({ usage: usage() });
+		// One vertical bar per reported window; the limiting one leads the label.
+		const bars = trigger().querySelectorAll("[data-quota-bar]");
+		expect([...bars].map((bar) => bar.getAttribute("data-quota-bar"))).toEqual([
+			"fiveHour",
+			"weekly",
+		]);
 		// Rolling has 63% left, weekly 88%: the rolling window bounds the account.
-		expect(trigger().textContent).toBe("5h 63%");
+		expect(trigger().getAttribute("aria-label")).toContain("5h 63%");
 		const panel = await openPanel();
 		expect(panel).toContain("5-hour limit");
 		expect(panel).toContain("Weekly limit");
@@ -140,10 +146,12 @@ describe("OpencodeQuotaIndicator", () => {
 		expect(panel).toContain("Resets Monday, in");
 	});
 
-	test("an OpenCode quota wait turns the badge red and shows the wait in the panel", async () => {
+	test("an OpenCode quota wait turns the bars red and shows the wait in the panel", async () => {
 		mount({ usage: usage(), waitingForQuota: true, waitingText: "Waiting for quota · soon" });
-		const badge = trigger().querySelector("[data-variant]");
-		expect(badge?.getAttribute("data-variant")).toBe("filled");
+		const levels = [...trigger().querySelectorAll("[data-quota-bar]")].map((bar) =>
+			bar.getAttribute("data-level"),
+		);
+		expect(levels).toEqual(["critical", "critical"]);
 		expect(await openPanel()).toContain("Waiting for quota · soon");
 	});
 
@@ -189,10 +197,13 @@ describe("QuotaPanelIndicator with a Kimi allowance", () => {
 		});
 	}
 
-	test("badge shows the limiting window; panel has bars, amounts and countdown", async () => {
+	test("trigger draws a bar per window; panel has bars, amounts and countdown", async () => {
 		mountKimi();
-		expect(trigger().textContent).toBe("5h 8%");
-		expect(trigger().querySelector("[data-variant]")?.getAttribute("data-variant")).toBe("filled");
+		const levels = [...trigger().querySelectorAll("[data-quota-bar]")].map((bar) =>
+			bar.getAttribute("data-level"),
+		);
+		expect(levels).toEqual(["critical", "ok"]);
+		expect(trigger().getAttribute("aria-label")).toContain("5h 8%");
 		const panel = await openPanel();
 		expect(panel).toContain("Kimi usage");
 		expect(panel).toContain("5-hour limit");

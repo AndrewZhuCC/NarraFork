@@ -48,6 +48,7 @@ import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
 import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
 import type { QuotaPanelView } from "../model/quota-panel-view";
+import { useKimiProviderBadges } from "../model/use-kimi-provider-badges";
 import { useOpencodeProviderBadges } from "../model/use-opencode-provider-badges";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
@@ -324,6 +325,17 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	const opencodeProviderBadges = useOpencodeProviderBadges(
 		model.settingsData,
 		menuOpenDesktop || menuOpenMobile,
+	);
+	const kimiProviderBadges = useKimiProviderBadges(
+		model.settingsData,
+		menuOpenDesktop || menuOpenMobile,
+	);
+	const providerQuotaBadges = useMemo(
+		() =>
+			opencodeProviderBadges || kimiProviderBadges
+				? { ...kimiProviderBadges, ...opencodeProviderBadges }
+				: undefined,
+		[opencodeProviderBadges, kimiProviderBadges],
 	);
 
 	// Quota-details popover open state + its delayed-close timer. Kept internal to
@@ -746,7 +758,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																}
 																onShowPrice={setPriceModel}
 																providerLabels={model.providerLabels}
-																providerBadges={opencodeProviderBadges}
+																providerBadges={providerQuotaBadges}
 																onEditDefaultModel={model.onEditDefaultModel}
 																onEditSummaryModel={model.onEditSummaryModel}
 																onSetAsDefaultModel={model.onSetAsDefaultModel}
@@ -1023,7 +1035,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															onSelect={(v) => model.mutation.mutate({ id: narratorId, model: v })}
 															onShowPrice={setPriceModel}
 															providerLabels={model.providerLabels}
-															providerBadges={opencodeProviderBadges}
+															providerBadges={providerQuotaBadges}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
 															onSetAsDefaultModel={model.onSetAsDefaultModel}
