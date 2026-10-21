@@ -187,6 +187,7 @@ import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepse
 import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
 import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
+import { isSub2ApiSubscriptionSnapshot } from "./model/sub2api-subscription-quota-view";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
@@ -778,6 +779,10 @@ function NarratorPanelBody({
 		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
 		firstScreenActivity,
 	);
+	// The query already isolates provider/generation; this layer only selects the mode.
+	const sub2ApiSubscriptionSnapshot = isSub2ApiSubscriptionSnapshot(providerBalanceQuery.data)
+		? providerBalanceQuery.data
+		: null;
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1193,6 +1198,11 @@ function NarratorPanelBody({
 		if (usageSource === "kimi") {
 			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
+		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
+			// The shared window panel owns subscription amounts, including unknown/stale
+			// placeholders. Do not duplicate them in the generic balance text slot.
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
+		}
 		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
 			return {
 				providerId: cfg.id,
@@ -1220,6 +1230,7 @@ function NarratorPanelBody({
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,
 		currentBalanceProviderId,
+		sub2ApiSubscriptionSnapshot,
 		providerBalanceQuery.data,
 		providerBalanceQuery.isError,
 		balanceT,
@@ -3619,10 +3630,16 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								// Command Code renders through `panel`; its generic slot stays empty.
+								// Structured subscription quotas are rendered by the status bar, not this text slot.
 								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
 								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
 								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
+								sub2api: sub2ApiSubscriptionSnapshot
+									? {
+											snapshot: sub2ApiSubscriptionSnapshot,
+											queryFailed: providerBalanceQuery.isError,
+										}
+									: undefined,
 								opencode: opencodeQuotaProps,
 								panel: quotaPanelProps,
 								shouldShowNugRechargeButton,

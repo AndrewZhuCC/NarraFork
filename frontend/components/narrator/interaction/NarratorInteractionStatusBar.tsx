@@ -14,6 +14,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -48,6 +49,7 @@ import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
 import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
 import type { QuotaPanelView } from "../model/quota-panel-view";
+import { Sub2ApiSubscriptionQuotaIndicator } from "../model/Sub2ApiSubscriptionQuotaIndicator";
 import { useKimiProviderBadges } from "../model/use-kimi-provider-badges";
 import { useOpencodeProviderBadges } from "../model/use-opencode-provider-badges";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
@@ -225,6 +227,8 @@ export interface NarratorInteractionStatusBarProps {
 			waitingForQuota: boolean;
 			waitingText: string | null;
 		};
+		/** The active sub2api subscription, already isolated by the balance query. */
+		sub2api?: { snapshot: ProviderBalanceSnapshot; queryFailed: boolean };
 		/**
 		 * Windowed allowance of another provider (Kimi, Command Code), shown with the
 		 * same progress-bar indicator as OpenCode Go. `undefined` when not applicable.
@@ -574,6 +578,13 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									isMobile={isMobileViewport}
 								/>
 							)}
+							{quota.sub2api && !isWorkspacePreview && (
+								<Sub2ApiSubscriptionQuotaIndicator
+									snapshot={quota.sub2api.snapshot}
+									queryFailed={quota.sub2api.queryFailed}
+									isMobile={isMobileViewport}
+								/>
+							)}
 							{quota.panel && !isWorkspacePreview && (
 								<QuotaPanelIndicator
 									view={quota.panel.view}
@@ -583,7 +594,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 								/>
 							)}
 							{/* Generic gateway/API quota balance */}
-							{quota.balance != null &&
+							{!quota.sub2api &&
+								quota.balance != null &&
 								(quota.hasDetailsPopover ? (
 									<Popover
 										opened={quotaDetailsOpened}

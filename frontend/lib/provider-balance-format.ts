@@ -11,7 +11,8 @@ function amountText(value: number | null | undefined, unit: string, t: Translate
 			: unit === "TOKENS"
 				? t("providerBalance.tokens")
 				: unit;
-	return `${formatLocaleNumber(value, { maximumSignificantDigits: 12 })} ${label}`;
+	const amount = formatLocaleNumber(value, { maximumSignificantDigits: 12 });
+	return unit === "QUOTA" || unit === "TOKENS" ? `${amount} ${label}` : `${label} ${amount}`;
 }
 
 function remainingText(amount: ProviderBalanceAmount, t: Translate): string {
@@ -30,7 +31,8 @@ export function formatProviderBalance(
 		const text = t(`providerBalance.${queryFailed ? "failed" : (snapshot?.status ?? "pending")}`);
 		return { quotaBalance: text, detailedQuotaBalance: text };
 	}
-	const scope = t(`providerBalance.${balance.scope}`);
+	// A wallet needs no scope label; key/subscription allowances still need that distinction.
+	const scope = balance.scope === "wallet" ? "" : t(`providerBalance.${balance.scope}`);
 	const values = balance.unlimited
 		? t("providerBalance.unlimited")
 		: balance.amounts.map((amount) => remainingText(amount, t)).join(" / ") ||
@@ -41,22 +43,23 @@ export function formatProviderBalance(
 		failed ? t("providerBalance.failed") : "",
 		stale ? t("providerBalance.stale") : "",
 	].filter(Boolean);
-	const summary = `${scope}: ${values}${suffix.length ? ` · ${suffix.join(" · ")}` : ""}`;
-	const lines = [summary];
-	if (snapshot.adapter) lines.push(t("providerBalance.source", { source: snapshot.adapter }));
-	if (!balance.unlimited) {
-		for (const amount of balance.amounts) {
-			const details = [remainingText(amount, t)];
-			if (amount.used != null)
-				details.push(
-					t("providerBalance.used", { amount: amountText(amount.used, amount.unit, t) }),
-				);
-			if (amount.total != null)
-				details.push(
-					t("providerBalance.total", { amount: amountText(amount.total, amount.unit, t) }),
-				);
-			lines.push(details.join(" · "));
-		}
-	}
+	const summary = `${scope ? `${scope}: ` : ""}${values}${suffix.length ? ` · ${suffix.join(" · ")}` : ""}`;
+	const lines =
+		balance.unlimited || balance.amounts.length === 0
+			? [values]
+			: balance.amounts.map((amount) => {
+					const details = [remainingText(amount, t)];
+					if (amount.used != null)
+						details.push(
+							t("providerBalance.used", { amount: amountText(amount.used, amount.unit, t) }),
+						);
+					if (amount.total != null)
+						details.push(
+							t("providerBalance.total", { amount: amountText(amount.total, amount.unit, t) }),
+						);
+					return details.join(" · ");
+				});
+	if (scope) lines.unshift(scope);
+	if (suffix.length) lines.push(suffix.join(" · "));
 	return { quotaBalance: summary, detailedQuotaBalance: lines.join("\n") };
 }
