@@ -74,6 +74,25 @@ describe("immutable accepted file references", () => {
 		expect(() => parseFileReferenceSnapshotsJson('[{"type":"file_reference"}]')).toThrow();
 	});
 
+	test("freeze and queue JSON preserve explicit hash kinds without rewriting legacy metadata", () => {
+		for (const expectedHashKind of [undefined, "decoded-sha256", "raw-sha256"] as const) {
+			const input = snapshot();
+			input.reference.expectedHash = "a".repeat(64);
+			if (expectedHashKind) input.reference.expectedHashKind = expectedHashKind;
+			const accepted = freezeFileReferenceSnapshots([input]);
+			expect(accepted[0].reference).toEqual(input.reference);
+			expect(JSON.stringify(accepted)).toBe(JSON.stringify([input]));
+			expect(parseFileReferenceSnapshotsJson(JSON.stringify(accepted))).toEqual(accepted);
+			if (!expectedHashKind) expect(accepted[0].reference).not.toHaveProperty("expectedHashKind");
+			const legacy = snapshot();
+			legacy.reference.expectedHash = input.reference.expectedHash;
+			const projected = projectFileReferenceText("inspect", accepted);
+			expect(projected).toBe(projectFileReferenceText("inspect", [legacy]));
+			expect(projected).toContain("10 | first\n11 | second\n12 | 末");
+			expect(headerLinks(projected)[0].href).toEndWith("#L10-L12");
+		}
+	});
+
 	test("public locator whitelist never copies snapshot payloads", () => {
 		const data = snapshot();
 		const dirtyReference = { ...data.reference, snapshotText: "not public" };

@@ -274,6 +274,8 @@ export class WorkspaceDockStore {
 	}
 
 	addFileReference(narratorId: string, reference: FileReference) {
+		const chat = this.narratorPanel(narratorId);
+		if (chat) this.activateResource(chat);
 		this.getBridges(narratorId).addFileReference?.(reference);
 	}
 

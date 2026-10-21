@@ -8,6 +8,7 @@ import {
 	type FilePanelPage,
 	type FileReference,
 	type FileReferenceCandidate,
+	type FileReferenceHashKind,
 	type FileReferencePreview,
 	type FileReferenceSearchResult,
 	type FileReferenceSnapshot,
@@ -183,7 +184,7 @@ export function evaluateFileReferenceReadPolicy(
 	return mode === "readOnly" ? "deny" : "ask";
 }
 
-/** The saved decoded document hash is also the /fs/edit-source optimistic lock token. */
+/** Decoded text hash retained for legacy references and file previews. */
 export function hashFileReferenceText(text: string): string {
 	return createHash("sha256").update(text, "utf8").digest("hex");
 }
@@ -584,6 +585,7 @@ export function createFileReferenceService(
 		op: Operation,
 		devices: Map<string, Promise<DeviceContext>>,
 		expectedHash?: string,
+		expectedHashKind?: FileReferenceHashKind,
 	) {
 		const file = await authorize(scope, input, op, devices);
 		if (file.stat.size > MAX_FILE_REFERENCE_SOURCE_BYTES)
@@ -620,7 +622,11 @@ export function createFileReferenceService(
 		if (decoded.text.includes("\0"))
 			throw failure("BINARY", "Only text files can be referenced", 415);
 		const hash = hashFileReferenceText(decoded.text);
-		if (expectedHash !== undefined && expectedHash !== hash)
+		const verificationHash =
+			expectedHashKind === "raw-sha256"
+				? createHash("sha256").update(result.bytes).digest("hex")
+				: hash;
+		if (expectedHash !== undefined && expectedHash !== verificationHash)
 			throw failure(
 				"STALE",
 				"Saved file has changed; reload or save your selection before sending",
@@ -721,7 +727,14 @@ export function createFileReferenceService(
 					parsed.data,
 					op,
 					async (reference): Promise<FileReferenceSnapshot> => {
-						const file = await read(scope, reference, op, devices, reference.expectedHash);
+						const file = await read(
+							scope,
+							reference,
+							op,
+							devices,
+							reference.expectedHash,
+							reference.expectedHashKind,
+						);
 						const bytes = Buffer.byteLength(file.selectedText, "utf8");
 						totalBytes += bytes;
 						if (

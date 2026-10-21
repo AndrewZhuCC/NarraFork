@@ -37,21 +37,30 @@ export const fileTargetSchema = z.strictObject({
 });
 
 /** Strict objects deliberately reject every server-owned snapshot field. */
-export const fileReferenceSchema = fileTargetSchema.extend({
-	id: z.string().min(1).max(256),
-	label: z.string().min(1).max(MAX_FILE_REFERENCE_PATH_CHARS),
-	inputRange: z
-		.tuple([
-			z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-			z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-		])
-		.refine(([start, end]) => end >= start, "Invalid input range")
-		.optional(),
-	expectedHash: z
-		.string()
-		.regex(/^[a-f0-9]{64}$/)
-		.optional(),
-});
+export const fileReferenceSchema = fileTargetSchema
+	.extend({
+		id: z.string().min(1).max(256),
+		label: z.string().min(1).max(MAX_FILE_REFERENCE_PATH_CHARS),
+		inputRange: z
+			.tuple([
+				z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+				z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+			])
+			.refine(([start, end]) => end >= start, "Invalid input range")
+			.optional(),
+		expectedHash: z
+			.string()
+			.regex(/^[a-f0-9]{64}$/)
+			.optional(),
+		expectedHashKind: z.enum(["decoded-sha256", "raw-sha256"]).optional(),
+	})
+	.refine(
+		(reference) => reference.expectedHashKind === undefined || reference.expectedHash !== undefined,
+		{
+			message: "Saved-file hash kind requires an expected hash",
+			path: ["expectedHash"],
+		},
+	);
 
 const metadataWithinBudget = (value: unknown) =>
 	Buffer.byteLength(JSON.stringify(value), "utf8") <= MAX_FILE_REFERENCE_METADATA_BYTES;

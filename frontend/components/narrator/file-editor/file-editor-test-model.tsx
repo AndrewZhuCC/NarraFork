@@ -96,6 +96,9 @@ export class TestEditorModel {
 		});
 	}
 	getModel = () => this as unknown as editor.ITextModel;
+	textFocused = true;
+	hasTextFocus = () => this.textFocused;
+	getSelection = () => this.selected;
 	focus = () => {};
 	getEditor = () => this as unknown as editor.IStandaloneCodeEditor;
 }

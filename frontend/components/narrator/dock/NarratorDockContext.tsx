@@ -643,10 +643,11 @@ export function NarratorDockProvider({
 			if (bridgesRef.current.addFileReference === fn) bridgesRef.current.addFileReference = null;
 		};
 	}, []);
-	const addFileReference = useCallback(
-		(reference: FileReference) => bridgesRef.current.addFileReference?.(reference),
-		[],
-	);
+	const addFileReference = useCallback((reference: FileReference) => {
+		const chat = apiRef.current?.getPanel(dockPanelId("chat"));
+		if (chat && !chat.api.isActive) chat.api.setActive();
+		bridgesRef.current.addFileReference?.(reference);
+	}, []);
 
 	// These callback props (onForkFromMessage, onBack, onMinimize) MUST keep stable
 	// references across parent renders. The sole call site in

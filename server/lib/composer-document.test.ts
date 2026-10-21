@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { ComposerDocument } from "@shared/composer-document";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import {
 	parseOptionalComposerDocument,
 	validateComposerAssets,
@@ -70,6 +70,44 @@ describe("server composer acceptance", () => {
 		expect(() =>
 			validateComposerAssets(document, [], [{ name: "image.png", size: 9, type: "image/png" }]),
 		).toThrow();
+	});
+	test("projection identity compares hash kinds without adding defaults to legacy metadata", () => {
+		for (const expectedHashKind of [undefined, "decoded-sha256", "raw-sha256"] as const) {
+			const reference = {
+				id: "ref",
+				deviceId: "local",
+				path: "/work/a.ts",
+				label: "a.ts",
+				expectedHash: "a".repeat(64),
+				...(expectedHashKind ? { expectedHashKind } : {}),
+			};
+			const document: ComposerDocument = {
+				version: 1,
+				paragraphs: [{ children: [{ type: "fileReference", id: "f", reference }] }],
+				assets: [],
+			};
+			const before = JSON.stringify(document);
+			const accepted = parseOptionalComposerDocument(before);
+			if (!accepted) throw new Error("Expected composer document");
+			const { text, fileReferences } = composerDocumentText(accepted);
+			validateComposerProjection(accepted, text, fileReferences);
+			expect(() =>
+				validateComposerProjection(accepted, text, [
+					{
+						...fileReferences[0],
+						expectedHashKind: expectedHashKind === "raw-sha256" ? "decoded-sha256" : "raw-sha256",
+					},
+				]),
+			).toThrow("Composer document does not match");
+			if (expectedHashKind !== "raw-sha256")
+				validateComposerProjection(accepted, text, [
+					{
+						...fileReferences[0],
+						expectedHashKind: expectedHashKind ? undefined : "decoded-sha256",
+					},
+				]);
+			expect(JSON.stringify(accepted)).toBe(before);
+		}
 	});
 	test("block discriminators and advisory MIME values do not participate in attachment identity", () => {
 		const document: ComposerDocument = {

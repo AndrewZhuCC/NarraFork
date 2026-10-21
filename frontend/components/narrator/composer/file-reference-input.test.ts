@@ -228,6 +228,36 @@ describe("bounded metadata and saved selection", () => {
 		refs[0].path = "/changed";
 		expect(reference.path).toBe("/work/src/中文 file.ts");
 	});
+	test("copies hash kinds through draft sidecars without adding a default to old metadata", () => {
+		const legacy = { ...reference, expectedHash: "a".repeat(64) };
+		expect(JSON.stringify(copyFileReferences([legacy]))).toBe(JSON.stringify([legacy]));
+		expect(copyFileReferences([legacy])[0]).not.toHaveProperty("expectedHashKind");
+		for (const expectedHashKind of ["decoded-sha256", "raw-sha256"] as const) {
+			const metadata = { ...legacy, expectedHashKind };
+			const composerDocument: ComposerDocument = {
+				version: 1,
+				assets: [],
+				paragraphs: [{ children: [{ type: "fileReference", id: "f", reference: metadata }] }],
+			};
+			const projection = composerDocumentText(composerDocument);
+			const copied = copyFileReferences(projection.fileReferences, projection.text);
+			expect(copied[0].expectedHashKind).toBe(expectedHashKind);
+			expect(readFileReferences(JSON.parse(JSON.stringify(copied)), projection.text)).toEqual(
+				copied,
+			);
+			expect(readInputComposerDocument(composerDocument, projection.text, copied)).toEqual(
+				composerDocument,
+			);
+		}
+		for (const metadata of [
+			{ ...legacy, expectedHashKind: "sha256" },
+			{ ...legacy, expectedHashKind: null },
+			{ ...reference, expectedHashKind: "raw-sha256" },
+		]) {
+			expect(() => copyFileReferences([metadata])).toThrow();
+			expect(readFileReferences([metadata])).toEqual([]);
+		}
+	});
 	test("rejects occurrence/path/aggregate budgets rather than silently selecting a prefix", () => {
 		expect(() =>
 			copyFileReferences(
@@ -272,11 +302,19 @@ describe("bounded metadata and saved selection", () => {
 			expectedHash: "saved-hash",
 			dirty: false,
 		};
-		expect(savedSelectionReference(selection)).toMatchObject({
+		const saved = savedSelectionReference(selection);
+		expect(saved).toMatchObject({
 			deviceId: reference.deviceId,
 			selection: selection.target.selection,
 			expectedHash: "saved-hash",
 		});
+		expect(saved).not.toHaveProperty("expectedHashKind");
+		for (const expectedHashKind of ["decoded-sha256", "raw-sha256"] as const)
+			expect(savedSelectionReference({ ...selection, expectedHashKind })).toMatchObject({
+				expectedHash: selection.expectedHash,
+				expectedHashKind,
+				selection: selection.target.selection,
+			});
 		expect(savedSelectionReference({ ...selection, dirty: true })).toBeNull();
 		expect(savedSelectionReference({ ...selection, expectedHash: "" })).toBeNull();
 		expect(

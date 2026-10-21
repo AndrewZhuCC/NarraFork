@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import type { FileReference, FileSelection } from "@shared/file-reference";
 import {
 	FILE_PANEL_PAGE_BYTES,
@@ -754,6 +755,82 @@ describe("safe file capture and preview", () => {
 		expect(references[0].path).toBe("./alias");
 		f.files.delete("/work/file.ts");
 		expect(saved.snapshotText).toBe("😀");
+	});
+	test("raw hashes include UTF-8 BOM and CRLF while selections keep decoded coordinates", async () => {
+		const f = fixture();
+		const source = "\uFEFFone\r\n中文😀\r\nlast";
+		const decoded = "one\r\n中文😀\r\nlast";
+		f.files.set("/work/file.ts", source);
+		f.aliases.set("/work/alias", "/work/file.ts");
+		const expectedHash = createHash("sha256")
+			.update(new TextEncoder().encode(source))
+			.digest("hex");
+		const [saved] = await f.service.captureFileReferences("narrator", "visitor", [
+			ref("./alias", {
+				expectedHash,
+				expectedHashKind: "raw-sha256",
+				selection: selection(1, 1, 2, 5),
+			}),
+		]);
+		expect(saved.reference).toMatchObject({
+			path: "/work/file.ts",
+			expectedHash,
+			expectedHashKind: "raw-sha256",
+			selection: selection(1, 1, 2, 5),
+		});
+		expect(saved.snapshotText).toBe("one\r\n中文😀");
+		expect(saved.snapshotHash).toBe(hashFileReferenceText("one\r\n中文😀"));
+		expect(f.reads).toHaveLength(1);
+		expect(f.reads[0].opts?.expectedResolvedPath).toBe("/work/file.ts");
+		expect(f.reads[0].opts?.maxBytes).toBe(MAX_FILE_REFERENCE_SOURCE_BYTES);
+		expect(f.reads[0].opts?.timeoutMs).toBeLessThanOrEqual(10_000);
+		const preview = await f.service.previewFileReference("narrator", "visitor", {
+			deviceId: "local",
+			path: "/work/file.ts",
+		});
+		expect(preview.content).toBe(decoded);
+		expect(preview.hash).toBe(hashFileReferenceText(decoded));
+		expect(preview.hash).not.toBe(expectedHash);
+	});
+	test("legacy and explicit decoded hashes retain decoded BOM semantics", async () => {
+		for (const expectedHashKind of [undefined, "decoded-sha256"] as const) {
+			const f = fixture();
+			f.files.set("/work/file.ts", "\uFEFFone\r\n中文😀");
+			const [saved] = await f.service.captureFileReferences("narrator", "visitor", [
+				ref(undefined, {
+					expectedHash: hashFileReferenceText("one\r\n中文😀"),
+					...(expectedHashKind ? { expectedHashKind } : {}),
+					selection: selection(2, 3, 3, 1),
+				}),
+			]);
+			expect(saved.snapshotText).toBe("😀");
+			expect(saved.reference.selection).toEqual(selection(2, 3, 2, 5));
+			expect(saved.reference.expectedHashKind).toBe(expectedHashKind);
+			if (!expectedHashKind) expect(saved.reference).not.toHaveProperty("expectedHashKind");
+			expect(f.reads).toHaveLength(1);
+		}
+	});
+	test("raw expected hashes reject decoded-only hashes and BOM or CRLF-only changes", async () => {
+		const original = "\uFEFFone\r\n中文😀";
+		const rawHash = createHash("sha256").update(new TextEncoder().encode(original)).digest("hex");
+		for (const [source, expectedHash] of [
+			[original, hashFileReferenceText("one\r\n中文😀")],
+			[original.slice(1), rawHash],
+			[original.replace(/\r\n/g, "\n"), rawHash],
+		]) {
+			const f = fixture();
+			f.files.set("/work/file.ts", source);
+			await expect(
+				f.service.captureFileReferences("narrator", "visitor", [
+					ref(undefined, {
+						expectedHash,
+						expectedHashKind: "raw-sha256",
+						selection: selection(2, 1, 2, 3),
+					}),
+				]),
+			).rejects.toMatchObject({ code: "FILE_REFERENCE_STALE", statusCode: 409 });
+			expect(f.reads).toHaveLength(1);
+		}
 	});
 	test("changed saved document rejects selection without returning partial snapshots", async () => {
 		const f = fixture();

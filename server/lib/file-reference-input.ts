@@ -28,7 +28,12 @@ export function parseFileReferenceInput(value: unknown): FileReference[] | undef
 }
 
 function sameTarget(a: FileReference, b: FileReference): boolean {
-	if (a.deviceId !== b.deviceId || a.path !== b.path || a.expectedHash !== b.expectedHash)
+	if (
+		a.deviceId !== b.deviceId ||
+		a.path !== b.path ||
+		a.expectedHash !== b.expectedHash ||
+		(a.expectedHashKind ?? "decoded-sha256") !== (b.expectedHashKind ?? "decoded-sha256")
+	)
 		return false;
 	if (!a.selection || !b.selection) return a.selection === b.selection;
 	return (

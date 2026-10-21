@@ -56,6 +56,7 @@ export function validateComposerProjection(
 			: null,
 		ref.inputRange ?? null,
 		ref.expectedHash ?? null,
+		ref.expectedHashKind ?? "decoded-sha256",
 	];
 	const expected = JSON.stringify(references.map(canonical));
 	// Stale clients, queued rows and drafts may still carry the legacy quote-prefix projection.

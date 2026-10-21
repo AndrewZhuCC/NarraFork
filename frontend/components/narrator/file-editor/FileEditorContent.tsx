@@ -144,6 +144,18 @@ export function fileEditorReferenceSelection(
 	};
 }
 
+const quoteBlocked = (current: EditorSessionState | null) =>
+	!current?.loaded ||
+	current.invalidated ||
+	current.discarded ||
+	current.loading ||
+	current.phase !== "idle" ||
+	!current.baseHash ||
+	(current.protocol === "raw-v2" && !current.codecSafe) ||
+	!!current.error ||
+	!!current.conflict ||
+	!!current.confirmation ||
+	sessionDirty(current);
 /** Every consumer is authorized before attaching a realm-local working copy. */
 export function FileEditorContent(props: FileEditorContentProps) {
 	const recovery = useEditorRecoveryHost(props);
@@ -584,13 +596,18 @@ function FileEditorDocument({
 			// MonacoEditor already coalesces pointer-drag cursor events; this callback
 			// only runs for ownership-relevant moments (mouseup / keyboard / focus).
 			if (explicit) {
+				const current = session.state;
+				const target = session.currentDocument?.target ?? sourceTargetRef.current;
 				publishSelection?.(
-					session.state.baseHash && next && session.state.protocol !== "raw-v2"
+					current.baseHash && next
 						? {
-								target: { deviceId, path: filePath, selection: next },
-								label: filePanelBaseName(filePath),
-								expectedHash: session.state.baseHash,
-								dirty: sessionDirty(session.state),
+								target: { ...target, selection: next },
+								label: filePanelBaseName(target.path),
+								expectedHash: current.baseHash,
+								...(current.hashKind === "raw-sha256"
+									? { expectedHashKind: current.hashKind }
+									: {}),
+								dirty: quoteBlocked(current),
 							}
 						: null,
 					true,
@@ -601,19 +618,8 @@ function FileEditorDocument({
 			// ownership. Drop this panel's published selection if it owned one.
 			if (next === null && previous !== null) publishSelection?.(null, false);
 		},
-		[deviceId, filePath, publishSelection, session],
+		[publishSelection, session, sourceTargetRef],
 	);
-	const quoteBlocked = (current: EditorSessionState | null) =>
-		!current?.loaded ||
-		current.invalidated ||
-		current.discarded ||
-		current.loading ||
-		current.phase !== "idle" ||
-		!current.baseHash ||
-		!!current.error ||
-		!!current.conflict ||
-		!!current.confirmation ||
-		sessionDirty(current);
 	const quoteSelection = (range: FileSelection) => {
 		// Check the controller, not a render snapshot: edits/save-start publish synchronously.
 		const current = session.state;
@@ -621,18 +627,25 @@ function FileEditorDocument({
 			!quoteActiveRef.current ||
 			!addReferenceRef.current ||
 			!current.baseHash ||
-			quoteBlocked(current)
+			quoteBlocked(current) ||
+			(range.startLineNumber === range.endLineNumber && range.startColumn === range.endColumn)
 		)
-			return;
+			return false;
 		const target = session.currentDocument?.target ?? sourceTargetRef.current;
 		const reference = savedSelectionReference({
 			target: { ...target, selection: range },
 			label: filePanelBaseName(target.path),
 			expectedHash: current.baseHash,
+			...(current.hashKind === "raw-sha256" ? { expectedHashKind: current.hashKind } : {}),
 			dirty: sessionDirty(current),
 		});
-		if (reference) addReferenceRef.current(reference);
+		if (!reference) return false;
+		editorSelectionRef.current = null;
+		publishSelectionRef.current?.(null);
+		addReferenceRef.current(reference);
+		return true;
 	};
+	const selectionUnavailable = quoteBlocked(state);
 	const quoteSelectionDisabledReason =
 		!state?.loaded || state.loading
 			? t("common:loading")
@@ -640,7 +653,7 @@ function FileEditorDocument({
 				? t(state.phase === "unknown" ? "fileEditor.unknownSave" : "fileEditor.saveTask")
 				: sessionDirty(state)
 					? t("quote.fileUnsaved")
-					: quoteBlocked(state)
+					: selectionUnavailable
 						? t("quote.fileUnavailable")
 						: null;
 	const dirty = state ? sessionDirty(state) : false;
@@ -668,19 +681,23 @@ function FileEditorDocument({
 	// changes. Selection itself is not a dependency — drag-select must not re-enter
 	// this path. Identity publish remains explicit (handleSelection).
 	useEffect(() => {
-		if (!visible || !baseHash) return;
+		if (!visible) return;
 		const next = editorSelectionRef.current;
+		if (!baseHash && !next) return;
+		const current = session.state;
+		const target = session.currentDocument?.target ?? sourceTargetRef.current;
 		publishSelection?.(
-			next && session.state.protocol !== "raw-v2"
+			next && baseHash
 				? {
-						target: { deviceId, path: filePath, selection: next },
-						label: filePanelBaseName(filePath),
+						target: { ...target, selection: next },
+						label: filePanelBaseName(target.path),
 						expectedHash: baseHash,
-						dirty,
+						...(current.hashKind === "raw-sha256" ? { expectedHashKind: current.hashKind } : {}),
+						dirty: selectionUnavailable,
 					}
 				: null,
 		);
-	}, [visible, baseHash, deviceId, dirty, filePath, publishSelection, session.state.protocol]);
+	}, [visible, baseHash, selectionUnavailable, publishSelection, session, sourceTargetRef]);
 	useEffect(() => () => publishSelection?.(null), [publishSelection]);
 	useEffect(() => {
 		onDirtyChange?.(exitBlocked);
@@ -751,7 +768,8 @@ function FileEditorDocument({
 			previewController.current?.abort();
 			setPreviewText(null);
 			setSearchOpen(false);
-			publishSelectionRef.current?.(null);
+			// Keep the saved selection when switching back to the chat tab to accept it.
+			if (state.paged) publishSelectionRef.current?.(null);
 			return;
 		}
 		if (state.loaded && mode !== "raw") void generatePreview(true);
@@ -1054,6 +1072,25 @@ function FileEditorDocument({
 		<Box
 			style={{ height: "100%", display: "flex", flexDirection: "column" }}
 			onKeyDownCapture={(event) => {
+				if (
+					event.key === "Tab" &&
+					!event.shiftKey &&
+					!event.altKey &&
+					!event.ctrlKey &&
+					!event.metaKey &&
+					!event.repeat &&
+					!event.nativeEvent.isComposing &&
+					event.nativeEvent.keyCode !== 229 &&
+					editorActive
+				) {
+					const view = editorRef.current?.getEditor();
+					const range = view?.hasTextFocus() ? view.getSelection() : null;
+					if (range && quoteSelection(range)) {
+						event.preventDefault();
+						event.stopPropagation();
+						return;
+					}
+				}
 				if (
 					mode !== "raw" &&
 					!event.nativeEvent.isComposing &&

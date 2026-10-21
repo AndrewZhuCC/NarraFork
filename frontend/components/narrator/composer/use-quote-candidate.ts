@@ -19,7 +19,7 @@ export type QuoteCandidate =
 type FileQuoteCandidate = Extract<QuoteCandidate, { kind: "file" }>;
 
 // Several composers can be mounted (workspace panes). The shortcut belongs to
-// whichever one most recently gained a candidate, never to all of them.
+// the latest text candidate; a clickable file candidate must not steal its Tab.
 let ownerSequence = 0;
 let shortcutOwner = 0;
 
@@ -56,7 +56,7 @@ function canQuoteWithTab(
 ): boolean {
 	if (event.defaultPrevented) return false;
 	const target = targetElement(event.target);
-	// File editors expose their own source-bound gutter action. Tab always belongs to Monaco.
+	// File Tab is handled at its source editor, never by a composer's global shortcut.
 	if (candidate.kind === "file") return false;
 	if (target?.closest('button, a[href], select, [role="button"], [role="menu"], [role="listbox"]'))
 		return false;
@@ -86,24 +86,33 @@ export function editorSelectionCandidate(
 	const { deviceId, path } = selection.target;
 	return {
 		kind: "file",
-		key: JSON.stringify([deviceId, path, range]),
+		key: JSON.stringify([
+			deviceId,
+			path,
+			range,
+			selection.expectedHash,
+			selection.expectedHashKind ?? "decoded-sha256",
+			selection.dirty,
+		]),
 		label: editorSelectionLabel(selection),
 		reference: savedSelectionReference(selection),
 	};
 }
 
 /**
- * The temporary message/tool quote in this composer's own list. File selections
- * use source-bound Monaco gutter buttons, never this popup or the global Tab.
+ * The temporary message/tool or saved-file selection in this composer's own input.
+ * File candidates also have a source-editor action; this hook owns only text-selection Tab.
  * Consuming/dismissing hides a candidate until its source selection changes.
  */
 export function useQuoteCandidate({
 	textareaRef,
 	element,
+	fileSelection,
 	onShortcut,
 }: {
 	textareaRef: RefObject<HTMLElement | null>;
 	element?: HTMLElement | null;
+	fileSelection?: FileReferenceEditorSelection | null;
 	onShortcut: (candidate: QuoteCandidate) => void;
 }) {
 	const [candidate, setCandidate] = useState<QuoteCandidate | null>(null);
@@ -190,8 +199,23 @@ export function useQuoteCandidate({
 	}, [textareaRef, element]);
 
 	useEffect(() => {
+		const next = editorSelectionCandidate(fileSelection);
+		if (!next) {
+			hiddenKeysRef.current.file = null;
+			setCandidate((current) => (current?.kind === "file" ? null : current));
+			return;
+		}
+		if (next.key === hiddenKeysRef.current.file) return;
+		const textarea = element ?? textareaRef.current;
+		const panel = textarea?.closest(NARRATOR_PANEL_SELECTOR);
+		if (textarea && panel && readPanelQuoteSelection(panel, textarea.ownerDocument.getSelection()))
+			return;
+		setCandidate((current) => (current?.key === next.key ? current : next));
+	}, [fileSelection, element, textareaRef]);
+
+	useEffect(() => {
 		const owner = ownerRef.current;
-		if (candidate) shortcutOwner = owner;
+		if (candidate?.kind === "text") shortcutOwner = owner;
 		else if (shortcutOwner === owner) shortcutOwner = 0;
 	}, [candidate]);
 	useEffect(

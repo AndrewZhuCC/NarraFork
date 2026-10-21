@@ -1490,6 +1490,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const quoteCandidate = useQuoteCandidate({
 			textareaRef,
 			element: editorElement,
+			fileSelection:
+				fileScope.selection !== undefined ? fileScope.selection : dock?.fileReferenceSelection,
 			onShortcut: (candidate) => acceptQuoteRef.current(candidate),
 		});
 		const acceptQuote = useCallback(

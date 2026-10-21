@@ -183,6 +183,14 @@ export function copyFileReferences(value: unknown, text?: string): FileReference
 			if (!boundedString(ref.expectedHash)) throw new Error("Invalid saved-file hash");
 			copy.expectedHash = ref.expectedHash;
 		}
+		if (ref.expectedHashKind !== undefined) {
+			if (
+				copy.expectedHash === undefined ||
+				(ref.expectedHashKind !== "decoded-sha256" && ref.expectedHashKind !== "raw-sha256")
+			)
+				throw new Error("Invalid saved-file hash kind");
+			copy.expectedHashKind = ref.expectedHashKind;
+		}
 		if (ref.inputRange !== undefined) {
 			if (!Array.isArray(ref.inputRange) || ref.inputRange.length !== 2)
 				throw new Error("Invalid input range");
@@ -361,6 +369,9 @@ export function savedSelectionReference(
 				id: createFileReferenceId(),
 				label: selection.label,
 				expectedHash: selection.expectedHash,
+				...(selection.expectedHashKind !== undefined
+					? { expectedHashKind: selection.expectedHashKind }
+					: {}),
 			},
 		])[0] ?? null
 	);

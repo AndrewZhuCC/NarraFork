@@ -273,6 +273,29 @@ describe("editorSelectionCandidate", () => {
 			dirty: true,
 		});
 		expect(dirty?.reference).toBeNull();
-		expect(dirty?.key).toBe(saved?.key ?? "");
+		// Availability changes must replace a previously accepted saved-file candidate.
+		expect(dirty?.key).not.toBe(saved?.key);
+	});
+
+	test("refreshes raw file identity when its saved bytes or hash kind change", () => {
+		const input = {
+			target: { ...target, selection: range },
+			label: "src/a.ts",
+			expectedHash: "h1",
+			expectedHashKind: "raw-sha256" as const,
+			dirty: false,
+		};
+		const raw = editorSelectionCandidate(input);
+		expect(raw?.reference).toMatchObject({
+			...target,
+			selection: range,
+			expectedHash: "h1",
+			expectedHashKind: "raw-sha256",
+		});
+		expect(raw?.label).toBe("src/a.ts:3-5");
+		expect(editorSelectionCandidate({ ...input, expectedHash: "h2" })?.key).not.toBe(raw?.key);
+		expect(
+			editorSelectionCandidate({ ...input, expectedHashKind: "decoded-sha256" })?.key,
+		).not.toBe(raw?.key);
 	});
 });

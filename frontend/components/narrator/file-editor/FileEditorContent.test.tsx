@@ -356,6 +356,48 @@ function deferred<T>() {
 	});
 	return { resolve, promise };
 }
+test("Tab quotes only a live saved source selection and leaves ordinary editor keys alone", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const model = await mount({ selection: undefined }, { addReference });
+	const sourceElement = host.querySelector("[data-file-editor-source]");
+	if (!sourceElement) throw new Error("Missing source editor");
+	const pressTab = async (flags: Record<string, boolean | number | undefined> = {}) => {
+		const event = new Event("keydown", { bubbles: true, cancelable: true });
+		Object.assign(event, { key: "Tab", ...flags });
+		await act(async () => sourceElement.dispatchEvent(event));
+		return event;
+	};
+	expect((await pressTab()).defaultPrevented).toBe(false);
+	await act(async () => model.select({ ...selection, endColumn: selection.startColumn }));
+	expect((await pressTab()).defaultPrevented).toBe(false);
+	await act(async () => model.select(selection));
+	for (const flags of [
+		{ shiftKey: true },
+		{ altKey: true },
+		{ ctrlKey: true },
+		{ metaKey: true },
+		{ repeat: true },
+		{ isComposing: true },
+		{ keyCode: 229 },
+	])
+		expect((await pressTab(flags)).defaultPrevented).toBe(false);
+	model.textFocused = false;
+	expect((await pressTab()).defaultPrevented).toBe(false);
+	model.textFocused = true;
+	expect(addReference).not.toHaveBeenCalled();
+	expect((await pressTab()).defaultPrevented).toBe(true);
+	expect(addReference).toHaveBeenCalledTimes(1);
+	expect(addReference.mock.calls[0]?.[0]).toMatchObject({
+		...source.target,
+		selection,
+		expectedHash: source.hash,
+	});
+	expect(currentSelection()).toBeNull();
+	await act(async () => model.edit("unsaved source"));
+	await act(async () => model.select(selection));
+	expect((await pressTab()).defaultPrevented).toBe(false);
+	expect(addReference).toHaveBeenCalledTimes(1);
+});
 test("gutter quote uses this document and clicked range, never the shared selection", async () => {
 	const addReference = mock((_reference: unknown) => {});
 	const model = await mount(
@@ -2140,7 +2182,7 @@ test("hiding a pending authorization cancels it and a late descriptor never star
 	expect([...mountedTestModels.values()]).toHaveLength(1);
 });
 
-test("hidden real panel keeps the dirty close/unload guard without continuing preview work", async () => {
+test("hidden real panel preserves pending citations and dirty guards without preview work", async () => {
 	const renderVisible = async (visible: boolean) =>
 		act(async () =>
 			root?.render(
@@ -2152,6 +2194,7 @@ test("hidden real panel keeps the dirty close/unload guard without continuing pr
 								narratorId="child"
 								referenceOrigin
 								onDirtyChange={dirty}
+								onFileReferenceSelectionChange={publish}
 							/>
 						</NarratorPanelVisibilityProvider>
 					</MantineProvider>
@@ -2160,6 +2203,12 @@ test("hidden real panel keeps the dirty close/unload guard without continuing pr
 		);
 	await renderVisible(true);
 	const model = [...mountedTestModels.values()][0];
+	await act(async () => model.select(selection));
+	const savedSelection = currentSelection();
+	expect(savedSelection).toMatchObject({ expectedHash: source.hash, dirty: false });
+	await renderVisible(false);
+	expect(currentSelection()).toBe(savedSelection);
+	await renderVisible(true);
 	await edit(model, "# hidden dirty");
 	await switchFileMode("split");
 	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("hidden dirty");

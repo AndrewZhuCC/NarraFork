@@ -24,6 +24,9 @@ export function copyFileReference(reference: FileReference): FileReference {
 			: {}),
 		...(reference.inputRange ? { inputRange: [...reference.inputRange] as [number, number] } : {}),
 		...(reference.expectedHash !== undefined ? { expectedHash: reference.expectedHash } : {}),
+		...(reference.expectedHashKind !== undefined
+			? { expectedHashKind: reference.expectedHashKind }
+			: {}),
 	};
 }
 

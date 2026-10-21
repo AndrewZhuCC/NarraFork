@@ -59,6 +59,7 @@ function reference(value: unknown): FileReference {
 		"selection",
 		"inputRange",
 		"expectedHash",
+		"expectedHashKind",
 	]);
 	const result: FileReference = {
 		id: identifier(item.id),
@@ -88,6 +89,14 @@ function reference(value: unknown): FileReference {
 		result.selection = { ...s };
 	}
 	if (item.expectedHash !== undefined) result.expectedHash = string(item.expectedHash, 128);
+	if (item.expectedHashKind !== undefined) {
+		if (
+			result.expectedHash === undefined ||
+			(item.expectedHashKind !== "decoded-sha256" && item.expectedHashKind !== "raw-sha256")
+		)
+			throw new Error("Invalid saved-file hash kind");
+		result.expectedHashKind = item.expectedHashKind;
+	}
 	if (item.inputRange !== undefined) {
 		const range = item.inputRange;
 		if (

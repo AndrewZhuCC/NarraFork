@@ -55,6 +55,61 @@ describe("semantic composer document", () => {
 		expect(start).toBe(text.indexOf("#file"));
 		expect(accepted).toEqual(doc);
 	});
+	test("preserves explicit saved-file hash kinds without rewriting legacy metadata", () => {
+		const reference = {
+			id: "ref-hash",
+			deviceId: "local",
+			path: "/a.ts",
+			label: "a.ts",
+			expectedHash: "a".repeat(64),
+		};
+		for (const metadata of [
+			reference,
+			{ ...reference, expectedHashKind: "decoded-sha256" as const },
+			{ ...reference, expectedHashKind: "raw-sha256" as const },
+		]) {
+			const doc: ComposerDocument = {
+				...empty(),
+				paragraphs: [{ children: [{ type: "fileReference", id: "f", reference: metadata }] }],
+			};
+			const accepted = parseComposerDocument(doc);
+			expect(JSON.stringify(accepted)).toBe(JSON.stringify(doc));
+			const projected = composerDocumentText(accepted).fileReferences[0];
+			expect(projected).toMatchObject(metadata);
+			if (!("expectedHashKind" in metadata))
+				expect(projected).not.toHaveProperty("expectedHashKind");
+		}
+	});
+	test("rejects unknown saved-file hash kinds and hash kinds without hashes", () => {
+		for (const reference of [
+			{ expectedHash: "a".repeat(64), expectedHashKind: "sha256" },
+			{ expectedHash: "a".repeat(64), expectedHashKind: null },
+			{ expectedHashKind: "raw-sha256" },
+			{ expectedHashKind: "decoded-sha256", expectedHash: "" },
+		])
+			expect(() =>
+				parseComposerDocument({
+					...empty(),
+					paragraphs: [
+						{
+							children: [
+								{
+									type: "fileReference",
+									id: "f",
+									reference: {
+										id: "ref",
+										deviceId: "local",
+										path: "/a.ts",
+										label: "a.ts",
+										...reference,
+									},
+								},
+							],
+						},
+					],
+				}),
+			).toThrow();
+	});
 	test("projects comments separately from source text and immutable file metadata", () => {
 		const reference = {
 			id: "ref-1",

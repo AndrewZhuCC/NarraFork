@@ -38,14 +38,17 @@ export interface FileReferenceContext {
 	cwd: string;
 }
 
+export type FileReferenceHashKind = "decoded-sha256" | "raw-sha256";
+
 /** One occurrence in a composer/message; two selections of the same file have different ids. */
 export interface FileReference extends FileTarget {
 	id: string;
 	label: string;
 	/** UTF-16 offsets in the user's prompt, unrelated to the target file's selection. */
 	inputRange?: [start: number, end: number];
-	/** Hash of the saved text shown by the editor, checked again before capturing a selection. */
+	/** SHA-256 of the saved file, decoded text unless expectedHashKind specifies raw bytes. */
 	expectedHash?: string;
+	expectedHashKind?: FileReferenceHashKind;
 }
 
 /** Only the server constructs accepted snapshots. Never accept these fields from a client. */
@@ -100,6 +103,7 @@ export interface FileReferenceEditorSelection {
 	target: FileTarget;
 	label: string;
 	expectedHash: string;
+	expectedHashKind?: FileReferenceHashKind;
 	dirty: boolean;
 }
 
