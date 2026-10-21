@@ -1,4 +1,14 @@
-import { ActionIcon, Badge, Box, CloseButton, Group, Menu, Text, TextInput } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Box,
+	CloseButton,
+	Group,
+	Menu,
+	Text,
+	TextInput,
+	Tooltip,
+} from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import {
 	IconAlertTriangle,
@@ -52,6 +62,7 @@ export function ModelMenuItems({
 	onShowPrice,
 	label,
 	providerLabels,
+	providerBadges,
 	onEditDefaultModel,
 	onEditSummaryModel,
 	onSetAsDefaultModel,
@@ -76,6 +87,11 @@ export function ModelMenuItems({
 	label?: string;
 	/** Provider prefix → display name, used to label provider groups. */
 	providerLabels?: Record<string, string>;
+	/**
+	 * Provider prefix → a small status badge for the group header, e.g. what is
+	 * left of an OpenCode Go plan allowance. `tooltip` explains the badge.
+	 */
+	providerBadges?: Record<string, { text: string; color: string; tooltip?: string }>;
 	/** When provided, an edit button on the "Default" group opens the global default model picker. */
 	onEditDefaultModel?: () => void;
 	/** When provided, an edit button on the "Summary" group opens the global summary model picker. */
@@ -321,21 +337,46 @@ export function ModelMenuItems({
 					return (
 						<span key={prov}>
 							{gi > 0 && <Menu.Divider />}
-							{headerAction ? (
-								<Menu.Label
-									style={{
-										display: "flex",
-										alignItems: "center",
-										justifyContent: "space-between",
-										gap: 4,
-									}}
-								>
-									<span>{provLabels[prov] ?? prov}</span>
-									{headerAction}
-								</Menu.Label>
-							) : (
-								<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-							)}
+							{(() => {
+								const badgeInfo = providerBadges?.[prov];
+								const badge = badgeInfo ? (
+									<Tooltip
+										label={badgeInfo.tooltip}
+										disabled={!badgeInfo.tooltip}
+										multiline
+										withinPortal
+										style={{ whiteSpace: "pre-line" }}
+									>
+										<Badge
+											size="xs"
+											variant="light"
+											color={badgeInfo.color}
+											style={{ textTransform: "none", flexShrink: 0 }}
+										>
+											{badgeInfo.text}
+										</Badge>
+									</Tooltip>
+								) : null;
+								if (!headerAction && !badge) {
+									return <Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>;
+								}
+								return (
+									<Menu.Label
+										style={{
+											display: "flex",
+											alignItems: "center",
+											justifyContent: "space-between",
+											gap: 4,
+										}}
+									>
+										<span>{provLabels[prov] ?? prov}</span>
+										<Group gap={4} wrap="nowrap">
+											{badge}
+											{headerAction}
+										</Group>
+									</Menu.Label>
+								);
+							})()}
 							{models.map((m) => {
 								// For aggregation items, check if the current model's aggId matches
 								const isAggItem = m.provider === "__agg__";

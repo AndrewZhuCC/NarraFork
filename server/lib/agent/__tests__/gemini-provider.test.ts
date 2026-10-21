@@ -559,6 +559,34 @@ describe("Gemini lightweight partial output regression", () => {
 	}
 });
 
+describe("Gemini HTTP error diagnostics", () => {
+	test("a non-2xx response carries status, envelope and retry-after in diagnostics", async () => {
+		setOutboundFetchOverrideForTest(async () =>
+			Response.json(
+				{
+					error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "5-hour usage limit reached" },
+				},
+				{ status: 429, headers: { "retry-after": "1800" } },
+			),
+		);
+		const error = await makeGenerateContentProvider()
+			.generateWithMeta("hello", "gemini-generate-test:gemini-2.5-flash")
+			.then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+		expect(error).toMatchObject({
+			status: 429,
+			message: expect.stringContaining("Gemini API error 429:"),
+			diagnostics: {
+				statusCode: 429,
+				message: "5-hour usage limit reached",
+				responseHeaders: { "retry-after": "1800" },
+			},
+		});
+	});
+});
+
 describe("Gemini Interactions API provider", () => {
 	test("uses the current Interactions revision, store:false, flat tools, and full input steps", async () => {
 		let requestUrl = "";

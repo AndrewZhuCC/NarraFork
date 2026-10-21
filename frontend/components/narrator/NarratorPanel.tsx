@@ -185,17 +185,9 @@ import { useMockStreamActive } from "./mock/mock-stream-store";
 import { commandCodeQuotaView } from "./model/commandcode-quota-format";
 import { usageSourceFor } from "./model/custom-api-usage-source";
 import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
-import {
-	formatKimiBarText,
-	formatKimiDetailsText,
-	isKimiProviderBaseUrl,
-} from "./model/kimi-usage-format";
+import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import {
-	formatOpencodeBarText,
-	formatOpencodeDetailsText,
-	isOpencodeProviderBaseUrl,
-} from "./model/opencode-usage-format";
+import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -1219,27 +1211,15 @@ function NarratorPanelBody({
 			opencodeProviderId: currentOpencodeProviderId,
 			kimiProviderId: currentKimiProviderId,
 		});
+		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
+		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
+		// generic text-balance slot — showing both would duplicate the 5h figure.
 		if (usageSource === "opencode") {
-			const usage = opencodeUsageQuery.data;
-			if (usage) {
-				const quotaBalance = formatOpencodeBarText(usage, t);
-				const detailedQuotaBalance = formatOpencodeDetailsText(usage, t);
-				if (quotaBalance || detailedQuotaBalance) {
-					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
-				}
-			}
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
-		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
-		// in the details popover) instead of the generic relay quota string.
+		// Kimi likewise has its own progress-bar indicator (`kimiQuotaView` below).
 		if (usageSource === "kimi") {
-			const kimiUsage = kimiUsagesData?.[cfg.id];
-			if (kimiUsage) {
-				const quotaBalance = formatKimiBarText(kimiUsage, t);
-				const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
-				if (quotaBalance || detailedQuotaBalance) {
-					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
-				}
-			}
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
 		const quotas = settingsData?.customApiQuotas as
 			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
@@ -1256,10 +1236,8 @@ function NarratorPanelBody({
 		resolvedModel,
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
-		kimiUsagesData,
 		currentKimiProviderId,
 		currentOpencodeProviderId,
-		opencodeUsageQuery.data,
 		currentDeepSeekProviderId,
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,
@@ -2894,6 +2872,65 @@ function NarratorPanelBody({
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
+	/**
+	 * Which plan the narrator is parked on, so only that provider's allowance
+	 * indicator turns red: the live event names the plan, and after a reload the
+	 * persisted waiting payload does (`errorMessage` carries `quotaProvider` while
+	 * parked). A Kimi wait never turns the OpenCode badge red, and vice versa.
+	 */
+	const quotaWaitProvider = (() => {
+		if (!isWaitingForQuota) return undefined;
+		if (quotaWaitInfo?.quotaProvider) return quotaWaitInfo.quotaProvider;
+		if (!narrator?.errorMessage) return undefined;
+		try {
+			const parsed = JSON.parse(narrator.errorMessage) as { quotaProvider?: unknown };
+			if (parsed.quotaProvider === "opencode" || parsed.quotaProvider === "kimi") {
+				return parsed.quotaProvider;
+			}
+		} catch {
+			// Not a waiting payload; leave the provider unknown.
+		}
+		return undefined;
+	})();
+
+	/**
+	 * Props for the OpenCode Go allowance indicator, or undefined when the current
+	 * model is not on a Go endpoint.
+	 */
+	const opencodeQuotaProps = (() => {
+		if (!currentOpencodeProviderId) return undefined;
+		const waitingForQuota = quotaWaitProvider === "opencode";
+		return {
+			usage: opencodeUsageQuery.data,
+			waitingForQuota,
+			waitingText: waitingForQuota ? quotaWaitText : null,
+		};
+	})();
+
+	/**
+	 * Kimi or Command Code allowance, drawn with the same progress-bar indicator
+	 * as OpenCode Go. Kimi is gated on the provider id it is CURRENTLY configured
+	 * for, like the generic quota slot above, so a disabled query's stale entry
+	 * for a re-pointed provider is never shown.
+	 */
+	const kimiQuotaView = currentKimiProviderId
+		? buildKimiQuotaView(kimiUsagesData?.[currentKimiProviderId], t)
+		: null;
+	const quotaPanelProps = (() => {
+		if (currentKimiProviderId) {
+			const waitingForQuota = quotaWaitProvider === "kimi";
+			return {
+				view: kimiQuotaView,
+				waitingForQuota,
+				waitingText: waitingForQuota ? quotaWaitText : null,
+			};
+		}
+		if (commandCodeEnabled) {
+			return { view: commandCodeQuota, waitingForQuota: false, waitingText: null };
+		}
+		return undefined;
+	})();
+
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
 	const contextIndicatorRadius = 9;
@@ -3589,6 +3626,7 @@ function NarratorPanelBody({
 								allModels,
 								aggregations,
 								providerLabels,
+								settingsData,
 								defaultModelValue,
 								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
@@ -3599,13 +3637,12 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								balance: commandCodeQuota?.balance ?? tokenDanceQuota?.balance ?? quotaBalance,
-								detailsText:
-									commandCodeQuota?.detailsText ?? tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover:
-									commandCodeQuota?.hasDetailsPopover ??
-									tokenDanceQuota?.hasDetailsPopover ??
-									hasQuotaDetailsPopover,
+								// Command Code renders through `panel`; its generic slot stays empty.
+								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
+								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
+								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
+								opencode: opencodeQuotaProps,
+								panel: quotaPanelProps,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,

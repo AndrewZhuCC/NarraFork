@@ -289,7 +289,7 @@ describe("localizeNarratorError Kimi 额度墙", () => {
 
 	test("报出重置时刻，而不是转发上游 403 原文", () => {
 		const result = localizeNarratorError(payload, t);
-		expect(result).toStartWith("quotaExhaustedWaitNotPossible(resetAt=");
+		expect(result).toStartWith("quotaExhaustedWaitNotPossible(provider=Kimi, resetAt=");
 		// A real, formatted instant rather than a raw epoch or an empty value.
 		expect(result).not.toContain(String(resetAt));
 		expect(result).not.toContain("resetAt=undefined");
@@ -305,12 +305,35 @@ describe("localizeNarratorError Kimi 额度墙", () => {
 			JSON.stringify({ type: "kimi_quota_exhausted", reason: "wait-budget-spent" }),
 			t,
 		);
-		expect(result).toBe("quotaExhaustedWaitNotPossibleNoReset");
+		expect(result).toBe("quotaExhaustedWaitNotPossibleNoReset(provider=Kimi)");
 	});
 
 	test("英文原文本身不被误判为该 payload", () => {
 		const upstream =
 			"Anthropic API error 403: You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.";
 		expect(localizeNarratorError(upstream, t)).toBe(upstream);
+	});
+});
+
+describe("localizeNarratorError OpenCode Go 额度墙", () => {
+	test("按提供商命名额度，并报出重置时刻", () => {
+		const result = localizeNarratorError(
+			JSON.stringify({
+				type: "opencode_quota_exhausted",
+				reason: "reset-beyond-budget",
+				quotaBucket: "monthly",
+				quotaResetAt: Date.UTC(2026, 10, 15),
+			}),
+			t,
+		);
+		expect(result).toStartWith("quotaExhaustedWaitNotPossible(provider=OpenCode Go, resetAt=");
+	});
+
+	test("重置时刻未知时仍命名提供商", () => {
+		const result = localizeNarratorError(
+			JSON.stringify({ type: "opencode_quota_exhausted", reason: "reset-unknown" }),
+			t,
+		);
+		expect(result).toBe("quotaExhaustedWaitNotPossibleNoReset(provider=OpenCode Go)");
 	});
 });

@@ -1,5 +1,11 @@
 import type { KimiUsageCache, KimiUsageWindow } from "../../../lib/api/types";
-import { formatLocaleDateTime } from "../../../lib/intl-format";
+import {
+	parseQuotaReset,
+	pickLimitingWindow,
+	type QuotaPanelView,
+	quotaWindowFromAmounts,
+	worstQuotaLevel,
+} from "./quota-panel-view";
 
 /** Minimal translation signature compatible with react-i18next's `t`. */
 export type KimiTFunction = (key: string, options?: Record<string, unknown>) => string;
@@ -32,63 +38,52 @@ export function isKimiProviderBaseUrl(baseUrl?: string): boolean {
 	}
 }
 
-function formatResetTime(resetTime: string | null): string | null {
-	if (!resetTime) return null;
-	// `formatLocaleDateTime` rather than the Date method with no locale argument: the bare
-	// method follows the SYSTEM locale, so a user running the app in Chinese on an English
-	// OS saw this one timestamp in English among translated text. It returns "" for an
-	// unparseable value, normalized back to null so callers keep their "no reset" branch.
-	const formatted = formatLocaleDateTime(resetTime);
-	return formatted || null;
-}
-
-function formatWindowLine(label: string, window: KimiUsageWindow, t: KimiTFunction): string {
-	const reset = formatResetTime(window.resetTime);
-	return (
-		t("kimi.windowLine", {
-			label,
-			used: window.used ?? "?",
-			limit: window.limit ?? "?",
-		}) + (reset ? t("kimi.resetSuffix", { time: reset }) : "")
-	);
-}
-
 /**
- * Status-bar text for a Kimi provider: remaining percentage of the 5-hour
- * window (same "remaining" convention as the Codex quota indicator). Falls
- * back to used/limit when the percentage cannot be computed; returns null
- * when there is nothing meaningful to show.
+ * Kimi windows mapped onto the shared quota panel (same progress-bar view as
+ * OpenCode Go), or null when there is nothing to show yet.
  */
-export function formatKimiBarText(usage: KimiUsageCache, t: KimiTFunction): string | null {
-	const fiveHour = usage.fiveHour;
-	if (fiveHour?.limit != null && fiveHour.limit > 0) {
-		const remaining =
-			fiveHour.remaining ?? (fiveHour.used != null ? fiveHour.limit - fiveHour.used : null);
-		if (remaining != null) {
-			const percent = Math.max(0, Math.min(100, Math.round((remaining / fiveHour.limit) * 100)));
-			return t("kimi.fiveHourShort", { percent });
-		}
-		return t("kimi.fiveHourRatio", {
-			used: fiveHour.used ?? "?",
-			limit: fiveHour.limit,
-		});
-	}
-	if (kimiUsageFailed(usage)) return t("kimi.unavailable");
-	return null;
-}
-
-/** Details-popover text: 5-hour + weekly + monthly windows, one per line. */
-export function formatKimiDetailsText(usage: KimiUsageCache, t: KimiTFunction): string {
-	const lines: string[] = [];
-	if (usage.fiveHour) lines.push(formatWindowLine(t("kimi.window5h"), usage.fiveHour, t));
-	if (usage.weekly) lines.push(formatWindowLine(t("kimi.windowWeekly"), usage.weekly, t));
-	if (usage.monthly) lines.push(formatWindowLine(t("kimi.windowMonthly"), usage.monthly, t));
-	for (const extra of usage.extraWindows) {
-		lines.push(formatWindowLine(extra.label, extra, t));
-	}
-	// A non-admin gets `hasError` without the text, so the reason line falls back to a
-	// bare "fetch failed". Saying nothing at all would leave stale numbers looking current.
-	if (usage.error) lines.push(t("kimi.fetchError", { error: usage.error }));
-	else if (usage.hasError) lines.push(t("kimi.fetchFailed"));
-	return lines.join("\n");
+export function buildKimiQuotaView(
+	usage: KimiUsageCache | null | undefined,
+	t: KimiTFunction,
+): QuotaPanelView | null {
+	if (!usage) return null;
+	const entries: Array<[string, string, string, KimiUsageWindow | null]> = [
+		["fiveHour", t("kimi.window5h"), t("quotaPanel.short5h"), usage.fiveHour],
+		["weekly", t("kimi.windowWeekly"), t("quotaPanel.shortWeekly"), usage.weekly],
+		["monthly", t("kimi.windowMonthly"), t("quotaPanel.shortMonthly"), usage.monthly],
+		...usage.extraWindows.map((extra, index): [string, string, string, KimiUsageWindow] => [
+			`extra-${index}`,
+			extra.label,
+			extra.label,
+			extra,
+		]),
+	];
+	const windows = entries.flatMap(([id, label, shortLabel, window]) =>
+		window
+			? [
+					quotaWindowFromAmounts({
+						id,
+						label,
+						shortLabel,
+						used: window.used,
+						limit: window.limit,
+						remaining: window.remaining,
+						resetAt: parseQuotaReset(window.resetTime),
+					}),
+				]
+			: [],
+	);
+	const failed = kimiUsageFailed(usage);
+	if (windows.length === 0 && !failed) return null;
+	return {
+		title: t("kimi.title"),
+		unavailableText: t("kimi.unavailable"),
+		windows,
+		limiting: pickLimitingWindow(windows),
+		level: worstQuotaLevel(windows.map((window) => window.level)),
+		rows: [],
+		failed,
+		failureDetail: usage.error ?? null,
+		fetchedAt: usage.fetchedAt,
+	};
 }

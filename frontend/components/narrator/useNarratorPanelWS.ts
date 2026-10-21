@@ -1,4 +1,5 @@
 import { notifications } from "@mantine/notifications";
+import { quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
@@ -100,6 +101,8 @@ export interface RetryInfo {
  */
 export interface QuotaWaitInfo {
 	resumeAt: number | null;
+	/** Which plan the wait belongs to; absent from older servers (always Kimi). */
+	quotaProvider?: "kimi" | "opencode";
 }
 
 export interface PaymentRequiredInfo {
@@ -1328,19 +1331,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onModelUnavailableWaiting: (info) => {
 				// The narrator is parked on a self-recovering block: a NUG credential
-				// pool coming back, or a Kimi quota window resetting. Reflect the
+				// pool coming back, or a Kimi / OpenCode Go quota window resetting. Reflect the
 				// waiting status locally and surface a dismissible notice that says
 				// which of the two it is.
 				const isQuota = info.waitKind === "quota";
 				const substatus = isQuota ? "quota_exhausted" : "model_unavailable";
-				applyQuotaWaitInfo(isQuota ? { resumeAt: info.resumeAt ?? null } : null);
+				applyQuotaWaitInfo(
+					isQuota ? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider } : null,
+				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
 					id: `model-unavailable-${narratorId}`,
-					title: t(isQuota ? "quotaExhaustedWaitingTitle" : "modelUnavailableWaitingTitle"),
+					title: t(isQuota ? "quotaExhaustedWaitingTitle" : "modelUnavailableWaitingTitle", {
+						provider: quotaProviderLabel(info.quotaProvider),
+					}),
 					message: isQuota
 						? t("quotaExhaustedWaitingDesc", {
 								model: info.model,
+								provider: quotaProviderLabel(info.quotaProvider),
 								resetAt: info.resumeAt
 									? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
 									: t("quotaExhaustedResetUnknown"),

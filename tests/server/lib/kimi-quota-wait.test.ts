@@ -362,35 +362,42 @@ describe("kimi quota wait wiring", () => {
 	);
 
 	test("two refusal paths in the agent loop each resolve a quota decision", () => {
-		expect(loopSource.match(/resolveKimiQuotaWait\(/g)?.length).toBe(2);
-		expect(loopSource.match(/waitKind: "quota"/g)?.length).toBe(2);
+		// One shared generator emits the suspension; both refusal paths must call it.
+		expect(loopSource.match(/resolveProviderQuotaWait\(/g)?.length).toBe(1);
+		expect(loopSource.match(/yield\* tryQuotaSuspension\(/g)?.length).toBe(2);
+		expect(loopSource.match(/waitKind: "quota"/g)?.length).toBe(1);
 	});
 
 	test("the suspension carries both the wake instant and the upstream reset", () => {
 		// `resumeAt` is what the orchestrator sleeps to; `quotaResetAt` is what it
 		// names in the message when it declines to wait. A path that set only one of
 		// them would silently lose either the wait or the explanation.
-		expect(loopSource.match(/resumeAt: kimiQuota\.kind === "wait"/g)?.length).toBe(2);
-		expect(loopSource.match(/quotaResetAt: resetAt/g)?.length).toBe(2);
+		expect(loopSource).toContain(
+			'resumeAt: quota.kind === "wait" ? quota.wait.resumeAt : undefined',
+		);
+		expect(loopSource).toContain("quotaResetAt: decided.resetAt");
+		expect(loopSource).toContain("quotaProvider: decided.quotaProvider");
 	});
 
 	test("the decision distinguishes a wait from a refusal", () => {
-		expect(loopSource).toContain('kimiQuota.kind !== "none"');
-		expect(loopSource).toContain('kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal');
+		expect(loopSource).toContain('if (quota.kind === "none") return false;');
+		expect(loopSource).toContain('quota.kind === "wait" ? quota.wait : quota.refusal');
 	});
 
 	test("the run-scoped wait budget is enforced before parking again", () => {
 		expect(orchestratorSource).toContain("MAX_QUOTA_WAITS_PER_RUN");
 		expect(orchestratorSource).toContain("runState.recovery.quotaWaits += 1");
+		// Consecutive, not lifetime: a successful pass resets the budget.
+		expect(orchestratorSource).toContain("runState.recovery.quotaWaits = 0;");
 	});
 
 	test("a refusal is reported with its reset instant, not only as an error", () => {
 		// The user-visible half: a wall that is not waited on must still say when the
 		// allowance returns. `errorMessage` is the only carrier that survives a page
-		// reload, so the payload goes there.
+		// reload, so the payload goes there, typed by the plan that refused.
 		expect(orchestratorSource).toContain("errorMessage: JSON.stringify({");
 		expect(orchestratorSource).toContain("quotaResetAt,");
-		expect(orchestratorSource).toContain("KIMI_QUOTA_EXHAUSTED");
+		expect(orchestratorSource).toContain("quotaExhaustedCode(mu.quotaProvider)");
 	});
 
 	test("a quota wait is not polled", () => {

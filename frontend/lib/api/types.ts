@@ -30,6 +30,9 @@ export interface OpencodeUsageWindow {
 	percent: number | null;
 	/** ISO timestamp when the window refills. The windows are not calendar periods. */
 	resetsAt: string | null;
+	/** Absolute amounts in the plan's units, only when upstream reported both. */
+	used?: number | null;
+	limit?: number | null;
 }
 
 /**
@@ -46,6 +49,8 @@ export interface OpencodeUsageCache {
 	rolling: OpencodeUsageWindow | null;
 	weekly: OpencodeUsageWindow | null;
 	monthly: OpencodeUsageWindow | null;
+	/** Pay-as-you-go fallback balance, when upstream reports one. */
+	balance?: number | null;
 	generation: string;
 	fetchedAt: number;
 	/** Admin-only: the upstream failure text. Absent for non-admins. */
