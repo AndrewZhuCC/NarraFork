@@ -10,6 +10,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../../lib/z-index";
+import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
 
 export interface CommandParam {
 	name: string;
@@ -195,6 +196,9 @@ export function CommandPopover({
 		}
 	}, [visible, handleKeyDown, anchorRef]);
 
+	// List cap (240) plus the gap to the composer.
+	const popoverSide = useComposerPopoverSide(anchorRef, visible, 248);
+
 	if (!visible || visibleCommands.length === 0) return null;
 
 	return (
@@ -204,10 +208,9 @@ export function CommandPopover({
 			withBorder
 			style={{
 				position: "absolute",
-				bottom: "100%",
+				...composerPopoverOffset(popoverSide),
 				left: 0,
 				right: 0,
-				marginBottom: 4,
 				maxHeight: 240,
 				overflow: "auto",
 				zIndex: Z.dropdown,

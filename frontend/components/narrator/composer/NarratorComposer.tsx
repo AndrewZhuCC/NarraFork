@@ -1747,6 +1747,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				/>
 				{matchedCommand && (
 					<CommandParamHelper
+						anchorRef={textareaRef}
 						command={matchedCommand}
 						input={commandInput}
 						visible={!commandPopoverVisible}
