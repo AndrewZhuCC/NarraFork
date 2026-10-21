@@ -519,3 +519,60 @@ describe("listTeamBashTasks", () => {
 		expect(view).toEqual({ tasks: [], omitted: 0, omittedCapped: false });
 	});
 });
+
+describe("listTeamMembers", () => {
+	test("returns every member across keyset pages, oldest first, with tied createdAt", async () => {
+		await seedParent();
+		// More than one 500-row page, and every row shares one createdAt so the page
+		// boundary falls inside a tie that only the `id` tiebreaker can resolve.
+		const createdAt = "2026-01-01T00:00:00.000Z";
+		const ids = Array.from({ length: 1203 }, (_, i) => `m-${String(i).padStart(4, "0")}`);
+		for (const id of ids) await seedSubagent({ id, createdAt });
+		await seedSubagent({ id: "a-newest", createdAt: "2026-01-02T00:00:00.000Z" });
+
+		const members = await narratorService.listTeamMembers(PARENT);
+
+		expect(members.map((m) => m.id)).toEqual([...ids, "a-newest"]);
+	});
+
+	test("reads only the selector handles, never the large prompt columns", async () => {
+		await seedParent();
+		await seedSubagent({
+			id: "big",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			title: "Explore Payment Flow",
+			traits: ["subagent-alias:payments"],
+		});
+		await db
+			.update(narrators)
+			.set({ systemPrompt: "x".repeat(50_000), contextSummary: "y".repeat(50_000) });
+
+		const [member] = await narratorService.listTeamMembers(PARENT);
+
+		expect(member).toEqual({
+			id: "big",
+			title: "Explore Payment Flow",
+			traits: ["subagent-alias:payments"],
+			createdAt: "2026-01-01T00:00:00.000Z",
+		});
+	});
+
+	test("excludes the root and narrators outside the team", async () => {
+		await seedParent();
+		await seedSubagent({ id: "member", createdAt: "2026-01-01T00:00:00.000Z" });
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "stranger",
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: PARENT,
+			runtimeRegistrationJson: delegationRegistration("someone-else", "general"),
+			createdAt: now,
+			updatedAt: now,
+		});
+
+		const members = await narratorService.listTeamMembers(PARENT);
+
+		expect(members.map((m) => m.id)).toEqual(["member"]);
+	});
+});
