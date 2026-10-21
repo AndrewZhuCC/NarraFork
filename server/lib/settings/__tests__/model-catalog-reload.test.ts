@@ -5,16 +5,11 @@ import { pathToFileURL } from "node:url";
 import {
 	getEffectiveModelProfile,
 	getModelCardSnapshot,
-	legacyWindowProjection,
+	getModelCatalogRevision,
 	mutateModelCard,
+	setModelWindow,
 } from "../../model-catalog";
-import {
-	narraforkDir,
-	reloadSettings,
-	reloadSettingsIfChanged,
-	saveSettings,
-	settings,
-} from "../index";
+import { narraforkDir, reloadSettings, reloadSettingsIfChanged, settings } from "../index";
 
 /**
  * Regression for "provider context window has no effect" and "Unknown field ...
@@ -35,13 +30,15 @@ afterEach(() => {
 });
 
 function saveWindow(value: number | undefined) {
-	const draft = structuredClone(settings);
-	const windows = { ...draft.agent.modelContextWindows };
-	if (value === undefined) delete windows[model];
-	else windows[model] = value;
-	draft.agent.modelContextWindows = windows;
-	saveSettings(draft);
+	setModelWindow({
+		baseRevision: getModelCatalogRevision(),
+		scope: "connection",
+		target: model,
+		contextWindow: value ?? null,
+	});
 }
+const ownWindow = (local = settings.agent.modelCatalog?.local) =>
+	local?.connections?.[model]?.working_context_tokens;
 
 describe("model catalog survives hot reload", () => {
 	test("provider-page windows apply, reload and re-apply; catalog edits keep working", () => {
@@ -53,8 +50,8 @@ describe("model catalog survives hot reload", () => {
 		reloadSettings();
 		expect(settings.agent.modelCatalog?.schemaVersion).toBe(2);
 		expect(getEffectiveModelProfile(model).contextWindow).toBe(77_777);
-		expect(getEffectiveModelProfile(model).contextWindowSource?.layer).toBe("local-binding");
-		expect(settings.agent.modelContextWindows[model]).toBe(77_777);
+		expect(getEffectiveModelProfile(model).contextWindowSource?.layer).toBe("local-connection");
+		expect(ownWindow()).toBe(77_777);
 
 		// A second page edit after the reload must land, not be silently dropped.
 		saveWindow(55_555);
@@ -62,7 +59,7 @@ describe("model catalog survives hot reload", () => {
 		expect(getEffectiveModelProfile(model).contextWindow).toBe(55_555);
 		const disk = JSON.parse(readFileSync(path, "utf8"));
 		expect(disk.agent.modelContextWindows).toBeUndefined();
-		expect(legacyWindowProjection(disk.agent.modelCatalog.local)[model]).toBe(55_555);
+		expect(ownWindow(disk.agent.modelCatalog.local)).toBe(55_555);
 
 		// The catalog editor validates the same document without tripping on raw keys.
 		expect(() =>
@@ -121,7 +118,7 @@ describe("model catalog survives hot reload", () => {
 				process.execPath,
 				"--eval",
 				`const { settings } = await import(${JSON.stringify(settingsModule)});
-				console.log("COLD=" + JSON.stringify({ catalog: settings.agent.modelCatalog, windows: settings.agent.modelContextWindows }));`,
+				console.log("COLD=" + JSON.stringify({ catalog: settings.agent.modelCatalog, windows: settings.agent.modelContextWindows ?? null }));`,
 			],
 			{ env: { ...process.env, NARRAFORK_HOME: home }, stdout: "pipe", stderr: "pipe" },
 		);
@@ -138,8 +135,10 @@ describe("model catalog survives hot reload", () => {
 		reloadSettings();
 		expect({
 			catalog: settings.agent.modelCatalog,
-			windows: settings.agent.modelContextWindows,
+			windows: (settings.agent as { modelContextWindows?: unknown }).modelContextWindows ?? null,
 		}).toEqual(cold);
-		expect(settings.agent.modelContextWindows[model]).toBe(99_999);
+		// The old map is imported as the entry's own window and not kept beside it.
+		expect(cold.windows).toBeNull();
+		expect(ownWindow()).toBe(99_999);
 	}, 30_000);
 });

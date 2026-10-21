@@ -2,11 +2,6 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
-	MAX_MODEL_CONTEXT_WINDOW,
-	MIN_MODEL_CONTEXT_WINDOW,
-	normalizeModelContextWindowOverrides,
-} from "@shared/model-context-window";
-import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -55,6 +50,11 @@ import {
 	syncOpencodeUsageCache,
 } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import {
+	discoverPendingProviderBalances,
+	getProviderBalanceGenerations,
+	syncProviderBalanceCache,
+} from "../lib/provider-balance-cache";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
@@ -522,13 +522,12 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.preprocess(
-					normalizeModelContextWindowOverrides,
-					z.record(
-						z.string(),
-						z.number().int().min(MIN_MODEL_CONTEXT_WINDOW).max(MAX_MODEL_CONTEXT_WINDOW),
-					),
-				),
+				// Windows are edited through the model catalog now. A page loaded before the
+				// upgrade still sends its old map; reject it rather than drop its edits silently.
+				modelContextWindows: z.unknown().refine(() => false, {
+					message:
+						"Context windows are now saved from each model row; reload the page and set them again",
+				}),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),
@@ -951,6 +950,7 @@ async function buildSettingsResponse(
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
 		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
+		providerBalanceGenerations: getProviderBalanceGenerations(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1219,7 +1219,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
-	// (summaryModel, hiddenModels, modelContextWindows, customModels) that reference stale models.
+	// (summaryModel, hiddenModels, provider-model overrides, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
 	const removedProviderGroups = [
 		{ ids: removedCustomApiIds, providers: prev.customApiProviders },
@@ -1762,8 +1762,10 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		}
 		// Invalidate account/transport identities immediately after a successful save.
 		syncDeepSeekBalanceCache();
+		syncProviderBalanceCache();
 		if (validated.customApiProviders || validated.proxy) {
 			void refreshAllDeepSeekBalances().catch(() => {});
+			discoverPendingProviderBalances();
 		}
 		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
@@ -2001,6 +2003,8 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 		geminiProviders: customApiProvidersToGemini(nextCustomApiProviders),
 	};
 	saveSettings(merged);
+	syncProviderBalanceCache();
+	discoverPendingProviderBalances();
 
 	logger.info("Provider base URL fixed with /v1 suffix", {
 		providerId: target.id,

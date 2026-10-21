@@ -83,6 +83,7 @@ import {
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
+import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
@@ -102,6 +103,7 @@ import {
 	formatFullLocaleDateTime,
 } from "../../lib/format";
 import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
+import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
@@ -427,6 +429,7 @@ function NarratorPanelBody({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { t: balanceT } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -753,6 +756,26 @@ function NarratorPanelBody({
 	const deepseekBalancesQuery = useDeepSeekBalance(
 		currentDeepSeekProviderId,
 		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
+		firstScreenActivity,
+	);
+
+	const currentBalanceProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (settingsData?.customApiProviders ?? []).find(
+			(p: { id: string; prefix?: string; disabled?: boolean }) =>
+				p.prefix === prefix && !p.disabled,
+		);
+		return cfg && typeof settingsData?.providerBalanceGenerations?.[cfg.id] === "string"
+			? (cfg.id as string)
+			: null;
+	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.providerBalanceGenerations]);
+	const balanceGeneration = currentBalanceProviderId
+		? settingsData?.providerBalanceGenerations?.[currentBalanceProviderId]
+		: undefined;
+	const providerBalanceQuery = useProviderBalance(
+		currentBalanceProviderId,
+		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
 		firstScreenActivity,
 	);
 
@@ -1170,6 +1193,12 @@ function NarratorPanelBody({
 		if (usageSource === "kimi") {
 			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
+		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
+			return {
+				providerId: cfg.id,
+				...formatProviderBalance(providerBalanceQuery.data, balanceT, providerBalanceQuery.isError),
+			};
+		}
 		const quotas = settingsData?.customApiQuotas as
 			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
 			| undefined;
@@ -1190,6 +1219,10 @@ function NarratorPanelBody({
 		currentDeepSeekProviderId,
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,
+		currentBalanceProviderId,
+		providerBalanceQuery.data,
+		providerBalanceQuery.isError,
+		balanceT,
 		t,
 	]);
 

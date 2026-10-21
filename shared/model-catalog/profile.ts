@@ -58,6 +58,7 @@ const LAYER_RANK: Record<MetadataLayer, number> = {
 	"local-model": 4,
 	"local-variant": 5,
 	"local-binding": 6,
+	"local-connection": 7,
 };
 /**
  * Window keys in tie-break order within one layer. `working_context_tokens` is this

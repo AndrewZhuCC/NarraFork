@@ -307,6 +307,12 @@
 						"$ref": "#/$defs/RawOverride"
 					}
 				},
+				"connections": {
+					"type": "object",
+					"additionalProperties": {
+						"type": "object"
+					}
+				},
 				"hiddenModelIds": {
 					"type": "array",
 					"items": {

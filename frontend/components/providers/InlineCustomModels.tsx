@@ -1,18 +1,9 @@
-import {
-	ActionIcon,
-	Badge,
-	Divider,
-	Group,
-	NumberInput,
-	Stack,
-	Text,
-	TextInput,
-	Tooltip,
-} from "@mantine/core";
+import { ActionIcon, Badge, Divider, Group, Stack, Text, TextInput, Tooltip } from "@mantine/core";
 import { IconEye, IconEyeOff, IconPlayerPlay, IconPlus, IconTrash } from "@tabler/icons-react";
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { modelValue } from "../../lib/constants";
+import { ContextWindowField } from "./ContextWindowField";
 
 export interface CustomModelEntry {
 	value: string;
@@ -28,8 +19,6 @@ interface InlineCustomModelsProps {
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
-	modelContextWindows: Record<string, number>;
-	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 }
 
@@ -39,8 +28,6 @@ export const InlineCustomModels = React.memo(function InlineCustomModels({
 	onCustomModelsChange,
 	hiddenModels,
 	onToggleHidden,
-	modelContextWindows,
-	onContextWindowChange,
 	onTestModel,
 }: InlineCustomModelsProps) {
 	const { t } = useTranslation("settings");
@@ -90,16 +77,7 @@ export const InlineCustomModels = React.memo(function InlineCustomModels({
 					<Group key={m.value} gap="xs" wrap="wrap" style={isHidden ? { opacity: 0.5 } : undefined}>
 						<TextInput value={m.value} disabled style={{ flex: 1, minWidth: 120 }} />
 						<TextInput value={m.label} disabled style={{ flex: 1, minWidth: 120 }} />
-						<NumberInput
-							placeholder={t("contextWindowPlaceholder")}
-							value={modelContextWindows[m.value] || ""}
-							onChange={(v) => onContextWindowChange(m.value, typeof v === "number" ? v : null)}
-							min={256}
-							step={1000}
-							suffix={` ${t("contextWindowSuffix")}`}
-							w={180}
-							size="xs"
-						/>
+						<ContextWindowField modelValue={m.value} />
 						<ActionIcon
 							variant="subtle"
 							color={isHidden ? "gray" : "blue"}

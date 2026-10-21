@@ -2,7 +2,6 @@ import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { isValidModelContextWindow } from "@shared/model-context-window";
 import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -25,7 +24,6 @@ import {
 	isGeminiProtocol,
 } from "../../components/providers/CustomApiProviderSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
-import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
@@ -44,7 +42,6 @@ import {
 	type ProvidersState,
 	providersReducer,
 	providersStateFromSettings,
-	type SavedSnapshot,
 	useIsDirty,
 	useProvidersDispatch,
 } from "../../components/providers/providers-reducer";
@@ -60,6 +57,7 @@ import {
 	tokenDanceDraftSnapshot,
 } from "../../components/providers/tokendance-flow";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { modelCatalogKeys } from "../../hooks/useModelCatalog";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useProviderModelRefreshCapability,
@@ -95,26 +93,7 @@ function getDirtyProviderIds<T extends { id: string }>(
 	return dirtyIds;
 }
 
-function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: SavedSnapshot) {
-	const migratedWindows = { ...state.modelContextWindows };
-	for (const providers of [
-		{ cur: state.customApiProviders, saved: savedSnapshot.customApiProviders },
-		{ cur: state.nugProviders, saved: savedSnapshot.nugProviders },
-	]) {
-		for (const provider of providers.cur) {
-			const original = providers.saved.find((p) => p.id === provider.id);
-			if (original && original.prefix !== provider.prefix) {
-				for (const key of Object.keys(migratedWindows)) {
-					if (key.startsWith(`${original.prefix}:`)) {
-						const model = key.slice(original.prefix.length + 1);
-						migratedWindows[`${provider.prefix}:${model}`] = migratedWindows[key];
-						delete migratedWindows[key];
-					}
-				}
-			}
-		}
-	}
-
+function prepareProviderSettingsSave(state: ProvidersState) {
 	const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
 		...provider,
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
@@ -127,7 +106,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 		...state,
 		customApiProviders: normalizedCustomApiProviders,
 		nugProviders: normalizedNugProviders,
-		modelContextWindows: migratedWindows,
 	};
 	const snapshot = createSnapshot(normalizedState);
 
@@ -142,7 +120,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 				hiddenModels: [...state.hiddenModels],
 				customModels: state.customModels,
 				modelProtocols: state.modelProtocols,
-				modelContextWindows: migratedWindows,
 				providerOrder: state.providerOrder,
 				disabledProviders: [...state.disabledProviders],
 			},
@@ -421,7 +398,7 @@ function SettingsProvidersPage() {
 					throw new Error(t("tokendance.operationFailed"));
 				}
 			}
-			const { payload } = prepareProviderSettingsSave(stateToSave, savedSnapshot.current);
+			const { payload } = prepareProviderSettingsSave(stateToSave);
 			const response = await updateMutation.mutateAsync(payload);
 			// 快照先行、SYNC 随后：快照一变，概览排序（只看快照）在 SYNC 触发的这次
 			// 渲染里就重排 —— 不需要额外的信号 state，也不存在时序窗口。
@@ -431,6 +408,8 @@ function SettingsProvidersPage() {
 			dispatch({ type: "SYNC_FROM_SETTINGS", settings: response as Record<string, unknown> });
 			// 凭据可能刚被替换，额度要按新的 key 重新拉取。
 			void qc.invalidateQueries({ queryKey: ["commandcode", "usage"] });
+			// Prefix renames and removed providers move or drop provider-model overrides.
+			void qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 		},
 		[settingsFeatureCapability.patchSupported, t, updateMutation, state, qc],
 	);
@@ -571,21 +550,6 @@ function SettingsProvidersPage() {
 		[settingsFeatureCapability.patchSupported, qc, t, tc],
 	);
 
-	// ── Server-side context window merge (e.g. after a provider model add) ──
-	const handleServerContextWindowsMerge = useCallback(
-		(windows: Record<string, number>) => {
-			dispatchers.mergeContextWindows(windows);
-			// Also update the saved snapshot so dirty detection doesn't falsely trigger
-			const snap = savedSnapshot.current;
-			for (const [key, value] of Object.entries(windows)) {
-				if (isValidModelContextWindow(value) && !(key in snap.modelContextWindows)) {
-					snap.modelContextWindows[key] = value;
-				}
-			}
-		},
-		[dispatchers],
-	);
-
 	const confirmSaveBeforeRefresh = useCallback(async () => {
 		const confirmed = await confirm({
 			title: t("saveBeforeRefreshTitle"),
@@ -619,17 +583,15 @@ function SettingsProvidersPage() {
 		async (providerId: string) => {
 			if (!nugRefreshCapability.supported) return;
 			try {
-				const result = await api.nugRefreshProviderModels(providerId);
-				if (result.modelContextWindows) {
-					handleServerContextWindowsMerge(result.modelContextWindows);
-				}
+				await api.nugRefreshProviderModels(providerId);
 				await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				await qc.invalidateQueries({ queryKey: ["settings"] });
+				await qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 			} catch {
 				// Non-critical — model list can still be refreshed manually.
 			}
 		},
-		[nugRefreshCapability.supported, qc, handleServerContextWindowsMerge],
+		[nugRefreshCapability.supported, qc],
 	);
 
 	// ── Handle OAuth callback redirect (oauth_success / oauth_error in URL) ──
@@ -1030,10 +992,10 @@ function SettingsProvidersPage() {
 		providerLabels,
 	]);
 
-	// ── Auto-fetch models + fill default context windows after a manual save ──
+	// ── Auto-fetch models after a manual save ──
 	// Triggered by handleSave (only when a provider is being edited). Refreshes the
-	// model list for the selected provider, then computes default token counts for
-	// recognized model families and silently saves them.
+	// model list for the selected provider. Windows are not filled in here: the model
+	// catalog supplies them, and a stored value would pin this provider entry for good.
 	const autoFetchAndFill = useCallback(async () => {
 		const providerId = selectedProvider;
 		if (!providerId) return;
@@ -1065,64 +1027,11 @@ function SettingsProvidersPage() {
 			return;
 		}
 
-		// Fetch fresh settings so we can read the newly-refreshed grouped models.
-		let freshSettings: Record<string, unknown>;
-		try {
-			freshSettings = (await qc.fetchQuery({
-				queryKey: ["admin", "settings"],
-				queryFn: api.getSettings,
-			})) as Record<string, unknown>;
-			qc.setQueryData(["settings"], freshSettings);
-		} catch {
-			return;
-		}
-
-		// Resolve this provider's prefix and the list of model ids from grouped data.
-		const prefix = customApi?.prefix ?? nug?.prefix ?? "";
-		if (!prefix) return;
-
-		const groupedKey = customApi
-			? isGemini
-				? "geminiModelsGrouped"
-				: isAnthropicProtocol(customApi.protocol)
-					? "anthropicModelsGrouped"
-					: "openaiModelsGrouped"
-			: "nugModelsGrouped";
-		const grouped = (freshSettings[groupedKey] ?? []) as Array<{
-			providerId: string;
-			models: Array<Record<string, unknown>>;
-		}>;
-		const group = grouped.find((g) => g.providerId === providerId);
-		if (!group || group.models.length === 0) return;
-
-		const modelIds = group.models
-			.map((m) => String(m.id ?? m.model_id ?? m.modelId ?? ""))
-			.filter(Boolean);
-
-		// Compute default context windows for recognized model families only.
-		const existing = state.modelContextWindows;
-		const additions: Record<string, number> = {};
-		for (const id of modelIds) {
-			const key = `${prefix}:${id}`;
-			if (existing[key] != null) continue;
-			const def = getModelDefaultContextWindow(id);
-			if (isValidModelContextWindow(def)) additions[key] = def;
-		}
-		if (Object.keys(additions).length === 0) return;
-
-		// Silently persist the new context windows.
-		const nextState: ProvidersState = {
-			...state,
-			modelContextWindows: { ...state.modelContextWindows, ...additions },
-		};
-		dispatchers.mergeContextWindows(additions);
-		try {
-			await saveProvidersState(nextState);
-		} catch {
-			// Ignore — the values remain in local state for the user to save manually.
-		}
-	}, [selectedProvider, state, qc, dispatchers, saveProvidersState]);
-
+		// The refreshed listing changes model lists and the windows their rows show.
+		await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+		await qc.invalidateQueries({ queryKey: ["settings"] });
+		await qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
+	}, [selectedProvider, state, qc]);
 	autoFetchAndFillRef.current = autoFetchAndFill;
 
 	if (isTokenDanceCallback) return <Outlet />;
@@ -1176,8 +1085,6 @@ function SettingsProvidersPage() {
 							onBatchToggleHidden={dispatchers.batchToggleHidden}
 							modelProtocols={state.modelProtocols}
 							onModelProtocolChange={dispatchers.setModelProtocol}
-							modelContextWindows={state.modelContextWindows}
-							onContextWindowChange={dispatchers.handleContextWindowChange}
 							onTestModel={setTestingModel}
 							onLogin={() => tokenDanceLogin()}
 							onChanged={refreshTokenDanceSettings}
@@ -1200,7 +1107,6 @@ function SettingsProvidersPage() {
 							getPrefixError={getPrefixError}
 							getUniquePrefix={getUniquePrefix}
 							onTestModel={setTestingModel}
-							onServerContextWindowsMerge={handleServerContextWindowsMerge}
 							onSaveBeforeRefresh={confirmSaveBeforeRefresh}
 							onSaveBeforeNugAction={saveBeforeNugAction}
 							onNugLoginSuccess={saveNugLoginResult}
@@ -1356,7 +1262,6 @@ interface ProviderSectionContentProps {
 	getPrefixError: (prefix: string, id: string) => string | undefined;
 	getUniquePrefix: (base: string, id: string) => string;
 	onTestModel: (model: string) => void;
-	onServerContextWindowsMerge?: (windows: Record<string, number>) => void;
 	onSaveBeforeRefresh: () => Promise<boolean>;
 	onSaveBeforeNugAction: () => Promise<boolean>;
 	onNugLoginSuccess: (providerId: string, apiKey: string, username: string) => Promise<boolean>;
@@ -1380,7 +1285,6 @@ function ProviderSectionContent({
 	getPrefixError,
 	getUniquePrefix,
 	onTestModel,
-	onServerContextWindowsMerge,
 	onSaveBeforeRefresh,
 	onSaveBeforeNugAction,
 	onNugLoginSuccess,
@@ -1403,8 +1307,6 @@ function ProviderSectionContent({
 				onCustomModelsChange={dispatchers.setCustomModels}
 				modelProtocols={state.modelProtocols}
 				onModelProtocolChange={dispatchers.setModelProtocol}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
 				onTestModel={onTestModel}
 				onRefreshModels={onRefreshCommandCodeModels}
 			/>
@@ -1420,8 +1322,6 @@ function ProviderSectionContent({
 				onCustomModelsChange={dispatchers.setCustomModels}
 				modelProtocols={state.modelProtocols}
 				onModelProtocolChange={dispatchers.setModelProtocol}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
 				onTestModel={onTestModel}
 			/>
 		);
@@ -1447,8 +1347,6 @@ function ProviderSectionContent({
 					hiddenModels: state.hiddenModels,
 					onToggleHidden: dispatchers.toggleHidden,
 					onBatchToggleHidden: dispatchers.batchToggleHidden,
-					modelContextWindows: state.modelContextWindows,
-					onContextWindowChange: dispatchers.handleContextWindowChange,
 					customModels: state.customModels,
 					onCustomModelsChange: dispatchers.setCustomModels,
 					modelProtocols: state.modelProtocols,
@@ -1472,8 +1370,6 @@ function ProviderSectionContent({
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}
 				onBatchToggleHidden={dispatchers.batchToggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
 				isProviderDirty={isCustomApiProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
@@ -1483,7 +1379,6 @@ function ProviderSectionContent({
 				getUniquePrefix={getUniquePrefix}
 				onTestModel={onTestModel}
 				onSaveBeforeRefresh={onSaveBeforeRefresh}
-				onMergeContextWindows={onServerContextWindowsMerge}
 				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
 			/>
 		);
@@ -1497,9 +1392,6 @@ function ProviderSectionContent({
 				providerModelsMap={nugModelsMap}
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
-				onMergeContextWindows={onServerContextWindowsMerge}
 				isProviderDirty={isNugProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}

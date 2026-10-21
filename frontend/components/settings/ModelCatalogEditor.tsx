@@ -23,6 +23,7 @@ import {
 } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
 import { Z } from "../../lib/z-index";
+import { ProviderWindowOverrides } from "../providers/ContextWindowField";
 import {
 	COMMAND_CODE_PROTOCOL_OPTIONS,
 	ModelProtocolSelect,
@@ -500,6 +501,9 @@ export function ModelCatalogEditor({
 							</Group>
 						)}
 					</Stack>
+				)}
+				{target.kind === "model" && !target.isNew && (
+					<ProviderWindowOverrides modelId={target.id} />
 				)}
 				<CatalogMetadataFields
 					card={target.card}

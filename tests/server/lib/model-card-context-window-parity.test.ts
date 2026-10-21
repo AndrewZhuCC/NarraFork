@@ -160,17 +160,18 @@ const FUZZY_MATCHED_IDS = [
 const ALL_PROBE_IDS = [...Object.keys(EXPECTED_BUILTIN_CONTEXT_WINDOWS), ...FUZZY_MATCHED_IDS];
 
 /**
- * The probe runs with an empty user-override map so the card layer is the only
- * thing under test. `modelContextWindows` would otherwise win outright and mask
- * a regression in the layer below it.
+ * The probe runs without provider entries' own windows so the card layer is the only
+ * thing under test. An entry's own window would otherwise win outright and mask a
+ * regression in the layer below it.
  */
 function withoutUserOverrides<T>(fn: () => T): T {
-	const original = settings.agent.modelContextWindows;
-	settings.agent.modelContextWindows = {};
+	const local = settings.agent.modelCatalog?.local;
+	const original = local?.connections;
+	if (local) delete local.connections;
 	try {
 		return fn();
 	} finally {
-		settings.agent.modelContextWindows = original;
+		if (local && original) local.connections = original;
 	}
 }
 
