@@ -46,3 +46,43 @@ export interface ModelCatalogResolveRequest {
 	model?: string;
 }
 export type ModelCatalogResolveResponse = ModelCard;
+
+/** Where the window a provider entry runs with comes from, as the provider page labels it. */
+export type ModelWindowSource =
+	/** This provider entry's own value. */
+	| "own"
+	/** A catalog-editor binding for this connection. */
+	| "binding"
+	/** A model-wide value the user set for the catalog model. */
+	| "model"
+	/** Reported by the gateway or provider listing. */
+	| "discovered"
+	/** The provider's configured default window. */
+	| "provider"
+	/** The bundled catalog. */
+	| "preset"
+	/** Nothing declared: the runtime default. */
+	| "fallback";
+
+/** One provider entry's context window and the two scopes that can set it. */
+export interface ModelWindowInfo {
+	model: string;
+	/** What requests use. */
+	contextWindow: number;
+	source: ModelWindowSource;
+	/** This provider entry's own working window. */
+	own?: number;
+	/** What applies when `own` is cleared. */
+	inherited: number;
+	inheritedSource: ModelWindowSource;
+	/** The catalog model a model-wide value targets; absent when there is none to target. */
+	modelId?: string;
+	/** The model-wide working window, when one is set. */
+	modelWide?: number;
+	/** Other provider entries of the same model that set their own window. */
+	others: Array<{ model: string; contextWindow: number }>;
+}
+export interface ModelWindowsResponse {
+	revision: number;
+	windows: ModelWindowInfo[];
+}

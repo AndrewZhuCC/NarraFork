@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { isValidModelContextWindow } from "@shared/model-context-window";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
+import { registerListingWindows } from "../lib/model-catalog";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
 	type GeminiProviderConfig,
@@ -10,7 +11,6 @@ import {
 	narraforkDir,
 	registerGeminiModelChecker,
 	registerGeminiModelLister,
-	saveSettings,
 	settings,
 } from "../lib/settings";
 import { requireAdmin, requireAuth } from "../middleware/auth";
@@ -375,19 +375,20 @@ export async function fetchGeminiModels(
 	return models;
 }
 
-/** Fill context window sizes into settings for a provider's fetched models. */
-function fillContextWindows(models: GeminiModelInfo[], provider: GeminiProviderConfig): void {
-	let changed = false;
-	const windows = settings.agent.modelContextWindows ?? {};
-	settings.agent.modelContextWindows = windows;
-	for (const m of models) {
-		if (isValidModelContextWindow(m.contextLength) && !windows[`${provider.prefix}:${m.id}`]) {
-			windows[`${provider.prefix}:${m.id}`] = m.contextLength;
-			changed = true;
-		}
+/**
+ * Gemini's listing reports each model's input limit. It reaches the catalog as discovered
+ * metadata, below anything the user sets, so a model-wide value still applies and clearing
+ * a provider entry's own value is not undone by the next refresh.
+ */
+registerListingWindows((model) => {
+	for (const provider of settings.geminiProviders ?? []) {
+		if (!provider.prefix || !model.startsWith(`${provider.prefix}:`)) continue;
+		const id = model.slice(provider.prefix.length + 1);
+		const listed = matchingCachedModels(provider, cachedModelsByProvider).find((m) => m.id === id);
+		if (listed && isValidModelContextWindow(listed.contextLength)) return listed.contextLength;
 	}
-	if (changed) saveSettings(settings);
-}
+	return undefined;
+});
 
 // === Routes ===
 
@@ -405,7 +406,6 @@ geminiRoutes.post("/models/refresh", async (c) => {
 		try {
 			const models = await fetchGeminiModels(p, { signal: c.req.raw.signal });
 			cachedModelsByProvider.set(p.id, { transport: geminiTransport(p), models });
-			fillContextWindows(models, p);
 			results.push({ providerId: p.id, name: p.name, count: models.length });
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
@@ -418,7 +418,6 @@ geminiRoutes.post("/models/refresh", async (c) => {
 		results,
 		models: getGeminiCachedModels(),
 		fromCache: false,
-		modelContextWindows: settings.agent.modelContextWindows ?? {},
 	});
 });
 
@@ -438,13 +437,11 @@ geminiRoutes.post("/providers/:id/models/refresh", async (c) => {
 	try {
 		const models = await fetchGeminiModels(config, { signal: c.req.raw.signal });
 		cachedModelsByProvider.set(id, { transport: geminiTransport(config), models });
-		fillContextWindows(models, config);
 		saveCachedModels();
 		return c.json({
 			models,
 			count: models.length,
 			fromCache: false,
-			modelContextWindows: settings.agent.modelContextWindows ?? {},
 		});
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

@@ -370,8 +370,6 @@ describe("PluginProviderSection model area", () => {
 			onToggleHidden: () => {},
 			modelProtocols: {},
 			onModelProtocolChange: () => {},
-			modelContextWindows: {},
-			onContextWindowChange: () => {},
 			customModels: [],
 			onCustomModelsChange: () => {},
 			...overrides,

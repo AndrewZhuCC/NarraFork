@@ -90,7 +90,6 @@ export const DEFAULTS: NarraForkSettings = {
 		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
-		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		planModeAllowInlinePlan: true,
@@ -603,10 +602,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.freshShellEnv": {
 		desc: "启用后 Bash 工具通过 login shell 加载最新环境变量，而非继承服务器进程环境。适用于服务器启动后修改了 shell 配置的场景。",
 		type: "boolean",
-	},
-	"agent.modelContextWindows": {
-		desc: '按模型覆盖上下文窗口大小（tokens）。键为完整模型值 "provider:modelId"，值为 token 数。优先级最高。',
-		type: "Record<string, number>",
 	},
 	"agent.translateReasoning": {
 		desc: "启用后，每个 reasoning/thinking 块完成后自动通过 translationModel 翻译成用户语言（非英文时）。",

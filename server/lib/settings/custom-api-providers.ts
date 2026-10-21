@@ -3,6 +3,7 @@ import {
 	type SubagentModelReasoningEfforts,
 } from "@shared/subagent-model-policy";
 import { ValidationError } from "../errors";
+import { rewriteConnectionOverrides } from "../model-catalog";
 import type {
 	AnthropicProviderConfig,
 	CustomApiProtocol,
@@ -444,23 +445,20 @@ export function migrateProviderPrefixReferences(
 	);
 	if (prefixMap.size === 0) return false;
 
-	const migratedContextWindows: Record<string, number> = {};
-	const contextSources = new Map<string, string>();
-	for (const [sourceModel, contextWindow] of Object.entries(
-		settings.agent.modelContextWindows ?? {},
-	)) {
-		const targetModel = rewriteModelReference(sourceModel, prefixMap);
-		const existing = migratedContextWindows[targetModel];
-		if (existing !== undefined && existing !== contextWindow) {
-			throw new ValidationError(
-				`Provider prefix migration would overwrite context window "${targetModel}" ` +
-					`from both "${contextSources.get(targetModel)}" and "${sourceModel}".`,
-			);
-		}
-		if (existing === undefined) {
-			migratedContextWindows[targetModel] = contextWindow;
-			contextSources.set(targetModel, sourceModel);
-		}
+	// Provider entries' own model overrides move with the prefix. Checked on a scratch
+	// document first so a collision rejects the migration before anything is rewritten.
+	const renameConnection = (model: string) => rewriteModelReference(model, prefixMap);
+	try {
+		rewriteConnectionOverrides(
+			{ agent: { modelCatalog: settings.agent.modelCatalog } } as NarraForkSettings,
+			renameConnection,
+		);
+	} catch (error) {
+		throw new ValidationError(
+			`Provider prefix migration would overwrite model overrides: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
 	}
 
 	const migratedCustomModels: typeof settings.agent.customModels = [];
@@ -526,12 +524,12 @@ export function migrateProviderPrefixReferences(
 		modelAggregations: settings.agent.modelAggregations,
 		hiddenModels: settings.agent.hiddenModels,
 		customModels: settings.agent.customModels,
-		modelContextWindows: settings.agent.modelContextWindows,
 		providerOrder: settings.agent.providerOrder,
 		disabledProviders: settings.agent.disabledProviders,
 		searchChannels: settings.search?.channels,
 	});
 
+	const connectionsMoved = rewriteConnectionOverrides(settings, renameConnection);
 	settings.agent.defaultModel = rewriteModelReference(settings.agent.defaultModel, prefixMap);
 	settings.agent.summaryModel = rewriteModelReference(settings.agent.summaryModel, prefixMap);
 	settings.agent.translationModel = rewriteModelReference(
@@ -568,7 +566,6 @@ export function migrateProviderPrefixReferences(
 		settings.agent.subagentModelReasoningEfforts = migratedReasoningEfforts;
 	}
 	settings.agent.customModels = migratedCustomModels;
-	settings.agent.modelContextWindows = migratedContextWindows;
 	settings.agent.providerOrder = settings.agent.providerOrder?.map(
 		(prefix) => prefixMap.get(prefix) ?? prefix,
 	);
@@ -593,12 +590,11 @@ export function migrateProviderPrefixReferences(
 		modelAggregations: settings.agent.modelAggregations,
 		hiddenModels: settings.agent.hiddenModels,
 		customModels: settings.agent.customModels,
-		modelContextWindows: settings.agent.modelContextWindows,
 		providerOrder: settings.agent.providerOrder,
 		disabledProviders: settings.agent.disabledProviders,
 		searchChannels: settings.search?.channels,
 	});
-	return before !== after;
+	return connectionsMoved || before !== after;
 }
 
 export function normalizeCustomApiProviderSettings(settings: NarraForkSettings): boolean {

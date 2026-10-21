@@ -736,7 +736,6 @@ nugRoutes.post("/models/refresh", async (c) => {
 		results,
 		models: getActiveNugCachedModels(),
 		fromCache: false,
-		modelContextWindows: settings.agent.modelContextWindows ?? {},
 	});
 });
 
@@ -777,7 +776,6 @@ nugRoutes.post("/providers/:id/models/refresh", async (c) => {
 			models: applied.models,
 			fromCache: false,
 			modelHash: applied.modelHash,
-			modelContextWindows: settings.agent.modelContextWindows ?? {},
 		});
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

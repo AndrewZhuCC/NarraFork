@@ -74,12 +74,27 @@ export function createModelCardResolver(
 	for (const entry of local.overrides ?? []) entry.metadata = validateRawMetadata(entry.metadata);
 	for (const entry of local.bindings ?? [])
 		if (entry.overrides !== undefined) entry.overrides = validateRawMetadata(entry.overrides);
+	const connections = new Map(
+		Object.entries(local.connections ?? {}).map(([model, metadata]) => [
+			model,
+			validateRawMetadata(metadata),
+		]),
+	);
 	const identify = createModelIdentityResolver(catalog, local);
 	const baseModels = new Map(catalog.models.map((entry) => [entry.id, entry]));
 	const baseVariants = new Map(catalog.variants.map((entry) => [entry.id, entry]));
 	const localModels = new Map((local.models ?? []).map((entry) => [entry.id, entry]));
 	const localVariants = new Map((local.variants ?? []).map((entry) => [entry.id, entry]));
-	return (query: ModelQuery, discovered?: RawMetadata, defaults?: RawMetadata): ModelCard => {
+	/**
+	 * `connection` is the full model value (`provider:model`) the query was derived from;
+	 * that provider entry's own overrides apply by name, last.
+	 */
+	return (
+		query: ModelQuery,
+		discovered?: RawMetadata,
+		defaults?: RawMetadata,
+		connection?: string,
+	): ModelCard => {
 		const identity = identify(query);
 		const binding = identity.binding;
 		const matched = identity.matchedEntry;
@@ -195,6 +210,8 @@ export function createModelCardResolver(
 			merge(binding.overrides, { layer: "local-binding", id: binding.id, explicit: true });
 			applyOverride("binding", binding.id);
 		}
+		const own = connection === undefined ? undefined : connections.get(connection);
+		if (own) merge(own, { layer: "local-connection", id: connection, explicit: true });
 		const card = {
 			schemaVersion: 2,
 			catalogVersion: catalog.catalogVersion,

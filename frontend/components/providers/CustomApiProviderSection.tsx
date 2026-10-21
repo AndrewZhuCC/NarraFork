@@ -18,6 +18,7 @@ import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { modelCatalogKeys } from "../../hooks/useModelCatalog";
 import {
 	useProviderModelRefreshCapability,
 	useProviderRouteCapability,
@@ -30,6 +31,7 @@ import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
+import { ProviderBalanceStatus } from "./ProviderBalanceStatus";
 import type { CustomApiProtocol, CustomApiProviderState, OpenAIProviderState } from "./types";
 import { defaultUserAgentModeForProtocol } from "./types";
 
@@ -107,11 +109,8 @@ interface CustomApiProviderSectionProps {
 	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
 	modelProtocols: Record<string, CustomApiProtocol>;
 	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
-	modelContextWindows: Record<string, number>;
-	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
 	onSaveBeforeRefresh?: () => Promise<boolean>;
-	onMergeContextWindows?: (windows: Record<string, number>) => void;
 	onToggleProviderDisabled?: (prefix: string) => void;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
@@ -136,11 +135,8 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	onBatchToggleHidden,
 	modelProtocols,
 	onModelProtocolChange,
-	modelContextWindows,
-	onContextWindowChange,
 	isProviderDirty,
 	onSaveBeforeRefresh,
-	onMergeContextWindows,
 	onToggleProviderDisabled,
 	customModels,
 	onCustomModelsChange,
@@ -334,10 +330,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		setRefreshingProvider(provider.id);
 		try {
 			if (usesGemini) {
-				const result = await api.geminiRefreshProviderModels(provider.id);
-				if (result.modelContextWindows) {
-					onMergeContextWindows?.(result.modelContextWindows);
-				}
+				await api.geminiRefreshProviderModels(provider.id);
 			} else if (usesAnthropic) {
 				const result = await api.anthropicRefreshProviderModels(provider.id);
 				if (result.resolvedBaseUrl) {
@@ -368,6 +361,8 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 			}
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });
+			// Listings can report windows; provider rows re-read theirs.
+			qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 		} catch (err) {
 			notifications.show({
 				color: "red",
@@ -383,7 +378,6 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		t,
 		isProviderDirty,
 		onSaveBeforeRefresh,
-		onMergeContextWindows,
 		provider.id,
 		usesAnthropic,
 		usesGemini,
@@ -462,6 +456,11 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					value={provider.baseUrl}
 					size="xs"
 					onChange={(e) => handleBaseUrlChange(e.currentTarget.value)}
+				/>
+
+				<ProviderBalanceStatus
+					providerId={provider.id}
+					dirty={isProviderDirty?.(provider.id) ?? false}
 				/>
 
 				<ProxyOverrideField
@@ -625,8 +624,6 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						onBatchToggleHidden={onBatchToggleHidden}
 						modelProtocols={modelProtocols}
 						onModelProtocolChange={onModelProtocolChange}
-						modelContextWindows={modelContextWindows}
-						onContextWindowChange={onContextWindowChange}
 						onTestModel={onTestModel}
 					/>
 				)}
@@ -638,8 +635,6 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					onCustomModelsChange={onCustomModelsChange}
 					hiddenModels={hiddenModels}
 					onToggleHidden={onToggleHidden}
-					modelContextWindows={modelContextWindows}
-					onContextWindowChange={onContextWindowChange}
 					onTestModel={onTestModel}
 				/>
 			</Stack>

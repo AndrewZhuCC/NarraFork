@@ -8,16 +8,15 @@ import {
 import type { ModelCatalogSettings } from "../../../server/lib/model-catalog";
 import {
 	applyModelCatalogUpdate,
-	applyWindowSettings,
 	bindModelCatalogSettings,
 	checkModelCatalogUpdate,
 	getEffectiveModelCard,
 	getEffectiveModelProfile,
 	getModelCardSnapshot,
-	legacyWindowProjection,
 	mutateModelCard,
 	rollbackModelCatalog,
 	setModelCatalogUpdateSettings,
+	setModelWindow,
 	withModelMetadataSnapshot,
 	withModelMetadataSnapshotIterator,
 } from "../../../server/lib/model-catalog";
@@ -78,6 +77,17 @@ afterEach(() => {
 	_bindSettings(settings);
 });
 const profile = (model: string) => getEffectiveModelProfile(model);
+/** The per-model window map a settings file from an older build may carry. */
+const storeWindowMap = (windows: Record<string, number>) => {
+	(local.agent as Record<string, unknown>).modelContextWindows = windows;
+};
+const setOwnWindow = (model: string, contextWindow: number | null) =>
+	setModelWindow({
+		baseRevision: getModelCardSnapshot().local.revision,
+		scope: "connection",
+		target: model,
+		contextWindow,
+	});
 /** Fixture prices are written per million tokens; the catalog stores per-token decimals. */
 const perToken = (perMillion: string) => decimalValue(perMillion, -6);
 function mutate(value: Omit<Extract<ModelCardMutation, { action: "patch" }>, "baseRevision">) {
@@ -181,7 +191,7 @@ describe("unified metadata storage and runtime", () => {
 				contextWindow: 32000,
 			},
 		];
-		local.agent.modelContextWindows = { "custom-empty-label": 16000 };
+		storeWindowMap({ "custom-empty-label": 16000 });
 		expect(() => bindModelCatalogSettings(local, () => {})).not.toThrow();
 		const model = local.agent.modelCatalog!.local.models!.find(
 			(m) => m.id === "custom-empty-label",
@@ -257,31 +267,27 @@ describe("unified metadata storage and runtime", () => {
 		).toThrow("disk unavailable");
 		expect(getModelCardSnapshot()).toEqual(initial);
 	});
-	test("provider-page window edits become bindings and a catalog reset is never re-pinned", () => {
-		local.agent.modelContextWindows = { "codex:gpt-5.5": 230000 };
-		applyWindowSettings(local);
+	test("provider-entry windows apply by model value and a reset restores inheritance", () => {
+		setOwnWindow("codex:gpt-5.5", 230000);
 		expect(profile("codex:gpt-5.5").contextWindow).toBe(230000);
 		mutate({
 			action: "patch",
-			target: "binding",
-			targetId: "legacy-window:codex:gpt-5.5",
+			target: "connection",
+			targetId: "codex:gpt-5.5",
 			patch: { reset: ["working_context_tokens"] },
 		});
-		// The page's map is a view: the reset is visible there, so saving it again
-		// cannot resurrect the old value.
-		expect(local.agent.modelContextWindows).toEqual({});
-		applyWindowSettings(local);
 		expect(profile("codex:gpt-5.5").contextWindow).toBe(presetContextWindow);
-		expect(legacyWindowProjection(getModelCardSnapshot().local)).toEqual({});
+		expect(getModelCardSnapshot().local.connections).toBeUndefined();
 	});
 	test.each([
 		"migrated",
 		"patched",
-	] as const)("deleting a %s binding atomically removes its overrides", (source) => {
-		const id = source === "migrated" ? "legacy-window:codex:gpt-5.5" : "editable-binding";
+	] as const)("deleting a %s window atomically removes its overrides", (source) => {
+		const target = source === "migrated" ? "connection" : "binding";
+		const id = source === "migrated" ? "codex:gpt-5.5" : "editable-binding";
 		if (source === "migrated") {
 			delete local.agent.modelCatalog;
-			local.agent.modelContextWindows = { "codex:gpt-5.5": 199999 };
+			storeWindowMap({ "codex:gpt-5.5": 199999 });
 			bindModelCatalogSettings(local, () => {});
 		} else {
 			mutateModelCard({
@@ -308,7 +314,7 @@ describe("unified metadata storage and runtime", () => {
 		});
 		const deletion = {
 			action: "delete",
-			target: "binding",
+			target,
 			targetId: id,
 			baseRevision: before.local.revision,
 		} as const;
@@ -320,6 +326,7 @@ describe("unified metadata storage and runtime", () => {
 		expect(saves).toBe(1);
 		expect(after.local.revision).toBe(before.local.revision + 1);
 		expect(after.local.bindings?.some((b) => b.id === id)).toBe(false);
+		expect(after.local.connections?.[id]).toBeUndefined();
 		expect(after.local.overrides?.some((o) => o.target === "binding" && o.targetId === id)).toBe(
 			false,
 		);
@@ -521,17 +528,18 @@ describe("unified metadata storage and runtime", () => {
 		"migration",
 		"save",
 	] as const)("legacy window %s preserves weak-match pricing restrictions", (mode) => {
-		local.agent.modelContextWindows = { "codex:gpt-5.5-mini": 160000 };
 		if (mode === "migration") {
+			storeWindowMap({ "codex:gpt-5.5-mini": 160000 });
 			delete local.agent.modelCatalog;
 			bindModelCatalogSettings(local, () => {});
 		} else {
-			applyWindowSettings(local);
+			setOwnWindow("codex:gpt-5.5-mini", 160000);
 		}
 		const resolved = profile("codex:gpt-5.5-mini");
 		expect(resolved.contextWindow).toBe(160000);
 		expect(resolved.referencePricing).toBeUndefined();
-		expect(getModelCardSnapshot().local.bindings?.[0]?.modelId).toBeUndefined();
+		// A provider entry's own window never asserts an identity.
+		expect(getModelCardSnapshot().local.bindings ?? []).toEqual([]);
 	});
 	test("migration merges alias and duplicate cards once with canonical fields winning independent of order", () => {
 		delete local.agent.modelCatalog;
@@ -573,7 +581,7 @@ describe("unified metadata storage and runtime", () => {
 			{ modelKey: "gpt-5.5", officialPricing: { input: 0, output: 99 }, contextWindow: 222222 },
 		];
 		local.pricing = { overrides: { "gpt-5.5": { input: 0 } } };
-		local.agent.modelContextWindows = { "codex:gpt-5.5": 199999 };
+		storeWindowMap({ "codex:gpt-5.5": 199999 });
 		let saves = 0;
 		bindModelCatalogSettings(local, () => saves++);
 		expect(profile("codex:gpt-5.5").contextWindow).toBe(199999);
@@ -624,7 +632,7 @@ describe("unified metadata storage and runtime", () => {
 			{ saveCache: false },
 		);
 		expect(applied.changedContextWindows).toBe(false);
-		expect(local.agent.modelContextWindows).toEqual({});
+		expect(local.agent.modelCatalog?.local.connections).toBeUndefined();
 		expect(getNugCachedModelsByProvider(config.id)[0]?.metadata).toEqual(metadata);
 		expect(
 			resolveNugModelMeta(config.id, config.prefix, "gateway:channel:gpt-5.5").metadata,

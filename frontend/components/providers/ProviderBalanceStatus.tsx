@@ -1,0 +1,72 @@
+import { Button, Group, Stack, Text } from "@mantine/core";
+import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
+import { useCurrentUser } from "../../hooks/useAuth";
+import { useProbeProviderBalance, useProviderBalance } from "../../hooks/useProviderBalance";
+import { api } from "../../lib/api";
+import { formatProviderBalance } from "../../lib/provider-balance-format";
+
+export function ProviderBalanceStatus({
+	providerId,
+	dirty,
+}: {
+	providerId: string;
+	dirty: boolean;
+}) {
+	const { t } = useTranslation("settings");
+	const { data: user } = useCurrentUser();
+	const { data: settings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		staleTime: 30_000,
+	});
+	const rawGeneration = settings?.providerBalanceGenerations?.[providerId];
+	const generation = typeof rawGeneration === "string" ? rawGeneration : undefined;
+	const query = useProviderBalance(providerId, generation);
+	const canProbe =
+		user?.role === "admin" &&
+		!dirty &&
+		generation !== undefined &&
+		!query.isPending &&
+		!query.isError;
+	const probe = useProbeProviderBalance(providerId, generation, canProbe);
+	if (!generation) return null;
+	const snapshot = query.data;
+	const formatted = formatProviderBalance(snapshot, t, query.isError);
+	const probing = snapshot?.status === "pending" || snapshot?.status === "probing";
+	return (
+		<Stack gap={4}>
+			<Group justify="space-between">
+				<Text size="xs" c="dimmed">
+					{t(`providerBalance.${snapshot?.status ?? "pending"}`)}
+				</Text>
+				{user?.role === "admin" && (
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						disabled={!canProbe || probing}
+						loading={probe.isPending}
+						onClick={() => probe.mutate()}
+					>
+						{t("providerBalance.probe")}
+					</Button>
+				)}
+			</Group>
+			{snapshot?.balance && (
+				<Text size="xs" style={{ whiteSpace: "pre-line" }}>
+					{formatted.detailedQuotaBalance}
+				</Text>
+			)}
+			{(query.isError || probe.isError) && (
+				<Text size="xs" c="red">
+					{t("providerBalance.failed")}
+				</Text>
+			)}
+			{dirty && (
+				<Text size="xs" c="dimmed">
+					{t("providerBalance.saveFirst")}
+				</Text>
+			)}
+		</Stack>
+	);
+}

@@ -63,22 +63,6 @@ export function rebaseProviderState(
 		fresh.customApiProviders,
 	);
 	const nugProviders = rebaseRecords(local.nugProviders, baseline.nugProviders, fresh.nugProviders);
-	const modelContextWindows = { ...fresh.modelContextWindows };
-	for (const key of new Set([
-		...Object.keys(baseline.modelContextWindows),
-		...Object.keys(local.modelContextWindows),
-	])) {
-		const hasLocal = Object.hasOwn(local.modelContextWindows, key);
-		const hasSaved = Object.hasOwn(baseline.modelContextWindows, key);
-		if (
-			hasLocal === hasSaved &&
-			local.modelContextWindows[key] === baseline.modelContextWindows[key]
-		) {
-			continue;
-		}
-		if (hasLocal) modelContextWindows[key] = local.modelContextWindows[key];
-		else delete modelContextWindows[key];
-	}
 	const projected = providersReducer(fresh, {
 		type: "SET_CUSTOM_API_PROVIDERS",
 		providers: customApiProviders,
@@ -115,6 +99,5 @@ export function rebaseProviderState(
 			local.tokenDanceDisabled !== baseline.tokenDanceDisabled
 				? local.tokenDanceDisabled
 				: fresh.tokenDanceDisabled,
-		modelContextWindows,
 	});
 }
