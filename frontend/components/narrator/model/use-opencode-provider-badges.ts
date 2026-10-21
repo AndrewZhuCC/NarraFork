@@ -9,7 +9,9 @@ import {
 	formatOpencodeBadgeText,
 	formatOpencodeSummaryLines,
 	OPENCODE_LEVEL_COLORS,
+	opencodeWindowLabel,
 } from "./opencode-usage-view";
+import type { QuotaBarSpec } from "./QuotaWindowBars";
 
 interface ProviderConfigLike {
 	id: string;
@@ -18,10 +20,20 @@ interface ProviderConfigLike {
 	disabled?: boolean;
 }
 
-export type OpencodeProviderBadges = Record<
-	string,
-	{ text: string; color: string; tooltip?: string }
->;
+/**
+ * Model-picker group badge. With `bars`, the header draws one vertical bar per
+ * limit window (same glyph as the status bar); `text` stays the accessible label.
+ */
+export interface ProviderQuotaBadge {
+	text: string;
+	color: string;
+	tooltip?: string;
+	bars?: QuotaBarSpec[];
+	/** The last refresh failed; bars are drawn dimmed. */
+	stale?: boolean;
+}
+
+export type OpencodeProviderBadges = Record<string, ProviderQuotaBadge>;
 
 /**
  * Build model-picker group badges for every enabled OpenCode Go provider.
@@ -51,6 +63,13 @@ export function buildOpencodeProviderBadges(input: {
 			text: formatOpencodeBadgeText(view, input.t),
 			color: view.failed && view.level === "unknown" ? "gray" : OPENCODE_LEVEL_COLORS[view.level],
 			tooltip: formatOpencodeSummaryLines(view, input.now, input.t).join("\n"),
+			bars: view.windows.map((window) => ({
+				id: window.key,
+				label: opencodeWindowLabel(window.key, input.t),
+				remainingPercent: window.remainingPercent,
+				level: window.level,
+			})),
+			stale: view.failed,
 		};
 	}
 	return out;

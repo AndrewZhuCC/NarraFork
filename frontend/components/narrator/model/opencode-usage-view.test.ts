@@ -170,6 +170,11 @@ describe("buildOpencodeProviderBadges", () => {
 		expect(Object.keys(badges)).toEqual(["ocg"]);
 		expect(badges.ocg?.color).toBe("teal");
 		expect(badges.ocg?.tooltip?.split("\n")).toHaveLength(3);
+		expect(badges.ocg?.bars?.map((bar) => [bar.id, bar.remainingPercent])).toEqual([
+			["fiveHour", 63],
+			["weekly", 88],
+			["monthly", 50],
+		]);
 	});
 
 	test("skips an allowance whose generation belongs to a replaced account", () => {
