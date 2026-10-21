@@ -691,13 +691,6 @@ export interface NarraForkSettings {
 		 */
 		legacyEncoding: boolean;
 		/**
-		 * Per-model working context windows (tokens), keyed by full model value
-		 * ("provider:modelId"). A derived view of the model catalog's provider-page
-		 * bindings: saving an edited map writes those bindings, and the map itself is
-		 * never stored in settings.json.
-		 */
-		modelContextWindows: Record<string, number>;
-		/**
 		 * Pre-catalog model card deltas. Read once, when a settings file without
 		 * `modelCatalog` is first loaded, and archived in `modelCatalog.legacyArchive`;
 		 * nothing reads them afterwards.

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { getModelCatalogRevision, setModelWindow } from "../../model-catalog";
 import { narraforkDir, reloadSettings, saveSettings, settings } from "../index";
 
 const path = join(narraforkDir, "settings.json");
@@ -29,8 +30,13 @@ describe("model references survive settings reload", () => {
 			draft.agent.promptOptimizeModel = model;
 			draft.agent.subagentModels.explore = model;
 			draft.agent.hiddenModels = [model];
-			draft.agent.modelContextWindows = { [model]: 128000 };
 			saveSettings(draft);
+			setModelWindow({
+				baseRevision: getModelCatalogRevision(),
+				scope: "connection",
+				target: model,
+				contextWindow: 128000,
+			});
 
 			// Force a migration write on the first load, so both returned settings
 			// and the re-persisted JSON must retain the operator's references.
@@ -45,7 +51,9 @@ describe("model references survive settings reload", () => {
 				expect(loaded.agent.promptOptimizeModel).toBe(model);
 				expect(loaded.agent.subagentModels.explore).toBe(model);
 				expect(loaded.agent.hiddenModels).toContain(model);
-				expect(loaded.agent.modelContextWindows?.[model]).toBe(128000);
+				expect(loaded.agent.modelCatalog?.local.connections?.[model]?.working_context_tokens).toBe(
+					128000,
+				);
 				expect(JSON.parse(readFileSync(path, "utf8")).agent.summaryModel).toBe(model);
 			}
 		});

@@ -253,3 +253,32 @@ export function legacyCardMetadata(card: LegacyModelCard): RawMetadata {
 	}
 	return validateRawMetadata(raw);
 }
+
+/** How builds before provider-model overrides stored a provider-page window: a binding. */
+const WINDOW_BINDING_PREFIX = "legacy-window:";
+
+/**
+ * Move provider-page window bindings (`legacy-window:<model value>`) into the per-provider
+ * layer they always stood for, keyed by the same model value. Their selector and pinned
+ * identity are dropped: that layer applies by name. Returns the input when there is
+ * nothing to move. Expects a normalized local state (binding overrides already folded).
+ */
+export function liftWindowBindings(local: RawLocalState): RawLocalState {
+	const lifted = (local.bindings ?? []).filter((b) => b.id.startsWith(WINDOW_BINDING_PREFIX));
+	if (!lifted.length) return local;
+	const next = structuredClone(local);
+	next.bindings = next.bindings?.filter((b) => !b.id.startsWith(WINDOW_BINDING_PREFIX));
+	for (const binding of lifted) {
+		const model = binding.id.slice(WINDOW_BINDING_PREFIX.length).trim();
+		const origins = next.legacyFields?.[`binding:${binding.id}`];
+		if (next.legacyFields) delete next.legacyFields[`binding:${binding.id}`];
+		if (!model || !binding.overrides || !Object.keys(binding.overrides).length) continue;
+		next.connections = {
+			...next.connections,
+			[model]: { ...next.connections?.[model], ...binding.overrides },
+		};
+		if (origins?.length)
+			next.legacyFields = { ...next.legacyFields, [`connection:${model}`]: origins };
+	}
+	return normalizeRawLocalState(next);
+}

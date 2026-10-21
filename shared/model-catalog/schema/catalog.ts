@@ -77,6 +77,12 @@ export interface RawLocalState {
 	variants?: RawVariant[];
 	bindings?: RawBinding[];
 	overrides?: RawOverride[];
+	/**
+	 * Overrides for one provider's entry, keyed by the full model value a provider list
+	 * shows (`provider:model`). They apply by that name, never assert an identity, and sit
+	 * above every other local layer: a per-provider decision beats a model-wide one.
+	 */
+	connections?: Record<string, RawMetadata>;
 	hiddenModelIds?: string[];
 	hiddenVariantIds?: string[];
 }
@@ -95,7 +101,8 @@ export type MetadataLayer =
 	| "discovered"
 	| "local-model"
 	| "local-variant"
-	| "local-binding";
+	| "local-binding"
+	| "local-connection";
 export interface FieldSource {
 	layer: MetadataLayer;
 	id?: string;

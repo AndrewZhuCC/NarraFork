@@ -935,6 +935,18 @@ describe("provider add nested route", () => {
 			},
 		};
 		queryClient.setQueryData(["admin", "settings"], serverSettings);
+		// Row windows come from the catalog's window endpoint, which reports the platform's value.
+		queryClient.setQueryData(["model-catalog", "window", "tokendance:raw:model"], {
+			revision: 0,
+			info: {
+				model: "tokendance:raw:model",
+				contextWindow: 64000,
+				source: "discovered",
+				inherited: 64000,
+				inheritedSource: "discovered",
+				others: [],
+			},
+		});
 		const complete = spyOn(tokenDanceFlow, "completeTokenDanceCallback").mockResolvedValue(true);
 		restorers.push(() => complete.mockRestore());
 		await mount("/settings/providers/tokendance/callback");
@@ -949,9 +961,8 @@ describe("provider add nested route", () => {
 			[...container.querySelectorAll("p")].find(
 				(node) => node.textContent === "tokendance:raw:model",
 			)?.parentElement;
-		// 协议选择器加入行首后，上下文窗口输入不再是第一个 input —— 按值找。
-		const rowInputs = [...(modelRow()?.querySelectorAll("input") ?? [])];
-		expect(rowInputs.some((input) => input.value.includes("64"))).toBe(true);
+		// The window column shows the value requests use and where it comes from.
+		expect(modelRow()?.textContent).toContain("64k");
 		// The unified row contains NumberInput controls and model testing; its last button toggles visibility.
 		const rowButtons = modelRow()?.querySelectorAll<HTMLButtonElement>("button");
 		const visibility = rowButtons?.item(rowButtons.length - 1);

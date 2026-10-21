@@ -22,10 +22,10 @@ import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import {
-	applyWindowSettings,
 	bindModelCatalogSettings,
+	keepLatestCatalog,
 	normalizeModelCatalogSettings,
-	settingsForDisk,
+	rewriteConnectionOverrides,
 	startModelCatalogDailyCheck,
 } from "../model-catalog";
 import { getNarraforkHome } from "../narrafork-home";
@@ -729,15 +729,8 @@ export function purgeStaleAgentModelRefs(
 		settings.agent.hiddenModels = cleanedHidden;
 		dirty = true;
 	}
-	const origWindows = settings.agent.modelContextWindows ?? {};
-	const cleanedWindows: Record<string, number> = {};
-	for (const [k, v] of Object.entries(origWindows)) {
-		if (!isStale(k)) cleanedWindows[k] = v;
-	}
-	if (Object.keys(cleanedWindows).length !== Object.keys(origWindows).length) {
-		settings.agent.modelContextWindows = cleanedWindows;
+	if (rewriteConnectionOverrides(settings, (model) => (isStale(model) ? null : model)))
 		dirty = true;
-	}
 	const origCustom = settings.agent.customModels ?? [];
 	const cleanedCustom = origCustom.filter((m) => !isStale(m.value));
 	if (cleanedCustom.length !== origCustom.length) {
@@ -891,7 +884,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
 	initializeTokenDanceModelCollection(newSettings);
-	applyWindowSettings(newSettings);
+	keepLatestCatalog(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	withSettingsFileLock(narraforkDir, () => {
@@ -906,7 +899,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		preserveExternalManagerFields(newSettings, readManagerOwnedFields(disk), lastDiskManagerFields);
 		const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 		try {
-			const text = JSON.stringify(settingsForDisk(newSettings), null, 2);
+			const text = JSON.stringify(newSettings, null, 2);
 			writeFileSync(tempPath, text, { mode: 0o600 });
 			renameSync(tempPath, settingsPath);
 			lastSettingsText = text;

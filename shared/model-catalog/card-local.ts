@@ -3,7 +3,14 @@ import type { RawLocalState } from "./card-resolver";
 
 type CardMetadataPatch = Parameters<typeof patchRawMetadata>[1];
 
-type Target = "model" | "variant" | "binding";
+type Target = "model" | "variant" | "binding" | "connection";
+const TARGETS: readonly Target[] = ["model", "variant", "binding", "connection"];
+/** A connection key is the full model value a provider list shows, e.g. `codex:gpt-6`. */
+export function isConnectionKey(value: unknown): value is string {
+	return (
+		typeof value === "string" && value.length > 0 && value.length <= 512 && value === value.trim()
+	);
+}
 const scopeKey = (target: Target, id: string) => `${target}:${id}`;
 function leaves(metadata: RawMetadata, prefix = ""): string[] {
 	return Object.entries(metadata).flatMap(([key, value]) => {
@@ -41,7 +48,7 @@ export function normalizeRawLocalState(input: RawLocalState): RawLocalState {
 			throw new Error("Invalid migration provenance");
 		for (const [key, paths] of Object.entries(input.legacyFields)) {
 			if (
-				!/^(model|variant|binding):.+$/.test(key) ||
+				!/^(model|variant|binding|connection):.+$/.test(key) ||
 				!Array.isArray(paths) ||
 				paths.length > 10000 ||
 				paths.some((path) => typeof path !== "string" || path.length > 1024)
@@ -72,6 +79,21 @@ export function normalizeRawLocalState(input: RawLocalState): RawLocalState {
 		return false;
 	});
 	local.legacyFields = origins;
+	if (local.connections !== undefined) {
+		if (
+			!local.connections ||
+			typeof local.connections !== "object" ||
+			Array.isArray(local.connections)
+		)
+			throw new Error("Invalid provider model overrides");
+		for (const [key, metadata] of Object.entries(local.connections)) {
+			if (!isConnectionKey(key)) throw new Error(`Invalid provider model key: ${key}`);
+			const own = validateRawMetadata(metadata);
+			if (Object.keys(own).length) local.connections[key] = own;
+			else delete local.connections[key];
+		}
+		if (!Object.keys(local.connections).length) delete local.connections;
+	}
 	return local;
 }
 
@@ -83,11 +105,21 @@ export function patchLocalCardMetadata(
 	id: string,
 	patch: CardMetadataPatch,
 ): RawLocalState {
-	if (!["model", "variant", "binding"].includes(target)) throw new Error("Invalid metadata scope");
+	if (!TARGETS.includes(target)) throw new Error("Invalid metadata scope");
 	const local = normalizeRawLocalState(input);
 	let before: RawMetadata;
 	let store: (metadata: RawMetadata) => void;
-	if (target === "binding") {
+	if (target === "connection") {
+		if (!isConnectionKey(id)) throw new Error(`Invalid provider model key: ${id}`);
+		before = local.connections?.[id] ?? {};
+		store = (metadata) => {
+			const rest = { ...local.connections };
+			delete rest[id];
+			if (Object.keys(metadata).length) rest[id] = metadata;
+			if (Object.keys(rest).length) local.connections = rest;
+			else delete local.connections;
+		};
+	} else if (target === "binding") {
 		const binding = local.bindings?.find((b) => b.id === id);
 		if (!binding) throw new Error(`Unknown local binding: ${id}`);
 		before = binding.overrides ?? {};
@@ -286,10 +318,15 @@ export function mutateRawLocal(
 		if (!Object.keys(entry.overrides!).length) delete entry.overrides;
 		local.bindings = replaceLocalEntry(local.bindings, entry);
 	} else {
-		if (!["model", "variant", "binding"].includes(mutation.target) || !mutation.targetId)
+		if (!TARGETS.includes(mutation.target) || !mutation.targetId)
 			throw new Error("Invalid metadata scope");
 		const { target, targetId: id } = mutation;
-		if (target === "binding") {
+		if (target === "connection") {
+			if (mutation.action !== "delete")
+				throw new Error("Provider model overrides cannot hide model availability");
+			if (!local.connections?.[id]) throw new Error("Unknown provider model override");
+			delete local.connections[id];
+		} else if (target === "binding") {
 			if (mutation.action !== "delete") throw new Error("Bindings cannot hide model availability");
 			if (!local.bindings?.some((b) => b.id === id)) throw new Error("Unknown binding");
 			local.bindings = local.bindings.filter((b) => b.id !== id);

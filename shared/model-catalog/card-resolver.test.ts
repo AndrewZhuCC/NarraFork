@@ -253,3 +253,64 @@ test("canonical local scopes preserve effective values and reset the only write 
 	).toThrow();
 	expect(input.models?.[0]?.metadata.input_cost_per_token).toBe(2e-6);
 });
+
+describe("provider-entry (connection) overrides", () => {
+	const catalog = () =>
+		rawCatalogFromModelFiles(files({ max_input_tokens: 128000 }), sourceVersion, date);
+	const query = { upstreamModelId: "m", providerId: "a" };
+
+	test("apply by model value above every other local layer and never assert identity", () => {
+		let local: RawLocalState = {
+			revision: 0,
+			bindings: [
+				{
+					id: "editor",
+					providerId: "a",
+					upstreamModelId: "m",
+					overrides: { working_context_tokens: 90000, max_output_tokens: 4000 },
+				},
+			],
+		};
+		local = patchLocalCardMetadata(catalog(), local, "model", "m", {
+			set: { working_context_tokens: 100000 },
+		});
+		local = patchLocalCardMetadata(catalog(), local, "connection", "a:m", {
+			set: { working_context_tokens: 64000 },
+		});
+		const resolve = createModelCardResolver(catalog(), local);
+		const own = resolve(query, undefined, undefined, "a:m");
+		expect(own.metadata.working_context_tokens).toBe(64000);
+		expect(own.metadata.max_output_tokens).toBe(4000);
+		expect(own.provenance.working_context_tokens).toEqual({
+			layer: "local-connection",
+			id: "a:m",
+			explicit: true,
+		});
+		expect(own.bindingId).toBe("editor");
+		// Another provider entry of the same connection, or none, does not see it.
+		expect(resolve(query, undefined, undefined, "b:m").metadata.working_context_tokens).toBe(90000);
+		expect(resolve(query).metadata.working_context_tokens).toBe(90000);
+	});
+
+	test("normalization validates keys and drops emptied entries; only delete removes one", () => {
+		expect(() =>
+			normalizeRawLocalState({
+				revision: 0,
+				connections: { " a:m": { working_context_tokens: 1 } },
+			}),
+		).toThrow("Invalid provider model key");
+		expect(() =>
+			normalizeRawLocalState({ revision: 0, connections: { "a:m": { api_key: "x" } } }),
+		).toThrow();
+		expect(
+			normalizeRawLocalState({ revision: 0, connections: { "a:m": {} } }).connections,
+		).toBeUndefined();
+		const set = patchLocalCardMetadata(catalog(), { revision: 0 }, "connection", "a:m", {
+			set: { working_context_tokens: 64000 },
+		});
+		const reset = patchLocalCardMetadata(catalog(), set, "connection", "a:m", {
+			reset: ["working_context_tokens"],
+		});
+		expect(reset.connections).toBeUndefined();
+	});
+});

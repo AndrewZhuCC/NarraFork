@@ -89,7 +89,7 @@ describe("provider settings three-way rebase", () => {
 				provider("gemini", { protocol: "gemini-compatible" }),
 				provider("new-openai"),
 			],
-			agent: { modelContextWindows: { "gemini:model": 1_000_000 } },
+			agent: {},
 		});
 		expect(result.customApiProviders.find((p) => p.id === "gemini")).toMatchObject({
 			geminiTransport: "generate-content",
@@ -99,21 +99,6 @@ describe("provider settings three-way rebase", () => {
 		expect(result.openaiProviders.map((p) => p.id)).toEqual(["new-openai"]);
 		expect(result.anthropicProviders.map((p) => p.id)).toEqual(["openai"]);
 		expect(result.anthropicProviders[0].name).toBe("draft");
-		expect(result.modelContextWindows).toEqual({ "gemini:model": 1_000_000 });
-	});
-
-	test("context windows merge per key, including local and remote removals", () => {
-		const saved = providersStateFromSettings({
-			agent: { modelContextWindows: { edited: 10, deleted: 20, updated: 30, gone: 40 } },
-		});
-		const local = structuredClone(saved);
-		local.modelContextWindows = { edited: 11, updated: 30, gone: 40, added: 50 };
-		const result = rebaseProviderState(local, createSnapshot(saved), {
-			agent: {
-				modelContextWindows: { edited: 99, deleted: 99, updated: 31, added: 99, fresh: 60 },
-			},
-		});
-		expect(result.modelContextWindows).toEqual({ edited: 11, updated: 31, added: 50, fresh: 60 });
 	});
 
 	test("unchanged collections adopt external updates, regardless of set insertion order", () => {
@@ -172,7 +157,7 @@ describe("provider settings three-way rebase", () => {
 	test("does not mutate or share mutable output with any input", () => {
 		const settings = {
 			customApiProviders: [provider("clean", { extraHeaders: { token: "clean" } })],
-			agent: { modelContextWindows: { "clean:m": 100 }, providerOrder: ["clean"] },
+			agent: { providerOrder: ["clean"] },
 		};
 		const local = providersStateFromSettings(settings);
 		const baseline = createSnapshot(local);
@@ -188,7 +173,6 @@ describe("provider settings three-way rebase", () => {
 		projectedHeaders.token = "projection";
 		result.hiddenModels.clear();
 		result.disabledProviders.add("changed");
-		result.modelContextWindows["clean:m"] = 200;
 		result.providerOrder.push("changed");
 		expect({ local, baseline, settings }).toEqual(before);
 	});
