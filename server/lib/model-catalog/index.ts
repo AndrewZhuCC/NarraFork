@@ -130,6 +130,17 @@ function providerConfigs(settings: NarraForkSettings | undefined) {
 	];
 }
 
+/** Context windows a provider's model listing reports, by full model value. */
+type ListingWindows = (model: string) => number | undefined;
+const listingWindows: ListingWindows[] = [];
+/**
+ * For providers whose listing reports an input limit but which have no gateway metadata
+ * channel (e.g. Gemini). The value enters resolution as discovered metadata.
+ */
+export function registerListingWindows(lookup: ListingWindows): void {
+	listingWindows.push(lookup);
+}
+
 export function queryForModel(
 	model: string,
 	settings: NarraForkSettings | undefined = settingsRef,
@@ -176,6 +187,10 @@ export function queryForModel(
 			/* Old gateway without cache: keep opaque upstream identity. */
 		}
 	}
+	for (const lookup of listingWindows) {
+		const window = lookup(model);
+		if (window !== undefined) return { query, discovered: { max_input_tokens: window } };
+	}
 	return { query };
 }
 
@@ -221,9 +236,9 @@ function importWindowMap(local: RawLocalState, input: unknown, legacy: boolean):
 	return next;
 }
 
-function backupLegacyCatalog(stored: unknown): void {
+function backupLegacyCatalog(stored: unknown, kind = "local-v1"): void {
 	const hash = createHash("sha256").update(JSON.stringify(stored)).digest("hex").slice(0, 20);
-	const backup = resolve(directory, `local-v1-${hash}.json`);
+	const backup = resolve(directory, `${kind}-${hash}.json`);
 	if (!existsSync(backup)) atomicJSON(backup, { modelCatalog: stored });
 }
 
@@ -391,6 +406,8 @@ export function normalizeModelCatalogSettings(settings: NarraForkSettings): bool
 	// Builds before provider-model overrides stored provider-page windows as bindings.
 	const lifted = liftWindowBindings(cfg.local);
 	if (lifted !== cfg.local) {
+		// Older builds reject the new `connections` field; keep what they can read.
+		if (stored) backupLegacyCatalog(stored, "local-v2-window-bindings");
 		cfg.local = { ...lifted, revision: cfg.local.revision + 1 };
 		changed = true;
 	}
@@ -417,25 +434,93 @@ export function normalizeModelCatalogSettings(settings: NarraForkSettings): bool
 	return changed;
 }
 
+/** A pure edit of the local layer; undefined means it changes nothing. */
+type LocalEdit = (local: RawLocalState) => RawLocalState | undefined;
+/**
+ * Edits made to a settings draft's catalog, and the live revision the draft was copied
+ * at. If the live catalog moves before the draft is saved, the edits are replayed on top
+ * of it instead of the draft's copy replacing it.
+ */
+const draftEdits = new WeakMap<RawLocalState, { base: number; edits: LocalEdit[] }>();
+
 /**
  * Called on every settings save. The catalog has its own revisioned writers; a document
- * assembled without it (e.g. from defaults) or copied before a catalog edit landed must
- * not erase or roll it back.
+ * assembled without it (e.g. from defaults), copied before a catalog edit landed, or
+ * edited while one landed must not erase or roll it back.
  */
 export function keepLatestCatalog(nextSettings: NarraForkSettings): void {
+	delete (nextSettings.agent as { modelContextWindows?: unknown }).modelContextWindows;
 	const current = settingsRef?.agent.modelCatalog;
 	const cfg = nextSettings.agent.modelCatalog;
-	if (current && (!cfg || (cfg !== current && cfg.local.revision < current.local.revision)))
+	if (!current || cfg === current) return;
+	const pending = cfg && draftEdits.get(cfg.local);
+	if (pending && pending.base !== current.local.revision) {
+		let local = current.local;
+		for (const edit of pending.edits) local = edit(local) ?? local;
+		if (local === current.local) {
+			nextSettings.agent.modelCatalog = current;
+			return;
+		}
+		validateLocal(local);
+		nextSettings.agent.modelCatalog = {
+			...current,
+			local: { ...local, revision: current.local.revision + 1 },
+		};
+		return;
+	}
+	if (!cfg || cfg.local.revision < current.local.revision)
 		nextSettings.agent.modelCatalog = current;
-	delete (nextSettings.agent as { modelContextWindows?: unknown }).modelContextWindows;
 }
 
-/** Store a new local layer into a settings document (live or draft), bumping its revision. */
-function storeLocal(settings: NarraForkSettings, next: RawLocalState): void {
+/** Apply an edit to a settings document (live or draft), bumping its revision. */
+function editLocal(settings: NarraForkSettings, edit: LocalEdit): boolean {
 	const cfg = settings.agent.modelCatalog;
-	if (!cfg) return;
+	if (!cfg) return false;
+	const next = edit(cfg.local);
+	if (!next) return false;
 	validateLocal(next);
-	settings.agent.modelCatalog = { ...cfg, local: { ...next, revision: cfg.local.revision + 1 } };
+	const pending = draftEdits.get(cfg.local);
+	const local = { ...next, revision: cfg.local.revision + 1 };
+	settings.agent.modelCatalog = { ...cfg, local };
+	draftEdits.set(local, {
+		base: pending?.base ?? cfg.local.revision,
+		edits: [...(pending?.edits ?? []), edit],
+	});
+	return true;
+}
+
+/** Rename or drop provider entries' own overrides; throws when two land on one key. */
+function renameConnections(
+	local: RawLocalState,
+	rename: (model: string) => string | null,
+): RawLocalState | undefined {
+	if (!local.connections) return undefined;
+	const connections: Record<string, RawMetadata> = {};
+	const origins: Record<string, string> = {};
+	const legacyFields = { ...local.legacyFields };
+	let changed = false;
+	const place = (target: string, model: string, metadata: RawMetadata) => {
+		if (connections[target] && !isDeepStrictEqual(connections[target], metadata))
+			throw new Error(
+				`Provider model overrides for "${origins[target]}" and "${model}" would both become "${target}"`,
+			);
+		connections[target] = metadata;
+		origins[target] = model;
+	};
+	for (const [model, metadata] of Object.entries(local.connections)) {
+		const target = rename(model);
+		if (target === model) {
+			place(target, model, metadata);
+			continue;
+		}
+		changed = true;
+		const provenance = legacyFields[`connection:${model}`];
+		delete legacyFields[`connection:${model}`];
+		if (target === null) continue;
+		place(target, model, metadata);
+		if (provenance) legacyFields[`connection:${target}`] = provenance;
+	}
+	return changed ? normalizeRawLocalState({ ...local, connections, legacyFields }) : undefined;
 }
 
 /**
@@ -448,59 +533,7 @@ export function rewriteConnectionOverrides(
 	settings: NarraForkSettings,
 	rename: (model: string) => string | null,
 ): boolean {
-	const local = settings.agent.modelCatalog?.local;
-	if (!local?.connections) return false;
-	const connections: Record<string, RawMetadata> = {};
-	const origins: Record<string, string> = {};
-	const legacyFields = { ...local.legacyFields };
-	let changed = false;
-	for (const [model, metadata] of Object.entries(local.connections)) {
-		const target = rename(model);
-		const provenance = legacyFields[`connection:${model}`];
-		if (target === model) {
-			if (connections[target] && !isDeepStrictEqual(connections[target], metadata))
-				throw new Error(
-					`Provider model overrides for "${origins[target]}" and "${model}" would both become "${target}"`,
-				);
-			connections[target] = metadata;
-			origins[target] = model;
-			continue;
-		}
-		changed = true;
-		delete legacyFields[`connection:${model}`];
-		if (target === null) continue;
-		if (connections[target] && !isDeepStrictEqual(connections[target], metadata))
-			throw new Error(
-				`Provider model overrides for "${origins[target]}" and "${model}" would both become "${target}"`,
-			);
-		connections[target] = metadata;
-		origins[target] = model;
-		if (provenance) legacyFields[`connection:${target}`] = provenance;
-	}
-	if (!changed) return false;
-	storeLocal(settings, normalizeRawLocalState({ ...local, connections, legacyFields }));
-	return true;
-}
-
-/**
- * Give provider entries a discovered window where they have none of their own (providers
- * whose listing reports one but which have no discovered-metadata channel).
- */
-export function fillConnectionWindows(
-	settings: NarraForkSettings,
-	windows: Record<string, number>,
-): boolean {
-	const cfg = settings.agent.modelCatalog;
-	if (!cfg) return false;
-	let next = cfg.local;
-	for (const [model, value] of Object.entries(normalizeModelContextWindowOverrides(windows))) {
-		if (!isConnectionKey(model) || next.connections?.[model]?.[WORKING_WINDOW] !== undefined)
-			continue;
-		next = withConnectionWindow(next, model, value);
-	}
-	if (next === cfg.local) return false;
-	storeLocal(settings, next);
-	return true;
+	return editLocal(settings, (local) => renameConnections(local, rename));
 }
 
 export function bindModelCatalogSettings(settings: NarraForkSettings, save: () => void): void {
@@ -644,10 +677,25 @@ export interface ModelWindowScopes {
 	/** Other provider entries of the same model that set their own window. */
 	others: Array<{ model: string; contextWindow: number }>;
 }
-/** Which catalog model each provider entry with its own window resolves to. */
+let connectionIdsCache:
+	| { catalog: RawCatalog; local: RawLocalState; at: number; ids: Map<string, string | undefined> }
+	| undefined;
+/**
+ * Which catalog model each provider entry with its own window resolves to. Cached per
+ * local layer for a few seconds: a page load asks once per batch of rows.
+ */
 export function connectionModelIds(): Map<string, string | undefined> {
+	const local = state().local;
+	const now = Date.now();
+	if (
+		connectionIdsCache?.catalog === active &&
+		connectionIdsCache.local === local &&
+		now - connectionIdsCache.at < 5_000
+	)
+		return connectionIdsCache.ids;
 	const ids = new Map<string, string | undefined>();
-	for (const [model, metadata] of Object.entries(state().local.connections ?? {})) {
+	connectionIdsCache = { catalog: active, local, at: now, ids };
+	for (const [model, metadata] of Object.entries(local.connections ?? {})) {
 		if (positiveInteger(metadata[WORKING_WINDOW]) === undefined) continue;
 		try {
 			ids.set(model, effectiveCard(model, false).card.modelId);

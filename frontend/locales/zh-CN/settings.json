@@ -1408,7 +1408,6 @@
 	"providerPrefix": "供应商前缀",
 	"providerPrefixPlaceholder": "选择供应商",
 	"contextWindow": "上下文窗口",
-	"contextWindowPlaceholder": "例如 272000",
 	"contextWindowSuffix": "tokens",
 	"contextWindowTooSmallWarning": "该值偏小，可能导致压缩失败",
 	"contextWindowSource": {

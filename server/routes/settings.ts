@@ -517,6 +517,12 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
+				// Windows are edited through the model catalog now. A page loaded before the
+				// upgrade still sends its old map; reject it rather than drop its edits silently.
+				modelContextWindows: z.unknown().refine(() => false, {
+					message:
+						"Context windows are now saved from each model row; reload the page and set them again",
+				}),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),

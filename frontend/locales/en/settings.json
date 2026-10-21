@@ -1406,7 +1406,6 @@
 	"providerPrefix": "Provider Prefix",
 	"providerPrefixPlaceholder": "Select provider",
 	"contextWindow": "Context Window",
-	"contextWindowPlaceholder": "e.g. 272000",
 	"contextWindowSuffix": "tokens",
 	"contextWindowTooSmallWarning": "This value is quite small and may cause compact to fail.",
 	"contextWindowSource": {

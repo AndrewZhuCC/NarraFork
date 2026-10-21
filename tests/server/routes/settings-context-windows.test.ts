@@ -263,15 +263,21 @@ describe("context-window automatic normalization", () => {
 		expect(diskWindows()).toEqual(result);
 	});
 
-	it("a settings PATCH no longer writes windows; the map from an old page is ignored", async () => {
+	it("a settings PATCH from a page loaded before the upgrade is rejected, not dropped", async () => {
 		const before = ownWindows(settings.agent.modelCatalog!.local);
+		const order = structuredClone(settings.agent.providerOrder);
 		const response = await patch(input);
-		expect(response.status).toBe(200);
-		const body = await response.json();
-		expect(body.agent).not.toHaveProperty("modelContextWindows");
-		expect(settings.agent.providerOrder).toEqual(["test"]);
+		expect(response.status).toBe(400);
+		expect((await response.json()).error).toContain("reload the page");
+		expect(settings.agent.providerOrder).toEqual(order);
 		expect(ownWindows(settings.agent.modelCatalog!.local)).toEqual(before);
-		expect(updateSettingsSchema.parse({ agent: { modelContextWindows: input } }).agent).toEqual({});
+		const ok = await app.request("/settings", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ agent: { providerOrder: ["test"] } }),
+		});
+		expect(ok.status).toBe(200);
+		expect(settings.agent.providerOrder).toEqual(["test"]);
 	});
 
 	it("internal writes never store a window map beside the catalog", () => {

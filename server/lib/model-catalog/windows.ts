@@ -48,28 +48,37 @@ function describe(
 	return { contextWindow, source };
 }
 
-export function describeModelWindows(models: string[]): ModelWindowsResponse {
-	return withModelMetadataSnapshot(() => describeAll(models));
-}
-function describeAll(models: string[]): ModelWindowsResponse {
+/** Rows resolved per synchronous slice; the event loop runs between slices. */
+const SLICE = 50;
+
+/**
+ * Each row resolves its card up to three times, so a full page is processed in slices
+ * with a yield between them rather than as one long synchronous run.
+ */
+export async function describeModelWindows(models: string[]): Promise<ModelWindowsResponse> {
 	const revision = getModelCatalogRevision();
 	const connections = connectionModelIds();
-	const windows = [...new Set(models.map((model) => model.trim()).filter(Boolean))].map(
-		(model): ModelWindowInfo => {
-			const scopes = getModelWindowScopes(model, connections);
-			const current = describe(model, true);
-			const inherited = scopes.own === undefined ? current : describe(model, false);
-			return {
-				model,
-				...current,
-				...(scopes.own !== undefined ? { own: scopes.own } : {}),
-				inherited: inherited.contextWindow,
-				inheritedSource: inherited.source,
-				...(scopes.modelId ? { modelId: scopes.modelId } : {}),
-				...(scopes.modelWide !== undefined ? { modelWide: scopes.modelWide } : {}),
-				others: scopes.others,
-			};
-		},
-	);
+	const unique = [...new Set(models.map((model) => model.trim()).filter(Boolean))];
+	const windows: ModelWindowInfo[] = [];
+	for (let start = 0; start < unique.length; start += SLICE) {
+		if (start) await new Promise((resolve) => setImmediate(resolve));
+		const slice = unique.slice(start, start + SLICE);
+		windows.push(...withModelMetadataSnapshot(() => slice.map((m) => describeRow(m, connections))));
+	}
 	return { revision, windows };
+}
+function describeRow(model: string, connections: Map<string, string | undefined>): ModelWindowInfo {
+	const scopes = getModelWindowScopes(model, connections);
+	const current = describe(model, true);
+	const inherited = scopes.own === undefined ? current : describe(model, false);
+	return {
+		model,
+		...current,
+		...(scopes.own !== undefined ? { own: scopes.own } : {}),
+		inherited: inherited.contextWindow,
+		inheritedSource: inherited.source,
+		...(scopes.modelId ? { modelId: scopes.modelId } : {}),
+		...(scopes.modelWide !== undefined ? { modelWide: scopes.modelWide } : {}),
+		others: scopes.others,
+	};
 }

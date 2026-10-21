@@ -80,7 +80,7 @@ modelCatalogRoutes.post("/v2/windows", resolveBodyLimit, async (c) => {
 		body.models.some((model) => typeof model !== "string")
 	)
 		throw new Error(`models must be an array of at most ${MAX_WINDOW_MODELS} model values`);
-	return c.json(describeModelWindows(body.models as string[]));
+	return c.json(await describeModelWindows(body.models as string[]));
 });
 /** Set or clear a working window for one provider entry (`connection`) or model-wide (`model`). */
 modelCatalogRoutes.post("/v2/windows/set", requireAdmin, resolveBodyLimit, async (c) =>

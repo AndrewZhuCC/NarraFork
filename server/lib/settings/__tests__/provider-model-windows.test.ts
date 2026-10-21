@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelWindowsResponse } from "@shared/model-catalog/schema/api";
 import { Hono } from "hono";
@@ -10,6 +10,9 @@ import {
 	getModelCardSnapshot,
 	getModelCatalogRevision,
 	mutateModelCard,
+	registerListingWindows,
+	rewriteConnectionOverrides,
+	setModelWindow,
 } from "../../model-catalog";
 import { deleteNugCachedModels, setNugCachedModels } from "../../nug-model-cache";
 import {
@@ -205,10 +208,62 @@ describe("provider-model and model-wide context windows", () => {
 		expect(local?.legacyFields?.[`connection:${model}`]).toEqual(["working_context_tokens"]);
 		expect(getModelContextWindow("gpt-6-astra", "codex")).toBe(272_000);
 		expect(getEffectiveModelProfile(model).contextWindowSource?.legacy).toBe(true);
+		// What older builds can read is kept beside it.
+		const backups = join(narraforkDir, "model-catalog");
+		expect(
+			existsSync(backups) &&
+				readdirSync(backups).some((name) => name.startsWith("local-v2-window-bindings-")),
+		).toBe(true);
 		// The migrated document is written back in its new form.
 		const disk = JSON.parse(readFileSync(path, "utf8"));
 		expect(disk.agent.modelCatalog.local.connections[model]).toEqual({
 			working_context_tokens: 272_000,
 		});
+	});
+
+	test("a settings save never drops window edits that landed while it was in flight", () => {
+		const live = (model: string) =>
+			settings.agent.modelCatalog?.local.connections?.[model]?.working_context_tokens;
+		setModelWindow({
+			baseRevision: getModelCatalogRevision(),
+			scope: "connection",
+			target: "old:m",
+			contextWindow: 64_000,
+		});
+		// A settings PATCH copies live settings, renames a provider prefix on the copy, then
+		// awaits other work before saving it.
+		const draft = structuredClone(settings);
+		rewriteConnectionOverrides(draft, (model) =>
+			model.startsWith("old:") ? `new:${model.slice(4)}` : model,
+		);
+		// Meanwhile the provider page saves a window.
+		setModelWindow({
+			baseRevision: getModelCatalogRevision(),
+			scope: "connection",
+			target: "codex:gpt-6-astra",
+			contextWindow: 272_000,
+		});
+		const before = getModelCatalogRevision();
+		saveSettings(draft);
+		expect(live("codex:gpt-6-astra")).toBe(272_000);
+		expect(live("new:m")).toBe(64_000);
+		expect(live("old:m")).toBeUndefined();
+		expect(getModelCatalogRevision()).toBe(before + 1);
+		expect(getModelContextWindow("gpt-6-astra", "codex")).toBe(272_000);
+	});
+
+	test("a listing-reported window is discovered metadata, below both user scopes", async () => {
+		registerListingWindows((model) => (model === "codex:gpt-6-astra" ? 900_000 : undefined));
+		const model = "codex:gpt-6-astra";
+		expect(getModelContextWindow("gpt-6-astra", "codex")).toBe(900_000);
+		expect(getEffectiveModelProfile(model).contextWindowSource?.layer).toBe("discovered");
+		expect((await setWindow("model", "gpt-6-astra", 400_000)).status).toBe(200);
+		expect(getModelContextWindow("gpt-6-astra", "codex")).toBe(400_000);
+		expect((await setWindow("connection", model, 272_000)).status).toBe(200);
+		expect(getModelContextWindow("gpt-6-astra", "codex")).toBe(272_000);
+		// Clearing the entry's own value is not undone by the listing.
+		expect((await setWindow("connection", model, null)).status).toBe(200);
+		expect(getModelContextWindow("gpt-6-astra", "codex")).toBe(400_000);
+		expect(settings.agent.modelCatalog?.local.connections).toBeUndefined();
 	});
 });

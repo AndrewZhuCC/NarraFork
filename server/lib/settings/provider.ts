@@ -1084,7 +1084,11 @@ export function resolveModelContextWindow(
 		)
 			return {
 				contextWindow: user.contextWindow,
-				source: user.contextWindowSource.layer === "local-model" ? "card" : "user",
+				source:
+					user.contextWindowSource.layer === "local-model" ||
+					user.contextWindowSource.layer === "local-variant"
+						? "card"
+						: "user",
 			};
 		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
 		if (catalog && catalog.context_length > 0)
