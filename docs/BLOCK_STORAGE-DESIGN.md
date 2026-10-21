@@ -433,13 +433,13 @@ payload: {
     toolCallId,                  // 被采用的 attempt（provider 执行的工具为空）
     isError,
     parts?: [image…],            // 工具结果里的图片（现在只在内存）
-    appendix?: string            // turn nudge 等随结果发送的附言（现在只在内存）
+    appendix?: string            // 确实属于这个结果的附言（turn nudge 不放这里，见 D12）
   }
 }
 ```
 
 - **结果文本不复制进块**（D1）。它仍在账本被采用行的 `output_json`，账本的输入输出已约 1.5GB（`execution-log-service.ts:4-6`）。
-- **appendix 随结果走。** turn nudge 只拼在本轮最后一个工具的结果上。代码注释说明它必须随结果送达，因为 loop 未必能走到下一个边界（`loop.ts:7271-7277`）。settle 时把它冻结进 `appendix`，重建与实时就一致了。
+- **turn nudge 不再随结果走**（D12）。现在它只拼在本轮最后一个工具的结果上，代码注释的理由是 loop 未必能走到下一个边界（`loop.ts:7271-7277`）。改为在该步最后一个工具 settle 的同一事务里写一条 `context` 块（subtype `turn_nudge`），投影时排在该步工具结果之后、同一个 user 轮里，所以不依赖 loop 走到下一个边界。`appendix` 字段保留给今后确实属于某个结果的附言。
 - **AskUserQuestion** 的作答仍写账本 attempt，模型经结果文本（"User answered: …"）看到。块的 `input` 不含作答，投影不再需要剥离（`question-model-input.ts:1-84`）。
 - **provider 执行的工具**（web_search、image_generation）也是 tool 块，`executor = "provider"`，没有账本行。现在它们本来就是「调用和结果在一个块里」（`narrator-event-handler.ts:2141-2187`）。
 - **`/bash`**：
@@ -671,7 +671,7 @@ interface NarratorStore {
    - 触发一次 revision bump；
    - 重算该信封的 `content_text` 和 `context_chars_json`。
 6. **工具输入完整。** `callTool` 在一个事务里插入 tool 块（phase 为 called）和账本 attempt 1（带 `block_id`）。
-7. **工具结束。** `settleTool` 与账本的结果写入放在同一个事务里：写入被采用的 attempt、结果图片、appendix，phase 改为 settled。
+7. **工具结束。** `settleTool` 与账本的结果写入放在同一个事务里：写入被采用的 attempt、结果图片、appendix，phase 改为 settled。需要回合将尽提示时，同一事务里再写一条 `turn_nudge` context 块（D12）。
 8. **step 结束。** `sealStep` 补写用量和 `provider_response_id`。
    - 不重写块，也不需要 COW。
    - 现在 `completeAssistantOutput` 为了写 `completed:true` 要走一次 COW（`narrator-output-recovery.ts:46-63`），这一步随之消失。
@@ -925,14 +925,53 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 
 | 类别 | 内容 | 处理 |
 |---|---|---|
-| 写入时冻结进块 | 附件提示与路径；`/bash` 等命令的模型文本；wire-safe 工具 id；turn nudge；broken 提醒与 loop 自造文本；ExitPlanMode 计划正文的引用形态（随 settle 冻结，现在随账本 status 变化，`strip-plan-body.ts:30-60`）；被采用的 attempt | 投影只读数据 |
-| 投影的显式输入 | target（协议、裸 model、strict、官方或中转、能力）；作者标题与用户名（改名时由现有触发器让历史失效）；asset 字节是否可读 | 进 `targetFingerprint` 或 view |
+| 写入时冻结进块 | 附件提示与路径；`/bash` 等命令的模型文本；wire-safe 工具 id；turn nudge（作为 `context` 块）；broken 提醒与 loop 自造文本；ExitPlanMode 计划正文的引用形态（随 settle 冻结，现在随账本 status 变化，`strip-plan-body.ts:30-60`）；被采用的 attempt | 投影只读数据 |
+| 投影的显式输入 | target（协议、裸 model、strict、官方或中转、能力）；作者标题与用户名（纪元内读 pin，§7.7）；asset 字节是否可读 | 进 `targetFingerprint` 或 view |
 | 投影之后的传输层 | NUG 的图片 sha256 引用与网关 ack 剥离（`nug-provider.ts:444-507`）；Codex WS 的续写判定 | 不影响投影结果的缓存 |
 
 ### 7.6 字节稳定性约定
 
 - **同一版本内**：「从 DB 重建 == 实时发送」由构造保证，并由每个 provider 的等价测试兜底（§13）。
 - **跨越投影切换的那次发布**：允许一次性的 prompt cache 未命中。这与 compact 之后换 conversationId 重新起缓存（`narrator-session-state.ts:471-478`）的代价同级，在发布说明里写明即可。
+
+### 7.7 前缀保持：compact 之间不改写已发送的历史
+
+已经发给模型的前缀，在下一次 compact 之前不因派生数据的变化而改写；变化改为在末尾追加一条简短的 `context` 提醒。compact 之后前缀本来就要重建，这时完全按最新数据投影。这样 prompt cache 只在 compact 时失效一次，而不是每次改名或状态变化都失效。
+
+**投影纪元**
+- 一个叙述者的纪元从最近一次成功 compact（或叙述者创建）开始，到下一次 compact 为止。
+- 纪元内，投影要用到的派生输入在信封**第一次被投影**时固定下来，存进 pin 表；之后的请求都读 pin，不读最新值。
+- compact 成功后开启新纪元，旧 pin 作废，全部按最新数据重新投影。
+
+```
+narrator_projection_pins
+  narrator_id  text NOT NULL
+  epoch        text NOT NULL        开启该纪元的 compact 标记块 id（创建时为 'root'）
+  message_id   text NOT NULL
+  key          text NOT NULL        例如 sender_label
+  value        text NOT NULL
+  PRIMARY KEY (narrator_id, epoch, message_id, key)
+```
+
+- pin 按叙述者存，因为 fork 共享信封，但各自有各自的纪元和已发送前缀。
+
+**受这条规则约束的派生输入**
+
+| 输入 | 纪元内的处理 | 现状 |
+|---|---|---|
+| sender 标记里的叙述者标题、用户名（D14） | 用 pin 的旧值；改名时追加一条提醒，如「叙述者 A 已更名为 B」 | 改名会让全部历史的 sender 标记变化，触发器让源缓存失效（`model-history-revision-sql.ts:84-101`） |
+| ExitPlanMode 计划正文的引用形态 | 已在 settle 时冻结（§7.5），不受影响 | 随账本 status 变化（`strip-plan-body.ts:30-60`） |
+| Await 问答回执的改写 | 按回执第一次被投影时的判断固定；后来到达的答复照常作为新内容追加 | 每次投影时按「同一请求里是否已有答复」重新判断（`question-model-input.ts:112-165`） |
+| 其他今后新增的、依赖可变外部数据的投影规则 | 默认按本节处理，进 pin 表 | — |
+
+**不受约束的情况**（本来就改变前缀，接受 cache 未命中）
+- 用户显式的编辑、删除、回滚、段压缩：改的就是历史本身。
+- 切换 provider 或模型：`targetFingerprint` 变化，第二段整体重投。
+- 携带策略因 target 变化而不同：同上。
+
+**提醒块**
+- 由触发变化的服务（改名、状态变更）写入，`subtype` 标明类别，`model_text` 简短。
+- 在叙述者 idle 时写入的提醒，随下一次运行的第一条请求发出；同一纪元内同一对象的多次变化，只保留最后一条未发送的提醒。
 
 ## 8. 前端与传输
 
@@ -1057,7 +1096,7 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 | 阶段 | `body_format = 2` 信封的 `content_json` | 回退方式 |
 |---|---|---|
 | P1–P2 | 写入完整的派生投影 | 关闭 `narratorBlocks.read` 开关，读取方回到 `content_json` |
-| P3 | 新行写 `'[]'`；旧行在回填和校验完成后，由第二个作业清空 | 需要先运行「重组作业」，由块回写 `content_json` |
+| P3 | 继续写派生投影（D8）。确认稳定后再单独立项：新行写 `'[]'`，旧行由第二个作业清空 | 清空之前一直可以直接回退；清空之后需要先运行「重组作业」，由块回写 `content_json` |
 
 - 这一列本身不删除。重建带触发器的表需要一次带版本的重装迁移，收益不值得这个代价。
 - 清空释放出的空间，只能在管理员维护窗口里用 `/api/storage/database/vacuum` 回收。
@@ -1190,6 +1229,8 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 - 内部执行不进模型历史（§3.7）；
 - assistant 编辑只改被点的那一块（§5.5）；
 - `aborted` 块的重放规则（§3.5）；
+- turn nudge 从工具结果里移出，改为该步工具结果之后的一条独立文本（D12）；
+- 改名等派生数据变化，在 compact 之前不再改写已发送的历史，改为追加提醒（§7.7）；
 - 跨越投影切换的那次发布，会有一次 prompt cache 未命中（§7.6）。
 
 「轮」的定义一旦落库就很难再改，因此 D3 必须在 P1 之前定下来。
@@ -1220,26 +1261,24 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 | 存储 | 在生产库副本上测得的增量落在预估范围内 | 存储扫描 |
 | PG | schema 和迁移可以生成，`db:check:pg` 通过 | CI |
 
-## 14. 待决问题
+## 14. 决策记录与待决问题
 
-每项都给出推荐选项。D2、D3、D8、D10、D11 需要在 P1 之前拍板。
-
-| # | 问题 | 推荐 | 备选 |
+| # | 问题 | 结论 | 状态 |
 |---|---|---|---|
-| D1 | tool 结果的文本是否复制进块 | 不复制。块只存被采用的 attempt、结果图片、附言；文本留在账本 | 复制。块自包含，便于导出与块级 FTS，代价是账本输出的存储翻倍 |
-| D2 | tool 块的 `input` 以哪份为准 | 重放给模型的，就是执行时实际使用的输入（重定向或修复之后）；账本保留每个 attempt 的执行输入 | 重放模型的原始输入，把改写说明放进结果 |
-| D3 | 「轮」的边界 | 以一次运行为界（§3.6）：插话不开新轮 | 以 user 输入为界：插话开启新轮 |
-| D4 | `aborted` 块是否重放 | text 重放，reasoning 不重放 | 都不重放，与现在冷启动的行为一致 |
-| D5 | 前端传输怎样演进 | P1 先给数组元素附加块 id，P2 再改成规范化结构 | 一步到位改成规范化结构 |
-| D6 | 是否做块级 FTS | 放在 P3，作为可选项、独立开关；先保留消息级 | P1 起改为块级 |
-| D7 | 是否建 `narrator_turns` 表 | P2 视 UI 需求再定 | P1 与 `turn_id` 一起建 |
-| D8 | `content_json` 的终态 | 清空为 `'[]'`，需要一次 VACUUM 回收空间 | 长期保留派生投影：存储翻倍，还要持续维护一致性 |
-| D9 | 作者与属主是否拆分 | 拆分，新增 `author_narrator_id` | 统一按某一种语义处理，但会改变现有某条路径的行为 |
-| D10 | assistant 编辑的作用域 | 只改被点的那个 `output` 块（§5.5） | 保留「把整条消息的文本合并编辑」，作为单独的多块操作 |
-| D11 | broken 调用在历史中的形态 | tool 块 `failed`、不可见，另加一条 `context` 说明。与实时路径一致 | 净化后的调用与错误结果照常可见。与现在的重建路径一致，但需要改实时路径 |
-| D12 | turn nudge 放在哪里 | 冻结为 tool 结果的 `appendix`，与现在发出的字节一致 | 单独一条 `context` 块。语义更清楚，但会改变发给模型的内容 |
-| D13 | 引用锚点是否写进模型可见正文 | 先核实是否有工具按 id 读取消息；没有的话，锚点只存在 composer 文档的 quote 节点里，模型只看到引用文本与标签 | 保持现状：`@@m:<id>` 写进正文，COW 换 id 后靠 lineage 解析 |
-| D14 | sender 标记里的标题与用户名 | 保持现状：随改名变化，由现有触发器让历史失效 | 写入时冻结：改名不影响历史，前缀更稳定 |
+| D1 | tool 结果的文本是否复制进块 | 不复制。块只存被采用的 attempt、结果图片、附言；文本留在账本 | 推荐，未确认 |
+| D2 | tool 块的 `input` 以哪份为准 | 重放实际执行的输入（重定向或修复之后）；账本保留每个 attempt 的执行输入 | **已定** |
+| D3 | 「轮」的边界 | 推荐以一次运行为界（§3.6）：插话不开新轮。用途说明后再定 | **待定** |
+| D4 | `aborted` 块是否重放 | text 重放，reasoning 不重放 | 推荐，未确认 |
+| D5 | 前端传输怎样演进 | P1 先给数组元素附加块 id，P2 再改成规范化结构 | 推荐，未确认 |
+| D6 | 是否做块级 FTS | 放在 P3，作为可选项、独立开关；先保留消息级 | 推荐，未确认 |
+| D7 | 是否建 `narrator_turns` 表 | P2 视 UI 需求再定 | 推荐，未确认 |
+| D8 | `content_json` 的终态 | 当前版本保留派生投影；确认稳定后再单独立项清理（§10.4） | **已定** |
+| D9 | 作者与属主是否拆分 | 拆分，新增 `author_narrator_id` | 推荐，未确认 |
+| D10 | assistant 编辑的作用域 | 只改被点的那个 `output` 块（§5.5） | **已定** |
+| D11 | broken 调用在历史中的形态 | tool 块 `failed`、不可见，另加一条 `context` 说明，与实时路径一致 | **已定** |
+| D12 | turn nudge 放在哪里 | 单独一条 `context` 块（subtype `turn_nudge`），排在该步工具结果之后；不再拼进工具结果。这会改变发给模型的内容，列入 §12.6 | **已定** |
+| D13 | 引用锚点是否写进模型可见正文 | 保持写在正文里；锚点改为块 id（`b:<blockId>`），COW 后靠 lineage 解析 | **已定** |
+| D14 | sender 标记里的标题与用户名在改名后的处理 | compact 之间不改写已发送的前缀，用一条提醒代替；compact 后按最新数据完整重建（§7.7） | **已定** |
 
 ## 附录 A：现有块 type 到 kind 的映射
 
