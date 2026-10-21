@@ -37,6 +37,8 @@ import {
 	modelProviderPrefix,
 	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
+import { QuotaWindowBars } from "./QuotaWindowBars";
+import type { ProviderQuotaBadge } from "./use-opencode-provider-badges";
 
 /**
  * The provider-grouped model list rendered inside a narrator's model menu.
@@ -91,7 +93,7 @@ export function ModelMenuItems({
 	 * Provider prefix → a small status badge for the group header, e.g. what is
 	 * left of an OpenCode Go plan allowance. `tooltip` explains the badge.
 	 */
-	providerBadges?: Record<string, { text: string; color: string; tooltip?: string }>;
+	providerBadges?: Record<string, ProviderQuotaBadge>;
 	/** When provided, an edit button on the "Default" group opens the global default model picker. */
 	onEditDefaultModel?: () => void;
 	/** When provided, an edit button on the "Summary" group opens the global summary model picker. */
@@ -347,14 +349,24 @@ export function ModelMenuItems({
 										withinPortal
 										style={{ whiteSpace: "pre-line" }}
 									>
-										<Badge
-											size="xs"
-											variant="light"
-											color={badgeInfo.color}
-											style={{ textTransform: "none", flexShrink: 0 }}
-										>
-											{badgeInfo.text}
-										</Badge>
+										{badgeInfo.bars && badgeInfo.bars.length > 0 ? (
+											<span
+												role="img"
+												aria-label={badgeInfo.text}
+												style={{ display: "inline-flex", flexShrink: 0 }}
+											>
+												<QuotaWindowBars bars={badgeInfo.bars} size="xs" stale={badgeInfo.stale} />
+											</span>
+										) : (
+											<Badge
+												size="xs"
+												variant="light"
+												color={badgeInfo.color}
+												style={{ textTransform: "none", flexShrink: 0 }}
+											>
+												{badgeInfo.text}
+											</Badge>
+										)}
 									</Tooltip>
 								) : null;
 								if (!headerAction && !badge) {
