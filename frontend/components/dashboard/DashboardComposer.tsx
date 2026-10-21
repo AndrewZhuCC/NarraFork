@@ -1,50 +1,47 @@
-import {
-	ActionIcon,
-	Button,
-	Group,
-	Menu,
-	Modal,
-	Paper,
-	Select,
-	Stack,
-	Text,
-	Textarea,
-	Tooltip,
-} from "@mantine/core";
+import { ActionIcon, Box, Button, Group, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import {
-	IconAdjustmentsHorizontal,
-	IconArrowUp,
-	IconCheck,
-	IconChevronDown,
-	IconClock,
-	IconFolder,
-	IconFolderOpen,
-	IconSparkles,
-	IconStarFilled,
-} from "@tabler/icons-react";
+import { composerDocumentText, parseComposerDocument } from "@shared/composer-document";
+import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useFavoriteDirectories } from "../../hooks/useFavoriteDirectories";
-import { useAllModels } from "../../hooks/useModels";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { useCreateNarrator } from "../../hooks/useNarrator";
+import { useFileSystemCapability } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
-import { api } from "../../lib/api";
+import { api, isAbortError } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
-import { DirectoryPicker } from "../common/DirectoryPicker";
+import { DirectoryBrowserModal } from "../common/DirectoryPicker";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
+import { hasSendableComposerContent } from "../narrator/composer/composer-send-gate";
+import { trimFileReferenceInput } from "../narrator/composer/file-reference-input";
+import {
+	NarratorComposer,
+	type NarratorComposerHandle,
+} from "../narrator/composer/NarratorComposer";
+import { UploadProgressBar } from "../narrator/interaction/UploadProgressBar";
+import { useComposerAttachments } from "../narrator/interaction/use-composer-attachments";
+import { useComposerFileIngest } from "../narrator/interaction/use-composer-file-ingest";
+import {
+	type NarratorSendingState,
+	snapshotComposerFiles,
+} from "../narrator/interaction/use-narrator-send";
+import { ModelPickerMenu } from "../narrator/model/ModelPickerMenu";
 import { directoryLabel } from "./dashboard-sessions";
 
 const CreateNarratorModal = lazy(() =>
 	import("../narrator/CreateNarratorModal").then((m) => ({ default: m.CreateNarratorModal })),
 );
 
+/**
+ * Local key for the dashboard composer's draft, input history and staged
+ * attachments. It names no narrator: the composer runs in draft mode, so nothing
+ * is ever sent to the server under it.
+ */
+export const DASHBOARD_COMPOSER_KEY = "dashboard-composer";
 const COMPOSER_PREFS_KEY = "narrafork_dashboard_composer";
 const SETTINGS_QUERY_GC_TIME_MS = 60_000;
-const MODEL_SELECT_OPTION_LIMIT = 100;
-const RECENT_DIRECTORY_LIMIT = 5;
 
 interface ComposerPrefs {
 	cwd?: string;
@@ -70,16 +67,20 @@ function writePrefs(prefs: ComposerPrefs) {
 }
 
 /**
- * Cursor-style entry point: type a task, pick a directory and model, press Enter.
- * Creates a standalone session, sends the text as its first message, then opens it.
+ * The dashboard's entry point: the narrator composer (slash commands, skills,
+ * pasted images and files, input history) without a session behind it. Sending
+ * creates a standalone session in the chosen directory with the chosen model,
+ * delivers the message as its first turn, and opens it.
  */
-export function DashboardComposer({ recentDirectories }: { recentDirectories: string[] }) {
+export function DashboardComposer() {
 	const { t } = useTranslation("dashboard");
-	const { t: tn } = useTranslation("narrators");
+	const { t: tn } = useTranslation("narrator");
+	const { t: tns } = useTranslation("narrators");
 	const navigate = useNavigate();
 	const createNarrator = useCreateNarrator();
-	const { groupedModels } = useAllModels();
-	const { data: favorites } = useFavoriteDirectories();
+	const fsCapability = useFileSystemCapability();
+	const { data: currentUser } = useCurrentUser();
+	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -88,47 +89,66 @@ export function DashboardComposer({ recentDirectories }: { recentDirectories: st
 	const defaultProjectDir: string = settings?.paths?.defaultProjectDir ?? "";
 
 	const [prefs] = useState(readPrefs);
-	const [text, setText] = useState("");
 	// `null` = never chosen on this device: follow the instance default directory.
 	const [chosenCwd, setChosenCwd] = useState<string | null>(prefs.cwd || null);
 	const [model, setModel] = useState(prefs.model || FOLLOW_DEFAULT_MODEL);
-	const [submitting, setSubmitting] = useState(false);
+	const cwd = chosenCwd ?? defaultProjectDir;
 	const [browseOpen, setBrowseOpen] = useState(false);
-	const [browseValue, setBrowseValue] = useState("");
 	const [advancedOpen, setAdvancedOpen] = useState(false);
-	const textareaRef = useRef<HTMLTextAreaElement>(null);
-	// A session created by a submit whose first message then failed to send. Retrying
-	// reuses it instead of leaving an empty session behind per attempt.
+	const [hasText, setHasText] = useState(false);
+	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);
+	const composerRef = useRef<NarratorComposerHandle>(null);
+	const fileInputRef = useRef<HTMLInputElement>(null);
+	const sendingRef = useRef(false);
+	const sendAbortRef = useRef<AbortController | null>(null);
+	// A session created by a send whose message then failed. Retrying reuses it
+	// instead of leaving an empty session behind per attempt.
 	const pendingSessionRef = useRef<CreateNarratorResult | null>(null);
 
-	const cwd = chosenCwd ?? defaultProjectDir;
-
-	useEffect(() => {
-		textareaRef.current?.focus();
-	}, []);
+	const {
+		attachedImages,
+		attachedTextFiles,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
+		retryAttachmentRestore,
+		restoredAttachmentResources,
+		setIsDragging,
+		dragCounterRef,
+		updateAttachedImages,
+		updateAttachedTextFiles,
+		reconcileDocumentAssets,
+		clearAttachedFilesAndDraft,
+	} = useComposerAttachments({
+		narratorId: DASHBOARD_COMPOSER_KEY,
+		currentUserId,
+		sendingRef,
+		t: tn,
+	});
+	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps, ingestingRef } =
+		useComposerFileIngest({
+			narratorId: DASHBOARD_COMPOSER_KEY,
+			sendingRef,
+			updateAttachedImages,
+			updateAttachedTextFiles,
+			setIsDragging,
+			dragCounterRef,
+			captureInsertion: (origin) => composerRef.current?.captureAttachmentInsertion(origin),
+			onAcceptedFiles: (files, bookmark) =>
+				composerRef.current?.insertAcceptedFiles(files, bookmark) ?? false,
+			t: tn,
+		});
+	const hasAttachments = attachedImages.length + attachedTextFiles.length > 0;
 
 	const selectCwd = (path: string) => {
 		pendingSessionRef.current = null;
 		setChosenCwd(path);
 		writePrefs({ cwd: path, model });
 	};
-
-	const selectModel = (value: string | null) => {
-		const next = value || FOLLOW_DEFAULT_MODEL;
+	const selectModel = (value: string) => {
 		pendingSessionRef.current = null;
-		setModel(next);
-		writePrefs({ cwd: chosenCwd ?? undefined, model: next });
+		setModel(value);
+		writePrefs({ cwd: chosenCwd ?? undefined, model: value });
 	};
-
-	const favoritePaths = useMemo<{ path: string; label: string }[]>(
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
-		() => (favorites ?? []).map((f: any) => ({ path: f.path, label: f.label || f.path })),
-		[favorites],
-	);
-	const recentPaths = useMemo(() => {
-		const favoriteSet = new Set(favoritePaths.map((f) => f.path));
-		return recentDirectories.filter((p) => !favoriteSet.has(p)).slice(0, RECENT_DIRECTORY_LIMIT);
-	}, [recentDirectories, favoritePaths]);
 
 	const openSession = (session: CreateNarratorResult) => {
 		void addRecentTab({
@@ -141,222 +161,220 @@ export function DashboardComposer({ recentDirectories }: { recentDirectories: st
 		navigate({ to: "/narrators/$narratorId", params: { narratorId: session.id } });
 	};
 
-	const submit = async () => {
-		const message = text.trim();
-		if (!message || submitting) return;
-		setSubmitting(true);
+	const send = async () => {
+		const composer = composerRef.current;
+		if (!composer || sendingRef.current || ingestingRef.current) return;
+		const rawText = composer.getText();
+		const liveDocument = composer.getDocument();
+		const document = liveDocument ? parseComposerDocument(liveDocument) : undefined;
+		const { text, fileReferences, composerDocument } = document
+			? { ...composerDocumentText(document), composerDocument: document }
+			: {
+					...trimFileReferenceInput({
+						text: rawText,
+						fileReferences: composer.getFileReferences(),
+					}),
+					composerDocument: undefined,
+				};
+		const files = snapshotComposerFiles(composerDocument, attachedImages, attachedTextFiles);
+		if (!files || composer.hasMissingAssets()) {
+			notifications.show({
+				color: "red",
+				title: tn("sendFailed"),
+				message: tn("composerMissingAssets"),
+			});
+			return;
+		}
+		if (
+			!hasSendableComposerContent({
+				text: rawText,
+				imageCount: files.images.length,
+				textFileCount: files.textFiles.length,
+				fileReferenceCount: fileReferences.length,
+			})
+		)
+			return;
+
+		sendingRef.current = true;
+		const attachmentCount = files.images.length + files.textFiles.length;
+		const abort = new AbortController();
+		sendAbortRef.current = abort;
+		setSendingState({
+			attachmentCount,
+			progress: attachmentCount > 0 ? 0 : null,
+			canCancel: attachmentCount > 0,
+		});
+		let lastPercent = -1;
 		try {
 			let session = pendingSessionRef.current;
 			if (!session) {
+				// Unchosen → let the server resolve (and create) the default project directory.
 				const data = await createNarrator.mutateAsync({
-					...(cwd ? { cwd } : {}),
+					...(chosenCwd ? { cwd: chosenCwd } : {}),
 					model,
 				});
 				session = {
 					id: data.id,
-					title: data.title || tn("newNarrator"),
+					title: data.title || tns("newNarrator"),
 					cwd: data.cwd || cwd,
 					status: data.status || "idle",
 				};
 				pendingSessionRef.current = session;
 			}
-			try {
-				await api.sendNarratorMessage(session.id, message);
-			} catch (error) {
+			const args: Parameters<typeof api.sendNarratorMessage> = [
+				session.id,
+				text,
+				files.images.length > 0 ? files.images : undefined,
+				files.textFiles.length > 0 ? files.textFiles : undefined,
+				undefined,
+				(fraction) => {
+					// Same throttle as the narrator page: re-render on whole-percent steps only.
+					const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
+					if (percent === lastPercent) return;
+					lastPercent = percent;
+					setSendingState((state) => (state ? { ...state, progress: fraction } : state));
+				},
+				abort.signal,
+			];
+			if (fileReferences.length > 0) args[7] = fileReferences;
+			if (composerDocument) args[10] = { composerDocument };
+			await api.sendNarratorMessage(...args);
+			composer.noteSent(text, fileReferences, composerDocument);
+			composer.clearTextAndDraft();
+			clearAttachedFilesAndDraft();
+			pendingSessionRef.current = null;
+			openSession(session);
+		} catch (error) {
+			if (isAbortError(error)) {
+				notifications.show({ message: tn("sendCancelled"), color: "gray", autoClose: 2000 });
+			} else if (pendingSessionRef.current) {
+				// Creation errors are toasted by the global mutation handler.
 				notifications.show({
 					color: "red",
 					title: t("composer.sendFailed"),
 					message: error instanceof Error ? error.message : String(error),
 				});
-				return;
 			}
-			pendingSessionRef.current = null;
-			setText("");
-			openSession(session);
-		} catch {
-			// Creation failures are already toasted by the global mutation error handler.
 		} finally {
-			setSubmitting(false);
+			sendingRef.current = false;
+			sendAbortRef.current = null;
+			setSendingState(null);
 		}
 	};
 
-	const canSubmit = text.trim().length > 0 && !submitting;
+	const sending = sendingState != null;
 
 	return (
-		<Stack gap="xs">
-			<Paper
-				withBorder
-				radius="lg"
-				shadow="xs"
-				px="md"
-				pt="sm"
-				pb="xs"
-				style={{ cursor: "text" }}
-				onClick={() => textareaRef.current?.focus()}
-			>
-				<Textarea
-					ref={textareaRef}
-					variant="unstyled"
-					autosize
-					minRows={3}
-					maxRows={12}
-					size="md"
-					placeholder={t("composer.placeholder")}
-					value={text}
-					onChange={(e) => setText(e.currentTarget.value)}
-					onKeyDown={(e) => {
-						if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
-						e.preventDefault();
-						void submit();
-					}}
-					aria-label={t("composer.placeholder")}
+		<Box {...dropZoneProps}>
+			<UploadProgressBar
+				sendingState={sendingState}
+				cancelSending={() => sendAbortRef.current?.abort()}
+			/>
+			<Box>
+				<input
+					ref={fileInputRef}
+					type="file"
+					multiple
+					style={{ display: "none" }}
+					onChange={handleFileInputChange}
+					disabled={sending}
 				/>
-				<Group justify="space-between" wrap="nowrap" mt={4}>
-					<Text size="xs" c="dimmed" visibleFrom="sm">
-						{t("composer.hint")}
-					</Text>
-					<Group gap={6} wrap="nowrap" ml="auto">
-						<Tooltip label={t("composer.advanced")}>
+				<NarratorComposer
+					ref={composerRef}
+					narratorId={DASHBOARD_COMPOSER_KEY}
+					draft={{ cwd: cwd || null }}
+					adaptive={false}
+					sendingRef={sendingRef}
+					sending={sending}
+					permEnterActive={false}
+					hasAttachments={hasAttachments}
+					enterMode="turn"
+					ctrlEnterMode="turn"
+					onSendWithMode={() => send()}
+					onTextFlagsChange={setHasText}
+					onPasteImages={handleComposerPasteImages}
+					attachedImages={attachedImages}
+					attachedTextFiles={attachedTextFiles}
+					attachmentsHydrating={attachmentsHydrating}
+					attachmentsRestoreFailed={attachmentsRestoreFailed}
+					onRetryAttachments={retryAttachmentRestore}
+					restoredAttachmentResources={restoredAttachmentResources}
+					onDocumentAssetsChange={reconcileDocumentAssets}
+					onAttachmentsChange={(images, textFiles) => {
+						updateAttachedImages(images);
+						updateAttachedTextFiles(textFiles);
+					}}
+					controls={
+						<Tooltip label={tn("attachFile")}>
 							<ActionIcon
+								aria-label={tn("attachFile")}
 								variant="subtle"
 								color="gray"
-								radius="xl"
-								size="lg"
-								aria-label={t("composer.advanced")}
-								onClick={(e) => {
-									e.stopPropagation();
-									setAdvancedOpen(true);
+								disabled={sending}
+								onMouseDown={(event) => event.preventDefault()}
+								onClick={() => {
+									composerRef.current?.captureAttachmentSelection();
+									fileInputRef.current?.click();
 								}}
 							>
-								<IconAdjustmentsHorizontal size={18} />
+								<IconPaperclip size={18} />
 							</ActionIcon>
 						</Tooltip>
-						<ActionIcon
-							variant="filled"
-							radius="xl"
-							size="lg"
-							aria-label={t("composer.send")}
-							disabled={!canSubmit}
-							loading={submitting}
-							onClick={(e) => {
-								e.stopPropagation();
-								void submit();
-							}}
-						>
-							<IconArrowUp size={18} />
-						</ActionIcon>
-					</Group>
-				</Group>
-			</Paper>
-
-			<Group gap="xs" px={4} wrap="wrap">
-				<Menu position="bottom-start" width={320} shadow="md" withinPortal>
-					<Menu.Target>
+					}
+					actions={
 						<Button
-							variant="subtle"
-							color="gray"
-							size="compact-sm"
-							leftSection={<IconFolder size={15} />}
-							rightSection={<IconChevronDown size={13} />}
-							title={cwd || undefined}
-							styles={{ label: { maxWidth: 220 } }}
+							onClick={() => void send()}
+							loading={sending}
+							disabled={!hasText && !hasAttachments}
 						>
-							<Text span size="sm" truncate>
-								{cwd ? directoryLabel(cwd) : t("composer.homeDirectory")}
-							</Text>
+							{t("composer.start")}
 						</Button>
-					</Menu.Target>
-					<Menu.Dropdown>
-						{defaultProjectDir && (
-							<DirectoryItem
-								path={defaultProjectDir}
-								label={t("composer.defaultDirectory")}
-								active={cwd === defaultProjectDir}
-								icon={<IconFolder size={15} />}
-								onSelect={selectCwd}
-							/>
-						)}
-						{favoritePaths.length > 0 && <Menu.Label>{t("composer.favorites")}</Menu.Label>}
-						{favoritePaths.map((f) => (
-							<DirectoryItem
-								key={f.path}
-								path={f.path}
-								label={f.label}
-								active={cwd === f.path}
-								icon={<IconStarFilled size={14} color="var(--mantine-color-yellow-5)" />}
-								onSelect={selectCwd}
-							/>
-						))}
-						{recentPaths.length > 0 && <Menu.Label>{t("composer.recentDirectories")}</Menu.Label>}
-						{recentPaths.map((path) => (
-							<DirectoryItem
-								key={path}
-								path={path}
-								label={directoryLabel(path)}
-								active={cwd === path}
-								icon={<IconClock size={15} />}
-								onSelect={selectCwd}
-							/>
-						))}
-						<Menu.Divider />
-						<Menu.Item
-							leftSection={<IconFolderOpen size={15} />}
-							onClick={() => {
-								setBrowseValue(cwd);
-								setBrowseOpen(true);
-							}}
-						>
-							{t("composer.otherDirectory")}
-						</Menu.Item>
-					</Menu.Dropdown>
-				</Menu>
-
-				<Select
-					variant="unstyled"
-					size="sm"
-					w={210}
-					data={groupedModels}
-					searchable
-					limit={MODEL_SELECT_OPTION_LIMIT}
-					value={model}
-					onChange={selectModel}
-					allowDeselect={false}
-					leftSection={<IconSparkles size={15} />}
-					rightSection={<IconChevronDown size={13} />}
-					rightSectionPointerEvents="none"
-					maxDropdownHeight={320}
-					comboboxProps={{ width: 300, position: "bottom-start", shadow: "md" }}
-					aria-label={tn("model")}
-					styles={{ input: { color: "var(--mantine-color-dimmed)", fontSize: 14 } }}
+					}
 				/>
+			</Box>
+
+			<Group gap="xs" mt="xs" wrap="wrap">
+				<Tooltip
+					label={fsCapability.browse.supported ? cwd || t("composer.homeDirectory") : undefined}
+					disabled={!fsCapability.browse.supported && !cwd}
+				>
+					<Button
+						variant="default"
+						size="xs"
+						leftSection={<IconFolder size={14} />}
+						disabled={!fsCapability.browse.supported}
+						onClick={() => setBrowseOpen(true)}
+						styles={{ label: { maxWidth: 260 } }}
+					>
+						<Text span size="xs" truncate>
+							{cwd ? directoryLabel(cwd) : t("composer.homeDirectory")}
+						</Text>
+					</Button>
+				</Tooltip>
+				<Box style={{ minWidth: 0, maxWidth: 280 }}>
+					<ModelPickerMenu value={model} onChange={selectModel} />
+				</Box>
+				<Tooltip label={t("composer.advanced")}>
+					<ActionIcon
+						variant="subtle"
+						color="gray"
+						aria-label={t("composer.advanced")}
+						onClick={() => setAdvancedOpen(true)}
+					>
+						<IconAdjustmentsHorizontal size={16} />
+					</ActionIcon>
+				</Tooltip>
 			</Group>
 
-			<Modal
+			<DirectoryBrowserModal
 				opened={browseOpen}
 				onClose={() => setBrowseOpen(false)}
-				title={tn("workingDirectory")}
-				size="lg"
-			>
-				<Stack>
-					<DirectoryPicker
-						value={browseValue}
-						onChange={setBrowseValue}
-						placeholder={defaultProjectDir || undefined}
-						leftSection={<IconFolder size={16} />}
-					/>
-					<Group justify="flex-end">
-						<Button
-							disabled={!browseValue.trim()}
-							onClick={() => {
-								selectCwd(browseValue.trim());
-								setBrowseOpen(false);
-							}}
-						>
-							{t("composer.useDirectory")}
-						</Button>
-					</Group>
-				</Stack>
-			</Modal>
+				initialPath={cwd || undefined}
+				onSelect={(path) => {
+					selectCwd(path);
+					setBrowseOpen(false);
+				}}
+			/>
 
 			{advancedOpen && (
 				<Suspense fallback={null}>
@@ -368,35 +386,6 @@ export function DashboardComposer({ recentDirectories }: { recentDirectories: st
 					/>
 				</Suspense>
 			)}
-		</Stack>
-	);
-}
-
-function DirectoryItem({
-	path,
-	label,
-	active,
-	icon,
-	onSelect,
-}: {
-	path: string;
-	label: string;
-	active: boolean;
-	icon: React.ReactNode;
-	onSelect: (path: string) => void;
-}) {
-	return (
-		<Menu.Item
-			leftSection={icon}
-			rightSection={active ? <IconCheck size={14} /> : null}
-			onClick={() => onSelect(path)}
-		>
-			<Text size="sm" truncate>
-				{label}
-			</Text>
-			<Text size="xs" c="dimmed" truncate title={path}>
-				{path}
-			</Text>
-		</Menu.Item>
+		</Box>
 	);
 }

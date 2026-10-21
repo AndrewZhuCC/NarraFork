@@ -24,7 +24,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
-import { useNarratorCommands } from "../../../hooks/useCommands";
+import { useDraftComposerCommands, useNarratorCommands } from "../../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInputHistory";
 import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
@@ -195,6 +195,18 @@ export interface NarratorComposerProps {
 	controls?: React.ReactNode;
 	actions?: React.ReactNode;
 	sending?: boolean;
+	/**
+	 * Session-less composer (the dashboard). `narratorId` is then only a local key:
+	 * the draft persists in this browser only, the slash menu resolves from
+	 * `draft.cwd`, and session-bound features (server draft sync, prompt
+	 * optimization) are off.
+	 */
+	draft?: { cwd: string | null };
+	/**
+	 * False keeps the editor in its expanded layout (multi-line box, controls on a
+	 * row below) instead of collapsing to one line while short.
+	 */
+	adaptive?: boolean;
 }
 
 /**
@@ -235,6 +247,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			controls,
 			actions,
 			sending = false,
+			draft,
+			adaptive = true,
 		},
 		ref,
 	) {
@@ -317,7 +331,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const bodyText = bodyInput.text;
 		const inputStateRef = useRef(inputState);
 		const [draftHydrated, setDraftHydrated] = useState(false);
-		const [draftSyncState, setDraftSyncState] = useState<"loading" | "ready" | "error">("loading");
+		const localDraftOnly = !!draft;
+		// "local": a session-less composer whose draft never syncs to the server.
+		const [draftSyncState, setDraftSyncState] = useState<"loading" | "ready" | "error" | "local">(
+			"loading",
+		);
 		// A remote write replaced non-empty local content; the overwritten version
 		// sits in the server's undo slot until restored or the user edits again.
 		const [draftReplacedByRemote, setDraftReplacedByRemote] = useState(false);
@@ -886,6 +904,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			}
 			draftOwnerScopeRef.current = currentDraftScope;
 			setDraftHydrated(true);
+			if (localDraftOnly) {
+				clearTimeout(timer);
+				setDraftSyncState("local");
+				return;
+			}
 
 			const loadDraft = async () => {
 				try {
@@ -986,6 +1009,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			currentUserId,
 			currentDraftScope,
 			draftLoadAttempt,
+			localDraftOnly,
 			narratorId,
 			restoreInput,
 			restoreRemoteInput,
@@ -1222,9 +1246,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			? ""
 			: bodyText;
 		// Only fetch commands when user starts typing "/" to avoid unnecessary API call on page load
-		const { data: commandsList } = useNarratorCommands(
-			commandInput.startsWith("/") ? narratorId : undefined,
+		const typingCommand = commandInput.startsWith("/");
+		const { data: sessionCommands } = useNarratorCommands(
+			typingCommand && !draft ? narratorId : undefined,
 		);
+		const { data: draftCommands } = useDraftComposerCommands(
+			draft?.cwd ?? null,
+			typingCommand && !!draft,
+		);
+		const commandsList = draft ? draftCommands : sessionCommands;
 		// Show command popover only when typing command name (no space yet),
 		// or when typing optional tool sub-completion (/load <tool>, /unload <tool>).
 		// Suppress when browsing input history so arrow keys keep navigating history.
@@ -1779,7 +1809,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					elementRef={textareaRef}
 					onElement={setEditorElement}
 					value={document}
-					adaptive={!fullscreenOpened}
+					adaptive={adaptive && !fullscreenOpened}
 					leadingControls={controls}
 					candidate={
 						quoteCandidate.candidate
@@ -1836,6 +1866,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								</Button>
 							)}
 							<TextareaOptimizeControls
+								optimizeAvailable={!draft}
 								disabled={!bodyText.trim() || optimizeHook.loading || sending}
 								loading={optimizeHook.loading}
 								withContext={optimizeHook.withContext}

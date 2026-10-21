@@ -2397,8 +2397,21 @@ function parseSubagentSummary(raw: unknown): SubagentToolInputSummary | null {
 	}
 }
 
+/**
+ * Latest tool calls of each narrator, oldest first, as short summary rows — the
+ * dashboard activity cards' snapshot. Same bounded projection as a subagent
+ * card's recent calls: never reads `input_json` or outputs into JS.
+ */
+export function loadRecentToolCallActivity(
+	narratorIds: string[],
+	limit: number,
+): Promise<Map<string, SubagentActivityToolCall[]>> {
+	return loadLatestSubagentToolCalls(narratorIds, limit);
+}
+
 async function loadLatestSubagentToolCalls(
 	narratorIds: string[],
+	limit = SUBAGENT_ACTIVITY_LIMIT,
 ): Promise<Map<string, SubagentActivityToolCall[]>> {
 	const result = new Map<string, SubagentActivityToolCall[]>();
 	const uniqueNarratorIds = [...new Set(narratorIds)];
@@ -2431,7 +2444,7 @@ async function loadLatestSubagentToolCalls(
 					),
 				)
 				.orderBy(desc(narratorToolCalls.createdAt), desc(narratorToolCalls.id))
-				.limit(SUBAGENT_ACTIVITY_LIMIT);
+				.limit(limit);
 			return { narratorId, rows: rows.reverse() };
 		}),
 	);

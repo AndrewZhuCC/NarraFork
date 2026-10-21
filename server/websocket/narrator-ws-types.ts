@@ -58,6 +58,15 @@ export type ReflectionProgressKind =
 	| "task_reflection"
 	| "question_reflection";
 
+/** One row of an activity card's recent-tool list (`activity` subscriptions). */
+export interface NarratorActivityToolCall {
+	toolUseId: string;
+	toolName: string;
+	status: string;
+	createdAt: string | null;
+	inputSummary?: SubagentToolInputSummary;
+}
+
 export interface NarratorListStateSnapshotMessage {
 	type: "list_state_snapshot";
 	items: NarratorListStateSnapshotItem[];
@@ -301,6 +310,13 @@ export type NarratorServerMessage =
 			backgroundWorkActive?: boolean;
 	  }
 	| { type: "substatus_change"; narratorId: string; substatus: string[] }
+	/** Initial state of an `activity` subscription: the narrator's latest tool calls. */
+	| {
+			type: "activity_snapshot";
+			narratorId: string;
+			toolCalls: NarratorActivityToolCall[];
+			subscriptionRequestId?: string;
+	  }
 	| {
 			type: "payment_required";
 			narratorId: string;

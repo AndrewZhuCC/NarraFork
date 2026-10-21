@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import type { HumanAttentionItem } from "@shared/human-attention";
+import type { NarratorActivity } from "./dashboard-activity";
 import {
 	buildDashboardSessions,
 	type DashboardNarrator,
 	directoryLabel,
+	parseSubstatus,
 } from "./dashboard-sessions";
 
 function narrator(id: string, extra: Partial<DashboardNarrator> = {}): DashboardNarrator {
@@ -31,67 +33,85 @@ function decision(narratorId: string, extra: Partial<HumanAttentionItem> = {}): 
 	};
 }
 
-const empty = { attentionItems: [], working: [], waiting: [], recent: [] };
+function build(
+	narrators: DashboardNarrator[],
+	attentionItems: HumanAttentionItem[] = [],
+	activity: Map<string, NarratorActivity> = new Map(),
+) {
+	return buildDashboardSessions({ narrators, attentionItems, activity });
+}
+
+const ids = (rows: { narratorId: string }[]) => rows.map((row) => row.narratorId);
 
 describe("buildDashboardSessions", () => {
 	it("puts a working session with an open decision under attention, not running", () => {
-		const working = [narrator("a", { status: "working" }), narrator("b", { status: "working" })];
-		const groups = buildDashboardSessions({
-			...empty,
-			working,
-			attentionItems: [decision("a", { blocking: true })],
-		});
-		expect(groups.attention.map((r) => r.narratorId)).toEqual(["a"]);
+		const groups = build(
+			[narrator("a", { status: "working" }), narrator("b", { status: "working" })],
+			[decision("a", { blocking: true })],
+		);
+		expect(ids(groups.attention)).toEqual(["a"]);
 		expect(groups.attention[0]?.title).toBe("title-a");
-		expect(groups.running.map((r) => r.narratorId)).toEqual(["b"]);
+		expect(ids(groups.running)).toEqual(["b"]);
+	});
+
+	it("keeps a waiting session without a human decision (reflection) under running", () => {
+		const groups = build([
+			narrator("r", { status: "waiting", substatus: '["reflecting"]' }),
+			narrator("q", { status: "waiting" }),
+		]);
+		expect(groups.attention).toEqual([]);
+		expect(ids(groups.running).sort()).toEqual(["q", "r"]);
+		expect(groups.running.find((s) => s.narratorId === "r")?.substatus).toEqual(["reflecting"]);
+	});
+
+	it("treats an idle session with background work as running", () => {
+		const groups = build([
+			narrator("bg", { activeBackgroundWorkCount: 2 }),
+			narrator("done", { activeBackgroundWorkCount: 0 }),
+		]);
+		expect(ids(groups.running)).toEqual(["bg"]);
+		expect(ids(groups.recent)).toEqual(["done"]);
 	});
 
 	it("attributes subagent decisions to the root session and counts them", () => {
-		const groups = buildDashboardSessions({
-			...empty,
-			attentionItems: [
+		const groups = build(
+			[],
+			[
 				decision("sub1", { rootNarratorId: "root" }),
 				decision("sub2", { rootNarratorId: "root", blocking: true, summary: "rm -rf build" }),
 			],
-		});
+		);
 		expect(groups.attention).toHaveLength(1);
 		expect(groups.attention[0]).toMatchObject({
 			narratorId: "root",
-			decisionCount: 2,
-			blocking: true,
-			detail: "rm -rf build",
+			decision: { count: 2, blocking: true, summary: "rm -rf build" },
 		});
 	});
 
-	it("orders decisions before waiting before errors, blocking first", () => {
-		const groups = buildDashboardSessions({
-			attentionItems: [decision("d1"), decision("d2", { blocking: true })],
-			working: [],
-			waiting: [narrator("w", { status: "waiting" })],
-			recent: [narrator("e", { errorMessage: "boom" })],
-		});
-		expect(groups.attention.map((r) => r.narratorId)).toEqual(["d2", "d1", "w", "e"]);
-		expect(groups.attention.map((r) => r.reason)).toEqual([
-			"decision",
-			"decision",
-			"waiting",
-			"error",
-		]);
+	it("orders blocking decisions, then other decisions, then errored sessions", () => {
+		const groups = build(
+			[narrator("e", { substatus: ["error"] }), narrator("d1"), narrator("d2")],
+			[decision("d1"), decision("d2", { blocking: true })],
+		);
+		expect(ids(groups.attention)).toEqual(["d2", "d1", "e"]);
+		expect(groups.attention[2]?.errored).toBe(true);
 	});
 
-	it("does not flag a working session as errored, and keeps recent to idle leftovers", () => {
-		const groups = buildDashboardSessions({
-			...empty,
-			working: [narrator("x", { status: "working", errorMessage: "old" })],
-			recent: [
-				narrator("x", { status: "working", errorMessage: "old" }),
-				narrator("i1", { lastMessageAt: "2026-01-02T00:00:00Z" }),
-				narrator("i2", { lastMessageAt: "2026-01-03T00:00:00Z" }),
-			],
-		});
-		expect(groups.attention).toHaveLength(0);
-		expect(groups.running.map((r) => r.narratorId)).toEqual(["x"]);
-		expect(groups.recent.map((r) => r.narratorId)).toEqual(["i2", "i1"]);
+	it("lets live activity move a session between groups", () => {
+		const narrators = [narrator("x", { status: "working" })];
+		expect(ids(build(narrators).running)).toEqual(["x"]);
+		const live = new Map([["x", { tools: [], status: "idle", substatus: [] }]]);
+		const groups = build(narrators, [], live);
+		expect(groups.running).toEqual([]);
+		expect(ids(groups.recent)).toEqual(["x"]);
+	});
+});
+
+describe("parseSubstatus", () => {
+	it("accepts arrays and JSON strings", () => {
+		expect(parseSubstatus(["a", 1])).toEqual(["a"]);
+		expect(parseSubstatus('["reasoning"]')).toEqual(["reasoning"]);
+		expect(parseSubstatus("not json")).toEqual([]);
 	});
 });
 

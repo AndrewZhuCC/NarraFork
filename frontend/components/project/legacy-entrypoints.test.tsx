@@ -182,7 +182,7 @@ describe("ordinary entry points and retained legacy sessions", () => {
 								{ narratorId: "recent-1", title: "recent", cwd: null, status: "idle", time: null },
 							],
 						},
-						recentDirectories: [],
+						activity: new Map(),
 						attention: { isError: false, hasNextPage: false },
 						isLoading: false,
 						// biome-ignore lint/suspicious/noExplicitAny: only the fields the view reads

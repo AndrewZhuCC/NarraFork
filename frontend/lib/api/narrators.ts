@@ -628,6 +628,36 @@ export interface NarratorCustomTraits {
 	availableTools: { name: string; description: string; category: string }[];
 }
 
+export type NarratorSlashMenuResponse = {
+	commands: Array<{
+		name: string;
+		prompt: string;
+		description?: string;
+		source: string;
+		runBashFirst?: boolean;
+		bashCommand?: string;
+		params?: Array<{
+			name: string;
+			description?: string;
+			required?: boolean;
+			defaultValue?: string;
+		}>;
+	}>;
+	skills: Array<{
+		name: string;
+		description: string;
+		source: string;
+		blocked?: boolean;
+	}>;
+	tools: Array<{
+		id: string;
+		toolName: string;
+		descriptionEn: string;
+		descriptionZh: string;
+	}>;
+	allSkillsBlocked?: boolean;
+};
+
 export const narratorsApi = {
 	getRequestRecordingDetail: (narratorId: string, requestId: string, signal?: AbortSignal) =>
 		request<RequestRecordingDetail>(
@@ -828,35 +858,12 @@ export const narratorsApi = {
 		return request<UsageHistoryStats>(`/narrators/${id}/usage-stats${qs ? `?${qs}` : ""}`);
 	},
 	getNarratorCommands: (id: string) =>
-		request<{
-			commands: Array<{
-				name: string;
-				prompt: string;
-				description?: string;
-				source: string;
-				runBashFirst?: boolean;
-				bashCommand?: string;
-				params?: Array<{
-					name: string;
-					description?: string;
-					required?: boolean;
-					defaultValue?: string;
-				}>;
-			}>;
-			skills: Array<{
-				name: string;
-				description: string;
-				source: string;
-				blocked?: boolean;
-			}>;
-			tools: Array<{
-				id: string;
-				toolName: string;
-				descriptionEn: string;
-				descriptionZh: string;
-			}>;
-			allSkillsBlocked?: boolean;
-		}>(`/narrators/${id}/commands`),
+		request<NarratorSlashMenuResponse>(`/narrators/${id}/commands`),
+	/** Slash menu for the session-less dashboard composer, resolved from `cwd`. */
+	getDraftComposerCommands: (cwd: string | null) =>
+		request<NarratorSlashMenuResponse>(
+			`/narrators/draft-composer/commands${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`,
+		),
 	getNarratorSkills: (id: string, opts?: { refresh?: boolean }) => {
 		const params = new URLSearchParams();
 		if (opts?.refresh) params.set("refresh", "true");

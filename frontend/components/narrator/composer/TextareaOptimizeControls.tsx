@@ -44,6 +44,8 @@ export function textareaOptimizeControlsWidth(hasExpand: boolean): number {
 }
 
 export interface TextareaOptimizeControlsProps {
+	/** False hides the optimize menu (no session to bill or read context from). */
+	optimizeAvailable?: boolean;
 	disabled?: boolean;
 	loading?: boolean;
 	withContext: boolean;
@@ -63,7 +65,7 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 
 	return (
 		<Group gap={4} wrap="nowrap" pr={8} style={{ pointerEvents: "auto" }}>
-			{props.loading ? (
+			{props.optimizeAvailable === false ? null : props.loading ? (
 				<Tooltip label={t("optimizeCancel")} position="top">
 					<ActionIcon
 						size="sm"

@@ -104,7 +104,6 @@ export function DirectoryPicker({
 	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
 	const [opened, { open, close }] = useDisclosure(false);
 	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
-	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 
 	const handleOpen = () => {
 		if (!browseSupported) return;
@@ -163,23 +162,56 @@ export function DirectoryPicker({
 				rightSectionWidth={rightSectionExtra ? 64 : undefined}
 				dropdownPosition={dropdownPosition}
 			/>
-			<Modal
+			<DirectoryBrowserModal
 				opened={opened}
 				onClose={close}
-				title={t("selectDirectory")}
-				size={isWide ? 880 : "md"}
-				styles={DIRECTORY_BROWSER_MODAL_STYLES}
-			>
-				<DirectoryBrowser
-					mode={mode}
-					newTargetError={newTargetError}
-					initialPath={browsePath}
-					onSelect={handleSelect}
-					onCancel={close}
-					isWide={isWide}
-				/>
-			</Modal>
+				mode={mode}
+				newTargetError={newTargetError}
+				initialPath={browsePath}
+				onSelect={handleSelect}
+			/>
 		</>
+	);
+}
+
+/**
+ * The directory browser dialog on its own, for entry points that open it straight
+ * from a button instead of from a path field.
+ */
+export function DirectoryBrowserModal({
+	opened,
+	onClose,
+	onSelect,
+	initialPath,
+	mode = "existing",
+	newTargetError,
+}: {
+	opened: boolean;
+	onClose: () => void;
+	onSelect: (path: string) => void;
+	initialPath?: string;
+	mode?: "existing" | "newTarget";
+	newTargetError?: string;
+}) {
+	const { t } = useTranslation("common");
+	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
+	return (
+		<Modal
+			opened={opened}
+			onClose={onClose}
+			title={t("selectDirectory")}
+			size={isWide ? 880 : "md"}
+			styles={DIRECTORY_BROWSER_MODAL_STYLES}
+		>
+			<DirectoryBrowser
+				mode={mode}
+				newTargetError={newTargetError}
+				initialPath={initialPath}
+				onSelect={onSelect}
+				onCancel={onClose}
+				isWide={isWide}
+			/>
+		</Modal>
 	);
 }
 

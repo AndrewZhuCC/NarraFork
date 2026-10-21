@@ -1,29 +1,19 @@
 {
+	"heading": "接下来做什么？",
 	"viewAll": "查看全部 →",
-	"noActiveNarrators": "当前没有正在运行的会话",
-	"heading": "接下来要做什么？",
 	"openInbox": "打开收件箱",
+	"noActiveNarrators": "当前没有正在运行的会话",
+	"backgroundWork": "仍有 {{count}} 个后台任务在运行",
+	"moreDecisions": "另有 {{count}} 项",
 	"sections": {
 		"needsYou": "需要你处理",
 		"running": "正在运行",
 		"recent": "最近"
 	},
-	"reason": {
-		"waiting": "等待你的输入",
-		"decision": "有待你决定的事项",
-		"blockingDecision": "已暂停，等待你决定"
-	},
 	"composer": {
-		"placeholder": "描述一个任务——开发功能、修复 Bug、探索代码…",
-		"hint": "Enter 开始 · Shift+Enter 换行",
-		"send": "开始会话",
-		"advanced": "更多会话选项",
+		"start": "开始",
 		"homeDirectory": "主目录",
-		"defaultDirectory": "默认目录",
-		"favorites": "收藏",
-		"recentDirectories": "最近",
-		"otherDirectory": "选择其他目录…",
-		"useDirectory": "使用此目录",
+		"advanced": "更多会话选项",
 		"sendFailed": "会话已创建，但消息发送失败"
 	}
 }
