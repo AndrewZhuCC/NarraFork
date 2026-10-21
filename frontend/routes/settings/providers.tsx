@@ -957,30 +957,30 @@ function SettingsProvidersPage() {
 		t,
 	]);
 
-	// Resolve `?provider=` (a provider id or a model prefix) to the key the config view
-	// uses: the provider id for multi-instance providers, the prefix for platform and
-	// plugin providers. Unknown or not-yet-loaded targets show the overview.
+	// Resolve `?provider=` (a provider id or a model prefix) to a key the config view can
+	// render: the provider id for multi-instance providers, the prefix for platform and
+	// plugin providers. Anything else (an unknown or not-yet-loaded target, or a prefix
+	// that only carries custom models) shows the overview rather than an empty detail.
 	const selectedProvider = useMemo(() => {
 		const target = search.provider;
 		if (!target) return null;
 		if (target === "tokendance") return tokenDance?.connected ? "tokendance" : null;
-		if (target === "codex") return "codex";
-		if (
-			state.customApiProviders.some((p) => p.id === target) ||
-			state.nugProviders.some((p) => p.id === target)
-		) {
-			return target;
-		}
-		const group =
-			providerGroups.find((item) => item.providerId === target) ??
-			providerGroups.find((item) => item.prefix === target);
-		return group ? (group.providerId ?? group.prefix) : null;
+		if (target === "codex" || target === "CommandCode") return target;
+		const configured = [...state.customApiProviders, ...state.nugProviders];
+		const byId = configured.find((p) => p.id === target);
+		if (byId) return byId.id;
+		const lower = target.toLowerCase();
+		const byPrefix =
+			configured.find((p) => p.prefix === target) ??
+			configured.find((p) => p.prefix?.toLowerCase() === lower);
+		if (byPrefix) return byPrefix.id;
+		return pluginProviderGroups?.some((group) => group.prefix === target) ? target : null;
 	}, [
 		search.provider,
 		tokenDance?.connected,
 		state.customApiProviders,
 		state.nugProviders,
-		providerGroups,
+		pluginProviderGroups,
 	]);
 
 	// ── Provider label for detail panel ──
