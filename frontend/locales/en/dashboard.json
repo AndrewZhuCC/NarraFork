@@ -12,7 +12,8 @@
 	},
 	"composer": {
 		"start": "Start",
-		"homeDirectory": "Home directory",
+		"chooseDirectory": "Choose working directory",
+		"directoryRequired": "No default project directory is set. Choose a working directory for this session, or set a default in Settings.",
 		"advanced": "More session options",
 		"sendFailed": "Session created, but the message could not be sent"
 	}

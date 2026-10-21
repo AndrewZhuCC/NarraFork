@@ -12,7 +12,6 @@ import {
 	Title,
 	Tooltip,
 } from "@mantine/core";
-import { useDebouncedCallback } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { ProviderReadiness } from "@shared/provider-readiness";
 import {
@@ -28,11 +27,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { useAllModels } from "../../hooks/useModels";
+import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
-import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
+import { ProjectDirChooser } from "./ProjectDirChooser";
 
 const TOTAL_STEPS = 6;
 
@@ -85,21 +85,22 @@ export function wizardStepIndex(step: WizardStep): number {
 /**
  * Which gate (if any) blocks "Next" on the current step.
  *
- * Providers and models are hard gates: nothing downstream — including delegated
- * dependency installation, which spawns a narrator on the default model — works
- * without them. Dependencies are deliberately NOT gated, so a user can move on
+ * Providers, models and the default project directory are hard gates: nothing
+ * downstream — including delegated dependency installation, which spawns a narrator
+ * on the default model — works without the first two, and with no existing default
+ * directory every new session has to ask for one. Dependencies are deliberately NOT gated, so a user can move on
  * and let the Setup Assistant finish the job later.
  */
 export function wizardNextBlockedReasonKey(state: {
 	step: number;
 	providerCount: number;
 	basicStepValid: boolean;
-}): "wizardProviderRequired" | "wizardModelsRequired" | null {
+}): "wizardProviderRequired" | "wizardBasicRequired" | null {
 	if (state.step === wizardStepIndex("provider") && state.providerCount === 0) {
 		return "wizardProviderRequired";
 	}
 	if (state.step === wizardStepIndex("basic") && !state.basicStepValid) {
-		return "wizardModelsRequired";
+		return "wizardBasicRequired";
 	}
 	return null;
 }
@@ -192,7 +193,7 @@ export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 	const { settingsData } = useAllModels();
 	const providerCount = useMemo(() => countConfiguredProviders(settingsData), [settingsData]);
 
-	// Track whether both models are set in BasicSettingsStep
+	// Track whether the project directory and both models are set in BasicSettingsStep
 	const [basicStepValid, setBasicStepValid] = useState(false);
 
 	const blockedReasonKey = wizardNextBlockedReasonKey({ step, providerCount, basicStepValid });
@@ -428,7 +429,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 			? settings.agent.summaryModel
 			: "";
 
-	const [projectDir, setProjectDir] = useState(settings?.paths?.defaultProjectDir ?? "");
+	const { usablePath: projectDir } = useProjectDirStatus();
 	const [defaultModel, setDefaultModel] = useState(validatedDefault);
 	const [summaryModel, setSummaryModel] = useState(validatedSummary);
 
@@ -446,32 +447,17 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
 	});
 
-	const debouncedSaveDir = useDebouncedCallback((path: string) => {
-		save.mutate({
-			paths: { defaultProjectDir: path },
-			agent: {
-				...(defaultModel ? { defaultModel } : {}),
-				...(summaryModel ? { summaryModel } : {}),
-			},
-		});
-	}, 500);
-
-	const handleDirChange = (path: string) => {
-		setProjectDir(path);
-		debouncedSaveDir(path);
-	};
-
 	// Report validity to parent
 	useEffect(() => {
-		onValidChange(!!defaultModel && !!summaryModel);
-	}, [defaultModel, summaryModel, onValidChange]);
+		onValidChange(!!projectDir && !!defaultModel && !!summaryModel);
+	}, [projectDir, defaultModel, summaryModel, onValidChange]);
 
 	return (
 		<Stack gap="md">
 			<Text size="sm" c="dimmed">
 				{t("wizardBasicDesc")}
 			</Text>
-			<PathInput label={t("defaultProjectDir")} value={projectDir} onChange={handleDirChange} />
+			<ProjectDirChooser />
 			<Select
 				label={t("defaultModel")}
 				placeholder={t("wizardSelectModel")}
@@ -483,7 +469,6 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 					const val = v ?? "";
 					setDefaultModel(val);
 					save.mutate({
-						paths: { defaultProjectDir: projectDir },
 						agent: {
 							...(val ? { defaultModel: val } : {}),
 							...(summaryModel ? { summaryModel } : {}),
@@ -503,7 +488,6 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 					const val = v ?? "";
 					setSummaryModel(val);
 					save.mutate({
-						paths: { defaultProjectDir: projectDir },
 						agent: {
 							...(defaultModel ? { defaultModel } : {}),
 							...(val ? { summaryModel: val } : {}),

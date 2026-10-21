@@ -2,8 +2,6 @@
  * Default settings values and per-field documentation.
  * Extracted from the monolithic settings/index.ts.
  */
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -24,7 +22,9 @@ export const DEFAULTS: NarraForkSettings = {
 	// (see the `database` field comment in types.ts).
 	database: { backend: "sqlite" },
 	paths: {
-		defaultProjectDir: resolve(homedir(), "projects"),
+		// Unset until the user picks an existing directory (setup wizard / settings).
+		// Never guessed: `~/projects` does not exist on most machines.
+		defaultProjectDir: "",
 		// Empty by default, and that is the safe zero value: with no entry here the
 		// in-browser editor can only write inside a narrator's own worktree.
 		extraWritableDirs: [] as string[],
@@ -353,7 +353,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── paths ───────────────────────────────────────────────────────────
 	"paths.defaultProjectDir": {
-		desc: "默认项目目录。新建项目时的默认父目录。",
+		desc: "默认项目目录：未指定目录时新会话的工作目录，也是新建项目时的默认父目录。必须是已存在的目录；为空表示未设置，此时需要用户手动选择目录。",
 		type: "string",
 	},
 	"paths.extraWritableDirs": {

@@ -999,6 +999,18 @@ export const miscApi = {
 			drives?: Array<{ name: string; path: string }>;
 			sep: string;
 		}>("/fs/shortcuts"),
+	/** Whether the instance's default project directory is set and exists. */
+	fsProjectDirStatus: () =>
+		request<{
+			configured: string;
+			path: string | null;
+			state: "valid" | "unset" | "missing" | "not_directory";
+		}>("/fs/project-dir"),
+	/** Existing folders under home that look like where the user keeps code. */
+	fsProjectDirCandidates: () =>
+		request<{
+			candidates: Array<{ path: string; repoCount: number; conventional: boolean }>;
+		}>("/fs/project-dir/candidates"),
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",
