@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { buildProviderRefreshTargets } from "./use-model-menu-refresh-props";
+import {
+	buildProviderIdByPrefix,
+	buildProviderRefreshTargets,
+} from "./use-model-menu-refresh-props";
 import {
 	buildProviderBalanceBadges,
 	type ProviderBalanceSources,
@@ -97,5 +100,19 @@ describe("buildProviderRefreshTargets", () => {
 		expect(admin.nug).toBeUndefined();
 		expect(admin.CommandCode).toEqual({ kind: "commandcode" });
 		expect(admin.tokendance).toEqual({ kind: "tokendance" });
+	});
+});
+
+describe("buildProviderIdByPrefix", () => {
+	test("links the settings button by provider id, not by model prefix", () => {
+		expect(
+			buildProviderIdByPrefix(
+				{
+					customApiProviders: [{ id: "c1", prefix: "xiaomi" }],
+					nugProviders: [{ id: "n1", prefix: "nugjp" }],
+				},
+				{ other: "n2" },
+			),
+		).toEqual({ xiaomi: "c1", nugjp: "n1", other: "n2" });
 	});
 });

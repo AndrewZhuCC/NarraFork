@@ -62,6 +62,21 @@ export function buildProviderRefreshTargets(
 	return out;
 }
 
+/** Model-group prefix → configured provider id (custom API and NUG providers). */
+export function buildProviderIdByPrefix(
+	settingsData: { customApiProviders?: unknown; nugProviders?: unknown } | undefined,
+	nugProviderIdByPrefix: Record<string, string> = {},
+): Record<string, string> {
+	const out: Record<string, string> = { ...nugProviderIdByPrefix };
+	for (const list of [settingsData?.customApiProviders, settingsData?.nugProviders]) {
+		if (!Array.isArray(list)) continue;
+		for (const p of list as ProviderRef[]) {
+			if (p?.id && p.prefix) out[p.prefix] = p.id;
+		}
+	}
+	return out;
+}
+
 async function refreshProviderCatalog(target: { kind: RefreshKind; id?: string }) {
 	const id = target.id ?? "";
 	switch (target.kind) {
@@ -153,11 +168,20 @@ export function useModelMenuRefreshProps(nugProviderIdByPrefix: Record<string, s
 		return actions;
 	}, [refreshTargets, nugProviderIdByPrefix, canRefreshNugModels, handleRefresh, refreshingPrefix]);
 
+	// Link by provider id whenever the prefix belongs to a configured provider: the
+	// settings page keys multi-instance providers by id, and a prefix is only a fallback.
+	const providerIdByPrefix = useMemo(
+		() => buildProviderIdByPrefix(settingsData, nugProviderIdByPrefix),
+		[settingsData, nugProviderIdByPrefix],
+	);
 	const onOpenProviderSettings = useCallback(
 		(prefix: string) => {
-			void navigate({ to: "/settings/providers", search: { provider: prefix } });
+			void navigate({
+				to: "/settings/providers",
+				search: { provider: providerIdByPrefix[prefix] ?? prefix },
+			});
 		},
-		[navigate],
+		[navigate, providerIdByPrefix],
 	);
 
 	// Opening the picker also kicks off an opportunistic NUG catalog refresh, so a
