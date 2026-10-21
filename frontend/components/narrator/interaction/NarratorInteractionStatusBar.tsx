@@ -50,8 +50,7 @@ import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
 import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
 import type { QuotaPanelView } from "../model/quota-panel-view";
 import { Sub2ApiSubscriptionQuotaIndicator } from "../model/Sub2ApiSubscriptionQuotaIndicator";
-import { useKimiProviderBadges } from "../model/use-kimi-provider-badges";
-import { useOpencodeProviderBadges } from "../model/use-opencode-provider-badges";
+import { useModelMenuProviderBadges } from "../model/use-model-menu-provider-badges";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
@@ -150,8 +149,8 @@ export interface NarratorInteractionStatusBarProps {
 		aggregations: any;
 		// biome-ignore lint/suspicious/noExplicitAny: provider label map passthrough.
 		providerLabels: any;
-		/** Settings projection, for the OpenCode Go allowance badges on provider groups. */
-		settingsData?: { customApiProviders?: unknown; opencodeUsageGenerations?: unknown };
+		/** Settings projection, for the allowance/balance badges on provider groups. */
+		settingsData?: Parameters<typeof useModelMenuProviderBadges>[0];
 		defaultModelValue: string;
 		// biome-ignore lint/suspicious/noExplicitAny: refresh props are spread verbatim onto ModelMenuItems.
 		refreshProps: any;
@@ -326,20 +325,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	// (a click outside the menu) does not also close the model menu.
 	const [menuOpenDesktop, setMenuOpenDesktop] = useState(false);
 	const [menuOpenMobile, setMenuOpenMobile] = useState(false);
-	const opencodeProviderBadges = useOpencodeProviderBadges(
+	const { providerBadges: providerQuotaBadges, providerBalances } = useModelMenuProviderBadges(
 		model.settingsData,
 		menuOpenDesktop || menuOpenMobile,
-	);
-	const kimiProviderBadges = useKimiProviderBadges(
-		model.settingsData,
-		menuOpenDesktop || menuOpenMobile,
-	);
-	const providerQuotaBadges = useMemo(
-		() =>
-			opencodeProviderBadges || kimiProviderBadges
-				? { ...kimiProviderBadges, ...opencodeProviderBadges }
-				: undefined,
-		[opencodeProviderBadges, kimiProviderBadges],
 	);
 
 	// Quota-details popover open state + its delayed-close timer. Kept internal to
@@ -771,6 +759,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																onShowPrice={setPriceModel}
 																providerLabels={model.providerLabels}
 																providerBadges={providerQuotaBadges}
+																providerBalances={providerBalances}
 																onEditDefaultModel={model.onEditDefaultModel}
 																onEditSummaryModel={model.onEditSummaryModel}
 																onSetAsDefaultModel={model.onSetAsDefaultModel}
@@ -1048,6 +1037,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															onShowPrice={setPriceModel}
 															providerLabels={model.providerLabels}
 															providerBadges={providerQuotaBadges}
+															providerBalances={providerBalances}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
 															onSetAsDefaultModel={model.onSetAsDefaultModel}

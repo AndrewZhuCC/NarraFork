@@ -11,6 +11,9 @@ import { buildAppErrorResponse } from "../../lib/app-error-response";
 import { generateId } from "../../lib/id";
 import { getDefaults, narraforkDir, saveSettings, settings } from "../../lib/settings";
 import type { NarraForkSettings } from "../../lib/settings/types";
+import { invalidateUserCache } from "../../middleware/auth";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { resetTraitLayerCaches } from "../../services/trait-layer-service";
 import { narratorRoutes } from "../narrators";
 import { settingsRoutes } from "../settings";
@@ -18,15 +21,43 @@ import { traitLayerRoutes } from "../trait-layers";
 
 // HOME, settings and DB are isolated by tests/preload.ts before these imports.
 const ADMIN = "subagent-policy-test-admin";
+// A distinct sub for the non-admin case so the live-role seam resolves it to "user"
+// (→ 403) without colliding with the admin `ADMIN` id (or its verified-user cache).
+const NON_ADMIN = "subagent-policy-test-user";
 const createdNarrators: string[] = [];
 const createdProjects: string[] = [];
 const createdPrefs: string[] = [];
 let original: NarraForkSettings;
 
+/**
+ * The settings/trait admin guards run `assertAdmin`, which authorizes against the LIVE role
+ * read through the session store, never the token's `role` claim. The middleware below only
+ * sets `c.get("user")`, so this seam resolves the acting principal's role by actor id;
+ * without it an admin would surface as 401 USER_GONE and a non-admin never reach 403.
+ */
+function installSessionStoreSeam(): void {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === ADMIN ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+	invalidateUserCache(ADMIN);
+	invalidateUserCache(NON_ADMIN);
+}
+
 function appAs(role: "admin" | "user" = "admin") {
 	const app = new Hono();
 	app.use("*", async (c, next) => {
-		c.set("user", { sub: ADMIN, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("user", {
+			sub: role === "admin" ? ADMIN : NON_ADMIN,
+			role,
+			iat: 0,
+			exp: Number.MAX_SAFE_INTEGER,
+		});
 		await next();
 	});
 	app.onError(
@@ -51,11 +82,15 @@ function readDisk() {
 }
 
 beforeEach(() => {
+	installSessionStoreSeam();
 	original = structuredClone(settings);
 	resetTraitLayerCaches();
 });
 
 afterEach(async () => {
+	setAuthStores(undefined);
+	invalidateUserCache(ADMIN);
+	invalidateUserCache(NON_ADMIN);
 	saveSettings(original);
 	resetTraitLayerCaches();
 	if (createdNarrators.length) {

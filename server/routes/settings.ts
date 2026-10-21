@@ -50,6 +50,7 @@ import {
 	syncOpencodeUsageCache,
 } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import { getHome } from "../lib/platform";
 import {
 	discoverPendingProviderBalances,
 	getProviderBalanceGenerations,
@@ -109,6 +110,7 @@ import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
 import { listPluginProviderModelGroups } from "../services/plugin-provider-model-source";
 import { pluginProviderRegistry } from "../services/plugin-provider-registry";
+import { getProjectDirStatus } from "../services/project-dir";
 import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
@@ -357,7 +359,8 @@ export const updateSettingsSchema = z
 		diskSafety: diskSafetySettingsSchema.optional(),
 		paths: z
 			.object({
-				defaultProjectDir: z.string().min(1),
+				// "" = unset; a non-empty value must name an existing directory (checked on save).
+				defaultProjectDir: z.string().trim(),
 				/**
 				 * Extra roots the in-browser editor may write to.
 				 *
@@ -1545,6 +1548,21 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// Preserve real VNet relay token when the client sends a masked display value.
 		if (validated.vnet?.relayToken?.startsWith("*")) {
 			validated.vnet.relayToken = current.vnet?.relayToken;
+		}
+
+		// A newly chosen default project directory must already exist: nothing creates it,
+		// and a missing default leaves every new session without a working directory.
+		// Re-saving an unchanged value is allowed even if it has since disappeared, so an
+		// unrelated settings save never fails on it.
+		const nextProjectDir = validated.paths?.defaultProjectDir;
+		if (nextProjectDir && nextProjectDir !== current.paths.defaultProjectDir) {
+			const status = getProjectDirStatus(nextProjectDir, getHome());
+			if (status.state !== "valid") {
+				throw new ValidationError(
+					`Default project directory is not an existing directory: ${status.path ?? nextProjectDir}`,
+					"PROJECT_DIR_NOT_FOUND",
+				);
+			}
 		}
 
 		// Validate TLS cert/key files exist when enabling TLS

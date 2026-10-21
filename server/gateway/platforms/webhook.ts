@@ -60,6 +60,9 @@ export class WebhookAdapter extends BaseAdapter {
 	 */
 	verifySignature(body: string, signature: string | null): boolean {
 		if (!signature) return false;
+		// Fail closed: without a configured secret there is nothing to verify
+		// against, and an empty HMAC key would authenticate every attacker.
+		if (!this.config.secret) return false;
 
 		const expected = createHmac("sha256", this.config.secret).update(body).digest("hex");
 

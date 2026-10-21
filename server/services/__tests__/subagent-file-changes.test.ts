@@ -20,6 +20,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	chapters,
 	fileAttributions,
 	fileChangeEffects,
 	fileChangeExecutionSegments,
@@ -29,6 +30,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	projects,
 } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
@@ -1048,6 +1050,44 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		const byId = await getFileChangesBySubagent(["sub-a"]);
 
 		expect(byId.get("sub-a")?.files[0]?.outsideParentWorkspace).toBeNull();
+	});
+
+	test("resolves a chapter-bound parent's workspace from its worktree", async () => {
+		// Chapter narrators usually have no cwd of their own; the session works in the
+		// chapter worktree, so the card must classify against it rather than say unknown.
+		cleanDb(sqlite);
+		const now = new Date().toISOString();
+		await db.insert(projects).values({
+			id: "project-1",
+			name: "p",
+			gitPath: OTHER_WORKSPACE,
+			createdAt: now,
+			updatedAt: now,
+		});
+		await db.insert(chapters).values({
+			id: "chapter-1",
+			projectId: "project-1",
+			title: "c",
+			branch: "chapter/c",
+			baseBranch: "main",
+			worktreePath: WORKSPACE,
+			createdAt: now,
+			updatedAt: now,
+		});
+		await makeNarrator(PARENT, null, undefined, { chapterId: "chapter-1" });
+		await makeNarrator("sub-a", PARENT);
+		await attribute({ narratorId: "sub-a", filePath: "in.ts", linesAdded: 1 });
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "out.ts",
+			linesAdded: 1,
+			workspacePath: "/third",
+		});
+
+		const files = (await getFileChangesBySubagent(["sub-a"])).get("sub-a")?.files ?? [];
+
+		expect(files.find((f) => f.filePath === "in.ts")?.outsideParentWorkspace).toBe(false);
+		expect(files.find((f) => f.filePath === "out.ts")?.outsideParentWorkspace).toBe(true);
 	});
 });
 

@@ -156,12 +156,10 @@ export class TelegramAdapter extends BaseAdapter {
 		const userId = String(msg.from?.id ?? "");
 		const username = msg.from?.username ?? msg.from?.first_name ?? "unknown";
 
-		// Check allowlist
-		if (this.config.allowedUsers?.length) {
-			if (!this.config.allowedUsers.includes(userId)) {
-				logger.debug(`[telegram] Ignoring message from unauthorized user ${userId}`);
-				return;
-			}
+		// Check allowlist — fail closed: an empty/unset allowlist denies all users.
+		if (!this.config.allowedUsers?.length || !this.config.allowedUsers.includes(userId)) {
+			logger.debug(`[telegram] Ignoring message from unauthorized user ${userId}`);
+			return;
 		}
 
 		// Extract images from photo messages

@@ -1,8 +1,10 @@
 import { Menu, NativeSelect, Tooltip } from "@mantine/core";
+import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useInputMenu } from "../../../hooks/useInputMenu";
 import { useAllModels } from "../../../hooks/useModels";
+import { api } from "../../../lib/api";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
@@ -12,6 +14,7 @@ import {
 import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
 import { MODEL_MENU_POSITIONING } from "./model-menu-selection";
+import { useModelMenuProviderBadges } from "./use-model-menu-provider-badges";
 import { useModelMenuRefreshProps } from "./use-model-menu-refresh-props";
 
 /**
@@ -42,6 +45,13 @@ export function ModelPickerMenu({
 		nugProviderIdByPrefix,
 	} = useAllModels();
 	const refreshProps = useModelMenuRefreshProps(nugProviderIdByPrefix);
+	// Same cache entry as useAllModels; feeds the provider allowance/balance badges.
+	const { data: settingsData } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		staleTime: 30_000,
+	});
+	const { providerBadges, providerBalances } = useModelMenuProviderBadges(settingsData, opened);
 
 	const agg = parseAggModelValue(value);
 	// A pinned aggregation member displays as its aggregation, as in the status bar.
@@ -97,6 +107,8 @@ export function ModelPickerMenu({
 							onSelect={onChange}
 							onShowPrice={setPriceModel}
 							providerLabels={providerLabels}
+							providerBadges={providerBadges}
+							providerBalances={providerBalances}
 							defaultModelValue={defaultModelValue}
 							summaryModelValue={summaryModelValue}
 							{...refreshProps}

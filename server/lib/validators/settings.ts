@@ -46,8 +46,8 @@ const gatewayPlatformConfigSchema = z.object({
 	// Feishu / QQ Bot
 	appId: z.string().max(200).optional(),
 	appSecret: z.string().max(500).optional(),
-	// Webhook
-	secret: z.string().max(500).optional(),
+	// Webhook — must be non-empty when present (empty secret = unauthenticated HMAC).
+	secret: z.string().min(1).max(500).optional(),
 	// Weixin
 	accountId: z.string().max(200).optional(),
 	baseUrl: z.string().max(500).optional(),

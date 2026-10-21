@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
-import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
+import {
+	fileChangeExecutionSegments,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../../db/schema";
+import type { ToolCallBinding } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
 import { parseSubstatus } from "../../lib/narrator-utils";
 import { settings } from "../../lib/settings";
@@ -17,6 +24,7 @@ import * as passExecutor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
 import { drainPendingInjections, takePendingInjectionBatch } from "../parent-injection-queue";
 import { clearAliasRegistry } from "../subagent-alias";
+import { readSubagentExecutionBoundary } from "../subagent-execution-boundary";
 import { runSubagent } from "../subagent-runner";
 
 const isTakenOver = (id: string) => !!getRunHold(id);
@@ -112,6 +120,10 @@ afterEach(async () => {
 		clearAliasRegistry(id);
 	}
 	if (ids.length) {
+		await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.narratorId, ids));
+		await db
+			.delete(fileChangeExecutionSegments)
+			.where(inArray(fileChangeExecutionSegments.narratorId, ids));
 		await db.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.narratorId, ids));
 		await db.delete(narratorMessages).where(inArray(narratorMessages.narratorId, ids));
 		// Child first: parentNarratorId is a real FK.
@@ -120,7 +132,51 @@ afterEach(async () => {
 	ids.length = 0;
 });
 
-async function launch(takeoverByUser: boolean, outcome: "success" | "error" | "throw") {
+/** A durable v1 receipt for the parent's Agent call, as the live tool executor records it. */
+async function insertParentAgentCall(toolUseId: string) {
+	const now = new Date().toISOString();
+	const callId = generateId();
+	const segmentId = generateId();
+	const messageId = generateId();
+	await db.insert(fileChangeExecutionSegments).values({
+		id: segmentId,
+		narratorId: parentId,
+		sourceToolCallId: callId,
+		sourceExecutionAttempt: 1,
+		createdAt: now,
+	});
+	await db.insert(narratorMessages).values({
+		id: messageId,
+		narratorId: parentId,
+		role: "assistant",
+		contentJson: [],
+		createdAt: now,
+	});
+	await db
+		.insert(narratorMessageRefs)
+		.values({ id: generateId(), narratorId: parentId, messageId, seq: 1 });
+	await db.insert(narratorToolCalls).values({
+		id: callId,
+		messageId,
+		narratorId: parentId,
+		toolUseId,
+		toolName: "Agent",
+		inputJson: {},
+		status: "running",
+		executionStartedAt: now,
+		executionAttempt: 1,
+		executionIdentityVersion: 1,
+		executionSegmentId: segmentId,
+		createdAt: now,
+	});
+	return { toolCallId: callId, attempt: 1, executionSegmentId: segmentId };
+}
+
+async function launch(
+	takeoverByUser: boolean,
+	outcome: "success" | "error" | "throw",
+	parentCall?: { toolUseId: string; toolCallBinding: ToolCallBinding },
+) {
 	let settle: (() => void) | undefined;
 	const held = new Promise<void>((resolve) => {
 		settle = resolve;
@@ -154,7 +210,8 @@ async function launch(takeoverByUser: boolean, outcome: "success" | "error" | "t
 	const output = await Promise.race([
 		runSubagent({
 			parentNarratorId: parentId,
-			toolUseId: generateId(),
+			toolUseId: parentCall?.toolUseId ?? generateId(),
+			...(parentCall ? { toolCallBinding: parentCall.toolCallBinding } : {}),
 			subagentType: "general",
 			prompt: "Initial prompt must execute without waiting for user input",
 			cwd: process.env.HOME as string,
@@ -281,5 +338,20 @@ describe("Agent creation in user takeover mode", () => {
 			outbox.some((row) => row.eventKind === "completed" && row.recipientId === parentId) ||
 				delivered.some((row) => JSON.stringify(row).includes(childId)),
 		).toBe(true);
+	});
+
+	test("background creation records the parent Agent call as the run's exact receipt", async () => {
+		const toolUseId = generateId();
+		const toolCallBinding = await insertParentAgentCall(toolUseId);
+		const { childId } = await launch(false, "success", { toolUseId, toolCallBinding });
+		// Without it, the card's file changes fall back to legacy/unscoped attribution.
+		expect(await readSubagentExecutionBoundary(childId)).toEqual({
+			sourceToolCallId: toolCallBinding.toolCallId,
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			executionSegmentId: toolCallBinding.executionSegmentId,
+		});
+		releaseExecution?.();
+		await until(() => runEnded(childId));
 	});
 });

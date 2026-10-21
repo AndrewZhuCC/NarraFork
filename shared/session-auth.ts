@@ -101,11 +101,19 @@ export const SESSION_VERSION_CLAIM = "sv";
  * agree: existing sessions survive the deploy and only stop working once that user's
  * counter is actually bumped. A non-numeric claim is treated as stale rather than
  * current — a malformed credential must fail closed.
+ *
+ * The comparison is strict equality, not `>=`: only the exact current generation is
+ * accepted. Accepting any claim at or above the stored value would let a forged token
+ * carrying an inflated version sail past revocation, so a claim ahead of the live
+ * counter is rejected just like one left behind. A legitimately renewed token stays
+ * valid because renewal always re-signs against the live `token_version`, and every
+ * path that bumps the counter invalidates the cache the live value is read through —
+ * so the stored value a renewed token is checked against is never behind the token.
  */
 export function isSessionTokenVersionCurrent(claim: unknown, current: number): boolean {
 	const presented = claim === undefined ? 0 : claim;
 	if (typeof presented !== "number" || !Number.isFinite(presented)) return false;
-	return presented >= current;
+	return presented === current;
 }
 
 /** Whether a token with this `exp` (unix seconds) should be re-issued now. */

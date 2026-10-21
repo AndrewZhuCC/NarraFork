@@ -1,6 +1,7 @@
 import { isOpencodeGoBaseUrl, parseOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
+import { createPersistedCredentialCache } from "./persisted-credential-cache";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 /**
@@ -34,11 +35,13 @@ import { type CustomApiProviderConfig, settings } from "./settings";
  * change (in both indicators), not a data-layer one.
  *
  * Cache layout follows the DeepSeek balance cache rather than the Kimi one:
- * entries are MEMORY-ONLY and keyed by a credential identity, because a
- * percentage of a plan belongs to one account. Persisting it would let a
- * restart resurrect an allowance under a different key, and `generation` is what
- * stops a late response from an account the user has since replaced from
- * publishing into the current one.
+ * entries are keyed by a credential identity, because a percentage of a plan
+ * belongs to one account. They are persisted across restarts, but a persisted
+ * entry is only restored when the live identity matches the one it was saved
+ * under (see persisted-credential-cache.ts), so a restart never resurrects an
+ * allowance under a different key. `generation` is what stops a late response
+ * from an account the user has since replaced from publishing into the current
+ * one.
  */
 
 export interface OpencodeUsageWindow {
@@ -103,9 +106,36 @@ interface Entry {
 	/** Pending post-request refresh, if one is scheduled. */
 	activityTimer?: ReturnType<typeof setTimeout>;
 }
-// Deliberately memory-only: a plan allowance describes one credential identity
-// and must not survive a restart or be restored under a different account.
 const entries = new Map<string, Entry>();
+
+type PersistedUsage = Omit<OpencodeUsageCache, "generation">;
+
+function parsePersistedUsage(raw: unknown): PersistedUsage | null {
+	if (!raw || typeof raw !== "object") return null;
+	const value = raw as Record<string, unknown>;
+	if (typeof value.fetchedAt !== "number" || !Number.isFinite(value.fetchedAt)) return null;
+	const windows = {
+		rolling: normalizeWindow(value.rolling),
+		weekly: normalizeWindow(value.weekly),
+		monthly: normalizeWindow(value.monthly),
+	};
+	const balance = normalizeAmount(value.balance);
+	return {
+		...windows,
+		...(balance != null ? { balance } : {}),
+		fetchedAt: value.fetchedAt,
+		error: typeof value.error === "string" ? "OpenCode usage request failed" : null,
+	};
+}
+
+// Persisted across restarts, restored only under the same credential identity.
+const persisted = createPersistedCredentialCache("opencode-usages.json", parsePersistedUsage);
+
+function persistEntry(id: string, entry: Entry): void {
+	if (entry.cache.fetchedAt === 0) return;
+	const { generation: _generation, ...rest } = entry.cache;
+	persisted.save(id, entry.identity, rest);
+}
 
 /**
  * Whether a provider points at an OpenCode Go plan root — `/zen/go/v1`,
@@ -172,12 +202,15 @@ export function syncOpencodeUsageCache(): void {
 			entries.delete(id);
 			entry.controller?.abort();
 			clearTimeout(entry.activityTimer);
+			if (!config) persisted.remove(id);
 		}
 	}
 	for (const [id, config] of providers) {
 		if (!entries.has(id)) {
+			const key = identity(config);
+			const restored = persisted.restore(id, key);
 			entries.set(id, {
-				identity: identity(config),
+				identity: key,
 				cache: {
 					generation: crypto.randomUUID(),
 					rolling: null,
@@ -185,6 +218,7 @@ export function syncOpencodeUsageCache(): void {
 					monthly: null,
 					fetchedAt: 0,
 					error: null,
+					...restored,
 				},
 				failures: 0,
 			});
@@ -376,6 +410,7 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 				error: null,
 			};
 			entry.failures = 0;
+			persistEntry(providerId, entry);
 		} catch {
 			syncOpencodeUsageCache();
 			if (entries.get(providerId) !== entry) return null;
@@ -387,6 +422,7 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 				error: "OpenCode usage request failed",
 			};
 			entry.failures += 1;
+			persistEntry(providerId, entry);
 		} finally {
 			clearTimeout(timer);
 			entry.inFlight = undefined;

@@ -1,5 +1,6 @@
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
+import { createPersistedCredentialCache } from "./persisted-credential-cache";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 export interface DeepSeekBalanceCache {
@@ -27,9 +28,47 @@ interface Entry {
 	controller?: AbortController;
 }
 
-// Deliberately memory-only: account balances and credential identities must not
-// survive a restart or accidentally be restored under a different account.
 const entries = new Map<string, Entry>();
+
+type PersistedBalance = Pick<
+	DeepSeekBalanceCache,
+	"isAvailable" | "balanceInfos" | "fetchedAt" | "error"
+>;
+
+function parsePersistedBalance(raw: unknown): PersistedBalance | null {
+	if (!raw || typeof raw !== "object") return null;
+	const value = raw as Record<string, unknown>;
+	if (typeof value.fetchedAt !== "number" || !Number.isFinite(value.fetchedAt)) return null;
+	const parsed = parseDeepSeekBalanceResponse({
+		is_available: value.isAvailable,
+		balance_infos: Array.isArray(value.balanceInfos)
+			? value.balanceInfos.map((info) => {
+					const row = (info ?? {}) as Record<string, unknown>;
+					return {
+						currency: row.currency,
+						total_balance: row.totalBalance,
+						granted_balance: row.grantedBalance,
+						topped_up_balance: row.toppedUpBalance,
+					};
+				})
+			: value.balanceInfos,
+	});
+	return {
+		...parsed,
+		fetchedAt: value.fetchedAt,
+		error: typeof value.error === "string" ? "DeepSeek balance request failed" : null,
+	};
+}
+
+// Persisted across restarts, but only restored under the same credential identity
+// (see persisted-credential-cache.ts); the identity itself is never written.
+const persisted = createPersistedCredentialCache("deepseek-balances.json", parsePersistedBalance);
+
+function persistEntry(id: string, entry: Entry): void {
+	if (entry.cache.fetchedAt === 0 || entry.cache.isAvailable === null) return;
+	const { isAvailable, balanceInfos, fetchedAt, error } = entry.cache;
+	persisted.save(id, entry.identity, { isAvailable, balanceInfos, fetchedAt, error });
+}
 
 export function isDeepSeekCustomApiProvider(config: {
 	baseUrl?: string;
@@ -77,18 +116,21 @@ export function syncDeepSeekBalanceCache(): void {
 		if (!config || identity(config) !== entry.identity) {
 			entries.delete(id);
 			entry.controller?.abort();
+			if (!config) persisted.remove(id);
 		}
 	}
 	for (const [id, config] of providers) {
 		if (!entries.has(id)) {
+			const key = identity(config);
+			const restored = persisted.restore(id, key);
 			entries.set(id, {
-				identity: identity(config),
+				identity: key,
 				cache: {
 					generation: crypto.randomUUID(),
-					isAvailable: null,
-					balanceInfos: [],
-					fetchedAt: 0,
-					error: null,
+					isAvailable: restored?.isAvailable ?? null,
+					balanceInfos: restored?.balanceInfos ?? [],
+					fetchedAt: restored?.fetchedAt ?? 0,
+					error: restored?.error ?? null,
 				},
 			});
 		}
@@ -205,6 +247,7 @@ export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBala
 				fetchedAt: Date.now(),
 				error: null,
 			};
+			persistEntry(providerId, entry);
 		} catch {
 			syncDeepSeekBalanceCache();
 			if (entries.get(providerId) !== entry) return null;
@@ -214,6 +257,7 @@ export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBala
 				fetchedAt: Date.now(),
 				error: "DeepSeek balance request failed",
 			};
+			persistEntry(providerId, entry);
 		} finally {
 			clearTimeout(timer);
 			entry.inFlight = undefined;

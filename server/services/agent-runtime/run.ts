@@ -430,7 +430,11 @@ async function executeRun(
 		}
 		if (deliverTo && publicationRun) {
 			const { establishSubagentExecutionSegment } = await import("../subagent-execution-boundary");
-			const exact = req.binding?.deliverTo;
+			// A background task's first start adopts the run its Agent call registered
+			// (same logical run), so that registration is this run's own receipt. A fresh
+			// continuation never inherits it; recovery reuses the persisted segment.
+			const exact =
+				req.binding?.deliverTo ?? (req.resumeRunId && !req.recovered ? deliverTo : undefined);
 			const segment = await establishSubagentExecutionSegment({
 				childNarratorId: id,
 				parentNarratorId: deliverTo.narratorId,

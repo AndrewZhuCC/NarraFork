@@ -71,7 +71,19 @@ mock.module("../lib/auth", () => ({
 	isAuthenticSessionTokenIgnoringExpiry: async () => false,
 }));
 mock.module("../lib/oauth-provider", () => ({ validateAccessToken: () => null }));
-mock.module("../services/auth/store", () => ({ authSessionStore: {} }));
+// `assertAdmin` authorizes against the LIVE role read through the session store, never the
+// token's `role` claim, so the store must resolve each acting principal to a role. Admin
+// actors ("test-owner", "other-admin") → admin; the ordinary-session actor → user (→ 403,
+// not the 401 USER_GONE an absent `findSessionState` or an unseeded user would raise).
+mock.module("../services/auth/store", () => ({
+	authSessionStore: {
+		findSessionState: async (id: string) => ({
+			id,
+			role: id === "ordinary-user" ? ("user" as const) : ("admin" as const),
+			tokenVersion: 0,
+		}),
+	},
+}));
 const { tokendanceRoutes } = await import("./tokendance");
 const user = { sub: "test-owner", role: "admin" as const, iat: 0, exp: 0 };
 function app(principal?: AuthPrincipal) {
@@ -225,7 +237,12 @@ describe("TokenDance first-party admin boundary", () => {
 		}
 	});
 	test("every management endpoint rejects an ordinary session user", async () => {
-		const instance = app({ type: "session", user: { ...user, role: "user" } });
+		// A distinct sub so the live-role seam resolves this actor to "user" (→ 403) without
+		// colliding with the admin "test-owner" the other cases rely on.
+		const instance = app({
+			type: "session",
+			user: { ...user, sub: "ordinary-user", role: "user" },
+		});
 		for (const [method, path] of endpoints) {
 			const response = await instance.request(`/api/tokendance${path}`, { method });
 			expect(response.status).toBe(403);
