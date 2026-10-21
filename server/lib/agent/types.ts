@@ -913,7 +913,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 
 // Single source of truth for the reasoning-effort tier union (shared with the
 // frontend). Re-exported here so existing importers keep their import path.
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 
 export type { ReasoningEffort };
 
@@ -1327,18 +1327,6 @@ export interface AgentConfig {
 /** Whether a model name refers to a DeepSeek model. */
 export function isDeepSeekModel(model: string): boolean {
 	return model.toLowerCase().includes("deepseek");
-}
-
-/**
- * Map reasoning effort to DeepSeek effort value.
- * DeepSeek's reasoning_effort param only accepts "high" and "max". Uses the
- * shared clamp (就近、并列偏高): low/medium → high, xhigh/max → max.
- */
-export function mapDeepSeekEffort(reasoningEffort: string | undefined): "high" | "max" | undefined {
-	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	return clampReasoningEffort(reasoningEffort as ReasoningEffort, ["high", "max"]) as
-		| "high"
-		| "max";
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

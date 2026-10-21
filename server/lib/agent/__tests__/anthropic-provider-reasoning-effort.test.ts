@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { RawMetadata } from "@shared/model-catalog/card";
 import bundledCatalog from "@shared/model-catalog/dist/catalog.json";
 import { bindModelCatalogSettings, getEffectiveModelCard } from "../../model-catalog";
@@ -141,6 +141,81 @@ const OPUS_45_BUDGET_REASONING: RawMetadata = {
 };
 
 const REQUEST_PATHS: RequestPath[] = ["chat", "generate", "history"];
+
+describe("DeepSeek card reasoning reaches all Anthropic-compatible request paths", () => {
+	beforeEach(() => {
+		bindModelCatalogSettings(
+			{
+				anthropicProviders: [config()],
+				agent: {
+					modelCatalog: {
+						schemaVersion: 2,
+						migrationVersion: 2,
+						local: { revision: 0 },
+						autoApply: false,
+						pinnedVersion: null,
+					},
+				},
+			} as NarraForkSettings,
+			() => {},
+		);
+	});
+	for (const path of REQUEST_PATHS) {
+		test.each([
+			["none", "none"],
+			["low", "low"],
+			["medium", "high"],
+			["high", "high"],
+			["xhigh", "high"],
+			["max", "max"],
+		] as const)(`${path}: %s resolves to %s`, async (effort, expected) => {
+			const body = await capturePath(
+				new AnthropicProvider(config({ defaultModel: "deepseek-v4-pro" })),
+				path,
+				"relay:deepseek-v4-pro",
+				effort,
+			);
+			if (effort === "none") {
+				expect(body.thinking).toEqual({ type: "disabled" });
+				expect(body.output_config).toBeUndefined();
+			} else {
+				expect(body.output_config).toEqual({ effort: expected });
+			}
+		});
+	}
+
+	test.each(
+		REQUEST_PATHS,
+	)("%s honors local tiers without preset historical migration", async (path) => {
+		installClaudeReasoningMetadata("deepseek-v4-pro", {
+			supports_reasoning: true,
+			reasoning_effort_levels: ["low", "high", "max"],
+		});
+		const body = await capturePath(
+			new AnthropicProvider(config()),
+			path,
+			"relay:anthropic:deepseek-v4-pro",
+			"xhigh",
+		);
+		expect(body.output_config).toEqual({ effort: "max" });
+	});
+
+	test.each(
+		REQUEST_PATHS,
+	)("%s honors local tiers instead of the old vendor mapper", async (path) => {
+		installClaudeReasoningMetadata("deepseek-v4-pro", {
+			supports_reasoning: true,
+			reasoning_effort_levels: ["low", "medium", "high", "xhigh", "max"],
+		});
+		const body = await capturePath(
+			new AnthropicProvider(config()),
+			path,
+			"relay:anthropic:deepseek-v4-pro",
+			"xhigh",
+		);
+		expect(body.output_config).toEqual({ effort: "xhigh" });
+	});
+});
 
 // Legacy Opus uses catalog-declared budget thinking, not a guessed adaptive mode.
 // Effort is still valid independently of the thinking configuration.

@@ -62,13 +62,7 @@ import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { flattenTopLevelUnion } from "./tool-schema-compat";
-import {
-	type AgentToolUse,
-	ApiError,
-	isDeepSeekModel,
-	mapDeepSeekEffort,
-	type ResolvedToolDefinition,
-} from "./types";
+import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
 
 // === Claude Code protocol constants ===
@@ -614,7 +608,7 @@ function buildThinkingConfig(
 	const metadata = effectiveModelProfile(model);
 	if (metadata.reasoning?.supported === false) return undefined;
 	if (metadata.reasoning?.supported !== true && !supportsThinking(model)) return undefined;
-	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort, model);
 
 	// "none" explicitly disables thinking
 	if (reasoningEffort === "none") {
@@ -672,7 +666,7 @@ export function mapEffortParam(
 	// Explicit exclusions take precedence over catalog capability and tier metadata.
 	if (!supportsEffort(parseModelId(model).model)) return undefined;
 	const metadata = effectiveModelProfile(model);
-	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort, model);
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
 	if (metadata.reasoning?.levels?.length)
 		return reasoningEffort as "low" | "medium" | "high" | "xhigh" | "max";
@@ -1556,7 +1550,6 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const isOfficial = !!this.config.officialApi;
 		const model = parseModelId(params.model).model;
-		const isDeepSeek = isDeepSeekModel(model);
 		// Strict models (Claude families, gpt/o-series) mint server-bound reasoning
 		// credentials; an uncredentialed thinking block must be dropped for them.
 		// Every relay model keeps its plain-text reasoning instead — with an empty
@@ -1790,17 +1783,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (supportsEffort(model)) {
 			const effort = mapEffortParam(params.model, params.reasoningEffort);
 			if (effort) body.output_config = { effort };
-		}
-
-		// DeepSeek effort: output_config.effort controls thinking intensity
-		// (DeepSeek supports "high" and "max"; low/medium map to high)
-		if (isDeepSeek && thinkingEnabled && supportsEffort(model)) {
-			const effort = mapDeepSeekEffort(
-				resolveMetadataReasoning(effectiveModelProfile(params.model), params.reasoningEffort),
-			);
-			if (effort) {
-				body.output_config = { effort };
-			}
 		}
 
 		body.system = systemBlocks;
@@ -2138,7 +2120,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			const effort = mapEffortParam(model, reasoningEffort);
 			if (effort) {
 				body.output_config = {
-					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
+					effort,
 				};
 			}
 		}
@@ -2235,7 +2217,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			const effort = mapEffortParam(model, reasoningEffort);
 			if (effort) {
 				body.output_config = {
-					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
+					effort,
 				};
 			}
 		}

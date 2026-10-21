@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	bindModelCatalogSettings,
 	getEffectiveModelProfile,
@@ -152,8 +152,7 @@ describe("OpenAIProvider completions-compatible reasoning effort", () => {
 			chatParams({ model: "p1:deepseek-v4-pro", reasoningEffort: "low" }),
 		);
 		expect(body.thinking).toEqual({ type: "enabled" });
-		// DeepSeek accepts only high/max, so low clamps up to high.
-		expect(body.reasoning_effort).toBe("high");
+		expect(body.reasoning_effort).toBe("low");
 	});
 
 	test("DeepSeek none disables thinking outright", async () => {
@@ -175,6 +174,71 @@ describe("OpenAIProvider completions-compatible reasoning effort", () => {
 		const body = await sendAndCaptureBody(provider, chatParams());
 		expect(body.reasoning_effort).toBeUndefined();
 		expect(body.thinking).toBeUndefined();
+	});
+});
+
+describe("DeepSeek metadata reaches every OpenAI request path", () => {
+	beforeEach(() => {
+		bindModelCatalogSettings(
+			{
+				openaiProviders: [config({})],
+				agent: {
+					modelCatalog: {
+						schemaVersion: 2,
+						migrationVersion: 2,
+						local: { revision: 0 },
+						autoApply: false,
+						pinnedVersion: null,
+					},
+				},
+			} as NarraForkSettings,
+			() => {},
+		);
+	});
+	for (const apiMode of ["completions", "responses"] as const) {
+		for (const path of ["chat", "generate", "history"] as const) {
+			test.each([
+				["none", "none"],
+				["low", "low"],
+				["medium", "high"],
+				["high", "high"],
+				["xhigh", "high"],
+				["max", "max"],
+			] as const)(`${apiMode} ${path}: %s resolves to %s`, async (effort, expected) => {
+				const model = "p1:deepseek-v4-pro";
+				const provider = new OpenAIProvider(config({ apiMode, defaultModel: "deepseek-v4-pro" }));
+				mockFetchCapturingBody();
+				let body: Record<string, unknown>;
+				if (path === "chat") {
+					body = await sendAndCaptureBody(provider, chatParams({ model, reasoningEffort: effort }));
+				} else {
+					const request =
+						path === "generate"
+							? provider.generateWithMeta("hi", model, undefined, { reasoningEffort: effort })
+							: provider.generateWithHistoryWithMeta("sys", "hi", model, undefined, {
+									reasoningEffort: effort,
+								});
+					await expect(request).rejects.toThrow();
+					expect(capturedBody).not.toBeNull();
+					body = capturedBody as Record<string, unknown>;
+				}
+				if (apiMode === "responses") {
+					expect(body.reasoning).toEqual({ effort: expected, summary: "auto" });
+				} else {
+					expect(body.thinking).toEqual({ type: effort === "none" ? "disabled" : "enabled" });
+					expect(body.reasoning_effort).toBe(effort === "none" ? undefined : expected);
+				}
+			});
+		}
+	}
+
+	test("unknown DeepSeek-like models preserve an undeclared effort", async () => {
+		mockFetchCapturingBody();
+		const body = await sendAndCaptureBody(
+			new OpenAIProvider(config({ apiMode: "completions" })),
+			chatParams({ model: "p1:deepseek-future-unknown", reasoningEffort: "xhigh" }),
+		);
+		expect(body.reasoning_effort).toBe("xhigh");
 	});
 });
 
