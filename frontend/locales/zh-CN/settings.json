@@ -1,5 +1,26 @@
 {
 	"title": "设置",
+	"providerBalance": {
+		"wallet": "钱包余额",
+		"key": "Key 剩余额度",
+		"subscription": "订阅额度",
+		"unlimited": "无限额度",
+		"unknown": "未知",
+		"quotaUnit": "额度单位",
+		"tokens": "Token",
+		"pending": "余额待探测",
+		"probing": "正在探测余额支持",
+		"supported": "支持余额查询",
+		"unsupported": "不支持余额探测",
+		"error": "余额探测失败",
+		"failed": "余额请求失败",
+		"stale": "数据可能已过期",
+		"source": "来源：{{source}}",
+		"used": "已用：{{amount}}",
+		"total": "总量：{{amount}}",
+		"probe": "重新探测余额",
+		"saveFirst": "请先保存修改再探测余额。当前数值属于已保存的配置。"
+	},
 	"tokendance": {
 		"balance": "余额",
 		"credits": "累计充值",

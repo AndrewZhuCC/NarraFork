@@ -55,6 +55,11 @@ import {
 	syncOpencodeUsageCache,
 } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import {
+	discoverPendingProviderBalances,
+	getProviderBalanceGenerations,
+	syncProviderBalanceCache,
+} from "../lib/provider-balance-cache";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
@@ -951,6 +956,7 @@ async function buildSettingsResponse(
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
 		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
+		providerBalanceGenerations: getProviderBalanceGenerations(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1762,8 +1768,10 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		}
 		// Invalidate account/transport identities immediately after a successful save.
 		syncDeepSeekBalanceCache();
+		syncProviderBalanceCache();
 		if (validated.customApiProviders || validated.proxy) {
 			void refreshAllDeepSeekBalances().catch(() => {});
+			discoverPendingProviderBalances();
 		}
 		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
@@ -2001,6 +2009,8 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 		geminiProviders: customApiProvidersToGemini(nextCustomApiProviders),
 	};
 	saveSettings(merged);
+	syncProviderBalanceCache();
+	discoverPendingProviderBalances();
 
 	logger.info("Provider base URL fixed with /v1 suffix", {
 		providerId: target.id,

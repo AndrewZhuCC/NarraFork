@@ -30,6 +30,7 @@ import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
+import { ProviderBalanceStatus } from "./ProviderBalanceStatus";
 import type { CustomApiProtocol, CustomApiProviderState, OpenAIProviderState } from "./types";
 import { defaultUserAgentModeForProtocol } from "./types";
 
@@ -462,6 +463,11 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					value={provider.baseUrl}
 					size="xs"
 					onChange={(e) => handleBaseUrlChange(e.currentTarget.value)}
+				/>
+
+				<ProviderBalanceStatus
+					providerId={provider.id}
+					dirty={isProviderDirty?.(provider.id) ?? false}
 				/>
 
 				<ProxyOverrideField

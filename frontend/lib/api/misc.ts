@@ -3,6 +3,7 @@ import type {
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
+import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
@@ -699,6 +700,21 @@ export const miscApi = {
 				{ status: "disabled" | "offline" | "connecting" | "online"; egressMode: string }
 			>
 		>("/nug/relay-status"),
+
+	providerGetBalances: (options?: { providerId?: string; signal?: AbortSignal }) =>
+		request<Record<string, ProviderBalanceSnapshot>>(
+			`/provider-balances${options?.providerId ? `?providerId=${encodeURIComponent(options.providerId)}` : ""}`,
+			pickRequestOptions(options),
+		),
+	providerProbeBalance: (providerId: string) =>
+		request<ProviderBalanceSnapshot>(`/provider-balances/${encodeURIComponent(providerId)}/probe`, {
+			method: "POST",
+		}),
+	providerRefreshBalance: (providerId: string) =>
+		request<ProviderBalanceSnapshot>(
+			`/provider-balances/${encodeURIComponent(providerId)}/refresh`,
+			{ method: "POST" },
+		),
 
 	deepseekGetBalances: (options?: object) =>
 		request<Record<string, DeepSeekBalanceCache>>(

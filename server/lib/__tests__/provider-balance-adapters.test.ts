@@ -1,0 +1,379 @@
+import { describe, expect, test } from "bun:test";
+import {
+	BalanceProbeRequestError,
+	type BalanceRequest,
+	buildBalanceRoots,
+	parseNewApiBalance,
+	parseSub2ApiBalance,
+	probeProviderBalance,
+	refreshProviderBalance,
+} from "../provider-balance-adapters";
+
+const wallet = { mode: "unrestricted", isValid: true, unit: "USD", balance: 12.5 };
+const token = {
+	code: true,
+	message: "ok",
+	data: {
+		object: "token_usage",
+		total_available: 500_000,
+		total_used: 250_000,
+		total_granted: 750_000,
+		unlimited_quota: false,
+	},
+};
+const metadata = (data: Record<string, unknown>) => ({
+	success: true,
+	data: { quota_per_unit: 500_000, ...data },
+});
+
+describe("sub2api shape validation", () => {
+	test.each([0, -3, 2.5])("wallet preserves explicit balance %s", (balance) => {
+		expect(parseSub2ApiBalance({ ...wallet, balance })).toEqual({
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: balance }],
+		});
+	});
+
+	test("key quota takes precedence and preserves window limits", () => {
+		expect(
+			parseSub2ApiBalance({
+				...wallet,
+				mode: "quota_limited",
+				isValid: false,
+				quota: { unit: "USD", limit: 10, used: 12, remaining: -2 },
+				rate_limits: [{ window: "5h", limit: 5, used: 1, remaining: 4 }],
+			}),
+		).toEqual({
+			scope: "key",
+			unlimited: false,
+			amounts: [
+				{ unit: "USD", total: 10, used: 12, remaining: -2 },
+				{ unit: "USD", total: 5, used: 1, remaining: 4, window: "5h" },
+			],
+		});
+	});
+
+	test("window-only quota is supported", () => {
+		expect(
+			parseSub2ApiBalance({
+				mode: "quota_limited",
+				isValid: true,
+				rate_limits: [{ window: "7d", limit: 5, used: 5, remaining: 0 }],
+			})?.amounts[0]?.remaining,
+		).toBe(0);
+	});
+
+	test("subscription displays only periods that have actual values", () => {
+		const body = {
+			mode: "unrestricted",
+			isValid: true,
+			unit: "USD",
+			planName: "Premium",
+			subscription: {
+				daily_limit_usd: 10,
+				daily_usage_usd: 12,
+				weekly_limit_usd: null,
+				weekly_usage_usd: 100,
+				monthly_limit_usd: 0,
+				monthly_usage_usd: 0,
+			},
+		};
+		expect(parseSub2ApiBalance(body)).toEqual({
+			scope: "subscription",
+			unlimited: false,
+			amounts: [
+				{ unit: "USD", total: 10, used: 12, remaining: -2, window: "daily" },
+				{ unit: "USD", total: 0, used: 0, remaining: 0, window: "monthly" },
+			],
+		});
+		expect(parseSub2ApiBalance({ ...body, subscription: undefined })).toBeNull();
+		const { subscription: _subscription, ...withoutSubscription } = body;
+		expect(parseSub2ApiBalance(withoutSubscription)).toEqual({
+			scope: "subscription",
+			unlimited: false,
+			amounts: [],
+		});
+	});
+
+	test.each([
+		"<html>login</html>",
+		{},
+		{ ...wallet, isValid: "true" },
+		{ ...wallet, mode: "other" },
+		{ ...wallet, unit: "USD<script>" },
+		{ ...wallet, balance: "12" },
+		{ ...wallet, balance: Number.NaN },
+		{ ...wallet, balance: Infinity },
+		{ ...wallet, balance: Number.MAX_SAFE_INTEGER + 1 },
+		{ ...wallet, success: false },
+		{ ...wallet, error: "failed" },
+		{ mode: "quota_limited", isValid: true },
+		{ mode: "quota_limited", isValid: true, rate_limits: new Array(11).fill({}) },
+		{
+			mode: "quota_limited",
+			isValid: true,
+			rate_limits: [{ window: "forever", limit: 1, used: 0, remaining: 1 }],
+		},
+		{ ...wallet, balance: undefined, planName: "x".repeat(129) },
+		{ ...wallet, unused: "x".repeat(4097) },
+	])("rejects malformed or non-protocol response %#", (body) => {
+		expect(parseSub2ApiBalance(body)).toBeNull();
+	});
+});
+
+describe("new-api quota normalization", () => {
+	test("raw native envelope requires no invented conversion", () => {
+		expect(parseNewApiBalance(token)?.amounts).toEqual([
+			{ unit: "QUOTA", remaining: 500_000, used: 250_000, total: 750_000 },
+		]);
+	});
+
+	test.each([0, -500_000])("preserves remaining %s", (remaining) => {
+		expect(
+			parseNewApiBalance({ ...token, data: { ...token.data, total_available: remaining } })
+				?.amounts[0]?.remaining,
+		).toBe(remaining);
+	});
+
+	test("unlimited has no pseudo amount", () => {
+		expect(
+			parseNewApiBalance({ ...token, data: { ...token.data, unlimited_quota: true } }),
+		).toEqual({ scope: "key", unlimited: true, amounts: [] });
+	});
+
+	test.each([
+		[{ quota_display_type: "USD" }, "USD", 1],
+		[{ quota_display_type: "CNY", usd_exchange_rate: 7.2 }, "CNY", 7.2],
+		[{ quota_display_type: "TOKENS" }, "TOKENS", 500_000],
+		[
+			{
+				quota_display_type: "CUSTOM",
+				custom_currency_symbol: "€",
+				custom_currency_exchange_rate: 0.9,
+			},
+			"€",
+			0.9,
+		],
+		[
+			{
+				quota_display_type: "CUSTOM",
+				custom_currency_symbol: "CREDIT",
+				custom_currency_exchange_rate: 2,
+			},
+			"CREDIT",
+			2,
+		],
+	] as const)("uses upstream unit/rate %#", (data, unit, remaining) => {
+		expect(parseNewApiBalance(token, metadata(data))?.amounts[0]).toEqual({
+			unit,
+			remaining,
+			used: remaining / 2,
+			total: remaining * 1.5,
+		});
+	});
+
+	test.each([
+		undefined,
+		{},
+		{ success: false, data: { quota_per_unit: 1, quota_display_type: "USD" } },
+		metadata({ quota_display_type: "USD", quota_per_unit: 0 }),
+		metadata({ quota_display_type: "USD", quota_per_unit: "500000" }),
+		metadata({ quota_display_type: "unknown" }),
+		metadata({ quota_display_type: "CNY", usd_exchange_rate: -7 }),
+		metadata({
+			quota_display_type: "CUSTOM",
+			custom_currency_symbol: "<img>",
+			custom_currency_exchange_rate: 1,
+		}),
+		metadata({
+			quota_display_type: "CUSTOM",
+			custom_currency_symbol: "x".repeat(9),
+			custom_currency_exchange_rate: 1,
+		}),
+		metadata({ quota_display_type: "USD", quota_per_unit: Number.MIN_VALUE }),
+		metadata({ quota_display_type: "USD", quota_per_unit: Infinity }),
+		metadata({ display_in_currency: true }),
+	])("invalid metadata falls back to raw quota %#", (status) => {
+		expect(parseNewApiBalance(token, status)?.amounts[0]?.unit).toBe("QUOTA");
+	});
+
+	test.each([
+		"<html>",
+		{},
+		{ ...token, code: false },
+		{ ...token, success: false },
+		{ ...token, code: 200 },
+		{ ...token, data: { ...token.data, object: "balance" } },
+		{ ...token, data: { ...token.data, total_used: NaN } },
+		{ ...token, data: { ...token.data, total_granted: Infinity } },
+		{ ...token, data: { ...token.data, total_available: Number.MAX_SAFE_INTEGER + 1 } },
+		{ ...token, data: { ...token.data, unlimited_quota: "false" } },
+	])("rejects false-positive body %#", (body) => {
+		expect(parseNewApiBalance(body)).toBeNull();
+	});
+});
+
+describe("bounded same-origin deployment roots", () => {
+	test.each([
+		["https://relay.test/", ["https://relay.test"]],
+		["https://relay.test/prefix///", ["https://relay.test/prefix"]],
+		[
+			"https://relay.test/prefix/v1/",
+			["https://relay.test/prefix", "https://relay.test/prefix/v1"],
+		],
+		["https://relay.test/v1beta", ["https://relay.test", "https://relay.test/v1beta"]],
+		[
+			"http://relay.test:9000/team/anthropic",
+			["http://relay.test:9000/team", "http://relay.test:9000/team/anthropic"],
+		],
+		["https://relay.test/team/custom", ["https://relay.test/team/custom"]],
+	])("normalizes %s without guessing parent directories", (url, roots) => {
+		expect(buildBalanceRoots(url)).toEqual(roots);
+	});
+
+	test.each([
+		"not-a-url",
+		"ftp://relay.test",
+		"https://user:pass@relay.test/v1",
+		"https://user@relay.test",
+		"https://relay.test/v1?secret=1",
+		"https://relay.test/#hash",
+		"https://relay.test/?",
+		"https://relay.test/#",
+		"https://relay.test\\v1",
+	])("rejects ambiguous connection %s", (url) => {
+		expect(() => buildBalanceRoots(url)).toThrow("Invalid balance URL");
+	});
+});
+
+describe("protocol discovery and refresh", () => {
+	test("stops immediately on sub2api wallet", async () => {
+		const calls: unknown[] = [];
+		const request: BalanceRequest = async (...args) => {
+			calls.push(args);
+			return wallet;
+		};
+		expect(await probeProviderBalance("https://relay.test/prefix/v1", request)).toEqual({
+			adapter: "sub2api",
+			root: "https://relay.test/prefix",
+			balance: {
+				scope: "wallet",
+				unlimited: false,
+				amounts: [{ unit: "USD", remaining: 12.5 }],
+			},
+		});
+		expect(calls).toEqual([["https://relay.test/prefix/v1/usage", true]]);
+	});
+
+	test("tries at most four introspections and one unauthenticated metadata request", async () => {
+		const calls: unknown[] = [];
+		const request: BalanceRequest = async (url, auth) => {
+			calls.push([url, auth]);
+			if (url.endsWith("/v1/api/usage/token/")) return token;
+			if (url.endsWith("/api/status")) return metadata({ quota_display_type: "USD" });
+			throw new BalanceProbeRequestError("unsupported");
+		};
+		const result = await probeProviderBalance("https://relay.test/prefix/v1", request);
+		expect(result?.adapter).toBe("new-api");
+		expect(result?.balance.amounts[0]?.remaining).toBe(1);
+		expect(calls).toEqual([
+			["https://relay.test/prefix/v1/usage", true],
+			["https://relay.test/prefix/api/usage/token/", true],
+			["https://relay.test/prefix/v1/v1/usage", true],
+			["https://relay.test/prefix/v1/api/usage/token/", true],
+			["https://relay.test/prefix/v1/api/status", false],
+		]);
+	});
+
+	test("optional status errors do not lose confirmed support", async () => {
+		const request: BalanceRequest = async (url) => {
+			if (url.endsWith("/v1/usage")) return {};
+			if (url.endsWith("/api/status")) throw new Error("secret response");
+			return token;
+		};
+		expect(
+			(await probeProviderBalance("https://relay.test", request))?.balance.amounts[0]?.unit,
+		).toBe("QUOTA");
+	});
+
+	test("unsupported structures and missing endpoints return null, without metadata", async () => {
+		let count = 0;
+		expect(
+			await probeProviderBalance("https://relay.test/v1", async () => {
+				count++;
+				return { success: false, message: "error" };
+			}),
+		).toBeNull();
+		expect(count).toBe(4);
+		expect(
+			await probeProviderBalance("https://relay.test", async () => {
+				throw new BalanceProbeRequestError("unsupported");
+			}),
+		).toBeNull();
+	});
+
+	test("transient failures remain errors, but do not prevent later success", async () => {
+		await expect(
+			probeProviderBalance("https://relay.test", async () => {
+				throw new BalanceProbeRequestError("transient");
+			}),
+		).rejects.toMatchObject({ kind: "transient", message: "Balance request failed" });
+		await expect(
+			probeProviderBalance("https://relay.test", async () => {
+				throw new Error("key-super-secret");
+			}),
+		).rejects.toThrow("Balance request failed");
+		expect(
+			(
+				await probeProviderBalance("https://relay.test", async (url) => {
+					if (url.endsWith("/v1/usage")) throw new BalanceProbeRequestError("transient");
+					return token;
+				})
+			)?.adapter,
+		).toBe("new-api");
+	});
+
+	test("refresh only uses the confirmed adapter and exact deployment path", async () => {
+		const calls: unknown[] = [];
+		expect(
+			await refreshProviderBalance("sub2api", "https://relay.test/v1", async (...args) => {
+				calls.push(args);
+				return wallet;
+			}),
+		).toEqual({
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: 12.5 }],
+		});
+		expect(calls).toEqual([["https://relay.test/v1/v1/usage", true]]);
+	});
+
+	test("new-api refresh optionally reloads public metadata", async () => {
+		const calls: unknown[] = [];
+		const balance = await refreshProviderBalance(
+			"new-api",
+			"https://relay.test/team/",
+			async (url, auth) => {
+				calls.push([url, auth]);
+				return url.endsWith("/api/status") ? metadata({ quota_display_type: "USD" }) : token;
+			},
+		);
+		expect(balance.amounts[0]?.remaining).toBe(1);
+		expect(calls).toEqual([
+			["https://relay.test/team/api/usage/token/", true],
+			["https://relay.test/team/api/status", false],
+		]);
+	});
+
+	test("refresh fails safely rather than reporting a false zero", async () => {
+		await expect(
+			refreshProviderBalance("sub2api", "https://relay.test", async () => ({})),
+		).rejects.toMatchObject({ kind: "unsupported" });
+		await expect(
+			refreshProviderBalance("sub2api", "https://relay.test", async () => {
+				throw new Error("private data");
+			}),
+		).rejects.toMatchObject({ kind: "transient", message: "Balance request failed" });
+	});
+});

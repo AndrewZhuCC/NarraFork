@@ -69,6 +69,7 @@ import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
 import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
+import { providerBalanceRoutes } from "./routes/provider-balances";
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
@@ -437,6 +438,7 @@ app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/kimi", kimiRoutes);
 app.route("/api/deepseek", deepseekRoutes);
+app.route("/api/provider-balances", providerBalanceRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);

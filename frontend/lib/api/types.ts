@@ -13,6 +13,12 @@ import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
+export type {
+	ProviderBalanceAmount,
+	ProviderBalanceData,
+	ProviderBalanceSnapshot,
+	ProviderBalanceStatus,
+} from "@shared/provider-balance";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type ChangelogEntry = {
