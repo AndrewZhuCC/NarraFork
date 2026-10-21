@@ -1,0 +1,4 @@
+# Drizzle records each migration by the SHA-256 of its raw file text, so a CRLF checkout
+# (Windows git with core.autocrlf) hashes the same migration differently. Keep them LF everywhere.
+drizzle/** text eol=lf
+drizzle-postgres/** text eol=lf

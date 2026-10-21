@@ -656,6 +656,47 @@ describe("hash-based migration self-heal", () => {
 	const TOOL_CONTINUATIONS_WHEN = 1784524348158; // 0090_public_nextwave
 	const BENCHMARK_RUNS_WHEN = 1777102252438; // 0028_pale_silhouette (DROP+RENAME rebuild)
 
+	function crlfMigrationsFolder(): string {
+		const folder = mkdtempSync(join(tmpdir(), "nf-crlf-migrations-"));
+		mkdirSync(join(folder, "meta"));
+		const journal = readFileSync(join(import.meta.dir, "../../drizzle/meta/_journal.json"), "utf8");
+		writeFileSync(join(folder, "meta", "_journal.json"), journal);
+		for (const { tag } of JSON.parse(journal).entries as Array<{ tag: string }>) {
+			const sql = readFileSync(join(import.meta.dir, `../../drizzle/${tag}.sql`), "utf8");
+			writeFileSync(join(folder, `${tag}.sql`), sql.replace(/\r?\n/g, "\r\n"));
+		}
+		return folder;
+	}
+
+	test("recognizes a ledger written from CRLF migration files (Windows checkout)", async () => {
+		// The reported incident: a database migrated from a CRLF checkout recorded every hash over
+		// CRLF text. An LF build then saw nothing as applied, replayed the whole journal and failed
+		// on the model-history contract row it had already inserted.
+		const folder = crlfMigrationsFolder();
+		try {
+			sqlite = new Database(":memory:");
+			applyPendingMigrationsByHash(sqlite, folder);
+			const before = hashCount(sqlite);
+			expect(before).toBe(readMigrationFiles({ migrationsFolder: folder }).length);
+
+			await runMigrations(sqlite);
+			expect(hashCount(sqlite)).toBe(before);
+
+			// And the reverse: an LF ledger read by a CRLF build.
+			const lf = new Database(":memory:");
+			try {
+				await runMigrations(lf);
+				const lfCount = hashCount(lf);
+				applyPendingMigrationsByHash(lf, folder);
+				expect(hashCount(lf)).toBe(lfCount);
+			} finally {
+				lf.close();
+			}
+		} finally {
+			rmSync(folder, { recursive: true, force: true });
+		}
+	});
+
 	test("recreates a missing table after the watermark was polluted (the real incident)", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
