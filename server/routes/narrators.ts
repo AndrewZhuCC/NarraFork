@@ -255,7 +255,11 @@ import type {
 	UnloadToolNotFound,
 	UnloadToolResult,
 } from "../services/command-service";
-import { getSlashMenuItems, resolveCommand } from "../services/command-service";
+import {
+	getDraftSlashMenuItems,
+	getSlashMenuItems,
+	resolveCommand,
+} from "../services/command-service";
 import {
 	type LiveCompactStreamEvent,
 	liveCompactProgress,
@@ -738,6 +742,8 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"questions",
 	// Every inbox row/detail is authorized against its actual owner by the service.
 	"human-attention",
+	// Session-less dashboard composer: resolves user-level commands and cwd skills only.
+	"draft-composer",
 	"whitelist-dirs",
 	"blacklist-dirs",
 	"cmd-whitelist",
@@ -1543,6 +1549,13 @@ narratorRoutes.get("/human-attention/:attentionId", async (c) => {
 			signal: c.req.raw.signal,
 		}),
 	);
+});
+
+// Slash menu for a composer with no session yet (dashboard): user commands and the
+// skills visible from the directory the session would be created in.
+narratorRoutes.get("/draft-composer/commands", async (c) => {
+	const cwd = c.req.query("cwd")?.trim() || settings.paths.defaultProjectDir || null;
+	return c.json(await getDraftSlashMenuItems(c.get("user").sub, cwd));
 });
 
 narratorRoutes.get("/broken-models", requireAdmin, async (c) => {

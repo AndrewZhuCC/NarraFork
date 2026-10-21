@@ -59,8 +59,9 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			type: z.literal("subscribe"),
 			narratorIds: z.array(z.string().min(1)).max(RECENT_TABS_WS_BATCH_SIZE),
 			catchUpCursor: catchUpCursorSchema.optional(),
-			kind: z.enum(["list", "panel", "messages"]).optional(),
+			kind: z.enum(["list", "panel", "messages", "activity"]).optional(),
 			requestId: z.string().min(1).optional(),
+			downgrade: z.boolean().optional(),
 			// Client's last-known messageVersion for this narrator. When it matches
 			// the server version, the subscribe short-circuits to sync_ok instead of
 			// running a full catch-up query (see narrator-ws.ts subscribe handler).

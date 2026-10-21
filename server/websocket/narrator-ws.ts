@@ -102,6 +102,7 @@ import {
 } from "./catch-up-buffer";
 import { handleEditorFileMessage, releaseEditorFileSubscriptions } from "./editor-file-ws";
 import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
+import { projectNarratorActivityEvent } from "./narrator-activity-projection";
 import {
 	createCodexQuotaOverviewWsMessage,
 	type NarratorListStateSnapshotItem,
@@ -118,6 +119,13 @@ export interface NarratorWSData {
 	connectedAt: number;
 	lastPongAt: number;
 	subscribedNarrators: Set<string>;
+	/**
+	 * Subset of `subscribedNarrators` watched only at activity level: they receive
+	 * the {@link projectNarratorActivityEvent} projection instead of the full stream.
+	 * The client owns the level (it ref-counts its handles): an `activity` subscribe
+	 * sets it, any other kind clears it.
+	 */
+	activityOnlyNarrators?: Set<string>;
 	subscribedStats?: boolean;
 	/** narratorId → number of in-flight catch-up queries buffering realtime frames. */
 	catchingUpNarrators: Map<string, number>;
@@ -153,7 +161,7 @@ export interface NarratorWSData {
 	publicShareConnectionLease?: PublicShareConnectionLease;
 }
 
-type NarratorSubscriptionKind = "list" | "panel" | "messages";
+type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 
 // Client → Server messages
 export type NarratorClientMessage =
@@ -167,6 +175,8 @@ export type NarratorClientMessage =
 			kind?: NarratorSubscriptionKind;
 			requestId?: string;
 			version?: number;
+			/** `activity` only: lower narrators already streamed in full (see subscribe). */
+			downgrade?: boolean;
 	  }
 	| { type: "unsubscribe"; narratorIds: string[] }
 	| {
@@ -707,6 +717,7 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 		for (const ws of connections) {
 			if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 			if (!ws.data.subscribedNarrators.has(narratorId)) continue;
+			if (ws.data.activityOnlyNarrators?.has(narratorId)) continue;
 			if (ws.data.publicShare && !projectPublicNarratorEvent(narratorId, message)) continue;
 			if (!sendToolInputLane(ws, message)) removeConnection(ws);
 		}
@@ -716,11 +727,24 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	const payload = JSON.stringify(message);
 	let publicMessage: NarratorServerMessage | null | undefined;
 	let publicPayload: string | undefined;
+	let activityMessage: NarratorServerMessage | null | undefined;
+	let activityPayload: string | undefined;
 	for (const ws of connections) {
 		if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
 		let outgoing = message;
 		let outgoingPayload = payload;
+		if (ws.data.activityOnlyNarrators?.has(narratorId)) {
+			if (activityMessage === undefined) activityMessage = projectNarratorActivityEvent(message);
+			if (!activityMessage) continue;
+			activityPayload ??= JSON.stringify(activityMessage);
+			try {
+				ws.send(activityPayload);
+			} catch {
+				removeConnection(ws);
+			}
+			continue;
+		}
 		if (ws.data.publicShare) {
 			if (publicMessage === undefined)
 				publicMessage = projectPublicNarratorEvent(narratorId, message);
@@ -1094,6 +1118,54 @@ async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promis
 // List subscriptions are a high-cardinality RecentTabs window. Send bounded
 // batches rather than one status_change frame per narrator. These state frames
 // intentionally remain unscoped so wildcard list listeners receive reconnects.
+/** Max tool rows an activity card shows; the snapshot sends no more than that. */
+const ACTIVITY_SNAPSHOT_TOOL_CALLS = 4;
+
+async function sendActivitySnapshot(
+	ws: NarratorWS,
+	narratorIds: string[],
+	requestId?: string,
+): Promise<void> {
+	for (let offset = 0; offset < narratorIds.length; offset += RECENT_TABS_WS_BATCH_SIZE) {
+		if (!connections.has(ws)) return;
+		const batchIds = narratorIds.slice(offset, offset + RECENT_TABS_WS_BATCH_SIZE);
+		let toolCalls: Awaited<
+			ReturnType<typeof import("../services/narrator-messages").loadRecentToolCallActivity>
+		>;
+		try {
+			const { loadRecentToolCallActivity } = await import("../services/narrator-messages");
+			toolCalls = await loadRecentToolCallActivity(batchIds, ACTIVITY_SNAPSHOT_TOOL_CALLS);
+		} catch (err) {
+			logger.warn("Failed to load narrator activity snapshot", {
+				count: batchIds.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return;
+		}
+		for (const narratorId of batchIds) {
+			// Unsubscribed while the query ran: nobody is listening for it any more.
+			if (!ws.data.subscribedNarrators.has(narratorId)) continue;
+			safeSend(
+				ws,
+				withSubscriptionRequestId(
+					{
+						type: "activity_snapshot",
+						narratorId,
+						toolCalls: (toolCalls.get(narratorId) ?? []).map((call) => ({
+							toolUseId: call.toolUseId,
+							toolName: call.toolName,
+							status: call.status,
+							createdAt: call.createdAt,
+							...(call.inputSummary ? { inputSummary: call.inputSummary } : {}),
+						})),
+					},
+					requestId,
+				),
+			);
+		}
+	}
+}
+
 async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
 	for (let offset = 0; offset < narratorIds.length; offset += RECENT_TABS_WS_BATCH_SIZE) {
 		if (!connections.has(ws)) return;
@@ -2137,7 +2209,10 @@ export const handleNarratorWS = {
 				// Heartbeat response — lastPongAt already updated above
 				break;
 			case "subscribe": {
-				const kind = msg.kind ?? "messages";
+				// Public-share readers get the share's own filtered stream; the activity
+				// projection is not share-aware, so it is never offered to them.
+				const kind =
+					msg.kind === "activity" && ws.data.publicShare ? "list" : (msg.kind ?? "messages");
 				const requestId = msg.requestId;
 				if (!canAddSubscriptions(ws, msg.narratorIds)) break;
 
@@ -2153,9 +2228,30 @@ export const handleNarratorWS = {
 					kind === "messages" && allowedIds.length === 1 ? allowedIds[0] : undefined;
 				const catchUpAnchor = messageNarratorId ? msg.catchUpCursor : undefined;
 
+				// An activity frame lowers only what it newly subscribes, or what the client
+				// explicitly downgrades after its last full handle went away; otherwise it
+				// just asks for the activity snapshot of a narrator streamed in full.
+				const activityLevelIds =
+					kind === "activity"
+						? allowedIds.filter(
+								(id) => msg.downgrade === true || !ws.data.subscribedNarrators.has(id),
+							)
+						: [];
 				// Reserve the full accepted set before any async snapshot/version work so
 				// concurrent subscribe frames cannot race past the per-connection limit.
 				for (const id of allowedIds) ws.data.subscribedNarrators.add(id);
+				if (kind === "activity") {
+					ws.data.activityOnlyNarrators ??= new Set();
+					for (const id of activityLevelIds) ws.data.activityOnlyNarrators.add(id);
+				} else {
+					for (const id of allowedIds) ws.data.activityOnlyNarrators?.delete(id);
+				}
+
+				if (kind === "activity") {
+					await sendListStateSnapshot(ws, allowedIds);
+					await sendActivitySnapshot(ws, allowedIds, requestId);
+					break;
+				}
 
 				if (kind === "list") {
 					await sendListStateSnapshot(ws, allowedIds);
@@ -2209,6 +2305,7 @@ export const handleNarratorWS = {
 			case "unsubscribe": {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.delete(id);
+					ws.data.activityOnlyNarrators?.delete(id);
 					toolInputLaneSender.clearNarrator(ws, id);
 				}
 				break;

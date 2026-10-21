@@ -867,3 +867,104 @@ describe("narrator WebSocket backgroundWorkActive snapshot flag", () => {
 		}
 	});
 });
+
+describe("narrator WebSocket activity subscription", () => {
+	it("sends a snapshot and only the activity projection of the stream", async () => {
+		await seedNarrators();
+		const { ws, sent } = openFakeWs();
+
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "activity",
+			narratorIds: ["narrator-idle"],
+			requestId: "activity-1",
+		});
+		expect(sent).toContainEqual({
+			type: "activity_snapshot",
+			narratorId: "narrator-idle",
+			toolCalls: [],
+			subscriptionRequestId: "activity-1",
+		});
+
+		sent.length = 0;
+		broadcastToNarrator("narrator-idle", {
+			type: "text",
+			narratorId: "narrator-idle",
+			text: "streamed prose",
+		} as never);
+		broadcastToNarrator("narrator-idle", {
+			type: "tool_started",
+			narratorId: "narrator-idle",
+			toolCallId: "call-1",
+			toolUseId: "use-1",
+			toolName: "Bash",
+			input: { command: "bun test", content: "x".repeat(10_000) },
+		});
+		broadcastToNarrator("narrator-idle", {
+			type: "tool_started",
+			narratorId: "narrator-idle",
+			toolCallId: "call-child",
+			toolUseId: "use-child",
+			toolName: "Read",
+			parentToolUseId: "use-agent",
+		});
+		broadcastToNarrator("narrator-idle", {
+			type: "tool_completed",
+			narratorId: "narrator-idle",
+			toolCallId: "call-1",
+			toolUseId: "use-1",
+			toolName: "Bash",
+			status: "success",
+			output: "y".repeat(10_000),
+		});
+		expect(sent).toEqual([
+			{
+				type: "tool_started",
+				narratorId: "narrator-idle",
+				toolCallId: "call-1",
+				toolUseId: "use-1",
+				toolName: "Bash",
+				inputSummary: { command: "bun test" },
+			},
+			{
+				type: "tool_completed",
+				narratorId: "narrator-idle",
+				toolCallId: "call-1",
+				toolUseId: "use-1",
+				toolName: "Bash",
+				status: "success",
+			},
+		]);
+
+		// Any fuller subscription upgrades the narrator back to the complete stream...
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "list",
+			narratorIds: ["narrator-idle"],
+		});
+		sent.length = 0;
+		broadcastToNarrator("narrator-idle", {
+			type: "text",
+			narratorId: "narrator-idle",
+			text: "streamed prose",
+		} as never);
+		expect(sent.map((message) => message.type)).toEqual(["text"]);
+
+		// ...and a later plain activity frame only re-sends the snapshot.
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "activity",
+			narratorIds: ["narrator-idle"],
+		});
+		expect(ws.data.activityOnlyNarrators?.has("narrator-idle")).toBe(false);
+		expect(sent.at(-1)).toMatchObject({ type: "activity_snapshot", narratorId: "narrator-idle" });
+
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "activity",
+			narratorIds: ["narrator-idle"],
+			downgrade: true,
+		});
+		expect(ws.data.activityOnlyNarrators?.has("narrator-idle")).toBe(true);
+	});
+});

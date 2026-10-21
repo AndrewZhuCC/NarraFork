@@ -26,7 +26,12 @@ import { removeWSStatus, setWSStatus } from "./ws-status";
 // Types
 // ---------------------------------------------------------------------------
 
-export type NarratorSubscriptionKind = "list" | "panel" | "messages";
+/**
+ * `activity` is the lightest level: the server sends only status, title and a
+ * one-line projection of top-level tool calls (see `narrator-activity-projection`).
+ * A narrator stays at that level only while every handle on it is `activity`.
+ */
+export type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 
 /**
  * Max chat room ids per `chat_subscribe` frame. Matches the server-side Zod cap
@@ -609,6 +614,34 @@ export class NarratorWSManager {
 				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds }));
 			}
 		}
+		if (handle._kind !== "activity") this._downgradeToActivity(handle._narratorIds);
+	}
+
+	/** Whether any non-`activity` handle still holds this narrator. */
+	private _hasFullSubscription(narratorId: string): boolean {
+		for (const handleId of this.narratorRefCounts.get(narratorId) ?? []) {
+			if (this.subscriptions.get(handleId)?.kind !== "activity") return true;
+		}
+		return false;
+	}
+
+	/**
+	 * After a full handle let go, narrators still held only by `activity` handles
+	 * fall back to the activity stream (the server keeps the last level it was told).
+	 */
+	private _downgradeToActivity(narratorIds: string[]): void {
+		for (const narratorId of narratorIds) {
+			const refs = this.narratorRefCounts.get(narratorId);
+			if (!refs?.size || this._hasFullSubscription(narratorId)) continue;
+			const holder = [...refs][0];
+			const record = holder == null ? undefined : this.subscriptions.get(holder);
+			if (!record) continue;
+			this._scheduleSubscribe(
+				{ _id: record.id, _narratorIds: record.narratorIds, _kind: record.kind },
+				[narratorId],
+				{ downgrade: true },
+			);
+		}
 	}
 
 	/**
@@ -675,6 +708,7 @@ export class NarratorWSManager {
 			}
 			if (accepted.length) this._scheduleSubscribe(handle, accepted);
 		}
+		if (handle._kind !== "activity") this._downgradeToActivity(toRemove);
 	}
 
 	// -----------------------------------------------------------------------
@@ -1892,15 +1926,28 @@ export class NarratorWSManager {
 		this.syncProbeTimer = undefined;
 	}
 
-	private _scheduleSubscribe(handle: SubscriptionHandle, narratorIds: string[]): void {
+	private _scheduleSubscribe(
+		handle: SubscriptionHandle,
+		narratorIds: string[],
+		opts?: { downgrade?: boolean },
+	): void {
 		if (narratorIds.length === 0) return;
 		// When the socket isn't OPEN there's nothing to send now; reconnect replays
 		// every active handle via `_restoreSubscriptions`, so we simply drop this.
 		if (this.ws?.readyState !== WebSocket.OPEN) return;
-		queueMicrotask(() => this._sendSubscribe(handle, narratorIds));
+		queueMicrotask(() => this._sendSubscribe(handle, narratorIds, opts));
 	}
 
-	private _sendSubscribe(handle: SubscriptionHandle, narratorIds: string[]): void {
+	/**
+	 * `downgrade` only matters for `activity`: such a frame never lowers a narrator
+	 * the server already streams in full unless the client says the full handles are
+	 * gone. Without it, the frame just requests the activity snapshot.
+	 */
+	private _sendSubscribe(
+		handle: SubscriptionHandle,
+		narratorIds: string[],
+		opts?: { downgrade?: boolean },
+	): void {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 		const record = this.subscriptions.get(handle._id);
@@ -1940,6 +1987,10 @@ export class NarratorWSManager {
 			return;
 		}
 
+		const downgrade =
+			kind === "activity" &&
+			opts?.downgrade === true &&
+			activeNarratorIds.every((nId) => !this._hasFullSubscription(nId));
 		for (const narratorIds of chunkNarratorIds(activeNarratorIds)) {
 			ws.send(
 				JSON.stringify({
@@ -1947,6 +1998,7 @@ export class NarratorWSManager {
 					narratorIds,
 					kind,
 					...(requestId ? { requestId } : {}),
+					...(downgrade ? { downgrade: true } : {}),
 				}),
 			);
 		}

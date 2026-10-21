@@ -1,4 +1,5 @@
 import type { HumanAttentionItem } from "@shared/human-attention";
+import type { NarratorActivity } from "./dashboard-activity";
 
 /** Fields of a narrator list row the dashboard reads; the list API is loosely typed. */
 export interface DashboardNarrator {
@@ -6,49 +7,54 @@ export interface DashboardNarrator {
 	title?: string | null;
 	cwd?: string | null;
 	status?: string | null;
-	substatus?: string | null;
-	errorMessage?: string | null;
+	substatus?: unknown;
 	lastMessageAt?: string | null;
 	updatedAt?: string | null;
+	activeBackgroundTaskCount?: number | null;
+	activeBackgroundWorkCount?: number | null;
 }
 
-export type AttentionReason = "decision" | "waiting" | "error";
+export interface DashboardDecision {
+	count: number;
+	/** At least one decision is holding the agent. */
+	blocking: boolean;
+	summary?: string;
+	kind: HumanAttentionItem["kind"];
+	source: HumanAttentionItem["source"];
+}
 
-export interface DashboardSessionRow {
-	/** The session the row opens. */
+export interface DashboardSession {
 	narratorId: string;
 	title: string;
 	cwd: string | null;
 	status: string;
+	substatus: string[];
+	activeBackgroundWorkCount: number;
 	time: string | null;
-	/** Set only on rows in the attention group. */
-	reason?: AttentionReason;
-	/** Decision summary or error text. */
-	detail?: string;
-	/** Decision rows: at least one decision is holding the agent. */
-	blocking?: boolean;
-	/** Decision rows: number of open decisions in this session. */
-	decisionCount?: number;
+	/** Set when the session waits on the user. */
+	decision?: DashboardDecision;
+	/** Set when the session stopped on an error. */
+	errored?: boolean;
 }
 
 export interface DashboardSessionGroups {
-	attention: DashboardSessionRow[];
-	running: DashboardSessionRow[];
-	recent: DashboardSessionRow[];
+	/** Waiting on the user: open decisions first (blocking before not), then errors. */
+	attention: DashboardSession[];
+	/** Working, reflecting, or idle with background work still running. */
+	running: DashboardSession[];
+	recent: DashboardSession[];
 }
 
-export const RECENT_SESSION_LIMIT = 5;
+export const RECENT_SESSION_LIMIT = 6;
 
-const REASON_ORDER: Record<AttentionReason, number> = { decision: 0, waiting: 1, error: 2 };
-
-function toRow(n: DashboardNarrator): DashboardSessionRow {
-	return {
-		narratorId: n.id,
-		title: n.title || n.id.slice(0, 8),
-		cwd: n.cwd ?? null,
-		status: n.status ?? "idle",
-		time: n.lastMessageAt ?? n.updatedAt ?? null,
-	};
+export function parseSubstatus(raw: unknown): string[] {
+	if (Array.isArray(raw)) return raw.filter((s): s is string => typeof s === "string");
+	if (typeof raw !== "string" || !raw) return [];
+	try {
+		return parseSubstatus(JSON.parse(raw));
+	} catch {
+		return [];
+	}
 }
 
 function timeValue(iso: string | null): number {
@@ -56,87 +62,117 @@ function timeValue(iso: string | null): number {
 	return Number.isFinite(value) ? value : 0;
 }
 
+function toSession(n: DashboardNarrator, live: NarratorActivity | undefined): DashboardSession {
+	return {
+		narratorId: n.id,
+		title: live?.title || n.title || n.id.slice(0, 8),
+		cwd: n.cwd ?? null,
+		status: live?.status ?? n.status ?? "idle",
+		substatus: live?.substatus ?? parseSubstatus(n.substatus),
+		activeBackgroundWorkCount:
+			live?.activeBackgroundWorkCount ??
+			n.activeBackgroundWorkCount ??
+			n.activeBackgroundTaskCount ??
+			0,
+		time: n.lastMessageAt ?? n.updatedAt ?? null,
+	};
+}
+
 /**
- * Split sessions into the three dashboard groups. A session appears in exactly one
- * group, attention winning: a working session with an open decision is shown as
- * needing the user, not as running.
+ * Split sessions into the dashboard groups. Each session lands in exactly one.
  *
- * Decisions raised by a subagent are attributed to its root session — that is the
- * page that surfaces them (see `groupHumanAttentionByScope`).
+ * "Needs you" is driven by the human-attention feed, not by `status: "waiting"`:
+ * a narrator also waits while an automated gate (danger / plan / question
+ * reflection) reviews a request, and that is not the user's turn. Such a
+ * session stays under Running, showing its reflecting state. A subagent's
+ * decision is attributed to its root session, the page that surfaces it.
+ *
+ * Running also covers an idle narrator whose background work (bash tasks,
+ * subagents) is still going — the session is not done, and will wake when the
+ * work completes.
  */
 export function buildDashboardSessions(input: {
 	attentionItems: readonly HumanAttentionItem[];
-	working: readonly DashboardNarrator[];
-	waiting: readonly DashboardNarrator[];
-	recent: readonly DashboardNarrator[];
+	narrators: readonly DashboardNarrator[];
+	activity: ReadonlyMap<string, NarratorActivity>;
 }): DashboardSessionGroups {
 	const known = new Map<string, DashboardNarrator>();
-	for (const n of [...input.recent, ...input.waiting, ...input.working]) known.set(n.id, n);
+	for (const n of input.narrators) if (!known.has(n.id)) known.set(n.id, n);
 
-	const attention = new Map<string, DashboardSessionRow>();
-
+	const decisions = new Map<string, { item: HumanAttentionItem; decision: DashboardDecision }>();
 	for (const item of input.attentionItems) {
 		const ownerId = item.rootNarratorId ?? item.narratorId;
-		const existing = attention.get(ownerId);
-		if (existing) {
-			existing.decisionCount = (existing.decisionCount ?? 1) + 1;
-			if (item.blocking && !existing.blocking) {
-				existing.blocking = true;
-				existing.detail = item.summary || existing.detail;
-			}
+		const entry = decisions.get(ownerId);
+		if (!entry) {
+			decisions.set(ownerId, {
+				item,
+				decision: {
+					count: 1,
+					blocking: item.blocking,
+					summary: item.summary || undefined,
+					kind: item.kind,
+					source: item.source,
+				},
+			});
 			continue;
 		}
+		entry.decision.count++;
+		if (item.blocking && !entry.decision.blocking) {
+			entry.decision = {
+				...entry.decision,
+				blocking: true,
+				summary: item.summary || entry.decision.summary,
+				kind: item.kind,
+				source: item.source,
+			};
+		}
+	}
+
+	const attention: DashboardSession[] = [];
+	const running: DashboardSession[] = [];
+	const recent: DashboardSession[] = [];
+
+	for (const [ownerId, { item, decision }] of decisions) {
 		const narrator = known.get(ownerId);
-		const base = narrator
-			? toRow(narrator)
+		const session = narrator
+			? toSession(narrator, input.activity.get(ownerId))
 			: {
 					narratorId: ownerId,
 					title: item.narratorTitle || ownerId.slice(0, 8),
 					cwd: null,
 					status: "waiting",
+					substatus: [],
+					activeBackgroundWorkCount: 0,
 					time: item.createdAt,
 				};
-		attention.set(ownerId, {
-			...base,
-			reason: "decision",
-			detail: item.summary || undefined,
-			blocking: item.blocking,
-			decisionCount: 1,
-		});
+		attention.push({ ...session, decision });
 	}
 
-	for (const n of input.waiting) {
-		if (!attention.has(n.id)) attention.set(n.id, { ...toRow(n), reason: "waiting" });
+	for (const narrator of known.values()) {
+		if (decisions.has(narrator.id)) continue;
+		const session = toSession(narrator, input.activity.get(narrator.id));
+		if (session.status === "archived") continue;
+		if (session.status === "working" || session.status === "waiting") running.push(session);
+		else if (session.substatus.includes("error")) attention.push({ ...session, errored: true });
+		else if (session.activeBackgroundWorkCount > 0) running.push(session);
+		else recent.push(session);
 	}
 
-	for (const n of input.recent) {
-		if (attention.has(n.id) || !n.errorMessage || n.status === "working") continue;
-		attention.set(n.id, { ...toRow(n), reason: "error", detail: String(n.errorMessage) });
-	}
-
-	const attentionRows = [...attention.values()].sort(
+	const byTime = (a: DashboardSession, b: DashboardSession) =>
+		timeValue(b.time) - timeValue(a.time);
+	attention.sort(
 		(a, b) =>
-			REASON_ORDER[a.reason ?? "error"] - REASON_ORDER[b.reason ?? "error"] ||
-			Number(Boolean(b.blocking)) - Number(Boolean(a.blocking)) ||
-			timeValue(b.time) - timeValue(a.time),
+			Number(!!b.decision) - Number(!!a.decision) ||
+			Number(!!b.decision?.blocking) - Number(!!a.decision?.blocking) ||
+			byTime(a, b),
 	);
+	running.sort(byTime);
+	recent.sort(byTime);
 
-	const running = input.working
-		.filter((n) => !attention.has(n.id))
-		.map(toRow)
-		.sort((a, b) => timeValue(b.time) - timeValue(a.time));
-	const shown = new Set([...attention.keys(), ...running.map((r) => r.narratorId)]);
-
-	const recent = input.recent
-		.filter((n) => !shown.has(n.id) && n.status !== "working" && n.status !== "waiting")
-		.map(toRow)
-		.sort((a, b) => timeValue(b.time) - timeValue(a.time))
-		.slice(0, RECENT_SESSION_LIMIT);
-
-	return { attention: attentionRows, running, recent };
+	return { attention, running, recent: recent.slice(0, RECENT_SESSION_LIMIT) };
 }
 
-/** Last path segment, for compact directory chips. */
+/** Last path segment, for compact directory labels. */
 export function directoryLabel(path: string): string {
 	const trimmed = path.replace(/[/\\]+$/, "");
 	const segment = trimmed.split(/[/\\]/).pop();

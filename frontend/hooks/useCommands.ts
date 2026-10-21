@@ -6,18 +6,54 @@ import { api } from "../lib/api";
 
 const NARRATOR_COMMANDS_GC_TIME_MS = 60_000;
 
+type SlashMenuPayload = Awaited<ReturnType<typeof api.getNarratorCommands>>;
+
 export function useNarratorCommands(narratorId: string | undefined) {
+	return useSlashMenuItems({
+		queryKey: ["narrator-commands", narratorId],
+		queryFn: () => api.getNarratorCommands(narratorId as string),
+		enabled: !!narratorId,
+		sessionCommands: true,
+	});
+}
+
+/**
+ * Slash menu for a composer that has no session yet. Session-control builtins
+ * (/new, /fork, /compact, /save_dump) act on an existing conversation, so they are
+ * not offered; everything else resolves server-side once the session exists.
+ * Shares the `narrator-commands` key prefix so routine/command edits invalidate it.
+ */
+export function useDraftComposerCommands(cwd: string | null, enabled: boolean) {
+	return useSlashMenuItems({
+		queryKey: ["narrator-commands", "draft", cwd ?? ""],
+		queryFn: () => api.getDraftComposerCommands(cwd),
+		enabled,
+		sessionCommands: false,
+	});
+}
+
+function useSlashMenuItems({
+	queryKey,
+	queryFn,
+	enabled,
+	sessionCommands,
+}: {
+	queryKey: readonly unknown[];
+	queryFn: () => Promise<SlashMenuPayload>;
+	enabled: boolean;
+	sessionCommands: boolean;
+}) {
 	const { i18n } = useTranslation();
 	const locale = i18n.resolvedLanguage ?? i18n.language;
 	const localize = (en: string, zhCN: string) => pickLocalizedValue({ en, "zh-CN": zhCN }, locale);
 	return useQuery({
-		queryKey: ["narrator-commands", narratorId],
-		queryFn: () => api.getNarratorCommands(narratorId as string),
-		enabled: !!narratorId,
+		queryKey,
+		queryFn,
+		enabled,
 		staleTime: 10_000,
 		gcTime: NARRATOR_COMMANDS_GC_TIME_MS,
 		select: (data): CommandItem[] => {
-			const commands: CommandItem[] = [
+			const builtins: CommandItem[] = [
 				{
 					name: "new",
 					prompt: "/new [message]",
@@ -58,6 +94,9 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					source: "builtin",
 					type: "command" as const,
 				},
+			];
+			const commands: CommandItem[] = [
+				...(sessionCommands ? builtins : []),
 				...(data.commands ?? [])
 					.filter((c) => c.name !== "save_dump")
 					.map((c) => ({

@@ -1,5 +1,25 @@
-import { Badge, Button, Group, Loader, Stack, Text, ThemeIcon } from "@mantine/core";
-import { IconAlertTriangle, IconClockPause, IconHandStop } from "@tabler/icons-react";
+import {
+	Badge,
+	Button,
+	Card,
+	Group,
+	Loader,
+	SimpleGrid,
+	Stack,
+	Text,
+	Title,
+	Tooltip,
+} from "@mantine/core";
+import { resolveToolRowStatusMark, type ToolRowStatusMark } from "@shared/tool-row-status";
+import {
+	IconBan,
+	IconCircleX,
+	IconClock,
+	IconFolder,
+	IconPlayerPause,
+	IconShield,
+	IconSubtask,
+} from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { lazy, Suspense, useMemo, useState } from "react";
@@ -7,13 +27,17 @@ import { useTranslation } from "react-i18next";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { api } from "../../lib/api";
 import { formatSmartTime } from "../../lib/format";
-import classes from "./DashboardSessions.module.css";
+import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
+import { subagentRecentCallSummary, traceRowTitle } from "../narrator/tool-call/tool-display";
+import { NarratorStatusIcon } from "../nav/NarratorStatusIcon";
+import type { ActivityToolRow, NarratorActivity } from "./dashboard-activity";
 import {
 	buildDashboardSessions,
 	type DashboardNarrator,
-	type DashboardSessionRow,
+	type DashboardSession,
 	directoryLabel,
 } from "./dashboard-sessions";
+import { useNarratorActivity } from "./useNarratorActivity";
 
 const NotificationCenterDrawer = lazy(() =>
 	import("../notifications/NotificationCenterDrawer").then((m) => ({
@@ -23,68 +47,69 @@ const NotificationCenterDrawer = lazy(() =>
 
 const SESSIONS_QUERY_GC_TIME_MS = 30_000;
 const LIVE_REFETCH_INTERVAL_MS = 15_000;
+const RECENT_REFETCH_INTERVAL_MS = 60_000;
 const LIVE_LIST_LIMIT = 30;
 const RECENT_LIST_LIMIT = 50;
+/** Cap on activity subscriptions, well under the per-connection subscription limit. */
+const MAX_ACTIVITY_SUBSCRIPTIONS = 40;
 
-function liveQuery(status: "working" | "waiting") {
+function narratorListQuery(status: "working" | "waiting" | null) {
 	return {
-		queryKey: ["narrators", "dashboard", status],
+		queryKey: ["narrators", "dashboard", status ?? "recent"],
 		queryFn: () =>
 			api.listNarratorsPaginated({
 				standalone: "all",
-				status,
-				limit: LIVE_LIST_LIMIT,
+				...(status ? { status } : {}),
+				limit: status ? LIVE_LIST_LIMIT : RECENT_LIST_LIMIT,
 				sortBy: "updatedAt",
 				sortOrder: "desc",
 			}),
 		gcTime: SESSIONS_QUERY_GC_TIME_MS,
-		refetchInterval: LIVE_REFETCH_INTERVAL_MS,
+		refetchInterval: status ? LIVE_REFETCH_INTERVAL_MS : RECENT_REFETCH_INTERVAL_MS,
 	};
 }
 
-/** Dashboard session data: grouped rows plus recently used directories for the composer. */
+/** Grouped dashboard sessions with their live activity overlay. */
 export function useDashboardSessions() {
 	const attention = useHumanAttention();
-	const working = useQuery(liveQuery("working"));
-	const waiting = useQuery(liveQuery("waiting"));
-	const recent = useQuery({
-		queryKey: ["narrators", "dashboard", "recent"],
-		queryFn: () =>
-			api.listNarratorsPaginated({
-				standalone: "all",
-				limit: RECENT_LIST_LIMIT,
-				sortBy: "updatedAt",
-				sortOrder: "desc",
-			}),
-		gcTime: SESSIONS_QUERY_GC_TIME_MS,
-	});
+	const working = useQuery(narratorListQuery("working"));
+	const waiting = useQuery(narratorListQuery("waiting"));
+	const recent = useQuery(narratorListQuery(null));
 
 	const attentionPages = attention.data?.pages;
 	const attentionItems = useMemo(() => loadedHumanAttentionItems(attentionPages), [attentionPages]);
-	const workingItems = working.data?.items as DashboardNarrator[] | undefined;
-	const waitingItems = waiting.data?.items as DashboardNarrator[] | undefined;
-	const recentItems = recent.data?.items as DashboardNarrator[] | undefined;
-
-	const groups = useMemo(
+	const narrators = useMemo(
 		() =>
-			buildDashboardSessions({
-				attentionItems,
-				working: workingItems ?? [],
-				waiting: waitingItems ?? [],
-				recent: recentItems ?? [],
-			}),
-		[attentionItems, workingItems, waitingItems, recentItems],
+			[
+				...((working.data?.items ?? []) as DashboardNarrator[]),
+				...((waiting.data?.items ?? []) as DashboardNarrator[]),
+				...((recent.data?.items ?? []) as DashboardNarrator[]),
+			] satisfies DashboardNarrator[],
+		[working.data, waiting.data, recent.data],
 	);
 
-	const recentDirectories = useMemo(() => {
-		const seen = new Set<string>();
-		for (const n of recentItems ?? []) if (n.cwd) seen.add(n.cwd);
-		return [...seen];
-	}, [recentItems]);
+	// Watch what can change on its own: sessions that need the user or are running.
+	// Their live status also decides the grouping, so it is fed back in below.
+	const initial = useMemo(
+		() => buildDashboardSessions({ attentionItems, narrators, activity: new Map() }),
+		[attentionItems, narrators],
+	);
+	const watchedIds = useMemo(
+		() =>
+			[...initial.attention, ...initial.running]
+				.map((session) => session.narratorId)
+				.slice(0, MAX_ACTIVITY_SUBSCRIPTIONS),
+		[initial],
+	);
+	const activity = useNarratorActivity(watchedIds);
+	const groups = useMemo(
+		() => buildDashboardSessions({ attentionItems, narrators, activity }),
+		[attentionItems, narrators, activity],
+	);
 
 	return {
 		groups,
-		recentDirectories,
+		activity,
 		attention,
 		isLoading: working.isLoading || waiting.isLoading || recent.isLoading || attention.isLoading,
 	};
@@ -94,22 +119,22 @@ export function DashboardSessions({ data }: { data: ReturnType<typeof useDashboa
 	const { t } = useTranslation("dashboard");
 	const { t: tn } = useTranslation("narrator");
 	const [inboxOpened, setInboxOpened] = useState(false);
-	const { groups, attention, isLoading } = data;
+	const { groups, activity, attention, isLoading } = data;
 	const empty =
 		groups.attention.length === 0 && groups.running.length === 0 && groups.recent.length === 0;
 
 	if (isLoading && empty) {
 		return (
 			<Group justify="center" py="xl">
-				<Loader size="sm" type="dots" />
+				<Loader size="sm" />
 			</Group>
 		);
 	}
 
 	return (
-		<Stack gap="lg">
+		<Stack gap="xl">
 			{attention.isError && (
-				<Group gap="xs" px="sm">
+				<Group gap="xs">
 					<Text size="sm" c="red">
 						{tn("humanAttentionLoadError")}
 					</Text>
@@ -130,31 +155,34 @@ export function DashboardSessions({ data }: { data: ReturnType<typeof useDashboa
 					count={groups.attention.length}
 					more={attention.hasNextPage}
 					action={
-						<Button
-							size="compact-xs"
-							variant="subtle"
-							color="gray"
-							onClick={() => setInboxOpened(true)}
-						>
+						<Button size="compact-sm" variant="subtle" onClick={() => setInboxOpened(true)}>
 							{t("openInbox")}
 						</Button>
 					}
 				>
-					<div className={classes.attentionGroup}>
-						{groups.attention.map((row) => (
-							<SessionRow key={row.narratorId} row={row} />
-						))}
-					</div>
+					{groups.attention.map((session) => (
+						<SessionCard
+							key={session.narratorId}
+							session={session}
+							activity={activity.get(session.narratorId)}
+						/>
+					))}
 				</Section>
 			)}
 
 			<Section title={t("sections.running")} count={groups.running.length}>
 				{groups.running.length === 0 ? (
-					<Text size="sm" c="dimmed" px="sm">
+					<Text size="sm" c="dimmed">
 						{t("noActiveNarrators")}
 					</Text>
 				) : (
-					groups.running.map((row) => <SessionRow key={row.narratorId} row={row} />)
+					groups.running.map((session) => (
+						<SessionCard
+							key={session.narratorId}
+							session={session}
+							activity={activity.get(session.narratorId)}
+						/>
+					))
 				)}
 			</Section>
 
@@ -162,19 +190,13 @@ export function DashboardSessions({ data }: { data: ReturnType<typeof useDashboa
 				<Section
 					title={t("sections.recent")}
 					action={
-						<Button
-							size="compact-xs"
-							variant="subtle"
-							color="gray"
-							component={Link}
-							to="/narrators"
-						>
+						<Button size="compact-sm" variant="subtle" component={Link} to="/narrators">
 							{t("viewAll")}
 						</Button>
 					}
 				>
-					{groups.recent.map((row) => (
-						<SessionRow key={row.narratorId} row={row} />
+					{groups.recent.map((session) => (
+						<SessionCard key={session.narratorId} session={session} />
 					))}
 				</Section>
 			)}
@@ -206,99 +228,199 @@ function Section({
 	children: React.ReactNode;
 }) {
 	return (
-		<Stack gap={4}>
-			<Group justify="space-between" px="sm" mb={2}>
-				<Group gap={6}>
-					<Text size="xs" fw={600} c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
-						{title}
-					</Text>
+		<Stack gap="sm">
+			<Group justify="space-between" wrap="nowrap">
+				<Group gap="xs" wrap="nowrap">
+					<Title order={4}>{title}</Title>
 					{count != null && count > 0 && (
-						<Text size="xs" c="dimmed">
+						<Badge variant="light" color="gray" size="sm">
 							{count}
 							{more ? "+" : ""}
-						</Text>
+						</Badge>
 					)}
 				</Group>
 				{action}
 			</Group>
-			{children}
+			{Array.isArray(children) || children ? (
+				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="sm">
+					{children}
+				</SimpleGrid>
+			) : null}
 		</Stack>
 	);
 }
 
-function RowIndicator({ row }: { row: DashboardSessionRow }) {
-	if (row.reason === "decision") {
-		return (
-			<ThemeIcon variant="light" color={row.blocking ? "yellow" : "blue"} radius="xl" size={26}>
-				<IconHandStop size={15} />
-			</ThemeIcon>
-		);
-	}
-	if (row.reason === "waiting") {
-		return (
-			<ThemeIcon variant="light" color="yellow" radius="xl" size={26}>
-				<IconClockPause size={15} />
-			</ThemeIcon>
-		);
-	}
-	if (row.reason === "error") {
-		return (
-			<ThemeIcon variant="light" color="red" radius="xl" size={26}>
-				<IconAlertTriangle size={15} />
-			</ThemeIcon>
-		);
-	}
-	if (row.status === "working") return <Loader size={14} color="blue" />;
-	return <span className={classes.dot} style={{ background: "var(--mantine-color-gray-6)" }} />;
-}
-
-function SessionRow({ row }: { row: DashboardSessionRow }) {
+function SessionCard({
+	session,
+	activity,
+}: {
+	session: DashboardSession;
+	activity?: NarratorActivity;
+}) {
 	const { t } = useTranslation("dashboard");
-	const subtitle =
-		row.reason === "waiting"
-			? t("reason.waiting")
-			: row.reason === "decision" && !row.detail
-				? t(row.blocking ? "reason.blockingDecision" : "reason.decision")
-				: row.detail;
+	const { t: tc } = useTranslation("common");
+	const { t: tn } = useTranslation("narrator");
+	const display = getEffectiveNarratorDisplay(session.status, session.substatus);
+	const decision = session.decision;
+	const tools = activity?.tools ?? [];
+	const accent = decision
+		? decision.blocking
+			? "var(--mantine-color-yellow-filled)"
+			: "var(--mantine-color-blue-filled)"
+		: session.errored
+			? "var(--mantine-color-red-filled)"
+			: undefined;
 
 	return (
-		<Link
+		<Card
+			withBorder
+			shadow="sm"
+			padding="sm"
+			component={Link}
 			to="/narrators/$narratorId"
-			params={{ narratorId: row.narratorId }}
-			className={classes.row}
+			// biome-ignore lint/suspicious/noExplicitAny: Card's polymorphic props lose route typing
+			params={{ narratorId: session.narratorId } as any}
+			style={{
+				textDecoration: "none",
+				color: "inherit",
+				...(accent ? { borderLeft: `3px solid ${accent}` } : {}),
+			}}
 		>
-			<span className={classes.indicator}>
-				<RowIndicator row={row} />
-			</span>
-			<Stack gap={0} style={{ flex: 1, minWidth: 0 }}>
-				<Group gap={6} wrap="nowrap">
-					<Text size="sm" fw={500} truncate>
-						{row.title}
-					</Text>
-					{row.decisionCount != null && row.decisionCount > 1 && (
-						<Badge size="xs" variant="light" color={row.blocking ? "yellow" : "blue"} circle>
-							{row.decisionCount}
-						</Badge>
+			<Stack gap={6}>
+				<Group justify="space-between" wrap="nowrap" gap="xs">
+					<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+						<Tooltip label={tc(display.i18nKey)} openDelay={400}>
+							<span style={{ display: "inline-flex", flexShrink: 0 }}>
+								<NarratorStatusIcon
+									size={18}
+									status={session.status}
+									substatus={session.substatus}
+									activeBackgroundWorkCount={session.activeBackgroundWorkCount}
+								/>
+							</span>
+						</Tooltip>
+						<Text fw={500} truncate>
+							{session.title}
+						</Text>
+					</Group>
+					{session.time && (
+						<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+							{formatSmartTime(session.time)}
+						</Text>
 					)}
 				</Group>
-				{(subtitle || row.cwd) && (
-					<Text size="xs" c={row.reason === "error" ? "red" : "dimmed"} truncate>
-						{subtitle ?? (row.cwd ? directoryLabel(row.cwd) : "")}
+
+				<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+					<Text size="xs" c="dimmed" tt="none" style={{ display: "inline-flex", flexShrink: 0 }}>
+						<IconFolder size={13} />
 					</Text>
-				)}
-			</Stack>
-			<Stack gap={0} align="flex-end" style={{ flexShrink: 0 }}>
-				{row.time && (
+					<Text size="xs" c="dimmed" truncate title={session.cwd ?? undefined} style={{ flex: 1 }}>
+						{session.cwd ? directoryLabel(session.cwd) : "—"}
+					</Text>
+					{session.activeBackgroundWorkCount > 0 && (
+						<Tooltip label={t("backgroundWork", { count: session.activeBackgroundWorkCount })}>
+							<Badge
+								size="xs"
+								variant="light"
+								color="blue"
+								leftSection={<IconSubtask size={10} />}
+								style={{ flexShrink: 0 }}
+							>
+								{session.activeBackgroundWorkCount}
+							</Badge>
+						</Tooltip>
+					)}
+				</Group>
+
+				{decision ? (
+					<Stack gap={2}>
+						<Group gap={6} wrap="nowrap">
+							<Badge size="xs" variant="light" color={decision.blocking ? "yellow" : "blue"}>
+								{tn(`humanAttentionKind.${decision.kind}`)}
+							</Badge>
+							{decision.count > 1 && (
+								<Text size="xs" c="dimmed">
+									{t("moreDecisions", { count: decision.count - 1 })}
+								</Text>
+							)}
+						</Group>
+						{decision.summary && (
+							<Text size="sm" lineClamp={2}>
+								{decision.summary}
+							</Text>
+						)}
+					</Stack>
+				) : session.errored ? (
+					<Text size="xs" c="red">
+						{tc(display.i18nKey)}
+					</Text>
+				) : null}
+
+				{tools.length > 0 ? (
+					<Stack gap={2}>
+						{tools.map((tool) => (
+							<ToolRow key={tool.toolUseId} tool={tool} />
+						))}
+					</Stack>
+				) : !decision && !session.errored && session.status !== "idle" ? (
 					<Text size="xs" c="dimmed">
-						{formatSmartTime(row.time)}
+						{tc(display.i18nKey)}
 					</Text>
-				)}
-				{subtitle && row.cwd && (
-					<Text size="xs" c="dimmed" visibleFrom="sm" maw={160} truncate title={row.cwd}>
-						{directoryLabel(row.cwd)}
-					</Text>
-				)}
+				) : null}
 			</Stack>
-		</Link>
+		</Card>
+	);
+}
+
+const TOOL_MARK_SIZE = 12;
+
+/**
+ * A compact row's status glyph. Same mark rule (`@shared/tool-row-status`: success
+ * unmarked, only `running` moves) and the same icons/hues as the vlist trace rows;
+ * drawn here because nothing outside `vlist/` may import it statically.
+ */
+function ToolMarkGlyph({ mark }: { mark: ToolRowStatusMark }) {
+	const props = { size: TOOL_MARK_SIZE, style: { flexShrink: 0 } } as const;
+	switch (mark) {
+		case "running":
+			return <Loader size={10} />;
+		case "queued":
+			return <IconClock {...props} color="var(--mantine-color-slate-5)" />;
+		case "reflecting":
+			return <IconShield {...props} color="var(--mantine-color-indigo-6)" />;
+		case "awaiting":
+			return <IconPlayerPause {...props} color="var(--mantine-color-yellow-6)" />;
+		case "failed":
+			return <IconCircleX {...props} color="var(--mantine-color-red-6)" />;
+		default:
+			return <IconBan {...props} color="var(--mantine-color-orange-6)" />;
+	}
+}
+
+/** One recent tool call: the same label and status mark as a subagent card's row. */
+function ToolRow({ tool }: { tool: ActivityToolRow }) {
+	const mark = resolveToolRowStatusMark(tool.status);
+	const label = traceRowTitle(
+		tool.toolName,
+		subagentRecentCallSummary(tool.toolName, tool.inputSummary ?? null),
+	);
+	return (
+		<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+			<span
+				style={{
+					width: TOOL_MARK_SIZE,
+					height: TOOL_MARK_SIZE,
+					flexShrink: 0,
+					display: "flex",
+					alignItems: "center",
+					justifyContent: "center",
+				}}
+			>
+				{mark ? <ToolMarkGlyph mark={mark} /> : null}
+			</span>
+			<Text size="xs" c={mark === "running" ? undefined : "dimmed"} ff="monospace" truncate>
+				{label}
+			</Text>
+		</Group>
 	);
 }

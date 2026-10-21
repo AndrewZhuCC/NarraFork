@@ -82,8 +82,6 @@ import {
 	useNarratorRetryRecoveryCapability,
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
-	useProviderModelRefreshCapability,
-	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useSpecTasks } from "../../hooks/useSpec";
@@ -105,7 +103,6 @@ import {
 	formatFullLocaleDateTime,
 } from "../../lib/format";
 import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
-import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
@@ -191,6 +188,7 @@ import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-fo
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
 import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
+import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
@@ -542,56 +540,7 @@ function NarratorPanelBody({
 		},
 		[mutateSettings, t],
 	);
-	// Re-fetch one NUG gateway's model catalog straight from the model menu. This
-	// is also how a stale "temporarily unavailable" flag gets cleared, since a
-	// refresh replaces the cached list wholesale.
-	const nugModelRefreshCapability = useProviderModelRefreshCapability("nug");
-	const nugRuntimeCapability = useProviderRuntimeCapability("nug");
-	const canRefreshNugModels =
-		nugModelRefreshCapability.supported &&
-		nugRuntimeCapability?.routes?.supported !== false &&
-		nugRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
-	const [refreshingNugProviderId, setRefreshingNugProviderId] = useState<string | null>(null);
-	const handleRefreshNugModels = useCallback(
-		async (providerId: string) => {
-			setRefreshingNugProviderId(providerId);
-			try {
-				await api.nugRefreshProviderModels(providerId);
-				await qc.invalidateQueries({ queryKey: ["settings"] });
-			} catch (error) {
-				notifications.show({
-					color: "red",
-					title: t("refreshProviderModelsErrorTitle"),
-					message: error instanceof Error ? error.message : String(error),
-				});
-			} finally {
-				setRefreshingNugProviderId(null);
-			}
-		},
-		[qc, t],
-	);
-	// Opening the picker also kicks off an opportunistic catalog refresh, so a
-	// model that recovered upstream stops showing as "temporarily unavailable"
-	// without the user having to find the per-provider refresh button. The real
-	// rate limit is a process-wide cooldown on the server; `requestNugModelRefresh…`
-	// only avoids redundant round-trips from this tab.
-	const handleModelPickerOpened = useCallback(() => {
-		void requestNugModelRefreshOnPickerOpen().then((refreshed) => {
-			if (refreshed) qc.invalidateQueries({ queryKey: ["settings"] });
-		});
-	}, [qc]);
-	const hasNugModelGroups = Object.keys(nugProviderIdByPrefix).length > 0;
-	const modelMenuRefreshProps = canRefreshNugModels
-		? {
-				nugProviderIdByPrefix,
-				onRefreshProviderModels: (providerId: string) => {
-					void handleRefreshNugModels(providerId);
-				},
-				refreshingProviderId: refreshingNugProviderId,
-				// No NUG gateway in the picker → nothing to refresh, so don't even ask.
-				...(hasNugModelGroups ? { onPickerOpened: handleModelPickerOpened } : {}),
-			}
-		: {};
+	const modelMenuRefreshProps = useModelMenuRefreshProps(nugProviderIdByPrefix);
 	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
 		settingsData?.agent?.dangerReflectionLevel,
 		settingsData?.agent?.dangerReflectionEnabled ?? true,

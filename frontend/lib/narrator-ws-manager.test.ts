@@ -134,6 +134,50 @@ describe("narrator subscription batching", () => {
 	});
 });
 
+describe("activity subscriptions", () => {
+	test("never downgrade a fully watched narrator and fall back once the full handle goes", async () => {
+		const manager = new NarratorWSManager();
+		const sent: Array<Record<string, unknown>> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+		};
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload)),
+		};
+		const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
+		const frames = () =>
+			sent.map(({ type, kind, narratorIds, downgrade }) => ({
+				type,
+				kind,
+				narratorIds,
+				...(downgrade ? { downgrade } : {}),
+			}));
+
+		const full = manager.subscribe(["a"], { kind: "list" });
+		await flush();
+		const activity = manager.subscribe(["a", "b"], { kind: "activity" });
+		await flush();
+		// A plain activity frame only asks for the snapshot of "a": the server keeps
+		// streaming a narrator it already sends in full.
+		expect(frames()).toEqual([
+			{ type: "subscribe", kind: "list", narratorIds: ["a"] },
+			{ type: "subscribe", kind: "activity", narratorIds: ["a", "b"] },
+		]);
+
+		sent.length = 0;
+		manager.unsubscribe(full);
+		await flush();
+		expect(frames()).toEqual([
+			{ type: "subscribe", kind: "activity", narratorIds: ["a"], downgrade: true },
+		]);
+
+		sent.length = 0;
+		manager.unsubscribe(activity);
+		expect(frames()).toEqual([{ type: "unsubscribe", kind: undefined, narratorIds: ["a", "b"] }]);
+	});
+});
+
 describe("matchesListenerFilter", () => {
 	test("matches a narrator-scoped listener by narratorId", () => {
 		expect(matchesListenerFilter({ narratorIds: ["n1"] }, "status_change", "n1")).toBe(true);
