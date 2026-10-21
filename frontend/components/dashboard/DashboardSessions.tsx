@@ -10,7 +10,16 @@ import {
 	Title,
 	Tooltip,
 } from "@mantine/core";
-import { IconFolder, IconSubtask } from "@tabler/icons-react";
+import { resolveToolRowStatusMark, type ToolRowStatusMark } from "@shared/tool-row-status";
+import {
+	IconBan,
+	IconCircleX,
+	IconClock,
+	IconFolder,
+	IconPlayerPause,
+	IconShield,
+	IconSubtask,
+} from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { lazy, Suspense, useMemo, useState } from "react";
@@ -20,11 +29,6 @@ import { api } from "../../lib/api";
 import { formatSmartTime } from "../../lib/format";
 import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
 import { subagentRecentCallSummary, traceRowTitle } from "../narrator/tool-call/tool-display";
-import {
-	resolveToolRowStatusMark,
-	TRACE_ROW_STATUS_SLOT_STYLE,
-	TraceRowStatusGlyph,
-} from "../narrator/vlist/render/trace-row-status";
 import { NarratorStatusIcon } from "../nav/NarratorStatusIcon";
 import type { ActivityToolRow, NarratorActivity } from "./dashboard-activity";
 import {
@@ -368,6 +372,31 @@ function SessionCard({
 	);
 }
 
+const TOOL_MARK_SIZE = 12;
+
+/**
+ * A compact row's status glyph. Same mark rule (`@shared/tool-row-status`: success
+ * unmarked, only `running` moves) and the same icons/hues as the vlist trace rows;
+ * drawn here because nothing outside `vlist/` may import it statically.
+ */
+function ToolMarkGlyph({ mark }: { mark: ToolRowStatusMark }) {
+	const props = { size: TOOL_MARK_SIZE, style: { flexShrink: 0 } } as const;
+	switch (mark) {
+		case "running":
+			return <Loader size={10} />;
+		case "queued":
+			return <IconClock {...props} color="var(--mantine-color-slate-5)" />;
+		case "reflecting":
+			return <IconShield {...props} color="var(--mantine-color-indigo-6)" />;
+		case "awaiting":
+			return <IconPlayerPause {...props} color="var(--mantine-color-yellow-6)" />;
+		case "failed":
+			return <IconCircleX {...props} color="var(--mantine-color-red-6)" />;
+		default:
+			return <IconBan {...props} color="var(--mantine-color-orange-6)" />;
+	}
+}
+
 /** One recent tool call: the same label and status mark as a subagent card's row. */
 function ToolRow({ tool }: { tool: ActivityToolRow }) {
 	const mark = resolveToolRowStatusMark(tool.status);
@@ -377,12 +406,17 @@ function ToolRow({ tool }: { tool: ActivityToolRow }) {
 	);
 	return (
 		<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-			<span style={TRACE_ROW_STATUS_SLOT_STYLE}>
-				{mark === "running" ? (
-					<Loader size={10} />
-				) : mark ? (
-					<TraceRowStatusGlyph mark={mark} />
-				) : null}
+			<span
+				style={{
+					width: TOOL_MARK_SIZE,
+					height: TOOL_MARK_SIZE,
+					flexShrink: 0,
+					display: "flex",
+					alignItems: "center",
+					justifyContent: "center",
+				}}
+			>
+				{mark ? <ToolMarkGlyph mark={mark} /> : null}
 			</span>
 			<Text size="xs" c={mark === "running" ? undefined : "dimmed"} ff="monospace" truncate>
 				{label}
