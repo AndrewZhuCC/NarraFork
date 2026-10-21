@@ -1,5 +1,26 @@
 {
 	"title": "Settings",
+	"providerBalance": {
+		"wallet": "Wallet balance",
+		"key": "Key remaining allowance",
+		"subscription": "Subscription allowance",
+		"unlimited": "Unlimited allowance",
+		"unknown": "Unknown",
+		"quotaUnit": "quota units",
+		"tokens": "tokens",
+		"pending": "Balance discovery pending",
+		"probing": "Discovering balance support",
+		"supported": "Balance supported",
+		"unsupported": "Balance discovery not supported",
+		"error": "Balance discovery failed",
+		"failed": "Balance request failed",
+		"stale": "Data may be outdated",
+		"source": "Source: {{source}}",
+		"used": "Used: {{amount}}",
+		"total": "Total: {{amount}}",
+		"probe": "Rediscover balance",
+		"saveFirst": "Save changes before rediscovering balance. The values shown belong to the saved configuration."
+	},
 	"tokendance": {
 		"balance": "Balance",
 		"credits": "Total credited",
