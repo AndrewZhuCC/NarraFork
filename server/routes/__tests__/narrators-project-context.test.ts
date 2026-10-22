@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -58,7 +59,7 @@ function appAs(userId: string) {
 		})
 		.onError((error) => {
 			if (error instanceof AppError) {
-				return new Response(JSON.stringify({ error: error.message }), {
+				return new Response(JSON.stringify({ error: error.message, code: error.code }), {
 					status: error.statusCode,
 					headers: { "Content-Type": "application/json" },
 				});
@@ -133,8 +134,20 @@ test("unbound HTTP creation preserves standalone defaults and does not infer pro
 	expect(created.contextProjectId).toBeNull();
 	expect(created.visibility).toBe("private");
 	expect(created.writeAudience).toBe("owner");
-	const defaultResponse = await create({});
-	expect((await row((await defaultResponse.json()).id)).cwd).toBe(getHome());
+});
+
+test("unbound creation without cwd requires an existing default project directory", async () => {
+	for (const configured of ["", join(getHome(), `missing-default-${projectId}`)]) {
+		settings.paths.defaultProjectDir = configured;
+		const response = await create({});
+		expect(response.status).toBe(400);
+		expect((await response.json()).code).toBe("PROJECT_DIR_REQUIRED");
+	}
+	const existing = mkdtempSync(join(tmpdir(), "nf-default-project-"));
+	settings.paths.defaultProjectDir = existing;
+	const response = await create({});
+	expect(response.status).toBe(201);
+	expect((await row((await response.json()).id)).cwd).toBe(existing);
 });
 
 test("public validator rejects malformed project contexts", async () => {
@@ -143,12 +156,17 @@ test("public validator rejects malformed project contexts", async () => {
 	}
 });
 
-test("a project without a default path falls back to the unchanged standalone cwd policy", async () => {
+test("a project without a default path falls back to the standalone cwd policy", async () => {
 	await db.update(projects).set({ gitPath: null }).where(eq(projects.id, projectId));
+	const required = await create({ contextProjectId: projectId });
+	expect(required.status).toBe(400);
+	expect((await required.json()).code).toBe("PROJECT_DIR_REQUIRED");
+	const existing = mkdtempSync(join(tmpdir(), "nf-default-project-"));
+	settings.paths.defaultProjectDir = existing;
 	const response = await create({ contextProjectId: projectId });
 	expect(response.status).toBe(201);
 	const created = await row((await response.json()).id);
-	expect(created.cwd).toBe(getHome());
+	expect(created.cwd).toBe(existing);
 	expect(created.contextProjectId).toBe(projectId);
 });
 

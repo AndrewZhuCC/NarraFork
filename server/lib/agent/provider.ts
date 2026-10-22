@@ -89,6 +89,8 @@ export interface ChatParams extends ProtocolChatParams {
 	maxOutputTokens?: number;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** How tool loads in `history` were rendered; decides the Anthropic tool-change beta. */
+	toolLoadingStrategy?: import("./tool-loading").ToolLoadingStrategy;
 	/** Metadata to include in the request body (e.g. user_id for Anthropic) */
 	metadata?: { user_id: string };
 	/** Optional collector for persisting raw provider request/response dumps. */
@@ -166,6 +168,13 @@ export interface ProviderAdapter {
 	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory>;
 
 	/**
+	 * The wire protocol this adapter speaks for `model`, used to pick a prefix-preserving
+	 * tool loading strategy (see `tool-loading.ts`). Absent means tools are always
+	 * re-declared in full.
+	 */
+	toolLoadingTarget?(model: string): import("./tool-loading").ToolLoadingTarget | undefined;
+
+	/**
 	 * Stable identity ("provider:channel") of the upstream this provider is
 	 * currently routed to, used to gate thinking-signature replay across
 	 * servers. Returns `undefined` for providers that never mint Anthropic-style
@@ -186,61 +195,6 @@ export interface ProviderAdapter {
 
 	/** Stream a chat completion, yielding parsed events */
 	chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent>;
-
-	/** Format a single tool result for the provider protocol */
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		/** Real tool name for protocols (e.g. Gemini Interactions) that echo it with results. */
-		toolName?: string,
-	): unknown;
-
-	/** Append a user turn to history (mutates in place) */
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void;
-
-	/** Append an assistant turn to history (mutates in place) */
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		/** Provider-native content block index for the text block (for interleaved ordering). */
-		textOutputIndex?: number,
-		/** Anthropic redacted thinking blocks to preserve during a tool-use trajectory. */
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		/** Authoritative encounter order; reasoning entries contain whole native items, not checkpoints. */
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */
 	generate(text: string, model: string): Promise<string>;

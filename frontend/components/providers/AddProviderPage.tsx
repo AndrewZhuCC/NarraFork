@@ -12,12 +12,17 @@ import {
 	Title,
 	UnstyledButton,
 } from "@mantine/core";
-import { IconArrowLeft, IconSearch } from "@tabler/icons-react";
+import { IconArrowLeft, IconDownload, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../../lib/api";
 import classes from "./AddProviderPage.module.css";
-import { useTokenDanceAdd } from "./provider-add-context";
+import {
+	hasDetectedLocalSources,
+	LOCAL_IMPORT_SOURCE_LABELS,
+	LocalProviderImport,
+} from "./LocalProviderImport";
+import { useProviderImport, useTokenDanceAdd } from "./provider-add-context";
 import {
 	type AddProviderDraft,
 	draftFromPreset,
@@ -38,6 +43,7 @@ import {
 import {
 	type AddProviderType,
 	getProviderPresetName,
+	isProviderPresetAvailable,
 	PROVIDER_PRESETS,
 	type ProviderPreset,
 	searchProviderPresets,
@@ -51,6 +57,12 @@ const PROTOCOL_KEYS: Record<AddProviderType, string> = {
 	nug: "addProviderNug",
 };
 
+/** The preset preselected when there is nothing to import: TokenDance where offered, else DeepSeek. */
+export function defaultAddProviderPresetId(language: string): string {
+	const tokenDance = PROVIDER_PRESETS.find((item) => item.id === "tokendance");
+	return tokenDance && isProviderPresetAvailable(tokenDance, language) ? "tokendance" : "deepseek";
+}
+
 export function AddProviderPage({
 	onClose,
 	onAdd,
@@ -60,6 +72,7 @@ export function AddProviderPage({
 }) {
 	const { t, i18n } = useTranslation("settings");
 	const tokenDance = useTokenDanceAdd();
+	const importContext = useProviderImport();
 	const restoredRef = useRef(false);
 	const locallyEditedRef = useRef(false);
 	useEffect(() => {
@@ -74,6 +87,7 @@ export function AddProviderPage({
 			(restored.connectionSelection as ProviderConnectionSelection | null) ?? null,
 		);
 		setShowConfig(!!restored.showConfig);
+		setImportSelected(false);
 		tokenDance?.consumeRestoredAddPage?.();
 	}, [tokenDance?.restoredAddPage, tokenDance?.consumeRestoredAddPage]);
 	const [query, setQuery] = useState("");
@@ -83,6 +97,8 @@ export function AddProviderPage({
 	const [preset, setPreset] = useState<ProviderPreset | null>(null);
 	const [draft, setDraft] = useState<AddProviderDraft | null>(null);
 	const [showConfig, setShowConfig] = useState(false);
+	/** "Import from this machine" is the selected catalog entry. */
+	const [importSelected, setImportSelected] = useState(false);
 	const [submitting, setSubmitting] = useState(false);
 	const [submitError, setSubmitError] = useState<string | null>(null);
 	const submittingRef = useRef(false);
@@ -97,16 +113,25 @@ export function AddProviderPage({
 	const headingRef = useRef<HTMLHeadingElement>(null);
 	useEffect(() => {
 		// Move focus out of the hidden catalog without opening the mobile keyboard.
-		if (!preset) return;
+		// Only after the user picked something: the default selection must not steal focus.
+		if ((!preset && !importSelected) || !locallyEditedRef.current) return;
 		if (showConfig) headingRef.current?.focus();
 		else catalogRef.current?.focus();
-	}, [showConfig, preset]);
+	}, [showConfig, preset, importSelected]);
+	const language = i18n.resolvedLanguage ?? i18n.language;
+	const importAvailable = !!importContext && hasDetectedLocalSources(importContext.detectedSources);
+	const detectedSourceNames = new Intl.ListFormat(language, { type: "conjunction" }).format(
+		(importContext?.detectedSources ?? [])
+			.filter((source) => source.found)
+			.map((source) => LOCAL_IMPORT_SOURCE_LABELS[source.source]),
+	);
 	const presets = useMemo(
 		() =>
-			category === "popular" && !query.trim()
+			(category === "popular" && !query.trim()
 				? getPopularProviderPresets()
-				: searchProviderPresets(query, t),
-		[category, query, t],
+				: searchProviderPresets(query, t)
+			).filter((item) => isProviderPresetAvailable(item, language)),
+		[category, query, t, language],
 	);
 	const connection =
 		preset && connectionSelection
@@ -123,13 +148,13 @@ export function AddProviderPage({
 		getConnectionFamily(preset.id) === "mimo" &&
 		connectionSelection?.region === "international" &&
 		connectionSelection.billing === "token-plan";
-	const choose = (next: ProviderPreset) => {
-		if (submittingRef.current) return;
-		locallyEditedRef.current = true;
+	/** Select a preset; `reveal` switches narrow layouts to its form (a user pick). */
+	const selectPreset = (next: ProviderPreset, reveal: boolean) => {
 		setSubmitError(null);
+		setImportSelected(false);
 		if (next.category === "platform-login") {
 			setPreset(next);
-			setShowConfig(true);
+			if (reveal) setShowConfig(true);
 			return;
 		}
 		const selection = getConnectionFamily(next.id)
@@ -145,8 +170,40 @@ export function AddProviderPage({
 			apiKey: prev?.apiKey ?? "",
 			...(resolved?.userAgentMode ? { userAgentMode: resolved.userAgentMode } : {}),
 		}));
+		if (reveal) setShowConfig(true);
+	};
+	const choose = (next: ProviderPreset) => {
+		if (submittingRef.current) return;
+		locallyEditedRef.current = true;
+		selectPreset(next, true);
+	};
+	const chooseImport = () => {
+		if (submittingRef.current) return;
+		locallyEditedRef.current = true;
+		setSubmitError(null);
+		setPreset(null);
+		setImportSelected(true);
 		setShowConfig(true);
 	};
+
+	// Never open on an empty form: once detection settles, select "import from this
+	// machine" when another tool's config exists, else TokenDance in the Chinese UI,
+	// else DeepSeek. A restored draft or a choice the user already made wins.
+	const autoSelectedRef = useRef(false);
+	const detecting = !!importContext?.detecting;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: runs once when detection settles
+	useEffect(() => {
+		if (autoSelectedRef.current || detecting) return;
+		autoSelectedRef.current = true;
+		if (restoredRef.current || tokenDance?.restoredAddPage || locallyEditedRef.current) return;
+		if (importAvailable) {
+			setImportSelected(true);
+			return;
+		}
+		const fallback = defaultAddProviderPresetId(language);
+		const next = PROVIDER_PRESETS.find((item) => item.id === fallback);
+		if (next) selectPreset(next, false);
+	}, [detecting, importAvailable]);
 	const changeConnection = (selection: ProviderConnectionSelection) => {
 		if (!preset || submittingRef.current) return;
 		setSubmitError(null);
@@ -217,6 +274,23 @@ export function AddProviderPage({
 					aria-label={t("addProviderCatalog")}
 				>
 					<Stack gap="sm" p="md">
+						{importAvailable && (
+							<UnstyledButton
+								data-local-import-option
+								className={classes.preset}
+								data-selected={importSelected || undefined}
+								aria-pressed={importSelected}
+								onClick={chooseImport}
+							>
+								<Group gap="xs" wrap="nowrap">
+									<IconDownload size={16} style={{ flexShrink: 0 }} />
+									<Text fw={600}>{t("localImport.title")}</Text>
+								</Group>
+								<Text size="xs" c="dimmed">
+									{t("localImport.sourcesFound", { sources: detectedSourceNames })}
+								</Text>
+							</UnstyledButton>
+						)}
 						<TextInput
 							label={t("addProviderSearch")}
 							placeholder={t("addProviderSearchPlaceholder")}
@@ -263,6 +337,11 @@ export function AddProviderPage({
 									aria-pressed={preset?.id === item.id}
 								>
 									<Text fw={600}>{getProviderPresetName(item, t)}</Text>
+									{item.descriptionKey && (
+										<Text size="xs" c="dimmed">
+											{t(item.descriptionKey)}
+										</Text>
+									)}
 									<Group gap={4} mt={4}>
 										{(Object.keys(item.endpoints) as AddProviderType[]).map((protocol) => (
 											<Badge key={protocol} size="xs" variant="light">
@@ -291,9 +370,28 @@ export function AddProviderPage({
 					</Stack>
 				</section>
 				<section className={classes.configuration} aria-label={t("addProviderConfigure")}>
-					{preset?.category === "platform-login" ? (
+					{importSelected && importContext ? (
+						<Stack gap="md" p="md">
+							<Button
+								className={classes.back}
+								variant="subtle"
+								leftSection={<IconArrowLeft size={16} />}
+								onClick={() => setShowConfig(false)}
+							>
+								{t("addProviderBack")}
+							</Button>
+							<LocalProviderImport
+								importProvider={importContext.importProvider}
+								protocolLabel={(protocol) => t(PROTOCOL_KEYS[protocol])}
+								onImported={onClose}
+								detectedSources={importContext.detectedSources}
+								headingRef={headingRef}
+							/>
+						</Stack>
+					) : preset?.category === "platform-login" ? (
 						<Stack p="md">
 							<Title order={3}>TokenDance</Title>
+							{preset.descriptionKey && <Text fw={600}>{t(preset.descriptionKey)}</Text>}
 							<Text>{t("tokendance.loginDescription")}</Text>
 							{submitError && <Alert color="red">{submitError}</Alert>}
 							<Button

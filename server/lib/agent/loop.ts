@@ -26,7 +26,7 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
-import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import { getPrompt, getToolMessage, type Locale } from "../prompt-i18n";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -56,11 +56,13 @@ import {
 	isRetryableError,
 } from "./error-handling";
 import { localPathSemantics } from "./execution/path-semantics";
+import { buildAdapterHistory, historyTail } from "./history-build";
 import { countInputCharacters } from "./input-characters";
+import { LoopTranscript, type TranscriptImage } from "./loop-transcript";
 import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
-import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
-import { projectAskUserQuestionInput, projectQuestionModelInput } from "./question-model-input";
+import { type DbMessage, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
+import { projectQuestionModelInput } from "./question-model-input";
 import {
 	bindPermissionRecovery,
 	isRecoveredHumanPermission,
@@ -86,14 +88,15 @@ import {
 	type ToolExecResult,
 } from "./tool-executor";
 import { ToolInputStream } from "./tool-input-stream";
+import {
+	formatRequestTools,
+	resolveAdapterToolLoadingStrategy,
+	sameToolLoadingLayout,
+	type ToolLoadingStrategy,
+	usesToolLoading,
+} from "./tool-loading";
 import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
-import {
-	applyToolUseIdRemap,
-	collectToolUseIdsFromHistory,
-	remapToolResultIds,
-	reserveUniqueToolUseIds,
-} from "./tool-use-id-dedup";
 import { SHELL_TOOL_NAME } from "./tools/bash";
 import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
 import { replace as applyEditReplacement, findReplaceMatch } from "./tools/edit";
@@ -126,6 +129,7 @@ import type {
 	AgentEvent,
 	AgentHistoryReplacement,
 	AgentInputPart,
+	AgentLoopHistory,
 	AgentToolUse,
 	ApiRequestDiagnostics,
 	ContentBlock,
@@ -756,7 +760,7 @@ function stampReasoningSource(
 	return { ...metadata, signatureSource: source };
 }
 
-/** Convert the per-itemId reasoning map to the blocks array expected by pushAssistantTurn. */
+/** The reasoning blocks of the per-itemId map that carry text or a credential. */
 function collectReasoningBlocks(
 	map: Map<string, ReasoningBlockEntry>,
 ): ReasoningBlockEntry[] | undefined {
@@ -1032,7 +1036,12 @@ export function buildTaskReflectionPrompt(
 
 export interface ReflectionLoopRunOptions {
 	parentConfig: AgentConfig;
-	history: unknown[];
+	/**
+	 * The rows the parent's request was projected from (its transcript plus the input it
+	 * sent). The reflection's request is their projection plus `prompt`, so it starts with
+	 * exactly the bytes the parent sent and shares its cacheable prefix.
+	 */
+	rows: readonly DbMessage[];
 	prompt: string;
 	reflectionLoop: NonNullable<AgentConfig["reflectionLoop"]>;
 	abortController?: AbortController;
@@ -1048,15 +1057,6 @@ export interface ReflectionLoopRunOptions {
 	 * identity, so only the caller can address the right card.
 	 */
 	onProgress?: (snapshot: ProgressSnapshot) => void;
-	/**
-	 * Whether the nested loop should inject the parent's system prompt itself.
-	 *
-	 * Defaults to `false` whenever a non-empty parent history is inherited: that
-	 * history was already produced by the parent loop's own injection, so a second
-	 * injection duplicates the prompt and shifts the cacheable prefix. Callers that
-	 * pass a raw history with no system prompt of its own can set this to `true`.
-	 */
-	injectParentSystemPrompt?: boolean;
 }
 
 export interface ReflectionLoopObservation {
@@ -1283,9 +1283,9 @@ const requestToolSnapshots = new WeakMap<
 		provider: string;
 		model: string;
 		tools: unknown[];
+		toolLoadingStrategy: ToolLoadingStrategy;
 	}
 >();
-const inheritedPromptConfigs = new WeakSet<AgentConfig>();
 
 function buildReflectionCorrectionPrompt(config: AgentConfig): string {
 	const tools = config.reflectionLoop?.allowedTools.join(", ") ?? "";
@@ -1300,33 +1300,16 @@ export async function runReflectionLoop(
 ): Promise<ReflectionLoopObservation> {
 	const {
 		parentConfig,
-		history,
+		rows,
 		prompt,
 		reflectionLoop,
 		abortController = new AbortController(),
 		maxTurns = 2,
 		label = "reflection loop",
 		onProgress,
-		injectParentSystemPrompt,
 	} = options;
 	const allowedTools = new Set(reflectionLoop.allowedTools);
 	const progress = createThrottledProgressReporter(onProgress);
-	// The history handed to us is the parent agentLoop's own post-injection array:
-	// agentLoop calls injectSystemPrompt once before its turn loop, so a non-empty
-	// inherited history already carries the system prompt as its leading entry.
-	//
-	// Letting the nested loop inject again produced two copies — a stray
-	// `__SYSTEM__:` user block on Anthropic, doubled `instructions` on
-	// codex/openai, a duplicated leading user message on some gateways — and, because
-	// the duplicate lands at the very front, it shifted every following byte and
-	// destroyed the cacheable prefix this loop shares with the parent
-	// conversation. Prompt caching is a byte-exact prefix match, so a reflection
-	// on a 200k-token conversation re-billed the whole prefix at full price.
-	//
-	// `injectParentSystemPrompt` lets a caller that builds a raw history (rather
-	// than inheriting the parent's) opt back in.
-	const inheritsInjectedSystemPrompt =
-		injectParentSystemPrompt === undefined ? history.length > 0 : !injectParentSystemPrompt;
 	const pendingApiRequests = new Map<string, ApiRequestHandle>();
 	const observed: ReflectionLoopObservation = {
 		assistantMessages: 0,
@@ -1347,7 +1330,7 @@ export async function runReflectionLoop(
 			signal: abortController.signal,
 			maxTurns: Number.isFinite(maxTurns) ? Math.max(1, Math.min(2, Math.floor(maxTurns))) : 2,
 			reflectionLoop,
-			// Keep systemPrompt available to dynamic tool definitions; suppress only injection.
+			// The parent's system prompt is inherited: the projected request starts as the parent's did.
 			getRuntimeSettingsOverride: undefined,
 			getModelOverride: undefined,
 			// Auxiliary inputs cannot replace or pin the parent conversation's classification.
@@ -1361,6 +1344,9 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
+			// A reflection extends the parent's request rows in memory; it writes no rows of its own.
+			rebuildRequestHistory: undefined,
+			historyEndsWithToolResults: undefined,
 			shouldIdleOnReasoningOnly: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
@@ -1388,10 +1374,11 @@ export async function runReflectionLoop(
 				};
 			},
 		};
-		if (inheritsInjectedSystemPrompt) inheritedPromptConfigs.add(reflectionConfig);
 		const snapshot = requestToolSnapshots.get(parentConfig);
 		if (snapshot) requestToolSnapshots.set(reflectionConfig, snapshot);
-		for await (const event of agentLoop(reflectionConfig, prompt, [...history])) {
+		// The parent's rows, projected the way the parent's request was (same adapter,
+		// tools and system prompt): the reflection's request extends those bytes.
+		for await (const event of agentLoop(reflectionConfig, prompt, { rows })) {
 			if (event.type === "api_request_start") {
 				pendingApiRequests.set(
 					event.requestId,
@@ -1502,7 +1489,7 @@ export async function runReflectionLoop(
 
 async function runDangerReflectionLoop(
 	parentConfig: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	pause: DangerReflectionPermission,
 	toolUse: AgentToolUse,
 	reflectionAbort: AbortController,
@@ -1513,7 +1500,7 @@ async function runDangerReflectionLoop(
 	);
 	return runReflectionLoop({
 		parentConfig,
-		history,
+		rows,
 		prompt: buildDangerReflectionPrompt(pause, toolUse.name, pause.input, locale),
 		onProgress: (snapshot) => broadcastDangerReflectionProgress(pause.requestId, snapshot),
 		reflectionLoop: {
@@ -1539,7 +1526,7 @@ async function runDangerReflectionLoop(
 
 async function runExitPlanModeReflectionLoop(
 	parentConfig: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	requestId: string,
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
@@ -1548,7 +1535,7 @@ async function runExitPlanModeReflectionLoop(
 	const locale = (parentConfig.locale as Locale) ?? "en";
 	return runReflectionLoop({
 		parentConfig,
-		history,
+		rows,
 		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
 		onProgress: (snapshot) => void broadcastPlanReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
@@ -1570,7 +1557,7 @@ async function runExitPlanModeReflectionLoop(
 
 async function runTaskReflectionLoop(
 	parentConfig: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	requestId: string,
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
@@ -1580,7 +1567,7 @@ async function runTaskReflectionLoop(
 	const locale = (parentConfig.locale as Locale) ?? "en";
 	return runReflectionLoop({
 		parentConfig,
-		history,
+		rows,
 		prompt: buildTaskReflectionPrompt(requestId, input, mutations, locale),
 		onProgress: (snapshot) => void broadcastTaskReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
@@ -1667,7 +1654,7 @@ async function discardDangerReflectionRuntimeState(requestId: string): Promise<v
 
 export async function resolveDangerReflectionDecision(
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	pause: DangerReflectionPermission,
 	toolUse: AgentToolUse,
 ): Promise<PermissionResult> {
@@ -1686,13 +1673,7 @@ export async function resolveDangerReflectionDecision(
 	//
 	// Converting the rejection to a fulfilment keeps the fallback path reachable, which is what
 	// cancels the gate and converges the row. The plan and task gates already do exactly this.
-	const reflectionPromise = runDangerReflectionLoop(
-		config,
-		history,
-		pause,
-		toolUse,
-		reflectionAbort,
-	)
+	const reflectionPromise = runDangerReflectionLoop(config, rows, pause, toolUse, reflectionAbort)
 		.catch((err) => {
 			const crashMessage = extractErrorMessage(err);
 			logger.warn("Danger reflection loop ended unexpectedly", {
@@ -1818,7 +1799,7 @@ interface ExitPlanReflectionGateResult {
 
 export async function resolveExitPlanModeReflection(
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	toolUse: AgentToolUse,
 	recoveryGate?: PersistedRecoveryGate,
 ): Promise<ExitPlanReflectionGateResult> {
@@ -1893,7 +1874,7 @@ export async function resolveExitPlanModeReflection(
 	let failedCheckFeedback: string | undefined;
 	const reflectionPromise = runExitPlanModeReflectionLoop(
 		config,
-		history,
+		rows,
 		requestId,
 		toolUse,
 		resolvedInput.input,
@@ -2219,7 +2200,7 @@ function appendTaskReflectionConfirmation(
 
 async function resolveTaskReflection(
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	toolUse: AgentToolUse,
 	candidateContent: string,
 	recoveryGate?: PersistedRecoveryGate,
@@ -2289,7 +2270,7 @@ async function resolveTaskReflection(
 	let failedCheckFeedback: string | undefined;
 	const reflectionPromise = runTaskReflectionLoop(
 		config,
-		history,
+		rows,
 		requestId,
 		toolUse,
 		input,
@@ -2373,7 +2354,7 @@ interface ExecuteToolAfterReflectionsOptions {
 export async function executePersistedToolAfterReflections(
 	tu: AgentToolUse,
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	options: Parameters<typeof executeTool>[2] & { recoveryGate?: PersistedRecoveryGate } = {},
 ): Promise<ToolExecResult> {
 	if (options.recoveryGate?.executionStartedAt) {
@@ -2407,7 +2388,7 @@ export async function executePersistedToolAfterReflections(
 			if (recoveryReflection(options.recoveryGate)?.status === "awaiting_user") {
 				return result.decision;
 			}
-			return resolveDangerReflectionDecision(recoveredConfig, history, result, {
+			return resolveDangerReflectionDecision(recoveredConfig, rows, result, {
 				name,
 				input: result.input,
 				toolUseId,
@@ -2435,22 +2416,16 @@ export async function executePersistedToolAfterReflections(
 			requested: options.preFrozenTarget.deviceId,
 		});
 	}
-	return executeToolAfterReflections(
-		tu,
-		recoveredConfig,
-		history,
-		(config.locale as Locale) ?? "en",
-		{
-			executeOptions: options,
-			recoveryGate: options.recoveryGate,
-		},
-	);
+	return executeToolAfterReflections(tu, recoveredConfig, rows, (config.locale as Locale) ?? "en", {
+		executeOptions: options,
+		recoveryGate: options.recoveryGate,
+	});
 }
 
 async function executeToolAfterReflections(
 	tu: AgentToolUse,
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	locale: Locale,
 	options: ExecuteToolAfterReflectionsOptions = {},
 ): Promise<ToolExecResult> {
@@ -2534,7 +2509,7 @@ async function executeToolAfterReflections(
 				: config;
 			const reflected = await resolveExitPlanModeReflection(
 				reflectionConfig,
-				history,
+				rows,
 				tu,
 				options.recoveryGate,
 			);
@@ -2594,7 +2569,7 @@ async function executeToolAfterReflections(
 					await freezeExecution();
 					const reflected = await resolveTaskReflection(
 						config,
-						history,
+						rows,
 						tu,
 						candidateContent,
 						options.recoveryGate,
@@ -2664,8 +2639,7 @@ export function agentLoop(
 async function* agentLoopInMetadataSnapshot(
 	config: AgentConfig,
 	userText: string,
-	history: unknown[],
-	initialToolResults?: unknown[],
+	initialHistory: AgentLoopHistory = { rows: [] },
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
 	const guidanceSignal =
@@ -2697,19 +2671,27 @@ async function* agentLoopInMetadataSnapshot(
 	);
 	const locale = (config.locale as Locale) ?? "en";
 
+	/** The conversation this loop's requests are projected from (`loop-transcript.ts`). */
+	const transcript = new LoopTranscript(initialHistory.rows);
+	/** The turn's input until the model has answered it; then it is a transcript row. */
+	let uncommittedInput: { text: string; images?: readonly TranscriptImage[] } = { text: "" };
+	/**
+	 * The rows the current request is projected from: the transcript plus the turn's
+	 * input. A reflection gating one of its calls starts from exactly these.
+	 */
+	const requestRows = (): DbMessage[] =>
+		transcript.withInput(uncommittedInput.text, uncommittedInput.images);
+
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
 	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
 	const originalPermissionHandler = config.permissionHandler;
-	// A streamed tool may request reflection before the provider's current user
-	// turn has been appended to history. Supply that turn on a separate array.
-	let getPermissionHistory = (): unknown[] => history;
 	let permissionTail: Promise<void> = Promise.resolve();
 	config.permissionHandler = async (toolName, input, toolUseId, options) => {
 		const run = permissionTail.then(async () => {
 			const result = await originalPermissionHandler(toolName, input, toolUseId, options);
 			if (result.behavior !== "dangerReflection") return result;
 
-			return resolveDangerReflectionDecision(config, getPermissionHistory(), result, {
+			return resolveDangerReflectionDecision(config, requestRows(), result, {
 				toolUseId,
 				name: toolName,
 				input: result.input,
@@ -2823,9 +2805,26 @@ async function* agentLoopInMetadataSnapshot(
 		}
 	}
 
-	let tools =
-		inheritedTools?.tools ??
-		provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+	/**
+	 * Format the request's tool array for the current adapter. Managed optional tools
+	 * follow the history's loading state and the adapter's tool loading strategy, so the
+	 * array stays fixed while tools are loaded inside the history.
+	 */
+	let toolLoadingStrategy: ToolLoadingStrategy =
+		inheritedTools?.toolLoadingStrategy ?? "replace_tools";
+	function formatRequestToolsForProvider(): unknown[] {
+		toolLoadingStrategy = usesToolLoading(config.toolLoading)
+			? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
+			: "replace_tools";
+		return formatRequestTools(
+			(selected) => provider.formatTools(selected),
+			resolveToolsForProvider(effectiveProvider, effectiveModel),
+			config.toolLoading,
+			toolLoadingStrategy,
+		);
+	}
+
+	let tools = inheritedTools?.tools ?? formatRequestToolsForProvider();
 	await reportToolsCharacters(tools);
 	/**
 	 * The plan-mode tool-description state `tools` was formatted with.
@@ -2834,10 +2833,6 @@ async function* agentLoopInMetadataSnapshot(
 	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
 	 */
 	let toolsPlanModeDisabled = planModeDisablesTools();
-	// The current provider-formatted results are the single replay source, including on
-	// turn zero: a retry rebuild may rename IDs or move these results into history.
-	// Never re-read initialToolResults when committing or reflecting the current input.
-	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
 	const silentToolCallThreshold = normalizeSilentToolCallThreshold(config.silentToolCallThreshold);
@@ -2869,30 +2864,87 @@ async function* agentLoopInMetadataSnapshot(
 	type LoopInjection = NonNullable<Parameters<NonNullable<typeof config.deliverInjectionRow>>[0]>;
 
 	const pendingLoopInjections: LoopInjection[] = [];
+	/**
+	 * Loop-control notices (turn nudge, broken call, continue). Unlike the advisory
+	 * reminders, the next request is wrong without them, so a host that cannot persist a
+	 * row (a reflection loop, a probe) still sends their text from memory.
+	 */
+	const requiredLoopInjections = new WeakSet<LoopInjection>();
 
 	function queueLoopInjection(injection: LoopInjection): void {
 		if (!injection.content.trim()) return;
 		pendingLoopInjections.push(injection);
 	}
 
+	/** Queue a loop-control notice; persisted as its own row like every other reminder. */
+	function queueLoopNotice(source: string, params?: Record<string, string | number>): void {
+		const injection: LoopInjection = {
+			source,
+			...sideCarBodyWithText(source, { kind: "notice", ...(params ? { params } : {}) }, locale),
+		};
+		requiredLoopInjections.add(injection);
+		queueLoopInjection(injection);
+	}
+
 	/** Persist reminders once, retaining their source IDs until input is actually assembled. */
 	async function flushLoopInjections(): Promise<void> {
 		if (pendingLoopInjections.length === 0) return;
 		const queued = pendingLoopInjections.splice(0, pendingLoopInjections.length);
-		if (!config.deliverInjectionRow) return;
 		for (const injection of queued) {
-			try {
-				const delivered = await config.deliverInjectionRow(injection);
-				const part = typeof delivered === "string" ? { text: delivered } : delivered;
-				if (part.text.trim()) pendingInputParts.push(part);
-			} catch (err) {
-				logger.warn("Failed to deliver loop injection row", {
-					narratorId: config.narratorId,
-					source: injection.source,
-					error: String(err),
-				});
+			let delivered = false;
+			if (config.deliverInjectionRow) {
+				try {
+					const result = await config.deliverInjectionRow(injection);
+					const part = typeof result === "string" ? { text: result } : result;
+					if (part.text.trim()) {
+						pendingInputParts.push(part);
+						delivered = true;
+					}
+				} catch (err) {
+					logger.warn("Failed to deliver loop injection row", {
+						narratorId: config.narratorId,
+						source: injection.source,
+						error: String(err),
+					});
+				}
 			}
+			if (!delivered && requiredLoopInjections.has(injection))
+				pendingInputParts.push({ text: injection.content });
 		}
+	}
+
+	/**
+	 * The persisted form of one settled tool result.
+	 *
+	 * A broken call stores its sanitized input and the fixed broken-call result (the
+	 * model's history leaves it out); images travel with the event so the consumer can
+	 * save them, which is what lets a rebuilt request carry them too.
+	 */
+	function toolResultEvent(
+		tu: AgentToolUse,
+		result: ToolExecResult,
+		overrides: { durationMs?: number; metadata?: Record<string, unknown> } = {},
+	): Extract<AgentEvent, { type: "tool_result" }> {
+		const brokenInputOverride = result.broken
+			? sanitizeBrokenInput(tu.name, result.updatedInput ?? tu.input, locale)
+			: undefined;
+		return {
+			type: "tool_result",
+			toolCallBinding: executionBindings.get(tu),
+			toolUseId: tu.toolUseId,
+			toolName: tu.name,
+			input: result.updatedInput ?? tu.input,
+			output: result.broken ? getToolMessage("brokenToolCallResult", locale) : result.output,
+			isError: result.isError ?? false,
+			durationMs: overrides.durationMs ?? result.durationMs,
+			permissionStartedAt: result.permissionStartedAt,
+			executionStartedAt: result.executionStartedAt,
+			completedAt: result.completedAt,
+			brokenInputOverride,
+			updatedInput: brokenInputOverride ?? result.updatedInput,
+			metadata: overrides.metadata ?? result.metadata,
+			...(!result.broken && result.images?.length ? { images: result.images } : {}),
+		};
 	}
 
 	/**
@@ -3073,15 +3125,41 @@ async function* agentLoopInMetadataSnapshot(
 		}
 	}
 
+	/** A built history with this loop's system prompt; the builder's array stays untouched. */
+	function withSystemPrompt(built: unknown[]): unknown[] {
+		const history = [...built];
+		if (config.systemPrompt)
+			provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+		return history;
+	}
+
+	/**
+	 * The host's history for the next request while it is current: the first request's
+	 * build, or a rebuild at a turn boundary. Without one, the request is the projection
+	 * of the transcript — the same builder over the same kind of rows.
+	 */
+	let hostHistory: unknown[] | null = initialHistory.built
+		? withSystemPrompt(initialHistory.built)
+		: null;
 	// Preserve the exact build identity for delivery receipts; the model history itself
 	// is copied/mutated by provider projections and must not be used as a global inbox.
-	let sourceInputHistory = history;
-	// Shallow-copy to avoid mutating the caller's array
-	history = [...history];
+	let sourceInputHistory: unknown[] = initialHistory.built ?? [];
 
-	// Inherited reflection history already contains this prompt.
-	if (config.systemPrompt && !inheritedPromptConfigs.has(config)) {
-		provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+	/** A request's history from rows, for the current adapter, model and tool layout. */
+	async function projectRows(rows: readonly DbMessage[]): Promise<unknown[]> {
+		const built = await buildAdapterHistory(
+			provider,
+			rows,
+			{ provider: effectiveProvider, model: effectiveModel },
+			{
+				narratorId: config.narratorId,
+				// Injected schemas are already notice text in host rows (`buildRuntimeHistory`).
+				...(usesToolLoading(config.toolLoading) && toolLoadingStrategy !== "custom_injection"
+					? { toolLoading: { state: config.toolLoading, strategy: toolLoadingStrategy } }
+					: {}),
+			},
+		);
+		return withSystemPrompt(built.history);
 	}
 
 	// Extra content to prepend to the next turn's user message (e.g. broken-tool reminder).
@@ -3111,32 +3189,36 @@ async function* agentLoopInMetadataSnapshot(
 
 	let resetUpstreamSessionOnNextRequest = !!config.resetUpstreamSessionOnFirstRequest;
 
-	/**
-	 * Tool-use identifiers already present in the model-facing history.
-	 *
-	 * Providers that mint one id for every call (e.g. "call_go_0") produce a valid single
-	 * turn but an invalid history: after a few turns the replayed conversation carries the
-	 * same id many times and the API answers 400 "duplicate tool_use id". The DB rebuild
-	 * path fixes accumulated rows (see uniquifyDbMessageToolUseIds); this set guards the
-	 * turns appended in-memory during one run, which never go through a rebuild.
-	 *
-	 * Rebuilt on every history replacement so it always describes the live history.
-	 */
-	let historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
+	/** Replacements applied so far; a turn that already got one needs no rebuild. */
+	let historyReplacements = 0;
 
-	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
-		resetUpstreamSessionOnNextRequest = true;
-		history = replacement.history;
+	function applyHistoryReplacement(
+		replacement: AgentHistoryReplacement,
+		options: { sameUpstreamSession?: boolean } = {},
+	) {
+		historyReplacements++;
+		// A per-request rebuild continues the same conversation; only a replacement that
+		// changes what was already sent (compact, model switch) starts a new upstream session.
+		if (!options.sameUpstreamSession) resetUpstreamSessionOnNextRequest = true;
+		// The builder's array is the receipt identity; the system prompt goes into a copy.
 		sourceInputHistory = replacement.history;
 		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
 		}
-		if (config.systemPrompt) {
-			provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+		hostHistory = withSystemPrompt(replacement.history);
+		transcript.replace(replacement.rows);
+		// A rebuild after compact (or a load the old history did not contain) moves tools
+		// between the array and the history; keep the array in step with the new history.
+		if (
+			!inheritedTools &&
+			replacement.toolLoading &&
+			!sameToolLoadingLayout(config.toolLoading, replacement.toolLoading)
+		) {
+			config.toolLoading = replacement.toolLoading;
+			tools = formatRequestToolsForProvider();
+			void reportToolsCharacters(tools);
 		}
-		pendingToolResults = replacement.pendingToolResults;
-		historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 	}
 
 	async function hasPendingRuntimeSettingsOverride(): Promise<boolean> {
@@ -3188,7 +3270,7 @@ async function* agentLoopInMetadataSnapshot(
 				config.model = newResolved.model;
 				config.provider = newResolved.provider;
 				if (providerChanged || modelChanged) {
-					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					tools = formatRequestToolsForProvider();
 					await reportToolsCharacters(tools);
 					// This re-format already applied the current plan-mode state; record it so the
 					// turn-boundary check does not immediately redo the same work.
@@ -3207,11 +3289,9 @@ async function* agentLoopInMetadataSnapshot(
 					force: true,
 					cause: "model_switch",
 				});
-				if (replacement) {
-					applyHistoryReplacement(replacement);
-				} else if (config.systemPrompt && providerChanged) {
-					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
-				}
+				if (replacement) applyHistoryReplacement(replacement);
+				// Without a rebuild the transcript is projected for the new protocol.
+				else hostHistory = null;
 			}
 
 			logger.info("Agent loop switched runtime settings before API call", {
@@ -3252,14 +3332,6 @@ async function* agentLoopInMetadataSnapshot(
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
 			config.shouldStop?.();
-			const isFirstTurn = turnIndex === 0;
-			provider.pushUserTurn(
-				history,
-				isFirstTurn ? userText : combinePendingInput(nextTurnContent, pendingInputParts),
-				effectiveModel,
-				pendingToolResults,
-				isFirstTurn ? images : undefined,
-			);
 			yield { type: "turn_complete", turnIndex };
 			return;
 		}
@@ -3280,6 +3352,9 @@ async function* agentLoopInMetadataSnapshot(
 			const isFirstTurn = turnIndex === 0;
 
 			if (!isFirstTurn) {
+				// The host's history described the previous request; the transcript has moved on.
+				hostHistory = null;
+				const replacementsBefore = historyReplacements;
 				const switchEvent = await applyPendingRuntimeSettings("turn");
 				if (switchEvent) {
 					yield switchEvent;
@@ -3290,6 +3365,27 @@ async function* agentLoopInMetadataSnapshot(
 						applyHistoryReplacement(replacement);
 					}
 				}
+				// Every later request is the projection of the persisted rows, exactly what a
+				// rebuild of this conversation sends. A failed rebuild projects the transcript.
+				if (config.rebuildRequestHistory && historyReplacements === replacementsBefore) {
+					try {
+						const replacement = await config.rebuildRequestHistory();
+						// A new system prompt (a compact landed) changes what was already sent.
+						applyHistoryReplacement(replacement, {
+							sameUpstreamSession: replacement.systemPrompt === undefined,
+						});
+					} catch (error) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						logger.warn("Request history rebuild failed; projecting the loop's transcript", {
+							narratorId: config.narratorId,
+							turnIndex,
+							error: String(error),
+						});
+					}
+				}
 
 				// A manual plan-mode toggle landed between turns: re-format the tool array so
 				// the forbidden tools carry (or drop) the disabled description. Checked after
@@ -3297,7 +3393,7 @@ async function* agentLoopInMetadataSnapshot(
 				const planModeDisabledNow = planModeDisablesTools();
 				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
 					toolsPlanModeDisabled = planModeDisabledNow;
-					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					tools = formatRequestToolsForProvider();
 					await reportToolsCharacters(tools);
 					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
 						narratorId: config.narratorId,
@@ -3310,22 +3406,16 @@ async function* agentLoopInMetadataSnapshot(
 			const currentInputParts = pendingInputParts.splice(0);
 			let content = combinePendingInput(baseContent, currentInputParts);
 			nextTurnContent = ""; // consume once
-			getPermissionHistory = () => {
-				const reflectionHistory = [...history];
-				provider.pushUserTurn(
-					reflectionHistory,
-					content,
-					effectiveModel,
-					pendingToolResults,
-					isFirstTurn ? images : undefined,
-				);
-				return reflectionHistory;
+			const turnImages = isFirstTurn ? images : undefined;
+			uncommittedInput = { text: content, images: turnImages };
+			/** The model answered the turn's input: from now on it is part of the conversation. */
+			const commitInput = () => {
+				transcript.appendInput(uncommittedInput.text, uncommittedInput.images);
+				uncommittedInput = { text: "" };
 			};
 
 			// Call provider and collect the response
 			let assistantText = "";
-			/** Provider-native content block index for the text block (for interleaved ordering). */
-			let textOutputIndex: number | undefined;
 			/**
 			 * Reasoning blocks accumulated during streaming, keyed by itemId.
 			 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
@@ -3496,7 +3586,7 @@ async function* agentLoopInMetadataSnapshot(
 					},
 				});
 				const execution = settleToolExecutionResult(
-					executeToolAfterReflections(tu, invocationConfig, history, locale),
+					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale),
 				)
 					.then((result) =>
 						preparationAbort.signal.aborted
@@ -3678,31 +3768,6 @@ async function* agentLoopInMetadataSnapshot(
 			let lastStopReason: string | undefined;
 			const namelessToolUseIds = new Set<string>();
 
-			function earlyToolResultEvent(
-				tu: AgentToolUse,
-				settled: ToolExecResult,
-			): Extract<AgentEvent, { type: "tool_result" }> {
-				const brokenOverride = settled.broken
-					? sanitizeBrokenInput(tu.name, settled.updatedInput ?? tu.input, locale)
-					: undefined;
-				return {
-					type: "tool_result",
-					toolCallBinding: executionBindings.get(tu),
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					input: settled.updatedInput ?? tu.input,
-					output: settled.broken ? getToolMessage("brokenToolCallResult", locale) : settled.output,
-					isError: settled.isError ?? false,
-					durationMs: settled.durationMs,
-					permissionStartedAt: settled.permissionStartedAt,
-					executionStartedAt: settled.executionStartedAt,
-					completedAt: settled.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride ?? settled.updatedInput,
-					metadata: settled.metadata,
-				};
-			}
-
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
 					const settled = settledResults.get(tu.toolUseId);
@@ -3712,7 +3777,7 @@ async function* agentLoopInMetadataSnapshot(
 					if (settled.updatedInput && tu.name !== "AskUserQuestion")
 						tu.input = settled.updatedInput;
 					await processToolResultInjections(tu, settled);
-					yield earlyToolResultEvent(tu, settled);
+					yield toolResultEvent(tu, settled);
 				}
 			}
 
@@ -3733,7 +3798,7 @@ async function* agentLoopInMetadataSnapshot(
 					// final result alive without holding up interruption or emitting into
 					// a stream that may already belong to the narrator's next run.
 					void execution
-						.then((settled) => persist(earlyToolResultEvent(tu, settled)))
+						.then((settled) => persist(toolResultEvent(tu, settled)))
 						.catch((error) => {
 							logger.error("Failed to persist detached tool result", {
 								narratorId: config.narratorId,
@@ -3786,7 +3851,7 @@ async function* agentLoopInMetadataSnapshot(
 				for (const tu of toolUses) {
 					if (earlyExecMap.has(tu.toolUseId) || yieldedToolResults.has(tu.toolUseId)) continue;
 					yieldedToolResults.add(tu.toolUseId);
-					yield earlyToolResultEvent(tu, {
+					yield toolResultEvent(tu, {
 						output: locale === "zh-CN" ? "工具执行已取消。" : "Tool execution cancelled.",
 						isError: true,
 						durationMs: 0,
@@ -4413,7 +4478,6 @@ async function* agentLoopInMetadataSnapshot(
 				// dispatch), so this is safe.
 				assistantText = "";
 				outputContent.reset();
-				textOutputIndex = undefined;
 				reasoningBlockMap.clear();
 				redactedThinkingBlocks.length = 0;
 				toolUses.length = 0;
@@ -4616,10 +4680,14 @@ async function* agentLoopInMetadataSnapshot(
 					// original fragments, not a previously filtered string, so both newly
 					// replayed and newly lifted-out rows are represented exactly once.
 					content = combinePendingInput(baseContent, currentInputParts);
+					uncommittedInput = { text: content, images: turnImages };
+					// A host-built history carries the rows and the input rides beside it as the
+					// current turn; otherwise the transcript plus the input is the whole request.
+					const requestContent = hostHistory ? content : "";
 					const questionInput = projectQuestionModelInput(
-						history,
-						content,
-						pendingToolResults,
+						hostHistory ?? (await projectRows(requestRows())),
+						requestContent,
+						[],
 						config.getQuestionModelReceipts?.() ?? [],
 					);
 					// This is adoption by the recipient loop, not persistence, wake admission,
@@ -4650,6 +4718,7 @@ async function* agentLoopInMetadataSnapshot(
 						provider: effectiveProvider,
 						model: effectiveModel,
 						tools,
+						toolLoadingStrategy,
 					});
 					const toolSnapshot = requestToolSnapshots.get(config);
 					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
@@ -4669,12 +4738,13 @@ async function* agentLoopInMetadataSnapshot(
 					}
 					const stream = provider.chat({
 						conversationId: config.conversationId,
-						content,
+						content: requestContent,
 						model: effectiveModel,
 						cwd: config.cwd,
 						history: questionInput.history,
 						tools,
-						toolResults: questionInput.toolResults,
+						toolResults: [],
+						toolLoadingStrategy,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
 						reasoningEffort: config.reasoningEffort,
@@ -4697,7 +4767,7 @@ async function* agentLoopInMetadataSnapshot(
 								inputComposition = null;
 							}
 						},
-						...(isFirstTurn && images?.length ? { images } : {}),
+						...(hostHistory && turnImages?.length ? { images: turnImages } : {}),
 					});
 
 					streamExecutionOpen = true;
@@ -4887,9 +4957,6 @@ async function* agentLoopInMetadataSnapshot(
 							yield* outputContent.begin("text", textLane);
 							assistantText += parsed.text;
 							if (parsed.text.trim()) silentToolCallCount = 0;
-							if (parsed.textOutputIndex != null) {
-								textOutputIndex = parsed.textOutputIndex;
-							}
 							// Deltas are forwarded verbatim. Stripping happens once at finalize,
 							// and the read side projects historical rows anyway — a second,
 							// incremental parser here only created two ways to disagree.
@@ -5211,29 +5278,8 @@ async function* agentLoopInMetadataSnapshot(
 											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
 											if (sr.updatedInput && prevTu.name !== "AskUserQuestion")
 												prevTu.input = sr.updatedInput;
-											const brokenOverride = sr.broken
-												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
-												: undefined;
 											await processToolResultInjections(prevTu, sr);
-											const baseOutput = sr.broken
-												? getToolMessage("brokenToolCallResult", locale)
-												: sr.output;
-											yield {
-												type: "tool_result",
-												toolCallBinding: executionBindings.get(prevTu),
-												toolUseId: prevTu.toolUseId,
-												toolName: prevTu.name,
-												input: sr.updatedInput ?? prevTu.input,
-												output: baseOutput,
-												isError: sr.isError ?? false,
-												durationMs: sr.durationMs,
-												permissionStartedAt: sr.permissionStartedAt,
-												executionStartedAt: sr.executionStartedAt,
-												completedAt: sr.completedAt,
-												brokenInputOverride: brokenOverride,
-												updatedInput: brokenOverride ?? sr.updatedInput,
-												metadata: sr.metadata,
-											};
+											yield toolResultEvent(prevTu, sr);
 											if (sr.fatal) {
 												yield* finishRequest(sr.output);
 												yield { type: "error", message: sr.output };
@@ -6049,7 +6095,7 @@ async function* agentLoopInMetadataSnapshot(
 							balance: paymentRequired.balance,
 							required: paymentRequired.required,
 							resumeAction:
-								hasStartedEarlyToolExecution() || (initialToolResults?.length ?? 0) > 0
+								hasStartedEarlyToolExecution() || !!config.historyEndsWithToolResults
 									? "continue"
 									: "retry",
 						};
@@ -6440,8 +6486,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "done" };
 						return;
 					}
-					provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
-					pendingToolResults = [];
+					commitInput();
 					nextTurnContent = buildReflectionCorrectionPrompt(config);
 					yield { type: "turn_complete", turnIndex };
 					turnIndex++;
@@ -6847,7 +6892,6 @@ async function* agentLoopInMetadataSnapshot(
 						attempt: reasoningOnlyRetries,
 						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
 						isFirstTurn,
-						pendingToolResults: pendingToolResults.length,
 						contextUsagePercentage,
 						compacted: !!compactReplacement,
 					});
@@ -6871,13 +6915,12 @@ async function* agentLoopInMetadataSnapshot(
 					// The dead turn itself is discarded entirely — nothing is pushed to
 					// history, so no content:null assistant message can be created.
 					//
-					// If the request that produced the dead turn still has pending input
-					// that has NOT been committed to history yet — i.e. the first-turn user
-					// message, a mid-loop user nudge (non-empty `content`), or tool results
-					// (`pendingToolResults`) — then the previous block is a user/tool block.
-					// Re-send the exact same request by retrying the chat() call in place
-					// (same turn: history, content and toolResults are all unchanged).
-					if (isFirstTurn || content.length > 0 || pendingToolResults.length > 0) {
+					// If the request that produced the dead turn ends with input the model has
+					// not answered — the first-turn user message, a mid-loop nudge (non-empty
+					// `content`), tool results or a notice row at the end of the conversation —
+					// then the previous block is a user/tool block. Re-send the exact same
+					// request by retrying the chat() call in place (same turn, same rows).
+					if (isFirstTurn || content.length > 0 || historyTail(transcript.rows).input) {
 						continue;
 					}
 
@@ -6886,7 +6929,8 @@ async function* agentLoopInMetadataSnapshot(
 					// the model to continue, so the loop can make progress.
 					yield { type: "turn_complete", turnIndex };
 					turnIndex++;
-					nextTurnContent = getToolMessage("userContinue", locale);
+					queueLoopNotice("continue_prompt");
+					await flushLoopInjections();
 					continue turnLoop;
 				}
 
@@ -6900,7 +6944,7 @@ async function* agentLoopInMetadataSnapshot(
 
 			// ── Finalize citations for this turn's assistant text ──
 			// Runs once, here, so the SAME cleaned text feeds token estimation, the
-			// `assistant_message` event, persistence and `pushAssistantTurn`. If the
+			// `assistant_message` event, persistence and the transcript. If the
 			// raw text were used for the model history, the next turn would see the
 			// internal markers and happily reproduce them.
 			const finalizedText = outputContent.finalizeText();
@@ -6920,37 +6964,6 @@ async function* agentLoopInMetadataSnapshot(
 			// from identities recorded at tool start before persistence, execution grouping,
 			// and model-facing tool results consume the completed calls.
 			sortToolUsesByOutputOrder();
-
-			// Reserve this turn's tool_use identifiers against the ones already in history,
-			// and coerce them into the character set every channel accepts.
-			// Providers that mint a single id for every call (e.g. "call_go_0") would otherwise
-			// make the replayed history carry the same id in several assistant messages, which
-			// the API rejects with 400 "duplicate tool_use id"; ids like "Bash:0" are accepted
-			// by Anthropic but rejected outright by NUG's strict gateway, which would break the
-			// session the moment it is switched there. Only the model-facing history is
-			// rewritten — the tool_use objects below keep the provider's original id, so
-			// persistence, the UI, and permission/approval flows are unaffected.
-			const turnToolUseIdRemap = reserveUniqueToolUseIds(toolUses, historyToolUseIds);
-			if (turnToolUseIdRemap.size > 0) {
-				logger.warn("Rewrote unusable tool_use IDs for model history", {
-					narratorId: config.narratorId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					requestId,
-					renamedCount: turnToolUseIdRemap.size,
-					originalIds: [...turnToolUseIdRemap.keys()].slice(0, 10),
-				});
-			}
-			/** Tool uses with history-safe ids, for provider.pushAssistantTurn. */
-			const toHistoryToolUses = (list: AgentToolUse[]): AgentToolUse[] =>
-				applyToolUseIdRemap(
-					list.map((toolUse) => {
-						if (toolUse.name !== "AskUserQuestion") return toolUse;
-						const input = projectAskUserQuestionInput(toolUse.input);
-						return input === toolUse.input ? toolUse : { ...toolUse, input };
-					}),
-					turnToolUseIdRemap,
-				);
 
 			// No fabricated billing counters: occupancy estimates live only in contextSnapshot.
 
@@ -6994,27 +7007,8 @@ async function* agentLoopInMetadataSnapshot(
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
 				if (sr.updatedInput && tu.name !== "AskUserQuestion") tu.input = sr.updatedInput;
-				const brokenOverride = sr.broken
-					? sanitizeBrokenInput(tu.name, tu.input, locale)
-					: undefined;
 				await processToolResultInjections(tu, sr);
-				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
-				yield {
-					type: "tool_result",
-					toolCallBinding: executionBindings.get(tu),
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					input: sr.updatedInput ?? tu.input,
-					output: baseOutput,
-					isError: sr.isError ?? false,
-					durationMs: sr.durationMs,
-					permissionStartedAt: sr.permissionStartedAt,
-					executionStartedAt: sr.executionStartedAt,
-					completedAt: sr.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride ?? sr.updatedInput,
-					metadata: sr.metadata,
-				};
+				yield toolResultEvent(tu, sr);
 				if (sr.fatal) {
 					yield { type: "error", message: sr.output };
 					return;
@@ -7032,13 +7026,6 @@ async function* agentLoopInMetadataSnapshot(
 				!collectCompletedImageGenerations(imageGenAccum)
 			) {
 				responseActivity.release();
-				provider.pushUserTurn(
-					history,
-					isFirstTurn ? userText : content,
-					effectiveModel,
-					pendingToolResults,
-					isFirstTurn ? images : undefined,
-				);
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
@@ -7072,84 +7059,31 @@ async function* agentLoopInMetadataSnapshot(
 				// Still-running detached calls retain their real pending rows. Do not fabricate
 				// skipped results or replay their incomplete pairs into model-facing history.
 				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
-				const guidanceResults: unknown[] = [];
 				for (const tu of guidanceTools) {
-					const result = settledResults.get(tu.toolUseId) ?? {
-						output: getToolMessage("skippedForSoftStop", locale),
-						isError: true,
-						durationMs: 0,
-						completedAt: Date.now(),
-						metadata: { skippedForSoftStop: true },
-					};
-					if (!yieldedToolResults.has(tu.toolUseId)) {
-						yieldedToolResults.add(tu.toolUseId);
-						yield earlyToolResultEvent(tu, result);
-					}
-					guidanceResults.push(
-						provider.formatToolResult(
-							turnToolUseIdRemap.get(tu.toolUseId) ?? tu.toolUseId,
-							result.output,
-							result.isError ?? false,
-							result.images,
-							tu.name,
-						),
+					if (yieldedToolResults.has(tu.toolUseId)) continue;
+					yieldedToolResults.add(tu.toolUseId);
+					yield toolResultEvent(
+						tu,
+						settledResults.get(tu.toolUseId) ?? {
+							output: getToolMessage("skippedForSoftStop", locale),
+							isError: true,
+							durationMs: 0,
+							completedAt: Date.now(),
+							metadata: { skippedForSoftStop: true },
+						},
 					);
 				}
-				provider.pushUserTurn(
-					history,
-					isFirstTurn ? userText : content,
-					effectiveModel,
-					pendingToolResults,
-					isFirstTurn ? images : undefined,
-				);
-				if (
-					assistantText ||
-					guidanceTools.length > 0 ||
-					collectReasoningBlocks(reasoningBlockMap)
-				) {
-					provider.pushAssistantTurn(
-						history,
-						assistantText,
-						toHistoryToolUses(guidanceTools),
-						collectReasoningBlocks(reasoningBlockMap),
-						collectCompletedWebSearches(webSearchAccum),
-						messageId,
-						collectCompletedImageGenerations(imageGenAccum),
-						textOutputIndex,
-						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(guidanceTools)),
-					);
-				}
-				if (guidanceResults.length > 0)
-					provider.pushUserTurn(history, "", effectiveModel, guidanceResults);
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
 
 			if (hasOrphanedToolUses) {
-				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-					toolNames: orphanedToolNames.join(", "),
-				});
+				queueLoopNotice("broken_call", { toolNames: orphanedToolNames.join(", ") });
 				if (toolUses.length === 0) {
-					if (isFirstTurn) {
-						provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
-					} else if (content || pendingToolResults.length > 0) {
-						provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
-					}
-					// These results are now in history, not pending input for the recovery request.
-					pendingToolResults = [];
-					provider.pushAssistantTurn(
-						history,
-						assistantText,
-						[],
-						collectReasoningBlocks(reasoningBlockMap),
-						collectCompletedWebSearches(webSearchAccum),
-						messageId,
-						collectCompletedImageGenerations(imageGenAccum),
-						textOutputIndex,
-						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(toolUses)),
-					);
+					commitInput();
+					transcript.appendStep(orderedAssistantContent([]));
+					// No tools ran, so the boundary below is skipped: deliver the notice here.
+					await flushLoopInjections();
 					yield { type: "turn_complete", turnIndex };
 					turnIndex++;
 					continue;
@@ -7168,14 +7102,8 @@ async function* agentLoopInMetadataSnapshot(
 					parseDangerReflectionTextFallback(assistantText)
 				)
 			) {
-				provider.pushUserTurn(
-					history,
-					isFirstTurn ? userText : content,
-					effectiveModel,
-					pendingToolResults,
-				);
-				provider.pushAssistantTurn(history, assistantText, []);
-				pendingToolResults = [];
+				commitInput();
+				if (assistantText) transcript.appendStep([{ type: "text", text: assistantText }]);
 				nextTurnContent = buildReflectionCorrectionPrompt(config);
 				yield { type: "turn_complete", turnIndex };
 				turnIndex++;
@@ -7188,32 +7116,20 @@ async function* agentLoopInMetadataSnapshot(
 				return;
 			}
 
-			// Push the current user turn into history for the next turn.
-			// This must happen AFTER the API call (not before), because
-			// chat() references the history array directly.
-			// After-tools injections are already consumed; retain their actual content
-			// in memory too, or later requests lose them until a full history rebuild.
-			if (isFirstTurn) {
-				provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
-			} else if (content || pendingToolResults.length > 0) {
-				provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
-			}
+			// The model answered this turn's input, so it joins the transcript now; a
+			// permission resolving after the stream reads it there, not a second time.
+			commitInput();
 
-			// The current input now lives in history; pending permissions must not
-			// append it a second time when they resolve after stream completion.
-			getPermissionHistory = () => history;
-
-			// Execute each tool call
-			pendingToolResults = [];
-			// Nudge threshold: append a wrap-up reminder when ≥80% of maxTurns used
+			// Execute each tool call. Their results join the transcript with the step, in
+			// call order, once the step's tools have run.
+			const stepResults = new Map<string, ToolExecResult>();
+			// Nudge threshold: a wrap-up notice after this step's results when ≥80% of
+			// maxTurns is used. Its own row, after the results, not inside the last one.
 			const nudgeThreshold = Math.floor(maxTurns * 0.8);
 			const shouldNudge = turnIndex >= nudgeThreshold;
-			const nudgeText = shouldNudge
-				? getToolMessageWithParams("turnNudge", locale, {
-						turnIndex: turnIndex + 1,
-						maxTurns,
-					})
-				: "";
+			const queueTurnNudge = () => {
+				if (shouldNudge) queueLoopNotice("turn_nudge", { turnIndex: turnIndex + 1, maxTurns });
+			};
 
 			// Preserve provider order while grouping consecutive parallel-safe calls.
 			// The same grouping function is used by planned-update recovery.
@@ -7264,26 +7180,12 @@ async function* agentLoopInMetadataSnapshot(
 					}
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 					// When the permission handler redirected the input (e.g. the plan file),
-					// update the in-memory tool_use so pushAssistantTurn writes the correct
-					// input into history — otherwise the model sees the original (wrong) path.
+					// update the in-memory tool_use so the transcript's step carries the input
+					// the call ran with — otherwise the model sees the original (wrong) path.
 					if (result.updatedInput && tu.name !== "AskUserQuestion") tu.input = result.updatedInput;
 					await processToolResultInjections(tu, result);
-					const isLastTool = toolIndex === toolUses.length - 1;
-					// The turn nudge is still appended inline: it is about THIS being the last
-					// tool of a nearly-exhausted turn, so it has to travel with that result
-					// rather than wait for a boundary the loop may not reach.
-					const outputForModel =
-						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
-
-					pendingToolResults.push(
-						provider.formatToolResult(
-							tu.toolUseId,
-							outputForModel,
-							result.isError ?? false,
-							result.images,
-							tu.name,
-						),
-					);
+					if (toolIndex === toolUses.length - 1) queueTurnNudge();
+					stepResults.set(tu.toolUseId, result);
 
 					if (yieldedToolResults.has(tu.toolUseId)) {
 						// Already yielded during streaming — just accumulate timing
@@ -7304,34 +7206,13 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						prevToolsExecMs += result.durationMs;
 
-						// For broken tool calls, sanitize the persisted input and output
-						// so the DB shows a clean message instead of truncated garbage.
-						const brokenInputOverride = result.broken
-							? sanitizeBrokenInput(tu.name, tu.input, locale)
-							: undefined;
-
 						yieldedToolResults.add(tu.toolUseId);
-						yield {
-							type: "tool_result",
-							toolCallBinding: executionBindings.get(tu),
-							toolUseId: tu.toolUseId,
-							toolName: tu.name,
-							input: result.updatedInput ?? tu.input,
-							output: result.broken
-								? getToolMessage("brokenToolCallResult", locale)
-								: result.output,
-							isError: result.isError ?? false,
+						yield toolResultEvent(tu, result, {
 							durationMs,
-							permissionStartedAt: result.permissionStartedAt,
-							executionStartedAt: result.executionStartedAt,
-							completedAt: result.completedAt,
-							brokenInputOverride,
-							updatedInput: brokenInputOverride ?? result.updatedInput,
-							metadata:
-								durationMs !== result.durationMs
-									? { ...result.metadata, execDurationMs: result.durationMs }
-									: result.metadata,
-						};
+							...(durationMs !== result.durationMs
+								? { metadata: { ...result.metadata, execDurationMs: result.durationMs } }
+								: {}),
+						});
 						toolIndex++;
 
 						if (result.fatal) {
@@ -7376,7 +7257,6 @@ async function* agentLoopInMetadataSnapshot(
 					const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
 
 					const settled = new Array<ToolExecResult | undefined>(group.length);
-					const formattedResults = new Array<unknown>(group.length);
 					const groupStartToolIndex = toolIndex;
 					let remaining = new Set(indexed);
 					let hasFatal = false;
@@ -7407,34 +7287,13 @@ async function* agentLoopInMetadataSnapshot(
 						await processToolResultInjections(tu, effectiveResult);
 
 						// Persist and broadcast every completed result immediately in completion order.
-						// Model-facing formatting still happens below in the original call order.
+						// The transcript keeps call order: results settle into the step's calls.
 						if (!yieldedToolResults.has(tu.toolUseId)) {
 							// Mark before yielding. The consumer may abort while handling this
 							// event; an abort drain at the next group boundary must not replay
 							// a result that was already delivered to persistence/UI.
 							yieldedToolResults.add(tu.toolUseId);
-							const brokenInputOverride = effectiveResult.broken
-								? sanitizeBrokenInput(tu.name, tu.input, locale)
-								: undefined;
-
-							yield {
-								type: "tool_result",
-								toolCallBinding: executionBindings.get(tu),
-								toolUseId: tu.toolUseId,
-								toolName: tu.name,
-								input: effectiveResult.updatedInput ?? tu.input,
-								output: effectiveResult.broken
-									? getToolMessage("brokenToolCallResult", locale)
-									: effectiveResult.output,
-								isError: effectiveResult.isError ?? false,
-								durationMs: effectiveResult.durationMs,
-								permissionStartedAt: effectiveResult.permissionStartedAt,
-								executionStartedAt: effectiveResult.executionStartedAt,
-								completedAt: effectiveResult.completedAt,
-								brokenInputOverride,
-								updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
-								metadata: effectiveResult.metadata,
-							};
+							yield toolResultEvent(tu, effectiveResult);
 						}
 						if (effectiveResult.durationMs > maxParallelMs)
 							maxParallelMs = effectiveResult.durationMs;
@@ -7443,24 +7302,11 @@ async function* agentLoopInMetadataSnapshot(
 					}
 
 					for (let i = 0; i < group.length; i++) {
-						const tu = group[i];
 						const effectiveResult = settled[i];
 						if (!effectiveResult) continue;
-						const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
-						const outputForModel =
-							isLastTool && shouldNudge
-								? effectiveResult.output + nudgeText
-								: effectiveResult.output;
-						formattedResults[i] = provider.formatToolResult(
-							tu.toolUseId,
-							outputForModel,
-							effectiveResult.isError ?? false,
-							effectiveResult.images,
-							tu.name,
-						);
+						if (groupStartToolIndex + i === toolUses.length - 1) queueTurnNudge();
+						stepResults.set(group[i].toolUseId, effectiveResult);
 					}
-
-					pendingToolResults.push(...formattedResults);
 					toolIndex += group.length;
 					prevToolsExecMs += maxParallelMs;
 
@@ -7481,15 +7327,6 @@ async function* agentLoopInMetadataSnapshot(
 					for (const remainingTool of toolUses.slice(toolIndex)) {
 						const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
 						if (!earlyPromise) {
-							pendingToolResults.push(
-								provider.formatToolResult(
-									remainingTool.toolUseId,
-									skippedOutput,
-									true,
-									undefined,
-									remainingTool.name,
-								),
-							);
 							if (!yieldedToolResults.has(remainingTool.toolUseId)) {
 								yieldedToolResults.add(remainingTool.toolUseId);
 								yield {
@@ -7522,39 +7359,10 @@ async function* agentLoopInMetadataSnapshot(
 						if (result.updatedInput && remainingTool.name !== "AskUserQuestion")
 							remainingTool.input = result.updatedInput;
 						await processToolResultInjections(remainingTool, result);
-						pendingToolResults.push(
-							provider.formatToolResult(
-								remainingTool.toolUseId,
-								result.output,
-								result.isError ?? false,
-								result.images,
-								remainingTool.name,
-							),
-						);
 
 						if (!yieldedToolResults.has(remainingTool.toolUseId)) {
 							yieldedToolResults.add(remainingTool.toolUseId);
-							const brokenInputOverride = result.broken
-								? sanitizeBrokenInput(remainingTool.name, remainingTool.input, locale)
-								: undefined;
-							yield {
-								type: "tool_result",
-								toolCallBinding: executionBindings.get(remainingTool),
-								toolUseId: remainingTool.toolUseId,
-								toolName: remainingTool.name,
-								input: result.updatedInput ?? remainingTool.input,
-								output: result.broken
-									? getToolMessage("brokenToolCallResult", locale)
-									: result.output,
-								isError: result.isError ?? false,
-								durationMs: result.durationMs,
-								permissionStartedAt: result.permissionStartedAt,
-								executionStartedAt: result.executionStartedAt,
-								completedAt: result.completedAt,
-								brokenInputOverride,
-								updatedInput: brokenInputOverride ?? result.updatedInput,
-								metadata: result.metadata,
-							};
+							yield toolResultEvent(remainingTool, result);
 						}
 						if (result.fatal && !fatalOutput) fatalOutput = result.output;
 					}
@@ -7563,80 +7371,32 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "error", message: fatalOutput };
 						return;
 					}
-					provider.pushAssistantTurn(
-						history,
-						assistantText,
-						toHistoryToolUses(toolUses),
-						collectReasoningBlocks(reasoningBlockMap),
-						collectCompletedWebSearches(webSearchAccum),
-						messageId,
-						collectCompletedImageGenerations(imageGenAccum),
-						textOutputIndex,
-						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(toolUses)),
-					);
 					yield { type: "turn_complete", turnIndex };
 					return;
 				}
 			}
 
-			// Strip broken tool calls from the history sent to the model.
-			// The UI already has the full picture (tool_result events were yielded above),
-			// but the model should not see the broken tool_use + tool_result pair —
-			// they waste context and cause retry loops.
-			if (brokenToolUseIds.size > 0) {
-				const cleanToolUses = toolUses.filter((tu) => !brokenToolUseIds.has(tu.toolUseId));
-				// Broken calls are filtered by the ORIGINAL ids: pendingToolResults were
-				// formatted from tu.toolUseId and are only renamed further below.
-				pendingToolResults = pendingToolResults.filter((tr) => {
-					const toolUseId =
-						(tr as { toolUseId?: string }).toolUseId ??
-						(tr as { tool_use_id?: string }).tool_use_id ??
-						(tr as { call_id?: string }).call_id ??
-						(tr as { tool_call_id?: string }).tool_call_id;
-					return !toolUseId || !brokenToolUseIds.has(toolUseId);
+			// The step joins the transcript as the host stores it: every call with its result,
+			// a broken one marked so that every projection leaves it out.
+			transcript.appendStep(orderedAssistantContent(toolUses));
+			for (const tu of toolUses) {
+				const result = stepResults.get(tu.toolUseId);
+				if (!result) continue;
+				transcript.settleTool(tu.toolUseId, {
+					output: result.output,
+					isError: result.isError,
+					images: result.images,
+					broken: brokenToolUseIds.has(tu.toolUseId),
 				});
-				provider.pushAssistantTurn(
-					history,
-					assistantText,
-					toHistoryToolUses(cleanToolUses),
-					collectReasoningBlocks(reasoningBlockMap),
-					collectCompletedWebSearches(webSearchAccum),
-					messageId,
-					collectCompletedImageGenerations(imageGenAccum),
-					textOutputIndex,
-					redactedThinkingBlocks,
-					orderedAssistantContent(toHistoryToolUses(cleanToolUses)),
-				);
-
-				// Inject a user-side reminder so the model knows what happened and
-				// switches strategy instead of blindly retrying the same large write.
+			}
+			if (brokenToolUseIds.size > 0) {
+				// A notice row tells the model what happened, so it switches strategy instead
+				// of blindly retrying the same large write.
 				const brokenNames = toolUses
 					.filter((tu) => brokenToolUseIds.has(tu.toolUseId))
 					.map((tu) => tu.name);
-				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-					toolNames: brokenNames.join(", "),
-				});
-			} else {
-				// Append assistant message to history for next turn
-				provider.pushAssistantTurn(
-					history,
-					assistantText,
-					toHistoryToolUses(toolUses),
-					collectReasoningBlocks(reasoningBlockMap),
-					collectCompletedWebSearches(webSearchAccum),
-					messageId,
-					collectCompletedImageGenerations(imageGenAccum),
-					textOutputIndex,
-					redactedThinkingBlocks,
-					orderedAssistantContent(toHistoryToolUses(toolUses)),
-				);
+				queueLoopNotice("broken_call", { toolNames: brokenNames.join(", ") });
 			}
-
-			// The assistant turn now carries the renamed ids, so the paired tool results
-			// sent with the next request must be renamed too — otherwise the API sees a
-			// tool_use with no matching result (and an orphaned result for the old id).
-			remapToolResultIds(pendingToolResults, turnToolUseIdRemap);
 
 			// Persisted rows contribute pending input, not another persistence event.
 			// Keep their identities until the actual request: a compact/model switch

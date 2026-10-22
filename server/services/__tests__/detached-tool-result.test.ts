@@ -153,6 +153,56 @@ describe("detached tool result durable settlement", () => {
 		}
 	});
 
+	test("returned images are saved as uploads and stored by reference; broken calls are marked", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { getImagePath, setUploadsDirForTests } = await import("../../lib/uploads");
+		const uploads = mkdtempSync(join(tmpdir(), "nf-tool-images-"));
+		setUploadsDirForTests(uploads);
+		try {
+			await seed();
+			const png =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+			await persistDetachedToolResult(
+				"owner",
+				result("owner", {
+					images: [
+						{ format: "png", base64: png },
+						{ format: "png", base64: "bad" },
+					],
+				}),
+			);
+			const stored = (await row())?.outputJson as {
+				_text: string;
+				_images: Array<{ imageId: string; mediaType: string; uploadNarratorId: string }>;
+			};
+			// The unreadable image is logged and left out; the text is kept.
+			expect(stored._text).toBe("actual durable result");
+			expect(stored._images).toHaveLength(1);
+			expect(stored._images[0]).toMatchObject({
+				mediaType: "image/png",
+				uploadNarratorId: "owner",
+			});
+			expect(getImagePath("owner", stored._images[0]?.imageId ?? "")).not.toBeNull();
+
+			cleanDb(sqlite);
+			await seed();
+			await persistDetachedToolResult(
+				"owner",
+				result("owner", {
+					output: "not executed",
+					isError: true,
+					brokenInputOverride: { file_path: "[invalid]" },
+				}),
+			);
+			expect((await row())?.outputJson).toEqual({ _text: "not executed", _broken: true });
+		} finally {
+			setUploadsDirForTests(null);
+			rmSync(uploads, { recursive: true, force: true });
+		}
+	});
+
 	test("database lock retries are bounded and do not invent a successful result", async () => {
 		await seed();
 		const update = spyOn(narratorPersistence, "updateToolCallResult").mockImplementation(

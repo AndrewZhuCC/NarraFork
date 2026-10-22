@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { outputToText } from "@shared/agent-protocol/tool-output";
 import { z } from "zod/v4";
-import type { AgentToolUse, ProviderAdapter } from "../provider";
+import type { AgentToolUse, DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig } from "../types";
 
@@ -16,7 +17,11 @@ type Reply =
 	| { reasoning: string }
 	| { empty: true };
 type ToolResult = { toolUseId: string; output: string; isError: boolean };
-type Request = { history: unknown[]; content: string; toolResults: ToolResult[] };
+type Turn =
+	| { role: "user" | "system"; content: string }
+	| { role: "assistant"; content: string; toolUses: Array<{ toolUseId: string; name: string }> }
+	| { role: "tool"; results: ToolResult[] };
+type Request = { history: Turn[]; content: string };
 let replies: Reply[] = [];
 let requests: Request[] = [];
 let decisions = 0;
@@ -25,6 +30,36 @@ let permissionChecks = 0;
 let executionAuthorizations = 0;
 let nextToolUseId = 0;
 let onReply: (() => void) | undefined;
+
+/** A minimal wire format over the transcript rows: a step, then its settled results. */
+function turnsOf(row: DbMessage): Turn[] {
+	const blocks = Array.isArray(row.contentJson)
+		? (row.contentJson as Array<{ type?: string; id?: string; name?: string; text?: string }>)
+		: [];
+	if (row.role !== "assistant") return [{ role: "user", content: row.contentText ?? "" }];
+	const settled = (row.toolCalls ?? []).filter((call) => call.status !== "running");
+	return [
+		{
+			role: "assistant",
+			content: blocks.map((block) => (block.type === "text" ? (block.text ?? "") : "")).join(""),
+			toolUses: blocks
+				.filter((block) => block.type === "tool_use")
+				.map((block) => ({ toolUseId: block.id ?? "", name: block.name ?? "" })),
+		},
+		...(settled.length
+			? [
+					{
+						role: "tool" as const,
+						results: settled.map((call) => ({
+							toolUseId: call.toolUseId,
+							output: outputToText(call.outputJson),
+							isError: call.status === "fail",
+						})),
+					},
+				]
+			: []),
+	];
+}
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) =>
@@ -36,18 +71,10 @@ const provider: ProviderAdapter = {
 	injectSystemPrompt: (history, systemPrompt) => {
 		history.unshift({ role: "system", content: systemPrompt });
 	},
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({ history: rows.flatMap(turnsOf) }),
 	async *chat(params) {
 		params.onRequestStart?.();
-		requests.push(
-			JSON.parse(
-				JSON.stringify({
-					history: params.history,
-					content: params.content,
-					toolResults: params.toolResults,
-				}),
-			),
-		);
+		requests.push(JSON.parse(JSON.stringify({ history: params.history, content: params.content })));
 		const reply = replies[requests.length - 1];
 		if (!reply) throw new Error("Reflection exceeded the scripted turn budget");
 		onReply?.();
@@ -62,13 +89,6 @@ const provider: ProviderAdapter = {
 			};
 			yield { toolUses: [toolUse] };
 		}
-	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: (history, content, _model, toolResults) => {
-		history.push({ role: "user", content, toolResults });
-	},
-	pushAssistantTurn: (history, text, toolUses) => {
-		history.push({ role: "assistant", content: text, toolUses });
 	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
@@ -148,15 +168,25 @@ function config(locale = "en", signal = new AbortController().signal): AgentConf
 		},
 	};
 }
+function row(id: string, role: DbMessage["role"], text: string): DbMessage {
+	return {
+		id,
+		role,
+		contentJson: [{ type: "text", text }],
+		contentText: text,
+		parentToolUseId: null,
+		messageUuid: null,
+	};
+}
 function run(
 	parentConfig = config(),
 	maxTurns = 99,
 	kind = "exitPlanMode",
-	history: unknown[] = [{ role: "system", content: parentConfig.systemPrompt }],
+	rows: DbMessage[] = [],
 ) {
 	return runReflectionLoop({
 		parentConfig,
-		history,
+		rows,
 		prompt: PROMPT,
 		maxTurns,
 		reflectionLoop: {
@@ -174,8 +204,16 @@ function assertNoOriginalExecution() {
 	expect(executionAuthorizations).toBe(0);
 }
 
+/** The results the second request ends with: the first answer's settled calls. */
 function secondTurnFeedback(): ToolResult[] {
-	return requests[1].toolResults;
+	const last = requests[1].history.at(-1);
+	return last?.role === "tool" ? last.results : [];
+}
+
+/** The input a request ends with: its current text, or the last input row. */
+function lastInput(request: Request): string {
+	const last = request.history.at(-1);
+	return request.content || (last?.role === "user" ? last.content : "");
 }
 
 describe("reflection decision retries are bounded and safe", () => {
@@ -196,12 +234,12 @@ describe("reflection decision retries are bounded and safe", () => {
 				}
 				expect(feedback[0].output).not.toContain("durable");
 				expect(feedback[0].output).toContain(locale === "zh-CN" ? "反思" : "reflection");
-				// The pending error result travels in params.toolResults; the previous
-				// assistant call is already part of the reusable history prefix.
-				const history = requests[1].history as Array<{ toolUses?: AgentToolUse[] }>;
-				expect(history.some((turn) => turn.toolUses?.[0]?.name === name)).toBe(true);
-				const previousToolUseId = history.find((turn) => turn.toolUses?.[0]?.name === name)
-					?.toolUses?.[0]?.toolUseId;
+				// The error result follows the previous assistant call, both rows of the
+				// reflection's transcript.
+				const history = requests[1].history;
+				const previousToolUseId = history.flatMap((turn) =>
+					turn.role === "assistant" ? turn.toolUses.filter((use) => use.name === name) : [],
+				)[0]?.toolUseId;
 				if (previousToolUseId === undefined) throw new Error("Previous tool use is missing");
 				expect(feedback[0].toolUseId).toBe(previousToolUseId);
 				assertNoOriginalExecution();
@@ -255,7 +293,7 @@ describe("reflection decision retries are bounded and safe", () => {
 			expect(requests).toHaveLength(2);
 			expect(decisions).toBe(1);
 			expect(result.failureSummary).toBeUndefined();
-			const reminder = requests[1].content;
+			const reminder = lastInput(requests[1]);
 			for (const allowed of [DECISION_TOOL, OTHER_DECISION_TOOL]) {
 				expect(reminder).toContain(allowed);
 			}
@@ -287,7 +325,7 @@ describe("reflection decision retries are bounded and safe", () => {
 			expect(decisions).toBe(1);
 			expect(result.failureSummary).toBeUndefined();
 			expect(result.toolResults).toHaveLength(1);
-			expect(requests[1].content).toContain(DECISION_TOOL);
+			expect(lastInput(requests[1])).toContain(DECISION_TOOL);
 			assertNoOriginalExecution();
 		});
 
@@ -318,25 +356,24 @@ describe("reflection decision retries are bounded and safe", () => {
 
 	test("retry preserves the exact parent cache prefix without reinjecting the system prompt", async () => {
 		const parentConfig = config();
-		const parentHistory = [
-			{ role: "system", content: parentConfig.systemPrompt },
-			{ role: "user", content: "Parent question with cacheable context" },
-			{ role: "assistant", content: "Prior work" },
+		const parentRows = [
+			row("u1", "user", "Parent question with cacheable context"),
+			row("a1", "assistant", "Prior work"),
 		];
-		const originalBytes = JSON.stringify(parentHistory);
+		const originalRows = JSON.stringify(parentRows);
 		replies = [{ name: UNKNOWN_TOOL, input: {} }, decision(), decision()];
-		const result = await run(parentConfig, 99, "exitPlanMode", parentHistory);
+		const result = await run(parentConfig, 99, "exitPlanMode", parentRows);
 		expect(requests).toHaveLength(2);
+		// The parent's projection (system prompt, then its rows) leads both requests.
+		const parentPrefix = requests[0].history.slice(0, parentRows.length + 1);
+		expect(parentPrefix[0]).toEqual({ role: "system", content: "Reflection retry parent system" });
+		expect(JSON.stringify(parentPrefix)).toContain("Parent question with cacheable context");
+		expect(parentPrefix.at(-1)).toMatchObject({ role: "assistant", content: "Prior work" });
 		for (const request of requests) {
-			expect(JSON.stringify(request.history.slice(0, parentHistory.length))).toBe(originalBytes);
-			expect(
-				request.history.filter(
-					(turn) =>
-						typeof turn === "object" && turn !== null && "role" in turn && turn.role === "system",
-				),
-			).toHaveLength(1);
+			expect(request.history.slice(0, parentRows.length + 1)).toEqual(parentPrefix);
+			expect(request.history.filter((turn) => turn.role === "system")).toHaveLength(1);
 		}
-		expect(JSON.stringify(parentHistory)).toBe(originalBytes);
+		expect(JSON.stringify(parentRows)).toBe(originalRows);
 		expect(decisions).toBe(1);
 		expect(result.toolResults.filter((tool) => !tool.isError)).toHaveLength(1);
 		expect(result.failureSummary).toBeUndefined();

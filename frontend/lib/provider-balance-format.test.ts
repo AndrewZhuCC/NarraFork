@@ -65,17 +65,82 @@ for (const [lng, resource] of [
 		);
 		value.balance.scope = "wallet";
 		value.balance.amounts = [{ unit: "CNY", remaining: 1.25 }];
-		expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toContain(
-			`${t("providerBalance.wallet")}: 1.25 CNY`,
+		expect(formatProviderBalance(value, t, false, 1000)).toEqual({
+			quotaBalance: "CNY 1.25",
+			detailedQuotaBalance: "CNY 1.25",
+		});
+	});
+	test(`${lng}: wallet shows only the amount and currency, once in each display`, () => {
+		const value = snapshot();
+		value.adapter = "sub2api";
+		value.balance = {
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: 56561.8789152 }],
+		};
+		const result = formatProviderBalance(value, t, false, 1000);
+		expect(result).toEqual({
+			quotaBalance: "USD 56,561.8789152",
+			detailedQuotaBalance: "USD 56,561.8789152",
+		});
+		expect(result.detailedQuotaBalance).not.toContain(t("providerBalance.wallet"));
+		expect(result.detailedQuotaBalance).not.toContain("sub2api");
+	});
+	test(`${lng}: multiple wallet currencies have no repeated summary in the tooltip`, () => {
+		const value = snapshot();
+		value.balance = {
+			scope: "wallet",
+			unlimited: false,
+			amounts: [
+				{ unit: "CNY", remaining: 1.25 },
+				{ unit: "USD", remaining: 1e-8 },
+			],
+		};
+		expect(formatProviderBalance(value, t, false, 1000)).toEqual({
+			quotaBalance: "CNY 1.25 / USD 0.00000001",
+			detailedQuotaBalance: "CNY 1.25\nUSD 0.00000001",
+		});
+	});
+	test(`${lng}: wallet failure keeps its amount and one useful status line`, () => {
+		const value = snapshot();
+		value.balance = { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 0 }] };
+		value.error = "request_failed";
+		const result = formatProviderBalance(value, t, false, 1000);
+		expect(result.quotaBalance).toContain("USD 0");
+		expect(result.quotaBalance).not.toContain(t("providerBalance.wallet"));
+		expect(result.detailedQuotaBalance.split("\n")).toEqual([
+			"USD 0",
+			`${t("providerBalance.failed")} · ${t("providerBalance.stale")}`,
+		]);
+	});
+	test.each([
+		"USD",
+		"CNY",
+		"EUR",
+		"€",
+	])(`${lng}: %s precedes all monetary amounts and quota details`, (unit) => {
+		const value = snapshot();
+		value.balance = {
+			scope: "key",
+			unlimited: false,
+			amounts: [{ unit, remaining: -1.25, used: 2, total: 0.75 }],
+		};
+		const result = formatProviderBalance(value, t, false, 1000);
+		expect(result.quotaBalance).toContain(`${unit} -1.25`);
+		expect(result.detailedQuotaBalance).toContain(
+			t("providerBalance.used", { amount: `${unit} 2` }),
+		);
+		expect(result.detailedQuotaBalance).toContain(
+			t("providerBalance.total", { amount: `${unit} 0.75` }),
 		);
 	});
 	test(`${lng}: tiny nonzero balances never round to zero`, () => {
 		const value = snapshot();
 		if (!value.balance) throw new Error("Expected balance fixture");
 		value.balance.amounts = [{ unit: "USD", remaining: 1e-8 }];
-		expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toContain("0.00000001 USD");
+		expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toContain("USD 0.00000001");
 		value.balance.amounts[0].remaining = -1e-8;
-		expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toContain("-0.00000001 USD");
+		expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toContain("USD -0.00000001");
 	});
 	test(`${lng}: failure retains the last amount and marks it outdated`, () => {
 		const value = snapshot();

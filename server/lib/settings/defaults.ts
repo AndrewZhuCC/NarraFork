@@ -2,8 +2,6 @@
  * Default settings values and per-field documentation.
  * Extracted from the monolithic settings/index.ts.
  */
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -24,7 +22,9 @@ export const DEFAULTS: NarraForkSettings = {
 	// (see the `database` field comment in types.ts).
 	database: { backend: "sqlite" },
 	paths: {
-		defaultProjectDir: resolve(homedir(), "projects"),
+		// Unset until the user picks an existing directory (setup wizard / settings).
+		// Never guessed: `~/projects` does not exist on most machines.
+		defaultProjectDir: "",
 		// Empty by default, and that is the safe zero value: with no entry here the
 		// in-browser editor can only write inside a narrator's own worktree.
 		extraWritableDirs: [] as string[],
@@ -129,6 +129,10 @@ export const DEFAULTS: NarraForkSettings = {
 		dormantAfterMinutes: 0,
 		treeSnapshotsEnabled: true,
 	},
+	narratorBlocks: {
+		write: true,
+		read: true,
+	},
 	containers: {
 		portRangeStart: 10000,
 		portRangeEnd: 20000,
@@ -232,19 +236,19 @@ export const DEFAULTS: NarraForkSettings = {
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
 	customApiProviders: {
-		desc: "通过自定义提供商面板维护的结构化 API 提供商配置。密钥由对应面板管理，不作为普通文本设置展示。",
+		desc: "通过自定义供应商面板维护的结构化 API 供应商配置。密钥由对应面板管理，不作为普通文本设置展示。",
 		type: "array",
 	},
 	openaiProviders: {
-		desc: "通过 OpenAI 兼容提供商面板维护的结构化配置，包括模型、协议和连接设置。",
+		desc: "通过 OpenAI 兼容供应商面板维护的结构化配置，包括模型、协议和连接设置。",
 		type: "array",
 	},
 	anthropicProviders: {
-		desc: "通过 Anthropic 兼容提供商面板维护的结构化配置。",
+		desc: "通过 Anthropic 兼容供应商面板维护的结构化配置。",
 		type: "array",
 	},
 	geminiProviders: {
-		desc: "通过 Gemini 提供商面板维护的结构化配置。",
+		desc: "通过 Gemini 供应商面板维护的结构化配置。",
 		type: "array",
 	},
 	"tokendance.apiKey": {
@@ -353,7 +357,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── paths ───────────────────────────────────────────────────────────
 	"paths.defaultProjectDir": {
-		desc: "默认项目目录。新建项目时的默认父目录。",
+		desc: "默认项目目录：未指定目录时新会话的工作目录，也是新建项目时的默认父目录。必须是已存在的目录；为空表示未设置，此时需要用户手动选择目录。",
 		type: "string",
 	},
 	"paths.extraWritableDirs": {
@@ -654,7 +658,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "always / blockStop / protectedOnly / off，默认 protectedOnly",
 	},
 	"agent.maxTransientRetries": {
-		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态提供商（Responses/Codex）会在外层重建历史后重试。",
+		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态供应商（Responses/Codex）会在外层重建历史后重试。",
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
 	},
@@ -802,6 +806,18 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"chapters.treeSnapshotsEnabled": {
 		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。结构性快照（fork/merge/restore）不受影响。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
+		type: "boolean",
+		valid: "true / false，默认 true",
+	},
+
+	// ── narratorBlocks ──────────────────────────────────────────────────
+	"narratorBlocks.write": {
+		desc: "新消息是否以原生块存储（narrator_blocks 表），同时写入兼容的 content_json。关闭后新消息回到只写 content_json 的旧格式；已是块格式的消息仍按块维护。默认 true。",
+		type: "boolean",
+		valid: "true / false，默认 true",
+	},
+	"narratorBlocks.read": {
+		desc: "读取方（模型历史、消息页、External API、导出）是否从块表读取块格式消息的正文。关闭后全部回到读取 content_json，与块表并存期间两者内容一致。默认 true。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},

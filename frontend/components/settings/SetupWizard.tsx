@@ -12,7 +12,6 @@ import {
 	Title,
 	Tooltip,
 } from "@mantine/core";
-import { useDebouncedCallback } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { ProviderReadiness } from "@shared/provider-readiness";
 import {
@@ -23,18 +22,17 @@ import {
 	IconRocket,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { useAllModels } from "../../hooks/useModels";
+import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
-import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
-
-const TOTAL_STEPS = 6;
+import { ProjectDirChooser } from "./ProjectDirChooser";
 
 const SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 const MODEL_SELECT_OPTION_LIMIT = 100;
@@ -57,6 +55,8 @@ export function countConfiguredProviders(
  * actually run comes BEFORE the dependency step:
  *
  *  - `provider`: a provider key is the one thing the user must supply themselves.
+ *    It is also the first step: the wizard opens straight onto it (with the
+ *    welcome text) while the main area shows the add-provider page.
  *  - `basic`: the default/summary models. Delegation creates a narrator whose
  *    model is `settings.agent.defaultModel`; with that still unset the narrator
  *    would be spawned against whatever the resolver falls back to, which is not
@@ -67,39 +67,50 @@ export function countConfiguredProviders(
  * handed to an agent, so gating on them first blocked first-time users on an
  * install step they could have delegated.
  */
-export const WIZARD_STEPS = [
-	"welcome",
-	"provider",
-	"basic",
-	"deps",
-	"network",
-	"complete",
-] as const;
+export const WIZARD_STEPS = ["provider", "basic", "deps", "network", "complete"] as const;
 
 export type WizardStep = (typeof WIZARD_STEPS)[number];
+
+const TOTAL_STEPS = WIZARD_STEPS.length;
 
 export function wizardStepIndex(step: WizardStep): number {
 	return WIZARD_STEPS.indexOf(step);
 }
 
 /**
+ * Whether the provider step should open the add-provider page in the main area:
+ * only once readiness has loaded, nothing is ready yet, and the user is not
+ * already somewhere on the providers pages (adding, or finishing a login flow).
+ */
+export function shouldOpenAddProviderPage(state: {
+	settingsLoaded: boolean;
+	providerCount: number;
+	pathname: string;
+}): boolean {
+	if (!state.settingsLoaded || state.providerCount > 0) return false;
+	const path = state.pathname.replace(/\/+$/, "");
+	return path !== "/settings/providers" && !path.startsWith("/settings/providers/");
+}
+
+/**
  * Which gate (if any) blocks "Next" on the current step.
  *
- * Providers and models are hard gates: nothing downstream — including delegated
- * dependency installation, which spawns a narrator on the default model — works
- * without them. Dependencies are deliberately NOT gated, so a user can move on
+ * Providers, models and the default project directory are hard gates: nothing
+ * downstream — including delegated dependency installation, which spawns a narrator
+ * on the default model — works without the first two, and with no existing default
+ * directory every new session has to ask for one. Dependencies are deliberately NOT gated, so a user can move on
  * and let the Setup Assistant finish the job later.
  */
 export function wizardNextBlockedReasonKey(state: {
 	step: number;
 	providerCount: number;
 	basicStepValid: boolean;
-}): "wizardProviderRequired" | "wizardModelsRequired" | null {
+}): "wizardProviderRequired" | "wizardBasicRequired" | null {
 	if (state.step === wizardStepIndex("provider") && state.providerCount === 0) {
 		return "wizardProviderRequired";
 	}
 	if (state.step === wizardStepIndex("basic") && !state.basicStepValid) {
-		return "wizardModelsRequired";
+		return "wizardBasicRequired";
 	}
 	return null;
 }
@@ -190,9 +201,10 @@ export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 	// Readiness comes from actual backend registrations, not a second provider list
 	// or model catalog (which may not have been refreshed yet).
 	const { settingsData } = useAllModels();
+	const settingsLoaded = settingsData !== undefined;
 	const providerCount = useMemo(() => countConfiguredProviders(settingsData), [settingsData]);
 
-	// Track whether both models are set in BasicSettingsStep
+	// Track whether the project directory and both models are set in BasicSettingsStep
 	const [basicStepValid, setBasicStepValid] = useState(false);
 
 	const blockedReasonKey = wizardNextBlockedReasonKey({ step, providerCount, basicStepValid });
@@ -224,8 +236,9 @@ export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Box p="md">
-					{step === wizardStepIndex("welcome") && <WelcomeStep />}
-					{step === wizardStepIndex("provider") && <ProviderStep providerCount={providerCount} />}
+					{step === wizardStepIndex("provider") && (
+						<ProviderStep providerCount={providerCount} settingsLoaded={settingsLoaded} />
+					)}
 					{step === wizardStepIndex("deps") && <DepsStep onDelegated={onClose} />}
 					{step === wizardStepIndex("basic") && (
 						<BasicSettingsStep onValidChange={setBasicStepValid} />
@@ -307,21 +320,6 @@ function StepIndicator({ current, total }: { current: number; total: number }) {
 	);
 }
 
-function WelcomeStep() {
-	const { t } = useTranslation("settings");
-	return (
-		<Stack align="center" justify="center" gap="lg" py="xl">
-			<IconRocket size={48} color="var(--mantine-color-indigo-6)" />
-			<Title order={3} ta="center">
-				{t("wizardWelcomeTitle")}
-			</Title>
-			<Text size="sm" c="dimmed" ta="center" maw={420}>
-				{t("wizardWelcomeDesc")}
-			</Text>
-		</Stack>
-	);
-}
-
 /**
  * Dependency step. Intentionally not gated: the user may skip it and either
  * install later or let a Setup Assistant narrator do it. `onDelegated` closes
@@ -342,18 +340,48 @@ function DepsStep({ onDelegated }: { onDelegated: () => void }) {
 	);
 }
 
-function ProviderStep({ providerCount }: { providerCount: number }) {
+/**
+ * First step: welcome text plus the provider explanation on the left, while the
+ * main area shows the add-provider page so the user can act on it right away.
+ */
+function ProviderStep({
+	providerCount,
+	settingsLoaded,
+}: {
+	providerCount: number;
+	settingsLoaded: boolean;
+}) {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
+	const pathname = useRouterState({ select: (state) => state.location.pathname });
+	const openedRef = useRef(false);
 
-	const handleGoToProviders = () => {
-		navigate({ to: "/settings/providers" });
+	const handleAddProvider = () => {
+		navigate({ to: "/settings/providers/add" });
 	};
+
+	// Open the add-provider page once per visit to this step; after that the user
+	// is free to navigate away without being pulled back.
+	useEffect(() => {
+		if (openedRef.current || !settingsLoaded) return;
+		openedRef.current = true;
+		if (shouldOpenAddProviderPage({ settingsLoaded, providerCount, pathname })) {
+			navigate({ to: "/settings/providers/add" });
+		}
+	}, [settingsLoaded, providerCount, pathname, navigate]);
 
 	return (
 		<Stack gap="md">
+			<Group gap="sm" wrap="nowrap">
+				<IconRocket size={28} color="var(--mantine-color-indigo-6)" style={{ flexShrink: 0 }} />
+				<Title order={4}>{t("wizardWelcomeTitle")}</Title>
+			</Group>
+			<Text size="sm">{t("wizardWelcomeDesc")}</Text>
 			<Text size="sm" c="dimmed">
 				{t("wizardProviderDesc")}
+			</Text>
+			<Text size="sm" c="dimmed">
+				{t("wizardProviderImportHint")}
 			</Text>
 			<Group>
 				{providerCount > 0 ? (
@@ -372,7 +400,7 @@ function ProviderStep({ providerCount }: { providerCount: number }) {
 				</Text>
 			)}
 			<Group>
-				<Button variant="light" onClick={handleGoToProviders}>
+				<Button variant="light" onClick={handleAddProvider}>
 					{t("wizardProviderGoToAdmin")}
 				</Button>
 			</Group>
@@ -428,7 +456,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 			? settings.agent.summaryModel
 			: "";
 
-	const [projectDir, setProjectDir] = useState(settings?.paths?.defaultProjectDir ?? "");
+	const { usablePath: projectDir } = useProjectDirStatus();
 	const [defaultModel, setDefaultModel] = useState(validatedDefault);
 	const [summaryModel, setSummaryModel] = useState(validatedSummary);
 
@@ -446,32 +474,17 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
 	});
 
-	const debouncedSaveDir = useDebouncedCallback((path: string) => {
-		save.mutate({
-			paths: { defaultProjectDir: path },
-			agent: {
-				...(defaultModel ? { defaultModel } : {}),
-				...(summaryModel ? { summaryModel } : {}),
-			},
-		});
-	}, 500);
-
-	const handleDirChange = (path: string) => {
-		setProjectDir(path);
-		debouncedSaveDir(path);
-	};
-
 	// Report validity to parent
 	useEffect(() => {
-		onValidChange(!!defaultModel && !!summaryModel);
-	}, [defaultModel, summaryModel, onValidChange]);
+		onValidChange(!!projectDir && !!defaultModel && !!summaryModel);
+	}, [projectDir, defaultModel, summaryModel, onValidChange]);
 
 	return (
 		<Stack gap="md">
 			<Text size="sm" c="dimmed">
 				{t("wizardBasicDesc")}
 			</Text>
-			<PathInput label={t("defaultProjectDir")} value={projectDir} onChange={handleDirChange} />
+			<ProjectDirChooser />
 			<Select
 				label={t("defaultModel")}
 				placeholder={t("wizardSelectModel")}
@@ -483,7 +496,6 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 					const val = v ?? "";
 					setDefaultModel(val);
 					save.mutate({
-						paths: { defaultProjectDir: projectDir },
 						agent: {
 							...(val ? { defaultModel: val } : {}),
 							...(summaryModel ? { summaryModel } : {}),
@@ -503,7 +515,6 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 					const val = v ?? "";
 					setSummaryModel(val);
 					save.mutate({
-						paths: { defaultProjectDir: projectDir },
 						agent: {
 							...(defaultModel ? { defaultModel } : {}),
 							...(val ? { summaryModel: val } : {}),

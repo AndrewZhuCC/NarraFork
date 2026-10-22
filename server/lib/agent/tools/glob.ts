@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { isSecretPlatformPath, SECRET_PATH_TOOL_REFUSAL } from "../../fs-secret-paths";
 import { toolSpecPathError } from "../../spec-uri";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -75,6 +76,11 @@ export const globTool: ToolDefinition = {
 			// Resolve relative paths against the backend's base cwd (device default
 			// cwd for remote, narrator cwd for local).
 			const cwd = pathArg ? resolveBackendPath(backend, base, pathArg) : base;
+			// Application authorization guard enforced in every permission mode: do not
+			// enumerate inside a NarraFork platform secret store on the host.
+			if (backend.kind === "local" && isSecretPlatformPath(cwd)) {
+				return { output: SECRET_PATH_TOOL_REFUSAL, isError: true };
+			}
 			const results = await backend.glob(pattern, {
 				cwd,
 				dot: dot ?? false,

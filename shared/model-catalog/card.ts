@@ -74,6 +74,8 @@ export const cardFields: readonly CardField[] = [
 		"supports_xhigh_reasoning_effort",
 		"supports_max_reasoning_effort",
 	].map((key) => ({ key, group: "capabilities" as const, kind: "boolean" as const })),
+	// Ordered prefix-preserving tool loading modes; `[]` turns preservation off.
+	{ key: "tool_loading_modes", group: "capabilities", kind: "strings" },
 	{ key: "reasoning_mode", group: "reasoning", kind: "string" },
 	{ key: "reasoning_effort_levels", group: "reasoning", kind: "strings" },
 	{ key: "default_reasoning_effort", group: "reasoning", kind: "string" },

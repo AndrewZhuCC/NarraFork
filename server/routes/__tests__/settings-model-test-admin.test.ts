@@ -8,6 +8,9 @@ import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { updateSettingsKey } from "../../../shared/update-settings";
 import { AppError } from "../../lib/errors";
 import { settingsUpdateLock } from "../../lib/settings/write-lock";
+import { invalidateUserCache } from "../../middleware/auth";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-model-test-admin-"));
@@ -20,7 +23,29 @@ const { getDefaults, deepMerge } = await import("../../lib/settings");
 const { registerServerRestart } = await import("../../lib/server-restart");
 const { tlsRoutes } = await import("../tls");
 
+/**
+ * The admin-gated settings routes run `requireAdmin`, which authorizes against the LIVE role
+ * read through the session store, never the token's `role` claim. The middleware below only
+ * sets `c.get("user")`, so this seam resolves each principal's role by actor id ("admin-id"
+ * → admin, anything else → user). Without it a non-admin would surface as 401 USER_GONE
+ * instead of the expected 403 ADMIN_REQUIRED.
+ */
+const ADMIN_ACTOR_ID = "admin-id";
+const NON_ADMIN_ACTOR_ID = "user-id";
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === ADMIN_ACTOR_ID ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 afterAll(() => {
+	setAuthStores(undefined);
+	invalidateUserCache(ADMIN_ACTOR_ID);
+	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	rmSync(testHome, { recursive: true, force: true });
@@ -774,6 +799,38 @@ describe("conditional update source settings", () => {
 			});
 			expect(response.status).toBe(200);
 			expect(settings.update?.channel).toBe("beta");
+		} finally {
+			saveSettings(original);
+		}
+	});
+});
+
+describe("default project directory", () => {
+	async function patchProjectDir(defaultProjectDir: string) {
+		return appForRole("admin").request("/settings", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ paths: { defaultProjectDir } }),
+		});
+	}
+
+	test("accepts only an existing directory, and unchanged or empty values always save", async () => {
+		const original = structuredClone(settings);
+		const existing = mkdtempSync(join(testHome, "projects-"));
+		try {
+			const missing = await patchProjectDir(join(testHome, "no-such-dir"));
+			expect(missing.status).toBe(400);
+			expect((await missing.json()).code).toBe("PROJECT_DIR_NOT_FOUND");
+			expect(settings.paths.defaultProjectDir).toBe(original.paths.defaultProjectDir);
+
+			expect((await patchProjectDir(existing)).status).toBe(200);
+			expect(settings.paths.defaultProjectDir).toBe(existing);
+
+			// The chosen directory disappearing must not block re-saving the form.
+			rmSync(existing, { recursive: true, force: true });
+			expect((await patchProjectDir(existing)).status).toBe(200);
+			expect((await patchProjectDir("")).status).toBe(200);
+			expect(settings.paths.defaultProjectDir).toBe("");
 		} finally {
 			saveSettings(original);
 		}

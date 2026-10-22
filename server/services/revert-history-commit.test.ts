@@ -646,11 +646,13 @@ describe("fixed selector history application", () => {
 		expect(body(target.messageId)).toBe(original);
 		expect(JSON.parse(body(clonedId))).toHaveLength(2);
 		const cloned = query<Record<string, unknown>>(
-			"SELECT narrator_id,role,origin,original_content_json,turn_usage_json,tree_hash_after,snapshot_commit_sha,compact_pending FROM narrator_messages WHERE id=?",
+			"SELECT narrator_id,author_narrator_id,role,origin,original_content_json,turn_usage_json,tree_hash_after,snapshot_commit_sha,compact_pending FROM narrator_messages WHERE id=?",
 			clonedId,
 		)[0];
+		// The copy belongs to the ref's holder; the narrator that wrote it stays its author.
 		expect(cloned).toEqual({
-			narrator_id: "root",
+			narrator_id: "fork",
+			author_narrator_id: "root",
 			role: "disp",
 			origin: "system",
 			original_content_json: '[ { "text":"original" } ]',

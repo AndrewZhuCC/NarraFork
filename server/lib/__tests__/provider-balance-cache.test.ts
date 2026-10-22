@@ -111,6 +111,48 @@ describe("provider balance discovery lifecycle", () => {
 		expect(f.fetch).toHaveBeenCalledTimes(calls + 1);
 	});
 
+	test("subscription metadata stays with its generation, not a new key or wallet mode", async () => {
+		const f = fixture();
+		f.respond(async () =>
+			Response.json({
+				mode: "unrestricted",
+				isValid: true,
+				unit: "USD",
+				planName: "Pro subscription",
+				subscription: {
+					weekly_limit_usd: 50,
+					weekly_usage_usd: 4,
+					weekly_window_start: "2026-10-19T00:00:00Z",
+					expires_at: "2026-11-19T00:00:00Z",
+				},
+			}),
+		);
+		await f.cache.request("relay-test");
+		const first = f.cache.peek("relay-test");
+		expect(first?.balance).toMatchObject({
+			scope: "subscription",
+			planName: "Pro subscription",
+			expiresAt: "2026-11-19T00:00:00.000Z",
+		});
+		f.advance(60_000);
+		f.respond(async () => new Response(null, { status: 503 }));
+		await f.cache.request("relay-test", "refresh");
+		expect(f.cache.peek("relay-test")).toMatchObject({
+			status: "supported",
+			error: "request_failed",
+			balance: first?.balance,
+		});
+		f.setProviders([{ ...provider(), apiKey: "another-account" }]);
+		expect(f.cache.peek("relay-test")?.generation).not.toBe(first?.generation);
+		expect(f.cache.peek("relay-test")?.balance).toBeNull();
+		f.respond(async () => Response.json(wallet()));
+		await f.cache.request("relay-test");
+		const next = f.cache.peek("relay-test")?.balance;
+		expect(next?.scope).toBe("wallet");
+		expect(next).not.toHaveProperty("planName");
+		expect(next).not.toHaveProperty("expiresAt");
+	});
+
 	test("transient discovery failures are safe and do not poll automatically", async () => {
 		const f = fixture();
 		f.respond(async () => {

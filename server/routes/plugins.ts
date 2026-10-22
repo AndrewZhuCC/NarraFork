@@ -560,9 +560,9 @@ function adminActor(c: Context): string {
  * `assertAdmin` (which correctly rejects OAuth tokens even when the underlying
  * user row is admin, and enforces `role === "admin"`).
  */
-function isAdminActor(c: Context): boolean {
+async function isAdminActor(c: Context): Promise<boolean> {
 	try {
-		assertAdmin(c);
+		await assertAdmin(c);
 		return true;
 	} catch {
 		return false;
@@ -583,8 +583,8 @@ function isAdminActor(c: Context): boolean {
  * open-capability change deliberately keeps: installing a plugin puts third-party code on
  * the server, which is a different decision from what an installed plugin may then do.
  */
-function assertPluginAdmin(c: Context): void {
-	if (isAdminActor(c)) return;
+async function assertPluginAdmin(c: Context): Promise<void> {
+	if (await isAdminActor(c)) return;
 	throw new AppError(
 		"Plugin lifecycle operations require an administrator",
 		403,
@@ -1173,7 +1173,7 @@ export function createPluginRoutes(
 			// non-admin — which meant an unauthorized request still wrote to disk. A flat admin
 			// rule is decidable from the request alone, so nothing is staged for a caller who
 			// was never allowed to install.
-			assertPluginAdmin(c);
+			await assertPluginAdmin(c);
 			const contentType = c.req.header("content-type") ?? "";
 
 			// Multipart upload: install directly from the uploaded bytes (no
@@ -1232,7 +1232,7 @@ export function createPluginRoutes(
 		app.post(`/:pluginId/${path}`, auth, async (c) => {
 			try {
 				requirePluginsEnabled();
-				assertPluginAdmin(c);
+				await assertPluginAdmin(c);
 				const pluginId = parsePluginId(c);
 				const current = await manager.getStatus(pluginId);
 				if (current == null) throw new NotFoundError("Plugin", pluginId);

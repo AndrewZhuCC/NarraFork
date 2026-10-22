@@ -7,7 +7,11 @@ import {
 	isShareText,
 	SHARE_HTML_MAX_BYTES,
 } from "../../../../shared/share-preview";
-import { isPrivateRequestRecordingPath, SECRET_PATH_REFUSAL } from "../../fs-secret-paths";
+import {
+	isPrivateRequestRecordingPath,
+	isSecretPlatformPath,
+	SECRET_PATH_REFUSAL,
+} from "../../fs-secret-paths";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { settings } from "../../settings";
@@ -191,7 +195,11 @@ async function zipViaArchiver(
  * ZIP can follow nested symlinks, so checking only the selected root would leak private recordings.
  * Walk only names/metadata, asynchronously, with count/depth/time bounds and cancellation. */
 async function assertRecordingShareSource(fullPath: string, deadline: AbortSignal): Promise<void> {
-	if (isPrivateRequestRecordingPath(fullPath, undefined, true))
+	// A credential file (settings.json, narrafork.db*) or a private protocol directory
+	// must never be packaged into a share link, in any permission mode. `isSecretPlatformPath`
+	// subsumes the private-recording check and also covers the credential files; the
+	// ancestor-aware recording check is kept so sharing a PARENT of a private root is refused.
+	if (isSecretPlatformPath(fullPath) || isPrivateRequestRecordingPath(fullPath, undefined, true))
 		throw new Error(SECRET_PATH_REFUSAL);
 	if (!existsSync(fullPath)) return; // Preserve the existing missing-source response.
 	const pending = [{ path: fullPath, depth: 0 }];
@@ -204,7 +212,7 @@ async function assertRecordingShareSource(fullPath: string, deadline: AbortSigna
 		if (current.depth > 64) throw new Error("Share source privacy scan exceeds depth limit");
 		const physical = await realpath(current.path);
 		deadline.throwIfAborted();
-		if (isPrivateRequestRecordingPath(physical, undefined, true))
+		if (isSecretPlatformPath(physical) || isPrivateRequestRecordingPath(physical, undefined, true))
 			throw new Error(SECRET_PATH_REFUSAL);
 		if (visited.has(physical)) continue;
 		visited.add(physical);
@@ -218,11 +226,16 @@ async function assertRecordingShareSource(fullPath: string, deadline: AbortSigna
 			const path = resolve(physical, entry.name);
 			if (entry.isSymbolicLink()) {
 				// Reject before dereferencing, even for a link to a parent of the private roots.
-				if (isPrivateRequestRecordingPath(path, undefined, true))
+				if (isSecretPlatformPath(path) || isPrivateRequestRecordingPath(path, undefined, true))
 					throw new Error(SECRET_PATH_REFUSAL);
 				pending.push({ path, depth: current.depth + 1 });
 			} else if (entry.isDirectory()) {
+				// A credential file sitting directly in a shared directory would be archived
+				// by the time the walk reaches it; refuse it up front.
+				if (isSecretPlatformPath(path)) throw new Error(SECRET_PATH_REFUSAL);
 				pending.push({ path, depth: current.depth + 1 });
+			} else if (isSecretPlatformPath(path)) {
+				throw new Error(SECRET_PATH_REFUSAL);
 			}
 		}
 	}

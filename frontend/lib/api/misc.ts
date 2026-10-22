@@ -18,6 +18,7 @@ import {
 import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
+	BlockBackfillStatus,
 	ChangelogEntry,
 	CodexCredentialEntry,
 	CodexLoadBalancingMode,
@@ -999,6 +1000,18 @@ export const miscApi = {
 			drives?: Array<{ name: string; path: string }>;
 			sep: string;
 		}>("/fs/shortcuts"),
+	/** Whether the instance's default project directory is set and exists. */
+	fsProjectDirStatus: () =>
+		request<{
+			configured: string;
+			path: string | null;
+			state: "valid" | "unset" | "missing" | "not_directory";
+		}>("/fs/project-dir"),
+	/** Existing folders under home that look like where the user keeps code. */
+	fsProjectDirCandidates: () =>
+		request<{
+			candidates: Array<{ path: string; repoCount: number; conventional: boolean }>;
+		}>("/fs/project-dir/candidates"),
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",
@@ -1399,6 +1412,13 @@ export const miscApi = {
 	vacuumDatabase: () =>
 		request<DatabaseVacuumResult>("/storage/database/vacuum", {
 			method: "POST",
+		}),
+	getBlockBackfillStatus: () =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill"),
+	setBlockBackfillPaused: (paused: boolean) =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill/pause", {
+			method: "POST",
+			body: JSON.stringify({ paused }),
 		}),
 
 	// Runtime Resources

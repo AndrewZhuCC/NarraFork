@@ -4,6 +4,7 @@ import {
 	countConfiguredProviders,
 	persistSetupWizardBeforeNetworkChange,
 	resolveWizardNetworkMode,
+	shouldOpenAddProviderPage,
 	WIZARD_STEPS,
 	wizardNetworkModeToHost,
 	wizardNextBlockedReasonKey,
@@ -81,7 +82,8 @@ describe("setup wizard step order and gating", () => {
 		// otherwise the narrator runs on an unconfigured fallback model.
 		expect(wizardStepIndex("provider")).toBeLessThan(wizardStepIndex("deps"));
 		expect(wizardStepIndex("basic")).toBeLessThan(wizardStepIndex("deps"));
-		expect(WIZARD_STEPS[0]).toBe("welcome");
+		// The wizard opens straight onto the provider step; there is no separate welcome page.
+		expect(WIZARD_STEPS[0]).toBe("provider");
 		expect(WIZARD_STEPS.at(-1)).toBe("complete");
 	});
 
@@ -114,14 +116,14 @@ describe("setup wizard step order and gating", () => {
 		).toBeNull();
 	});
 
-	test("the basic step still requires both models", () => {
+	test("the basic step requires the project directory and both models", () => {
 		expect(
 			wizardNextBlockedReasonKey({
 				step: wizardStepIndex("basic"),
 				providerCount: 1,
 				basicStepValid: false,
 			}),
-		).toBe("wizardModelsRequired");
+		).toBe("wizardBasicRequired");
 		expect(
 			wizardNextBlockedReasonKey({
 				step: wizardStepIndex("basic"),
@@ -167,5 +169,39 @@ describe("setup wizard provider readiness", () => {
 		expect(countConfiguredProviders(undefined)).toBe(0);
 		expect(countConfiguredProviders({})).toBe(0);
 		expect(countConfiguredProviders({ providerReadiness: [] })).toBe(0);
+	});
+});
+
+describe("setup wizard add-provider page", () => {
+	test("opens the add-provider page only once readiness says nothing is configured", () => {
+		expect(
+			shouldOpenAddProviderPage({ settingsLoaded: false, providerCount: 0, pathname: "/" }),
+		).toBe(false);
+		expect(
+			shouldOpenAddProviderPage({ settingsLoaded: true, providerCount: 1, pathname: "/" }),
+		).toBe(false);
+		expect(
+			shouldOpenAddProviderPage({ settingsLoaded: true, providerCount: 0, pathname: "/" }),
+		).toBe(true);
+	});
+
+	test("leaves the user on the providers pages they are already using", () => {
+		for (const pathname of [
+			"/settings/providers",
+			"/settings/providers/",
+			"/settings/providers/add",
+			"/settings/providers/tokendance/callback",
+		]) {
+			expect(shouldOpenAddProviderPage({ settingsLoaded: true, providerCount: 0, pathname })).toBe(
+				false,
+			);
+		}
+		expect(
+			shouldOpenAddProviderPage({
+				settingsLoaded: true,
+				providerCount: 0,
+				pathname: "/settings/providers-other",
+			}),
+		).toBe(true);
 	});
 });

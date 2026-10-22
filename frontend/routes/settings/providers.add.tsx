@@ -17,13 +17,18 @@ function AddProviderRoutePage() {
 			mountedRef.current = false;
 		};
 	}, []);
-	const close = () => void navigate({ to: "/settings/providers", replace: true });
+	const close = (providerId?: string) =>
+		void navigate({
+			to: "/settings/providers",
+			search: providerId ? { provider: providerId } : {},
+			replace: true,
+		});
 	return (
 		<AddProviderPage
-			onClose={close}
+			onClose={() => close()}
 			onAdd={async (draft) => {
-				await addProvider(draft);
-				if (mountedRef.current) close();
+				const providerId = await addProvider(draft);
+				if (mountedRef.current) close(providerId);
 			}}
 		/>
 	);

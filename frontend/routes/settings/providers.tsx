@@ -8,6 +8,7 @@ import {
 	createFileRoute,
 	Outlet,
 	useNavigate,
+	useRouter,
 	useRouterState,
 	useSearch,
 } from "@tanstack/react-router";
@@ -30,6 +31,7 @@ import { ProviderConfigView } from "../../components/providers/ProviderConfigVie
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
 	ProviderAddContext,
+	ProviderImportContext,
 	TokenDanceAddContext,
 } from "../../components/providers/provider-add-context";
 import type { AddProviderDraft } from "../../components/providers/provider-add-draft";
@@ -455,14 +457,29 @@ function SettingsProvidersPage() {
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
 	const [testingModel, setTestingModel] = useState<string | null>(null);
-	// selectedProvider: provider ID for multi-instance providers, prefix for platform providers (codex)
-	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
-
-	useEffect(() => {
-		if (search.provider === "codex") setSelectedProvider("codex");
-		if (search.provider === "tokendance" && tokenDance?.connected)
-			setSelectedProvider("tokendance");
-	}, [search.provider, tokenDance?.connected]);
+	// The open provider lives in the URL (`?provider=`), not in component state, so deep
+	// links (model picker, Codex quota, TokenDance recovery), reloads and back/forward all
+	// land on the same page. Opening from the overview pushes an entry and closing steps
+	// back over it; closing a deep-linked detail replaces its entry with the overview.
+	const router = useRouter();
+	const setSelectedProvider = useCallback(
+		(key: string | null) => {
+			if (key) {
+				void navigate({
+					to: "/settings/providers",
+					search: { provider: key },
+					state: (prev) => ({ ...prev, providerDetailFromOverview: true }),
+				});
+				return;
+			}
+			if (router.state.location.state.providerDetailFromOverview) {
+				router.history.back();
+				return;
+			}
+			void navigate({ to: "/settings/providers", search: {}, replace: true });
+		},
+		[navigate, router],
+	);
 
 	useEffect(() => {
 		if (providerSettingsDirty) {
@@ -473,12 +490,11 @@ function SettingsProvidersPage() {
 	}, [providerSettingsDirty]);
 
 	// ── Add provider ──
-	const handleAddProvider = useCallback(
-		async (draft: AddProviderDraft) => {
+	/** Save one provider under `id`, then refresh its models (shared by add and import). */
+	const createProvider = useCallback(
+		async (id: string, draft: AddProviderDraft) => {
 			if (!settingsFeatureCapability.patchSupported)
 				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
-			const id = creationIdRef.current ?? nanoid();
-			creationIdRef.current = id;
 			const bounded = async <T,>(
 				execute: (options: { signal: AbortSignal; maxResponseBytes: number }) => Promise<T>,
 			): Promise<T> => {
@@ -503,7 +519,7 @@ function SettingsProvidersPage() {
 				qc.setQueryData(["admin", "settings"], response);
 				qc.setQueryData(["settings"], response);
 			};
-			const result = await createProviderAndRefresh(id, draft, stateRef.current, {
+			return createProviderAndRefresh(id, draft, stateRef.current, {
 				getSettings: () => bounded((options) => api.getSettings(options)),
 				updateSettings: (payload) => bounded((options) => api.updateSettings(payload, options)),
 				refreshModels: (providerId, protocol) =>
@@ -528,8 +544,17 @@ function SettingsProvidersPage() {
 					unconfirmedSave: t("addProviderSaveUnconfirmed"),
 				},
 			});
-			if (providerPageMountedRef.current && isAddingRef.current && creationIdRef.current === id)
-				setSelectedProvider(result.providerId);
+		},
+		[settingsFeatureCapability.patchSupported, qc, t],
+	);
+
+	const handleAddProvider = useCallback(
+		async (draft: AddProviderDraft) => {
+			const id = creationIdRef.current ?? nanoid();
+			creationIdRef.current = id;
+			const result = await createProvider(id, draft);
+			const openCreated =
+				providerPageMountedRef.current && isAddingRef.current && creationIdRef.current === id;
 			if ("refreshError" in result) {
 				notifications.show({
 					title: t("addProviderSavedRefreshFailed"),
@@ -546,8 +571,49 @@ function SettingsProvidersPage() {
 					color: "green",
 				});
 			}
+			// The add route navigates back with this id, which opens the new provider.
+			return openCreated ? result.providerId : undefined;
 		},
-		[settingsFeatureCapability.patchSupported, qc, t, tc],
+		[createProvider, t, tc],
+	);
+
+	// Each imported provider is a separate creation with its own id; the import
+	// panel reports the batch outcome itself, so no per-provider notification.
+	const handleImportProvider = useCallback(
+		async (draft: AddProviderDraft) => {
+			const result = await createProvider(nanoid(), draft);
+			return { refreshFailed: "refreshError" in result };
+		},
+		[createProvider],
+	);
+
+	// Existence-only probe of other tools' config directories (reads no file),
+	// so the add page offers "import from this machine" only when there is something.
+	const canImport = user?.role === "admin";
+	const localDetect = useQuery({
+		queryKey: ["provider-import", "local-detect"],
+		queryFn: api.detectLocalProviders,
+		enabled: canImport && isAddingProvider,
+		staleTime: 0,
+		gcTime: 60_000,
+		retry: false,
+	});
+	const importContext = useMemo(
+		() =>
+			canImport
+				? {
+						importProvider: handleImportProvider,
+						detectedSources: localDetect.data?.sources,
+						detecting: localDetect.isPending && localDetect.fetchStatus !== "idle",
+					}
+				: null,
+		[
+			canImport,
+			handleImportProvider,
+			localDetect.data,
+			localDetect.isPending,
+			localDetect.fetchStatus,
+		],
 	);
 
 	const confirmSaveBeforeRefresh = useCallback(async () => {
@@ -939,6 +1005,32 @@ function SettingsProvidersPage() {
 		t,
 	]);
 
+	// Resolve `?provider=` (a provider id or a model prefix) to a key the config view can
+	// render: the provider id for multi-instance providers, the prefix for platform and
+	// plugin providers. Anything else (an unknown or not-yet-loaded target, or a prefix
+	// that only carries custom models) shows the overview rather than an empty detail.
+	const selectedProvider = useMemo(() => {
+		const target = search.provider;
+		if (!target) return null;
+		if (target === "tokendance") return tokenDance?.connected ? "tokendance" : null;
+		if (target === "codex" || target === "CommandCode") return target;
+		const configured = [...state.customApiProviders, ...state.nugProviders];
+		const byId = configured.find((p) => p.id === target);
+		if (byId) return byId.id;
+		const lower = target.toLowerCase();
+		const byPrefix =
+			configured.find((p) => p.prefix === target) ??
+			configured.find((p) => p.prefix?.toLowerCase() === lower);
+		if (byPrefix) return byPrefix.id;
+		return pluginProviderGroups?.some((group) => group.prefix === target) ? target : null;
+	}, [
+		search.provider,
+		tokenDance?.connected,
+		state.customApiProviders,
+		state.nugProviders,
+		pluginProviderGroups,
+	]);
+
 	// ── Provider label for detail panel ──
 	/**
 	 * Plugin provider models for the detail area, keyed by prefix.
@@ -1047,19 +1139,21 @@ function SettingsProvidersPage() {
 				}
 			>
 				<ProviderAddContext value={handleAddProvider}>
-					{restoreFetchError && (
-						<Alert color="yellow">
-							{t("tokendance.settingsUnavailable")}
-							<Button
-								size="xs"
-								variant="light"
-								onClick={() => setReturnEpoch((value) => value + 1)}
-							>
-								{t("tokendance.retryRestore")}
-							</Button>
-						</Alert>
-					)}
-					<Outlet />
+					<ProviderImportContext value={importContext}>
+						{restoreFetchError && (
+							<Alert color="yellow">
+								{t("tokendance.settingsUnavailable")}
+								<Button
+									size="xs"
+									variant="light"
+									onClick={() => setReturnEpoch((value) => value + 1)}
+								>
+									{t("tokendance.retryRestore")}
+								</Button>
+							</Alert>
+						)}
+						<Outlet />
+					</ProviderImportContext>
 				</ProviderAddContext>
 			</TokenDanceAddContext>
 		);

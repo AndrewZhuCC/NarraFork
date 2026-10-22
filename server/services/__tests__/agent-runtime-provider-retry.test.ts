@@ -206,7 +206,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			if (expected) await openReasoningIdleTask(id);
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
-				options.config.onModelInputConsumed?.(options.history, options.userText);
+				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
 				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
 			});
@@ -270,7 +270,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			if (expected) await openReasoningIdleTask(id);
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
-				options.config.onModelInputConsumed?.(options.history, options.userText);
+				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
 				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
 			});
@@ -290,7 +290,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 		const consumed = mock(() => {});
 		const drain = spyOn(runtimeSession, "drainInjectionsIntoHistory");
 		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
-			options.config.onModelInputConsumed?.(options.history, options.userText);
+			options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
 			for (const step of [
 				{ parts: [{ text: "mailbox update" }], mailbox: true, before: false, after: true },
@@ -309,11 +309,11 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 				input.onConsumed?.();
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
 				// Provider retries re-adopt the same packet, but do not repeat onConsumed.
-				options.config.onModelInputConsumed?.(options.history, options.userText);
+				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
 			}
 			expect(consumed).toHaveBeenCalledTimes(3);
-			options.config.onModelInputConsumed?.(options.history, "a new user turn");
+			options.config.onModelInputConsumed?.(options.history.built ?? [], "a new user turn");
 			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
 			return { ...reasoningIdleResult, reasoningOnlyIdle: false };
 		});
@@ -480,8 +480,7 @@ describe("provider retry policy is identical through the real primary and child 
 						calls.push({
 							packet: JSON.stringify({
 								text: options.userText,
-								history: options.history,
-								tools: options.trailingToolResults,
+								history: options.history.built,
 							}),
 							conversation: options.config.conversationId,
 							reset: options.config.resetUpstreamSessionOnFirstRequest,

@@ -15,6 +15,7 @@ import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
+import { providerImportApi } from "./provider-import";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
@@ -55,6 +56,7 @@ export const api = {
 	...pluginsApi,
 	...sessionInterchangeApi,
 	...commandCodeApi,
+	...providerImportApi,
 };
 
 export {
@@ -219,6 +221,8 @@ export type {
 	BaseContentBlock,
 	BlacklistCmd,
 	BlacklistDir,
+	BlockBackfillStatus,
+	BlockJobState,
 	BufferCreator,
 	BufferMessageSummary,
 	ChangelogEntry,

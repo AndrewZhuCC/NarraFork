@@ -14,43 +14,8 @@ import { ApiRequestDumpCollector } from "../request-dump";
 
 interface TestGeminiProvider {
 	formatTools(tools: unknown[]): unknown[];
-	buildHistory(
-		messages: DbMessage[],
-		model: string,
-	): Promise<{
-		history: unknown[];
-		trailingToolResults: unknown[];
-	}>;
+	buildHistory(messages: DbMessage[], model: string): Promise<{ history: unknown[] }>;
 	chat(params: Record<string, unknown>): AsyncGenerator<ParsedStreamEvent>;
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown;
-	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void;
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: Array<{
-			toolUseId: string;
-			name: string;
-			input: Record<string, unknown>;
-			outputIndex?: number;
-			thoughtSignature?: string;
-			thoughtSignatureSource?: string;
-		}>,
-		reasoningBlocks?: Array<{
-			text: string;
-			outputIndex?: number;
-			providerMetadata?: Record<string, unknown>;
-		}>,
-		webSearches?: unknown[],
-		messageId?: string,
-		imageGenerations?: unknown[],
-		textOutputIndex?: number,
-	): void;
 	generateWithMeta(
 		text: string,
 		model: string,
@@ -241,47 +206,59 @@ describe("Gemini transport selection", () => {
 		expect(url).toBe("https://gemini.example.test/v1beta/interactions");
 	});
 
-	test("does not replay opaque signatures across Gemini transports", () => {
-		const interactionsHistory: unknown[] = [];
-		makeProvider().pushAssistantTurn(interactionsHistory, "", [
+	test("does not replay opaque signatures across Gemini transports", async () => {
+		const call = (toolUseId: string, source: string): DbMessage[] => [
 			{
-				toolUseId: "cross-transport",
-				name: "Read",
-				input: { file_path: "/tmp/a" },
-				thoughtSignature: "opaque-signature",
-				thoughtSignatureSource: "gemini:gemini-test:generate-content",
-			},
-		]);
-		expect(interactionsHistory).toEqual([
-			{
-				type: "function_call",
-				id: "cross-transport",
-				name: "Read",
-				arguments: { file_path: "/tmp/a" },
-			},
-		]);
-
-		const generateHistory: unknown[] = [];
-		makeGenerateContentProvider().pushAssistantTurn(generateHistory, "", [
-			{
-				toolUseId: "same-transport",
-				name: "Read",
-				input: { file_path: "/tmp/a" },
-				thoughtSignature: "opaque-signature",
-				thoughtSignatureSource: "gemini:gemini-generate-test:generate-content",
-			},
-		]);
-		expect(generateHistory).toEqual([
-			{
-				role: "model",
-				parts: [
+				id: `assistant-${toolUseId}`,
+				role: "assistant",
+				contentJson: [
 					{
-						functionCall: { name: "Read", args: { file_path: "/tmp/a" } },
+						type: "tool_use",
+						id: toolUseId,
+						name: "Read",
+						input: { file_path: "/tmp/a" },
 						thoughtSignature: "opaque-signature",
+						thoughtSignatureSource: source,
+					},
+				],
+				contentText: null,
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [
+					{
+						toolUseId,
+						toolName: "Read",
+						inputJson: { file_path: "/tmp/a" },
+						outputJson: "contents",
+						status: "success",
 					},
 				],
 			},
-		]);
+		];
+		const interactions = await makeProvider().buildHistory(
+			call("cross-transport", "gemini:gemini-test:generate-content"),
+			"gemini-test:model",
+		);
+		expect(interactions.history[0]).toEqual({
+			type: "function_call",
+			id: "cross-transport",
+			name: "Read",
+			arguments: { file_path: "/tmp/a" },
+		});
+
+		const generate = await makeGenerateContentProvider().buildHistory(
+			call("same-transport", "gemini:gemini-generate-test:generate-content"),
+			"gemini-generate-test:model",
+		);
+		expect(generate.history[0]).toEqual({
+			role: "model",
+			parts: [
+				{
+					functionCall: { name: "Read", args: { file_path: "/tmp/a" } },
+					thoughtSignature: "opaque-signature",
+				},
+			],
+		});
 	});
 
 	test("generateContent lightweight generation streams deltas and usage", async () => {
@@ -801,22 +778,48 @@ describe("Gemini Interactions API provider", () => {
 			]);
 		});
 		const provider = makeProvider();
-		const history: unknown[] = [];
 		await collect(provider.chat(baseChatParams() as never));
-		provider.pushUserTurn(history, "hello", "gemini-test:model", []);
-		provider.pushAssistantTurn(history, "", [
-			{ toolUseId: "call_upstream", name: "Read", input: { file_path: "/tmp/a" }, outputIndex: 0 },
-		]);
-		const result = provider.formatToolResult(
-			"call_upstream",
-			"file contents",
-			false,
-			undefined,
-			"Read",
+		// The second request is the projection of the conversation so far.
+		const { history } = await provider.buildHistory(
+			[
+				{
+					id: "user-1",
+					role: "user",
+					contentJson: [{ type: "text", text: "hello" }],
+					contentText: "hello",
+					parentToolUseId: null,
+					messageUuid: null,
+				},
+				{
+					id: "assistant-1",
+					role: "assistant",
+					contentJson: [
+						{
+							type: "tool_use",
+							id: "call_upstream",
+							name: "Read",
+							input: { file_path: "/tmp/a" },
+							outputIndex: 0,
+						},
+					],
+					contentText: null,
+					parentToolUseId: null,
+					messageUuid: null,
+					toolCalls: [
+						{
+							toolUseId: "call_upstream",
+							toolName: "Read",
+							inputJson: { file_path: "/tmp/a" },
+							outputJson: "file contents",
+							status: "success",
+						},
+					],
+				},
+			],
+			"gemini-test:model",
 		);
-		provider.pushUserTurn(history, "", "gemini-test:model", [result]);
 		await collect(
-			provider.chat(baseChatParams({ content: ".", history, toolResults: [] }) as never),
+			provider.chat(baseChatParams({ content: "", history, toolResults: [] }) as never),
 		);
 
 		expect(bodies[1].input).toEqual([
@@ -836,42 +839,8 @@ describe("Gemini Interactions API provider", () => {
 		]);
 	});
 
-	test("pushAssistantTurn and buildHistory round-trip ordering, indices, and thought signature", async () => {
+	test("buildHistory keeps ordering, indices, and thought signatures", async () => {
 		const provider = makeProvider();
-		const pushed: unknown[] = [];
-		provider.pushUserTurn(pushed, "question", "gemini-test:model", []);
-		provider.pushAssistantTurn(
-			pushed,
-			"answer prefix",
-			[
-				{
-					toolUseId: "call_roundtrip",
-					name: "Read",
-					input: { file_path: "/tmp/a" },
-					outputIndex: 2,
-					thoughtSignature: "sig_roundtrip",
-				},
-			],
-			[
-				{
-					text: "reasoning summary",
-					outputIndex: 0,
-					providerMetadata: {
-						gemini: {
-							stepId: "thought_roundtrip",
-							stepIndex: 0,
-							thoughtSignature: "sig_roundtrip",
-						},
-						signatureSource: "gemini:gemini-test:interactions",
-					},
-				},
-			],
-			undefined,
-			undefined,
-			undefined,
-			1,
-		);
-
 		const rebuilt = await provider.buildHistory(
 			[
 				{
@@ -926,8 +895,23 @@ describe("Gemini Interactions API provider", () => {
 			"gemini-test:model",
 		);
 
-		expect(rebuilt.history).toEqual(pushed);
-		expect(rebuilt.trailingToolResults).toEqual([
+		// Encounter order; the thought keeps its same-source signature, the call (whose
+		// signature names no source) does not carry one.
+		expect(rebuilt.history).toEqual([
+			{ type: "user_input", content: "question" },
+			{
+				type: "thought",
+				id: "thought_roundtrip",
+				signature: "sig_roundtrip",
+				summary: [{ type: "text", text: "reasoning summary" }],
+			},
+			{ type: "model_output", content: "answer prefix" },
+			{
+				type: "function_call",
+				id: "call_roundtrip",
+				name: "Read",
+				arguments: { file_path: "/tmp/a" },
+			},
 			{
 				type: "function_result",
 				call_id: "call_roundtrip",

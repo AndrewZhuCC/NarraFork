@@ -36,12 +36,13 @@ import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-bounda
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
-import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { getHome, IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { isLoopbackHostname } from "../lib/public-origin";
 import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
 import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
+import { sanitizeSvg } from "../lib/svg-sanitize";
 import { fsWriteSchema } from "../lib/validators/fs";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import type { EditorActor } from "../services/editor-document-service";
@@ -52,6 +53,7 @@ import {
 	type FileChangeCompletion,
 } from "../services/file-change-runtime";
 import { resolveNarratorProjectId } from "../services/narrator-project";
+import { findProjectDirCandidates, getProjectDirStatus } from "../services/project-dir";
 import { closeClaim, openClaim, sealClaim } from "../services/worktree-write-claims";
 
 export const fsRoutes = new Hono();
@@ -116,6 +118,28 @@ fsRoutes.get("/browse", (c) => {
 	const parent = getParent(absPath, isWin);
 
 	return c.json({ ...listing, path: absPath, drives, parent, sep });
+});
+
+/**
+ * GET /api/fs/project-dir
+ *
+ * Whether the instance's default project directory is set and exists. Clients use it
+ * to ask the user for a working directory instead of creating sessions in a folder
+ * that is unset or gone. One `stat`; safe to poll.
+ */
+fsRoutes.get("/project-dir", (c) => {
+	return c.json(getProjectDirStatus(settings.paths.defaultProjectDir, getHome()));
+});
+
+/**
+ * GET /api/fs/project-dir/candidates
+ *
+ * Existing folders under home that look like where the user keeps code (conventional
+ * names in any case, or folders already holding several git repositories), to offer
+ * when choosing the default project directory. Bounded async scan; see project-dir.ts.
+ */
+fsRoutes.get("/project-dir/candidates", async (c) => {
+	return c.json({ candidates: await findProjectDirCandidates(getHome()) });
 });
 
 /**
@@ -386,9 +410,31 @@ fsRoutes.get("/preview", async (c) => {
 
 	const ext = extname(absPath).toLowerCase();
 	const mime = PREVIEW_MIME[ext];
+	// SVG is text that executes: it is served through the sanitizer below rather than
+	// streamed, and it gets the smaller TEXT cap (not the 20 MB binary cap) because the
+	// whole document is read and parsed on the server's single JS thread.
+	const isSvg = ext === ".svg";
 
-	if (stat.size > (mime ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)) {
+	if (stat.size > (mime && !isSvg ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)) {
 		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	if (isSvg) {
+		// An SVG runs as a document on this origin (directly or via the frontend's
+		// same-origin blob URL), so its bytes are sanitized before they leave the server;
+		// see lib/svg-sanitize.ts. `nosniff` keeps the declared type honest, and the CSP
+		// is a second line of defense for a DIRECT navigation to this endpoint — it cannot
+		// reach the blob case, which is exactly why the bytes themselves are cleaned.
+		const clean = sanitizeSvg(await Bun.file(absPath).text());
+		return new Response(clean, {
+			headers: {
+				"Content-Type": "image/svg+xml; charset=utf-8",
+				"Content-Disposition": "inline",
+				"Cache-Control": "private, max-age=60",
+				"X-Content-Type-Options": "nosniff",
+				"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+			},
+		});
 	}
 
 	if (mime) {

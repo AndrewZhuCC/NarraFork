@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { normalizeApiRequestDiagnostics } from "@shared/agent-protocol/error-diagnostics";
+import { encodeToolOutput, type ToolOutputImageRef } from "@shared/agent-protocol/tool-output";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
@@ -10,15 +11,9 @@ import {
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import {
-	apiRequests,
-	narratorMessageRefs,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-} from "../db/schema";
+import { apiRequests, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
@@ -31,7 +26,7 @@ import {
 	finishApiRequest,
 	startApiRequest,
 } from "../lib/api-request-tracker";
-import { measureMessageCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
+import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { withDbRetry } from "../lib/db-resilience";
@@ -46,6 +41,7 @@ import {
 	resolveTranslationModelOverride,
 	settings,
 } from "../lib/settings";
+import { saveUploadedImage } from "../lib/uploads";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
@@ -60,6 +56,8 @@ import {
 	truncateJson,
 	truncateToolIO,
 } from "./narrator-service";
+import { narratorStore } from "./narrator-store";
+import { recordTurnStep, recordTurnToolCall } from "./narrator-turns";
 import { recordOutputChunk } from "./output-stats";
 import { toolInputStreamSource } from "./tool-input-stream-source";
 
@@ -184,6 +182,49 @@ function boundedWriteInput(input: Record<string, unknown>, update?: TextDocument
 }
 
 /**
+ * The stored output of a tool result: text plus metadata, the broken marker and the
+ * images the tool returned. Images are saved as uploads of this narrator and stored by
+ * reference, so a rebuilt request can send them again; one that cannot be saved is
+ * logged and left out while the text is kept.
+ */
+export async function toolResultLedgerOutput(
+	narratorId: string,
+	event: Extract<AgentEvent, { type: "tool_result" }>,
+): Promise<unknown> {
+	const images: ToolOutputImageRef[] = [];
+	for (const [index, image] of (event.images ?? []).entries()) {
+		try {
+			const saved = await saveUploadedImage(
+				narratorId,
+				new File(
+					[Buffer.from(image.base64, "base64")],
+					`${event.toolUseId}-${index}.${image.format}`,
+					{
+						type: `image/${image.format}`,
+					},
+				),
+			);
+			images.push({
+				imageId: saved.imageId,
+				mediaType: saved.mediaType,
+				uploadNarratorId: saved.uploadNarratorId ?? narratorId,
+			});
+		} catch (error) {
+			logger.warn("Failed to save a tool result image; its text is kept", {
+				narratorId,
+				toolUseId: event.toolUseId,
+				error: String(error),
+			});
+		}
+	}
+	return encodeToolOutput(event.output, {
+		metadata: event.metadata,
+		broken: !!event.brokenInputOverride,
+		images,
+	});
+}
+
+/**
  * Finish an already-started tool after its loop has drained/aborted. This intentionally
  * takes no EventHandlerContext: a newer turn may own the streaming snapshot and hooks.
  * Only the original execution receipt can update history; never recover it by provider id.
@@ -196,13 +237,14 @@ export async function persistDetachedToolResult(
 	if (!binding) {
 		throw new CriticalEventPersistenceError("Detached tool result has no execution receipt");
 	}
+	const output = await toolResultLedgerOutput(narratorId, event);
 	// The generator is already gone, so a transient lock cannot rely on its normal
 	// tool_result retry path. Retry asynchronously and retain the same CAS authority.
 	const affected = await withDbRetry(
 		() =>
-			narratorPersistence.updateToolCallResult(event.toolUseId, {
+			narratorStore.settleTool(event.toolUseId, {
 				expectedBinding: { ...binding, narratorId },
-				output: event.metadata ? { _text: event.output, _metadata: event.metadata } : event.output,
+				output,
 				input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
 				status: event.isError ? "fail" : "success",
 				errorMessage: event.isError ? event.output : undefined,
@@ -361,6 +403,11 @@ export interface EventHandlerContext {
 	 * of how blocks are stored.
 	 */
 	attemptBlockBaselines?: Map<string, number>;
+	/**
+	 * The provider request whose stream is being written (§3.6): the blocks it creates
+	 * carry it, and `attempt_discarded` drops exactly those.
+	 */
+	currentAttemptId?: string;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
 	pendingApiRequestIds?: string[];
 	/** Exact persisted tool-call row ids prepared for EnterPlanMode in this turn. */
@@ -664,17 +711,26 @@ function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 	return snap;
 }
 
+/** Write one item of the open step, stamped with the provider request writing it. */
+function writeAttemptItem(
+	ctx: EventHandlerContext,
+	messageId: string,
+	block: Parameters<typeof narratorStore.writeStepItem>[2],
+) {
+	return narratorStore.writeStepItem(messageId, ctx.narratorId, block, {
+		attemptId: ctx.currentAttemptId,
+	});
+}
+
 async function persistContentCheckpoint(
 	ctx: EventHandlerContext,
 	messageId: string,
-	block: Extract<
-		Parameters<typeof narratorService.appendBlockToMessage>[2],
-		{ type: "text" | "reasoning" }
-	>,
+	block: Extract<Parameters<typeof narratorStore.writeStepItem>[2], { type: "text" | "reasoning" }>,
 ): Promise<void> {
 	try {
-		await narratorService.appendBlockToMessage(messageId, ctx.narratorId, block, {
+		await narratorStore.writeStepItem(messageId, ctx.narratorId, block, {
 			republishUnchanged: !!block.id && ctx.unpublishedContentBlockIds?.has(block.id),
+			attemptId: ctx.currentAttemptId,
 		});
 		if (block.id) ctx.unpublishedContentBlockIds?.delete(block.id);
 	} catch (error) {
@@ -1264,90 +1320,23 @@ async function discardAttemptPersistedBlocks(
 	if (!partialId) return;
 
 	try {
-		const message = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			columns: { contentJson: true },
-		});
-		const blocks = Array.isArray(message?.contentJson)
-			? (message.contentJson as Array<Record<string, unknown>>)
-			: [];
-		if (blocks.length <= baseline) return;
-
-		// An in-flight partial may have been forked. Keep execution/approval identity
-		// on the real owner while isolating sibling snapshots before any mutation.
-		partialId = await narratorPersistence.copyOnWriteMessage(narratorId, partialId, undefined, {
-			preserveExecutionOwner: true,
-		});
-		ctx.setPartialMessageId(partialId);
-		const discarded = blocks.slice(baseline);
-		const discardedToolUseIds = discarded.flatMap((block) =>
-			block.type === "tool_use" && typeof block.id === "string" ? [block.id] : [],
-		);
-
-		// Which of those tool calls never ran — only these may be removed.
-		const executedToolUseIds = new Set<string>();
-		if (discardedToolUseIds.length > 0) {
-			const rows = await db.query.narratorToolCalls.findMany({
-				where: and(
-					eq(narratorToolCalls.messageId, partialId),
-					inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
-				),
-				columns: { id: true, toolUseId: true, status: true },
-			});
-			const removableRowIds: string[] = [];
-			for (const row of rows) {
-				if (row.status === "initializing" || row.status === "pending") {
-					removableRowIds.push(row.id);
-				} else {
-					executedToolUseIds.add(row.toolUseId);
-				}
-			}
-			if (removableRowIds.length > 0) {
-				await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.id, removableRowIds));
-				for (const toolUseId of discardedToolUseIds) {
-					if (!executedToolUseIds.has(toolUseId)) ctx.toolCallIdsMap?.delete(toolUseId);
-				}
-			}
-		}
-
-		// Keep the blocks of tools that actually executed, drop the rest. Order is
-		// preserved by filtering the whole array rather than concatenating the survivors
-		// after the baseline slice: `appendBlockToMessage` maintains blocks in
-		// `outputIndex` order, and `reorderPersistedToolUseBlocks` (run at
-		// `assistant_message`) reads tool positions, so both rely on that invariant.
-		const isRetainedBlock = (block: Record<string, unknown>, index: number): boolean =>
-			index < baseline ||
-			(block.type === "tool_use" &&
-				typeof block.id === "string" &&
-				executedToolUseIds.has(block.id));
-		const nextBlocks = blocks.filter(isRetainedBlock);
-		const retainedFromAttempt = nextBlocks.length - baseline;
-		const contentText = nextBlocks
-			.flatMap((block) =>
-				block.type === "text" && typeof block.text === "string" ? [block.text] : [],
-			)
-			.join("\n");
-
-		// A fork can acquire a ref after the earlier tool-isolation COW returned.
-		// Recheck membership and truncate atomically, never in a separate UPDATE.
-		partialId = await narratorPersistence.copyOnWriteMessage(
+		const discarded = await narratorStore.discardAttempt(
 			narratorId,
 			partialId,
-			{
-				contentJson: nextBlocks,
-				contentText: contentText || null,
-				contextCharsJson: measureMessageCharacters("assistant", nextBlocks, contentText),
-			},
-			{ preserveExecutionOwner: true },
+			baseline,
+			requestId,
 		);
+		if (!discarded) return;
+		partialId = discarded.messageId;
 		ctx.setPartialMessageId(partialId);
+		for (const toolUseId of discarded.removedToolUseIds) ctx.toolCallIdsMap?.delete(toolUseId);
 
 		logger.info("Discarded persisted blocks of a replayed attempt", {
 			narratorId,
 			partialId,
 			baseline,
-			discardedBlocks: discarded.length - retainedFromAttempt,
-			retainedExecutedToolCalls: retainedFromAttempt,
+			discardedBlocks: discarded.discardedBlocks,
+			retainedExecutedToolCalls: discarded.retainedExecutedCalls,
 		});
 
 		// `streaming_reset` above only drops LIVE streaming blocks. Blocks that already
@@ -2005,7 +1994,7 @@ export async function processEvent(
 			// Ensure a partial message exists for incremental persistence
 			if (!ctx.getPartialMessageId()) {
 				const tokenUsage = ctx.getTokenUsage();
-				const partial = await narratorService.createPartialAssistantMessage(narratorId, {
+				const partial = await narratorStore.openStep(narratorId, {
 					uuid: randomUUID(),
 					session_id: ctx.conversationId,
 					parent_tool_use_id: ctx.parentToolUseId,
@@ -2102,14 +2091,14 @@ export async function processEvent(
 					});
 				}
 			} else if (block.type === "redacted_thinking") {
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "redacted_thinking",
 					data: block.data,
 					outputIndex: block.outputIndex,
 					signatureSource: block.signatureSource,
 				});
 			} else if (block.type === "tool_use") {
-				const toolCallId = await narratorService.appendBlockToMessage(partialId, narratorId, {
+				const toolCallId = await writeAttemptItem(ctx, partialId, {
 					type: "tool_use",
 					id: block.toolUseId,
 					name: block.name,
@@ -2135,11 +2124,12 @@ export async function processEvent(
 				ctx.toolExecutionReceipts ??= new Map();
 				ctx.toolExecutionReceipts.set(block.toolUseId, { messageId: partialId, binding });
 				event.onToolPersisted?.(binding);
+				recordTurnToolCall(narratorId);
 				if (block.name === "Write" && typeof block.input.content === "string") {
 					await handoffWriteInput(ctx, block.toolUseId, block.input.content, partialId, binding);
 				}
 			} else if (block.type === "web_search") {
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "web_search",
 					id: block.id,
 					query: block.query,
@@ -2173,7 +2163,7 @@ export async function processEvent(
 						});
 					}
 				}
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "image_generation",
 					id: block.id,
 					revisedPrompt: block.revisedPrompt,
@@ -2271,14 +2261,11 @@ export async function processEvent(
 				// Partial message was already created incrementally via block_complete —
 				// just update final metadata (messageUuid + token usage).
 				savedId = partialId;
-				const updates: Record<string, unknown> = {};
-				if (event.messageId) updates.messageUuid = event.messageId;
-				if (event.credentialId) updates.credentialId = event.credentialId;
-				if (turnUsage) updates.turnUsageJson = turnUsage;
-
-				if (Object.keys(updates).length > 0) {
-					await db.update(narratorMessages).set(updates).where(eq(narratorMessages.id, savedId));
-				}
+				await narratorStore.sealStepMeta(savedId, {
+					messageUuid: event.messageId || undefined,
+					credentialId: event.credentialId || undefined,
+					turnUsageJson: turnUsage,
+				});
 				const usageData = buildUsageDataFromSnapshot(tokenUsage);
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
@@ -2308,7 +2295,7 @@ export async function processEvent(
 				}
 
 				const usageData = buildUsageDataFromSnapshot(tokenUsage);
-				const saved = await narratorService.persistAssistantMessage(narratorId, {
+				const saved = await narratorStore.appendStep(narratorId, {
 					uuid: event.messageId ?? randomUUID(),
 					session_id: ctx.conversationId,
 					parent_tool_use_id: ctx.parentToolUseId,
@@ -2342,11 +2329,7 @@ export async function processEvent(
 						: undefined,
 				});
 				savedId = saved.id;
-				if (turnUsage)
-					await db
-						.update(narratorMessages)
-						.set({ turnUsageJson: turnUsage })
-						.where(eq(narratorMessages.id, savedId));
+				await narratorStore.sealStepMeta(savedId, { turnUsageJson: turnUsage });
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
 				}
@@ -2374,18 +2357,12 @@ export async function processEvent(
 					event.toolUses,
 				);
 				if (reorderedContent) {
-					await db
-						.update(narratorMessages)
-						.set({
-							contentJson: reorderedContent,
-							contextCharsJson: measureMessageCharacters(
-								"assistant",
-								reorderedContent,
-								fullMessage.contentText,
-							),
-						})
-						.where(eq(narratorMessages.id, savedId));
-					queueContextCharacterRefresh(narratorId, savedId);
+					await narratorStore.orderStepCalls(
+						narratorId,
+						savedId,
+						reorderedContent,
+						fullMessage.contentText,
+					);
 					fullMessage = { ...fullMessage, contentJson: reorderedContent };
 				}
 			}
@@ -2537,9 +2514,7 @@ export async function processEvent(
 					"Prepared plan state belongs to another tool attempt",
 				);
 			}
-			const persistedOutput = event.metadata
-				? { _text: event.output, _metadata: event.metadata }
-				: event.output;
+			const persistedOutput = await toolResultLedgerOutput(narratorId, event);
 			const isSuccessfulEnterPlanMode = event.toolName === "EnterPlanMode" && !event.isError;
 			if (isSuccessfulEnterPlanMode && ctx.committedPlanModeToolUseIds?.has(event.toolUseId)) {
 				return null;
@@ -2563,7 +2538,7 @@ export async function processEvent(
 					: "Refusing successful EnterPlanMode without prepared persisted state.";
 				try {
 					if (resultToolCallId)
-						await narratorService.updateToolCallResult(
+						await narratorStore.settleTool(
 							event.toolUseId,
 							{ output: message, status: "fail", errorMessage: message },
 							undefined,
@@ -2640,7 +2615,7 @@ export async function processEvent(
 					);
 					const message = failure.message;
 					try {
-						await narratorService.updateToolCallResult(
+						await narratorStore.settleTool(
 							event.toolUseId,
 							{ output: message, status: "fail", errorMessage: message },
 							undefined,
@@ -2666,9 +2641,12 @@ export async function processEvent(
 				}
 			}
 
+			// A broken call stores its sanitized input; a permission redirect (e.g. the
+			// plan-mode file path) the input actually used. Either rides with the result.
+			const settledInput = event.brokenInputOverride ?? event.updatedInput;
 			if (!shouldCommitEnterPlanModeAtomically && resultToolCallId) {
 				try {
-					await narratorService.updateToolCallResult(
+					await narratorStore.settleTool(
 						event.toolUseId,
 						{
 							output: persistedOutput,
@@ -2678,28 +2656,11 @@ export async function processEvent(
 							permissionStartedAt: event.permissionStartedAt,
 							executionStartedAt: event.executionStartedAt,
 							completedAt: event.completedAt,
+							input: settledInput,
 						},
 						undefined,
 						resultToolCallId,
 					);
-					// Broken tool call: overwrite the persisted inputJson with a sanitized
-					// version (large content fields replaced with a short placeholder).
-					if (event.brokenInputOverride) {
-						await narratorService.overwriteToolCallInput(
-							event.toolUseId,
-							event.brokenInputOverride,
-							resultToolCallId,
-						);
-					}
-					// Permission-level input redirect (e.g. plan-mode file path):
-					// update the persisted inputJson to reflect the actual path used.
-					else if (event.updatedInput) {
-						await narratorService.overwriteToolCallInput(
-							event.toolUseId,
-							event.updatedInput,
-							resultToolCallId,
-						);
-					}
 					toolResultPersisted = true;
 				} catch (err) {
 					logger.error("Failed to persist tool result", {
@@ -2709,35 +2670,21 @@ export async function processEvent(
 					});
 					// Retry once — transient DB lock / busy errors are common with SQLite
 					try {
-						await narratorService.updateToolCallResult(
+						await narratorStore.settleTool(
 							event.toolUseId,
 							{
-								output: event.metadata
-									? { _text: event.output, _metadata: event.metadata }
-									: event.output,
+								output: persistedOutput,
 								status,
 								errorMessage: event.isError ? event.output : undefined,
 								durationMs: event.durationMs,
 								permissionStartedAt: event.permissionStartedAt,
 								executionStartedAt: event.executionStartedAt,
 								completedAt: event.completedAt,
+								input: settledInput,
 							},
 							undefined,
 							resultToolCallId,
 						);
-						if (event.brokenInputOverride) {
-							await narratorService.overwriteToolCallInput(
-								event.toolUseId,
-								event.brokenInputOverride,
-								resultToolCallId,
-							);
-						} else if (event.updatedInput) {
-							await narratorService.overwriteToolCallInput(
-								event.toolUseId,
-								event.updatedInput,
-								resultToolCallId,
-							);
-						}
 						toolResultPersisted = true;
 					} catch (retryErr) {
 						logger.error("CRITICAL: tool_result persist failed after retry", {
@@ -3459,6 +3406,7 @@ export async function processEvent(
 		}
 
 		case "api_request_start": {
+			ctx.currentAttemptId = event.requestId;
 			// Counters and frozen classifications never carry across attempts.
 			ctx.setTokenUsage(undefined);
 			// This context is runtime state; durable checkpoints must use the same
@@ -3542,6 +3490,7 @@ export async function processEvent(
 			if (requestInfo) {
 				ctx.apiRequestsMap?.delete(event.requestId);
 				ctx.accountRequestTokenUsage?.(event.usage);
+				recordTurnStep(narratorId, ctx.model, event.usage);
 			}
 			const snapshot = boundedContextSnapshot(event.contextSnapshot);
 			if (snapshot) {

@@ -1,5 +1,6 @@
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { isSecretPlatformPath, SECRET_PATH_TOOL_REFUSAL } from "../../fs-secret-paths";
 import { isRgAvailable, RG_FALLBACK_NOTE, RG_INSTALL_HINT } from "../../ripgrep";
 import { settings } from "../../settings";
 import { toolSpecPathError } from "../../spec-uri";
@@ -257,6 +258,12 @@ export const grepTool: ToolDefinition = {
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
 		const base = toolBaseCwd(backend, ctx.cwd);
 		const searchPath = resolveBackendPath(backend, base, searchPathArg ?? base);
+
+		// Application authorization guard enforced in every permission mode: never grep a
+		// NarraFork platform secret on the host (grepping its bytes discloses them).
+		if (backend.kind === "local" && isSecretPlatformPath(searchPath)) {
+			return { output: SECRET_PATH_TOOL_REFUSAL, isError: true };
+		}
 
 		try {
 			const grepResult = await backend.grep({

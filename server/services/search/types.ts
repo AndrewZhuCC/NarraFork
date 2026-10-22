@@ -263,6 +263,12 @@ export interface MessageSearchRow {
 	/** Leading body text, used when the backend produced no excerpt. */
 	preview: string;
 	rank: RelevanceRank;
+	/**
+	 * The block the match is in, when the backend indexes blocks (docs/BLOCK_STORAGE-DESIGN.md
+	 * §4.6). Absent for envelopes without blocks, substring matches and backends without a
+	 * block index; the hit still names its message.
+	 */
+	blockId?: string;
 }
 
 export interface NarratorSearchRow {
@@ -288,6 +294,8 @@ export interface TimelineSearchRow {
 	snippet: string;
 	preview: string;
 	createdAt: string;
+	/** See {@link MessageSearchRow.blockId}. */
+	blockId?: string;
 }
 
 export interface RecallMessageRow {

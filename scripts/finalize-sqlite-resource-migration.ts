@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite";
 import {
+	generatedModelHistoryTriggerContract,
 	generatedModelHistoryTriggerSuffix,
+	hasModelHistoryBlockSchema,
 	hasModelHistoryRevisionSchema,
 	MODEL_HISTORY_TRIGGER_TABLES,
+	modelHistoryTriggerTables,
 	splitGeneratedModelHistoryTriggers,
 } from "./lib/generated-model-history-triggers";
 
@@ -581,7 +584,8 @@ function validateTargetDDL(
 			// private databases to reject unresolved trigger columns without running DML.
 			for (const db of [actual, expected]) {
 				db.exec(triggerSql);
-				for (const name of MODEL_HISTORY_TRIGGER_TABLES) {
+				const contract = generatedModelHistoryTriggerContract(before, after, "sqlite");
+				for (const name of contract ? modelHistoryTriggerTables(contract) : []) {
 					const table = after.tables[name];
 					if (!table) throw new Error(`Missing generated trigger table ${name}`);
 					const columns = Object.keys(table.columns).filter(
@@ -744,7 +748,10 @@ export function finalizeResourceMigration(
 			const name = key(identifier(t[2]));
 			if (
 				hasModelHistoryRevisionSchema(before, "sqlite") &&
-				MODEL_HISTORY_TRIGGER_TABLES.some((table) => table === name)
+				(hasModelHistoryBlockSchema(before, "sqlite")
+					? MODEL_HISTORY_TRIGGER_TABLES
+					: modelHistoryTriggerTables("model-history-v1")
+				).some((table) => table === name)
 			)
 				throw new Error(
 					"Model-history trigger table rebuild requires a versioned reinstall migration",

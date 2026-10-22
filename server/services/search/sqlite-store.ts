@@ -103,6 +103,35 @@ type QueryTemplate = {
 	all(options: QueryOptions, ...params: Array<string | number | null>): Promise<RawRow[]>;
 };
 
+/**
+ * Merge block hits into envelope hits (docs/BLOCK_STORAGE-DESIGN.md §4.6). Until the envelope
+ * index retires (P3) both are live: an envelope hit keeps its excerpt and rank and gains the
+ * id of its first block hit; a message only its blocks match (a tool's input or result) is
+ * added. `blockHits` arrive in the order their first hit should win. With no block hits the
+ * envelope hits come back unchanged.
+ */
+function mergeBlockHits<T extends { blockId?: string }>(
+	hits: readonly T[],
+	blockHits: readonly T[],
+	key: (row: T) => string,
+	order: (a: T, b: T) => number,
+	limit: number,
+): T[] {
+	if (blockHits.length === 0) return [...hits];
+	const merged = new Map(hits.map((row) => [key(row), row]));
+	for (const hit of blockHits) {
+		const existing = merged.get(key(hit));
+		if (!existing) merged.set(key(hit), hit);
+		else if (!existing.blockId) merged.set(key(hit), { ...existing, blockId: hit.blockId });
+	}
+	return [...merged.values()].sort(order).slice(0, limit);
+}
+
+/** Binary string order, as SQLite compares TEXT. */
+function compareText(a: string, b: string): number {
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /** Every executor gets its own bounded set of fixed SQL templates. */
 export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchStore {
 	const templates = new Map<string, string>();
@@ -193,6 +222,26 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 LEFT JOIN projects p ON p.id = c.project_id
 			 WHERE m.content_text LIKE ? ${gate}
 			 ${sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ?`;
+		});
+	}
+
+	/**
+	 * Block hits for message search (index path only). The block index is contentless, so these
+	 * rows carry no excerpt; {@link mergeBlockHits} keeps the envelope's where it has one.
+	 */
+	function messageBlockStmt(gated: boolean, sort: EntitySearchQuery["sort"]): QueryTemplate {
+		return cached(`messages:blocks:${sort ?? "relevance"}:${gated ? "gated" : "all"}`, () => {
+			const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
+			return `SELECT ${MESSAGE_COLUMNS}, b.id as block_id,
+			  rank as rank_score
+			 FROM narrator_blocks_fts
+			 JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
+			 JOIN narrator_messages m ON m.id = b.message_id
+			 JOIN narrators n ON n.id = m.narrator_id
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
+			 WHERE narrator_blocks_fts MATCH ? ${gate}
+			 ORDER BY ${sort === "time" ? "m.created_at DESC, m.id ASC, b.ordinal ASC" : "rank"} LIMIT ?`;
 		});
 	}
 
@@ -290,12 +339,27 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 LIMIT ?`;
 	}
 
+	/** Block hits in a timeline: each message's first matching block, in timeline order. */
+	function timelineBlockSql(scopeSql: string): string {
+		return `SELECT ${TIMELINE_COLUMNS}, b.id as block_id
+			 FROM narrator_blocks_fts
+			 JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
+			 JOIN narrator_messages m ON m.id = b.message_id
+			 JOIN narrator_message_refs r
+			   ON r.message_id = m.id AND ${scopeSql} AND r.segment_compact_id IS NULL
+			 WHERE narrator_blocks_fts MATCH ?
+			 ORDER BY r.seq DESC, b.ordinal ASC
+			 LIMIT ?`;
+	}
+
 	/** The no-ancestry case binds the narrator id instead of interpolating it, so it caches. */
-	function timelineOwnStmt(strategy: "index" | "substring"): QueryTemplate {
+	function timelineOwnStmt(strategy: "index" | "substring" | "blocks"): QueryTemplate {
 		return cached(`timeline:${strategy}`, () =>
 			strategy === "index"
 				? timelineIndexSql("r.narrator_id = ? ")
-				: timelineSubstringSql("r.narrator_id = ? "),
+				: strategy === "blocks"
+					? timelineBlockSql("r.narrator_id = ? ")
+					: timelineSubstringSql("r.narrator_id = ? "),
 		);
 	}
 
@@ -489,7 +553,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			const gate = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
 			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
 			const rows: RawRow[] = await stmt.all(options, needle, ...gate, query.limit);
-			return rows.map((row) => ({
+			const toRow = (row: RawRow): MessageSearchRow => ({
 				id: row.id,
 				narratorId: row.narrator_id ?? null,
 				narratorTitle: row.narrator_title ?? null,
@@ -502,7 +566,24 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				snippet: row.snippet ?? "",
 				preview: row.content_preview ?? "",
 				rank: rankOf(row, query.strategy),
-			}));
+				...(row.block_id ? { blockId: row.block_id } : {}),
+			});
+			if (query.strategy !== "index") return rows.map(toRow);
+			const blockRows: RawRow[] = await messageBlockStmt(gated, query.sort).all(
+				options,
+				needle,
+				...gate,
+				query.limit,
+			);
+			return mergeBlockHits(
+				rows.map(toRow),
+				blockRows.map(toRow),
+				(row) => row.id,
+				query.sort === "time"
+					? (a, b) => compareText(b.createdAt ?? "", a.createdAt ?? "") || compareText(a.id, b.id)
+					: (a, b) => (a.rank ?? 0) - (b.rank ?? 0),
+				query.limit,
+			);
 		},
 
 		async searchNarrators(query: EntitySearchQuery): Promise<NarratorSearchRow[]> {
@@ -531,29 +612,37 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		async searchTimeline(query: TimelineSearchQuery): Promise<TimelineSearchRow[]> {
 			const options = { signal: query.signal, operation: "searchTimeline" };
 			const needle = query.strategy === "index" ? prefixExpr(query.text) : rawContains(query.text);
-			let rows: RawRow[];
-			if (query.inheritedScopes.length === 0) {
-				rows = await timelineOwnStmt(query.strategy).all(
-					options,
-					query.narratorId,
-					needle,
-					query.limit,
-				);
-			} else {
+			const run = (strategy: "index" | "substring" | "blocks"): Promise<RawRow[]> => {
+				if (query.inheritedScopes.length === 0)
+					return timelineOwnStmt(strategy).all(options, query.narratorId, needle, query.limit);
 				// Ancestry shape varies per narrator, so this statement cannot be cached.
 				const scopeSql = timelineScopeSql(query.narratorId, query.inheritedScopes);
 				const sql =
-					query.strategy === "index" ? timelineIndexSql(scopeSql) : timelineSubstringSql(scopeSql);
-				rows = await execute(sql, [needle, query.limit], options);
-			}
-			return rows.map((row) => ({
+					strategy === "index"
+						? timelineIndexSql(scopeSql)
+						: strategy === "blocks"
+							? timelineBlockSql(scopeSql)
+							: timelineSubstringSql(scopeSql);
+				return execute(sql, [needle, query.limit], options);
+			};
+			const toRow = (row: RawRow): TimelineSearchRow => ({
 				messageId: row.id,
 				seq: typeof row.seq === "number" ? row.seq : Number(row.seq) || 0,
 				role: row.message_role ?? "",
 				snippet: row.snippet ?? "",
 				preview: row.content_preview ?? "",
 				createdAt: row.created_at,
-			}));
+				...(row.block_id ? { blockId: row.block_id } : {}),
+			});
+			const rows = (await run(query.strategy)).map(toRow);
+			if (query.strategy !== "index") return rows;
+			return mergeBlockHits(
+				rows,
+				(await run("blocks")).map(toRow),
+				(row) => `${row.messageId}:${row.seq}`,
+				(a, b) => b.seq - a.seq,
+				query.limit,
+			);
 		},
 
 		async searchRecallMessages(query: RecallSearchQuery): Promise<RecallMessageRow[]> {

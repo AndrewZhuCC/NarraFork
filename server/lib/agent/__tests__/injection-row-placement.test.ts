@@ -167,10 +167,7 @@ describe("Anthropic — an injected sys row", () => {
 			AnthropicProvider as unknown as new (
 				config: Record<string, unknown>,
 			) => {
-				buildHistory: (
-					rows: unknown[],
-					model: string,
-				) => Promise<{ history: unknown[]; trailingToolResults: unknown[] }>;
+				buildHistory: (rows: unknown[], model: string) => Promise<{ history: unknown[] }>;
 			}
 		)({
 			id: "test-anthropic",
@@ -220,10 +217,7 @@ describe("Anthropic — an injected sys row", () => {
 			AnthropicProvider as unknown as new (
 				config: Record<string, unknown>,
 			) => {
-				buildHistory: (
-					rows: unknown[],
-					model: string,
-				) => Promise<{ history: unknown[]; trailingToolResults: unknown[] }>;
+				buildHistory: (rows: unknown[], model: string) => Promise<{ history: unknown[] }>;
 				chat: (params: Record<string, unknown>) => AsyncGenerator<unknown>;
 			}
 		)({
@@ -263,7 +257,7 @@ describe("Anthropic — an injected sys row", () => {
 				content: "",
 				model: "anthropic:claude-sonnet-4",
 				tools: [],
-				toolResults: built.trailingToolResults,
+				toolResults: [],
 				conversationId: "conv-1",
 			})) {
 				// drain
@@ -317,10 +311,7 @@ describe("OpenAI — an injected sys row", () => {
 			OpenAIProvider as unknown as new (
 				config: Record<string, unknown>,
 			) => {
-				buildHistory: (
-					rows: unknown[],
-					model: string,
-				) => Promise<{ history: unknown[]; trailingToolResults: unknown[] }>;
+				buildHistory: (rows: unknown[], model: string) => Promise<{ history: unknown[] }>;
 			}
 		)({
 			id: "test-openai",

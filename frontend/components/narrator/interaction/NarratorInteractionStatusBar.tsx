@@ -14,6 +14,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -48,8 +49,8 @@ import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
 import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
 import type { QuotaPanelView } from "../model/quota-panel-view";
-import { useKimiProviderBadges } from "../model/use-kimi-provider-badges";
-import { useOpencodeProviderBadges } from "../model/use-opencode-provider-badges";
+import { Sub2ApiSubscriptionQuotaIndicator } from "../model/Sub2ApiSubscriptionQuotaIndicator";
+import { useModelMenuProviderBadges } from "../model/use-model-menu-provider-badges";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
@@ -148,8 +149,8 @@ export interface NarratorInteractionStatusBarProps {
 		aggregations: any;
 		// biome-ignore lint/suspicious/noExplicitAny: provider label map passthrough.
 		providerLabels: any;
-		/** Settings projection, for the OpenCode Go allowance badges on provider groups. */
-		settingsData?: { customApiProviders?: unknown; opencodeUsageGenerations?: unknown };
+		/** Settings projection, for the allowance/balance badges on provider groups. */
+		settingsData?: Parameters<typeof useModelMenuProviderBadges>[0];
 		defaultModelValue: string;
 		// biome-ignore lint/suspicious/noExplicitAny: refresh props are spread verbatim onto ModelMenuItems.
 		refreshProps: any;
@@ -225,6 +226,8 @@ export interface NarratorInteractionStatusBarProps {
 			waitingForQuota: boolean;
 			waitingText: string | null;
 		};
+		/** The active sub2api subscription, already isolated by the balance query. */
+		sub2api?: { snapshot: ProviderBalanceSnapshot; queryFailed: boolean };
 		/**
 		 * Windowed allowance of another provider (Kimi, Command Code), shown with the
 		 * same progress-bar indicator as OpenCode Go. `undefined` when not applicable.
@@ -322,20 +325,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	// (a click outside the menu) does not also close the model menu.
 	const [menuOpenDesktop, setMenuOpenDesktop] = useState(false);
 	const [menuOpenMobile, setMenuOpenMobile] = useState(false);
-	const opencodeProviderBadges = useOpencodeProviderBadges(
+	const { providerBadges: providerQuotaBadges, providerBalances } = useModelMenuProviderBadges(
 		model.settingsData,
 		menuOpenDesktop || menuOpenMobile,
-	);
-	const kimiProviderBadges = useKimiProviderBadges(
-		model.settingsData,
-		menuOpenDesktop || menuOpenMobile,
-	);
-	const providerQuotaBadges = useMemo(
-		() =>
-			opencodeProviderBadges || kimiProviderBadges
-				? { ...kimiProviderBadges, ...opencodeProviderBadges }
-				: undefined,
-		[opencodeProviderBadges, kimiProviderBadges],
 	);
 
 	// Quota-details popover open state + its delayed-close timer. Kept internal to
@@ -574,6 +566,13 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									isMobile={isMobileViewport}
 								/>
 							)}
+							{quota.sub2api && !isWorkspacePreview && (
+								<Sub2ApiSubscriptionQuotaIndicator
+									snapshot={quota.sub2api.snapshot}
+									queryFailed={quota.sub2api.queryFailed}
+									isMobile={isMobileViewport}
+								/>
+							)}
 							{quota.panel && !isWorkspacePreview && (
 								<QuotaPanelIndicator
 									view={quota.panel.view}
@@ -583,7 +582,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 								/>
 							)}
 							{/* Generic gateway/API quota balance */}
-							{quota.balance != null &&
+							{!quota.sub2api &&
+								quota.balance != null &&
 								(quota.hasDetailsPopover ? (
 									<Popover
 										opened={quotaDetailsOpened}
@@ -759,6 +759,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																onShowPrice={setPriceModel}
 																providerLabels={model.providerLabels}
 																providerBadges={providerQuotaBadges}
+																providerBalances={providerBalances}
 																onEditDefaultModel={model.onEditDefaultModel}
 																onEditSummaryModel={model.onEditSummaryModel}
 																onSetAsDefaultModel={model.onSetAsDefaultModel}
@@ -1036,6 +1037,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															onShowPrice={setPriceModel}
 															providerLabels={model.providerLabels}
 															providerBadges={providerQuotaBadges}
+															providerBalances={providerBalances}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
 															onSetAsDefaultModel={model.onSetAsDefaultModel}

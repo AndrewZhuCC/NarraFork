@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -14,7 +15,9 @@ import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
 import {
 	MODEL_HISTORY_REVISION_CONTRACT,
+	MODEL_HISTORY_REVISION_CONTRACT_V1,
 	renderModelHistoryRevisionSql,
+	renderModelHistoryRevisionSqlV1,
 } from "../services/agent-runtime/model-history-revision-sql";
 
 const FILESYSTEM_MIGRATIONS_FOLDER = "./drizzle";
@@ -700,8 +703,9 @@ function isRetiredIndexCreateError(
 
 // Only outer whitespace and SQLite's omitted final semicolon are interchangeable. In
 // particular, never normalize whitespace/case inside a trigger body or a SQL literal.
+// CRLF is the one exception: it only reflects the checkout the migration file was read from.
 function normalizeModelHistorySql(sql: string): string {
-	return sql.trim().replace(/;$/, "").trimEnd();
+	return sql.replace(/\r\n/g, "\n").trim().replace(/;$/, "").trimEnd();
 }
 
 // The official SQLite v1 schema prelude, followed by the generator's pure trigger SQL.
@@ -713,15 +717,26 @@ const MODEL_HISTORY_MIGRATION_SQL = [
 	"ALTER TABLE `narrator_tool_calls` ADD `model_revision` integer DEFAULT 0 NOT NULL;",
 	"ALTER TABLE `narrators` ADD `model_history_revision` integer DEFAULT 0 NOT NULL;",
 	"PRAGMA foreign_keys=ON;",
-	...renderModelHistoryRevisionSql("sqlite").split("--> statement-breakpoint"),
+	...renderModelHistoryRevisionSqlV1("sqlite").split("--> statement-breakpoint"),
 ].map(normalizeModelHistorySql);
-const MODEL_HISTORY_TRIGGERS = MODEL_HISTORY_MIGRATION_SQL.slice(6, -1).map((sql) => {
-	const match = /^CREATE TRIGGER (\w+) (?:BEFORE|AFTER) (?:INSERT|UPDATE|DELETE) ON (\w+)\b/.exec(
-		sql,
-	);
-	if (!match) throw new Error("Invalid canonical model-history SQLite trigger");
-	return { name: match[1], table: match[2], sql };
-});
+function canonicalTriggers(statements: readonly string[]) {
+	return statements.map((sql) => {
+		const match =
+			/^CREATE TRIGGER (\w+) (?:BEFORE|AFTER) (?:INSERT|UPDATE(?: OF [\w, ]+)?|DELETE) ON (\w+)\b/.exec(
+				sql,
+			);
+		if (!match) throw new Error("Invalid canonical model-history SQLite trigger");
+		return { name: match[1], table: match[2], sql };
+	});
+}
+const MODEL_HISTORY_TRIGGERS = canonicalTriggers(MODEL_HISTORY_MIGRATION_SQL.slice(6, -1));
+/** The current (v2) contract's triggers, which supersede v1 once its reinstall ran. */
+const MODEL_HISTORY_V2_TRIGGERS = canonicalTriggers(
+	renderModelHistoryRevisionSql("sqlite")
+		.split("--> statement-breakpoint")
+		.map(normalizeModelHistorySql)
+		.filter((sql) => sql.startsWith("CREATE TRIGGER")),
+);
 
 function isOfficialModelHistoryMigration(statements: readonly string[]): boolean {
 	return (
@@ -733,13 +748,37 @@ function isOfficialModelHistoryMigration(statements: readonly string[]): boolean
 	);
 }
 
-/** Bounded catalog proof only; this never installs or repairs live DDL. */
+/**
+ * Bounded catalog proof only; this never installs or repairs live DDL. A database whose
+ * v1 contract was later reinstalled as v2 (block storage) has the v1 migration's effect too.
+ */
 function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
+	return (
+		isModelHistoryContractInstalled(
+			sqlite,
+			MODEL_HISTORY_REVISION_CONTRACT_V1,
+			MODEL_HISTORY_TRIGGERS,
+		) ||
+		isModelHistoryContractInstalled(
+			sqlite,
+			MODEL_HISTORY_REVISION_CONTRACT,
+			MODEL_HISTORY_V2_TRIGGERS,
+		)
+	);
+}
+
+function isModelHistoryContractInstalled(
+	sqlite: Database,
+	contract: string,
+	triggers: ReadonlyArray<{ name: string; table: string; sql: string }>,
+): boolean {
 	const catalogSql = sqlite.prepare(
 		"SELECT sql FROM sqlite_schema WHERE type = ? AND name = ? AND tbl_name = ? AND length(sql) <= ? LIMIT 1",
 	);
 	const matchesCatalogSql = (type: string, name: string, table: string, expected: string) => {
-		const row = catalogSql.get(type, name, table, expected.length + 1) as { sql: string } | null;
+		// Room for a CRLF form: one extra byte per line.
+		const maxLength = expected.length + expected.split("\n").length;
+		const row = catalogSql.get(type, name, table, maxLength) as { sql: string } | null;
 		return row !== null && normalizeModelHistorySql(row.sql) === expected;
 	};
 	if (
@@ -770,22 +809,41 @@ function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
 			.prepare(
 				"SELECT 1 FROM model_history_revision_contracts WHERE id = 'model-history' AND installed_version = ? LIMIT 1",
 			)
-			.get(MODEL_HISTORY_REVISION_CONTRACT)
+			.get(contract)
 	) {
 		return false;
 	}
-	for (const trigger of MODEL_HISTORY_TRIGGERS) {
+	for (const trigger of triggers) {
 		if (!matchesCatalogSql("trigger", trigger.name, trigger.table, trigger.sql)) return false;
 	}
-	// Other business triggers are unrelated, but an unknown v1-contract trigger is not.
+	// Other business triggers are unrelated, but an unknown model-history trigger is not.
 	return (
 		sqlite
 			.prepare(
-				`SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name GLOB 'model_history_v1_*'
-				 AND name NOT IN (${MODEL_HISTORY_TRIGGERS.map(() => "?").join(",")}) LIMIT 1`,
+				`SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name GLOB 'model_history_v*'
+				 AND name NOT IN (${triggers.map(() => "?").join(",")}) LIMIT 1`,
 			)
-			.get(...MODEL_HISTORY_TRIGGERS.map((trigger) => trigger.name)) === null
+			.get(...triggers.map((trigger) => trigger.name)) === null
 	);
+}
+
+/**
+ * Whether the ledger already records this migration, under either line-ending form.
+ *
+ * Drizzle hashes the raw file text, so the same migration read from a CRLF checkout (Windows
+ * git with `core.autocrlf`, or a binary built from one) is recorded under a different hash than
+ * its LF copy. Without this, a database migrated by one form looks entirely unmigrated to the
+ * other: every migration is replayed from the start, and the high-water mark that protects
+ * already-applied destructive rebuilds is lost.
+ */
+function isRecordedMigration(
+	appliedHashes: ReadonlySet<string>,
+	migration: { sql: string[]; hash: string },
+): boolean {
+	if (appliedHashes.has(migration.hash)) return true;
+	const lf = migration.sql.join("--> statement-breakpoint").replace(/\r\n/g, "\n");
+	const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+	return appliedHashes.has(sha256(lf)) || appliedHashes.has(sha256(lf.replace(/\n/g, "\r\n")));
 }
 
 /**
@@ -843,14 +901,15 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	// past that journal position (normal incremental upgrades only ever leave a trailing
 	// suffix pending). A destructive migration in a hole must not be re-run: its rebuild
 	// already happened, so replaying the DROP would destroy live data.
+	const applied = migrations.map((migration) => isRecordedMigration(appliedHashes, migration));
 	let lastAppliedIndex = -1;
 	for (let i = 0; i < migrations.length; i++) {
-		if (appliedHashes.has(migrations[i].hash)) lastAppliedIndex = i;
+		if (applied[i]) lastAppliedIndex = i;
 	}
 
 	const pending = migrations
 		.map((migration, index) => ({ migration, index }))
-		.filter(({ migration }) => !appliedHashes.has(migration.hash));
+		.filter(({ index }) => !applied[index]);
 	if (pending.length === 0) return;
 
 	const foreignKeyState = sqlite.prepare("PRAGMA foreign_keys").get() as {

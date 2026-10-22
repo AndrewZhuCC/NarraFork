@@ -887,6 +887,21 @@ export interface NarraForkSettings {
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
+	/** Block storage rollout switches (docs/BLOCK_STORAGE-DESIGN.md §10.6). */
+	narratorBlocks: {
+		/**
+		 * Whether new envelopes are stored as blocks (`body_format = 2`), with the
+		 * compatible `content_json` derived alongside. Off: new envelopes use the legacy
+		 * format; envelopes already stored as blocks keep being maintained as blocks.
+		 */
+		write: boolean;
+		/**
+		 * Whether readers (model history, display pages, External API, exports) read a
+		 * block-format envelope's body from its block rows. Off: everything reads
+		 * `content_json`, which holds the same content while both are written.
+		 */
+		read: boolean;
+	};
 	containers: {
 		portRangeStart: number;
 		portRangeEnd: number;

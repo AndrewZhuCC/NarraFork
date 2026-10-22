@@ -14,6 +14,7 @@ export interface SenderMessage extends DbMessage {
 	origin?: string | null;
 	originLabel?: string | null;
 	creator?: { username: string } | null;
+	/** The author narrator's title (the owner's when no author is recorded). */
 	narrator?: { title?: string | null } | null;
 }
 
@@ -64,7 +65,7 @@ function systemSender(message: SenderMessage): MessageSender {
 /** Ownership and role/origin outrank createdBy (which can be an initiating human). */
 export function resolveMessageSender(message: SenderMessage): MessageSender {
 	if (message.role === "assistant")
-		return sender("agent", message.narratorId, message.narrator?.title);
+		return sender("agent", message.authorNarratorId ?? message.narratorId, message.narrator?.title);
 	const items = inboundItems(message);
 	if (items.length) {
 		const identities = items.map(itemSender);
@@ -77,6 +78,9 @@ export function resolveMessageSender(message: SenderMessage): MessageSender {
 		const label = parseOriginLabel(message.originLabel);
 		return sender("agent", undefined, label?.source === "agentMessage" ? label.detail : undefined);
 	}
+	// A segment-compact marker is written as a user row without an origin, but no human
+	// wrote it: its summary is the system's.
+	if (record(blocksOf(message)[0])?.type === "segment_compact") return systemSender(message);
 	if (message.role === "user" && (message.origin == null || message.origin === "user"))
 		return sender("human", message.createdBy, message.creator?.username);
 	return systemSender(message);
@@ -156,6 +160,14 @@ export function projectInjectionSenderText(text: string, source: string, body?: 
 // ignored by JSON serialization, so this never changes persisted message schemas.
 const projected = Symbol("senderProjection");
 type ProjectedMessage = SenderMessage & { [projected]?: true };
+
+/**
+ * Mark a row whose text is already exactly what the model reads — a loop's own input
+ * (`loop-transcript.ts`), which was never attributed and is sent as written.
+ */
+export function markSenderProjected<T extends SenderMessage>(message: T): T {
+	return Object.assign(message, { [projected]: true as const });
+}
 
 /** Immutable model projection; preserve blocks, body metadata and all non-text payloads. */
 export function projectMessageSenderForModel<T extends SenderMessage>(message: T): T {

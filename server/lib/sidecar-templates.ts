@@ -36,6 +36,10 @@ const MESSAGE_TABLE_KEYS = [
 	"noticeSilentProgress",
 	"noticeRelaxedPlan",
 	"noticePipelineExit",
+	"noticeTurnNudge",
+	"noticeBrokenCall",
+	"noticeContinue",
+	"noticeWorkspaceChanged",
 	// prose headings (keyed by side-car source)
 	"behavior_fenceHeading",
 	// tasks

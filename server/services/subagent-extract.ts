@@ -31,6 +31,11 @@ import type { Locale } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	flushChangedEnvelopes,
+	newEnvelopeColumns,
+	newEnvelopeFormat,
+} from "./narrator-block-sync";
+import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
 	withSeqFloorRaiseScope,
@@ -242,6 +247,11 @@ export async function extractSubagentToPrimary(
 								// New identity: never reuse the source SDK uuid.
 								messageUuid: null,
 								role: msg.role,
+								bodyFormat: newEnvelopeFormat(),
+								// A copy stays in the run that produced it.
+								turnId: msg.turnId,
+								// The subagent still authored what the new narrator holds (§6.3).
+								authorNarratorId: msg.authorNarratorId ?? msg.narratorId,
 								contentJson: msg.contentJson,
 								contextCharsJson: msg.contextCharsJson,
 								contentText: msg.contentText,
@@ -298,6 +308,7 @@ export async function extractSubagentToPrimary(
 							narratorId: id,
 							parentToolUseId: null,
 							role: "system",
+							...newEnvelopeColumns(id),
 							contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
 							contextCharsJson: { segments: [] },
 							contentText:
@@ -322,6 +333,7 @@ export async function extractSubagentToPrimary(
 				}
 
 				initializeRefSeqFloor(tx, id);
+				flushChangedEnvelopes();
 				return created;
 			}),
 		),

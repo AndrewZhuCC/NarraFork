@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
@@ -296,6 +296,7 @@ import {
 	NARRATOR_ACL_COLUMNS,
 	narratorReadableWhere,
 } from "../services/narrator-acl";
+import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
@@ -432,6 +433,7 @@ import {
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { permissionRuleService } from "../services/permission-rule-service";
+import { usableProjectDir } from "../services/project-dir";
 import {
 	applyLocalRevertPlan,
 	getLocalRevertPlan,
@@ -1279,9 +1281,9 @@ narratorRoutes.get("/", async (c) => {
 /**
  * Bind the standalone-cwd decision to this process's real filesystem and settings.
  *
- * The decision itself lives in `standalone-narrator-cwd` so its branches (a `~` to
- * expand, a configured directory that cannot be created) are unit-testable without a
- * disk.
+ * The decision itself lives in `standalone-narrator-cwd` so its branches are
+ * unit-testable without a disk. Nothing is created: with no directory in the request
+ * and no existing default, creation is refused so the client asks the user to choose.
  */
 function standaloneNarratorCwd(
 	input: {
@@ -1291,23 +1293,26 @@ function standaloneNarratorCwd(
 	projectDir?: string | null,
 ): string | undefined {
 	// Project paths are metadata, not an invitation to create or validate a repository.
-	const explicit = input.cwd?.trim();
-	if (explicit) return explicit;
-	if (projectDir) return projectDir;
-	return resolveStandaloneNarratorCwd(input, {
+	if (!input.cwd?.trim() && projectDir) return projectDir;
+	const decision = resolveStandaloneNarratorCwd(input, {
 		home: getHome(),
 		configuredDir: settings.paths.defaultProjectDir,
-		ensureDir: (path) => {
-			mkdirSync(path, { recursive: true });
+		isDirectory: (path) => {
+			try {
+				return statSync(path).isDirectory();
+			} catch {
+				return false;
+			}
 		},
 		toAbsolute: (path) => resolve(path),
-		onEnsureFailed: (path, error) => {
-			logger.warn("Failed to ensure default project dir exists for narrator cwd", {
-				path,
-				error: String(error),
-			});
-		},
 	});
+	if (decision.kind === "required") {
+		throw new ValidationError(
+			"Choose a working directory: no default project directory is set, or it no longer exists",
+			"PROJECT_DIR_REQUIRED",
+		);
+	}
+	return decision.kind === "cwd" ? decision.cwd : undefined;
 }
 
 // Create narrator
@@ -1554,7 +1559,8 @@ narratorRoutes.get("/human-attention/:attentionId", async (c) => {
 // Slash menu for a composer with no session yet (dashboard): user commands and the
 // skills visible from the directory the session would be created in.
 narratorRoutes.get("/draft-composer/commands", async (c) => {
-	const cwd = c.req.query("cwd")?.trim() || settings.paths.defaultProjectDir || null;
+	const cwd =
+		c.req.query("cwd")?.trim() || usableProjectDir(settings.paths.defaultProjectDir, getHome());
 	return c.json(await getDraftSlashMenuItems(c.get("user").sub, cwd));
 });
 
@@ -4455,18 +4461,21 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 			import("../services/agent-runtime/ownership"),
 			import("../services/agent-runtime/run"),
 		]);
-	const deliverTo = await readSessionDeliverTo(id);
-	if (!deliverTo) return c.json({ error: "This session does not deliver a result" }, 400);
 	if (!getRunHold(id)) return c.json({ error: "Subagent is not taken over" }, 400);
 	const run = getRunControl(id);
+	const deliverTo = run?.deliverTo ?? (await readSessionDeliverTo(id));
 	const deferred = !!run && !run.wake;
+	// Restored/legacy holds may have no delivery registration. Releasing the hold
+	// must still work; historical parentage alone does not grant result delivery.
 	await controlRun(id, { kind: "release" });
-	await broadcastSubagentTakeoverChanged({
-		parentNarratorId: deliverTo.narratorId,
-		subagentNarratorId: id,
-		takenOver: false,
-		toolUseId: deliverTo.toolUseId,
-	});
+	if (deliverTo) {
+		await broadcastSubagentTakeoverChanged({
+			parentNarratorId: deliverTo.narratorId,
+			subagentNarratorId: id,
+			takenOver: false,
+			toolUseId: deliverTo.toolUseId,
+		});
+	}
 	return c.json({ stopped: true, deferred });
 });
 
@@ -5284,6 +5293,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 				id: msgId,
 				narratorId: id,
 				role: "system",
+				...newEnvelopeColumns(id),
 				contentJson: [
 					{
 						type: "ask_in_passing",

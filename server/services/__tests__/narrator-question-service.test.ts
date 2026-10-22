@@ -71,6 +71,7 @@ const {
 	resolveAsyncQuestion,
 	supplementAsyncQuestion,
 	getBoundedQuestionDetail,
+	listQuestionEvents,
 	listQuestionSummaries,
 	buildPendingQuestionHint,
 	getBoundedQuestionReceipt,
@@ -84,6 +85,7 @@ const {
 	setQuestionServiceSeam,
 	withdrawAsyncQuestions,
 } = await import("../narrator-question-service");
+const { settings } = await import("../../lib/settings");
 
 const createAsyncQuestion = (args: Parameters<typeof createQuestionRecord>[0]) =>
 	createQuestionRecord({
@@ -1461,5 +1463,53 @@ describe("listAsyncQuestions", () => {
 		});
 		expect(secondPage.items.map((q) => q.id)).toEqual([created[1]]);
 		expect(secondPage.nextCursor).toBeNull();
+	});
+});
+
+describe("receipt supplements with block reads", () => {
+	test("event text matches the content_json read, and comes from the receipt's block", async () => {
+		const call = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: QUESTIONS,
+		});
+		const answer = await answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } });
+		if (!answer.ok) throw new Error("answer failed");
+		const supplemented = await supplementAsyncQuestion(record.id, { text: "Actually memory" });
+		if (!supplemented.ok || !supplemented.record.answerMessageId)
+			throw new Error("supplement failed");
+		const receipt = supplemented.record.answerMessageId;
+		expect(
+			sqlite.query("SELECT body_format AS format FROM narrator_messages WHERE id = ?").get(receipt),
+		).toEqual({ format: 2 });
+		const read = async (fromBlocks: boolean) => {
+			settings.narratorBlocks.read = fromBlocks;
+			try {
+				return await listQuestionEvents(record.id);
+			} finally {
+				settings.narratorBlocks.read = true;
+			}
+		};
+		const off = await read(false);
+		expect(await read(true)).toEqual(off);
+		expect(off.events.map((event) => event.text)).toEqual(["", "Actually memory"]);
+
+		// Rows that count as current answer, whatever content_json says.
+		const stored = sqlite
+			.query("SELECT content_json AS content FROM narrator_messages WHERE id = ?")
+			.get(receipt) as { content: string };
+		const changed = (JSON.parse(stored.content) as Array<{ body?: { supplement?: string } }>).map(
+			(element) =>
+				element.body?.supplement === undefined
+					? element
+					: { ...element, body: { ...element.body, supplement: "changed" } },
+		);
+		sqlite
+			.query("UPDATE narrator_messages SET content_json = ? WHERE id = ?")
+			.run(JSON.stringify(changed), receipt);
+		sqlite.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?").run(receipt);
+		expect((await read(false)).events.at(-1)?.text).toBe("changed");
+		expect((await read(true)).events.at(-1)?.text).toBe("Actually memory");
 	});
 });

@@ -1667,6 +1667,22 @@ export const narratorMessages = sqliteTable(
 			sql`(CASE WHEN json_extract("content_json", '$[0].type') = 'compact' AND (json_extract("content_json", '$[0].status') IN ('compacting', 'running') OR json_extract("content_json", '$[0].attempts[#-1].status') = 'running') THEN 1 ELSE 0 END)`,
 			{ mode: "virtual" },
 		),
+		/**
+		 * 1: `content_json` is authoritative. 2: the `narrator_blocks` rows are, and
+		 * `content_json` / `content_text` / `context_chars_json` are derived from them
+		 * (docs/BLOCK_STORAGE-DESIGN.md §4.2, §10.1).
+		 */
+		bodyFormat: integer("body_format").notNull().default(1),
+		/** The run (`narrator_turns.id`) that produced this envelope; a grouping key, no FK. */
+		turnId: text("turn_id"),
+		/** Immutable author; kept by COW. Null on older rows means `narrator_id`. */
+		authorNarratorId: text("author_narrator_id"),
+		/** The block this envelope responds to (an input, a notice, a tool result). */
+		causeBlockId: text("cause_block_id"),
+		/** The provider's response id; item ids live on each block's `provider_meta`. */
+		providerResponseId: text("provider_response_id"),
+		/** Sum of this envelope's blocks' `byte_size`, so reads batch without opening bodies. */
+		bodyBytes: integer("body_bytes").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -1678,12 +1694,21 @@ export const narratorMessages = sqliteTable(
 		// this (largest) table once per removed row.
 		index("idx_messages_created_by").on(table.createdBy),
 		index("idx_messages_edited_by").on(table.editedBy),
+		// A narrator's rename bumps the holders of what it authored (model_history_v2_narrator);
+		// without this the trigger's `OR author_narrator_id = ?` scans every ref.
+		index("idx_messages_author")
+			.on(table.authorNarratorId)
+			.where(sql`"author_narrator_id" IS NOT NULL`),
 		// Partial index: only the pending-compact rows are indexed, which in practice
 		// means a handful of rows (usually zero). This is what lets fork enumerate the
 		// unstable messages without touching message bodies.
 		index("idx_messages_compact_pending")
 			.on(table.compactPending)
 			.where(sql`"compact_pending" = 1`),
+		// Partial index: the legacy (not yet block-format) envelopes, which the backfill
+		// converts and body scans still match on content_json. Empty once the backfill is
+		// done, so finding them never walks message bodies (docs/BLOCK_STORAGE-DESIGN.md §10.3).
+		index("idx_messages_legacy_body").on(table.bodyFormat).where(sql`"body_format" = 1`),
 	],
 );
 
@@ -1861,10 +1886,20 @@ export const narratorToolCalls = sqliteTable(
 		model: text("model"), // claude-3-5-sonnet-20241022, gpt-4o, etc.
 		// Subagent result binding: points to the subagent's assistant message that produced the result
 		resultMessageId: text("result_message_id"),
+		/**
+		 * The tool block this attempt executes. Required on new non-internal rows; null on
+		 * rows written before block storage. COW remaps it to the cloned block.
+		 */
+		blockId: text("block_id").references((): AnySQLiteColumn => narratorBlocks.id, {
+			onDelete: "set null",
+		}),
+		/** An internal execution (`internal_read_`): never a block, never projected. */
+		isInternal: integer("is_internal", { mode: "boolean" }).notNull().default(false),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
+		index("idx_toolcalls_block").on(table.blockId),
 		// Numeric context keyset paging must not sort the entire message on every batch,
 		// and must not open input_json/output_json just to read the character columns.
 		index("idx_toolcalls_context_id").on(
@@ -1907,6 +1942,213 @@ export const narratorToolCalls = sqliteTable(
 		 * 3.8s for an unindexed `ORDER BY ... LIMIT 51` on the same data.
 		 */
 		index("idx_toolcalls_started_at").on(table.startedAt, table.id),
+	],
+);
+
+// === narrator_blocks (docs/BLOCK_STORAGE-DESIGN.md §4.1) ===
+/**
+ * The blocks of an envelope (`narrator_messages` row with `body_format = 2`): one block
+ * per non-assistant envelope, one per provider item in an assistant step.
+ *
+ * Column order matters: SQLite stores columns in record order and spills large values to
+ * overflow pages, so the small fixed columns come first and metadata-only reads (startup
+ * recovery, sharing checks, page skeletons) never walk the JSON bodies.
+ */
+export const narratorBlocks = sqliteTable(
+	"narrator_blocks",
+	{
+		id: text("id").primaryKey(),
+		messageId: text("message_id")
+			.notNull()
+			.references(() => narratorMessages.id, { onDelete: "cascade" }),
+		/** Assigned when the item opens; may have gaps (a discarded attempt), never renumbered. */
+		ordinal: integer("ordinal").notNull(),
+		kind: text("kind", { enum: ["input", "output", "reasoning", "tool", "context"] }).notNull(),
+		/** A context block's subtype; a tool block's tool name. */
+		subtype: text("subtype"),
+		phase: text("phase", { enum: ["open", "done", "aborted", "failed"] })
+			.notNull()
+			.default("done"),
+		/** Body version: bumped by a checkpoint, by leaving `open`, and by an edit. */
+		revision: integer("revision").notNull().default(0),
+		/** A tool block's call id on the wire. */
+		wireId: text("wire_id"),
+		/** The provider attempt that produced the block. */
+		attemptId: text("attempt_id"),
+		/** Root of the COW lineage. */
+		originBlockId: text("origin_block_id"),
+		/** Characters that count toward the context window. */
+		modelChars: integer("model_chars").notNull().default(0),
+		/** Bytes of model_text + payload + state + provider_meta. */
+		byteSize: integer("byte_size").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+		/** When the block left `open`. */
+		completedAt: text("completed_at"),
+		/** An input or context block's frozen model-visible text. */
+		modelText: text("model_text"),
+		payload: text("payload", { mode: "json" }).notNull(),
+		/** Mutable metadata the model never reads (translations, card status). */
+		state: text("state", { mode: "json" }),
+		/** `{ source, wire?, result? }`: the upstream item skeleton and its credentials. */
+		providerMeta: text("provider_meta", { mode: "json" }),
+		/** An output block's body before its first edit. */
+		originalPayload: text("original_payload", { mode: "json" }),
+	},
+	(table) => [
+		uniqueIndex("idx_blocks_message_ordinal").on(table.messageId, table.ordinal),
+		// A non-assistant envelope holds exactly one block.
+		uniqueIndex("idx_blocks_single")
+			.on(table.messageId)
+			.where(sql`${table.kind} in ('input', 'context')`),
+		// Whether an envelope may be shared, and the startup recovery scan.
+		index("idx_blocks_open").on(table.messageId).where(sql`${table.phase} = 'open'`),
+		index("idx_blocks_origin")
+			.on(table.originBlockId)
+			.where(sql`${table.originBlockId} is not null`),
+		index("idx_blocks_context_subtype").on(table.subtype).where(sql`${table.kind} = 'context'`),
+		index("idx_blocks_tool_wire").on(table.wireId).where(sql`${table.kind} = 'tool'`),
+		check(
+			"ck_blocks_kind",
+			sql`${table.kind} in ('input', 'output', 'reasoning', 'tool', 'context')`,
+		),
+		check("ck_blocks_phase", sql`${table.phase} in ('open', 'done', 'aborted', 'failed')`),
+		check(
+			"ck_blocks_subtype",
+			sql`(${table.subtype} is not null) = (${table.kind} in ('tool', 'context'))`,
+		),
+		check(
+			"ck_blocks_aborted",
+			sql`${table.phase} <> 'aborted' or ${table.kind} in ('output', 'reasoning')`,
+		),
+		check("ck_blocks_input_done", sql`${table.phase} = 'done' or ${table.kind} <> 'input'`),
+		check(
+			"ck_blocks_model_text",
+			sql`${table.modelText} is null or ${table.kind} in ('input', 'context')`,
+		),
+		check(
+			"ck_blocks_provider_meta",
+			sql`${table.providerMeta} is null or ${table.kind} in ('output', 'reasoning', 'tool')`,
+		),
+		check("ck_blocks_wire_id", sql`(${table.wireId} is not null) = (${table.kind} = 'tool')`),
+		check(
+			"ck_blocks_original_payload",
+			sql`${table.originalPayload} is null or ${table.kind} = 'output'`,
+		),
+	],
+);
+
+// === narrator_block_assets (§4.1) ===
+/** Every upload, image or text snapshot a block references; retention asks this table. */
+export const narratorBlockAssets = sqliteTable(
+	"narrator_block_assets",
+	{
+		blockId: text("block_id")
+			.notNull()
+			.references(() => narratorBlocks.id, { onDelete: "cascade" }),
+		/** An upload id, or the sha256 of a `narrator_text_snapshots` row. */
+		assetId: text("asset_id").notNull(),
+		role: text("role", {
+			enum: ["input_image", "input_file", "output_image", "tool_image", "epoch_snapshot"],
+		}).notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.blockId, table.assetId] }),
+		index("idx_block_assets_asset").on(table.assetId),
+		check(
+			"ck_block_assets_role",
+			sql`${table.role} in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')`,
+		),
+	],
+);
+
+// === narrator_block_sync_queue ===
+/**
+ * Block-format envelopes whose content or tool ledger changed and whose block rows still
+ * have to be brought in line (filled by the generated model-history v2 triggers). The
+ * store syncs what it writes in the same transaction; this queue is what makes any other
+ * writer's change — or a crash between — converge (narrator-block-sync.ts).
+ */
+export const narratorBlockSyncQueue = sqliteTable("narrator_block_sync_queue", {
+	messageId: text("message_id")
+		.primaryKey()
+		.references(() => narratorMessages.id, { onDelete: "cascade" }),
+});
+
+// === narrator_text_snapshots (§7.7) ===
+/** Content-addressed epoch snapshots: tool definitions and system prompt sections. */
+export const narratorTextSnapshots = sqliteTable("narrator_text_snapshots", {
+	sha256: text("sha256").primaryKey(),
+	text: text("text").notNull(),
+	byteSize: integer("byte_size").notNull(),
+	createdAt: text("created_at").notNull(),
+});
+
+// === narrator_turns (§4.4, D7) ===
+/** One row per run; its id is the `turn_id` of every envelope the run produced. */
+export const narratorTurns = sqliteTable(
+	"narrator_turns",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		status: text("status", {
+			enum: ["running", "completed", "interrupted", "failed"],
+		}).notNull(),
+		/** The envelope that started the run; null when nothing input-like did. */
+		triggerMessageId: text("trigger_message_id"),
+		startedAt: text("started_at").notNull(),
+		endedAt: text("ended_at"),
+		stopReason: text("stop_reason"),
+		stepCount: integer("step_count").notNull().default(0),
+		toolCallCount: integer("tool_call_count").notNull().default(0),
+		/** Token usage and cost, by model. */
+		usageJson: text("usage_json", { mode: "json" }),
+	},
+	(table) => [
+		index("idx_turns_narrator_started").on(table.narratorId, table.startedAt),
+		check(
+			"ck_turns_status",
+			sql`${table.status} in ('running', 'completed', 'interrupted', 'failed')`,
+		),
+	],
+);
+
+// === narrator_block_backfill (§10.3) ===
+/**
+ * Progress of the background block jobs, one row per job:
+ *   - `convert` turns legacy (`body_format = 1`) envelopes into block rows;
+ *   - `verify` checks block-format envelopes' rows against their stored content.
+ * `cursor` is the last `narrator_messages.rowid` the job handled; it resumes after it.
+ */
+export const narratorBlockBackfill = sqliteTable(
+	"narrator_block_backfill",
+	{
+		job: text("job", { enum: ["convert", "verify"] }).primaryKey(),
+		cursor: integer("cursor").notNull().default(0),
+		complete: integer("complete", { mode: "boolean" }).notNull().default(false),
+		paused: integer("paused", { mode: "boolean" }).notNull().default(false),
+		/** Envelopes the job has handled so far. */
+		processed: integer("processed").notNull().default(0),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [check("ck_block_backfill_job", sql`${table.job} in ('convert', 'verify')`)],
+);
+
+// === narrator_block_diagnostics (§10.3) ===
+/** Envelopes a block job could not reconcile: rows that differed, or content it could not read. */
+export const narratorBlockDiagnostics = sqliteTable(
+	"narrator_block_diagnostics",
+	{
+		messageId: text("message_id")
+			.primaryKey()
+			.references(() => narratorMessages.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["mismatch", "undecodable"] }).notNull(),
+		detail: text("detail"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		check("ck_block_diagnostics_kind", sql`${table.kind} in ('mismatch', 'undecodable')`),
 	],
 );
 

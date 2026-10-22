@@ -18,12 +18,36 @@ import {
 } from "../../../server/lib/model-catalog";
 import { _bindSettings, getDefaults, saveSettings, settings } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
+import { invalidateUserCache } from "../../../server/middleware/auth";
 import { modelCatalogRoutes } from "../../../server/routes/model-catalog";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 
 let local: NarraForkSettings;
 let persisted: string | undefined;
 const future = { flags: [0, false, null, []], units: "source-defined" };
+
+/**
+ * The v2 mutate route runs the real `requireAdmin`, which authorizes against the LIVE role
+ * read through the session store, never the token's `role` claim. The admin-only test seeds
+ * its principal with `c.get("user")` only, so this seam makes the store resolve the role by
+ * actor id (the two principals carry distinct subs below). Without it the lookup would hit
+ * the real (empty) database and 401 USER_GONE instead of 403/200.
+ */
+const CATALOG_ADMIN_ID = "catalog-admin";
+const CATALOG_USER_ID = "catalog-user";
 beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === CATALOG_ADMIN_ID ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+	invalidateUserCache(CATALOG_ADMIN_ID);
+	invalidateUserCache(CATALOG_USER_ID);
 	local = getDefaults();
 	local.agent.modelCatalog = {
 		schemaVersion: 2,
@@ -53,6 +77,9 @@ beforeEach(() => {
 	_bindSettings(local);
 });
 afterEach(() => {
+	setAuthStores(undefined);
+	invalidateUserCache(CATALOG_ADMIN_ID);
+	invalidateUserCache(CATALOG_USER_ID);
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 	_bindSettings(settings);
 });
@@ -258,7 +285,8 @@ test("v2 writes are admin-only, return v2 conflicts and enforce body limits", as
 	const app = (role: "admin" | "user") => {
 		const app = new Hono();
 		app.use("*", async (c, next) => {
-			c.set("user", { sub: "test", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+			const sub = role === "admin" ? CATALOG_ADMIN_ID : CATALOG_USER_ID;
+			c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 			await next();
 		});
 		app.route("/api/model-catalog", modelCatalogRoutes);

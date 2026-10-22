@@ -10,6 +10,7 @@ import { and, asc, eq, inArray, like, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "../db";
 import {
+	chapters,
 	fileAttributions,
 	fileChangeEffects,
 	fileChangeExecutionSegments,
@@ -17,6 +18,7 @@ import {
 	fileChangeScopes,
 	narrators,
 	narratorToolCalls,
+	projects,
 } from "../db/schema";
 import { logger } from "../lib/logger";
 import { normalizeWorkspacePath } from "./git-workspace";
@@ -143,16 +145,25 @@ interface ChildQuery {
 async function loadChildren(ids: string[], parentNarratorId?: string): Promise<ChildQuery[]> {
 	if (!ids.length) return [];
 	const parent = alias(narrators, "file_changes_parent");
+	const chapterProject = alias(projects, "file_changes_parent_chapter_project");
+	const contextProject = alias(projects, "file_changes_parent_context_project");
 	const rows = await db
 		.select({
 			id: narrators.id,
 			parentNarratorId: narrators.parentNarratorId,
 			parentId: parent.id,
 			parentCwd: parent.cwd,
+			parentChapterId: parent.chapterId,
+			parentWorktreePath: chapters.worktreePath,
+			parentChapterGitPath: chapterProject.gitPath,
+			parentContextGitPath: contextProject.gitPath,
 			parentDeviceId: parent.defaultDeviceId,
 		})
 		.from(narrators)
 		.leftJoin(parent, eq(parent.id, narrators.parentNarratorId))
+		.leftJoin(chapters, eq(chapters.id, parent.chapterId))
+		.leftJoin(chapterProject, eq(chapterProject.id, chapters.projectId))
+		.leftJoin(contextProject, eq(contextProject.id, parent.contextProjectId))
 		.where(
 			and(
 				inArray(narrators.id, ids),
@@ -170,7 +181,14 @@ async function loadChildren(ids: string[], parentNarratorId?: string): Promise<C
 		parentWorkspace: row.parentId
 			? normalizeParentWorkspace({
 					deviceId: row.parentDeviceId ?? "local",
-					workspacePath: row.parentCwd,
+					// Same precedence as resolveNarratorCwd: a chapter/project narrator
+					// usually has no cwd of its own and works in the chapter worktree.
+					workspacePath:
+						row.parentCwd ||
+						(row.parentChapterId
+							? row.parentWorktreePath || row.parentChapterGitPath
+							: row.parentContextGitPath) ||
+						null,
 				})
 			: null,
 	}));

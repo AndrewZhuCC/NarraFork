@@ -38,6 +38,8 @@ describe("Command Code 端点选择（规则与实测 supported_endpoints 一致
 
 	test("目录里的 supported_endpoints 优先于模型名，显式协议再优先于目录", () => {
 		expect(endpointFromSupported(["/messages"])).toBe("messages");
+		// 与 TokenDance 不同：/messages 不可用，同时支持时仍优先 /responses。
+		expect(endpointFromSupported(["/responses", "/messages"])).toBe("responses");
 		expect(selectCommandCodeEndpoint("foo-model", { supportedEndpoints: ["/messages"] })).toBe(
 			"messages",
 		);

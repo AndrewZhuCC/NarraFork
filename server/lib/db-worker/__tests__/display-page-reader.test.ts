@@ -59,6 +59,11 @@ function createFixture(sqlite: Database): void {
 				.join(", ")})`,
 		);
 	}
+	// Block bodies (empty here: fixture envelopes are legacy, read from content_json).
+	sqlite.run(
+		"CREATE TABLE narrator_blocks(id TEXT PRIMARY KEY, message_id TEXT, ordinal INTEGER, payload TEXT, state TEXT)",
+	);
+	sqlite.run("CREATE TABLE narrator_block_sync_queue(message_id TEXT PRIMARY KEY)");
 	sqlite.run("CREATE INDEX idx_tools_message ON narrator_tool_calls(message_id)");
 	sqlite.run(
 		"CREATE INDEX idx_tools_latest ON narrator_tool_calls(message_id, tool_use_id, execution_attempt, created_at, id)",

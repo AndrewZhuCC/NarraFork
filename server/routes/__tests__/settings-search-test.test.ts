@@ -3,6 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
+import { invalidateUserCache } from "../../middleware/auth";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "nf-search-route-"));
@@ -14,10 +17,21 @@ const { AppError } = await import("../../lib/errors");
 const snapshot = structuredClone(settings);
 const oldFetch = globalThis.fetch;
 
+/**
+ * The search-test route runs `assertAdmin`, which authorizes against the LIVE role read
+ * through the session store, never the token's `role` claim. The middleware below only sets
+ * `c.get("user")`, so this seam resolves each principal's role by actor id. The two roles
+ * carry distinct subs so one test can exercise both without the lookup (or its cache)
+ * colliding; without it a non-admin would 401 USER_GONE instead of the expected 403.
+ */
+const ADMIN_ACTOR_ID = "verified-admin";
+const NON_ADMIN_ACTOR_ID = "verified-user";
+
 function app(role: "admin" | "user" = "admin") {
 	const instance = new Hono();
 	instance.use("*", async (c, next) => {
-		c.set("user", { sub: "verified-admin", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		const sub = role === "admin" ? ADMIN_ACTOR_ID : NON_ADMIN_ACTOR_ID;
+		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	instance.onError((error) =>
@@ -51,6 +65,17 @@ const body = {
 };
 
 beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === ADMIN_ACTOR_ID ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+	invalidateUserCache(ADMIN_ACTOR_ID);
+	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	Object.assign(settings, structuredClone(snapshot));
 	settings.anthropicProviders = [
 		{
@@ -70,6 +95,9 @@ beforeEach(() => {
 	};
 });
 afterEach(() => {
+	setAuthStores(undefined);
+	invalidateUserCache(ADMIN_ACTOR_ID);
+	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	globalThis.fetch = oldFetch;
 	Object.assign(settings, structuredClone(snapshot));
 });

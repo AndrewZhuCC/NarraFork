@@ -109,6 +109,7 @@ async function render(
 		summaryModelValue?: string | null;
 		canFollowParent?: boolean;
 		inheritance?: SubagentModelInheritance | null;
+		extraProps?: Partial<Parameters<typeof ModelMenuItems>[0]>;
 	},
 ) {
 	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
@@ -136,6 +137,7 @@ async function render(
 									}}
 									defaultModelValue={options?.defaultModelValue}
 									summaryModelValue={options?.summaryModelValue}
+									{...options?.extraProps}
 									{...(withGlobalRoleActions
 										? {
 												onSetAsDefaultModel: (value: string) => setAsDefault.push(value),
@@ -264,20 +266,59 @@ describe("follow parent selection", () => {
 });
 
 describe("catalog details access", () => {
-	test("metadata details work without billing prices and resolve follow-default to the actual model", async () => {
+	test("details live in the three-dot menu and resolve follow-default to the actual model", async () => {
 		const details: ModelOption[] = [];
 		await render("a:one", models, true, true, {
 			defaultModelValue: "a:two:opaque",
 			onShowPrice: (model) => details.push(model),
 		});
-		const controls = [
-			...host.querySelectorAll<HTMLElement>('[aria-label="Model metadata and prices"]'),
-		];
-		expect(controls).toHaveLength(3);
-		await act(async () => {
-			for (const control of controls) control.click();
-		});
+		expect(host.querySelector('[aria-label="Model metadata and prices"]')).toBeNull();
+		// Follow-default and the two concrete models; aggregations have no details.
+		const toggleCount = host.querySelectorAll("[aria-label='Model actions']").length;
+		expect(toggleCount).toBe(3);
+		for (let index = 0; index < toggleCount; index++) {
+			const toggle = host.querySelectorAll("[aria-label='Model actions']")[index];
+			await act(async () => {
+				toggle?.dispatchEvent(new window.Event("click", { bubbles: true }));
+			});
+			const item = buttons().find((entry) => entry.textContent === settingsLocale.catalog.details);
+			if (!item) throw new Error("Missing details action");
+			await act(async () => item.dispatchEvent(new window.Event("click", { bubbles: true })));
+		}
 		expect(details.map((model) => model.value)).toEqual(["a:two:opaque", "a:one", "a:two"]);
+		expect(selected).toEqual([]);
+	});
+});
+
+describe("provider group header", () => {
+	test("shows bars, balance, refresh and settings for provider groups only", async () => {
+		let refreshes = 0;
+		const opened: string[] = [];
+		await render("a:one", models, true, true, {
+			extraProps: {
+				providerBalances: { a: { text: "$12.50", tooltip: "Wallet: 12.5 USD" } },
+				providerActions: {
+					a: {
+						onRefresh: () => {
+							refreshes++;
+						},
+					},
+				},
+				onOpenProviderSettings: (prefix) => opened.push(prefix),
+			},
+		});
+		expect(host.querySelector("[data-provider-balance='a']")?.textContent).toBe("$12.50");
+		const refresh = host.querySelectorAll(`[aria-label='${narratorLocale.refreshProviderModels}']`);
+		const settings = host.querySelectorAll(`[aria-label='${narratorLocale.openProviderSettings}']`);
+		// Default and aggregation groups are not providers.
+		expect(refresh).toHaveLength(1);
+		expect(settings).toHaveLength(1);
+		await act(async () => {
+			refresh[0]?.dispatchEvent(new window.Event("click", { bubbles: true }));
+			settings[0]?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		expect(refreshes).toBe(1);
+		expect(opened).toEqual(["a"]);
 		expect(selected).toEqual([]);
 	});
 });

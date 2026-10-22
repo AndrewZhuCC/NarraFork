@@ -1,5 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve, sep } from "node:path";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
@@ -47,7 +48,6 @@ import {
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
 	measureMessageCharacters,
-	measureSerializedCharacters,
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
@@ -130,17 +130,14 @@ import { getAvailableOptionalToolIds } from "./command-service";
 import { compileDelegationCeiling } from "./custom-subagent-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
+import { newEnvelopeColumns, syncEnvelopeNow } from "./narrator-block-sync";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
 // child row gets it rather than only the subagent entry point that remembered to call it.
-import {
-	appendMessageRef,
-	deleteRecipientMessageRefs,
-	narratorPersistence,
-} from "./narrator-persistence";
+import { deleteRecipientMessageRefs, narratorPersistence } from "./narrator-persistence";
 import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	claimNextRefSeq,
@@ -150,6 +147,7 @@ import {
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -187,6 +185,16 @@ const MAX_INHERITED_FULL_FORK_REFS = 500;
  * same thing an exact number would.
  */
 const TEAM_VIEW_OMITTED_COUNT_CAP = 500;
+/** Rows per keyset page of {@link narratorService.listTeamMembers}. */
+const TEAM_MEMBERS_PAGE_SIZE = 500;
+
+/** The selector handles of a team member — no prompt/summary columns. */
+export interface TeamMemberSelectorRow {
+	id: string;
+	title: string | null;
+	traits: string[];
+	createdAt: string;
+}
 export const TEAM_BROADCAST_MAX_TARGETS = 100;
 export const TEAM_BROADCAST_RECENT_IDLE_LIMIT = 100;
 
@@ -455,6 +463,27 @@ async function resolveLayeredTraitsFor(
 	return resolved.traits;
 }
 
+/** Persist a tool load/unload notice row and announce it to the transcript. */
+async function persistToolChange(
+	narratorId: string,
+	block: Parameters<typeof narratorStore.appendToolChange>[1],
+): Promise<void> {
+	const msg = await narratorStore.appendToolChange(narratorId, block);
+	broadcastToNarrator(narratorId, {
+		type: "user_message",
+		narratorId,
+		message: {
+			id: msg.id,
+			narratorId,
+			role: "user",
+			contentJson: msg.contentJson,
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			children: [],
+		},
+	});
+}
+
 /**
  * Shared handler for `/load <tool>` commands.
  */
@@ -511,7 +540,7 @@ export async function handleLoadToolCommand(
 	}
 
 	const { loadOptionalTool } = await import("./narrator-session");
-	const results = [];
+	const results: Awaited<ReturnType<typeof loadOptionalTool>>[] = [];
 	for (const toolName of toolNames) {
 		results.push(await loadOptionalTool(narratorId, toolName));
 	}
@@ -534,38 +563,14 @@ export async function handleLoadToolCommand(
 			toolName: displayToolName,
 			toolDescription,
 		});
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "user",
-				contentJson: [{ type: "tool_loaded", toolName: displayToolName, text }],
-				contextCharsJson: measureMessageCharacters(
-					"user",
-					[{ type: "tool_loaded", toolName: displayToolName, text }],
-					text,
-				),
-				contentText: text,
-				createdAt: now,
-			})
-			.returning();
-		await appendMessageRef(narratorId, id);
-		queueContextCharacterRefresh(narratorId, id);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: {
-				id: msg.id,
-				narratorId,
-				role: "user",
-				contentJson: msg.contentJson,
-				contentText: msg.contentText,
-				createdAt: msg.createdAt,
-				children: [],
-			},
+		// The registry names this row changed; tool loading reads them to keep the
+		// request's tool array fixed (see lib/agent/tool-loading.ts).
+		const changedToolNames = toolNames.filter((_, index) => results[index] === "loaded");
+		await persistToolChange(narratorId, {
+			type: "tool_loaded",
+			toolName: displayToolName,
+			toolNames: changedToolNames,
+			text,
 		});
 	}
 
@@ -594,7 +599,7 @@ export async function handleUnloadToolCommand(
 	const toolNames = cmdResult.unloadTools ?? [cmdResult.unloadTool];
 	const displayToolName = cmdResult.unloadToolId ?? cmdResult.unloadTool;
 	const { unloadOptionalTool } = await import("./narrator-session");
-	const results = [];
+	const results: Awaited<ReturnType<typeof unloadOptionalTool>>[] = [];
 	for (const toolName of toolNames) {
 		results.push(await unloadOptionalTool(narratorId, toolName));
 	}
@@ -610,38 +615,12 @@ export async function handleUnloadToolCommand(
 	// Persist a user-role message so the model is aware the tool is no longer available.
 	if (!notLoaded && !unknownTool) {
 		const text = getToolMessageWithParams("toolUnloaded", locale, { toolName: displayToolName });
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "user",
-				contentJson: [{ type: "tool_unloaded", toolName: displayToolName, text }],
-				contextCharsJson: measureMessageCharacters(
-					"user",
-					[{ type: "tool_unloaded", toolName: displayToolName, text }],
-					text,
-				),
-				contentText: text,
-				createdAt: now,
-			})
-			.returning();
-		await appendMessageRef(narratorId, id);
-		queueContextCharacterRefresh(narratorId, id);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: {
-				id: msg.id,
-				narratorId,
-				role: "user",
-				contentJson: msg.contentJson,
-				contentText: msg.contentText,
-				createdAt: msg.createdAt,
-				children: [],
-			},
+		const changedToolNames = toolNames.filter((_, index) => results[index] === "unloaded");
+		await persistToolChange(narratorId, {
+			type: "tool_unloaded",
+			toolName: displayToolName,
+			toolNames: changedToolNames,
+			text,
 		});
 	}
 
@@ -967,7 +946,7 @@ export async function handleBashCommand(
 	const streamStartedAtIso = new Date(streamStartedAt).toISOString();
 	const toolInput = { command, description: command };
 	const toolUseBlock = {
-		type: "tool_use",
+		type: "tool_use" as const,
 		id: toolUseId,
 		name: "Bash",
 		input: toolInput,
@@ -976,32 +955,14 @@ export async function handleBashCommand(
 	const now = new Date().toISOString();
 
 	// 2. Persist and broadcast a running assistant tool card before the process starts.
-	const [assistantMsg] = await db
-		.insert(narratorMessages)
-		.values({
-			id: assistantMsgId,
-			narratorId,
-			role: "assistant",
-			contentJson: [toolUseBlock],
-			contextCharsJson: measureMessageCharacters("assistant", [toolUseBlock]),
-			contentText: null,
-			createdAt: now,
-		})
-		.returning();
-	const assistantSeq = await appendMessageRef(narratorId, assistantMsgId);
-	await db.insert(narratorToolCalls).values({
-		id: toolCallId,
-		narratorId,
+	const assistantMsg = await narratorStore.callManualTool(narratorId, {
 		messageId: assistantMsgId,
-		toolUseId,
-		toolName: "Bash",
-		inputJson: toolInput,
-		inputChars: measureSerializedCharacters(toolInput),
-		status: "running",
+		toolCallId,
+		toolUseBlock,
 		streamStartedAt: streamStartedAtIso,
 		createdAt: now,
 	});
-	queueContextCharacterRefresh(narratorId, assistantMsgId);
+	const assistantSeq = assistantMsg.seq;
 
 	broadcastToNarrator(narratorId, {
 		type: "message",
@@ -1111,9 +1072,7 @@ export async function handleBashCommand(
 	const completedAt = Date.now();
 	const durationMs = completedAt - streamStartedAt;
 	const status = result.isError ? "fail" : "success";
-	const persistedOutput = result.metadata
-		? { _text: result.output, _metadata: result.metadata }
-		: result.output;
+	const persistedOutput = encodeToolOutput(result.output, { metadata: result.metadata });
 	const toolResultBlock = {
 		type: "tool_result",
 		tool_use_id: toolUseId,
@@ -1121,15 +1080,8 @@ export async function handleBashCommand(
 		is_error: result.isError ?? false,
 	};
 
-	await db
-		.update(narratorMessages)
-		.set({
-			contentJson: [toolUseBlock, toolResultBlock],
-			contextCharsJson: measureMessageCharacters("assistant", [toolUseBlock, toolResultBlock]),
-			durationMs,
-		})
-		.where(eq(narratorMessages.id, assistantMsgId));
-	await narratorService.updateToolCallResult(
+	// The card's display copy of the result and the ledger result are one transaction.
+	await narratorStore.settleTool(
 		toolUseId,
 		{
 			output: persistedOutput,
@@ -1138,6 +1090,19 @@ export async function handleBashCommand(
 			durationMs,
 			executionStartedAt: streamStartedAt,
 			completedAt,
+			onPersist: (tx) =>
+				tx
+					.update(narratorMessages)
+					.set({
+						contentJson: [toolUseBlock, toolResultBlock],
+						contextCharsJson: measureMessageCharacters("assistant", [
+							toolUseBlock,
+							toolResultBlock,
+						]),
+						durationMs,
+					})
+					.where(eq(narratorMessages.id, assistantMsgId))
+					.run(),
 		},
 		assistantMsgId,
 		toolCallId,
@@ -1988,14 +1953,54 @@ export const narratorService = {
 	},
 
 	/**
-	 * Unbounded on purpose for explicit Send/Await/ContextAsk selector resolution.
+	 * Every team member's selector handles, for explicit Send/Await/ContextAsk
+	 * selector resolution and the TeamStatus bash scope. The membership is unbounded
+	 * on purpose — dropping a member would resolve a selector wrongly — but each row
+	 * is not: only `id`/`title`/`traits` are read, which is all
+	 * `subagentMatchesSelector` and `agentLabelFromNarrator` look at. Callers re-read
+	 * the one matched target with `getById`. Reading full rows here pulled every
+	 * member's `systemPrompt`/`contextSummary` and blew the query result budget on
+	 * large teams.
+	 *
+	 * Pages are keyset-bounded on `(createdAt, id)` so no single query materializes
+	 * the whole team at once.
+	 *
 	 * Display uses listSubagentsForTeamView; broadcast uses listSubagentsForBroadcast.
 	 */
-	async listTeamMembers(rootId: string) {
-		return db.query.narrators.findMany({
-			where: teamMembersWhere(rootId),
-			orderBy: (n, { asc }) => [asc(n.createdAt)],
-		});
+	async listTeamMembers(rootId: string): Promise<TeamMemberSelectorRow[]> {
+		const members: TeamMemberSelectorRow[] = [];
+		let cursor: { createdAt: string; id: string } | null = null;
+		for (;;) {
+			const page: TeamMemberSelectorRow[] = await db
+				.select({
+					id: narrators.id,
+					title: narrators.title,
+					traits: narrators.traits,
+					createdAt: narrators.createdAt,
+				})
+				.from(narrators)
+				.where(
+					and(
+						teamMembersWhere(rootId),
+						cursor
+							? or(
+									sql`${narrators.createdAt} > ${cursor.createdAt}`,
+									and(
+										eq(narrators.createdAt, cursor.createdAt),
+										sql`${narrators.id} > ${cursor.id}`,
+									),
+								)
+							: undefined,
+					),
+				)
+				.orderBy(narrators.createdAt, narrators.id)
+				.limit(TEAM_MEMBERS_PAGE_SIZE)
+				.all();
+			members.push(...page);
+			if (page.length < TEAM_MEMBERS_PAGE_SIZE) return members;
+			const last = page[page.length - 1];
+			cursor = { createdAt: last.createdAt, id: last.id };
+		}
 	},
 
 	/**
@@ -3037,6 +3042,7 @@ export const narratorService = {
 									id: compactMsgId,
 									narratorId: id,
 									role: "system",
+									...newEnvelopeColumns(id),
 									contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
 									contextCharsJson: { segments: [] },
 									contentText: `[Compressed context from parent conversation]`,
@@ -3055,6 +3061,7 @@ export const narratorService = {
 									isCompact: 1,
 								})
 								.run();
+							syncEnvelopeNow(compactMsgId);
 						}
 
 						copyForkAccessAndRules(tx, parentNarratorId, id);
@@ -3264,8 +3271,6 @@ export const narratorService = {
 	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
-	removeCompactingMessage:
-		narratorMessageQueries.removeCompactingMessage.bind(narratorMessageQueries),
 	updateCompactSummary: narratorMessageQueries.updateCompactSummary.bind(narratorMessageQueries),
 	getPendingPermissions: narratorMessageQueries.getPendingPermissions.bind(narratorMessageQueries),
 
@@ -3291,7 +3296,6 @@ export const narratorService = {
 		narratorPersistence.patchReasoningTranslation.bind(narratorPersistence),
 	updateConversationId: narratorPersistence.updateConversationId.bind(narratorPersistence),
 	updateStats: narratorPersistence.updateStats.bind(narratorPersistence),
-	updateMessageCost: narratorPersistence.updateMessageCost.bind(narratorPersistence),
 	updateMessageHistoryTokenEstimate:
 		narratorPersistence.updateMessageHistoryTokenEstimate.bind(narratorPersistence),
 	updateTitle: narratorPersistence.updateTitle.bind(narratorPersistence),
@@ -3321,7 +3325,6 @@ export const narratorService = {
 	copyOnWriteMessage: narratorPersistence.copyOnWriteMessage.bind(narratorPersistence),
 	copyOnWriteToolCallMessage:
 		narratorPersistence.copyOnWriteToolCallMessage.bind(narratorPersistence),
-	overwriteToolCallInput: narratorPersistence.overwriteToolCallInput.bind(narratorPersistence),
 	getToolCallPlanText: narratorPersistence.getToolCallPlanText.bind(narratorPersistence),
 	persistSegmentCompactMarker:
 		narratorPersistence.persistSegmentCompactMarker.bind(narratorPersistence),

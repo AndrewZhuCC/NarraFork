@@ -4,7 +4,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
-import { renderModelHistoryRevisionSql } from "../services/agent-runtime/model-history-revision-sql";
+import {
+	renderModelHistoryRevisionSql,
+	renderModelHistoryRevisionSqlV1,
+} from "../services/agent-runtime/model-history-revision-sql";
 import {
 	applyPendingMigrationsByHash,
 	repairMissingSpecTables,
@@ -655,6 +658,47 @@ describe("hash-based migration self-heal", () => {
 	// pure additive migration — and of a destructive rebuild migration (0028 benchmark_runs).
 	const TOOL_CONTINUATIONS_WHEN = 1784524348158; // 0090_public_nextwave
 	const BENCHMARK_RUNS_WHEN = 1777102252438; // 0028_pale_silhouette (DROP+RENAME rebuild)
+
+	function crlfMigrationsFolder(): string {
+		const folder = mkdtempSync(join(tmpdir(), "nf-crlf-migrations-"));
+		mkdirSync(join(folder, "meta"));
+		const journal = readFileSync(join(import.meta.dir, "../../drizzle/meta/_journal.json"), "utf8");
+		writeFileSync(join(folder, "meta", "_journal.json"), journal);
+		for (const { tag } of JSON.parse(journal).entries as Array<{ tag: string }>) {
+			const sql = readFileSync(join(import.meta.dir, `../../drizzle/${tag}.sql`), "utf8");
+			writeFileSync(join(folder, `${tag}.sql`), sql.replace(/\r?\n/g, "\r\n"));
+		}
+		return folder;
+	}
+
+	test("recognizes a ledger written from CRLF migration files (Windows checkout)", async () => {
+		// The reported incident: a database migrated from a CRLF checkout recorded every hash over
+		// CRLF text. An LF build then saw nothing as applied, replayed the whole journal and failed
+		// on the model-history contract row it had already inserted.
+		const folder = crlfMigrationsFolder();
+		try {
+			sqlite = new Database(":memory:");
+			applyPendingMigrationsByHash(sqlite, folder);
+			const before = hashCount(sqlite);
+			expect(before).toBe(readMigrationFiles({ migrationsFolder: folder }).length);
+
+			await runMigrations(sqlite);
+			expect(hashCount(sqlite)).toBe(before);
+
+			// And the reverse: an LF ledger read by a CRLF build.
+			const lf = new Database(":memory:");
+			try {
+				await runMigrations(lf);
+				const lfCount = hashCount(lf);
+				applyPendingMigrationsByHash(lf, folder);
+				expect(hashCount(lf)).toBe(lfCount);
+			} finally {
+				lf.close();
+			}
+		} finally {
+			rmSync(folder, { recursive: true, force: true });
+		}
+	});
 
 	test("recreates a missing table after the watermark was polluted (the real incident)", async () => {
 		sqlite = new Database(":memory:");
@@ -1375,7 +1419,26 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 				.all() as Array<{ name: string; sql: string }>
 		).map(({ name, sql }) => ({ name, sql: sql.trim().replace(/;$/, "").trimEnd() }));
 	}
-	const canonicalTriggers = renderModelHistoryRevisionSql("sqlite")
+	/** Every model-history trigger, any contract version (a fully migrated database is v2). */
+	function installedTriggerSql(database: Database): Array<{ name: string; sql: string }> {
+		return (
+			database
+				.prepare(
+					"SELECT name, sql FROM sqlite_schema WHERE type='trigger' AND name GLOB 'model_history_v*' ORDER BY name LIMIT 32",
+				)
+				.all() as Array<{ name: string; sql: string }>
+		).map(({ name, sql }) => ({ name, sql: sql.trim().replace(/;$/, "").trimEnd() }));
+	}
+	const currentCanonicalTriggers = renderModelHistoryRevisionSql("sqlite")
+		.split("--> statement-breakpoint")
+		.filter((statement) => statement.trim().startsWith("CREATE TRIGGER"))
+		.map((statement) => {
+			const match = /^CREATE TRIGGER (\w+)/.exec(statement.trim());
+			if (!match) throw new Error("Invalid canonical SQLite trigger in migration fixture");
+			return { name: match[1], sql: statement.trim().replace(/;$/, "").trimEnd() };
+		})
+		.sort((a, b) => a.name.localeCompare(b.name));
+	const canonicalTriggers = renderModelHistoryRevisionSqlV1("sqlite")
 		.split("--> statement-breakpoint")
 		.filter((statement) => statement.trim().startsWith("CREATE TRIGGER"))
 		.map((statement) => {
@@ -1493,7 +1556,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 				(table) => [table, foreignKeys(table)],
 			),
 		);
-		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		expect(installedTriggerSql(sqlite)).toEqual(currentCanonicalTriggers);
 		// Worst case for a source-built machine: not a single recorded hash matches the
 		// released files, so every migration is replayed against its own end state.
 		sqlite.run("DELETE FROM __drizzle_migrations");
@@ -1508,7 +1571,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			realHashes,
 		);
 		expect(stableHistory()).toEqual(historyBefore);
-		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		expect(installedTriggerSql(sqlite)).toEqual(currentCanonicalTriggers);
 		for (const [table, constraints] of foreignKeysBefore) {
 			expect(foreignKeys(table)).toEqual(expect.arrayContaining(constraints));
 		}

@@ -191,7 +191,7 @@ let reflectionScenario: "confirm" | "text" | "throw" | "cancel" | "confirmError"
 const providerModule = { ...(await import("../../lib/agent/provider")) };
 const fakeProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -210,9 +210,6 @@ const fakeProvider: ProviderAdapter = {
 			],
 		};
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -817,6 +814,10 @@ describe("attempt-bound permission requests", () => {
 				const path = symlink ? join(fixture.directory, "alias.json") : configuration;
 				if (symlink) symlinkSync(configuration, path);
 				if (kind === "Edit") {
+					// Edit would normally need a prior Read of the file. The secret-path
+					// guard now refuses even that Read of the host settings file, so the
+					// bypass is cut off a step earlier; the Edit below is still blocked by
+					// the host-settings write boundary.
 					const read = await call(fixture.actor.narratorId);
 					const input = { file_path: path, offset: 1, limit: 2 };
 					await db
@@ -831,7 +832,7 @@ describe("attempt-bound permission requests", () => {
 								{ toolCallBinding: read.binding },
 							)
 						).isError,
-					).not.toBe(true);
+					).toBe(true);
 				}
 				fixture.tu.input =
 					kind === "Write"
@@ -861,13 +862,17 @@ describe("attempt-bound permission requests", () => {
 				expect(readFileSync(configuration, "utf8")).toBe(original);
 			});
 
-	test("host settings Read and trusted saveSettings remain available; repository settings Write is unrelated", async () => {
+	test("agent Read of host settings is now refused; trusted saveSettings and repository settings Write are unrelated", async () => {
 		settings.agent.permissionRuleAutoApprove = true;
+		// Trusted, non-agent saveSettings still writes the host settings file.
 		saveSettings(structuredClone(settings));
 		expect(
 			JSON.parse(readFileSync(join(narraforkDir, "settings.json"), "utf8")).agent
 				.permissionRuleAutoApprove,
 		).toBe(true);
+		// An agent file tool, however, may no longer read the host settings file:
+		// it holds auth.jwtSecret and provider keys, so a hijacked agent could
+		// otherwise exfiltrate them. The secret-path guard refuses it in every mode.
 		const reader = await finalExecutionFixture("Read", false, undefined, {
 			file_path: join(narraforkDir, "settings.json"),
 			offset: 1,
@@ -875,7 +880,7 @@ describe("attempt-bound permission requests", () => {
 		});
 		expect(
 			(await executeTool(reader.tu, reader.config, { toolCallBinding: reader.binding })).isError,
-		).not.toBe(true);
+		).toBe(true);
 		const writer = await finalExecutionFixture("Write", false);
 		writer.tu.input.file_path = join(writer.directory, "settings.json");
 		await db
@@ -897,6 +902,16 @@ describe("attempt-bound permission requests", () => {
 			await next();
 		});
 		app.route("/settings", settingsRoutes);
+		// assertAdmin now authorizes against the live DB role, so the acting
+		// administrator must exist as an admin row (the token claim alone no
+		// longer grants admin).
+		await db.insert(schema.users).values({
+			id: "trusted-human",
+			username: "trusted-human",
+			passwordHash: "not-a-real-password",
+			role: "admin",
+			createdAt: now(),
+		});
 		settings.agent.permissionRuleAutoApprove = false;
 		const response = await app.request("/settings", {
 			method: "PATCH",

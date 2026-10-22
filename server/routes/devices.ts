@@ -389,7 +389,7 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 
 // Browse a remote path (file/dir metadata; recursive lists a directory tree).
 deviceRoutes.get("/:id/fs", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new NotFoundError("Device", c.req.param("id"));
 	const parsed = deviceStatQuerySchema.safeParse({
@@ -431,7 +431,7 @@ deviceRoutes.get("/:id/browse", async (c) => {
 
 // Background transfer tasks return immediately and can be paused/resumed.
 deviceRoutes.post("/:id/transfer-tasks", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	const parsed = deviceTransferSchema.safeParse(await c.req.json());
@@ -445,28 +445,28 @@ deviceRoutes.post("/:id/transfer-tasks", async (c) => {
 });
 
 deviceRoutes.get("/:id/transfer-tasks", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	return c.json(await listDeviceTransferTasks(device.id));
 });
 
 deviceRoutes.get("/:id/transfer-tasks/:taskId", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await getDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) throw new ValidationError("Transfer task not found");
 	return c.json(task);
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/pause", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await pauseDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) throw new ValidationError("Transfer task not found");
 	return c.json(task);
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/cancel", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await cancelDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) {
 		throw new ValidationError("Transfer task cannot be cancelled");
@@ -475,7 +475,7 @@ deviceRoutes.post("/:id/transfer-tasks/:taskId/cancel", async (c) => {
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/resume", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await resumeDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) {
 		throw new ValidationError("Transfer task is not resumable");
@@ -485,7 +485,7 @@ deviceRoutes.post("/:id/transfer-tasks/:taskId/resume", async (c) => {
 
 // Synchronous compatibility endpoint. Progress is broadcast via transfer:* events.
 deviceRoutes.post("/:id/transfers", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	const parsed = deviceTransferSchema.safeParse(await c.req.json());

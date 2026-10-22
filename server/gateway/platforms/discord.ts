@@ -208,11 +208,9 @@ export class DiscordAdapter extends BaseAdapter {
 		const userId = msg.author.id;
 		const username = msg.author.username ?? "unknown";
 
-		// Check allowlist
-		if (this.config.allowedUsers?.length) {
-			if (!this.config.allowedUsers.includes(userId)) {
-				return;
-			}
+		// Check allowlist — fail closed: an empty/unset allowlist denies all users.
+		if (!this.config.allowedUsers?.length || !this.config.allowedUsers.includes(userId)) {
+			return;
 		}
 
 		// In guild channels, require @mention

@@ -11,7 +11,7 @@ import {
 	appendGeneratedModelHistoryTriggers,
 	generatedModelHistoryTriggerSuffix,
 	MODEL_HISTORY_REVISION_CONTRACT,
-	renderModelHistoryRevisionSql,
+	modelHistoryRendererFingerprint,
 } from "./lib/generated-model-history-triggers";
 import { acquireSqliteGenerationLock } from "./lib/sqlite-generation-lock";
 
@@ -130,7 +130,7 @@ async function generateLocked(
 	const schemaDigest = digest(readBounded(schemaPath, 1024 * 1024));
 	const modelHistoryTriggers = {
 		contract: MODEL_HISTORY_REVISION_CONTRACT,
-		sqlDigest: digest(renderModelHistoryRevisionSql("sqlite")),
+		sqlDigest: digest(modelHistoryRendererFingerprint("sqlite")),
 	};
 	let pending: Pending;
 	if (existsSync(pendingPath)) {

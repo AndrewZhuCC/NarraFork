@@ -502,6 +502,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// History/display ports also have PG implementations. Register the SQLite branches
 	// and Database types without claiming these main-database modules are SQLite-only.
 	"server/services/agent-runtime/model-history-revision.ts": ["driver", "sqliteCatalog"],
+	// The trigger renderer emits both dialects; these are its SQLite branch (tool-block phase
+	// and sync-queue triggers). The PG branch spells them `::jsonb` and `ON CONFLICT`.
+	"server/services/agent-runtime/model-history-revision-sql.ts": ["json1", "insertOr"],
 	"server/services/agent-runtime/model-history-source.ts": ["driver"],
 	"server/services/agent-runtime/model-history-query.ts": ["driver"],
 	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
@@ -545,6 +548,29 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
+	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
+	"server/services/narrator-block-sync.ts": ["handle", "sqliteCatalog", "insertOr", "rowid"],
+	"server/services/narrator-epochs.ts": ["handle", "json1"],
+	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
+	"server/services/narrator-block-backfill.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+		"insertOr",
+		"indexHint",
+	],
+	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid"],
+	// Scans that find envelopes through block rows (SQLite-only, like block storage).
+	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
+	// The central body reader: selects block-format bodies and assembles them from rows.
+	"server/lib/narrator-bodies.ts": ["driver"],
+	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
+	// storage): exports, the session interchange, and the body length they measure in SQL.
+	"server/lib/narrator-body-length.ts": ["json1"],
+	"server/services/narrator-export.ts": ["handle"],
+	"server/services/session-interchange/export.ts": ["handle"],
+	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
@@ -560,7 +586,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/archive-file.ts": ["driver", "pragma"],
 	"server/services/project-archive/archive-writer.ts": ["driver", "pragma", "insertOr"],
 	"server/services/project-archive/export-rows.ts": ["driver"],
-	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
+	"server/services/project-archive/sqlite-main-store.ts": ["handle", "insertOr"],
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
@@ -612,7 +638,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
-	"server/services/workspace-modification-view.ts": ["rowid"],
+	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
 	// SQLite-only exemptions. Mixed archive workers also support PG main stores; only
 	// their portable archive file uses SQLite. Fixture detach uses a private memory DB,

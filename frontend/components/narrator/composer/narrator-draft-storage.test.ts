@@ -382,7 +382,7 @@ describe("acknowledged draft revision metadata", () => {
 		).toBe(false);
 	});
 
-	test("unsynced clears survive when another writer advanced the revision", () => {
+	test("a stale unsynced clear yields to a newer server draft", () => {
 		const local = { text: "", serverRevision: 4, serverUpdatedAt: "t4", unsynced: true as const };
 		expect(
 			resolveHydratedNarratorDraft({
@@ -392,7 +392,7 @@ describe("acknowledged draft revision metadata", () => {
 				currentInput: "",
 				localChangedSinceRequest: false,
 			}),
-		).toEqual({ text: "" });
+		).toEqual({ text: "new elsewhere" });
 	});
 });
 
@@ -437,7 +437,7 @@ describe("narrator draft hydration resolution", () => {
 		).toEqual({ text: "typed during request" });
 	});
 
-	test("keeps a version-1 local draft that has no trustworthy base", () => {
+	test("sets a version-1 local draft aside against a nonempty server", () => {
 		// A v1 envelope can still be present under the CURRENT storage id: the
 		// envelope version and the key shape moved independently, so the reader must
 		// keep honouring version 1 rather than assuming the id implies version 2.
@@ -461,7 +461,33 @@ describe("narrator draft hydration resolution", () => {
 				currentInput: local.text,
 				localChangedSinceRequest: false,
 			}),
+		).toEqual({ text: "server", staleLocal: { text: "legacy local" } });
+		expect(
+			resolveHydratedNarratorDraft({
+				local,
+				serverText: "",
+				serverRevision: 4,
+				currentInput: local.text,
+				localChangedSinceRequest: false,
+			}),
 		).toEqual({ text: "legacy local" });
+	});
+
+	test("offers unsynced edits back when the server moved past their base", () => {
+		expect(
+			resolveHydratedNarratorDraft({
+				local: {
+					text: "typed on the old tab",
+					serverRevision: 1,
+					serverUpdatedAt: "updated-1",
+					unsynced: true,
+				},
+				serverText: "newer elsewhere",
+				serverRevision: 2,
+				currentInput: "typed on the old tab",
+				localChangedSinceRequest: false,
+			}),
+		).toEqual({ text: "newer elsewhere", staleLocal: { text: "typed on the old tab" } });
 	});
 });
 

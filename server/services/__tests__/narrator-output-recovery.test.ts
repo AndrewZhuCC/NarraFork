@@ -334,7 +334,7 @@ describe("cold recovery output boundary", () => {
 		// fixture. Restart, COW, attempt guards, final authorization and approvals stay real.
 		mock.module("../../lib/agent", () => ({
 			...realAgent,
-			buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+			buildHistory: async () => ({ history: [] }),
 		}));
 		process.env.NARRAFORK_HOME = directory;
 		resetRestartRecoveryForTests();
