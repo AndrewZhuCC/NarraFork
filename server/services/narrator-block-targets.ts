@@ -146,6 +146,11 @@ function rowLayout(messageId: string): LayoutBlock[] {
 	});
 }
 
+/** Rebuild a queued envelope's rows from what it stores now (synchronous, in a transaction). */
+function syncQueued(messageId: string): void {
+	syncEnvelopeNow(messageId);
+}
+
 function isQueued(messageId: string): boolean {
 	return !!database.sqlite
 		.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
@@ -160,7 +165,7 @@ function isQueued(messageId: string): boolean {
  */
 function layoutOf(envelope: EnvelopeRow): { rows: LayoutBlock[]; decoded: LayoutBlock[] } {
 	if (envelope.bodyFormat !== 2) return { rows: [], decoded: splitLayout(envelope) };
-	if (isQueued(envelope.id)) database.sqlite.transaction(() => syncEnvelopeNow(envelope.id))();
+	if (isQueued(envelope.id)) database.sqlite.transaction(() => syncQueued(envelope.id))();
 	const rows = rowLayout(envelope.id);
 	// A sync rebuilds rows from `content_json`; the content itself is unchanged.
 	const decoded = splitLayout(envelope);
