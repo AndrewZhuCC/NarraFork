@@ -56,7 +56,7 @@ export function createApp(
 
 	// Public endpoints
 	app.route("/api/v3/products", createMirrorRoutes(storage, ingest));
-	app.route("/api/v2/products", createCheckRoutes(storage));
+	app.route("/api/v2/products", createCheckRoutes(storage, ingest));
 	app.route("/api/v2/products", createDownloadRoutes(storage));
 
 	// Tools endpoints — public download plus authenticated publish for helper
