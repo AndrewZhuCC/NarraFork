@@ -11,6 +11,7 @@ import * as pwa from "../lib/pwa";
 import { type UpdateSourceSettings, updateSettingsKey } from "../lib/update-source";
 import type { PreparedUpdateStatus } from "../lib/update-state";
 import common from "../locales/en/common.json";
+import commonZh from "../locales/zh-CN/common.json";
 
 mock.module("./common/confirm-dialog-context", () => ({
 	useConfirmDialog: () => async () => true,
@@ -22,6 +23,7 @@ const { UpdateModal } = await import("./UpdateModal");
 const { UpdateBadge } = await import("./UpdateBadge");
 const originalCheck = api.checkUpdate;
 const originalGetSettings = api.getSettings;
+const originalUpdateSettings = api.updateSettings;
 const originalStatus = api.getUpdateStatus;
 const originalApply = api.applyUpdate;
 const originalCancel = api.cancelUpdate;
@@ -46,9 +48,11 @@ const originalIdentity = {
 	},
 };
 const translation = i18next.createInstance();
-await translation
-	.use(initReactI18next)
-	.init({ lng: "en", resources: { en: { common } }, interpolation: { escapeValue: false } });
+await translation.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { common }, "zh-CN": { common: commonZh } },
+	interpolation: { escapeValue: false },
+});
 
 function install(key: string, value: unknown) {
 	globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -129,6 +133,8 @@ afterEach(async () => {
 	api.getUpdateNotes = originalNotes;
 	api.checkUpdate = originalCheck;
 	api.getSettings = originalGetSettings;
+	api.updateSettings = originalUpdateSettings;
+	await translation.changeLanguage("en");
 	for (const [key, descriptor] of globals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -1130,5 +1136,63 @@ describe("UpdateModal saved source changes", () => {
 		await act(async () => schedule?.click());
 		await settle();
 		expect(appliedVersion).toBe("1.1.0");
+	});
+});
+
+describe("UpdateBadge first-check mirror dialog", () => {
+	async function renderFailedChineseCheck() {
+		await translation.changeLanguage("zh-CN");
+		client.setQueryData(["auth", "me"], { id: "admin", role: "admin" });
+		const settings = {
+			update: { source: "github" as const, githubRepository: "NarraFork/NarraFork" },
+		};
+		client.setQueryData(["settings"], settings);
+		api.getSettings = async () => settings;
+		api.checkUpdate = async () => ({
+			updateAvailable: false,
+			currentVersion: "1.0.0",
+			source: "github",
+			errorCode: "TIMEOUT",
+		});
+		await renderBadge();
+		await settle();
+	}
+
+	test("shows a Chinese prompt even without an available-update badge; cancel never saves", async () => {
+		let writes = 0;
+		api.updateSettings = async () => {
+			writes++;
+			return {};
+		};
+		await renderFailedChineseCheck();
+		expect(document.querySelector(".mantine-Badge-root")).toBeNull();
+		expect(document.body.textContent).toContain(commonZh.updateMirrorPromptTitle);
+		expect(document.body.textContent).toContain(commonZh.updateMirrorPromptDescription);
+		expect(findButton(commonZh.updateMirrorSwitch)).toBeDefined();
+		await act(async () => findButton(commonZh.updateMirrorKeepGithub)?.click());
+		await settle();
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
+		expect(writes).toBe(0);
+	});
+
+	test("save failure remains visible and the confirmation button can retry", async () => {
+		let writes = 0;
+		api.updateSettings = async () => {
+			writes++;
+			throw new Error("offline");
+		};
+		await renderFailedChineseCheck();
+		await act(async () => findButton(commonZh.updateMirrorSwitch)?.click());
+		await settle();
+		expect(document.body.textContent).toContain(commonZh.updateMirrorSwitchFailed);
+		expect(findButton(commonZh.updateMirrorSwitch)?.disabled).toBe(false);
+		api.updateSettings = async () => {
+			writes++;
+			return { update: { source: "update-server" } };
+		};
+		await act(async () => findButton(commonZh.updateMirrorSwitch)?.click());
+		await settle();
+		expect(writes).toBe(2);
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
 	});
 });

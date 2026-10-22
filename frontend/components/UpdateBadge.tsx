@@ -1,4 +1,4 @@
-import { Badge, Loader, Tooltip } from "@mantine/core";
+import { Alert, Badge, Button, Group, Loader, Modal, Stack, Text, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { preparedMatchesRelease } from "@shared/update-identity";
 import { IconClock, IconRocket } from "@tabler/icons-react";
@@ -8,6 +8,7 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
 import { useUpdateCheck } from "../hooks/useUpdateCheck";
 import { UPDATE_STATUS_QUERY_KEY, useUpdateScheduleStatus } from "../hooks/useUpdateSchedule";
+import { OFFICIAL_UPDATE_SERVER_URL, useUpdateSourcePrompt } from "../hooks/useUpdateSourcePrompt";
 import {
 	hasActiveUpdateSchedule,
 	type PreparedUpdateStatus,
@@ -36,11 +37,13 @@ const UpdateModal = lazy(() =>
  * non-admin never issues either request and simply sees no badge.
  */
 export function UpdateBadge() {
-	const { t } = useTranslation("common");
+	const { t, i18n } = useTranslation("common");
 	const [opened, { open, close }] = useDisclosure(false);
 	const queryClient = useQueryClient();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
+	const check = useUpdateCheck();
+	const sourcePrompt = useUpdateSourcePrompt(check, i18n.resolvedLanguage ?? i18n.language);
 	const {
 		updateAvailable,
 		latestVersion,
@@ -53,7 +56,7 @@ export function UpdateBadge() {
 		totalSize,
 		strategy,
 		settingsKey,
-	} = useUpdateCheck();
+	} = check;
 	const [modalData, setModalData] = useState<UpdateModalData>({});
 	// Source changes clear the recommendation query, but not a prepared/scheduled binary.
 	const previousTarget = useRef<string | undefined>(undefined);
@@ -88,67 +91,96 @@ export function UpdateBadge() {
 	const recommendationMatchesTarget =
 		checkedTarget === targetVersion &&
 		(!(prepared || pill) || preparedMatchesRelease(scheduleStatus?.preparedIdentity, releaseInfo));
-	if (!updateAvailable && !pill && !prepared) return null;
+	const showBadge = updateAvailable || !!pill || prepared;
 
 	return (
 		<>
-			<Tooltip
-				label={
-					pill
-						? t(pill.tooltipKey, {
-								version: scheduleStatus?.targetVersion ?? targetVersion,
-							})
-						: t("updateViewDetails")
-				}
-				position="bottom"
-				withArrow
+			<Modal
+				opened={sourcePrompt.opened}
+				onClose={sourcePrompt.dismiss}
+				title={t("updateMirrorPromptTitle")}
+				closeOnClickOutside={!sourcePrompt.saving}
+				closeOnEscape={!sourcePrompt.saving}
+				withCloseButton={!sourcePrompt.saving}
+				centered
 			>
-				<Badge
-					size="sm"
-					variant="light"
-					color={pill ? "orange" : "indigo"}
-					leftSection={
-						pill ? (
-							pill.busy ? (
-								<Loader size={10} color="orange" />
-							) : (
-								<IconClock size={12} />
-							)
-						) : (
-							<IconRocket size={12} />
-						)
-					}
-					style={{ cursor: "pointer" }}
-					onClick={() => {
-						setModalData({
-							latestVersion: targetVersion,
-							currentVersion,
-							preparedStatus: prepared || pill ? scheduleStatus : undefined,
-							...(recommendationMatchesTarget && {
-								releaseInfo,
-								releaseNotes,
-								releaseNotesPerVersion,
-								releaseDate,
-								downloadSize,
-								totalSize,
-								strategy,
-								settingsKey,
-							}),
-						});
-						open();
-					}}
-				>
-					{pill
-						? t(pill.labelKey)
-						: (!updateAvailable || !recommendationMatchesTarget) && prepared
-							? t("updateReadyBadge", { version: targetVersion })
-							: t("updateBadge", { from: currentVersion, to: latestVersion })}
-				</Badge>
-			</Tooltip>
+				<Stack>
+					<Text size="sm">{t("updateMirrorPromptDescription")}</Text>
+					<Text size="xs" c="dimmed">
+						{OFFICIAL_UPDATE_SERVER_URL}
+					</Text>
+					{sourcePrompt.error && <Alert color="red">{t(sourcePrompt.error)}</Alert>}
+					<Group justify="flex-end">
+						<Button variant="default" onClick={sourcePrompt.dismiss} disabled={sourcePrompt.saving}>
+							{t("updateMirrorKeepGithub")}
+						</Button>
+						<Button onClick={() => void sourcePrompt.confirm()} loading={sourcePrompt.saving}>
+							{t("updateMirrorSwitch")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+			{showBadge && (
+				<>
+					<Tooltip
+						label={
+							pill
+								? t(pill.tooltipKey, {
+										version: scheduleStatus?.targetVersion ?? targetVersion,
+									})
+								: t("updateViewDetails")
+						}
+						position="bottom"
+						withArrow
+					>
+						<Badge
+							size="sm"
+							variant="light"
+							color={pill ? "orange" : "indigo"}
+							leftSection={
+								pill ? (
+									pill.busy ? (
+										<Loader size={10} color="orange" />
+									) : (
+										<IconClock size={12} />
+									)
+								) : (
+									<IconRocket size={12} />
+								)
+							}
+							style={{ cursor: "pointer" }}
+							onClick={() => {
+								setModalData({
+									latestVersion: targetVersion,
+									currentVersion,
+									preparedStatus: prepared || pill ? scheduleStatus : undefined,
+									...(recommendationMatchesTarget && {
+										releaseInfo,
+										releaseNotes,
+										releaseNotesPerVersion,
+										releaseDate,
+										downloadSize,
+										totalSize,
+										strategy,
+										settingsKey,
+									}),
+								});
+								open();
+							}}
+						>
+							{pill
+								? t(pill.labelKey)
+								: (!updateAvailable || !recommendationMatchesTarget) && prepared
+									? t("updateReadyBadge", { version: targetVersion })
+									: t("updateBadge", { from: currentVersion, to: latestVersion })}
+						</Badge>
+					</Tooltip>
 
-			<Suspense fallback={null}>
-				<UpdateModal opened={opened} onClose={close} data={modalData} />
-			</Suspense>
+					<Suspense fallback={null}>
+						<UpdateModal opened={opened} onClose={close} data={modalData} />
+					</Suspense>
+				</>
+			)}
 		</>
 	);
 }
