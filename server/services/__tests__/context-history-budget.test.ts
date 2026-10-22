@@ -14,6 +14,7 @@ function prepared(): runtimeHistory.PreparedRuntimeHistory {
 		currentInputText: "",
 		currentInputPersisted: false,
 		endsWithToolResults: false,
+		endsWithInput: false,
 	};
 }
 function hooks(signal: AbortSignal) {

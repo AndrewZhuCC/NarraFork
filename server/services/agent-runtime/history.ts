@@ -71,20 +71,27 @@ export interface PreparedRuntimeHistory extends BuiltHistory {
 	currentInputPersisted: boolean;
 	/** Whether the history ends with tool results the model has not answered yet. */
 	endsWithToolResults: boolean;
+	/** Whether the history ends with input of any kind (a user or sys row, or tool results). */
+	endsWithInput: boolean;
 	/** Loading state of this history; the loop derives the tool array from it. */
 	toolLoading?: ToolLoadingState;
 }
 
-function endsWithToolResults(messages: readonly RuntimeHistoryMessage[]): boolean {
+/** The last top-level row the model reads, and whether it is an answered tool step. */
+function historyTail(messages: readonly RuntimeHistoryMessage[]): {
+	toolResults: boolean;
+	input: boolean;
+} {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message.parentToolUseId || message.role === "disp" || message.role === "system") continue;
-		if (message.role !== "assistant") return false;
-		return (message.toolCalls ?? []).some(
+		if (message.role !== "assistant") return { toolResults: false, input: true };
+		const toolResults = (message.toolCalls ?? []).some(
 			(call) => call.status === "success" || call.status === "fail",
 		);
+		return { toolResults, input: toolResults };
 	}
-	return false;
+	return { toolResults: false, input: false };
 }
 
 /**
@@ -284,6 +291,7 @@ export async function buildRuntimeHistory(
 	// The history carries every persisted row, the current input included; only text no
 	// row holds is still sent as the request's current content.
 	const current = projectCurrentInput(modelMessages, currentInput ?? "");
+	const tail = historyTail(modelMessages);
 	return {
 		...built,
 		replayedInjectionMessageIds: built.replayedInjectionMessageIds ?? [],
@@ -292,7 +300,8 @@ export async function buildRuntimeHistory(
 		currentInputText: current.text,
 		currentText: current.persisted ? "" : current.text,
 		currentInputPersisted: current.persisted,
-		endsWithToolResults: endsWithToolResults(modelMessages),
+		endsWithToolResults: tail.toolResults,
+		endsWithInput: tail.input,
 		...(toolLoadingState ? { toolLoading: toolLoadingState } : {}),
 	};
 }

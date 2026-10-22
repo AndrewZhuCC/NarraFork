@@ -1825,6 +1825,8 @@ export async function runAgentLoopUnlocked(
 						config.reviewReadOnlyBash,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
+				rebuildRequestHistory: ctxMgmt.rebuildRequestHistory,
+				historyEndsWithToolResults: preparedHistory.endsWithToolResults,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
 				shouldIdleOnReasoningOnly: async () => {

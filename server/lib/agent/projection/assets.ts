@@ -17,6 +17,34 @@ const FORMAT_BY_MEDIA_TYPE: Record<string, string> = {
 	"image/webp": "webp",
 };
 
+/**
+ * Resolved uploads, reused across requests by file path. Every request of a session run
+ * is a fresh projection, and an upload never changes under its id, so its bytes are read
+ * once while they fit the budget (least recently used first out).
+ */
+const UPLOAD_CACHE_BUDGET_CHARS = 64 * 1024 * 1024;
+const uploadCache = new Map<string, ResolvedImage>();
+let uploadCacheChars = 0;
+
+function cachedUpload(key: string): ResolvedImage | undefined {
+	const hit = uploadCache.get(key);
+	if (!hit) return undefined;
+	uploadCache.delete(key);
+	uploadCache.set(key, hit);
+	return hit;
+}
+
+function rememberUpload(key: string, image: ResolvedImage): void {
+	if (image.base64.length > UPLOAD_CACHE_BUDGET_CHARS / 4) return;
+	uploadCache.set(key, image);
+	uploadCacheChars += image.base64.length;
+	for (const [oldest, value] of uploadCache) {
+		if (uploadCacheChars <= UPLOAD_CACHE_BUDGET_CHARS) break;
+		uploadCache.delete(oldest);
+		uploadCacheChars -= value.base64.length;
+	}
+}
+
 async function readUpload(
 	uploadNarratorId: string,
 	imageId: string,
@@ -32,12 +60,21 @@ async function readUpload(
 		});
 		return null;
 	}
+	// Keyed by the resolved path: a deleted file is never served from memory.
+	const cached = cachedUpload(filePath);
+	if (cached) return cached;
 	try {
 		const result = await imageToBase64(filePath);
 		// The detected type wins over the stored one: bytes saved under the wrong
 		// extension would otherwise be declared as a type the API rejects.
 		const mediaType = result.detectedMediaType ?? storedMediaType ?? "image/png";
-		return { mediaType, format: FORMAT_BY_MEDIA_TYPE[mediaType] ?? "png", base64: result.base64 };
+		const image = {
+			mediaType,
+			format: FORMAT_BY_MEDIA_TYPE[mediaType] ?? "png",
+			base64: result.base64,
+		};
+		rememberUpload(filePath, image);
+		return image;
 	} catch (error) {
 		logger.warn("Failed to read history image; skipping replay", {
 			...context,

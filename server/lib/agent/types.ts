@@ -941,10 +941,15 @@ export interface AgentHistoryReplacement {
 	history: unknown[];
 	pendingToolResults: unknown[];
 	systemPrompt?: string;
-	/** Persisted input rows retained in history, excluding rows lifted into current input. */
+	/** Persisted input rows the rebuilt history carries. */
 	replayedInjectionMessageIds?: readonly string[];
 	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/**
+	 * Whether the history ends with input the model has not answered yet: a user or sys
+	 * row, or tool results. A reasoning-only reply to such a history is retried as is.
+	 */
+	endsWithInput?: boolean;
 }
 
 export interface AgentConfig {
@@ -1185,6 +1190,18 @@ export interface AgentConfig {
 		turnIndex: number,
 		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
 	) => Promise<AgentHistoryReplacement | null>;
+	/**
+	 * Rebuild the history a request is sent with, from persisted rows.
+	 *
+	 * When present, every request after the first is built by this instead of from the
+	 * loop's in-memory turns, so a live request is byte-for-byte what a later rebuild of
+	 * the same rows produces. Everything the model saw in earlier turns is persisted by
+	 * then (assistant steps, tool results, notice rows); only text no row carries is
+	 * still sent as the request's current content. Hosts without a store leave it unset.
+	 */
+	rebuildRequestHistory?: () => Promise<AgentHistoryReplacement>;
+	/** Whether the initial history ends with tool results the model has not answered. */
+	historyEndsWithToolResults?: boolean;
 	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
 	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */

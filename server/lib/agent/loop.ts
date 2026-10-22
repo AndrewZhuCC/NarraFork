@@ -1369,6 +1369,9 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
+			// A reflection extends the parent's request in memory; the parent's rows are not its own.
+			rebuildRequestHistory: undefined,
+			historyEndsWithToolResults: undefined,
 			shouldIdleOnReasoningOnly: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
@@ -3206,10 +3209,23 @@ async function* agentLoopInMetadataSnapshot(
 	 */
 	let historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 
-	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
-		resetUpstreamSessionOnNextRequest = true;
-		history = replacement.history;
+	/** Replacements applied so far; a turn that already got one needs no rebuild. */
+	let historyReplacements = 0;
+	/** Whether the current history ends with input the model has not answered. */
+	let historyEndsWithInput = false;
+
+	function applyHistoryReplacement(
+		replacement: AgentHistoryReplacement,
+		options: { sameUpstreamSession?: boolean } = {},
+	) {
+		historyReplacements++;
+		// A per-request rebuild continues the same conversation; only a replacement that
+		// changes what was already sent (compact, model switch) starts a new upstream session.
+		if (!options.sameUpstreamSession) resetUpstreamSessionOnNextRequest = true;
+		// The builder's array is the receipt identity; the system prompt goes into a copy.
 		sourceInputHistory = replacement.history;
+		history = [...replacement.history];
+		historyEndsWithInput = replacement.endsWithInput ?? false;
 		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
@@ -3371,8 +3387,10 @@ async function* agentLoopInMetadataSnapshot(
 			pipelineExitConfirmationAttachedStateIds.clear();
 
 			const isFirstTurn = turnIndex === 0;
+			if (!isFirstTurn) historyEndsWithInput = false;
 
 			if (!isFirstTurn) {
+				const replacementsBefore = historyReplacements;
 				const switchEvent = await applyPendingRuntimeSettings("turn");
 				if (switchEvent) {
 					yield switchEvent;
@@ -3381,6 +3399,27 @@ async function* agentLoopInMetadataSnapshot(
 					const replacement = await config.onBeforeTurn(turnIndex);
 					if (replacement) {
 						applyHistoryReplacement(replacement);
+					}
+				}
+				// Every later request is the projection of the persisted rows, exactly what a
+				// rebuild of this conversation sends. A failed rebuild keeps the in-memory turns.
+				if (config.rebuildRequestHistory && historyReplacements === replacementsBefore) {
+					try {
+						const replacement = await config.rebuildRequestHistory();
+						// A new system prompt (a compact landed) changes what was already sent.
+						applyHistoryReplacement(replacement, {
+							sameUpstreamSession: replacement.systemPrompt === undefined,
+						});
+					} catch (error) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						logger.warn("Request history rebuild failed; continuing from in-memory history", {
+							narratorId: config.narratorId,
+							turnIndex,
+							error: String(error),
+						});
 					}
 				}
 
@@ -6098,7 +6137,9 @@ async function* agentLoopInMetadataSnapshot(
 							balance: paymentRequired.balance,
 							required: paymentRequired.required,
 							resumeAction:
-								hasStartedEarlyToolExecution() || (initialToolResults?.length ?? 0) > 0
+								hasStartedEarlyToolExecution() ||
+								(initialToolResults?.length ?? 0) > 0 ||
+								!!config.historyEndsWithToolResults
 									? "continue"
 									: "retry",
 						};
@@ -6926,7 +6967,12 @@ async function* agentLoopInMetadataSnapshot(
 					// (`pendingToolResults`) — then the previous block is a user/tool block.
 					// Re-send the exact same request by retrying the chat() call in place
 					// (same turn: history, content and toolResults are all unchanged).
-					if (isFirstTurn || content.length > 0 || pendingToolResults.length > 0) {
+					if (
+						isFirstTurn ||
+						content.length > 0 ||
+						pendingToolResults.length > 0 ||
+						historyEndsWithInput
+					) {
 						continue;
 					}
 

@@ -2734,11 +2734,13 @@ export interface ContextManagementOptions {
  * Build reusable context management hooks (compact) for both
  * main narrators and subagents.
  *
- * Returns an `onContextUsage` EventHook and an `onBeforeTurn` AgentConfig callback.
+ * Returns an `onContextUsage` EventHook, an `onBeforeTurn` AgentConfig callback and the
+ * per-request history rebuild.
  */
 export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	onContextUsage: NonNullable<EventHooks["onContextUsage"]>;
 	onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]>;
+	rebuildRequestHistory: NonNullable<import("../lib/agent").AgentConfig["rebuildRequestHistory"]>;
 	onReasoningOnlyHighContext: NonNullable<
 		import("../lib/agent").AgentConfig["onReasoningOnlyHighContext"]
 	>;
@@ -2811,6 +2813,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			pendingToolResults: result.trailingToolResults,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+			endsWithInput: result.endsWithInput,
 			...(result.toolLoading ? { toolLoading: result.toolLoading } : {}),
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
 		};
@@ -2909,7 +2912,18 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		return rebuildHistoryForCurrentContext(true);
 	};
 
-	return { onContextUsage, onBeforeTurn, onReasoningOnlyHighContext };
+	// Same rows, same projection as a pass start; the system prompt stays the pass's own.
+	// A compact that finished since `onBeforeTurn` looked moves its summary into the
+	// system prompt, so that case rebuilds both, as `onBeforeTurn` would.
+	const rebuildRequestHistory = async () => {
+		if ((isCompactDone?.() ?? false) || hasPendingHistoryCompact(narratorId)) {
+			clearCompactDone?.();
+			return rebuildHistoryForCurrentContext(true);
+		}
+		return rebuildHistoryForCurrentContext(false);
+	};
+
+	return { onContextUsage, onBeforeTurn, rebuildRequestHistory, onReasoningOnlyHighContext };
 }
 
 /**
