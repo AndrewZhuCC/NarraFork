@@ -25,7 +25,7 @@
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
-import { historyStrings } from "../../../tests/fixtures/model-input";
+import { historyStrings, sentHistory } from "../../../tests/fixtures/model-input";
 import { db } from "../../db";
 import { aclGrants, knowledgeTags, narrators, users } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
@@ -36,7 +36,6 @@ import { startNarratorRun } from "../agent-runtime/run";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
 import { clearBufferedMessages, enqueueBufferedMessage } from "../narrator-buffer";
-import type { ExecuteLoopOptions } from "../narrator-executor";
 import * as narratorExecutor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
 import { resumeBufferedMessagesIfIdle } from "../narrator-session";
@@ -469,13 +468,13 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			name: creator?.username,
 		});
 		await enqueueBufferedMessage(narratorId, text, undefined, null, userId);
-		const requests: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults">[] = [];
+		// What the model is sent: the host-built history (not the rows it was built from).
+		const requests: Array<{ userText: string; history: unknown }> = [];
 		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
 			async (input) => {
 				requests.push({
 					userText: input.userText,
-					history: structuredClone(input.history),
-					trailingToolResults: structuredClone(input.trailingToolResults),
+					history: structuredClone(sentHistory(input.history)),
 				});
 				return { finalText: "done", hasError: false, shouldUpdateTitle: false };
 			},

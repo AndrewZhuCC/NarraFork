@@ -191,7 +191,7 @@ let reflectionScenario: "confirm" | "text" | "throw" | "cancel" | "confirmError"
 const providerModule = { ...(await import("../../lib/agent/provider")) };
 const fakeProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();

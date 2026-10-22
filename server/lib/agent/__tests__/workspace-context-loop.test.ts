@@ -25,7 +25,7 @@ let scenario: "switch-write" | "background-switch" | "device-switch" | "write" |
 let backgroundResult: (() => { cwd: string; targetCwd: string | undefined }) | undefined;
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();

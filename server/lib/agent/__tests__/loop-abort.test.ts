@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:t
 import { z } from "zod/v4";
 import { diskSpaceMonitor } from "../../disk-safety";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, CodexRebuildHistoryRetryError } from "../codex-errors";
-import type { ProviderAdapter } from "../provider";
+import type { DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
@@ -35,9 +35,32 @@ let streamingBoundaryChunks: Array<{
 }> = [];
 const executedToolValues: string[] = [];
 const completedToolValues: string[] = [];
-const formattedToolResultOrder: string[] = [];
-const modelToolResultOrder: string[] = [];
-const assistantToolUseOrders: string[][] = [];
+/** Rows of the latest projected request: what the fake history builder received. */
+let lastBuiltRows: DbMessage[] = [];
+
+function toolUseIds(row: DbMessage): string[] {
+	return Array.isArray(row.contentJson)
+		? row.contentJson.flatMap((block) => (block?.type === "tool_use" ? [String(block.id)] : []))
+		: [];
+}
+
+/** The calls whose results the model reads, in the order the projection sends them. */
+function modelResultOrder(rows: readonly DbMessage[]): string[] {
+	return rows.flatMap((row) =>
+		row.role === "assistant"
+			? toolUseIds(row).filter((id) =>
+					row.toolCalls?.some(
+						(call) => call.toolUseId === id && (call.status === "success" || call.status === "fail"),
+					),
+				)
+			: [],
+	);
+}
+
+/** The tool_use order of every assistant step in the rows. */
+function stepToolUseOrders(rows: readonly DbMessage[]): string[][] {
+	return rows.filter((row) => row.role === "assistant").map(toolUseIds);
+}
 let enterPlanStopEmitted = false;
 let readStartedBeforeEnterPlanStop = false;
 let releasePendingTool: (() => void) | undefined;
@@ -92,7 +115,10 @@ function releaseParallelAbortTools(): void {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => {
+		lastBuiltRows = rows;
+		return { history: [] };
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
@@ -228,11 +254,6 @@ const testProvider: ProviderAdapter = {
 				enterPlanStopEmitted = true;
 				yield { toolUseChunk: { toolUseId: "tu_enter_plan_interleaved", stop: true } };
 			} else {
-				modelToolResultOrder.push(
-					...(params.toolResults as Array<{ toolUseId?: string }>).map((result) =>
-						String(result.toolUseId),
-					),
-				);
 				yield { text: "interleaved tools complete" };
 			}
 			return;
@@ -623,7 +644,6 @@ describe("agentLoop abort result draining", () => {
 		providerAttempts = 0;
 		executedToolValues.length = 0;
 		completedToolValues.length = 0;
-		formattedToolResultOrder.length = 0;
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
@@ -680,7 +700,7 @@ describe("agentLoop abort result draining", () => {
 		providerAttempts = 0;
 		executedToolValues.length = 0;
 		completedToolValues.length = 0;
-		formattedToolResultOrder.length = 0;
+		lastBuiltRows = [];
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
@@ -699,7 +719,8 @@ describe("agentLoop abort result draining", () => {
 			})
 			.map((event) => event.toolUseId);
 		expect(toolResultIds).toEqual(["tu_parallel_fast", "tu_parallel_slow"]);
-		expect(formattedToolResultOrder).toEqual(["tu_parallel_slow", "tu_parallel_fast"]);
+		// The next request reads the results in call order: the step's order, not completion's.
+		expect(modelResultOrder(lastBuiltRows)).toEqual(["tu_parallel_slow", "tu_parallel_fast"]);
 	});
 
 	test("并行组完成后进入下一串行组前中断不会重复 drain 已即时产出的结果", async () => {
@@ -752,7 +773,7 @@ describe("agentLoop abort result draining", () => {
 		test(
 			abortAfterFirstResult
 				? "受控逆序磁盘预检：并行完成后中断不重复 drain，也不启动后续串行工具"
-				: "受控逆序磁盘预检：soft-stop 仍等待完整并行组，并按调用顺序组装模型结果",
+				: "受控逆序磁盘预检：soft-stop 仍等待完整并行组，结果按完成顺序产出",
 			async () => {
 				providerScenario = abortAfterFirstResult
 					? "parallel_then_serial_abort"
@@ -760,7 +781,6 @@ describe("agentLoop abort result draining", () => {
 				providerAttempts = 0;
 				executedToolValues.length = 0;
 				completedToolValues.length = 0;
-				formattedToolResultOrder.length = 0;
 				parallelToolsStarted = createGate();
 				const gate: ParallelPreflightGate = {
 					firstPath: abortAfterFirstResult ? "parallel-1.txt" : "first.txt",
@@ -833,7 +853,6 @@ describe("agentLoop abort result draining", () => {
 						expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 					} else {
 						expect(results[2]?.metadata).toEqual({ skippedForSoftStop: true });
-						expect(formattedToolResultOrder).toEqual([firstId, secondId, serialId]);
 						expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 					}
 				} finally {
@@ -848,9 +867,7 @@ describe("agentLoop abort result draining", () => {
 		providerScenario = "interleaved_tool_chunk_order";
 		providerAttempts = 0;
 		executedToolValues.length = 0;
-		formattedToolResultOrder.length = 0;
-		modelToolResultOrder.length = 0;
-		assistantToolUseOrders.length = 0;
+		lastBuiltRows = [];
 		enterPlanStopEmitted = false;
 		readStartedBeforeEnterPlanStop = false;
 		const ac = new AbortController();
@@ -882,16 +899,15 @@ describe("agentLoop abort result draining", () => {
 			"serial:unindexed-first",
 			"serial:unindexed-second",
 		]);
-		expect(formattedToolResultOrder).toEqual(expectedToolOrder);
-		expect(modelToolResultOrder).toEqual(expectedToolOrder);
-		expect(assistantToolUseOrders).toContainEqual(expectedToolOrder);
+		// The follow-up request reads the step and its results in the same start order.
+		expect(stepToolUseOrders(lastBuiltRows)).toEqual([expectedToolOrder]);
+		expect(modelResultOrder(lastBuiltRows)).toEqual(expectedToolOrder);
 		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
 	test("EnterPlanMode 在 assistant_message 建立准备态之后才请求执行权限", async () => {
 		providerScenario = "enter_plan_prepared_order";
 		providerAttempts = 0;
-		formattedToolResultOrder.length = 0;
 		const ac = new AbortController();
 		const order: string[] = [];
 

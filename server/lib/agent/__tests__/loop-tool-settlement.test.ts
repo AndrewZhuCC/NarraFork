@@ -6,7 +6,7 @@ import type { AgentConfig, AgentEvent } from "../types";
 
 // Records which tools' execute() actually started, in start order.
 const executionOrder: string[] = [];
-// Model-facing tool_result order (provider.formatToolResult call order).
+// Model-facing tool_result order: the settled calls of the latest step, in call order.
 const modelResultOrder: string[] = [];
 
 let scenario:
@@ -39,7 +39,24 @@ const PARALLEL_TOOL_NAMES = ["Read", "Glob", "Grep"] as const;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	// The model reads a step's results in call order: record the settled calls of the
+	// latest step in the order its blocks hold them.
+	buildHistory: async (rows) => {
+		const step = rows.findLast((row) => row.role === "assistant");
+		if (step) {
+			const settled = new Set(
+				(step.toolCalls ?? [])
+					.filter((call) => call.status !== "running")
+					.map((call) => call.toolUseId),
+			);
+			const blocks = step.contentJson as Array<{ type?: string; id?: string }>;
+			modelResultOrder.length = 0;
+			for (const block of blocks)
+				if (block.type === "tool_use" && block.id && settled.has(block.id))
+					modelResultOrder.push(block.id);
+		}
+		return { history: [] };
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;

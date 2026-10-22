@@ -57,16 +57,14 @@ const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
 const MODEL = "orchestratorfixture:model";
 const adapter: ProviderAdapter = {
 	formatTools: () => [],
+	// Every row is one entry, and a step's settled results follow it, as real builders do.
 	buildHistory: async (messages) => ({
-		history: messages.map((message) => ({ role: message.role, content: message.contentJson })),
-		trailingToolResults: messages.flatMap((message) =>
-			(message.toolCalls ?? [])
+		history: messages.flatMap((message) => [
+			{ role: message.role, content: message.contentJson },
+			...(message.toolCalls ?? [])
 				.filter((tool) => tool.status === "success")
-				.map((tool) => ({
-					toolUseId: tool.toolUseId,
-					output: tool.outputJson,
-				})),
-		),
+				.map((tool) => ({ toolUseId: tool.toolUseId, output: tool.outputJson })),
+		]),
 	}),
 	injectSystemPrompt: () => {},
 	chat() {
@@ -571,7 +569,7 @@ describe("real shared orchestrator profile contract", () => {
 							// persisted input row; the trailing sys row is kept.
 							expect(modelInputText(options).split(snapshot.snapshotText).length).toBe(2);
 							// Official semantics: the trailing sys row stays a system message in history.
-							expect(options.history).toEqual(
+							expect(options.history.built).toEqual(
 								expect.arrayContaining([
 									expect.objectContaining({
 										role: "system",
@@ -959,9 +957,12 @@ describe("real shared orchestrator profile contract", () => {
 			expect(
 				db.select().from(narratorMessages).where(eq(narratorMessages.role, "user")).all(),
 			).toEqual([]);
-			expect(h.calls[1].trailingToolResults).toEqual([
-				{ toolUseId: "read-replay", output: "persisted replay output" },
-			]);
+			// The replayed request is the history, which ends with the persisted result.
+			expect(h.calls[1].startedWithToolResults).toBe(true);
+			expect(h.calls[1].history.built?.at(-1)).toEqual({
+				toolUseId: "read-replay",
+				output: "persisted replay output",
+			});
 		});
 
 		test(`${profile.kind}: actual after-tools materialization remains unadopted until its request callback`, async () => {
@@ -1516,7 +1517,7 @@ for (const profile of profiles) {
 				sourceMessages: rawMessages,
 			});
 			// Live and rebuilt requests carry the same bytes.
-			expect(rebuilt.history).toEqual(h.calls[0].history);
+			expect(rebuilt.history).toEqual(h.calls[0].history.built);
 			expect(h.session._currentUserId).toBe("principal-a");
 		} finally {
 			settings.knowledge.injectMode = previousMode;

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import type { ProviderAdapter } from "../provider";
+import type { DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
@@ -15,11 +15,17 @@ function gate() {
 let script: ProviderAdapter["chat"];
 let attempts = 0;
 const started: string[] = [];
-const replayed: unknown[][] = [];
+/** Rows each projected request was built from (the fake builder's input). */
+const builtRows: DbMessage[][] = [];
 const requests: Array<{ history: unknown[]; toolResults?: unknown[] }> = [];
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => {
+		builtRows.push(structuredClone(rows));
+		return {
+			history: rows.map((row) => ({ role: row.role, content: row.contentJson, calls: row.toolCalls })),
+		};
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		requests.push(
@@ -62,7 +68,7 @@ toolRegistry.register({
 beforeEach(() => {
 	attempts = 0;
 	started.length = 0;
-	replayed.length = 0;
+	builtRows.length = 0;
 	requests.length = 0;
 });
 afterAll(() => {
@@ -133,7 +139,9 @@ describe("reasoning identity and replay", () => {
 			text: "abcd",
 			providerMetadata: { anthropic: { signature: "signed" } },
 		});
-		expect(replayed[0]?.[9]).toEqual(
+		// The next request reads the step with the reasoning whole.
+		const step = builtRows.at(-1)?.find((row) => row.role === "assistant");
+		expect(step?.contentJson).toEqual(
 			expect.arrayContaining([expect.objectContaining({ type: "reasoning", text: "abcd" })]),
 		);
 	});
@@ -281,7 +289,6 @@ describe("question reply ownership during real loop execution", () => {
 		true,
 	])("permission reply never becomes the assistant's arguments (deferred=%s)", async (deferred) => {
 		const originalTool = toolRegistry.get("AskUserQuestion");
-		const originalPush = provider.pushAssistantTurn;
 		const authored = {
 			questions: [{ header: "Direction", options: [{ header: "A" }, { header: "B" }] }],
 			async: false,
@@ -307,18 +314,6 @@ describe("question reply ownership during real loop execution", () => {
 				};
 			},
 		});
-		provider.pushAssistantTurn = (history, text, uses, ...rest) => {
-			replayed.push([history, text, structuredClone(uses), ...rest]);
-			history.push({
-				role: "assistant",
-				content: uses.map((use) => ({
-					type: "tool_use",
-					id: use.toolUseId,
-					name: use.name,
-					input: structuredClone(use.input),
-				})),
-			});
-		};
 		script = async function* () {
 			yield {
 				toolUses: [
@@ -333,24 +328,23 @@ describe("question reply ownership during real loop execution", () => {
 		try {
 			const events = await run(undefined, async () => ({ behavior: "allow", updatedInput: reply }));
 			expect(executionInput).toEqual(reply);
-			const sent = requests[1]?.history as Array<{
-				role: string;
-				content: Array<{ type: string; name: string; input: unknown }>;
-			}>;
-			const call = sent
-				.flatMap((message) => message.content)
+			// The next request's step keeps the authored call; the reply is only its result.
+			expect(requests).toHaveLength(2);
+			const step = builtRows.at(-1)?.find((row) => row.role === "assistant");
+			const call = (step?.contentJson as Array<{ type: string; name?: string; input?: unknown }>)
+				.filter((block) => block.type === "tool_use")
 				.find((block) => block.name === "AskUserQuestion");
 			expect(call?.input).toEqual(authored);
-			expect(JSON.stringify(requests[1]?.history)).not.toContain("UNIQUE_HUMAN_PERMISSION_REPLY");
+			const ledger = step?.toolCalls?.find((entry) => entry.toolUseId === "question-authored");
+			expect(ledger?.inputJson).toEqual(authored);
+			expect(JSON.stringify(ledger?.outputJson)).toContain(
+				deferred ? "Question accepted asynchronously." : "UNIQUE_HUMAN_PERMISSION_REPLY",
+			);
 			expect(events.find((event) => event.type === "tool_result")).toMatchObject({
 				updatedInput: reply,
 			});
-			expect(JSON.stringify(requests[1]?.toolResults)).toContain(
-				deferred ? "Question accepted asynchronously." : "UNIQUE_HUMAN_PERMISSION_REPLY",
-			);
 			expect(authored.async).toBe(false);
 		} finally {
-			provider.pushAssistantTurn = originalPush;
 			if (originalTool) toolRegistry.register(originalTool);
 			else toolRegistry.unregister("AskUserQuestion");
 		}

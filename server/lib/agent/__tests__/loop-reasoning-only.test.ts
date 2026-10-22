@@ -9,8 +9,9 @@ let providerScenario:
 	| "reasoning_high_context_abort" // attempt 1: high-context reasoning only; recovery waits for abort
 	| "reasoning_forever" = "reasoning_then_text"; // every attempt: reasoning only (exhausts retries)
 let providerAttempts = 0;
-// Captures the `content` passed to each chat() call so we can assert the
-// previous-block recovery behavior (same-turn resend vs continue nudge).
+// Captures the input each chat() call ends with (its current content, or the last input
+// row of the projected history) so we can assert the previous-block recovery behavior
+// (same-turn resend vs continue nudge).
 const contentLog: string[] = [];
 const resetLog: boolean[] = [];
 let highContextRecoveryCompleted = false;
@@ -18,11 +19,14 @@ let highContextSecondAttemptSawRecovery = false;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({
+		history: rows.map((row) => ({ role: row.role, content: row.contentText ?? "" })),
+	}),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
-		contentLog.push(params.content);
+		const last = params.history.at(-1) as { role?: string; content?: string } | undefined;
+		contentLog.push(params.content || (last?.role === "user" ? (last.content ?? "") : ""));
 		resetLog.push(params.resetUpstreamSession === true);
 		params.onRequestStart?.();
 
@@ -217,7 +221,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 				highContextRecoveryCompleted = true;
 				return {
 					history: [{ role: "system", content: "rebuilt after compact" }],
-					pendingToolResults: [],
+					rows: [],
 					systemPrompt: "rebuilt system prompt",
 				};
 			},

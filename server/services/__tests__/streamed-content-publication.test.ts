@@ -59,7 +59,7 @@ const thought = "先分析，再运行工具。";
 const text = "我先检查源文件。";
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	getActiveReasoningSource: () => "test:channel",
 	async *chat(params) {

@@ -82,7 +82,6 @@ describe("a trailing user row stays in the built history", () => {
 		expect(JSON.stringify(last.content)).toContain("the index has no migration");
 		// The model-facing text only, never the card's structured fields.
 		expect(JSON.stringify(built.history).split("the index has no migration")).toHaveLength(2);
-		expect(built.trailingToolResults).toEqual([]);
 	});
 
 	test("a legacy row without a text block falls back to its flat text", async () => {

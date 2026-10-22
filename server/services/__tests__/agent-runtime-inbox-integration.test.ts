@@ -27,7 +27,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 const agent = { ...(await import("../../lib/agent")) };
 mock.module("../../lib/agent", () => ({
 	...agent,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 }));
 const inbox = await import("../agent-runtime/inbox");
 const { activeNarrators } = await import("../narrator-session-state");

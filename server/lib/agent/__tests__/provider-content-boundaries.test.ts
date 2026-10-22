@@ -4,7 +4,7 @@ import { AnthropicProvider, parseAnthropicSSEStream } from "../anthropic-provide
 import { CodexProvider } from "../codex-provider";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
 import { GeminiProvider } from "../gemini-provider";
-import { NugProvider } from "../nug-provider";
+import { LoopTranscript } from "../loop-transcript";
 import {
 	OpenAIProvider,
 	parseResponsesAPIEvent,
@@ -55,21 +55,20 @@ function responsesParser() {
 	return (chunk: ResponsesAPIChunk) => parseResponsesAPIEvent(chunk, tools, reasoning);
 }
 
-function replay(provider: ProviderAdapter, blocks: ContentBlock[]): unknown[] {
-	const history: unknown[] = [];
-	provider.pushAssistantTurn(
-		history,
-		"ignored flat text",
-		[],
-		undefined,
-		undefined,
-		undefined,
-		undefined,
-		undefined,
-		undefined,
-		blocks,
-	);
-	return history;
+/**
+ * A step as the loop keeps it — written to its transcript, its calls settled — projected
+ * by the provider: the path every replayed step takes.
+ */
+async function replay(
+	provider: ProviderAdapter,
+	blocks: ContentBlock[],
+	model = "gpt-5",
+): Promise<unknown[]> {
+	const transcript = new LoopTranscript();
+	transcript.appendStep(blocks);
+	for (const block of blocks)
+		if (block.type === "tool_use") transcript.settleTool(block.toolUseId, { output: "read" });
+	return (await provider.buildHistory(transcript.rows, model)).history;
 }
 
 afterEach(() => setOutboundFetchOverrideForTest(null));
@@ -568,17 +567,24 @@ describe("ordered assistant replay", () => {
 		{ type: "text", text: "after", outputIndex: 1 },
 	];
 
-	test("Anthropic preserves encounter order and whole signed thinking items", () => {
-		const history = replay(new AnthropicProvider(config), [
+	test("Anthropic preserves encounter order and whole signed thinking items", async () => {
+		const provider = new AnthropicProvider(config);
+		// The loop stamps every credential with the upstream that minted it.
+		const signatureSource = provider.getActiveReasoningSource();
+		const history = (await replay(provider, [
 			{
 				type: "reasoning",
 				text: "one\n\ntwo",
-				providerMetadata: { anthropic: { signature: "sig1" } },
+				providerMetadata: { signatureSource, anthropic: { signature: "sig1" } },
 			},
 			...blocks,
-			{ type: "reasoning", text: "three", providerMetadata: { anthropic: { signature: "sig2" } } },
-			{ type: "redacted_thinking", data: "opaque" },
-		]) as Array<{ content: Array<Record<string, unknown>> }>;
+			{
+				type: "reasoning",
+				text: "three",
+				providerMetadata: { signatureSource, anthropic: { signature: "sig2" } },
+			},
+			{ type: "redacted_thinking", data: "opaque", signatureSource },
+		])) as Array<{ content: Array<Record<string, unknown>> }>;
 		expect(history[0].content.map((block) => block.type)).toEqual([
 			"thinking",
 			"text",
@@ -595,7 +601,7 @@ describe("ordered assistant replay", () => {
 		expect(history[0].content[4].signature).toBe("sig2");
 	});
 
-	test("Responses replays text-tool-text, independent text items, and opaque native reasoning once", () => {
+	test("Responses replays text-tool-text, adjacent text as one item, and opaque native reasoning once", async () => {
 		const provider = new OpenAIProvider({ ...config, apiMode: "responses" });
 		const reasoning = (itemId: string, text: string): ContentBlock => ({
 			type: "reasoning",
@@ -605,27 +611,31 @@ describe("ordered assistant replay", () => {
 				openai: { itemId, reasoningEncryptedContent: `encrypted-${itemId}` },
 			},
 		});
-		const history = replay(provider, [
+		const history = (await replay(provider, [
 			reasoning("rs_1", "one\n\ntwo"),
 			...blocks,
 			{ type: "text", text: "separate" },
 			reasoning("rs_2", "three"),
-		]) as Array<Record<string, unknown>>;
+		])) as Array<Record<string, unknown>>;
+		// Adjacent text items of a step are one assistant item; the call's result follows the step.
 		expect(history.map((item) => item.type ?? item.role)).toEqual([
 			"reasoning",
 			"assistant",
 			"function_call",
 			"assistant",
-			"assistant",
 			"reasoning",
+			"function_call_output",
 		]);
+		expect(history[3]).toMatchObject({
+			content: [{ type: "output_text", text: "after\nseparate" }],
+		});
 		expect(history[0]).toMatchObject({
 			id: "rs_1",
 			encrypted_content: "encrypted-rs_1",
 			summary: [{ type: "summary_text", text: "one\n\ntwo" }],
 		});
-		expect(history.at(-1)).toMatchObject({ id: "rs_2", encrypted_content: "encrypted-rs_2" });
-		const foreign = replay(provider, [
+		expect(history.at(-2)).toMatchObject({ id: "rs_2", encrypted_content: "encrypted-rs_2" });
+		const foreign = await replay(provider, [
 			{
 				type: "reasoning",
 				text: "foreign",
@@ -639,30 +649,7 @@ describe("ordered assistant replay", () => {
 		expect(JSON.stringify(foreign)).not.toContain("secret");
 	});
 
-	test("NUG forwards ordered content to its active delegate", () => {
-		const provider = Object.create(NugProvider.prototype) as NugProvider;
-		(provider as unknown as { activeDelegate: ProviderAdapter }).activeDelegate =
-			new OpenAIProvider({ ...config, apiMode: "responses" });
-		const history = replay(provider, blocks) as Array<Record<string, unknown>>;
-		expect(history.map((item) => item.type ?? item.role)).toEqual([
-			"assistant",
-			"function_call",
-			"assistant",
-		]);
-		expect(JSON.stringify(history)).not.toContain("ignored flat text");
-	});
-
-	test("Codex forwards ordered content instead of falling back to flat text", () => {
-		const history = replay(new CodexProvider({}), blocks) as Array<Record<string, unknown>>;
-		expect(history.map((item) => item.type ?? item.role)).toEqual([
-			"assistant",
-			"function_call",
-			"assistant",
-		]);
-		expect(JSON.stringify(history)).not.toContain("ignored flat text");
-	});
-
-	test("Gemini transports preserve text-tool-text and signed whole thought parts", () => {
+	test("Gemini transports preserve text-tool-text and signed whole thought parts", async () => {
 		const generate = new GeminiProvider(config);
 		const interactions = new GeminiInteractionsProvider({
 			...config,
@@ -677,7 +664,9 @@ describe("ordered assistant replay", () => {
 					gemini: { stepId: "thought_1", thoughtSignature: "sig" },
 				},
 			};
-			const history = replay(provider, [thought, ...blocks]) as Array<Record<string, unknown>>;
+			const history = (await replay(provider, [thought, ...blocks], "gemini-3-pro")) as Array<
+				Record<string, unknown>
+			>;
 			if (provider === generate) {
 				expect(history[0].parts).toEqual([
 					{ text: "one\n\ntwo", thought: true, thoughtSignature: "sig" },
@@ -691,6 +680,7 @@ describe("ordered assistant replay", () => {
 					"model_output",
 					"function_call",
 					"model_output",
+					"function_result",
 				]);
 				expect(history[0]).toMatchObject({
 					signature: "sig",

@@ -3,9 +3,9 @@
  * everything persisted or replayed. Three invariants live here:
  *
  *  1. provider-internal `citeturn…` markers never reach the VISIBLE text of
- *     `block_complete`, `assistant_message`, or `pushAssistantTurn` (the model
- *     history — if they did, the model would keep reproducing them and the leak
- *     would be self-sustaining);
+ *     `block_complete`, `assistant_message`, or the next request's history (if they
+ *     did, the model would keep reproducing them and the leak would be
+ *     self-sustaining);
  *  2. structured annotations survive as `citations` on the text block, where the
  *     internal ref is allowed to live as metadata;
  *  3. a turn with no citations produces byte-identical output to before.
@@ -28,7 +28,7 @@ type Scenario =
 
 let scenario: Scenario = "marker_only";
 let attempt = 0;
-/** Text handed to pushAssistantTurn — i.e. what the NEXT turn's model sees. */
+/** Assistant text in the rows a later request is built from — what the NEXT turn's model sees. */
 const historyText: string[] = [];
 
 const PUA_START = "\ue200";
@@ -38,7 +38,15 @@ const MARKER = `${PUA_START}cite${PUA_MID}turn0search1${PUA_END}`;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => {
+		historyText.length = 0;
+		for (const row of rows) {
+			if (row.role !== "assistant" || !Array.isArray(row.contentJson)) continue;
+			for (const block of row.contentJson)
+				if (block?.type === "text" && typeof block.text === "string") historyText.push(block.text);
+		}
+		return { history: [] };
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		attempt++;
@@ -53,8 +61,8 @@ const testProvider: ProviderAdapter = {
 		}
 		if (scenario === "marker_then_tool") {
 			if (attempt === 1) {
-				// Text + a tool call: this is the shape that makes the loop push the
-				// assistant turn into the model history.
+				// Text + a tool call: the loop writes the step into its transcript and
+				// requests again, so the next request's history carries this text.
 				yield { text: `第一段结论${MARKER}` };
 				yield { toolUses: [{ toolUseId: "tu_1", name: "CitationProbe", input: { value: "x" } }] };
 				return;
@@ -127,7 +135,7 @@ const { agentLoop } = await import("../loop");
 
 toolRegistry.register({
 	name: "CitationProbe",
-	description: "Test tool that lets the loop reach pushAssistantTurn",
+	description: "Test tool that lets the loop write the step and request again",
 	parameters: z.object({ value: z.string() }),
 	execute: async () => ({ output: "ok" }),
 });

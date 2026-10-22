@@ -20,7 +20,7 @@
 
 import { describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { historyStrings } from "../../../tests/fixtures/model-input";
+import { historyStrings, sentHistory } from "../../../tests/fixtures/model-input";
 import { db } from "../../db";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
@@ -31,7 +31,7 @@ import { settings, usesStatefulModel } from "../../lib/settings";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
 import { startNarratorRun } from "../agent-runtime/run";
-import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import type { ExecuteLoopResult } from "../narrator-executor";
 import * as narratorExecutor from "../narrator-executor";
 import * as narratorRecovery from "../narrator-recovery";
 import { narratorService } from "../narrator-service";
@@ -787,7 +787,8 @@ describe("persisted continuation reaches the next executor request", () => {
 		const prompt = "DISPATCH_MARKER finish the delegated work";
 		await narratorService.persistSubagentUserMessage(narratorId, prompt, toolUseId);
 
-		const requests: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults">[] = [];
+		// What the model is sent: the host-built history (not the rows it was built from).
+		const requests: Array<{ userText: string; history: unknown }> = [];
 		const retry = spyOn(narratorRecovery, "handleTransientError").mockResolvedValue({
 			shouldRetry: true,
 			delayMs: 0,
@@ -796,8 +797,7 @@ describe("persisted continuation reaches the next executor request", () => {
 			async (input) => {
 				requests.push({
 					userText: input.userText,
-					history: structuredClone(input.history),
-					trailingToolResults: structuredClone(input.trailingToolResults),
+					history: structuredClone(sentHistory(input.history)),
 				});
 				const success = { finalText: "done", hasError: false, shouldUpdateTitle: false };
 				if (requests.length === 1) {
@@ -900,7 +900,6 @@ describe("persisted continuation reaches the next executor request", () => {
 				// Assert the ACTUAL next pass input, not a manually concatenated BuiltHistory.
 				// Every route carries the persisted continuation and tool results in history.
 				expect(request.userText).toBe("");
-				expect(request.trailingToolResults).toEqual([]);
 				if (route === "responses") {
 					expect(request.history).toContainEqual({
 						role: "user",

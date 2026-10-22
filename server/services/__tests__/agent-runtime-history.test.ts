@@ -400,7 +400,6 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 		});
 		expect(nativeToolArguments(prepared.history)).toEqual([]);
 		expect(JSON.stringify(prepared.history)).not.toContain(HUMAN_QUESTION_CANARY);
-		expect(prepared.trailingToolResults).toEqual([]);
 		expect(source).toEqual(before);
 	});
 }
@@ -617,7 +616,6 @@ test("empty prompt keeps the accepted user in history and tool results never inv
 	expect(replay.endsWithToolResults).toBe(true);
 	expect(replay.currentText).toBe("");
 	expect(replay.currentInputText).toBe("");
-	expect(replay.trailingToolResults).toEqual([]);
 	expect(JSON.stringify(replay.history)).toContain("result");
 });
 

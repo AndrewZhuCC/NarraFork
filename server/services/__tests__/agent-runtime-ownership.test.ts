@@ -39,7 +39,7 @@ const { registerExternalProviderResolver } = await import("../../lib/agent/provi
 const { settings } = await import("../../lib/settings");
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("Ownership test must never call a model");

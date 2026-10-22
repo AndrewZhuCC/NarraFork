@@ -46,7 +46,7 @@ const { createAgentMessageDelivery } = await import("../agent-message-delivery")
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("Contract must never call a model");

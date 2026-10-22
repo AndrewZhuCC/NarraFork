@@ -25,7 +25,7 @@ const order: string[] = [];
 const executed: ToolContext[] = [];
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -887,7 +887,12 @@ describe("真实工具行执行绑定", () => {
 		const ctx = context("child");
 		const cfg = config("child");
 		scenario = "eager";
-		await executeAgentLoop({ config: cfg, userText: "child", history: { rows: [] }, eventContext: ctx });
+		await executeAgentLoop({
+			config: cfg,
+			userText: "child",
+			history: { rows: [] },
+			eventContext: ctx,
+		});
 		const binding = requiredBinding(executed[0]);
 		expect(binding.toolCallId).not.toBe("parent-row");
 		const persisted = await db.query.narratorToolCalls.findFirst({

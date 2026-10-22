@@ -30,7 +30,6 @@ const adapter: ProviderAdapter = {
 		providerBuilds.push(model);
 		return {
 			history: [{ protocol: "inheritfixture", source: "rebuilt" }],
-			trailingToolResults: [],
 		};
 	},
 	injectSystemPrompt: () => {},
@@ -51,7 +50,7 @@ const otherAdapter: ProviderAdapter = {
 	...adapter,
 	buildHistory: async (_messages, model) => {
 		providerBuilds.push(`otherfixture:${model}`);
-		return { history: [{ protocol: "otherfixture", source: "rebuilt" }], trailingToolResults: [] };
+		return { history: [{ protocol: "otherfixture", source: "rebuilt" }] };
 	},
 };
 const unregister = registerExternalProviderResolver({
@@ -189,7 +188,7 @@ describe("shared orchestrator inherited runtime model", () => {
 		let checked = false;
 		const f = fixture(async ({ history }, active) => {
 			expect(active.model).toBe(B);
-			expect(history).toEqual([{ protocol: "inheritfixture", source: "rebuilt" }]);
+			expect(history.built).toEqual([{ protocol: "inheritfixture", source: "rebuilt" }]);
 			checked = true;
 			return finished;
 		});
@@ -207,7 +206,7 @@ describe("shared orchestrator inherited runtime model", () => {
 		const f = fixture(async ({ history, config }, active) => {
 			expect(active.model).toBe(otherModel);
 			expect(config.provider).toBe("otherfixture");
-			expect(history).toEqual([{ protocol: "otherfixture", source: "rebuilt" }]);
+			expect(history.built).toEqual([{ protocol: "otherfixture", source: "rebuilt" }]);
 			checked = true;
 			return finished;
 		});

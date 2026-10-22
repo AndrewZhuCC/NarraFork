@@ -41,7 +41,7 @@ import { projectPendingInjection } from "../parent-injection-queue";
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("Notice test must never call a model");

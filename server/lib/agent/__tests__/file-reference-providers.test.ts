@@ -158,7 +158,6 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 				// The history carries the current input too, each occurrence with its material.
 				expect(occurrences(built.history, body.split("\n")[0])).toBe(2);
 				expect(occurrences(built.history, "tool result")).toBe(1);
-				expect(built.trailingToolResults).toEqual([]);
 				expect(messages).toEqual(original);
 			});
 

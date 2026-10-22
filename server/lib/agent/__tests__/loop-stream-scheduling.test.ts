@@ -47,7 +47,7 @@ const names = [
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -169,22 +169,12 @@ describe("event-driven immediate guidance", () => {
 			guidance.abort();
 			let softStopTaken = false;
 			let softStopCalls = 0;
-			const pushes: Parameters<ProviderAdapter["pushUserTurn"]>[] = [];
-			const originalUser = provider.pushUserTurn;
-			provider.pushUserTurn = (...args) => {
-				pushes.push(args);
-			};
 			script = async function* () {
 				yield { text: "Unexpected provider activation" };
 				throw new Error("Pre-aborted guidance activated provider");
 			};
-			const results = [
-				{ toolUseId: "previous", output: "completed before guidance", isError: false },
-			];
 			const events: AgentEvent[] = [];
-			const history: unknown[] = [];
-			try {
-				for await (const event of agentLoop(
+			for await (const event of agentLoop(
 					{
 						narratorId: "n-preaborted-guidance",
 						conversationId: "conv-preaborted-guidance",
@@ -201,21 +191,13 @@ describe("event-driven immediate guidance", () => {
 						},
 					},
 					"queued guidance",
-					history,
-					results,
 				))
 					events.push(event);
-				expect(attempts).toBe(0);
-				expect(softStopTaken).toBe(true);
-				expect(softStopCalls).toBe(1);
-				expect(pushes).toHaveLength(1);
-				expect(pushes[0]?.[0]).toEqual(history);
-				expect(pushes[0]?.[1]).toBe("queued guidance");
-				expect(pushes[0]?.[3]).toBe(results);
-				expect(events).toEqual([{ type: "turn_complete", turnIndex: 0 }]);
-			} finally {
-				provider.pushUserTurn = originalUser;
-			}
+			// The queued input stays with the host (nothing was sent, nothing is written).
+			expect(attempts).toBe(0);
+			expect(softStopTaken).toBe(true);
+			expect(softStopCalls).toBe(1);
+			expect(events).toEqual([{ type: "turn_complete", turnIndex: 0 }]);
 		});
 	}
 
@@ -417,19 +399,9 @@ describe("event-driven immediate guidance", () => {
 		expectSuccess(events);
 	});
 
-	test("guidance commits matched assistant/tool results to model history", async () => {
+	test("guidance settles the matched assistant step and its results for the host", async () => {
 		const guidance = new AbortController();
 		const a = watch("history", true);
-		const assistantTurns: Parameters<ProviderAdapter["pushAssistantTurn"]>[] = [];
-		const userTurns: Parameters<ProviderAdapter["pushUserTurn"]>[] = [];
-		const originalAssistant = provider.pushAssistantTurn;
-		const originalUser = provider.pushUserTurn;
-		provider.pushAssistantTurn = (...args) => {
-			assistantTurns.push(args);
-		};
-		provider.pushUserTurn = (...args) => {
-			userTurns.push(args);
-		};
 		script = async function* (params) {
 			yield { text: "partial" };
 			yield { toolUses: [tool("Read", "history", 0), tool("Write", "queued", 1)] };
@@ -439,20 +411,24 @@ describe("event-driven immediate guidance", () => {
 			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
-		try {
-			await run({ guidanceSignal: guidance.signal });
-			expect(assistantTurns).toHaveLength(1);
-			expect(assistantTurns[0]?.[1]).toBe("partial");
-			expect(assistantTurns[0]?.[2]?.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
-			expect(userTurns).toHaveLength(2);
-			expect(userTurns[1]?.[3]).toEqual([
-				expect.objectContaining({ toolUseId: "history", output: "ok:history", isError: false }),
-				expect.objectContaining({ toolUseId: "queued", isError: true }),
-			]);
-		} finally {
-			provider.pushAssistantTurn = originalAssistant;
-			provider.pushUserTurn = originalUser;
-		}
+		const events = await run({ guidanceSignal: guidance.signal });
+		// The step the host stores: the text and the calls before the cut, not the cut call.
+		const steps = events.filter((event) => event.type === "assistant_message");
+		expect(steps).toHaveLength(1);
+		const step = steps[0] as Extract<AgentEvent, { type: "assistant_message" }>;
+		expect(step.text).toBe("partial");
+		expect(step.toolUses.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
+		// Each call settles exactly once: the one that ran, and the one skipped by the stop.
+		const results = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
+				event.type === "tool_result",
+		);
+		expect(results.map((result) => [result.toolUseId, result.isError])).toEqual([
+			["history", false],
+			["queued", true],
+		]);
+		expect(results[0]?.output).toBe("ok:history");
+		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
 	for (const mode of ["urgent", "urgent-post-stream", "safe-then-hard-abort"] as const) {

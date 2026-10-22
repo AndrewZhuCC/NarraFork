@@ -341,7 +341,7 @@ async function request(
 		cwd: process.cwd(),
 		history: built.history,
 		tools,
-		toolResults: built.trailingToolResults,
+		toolResults: [],
 		toolLoadingStrategy: strategy,
 		signal: new AbortController().signal,
 		reasoningEffort: "none",

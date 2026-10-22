@@ -38,13 +38,46 @@ async function captureAwaitRequests(
 	const { agentLoop } = await import("../../lib/agent/loop");
 	const { toolRegistry } = await import("../../lib/agent/tool-registry");
 	const { awaitTool } = await import("../../lib/agent/tools/await");
+	const { projectHistory } = await import("../../lib/agent/projection");
 	const requests: Array<{ history: unknown[]; content: string; toolResults: unknown[] }> = [];
 	const storedOutputs: string[] = [];
 	const adopted: string[][] = [];
 	let turn = 0;
 	const adapter = {
 		formatTools: (tools: unknown) => tools,
-		buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+		// The loop's own rows, through the real first projection stage, in a minimal wire shape.
+		buildHistory: async (rows: import("../../lib/agent/provider").DbMessage[]) => {
+			const { turns } = await projectHistory(rows, { strict: false });
+			return {
+				history: turns.map((turn) =>
+					turn.kind === "input"
+						? {
+								role: "user",
+								content: turn.items.map((item) => ({ type: "text", text: item.text })),
+							}
+						: turn.kind === "assistant"
+							? {
+									role: "assistant",
+									content: turn.items
+										.map((item) => (item.kind === "text" ? item.text : ""))
+										.join(""),
+									toolUses: turn.items.flatMap((item) =>
+										item.kind === "tool_call"
+											? [{ toolUseId: item.wireId, name: item.name, input: item.input }]
+											: [],
+									),
+								}
+							: {
+									role: "user",
+									content: turn.results.map((result) => ({
+										type: "tool_result",
+										tool_use_id: result.wireId,
+										content: result.text,
+									})),
+								},
+				),
+			};
+		},
 		injectSystemPrompt: () => {},
 		async *chat(params: import("../../lib/agent/provider").ChatParams) {
 			params.onRequestStart?.();
@@ -475,13 +508,20 @@ describe("async question receipt runtime adoption", () => {
 			expect(JSON.stringify(request).split("UNIQUE_MODEL_ANSWER")).toHaveLength(2);
 			expect(JSON.stringify(request)).toContain('kind=\\"human\\"');
 		}
-		const secondResults = evidence.requests[1].toolResults as Array<{ tool_use_id: string }>;
-		expect(secondResults.map((result) => result.tool_use_id)).toEqual(["await-1-0", "await-1-1"]);
-		expect(
-			(evidence.requests[2].toolResults as Array<{ tool_use_id: string }>).map(
-				(result) => result.tool_use_id,
-			),
-		).toEqual(["await-2-0"]);
+		// The previous step's results are the request's last tool-result turn, in call order.
+		const lastResultIds = (request: { history: unknown[] }) =>
+			(request.history as Array<{ content: unknown }>)
+				.map((turn) =>
+					Array.isArray(turn.content)
+						? (turn.content as Array<{ type?: string; tool_use_id?: string }>)
+								.filter((part) => part.type === "tool_result")
+								.map((part) => part.tool_use_id)
+						: [],
+				)
+				.filter((ids) => ids.length > 0)
+				.at(-1);
+		expect(lastResultIds(evidence.requests[1])).toEqual(["await-1-0", "await-1-1"]);
+		expect(lastResultIds(evidence.requests[2])).toEqual(["await-2-0"]);
 		expect(evidence.storedOutputs[0]).toContain("UNIQUE_MODEL_ANSWER");
 		expect(evidence.storedOutputs[1]).toContain("UNIQUE_MODEL_ANSWER");
 		expect(evidence.adopted[0]).not.toContain(answer.record.answerMessageId);
@@ -516,8 +556,19 @@ describe("async question receipt runtime adoption", () => {
 			expect(JSON.stringify(request).split("PREVIOUSLY_CONSUMED_ANSWER")).toHaveLength(2);
 			expect(JSON.stringify(request)).toContain('kind=\\"human\\"');
 		}
+		// Tool results now ride in the history; none of them repeats the consumed receipt.
 		for (const request of evidence.requests.slice(1))
-			expect(JSON.stringify(request.toolResults)).not.toContain("PREVIOUSLY_CONSUMED_ANSWER");
+			expect(
+				JSON.stringify(
+					(request.history as Array<{ content: unknown }>).flatMap((turn) =>
+						Array.isArray(turn.content)
+							? (turn.content as Array<{ type?: string }>).filter(
+									(part) => part.type === "tool_result",
+								)
+							: [],
+					),
+				),
+			).not.toContain("PREVIOUSLY_CONSUMED_ANSWER");
 		expect(
 			evidence.adopted.every((ids) => ids.includes(answer.record.answerMessageId as string)),
 		).toBe(true);

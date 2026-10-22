@@ -46,7 +46,6 @@ const stubAdapter = {
 				.map((block) => block.text ?? "")
 				.join("\n"),
 		})),
-		trailingToolResults: [],
 	}),
 	injectSystemPrompt: () => {},
 	chat: async function* () {},

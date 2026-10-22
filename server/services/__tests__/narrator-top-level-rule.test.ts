@@ -363,7 +363,7 @@ for (const shape of shapes) {
 			const seen: Array<{ id: string; parentToolUseId?: string | null }> = [];
 			const builder = spyOn(agent, "buildHistory").mockImplementation(async (messages) => {
 				for (const row of messages) seen.push({ id: row.id, parentToolUseId: row.parentToolUseId });
-				return { history: [], trailingToolResults: [] };
+				return { history: [] };
 			});
 			try {
 				// No destination passed: it is read from the session's run registration.

@@ -35,7 +35,7 @@ const adapter: ProviderAdapter = {
 			description: tool.description,
 			parameters: resolveToolJsonSchema(tool),
 		})),
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		requests.push(params);

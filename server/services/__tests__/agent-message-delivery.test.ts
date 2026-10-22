@@ -33,7 +33,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 const realAgent = { ...(await import("../../lib/agent")) };
 mock.module("../../lib/agent", () => ({
 	...realAgent,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 }));
 const { narratorService } = await import("../narrator-service");
 const { deliverInjection } = await import("../narrator-injection");

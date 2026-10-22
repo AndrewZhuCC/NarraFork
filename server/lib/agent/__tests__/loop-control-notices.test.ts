@@ -5,26 +5,38 @@
  * reminder lived only in the next turn's string, so a request rebuilt from the database
  * never said what the live one had. Both are now notice rows the host persists
  * (`deliverInjectionRow`), placed after the step's results; a host that cannot persist
- * (a reflection loop) still sends their text from memory.
+ * (a reflection loop) still sends their text, as the next turn's input.
+ *
+ * These loops have no rebuild, so each later request is the projection of the loop's
+ * own transcript: the rows the fake builder receives are exactly what the model reads.
  */
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import type { ChatParams, ProviderAdapter } from "../provider";
+import { isBrokenToolOutput, outputToText } from "@shared/agent-protocol/tool-output";
+import type { ChatParams, DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
 const TOOL = "LoopNoticeTool";
 
 let script: (request: number) => Array<Record<string, unknown>> = () => [{ text: "done" }];
-const requests: Array<Pick<ChatParams, "content" | "toolResults">> = [];
+const requests: Array<Pick<ChatParams, "content" | "toolResults"> & { rows: DbMessage[] }> = [];
+let projectedRows: DbMessage[] = [];
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => {
+		projectedRows = structuredClone(rows);
+		return { history: [] };
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
-		requests.push({ content: params.content, toolResults: structuredClone(params.toolResults) });
+		requests.push({
+			content: params.content,
+			toolResults: structuredClone(params.toolResults),
+			rows: projectedRows,
+		});
 		params.onRequestStart?.();
 		for (const event of script(requests.length - 1)) yield event;
 	},
@@ -77,15 +89,27 @@ function toolCall(request: number, input: Record<string, unknown>): Record<strin
 
 async function run(cfg: AgentConfig): Promise<AgentEvent[]> {
 	requests.length = 0;
+	projectedRows = [];
 	const events: AgentEvent[] = [];
 	for await (const event of agentLoop(cfg, "start", { rows: [] })) events.push(event);
 	return events;
 }
 
+/** Every settled call's stored output across the requests' rows. */
 function resultOutputs(): string[] {
 	return requests.flatMap((request) =>
-		(request.toolResults as Array<{ output: string }>).map((result) => result.output),
+		request.rows.flatMap((row) =>
+			(row.toolCalls ?? []).flatMap((call) =>
+				call.status === "success" || call.status === "fail" ? [outputToText(call.outputJson)] : [],
+			),
+		),
 	);
+}
+
+/** The text of the input a request ends with. */
+function trailingInput(rows: readonly DbMessage[]): string | null | undefined {
+	const last = rows.at(-1);
+	return last?.role === "user" ? last.contentText : undefined;
 }
 
 describe("turn nudge", () => {
@@ -113,8 +137,13 @@ describe("turn nudge", () => {
 		]);
 		expect(resultOutputs().some((output) => output.includes("wrap up"))).toBe(false);
 		// The next request carries it once, after that step's results.
-		expect(requests[9]?.content).toBe(nudges[0]?.content);
-		expect(requests[9]?.toolResults).toHaveLength(1);
+		const rows = requests[9]?.rows ?? [];
+		expect(requests[9]?.content).toBe("");
+		expect(trailingInput(rows)).toBe(nudges[0]?.content);
+		expect(rows.filter((row) => row.contentText?.includes("You have used"))).toHaveLength(1);
+		expect(rows.at(-2)?.toolCalls).toEqual([
+			expect.objectContaining({ toolUseId: "call-8", status: "success", outputJson: "ran:v8" }),
+		]);
 	});
 });
 
@@ -140,16 +169,19 @@ describe("broken call", () => {
 		expect(reminder?.content).toContain(
 			`Your previous ${TOOL} call(s) had invalid or missing input`,
 		);
-		// The broken pair is left out of the next request; the reminder says why.
-		expect(requests[1]?.toolResults).toEqual([]);
-		expect(requests[1]?.content).toBe(reminder?.content ?? "missing reminder");
+		// The broken pair is stored marked, so the projection leaves it out; the reminder
+		// says why, as the next request's input.
+		const rows = requests[1]?.rows ?? [];
+		const call = rows.flatMap((row) => row.toolCalls ?? []).find((c) => c.toolUseId === "call-0");
+		expect(isBrokenToolOutput(call?.outputJson)).toBe(true);
+		expect(trailingInput(rows)).toBe(reminder?.content ?? "missing reminder");
 	});
 
 	test("a host without a store still sends the reminder from memory", async () => {
 		script = (request) =>
 			request === 0 ? [toolCall(request, { _raw: '{"value":' })] : [{ text: "done" }];
 		await run(config());
-		expect(requests[1]?.content).toContain(
+		expect(trailingInput(requests[1]?.rows ?? [])).toContain(
 			`Your previous ${TOOL} call(s) had invalid or missing input`,
 		);
 	});

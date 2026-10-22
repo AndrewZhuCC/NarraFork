@@ -419,10 +419,7 @@ describe("subagent logical-run receipts", () => {
 			});
 			const agent = await import("../../lib/agent");
 			spyOn(agent, "buildHistory").mockResolvedValue({
-				history: [],
-				trailingToolResults: [
-					{ type: "tool_result", toolUseId: "denied-write", output: "written" },
-				],
+				history: [{ type: "tool_result", toolUseId: "denied-write", output: "written" }],
 			});
 			// The continuation after a successful retry is an ordinary run start; observe it.
 			const runModule = await import("../agent-runtime/run");

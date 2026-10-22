@@ -6,7 +6,6 @@ import { buildContextManagementHooks } from "../narrator-session";
 function prepared(): runtimeHistory.PreparedRuntimeHistory {
 	return {
 		history: [],
-		trailingToolResults: [],
 		sourceMessages: [],
 		modelMessages: [],
 		replayedInjectionMessageIds: [],
