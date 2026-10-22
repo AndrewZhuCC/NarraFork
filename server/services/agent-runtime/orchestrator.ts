@@ -106,6 +106,7 @@ import {
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
 import { freezeNarratorContextComposition } from "../narrator-context-composition";
+import { optionalToolDescription, reconcileEpoch } from "../narrator-epochs";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -192,6 +193,7 @@ import {
 import { clearAliasRegistry, clearTeamFileChanges } from "../narrator-subagent";
 import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
+import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { reviewService } from "../review-service";
@@ -448,6 +450,8 @@ export async function runAgentLoopUnlocked(
 		unregisterUpdateLoop();
 		throw error;
 	}
+	// One run, one `narrator_turns` row; envelopes written from here carry its id.
+	const turnId = startTurn(narratorId);
 
 	// One continuation decision for every session. Placement affects only the saved
 	// transcript and the explanation attached to the delivered result, never its budget.
@@ -873,7 +877,7 @@ export async function runAgentLoopUnlocked(
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, placement);
 			const historyDeadline = Date.now() + 10_000;
-			const rawMessages = await narratorService.getModelHistorySinceLastCompact(
+			let rawMessages = await narratorService.getModelHistorySinceLastCompact(
 				narratorId,
 				undefined,
 				{
@@ -1015,6 +1019,28 @@ export async function runAgentLoopUnlocked(
 			// rebuild request raised before it is satisfied by construction.
 			clearPlanModePromptRebuild(narratorId);
 
+			// What this request must carry before its history is built: a new epoch at a
+			// boundary, or notices for tool changes that bypassed `/load` (§7.7).
+			if (
+				await reconcileEpoch({
+					narratorId,
+					messages: rawMessages,
+					...toolLoadingInput(),
+					model: resolved.model,
+					provider: resolved.provider,
+					noticeText: (kind, toolName) =>
+						kind === "tool_loaded"
+							? getToolMessageWithParams("toolLoaded", locale, {
+									toolName,
+									toolDescription: optionalToolDescription(toolName, locale),
+								})
+							: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
+				})
+			)
+				rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+					signal: active.abortController.signal,
+					deadline: historyDeadline,
+				});
 			const historyOptions = {
 				narratorId,
 				model: resolved.model,
@@ -3467,6 +3493,16 @@ export async function runAgentLoopUnlocked(
 
 	const aborted =
 		runState.wasInterrupted || (abortedBeforeCleanup ?? active.abortController.signal.aborted);
+	endTurn(narratorId, turnId, {
+		status: aborted ? "interrupted" : runState.hadError ? "failed" : "completed",
+		stopReason: aborted
+			? "user_interrupt"
+			: runState.hadError
+				? "error"
+				: runState.hitMaxTurns
+					? "max_turns"
+					: "end_turn",
+	});
 	let finalText = runState.finalText;
 	if (runState.lastPass?.paymentRequired)
 		finalText = `Payment required: ${runState.lastPass.paymentRequired.message}`;

@@ -130,6 +130,7 @@ import { getAvailableOptionalToolIds } from "./command-service";
 import { compileDelegationCeiling } from "./custom-subagent-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
+import { newEnvelopeColumns, syncEnvelopeNow } from "./narrator-block-sync";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -3041,6 +3042,7 @@ export const narratorService = {
 									id: compactMsgId,
 									narratorId: id,
 									role: "system",
+									...newEnvelopeColumns(id),
 									contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
 									contextCharsJson: { segments: [] },
 									contentText: `[Compressed context from parent conversation]`,
@@ -3059,6 +3061,7 @@ export const narratorService = {
 									isCompact: 1,
 								})
 								.run();
+							syncEnvelopeNow(compactMsgId);
 						}
 
 						copyForkAccessAndRules(tx, parentNarratorId, id);

@@ -232,6 +232,14 @@
 			"prevId": "8b50bffe-308c-45db-9e1c-64c73f06c646",
 			"version": "7",
 			"snapshotDigest": "ec7d2682b1a4c006cfeb6c8997022f6a15972e0629ef5bdfe4b646b0d802ae90"
+		},
+		{
+			"idx": 29,
+			"tag": "0029_block_storage",
+			"id": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
+			"prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
+			"version": "7",
+			"snapshotDigest": "178a8dc056bd01e7dc5c5c8a44589feddfc3759d4933f09d6c7925106c8e2897"
 		}
 	]
 }

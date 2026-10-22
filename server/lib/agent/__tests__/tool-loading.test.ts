@@ -8,12 +8,15 @@ import {
 	DEFERRED_TOOL_PLACEHOLDER,
 	defaultToolLoadingModes,
 	deriveToolLoadingState,
+	epochRecordOf,
 	formatRequestTools,
+	latestToolLoadingEpoch,
 	projectToolLoadingHistory,
 	resolveToolLoadingStrategy,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 	toolLoadingChangeOf,
+	toolLoadingDrift,
 } from "../tool-loading";
 import type { ResolvedToolDefinition } from "../types";
 
@@ -352,7 +355,12 @@ async function request(
 	messages: DbMessage[],
 	current: string[],
 ) {
-	const state = deriveToolLoadingState(messages, MANAGED, current);
+	const state = deriveToolLoadingState(
+		messages,
+		MANAGED,
+		current,
+		latestToolLoadingEpoch(messages),
+	);
 	const projected = projectToolLoadingHistory(messages, state, strategy, resolveDefinition);
 	const built = await adapter.buildHistory(projected, model);
 	const tools = formatRequestTools(
@@ -559,6 +567,111 @@ describe("openai_additional_tools wire", () => {
 		// Rebuilt later, the item and notice keep their place: a growing prefix.
 		expect((later.body.input as unknown[]).slice(0, input.length)).toEqual(input);
 		expect(String(later.body.instructions ?? "")).not.toContain("additional_tools");
+	});
+});
+
+describe("epochs", () => {
+	function marker(toolNames: string[]): DbMessage {
+		return row("system", "", {
+			contentJson: [{ type: "epoch", epoch: { reason: "cold", target: "t", toolNames } }],
+			contentText: null,
+		});
+	}
+
+	test("an epoch is read from a marker row or a compact element", () => {
+		expect(epochRecordOf(marker(["Eval"]).contentJson as unknown[])).toBeUndefined();
+		expect(epochRecordOf((marker(["Eval"]).contentJson as unknown[])[0])).toEqual({
+			reason: "cold",
+			target: "t",
+			toolNames: ["Eval"],
+		});
+		expect(
+			epochRecordOf({
+				type: "compact",
+				status: "compacted",
+				summary: "s",
+				epoch: { reason: "compact", toolNames: ["Terminal"] },
+			}),
+		).toEqual({ reason: "compact", toolNames: ["Terminal"] });
+		// A compact from before epochs records nothing: its epoch is derived.
+		expect(epochRecordOf({ type: "compact", status: "compacted", summary: "s" })).toBeUndefined();
+	});
+
+	test("a frozen epoch fixes the array's share; loads before its marker are folded in", () => {
+		const opened = marker(["Eval"]);
+		const earlier = notice("tool_loaded", ["Eval"]);
+		const later = notice("tool_loaded", ["Terminal"]);
+		const messages = [
+			row("user", "a"),
+			earlier,
+			row("assistant", "b"),
+			opened,
+			row("user", "c"),
+			later,
+		];
+		const state = deriveToolLoadingState(
+			messages,
+			MANAGED,
+			["Eval", "Terminal"],
+			latestToolLoadingEpoch(messages),
+		);
+		expect(state).toMatchObject({ epochMarkerId: opened.id, loaded: ["Terminal"] });
+		expect([...state.base]).toEqual(["Eval"]);
+
+		const projected = projectToolLoadingHistory(
+			messages,
+			state,
+			"openai_additional_tools",
+			resolveDefinition,
+		);
+		// The earlier epoch's load is plain notice text now; Eval is in the array.
+		expect(projected[1]).toBe(earlier);
+		expect(toolLoadingChangeOf(projected[1])).toBeUndefined();
+		expect(toolLoadingChangeOf(projected[5])?.additions.map((addition) => addition.name)).toEqual([
+			"Terminal",
+		]);
+	});
+
+	test("drift is what the current set says that the epoch's notices do not", () => {
+		const messages = [marker(["Eval"]), notice("tool_unloaded", ["Eval"])];
+		const epoch = latestToolLoadingEpoch(messages);
+		const drifted = deriveToolLoadingState(messages, MANAGED, ["Terminal"], epoch);
+		expect(toolLoadingDrift(messages, drifted)).toEqual({ loads: ["Terminal"], unloads: [] });
+		const consistent = deriveToolLoadingState(messages, MANAGED, [], epoch);
+		expect(toolLoadingDrift(messages, consistent)).toEqual({ loads: [], unloads: [] });
+	});
+
+	test("the marker row never reaches the model", async () => {
+		captureFetch();
+		const provider = new AnthropicProvider({
+			id: "tool-loading-epoch",
+			name: "Tool loading",
+			prefix: "tl_epoch",
+			apiKey: "sk-test",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "claude-opus-5-5",
+			officialApi: false,
+		});
+		const model = "tl_epoch:claude-opus-5-5";
+		const first = row("user", "hello");
+		const reply = row("assistant", "hi");
+		const ask = row("user", "again");
+		const without = await request(
+			provider,
+			model,
+			"anthropic_tool_addition",
+			[first, reply, ask],
+			[],
+		);
+		const withMarker = await request(
+			provider,
+			model,
+			"anthropic_tool_addition",
+			[first, reply, marker([]), ask],
+			[],
+		);
+		expect(stripCache(withMarker.body.messages)).toEqual(stripCache(without.body.messages));
+		expect(withMarker.body.tools).toEqual(without.body.tools);
 	});
 });
 

@@ -57,6 +57,7 @@ import {
 	truncateToolIO,
 } from "./narrator-service";
 import { narratorStore } from "./narrator-store";
+import { recordTurnStep, recordTurnToolCall } from "./narrator-turns";
 import { recordOutputChunk } from "./output-stats";
 import { toolInputStreamSource } from "./tool-input-stream-source";
 
@@ -402,6 +403,11 @@ export interface EventHandlerContext {
 	 * of how blocks are stored.
 	 */
 	attemptBlockBaselines?: Map<string, number>;
+	/**
+	 * The provider request whose stream is being written (§3.6): the blocks it creates
+	 * carry it, and `attempt_discarded` drops exactly those.
+	 */
+	currentAttemptId?: string;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
 	pendingApiRequestIds?: string[];
 	/** Exact persisted tool-call row ids prepared for EnterPlanMode in this turn. */
@@ -705,6 +711,17 @@ function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 	return snap;
 }
 
+/** Write one item of the open step, stamped with the provider request writing it. */
+function writeAttemptItem(
+	ctx: EventHandlerContext,
+	messageId: string,
+	block: Parameters<typeof narratorStore.writeStepItem>[2],
+) {
+	return narratorStore.writeStepItem(messageId, ctx.narratorId, block, {
+		attemptId: ctx.currentAttemptId,
+	});
+}
+
 async function persistContentCheckpoint(
 	ctx: EventHandlerContext,
 	messageId: string,
@@ -713,6 +730,7 @@ async function persistContentCheckpoint(
 	try {
 		await narratorStore.writeStepItem(messageId, ctx.narratorId, block, {
 			republishUnchanged: !!block.id && ctx.unpublishedContentBlockIds?.has(block.id),
+			attemptId: ctx.currentAttemptId,
 		});
 		if (block.id) ctx.unpublishedContentBlockIds?.delete(block.id);
 	} catch (error) {
@@ -1302,7 +1320,12 @@ async function discardAttemptPersistedBlocks(
 	if (!partialId) return;
 
 	try {
-		const discarded = await narratorStore.discardAttempt(narratorId, partialId, baseline);
+		const discarded = await narratorStore.discardAttempt(
+			narratorId,
+			partialId,
+			baseline,
+			requestId,
+		);
 		if (!discarded) return;
 		partialId = discarded.messageId;
 		ctx.setPartialMessageId(partialId);
@@ -2068,14 +2091,14 @@ export async function processEvent(
 					});
 				}
 			} else if (block.type === "redacted_thinking") {
-				await narratorStore.writeStepItem(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "redacted_thinking",
 					data: block.data,
 					outputIndex: block.outputIndex,
 					signatureSource: block.signatureSource,
 				});
 			} else if (block.type === "tool_use") {
-				const toolCallId = await narratorStore.writeStepItem(partialId, narratorId, {
+				const toolCallId = await writeAttemptItem(ctx, partialId, {
 					type: "tool_use",
 					id: block.toolUseId,
 					name: block.name,
@@ -2101,11 +2124,12 @@ export async function processEvent(
 				ctx.toolExecutionReceipts ??= new Map();
 				ctx.toolExecutionReceipts.set(block.toolUseId, { messageId: partialId, binding });
 				event.onToolPersisted?.(binding);
+				recordTurnToolCall(narratorId);
 				if (block.name === "Write" && typeof block.input.content === "string") {
 					await handoffWriteInput(ctx, block.toolUseId, block.input.content, partialId, binding);
 				}
 			} else if (block.type === "web_search") {
-				await narratorStore.writeStepItem(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "web_search",
 					id: block.id,
 					query: block.query,
@@ -2139,7 +2163,7 @@ export async function processEvent(
 						});
 					}
 				}
-				await narratorStore.writeStepItem(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "image_generation",
 					id: block.id,
 					revisedPrompt: block.revisedPrompt,
@@ -3382,6 +3406,7 @@ export async function processEvent(
 		}
 
 		case "api_request_start": {
+			ctx.currentAttemptId = event.requestId;
 			// Counters and frozen classifications never carry across attempts.
 			ctx.setTokenUsage(undefined);
 			// This context is runtime state; durable checkpoints must use the same
@@ -3465,6 +3490,7 @@ export async function processEvent(
 			if (requestInfo) {
 				ctx.apiRequestsMap?.delete(event.requestId);
 				ctx.accountRequestTokenUsage?.(event.usage);
+				recordTurnStep(narratorId, ctx.model, event.usage);
 			}
 			const snapshot = boundedContextSnapshot(event.contextSnapshot);
 			if (snapshot) {

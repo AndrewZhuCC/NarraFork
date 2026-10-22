@@ -853,10 +853,20 @@ export class RevertHistoryCommitService {
 			} else {
 				const id = cowIds.get(message.id);
 				if (!id) throw fail("MANIFEST_INVALID", "COW has no allocated identity");
-				// Keep message role, historical narrator/actor and every other raw field.
-				// Ref ownership moves; historical authorship does NOT move to the fork owner.
+				// Keep message role, actor and every other raw field. The copy belongs to the
+				// ref's holder; its author stays the narrator that wrote it (§6.3).
 				messageProgram.push(
-					insert("narrator_messages", { ...original, ...patch, id }, MESSAGE_COLUMNS),
+					insert(
+						"narrator_messages",
+						{
+							...original,
+							...patch,
+							id,
+							narrator_id: message.narratorId,
+							author_narrator_id: original.author_narrator_id ?? original.narrator_id,
+						},
+						MESSAGE_COLUMNS,
+					),
 				);
 				const ref = refPatches.get(message.refId);
 				if (!ref) throw fail("MANIFEST_INVALID", "COW has no owner ref");

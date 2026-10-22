@@ -348,6 +348,7 @@ import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
+import { recoverBlockStorage } from "./narrator-block-sync";
 import {
 	cleanupBufferedTextFilesAsync,
 	enqueueBufferedMessage,
@@ -377,6 +378,7 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { narratorStore } from "./narrator-store";
+import { recoverInterruptedTurns } from "./narrator-turns";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
 import {
 	assertSnapshotRevertComplete,
@@ -7258,7 +7260,11 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 				return true;
 			});
 
-			if (hasContent) queueContextCharacterRefresh(narratorId, partialId);
+			if (hasContent) {
+				// The kept partial is a finished step whose incomplete items were interrupted.
+				narratorStore.sealStep(partialId);
+				queueContextCharacterRefresh(narratorId, partialId);
+			}
 			if (!hasContent) {
 				// Truly empty — safe to delete
 				await cleanupPartialMessage(partialId, narratorId);
@@ -7324,6 +7330,7 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 			}
 		});
 
+		narratorStore.sealStep(partialId);
 		queueContextCharacterRefresh(narratorId, partialId);
 		logger.info("Finalized partial message with executed tool calls", {
 			narratorId,
@@ -8553,6 +8560,16 @@ export async function recoverOnStartup(
 	// become failed audit entries; only legacy placeholders with no attempt/retry
 	// history are removed.
 	await recoverStaleCompactingMessages();
+	const interruptedBlocks = recoverBlockStorage();
+	if (interruptedBlocks)
+		logger.info("Interrupted streaming blocks marked aborted on startup", {
+			count: interruptedBlocks,
+		});
+	const interruptedTurns = recoverInterruptedTurns();
+	if (interruptedTurns)
+		logger.info("Runs cut off by the previous process marked interrupted", {
+			count: interruptedTurns,
+		});
 
 	const transientCompactRows = await db.query.narrators.findMany({
 		columns: { id: true, substatus: true },

@@ -36,6 +36,7 @@ export interface StartedRun {
 	publication?: PublicationRun;
 }
 
+import { newEnvelopeColumns } from "../narrator-block-sync";
 import {
 	claimNextRefSeq,
 	NARRATOR_REF_SEQ_EMPTY_TOP,
@@ -348,6 +349,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				id: messageId,
 				narratorId,
 				role: "disp",
+				...newEnvelopeColumns(narratorId),
 				contextCharsJson: { segments: [] },
 				origin: "system",
 				contentText: storedText,
@@ -718,6 +720,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 							id: messageId,
 							narratorId: recipientId,
 							role: "disp",
+							...newEnvelopeColumns(recipientId),
 							contextCharsJson: { segments: [] },
 							origin: "system",
 							contentText: text,

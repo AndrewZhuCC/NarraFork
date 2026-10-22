@@ -4,7 +4,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
-import { renderModelHistoryRevisionSql } from "../services/agent-runtime/model-history-revision-sql";
+import {
+	renderModelHistoryRevisionSql,
+	renderModelHistoryRevisionSqlV1,
+} from "../services/agent-runtime/model-history-revision-sql";
 import {
 	applyPendingMigrationsByHash,
 	repairMissingSpecTables,
@@ -1416,7 +1419,26 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 				.all() as Array<{ name: string; sql: string }>
 		).map(({ name, sql }) => ({ name, sql: sql.trim().replace(/;$/, "").trimEnd() }));
 	}
-	const canonicalTriggers = renderModelHistoryRevisionSql("sqlite")
+	/** Every model-history trigger, any contract version (a fully migrated database is v2). */
+	function installedTriggerSql(database: Database): Array<{ name: string; sql: string }> {
+		return (
+			database
+				.prepare(
+					"SELECT name, sql FROM sqlite_schema WHERE type='trigger' AND name GLOB 'model_history_v*' ORDER BY name LIMIT 32",
+				)
+				.all() as Array<{ name: string; sql: string }>
+		).map(({ name, sql }) => ({ name, sql: sql.trim().replace(/;$/, "").trimEnd() }));
+	}
+	const currentCanonicalTriggers = renderModelHistoryRevisionSql("sqlite")
+		.split("--> statement-breakpoint")
+		.filter((statement) => statement.trim().startsWith("CREATE TRIGGER"))
+		.map((statement) => {
+			const match = /^CREATE TRIGGER (\w+)/.exec(statement.trim());
+			if (!match) throw new Error("Invalid canonical SQLite trigger in migration fixture");
+			return { name: match[1], sql: statement.trim().replace(/;$/, "").trimEnd() };
+		})
+		.sort((a, b) => a.name.localeCompare(b.name));
+	const canonicalTriggers = renderModelHistoryRevisionSqlV1("sqlite")
 		.split("--> statement-breakpoint")
 		.filter((statement) => statement.trim().startsWith("CREATE TRIGGER"))
 		.map((statement) => {
@@ -1534,7 +1556,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 				(table) => [table, foreignKeys(table)],
 			),
 		);
-		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		expect(installedTriggerSql(sqlite)).toEqual(currentCanonicalTriggers);
 		// Worst case for a source-built machine: not a single recorded hash matches the
 		// released files, so every migration is replayed against its own end state.
 		sqlite.run("DELETE FROM __drizzle_migrations");
@@ -1549,7 +1571,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			realHashes,
 		);
 		expect(stableHistory()).toEqual(historyBefore);
-		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		expect(installedTriggerSql(sqlite)).toEqual(currentCanonicalTriggers);
 		for (const [table, constraints] of foreignKeysBefore) {
 			expect(foreignKeys(table)).toEqual(expect.arrayContaining(constraints));
 		}

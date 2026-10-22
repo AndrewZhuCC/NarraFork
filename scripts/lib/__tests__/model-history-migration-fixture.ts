@@ -88,3 +88,51 @@ export function modelHistorySnapshots() {
 		.join("\n");
 	return { before, after, previousDDL };
 }
+
+/** The v1 `after` snapshot plus what the v2 (block storage) contract reads. */
+export function modelHistoryBlockSnapshot(): ResourceMigrationSnapshot {
+	const snapshot = structuredClone(modelHistorySnapshots().after);
+	const column = (name: string, type: "text" | "integer", extra: Record<string, unknown> = {}) => ({
+		name,
+		type,
+		...extra,
+	});
+	snapshot.tables.narrator_messages.columns.body_format = column("body_format", "integer", {
+		notNull: true,
+		default: 1,
+	});
+	snapshot.tables.narrator_messages.columns.author_narrator_id = column(
+		"author_narrator_id",
+		"text",
+	);
+	snapshot.tables.narrator_tool_calls.columns.block_id = column("block_id", "text");
+	snapshot.tables.narrator_tool_calls.columns.is_internal = column("is_internal", "integer", {
+		notNull: true,
+		default: 0,
+	});
+	snapshot.tables.narrator_block_sync_queue = {
+		columns: { message_id: column("message_id", "text", { primaryKey: true }) },
+		foreignKeys: {},
+	};
+	snapshot.tables.narrator_blocks = {
+		columns: Object.fromEntries(
+			[
+				["id", "text", { primaryKey: true }],
+				["message_id", "text", { notNull: true }],
+				["ordinal", "integer", { notNull: true }],
+				["kind", "text", { notNull: true }],
+				["subtype", "text", {}],
+				["phase", "text", { notNull: true }],
+				["model_text", "text", {}],
+				["payload", "text", { notNull: true }],
+				["state", "text", {}],
+				["provider_meta", "text", {}],
+			].map(([name, type, extra]) => [
+				name as string,
+				column(name as string, type as "text" | "integer", extra as Record<string, unknown>),
+			]),
+		),
+		foreignKeys: {},
+	};
+	return snapshot;
+}
