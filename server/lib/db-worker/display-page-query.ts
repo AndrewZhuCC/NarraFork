@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { blockBodies, bodyBytesSql, bodySql } from "../narrator-bodies";
 import {
 	DisplayJsonAllocationBudget,
 	storedDisplayAllocationBudget,
@@ -72,22 +73,30 @@ export const DISPLAY_TOOL_COLUMNS = columns(
 const CREATOR_COLUMNS = columns("id username avatarColor avatarImageId", "");
 type Limits = typeof DISPLAY_PAGE_LIMITS | typeof DISPLAY_FIXTURE_LIMITS;
 
-function selection(alias: string, descriptors: readonly DisplayColumn[]): string {
+function selection(
+	alias: string,
+	descriptors: readonly DisplayColumn[],
+	fromBlocks = false,
+): string {
 	return descriptors
-		.map(
-			({ column, field }) =>
-				`${field === "hasComposerDocument" ? `(${alias}."${column}" IS NOT NULL)` : `${alias}."${column}"`} AS "${field}"`,
-		)
+		.map(({ column, field }) => {
+			if (field === "contentJson" && fromBlocks) return `${bodySql(alias, true)} AS "${field}"`;
+			return `${field === "hasComposerDocument" ? `(${alias}."${column}" IS NOT NULL)` : `${alias}."${column}"`} AS "${field}"`;
+		})
 		.join(", ");
 }
 
-function storedBytes(alias: string, descriptors: readonly DisplayColumn[]): string {
+function storedBytes(
+	alias: string,
+	descriptors: readonly DisplayColumn[],
+	fromBlocks = false,
+): string {
 	return descriptors
-		.map(({ column, field }) =>
-			field === "hasComposerDocument"
-				? "1"
-				: `coalesce(length(CAST(${alias}."${column}" AS BLOB)), 0)`,
-		)
+		.map(({ column, field }) => {
+			if (field === "hasComposerDocument") return "1";
+			if (field === "contentJson" && fromBlocks) return `coalesce(${bodyBytesSql(alias, true)}, 0)`;
+			return `coalesce(length(CAST(${alias}."${column}" AS BLOB)), 0)`;
+		})
 		.join(" + ");
 }
 
@@ -141,6 +150,7 @@ export function runDisplayPageQuery(
 ): DisplayPageMessagesResult {
 	validateDisplayPageRequest(input, limits);
 	const deadlineAt = Math.min(input.deadlineAt, Date.now() + limits.timeoutMs);
+	const fromBlocks = input.bodiesFromBlocks === true;
 	const maxRawBytes = Math.min(input.maxRawBytes ?? limits.maxRawBytes, limits.maxRawBytes);
 	const checkDeadline = () => {
 		if (Date.now() >= deadlineAt)
@@ -190,7 +200,7 @@ export function runDisplayPageQuery(
 		// All raw fields (including originalContentJson and small scalars) are charged,
 		// and only the four PUBLIC creator fields are ever read from users.
 		queryRows<{ bytes: number }>(
-			`SELECT (${storedBytes("m", DISPLAY_MESSAGE_COLUMNS)} + ${storedBytes("u", CREATOR_COLUMNS)}) AS bytes
+			`SELECT (${storedBytes("m", DISPLAY_MESSAGE_COLUMNS, fromBlocks)} + ${storedBytes("u", CREATOR_COLUMNS)}) AS bytes
 			FROM narrator_messages m LEFT JOIN users u ON u.id = m.created_by
 			WHERE ${messageWhere} LIMIT ${limits.maxInputIds + 1}`,
 			(row) => {
@@ -233,8 +243,10 @@ export function runDisplayPageQuery(
 		);
 
 		const byId = new Map<string, NarratorDisplayMessage>();
+		// A NULL body (content_json is NOT NULL) is a block-format envelope's: assembled below.
+		const blockBodied: string[] = [];
 		queryRows<Record<string, unknown>>(
-			`SELECT ${selection("m", DISPLAY_MESSAGE_COLUMNS)},
+			`SELECT ${selection("m", DISPLAY_MESSAGE_COLUMNS, fromBlocks)},
 			u.id AS _creatorId, u.username AS _creatorUsername,
 			u.avatar_color AS _creatorAvatarColor, u.avatar_image_id AS _creatorAvatarImageId
 			FROM narrator_messages m LEFT JOIN users u ON u.id = m.created_by
@@ -260,9 +272,22 @@ export function runDisplayPageQuery(
 									avatarImageId: row._creatorAvatarImageId as string | null,
 								},
 				};
-				byId.set(message.id, projectNarratorDisplayMessage(message, input.ioBudget));
+				if (fromBlocks && message.contentJson === null) blockBodied.push(message.id);
+				byId.set(message.id, message);
 			},
 		);
+		if (blockBodied.length) {
+			const bodies = blockBodies(sqlite, blockBodied, (stored) => {
+				checkDeadline();
+				allocation.reserveJson(stored);
+			});
+			for (const id of blockBodied) {
+				const message = byId.get(id);
+				if (message) message.contentJson = bodies.get(id) ?? [];
+			}
+		}
+		for (const [id, message] of byId)
+			byId.set(id, projectNarratorDisplayMessage(message, input.ioBudget));
 		queryRows<Record<string, unknown>>(
 			`SELECT ${selection("tc", DISPLAY_TOOL_COLUMNS)} FROM narrator_tool_calls tc
 			WHERE ${latestWhere} ORDER BY tc.created_at, tc.id LIMIT ${limits.maxRows}`,

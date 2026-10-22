@@ -32,6 +32,7 @@ import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
 import { syncEnvelopeNow } from "./narrator-block-sync";
 
 export type BlockJob = "convert" | "verify";
@@ -290,7 +291,8 @@ export async function runBlockJobSlice(reader: SliceReader = workerReader): Prom
 	if (!hasSchema()) return false;
 	const convert = jobState("convert");
 	if (!convert.complete) {
-		if (convert.paused) return false;
+		// Block writes off is the rollback switch: no envelope becomes block-format.
+		if (convert.paused || !settings.narratorBlocks.write) return false;
 		await convertSlice(reader);
 		return true;
 	}
@@ -300,9 +302,33 @@ export async function runBlockJobSlice(reader: SliceReader = workerReader): Prom
 	return true;
 }
 
+/**
+ * Legacy envelopes can appear after convert finished: written while block writes were off,
+ * or imported. Send the job back to the first one it can convert; the ones it could not
+ * read stay legacy for good and do not count.
+ */
+export function rearmBlockConvert(): void {
+	if (!jobState("convert").complete) return;
+	const first = database.sqlite
+		.prepare(
+			`SELECT min(m.rowid) AS rowid FROM narrator_messages m INDEXED BY idx_messages_legacy_body
+			 WHERE m.body_format = 1 AND NOT EXISTS (
+				SELECT 1 FROM narrator_block_diagnostics d
+				WHERE d.message_id = m.id AND d.kind = 'undecodable')`,
+		)
+		.get() as { rowid: number | null };
+	if (first.rowid === null) return;
+	database.sqlite
+		.prepare(
+			"UPDATE narrator_block_backfill SET cursor = ?, complete = 0, updated_at = ? WHERE job = 'convert'",
+		)
+		.run(first.rowid - 1, new Date().toISOString());
+}
+
 /** Start the jobs in the background, if they have work; a no-op while they already run. */
 export function startBlockBackfill(): void {
 	if (state.running || !hasSchema()) return;
+	rearmBlockConvert();
 	state.running = true;
 	const next = () => {
 		runBlockJobSlice()

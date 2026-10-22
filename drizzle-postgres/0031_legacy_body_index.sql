@@ -1,0 +1,1 @@
+CREATE INDEX "idx_messages_legacy_body" ON "narrator_messages" USING btree ("body_format") WHERE "body_format" = 1;

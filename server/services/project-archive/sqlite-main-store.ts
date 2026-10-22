@@ -50,7 +50,7 @@
  * forked chapters or narrators. The PostgreSQL main store uses the same two phases,
  * which is what makes the conflict policy's semantics identical across backends.
  */
-import { db } from "@server/db";
+import { activeDatabaseBackend, db, sqlite } from "@server/db";
 import {
 	chapterCommits,
 	chapterEdges,
@@ -64,6 +64,8 @@ import {
 	narratorToolCalls,
 	projects,
 } from "@server/db/schema";
+import { blockBodies, bodySql } from "@server/lib/narrator-bodies";
+import { settings } from "@server/lib/settings";
 import { type Column, getTableColumns, getTableName, type SQL, sql, type Table } from "drizzle-orm";
 /**
  * Flatten one main-database value to something the portable file can hold, and the
@@ -271,6 +273,27 @@ function importRowsAtomically(tx: DbTransaction, request: ImportRowsRequest): Im
 	return { applied };
 }
 
+/**
+ * Whether `narrator_messages.content_json` is assembled from block rows on export
+ * (docs/BLOCK_STORAGE-DESIGN.md §10.5): the archive keeps its column, filled with the
+ * array the rows assemble to. SQLite only, the one backend that writes blocks.
+ */
+function archiveBodiesFromBlocks(): boolean {
+	return settings.narratorBlocks.read && activeDatabaseBackend === "sqlite";
+}
+
+/** Fill the `content_json` that `bodySql` left out with the array its block rows assemble to. */
+function assembleContentJson(page: Record<string, unknown>[]): void {
+	const assembled = blockBodies(
+		sqlite,
+		page.filter((row) => row.content_json === null).map((row) => String(row.id)),
+	);
+	for (const row of page) {
+		if (row.content_json === null)
+			row.content_json = JSON.stringify(assembled.get(String(row.id)) ?? []);
+	}
+}
+
 export const sqliteProjectArchiveMainStore: ProjectArchiveMainStore = {
 	async supportedColumns(table: string): Promise<readonly string[]> {
 		if (!isArchiveTable(table)) return [];
@@ -308,8 +331,13 @@ export const sqliteProjectArchiveMainStore: ProjectArchiveMainStore = {
 		}
 
 		const target = sql.identifier(getTableName(MAIN_TABLES[table]));
+		const assembleBodies = table === "narrator_messages" && archiveBodiesFromBlocks();
 		const selection = sql.join(
-			columns.map((column) => sql.identifier(column.name)),
+			columns.map((column) =>
+				assembleBodies && column.name === "content_json"
+					? sql`${sql.raw(bodySql("narrator_messages", true))} AS ${sql.identifier(column.name)}`
+					: sql.identifier(column.name),
+			),
 			sql`, `,
 		);
 		const where =
@@ -323,6 +351,7 @@ export const sqliteProjectArchiveMainStore: ProjectArchiveMainStore = {
 		const raw = db.all(statement) as Record<string, unknown>[];
 		const hasMore = raw.length > limit;
 		const page = hasMore ? raw.slice(0, limit) : raw;
+		if (assembleBodies) assembleContentJson(page);
 		const rows: ArchiveRow[] = page.map((source) => {
 			const row: Record<string, ArchiveValue> = {};
 			for (const column of columns) row[column.name] = toArchiveValue(source[column.name]);

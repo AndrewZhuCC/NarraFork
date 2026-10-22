@@ -895,6 +895,12 @@ export interface NarraForkSettings {
 		 * format; envelopes already stored as blocks keep being maintained as blocks.
 		 */
 		write: boolean;
+		/**
+		 * Whether readers (model history, display pages, External API, exports) read a
+		 * block-format envelope's body from its block rows. Off: everything reads
+		 * `content_json`, which holds the same content while both are written.
+		 */
+		read: boolean;
 	};
 	containers: {
 		portRangeStart: number;

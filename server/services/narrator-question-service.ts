@@ -68,6 +68,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { assertRuntimeCanAskQuestion, type RuntimePolicy } from "./agent-runtime/policy";
 import { coerceAskQuestions } from "./ask-user-question-coerce";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
+import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
 
 /** One question as the tool defined it. Header + description only. */
@@ -767,6 +768,19 @@ export async function getBoundedQuestionDetail(
 	return { ...detail, ...events };
 }
 
+/**
+ * A receipt's supplement, from its block's payload when its rows are current (block reads
+ * on), else from content_json; either way size-capped before any JSON is parsed.
+ */
+function receiptSupplementSql() {
+	const expression = storedElementsSql(
+		"narrator_messages",
+		(json, root) =>
+			`case when length(cast(${json} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${json}, '${root}[0].body.supplement'), json_extract(${json}, '${root}[1].body.supplement'), '') else null end`,
+	);
+	return sql<string | null>`${sql.raw(expression)}`;
+}
+
 /** Event payloads are bounded in SQL, before fetching or parsing legacy JSON. */
 export async function listQuestionEvents(
 	id: string,
@@ -789,9 +803,11 @@ export async function listQuestionEvents(
 			>`case when length(cast(${narratorQuestionEvents.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestionEvents.resolutionJson} else null end`,
 			kind: narratorQuestionEvents.kind,
 			createdAt: narratorQuestionEvents.createdAt,
-			text: sql<
-				string | null
-			>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
+			text: blockReadsEnabled()
+				? receiptSupplementSql()
+				: sql<
+						string | null
+					>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
 			actor: narratorMessages.createdBy,
 		})
 		.from(narratorQuestionEvents)
