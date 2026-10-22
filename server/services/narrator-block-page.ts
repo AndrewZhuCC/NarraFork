@@ -45,7 +45,12 @@ export interface BlockDTO {
 }
 
 /** A message row without its body: the body is its blocks, named in order. */
-export type EnvelopeDTO = Record<string, unknown> & { id: string; blockIds: string[] };
+export type EnvelopeDTO = Record<string, unknown> & {
+	id: string;
+	blockIds: string[];
+	/** The row it was nested under in v1 (`children`); null for a row at the top. */
+	parentMessageId: string | null;
+};
 
 interface RowLayout {
 	id: string;
@@ -167,31 +172,40 @@ function blocksOf(message: MessageRow, rows: RowLayout[] | undefined): BlockDTO[
 }
 
 /** The rows in the order v2 lists them: each row, then the rows nested under it. */
-function flatten(messages: readonly MessageRow[], into: MessageRow[] = []): MessageRow[] {
+function flatten(
+	messages: readonly MessageRow[],
+	parentMessageId: string | null = null,
+	into: Array<{ row: MessageRow; parentMessageId: string | null }> = [],
+): Array<{ row: MessageRow; parentMessageId: string | null }> {
 	for (const message of messages) {
-		into.push(message);
-		if (Array.isArray(message.children)) flatten(message.children, into);
+		into.push({ row: message, parentMessageId });
+		if (Array.isArray(message.children)) flatten(message.children, message.id, into);
 	}
 	return into;
 }
 
 /**
  * v1 message rows (with nested `children`, as a page has them) as v2 envelopes and
- * blocks. Rows keep every field but their body and nesting; a child row already names
- * the tool call it belongs to (`parentToolUseId`).
+ * blocks. Rows keep every field but their body and nesting; an envelope names the row it
+ * was nested under (`parentMessageId`), so a client can rebuild the v1 tree exactly.
  */
 export function toEnvelopes(messages: readonly MessageRow[]): {
 	messages: EnvelopeDTO[];
 	blocks: BlockDTO[];
 } {
 	const rows = flatten(messages);
-	const layouts = blockLayouts(rows.map((row) => row.id));
+	const layouts = blockLayouts(rows.map(({ row }) => row.id));
 	const envelopes: EnvelopeDTO[] = [];
 	const blocks: BlockDTO[] = [];
-	for (const row of rows) {
+	for (const { row, parentMessageId } of rows) {
 		const { contentJson: _body, children: _children, ...envelope } = row;
 		const own = blocksOf(row, layouts.get(row.id));
-		envelopes.push({ ...envelope, id: row.id, blockIds: own.map((block) => block.id) });
+		envelopes.push({
+			...envelope,
+			id: row.id,
+			blockIds: own.map((block) => block.id),
+			parentMessageId,
+		});
 		blocks.push(...own);
 	}
 	return { messages: envelopes, blocks };

@@ -161,19 +161,23 @@ export function toBlockSnapshot<T extends Frame>(snapshot: T): T & { protocol: 2
 	};
 }
 
-/** A v1 catch-up frame in protocol v2: its rows, children included, as envelopes + blocks. */
+/**
+ * A v1 catch-up frame in protocol v2: its rows, children included, as envelopes + blocks.
+ * `orphanMessageIds` names the rows v1 sent as `orphanChildren` (children whose parent row
+ * is not in this catch-up); every other row without a parent was in `topLevel`.
+ */
 export function toBlockCatchUp(frame: Frame): Frame {
-	const rows = [
-		...(Array.isArray(frame.topLevel) ? frame.topLevel : []),
-		...(Array.isArray(frame.orphanChildren) ? frame.orphanChildren : []),
-	] as Array<Record<string, unknown> & { id: string }>;
+	type Row = Record<string, unknown> & { id: string };
+	const topLevel = (Array.isArray(frame.topLevel) ? frame.topLevel : []) as Row[];
+	const orphans = (Array.isArray(frame.orphanChildren) ? frame.orphanChildren : []) as Row[];
 	const { topLevel: _top, orphanChildren: _orphans, ...rest } = frame;
 	return {
 		...(rest as Omit<Frame, "type">),
 		type: "catch_up",
 		narratorId: frame.narratorId as string,
 		protocol: 2,
-		...toEnvelopes(rows),
+		...toEnvelopes([...topLevel, ...orphans]),
+		orphanMessageIds: orphans.map((row) => row.id),
 		subagentActivities: Array.isArray(frame.subagentActivities) ? frame.subagentActivities : [],
 	};
 }

@@ -25,6 +25,7 @@ import type { RequestRecordingDetail, SavedRecording } from "@shared/request-rec
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import { decodeBlockPage } from "../block-protocol";
 import { narratorLoadingMetrics } from "../narrator-loading-metrics";
 import { createSharedInflight, type SharedReadOptions } from "../shared-inflight";
 import type { GitIdentity } from "./auth";
@@ -982,15 +983,13 @@ export const narratorsApi = {
 		if (opts?.beforeSeq != null) params.set("beforeSeq", String(opts.beforeSeq));
 		if (opts?.limit != null) params.set("limit", String(opts.limit));
 		if (opts?.messageVersion != null) params.set("messageVersion", String(opts.messageVersion));
-		const qs = params.toString();
-		return request<PretextDocumentPageResult>(
-			`/narrators/${id}/pretext-document${qs ? `?${qs}` : ""}`,
-			{
-				signal: opts?.signal,
-				maxResponseBytes: opts?.maxResponseBytes,
-				onResponseBytes: opts?.onResponseBytes,
-			},
-		);
+		// Block-keyed pages when the server offers them (§8.1), decoded back to v1 rows.
+		params.set("protocol", "2");
+		return request<PretextDocumentPageResult>(`/narrators/${id}/pretext-document?${params}`, {
+			signal: opts?.signal,
+			maxResponseBytes: opts?.maxResponseBytes,
+			onResponseBytes: opts?.onResponseBytes,
+		}).then(decodeBlockPage);
 	},
 	// Resolve a message id to its top-level seq coordinate (jump-to-message).
 	getMessageLocation: (id: string, messageId: string, signal?: AbortSignal) =>

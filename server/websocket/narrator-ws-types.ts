@@ -867,6 +867,8 @@ export type NarratorServerMessage =
 			protocol: 2;
 			messages: unknown[];
 			blocks: unknown[];
+			/** Rows sent as v1 `orphanChildren`: children whose parent row is not included. */
+			orphanMessageIds: string[];
 			subagentActivities: unknown[];
 			cursor?: CatchUpCursor;
 			messageVersion?: number;
