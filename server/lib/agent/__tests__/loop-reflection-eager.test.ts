@@ -38,9 +38,6 @@ const testProvider: ProviderAdapter = {
 		}
 		throw new Error("Aborted");
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -109,7 +106,7 @@ async function runUntilAbortMidStream(): Promise<AgentEvent[]> {
 	const normalStarted = new Promise<void>((resolve) => {
 		onNormalStarted = resolve;
 	});
-	for await (const event of agentLoop(makeConfig(ac.signal), "decide", [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal), "decide", { rows: [] })) {
 		events.push(event);
 		// Abort while the provider stream is still open (trailing text just arrived),
 		// mirroring the reflection abort race that produced spurious "Aborted" records.

@@ -131,9 +131,6 @@ const provider: ProviderAdapter = {
 		}
 		await bounded(releaseProvider.promise);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -307,9 +304,9 @@ describe("real loop content publication before tools", () => {
 				const events: AgentEvent[] = [];
 				let messageId: string | undefined;
 				const running = executeAgentLoop(
-					{ config, userText: "Inspect then report", history: [], eventContext: ctx },
+					{ config, userText: "Inspect then report", history: { rows: [] }, eventContext: ctx },
 					{
-						eventSource: agentLoop(config, "Inspect then report", []),
+						eventSource: agentLoop(config, "Inspect then report", { rows: [] }),
 						processEventFn: async (event, context, hooks) => {
 							const result = await processEvent(event, context, hooks);
 							events.push(event);
@@ -425,7 +422,7 @@ describe("real loop content publication before tools", () => {
 				executeAgentLoop({
 					config: makeConfig(ctx),
 					userText: "Fail closed",
-					history: [],
+					history: { rows: [] },
 					eventContext: ctx,
 				}),
 			).rejects.toBeInstanceOf(CriticalEventPersistenceError);

@@ -60,40 +60,6 @@ const testProvider: ProviderAdapter = {
 		}
 		yield { text: "done" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({
-		type: "tool_result",
-		tool_use_id: toolUseId,
-		content: output,
-		is_error: isError,
-	}),
-	pushUserTurn: (h, content, _model, toolResults) => {
-		const target = h as Array<Record<string, unknown>>;
-		const results = toolResults as Array<Record<string, unknown>>;
-		historyToolResultIdsPerTurn.push(
-			results.map((tr) => String((tr as { tool_use_id?: string }).tool_use_id)),
-		);
-		target.push({
-			role: "user",
-			content: [...results, ...(content ? [{ type: "text", text: content }] : [])],
-		});
-	},
-	pushAssistantTurn: (h, text, toolUses) => {
-		const target = h as Array<Record<string, unknown>>;
-		const uses = toolUses as AgentToolUse[];
-		historyToolUseIdsPerTurn.push(uses.map((tu) => tu.toolUseId));
-		target.push({
-			role: "assistant",
-			content: [
-				...(text ? [{ type: "text", text }] : []),
-				...uses.map((tu) => ({
-					type: "tool_use",
-					id: tu.toolUseId,
-					name: tu.name,
-					input: tu.input,
-				})),
-			],
-		});
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

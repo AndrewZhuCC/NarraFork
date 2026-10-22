@@ -79,9 +79,6 @@ const provider: ProviderAdapter = {
 		yield { text: "stream is still open" };
 		streaming = false;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -170,7 +167,7 @@ function config(context: WorkspaceContext): AgentConfig {
 }
 async function run(conf: AgentConfig) {
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(conf, "switch then write", [])) events.push(event);
+	for await (const event of agentLoop(conf, "switch then write", { rows: [] })) events.push(event);
 	return events;
 }
 

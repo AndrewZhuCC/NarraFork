@@ -310,16 +310,6 @@ const testProvider: ProviderAdapter = {
 		}
 		throw new Error("Aborted");
 	},
-	formatToolResult: (toolUseId, output, isError) => {
-		formattedToolResultOrder.push(toolUseId);
-		return { toolUseId, output, isError };
-	},
-	pushUserTurn: () => {},
-	pushAssistantTurn: (_history, _text, toolUses) => {
-		if (providerScenario === "interleaved_tool_chunk_order" && toolUses.length > 0) {
-			assistantToolUseOrders.push(toolUses.map((toolUse) => toolUse.toolUseId));
-		}
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -462,7 +452,7 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "run tools then answer", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "run tools then answer", { rows: [] })) {
 			events.push(event);
 			if (event.type === "stream_text") {
 				expect(executedToolValues).toEqual(["serial:one", "serial:two"]);
@@ -490,7 +480,7 @@ describe("agentLoop abort result draining", () => {
 		const startedAt = Date.now();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "interrupt pending tool", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "interrupt pending tool", { rows: [] })) {
 			events.push(event);
 			if (event.type === "stream_text") ac.abort();
 		}
@@ -514,7 +504,7 @@ describe("agentLoop abort result draining", () => {
 				shouldStop: () => true,
 			}),
 			"stop after first tool",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -546,7 +536,7 @@ describe("agentLoop abort result draining", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { shouldStop: () => ++asks > 1 }),
 			"finish tools that already started",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -586,7 +576,7 @@ describe("agentLoop abort result draining", () => {
 				},
 			}),
 			"stop before the next provider turn",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -609,7 +599,7 @@ describe("agentLoop abort result draining", () => {
 				shouldStop: () => true,
 			}),
 			"finish parallel reads then stop",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -653,7 +643,7 @@ describe("agentLoop abort result draining", () => {
 				shouldStop: () => stopRequested,
 			}),
 			"stop without running an unstarted edit",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -697,7 +687,7 @@ describe("agentLoop abort result draining", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel reads",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -724,7 +714,7 @@ describe("agentLoop abort result draining", () => {
 		// installed their resolvers, without blocking the event consumer itself.
 		const releaseReads = parallelToolsStarted.promise.then(releaseParallelAbortTools);
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "abort between tool groups", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "abort between tool groups", { rows: [] })) {
 			events.push(event);
 			if (
 				event.type === "tool_result" &&
@@ -808,7 +798,7 @@ describe("agentLoop abort result draining", () => {
 							},
 						}),
 						"parallel preflight completes out of order",
-						[],
+						{ rows: [] },
 					)) {
 						events.push(event);
 						if (event.type !== "tool_result" || event.toolUseId !== secondId) continue;
@@ -866,7 +856,7 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "run interleaved tools", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "run interleaved tools", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -914,7 +904,7 @@ describe("agentLoop abort result draining", () => {
 				},
 			}),
 			"enter plan mode",
-			[],
+			{ rows: [] },
 		)) {
 			if (event.type === "assistant_message") order.push("assistant_message");
 		}
@@ -946,7 +936,7 @@ describe("agentLoop abort result draining", () => {
 				},
 			}),
 			"run tools while planning",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 			if (event.type === "stream_text") {
@@ -987,7 +977,7 @@ describe("agentLoop abort result draining", () => {
 				},
 			}),
 			"run tools while planning",
-			[],
+			{ rows: [] },
 		)) {
 			// drain
 		}
@@ -1005,7 +995,7 @@ describe("agentLoop abort result draining", () => {
 		let streamedText = "";
 		const startsField: Array<boolean | undefined> = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", { rows: [] })) {
 			if (event.type === "tool_use_chunk" && event.streamingField?.delta) {
 				startsField.push(event.streamingField.startsField);
 				streamedText += event.streamingField.delta;
@@ -1086,7 +1076,7 @@ describe("agentLoop abort result draining", () => {
 				for await (const event of agentLoop(
 					makeConfig(new AbortController().signal),
 					"stream tool arguments",
-					[],
+					{ rows: [] },
 				)) {
 					if (event.type !== "tool_use_chunk" || !event.streamingField) continue;
 					deltas.push(event.streamingField);
@@ -1168,7 +1158,7 @@ describe("agentLoop abort result draining", () => {
 				for await (const event of agentLoop(
 					makeConfig(new AbortController().signal),
 					"stream complete tool",
-					[],
+					{ rows: [] },
 				)) {
 					events.push(event);
 					if (event.type === "tool_call") break;
@@ -1219,7 +1209,7 @@ describe("agentLoop abort result draining", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { maxTransientRetries: 2 }),
 			"run tools then truncate",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -1253,7 +1243,7 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "answer then quota", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "answer then quota", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -1299,7 +1289,7 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "tool then quota", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "tool then quota", { rows: [] })) {
 			events.push(event);
 		}
 		serialToolsCompleted = undefined;

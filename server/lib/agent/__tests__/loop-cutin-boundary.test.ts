@@ -85,9 +85,6 @@ const testProvider: ProviderAdapter = {
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -180,7 +177,7 @@ async function runTurnWithCutIn(overrides: Partial<AgentConfig> = {}): Promise<{
 			...overrides,
 		} satisfies AgentConfig,
 		"do a long task",
-		[],
+		{ rows: [] },
 	)) {
 		events.push(event);
 	}

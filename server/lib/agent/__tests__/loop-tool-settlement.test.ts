@@ -138,12 +138,6 @@ const testProvider: ProviderAdapter = {
 			throw new Error("Aborted");
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => {
-		modelResultOrder.push(String(toolUseId));
-		return { toolUseId, output, isError };
-	},
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -276,7 +270,7 @@ describe("Bash streaming barriers", () => {
 				for await (const event of agentLoop(
 					makeConfig(new AbortController().signal),
 					"run Bash then Read",
-					[],
+					{ rows: [] },
 				)) {
 					events.push(event);
 				}
@@ -308,7 +302,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel tools with one failure",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -344,7 +338,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel tools that all throw",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -369,7 +363,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run a serial tool that throws",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -392,7 +386,7 @@ describe("agent loop tool-result settlement", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "await then send", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "await then send", { rows: [] })) {
 			events.push(event);
 			if (event.type === "stream_text") {
 				await Promise.resolve();

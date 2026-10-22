@@ -54,9 +54,6 @@ const provider: ProviderAdapter = {
 		}
 		yield { text: "after tool" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -309,9 +306,9 @@ describe("真实工具行执行绑定", () => {
 			ctx.toolCallIdsMap.set("call_0", "stale");
 			const cfg = config();
 			await executeAgentLoop(
-				{ config: cfg, userText: "run", history: [], eventContext: ctx },
+				{ config: cfg, userText: "run", history: { rows: [] }, eventContext: ctx },
 				{
-					eventSource: agentLoop(cfg, "run", []),
+					eventSource: agentLoop(cfg, "run", { rows: [] }),
 					processEventFn: async (event, ec, hooks) => {
 						const result = await processEvent(event, ec, hooks);
 						if (event.type === "block_complete" && event.block.type === "tool_use")
@@ -346,7 +343,7 @@ describe("真实工具行执行绑定", () => {
 			executeAgentLoop({
 				config: config(),
 				userText: "write",
-				history: [],
+				history: { rows: [] },
 				eventContext: context(),
 			}),
 		).rejects.toThrow("persistence barrier");
@@ -654,7 +651,7 @@ describe("真实工具行执行绑定", () => {
 		ctx.toolCallIdsMap.set("call_0", binding.toolCallId);
 		await expect(
 			executeAgentLoop(
-				{ config: config(), userText: "", history: [], eventContext: ctx },
+				{ config: config(), userText: "", history: { rows: [] }, eventContext: ctx },
 				{
 					eventSource: (async function* () {
 						yield {
@@ -890,7 +887,7 @@ describe("真实工具行执行绑定", () => {
 		const ctx = context("child");
 		const cfg = config("child");
 		scenario = "eager";
-		await executeAgentLoop({ config: cfg, userText: "child", history: [], eventContext: ctx });
+		await executeAgentLoop({ config: cfg, userText: "child", history: { rows: [] }, eventContext: ctx });
 		const binding = requiredBinding(executed[0]);
 		expect(binding.toolCallId).not.toBe("parent-row");
 		const persisted = await db.query.narratorToolCalls.findFirst({

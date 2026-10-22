@@ -66,9 +66,6 @@ const throwingProvider: ProviderAdapter = {
 			],
 		};
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -182,7 +179,7 @@ describe("danger reflection whose loop throws", () => {
 		const config = dangerReflectionConfig();
 		const events: string[] = [];
 		const iterate = (async () => {
-			for await (const event of agentLoop(config, "run the command", [])) {
+			for await (const event of agentLoop(config, "run the command", { rows: [] })) {
 				events.push(event.type);
 				if (events.length > 40) break;
 			}

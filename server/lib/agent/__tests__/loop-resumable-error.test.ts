@@ -136,7 +136,7 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 async function runLoop(overrides: Partial<AgentConfig> = {}): Promise<AgentEvent[]> {
 	const events: AgentEvent[] = [];
 	const controller = new AbortController();
-	for await (const event of agentLoop(makeConfig(controller.signal, overrides), "answer", [])) {
+	for await (const event of agentLoop(makeConfig(controller.signal, overrides), "answer", { rows: [] })) {
 		events.push(event);
 	}
 	return events;

@@ -57,9 +57,6 @@ const provider: ProviderAdapter = {
 		}
 		yield* script(params);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -145,7 +142,7 @@ function run(
 		...overrides,
 	};
 	return (async () => {
-		for await (const event of agentLoop(config, "execute in order", [])) {
+		for await (const event of agentLoop(config, "execute in order", { rows: [] })) {
 			events.push(event);
 			await onEvent?.(event);
 		}

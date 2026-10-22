@@ -37,9 +37,6 @@ const adapter: ProviderAdapter = {
 	chat() {
 		throw new Error("This runtime test must not contact a provider");
 	},
-	formatToolResult: () => ({}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => {
 		throw new Error("This runtime test must not generate titles");
 	},

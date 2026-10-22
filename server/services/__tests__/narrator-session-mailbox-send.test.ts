@@ -45,9 +45,6 @@ const provider: ProviderAdapter = {
 		await beforeResponse?.({ ...params, content });
 		yield { text: "mailbox send turn ran" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

@@ -72,9 +72,6 @@ const testProvider: ProviderAdapter = {
 		}
 		yield { text: "ok" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -131,7 +128,7 @@ async function runLoop(onEvent?: (event: AgentEvent) => void): Promise<AgentEven
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
 	anyChatHadDump = false;
-	for await (const event of agentLoop(makeConfig(ac.signal), "go", [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal), "go", { rows: [] })) {
 		events.push(event);
 		onEvent?.(event);
 	}
@@ -301,7 +298,7 @@ describe("request evidence 开关实时生效", () => {
 		);
 		try {
 			const controller = new AbortController();
-			for await (const event of agentLoop(makeConfig(controller.signal), "go", [])) {
+			for await (const event of agentLoop(makeConfig(controller.signal), "go", { rows: [] })) {
 				if (event.type !== "stream_text") continue;
 				expect(operations.some((operation) => operation.type === "end")).toBe(false);
 				break;
@@ -337,7 +334,7 @@ describe("request evidence 开关实时生效", () => {
 			let ownerReads = 0;
 			Object.defineProperty(config, "userId", { get: () => `shared-owner-${++ownerReads}` });
 			const events: AgentEvent[] = [];
-			for await (const event of agentLoop(config, "go", [])) events.push(event);
+			for await (const event of agentLoop(config, "go", { rows: [] })) events.push(event);
 			const start = events.find((event) => event.type === "api_request_start");
 			const begin = operations.find((operation) => operation.type === "begin");
 			expect(start?.type === "api_request_start" ? start.userId : undefined).toBe(

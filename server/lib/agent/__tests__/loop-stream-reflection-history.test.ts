@@ -95,14 +95,6 @@ const provider: ProviderAdapter = {
 		await endStream.promise;
 		targetStreamFinished = true;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: (history, content, model, toolResults, images) => {
-		history.push(clone({ role: "user", content, model, toolResults, images }));
-		if (history === targetHistory) userCommitted.resolve();
-	},
-	pushAssistantTurn: (history, content, toolUses) => {
-		history.push(clone({ role: "assistant", content, toolUses }));
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

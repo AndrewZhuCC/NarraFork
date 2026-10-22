@@ -67,9 +67,6 @@ const testProvider: ProviderAdapter = {
 			yield event;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -122,7 +119,7 @@ async function runLoop(
 	for await (const event of agentLoop(
 		makeConfig(controller.signal, options.overrides),
 		"answer",
-		[],
+		{ rows: [] },
 	)) {
 		events.push(event);
 		if (options.stopAfter && event.type === options.stopAfter) break;

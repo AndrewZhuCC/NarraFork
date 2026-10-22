@@ -29,9 +29,6 @@ const provider: ProviderAdapter = {
 		params.onRequestStart?.();
 		yield { text: "finished" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

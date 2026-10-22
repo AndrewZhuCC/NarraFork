@@ -22,9 +22,6 @@ const adapter: ProviderAdapter = {
 			yield event;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -69,7 +66,7 @@ async function runWithConfig(
 			...overrides,
 		},
 		"hello",
-		[],
+		{ rows: [] },
 	))
 		events.push(event);
 	inputPlans = [];

@@ -50,7 +50,6 @@ const stubAdapter = {
 	}),
 	injectSystemPrompt: () => {},
 	chat: async function* () {},
-	formatToolResult: () => ({}),
 } as unknown as ProviderAdapter;
 
 const TEST_PROVIDER = "subagentfeedbackstub";

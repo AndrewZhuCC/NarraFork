@@ -32,29 +32,6 @@ export class BenchProvider {
 					},
 		);
 	}
-	formatToolResult(id: string, output: string, isError: boolean, ..._rest: unknown[]) {
-		return this.config.protocol === "anthropic"
-			? { type: "tool_result", tool_use_id: id, content: output, is_error: isError }
-			: { type: "function_call_output", call_id: id, output };
-	}
-	pushUserTurn(history: unknown[], content: string, _model: string, results: unknown[]) {
-		if (this.config.protocol === "anthropic") {
-			if (results.length)
-				history.push({
-					role: "user",
-					content: [...results, ...(content ? [{ type: "text", text: content }] : [])],
-				});
-			else if (content) history.push({ role: "user", content });
-		} else {
-			history.push(...results);
-			if (content) history.push({ role: "user", content: [{ type: "input_text", text: content }] });
-		}
-	}
-	pushAssistantTurn(history: unknown[], ..._rest: unknown[]) {
-		if (this.config.protocol === "anthropic")
-			history.push({ role: "assistant", content: structuredClone(this.nativeAssistant) });
-		else history.push(...structuredClone(this.nativeAssistant));
-	}
 
 	async *chat(params: any): AsyncGenerator<any> {
 		try {

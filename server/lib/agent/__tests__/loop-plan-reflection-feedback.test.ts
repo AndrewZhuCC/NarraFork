@@ -38,13 +38,6 @@ const provider: ProviderAdapter = {
 			],
 		};
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: (history, content, _model, toolResults) => {
-		history.push({ role: "user", content, toolResults });
-	},
-	pushAssistantTurn: (history, text, toolUses) => {
-		history.push({ role: "assistant", content: text, toolUses });
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

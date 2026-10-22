@@ -68,25 +68,6 @@ async function captureAwaitRequests(
 				};
 			else yield { text: "done" };
 		},
-		formatToolResult: (toolUseId: string, output: string) => ({
-			type: "tool_result",
-			tool_use_id: toolUseId,
-			content: output,
-		}),
-		pushUserTurn: (
-			history: unknown[],
-			content: string,
-			_model: string,
-			results: unknown[] = [],
-		) => {
-			history.push({
-				role: "user",
-				content: [...(content ? [{ type: "text", text: content }] : []), ...results],
-			});
-		},
-		pushAssistantTurn: (history: unknown[], text: string, uses: unknown[]) => {
-			history.push({ role: "assistant", content: text, toolUses: uses });
-		},
 		generate: async () => "",
 	} as unknown as import("../../lib/agent/provider").ProviderAdapter;
 	const unregister = registerExternalProviderResolver({
@@ -116,7 +97,7 @@ async function captureAwaitRequests(
 				},
 			},
 			currentText,
-			[],
+			{ rows: [] },
 		)) {
 			if (event.type === "tool_result") storedOutputs.push(event.output);
 			if (event.type === "error") throw new Error(event.message);

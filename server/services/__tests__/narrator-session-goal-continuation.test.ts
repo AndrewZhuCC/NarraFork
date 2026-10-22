@@ -54,9 +54,6 @@ const testProvider: ProviderAdapter = {
 		}
 		yield { text: "explicit goal turn ran" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

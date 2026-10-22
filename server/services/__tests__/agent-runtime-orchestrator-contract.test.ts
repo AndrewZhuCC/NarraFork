@@ -72,9 +72,6 @@ const adapter: ProviderAdapter = {
 	chat() {
 		throw new Error("Contract must not contact a model");
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => {
 		throw new Error("Contract must not generate titles");
 	},

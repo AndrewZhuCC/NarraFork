@@ -22,35 +22,6 @@ interface TestGeminiProvider {
 		trailingToolResults: unknown[];
 	}>;
 	chat(params: Record<string, unknown>): AsyncGenerator<ParsedStreamEvent>;
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown;
-	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void;
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: Array<{
-			toolUseId: string;
-			name: string;
-			input: Record<string, unknown>;
-			outputIndex?: number;
-			thoughtSignature?: string;
-			thoughtSignatureSource?: string;
-		}>,
-		reasoningBlocks?: Array<{
-			text: string;
-			outputIndex?: number;
-			providerMetadata?: Record<string, unknown>;
-		}>,
-		webSearches?: unknown[],
-		messageId?: string,
-		imageGenerations?: unknown[],
-		textOutputIndex?: number,
-	): void;
 	generateWithMeta(
 		text: string,
 		model: string,

@@ -131,7 +131,7 @@ export function createRuntimeContractHarness(scenario: RuntimeContractScenario) 
 			steps: readonly ContractStep[],
 			input: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults" | "hooks"> = {
 				userText: "contract input",
-				history: [],
+				history: { rows: [] },
 			},
 			processEventFn?: ProcessEventFn,
 		) {

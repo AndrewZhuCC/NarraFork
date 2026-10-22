@@ -54,9 +54,6 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -113,7 +110,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 				},
 			}),
 			"wait for result",
-			[],
+			{ rows: [] },
 		))
 			events.push(event);
 		expect(providerAttempts).toBe(1);
@@ -141,7 +138,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 				},
 			}),
 			"do the thing",
-			[],
+			{ rows: [] },
 		))
 			events.push(event);
 		expect(providerAttempts).toBe(2);
@@ -162,7 +159,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 				},
 			}),
 			"wait",
-			[],
+			{ rows: [] },
 		))
 			events.push(event);
 		expect(providerAttempts).toBe(1);
@@ -176,7 +173,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -226,7 +223,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 			},
 		});
 
-		for await (const event of agentLoop(config, "compact before retry", [])) {
+		for await (const event of agentLoop(config, "compact before retry", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -261,7 +258,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 			},
 		});
 		const abortTimer = setTimeout(() => ac.abort(), 0);
-		for await (const event of agentLoop(config, "abort compact", [])) events.push(event);
+		for await (const event of agentLoop(config, "abort compact", { rows: [] })) events.push(event);
 		clearTimeout(abortTimer);
 
 		expect(highContextRecoveryCompleted).toBe(true);
@@ -276,7 +273,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 		const events: AgentEvent[] = [];
 
 		const endedRequests: Array<Extract<AgentEvent, { type: "api_request_end" }>> = [];
-		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", { rows: [] })) {
 			if (event.type === "api_request_end") {
 				// Match the real consumer's successful end persistence boundary: enrich
 				// this exact attempt before the generator resumes and builds invalid_state.

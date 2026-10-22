@@ -51,9 +51,6 @@ const provider: ProviderAdapter = {
 		}
 		yield* script(params);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -109,7 +106,7 @@ function run(events: AgentEvent[], consume?: (event: AgentEvent) => void | Promi
 		permissionHandler: async () => ({ behavior: "allow" }),
 	};
 	const done = (async () => {
-		for await (const event of agentLoop(config, "original input", [])) {
+		for await (const event of agentLoop(config, "original input", { rows: [] })) {
 			events.push(event);
 			await consume?.(event);
 		}

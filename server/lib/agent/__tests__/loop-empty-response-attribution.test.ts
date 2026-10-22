@@ -177,16 +177,6 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) =>
-		usesAnthropicRecovery()
-			? anthropicFormatter.formatToolResult(toolUseId, output, isError)
-			: { toolUseId, output, isError },
-	pushUserTurn: (...args) => {
-		if (usesAnthropicRecovery()) anthropicFormatter.pushUserTurn(...args);
-	},
-	pushAssistantTurn: (...args) => {
-		if (usesAnthropicRecovery()) anthropicFormatter.pushAssistantTurn(...args);
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -231,7 +221,7 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 async function runLoop(overrides: Partial<AgentConfig> = {}): Promise<AgentEvent[]> {
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(makeConfig(ac.signal, overrides), "go", [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal, overrides), "go", { rows: [] })) {
 		events.push(event);
 	}
 	return events;

@@ -32,11 +32,6 @@ const provider: ProviderAdapter = {
 		}
 		yield* script(params);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: (...args) => {
-		replayed.push(args);
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -90,7 +85,7 @@ async function run(
 		permissionHandler,
 	};
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(config, "test content ordering", [])) {
+	for await (const event of agentLoop(config, "test content ordering", { rows: [] })) {
 		events.push(event);
 		await onEvent?.(event);
 	}

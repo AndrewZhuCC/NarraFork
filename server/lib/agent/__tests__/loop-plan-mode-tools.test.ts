@@ -65,9 +65,6 @@ const testProvider: ProviderAdapter = {
 		}
 		yield { text: "done" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushAssistantTurn: () => {},
-	pushUserTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -143,7 +140,7 @@ function describedTool(
 
 async function drain(config: AgentConfig): Promise<AgentEvent[]> {
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(config, "go", [])) events.push(event);
+	for await (const event of agentLoop(config, "go", { rows: [] })) events.push(event);
 	return events;
 }
 

@@ -140,9 +140,6 @@ function scripted(base: ProviderAdapter): ProviderAdapter {
 		formatTools: base.formatTools.bind(base),
 		buildHistory: base.buildHistory.bind(base),
 		injectSystemPrompt: base.injectSystemPrompt.bind(base),
-		formatToolResult: base.formatToolResult.bind(base),
-		pushUserTurn: base.pushUserTurn.bind(base),
-		pushAssistantTurn: base.pushAssistantTurn.bind(base),
 		async *chat(params: ChatParams) {
 			params.onRequestStart?.();
 			captured.push(

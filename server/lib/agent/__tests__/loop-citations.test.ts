@@ -105,11 +105,6 @@ const testProvider: ProviderAdapter = {
 		}
 		yield { text: "plain answer" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: (_history, text) => {
-		historyText.push(text);
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -162,7 +157,7 @@ async function runTurn(next: Scenario): Promise<AgentEvent[]> {
 	historyText.length = 0;
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(makeConfig(ac.signal), "ask", [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal), "ask", { rows: [] })) {
 		events.push(event);
 	}
 	return events;

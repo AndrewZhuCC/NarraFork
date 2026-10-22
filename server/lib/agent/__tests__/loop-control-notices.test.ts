@@ -28,9 +28,6 @@ const provider: ProviderAdapter = {
 		params.onRequestStart?.();
 		for (const event of script(requests.length - 1)) yield event;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -81,7 +78,7 @@ function toolCall(request: number, input: Record<string, unknown>): Record<strin
 async function run(cfg: AgentConfig): Promise<AgentEvent[]> {
 	requests.length = 0;
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(cfg, "start", [])) events.push(event);
+	for await (const event of agentLoop(cfg, "start", { rows: [] })) events.push(event);
 	return events;
 }
 

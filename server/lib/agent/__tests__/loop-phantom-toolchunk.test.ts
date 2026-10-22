@@ -53,9 +53,6 @@ const testProvider: ProviderAdapter = {
 			yield { text: "retried answer" };
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -105,7 +102,7 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -145,7 +142,7 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { maxTransientRetries: 1 }),
 			"retry once",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -165,7 +162,7 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", { rows: [] })) {
 			events.push(event);
 		}
 

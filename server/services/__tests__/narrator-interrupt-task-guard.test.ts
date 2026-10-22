@@ -77,13 +77,6 @@ const testProvider = {
 		}
 		yield { text: "turn ran" };
 	},
-	formatToolResult: (toolUseId: string, output: string, isError: boolean) => ({
-		toolUseId,
-		output,
-		isError,
-	}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

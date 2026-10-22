@@ -75,7 +75,7 @@ for (const scenario of runtimeContractScenarios) {
 				],
 				{
 					userText: "cancel test",
-					history: [],
+					history: { rows: [] },
 					hooks: {
 						onErrorCleanup: async (message) => {
 							cleanup.push(message);
@@ -305,7 +305,7 @@ describe("runtime contract fixture controls", () => {
 		const trailingToolResults = [{ toolUseId: "provider-reused-id", content: "stored output" }];
 		const result = await harness.runPass(
 			[{ type: "output_truncated", message: "length" }, { type: "done" }],
-			{ userText: "", history: [], trailingToolResults },
+			{ userText: "", history: { rows: [] }, trailingToolResults },
 		);
 		expect(result.interrupted).toBe(true);
 		expect(result.shouldReplayInterruptedToolResultTurn).toBe(true);

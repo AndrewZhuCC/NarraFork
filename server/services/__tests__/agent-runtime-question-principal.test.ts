@@ -39,9 +39,6 @@ const adapter = {
 	chat: () => {
 		throw new Error("Question principal test must not contact a model");
 	},
-	formatToolResult: () => ({}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 } as unknown as ProviderAdapter;
 const unregister = provider.registerExternalProviderResolver({

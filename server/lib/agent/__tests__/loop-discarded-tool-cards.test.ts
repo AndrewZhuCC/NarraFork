@@ -86,9 +86,6 @@ const testProvider: ProviderAdapter = {
 		};
 		throw transientError();
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -133,7 +130,7 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 async function collect(prompt: string, overrides?: Partial<AgentConfig>): Promise<AgentEvent[]> {
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(makeConfig(ac.signal, overrides), prompt, [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal, overrides), prompt, { rows: [] })) {
 		events.push(event);
 	}
 	return events;

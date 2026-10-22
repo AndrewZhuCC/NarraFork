@@ -32,13 +32,6 @@ const provider: ProviderAdapter = {
 		if (text === undefined) throw new Error("Reflection exceeded scripted request budget");
 		yield { text };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: (history, content) => {
-		history.push({ role: "user", content });
-	},
-	pushAssistantTurn: (history, text, toolUses) => {
-		history.push({ role: "assistant", content: text, toolUses });
-	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
