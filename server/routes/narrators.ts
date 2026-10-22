@@ -296,6 +296,7 @@ import {
 	NARRATOR_ACL_COLUMNS,
 	narratorReadableWhere,
 } from "../services/narrator-acl";
+import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
@@ -5289,6 +5290,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 				id: msgId,
 				narratorId: id,
 				role: "system",
+				...newEnvelopeColumns(id),
 				contentJson: [
 					{
 						type: "ask_in_passing",

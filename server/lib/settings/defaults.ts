@@ -129,6 +129,9 @@ export const DEFAULTS: NarraForkSettings = {
 		dormantAfterMinutes: 0,
 		treeSnapshotsEnabled: true,
 	},
+	narratorBlocks: {
+		write: true,
+	},
 	containers: {
 		portRangeStart: 10000,
 		portRangeEnd: 20000,
@@ -802,6 +805,13 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"chapters.treeSnapshotsEnabled": {
 		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。结构性快照（fork/merge/restore）不受影响。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
+		type: "boolean",
+		valid: "true / false，默认 true",
+	},
+
+	// ── narratorBlocks ──────────────────────────────────────────────────
+	"narratorBlocks.write": {
+		desc: "新消息是否以原生块存储（narrator_blocks 表），同时写入兼容的 content_json。关闭后新消息回到只写 content_json 的旧格式；已是块格式的消息仍按块维护。默认 true。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},

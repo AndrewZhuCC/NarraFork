@@ -867,6 +867,12 @@ export const narratorMessages = pgTable(
 				"(CASE WHEN (\"content_json\"::jsonb #>> '{0,type}') = 'compact' AND ((\"content_json\"::jsonb #>> '{0,status}') IN ('compacting', 'running') OR (\"content_json\"::jsonb #>> '{0,attempts,-1,status}') = 'running') THEN 1 ELSE 0 END)",
 			),
 		),
+		bodyFormat: integer("body_format").notNull().default(1),
+		turnId: text("turn_id"),
+		authorNarratorId: text("author_narrator_id"),
+		causeBlockId: text("cause_block_id"),
+		providerResponseId: text("provider_response_id"),
+		bodyBytes: integer("body_bytes").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -876,6 +882,9 @@ export const narratorMessages = pgTable(
 		index("idx_messages_toplevel").on(table.narratorId, table.parentToolUseId, table.createdAt),
 		index("idx_messages_created_by").on(table.createdBy),
 		index("idx_messages_edited_by").on(table.editedBy),
+		index("idx_messages_author")
+			.on(table.authorNarratorId)
+			.where(sql.raw('"author_narrator_id" IS NOT NULL')),
 		index("idx_messages_compact_pending")
 			.on(table.compactPending)
 			.where(sql.raw('"compact_pending" = 1')),
@@ -976,10 +985,15 @@ export const narratorToolCalls = pgTable(
 		provider: text("provider"),
 		model: text("model"),
 		resultMessageId: text("result_message_id"),
+		blockId: text("block_id").references((): PgColumn => narratorBlocks.id, {
+			onDelete: "set null",
+		}),
+		isInternal: boolean("is_internal").notNull().default(false),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
+		index("idx_toolcalls_block").on(table.blockId),
 		index("idx_toolcalls_context_id").on(
 			table.messageId,
 			table.id,
@@ -1019,6 +1033,132 @@ export const narratorToolCalls = pgTable(
 			columns: [table.fileChangeOperationId],
 			foreignColumns: [fileChangeOperations.id],
 		}).onDelete("set null"),
+	],
+);
+
+export const narratorBlocks = pgTable(
+	"narrator_blocks",
+	{
+		id: text("id").primaryKey().notNull(),
+		messageId: text("message_id")
+			.notNull()
+			.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+		ordinal: integer("ordinal").notNull(),
+		kind: text("kind").notNull(),
+		subtype: text("subtype"),
+		phase: text("phase").notNull().default("done"),
+		revision: integer("revision").notNull().default(0),
+		wireId: text("wire_id"),
+		attemptId: text("attempt_id"),
+		originBlockId: text("origin_block_id"),
+		modelChars: integer("model_chars").notNull().default(0),
+		byteSize: integer("byte_size").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+		completedAt: text("completed_at"),
+		modelText: text("model_text"),
+		payload: jsonText("payload").notNull(),
+		state: jsonText("state"),
+		providerMeta: jsonText("provider_meta"),
+		originalPayload: jsonText("original_payload"),
+	},
+	(table) => [
+		uniqueIndex("idx_blocks_message_ordinal").on(table.messageId, table.ordinal),
+		uniqueIndex("idx_blocks_single")
+			.on(table.messageId)
+			.where(sql.raw("\"kind\" in ('input', 'context')")),
+		index("idx_blocks_open").on(table.messageId).where(sql.raw("\"phase\" = 'open'")),
+		index("idx_blocks_origin")
+			.on(table.originBlockId)
+			.where(sql.raw('"origin_block_id" is not null')),
+		index("idx_blocks_context_subtype").on(table.subtype).where(sql.raw("\"kind\" = 'context'")),
+		index("idx_blocks_tool_wire").on(table.wireId).where(sql.raw("\"kind\" = 'tool'")),
+		check(
+			"ck_blocks_kind",
+			sql.raw("\"kind\" in ('input', 'output', 'reasoning', 'tool', 'context')"),
+		),
+		check("ck_blocks_phase", sql.raw("\"phase\" in ('open', 'done', 'aborted', 'failed')")),
+		check(
+			"ck_blocks_subtype",
+			sql.raw("(\"subtype\" is not null) = (\"kind\" in ('tool', 'context'))"),
+		),
+		check(
+			"ck_blocks_aborted",
+			sql.raw("\"phase\" <> 'aborted' or \"kind\" in ('output', 'reasoning')"),
+		),
+		check("ck_blocks_input_done", sql.raw("\"phase\" = 'done' or \"kind\" <> 'input'")),
+		check(
+			"ck_blocks_model_text",
+			sql.raw("\"model_text\" is null or \"kind\" in ('input', 'context')"),
+		),
+		check(
+			"ck_blocks_provider_meta",
+			sql.raw("\"provider_meta\" is null or \"kind\" in ('output', 'reasoning', 'tool')"),
+		),
+		check("ck_blocks_wire_id", sql.raw('("wire_id" is not null) = ("kind" = \'tool\')')),
+		check(
+			"ck_blocks_original_payload",
+			sql.raw('"original_payload" is null or "kind" = \'output\''),
+		),
+	],
+);
+
+export const narratorBlockAssets = pgTable(
+	"narrator_block_assets",
+	{
+		blockId: text("block_id")
+			.notNull()
+			.references((): PgColumn => narratorBlocks.id, { onDelete: "cascade" }),
+		assetId: text("asset_id").notNull(),
+		role: text("role").notNull(),
+	},
+	(table) => [
+		index("idx_block_assets_asset").on(table.assetId),
+		check(
+			"ck_block_assets_role",
+			sql.raw(
+				"\"role\" in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')",
+			),
+		),
+		primaryKey({ columns: [table.blockId, table.assetId] }),
+	],
+);
+
+export const narratorBlockSyncQueue = pgTable("narrator_block_sync_queue", {
+	messageId: text("message_id")
+		.primaryKey()
+		.notNull()
+		.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+});
+
+export const narratorTextSnapshots = pgTable("narrator_text_snapshots", {
+	sha256: text("sha256").primaryKey().notNull(),
+	text: text("text").notNull(),
+	byteSize: integer("byte_size").notNull(),
+	createdAt: text("created_at").notNull(),
+});
+
+export const narratorTurns = pgTable(
+	"narrator_turns",
+	{
+		id: text("id").primaryKey().notNull(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		status: text("status").notNull(),
+		triggerMessageId: text("trigger_message_id"),
+		startedAt: text("started_at").notNull(),
+		endedAt: text("ended_at"),
+		stopReason: text("stop_reason"),
+		stepCount: integer("step_count").notNull().default(0),
+		toolCallCount: integer("tool_call_count").notNull().default(0),
+		usageJson: jsonText("usage_json"),
+	},
+	(table) => [
+		index("idx_turns_narrator_started").on(table.narratorId, table.startedAt),
+		check(
+			"ck_turns_status",
+			sql.raw("\"status\" in ('running', 'completed', 'interrupted', 'failed')"),
+		),
 	],
 );
 
@@ -3886,8 +4026,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 122,
-  "columnCount": 1717,
+  "tableCount": 127,
+  "columnCount": 1762,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -9018,6 +9158,64 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           }
         },
         {
+          "property": "bodyFormat",
+          "name": "body_format",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "turnId",
+          "name": "turn_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "authorNarratorId",
+          "name": "author_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "causeBlockId",
+          "name": "cause_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "providerResponseId",
+          "name": "provider_response_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bodyBytes",
+          "name": "body_bytes",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -9074,6 +9272,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "editedBy"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_messages_author",
+          "columns": [
+            "authorNarratorId"
+          ],
+          "unique": false,
+          "predicate": "\"author_narrator_id\" IS NOT NULL"
         },
         {
           "name": "idx_messages_compact_pending",
@@ -9825,6 +10031,34 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorBlocks",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_tool_calls_block_id_narrator_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "isInternal",
+          "name": "is_internal",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -9839,6 +10073,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_toolcalls_message",
           "columns": [
             "messageId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_toolcalls_block",
+          "columns": [
+            "blockId"
           ],
           "unique": false
         },
@@ -9943,6 +10184,578 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "checks": [],
       "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlocks",
+      "name": "narrator_blocks",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_blocks_message_id_narrator_messages_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "ordinal",
+          "name": "ordinal",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "subtype",
+          "name": "subtype",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "phase",
+          "name": "phase",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"done\"",
+          "defaultExpression": "\"done\""
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "wireId",
+          "name": "wire_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attemptId",
+          "name": "attempt_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "originBlockId",
+          "name": "origin_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "modelChars",
+          "name": "model_chars",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "byteSize",
+          "name": "byte_size",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "completedAt",
+          "name": "completed_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "modelText",
+          "name": "model_text",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "payload",
+          "name": "payload",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "providerMeta",
+          "name": "provider_meta",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "originalPayload",
+          "name": "original_payload",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_blocks_message_ordinal",
+          "columns": [
+            "messageId",
+            "ordinal"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_blocks_single",
+          "columns": [
+            "messageId"
+          ],
+          "unique": true,
+          "predicate": "\"kind\" in ('input', 'context')"
+        },
+        {
+          "name": "idx_blocks_open",
+          "columns": [
+            "messageId"
+          ],
+          "unique": false,
+          "predicate": "\"phase\" = 'open'"
+        },
+        {
+          "name": "idx_blocks_origin",
+          "columns": [
+            "originBlockId"
+          ],
+          "unique": false,
+          "predicate": "\"origin_block_id\" is not null"
+        },
+        {
+          "name": "idx_blocks_context_subtype",
+          "columns": [
+            "subtype"
+          ],
+          "unique": false,
+          "predicate": "\"kind\" = 'context'"
+        },
+        {
+          "name": "idx_blocks_tool_wire",
+          "columns": [
+            "wireId"
+          ],
+          "unique": false,
+          "predicate": "\"kind\" = 'tool'"
+        }
+      ],
+      "checks": [
+        "ck_blocks_kind",
+        "ck_blocks_phase",
+        "ck_blocks_subtype",
+        "ck_blocks_aborted",
+        "ck_blocks_input_done",
+        "ck_blocks_model_text",
+        "ck_blocks_provider_meta",
+        "ck_blocks_wire_id",
+        "ck_blocks_original_payload"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_blocks_kind",
+          "expression": "\"kind\" in ('input', 'output', 'reasoning', 'tool', 'context')"
+        },
+        {
+          "name": "ck_blocks_phase",
+          "expression": "\"phase\" in ('open', 'done', 'aborted', 'failed')"
+        },
+        {
+          "name": "ck_blocks_subtype",
+          "expression": "(\"subtype\" is not null) = (\"kind\" in ('tool', 'context'))"
+        },
+        {
+          "name": "ck_blocks_aborted",
+          "expression": "\"phase\" <> 'aborted' or \"kind\" in ('output', 'reasoning')"
+        },
+        {
+          "name": "ck_blocks_input_done",
+          "expression": "\"phase\" = 'done' or \"kind\" <> 'input'"
+        },
+        {
+          "name": "ck_blocks_model_text",
+          "expression": "\"model_text\" is null or \"kind\" in ('input', 'context')"
+        },
+        {
+          "name": "ck_blocks_provider_meta",
+          "expression": "\"provider_meta\" is null or \"kind\" in ('output', 'reasoning', 'tool')"
+        },
+        {
+          "name": "ck_blocks_wire_id",
+          "expression": "(\"wire_id\" is not null) = (\"kind\" = 'tool')"
+        },
+        {
+          "name": "ck_blocks_original_payload",
+          "expression": "\"original_payload\" is null or \"kind\" = 'output'"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockAssets",
+      "name": "narrator_block_assets",
+      "columns": [
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_assets_block_id_narrator_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "assetId",
+          "name": "asset_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "role",
+          "name": "role",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_block_assets_asset",
+          "columns": [
+            "assetId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_block_assets_role"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_block_assets_role",
+          "expression": "\"role\" in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "blockId",
+            "assetId"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "narratorBlockSyncQueue",
+      "name": "narrator_block_sync_queue",
+      "columns": [
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_sync_queue_message_id_narrator_messages_id_fk"
+          },
+          "emitAsTableConstraint": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorTextSnapshots",
+      "name": "narrator_text_snapshots",
+      "columns": [
+        {
+          "property": "sha256",
+          "name": "sha256",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "text",
+          "name": "text",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "byteSize",
+          "name": "byte_size",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorTurns",
+      "name": "narrator_turns",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_turns_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "triggerMessageId",
+          "name": "trigger_message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "startedAt",
+          "name": "started_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "endedAt",
+          "name": "ended_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "stopReason",
+          "name": "stop_reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "stepCount",
+          "name": "step_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "toolCallCount",
+          "name": "tool_call_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "usageJson",
+          "name": "usage_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_turns_narrator_started",
+          "columns": [
+            "narratorId",
+            "startedAt"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_turns_status"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_turns_status",
+          "expression": "\"status\" in ('running', 'completed', 'interrupted', 'failed')"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []

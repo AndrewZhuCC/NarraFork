@@ -502,6 +502,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// History/display ports also have PG implementations. Register the SQLite branches
 	// and Database types without claiming these main-database modules are SQLite-only.
 	"server/services/agent-runtime/model-history-revision.ts": ["driver", "sqliteCatalog"],
+	// The trigger renderer emits both dialects; these are its SQLite branch (tool-block phase
+	// and sync-queue triggers). The PG branch spells them `::jsonb` and `ON CONFLICT`.
+	"server/services/agent-runtime/model-history-revision-sql.ts": ["json1", "insertOr"],
 	"server/services/agent-runtime/model-history-source.ts": ["driver"],
 	"server/services/agent-runtime/model-history-query.ts": ["driver"],
 	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
@@ -545,6 +548,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
+	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
+	"server/services/narrator-block-sync.ts": ["handle", "sqliteCatalog", "insertOr"],
+	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],

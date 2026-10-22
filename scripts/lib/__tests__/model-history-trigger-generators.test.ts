@@ -3,11 +3,19 @@ import { afterEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { MODEL_HISTORY_V2_SQLITE_TRIGGERS } from "../../../server/services/agent-runtime/model-history-revision-sql";
 import { generateSqliteMigrations } from "../../generate-sqlite-migrations";
-import { modelHistoryTriggerSuffix } from "../generated-model-history-triggers";
+import {
+	MODEL_HISTORY_REVISION_CONTRACT,
+	MODEL_HISTORY_REVISION_CONTRACT_V1,
+	modelHistoryTriggerSuffix,
+} from "../generated-model-history-triggers";
 import { readPgMetadata } from "../postgres-migration-metadata";
 import { executePostgresMigrations } from "../postgres-migration-transaction";
-import { modelHistorySnapshots } from "./model-history-migration-fixture";
+import {
+	modelHistoryBlockSnapshot,
+	modelHistorySnapshots,
+} from "./model-history-migration-fixture";
 
 const repository = resolve(import.meta.dir, "../../..");
 const roots: string[] = [];
@@ -68,9 +76,18 @@ function fixture(dialect: "sqlite" | "postgres") {
 	return { root, folder };
 }
 
-function writeSchema(root: string, dialect: "sqlite" | "postgres", revisions: boolean) {
+function writeSchema(
+	root: string,
+	dialect: "sqlite" | "postgres",
+	stage: "base" | "revisions" | "blocks",
+) {
 	const snapshots = modelHistorySnapshots();
-	const snapshot = revisions ? snapshots.after : snapshots.before;
+	const snapshot =
+		stage === "blocks"
+			? modelHistoryBlockSnapshot()
+			: stage === "revisions"
+				? snapshots.after
+				: snapshots.before;
 	const tableFunction = dialect === "sqlite" ? "sqliteTable" : "pgTable";
 	const schema = [
 		`import { ${tableFunction}, integer, text } from "drizzle-orm/${dialect === "sqlite" ? "sqlite" : "pg"}-core";`,
@@ -90,52 +107,79 @@ function writeSchema(root: string, dialect: "sqlite" | "postgres", revisions: bo
 
 test("real SQLite Kit through the official wrapper publishes fields and triggers in one new immutable batch", async () => {
 	const { root, folder } = fixture("sqlite");
-	writeSchema(root, "sqlite", false);
+	writeSchema(root, "sqlite", "base");
 	await generateSqliteMigrations(["--name", "model_base"], { root });
 	const baseline = readFileSync(join(folder, "0001_model_base.sql"), "utf8");
-	writeSchema(root, "sqlite", true);
+	writeSchema(root, "sqlite", "revisions");
 	await generateSqliteMigrations(["--name", "model_revision"], { root });
 	const generated = readFileSync(join(folder, "0002_model_revision.sql"), "utf8");
-	expect(generated.endsWith(modelHistoryTriggerSuffix("sqlite"))).toBe(true);
+	expect(
+		generated.endsWith(modelHistoryTriggerSuffix("sqlite", MODEL_HISTORY_REVISION_CONTRACT_V1)),
+	).toBe(true);
+	writeSchema(root, "sqlite", "blocks");
+	await generateSqliteMigrations(["--name", "model_blocks"], { root });
+	const reinstall = readFileSync(join(folder, "0003_model_blocks.sql"), "utf8");
+	expect(reinstall.endsWith(modelHistoryTriggerSuffix("sqlite"))).toBe(true);
 	const db = new Database(":memory:");
 	try {
 		db.exec(baseline);
 		db.exec(generated);
-		expect(db.query("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger'").get()).toEqual({
-			n: 11,
-		});
+		const triggers = () =>
+			db
+				.query<{ name: string }, []>(
+					"SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
+				)
+				.all()
+				.map((row) => row.name);
+		expect(triggers()).toHaveLength(11);
+		// The block-storage migration is a versioned reinstall: v1 is dropped, v2 replaces it.
+		db.exec(reinstall);
+		expect(triggers()).toEqual([...MODEL_HISTORY_V2_SQLITE_TRIGGERS].sort());
+		expect(triggers().every((name) => name.startsWith("model_history_v2_"))).toBe(true);
+		expect(
+			db.query("SELECT installed_version AS v FROM model_history_revision_contracts").all(),
+		).toEqual([{ v: MODEL_HISTORY_REVISION_CONTRACT }]);
 	} finally {
 		db.close();
 	}
-	await generateSqliteMigrations(["--name", "model_revision"], { root });
+	await generateSqliteMigrations(["--name", "model_blocks"], { root });
 	expect(readFileSync(join(folder, "0001_model_base.sql"), "utf8")).toBe(baseline);
 	expect(readFileSync(join(folder, "0002_model_revision.sql"), "utf8")).toBe(generated);
-}, 30_000);
+	expect(readFileSync(join(folder, "0003_model_blocks.sql"), "utf8")).toBe(reinstall);
+}, 60_000);
 
 test("real PG Kit through the official wrapper binds fields and trigger functions to the same convergent snapshot", async () => {
 	const { root, folder } = fixture("postgres");
 	await executePostgresMigrations("baseline", [], { root });
-	writeSchema(root, "postgres", false);
+	writeSchema(root, "postgres", "base");
 	await executePostgresMigrations("generate", ["--name", "model_base"], { root });
 	const baseline = readPgMetadata(folder);
 	const baselineSql = readFileSync(
 		join(folder, `${baseline.journal.entries.at(-1)?.tag}.sql`),
 		"utf8",
 	);
-	writeSchema(root, "postgres", true);
+	writeSchema(root, "postgres", "revisions");
 	await executePostgresMigrations("generate", ["--name", "model_revision"], { root });
 	const metadata = readPgMetadata(folder);
 	const generated = readFileSync(
 		join(folder, `${metadata.journal.entries.at(-1)?.tag}.sql`),
 		"utf8",
 	);
-	expect(generated.endsWith(modelHistoryTriggerSuffix("postgres"))).toBe(true);
+	expect(
+		generated.endsWith(modelHistoryTriggerSuffix("postgres", MODEL_HISTORY_REVISION_CONTRACT_V1)),
+	).toBe(true);
 	expect(metadata.journal.entries).toHaveLength(3);
-	expect(metadata.snapshot.prevId).toBe(baseline.snapshot.id);
+	writeSchema(root, "postgres", "blocks");
+	await executePostgresMigrations("generate", ["--name", "model_blocks"], { root });
+	const blocks = readPgMetadata(folder);
+	const reinstall = readFileSync(join(folder, `${blocks.journal.entries.at(-1)?.tag}.sql`), "utf8");
+	expect(reinstall.endsWith(modelHistoryTriggerSuffix("postgres"))).toBe(true);
+	expect(blocks.journal.entries).toHaveLength(4);
+	expect(blocks.snapshot.prevId).toBe(metadata.snapshot.id);
 	expect(await executePostgresMigrations("generate", [], { root })).toMatchObject({
 		changed: false,
 	});
 	expect(readFileSync(join(folder, `${baseline.journal.entries.at(-1)?.tag}.sql`), "utf8")).toBe(
 		baselineSql,
 	);
-}, 30_000);
+}, 60_000);

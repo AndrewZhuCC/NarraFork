@@ -360,8 +360,10 @@ function dataOnly(tokens: readonly Token[]): void {
  *
  * Layout replay cannot see inside a dollar-quoted body, so procedural DDL stays fail-closed in
  * general. Admitted statements are the model-history revision triggers of migration 0012 (they
- * bump integer counters) and the numeric context-stats copy of migration 0022 (it upserts one
- * existing table). None of them alter, create or drop a relation or column. Each entry is the
+ * bump integer counters), the numeric context-stats copy of migration 0022 (it upserts one
+ * existing table), and the model-history v2 reinstall of migration 0029 (it drops the v1
+ * triggers and functions; v2 also sets a tool block's phase and queues envelopes for block
+ * sync). None of them alter, create or drop a relation or column. Each entry is the
  * SHA-256 of the statement as written in the SQL file (trimmed, without its terminating
  * semicolon); a single changed character falls back to the generic rejection and requires a
  * fresh review here.
@@ -430,6 +432,124 @@ const REVIEWED_PROCEDURAL_STATEMENTS = new Map<string, string>([
 		"adb48fb8a2e584de04374d4bdd36395b87299f1d5b0b53e726ecdef2890b4c13",
 		"trigger narrator_message_context_stats_update",
 	],
+	// 0029_block_storage.sql — model-history contract v2, a versioned reinstall: drops the v1
+	// triggers and functions, then installs v2 (revision bumps, tool-block phase, sync queue).
+	[
+		"4c5764c911db08f3937bfb02348d51f48280d288fd440d90c95235e89151cf65",
+		"drop trigger model_history_v1_message",
+	],
+	[
+		"9cc4e00ae32c088206b57b187ad78ac2b0c7bf380b6eb4936bada7c229549d89",
+		"drop function model_history_v1_message",
+	],
+	[
+		"80d20309b0e1aa94bf39cd0b73152c1d444e56991090fb94c9462dfb96d12898",
+		"drop trigger model_history_v1_tool",
+	],
+	[
+		"f4c0a8ae4394d7101a6f7137079df965ef6e3d1a542dd3207f2cda47674facaa",
+		"drop function model_history_v1_tool",
+	],
+	[
+		"f0f0e5450bd8f2b7df6ac44f58762509439d064f8b0cd5d7a2fda96b051fa826",
+		"drop trigger model_history_v1_ref",
+	],
+	[
+		"b65f55e72fbae77dac9e1b63b070dc6f75cc3f219847e4e252d3694b4cdf0c65",
+		"drop function model_history_v1_ref",
+	],
+	[
+		"31b85ca08d3bbb2704492e773a6e78207730060c751cbd3c21c7424cefbcdd5d",
+		"drop trigger model_history_v1_sender",
+	],
+	[
+		"7083bf694ecddeb70dddc3a4df5864cb2948c399d6f90ec6478a2d5c649dd219",
+		"drop function model_history_v1_sender",
+	],
+	[
+		"958ca35d4a6c3d643555c98f6615fc6d239edd9454beb4766bc470c661fa9206",
+		"drop trigger model_history_v1_narrator",
+	],
+	[
+		"d87ec539a72e18ec8105ef0f96b3b0c151e9936983a42ea26b1e8ed03205c9c1",
+		"drop function model_history_v1_narrator",
+	],
+	[
+		"d783a8a4723fbbb75d7d996779701210b04332be4fc49aabb8a373e283363062",
+		"function model_history_v2_message",
+	],
+	[
+		"d6926c3eda8bf3ece36d20a00d1b3184ecdfb353c73def2e6e275e96c489965b",
+		"trigger model_history_v2_message",
+	],
+	[
+		"0e7d7020a026dd1ac6a13676237aeab86ca933c2c70652e64c913b65ffb5b93f",
+		"function model_history_v2_tool",
+	],
+	[
+		"931aa34270cceff36c06bd857b4ae3d40f0c454ef58a9c87d6543358673954eb",
+		"trigger model_history_v2_tool",
+	],
+	[
+		"b9503fe634712ea69dee9063f32d4fbaffa22ea4d22a135b5c0827d719afcafb",
+		"function model_history_v2_ref",
+	],
+	[
+		"a5a5a58b2b2ac2cb01b590dfa994d229ada38a7b1a0afb8f9767201c32c153b4",
+		"trigger model_history_v2_ref",
+	],
+	[
+		"3928308ba47d26eca2c8ee3e3656343fcfba7a7c300668ca4a6c057540a5fb6a",
+		"function model_history_v2_block",
+	],
+	[
+		"ecd3e22563f3ae338b9ffdc5733647b6df08aa0ff27307b2e4b138b7bd58083a",
+		"trigger model_history_v2_block",
+	],
+	[
+		"0064fe3b4d6636f136b40229e77e5f7139599b01426f55a7b6fb61eacf4ca619",
+		"function model_history_v2_tool_phase",
+	],
+	[
+		"8abd70c11747beb4501aa6b16b77a5c9cb584a7a95878d36178ee7c7448e4e56",
+		"trigger model_history_v2_tool_phase",
+	],
+	[
+		"e5fbbb143be30768ed5ca37e5738736c27bd8c6a6aa464f53073194540ec1c8c",
+		"function model_history_v2_sync_message",
+	],
+	[
+		"7a7df5459db3608e9741bc53f873d62ec43f334f6c3be435d647d85a23e14fb0",
+		"trigger model_history_v2_sync_message",
+	],
+	[
+		"89f64c3a69622dbdba888396475006455439f8b6fd40c4fee36f17cc75f3be5a",
+		"function model_history_v2_sync_tool",
+	],
+	[
+		"6d9fb645eb12b0fda8257f307d3fb49a8466d7c5f8f1a828e8fb66339584f9fb",
+		"trigger model_history_v2_sync_tool",
+	],
+	[
+		"075a5660d50efb2b6d80c78fbc307a97968f193077a52fb401e5b2110c8f94ce",
+		"function model_history_v2_sender",
+	],
+	[
+		"a611b18a131d1585f1e704216651a30292b3bbc0f6c8751b3a9fe7352f13d61e",
+		"trigger model_history_v2_sender",
+	],
+	[
+		"b75813f047288bbb4c995647fbae67d429184528c606d587b9c4542083b33190",
+		"function model_history_v2_narrator",
+	],
+	[
+		"1b39a2e3c3f5d8351c562cc8efb72579929b1a7fec62a689174dc815105ae48b",
+		"trigger model_history_v2_narrator",
+	],
+	[
+		"86db7cec3aadd9b1a291f6450f678045f020d93eca502eb0924b656714aeedd4",
+		"seed model_history_revision_contracts",
+	],
 ]);
 
 /** The exact source text of one statement, as the allow-list digests were computed. */
@@ -446,7 +566,9 @@ function reviewedProcedural(tokens: readonly Token[], sql: string): boolean {
 	// Defence in depth: the digest pins the text, the label pins what kind of statement it is.
 	const cursor = new Cursor(tokens);
 	if (label.startsWith("seed ")) return cursor.keyword("insert") && cursor.keyword("into");
-	return cursor.keyword("create") && cursor.keyword(label.split(" ")[0]);
+	const [verb, kind] = label.split(" ");
+	if (verb === "drop") return cursor.keyword("drop") && cursor.keyword(kind);
+	return cursor.keyword("create") && cursor.keyword(verb);
 }
 
 function replay(tokens: readonly Token[], order: Map<string, string[]>, sql = ""): void {

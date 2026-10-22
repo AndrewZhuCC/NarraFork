@@ -60,6 +60,14 @@ import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
+import {
+	contentByAttempt,
+	flushChangedEnvelopes,
+	newEnvelopeColumns,
+	type SyncMode,
+	syncCopiedEnvelope,
+	syncEnvelopeNow,
+} from "./narrator-block-sync";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import {
@@ -484,6 +492,67 @@ type MessageCopyResult = {
 };
 
 /**
+ * The copy-on-write step every path shares (§6.3): give one ref its own copy of a
+ * shared envelope, inside the caller's transaction.
+ *   - The copy belongs to the ref's narrator and keeps the original's author and
+ *     creation time.
+ *   - The given ledger rows are cloned onto it as history, each pointing back at the row
+ *     it copies.
+ *   - Its blocks are built now and point at the blocks they copy.
+ *   - The ref, the holder's mailbox receipt (when `receipt` is given) and the holder's
+ *     fork boundary move to the copy.
+ */
+export function cowEnvelopeTx(
+	tx: DbTx,
+	input: {
+		original: typeof narratorMessages.$inferSelect;
+		ref: { id: string; narratorId: string };
+		changes?: Partial<typeof narratorMessages.$inferInsert>;
+		toolCalls: ReadonlyArray<typeof narratorToolCalls.$inferSelect>;
+		receipt?: "semantic_edit" | "cow";
+	},
+): string {
+	const { original, ref } = input;
+	const id = generateId();
+	const now = new Date().toISOString();
+	tx.insert(narratorMessages)
+		.values({
+			...original,
+			...input.changes,
+			id,
+			narratorId: ref.narratorId,
+			authorNarratorId: original.authorNarratorId ?? original.narratorId,
+			createdAt: original.createdAt,
+		})
+		.run();
+	if (input.toolCalls.length)
+		tx.insert(narratorToolCalls)
+			.values(
+				input.toolCalls.map((call) => ({
+					...call,
+					executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
+					id: generateId(),
+					narratorId: ref.narratorId,
+					messageId: id,
+					createdAt: now,
+				})),
+			)
+			.run();
+	syncCopiedEnvelope(original.id, id);
+	tx.update(narratorMessageRefs)
+		.set({ messageId: id })
+		.where(eq(narratorMessageRefs.id, ref.id))
+		.run();
+	if (input.receipt)
+		updateRecipientMessageRef(tx, ref.narratorId, ref.id, { kind: input.receipt, messageId: id });
+	tx.update(narrators)
+		.set({ forkMessageId: id })
+		.where(and(eq(narrators.id, ref.narratorId), eq(narrators.forkMessageId, original.id)))
+		.run();
+	return id;
+}
+
+/**
  * Copy a message for one narrator while the caller already holds a native
  * synchronous transaction. Message rows are shared through refs when a full
  * fork inherits history, so any lifecycle mutation must first move the current
@@ -530,6 +599,7 @@ function copyMessageForNarratorTx(
 	if (!shouldCopy) {
 		if (Object.keys(overrides).length > 0) {
 			tx.update(narratorMessages).set(overrides).where(eq(narratorMessages.id, messageId)).run();
+			syncEnvelopeNow(messageId);
 		}
 		return { messageId, ref, copied: false };
 	}
@@ -539,52 +609,15 @@ function copyMessageForNarratorTx(
 		.sync();
 	if (!original) throw new NotFoundError("Message", messageId);
 
-	const newMessageId = generateId();
-	const now = new Date().toISOString();
-	tx.insert(narratorMessages)
-		.values({
-			...original,
-			...overrides,
-			id: newMessageId,
-			narratorId,
-			createdAt: original.createdAt,
-		})
-		.run();
-
 	const originalToolCalls = tx.query.narratorToolCalls
 		.findMany({ where: eq(narratorToolCalls.messageId, messageId) })
 		.sync();
-	if (originalToolCalls.length > 0) {
-		tx.insert(narratorToolCalls)
-			.values(
-				originalToolCalls.map((toolCall) => ({
-					...toolCall,
-					executionOriginToolCallId: toolCall.executionOriginToolCallId ?? toolCall.id,
-					id: generateId(),
-					narratorId,
-					messageId: newMessageId,
-					createdAt: now,
-				})),
-			)
-			.run();
-	}
-
-	tx.update(narratorMessageRefs)
-		.set({ messageId: newMessageId })
-		.where(eq(narratorMessageRefs.id, ref.id))
-		.run();
-
-	const narrator = tx.query.narrators
-		.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { forkMessageId: true },
-		})
-		.sync();
-	const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
-	if (narrator?.forkMessageId === messageId) narratorUpdates.forkMessageId = newMessageId;
-	if (Object.keys(narratorUpdates).length > 0) {
-		tx.update(narrators).set(narratorUpdates).where(eq(narrators.id, narratorId)).run();
-	}
+	const newMessageId = cowEnvelopeTx(tx, {
+		original,
+		ref,
+		changes: overrides,
+		toolCalls: originalToolCalls,
+	});
 
 	return {
 		messageId: newMessageId,
@@ -1279,6 +1312,8 @@ async function appendPersistedMessage(
 		bumpMessageVersion?: boolean;
 		/** Rows that belong to the message, written in its transaction (SQLite only). */
 		withRows?: (tx: DbTx) => void;
+		/** How incomplete output reads when the envelope is stored as blocks. */
+		blockMode?: SyncMode;
 	},
 ): Promise<RefMessage> {
 	const bumpMessageVersion = options?.bumpMessageVersion !== false;
@@ -1292,9 +1327,20 @@ async function appendPersistedMessage(
 	const created = await withDbRetry(
 		async () =>
 			db.transaction((tx) => {
-				const created = tx.insert(narratorMessages).values(message).returning().get();
+				const created = tx
+					.insert(narratorMessages)
+					.values({
+						...newEnvelopeColumns(message.narratorId),
+						...message,
+						authorNarratorId: message.authorNarratorId ?? message.narratorId,
+					})
+					.returning()
+					.get();
 				const seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
 				options?.withRows?.(tx);
+				// The blocks commit with the envelope and the rows that belong to it.
+				syncEnvelopeNow(message.id, options?.blockMode);
+				flushChangedEnvelopes();
 				return { ...created, seq };
 			}),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
@@ -1445,6 +1491,7 @@ const sqliteNarratorPersistence = {
 						.insert(narratorMessages)
 						.values({
 							id,
+							...newEnvelopeColumns(narratorId),
 							narratorId,
 							parentToolUseId,
 							role: "user",
@@ -1574,6 +1621,7 @@ const sqliteNarratorPersistence = {
 						.insert(narratorMessages)
 						.values({
 							id,
+							...newEnvelopeColumns(narratorId),
 							narratorId,
 							parentToolUseId,
 							role: "sys",
@@ -1771,6 +1819,7 @@ const sqliteNarratorPersistence = {
 						.insert(narratorMessages)
 						.values({
 							id,
+							...newEnvelopeColumns(narratorId),
 							narratorId,
 							role: "system",
 							contentJson: [compactBlock],
@@ -1893,6 +1942,7 @@ const sqliteNarratorPersistence = {
 				.insert(narratorMessages)
 				.values({
 					id,
+					...newEnvelopeColumns(narratorId),
 					narratorId,
 					role: "system",
 					contentJson: [
@@ -1943,6 +1993,7 @@ const sqliteNarratorPersistence = {
 				.insert(narratorMessages)
 				.values({
 					id,
+					...newEnvelopeColumns(narratorId),
 					narratorId,
 					role: "system",
 					contentJson: [{ type: "compact", status: "compacted", summary: "" }],
@@ -2005,6 +2056,7 @@ const sqliteNarratorPersistence = {
 				.insert(narratorMessages)
 				.values({
 					id,
+					...newEnvelopeColumns(narratorId),
 					narratorId,
 					role: "system",
 					contentJson: [{ type: "compact", status: "compacted", summary: "" }],
@@ -2271,20 +2323,23 @@ const sqliteNarratorPersistence = {
 				meterUnit: sdkMessage.meterUnit ?? null,
 				createdAt: now,
 			},
-			toolUseBlocks.length
-				? {
-						withRows: (tx) => {
-							for (const block of toolUseBlocks)
-								insertToolCallRowTx(tx, {
-									narratorId,
-									messageId: id,
-									parentSegmentId,
-									block,
-									createdAt: now,
-								});
-						},
-					}
-				: undefined,
+			{
+				blockMode: "sealed",
+				...(toolUseBlocks.length
+					? {
+							withRows: (tx: DbTx) => {
+								for (const block of toolUseBlocks)
+									insertToolCallRowTx(tx, {
+										narratorId,
+										messageId: id,
+										parentSegmentId,
+										block,
+										createdAt: now,
+									});
+							},
+						}
+					: {}),
+			},
 		);
 
 		const seq = msg.seq;
@@ -2412,7 +2467,11 @@ const sqliteNarratorPersistence = {
 					width?: number;
 					height?: number;
 			  },
-		options?: { republishUnchanged?: boolean },
+		options?: {
+			republishUnchanged?: boolean;
+			/** The provider request writing this item; its blocks are discarded by it. */
+			attemptId?: string;
+		},
 	) {
 		// The segment parent is read up front; the block and its ledger row are then one
 		// transaction, so a tool_use never commits without the row that pairs its result.
@@ -2554,6 +2613,9 @@ const sqliteNarratorPersistence = {
 					block,
 					createdAt: toolCreatedAt,
 				});
+			// One item changed: its block row (and the tool's ledger binding) follows.
+			syncEnvelopeNow(messageId, "streaming", { attemptId: options?.attemptId });
+			flushChangedEnvelopes();
 			return existing;
 		});
 		if (!persisted) return undefined;
@@ -2635,10 +2697,14 @@ const sqliteNarratorPersistence = {
 		if (block.translatedText === translatedText) return false;
 
 		block.translatedText = translatedText;
-		db.update(narratorMessages)
-			.set({ contentJson: content })
-			.where(eq(narratorMessages.id, messageId))
-			.run();
+		db.transaction(() => {
+			db.update(narratorMessages)
+				.set({ contentJson: content })
+				.where(eq(narratorMessages.id, messageId))
+				.run();
+			// A translation is block state: no body revision.
+			syncEnvelopeNow(messageId);
+		});
 		return true;
 	},
 
@@ -3032,6 +3098,7 @@ const sqliteNarratorPersistence = {
 								tx.insert(narratorMessages)
 									.values({
 										id: msgId,
+										...newEnvelopeColumns(narratorId),
 										narratorId,
 										role: "system",
 										contentJson,
@@ -3677,6 +3744,8 @@ const sqliteNarratorPersistence = {
 					})
 					.returning()
 					.all();
+				// The new attempt reopens its tool block in the same commit.
+				flushChangedEnvelopes();
 				return created;
 			});
 			return {
@@ -3952,6 +4021,8 @@ const sqliteNarratorPersistence = {
 			if (result.input !== undefined)
 				for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
 			result.onPersist?.(tx);
+			// The settled tool block (phase, binding, searchable result) commits with it.
+			flushChangedEnvelopes();
 			return updated;
 		});
 
@@ -4129,6 +4200,11 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 		const refreshedRecipients: string[] = [];
 		const result = db.transaction((tx) => {
+			const id = rewrite(tx);
+			flushChangedEnvelopes();
+			return id;
+		});
+		function rewrite(tx: DbTx): string {
 			const original = tx.query.narratorMessages
 				.findFirst({ where: eq(narratorMessages.id, messageId) })
 				.sync();
@@ -4185,37 +4261,13 @@ const sqliteNarratorPersistence = {
 				changes: Partial<typeof narratorMessages.$inferInsert> | undefined,
 				kind: "semantic_edit" | "cow",
 			) => {
-				const replacementId = generateId();
-				tx.insert(narratorMessages)
-					.values({
-						...original,
-						...changes,
-						id: replacementId,
-						narratorId: recipient.narratorId,
-						createdAt: original.createdAt,
-					})
-					.run();
-				tx.update(narratorMessageRefs)
-					.set({ messageId: replacementId })
-					.where(eq(narratorMessageRefs.id, recipient.id))
-					.run();
-				updateRecipientMessageRef(tx, recipient.narratorId, recipient.id, {
-					kind,
-					messageId: replacementId,
+				const replacementId = cowEnvelopeTx(tx, {
+					original,
+					ref: recipient,
+					changes,
+					toolCalls: originalToolCalls,
+					receipt: kind,
 				});
-				if (originalToolCalls.length)
-					tx.insert(narratorToolCalls)
-						.values(
-							originalToolCalls.map((call) => ({
-								...call,
-								executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
-								id: generateId(),
-								narratorId: recipient.narratorId,
-								messageId: replacementId,
-								createdAt: now,
-							})),
-						)
-						.run();
 				bumpVersion(recipient.narratorId, replacementId);
 				refreshedRecipients.push(recipient.narratorId);
 				return replacementId;
@@ -4249,14 +4301,15 @@ const sqliteNarratorPersistence = {
 				return updateOriginal();
 			}
 			return cloneRecipient(currentRef, overrides, semanticEdit ? "semantic_edit" : "cow");
-		});
+		}
 		for (const recipient of refreshedRecipients) queueContextCharacterRefresh(recipient);
 		return result;
 	},
 
 	/**
-	 * Drop what a discarded provider attempt wrote into an open step: the blocks after
-	 * the attempt's baseline, and the ledger rows of its calls that never ran. A call that
+	 * Drop what a discarded provider attempt wrote into an open step: the blocks that
+	 * attempt created (by `attemptId` when the step keeps block rows, else the blocks after
+	 * the attempt's baseline), and the ledger rows of its calls that never ran. A call that
 	 * did run keeps its row and its block, so a result never loses its call. The row
 	 * removal and the truncation are one transaction. Null when there was nothing to drop.
 	 */
@@ -4264,6 +4317,7 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		messageId: string,
 		baseline: number,
+		attemptId?: string,
 	): Promise<{
 		messageId: string;
 		discardedBlocks: number;
@@ -4277,16 +4331,25 @@ const sqliteNarratorPersistence = {
 		const blocks = Array.isArray(message?.contentJson)
 			? (message.contentJson as Array<Record<string, unknown>>)
 			: [];
-		if (blocks.length <= baseline) return null;
+		const attemptRows = attemptId
+			? db.transaction(() => contentByAttempt(messageId, attemptId))
+			: null;
+		if (attemptRows ? !attemptRows.some((row) => row.fromAttempt) : blocks.length <= baseline)
+			return null;
 		// An in-flight partial may have been forked. Keep execution/approval identity on the
 		// real owner while isolating sibling snapshots before any mutation.
 		let partialId = await this.copyOnWriteMessage(narratorId, messageId, undefined, {
 			preserveExecutionOwner: true,
 		});
-		const discarded = blocks.slice(baseline);
-		const discardedToolUseIds = discarded.flatMap((block) =>
-			block.type === "tool_use" && typeof block.id === "string" ? [block.id] : [],
-		);
+		const discarded = attemptRows
+			? attemptRows.flatMap((row) => (row.fromAttempt ? row.elements : []))
+			: blocks.slice(baseline);
+		const discardedToolUseIds = attemptRows
+			? attemptRows.flatMap((row) => (row.fromAttempt && row.toolUseId ? [row.toolUseId] : []))
+			: discarded.flatMap((block) => {
+					const value = block as Record<string, unknown>;
+					return value.type === "tool_use" && typeof value.id === "string" ? [value.id] : [];
+				});
 		// Which of those calls never ran — only these may be removed.
 		const executedToolUseIds = new Set<string>();
 		const removableRowIds: string[] = [];
@@ -4306,13 +4369,20 @@ const sqliteNarratorPersistence = {
 		// Keep the blocks of tools that actually executed, drop the rest. Order is preserved
 		// by filtering the whole array: blocks are kept in `outputIndex` order, and the tool
 		// reordering at the step's seal reads tool positions.
-		const nextBlocks = blocks.filter(
-			(block, index) =>
-				index < baseline ||
-				(block.type === "tool_use" &&
-					typeof block.id === "string" &&
-					executedToolUseIds.has(block.id)),
-		);
+		const nextBlocks = attemptRows
+			? (attemptRows.flatMap((row) =>
+					!row.fromAttempt || (row.toolUseId && executedToolUseIds.has(row.toolUseId))
+						? row.elements
+						: [],
+				) as Array<Record<string, unknown>>)
+			: blocks.filter(
+					(block, index) =>
+						index < baseline ||
+						(block.type === "tool_use" &&
+							typeof block.id === "string" &&
+							executedToolUseIds.has(block.id)),
+				);
+		const kept = nextBlocks.length - (blocks.length - discarded.length);
 		const contentText = nextBlocks
 			.flatMap((block) =>
 				block.type === "text" && typeof block.text === "string" ? [block.text] : [],
@@ -4343,8 +4413,8 @@ const sqliteNarratorPersistence = {
 		);
 		return {
 			messageId: partialId,
-			discardedBlocks: discarded.length - (nextBlocks.length - baseline),
-			retainedExecutedCalls: nextBlocks.length - baseline,
+			discardedBlocks: discarded.length - kept,
+			retainedExecutedCalls: kept,
 			removedToolUseIds: discardedToolUseIds.filter((id) => !executedToolUseIds.has(id)),
 		};
 	},
@@ -4357,8 +4427,17 @@ const sqliteNarratorPersistence = {
 		const updates = Object.fromEntries(
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
-		if (Object.keys(updates).length === 0) return;
-		await db.update(narratorMessages).set(updates).where(eq(narratorMessages.id, messageId));
+		db.transaction((tx) => {
+			if (Object.keys(updates).length)
+				tx.update(narratorMessages).set(updates).where(eq(narratorMessages.id, messageId)).run();
+			// The step is complete: items it left incomplete are interrupted, not streaming.
+			syncEnvelopeNow(messageId, "sealed");
+		});
+	},
+
+	/** Seal a step's blocks without changing its metadata (a kept partial after a stop). */
+	sealStepBlocks(messageId: string): void {
+		db.transaction(() => syncEnvelopeNow(messageId, "sealed"));
 	},
 
 	/** Put a sealed step's tool_use blocks into the model's call order. */
@@ -4368,13 +4447,16 @@ const sqliteNarratorPersistence = {
 		content: unknown[],
 		contentText: string | null,
 	): Promise<void> {
-		await db
-			.update(narratorMessages)
-			.set({
-				contentJson: content,
-				contextCharsJson: measureMessageCharacters("assistant", content, contentText),
-			})
-			.where(eq(narratorMessages.id, messageId));
+		db.transaction((tx) => {
+			tx.update(narratorMessages)
+				.set({
+					contentJson: content,
+					contextCharsJson: measureMessageCharacters("assistant", content, contentText),
+				})
+				.where(eq(narratorMessages.id, messageId))
+				.run();
+			syncEnvelopeNow(messageId, "sealed");
+		});
 		queueContextCharacterRefresh(narratorId, messageId);
 	},
 
@@ -4460,6 +4542,7 @@ const sqliteNarratorPersistence = {
 			tx.insert(narratorMessages)
 				.values({
 					id,
+					...newEnvelopeColumns(narratorId),
 					narratorId,
 					role: "user",
 					contentJson: [

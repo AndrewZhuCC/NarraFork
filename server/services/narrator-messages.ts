@@ -87,12 +87,17 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
+import { newEnvelopeColumns } from "./narrator-block-sync";
 import {
 	createPostgresNarratorDisplayPagePort,
 	readDisplayFixtureMessages,
 	readNarratorDisplayMessages,
 } from "./narrator-display-page-reader";
-import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
+import {
+	cowEnvelopeTx,
+	deleteRecipientMessageRefs,
+	updateRecipientMessageRef,
+} from "./narrator-persistence";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
 	ensureRefsCoverMessage,
@@ -856,40 +861,16 @@ function applyBlockDeletionTx(
 			: {}),
 	};
 	if (isShared) {
-		const newId = generateId();
-		tx.insert(narratorMessages)
-			.values({ ...message, ...patch, id: newId })
-			.run();
-		tx.update(narratorMessageRefs)
-			.set({ messageId: newId })
-			.where(eq(narratorMessageRefs.id, ref.id))
-			.run();
-		updateRecipientMessageRef(tx, narratorId, ref.id, {
-			kind: "semantic_edit",
-			messageId: newId,
-		});
 		const retainedIds = new Set(
 			remaining.filter((block) => block.type === "tool_use").map((block) => block.id),
 		);
-		const retainedCalls = plan.toolCalls.filter((call) => retainedIds.has(call.toolUseId));
-		if (retainedCalls.length > 0) {
-			tx.insert(narratorToolCalls)
-				.values(
-					retainedCalls.map((call) => ({
-						...call,
-						id: generateId(),
-						messageId: newId,
-						executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
-					})),
-				)
-				.run();
-		}
-		// The fork boundary follows this narrator's COW ref, not the shared original.
-		tx.update(narrators)
-			.set({ forkMessageId: newId })
-			.where(and(eq(narrators.id, narratorId), eq(narrators.forkMessageId, message.id)))
-			.run();
-		return newId;
+		return cowEnvelopeTx(tx, {
+			original: message,
+			ref: { id: ref.id, narratorId },
+			changes: patch,
+			toolCalls: plan.toolCalls.filter((call) => retainedIds.has(call.toolUseId)),
+			receipt: "semantic_edit",
+		});
 	} else {
 		tx.update(narratorMessages).set(patch).where(eq(narratorMessages.id, message.id)).run();
 		updateRecipientMessageRef(tx, narratorId, ref.id, {
@@ -1089,32 +1070,12 @@ function copySharedCompactMessageTx(
 		.where(eq(narratorMessageRefs.messageId, message.id))
 		.all();
 	if (refs.length <= 1) return { messageId: message.id, copied: false };
-
-	const newMessageId = generateId();
-	tx.insert(narratorMessages)
-		.values({
-			...message,
-			id: newMessageId,
-			narratorId,
-			createdAt: message.createdAt,
-		})
-		.run();
-	tx.update(narratorMessageRefs)
-		.set({ messageId: newMessageId })
-		.where(eq(narratorMessageRefs.id, ref.id))
-		.run();
-	const narrator = tx.query.narrators
-		.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { forkMessageId: true },
-		})
-		.sync();
-	const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
-	if (narrator?.forkMessageId === message.id) narratorUpdates.forkMessageId = newMessageId;
-	if (Object.keys(narratorUpdates).length > 0) {
-		tx.update(narrators).set(narratorUpdates).where(eq(narrators.id, narratorId)).run();
-	}
-	return { messageId: newMessageId, copied: true };
+	const messageId = cowEnvelopeTx(tx, {
+		original: message,
+		ref: { id: ref.id, narratorId },
+		toolCalls: [],
+	});
+	return { messageId, copied: true };
 }
 
 function assertNoRunningCompactRefsTx(tx: MessageTx, narratorId: string, refIds: string[]): void {
@@ -1672,6 +1633,7 @@ function insertFileHistoryCheckpoints(
 				id: checkpointId,
 				narratorId,
 				role: "disp",
+				...newEnvelopeColumns(narratorId),
 				contentJson: [{ type: "file_history_checkpoint" }],
 				contextCharsJson: { segments: [] },
 				contentText: null,
@@ -3704,8 +3666,31 @@ const narratorMessageQueriesUnlocked = {
 		// A failed earlier compact marker may sit inside this retry range. Keep it
 		// visible in the transcript, but never summarize it into a later compact.
 		const compactableMessages = messages.filter((message) => !isCompactLifecycleMessage(message));
+		// A copy keeps its author: the sender label is the author's title, not the holder's.
+		const authorIds = [
+			...new Set(
+				compactableMessages.flatMap((message) =>
+					message.authorNarratorId && message.authorNarratorId !== message.narratorId
+						? [message.authorNarratorId]
+						: [],
+				),
+			),
+		];
+		const authorTitles = new Map(
+			authorIds.length
+				? (
+						await db
+							.select({ id: narrators.id, title: narrators.title })
+							.from(narrators)
+							.where(inArray(narrators.id, authorIds))
+					).map((row) => [row.id, row.title])
+				: [],
+		);
 		return compactableMessages.map((message) => ({
 			...message,
+			...(message.authorNarratorId && authorTitles.has(message.authorNarratorId)
+				? { narrator: { title: authorTitles.get(message.authorNarratorId) ?? null } }
+				: {}),
 			toolCalls: latestToolCallAttempts(message.toolCalls),
 		}));
 	},

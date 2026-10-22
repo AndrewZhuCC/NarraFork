@@ -35,6 +35,7 @@ export type ModelSourceRow = {
 	bodyRevision: number;
 	jsonContainerBytes?: number;
 	narratorId: string;
+	authorNarratorId: string | null;
 	role: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown;
 	contentText: string | null;
@@ -158,12 +159,14 @@ export async function queryModelHistory(
 					title: string | null;
 				}
 			>(
-				`SELECT m.id, ${options.versioned ? "m.body_revision" : "0"} AS "bodyRevision", m.narrator_id AS "narratorId", m.role, m.content_json AS "contentJson",
+				`SELECT m.id, ${options.versioned ? "m.body_revision" : "0"} AS "bodyRevision", m.narrator_id AS "narratorId",
+				 m.author_narrator_id AS "authorNarratorId", m.role, m.content_json AS "contentJson",
 				 m.content_text AS "contentText", m.parent_tool_use_id AS "parentToolUseId",
 				 m.sdk_message_uuid AS "messageUuid", m.created_by AS "createdBy", m.origin,
 				 m.origin_label AS "originLabel", u.username, n.title
 				 FROM narrator_messages m LEFT JOIN users u ON u.id = m.created_by
-				 LEFT JOIN narrators n ON n.id = m.narrator_id WHERE m.id IN (${placeholders})`,
+				 LEFT JOIN narrators n ON n.id = coalesce(m.author_narrator_id, m.narrator_id)
+				 WHERE m.id IN (${placeholders})`,
 				ids,
 			);
 			counters.bodyQueries++;

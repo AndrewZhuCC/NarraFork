@@ -14,6 +14,7 @@ export interface SenderMessage extends DbMessage {
 	origin?: string | null;
 	originLabel?: string | null;
 	creator?: { username: string } | null;
+	/** The author narrator's title (the owner's when no author is recorded). */
 	narrator?: { title?: string | null } | null;
 }
 
@@ -64,7 +65,7 @@ function systemSender(message: SenderMessage): MessageSender {
 /** Ownership and role/origin outrank createdBy (which can be an initiating human). */
 export function resolveMessageSender(message: SenderMessage): MessageSender {
 	if (message.role === "assistant")
-		return sender("agent", message.narratorId, message.narrator?.title);
+		return sender("agent", message.authorNarratorId ?? message.narratorId, message.narrator?.title);
 	const items = inboundItems(message);
 	if (items.length) {
 		const identities = items.map(itemSender);

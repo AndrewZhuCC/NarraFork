@@ -46,9 +46,12 @@ export const narratorStore = {
 	/** Drop what a discarded provider attempt wrote into an open step. */
 	discardAttempt: (...args: Parameters<Persistence["discardAttemptBlocks"]>) =>
 		narratorPersistence.discardAttemptBlocks(...args),
-	/** Final metadata of a sealed step. */
+	/** Final metadata of a sealed step; its incomplete items become interrupted. */
 	sealStepMeta: (...args: Parameters<Persistence["patchStepMeta"]>) =>
 		narratorPersistence.patchStepMeta(...args),
+	/** Seal a step kept after a stop: its incomplete items are interrupted, not streaming. */
+	sealStep: (...args: Parameters<Persistence["sealStepBlocks"]>) =>
+		narratorPersistence.sealStepBlocks(...args),
 	/** Put a sealed step's calls into the model's call order. */
 	orderStepCalls: (...args: Parameters<Persistence["reorderStepToolBlocks"]>) =>
 		narratorPersistence.reorderStepToolBlocks(...args),

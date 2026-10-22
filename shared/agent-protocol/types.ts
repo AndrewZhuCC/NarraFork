@@ -171,8 +171,10 @@ export interface WebSearchAction {
 
 export interface DbMessage {
 	id: string;
-	/** Original owner narrator for this persisted message row. */
+	/** Owner narrator for this persisted message row (a copy belongs to its holder). */
 	narratorId?: string;
+	/** The narrator that wrote it; unchanged by copies (§6.3). Null means the owner. */
+	authorNarratorId?: string | null;
 	role: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown;
 	contentText: string | null;

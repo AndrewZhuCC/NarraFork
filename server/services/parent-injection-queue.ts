@@ -21,6 +21,7 @@ import {
 import type { LegacyCompletionAdmission } from "./agent-runtime/publication-outbox";
 import type { CompletedNotification } from "./background-task-service";
 import type { CompletedBgSubagentNotification } from "./bg-completion-queue";
+import { newEnvelopeColumns } from "./narrator-block-sync";
 import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "./narrator-refs/seq-store";
 import type { ParentInboundMessage } from "./parent-inbound-queue";
@@ -101,6 +102,7 @@ function persistUnboundLegacyAgentMessage(
 				id: messageId,
 				narratorId,
 				role: "disp",
+				...newEnvelopeColumns(narratorId),
 				origin: "system",
 				contentText: text,
 				contentJson: [{ type: "text", text }],

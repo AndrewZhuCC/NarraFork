@@ -15,10 +15,9 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, stripVTControlCharacters } from "node:util";
 import {
 	appendGeneratedModelHistoryTriggers,
-	generatedModelHistoryTriggerSuffix,
-	MODEL_HISTORY_REVISION_CONTRACT,
+	generatedModelHistoryTriggerContract,
 	modelHistoryTriggerSuffix,
-	renderModelHistoryRevisionSql,
+	renderModelHistoryContractSql,
 	splitGeneratedModelHistoryTriggers,
 } from "./generated-model-history-triggers";
 import { runPostgresKit } from "./postgres-kit";
@@ -444,14 +443,18 @@ function validateReceiptPayload(root: string, receipt: Receipt): string {
 		if (!latest || !receipt.newFiles[`${latest.tag}.sql`] || receipt.oldFiles[`${latest.tag}.sql`])
 			throw new Error("Invalid PostgreSQL new SQL receipt");
 		if (receipt.modelHistoryTriggers) {
-			if (
-				receipt.modelHistoryTriggers.contract !== MODEL_HISTORY_REVISION_CONTRACT ||
-				receipt.modelHistoryTriggers.sqlDigest !== digest(renderModelHistoryRevisionSql("postgres"))
-			)
+			const { contract, sqlDigest } = receipt.modelHistoryTriggers;
+			let rendered: string;
+			try {
+				rendered = renderModelHistoryContractSql("postgres", contract);
+			} catch {
+				throw new Error("PostgreSQL pending model-history trigger renderer changed");
+			}
+			if (sqlDigest !== digest(rendered))
 				throw new Error("PostgreSQL pending model-history trigger renderer changed");
 			splitGeneratedModelHistoryTriggers(
 				readBounded(join(stage, "publish", `${latest.tag}.sql`), MAX_SQL_BYTES),
-				modelHistoryTriggerSuffix("postgres"),
+				modelHistoryTriggerSuffix("postgres", contract),
 			);
 		}
 	}
@@ -799,21 +802,21 @@ export async function executePostgresMigrations(
 			validateHistory(parseJournal(preservedJournal), history, snapshotText);
 			// Append only to this freshly generated schema transition, after native
 			// snapshot convergence but BEFORE any durable receipt/hash is produced.
-			const triggerSuffix = generatedModelHistoryTriggerSuffix(
+			const triggerContract = generatedModelHistoryTriggerContract(
 				{ tables: before.snapshot.tables },
 				{ tables: snapshot.tables },
 				"postgres",
 			);
 			const generatedSql = appendGeneratedModelHistoryTriggers(
 				readBounded(join(owned.stage, sqlPath), MAX_SQL_BYTES),
-				triggerSuffix,
+				triggerContract ? modelHistoryTriggerSuffix("postgres", triggerContract) : "",
 			);
 			if (Buffer.byteLength(generatedSql) > MAX_SQL_BYTES)
 				throw new Error("PostgreSQL generated SQL with triggers exceeds byte budget");
-			if (triggerSuffix)
+			if (triggerContract)
 				modelHistoryTriggers = {
-					contract: MODEL_HISTORY_REVISION_CONTRACT,
-					sqlDigest: digest(renderModelHistoryRevisionSql("postgres")),
+					contract: triggerContract,
+					sqlDigest: digest(renderModelHistoryContractSql("postgres", triggerContract)),
 				};
 			files = {
 				[sqlPath]: generatedSql,
