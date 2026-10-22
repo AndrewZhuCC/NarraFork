@@ -523,12 +523,15 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 122 tables and 1717 columns including file IO outcomes and editor recovery", () => {
-		expect(target.tables.length).toBe(122);
+	test("covers 127 tables and 1762 columns including file IO outcomes and editor recovery", () => {
+		expect(target.tables.length).toBe(127);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1717);
+		// Block storage (P1) adds 45: narrator_blocks (19), narrator_block_assets (3),
+		// narrator_block_sync_queue (1), narrator_text_snapshots (4), narrator_turns (10), six
+		// envelope columns and two ledger columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1762);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

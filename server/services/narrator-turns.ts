@@ -10,7 +10,9 @@
  * run without a lookup.
  */
 
-import { sqlite } from "../db";
+// Read through the namespace: the handle is a live binding, and importers that mock
+// `server/db` without it can still load this module.
+import * as database from "../db";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -40,7 +42,7 @@ let turnSchema: boolean | undefined;
 
 /** Whether this database has the turns table (a schema predating it records none). */
 function hasTurnSchema(): boolean {
-	turnSchema ??= !!sqlite
+	turnSchema ??= !!database.sqlite
 		.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'narrator_turns'")
 		.get();
 	return turnSchema;
@@ -62,8 +64,8 @@ export function startTurn(narratorId: string): string | null {
 	if (previous) endTurn(narratorId, previous.id, { status: "interrupted", stopReason: "replaced" });
 	const id = generateId();
 	try {
-		sqlite.transaction(() => {
-			const latest = sqlite
+		database.sqlite.transaction(() => {
+			const latest = database.sqlite
 				.prepare(
 					`SELECT m.id, m.role, m.turn_id AS turnId FROM narrator_message_refs r
 					 JOIN narrator_messages m ON m.id = r.message_id
@@ -71,14 +73,14 @@ export function startTurn(narratorId: string): string | null {
 				)
 				.get(narratorId) as { id: string; role: string; turnId: string | null } | null;
 			const trigger = latest?.role === "user" && latest.turnId === null ? latest.id : null;
-			sqlite
+			database.sqlite
 				.prepare(
 					`INSERT INTO narrator_turns (id, narrator_id, status, trigger_message_id, started_at)
 					 VALUES (?, ?, 'running', ?, ?)`,
 				)
 				.run(id, narratorId, trigger, new Date().toISOString());
 			if (trigger)
-				sqlite
+				database.sqlite
 					.prepare("UPDATE narrator_messages SET turn_id = ? WHERE id = ? AND turn_id IS NULL")
 					.run(id, trigger);
 		})();
@@ -143,7 +145,7 @@ export function endTurn(
 	if (!turn || turn.id !== turnId) return;
 	activeTurns.delete(narratorId);
 	try {
-		sqlite
+		database.sqlite
 			.prepare(
 				`UPDATE narrator_turns SET status = ?, stop_reason = ?, ended_at = ?, step_count = ?,
 					tool_call_count = ?, usage_json = ?
@@ -169,20 +171,20 @@ export function endTurn(
  */
 export function recoverInterruptedTurns(): number {
 	if (!hasTurnSchema()) return 0;
-	const running = sqlite
+	const running = database.sqlite
 		.prepare("SELECT id, narrator_id AS narratorId FROM narrator_turns WHERE status = 'running'")
 		.all() as Array<{ id: string; narratorId: string }>;
-	const lastEnvelope = sqlite.prepare(
+	const lastEnvelope = database.sqlite.prepare(
 		`SELECT m.created_at AS createdAt FROM narrator_message_refs r
 		 JOIN narrator_messages m ON m.id = r.message_id
 		 WHERE r.narrator_id = ? AND m.turn_id = ? ORDER BY r.seq DESC LIMIT 1`,
 	);
-	const close = sqlite.prepare(
+	const close = database.sqlite.prepare(
 		`UPDATE narrator_turns SET status = 'interrupted', stop_reason = 'restart',
 			ended_at = coalesce(?, started_at)
 		 WHERE id = ? AND status = 'running'`,
 	);
-	sqlite.transaction(() => {
+	database.sqlite.transaction(() => {
 		for (const turn of running) {
 			const last = lastEnvelope.get(turn.narratorId, turn.id) as { createdAt: string } | null;
 			close.run(last?.createdAt ?? null, turn.id);

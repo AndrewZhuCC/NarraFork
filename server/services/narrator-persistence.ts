@@ -4357,8 +4357,12 @@ const sqliteNarratorPersistence = {
 		const blocks = Array.isArray(message?.contentJson)
 			? (message.contentJson as Array<Record<string, unknown>>)
 			: [];
+		// What the rows say must be what the envelope stores now: converge, then read.
 		const attemptRows = attemptId
-			? db.transaction(() => contentByAttempt(messageId, attemptId))
+			? db.transaction(() => {
+					syncEnvelopeNow(messageId);
+					return contentByAttempt(messageId, attemptId);
+				})
 			: null;
 		if (attemptRows ? !attemptRows.some((row) => row.fromAttempt) : blocks.length <= baseline)
 			return null;
@@ -4463,7 +4467,10 @@ const sqliteNarratorPersistence = {
 
 	/** Seal a step's blocks without changing its metadata (a kept partial after a stop). */
 	sealStepBlocks(messageId: string): void {
-		db.transaction(() => syncEnvelopeNow(messageId, "sealed"));
+		db.transaction(() => {
+			syncEnvelopeNow(messageId, "sealed");
+			flushChangedEnvelopes();
+		});
 	},
 
 	/** Put a sealed step's tool_use blocks into the model's call order. */

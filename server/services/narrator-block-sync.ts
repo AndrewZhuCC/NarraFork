@@ -28,7 +28,9 @@ import {
 import { INTERNAL_READ_TOOL_USE_PREFIX } from "@shared/narrator-blocks/decode";
 import { assembleContent, type BlockDraft, splitEnvelope } from "@shared/narrator-blocks/storage";
 import type { CanonicalBlock, EnvelopeRole } from "@shared/narrator-blocks/types";
-import { sqlite } from "../db";
+// Read through the namespace: the handle is a live binding, and importers that mock
+// `server/db` without it can still load this module.
+import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -63,7 +65,7 @@ let blockSchema: boolean | undefined;
 
 /** Whether this database has block storage (a schema predating it writes legacy rows). */
 function hasBlockSchema(): boolean {
-	blockSchema ??= !!sqlite
+	blockSchema ??= !!database.sqlite
 		.prepare(
 			"SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'narrator_block_sync_queue'",
 		)
@@ -81,11 +83,13 @@ const FLUSH_LIMIT = 64;
 export function flushChangedEnvelopes(limit = FLUSH_LIMIT): number {
 	if (!hasBlockSchema()) return 0;
 	const ids = (
-		sqlite
+		database.sqlite
 			.prepare("SELECT message_id AS id FROM narrator_block_sync_queue LIMIT ?")
 			.all(limit) as Array<{ id: string }>
 	).map((row) => row.id);
-	const done = sqlite.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?");
+	const done = database.sqlite.prepare(
+		"DELETE FROM narrator_block_sync_queue WHERE message_id = ?",
+	);
 	for (const id of ids) {
 		syncEnvelope(id);
 		done.run(id);
@@ -101,7 +105,9 @@ export function syncEnvelopeNow(
 ): void {
 	if (!hasBlockSchema()) return;
 	syncEnvelope(messageId, mode, stamp);
-	sqlite.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?").run(messageId);
+	database.sqlite
+		.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
+		.run(messageId);
 }
 
 const SWEEP_INTERVAL_MS = 5_000;
@@ -115,7 +121,7 @@ function drainQueue(budgetMs: number): number {
 	const started = performance.now();
 	let synced = 0;
 	for (;;) {
-		const batch = sqlite.transaction(() => flushChangedEnvelopes(SWEEP_BATCH))();
+		const batch = database.sqlite.transaction(() => flushChangedEnvelopes(SWEEP_BATCH))();
 		synced += batch;
 		if (batch < SWEEP_BATCH || performance.now() - started >= budgetMs) return synced;
 	}
@@ -146,7 +152,7 @@ export function stopBlockSyncSweep(): void {
  */
 export function recoverBlockStorage(): number {
 	if (!hasBlockSchema()) return 0;
-	const interrupted = sqlite
+	const interrupted = database.sqlite
 		.prepare(
 			`UPDATE narrator_blocks SET phase = 'aborted', revision = revision + 1,
 				completed_at = coalesce(completed_at, ?)
@@ -168,7 +174,7 @@ const AUDIT_ENVELOPES = 50;
  */
 export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
 	if (!hasBlockSchema()) return [];
-	const rows = sqlite
+	const rows = database.sqlite
 		.prepare(
 			`SELECT id, content_json AS contentJson FROM narrator_messages
 			 WHERE body_format = 2 ORDER BY rowid DESC LIMIT ?`,
@@ -177,7 +183,7 @@ export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
 	const differing = rows.flatMap((row) => {
 		const stored = parse(row.contentJson);
 		if (!Array.isArray(stored)) return [];
-		const blocks = sqlite
+		const blocks = database.sqlite
 			.prepare("SELECT payload, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal")
 			.all(row.id) as Array<{ payload: string; state: string | null }>;
 		const assembled = assembleContent(
@@ -187,7 +193,7 @@ export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
 	});
 	if (differing.length) {
 		logger.warn("Block rows differed from their envelope; re-synced", { messageIds: differing });
-		sqlite.transaction(() => {
+		database.sqlite.transaction(() => {
 			for (const id of differing) syncEnvelopeNow(id);
 		})();
 	}
@@ -313,7 +319,7 @@ function assetsOf(
 
 /** Adopted attempt per tool use: the newest execution attempt. */
 function adoptedCalls(messageId: string): LedgerRow[] {
-	const rows = sqlite
+	const rows = database.sqlite
 		.prepare(
 			`SELECT tool_use_id AS toolUseId, tool_name AS toolName, input_json AS inputJson,
 				output_json AS outputJson, status
@@ -338,7 +344,7 @@ export function syncEnvelope(
 	mode: SyncMode = "keep",
 	stamp: BlockStamp = {},
 ): void {
-	const row = sqlite
+	const row = database.sqlite
 		.prepare(
 			`SELECT id, narrator_id AS narratorId, role, content_json AS contentJson,
 				content_text AS contentText, parent_tool_use_id AS parentToolUseId,
@@ -376,7 +382,7 @@ export function syncEnvelope(
 		},
 	).blocks;
 
-	const existing = sqlite
+	const existing = database.sqlite
 		.prepare(
 			`SELECT id, ordinal, kind, subtype, phase, wire_id AS wireId, model_text AS modelText,
 				payload, state, revision
@@ -412,33 +418,35 @@ export function syncEnvelope(
 	});
 
 	const removed = existing.filter((block) => !kept.has(block.id));
-	const deleteBlock = sqlite.prepare("DELETE FROM narrator_blocks WHERE id = ?");
+	const deleteBlock = database.sqlite.prepare("DELETE FROM narrator_blocks WHERE id = ?");
 	for (const block of removed) {
 		dropBlockIndex(block.id);
 		deleteBlock.run(block.id);
 	}
 	// Ordinals are unique per envelope: park every moving row before placing any.
-	const park = sqlite.prepare("UPDATE narrator_blocks SET ordinal = ? WHERE id = ?");
+	const park = database.sqlite.prepare("UPDATE narrator_blocks SET ordinal = ? WHERE id = ?");
 	for (const plan of plans)
 		if (plan.current && plan.current.ordinal !== plan.ordinal) park.run(-1 - plan.ordinal, plan.id);
 
-	const insert = sqlite.prepare(
+	const insert = database.sqlite.prepare(
 		`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, subtype, phase, revision, wire_id,
 			attempt_id, model_chars, byte_size, created_at, completed_at, model_text, payload, state)
 		 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
-	const update = sqlite.prepare(
+	const update = database.sqlite.prepare(
 		`UPDATE narrator_blocks SET ordinal = ?, kind = ?, subtype = ?, phase = ?, revision = ?,
 			wire_id = ?, model_chars = ?, byte_size = ?,
 			completed_at = CASE WHEN ? = 'open' THEN NULL ELSE coalesce(completed_at, ?) END,
 			model_text = ?, payload = ?, state = ?
 		 WHERE id = ?`,
 	);
-	const clearAssets = sqlite.prepare("DELETE FROM narrator_block_assets WHERE block_id = ?");
-	const addAsset = sqlite.prepare(
+	const clearAssets = database.sqlite.prepare(
+		"DELETE FROM narrator_block_assets WHERE block_id = ?",
+	);
+	const addAsset = database.sqlite.prepare(
 		"INSERT OR IGNORE INTO narrator_block_assets (block_id, asset_id, role) VALUES (?, ?, ?)",
 	);
-	const bindLedger = sqlite.prepare(
+	const bindLedger = database.sqlite.prepare(
 		`UPDATE narrator_tool_calls SET block_id = ?
 		 WHERE message_id = ? AND tool_use_id = ? AND is_internal = 0 AND block_id IS NOT ?`,
 	);
@@ -515,7 +523,7 @@ export function syncEnvelope(
 		else if (!current || changed || output !== undefined)
 			writeBlockIndex(plan.id, blockIndexText(draft.canonical, output));
 	}
-	sqlite
+	database.sqlite
 		.prepare("UPDATE narrator_messages SET body_bytes = ? WHERE id = ? AND body_bytes <> ?")
 		.run(bodyBytes, messageId, bodyBytes);
 }
@@ -524,15 +532,14 @@ export function syncEnvelope(
  * An envelope's stored content block by block, each marked by whether `attemptId`
  * created it (§5.3). Null when the envelope keeps no block rows (a legacy-format
  * envelope, or a database without block storage): the caller falls back to positions.
+ * The caller syncs the envelope first, in the same transaction.
  */
 export function contentByAttempt(
 	messageId: string,
 	attemptId: string,
 ): Array<{ fromAttempt: boolean; toolUseId: string | null; elements: unknown[] }> | null {
 	if (!hasBlockSchema()) return null;
-	// Converge first: what the rows say must be what the envelope stores now.
-	syncEnvelopeNow(messageId);
-	const rows = sqlite
+	const rows = database.sqlite
 		.prepare(
 			`SELECT b.attempt_id AS attemptId, b.kind, b.wire_id AS wireId, b.payload, b.state
 			 FROM narrator_blocks b JOIN narrator_messages m ON m.id = b.message_id
@@ -568,7 +575,7 @@ export function inheritBlockLineage(fromMessageId: string, toMessageId: string):
 	const source = keyedRows(fromMessageId);
 	if (!source.length) return;
 	const byKey = new Map(source.map((row) => [row.key, row]));
-	const inherit = sqlite.prepare(
+	const inherit = database.sqlite.prepare(
 		`UPDATE narrator_blocks SET origin_block_id = ?, attempt_id = ?, created_at = ?
 		 WHERE id = ? AND (origin_block_id IS NOT ? OR attempt_id IS NOT ? OR created_at IS NOT ?)`,
 	);
@@ -596,14 +603,14 @@ function keyedRows(messageId: string): Array<{
 	attemptId: string | null;
 	createdAt: string;
 }> {
-	const envelope = sqlite
+	const envelope = database.sqlite
 		.prepare(
 			`SELECT id, narrator_id AS narratorId, role, content_text AS contentText,
 				parent_tool_use_id AS parentToolUseId, origin FROM narrator_messages WHERE id = ?`,
 		)
 		.get(messageId) as Omit<EnvelopeRow, "contentJson" | "bodyFormat"> | null;
 	if (!envelope) return [];
-	const rows = sqlite
+	const rows = database.sqlite
 		.prepare(
 			`SELECT id, payload, state, origin_block_id AS originBlockId, attempt_id AS attemptId,
 				created_at AS createdAt
@@ -630,9 +637,9 @@ function keyedRows(messageId: string): Array<{
 // === Block search index (§4.6) ===
 
 function writeBlockIndex(blockId: string, text: string): void {
-	replaceBlockIndexText(sqlite, blockId, text);
+	replaceBlockIndexText(database.sqlite, blockId, text);
 }
 
 function dropBlockIndex(blockId: string): void {
-	removeBlockIndexText(sqlite, blockId);
+	removeBlockIndexText(database.sqlite, blockId);
 }

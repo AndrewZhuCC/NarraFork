@@ -47,7 +47,8 @@ export const DISPLAY_MESSAGE_COLUMNS = [
 	model outputTokens cachedInputTokens cacheCreationInputTokens cacheCreation5mTokens
 	cacheCreation1hTokens reasoningTokens ttftMs durationMs contextPercent meterUsage meterUnit
 	commitSha treeHashAfter snapshotCommitSha commandText createdBy origin originLabel editedAt
-	editedBy originalContentJson compactPending createdAt`,
+	editedBy originalContentJson compactPending bodyFormat turnId authorNarratorId causeBlockId
+	providerResponseId bodyBytes createdAt`,
 		"contentJson contextCharsJson costMissingFields turnUsageJson originalContentJson",
 	),
 	{ column: "composer_document", field: "hasComposerDocument", json: false, boolean: true },
@@ -62,9 +63,10 @@ export const DISPLAY_TOOL_COLUMNS = columns(
 	executionIdentityVersion executionOriginToolCallId executionAttempt executionSegmentId fileChangeOperationId
 	isFileHistoryCheckpoint treeHashBefore treeHashAfter ownedPathsJson inputTokens outputTokens
 	cacheCreationTokens cacheReadTokens cacheCreation5mTokens cacheCreation1hTokens inputCost outputCost
-	cacheCreationCost cacheReadCost totalCost costStatus costMissingFields provider model resultMessageId createdAt`,
+	cacheCreationCost cacheReadCost totalCost costStatus costMissingFields provider model resultMessageId
+	blockId isInternal createdAt`,
 	"inputJson outputJson executionTargetsJson permissionSuggestions ownedPathsJson costMissingFields",
-	"isBackground isFileHistoryCheckpoint",
+	"isBackground isFileHistoryCheckpoint isInternal",
 );
 
 const CREATOR_COLUMNS = columns("id username avatarColor avatarImageId", "");
