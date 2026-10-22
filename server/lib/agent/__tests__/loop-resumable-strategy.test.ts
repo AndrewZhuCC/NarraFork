@@ -119,11 +119,9 @@ async function runLoop(
 	sentContents = [];
 	const events: AgentEvent[] = [];
 	const controller = new AbortController();
-	for await (const event of agentLoop(
-		makeConfig(controller.signal, options.overrides),
-		"answer",
-		{ rows: [] },
-	)) {
+	for await (const event of agentLoop(makeConfig(controller.signal, options.overrides), "answer", {
+		rows: [],
+	})) {
 		events.push(event);
 		if (options.stopAfter && event.type === options.stopAfter) break;
 	}

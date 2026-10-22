@@ -375,11 +375,9 @@ describe("重试不得丢弃已产生的工具进展", () => {
 			sentRequests = [];
 			const ac = new AbortController();
 			const events: AgentEvent[] = [];
-			for await (const event of agentLoop(
-				makeConfig(ac.signal, { maxTransientRetries: 3 }),
-				"go",
-				{ rows: [] },
-			)) {
+			for await (const event of agentLoop(makeConfig(ac.signal, { maxTransientRetries: 3 }), "go", {
+				rows: [],
+			})) {
 				events.push(event);
 			}
 

@@ -86,7 +86,7 @@ async function runWithPlan(
 	const seen: ProgressSnapshot[] = [];
 	await runReflectionLoop({
 		parentConfig: parentConfig(),
-		history: [],
+		rows: [],
 		prompt: "decide",
 		reflectionLoop: {
 			allowedTools: [DECISION_TOOL_NAME],
@@ -136,7 +136,7 @@ describe("runReflectionLoop two-phase progress", () => {
 		streamPlan = [{ reasoning: "r" }, { text: "t" }];
 		const observed = await runReflectionLoop({
 			parentConfig: parentConfig(),
-			history: [],
+			rows: [],
 			prompt: "decide",
 			reflectionLoop: {
 				allowedTools: [DECISION_TOOL_NAME],

@@ -175,24 +175,24 @@ describe("event-driven immediate guidance", () => {
 			};
 			const events: AgentEvent[] = [];
 			for await (const event of agentLoop(
-					{
-						narratorId: "n-preaborted-guidance",
-						conversationId: "conv-preaborted-guidance",
-						provider: "test",
-						model: "test:model",
-						cwd: "/tmp",
-						signal: new AbortController().signal,
-						[channel]: guidance.signal,
-						permissionHandler: async () => ({ behavior: "allow" }),
-						shouldStop: () => {
-							softStopCalls++;
-							softStopTaken = true;
-							return true;
-						},
+				{
+					narratorId: "n-preaborted-guidance",
+					conversationId: "conv-preaborted-guidance",
+					provider: "test",
+					model: "test:model",
+					cwd: "/tmp",
+					signal: new AbortController().signal,
+					[channel]: guidance.signal,
+					permissionHandler: async () => ({ behavior: "allow" }),
+					shouldStop: () => {
+						softStopCalls++;
+						softStopTaken = true;
+						return true;
 					},
-					"queued guidance",
-				))
-					events.push(event);
+				},
+				"queued guidance",
+			))
+				events.push(event);
 			// The queued input stays with the host (nothing was sent, nothing is written).
 			expect(attempts).toBe(0);
 			expect(softStopTaken).toBe(true);

@@ -4,15 +4,17 @@
  * Reproduces the observed grok-4.5-behind-a-proxy behaviour: each turn returns
  * `call_go_0`. Nothing is wrong within a single turn, but the replayed history then
  * carries the same id in several assistant messages and the upstream rejects the
- * request with 400 "Found duplicate tool_use id". The loop must keep the model-facing
- * history unique while leaving the persisted/broadcast ids untouched.
+ * request with 400 "Found duplicate tool_use id". The loop's transcript keeps the ids
+ * the provider minted, like the store does; the projection every request runs through
+ * (`uniquifyDbMessageToolUseIds`) keeps the model-facing history unique, and the
+ * persisted/broadcast ids stay untouched.
  */
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import type { ProviderAdapter } from "../provider";
+import type { DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
-import type { AgentConfig, AgentEvent, AgentToolUse } from "../types";
+import type { AgentConfig, AgentEvent } from "../types";
 
 const TEST_TOOL_NAME = "TestDupIdTool";
 /** The id this provider repeats on every single tool call. */
@@ -21,16 +23,42 @@ const REPEATED_ID = "call_go_0";
 const TOOL_TURNS = 3;
 
 let providerAttempts = 0;
-/** Anthropic-ish history the fake provider accumulates, mirroring a real adapter. */
-let history: Array<Record<string, unknown>> = [];
-/** tool_use ids seen by pushAssistantTurn, per turn. */
-const historyToolUseIdsPerTurn: string[][] = [];
-/** tool_use_id values seen by pushUserTurn (the paired tool results). */
-const historyToolResultIdsPerTurn: string[][] = [];
+/** The Anthropic-ish history of the latest request. */
+let lastHistory: Array<{ role: string; content: Array<Record<string, unknown>> }> = [];
+
+/** An Anthropic-ish second stage: steps with their tool_use blocks, then their results. */
+function anthropicLike(rows: readonly DbMessage[]) {
+	return rows.flatMap((row) => {
+		const blocks = Array.isArray(row.contentJson)
+			? (row.contentJson as Array<Record<string, unknown>>)
+			: [];
+		if (row.role !== "assistant") return [{ role: "user", content: blocks }];
+		const settled = (row.toolCalls ?? []).filter(
+			(call) => call.status === "success" || call.status === "fail",
+		);
+		return [
+			{ role: "assistant", content: blocks.filter((block) => block.type === "tool_use") },
+			...(settled.length
+				? [
+						{
+							role: "user",
+							content: settled.map((call) => ({ type: "tool_result", tool_use_id: call.toolUseId })),
+						},
+					]
+				: []),
+		];
+	});
+}
+
+function blockIds(type: string, key: string): string[] {
+	return lastHistory.flatMap((message) =>
+		message.content.flatMap((block) => (block.type === type ? [String(block[key])] : [])),
+	);
+}
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({ history: anthropicLike(rows) }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
@@ -39,6 +67,7 @@ const testProvider: ProviderAdapter = {
 		// Assert what a real API would validate: no duplicate tool_use id anywhere in
 		// the request. Throwing here would surface as a loop error event, so record it
 		// as a plain failure the test can assert on afterwards.
+		lastHistory = structuredClone(params.history) as typeof lastHistory;
 		const seen = new Set<string>();
 		for (const message of params.history as Array<Record<string, unknown>>) {
 			const content = message.content;
@@ -109,13 +138,11 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 describe("agentLoop 处理提供商重复的 tool_use ID", () => {
 	test("跨轮重复的 ID 在模型历史中被唯一化，但对外事件保留原始 ID", async () => {
 		providerAttempts = 0;
-		history = [];
-		historyToolUseIdsPerTurn.length = 0;
-		historyToolResultIdsPerTurn.length = 0;
+		lastHistory = [];
 
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
-		for await (const event of agentLoop(makeConfig(ac.signal), "go", history)) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "go")) {
 			events.push(event);
 		}
 
@@ -125,19 +152,17 @@ describe("agentLoop 处理提供商重复的 tool_use ID", () => {
 
 		// The loop ran all tool turns plus the final text turn.
 		expect(providerAttempts).toBe(TOOL_TURNS + 1);
-		expect(historyToolUseIdsPerTurn).toHaveLength(TOOL_TURNS);
 
-		// Model-facing history: every tool_use id is unique across turns, and the first
-		// turn keeps the provider's original id.
-		const historyIds = historyToolUseIdsPerTurn.flat();
+		// Model-facing history of the last request: every tool_use id is unique across
+		// turns, and the first turn keeps the provider's original id.
+		const historyIds = blockIds("tool_use", "id");
 		expect(historyIds).toHaveLength(TOOL_TURNS);
 		expect(new Set(historyIds).size).toBe(TOOL_TURNS);
 		expect(historyIds[0]).toBe(REPEATED_ID);
 
 		// Each replayed tool result matches the tool_use id of the turn it answers,
 		// so no orphaned result / unanswered call reaches the API.
-		const pairedResultIds = historyToolResultIdsPerTurn.flat().filter(Boolean);
-		expect(pairedResultIds).toEqual(historyIds.slice(0, pairedResultIds.length));
+		expect(blockIds("tool_result", "tool_use_id")).toEqual(historyIds);
 
 		// Outward-facing events (persistence, UI, permissions) keep the provider's id.
 		const toolCallIds = events

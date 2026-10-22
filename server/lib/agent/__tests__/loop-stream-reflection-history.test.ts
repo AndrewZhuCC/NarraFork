@@ -270,7 +270,10 @@ function run(images?: Array<{ format: string; base64: string }>) {
 		for await (const event of agentLoop(config, USER_TEXT, { rows: [] }, images)) {
 			events.push(event);
 			// The turn's input joins the transcript once the model has answered it.
-			if (event.type === "assistant_message" && event.toolUses.some((tu) => tu.toolUseId === "tu-danger"))
+			if (
+				event.type === "assistant_message" &&
+				event.toolUses.some((tu) => tu.toolUseId === "tu-danger")
+			)
 				userCommitted.resolve();
 			if (event.type === "block_complete" && event.block.type === "tool_use") {
 				event.onToolPersisted?.({ toolCallId: event.block.toolUseId, attempt: 1 });

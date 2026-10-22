@@ -1517,7 +1517,7 @@ for (const profile of profiles) {
 				sourceMessages: rawMessages,
 			});
 			// Live and rebuilt requests carry the same bytes.
-			expect(rebuilt.history).toEqual(h.calls[0].history.built);
+			expect(rebuilt.history).toEqual(h.calls[0].history.built ?? []);
 			expect(h.session._currentUserId).toBe("principal-a");
 		} finally {
 			settings.knowledge.injectMode = previousMode;

@@ -159,7 +159,9 @@ function systemEntries(history: unknown[]): string[] {
 describe("reflection loop cacheable prefix", () => {
 	test("ordinary loops cannot execute reflection decisions", async () => {
 		const before = decisions;
-		for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", { rows: [] })) {
+		for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", {
+			rows: [],
+		})) {
 			/* drain */
 		}
 		expect(decisions).toBe(before);

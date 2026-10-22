@@ -2,16 +2,10 @@ import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
 import { AnthropicProvider } from "../anthropic-provider";
 import { OpenAIProvider } from "../openai-provider";
-import type {
-	BuiltHistory,
-	ChatParams,
-	DbMessage,
-	ParsedStreamEvent,
-	ProviderAdapter,
-} from "../provider";
+import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import { uniquifyDbMessageToolUseIds } from "../tool-use-id-dedup";
-import { type AgentConfig, type AgentEvent, ApiError } from "../types";
+import { type AgentConfig, type AgentEvent, type AgentLoopHistory, ApiError } from "../types";
 
 /**
  * A cut-in ("插队 · 下次请求时发送") queued while a tool is already running must be
@@ -52,7 +46,7 @@ async function releaseSlowOnceStarted(): Promise<void> {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -192,11 +186,7 @@ async function runTurnWithCutIn(overrides: Partial<AgentConfig> = {}): Promise<{
 }
 
 describe("model input adoption boundary", () => {
-	async function runInput(
-		overrides: Partial<AgentConfig>,
-		history: unknown[] = [],
-		initialToolResults?: unknown[],
-	) {
+	async function runInput(overrides: Partial<AgentConfig>, history?: AgentLoopHistory) {
 		for await (const _event of agentLoop(
 			{
 				narratorId: "n-consumption",
@@ -210,7 +200,6 @@ describe("model input adoption boundary", () => {
 			},
 			"initial",
 			history,
-			initialToolResults,
 		)) {
 			/* Drain to the real provider-input boundary. */
 		}
@@ -242,6 +231,9 @@ describe("model input adoption boundary", () => {
 		return [];
 	}
 
+	/** The fixed part of the broken-call notice the loop raises for truncated arguments. */
+	const BROKEN_REMINDER = "had invalid or missing input and were not executed";
+
 	function occurrences(value: unknown, text: string): number {
 		return modelStrings(value).reduce((count, part) => count + part.split(text).length - 1, 0);
 	}
@@ -254,20 +246,15 @@ describe("model input adoption boundary", () => {
 		format: (typeof historyFormats)[number],
 		script: Array<ParsedStreamEvent[] | Error>,
 		overrides: Partial<AgentConfig> = {},
-		initial?: BuiltHistory,
+		initial?: AgentLoopHistory,
 	): Promise<HistoryRequest[]> {
 		const provider = historyProvider(format);
 		const requests: HistoryRequest[] = [];
-		// Keep real provider history/result projections. Only upstream output is scripted;
-		// the suite's default no-op pushUserTurn would hide this cross-request regression.
-		const userTurn = spyOn(testProvider, "pushUserTurn").mockImplementation(
-			provider.pushUserTurn.bind(provider),
-		);
-		const assistantTurn = spyOn(testProvider, "pushAssistantTurn").mockImplementation(
-			provider.pushAssistantTurn.bind(provider),
-		);
-		const toolResult = spyOn(testProvider, "formatToolResult").mockImplementation(
-			provider.formatToolResult.bind(provider),
+		// A request without a host build is the real provider's projection of the loop's
+		// rows. Only upstream output is scripted; the suite's default empty builder would
+		// hide this cross-request regression.
+		const builder = spyOn(testProvider, "buildHistory").mockImplementation(
+			provider.buildHistory.bind(provider),
 		);
 		const chat = spyOn(testProvider, "chat").mockImplementation(async function* (params) {
 			params.onRequestStart?.();
@@ -285,17 +272,11 @@ describe("model input adoption boundary", () => {
 			for (const event of response) yield event;
 		});
 		try {
-			await runInput(
-				{ maxTurns: 8, maxTransientRetries: 0, ...overrides },
-				initial?.history,
-				initial?.trailingToolResults,
-			);
+			await runInput({ maxTurns: 8, maxTransientRetries: 0, ...overrides }, initial);
 			return requests;
 		} finally {
 			chat.mockRestore();
-			toolResult.mockRestore();
-			assistantTurn.mockRestore();
-			userTurn.mockRestore();
+			builder.mockRestore();
 		}
 	}
 
@@ -375,10 +356,10 @@ describe("model input adoption boundary", () => {
 			{
 				onReasoningOnlyHighContext: async () => {
 					compacts++;
-					return { history: rebuilt.history, pendingToolResults: rebuilt.trailingToolResults };
+					return { history: rebuilt.history, rows: rows.slice(1) };
 				},
 			},
-			initial,
+			{ rows, built: initial.history },
 		);
 		expect(compacts).toBe(1);
 		expect(requests).toHaveLength(3);
@@ -400,23 +381,18 @@ describe("model input adoption boundary", () => {
 		const provider = historyProvider(format);
 		const row = completedHistoryTool("initial-tool", "initial-tool", "initial-tool");
 		const initial = await provider.buildHistory([row], "history-probe-model");
-		const rebuilt = await provider.buildHistory(
-			[
-				row,
-				{
-					id: "new-context",
-					role: "sys",
-					contentJson: [{ type: "text", text: "context added during preparation" }],
-					contentText: "context added during preparation",
-					parentToolUseId: null,
-					messageUuid: null,
-				},
-			],
-			"history-probe-model",
-		);
-		// Tool results are part of the projected history, never a separate trailing list.
-		expect(initial.trailingToolResults).toEqual([]);
-		expect(rebuilt.trailingToolResults).toEqual([]);
+		const rebuiltRows: DbMessage[] = [
+			row,
+			{
+				id: "new-context",
+				role: "sys",
+				contentJson: [{ type: "text", text: "context added during preparation" }],
+				contentText: "context added during preparation",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+		];
+		const rebuilt = await provider.buildHistory(rebuiltRows, "history-probe-model");
 		let switched = false;
 		const requests = await runHistoryInput(
 			format,
@@ -428,10 +404,10 @@ describe("model input adoption boundary", () => {
 					expect(turn).toBe(0);
 					expect(reason.cause).toBe("model_switch");
 					switched = true;
-					return { history: rebuilt.history, pendingToolResults: rebuilt.trailingToolResults };
+					return { history: rebuilt.history, rows: rebuiltRows };
 				},
 			},
-			initial,
+			{ rows: [row], built: initial.history },
 		);
 		expect(switched).toBe(true);
 		expect(requests).toHaveLength(2);
@@ -446,11 +422,10 @@ describe("model input adoption boundary", () => {
 	test.each([
 		...historyFormats,
 	])("%s retains rebuilt tool results when the run started without any", async (format) => {
-		const rebuilt = await historyProvider(format).buildHistory(
-			[completedHistoryTool("newly-completed", "newly-completed", "newly-completed")],
-			"history-probe-model",
-		);
-		expect(rebuilt.trailingToolResults).toEqual([]);
+		const rebuiltRows = [
+			completedHistoryTool("newly-completed", "newly-completed", "newly-completed"),
+		];
+		const rebuilt = await historyProvider(format).buildHistory(rebuiltRows, "history-probe-model");
 		let switched = false;
 		const requests = await runHistoryInput(
 			format,
@@ -460,7 +435,7 @@ describe("model input adoption boundary", () => {
 				onBeforeTurn: async (_turn, reason) => {
 					if (!reason?.force) return null;
 					switched = true;
-					return { history: rebuilt.history, pendingToolResults: rebuilt.trailingToolResults };
+					return { history: rebuilt.history, rows: rebuiltRows };
 				},
 			},
 		);
@@ -502,15 +477,14 @@ describe("model input adoption boundary", () => {
 		);
 		expect(requests).toHaveLength(4);
 		expect(occurrences(requests[0], completionNotice)).toBe(0);
-		expect(requests[1].content).toBe(completionNotice);
 		expect(consumed).toBe(1);
+		// Every later request is the transcript's projection: the notice is an input row.
 		for (const request of requests.slice(1)) {
-			expect(occurrences(request, completionNotice)).toBe(1);
+			expect(request.content).toBe("");
+			expect(occurrences(request.history, completionNotice)).toBe(1);
 			expect(occurrences(request, "done:first")).toBe(1);
 		}
 		for (const request of requests.slice(2)) {
-			expect(request.content).toBe("");
-			expect(occurrences(request.history, completionNotice)).toBe(1);
 			expect(occurrences(request, "done:second")).toBe(1);
 		}
 	});
@@ -558,7 +532,7 @@ describe("model input adoption boundary", () => {
 		const built = await historyProvider(format).buildHistory(rows, "history-probe-model");
 		return {
 			history: built.history,
-			pendingToolResults: built.trailingToolResults,
+			rows,
 			// Use provenance from the real builder, not an assumption about source rows.
 			replayedInjectionMessageIds: built.replayedInjectionMessageIds ?? [],
 		};
@@ -728,10 +702,12 @@ describe("model input adoption boundary", () => {
 			expect(occurrences(request, completionNotice)).toBe(1);
 			expect(occurrences(request, "done:first")).toBe(1);
 		}
-		expect(requests[2].content).toContain(FAST);
-		// The first tool result was already appended during orphan recovery.
+		// The recovery reminder is the next request's input, and stays in the transcript once.
+		expect(requests[2].content).toBe("");
 		expect(requests[2].toolResults).toEqual([]);
-		expect(occurrences(requests[3].history, requests[2].content)).toBe(1);
+		expect(occurrences(requests[2].history, BROKEN_REMINDER)).toBe(1);
+		expect(modelStrings(requests[2].history).some((part) => part.includes(FAST))).toBe(true);
+		expect(occurrences(requests[3].history, BROKEN_REMINDER)).toBe(1);
 	});
 
 	test.each([
@@ -752,9 +728,10 @@ describe("model input adoption boundary", () => {
 			[{ text: "finished after content-only input" }],
 		]);
 		expect(requests).toHaveLength(3);
-		expect(requests[1].content).toContain(FAST);
+		expect(requests[1].content).toBe("");
 		expect(requests[1].toolResults).toEqual([]);
-		expect(occurrences(requests[2].history, requests[1].content)).toBe(1);
+		expect(occurrences(requests[1].history, BROKEN_REMINDER)).toBe(1);
+		expect(occurrences(requests[2].history, BROKEN_REMINDER)).toBe(1);
 	});
 
 	test("aborted initial input is not acknowledged", async () => {
@@ -898,9 +875,9 @@ describe("model input adoption boundary", () => {
 					onModelInputConsumed: (history) => {
 						adopted.push(history);
 					},
-					onBeforeTurn: async () => ({ history: replacement, pendingToolResults: [] }),
+					onBeforeTurn: async () => ({ history: replacement, rows: [] }),
 				},
-				original,
+				{ rows: [], built: original },
 			);
 			expect(adopted).toHaveLength(2);
 			expect(adopted[0]).toBe(original);
@@ -925,7 +902,7 @@ describe("model input adoption boundary", () => {
 						throw new Error("receipt unavailable");
 					},
 				},
-				initialHistory,
+				{ rows: [], built: initialHistory },
 			);
 			expect(calls).toBe(1);
 		} finally {

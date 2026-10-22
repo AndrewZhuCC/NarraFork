@@ -74,9 +74,7 @@ const provider: ProviderAdapter = {
 	buildHistory: async (rows) => ({ history: rows.flatMap(turnsOf) }),
 	async *chat(params) {
 		params.onRequestStart?.();
-		requests.push(
-			JSON.parse(JSON.stringify({ history: params.history, content: params.content })),
-		);
+		requests.push(JSON.parse(JSON.stringify({ history: params.history, content: params.content })));
 		const reply = replies[requests.length - 1];
 		if (!reply) throw new Error("Reflection exceeded the scripted turn budget");
 		onReply?.();
@@ -180,7 +178,12 @@ function row(id: string, role: DbMessage["role"], text: string): DbMessage {
 		messageUuid: null,
 	};
 }
-function run(parentConfig = config(), maxTurns = 99, kind = "exitPlanMode", rows: DbMessage[] = []) {
+function run(
+	parentConfig = config(),
+	maxTurns = 99,
+	kind = "exitPlanMode",
+	rows: DbMessage[] = [],
+) {
 	return runReflectionLoop({
 		parentConfig,
 		rows,
