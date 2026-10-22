@@ -6,11 +6,13 @@
  * module turns pages and WS frames back into the v1 shapes the document store renders —
  * `TreeMessage` rows with `contentJson` and nested `children` — and keeps each row's
  * blocks alongside as `blockRefs`: every block's id and the elements `[from, to)` it holds
- * in `contentJson`, which block-addressed actions use. Anything that is not v2 passes
- * through unchanged, so a server with `narratorBlocks.wsV2` off keeps working.
+ * in `contentJson`, which block-addressed actions use (also recorded in `block-refs.ts`).
+ * Anything that is not v2 passes through unchanged, so a server with `narratorBlocks.wsV2`
+ * off keeps working.
  */
 
 import type { ContentBlock, MessageBlockRef, TreeMessage } from "./api/types";
+import { rememberBlockRefs } from "./block-refs";
 
 /** One block as the server sends it. */
 interface BlockDTO {
@@ -82,6 +84,7 @@ function rowsOf(
 			blockRefs,
 			...(withChildren ? { children: [] } : {}),
 		} as unknown as TreeMessage;
+		rememberBlockRefs(row.id, blockRefs);
 		const parent = parentMessageId ? byId.get(parentMessageId) : undefined;
 		if (parent) {
 			parent.children ??= [];
