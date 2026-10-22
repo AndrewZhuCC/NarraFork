@@ -1833,7 +1833,7 @@
 	"wizardDepsOptionalHint": "You can skip this step. Missing Git only affects project and version-control features, and a narrator can install it later.",
 	"wizardProviderTitle": "AI Provider",
 	"wizardProviderDesc": "NarraFork needs at least one AI provider to power its narrators. Pick a provider on the right and enter its API key.",
-	"wizardProviderImportHint": "Already using Claude Code, Codex, OpenCode or DeepSeek Harness on the machine running NarraFork? Import their provider settings in one click at the top of the right-hand page.",
+	"wizardProviderImportHint": "Already using Claude Code, Codex, OpenCode or DeepSeek Harness on the machine running NarraFork? Choose \"Import from this machine\" on the right to bring their provider settings over in one click.",
 	"wizardProviderGoToAdmin": "Add Provider",
 	"wizardProviderConfigured": "{{count}} provider(s) configured",
 	"wizardProviderNone": "No AI provider configured yet",

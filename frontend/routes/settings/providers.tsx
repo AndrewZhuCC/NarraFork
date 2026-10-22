@@ -587,6 +587,35 @@ function SettingsProvidersPage() {
 		[createProvider],
 	);
 
+	// Existence-only probe of other tools' config directories (reads no file),
+	// so the add page offers "import from this machine" only when there is something.
+	const canImport = user?.role === "admin";
+	const localDetect = useQuery({
+		queryKey: ["provider-import", "local-detect"],
+		queryFn: api.detectLocalProviders,
+		enabled: canImport && isAddingProvider,
+		staleTime: 0,
+		gcTime: 60_000,
+		retry: false,
+	});
+	const importContext = useMemo(
+		() =>
+			canImport
+				? {
+						importProvider: handleImportProvider,
+						detectedSources: localDetect.data?.sources,
+						detecting: localDetect.isPending && localDetect.fetchStatus !== "idle",
+					}
+				: null,
+		[
+			canImport,
+			handleImportProvider,
+			localDetect.data,
+			localDetect.isPending,
+			localDetect.fetchStatus,
+		],
+	);
+
 	const confirmSaveBeforeRefresh = useCallback(async () => {
 		const confirmed = await confirm({
 			title: t("saveBeforeRefreshTitle"),
@@ -1110,7 +1139,7 @@ function SettingsProvidersPage() {
 				}
 			>
 				<ProviderAddContext value={handleAddProvider}>
-					<ProviderImportContext value={user?.role === "admin" ? handleImportProvider : null}>
+					<ProviderImportContext value={importContext}>
 						{restoreFetchError && (
 							<Alert color="yellow">
 								{t("tokendance.settingsUnavailable")}
