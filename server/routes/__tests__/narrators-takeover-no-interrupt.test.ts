@@ -176,6 +176,13 @@ afterEach(async () => {
 		substatus: "[]",
 		isBackground: false,
 		backgroundStatus: null,
+		runtimeRegistrationJson: {
+			version: 1,
+			run: {
+				logicalRunId: "takeover-run",
+				deliverTo: { narratorId: parentId, toolUseId: "origin-tool" },
+			},
+		},
 	});
 });
 
@@ -252,6 +259,42 @@ describe("releasing a hold", () => {
 		expect(getExecutionOwner(subagentId)).toBe(owner);
 		expect(run.cancel.signal.aborted).toBe(false);
 	});
+
+	test("releases a live hold even when no result destination is registered", async () => {
+		await setSubagentRow({ runtimeRegistrationJson: { version: 1 } });
+		const { run, wakes } = registerRun(subagentId, true);
+		setRunHold(subagentId, { released: false });
+
+		const response = await stopTakeover(subagentId);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ stopped: true, deferred: false });
+		expect(getRunHold(subagentId)?.released).toBe(true);
+		expect(wakes).toEqual(["release"]);
+		expect(run.cancel.signal.aborted).toBe(false);
+	});
+
+	for (const registration of [null, { version: 1 }]) {
+		test(`releases a restored hold without a destination (${JSON.stringify(registration)})`, async () => {
+			await setSubagentRow({
+				runtimeRegistrationJson: registration,
+				status: "idle",
+				substatus: JSON.stringify(["taken_over"]),
+			});
+			setRunHold(subagentId, { released: false });
+
+			const response = await stopTakeover(subagentId);
+
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ stopped: true, deferred: false });
+			expect(getRunHold(subagentId)).toBeUndefined();
+			expect(getExecutionOwner(subagentId)).toBeUndefined();
+			const row = await readSubagent();
+			expect(parseSubstatus(row?.substatus)).not.toContain("taken_over");
+			// Historical parentage is not authority to deliver a result.
+			expect(row?.runtimeRegistrationJson?.run?.deliverTo).toBeUndefined();
+		});
+	}
 
 	test("refuses a session that is not held", async () => {
 		registerRun(subagentId);
