@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import type { SwitchWorkingDirectoryRequest, WorkspaceContext } from "@shared/workspace-context";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { narrators, projects } from "../db/schema";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
@@ -12,12 +12,11 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { isKnowledgeStewardNarrator } from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
-import { isInsidePath } from "../lib/platform-path";
 import { narraforkDir } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
-import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
+import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	type ActiveNarrator,
 	activeNarrators,
@@ -30,6 +29,7 @@ import {
 	withNarratorMutationAdmission,
 } from "./narrator-session-state";
 import { resolveOAuthNarratorRuntimePolicy } from "./oauth-narrator-runtime-policy";
+import { syncNarratorProjectLinksSafely } from "./project-index";
 import { transitionWorkspaceContext, workspaceConflict } from "./workspace-context-transition";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
@@ -81,7 +81,6 @@ async function loadWorkspaceRow(id: string) {
 			workspaceRevision: true,
 			workspaceContext: true,
 			defaultDeviceId: true,
-			chapterId: true,
 			contextProjectId: true,
 			variant: true,
 			traits: true,
@@ -329,13 +328,7 @@ export const workspaceContextService = {
 	},
 	async get(id: string): Promise<WorkspaceContext> {
 		const row = await loadWorkspaceRow(id);
-		const chapter = row.chapterId
-			? await db.query.chapters.findFirst({
-					where: eq(chapters.id, row.chapterId),
-					columns: { worktreePath: true, projectId: true, isRoot: true },
-				})
-			: undefined;
-		const projectId = chapter?.projectId ?? row.contextProjectId ?? undefined;
+		const projectId = row.contextProjectId ?? undefined;
 		const project = projectId
 			? await db.query.projects.findFirst({
 					where: eq(projects.id, projectId),
@@ -383,14 +376,9 @@ export const workspaceContextService = {
 		const cwd =
 			committed?.cwd ??
 			activeNarrators.get(id)?.cwd ??
-			(chapter
-				? resolveLegacyNarratorCwd(
-						row.cwd,
-						chapter.worktreePath,
-						project?.gitPath,
-						chapter.isRoot === 1,
-					)
-				: resolveNarratorSessionCwd(row.cwd, null, project?.gitPath, getHome()));
+			(isFormerChapterSessionWithoutDirectory(row)
+				? null
+				: resolveNarratorSessionCwd(row.cwd, project?.gitPath, getHome()));
 		if (!cwd)
 			throw new AppError(
 				"This legacy workspace has no directory. Choose a working directory to continue.",
@@ -461,12 +449,12 @@ export const workspaceContextService = {
 						);
 					}
 					// cwd remains the narrator's selected local directory across remote visits.
-					const chapter = row.chapterId
-						? await db.query.chapters.findFirst({
-								where: eq(chapters.id, row.chapterId),
-								columns: { worktreePath: true },
-							})
-						: undefined;
+					if (isFormerChapterSessionWithoutDirectory(row))
+						throw new AppError(
+							"This legacy workspace has no directory. Choose a working directory to continue.",
+							409,
+							"WORKSPACE_DIRECTORY_REQUIRED",
+						);
 					const project = previous.contextProjectId
 						? await db.query.projects.findFirst({
 								where: eq(projects.id, previous.contextProjectId),
@@ -474,7 +462,7 @@ export const workspaceContextService = {
 							})
 						: undefined;
 					const target = await prepareLocalWorkspaceContext(
-						resolveNarratorSessionCwd(row.cwd, chapter?.worktreePath, project?.gitPath, getHome()),
+						resolveNarratorSessionCwd(row.cwd, project?.gitPath, getHome()),
 						previous.revision,
 						previous.contextProjectId,
 						true,
@@ -545,13 +533,15 @@ export const workspaceContextService = {
 						active.abortController.abort("Workspace installation failed");
 					}
 				},
-				publish: ({ previous: old, current }) =>
+				publish: ({ previous: old, current }) => {
 					broadcastToNarrator(id, {
 						type: "workspace_context_changed",
 						narratorId: id,
 						previous: old,
 						current,
-					}),
+					});
+					void syncNarratorProjectLinksSafely(id);
+				},
 			},
 		);
 	},
@@ -585,24 +575,6 @@ export const workspaceContextService = {
 					previous.contextProjectId,
 				);
 				await assertTargetAllowed(id, target.cwd);
-				if (row.chapterId) {
-					const chapter = await db.query.chapters.findFirst({
-						where: eq(chapters.id, row.chapterId),
-						columns: { worktreePath: true },
-					});
-					const root = chapter?.worktreePath
-						? await realpath(chapter.worktreePath).catch(() => null)
-						: null;
-					if (
-						!root ||
-						!isInsidePath(root, target.cwd) ||
-						previous.git?.workspaceKey !== target.git?.workspaceKey
-					)
-						throw workspaceConflict(
-							"Chapter cross-worktree switching is unsupported",
-							"WORKSPACE_CONTEXT_UNSUPPORTED",
-						);
-				}
 				if (input.expectedWorktreeKey && input.expectedWorktreeKey !== target.git?.workspaceKey)
 					throw workspaceConflict("Target worktree identity changed");
 				return target;
@@ -665,13 +637,16 @@ export const workspaceContextService = {
 					active.abortController.abort("Workspace installation failed");
 				}
 			},
-			publish: ({ previous, current }) =>
+			publish: ({ previous, current }) => {
 				broadcastToNarrator(id, {
 					type: "workspace_context_changed",
 					narratorId: id,
 					previous,
 					current,
-				}),
+				});
+				// The directory may now belong to another project.
+				void syncNarratorProjectLinksSafely(id);
+			},
 		});
 		// Manual HTTP switch: the UI still promises a history reminder card. Agent-origin
 		// switches skip this — the orchestrator injects the pass-continuation text instead.

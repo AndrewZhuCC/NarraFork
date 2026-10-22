@@ -46,7 +46,6 @@ import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host"
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
-import { projectDbManager } from "./lib/project-db";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import {
 	registerGracefulShutdownHandler,
@@ -86,7 +85,6 @@ import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
-import { shutdownPrivateArchiveWorkers } from "./services/project-archive/worker-client";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
@@ -96,20 +94,15 @@ import {
 	backgroundOccupancyInitializer,
 	withBackgroundOccupancyInitialization,
 } from "./services/background-occupancy-startup";
-import { chapterBatchMerge } from "./services/chapter-batch-merge";
-import { chapterCleanup } from "./services/chapter-cleanup";
-import {
-	reconcileContainerStates,
-	startContainerProxy,
-	stopContainerProxy,
-} from "./services/container-proxy";
 import { ensureRootlessEnv } from "./services/container-service";
+import { retireLegacyChapterResources } from "./services/legacy-chapter-resource-cleanup";
 import {
 	failUnownedStartupRecovery,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
+import { scheduleProjectIndexRebuild } from "./services/project-index";
 import "./services/notification-service"; // Register notification event listeners
 import {
 	startNotificationCenterMaintenance,
@@ -119,7 +112,6 @@ import { initNotificationFanout, stopNotificationFanout } from "./services/notif
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { initChatNotify } from "./services/chat-notify";
-import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
@@ -146,13 +138,11 @@ import {
 	prepareSignalRestartRecovery,
 	restoreOrdinaryRestartRecovery,
 } from "./services/restart-recovery-service";
-import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import {
 	getPlannedUpdateStartupProtection,
 	restoreNarratorsAfterPlannedUpdate,
 } from "./services/update-recovery-service";
-import { worktreeWatcher } from "./services/worktree-watcher";
 import { canAcceptExternalNarratorConnection } from "./websocket/oauth-connection-registry";
 import {
 	closeAllConnections,
@@ -196,19 +186,6 @@ if (postgresRuntime) {
 	// timeout fail the process closed with a diagnosable error — the request hot path
 	// never re-probes the catalog, and there is no SQLite fallback.
 	await activatePostgresRuntimeQueue();
-}
-
-// Invalidate interrupted merge sessions before HTTP/WS or narrator recovery can
-// accept an old continue/cancel decision. This gate only updates session metadata;
-// it must never restore a worktree or advance chapter snapshots. Fail closed if
-// the database cannot invalidate old sessions, rather than serving stale commands.
-try {
-	await chapterBatchMerge.cleanupStaleSessions();
-} catch (error) {
-	logger.error("Interrupted merge-session startup gate failed; refusing to serve requests", {
-		error: String(error),
-	});
-	throw error;
 }
 
 // Ordinary cold continuation recovery requires strict single-instance provenance.
@@ -1784,12 +1761,6 @@ dissolveOrphanWorkspaces()
 		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
 	});
 
-// Register review event handler (inject feedback into source narrator on conclude)
-initReviewEventHandler();
-
-// Register container event handler (inject access info + auto-enable Browser on container start)
-initContainerEventHandler();
-
 // Register knowledge notification bridge (push publish/review state to reviewers + submitters)
 initKnowledgeNotify();
 
@@ -1800,22 +1771,19 @@ initChatNotify();
 initNotificationFanout();
 startNotificationCenterMaintenance();
 
-// Reconcile container states on startup (mark stale DB records as stopped)
-reconcileContainerStates().catch((err) => {
-	logger.warn("Container state reconciliation failed", { error: String(err) });
-});
+if (activeDatabaseBackend === "sqlite") {
+	// Stop containers and release ports that removed chapters left behind.
+	retireLegacyChapterResources().catch((err) => {
+		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
+	});
+	// Re-derive which project every session belongs to, in bounded background pages.
+	void scheduleProjectIndexRebuild();
+}
 
 // Establish client-egress relay channels for NUG providers configured with
 // local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
 // every settings save.
 reconcileNugRelayClients(settings.nugProviders ?? []);
-
-// Start container proxy if enabled
-if (settings.containers.proxy?.enabled) {
-	startContainerProxy().catch((err) => {
-		logger.error("Container proxy startup failed", { error: String(err) });
-	});
-}
 
 // One-time cleanup of legacy snapshot shadow repos (replaced by file-snapshot-service)
 const legacySnapshotsDir = getNarraforkPath("snapshots");
@@ -1945,14 +1913,10 @@ async function performGracefulShutdown(
 		stopScheduledTaskScheduler();
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
-		await shutdownStep(tracker, "containerProxy.stop", () => stopContainerProxy());
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}
-		chapterCleanup.clearAllTimers();
-		worktreeWatcher.shutdown();
-		projectDbManager.closeAll();
 		// The background integrity probe is a separate PROCESS holding a read-only handle on the
 		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
 		// replacement process may swap the database file (startup recovery) or rewrite it (admin
@@ -1960,7 +1924,6 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "privateArchiveWorkers.shutdown", shutdownPrivateArchiveWorkers);
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
 		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
 		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
