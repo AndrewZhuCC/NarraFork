@@ -76,7 +76,7 @@ beforeEach(() => {
 afterEach(() => {
 	for (const ws of opened.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
-	settings.narratorBlocks.wsV2 = false;
+	settings.narratorBlocks.wsV2 = true;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -303,6 +303,7 @@ describe("negotiating the message protocol", () => {
 	});
 
 	test("with wsV2 off a client asking for v2 is told it has v1", async () => {
+		settings.narratorBlocks.wsV2 = false;
 		const { ws, sent } = openWs();
 		await subscribe(ws, 2);
 		expect(sent).toContainEqual(expect.objectContaining({ type: "message_protocol", protocol: 1 }));
