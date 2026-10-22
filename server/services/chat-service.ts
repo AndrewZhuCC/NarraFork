@@ -15,9 +15,8 @@
  * Nothing in this module calls a model. Forwarding from a discussion room is an
  * explicit user action on the client (see `submitToNarrator`), which goes through
  * the narrator's normal composer path so busy-narrator buffering still applies.
- * A bot room's posts reach its bot through `bot-chat.ts`, which listens for
- * `chat:message_created` like every other consumer of room activity; the bot answers
- * through `postBotMessage`.
+ * A bot room's post is handed to its bot by `bot-chat.ts` before it is recorded
+ * (see `postMessage`); the bot answers through `postBotMessage`.
  *
  * Main-thread discipline (CLAUDE.md): every query here is small, indexed and
  * bounded. Specifically:
@@ -39,6 +38,7 @@ import {
 	narrators,
 	users,
 } from "@server/db/schema";
+import { AsyncMutex } from "@server/lib/async-mutex";
 import { buildAttachedFilesHint } from "@server/lib/attached-files";
 import {
 	CHAT_ATTACHMENT_TOTAL_BYTES_MAX,
@@ -590,6 +590,17 @@ async function assertCanPostToBot(narratorId: string | null, userId: string): Pr
 	}
 }
 
+/**
+ * Reading a room plus, for a bot room, the right to drive its bot. Shared by posting
+ * and by uploading a draft, so someone who may only watch a bot can't stage files in
+ * a room they could never send them to.
+ */
+async function assertCanPost(roomId: string, userId: string): Promise<ChatRoomAccess> {
+	const access = await assertCanRead(roomId, userId);
+	if (access.room.kind === "bot") await assertCanPostToBot(access.room.narratorId, userId);
+	return access;
+}
+
 async function ensureMembers(roomId: string, userIds: string[]): Promise<void> {
 	const timestamp = nowIso();
 	for (const userId of userIds) {
@@ -711,6 +722,9 @@ export interface PostMessageInput {
 	kind?: "text" | "system";
 }
 
+/** One FIFO per bot: a post is admitted and claims its seq before the next one starts. */
+const botPostOrder = new AsyncMutex();
+
 /**
  * Append a message and advance the room's denormalized tail.
  *
@@ -722,6 +736,9 @@ export interface PostMessageInput {
  * Attachment claiming is inside that transaction on purpose: a claim that succeeded
  * while the insert failed would leave a file owned by a message that does not exist,
  * and the reverse would show a message with attachments the reader cannot fetch.
+ *
+ * In a bot room the post is handed to the bot first (`admitBotPost`), and a refusal
+ * records nothing.
  */
 export async function postMessage(input: PostMessageInput): Promise<ChatMessageRow> {
 	const text = input.text.trim();
@@ -740,9 +757,25 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		);
 	}
 
-	const access = await assertCanRead(input.roomId, input.senderUserId);
-	if (access.room.kind === "bot")
-		await assertCanPostToBot(access.room.narratorId, input.senderUserId);
+	const access = await assertCanPost(input.roomId, input.senderUserId);
+	const post = { ...input, text, attachmentIds };
+	// A bot room's post IS the bot's next input, so it is recorded only once the bot
+	// has taken it: a bot that can't (its queue is full) answers the poster right away,
+	// as its own composer would, and the message stays in their composer — rather than
+	// the room showing a message the bot never heard. One bot's posts are serialized,
+	// so what it hears follows the room's seq order.
+	const botId = access.room.kind === "bot" ? access.room.narratorId : null;
+	if (botId) return botPostOrder.acquire(botId, () => appendPost(post, access, botId));
+	return appendPost(post, access, null);
+}
+
+/** The rest of `postMessage`, once the sender may post: snapshot, admit, record, announce. */
+async function appendPost(
+	input: PostMessageInput & { text: string; attachmentIds: string[] },
+	access: ChatRoomAccess,
+	botId: string | null,
+): Promise<ChatMessageRow> {
+	const { text, attachmentIds } = input;
 	// A narrator room's member row may not exist yet if the sender never opened
 	// the panel through the resolve endpoint (e.g. posting straight from a deep
 	// link). The watermark update below needs it.
@@ -825,6 +858,17 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 				0,
 			)}MB limit`,
 		);
+	}
+
+	if (botId) {
+		const { admitBotPost } = await import("./bot-chat");
+		await admitBotPost({
+			narratorId: botId,
+			senderUserId: input.senderUserId,
+			text,
+			replyToPreview: replySnapshot.replyToPreview,
+			attachments: pendingAttachments,
+		});
 	}
 
 	const timestamp = nowIso();
@@ -967,9 +1011,15 @@ export async function postBotMessage(input: PostBotMessageInput): Promise<ChatMe
 	}
 	const bot = await db.query.narrators.findFirst({
 		where: eq(narrators.id, input.narratorId),
-		columns: BOT_COLUMNS,
+		columns: { ...NARRATOR_ACL_COLUMNS, ...BOT_COLUMNS },
 	});
 	if (!bot) throw new NotFoundError("Narrator", input.narratorId);
+	// A bot writes only within its audience: the room it opens is one this person could
+	// have opened (`resolveBotRoom`'s bar). Past it, a message would come from a name any
+	// owner can pick, which the recipient could neither look up nor answer.
+	if (!(await canReadNarrator(bot, await resolvePrincipal(input.userId)))) {
+		throw new ForbiddenError("This person can't open this bot, so it can't message them");
+	}
 
 	const room = await ensureBotRoom(input.narratorId, input.userId);
 	const timestamp = nowIso();
@@ -1922,7 +1972,7 @@ export async function createChatAttachment(
 	userId: string,
 	file: File,
 ): Promise<ChatAttachmentRow> {
-	await assertCanRead(roomId, userId);
+	await assertCanPost(roomId, userId);
 
 	// Bound the drafts one user can accumulate in a room. An upload is persisted
 	// before its message exists, so "upload and never send" is reachable; the

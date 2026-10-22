@@ -3,31 +3,33 @@
  *
  * A bot is a narrator whose audience is a chat room rather than its transcript:
  *
- *   person ── post ──▶ bot room ── deliverToBot ──▶ the bot's next input
+ *   person ── post ──▶ bot room ── admitBotPost ──▶ the bot's next input
  *   person ◀───────── bot room ◀── sendAsBot ◀──── Send({ user }) in the bot
  *
- * Inbound is one more `chat:message_created` listener, beside the WebSocket fan-out
- * and the notification center: chat-service only records what a person posted, and
- * this module decides that the room's bot hears it. The delivery takes the same user
- * input admission as the bot's own composer — queued while it works, starting a turn
- * when idle — and is authored by the poster, so the model reads who is speaking from
- * the ordinary sender marker. Outbound is `sendAsBot`, the only way a bot speaks:
- * its replies and tool calls stay in the transcript, which is what the monitor shows.
+ * Inbound, posting in a bot room is typing into the bot's composer: chat-service
+ * hands the post to `admitBotPost` and records it only once the bot has taken it, so
+ * a bot that can't (its queue is full) is the poster's answer at once, as in the
+ * composer. The input is authored by the poster, so the model reads who is speaking
+ * from the ordinary sender marker. Outbound is `sendAsBot`, the only way a bot
+ * speaks: its replies and tool calls stay in the transcript, which is what the
+ * monitor shows.
  *
- * Group chat generalizes both directions without changing their shape: a post goes
- * to every bot in the room except its author, and Send addresses a room.
+ * Group chat keeps both shapes: a post goes to every bot in the room except its
+ * author, and Send addresses a room. What changes is admission, since one post then
+ * has several bots to reach — see docs/BOT_NARRATOR.md.
  */
 
+import { rmSync } from "node:fs";
 import { db } from "@server/db";
-import { chatAttachments, chatMessages, narrators, users } from "@server/db/schema";
-import { AsyncMutex } from "@server/lib/async-mutex";
+import { narrators, users } from "@server/db/schema";
+import { buildAttachedFilesHint } from "@server/lib/attached-files";
+import { copyChatAttachmentToWorktree } from "@server/lib/chat-attachments";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
-import { eventBus } from "@server/lib/event-bus";
 import { getUserLanguage, getUserReplyInLanguage } from "@server/lib/i18n";
-import { logger } from "@server/lib/logger";
 import { isBotNarrator } from "@server/lib/narrator-utils";
-import { and, eq, sql } from "drizzle-orm";
-import { materializeAttachmentsForNarrator, postBotMessage } from "./chat-service";
+import type { TextFileRef } from "@server/lib/uploads";
+import { eq, sql } from "drizzle-orm";
+import { postBotMessage } from "./chat-service";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Outbound: Send({ user }) → the person's bot room
@@ -104,63 +106,63 @@ async function resolveRecipient(raw: string): Promise<{ id: string; username: st
 // Inbound: a person's post → the bot's next input
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface PostedEvent {
+/** A draft the post claims once recorded, as the copy into the bot's worktree reads it. */
+interface PostedFile {
 	roomId: string;
-	messageId: string;
-	senderUserId: string | null;
-	roomKind: string;
-	narratorId: string | null;
+	storedName: string;
+	filename: string;
+	sizeBytes: number;
+}
+
+export interface BotPost {
+	narratorId: string;
+	senderUserId: string;
+	text: string;
+	/** What the person saw quoted, when the post is a reply. Already bounded. */
+	replyToPreview: string | null;
+	attachments: readonly PostedFile[];
 }
 
 /**
- * One FIFO per bot, so posts reach it in the order they were made: a post carrying
- * an attachment (copied into the bot's worktree first) must not be overtaken by a
- * text-only post that followed it.
+ * Hand a person's post to its bot, before chat-service records it. The bot's own
+ * composer path, so the post queues while the bot works and starts a turn when it is
+ * idle; it throws when the bot can't take the post (its queue is full, a file could
+ * not be copied), and then nothing is recorded and the person still holds it.
  */
-const deliveryOrder = new AsyncMutex();
-
-/** Hand a person's post to the room's bot. Exported for tests; production goes through the bus. */
-export async function deliverToBot(event: PostedEvent): Promise<void> {
-	// The bot's own messages are its output, never its input.
-	if (event.roomKind !== "bot" || !event.senderUserId || !event.narratorId) return;
-	const userId = event.senderUserId;
-	const narratorId = event.narratorId;
-
-	const message = await db.query.chatMessages.findFirst({
-		where: and(eq(chatMessages.id, event.messageId), eq(chatMessages.roomId, event.roomId)),
-		columns: { id: true, contentText: true, replyToPreview: true, deletedAt: true },
-	});
-	if (!message || message.deletedAt) return;
-
-	const prompt = [quoteLine(message.replyToPreview), message.contentText.trim()]
-		.filter(Boolean)
-		.join("\n\n");
-	const attachmentHint = await materializeForBot(event, narratorId, userId);
-	const input = [prompt, attachmentHint].filter(Boolean).join("\n");
-	if (!input) return;
-
+export async function admitBotPost(post: BotPost): Promise<void> {
 	const [narrator, sender] = await Promise.all([
 		db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { id: true, status: true },
+			where: eq(narrators.id, post.narratorId),
+			columns: { id: true, status: true, cwd: true },
 		}),
 		db.query.users.findFirst({
-			where: eq(users.id, userId),
+			where: eq(users.id, post.senderUserId),
 			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
 		}),
 	]);
-	if (!narrator) return;
-	const { narratorService } = await import("./narrator-service");
-	// Talking to a bot is interacting with it, exactly like its composer's auto-unarchive.
-	if (narrator.status === "archived") await narratorService.updateStatus(narratorId, "idle");
+	if (!narrator) throw new NotFoundError("Bot", post.narratorId);
 
-	const { acceptUserMessage } = await import("./narrator-session");
-	await acceptUserMessage(narratorId, input, {
-		locale: await getUserLanguage(userId),
-		replyInUserLanguage: await getUserReplyInLanguage(userId),
-		userId,
-		creator: sender ?? null,
-	});
+	const files = await copyIntoWorktree(narrator.cwd, post.attachments);
+	const prompt = [quoteLine(post.replyToPreview), post.text].filter(Boolean).join("\n\n");
+	const input = [prompt, buildAttachedFilesHint(files)].filter(Boolean).join("\n");
+	try {
+		const { narratorService } = await import("./narrator-service");
+		// Talking to a bot is interacting with it, exactly like its composer's auto-unarchive.
+		if (narrator.status === "archived") await narratorService.updateStatus(narrator.id, "idle");
+		const { acceptUserMessage } = await import("./narrator-session");
+		await acceptUserMessage(narrator.id, input, {
+			locale: await getUserLanguage(post.senderUserId),
+			replyInUserLanguage: await getUserReplyInLanguage(post.senderUserId),
+			userId: post.senderUserId,
+			creator: sender ?? null,
+			// Chat is conversation: a post reading "/new …" is something a person said,
+			// not a command for the session.
+			executionIntent: { literal: true },
+		});
+	} catch (error) {
+		removeCopies(files);
+		throw error;
+	}
 }
 
 /**
@@ -172,58 +174,30 @@ function quoteLine(preview: string | null): string {
 }
 
 /**
- * Copy the post's attachments into the bot's working directory and return the
- * `<attached_files>` hint — the same path, and the same wording, as forwarding them
- * from a discussion room. A failure loses the files but never the message.
+ * Copy the post's files into the bot's working directory, where the
+ * `<attached_files>` hint names them — the same layout a discussion-room forward
+ * uses. All or nothing: a post is the person's whole message, so one file that can't
+ * be copied refuses it rather than delivering it without that file.
  */
-async function materializeForBot(
-	event: PostedEvent,
-	narratorId: string,
-	userId: string,
-): Promise<string> {
-	const attachments = await db.query.chatAttachments.findMany({
-		where: eq(chatAttachments.messageId, event.messageId),
-		columns: { id: true },
-	});
-	if (attachments.length === 0) return "";
+async function copyIntoWorktree(
+	cwd: string | null,
+	attachments: readonly PostedFile[],
+): Promise<TextFileRef[]> {
+	if (attachments.length === 0) return [];
+	if (!cwd) throw new ValidationError("This bot has no working directory to receive files");
+	const files: TextFileRef[] = [];
 	try {
-		const result = await materializeAttachmentsForNarrator({
-			roomId: event.roomId,
-			userId,
-			narratorId,
-			attachmentIds: attachments.map((attachment) => attachment.id),
-		});
-		return result.files.length > 0 ? result.hint : "";
+		for (const attachment of attachments) {
+			files.push(await copyChatAttachmentToWorktree(cwd, attachment));
+		}
 	} catch (error) {
-		logger.warn("Bot chat attachments were not delivered", {
-			narratorId,
-			messageId: event.messageId,
-			error: error instanceof Error ? error.message : String(error),
-		});
-		return "";
+		removeCopies(files);
+		throw error;
 	}
+	return files;
 }
 
-let registered = false;
-
-/** Register the inbound bridge. Idempotent. */
-export function initBotChat(): void {
-	if (registered) return;
-	registered = true;
-	eventBus.on("chat:message_created", (event) => {
-		if (event.roomKind !== "bot" || !event.senderUserId || !event.narratorId) return;
-		const narratorId = event.narratorId;
-		void deliveryOrder
-			.acquire(narratorId, () => deliverToBot(event))
-			.catch((error) => {
-				// The post is already in the room; what is lost is the bot hearing it, so
-				// this is an error, not a warning.
-				logger.error("Bot chat delivery failed", {
-					narratorId,
-					roomId: event.roomId,
-					messageId: event.messageId,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			});
-	});
+/** A refused post leaves nothing behind in the bot's worktree. */
+function removeCopies(files: readonly TextFileRef[]): void {
+	for (const file of files) rmSync(file.filePath, { force: true });
 }

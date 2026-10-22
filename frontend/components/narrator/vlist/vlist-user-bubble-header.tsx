@@ -114,11 +114,6 @@ export function UserBubbleHeader({
 					{t("guestBadge")}
 				</Badge>
 			) : null}
-			{creator?.isBot ? (
-				<Badge size="xs" variant="light" color="grape" style={{ flexShrink: 0 }}>
-					{t("botBadge")}
-				</Badge>
-			) : null}
 			{/* Icon-only marker; sits inside the reserved 20px row so height is unchanged. */}
 			<MessageOriginBadge origin={origin} originLabel={originLabel} />
 			{badge ? (

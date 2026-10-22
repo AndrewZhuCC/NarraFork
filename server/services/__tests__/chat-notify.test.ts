@@ -21,11 +21,11 @@
  */
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { db } from "../../db";
-import { users } from "../../db/schema";
+import { narrators, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import type { NarratorServerMessage } from "../../websocket/narrator-ws-types";
 import { chatNotifyTesting, setChatNotifyChannel } from "../chat-notify";
-import { markRead, postMessage, resolveDmRoom } from "../chat-service";
+import { markRead, postBotMessage, postMessage, resolveDmRoom } from "../chat-service";
 
 interface Recorded {
 	roomBroadcasts: Array<{ roomId: string; message: NarratorServerMessage }>;
@@ -107,6 +107,38 @@ describe("message fan-out", () => {
 			expect(badge.unread).toBe(1);
 			expect(badge).not.toHaveProperty("message");
 		}
+	});
+
+	test("a bot's message badges the person it wrote to", async () => {
+		const reader = await makeUser("bot-reader");
+		const botId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: botId,
+			title: "Notify Bot",
+			traits: ["bot", "standalone"],
+			visibility: "public",
+			createdAt: now,
+			updatedAt: now,
+		});
+		const sent = await postBotMessage({ narratorId: botId, userId: reader, text: "Ready" });
+
+		const recorded = record();
+		await chatNotifyTesting.onMessageCreated({
+			roomId: sent.roomId,
+			messageId: sent.id,
+			seq: sent.seq,
+			senderUserId: null,
+		});
+
+		const roomMessage = recorded.roomBroadcasts[0]?.message;
+		if (roomMessage?.type !== "chat:message") throw new Error("expected the room frame");
+		expect(roomMessage.message.sender).toMatchObject({ id: botId, isBot: true });
+		// No human sender to exclude: the one member, the reader, gets the badge.
+		expect(recorded.userBroadcasts).toHaveLength(1);
+		expect(recorded.userBroadcasts[0].userId).toBe(reader);
+		const badge = recorded.userBroadcasts[0].message;
+		expect(badge.type === "chat:unread_changed" && badge.unread).toBe(1);
 	});
 
 	test("the sender never gets a badge for their own message", async () => {

@@ -118,7 +118,6 @@ import {
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
-import { initBotChat } from "./services/bot-chat";
 import { initChatNotify } from "./services/chat-notify";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
@@ -1796,9 +1795,6 @@ initKnowledgeNotify();
 
 // Register chat notification bridge (room messages to viewers, unread badges to the rest)
 initChatNotify();
-
-// Register the bot bridge (a person's post in a bot room becomes that bot's next input)
-initBotChat();
 
 // Activity projections consume source events independently of WebSocket delivery.
 initNotificationFanout();

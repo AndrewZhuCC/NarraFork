@@ -13,6 +13,8 @@ export interface AppHistoryState {
 	contentViewerFullscreen?: true;
 	/** A provider detail opened from the providers overview; closing it steps back. */
 	providerDetailFromOverview?: true;
+	/** A bot's monitor opened from its conversation; closing it steps back. */
+	botMonitorFromChat?: true;
 	__NF_history_key?: string;
 	__NF_scroll_key?: string;
 	__NF_sentinel_id?: string;

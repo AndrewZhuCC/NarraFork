@@ -74,6 +74,16 @@ const DELEGATED_DENY: NonNullable<RuntimePolicyTrait["deny"]> = [
 	"switchWorkingDirectory",
 ];
 
+/**
+ * A bot's ceiling, stored on it at creation. Nobody reads a bot's transcript, so
+ * nothing may wait there for a person: a question or a plan up for approval would
+ * stall it in front of people who can't see either. It asks through Send instead.
+ */
+export const BOT_RUNTIME_CEILING: RuntimePolicyTrait = {
+	version: 1,
+	deny: ["askUserQuestion", "planApproval"],
+};
+
 /** Template names with a built-in ceiling; any other name is a custom definition. */
 export const BUILTIN_DELEGATION_TEMPLATES: ReadonlySet<string> = new Set([
 	"general",

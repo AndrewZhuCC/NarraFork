@@ -608,12 +608,27 @@ export async function runAgentLoopUnlocked(
 			// Keep accepted snapshots and uploaded files recoverable until the
 			// ordinary user message commits, just like the interrupt drain path.
 			const terminalCommand =
-				parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument) ||
-				parseQueuedGoalCommand(buffered.text, buffered.commandText, buffered.composerDocument);
+				parseQueuedNewCommand(
+					buffered.text,
+					buffered.commandText,
+					buffered.composerDocument,
+					buffered.executionIntent,
+				) ||
+				parseQueuedGoalCommand(
+					buffered.text,
+					buffered.commandText,
+					buffered.composerDocument,
+					buffered.executionIntent,
+				);
 			pendingBufferedDelivery = buffered;
 			if (
 				terminalCommand &&
-				parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument)
+				parseQueuedNewCommand(
+					buffered.text,
+					buffered.commandText,
+					buffered.composerDocument,
+					buffered.executionIntent,
+				)
 			) {
 				await persistClaimedUserInput({
 					claim: bufferedClaim,
@@ -652,6 +667,7 @@ export async function runAgentLoopUnlocked(
 				buffered.text,
 				buffered.commandText,
 				buffered.composerDocument,
+				buffered.executionIntent,
 			);
 			if (newCommand) {
 				const newNarratorId = await executeQueuedNewCommand(
@@ -686,6 +702,7 @@ export async function runAgentLoopUnlocked(
 				buffered.text,
 				buffered.commandText,
 				buffered.composerDocument,
+				buffered.executionIntent,
 			);
 			if (goalCommand) {
 				await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);

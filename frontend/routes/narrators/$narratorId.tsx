@@ -10,7 +10,7 @@ import {
 } from "@tanstack/react-router";
 import type { Direction } from "dockview-react";
 import type React from "react";
-import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
@@ -195,6 +195,17 @@ function NarratorDetailPage() {
 	const narratorTitle = narrator?.title;
 	const narratorCwd = narrator?.cwd;
 	const narratorStatus = narrator?.status;
+	const narratorSubstatus = useMemo(
+		() =>
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			Array.isArray((narrator as any)?.substatus)
+				? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					((narrator as any).substatus as unknown[]).filter(
+						(tag): tag is string => typeof tag === "string",
+					)
+				: undefined,
+		[narrator],
+	);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterTitle = (chapter as any)?.title as string | undefined;
 	const { data: userPrefs, isLoading: userPrefsLoading } = useUserPreferences();
@@ -339,28 +350,43 @@ function NarratorDetailPage() {
 	}, [navigate, projectId, chapterId]);
 	const showMinimize = from === "graph" && !!projectId && !!chapterId;
 
-	// Switch a bot between its conversation and its monitor, keeping where it was opened from.
-	const showBotView = useCallback(
-		(view: "chat" | "monitor") => {
-			navigate({
-				to: "/narrators/$narratorId",
-				params: { narratorId },
-				search: {
-					...(from ? { from } : {}),
-					...(workspaceId ? { workspaceId } : {}),
-					...(view === "monitor" ? { view } : {}),
-				},
-			});
-		},
-		[navigate, narratorId, from, workspaceId],
+	// Switch a bot between its conversation and its monitor, keeping where it was opened
+	// from. Opened from the conversation, the monitor is a step forward that closing
+	// steps back from, so chat → monitor → chat leaves no extra history entries.
+	const botViewSearch = useCallback(
+		(view: "chat" | "monitor") => ({
+			...(from ? { from } : {}),
+			...(workspaceId ? { workspaceId } : {}),
+			...(view === "monitor" ? { view } : {}),
+		}),
+		[from, workspaceId],
 	);
-	const openBotMonitor = useCallback(() => showBotView("monitor"), [showBotView]);
+	const openBotMonitor = useCallback(() => {
+		navigate({
+			to: "/narrators/$narratorId",
+			params: { narratorId },
+			search: botViewSearch("monitor"),
+			state: (prev) => ({ ...prev, botMonitorFromChat: true }),
+		});
+	}, [navigate, narratorId, botViewSearch]);
+	const closeBotMonitor = useCallback(() => {
+		if (router.state.location.state.botMonitorFromChat) {
+			router.history.back();
+			return;
+		}
+		navigate({
+			to: "/narrators/$narratorId",
+			params: { narratorId },
+			search: botViewSearch("chat"),
+			replace: true,
+		});
+	}, [navigate, router, narratorId, botViewSearch]);
 
 	// A bot's monitor returns to its conversation; otherwise return to the originating
 	// workspace before applying subagent navigation defaults.
 	const onBack = useCallback(() => {
-		if (isBot) {
-			showBotView("chat");
+		if (isBot && monitoring) {
+			closeBotMonitor();
 		} else if (fromWorkspace && workspaceId) {
 			navigate({
 				to: "/narrators/workspace/$workspaceId",
@@ -387,7 +413,8 @@ function NarratorDetailPage() {
 		}
 	}, [
 		isBot,
-		showBotView,
+		monitoring,
+		closeBotMonitor,
 		fromWorkspace,
 		workspaceId,
 		isSubagent,
@@ -397,7 +424,7 @@ function NarratorDetailPage() {
 		parentNarratorId,
 		navigate,
 	]);
-	const hasBack = isSubagent || fromWorkspace || isBot;
+	const hasBack = isSubagent || fromWorkspace || (isBot && monitoring);
 
 	const [forkMessageId, setForkMessageId] = useState<string | null>(null);
 	const handleForkFromMessage = useCallback(
@@ -546,9 +573,13 @@ function NarratorDetailPage() {
 					narratorId={narratorId}
 					title={narratorTitle}
 					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					handle={(narrator as any).handle as string | null | undefined}
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					avatarImageId={(narrator as any).avatarImageId as string | null | undefined}
 					status={narratorStatus}
+					substatus={narratorSubstatus}
 					onMonitor={openBotMonitor}
+					onBack={fromWorkspace ? onBack : undefined}
 				/>
 			</Suspense>
 		);

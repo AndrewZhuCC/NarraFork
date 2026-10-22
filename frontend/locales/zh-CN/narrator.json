@@ -2538,6 +2538,5 @@
 		"fetchError": "用量获取失败：{{error}}",
 		"staleHint": "最近一次刷新失败，数据可能已过时。",
 		"updatedAt": "更新于 {{time}}"
-	},
-	"botBadge": "Bot"
+	}
 }

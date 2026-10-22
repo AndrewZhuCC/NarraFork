@@ -209,7 +209,12 @@ import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
 
-import type { ActiveNarrator, BufferedMessage, NarratorEvent } from "./narrator-session-state";
+import type {
+	ActiveNarrator,
+	BufferedExecutionIntent,
+	BufferedMessage,
+	NarratorEvent,
+} from "./narrator-session-state";
 import {
 	activeNarrators,
 	claimNarratorRuntime,
@@ -424,7 +429,9 @@ export function parseQueuedNewCommand(
 	message: string,
 	commandText?: string | null,
 	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
 ) {
+	if (intent?.literal) return null;
 	if (
 		composerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
@@ -447,7 +454,9 @@ export function parseQueuedGoalCommand(
 	message: string,
 	commandText?: string | null,
 	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
 ) {
+	if (intent?.literal) return null;
 	if (
 		composerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
@@ -853,11 +862,17 @@ async function resumeNextBufferedMessageUnlocked(
 		// differently: a terminal command owns its attachments from here on, while a
 		// plain message keeps its files on disk until delivery has actually succeeded —
 		// they are what a restore needs when it has not.
-		const newCommand = parseQueuedNewCommand(first.text, first.commandText, first.composerDocument);
+		const newCommand = parseQueuedNewCommand(
+			first.text,
+			first.commandText,
+			first.composerDocument,
+			first.executionIntent,
+		);
 		const goalCommand = parseQueuedGoalCommand(
 			first.text,
 			first.commandText,
 			first.composerDocument,
+			first.executionIntent,
 		);
 		const controlCommand = first.executionIntent?.controlCommand;
 		if (newCommand || controlCommand) {
@@ -3774,8 +3789,18 @@ export async function acceptUserMessage(
 						// exits. Leave it to the command-aware buffered consumer, not feedMessage.
 						const queuedCommand =
 							options.executionIntent?.controlCommand ||
-							parseQueuedNewCommand(prompt, options.commandText, options.composerDocument) ||
-							parseQueuedGoalCommand(prompt, options.commandText, options.composerDocument);
+							parseQueuedNewCommand(
+								prompt,
+								options.commandText,
+								options.composerDocument,
+								options.executionIntent,
+							) ||
+							parseQueuedGoalCommand(
+								prompt,
+								options.commandText,
+								options.composerDocument,
+								options.executionIntent,
+							);
 						claimed = queuedCommand
 							? undefined
 							: await claimInboxHead(

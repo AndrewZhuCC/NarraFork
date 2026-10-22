@@ -9,17 +9,22 @@
  * 3. **The bot speaks only through Send({ user }).** Only a bot narrator is offered the
  *    target and only a bot narrator can use it; its message is attributed to the bot,
  *    not to a stand-in account.
- * 4. **A person's post reaches the bot authored by that person**, quotes included, while
- *    the bot's own messages are never fed back to it.
+ * 4. **A person's post reaches the bot authored by that person**, quotes and files
+ *    included, as literal text, in the room's order — and only a post the bot took is
+ *    recorded. The bot's own messages are never fed back to it.
  * 5. **Bot conversations are conversations**: listed with the bot as peer and counted
  *    in the navigation badge.
+ * 6. **Nothing waits on a person who can't see it**: a bot can't ask or plan for
+ *    approval, and a fork of one is an ordinary narrator.
  *
  * Runs against an isolated DB under a temp NARRAFORK_HOME (see tests/preload.ts).
  */
 import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../../db";
-import { chatMessages, chatRooms, narrators, users } from "../../db/schema";
+import { chatAttachments, chatMessages, chatRooms, narrators, users } from "../../db/schema";
 import { sendTool } from "../../lib/agent/tools/send";
 import type { AgentConfig, ToolContext } from "../../lib/agent/types";
 import { ForbiddenError, NotFoundError, ValidationError } from "../../lib/errors";
@@ -29,27 +34,49 @@ import { resolveRuntimePolicy } from "../agent-runtime/policy";
 
 // ── narrator-session double: delivery is observed, never run as a real agent turn ──
 
-const accepted: Array<{ narratorId: string; text: string; userId: string | null | undefined }> = [];
+interface Accepted {
+	narratorId: string;
+	text: string;
+	userId: string | null | undefined;
+	literal: boolean | undefined;
+}
+const accepted: Accepted[] = [];
 const creators: Array<{ username: string } | null | undefined> = [];
+/** Set to make the bot refuse what it is handed, as a full queue does. */
+let refusal: Error | null = null;
+/** Set to hold an admission open, to see whether a later post can overtake it. */
+let admissionDelay: ((text: string) => Promise<void>) | null = null;
 const realSessionModule = { ...(await import("../narrator-session")) };
 mock.module("../narrator-session", () => ({
 	...realSessionModule,
 	acceptUserMessage: async (
 		narratorId: string,
 		text: string,
-		options: { userId?: string | null; creator?: { username: string } | null },
+		options: {
+			userId?: string | null;
+			creator?: { username: string } | null;
+			executionIntent?: { literal?: boolean };
+		},
 	) => {
-		accepted.push({ narratorId, text, userId: options.userId });
+		await admissionDelay?.(text);
+		if (refusal) throw refusal;
+		accepted.push({
+			narratorId,
+			text,
+			userId: options.userId,
+			literal: options.executionIntent?.literal,
+		});
 		creators.push(options.creator);
 		return { buffered: true, id: generateId(), bufferedAt: new Date().toISOString() };
 	},
 }));
 
-const { deliverToBot, sendAsBot } = await import("../bot-chat");
+const { sendAsBot } = await import("../bot-chat");
 const {
 	assertCanRead,
 	buildBotRoomKey,
 	CHAT_BOT_MESSAGE_MAX_CHARS,
+	createChatAttachment,
 	getUnreadSummary,
 	hydrateMessageForBroadcast,
 	listConversationRooms,
@@ -62,6 +89,7 @@ const {
 const { runtimeBasePrompt } = await import("../agent-runtime/orchestrator");
 const { shouldAutoAllowSendWithinScope } = await import("../narrator-permission");
 const { narratorService } = await import("../narrator-service");
+const { resolveNarratorRuntimePolicy } = await import("../trait-layer-service");
 
 afterAll(() => {
 	mock.module("../narrator-session", () => realSessionModule);
@@ -81,6 +109,9 @@ let watchOnlyBot: string;
 /** Only the owner may even see it. */
 let privateBot: string;
 let plainNarrator: string;
+/** A bot with a working directory, so files can reach it. */
+let fileBot: string;
+let fileBotCwd: string;
 
 async function makeUser(label: string): Promise<{ id: string; username: string }> {
 	const id = generateId();
@@ -100,6 +131,7 @@ async function makeNarrator(input: {
 	traits: string[];
 	visibility: "private" | "project" | "public";
 	writeAudience: "owner" | "project" | "public";
+	cwd?: string;
 }): Promise<string> {
 	const id = generateId();
 	const now = new Date().toISOString();
@@ -110,14 +142,26 @@ async function makeNarrator(input: {
 		ownerUserId: owner,
 		visibility: input.visibility,
 		writeAudience: input.writeAudience,
+		cwd: input.cwd ?? null,
 		createdAt: now,
 		updatedAt: now,
 	});
 	return id;
 }
 
-function botMessageEvent(roomId: string, messageId: string, senderUserId: string | null) {
-	return { roomId, messageId, senderUserId, roomKind: "bot", narratorId: openBot };
+function textFile(name: string, body: string): File {
+	return new File([body], name, { type: "text/markdown" });
+}
+
+/** What the bot's worktree holds of attached files. */
+function attachedCopies(): string[] {
+	const dir = join(fileBotCwd, ".narrafork", "attached");
+	return existsSync(dir) ? readdirSync(dir) : [];
+}
+
+async function roomTexts(roomId: string, userId: string): Promise<string[]> {
+	const page = await listMessages({ roomId, userId });
+	return page.messages.map((message) => message.contentText);
 }
 
 beforeAll(async () => {
@@ -150,6 +194,14 @@ beforeAll(async () => {
 		traits: ["standalone"],
 		visibility: "public",
 		writeAudience: "public",
+	});
+	fileBotCwd = mkdtempSync(join(process.env.NARRAFORK_HOME as string, "bot-cwd-"));
+	fileBot = await makeNarrator({
+		title: "File Bot",
+		traits: bot,
+		visibility: "public",
+		writeAudience: "public",
+		cwd: fileBotCwd,
 	});
 });
 
@@ -229,6 +281,30 @@ describe("bot room access", () => {
 		const room = await resolveBotRoom(watchOnlyBot, alice);
 		await expect(
 			postMessage({ roomId: room.id, senderUserId: alice, text: "hi" }),
+		).rejects.toBeInstanceOf(ForbiddenError);
+	});
+
+	test("narrowing who may drive a bot stops their posts, not their history", async () => {
+		const narrowing = await makeNarrator({
+			title: "Narrowing Bot",
+			traits: [BOT_TRAIT, "standalone"],
+			visibility: "public",
+			writeAudience: "public",
+		});
+		const room = await resolveBotRoom(narrowing, alice);
+		await postMessage({ roomId: room.id, senderUserId: alice, text: "before" });
+		await db.update(narrators).set({ writeAudience: "owner" }).where(eq(narrators.id, narrowing));
+		await expect(
+			postMessage({ roomId: room.id, senderUserId: alice, text: "after" }),
+		).rejects.toBeInstanceOf(ForbiddenError);
+		expect(await roomTexts(room.id, alice)).toEqual(["before"]);
+		expect((await resolveBotRoom(narrowing, alice)).canPost).toBe(false);
+	});
+
+	test("so does staging a file, which could never be sent", async () => {
+		const room = await resolveBotRoom(watchOnlyBot, alice);
+		await expect(
+			createChatAttachment(room.id, alice, textFile("notes.md", "# hi")),
 		).rejects.toBeInstanceOf(ForbiddenError);
 	});
 });
@@ -329,6 +405,16 @@ describe("Send({ user })", () => {
 		).rejects.toBeInstanceOf(NotFoundError);
 	});
 
+	test("reaches only people who can open the bot, without opening a room for others", async () => {
+		await expect(
+			sendAsBot({ narratorId: privateBot, user: aliceName, message: "Your session expired" }),
+		).rejects.toBeInstanceOf(ForbiddenError);
+		const phantom = await db.query.chatRooms.findFirst({
+			where: eq(chatRooms.dmKey, buildBotRoomKey(privateBot, alice)),
+		});
+		expect(phantom).toBeUndefined();
+	});
+
 	test("refuses a narrator that is not a bot, even with a hand-built call", async () => {
 		const result = await sendTool.execute({ user: aliceName, message: "hi" }, ctx(plainNarrator));
 		expect(result.isError).toBe(true);
@@ -364,13 +450,10 @@ describe("delivery to the bot", () => {
 		accepted.length = 0;
 		creators.length = 0;
 		const room = await resolveBotRoom(openBot, alice);
-		const posted = await postMessage({
-			roomId: room.id,
-			senderUserId: alice,
-			text: "Make it blue",
-		});
-		await deliverToBot(botMessageEvent(room.id, posted.id, alice));
-		expect(accepted).toEqual([{ narratorId: openBot, text: "Make it blue", userId: alice }]);
+		await postMessage({ roomId: room.id, senderUserId: alice, text: "Make it blue" });
+		expect(accepted).toEqual([
+			{ narratorId: openBot, text: "Make it blue", userId: alice, literal: true },
+		]);
 		expect(creators[0]?.username).toBe(aliceName);
 	});
 
@@ -381,20 +464,35 @@ describe("delivery to the bot", () => {
 			userId: alice,
 			text: "Serif or sans?",
 		});
-		const answer = await postMessage({
+		await postMessage({
 			roomId: question.roomId,
 			senderUserId: alice,
 			text: "Sans",
 			replyToMessageId: question.id,
 		});
-		await deliverToBot(botMessageEvent(question.roomId, answer.id, alice));
 		expect(accepted[0]?.text).toBe("> Serif or sans?\n\nSans");
+	});
+
+	test("chat text is never a session command", async () => {
+		accepted.length = 0;
+		const room = await resolveBotRoom(openBot, alice);
+		await postMessage({ roomId: room.id, senderUserId: alice, text: "/new draft a poem" });
+		expect(accepted[0]).toMatchObject({ text: "/new draft a poem", literal: true });
+		expect(
+			realSessionModule.parseQueuedNewCommand("/new draft a poem", null, undefined, {
+				literal: true,
+			}),
+		).toBeNull();
+		expect(
+			realSessionModule.parseQueuedGoalCommand("/goal ship it", null, undefined, {
+				literal: true,
+			}),
+		).toBeNull();
 	});
 
 	test("the bot's own messages are never fed back to it", async () => {
 		accepted.length = 0;
-		const sent = await postBotMessage({ narratorId: openBot, userId: alice, text: "Hi" });
-		await deliverToBot(botMessageEvent(sent.roomId, sent.id, null));
+		await postBotMessage({ narratorId: openBot, userId: alice, text: "Hi" });
 		expect(accepted).toHaveLength(0);
 	});
 
@@ -402,11 +500,94 @@ describe("delivery to the bot", () => {
 		accepted.length = 0;
 		await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, openBot));
 		const room = await resolveBotRoom(openBot, bob);
-		const posted = await postMessage({ roomId: room.id, senderUserId: bob, text: "Still there?" });
-		await deliverToBot(botMessageEvent(room.id, posted.id, bob));
+		await postMessage({ roomId: room.id, senderUserId: bob, text: "Still there?" });
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, openBot) });
 		expect(row?.status).toBe("idle");
 		expect(accepted).toHaveLength(1);
+	});
+
+	test("files travel with the post into the bot's worktree", async () => {
+		accepted.length = 0;
+		const room = await resolveBotRoom(fileBot, alice);
+		const draft = await createChatAttachment(room.id, alice, textFile("brief.md", "# Brief"));
+		await postMessage({
+			roomId: room.id,
+			senderUserId: alice,
+			text: "",
+			attachmentIds: [draft.id],
+		});
+		expect(accepted[0]?.text).toContain("<attached_files>");
+		expect(accepted[0]?.text).toContain("brief.md");
+		const copies = attachedCopies();
+		expect(copies).toHaveLength(1);
+		expect(readFileSync(join(fileBotCwd, ".narrafork", "attached", copies[0]), "utf-8")).toBe(
+			"# Brief",
+		);
+	});
+
+	test("a post the bot can't take is refused: nothing recorded, the files left to retry", async () => {
+		accepted.length = 0;
+		const room = await resolveBotRoom(fileBot, bob);
+		const draft = await createChatAttachment(room.id, bob, textFile("plan.md", "# Plan"));
+		const before = attachedCopies().length;
+		refusal = new ValidationError("Message queue is full");
+		try {
+			await expect(
+				postMessage({
+					roomId: room.id,
+					senderUserId: bob,
+					text: "Here is the plan",
+					attachmentIds: [draft.id],
+				}),
+			).rejects.toThrow("Message queue is full");
+		} finally {
+			refusal = null;
+		}
+		expect(await roomTexts(room.id, bob)).not.toContain("Here is the plan");
+		expect(attachedCopies()).toHaveLength(before);
+		const stillDraft = await db.query.chatAttachments.findFirst({
+			where: and(eq(chatAttachments.id, draft.id), isNull(chatAttachments.messageId)),
+		});
+		expect(stillDraft).toBeDefined();
+
+		// The person sends the same message again, and this time the bot takes it.
+		await postMessage({
+			roomId: room.id,
+			senderUserId: bob,
+			text: "Here is the plan",
+			attachmentIds: [draft.id],
+		});
+		expect(await roomTexts(room.id, bob)).toContain("Here is the plan");
+		expect(accepted).toHaveLength(1);
+	});
+
+	test("a file for a bot with no working directory refuses the post", async () => {
+		const room = await resolveBotRoom(openBot, alice);
+		const draft = await createChatAttachment(room.id, alice, textFile("x.md", "x"));
+		await expect(
+			postMessage({ roomId: room.id, senderUserId: alice, text: "", attachmentIds: [draft.id] }),
+		).rejects.toBeInstanceOf(ValidationError);
+	});
+
+	test("the bot hears posts in the room's order, even when they race", async () => {
+		accepted.length = 0;
+		const frank = await makeUser("bot-frank");
+		const room = await resolveBotRoom(openBot, frank.id);
+		// Hold the first admission open: without one-at-a-time delivery the second post
+		// would reach the bot first.
+		admissionDelay = (text) => (text === "first" ? Bun.sleep(50) : Promise.resolve());
+		try {
+			await Promise.all([
+				postMessage({ roomId: room.id, senderUserId: frank.id, text: "first" }),
+				Bun.sleep(5).then(() =>
+					postMessage({ roomId: room.id, senderUserId: frank.id, text: "second" }),
+				),
+			]);
+		} finally {
+			admissionDelay = null;
+		}
+		expect(accepted.map((entry) => entry.text)).toEqual(["first", "second"]);
+		expect(await roomTexts(room.id, frank.id)).toEqual(["first", "second"]);
 	});
 });
 
@@ -446,6 +627,25 @@ describe("bot narrators", () => {
 		expect(bot.title).toBe("Review Bot");
 	});
 
+	test("nothing in a bot waits for a person to approve or answer", async () => {
+		const bot = await narratorService.create({
+			kind: "bot",
+			title: "Planner Bot",
+			startInPlanMode: true,
+		});
+		expect(bot.planMode).toBe(false);
+		expect(bot.traits).not.toContain("plan");
+		const policy = await resolveNarratorRuntimePolicy(bot.id);
+		expect(policy.capabilities.askUserQuestion).toBe("disabled");
+		expect(policy.capabilities.planApproval).toBe(false);
+	});
+
+	test("a fork of a bot is an ordinary narrator", async () => {
+		const bot = await narratorService.create({ kind: "bot", title: "Fork Me" });
+		const fork = await narratorService.forkNarrator(bot.id, null, { inheritMode: "fresh" });
+		expect(isBotNarrator(fork.traits)).toBe(false);
+	});
+
 	test("a bot needs a name and cannot belong to a chapter", async () => {
 		await expect(narratorService.create({ kind: "bot" })).rejects.toBeInstanceOf(ValidationError);
 		await expect(
@@ -468,24 +668,5 @@ describe("bot narrators", () => {
 		expect(runtimeBasePrompt({ systemPrompt: "PERSONA", traits: [] }, "en", policy)).toBe(
 			"PERSONA",
 		);
-	});
-});
-
-// ─── Wiring (last: the bus listener stays registered for the rest of the file) ──
-
-describe("the bus bridge", () => {
-	test("posts reach the bot through chat:message_created, in post order", async () => {
-		const { initBotChat } = await import("../bot-chat");
-		initBotChat();
-		accepted.length = 0;
-		const frank = await makeUser("bot-frank");
-		const room = await resolveBotRoom(openBot, frank.id);
-		await postMessage({ roomId: room.id, senderUserId: frank.id, text: "first" });
-		await postMessage({ roomId: room.id, senderUserId: frank.id, text: "second" });
-		await postBotMessage({ narratorId: openBot, userId: frank.id, text: "bot reply" });
-		const deadline = Date.now() + 5_000;
-		while (accepted.length < 2 && Date.now() < deadline) await Bun.sleep(10);
-		await Bun.sleep(50);
-		expect(accepted.map((entry) => entry.text)).toEqual(["first", "second"]);
 	});
 });

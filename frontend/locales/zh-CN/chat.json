@@ -54,8 +54,11 @@
 	"botBadge": "Bot",
 	"botFallbackName": "Bot",
 	"botThinking": "思考中…",
-	"botWaiting": "正在等待审批——打开监控界面处理",
+	"botWaiting": "需要处理——请打开监控界面",
+	"botWaitingReadOnly": "等待处理中",
+	"botWaitingModel": "正在等待模型恢复可用",
+	"botFailed": "bot 运行出错——打开监控查看详情",
 	"botMonitor": "监控",
-	"botReadOnly": "你可以查看这个 bot，但不能给它发消息。",
+	"botReadOnly": "你没有给这个 bot 发消息的权限。",
 	"openBot": "打开 bot"
 }

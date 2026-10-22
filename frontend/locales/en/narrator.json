@@ -2541,6 +2541,5 @@
 		"fetchError": "Usage fetch failed: {{error}}",
 		"staleHint": "Last refresh failed — figures may be out of date.",
 		"updatedAt": "Updated {{time}}"
-	},
-	"botBadge": "Bot"
+	}
 }
