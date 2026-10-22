@@ -1680,8 +1680,8 @@ reconcile(narrator, target, now):
 | D19 | 是否提供「按最新数据重建上下文」的手动操作 | 待定。纪元改为标记块之后，实现代价只是一次 `openEpoch(reason = "manual")`（§7.7），可以只按需求取舍 | **待定** |
 | D20 | 纪元内加载工具 | 五种策略，由模型在 catalog 里声明（可多种），按当前协议选用；都不适用时直接改 tools[] 并开启新纪元；新纪元完全重新构建（§7.8） | **已定** |
 | D21 | 工具加载策略的默认值 | 按裸模型名匹配：含 gpt 用 `openai_additional_tools`，含 claude 用 `anthropic_tool_addition`，含 deepseek 用 `anthropic_deferred_tail`，其他用 `custom_injection`；catalog 声明可覆盖，用户可禁用（§7.8） | **已定** |
-| D22 | kind 是否从 7 种收为 5 种 | 推荐收：`marker`、`notice` 并入 `context`，按 subtype 分族；可见性统一为「`done` 且 `model_text` 非空」（§3.3）。备选：保留 7 种，代价是三处 kind 分支与三套可见性规则 | 推荐，未确认 |
-| D23 | phase 是否从 6 个收为 4 个 | 推荐收：tool 的 `called`、`settled` 分别并入 `open`、`done`；输入流式阶段不落行，不需要名字（§3.5）。备选：保留，代价是部分索引、触发器、共享判定都要比较两个值 | 推荐，未确认 |
+| D22 | kind 是否从 7 种收为 5 种 | 推荐收：`marker`、`notice` 并入 `context`，按 subtype 分族；可见性统一为「`done` 且 `model_text` 非空」（§3.3）。备选：保留 7 种，代价是三处 kind 分支与三套可见性规则 | **已定** |
+| D23 | phase 是否从 6 个收为 4 个 | 推荐收：tool 的 `called`、`settled` 分别并入 `open`、`done`；输入流式阶段不落行，不需要名字（§3.5）。备选：保留，代价是部分索引、触发器、共享判定都要比较两个值 | **已定** |
 | D24 | `provider_meta` 的形状 | 推荐「来源 + 上游原样骨架」：正文换成 part 引用，其余字段原样；同源回放把 part 填回（§3.4）。备选：按协议的字段白名单，每遇上游新字段都要改 schema，Codex WS 续写只能靠测试补字段 | **已定** |
 | D25 | 纪元状态存在哪里 | 推荐：开启纪元写一个 `context` 标记块（compact 块兼任），工具定义与 system 正文按内容寻址存 `narrator_text_snapshots`；纪元内一切变化由每次请求前的对账写成追加的块（§7.7、§7.8）。已实现的倒推保留为旧数据的兜底与一致性检查。备选 A：前两轮的两张旁表，fork / 提取要另外复制；备选 B：全部倒推（即已实现的做法），绕过提示行的变化会漂移，system 正文也无法倒推 | **已定** |
 | D26 | Await 回执改写怎样满足只追加 | 推荐：只许 seq 更早的回执缩短更晚的工具结果；后到的回执与更早的结果都保留全文（§7.2）。备选：记录「第一次投影时的判断」，要多一份状态 | 推荐，未确认 |
