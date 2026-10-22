@@ -77,13 +77,13 @@ import {
 				]) {
 					await second.unsafe(`CREATE TABLE other_tenant.${table} (LIKE public.${table})`);
 					await second.unsafe(
-						`CREATE TRIGGER model_history_v2_${kind} BEFORE UPDATE ON other_tenant.${table} FOR EACH ROW EXECUTE FUNCTION public.model_history_v2_${kind}()`,
+						`CREATE TRIGGER model_history_v3_${kind} BEFORE UPDATE ON other_tenant.${table} FOR EACH ROW EXECUTE FUNCTION public.model_history_v3_${kind}()`,
 					);
 				}
 				expect((await signature()).trusted).toBe(true);
 				expect(await loadModelHistorySource(backend, "fork")).toBe(changed);
 				await second.unsafe(
-					"ALTER TABLE narrator_tool_calls DISABLE TRIGGER model_history_v2_tool",
+					"ALTER TABLE narrator_tool_calls DISABLE TRIGGER model_history_v3_tool",
 				);
 				expect((await signature()).trusted).toBe(false);
 				const hits = modelHistorySourceStats().hits;
@@ -94,7 +94,7 @@ import {
 					`UPDATE narrator_tool_calls SET output_json='"disabled result"' WHERE id='tool'`,
 				);
 				expect((await signature()).revision).toBe(disabledRevision);
-				await second.unsafe("ALTER TABLE narrator_tool_calls ENABLE TRIGGER model_history_v2_tool");
+				await second.unsafe("ALTER TABLE narrator_tool_calls ENABLE TRIGGER model_history_v3_tool");
 				const restored = await loadModelHistorySource(backend, "fork");
 				expect(restored.counters.reusedBodies ?? 0).toBe(0);
 				expect(restored.messages[0].toolCalls[0].outputJson).toBe("disabled result");
@@ -113,7 +113,7 @@ import {
 					});
 				} catch {}
 				expect((await signature()).revision).toBe(before.revision);
-				await second.unsafe("DROP TRIGGER model_history_v2_tool ON narrator_tool_calls");
+				await second.unsafe("DROP TRIGGER model_history_v3_tool ON narrator_tool_calls");
 				expect((await signature()).trusted).toBe(false);
 				return { status: "verified" as const };
 			} catch (error) {

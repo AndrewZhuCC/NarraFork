@@ -67,6 +67,8 @@ const STATE_KEYS: Readonly<Record<string, readonly string[]>> = {
 	review_feedback: ["applied"],
 	compact: ["status", "attempts", "mode", "error"],
 	segment_compact: ["status", "error"],
+	// The card's model text is the envelope's content text; these only drive its controls.
+	subagent_recovery: ["status", "mode", "resumedCount", "subagents"],
 };
 const CARD_STATE_KEYS = ["isLatest"];
 
@@ -205,6 +207,22 @@ export function splitEnvelope(
 		if (count) block.key = `${block.key}~${count}`;
 	}
 	return { blocks, envelope };
+}
+
+/**
+ * Whether `after` differs from `before` only in reader-only fields: same elements, same
+ * fields outside `state`. A state-only write (§5.4) is one of these whose blocks also keep
+ * every column the decoder derives (a compact's status sets its phase; see the store).
+ */
+export function isStateOnlyChange(before: readonly unknown[], after: readonly unknown[]): boolean {
+	return (
+		before.length === after.length &&
+		before.every(
+			(element, index) =>
+				JSON.stringify(separateState(element)[0]) ===
+				JSON.stringify(separateState(after[index])[0]),
+		)
+	);
 }
 
 /**

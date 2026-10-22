@@ -225,6 +225,13 @@
 			"when": 1792659185981,
 			"tag": "0031_legacy_body_index",
 			"breakpoints": true
+		},
+		{
+			"idx": 32,
+			"version": "7",
+			"when": 1792663582482,
+			"tag": "0032_block_state_writes",
+			"breakpoints": true
 		}
   ]
 }

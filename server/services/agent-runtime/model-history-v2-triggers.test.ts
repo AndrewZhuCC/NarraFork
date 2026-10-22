@@ -1,10 +1,12 @@
 /**
- * Model-history contract v2 (docs/BLOCK_STORAGE-DESIGN.md §4.5), on the migrated schema.
+ * Model-history contract v2 (docs/BLOCK_STORAGE-DESIGN.md §4.5), as v3 installs it on the
+ * migrated schema.
  *
  * A native envelope's (`body_format = 2`) blocks count once they leave `open`; `state` never
- * counts. Its `content_json` still counts too (readers read it during P1), and flipping the
+ * counts. Its `content_json` still counts too (the compatibility projection), and flipping the
  * format alone counts for nothing. Block rows of a legacy envelope never count. A tool
- * block's phase follows its newest ledger attempt.
+ * block's phase follows its newest ledger attempt. v3: a state-only write (it moves
+ * `state_revision`) neither counts nor queues a sync (§5.4).
  */
 
 import { beforeEach, describe, expect, test } from "bun:test";
@@ -12,7 +14,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import { readSqliteModelHistorySignature } from "./model-history-revision";
 import {
 	MODEL_HISTORY_REVISION_CONTRACT,
-	MODEL_HISTORY_V2_SQLITE_TRIGGERS,
+	MODEL_HISTORY_SQLITE_TRIGGERS,
 } from "./model-history-revision-sql";
 
 const { sqlite } = getTestDb();
@@ -239,6 +241,50 @@ describe("model-history v2 triggers", () => {
 		expect(queued()).toEqual(["legacy"]);
 	});
 
+	test("a state-only write moves state_revision and neither counts nor queues a sync", () => {
+		const queued = () =>
+			(sqlite.prepare("SELECT count(*) AS n FROM narrator_block_sync_queue").get() as { n: number })
+				.n;
+		for (const [id, format] of [
+			["native", 2],
+			["legacy", 1],
+		] as const) {
+			envelope(id, format);
+			sqlite.run("DELETE FROM narrator_block_sync_queue");
+			const body = () =>
+				sqlite.prepare("SELECT body_revision AS r FROM narrator_messages WHERE id = ?").get(id) as {
+					r: number;
+				};
+			const before = body().r;
+			expect(
+				bumps(() =>
+					sqlite.run(
+						`UPDATE narrator_messages SET content_json = '[{"type":"text","text":"","translatedText":"t"}]', state_revision = state_revision + 1 WHERE id = ?`,
+						[id],
+					),
+				),
+			).toBe(false);
+			expect(body().r).toBe(before);
+			expect(queued()).toBe(0);
+			// The same body change without the state counter is a body write again.
+			expect(
+				bumps(() =>
+					sqlite.run(`UPDATE narrator_messages SET content_json = '[]' WHERE id = ?`, [id]),
+				),
+			).toBe(true);
+			expect(queued()).toBe(format === 2 ? 1 : 0);
+			// An identity change counts even inside a state write.
+			expect(
+				bumps(() =>
+					sqlite.run(
+						"UPDATE narrator_messages SET origin = 'x', state_revision = state_revision + 1 WHERE id = ?",
+						[id],
+					),
+				),
+			).toBe(true);
+		}
+	});
+
 	test("the installed contract is exactly the rendered trigger set", () => {
 		const names = (
 			sqlite
@@ -247,6 +293,6 @@ describe("model-history v2 triggers", () => {
 				)
 				.all() as Array<{ name: string }>
 		).map((row) => row.name);
-		expect(names).toEqual([...MODEL_HISTORY_V2_SQLITE_TRIGGERS].sort());
+		expect(names).toEqual([...MODEL_HISTORY_SQLITE_TRIGGERS].sort());
 	});
 });

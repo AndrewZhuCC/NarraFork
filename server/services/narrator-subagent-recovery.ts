@@ -55,6 +55,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
+import { narratorStore } from "./narrator-store";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
 import { registerAndPersistSubagentAlias } from "./subagent-alias";
 
@@ -1223,35 +1224,29 @@ export async function markRecoveryCardResolved(input: {
 	/** Failed starts stay actionable; successful starts must not be restarted twice. */
 	retrySubagentIds?: string[];
 }): Promise<void> {
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, input.messageId),
-		columns: { id: true, contentJson: true },
-	});
-	if (!message) return;
-	const blocks = Array.isArray(message.contentJson) ? [...message.contentJson] : [];
-	const index = blocks.findIndex(
-		(block) => (block as { type?: string } | null)?.type === "subagent_recovery",
-	);
-	if (index < 0) return;
-	const previous = blocks[index] as Record<string, unknown>;
 	const retryIds = new Set(input.retrySubagentIds ?? []);
-	const remaining = (Array.isArray(previous.subagents) ? previous.subagents : []).filter(
-		(entry) => entry && typeof entry.id === "string" && retryIds.has(entry.id),
-	);
-	blocks[index] = {
-		...previous,
-		status: remaining.length > 0 ? "pending" : "resolved",
-		mode: input.mode,
-		resumedCount:
-			(typeof previous.resumedCount === "number" ? previous.resumedCount : 0) +
-			input.resumedAliases.length,
-		...(remaining.length > 0 ? { subagents: remaining } : {}),
-	};
-
-	await db
-		.update(narratorMessages)
-		.set({ contentJson: blocks })
-		.where(eq(narratorMessages.id, input.messageId));
+	// Card state: the card's model text is its content text (§5.4).
+	const written = narratorStore.patchState(input.messageId, (blocks) => {
+		const index = blocks.findIndex(
+			(block) => (block as { type?: string } | null)?.type === "subagent_recovery",
+		);
+		if (index < 0) return null;
+		const previous = blocks[index] as Record<string, unknown>;
+		const remaining = (Array.isArray(previous.subagents) ? previous.subagents : []).filter(
+			(entry) => entry && typeof entry.id === "string" && retryIds.has(entry.id),
+		);
+		blocks[index] = {
+			...previous,
+			status: remaining.length > 0 ? "pending" : "resolved",
+			mode: input.mode,
+			resumedCount:
+				(typeof previous.resumedCount === "number" ? previous.resumedCount : 0) +
+				input.resumedAliases.length,
+			...(remaining.length > 0 ? { subagents: remaining } : {}),
+		};
+		return blocks;
+	});
+	if (!written) return;
 	sqlite
 		.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
 		.run(input.narratorId);

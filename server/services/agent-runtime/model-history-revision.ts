@@ -1,27 +1,29 @@
 import type { Database } from "bun:sqlite";
 import type { SQL } from "bun";
 import {
+	MODEL_HISTORY_PG_TRIGGERS,
 	MODEL_HISTORY_REVISION_CONTRACT,
-	MODEL_HISTORY_V2_PG_TRIGGERS,
-	MODEL_HISTORY_V2_SQLITE_TRIGGERS,
+	MODEL_HISTORY_SQLITE_TRIGGERS,
 } from "./model-history-revision-sql";
 
-const tableOf = (name: string) =>
-	name.startsWith("model_history_v2_message") || name.startsWith("model_history_v2_sync_message")
+const tableOf = (name: string) => {
+	const kind = name.replace(/^model_history_v\d+_/, "");
+	return kind.startsWith("message") || kind.startsWith("sync_message")
 		? "narrator_messages"
-		: name.startsWith("model_history_v2_tool") || name.startsWith("model_history_v2_sync_tool")
+		: kind.startsWith("tool") || kind.startsWith("sync_tool")
 			? "narrator_tool_calls"
-			: name.startsWith("model_history_v2_ref")
+			: kind.startsWith("ref")
 				? "narrator_message_refs"
-				: name.startsWith("model_history_v2_block")
+				: kind.startsWith("block")
 					? "narrator_blocks"
-					: name === "model_history_v2_sender"
+					: kind === "sender"
 						? "users"
 						: "narrators";
-const sqliteTriggerPredicate = MODEL_HISTORY_V2_SQLITE_TRIGGERS.map(
+};
+const sqliteTriggerPredicate = MODEL_HISTORY_SQLITE_TRIGGERS.map(
 	(name) => `(name='${name}' AND tbl_name='${tableOf(name)}')`,
 ).join(" OR ");
-const pgTriggerPredicate = MODEL_HISTORY_V2_PG_TRIGGERS.map(
+const pgTriggerPredicate = MODEL_HISTORY_PG_TRIGGERS.map(
 	([name, table]) => `(tgname='${name}' AND tgrelid='${table}'::regclass)`,
 ).join(" OR ");
 
@@ -54,7 +56,7 @@ export function readSqliteModelHistorySignature(
 			catalogIdentity: String(row?.catalogIdentity ?? -1),
 			trusted:
 				row?.contract === MODEL_HISTORY_REVISION_CONTRACT &&
-				row.triggers === MODEL_HISTORY_V2_SQLITE_TRIGGERS.length,
+				row.triggers === MODEL_HISTORY_SQLITE_TRIGGERS.length,
 		};
 	} catch (error) {
 		// An old schema is still readable, but cannot ever admit cached source rows.
@@ -109,7 +111,7 @@ export async function readPostgresModelHistorySignature(
 			catalogIdentity: String(row?.catalogIdentity ?? "missing"),
 			trusted:
 				row?.contract === MODEL_HISTORY_REVISION_CONTRACT &&
-				Number(row.triggers) === MODEL_HISTORY_V2_PG_TRIGGERS.length,
+				Number(row.triggers) === MODEL_HISTORY_PG_TRIGGERS.length,
 		};
 	} catch (error) {
 		if (error instanceof Error && error.message.startsWith("Model history preparation"))

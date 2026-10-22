@@ -65,6 +65,7 @@ import {
 	contentByAttempt,
 	flushChangedEnvelopes,
 	newEnvelopeColumns,
+	patchEnvelopeState,
 	type SyncMode,
 	syncCopiedEnvelope,
 	syncEnvelopeNow,
@@ -2705,33 +2706,30 @@ const sqliteNarratorPersistence = {
 		translatedText: string,
 		expected?: { id?: string; text: string },
 	) {
-		const existing = db.query.narratorMessages
-			.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			})
-			.sync();
-		if (!existing) return false;
-
-		const content = Array.isArray(existing.contentJson) ? [...existing.contentJson] : [];
-		const index = expected?.id
-			? content.findIndex((entry) => entry?.type === "reasoning" && entry.id === expected.id)
-			: reasoningIndex;
-		const block = content[index] as Record<string, unknown> | undefined;
-		if (!block || block.type !== "reasoning") return false;
-		if (expected && block.text !== expected.text) return false;
-		if (block.translatedText === translatedText) return false;
-
-		block.translatedText = translatedText;
-		db.transaction(() => {
-			db.update(narratorMessages)
-				.set({ contentJson: content })
-				.where(eq(narratorMessages.id, messageId))
-				.run();
-			// A translation is block state: no body revision.
-			syncEnvelopeNow(messageId);
+		// A translation is block state: no body revision (§5.4).
+		return patchEnvelopeState(messageId, (content) => {
+			const index = expected?.id
+				? content.findIndex(
+						(entry) =>
+							(entry as { type?: unknown } | null)?.type === "reasoning" &&
+							(entry as { id?: unknown }).id === expected.id,
+					)
+				: reasoningIndex;
+			const block = content[index] as Record<string, unknown> | undefined;
+			if (!block || block.type !== "reasoning") return null;
+			if (expected && block.text !== expected.text) return null;
+			if (block.translatedText === translatedText) return null;
+			block.translatedText = translatedText;
+			return content;
 		});
-		return true;
+	},
+
+	/**
+	 * A state-only write (§5.4): reader-only fields of one envelope's elements, without a
+	 * model-history bump, COW or search index. See `patchEnvelopeState`.
+	 */
+	patchState(messageId: string, mutate: (content: unknown[]) => unknown[] | null): boolean {
+		return patchEnvelopeState(messageId, mutate);
 	},
 
 	/**
