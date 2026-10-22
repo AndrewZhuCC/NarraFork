@@ -13,6 +13,8 @@
  * Pure types: no server imports, so clients and plugins can share them.
  */
 
+import type { TextCitation } from "../citations";
+import type { FileReference } from "../file-reference";
 import type { MessageOrigin } from "../message-origin";
 
 /** Who wrote a block and how it came to be (§3.3). */
@@ -30,19 +32,11 @@ export type BlockPhase = "open" | "done" | "aborted" | "failed";
 
 // === Parts ===
 
-/** Citation attached to a text range, in the part's own coordinates. */
-export interface PartCitation {
-	startIndex?: number;
-	endIndex: number;
-	url?: string;
-	title?: string;
-	[key: string]: unknown;
-}
-
 export interface TextPart {
 	type: "text";
 	text: string;
-	citations?: PartCitation[];
+	/** Citations in the coordinates of `text`. */
+	citations?: TextCitation[];
 	/** Reasoning only: which channel of the item the segment came from. */
 	segment?: "summary" | "content";
 }
@@ -57,29 +51,31 @@ export interface ImagePart {
 	assetId: string;
 	mediaType?: string;
 	name?: string;
+	size?: number;
+	sourceMimeType?: string;
 	width?: number;
 	height?: number;
 	sha256?: string;
 	uploadNarratorId?: string;
-	/** Placeholder position the composer wrote (`[image #N]`), 1-based. */
-	position?: number;
 }
 
 /** A text file attached by the user (`text_file`). */
 export interface FilePart {
 	type: "file";
-	assetId?: string;
 	name: string;
 	size?: number;
-	mediaType?: string;
-	position?: number;
-	[key: string]: unknown;
+	/** Where the attachment was saved; legacy rows hold a path relative to the workspace. */
+	filePath?: string;
+	fileId?: string;
 }
 
-/** A frozen reference to a workspace file (`file_reference`). */
+/** A workspace file captured when the input was accepted (`file_reference`). */
 export interface FileRefPart {
 	type: "file_ref";
-	reference: Record<string, unknown>;
+	reference: FileReference;
+	snapshotText: string;
+	snapshotHash: string;
+	capturedAt: string;
 }
 
 export type BlockPart = TextPart | ImagePart | FilePart | FileRefPart;
@@ -153,7 +149,7 @@ interface BlockBase {
 	/** Non model-visible mutable metadata (§3.4). */
 	state?: Record<string, unknown>;
 	/** Provider attempt that produced an assistant block (§3.2). */
-	attemptId?: number;
+	attemptId?: string;
 }
 
 export interface InputBlock extends BlockBase {
@@ -191,6 +187,18 @@ export interface ContextBlock extends BlockBase {
 	subtype: string;
 	payload: ContextPayload;
 	modelText: string | null;
+	/**
+	 * View only: the protocol-native tool change a `tool_loaded` / `tool_unloaded` notice
+	 * carries for the current tool loading strategy (see server tool-loading).
+	 */
+	toolChange?: ToolChange;
+}
+
+/** Tools surfaced or withdrawn at one history position. */
+export interface ToolChange {
+	mode: string;
+	additions: ReadonlyArray<{ name: string; definition?: unknown }>;
+	removals: readonly string[];
 }
 
 export type CanonicalBlock = InputBlock | OutputBlock | ReasoningBlock | ToolBlock | ContextBlock;
@@ -209,7 +217,20 @@ export interface CanonicalEnvelope {
 	parentToolUseId: string | null;
 	/** Provider prefix of the step, when the row records one. */
 	provider?: string | null;
+	/** Upstream message id of an assistant step. */
+	upstreamMessageId?: string | null;
 	blocks: CanonicalBlock[];
+	/**
+	 * View only: the adopted ledger outputs of this envelope's tool blocks, by wire id.
+	 * Tool output text stays in the ledger (D1); a history view joins it here.
+	 */
+	toolOutputs?: Record<string, ToolOutput>;
+}
+
+/** The adopted ledger attempt of a tool block, as the model sees it. */
+export interface ToolOutput {
+	status: "success" | "fail";
+	output: unknown;
 }
 
 /** Whether a block may reach the model at all (§3.5); carry policy decides the rest. */
