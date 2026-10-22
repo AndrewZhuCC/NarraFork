@@ -215,7 +215,7 @@
 | 能力 | 说明 |
 |---|---|
 | 块级永久链接与引用 | 链接形如 `#blk-<id>`。引用锚点从「消息 id + 前 48 字 needle」（`quote-jump.ts:73-185`）换成块 id。经 COW 复制后，靠 lineage 仍能解析到原块。 |
-| 块级搜索 | 可选块级 FTS：命中直接定位到块并高亮。现在只能定位到消息（`frontend/lib/api/types.ts:1055-1062`）。 |
+| 块级搜索 | 块级 FTS（P1 起，D6）：命中直接定位到块并高亮。现在只能定位到消息（`frontend/lib/api/types.ts:1055-1062`）。 |
 | 块级评论 / 批注 | 以块的 lineage 为键挂评论，fork 后依然可见。现在没有这项能力。 |
 | 块级编辑历史 | `original_payload` 保持现有的「看原文」能力；之后可以按需扩展成块 revision 表，支持撤销和对比。 |
 | 按种类查询 | 例如 merge summary、图片引用、推理块，都能走索引，不再 `LIKE` 全表扫描或 `json_each`。 |
@@ -602,7 +602,7 @@ narrator_block_assets
 
 说明：
 - **不设 `narrator_id` 列。** 块属于哪个叙述者，一律经 refs → 信封判定。块的作者就是信封的作者。
-- **不设 `search_text` 列。** 前两轮为 `content_text` 派生和块级 FTS 预留了冻结的可搜索文本。它是 payload / model_text 的纯函数；`deriveEnvelope` 在同一事务里手上就有块，不需要它；块级 FTS 是 P3 的可选项（D6），到时再加。
+- **不设 `search_text` 列。** 可搜索文本是 payload / model_text（tool 块再加账本里被采用的结果）的纯函数。`deriveEnvelope` 在同一事务里手上就有块，写块级 FTS 时直接算出来，不需要再存一份（§4.6、D6）。
 - **`ordinal` 不重新编号。** 顺序在 item 打开时就确定（§3.2），落库先后无关。
 
 ### 4.2 `narrator_messages` 新增列（只做 `ALTER … ADD`）
@@ -633,11 +633,26 @@ narrator_block_assets
   - COW 克隆账本行时，`block_id` 重映射到克隆后的块。
 - **内部执行标记**：现有的内部执行行（`createInternalRead` 写入，toolUseId 以 `internal_read_` 开头）改为显式标记。它们的 `block_id` 为 null，投影与展示配对都跳过。
 
-### 4.4 可选：`narrator_turns`（P2 视需要）
+### 4.4 `narrator_turns`（P1 建，D7）
 
-`id, narrator_id, status, trigger_message_id, started_at, ended_at, stop_reason, usage 汇总`。
+一行是一次运行（D3），`id` 就是信封上的 `turn_id`。
 
-这张表用来支撑「本轮用了多少时间、调用了几次工具」这类轮级 UI，以及 External API 的轮列表。只有 `turn_id` 列已经足够完成本设计的其余部分，所以这张表不是前置条件。
+| 列 | 说明 |
+|---|---|
+| `id text primary key` | 运行开始时生成，写进这次运行产生的每个信封的 `turn_id` |
+| `narrator_id text not null` | 执行这次运行的叙述者，随叙述者删除级联 |
+| `status text not null` | `running`、`completed`、`interrupted`、`failed`；CHECK 约束 |
+| `trigger_message_id text` | 触发这次运行的信封（用户输入、自动续跑、定时任务等）；为空表示无输入触发 |
+| `started_at text not null`、`ended_at text` | 运行起止时间 |
+| `stop_reason text` | 结束原因：模型自然停止、用户中断、达到 maxTurns、错误等 |
+| `step_count integer`、`tool_call_count integer` | 本次运行的 provider 请求次数与工具调用次数 |
+| `usage_json text` | token 用量与费用汇总（输入、输出、缓存读写），按模型分项 |
+
+- 索引：`(narrator_id, started_at desc)`，供轮列表与 External API 的游标分页。
+- 写入只有两次：运行开始时插入一行（`running`），运行结束时更新一次。计数和用量在内存里累加，结束时一次写入；运行中途不写这张表。
+- 启动恢复：仍为 `running` 的行改为 `interrupted`，`ended_at` 取它最后一个信封的时间。
+- fork 共享信封时，`turn_id` 仍指向原叙述者的那一行；轮表行不复制。`turn_id` 只是分组键，不设外键：原叙述者删除后，fork 里的信封仍能按 `turn_id` 分组，只是没有汇总数据可显示。
+- 用途：轮级 UI（本轮用时、工具次数、用量、停止原因），External API 的轮列表，以及按轮的用量统计。
 
 ### 4.5 revision 触发器契约 v2
 
@@ -677,7 +692,18 @@ narrator_block_assets
 - `eq(contentText,"[Compacting]")` 改为按块的 `subtype` / `phase` 查询。
 - `isNotNull(contentText)` 改为「存在可见文本块」。
 
-**FTS 触发器**
+**块级 FTS（D6，P1 起）**
+- 新建 `narrator_blocks_fts`：FTS5、trigram 分词（与现有三个索引一致，支持 CJK），contentless（`content=''`），rowid 取块行的 rowid。正文不再存一份。
+- 写入时机与 `deriveEnvelope` 相同（D28）：一步封口、工具进入终态、编辑或删除时，在同一个事务里把这一步变化过的块整批删插。流式中途不写，一步只有一次批量写入。
+- 每块的索引文本：
+  - `input`、`output`：`model_text`；
+  - `reasoning`：推理分段原文；
+  - `tool`：工具名 + 输入的紧凑 JSON + 被采用结果的文本（取自账本，截断到 64 KiB）；
+  - `context`：有 `model_text` 时取它，UI 卡片取 `body` 里的标题与正文。
+- 搜索结果返回 `blockId`，前端直接定位到块并高亮；列表仍按信封聚合显示。
+- 迁移期两套索引并存：没有块的旧信封仍由信封级索引命中；回填（§10.3）为旧信封补写块级索引；回填完成后搜索只查块级索引，信封级 FTS 在 P3 退役（`content_text` 仍保留，供列表摘要）。
+
+**信封级 FTS 触发器（迁移期）**
 - update 触发器改为 `AFTER UPDATE OF content_text`。
 - FTS 触发器由运行期的 `ensureFts` 安装（`server/db/fts.ts:372-393`），不在 drizzle 迁移里。改动时要给触发器定义加版本号，并做 DROP + CREATE，因为现在用的是 `CREATE TRIGGER IF NOT EXISTS`，不会替换已有定义。
 
@@ -1102,7 +1128,7 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 
 **不受约束的情况**（本来就改变前缀，接受缓存失效）
 - 用户显式的编辑、删除、回滚、段压缩。
-- 用户手动「按最新数据重建上下文」（若提供该操作）。
+- 用户手动「按最新数据重建上下文」：斜杠命令 `/refresh-context`（D19）。执行时调用 `openEpoch(reason = "manual")`，下一次请求按最新数据完整重建；不加界面入口。
 
 **提醒的分级**（D17）
 - 影响模型行为的变化追加提醒：设备、项目说明、plan mode、cwd、工具可用性、消息修订。
@@ -1310,12 +1336,11 @@ reconcile(narrator, target, now):
 
 ### 8.1 页面 API
 
-`GET /:id/pretext-document` 分两步演进：
+`GET /:id/pretext-document` 一步切换到规范化结构（D5），与读路径切换同在 P2：
 
-- **过渡形态（P1）**
-  - 仍返回 `contentJson`，但每个元素附带 `blockId`、`blockRevision`、`phase`，属于加字段的扩展。
-  - 前端可以先把身份换成块 id，渲染层暂时不动。
-- **终态（P2）**
+- P1 期间前端不动：接口仍返回由块派生的 `contentJson`，WS 仍发旧事件。
+- P2 时接口、WS v2 与前端 store 一起切换，不设「数组元素附带块 id」的过渡形态。还没回填的旧信封在读取时经 `decodeLegacyContent` 现场解码成块，所以前端只需要支持一种形态。
+- 切换后的形态：
   - 返回规范化结构：`{messages: EnvelopeDTO[], blocks: BlockDTO[], ...}`，块按 `messageId + ordinal` 组织。
   - 工具 IO 截断仍按块的叶子做，每个叶子 8KiB（`shared/pretext-layout/tool-io-projection.ts:67`）。
   - 详情接口改为按块寻址，例如 `GET /:id/blocks/:blockId`；旧的 `/tool-calls/:toolUseId` 保留为兼容接口。
@@ -1357,7 +1382,7 @@ reconcile(narrator, target, now):
 |---|---|---|---|
 | 模型历史加载与各 provider builder | `content_json` + 账本；各 builder 自行解析 | 规范视图 + 两段投影（§7） | P0 改为吃规范块；P2 切换到块表 |
 | 展示页 worker / WS / catch-up | 整数组读取、按字节预检、`enrichToolUseBlocks` | 按块读取、按块计字节；过渡期仍组装数组 | P1–P2 |
-| FTS / 搜索 / Recall | `content_text` | 保留信封级 `content_text`（集中派生）；块级 FTS 可选 | P1；块级 FTS 在 P3 |
+| FTS / 搜索 / Recall | `content_text` | 块级 FTS 定位到块；`content_text` 保留，供列表摘要 | P1 起新信封走块级；P2 回填后全部走块级；P3 退役信封级 FTS |
 | compact / 段压缩 | `$[0]`、生成列、JSON CAS、哨兵字符串查询 | `context` 块（subtype `compact` / `segment_compact`）+ `phase` + `state` | P1 |
 | 文件回退 / 块删除 / 回滚到块 | 原始字节、摘要 + 出现序号身份、下标 | 块 id + `revision`；`RewriteWorker` 不再解析 JSON 片段 | P2 |
 | 编辑与恢复 | 整数组快照 `original_content_json` | 块的 `original_payload`；publication 读 `COALESCE(original_payload, payload)` | P1 |
@@ -1421,7 +1446,8 @@ reconcile(narrator, target, now):
 | 单片 | 每片不超过 100 个信封、4 MiB 源字节、1 秒，先到先停 |
 | 解码位置 | 在只读 db-worker 中读 `content_json` 并解码（`lib/db-worker/pool.ts`），主线程不碰正文 |
 | 写入 | 回到主线程，每片一个短的同步事务：插入块与 asset 行，写 `body_bytes`，最后把 `body_format` 改为 2。带 `WHERE body_format = 1` 守卫：幂等，且能与同时发生的物化安全并发。目标每个事务 50ms 以内，超过记慢操作日志并把下一片减半 |
-| 不触发的东西 | 块插入时信封仍是 `body_format = 1`，块触发器不生效（§4.5），所以回填不 bump `body_revision` / `model_history_revision`，源缓存不失效；`content_text`、`context_chars_json` 原样保留，不触发 FTS。回填只改存储形态，不改任何投影字节 |
+| 不触发的东西 | 块插入时信封仍是 `body_format = 1`，块触发器不生效（§4.5），所以回填不 bump `body_revision` / `model_history_revision`，源缓存不失效；`content_text`、`context_chars_json` 原样保留，不触发信封级 FTS。回填只改存储形态，不改任何投影字节 |
+| 块级 FTS | 同一事务里为本片的块写块级索引（D6）。索引文本在 db-worker 里随解码一起算好，主线程只做插入 |
 | 节奏 | 片与片之间 `setTimeout(0)`；由定时器重入；重启后从游标继续 |
 | 校验 | 对 P1 双写期间产生的 `body_format = 2` 信封，比对「块组装出的数组」与 `content_json`，不一致的写入诊断表。双写一致性因此有了持续的证据 |
 | 进度展示 | 在存储页显示进度，可以暂停 |
@@ -1448,7 +1474,7 @@ reconcile(narrator, target, now):
 |---|---|---|
 | `narratorBlocks.write` | store 写块表（双写） | P1 |
 | `narratorBlocks.read` | 读取方读块表 | P2 |
-| `narratorBlocks.wsV2` | WS 协议 v2 | P1 |
+| `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5） | P2 |
 | `narratorBlocks.compactJson` | 新行的 `content_json` 写 `'[]'` | P3 |
 
 每个开关都可以单独关闭。P3 之前，关闭 `narratorBlocks.read` 就完全回到现状。
@@ -1488,14 +1514,14 @@ reconcile(narrator, target, now):
    - 新建 `narrator_blocks`、`narrator_block_assets`；
    - `narrator_messages` 新增 `body_format`、`turn_id`、`author_narrator_id`、`cause_block_id`、`provider_response_id`、`body_bytes`；
    - `narrator_text_snapshots`（纪元的工具定义与 system 快照，§7.7）；
-   - `narrator_tool_calls` 新增 `block_id` 与内部执行标记。
+   - `narrator_tool_calls` 新增 `block_id` 与内部执行标记；
+   - `narrator_turns`（§4.4，D7），运行开始与结束各写一次。
 2. v2 触发器契约：生成器支持，SQLite 与 PG 各一份。
-3. FTS 触发器加列过滤，并带版本号。
+3. 信封级 FTS 触发器加列过滤，并带版本号；新建块级 FTS `narrator_blocks_fts`，搜索合并两套索引的结果（D6）。
 4. store 写块表，新信封一律为 `body_format = 2`，同时写派生的 `content_json`。
-5. 流式按 provider item 写入（§5.2）；WS v2；按 `attemptId` 丢弃 attempt。
+5. 流式按 provider item 写入（§5.2）；按 `attemptId` 丢弃 attempt。WS 仍发旧事件，由块派生（D5）。
 6. tool 块合并调用与结果，采用两段生命周期（§3.5、§3.7）；`state` 写入（§5.4）；`phase` 统一。
 7. 只保留一个 COW 实现；作者与属主分开。
-8. 前端先切换身份：把 `blockId` 作为 key 和 API 寻址，操作目标按 §5.5；删除流式交接的启发式。
 9. 纪元标记块与请求前对账（§7.7）：compact 成功写 `payload.epoch`，target 切换与缓存已冷写 `epoch` 块；工具表改为取自纪元快照，已实现的倒推降为兜底。
 
 **退出条件**
@@ -1507,8 +1533,8 @@ reconcile(narrator, target, now):
 
 **交付**
 1. 模型历史 worker、展示页 worker、External API、回退、块删除、导出、project.db 同步、merge summary、存储 GC，都改为读块表。
-2. 页面 API 改为规范化形态；前端 store 以块 id 为键；`turn_id` 驱动 recency；`cause_block_id` 驱动通知与工具卡的关联。
-3. 回填作业（§10.3）；视需要增加 `narrator_turns`。
+2. 前端一步切换（D5）：页面 API 改为规范化形态，WS v2 上线；前端 store 以块 id 为键，`blockId` 作为 key 和 API 寻址，操作目标按 §5.5；删除流式交接的启发式（§8.3）；`turn_id` 驱动 recency；`cause_block_id` 驱动通知与工具卡的关联；轮级 UI 读 `narrator_turns`。
+3. 回填作业（§10.3），同时为旧信封补写块级 FTS。旧会话没有 `turn_id`，不补建轮表行。
 
 **退出条件**
 - 回填完成。
@@ -1519,9 +1545,9 @@ reconcile(narrator, target, now):
 
 **交付**
 1. 新行的 `content_json` 写 `'[]'`；运行清空旧行的作业；删除 `compact_pending` 的读取方。
-2. 解码路径保留一个版本后删除，只留给 project.db 旧归档导入使用。
-3. 按需开放新能力：
-   - 块级 FTS；
+2. 退役信封级 FTS：删除 `narrator_messages_fts` 及其触发器，搜索只查块级索引。
+3. 解码路径保留一个版本后删除，只留给 project.db 旧归档导入使用。
+4. 按需开放新能力：
    - 块级永久链接、引用、评论；
    - 按块的保留策略；
    - 块 revision 历史；
@@ -1614,15 +1640,15 @@ reconcile(narrator, target, now):
 | 大工作放 worker | 解码、回填读正文、asset 预取、投影都在 worker；主线程只做每片一个短事务 |
 
 **FTS**
-- 索引仍只建在 `narrator_messages.content_text` 上，形态不变，现有搜索不受影响。
-- 更新次数从每次 checkpoint 一次（触发器不限定列时还要更多）降到每步 1 + K 次。
-- 回填不改 `content_text`，零 FTS 写入（§10.3）。
-- 块级 FTS（D6）若在 P3 启用，作为独立的外部内容表，由块封闭时写入；不影响信封级索引。
+- 信封级索引：更新次数从每次 checkpoint 一次（触发器不限定列时还要更多）降到每步 1 + K 次；P3 退役。
+- 块级索引（D6）：与信封级在同一时刻、同一事务里批量写入，每步 1 + K 个事务，每次删插这一步变化过的块（一步 N 个 item 就是 N 行）。行数多了，事务次数没有增加。
+- 回填不改 `content_text`，不写信封级索引；但要为旧信封补写块级索引，这部分 FTS 写入计入每片 50ms 的预算（§10.3）。
+- 存储：contentless 表只存倒排索引，trigram 索引大约是正文的 1–3 倍（推测，P1 前在生产库副本上测）。迁移期两套索引并存，P3 退役信封级后回落。
 
 **迁移成本**
 - 存储：每块固定开销 150–250 字节（§12.1）；双写期正文约占两份。
 - 回填：每片不超过 100 个信封、4 MiB、1 秒，主线程每片一个短事务。以 100 万个信封、每片 50ms 主线程时间粗估，主线程累计约 8 分钟，分散在片与片之间（推测，需在生产库副本上测）。
-- 回填不 bump revision、不失效源缓存、不改 FTS，所以运行中的会话感知不到它。
+- 回填不 bump revision、不失效源缓存、不改信封级 FTS，所以运行中的会话感知不到它；块级 FTS 的补写只影响搜索结果的粒度。
 
 ## 13. 验收矩阵
 
@@ -1655,19 +1681,19 @@ reconcile(narrator, target, now):
 | 存储 | 在生产库副本上测得的增量落在预估范围内 | 存储扫描 |
 | PG | schema 和迁移可以生成，`db:check:pg` 通过 | CI |
 
-## 14. 决策记录与待决问题
+## 14. 决策记录
 
 | # | 问题 | 结论 | 状态 |
 |---|---|---|---|
-| D1 | tool 结果的文本是否复制进块 | 不复制。块只存被采用的 attempt、结果图片、附言；文本留在账本 | 推荐，未确认 |
+| D1 | tool 结果的文本是否复制进块 | 不复制。块只存被采用的 attempt、结果图片、附言；文本留在账本 | **已定** |
 | D2 | tool 块的 `input` 以哪份为准 | 重放实际执行的输入（重定向或修复之后）；账本保留每个 attempt 的执行输入 | **已定** |
 | D3 | 「轮」的边界 | 以一次运行为界（§3.6）：插话、注入、自动续跑都留在同一轮 | **已定** |
-| D4 | `aborted` 块是否重放 | text 重放，reasoning 不重放 | 推荐，未确认 |
-| D5 | 前端传输怎样演进 | P1 先给数组元素附加块 id，P2 再改成规范化结构 | 推荐，未确认 |
-| D6 | 是否做块级 FTS | 放在 P3，作为可选项、独立开关；先保留消息级 | 推荐，未确认 |
-| D7 | 是否建 `narrator_turns` 表 | P2 视 UI 需求再定 | 推荐，未确认 |
+| D4 | `aborted` 块是否重放 | text 重放，reasoning 不重放 | **已定** |
+| D5 | 前端传输怎样演进 | 一步到位：P1 前端不动，P2 时页面 API、WS v2 与前端 store 一起切换到规范化结构；未回填的旧信封读取时现场解码（§8.1） | **已定** |
+| D6 | 是否做块级 FTS | P1 起建块级 FTS（contentless、trigram），与派生字段同一时刻批量写入；迁移期两套索引并存，回填补写旧信封，P3 退役信封级 FTS（§4.6、§12.7） | **已定** |
+| D7 | 是否建 `narrator_turns` 表 | P1 就建 `narrator_turns`：运行开始插入、结束更新一次；`turn_id` 不设外键（§4.4） | **已定** |
 | D8 | `content_json` 的终态 | 当前版本保留派生投影；确认稳定后再单独立项清理（§10.4） | **已定** |
-| D9 | 作者与属主是否拆分 | 拆分，新增 `author_narrator_id` | 推荐，未确认 |
+| D9 | 作者与属主是否拆分 | 拆分，新增 `author_narrator_id` | **已定** |
 | D10 | assistant 编辑的作用域 | 只改被点的那个 `output` 块（§5.5） | **已定** |
 | D11 | broken 调用在历史中的形态 | tool 块 `failed`、不可见，另加一条 `context` 说明，与实时路径一致 | **已定** |
 | D12 | turn nudge 放在哪里 | 单独一条 `context` 块（subtype `turn_nudge`），排在该步工具结果之后；不再拼进工具结果。这会改变发给模型的内容，列入 §12.6 | **已定** |
@@ -1677,16 +1703,16 @@ reconcile(narrator, target, now):
 | D16 | 纪元边界 | compact 成功、切换 provider 或模型、缓存肯定已冷 | **已定** |
 | D17 | 哪些变化追加提醒 | 只对影响模型行为的变化提醒；纯展示性变化静默沿用旧值 | **已定** |
 | D18 | mailbox 语义编辑 | 未被接收方采纳的原地改写；已采纳的追加修订通知 | **已定** |
-| D19 | 是否提供「按最新数据重建上下文」的手动操作 | 待定。纪元改为标记块之后，实现代价只是一次 `openEpoch(reason = "manual")`（§7.7），可以只按需求取舍 | **待定** |
+| D19 | 是否提供「按最新数据重建上下文」的手动操作 | 只提供斜杠命令 `/refresh-context`，执行 `openEpoch(reason = "manual")`；不加界面入口（§7.7） | **已定** |
 | D20 | 纪元内加载工具 | 五种策略，由模型在 catalog 里声明（可多种），按当前协议选用；都不适用时直接改 tools[] 并开启新纪元；新纪元完全重新构建（§7.8） | **已定** |
 | D21 | 工具加载策略的默认值 | 按裸模型名匹配：含 gpt 用 `openai_additional_tools`，含 claude 用 `anthropic_tool_addition`，含 deepseek 用 `anthropic_deferred_tail`，其他用 `custom_injection`；catalog 声明可覆盖，用户可禁用（§7.8） | **已定** |
 | D22 | kind 是否从 7 种收为 5 种 | 推荐收：`marker`、`notice` 并入 `context`，按 subtype 分族；可见性统一为「`done` 且 `model_text` 非空」（§3.3）。备选：保留 7 种，代价是三处 kind 分支与三套可见性规则 | **已定** |
 | D23 | phase 是否从 6 个收为 4 个 | 推荐收：tool 的 `called`、`settled` 分别并入 `open`、`done`；输入流式阶段不落行，不需要名字（§3.5）。备选：保留，代价是部分索引、触发器、共享判定都要比较两个值 | **已定** |
 | D24 | `provider_meta` 的形状 | 推荐「来源 + 上游原样骨架」：正文换成 part 引用，其余字段原样；同源回放把 part 填回（§3.4）。备选：按协议的字段白名单，每遇上游新字段都要改 schema，Codex WS 续写只能靠测试补字段 | **已定** |
 | D25 | 纪元状态存在哪里 | 推荐：开启纪元写一个 `context` 标记块（compact 块兼任），工具定义与 system 正文按内容寻址存 `narrator_text_snapshots`；纪元内一切变化由每次请求前的对账写成追加的块（§7.7、§7.8）。已实现的倒推保留为旧数据的兜底与一致性检查。备选 A：前两轮的两张旁表，fork / 提取要另外复制；备选 B：全部倒推（即已实现的做法），绕过提示行的变化会漂移，system 正文也无法倒推 | **已定** |
-| D26 | Await 回执改写怎样满足只追加 | 推荐：只许 seq 更早的回执缩短更晚的工具结果；后到的回执与更早的结果都保留全文（§7.2）。备选：记录「第一次投影时的判断」，要多一份状态 | 推荐，未确认 |
+| D26 | Await 回执改写怎样满足只追加 | 推荐：只许 seq 更早的回执缩短更晚的工具结果；后到的回执与更早的结果都保留全文（§7.2）。备选：记录「第一次投影时的判断」，要多一份状态 | **已定** |
 | D27 | plan mode 改写工具描述与前缀保持冲突 | 推荐：纪元内不改描述，限制靠 system 提醒与执行期拦截（权限层已有 `readOnly`，覆盖范围待核，§7.7）。备选：切换 plan mode 视为纪元边界，代价是每次切换一次缓存未命中（即现状） | **已定** |
-| D28 | 派生字段（`content_text` 等）何时重算 | 推荐：只在封口、工具进入终态、编辑或删除时；流式中途的部分文本搜不到（§4.6）。备选：每个 item 封闭时重算，FTS 写入多 N 倍 | 推荐，未确认 |
+| D28 | 派生字段（`content_text` 等）何时重算 | 推荐：只在封口、工具进入终态、编辑或删除时；流式中途的部分文本搜不到（§4.6）。备选：每个 item 封闭时重算，FTS 写入多 N 倍 | **已定** |
 
 ## 附录 A：现有块 type 到 kind 的映射
 
