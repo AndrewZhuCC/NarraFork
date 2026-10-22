@@ -137,7 +137,7 @@ describe("shared bottom toolbar actions", () => {
 				status: "denied",
 			},
 		]);
-		for (const surface of ["workspace", "director", "focus", "graph"] as const) {
+		for (const surface of ["workspace", "director", "focus"] as const) {
 			const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 			const storage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 			try {
@@ -185,7 +185,7 @@ describe("shared bottom toolbar actions", () => {
 
 	test("plugin picker follows the live host surface and defaults to focus without a provider", () => {
 		const props = { ...makeProps(), def: def("plugins") };
-		for (const surface of ["workspace", "director", "focus", "graph"] as const) {
+		for (const surface of ["workspace", "director", "focus"] as const) {
 			const picker = elementOf(renderItem(props, surface), PluginContributionPicker);
 			expect(picker?.props.surface).toBe(surface);
 			expect(picker?.props.onPick).toBe(props.inlineControls.openPluginPanel);
@@ -286,7 +286,6 @@ describe("shared bottom toolbar actions", () => {
 			relaxedPlanForced: false,
 			relaxedPlanMutation: { isPending: false },
 			isAskInPassing: true,
-			chapterId: null,
 			promoteMutation: { isPending: false },
 			handlePromote: () => {},
 			bottomActions,

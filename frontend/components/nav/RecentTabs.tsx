@@ -6,7 +6,6 @@ import {
 	type RecentTabRow,
 } from "@frontend/hooks/recent-tab-directory-groups";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
-import { statusRegistry } from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
 import {
 	ActionIcon,
@@ -30,14 +29,12 @@ import type { RecentTabsDelta as RecentTabsDeltaFrame } from "@shared/recent-tab
 import {
 	IconArchive,
 	IconArrowUp,
-	IconBox,
 	IconBrain,
 	IconClock,
 	IconColumns,
 	IconCopy,
 	IconFolder,
 	IconFolderPlus,
-	IconGitBranch,
 	IconPencil,
 	IconPin,
 	IconPinnedOff,
@@ -97,7 +94,7 @@ import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
-import { getNarratorStatusIconColor, isFilledNarratorStatus } from "./narrator-status-icon-logic";
+import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import type { RecentTabDropTarget } from "./recent-tab-drop-target";
@@ -128,23 +125,12 @@ const CreateNarratorModal = React.lazy(() =>
 	})),
 );
 
-const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
-
-const CONTAINER_STATUS_I18N: Record<string, string> = {
-	running: "containerRunning",
-	paused: "containerPaused",
-	stopped: "containerStopped",
-	created: "containerCreated",
-	removed: "containerRemoved",
-};
-
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId ?? null;
 	// group tabs have no single narrator (multi-party)
 	return null;
 }
@@ -325,8 +311,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				patch.activeBackgroundTaskCount = event.activeBackgroundTaskCount;
 				patch.activeBackgroundWorkCount = event.activeBackgroundWorkCount;
 				patch.activeBackgroundServiceCount = event.activeBackgroundServiceCount;
-			} else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
-			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
+			} else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
 			else if (event.type === "awaitedQuestion") {
 				// The subscription reconciles caches for ALL changes before this callback.
 				// Attention is separate: no synthetic status patch or urgency-gated refetch.
@@ -489,7 +474,7 @@ interface RecentTabListProps {
 
 /**
  * Renders a filtered subset of recent tabs with DnD, clear button, etc.
- * `filter="project"` shows project tabs; `filter="narrator"` shows chapter+narrator tabs.
+ * `filter="project"` shows project tabs; `filter="narrator"` shows narrator tabs.
  */
 export function RecentTabList({
 	filter,
@@ -536,14 +521,6 @@ export function RecentTabList({
 					queryKey: narratorKey,
 					queryFn: () => api.getNarrator(narratorId),
 					staleTime: 30_000,
-					gcTime: PREFETCH_QUERY_GC_TIME_MS,
-				});
-			}
-
-			if (tab.type === "chapter" && !qc.getQueryData(["chapters", tab.id])) {
-				void qc.prefetchQuery({
-					queryKey: ["chapters", tab.id],
-					queryFn: () => api.getChapter(tab.id),
 					gcTime: PREFETCH_QUERY_GC_TIME_MS,
 				});
 			}
@@ -706,19 +683,15 @@ export function RecentTabList({
 	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
 
 	/**
-	 * Resolve the on-disk directory a tab points at: a chapter's worktree, or a
-	 * narrator/subagent's cwd. Returns null when the tab has no directory
-	 * (workspace, project) or the lookup fails.
+	 * Resolve the on-disk directory a tab points at: its narrator's cwd. Returns null
+	 * when the tab has no
+	 * directory (workspace, project) or the lookup fails.
 	 */
 	const resolveTabDirectory = useCallback(async (tab: RecentTab): Promise<string | null> => {
 		try {
-			if (tab.type === "chapter") {
-				const chapter = await api.getChapter(tab.id);
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				return ((chapter as any)?.worktreePath as string | undefined) ?? null;
-			}
-			if (tab.type === "narrator" || tab.type === "subagent") {
-				const narrator = await api.getNarrator(tab.id);
+			const narratorId = getRecentTabNarratorId(tab);
+			if (narratorId) {
+				const narrator = await api.getNarrator(narratorId);
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				return ((narrator as any)?.cwd as string | undefined) ?? null;
 			}
@@ -769,13 +742,9 @@ export function RecentTabList({
 		setCtxMenu(null);
 		if (!revealAvailable) return;
 		try {
-			if (tab.type === "chapter") {
-				const chapter = await api.getChapter(tab.id);
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const wt = (chapter as any)?.worktreePath;
-				if (wt) await api.fsReveal(wt);
-			} else if (tab.type === "narrator") {
-				const narrator = await api.getNarrator(tab.id);
+			const narratorId = tab.type === "subagent" ? null : getRecentTabNarratorId(tab);
+			if (narratorId) {
+				const narrator = await api.getNarrator(narratorId);
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const cwd = (narrator as any)?.cwd;
 				if (cwd) await api.fsReveal(cwd);
@@ -785,7 +754,7 @@ export function RecentTabList({
 		}
 	}, [ctxMenu, revealAvailable]);
 
-	/** 复制工作目录到剪贴板（chapter/narrator/subagent） */
+	/** 复制工作目录到剪贴板（narrator/subagent） */
 	const handleCopyCwd = useCallback(async () => {
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
@@ -1236,12 +1205,10 @@ export function RecentTabList({
 							canReveal={revealAvailable && ctxMenu.tab.type !== "project"}
 							onNewNarratorHere={handleNewNarratorHere}
 							canNewNarratorHere={
-								ctxMenu.tab.type === "chapter" ||
-								ctxMenu.tab.type === "narrator" ||
-								ctxMenu.tab.type === "subagent"
+								ctxMenu.tab.type === "narrator" || ctxMenu.tab.type === "subagent"
 							}
 							onCopyCwd={handleCopyCwd}
-							canCopyCwd={["chapter", "narrator", "subagent"].includes(ctxMenu.tab.type)}
+							canCopyCwd={["narrator", "subagent"].includes(ctxMenu.tab.type)}
 							onOpenInWindow={handleOpenInWindow}
 							canOpenInWindow={recentTabWindowHref(ctxMenu.tab) !== null}
 							onRename={handleRename}
@@ -1335,17 +1302,7 @@ export function RecentTabList({
 }
 
 /** Shared icon component for recent tabs — avoids duplicating icon logic across 4 components. */
-function TabIcon({
-	tab,
-	size,
-	iconColor,
-	filledStatus,
-}: {
-	tab: RecentTab;
-	size: number;
-	iconColor?: string;
-	filledStatus: boolean;
-}) {
+function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconColor?: string }) {
 	// The narrator bubble is shared verbatim with the narrator list page — see
 	// `NarratorStatusIcon`. It owns its corner markers and the centre shape overlay.
 	if (tab.type === "narrator") {
@@ -1365,19 +1322,13 @@ function TabIcon({
 	let icon: React.ReactNode;
 	if (tab.type === "project") icon = <IconFolder size={size} />;
 	else if (tab.type === "workspace") icon = <IconColumns size={size} />;
-	else if (tab.type === "chapter") {
-		icon = (
-			<IconGitBranch size={size} color={iconColor} fill={filledStatus ? "currentColor" : "none"} />
-		);
-	} else icon = <IconRobot size={size} color={iconColor} />;
+	else icon = <IconRobot size={size} color={iconColor} />;
 
-	// Corner markers remain for chapter / subagent rows. The centre state SHAPE
-	// (tick / shield / alert) does not: it is knocked out in white and needs the
-	// narrator bubble's solid body behind it — the git-branch and robot glyphs are
-	// Tabler OUTLINE icons (stroke only, no closed shape), so a white glyph there
-	// would land on the page background and disappear. `IconGitBranch`'s `fill`
-	// only tints its three small nodes, which is not a body either.
-	const canShowMarker = tab.type === "chapter" || tab.type === "subagent";
+	// Corner markers remain for subagent rows. The centre state SHAPE (tick / shield /
+	// alert) does not: it is knocked out in white and needs the narrator bubble's solid
+	// body behind it — the robot glyph is a Tabler OUTLINE icon (stroke only, no closed
+	// shape), so a white glyph there would land on the page background and disappear.
+	const canShowMarker = tab.type === "subagent";
 	const showDraft = !!tab.hasDraft && canShowMarker;
 	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
 	const showScheduled = !!tab.isScheduled && canShowMarker;
@@ -1469,20 +1420,14 @@ function WorkspaceChildTab({
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 }) {
 	const navigate = useNavigate();
-	const to =
-		tab.type === "chapter" && tab.narratorId
-			? `/narrators/${tab.narratorId}`
-			: `/narrators/${tab.id}`;
+	const to = `/narrators/${tab.id}`;
 	const iconColor = getNarratorStatusIconColor(tab);
-	const filledStatus = isFilledNarratorStatus(tab);
 
 	return (
 		<NavLink
 			active={active}
 			label={<Text size="xs">{tab.title}</Text>}
-			leftSection={
-				<TabIcon tab={tab} size={14} iconColor={iconColor} filledStatus={filledStatus} />
-			}
+			leftSection={<TabIcon tab={tab} size={14} iconColor={iconColor} />}
 			onClick={() => {
 				onNavigate?.();
 				navigate({ to });
@@ -1520,24 +1465,14 @@ const DraggableWorkspaceChildTab = React.memo(function DraggableWorkspaceChildTa
 		id: tabSortId(tab),
 		disabled: drag.pending,
 	});
-	const to =
-		tab.type === "chapter" && tab.narratorId
-			? `/narrators/${tab.narratorId}`
-			: `/narrators/${tab.id}`;
+	const to = `/narrators/${tab.id}`;
 	const prefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 	return (
 		<div ref={setNodeRef} {...attributes} {...listeners} data-tab-sort-id={tabSortId(tab)}>
 			<NavLink
 				active={active}
 				label={<Text size="xs">{tab.title}</Text>}
-				leftSection={
-					<TabIcon
-						tab={tab}
-						size={14}
-						iconColor={getNarratorStatusIconColor(tab)}
-						filledStatus={isFilledNarratorStatus(tab)}
-					/>
-				}
+				leftSection={<TabIcon tab={tab} size={14} iconColor={getNarratorStatusIconColor(tab)} />}
 				onClick={() => {
 					if (drag.consumeClick()) return;
 					prefetch();
@@ -1613,7 +1548,6 @@ function DragOverlayWorkspaceItem({
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const { t } = useTranslation("common");
 	const iconColor = getNarratorStatusIconColor(tab);
-	const filledStatus = isFilledNarratorStatus(tab);
 
 	return (
 		<div style={{ overflow: "hidden" }}>
@@ -1643,7 +1577,7 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 				}
 				leftSection={
 					<span>
-						<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
+						<TabIcon tab={tab} size={16} iconColor={iconColor} />
 					</span>
 				}
 				styles={{
@@ -1722,13 +1656,10 @@ function TabItemBody({
 	const to =
 		tab.type === "project"
 			? `/projects/${tab.id}`
-			: tab.type === "chapter" && tab.narratorId
-				? `/narrators/${tab.narratorId}`
-				: tab.type === "workspace"
-					? `/narrators/workspace/${tab.id}`
-					: `/narrators/${tab.id}`;
+			: tab.type === "workspace"
+				? `/narrators/workspace/${tab.id}`
+				: `/narrators/${tab.id}`;
 	const iconColor = getNarratorStatusIconColor(tab);
-	const filledStatus = isFilledNarratorStatus(tab);
 
 	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 
@@ -1930,7 +1861,7 @@ function TabItemBody({
 								touchAction: "pan-y",
 							}}
 						>
-							<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
+							<TabIcon tab={tab} size={16} iconColor={iconColor} />
 						</span>
 					}
 					rightSection={
@@ -2050,14 +1981,12 @@ interface TabIndicatorsProps {
 function TabIndicators({ tab, t }: TabIndicatorsProps) {
 	const viewerCount = tab.viewerCount ?? tab.viewers?.length ?? 0;
 	const hasViewers = viewerCount >= 2;
-	const hasContainer = tab.type === "chapter" && tab.containerStatus;
 	const hasTerminals = (tab.activeTerminalCount ?? 0) > 0;
 	const workCount = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
 	const serviceCount = tab.activeBackgroundServiceCount ?? 0;
 	const hasBackgroundTasks = workCount > 0;
 
-	if (!hasViewers && !hasContainer && !hasTerminals && !hasBackgroundTasks && !serviceCount)
-		return null;
+	if (!hasViewers && !hasTerminals && !hasBackgroundTasks && !serviceCount) return null;
 
 	return (
 		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
@@ -2067,18 +1996,6 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 					viewerCount={viewerCount}
 					t={t}
 				/>
-			)}
-			{hasContainer && (
-				<Tooltip
-					label={t(CONTAINER_STATUS_I18N[tab.containerStatus as string] ?? "containerStopped")}
-					withArrow
-					position="right"
-				>
-					<IconBox
-						size={12}
-						color={mantineVar(statusRegistry.containerStatus(tab.containerStatus as string).color)}
-					/>
-				</Tooltip>
 			)}
 			{hasTerminals && (
 				<Tooltip

@@ -5,7 +5,6 @@ import {
 	Group,
 	Indicator,
 	Popover,
-	SegmentedControl,
 	Select,
 	Stack,
 	Text,
@@ -127,7 +126,7 @@ export function NarratorListControls({
 	sortAction,
 }: NarratorListControlsProps) {
 	const { t } = useTranslation("narrators");
-	const { sortBy, sortOrder, filter, localQuery } = state;
+	const { sortBy, sortOrder, localQuery } = state;
 	const isMobile = layout === "mobile";
 	const sortOptions = useMemo(
 		() => [
@@ -155,20 +154,6 @@ export function NarratorListControls({
 					</ActionIcon>
 				) : undefined
 			}
-		/>
-	);
-
-	const filterControl = (
-		<SegmentedControl
-			size="xs"
-			fullWidth={isMobile}
-			value={filter}
-			onChange={(v) => onChange({ filter: v })}
-			data={[
-				{ value: "all", label: t("filterAll") },
-				{ value: "standalone", label: t("filterStandalone") },
-				{ value: "chapter", label: t("filterChapter") },
-			]}
 		/>
 	);
 
@@ -200,7 +185,6 @@ export function NarratorListControls({
 		return (
 			<Stack gap="xs">
 				{searchInput}
-				{filterControl}
 				{sortControl}
 			</Stack>
 		);
@@ -209,7 +193,6 @@ export function NarratorListControls({
 	return (
 		<>
 			{searchInput}
-			{filterControl}
 			{includeExtraFilters && <NarratorListExtraFiltersButton state={state} onChange={onChange} />}
 			{sortControl}
 		</>
