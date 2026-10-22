@@ -132,6 +132,20 @@ type TimeEntity = "chapters" | "messages" | "narrators";
 const TIME_ENTITIES: TimeEntity[] = ["chapters", "messages", "narrators"];
 const TIME_VIEWER = { userId: "shape-viewer", isAdmin: false };
 
+function seedNarrator(id: string) {
+	db.insert(narrators)
+		.values({
+			id,
+			chapterId: "chap-shape",
+			type: "primary",
+			inheritMode: "fresh",
+			visibility: "public",
+			createdAt: NOW,
+			updatedAt: NOW,
+		})
+		.run();
+}
+
 /** Insert old hits first, then equal-time newest hits in reverse id order. */
 function seedTimeCorpus(entity: TimeEntity) {
 	const text = "PR chronometer";
@@ -168,10 +182,13 @@ function seedTimeCorpus(entity: TimeEntity) {
 				})
 				.run();
 		} else {
+			// One narrator per visible hit: global search groups message hits by narrator,
+			// and these cases pin ordering, not grouping.
+			if (!hidden) seedNarrator(`narr-${id}`);
 			db.insert(narratorMessages)
 				.values({
 					id,
-					narratorId: hidden ? "narr-time-private" : "narr-shape",
+					narratorId: hidden ? "narr-time-private" : `narr-${id}`,
 					role: "assistant",
 					contentJson: [{ type: "text", text }],
 					contentText: text,
@@ -293,10 +310,11 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 			["m-all-new", "2026-09-04"],
 			["m-all-mid", "2026-09-02"],
 		]) {
+			seedNarrator(`narr-${id}`);
 			db.insert(narratorMessages)
 				.values({
 					id,
-					narratorId: "narr-shape",
+					narratorId: `narr-${id}`,
 					role: "assistant",
 					contentText: "PR chronometer",
 					contentJson: [{ type: "text", text: "PR chronometer" }],
@@ -743,4 +761,48 @@ describe("real worker transport preserves the search store contract", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	}, 30_000);
+});
+
+describe("global search content scope over HTTP", () => {
+	it("searches primary conversations by default and widens with include", async () => {
+		db.insert(narrators)
+			.values({
+				id: "narr-sub",
+				chapterId: "chap-shape",
+				type: "subagent",
+				parentNarratorId: "narr-shape",
+				aclRootNarratorId: "narr-shape",
+				inheritMode: "fresh",
+				visibility: "public",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		for (const [id, narratorId, role] of [
+			["m-scope-sub", "narr-sub", "assistant"],
+			["m-scope-sys", "narr-shape", "sys"],
+		] as const) {
+			db.insert(narratorMessages)
+				.values({
+					id,
+					narratorId,
+					role,
+					contentText: "quokka sighting",
+					contentJson: [{ type: "text", text: "quokka sighting" }],
+					createdAt: NOW,
+				})
+				.run();
+		}
+		const ids = async (include?: string) => {
+			const params = new URLSearchParams({ q: "quokka", entities: "messages" });
+			if (include !== undefined) params.set("include", include);
+			const response = await searchApp.request(`/api/search?${params}`);
+			const body = (await response.json()) as { results: { id: string }[] };
+			return body.results.map((r) => r.id).sort();
+		};
+		expect(await ids()).toEqual([]);
+		expect(await ids("subagents")).toEqual(["m-scope-sub"]);
+		expect(await ids("system,nonsense")).toEqual(["m-scope-sys"]);
+		expect(await ids("subagents,system")).toEqual(["m-scope-sub", "m-scope-sys"]);
+	});
 });

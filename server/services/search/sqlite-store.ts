@@ -38,6 +38,7 @@ import { ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { projectReadableSqlFragment } from "../project-acl";
 import type { SearchStore } from "./port";
+import { blockScopeSql, messageScopeSql, narratorScopeSql, scopeKey } from "./scope";
 import {
 	escapedContains,
 	phraseExpr,
@@ -55,6 +56,7 @@ import {
 	type KnowledgeSearchQuery,
 	type KnowledgeSearchRow,
 	type MessageSearchRow,
+	type MessageSearchScope,
 	type NarratorSearchRow,
 	PREVIEW_CHARS,
 	RECALL_SNIPPET,
@@ -199,9 +201,11 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		strategy: "index" | "substring",
 		gated: boolean,
 		sort: EntitySearchQuery["sort"],
+		scope: MessageSearchScope | undefined,
 	): QueryTemplate {
-		return cached(`messages:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}`, () => {
-			const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
+		const key = `messages:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}`;
+		return cached(key, () => {
+			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${messageScopeSql(scope)}`;
 			if (strategy === "index") {
 				return `SELECT ${MESSAGE_COLUMNS},
 			  ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)} as snippet,
@@ -229,9 +233,14 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	 * Block hits for message search (index path only). The block index is contentless, so these
 	 * rows carry no excerpt; {@link mergeBlockHits} keeps the envelope's where it has one.
 	 */
-	function messageBlockStmt(gated: boolean, sort: EntitySearchQuery["sort"]): QueryTemplate {
-		return cached(`messages:blocks:${sort ?? "relevance"}:${gated ? "gated" : "all"}`, () => {
-			const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
+	function messageBlockStmt(
+		gated: boolean,
+		sort: EntitySearchQuery["sort"],
+		scope: MessageSearchScope | undefined,
+	): QueryTemplate {
+		const key = `messages:blocks:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}`;
+		return cached(key, () => {
+			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${blockScopeSql(scope)}`;
 			return `SELECT ${MESSAGE_COLUMNS}, b.id as block_id,
 			  rank as rank_score
 			 FROM narrator_blocks_fts
@@ -249,9 +258,11 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		strategy: "index" | "substring",
 		gated: boolean,
 		sort: EntitySearchQuery["sort"],
+		scope: MessageSearchScope | undefined,
 	): QueryTemplate {
-		return cached(`narrators:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}`, () => {
-			const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
+		const key = `narrators:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}`;
+		return cached(key, () => {
+			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${narratorScopeSql(scope)}`;
 			if (strategy === "index") {
 				return `SELECT ${NARRATOR_COLUMNS},
 			  ${snippetCall("narrators_fts", 0, GLOBAL_SNIPPET)} as snippet,
@@ -548,7 +559,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 		async searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]> {
 			const gated = !query.viewer.isAdmin;
-			const stmt = messageStmt(query.strategy, gated, query.sort);
+			const stmt = messageStmt(query.strategy, gated, query.sort, query.scope);
 			const options = { signal: query.signal, operation: "searchMessages" };
 			const gate = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
 			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
@@ -569,7 +580,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				...(row.block_id ? { blockId: row.block_id } : {}),
 			});
 			if (query.strategy !== "index") return rows.map(toRow);
-			const blockRows: RawRow[] = await messageBlockStmt(gated, query.sort).all(
+			const blockRows: RawRow[] = await messageBlockStmt(gated, query.sort, query.scope).all(
 				options,
 				needle,
 				...gate,
@@ -588,7 +599,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 		async searchNarrators(query: EntitySearchQuery): Promise<NarratorSearchRow[]> {
 			const gated = !query.viewer.isAdmin;
-			const stmt = narratorStmt(query.strategy, gated, query.sort);
+			const stmt = narratorStmt(query.strategy, gated, query.sort, query.scope);
 			const options = { signal: query.signal, operation: "searchNarrators" };
 			const gate = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
 			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);

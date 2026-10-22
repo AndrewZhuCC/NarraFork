@@ -12,7 +12,7 @@
 	"typeAll": "All {{count}}",
 	"typeChapter": "Chapters {{count}}",
 	"typeNarrator": "Narrators {{count}}",
-	"typeMessage": "Messages {{count}}",
+	"typeMessage": "Conversations {{count}}",
 	"typeKnowledge": "Knowledge {{count}}",
 	"sortRelevance": "Relevance",
 	"sortTime": "Newest",
@@ -21,7 +21,7 @@
 	"resultUntitled": "Result {{id}}",
 	"label_chapter": "Chapter",
 	"label_narrator": "Narrator",
-	"label_message": "Message",
+	"label_message": "Conversation",
 	"label_knowledge": "Knowledge",
 	"score": "Score {{score}}",
 	"matchField": "Matched {{field}}",
@@ -44,5 +44,13 @@
 	"matchField_title": "title",
 	"matchField_description": "description",
 	"matchField_message": "message",
-	"matchField_content": "content"
+	"matchField_content": "content",
+	"includeLabel": "Also search:",
+	"include_subagents": "Subagents",
+	"include_system": "System injections",
+	"include_tools": "Tool calls",
+	"hitCount_one": "{{count}} match",
+	"hitCount_other": "{{count}} matches",
+	"hitCountAtLeast_one": "{{count}}+ match",
+	"hitCountAtLeast_other": "{{count}}+ matches"
 }

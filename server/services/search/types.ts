@@ -143,7 +143,41 @@ export interface EntitySearchQuery {
 	strategy: SearchStrategy;
 	limit: number;
 	viewer: SearchViewer;
+	/** Which conversation content message and narrator hits may come from. Omitted means
+	 *  {@link FULL_MESSAGE_SCOPE}; chapter search ignores it. */
+	scope?: MessageSearchScope;
 }
+
+/**
+ * Which kinds of conversation content global search looks at.
+ *
+ * Each flag widens the search beyond what people wrote and read in a primary session. Off,
+ * the search skips text that repeats elsewhere or that nobody typed: a subagent's working
+ * notes (its result already lands in the parent), injected context such as knowledge hints
+ * (the entry itself is a knowledge hit), and tool calls with their output.
+ */
+export interface MessageSearchScope {
+	/** Subagent narrators: their messages, and their titles in narrator search. */
+	subagents: boolean;
+	/** System-written rows: injections, reminders, compact markers, automation prompts. */
+	system: boolean;
+	/** Tool calls and their results. */
+	tools: boolean;
+}
+
+/** Everything, which is what global search matched before scopes existed. */
+export const FULL_MESSAGE_SCOPE: MessageSearchScope = Object.freeze({
+	subagents: true,
+	system: true,
+	tools: true,
+});
+
+/** The global search default: what people wrote and read in primary sessions. */
+export const CONVERSATION_MESSAGE_SCOPE: MessageSearchScope = Object.freeze({
+	subagents: false,
+	system: false,
+	tools: false,
+});
 
 /**
  * Search inside one narrator's own timeline.

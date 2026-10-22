@@ -50,6 +50,20 @@ export function normalizeSearchSort(value: unknown): SearchSortMode {
 	}
 }
 
+/**
+ * Conversation content global search skips unless asked: subagent sessions, system-written
+ * rows (injected knowledge hints, reminders, automation prompts) and tool calls.
+ */
+export const SEARCH_INCLUDES = ["subagents", "system", "tools"] as const;
+export type SearchInclude = (typeof SEARCH_INCLUDES)[number];
+
+/** Parse the `include` URL value (comma-separated) into known names, in canonical order. */
+export function normalizeSearchInclude(value: unknown): SearchInclude[] {
+	const raw = Array.isArray(value) ? value.map(String) : String(value ?? "").split(",");
+	const names = new Set(raw.map((name) => name.trim()));
+	return SEARCH_INCLUDES.filter((name) => names.has(name));
+}
+
 export function getSearchResultDisplayTitle(
 	result: {
 		id?: string;

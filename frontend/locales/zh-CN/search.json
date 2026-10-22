@@ -12,7 +12,7 @@
 	"typeAll": "全部 {{count}}",
 	"typeChapter": "章节 {{count}}",
 	"typeNarrator": "叙述者 {{count}}",
-	"typeMessage": "消息 {{count}}",
+	"typeMessage": "对话 {{count}}",
 	"typeKnowledge": "知识库 {{count}}",
 	"sortRelevance": "相关度",
 	"sortTime": "最新",
@@ -21,7 +21,7 @@
 	"resultUntitled": "结果 {{id}}",
 	"label_chapter": "章节",
 	"label_narrator": "叙述者",
-	"label_message": "消息",
+	"label_message": "对话",
 	"label_knowledge": "知识库",
 	"score": "相关度 {{score}}",
 	"matchField": "匹配{{field}}",
@@ -44,5 +44,13 @@
 	"matchField_title": "标题",
 	"matchField_description": "描述",
 	"matchField_message": "消息",
-	"matchField_content": "正文"
+	"matchField_content": "正文",
+	"includeLabel": "同时搜索：",
+	"include_subagents": "子代理",
+	"include_system": "系统注入",
+	"include_tools": "工具调用",
+	"hitCount_other": "{{count}} 处命中",
+	"hitCountAtLeast_other": "{{count}}+ 处命中",
+	"hitCount_one": "{{count}} 处命中",
+	"hitCountAtLeast_one": "{{count}}+ 处命中"
 }
