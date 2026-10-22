@@ -4,6 +4,7 @@
 > 调研基线：`main` @ `a5a2128e`。文中 `path:line` 都相对仓库根目录；标「推测」的结论没有在代码或测试中直接验证。
 > 前提：本设计不以 vlist 性能为目标。vlist 变快只是附带结果，取舍以数据模型的正确性和可扩展性为准。
 > 修订：块的粒度与种类按附录 C 的推导修订，第二轮调研基线 `af933c09`。
+> 第三轮修订（基线 `95c68304`，本轮新增的 `path:line` 以此为准）：种类从 7 种收为 5 种、phase 从 6 个收为 4 个（§3.3、§3.5）；`provider_meta` 改为「来源 + 线上骨架」（§3.4）；列与约束定稿（§4.1）；纪元改为历史里的标记块（§7.7）；吸收已实现的工具加载（§7.8）；新增逐协议投影（§7.9）、场景走查（§5.6）、效率预算（§12.7）。
 
 ## 0. 摘要
 
@@ -17,7 +18,8 @@
 **提案**
 - 分三层：信封 → 块 → part（§3.1）。
   - **信封**（`narrator_messages`）：一个 assistant 步（一次 provider 响应），或一条输入。它是作者、用量、fork 共享与 COW 的单位。`narrator_message_refs` 不变。
-  - **块**（新表 `narrator_blocks`，一块一行）：落库、编辑、展示、组装四个维度里，任何一个需要独立寻址、独立生命周期或独立取舍的最小内容。共 7 种：`input`、`output`、`reasoning`、`tool`、`context`、`marker`、`notice`（§3.3）。非 assistant 信封恰好一块。
+  - **块**（新表 `narrator_blocks`，一块一行）：落库、编辑、展示、组装四个维度里，任何一个需要独立寻址、独立生命周期或独立取舍的最小内容。共 5 种：`input`、`output`、`reasoning`、`tool`、`context`（§3.3）。非 assistant 信封恰好一块。
+  - 生命周期只有 4 个 phase：`open`、`done`、`aborted`、`failed`（§3.5）。模型可见性由 kind、phase 和 `model_text` 三者决定，没有别的开关。
   - **part**：块内有序的内容片段，包括文本、图片、文件、文件引用、推理分段。按（块 id, 下标）引用，不单独成行。
 - 工具调用与它被采用的结果合成一个 `tool` 块。执行账本 `narrator_tool_calls` 保留，每个 attempt 一行，通过 `block_id` 挂到块上。
 - 这套粒度的推导见附录 C：四个维度的证据、五种候选方案的对比、业界做法。
@@ -30,6 +32,8 @@
 **读路径**
 - 引入规范历史视图和两段投影：先投成与 provider 无关的轮次，再投成各家线上格式（§7）。
 - loop 内的实时请求和从 DB 重建走同一套投影，消除两条路径的字节差异。
+- provider 凭据按「来源 + 上游原样骨架」保存，同源回放逐字节还原上游 item（§3.4）。
+- 纪元是历史里的一个标记块；工具加载与 system 变化在每次请求前对账，差异写成提醒块（§7.7、§7.8）。
 
 **迁移**
 - 每个信封有一个 `body_format`：1 表示旧 JSON，2 表示原生块。读取层两种都认，不需要停机切换。
@@ -237,11 +241,11 @@
 ```
 narrator_message_refs ──▶ 信封 narrator_messages
   （叙述者, seq）           一个 assistant 步，或一条输入
-                            role · 作者 · origin · turn/step · provider/source · usage · cause
+                            role · 作者 · origin · turn · provider/model · usage · cause
                                 │ 1:N，按 ordinal 排序；非 assistant 信封恰好 1 块
                                 ▼
                             块 narrator_blocks
-                            id · kind · phase · payload(part) · model_text · state · provider_meta
+                            id · kind · subtype · phase · payload(part) · model_text · state · provider_meta
                                 │ 每个 tool 块 1:N
                                 ▼
                             账本 narrator_tool_calls（每个 attempt 一行）
@@ -266,6 +270,7 @@ narrator_message_refs ──▶ 信封 narrator_messages
 | 同一步的多个输出 item | 各有线上 id、phase、签名；与工具调用交错 | — | 拆：一个 provider item 一块 |
 | item 内的子段（Responses 的多段 summary、多个 output_text） | 展示成步骤 | 凭据属于 item；没有独立操作 | 合：做 part |
 | 注入正文 / 伴随卡片 / 旧格式的 text 配对 | — | 删除时已经按逻辑块一起删；属于同一次投递 | 合：一个 `context` 块 |
+| 注入 / 控制标记 / 纯 UI 卡片 | 前两轮设计为三种 kind（`context`、`marker`、`notice`） | 都是系统写的单块信封；区别只在「是否有 `model_text`」和 subtype 专属的行为，kind 上再分没有任何读写方用得到 | 合：一个 `context` kind，按 subtype 分族（§3.3） |
 | 同一工具的多次 attempt | 执行身份、权限、文件历史各不相同 | — | 拆：账本行；块指向被采用的那一次 |
 | 同一轮的多步 | 用量、模型、响应 id、共享与 COW 都按步 | 展示上合成 activity 或 run | 信封 = 步；轮由 `turn_id` 表达 |
 
@@ -275,29 +280,43 @@ narrator_message_refs ──▶ 信封 narrator_messages
 |---|---|
 | `id` | 全局唯一，由 `generateId()` 生成，在块开始产生时由服务端分配：流式 item 打开、工具调用开始流式输入、输入落库、注入写入。流式事件、DB 行、前端、HTTP API、回退、导出都用这个 id。 |
 | part 地址 | `(块 id, part 下标)`。part 在块 `done` 之后不可变，所以下标稳定；编辑产生新 revision 时整体替换。 |
-| `origin_block_id` | COW 复制出的块指回原块，原块为 null。「同一个逻辑块」即同一条 lineage。跨叙述者解析永久链接、引用时，在本叙述者的 refs 范围内按 `id` 或 lineage 找唯一的一行，与账本 `executionOriginToolCallId` 的定位规则一致（`narrator-persistence.ts:3349-3394`）。 |
-| `wire_id` | tool 块的线上调用 id，写入时一次确定：provider 给的 id 合法、且在本叙述者历史内唯一，就沿用；否则生成一个 wire-safe 的替代值，规则沿用 `tool-use-id-dedup.ts`。原始 id 存进 `provider_meta`。投影不再做改名。 |
+| `origin_block_id` | COW 复制出的块指向 lineage 的**根**（不是直接父块），原块为 null。「同一个逻辑块」即同一个根。指向根而不是父，查找永远一跳，链不会随多次 COW 变长。跨叙述者解析永久链接、引用时，在本叙述者的 refs 范围内按 `id` 或根找唯一的一行，与账本 `executionOriginToolCallId` 的定位规则一致（`narrator-persistence.ts:3349-3394`）。 |
+| `ordinal` | 信封内的顺序。由服务端在 item 打开时按到达顺序分配（每个信封一个内存计数器，恢复时取 `max(ordinal)+1`），不是在落库时计算。所以落库先后不影响顺序，也不需要中途重新编号；丢弃的 attempt 会留下空号，允许不连续。 |
+| `wire_id` | tool 块的线上调用 id，写入时一次确定：provider 给的 id 合法、且在本叙述者历史内唯一，就沿用；否则生成一个 wire-safe 的替代值，规则沿用 `tool-use-id-dedup.ts`。原始 id 留在 `provider_meta.wire` 里。投影不再做改名，实时与重建也就不会改出两个名字（附录 B 第 35 条）。 |
 | `attempt_id` | 产生该块的 provider attempt，即现在的 `OutputContentAccumulator.attempt`。丢弃某个 attempt 时按它精确删除，不再按数组下标基线截断。 |
 
-旧数据的块 id 按确定性规则 `${messageId}:${index}` 生成：多个物理块合成一块时，index 取组内第一个下标（§10.2）。这样回填前后 id 不变。
+旧数据的块 id 按确定性规则 `${messageId}:${index}` 生成：多个物理块合成一块时，index 取组内第一个下标（§10.2）。这样回填前后 id 不变。id 对所有读取方都是不透明字符串，不解析其结构。
 
 ### 3.3 块的种类
 
-7 种 kind 按「谁写的、怎样产生」划分，内容形态交给 part：
+5 种 kind 按「谁写的、怎样产生」划分，内容形态交给 part：
 
 | kind | 是什么 | 所在信封 | payload / part | 模型可见 |
 |---|---|---|---|---|
-| `input` | 一个参与者写的一条输入，参与者可以是人，也可以是经 mailbox 投递的其他代理 | user，一信封一块 | part：`text`、`image`、`file`、`file_ref`；可带 composer 文档 `doc` | 是：`model_text` 加图片 part |
-| `output` | assistant 的一个可见输出 item | assistant 步 | part：`text`（带 citations）、`image` | 是 |
-| `reasoning` | assistant 的一个推理 item，含 redacted | assistant 步 | part：推理分段（`text` part，`segment` 取 `summary` 或 `content`）；redacted 时没有 part | 按携带策略（§7.4） |
-| `tool` | 一次工具调用及其被采用的结果 | assistant 步 | `name`、`input`、`executor`、`issuer`、`result`（§3.7） | 调用与结果成对，`settled` 时可见 |
-| `context` | 系统或运行期写给模型的内容 | sys 或 user，一信封一块 | `subtype` 加 `body`（UI 用的结构化正文） | 是：`model_text` |
-| `marker` | 控制标记：compact、计划、清空上下文、段压缩、文件历史检查点 | system、user 或 disp，一信封一块 | `subtype`、`summary?`、`messageCount?` | 否；段压缩完成后以 `model_text` 呈现 |
-| `notice` | 纯 UI 卡片：错误、info、spec 卡片、恢复卡、发布结果等 | disp 或 system，一信封一块 | `subtype` 加原字段 | 否 |
+| `input` | 一个参与者写的一条输入，参与者可以是人，也可以是经 mailbox 投递的其他代理 | user，一信封一块 | part：`text`、`image`、`file`、`file_ref`；可带 composer 文档 `doc` | `done` 时可见：`model_text` 加图片 part |
+| `output` | assistant 的一个可见输出 item | assistant 步 | part：`text`（带 citations）、`image` | `done` 或 `aborted` 时可见 |
+| `reasoning` | assistant 的一个推理 item，含 redacted | assistant 步 | part：推理分段（`text` part，`segment` 取 `summary` 或 `content`）；redacted 时没有 part | `done` 时按携带策略（§7.4） |
+| `tool` | 一次工具调用及其被采用的结果 | assistant 步 | `input`、`executor`、`issuer`、`result`（§3.7）；工具名存 `subtype` | `done` 时调用与结果成对可见 |
+| `context` | 系统或运行期写的一切单块内容：注入、提醒、控制标记、UI 卡片 | user、sys、system 或 disp，一信封一块 | `subtype` 加 `body`（UI 用的结构化正文） | `done` 且 `model_text` 非空时可见 |
+
+**`context` 按 subtype 分三族。** 族只是文档上的分组，存储上只有 subtype：
+
+| 族 | subtype | `model_text` | 专属行为 |
+|---|---|---|---|
+| 注入与提醒 | `system_injection`、`spec_continuation`、`knowledge_hint`、`merge_summary`、`review_feedback`、`tool_loaded`、`tool_unloaded`、`turn_nudge`、`broken_call`、`reminder`（§7.7）等 | 有 | 无 |
+| 控制标记 | `compact`、`plan`、`clear_context`、`segment_compact`、`file_history_checkpoint`、`epoch` | 只有完成的 `segment_compact` 有 | 有 lifecycle（`open` → `done`/`failed`）；`compact`、`epoch` 开启纪元（§7.7）；`segment_compact`、`file_history_checkpoint` 经 `refs.segment_compact_id` 隐藏 ref |
+| UI 卡片 | `error`、`info`、`ask_in_passing`、`subagent_recovery`、`cwd_recovery`、`spec_goal_added`、`publication_result` 等 | 无 | 状态写 `state` |
+
+**为什么把前两轮的 `marker`、`notice` 并进 `context`**（D22）
+- 三者都由系统写、一信封一块、写入后只改 `state`。
+- 读写方真正分支的依据是 subtype（compact 与段压缩的行为完全不同），不是 kind。
+- 模型可见性在三者里本来就由「有没有 `model_text`」决定：段压缩完成后有，compact 没有，卡片没有。并成一种之后，规则只剩一条：**非 assistant 块，`done` 且 `model_text` 非空即可见**。
+- 部分索引、启动恢复、COW 都少一个分支。
 
 **`input` 和 `context` 按作者区分，不按 role 区分。**
 - role=user 不等于人类输入。自动续跑、批准反馈、审查检查、`/load` 通知、段压缩标记现在都是 role=user 的行（`orchestrator.ts:2740-2915`；`narrator-service.ts:539-630`），sender 投影因此可能把它们当成人写的（附录 B 第 4 条）。
-- 改为：人或其他代理写的才是 `input`，其余模型可见文本都是 `context`。协议上需要的 role 仍由信封决定。
+- 改为：人或其他代理写的才是 `input`，其余都是 `context`。协议上需要的 role 仍由信封决定。
+- 一条不变式：`input` 只出现在 role=user 的信封里；assistant 信封里只有 `output`、`reasoning`、`tool`；`context` 不出现在 assistant 信封里。store 写入时检查，违反即抛错。
 
 **`output` / `reasoning` 的粒度是 provider 的原生输出 item：**
 
@@ -329,9 +348,9 @@ narrator_message_refs ──▶ 信封 narrator_messages
 | 列 | 内容 | 可变性 | 影响模型历史 revision | 共享信封上的修改 |
 |---|---|---|---|---|
 | `payload` | 块正文与 part | 信封可共享之前可以随流式更新；之后不可变，编辑产生新 revision | 是 | 必须 COW |
-| `model_text` | `input`、`context`、`marker` 的模型可见文本，写入时冻结 | 同上 | 是 | 必须 COW |
+| `model_text` | `input`、`context` 的模型可见文本，写入时冻结；assistant 块恒为 null（它们的模型可见文本就是 part） | 同上 | 是 | 必须 COW |
 | `state` | 非模型可见的可变元数据，见下 | 随时 | **否** | 原地更新，所有持有者可见，与现状一致 |
-| `provider_meta` | provider 凭据与线上 id，带 `source` | 随正文写定 | 是 | 必须 COW |
+| `provider_meta` | 产出来源与上游原样骨架（见下），只有 assistant 块有 | 随正文写定 | 是 | 必须 COW |
 
 `state` 收纳：
 - reasoning 的翻译（按 part）；
@@ -350,66 +369,96 @@ narrator_message_refs ──▶ 信封 narrator_messages
 `provider_meta` 的形状：
 
 ```
-output / reasoning: {source, anthropic?:{signature}, openai?:{itemId, encryptedContent, phase, format},
-                     gemini?:{thoughtSignature, stepId}}
-tool:               {source, originalId?, call?:{itemId?, thoughtSignature?}, result?:{...}}
+{ source: string,      // 产出它的上游，即现在的 signatureSource 键，如 "codex"、"nug:<channel>:anthropic"
+  wire?: object,       // output / reasoning：上游 item 原样骨架；tool：调用 item 的骨架
+  result?: object }    // 只有 executor = "provider" 的 tool：结果 item 的骨架
 ```
 
+**骨架 = 上游返回的原始 item，去掉模型可见的正文。** 正文换成 part 引用 `{"$part": i}`，其余字段（id、status、phase、signature、encrypted_content、annotations、未知的新字段）按上游的键顺序原样保留。同源回放时，第二段把 part 填回骨架，得到与上游逐字节相同的 item。骨架取自 item 完成时的上游原文：Responses 是 `response.output_item.done` 里的 item（Codex WS 续写的基线也是它，`codex-websocket.ts:757-760,1719-1720`），Anthropic 是 `content_block_stop` 时累积完的块，Gemini 是收到的 part。
+
+| 上游 | `wire` 里留下什么（正文换成 part 引用） |
+|---|---|
+| Anthropic | `thinking`：`signature`；`redacted_thinking`：`data`；`text`：`citations`；`tool_use`：`id`、`name` |
+| Responses | message：`id`、`status`、`role`、`phase`、各 `output_text` 的 `annotations`；reasoning：`id`、`encrypted_content`、`summary` / `content` 的分段结构；function_call：`id`、`call_id`、`name`、原始 `arguments` 字符串、`status` |
+| Gemini generateContent | part 的 `thought`、`thoughtSignature`；functionCall 的 `id`（上游给了才有）、`name`。合成一块的连续 part 各留一份骨架，按顺序组成数组 |
+| Gemini Interactions | step 的 `type`、`id`、`signature`、summary 分段结构 |
+| Chat Completions | 无（`reasoning_content` 只有文本，没有凭据），`wire` 为空 |
+| 插件 | 插件给出的 `continuation`（`remote-provider-adapter.ts:373-423`） |
+
+为什么不按字段白名单存（前两轮的 `anthropic? / openai? / gemini?` 形状，D24）：
+- 白名单每遇到上游新增字段就要改 schema。Responses 的 `phase`、function_call 的 item id、Gemini 普通 text part 的签名，都是因为白名单漏了才没落库（§1.3 E）。
+- Codex WS 增量续写要求逐项 JSON 相同，包括键顺序（`codex-websocket.ts:255-267`）。只有存原样骨架才能由构造保证，白名单只能靠测试逐个补字段（§7.3）。
+- 跨源时第二段完全不读 `wire`，只用 part 降级或丢弃（§7.4），所以骨架里多存的字段不会泄漏到别家。
+
+两条细则：
+- **工具参数。** function_call 的骨架保留上游原始 `arguments` 字符串。第二段在 `JSON.parse(arguments)` 与块的 `input` 深相等时回放原始字符串（字节不变），否则序列化 `input`（D2：回放实际执行的输入）。其他协议同理。
+- **大字段。** 上游 item 里的二进制（image_generation 的 base64 结果）不进骨架，落盘成 asset，骨架里换成 `{"$asset": id}`。
+
 tool 的调用侧和结果侧分开存，与 AI SDK 的 `callProviderMetadata` / `resultProviderMetadata` 一致（附录 C.3）：
-- **调用侧**：Responses 的 `fc_` item id、Gemini 的 thoughtSignature。后者不再嵌进账本 `input_json` 的保留键（`narrator-persistence.ts:515-536`）。
-- **结果侧**：留给 provider 执行的工具，例如 Anthropic 原生搜索的加密结果（现在不落库）。
+- **调用侧**（`wire`）：Responses 的 `fc_` item id、Gemini 的 thoughtSignature。后者不再嵌进账本 `input_json` 的保留键（`narrator-persistence.ts:515-536`），也就不会再泄漏给别家（附录 B 第 34 条）。
+- **结果侧**（`result`）：只用于 provider 执行的工具，例如 `web_search_call`、`image_generation_call` 的结果骨架。
 
 ### 3.5 生命周期 `phase`
 
+全部 kind 共用 4 个 phase：
+
+| phase | 含义 | 对模型 | 信封可共享 |
+|---|---|---|---|
+| `open` | 还没完成：item 在流式中、工具在等结果、compact 在进行 | 不可见 | 否 |
+| `done` | 正常完成 | 可见（`context` 还要有 `model_text`） | 是 |
+| `aborted` | 被中断，已产生的内容保留；只用于 output / reasoning | output 可见，reasoning 不可见（D4） | 是 |
+| `failed` | 完成但作废：broken 工具调用、失败的 compact / 段压缩 | 不可见 | 是 |
+
 ```
-output / reasoning:  open ──▶ done
-                       └──▶ aborted        用户中断、进程退出：已产生的内容保留
-
-tool:                open ──▶ called ──▶ settled ──┐
-                       │        ▲                   │ 重跑被拒工具：新 attempt，回到 called
-                       │        └───────────────────┘
-                       └──▶ failed         输入损坏（broken），永不执行
-
-marker:              open ──▶ done | failed     compact、段压缩
-
-input / context / notice: 写入即 done
+output / reasoning:  open ──▶ done | aborted
+tool:                open ──▶ done ──┐  重跑被拒工具：新 attempt，回到 open
+                       ▲             │
+                       └─────────────┘
+                     open ──▶ failed       输入损坏（broken），永不执行
+context:             写入即 done；控制标记 compact、段压缩为 open ──▶ done | failed
 ```
 
-`tool` 的各阶段：
-- **`open`**：输入还在流式生成。只走 WS，不落行。
-- **`called`**：输入已定，等待结束。
-  - 期间可能等权限、等前台子代理，或被 continuation 挂起并跨越重启（`tool-continuation-service.ts`）。
-  - 块行与账本 attempt 1 在**同一个事务**里插入。现在是分两步写的（`narrator-persistence.ts:2210-2333` 与 `2385-2420`）。
-  - 对模型不可见。
-- **`settled`**：被采用的 attempt 到达终态（success / fail）。
-  - 调用与结果成对对模型可见。
-  - 被采用的结果之后仍可能改变：detach 的真结果覆盖中断占位、Agent 结论被改写、遗弃清扫补写（`run.ts:996-1049`；`abandoned-tool-cleanup.ts:97-121`）。每次改变都是这一块的新 revision。
-- **`failed`**：broken 输入。
-  - 对模型不可见，同时写一条 `context` 块说明被移除的调用（§5.3）。
-  - 这与实时路径一致：实时路径剔除 broken 调用并加提醒（`loop.ts:7583-7619`），而现在的重建路径会把它们重放出来。
+前两轮 tool 用了 `open`（输入流式中）、`called`（等结果）、`settled`（有结果）三个名字。收成一个 `open` 的理由（D23）：
+- 输入流式阶段只走 WS，从不落行（§5.2），数据库里看不到它，不需要名字。
+- `called` 与 output 的 `open` 在所有规则里待遇相同：对模型不可见、阻止共享、启动恢复要处理。差别只在恢复动作，而恢复本来就按 kind 分支。
+- `settled` 与 `done` 同义。
+- 结果：部分索引、触发器条件、共享判定都只看 `phase = 'open'` 一个值。
+
+`tool` 在 `open` 期间：
+- 可能等权限、等前台子代理，或被 continuation 挂起并跨越重启（`tool-continuation-service.ts`）。
+- 块行与账本 attempt 1 在**同一个事务**里插入。现在是分两步写的（`narrator-persistence.ts:2210-2333` 与 `2385-2420`）。
+- 被采用的 attempt 到达终态（success / fail）时进入 `done`，调用与结果成对对模型可见。
+- `done` 之后被采用的结果仍可能改变：detach 的真结果覆盖中断占位、Agent 结论被改写、遗弃清扫补写（`run.ts:996-1049`；`abandoned-tool-cleanup.ts:97-121`）。每次改变都是这一块的新 revision，phase 不变。
+- broken 输入直接进入 `failed`：对模型不可见，同时写一条 `context` 块（subtype `broken_call`）说明被移除的调用（§5.3，D11）。这与实时路径一致：实时路径剔除 broken 调用并加提醒（`loop.ts:7583-7619`），而现在的重建路径会把它们重放出来。
 
 由此带来的规则：
-- **信封可共享 ⇔ 信封里没有 `open` 或 `called` 的块。**
+- **信封可共享 ⇔ 信封里没有 `open` 的块。**
   - fork 只共享可共享的信封；工具执行期间 fork，子叙述者拿到的是上一步为止的历史。
   - 这取代了现在「排除进行中 compact」的特例。
   - 也修复了 partial 行先被共享、后被原地追加的问题（`narrator-persistence.ts:2208-2333`；`narrator-session-state.ts:895-901`）。
 - **块在信封可共享之前可以原地修订**，例如迟到的签名、引文回补（`output-content.ts:175-200`）。此后模型可见内容只能经编辑 API 产生新 revision，共享时走 COW。
-- **启动恢复只扫 `phase IN ('open','called')` 的部分索引。**
-  - `open` 的 output / reasoning 改为 `aborted`，`open` 的 marker 改为 `failed`。
-  - `called` 的 tool 不动，由账本与 continuation 服务决定。
+- **启动恢复只扫 `phase = 'open'` 的部分索引**，按 kind 处理：
+  - output / reasoning → `aborted`；
+  - 控制标记 → `failed`；
+  - tool 不动，由账本与 continuation 服务决定。
   - 这取代了 `recoverStaleCompactingMessages` 和冷启动对 `completed:false` 的清理。
-- **模型历史只读以下块：**
-  - `done` 和 `aborted` 的 output 与 reasoning。其中 `aborted` 的 reasoning 不重放，因为凭据不完整；`aborted` 的 text 照常重放，因为用户已经看到。
-  - `settled` 的 tool。
-  - `input` 和 `context`。
-  - 带 `model_text` 且 `done` 的 marker。
+- **模型可见性是 (kind, phase, model_text) 的纯函数**：
+
+  | kind | 可见条件 |
+  |---|---|
+  | `output` | `done` 或 `aborted`（`aborted` 的 text 照常重放，因为用户已经看到） |
+  | `reasoning` | `done`（`aborted` 的凭据不完整，不重放），再经携带策略（§7.4） |
+  | `tool` | `done` |
+  | `input`、`context` | `done` 且 `model_text` 非空 |
+
+  此外只有两条规则能让一块不出现：携带策略判为 `drop`（§7.4）；subtype `reminder` 在它所属的纪元之后跳过（§7.7）。没有别的开关。
 
 ### 3.6 轮、步、attempt、因果：写入时盖章
 
 | 概念 | 定义 | 存放位置 |
 |---|---|---|
 | 轮（turn） | 一次运行：从叙述者被一次输入唤醒，到回到 idle 或等待用户为止，即 orchestrator 一个 active run 的生命周期（`orchestrator.ts:813`）。期间的插话、注入、自动续跑、错误卡都属于该轮；idle 时写入的卡片不属于任何轮 | 信封 `turn_id` |
-| 步（step） | 一次 provider 响应，即一个 assistant 信封；同一步内的重试 attempt 共用这个信封 | 信封 `step_index`（轮内序号） |
+| 步（step） | 一次 provider 响应，即一个 assistant 信封；同一步内的重试 attempt 共用这个信封 | 信封本身；轮内顺序就是 refs 的 seq，不另存序号 |
 | attempt | 同一步内的一次 provider 请求；被丢弃的 attempt，其 item 块整体删除 | 块 `attempt_id` |
 | 并行组 | loop 的 `groupToolExecutions` 给出的执行分组 | tool 块 `state.execGroup` |
 | 工具采用 | 模型看到的是哪一次 attempt | tool 块 `payload.result.toolCallId`；账本 `block_id` |
@@ -419,17 +468,19 @@ input / context / notice: 写入即 done
 - 前端的 recency（最近两轮）、流式交接、工具排队都改为读这些字段，原来的三套定义合成一套（§8.3）。
 - 因果链接让展示可以把后台通知挂在它的工具卡旁，也让删除可以提示连带内容；它不参与投影。现在一条 `/goal` 命令散落成三行，彼此没有关联。
 - 子代理在自己的叙述者上有自己的轮。
+- 前两轮设计还有一个 `step_index` 列。它是「同一 `turn_id` 内 assistant 信封按 seq 的名次」，可以由 refs 推出，没有读取方需要它在 SQL 里过滤，所以删去。
 
 ### 3.7 tool 块与账本
 
 **tool 块**：一次调用及其被采用的结果。
 
 ```
+subtype: 工具名                   // 唯一存放处，payload 不再重复
 payload: {
-  name, input,                   // input = 重放给模型的那一份（重定向、修复之后）
+  input,                         // 重放给模型的那一份（重定向、修复之后，D2）
   executor: "local" | "provider",
   issuer: "model" | "user",      // /bash 由用户发起
-  result?: {                     // settled 时写入
+  result?: {                     // 进入 done 时写入
     toolCallId,                  // 被采用的 attempt（provider 执行的工具为空）
     isError,
     parts?: [image…],            // 工具结果里的图片（现在只在内存）
@@ -439,25 +490,25 @@ payload: {
 ```
 
 - **结果文本不复制进块**（D1）。它仍在账本被采用行的 `output_json`，账本的输入输出已约 1.5GB（`execution-log-service.ts:4-6`）。
-- **turn nudge 不再随结果走**（D12）。现在它只拼在本轮最后一个工具的结果上，代码注释的理由是 loop 未必能走到下一个边界（`loop.ts:7271-7277`）。改为在该步最后一个工具 settle 的同一事务里写一条 `context` 块（subtype `turn_nudge`），投影时排在该步工具结果之后、同一个 user 轮里，所以不依赖 loop 走到下一个边界。`appendix` 字段保留给今后确实属于某个结果的附言。
+- **turn nudge 不再随结果走**（D12）。现在它只拼在本轮最后一个工具的结果上，代码注释的理由是 loop 未必能走到下一个边界（`loop.ts:7271-7277`）。改为在该步最后一个工具进入 `done` 的同一事务里写一条 `context` 块（subtype `turn_nudge`），投影时排在该步工具结果之后、同一个 user 轮里，所以不依赖 loop 走到下一个边界。`appendix` 字段保留给今后确实属于某个结果的附言。
 - **AskUserQuestion** 的作答仍写账本 attempt，模型经结果文本（"User answered: …"）看到。块的 `input` 不含作答，投影不再需要剥离（`question-model-input.ts:1-84`）。
 - **provider 执行的工具**（web_search、image_generation）也是 tool 块，`executor = "provider"`，没有账本行。现在它们本来就是「调用和结果在一个块里」（`narrator-event-handler.ts:2141-2187`）。
 - **`/bash`**：
   - 用户输入是一个 `input` 块，`model_text` 为命令原文。
   - 合成的 assistant 步里是一个 `issuer = "user"` 的 tool 块，`cause_block_id` 指回输入。
   - 现在 assistant 行里那个只给显示用的 `tool_result` 块不再需要（`narrator-service.ts:1117-1131`）。
-- **重跑与迟到结果。** 重跑被拒工具时，在共享信封上先 COW 再开新 attempt，与现状一致（`narrator-persistence.ts:3397-3501`）。settled 之后被采用结果的改变，在共享信封上按 `preserveExecutionOwner` 的语义处理：执行所有者原地更新，其他持有者保留克隆（`narrator-persistence.ts:4031-4058`）。
+- **重跑与迟到结果。** 重跑被拒工具时，在共享信封上先 COW 再开新 attempt，与现状一致（`narrator-persistence.ts:3397-3501`）。done 之后被采用结果的改变，在共享信封上按 `preserveExecutionOwner` 的语义处理：执行所有者原地更新，其他持有者保留克隆（`narrator-persistence.ts:4031-4058`）。
 
 **账本行**：每个 attempt 一行，`block_id` 指向它执行的 tool 块。
 - 重复的 toolUseId 不再有歧义，`#dupN` 和 `resolveToolCallWriteId` 里的猜测可以去掉。
 - 被采用的 attempt 由块显式指向，不再在读取时用 `latestToolCallAttempts` 推导（`narrator-messages.ts:2026-2048`）。
 - **内部执行**，如 Eval 的内部 Read（toolUseId 以 `internal_read_` 开头，`narrator-persistence.ts:3199-3263`），不挂块，以显式字段标记，投影一律跳过。现在构造器的向后兼容路径会把它们补成模型从没发过的调用（推测，附录 B 第 21 条）。
 
-**投影**：tool 块拆成两部分。调用放进 assistant 轮；结果按协议放置，可能是下一个 user 轮里的 tool_result、function_call_output、role=tool 消息或 functionResponse。顺序就是块的 ordinal，即调用顺序。
+**投影**：tool 块拆成两部分。调用放进 assistant 轮；结果按协议放置，可能是下一个 user 轮里的 tool_result、function_call_output、role=tool 消息或 functionResponse。顺序就是块的 ordinal，即调用顺序。按名称加顺序配对的协议（Gemini generateContent 现在的 functionResponse 不带 id，`gemini-provider.ts:653-662`）因此总能配对正确：结果的顺序由结构保证，不再取决于账本行 id。
 
 ### 3.8 非 assistant 信封：一块
 
-`input`、`context`、`marker`、`notice` 所在的信封恰好一块。现有的多块形态在这一块里合并：
+`input`、`context` 所在的信封恰好一块。现有的多块形态在这一块里合并：
 
 | 现有形态 | 合并为 |
 |---|---|
@@ -473,55 +524,86 @@ payload: {
 ### 4.1 `narrator_blocks` 与 `narrator_block_assets`（新表）
 
 ```
-narrator_blocks
-  id                text  PK                       §3.2
-  message_id        text  NOT NULL → narrator_messages.id ON DELETE CASCADE
-  ordinal           integer NOT NULL               信封内的顺序
-  kind              text  NOT NULL                 input | output | reasoning | tool | context | marker | notice
-  subtype           text                           context / marker / notice 的子类型；tool 的工具名
-  phase             text  NOT NULL DEFAULT 'done'  open | done | aborted | called | settled | failed
-  revision          integer NOT NULL DEFAULT 0     正文版本；流式 checkpoint、settle、编辑时递增
-  payload           text(json) NOT NULL            块正文与 part
-  model_text        text                           input / context / marker 冻结的模型可见文本
-  search_text       text                           冻结的可搜索文本（content_text 派生与块级 FTS 的来源）
-  state             text(json)                     非模型可见的可变元数据
-  provider_meta     text(json)                     凭据与线上 id，带 source
-  wire_id           text                           tool 的线上调用 id，写入时确定（§3.2）
-  attempt_id        text                           产生它的 provider attempt
-  origin_block_id   text                           COW lineage
-  original_payload  text(json)                     首次编辑前的正文（替代 original_content_json）
-  model_chars       integer NOT NULL DEFAULT 0     计入上下文的字符数
-  byte_size         integer NOT NULL DEFAULT 0     payload + model_text + provider_meta 的字节数
-  created_at        text  NOT NULL
-  completed_at      text
+narrator_blocks                                         小列在前，大 JSON 列在后（见下）
+  id               text     PRIMARY KEY                 §3.2
+  message_id       text     NOT NULL REFERENCES narrator_messages(id) ON DELETE CASCADE
+  ordinal          integer  NOT NULL                    item 打开时分配，可不连续（§3.2）
+  kind             text     NOT NULL                    input | output | reasoning | tool | context
+  subtype          text                                 context 的子类型；tool 的工具名
+  phase            text     NOT NULL DEFAULT 'done'     open | done | aborted | failed
+  revision         integer  NOT NULL DEFAULT 0          正文版本；checkpoint、离开 open、编辑时递增
+  wire_id          text                                 tool 的线上调用 id（§3.2）
+  attempt_id       text                                 产生它的 provider attempt
+  origin_block_id  text                                 COW lineage 的根
+  model_chars      integer  NOT NULL DEFAULT 0          计入上下文的字符数
+  byte_size        integer  NOT NULL DEFAULT 0          model_text + payload + state + provider_meta 的字节数
+  created_at       text     NOT NULL
+  completed_at     text                                 离开 open 的时间
+  model_text       text                                 input / context 冻结的模型可见文本
+  payload          text     NOT NULL                    JSON：块正文与 part
+  state            text                                 JSON：非模型可见的可变元数据
+  provider_meta    text                                 JSON：{source, wire?, result?}（§3.4）
+  original_payload text                                 JSON：首次编辑前的正文，只用于 output
 ```
 
-索引：
+**列顺序有意义。** SQLite 按记录顺序存列，大值溢出到链式溢出页；读一行里排在大列之后的列，要先走过前面列的溢出页。所以定长与短文本列放前面，只读元数据的查询（启动恢复、共享判定、页面 API 的骨架、COW 预算）不必加载正文。
+
+**约束**：让无效状态写不进去。`schema.ts` 已有用 `check()` 定义表级约束的先例（`server/db/schema.ts:182-192`），PG 生成器也能转译 CHECK（`scripts/generate-postgres-schema.ts:291`）。
+
+| 约束 | 表达式 | 排除的无效状态 |
+|---|---|---|
+| kind 取值 | `kind IN ('input','output','reasoning','tool','context')` | — |
+| phase 取值 | `phase IN ('open','done','aborted','failed')` | — |
+| subtype 归属 | `(subtype IS NOT NULL) = (kind IN ('tool','context'))` | 没有子类型的 context；带子类型的 output |
+| aborted 归属 | `phase <> 'aborted' OR kind IN ('output','reasoning')` | 「中断了一半」的工具或输入 |
+| input 不经历 open | `phase = 'done' OR kind <> 'input'` | 流式中的用户输入 |
+| model_text 归属 | `model_text IS NULL OR kind IN ('input','context')` | assistant 块上的第二份正文 |
+| provider_meta 归属 | `provider_meta IS NULL OR kind IN ('output','reasoning','tool')` | 系统块上的凭据 |
+| wire_id 归属 | `(wire_id IS NOT NULL) = (kind = 'tool')` | 没有线上 id 的工具调用 |
+| original_payload 归属 | `original_payload IS NULL OR kind = 'output'` | — |
+
+CHECK 管不到的跨行不变式，由 store 在写入时检查，并有守卫测试：
+- 非 assistant 信封恰好一块；`input`、`context` 只在非 assistant 信封里，`output`、`reasoning`、`tool` 只在 assistant 信封里（§3.3）。其中「至多一块」由下面的部分唯一索引保证。
+- `wire_id` 在本叙述者可见历史内唯一（§3.2）。
+- `phase = 'done'` 的 tool 块，`payload.result` 必须存在；provider 执行的工具之外，`result.toolCallId` 必须指向一行 `block_id` 等于本块的账本行。
+
+**索引**
 
 | 索引 | 用途 |
 |---|---|
-| `UNIQUE (message_id, ordinal)` | 读取信封的块，同时约束顺序 |
-| `(phase) WHERE phase IN ('open','called')` | 启动恢复；判断信封能否共享。替代 `idx_messages_compact_pending` |
+| `UNIQUE (message_id, ordinal)` | 读取一个信封的块（读路径唯一的块查询，§12.7），同时约束顺序 |
+| `UNIQUE (message_id) WHERE kind IN ('input','context')` | 非 assistant 信封至多一块 |
+| `(message_id) WHERE phase = 'open'` | 信封能否共享（一次索引探测）；启动恢复扫描。替代 `idx_messages_compact_pending` |
 | `(origin_block_id) WHERE origin_block_id IS NOT NULL` | 按 lineage 解析永久链接、引用、评论 |
-| `(kind, subtype) WHERE kind IN ('context','marker','notice')` | 按种类查找，例如 merge summary、compact 标记 |
-| `(wire_id) WHERE kind = 'tool'` | 按 toolUseId 查找工具详情（兼容旧 API） |
+| `(subtype) WHERE kind = 'context'` | 按子类型查找：merge summary、compact 标记、纪元标记 |
+| `(wire_id) WHERE kind = 'tool'` | 按 toolUseId 查找工具详情（兼容旧 API）；`wire_id` 唯一性检查 |
+
+**大小上限**（建议值，P1 前用生产库副本的分布核对）
+
+| 对象 | 上限 | 超出时 |
+|---|---|---|
+| 单块 `byte_size` | 4 MiB，与模型历史单批上限 `MODEL_HISTORY_BATCH_BYTES` 相同（`agent-runtime/model-history-query.ts:5`），保证一块总能放进一批 | output / reasoning：封块并记错误，后续内容开新块；input：在上传校验处拒绝；tool `input`：沿用现有工具输入上限 |
+| `state` | 1 MiB（推理译文按 part 存，体量与推理相当） | 拒绝写入 |
+| `provider_meta` | 1 MiB（encrypted_content 是大头） | 记错误，凭据置空，该块按跨源处理（降级或丢弃） |
+| 单块 checkpoint 频率 | 块超过 256 KiB 后，最多每 2 秒一次 | 合并到下一次 |
 
 ```
 narrator_block_assets
-  block_id   text NOT NULL → narrator_blocks.id ON DELETE CASCADE
-  asset_id   text NOT NULL                       上传文件 id
-  role       text NOT NULL                       input_image | input_file | output_image | tool_image
+  block_id   text NOT NULL REFERENCES narrator_blocks(id) ON DELETE CASCADE
+  asset_id   text NOT NULL                       上传文件 id，或文本快照的 sha256
+  role       text NOT NULL                       input_image | input_file | output_image | tool_image | epoch_snapshot
   PRIMARY KEY (block_id, asset_id)
   INDEX (asset_id)
 ```
 
-- store 写入含 `image` 或 `file` part 的块时，在同一事务里维护这张表。
+- store 写入含 `image` 或 `file` part 的块、或纪元标记块（§7.7）时，在同一事务里维护这张表。
 - 孤儿上传回收与保留策略改为按 `asset_id` 查，替代 `LIKE '%"type":"image"%'` 全表扫描（`storage-service.ts:826-835`），而且能覆盖工具结果截图与生成的图片。
+- `epoch_snapshot` 行的 `asset_id` 是 `narrator_text_snapshots` 的 sha256（§7.7）。两种 asset 共用这张引用表，回收逻辑相同：没有引用行即可回收。
 
 说明：
 - **不设 `narrator_id` 列。** 块属于哪个叙述者，一律经 refs → 信封判定。块的作者就是信封的作者。
-- **`ordinal` 用稠密整数。** 极少数需要在中间插入的情况（例如 provider 按 `outputIndex` 乱序到达），在同一事务里对这一个信封重新编号即可。单个信封通常只有几十块，开销可以忽略。
-- **非 assistant 信封恰好一块**，由 store 保证（§3.8）。
+- **不设 `search_text` 列。** 前两轮为 `content_text` 派生和块级 FTS 预留了冻结的可搜索文本。它是 payload / model_text 的纯函数；`deriveEnvelope` 在同一事务里手上就有块，不需要它；块级 FTS 是 P3 的可选项（D6），到时再加。
+- **`ordinal` 不重新编号。** 顺序在 item 打开时就确定（§3.2），落库先后无关。
 
 ### 4.2 `narrator_messages` 新增列（只做 `ALTER … ADD`）
 
@@ -529,17 +611,17 @@ narrator_block_assets
 |---|---|
 | `body_format integer NOT NULL DEFAULT 1` | 1 = `content_json` 是权威；2 = 块行是权威 |
 | `turn_id text` | §3.6 |
-| `step_index integer` | §3.6 |
 | `author_narrator_id text` | 不可变的作者，COW 时保留；为 null 时视为 `narrator_id`（旧行）。sender 投影和归属展示读这一列（§6.3）。其他代理经 mailbox 投递的消息也写在这里（§3.8） |
 | `cause_block_id text` | §3.6 |
-| `provider_response_id text` | provider 的响应 id。现在 `sdk_message_uuid` 会被当作 item id 回放；以后 item id 由各块的 `provider_meta` 携带，这一列只记响应 id |
+| `provider_response_id text` | provider 的响应 id。现在 `sdk_message_uuid` 会被当作 item id 回放；以后 item id 由各块的 `provider_meta.wire` 携带，这一列只记响应 id |
+| `body_bytes integer NOT NULL DEFAULT 0` | 派生：本信封全部块的 `byte_size` 之和，由 `deriveEnvelope` 维护。读路径按它切批，不必为了算批大小读正文（§12.7） |
 
 已有列在 `body_format = 2` 下的语义：
 
 | 列 | 语义 |
 |---|---|
 | `content_json` | P1–P2 期间写入由块派生的兼容投影（供回退开关使用）；P3 起新行写 `'[]'`（§10.4） |
-| `content_text` | 由块的 `search_text` 按统一规则派生（§4.6）；只在块封闭、settle、编辑时重算，不在每个 checkpoint 重算 |
+| `content_text` | 由块按统一规则派生（§4.6）；只在信封封口、工具进入终态、编辑或删除时重算，不在 checkpoint 或单个 item 封闭时重算 |
 | `context_chars_json` | 由块的 `model_chars` 和 kind 派生，context stats 触发器不变 |
 | `original_content_json` / `compact_pending` | 只对 `body_format = 1` 有意义 |
 | `body_revision` | 块触发器同样会 bump 它（§4.5） |
@@ -563,13 +645,16 @@ narrator_block_assets
 
 | 事件 | 条件 |
 |---|---|
-| INSERT | `NEW.phase NOT IN ('open','called')` |
-| DELETE | `OLD.phase NOT IN ('open','called')` |
-| UPDATE OF `payload, model_text, provider_meta, kind, subtype, ordinal, phase, message_id` | 排除前后都处于 open 或 called 的更新（流式 checkpoint、工具执行中） |
+| INSERT | `NEW.phase <> 'open'` |
+| DELETE | `OLD.phase <> 'open'` |
+| UPDATE OF `payload, model_text, provider_meta, kind, subtype, ordinal, phase, message_id` | `NOT (OLD.phase = 'open' AND NEW.phase = 'open')` |
 
 要点：
 - **`state` 的变化不触发。** 这就把「UI 状态让模型历史失效」从根本上去掉了。
-- **流式 checkpoint 与工具执行不触发。** 块进入 done、settled 或 failed 时触发一次；tool 从 settled 回到 called（重跑）也触发，因为调用与结果从模型历史中消失。
+- **流式 checkpoint 与工具执行不触发。** 块离开 `open` 时触发一次；tool 从 `done` 回到 `open`（重跑）也触发，因为调用与结果从模型历史中消失。phase 收成 4 个之后，三个条件都只比较一个值。
+- **信封表上监视 `content_json` 的触发器只对旧格式生效。** 双写期间原生信封也写兼容的 `content_json`；如果信封表的触发器照旧监视它，同一次修改会 bump 两次。v2 给这些触发器加条件 `body_format = 1`。
+- **账本触发器保留。** 被采用的结果文本仍在账本（D1），所以 v1 里监视 `narrator_tool_calls` 的触发器照旧保留；块表触发器不重复监视它。
+- **只对原生信封生效。** 三个触发器的条件都再加一条「所属信封 `body_format = 2`」（一次主键查找）。物化与回填先在 `body_format = 1` 的信封下插入块，最后才翻转格式，所以「把旧数据换成块」本身不 bump 任何 revision；投影字节本来就相同（§10.2）。
 - **契约版本升级。** 契约 id 改为 `model-history-v2`，运行时核对的触发器数量随之更新。
 - **由生成器产出。** 生成器（`scripts/lib/generated-model-history-triggers.ts`）需要学会产出 v2，以「带版本的重装迁移」形式交付。finalizer 拒绝直接重建触发器表时，报错信息也指向这条路：`"Model-history trigger table rebuild requires a versioned reinstall migration"`（`scripts/finalize-sqlite-resource-migration.ts:744-751`）。
 - **禁止手改迁移文件。** 不得手改 `drizzle/`，也不重复 0206 那种在生成结果后人工追加 SQL 的做法。
@@ -581,7 +666,8 @@ narrator_block_assets
 
 **调用方式**
 - 由 store 在同一事务内调用。
-- 时机：块封闭、信封封口、编辑或删除之后。
+- 时机：信封封口（`sealStep`、单块信封写入）、tool 进入终态、编辑或删除之后。
+- 单个 item 封闭时**不**调用（D28）。一步有 N 个 item 时，`content_text` 只写一次而不是 N 次，FTS 也只重建一次（§12.7）。流式中途的部分文本搜不到，这与「封口才算完成」一致；崩溃恢复把 open 块改为 `aborted` 时补算一次。
 
 **派生规则**
 - 第一版逐条复刻现状，包括 user 行的附件提示和控制行的哨兵字符串，所以 External API `detail=text` 的输出不变（`external-resource-service.ts:1559-1577`）。
@@ -628,10 +714,13 @@ interface NarratorStore {
 	discardAttempt(tx, messageId, attemptId): void;
 	sealStep(tx, messageId, usage: EnvelopeUsage): void;
 	// 工具
-	callTool(tx, messageId, call: NewToolCall): { blockId: BlockId; toolCallId: string }; // 块 called + 账本 attempt 1
-	settleTool(tx, blockId, toolCallId, settlement: ToolSettlement): void; // 采用、图片、附言 → settled
-	retryTool(tx, holderNarratorId, blockId): { toolCallId: string }; // 新 attempt，块回到 called；共享则先 COW
+	callTool(tx, messageId, call: NewToolCall): { blockId: BlockId; toolCallId: string }; // 块 open + 账本 attempt 1
+	settleTool(tx, blockId, toolCallId, settlement: ToolSettlement): void; // 采用、图片、附言 → done
+	retryTool(tx, holderNarratorId, blockId): { toolCallId: string }; // 新 attempt，块回到 open；共享则先 COW
 	failTool(tx, blockId, reminder: NewSingleBlock): void; // broken：块 failed，另写一条 context
+	// 纪元与对账（§7.7、§7.8）
+	changeTools(tx, narratorId, change: ToolChange): BlockId | null; // 改 enabledTools 并写 tool_loaded / tool_unloaded，同一事务
+	openEpoch(tx, narratorId, epoch: EpochSnapshot): BlockId; // 写 epoch 标记块与 system 快照引用
 	// 修改
 	editBlock(tx, holderNarratorId, blockId, patch): BlockId; // 共享则 COW，返回新 id
 	deleteBlocks(tx, holderNarratorId, blockIds: BlockId[]): void; // 共享则 COW；tool 连同账本
@@ -667,30 +756,30 @@ interface NarratorStore {
    - 之后：只 UPDATE 这一块的 `payload`、`revision`。
    - 广播 `block_checkpoint {blockId, revision}`，不再广播整条消息。
 5. **item 完成。** `closeItem(done)`：
-   - 写入最终的 `provider_meta`；
-   - 触发一次 revision bump；
-   - 重算该信封的 `content_text` 和 `context_chars_json`。
-6. **工具输入完整。** `callTool` 在一个事务里插入 tool 块（phase 为 called）和账本 attempt 1（带 `block_id`）。
-7. **工具结束。** `settleTool` 与账本的结果写入放在同一个事务里：写入被采用的 attempt、结果图片、appendix，phase 改为 settled。需要回合将尽提示时，同一事务里再写一条 `turn_nudge` context 块（D12）。
-8. **step 结束。** `sealStep` 补写用量和 `provider_response_id`。
+   - 写入最终的 `provider_meta`（上游 item 的骨架，§3.4）；
+   - phase 离开 `open`，触发一次 revision bump；
+   - 不重算派生字段。
+6. **工具输入完整。** `callTool` 在一个事务里插入 tool 块（phase 为 `open`）和账本 attempt 1（带 `block_id`）。
+7. **工具结束。** `settleTool` 与账本的结果写入放在同一个事务里：写入被采用的 attempt、结果图片、appendix，phase 改为 `done`，重算派生字段。需要回合将尽提示时，同一事务里再写一条 `turn_nudge` context 块（D12）。
+8. **step 结束。** `sealStep` 补写用量和 `provider_response_id`，重算 `content_text`、`context_chars_json`、`body_bytes`。
    - 不重写块，也不需要 COW。
    - 现在 `completeAssistantOutput` 为了写 `completed:true` 要走一次 COW（`narrator-output-recovery.ts:46-63`），这一步随之消失。
-9. **信封变为可共享。** 信封里不再有 `open` / `called` 的块之后，fork 才能共享它（§3.5）。
+9. **信封变为可共享。** 信封里不再有 `open` 的块之后，fork 才能共享它（§3.5）。
 
 **写入代价**
-- SQLite 不能部分更新一个 TEXT 值，所以每个 checkpoint 仍要重写该块的 `payload`。不过开销只与这一块的长度成正比，不再与整条消息的长度成正比。
-- open 块不触发 revision；FTS 只在块封闭时随 `content_text` 更新一次。
+- SQLite 不能部分更新一个 TEXT 值，所以每个 checkpoint 仍要重写该块的 `payload`。不过开销只与这一块的长度成正比，不再与整条消息的长度成正比；超过 256 KiB 的块限频（§4.1）。
+- open 块不触发 revision；FTS 只在封口时随 `content_text` 更新一次。逐项计数见 §12.7。
 
 ### 5.3 丢弃 attempt、中断、错误、broken、loop 文本
 
 | 场景 | 现在 | 改为 |
 |---|---|---|
 | `attempt_discarded` | 按 `api_request_start` 时记录的块数基线截断数组。基线是数组下标，而块又按 `outputIndex` 排序插入，可能切错（推测，`narrator-event-handler.ts:1201-1211` 与 `output-content.ts:67-81`） | `discardAttempt(messageId, attemptId)` 删除该 attempt 的 item 块。<br>已经执行过的 tool 块保留，因为副作用已经发生。<br>投影时，同一信封里属于更早 attempt 的块单独成一个 assistant 轮并带上结果，排在当前 attempt 的内容之前，这样「thinking 必须在首位」一类约束仍然成立（§7.2）。<br>现在这些块留在信封里，重试请求却没带它们（`narrator-event-handler.ts:1318-1323`） |
-| 用户中断 | 内容 flush 后保持 `completed:false`；之后运行中会重放，冷启动时又会删除 | open item 改为 `aborted`，重放规则见 §3.5。<br>执行中的工具照旧以 interruptedByUser 结束并 settle；detach 的真结果稍后到达时，作为新 revision 替换 |
+| 用户中断 | 内容 flush 后保持 `completed:false`；之后运行中会重放，冷启动时又会删除 | open item 改为 `aborted`，重放规则见 §3.5。<br>执行中的工具照旧以 interruptedByUser 结束并进入 `done`；detach 的真结果稍后到达时，作为新 revision 替换 |
 | 终止性错误 | `finalizeOrCleanupPartialMessage` 的三个分支在数组上做过滤 | 同样三个分支，改为按 kind / phase / 账本状态删除块行 |
-| broken 输入 | 实时路径剔除调用并加提醒；账本存净化后的输入与 brokenToolCallResult；重建时又重放出来 | `failTool`：tool 块改为 failed（不可见），再写一条 `context` 块，内容是提醒原文。实时与重建一致 |
+| broken 输入 | 实时路径剔除调用并加提醒；账本存净化后的输入与 brokenToolCallResult；重建时又重放出来 | `failTool`：tool 块改为 `failed`（不可见），再写一条 `context` 块（subtype `broken_call`），内容是提醒原文。实时与重建一致 |
 | loop 自造的文本 | brokenToolCallReminder、userContinue、reflection 纠正只在内存（`loop.ts:6445,6889,7130,7179,7617`） | 各写一条 `context` 块。loop 的其他提醒（relaxed_plan、knowledge hint、silent_progress）本来就落 sys 行，两者规则统一 |
-| 冷启动 | 扫 compact 部分索引，并删除最后一条 assistant 中 `completed:false` 的块 | 只扫 `phase IN ('open','called')` 的部分索引，一次处理完（§3.5） |
+| 冷启动 | 扫 compact 部分索引，并删除最后一条 assistant 中 `completed:false` 的块 | 只扫 `phase = 'open'` 的部分索引，一次处理完（§3.5） |
 
 ### 5.4 UI 状态写入
 
@@ -727,18 +816,49 @@ AskUserQuestion 的作答不走 `patchState`：它是 attempt 的执行输入，
 | 操作 | 目标 | 行为 | 修正的现状问题 |
 |---|---|---|---|
 | 编辑 user 输入并重新生成 | `input` 块 | 新 revision：`doc`、part、`model_text` 一起重新生成；截断其后的历史 | — |
-| 编辑 assistant 文本 | 被点的那个 `output` 块 | 只改这一块；与新文本对不上的 citations 丢弃；首次编辑前的正文存 `original_payload` | 现在合并全部 text 块，把工具之后的文字搬到工具之前（附录 B 第 20 条） |
+| 编辑 assistant 文本 | 被点的那个 `output` 块 | 只改这一块；与新文本对不上的 citations 丢弃；首次编辑前的正文存 `original_payload`；`provider_meta.wire` 清空（`source` 保留），此后按纯文本投影，不再冒充上游原样 item | 现在合并全部 text 块，把工具之后的文字搬到工具之前（附录 B 第 20 条） |
 | 恢复原文 | 同一块 | 回到该块的 `original_payload`，不影响其他块 | 整数组快照会复活已删的工具调用 |
 | 删除、回滚到此 | 一组块 id | 共享信封走 COW；tool 块连同全部账本 attempt 一起删；`input` 整块；reasoning run 传整组 id | user 气泡只删第一个附件；run 只删最后一块；回滚截掉 run 后半（附录 B 第 18、19 条） |
 | 删除并回退文件 | tool 块 | 由 `block_id` 找到全部 attempt 的执行证据 | 要求 tool_use 与账本行 1:1，重跑过的工具会失败（附录 B 第 24 条） |
-| 重执行被拒工具 | tool 块 | `retryTool`：开新 attempt，块回到 called | — |
+| 重执行被拒工具 | tool 块 | `retryTool`：开新 attempt，块回到 `open` | — |
 | AskUserQuestion 作答 | tool 块的当前 attempt | 写账本；结果文本对模型可见 | — |
 | reasoning 翻译 | reasoning 块的 part | 写 `state`，不 bump revision | — |
-| 卡片状态 | context、notice、marker 块 | `patchState` | 现在原地改 JSON 并 bump 模型历史 |
+| 卡片状态 | `context` 块 | `patchState` | 现在原地改 JSON 并 bump 模型历史 |
 | 引用、永久链接、搜索跳转 | 块 id，可附 part 下标与字符区间 | 锚点 `b:<blockId>`，经 lineage 解析 | 锚点只到消息，COW 换 id 后失效（附录 B 第 25 条） |
 | 复制 | 块或 run | 复制块的显示文本；`input` 复制用户原文，不带附件提示 | 复制 user 消息时会带出附件提示 |
 
 编辑菜单只对 `output` 与 `input` 块开放。现在对所有 markdown 行开放，点系统行会被服务端拒绝（附录 B 第 23 条）。
+
+### 5.6 场景走查
+
+每个场景写出「什么时候写哪些块、什么 phase」，并核对三条不变式：**I1** 可共享的信封里没有 `open` 块；**I2** 模型可见性只由 (kind, phase, model_text) 决定（§3.5）；**I3** 实时请求与重建出的请求逐字节相同。
+
+| 场景 | 写入（按时间顺序） | 不变式要点 |
+|---|---|---|
+| 正常一步 | `openStep` → 每个 item：首个 checkpoint 插入 `open` 块，之后单行 UPDATE → `closeItem(done)` 写骨架 → tool：`callTool`（块 `open` + 账本 attempt 1）→ `settleTool`（`done`）→ `sealStep` 派生 | I1：封口前信封不可共享；I3：loop 把同一块对象追加进 view（§7.3） |
+| 崩溃在 item 中途 | 已落库的是最后一次 checkpoint 的 `open` 块 | 恢复：output / reasoning → `aborted`，补算派生；未落库的尾部 delta 丢失，与现在相同 |
+| 崩溃在工具执行中 | tool 块 `open`，账本行非终态 | 恢复不动块，由账本与 continuation 决定 settle 或补 fail（`tool-continuation-service.ts`） |
+| 用户中断 | open item → `aborted`；执行中的工具以 interruptedByUser 结果 `done` | aborted reasoning 不可见（D4）；detach 的真结果迟到时是新 revision |
+| 同一步重试（attempt） | 新 `attempt_id`；被丢弃 attempt 的 item 块 `discardAttempt` 删除；已执行的 tool 块保留 | 投影把保留的 tool 块放成更早的一轮（§5.3）；I3 由同一投影保证 |
+| 重跑被拒工具 | `retryTool`：共享则先 COW；账本 attempt+1；块 `done` → `open` | 回到 `open` 触发 revision，调用与结果从历史消失，直到新结果 `done` |
+| 权限请求 | 块保持 `open`，账本 `pending` | 不写块；权限状态只在账本 |
+| broken 调用 | `failTool`：块 `failed` + `context/broken_call` | D11；I2：failed 不可见，提醒可见 |
+| 子代理 | 子叙述者自己的信封与块；父侧的 Agent 调用是一个 tool 块，`open` 直到子代理结论成为结果 | 关联仍是 `parentToolUseId`（父侧 `wire_id`）与 `narrators.originToolCallId`（§6.5） |
+| fork / COW | fork 复制 ref；共享信封上的修改走 `cowEnvelope`，块复制并指向 lineage 根 | I1 保证 fork 不会拿到写到一半的信封 |
+| compact | `context/compact` 块 `open` → `done`（开新纪元，§7.7）或 `failed`；attempts 进 `state` | CAS 比较 `phase` 与 `revision`（§5.4） |
+| 段压缩 | `context/segment_compact` `open`（不可见）→ `done` 写 `model_text`；被选 ref 的 `segment_compact_id` 指向它 | 段压缩是显式操作，允许改写前缀（§7.7） |
+| 注入（mailbox、知识、spec） | `deliverInjection` 写单块 `context`，伴随卡片进 `body` | mid-pass 注入落在 seq 上的位置就是投影位置，不再拼进下一个 user turn（§7.3） |
+| mailbox 消息被发送方修改 | 未采纳：原地改写该 `input` 块（新 revision）；已采纳：追加 `context/reminder` | D18 |
+| assistant 编辑 / 删除 / 回滚 | `editBlock`、`deleteBlocks`；共享则 COW | 显式操作，允许改写前缀；编辑清空骨架（§5.5） |
+| 翻译 | `patchState`（按 part） | 不触发 revision，前缀不变 |
+| 跨 provider 切换 | 下一次请求前 `openEpoch(reason = target)` | 旧块的凭据按携带策略降级或丢弃（§7.4）；新纪元完整重建 |
+| reflection 循环 | 不写块。reflection 请求 = 父请求的线上前缀 + 只在内存里的后缀，工具表沿用父请求的快照（`loop.ts:1399-1401`） | 结论经父侧 tool 块的结果（账本）回到历史；reflection 自己的轮次不入库，与现状相同（`loop.ts:1352-1385` 关掉了它的持久化回调） |
+| 内部执行（`internal_read_`） | 只写账本行，`block_id` 为 null，带内部标记 | 不投影（§3.7） |
+| `/bash` | `input`（`model_text` = 命令）→ 合成 assistant 步，一个 `issuer = "user"` 的 tool 块，`cause_block_id` 指回输入 | 不再有只给显示用的 `tool_result` 块 |
+| plan mode | 进入 / 退出写 `context/plan` 标记；system 中的 plan 段冻结，变化追加提醒 | 工具描述的 plan 改写见 §7.7 |
+| `/load`、`/unload` | `changeTools`：改 `enabledTools` 并写 `context/tool_loaded` 或 `tool_unloaded`，同一事务 | §7.8 |
+| 前缀提醒 | 每次请求前对账，差异写 `context/reminder`（§7.7） | 只追加，I3 成立 |
+
 
 ## 6. 共享、fork 与 COW
 
@@ -752,11 +872,11 @@ AskUserQuestion 的作答不走 `patchState`：它是 attempt 的执行输入，
 
 ### 6.2 不可变规则
 
-1. **信封可共享之后，块的正文不可变**，这里的正文指 `payload` / `model_text` / `provider_meta`。在此之前（信封里还有 `open` 或 `called` 的块）只有写入方会改它（§3.5）；之后在被共享的信封上做编辑或删除，一律经 COW。
+1. **信封可共享之后，块的正文不可变**，这里的正文指 `payload` / `model_text` / `provider_meta`。在此之前（信封里还有 `open` 的块）只有写入方会改它（§3.5）；之后在被共享的信封上做编辑或删除，一律经 COW。
 2. **共享判定要补上惰性 fork 的缺口。**
    - 现在只数 refs。惰性 fork 的子叙述者对祖先区间还没有 ref，所以父叙述者原地修改旧消息时，子叙述者回填后会看到修改后的版本（推测）。
    - 新判定：refs 数大于 1，或者存在一个惰性继承者，其待回填区间覆盖该 ref 的 seq。后者经 `refs_inherited_from` 的部分索引查询，是常数级开销。
-3. **含 `open` 或 `called` 块的信封不参与共享**（§3.5）。
+3. **含 `open` 块的信封不参与共享**（§3.5）。
 
 ### 6.3 一个 COW 实现，作者与属主分开
 
@@ -765,14 +885,14 @@ AskUserQuestion 的作答不走 `patchState`：它是 attempt 的执行输入，
 1. 复制信封。
    - 新行的 `narrator_id` 为持有者，用于属主与回收。
    - `author_narrator_id` 保留原作者。
-2. 复制全部块：分配新 id，`origin_block_id` 指回原块，然后应用 `mutate`。
+2. 复制全部块：分配新 id，`origin_block_id` 取原块的 `origin_block_id ?? id`（即 lineage 根），然后应用 `mutate`。同时复制 `narrator_block_assets` 行。
 3. 克隆账本行，沿用现有语义：
    - `executionOriginToolCallId` 指回原行；
    - 克隆行不可执行；
    - `block_id` 重映射到新块。
 4. 把持有者的 ref 改指新信封。
 5. 在同一事务里更新 mailbox 回执（`updateRecipientMessageRef`）。
-6. 预算沿用现有上限（1000 个持有者、8MiB），改按块字节计算。
+6. 预算沿用现有上限（1000 个持有者、8MiB），改按信封的 `body_bytes` 计算，不读正文。
 
 **为什么要把作者和属主分开**
 
@@ -787,8 +907,9 @@ AskUserQuestion 的作答不走 `patchState`：它是 attempt 的执行输入，
 ### 6.4 compact、段压缩、清空上下文
 
 **compact 标记**
-- 形态：role=system 的信封，内含一个 `marker` 块（subtype `compact`）。
-- 生命周期：phase 从 open 变为 done 或 failed；attempts、mode、error 记在 `state` 里。
+- 形态：role=system 的信封，内含一个 `context` 块（subtype `compact`）。
+- 生命周期：phase 从 `open` 变为 `done` 或 `failed`；attempts、mode、error 记在 `state` 里。
+- 进入 `done` 时同时开启新纪元：块的 `payload.epoch` 写入纪元快照（§7.7），不另写纪元标记。
 - `refs.is_compact` 和 `narrators.context_summary` 的语义都不变。
 - `compact_pending` 生成列及其部分索引，由块表的 `phase` 部分索引取代。
 
@@ -799,14 +920,14 @@ AskUserQuestion 的作答不走 `patchState`：它是 attempt 的执行输入，
   - 压缩进行中，模型还会看到 `[Segment compacting]`。
 - 改为：
   - 信封 role 保持 user，以保住协议位置；`origin = system`。
-  - `marker` 块（subtype `segment_compact`）在 done 时写入 `model_text`，以 `[Earlier conversation summarized]` 一类的前缀标明这是摘要。
+  - `context` 块（subtype `segment_compact`）在 `done` 时写入 `model_text`，以 `[Earlier conversation summarized]` 一类的前缀标明这是摘要。
   - phase 为 open 时对模型不可见。
 
-**计划 / 清空上下文**：都是 `marker` 块的 subtype，`refs.is_compact` 的写法不变。
+**计划 / 清空上下文**：都是 `context` 块的 subtype（`plan`、`clear_context`），`refs.is_compact` 的写法不变。
 
 **file_history_checkpoint**
 - 仍用 `segment_compact_id` 指向自身来隐藏（`narrator-messages.ts:1662-1706`）。
-- 块形态是 `marker` / `file_history_checkpoint`；被克隆的账本行带上 `block_id`。
+- 块形态是 `context` / `file_history_checkpoint`；被克隆的账本行带上 `block_id`。
 
 ### 6.5 子代理、提取、注入、mailbox
 
@@ -834,13 +955,20 @@ interface HistoryView {
 		author: { narratorId: string; title: string; username?: string };
 		parentToolUseId: string | null;
 		turnId: string | null;
-		stepIndex: number | null;
-		source: string | null; // 产出该步的 provider 来源，用于同源判定
-		blocks: CanonicalBlock[]; // 只含模型可见阶段的块（§3.5），按 ordinal 排序
+		blocks: CanonicalBlock[]; // 只含模型可见的块（§3.5），按 ordinal 排序；同源判定读块的 provider_meta.source
 	}>;
 	adoptedOutputs: Map<string /* toolCallId */, { status: "success" | "fail"; output: ToolOutput }>;
+	epoch: {
+		markerId: string | null; // 最近一个开启纪元的块（compact 或 epoch）；旧数据为 null
+		tools: NeutralToolDefinition[] | null; // 纪元开始时冻结的工具定义；旧数据为 null，按 §7.8 倒推
+		system: SystemSections;   // 纪元开始时冻结的 system 各节（§7.7）
+		senders: Record<string, string>; // 纪元开始时冻结的作者标题
+	};
+	tools: { managed: ReadonlySet<string>; current: ReadonlySet<string> }; // 工具加载的输入（§7.8）
 }
 ```
+
+前两轮的 `stepIndex` 与信封级 `source` 删去：前者可由 seq 推出（§3.6）；后者在同一步内并不唯一（同一步的不同 attempt 可能来自不同上游），只有块级的 `provider_meta.source` 是准确的。旧数据没有块级来源时，由解码从信封的 `provider` 列补上（§10.2）。
 
 **加载器**
 - 沿用模型历史 worker 和 `model_history_revision` 源缓存（`model-history-source.ts:334-445`）。
@@ -859,16 +987,19 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 - **分组**
   - 每个 assistant 步投成一个 assistant 轮，其中的 output、reasoning、tool 调用按 ordinal 排列。
   - 同一信封里属于更早 attempt 的已执行 tool 块单独成一轮，连同结果排在前面（§5.3）。
-  - 每个 assistant 轮之后紧跟该步 settled 的 tool 结果，按 ordinal 排列，也就是调用顺序。
-  - 从这之后到下一个 assistant 步之前的 `input`、`context`、带 `model_text` 的 marker，按 seq 组成一个 user 侧分组。每项保留自己的 user / sys 角色，由第二段决定合成一条 user 消息还是拆出 system。
+  - 每个 assistant 轮之后紧跟该步 `done` 的 tool 结果，按 ordinal 排列，也就是调用顺序。
+  - 从这之后到下一个 assistant 步之前的可见 `input`、`context`，按 seq 组成一个 user 侧分组。每项保留自己的 user / sys 角色，由第二段决定合成一条 user 消息还是拆出 system。
+  - `tool_loaded` / `tool_unloaded` 块在分组里除了文本，还带一个中立的工具变更项（§7.8），由第二段按协议放置。
+  - 本次请求的工具表也在第一段算出：`{active, deferredTail, placeholder}`（§7.8）。它与历史一起构成中立请求，第二段只做格式化。
 - **内容**
   - `input` 投成 `model_text` 加图片 part。图片按 `[image #N]` 占位符就位，规则沿用 `user-content-order.ts:15-56`。
   - file_ref 展开为引用文本。
-  - 剥离 citation 标记。
-  - 按信封作者加 sender 标记。
+  - 按信封作者加 sender 标记，标题取 `epoch.senders`，纪元内第一次出现的作者取写入时的标题（§7.7）。
+  - 旧行里的 `citeturn…` 标记由解码一次性清掉（§10.2），新数据本来就没有，投影不再处理。
   - tool 结果 = `outputToText(账本输出)` + `appendix` + 结果图片。
 - **取舍**：每块按携带策略（§7.4）决定原生回放、降级为文本或丢弃。strict 只由裸 model 名计算一次。
 - **跨块规则**：少数规则依赖上下文，例如 Await 问答回执要看同一请求里是否已有答复（`question-model-input.ts:112-165`）。它们是 view 的确定性函数，统一写在第一段，作为显式规则测试。
+  - 这类规则只许「前面的内容影响后面的内容」，不许反过来。现在的回执规则是反过来的：后到的用户回执会把更早的工具结果缩短成一句引用（`question-model-input.ts:119-137`），等于改写已发送的前缀。改为只有 seq 更早的回执才能缩短后面的结果；后到的回执与更早的结果都保留全文（D26）。这样规则仍是纯函数，又天然只追加，不再需要「第一次投影时的判断」这种额外状态（§7.7）。
 
 **第二段 `toWire`** 只做格式映射，不再决定结构：
 
@@ -902,11 +1033,12 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 **Codex WS 的增量续写**
 - 前提条件：新请求必须是「上次输入 + 上游返回的原始 item」的逐项前缀（`codex-websocket.ts:259-292`）。
 - 现状：本地重新序列化的 item 缺 `status`、`annotations`、`id`、`phase` 等字段，并且合并了 summary 分段。推测几乎每次有 assistant 输出之后，都会退化为全量 `response.create`。
-- 要求：Responses 的 output、reasoning、tool 块经第二段投影后，必须还原出与上游原始 item 相同的 JSON。这条要求规定了 `provider_meta.openai` 与 part 必须保存哪些字段，并由测试钉住。
+- 要求：Responses 的 output、reasoning、tool 块经第二段投影后，必须还原出与上游原始 item 相同的 JSON。§3.4 的骨架由构造满足这一点：同源时第二段把 part 填回骨架，不重新序列化。测试只需钉住「填回 == 上游原样」一条。
+- 工具加载的 `additional_tools` 项放在 input 里，不改顶层 `tools`，所以续写条件（去掉 input 后的请求必须相同，`codex-websocket.ts:752-756`）不受加载影响（§7.8）。
 
 ### 7.4 跨 provider 的携带策略集中在一处
 
-`carryPolicy(block, target)` 按块返回三种结果之一：`native`、`degrade-to-text`、`drop`。同源判定读块的 `provider_meta.source`，没有时读信封的 `source`。
+`carryPolicy(block, target)` 按块返回三种结果之一：`native`、`degrade-to-text`、`drop`。同源判定只读块的 `provider_meta.source`，与 target 的来源键做相等比较（`shared/agent-protocol/reasoning-source.ts:56-62`）；缺失视为不同源。`native` 时第二段使用 `wire` 骨架，其余两种只用 part。
 
 第一版逐条编码现有规则：
 - Anthropic strict 模式下，外源签名整块丢弃；中转模式保留文本，签名置空。
@@ -925,8 +1057,9 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 
 | 类别 | 内容 | 处理 |
 |---|---|---|
-| 写入时冻结进块 | 附件提示与路径；`/bash` 等命令的模型文本；wire-safe 工具 id；turn nudge（作为 `context` 块）；broken 提醒与 loop 自造文本；ExitPlanMode 计划正文的引用形态（随 settle 冻结，现在随账本 status 变化，`strip-plan-body.ts:30-60`）；被采用的 attempt | 投影只读数据 |
-| 投影的显式输入 | target（协议、裸 model、strict、官方或中转、能力）；作者标题与用户名、system 各节、工具定义（纪元内读冻结值与变更日志，§7.7）；asset 字节是否可读 | 进 `targetFingerprint` 或 view |
+| 写入时冻结进块 | 附件提示与路径；`/bash` 等命令的模型文本；wire-safe 工具 id；上游 item 骨架；turn nudge（作为 `context` 块）；broken 提醒与 loop 自造文本；工具加载事件与前缀提醒（`context` 块）；ExitPlanMode 计划正文的引用形态（随进入 `done` 冻结，现在随账本 status 变化，`strip-plan-body.ts:30-60`）；被采用的 attempt | 投影只读数据 |
+| 写入纪元标记 | 纪元开始时的工具定义、system 各节、作者标题（§7.7） | 投影读最近一个纪元标记 |
+| 投影的显式输入 | target（协议、裸 model、strict、官方或中转、能力、工具加载策略）；asset 字节是否可读 | 进 `targetFingerprint` 或 view |
 | 投影之后的传输层 | NUG 的图片 sha256 引用与网关 ack 剥离（`nug-provider.ts:444-507`）；Codex WS 的续写判定 | 不影响投影结果的缓存 |
 
 ### 7.6 字节稳定性约定
@@ -944,21 +1077,27 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 - compact 成功。
 - 切换 provider 或模型（`targetFingerprint` 变化）。
 - 缓存肯定已冷：距上次请求的空闲时间超过该 target 的缓存有效期。例如 Anthropic 按所用的缓存档位（5 分钟或 1 小时）判断。有效期不确定的 provider 不按这条换纪元，保守处理。
+  - 「上次请求」取本叙述者可见历史中最后一个 assistant 信封的 `created_at`，不另存时间戳。
+  - 误判的代价有限：开启新纪元是「按最新数据重建」，最新数据与冻结值相同时，重建出的字节不变，缓存照样命中。
+- 已实现的工具加载只把 compact 当作边界（`tool-loading.ts` 文件头注释，`95c68304`）。另外两种边界由本节的纪元标记块补上（§7.8）。
 
 **现在会改写前缀的来源，以及纪元内的处理**
 
 | 层 | 来源 | 纪元内的处理 |
 |---|---|---|
 | 工具定义 | `/load` 加载工具 | 按模型在 catalog 里声明的策略追加，前缀不变；没有可用策略时直接改 tools[] 并开启新纪元（§7.8） |
-| 工具定义 | `/unload` 卸载工具、MCP 工具消失 | 纪元内只增不减：定义留在前缀里，追加一条提醒说明该工具已不可用，执行器拒绝调用；下个纪元再移除 |
+| 工具定义 | 绕过 `/load` 改变已加载集合：resident 模式变化、重启后预加载、知识或设置预加载 | 对账时补写一条 system 来源的 `tool_loaded` / `tool_unloaded`，按上一行处理（§7.8） |
+| 工具定义 | plan mode 把禁用工具的描述换成「已禁用」（`loop.ts:2801-2816`），现在每次切换都重新格式化 tools[] | 纪元内不改描述；plan mode 的限制由 system 段的提醒表达，执行期由权限层拦截：plan mode 下有效权限模式为 `readOnly`，Write / Edit 另有专门处理（`narrator-permission.ts:806,841`）。`readOnly` 是否覆盖 `PLAN_MODE_ALLOWED_TOOLS` 之外的全部工具待核；不覆盖的部分在执行器补一条与「未加载工具」同样的拒绝。下个纪元按当时状态重建（D27） |
+| 工具定义 | `/unload` 卸载工具、MCP 工具消失 | 纪元内只增不减：定义留在前缀里（工具表取自纪元快照，见下文「存储」），追加一条 `tool_unloaded` 说明该工具已不可用，执行器拒绝调用（未加载的 managed 工具被拒，注册表里已没有的工具返回 Unknown tool）；下个纪元再移除 |
+| 工具定义 | 纪元中途出现的新工具（新连上的 MCP、插件工具） | 对账时写一条 system 来源的 `tool_loaded`，按策略送达；策略 5 则开启新纪元 |
 | system prompt | 在线设备列表、默认设备是否可用（`narrator-prompt.ts:176-200`） | 冻结纪元开始时的文本；变化追加提醒，如「设备 X 已离线」 |
 | system prompt | AGENTS.md 等项目说明（`narrator-prompt.ts:248-262`） | 冻结；文件变化时追加提醒，说明已更新，并附新内容或差异（体积受同样的上限约束） |
 | system prompt | plan mode 开关、计划文件字节数（`narrator-prompt.ts:300-316`） | 冻结；进入或退出 plan mode、计划文件写入时追加提醒 |
 | system prompt | cwd | 冻结；cwd 变化追加提醒 |
 | 历史 | 叙述者标题、用户名（sender 标记） | 纪元内沿用旧值，**不提醒**（纯展示性变化，D17）；下个纪元生效 |
-| 历史 | Await 问答回执的改写（`question-model-input.ts:112-165`） | 按回执第一次被投影时的判断固定；后来到达的答复照常作为新内容追加 |
-| 历史 | ExitPlanMode 计划正文的引用形态 | 已在 settle 时冻结（§7.5） |
-| 历史 | 历史图片读不到、附件路径变成 unavailable | 图片按第一次投影时的结果固定（读到过就从缓存的 sha256 引用或重新读取，读不到时不再把已发送的图片改成空槽）；附件路径已在写入时冻结（§3.4） |
+| 历史 | Await 问答回执的改写（`question-model-input.ts:112-165`） | 改为只许更早的回执缩短更晚的结果（§7.2 跨块规则），天然只追加，不需要记录状态 |
+| 历史 | ExitPlanMode 计划正文的引用形态 | 已在工具进入 `done` 时冻结（§7.5） |
+| 历史 | 历史图片读不到、附件路径变成 unavailable | 附件路径已在写入时冻结（§3.4）。图片 part 带 sha256；字节被保留策略或用户删除之后读不到，投成固定的占位文本。这是存储治理的显式操作，归入「不受约束的情况」，前缀核对记一次违例 |
 | 历史 | agent 消息投递后被发送方修改（mailbox 语义编辑） | 接收方还没采纳的（`injection_consumed_at` 为空），原地改写；已经采纳的，原消息不动，追加一条「来自 X 的消息已修订为：……」（D18） |
 
 **不受约束的情况**（本来就改变前缀，接受缓存失效）
@@ -968,26 +1107,62 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 **提醒的分级**（D17）
 - 影响模型行为的变化追加提醒：设备、项目说明、plan mode、cwd、工具可用性、消息修订。
 - 纯展示性的变化不提醒，纪元内静默沿用旧值：叙述者改名、用户改昵称。
-- 提醒是 `context` 块，`subtype` 标明类别，`model_text` 简短。
-- idle 时发生的变化，随下一次运行的第一条请求发出。同一纪元内同一对象变化多次，只保留最后一条未发送的提醒。
-- 提醒带上它所属的纪元。进入新纪元后，正文已按最新数据重建，这些提醒在投影时跳过，但不删除。
+- 提醒是 `context` 块，`subtype = reminder`，`body.topic` 标明类别（如 `system:devices`），`model_text` 简短。工具可用性的变化不走 `reminder`，走 `tool_loaded` / `tool_unloaded`（§7.8）。
 
-**存储：变更日志，不逐条 pin**
+**对账：每次请求前一次，差异写成块**
+
+纪元内的「冻结值 + 已发提醒」与「当前实时值」不一致，就是要追加提醒的时候。把这件事收成一个动作：
 
 ```
-narrator_projection_overrides
-  narrator_id   text NOT NULL
-  epoch         text NOT NULL     开启纪元的事件 id（compact 标记块 id、target 变化或冷缓存的记录 id）
-  subject       text NOT NULL     例如 sender:<narratorId>、system:devices、tools
-  upto_seq      integer           此 seq 及之前的投影沿用 frozen_value；系统层与工具层为空
-  frozen_value  text NOT NULL
-  created_at    text NOT NULL
-  PRIMARY KEY (narrator_id, epoch, subject)
+reconcile(narrator, target, now):
+  if 纪元边界成立（target 变化 / 缓存肯定已冷 / 工具策略为 replace_tools 且集合变了）:
+      openEpoch(...)                    // 写纪元标记块，冻结最新值；之后不需要提醒
+  else:
+      for 每个被冻结的对象（system 各节、工具加载集合）:
+          expected = 纪元冻结值 ⊕ 纪元内已写的提醒 / 工具变更块
+          if expected != live: 写一条 reminder 或 tool 变更块
 ```
 
-- 只在变化发生时写一行；没有变化就没有行。
-- 纪元开始时冻结的 system prompt 各节与工具定义，存在纪元记录上（`narrator_projection_epochs`：叙述者、纪元 id、开始原因、冻结的 system 各节哈希与正文、工具定义哈希与列表）。
-- **fork 继承父叙述者当前的纪元与覆盖记录**，所以子叙述者第一次请求的前缀与父叙述者逐字节相同，可以命中父叙述者的缓存。
+- loop 在每次 provider 请求之前调用它，与 §7.3 的「store 写块 → 追加进 view」走同一条路，所以写下的块马上出现在这次请求里，实时与重建一致。
+- 规则「idle 时的变化随下一次运行的第一条请求发出」「同一对象变化多次只保留最后一条未发送的提醒」由此自然成立：对账只在请求前做，两次请求之间的多次变化只比较一次。
+- 比较只用哈希，没有差异时不写库，开销是每次请求几次内存比较。
+- 提醒带上它所属的纪元（标记块 id 写进 `body.epoch`）。进入新纪元后，正文已按最新数据重建，旧纪元的 `reminder` 在投影时跳过，但不删除。
+
+**存储：纪元是历史里的一个标记块**（D25）
+
+前两轮设计用两张旁表记纪元：`narrator_projection_epochs`（冻结的 system 与工具）和 `narrator_projection_overrides`（逐对象的冻结值）。改为不建旁表：
+
+- **开启纪元 = 在历史末尾写一个 `context` 块。** compact 成功时就是那个 compact 块本身；其他原因（切换 target、缓存已冷、`replace_tools`）写 subtype `epoch` 的块，所在信封 role=system，对模型不可见。
+- **块的 `payload.epoch` 存冻结值：**
+
+  ```
+  epoch: {
+    reason: "compact" | "target" | "cold" | "tools_replaced" | "manual",
+    target: string,                          // targetFingerprint
+    tools: sha256,                           // 纪元开始时的工具定义（中立形态：名称、描述、schema）
+    system: [{ key, sha256 }],               // system 各节的哈希；正文在快照表
+    senders: { [narratorId]: title }         // 纪元开始时历史中各作者的标题
+  }
+  ```
+- **工具定义与 system 正文按内容寻址存一次：**
+
+  ```
+  narrator_text_snapshots
+    sha256      text PRIMARY KEY
+    text        text NOT NULL
+    byte_size   integer NOT NULL
+    created_at  text NOT NULL
+  ```
+  纪元标记块经 `narrator_block_assets(role = 'epoch_snapshot', asset_id = sha256)` 引用它。内容不变的纪元（最常见的是「缓存已冷」）不新增快照行；回收按 `asset_id` 判断有没有引用，与上传文件同一套。
+- **工具表取自快照。** 纪元内 tools[] 由快照里的定义按 target 格式化，再加上 §7.8 的占位与 deferred 尾部；注册表、MCP、描述文案的变化都不会改动它。纪元内的一切增减都是追加的 `tool_loaded` / `tool_unloaded` 块。
+  - 已实现的版本不存基线，而是从当前集合沿可见历史倒推（§7.8）。块存储下倒推保留两个用途：没有 `payload.epoch` 的旧 compact 标记（回填前的数据）用它算基线；有快照时用它做一致性检查，不一致记前缀违例。
+  - 前两轮考虑过只靠倒推、不存快照。倒推依赖「当前集合」与「managed 集合」都只经由提示行变化，而 resident 模式、预加载、能力天花板、MCP 都会绕过提示行；system 正文更是无法从历史倒推。
+- **作者标题**：纪元内，`senders` 里有的作者用冻结值；纪元内第一次出现的作者用它第一个信封写入时的标题。两者都不随改名变化，换纪元时重取（D14）。
+
+这样做的好处：
+- **fork 不需要额外动作。** 纪元标记块就在历史里，fork 复制 ref 时一起带上，子叙述者第一次请求的前缀与父叙述者逐字节相同，可以命中父叙述者的缓存。前两轮的旁表要在 fork、惰性 fork、提取时各复制一遍。
+- **compact 与纪元是同一个概念的两种来源**，读取时都是「最近一个开启纪元的块」，一次部分索引查询（`(subtype) WHERE kind = 'context'`）。
+- **删除、回滚自动正确。** 回滚到纪元开始之前，纪元标记块随之被删，投影退回到更早的纪元或按最新数据重建，不会留下指向不存在位置的旁表行。
 
 **前缀核对**
 - 每次请求记录各段投影字节的哈希：工具定义、system 各节、每个信封。
@@ -1003,7 +1178,7 @@ narrator_projection_overrides
 
 `/load` 在纪元内加载工具时，按模型声明的能力与当前线上协议选一种策略（D20）。
 
-> 这部分已先于块存储重构，在现有消息结构上实现：纪元边界取最近一次 compact，加载事件来自现有的 `tool_loaded` / `tool_unloaded` 提示行。实现与线上字段见 `docs/AGENT_PROVIDERS.md`「会话中加载工具时保持缓存前缀」。块存储落地后，提示行改为本节所述的 `context` 块。
+> 这部分已先于块存储重构，在现有消息结构上实现（`95c68304`，主文件 `server/lib/agent/tool-loading.ts`）：纪元边界取最近一次 compact，加载事件来自现有的 `tool_loaded` / `tool_unloaded` 提示行。实现与线上字段见 `docs/AGENT_PROVIDERS.md`「会话中加载工具时保持缓存前缀」。块存储怎样接住这份实现，见本节末尾「从已实现形态到块」。
 
 | # | 策略 id | 做法 | 适用 | 参考实现 | 前缀 |
 |---|---|---|---|---|---|
@@ -1027,6 +1202,8 @@ narrator_projection_overrides
 | 其他 | `custom_injection` |
 
 - 匹配用去掉 provider 前缀之后的裸模型名，例如 `nug:claude-…` 按 `claude-…` 判断。去前缀的规则与 strict 判定共用同一个函数（§7.4）。
+- 实现在名称默认值上加了文档记载的版本下限：Claude 要求 Opus 4.8+、Sonnet / Haiku 5.5+ 或 Fable / Mythos；GPT 在 OpenAI API 上要求 5.4+，Codex 后端要求 5.6+；版本号解析不出时照常启用（`tool-loading.ts:82-123`）。低于下限的模型得到空列表，即策略 5。
+- 网关按路由后的模型名匹配：NUG 的 `toolLoadingTarget` 报告渠道协议与 `routedModel`（`nug-provider.ts:383-399`）；TokenDance 转给按协议选出的委托（`tokendance-provider.ts:282-284`）。插件 provider 不报告协议（`remote-provider-adapter.ts` 没有 `toolLoadingTarget`），一律策略 5。
 - 优先级：用户配置 > catalog 显式声明（模型卡元数据键，暂名 `tool_loading_modes`，按优先级排列，可多种）> 按名称的默认值。
 - 用户可以按模型禁用其中的某种方案，也可以整体关闭；禁用后只剩策略 5。配置走 catalog 现有的本地覆盖机制（`shared/model-catalog/card.ts` 的 `metadata` 与 provenance）。
 
@@ -1037,17 +1214,97 @@ narrator_projection_overrides
 - 同一个模型经不同通道（例如 NUG 的 anthropic 通道与 responses 通道）可能走不同协议，所以选择发生在投影时，按当时的 target 判断，而不是在加载时写死。
 
 **存储与投影**
-- 一次加载写一条 `context` 块，`subtype` 为 `tool_addition`，`payload` 存工具定义与加载时选定的策略。
-- 第二段投影按策略把它变成线上形态：追加的工具块、tools[] 末尾的 deferred 定义、Responses 的追加项，或注入的 schema 文本。这样它和别的历史一样只追加，前缀核对照常生效。
-- 占位工具属于纪元开始时冻结的工具定义（§7.7），只在模型声明了策略 1 或 2 时放入。
-- 卸载仍按 §7.7：纪元内定义不撤，追加提醒，执行器拒绝调用。
+- 一次加载写一条 `context` 块，subtype `tool_loaded`；一次卸载写 subtype `tool_unloaded`。沿用现有提示行的名字，解码一对一。
+  - `body = { toolNames: string[], label: string, definitions?: NeutralToolDefinition[] }`：`toolNames` 是这次实际变化的注册表工具名；`label` 是给人看的名字（可能是例程 id）；`definitions` 只在加载时有，是写入时的中立定义（名称、描述、schema）。
+  - `model_text` 是提示原文，写入时冻结。
+  - **存定义，不存策略。** 定义写入时冻结，与纪元快照里的工具同等对待，所以纪元内即使跨了一次发布，已发送的定义字节也不变。策略是 target 的属性，在投影时选（上面「选择规则」）；纪元内 target 不变，所以策略也不变。前两轮写的「payload 存工具定义与加载时选定的策略」与「选择发生在投影时」自相矛盾，以后者为准。
+  - 已实现的版本在投影时从注册表解析定义，并且只接受静态描述的工具（`resolveLoadableToolDefinition`，`tool-loading.ts:171-176`）；现有 `OPTIONAL_TOOLS` 都是静态描述（`grep` 核对：动态描述只出现在 Bash、ExitPlanMode、SwitchWorkingDirectory 等核心工具）。块存储下改为写入时冻结，这条限制随之只作用于写入那一刻。
+- 写入走 `changeTools`：改 `narrators.enabledTools` 与写块在同一事务。现在两者分开写，ref 还单独开事务追加（`narrator-persistence.ts:654-667`）。
+- **第一段**为每个 `tool_loaded` / `tool_unloaded` 块产出两样东西：提示文本，以及一个中立的工具变更项 `{additions: [{name, definition?}], removals: [name]}`。按策略：
+  - 策略 1：additions 带定义；removals 照发。
+  - 策略 2：additions 只带名字，定义进本次请求工具表的 `deferredTail`。removals 不发：deepseek-harness 给 DeepSeek 声明的是只认加载的 `addition-only`。`cf036d13` 已按此实现。
+  - 策略 3：additions 带定义；每个工具每纪元只声明一次；removals 不发，靠提示文本。
+  - 策略 4：不产出变更项，把 schema 文本拼到提示文本后面；每个工具每纪元只拼一次。
+  - 策略 5：不产出变更项；工具表直接跟随当前集合，并开启新纪元。
+- **第二段**只放置：
+  - Anthropic：本组 user 消息之后紧跟一条 `role: "system"` 消息，内容是 `tool_removal` / `tool_addition` 块，可以与同组的中途 system 文本合在一条里；请求头带策略对应的 beta。位置天然满足「紧跟 user、后面是 assistant 或末尾」。
+  - Responses：提示文本那条 user 项之前插入一项 `additional_tools`。
+- **工具表**也在第一段算出：`active`（纪元快照里的工具，顺序同快照）、`deferredTail`（策略 2：纪元内加载过的工具，按首次加载顺序）、`placeholder`（策略 1、2，且 `active` 非空）。三者都只随追加的块增长，所以纪元内已发送的字节不变。
+- 卸载按 §7.7：纪元内定义不撤，执行器拒绝调用未加载的 managed 工具（`tool-executor.ts:891-899`）。
 
 **换纪元：完全重新构建**
-- 新纪元开始时，工具定义按当时已加载的全部工具重新生成，直接放进 tools[]。
-- 之前的 `tool_addition` 块与卸载提醒都是旧纪元的事件，投影时跳过。
+- 新纪元开始时，工具表按当时已加载的全部工具重新生成，直接放进 tools[]。
+- 旧纪元里的 `tool_loaded` / `tool_unloaded` 块在新纪元只投提示文本，不再产出变更项或 schema 文本。提示文本保留，因为它记录的是用户真的执行过的命令；它与工具表一致，不会误导模型。
 - 策略 5 改了 tools[]，本身就是一次失效，所以同时开启新纪元，按上述方式完全重建。
 
 **切换模型或 provider**：本来就开启新纪元（D16），新 target 不需要兼容旧策略的线上形态。
+
+**从已实现形态到块**
+
+| 已实现（`95c68304`） | 块存储下 | 变化 |
+|---|---|---|
+| 提示行 `contentJson[0] = {type, toolName, toolNames, text}`（`narrator-service.ts:540-545,619-624`） | `context/tool_loaded`、`tool_unloaded`，`body.toolNames`、`body.label`、`model_text` | 解码一对一（§10.2） |
+| 旧提示行没有 `toolNames`，读时按例程展开（`tool-loading.ts:202-208`） | 回填作业在服务端展开一次，写进 `body.toolNames` | 解码保持纯函数，不依赖运行期注册表 |
+| `deriveToolLoadingState`：从当前集合沿可见历史倒推纪元基线（`tool-loading.ts:231-252`） | 基线取自纪元快照（§7.7）；倒推只用于没有快照的旧 compact 标记，以及一致性检查。窗口从「最近一次 compact 之后」改为「最近一个开启纪元的块之后」 | 补上 target 切换与缓存已冷两种边界 |
+| 基线可能漂移：resident、预加载等没有提示行的变化会让倒推结果在纪元中途改变，tools[] 随之改变 | 对账（§7.7）把每次漂移补写成一个 system 来源的 `tool_loaded` / `tool_unloaded`；tools[] 只取快照 | 漂移变成追加，前缀不变 |
+| 定义在投影时从注册表解析（`tool-loading.ts:171-176`） | 写入时冻结进 `body.definitions` | 跨发布也不改已发送字节 |
+| `managed` 只含可选工具（`orchestrator.ts:924-943`） | 快照覆盖全部工具；MCP、插件工具的增减同样走工具变更块 | D15 的工具层完整覆盖 |
+| `ToolLoadingChange` 经 `WeakMap` 挂在投影出的行对象旁（`tool-loading.ts:346-361`），构造器用 `toolLoadingChangeOf` 读 | 第一段产出的中立变更项，是 `NeutralTurn` 的一等成员 | 旁路通道消失 |
+| 构造器弹出当前轮时单独保留它的变更（`anthropic-provider.ts:3171-3176`；`openai-provider.ts:4109-4114`） | 不再弹出当前轮（§7.3） | 特例消失 |
+| `custom_injection` 在 `buildRuntimeHistory` 里改写提示行文本（`agent-runtime/history.ts:240-247`） | 第一段拼接 | 与其他策略同一处处理 |
+| 策略在每次组装时按适配器解析（`tool-loading.ts:153-164`） | `ProjectionTarget` 的一个字段，进 `targetFingerprint` | 策略变化即 target 变化，开启新纪元 |
+| 占位工具与 deferred 尾部在 `formatRequestTools` 里拼接（`tool-loading.ts:315-336`） | 第一段给出 `{active, deferredTail, placeholder}`，第二段格式化 | — |
+| 执行器拒绝未加载的 managed 工具（`tool-executor.ts:891-899`） | 不变 | — |
+
+迁移时这部分不需要单独的数据迁移：现有提示行由通用解码与回填转换；P0 把上表的投影逻辑挪进两段投影时，用已有的 `tool-loading.test.ts`、`loop-tool-loading.test.ts` 做字节等价测试。
+
+### 7.9 逐协议投影
+
+§7.2 的表给出结构怎样映射。本节逐个协议核对其余维度：凭据回放、图片、provider 执行的工具、工具 id 与配对、对话中途的 system、缓存、工具加载，以及哪些内容被降级或丢弃。「现状」列标出本设计要修正的偏差；没有标的格子与现状一致。
+
+**A. 内容**
+
+| 协议 / 通道 | 凭据回放（同源才用 `wire`） | 用户图片 | 工具结果图片 | provider 执行的工具 | 工具 id 与配对 |
+|---|---|---|---|---|---|
+| Anthropic 官方 | strict（Claude）：thinking 同源回放，否则整块丢弃，不存在无签名的 thinking（`shared/agent-protocol/reasoning-source.ts:44-50`）；redacted 只在同源时回放 | image block，按占位符就位 | 放进 tool_result 的 content | web_search 投成 user 文本 `[Web search: q]`（`anthropic-provider.ts:3209`）；image_generation 跳过 | `tool_use.id = wire_id`；tool_result 在下一条 user 消息最前面，按 ordinal |
+| Anthropic 中转（relay、NUG anthropic 渠道、TokenDance / CommandCode 的 messages 委托、DeepSeek 的 Anthropic 端点） | 来源键带渠道（`nug:<channel>:…`、`tokendance:<protocol>`，`tokendance-provider.ts:245-262`）；非 Claude 模型不 strict，外源推理保留文本、签名置空 | 同上 | 同上 | 同上 | 同上 |
+| Responses（OpenAI HTTP） | strict（gpt / o 系列）：同源时 reasoning item 原样回放（含 `encrypted_content`），否则降级为文本或丢弃；message 与 function_call 的 item id 只在同源时带（现状：不查来源，附录 B 第 13 条） | `input_image` | 紧随其后的 user `input_image`（`openai-provider.ts:3596-3616`）；协议已允许 output 数组带图，第二段可按能力改用 | `web_search_call`、`image_generation_call` 原样回放（`openai-provider.ts:3959-4010`）；生成图片的字节在 worker 预取（现状：主线程读盘） | `call_id = wire_id`（≤64 字符，wire-safe 规则在写入时执行） |
+| Codex HTTP | 同上，来源键 `codex` | 同上 | 同上 | 同上，原生工具追加在函数工具之后 | 同上 |
+| Codex WS | 同上；骨架逐字节还原是续写的前提（§7.3） | 同上 | 同上 | 同上 | 同上 |
+| Chat Completions（含 DeepSeek / GLM / Kimi 等思考中转） | 无凭据。非 strict 时推理作 `reasoning_content` 回放；思考中转要求每条 assistant 都带该字段，空推理补 `""`（`openai-provider.ts:472-480`） | `image_url` part（现状：历史图片全丢，附录 B 第 27 条） | 紧随其后的 user 消息（现状：丢弃） | web_search 投成 user 文本（`openai-provider.ts:4246-4259`）；image_generation 跳过 | `tool_calls[].id = wire_id`；role=tool 消息按 ordinal |
+| Gemini generateContent | thought part 的文本总回放，`thoughtSignature` 只在同源时带；普通 text part 的签名也进骨架（现状：解析时丢弃，附录 B 第 28 条） | `inlineData`（现状：历史图片丢失） | Gemini 3 放进 functionResponse 的 parts，旧模型放进随后的 user content，由能力位决定 | 跳过 | 现状 functionResponse 不带 id，按名称加顺序配对（`gemini-provider.ts:653-662`）；块存储下顺序由 ordinal 保证；上游给了 `functionCall.id` 时存进骨架并原样回带（现状：一律本地生成 id，`gemini-provider.ts:948-950`） |
+| Gemini Interactions | thought step 的签名同源才带；工具调用的签名用前置 thought step 表达，没有 reasoning 块时由 tool 骨架合成（`gemini-interactions-provider.ts:428-445`）；model_output 的 step id 同源才带（现状：不存） | `user_input` 里的图片（现状：重建丢失） | function_result 非错误时可带图 | 跳过 | `call_id = wire_id`（`gemini-interactions-provider.ts:772-773`） |
+| 插件 / 远程 provider | 只回放同源的 `continuation`（`remote-provider-adapter.ts:373-423,1289-1300`） | DTO 的通用 block（`plugin-provider-rpc.ts:350-359`）；现状：只有 imageId 的块被丢弃 | 同左 | 跳过 | 由插件定义；现状：不看账本状态，未完成的调用也发出（附录 B 第 32 条），块存储下只发 `done` 的 tool 块 |
+
+**B. 请求级**
+
+| 协议 / 通道 | sys 项（`context` 的 role=sys 信封） | 缓存 | 工具加载默认 | 引用 citations |
+|---|---|---|---|---|
+| Anthropic 官方 | 模型支持时投成对话中途的 `role: "system"`（`anthropic-provider.ts:1635`），否则并入 user | system 三块：首块是由首条 user 文本派生的计费头（`anthropic-provider.ts:269-272`，纪元内首条不变，所以稳定），第二、三块带断点；末条消息末块一个断点 | 策略 1（Claude 新版本） | text 块的 `citations` 在骨架里，同源原样回放 |
+| Anthropic 中转 | 并入 user；带工具变更的 system 消息不降级 | 不加 `cache_control` | 策略 1（Claude）、2（DeepSeek）、其余 4 | 同上 |
+| Responses / Codex HTTP | role=sys 投成 user `input_text`；system 与 developer 汇入 `instructions` | `prompt_cache_key = conversationId`（`codex-request.ts:78`） | 策略 3（GPT 新版本） | `annotations` 在骨架里 |
+| Codex WS | 同上 | 去掉 input 后请求相同、且 input 是上次 input 加上游 item 的逐项前缀，才发增量（`codex-websocket.ts:741-773`） | 策略 3；`additional_tools` 在 input 里，不破坏续写 | 同上 |
+| Chat Completions | 并入 user | 由上游隐式前缀缓存 | 策略 4（GPT 名称会选 3，但协议不相容，落到 5） | 纯文本 |
+| Gemini generateContent | 并入 user content | 无显式缓存 | 策略 4 | 纯文本 |
+| Gemini Interactions | 并入 user_input | 无 | 策略 4 | 纯文本 |
+| 插件 | 由 DTO 的 role 表达 | 由插件决定 | 策略 5（不报告协议） | 纯文本 |
+
+**几条贯穿规则**
+- **同源才用骨架。** `carryPolicy` 返回 `native` 时第二段把 part 填回 `wire`；其余情况只用 part。外源骨架里的字段（item id、step id、签名、annotations）一律不出现在请求里。
+- **图片的放置由能力位决定。** 第一段只给出「这个结果带这些图片」；第二段按 target 的能力选 tool_result 内、output 数组、随后的 user 消息三处之一。能力位进 `targetFingerprint`，所以能力变化等同于换纪元。
+- **工具 id 只在写入时处理一次。** 任何协议都直接用 `wire_id`；Responses 的 64 字符限制、DeepSeek 一类重复 id（`call_go_0`）都在写入时解决。
+- **并行调用。** 一步内多个 tool 块按 ordinal 排列，结果按同一顺序投放；并行组只是 `state.execGroup` 上的展示信息，不影响投影。
+
+**当前设计表达不了、或需要后续补的情况**
+
+| 情况 | 现状 | 处理 |
+|---|---|---|
+| Anthropic 服务端 compaction（`compaction` 块经 `tool_changes` 回传区间内的工具变更） | 未使用 | 若采用，需要一个 assistant 侧的新块种类或 output 骨架约定，届时另议 |
+| Anthropic `pause_turn`（服务端工具未完成的暂停轮）之后不能紧跟 `tool_addition` | 主请求不声明服务端工具，不会出现 | 若将来在主请求声明服务端工具，第二段需检查这条位置约束 |
+| Responses 的 `tool_search_call` / `tool_search_output` 加载方式 | 未实现，策略 3 只用 `additional_tools` | 可表达为一个 `executor = "provider"` 之外的第三种工具执行者；不在本轮范围 |
+| 音频等 image / file 之外的多模态 part | 没有写入点 | part 类型可扩展；新增时按「能力位 + 第二段放置」同一规则 |
+| 用户输入里的 `document` / `attachment` 块 | 附录 A 标「待核」 | 解码时用真实数据确认后归入 `file` 或新增 part |
+| Responses message 的 `refusal` content | 骨架原样保留；文本进 part（`segment = "refusal"`） | 跨源降级时按普通文本处理 |
 
 ## 8. 前端与传输
 
@@ -1101,7 +1358,7 @@ narrator_projection_overrides
 | 模型历史加载与各 provider builder | `content_json` + 账本；各 builder 自行解析 | 规范视图 + 两段投影（§7） | P0 改为吃规范块；P2 切换到块表 |
 | 展示页 worker / WS / catch-up | 整数组读取、按字节预检、`enrichToolUseBlocks` | 按块读取、按块计字节；过渡期仍组装数组 | P1–P2 |
 | FTS / 搜索 / Recall | `content_text` | 保留信封级 `content_text`（集中派生）；块级 FTS 可选 | P1；块级 FTS 在 P3 |
-| compact / 段压缩 | `$[0]`、生成列、JSON CAS、哨兵字符串查询 | `marker` 块 + `phase` + `state` | P1 |
+| compact / 段压缩 | `$[0]`、生成列、JSON CAS、哨兵字符串查询 | `context` 块（subtype `compact` / `segment_compact`）+ `phase` + `state` | P1 |
 | 文件回退 / 块删除 / 回滚到块 | 原始字节、摘要 + 出现序号身份、下标 | 块 id + `revision`；`RewriteWorker` 不再解析 JSON 片段 | P2 |
 | 编辑与恢复 | 整数组快照 `original_content_json` | 块的 `original_payload`；publication 读 `COALESCE(original_payload, payload)` | P1 |
 | merge summary / 孤儿上传回收 | `LIKE` 全表扫描 | 按 `subtype` / kind 查部分索引 | P2 |
@@ -1130,16 +1387,17 @@ narrator_projection_overrides
 | user 输入 `[image…, text_file…, file_reference…, text]`、命令类 `[file_reference…, text]` | 一个 `input` 块，part 按原顺序排列；`model_text = content_text`，即冻结现有的附件提示，旧行投影出的字节不变 |
 | 子代理收到的消息里，无 `modelText` 的 system_injection | 并入信封作者；块仍是 `input` |
 | `bash_command` | `input`，`model_text = content_text`（现在就是经 `content_text` 回退对模型可见的） |
-| origin 为 system 的 user `[text]`（自动续跑、批准反馈、审查检查）、`tool_loaded`、`tool_unloaded` | `context`，`model_text = content_text` |
+| origin 为 system 的 user `[text]`（自动续跑、批准反馈、审查检查） | `context`，`model_text = content_text` |
+| `tool_loaded`、`tool_unloaded` | `context`，subtype 同名；`model_text = content_text`；`body.toolNames` 取块里的 `toolNames`，没有时由回填作业按例程展开后写入（§7.8），`body.label` 取 `toolName` |
 | review `[text, review_feedback]` | 一个 `context` 块：`model_text` 取 text，卡片进 `body`，`applied` 进 `state` |
 | 注入及其伴随块、旧格式 `[text, system_injection]`、sys 的原生卡片与纯 text | 一个 `context` 块；配对规则沿用 `injectionBlockViews` / `contextBlockViews` |
-| `$[0]` 的 compact 块、计划、清空上下文 | `marker`。status 映射为 phase；attempts、mode、error 放进 `state` |
-| `segment_compact` | `marker`；已完成的取 `model_text = content_text` |
-| `file_history_checkpoint` | `marker` |
-| error、info、spec 卡片、恢复卡、ask_in_passing、发布结果 | `notice` |
-| assistant `text` | `output`，一块对一块。旧数据没有 item 分组，第二段对没有 item id 的相邻 output 沿用现在「合成一个 message item」的做法 |
-| `reasoning`、旧 `thinking`、`redacted_thinking` | `reasoning`。签名、`providerMetadata`、`signatureSource` 并入 `provider_meta`。旧数据的 summary 分段已不可恢复，当作单段 |
-| `tool_use` + 账本 | `tool`：被采用的 attempt 取最新一次；终态 → `settled`，非终态 → `called`；`thoughtSignature` 并入 `provider_meta.call`。`/bash` 行里那个只给显示用的 `tool_result` 块丢弃 |
+| `$[0]` 的 compact 块、计划、清空上下文 | `context`，subtype `compact` / `plan` / `clear_context`。status 映射为 phase；attempts、mode、error 放进 `state`；没有 `payload.epoch`，读取时按「旧纪元标记」处理（工具基线倒推，system 取当前值） |
+| `segment_compact` | `context/segment_compact`；已完成的取 `model_text = content_text` |
+| `file_history_checkpoint` | `context/file_history_checkpoint` |
+| error、info、spec 卡片、恢复卡、ask_in_passing、发布结果 | `context`，subtype 同名，没有 `model_text` |
+| assistant `text` | `output`，一块对一块。旧数据没有 item 分组，第二段对没有骨架的相邻 output 沿用现在「合成一个 message item」的做法。文本里遗留的 `citeturn…` 标记在这里清掉（规则沿用 `shared/citations.ts` 的 `cleanAssistantText`），投影不再处理 |
+| `reasoning`、旧 `thinking`、`redacted_thinking` | `reasoning`。`signatureSource` 成为 `provider_meta.source`（没有时取信封的 `provider` 列，按 §7.4 只会判为不同源）；签名、`providerMetadata` 按 §3.4 的形状拼成 `wire` 骨架。旧数据的 summary 分段已不可恢复，当作单段 |
+| `tool_use` + 账本 | `tool`：被采用的 attempt 取最新一次；终态 → `done`，非终态 → `open`；工具名进 `subtype`；`thoughtSignature`（含账本 `input_json` 里的保留键）并入 `provider_meta.wire`。`/bash` 行里那个只给显示用的 `tool_result` 块丢弃 |
 | `web_search`、`image_generation` | `tool`，`executor = "provider"` |
 | 没有对应块的账本行 | 内部执行（`internal_read_` 前缀）标为 internal，不投影；只有账本的旧数据按现在的向后兼容路径合成 `tool` 块，保持旧行投影出的字节不变 |
 | `completed:false` | `aborted` |
@@ -1160,9 +1418,10 @@ narrator_projection_overrides
 | 方面 | 规则 |
 |---|---|
 | 进度 | 持久游标行，记录 `cursor` 和 `complete`。SQLite 按 `narrator_messages.rowid` 推进，PG 按 `(created_at, id)` |
-| 单片 | 每片不超过 1 秒或 100 个信封 |
-| 解码位置 | 在只读 db-worker 中解码（`lib/db-worker/pool.ts`） |
-| 写入 | 回到主线程，用一个短的同步事务写入，带 `WHERE body_format = 1` 守卫：幂等，且能与同时发生的物化安全并发 |
+| 单片 | 每片不超过 100 个信封、4 MiB 源字节、1 秒，先到先停 |
+| 解码位置 | 在只读 db-worker 中读 `content_json` 并解码（`lib/db-worker/pool.ts`），主线程不碰正文 |
+| 写入 | 回到主线程，每片一个短的同步事务：插入块与 asset 行，写 `body_bytes`，最后把 `body_format` 改为 2。带 `WHERE body_format = 1` 守卫：幂等，且能与同时发生的物化安全并发。目标每个事务 50ms 以内，超过记慢操作日志并把下一片减半 |
+| 不触发的东西 | 块插入时信封仍是 `body_format = 1`，块触发器不生效（§4.5），所以回填不 bump `body_revision` / `model_history_revision`，源缓存不失效；`content_text`、`context_chars_json` 原样保留，不触发 FTS。回填只改存储形态，不改任何投影字节 |
 | 节奏 | 片与片之间 `setTimeout(0)`；由定时器重入；重启后从游标继续 |
 | 校验 | 对 P1 双写期间产生的 `body_format = 2` 信封，比对「块组装出的数组」与 `content_json`，不一致的写入诊断表。双写一致性因此有了持续的证据 |
 | 进度展示 | 在存储页显示进度，可以暂停 |
@@ -1205,13 +1464,14 @@ narrator_projection_overrides
 4. 先在现有表里落库原来只在内存里的模型可见内容：
    - loop 自造的文本写成 sys 行；
    - 工具结果图片与附言写进账本行的输出结构。
-5. 修正现存偏差，见附录 B 第 1–4、21、27 条：
+5. 已实现的工具加载（§7.8 末尾的对照表）并入两段投影：变更项成为中立结构，`WeakMap` 旁路与当前轮特例删除；以现有 `tool-loading.test.ts`、`loop-tool-loading.test.ts` 做字节等价测试。
+6. 修正现存偏差，见附录 B 第 1–4、21、27 条：
    - 重建时按调用顺序排列工具结果；
    - strict 只由裸 model 名计算一次；
    - 各 provider 的用户图片与工具结果图片按同一规则放置；
    - 段压缩标记的 origin；
    - 内部执行不进模型历史。
-6. 测试网：
+7. 测试网：
    - 每种 provider 模式都有「重建 == 实时」等价测试，覆盖 loop 实际使用的 `orderedContent` 路径；
    - 测试多工具结果顺序、broken 调用、mid-pass 注入、当前轮合并；
    - 新旧实现对真实会话的请求做字节 diff：开启 `requestEvidence.autoPin`，比对录制。
@@ -1226,7 +1486,8 @@ narrator_projection_overrides
 **交付**
 1. schema：
    - 新建 `narrator_blocks`、`narrator_block_assets`；
-   - `narrator_messages` 新增 `body_format`、`turn_id`、`step_index`、`author_narrator_id`、`cause_block_id`、`provider_response_id`；
+   - `narrator_messages` 新增 `body_format`、`turn_id`、`author_narrator_id`、`cause_block_id`、`provider_response_id`、`body_bytes`；
+   - `narrator_text_snapshots`（纪元的工具定义与 system 快照，§7.7）；
    - `narrator_tool_calls` 新增 `block_id` 与内部执行标记。
 2. v2 触发器契约：生成器支持，SQLite 与 PG 各一份。
 3. FTS 触发器加列过滤，并带版本号。
@@ -1235,6 +1496,7 @@ narrator_projection_overrides
 6. tool 块合并调用与结果，采用两段生命周期（§3.5、§3.7）；`state` 写入（§5.4）；`phase` 统一。
 7. 只保留一个 COW 实现；作者与属主分开。
 8. 前端先切换身份：把 `blockId` 作为 key 和 API 寻址，操作目标按 §5.5；删除流式交接的启发式。
+9. 纪元标记块与请求前对账（§7.7）：compact 成功写 `payload.epoch`，target 切换与缓存已冷写 `epoch` 块；工具表改为取自纪元快照，已实现的倒推降为兜底。
 
 **退出条件**
 - 新会话全部是原生块；关闭开关能回到现状。
@@ -1307,9 +1569,60 @@ narrator_projection_overrides
 - `aborted` 块的重放规则（§3.5）；
 - turn nudge 从工具结果里移出，改为该步工具结果之后的一条独立文本（D12）；
 - 纪元内不再改写已发送的前缀（工具、system prompt、历史）：影响行为的变化改为追加提醒，改名等展示性变化延到下个纪元生效；已被采纳的 agent 消息修订改为追加通知（§7.7）；
-- 跨越投影切换的那次发布，会有一次 prompt cache 未命中（§7.6）。
+- 跨越投影切换的那次发布，会有一次 prompt cache 未命中（§7.6）；
+- Await 回执只许更早的回执缩短更晚的工具结果（§7.2）；
+- 纪元内 plan mode 不再改写工具描述（§7.7）；
+- 编辑过的 assistant 文本按纯文本回放，不再带上游 item id 与 annotations（§5.5）；
+- Gemini 上游给出的 `functionCall.id` 原样回带（§7.9）。
 
 「轮」的定义一旦落库就很难再改，因此 D3 必须在 P1 之前定下来。
+
+### 12.7 效率预算
+
+**流式写入：一步的写入次数**
+
+设一步有 N 个 item、K 个工具调用、C 次 checkpoint、H 个持有者（流式中 H = 1）。
+
+| 动作 | 现在 | 块存储 |
+|---|---|---|
+| 每次 checkpoint | 读整列 + 写整列 + 重算 `content_text` / `context_chars_json`；FTS 删插；`model_history` 触发器（其嵌套 UPDATE 再触发一次 FTS）；H 行叙述者 UPDATE；context stats upsert；广播整条消息（§1.3 G） | 一行块 UPDATE（`payload`、`revision`），无触发器；广播 `block_checkpoint` |
+| 每个 item 封闭 | 同上（也是一次 checkpoint） | 一行块 UPDATE + 一次 revision 触发（1 行信封 + H 行叙述者） |
+| 每个工具 | 块与账本分两步写；settle 写账本 | `callTool` 2 行 INSERT；`settleTool` 2 行 UPDATE + 一次 revision 触发 + 一次派生 |
+| 封口 | 再一次 COW 写 `completed:true`（`narrator-output-recovery.ts:46-63`） | 一行信封 UPDATE（用量与派生），FTS 重建一次，context stats 一次 |
+| 合计 | O(C) 次整列重写与四组触发器，FTS 约 2C 次 | C 次单行小写；revision 触发 N + K 次；FTS 1 + K 次 |
+
+单次 checkpoint 的字节量从「整条消息」降到「这一块」。超过 256 KiB 的块限频（§4.1），所以最坏情况受 `块大小 × 每 2 秒一次` 约束。
+
+**模型历史读取：每批三次有界查询**
+
+每批最多 200 个 ref（`MODEL_HISTORY_REF_BATCH`，`agent-runtime/model-history-query.ts:4`），全部在只读 worker 里执行：
+
+1. refs JOIN 信封元数据：取 seq、role、作者、`body_format`、`body_bytes`。按 `body_bytes` 把 ref 切成不超过 4 MiB 的子批。现在这一步要对每行算 `length(CAST(content_json AS BLOB))`（`model-history-query.ts:122-127`），会读到正文。
+2. 块：`WHERE message_id IN (…) AND phase <> 'open' ORDER BY message_id, ordinal`，走 `UNIQUE (message_id, ordinal)`。
+3. 被采用的账本行：`WHERE id IN (result.toolCallId …)`，主键查找，按 `output_json` 长度切批。不再分页扫描整个信封的全部 attempt 再推导最新一次。
+
+另加一次纪元查询：最近一个开启纪元的块（`(subtype) WHERE kind = 'context'` 部分索引 + refs 的 seq），以及它引用的 system 快照（主键）。总预算沿用 128 MiB / 10 秒（`model-history-query.ts:6,101-108`）。
+
+**主线程规则对照**（CLAUDE.md「后端主线程性能规则」）
+
+| 规则 | 本设计 |
+|---|---|
+| 主线程 SQLite 只做小、快、有索引、有限制的 CRUD | store 的每个方法只碰一个信封的块；共享判定是一次部分索引探测；对账没有差异时不写库 |
+| 禁止无上限 `.all()` | 块查询总带 `message_id IN (≤200)`；启动恢复按部分索引分页（每页 100，沿用 `COMPACT_RECOVERY_PAGE_SIZE`，`narrator-persistence.ts:745`） |
+| 列表 API 不读大字段 | 页面 API 不选 `provider_meta`、`original_payload`；需要「有没有加密推理」时只判 `provider_meta IS NOT NULL`（推测：SQLite 只看记录头的类型码即可判 NULL，P1 用 `EXPLAIN` 与基准确认；否则加一个派生的整数标志列） |
+| 分页用游标 + `LIMIT n+1` | 页面 API 仍按 refs.seq 游标，块随信封批量取 |
+| 大工作放 worker | 解码、回填读正文、asset 预取、投影都在 worker；主线程只做每片一个短事务 |
+
+**FTS**
+- 索引仍只建在 `narrator_messages.content_text` 上，形态不变，现有搜索不受影响。
+- 更新次数从每次 checkpoint 一次（触发器不限定列时还要更多）降到每步 1 + K 次。
+- 回填不改 `content_text`，零 FTS 写入（§10.3）。
+- 块级 FTS（D6）若在 P3 启用，作为独立的外部内容表，由块封闭时写入；不影响信封级索引。
+
+**迁移成本**
+- 存储：每块固定开销 150–250 字节（§12.1）；双写期正文约占两份。
+- 回填：每片不超过 100 个信封、4 MiB、1 秒，主线程每片一个短事务。以 100 万个信封、每片 50ms 主线程时间粗估，主线程累计约 8 分钟，分散在片与片之间（推测，需在生产库副本上测）。
+- 回填不 bump revision、不失效源缓存、不改 FTS，所以运行中的会话感知不到它。
 
 ## 13. 验收矩阵
 
@@ -1322,19 +1635,22 @@ narrator_projection_overrides
 | assistant 编辑 | 只改被点的 output 块，其他块的 id、位置、revision 不变；恢复不影响其他块 | 单测 |
 | 流式 | 块 id 从 `block_opened` 到落库不变；没有合成消息；重连后不重复、不回退 | 前端集成测试 |
 | 丢弃 attempt | 只删除该 attempt 的 item 块；已执行的 tool 块保留，并投影为更早的独立一轮 | 单测 |
-| 中断与冷启动 | open 的块改为 `aborted` 或 `failed`；`called` 的 tool 不动；按 §3.5 重放 | 单测 + 重启恢复测试 |
-| fork | 含 open 或 called 块的信封不共享；惰性 fork 之后，父叙述者修改旧消息会走 COW | 单测 |
+| 中断与冷启动 | `open` 的 output / reasoning 改为 `aborted`，控制标记改为 `failed`；tool 不动；按 §3.5 重放 | 单测 + 重启恢复测试 |
+| fork | 含 `open` 块的信封不共享；惰性 fork 之后，父叙述者修改旧消息会走 COW | 单测 |
+| 约束 | §4.1 的每条 CHECK 都有一个写入被拒的测试；跨行不变式有 store 守卫测试 | 单测 |
+| 骨架回放 | 每种协议：同源时「part 填回骨架」与上游原始 item 逐字节相同；跨源时请求里不出现骨架字段 | 用上游录制做测试 |
 | COW | 只有一个实现；作者不变；克隆的账本行不可执行，且 `block_id` 已重映射；mailbox 回执同步更新 | 单测 |
 | UI 状态 | `patchState` 不改变 `model_history_revision`，不触发 FTS | 触发器测试 |
 | compact 与段压缩 | 生命周期与现状等价；CAS 不再使用 JSON 路径 | 现有 compact 测试迁移 |
 | 回退与块删除 | 以块 id 寻址；重跑过的工具也能删除并回退文件；预算按块字节计算；共享信封走 COW | 现有回退测试迁移 |
 | Codex WS | 有 assistant 输出之后的下一次请求仍能增量续写 | 用上游原始 item 的录制做测试 |
-| 工具加载策略 | 五种策略各自的线上形态与参考实现一致；按协议选择正确；策略 5 开启新纪元；新纪元不再投影旧的 `tool_addition` 块 | 单测 + 请求录制 |
+| 工具加载策略 | 五种策略各自的线上形态与参考实现一致；按协议选择正确；策略 5 开启新纪元；新纪元里旧的 `tool_loaded` / `tool_unloaded` 只投提示文本；已实现版本的测试（`tool-loading.test.ts`、`loop-tool-loading.test.ts`）在两段投影上不改即过 | 单测 + 请求录制 |
+| 对账 | 绕过 `/load` 的集合变化（resident、预加载）在下一次请求前补写一个工具变更块，纪元基线不变；system 各节变化写 `reminder`；没有差异时不写库 | 单测 |
 | 前缀保持 | 纪元内，已发送的工具定义、system 各节、信封投影哈希不变；违例被记录并带上原因；换纪元的三种条件都能触发重建；fork 的第一次请求与父叙述者前缀相同 | 前缀核对 + 单测 |
 | External API v1 | 现有契约测试不修改即通过 | 契约测试 |
 | project.db | 导出再导入，内容相等；旧归档可以导入 | 往返测试 |
 | 搜索 | 结果与现状一致（content_text 规则逐条复刻） | 搜索测试 |
-| 回填 | 可中断、可恢复、幂等；校验无差异；主线程单片不超过 1 秒 | 作业测试 + 慢操作日志 |
+| 回填 | 可中断、可恢复、幂等；校验无差异；主线程单片不超过 1 秒；不改变任何叙述者的 `model_history_revision`，不写 FTS | 作业测试 + 慢操作日志 |
 | 性能 | 流式写入耗时、模型历史加载、页面首屏都不劣于现状 | benchmark |
 | 存储 | 在生产库副本上测得的增量落在预估范围内 | 存储扫描 |
 | PG | schema 和迁移可以生成，`db:check:pg` 通过 | CI |
@@ -1361,9 +1677,16 @@ narrator_projection_overrides
 | D16 | 纪元边界 | compact 成功、切换 provider 或模型、缓存肯定已冷 | **已定** |
 | D17 | 哪些变化追加提醒 | 只对影响模型行为的变化提醒；纯展示性变化静默沿用旧值 | **已定** |
 | D18 | mailbox 语义编辑 | 未被接收方采纳的原地改写；已采纳的追加修订通知 | **已定** |
-| D19 | 是否提供「按最新数据重建上下文」的手动操作 | 待定 | **待定** |
+| D19 | 是否提供「按最新数据重建上下文」的手动操作 | 待定。纪元改为标记块之后，实现代价只是一次 `openEpoch(reason = "manual")`（§7.7），可以只按需求取舍 | **待定** |
 | D20 | 纪元内加载工具 | 五种策略，由模型在 catalog 里声明（可多种），按当前协议选用；都不适用时直接改 tools[] 并开启新纪元；新纪元完全重新构建（§7.8） | **已定** |
 | D21 | 工具加载策略的默认值 | 按裸模型名匹配：含 gpt 用 `openai_additional_tools`，含 claude 用 `anthropic_tool_addition`，含 deepseek 用 `anthropic_deferred_tail`，其他用 `custom_injection`；catalog 声明可覆盖，用户可禁用（§7.8） | **已定** |
+| D22 | kind 是否从 7 种收为 5 种 | 推荐收：`marker`、`notice` 并入 `context`，按 subtype 分族；可见性统一为「`done` 且 `model_text` 非空」（§3.3）。备选：保留 7 种，代价是三处 kind 分支与三套可见性规则 | 推荐，未确认 |
+| D23 | phase 是否从 6 个收为 4 个 | 推荐收：tool 的 `called`、`settled` 分别并入 `open`、`done`；输入流式阶段不落行，不需要名字（§3.5）。备选：保留，代价是部分索引、触发器、共享判定都要比较两个值 | 推荐，未确认 |
+| D24 | `provider_meta` 的形状 | 推荐「来源 + 上游原样骨架」：正文换成 part 引用，其余字段原样；同源回放把 part 填回（§3.4）。备选：按协议的字段白名单，每遇上游新字段都要改 schema，Codex WS 续写只能靠测试补字段 | 推荐，未确认 |
+| D25 | 纪元状态存在哪里 | 推荐：开启纪元写一个 `context` 标记块（compact 块兼任），工具定义与 system 正文按内容寻址存 `narrator_text_snapshots`；纪元内一切变化由每次请求前的对账写成追加的块（§7.7、§7.8）。已实现的倒推保留为旧数据的兜底与一致性检查。备选 A：前两轮的两张旁表，fork / 提取要另外复制；备选 B：全部倒推（即已实现的做法），绕过提示行的变化会漂移，system 正文也无法倒推 | 推荐，未确认 |
+| D26 | Await 回执改写怎样满足只追加 | 推荐：只许 seq 更早的回执缩短更晚的工具结果；后到的回执与更早的结果都保留全文（§7.2）。备选：记录「第一次投影时的判断」，要多一份状态 | 推荐，未确认 |
+| D27 | plan mode 改写工具描述与前缀保持冲突 | 推荐：纪元内不改描述，限制靠 system 提醒与执行期拦截（权限层已有 `readOnly`，覆盖范围待核，§7.7）。备选：切换 plan mode 视为纪元边界，代价是每次切换一次缓存未命中（即现状） | 推荐，未确认 |
+| D28 | 派生字段（`content_text` 等）何时重算 | 推荐：只在封口、工具进入终态、编辑或删除时；流式中途的部分文本搜不到（§4.6）。备选：每个 item 封闭时重算，FTS 写入多 N 倍 | 推荐，未确认 |
 
 ## 附录 A：现有块 type 到 kind 的映射
 
@@ -1375,7 +1698,7 @@ narrator_projection_overrides
 | text | user（origin 为 system） | `context` | — | 是 | 自动续跑、批准反馈、审查检查 |
 | text | sys | `context` | — | 是 | plan mode 退出、浏览器 tracing 通知等 |
 | text | assistant | `output` 的 `text` part | 一个 item 一块 | 是 | |
-| text | disp | `notice` / publication_result | — | 否 | 带 `publicationResult` 字段 |
+| text | disp | `context` / publication_result（卡片族） | — | 否 | 带 `publicationResult` 字段 |
 | text（与注入或 review 配对的那一个） | sys / user | 并入 `context` 块的 `model_text` | 与配对块合成一块 | 是 | |
 | image | user | `input` 的 `image` part | 并入 `input` | Anthropic、Responses 原生；其他 provider 为附件提示，重建时丢失 | |
 | image | assistant（插件） | `output` 的 `image` part | — | 待核 | |
@@ -1383,25 +1706,25 @@ narrator_projection_overrides
 | file_reference | user | `input` 的 `file_ref` part | 并入 `input` | 展开为引用文本 | |
 | attachment、document | user | `input` 的 part | 并入 `input` | 待核 | 调研中列出，但未找到写入点 |
 | reasoning、旧的 thinking | assistant | `reasoning` | 一个 item 一块 | 按携带策略 | `translatedText` 移入 `state` |
-| redacted_thinking | assistant | `reasoning`（redacted） | — | 仅 strict 且同源时 | `data` 移入 `provider_meta` |
-| tool_use | assistant | `tool` | 与被采用的账本 attempt 合成一块 | 是，需账本到达终态 | `thoughtSignature` 移入 `provider_meta.call` |
+| redacted_thinking | assistant | `reasoning`（redacted） | — | 仅 strict 且同源时 | `data` 移入 `provider_meta.wire` |
+| tool_use | assistant | `tool`，工具名进 subtype | 与被采用的账本 attempt 合成一块 | 是，需账本到达终态 | `thoughtSignature` 移入 `provider_meta.wire` |
 | tool_result | assistant（/bash） | 并入 `tool` | — | 否（只给显示用） | 显示数据改由账本提供 |
 | web_search | assistant | `tool`，`executor = "provider"` | — | Responses 原生；Anthropic、Completions 为文本摘要；Gemini 跳过 | |
 | image_generation | assistant | `tool`，`executor = "provider"` | 生成的图片为结果 part | 仅 Responses | `result` 只在落盘失败时存在 |
 | bash_command | user | `input` | — | 是（经 `content_text` 回退） | `model_text` 为命令原文 |
-| tool_loaded、tool_unloaded | user | `context` | — | 是（经 `content_text` 回退） | |
+| tool_loaded、tool_unloaded | user | `context` / 同名 | — | 是（经 `content_text` 回退） | `toolNames` 进 `body`，旧行由回填展开（§7.8） |
 | system_injection 及旧拼写（sidecar、side_car、injection、system-injection） | sys / user | `context` / system_injection | 旧形态与前一个 text 合并 | 是（modelText） | |
 | spec_continuation、spec_blocked_continuation、knowledge_hint、container_ready、browser_session_lost、merge_summary | sys | `context` / 同名 | — | 是（modelText） | `merge_summary.isLatest` 移入 `state` |
 | subagent_messages、background_agents_completed | 注入的伴随块 | 并入所属 `context` 块的 `body` | 与注入合成一块 | 否 | |
 | review_feedback | user（前面带一个 text） | `context` / review_feedback | 与前面的 text 合成一块 | 前面的 text 可见 | `applied` 移入 `state` |
-| ask_in_passing | system | `notice` / ask_in_passing | — | 否 | status 移入 `state` |
-| subagent_recovery、cwd_recovery | disp | `notice` / 同名 | — | 否 | status 移入 `state` |
-| spec_goal_added、spec_fork_carryover、spec_context_cleared | disp | `notice` / 同名 | — | 否 | spec_goal_added 的信封 `cause_block_id` 指向 `/goal` 输入 |
-| info | disp | `notice` / info | — | 否 | |
-| error | system | `notice` / error | — | 否 | |
-| compact（含 subtype plan，以及清空上下文） | system | `marker` / compact、plan、clear_context | — | 否（摘要走 system prompt） | status、attempts 移入 `phase` / `state` |
-| segment_compact | user | `marker` / segment_compact | — | 是（现在经 `content_text`） | 改为 `model_text`，origin 为 system |
-| file_history_checkpoint | disp | `marker` / file_history_checkpoint | — | 否 | |
+| ask_in_passing | system | `context` / ask_in_passing（卡片族） | — | 否 | status 移入 `state` |
+| subagent_recovery、cwd_recovery | disp | `context` / 同名（卡片族） | — | 否 | status 移入 `state` |
+| spec_goal_added、spec_fork_carryover、spec_context_cleared | disp | `context` / 同名（卡片族） | — | 否 | spec_goal_added 的信封 `cause_block_id` 指向 `/goal` 输入 |
+| info | disp | `context` / info（卡片族） | — | 否 | |
+| error | system | `context` / error（卡片族） | — | 否 | |
+| compact（含 subtype plan，以及清空上下文） | system | `context` / compact、plan、clear_context（控制标记族） | — | 否（摘要走 system prompt） | status、attempts 移入 `phase` / `state` |
+| segment_compact | user | `context` / segment_compact（控制标记族） | — | 是（现在经 `content_text`） | 改为 `model_text`，origin 为 system |
+| file_history_checkpoint | disp | `context` / file_history_checkpoint（控制标记族） | — | 否 | |
 
 ## 附录 B：调研中顺带发现的现存问题
 
