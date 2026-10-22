@@ -558,8 +558,18 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"sqliteCatalog",
 		"rowid",
 		"insertOr",
+		"indexHint",
 	],
 	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid"],
+	// Scans that find envelopes through block rows (SQLite-only, like block storage).
+	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
+	// The central body reader: selects block-format bodies and assembles them from rows.
+	"server/lib/narrator-bodies.ts": ["driver"],
+	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
+	// storage): exports, the session interchange, and the body length they measure in SQL.
+	"server/lib/narrator-body-length.ts": ["json1"],
+	"server/services/narrator-export.ts": ["handle"],
+	"server/services/session-interchange/export.ts": ["handle"],
 	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
@@ -576,7 +586,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/archive-file.ts": ["driver", "pragma"],
 	"server/services/project-archive/archive-writer.ts": ["driver", "pragma", "insertOr"],
 	"server/services/project-archive/export-rows.ts": ["driver"],
-	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
+	"server/services/project-archive/sqlite-main-store.ts": ["handle", "insertOr"],
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.

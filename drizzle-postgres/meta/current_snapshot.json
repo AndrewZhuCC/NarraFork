@@ -1,6 +1,6 @@
 {
-  "id": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
-  "prevId": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
+  "id": "20534647-c4ef-455c-8c6f-4250ed5f2786",
+  "prevId": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -13158,6 +13158,22 @@
           ],
           "isUnique": false,
           "where": "\"compact_pending\" = 1",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_messages_legacy_body": {
+          "name": "idx_messages_legacy_body",
+          "columns": [
+            {
+              "expression": "body_format",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"body_format\" = 1",
           "concurrently": false,
           "method": "btree",
           "with": {}

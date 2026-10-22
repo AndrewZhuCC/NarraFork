@@ -226,6 +226,51 @@ describe("block backfill", () => {
 		expect(envelope(input.id).bodyFormat).toBe(2);
 	});
 
+	test("content holding reader-only fields mid-element converts and verifies clean", async () => {
+		// Written before block storage: `isLatest` between other fields, not after them.
+		const card = {
+			type: "merge_summary",
+			sourceChapterId: "ch1",
+			isLatest: true,
+			summary: "s",
+			modelText: "merged",
+		};
+		sqlite.run(
+			`INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at)
+			 VALUES ('card', 'n1', 'system', ?, ?)`,
+			[JSON.stringify([card]), NOW],
+		);
+		await drain();
+		expect(envelope("card").bodyFormat).toBe(2);
+		// Same content; the rows put reader-only fields last, as the store writes them.
+		expect(assembled("card")).toEqual([card]);
+		expect(Object.keys(assembled("card")[0] as object).at(-1)).toBe("isLatest");
+		expect(sqlite.prepare("SELECT count(*) AS n FROM narrator_block_diagnostics").get()).toEqual({
+			n: 0,
+		});
+		expect(blockSync.auditRecentEnvelopes()).toEqual([]);
+	});
+
+	test("legacy envelopes written after convert finished send it back to them", async () => {
+		await legacy(() => narratorStore.appendInput("n1", "first"));
+		await drain();
+		expect(backfill.blockBackfillStatus().convert?.complete).toBe(true);
+		// Written while block writes were off: the job does not convert while they are off.
+		settings.narratorBlocks.write = false;
+		const later = await narratorStore.appendInput("n1", "later");
+		backfill.rearmBlockConvert();
+		expect(backfill.blockBackfillStatus().convert?.complete).toBe(false);
+		expect(await backfill.runBlockJobSlice(inline)).toBe(false);
+		expect(envelope(later.id).bodyFormat).toBe(1);
+		settings.narratorBlocks.write = true;
+		await drain();
+		expect(envelope(later.id).bodyFormat).toBe(2);
+		expect(assembled(later.id)).toEqual(JSON.parse(envelope(later.id).contentJson));
+		// Nothing left to convert: re-arming is a no-op.
+		backfill.rearmBlockConvert();
+		expect(backfill.blockBackfillStatus().convert?.complete).toBe(true);
+	});
+
 	test("slices stop at the envelope limit and resume from the cursor", async () => {
 		const ids: string[] = [];
 		await legacy(async () => {

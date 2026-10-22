@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
 import { SQL } from "bun";
+import { blockBodies, bodySql } from "../../lib/narrator-bodies";
+import { assembledBodyLengthSql } from "../../lib/narrator-body-length";
 import { type ArchiveActor, assertFullExport, ProjectArchiveAuthorizationError } from "./access";
 import { PROJECT_ARCHIVE_LIMITS as LIMITS } from "./limits";
 import type { ArchiveRow, ArchiveValue } from "./main-store";
@@ -26,6 +28,11 @@ export interface LegacySyncWorkerRequest {
 	actor?: ArchiveActor;
 	deadline: number;
 	cancellation: SharedArrayBuffer;
+	/**
+	 * Assemble block-format `narrator_messages.content_json` from its block rows
+	 * (`narratorBlocks.read`; SQLite sources only, the one backend that writes blocks).
+	 */
+	bodiesFromBlocks?: boolean;
 }
 const q = (name: string) => `"${name}"`;
 export async function runLegacySyncWorker(
@@ -50,6 +57,11 @@ export async function runLegacySyncWorker(
 			? postgresArchiveConnection(pg)
 			: undefined;
 	if (!sourceConnection) throw new Error("Project backup source unavailable");
+	const blockSource = request.bodiesFromBlocks ? source : undefined;
+	/** A block-format message's `content_json` is the array its rows assemble to (§10.5). */
+	const assembled = (table: ArchiveTable, name: string) =>
+		blockSource !== undefined && table === "narrator_messages" && name === "content_json";
+	const body = bodySql(q("narrator_messages"), true);
 	const archive = new Database(request.archivePath);
 	archive.run("PRAGMA busy_timeout=250");
 	try {
@@ -83,13 +95,19 @@ export async function runLegacySyncWorker(
 				const selection = columns.get(table) ?? [];
 				const found = rows.get(table);
 				if (!selection.length || !found) return;
+				const sizeOf = (name: string) =>
+					assembled(table, name)
+						? `CASE WHEN ${body} IS NULL THEN ${assembledBodyLengthSql(`${q(table)}.id`, "bytes")} ELSE ${tx.byteLength(name)} END`
+						: tx.byteLength(name);
+				const selected = (name: string) =>
+					assembled(table, name) ? `${body} AS ${q(name)}` : q(name);
 				for (let offset = 0; offset < values.length; offset += 200) {
 					const params: ArchiveValue[] = values.slice(offset, offset + 200);
 					let after = "";
 					for (;;) {
 						check();
 						const sizes = await tx.query(
-							`SELECT id,(${selection.map((name) => tx.byteLength(name)).join("+")}) AS size FROM ${q(table)} WHERE ${q(column)} IN (${params.map((_, i) => `$${i + 1}`).join(",")}) AND id>$${params.length + 1} ${extra} ORDER BY id LIMIT 500`,
+							`SELECT id,(${selection.map(sizeOf).join("+")}) AS size FROM ${q(table)} WHERE ${q(column)} IN (${params.map((_, i) => `$${i + 1}`).join(",")}) AND id>$${params.length + 1} ${extra} ORDER BY id LIMIT 500`,
 							[...params, after],
 						);
 						if (!sizes.length) break;
@@ -100,13 +118,18 @@ export async function runLegacySyncWorker(
 							if (!projectRow && found.has(id)) continue;
 							if (Number(info.size) > LIMITS.rowBytes)
 								throw new Error("Project backup row byte limit exceeded");
-							const raw = (
+							let raw = (
 								await tx.query(
-									`SELECT ${selection.map(q).join(",")} FROM ${q(table)} WHERE id=$1 LIMIT 1`,
+									`SELECT ${selection.map(selected).join(",")} FROM ${q(table)} WHERE id=$1 LIMIT 1`,
 									[id],
 								)
 							)[0];
 							if (!raw) throw new Error("Project snapshot row disappeared");
+							if (blockSource && assembled(table, "content_json") && raw.content_json === null)
+								raw = {
+									...raw,
+									content_json: JSON.stringify(blockBodies(blockSource, [id]).get(id) ?? []),
+								};
 							const row = projectRow ? projectRow(raw) : raw;
 							if (table === "narrators") projectPortableRuntimeRegistration(row);
 							if (typeof row.id !== "string") throw new Error("Invalid project row ID");

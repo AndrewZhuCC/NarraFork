@@ -20,13 +20,17 @@ import type { Database } from "bun:sqlite";
 import { parseStored } from "@shared/narrator-blocks/plan";
 import { assembleContent } from "@shared/narrator-blocks/storage";
 
+/** Whether the envelope at `alias` reads from its block rows: they are current. */
+export function blocksCurrentSql(alias: string): string {
+	return `(${alias}.body_format = 2
+		AND NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = ${alias}.id)
+		AND EXISTS (SELECT 1 FROM narrator_blocks b WHERE b.message_id = ${alias}.id))`;
+}
+
 /** The column a reader selects in place of `content_json` (see the module comment). */
 export function bodySql(alias: string, fromBlocks: boolean): string {
 	if (!fromBlocks) return `${alias}.content_json`;
-	return `CASE WHEN ${alias}.body_format = 2
-		AND NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = ${alias}.id)
-		AND EXISTS (SELECT 1 FROM narrator_blocks b WHERE b.message_id = ${alias}.id)
-		THEN NULL ELSE ${alias}.content_json END`;
+	return `CASE WHEN ${blocksCurrentSql(alias)} THEN NULL ELSE ${alias}.content_json END`;
 }
 
 /**

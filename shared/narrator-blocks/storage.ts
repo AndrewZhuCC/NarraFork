@@ -10,7 +10,11 @@
  *
  * so concatenating the rows in ordinal order and merging each state back reproduces the
  * stored array (`assembleContent`): the two representations can never drift apart, and
- * a state-only change (a translation, a card's status) is not a body change. The columns
+ * a state-only change (a translation, a card's status) is not a body change. One order
+ * rule makes this exact: an element's reader-only fields come after its other fields.
+ * The store writes `content_json` from the rows, so it follows the rule; content stored
+ * before block storage, or rewritten outside the store, may hold them anywhere, which
+ * means the same, so comparisons use `inAssembledOrder`. The columns
  * the database indexes and triggers read — kind, subtype, phase, model_text, wire_id —
  * are what `decodeLegacyContent` makes of the same elements.
  *
@@ -201,6 +205,18 @@ export function splitEnvelope(
 		if (count) block.key = `${block.key}~${count}`;
 	}
 	return { blocks, envelope };
+}
+
+/**
+ * Stored content in the order its rows assemble to: each element's reader-only fields
+ * after its other fields (see the module comment). Compare rows against `content_json`
+ * as `assembleContent(rows)` against `inAssembledOrder(stored)`.
+ */
+export function inAssembledOrder(content: readonly unknown[]): unknown[] {
+	return content.map((element) => {
+		const [rest, fields] = separateState(element);
+		return fields ? { ...(rest as RawElement), ...fields } : element;
+	});
 }
 
 /** The stored array the rows say, in ordinal order: the inverse of `splitEnvelope`. */

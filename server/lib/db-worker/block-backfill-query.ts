@@ -20,7 +20,7 @@ import {
 	parseStored,
 	planEnvelopeBlocks,
 } from "@shared/narrator-blocks/plan";
-import { assembleContent } from "@shared/narrator-blocks/storage";
+import { assembleContent, inAssembledOrder } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 
 export interface BlockSliceLimits {
@@ -105,10 +105,12 @@ function candidates(
 ): Array<{ rowid: number; bytes: number }> {
 	return db
 		.query(
+			// A literal format, so convert's candidates come from idx_messages_legacy_body.
 			`SELECT rowid, coalesce(length(CAST(content_json AS BLOB)), 0) AS bytes
-			 FROM narrator_messages WHERE rowid > ? AND body_format = ? ORDER BY rowid LIMIT ?`,
+			 FROM narrator_messages WHERE rowid > ? AND body_format = ${bodyFormat === 1 ? 1 : 2}
+			 ORDER BY rowid LIMIT ?`,
 		)
-		.all(params.afterRowid, bodyFormat, params.maxEnvelopes) as Array<{
+		.all(params.afterRowid, params.maxEnvelopes) as Array<{
 		rowid: number;
 		bytes: number;
 	}>;
@@ -242,7 +244,10 @@ function rowsMatch(db: Database, rowid: number): { id: string; matches: boolean 
 	const assembled = assembleContent(
 		rows.map((row) => ({ payload: parseStored(row.payload), state: parseStored(row.state) })),
 	);
-	return { id: envelope.id, matches: JSON.stringify(assembled) === JSON.stringify(stored) };
+	return {
+		id: envelope.id,
+		matches: JSON.stringify(assembled) === JSON.stringify(inAssembledOrder(stored)),
+	};
 }
 
 export function runBlockVerifySlice(

@@ -1705,6 +1705,10 @@ export const narratorMessages = sqliteTable(
 		index("idx_messages_compact_pending")
 			.on(table.compactPending)
 			.where(sql`"compact_pending" = 1`),
+		// Partial index: the legacy (not yet block-format) envelopes, which the backfill
+		// converts and body scans still match on content_json. Empty once the backfill is
+		// done, so finding them never walks message bodies (docs/BLOCK_STORAGE-DESIGN.md §10.3).
+		index("idx_messages_legacy_body").on(table.bodyFormat).where(sql`"body_format" = 1`),
 	],
 );
 

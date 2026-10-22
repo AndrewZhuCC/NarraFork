@@ -33,6 +33,7 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
+import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
 import { narratorStore } from "./narrator-store";
 
 /** What a reconciled load notice says a tool does: its routine's description, else its name. */
@@ -67,11 +68,15 @@ export function compactEpochRecord(
 /** The epoch the latest compact opened, when it recorded one (SQLite; PG derives). */
 export function compactToolLoadingEpoch(narratorId: string): ToolLoadingEpoch | undefined {
 	if (activeDatabaseBackend !== "sqlite") return undefined;
-	// Only the epoch: the summary beside it can be large.
+	// Only the epoch: the summary beside it can be large. With block reads it comes from
+	// the compact block's payload.
+	const element = (path: string) =>
+		blockReadsEnabled()
+			? storedElementsSql("m", (json, root) => `json_extract(${json}, '${root}[0]${path}')`)
+			: `json_extract(m.content_json, '$[0]${path}')`;
 	const row = sqlite
 		.prepare(
-			`SELECT json_extract(m.content_json, '$[0].type') AS type,
-				json_extract(m.content_json, '$[0].epoch') AS epoch
+			`SELECT ${element(".type")} AS type, ${element(".epoch")} AS epoch
 			 FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id
 			 WHERE r.narrator_id = ? AND r.is_compact = 1 ORDER BY r.seq DESC LIMIT 1`,
 		)

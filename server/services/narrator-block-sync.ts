@@ -28,7 +28,7 @@ import {
 	parseStored as parse,
 	planEnvelopeBlocks,
 } from "@shared/narrator-blocks/plan";
-import { assembleContent, splitEnvelope } from "@shared/narrator-blocks/storage";
+import { assembleContent, inAssembledOrder, splitEnvelope } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
@@ -189,7 +189,7 @@ export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
 		const assembled = assembleContent(
 			blocks.map((block) => ({ payload: parse(block.payload), state: parse(block.state) })),
 		);
-		return JSON.stringify(assembled) === JSON.stringify(stored) ? [] : [row.id];
+		return JSON.stringify(assembled) === JSON.stringify(inAssembledOrder(stored)) ? [] : [row.id];
 	});
 	if (differing.length) {
 		logger.warn("Block rows differed from their envelope; re-synced", { messageIds: differing });
