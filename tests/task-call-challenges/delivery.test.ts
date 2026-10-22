@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { ProviderAdapter } from "../../server/lib/agent/provider";
 import { BenchProvider } from "./client";
 import { RUNTIME_CONTRACT } from "./contract";
 import { type CompletionEvidence, completionKind, qualifies } from "./delivery-experiment";
@@ -192,11 +191,9 @@ describe("frozen V4 and protocol replay", () => {
 						}))
 							if (event.toolUses) id = event.toolUses[0].toolUseId;
 						expect(id).toBe(`c${index + 1}`);
-						p.pushUserTurn(history, content, "offline", pending);
-						p.pushAssistantTurn(history);
-						pending = [
-							p.formatToolResult(id, JSON.stringify({ ok: true, value: ["K1", "K2"] }), false),
-						];
+						p.appendUserTurn(history, content, pending);
+						p.appendAssistantTurn(history);
+						pending = [p.toolResult(id, JSON.stringify({ ok: true, value: ["K1", "K2"] }), false)];
 					}
 				},
 			);
@@ -524,7 +521,7 @@ describe("qualification accepts natural completion, not missing execution or tru
 			const code = fixture("2").reference[0];
 			const { result, sent } = await offline(protocol, [[{ id: "query", code }], []], (p) =>
 				runEpisode("offline", "2", coherent.delivery, {
-					adapter: p as unknown as ProviderAdapter,
+					adapter: p,
 					channelType: protocol,
 					evaluate: executeEval,
 				}),
@@ -541,7 +538,7 @@ describe("qualification accepts natural completion, not missing execution or tru
 				[[{ id: "delivery", code }]],
 				(p) =>
 					runEpisode("offline", "2", coherent.delivery, {
-						adapter: p as unknown as ProviderAdapter,
+						adapter: p,
 						channelType: protocol,
 						evaluate: executeEval,
 					}),
@@ -565,7 +562,7 @@ describe("real episode loop with offline model responses", () => {
 				[[{ id: "first", code: 'deliver("done","尚未做任何工作");' }]],
 				(p) =>
 					runEpisode("offline", "6", profiles.delivery, {
-						adapter: p as unknown as ProviderAdapter,
+						adapter: p,
 						channelType: protocol,
 						evaluate: executeEval,
 					}),
@@ -584,7 +581,7 @@ describe("real episode loop with offline model responses", () => {
 			];
 			const { result, sent } = await offline(protocol, [calls], (p) =>
 				runEpisode("offline", "6", profiles.delivery, {
-					adapter: p as unknown as ProviderAdapter,
+					adapter: p,
 					channelType: protocol,
 					evaluate: executeEval,
 				}),

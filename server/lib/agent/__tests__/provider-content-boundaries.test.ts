@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { setOutboundFetchOverrideForTest } from "../../net/outbound-fetch";
 import { AnthropicProvider, parseAnthropicSSEStream } from "../anthropic-provider";
-import { CodexProvider } from "../codex-provider";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
 import { GeminiProvider } from "../gemini-provider";
 import { LoopTranscript } from "../loop-transcript";

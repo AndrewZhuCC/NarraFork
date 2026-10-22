@@ -5,13 +5,13 @@ import { join, resolve } from "node:path";
 import type { OpenAIProviderConfig } from "../../settings";
 import { setUploadsDirForTests } from "../../uploads";
 import { isRetryableError } from "../error-handling";
+import { LoopTranscript, type TranscriptImage } from "../loop-transcript";
 import {
 	convertHistoryToResponsesApi,
 	type OAIMessage,
 	OpenAIProvider,
 	parseResponsesAPIEvent,
 } from "../openai-provider";
-import { LoopTranscript, type TranscriptImage } from "../loop-transcript";
 import { OutputContentAccumulator } from "../output-content";
 import type { DbMessage } from "../provider";
 import type { ContentBlock, ReasoningProviderMetadata } from "../types";

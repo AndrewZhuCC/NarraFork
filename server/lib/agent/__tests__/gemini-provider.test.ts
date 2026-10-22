@@ -14,10 +14,7 @@ import { ApiRequestDumpCollector } from "../request-dump";
 
 interface TestGeminiProvider {
 	formatTools(tools: unknown[]): unknown[];
-	buildHistory(
-		messages: DbMessage[],
-		model: string,
-	): Promise<{ history: unknown[] }>;
+	buildHistory(messages: DbMessage[], model: string): Promise<{ history: unknown[] }>;
 	chat(params: Record<string, unknown>): AsyncGenerator<ParsedStreamEvent>;
 	generateWithMeta(
 		text: string,
@@ -821,7 +818,9 @@ describe("Gemini Interactions API provider", () => {
 			],
 			"gemini-test:model",
 		);
-		await collect(provider.chat(baseChatParams({ content: "", history, toolResults: [] }) as never));
+		await collect(
+			provider.chat(baseChatParams({ content: "", history, toolResults: [] }) as never),
+		);
 
 		expect(bodies[1].input).toEqual([
 			{ type: "user_input", content: "hello" },

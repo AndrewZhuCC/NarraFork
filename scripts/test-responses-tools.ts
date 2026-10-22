@@ -55,7 +55,7 @@ console.log("2. Message Format Check:");
 
 // Build history using provider's method
 // Simulate a conversation: user → assistant with tool call → tool result → user
-const { history, trailingToolResults } = await provider.buildHistory(
+const { history } = await provider.buildHistory(
 	[
 		{
 			id: "msg_1",
@@ -117,8 +117,6 @@ for (const entry of history) {
 	console.log(`   - ${msgType}: ${preview}`);
 }
 
-console.log("   Trailing tool results:", trailingToolResults);
-
 // Check format
 const historyRecords = history as Array<Record<string, unknown>>;
 const userMsg = historyRecords.find((m) => m.role === "user");
@@ -154,11 +152,8 @@ const checks = [
 		pass: !!functionCall && functionCall.type === "function_call",
 	},
 	{
-		name: "Function output in trailing results",
-		pass:
-			Array.isArray(trailingToolResults) &&
-			trailingToolResults.length > 0 &&
-			(trailingToolResults[0] as Record<string, unknown>).type === "function_call_output",
+		name: "Function output in history",
+		pass: historyRecords.some((m) => m.type === "function_call_output"),
 	},
 ];
 

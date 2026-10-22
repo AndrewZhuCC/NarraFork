@@ -366,23 +366,52 @@ describe("AnthropicProvider thinking continuation", () => {
 			text,
 			providerMetadata: { signatureSource, anthropic: { blockIndex, signature } },
 		});
-		const history = await liveHistory(provider, [
+		const transcript = new LoopTranscript();
+		transcript.appendInput("question");
+		transcript.appendStep([
 			// Signature arrived, thinking text never did.
 			thought("", 0, "sig-orphan"),
 			thought("   ", 1, "sig-blank"),
 			thought("real", 2, "sig-real"),
 			{ type: "text", text: "answer" },
 		]);
+		transcript.appendInput("next");
+		const { history } = await provider.buildHistory(transcript.rows, "claude-sonnet-4-5");
 
-		expect(history).toEqual([
-			{
-				role: "assistant",
-				content: [
-					{ type: "thinking", thinking: "real", signature: "sig-real" },
-					{ type: "text", text: "answer" },
-				],
-			},
-		]);
+		// What the upstream receives: the empty block never enters the history, and the
+		// blank one is dropped by the request's last-line sanitizer.
+		let sent: { messages?: Array<{ role: string; content: unknown }> } = {};
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			sent = JSON.parse(String(init?.body));
+			return new Response("mocked failure", { status: 400 });
+		}) as typeof fetch;
+		try {
+			for await (const _event of provider.chat({
+				conversationId: "empty-thinking",
+				content: "",
+				model: "anthropic:claude-sonnet-4-5",
+				cwd: ".",
+				history,
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			})) {
+				/* consume */
+			}
+		} catch {
+			/* Mocked upstream failure. */
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(sent.messages?.find((message) => message.role === "assistant")).toEqual({
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "real", signature: "sig-real" },
+				{ type: "text", text: "answer" },
+			],
+		});
 	});
 
 	/**
