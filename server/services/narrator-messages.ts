@@ -90,6 +90,14 @@ import { liveCompactProgress } from "./compact-live-state";
 import { newEnvelopeColumns } from "./narrator-block-sync";
 import { resolveBlockTargets, targetElements } from "./narrator-block-targets";
 import {
+	bodyColumns,
+	contentJsonSql,
+	fillBodies,
+	fillBody,
+	hasStoredElementSql,
+	storedBodyBytesSql,
+} from "./narrator-body-reads";
+import {
 	createPostgresNarratorDisplayPagePort,
 	readDisplayFixtureMessages,
 	readNarratorDisplayMessages,
@@ -3325,10 +3333,13 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((row) => row.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		const seqMap = new Map(refRows.map((row) => [row.messageId, row.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		return messages.map((message) => ({
@@ -3367,10 +3378,13 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 
 		if (messages.length !== refRows.length) {
 			const foundIds = new Set(messages.map((m) => m.id));
@@ -3417,11 +3431,7 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					ne(narratorMessages.role, "disp"),
 					isNull(narratorMessageRefs.segmentCompactId),
-					sql`NOT EXISTS (
-						SELECT 1
-						FROM json_each(${narratorMessages.contentJson}) AS compact_block
-						WHERE json_extract(compact_block.value, '$.type') = 'compact'
-					)`,
+					sql`NOT ${hasStoredElementSql("compact")}`,
 				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -3654,14 +3664,17 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: {
-				toolCalls: true,
-				creator: { columns: { username: true } },
-				narrator: { columns: { title: true } },
-			},
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: {
+					toolCalls: true,
+					creator: { columns: { username: true } },
+					narrator: { columns: { title: true } },
+				},
+			}),
+		);
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -3703,7 +3716,7 @@ const narratorMessageQueriesUnlocked = {
 				id: narratorMessages.id,
 				narratorId: narratorMessages.narratorId,
 				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 				contentText: narratorMessages.contentText,
 				createdAt: narratorMessages.createdAt,
 			})
@@ -3718,7 +3731,7 @@ const narratorMessageQueriesUnlocked = {
 			)
 			.orderBy(narratorMessageRefs.seq)
 			.limit(limit);
-		return rows;
+		return fillBodies(rows);
 	},
 
 	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
@@ -3789,7 +3802,7 @@ const narratorMessageQueriesUnlocked = {
 				id: narratorMessages.id,
 				narratorId: narratorMessages.narratorId,
 				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 				contentText: narratorMessages.contentText,
 				createdAt: narratorMessages.createdAt,
 			})
@@ -3804,7 +3817,7 @@ const narratorMessageQueriesUnlocked = {
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(limit);
-		return rows.reverse();
+		return fillBodies(rows).reverse();
 	},
 
 	/**
@@ -3829,7 +3842,7 @@ const narratorMessageQueriesUnlocked = {
 		const rows = await db
 			.select({
 				id: narratorMessages.id,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -3844,7 +3857,7 @@ const narratorMessageQueriesUnlocked = {
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(Math.max(1, Math.floor(scanLimit)));
 
-		for (const row of rows) {
+		for (const row of fillBodies(rows)) {
 			const blocks = Array.isArray(row.contentJson)
 				? (row.contentJson as Array<{ type: string; text?: string }>)
 				: [];
@@ -3869,7 +3882,7 @@ const narratorMessageQueriesUnlocked = {
 		const rows = await db
 			.select({
 				id: narratorMessages.id,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -3879,7 +3892,7 @@ const narratorMessageQueriesUnlocked = {
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(1);
 
-		const row = rows[0];
+		const row = fillBody(rows[0]);
 		if (!row) return null;
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
 		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
@@ -3912,7 +3925,7 @@ const narratorMessageQueriesUnlocked = {
 			WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
 				AND narrator_tool_calls.is_file_history_checkpoint = 0
 		)`;
-		const byteSize = sql<number>`length(CAST(${narratorMessages.contentJson} AS BLOB))`;
+		const byteSize = storedBodyBytesSql();
 		const rows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -3934,7 +3947,7 @@ const narratorMessageQueriesUnlocked = {
 						 WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
 						   AND narrator_tool_calls.is_file_history_checkpoint = 0)
 						> ${HISTORY_RECOVERY_TOOL_COUNT}
-						OR length(CAST(${narratorMessages.contentJson} AS BLOB)) > ${HISTORY_RECOVERY_BYTE_SIZE}
+						OR ${byteSize} > ${HISTORY_RECOVERY_BYTE_SIZE}
 					)`,
 				),
 			)
@@ -4754,10 +4767,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
 			: [];
@@ -4814,10 +4829,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		// Unreachable while foreign keys are on: `narrator_message_refs.message_id` is a
 		// NOT NULL reference to `narrator_messages.id`, so a ref cannot outlive its
 		// message. Treated as "already gone" (like the missing-ref case above) rather
@@ -4999,10 +5016,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
 			: [];
@@ -5057,10 +5076,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		// Unreachable while foreign keys are on (a ref cannot outlive its message);
 		// treated as "already gone" rather than as an error, like the missing-ref case.
 		if (!msg) return;
@@ -5101,10 +5122,12 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async dismissErrorMessage(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 
 		// The message may already be gone (e.g. a historical "message without ref"
 		// orphan that disappeared on reload, or a double-dismiss). Treat that as an

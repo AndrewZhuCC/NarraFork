@@ -1613,6 +1613,41 @@ reconcile(narrator, target, now):
   双写期间 `content_json` 与块行一致，这些路径的结果不变；P3 把新行的 `content_json` 写成 `'[]'` 之前必须全部切换。
 - **不切换的：** compact 定稿的 CAS 是按主键读一行来保护对 `content_json` 本身的写入，块的 `phase` / `revision` 不携带它比较的尝试次数与状态，留在 `content_json` 上，随 P2c 的 compact 写入改造一起处理。project.db 导入仍读 `content_json` 列（§9）。
 
+**P2c 拆分与 P2c-1 实现说明（服务端：按块寻址、状态写入、余下的读取方）**
+- P2c 分三个 PR：
+  - P2c-1：服务端按块 id 的操作、`patchState`、余下的纯读取方；前端不动。
+  - P2c-2：页面 API v2 与 WS v2，挂在 `narratorBlocks.wsV2` 开关后（默认关）。
+  - P2c-3：前端以块 id 为键的 store，删除流式交接启发式，同一 PR 打开 `wsV2`。
+- **按块寻址**（`server/services/narrator-block-targets.ts`）：
+  - 块 id 解析为它所持有的元素区间：
+    - 有块行的信封按各行 `payload.raw` 的长度累加（在同步队列里的先同步，未变的块 id 不变）；
+    - 未转换的旧信封用解码器给出的 id，经 `splitEnvelope` 匹配。
+  - 解析在叙述者的 admission 内进行，结果交给现有有界、带 COW 的历史机制，所以安全检查与按下标的路径相同。
+- **新接口**（按下标的旧接口保留，供 P2c-3 之前的前端使用）：
+  - `DELETE /:id/blocks`：整块删除。tool 块连同其调用的全部账本 attempt；`input` 连同全部附件；reasoning run 传整组 id（修正附录 B 第 18、19 条）。
+  - `POST /:id/blocks/rollback`：所有目标块整块保留，删除最后一块之后的内容（修正附录 B 第 19 条）。
+  - `POST /:id/blocks/:blockId/edit` 与 `.../restore`：只改被点的 `output` 块（修正附录 B 第 20 条）。
+    - 编辑保留元素身份（块 id 不变），只保留仍逐字对应的 citations，去掉上游 item 元数据与译文。
+    - 首次编辑前的正文存 `original_payload`，COW 副本继承它；未转换的信封编辑时先建块行。
+    - 按消息的旧恢复接口会清掉各块的 `original_payload`。
+  - `GET /:id/blocks/:blockId`：单块完整内容；tool 块附账本详情。
+  - 预览（`rollback-preview`、`edit-preview`、`delete-preview`、`revert-action-preview`）、`edit-and-regenerate`、`allow-retry` 都有按块 id 的版本。
+- **删除并回退文件：** 选中 tool 块调用的全部执行 attempt（修正附录 B 第 24 条）。`fileChangeRevertActionMatches` 因此允许一个 tool 块对应多个 tool call id；带此 UI 动作的计划只能由服务端从单个块推导出来。
+- **状态写入 `patchState`**（`narratorStore.patchState`）：
+  - 一个事务：写 `content_json`（完整的兼容投影）并令 `state_revision + 1`，同时更新变化块行的 `state` / `byte_size` 与信封的 `body_bytes`。
+  - 不 bump revision，不 COW（共享信封原地修改），不写块级 FTS。
+  - 改到非状态字段，或改到解码器据以派生列的状态字段（compact 的 `status` 决定 phase）时，自动退化为正文写入。
+- **触发器契约 v3**（迁移 SQLite 0216、PG 0032）：一次 UPDATE 若移动了 `state_revision`，其 `content_json` / `content_text` 变化既不 bump 也不入同步队列；其余与 v2 相同，v2 的渲染保持不变。
+- **迁到 `patchState` 的写入：** reasoning 翻译、review feedback 的 applied / release、merge 卡片 `isLatest`、子代理恢复卡片、compact 的 `mode` 切换。
+  - 子代理恢复卡片的 `status/mode/resumedCount/subagents` 加入 `STATE_KEYS`；它是 `disp` 行，模型不读。已有行会重新切分一次。
+- **不迁的：**
+  - ask_in_passing 作答：它改写模型可见的 `content_text`。
+  - compact 定稿 CAS：块的 `phase/revision` 不携带尝试次数与重试基线，旧信封没有块行，P1–P2 期间块行在 `content_json` 写入之后才派生；P3 写入改为以块为准后再迁。
+- **余下的纯读取方**（`server/services/narrator-body-reads.ts`）：
+  - 消息查询族（分页、最近消息、compact 摘要、历史恢复）、卡片关闭检查、段压缩、事件处理与会话中的广播重读、publication、子代理提取、prompt 优化上下文、计划任务清理，都按 P2b 的规则读块行。
+  - 工具续跑的恢复排序改按 tool 块的 `ordinal`（§9），不再读正文。
+- **留给 P3 的 `content_json` 读改写：** `narrator-output-recovery`、编辑重生成与工具清理、删除叙述者时的归属转移、`updateCompactSummary`、计划输入补丁、`copyOnWriteMessage`、`discardAttemptBlocks`、段压缩摘要更新、compact 定稿；以及按 `content_json` 精确字节摘要与重写的回退管线（`revert-selection-service`、`revert-history-commit`）。双写期间这些路径的结果不变。
+
 ### P3 退役与新能力
 
 **交付**

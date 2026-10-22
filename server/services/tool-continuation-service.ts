@@ -23,6 +23,7 @@ import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { getInstanceMaintenanceAuthority } from "../lib/instance-lock";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
+import { contentJsonSql, storedBodyBytesSql, toolBlockOrdinalSql } from "./narrator-body-reads";
 import {
 	getRecoverySource,
 	getRegisteredRecoverySource,
@@ -279,7 +280,8 @@ const METADATA_PAGE_SIZE = 100;
 const MAX_BOUNDED_READ_ATTEMPTS = 3;
 const payloadBytes = sql<number>`coalesce(length(cast(${narratorToolContinuations.payloadJson} as blob)), 0)`;
 const toolInputBytes = sql<number>`coalesce(length(cast(${narratorToolCalls.inputJson} as blob)), 0)`;
-const messageContentBytes = sql<number>`coalesce(length(cast(${narratorMessages.contentJson} as blob)), 0)`;
+/** Stored size of the call's message body (`body_bytes` for a block-format one). */
+const messageContentBytes = () => sql<number>`coalesce(${storedBodyBytesSql()}, 0)`;
 const TERMINAL_STATES: ToolContinuationState[] = ["completed", "cancelled"];
 const CLAIMABLE_STATES: ToolContinuationState[] = ["paused", "waiting"];
 const STALE_RECLAIMABLE_KINDS: ToolContinuationKind[] = [
@@ -1311,7 +1313,7 @@ export const toolContinuationService = {
 						id: narratorToolContinuations.id,
 						bytes: payloadBytes,
 						inputBytes: toolInputBytes,
-						contentBytes: messageContentBytes,
+						contentBytes: messageContentBytes(),
 					})
 					.from(narratorToolContinuations)
 					.innerJoin(
@@ -1350,7 +1352,10 @@ export const toolContinuationService = {
 						toolUseId: narratorToolCalls.toolUseId,
 						toolName: narratorToolCalls.toolName,
 						inputJson: narratorToolCalls.inputJson,
-						contentJson: narratorMessages.contentJson,
+						// Only to place the call among its message's calls: from the tool block's
+						// ordinal when block rows hold the body, so the body is not read.
+						contentJson: contentJsonSql(),
+						blockOrder: toolBlockOrdinalSql(narratorMessages, narratorToolCalls.toolUseId),
 					})
 					.from(narratorToolContinuations)
 					.innerJoin(
@@ -1367,7 +1372,7 @@ export const toolContinuationService = {
 										eq(narratorToolContinuations.id, row.id),
 										lte(payloadBytes, row.bytes),
 										lte(toolInputBytes, row.inputBytes),
-										lte(messageContentBytes, row.contentBytes),
+										lte(messageContentBytes(), row.contentBytes),
 									),
 								),
 							),
@@ -1375,10 +1380,13 @@ export const toolContinuationService = {
 					);
 				if (rows.length !== page.length) throw new ContinuationScopeChangedError();
 				result.push(
-					...rows.map(({ toolUseId, inputJson, contentJson, ...row }) => ({
+					...rows.map(({ toolUseId, inputJson, contentJson, blockOrder, ...row }) => ({
 						...row,
 						input: normalizeToolInput(inputJson),
-						toolUseOrder: toolUseOrder(contentJson, toolUseId),
+						toolUseOrder:
+							contentJson === null
+								? (blockOrder ?? Number.MAX_SAFE_INTEGER)
+								: toolUseOrder(contentJson, toolUseId),
 					})),
 				);
 				await new Promise<void>((resolve) => setTimeout(resolve, 0));

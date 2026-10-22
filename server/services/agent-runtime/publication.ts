@@ -1,8 +1,10 @@
+import { assembleContent } from "@shared/narrator-blocks/storage";
 import { and, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { resolveDatabaseBackendConfig } from "../../db/postgres-runtime";
 import {
 	backgroundTasks,
+	narratorBlocks,
 	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
@@ -14,6 +16,7 @@ import { ValidationError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import { assembledBodyLengthSql } from "../../lib/narrator-body-length";
 import {
 	type RunBindingInput,
 	type RuntimeRunBinding,
@@ -36,7 +39,9 @@ export interface StartedRun {
 	publication?: PublicationRun;
 }
 
+import { blockReadsEnabled } from "../narrator-block-scans";
 import { newEnvelopeColumns } from "../narrator-block-sync";
+import { bodyInBlocksSql } from "../narrator-body-reads";
 import {
 	claimNextRefSeq,
 	NARRATOR_REF_SEQ_EMPTY_TOP,
@@ -391,15 +396,44 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return `message-original:${messageId}`;
 	}
 
+	/**
+	 * A result row's stored JSON (`original_content_json` before an edit, else the body) as
+	 * text, NULL when over the result limit. A body held in block rows is assembled from
+	 * them; its size is the exact byte length of the array they assemble to.
+	 */
+	function boundedResultJson() {
+		const stored = sql`COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson})`;
+		const fromColumn = sql<
+			string | null
+		>`CASE WHEN length(CAST(${stored} AS BLOB)) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN ${stored} ELSE NULL END`;
+		if (!blockReadsEnabled()) return { json: fromColumn, inBlocks: sql<number>`0` };
+		const inBlocks = sql`(${narratorMessages.originalContentJson} IS NULL AND ${bodyInBlocksSql()})`;
+		return {
+			json: sql<string | null>`CASE WHEN ${inBlocks} THEN NULL ELSE ${fromColumn} END`,
+			// 1: within the limit, read the rows; 2: over it.
+			inBlocks: sql<number>`CASE WHEN ${inBlocks} THEN CASE
+				WHEN ${sql.raw(assembledBodyLengthSql("narrator_messages.id", "bytes"))} <= ${AGENT_RESULT_JSON_MAX_BYTES}
+				THEN 1 ELSE 2 END ELSE 0 END`,
+		};
+	}
+	function resultJson(messageId: string, row: { json: string | null; inBlocks: number }) {
+		if (row.inBlocks !== 1) return row.json;
+		const blocks = database
+			.select({ payload: narratorBlocks.payload, state: narratorBlocks.state })
+			.from(narratorBlocks)
+			.where(eq(narratorBlocks.messageId, messageId))
+			.orderBy(narratorBlocks.ordinal)
+			.all();
+		return JSON.stringify(assembleContent(blocks));
+	}
+
 	function readAssistantSource(run: PublicationRun, messageId: string): AgentTerminalResult | null {
 		const projection = database
 			.select({
 				plain: sql<
 					string | null
 				>`CASE WHEN ${narratorMessages.originalContentJson} IS NULL THEN substr(${narratorMessages.contentText}, 1, ${AGENT_RESULT_OUTPUT_CHARS + 1}) ELSE NULL END`,
-				json: sql<
-					string | null
-				>`CASE WHEN length(CAST(COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) AS BLOB)) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) ELSE NULL END`,
+				...boundedResultJson(),
 			})
 			.from(narratorMessages)
 			.where(
@@ -412,7 +446,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			.limit(1)
 			.get();
 		const result = projection
-			? decodeRunAssistantProjection(projection.plain, projection.json)
+			? decodeRunAssistantProjection(projection.plain, resultJson(messageId, projection))
 			: null;
 		const sourceResultRef = agentSourceResultRef(`message:${messageId}`);
 		return result ? { ...result, ...(sourceResultRef ? { sourceResultRef } : {}) } : null;
@@ -479,9 +513,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			// JSON remains text in SQL: CASE prevents an edited/corrupt huge row from reaching JS.
 			const receipt = database
 				.select({
-					json: sql<
-						string | null
-					>`CASE WHEN length(CAST(COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) AS BLOB)) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) ELSE NULL END`,
+					...boundedResultJson(),
 				})
 				.from(narratorMessages)
 				.where(
@@ -494,7 +526,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				.limit(1)
 				.get();
 			const result = decodeAgentTerminalSnapshot(
-				receipt?.json ?? null,
+				receipt ? resultJson(`publication-result:${run.logicalRunId}`, receipt) : null,
 				run.logicalRunId,
 				options.includeEventKind,
 			);
