@@ -77,6 +77,9 @@ export function resolveMessageSender(message: SenderMessage): MessageSender {
 		const label = parseOriginLabel(message.originLabel);
 		return sender("agent", undefined, label?.source === "agentMessage" ? label.detail : undefined);
 	}
+	// A segment-compact marker is written as a user row without an origin, but no human
+	// wrote it: its summary is the system's.
+	if (record(blocksOf(message)[0])?.type === "segment_compact") return systemSender(message);
 	if (message.role === "user" && (message.origin == null || message.origin === "user"))
 		return sender("human", message.createdBy, message.creator?.username);
 	return systemSender(message);

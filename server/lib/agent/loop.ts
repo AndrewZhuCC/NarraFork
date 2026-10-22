@@ -26,7 +26,7 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
-import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import { getPrompt, getToolMessage, type Locale } from "../prompt-i18n";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -2894,30 +2894,87 @@ async function* agentLoopInMetadataSnapshot(
 	type LoopInjection = NonNullable<Parameters<NonNullable<typeof config.deliverInjectionRow>>[0]>;
 
 	const pendingLoopInjections: LoopInjection[] = [];
+	/**
+	 * Loop-control notices (turn nudge, broken call, continue). Unlike the advisory
+	 * reminders, the next request is wrong without them, so a host that cannot persist a
+	 * row (a reflection loop, a probe) still sends their text from memory.
+	 */
+	const requiredLoopInjections = new WeakSet<LoopInjection>();
 
 	function queueLoopInjection(injection: LoopInjection): void {
 		if (!injection.content.trim()) return;
 		pendingLoopInjections.push(injection);
 	}
 
+	/** Queue a loop-control notice; persisted as its own row like every other reminder. */
+	function queueLoopNotice(source: string, params?: Record<string, string | number>): void {
+		const injection: LoopInjection = {
+			source,
+			...sideCarBodyWithText(source, { kind: "notice", ...(params ? { params } : {}) }, locale),
+		};
+		requiredLoopInjections.add(injection);
+		queueLoopInjection(injection);
+	}
+
 	/** Persist reminders once, retaining their source IDs until input is actually assembled. */
 	async function flushLoopInjections(): Promise<void> {
 		if (pendingLoopInjections.length === 0) return;
 		const queued = pendingLoopInjections.splice(0, pendingLoopInjections.length);
-		if (!config.deliverInjectionRow) return;
 		for (const injection of queued) {
-			try {
-				const delivered = await config.deliverInjectionRow(injection);
-				const part = typeof delivered === "string" ? { text: delivered } : delivered;
-				if (part.text.trim()) pendingInputParts.push(part);
-			} catch (err) {
-				logger.warn("Failed to deliver loop injection row", {
-					narratorId: config.narratorId,
-					source: injection.source,
-					error: String(err),
-				});
+			let delivered = false;
+			if (config.deliverInjectionRow) {
+				try {
+					const result = await config.deliverInjectionRow(injection);
+					const part = typeof result === "string" ? { text: result } : result;
+					if (part.text.trim()) {
+						pendingInputParts.push(part);
+						delivered = true;
+					}
+				} catch (err) {
+					logger.warn("Failed to deliver loop injection row", {
+						narratorId: config.narratorId,
+						source: injection.source,
+						error: String(err),
+					});
+				}
 			}
+			if (!delivered && requiredLoopInjections.has(injection))
+				pendingInputParts.push({ text: injection.content });
 		}
+	}
+
+	/**
+	 * The persisted form of one settled tool result.
+	 *
+	 * A broken call stores its sanitized input and the fixed broken-call result (the
+	 * model's history leaves it out); images travel with the event so the consumer can
+	 * save them, which is what lets a rebuilt request carry them too.
+	 */
+	function toolResultEvent(
+		tu: AgentToolUse,
+		result: ToolExecResult,
+		overrides: { durationMs?: number; metadata?: Record<string, unknown> } = {},
+	): Extract<AgentEvent, { type: "tool_result" }> {
+		const brokenInputOverride = result.broken
+			? sanitizeBrokenInput(tu.name, result.updatedInput ?? tu.input, locale)
+			: undefined;
+		return {
+			type: "tool_result",
+			toolCallBinding: executionBindings.get(tu),
+			toolUseId: tu.toolUseId,
+			toolName: tu.name,
+			input: result.updatedInput ?? tu.input,
+			output: result.broken ? getToolMessage("brokenToolCallResult", locale) : result.output,
+			isError: result.isError ?? false,
+			durationMs: overrides.durationMs ?? result.durationMs,
+			permissionStartedAt: result.permissionStartedAt,
+			executionStartedAt: result.executionStartedAt,
+			completedAt: result.completedAt,
+			brokenInputOverride,
+			updatedInput: brokenInputOverride ?? result.updatedInput,
+			metadata: overrides.metadata ?? result.metadata,
+			...(!result.broken && result.images?.length ? { images: result.images } : {}),
+		};
 	}
 
 	/**
@@ -3714,31 +3771,6 @@ async function* agentLoopInMetadataSnapshot(
 			let lastStopReason: string | undefined;
 			const namelessToolUseIds = new Set<string>();
 
-			function earlyToolResultEvent(
-				tu: AgentToolUse,
-				settled: ToolExecResult,
-			): Extract<AgentEvent, { type: "tool_result" }> {
-				const brokenOverride = settled.broken
-					? sanitizeBrokenInput(tu.name, settled.updatedInput ?? tu.input, locale)
-					: undefined;
-				return {
-					type: "tool_result",
-					toolCallBinding: executionBindings.get(tu),
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					input: settled.updatedInput ?? tu.input,
-					output: settled.broken ? getToolMessage("brokenToolCallResult", locale) : settled.output,
-					isError: settled.isError ?? false,
-					durationMs: settled.durationMs,
-					permissionStartedAt: settled.permissionStartedAt,
-					executionStartedAt: settled.executionStartedAt,
-					completedAt: settled.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride ?? settled.updatedInput,
-					metadata: settled.metadata,
-				};
-			}
-
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
 					const settled = settledResults.get(tu.toolUseId);
@@ -3748,7 +3780,7 @@ async function* agentLoopInMetadataSnapshot(
 					if (settled.updatedInput && tu.name !== "AskUserQuestion")
 						tu.input = settled.updatedInput;
 					await processToolResultInjections(tu, settled);
-					yield earlyToolResultEvent(tu, settled);
+					yield toolResultEvent(tu, settled);
 				}
 			}
 
@@ -3769,7 +3801,7 @@ async function* agentLoopInMetadataSnapshot(
 					// final result alive without holding up interruption or emitting into
 					// a stream that may already belong to the narrator's next run.
 					void execution
-						.then((settled) => persist(earlyToolResultEvent(tu, settled)))
+						.then((settled) => persist(toolResultEvent(tu, settled)))
 						.catch((error) => {
 							logger.error("Failed to persist detached tool result", {
 								narratorId: config.narratorId,
@@ -3822,7 +3854,7 @@ async function* agentLoopInMetadataSnapshot(
 				for (const tu of toolUses) {
 					if (earlyExecMap.has(tu.toolUseId) || yieldedToolResults.has(tu.toolUseId)) continue;
 					yieldedToolResults.add(tu.toolUseId);
-					yield earlyToolResultEvent(tu, {
+					yield toolResultEvent(tu, {
 						output: locale === "zh-CN" ? "工具执行已取消。" : "Tool execution cancelled.",
 						isError: true,
 						durationMs: 0,
@@ -5249,29 +5281,8 @@ async function* agentLoopInMetadataSnapshot(
 											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
 											if (sr.updatedInput && prevTu.name !== "AskUserQuestion")
 												prevTu.input = sr.updatedInput;
-											const brokenOverride = sr.broken
-												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
-												: undefined;
 											await processToolResultInjections(prevTu, sr);
-											const baseOutput = sr.broken
-												? getToolMessage("brokenToolCallResult", locale)
-												: sr.output;
-											yield {
-												type: "tool_result",
-												toolCallBinding: executionBindings.get(prevTu),
-												toolUseId: prevTu.toolUseId,
-												toolName: prevTu.name,
-												input: sr.updatedInput ?? prevTu.input,
-												output: baseOutput,
-												isError: sr.isError ?? false,
-												durationMs: sr.durationMs,
-												permissionStartedAt: sr.permissionStartedAt,
-												executionStartedAt: sr.executionStartedAt,
-												completedAt: sr.completedAt,
-												brokenInputOverride: brokenOverride,
-												updatedInput: brokenOverride ?? sr.updatedInput,
-												metadata: sr.metadata,
-											};
+											yield toolResultEvent(prevTu, sr);
 											if (sr.fatal) {
 												yield* finishRequest(sr.output);
 												yield { type: "error", message: sr.output };
@@ -6924,7 +6935,8 @@ async function* agentLoopInMetadataSnapshot(
 					// the model to continue, so the loop can make progress.
 					yield { type: "turn_complete", turnIndex };
 					turnIndex++;
-					nextTurnContent = getToolMessage("userContinue", locale);
+					queueLoopNotice("continue_prompt");
+					await flushLoopInjections();
 					continue turnLoop;
 				}
 
@@ -7032,27 +7044,8 @@ async function* agentLoopInMetadataSnapshot(
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
 				if (sr.updatedInput && tu.name !== "AskUserQuestion") tu.input = sr.updatedInput;
-				const brokenOverride = sr.broken
-					? sanitizeBrokenInput(tu.name, tu.input, locale)
-					: undefined;
 				await processToolResultInjections(tu, sr);
-				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
-				yield {
-					type: "tool_result",
-					toolCallBinding: executionBindings.get(tu),
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					input: sr.updatedInput ?? tu.input,
-					output: baseOutput,
-					isError: sr.isError ?? false,
-					durationMs: sr.durationMs,
-					permissionStartedAt: sr.permissionStartedAt,
-					executionStartedAt: sr.executionStartedAt,
-					completedAt: sr.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride ?? sr.updatedInput,
-					metadata: sr.metadata,
-				};
+				yield toolResultEvent(tu, sr);
 				if (sr.fatal) {
 					yield { type: "error", message: sr.output };
 					return;
@@ -7121,7 +7114,7 @@ async function* agentLoopInMetadataSnapshot(
 					};
 					if (!yieldedToolResults.has(tu.toolUseId)) {
 						yieldedToolResults.add(tu.toolUseId);
-						yield earlyToolResultEvent(tu, result);
+						yield toolResultEvent(tu, result);
 					}
 					guidanceResults.push(
 						provider.formatToolResult(
@@ -7165,9 +7158,7 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			if (hasOrphanedToolUses) {
-				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-					toolNames: orphanedToolNames.join(", "),
-				});
+				queueLoopNotice("broken_call", { toolNames: orphanedToolNames.join(", ") });
 				if (toolUses.length === 0) {
 					if (isFirstTurn) {
 						provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
@@ -7188,6 +7179,8 @@ async function* agentLoopInMetadataSnapshot(
 						redactedThinkingBlocks,
 						orderedAssistantContent(toHistoryToolUses(toolUses)),
 					);
+					// No tools ran, so the boundary below is skipped: deliver the notice here.
+					await flushLoopInjections();
 					yield { type: "turn_complete", turnIndex };
 					turnIndex++;
 					continue;
@@ -7243,15 +7236,13 @@ async function* agentLoopInMetadataSnapshot(
 
 			// Execute each tool call
 			pendingToolResults = [];
-			// Nudge threshold: append a wrap-up reminder when ≥80% of maxTurns used
+			// Nudge threshold: a wrap-up notice after this step's results when ≥80% of
+			// maxTurns is used. Its own row, after the results, not inside the last one.
 			const nudgeThreshold = Math.floor(maxTurns * 0.8);
 			const shouldNudge = turnIndex >= nudgeThreshold;
-			const nudgeText = shouldNudge
-				? getToolMessageWithParams("turnNudge", locale, {
-						turnIndex: turnIndex + 1,
-						maxTurns,
-					})
-				: "";
+			const queueTurnNudge = () => {
+				if (shouldNudge) queueLoopNotice("turn_nudge", { turnIndex: turnIndex + 1, maxTurns });
+			};
 
 			// Preserve provider order while grouping consecutive parallel-safe calls.
 			// The same grouping function is used by planned-update recovery.
@@ -7306,17 +7297,12 @@ async function* agentLoopInMetadataSnapshot(
 					// input into history — otherwise the model sees the original (wrong) path.
 					if (result.updatedInput && tu.name !== "AskUserQuestion") tu.input = result.updatedInput;
 					await processToolResultInjections(tu, result);
-					const isLastTool = toolIndex === toolUses.length - 1;
-					// The turn nudge is still appended inline: it is about THIS being the last
-					// tool of a nearly-exhausted turn, so it has to travel with that result
-					// rather than wait for a boundary the loop may not reach.
-					const outputForModel =
-						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
+					if (toolIndex === toolUses.length - 1) queueTurnNudge();
 
 					pendingToolResults.push(
 						provider.formatToolResult(
 							tu.toolUseId,
-							outputForModel,
+							result.output,
 							result.isError ?? false,
 							result.images,
 							tu.name,
@@ -7342,34 +7328,13 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						prevToolsExecMs += result.durationMs;
 
-						// For broken tool calls, sanitize the persisted input and output
-						// so the DB shows a clean message instead of truncated garbage.
-						const brokenInputOverride = result.broken
-							? sanitizeBrokenInput(tu.name, tu.input, locale)
-							: undefined;
-
 						yieldedToolResults.add(tu.toolUseId);
-						yield {
-							type: "tool_result",
-							toolCallBinding: executionBindings.get(tu),
-							toolUseId: tu.toolUseId,
-							toolName: tu.name,
-							input: result.updatedInput ?? tu.input,
-							output: result.broken
-								? getToolMessage("brokenToolCallResult", locale)
-								: result.output,
-							isError: result.isError ?? false,
+						yield toolResultEvent(tu, result, {
 							durationMs,
-							permissionStartedAt: result.permissionStartedAt,
-							executionStartedAt: result.executionStartedAt,
-							completedAt: result.completedAt,
-							brokenInputOverride,
-							updatedInput: brokenInputOverride ?? result.updatedInput,
-							metadata:
-								durationMs !== result.durationMs
-									? { ...result.metadata, execDurationMs: result.durationMs }
-									: result.metadata,
-						};
+							...(durationMs !== result.durationMs
+								? { metadata: { ...result.metadata, execDurationMs: result.durationMs } }
+								: {}),
+						});
 						toolIndex++;
 
 						if (result.fatal) {
@@ -7451,28 +7416,7 @@ async function* agentLoopInMetadataSnapshot(
 							// event; an abort drain at the next group boundary must not replay
 							// a result that was already delivered to persistence/UI.
 							yieldedToolResults.add(tu.toolUseId);
-							const brokenInputOverride = effectiveResult.broken
-								? sanitizeBrokenInput(tu.name, tu.input, locale)
-								: undefined;
-
-							yield {
-								type: "tool_result",
-								toolCallBinding: executionBindings.get(tu),
-								toolUseId: tu.toolUseId,
-								toolName: tu.name,
-								input: effectiveResult.updatedInput ?? tu.input,
-								output: effectiveResult.broken
-									? getToolMessage("brokenToolCallResult", locale)
-									: effectiveResult.output,
-								isError: effectiveResult.isError ?? false,
-								durationMs: effectiveResult.durationMs,
-								permissionStartedAt: effectiveResult.permissionStartedAt,
-								executionStartedAt: effectiveResult.executionStartedAt,
-								completedAt: effectiveResult.completedAt,
-								brokenInputOverride,
-								updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
-								metadata: effectiveResult.metadata,
-							};
+							yield toolResultEvent(tu, effectiveResult);
 						}
 						if (effectiveResult.durationMs > maxParallelMs)
 							maxParallelMs = effectiveResult.durationMs;
@@ -7484,14 +7428,10 @@ async function* agentLoopInMetadataSnapshot(
 						const tu = group[i];
 						const effectiveResult = settled[i];
 						if (!effectiveResult) continue;
-						const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
-						const outputForModel =
-							isLastTool && shouldNudge
-								? effectiveResult.output + nudgeText
-								: effectiveResult.output;
+						if (groupStartToolIndex + i === toolUses.length - 1) queueTurnNudge();
 						formattedResults[i] = provider.formatToolResult(
 							tu.toolUseId,
-							outputForModel,
+							effectiveResult.output,
 							effectiveResult.isError ?? false,
 							effectiveResult.images,
 							tu.name,
@@ -7572,27 +7512,7 @@ async function* agentLoopInMetadataSnapshot(
 
 						if (!yieldedToolResults.has(remainingTool.toolUseId)) {
 							yieldedToolResults.add(remainingTool.toolUseId);
-							const brokenInputOverride = result.broken
-								? sanitizeBrokenInput(remainingTool.name, remainingTool.input, locale)
-								: undefined;
-							yield {
-								type: "tool_result",
-								toolCallBinding: executionBindings.get(remainingTool),
-								toolUseId: remainingTool.toolUseId,
-								toolName: remainingTool.name,
-								input: result.updatedInput ?? remainingTool.input,
-								output: result.broken
-									? getToolMessage("brokenToolCallResult", locale)
-									: result.output,
-								isError: result.isError ?? false,
-								durationMs: result.durationMs,
-								permissionStartedAt: result.permissionStartedAt,
-								executionStartedAt: result.executionStartedAt,
-								completedAt: result.completedAt,
-								brokenInputOverride,
-								updatedInput: brokenInputOverride ?? result.updatedInput,
-								metadata: result.metadata,
-							};
+							yield toolResultEvent(remainingTool, result);
 						}
 						if (result.fatal && !fatalOutput) fatalOutput = result.output;
 					}
@@ -7647,14 +7567,13 @@ async function* agentLoopInMetadataSnapshot(
 					orderedAssistantContent(toHistoryToolUses(cleanToolUses)),
 				);
 
-				// Inject a user-side reminder so the model knows what happened and
-				// switches strategy instead of blindly retrying the same large write.
+				// A notice row tells the model what happened, so it switches strategy instead
+				// of blindly retrying the same large write. The calls themselves are stored
+				// as broken, and every rebuild leaves them out the same way.
 				const brokenNames = toolUses
 					.filter((tu) => brokenToolUseIds.has(tu.toolUseId))
 					.map((tu) => tu.name);
-				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-					toolNames: brokenNames.join(", "),
-				});
+				queueLoopNotice("broken_call", { toolNames: brokenNames.join(", ") });
 			} else {
 				// Append assistant message to history for next turn
 				provider.pushAssistantTurn(

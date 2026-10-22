@@ -690,7 +690,19 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 						type: "function_result",
 						call_id: result.wireId,
 						name: result.name,
-						result: result.isError ? { error: result.text } : result.text,
+						// Images ride with a successful result, as the live turn sends them.
+						result: result.isError
+							? { error: result.text }
+							: result.images.length
+								? [
+										{ type: "text", text: result.text },
+										...result.images.map((image) => ({
+											type: "image",
+											data: image.base64,
+											mime_type: image.mediaType,
+										})),
+									]
+								: result.text,
 					});
 				continue;
 			}

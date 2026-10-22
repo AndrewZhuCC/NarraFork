@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { normalizeApiRequestDiagnostics } from "@shared/agent-protocol/error-diagnostics";
+import { encodeToolOutput, type ToolOutputImageRef } from "@shared/agent-protocol/tool-output";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
@@ -46,6 +47,7 @@ import {
 	resolveTranslationModelOverride,
 	settings,
 } from "../lib/settings";
+import { saveUploadedImage } from "../lib/uploads";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
@@ -184,6 +186,49 @@ function boundedWriteInput(input: Record<string, unknown>, update?: TextDocument
 }
 
 /**
+ * The stored output of a tool result: text plus metadata, the broken marker and the
+ * images the tool returned. Images are saved as uploads of this narrator and stored by
+ * reference, so a rebuilt request can send them again; one that cannot be saved is
+ * logged and left out while the text is kept.
+ */
+export async function toolResultLedgerOutput(
+	narratorId: string,
+	event: Extract<AgentEvent, { type: "tool_result" }>,
+): Promise<unknown> {
+	const images: ToolOutputImageRef[] = [];
+	for (const [index, image] of (event.images ?? []).entries()) {
+		try {
+			const saved = await saveUploadedImage(
+				narratorId,
+				new File(
+					[Buffer.from(image.base64, "base64")],
+					`${event.toolUseId}-${index}.${image.format}`,
+					{
+						type: `image/${image.format}`,
+					},
+				),
+			);
+			images.push({
+				imageId: saved.imageId,
+				mediaType: saved.mediaType,
+				uploadNarratorId: saved.uploadNarratorId ?? narratorId,
+			});
+		} catch (error) {
+			logger.warn("Failed to save a tool result image; its text is kept", {
+				narratorId,
+				toolUseId: event.toolUseId,
+				error: String(error),
+			});
+		}
+	}
+	return encodeToolOutput(event.output, {
+		metadata: event.metadata,
+		broken: !!event.brokenInputOverride,
+		images,
+	});
+}
+
+/**
  * Finish an already-started tool after its loop has drained/aborted. This intentionally
  * takes no EventHandlerContext: a newer turn may own the streaming snapshot and hooks.
  * Only the original execution receipt can update history; never recover it by provider id.
@@ -196,13 +241,14 @@ export async function persistDetachedToolResult(
 	if (!binding) {
 		throw new CriticalEventPersistenceError("Detached tool result has no execution receipt");
 	}
+	const output = await toolResultLedgerOutput(narratorId, event);
 	// The generator is already gone, so a transient lock cannot rely on its normal
 	// tool_result retry path. Retry asynchronously and retain the same CAS authority.
 	const affected = await withDbRetry(
 		() =>
 			narratorPersistence.updateToolCallResult(event.toolUseId, {
 				expectedBinding: { ...binding, narratorId },
-				output: event.metadata ? { _text: event.output, _metadata: event.metadata } : event.output,
+				output,
 				input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
 				status: event.isError ? "fail" : "success",
 				errorMessage: event.isError ? event.output : undefined,
@@ -2537,9 +2583,7 @@ export async function processEvent(
 					"Prepared plan state belongs to another tool attempt",
 				);
 			}
-			const persistedOutput = event.metadata
-				? { _text: event.output, _metadata: event.metadata }
-				: event.output;
+			const persistedOutput = await toolResultLedgerOutput(narratorId, event);
 			const isSuccessfulEnterPlanMode = event.toolName === "EnterPlanMode" && !event.isError;
 			if (isSuccessfulEnterPlanMode && ctx.committedPlanModeToolUseIds?.has(event.toolUseId)) {
 				return null;
@@ -2712,9 +2756,7 @@ export async function processEvent(
 						await narratorService.updateToolCallResult(
 							event.toolUseId,
 							{
-								output: event.metadata
-									? { _text: event.output, _metadata: event.metadata }
-									: event.output,
+								output: persistedOutput,
 								status,
 								errorMessage: event.isError ? event.output : undefined,
 								durationMs: event.durationMs,

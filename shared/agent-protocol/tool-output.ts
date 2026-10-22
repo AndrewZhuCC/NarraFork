@@ -1,10 +1,10 @@
 /**
- * tool-output.ts — normalize a persisted tool result to the text a model reads.
+ * tool-output.ts — the stored form of a tool result (`narrator_tool_calls.outputJson`):
+ * how it is written, and how the text, broken marker and images are read back.
  *
  * Lived in `sidecar.ts` until the side-car channel was retired, purely because that
  * file happened to be where the history builders already imported from. It has nothing
- * to do with injected content: every provider's `buildHistory` needs it to turn a
- * `narrator_tool_calls.outputJson` value back into a string, and that is all it does.
+ * to do with injected content.
  */
 
 /**
@@ -26,4 +26,70 @@ export function outputToText(value: unknown): string {
 		if (typeof maybeText === "string") return maybeText;
 	}
 	return value == null ? "" : JSON.stringify(value);
+}
+
+/** An image a tool returned, saved as an upload; the ledger keeps only the reference. */
+export interface ToolOutputImageRef {
+	imageId: string;
+	mediaType: string;
+	/** Narrator whose upload directory holds the file. */
+	uploadNarratorId: string;
+}
+
+/**
+ * Encode a tool result for `narrator_tool_calls.outputJson`.
+ *
+ * Plain text stays a plain string. Anything else uses the `_text` wrapper:
+ *   - `_metadata` — the tool's structured result for the reader's card;
+ *   - `_broken`   — the call's input was invalid and it never ran; the model's
+ *                   history leaves the call and its result out (a notice row says why);
+ *   - `_images`   — images the tool returned, by upload reference.
+ */
+export function encodeToolOutput(
+	text: string,
+	extra: {
+		metadata?: Record<string, unknown>;
+		broken?: boolean;
+		images?: readonly ToolOutputImageRef[];
+	} = {},
+): unknown {
+	if (!extra.metadata && !extra.broken && !extra.images?.length) return text;
+	return {
+		_text: text,
+		...(extra.metadata ? { _metadata: extra.metadata } : {}),
+		...(extra.broken ? { _broken: true } : {}),
+		...(extra.images?.length ? { _images: extra.images.map((image) => ({ ...image })) } : {}),
+	};
+}
+
+function outputRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/** Whether a stored output belongs to a call whose input was invalid and never ran. */
+export function isBrokenToolOutput(value: unknown): boolean {
+	return outputRecord(value)?._broken === true;
+}
+
+/** Image references of a stored output; malformed entries are skipped. */
+export function toolOutputImages(value: unknown): ToolOutputImageRef[] {
+	const images = outputRecord(value)?._images;
+	if (!Array.isArray(images)) return [];
+	return images.flatMap((image) => {
+		const ref = outputRecord(image);
+		return ref &&
+			typeof ref.imageId === "string" &&
+			typeof ref.mediaType === "string" &&
+			typeof ref.uploadNarratorId === "string"
+			? [
+					{
+						imageId: ref.imageId,
+						mediaType: ref.mediaType,
+						uploadNarratorId: ref.uploadNarratorId,
+					},
+				]
+			: [];
+	});
 }

@@ -269,6 +269,11 @@ describe("round token totals at the Stop hook", () => {
 			]);
 			await h.run();
 			expect(stopTotals).toEqual([exit === "workspace" ? 2315 : 2300]);
+			if (exit === "workspace") {
+				// The workspace notice is a persisted row the next pass reads from history.
+				expect(h.calls[1]?.userText).toBe("");
+				expect(modelInputText(h.calls[1])).toContain("Working directory changed.");
+			}
 		});
 	}
 

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { encodeToolOutput } from "../agent-protocol/tool-output";
 import { type DecodableMessage, decodeLegacyContent, splitToolInput } from "./decode";
 import { isModelVisible } from "./types";
 
@@ -94,6 +95,53 @@ describe("decodeLegacyContent: assistant steps", () => {
 		expect(envelope.blocks[0]).toMatchObject({ kind: "tool", phase: "open" });
 		expect(isModelVisible(envelope.blocks[0])).toBe(false);
 		expect(envelope.toolOutputs).toBeUndefined();
+	});
+
+	test("a broken call is failed and carries no result; tool images become result parts", () => {
+		const envelope = decodeLegacyContent(
+			row({
+				role: "assistant",
+				contentJson: [
+					{ type: "tool_use", id: "toolu_bad", name: "Write", input: { content: "[invalid]" } },
+					{ type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} },
+				],
+				toolCalls: [
+					{
+						toolUseId: "toolu_bad",
+						toolName: "Write",
+						inputJson: { content: "[invalid]" },
+						outputJson: encodeToolOutput("not executed", { broken: true }),
+						status: "fail",
+					},
+					{
+						toolUseId: "toolu_shot",
+						toolName: "Screenshot",
+						inputJson: {},
+						outputJson: encodeToolOutput("captured", {
+							images: [{ imageId: "img1", mediaType: "image/png", uploadNarratorId: "n1" }],
+						}),
+						status: "success",
+					},
+				],
+			}),
+		);
+		expect(envelope.blocks[0]).toMatchObject({
+			phase: "failed",
+			payload: { result: { isError: true } },
+		});
+		expect(isModelVisible(envelope.blocks[0])).toBe(false);
+		expect(envelope.blocks[1]).toMatchObject({
+			phase: "done",
+			payload: {
+				result: {
+					isError: false,
+					parts: [
+						{ type: "image", assetId: "img1", mediaType: "image/png", uploadNarratorId: "n1" },
+					],
+				},
+			},
+		});
+		expect(Object.keys(envelope.toolOutputs ?? {})).toEqual(["toolu_shot"]);
 	});
 
 	test("ledger-only calls are synthesized after the content; internal reads are dropped", () => {

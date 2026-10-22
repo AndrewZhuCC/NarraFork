@@ -1,7 +1,8 @@
 /**
- * Prefetch the bytes a projection needs (§7.1): uploaded images of inputs and the
- * saved result of provider image generations. Reading happens here, asynchronously,
- * so the projection itself is a pure function of the view and these bytes.
+ * Prefetch the bytes a projection needs (§7.1): uploaded images of inputs, images local
+ * tools returned, and the saved result of provider image generations. Reading happens
+ * here, asynchronously, so the projection itself is a pure function of the view and
+ * these bytes.
  */
 
 import type { CanonicalEnvelope } from "@shared/narrator-blocks/types";
@@ -48,13 +49,14 @@ async function readUpload(
 	}
 }
 
-/** Load the image bytes of every visible input and generated image in the view. */
+/** Load the image bytes of every input, tool result and generated image in the view. */
 export async function resolveProjectionAssets(
 	envelopes: readonly CanonicalEnvelope[],
 	narratorId?: string,
 ): Promise<ProjectionAssets> {
 	const inputImages = new Map<string, Array<ResolvedImage | null>>();
 	const generatedImages = new Map<string, string>();
+	const toolResultImages = new Map<string, ResolvedImage[]>();
 	for (const envelope of envelopes) {
 		const owner = envelope.narratorId ?? narratorId;
 		for (const block of envelope.blocks) {
@@ -79,6 +81,24 @@ export async function resolveProjectionAssets(
 				inputImages.set(block.id, slots);
 				continue;
 			}
+			if (block.kind === "tool" && block.payload.executor === "local") {
+				const parts = block.payload.result?.parts ?? [];
+				if (!parts.length || block.phase !== "done") continue;
+				const images: ResolvedImage[] = [];
+				for (const part of parts) {
+					const uploader = part.uploadNarratorId ?? owner;
+					const image = uploader
+						? await readUpload(uploader, part.assetId, part.mediaType, {
+								narratorId,
+								messageId: envelope.id,
+								toolUseId: block.wireId,
+							})
+						: null;
+					if (image) images.push(image);
+				}
+				if (images.length) toolResultImages.set(block.id, images);
+				continue;
+			}
 			if (block.kind === "tool" && block.subtype === "image_generation") {
 				const result = block.providerMeta?.result as Record<string, unknown> | undefined;
 				const savedPath = typeof result?.savedPath === "string" ? result.savedPath : undefined;
@@ -92,5 +112,5 @@ export async function resolveProjectionAssets(
 			}
 		}
 	}
-	return { inputImages, generatedImages };
+	return { inputImages, generatedImages, toolResultImages };
 }

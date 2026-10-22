@@ -2498,10 +2498,9 @@ export async function drainInjectionsIntoHistory(
 	onConsumed: () => void;
 }> {
 	const narratorId = active.narratorId;
+	// Every part is a persisted row. Unresolved questions are listed in the pass's system
+	// prompt instead of being re-sent, unpersisted, at every tool boundary.
 	const parts: AgentInputPart[] = [];
-	const { buildPendingQuestionHint } = await import("./narrator-question-service");
-	const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
-	if (pendingQuestionHint) parts.push({ text: pendingQuestionHint });
 	const adoptedDeliveries: AgentMessageDelivery[] = [];
 	const adoptedMailbox: MailboxDeliveryConsumption[] = [];
 

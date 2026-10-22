@@ -8,6 +8,7 @@
  * from; blocks synthesized from row-level data use a stable suffix instead.
  */
 
+import { isBrokenToolOutput, toolOutputImages } from "../agent-protocol/tool-output";
 import type { TextCitation } from "../citations";
 import type { MessageOrigin } from "../message-origin";
 import {
@@ -29,6 +30,7 @@ import type {
 	ToolBlock,
 	ToolChange,
 	ToolOutput,
+	ToolResult,
 } from "./types";
 
 /** One adopted ledger attempt per tool use, as the history loader returns them. */
@@ -134,6 +136,39 @@ function terminal(status: string): status is ToolOutput["status"] {
 	return status === "success" || status === "fail";
 }
 
+/**
+ * Phase and result of a local call, from its ledger attempt.
+ *
+ * A call whose input was invalid never ran: it is `failed`, so neither it nor its stored
+ * placeholder result reaches the model (a `broken_call` notice row says why).
+ */
+function toolState(call: DecodableToolCall | undefined): {
+	phase: BlockPhase;
+	result?: ToolResult;
+	output?: ToolOutput;
+} {
+	if (!call || !terminal(call.status)) return { phase: "open" };
+	if (isBrokenToolOutput(call.outputJson)) return { phase: "failed", result: { isError: true } };
+	const images = toolOutputImages(call.outputJson);
+	return {
+		phase: "done",
+		result: {
+			isError: call.status === "fail",
+			...(images.length
+				? {
+						parts: images.map((image) => ({
+							type: "image" as const,
+							assetId: image.imageId,
+							mediaType: image.mediaType,
+							uploadNarratorId: image.uploadNarratorId,
+						})),
+					}
+				: {}),
+		},
+		output: { status: call.status, output: call.outputJson },
+	};
+}
+
 function outputPhase(raw: RawBlock): BlockPhase {
 	return raw.completed === false ? "aborted" : "done";
 }
@@ -199,20 +234,21 @@ function decodeToolUse(
 	const blockInput = splitToolInput(raw.input);
 	const signature = string(raw.thoughtSignature) ?? ledger?.thoughtSignature;
 	const source = string(raw.thoughtSignatureSource) ?? ledger?.thoughtSignatureSource;
+	const state = toolState(call);
 	return {
 		id,
 		kind: "tool",
 		subtype: call?.toolName || string(raw.name) || "",
 		wireId,
 		ordinal: 0,
-		phase: call && terminal(call.status) ? "done" : "open",
+		phase: state.phase,
 		payload: {
 			input: ledger ? ledger.input : blockInput.input,
 			executor: "local",
 			issuer: USER_ISSUED_TOOL_USE_PREFIXES.some((prefix) => wireId.startsWith(prefix))
 				? "user"
 				: "model",
-			...(call && terminal(call.status) ? { result: { isError: call.status === "fail" } } : {}),
+			...(state.result ? { result: state.result } : {}),
 		},
 		...(signature
 			? {
@@ -227,18 +263,19 @@ function decodeToolUse(
 
 function ledgerOnlyTool(messageId: string, call: DecodableToolCall): ToolBlock {
 	const { input, thoughtSignature, thoughtSignatureSource } = splitToolInput(call.inputJson);
+	const state = toolState(call);
 	return {
 		id: `${messageId}:call:${call.toolUseId}`,
 		kind: "tool",
 		subtype: call.toolName,
 		wireId: call.toolUseId,
 		ordinal: 0,
-		phase: terminal(call.status) ? "done" : "open",
+		phase: state.phase,
 		payload: {
 			input,
 			executor: "local",
 			issuer: "model",
-			...(terminal(call.status) ? { result: { isError: call.status === "fail" } } : {}),
+			...(state.result ? { result: state.result } : {}),
 		},
 		...(thoughtSignature
 			? {
@@ -326,8 +363,8 @@ function decodeAssistant(message: DecodableMessage): {
 				const block = decodeToolUse(id, raw, call);
 				if (!block) return;
 				consumed.add(block.wireId);
-				if (call && terminal(call.status))
-					toolOutputs[block.wireId] = { status: call.status, output: call.outputJson };
+				const output = toolState(call).output;
+				if (output) toolOutputs[block.wireId] = output;
 				blocks.push(block);
 				return;
 			}
@@ -359,8 +396,8 @@ function decodeAssistant(message: DecodableMessage): {
 	for (const call of calls.values()) {
 		if (consumed.has(call.toolUseId)) continue;
 		blocks.push(ledgerOnlyTool(message.id, call));
-		if (terminal(call.status))
-			toolOutputs[call.toolUseId] = { status: call.status, output: call.outputJson };
+		const output = toolState(call).output;
+		if (output) toolOutputs[call.toolUseId] = output;
 	}
 	blocks.forEach((block, ordinal) => {
 		block.ordinal = ordinal;

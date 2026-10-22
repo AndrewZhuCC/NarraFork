@@ -346,6 +346,10 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	noticeSilentProgress: "You have made {count} tool calls without a visible reply",
 	noticeRelaxedPlan: "Still planning — write the plan to {planFile}, do not implement yet",
 	noticePipelineExit: "Pipeline is still active — confirm whether it is still needed",
+	noticeTurnNudge: "Turn {turnIndex} of {maxTurns} — time to wrap up",
+	noticeBrokenCall: "Invalid {toolNames} call removed from context — retry with valid input",
+	noticeContinue: "Asked to continue after an empty reply",
+	noticeWorkspaceChanged: "Working directory changed — continuing in the new workspace",
 	// Dynamic Spec digests.
 	tasksCurrent: "Dynamic Spec — {n} open task(s)",
 	tasksEmptyNever: "Dynamic Spec — no tasks created yet",
@@ -486,6 +490,17 @@ function noticeHeadline(
 			});
 		case "pipeline_exit_confirmation":
 			return label(labels, "noticePipelineExit");
+		case "turn_nudge":
+			return labelWith(labels, "noticeTurnNudge", {
+				turnIndex: params?.turnIndex ?? 0,
+				maxTurns: params?.maxTurns ?? 0,
+			});
+		case "broken_call":
+			return labelWith(labels, "noticeBrokenCall", { toolNames: params?.toolNames ?? "" });
+		case "continue_prompt":
+			return label(labels, "noticeContinue");
+		case "workspace_changed":
+			return label(labels, "noticeWorkspaceChanged");
 		default:
 			// An unmapped notice source: the caller's own source label is the best we
 			// can say, and it is already painted beside the headline.
@@ -865,6 +880,14 @@ function noticeModelKey(source: string): string {
 			return "noticeRelaxedPlan";
 		case "pipeline_exit_confirmation":
 			return "noticePipelineExit";
+		case "turn_nudge":
+			return "noticeTurnNudge";
+		case "broken_call":
+			return "noticeBrokenCall";
+		case "continue_prompt":
+			return "noticeContinue";
+		case "workspace_changed":
+			return "noticeWorkspaceChanged";
 		default:
 			return "";
 	}

@@ -41,11 +41,14 @@ export interface ProjectionAssets {
 	inputImages: ReadonlyMap<string, ReadonlyArray<ResolvedImage | null>>;
 	/** Base64 result of a provider-executed image generation, by block id. */
 	generatedImages: ReadonlyMap<string, string>;
+	/** Readable images a local tool returned, by tool block id; unreadable ones are left out. */
+	toolResultImages: ReadonlyMap<string, readonly ResolvedImage[]>;
 }
 
 export const NO_ASSETS: ProjectionAssets = {
 	inputImages: new Map(),
 	generatedImages: new Map(),
+	toolResultImages: new Map(),
 };
 
 export interface NeutralInputItem {
@@ -241,7 +244,7 @@ function assistantItems(
 	return items;
 }
 
-function toolResults(envelope: CanonicalEnvelope): NeutralToolResult[] {
+function toolResults(envelope: CanonicalEnvelope, assets: ProjectionAssets): NeutralToolResult[] {
 	const results: NeutralToolResult[] = [];
 	for (const block of envelope.blocks) {
 		if (block.kind !== "tool" || block.payload.executor !== "local" || !isModelVisible(block))
@@ -255,7 +258,7 @@ function toolResults(envelope: CanonicalEnvelope): NeutralToolResult[] {
 			name: block.subtype,
 			isError: output.status === "fail",
 			text: appendix ? `${text}${appendix}` : text,
-			images: [],
+			images: [...(assets.toolResultImages.get(block.id) ?? [])],
 		});
 	}
 	return results;
@@ -287,7 +290,7 @@ export function toTurns(
 				...(envelope.upstreamMessageId ? { upstreamMessageId: envelope.upstreamMessageId } : {}),
 				items,
 			});
-			const results = toolResults(envelope);
+			const results = toolResults(envelope, assets);
 			if (results.length) turns.push({ kind: "tool_results", envelopeId: envelope.id, results });
 			continue;
 		}

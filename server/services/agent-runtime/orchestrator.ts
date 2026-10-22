@@ -67,6 +67,7 @@ import {
 	usesCodexModel,
 	usesStatefulModel,
 } from "../../lib/settings";
+import { sideCarBodyWithText } from "../../lib/sidecar-templates";
 import type { ImageRef, PersistedUserImageBlock, TextFileRef } from "../../lib/uploads";
 import {
 	getImagePath,
@@ -2274,9 +2275,15 @@ export async function runAgentLoopUnlocked(
 				!active.abortController.signal.aborted
 			) {
 				// Rebuild config, permissions, skills, prompt and file-reference lanes together.
+				// The notice is a row, so the next pass and every rebuild send the same words.
 				active._workspacePassInvalidated = false;
-				runState.input.text =
-					"Working directory changed. Continue using the newly installed workspace context; unstarted calls from the previous pass were not executed.";
+				await deliverInjection(narratorId, {
+					subagent: placement,
+					source: "workspace_changed",
+					...sideCarBodyWithText("workspace_changed", { kind: "notice" }, locale),
+					locale,
+				});
+				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
 			}

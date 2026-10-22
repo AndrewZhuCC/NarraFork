@@ -475,6 +475,8 @@ export type AgentEvent =
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
 			metadata?: Record<string, unknown>;
+			/** Images the tool returned; the consumer saves them and stores references. */
+			images?: Array<{ format: string; base64: string }>;
 	  }
 	/**
 	 * The tool passed its permission gate and final admission — execution begins NOW.
