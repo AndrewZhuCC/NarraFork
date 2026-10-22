@@ -192,6 +192,123 @@ describe("Write complete input source routing", () => {
 	});
 });
 
+describe("reasoning translation output boundary", () => {
+	for (const boundary of [
+		"stream_text",
+		"tool_use_chunk",
+		"tool_call",
+		"block_complete",
+	] as const) {
+		test(`${boundary} translates the latest reasoning once, never intermediate prefixes`, async () => {
+			const { settings } = await import("../../lib/settings");
+			const agent = await import("../../lib/agent");
+			const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "" });
+			const original = settings.agent.translateReasoning;
+			settings.agent.translateReasoning = true;
+			const id = `translation-boundary-${boundary}`;
+			const createdAt = new Date().toISOString();
+			await db
+				.insert(narrators)
+				.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+			let partialId: string | undefined;
+			const ctx: EventHandlerContext = {
+				...makeMainContext(),
+				narratorId: id,
+				broadcastTargetId: id,
+				locale: "zh-CN",
+				getPartialMessageId: () => partialId,
+				setPartialMessageId: (value) => {
+					partialId = value;
+				},
+			};
+			const checkpoint = (text: string, revision: number) =>
+				processEvent(
+					{
+						type: "block_complete",
+						block: { type: "reasoning", id: "reason", text, revision },
+					},
+					ctx,
+				);
+			try {
+				await checkpoint("A", 1);
+				await checkpoint("A+B", 2);
+				await checkpoint("A+B+C", 3);
+				expect(generate).not.toHaveBeenCalled();
+				expect(ctx.pendingReasoningTranslations?.size).toBe(1);
+				const event =
+					boundary === "stream_text"
+						? { type: "stream_text" as const, text: "Answer" }
+						: boundary === "tool_use_chunk"
+							? {
+									type: "tool_use_chunk" as const,
+									toolUseId: "tool",
+									toolName: "Read",
+									inputCharsTotal: 1,
+								}
+							: boundary === "tool_call"
+								? { type: "tool_call" as const, toolUseId: "tool", toolName: "Read", input: {} }
+								: {
+										type: "block_complete" as const,
+										block: { type: "text" as const, text: "Answer" },
+									};
+				await processEvent(event, ctx);
+				await Bun.sleep(10);
+				expect(generate).toHaveBeenCalledTimes(1);
+				expect(generate.mock.calls[0]?.[0]).toBe("A+B+C");
+				await checkpoint("A+B+C", 4);
+				await processEvent(event, ctx);
+				await Bun.sleep(10);
+				expect(generate).toHaveBeenCalledTimes(1);
+				expect(ctx.pendingReasoningTranslations?.size).toBe(0);
+				// A later, distinct reasoning phase in the same response is independent.
+				await processEvent(
+					{
+						type: "block_complete",
+						block: { type: "reasoning", id: "next-reason", text: "Next thought", revision: 1 },
+					},
+					ctx,
+				);
+				expect(generate).toHaveBeenCalledTimes(1);
+				await processEvent(event, ctx);
+				await Bun.sleep(10);
+				expect(generate).toHaveBeenCalledTimes(2);
+				expect(generate.mock.calls[1]?.[0]).toBe("Next thought");
+			} finally {
+				generate.mockRestore();
+				settings.agent.translateReasoning = original;
+				clearStreamingSnapshot(id);
+				await cleanupFileContextNarrator(id);
+			}
+		});
+	}
+
+	for (const reset of ["stream_reset", "attempt_discarded", "api_request_start"] as const) {
+		test(`${reset} drops reasoning-only attempts without translation`, async () => {
+			const ctx = makeMainContext();
+			ctx.pendingReasoningTranslations = new Map([
+				[
+					"old",
+					{
+						messageId: "discarded",
+						block: { type: "reasoning", id: "old", text: "unused" },
+					},
+				],
+			]);
+			await processEvent(
+				reset === "stream_reset"
+					? { type: reset }
+					: reset === "attempt_discarded"
+						? { type: reset, requestId: "old" }
+						: { type: reset, requestId: "new", model: "test", provider: "test" },
+				ctx,
+			);
+			expect(ctx.pendingReasoningTranslations.size).toBe(0);
+			await processEvent({ type: "stream_text", text: "new answer" }, ctx);
+			expect(ctx.reasoningTranslations?.size ?? 0).toBe(0);
+		});
+	}
+});
+
 describe("request attribution", () => {
 	test("persists the actual request identity on the first content checkpoint", async () => {
 		const id = "request-checkpoint-identity";

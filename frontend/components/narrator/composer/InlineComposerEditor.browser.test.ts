@@ -1059,6 +1059,12 @@ test("real drop coordinates are captured before async file work and survive a la
 			{ type: "attachment", id: "uploaded", assetId: "uploaded" },
 			{ type: "text", text: "def" },
 		]);
+		// Tiptap schedules focus in requestAnimationFrame; model updates do not imply DOM focus.
+		// Wait for the keyboard target, otherwise Ctrl+Z can reach body instead of the editor.
+		await page.waitForFunction(
+			() => document.activeElement === document.querySelector('[role="textbox"]'),
+			{ timeout: 5_000 },
+		);
 		await chord(page, "z", "Control");
 		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
 			{ type: "text", text: "NEWabcdef" },

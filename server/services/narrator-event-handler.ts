@@ -348,6 +348,10 @@ export interface EventHandlerContext {
 	>;
 	/** Avoid translating the same checkpoint concurrently while metadata catches up. */
 	reasoningTranslations?: Set<string>;
+	/** Latest checkpoints wait for real output; reasoning-only retries never translate. */
+	pendingReasoningTranslations?: Map<string, { messageId: string; block: PersistedReasoningBlock }>;
+	/** A reasoning block is dispatched at most once per provider attempt. */
+	dispatchedReasoningTranslations?: Set<string>;
 	/** Retry publication after a checkpoint write succeeded but its announce failed. */
 	unpublishedContentBlockIds?: Set<string>;
 	getTtftMs?: () => number | undefined;
@@ -1622,6 +1626,33 @@ export async function processEvent(
 ): Promise<{ titleUpdate?: boolean } | null> {
 	const { narratorId, broadcastTargetId } = ctx;
 
+	if (
+		event.type === "attempt_discarded" ||
+		event.type === "stream_reset" ||
+		event.type === "api_request_start"
+	) {
+		ctx.pendingReasoningTranslations?.clear();
+		ctx.dispatchedReasoningTranslations?.clear();
+	} else if (
+		(event.type === "stream_text" && event.text.trim().length > 0) ||
+		event.type === "tool_call" ||
+		event.type === "tool_use_chunk" ||
+		(event.type === "block_complete" &&
+			((event.block.type === "text" && event.block.text.trim().length > 0) ||
+				event.block.type === "tool_use"))
+	) {
+		// Drain synchronously before starting asynchronous translations. Further tokens,
+		// tool argument chunks and completion events must not dispatch the same block.
+		ctx.dispatchedReasoningTranslations ??= new Set();
+		for (const [key, { messageId, block }] of ctx.pendingReasoningTranslations ?? []) {
+			ctx.dispatchedReasoningTranslations.add(key);
+			if (settings.agent.translateReasoning && block.text) {
+				translateReasoningBlock(messageId, narratorId, broadcastTargetId, block.text, ctx, block);
+			}
+		}
+		ctx.pendingReasoningTranslations?.clear();
+	}
+
 	switch (event.type) {
 		case "stream_text": {
 			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
@@ -2082,13 +2113,20 @@ export async function processEvent(
 					outputIndex: block.outputIndex,
 				});
 				retireCompletedSnapshot();
-				// Fire-and-forget reasoning translation
+				// Summary segments share a block ID and can repeatedly checkpoint a growing
+				// prefix. Only retain the latest version until real output begins.
 				if (settings.agent.translateReasoning && block.text) {
-					translateReasoningBlock(partialId, narratorId, broadcastTargetId, block.text, ctx, {
-						id: block.id,
-						providerMetadata: block.providerMetadata,
-						outputIndex: block.outputIndex,
-					});
+					const key = JSON.stringify([
+						partialId,
+						block.id ??
+							getReasoningItemId(block.providerMetadata) ??
+							block.outputIndex ??
+							block.text,
+					]);
+					if (!ctx.dispatchedReasoningTranslations?.has(key)) {
+						ctx.pendingReasoningTranslations ??= new Map();
+						ctx.pendingReasoningTranslations.set(key, { messageId: partialId, block });
+					}
 				}
 			} else if (block.type === "redacted_thinking") {
 				await writeAttemptItem(ctx, partialId, {
