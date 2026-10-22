@@ -13,6 +13,8 @@
  *   - `anthropic_deferred_tail` — the definition is appended to the end of `tools`
  *     with `defer_loading`, and a `tool_addition` block names it by reference.
  *   - `openai_additional_tools` — an `additional_tools` input item (Responses API).
+ *   - `kimi_system_tools` — a mid-conversation `role:"system"` message whose `tools`
+ *     field defines the tool by value (Kimi Chat Completions).
  *   - `custom_injection` — the JSON schema is written into the load notice itself,
  *     for endpoints that do not validate tool names against the declared list.
  *
@@ -48,6 +50,7 @@ export const TOOL_LOADING_MODES = [
 	"anthropic_tool_addition",
 	"anthropic_deferred_tail",
 	"openai_additional_tools",
+	"kimi_system_tools",
 	"custom_injection",
 ] as const;
 
@@ -73,6 +76,7 @@ const MODE_PROTOCOL: Record<ToolLoadingMode, ModelProtocol | null> = {
 	anthropic_tool_addition: "anthropic-messages",
 	anthropic_deferred_tail: "anthropic-messages",
 	openai_additional_tools: "openai-responses",
+	kimi_system_tools: "completions-compatible",
 	custom_injection: null,
 };
 
@@ -109,6 +113,21 @@ function gptSupportsAdditionalTools(model: string, codexBackend: boolean): boole
 	return major > floorMajor || (major === floorMajor && minor >= floorMinor);
 }
 
+/** `kimi-k3`, `kimi-k3.5`, and Kimi Coding's `k3`/`k3-256k` → major. */
+const KIMI_VERSION_PATTERN = /(?:^|kimi[-_.]?)k(\d{1,2})(?!\d)/i;
+
+/**
+ * Dynamic tool loading (a `system` message carrying `tools`) is reported for Kimi K3 and
+ * Kimi Coding's `kimi-for-coding`. K2.x and `kimi-for-coding-highspeed` reject a
+ * tool-bearing system message with a 400, so ids that are not known to support it inject.
+ */
+function kimiSupportsSystemTools(model: string): boolean {
+	if (model.includes("highspeed")) return false;
+	if (model === "kimi-for-coding") return true;
+	const match = KIMI_VERSION_PATTERN.exec(model);
+	return !!match && Number(match[1]) >= 3;
+}
+
 /**
  * The modes a model gets when its catalog card declares none. Matched on the bare
  * name so the catalog does not have to list every current model.
@@ -126,6 +145,8 @@ export function defaultToolLoadingModes(
 			? ["openai_additional_tools"]
 			: [];
 	if (bare.includes("deepseek")) return ["anthropic_deferred_tail"];
+	// Through an Anthropic or Responses relay Kimi has no native form; inject instead.
+	if (kimiSupportsSystemTools(bare)) return ["kimi_system_tools", "custom_injection"];
 	return ["custom_injection"];
 }
 
@@ -532,7 +553,11 @@ export function projectToolLoadingHistory(
 		}
 		const event = toolLoadingEventOf(message, state.managed);
 		if (!event) return message;
-		if (strategy === "custom_injection" || strategy === "openai_additional_tools") {
+		if (
+			strategy === "custom_injection" ||
+			strategy === "openai_additional_tools" ||
+			strategy === "kimi_system_tools"
+		) {
 			if (event.kind !== "load") return message;
 			const fresh = event.tools.flatMap((name) => {
 				if (declared.has(name)) return [];

@@ -29,8 +29,8 @@ export interface TokenDanceCatalogModel {
 export function selectTokenDanceProtocol(
 	protocols: readonly string[],
 ): TokenDanceProtocol | undefined {
-	if (protocols.includes("openai:responses")) return "openai-responses";
 	if (protocols.includes("anthropic:messages")) return "anthropic-messages";
+	if (protocols.includes("openai:responses")) return "openai-responses";
 	if (protocols.includes("openai:chat-completions")) return "completions-compatible";
 	if (protocols.includes("gemini:generate-content")) return "gemini-compatible";
 	return undefined;

@@ -85,6 +85,33 @@ describe("tool loading strategy resolution", () => {
 
 		expect(defaultToolLoadingModes("deepseek-v4-pro")).toEqual(["anthropic_deferred_tail"]);
 		expect(defaultToolLoadingModes("anthropic:glm-5.1")).toEqual(["custom_injection"]);
+
+		expect(defaultToolLoadingModes("kimi-k3")).toEqual(["kimi_system_tools", "custom_injection"]);
+		expect(defaultToolLoadingModes("moonshot:kimi-k3.5")).toEqual([
+			"kimi_system_tools",
+			"custom_injection",
+		]);
+		expect(defaultToolLoadingModes("kimi-for-coding")).toEqual([
+			"kimi_system_tools",
+			"custom_injection",
+		]);
+		expect(defaultToolLoadingModes("k3-256k")).toEqual(["kimi_system_tools", "custom_injection"]);
+		// K2.x and the highspeed coding model reject a tool-bearing system message.
+		expect(defaultToolLoadingModes("kimi-k2.7-code")).toEqual(["custom_injection"]);
+		expect(defaultToolLoadingModes("kimi-for-coding-highspeed")).toEqual(["custom_injection"]);
+		expect(defaultToolLoadingModes("kimi-latest")).toEqual(["custom_injection"]);
+	});
+
+	test("Kimi uses system tools on Chat Completions and injection elsewhere", () => {
+		expect(resolveToolLoadingStrategy("kimi-k3", { protocol: "completions-compatible" })).toBe(
+			"kimi_system_tools",
+		);
+		expect(resolveToolLoadingStrategy("kimi-k3", { protocol: "anthropic-messages" })).toBe(
+			"custom_injection",
+		);
+		expect(resolveToolLoadingStrategy("kimi-k3", { protocol: "openai-responses" })).toBe(
+			"custom_injection",
+		);
 	});
 
 	test("a mode is only used on the protocol it targets", () => {
@@ -645,5 +672,64 @@ describe("epochs", () => {
 		);
 		expect(stripCache(withMarker.body.messages)).toEqual(stripCache(without.body.messages));
 		expect(withMarker.body.tools).toEqual(without.body.tools);
+	});
+});
+
+describe("kimi_system_tools wire", () => {
+	const config: OpenAIProviderConfig = {
+		id: "tool-loading-kimi",
+		name: "Tool loading Kimi",
+		prefix: "tl_kimi",
+		apiKey: "sk-test",
+		baseUrl: "https://example.invalid/v1",
+		defaultModel: "kimi-k3",
+		apiMode: "completions",
+	};
+
+	test("the load becomes a system message with tools before its notice", async () => {
+		captureFetch();
+		const provider = new OpenAIProvider(config);
+		const model = "tl_kimi:kimi-k3";
+		const first = row("user", "hello");
+		const reply = row("assistant", "hi there");
+		const loaded = notice("tool_loaded", ["Eval"]);
+
+		const before = await request(
+			provider,
+			model,
+			"kimi_system_tools",
+			[first, reply, row("user", "more")],
+			[],
+		);
+		// The notice is the current turn here, so its system message ends the history.
+		const current = await request(
+			provider,
+			model,
+			"kimi_system_tools",
+			[first, reply, loaded],
+			["Eval"],
+		);
+		const later = await request(
+			provider,
+			model,
+			"kimi_system_tools",
+			[first, reply, loaded, row("assistant", "ok"), row("user", "go")],
+			["Eval"],
+		);
+		expect(current.body.tools).toEqual(before.body.tools);
+		expect(later.body.tools).toEqual(before.body.tools);
+		expect(
+			(before.body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name),
+		).toEqual(["Read"]);
+		// The declaration is complete: name, description and parameters, as in `tools`.
+		const message = { role: "system", tools: provider.formatTools([EVAL]) };
+		const messages = current.body.messages as unknown[];
+		expect(messages.at(-2)).toEqual(message);
+		expect(messages.at(-1)).toEqual({ role: "user", content: loaded.contentText });
+		// Rebuilt later, the declaration and notice keep their place: a growing prefix.
+		expect((later.body.messages as unknown[]).slice(0, messages.length)).toEqual(messages);
+		// Declared once per epoch.
+		const declarations = (later.body.messages as Array<{ tools?: unknown }>).filter((m) => m.tools);
+		expect(declarations).toEqual([message]);
 	});
 });
