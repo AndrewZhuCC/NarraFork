@@ -232,19 +232,19 @@ export const DEFAULTS: NarraForkSettings = {
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
 	customApiProviders: {
-		desc: "通过自定义提供商面板维护的结构化 API 提供商配置。密钥由对应面板管理，不作为普通文本设置展示。",
+		desc: "通过自定义供应商面板维护的结构化 API 供应商配置。密钥由对应面板管理，不作为普通文本设置展示。",
 		type: "array",
 	},
 	openaiProviders: {
-		desc: "通过 OpenAI 兼容提供商面板维护的结构化配置，包括模型、协议和连接设置。",
+		desc: "通过 OpenAI 兼容供应商面板维护的结构化配置，包括模型、协议和连接设置。",
 		type: "array",
 	},
 	anthropicProviders: {
-		desc: "通过 Anthropic 兼容提供商面板维护的结构化配置。",
+		desc: "通过 Anthropic 兼容供应商面板维护的结构化配置。",
 		type: "array",
 	},
 	geminiProviders: {
-		desc: "通过 Gemini 提供商面板维护的结构化配置。",
+		desc: "通过 Gemini 供应商面板维护的结构化配置。",
 		type: "array",
 	},
 	"tokendance.apiKey": {
@@ -654,7 +654,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "always / blockStop / protectedOnly / off，默认 protectedOnly",
 	},
 	"agent.maxTransientRetries": {
-		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态提供商（Responses/Codex）会在外层重建历史后重试。",
+		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态供应商（Responses/Codex）会在外层重建历史后重试。",
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
 	},

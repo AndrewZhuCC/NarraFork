@@ -17,7 +17,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../../lib/api";
 import classes from "./AddProviderPage.module.css";
-import { useTokenDanceAdd } from "./provider-add-context";
+import { LocalProviderImport } from "./LocalProviderImport";
+import { useProviderImport, useTokenDanceAdd } from "./provider-add-context";
 import {
 	type AddProviderDraft,
 	draftFromPreset,
@@ -38,6 +39,7 @@ import {
 import {
 	type AddProviderType,
 	getProviderPresetName,
+	isProviderPresetAvailable,
 	PROVIDER_PRESETS,
 	type ProviderPreset,
 	searchProviderPresets,
@@ -60,6 +62,7 @@ export function AddProviderPage({
 }) {
 	const { t, i18n } = useTranslation("settings");
 	const tokenDance = useTokenDanceAdd();
+	const importProvider = useProviderImport();
 	const restoredRef = useRef(false);
 	const locallyEditedRef = useRef(false);
 	useEffect(() => {
@@ -101,12 +104,14 @@ export function AddProviderPage({
 		if (showConfig) headingRef.current?.focus();
 		else catalogRef.current?.focus();
 	}, [showConfig, preset]);
+	const language = i18n.resolvedLanguage ?? i18n.language;
 	const presets = useMemo(
 		() =>
-			category === "popular" && !query.trim()
+			(category === "popular" && !query.trim()
 				? getPopularProviderPresets()
-				: searchProviderPresets(query, t),
-		[category, query, t],
+				: searchProviderPresets(query, t)
+			).filter((item) => isProviderPresetAvailable(item, language)),
+		[category, query, t, language],
 	);
 	const connection =
 		preset && connectionSelection
@@ -205,6 +210,13 @@ export function AddProviderPage({
 				</Button>
 				<Title order={2}>{t("addProvider")}</Title>
 			</Group>
+			{importProvider && !showConfig && (
+				<LocalProviderImport
+					importProvider={importProvider}
+					protocolLabel={(protocol) => t(PROTOCOL_KEYS[protocol])}
+					onImported={onClose}
+				/>
+			)}
 			<fieldset
 				disabled={submitting}
 				className={classes.layout}
@@ -263,6 +275,11 @@ export function AddProviderPage({
 									aria-pressed={preset?.id === item.id}
 								>
 									<Text fw={600}>{getProviderPresetName(item, t)}</Text>
+									{item.descriptionKey && (
+										<Text size="xs" c="dimmed">
+											{t(item.descriptionKey)}
+										</Text>
+									)}
 									<Group gap={4} mt={4}>
 										{(Object.keys(item.endpoints) as AddProviderType[]).map((protocol) => (
 											<Badge key={protocol} size="xs" variant="light">
@@ -294,6 +311,7 @@ export function AddProviderPage({
 					{preset?.category === "platform-login" ? (
 						<Stack p="md">
 							<Title order={3}>TokenDance</Title>
+							{preset.descriptionKey && <Text fw={600}>{t(preset.descriptionKey)}</Text>}
 							<Text>{t("tokendance.loginDescription")}</Text>
 							{submitError && <Alert color="red">{submitError}</Alert>}
 							<Button

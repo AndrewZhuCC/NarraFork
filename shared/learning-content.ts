@@ -100,7 +100,7 @@ const categories: Record<string, LocalizedText & { description: LocalizedText }>
 		"zh-CN": "运维与设置",
 		description: {
 			en: "Providers, models, notifications, updates, users, and system settings.",
-			"zh-CN": "提供商、模型、通知、更新、用户与系统设置。",
+			"zh-CN": "供应商、模型、通知、更新、用户与系统设置。",
 		},
 	},
 };
@@ -129,7 +129,7 @@ const docs: LearningDocSource[] = [
 		workflow: [
 			{
 				en: "Finish initial setup: configure providers and models, then verify runtime availability.",
-				"zh-CN": "先完成初始化：配置提供商与模型，再确认运行资源可用。",
+				"zh-CN": "先完成初始化：配置供应商与模型，再确认运行资源可用。",
 			},
 			{
 				en: "Create or open a project only when you need repository-bound work; otherwise start with a standalone narrator.",
@@ -162,7 +162,7 @@ const docs: LearningDocSource[] = [
 				label: { en: "Open settings", "zh-CN": "打开设置" },
 				description: {
 					en: "Configure providers, models, appearance, and runtime.",
-					"zh-CN": "配置提供商、模型、外观与运行资源。",
+					"zh-CN": "配置供应商、模型、外观与运行资源。",
 				},
 				href: "/settings",
 			},
@@ -957,19 +957,19 @@ const docs: LearningDocSource[] = [
 		id: "providers-models-and-quotas",
 		category: "admin",
 		tags: ["providers", "models", "anthropic", "openai", "codex", "nug", "gemini", "quota"],
-		title: { en: "Providers, models, and quotas", "zh-CN": "提供商、模型与额度" },
+		title: { en: "Providers, models, and quotas", "zh-CN": "供应商、模型与额度" },
 		summary: {
 			en: "Configure AI providers, select models, manage credentials, and monitor usage so narrator work is reliable and cost-aware.",
 			"zh-CN":
-				"配置 AI 提供商、选择模型、管理凭据并监控使用历史和额度，让叙述者工作更可靠且可控成本。",
+				"配置 AI 供应商、选择模型、管理凭据并监控使用历史和额度，让叙述者工作更可靠且可控成本。",
 		},
 		sections: [
 			{
-				title: { en: "Provider setup", "zh-CN": "提供商配置" },
+				title: { en: "Provider setup", "zh-CN": "供应商配置" },
 				body: {
 					en: "NarraFork supports multiple providers and adapter styles. Configure at least one working provider before expecting narrator sessions to run.",
 					"zh-CN":
-						"NarraFork 支持多个提供商和适配器；至少配置一个可用提供商后，叙述者会话才能稳定运行。",
+						"NarraFork 支持多个供应商和适配器；至少配置一个可用供应商后，叙述者会话才能稳定运行。",
 				},
 			},
 			{
@@ -983,7 +983,7 @@ const docs: LearningDocSource[] = [
 		workflow: [
 			{
 				en: "Add credentials in provider settings and refresh model lists.",
-				"zh-CN": "在提供商设置中添加凭据并刷新模型列表。",
+				"zh-CN": "在供应商设置中添加凭据并刷新模型列表。",
 			},
 			{
 				en: "Set default models for normal work and summary work.",
@@ -997,7 +997,7 @@ const docs: LearningDocSource[] = [
 		bestPractices: [
 			{
 				en: "Keep fallback providers available for outages or quota exhaustion.",
-				"zh-CN": "保留备用提供商，应对故障或额度耗尽。",
+				"zh-CN": "保留备用供应商，应对故障或额度耗尽。",
 			},
 			{
 				en: "Use model-specific strengths intentionally instead of one default for every task.",
@@ -1013,13 +1013,13 @@ const docs: LearningDocSource[] = [
 		agentHints: [
 			{
 				en: "If model errors occur, report provider, model, and status clearly rather than retrying blindly.",
-				"zh-CN": "遇到模型错误时，明确报告提供商、模型和状态，不要盲目重试。",
+				"zh-CN": "遇到模型错误时，明确报告供应商、模型和状态，不要盲目重试。",
 			},
 		],
 		actions: [
 			{
-				label: { en: "Providers", "zh-CN": "提供商" },
-				description: { en: "Configure AI provider credentials.", "zh-CN": "配置 AI 提供商凭据。" },
+				label: { en: "Providers", "zh-CN": "供应商" },
+				description: { en: "Configure AI provider credentials.", "zh-CN": "配置 AI 供应商凭据。" },
 				href: "/settings/providers",
 			},
 			{
@@ -1130,7 +1130,7 @@ const docs: LearningDocSource[] = [
 				title: { en: "Instance settings", "zh-CN": "实例设置" },
 				body: {
 					en: "Admins can manage providers, users, runtime, storage, terminal settings, server status, and update information.",
-					"zh-CN": "管理员可管理提供商、用户、运行资源、储存空间、终端设置、服务器状态和更新信息。",
+					"zh-CN": "管理员可管理供应商、用户、运行资源、储存空间、终端设置、服务器状态和更新信息。",
 				},
 			},
 		],
@@ -1141,7 +1141,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Admins should configure providers, runtime, storage, and users after first login.",
-				"zh-CN": "管理员首次登录后应配置提供商、运行资源、储存空间和用户。",
+				"zh-CN": "管理员首次登录后应配置供应商、运行资源、储存空间和用户。",
 			},
 			{
 				en: "Check changelogs and update status before planning maintenance windows.",
