@@ -330,6 +330,22 @@ function classifyEmptyResponse(signals: EmptyResponseSignals): EmptyResponseKind
 	return "empty_response";
 }
 
+/** Stop reasons a provider gives for an ordinary finish, as opposed to a refusal or cutoff. */
+const QUIET_STOP_REASONS = new Set(["stop", "end_turn", "completed"]);
+
+/**
+ * A served request that ended without content and without a fault: the model chose to
+ * say nothing. For a bot after a tool round that is how a turn ends — its answers went
+ * out through Send, and the transcript is not a channel — so it is not an empty reply.
+ */
+function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): boolean {
+	if (kind === "empty_response_usage_only") return true;
+	return (
+		kind === "empty_response_stop_without_content" &&
+		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
+	);
+}
+
 /**
  * Human-readable explanation for an empty turn.
  *
@@ -6537,6 +6553,19 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
+					// A bot answers through Send({ user }); once a tool round has run, a model
+					// with nothing left to say for the transcript is done, not failing.
+					if (
+						config.bot &&
+						turnIndex > 0 &&
+						requestStarted &&
+						!lastRetryErrorMessage &&
+						isQuietFinish(emptyKind, emptySignals)
+					) {
+						yield* finishRequest();
+						yield { type: "done" };
+						return;
+					}
 					const emptyEvidence = emptyResponseEvidence(emptySignals);
 					const emptyResponseText = emptyResponseMessageFor(emptyKind, emptySignals);
 					const buildEmptyDiagnostics = (message: string) =>

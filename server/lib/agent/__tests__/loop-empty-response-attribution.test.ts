@@ -34,7 +34,13 @@ let providerScenario:
 	| "reasoning_then_truncated_tool_input"
 	| "broken_anthropic_single"
 	| "broken_anthropic_mixed"
-	| "ws_error_response" = "error_then_usage_only";
+	| "ws_error_response"
+	| "tool_then_quiet" = "error_then_usage_only";
+/** What `tool_then_quiet` answers once its tool has run. */
+let quietTail:
+	| { usage: { promptTokens: number; completionTokens: number } }
+	| { stopReason: string } = { usage: { promptTokens: 900, completionTokens: 0 } };
+const QUIET_TOOL = "__QuietFinishTest";
 let providerAttempts = 0;
 let wsBaseUrl = "";
 /**
@@ -146,6 +152,17 @@ const testProvider: ProviderAdapter = {
 			}
 			// `queueStatus` counts as "meaningful" for liveness but lands nothing.
 			yield { queueStatus: { position: 2, queueDepth: 5 } };
+			return;
+		}
+
+		if (providerScenario === "tool_then_quiet") {
+			if (providerAttempts === 1) {
+				yield {
+					toolUseChunk: { toolUseId: "tu-send", name: QUIET_TOOL, input: "{}", stop: true },
+				};
+				return;
+			}
+			yield quietTail;
 			return;
 		}
 
@@ -524,5 +541,55 @@ describe("空响应细分归因", () => {
 		expect(followUp).toContain("Write");
 		expect(followUp).toContain("SPLICE_1");
 		expect(followUp).toContain("10,000");
+	});
+});
+
+describe("bot turns end quietly after answering through tools", () => {
+	async function quietRun(overrides: Partial<AgentConfig>, tail: typeof quietTail) {
+		providerScenario = "tool_then_quiet";
+		providerAttempts = 0;
+		quietTail = tail;
+		toolRegistry.register({
+			name: QUIET_TOOL,
+			description: "Stands in for Send({ user })",
+			parameters: z.object({}),
+			execute: async () => ({ output: "Delivered." }),
+		});
+		try {
+			return await runLoop({ maxTurns: 4, ...overrides });
+		} finally {
+			toolRegistry.unregister(QUIET_TOOL);
+		}
+	}
+	const usageOnly = { usage: { promptTokens: 900, completionTokens: 0 } };
+
+	test("a bot with nothing left to say after a tool round is done", async () => {
+		const events = await quietRun({ bot: true }, usageOnly);
+		expect(events.at(-1)?.type).toBe("done");
+		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(providerAttempts).toBe(2);
+	});
+
+	test("so is one that stops normally without text", async () => {
+		const events = await quietRun({ bot: true }, { stopReason: "stop" });
+		expect(events.at(-1)?.type).toBe("done");
+	});
+
+	test("a refusal is still reported, bot or not", async () => {
+		const events = await quietRun({ bot: true }, { stopReason: "content_filter" });
+		expect(events.at(-1)?.type).toBe("invalid_state");
+	});
+
+	test("an ordinary narrator still treats the empty reply as a fault", async () => {
+		const events = await quietRun({}, usageOnly);
+		expect(events.at(-1)?.type).toBe("invalid_state");
+	});
+
+	test("a bot whose first reply is empty has answered no one", async () => {
+		providerScenario = "usage_only_forever";
+		providerAttempts = 0;
+		const events = await runLoop({ bot: true });
+		expect(events.at(-1)?.type).toBe("invalid_state");
 	});
 });
