@@ -61,7 +61,7 @@ describe("git APIs", () => {
 		await api.getGitStatus(target, controller.signal);
 		await api.getGitModifications(
 			target,
-			{ scope: "uncommitted", projection: "byFile" },
+			{ scope: "uncommitted", projection: "byFile", filePath: "sub/file one.ts" },
 			controller.signal,
 		);
 		await api.getGitDiff(target, "sub/file one.ts", true, controller.signal);
@@ -95,6 +95,9 @@ describe("git APIs", () => {
 				.slice(6)
 				.every((call) => JSON.parse(call.body ?? "{}").workspaceKey === "device-a:/repo"),
 		).toBe(true);
+		const modifications = new URL(calls[2]?.url ?? "", "http://localhost").searchParams;
+		expect(modifications.get("filePath")).toBe("sub/file one.ts");
+		expect(modifications.get("projection")).toBe("byFile");
 		expect(gitTargetKey({ ...target, narratorId: "another" })).toBe(gitTargetKey(target));
 		expect(gitTargetKey({ ...target, workspaceKey: "device-b:/repo" })).not.toBe(
 			gitTargetKey(target),

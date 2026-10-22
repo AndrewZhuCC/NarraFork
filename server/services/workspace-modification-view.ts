@@ -20,6 +20,7 @@ import {
 } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
+import { SELECT_ROWS_MAX_ROWS } from "../lib/db-worker/protocol";
 import {
 	type AttributionActor,
 	attributionActorKey,
@@ -36,10 +37,11 @@ const MAX_EVENT_LIMIT = 2000;
 const PER_PATH_EVENT_LIMIT = 10;
 /** Hover cards need a useful history, not the entire per-file observation window. */
 const FILE_TIMELINE_EVENT_LIMIT = 5;
-const PATHS_PER_SHARD = 50;
-/** 400 paths; each of at most three canonical/legacy workspace spellings gets 10+1
- * indexed rows. Merge those bounded slices before returning at most ten per path. */
+/** 400 paths; each workspace spelling that has stored rows gets 10+1 indexed rows.
+ * Merge those bounded slices before returning at most ten per path. */
 const MAX_QUERY_PATHS = 400;
+/** Additional cwd spellings kept after dropping the ones with no stored history. */
+const MAX_ADDITIONAL_SCOPES = 32;
 
 export type ModificationAction = "write" | "edit" | "bash" | "external" | "human";
 export type ModificationActor = AttributionActor;
@@ -252,11 +254,6 @@ type EventRow = {
 	linesRemoved: number | null;
 };
 
-/**
- * Each indexed sub-select reads n+1, keeping only n. No unbounded GROUP BY, window
- * function or all-history flag scan on the request thread. A missing flag in a
- * truncated slice is unknown until an indexed exact projection can supply it.
- */
 function safeGitRootPath(path: string): string | null {
 	if (!path || posix.isAbsolute(path)) return null;
 	const normalized = posix.normalize(path);
@@ -294,54 +291,133 @@ function displayScopePath(path: string, scope?: WorkspaceAttributionScope): stri
 	return rootPath === ".." || rootPath.startsWith("../") ? "\0outside-workspace" : rootPath;
 }
 
+/** One indexed probe: [query path ordinal, workspace spelling, recorded file path]. */
+type HistoryTarget = [ord: number, workspaceKey: string, recordedPath: string];
+
+/**
+ * Per-path history uses a constant-size statement and passes targets as one JSON
+ * parameter, so SQL length no longer grows with paths x workspace spellings (a UNION ALL
+ * branch per pair reached 437 KB for 12 paths x 32 cwd keys). Batches stay inside the
+ * shared read-query budgets: every target yields at most 11 candidate rows.
+ */
+const TARGETS_PER_QUERY = Math.floor(SELECT_ROWS_MAX_ROWS / (PER_PATH_EVENT_LIMIT + 1));
+const TARGET_PARAM_BYTES = 96 * 1024;
+/** Detail rows are at most ~9 KiB (actor snapshots are capped at 8 KiB in SQL). */
+const DETAIL_ROWS_PER_QUERY = 256;
+
+function batchTargets(targets: HistoryTarget[]): HistoryTarget[][] {
+	const batches: HistoryTarget[][] = [];
+	let batch: HistoryTarget[] = [];
+	let bytes = 2;
+	for (const target of targets) {
+		const size = Buffer.byteLength(JSON.stringify(target)) + 1;
+		if (batch.length && (batch.length >= TARGETS_PER_QUERY || bytes + size > TARGET_PARAM_BYTES)) {
+			batches.push(batch);
+			batch = [];
+			bytes = 2;
+		}
+		batch.push(target);
+		bytes += size;
+	}
+	if (batch.length) batches.push(batch);
+	return batches;
+}
+
+/**
+ * Phase 1 reads only (ordinal, rowid, changedAt) for the newest 10+1 rows of each target,
+ * then merges every workspace spelling of a path under one comparator, across batches.
+ * Phase 2 reads full columns for the kept rows only. No unbounded GROUP BY, window
+ * function or all-history flag scan; a missing flag in a truncated slice stays unknown.
+ */
 async function selectPerPathRows(
 	filePaths: string[],
 	baseConditions: SQL[],
 	workspaceKeys: string[],
 	scopes: ReadonlyMap<string, WorkspaceAttributionScope>,
 ): Promise<{ rows: EventRow[]; truncatedPaths: Set<string> }> {
-	const rows: EventRow[] = [];
-	const truncatedPaths = new Set<string>();
-	const counts = new Map<string, number>();
-	const shardSize = Math.min(PATHS_PER_SHARD, Math.max(1, Math.floor(400 / workspaceKeys.length)));
-	for (let offset = 0; offset < filePaths.length; offset += shardSize) {
-		const shard = filePaths.slice(offset, offset + shardSize);
-		const parts = shard.flatMap((filePath) =>
-			workspaceKeys.map(
-				(workspaceKey) => sql`
-				select * from (
-					select
-						${fileAttributions.id} as "id",
-						${EVENT_ROW_ID} as "rowId",
-						${fileAttributions.effectId} as "effectId",
-						${SNAPSHOT_COLUMN} as "actorSnapshotJson",
-						${filePath} as "filePath",
-						${fileAttributions.narratorId} as "narratorId",
-						${fileAttributions.userId} as "userId",
-						${fileAttributions.subagentType} as "subagentType",
-						${fileAttributions.action} as "action",
-						${fileAttributions.toolName} as "toolName",
-						${fileAttributions.toolUseId} as "toolUseId",
-						${fileAttributions.changedAt} as "changedAt",
-						${fileAttributions.linesAdded} as "linesAdded",
-						${fileAttributions.linesRemoved} as "linesRemoved"
-					from ${fileAttributions}
-					where ${and(...baseConditions, eq(fileAttributions.workspacePath, workspaceKey), eq(fileAttributions.filePath, recordedScopePath(filePath, scopes.get(workspaceKey))))}
-					order by ${fileAttributions.changedAt} desc, ${EVENT_ROW_ID} desc
-					limit ${PER_PATH_EVENT_LIMIT + 1}
-				)`,
-			),
-		);
-		const fetched = await db.all<EventRow>(sql.join(parts, sql` union all `));
-		fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
+	const targets: HistoryTarget[] = [];
+	filePaths.forEach((filePath, ord) => {
+		for (const workspaceKey of workspaceKeys) {
+			const recorded = recordedScopePath(filePath, scopes.get(workspaceKey));
+			if (recorded !== "\0outside-workspace") targets.push([ord, workspaceKey, recorded]);
+		}
+	});
+	const candidates = new Map<number, { rowId: number; changedAt: string }[]>();
+	for (const batch of batchTargets(targets)) {
+		const fetched = await db.all<{ ord: number; rowId: number; changedAt: string }>(sql`
+			with "targets"("ord", "workspacePath", "filePath") as (
+				select json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')
+				from json_each(${JSON.stringify(batch)})
+			)
+			select "targets"."ord" as "ord", "candidate".rowid as "rowId", "candidate"."changed_at" as "changedAt"
+			from "targets" join ${fileAttributions} as "candidate" on "candidate".rowid in (
+				select ${EVENT_ROW_ID} from ${fileAttributions}
+				where ${and(
+					...baseConditions,
+					sql`${fileAttributions.workspacePath} = "targets"."workspacePath"`,
+					sql`${fileAttributions.filePath} = "targets"."filePath"`,
+				)}
+				order by ${fileAttributions.changedAt} desc, ${EVENT_ROW_ID} desc
+				limit ${PER_PATH_EVENT_LIMIT + 1}
+			)`);
 		for (const row of fetched) {
-			const count = (counts.get(row.filePath) ?? 0) + 1;
-			counts.set(row.filePath, count);
-			if (count > PER_PATH_EVENT_LIMIT) truncatedPaths.add(row.filePath);
-			else rows.push(row);
+			const list = candidates.get(row.ord);
+			if (list) list.push(row);
+			else candidates.set(row.ord, [row]);
 		}
 	}
+
+	const truncatedPaths = new Set<string>();
+	const kept = new Map<number, number[]>();
+	for (const [ord, list] of candidates) {
+		list.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
+		if (list.length > PER_PATH_EVENT_LIMIT) truncatedPaths.add(filePaths[ord]);
+		for (const { rowId } of list.slice(0, PER_PATH_EVENT_LIMIT)) {
+			const ords = kept.get(rowId);
+			if (ords) ords.push(ord);
+			else kept.set(rowId, [ord]);
+		}
+	}
+
+	const rows: EventRow[] = [];
+	const rowIds = [...kept.keys()];
+	for (let offset = 0; offset < rowIds.length; offset += DETAIL_ROWS_PER_QUERY) {
+		const ids = rowIds.slice(offset, offset + DETAIL_ROWS_PER_QUERY);
+		const details = await db.all<EventRow>(sql`
+			select
+				${fileAttributions.id} as "id",
+				${EVENT_ROW_ID} as "rowId",
+				${fileAttributions.effectId} as "effectId",
+				${SNAPSHOT_COLUMN} as "actorSnapshotJson",
+				${fileAttributions.filePath} as "filePath",
+				${fileAttributions.narratorId} as "narratorId",
+				${fileAttributions.userId} as "userId",
+				${fileAttributions.subagentType} as "subagentType",
+				${fileAttributions.action} as "action",
+				${fileAttributions.toolName} as "toolName",
+				${fileAttributions.toolUseId} as "toolUseId",
+				${fileAttributions.changedAt} as "changedAt",
+				${fileAttributions.linesAdded} as "linesAdded",
+				${fileAttributions.linesRemoved} as "linesRemoved"
+			from ${fileAttributions}
+			where ${EVENT_ROW_ID} in (select value from json_each(${JSON.stringify(ids)}))`);
+		for (const row of details)
+			for (const ord of kept.get(row.rowId) ?? []) rows.push({ ...row, filePath: filePaths[ord] });
+	}
 	return { rows, truncatedPaths };
+}
+
+/** Spellings with no stored rows cannot contribute history; one indexed EXISTS per key. */
+async function workspaceKeysWithHistory(deviceId: string, keys: string[]): Promise<Set<string>> {
+	if (keys.length === 0) return new Set();
+	const rows = await db.all<{ key: string }>(sql`
+		select "json_each".value as "key" from json_each(${JSON.stringify(keys)})
+		where exists (
+			select 1 from ${fileAttributions}
+			where ${fileAttributions.deviceId} = ${deviceId}
+				and ${fileAttributions.workspacePath} = "json_each".value
+		)`);
+	return new Set(rows.map((row) => row.key));
 }
 
 export async function getWorkspaceModificationView(
@@ -351,10 +427,9 @@ export async function getWorkspaceModificationView(
 	const deviceId = options.deviceId ?? LOCAL_DEVICE_ID;
 	const key = deviceId === LOCAL_DEVICE_ID ? normalizeWorkspacePath(workspacePath) : workspacePath;
 	const workspaceKeys = new Set([key]);
-	const scopes = new Map(
-		(options.additionalScopes ?? []).slice(0, 32).map((scope) => [scope.workspacePath, scope]),
+	const candidateScopes = new Map(
+		(options.additionalScopes ?? []).map((scope) => [scope.workspacePath, scope]),
 	);
-	for (const scope of scopes.keys()) workspaceKeys.add(scope);
 	if (deviceId === LOCAL_DEVICE_ID) {
 		try {
 			const canonical = (
@@ -420,6 +495,26 @@ export async function getWorkspaceModificationView(
 		};
 	}
 
+	// Speculative cwd spellings (ancestor directories, legacy/canonical forms) only cost
+	// query work; dropping the ones with no stored rows loses no history. The cap applies
+	// afterwards so empty guesses cannot crowd out spellings that really hold rows.
+	const stored = await workspaceKeysWithHistory(deviceId, [
+		...new Set([...workspaceKeys, ...candidateScopes.keys()]),
+	]);
+	const scopes = new Map<string, WorkspaceAttributionScope>();
+	let scopesTruncated = options.additionalScopesTruncated === true;
+	for (const [scopeKey, scope] of candidateScopes) {
+		if (!stored.has(scopeKey)) continue;
+		if (scopes.size >= MAX_ADDITIONAL_SCOPES) {
+			scopesTruncated = true;
+			break;
+		}
+		scopes.set(scopeKey, scope);
+	}
+	const queryKeys = [...new Set([...workspaceKeys, ...scopes.keys()])].filter((workspaceKey) =>
+		stored.has(workspaceKey),
+	);
+
 	let rows: EventRow[];
 	let hasMore: boolean;
 	const incompleteDisplayPaths = new Set<string>();
@@ -428,7 +523,7 @@ export async function getWorkspaceModificationView(
 		const selected = await selectPerPathRows(
 			paths.slice(0, MAX_QUERY_PATHS),
 			conditions,
-			[...workspaceKeys],
+			queryKeys,
 			scopes,
 		);
 		rows = selected.rows;
@@ -436,13 +531,13 @@ export async function getWorkspaceModificationView(
 		for (const path of [...selected.truncatedPaths, ...paths.slice(MAX_QUERY_PATHS)]) {
 			incompleteDisplayPaths.add(resolveDisplayPath(path, options.pathAliases));
 		}
-		hasMore = incompleteDisplayPaths.size > 0 || options.additionalScopesTruncated === true;
+		hasMore = incompleteDisplayPaths.size > 0 || scopesTruncated;
 	} else {
 		// Each canonical/legacy spelling gets its own indexed bound; IN + global
 		// ORDER BY would otherwise sort the entire history across workspace keys.
 		const fetched = (
 			await Promise.all(
-				[...workspaceKeys].map(async (workspaceKey) => {
+				queryKeys.map(async (workspaceKey) => {
 					const rows = await db
 						.select(EVENT_COLUMNS)
 						.from(fileAttributions)
@@ -459,7 +554,7 @@ export async function getWorkspaceModificationView(
 			)
 		).flat();
 		fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
-		hasMore = fetched.length > limit || options.additionalScopesTruncated === true;
+		hasMore = fetched.length > limit || scopesTruncated;
 		rows = fetched.slice(0, limit);
 	}
 
@@ -536,7 +631,9 @@ export async function getWorkspaceModificationView(
 		if (!group) {
 			const complete =
 				!options.cursor &&
-				(options.filePaths ? !incompleteDisplayPaths.has(displayPath) : !hasMore);
+				(options.filePaths
+					? !scopesTruncated && !incompleteDisplayPaths.has(displayPath)
+					: !hasMore);
 			group = {
 				filePath: displayPath,
 				changeCount: 0,

@@ -612,7 +612,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
-	"server/services/workspace-modification-view.ts": ["rowid"],
+	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
 	// SQLite-only exemptions. Mixed archive workers also support PG main stores; only
 	// their portable archive file uses SQLite. Fixture detach uses a private memory DB,

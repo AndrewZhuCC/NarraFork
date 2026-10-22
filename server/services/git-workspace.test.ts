@@ -1418,6 +1418,71 @@ test("sibling-directory observations include other narrators but redact private 
 	}
 });
 
+test("a single-file read covers only that file, its rename source and sibling cwd history", async () => {
+	const actorCwd = join(repo, "packages", "a");
+	await mkdir(actorCwd, { recursive: true });
+	await git(repo, "mv", "seed.txt", "renamed.txt");
+	await writeFile(join(repo, "other.txt"), "other\n");
+	await recordAttribution({
+		deviceId: "local",
+		workspacePath: repo,
+		filePath: "seed.txt",
+		narratorId,
+		action: "edit",
+	});
+	await recordAttribution({
+		deviceId: "local",
+		workspacePath: actorCwd,
+		filePath: "../../renamed.txt",
+		narratorId,
+		action: "edit",
+	});
+	await recordAttribution({
+		deviceId: "local",
+		workspacePath: repo,
+		filePath: "other.txt",
+		narratorId,
+		action: "write",
+	});
+	const response = await request(
+		"modifications?scope=uncommitted&projection=byFile&filePath=renamed.txt",
+	);
+	expect(response.status).toBe(200);
+	const body = (await response.json()) as {
+		byFile: { filePath: string; changeCount: number }[];
+		currentDiff: { byFile: { filePath: string }[] };
+		timeline?: unknown;
+	};
+	expect(body.timeline).toBeUndefined();
+	expect(body.byFile.map((file) => [file.filePath, file.changeCount])).toEqual([
+		["renamed.txt", 2],
+	]);
+	expect(body.currentDiff.byFile.map((file) => file.filePath)).toEqual(["renamed.txt"]);
+
+	const clean = await request(
+		"modifications?scope=uncommitted&projection=byFile&filePath=seed.txt",
+	);
+	expect(clean.status).toBe(200);
+	const cleanBody = (await clean.json()) as { byFile: unknown[]; hasMore: boolean };
+	expect(cleanBody.byFile).toEqual([]);
+	expect(cleanBody.hasMore).toBe(false);
+});
+
+test("a single-file read rejects unscoped, absolute, escaping and .git paths", async () => {
+	const base = "modifications?scope=uncommitted&projection=byFile&filePath=";
+	for (const suffix of [
+		"modifications?scope=uncommitted&filePath=seed.txt",
+		"modifications?projection=byFile&filePath=seed.txt",
+		`${base}${encodeURIComponent("../outside.txt")}`,
+		`${base}${encodeURIComponent("/etc/passwd")}`,
+		`${base}${encodeURIComponent(".git/config")}`,
+		`${base}${encodeURIComponent("a\0b")}`,
+		base,
+	]) {
+		expect((await request(suffix)).status).toBe(400);
+	}
+});
+
 test("remote Windows sibling paths use case-folded workspace attribution", async () => {
 	const deviceId = generateId();
 	await db.insert(remoteDevices).values({
