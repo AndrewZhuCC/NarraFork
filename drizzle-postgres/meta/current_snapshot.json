@@ -1,6 +1,6 @@
 {
-  "id": "a2ff5b16-5c87-43fc-a770-b84045892e96",
-  "prevId": "20534647-c4ef-455c-8c6f-4250ed5f2786",
+  "id": "ae0bd9a2-3a8a-430f-83b1-497b4a3c46ba",
+  "prevId": "a2ff5b16-5c87-43fc-a770-b84045892e96",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2705,6 +2705,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "sender_narrator_id": {
+          "name": "sender_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "kind": {
           "name": "kind",
           "type": "text",
@@ -2738,6 +2744,12 @@
         },
         "reply_to_guest_name": {
           "name": "reply_to_guest_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reply_to_sender_narrator_id": {
+          "name": "reply_to_sender_narrator_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -2818,6 +2830,21 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_chat_messages_sender_narrator": {
+          "name": "idx_chat_messages_sender_narrator",
+          "columns": [
+            {
+              "expression": "sender_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -2853,6 +2880,19 @@
           "tableTo": "narrator_public_shares",
           "columnsFrom": [
             "sender_share_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "fk_chat_messages_sender_narrator": {
+          "name": "fk_chat_messages_sender_narrator",
+          "tableFrom": "chat_messages",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "sender_narrator_id"
           ],
           "columnsTo": [
             "id"
@@ -3081,6 +3121,22 @@
             }
           ],
           "isUnique": true,
+          "where": "\"kind\" = 'narrator'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_chat_rooms_narrator_id": {
+          "name": "idx_chat_rooms_narrator_id",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
           "concurrently": false,
           "method": "btree",
           "with": {}

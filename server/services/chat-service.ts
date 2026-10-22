@@ -1,16 +1,22 @@
 /**
- * chat-service.ts — Human-to-human chat, disjoint from narrator context.
+ * chat-service.ts — Chat rooms and their messages, disjoint from narrator context.
  *
- * Two room kinds share one storage shape but not one authorization rule:
+ * Three room kinds share one storage shape but not one authorization rule:
  *
  *   - `dm`       — closed 1:1. `chat_room_members` IS the ACL.
  *   - `narrator` — the discussion room beside one narrator. Read access follows
  *                  NARRATOR VISIBILITY, not membership; the member row exists
  *                  only to hold that user's read watermark.
+ *   - `bot`      — one person's conversation with a bot narrator. Closed like a
+ *                  DM (the person's member row is the ACL); posting additionally
+ *                  requires the right to drive the bot, because a post becomes
+ *                  the bot's next input.
  *
- * Nothing written here ever reaches a model. Forwarding is an explicit user
- * action on the client (see `submitToNarrator`), which goes through the
- * narrator's normal composer path so busy-narrator buffering still applies.
+ * Nothing in this module calls a model. Forwarding from a discussion room is an
+ * explicit user action on the client (see `submitToNarrator`), which goes through
+ * the narrator's normal composer path so busy-narrator buffering still applies.
+ * A bot room's post is handed to its bot by `bot-chat.ts` before it is recorded
+ * (see `postMessage`); the bot answers through `postBotMessage`.
  *
  * Main-thread discipline (CLAUDE.md): every query here is small, indexed and
  * bounded. Specifically:
@@ -32,6 +38,7 @@ import {
 	narrators,
 	users,
 } from "@server/db/schema";
+import { AsyncMutex } from "@server/lib/async-mutex";
 import { buildAttachedFilesHint } from "@server/lib/attached-files";
 import {
 	CHAT_ATTACHMENT_TOTAL_BYTES_MAX,
@@ -54,6 +61,7 @@ import { eventBus } from "@server/lib/event-bus";
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import { isBotNarrator } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
 import type { TextFileRef } from "@server/lib/uploads";
 import {
@@ -61,6 +69,7 @@ import {
 	canWriteNarrator,
 	NARRATOR_ACL_COLUMNS,
 } from "@server/services/narrator-acl";
+import { type ChatRoomKind, isConversationRoomKind } from "@shared/chat-room-kinds";
 import type { PublicDiscussionMessage, PublicDiscussionPage } from "@shared/public-narrator-share";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
@@ -72,6 +81,12 @@ import { PUBLIC_SHARE_LIMITS } from "./public-narrator-share-limits";
 
 /** Hard ceiling on one message body. Enforced again by the Zod schema. */
 export const CHAT_MESSAGE_MAX_CHARS = 8_000;
+/**
+ * Ceiling on one bot message. Higher than a person's: a bot's answer is often a
+ * document (a design, a plan with code), and splitting it would make the reader
+ * reassemble it. Still bounded, since every reader of the room renders it.
+ */
+export const CHAT_BOT_MESSAGE_MAX_CHARS = 32_000;
 /** Room-list summary length. Written at post time so the list never reads bodies. */
 export const CHAT_PREVIEW_MAX_CHARS = 120;
 export const CHAT_PAGE_DEFAULT = 50;
@@ -139,6 +154,8 @@ export interface ChatUserSnapshot {
 	avatarImageId: string | null;
 	/** Display-only identity, never a user/profile lookup key. */
 	isGuest?: boolean;
+	/** A bot: `id` is its NARRATOR id and `avatarImageId` keys a narrator avatar. */
+	isBot?: boolean;
 }
 
 /**
@@ -190,18 +207,23 @@ export interface ChatMessageRow {
 
 export interface ChatRoomSummary {
 	id: string;
-	kind: "dm" | "narrator";
+	kind: ChatRoomKind;
 	narratorId: string | null;
 	lastMessageAt: string | null;
 	lastMessagePreview: string | null;
 	lastMessageSenderId: string | null;
-	/** DM only: the other participant. */
+	/** DM: the other participant. Bot room: the bot. */
 	peer: ChatUserSnapshot | null;
 	unread: number;
 	/** `unread` hit CHAT_UNREAD_PROBE_LIMIT — display as "99+". */
 	unreadCapped: boolean;
 	lastReadSeq: number;
 	muted: boolean;
+	/**
+	 * Bot room resolved on its own (`resolveBotRoom`): whether this person may post,
+	 * i.e. drive the bot. Absent in room lists, where the post itself is the check.
+	 */
+	canPost?: boolean;
 }
 
 export interface ChatMessagePage {
@@ -237,6 +259,37 @@ function toUserSnapshot(
 	};
 }
 
+/** Narrator columns a bot's chat identity is built from. */
+const BOT_COLUMNS = {
+	id: true,
+	title: true,
+	handle: true,
+	avatarImageId: true,
+} as const;
+
+type BotIdentityRow = { id: string; title: string | null; handle: string | null };
+
+/**
+ * A bot's display name: its title, else its @handle. A bot is created named, so the
+ * last fallback only covers a title someone cleared later.
+ */
+export function botDisplayName(row: BotIdentityRow): string {
+	return row.title?.trim() || (row.handle ? `@${row.handle}` : "") || "Bot";
+}
+
+function toBotSnapshot(
+	row: (BotIdentityRow & { avatarImageId: string | null }) | null | undefined,
+): ChatUserSnapshot | null {
+	if (!row) return null;
+	return {
+		id: row.id,
+		username: botDisplayName(row),
+		avatarColor: null,
+		avatarImageId: row.avatarImageId,
+		isBot: true,
+	};
+}
+
 /** A stable message-scoped display identity, including after the link is removed. */
 function toGuestSnapshot(name: string | null, messageId: string): ChatUserSnapshot | null {
 	if (name === null) return null;
@@ -252,6 +305,14 @@ function toGuestSnapshot(name: string | null, messageId: string): ChatUserSnapsh
 /** Canonical DM identity: sorted ids joined with ":" (see schema note). */
 export function buildDmKey(userA: string, userB: string): string {
 	return [userA, userB].sort().join(":");
+}
+
+/**
+ * Canonical bot-room identity: the bot and the person's id (see schema note). The
+ * prefix keeps it disjoint from DM keys, which are two bare ids.
+ */
+export function buildBotRoomKey(narratorId: string, userId: string): string {
+	return `bot:${narratorId}:${userId}`;
 }
 
 function truncatePreview(text: string): string {
@@ -394,13 +455,16 @@ export async function resolveNarratorRoom(
 	}
 
 	const timestamp = nowIso();
+	// No conflict target: the one-room-per-narrator index is partial (a bot also owns
+	// `bot` rooms), and SQLite only matches a partial index from a target that repeats
+	// its WHERE. The only other unique key, `dm_key`, is null here and cannot conflict.
 	await db
 		.insert(chatRooms)
 		.values({ id: generateId(), kind: "narrator", narratorId, nextSeq: 1, createdAt: timestamp })
-		.onConflictDoNothing({ target: chatRooms.narratorId });
+		.onConflictDoNothing();
 
 	const room = await db.query.chatRooms.findFirst({
-		where: eq(chatRooms.narratorId, narratorId),
+		where: and(eq(chatRooms.narratorId, narratorId), eq(chatRooms.kind, "narrator")),
 	});
 	if (!room) throw new NotFoundError("Chat room for narrator", narratorId);
 
@@ -431,6 +495,7 @@ export async function ensureNarratorDiscussionRoomForShare(narratorId: string): 
 			.where(and(eq(narrators.id, narratorId), eq(narrators.type, "primary")))
 			.get();
 		if (!narrator) throw new NotFoundError("Narrator", narratorId);
+		// Untargeted for the same partial-index reason as `resolveNarratorRoom`.
 		tx.insert(chatRooms)
 			.values({
 				id: generateId(),
@@ -439,7 +504,7 @@ export async function ensureNarratorDiscussionRoomForShare(narratorId: string): 
 				nextSeq: 1,
 				createdAt: nowIso(),
 			})
-			.onConflictDoNothing({ target: chatRooms.narratorId })
+			.onConflictDoNothing()
 			.run();
 		const room = tx
 			.select({ id: chatRooms.id })
@@ -449,6 +514,91 @@ export async function ensureNarratorDiscussionRoomForShare(narratorId: string): 
 		if (!room) throw new NotFoundError("Chat room for narrator", narratorId);
 		return room.id;
 	});
+}
+
+/**
+ * Resolve (creating if needed) one person's conversation with a bot.
+ *
+ * Opening needs only READ access to the bot — the same bar as its page — while
+ * `canPost` reports whether this person may also drive it, so a viewer who may watch
+ * but not talk gets an honest read-only composer instead of a failing one. Checked
+ * before the room exists, for the phantom-room reason given on `resolveNarratorRoom`.
+ */
+export async function resolveBotRoom(narratorId: string, userId: string): Promise<ChatRoomSummary> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { ...NARRATOR_ACL_COLUMNS, ...BOT_COLUMNS, traits: true },
+	});
+	if (!narrator || !isBotNarrator(narrator.traits)) throw new NotFoundError("Bot", narratorId);
+	const principal = await resolvePrincipal(userId);
+	if (!(await canReadNarrator(narrator, principal))) throw new NotFoundError("Bot", narratorId);
+
+	const room = await ensureBotRoom(narratorId, userId);
+	const membership = await loadMembership(room.id, userId);
+	const unread = await probeUnread(room.id, membership?.lastReadSeq ?? 0);
+	return {
+		id: room.id,
+		kind: "bot",
+		narratorId,
+		lastMessageAt: room.lastMessageAt,
+		lastMessagePreview: room.lastMessagePreview,
+		lastMessageSenderId: room.lastMessageSenderId,
+		peer: toBotSnapshot(narrator),
+		unread: unread.count,
+		unreadCapped: unread.capped,
+		lastReadSeq: membership?.lastReadSeq ?? 0,
+		muted: membership?.muted ?? false,
+		canPost: await canWriteNarrator(narrator, principal),
+	};
+}
+
+/**
+ * The bot room for (bot, person), created on first use from either side — the person
+ * opening it or the bot writing first. Idempotent under concurrency like
+ * `resolveDmRoom`: insert-or-ignore on the unique key, then read the winner back.
+ * Callers authorize first; this only materializes.
+ */
+async function ensureBotRoom(
+	narratorId: string,
+	userId: string,
+): Promise<typeof chatRooms.$inferSelect> {
+	const dmKey = buildBotRoomKey(narratorId, userId);
+	await db
+		.insert(chatRooms)
+		.values({ id: generateId(), kind: "bot", dmKey, narratorId, nextSeq: 1, createdAt: nowIso() })
+		.onConflictDoNothing({ target: chatRooms.dmKey });
+	const room = await db.query.chatRooms.findFirst({ where: eq(chatRooms.dmKey, dmKey) });
+	if (!room) throw new NotFoundError("Chat room", dmKey);
+	await ensureMembers(room.id, [userId]);
+	return room;
+}
+
+/**
+ * A bot room's post becomes the bot's next input, so posting takes the same right as
+ * typing into the bot's own composer: WRITE access to the narrator. Re-read per post,
+ * because the bot's owner can narrow its audience at any time.
+ */
+async function assertCanPostToBot(narratorId: string | null, userId: string): Promise<void> {
+	const narrator = narratorId
+		? await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: NARRATOR_ACL_COLUMNS,
+			})
+		: undefined;
+	if (!narrator || !(await canWriteNarrator(narrator, await resolvePrincipal(userId)))) {
+		throw new ForbiddenError("You cannot message this bot");
+	}
+}
+
+/**
+ * Reading a room plus, for a bot room, the right to drive its bot. Shared by posting
+ * and by uploading a draft, so someone who may only watch a bot can't stage files in
+ * a room they could never send them to.
+ */
+async function assertCanPost(roomId: string, userId: string): Promise<ChatRoomAccess> {
+	const access = await assertCanRead(roomId, userId);
+	if (access.room.kind === "bot") await assertCanPostToBot(access.room.narratorId, userId);
+	return access;
 }
 
 async function ensureMembers(roomId: string, userIds: string[]): Promise<void> {
@@ -497,7 +647,9 @@ export async function assertCanRead(roomId: string, userId: string): Promise<Cha
 	if (!room) throw new NotFoundError("Chat room", roomId);
 	const membership = await loadMembership(roomId, userId);
 
-	if (room.kind === "dm") {
+	// A person's own conversations: membership is the ACL. For a bot room that is what
+	// the bot said TO this person, which stays theirs to read like a DM.
+	if (isConversationRoomKind(room.kind)) {
 		if (!membership) throw new NotFoundError("Chat room", roomId);
 		return { room, membership };
 	}
@@ -532,13 +684,17 @@ async function resolvePrincipal(userId: string): Promise<{ userId: string; isAdm
 
 type ChatTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-/** Shared allocation only; each caller must apply its own authorization before entering here. */
+/**
+ * Shared allocation only; each caller must apply its own authorization before entering here.
+ * `senderId` is the author's user id, or narrator id for a bot — the same id the
+ * message's `sender` snapshot carries, so a live patch and a refetch agree.
+ */
 function claimMessageSeq(
 	tx: ChatTransaction,
 	roomId: string,
 	timestamp: string,
 	preview: string,
-	senderUserId: string | null,
+	senderId: string | null,
 ): number {
 	const updated = tx
 		.update(chatRooms)
@@ -546,7 +702,7 @@ function claimMessageSeq(
 			nextSeq: sql`${chatRooms.nextSeq} + 1`,
 			lastMessageAt: timestamp,
 			lastMessagePreview: preview,
-			lastMessageSenderId: senderUserId,
+			lastMessageSenderId: senderId,
 		})
 		.where(eq(chatRooms.id, roomId))
 		.returning({ nextSeq: chatRooms.nextSeq })
@@ -566,6 +722,9 @@ export interface PostMessageInput {
 	kind?: "text" | "system";
 }
 
+/** One FIFO per bot: a post is admitted and claims its seq before the next one starts. */
+const botPostOrder = new AsyncMutex();
+
 /**
  * Append a message and advance the room's denormalized tail.
  *
@@ -577,6 +736,9 @@ export interface PostMessageInput {
  * Attachment claiming is inside that transaction on purpose: a claim that succeeded
  * while the insert failed would leave a file owned by a message that does not exist,
  * and the reverse would show a message with attachments the reader cannot fetch.
+ *
+ * In a bot room the post is handed to the bot first (`admitBotPost`), and a refusal
+ * records nothing.
  */
 export async function postMessage(input: PostMessageInput): Promise<ChatMessageRow> {
 	const text = input.text.trim();
@@ -595,7 +757,25 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		);
 	}
 
-	const access = await assertCanRead(input.roomId, input.senderUserId);
+	const access = await assertCanPost(input.roomId, input.senderUserId);
+	const post = { ...input, text, attachmentIds };
+	// A bot room's post IS the bot's next input, so it is recorded only once the bot
+	// has taken it: a bot that can't (its queue is full) answers the poster right away,
+	// as its own composer would, and the message stays in their composer — rather than
+	// the room showing a message the bot never heard. One bot's posts are serialized,
+	// so what it hears follows the room's seq order.
+	const botId = access.room.kind === "bot" ? access.room.narratorId : null;
+	if (botId) return botPostOrder.acquire(botId, () => appendPost(post, access, botId));
+	return appendPost(post, access, null);
+}
+
+/** The rest of `postMessage`, once the sender may post: snapshot, admit, record, announce. */
+async function appendPost(
+	input: PostMessageInput & { text: string; attachmentIds: string[] },
+	access: ChatRoomAccess,
+	botId: string | null,
+): Promise<ChatMessageRow> {
+	const { text, attachmentIds } = input;
 	// A narrator room's member row may not exist yet if the sender never opened
 	// the panel through the resolve endpoint (e.g. posting straight from a deep
 	// link). The watermark update below needs it.
@@ -608,8 +788,15 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		replyToSeq: number | null;
 		replyToSenderUserId: string | null;
 		replyToGuestName: string | null;
+		replyToSenderNarratorId: string | null;
 		replyToPreview: string | null;
-	} = { replyToSeq: null, replyToSenderUserId: null, replyToGuestName: null, replyToPreview: null };
+	} = {
+		replyToSeq: null,
+		replyToSenderUserId: null,
+		replyToGuestName: null,
+		replyToSenderNarratorId: null,
+		replyToPreview: null,
+	};
 	if (input.replyToMessageId) {
 		const target = await db.query.chatMessages.findFirst({
 			where: and(
@@ -621,6 +808,7 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 				seq: true,
 				senderUserId: true,
 				senderGuestName: true,
+				senderNarratorId: true,
 				contentText: true,
 				deletedAt: true,
 			},
@@ -630,6 +818,7 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 			replyToSeq: target.seq,
 			replyToSenderUserId: target.senderUserId,
 			replyToGuestName: target.senderGuestName,
+			replyToSenderNarratorId: target.senderNarratorId,
 			// An empty string (not null) for an already-deleted target: null means
 			// "legacy row, no snapshot taken", and conflating the two would send the
 			// client back to window resolution for a message we know is gone.
@@ -671,6 +860,17 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		);
 	}
 
+	if (botId) {
+		const { admitBotPost } = await import("./bot-chat");
+		await admitBotPost({
+			narratorId: botId,
+			senderUserId: input.senderUserId,
+			text,
+			replyToPreview: replySnapshot.replyToPreview,
+			attachments: pendingAttachments,
+		});
+	}
+
 	const timestamp = nowIso();
 	const messageId = generateId();
 	const preview = buildRoomPreview(text, pendingAttachments);
@@ -690,6 +890,7 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 				replyToSeq: replySnapshot.replyToSeq,
 				replyToSenderUserId: replySnapshot.replyToSenderUserId,
 				replyToGuestName: replySnapshot.replyToGuestName,
+				replyToSenderNarratorId: replySnapshot.replyToSenderNarratorId,
 				replyToPreview: replySnapshot.replyToPreview,
 				createdAt: timestamp,
 			})
@@ -744,14 +945,6 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		where: eq(users.id, input.senderUserId),
 		columns: USER_COLUMNS,
 	});
-	const replyToSender = replySnapshot.replyToSenderUserId
-		? toUserSnapshot(
-				await db.query.users.findFirst({
-					where: eq(users.id, replySnapshot.replyToSenderUserId),
-					columns: USER_COLUMNS,
-				}),
-			)
-		: null;
 
 	const row: ChatMessageRow = {
 		id: messageId,
@@ -761,9 +954,10 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		contentText: text,
 		replyToMessageId: input.replyToMessageId ?? null,
 		replyToSeq: replySnapshot.replyToSeq,
-		replyToSender:
-			toGuestSnapshot(replySnapshot.replyToGuestName, input.replyToMessageId ?? messageId) ??
-			replyToSender,
+		replyToSender: await loadReplyAuthor(
+			{ ...replySnapshot, replyToMessageId: input.replyToMessageId ?? null },
+			messageId,
+		),
 		replyToPreview: replySnapshot.replyToPreview,
 		attachments: pendingAttachments.map(toAttachmentRow),
 		editedAt: null,
@@ -791,6 +985,95 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 	});
 
 	return row;
+}
+
+export interface PostBotMessageInput {
+	/** The bot. The caller (`Send`) has already verified it IS one. */
+	narratorId: string;
+	/** The person addressed; their conversation with the bot is created on first use. */
+	userId: string;
+	text: string;
+}
+
+/**
+ * Append a message a bot wrote to its conversation with one person.
+ *
+ * The bot's half of `postMessage`, and deliberately smaller: a bot quotes by writing
+ * rather than through a reply snapshot, owns no attachment drafts, and has no read
+ * watermark to advance. Everything downstream — the room tail, live frames, badges,
+ * notifications — is the shared `chat:message_created` path.
+ */
+export async function postBotMessage(input: PostBotMessageInput): Promise<ChatMessageRow> {
+	const text = input.text.trim();
+	if (!text) throw new ValidationError("Message text is required");
+	if (text.length > CHAT_BOT_MESSAGE_MAX_CHARS) {
+		throw new ValidationError(`Message exceeds ${CHAT_BOT_MESSAGE_MAX_CHARS} characters`);
+	}
+	const bot = await db.query.narrators.findFirst({
+		where: eq(narrators.id, input.narratorId),
+		columns: { ...NARRATOR_ACL_COLUMNS, ...BOT_COLUMNS },
+	});
+	if (!bot) throw new NotFoundError("Narrator", input.narratorId);
+	// A bot writes only within its audience: the room it opens is one this person could
+	// have opened (`resolveBotRoom`'s bar). Past it, a message would come from a name any
+	// owner can pick, which the recipient could neither look up nor answer.
+	if (!(await canReadNarrator(bot, await resolvePrincipal(input.userId)))) {
+		throw new ForbiddenError("This person can't open this bot, so it can't message them");
+	}
+
+	const room = await ensureBotRoom(input.narratorId, input.userId);
+	const timestamp = nowIso();
+	const messageId = generateId();
+	const seq = db.transaction((tx) => {
+		const claimed = claimMessageSeq(
+			tx,
+			room.id,
+			timestamp,
+			buildRoomPreview(text),
+			input.narratorId,
+		);
+		tx.insert(chatMessages)
+			.values({
+				id: messageId,
+				roomId: room.id,
+				seq: claimed,
+				senderUserId: null,
+				senderNarratorId: input.narratorId,
+				kind: "text",
+				contentText: text,
+				createdAt: timestamp,
+			})
+			.run();
+		return claimed;
+	});
+
+	eventBus.emit({
+		type: "chat:message_created",
+		roomId: room.id,
+		messageId,
+		seq,
+		senderUserId: null,
+		senderNarratorId: input.narratorId,
+		roomKind: "bot",
+		narratorId: input.narratorId,
+	});
+
+	return {
+		id: messageId,
+		roomId: room.id,
+		seq,
+		kind: "text",
+		contentText: text,
+		replyToMessageId: null,
+		replyToSeq: null,
+		replyToSender: null,
+		replyToPreview: null,
+		attachments: [],
+		editedAt: null,
+		deletedAt: null,
+		createdAt: timestamp,
+		sender: toBotSnapshot(bot),
+	};
 }
 
 // ─── Public discussion: capabilities, not user ACL bypasses ────────────────────
@@ -1040,15 +1323,15 @@ export async function hydrateMessageForBroadcast(
 	row: typeof chatMessages.$inferSelect,
 ): Promise<ChatMessageRow> {
 	const [sender, replyToSender, attachmentRows] = await Promise.all([
-		row.senderUserId
-			? db.query.users.findFirst({ where: eq(users.id, row.senderUserId), columns: USER_COLUMNS })
-			: Promise.resolve(undefined),
-		row.replyToSenderUserId
-			? db.query.users.findFirst({
-					where: eq(users.id, row.replyToSenderUserId),
-					columns: USER_COLUMNS,
-				})
-			: Promise.resolve(undefined),
+		loadAuthor(
+			{
+				guestName: row.senderGuestName,
+				narratorId: row.senderNarratorId,
+				userId: row.senderUserId,
+			},
+			row.id,
+		),
+		loadReplyAuthor(row, row.id),
 		row.deletedAt
 			? Promise.resolve([])
 			: db.query.chatAttachments.findMany({
@@ -1065,16 +1348,62 @@ export async function hydrateMessageForBroadcast(
 		contentText: row.deletedAt ? "" : row.contentText,
 		replyToMessageId: row.replyToMessageId,
 		replyToSeq: row.replyToSeq,
-		replyToSender:
-			toGuestSnapshot(row.replyToGuestName, row.replyToMessageId ?? row.id) ??
-			toUserSnapshot(replyToSender),
+		replyToSender,
 		replyToPreview: row.replyToPreview,
 		attachments: attachmentRows.map(toAttachmentRow),
 		editedAt: row.editedAt,
 		deletedAt: row.deletedAt,
 		createdAt: row.createdAt,
-		sender: toGuestSnapshot(row.senderGuestName, row.id) ?? toUserSnapshot(sender),
+		sender,
 	};
+}
+
+/**
+ * One author, for the single-row paths (posting, broadcast). Priority guest → bot →
+ * user, matching the page reader: a guest name is a snapshot that outlives its share,
+ * and a message has at most one of the other two. `identityKey` scopes a guest's
+ * display id to the message that carries it.
+ */
+async function loadAuthor(
+	author: { guestName: string | null; narratorId: string | null; userId: string | null },
+	identityKey: string,
+): Promise<ChatUserSnapshot | null> {
+	const guest = toGuestSnapshot(author.guestName, identityKey);
+	if (guest) return guest;
+	if (author.narratorId) {
+		return toBotSnapshot(
+			await db.query.narrators.findFirst({
+				where: eq(narrators.id, author.narratorId),
+				columns: BOT_COLUMNS,
+			}),
+		);
+	}
+	if (author.userId) {
+		return toUserSnapshot(
+			await db.query.users.findFirst({ where: eq(users.id, author.userId), columns: USER_COLUMNS }),
+		);
+	}
+	return null;
+}
+
+/** The quoted message's author, from a row's reply snapshot (see `loadAuthor`). */
+function loadReplyAuthor(
+	row: {
+		replyToMessageId: string | null;
+		replyToGuestName: string | null;
+		replyToSenderNarratorId: string | null;
+		replyToSenderUserId: string | null;
+	},
+	messageId: string,
+): Promise<ChatUserSnapshot | null> {
+	return loadAuthor(
+		{
+			guestName: row.replyToGuestName,
+			narratorId: row.replyToSenderNarratorId,
+			userId: row.replyToSenderUserId,
+		},
+		row.replyToMessageId ?? messageId,
+	);
 }
 
 /** DB row → the metadata shape clients receive (never `storedName`). */
@@ -1137,14 +1466,14 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 				: eq(chatMessages.roomId, input.roomId),
 		orderBy: [desc(chatMessages.seq)],
 		limit: limit + 1,
-		with: { sender: { columns: USER_COLUMNS } },
+		with: { sender: { columns: USER_COLUMNS }, senderNarrator: { columns: BOT_COLUMNS } },
 	});
 
 	const hasMore = rows.length > limit;
 	const page = hasMore ? rows.slice(0, limit) : rows;
 
-	// Two extra bounded queries for the whole page, never one per row: the page is
-	// at most CHAT_PAGE_MAX, so each is a single `IN (...)` on an indexed column.
+	// Bounded queries for the whole page, never one per row: the page is at most
+	// CHAT_PAGE_MAX, so each is a single `IN (...)` on an indexed column.
 	const [replyAuthors, attachmentsByMessage] = await Promise.all([
 		loadReplyAuthors(page),
 		loadAttachmentsForMessages(page),
@@ -1161,7 +1490,11 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 			replyToSeq: row.replyToSeq,
 			replyToSender:
 				toGuestSnapshot(row.replyToGuestName, row.replyToMessageId ?? row.id) ??
-				(row.replyToSenderUserId ? (replyAuthors.get(row.replyToSenderUserId) ?? null) : null),
+				(row.replyToSenderNarratorId
+					? (replyAuthors.bots.get(row.replyToSenderNarratorId) ?? null)
+					: row.replyToSenderUserId
+						? (replyAuthors.users.get(row.replyToSenderUserId) ?? null)
+						: null),
 			replyToPreview: row.replyToPreview,
 			// A soft-deleted message reports no attachments: its body is already gone,
 			// so listing files it used to carry would offer content the delete removed.
@@ -1169,7 +1502,10 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 			editedAt: row.editedAt,
 			deletedAt: row.deletedAt,
 			createdAt: row.createdAt,
-			sender: toGuestSnapshot(row.senderGuestName, row.id) ?? toUserSnapshot(row.sender),
+			sender:
+				toGuestSnapshot(row.senderGuestName, row.id) ??
+				toBotSnapshot(row.senderNarrator) ??
+				toUserSnapshot(row.sender),
 		}))
 		.reverse();
 
@@ -1185,29 +1521,43 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
  *
  * The snapshot stores an id rather than a username so a rename is reflected
  * everywhere, which means the name has to be joined back on read — but once per
- * page, for the distinct set, not once per message.
+ * page, for the distinct set, not once per message. People and bots are separate
+ * tables with separate id spaces, so they resolve into separate maps.
  */
 async function loadReplyAuthors(
-	rows: ReadonlyArray<{ replyToSenderUserId: string | null }>,
-): Promise<Map<string, ChatUserSnapshot>> {
-	const ids = [
+	rows: ReadonlyArray<{
+		replyToSenderUserId: string | null;
+		replyToSenderNarratorId: string | null;
+	}>,
+): Promise<{ users: Map<string, ChatUserSnapshot>; bots: Map<string, ChatUserSnapshot> }> {
+	const distinct = (pick: (row: (typeof rows)[number]) => string | null) => [
 		...new Set(
-			rows
-				.map((row) => row.replyToSenderUserId)
-				.filter((id): id is string => typeof id === "string" && id.length > 0),
+			rows.map(pick).filter((id): id is string => typeof id === "string" && id.length > 0),
 		),
 	];
-	if (ids.length === 0) return new Map();
-	const users_ = await db.query.users.findMany({
-		where: inArray(users.id, ids),
-		columns: USER_COLUMNS,
-	});
-	const map = new Map<string, ChatUserSnapshot>();
-	for (const row of users_) {
+	const userIds = distinct((row) => row.replyToSenderUserId);
+	const botIds = distinct((row) => row.replyToSenderNarratorId);
+	const [userRows, botRows] = await Promise.all([
+		userIds.length > 0
+			? db.query.users.findMany({ where: inArray(users.id, userIds), columns: USER_COLUMNS })
+			: Promise.resolve([]),
+		botIds.length > 0
+			? db.query.narrators.findMany({ where: inArray(narrators.id, botIds), columns: BOT_COLUMNS })
+			: Promise.resolve([]),
+	]);
+	const result = {
+		users: new Map<string, ChatUserSnapshot>(),
+		bots: new Map<string, ChatUserSnapshot>(),
+	};
+	for (const row of userRows) {
 		const snapshot = toUserSnapshot(row);
-		if (snapshot) map.set(row.id, snapshot);
+		if (snapshot) result.users.set(row.id, snapshot);
 	}
-	return map;
+	for (const row of botRows) {
+		const snapshot = toBotSnapshot(row);
+		if (snapshot) result.bots.set(row.id, snapshot);
+	}
+	return result;
 }
 
 /** Attachment metadata for a page of messages, in one bounded query. */
@@ -1350,12 +1700,13 @@ export async function probeRoomUnreadForUser(
 }
 
 /**
- * The current user's DM conversations, newest activity first.
+ * The current user's conversations — with people (`dm`) and with bots (`bot`) —
+ * newest activity first.
  *
- * Reads only room scalars, the peer's user scalars and the stored preview — never
+ * Reads only room scalars, the peer's scalars and the stored preview — never
  * `content_text`.
  */
-export async function listDmRooms(userId: string): Promise<ChatRoomSummary[]> {
+export async function listConversationRooms(userId: string): Promise<ChatRoomSummary[]> {
 	// Driven from the ROOM side, joined to this user's member row, so the
 	// CHAT_ROOM_SCAN_LIMIT cut falls on the least recently active conversations
 	// rather than on an arbitrary slice of member rows. Reading memberships first
@@ -1365,7 +1716,9 @@ export async function listDmRooms(userId: string): Promise<ChatRoomSummary[]> {
 	const rows = await db
 		.select({
 			id: chatRooms.id,
+			kind: chatRooms.kind,
 			dmKey: chatRooms.dmKey,
+			narratorId: chatRooms.narratorId,
 			lastMessageAt: chatRooms.lastMessageAt,
 			lastMessagePreview: chatRooms.lastMessagePreview,
 			lastMessageSenderId: chatRooms.lastMessageSenderId,
@@ -1374,27 +1727,41 @@ export async function listDmRooms(userId: string): Promise<ChatRoomSummary[]> {
 		})
 		.from(chatRooms)
 		.innerJoin(chatRoomMembers, eq(chatRoomMembers.roomId, chatRooms.id))
-		.where(and(eq(chatRoomMembers.userId, userId), eq(chatRooms.kind, "dm")))
+		.where(and(eq(chatRoomMembers.userId, userId), inArray(chatRooms.kind, ["dm", "bot"])))
 		.orderBy(desc(chatRooms.lastMessageAt))
 		.limit(CHAT_ROOM_SCAN_LIMIT);
 	if (rows.length === 0) return [];
 
-	// Peers come from the dmKey rather than a second members join: the key already
-	// encodes both ids, so this is one bounded `inArray` instead of a fan-out.
+	// DM peers come from the dmKey rather than a second members join: the key already
+	// encodes both ids, so this is one bounded `inArray` instead of a fan-out. A bot
+	// room's peer is its narrator — one more bounded `inArray`.
 	const peerIds = new Set<string>();
+	const botIds = new Set<string>();
 	for (const room of rows) {
+		if (room.kind === "bot") {
+			if (room.narratorId) botIds.add(room.narratorId);
+			continue;
+		}
 		for (const id of (room.dmKey ?? "").split(":")) {
 			if (id && id !== userId) peerIds.add(id);
 		}
 	}
-	const peerRows =
+	const [peerRows, botRows] = await Promise.all([
 		peerIds.size > 0
-			? await db.query.users.findMany({
+			? db.query.users.findMany({
 					where: inArray(users.id, [...peerIds]),
 					columns: USER_COLUMNS,
 				})
-			: [];
+			: Promise.resolve([]),
+		botIds.size > 0
+			? db.query.narrators.findMany({
+					where: inArray(narrators.id, [...botIds]),
+					columns: BOT_COLUMNS,
+				})
+			: Promise.resolve([]),
+	]);
 	const peerById = new Map(peerRows.map((row) => [row.id, row]));
+	const botById = new Map(botRows.map((row) => [row.id, row]));
 
 	// One batched query for every room's count. Muted rooms are excluded from it rather
 	// than probed and discarded: they report 0 by definition (the client draws no badge),
@@ -1408,15 +1775,18 @@ export async function listDmRooms(userId: string): Promise<ChatRoomSummary[]> {
 	const summaries: ChatRoomSummary[] = [];
 	for (const room of rows) {
 		const unread = unreadByRoom.get(room.id) ?? { count: 0, capped: false };
+		const isBot = room.kind === "bot";
 		const peerId = (room.dmKey ?? "").split(":").find((id) => id && id !== userId);
 		summaries.push({
 			id: room.id,
-			kind: "dm",
-			narratorId: null,
+			kind: isBot ? "bot" : "dm",
+			narratorId: isBot ? room.narratorId : null,
 			lastMessageAt: room.lastMessageAt,
 			lastMessagePreview: room.lastMessagePreview,
 			lastMessageSenderId: room.lastMessageSenderId,
-			peer: toUserSnapshot(peerId ? peerById.get(peerId) : null),
+			peer: isBot
+				? toBotSnapshot(room.narratorId ? botById.get(room.narratorId) : null)
+				: toUserSnapshot(peerId ? peerById.get(peerId) : null),
 			unread: unread.count,
 			unreadCapped: unread.capped,
 			lastReadSeq: room.lastReadSeq,
@@ -1431,6 +1801,7 @@ export async function listDmRooms(userId: string): Promise<ChatRoomSummary[]> {
 }
 
 export interface ChatUnreadSummary {
+	/** Unread across the user's conversations — people AND bots (`isConversationRoomKind`). */
 	dmTotal: number;
 	dmTotalCapped: boolean;
 	byRoom: Record<string, number>;
@@ -1441,10 +1812,11 @@ export interface ChatUnreadSummary {
  *
  * Narrator rooms are excluded from `dmTotal`: their badge belongs on the
  * narrator's own toolbar entry, not on the global messages nav item. They still
- * appear in `byRoom` so an open panel can show its own count.
+ * appear in `byRoom` so an open panel can show its own count. Bot rooms count:
+ * a bot writing to you is a conversation the messages page lists.
  *
  * Bounded to CHAT_ROOM_SCAN_LIMIT rooms, ordered by activity, for the same reason
- * as `listDmRooms`: this runs on every badge refresh. If someone really is a
+ * as `listConversationRooms`: this runs on every badge refresh. If someone really is a
  * member of more rooms than that, the ones left out are the ones nothing has
  * happened in recently — i.e. the ones with nothing unread anyway.
  *
@@ -1483,7 +1855,7 @@ export async function getUnreadSummary(userId: string): Promise<ChatUnreadSummar
 		const unread = unreadByRoom.get(membership.roomId);
 		if (!unread || unread.count === 0) continue;
 		byRoom[membership.roomId] = unread.count;
-		if (membership.kind === "dm") {
+		if (isConversationRoomKind(membership.kind)) {
 			dmTotal += unread.count;
 			if (unread.capped) dmTotalCapped = true;
 		}
@@ -1600,7 +1972,7 @@ export async function createChatAttachment(
 	userId: string,
 	file: File,
 ): Promise<ChatAttachmentRow> {
-	await assertCanRead(roomId, userId);
+	await assertCanPost(roomId, userId);
 
 	// Bound the drafts one user can accumulate in a room. An upload is persisted
 	// before its message exists, so "upload and never send" is reachable; the
@@ -1950,7 +2322,7 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 	const rows = await db.query.chatMessages.findMany({
 		where: and(eq(chatMessages.roomId, input.roomId), inArray(chatMessages.id, ids)),
 		orderBy: [asc(chatMessages.seq)],
-		with: { sender: { columns: { username: true } } },
+		with: { sender: { columns: { username: true } }, senderNarrator: { columns: BOT_COLUMNS } },
 	});
 	if (rows.length === 0) throw new ValidationError("Selected messages are not in this room");
 
@@ -1970,13 +2342,17 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 		const author =
 			row.senderGuestName !== null
 				? `${row.senderGuestName} [share guest]`
-				: (row.sender?.username ?? "unknown");
+				: row.senderNarrator
+					? `${botDisplayName(row.senderNarrator)} [bot]`
+					: (row.sender?.username ?? "unknown");
 		const quoted =
 			row.replyToGuestName !== null
 				? `${row.replyToGuestName} [share guest]`
-				: row.replyToSenderUserId
-					? replyAuthors.get(row.replyToSenderUserId)?.username
-					: undefined;
+				: row.replyToSenderNarratorId
+					? replyAuthors.bots.get(row.replyToSenderNarratorId)?.username
+					: row.replyToSenderUserId
+						? replyAuthors.users.get(row.replyToSenderUserId)?.username
+						: undefined;
 		// The quote is rendered inline from the SNAPSHOT, so summarizing never has to
 		// fetch a message outside the selection to know what was being answered.
 		const replyPrefix = row.replyToPreview

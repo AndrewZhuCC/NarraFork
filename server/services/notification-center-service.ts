@@ -1,4 +1,6 @@
 /** Bounded event history. Source ACL and read watermarks are authoritative, not the projection. */
+
+import { isConversationRoomKind } from "@shared/chat-room-kinds";
 import {
 	type MarkNotificationsReadBody,
 	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
@@ -353,7 +355,8 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 				/* fail closed */
 			}
 			if (
-				source?.roomKind === "dm" &&
+				source &&
+				isConversationRoomKind(source.roomKind) &&
 				source.lastReadSeq !== null &&
 				storedLink.type === "chat_room" &&
 				storedLink.roomId === source.roomId

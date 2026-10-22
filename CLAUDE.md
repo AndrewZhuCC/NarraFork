@@ -7,7 +7,7 @@
 NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台里：部署在自己的电脑或服务器上，与同事共享项目，管理 Agent 的上下文和操作权限，也能通过手机查看进展、继续对话。
 
 **核心领域概念：**
-- **叙述者（Narrator）** — 基于自定义 Agent Loop 的 AI 会话，绑定工作目录；类型分 primary 和 subagent（explore/plan/general/review）
+- **叙述者（Narrator）** — 基于自定义 Agent Loop 的 AI 会话，绑定工作目录；类型分 primary 和 subagent（explore/plan/general/review）；带 `bot` trait 的是 Bot：人们在聊天房间里与它对话，只看到它 `Send({ user })` 的内容，会话记录是监控视图
 - **工作区（Workspace）** — 多叙述者的面板布局，可保存与恢复
 - **项目（Project）** — 关联 git 仓库的工作单元，叙述者在仓库目录或其 worktree 中工作
 - **消息（Messages）** — 团队成员间的站内会话与通知
@@ -181,6 +181,7 @@ frontend/
 - 改 agent provider 历史构造、图片处理、NUG 网关事件 → `docs/AGENT_PROVIDERS.md`
 - 注入机制（服务端把内容放进叙述者对话） → `docs/INJECTION.md`
 - 知识库（分级 + 分 tag 双轴授权、写时复制版本、知识图谱链接） → `docs/KNOWLEDGE_BASE.md`
+- Bot 模式叙述者（`bot` 聊天房间、`Send({ user })`、监控视图、往群聊扩展） → `docs/BOT_NARRATOR.md`
 - OAuth 2.0 + External API v1 接入 → `docs/OPEN_API.md`
 - VS Code 插件 → `docs/VSCODE_EXTENSION.md`
 - Codex Responses WebSocket → `docs/codex-websocket.md`

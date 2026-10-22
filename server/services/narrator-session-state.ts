@@ -335,6 +335,8 @@ export interface BufferedExecutionIntent {
 	modelOverride?: { model: string; mode: "temporary" | "permanent" };
 	/** Built-in control command; execute only after the previous owner has finalized. */
 	controlCommand?: boolean;
+	/** Text a person said (a bot's chat): never parsed as a queued `/new` or `/goal`. */
+	literal?: boolean;
 }
 
 export interface BufferedMessage {

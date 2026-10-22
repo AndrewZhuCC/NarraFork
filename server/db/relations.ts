@@ -458,6 +458,10 @@ export const chatMessagesRelations = relations(chatMessages, ({ one, many }) => 
 		fields: [chatMessages.senderUserId],
 		references: [users.id],
 	}),
+	senderNarrator: one(narrators, {
+		fields: [chatMessages.senderNarratorId],
+		references: [narrators.id],
+	}),
 	// The reply snapshot columns are deliberately NOT modelled as a relation: the
 	// point of the snapshot is that the quote renders without reading the target
 	// row, and a declared relation invites exactly the join it exists to avoid.
