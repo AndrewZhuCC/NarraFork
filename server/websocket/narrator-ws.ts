@@ -105,6 +105,12 @@ import { handleEditorFileMessage, releaseEditorFileSubscriptions } from "./edito
 import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
 import { projectNarratorActivityEvent } from "./narrator-activity-projection";
 import {
+	toBlockCatchUp,
+	toBlockFrames,
+	toBlockSnapshot,
+	toolOpened,
+} from "./narrator-block-protocol";
+import {
 	createCodexQuotaOverviewWsMessage,
 	type NarratorListStateSnapshotItem,
 	type NarratorServerMessage,
@@ -722,11 +728,21 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 		});
 	}
 	if (message.type === "tool_use_chunk" && message.inputDocument) {
+		let opened: string | null | undefined;
 		for (const ws of connections) {
 			if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 			if (!ws.data.subscribedNarrators.has(narratorId)) continue;
 			if (ws.data.activityOnlyNarrators?.has(narratorId)) continue;
 			if (ws.data.publicShare && !projectPublicNarratorEvent(narratorId, message)) continue;
+			if (ws.data.blockProtocolNarrators?.has(narratorId)) {
+				if (opened === undefined) {
+					const frame = toolOpened(
+						message as unknown as Record<string, unknown> & { type: string },
+					);
+					opened = frame ? JSON.stringify(frame) : null;
+				}
+				if (opened && !sendPayload(ws, opened)) continue;
+			}
 			if (!sendToolInputLane(ws, message)) removeConnection(ws);
 		}
 		eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
@@ -737,6 +753,25 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	let publicPayload: string | undefined;
 	let activityMessage: NarratorServerMessage | null | undefined;
 	let activityPayload: string | undefined;
+	// Protocol v2 frames (§8.2), built once per broadcast for each audience that needs them.
+	let blockFrames: Array<[NarratorServerMessage, string]> | undefined;
+	let publicBlockFrames: Array<[NarratorServerMessage, string]> | undefined;
+	const inBlockProtocol = (
+		frame: NarratorServerMessage,
+	): Array<[NarratorServerMessage, string]> => {
+		try {
+			return toBlockFrames(frame).map((item) => [item, JSON.stringify(item)]);
+		} catch (error) {
+			// A broadcast never fails its emitter; the v2 client reloads what it missed.
+			logger.warn("Message protocol v2 frame failed; asking the client to reload", {
+				narratorId,
+				type: frame.type,
+				error: String(error),
+			});
+			const reload: NarratorServerMessage = { type: "full_reload", narratorId };
+			return [[reload, JSON.stringify(reload)]];
+		}
+	};
 	for (const ws of connections) {
 		if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
@@ -761,18 +796,20 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			outgoing = publicMessage;
 			outgoingPayload = publicPayload;
 		}
+		let frames: Array<[NarratorServerMessage, string]> = [[outgoing, outgoingPayload]];
+		if (ws.data.blockProtocolNarrators?.has(narratorId)) {
+			if (ws.data.publicShare) frames = publicBlockFrames ??= inBlockProtocol(outgoing);
+			else frames = blockFrames ??= inBlockProtocol(outgoing);
+		}
 		if (ws.data.catchingUpNarrators.has(narratorId)) {
 			const buffer = ws.data.catchUpBuffers.get(narratorId);
 			if (buffer) {
-				bufferRealtimeMessage(buffer, outgoing, outgoingPayload.length);
+				for (const [frame, framePayload] of frames)
+					bufferRealtimeMessage(buffer, frame, framePayload.length);
 				continue;
 			}
 		}
-		try {
-			ws.send(outgoingPayload);
-		} catch {
-			removeConnection(ws);
-		}
+		for (const [, framePayload] of frames) if (!sendPayload(ws, framePayload)) break;
 	}
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
@@ -794,7 +831,26 @@ function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	return subscriptionRequestId ? { ...message, subscriptionRequestId } : message;
 }
 
-function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
+/** Send one serialized frame; a failed send drops the connection. */
+function sendPayload(ws: NarratorWS, payload: string): boolean {
+	try {
+		ws.send(payload);
+		return true;
+	} catch {
+		removeConnection(ws);
+		return false;
+	}
+}
+
+/**
+ * Send one frame to one connection, projected for a public-share reader. `inProtocol`
+ * maps the (projected) frame for a connection that negotiated message protocol v2.
+ */
+function safeSend(
+	ws: NarratorWS,
+	message: Record<string, unknown>,
+	inProtocol?: (frame: Record<string, unknown> & { type: string }) => Record<string, unknown>,
+): boolean {
 	let outgoing = message;
 	if (ws.data.publicShare) {
 		if (typeof message.type !== "string") return true;
@@ -805,6 +861,7 @@ function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
 		if (!projected) return true;
 		outgoing = projected;
 	}
+	if (inProtocol) outgoing = inProtocol(outgoing as Record<string, unknown> & { type: string });
 	if (outgoing.type === "tool_use_chunk" && outgoing.inputDocument)
 		return sendToolInputLane(ws, outgoing as unknown as ToolInputChunkMessage);
 	try {
@@ -1315,6 +1372,7 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					},
 					requestId,
 				),
+				ws.data.blockProtocolNarrators?.has(id) ? toBlockSnapshot : undefined,
 			)
 		) {
 			return;
@@ -1377,6 +1435,11 @@ function markCatchUpOverflow(ws: NarratorWS, narratorId: string): void {
 	if (buffer) buffer.overflowed = true;
 }
 
+/** How a catch-up reaches this connection: as is, or in message protocol v2. */
+function catchUpProtocol(ws: NarratorWS, narratorId: string) {
+	return ws.data.blockProtocolNarrators?.has(narratorId) ? toBlockCatchUp : undefined;
+}
+
 async function sendCatchUpForAnchor(
 	ws: NarratorWS,
 	narratorId: string,
@@ -1436,6 +1499,7 @@ async function sendCatchUpForAnchor(
 					},
 					requestId,
 				),
+				catchUpProtocol(ws, narratorId),
 			);
 		}
 
@@ -1469,6 +1533,7 @@ async function sendCatchUpForAnchor(
 								},
 								requestId,
 							),
+							catchUpProtocol(ws, narratorId),
 						);
 					}
 				}

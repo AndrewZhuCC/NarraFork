@@ -860,6 +860,17 @@ export type NarratorServerMessage =
 			cursor?: CatchUpCursor;
 			messageVersion?: number;
 	  }
+	/** Catch-up in protocol v2: the rows as envelopes + blocks, children included. */
+	| {
+			type: "catch_up";
+			narratorId: string;
+			protocol: 2;
+			messages: unknown[];
+			blocks: unknown[];
+			subagentActivities: unknown[];
+			cursor?: CatchUpCursor;
+			messageVersion?: number;
+	  }
 	| { type: "error"; message: string }
 	| {
 			type: "warning";
@@ -1150,6 +1161,56 @@ export type NarratorServerMessage =
 	 * `narratorBlocks.wsV2` is on, else 1.
 	 */
 	| { type: "message_protocol"; narratorIds: string[]; protocol: 1 | 2 }
+	// ── Message protocol v2 (docs/BLOCK_STORAGE-DESIGN.md §8.2) ─────────────────
+	// Sent only to connections that negotiated v2; `narrator-block-protocol.ts` maps
+	// the v1 frames onto these.
+	/**
+	 * Message rows as envelopes + blocks: what `message`, `user_message` and
+	 * `message_updated` carry in v1, named by `cause`. An envelope lists its blocks in
+	 * order; a block it no longer lists is gone.
+	 */
+	| {
+			type: "message_upserted";
+			narratorId: string;
+			cause: "message" | "user_message" | "message_updated";
+			messages: unknown[];
+			blocks: unknown[];
+			oldMessageId?: string;
+			replacedMessageId?: string;
+			messageId?: string;
+			newMessageId?: string;
+			replacementMessageId?: string;
+	  }
+	/** A streaming item opened: its block id before the block has a row (§5.2). */
+	| {
+			type: "block_opened";
+			narratorId: string;
+			blockId: string;
+			kind: "output" | "reasoning" | "tool";
+			/** The element's own identity: `${attempt}:${order}`, or a tool's call id. */
+			elementId: string;
+			/** Known once the step's envelope exists; null while it is not written yet. */
+			messageId: string | null;
+			wireId?: string;
+			outputIndex?: number;
+			subagentToolUseId?: string;
+			subagentNarratorId?: string;
+	  }
+	/** Text streamed into an open output or reasoning block. */
+	| {
+			type: "block_delta";
+			narratorId: string;
+			blockId: string;
+			kind: "output" | "reasoning";
+			elementId: string;
+			text: string;
+			revision?: number;
+			textOffset?: number;
+			outputIndex?: number;
+			fileReferenceContext?: unknown;
+			subagentToolUseId?: string;
+			subagentNarratorId?: string;
+	  }
 	/**
 	 * A subscribe request was refused because the connection's user may not read
 	 * that narrator (or it does not exist — deliberately indistinguishable, matching

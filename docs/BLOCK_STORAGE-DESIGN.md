@@ -1657,6 +1657,29 @@ reconcile(narrator, target, now):
 - **回填**：计划同时记录 `state_revision`；worker 读取后发生的状态写入（如翻译）会让应用改走"翻转格式 + 同步队列"，不再用过期计划建行。
 - **留给 P3 的 `content_json` 读改写：** `narrator-output-recovery`、编辑重生成与工具清理、删除叙述者时的归属转移、`updateCompactSummary`、计划输入补丁、`copyOnWriteMessage`、`discardAttemptBlocks`、段压缩摘要更新、compact 定稿；以及按 `content_json` 精确字节摘要与重写的回退管线（`revert-selection-service`、`revert-history-commit`）。双写期间这些路径的结果不变。
 
+**P2c-2 实现说明（页面 API v2 与 WS v2，开关 `narratorBlocks.wsV2`）**
+- **开关与协商：**
+  - `narratorBlocks.wsV2` 默认关。
+  - `messages` 订阅可带 `protocol: 1 | 2`：开关开时授予 v2，按连接、按叙述者记录，并回 `message_protocol {narratorIds, protocol}`；不带 `protocol` 的客户端看不到任何变化。
+  - 页面接口（含公开分享页）带 `?protocol=2` 时同理：开关开时返回 `{protocol: 2, messages: EnvelopeDTO[], blocks: BlockDTO[], minSeq, maxSeq, hasPrev, hasNext, messageVersion}`，否则仍是 v1 页面。
+- **页面 v2**（`server/services/narrator-block-page.ts`）：
+  - 信封是 v1 的行去掉 `contentJson` 与 `children`，加上按顺序的 `blockIds`；子行平铺在父行之后，靠 `parentToolUseId` 定位。
+  - 块：`id, messageId, ordinal, kind, subtype, phase, revision, wireId, attemptId, elements, hasOriginal`。
+  - 块格式信封按块行切分（各行 `payload.raw` 的长度；在同步队列里的先同步，发出的 id 就是行保留的 id）；旧信封按解码器分组，id 是块 id 接口在它仍为旧格式时能解析的解码 id。
+  - `elements` 就是 v1 发出的元素（工具 IO 已截断、账本字段已注入），v2 只多读块行布局。
+- **流式块的 id**（§3.2，`server/services/narrator-block-ids.ts`）：
+  - 按（叙述者，元素自身标识）发放：文本、推理元素是 `${attempt}:${order}`，工具是调用 id。
+  - WS 适配器在元素的第一个 delta、工具的第一个输入分片时取 id；store 的流式同步插入该元素的块行时用同一个 id（该 id 已被别的行占用时换新 id 并更新映射）。哪一侧先要就由哪一侧发放，另一侧取到同一个。
+  - 映射有界（4096 项，丢弃最旧的）；attempt 重试换新 attempt id，元素标识不会重复。
+- **WS v2 事件**（中央适配器 `server/websocket/narrator-block-protocol.ts`）：发送方仍发 v1 帧；`broadcastToNarrator` 对协商了 v2 的连接按下表映射，每次广播只算一次。
+  - `message` / `user_message` / `message_updated` → `message_upserted {cause, messages, blocks, …COW 别名}`。`cause` 保留 v1 帧类型，客户端按帧计 `messageVersion` 的规则不变。
+  - 文本、推理 delta（`stream_event`）→ `block_delta {blockId, kind, elementId, text, revision, textOffset, outputIndex}`；元素的第一个 delta 之前先发 `block_opened`（`messageId` 为 null：信封在第一次检查点才写入）。
+  - 工具的第一个输入分片之前发 `block_opened {kind: "tool", wireId}`，分片本身不变。
+  - `streaming_snapshot` 为每个活动项附上 `blockId`；`catch_up` 改为 `{protocol: 2, messages, blocks, subagentActivities, cursor, messageVersion}`。
+  - 公开分享连接先做公开投影再转 v2；其余帧原样发送。
+  - 与 §8.2 的差别：信封不再列出的块就是已删除的块，所以不单独发 `blocks_deleted`；`message_sealed` 并入 `message_upserted`，由块的 `phase` 表明是否仍在流式。
+- **留给后续：** 检查点仍随 `message_upserted` 发整条信封的块（与 v1 的整行等量）。只带 `blockId, revision, phase` 的 `block_checkpoint`、`block_state` 增量、按帧合并 delta，等 P2c-3 前端确定消费方式后再做。
+
 ### P3 退役与新能力
 
 **交付**
