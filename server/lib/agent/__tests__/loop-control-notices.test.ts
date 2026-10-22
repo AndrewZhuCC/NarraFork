@@ -12,8 +12,8 @@
  */
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { z } from "zod/v4";
 import { isBrokenToolOutput, outputToText } from "@shared/agent-protocol/tool-output";
+import { z } from "zod/v4";
 import type { ChatParams, DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";

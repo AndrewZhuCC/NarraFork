@@ -50,7 +50,8 @@ function modelResultOrder(rows: readonly DbMessage[]): string[] {
 		row.role === "assistant"
 			? toolUseIds(row).filter((id) =>
 					row.toolCalls?.some(
-						(call) => call.toolUseId === id && (call.status === "success" || call.status === "fail"),
+						(call) =>
+							call.toolUseId === id && (call.status === "success" || call.status === "fail"),
 					),
 				)
 			: [],
@@ -473,7 +474,9 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "run tools then answer", { rows: [] })) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "run tools then answer", {
+			rows: [],
+		})) {
 			events.push(event);
 			if (event.type === "stream_text") {
 				expect(executedToolValues).toEqual(["serial:one", "serial:two"]);
@@ -501,7 +504,9 @@ describe("agentLoop abort result draining", () => {
 		const startedAt = Date.now();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "interrupt pending tool", { rows: [] })) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "interrupt pending tool", {
+			rows: [],
+		})) {
 			events.push(event);
 			if (event.type === "stream_text") ac.abort();
 		}
@@ -735,7 +740,9 @@ describe("agentLoop abort result draining", () => {
 		// installed their resolvers, without blocking the event consumer itself.
 		const releaseReads = parallelToolsStarted.promise.then(releaseParallelAbortTools);
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "abort between tool groups", { rows: [] })) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "abort between tool groups", {
+			rows: [],
+		})) {
 			events.push(event);
 			if (
 				event.type === "tool_result" &&
@@ -873,7 +880,9 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "run interleaved tools", { rows: [] })) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "run interleaved tools", {
+			rows: [],
+		})) {
 			events.push(event);
 		}
 
@@ -1011,7 +1020,9 @@ describe("agentLoop abort result draining", () => {
 		let streamedText = "";
 		const startsField: Array<boolean | undefined> = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", { rows: [] })) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", {
+			rows: [],
+		})) {
 			if (event.type === "tool_use_chunk" && event.streamingField?.delta) {
 				startsField.push(event.streamingField.startsField);
 				streamedText += event.streamingField.delta;

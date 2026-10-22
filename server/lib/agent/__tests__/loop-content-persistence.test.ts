@@ -23,7 +23,11 @@ const provider: ProviderAdapter = {
 	buildHistory: async (rows) => {
 		builtRows.push(structuredClone(rows));
 		return {
-			history: rows.map((row) => ({ role: row.role, content: row.contentJson, calls: row.toolCalls })),
+			history: rows.map((row) => ({
+				role: row.role,
+				content: row.contentJson,
+				calls: row.toolCalls,
+			})),
 		};
 	},
 	injectSystemPrompt: () => {},

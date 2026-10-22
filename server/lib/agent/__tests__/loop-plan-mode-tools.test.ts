@@ -55,7 +55,7 @@ const testProvider: ProviderAdapter = {
 		);
 		return formatted;
 	},
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat() {
 		// Turn 0 calls a tool (so the loop reaches a turn boundary), turn 1 just answers.

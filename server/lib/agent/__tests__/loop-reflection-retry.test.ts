@@ -366,7 +366,7 @@ describe("reflection decision retries are bounded and safe", () => {
 		expect(requests).toHaveLength(2);
 		// The parent's projection (system prompt, then its rows) leads both requests.
 		const parentPrefix = requests[0].history.slice(0, parentRows.length + 1);
-		expect(parentPrefix[0]).toEqual({ role: "system", content: parentConfig.systemPrompt });
+		expect(parentPrefix[0]).toEqual({ role: "system", content: "Reflection retry parent system" });
 		expect(JSON.stringify(parentPrefix)).toContain("Parent question with cacheable context");
 		expect(parentPrefix.at(-1)).toMatchObject({ role: "assistant", content: "Prior work" });
 		for (const request of requests) {

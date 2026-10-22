@@ -37,9 +37,11 @@ let providerScenario:
 	| "ws_error_response" = "error_then_usage_only";
 let providerAttempts = 0;
 let wsBaseUrl = "";
-/** `content` (user-side turn text) seen by each provider.chat() call, in order. */
+/**
+ * The input each provider.chat() call ends with, in order: its `content`, or (for a
+ * request projected from the loop's transcript) the trailing input row's text.
+ */
 let sentContents: string[] = [];
-let sentToolResults: unknown[][] = [];
 let sentHistories: unknown[][] = [];
 const RECOVERY_TOOL = "__BrokenInputRecoveryTest";
 const anthropicFormatter = new AnthropicProvider({
@@ -56,11 +58,17 @@ function usesAnthropicRecovery(): boolean {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	// The Anthropic recovery cases use the real second stage; the rest only need the
+	// rows' text in order.
+	buildHistory: async (rows, model, narratorId) =>
+		usesAnthropicRecovery()
+			? anthropicFormatter.buildHistory(rows, model, narratorId)
+			: { history: rows.map((row) => ({ role: row.role, text: row.contentText ?? "" })) },
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
-		sentContents.push(params.content ?? "");
+		const tail = params.history.at(-1) as { role?: string; text?: string } | undefined;
+		sentContents.push(params.content || (tail?.role === "user" ? (tail.text ?? "") : ""));
 		if (providerScenario === "local_failure") {
 			throw new ApiError(400, "Local request assembly failed", {
 				schema: "narrafork.error-diagnostics.v1",
@@ -72,7 +80,6 @@ const testProvider: ProviderAdapter = {
 		params.onRequestStart?.();
 
 		if (usesAnthropicRecovery()) {
-			sentToolResults.push(structuredClone(params.toolResults ?? []));
 			sentHistories.push(structuredClone(params.history));
 			if (providerAttempts === 1) {
 				yield {
@@ -235,7 +242,6 @@ describe("Anthropic broken tool recovery", () => {
 		providerScenario = scenario;
 		providerAttempts = 0;
 		sentContents = [];
-		sentToolResults = [];
 		sentHistories = [];
 		const execute = mock(async () => ({ output: "valid result" }));
 		toolRegistry.register({
@@ -250,20 +256,30 @@ describe("Anthropic broken tool recovery", () => {
 			expect(
 				events.some((event) => event.type === "assistant_message" && event.text === "recovered"),
 			).toBe(true);
-			expect(sentToolResults[1]).toEqual(
-				scenario === "broken_anthropic_mixed"
-					? [{ tool_use_id: "valid-call", content: "valid result", is_error: undefined }]
+			// The follow-up is the real Anthropic projection of the loop's rows: the valid
+			// call keeps its native result, the broken call and its result are gone.
+			const followUp = sentHistories[1] as Array<{ content: unknown }>;
+			const results = followUp.flatMap((message) =>
+				Array.isArray(message.content)
+					? (message.content as Array<Record<string, unknown>>).filter(
+							(block) => block.type === "tool_result",
+						)
 					: [],
 			);
-			expect(JSON.stringify(sentHistories[1])).not.toContain("broken-call");
+			expect(results).toEqual(
+				scenario === "broken_anthropic_mixed"
+					? [expect.objectContaining({ tool_use_id: "valid-call", content: "valid result" })]
+					: [],
+			);
+			expect(JSON.stringify(followUp)).not.toContain("broken-call");
 			if (scenario === "broken_anthropic_mixed") {
-				expect(JSON.stringify(sentHistories[1])).toContain("valid-call");
+				expect(JSON.stringify(followUp)).toContain("valid-call");
 				expect(execute).toHaveBeenCalledTimes(1);
 			} else {
 				expect(execute).not.toHaveBeenCalled();
 			}
-			expect(sentContents[1]).toContain("invalid or missing input");
-			expect(sentContents[1]).not.toContain("output was cut off by the token limit");
+			expect(JSON.stringify(followUp)).toContain("invalid or missing input");
+			expect(JSON.stringify(followUp)).not.toContain("output was cut off by the token limit");
 		} finally {
 			toolRegistry.unregister(RECOVERY_TOOL);
 		}

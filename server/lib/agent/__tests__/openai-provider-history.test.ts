@@ -11,9 +11,10 @@ import {
 	OpenAIProvider,
 	parseResponsesAPIEvent,
 } from "../openai-provider";
+import { LoopTranscript, type TranscriptImage } from "../loop-transcript";
 import { OutputContentAccumulator } from "../output-content";
 import type { DbMessage } from "../provider";
-import type { ReasoningProviderMetadata } from "../types";
+import type { ContentBlock, ReasoningProviderMetadata } from "../types";
 
 const TEST_PROVIDER: OpenAIProviderConfig = {
 	id: "test-openai",
@@ -61,6 +62,23 @@ function makeAssistantMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 		toolCalls: [],
 		...overrides,
 	};
+}
+
+/**
+ * What a live request sends for one step: the step as the loop keeps it in its transcript
+ * (calls settled with `results`), projected by the provider like every request.
+ */
+async function liveHistory(
+	provider: OpenAIProvider,
+	blocks: ContentBlock[],
+	model: string,
+	results: Record<string, { output: string; images?: TranscriptImage[] }> = {},
+): Promise<unknown[]> {
+	const transcript = new LoopTranscript();
+	transcript.appendStep(blocks);
+	for (const [toolUseId, result] of Object.entries(results))
+		transcript.settleTool(toolUseId, result);
+	return (await provider.buildHistory(transcript.rows, model)).history;
 }
 
 function makeUserMessage(overrides: Partial<DbMessage> = {}): DbMessage {
@@ -138,19 +156,9 @@ describe("native Responses reasoning continuation", () => {
 				input: {},
 				outputIndex: 1,
 			};
-			const history: unknown[] = [];
-			provider.pushAssistantTurn(
-				history,
-				"",
-				[{ toolUseId: call.call_id, name: call.name, input: {} }],
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				[...blocks, tool],
-			);
+			const live = await liveHistory(provider, [...blocks, tool], params.model, {
+				[call.call_id]: { output: "ok" },
+			});
 			const stored = await provider.buildHistory(
 				[
 					makeAssistantMessage({
@@ -173,21 +181,19 @@ describe("native Responses reasoning continuation", () => {
 				],
 				params.model,
 			);
-			// The rebuild also carries the result the live request appends separately.
-			const liveResults = [provider.formatToolResult(call.call_id, "ok", false)];
-			expect(stored.history).toEqual([
-				...history,
-				{ type: "function_call_output", call_id: call.call_id, output: "ok" },
-			]);
-			for (const [replay, toolResults] of [
-				[history, liveResults],
-				[stored.history, []],
-			] as const) {
+			// The loop's own rows and the stored rows project to the same request.
+			expect(live).toEqual(stored.history);
+			expect(stored.history.at(-1)).toEqual({
+				type: "function_call_output",
+				call_id: call.call_id,
+				output: "ok",
+			});
+			for (const replay of [live, stored.history]) {
 				for await (const _event of provider.chat({
 					...params,
 					content: "",
-					history: replay as unknown[],
-					toolResults: toolResults as unknown[],
+					history: replay,
+					toolResults: [],
 				})) {
 					/* consume mocked stream */
 				}
@@ -208,7 +214,6 @@ describe("native Responses reasoning continuation", () => {
 
 	test("only marked same-source native text replays; ambiguous legacy, summaries and foreign text do not", async () => {
 		const provider = new OpenAIProvider({ ...TEST_PROVIDER, defaultModel: "deepseek-v4.1-flash" });
-		provider.noteActiveModel("deepseek-v4.1-flash");
 		const source = provider.getActiveReasoningSource();
 		for (const [format, signatureSource] of [
 			[undefined, source],
@@ -360,7 +365,6 @@ describe("native Responses reasoning continuation", () => {
 				...TEST_PROVIDER,
 				defaultModel: "deepseek-v4.1-flash",
 			});
-			provider.noteActiveModel("deepseek-v4.1-flash");
 			const tools = new Map();
 			const reasoning = new Map();
 			const raw = "  first\nsecond  ";
@@ -430,12 +434,14 @@ describe("native Responses reasoning continuation", () => {
 				},
 				outputIndex: 0,
 			};
-			const history: unknown[] = [];
-			provider.pushAssistantTurn(
-				history,
-				"",
-				[{ toolUseId: "call_native", name: "Read", input: {} }],
-				[block],
+			const history = await liveHistory(
+				provider,
+				[
+					{ type: "reasoning", ...block },
+					{ type: "tool_use", toolUseId: "call_native", name: "Read", input: {} },
+				],
+				"deepseek-v4.1-flash",
+				{ call_native: { output: "ok" } },
 			);
 			const expected = {
 				type: "reasoning",
@@ -613,27 +619,24 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain('"encrypted_content":"enc_456"');
 	});
 
-	test("pushAssistantTurn emits native reasoning and web_search items for responses history", () => {
+	test("a live step replays native reasoning and web_search items for responses history", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(
-			history,
-			"Tool result summary",
-			[],
+		const history = await liveHistory(
+			provider,
 			[
 				{
+					type: "reasoning",
 					text: "Live reasoning summary",
 					outputIndex: 0,
 					providerMetadata: {
-						openai: {
-							itemId: "rs_live",
-							reasoningEncryptedContent: "enc_live",
-						},
+						signatureSource: provider.getActiveReasoningSource(),
+						openai: { itemId: "rs_live", reasoningEncryptedContent: "enc_live" },
 					},
 				},
+				{ type: "web_search", id: "ws_live", query: "cache me", outputIndex: 1 },
+				{ type: "text", text: "Tool result summary" },
 			],
-			[{ id: "ws_live", query: "cache me", outputIndex: 1 }],
+			"openai:gpt-5",
 		);
 
 		expect(history).toHaveLength(3);
@@ -643,17 +646,6 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(JSON.stringify(history[1])).toContain('"query":"cache me"');
 		expect(JSON.stringify(history[2])).toContain("Tool result summary");
 		expect(JSON.stringify(history[2])).not.toContain("Live reasoning summary");
-	});
-
-	test("pushAssistantTurn preserves official assistant message id when provided", () => {
-		const provider = new OpenAIProvider(TEST_PROVIDER);
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(history, "Visible reply", [], undefined, undefined, "msg_remote_1");
-
-		expect(history).toHaveLength(1);
-		expect(JSON.stringify(history[0])).toContain('"id":"msg_remote_1"');
-		expect(JSON.stringify(history[0])).toContain("Visible reply");
 	});
 
 	test("parseResponsesAPIEvent captures assistant message item ids from responses events", () => {
@@ -817,13 +809,18 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(skippedDoneEvents.some((event) => event.reasoning)).toBe(false);
 	});
 
-	test("pushAssistantTurn drops non-replayable reasoning on credential-bound models", () => {
+	test("a live step drops non-replayable reasoning on credential-bound models", async () => {
 		// gpt-5 is credential-bound: reasoning without an encrypted credential has
 		// nothing to replay — echoing the plain text would fail upstream.
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(history, "Visible reply", [], [{ text: "Fallback reasoning" }]);
+		const history = await liveHistory(
+			provider,
+			[
+				{ type: "reasoning", text: "Fallback reasoning" },
+				{ type: "text", text: "Visible reply" },
+			],
+			"openai:gpt-5",
+		);
 
 		expect(history).toHaveLength(1);
 		expect(JSON.stringify(history[0])).toContain("Visible reply");
@@ -831,41 +828,44 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(JSON.stringify(history[0])).not.toContain('"type":"reasoning"');
 	});
 
-	test("pushAssistantTurn keeps non-replayable reasoning as assistant text fallback on relay models", () => {
+	test("a live step keeps non-replayable reasoning as assistant text fallback on relay models", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		provider.noteActiveModel("openai:deepseek-chat");
-		const history: unknown[] = [];
+		const history = await liveHistory(
+			provider,
+			[
+				{ type: "reasoning", text: "Fallback reasoning" },
+				{ type: "text", text: "Visible reply" },
+			],
+			"openai:deepseek-chat",
+		);
 
-		provider.pushAssistantTurn(history, "Visible reply", [], [{ text: "Fallback reasoning" }]);
-
-		expect(history).toHaveLength(1);
-		expect(JSON.stringify(history[0])).toContain("Fallback reasoning");
-		expect(JSON.stringify(history[0])).toContain("Visible reply");
-		expect(JSON.stringify(history[0])).not.toContain('"type":"reasoning"');
+		const json = JSON.stringify(history);
+		expect(json).toContain("Fallback reasoning");
+		expect(json).toContain("Visible reply");
+		expect(json).not.toContain('"type":"reasoning"');
 	});
 
-	test("pushAssistantTurn replays gateway-minted encrypted reasoning verbatim on relay models", () => {
+	test("a live step replays gateway-minted encrypted reasoning verbatim on relay models", async () => {
 		// Some Codex-compatible gateways (e.g. Console Go) mint encrypted_content even
 		// for model names that classify as plain-text relays (deepseek here). They
 		// reject a follow-up turn that degrades the reasoning to assistant text
 		// ("reasoning_text in the thinking mode must be passed back"), so the item
 		// must be replayed verbatim with its credential.
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		provider.noteActiveModel("openai:deepseek-chat");
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(
-			history,
-			"Visible reply",
-			[],
+		const history = await liveHistory(
+			provider,
 			[
 				{
+					type: "reasoning",
 					text: "Hidden reasoning",
 					providerMetadata: {
+						signatureSource: provider.getActiveReasoningSource(),
 						openai: { itemId: "rs_relay_1", reasoningEncryptedContent: "enc_relay_1" },
 					},
 				},
+				{ type: "text", text: "Visible reply" },
 			],
+			"openai:deepseek-chat",
 		);
 
 		expect(history).toHaveLength(2);
@@ -890,25 +890,27 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		];
 
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
-		expect(result.trailingToolResults).toEqual([]);
 		expect(JSON.stringify(result.history[0])).toContain('"type":"web_search_call"');
 		expect(JSON.stringify(result.history[0])).toContain('"query":"weather sf"');
 		expect(JSON.stringify(result.history[1])).toContain("Search result summary");
 		expect(JSON.stringify(result.history)).not.toContain("[Web search:");
 	});
 
-	test("pushAssistantTurn replays image_generation as native responses item with id", () => {
+	test("a live step replays image_generation as native responses item with id", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(history, "", [], undefined, undefined, undefined, [
-			{
-				id: "ig_live",
-				revisedPrompt: "a tiny blue square",
-				result: SAMPLE_PNG_BASE64,
-				outputIndex: 0,
-			},
-		]);
+		const history = await liveHistory(
+			provider,
+			[
+				{
+					type: "image_generation",
+					id: "ig_live",
+					revisedPrompt: "a tiny blue square",
+					result: SAMPLE_PNG_BASE64,
+					outputIndex: 0,
+				},
+			],
+			"openai:gpt-5",
+		);
 
 		expect(history).toHaveLength(1);
 		expect(JSON.stringify(history[0])).toContain('"type":"image_generation_call"');
@@ -994,7 +996,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(JSON.stringify(result.history[2])).toContain("Follow up");
 	});
 
-	test("buildHistory matches pushAssistantTurn canonical responses layout", async () => {
+	test("buildHistory of stored rows matches the live step's canonical responses layout", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [
 			makeAssistantMessage({
@@ -1028,37 +1030,32 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		];
 
 		const rebuilt = await provider.buildHistory(dbMessages, "openai:gpt-5");
-		const pushedHistory: unknown[] = [];
-		provider.pushAssistantTurn(
-			pushedHistory,
-			"Assistant reply",
-			[{ toolUseId: "call_sync", name: "Read", input: { file_path: "/tmp/demo" } }],
+		// The stored row keeps the call in its ledger only, which replays after the items.
+		const live = await liveHistory(
+			provider,
 			[
 				{
+					type: "reasoning",
 					text: "Reasoning summary",
 					providerMetadata: {
-						openai: {
-							itemId: "rs_sync",
-							reasoningEncryptedContent: "enc_sync",
-						},
+						signatureSource: "openai",
+						openai: { itemId: "rs_sync", reasoningEncryptedContent: "enc_sync" },
 					},
 					outputIndex: 0,
 				},
+				{ type: "web_search", id: "ws_sync", query: "search term", outputIndex: 1 },
+				{ type: "text", text: "Assistant reply" },
+				{
+					type: "tool_use",
+					toolUseId: "call_sync",
+					name: "Read",
+					input: { file_path: "/tmp/demo" },
+				},
 			],
-			[{ id: "ws_sync", query: "search term", outputIndex: 1 }],
+			"openai:gpt-5",
+			{ call_sync: { output: "file contents" } },
 		);
-		const pushedTrailing = [provider.formatToolResult("call_sync", "file contents", false)];
-
-		provider.pushUserTurn(pushedHistory, "", "openai:gpt-5", pushedTrailing);
-		// Ignore the live-only message id; the wire never carries it either.
-		expect(
-			JSON.parse(
-				JSON.stringify(pushedHistory, (key, value) =>
-					key === "id" && typeof value === "string" && value.startsWith("msg") ? undefined : value,
-				),
-			),
-		).toEqual(rebuilt.history);
-		expect(rebuilt.trailingToolResults).toEqual([]);
+		expect(live).toEqual(rebuilt.history);
 	});
 
 	test("buildHistory replays persisted user images from the message owner narrator", async () => {
@@ -1092,14 +1089,19 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain("Describe this screenshot");
 	});
 
-	test("pushUserTurn preserves tool result images for the next responses turn", () => {
+	test("a live step's tool result images reach the next responses turn", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		const history: unknown[] = [];
-		const toolResult = provider.formatToolResult("call_image", "Rendered screenshot", false, [
-			{ format: "png", base64: SAMPLE_PNG_BASE64 },
-		]);
-
-		provider.pushUserTurn(history, "", "openai:gpt-5", [toolResult]);
+		const history = await liveHistory(
+			provider,
+			[{ type: "tool_use", toolUseId: "call_image", name: "Screenshot", input: {} }],
+			"openai:gpt-5",
+			{
+				call_image: {
+					output: "Rendered screenshot",
+					images: [{ format: "png", base64: SAMPLE_PNG_BASE64 }],
+				},
+			},
+		);
 
 		const historyJson = JSON.stringify(history);
 		expect(historyJson).toContain('"type":"function_call_output"');
@@ -1108,20 +1110,15 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain('"image_url":"data:image/png;base64,');
 	});
 
-	test("pushUserTurn preserves user images for tool continuation turns", () => {
+	test("a live input's images reach the responses history", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
-		const history: unknown[] = [];
+		const transcript = new LoopTranscript();
+		transcript.appendInput("Describe this screenshot", [
+			{ format: "png", base64: SAMPLE_PNG_BASE64 },
+		]);
+		const { history } = await provider.buildHistory(transcript.rows, "openai:gpt-5");
 
-		provider.pushUserTurn(
-			history,
-			"Describe this screenshot",
-			"openai:gpt-5",
-			[],
-			[{ format: "png", base64: SAMPLE_PNG_BASE64 }],
-		);
-
-		const responsesInput = convertHistoryToResponsesApi(history as OAIMessage[]);
-		const historyJson = JSON.stringify(responsesInput);
+		const historyJson = JSON.stringify(history);
 		expect(historyJson).toContain('"type":"input_text"');
 		expect(historyJson).toContain("Describe this screenshot");
 		expect(historyJson).toContain('"type":"input_image"');
@@ -1160,7 +1157,6 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain('"call_id":"call_enter_plan"');
 		expect(historyJson).toContain('"type":"function_call_output"');
 		expect(historyJson).toContain("Entered plan mode");
-		expect(result.trailingToolResults).toEqual([]);
 	});
 
 	test("buildHistory preserves plan submission tool pairs in responses history", async () => {
@@ -1201,7 +1197,6 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain('"call_id":"call_exit_plan"');
 		expect(historyJson).toContain('"type":"function_call_output"');
 		expect(historyJson).toContain("Plan presented for approval");
-		expect(result.trailingToolResults).toEqual([]);
 	});
 
 	test("buildHistory skips orphaned tool_use blocks without completed tool results", async () => {
@@ -1227,7 +1222,6 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		const historyJson = JSON.stringify(result.history);
 		expect(historyJson).not.toContain('"call_id":"call_orphaned"');
 		expect(historyJson).not.toContain('"type":"function_call"');
-		expect(result.trailingToolResults).toEqual([]);
 	});
 
 	test("buildHistory emits sys context as user input on responses format (not developer)", async () => {
@@ -1298,99 +1292,6 @@ describe("Chat Completions reasoning_content replay", () => {
 	function completionsProvider(defaultModel = "deepseek-v4-pro"): OpenAIProvider {
 		return new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions", defaultModel });
 	}
-
-	test("pushAssistantTurn echoes reasoning text and backfills tool turns that have none", () => {
-		const provider = completionsProvider();
-		provider.noteActiveModel("deepseek-v4-pro");
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(
-			history,
-			"answer",
-			[],
-			[{ text: "thought one" }, { text: "thought two" }],
-		);
-		provider.pushAssistantTurn(history, "", [
-			{ toolUseId: "call_1", name: "Read", input: { file_path: "a.ts" } },
-		]);
-
-		expect(history[0]).toMatchObject({
-			role: "assistant",
-			content: "answer",
-			reasoning_content: "thought one\n\nthought two",
-		});
-		expect(history[1]).toMatchObject({
-			role: "assistant",
-			content: "",
-			reasoning_content: "",
-		});
-		expect(JSON.stringify(history[1])).toContain('"id":"call_1"');
-	});
-
-	test("ordered content is what the live loop replays as reasoning_content", () => {
-		const provider = completionsProvider();
-		provider.noteActiveModel("glm-5.1");
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(
-			history,
-			"flat text ignored",
-			[{ toolUseId: "ignored", name: "Read", input: {} }],
-			[{ text: "param reasoning ignored" }],
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			[
-				{ type: "reasoning", text: "ordered thought" },
-				{ type: "text", text: "ordered answer" },
-				{
-					type: "tool_use",
-					toolUseId: "call_ordered",
-					name: "Read",
-					input: { file_path: "a.ts" },
-				},
-			],
-		);
-		provider.pushAssistantTurn(
-			history,
-			"fallback",
-			[],
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			[{ type: "tool_use", toolUseId: "call_bare", name: "Bash", input: { command: "ls" } }],
-		);
-
-		expect(history[0]).toMatchObject({
-			content: "ordered answer",
-			reasoning_content: "ordered thought",
-		});
-		expect(JSON.stringify(history[0])).toContain('"id":"call_ordered"');
-		expect(JSON.stringify(history[0])).not.toContain("param reasoning ignored");
-		expect(history[1]).toMatchObject({ content: "", reasoning_content: "" });
-		expect(JSON.stringify(history[1])).toContain('"id":"call_bare"');
-	});
-
-	test("credential-strict completions models never receive reasoning_content", () => {
-		const provider = completionsProvider("gpt-5");
-		provider.noteActiveModel("gpt-5");
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(
-			history,
-			"",
-			[{ toolUseId: "call_strict", name: "Read", input: {} }],
-			[{ text: "hidden" }],
-		);
-
-		expect(history[0]).not.toHaveProperty("reasoning_content");
-		expect(JSON.stringify(history[0])).not.toContain("hidden");
-	});
 
 	test("buildHistory replays reasoning text and patches assistant turns that have none", async () => {
 		const provider = completionsProvider();

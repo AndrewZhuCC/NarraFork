@@ -50,7 +50,7 @@ let sawParentTurn = false;
 
 const throwingProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		if (sawParentTurn) throw new Error("reflection provider exploded");

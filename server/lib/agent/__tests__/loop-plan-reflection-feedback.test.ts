@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { Locale } from "@server/lib/prompt-i18n";
-import type { AgentToolUse, ProviderAdapter } from "../provider";
+import { outputToText } from "@shared/agent-protocol/tool-output";
+import type { AgentToolUse, DbMessage, ProviderAdapter } from "../provider";
 import type { ExitPlanReflectionDecision } from "../tools/exit-plan-reflection";
 import type { AgentConfig } from "../types";
 
@@ -8,8 +9,20 @@ const realProviderModule = { ...(await import("../provider")) };
 const realPermissionModule = { ...(await import("@server/services/narrator-permission")) };
 const realReflectionModule = { ...(await import("../tools/exit-plan-reflection")) };
 
+/** The settled tool results a request's rows carry, as the model reads them. */
 type Request = { toolResults: Array<{ output: string; isError: boolean }> };
 const requests: Request[] = [];
+let projectedRows: DbMessage[] = [];
+
+function settledResults(rows: readonly DbMessage[]): Request["toolResults"] {
+	return rows.flatMap((row) =>
+		(row.toolCalls ?? []).flatMap((call) =>
+			call.status === "success" || call.status === "fail"
+				? [{ output: outputToText(call.outputJson), isError: call.status === "fail" }]
+				: [],
+		),
+	);
+}
 const pending = new Map<string, (decision: ExitPlanReflectionDecision) => void>();
 const lifecycle: string[] = [];
 const failureOptions: Array<{ failed?: boolean } | undefined> = [];
@@ -20,13 +33,16 @@ let cancellationFinished: Promise<void> | undefined;
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => {
+		projectedRows = rows;
+		return { history: [] };
+	},
 	injectSystemPrompt: (history, systemPrompt) => {
 		history.unshift({ role: "system", content: systemPrompt });
 	},
 	async *chat(params) {
 		params.onRequestStart?.();
-		requests.push(JSON.parse(JSON.stringify({ toolResults: params.toolResults })));
+		requests.push(structuredClone({ toolResults: settledResults(projectedRows) }));
 		if (requests.length > 2) throw new Error("Reflection exceeded its two-turn budget");
 		yield {
 			toolUses: [

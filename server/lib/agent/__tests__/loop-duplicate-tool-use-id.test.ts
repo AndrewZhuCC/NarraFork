@@ -42,7 +42,10 @@ function anthropicLike(rows: readonly DbMessage[]) {
 				? [
 						{
 							role: "user",
-							content: settled.map((call) => ({ type: "tool_result", tool_use_id: call.toolUseId })),
+							content: settled.map((call) => ({
+								type: "tool_result",
+								tool_use_id: call.toolUseId,
+							})),
 						},
 					]
 				: []),

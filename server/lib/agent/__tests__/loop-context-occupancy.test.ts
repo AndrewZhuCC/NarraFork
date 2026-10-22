@@ -11,7 +11,7 @@ let requestReadyObserver: (() => void) | undefined;
 const model = "claude-sonnet-4-20250514";
 const adapter: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		await params.onInputCharacters?.(inputPlans[attempt] ?? null);

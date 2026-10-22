@@ -8,17 +8,21 @@ let providerScenario:
 	| "phantom_forever" // every attempt: phantom chunk only (exhausts retries)
 	| "retryable_error_then_text" = "phantom_then_text";
 let providerAttempts = 0;
-// Captures the `content` passed to each chat() call so we can assert the
-// in-place same-turn retry behavior (resend identical request).
+// Captures the input each chat() call ends with — the trailing input row of the
+// projected history — so we can assert the in-place same-turn retry behavior
+// (resend identical request).
 const contentLog: string[] = [];
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({
+		history: rows.map((row) => ({ role: row.role, text: row.contentText ?? "" })),
+	}),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
-		contentLog.push(params.content);
+		const tail = params.history.at(-1) as { role?: string; text?: string } | undefined;
+		contentLog.push(params.content || (tail?.role === "user" ? (tail.text ?? "") : ""));
 		params.onRequestStart?.();
 
 		if (providerScenario === "phantom_then_text") {
