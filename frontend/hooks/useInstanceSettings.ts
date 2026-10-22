@@ -119,18 +119,8 @@ export interface InstanceSettingsState {
 	globalBlacklistDirs: DirectoryBlacklistRuleInput[];
 	globalCommandWhitelist: CommandWhitelistRuleInput[];
 	globalCommandBlacklist: CommandBlacklistRuleInput[];
-	// Chapters
-	maxWorktrees: number;
-	maxContainers: number;
-	sizeWarning: number;
-	autoSave: boolean;
-	dormantMinutes: number;
+	// Workspace
 	treeSnapshots: boolean;
-	// Containers
-	portStart: number;
-	portEnd: number;
-	proxyEnabled: boolean;
-	proxyPort: number;
 }
 
 type Setters = {
@@ -298,16 +288,7 @@ function makeDefaults(): InstanceSettingsState {
 		globalBlacklistDirs: [],
 		globalCommandWhitelist: [],
 		globalCommandBlacklist: [],
-		maxWorktrees: 10,
-		maxContainers: 5,
-		sizeWarning: 500,
-		autoSave: true,
-		dormantMinutes: 0,
 		treeSnapshots: true,
-		portStart: 10000,
-		portEnd: 20000,
-		proxyEnabled: false,
-		proxyPort: 7780,
 	};
 }
 
@@ -417,16 +398,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				globalCommandBlacklist: normalizeSharedRules<CommandBlacklistRuleInput>(
 					settings.agent?.commandBlacklist,
 				),
-				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
-				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
-				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
-				autoSave: settings.chapters?.autoSaveOnDormant ?? true,
-				dormantMinutes: settings.chapters?.dormantAfterMinutes ?? 0,
-				treeSnapshots: settings.chapters?.treeSnapshotsEnabled ?? true,
-				portStart: settings.containers?.portRangeStart ?? 10000,
-				portEnd: settings.containers?.portRangeEnd ?? 20000,
-				proxyEnabled: settings.containers?.proxy?.enabled ?? false,
-				proxyPort: settings.containers?.proxy?.port ?? 7780,
+				treeSnapshots: settings.workspace?.treeSnapshotsEnabled ?? true,
 			};
 			serverSnapshot.current = snap;
 			setState(snap);
@@ -556,22 +528,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					ringResponseBytes: state.ringResponseBytes,
 					autoPin: state.autoPin,
 				},
-				chapters: {
-					maxActiveWorktrees: state.maxWorktrees,
-					maxActiveContainers: state.maxContainers,
-					worktreeSizeWarningMb: state.sizeWarning,
-					autoSaveOnDormant: state.autoSave,
-					dormantAfterMinutes: state.dormantMinutes,
-					treeSnapshotsEnabled: state.treeSnapshots,
-				},
-				containers: {
-					portRangeStart: state.portStart,
-					portRangeEnd: state.portEnd,
-					proxy: {
-						enabled: state.proxyEnabled,
-						port: state.proxyPort,
-					},
-				},
+				workspace: { treeSnapshotsEnabled: state.treeSnapshots },
 				editor: { type: "vscode" },
 				update: {
 					source: state.updateSource,
