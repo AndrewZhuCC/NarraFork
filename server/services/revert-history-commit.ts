@@ -329,7 +329,7 @@ export class RevertHistoryCommitService {
 			)
 				throw fail("EVIDENCE_INCOMPLETE", "The complete fixed selection is not settled");
 			await compareSelection(fixed, current, () => this.pause(snapshot));
-			await this.verifyCopyProjection(snapshot);
+			await this.verifyCopyProjection(snapshot, current);
 			await this.build(snapshot, current, worker);
 			const latest = await this.selection.collect({
 				principal,
@@ -486,15 +486,24 @@ export class RevertHistoryCommitService {
 		}
 	}
 
-	private async verifyCopyProjection(work: Snapshot) {
-		// The application-owned schema and SQLite's enabled FK/trigger machinery are
-		// authoritative. Do not veto a user's recovery because an unrelated table or
-		// trigger was added after a hand-maintained whitelist was written.
-		// Only COW copy projections need a structural check to avoid dropping columns.
-		for (const [table, expected] of [
-			["narrator_messages", MESSAGE_COLUMNS],
-			["narrator_tool_calls", TOOL_COLUMNS],
+	private async verifyCopyProjection(work: Snapshot, selection: RevertSelectionResult) {
+		// Only actual COW inserts need a complete copy projection. Deletes, unlinks and
+		// in-place rewrites preserve unmentioned fields and must not be vetoed by schema
+		// drift in a table they never copy. Keep rejecting unknown fields when copying
+		// that table, rather than silently dropping data from the new history row.
+		for (const [table, expected, copying] of [
+			[
+				"narrator_messages",
+				MESSAGE_COLUMNS,
+				selection.history.messages.some((message) => message.action === "copy_on_write"),
+			],
+			[
+				"narrator_tool_calls",
+				TOOL_COLUMNS,
+				selection.history.toolChanges.some((tool) => tool.action === "copy"),
+			],
 		] as const) {
+			if (!copying) continue;
 			const columns = this.root
 				.query<{ name: string; hidden: number }, [string]>(
 					"SELECT name,hidden FROM pragma_table_xinfo(?) LIMIT 257",
