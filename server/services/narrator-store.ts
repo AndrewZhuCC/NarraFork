@@ -34,6 +34,8 @@ export const narratorStore = {
 	/** The notice of a manual tool load or unload. */
 	appendToolChange: (...args: Parameters<Persistence["persistToolChangeMessage"]>) =>
 		narratorPersistence.persistToolChangeMessage(...args),
+	openEpoch: (...args: Parameters<Persistence["persistEpochMarker"]>) =>
+		narratorPersistence.persistEpochMarker(...args),
 	/** Open an assistant step whose items arrive as they stream. */
 	openStep: (...args: Parameters<Persistence["createPartialAssistantMessage"]>) =>
 		narratorPersistence.createPartialAssistantMessage(...args),

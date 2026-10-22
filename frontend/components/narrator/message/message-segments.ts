@@ -353,10 +353,18 @@ function classifyBlock(b: ContentBlock): VisualLane | null {
 	return null;
 }
 
+function isEpochMarker(msg: NarratorMsg): boolean {
+	const head = Array.isArray(msg.contentJson) ? msg.contentJson[0] : undefined;
+	return !!head && typeof head === "object" && (head as { type?: unknown }).type === "epoch";
+}
+
 function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
 	const atoms: MessageAtom[] = [];
 	const materials: MessageMaterials = { atoms, toolCalls: [] };
 	if (msg.role !== "assistant") {
+		// An epoch marker records what the model's request is rebuilt from; it is not part
+		// of the conversation and has nothing to show.
+		if (msg.role === "system" && isEpochMarker(msg)) return materials;
 		atoms.push({ lane: "content-whole", msg });
 		return materials;
 	}

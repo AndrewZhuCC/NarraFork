@@ -154,8 +154,44 @@ export function recoverBlockStorage(): number {
 		)
 		.run(new Date().toISOString()).changes;
 	drainQueue(SWEEP_BUDGET_MS);
+	auditRecentEnvelopes();
 	startSweep();
 	return interrupted;
+}
+
+const AUDIT_ENVELOPES = 50;
+
+/**
+ * Dual-write check (P1 exit criterion): the newest block-format envelopes must assemble
+ * from their rows to exactly what they store. A mismatch is logged and re-synced.
+ * Returns the ids that differed.
+ */
+export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
+	if (!hasBlockSchema()) return [];
+	const rows = sqlite
+		.prepare(
+			`SELECT id, content_json AS contentJson FROM narrator_messages
+			 WHERE body_format = 2 ORDER BY rowid DESC LIMIT ?`,
+		)
+		.all(limit) as Array<{ id: string; contentJson: string | null }>;
+	const differing = rows.flatMap((row) => {
+		const stored = parse(row.contentJson);
+		if (!Array.isArray(stored)) return [];
+		const blocks = sqlite
+			.prepare("SELECT payload, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal")
+			.all(row.id) as Array<{ payload: string; state: string | null }>;
+		const assembled = assembleContent(
+			blocks.map((block) => ({ payload: parse(block.payload), state: parse(block.state) })),
+		);
+		return JSON.stringify(assembled) === JSON.stringify(stored) ? [] : [row.id];
+	});
+	if (differing.length) {
+		logger.warn("Block rows differed from their envelope; re-synced", { messageIds: differing });
+		sqlite.transaction(() => {
+			for (const id of differing) syncEnvelopeNow(id);
+		})();
+	}
+	return differing;
 }
 
 // === Sync ===

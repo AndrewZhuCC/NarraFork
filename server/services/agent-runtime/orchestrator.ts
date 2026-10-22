@@ -106,6 +106,7 @@ import {
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
 import { freezeNarratorContextComposition } from "../narrator-context-composition";
+import { optionalToolDescription, reconcileEpoch } from "../narrator-epochs";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -876,7 +877,7 @@ export async function runAgentLoopUnlocked(
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, placement);
 			const historyDeadline = Date.now() + 10_000;
-			const rawMessages = await narratorService.getModelHistorySinceLastCompact(
+			let rawMessages = await narratorService.getModelHistorySinceLastCompact(
 				narratorId,
 				undefined,
 				{
@@ -1018,6 +1019,28 @@ export async function runAgentLoopUnlocked(
 			// rebuild request raised before it is satisfied by construction.
 			clearPlanModePromptRebuild(narratorId);
 
+			// What this request must carry before its history is built: a new epoch at a
+			// boundary, or notices for tool changes that bypassed `/load` (§7.7).
+			if (
+				await reconcileEpoch({
+					narratorId,
+					messages: rawMessages,
+					...toolLoadingInput(),
+					model: resolved.model,
+					provider: resolved.provider,
+					noticeText: (kind, toolName) =>
+						kind === "tool_loaded"
+							? getToolMessageWithParams("toolLoaded", locale, {
+									toolName,
+									toolDescription: optionalToolDescription(toolName, locale),
+								})
+							: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
+				})
+			)
+				rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+					signal: active.abortController.signal,
+					deadline: historyDeadline,
+				});
 			const historyOptions = {
 				narratorId,
 				model: resolved.model,

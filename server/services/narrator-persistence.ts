@@ -23,6 +23,7 @@ import {
 	users,
 } from "../db/schema";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
+import type { EpochRecord } from "../lib/agent/tool-loading";
 import type {
 	ApiRequestDiagnostics,
 	ReasoningProviderMetadata,
@@ -1513,6 +1514,7 @@ const sqliteNarratorPersistence = {
 						.get();
 					const seq = appendMessageRefSync(tx, narratorId, id);
 					persistPlacement(tx, narratorId, id, placement);
+					syncEnvelopeNow(id);
 					return { ...created, seq };
 				});
 			},
@@ -1640,6 +1642,7 @@ const sqliteNarratorPersistence = {
 
 					const seq = appendMessageRefSync(tx, narratorId, id);
 					persistPlacement(tx, narratorId, id, placement);
+					syncEnvelopeNow(id);
 					return { ...created, seq };
 				}),
 			{ label: "persistSystemMessage", maxRetries: 5 },
@@ -1718,6 +1721,8 @@ const sqliteNarratorPersistence = {
 			toolNames: string[];
 			text: string;
 		},
+		/** `system` for a change the runtime reconciled rather than a `/load` someone typed. */
+		origin?: "system",
 	): Promise<RefMessage> {
 		return appendPersistedMessage({
 			id: generateId(),
@@ -1726,6 +1731,24 @@ const sqliteNarratorPersistence = {
 			contentJson: [block],
 			contextCharsJson: measureMessageCharacters("user", [block], block.text),
 			contentText: block.text,
+			...(origin ? { origin } : {}),
+			createdAt: new Date().toISOString(),
+		});
+	},
+
+	/**
+	 * Open an epoch (docs/BLOCK_STORAGE-DESIGN.md §7.7): a system row the model never
+	 * sees, recording what the epoch's request prefix is rebuilt from.
+	 */
+	async persistEpochMarker(narratorId: string, epoch: EpochRecord): Promise<RefMessage> {
+		return appendPersistedMessage({
+			id: generateId(),
+			narratorId,
+			role: "system",
+			contentJson: [{ type: "epoch", epoch }],
+			contextCharsJson: { segments: [] },
+			contentText: null,
+			origin: "system",
 			createdAt: new Date().toISOString(),
 		});
 	},
@@ -2104,6 +2127,8 @@ const sqliteNarratorPersistence = {
 			expectedCompactBoundaryMessageId?: string | null;
 			expectedAttempt?: number;
 			expectedSeq?: number;
+			/** What the epoch this compact opens froze (§7.7); recorded on success. */
+			epoch?: EpochRecord;
 		},
 	) {
 		const now = new Date().toISOString();
@@ -2181,6 +2206,7 @@ const sqliteNarratorPersistence = {
 			const compactBlock = {
 				...finished,
 				...(status === "compacted" ? { summary, contextPercentAfter: contextPercent } : {}),
+				...(status === "compacted" && options?.epoch ? { epoch: options.epoch } : {}),
 			};
 			const failureText = truncateCompactError(options?.error ?? "Compact failed");
 			const contentText =

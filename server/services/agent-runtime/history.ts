@@ -231,6 +231,12 @@ export async function buildRuntimeHistory(
 				modelMessages,
 				options.toolLoading.managed,
 				options.toolLoading.current,
+				options.toolLoading.managed.size
+					? (await import("../narrator-epochs")).toolLoadingEpochOf(
+							options.narratorId,
+							modelMessages,
+						)
+					: undefined,
 			)
 		: undefined;
 	const toolLoadingStrategy = usesToolLoading(toolLoadingState)

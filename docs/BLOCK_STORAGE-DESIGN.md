@@ -1536,6 +1536,30 @@ reconcile(narrator, target, now):
 - 双写校验没有差异。
 - 流式期间块表每秒的写入次数，不高于现状的 checkpoint 次数。
 
+**P1 实现说明（与上文的差异）**
+- **块行内容。** P1 的块行 `payload = {raw: [原样存储元素]}`，读者专用字段（译文、卡片状态、`isLatest`）移进 `state = {raw: [...]}`；`assembleContent` 把各行按 ordinal 拼回后与 `content_json` 逐字节一致（`shared/narrator-blocks/storage.ts`）。kind、subtype、phase、`model_text`、`wire_id` 取自 `decodeLegacyContent`。规范化 payload（parts、`provider_meta`）在所有读取方改读块表时（P2）再换，P1 先不存两份正文。
+- **同步路径。** store 的写操作在同一事务里同步受影响的信封（`server/services/narrator-block-sync.ts`）。其余写入方由生成的 v2 触发器写入 `narrator_block_sync_queue`，再由三处排空：事务末尾的 flush（有上限）、5 秒一次的限时清扫，以及启动恢复。块行按 key 匹配，id、attempt、lineage 在改写中保持不变。
+- **revision。** P1 中 `content_json` / `content_text` 的变化对所有格式仍然 bump（读取方仍读 `content_json`）。所以 `patchState` 类写入（译文、卡片状态）在 P1 仍会让模型历史 revision 加一次，P2 切读后取消。
+- **旧信封。** `body_format = 1` 的信封被修改时不就地物化成块，统一留给 P2 回填。
+- **PG。** v2 触发器、块表与 FTS 的迁移齐全，但 PG 写路径在 P1 仍写 `body_format = 1`，块同步只在 SQLite 上进行。
+- **COW。** 事务内的复制统一走 `cowEnvelopeTx`（`narrator-persistence.ts`），四处调用方都改用它：
+  - 副本的属主是持有者，作者保留原值；
+  - 副本的块指回所复制的块。
+  - `revert-history-commit` 的批量程序同样改为属主为持有者、作者保留；
+  - sender 标签读作者（`coalesce(author_narrator_id, narrator_id)`），v2 的标题触发器同时覆盖作者。
+- **丢弃 attempt。** 按块上的 `attempt_id`（即 loop 的 requestId）。没有块行的旧格式信封仍按基线截断。
+- **轮。**
+  - 每次 `runAgentLoopUnlocked` 写一行。
+  - `trigger_message_id` 取运行开始时历史里最新、且尚未归属任何轮的 user 行，并把这行的 `turn_id` 一并补上。
+  - `cause_block_id`、`provider_response_id` 列已建，P1 不写。
+- **纪元。** P1 只冻结工具集合：
+  - compact 成功时，compact 元素里写 `epoch`。
+  - 对账在每个 pass 开始时做，而不是每次请求：
+    - target 变化或缓存已冷，而且重建确实会改变工具布局时，写一行 role=system 的 `epoch` 标记（模型不可见，前端隐藏）；
+    - 冻结纪元内绕过 `/load` 的变化，写成 origin=system 的 `tool_loaded` / `tool_unloaded` 提示。
+  - 冻结工具定义、system 分节快照与提醒、前缀核对，以及 `narrator_text_snapshots` 的写入，留到后续阶段。
+- **双写校验。** 启动时审计最近 50 个块格式信封（`auditRecentEnvelopes`）。有差异就记日志并重新同步。
+
 ### P2 切换读取与回填
 
 **交付**
