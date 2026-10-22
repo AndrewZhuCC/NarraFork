@@ -49,6 +49,7 @@ export const TOOL_LOADING_MODE_VALUES = [
 	"anthropic_tool_addition",
 	"anthropic_deferred_tail",
 	"openai_additional_tools",
+	"kimi_system_tools",
 	"custom_injection",
 ];
 export const fieldOptions: Partial<Record<FieldKind, string[]>> = {

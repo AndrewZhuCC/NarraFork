@@ -696,9 +696,11 @@ export function usesStatefulModel(prefix?: string, model?: string): boolean {
 	if (prefix === "tokendance" && getTokenDanceRuntimeConfig()) {
 		const rawModel = model?.startsWith("tokendance:") ? model.slice("tokendance:".length) : model;
 		const catalog = getTokenDanceCatalogModels().find((m) => m.id === rawModel);
-		return (
-			!!catalog && selectTokenDanceProtocol(catalog.supported_protocols) === "openai-responses"
-		);
+		if (!catalog) return false;
+		const protocol =
+			resolveModelProtocol("tokendance", model) ??
+			selectTokenDanceProtocol(catalog.supported_protocols);
+		return protocol === "openai-responses";
 	}
 	if (usesStatefulApi(prefix)) return true;
 	if (usesCodexModel(prefix, model)) return true;

@@ -117,7 +117,7 @@ function params(provider: ProviderType): ChatParams {
 describe("strict TokenDance protocol mapping", () => {
 	test("fixed priority and no inference", () => {
 		expect(selectTokenDanceProtocol(protocols.map(([protocol]) => protocol).reverse())).toBe(
-			"openai-responses",
+			"anthropic-messages",
 		);
 		expect(selectTokenDanceProtocol(["openai", "claude", "gemini"])).toBeUndefined();
 		models = [
@@ -137,6 +137,8 @@ describe("strict TokenDance protocol mapping", () => {
 			const provider = new TokenDanceProvider();
 			provider.prepareForModel("tokendance:opaque-model");
 			expect(provider.getActiveReasoningSource()).toBe("tokendance:anthropic-messages");
+			// The stateful /responses helpers follow the protocol actually used.
+			expect(settingsProvider.usesStatefulModel("tokendance", "opaque-model")).toBe(false);
 		} finally {
 			settings.agent.modelProtocolOverrides = previous;
 		}

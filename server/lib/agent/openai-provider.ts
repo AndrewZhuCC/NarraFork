@@ -450,6 +450,8 @@ interface ResponsesFunctionCallOutputMessage {
 export interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
 	content?: string | OAIContentPart[] | null;
+	/** Kimi dynamic tool loading: tools a `system` message declares from its position on. */
+	tools?: OAITool[];
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
 	/**
@@ -680,16 +682,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			return tools.map(formatResponsesTool);
 		}
 		// Completions: nested format { type: "function", function: { ... } }
-		return tools.map(
-			(tool): OAITool => ({
-				type: "function",
-				function: {
-					name: tool.name,
-					description: tool.description,
-					parameters: resolveToolJsonSchema(tool),
-				},
-			}),
-		);
+		return tools.map(formatCompletionsTool);
 	}
 
 	async buildHistory(
@@ -4180,6 +4173,31 @@ async function buildResponsesHistory(
 	return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
 }
 
+/** One tool in Chat Completions shape; also an entry of a Kimi `system` tools message. */
+function formatCompletionsTool(tool: ResolvedToolDefinition): OAITool {
+	return {
+		type: "function",
+		function: {
+			name: tool.name,
+			description: tool.description,
+			parameters: resolveToolJsonSchema(tool),
+		},
+	};
+}
+
+/**
+ * Kimi's dynamic tool loading: a `system` message whose `tools` become callable from
+ * this position on, beside the top-level `tools`. Definitions must be complete.
+ */
+function systemToolsMessage(change: ToolLoadingChange): OAIMessage {
+	return {
+		role: "system",
+		tools: change.additions.flatMap((addition) =>
+			addition.definition ? [formatCompletionsTool(addition.definition)] : [],
+		),
+	};
+}
+
 function buildOAIHistory(dbMessages: DbMessage[]): {
 	history: OAIMessage[];
 	trailingToolResults: OAIToolResult[];
@@ -4191,9 +4209,12 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 	);
 
-	// Drop the last user message — it's sent as the current message
+	// Drop the last user message — it's sent as the current message. Its tool
+	// declaration still has to precede it, exactly where every later rebuild places it.
+	let trailingToolChange: ToolLoadingChange | undefined;
 	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-		topLevel.pop();
+		const current = topLevel.pop();
+		trailingToolChange = current ? toolLoadingChangeOf(current) : undefined;
 	}
 
 	const history: OAIMessage[] = [];
@@ -4320,6 +4341,8 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			}
 			pendingToolResults = [];
 
+			const toolChange = toolLoadingChangeOf(msg);
+			if (toolChange) history.push(systemToolsMessage(toolChange));
 			const text = msg.contentText || "";
 			if (text) {
 				history.push({ role: "user", content: text });
@@ -4347,6 +4370,14 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		}
+	}
+
+	if (trailingToolChange) {
+		for (const tr of pendingToolResults) {
+			history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
+		}
+		pendingToolResults = [];
+		history.push(systemToolsMessage(trailingToolChange));
 	}
 
 	return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
