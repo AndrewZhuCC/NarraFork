@@ -74,6 +74,7 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 	};
 	return {
 		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+		...(typeof data.blockId === "string" ? { blockId: data.blockId } : {}),
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
 			typeof data.createdAt === "string" || typeof data.createdAt === "number"
@@ -381,6 +382,8 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
+	blockId?: string | null;
 	toolName?: string | null;
 	createdAt?: string | number | null;
 	timing?: SubagentToolCallTiming | null;

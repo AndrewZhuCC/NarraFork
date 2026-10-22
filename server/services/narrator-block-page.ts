@@ -112,6 +112,35 @@ export function blockLayouts(messageIds: readonly string[]): Map<string, RowLayo
 	return layouts;
 }
 
+/**
+ * The tool block a tool lifecycle frame is about: its ledger attempt's `block_id` when the
+ * frame names the attempt (`toolCallId`), else the newest attempt of the call among the
+ * narrators the frame concerns. Undefined off SQLite, or before the block has a row.
+ */
+export function ledgerBlockId(
+	toolCallId: string | null | undefined,
+	toolUseId: string,
+	narratorIds: readonly string[],
+): string | undefined {
+	if (database.activeDatabaseBackend !== "sqlite") return undefined;
+	if (toolCallId) {
+		const row = database.sqlite
+			.prepare("SELECT block_id AS blockId FROM narrator_tool_calls WHERE id = ?")
+			.get(toolCallId) as { blockId: string | null } | null;
+		if (row) return row.blockId ?? undefined;
+	}
+	if (!narratorIds.length) return undefined;
+	const row = database.sqlite
+		.prepare(
+			`SELECT block_id AS blockId FROM narrator_tool_calls
+			 WHERE tool_use_id = ? AND narrator_id IN (${narratorIds.map(() => "?").join(",")})
+				AND block_id IS NOT NULL
+			 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		)
+		.get(toolUseId, ...narratorIds) as { blockId: string } | null;
+	return row?.blockId;
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: message rows are dynamic JSON on both protocols
 type MessageRow = Record<string, any> & { id: string };
 

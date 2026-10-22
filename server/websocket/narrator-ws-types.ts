@@ -453,6 +453,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;
+			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
+			blockId?: string;
 			subagentNarratorId?: string;
 			toolName?: string;
 			status: string;
@@ -693,6 +695,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;
+			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
+			blockId?: string;
 			subagentNarratorId?: string;
 			toolName: string;
 			input?: unknown;

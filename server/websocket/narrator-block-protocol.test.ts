@@ -216,6 +216,34 @@ describe("block ids of streaming items", () => {
 	});
 });
 
+describe("tool lifecycle frames", () => {
+	test("name the tool block of their ledger attempt", async () => {
+		const step = await narratorStore.openStep("n1", { uuid: "u", session_id: "s" });
+		const callRowId = await narratorStore.writeStepItem(step.id, "n1", {
+			type: "tool_use",
+			id: "call_led",
+			name: "Bash",
+			input: { command: "ls" },
+			outputIndex: 0,
+		});
+		const block = rowOf(step.id, "tool")?.id;
+		const completed = {
+			type: "tool_completed" as const,
+			narratorId: "n1",
+			toolCallId: callRowId as string,
+			toolUseId: "call_led",
+			status: "success",
+		};
+		expect(protocol.toBlockFrames(completed)).toEqual([{ ...completed, blockId: block }]);
+		// Without the attempt's id, the newest attempt of the call decides.
+		expect(protocol.toBlockFrames({ ...completed, toolCallId: null })).toEqual([
+			{ ...completed, toolCallId: null, blockId: block },
+		]);
+		const unknown = { ...completed, toolCallId: null, toolUseId: "call_none" };
+		expect(protocol.toBlockFrames(unknown)).toEqual([unknown]);
+	});
+});
+
 describe("negotiating the message protocol", () => {
 	async function subscribe(ws: FakeWs, version?: 1 | 2) {
 		await handleNarratorWS.message(ws, {
