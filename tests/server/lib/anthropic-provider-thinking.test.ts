@@ -3,8 +3,22 @@ import {
 	AnthropicProvider,
 	parseAnthropicSSEStream,
 } from "../../../server/lib/agent/anthropic-provider";
+import { LoopTranscript } from "../../../server/lib/agent/loop-transcript";
 import type { DbMessage } from "../../../server/lib/agent/provider";
-import type { AgentToolUse } from "../../../server/lib/agent/types";
+import type { ContentBlock } from "../../../server/lib/agent/types";
+
+/** A step as the loop keeps it, its calls settled, projected like every request. */
+async function liveHistory(
+	provider: AnthropicProvider,
+	blocks: ContentBlock[],
+	results: Record<string, string> = {},
+): Promise<unknown[]> {
+	const transcript = new LoopTranscript();
+	transcript.appendStep(blocks);
+	for (const [toolUseId, output] of Object.entries(results))
+		transcript.settleTool(toolUseId, { output });
+	return (await provider.buildHistory(transcript.rows, "claude-sonnet-4-5")).history;
+}
 
 function sseStream(events: Array<Record<string, unknown>>): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
@@ -290,7 +304,7 @@ describe("AnthropicProvider thinking continuation", () => {
 		});
 	});
 
-	it("keeps redacted thinking in the in-memory assistant trajectory", () => {
+	it("keeps redacted thinking in the loop's own assistant trajectory", async () => {
 		const provider = new AnthropicProvider({
 			id: "test",
 			name: "Test",
@@ -299,38 +313,35 @@ describe("AnthropicProvider thinking continuation", () => {
 			baseUrl: "https://api.anthropic.com/v1",
 			defaultModel: "claude-sonnet-4-5",
 		});
-		const history: unknown[] = [];
-		const toolUses: AgentToolUse[] = [
-			{
-				toolUseId: "toolu_1",
-				name: "Read",
-				input: { file_path: "/tmp/a" },
-				outputIndex: 2,
-			},
-		];
-
-		provider.pushAssistantTurn(
-			history,
-			"ok",
-			toolUses,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			1,
-			[{ data: "opaque-redacted-data", outputIndex: 0 }],
+		const history = await liveHistory(
+			provider,
+			[
+				{
+					type: "redacted_thinking",
+					data: "opaque-redacted-data",
+					outputIndex: 0,
+					signatureSource: provider.getActiveReasoningSource(),
+				},
+				{ type: "text", text: "ok", outputIndex: 1 },
+				{
+					type: "tool_use",
+					toolUseId: "toolu_1",
+					name: "Read",
+					input: { file_path: "/tmp/a" },
+					outputIndex: 2,
+				},
+			],
+			{ toolu_1: "contents" },
 		);
 
-		expect(history).toEqual([
-			{
-				role: "assistant",
-				content: [
-					{ type: "redacted_thinking", data: "opaque-redacted-data" },
-					{ type: "text", text: "ok" },
-					{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/tmp/a" } },
-				],
-			},
-		]);
+		expect(history[0]).toEqual({
+			role: "assistant",
+			content: [
+				{ type: "redacted_thinking", data: "opaque-redacted-data" },
+				{ type: "text", text: "ok" },
+				{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/tmp/a" } },
+			],
+		});
 	});
 
 	/**
@@ -340,7 +351,7 @@ describe("AnthropicProvider thinking continuation", () => {
 	 * "messages.N.content.M.thinking: ... too short". Since the block lived in
 	 * replayed history, every later turn failed at the same index.
 	 */
-	it("drops a signature-only reasoning block instead of sending empty thinking", () => {
+	it("drops a signature-only reasoning block instead of sending empty thinking", async () => {
 		const provider = new AnthropicProvider({
 			id: "test",
 			name: "Test",
@@ -349,29 +360,58 @@ describe("AnthropicProvider thinking continuation", () => {
 			baseUrl: "https://api.anthropic.com/v1",
 			defaultModel: "claude-sonnet-4-5",
 		});
-		const history: unknown[] = [];
-
-		provider.pushAssistantTurn(
-			history,
-			"answer",
-			[],
-			[
-				// Signature arrived, thinking text never did.
-				{ text: "", providerMetadata: { anthropic: { blockIndex: 0, signature: "sig-orphan" } } },
-				{ text: "   ", providerMetadata: { anthropic: { blockIndex: 1, signature: "sig-blank" } } },
-				{ text: "real", providerMetadata: { anthropic: { blockIndex: 2, signature: "sig-real" } } },
-			],
-		);
-
-		expect(history).toEqual([
-			{
-				role: "assistant",
-				content: [
-					{ type: "thinking", thinking: "real", signature: "sig-real" },
-					{ type: "text", text: "answer" },
-				],
-			},
+		const signatureSource = provider.getActiveReasoningSource();
+		const thought = (text: string, blockIndex: number, signature: string): ContentBlock => ({
+			type: "reasoning",
+			text,
+			providerMetadata: { signatureSource, anthropic: { blockIndex, signature } },
+		});
+		const transcript = new LoopTranscript();
+		transcript.appendInput("question");
+		transcript.appendStep([
+			// Signature arrived, thinking text never did.
+			thought("", 0, "sig-orphan"),
+			thought("   ", 1, "sig-blank"),
+			thought("real", 2, "sig-real"),
+			{ type: "text", text: "answer" },
 		]);
+		transcript.appendInput("next");
+		const { history } = await provider.buildHistory(transcript.rows, "claude-sonnet-4-5");
+
+		// What the upstream receives: the empty block never enters the history, and the
+		// blank one is dropped by the request's last-line sanitizer.
+		let sent: { messages?: Array<{ role: string; content: unknown }> } = {};
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			sent = JSON.parse(String(init?.body));
+			return new Response("mocked failure", { status: 400 });
+		}) as typeof fetch;
+		try {
+			for await (const _event of provider.chat({
+				conversationId: "empty-thinking",
+				content: "",
+				model: "anthropic:claude-sonnet-4-5",
+				cwd: ".",
+				history,
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			})) {
+				/* consume */
+			}
+		} catch {
+			/* Mocked upstream failure. */
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(sent.messages?.find((message) => message.role === "assistant")).toEqual({
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "real", signature: "sig-real" },
+				{ type: "text", text: "answer" },
+			],
+		});
 	});
 
 	/**

@@ -1,5 +1,6 @@
 import {
 	LOCAL_IMPORT_MAX_RESOLVE_IDS,
+	type LocalProviderDetectResponse,
 	type LocalProviderResolveResponse,
 } from "@shared/local-provider-import";
 import { Hono } from "hono";
@@ -8,6 +9,7 @@ import { ValidationError } from "../lib/errors";
 import { settings } from "../lib/settings";
 import { requireAdmin } from "../middleware/auth";
 import {
+	detectLocalProviderSources,
 	providerIdentity,
 	scanLocalProviderConfigs,
 	summarizeLocalScan,
@@ -16,8 +18,9 @@ import {
 /**
  * Import provider settings from other AI tools on the server machine.
  *
- * Both endpoints are admin-only POSTs: reading another tool's config is an
- * explicit, user-authorized action, never something a page load triggers.
+ * All endpoints are admin-only. `detect` only checks which config directories
+ * exist and reads no file. `scan` and `resolve` are POSTs: reading another tool's
+ * config is an explicit, user-authorized action, never something a page load triggers.
  * `scan` returns masked keys only; `resolve` returns the real key for the
  * candidates the admin picked, so the UI can save them through the normal
  * add-provider flow (same prefix rules and model refresh as manual entry).
@@ -35,6 +38,14 @@ function configuredIdentities(): Set<string> {
 			.map((provider) => providerIdentity(provider.protocol, provider.baseUrl, provider.apiKey)),
 	);
 }
+
+// Existence checks only (no file is read): lets the add page decide whether to
+// offer the import option at all.
+providerImportRoutes.get("/local/detect", requireAdmin, async (c) => {
+	const response: LocalProviderDetectResponse = { sources: await detectLocalProviderSources() };
+	c.header("Cache-Control", "no-store");
+	return c.json(response);
+});
 
 providerImportRoutes.post("/local/scan", requireAdmin, async (c) => {
 	const scan = await scanLocalProviderConfigs();

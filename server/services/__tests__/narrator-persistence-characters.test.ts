@@ -504,11 +504,6 @@ describe("character statistics at actual persistence boundaries", () => {
 		const display = await narratorPersistence.persistDisplayMessage("n1", "UI only");
 		expect(charsOf(display.id)).toEqual({ segments: [] });
 		await flushRefreshes();
-		refreshes.length = 0;
-		await narratorPersistence.updateMessageCost(msg.id, 1);
-		await flushRefreshes();
-		expect(charsOf(msg.id)).toBeNull();
-		expect(refreshes).toEqual([]);
 	});
 });
 

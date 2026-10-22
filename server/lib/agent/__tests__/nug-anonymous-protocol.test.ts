@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { setNugCachedModels } from "../../nug-model-cache";
 import { NugProvider } from "../nug-provider";
-import type { ParsedStreamEvent } from "../provider";
+import type { DbMessage, ParsedStreamEvent } from "../provider";
 
 let nextId = 0;
 function fixture(channelType = "anonymous") {
@@ -22,6 +22,15 @@ function fixture(channelType = "anonymous") {
 	});
 	return { provider, model, setChannelType };
 }
+
+const userRow: DbMessage = {
+	id: "user-1",
+	role: "user",
+	contentJson: [{ type: "text", text: "hello" }],
+	contentText: "hello",
+	parentToolUseId: null,
+	messageUuid: null,
+};
 
 const protocolError =
 	/NUG protocol configuration error: unsupported channelType.*Refresh the model catalog and check gateway\/client protocol compatibility/;
@@ -72,26 +81,25 @@ describe("NUG anonymous protocol rejection", () => {
 		);
 	});
 
-	test("history mutation rejects repeatedly rather than caching a failed delegate", () => {
+	test("history mutation rejects repeatedly rather than caching a failed delegate", async () => {
 		const { provider, model } = fixture();
 		const history: unknown[] = [];
 		for (let attempt = 0; attempt < 2; attempt++) {
 			expect(() => provider.injectSystemPrompt(history, "system", model)).toThrow(protocolError);
-			expect(() => provider.pushUserTurn(history, "hello", model, [])).toThrow(protocolError);
+			await expect(provider.buildHistory([userRow], model)).rejects.toThrow(protocolError);
 		}
 		expect(history).toEqual([]);
 	});
 
-	test("catalog changes cannot reuse a stale supported delegate for the same routed model", () => {
+	test("catalog changes cannot reuse a stale supported delegate for the same routed model", async () => {
 		const { provider, model, setChannelType } = fixture("anthropic");
 		provider.prepareForModel(model);
 		setChannelType("unsupported");
 		for (let attempt = 0; attempt < 2; attempt++) {
-			expect(() => provider.pushUserTurn([], "hello", model, [])).toThrow(protocolError);
+			await expect(provider.buildHistory([userRow], model)).rejects.toThrow(protocolError);
 		}
 		setChannelType("anthropic");
-		const history: unknown[] = [];
-		provider.pushUserTurn(history, "hello", model, []);
+		const { history } = await provider.buildHistory([userRow], model);
 		expect(history.length).toBeGreaterThan(0);
 	});
 
@@ -162,8 +170,7 @@ describe("NUG anonymous protocol rejection", () => {
 		test(`supported ${channelType} protocol still prepares and builds nonempty history`, async () => {
 			const { provider, model } = fixture(channelType);
 			provider.prepareForModel(model);
-			const { history } = await provider.buildHistory([], model);
-			provider.pushUserTurn(history, "hello", model, []);
+			const { history } = await provider.buildHistory([userRow], model);
 			expect(history.length).toBeGreaterThan(0);
 		});
 	}

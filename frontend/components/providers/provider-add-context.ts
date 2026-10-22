@@ -1,3 +1,4 @@
+import type { LocalImportSource } from "@shared/local-provider-import";
 import { createContext, useContext } from "react";
 import type { AddProviderDraft } from "./provider-add-draft";
 
@@ -7,13 +8,17 @@ export const ProviderAddContext = createContext<
 	((draft: AddProviderDraft) => Promise<string | undefined>) | null
 >(null);
 
-/**
- * Saves one provider imported from another tool's local config as a new provider.
- * Null when the viewer cannot import (not an admin, or outside the providers route).
- */
-export const ProviderImportContext = createContext<
-	((draft: AddProviderDraft) => Promise<{ refreshFailed: boolean }>) | null
->(null);
+export interface ProviderImportContextValue {
+	/** Saves one provider imported from another tool's local config as a new provider. */
+	importProvider: (draft: AddProviderDraft) => Promise<{ refreshFailed: boolean }>;
+	/** Which tools have config directories on the server (existence only); undefined until known. */
+	detectedSources?: readonly { source: LocalImportSource; found: boolean }[];
+	/** Detection is still running, so the page should not settle its default selection yet. */
+	detecting: boolean;
+}
+
+/** Null when the viewer cannot import (not an admin, or outside the providers route). */
+export const ProviderImportContext = createContext<ProviderImportContextValue | null>(null);
 export function useProviderImport() {
 	return useContext(ProviderImportContext);
 }

@@ -69,7 +69,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import type { MessagePlacementOptions } from "./narrator-persistence";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
-import { narratorService } from "./narrator-service";
+import { narratorStore } from "./narrator-store";
 
 /**
  * Content block carried by an injected message row.
@@ -318,7 +318,7 @@ async function deliverInjectionUnlocked(
 
 	const message =
 		role === "user"
-			? await narratorService.persistUserMessage(
+			? await narratorStore.appendInput(
 					narratorId,
 					content,
 					// Native injection blocks carry their model-facing projection themselves;
@@ -331,7 +331,7 @@ async function deliverInjectionUnlocked(
 					origin,
 					placement,
 				)
-			: await narratorService.persistSystemMessage(
+			: await narratorStore.appendNotice(
 					narratorId,
 					content,
 					// persistSystemMessage prepends `{type:"text"}` itself.

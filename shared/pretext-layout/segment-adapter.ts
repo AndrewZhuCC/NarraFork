@@ -2278,6 +2278,10 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
 	sidecarSourceTutorialLesson: "Tutorial lesson",
+	sidecarSourceTurnNudge: "Turn budget",
+	sidecarSourceBrokenCall: "Invalid tool call",
+	sidecarSourceContinuePrompt: "Continue",
+	sidecarSourceWorkspaceChanged: "Workspace changed",
 	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
 	// routine digest reads differently from a turn-end continuation in the header.
 	cadenceEveryNTools: "every {n} tool calls",
@@ -2384,6 +2388,11 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
+	turn_nudge: "sidecarSourceTurnNudge",
+	broken_call: "sidecarSourceBrokenCall",
+	continue_prompt: "sidecarSourceContinuePrompt",
+	workspace_changed: "sidecarSourceWorkspaceChanged",
 	// The interactive tutorial's lesson boundary. Named because a reused tutorial
 	// narrator shows one of these per lesson, and the generic "System" heading would
 	// make the row that separates lessons the least legible thing in the transcript.
@@ -3154,6 +3163,10 @@ export const PLATFORM_INJECTION_SOURCES = new Set([
 	"silent_progress",
 	"pipeline_exit_confirmation",
 	"spec_update",
+	"turn_nudge",
+	"broken_call",
+	"continue_prompt",
+	"workspace_changed",
 ]);
 
 /**

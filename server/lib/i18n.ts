@@ -234,11 +234,6 @@ Write the complete plan there, then call ExitPlanMode for approval. The plan fil
 		"zh-CN":
 			"你是 NarraFork 的问题反思关卡。AI 编程助手向用户提出了一个或多个问题，但当前会话允许自动继续。请根据对话上下文和项目意图，像谨慎的用户一样回答：选择安全、实用的默认值；当助手推荐项合理时优先采用；不要添加新的需求。如果提供了选项，请精确返回选项 label；多选问题返回用逗号分隔的选项 label。自由文本问题请给出简洁回答。只回复一个有效的 JSON 对象，将每个问题 key 映射到答案字符串。不要解释，不要 markdown 代码块。",
 	},
-	"tool.turnNudge": {
-		en: "\n\n[SYSTEM: You have used {turnIndex} of {maxTurns} turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
-		"zh-CN":
-			"\n\n[系统提示：你已使用 {turnIndex}/{maxTurns} 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
-	},
 	"tool.silentToolCallProgressReminder": {
 		en: `<progress_update_request>
 You have completed {count} tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.
@@ -251,14 +246,6 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 		en: "[SYSTEM: Pipeline has already been used to extract captured output and is still active. Before making more tool calls, confirm whether you still need Pipeline. If not, stop using Pipeline so its captures can be cleaned up by the inactivity limit instead of continuing to accumulate.]",
 		"zh-CN":
 			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
-	},
-	"tool.brokenToolCallReminder": {
-		en: `[SYSTEM: Your previous {toolNames} call(s) had invalid or missing input and were not executed. The broken calls and their results have been removed from model history to save context. Invalid input alone does not establish that an output/token limit was reached.
-
-Retry with complete, valid JSON containing all required parameters. If a large input may have exceeded the output budget, split it into smaller calls (aim for under 10,000 characters per call). For a new large file, use a skeleton-first approach: Write the opening and closing code with numbered SPLICE markers (SPLICE_1, SPLICE_2, etc.) using the file type's comment syntax, then use Edit to fill each marker with a manageable section. Do not overwrite an existing file with Write.]`,
-		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用参数无效或缺失，因此未执行。损坏的调用及其结果已从模型历史中移除以节省上下文。仅凭参数无效，无法认定触及输出或 token 上限。
-
-请使用完整、有效的 JSON 重试，并提供全部必填参数。如果大输入可能超出输出预算，请拆分为更小的调用（建议每次小于 10,000 字符）。对于大型新文件，采用骨架优先策略：先用 Write 写入开头、结尾及编号的 SPLICE 标记（如 SPLICE_1、SPLICE_2，使用对应文件类型的注释语法），再用 Edit 逐个填充大小适中的片段。不要用 Write 覆盖已有文件。]`,
 	},
 	"tool.brokenToolCallInputPlaceholder": {
 		en: "[Tool input invalid or missing — not executed]",
@@ -561,6 +548,29 @@ Continue investigating or refining the plan there, then call ExitPlanMode to sub
 			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
 	},
 
+	// Loop-control notices: rows the loop writes so a rebuilt request says what it sent.
+	"sidecar.noticeTurnNudge": {
+		en: "[SYSTEM: You have used {turnIndex} of {maxTurns} turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
+		"zh-CN":
+			"[系统提示：你已使用 {turnIndex}/{maxTurns} 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
+	},
+	"sidecar.noticeBrokenCall": {
+		en: `[SYSTEM: Your previous {toolNames} call(s) had invalid or missing input and were not executed. The broken calls and their results have been removed from model history to save context. Invalid input alone does not establish that an output/token limit was reached.
+
+Retry with complete, valid JSON containing all required parameters. If a large input may have exceeded the output budget, split it into smaller calls (aim for under 10,000 characters per call). For a new large file, use a skeleton-first approach: Write the opening and closing code with numbered SPLICE markers (SPLICE_1, SPLICE_2, etc.) using the file type's comment syntax, then use Edit to fill each marker with a manageable section. Do not overwrite an existing file with Write.]`,
+		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用参数无效或缺失，因此未执行。损坏的调用及其结果已从模型历史中移除以节省上下文。仅凭参数无效，无法认定触及输出或 token 上限。
+
+请使用完整、有效的 JSON 重试，并提供全部必填参数。如果大输入可能超出输出预算，请拆分为更小的调用（建议每次小于 10,000 字符）。对于大型新文件，采用骨架优先策略：先用 Write 写入开头、结尾及编号的 SPLICE 标记（如 SPLICE_1、SPLICE_2，使用对应文件类型的注释语法），再用 Edit 逐个填充大小适中的片段。不要用 Write 覆盖已有文件。]`,
+	},
+	"sidecar.noticeContinue": {
+		en: "Continue.",
+		"zh-CN": "继续。",
+	},
+	"sidecar.noticeWorkspaceChanged": {
+		en: "Working directory changed. Continue using the newly installed workspace context; unstarted calls from the previous pass were not executed.",
+		"zh-CN": "工作目录已切换。请在新安装的工作区上下文中继续；上一轮尚未开始的调用没有执行。",
+	},
+
 	// prose — `{source}Heading` prefixes the text; absent ⇒ emitted bare.
 	// Only behavior_fence has one (was: buildBehaviorFenceReminder). A buffered user
 	// message is the user's own words and gets no prefix.
@@ -847,10 +857,8 @@ export type ToolMessageKey =
 	| "planModeCancelled"
 	| "suggestAnswerSystem"
 	| "questionReflectionSystem"
-	| "turnNudge"
 	| "silentToolCallProgressReminder"
 	| "pipelineExitConfirmation"
-	| "brokenToolCallReminder"
 	| "brokenToolCallInputPlaceholder"
 	| "brokenToolCallResult"
 	| "skippedForSoftStop"

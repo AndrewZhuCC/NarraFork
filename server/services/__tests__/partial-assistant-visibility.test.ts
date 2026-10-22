@@ -540,6 +540,11 @@ describe("identified content checkpoints through the real event consumer", () =>
 					},
 				],
 			},
+			// The unanswered result rides in the history too.
+			{
+				role: "user",
+				parts: [{ functionResponse: { name: "Read", response: { output: "file content" } } }],
+			},
 		]);
 	});
 
@@ -899,7 +904,7 @@ describe("identified content checkpoints through the real event consumer", () =>
 				try {
 					await expect(
 						executeAgentLoop(
-							{ config, userText: "", history: [], eventContext: ctx },
+							{ config, userText: "", history: { rows: [] }, eventContext: ctx },
 							{ eventSource: source() },
 						),
 					).rejects.toBeInstanceOf(CriticalEventPersistenceError);

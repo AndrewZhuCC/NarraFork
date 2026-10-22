@@ -1835,7 +1835,7 @@
 	"wizardDepsOptionalHint": "这一步可以跳过。缺少 Git 只会影响项目和版本控制功能，你也可以稍后再让叙述者安装。",
 	"wizardProviderTitle": "AI 供应商",
 	"wizardProviderDesc": "NarraFork 需要至少一个 AI 供应商来驱动叙述者。请在右侧选择供应商并填写 API Key。",
-	"wizardProviderImportHint": "如果运行 NarraFork 的机器上已经在用 Claude Code、Codex、OpenCode 或 DeepSeek Harness，可以在右侧页面顶部一键导入它们的供应商配置。",
+	"wizardProviderImportHint": "如果运行 NarraFork 的机器上已经在用 Claude Code、Codex、OpenCode 或 DeepSeek Harness，可以在右侧选择「从本机导入」，一键导入它们的供应商配置。",
 	"wizardProviderGoToAdmin": "添加供应商",
 	"wizardProviderConfigured": "已配置 {{count}} 个供应商",
 	"wizardProviderNone": "尚未配置 AI 供应商",

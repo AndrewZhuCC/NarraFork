@@ -20,10 +20,7 @@ type ParseAnthropicEventForTest = (
 ) => TestParsedEvent[];
 
 type TestAnthropicProvider = {
-	buildHistory: (
-		dbMessages: unknown[],
-		model: string,
-	) => Promise<{ history: unknown[]; trailingToolResults: unknown[] }>;
+	buildHistory: (dbMessages: unknown[], model: string) => Promise<{ history: unknown[] }>;
 };
 
 let AnthropicProvider: new (config: Record<string, unknown>) => TestAnthropicProvider;
@@ -163,11 +160,13 @@ describe("AnthropicProvider mid-conversation system history", () => {
 		const compatibleHistory = (await compatible.buildHistory(dbMessages, "anthropic:claude-opus-5"))
 			.history as Array<{ role: string; content: unknown }>;
 
+		// The current input is part of the history; it is no longer sent separately.
 		expect(officialHistory.map((message) => message.role)).toEqual([
 			"user",
 			"assistant",
 			"system",
 			"assistant",
+			"user",
 		]);
 		expect(officialHistory[2]).toEqual({
 			role: "system",
@@ -178,6 +177,7 @@ describe("AnthropicProvider mid-conversation system history", () => {
 			"assistant",
 			"user",
 			"assistant",
+			"user",
 		]);
 		expect(compatibleHistory[2]).toEqual({
 			role: "user",

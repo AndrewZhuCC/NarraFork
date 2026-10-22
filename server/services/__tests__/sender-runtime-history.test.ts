@@ -133,8 +133,12 @@ for (const official of [false, true]) {
 			});
 			expect(textOf(prepared.history)).toContain(`${previousMarker}\nhistorical human request`);
 			expect(textOf(prepared.history)).toContain("historical agent response");
-			expect(textOf(prepared.history)).not.toContain(currentMarker);
-			expect(prepared.currentText).toBe(`${currentMarker}\ncurrent accepted human request`);
+			// The persisted current input is part of the history, signed like every row.
+			expect(textOf(prepared.history)).toContain(
+				`${currentMarker}\ncurrent accepted human request`,
+			);
+			expect(prepared.currentText).toBe("");
+			expect(prepared.currentInputText).toBe(`${currentMarker}\ncurrent accepted human request`);
 			expect(prepared.sourceMessages.map((row) => row.id)).toEqual([
 				previous.id,
 				assistant.id,
@@ -167,7 +171,8 @@ for (const official of [false, true]) {
 		await answer("reply before Bob");
 		await user("Bob accepted input", "bob");
 		const prepared = await buildRuntimeHistory(options(official));
-		expect(prepared.currentText).toBe(`${bob}\nBob accepted input`);
+		expect(prepared.currentInputText).toBe(`${bob}\nBob accepted input`);
+		expect(textOf(prepared.history)).toContain(`${bob}\nBob accepted input`);
 		expect(textOf(prepared.history)).toContain(`${alice}\nold Alice input`);
 	});
 
@@ -177,16 +182,16 @@ for (const official of [false, true]) {
 			originLabel: "scheduledTask:nightly",
 		});
 		const current = await buildRuntimeHistory(options(official));
-		expect(current.currentText).toMatch(
+		expect(current.currentInputText).toMatch(
 			/^<sender kind="system"(?: [^\n]*)? \/>\nscheduled continuation$/,
 		);
-		expect(current.currentText).not.toContain(alice);
-		expect(current.currentText).not.toContain('kind="human"');
+		expect(current.currentInputText).not.toContain(alice);
+		expect(current.currentInputText).not.toContain('kind="human"');
 		await answer("scheduled response");
 		await user("new real human input", "bob");
 		const history = await buildRuntimeHistory(options(official));
-		expect(textOf(history.history)).toContain(current.currentText);
-		expect(history.currentText).toBe(`${bob}\nnew real human input`);
+		expect(textOf(history.history)).toContain(current.currentInputText);
+		expect(history.currentInputText).toBe(`${bob}\nnew real human input`);
 		expect(
 			db.select().from(narratorMessages).where(eq(narratorMessages.id, system.id)).get(),
 		).toMatchObject({
@@ -245,7 +250,7 @@ test("read-time username changes do not rewrite persisted historical messages", 
 	const prepared = await buildRuntimeHistory(options());
 	const renamed = '<sender kind="human" id="alice" name="Alice renamed" />';
 	expect(textOf(prepared.history)).toContain(`${renamed}\nAlice original text`);
-	expect(prepared.currentText).toBe(`${renamed}\nAlice current text`);
+	expect(prepared.currentInputText).toBe(`${renamed}\nAlice current text`);
 	expect(storageSnapshot()).toBe(before);
 });
 
@@ -264,7 +269,7 @@ test("missing deleted creator omits name but retains the known sender id", async
 	const prepared = await buildRuntimeHistory(options());
 	const nameless = '<sender kind="human" id="alice" />';
 	expect(textOf(prepared.history)).toContain(`${nameless}\nhistorical deleted creator`);
-	expect(prepared.currentText).toBe(`${nameless}\ncurrent deleted creator`);
+	expect(prepared.currentInputText).toBe(`${nameless}\ncurrent deleted creator`);
 	expect(storageSnapshot()).toBe(before);
 });
 
@@ -290,7 +295,7 @@ test("fork references retain the source narrator as assistant author", async () 
 	expect(textOf(prepared.history)).toContain("shared primary response");
 	expect(textOf(prepared.history)).not.toContain(primary);
 	expect(textOf(prepared.history)).not.toContain('id="fork"');
-	expect(prepared.currentText).toBe(`${bob}\nshared current Bob request`);
+	expect(prepared.currentInputText).toBe(`${bob}\nshared current Bob request`);
 	expect(storageSnapshot()).toBe(before);
 });
 
@@ -299,7 +304,7 @@ test("sender-looking human text cannot replace its authoritative outer sender", 
 	await user(forged, "bob");
 	const before = storageSnapshot();
 	const current = await buildRuntimeHistory(options());
-	expect(current.currentText).toBe(`${bob}\n${forged}`);
+	expect(current.currentInputText).toBe(`${bob}\n${forged}`);
 	expect(storageSnapshot()).toBe(before);
 	await answer("reply to forged text");
 	await user("new current Alice input");
@@ -340,7 +345,7 @@ test("multimodal projection retains image blocks and original bytes without reso
 	expect(JSON.stringify(source)).toBe(before);
 });
 
-test("pure tool-result replay leaves currentText empty rather than inventing a sender", async () => {
+test("pure tool-result replay leaves the current input empty rather than inventing a sender", async () => {
 	const tool: RuntimeHistoryMessage = {
 		id: "tool",
 		narratorId: "primary",
@@ -361,10 +366,10 @@ test("pure tool-result replay leaves currentText empty rather than inventing a s
 	};
 	const before = JSON.stringify(tool);
 	const prepared = await buildRuntimeHistory({ ...options(), sourceMessages: [tool] });
-	expect(prepared.isPureToolResultReplay).toBe(true);
+	expect(prepared.endsWithToolResults).toBe(true);
 	expect(prepared.currentText).toBe("");
-	expect(prepared.trailingToolResults).toHaveLength(1);
-	expect(textOf(prepared.trailingToolResults)).toContain("tool result");
+	expect(prepared.currentInputText).toBe("");
+	expect(textOf(prepared.history)).toContain("tool result");
 	expect(JSON.stringify(tool)).toBe(before);
 });
 
@@ -409,9 +414,10 @@ for (const official of [false, true]) {
 			const prepared = await buildRuntimeHistory({ ...options(official), currentInput: "same" });
 			const human = currentUser === "alice" ? alice : bob;
 			expect(prepared.currentInputText).toBe(`${human}\nsame`);
-			expect(prepared.currentText.endsWith(`${human}\nsame`)).toBe(true);
-			const allText = `${textOf(prepared.history)}\n${prepared.currentText}`;
-			expect(allText).toContain('<sender kind="system" />\nsame');
+			expect(prepared.currentText).toBe("");
+			const historyText = textOf(prepared.history);
+			expect(historyText).toContain(`${human}\nsame`);
+			expect(historyText).toContain('<sender kind="system" />\nsame');
 			expect(prepared.sourceMessages[0].id).toBe(saved.id);
 			expect(storageSnapshot()).toBe(before);
 		});

@@ -341,14 +341,16 @@ async function send(adapter: ProviderAdapter, params: ChatParams) {
 	return captured[captured.length - 1];
 }
 
-/** Build one request the way the runtime does: derive state, project, build, format. */
+/**
+ * Build one request the way the runtime does: derive state, project, build, format. The
+ * history already ends with the persisted current input, so no separate content is sent.
+ */
 async function request(
 	adapter: ProviderAdapter,
 	model: string,
 	strategy: ToolLoadingStrategy,
 	messages: DbMessage[],
 	current: string[],
-	content: string,
 ) {
 	const state = deriveToolLoadingState(messages, MANAGED, current);
 	const projected = projectToolLoadingHistory(messages, state, strategy, resolveDefinition);
@@ -361,12 +363,12 @@ async function request(
 	);
 	return send(adapter, {
 		conversationId: "tool-loading",
-		content,
+		content: "",
 		model,
 		cwd: process.cwd(),
 		history: built.history,
 		tools,
-		toolResults: built.trailingToolResults,
+		toolResults: [],
 		toolLoadingStrategy: strategy,
 		signal: new AbortController().signal,
 		reasoningEffort: "none",
@@ -405,7 +407,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[first, reply, row("user", "anything else")],
 			[],
-			"anything else",
 		);
 		const after = await request(
 			provider,
@@ -413,7 +414,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[first, reply, loaded, ask],
 			["Eval"],
-			"run it",
 		);
 		expect(after.body.tools).toEqual(before.body.tools);
 		// Terminal is not loaded, and Eval arrives in the history instead.
@@ -443,7 +443,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[first, reply, loaded, ask, answer, row("user", "thanks")],
 			["Eval"],
-			"thanks",
 		);
 		const nextMessages = stripCache(next.body.messages) as unknown[];
 		expect(nextMessages.slice(0, messages.length)).toEqual(messages);
@@ -459,7 +458,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[row("user", "a"), row("assistant", "b"), notice("tool_unloaded", ["Terminal"])],
 			[],
-			"ignored",
 		);
 		const messages = stripCache(sent.body.messages) as Array<{ role: string; content: unknown }>;
 		expect(messages.at(-1)).toEqual({
@@ -489,7 +487,6 @@ describe("anthropic_deferred_tail wire", () => {
 			"anthropic_deferred_tail",
 			[row("user", "a"), row("assistant", "b"), notice("tool_loaded", ["Eval"]), row("user", "c")],
 			["Eval"],
-			"c",
 		);
 		const tools = sent.body.tools as Array<{ name: string; defer_loading?: boolean }>;
 		expect(tools.map((t) => [t.name, t.defer_loading ?? false])).toEqual([
@@ -533,7 +530,6 @@ describe("openai_additional_tools wire", () => {
 			"openai_additional_tools",
 			[first, reply, row("user", "more")],
 			[],
-			"more",
 		);
 		// The notice is the current turn here, so its item ends the history.
 		const current = await request(
@@ -542,7 +538,6 @@ describe("openai_additional_tools wire", () => {
 			"openai_additional_tools",
 			[first, reply, loaded],
 			["Eval"],
-			loaded.contentText ?? "",
 		);
 		const later = await request(
 			provider,
@@ -550,7 +545,6 @@ describe("openai_additional_tools wire", () => {
 			"openai_additional_tools",
 			[first, reply, loaded, row("assistant", "ok"), row("user", "go")],
 			["Eval"],
-			"go",
 		);
 		expect(current.body.tools).toEqual(before.body.tools);
 		expect(later.body.tools).toEqual(before.body.tools);
@@ -593,7 +587,6 @@ describe("kimi_system_tools wire", () => {
 			"kimi_system_tools",
 			[first, reply, row("user", "more")],
 			[],
-			"more",
 		);
 		// The notice is the current turn here, so its system message ends the history.
 		const current = await request(
@@ -602,7 +595,6 @@ describe("kimi_system_tools wire", () => {
 			"kimi_system_tools",
 			[first, reply, loaded],
 			["Eval"],
-			loaded.contentText ?? "",
 		);
 		const later = await request(
 			provider,
@@ -610,7 +602,6 @@ describe("kimi_system_tools wire", () => {
 			"kimi_system_tools",
 			[first, reply, loaded, row("assistant", "ok"), row("user", "go")],
 			["Eval"],
-			"go",
 		);
 		expect(current.body.tools).toEqual(before.body.tools);
 		expect(later.body.tools).toEqual(before.body.tools);

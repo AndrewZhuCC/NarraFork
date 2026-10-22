@@ -38,11 +38,15 @@ const inputs: string[] = [];
 const requestSignals: AbortSignal[] = [];
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({
+		history: rows.map((row) => ({ role: row.role, content: row.contentText ?? "" })),
+	}),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		attempts++;
-		inputs.push(params.content);
+		// The input a request ends with: its current text, or the last input row.
+		const last = params.history.at(-1) as { role?: string; content?: string } | undefined;
+		inputs.push(params.content || (last?.role === "user" ? (last.content ?? "") : ""));
 		requestSignals.push(params.signal);
 		params.onRequestStart?.();
 		if (attempts > 1 && !scriptEveryAttempt) {
@@ -51,9 +55,6 @@ const provider: ProviderAdapter = {
 		}
 		yield* script(params);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -109,7 +110,7 @@ function run(events: AgentEvent[], consume?: (event: AgentEvent) => void | Promi
 		permissionHandler: async () => ({ behavior: "allow" }),
 	};
 	const done = (async () => {
-		for await (const event of agentLoop(config, "original input", [])) {
+		for await (const event of agentLoop(config, "original input", { rows: [] })) {
 			events.push(event);
 			await consume?.(event);
 		}

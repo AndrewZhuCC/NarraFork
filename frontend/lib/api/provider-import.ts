@@ -1,4 +1,5 @@
 import type {
+	LocalProviderDetectResponse,
 	LocalProviderResolveResponse,
 	LocalProviderScanResponse,
 } from "@shared/local-provider-import";
@@ -17,6 +18,12 @@ function post<T>(path: string, data: unknown) {
 }
 
 export const providerImportApi = {
+	/** Which tools have config directories on the server machine; reads no file. */
+	detectLocalProviders: () =>
+		request<LocalProviderDetectResponse>("/provider-import/local/detect", {
+			signal: AbortSignal.timeout(LOCAL_IMPORT_TIMEOUT_MS),
+			maxResponseBytes: LOCAL_IMPORT_MAX_RESPONSE_BYTES,
+		}),
 	/** Read other AI tools' provider settings on the server machine (masked keys only). */
 	scanLocalProviders: () => post<LocalProviderScanResponse>("local/scan", {}),
 	/** Fetch the real keys for the candidates the admin chose to import. */

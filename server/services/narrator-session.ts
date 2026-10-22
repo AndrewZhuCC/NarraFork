@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
@@ -375,6 +376,7 @@ import {
 	revertPrincipalForUser,
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
+import { narratorStore } from "./narrator-store";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
 import {
 	assertSnapshotRevertComplete,
@@ -2498,10 +2500,9 @@ export async function drainInjectionsIntoHistory(
 	onConsumed: () => void;
 }> {
 	const narratorId = active.narratorId;
+	// Every part is a persisted row. Unresolved questions are listed in the pass's system
+	// prompt instead of being re-sent, unpersisted, at every tool boundary.
 	const parts: AgentInputPart[] = [];
-	const { buildPendingQuestionHint } = await import("./narrator-question-service");
-	const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
-	if (pendingQuestionHint) parts.push({ text: pendingQuestionHint });
 	const adoptedDeliveries: AgentMessageDelivery[] = [];
 	const adoptedMailbox: MailboxDeliveryConsumption[] = [];
 
@@ -2682,77 +2683,20 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
 }
 
 /**
- * Text of a trailing `role: "user"` row that a pass with no prompt of its own must resend.
- *
- * Every provider's history builder POPS the last top-level user row and expects the
- * caller to send it as the current turn (`buildAnthropicHistory` line ~2832 and the
- * same three lines in openai/gemini). That contract holds for an ordinary user
- * message, because whoever wrote the row also passes its text into `runAgentLoop`.
- *
- * It does NOT hold for a row written by a producer that then starts a bare
- * `runAgentLoop(active, "")` — the review conclusion written by
- * `review-event-handler` is the first such producer. The row was popped as "the
- * current turn" and the current turn was empty, so the conclusion reached the model
- * in NEITHER place: `pushUserTurn` pushes nothing for empty content, and history no
- * longer contains the row. The reviewer's findings simply were not in the request.
- *
- * Nothing reports that. The turn runs, the model answers something generic about the
- * previous context, and the transcript still shows the conclusion sitting there — so
- * it reads as the model ignoring it rather than never receiving it.
- *
- * Recovered here rather than at the producer because the gap belongs to this seam:
- * any future producer that persists a user row and starts an empty pass inherits the
- * same bug, and a fix at one call site would not cover it. `sys` rows need none of
- * this — the builders lift those into `trailingUserText` themselves.
- */
-export function resolvePoppedTrailingUserText(
-	messages: ContinuableTopLevelMessage[],
-): string | null {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (!msg || msg.parentToolUseId) continue;
-		// Mirrors the builders' filter: they only consider user/assistant/sys, and only
-		// a trailing `user` row is popped. A trailing `sys` run is lifted by the builder
-		// itself, so reaching one means there is nothing for this helper to recover.
-		if (msg.role === "sys") return null;
-		if (msg.role !== "user") return null;
-		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-		const text = blocks
-			.filter(
-				(block: { type?: string; text?: unknown }) =>
-					block?.type === "text" && typeof block.text === "string" && block.text.trim(),
-			)
-			.map((block: { text?: unknown }) => String(block.text))
-			.join("\n");
-		// Snapshot-only inputs are real turns too. Prefer contentText for the old
-		// uploaded-file hint when references are present, just as history projection does.
-		const flat = typeof msg.contentText === "string" ? msg.contentText : "";
-		const snapshots = getFileReferenceSnapshots(blocks);
-		const projected = projectFileReferenceText(
-			snapshots.length ? flat || text : text || flat,
-			snapshots,
-		);
-		return projected.trim() ? projected : null;
-	}
-	return null;
-}
-
-/**
  * Does model-visible history end on a server-authored injection?
  *
  * `resolveContinuationTail` walks PAST `sys` rows by design — it answers "what turn can
  * a continuation build on", and an injection is not a turn. But its absence from that
  * answer must not be read as "history ends on the row underneath": an injection sitting
  * last is the freshest thing the narrator was handed, and every provider's history
- * builder already sends a trailing `sys` run as the CURRENT turn
- * (`buildAnthropicHistory`'s `trailingUserText`).
+ * already ends with it as the latest input, so it IS the current turn.
  *
  * So a continuation whose tail is an injection has its content already in place and needs
  * nothing but a loop — the same `runAgentLoop(active, "")` that
  * `startInjectionContinuationIfPossible` uses. Appending a synthetic "please continue"
  * user row instead would be actively wrong, not merely redundant: it displaces the
- * injection from the trailing position, so the builder stops lifting it and the model
- * reads it as background while being asked to continue something unnamed.
+ * injection from the trailing position, and the model reads it as background while
+ * being asked to continue something unnamed.
  */
 export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -2792,11 +2736,13 @@ export interface ContextManagementOptions {
  * Build reusable context management hooks (compact) for both
  * main narrators and subagents.
  *
- * Returns an `onContextUsage` EventHook and an `onBeforeTurn` AgentConfig callback.
+ * Returns an `onContextUsage` EventHook, an `onBeforeTurn` AgentConfig callback and the
+ * per-request history rebuild.
  */
 export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	onContextUsage: NonNullable<EventHooks["onContextUsage"]>;
 	onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]>;
+	rebuildRequestHistory: NonNullable<import("../lib/agent").AgentConfig["rebuildRequestHistory"]>;
 	onReasoningOnlyHighContext: NonNullable<
 		import("../lib/agent").AgentConfig["onReasoningOnlyHighContext"]
 	>;
@@ -2867,7 +2813,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 		return {
 			history: result.history,
-			pendingToolResults: result.trailingToolResults,
+			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
 			...(result.toolLoading ? { toolLoading: result.toolLoading } : {}),
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
@@ -2967,7 +2913,18 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		return rebuildHistoryForCurrentContext(true);
 	};
 
-	return { onContextUsage, onBeforeTurn, onReasoningOnlyHighContext };
+	// Same rows, same projection as a pass start; the system prompt stays the pass's own.
+	// A compact that finished since `onBeforeTurn` looked moves its summary into the
+	// system prompt, so that case rebuilds both, as `onBeforeTurn` would.
+	const rebuildRequestHistory = async () => {
+		if ((isCompactDone?.() ?? false) || hasPendingHistoryCompact(narratorId)) {
+			clearCompactDone?.();
+			return rebuildHistoryForCurrentContext(true);
+		}
+		return rebuildHistoryForCurrentContext(false);
+	};
+
+	return { onContextUsage, onBeforeTurn, rebuildRequestHistory, onReasoningOnlyHighContext };
 }
 
 /**
@@ -3656,7 +3613,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 	const resultRow = resultRows[0];
 	const timing = refreshTiming ? resolveToolCallConclusionTiming(resultRow) : undefined;
 
-	await narratorService.updateToolCallResult(
+	await narratorStore.settleTool(
 		toolUseId,
 		{
 			output,
@@ -5164,8 +5121,7 @@ async function retryLastMessageUnlocked(
  * Continue the agent loop.
  *
  * If the last top-level message is a tool-call assistant turn, resumes by
- * reconstructing the tool-result upload packet (buildHistory produces
- * trailingToolResults).
+ * re-sending the history, which ends with that step's tool results.
  *
  * Otherwise (e.g. the assistant's text reply was truncated), sends a
  * locale-aware "please continue" user message via feedMessage so the
@@ -5704,7 +5660,7 @@ async function reExecuteDeniedToolCallUnlocked(
 		async (): Promise<ReExecuteDeniedResult> => {
 			try {
 				await options?.onAdmitted?.();
-				const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
+				const preparedAttempt = await narratorStore.retryTool(
 					narratorId,
 					sourceToolCall.id,
 					restoringPersistedCall,
@@ -5926,7 +5882,7 @@ async function reExecuteDeniedToolCallUnlocked(
 					const result = await executePersistedToolAfterReflections(
 						{ name: toolName, input: toolInput, toolUseId },
 						config,
-						reflectionHistory.history,
+						reflectionHistory.modelMessages,
 						{
 							toolCallBinding,
 							recoveryGate: restoringPersistedCall ? sourceToolCall : undefined,
@@ -5971,29 +5927,21 @@ async function reExecuteDeniedToolCallUnlocked(
 							}
 						}
 					}
-					await narratorService.updateToolCallResult(
+					await narratorStore.settleTool(
 						toolUseId,
 						{
-							output: result.metadata
-								? { _text: result.output, _metadata: result.metadata }
-								: result.output,
+							output: encodeToolOutput(result.output, { metadata: result.metadata }),
 							status: result.isError ? "fail" : "success",
 							errorMessage: result.isError ? result.output : undefined,
 							durationMs: result.durationMs,
 							permissionStartedAt: result.permissionStartedAt,
 							executionStartedAt: result.executionStartedAt,
 							completedAt: result.completedAt,
+							...(result.updatedInput ? { input: result.updatedInput } : {}),
 						},
 						toolCall.messageId,
 						toolCall.id,
 					);
-					if (result.updatedInput) {
-						await narratorService.overwriteToolCallInput(
-							toolUseId,
-							result.updatedInput,
-							toolCall.id,
-						);
-					}
 
 					broadcastToNarrator(narratorId, {
 						type: "tool_completed",
@@ -6002,9 +5950,7 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						toolName,
 						status: result.isError ? "fail" : "success",
-						output: result.metadata
-							? { _text: result.output, _metadata: result.metadata }
-							: result.output,
+						output: encodeToolOutput(result.output, { metadata: result.metadata }),
 						durationMs: result.durationMs,
 						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
 						...(result.metadata ? { metadata: result.metadata } : {}),
@@ -6017,8 +5963,8 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						error: message,
 					});
-					await narratorService
-						.updateToolCallResult(
+					await narratorStore
+						.settleTool(
 							toolUseId,
 							{
 								output: `Re-execution failed: ${message}`,

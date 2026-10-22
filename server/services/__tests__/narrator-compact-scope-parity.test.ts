@@ -41,14 +41,11 @@ const { activeNarrators } = await import("../narrator-session-state");
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("Never calls a model");
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

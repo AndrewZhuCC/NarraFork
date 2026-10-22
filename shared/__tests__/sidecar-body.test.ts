@@ -53,6 +53,9 @@ Continue investigating or refining the plan there, then call ExitPlanMode to sub
 </relaxed_plan_reminder>`,
 	noticePipelineExit:
 		"[SYSTEM: Pipeline has already been used to extract captured output and is still active. Before making more tool calls, confirm whether you still need Pipeline. If not, stop using Pipeline so its captures can be cleaned up by the inactivity limit instead of continuing to accumulate.]",
+	noticeTurnNudge:
+		"[SYSTEM: You have used {turnIndex} of {maxTurns} turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
+	noticeContinue: "Continue.",
 	behavior_fenceHeading:
 		"Behavior fence (durable behavior constraints set by the user — you must obey them):",
 	tasksCurrentHeading:
@@ -107,6 +110,9 @@ const ZH: SideCarModelTemplates = {
 </relaxed_plan_reminder>`,
 	noticePipelineExit:
 		"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
+	noticeTurnNudge:
+		"[系统提示：你已使用 {turnIndex}/{maxTurns} 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
+	noticeContinue: "继续。",
 	behavior_fenceHeading: "行为护栏（用户设定的行为约束，务必遵守）：",
 	tasksCurrentHeading: "Dynamic Spec 当前任务节选（非完整列表，完整内容见 spec://tasks.json）：",
 	tasksCurrentUpdateNote:
@@ -184,6 +190,25 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 			expect(text).toContain(".narrafork/plans/plan-xyz.md");
 			expect(text).not.toContain("{planFile}");
 		}
+	});
+
+	it("loop-control notices keep the wording the loop used to send inline", () => {
+		// Was: "tool.turnNudge" appended to the last tool result (minus its leading "\n\n")
+		// and "tool.userContinue" as the next turn's text.
+		const nudge: SideCarBody = { kind: "notice", params: { turnIndex: 9, maxTurns: 10 } };
+		expect(renderSideCarBodyToText("turn_nudge", nudge, EN)).toBe(
+			"[SYSTEM: You have used 9 of 10 turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
+		);
+		expect(renderSideCarBodyToText("turn_nudge", nudge, ZH)).toBe(
+			"[系统提示：你已使用 9/10 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
+		);
+		expect(renderSideCarBodyToText("continue_prompt", { kind: "notice" }, EN)).toBe("Continue.");
+		expect(renderSideCarBodyToText("continue_prompt", { kind: "notice" }, ZH)).toBe("继续。");
+		// The reader sees a short headline, not the instruction.
+		expect(sideCarBodyToMarkdown("turn_nudge", nudge)).toContain("Turn 9 of 10");
+		expect(
+			sideCarBodyToMarkdown("broken_call", { kind: "notice", params: { toolNames: "Write" } }),
+		).toContain("Invalid Write call removed from context");
 	});
 
 	it("an unmapped notice source renders empty rather than a wrong reminder", () => {

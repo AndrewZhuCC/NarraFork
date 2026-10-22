@@ -35,15 +35,12 @@ const adapter: ProviderAdapter = {
 			description: tool.description,
 			parameters: resolveToolJsonSchema(tool),
 		})),
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		requests.push(params);
 		yield* chat(params);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -86,7 +83,7 @@ function config(overrides: Partial<AgentConfig> = {}): AgentConfig {
 }
 async function drain(input: AgentConfig): Promise<AgentEvent[]> {
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(input, "fixture input", [])) events.push(event);
+	for await (const event of agentLoop(input, "fixture input", { rows: [] })) events.push(event);
 	return events;
 }
 
@@ -99,7 +96,7 @@ async function drainWithApiAssociations(input: AgentConfig) {
 	);
 	const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(() => true);
 	try {
-		for await (const event of agentLoop(input, "fixture input", [])) {
+		for await (const event of agentLoop(input, "fixture input", { rows: [] })) {
 			events.push(event);
 			if (event.type === "api_request_start") {
 				const handle = startApiRequest({

@@ -44,7 +44,6 @@ export async function runSearchProbe(
 						},
 		},
 		prompt,
-		[],
 	)) {
 		if (event.type === "assistant_message") text = event.text.slice(0, 100_000);
 		if (event.type === "web_search" && event.status === "completed") searched = true;
