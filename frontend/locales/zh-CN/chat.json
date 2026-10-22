@@ -50,5 +50,12 @@
 	"attachmentLimitTitle": "附件过多",
 	"attachmentLimit": "每条消息最多 {{count}} 个附件",
 	"attachmentForwardFailed": "部分附件未能发送给叙述者",
-	"attachmentDownloadFailed": "下载失败"
+	"attachmentDownloadFailed": "下载失败",
+	"botBadge": "Bot",
+	"botFallbackName": "Bot",
+	"botThinking": "思考中…",
+	"botWaiting": "正在等待审批——打开监控界面处理",
+	"botMonitor": "监控",
+	"botReadOnly": "你可以查看这个 bot，但不能给它发消息。",
+	"openBot": "打开 bot"
 }

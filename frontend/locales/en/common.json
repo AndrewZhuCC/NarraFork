@@ -764,5 +764,6 @@
 	"imageViewer_copySuccess": "Image copied to clipboard",
 	"imageViewer_copyUnavailableDownloaded": "Clipboard is unavailable in this environment; image downloaded instead",
 	"imageViewer_copyFailed": "Failed to copy image",
-	"imageViewer_downloadFailed": "Failed to download image"
+	"imageViewer_downloadFailed": "Failed to download image",
+	"botBadge": "Bot"
 }

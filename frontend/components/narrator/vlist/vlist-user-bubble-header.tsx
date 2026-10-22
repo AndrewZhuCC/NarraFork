@@ -16,6 +16,7 @@
  * heavy transitive imports — into the test graph.
  */
 
+import { NarratorAvatar } from "@frontend/components/narrator/header/NarratorAvatar";
 import {
 	MessageOriginBadge,
 	OriginAvatar,
@@ -37,6 +38,8 @@ export interface BubbleCreator {
 	avatarImageId?: string | null;
 	/** Share-guest author (chat rooms): initial-avatar + a badge instead of a profile. */
 	isGuest?: boolean;
+	/** Bot author (chat rooms): `id` is a narrator id, so it wears the narrator's avatar. */
+	isBot?: boolean;
 }
 
 /** Format a message timestamp like MessageBubble: today → HH:mm, else MM/DD HH:mm. */
@@ -82,6 +85,14 @@ export function UserBubbleHeader({
 					<Avatar size={20} radius="xl">
 						{creator.username.slice(0, 1)}
 					</Avatar>
+				) : creator.isBot && creator.id ? (
+					<NarratorAvatar
+						narratorId={creator.id}
+						avatarImageId={creator.avatarImageId}
+						title={creator.username}
+						size={20}
+						showTooltip={false}
+					/>
 				) : (
 					<UserAvatar
 						username={creator.username}
@@ -101,6 +112,11 @@ export function UserBubbleHeader({
 			{creator?.isGuest ? (
 				<Badge size="xs" variant="light" style={{ flexShrink: 0 }}>
 					{t("guestBadge")}
+				</Badge>
+			) : null}
+			{creator?.isBot ? (
+				<Badge size="xs" variant="light" color="grape" style={{ flexShrink: 0 }}>
+					{t("botBadge")}
 				</Badge>
 			) : null}
 			{/* Icon-only marker; sits inside the reserved 20px row so height is unchanged. */}

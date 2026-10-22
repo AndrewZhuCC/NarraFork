@@ -13,6 +13,7 @@ export {
 	getUserLanguage,
 	getUserReplyInLanguage,
 } from "./i18n";
+export { getBotModePrompt } from "./prompts/bot";
 export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";

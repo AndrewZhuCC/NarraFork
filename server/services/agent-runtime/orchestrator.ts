@@ -36,12 +36,18 @@ import {
 	getBlockedSkills,
 	getDisabledToolSet,
 } from "../../lib/narrator-custom-traits";
-import { isPlanModeTrait, parseSubstatus, redactDraftTraits } from "../../lib/narrator-utils";
+import {
+	isBotNarrator,
+	isPlanModeTrait,
+	parseSubstatus,
+	redactDraftTraits,
+} from "../../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../../lib/nug-availability-poller";
 import { resolveKnownUnavailableNugModel } from "../../lib/nug-model-availability";
 import { markNugCachedModelUnavailable } from "../../lib/nug-model-cache";
 import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import {
+	getBotModePrompt,
 	getRunDeliveryHint,
 	getToolMessage,
 	getToolMessageWithParams,
@@ -313,14 +319,17 @@ export async function executeRuntimeRetry(
  * The session's stored base prompt plus projections of its registered relations and
  * capability ceiling. Delivery names its actual recipient; only capability denials
  * state interaction limits. A control grant adds no prompt or behavioral restrictions.
+ * A bot's channel is a relation too: its audience reads only what it sends them, so
+ * the protocol follows the persona rather than replacing it.
  */
 export function runtimeBasePrompt(
-	row: RuntimeSourceRow & { systemPrompt: string | null },
+	row: RuntimeSourceRow & { systemPrompt: string | null; traits?: unknown },
 	locale: Locale,
 	policy: RuntimePolicy,
 ): string | null {
 	const base = row.systemPrompt;
 	const sections: string[] = [];
+	if (isBotNarrator(row.traits)) sections.push(getBotModePrompt(locale));
 	const deliverTo = runDeliverToOf(row);
 	if (deliverTo) {
 		const run = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
@@ -1631,6 +1640,7 @@ export async function runAgentLoopUnlocked(
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
+				bot: isBotNarrator(freshNarrator.traits),
 				narratorId,
 				conversationId: active.conversationId,
 				model: resolved.model,

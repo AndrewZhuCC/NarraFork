@@ -1,8 +1,18 @@
 import { runtimePolicyForContext } from "@server/services/agent-runtime/policy";
 import { SUBAGENT_SEND_ASYNC_ONLY_ERROR } from "@server/services/subagent-communication-policy";
 import { z } from "zod/v4";
-import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import type { AgentConfig, ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
+
+/**
+ * Offered to bot narrators only (see `buildRawJsonSchema`). The bot protocol itself is
+ * in the bot's system prompt; this says what the field does when the model reaches it.
+ */
+const USER_TARGET_DESCRIPTION =
+	"Bot only — your voice to people: the username of the person to message (the name in " +
+	"their sender marker). Delivers `message` into your chat with them, the only text of yours " +
+	"they ever see (Markdown renders, up to 32,000 characters). Use it alone: no agent " +
+	"targets, replyTo, doInterrupt or await.";
 
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
@@ -39,6 +49,15 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 			type: "boolean",
 		},
 	};
+
+	// Only a bot speaks to people, so only a bot is offered the person target. An
+	// unassembled config (no runtime, as with the policy ceiling) sees the full schema.
+	if (!config || config.bot) {
+		properties.user = {
+			description: USER_TARGET_DESCRIPTION,
+			type: "string",
+		};
+	}
 
 	// The model-facing schema omits reply-wait parameters for subagents. The Zod
 	// schema remains permissive for post-resolution validation and legacy inputs;
@@ -100,6 +119,7 @@ export const sendTool: ToolDefinition = {
 			.optional()
 			.describe("Target subagent titles, aliases, or unique ID prefixes."),
 		message: z.string().describe("Message to send to the target subagent(s)."),
+		user: z.string().optional().describe(USER_TARGET_DESCRIPTION),
 		replyTo: z
 			.string()
 			.optional()
@@ -136,11 +156,13 @@ export const sendTool: ToolDefinition = {
 			name?: string;
 			names?: string[];
 			message?: string;
+			user?: string;
 			replyTo?: string;
 			doInterrupt?: boolean;
 			await?: boolean;
 			timeout?: number;
 		};
+		if (raw.user !== undefined) return sendToUser(raw, ctx);
 		if (raw.await === true && !runtimePolicyForContext(ctx).capabilities.sendAwait) {
 			return { output: `Send error: ${SUBAGENT_SEND_ASYNC_ONLY_ERROR}`, isError: true };
 		}
@@ -233,3 +255,60 @@ export const sendTool: ToolDefinition = {
 		}
 	},
 };
+
+/**
+ * A bot's message to one person. Separate from agent messaging on purpose: there is no
+ * session to wake, no delivery receipt to track and no reply to wait for — the message
+ * is recorded in the person's chat with the bot, and they answer when they choose.
+ */
+async function sendToUser(
+	raw: {
+		user?: string;
+		message?: string;
+		id?: string;
+		ids?: string[];
+		name?: string;
+		names?: string[];
+		replyTo?: string;
+		doInterrupt?: boolean;
+		await?: boolean;
+	},
+	ctx: ToolContext,
+): Promise<ToolResult> {
+	if (raw.id || raw.ids?.length || raw.name || raw.names?.length || raw.replyTo) {
+		return { output: "Send error: `user` cannot be combined with agent targets.", isError: true };
+	}
+	if (raw.doInterrupt || raw.await) {
+		return {
+			output: "Send error: a message to a person cannot interrupt or await a reply.",
+			isError: true,
+		};
+	}
+	if (!raw.user?.trim()) return { output: "Error: user is required.", isError: true };
+	if (!raw.message?.trim()) return { output: "Error: message is required.", isError: true };
+	try {
+		const { sendAsBot } = await import("@server/services/bot-chat");
+		const result = await sendAsBot({
+			narratorId: ctx.narratorId,
+			user: raw.user,
+			message: raw.message,
+		});
+		return {
+			output: `Delivered to ${result.username}. A reply, if any, arrives as their next message.`,
+			metadata: {
+				kind: "send",
+				// No `id`: a person is not a session, so the card shows a plain chip
+				// instead of a link that would open a narrator page.
+				targets: [{ label: result.username, status: "sent" }],
+				targetCount: 1,
+				doInterrupt: false,
+				await: false,
+			},
+		};
+	} catch (err) {
+		return {
+			output: `Send error: ${err instanceof Error ? err.message : String(err)}`,
+			isError: true,
+		};
+	}
+}

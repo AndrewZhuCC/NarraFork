@@ -1,17 +1,19 @@
 /**
- * /messages — standalone direct-message page.
+ * /messages — standalone conversation page.
  *
  * Conversation list on the left, the selected room on the right. The active room
  * lives in a `?room=` search param so a conversation is linkable and survives a
  * reload.
  *
  * The narrator-side discussion rooms are NOT listed here: they belong to a
- * narrator and are opened from its toolbar. This page is only for person-to-person
- * conversations, which is also why there is no "send to narrator" action — there is
- * no narrator on this surface to send to.
+ * narrator and are opened from its toolbar. This page holds a person's own
+ * conversations — with people, and with bots (a bot that writes to you lands here
+ * like a DM). That is also why there is no "send to narrator" action: posting in a
+ * bot room already reaches its bot, and a DM has no narrator to send to.
  */
 
-import { Box, Loader, Text } from "@mantine/core";
+import { Box, Button, Loader, Text } from "@mantine/core";
+import { IconRobot } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -95,6 +97,25 @@ function MessagesPage() {
 							key={activeRoomId}
 							roomId={activeRoomId}
 							title={activeRoom?.peer?.username ?? t("conversations")}
+							headerActions={
+								activeRoom?.kind === "bot" && activeRoom.narratorId ? (
+									// The bot's own page adds its live status and the monitor.
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										color="gray"
+										leftSection={<IconRobot size={14} />}
+										onClick={() =>
+											navigate({
+												to: "/narrators/$narratorId",
+												params: { narratorId: activeRoom.narratorId as string },
+											})
+										}
+									>
+										{t("openBot")}
+									</Button>
+								) : undefined
+							}
 						/>
 					) : (
 						<Box style={{ height: "100%", display: "grid", placeItems: "center" }}>

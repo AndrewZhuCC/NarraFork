@@ -197,6 +197,9 @@ export function CreateNarratorModal({
 	const [sessionTitle, setSessionTitle] = useState("");
 	const [makeNamed, setMakeNamed] = useState(false);
 	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
+	// A bot is met in a chat room and signs its messages with its title, so it is named
+	// at creation (the server refuses an unnamed bot). Exclusive with the steward kind.
+	const [bot, setBot] = useState(false);
 	// 提交身份只对当前用户生效（服务端按 用户 × 会话 保存），默认跟随本人默认身份。
 	const [gitIdentityId, setGitIdentityId] = useState(FOLLOW_DEFAULT_GIT_IDENTITY);
 	const gitIdentityVisibility = useGitIdentityVisibility();
@@ -370,7 +373,11 @@ export function CreateNarratorModal({
 				// 自定义标题留空时不传，服务端沿用「首条消息后自动命名」的原逻辑。
 				...(sessionTitle.trim() ? { title: sessionTitle.trim() } : {}),
 				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),
-				...(knowledgeSteward ? { kind: "knowledge" as const } : {}),
+				...(bot
+					? { kind: "bot" as const }
+					: knowledgeSteward
+						? { kind: "knowledge" as const }
+						: {}),
 			},
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -417,6 +424,7 @@ export function CreateNarratorModal({
 		planModePrefilledForOpenRef.current = false;
 		setMakeNamed(false);
 		setKnowledgeSteward(false);
+		setBot(false);
 		setHandle("");
 		setSessionTitle("");
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
@@ -613,8 +621,9 @@ export function CreateNarratorModal({
 			/>
 
 			<TextInput
-				label={t("sessionTitle")}
-				description={t("sessionTitleHint")}
+				label={bot ? t("botName") : t("sessionTitle")}
+				description={bot ? t("botNameHint") : t("sessionTitleHint")}
+				required={bot}
 				value={sessionTitle}
 				onChange={(e) => setSessionTitle(e.currentTarget.value)}
 				maxLength={200}
@@ -644,7 +653,20 @@ export function CreateNarratorModal({
 				label={t("knowledgeSteward")}
 				description={t("knowledgeStewardHint")}
 				checked={knowledgeSteward}
-				onChange={(e) => setKnowledgeSteward(e.currentTarget.checked)}
+				onChange={(e) => {
+					setKnowledgeSteward(e.currentTarget.checked);
+					if (e.currentTarget.checked) setBot(false);
+				}}
+			/>
+
+			<Checkbox
+				label={t("botNarrator")}
+				description={t("botNarratorHint")}
+				checked={bot}
+				onChange={(e) => {
+					setBot(e.currentTarget.checked);
+					if (e.currentTarget.checked) setKnowledgeSteward(false);
+				}}
 			/>
 		</>
 	);
@@ -712,7 +734,9 @@ export function CreateNarratorModal({
 					onClick={handleCreate}
 					loading={createNarrator.isPending}
 					disabled={
-						directoryRequired || (makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH)
+						directoryRequired ||
+						(makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH) ||
+						(bot && !sessionTitle.trim())
 					}
 				>
 					{t("createNarrator")}

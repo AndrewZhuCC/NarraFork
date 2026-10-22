@@ -71,6 +71,7 @@ import {
 	upsertEncodedTrait,
 } from "../lib/narrator-custom-traits";
 import {
+	BOT_TRAIT,
 	isSubagentVariant,
 	KNOWLEDGE_KIND_TRAIT,
 	type NarratorTrait,
@@ -364,8 +365,9 @@ export interface CreateNarratorInput {
 	 * Specialized standalone narrator kind.
 	 * "knowledge" → a Knowledge Steward (knowledge-base management).
 	 * "setup" → a Setup Assistant (installs missing system dependencies).
+	 * "bot" → a bot, faced through chat rooms (see `BOT_TRAIT`). Requires `title`.
 	 */
-	kind?: "knowledge" | "setup";
+	kind?: "knowledge" | "setup" | "bot";
 	/** Whether the creating user is an admin (gates KnowledgeAdmin preinstall for kind="knowledge"). */
 	creatorIsAdmin?: boolean;
 	/** Locale for generating the default kind-specific system prompt. */
@@ -1528,6 +1530,18 @@ export async function prepareNarratorCreation(
 		if (!resolvedSystemPrompt) {
 			resolvedSystemPrompt = buildSetupAssistantSystemPrompt(input.locale ?? "en");
 		}
+	}
+
+	// Bot: a narrator people meet in a chat room instead of its transcript. Standalone
+	// because a conversation outlives any chapter, and named up front because its title
+	// is how it signs every message — the first-message auto-title would rename it
+	// after whatever the first person happened to ask.
+	if (input.kind === "bot") {
+		if (chapterId !== null) {
+			throw new ValidationError("Bot narrators must be standalone (no chapterId)");
+		}
+		if (!input.title?.trim()) throw new ValidationError("A bot needs a name (title)");
+		traits.push(BOT_TRAIT);
 	}
 
 	// Named narrators must be standalone so they are independent of a chapter lifecycle.

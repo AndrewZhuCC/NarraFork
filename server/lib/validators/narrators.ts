@@ -113,12 +113,14 @@ export const createNarratorSchema = z.object({
 	// mentionable via @handle in any session.
 	makeNamed: z.boolean().optional(),
 	handle: narratorHandleSchema.optional(),
-	// Specialized standalone narrator kind. Both must be standalone.
+	// Specialized standalone narrator kind. All must be standalone.
 	//   "knowledge" → Knowledge Steward (knowledge-base mgmt): preinstalls the knowledge
 	//                 toolset and a steward system prompt.
 	//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
 	//                 Terminal and a setup-assistant system prompt.
-	kind: z.enum(["knowledge", "setup"]).optional(),
+	//   "bot"       → a bot: people talk to it in a chat room and see only what it sends
+	//                 them with Send({ user }). Requires `title`, its name in that room.
+	kind: z.enum(["knowledge", "setup", "bot"]).optional(),
 });
 
 /**

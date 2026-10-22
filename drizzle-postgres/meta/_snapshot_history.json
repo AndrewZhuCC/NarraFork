@@ -256,6 +256,14 @@
 			"prevId": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
 			"version": "7",
 			"snapshotDigest": "99a5dcc17aa730f78b3b9d8a1683d3b5e0693d79541580d15b70961ec66c171b"
+		},
+		{
+			"idx": 32,
+			"tag": "0032_bot_rooms",
+			"id": "1d860d99-a8ec-4394-a1ac-03745bd914e0",
+			"prevId": "20534647-c4ef-455c-8c6f-4250ed5f2786",
+			"version": "7",
+			"snapshotDigest": "a7754bba7c6ecc6aa5168939dd7ef566cd6d88f8be49b5e8d0ece4a1dcc407e1"
 		}
 	]
 }

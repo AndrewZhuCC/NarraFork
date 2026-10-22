@@ -2917,30 +2917,37 @@ export const narratorPublicShares = sqliteTable(
 );
 
 // === chat_rooms ===
-// Human-to-human conversation, deliberately disjoint from `narrator_messages`:
-// nothing written here ever reaches a model's context unless a person explicitly
-// forwards it (see `submitToNarrator` on the client).
+// Conversation, deliberately disjoint from `narrator_messages`: nothing written here
+// reaches a model's context unless a person explicitly forwards it (see
+// `submitToNarrator` on the client) — or the room has a bot in it, in which case the
+// bot bridge delivers what people post (see `bot-chat.ts`).
 //
-// Two kinds, and they differ in what membership MEANS:
+// Three kinds, and they differ in what membership MEANS:
 //   - `dm`       — a closed 1:1 conversation. `chat_room_members` is the ACCESS
 //                  CONTROL list: not a member ⇒ cannot read.
 //   - `narrator` — the discussion room beside one narrator. Membership is NOT
 //                  access control (read access follows narrator visibility, see
 //                  `assertCanRead` in chat-service); the row only holds that
 //                  user's read watermark and is created lazily on first visit.
+//   - `bot`      — one person's conversation with a bot narrator (`narrator_id`).
+//                  Closed like a DM: the person's member row is the ACL.
 export const chatRooms = sqliteTable(
 	"chat_rooms",
 	{
 		id: text("id").primaryKey(),
-		kind: text("kind", { enum: ["dm", "narrator"] }).notNull(),
+		kind: text("kind", { enum: ["dm", "narrator", "bot"] }).notNull(),
 		/**
-		 * Canonical identity of a DM: both user ids sorted ascending and joined
-		 * with ":". The unique index makes (A,B) and (B,A) collapse onto one row,
-		 * so two people opening the conversation simultaneously cannot create two
-		 * rooms. Null for narrator rooms.
+		 * Canonical identity of a direct conversation, unique. A DM joins both user
+		 * ids sorted ascending with ":", so (A,B) and (B,A) collapse onto one row and
+		 * two people opening the conversation simultaneously cannot create two rooms.
+		 * A bot room is `bot:<narratorId>:<userId>` — keyed by the person's id, so a
+		 * rename never forks the conversation. Null for narrator rooms.
 		 */
 		dmKey: text("dm_key"),
-		/** The narrator this room belongs to; null for DMs. Unique. */
+		/**
+		 * The narrator this room belongs to: the narrator a discussion sits beside
+		 * (one room each), or the bot of a bot room (one room per person). Null for DMs.
+		 */
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		/**
 		 * Per-room sequence allocator. `postMessage` claims a number inside the
@@ -2961,14 +2968,19 @@ export const chatRooms = sqliteTable(
 	},
 	(table) => [
 		uniqueIndex("idx_chat_rooms_dm_key").on(table.dmKey),
-		uniqueIndex("idx_chat_rooms_narrator").on(table.narratorId),
+		// One discussion room per narrator. Partial because a bot owns a room per person.
+		uniqueIndex("idx_chat_rooms_narrator").on(table.narratorId).where(sql`"kind" = 'narrator'`),
+		// FK covering index for narrator deletion (cascade) and bot-room lookups; the
+		// partial index above serves neither, since those queries do not constrain kind.
+		index("idx_chat_rooms_narrator_id").on(table.narratorId),
 		index("idx_chat_rooms_kind_last").on(table.kind, table.lastMessageAt),
 	],
 );
 
 // === chat_room_members ===
-// See the note on `chat_rooms.kind`: for a DM this row grants access, for a
-// narrator room it only stores the read watermark.
+// See the note on `chat_rooms.kind`: for a DM or bot room this row grants access,
+// for a narrator room it only stores the read watermark. Members are people; a
+// bot room's bot is its `narrator_id`.
 export const chatRoomMembers = sqliteTable(
 	"chat_room_members",
 	{
@@ -3008,7 +3020,12 @@ export const chatMessages = sqliteTable(
 		/** A share is not a user. The name snapshot survives link deletion/revocation. */
 		senderShareId: text("sender_share_id"),
 		senderGuestName: text("sender_guest_name"),
-		/** `text` = written by a person; `system` = a room event (e.g. DM created). */
+		/**
+		 * The bot that wrote this message through `Send({ user })`. A bot is a narrator,
+		 * not a user, so it gets its own author column rather than a stand-in account.
+		 */
+		senderNarratorId: text("sender_narrator_id"),
+		/** `text` = written by a person or a bot; `system` = a room event (e.g. DM created). */
 		kind: text("kind", { enum: ["text", "system"] })
 			.notNull()
 			.default("text"),
@@ -3041,6 +3058,8 @@ export const chatMessages = sqliteTable(
 		replyToSeq: integer("reply_to_seq"),
 		replyToSenderUserId: text("reply_to_sender_user_id"),
 		replyToGuestName: text("reply_to_guest_name"),
+		/** The quoted message's bot author, by id for the same rename reason as above. */
+		replyToSenderNarratorId: text("reply_to_sender_narrator_id"),
 		replyToPreview: text("reply_to_preview"),
 		editedAt: text("edited_at"),
 		deletedAt: text("deleted_at"),
@@ -3050,12 +3069,21 @@ export const chatMessages = sqliteTable(
 		uniqueIndex("idx_chat_messages_room_seq").on(table.roomId, table.seq),
 		index("idx_chat_messages_sender").on(table.senderUserId),
 		index("idx_chat_messages_sender_share").on(table.senderShareId),
+		index("idx_chat_messages_sender_narrator").on(table.senderNarratorId),
 		// Explicitly named so migration generation rebuilds the FK rather than losing
 		// ON DELETE SET NULL in SQLite's ADD COLUMN path.
 		foreignKey({
 			name: "fk_chat_messages_sender_share",
 			columns: [table.senderShareId],
 			foreignColumns: [narratorPublicShares.id],
+		}).onDelete("set null"),
+		// Same reason. A bot's own rooms already go with it (`chat_rooms.narrator_id`);
+		// SET NULL keeps its words in any room it does not own instead of punching holes
+		// in that room's seq cursor.
+		foreignKey({
+			name: "fk_chat_messages_sender_narrator",
+			columns: [table.senderNarratorId],
+			foreignColumns: [narrators.id],
 		}).onDelete("set null"),
 	],
 );

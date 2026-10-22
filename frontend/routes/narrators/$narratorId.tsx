@@ -38,6 +38,11 @@ const NarratorPanel = lazy(() =>
 		default: memo(m.NarratorPanel),
 	})),
 );
+const BotChatPage = lazy(() =>
+	import("../../components/chat/BotChatPage").then((m) => ({
+		default: m.BotChatPage,
+	})),
+);
 
 import { FocusChatHost } from "../../components/narrator/dock/FocusChatHost";
 import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
@@ -153,6 +158,15 @@ function NarratorDetailPage() {
 		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			((narrator as any).traits as string[]).includes("scheduled")
 		: false;
+	// A bot's page is its conversation. The transcript is the monitor: a view of the same
+	// narrator kept in the URL (linkable, left with Back), never a change to the bot. A
+	// deep link to a transcript message means the monitor too.
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const isBot = Array.isArray((narrator as any)?.traits)
+		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			((narrator as any).traits as string[]).includes("bot")
+		: false;
+	const monitoring = search?.view === "monitor" || !!highlightMessageId;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const legacyParentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -325,9 +339,29 @@ function NarratorDetailPage() {
 	}, [navigate, projectId, chapterId]);
 	const showMinimize = from === "graph" && !!projectId && !!chapterId;
 
-	// Return to the originating workspace before applying subagent navigation defaults.
+	// Switch a bot between its conversation and its monitor, keeping where it was opened from.
+	const showBotView = useCallback(
+		(view: "chat" | "monitor") => {
+			navigate({
+				to: "/narrators/$narratorId",
+				params: { narratorId },
+				search: {
+					...(from ? { from } : {}),
+					...(workspaceId ? { workspaceId } : {}),
+					...(view === "monitor" ? { view } : {}),
+				},
+			});
+		},
+		[navigate, narratorId, from, workspaceId],
+	);
+	const openBotMonitor = useCallback(() => showBotView("monitor"), [showBotView]);
+
+	// A bot's monitor returns to its conversation; otherwise return to the originating
+	// workspace before applying subagent navigation defaults.
 	const onBack = useCallback(() => {
-		if (fromWorkspace && workspaceId) {
+		if (isBot) {
+			showBotView("chat");
+		} else if (fromWorkspace && workspaceId) {
 			navigate({
 				to: "/narrators/workspace/$workspaceId",
 				params: { workspaceId },
@@ -352,6 +386,8 @@ function NarratorDetailPage() {
 			navigate({ to: ".." });
 		}
 	}, [
+		isBot,
+		showBotView,
 		fromWorkspace,
 		workspaceId,
 		isSubagent,
@@ -361,6 +397,7 @@ function NarratorDetailPage() {
 		parentNarratorId,
 		navigate,
 	]);
+	const hasBack = isSubagent || fromWorkspace || isBot;
 
 	const [forkMessageId, setForkMessageId] = useState<string | null>(null);
 	const handleForkFromMessage = useCallback(
@@ -495,6 +532,27 @@ function NarratorDetailPage() {
 			</Alert>
 		);
 
+	if (isBot && !monitoring)
+		return (
+			<Suspense
+				fallback={
+					<Center h={APP_SHELL_CONTENT_HEIGHT}>
+						<Loader size="sm" />
+					</Center>
+				}
+			>
+				<BotChatPage
+					key={narratorId}
+					narratorId={narratorId}
+					title={narratorTitle}
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					avatarImageId={(narrator as any).avatarImageId as string | null | undefined}
+					status={narratorStatus}
+					onMonitor={openBotMonitor}
+				/>
+			</Suspense>
+		);
+
 	// The provider and portal owner never cross the responsive identity boundary.
 	return (
 		<NarratorDockProvider
@@ -503,7 +561,7 @@ function NarratorDetailPage() {
 			chapterId={chapterId}
 			onForkFromMessage={chapterId ? handleForkFromMessage : null}
 			highlightMessageId={highlightMessageId}
-			onBack={isSubagent || fromWorkspace ? onBack : null}
+			onBack={hasBack ? onBack : null}
 			onMinimize={showMinimize ? onMinimize : null}
 		>
 			<Box
@@ -544,7 +602,7 @@ function NarratorDetailPage() {
 										: undefined
 								}
 								onMinimize={showMinimize ? onMinimize : undefined}
-								onBack={isSubagent || fromWorkspace ? onBack : undefined}
+								onBack={hasBack ? onBack : undefined}
 								specPanelOpen={isMobile ? specDrawerOpened : undefined}
 								onToggleSpecPanel={
 									isMobile ? (specDrawerOpened ? closeSpecDrawer : openSpecDrawer) : undefined

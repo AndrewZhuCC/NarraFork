@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
+import type { ChatRoomKind } from "@shared/chat-room-kinds";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { PublicationRun } from "../services/agent-runtime/publication-outbox";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
@@ -515,14 +516,16 @@ export type NarraForkEvent =
 	// listener (WS fan-out today, an IM bridge later) can route without holding a
 	// copy of content it has no authorization story for.
 	| {
-			/** A person posted in a chat room. */
+			/** A person (or a bot, through Send) posted in a chat room. */
 			type: "chat:message_created";
 			roomId: string;
 			messageId: string;
 			seq: number;
 			senderUserId: string | null;
-			roomKind: "dm" | "narrator";
-			/** Set for a narrator room, so a consumer can scope by narrator. */
+			/** Set when a bot wrote the message; `senderUserId` is then null. */
+			senderNarratorId?: string | null;
+			roomKind: ChatRoomKind;
+			/** Set for a narrator or bot room, so a consumer can scope by narrator. */
 			narratorId: string | null;
 	  }
 	| {

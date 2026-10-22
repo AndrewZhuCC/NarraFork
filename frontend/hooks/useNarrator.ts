@@ -792,7 +792,7 @@ export function useCreateNarrator() {
 			title?: string;
 			makeNamed?: boolean;
 			handle?: string;
-			kind?: "knowledge";
+			kind?: "knowledge" | "bot";
 		}) =>
 			// No fast-mode default is injected here: new narrators keep the "inherit"
 			// override and the server resolves it against the user's fastModeDefault

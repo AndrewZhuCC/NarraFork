@@ -914,7 +914,7 @@ export const narratorsApi = {
 		title?: string;
 		makeNamed?: boolean;
 		handle?: string;
-		kind?: "knowledge" | "setup";
+		kind?: "knowledge" | "setup" | "bot";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	/**
 	 * Spawn a Setup Assistant narrator that installs the missing system
