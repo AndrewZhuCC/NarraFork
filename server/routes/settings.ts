@@ -627,7 +627,10 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		narratorBlocks: z.object({ write: z.boolean(), read: z.boolean() }).partial().optional(),
+		narratorBlocks: z
+			.object({ write: z.boolean(), read: z.boolean(), wsV2: z.boolean() })
+			.partial()
+			.optional(),
 		containers: z
 			.object({
 				portRangeStart: z.number().int().min(1).max(65535),

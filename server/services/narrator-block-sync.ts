@@ -45,6 +45,7 @@ import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { blockIdForElement, reassignBlockIdForElement } from "./narrator-block-ids";
 import { activeTurnId } from "./narrator-turns";
 
 /** How incomplete output and reasoning are read: still streaming, sealed, or as they were. */
@@ -277,6 +278,29 @@ function keyed(
 	}));
 }
 
+/** The element identity a codec key names exactly (`type:identity`); none for positional keys. */
+function elementIdentity(key: string): string | undefined {
+	const colon = key.indexOf(":");
+	return colon > 0 && !/~\d+$/.test(key) ? key.slice(colon + 1) : undefined;
+}
+
+/**
+ * A new row's id. A streaming element's row takes the block id handed out when the item
+ * opened (`narrator-block-ids.ts`, §5.2), or hands one out now for its later deltas;
+ * every other row gets a fresh id.
+ */
+function newRowId(narratorId: string, key: string, mode: SyncMode): string {
+	const identity = mode === "streaming" ? elementIdentity(key) : undefined;
+	if (!identity) return generateId();
+	const { blockId } = blockIdForElement(narratorId, identity);
+	if (!database.sqlite.prepare("SELECT 1 FROM narrator_blocks WHERE id = ?").get(blockId))
+		return blockId;
+	// The id names a row already (a copy of the envelope kept the element): use a new one.
+	const fresh = generateId();
+	reassignBlockIdForElement(narratorId, identity, fresh);
+	return fresh;
+}
+
 /** Non-internal ledger rows of a message, in the order `adoptedLedger` expects. */
 function ledgerRows(messageId: string): PlanLedgerRow[] {
 	return database.sqlite
@@ -355,7 +379,13 @@ export function syncEnvelope(
 			(draft.kind === "output" || draft.kind === "reasoning")
 		)
 			phase = "open";
-		return { ...block, ordinal, current, phase, id: current?.id ?? generateId() };
+		return {
+			...block,
+			ordinal,
+			current,
+			phase,
+			id: current?.id ?? newRowId(message.narratorId, draft.key, mode),
+		};
 	});
 
 	const removed = existing.filter((block) => !kept.has(block.id));
