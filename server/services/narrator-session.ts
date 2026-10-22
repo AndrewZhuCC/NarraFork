@@ -351,13 +351,13 @@ import {
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
 import { recoverBlockStorage } from "./narrator-block-sync";
-import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
 import {
 	lastTargetElement,
 	materializeEnvelope,
 	resolveBlockTargets,
 	rowAt,
 } from "./narrator-block-targets";
+import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
 import {
 	cleanupBufferedTextFilesAsync,
 	enqueueBufferedMessage,
