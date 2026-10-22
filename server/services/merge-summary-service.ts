@@ -15,6 +15,7 @@ import { getMergeSummaryLabel, getPrompt, getUserLanguage, type Locale } from ".
 import { safeSpawn } from "../lib/spawn";
 import { blockReadsEnabled, envelopesWithContext } from "./narrator-block-scans";
 import { narratorService } from "./narrator-service";
+import { narratorStore } from "./narrator-store";
 
 /** Maximum number of commits to include in the summary input. */
 const MAX_COMMITS_FOR_SUMMARY = 50;
@@ -120,6 +121,14 @@ const cardsFromBlocks = (sourceChapterId: string, commitSha: string | null) =>
 		...(commitSha ? [commitSha] : []),
 	]);
 
+/** A state patch setting a merge card's `isLatest` (whether it offers unmerge). */
+const latestCard = (isLatest: boolean) => (content: unknown[]) =>
+	content.map((block) =>
+		(block as { type?: unknown } | null)?.type === "merge_summary"
+			? { ...(block as Record<string, unknown>), isLatest }
+			: block,
+	);
+
 /** The merge_summary cards whose content mentions `sourceChapterId` (and `commitSha`). */
 async function findCards(
 	sourceChapterId: string,
@@ -211,19 +220,8 @@ export const mergeSummaryService = {
 
 			// Mark existing merge_summary messages as historical (isLatest: false)
 			// so the frontend hides the unmerge button on old cards.
-			if (existingSummaries.length > 0) {
-				for (const row of existingSummaries) {
-					const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					const updated = blocks.map((b: any) =>
-						b.type === "merge_summary" ? { ...b, isLatest: false } : b,
-					);
-					await db
-						.update(narratorMessages)
-						.set({ contentJson: updated })
-						.where(eq(narratorMessages.id, row.id));
-				}
-			}
+			// Card state: no model-history bump (§5.4).
+			for (const row of existingSummaries) narratorStore.patchState(row.id, latestCard(false));
 
 			// Use pre-collected data when available (collected before merge).
 			// Fall back to git queries (may return empty for fast-forward merges).
@@ -436,22 +434,7 @@ export const mergeSummaryService = {
 					.orderBy(sql`${narratorMessages.createdAt} DESC`)
 					.limit(1);
 
-		if (remaining.length > 0) {
-			const latest = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, remaining[0].id),
-			});
-			if (latest?.contentJson) {
-				const blocks = Array.isArray(latest.contentJson) ? latest.contentJson : [];
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const updated = blocks.map((b: any) =>
-					b.type === "merge_summary" ? { ...b, isLatest: true } : b,
-				);
-				await db
-					.update(narratorMessages)
-					.set({ contentJson: updated })
-					.where(eq(narratorMessages.id, remaining[0].id));
-			}
-		}
+		if (remaining.length > 0) narratorStore.patchState(remaining[0].id, latestCard(true));
 
 		logger.info("Cleaned up merge summary for specific merge", {
 			sourceChapterId,

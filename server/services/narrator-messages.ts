@@ -111,6 +111,7 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 import {
 	attachActiveSendDeliveryTargets,
 	attachSendTargetDetails,
@@ -4897,13 +4898,15 @@ const narratorMessageQueriesUnlocked = {
 				return { alreadyApplied: true };
 			}
 
-			const patched = blocks.map((entry, i) => (i === index ? { ...entry, applied: true } : entry));
-			const updated = tx
-				.update(narratorMessages)
-				.set({ contentJson: patched })
-				.where(eq(narratorMessages.id, messageId))
-				.returning()
-				.get();
+			// The latch is card state: the model reads the feedback either way (§5.4).
+			narratorStore.patchState(messageId, (content) =>
+				content.map((entry, i) =>
+					i === index ? { ...(entry as Record<string, unknown>), applied: true } : entry,
+				),
+			);
+			const updated = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -4942,15 +4945,14 @@ const narratorMessageQueriesUnlocked = {
 				: [];
 			const index = blocks.findIndex((block) => block?.type === "review_feedback");
 			if (!msg || index < 0) return undefined;
-			const patched = blocks.map((entry, i) =>
-				i === index ? { ...entry, applied: false } : entry,
+			narratorStore.patchState(messageId, (content) =>
+				content.map((entry, i) =>
+					i === index ? { ...(entry as Record<string, unknown>), applied: false } : entry,
+				),
 			);
-			const updated = tx
-				.update(narratorMessages)
-				.set({ contentJson: patched })
-				.where(eq(narratorMessages.id, messageId))
-				.returning()
-				.get();
+			const updated = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,

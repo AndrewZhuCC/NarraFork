@@ -1419,7 +1419,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 				.all() as Array<{ name: string; sql: string }>
 		).map(({ name, sql }) => ({ name, sql: sql.trim().replace(/;$/, "").trimEnd() }));
 	}
-	/** Every model-history trigger, any contract version (a fully migrated database is v2). */
+	/** Every model-history trigger, any contract version (a fully migrated database is v3). */
 	function installedTriggerSql(database: Database): Array<{ name: string; sql: string }> {
 		return (
 			database

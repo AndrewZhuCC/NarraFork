@@ -43,7 +43,6 @@ const DIRECT_WRITERS: Record<string, string> = {
 	"server/routes/narrators.ts": "manual plan/compact cards and their state",
 	"server/services/commit-sync-service.ts": "commit card state",
 	"server/services/merge-summary-service.ts": "merge summary cards",
-	"server/services/narrator-compact.ts": "compact marker state",
 	"server/services/narrator-subagent-recovery.ts": "recovery card state and parent call result",
 	"server/services/narrator-tree-snapshot-hooks.ts": "tree snapshot metadata",
 	"server/lib/usage-tracking.ts": "message usage and cost",

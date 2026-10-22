@@ -28,7 +28,13 @@ import {
 	parseStored as parse,
 	planEnvelopeBlocks,
 } from "@shared/narrator-blocks/plan";
-import { assembleContent, inAssembledOrder, splitEnvelope } from "@shared/narrator-blocks/storage";
+import {
+	assembleContent,
+	type BlockDraft,
+	inAssembledOrder,
+	isStateOnlyChange,
+	splitEnvelope,
+} from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
@@ -413,6 +419,136 @@ export function syncEnvelope(
 	database.sqlite
 		.prepare("UPDATE narrator_messages SET body_bytes = ? WHERE id = ? AND body_bytes <> ?")
 		.run(planned.bodyBytes, messageId, planned.bodyBytes);
+}
+
+// === State-only writes (§5.4) ===
+
+const utf8 = (text: string | null) => (text ? Buffer.byteLength(text) : 0);
+
+/** The columns the decoder derives from a block's elements, which the model reads. */
+function sameDerivedColumns(before: BlockDraft[], after: BlockDraft[]): boolean {
+	return (
+		before.length === after.length &&
+		before.every((draft, index) => {
+			const next = after[index];
+			return (
+				draft.key === next.key &&
+				draft.kind === next.kind &&
+				draft.subtype === next.subtype &&
+				draft.phase === next.phase &&
+				draft.wireId === next.wireId &&
+				draft.modelText === next.modelText
+			);
+		})
+	);
+}
+
+/**
+ * Write the new `state` of the rows a state-only write changed, in place. Rows that do not
+ * line up with the content (a sync still owed) are rebuilt from it instead.
+ */
+function writeBlockStates(messageId: string, drafts: BlockDraft[]): void {
+	if (
+		database.sqlite
+			.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
+			.get(messageId)
+	)
+		return; // The sync owed rebuilds the rows from content_json, state included.
+	const rows = database.sqlite
+		.prepare("SELECT id, kind, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal")
+		.all(messageId) as Array<{ id: string; kind: string; state: string | null }>;
+	const payloadOf = database.sqlite.prepare("SELECT payload FROM narrator_blocks WHERE id = ?");
+	const changes: Array<{ id: string; state: string | null; delta: number }> = [];
+	const aligned =
+		rows.length === drafts.length &&
+		rows.every((row, index) => {
+			const draft = drafts[index];
+			if (row.kind !== draft.kind) return false;
+			const state = draft.state === null ? null : JSON.stringify(draft.state);
+			if (row.state === state) return true;
+			// Only the rows whose state moves are read in full.
+			const { payload } = payloadOf.get(row.id) as { payload: string };
+			if (payload !== JSON.stringify(draft.payload)) return false;
+			changes.push({ id: row.id, state, delta: utf8(state) - utf8(row.state) });
+			return true;
+		});
+	if (!aligned) {
+		syncEnvelopeNow(messageId);
+		return;
+	}
+	const writeState = database.sqlite.prepare(
+		"UPDATE narrator_blocks SET state = ?, byte_size = byte_size + ? WHERE id = ?",
+	);
+	for (const change of changes) writeState.run(change.state, change.delta, change.id);
+	const delta = changes.reduce((sum, change) => sum + change.delta, 0);
+	if (delta)
+		database.sqlite
+			.prepare("UPDATE narrator_messages SET body_bytes = body_bytes + ? WHERE id = ?")
+			.run(delta, messageId);
+}
+
+/**
+ * A state-only write (§5.4): reader-only fields of an envelope's elements, the ones
+ * `splitEnvelope` keeps in a block's `state` (a translation, a card's status). One
+ * transaction: `content_json`, the complete compatibility projection, with
+ * `state_revision` moved, which contract v3 neither counts nor queues; and the `state` of
+ * the block rows it changes, written in place. No revision bump, no COW (a shared envelope
+ * is patched for every holder), no search index.
+ *
+ * `mutate` gets a copy of the stored content and returns the new content, or null to
+ * leave it. A change that is not state-only is written as the body change it is: a field
+ * outside the state, or a state field the decoder derives a model-visible column from (a
+ * compact's status sets its phase). Returns whether anything was written.
+ */
+export function patchEnvelopeState(
+	messageId: string,
+	mutate: (content: unknown[]) => unknown[] | null,
+): boolean {
+	return database.sqlite.transaction(() => {
+		const row = database.sqlite
+			.prepare(
+				`SELECT id, narrator_id AS narratorId, role, content_json AS contentJson,
+					content_text AS contentText, parent_tool_use_id AS parentToolUseId,
+					sdk_message_uuid AS messageUuid, origin, provider, body_format AS bodyFormat
+				 FROM narrator_messages WHERE id = ?`,
+			)
+			.get(messageId) as EnvelopeRow | null;
+		if (!row) return false;
+		const content = parse(row.contentJson);
+		if (!Array.isArray(content)) return false;
+		const next = mutate(structuredClone(content));
+		if (!next) return false;
+		const json = JSON.stringify(next);
+		if (json === row.contentJson) return false;
+		const message = {
+			id: row.id,
+			narratorId: row.narratorId,
+			role: row.role,
+			contentText: row.contentText,
+			parentToolUseId: row.parentToolUseId,
+			messageUuid: row.messageUuid,
+			origin: row.origin,
+			provider: row.provider,
+		};
+		const after = splitEnvelope({ ...message, contentJson: next }).blocks;
+		const stateOnly =
+			isStateOnlyChange(content, next) &&
+			sameDerivedColumns(splitEnvelope({ ...message, contentJson: content }).blocks, after);
+		if (!stateOnly) {
+			database.sqlite
+				.prepare("UPDATE narrator_messages SET content_json = ? WHERE id = ?")
+				.run(json, messageId);
+			if (row.bodyFormat === 2) syncEnvelopeNow(messageId);
+			return true;
+		}
+		database.sqlite
+			.prepare(
+				"UPDATE narrator_messages SET content_json = ?, state_revision = state_revision + 1 WHERE id = ?",
+			)
+			.run(json, messageId);
+		if (row.bodyFormat === 2 && hasBlockSchema()) writeBlockStates(messageId, after);
+		return true;
+	})();
 }
 
 /**
