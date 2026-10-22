@@ -136,3 +136,15 @@ export function modelHistoryBlockSnapshot(): ResourceMigrationSnapshot {
 	};
 	return snapshot;
 }
+
+/** The v3 contract's schema: the block schema plus the state-write counter. */
+export function modelHistoryStateSnapshot(): ResourceMigrationSnapshot {
+	const snapshot = modelHistoryBlockSnapshot();
+	snapshot.tables.narrator_messages.columns.state_revision = {
+		name: "state_revision",
+		type: "integer",
+		notNull: true,
+		default: 0,
+	};
+	return snapshot;
+}

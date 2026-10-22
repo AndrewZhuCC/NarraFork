@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { DecodableMessage } from "./decode";
-import { assembleContent, splitEnvelope } from "./storage";
+import { assembleContent, matchBlocks, splitEnvelope } from "./storage";
 
 function message(
 	role: DecodableMessage["role"],
@@ -153,5 +153,40 @@ describe("block storage codec", () => {
 		expect(step("running", null)).toBe("open");
 		expect(step("success", "ok")).toBe("done");
 		expect(step("fail", { _text: "bad input", _broken: true })).toBe("failed");
+	});
+});
+
+describe("matchBlocks", () => {
+	const text = (n: number, body: string) => ({ key: `text#${n}`, payload: body });
+	const tool = (id: string) => ({ key: `tool_use:${id}`, payload: `call ${id}` });
+
+	test("a removed id-less block's row is not continued by the one that moves up", () => {
+		expect(
+			matchBlocks([text(0, "A"), tool("c1"), text(1, "B")], [tool("c1"), text(0, "B")]),
+		).toEqual([1, 2]);
+	});
+
+	test("of identical blocks, the alignment keeps the ones around the same identities", () => {
+		const before = [text(0, "ok"), tool("c1"), text(1, "ok")];
+		expect(matchBlocks(before, [tool("c1"), text(0, "ok")])).toEqual([1, 2]);
+		expect(matchBlocks(before, [text(0, "ok"), tool("c1")])).toEqual([0, 1]);
+	});
+
+	test("a block edited or streamed in place keeps its row", () => {
+		expect(matchBlocks([text(0, "Hel")], [text(0, "Hello")])).toEqual([0]);
+		expect(
+			matchBlocks(
+				[text(0, "A"), tool("c1"), text(1, "B")],
+				[text(0, "B"), tool("c1"), text(1, "B")],
+			),
+		).toEqual([0, 1, 2]);
+	});
+
+	test("an identity follows its block wherever it moves; types never cross", () => {
+		expect(matchBlocks([tool("c1"), tool("c2")], [tool("c2"), tool("c1")])).toEqual([1, 0]);
+		expect(
+			matchBlocks([{ key: "reasoning#0", payload: "r" }], [{ key: "text#0", payload: "t" }]),
+		).toEqual([undefined]);
+		expect(matchBlocks([tool("c1")], [tool("c9")])).toEqual([undefined]);
 	});
 });

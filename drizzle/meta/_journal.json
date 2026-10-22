@@ -1513,6 +1513,13 @@
       "when": 1792659179609,
       "tag": "0215_legacy_body_index",
       "breakpoints": true
+    },
+    {
+      "idx": 216,
+      "version": "6",
+      "when": 1792663570008,
+      "tag": "0216_block_state_writes",
+      "breakpoints": true
     }
   ]
 }

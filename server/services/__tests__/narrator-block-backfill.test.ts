@@ -15,6 +15,7 @@ mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 // narrator-service must be imported before narrator-persistence (pre-existing cycle).
 await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
+const { narratorPersistence } = await import("../narrator-persistence");
 const { settings } = await import("../../lib/settings");
 const blockSync = await import("../narrator-block-sync");
 const backfill = await import("../narrator-block-backfill");
@@ -184,6 +185,35 @@ describe("block backfill", () => {
 		await backfill.runBlockJobSlice({ ...inline, backfill: async () => stale });
 		expect(envelope(input.id).bodyFormat).toBe(2);
 		expect(assembled(input.id)).toEqual([{ type: "text", text: "after" }]);
+	});
+
+	test("a state-only write after the worker read the envelope is not lost", async () => {
+		const step = await legacy(async () => {
+			const opened = await narratorStore.openStep("n1", { uuid: "u", session_id: "s" });
+			await narratorStore.writeStepItem(opened.id, "n1", {
+				type: "reasoning",
+				id: "r1",
+				text: "thinking",
+				completed: true,
+				outputIndex: 0,
+			});
+			return opened;
+		});
+		const stale = await inline.backfill({
+			kind: "blockBackfillSlice",
+			afterRowid: 0,
+			maxEnvelopes: 100,
+			maxSourceBytes: 1 << 22,
+			budgetMs: 1000,
+		});
+		// A translation lands while the slice is in flight: state moves, the body does not.
+		const { bodyRevision } = envelope(step.id);
+		expect(await narratorPersistence.patchReasoningTranslation(step.id, 0, "思考")).toBeTruthy();
+		expect(envelope(step.id).bodyRevision).toBe(bodyRevision);
+		await backfill.runBlockJobSlice({ ...inline, backfill: async () => stale });
+		expect(envelope(step.id).bodyFormat).toBe(2);
+		expect(assembled(step.id)).toEqual(JSON.parse(envelope(step.id).contentJson));
+		expect(JSON.stringify(assembled(step.id))).toContain("思考");
 	});
 
 	test("unreadable content is recorded and left legacy; the job moves past it", async () => {

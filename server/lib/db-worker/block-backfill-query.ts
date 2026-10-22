@@ -60,6 +60,8 @@ export interface BackfillEnvelope {
 	createdAt: string;
 	/** What the plan was read at; the apply skips an envelope that changed since. */
 	bodyRevision: number;
+	/** A state-only write (§5.4) moves this, not `bodyRevision`. */
+	stateRevision: number;
 	ledgerFingerprint: string;
 	bodyBytes: number;
 	/** Null when the stored content could not be read as an array of elements. */
@@ -95,6 +97,7 @@ interface EnvelopeSource {
 	provider: string | null;
 	createdAt: string;
 	bodyRevision: number;
+	stateRevision: number;
 }
 
 /** Rowids and sizes of the next candidates; bodies are read one at a time within the budget. */
@@ -147,7 +150,7 @@ function envelopeAt(db: Database, rowid: number): EnvelopeSource {
 			`SELECT rowid, id, narrator_id AS narratorId, role, content_json AS contentJson,
 				content_text AS contentText, parent_tool_use_id AS parentToolUseId,
 				sdk_message_uuid AS messageUuid, origin, provider, created_at AS createdAt,
-				body_revision AS bodyRevision
+				body_revision AS bodyRevision, state_revision AS stateRevision
 			 FROM narrator_messages WHERE rowid = ?`,
 		)
 		.get(rowid) as EnvelopeSource;
@@ -182,6 +185,7 @@ function planBackfill(db: Database, rowid: number): BackfillEnvelope {
 		rowid: source.rowid,
 		createdAt: source.createdAt,
 		bodyRevision: source.bodyRevision,
+		stateRevision: source.stateRevision,
 		ledgerFingerprint: ledgerFingerprint(db, source.id),
 	};
 	const content = parseStored(source.contentJson);
