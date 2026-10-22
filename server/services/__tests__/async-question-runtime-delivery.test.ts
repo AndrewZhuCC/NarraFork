@@ -278,12 +278,11 @@ describe("async question receipt runtime adoption", () => {
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 		expect(db.select().from(narratorBufferedMessages).get()?.state).toBe("materialized");
 	});
-	test("dynamic pending-question hints remain unpersisted identity-free parts", async () => {
+	test("pending questions are not re-sent at tool boundaries; the system prompt lists them", async () => {
 		await seedQuestion();
 		const projected = await drainInjectionsIntoHistory(active(), "en");
-		expect(projected.text).toContain("Pick a cache");
-		expect(projected.parts).toEqual([{ text: projected.text }]);
-		expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
+		expect(projected.text).not.toContain("Pick a cache");
+		expect(projected.parts).toEqual([]);
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 	});
 	test("answer received during final generation is materialized for a fresh history pass", async () => {
