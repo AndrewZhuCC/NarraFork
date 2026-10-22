@@ -12,6 +12,7 @@ import {
 	MODEL_HISTORY_REVISION_CONTRACT,
 	MODEL_HISTORY_REVISION_CONTRACT_V1,
 	MODEL_HISTORY_REVISION_CONTRACT_V2,
+	modelHistoryReinstall,
 	modelHistoryTriggerSuffix,
 } from "../generated-model-history-triggers";
 import { readPgMetadata } from "../postgres-migration-metadata";
@@ -84,17 +85,23 @@ function fixture(dialect: "sqlite" | "postgres") {
 function writeSchema(
 	root: string,
 	dialect: "sqlite" | "postgres",
-	stage: "base" | "revisions" | "blocks" | "state",
+	stage: "base" | "revisions" | "blocks" | "state" | "rebuild",
 ) {
 	const snapshots = modelHistorySnapshots();
 	const snapshot =
-		stage === "state"
+		stage === "state" || stage === "rebuild"
 			? modelHistoryStateSnapshot()
 			: stage === "blocks"
 				? modelHistoryBlockSnapshot()
 				: stage === "revisions"
 					? snapshots.after
 					: snapshots.before;
+	// SQLite cannot alter a default in place, so Kit rebuilds the trigger table `narrators`.
+	if (stage === "rebuild")
+		snapshot.tables.narrators.columns.title = {
+			...snapshot.tables.narrators.columns.title,
+			default: "untitled",
+		};
 	const tableFunction = dialect === "sqlite" ? "sqliteTable" : "pgTable";
 	const schema = [
 		`import { ${tableFunction}, integer, text } from "drizzle-orm/${dialect === "sqlite" ? "sqlite" : "pg"}-core";`,
@@ -165,6 +172,57 @@ test("real SQLite Kit through the official wrapper publishes fields and triggers
 	expect(readFileSync(join(folder, "0002_model_revision.sql"), "utf8")).toBe(generated);
 	expect(readFileSync(join(folder, "0003_model_blocks.sql"), "utf8")).toBe(reinstall);
 	expect(readFileSync(join(folder, "0004_model_state.sql"), "utf8")).toBe(stateReinstall);
+}, 60_000);
+
+test("real SQLite Kit wraps a rebuild of an installed contract's table in its versioned reinstall", async () => {
+	const { root, folder } = fixture("sqlite");
+	const migrations: string[] = [];
+	for (const [stage, name] of [
+		["base", "model_base"],
+		["revisions", "model_revision"],
+		["blocks", "model_blocks"],
+		["state", "model_state"],
+		["rebuild", "model_rebuild"],
+	] as const) {
+		writeSchema(root, "sqlite", stage);
+		await generateSqliteMigrations(["--name", name], { root });
+		migrations.push(readFileSync(join(folder, `000${migrations.length + 1}_${name}.sql`), "utf8"));
+	}
+	const rebuild = migrations[4];
+	const state = modelHistoryStateSnapshot();
+	const wrapper = modelHistoryReinstall(state, state, "sqlite");
+	if (!wrapper) throw new Error("v3 schema must offer a reinstall");
+	expect(rebuild.startsWith(wrapper.prefix)).toBe(true);
+	expect(rebuild.endsWith(wrapper.suffix)).toBe(true);
+	expect(rebuild).toContain("DROP TABLE `narrators`;");
+	const db = new Database(":memory:");
+	const clean = new Database(":memory:");
+	const catalog = (database: Database) =>
+		database
+			.query("SELECT name, tbl_name, sql FROM sqlite_master WHERE type='trigger' ORDER BY name")
+			.all();
+	try {
+		for (const migration of migrations.slice(0, 4)) db.exec(migration);
+		db.exec("INSERT INTO narrators(id, title) VALUES ('owner', 'kept')");
+		const kept = db.query("SELECT id, title, model_history_revision FROM narrators").all();
+		db.exec(rebuild);
+		expect(db.query("SELECT id, title, model_history_revision FROM narrators").all()).toEqual(kept);
+		// Byte-identical to a database that installed the contract without any rebuild.
+		for (const migration of migrations.slice(0, 4)) clean.exec(migration);
+		expect(catalog(db)).toEqual(catalog(clean));
+		expect(catalog(db).map((row) => (row as { name: string }).name)).toEqual(
+			[...MODEL_HISTORY_SQLITE_TRIGGERS].sort(),
+		);
+		expect(
+			db.query("SELECT installed_version AS v FROM model_history_revision_contracts").all(),
+		).toEqual([{ v: MODEL_HISTORY_REVISION_CONTRACT }]);
+	} finally {
+		clean.close();
+		db.close();
+	}
+	// History stays immutable: a no-change run only validates the wrapped batch read-only.
+	await generateSqliteMigrations(["--name", "model_rebuild"], { root });
+	expect(readFileSync(join(folder, "0005_model_rebuild.sql"), "utf8")).toBe(rebuild);
 }, 60_000);
 
 test("real PG Kit through the official wrapper binds fields and trigger functions to the same convergent snapshot", async () => {

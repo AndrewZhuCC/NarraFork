@@ -63,7 +63,6 @@ export const KILL_GRACE_MS = 3_000;
  * Batch 1: the files this baseline must answer for first.
  *  - the four files of the previously demonstrated same-process pollution chain
  *  - the source-anchor file (`narrators-file-references`)
- *  - `worktree-watcher-poll` (timing-sensitive, suspected order dependent)
  *  - registration-related files and the new db contract/guard files
  *
  * Registration and db-contract files are owned by other agents in this round;
@@ -74,11 +73,9 @@ export const BATCH_ACCEPTANCE1: readonly string[] = [
 	"server/routes/__tests__/fs-download.test.ts",
 	"server/routes/__tests__/trait-layers.test.ts",
 	"server/routes/__tests__/project-membership.test.ts",
-	"server/routes/__tests__/projects-delete-fallback.test.ts",
 	// source-anchor / mock-anchor suspects
 	"tests/server/routes/narrators-file-references.test.ts",
 	"server/routes/narrator-file-references.test.ts",
-	"server/services/worktree-watcher-poll.test.ts",
 	// registration domain (other agent's scope, read-only here)
 	"server/services/__tests__/registration-code-service.test.ts",
 	"server/lib/__tests__/register-closes-registration.test.ts",
@@ -94,7 +91,7 @@ export const BATCH_ACCEPTANCE1: readonly string[] = [
 
 /**
  * Batch 2: a deliberately bounded expansion into database / auth / ACL /
- * project / chapter / message-persistence files. Bounded on purpose: re-running
+ * project / message-persistence files. Bounded on purpose: re-running
  * ~600 files tells us nothing new and costs an hour.
  */
 export const BATCH_EXTENDED: readonly string[] = [
@@ -115,7 +112,6 @@ export const BATCH_EXTENDED: readonly string[] = [
 	"server/routes/__tests__/project-acl-gate.test.ts",
 	"server/routes/__tests__/narrators-acl-gate.test.ts",
 	"server/websocket/narrator-ws-acl.test.ts",
-	"tests/server/services/search-chapter-acl.test.ts",
 	// auth / oauth persistence
 	"tests/server/lib/auth.test.ts",
 	"server/lib/__tests__/auth-attempt-limiter.test.ts",
@@ -125,14 +121,10 @@ export const BATCH_EXTENDED: readonly string[] = [
 	"server/middleware/__tests__/auth-oauth-boundary.test.ts",
 	"server/services/__tests__/oauth-grant-service.test.ts",
 	"server/services/__tests__/oauth-resource-access.test.ts",
-	// project / chapter persistence
+	// project persistence
 	"tests/server/routes/admin.test.ts",
 	"tests/server/routes/api.test.ts",
 	"server/routes/__tests__/projects-oauth-runtime.test.ts",
-	"server/services/__tests__/chapter-split.test.ts",
-	"server/services/__tests__/chapter-edge-idempotent.test.ts",
-	"server/services/__tests__/chapter-lifecycle-fixes.test.ts",
-	"tests/server/services/chapter-fork.test.ts",
 	// message persistence
 	"server/services/__tests__/narrator-messages-history.test.ts",
 	"tests/server/services/narrator-message-count.test.ts",
@@ -156,7 +148,6 @@ export const BATCH_STAGE2: readonly string[] = [
 		"server/services/search/__tests__/search-backend-contract.test.ts",
 		"tests/server/services/search.test.ts",
 		"tests/server/services/search-knowledge.test.ts",
-		"tests/server/services/search-chapter-acl.test.ts",
 		"tests/server/services/search-narrator-acl.test.ts",
 		"tests/server/services/search-store-shapes.test.ts",
 		"tests/server/services/recall-search-port.test.ts",

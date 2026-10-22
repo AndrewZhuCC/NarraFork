@@ -279,7 +279,7 @@ describe("postgres runtime on a real PostgreSQL 17", () => {
 						const migrations = await runtime.readMigrationState();
 						expect(migrations.length).toBe(EXPECTED_MIGRATION_COUNT);
 						expect(migrations[0]?.hash).toBeTruthy();
-						await runtime.executor.unsafe(`SELECT 1 FROM "chapters" LIMIT 0`);
+						await runtime.executor.unsafe(`SELECT 1 FROM "narrators" LIMIT 0`);
 						await runtime.executor.unsafe(`SELECT 1 FROM "knowledge_entries" LIMIT 0`);
 
 						// The FTS catalog is complete and the trigger invariant works through this
@@ -296,15 +296,15 @@ describe("postgres runtime on a real PostgreSQL 17", () => {
 							["p1rt-project", now],
 						);
 						await runtime.executor.unsafe(
-							`INSERT INTO chapters (id, project_id, title, description, branch, base_branch, created_at, updated_at)
-						 VALUES ($1, $2, $3, $4, 'b1', 'main', $5, $5)`,
-							["p1rt-chapter", "p1rt-project", "runtime chapter", "via the runtime", now],
+							`INSERT INTO narrators (id, context_project_id, title, created_at, updated_at)
+						 VALUES ($1, $2, $3, $4, $4)`,
+							["p1rt-narrator", "p1rt-project", "runtime session", now],
 						);
 						expect(
 							await runtime.executor.unsafe(
-								`SELECT title FROM "search_chapters" WHERE id = 'p1rt-chapter'`,
+								`SELECT title FROM "search_narrators" WHERE id = 'p1rt-narrator'`,
 							),
-						).toEqual([{ title: "runtime chapter" }]);
+						).toEqual([{ title: "runtime session" }]);
 
 						// Shutdown: close is idempotent and the executor refuses new work immediately.
 						await runtime.close();

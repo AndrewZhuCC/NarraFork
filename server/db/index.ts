@@ -91,7 +91,7 @@ function unavailableSqliteHandle<T>(handle: string): T {
 					`The SQLite "${handle}" handle does not exist while the PostgreSQL backend is ` +
 						"active: no SQLite connection is opened in this mode. This code path is not " +
 						"wired to PostgreSQL yet — the composition seam covers " +
-						"register/knowledge/chapter/archive/search, and the remaining surfaces land " +
+						"register/knowledge/read/search, and the remaining surfaces land " +
 						"with the P2 composition batch.",
 				);
 			},

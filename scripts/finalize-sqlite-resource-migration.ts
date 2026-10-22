@@ -1,11 +1,15 @@
 import { Database } from "bun:sqlite";
 import {
 	generatedModelHistoryTriggerContract,
-	generatedModelHistoryTriggerSuffix,
 	hasModelHistoryBlockSchema,
 	hasModelHistoryRevisionSchema,
+	MODEL_HISTORY_REVISION_CONTRACT,
+	MODEL_HISTORY_REVISION_CONTRACT_V1,
 	MODEL_HISTORY_TRIGGER_TABLES,
+	modelHistoryReinstall,
+	modelHistoryTriggerSuffix,
 	modelHistoryTriggerTables,
+	renderModelHistoryRevisionSql,
 	splitGeneratedModelHistoryTriggers,
 } from "./lib/generated-model-history-triggers";
 
@@ -520,6 +524,80 @@ function tableSignature(db: Database, name: string): string {
 		autoincrement: tokens.some((t) => keyword(t, "AUTOINCREMENT")),
 	});
 }
+/** The machine-rendered model-history SQL around a migration's schema statements. */
+interface ModelHistoryParts {
+	prefix: string;
+	schemaSql: string;
+	suffix: string;
+	/** The contract `suffix` installs. */
+	contract?: string;
+	/** `prefix` + `suffix` are the versioned reinstall around a trigger-table rebuild. */
+	reinstall: boolean;
+}
+/** Byte-exact allowlist, not a grammar relaxation: anything else stays schema SQL, which the
+ * ordinary parser rejects (DROP/CREATE TRIGGER, altered bodies, extra statements). */
+function modelHistoryParts(
+	sql: string,
+	before: ResourceMigrationSnapshot,
+	after: ResourceMigrationSnapshot,
+): ModelHistoryParts {
+	const contract = generatedModelHistoryTriggerContract(before, after, "sqlite");
+	if (contract) {
+		const { schemaSql, triggerSql } = splitGeneratedModelHistoryTriggers(
+			sql,
+			modelHistoryTriggerSuffix("sqlite", contract),
+		);
+		return { prefix: "", schemaSql, suffix: triggerSql, contract, reinstall: false };
+	}
+	const reinstall = modelHistoryReinstall(before, after, "sqlite");
+	if (
+		reinstall &&
+		sql.length >= reinstall.prefix.length + reinstall.suffix.length &&
+		sql.startsWith(reinstall.prefix) &&
+		sql.endsWith(reinstall.suffix)
+	)
+		return {
+			prefix: reinstall.prefix,
+			schemaSql: sql.slice(reinstall.prefix.length, sql.length - reinstall.suffix.length),
+			suffix: reinstall.suffix,
+			contract: MODEL_HISTORY_REVISION_CONTRACT,
+			reinstall: true,
+		};
+	return { prefix: "", schemaSql: sql, suffix: "", reinstall: false };
+}
+/** Tables whose rebuild would drop, or strand, an installed contract's triggers. */
+function modelHistoryGuardedTables(before: ResourceMigrationSnapshot): readonly string[] {
+	if (!hasModelHistoryRevisionSchema(before, "sqlite")) return [];
+	return hasModelHistoryBlockSchema(before, "sqlite")
+		? MODEL_HISTORY_TRIGGER_TABLES
+		: modelHistoryTriggerTables(MODEL_HISTORY_REVISION_CONTRACT_V1);
+}
+function dropsGuardedTable(tokens: Token[], guarded: readonly string[]): boolean {
+	return (
+		keyword(tokens[0], "DROP") &&
+		keyword(tokens[1], "TABLE") &&
+		tokens.length === 3 &&
+		(tokens[2].kind === "identifier" || tokens[2].kind === "word") &&
+		guarded.includes(key(tokens[2].value))
+	);
+}
+/**
+ * The generator's half of the versioned reinstall: a fresh Drizzle batch that rebuilds a
+ * current-contract trigger table is wrapped in the canonical prefix + suffix. Anything else,
+ * including an already wrapped batch, is returned unchanged for the finalizer to judge.
+ */
+export function appendModelHistoryReinstall(
+	sql: string,
+	before: ResourceMigrationSnapshot,
+	after: ResourceMigrationSnapshot,
+): string {
+	const reinstall = modelHistoryReinstall(before, after, "sqlite");
+	if (!reinstall || modelHistoryParts(sql, before, after).reinstall) return sql;
+	const guarded = modelHistoryGuardedTables(before);
+	return statementsOf(sql).some(({ tokens }) => dropsGuardedTable(tokens, guarded))
+		? `${reinstall.prefix}${sql.trim()}${reinstall.suffix}`
+		: sql;
+}
 /** Execute only already-classified schema DDL in two private memory databases. Never run
  * INSERT, arbitrary SQL, ATTACH, user paths, or any user database. SQLite resolves column,
  * FK, PK and index semantics; CHECK/predicate equivalence remains deliberately conservative. */
@@ -527,7 +605,7 @@ function validateTargetDDL(
 	statements: Statement[],
 	before: ResourceMigrationSnapshot,
 	after: ResourceMigrationSnapshot,
-	triggerSql: string,
+	modelHistory: ModelHistoryParts,
 ): void {
 	const actual = new Database(":memory:");
 	let expected: Database | undefined;
@@ -537,6 +615,12 @@ function validateTargetDDL(
 			for (const ddl of snapshotDDL(name, table, before)) actual.exec(ddl);
 		for (const [name, table] of Object.entries(after.tables))
 			for (const ddl of snapshotDDL(name, table, after)) expected.exec(ddl);
+		if (modelHistory.reinstall) {
+			// Replay where the contract is installed: SQLite refuses a rebuild's RENAME while a
+			// trigger still names the dropped table, so this proves the prefix clears them all.
+			actual.exec(renderModelHistoryRevisionSql("sqlite"));
+			actual.exec(modelHistory.prefix);
+		}
 		for (const statement of statements) {
 			const t = statement.tokens;
 			if (keyword(t[0], "PRAGMA") || keyword(t[0], "INSERT")) continue;
@@ -579,12 +663,12 @@ function validateTargetDDL(
 					`Target DDL differs from generated snapshot: ${name} (${differences.join(", ")})`,
 				);
 		}
-		if (triggerSql) {
+		if (modelHistory.suffix) {
 			// Only the byte-exact renderer suffix reaches this seam. Compile each event in
 			// private databases to reject unresolved trigger columns without running DML.
 			for (const db of [actual, expected]) {
-				db.exec(triggerSql);
-				const contract = generatedModelHistoryTriggerContract(before, after, "sqlite");
+				db.exec(modelHistory.suffix);
+				const contract = modelHistory.contract;
 				for (const name of contract ? modelHistoryTriggerTables(contract) : []) {
 					const table = after.tables[name];
 					if (!table) throw new Error(`Missing generated trigger table ${name}`);
@@ -599,6 +683,16 @@ function validateTargetDDL(
 						db.query(`EXPLAIN ${ddl}`).all();
 				}
 			}
+			// The migrated catalog must equal a clean install: the runtime trusts the
+			// contract only on exact trigger text, and the migrator proves it the same way.
+			const triggers = (db: Database) =>
+				db
+					.query<{ name: string; tbl_name: string; sql: string }, []>(
+						"SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+					)
+					.all();
+			if (JSON.stringify(triggers(actual)) !== JSON.stringify(triggers(expected)))
+				throw new Error("Migrated model-history triggers differ from a clean install");
 		}
 	} finally {
 		expected?.close();
@@ -616,9 +710,12 @@ export function finalizeResourceMigration(
 	after: ResourceMigrationSnapshot,
 ): string {
 	if (Buffer.byteLength(sql) > 1024 * 1024) throw new Error("Migration exceeds generator budget");
-	const triggerSuffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
-	const { schemaSql, triggerSql } = splitGeneratedModelHistoryTriggers(sql, triggerSuffix);
+	const modelHistory = modelHistoryParts(sql, before, after);
+	// Token offsets below are positions in the schema SQL, never in the wrapped input.
+	const { schemaSql } = modelHistory;
 	const statements = statementsOf(schemaSql);
+	const guardedTables = modelHistoryGuardedTables(before);
+	let rebuildsTriggerTable = false;
 	const tables = new Map(
 		Object.entries(before.tables).map(([name, table]) => [
 			key(name),
@@ -728,7 +825,7 @@ export function finalizeResourceMigration(
 							end += 2;
 						else throw new Error("Unsupported added FK action");
 					}
-					rendered = `${sql.slice(t[0].start, t[refs.next - 1].end)} ON UPDATE ${fk.onUpdate ?? "no action"} ON DELETE ${fk.onDelete ?? "no action"};`;
+					rendered = `${schemaSql.slice(t[0].start, t[refs.next - 1].end)} ON UPDATE ${fk.onUpdate ?? "no action"} ON DELETE ${fk.onDelete ?? "no action"};`;
 				}
 			} else throw new Error("Unsupported ALTER TABLE SQL");
 		} else if (keyword(t[0], "CREATE") && keyword(t[1], "TABLE")) {
@@ -746,16 +843,14 @@ export function finalizeResourceMigration(
 			tables.set(key(table), new Set(columns.map(key)));
 		} else if (keyword(t[0], "DROP") && keyword(t[1], "TABLE") && t.length === 3) {
 			const name = key(identifier(t[2]));
-			if (
-				hasModelHistoryRevisionSchema(before, "sqlite") &&
-				(hasModelHistoryBlockSchema(before, "sqlite")
-					? MODEL_HISTORY_TRIGGER_TABLES
-					: modelHistoryTriggerTables("model-history-v1")
-				).some((table) => table === name)
-			)
-				throw new Error(
-					"Model-history trigger table rebuild requires a versioned reinstall migration",
-				);
+			if (dropsGuardedTable(t, guardedTables)) {
+				// Only inside the exact canonical reinstall wrapper (current contract only).
+				if (!modelHistory.reinstall)
+					throw new Error(
+						"Model-history trigger table rebuild requires a versioned reinstall migration",
+					);
+				rebuildsTriggerTable = true;
+			}
 			if (!tables.delete(name)) throw new Error("Unknown dropped table");
 		} else if (keyword(t[0], "INSERT")) {
 			if (!keyword(t[1], "INTO")) throw new Error("Unexpected generated copy expressions");
@@ -811,7 +906,7 @@ export function finalizeResourceMigration(
 					throw new Error(`Unbackfilled new required column ${target}.${column}`);
 			}
 			if (!retained.length) throw new Error("Empty generated copy projection");
-			const text = (token: Token) => sql.slice(token.start, token.end);
+			const text = (token: Token) => schemaSql.slice(token.start, token.end);
 			rendered = `INSERT INTO ${text(t[2])}(${retained.map((column) => text(column.target)).join(", ")}) SELECT ${retained.map((column) => text(column.source)).join(", ")} FROM ${text(t[end + 1])};`;
 		} else if (
 			keyword(t[0], "CREATE") &&
@@ -842,17 +937,22 @@ export function finalizeResourceMigration(
 				after.internal?.indexes?.[index.name]?.columns?.[term.value]?.isExpression === true
 			) {
 				constantOneIndexSignature(term.value);
-				rendered = `${sql.slice(t[0].start, term.start)}1${sql.slice(term.end, t.at(-1)?.end)};`;
+				rendered = `${schemaSql.slice(t[0].start, term.start)}1${schemaSql.slice(term.end, t.at(-1)?.end)};`;
 			}
 		} else if (keyword(t[0], "DROP") && keyword(t[1], "INDEX") && t.length === 3) identifier(t[2]);
 		else throw new Error(`Unsupported migration SQL: ${t[0]?.value}`);
 		output.push(rendered);
 	}
+	// One canonical form per schema change: a reinstall that rebuilds no trigger table is noise.
+	if (modelHistory.reinstall && !rebuildsTriggerTable)
+		throw new Error("Model-history reinstall without a trigger table rebuild");
 	const finalizedSchema = `${["PRAGMA foreign_keys=OFF;", ...output, "PRAGMA foreign_keys=ON;"].join("\n--> statement-breakpoint\n")}\n`;
-	const finalized = triggerSql ? `${finalizedSchema.trimEnd()}${triggerSql}` : finalizedSchema;
+	const finalized = `${modelHistory.prefix}${
+		modelHistory.suffix ? `${finalizedSchema.trimEnd()}${modelHistory.suffix}` : finalizedSchema
+	}`;
 	if (Buffer.byteLength(finalized) > 1024 * 1024)
 		throw new Error("Finalized migration exceeds byte budget");
-	validateTargetDDL(statementsOf(finalizedSchema), before, after, triggerSql);
+	validateTargetDDL(statementsOf(finalizedSchema), before, after, modelHistory);
 	return finalized;
 }
 /** Existing history is never repaired implicitly. A missing generation receipt may be
@@ -863,10 +963,9 @@ export function assertResourceMigrationValidated(
 	after: ResourceMigrationSnapshot,
 ): void {
 	const finalized = finalizeResourceMigration(sql, before, after);
-	const suffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
 	const signature = (source: string) =>
 		JSON.stringify(
-			statementsOf(splitGeneratedModelHistoryTriggers(source, suffix).schemaSql).map(({ tokens }) =>
+			statementsOf(modelHistoryParts(source, before, after).schemaSql).map(({ tokens }) =>
 				tokens.map((token) => [
 					token.kind,
 					token.kind === "word" ? token.value.toUpperCase() : token.value,
