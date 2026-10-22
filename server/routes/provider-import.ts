@@ -1,5 +1,6 @@
 import {
 	LOCAL_IMPORT_MAX_RESOLVE_IDS,
+	type LocalProviderDetectResponse,
 	type LocalProviderResolveResponse,
 } from "@shared/local-provider-import";
 import { Hono } from "hono";
@@ -8,6 +9,7 @@ import { ValidationError } from "../lib/errors";
 import { settings } from "../lib/settings";
 import { requireAdmin } from "../middleware/auth";
 import {
+	detectLocalProviderSources,
 	providerIdentity,
 	scanLocalProviderConfigs,
 	summarizeLocalScan,
@@ -35,6 +37,14 @@ function configuredIdentities(): Set<string> {
 			.map((provider) => providerIdentity(provider.protocol, provider.baseUrl, provider.apiKey)),
 	);
 }
+
+// Existence checks only (no file is read): lets the add page decide whether to
+// offer the import option at all.
+providerImportRoutes.get("/local/detect", requireAdmin, async (c) => {
+	const response: LocalProviderDetectResponse = { sources: await detectLocalProviderSources() };
+	c.header("Cache-Control", "no-store");
+	return c.json(response);
+});
 
 providerImportRoutes.post("/local/scan", requireAdmin, async (c) => {
 	const scan = await scanLocalProviderConfigs();
