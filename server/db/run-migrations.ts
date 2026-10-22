@@ -974,7 +974,11 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 				const statements = orderLegacyRequestDumpDrops(originalStatements);
 				const migrationStarted = performance.now();
 				activeMigration = { migrationIndex: index, folderMillis: migration.folderMillis };
-				logger.info("Starting SQLite migration", {
+				// Hundreds of fast migrations run on a cold database. Keep routine progress
+				// out of default stdout so bounded startup consumers still see readiness.
+				// The known large-payload upgrade must remain visible before blocking SQL.
+				const logStart = statements !== originalStatements ? logger.info : logger.debug;
+				logStart("Starting SQLite migration", {
 					...activeMigration,
 					statementCount: statements.length,
 					legacyRequestDumpDropReordered: statements !== originalStatements,
@@ -1062,7 +1066,7 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					migration.folderMillis,
 				]);
 				// This is progress, not a durability claim: a later failure rolls it back.
-				logger.info("SQLite migration executed; awaiting batch commit", {
+				logger.debug("SQLite migration executed; awaiting batch commit", {
 					...activeMigration,
 					durationMs: Math.round(performance.now() - migrationStarted),
 				});

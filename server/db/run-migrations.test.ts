@@ -747,6 +747,74 @@ describe("hash-based migration self-heal", () => {
 		]);
 	});
 
+	test("keeps complete cold-migration default logs within the startup output budget", async () => {
+		sqlite = new Database(":memory:");
+		const info = spyOn(logger, "info");
+		const warn = spyOn(logger, "warn");
+		const error = spyOn(logger, "error");
+		const debug = spyOn(logger, "debug");
+		try {
+			await runMigrations(sqlite);
+			const migrations = readMigrationFiles({
+				migrationsFolder: join(import.meta.dir, "../../drizzle"),
+			});
+			// Replay the real complete journal, not a short fixture or an already-seeded schema.
+			expect(migrations.length).toBeGreaterThan(200);
+			expect(sqlite.prepare("SELECT hash FROM __drizzle_migrations ORDER BY rowid").all()).toEqual(
+				migrations.map(({ hash }) => ({ hash })),
+			);
+
+			// Account for every default-visible call with the logger's JSON envelope, plus
+			// conservative per-line headroom. Do not relax subprocess caps or mute log levels.
+			let defaultLogBytes = 0;
+			for (const [level, calls] of [
+				["info", info.mock.calls],
+				["warn", warn.mock.calls],
+				["error", error.mock.calls],
+			] as const) {
+				for (const [message, data] of calls) {
+					const line = JSON.stringify({
+						ts: "2099-12-31T23:59:59.999+00:00",
+						level,
+						msg: message,
+						...data,
+					});
+					defaultLogBytes += Buffer.byteLength(`${line}\n`, "utf8") + 128;
+				}
+			}
+			expect(defaultLogBytes).toBeGreaterThan(0);
+			expect(defaultLogBytes).toBeLessThan(8 * 1024);
+			expect(error).not.toHaveBeenCalled();
+			const visibleStarts = info.mock.calls.filter(
+				([message]) => message === "Starting SQLite migration",
+			);
+			expect(visibleStarts).toHaveLength(1);
+			expect(visibleStarts[0][1]).toMatchObject({ legacyRequestDumpDropReordered: true });
+			expect(
+				debug.mock.calls.filter(([message]) => message === "Starting SQLite migration"),
+			).toHaveLength(migrations.length - 1);
+			expect(
+				debug.mock.calls.filter(
+					([message]) => message === "SQLite migration executed; awaiting batch commit",
+				),
+			).toHaveLength(migrations.length);
+			expect(
+				info.mock.calls.some(
+					([message]) => message === "SQLite migration executed; awaiting batch commit",
+				),
+			).toBe(false);
+			expect(info).toHaveBeenCalledWith("Applied pending migrations by hash", {
+				applied: migrations.length,
+				stampedWithoutRun: 0,
+			});
+		} finally {
+			debug.mockRestore();
+			error.mockRestore();
+			warn.mockRestore();
+			info.mockRestore();
+		}
+	});
+
 	test("is idempotent — a second run applies nothing", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
@@ -1610,7 +1678,11 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 					statementsAtStart.push(migrationCalls(run.mock.calls).length);
 				}
 			});
-			const debug = spyOn(logger, "debug").mockImplementation(() => {});
+			const debug = spyOn(logger, "debug").mockImplementation((message) => {
+				if (message === "Starting SQLite migration") {
+					statementsAtStart.push(migrationCalls(run.mock.calls).length);
+				}
+			});
 			const error = spyOn(logger, "error").mockImplementation(() => {});
 			try {
 				expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
@@ -1623,12 +1695,20 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 					statementCount: 9,
 					legacyRequestDumpDropReordered: true,
 				});
-				expect(info).toHaveBeenCalledWith("SQLite migration executed; awaiting batch commit", {
+				expect(debug).toHaveBeenCalledWith("SQLite migration executed; awaiting batch commit", {
 					migrationIndex: 0,
 					folderMillis: 1_700_000_000_000,
 					durationMs: expect.any(Number),
 				});
-				expect(debug).toHaveBeenCalledTimes(10);
+				expect(debug).toHaveBeenCalledWith("Starting SQLite migration", {
+					migrationIndex: 1,
+					folderMillis: 1_700_000_000_001,
+					statementCount: 1,
+					legacyRequestDumpDropReordered: false,
+				});
+				expect(
+					debug.mock.calls.filter(([message]) => message === "Starting SQLite migration statement"),
+				).toHaveLength(10);
 				const failedStatement = {
 					migrationIndex: 1,
 					folderMillis: 1_700_000_000_001,
