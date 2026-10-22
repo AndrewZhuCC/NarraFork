@@ -5,12 +5,17 @@
  * Supported tools and the files read (all small, user-owned config files):
  *  - Claude Code:      `$CLAUDE_CONFIG_DIR` or `~/.claude` — `settings.json` /
  *                      `settings.local.json` `env`, plus `primaryApiKey` in `.claude.json`
- *  - Codex:            `$CODEX_HOME` or `~/.codex` — `config.toml` `model_providers`,
- *                      `auth.json` `OPENAI_API_KEY`
+ *  - Codex:            `$CODEX_HOME` or `~/.codex` — `config.toml` `model_providers` and
+ *                      `openai_base_url`, `auth.json` `OPENAI_API_KEY`
  *  - OpenCode:         `$XDG_CONFIG_HOME/opencode` (`~/.config/opencode`) `opencode.json[c]`,
  *                      `$XDG_DATA_HOME/opencode` (`~/.local/share/opencode`) `auth.json`
- *  - DeepSeek Harness: `$DSH_HOME` or `~/.dsh` — `profiles/<profile>/cordis[.patch].yml`,
- *                      legacy `settings.yaml`, keys in `.credentials.yaml`
+ *  - DeepSeek Harness: `$DSH_HOME` or `~/.dsh` — `profiles/<profile>/cordis.patch.yml` and the
+ *                      home `cordis.patch.yml` (`llm-pi-ai` routes, `llm-deepseek`), legacy
+ *                      `settings.yaml`, keys in `.credentials.yaml` / environment / `.env`
+ *
+ * Formats follow the tools' sources (openai/codex `model-provider-info`, `login`
+ * auth storage; deepseek-ai/deepseek-harness `dsh-llm-pi-ai`, `dsh-llm-deepseek`,
+ * `dsh-credentials-local`, app-boot patch layering).
  *
  * Only API-key style credentials are imported. Subscription logins (Claude
  * `.credentials.json`, ChatGPT tokens in Codex `auth.json`, OAuth entries in
@@ -35,7 +40,6 @@ import { getHome } from "../lib/platform";
 /** Config files are tiny; anything larger is not a config file we understand. */
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const MAX_PROFILES = 32;
-const MAX_YAML_SEARCH_DEPTH = 8;
 
 export interface LocalProviderCandidate {
 	id: string;
@@ -289,6 +293,7 @@ export async function scanCodex(ctx: LocalScanContext): Promise<SourceScan> {
 		if (usesOpenaiAuth && apiKey === openaiKey) openaiKeyUsedByCustomProvider = true;
 		const candidate = makeCandidate("codex", `provider:${providerId}`, {
 			name: str(raw.name) ?? providerId,
+			// Current Codex speaks only Responses; `chat` survives in older configs.
 			protocol: raw.wire_api === "chat" ? "completions-compatible" : "openai-responses",
 			baseUrl,
 			apiKey,
@@ -301,10 +306,12 @@ export async function scanCodex(ctx: LocalScanContext): Promise<SourceScan> {
 	// The key in auth.json is an OpenAI key unless a custom provider borrows it
 	// (`requires_openai_auth`), which relays commonly do.
 	if (openaiKey && !openaiKeyUsedByCustomProvider) {
+		// `openai_base_url` repoints the built-in OpenAI provider (often at a relay).
+		const openaiBase = str(config?.openai_base_url) ?? OPENAI_OFFICIAL_BASE;
 		const candidate = makeCandidate("codex", "openai", {
-			name: "OpenAI",
+			name: openaiBase === OPENAI_OFFICIAL_BASE ? "OpenAI" : `Codex (${hostLabel(openaiBase)})`,
 			protocol: "openai-responses",
-			baseUrl: OPENAI_OFFICIAL_BASE,
+			baseUrl: openaiBase,
 			apiKey: openaiKey,
 			configPath: authPath,
 			...(activeModel && (!activeProvider || activeProvider === "openai")
@@ -498,25 +505,135 @@ function protocolFromPiAi(api: string | undefined): LocalImportProtocol | undefi
 }
 
 /**
- * Collect `providers` maps (id → { baseURL, api, apiKeyEnv }) wherever they sit:
- * under the `llm-pi-ai` plugin's `config` in a profile's cordis file, or under a
- * top-level `llm-pi-ai` key in the legacy settings.yaml.
+ * pi-ai catalog routes a profile may name without `api`/`baseURL` (the harness
+ * then uses the installed catalog's endpoint). Hand-declared routes always carry both.
  */
-export function collectHarnessProviders(node: unknown, depth = 0): Array<[string, Json]> {
-	if (depth > MAX_YAML_SEARCH_DEPTH || !node || typeof node !== "object") return [];
-	const out: Array<[string, Json]> = [];
-	if (Array.isArray(node)) {
-		for (const item of node) out.push(...collectHarnessProviders(item, depth + 1));
-		return out;
+const HARNESS_CATALOG_ROUTES: Record<string, KnownProvider> = {
+	anthropic: {
+		name: "Anthropic",
+		protocol: "anthropic-messages",
+		baseUrl: "https://api.anthropic.com",
+	},
+	openai: { name: "OpenAI", protocol: "openai-responses", baseUrl: OPENAI_OFFICIAL_BASE },
+	deepseek: {
+		name: "DeepSeek",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.deepseek.com/v1",
+	},
+	google: {
+		name: "Gemini",
+		protocol: "gemini-compatible",
+		baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+	},
+	openrouter: {
+		name: "OpenRouter",
+		protocol: "completions-compatible",
+		baseUrl: "https://openrouter.ai/api/v1",
+	},
+	groq: {
+		name: "Groq",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.groq.com/openai/v1",
+	},
+	xai: { name: "xAI", protocol: "completions-compatible", baseUrl: "https://api.x.ai/v1" },
+	moonshotai: {
+		name: "Moonshot AI",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.moonshot.ai/v1",
+	},
+	"moonshotai-cn": {
+		name: "Moonshot AI",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.moonshot.cn/v1",
+	},
+	minimax: {
+		name: "MiniMax",
+		protocol: "anthropic-messages",
+		baseUrl: "https://api.minimax.io/anthropic",
+	},
+	"minimax-cn": {
+		name: "MiniMax",
+		protocol: "anthropic-messages",
+		baseUrl: "https://api.minimaxi.com/anthropic",
+	},
+	zai: {
+		name: "Z.ai",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.z.ai/api/coding/paas/v4",
+	},
+	"zai-coding-cn": {
+		name: "Zhipu AI",
+		protocol: "completions-compatible",
+		baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
+	},
+	xiaomi: {
+		name: "Xiaomi MiMo",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.xiaomimimo.com/v1",
+	},
+	together: {
+		name: "Together",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.together.ai/v1",
+	},
+	nvidia: {
+		name: "NVIDIA",
+		protocol: "completions-compatible",
+		baseUrl: "https://integrate.api.nvidia.com/v1",
+	},
+	cerebras: {
+		name: "Cerebras",
+		protocol: "completions-compatible",
+		baseUrl: "https://api.cerebras.ai/v1",
+	},
+};
+
+/** The native DeepSeek adapter speaks Anthropic Messages at this root by default. */
+const HARNESS_DEEPSEEK_BASE = "https://api.deepseek.com/anthropic";
+
+type HarnessRows = Map<string, Json>;
+
+/**
+ * Flatten one cordis patch (a YAML array of `insert: [rows]` blocks and bare
+ * per-id override rows) into rows keyed by id; a later row replaces an earlier
+ * row's whole `config`, as the harness loader does.
+ */
+export function harnessPatchRows(doc: unknown, into: HarnessRows = new Map()): HarnessRows {
+	if (!Array.isArray(doc)) return into;
+	const apply = (row: unknown) => {
+		if (!isRecord(row)) return;
+		const id = str(row.id) ?? str(row.name);
+		if (!id) return;
+		const previous = into.get(id) ?? {};
+		into.set(id, Object.hasOwn(row, "config") ? { ...previous, ...row } : { ...row, ...previous });
+	};
+	for (const item of doc) {
+		if (isRecord(item) && Array.isArray(item.insert)) item.insert.forEach(apply);
+		else apply(item);
 	}
-	for (const [key, value] of Object.entries(node)) {
-		if (key === "providers" && isRecord(value)) {
-			for (const [id, provider] of Object.entries(value)) {
-				if (isRecord(provider) && str(provider.baseURL)) out.push([id, provider]);
-			}
-		} else {
-			out.push(...collectHarnessProviders(value, depth + 1));
+	return into;
+}
+
+function harnessRowConfig(rows: HarnessRows, id: string, packageName: string): Json | undefined {
+	for (const [key, row] of rows) {
+		if (key === id || str(row.name) === packageName) {
+			return isRecord(row.config) ? row.config : undefined;
 		}
+	}
+	return undefined;
+}
+
+/** Minimal dotenv reader: `KEY=value` lines, optional quotes and `export`. */
+export function parseDotenv(text: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const line of text.split(/\r?\n/)) {
+		const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+		if (!match?.[1]) continue;
+		let value = match[2] ?? "";
+		const quoted = /^(["'])(.*)\1$/.exec(value);
+		if (quoted) value = quoted[2] ?? "";
+		else value = value.replace(/\s+#.*$/, "");
+		out[match[1]] = value;
 	}
 	return out;
 }
@@ -527,49 +644,97 @@ export async function scanDeepseekHarness(ctx: LocalScanContext): Promise<Source
 	const found = await ctx.exists(dshHome);
 	if (!found) return { found, candidates, notes: [] };
 
-	const credentialsDoc = await readYaml(ctx, join(dshHome, ".credentials.yaml"));
-	const credentials = isRecord(credentialsDoc) ? credentialsDoc : {};
-	// An exported variable wins over the stored credential, as in the harness.
-	const credential = (name: string) => str(ctx.env[name]) ?? str(credentials[name]);
+	// Credential lookup order, as in dsh-credentials-local: the stored file
+	// (`version: 1` + `refs:`, or the older flat map), the launch environment,
+	// then `$DSH_HOME/.env`.
+	const credentialsPath = join(dshHome, ".credentials.yaml");
+	const credentialsDoc = await readYaml(ctx, credentialsPath);
+	const stored = isRecord(credentialsDoc)
+		? isRecord(credentialsDoc.refs)
+			? credentialsDoc.refs
+			: credentialsDoc
+		: {};
+	const homeEnvText = await ctx.readText(join(dshHome, ".env"));
+	const homeEnv = homeEnvText === null ? {} : parseDotenv(homeEnvText);
+	const credential = (name: string) =>
+		str(stored[name]) ?? str(ctx.env[name]) ?? str(homeEnv[name]);
 
-	const files = [join(dshHome, "settings.yaml"), join(dshHome, "settings.yaml.imported")];
+	// The home-level patch applies over every profile's own patch.
+	const homePatchPath = join(dshHome, "cordis.patch.yml");
+	const homePatch = await readYaml(ctx, homePatchPath);
+	// The legacy settings document held one section per entry id; current
+	// harnesses import it into the profile on first start.
+	const legacyPath = join(dshHome, "settings.yaml");
+	const legacy = await readYaml(ctx, legacyPath);
+
+	const layers: Array<{ path: string; rows: HarnessRows }> = [];
 	const profilesDir = join(dshHome, "profiles");
 	for (const profile of (await ctx.listDirs(profilesDir)).slice(0, MAX_PROFILES)) {
-		files.push(join(profilesDir, profile, "cordis.patch.yml"));
-		files.push(join(profilesDir, profile, "cordis.yml"));
+		const path = join(profilesDir, profile, "cordis.patch.yml");
+		const rows = harnessPatchRows(await readYaml(ctx, path));
+		harnessPatchRows(homePatch, rows);
+		layers.push({ path, rows });
+	}
+	if (layers.length === 0 && homePatch !== null) {
+		layers.push({ path: homePatchPath, rows: harnessPatchRows(homePatch) });
+	}
+	if (isRecord(legacy)) {
+		const rows: HarnessRows = new Map();
+		for (const [id, config] of Object.entries(legacy)) rows.set(id, { id, config });
+		layers.push({ path: legacyPath, rows });
 	}
 
-	const usedCredentials = new Set<string>();
-	for (const path of files) {
-		const doc = await readYaml(ctx, path);
-		for (const [providerId, provider] of collectHarnessProviders(doc)) {
-			const keyName = str(provider.apiKeyEnv);
-			const apiKey = str(provider.apiKey) ?? (keyName ? credential(keyName) : undefined);
+	let deepseekCovered = false;
+	for (const { path, rows } of layers) {
+		const piAi = harnessRowConfig(rows, "llm-pi-ai", "@deepseek-ai/dsh-llm-pi-ai");
+		const routes = isRecord(piAi?.providers) ? piAi.providers : {};
+		for (const [routeId, route] of Object.entries(routes)) {
+			if (!isRecord(route)) continue;
+			const keyName = str(route.apiKeyEnv);
+			const apiKey = keyName ? credential(keyName) : undefined;
 			if (!apiKey) continue;
-			if (keyName) usedCredentials.add(keyName);
-			const protocol = protocolFromPiAi(str(provider.api)) ?? "completions-compatible";
-			const rawBase = str(provider.baseURL) ?? "";
-			const candidate = makeCandidate("deepseek-harness", `provider:${providerId}`, {
-				name: str(provider.name) ?? providerId,
+			const catalog = HARNESS_CATALOG_ROUTES[routeId];
+			const protocol = protocolFromPiAi(str(route.api)) ?? catalog?.protocol;
+			const rawBase = str(route.baseURL) ?? catalog?.baseUrl;
+			if (!protocol || !rawBase) continue;
+			const candidate = makeCandidate("deepseek-harness", `pi-ai:${routeId}`, {
+				name: str(route.displayName) ?? catalog?.name ?? routeId,
 				protocol,
-				// The harness documents Anthropic bases without `/v1`.
+				// Anthropic SDK bases omit `/v1`; NarraFork's include it.
 				baseUrl: protocol === "anthropic-messages" ? anthropicBaseWithVersion(rawBase) : rawBase,
 				apiKey,
 				configPath: path,
 			});
 			if (candidate) candidates.push(candidate);
 		}
+
+		// The native DeepSeek adapter (`llm-deepseek`) is in every base profile and
+		// needs only a key; its config may name another reference or endpoint.
+		const native = harnessRowConfig(rows, "llm-deepseek", "@deepseek-ai/dsh-llm-deepseek-api-key");
+		const nativeKey = credential(str(native?.apiKeyEnv) ?? "DEEPSEEK_API_KEY");
+		if (nativeKey) {
+			deepseekCovered = true;
+			const base = str(native?.baseURL) ?? str(ctx.env.DEEPSEEK_BASE_URL) ?? HARNESS_DEEPSEEK_BASE;
+			const candidate = makeCandidate("deepseek-harness", "llm-deepseek", {
+				name: "DeepSeek",
+				protocol: "anthropic-messages",
+				baseUrl: anthropicBaseWithVersion(base),
+				apiKey: nativeKey,
+				configPath: str(native?.apiKeyEnv) ? path : credentialsPath,
+			});
+			if (candidate) candidates.push(candidate);
+		}
 	}
 
-	// The harness's built-in DeepSeek provider needs no providers block, only a key.
-	const deepseekKey = credential("DEEPSEEK_API_KEY");
-	if (deepseekKey && !usedCredentials.has("DEEPSEEK_API_KEY")) {
-		const candidate = makeCandidate("deepseek-harness", "builtin:deepseek", {
+	// A fresh install may have a saved key before any profile patch exists.
+	const defaultKey = credential("DEEPSEEK_API_KEY");
+	if (!deepseekCovered && defaultKey) {
+		const candidate = makeCandidate("deepseek-harness", "llm-deepseek", {
 			name: "DeepSeek",
-			protocol: "completions-compatible",
-			baseUrl: "https://api.deepseek.com/v1",
-			apiKey: deepseekKey,
-			configPath: join(dshHome, ".credentials.yaml"),
+			protocol: "anthropic-messages",
+			baseUrl: anthropicBaseWithVersion(str(ctx.env.DEEPSEEK_BASE_URL) ?? HARNESS_DEEPSEEK_BASE),
+			apiKey: defaultKey,
+			configPath: credentialsPath,
 		});
 		if (candidate) candidates.push(candidate);
 	}

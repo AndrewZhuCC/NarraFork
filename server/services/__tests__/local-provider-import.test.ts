@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import {
 	anthropicBaseWithVersion,
-	collectHarnessProviders,
+	harnessPatchRows,
 	type LocalScanContext,
 	parseJsonc,
 	providerIdentity,
@@ -64,17 +64,6 @@ describe("helpers", () => {
 				"list": [1, 2,],
 			}`),
 		).toEqual({ url: "https://example.com/v1", list: [1, 2] });
-	});
-
-	test("collectHarnessProviders finds providers in plugin lists and legacy maps", () => {
-		const found = collectHarnessProviders({
-			plugins: [
-				{ id: "llm-pi-ai", config: { providers: { a: { baseURL: "https://a/v1" } } } },
-				{ id: "agent-default-model", config: { provider: "a", model: "m" } },
-			],
-			"llm-pi-ai": { providers: { b: { baseURL: "https://b/v1" }, broken: { api: "x" } } },
-		});
-		expect(found.map(([id]) => id).sort()).toEqual(["a", "b"]);
 	});
 });
 
@@ -177,6 +166,14 @@ env_key = "UNSET_KEY"
 			{ name: "OpenAI", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1" },
 		]);
 
+		const repointed = memoryContext({
+			[h(".codex", "auth.json")]: JSON.stringify({ OPENAI_API_KEY: "sk-relay" }),
+			[h(".codex", "config.toml")]: 'openai_base_url = "https://relay.example/v1"\n',
+		});
+		expect((await scanCodex(repointed)).candidates).toMatchObject([
+			{ name: "Codex (relay.example)", baseUrl: "https://relay.example/v1", apiKey: "sk-relay" },
+		]);
+
 		const relay = memoryContext({
 			[h(".codex", "auth.json")]: JSON.stringify({ OPENAI_API_KEY: "sk-relay" }),
 			[h(".codex", "config.toml")]: `
@@ -248,33 +245,38 @@ describe("OpenCode", () => {
 });
 
 describe("DeepSeek Harness", () => {
-	test("profile cordis patches use apiKeyEnv from .credentials.yaml; env wins", async () => {
+	test("profile patch routes resolve keys: stored refs, then env, then home .env", async () => {
 		const ctx = memoryContext(
 			{
 				[h(".dsh", ".credentials.yaml")]:
-					"REQUESTY_API_KEY: stored-key\nDEEPSEEK_API_KEY: ds-key\n",
+					"version: 1\nrefs:\n  REQUESTY_API_KEY: stored-key\n  OPENAI_API_KEY: stored-openai\nrecords: {}\n",
+				[h(".dsh", ".env")]: "HOMEENV_KEY='from-dotenv'\n",
 				[h(".dsh", "profiles", "default", "cordis.patch.yml")]: `
-plugins:
-  - id: agent-default-model
-    config:
-      provider: requesty
-      model: deepseek/deepseek-v4-pro
-  - id: llm-pi-ai
-    config:
-      providers:
-        requesty:
-          api: openai-completions
-          baseURL: https://router.requesty.ai/v1
-          apiKeyEnv: REQUESTY_API_KEY
-          models:
-            - id: deepseek/deepseek-v4-pro
-        claude-like:
-          api: anthropic-messages
-          baseURL: https://gateway.example
-          apiKeyEnv: GATEWAY_KEY
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      requesty:
+        displayName: Requesty
+        api: openai-completions
+        baseURL: https://router.requesty.ai/v1
+        apiKeyEnv: REQUESTY_API_KEY
+        models:
+          - id: deepseek/deepseek-v4-pro
+      openai:
+        apiKeyEnv: OPENAI_API_KEY
+      gateway:
+        api: anthropic-messages
+        baseURL: https://gateway.example
+        apiKeyEnv: HOMEENV_KEY
+      keyless:
+        api: openai-completions
+        baseURL: https://keyless.example/v1
+- id: hmr
+  disabled: !!js "!ctx.get('profileContext')"
 `,
 			},
-			{ GATEWAY_KEY: "gw-env-key" },
+			{ OPENAI_API_KEY: "env-openai-loses" },
 		);
 		const scan = await scanDeepseekHarness(ctx);
 		expect(
@@ -286,33 +288,80 @@ plugins:
 			})),
 		).toEqual([
 			{
-				name: "requesty",
+				name: "Requesty",
 				protocol: "completions-compatible",
 				baseUrl: "https://router.requesty.ai/v1",
 				apiKey: "stored-key",
 			},
 			{
-				name: "claude-like",
-				protocol: "anthropic-messages",
-				baseUrl: "https://gateway.example/v1",
-				apiKey: "gw-env-key",
+				name: "OpenAI",
+				protocol: "openai-responses",
+				baseUrl: "https://api.openai.com/v1",
+				apiKey: "stored-openai",
 			},
 			{
-				name: "DeepSeek",
-				protocol: "completions-compatible",
-				baseUrl: "https://api.deepseek.com/v1",
-				apiKey: "ds-key",
+				name: "gateway",
+				protocol: "anthropic-messages",
+				baseUrl: "https://gateway.example/v1",
+				apiKey: "from-dotenv",
 			},
 		]);
 	});
 
-	test("legacy settings.yaml top-level llm-pi-ai block is read; missing home is not found", async () => {
+	test("native DeepSeek adapter: Anthropic Messages root, overridable reference and endpoint", async () => {
+		const bare = memoryContext({
+			[h(".dsh", ".credentials.yaml")]: "DEEPSEEK_API_KEY: legacy-flat\n",
+		});
+		expect((await scanDeepseekHarness(bare)).candidates).toMatchObject([
+			{
+				name: "DeepSeek",
+				protocol: "anthropic-messages",
+				baseUrl: "https://api.deepseek.com/anthropic/v1",
+				apiKey: "legacy-flat",
+			},
+		]);
+
+		const configured = memoryContext({
+			[h(".dsh", ".credentials.yaml")]: "version: 1\nrefs:\n  MY_DS: custom\n",
+			[h(".dsh", "profiles", "work", "cordis.patch.yml")]: `
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek-api-key'
+  config:
+    apiKeyEnv: MY_DS
+    baseURL: https://ds-gateway.example/v1
+`,
+		});
+		expect((await scanDeepseekHarness(configured)).candidates).toMatchObject([
+			{
+				protocol: "anthropic-messages",
+				baseUrl: "https://ds-gateway.example/v1",
+				apiKey: "custom",
+			},
+		]);
+	});
+
+	test("home patch replaces a profile row's config; legacy settings.yaml sections are read", async () => {
 		const ctx = memoryContext(
 			{
+				[h(".dsh", "profiles", "default", "cordis.patch.yml")]: `
+- id: llm-pi-ai
+  config:
+    providers:
+      old:
+        api: openai-completions
+        baseURL: https://old.example/v1
+        apiKeyEnv: OLD_KEY
+`,
+				[h(".dsh", "cordis.patch.yml")]: `
+- id: llm-pi-ai
+  config:
+    providers:
+      new:
+        api: openai-completions
+        baseURL: https://new.example/v1
+        apiKeyEnv: NEW_KEY
+`,
 				[h(".dsh", "settings.yaml")]: `
-agent-default-model:
-  provider: bailian
-  model: auto
 llm-pi-ai:
   providers:
     bailian:
@@ -321,30 +370,42 @@ llm-pi-ai:
       apiKeyEnv: BAILIAN_API_KEY
 `,
 			},
-			{ BAILIAN_API_KEY: "bl-key" },
+			{ OLD_KEY: "old", NEW_KEY: "new", BAILIAN_API_KEY: "bl-key" },
 		);
-		expect((await scanDeepseekHarness(ctx)).candidates.map((c) => c.apiKey)).toEqual(["bl-key"]);
+		expect((await scanDeepseekHarness(ctx)).candidates.map((c) => c.apiKey)).toEqual([
+			"new",
+			"bl-key",
+		]);
 		expect((await scanDeepseekHarness(memoryContext({}))).found).toBe(false);
+	});
+
+	test("harnessPatchRows flattens insert blocks and per-id overrides", () => {
+		const rows = harnessPatchRows([
+			{ insert: [{ id: "llm-pi-ai", name: "@deepseek-ai/dsh-llm-pi-ai" }] },
+			{ id: "llm-pi-ai", config: { providers: { a: {} } } },
+		]);
+		expect(rows.get("llm-pi-ai")).toEqual({
+			id: "llm-pi-ai",
+			name: "@deepseek-ai/dsh-llm-pi-ai",
+			config: { providers: { a: {} } },
+		});
 	});
 });
 
 describe("scanLocalProviderConfigs", () => {
 	test("reports every source, dedupes the same key across tools, and keeps ids stable", async () => {
 		const files = {
-			[h(".codex", "config.toml")]: `
-[model_providers.deepseek]
-base_url = "https://api.deepseek.com/v1/"
-experimental_bearer_token = "shared-key"
-wire_api = "chat"
-`,
-			[h(".dsh", ".credentials.yaml")]: "DEEPSEEK_API_KEY: shared-key\n",
+			[h(".codex", "auth.json")]: JSON.stringify({ OPENAI_API_KEY: "shared-key" }),
+			[h(".local", "share", "opencode", "auth.json")]: JSON.stringify({
+				openai: { type: "api", key: "shared-key" },
+			}),
 		};
 		const first = await scanLocalProviderConfigs(memoryContext(files));
 		expect(first.sources).toEqual([
 			{ source: "claude", found: false },
 			{ source: "codex", found: true },
-			{ source: "opencode", found: false },
-			{ source: "deepseek-harness", found: true },
+			{ source: "opencode", found: true },
+			{ source: "deepseek-harness", found: false },
 		]);
 		expect(first.candidates).toHaveLength(1);
 		expect(first.candidates[0]?.source).toBe("codex");
