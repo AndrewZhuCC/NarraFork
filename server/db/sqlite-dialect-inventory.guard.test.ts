@@ -551,6 +551,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	"server/services/narrator-block-sync.ts": ["handle", "sqliteCatalog", "insertOr", "rowid"],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
+	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
+	"server/services/narrator-block-backfill.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+		"insertOr",
+	],
+	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid"],
 	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],

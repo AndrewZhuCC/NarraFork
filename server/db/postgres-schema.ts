@@ -1162,6 +1162,35 @@ export const narratorTurns = pgTable(
 	],
 );
 
+export const narratorBlockBackfill = pgTable(
+	"narrator_block_backfill",
+	{
+		job: text("job").primaryKey().notNull(),
+		cursor: integer("cursor").notNull().default(0),
+		complete: boolean("complete").notNull().default(false),
+		paused: boolean("paused").notNull().default(false),
+		processed: integer("processed").notNull().default(0),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [check("ck_block_backfill_job", sql.raw("\"job\" in ('convert', 'verify')"))],
+);
+
+export const narratorBlockDiagnostics = pgTable(
+	"narrator_block_diagnostics",
+	{
+		messageId: text("message_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		detail: text("detail"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		check("ck_block_diagnostics_kind", sql.raw("\"kind\" in ('mismatch', 'undecodable')")),
+	],
+);
+
 export const narratorQuestions = pgTable(
 	"narrator_questions",
 	{
@@ -4026,8 +4055,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 127,
-  "columnCount": 1762,
+  "tableCount": 129,
+  "columnCount": 1772,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -10754,6 +10783,151 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "name": "ck_turns_status",
           "expression": "\"status\" in ('running', 'completed', 'interrupted', 'failed')"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockBackfill",
+      "name": "narrator_block_backfill",
+      "columns": [
+        {
+          "property": "job",
+          "name": "job",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "cursor",
+          "name": "cursor",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "complete",
+          "name": "complete",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "paused",
+          "name": "paused",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "processed",
+          "name": "processed",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [
+        "ck_block_backfill_job"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_block_backfill_job",
+          "expression": "\"job\" in ('convert', 'verify')"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockDiagnostics",
+      "name": "narrator_block_diagnostics",
+      "columns": [
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_diagnostics_message_id_narrator_messages_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "detail",
+          "name": "detail",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [
+        "ck_block_diagnostics_kind"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_block_diagnostics_kind",
+          "expression": "\"kind\" in ('mismatch', 'undecodable')"
         }
       ],
       "foreignKeys": [],

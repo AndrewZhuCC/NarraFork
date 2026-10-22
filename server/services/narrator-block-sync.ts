@@ -21,15 +21,15 @@
  */
 
 import {
-	isBrokenToolOutput,
-	outputToText,
-	toolOutputImages,
-} from "@shared/agent-protocol/tool-output";
-import { INTERNAL_READ_TOOL_USE_PREFIX } from "@shared/narrator-blocks/decode";
-import { assembleContent, type BlockDraft, splitEnvelope } from "@shared/narrator-blocks/storage";
-import type { CanonicalBlock, EnvelopeRole } from "@shared/narrator-blocks/types";
-// Read through the namespace: the handle is a live binding, and importers that mock
-// `server/db` without it can still load this module.
+	adoptedLedger,
+	blockAssets,
+	blockIndexText,
+	type PlanLedgerRow,
+	parseStored as parse,
+	planEnvelopeBlocks,
+} from "@shared/narrator-blocks/plan";
+import { assembleContent, splitEnvelope } from "@shared/narrator-blocks/storage";
+import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
 import { generateId } from "../lib/id";
@@ -215,14 +215,6 @@ interface EnvelopeRow {
 	bodyFormat: number;
 }
 
-interface LedgerRow {
-	toolUseId: string;
-	toolName: string;
-	inputJson: string | null;
-	outputJson: string | null;
-	status: string;
-}
-
 interface BlockRow {
 	id: string;
 	ordinal: number;
@@ -236,103 +228,16 @@ interface BlockRow {
 	revision: number;
 }
 
-function parse(value: string | null): unknown {
-	if (value === null) return null;
-	try {
-		return JSON.parse(value);
-	} catch {
-		return value;
-	}
-}
-
-function stored(value: unknown): string | null {
-	return value === null || value === undefined ? null : JSON.stringify(value);
-}
-
-/** Characters this block puts in front of the model. */
-function modelChars(block: CanonicalBlock | null): number {
-	if (!block) return 0;
-	switch (block.kind) {
-		case "input":
-		case "context":
-			return block.modelText?.length ?? 0;
-		case "output":
-		case "reasoning":
-			return block.payload.parts.reduce(
-				(sum, part) => sum + (part.type === "text" ? part.text.length : 0),
-				0,
-			);
-		case "tool":
-			return JSON.stringify(block.payload.input ?? null).length;
-	}
-}
-
-const INDEX_RESULT_CHARS = 64 * 1024;
-
-/** The text a block is found by (§4.6). */
-export function blockIndexText(block: CanonicalBlock | null, adoptedOutput?: unknown): string {
-	if (!block) return "";
-	switch (block.kind) {
-		case "input":
-		case "context":
-			if (block.modelText) return block.modelText;
-			if (block.kind === "context") {
-				const body = block.payload.body;
-				return [body?.title, body?.text, body?.message, body?.summary]
-					.filter((value): value is string => typeof value === "string")
-					.join("\n");
-			}
-			return block.payload.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
-		case "output":
-		case "reasoning":
-			return block.payload.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
-		case "tool": {
-			const result =
-				adoptedOutput === undefined ? "" : outputToText(adoptedOutput).slice(0, INDEX_RESULT_CHARS);
-			return [block.subtype, JSON.stringify(block.payload.input ?? null), result]
-				.filter(Boolean)
-				.join("\n");
-		}
-	}
-}
-
-/** Uploads and images a block references, by role (§4.1). */
-function assetsOf(
-	draft: BlockDraft,
-	adoptedOutput: unknown,
-): Array<[assetId: string, role: string]> {
-	const assets: Array<[string, string]> = [];
-	for (const element of draft.payload.raw) {
-		if (!element || typeof element !== "object") continue;
-		const raw = element as Record<string, unknown>;
-		if (raw.type === "image" && typeof raw.imageId === "string")
-			assets.push([raw.imageId, "input_image"]);
-		else if (raw.type === "text_file" && typeof raw.fileId === "string")
-			assets.push([raw.fileId, "input_file"]);
-		else if (raw.type === "image_generation" && typeof raw.savedPath === "string")
-			assets.push([raw.savedPath, "output_image"]);
-	}
-	if (draft.kind === "tool" && !isBrokenToolOutput(adoptedOutput))
-		for (const image of toolOutputImages(adoptedOutput)) assets.push([image.imageId, "tool_image"]);
-	return [...new Map(assets.map((asset) => [asset[0], asset])).values()];
-}
-
-/** Adopted attempt per tool use: the newest execution attempt. */
-function adoptedCalls(messageId: string): LedgerRow[] {
-	const rows = database.sqlite
+/** Non-internal ledger rows of a message, in the order `adoptedLedger` expects. */
+function ledgerRows(messageId: string): PlanLedgerRow[] {
+	return database.sqlite
 		.prepare(
 			`SELECT tool_use_id AS toolUseId, tool_name AS toolName, input_json AS inputJson,
 				output_json AS outputJson, status
 			 FROM narrator_tool_calls WHERE message_id = ? AND is_internal = 0
 			 ORDER BY tool_use_id, execution_attempt, created_at, id`,
 		)
-		.all(messageId) as LedgerRow[];
-	const latest = new Map<string, LedgerRow>();
-	for (const row of rows) {
-		if (row.toolUseId.startsWith(INTERNAL_READ_TOOL_USE_PREFIX)) continue;
-		latest.set(row.toolUseId, row);
-	}
-	return [...latest.values()];
+		.all(messageId) as PlanLedgerRow[];
 }
 
 /**
@@ -356,8 +261,6 @@ export function syncEnvelope(
 	const content = parse(row.contentJson);
 	if (!Array.isArray(content)) return;
 
-	const ledger = adoptedCalls(messageId);
-	const outputs = new Map(ledger.map((call) => [call.toolUseId, parse(call.outputJson)]));
 	const message = {
 		id: row.id,
 		narratorId: row.narratorId,
@@ -367,20 +270,12 @@ export function syncEnvelope(
 		messageUuid: row.messageUuid,
 		origin: row.origin,
 		provider: row.provider,
-		toolCalls: ledger.map((call) => ({
-			toolUseId: call.toolUseId,
-			toolName: call.toolName,
-			inputJson: parse(call.inputJson),
-			outputJson: parse(call.outputJson),
-			status: call.status,
-		})),
 	};
-	const drafts = splitEnvelope(
+	const planned = planEnvelopeBlocks(
 		{ ...message, contentJson: content },
-		{
-			streaming: mode === "streaming",
-		},
-	).blocks;
+		adoptedLedger(ledgerRows(messageId)),
+		{ streaming: mode === "streaming" },
+	);
 
 	const existing = database.sqlite
 		.prepare(
@@ -402,7 +297,8 @@ export function syncEnvelope(
 
 	const now = new Date().toISOString();
 	const kept = new Set<string>();
-	const plans = drafts.map((draft, ordinal) => {
+	const plans = planned.blocks.map((block, ordinal) => {
+		const { draft } = block;
 		const current = byKey.get(draft.key);
 		if (current) kept.add(current.id);
 		let phase = draft.phase;
@@ -414,7 +310,7 @@ export function syncEnvelope(
 			(draft.kind === "output" || draft.kind === "reasoning")
 		)
 			phase = "open";
-		return { draft, ordinal, current, phase, id: current?.id ?? generateId() };
+		return { ...block, ordinal, current, phase, id: current?.id ?? generateId() };
 	});
 
 	const removed = existing.filter((block) => !kept.has(block.id));
@@ -450,19 +346,9 @@ export function syncEnvelope(
 		`UPDATE narrator_tool_calls SET block_id = ?
 		 WHERE message_id = ? AND tool_use_id = ? AND is_internal = 0 AND block_id IS NOT ?`,
 	);
-	let bodyBytes = 0;
 	for (const plan of plans) {
-		const { draft } = plan;
-		const payload = JSON.stringify(draft.payload);
-		const state = stored(draft.state);
-		const byteSize =
-			Buffer.byteLength(payload) +
-			Buffer.byteLength(state ?? "") +
-			Buffer.byteLength(draft.modelText ?? "");
-		bodyBytes += byteSize;
-		const chars = modelChars(draft.canonical);
-		const output = draft.wireId ? outputs.get(draft.wireId) : undefined;
-		const current = plan.current;
+		const { draft, payload, state, byteSize, output, current } = plan;
+		const chars = plan.modelChars;
 		const bodyChanged =
 			!current || current.payload !== payload || current.modelText !== draft.modelText;
 		const changed =
@@ -514,7 +400,8 @@ export function syncEnvelope(
 		}
 		if (!current || changed || output !== undefined) {
 			clearAssets.run(plan.id);
-			for (const [assetId, role] of assetsOf(draft, output)) addAsset.run(plan.id, assetId, role);
+			for (const [assetId, role] of blockAssets(draft, output))
+				addAsset.run(plan.id, assetId, role);
 		}
 		if (draft.kind === "tool" && draft.wireId)
 			bindLedger.run(plan.id, messageId, draft.wireId, plan.id);
@@ -525,7 +412,7 @@ export function syncEnvelope(
 	}
 	database.sqlite
 		.prepare("UPDATE narrator_messages SET body_bytes = ? WHERE id = ? AND body_bytes <> ?")
-		.run(bodyBytes, messageId, bodyBytes);
+		.run(planned.bodyBytes, messageId, planned.bodyBytes);
 }
 
 /**
