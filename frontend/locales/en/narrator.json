@@ -1991,7 +1991,11 @@
 			"spec_context_cleared": "Context cleared",
 			"review_feedback": "Code review",
 			"interrupt_task_guard": "Interrupted-task reminder",
-			"tutorial_lesson": "Tutorial lesson"
+			"tutorial_lesson": "Tutorial lesson",
+			"turn_nudge": "Turn budget",
+			"broken_call": "Invalid tool call",
+			"continue_prompt": "Continue",
+			"workspace_changed": "Workspace changed"
 		},
 		"cadence": {
 			"everyNTools": "every {{n}} tool calls"
@@ -2012,6 +2016,10 @@
 			"noticeSilentProgress": "{{count}} tool calls without a visible reply",
 			"noticeRelaxedPlan": "Still planning — write the plan to {{planFile}}, do not implement yet",
 			"noticePipelineExit": "Pipeline still active — confirm it is still needed",
+			"noticeTurnNudge": "Turn {{turnIndex}} of {{maxTurns}} — time to wrap up",
+			"noticeBrokenCall": "Invalid {{toolNames}} call removed from context — retry with valid input",
+			"noticeContinue": "Asked to continue after an empty reply",
+			"noticeWorkspaceChanged": "Working directory changed — continuing in the new workspace",
 			"tasksCurrent": "Dynamic Spec — {{n}} open task(s)",
 			"tasksEmptyNever": "Dynamic Spec — no tasks created yet",
 			"tasksEmptyDone": "Dynamic Spec — all tasks done, time to reorganize",

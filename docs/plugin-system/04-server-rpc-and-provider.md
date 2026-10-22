@@ -35,10 +35,10 @@ Manifest、权限授予、沙箱和安装包格式由插件系统其他设计文
 **当前事实**：`server/lib/agent/provider.ts` 中的 `ProviderAdapter` 同时负责四类工作：
 
 1. 把 NarraFork 工具定义转换成供应商工具格式：`formatTools`；
-2. 把数据库消息转换成供应商历史格式：`buildHistory`；
-3. 在 Agent Loop 中增量维护历史：`injectSystemPrompt`、`pushUserTurn`、
-   `pushAssistantTurn`、`formatToolResult`；
-4. 执行模型请求：`chat`、`generate`、`generateWithMeta`、
+2. 把消息行转换成供应商历史格式：`buildHistory`（宿主重建与 Agent Loop 的内存
+   transcript 都经它投影，见 `docs/BLOCK_STORAGE-DESIGN.md` §7.3），以及
+   `injectSystemPrompt`；
+3. 执行模型请求：`chat`、`generate`、`generateWithMeta`、
    `generateWithHistory`。
 
 `history`、`tools`、`toolResults` 在现有接口中都是 `unknown[]`，实际内容由各适配器自行约定。
@@ -1586,9 +1586,6 @@ interface RemoteProviderAdapterOptions {
 | `getActiveReasoningSource` | 返回当前 operation 最近声明的 reasoning source；无动态 source 时返回 provider instance 稳定 source |
 | `injectSystemPrompt` | 在规范化 history 前部插入/替换 system message；不发 RPC |
 | `chat` | 创建 operation，调用 `provider.chat`，把 `provider.event` 转成 `ParsedStreamEvent` |
-| `formatToolResult` | 返回规范化 `tool_result` block；不发 RPC |
-| `pushUserTurn` | 把 tool result、image、text 追加到规范化 history；不发 RPC |
-| `pushAssistantTurn` | 按 outputIndex 追加 text/reasoning/tool call 等 block；不发 RPC |
 | `generate` | 调用 `provider.generate`，累计 text，返回字符串 |
 | `generateWithMeta` | 同上，并转换最终 usage/context/metering |
 | `generateWithHistory` | 使用 generate 的 `mode: "history"` |
@@ -1605,7 +1602,7 @@ interface RemoteProviderAdapterOptions {
 - 保留允许重放的 reasoning continuation；
 - 通过 reasoning source 检查丢弃来自不兼容上游的签名；
 - 把无效或只有空内容的 assistant message 过滤掉；
-- 将尾部未配对 tool result 放入 `trailingToolResults`；
+- 尾部未作答的 tool result 留在 history 末尾；
 - 不把数据库 ID、narrator 权限、用户 JWT、原始 sidecar 存储结构暴露给插件；
 - 复用现有 plan body 精简和 history rebuild 入口。
 

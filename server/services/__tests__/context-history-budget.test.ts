@@ -6,14 +6,14 @@ import { buildContextManagementHooks } from "../narrator-session";
 function prepared(): runtimeHistory.PreparedRuntimeHistory {
 	return {
 		history: [],
-		trailingToolResults: [],
 		sourceMessages: [],
 		modelMessages: [],
 		replayedInjectionMessageIds: [],
 		currentText: "",
 		currentInputText: "",
-		isPureToolResultReplay: false,
-		recoveredTrailingUserText: null,
+		currentInputPersisted: false,
+		endsWithToolResults: false,
+		endsWithInput: false,
 	};
 }
 function hooks(signal: AbortSignal) {

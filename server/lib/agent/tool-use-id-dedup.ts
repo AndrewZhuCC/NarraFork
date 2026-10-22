@@ -37,12 +37,10 @@
  *
  *       `Invalid 'input[384].call_id': string too long. Expected maximum length 64`
  *
- * Both are fixed at the two points where history is assembled:
- *
- *  - {@link uniquifyDbMessageToolUseIds} — rebuilds from DB rows (`buildHistory`). Runs on
- *    a copy-on-write message list, so the persisted rows and the UI keep the original ids.
- *  - {@link reserveUniqueToolUseIds} + {@link remapToolResultIds} — the live agent
- *    loop, whose in-memory history grows by `pushAssistantTurn` without a DB rebuild.
+ * All are fixed where every history is assembled — {@link uniquifyDbMessageToolUseIds},
+ * run by `buildAdapterHistory` over the rows of a rebuild or of a loop's own transcript.
+ * It runs on a copy-on-write message list, so the persisted rows and the UI keep the
+ * original ids.
  *
  * Renaming keeps the first occurrence of a duplicate untouched and rewrites later
  * collisions, so the model still sees a stable id for the older calls. Identifiers are
@@ -52,7 +50,6 @@
 
 import { logger } from "../logger";
 import type { DbMessage, DbToolCall } from "./provider";
-import type { AgentToolUse } from "./types";
 
 /**
  * Upper bound for a generated identifier. Several gateways validate `call_id` /
@@ -83,25 +80,6 @@ const MAX_SEQUENTIAL_PROBES = 64;
  * taking every session with it. A bounded loop degrades to a longer id instead.
  */
 const MAX_RANDOM_PROBES = 1000;
-
-/** Keys that carry a tool-use identifier in any provider's request shape. */
-const TOOL_ID_KEYS = new Set([
-	"tool_use_id",
-	"tool_call_id",
-	"toolUseId",
-	"toolCallId",
-	"call_id",
-	"callId",
-	"functionCallId",
-]);
-
-/**
- * Bounds for the generic history scan so a huge payload cannot stall the event loop.
- * The depth is generous on purpose: some gateways nest tool uses four levels down and missing an
- * id would reintroduce the duplicate, whereas scanning a little extra costs nothing.
- */
-const MAX_SCAN_DEPTH = 12;
-const MAX_SCAN_NODES = 200_000;
 
 /**
  * The character set every tool-calling channel accepts.
@@ -334,147 +312,4 @@ export function uniquifyDbMessageToolUseIds(
 	});
 
 	return out;
-}
-
-// ---------------------------------------------------------------------------
-// Live agent-loop path
-// ---------------------------------------------------------------------------
-
-function looksLikeToolIdentity(node: Record<string, unknown>): boolean {
-	const type = typeof node.type === "string" ? node.type : "";
-	if (
-		type === "tool_use" ||
-		type === "function" ||
-		type === "function_call" ||
-		type === "function_call_output" ||
-		type === "tool_result"
-	) {
-		return true;
-	}
-	// Gemini functionCall / provider-native shapes: a named node carrying arguments.
-	return (
-		typeof node.name === "string" && ("input" in node || "arguments" in node || "args" in node)
-	);
-}
-
-/**
- * Collect every tool-use identifier already present in a provider-specific history.
- *
- * The history is an opaque provider payload, so this walks it generically: values under
- * the well-known id keys, plus `id` on nodes that clearly describe a tool call. Over-
- * collecting is harmless — it can only cause one extra (still valid) rename — while
- * missing an id would let a duplicate reach the API. The walk is depth- and node-bounded
- * so a large history cannot stall the event loop.
- */
-export function collectToolUseIdsFromHistory(...payloads: unknown[]): Set<string> {
-	const ids = new Set<string>();
-	let budget = MAX_SCAN_NODES;
-
-	const visit = (node: unknown, depth: number): void => {
-		if (budget <= 0 || depth > MAX_SCAN_DEPTH || node == null) return;
-		budget--;
-		if (Array.isArray(node)) {
-			for (const item of node) visit(item, depth + 1);
-			return;
-		}
-		if (!isRecord(node)) return;
-		const isToolIdentity = looksLikeToolIdentity(node);
-		for (const [key, value] of Object.entries(node)) {
-			if (typeof value === "string") {
-				if (TOOL_ID_KEYS.has(key)) ids.add(value);
-				else if (key === "id" && isToolIdentity) ids.add(value);
-				continue;
-			}
-			if (value != null && typeof value === "object") visit(value, depth + 1);
-		}
-	};
-
-	for (const payload of payloads) visit(payload, 0);
-	return ids;
-}
-
-/**
- * Reserve the identifiers of the current turn's tool uses, allocating a replacement for
- * any that would duplicate an id already present in this run's history or that is not
- * wire-safe.
- *
- * Every reserved id (renamed or not) is recorded in `used`. Returns the
- * `old id → new id` map for the rewritten ones; an empty map means nothing needed a fix.
- *
- * Deliberately non-mutating: the tool-use objects were already broadcast and persisted
- * under their original ids, so the rename must only reach the model-facing history. The
- * caller applies the map to copies of the tool uses and to the formatted tool results via
- * {@link applyToolUseIdRemap} / {@link remapToolResultIds}.
- */
-export function reserveUniqueToolUseIds(
-	toolUses: ReadonlyArray<Pick<AgentToolUse, "toolUseId">>,
-	used: Set<string>,
-): Map<string, string> {
-	const remap = new Map<string, string>();
-	for (const tu of toolUses) {
-		const current = tu.toolUseId;
-		// Sanitize before the collision check so uniqueness is decided on the id that
-		// actually goes on the wire (see uniquifyDbMessageToolUseIds for the same order).
-		let next = toWireSafeToolUseId(current);
-		if (used.has(next)) {
-			// One turn repeating an id maps to a single replacement: the same-turn dedup
-			// already collapsed exact repeats, so a second sighting here is a distinct call.
-			next = allocateUniqueToolUseId(next, used);
-		}
-		used.add(next);
-		if (next !== current) remap.set(current, next);
-	}
-	return remap;
-}
-
-/** Return tool uses with renamed ids applied, leaving the originals untouched. */
-export function applyToolUseIdRemap(
-	toolUses: AgentToolUse[],
-	remap: Map<string, string>,
-): AgentToolUse[] {
-	if (remap.size === 0) return toolUses;
-	return toolUses.map((tu) => {
-		const next = remap.get(tu.toolUseId);
-		return next ? { ...tu, toolUseId: next } : tu;
-	});
-}
-
-/**
- * Apply a tool-use rename to already-formatted, provider-specific tool results.
- *
- * Each provider names the field differently (`tool_use_id`, `tool_call_id`, `call_id`,
- * `toolUseId`), so the rewrite is key-based and bounded rather than provider-specific.
- * Returns how many identifiers were rewritten.
- */
-export function remapToolResultIds(results: unknown[], remap: Map<string, string>): number {
-	if (remap.size === 0) return 0;
-	let rewritten = 0;
-	let budget = MAX_SCAN_NODES;
-
-	const visit = (node: unknown, depth: number): void => {
-		if (budget <= 0 || depth > MAX_SCAN_DEPTH || node == null || typeof node !== "object") return;
-		budget--;
-		if (Array.isArray(node)) {
-			for (const item of node) visit(item, depth + 1);
-			return;
-		}
-		const record = node as Record<string, unknown>;
-		const isToolIdentity = looksLikeToolIdentity(record);
-		for (const [key, value] of Object.entries(record)) {
-			if (typeof value === "string") {
-				const isIdKey = TOOL_ID_KEYS.has(key) || (key === "id" && isToolIdentity);
-				if (!isIdKey) continue;
-				const next = remap.get(value);
-				if (next) {
-					record[key] = next;
-					rewritten++;
-				}
-				continue;
-			}
-			if (value != null && typeof value === "object") visit(value, depth + 1);
-		}
-	};
-
-	visit(results, 0);
-	return rewritten;
 }

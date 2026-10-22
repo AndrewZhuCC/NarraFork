@@ -33,7 +33,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 const realAgent = { ...(await import("../../lib/agent")) };
 mock.module("../../lib/agent", () => ({
 	...realAgent,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 }));
 const { narratorService } = await import("../narrator-service");
 const { deliverInjection } = await import("../narrator-injection");
@@ -223,7 +223,8 @@ async function consume() {
 /**
  * A fresh run of the idle child for its queued human input (the session wake every
  * session uses): the input is persisted once, then the run starts with it as its current
- * input. Returns what the run's current input is, or null when nothing was delivered.
+ * input. Returns what the run's current input is and the text the model receives for it
+ * (carried by the persisted row in history), or null when nothing was delivered.
  */
 async function restart() {
 	sqlite
@@ -242,7 +243,8 @@ async function restart() {
 			provider: "anthropic",
 			currentInput: started[0].text,
 		});
-		return { currentInput: started[0].text, prompt: built.currentText };
+		expect(built.currentInputPersisted).toBe(true);
+		return { currentInput: started[0].text, prompt: built.currentInputText };
 	} finally {
 		activeNarrators.delete("child");
 	}
@@ -334,7 +336,7 @@ describe("last model input mailbox provenance", () => {
 	test("retains provenance after receipt consumption and when rebuilt already consumed", async () => {
 		const history: unknown[] = [];
 		await trackAgentMessageHistory("child", history, [mailbox]);
-		consumeAgentMessageHistory(history, "mailbox input");
+		consumeAgentMessageHistory(history);
 		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(true);
 		await trackAgentMessageHistory("child", history, [{ ...mailbox, injectionConsumedAt: now }]);
 		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(true);
@@ -342,19 +344,11 @@ describe("last model input mailbox provenance", () => {
 		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(false);
 	});
 
-	test("honors the builder's extracted sys tail instead of an older mailbox", async () => {
-		const history: unknown[] = [];
-		const sysMailbox = { ...mailbox, role: "sys" };
-		await trackAgentMessageHistory("child", history, [ordinary, sysMailbox], "mailbox input");
-		expect(isLastModelInputMailbox(history, "mailbox input\n\nmailbox input")).toBe(true);
+	test("a sys row after an older mailbox ends the model input", async () => {
+		const history: unknown[] = [{ role: "user", content: "mailbox input\n\nreminder" }];
+		await trackAgentMessageHistory("child", history, [mailbox, { ...ordinary, role: "sys" }]);
+		expect(isLastModelInputMailbox(history, "")).toBe(false);
 		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(false);
-		await trackAgentMessageHistory(
-			"child",
-			history,
-			[mailbox, { ...ordinary, role: "sys" }],
-			"reminder",
-		);
-		expect(isLastModelInputMailbox(history, "reminder\n\nmailbox input")).toBe(false);
 	});
 
 	test("ignores child subtree and display-only tail rows", async () => {
@@ -378,7 +372,7 @@ describe("Send exact delivery receipts", () => {
 		// An idle resume can fail after preparing this history; preparation is not receipt.
 		expect(prepared?.history).toBeArray();
 		expect(consumedAt(id)).toBeNull();
-		consumeAgentMessageHistory(prepared?.history ?? [], prepared?.prompt ?? "");
+		consumeAgentMessageHistory(prepared?.history ?? []);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(id)).toBeNumber();
 	});
@@ -394,7 +388,7 @@ describe("Send exact delivery receipts", () => {
 		expect(JSON.parse(saved?.content_json ?? "[]")[0].body.items[0].fromToolCallBinding).toEqual(
 			binding,
 		);
-		consumeAgentMessageHistory(prepared?.history ?? [], prepared?.prompt ?? "");
+		consumeAgentMessageHistory(prepared?.history ?? []);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		const receipts = broadcasts.filter(
 			({ event }) =>
@@ -440,11 +434,11 @@ describe("Send exact delivery receipts", () => {
 		];
 		const freshHistory: unknown[] = [];
 		trackAgentMessageHistory("child", freshHistory, reloaded);
-		consumeAgentMessageHistory(freshHistory, saved?.content_text ?? "");
-		consumeAgentMessageHistory(freshHistory, saved?.content_text ?? "");
+		consumeAgentMessageHistory(freshHistory);
+		consumeAgentMessageHistory(freshHistory);
 		const forkHistory: unknown[] = [];
 		trackAgentMessageHistory("sibling", forkHistory, reloaded);
-		consumeAgentMessageHistory(forkHistory, saved?.content_text ?? "");
+		consumeAgentMessageHistory(forkHistory);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(id)).toBe(first.getTime());
 		expect(consumedAt(id, "sibling")).toBeNull();
@@ -678,30 +672,16 @@ describe("Send exact delivery receipts", () => {
 		).toHaveLength(1);
 	});
 
-	test.each([
-		"disp",
-		"system",
-		"missing current prompt",
-		"missing extracted sys prompt",
-	])("filtered or extracted-but-unsent rows are not acknowledged: %s", async (scenario) => {
+	test.each(["disp", "system"])("filtered rows are not acknowledged: %s", async (role) => {
 		const sent = await send();
 		const id = sent.targets[0].deliveryMessageId as string;
 		await consume();
 		const saved = row(id);
 		const history: unknown[] = [];
-		const role =
-			scenario === "missing current prompt"
-				? "user"
-				: scenario === "missing extracted sys prompt"
-					? "sys"
-					: scenario;
-		trackAgentMessageHistory(
-			"child",
-			history,
-			[{ id, narratorId: "child", role, contentJson: JSON.parse(saved?.content_json ?? "[]") }],
-			scenario === "missing extracted sys prompt" ? saved?.content_text : undefined,
-		);
-		consumeAgentMessageHistory(history, "unrelated continuation prompt");
+		trackAgentMessageHistory("child", history, [
+			{ id, narratorId: "child", role, contentJson: JSON.parse(saved?.content_json ?? "[]") },
+		]);
+		consumeAgentMessageHistory(history);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(id)).toBeNull();
 	});
@@ -719,8 +699,8 @@ describe("Send exact delivery receipts", () => {
 				contentJson: [{ type: "text", text: "same words" }],
 			},
 		]);
-		consumeAgentMessageHistory(untracked, "same words");
-		consumeAgentMessageHistory([], "same words");
+		consumeAgentMessageHistory(untracked);
+		consumeAgentMessageHistory([]);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(id)).toBeNull();
 	});
@@ -902,20 +882,15 @@ describe("Send exact delivery receipts", () => {
 		expect(consumedAt(id, "parent")).toBeNull();
 		const source = row(id);
 		const history: unknown[] = [];
-		trackAgentMessageHistory(
-			"parent",
-			history,
-			[
-				{
-					id: id as string,
-					narratorId: "parent",
-					role: "sys",
-					contentJson: JSON.parse(source?.content_json ?? "[]"),
-				},
-			],
-			injected.turnText ?? undefined,
-		);
-		consumeAgentMessageHistory(history, injected.turnText ?? "");
+		trackAgentMessageHistory("parent", history, [
+			{
+				id: id as string,
+				narratorId: "parent",
+				role: "sys",
+				contentJson: JSON.parse(source?.content_json ?? "[]"),
+			},
+		]);
+		consumeAgentMessageHistory(history);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(id, "parent")).toBeNumber();
 		expect(broadcasts.filter(({ event }) => event.type === "message")).toHaveLength(1);
@@ -1291,20 +1266,15 @@ describe("Send exact delivery receipts", () => {
 		expect(teamBlocks[0].modelText).toBe("same");
 		expect(injection.turnText).toBe('<sender kind="agent" id="parent" name="parent" />\nsame');
 		const history: unknown[] = [];
-		trackAgentMessageHistory(
-			"child",
-			history,
-			[
-				{
-					id: first as string,
-					narratorId: "child",
-					role: "sys",
-					contentJson: JSON.parse(row(first)?.content_json ?? "[]"),
-				},
-			],
-			injection.turnText ?? undefined,
-		);
-		consumeAgentMessageHistory(history, injection.turnText ?? "");
+		trackAgentMessageHistory("child", history, [
+			{
+				id: first as string,
+				narratorId: "child",
+				role: "sys",
+				contentJson: JSON.parse(row(first)?.content_json ?? "[]"),
+			},
+		]);
+		consumeAgentMessageHistory(history);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(first)).toBeNumber();
 		expect(row(second)).toBeNull();

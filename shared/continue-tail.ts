@@ -9,9 +9,9 @@
  *                 truncated reply). This one was always recognized.
  *   `sys`       — a server-authored injection (a Dynamic Spec reminder, a finished
  *                 background task, a container coming up). An injection IS content
- *                 addressed to the narrator: every provider's history builder already
- *                 treats a trailing `sys` row as the CURRENT turn rather than as
- *                 background (see `buildAnthropicHistory`'s `trailingUserText`). The
+ *                 addressed to the narrator: every provider's history ends with a
+ *                 trailing `sys` row as the latest input, so it is the CURRENT turn
+ *                 rather than background. The
  *                 button, however, required `assistant`, so an injection landing last
  *                 left the reader with no way to say "go on" — neither Retry (which
  *                 wants a `user` tail) nor Continue appeared.

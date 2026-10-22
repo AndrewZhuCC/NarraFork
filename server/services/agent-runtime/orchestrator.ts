@@ -16,7 +16,6 @@ import {
 	acknowledgePipelineExitConfirmation,
 	clearPipelineStateIfActive,
 } from "../../lib/agent/pipeline-state";
-import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
@@ -68,6 +67,7 @@ import {
 	usesCodexModel,
 	usesStatefulModel,
 } from "../../lib/settings";
+import { sideCarBodyWithText } from "../../lib/sidecar-templates";
 import type { ImageRef, PersistedUserImageBlock, TextFileRef } from "../../lib/uploads";
 import {
 	getImagePath,
@@ -1015,18 +1015,92 @@ export async function runAgentLoopUnlocked(
 			// rebuild request raised before it is satisfied by construction.
 			clearPlanModePromptRebuild(narratorId);
 
-			const preparedHistory = await buildRuntimeHistory({
+			const historyOptions = {
 				narratorId,
 				model: resolved.model,
 				provider: resolved.provider,
-				sourceMessages: rawMessages,
 				currentInput: runState.input.text,
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
 				deadline: historyDeadline,
 				toolLoading: toolLoadingInput(),
+			};
+			let preparedHistory = await buildRuntimeHistory({
+				...historyOptions,
+				sourceMessages: rawMessages,
 			});
-			const { history, trailingToolResults } = preparedHistory;
+
+			// Passive knowledge injection (point A): when this turn carries real user text,
+			// surface relevant knowledge-base entries the triggering user may read.
+			// ACL is resolved by the loop-triggering user (active._currentUserId), not the narrator.
+			// The hit is persisted as a sys row and the history rebuilt to carry it, so this
+			// request and every later rebuild send the same bytes.
+			const knowledgeQuery = preparedHistory.currentInputText;
+			let knowledgePersisted = false;
+			if (knowledgeQuery.trim()) {
+				try {
+					const hits = await knowledgeInjection.resolveInjections(actingUserId, knowledgeQuery, {
+						already: knowledgeInjectedIds,
+						projectId: active._projectId ?? undefined,
+					});
+					if (hits.length > 0) {
+						const block = knowledgeInjection.formatInjections(
+							hits,
+							"Relevant knowledge-base entries were found for this request:",
+						);
+						if (block) {
+							const knowledgeMessage = await messageWriters.persistSystemMessage(
+								narratorId,
+								block,
+								[
+									{
+										...knowledgeInjection.createKnowledgeHintBlock(hits, "user_message", cycleSeq),
+										modelText: block,
+									},
+								],
+							);
+							broadcastToNarrator(narratorId, {
+								type: "message",
+								narratorId,
+								message: {
+									id: knowledgeMessage.id,
+									narratorId,
+									role: knowledgeMessage.role,
+									contentJson: knowledgeMessage.contentJson,
+									contentText: knowledgeMessage.contentText,
+									createdAt: knowledgeMessage.createdAt,
+									seq: knowledgeMessage.seq,
+									children: [],
+								},
+							});
+							knowledgeService.recordInjectionEvents({
+								narratorId,
+								compactSeq: cycleSeq,
+								source: "user_message",
+								hits,
+							});
+							for (const h of hits) knowledgeInjectedIds.add(injectionKey(h));
+							knowledgePersisted = true;
+						}
+					}
+				} catch (err) {
+					logger.warn("Knowledge injection (user message) failed", {
+						narratorId,
+						error: String(err),
+					});
+				}
+			}
+			if (knowledgePersisted) {
+				preparedHistory = await buildRuntimeHistory({
+					...historyOptions,
+					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
+						narratorId,
+						undefined,
+						{ signal: active.abortController.signal, deadline: historyDeadline },
+					),
+				});
+			}
+
 			const receipts = questionModelReceipts(preparedHistory.modelMessages);
 			active._questionAnswerModelReceipts = new Map(receipts.map(({ id, text }) => [id, text]));
 			runState.firstPass = false;
@@ -1750,6 +1824,8 @@ export async function runAgentLoopUnlocked(
 						config.reviewReadOnlyBash,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
+				rebuildRequestHistory: ctxMgmt.rebuildRequestHistory,
+				historyEndsWithToolResults: preparedHistory.endsWithToolResults,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
 				shouldIdleOnReasoningOnly: async () => {
@@ -1775,7 +1851,7 @@ export async function runAgentLoopUnlocked(
 						afterToolsInput?.history === history && afterToolsInput.content === content
 							? afterToolsInput.mailbox
 							: isLastModelInputMailbox(history, content);
-					consumeAgentMessageHistory(history, content);
+					consumeAgentMessageHistory(history);
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
@@ -1945,8 +2021,10 @@ export async function runAgentLoopUnlocked(
 				},
 			};
 
-			// Convert images to base64 for the agent loop (first iteration only)
+			// Convert images to base64 for the agent loop (first iteration only). A persisted
+			// input already carries its images in the projected history.
 			let loopImages: Array<{ format: string; base64: string; position?: number }> | undefined;
+			if (preparedHistory.currentInputPersisted) runState.input.images = undefined;
 			if (runState.input.images?.length) {
 				const resolved: Array<{ format: string; base64: string; position: number }> = [];
 				for (const [position, img] of runState.input.images.entries()) {
@@ -1976,69 +2054,6 @@ export async function runAgentLoopUnlocked(
 				}
 				if (resolved.length > 0) loopImages = resolved;
 				runState.input.images = undefined; // only attach images on the first iteration
-			}
-
-			// Run one agent loop pass
-
-			// Preserve the exact prepared packet: a pure tool replay never gets synthetic text.
-			let effectiveText = preparedHistory.currentText;
-			const _isPureToolResultReplay = !effectiveText.trim() && trailingToolResults.length > 0;
-
-			// Passive knowledge injection (point A): when this turn carries real user text,
-			// surface relevant knowledge-base entries the triggering user may read.
-			// ACL is resolved by the loop-triggering user (active._currentUserId), not the narrator.
-			if (effectiveText.trim()) {
-				try {
-					const hits = await knowledgeInjection.resolveInjections(actingUserId, effectiveText, {
-						already: knowledgeInjectedIds,
-						projectId: active._projectId ?? undefined,
-					});
-					if (hits.length > 0) {
-						const block = knowledgeInjection.formatInjections(
-							hits,
-							"Relevant knowledge-base entries were found for this request:",
-						);
-						if (block) {
-							const knowledgeMessage = await messageWriters.persistSystemMessage(
-								narratorId,
-								block,
-								[
-									{
-										...knowledgeInjection.createKnowledgeHintBlock(hits, "user_message", cycleSeq),
-										modelText: block,
-									},
-								],
-							);
-							broadcastToNarrator(narratorId, {
-								type: "message",
-								narratorId,
-								message: {
-									id: knowledgeMessage.id,
-									narratorId,
-									role: knowledgeMessage.role,
-									contentJson: knowledgeMessage.contentJson,
-									contentText: knowledgeMessage.contentText,
-									createdAt: knowledgeMessage.createdAt,
-									seq: knowledgeMessage.seq,
-									children: [],
-								},
-							});
-							knowledgeService.recordInjectionEvents({
-								narratorId,
-								compactSeq: cycleSeq,
-								source: "user_message",
-								hits,
-							});
-							for (const h of hits) knowledgeInjectedIds.add(injectionKey(h));
-							effectiveText = `${effectiveText}\n\n${projectMessageSenderText(knowledgeMessage, block)}`;
-						}
-					}
-				} catch (err) {
-					logger.warn("Knowledge injection (user message) failed", {
-						narratorId,
-						error: String(err),
-					});
-				}
 			}
 
 			/**
@@ -2227,9 +2242,10 @@ export async function runAgentLoopUnlocked(
 			try {
 				result = await executeAgentLoop({
 					config,
-					userText: effectiveText,
-					history,
-					trailingToolResults,
+					// Only input no persisted row carries; the projected history holds the rest.
+					userText: preparedHistory.currentText,
+					history: { rows: preparedHistory.modelMessages, built: preparedHistory.history },
+					startedWithToolResults: preparedHistory.endsWithToolResults,
 					images: loopImages,
 					eventContext,
 					hooks,
@@ -2259,9 +2275,15 @@ export async function runAgentLoopUnlocked(
 				!active.abortController.signal.aborted
 			) {
 				// Rebuild config, permissions, skills, prompt and file-reference lanes together.
+				// The notice is a row, so the next pass and every rebuild send the same words.
 				active._workspacePassInvalidated = false;
-				runState.input.text =
-					"Working directory changed. Continue using the newly installed workspace context; unstarted calls from the previous pass were not executed.";
+				await deliverInjection(narratorId, {
+					subagent: placement,
+					source: "workspace_changed",
+					...sideCarBodyWithText("workspace_changed", { kind: "notice" }, locale),
+					locale,
+				});
+				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
 			}

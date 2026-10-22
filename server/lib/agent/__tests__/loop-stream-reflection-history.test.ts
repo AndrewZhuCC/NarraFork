@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { outputToText } from "@shared/agent-protocol/tool-output";
 import { z } from "zod/v4";
-import type { ChatParams, ProviderAdapter } from "../provider";
+import type { ChatParams, DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent, PermissionResult } from "../types";
 
@@ -58,15 +59,53 @@ let cancelled: ReturnType<typeof gate>;
 let resolveDecision: ((result: PermissionResult) => void) | undefined;
 const pendingDangerReflections = new Map<string, Record<string, unknown>>();
 
+type Block = { type?: string; id?: string; name?: string; text?: string };
+
+/** A minimal wire format over the projected rows: inputs, steps and settled results. */
+function turnsOf(row: DbMessage): unknown[] {
+	const blocks = Array.isArray(row.contentJson) ? (row.contentJson as Block[]) : [];
+	if (row.role !== "assistant") {
+		const images = blocks.filter((block) => block.type === "image").length;
+		return [{ role: "user", content: row.contentText ?? "", ...(images ? { images } : {}) }];
+	}
+	const settled = (row.toolCalls ?? []).filter((call) => call.status !== "running");
+	return [
+		{
+			role: "assistant",
+			content: blocks.map((block) => (block.type === "text" ? block.text : "")).join(""),
+			toolUses: blocks.filter((block) => block.type === "tool_use").map((block) => block.id),
+		},
+		...(settled.length
+			? [
+					{
+						role: "tool",
+						results: settled.map((call) => ({
+							toolUseId: call.toolUseId,
+							output: outputToText(call.outputJson),
+							isError: call.status === "fail",
+						})),
+					},
+				]
+			: []),
+	];
+}
+
+/** The input a request ends with, when its last entry is one. */
+function lastInput(history: unknown[]): string | undefined {
+	const last = history.at(-1) as { role?: string; content?: string } | undefined;
+	return last?.role === "user" ? last.content : undefined;
+}
+
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({ history: rows.flatMap(turnsOf) }),
 	injectSystemPrompt: (history, content) => {
 		history.unshift({ role: "system", content });
 	},
 	async *chat(params) {
 		// The real wrapper constructs the reflection prompt; only parent inputs are scripted.
-		if (![USER_TEXT, INJECTION, ""].includes(params.content)) {
+		const input = lastInput(params.history);
+		if (input !== undefined && input !== USER_TEXT && input !== INJECTION) {
 			reflectionHistories.push(clone(params.history));
 			parentHistoryAtReflection = clone(targetHistory ?? []);
 			streamFinishedAtReflection = targetStreamFinished;
@@ -94,14 +133,6 @@ const provider: ProviderAdapter = {
 		streamHeld.resolve();
 		await endStream.promise;
 		targetStreamFinished = true;
-	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: (history, content, model, toolResults, images) => {
-		history.push(clone({ role: "user", content, model, toolResults, images }));
-		if (history === targetHistory) userCommitted.resolve();
-	},
-	pushAssistantTurn: (history, content, toolUses) => {
-		history.push(clone({ role: "assistant", content, toolUses }));
 	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
@@ -179,10 +210,7 @@ beforeEach(() => {
 	pendingDangerReflections.clear();
 });
 
-function run(
-	initialToolResults: unknown[] = [],
-	images?: Array<{ format: string; base64: string }>,
-) {
+function run(images?: Array<{ format: string; base64: string }>) {
 	const controller = new AbortController();
 	const events: AgentEvent[] = [];
 	let injectionDelivered = false;
@@ -239,8 +267,14 @@ function run(
 		},
 	};
 	const done = (async () => {
-		for await (const event of agentLoop(config, USER_TEXT, [], initialToolResults, images)) {
+		for await (const event of agentLoop(config, USER_TEXT, { rows: [] }, images)) {
 			events.push(event);
+			// The turn's input joins the transcript once the model has answered it.
+			if (
+				event.type === "assistant_message" &&
+				event.toolUses.some((tu) => tu.toolUseId === "tu-danger")
+			)
+				userCommitted.resolve();
 			if (event.type === "block_complete" && event.block.type === "tool_use") {
 				event.onToolPersisted?.({ toolCallId: event.block.toolUseId, attempt: 1 });
 			}
@@ -266,11 +300,8 @@ describe("streaming danger reflection history", () => {
 	for (const testMode of ["first", "second", "late"] as const) {
 		test(`${testMode}: reflection receives the current input exactly once without mutating the active request`, async () => {
 			mode = testMode;
-			const initialToolResults = [
-				{ toolUseId: "tu-initial", output: "initial authorization", isError: false },
-			];
 			const images = [{ format: "png", base64: "ZmFrZS1pbWFnZQ==" }];
-			const runState = run(initialToolResults, images);
+			const runState = run(images);
 			let completed = false;
 			try {
 				await waitFor(streamHeld.promise);
@@ -289,28 +320,30 @@ describe("streaming danger reflection history", () => {
 				if (!targetHistory) throw new Error("Parent history was not captured");
 				expect(streamFinishedAtReflection).toBe(mode === "late");
 				expect(reflectionHistory.slice(0, snapshot.length)).toEqual(snapshot);
-				if (mode !== "late") {
-					expect(targetStreamFinished).toBe(false);
-					expect(parentCalls[targetIndex].history).toBe(targetHistory);
-					expect(parentHistoryAtReflection).toEqual(snapshot);
-					expect(targetHistory).toEqual(snapshot);
-				} else {
-					expect(reflectionHistory).toEqual(parentHistoryAtReflection);
-				}
-				const currentTurn = {
-					role: "user",
-					content: mode === "second" ? INJECTION : USER_TEXT,
-					model: "test:model",
-					toolResults:
-						mode === "second"
-							? [{ toolUseId: "tu-previous", output: "fake result: fake previous", isError: false }]
-							: initialToolResults,
-					images: mode === "second" ? undefined : images,
-				};
-				expect(reflectionHistory).toEqual([...snapshot, currentTurn]);
+				if (mode !== "late") expect(targetStreamFinished).toBe(false);
+				// The active request is never written into, before or after its input commits.
+				expect(parentCalls[targetIndex].history).toBe(targetHistory);
+				expect(parentHistoryAtReflection).toEqual(snapshot);
+				expect(targetHistory).toEqual(snapshot);
+				// The parent's request ends with its current input, exactly once; the
+				// reflection's request is that request plus its own prompt.
+				const currentTurn =
+					mode === "second"
+						? { role: "user", content: INJECTION }
+						: { role: "user", content: USER_TEXT, images: 1 };
+				expect(snapshot.at(-1)).toEqual(currentTurn);
+				const inputs = JSON.stringify(snapshot).split(mode === "second" ? INJECTION : USER_TEXT);
+				expect(inputs).toHaveLength(2);
+				expect(reflectionHistory).toHaveLength(snapshot.length + 1);
+				expect(lastInput(reflectionHistory)).toContain("Fake danger requiring reflection");
+				expect(parentCalls[targetIndex].content).toBe("");
 				if (mode === "second") {
-					expect(parentCalls[1].content).toBe(INJECTION);
-					expect(parentCalls[1].toolResults).toEqual(currentTurn.toolResults);
+					expect(snapshot.at(-2)).toEqual({
+						role: "tool",
+						results: [
+							{ toolUseId: "tu-previous", output: "fake result: fake previous", isError: false },
+						],
+					});
 					expect(executed).toEqual(["fake previous"]);
 				}
 				endStream.resolve();

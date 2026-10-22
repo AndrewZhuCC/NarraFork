@@ -5220,43 +5220,6 @@ const narratorMessageQueriesUnlocked = {
 		return deleteBlockSelection(narratorId, blocks, opts);
 	},
 
-	async removeCompactingMessage(narratorId: string, messageId: string) {
-		db.transaction((tx) => {
-			const ref = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				})
-				.sync();
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-					columns: { contentJson: true },
-				})
-				.sync();
-			if (!ref || !msg) return;
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (compactBlock?.status === "compacting") {
-				throw new AppError(
-					"A running compact must be cancelled before its marker can be removed",
-					409,
-					"COMPACT_IN_PROGRESS",
-				);
-			}
-			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
-			const remainingRef = tx.query.narratorMessageRefs
-				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
-				.sync();
-			if (!remainingRef) {
-				tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
-				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
-			}
-		});
-	},
-
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
 		const result = db.transaction((tx) => {
 			const ref = tx.query.narratorMessageRefs
@@ -5407,7 +5370,6 @@ export const narratorMessageQueries = {
 	deleteDanglingReasoningMessage: admittedMutation(
 		narratorMessageQueriesUnlocked.deleteDanglingReasoningMessage,
 	),
-	removeCompactingMessage: admittedMutation(narratorMessageQueriesUnlocked.removeCompactingMessage),
 	updateCompactSummary: admittedMutation(narratorMessageQueriesUnlocked.updateCompactSummary),
 	dismissSpecCarryoverMessage: admittedMutation(
 		narratorMessageQueriesUnlocked.dismissSpecCarryoverMessage,

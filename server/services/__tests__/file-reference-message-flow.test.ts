@@ -370,8 +370,9 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				expect(saved.contentText).toBe(text);
 				expect(getFileReferenceSnapshots(saved.contentJson)).toEqual([snapshot()]);
 				expectMetadataOnlyFrames();
-				const recovered = session.resolvePoppedTrailingUserText([saved]);
-				expect(recovered).toContain(snapshot().snapshotText);
+				// The saved row carries its frozen bytes into the model history.
+				const [projected] = projectFileReferencesForModel([saved as DbMessage]);
+				expect(projected.contentText).toContain(snapshot().snapshotText);
 			}
 		});
 

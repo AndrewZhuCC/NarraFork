@@ -33,15 +33,11 @@ const adapter = {
 	formatTools: () => [],
 	buildHistory: async (messages: Array<{ role: string; contentJson: unknown }>) => ({
 		history: messages.map((message) => ({ role: message.role, content: message.contentJson })),
-		trailingToolResults: [],
 	}),
 	injectSystemPrompt: () => {},
 	chat: () => {
 		throw new Error("Question principal test must not contact a model");
 	},
-	formatToolResult: () => ({}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 } as unknown as ProviderAdapter;
 const unregister = provider.registerExternalProviderResolver({
@@ -259,10 +255,6 @@ describe("late async answers retain their durable execution principal", () => {
 			}
 			return snapshot;
 		});
-		spyOn(adapter, "pushUserTurn").mockImplementation((history, content, _model, results) => {
-			history.push({ role: "user", content, toolResults: results });
-		});
-		spyOn(adapter, "pushAssistantTurn").mockImplementation(() => {});
 		spyOn(adapter, "chat").mockImplementation(async function* (params) {
 			params.onRequestStart?.();
 			const active = activeNarrators.get(CHILD);

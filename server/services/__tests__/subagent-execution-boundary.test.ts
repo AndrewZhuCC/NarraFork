@@ -328,8 +328,8 @@ describe("subagent logical-run receipts", () => {
 					createdAt: now,
 					updatedAt: now,
 				});
-				const service = (await import("../narrator-service")).narratorService;
-				spyOn(service, "updateToolCallResult").mockRejectedValue(
+				const { narratorStore } = await import("../narrator-store");
+				spyOn(narratorStore, "settleTool").mockRejectedValue(
 					new Error("result persistence failed"),
 				);
 			}
@@ -419,10 +419,7 @@ describe("subagent logical-run receipts", () => {
 			});
 			const agent = await import("../../lib/agent");
 			spyOn(agent, "buildHistory").mockResolvedValue({
-				history: [],
-				trailingToolResults: [
-					{ type: "tool_result", toolUseId: "denied-write", output: "written" },
-				],
+				history: [{ type: "tool_result", toolUseId: "denied-write", output: "written" }],
 			});
 			// The continuation after a successful retry is an ordinary run start; observe it.
 			const runModule = await import("../agent-runtime/run");

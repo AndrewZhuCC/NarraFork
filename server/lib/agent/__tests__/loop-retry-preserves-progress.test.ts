@@ -43,7 +43,7 @@ function transientError(): ApiError {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -56,9 +56,6 @@ const testProvider: ProviderAdapter = {
 		if (typeof script === "function") script();
 		else for (const event of script) yield event;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -110,7 +107,7 @@ async function runLoop(
 	sentRequests = [];
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(makeConfig(ac.signal, overrides), prompt, [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal, overrides), prompt, { rows: [] })) {
 		events.push(event);
 	}
 	return events;
@@ -151,7 +148,7 @@ describe("请求发起用户快照", () => {
 		};
 		try {
 			const starts: AgentEvent[] = [];
-			for await (const event of agentLoop(config, "hello", [])) {
+			for await (const event of agentLoop(config, "hello", { rows: [] })) {
 				if (event.type === "api_request_start") starts.push(event);
 			}
 			expect(starts).toHaveLength(1);
@@ -229,7 +226,7 @@ describe("重试不得丢弃已产生的工具进展", () => {
 							},
 						}),
 						"fill the input",
-						[],
+						{ rows: [] },
 					)) {
 						events.push(event);
 						if (mode === "abortBefore" && event.type === "assistant_message") ac.abort();
@@ -298,7 +295,7 @@ describe("重试不得丢弃已产生的工具进展", () => {
 			for await (const event of agentLoop(
 				makeConfig(ac.signal, { maxTransientRetries: 3 }),
 				"read the file",
-				[],
+				{ rows: [] },
 			)) {
 				events.push(event);
 			}
@@ -378,11 +375,9 @@ describe("重试不得丢弃已产生的工具进展", () => {
 			sentRequests = [];
 			const ac = new AbortController();
 			const events: AgentEvent[] = [];
-			for await (const event of agentLoop(
-				makeConfig(ac.signal, { maxTransientRetries: 3 }),
-				"go",
-				[],
-			)) {
+			for await (const event of agentLoop(makeConfig(ac.signal, { maxTransientRetries: 3 }), "go", {
+				rows: [],
+			})) {
 				events.push(event);
 			}
 

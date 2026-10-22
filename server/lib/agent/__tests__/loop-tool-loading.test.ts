@@ -26,7 +26,7 @@ let script: Array<() => Record<string, unknown>> = [];
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools.map(({ name }) => ({ name })),
 	toolLoadingTarget: () => ({ protocol: "anthropic-messages" }),
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		requests.push({
@@ -38,12 +38,6 @@ const testProvider: ProviderAdapter = {
 		const next = script.shift();
 		yield next ? next() : { text: "done" };
 	},
-	formatToolResult: (toolUseId, output, isError) => {
-		toolOutputs.push(output);
-		return { toolUseId, output, isError };
-	},
-	pushAssistantTurn: () => {},
-	pushUserTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -101,8 +95,8 @@ function makeConfig(overrides: Partial<AgentConfig>): AgentConfig {
 }
 
 async function drain(config: AgentConfig): Promise<void> {
-	for await (const _event of agentLoop(config, "go", [])) {
-		// Run the loop to completion.
+	for await (const event of agentLoop(config, "go", { rows: [] })) {
+		if (event.type === "tool_result") toolOutputs.push(event.output);
 	}
 }
 
@@ -126,7 +120,7 @@ describe("loop tool loading", () => {
 				// A compact folds the load into the new epoch's base set.
 				onBeforeTurn: async () => ({
 					history: [],
-					pendingToolResults: [],
+					rows: [],
 					toolLoading: state([BASE, LOADED], [], [BASE, LOADED]),
 				}),
 			}),

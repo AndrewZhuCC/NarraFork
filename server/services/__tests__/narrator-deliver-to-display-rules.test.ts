@@ -117,7 +117,7 @@ describe.each(shapes)("$name", (shape) => {
 		const build = spyOn(agent, "buildHistory").mockImplementation(async (messages) => {
 			for (const message of messages)
 				seen.push({ id: message.id, parentToolUseId: message.parentToolUseId ?? null });
-			return { history: [], trailingToolResults: [] } as never;
+			return { history: [] } as never;
 		});
 		const resolve = spyOn(agent, "resolveProviderAndModel").mockImplementation(
 			() =>
@@ -151,7 +151,6 @@ test("history estimate is the same for a delegated and a parentless session with
 					role: "user",
 					content: `${message.id}:${message.parentToolUseId ?? "top"}`,
 				})),
-				trailingToolResults: [],
 			}) as never,
 	);
 	const resolve = spyOn(agent, "resolveProviderAndModel").mockImplementation(

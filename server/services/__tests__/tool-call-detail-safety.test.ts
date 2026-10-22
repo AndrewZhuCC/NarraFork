@@ -20,6 +20,7 @@ import { runtimePublication } from "../agent-runtime/publication";
 import { controlRun } from "../agent-runtime/run";
 import { narratorPersistence } from "../narrator-persistence";
 import { narratorService } from "../narrator-service";
+import { narratorStore } from "../narrator-store";
 import * as subagentFileChanges from "../subagent-file-changes";
 
 const createdUsers: string[] = [];
@@ -980,10 +981,7 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 			}).publication!;
 			await controlRun(f.subagent.id, { kind: "hold" });
 			if (failure === "binding") removeRef(f.parent.messageId, f.own.id);
-			else
-				spyOn(narratorService, "updateToolCallResult").mockRejectedValueOnce(
-					new Error("write failed"),
-				);
+			else spyOn(narratorStore, "settleTool").mockRejectedValueOnce(new Error("write failed"));
 			const app = appFor(f.own.ownerUserId);
 			const failed = await app.request(`/api/narrators/${f.subagent.id}/stop-takeover`, {
 				method: "POST",

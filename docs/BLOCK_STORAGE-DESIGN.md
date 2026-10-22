@@ -878,7 +878,7 @@ AskUserQuestion 的作答不走 `patchState`：它是 attempt 的执行输入，
 | assistant 编辑 / 删除 / 回滚 | `editBlock`、`deleteBlocks`；共享则 COW | 显式操作，允许改写前缀；编辑清空骨架（§5.5） |
 | 翻译 | `patchState`（按 part） | 不触发 revision，前缀不变 |
 | 跨 provider 切换 | 下一次请求前 `openEpoch(reason = target)` | 旧块的凭据按携带策略降级或丢弃（§7.4）；新纪元完整重建 |
-| reflection 循环 | 不写块。reflection 请求 = 父请求的线上前缀 + 只在内存里的后缀，工具表沿用父请求的快照（`loop.ts:1399-1401`） | 结论经父侧 tool 块的结果（账本）回到历史；reflection 自己的轮次不入库，与现状相同（`loop.ts:1352-1385` 关掉了它的持久化回调） |
+| reflection 循环 | 不写块。reflection 拿到父请求所投影的行（父 transcript + 当前轮输入），自己的 prompt 与纠正轮写进它的内存 transcript，经同一投影发出，工具表沿用父请求的快照；前缀与父请求逐字节相同 | 结论经父侧 tool 块的结果（账本）回到历史；reflection 自己的轮次不入库，与现状相同（关掉了它的持久化回调） |
 | 内部执行（`internal_read_`） | 只写账本行，`block_id` 为 null，带内部标记 | 不投影（§3.7） |
 | `/bash` | `input`（`model_text` = 命令）→ 合成 assistant 步，一个 `issuer = "user"` 的 tool 块，`cause_block_id` 指回输入 | 不再有只给显示用的 `tool_result` 块 |
 | plan mode | 进入 / 退出写 `context/plan` 标记；system 中的 plan 段冻结，变化追加提醒 | 工具描述的 plan 改写见 §7.7 |
@@ -1050,6 +1050,13 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 - loop 持有一个 `HistoryView`。store 写入块之后，把**同一个规范块对象**追加进 view。
 - 每次发请求都调用 `toTurns` 和 `toWire`。
 - provider 接口删去 `pushAssistantTurn`、`pushUserTurn`、`formatToolResult`、`buildHistory`，只剩 `toWire` 和 `chat(wire)`。
+
+**P0 的实现**（块表之前，行仍是 `DbMessage`）
+- 行 → provider 历史只有一个入口：`buildAdapterHistory`（`server/lib/agent/history-build.ts`），宿主重建与 loop 投影都走它。
+- loop 持有 `LoopTranscript`（`server/lib/agent/loop-transcript.ts`）：与 store 相同写入点、相同行形状的内存行（输入行、带账本的 assistant 步、结果结算）。宿主的行作为初值，每次重建替换它。
+- 有宿主时，首个请求用宿主构造的历史，之后每个请求用 `rebuildRequestHistory`（DB 行）；没有宿主（reflection、搜索探针）或重建失败时，请求就是 transcript 的投影，`content` 为空。
+- provider 接口已删去 `pushAssistantTurn`、`pushUserTurn`、`formatToolResult`，`BuiltHistory.trailingToolResults` 一并删除；`buildHistory` 暂作第二段入口，P1 改为 `toWire`。
+- loop 内的 tool_use id 重映射随之删除：重复或不合规的 id 由投影里的 `uniquifyDbMessageToolUseIds` 统一处理。
 - loop 内不再拼接字符串。当前轮由哪些单元组成、以什么顺序合并，完全由 seq 和第一段的分组规则决定。现在由三处各自拼接：`history.ts:238-243`、`orchestrator.ts:2007`、`loop.ts:3309-3311`。
 
 **性能与缓存**

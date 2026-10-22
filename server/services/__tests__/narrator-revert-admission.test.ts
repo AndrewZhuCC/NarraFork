@@ -72,7 +72,7 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	// Reexecution now prepares provider history before dispatching the tool. Keep
 	// the real runtime/admission path, but do not require a configured upstream.
-	spyOn(agent, "buildHistory").mockResolvedValue({ history: [], trailingToolResults: [] });
+	spyOn(agent, "buildHistory").mockResolvedValue({ history: [] });
 	const now = new Date().toISOString();
 	for (const id of [ROOT, OTHER]) {
 		db.insert(narrators)

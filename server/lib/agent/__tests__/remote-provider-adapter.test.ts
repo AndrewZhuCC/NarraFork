@@ -14,6 +14,7 @@ import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared
 import { createRequestRecording, RequestRecorderClient } from "../../request-recorder";
 import type { RecorderOperation } from "../../request-recorder-protocol";
 import { settings } from "../../settings";
+import { LoopTranscript } from "../loop-transcript";
 import type { ChatParams, DbMessage } from "../provider";
 import { RemoteProviderAdapter, type RemoteProviderRpcClient } from "../remote-provider-adapter";
 import { ApiRequestDumpCollector } from "../request-dump";
@@ -161,7 +162,7 @@ describe("RemoteProviderAdapter", () => {
 				},
 			],
 			contentText: "done",
-			parentToolUseId: "parent-secret",
+			parentToolUseId: null,
 			messageUuid: "uuid-secret",
 			toolCalls: [
 				{
@@ -176,55 +177,52 @@ describe("RemoteProviderAdapter", () => {
 
 		const result = await adapter.buildHistory([message], "remote:model-1");
 		const serialized = JSON.stringify(result);
-		expect(result.history).toHaveLength(1);
+		expect(result.history).toHaveLength(2);
 		expect(result.history[0]).toMatchObject({ role: "assistant" });
-		expect(result.trailingToolResults).toEqual([
-			{
-				type: "tool_result",
-				toolUseId: "call-1",
-				name: "Read",
-				content: [{ type: "text", text: "contents" }],
-				isError: false,
-			},
-		]);
+		expect(result.history[1]).toEqual({
+			role: "tool",
+			content: [
+				{
+					type: "tool_result",
+					toolUseId: "call-1",
+					name: "Read",
+					content: [{ type: "text", text: "contents" }],
+					isError: false,
+				},
+			],
+		});
 		expect(serialized).not.toContain("db-secret-id");
 		expect(serialized).not.toContain("narrator-secret");
 		expect(serialized).not.toContain("should-not-cross-rpc");
 		expect(serialized).not.toContain("requestPermission");
 	});
 
-	test("push methods and tool results keep canonical roles and media blocks", () => {
+	test("history keeps canonical roles and media blocks", async () => {
 		const adapter = makeAdapter(makeRpc());
-		const history: unknown[] = [];
+		const transcript = new LoopTranscript();
+		transcript.appendStep([
+			{ type: "tool_use", toolUseId: "call-1", name: "Read", input: { path: "b" } },
+		]);
+		transcript.settleTool("call-1", {
+			output: "output",
+			isError: true,
+			images: [{ format: "png", base64: "abc" }],
+		});
+		transcript.appendInput("Question", [{ format: "jpeg", base64: "def" }]);
+		transcript.appendStep([
+			{ type: "tool_use", toolUseId: "call-2", name: "Write", input: { path: "a" } },
+			{ type: "text", text: "Answer" },
+		]);
+		transcript.settleTool("call-2", { output: "written" });
+		const { history } = await adapter.buildHistory(transcript.rows, "remote:model-1");
 		adapter.injectSystemPrompt(history, "System instruction", "remote:model-1");
-		adapter.pushUserTurn(
-			history,
-			"Question",
-			"remote:model-1",
-			[
-				adapter.formatToolResult(
-					"call-1",
-					"output",
-					true,
-					[{ format: "png", base64: "abc" }],
-					"Read",
-				),
-			],
-			[{ format: "jpeg", base64: "def" }],
-		);
-		adapter.pushAssistantTurn(
-			history,
-			"Answer",
-			[{ toolUseId: "call-2", name: "Write", input: { path: "a" }, outputIndex: 1 }],
-			[{ text: "thinking", outputIndex: 0 }],
-			undefined,
-			"message-1",
-			undefined,
-			2,
-		);
 
 		expect(history).toEqual([
 			{ role: "system", content: [{ type: "text", text: "System instruction" }] },
+			{
+				role: "assistant",
+				content: [{ type: "tool_call", toolUseId: "call-1", name: "Read", input: { path: "b" } }],
+			},
 			{
 				role: "tool",
 				content: [
@@ -249,17 +247,21 @@ describe("RemoteProviderAdapter", () => {
 			},
 			{
 				role: "assistant",
-				messageId: "message-1",
 				content: [
-					{ type: "reasoning", text: "thinking", outputIndex: 0 },
+					{ type: "tool_call", toolUseId: "call-2", name: "Write", input: { path: "a" } },
+					{ type: "text", text: "Answer" },
+				],
+			},
+			{
+				role: "tool",
+				content: [
 					{
-						type: "tool_call",
+						type: "tool_result",
 						toolUseId: "call-2",
 						name: "Write",
-						input: { path: "a" },
-						outputIndex: 1,
+						content: [{ type: "text", text: "written" }],
+						isError: false,
 					},
-					{ type: "text", text: "Answer", outputIndex: 2 },
 				],
 			},
 		]);
@@ -518,33 +520,25 @@ describe("RemoteProviderAdapter", () => {
 			event("done", { status: "completed", stopReason: "end_turn" }),
 		]);
 		const metadata = (await collect(makeAdapter(rpc).chat(chatParams())))[0].reasoningMetadata;
-		const history: unknown[] = [];
-		adapter.pushAssistantTurn(
-			history,
-			"ignored",
-			[],
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			[
-				{ type: "reasoning", text: "", providerMetadata: metadata },
-				{ type: "text", text: "before", outputIndex: 9 },
-				{
-					type: "tool_use",
-					toolUseId: "call-1",
-					name: "Read",
-					input: {},
-					outputIndex: 0,
-					thoughtSignature: "tool-signature",
-					thoughtSignatureSource: source,
-				},
-				{ type: "text", text: "after", outputIndex: 1 },
-				{ type: "image_generation", id: "image-1", result: "base64-image" },
-			],
-		);
+		// The step as the loop keeps it, its call settled, projected like any replayed step.
+		const transcript = new LoopTranscript();
+		transcript.appendStep([
+			{ type: "reasoning", text: "", providerMetadata: metadata },
+			{ type: "text", text: "before", outputIndex: 9 },
+			{
+				type: "tool_use",
+				toolUseId: "call-1",
+				name: "Read",
+				input: {},
+				outputIndex: 0,
+				thoughtSignature: "tool-signature",
+				thoughtSignatureSource: source,
+			},
+			{ type: "text", text: "after", outputIndex: 1 },
+			{ type: "image_generation", id: "image-1", result: "base64-image" },
+		]);
+		transcript.settleTool("call-1", { output: "read" });
+		const { history } = await adapter.buildHistory(transcript.rows, "remote:model-1");
 		const content = (history[0] as { content: Array<Record<string, unknown>> }).content;
 		expect(content.map((block) => block.type)).toEqual([
 			"reasoning",
