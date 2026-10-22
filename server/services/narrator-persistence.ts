@@ -14,6 +14,7 @@ import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/n
 import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
+	fileChangeExecutionSegments,
 	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
@@ -59,7 +60,6 @@ import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
-import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import {
@@ -77,8 +77,6 @@ import {
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 
-const executionSegments = createFileChangeExecutionSegmentsService(db);
-
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -90,6 +88,111 @@ async function findExecutionSegmentParent(
 	const { resolveSubagentExecutionSegment } = await import("./subagent-execution-boundary");
 	const segment = await resolveSubagentExecutionSegment(narratorId);
 	return segment ? { executionSegmentId: segment.id } : null;
+}
+
+/**
+ * Create the execution segment of a new tool attempt inside the caller's transaction:
+ * the segment its file changes are attributed to commits with the attempt row.
+ */
+function insertExecutionSegmentTx(
+	tx: DbTx,
+	input: {
+		narratorId: string;
+		parentSegmentId: string | null;
+		toolCallId: string;
+		attempt: number;
+		createdAt: string;
+	},
+): string {
+	if (
+		input.parentSegmentId &&
+		!tx
+			.select({ id: fileChangeExecutionSegments.id })
+			.from(fileChangeExecutionSegments)
+			.where(eq(fileChangeExecutionSegments.id, input.parentSegmentId))
+			.get()
+	)
+		throw new Error("parent segment not found");
+	const segmentId = generateId();
+	tx.insert(fileChangeExecutionSegments)
+		.values({
+			id: segmentId,
+			narratorId: input.narratorId,
+			parentSegmentId: input.parentSegmentId,
+			sourceToolCallId: input.toolCallId,
+			sourceExecutionAttempt: input.attempt,
+			sourceInputId: null,
+			createdAt: input.createdAt,
+		})
+		.run();
+	return segmentId;
+}
+
+/** A streamed tool_use block, as the assistant step stores it. */
+interface StoredToolUseBlock {
+	id: string;
+	name: string;
+	input: Record<string, unknown>;
+	streamStartedAt?: number;
+	streamCompletedAt?: number;
+	thoughtSignature?: string;
+	thoughtSignatureSource?: string;
+}
+
+/**
+ * Create the ledger row of a new tool call, and the execution segment its file changes
+ * are attributed to, inside the caller's transaction. The tool_use block, its row and
+ * its segment are committed together or not at all: a block without a row is a call
+ * the model made that the history can no longer pair with a result.
+ */
+function insertToolCallRowTx(
+	tx: DbTx,
+	input: {
+		narratorId: string;
+		messageId: string;
+		parentSegmentId: string | null;
+		block: StoredToolUseBlock;
+		createdAt: string;
+	},
+): string {
+	const { block } = input;
+	const toolCallId = generateId();
+	const segmentId = insertExecutionSegmentTx(tx, {
+		narratorId: input.narratorId,
+		parentSegmentId: input.parentSegmentId,
+		toolCallId,
+		attempt: 1,
+		createdAt: input.createdAt,
+	});
+	tx.insert(narratorToolCalls)
+		.values({
+			executionSegmentId: segmentId,
+			id: toolCallId,
+			narratorId: input.narratorId,
+			messageId: input.messageId,
+			toolUseId: block.id,
+			toolName: block.name,
+			inputChars: measureSerializedCharacters(block.input),
+			inputJson: withGeminiThoughtSignature(
+				block.input,
+				block.thoughtSignature,
+				block.thoughtSignatureSource,
+			),
+			status: "initializing",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			streamStartedAt:
+				typeof block.streamStartedAt === "number"
+					? new Date(block.streamStartedAt).toISOString()
+					: null,
+			streamCompletedAt:
+				typeof block.streamCompletedAt === "number"
+					? new Date(block.streamCompletedAt).toISOString()
+					: null,
+			createdAt: input.createdAt,
+		})
+		.run();
+	return toolCallId;
 }
 
 /** Recipient mutation also invalidates source pages, including child cards rendered in a parent. */
@@ -741,6 +844,54 @@ function guardPersistedPlanBody(
 	return { ...input, plan: storedPlan };
 }
 
+/**
+ * Replace a call's stored input — the ledger row and the step's tool_use block — inside
+ * the caller's transaction, so the input a result was produced with and the input the
+ * history replays never disagree. Returns the input actually stored.
+ */
+function overwriteToolInputTx(
+	tx: DbTx,
+	toolCallId: string,
+	toolUseId: string,
+	input: Record<string, unknown>,
+): Record<string, unknown> {
+	const existing = tx
+		.select({
+			messageId: narratorToolCalls.messageId,
+			toolName: narratorToolCalls.toolName,
+			inputJson: narratorToolCalls.inputJson,
+		})
+		.from(narratorToolCalls)
+		.where(eq(narratorToolCalls.id, toolCallId))
+		.get();
+	const effective = guardPersistedPlanBody(input, existing, toolUseId);
+	tx.update(narratorToolCalls)
+		.set({ inputJson: effective, inputChars: measureSerializedCharacters(effective) })
+		.where(eq(narratorToolCalls.id, toolCallId))
+		.run();
+	// Question responses belong to the execution receipt, never the authored SDK call.
+	if (!existing?.messageId || existing.toolName === "AskUserQuestion") return effective;
+	const message = tx
+		.select({ contentJson: narratorMessages.contentJson })
+		.from(narratorMessages)
+		.where(eq(narratorMessages.id, existing.messageId))
+		.get();
+	if (!Array.isArray(message?.contentJson)) return effective;
+	let changed = false;
+	const patched = (message.contentJson as Array<Record<string, unknown>>).map((block) => {
+		if (block?.type !== "tool_use" || block.id !== toolUseId) return block;
+		if (isDeepStrictEqual(block.input, effective)) return block;
+		changed = true;
+		return { ...block, input: effective };
+	});
+	if (changed)
+		tx.update(narratorMessages)
+			.set({ contentJson: patched })
+			.where(eq(narratorMessages.id, existing.messageId))
+			.run();
+	return effective;
+}
+
 const COMPACT_RESTART_ERROR = "Interrupted by server restart";
 const COMPACT_RECOVERY_PAGE_SIZE = 100;
 
@@ -1124,11 +1275,16 @@ export function createPgPlacedMessageMaterializer(
 
 async function appendPersistedMessage(
 	message: RefMessageInput,
-	options?: { bumpMessageVersion?: boolean },
+	options?: {
+		bumpMessageVersion?: boolean;
+		/** Rows that belong to the message, written in its transaction (SQLite only). */
+		withRows?: (tx: DbTx) => void;
+	},
 ): Promise<RefMessage> {
 	const bumpMessageVersion = options?.bumpMessageVersion !== false;
 	const pg = getNarratorMessageRefsPort();
 	if (pg) {
+		if (options?.withRows) throw new Error("PostgreSQL message rows unavailable");
 		const created = await pg.append(message, { bumpMessageVersion });
 		if (message.role !== "disp") queueContextCharacterRefresh(message.narratorId, message.id);
 		return created;
@@ -1138,6 +1294,7 @@ async function appendPersistedMessage(
 			db.transaction((tx) => {
 				const created = tx.insert(narratorMessages).values(message).returning().get();
 				const seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
+				options?.withRows?.(tx);
 				return { ...created, seq };
 			}),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
@@ -1452,6 +1609,77 @@ const sqliteNarratorPersistence = {
 			await bumpParentNarratorMessageVersion(parentToolUseId);
 		}
 		return msg;
+	},
+
+	/**
+	 * Persist the assistant card of a user-run tool (`/bash`) with its running ledger row,
+	 * in one transaction: the card's tool_use never exists without the row its result
+	 * settles.
+	 */
+	async persistManualToolCall(
+		narratorId: string,
+		input: {
+			messageId: string;
+			toolCallId: string;
+			toolUseBlock: { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
+			streamStartedAt: string;
+			createdAt: string;
+		},
+	): Promise<RefMessage> {
+		const { toolUseBlock } = input;
+		return appendPersistedMessage(
+			{
+				id: input.messageId,
+				narratorId,
+				role: "assistant",
+				contentJson: [toolUseBlock],
+				contextCharsJson: measureMessageCharacters("assistant", [toolUseBlock]),
+				contentText: null,
+				createdAt: input.createdAt,
+			},
+			{
+				withRows: (tx) =>
+					tx
+						.insert(narratorToolCalls)
+						.values({
+							id: input.toolCallId,
+							narratorId,
+							messageId: input.messageId,
+							toolUseId: toolUseBlock.id,
+							toolName: toolUseBlock.name,
+							inputJson: toolUseBlock.input,
+							inputChars: measureSerializedCharacters(toolUseBlock.input),
+							status: "running",
+							streamStartedAt: input.streamStartedAt,
+							createdAt: input.createdAt,
+						})
+						.run(),
+			},
+		);
+	},
+
+	/**
+	 * Persist the notice of a manual tool load or unload: a user row the model reads at
+	 * its seq, written with its ref in one transaction.
+	 */
+	async persistToolChangeMessage(
+		narratorId: string,
+		block: {
+			type: "tool_loaded" | "tool_unloaded";
+			toolName: string;
+			toolNames: string[];
+			text: string;
+		},
+	): Promise<RefMessage> {
+		return appendPersistedMessage({
+			id: generateId(),
+			narratorId,
+			role: "user",
+			contentJson: [block],
+			contextCharsJson: measureMessageCharacters("user", [block], block.text),
+			contentText: block.text,
+			createdAt: new Date().toISOString(),
+		});
 	},
 
 	async persistDisplayMessage(
@@ -2008,78 +2236,59 @@ const sqliteNarratorPersistence = {
 
 		const usage = sdkMessage.message.usage;
 		const pg = getNarratorMessageRefsPort();
-		if (pg && content.some((block) => block.type === "tool_use"))
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use") as StoredToolUseBlock[];
+		if (pg && toolUseBlocks.length)
 			throw new Error("PostgreSQL assistant tool-call persistence unavailable");
-		const msg = await appendPersistedMessage({
-			id,
-			narratorId,
-			messageUuid: sdkMessage.uuid,
-			parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
-			role: "assistant",
-			contentJson: content,
-			contextCharsJson: measureMessageCharacters("assistant", content),
-			contentText: contentText || null,
-			tokensIn: usage?.input_tokens,
-			provider: sdkMessage.provider ?? null,
-			credentialId: sdkMessage.credentialId ?? null,
-			model: sdkMessage.model ?? null,
-			outputTokens: sdkMessage.outputTokens ?? null,
-			cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
-			cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
-			cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
-			cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
-			reasoningTokens: sdkMessage.reasoningTokens ?? null,
-			ttftMs: sdkMessage.ttftMs ?? null,
-			durationMs: sdkMessage.durationMs ?? null,
-			contextPercent: sdkMessage.contextPercent ?? null,
-			meterUsage: sdkMessage.meterUsage ?? null,
-			meterUnit: sdkMessage.meterUnit ?? null,
-			createdAt: now,
-		});
+		const parentSegmentId = toolUseBlocks.length
+			? ((await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null)
+			: null;
+		// The step and the ledger rows of its calls are one transaction.
+		const msg = await appendPersistedMessage(
+			{
+				id,
+				narratorId,
+				messageUuid: sdkMessage.uuid,
+				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
+				role: "assistant",
+				contentJson: content,
+				contextCharsJson: measureMessageCharacters("assistant", content),
+				contentText: contentText || null,
+				tokensIn: usage?.input_tokens,
+				provider: sdkMessage.provider ?? null,
+				credentialId: sdkMessage.credentialId ?? null,
+				model: sdkMessage.model ?? null,
+				outputTokens: sdkMessage.outputTokens ?? null,
+				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
+				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
+				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
+				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
+				reasoningTokens: sdkMessage.reasoningTokens ?? null,
+				ttftMs: sdkMessage.ttftMs ?? null,
+				durationMs: sdkMessage.durationMs ?? null,
+				contextPercent: sdkMessage.contextPercent ?? null,
+				meterUsage: sdkMessage.meterUsage ?? null,
+				meterUnit: sdkMessage.meterUnit ?? null,
+				createdAt: now,
+			},
+			toolUseBlocks.length
+				? {
+						withRows: (tx) => {
+							for (const block of toolUseBlocks)
+								insertToolCallRowTx(tx, {
+									narratorId,
+									messageId: id,
+									parentSegmentId,
+									block,
+									createdAt: now,
+								});
+						},
+					}
+				: undefined,
+		);
 
 		const seq = msg.seq;
 		if (!pg) await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
-		for (const block of toolUseBlocks) {
-			const parentToolCall = await findExecutionSegmentParent(narratorId);
-			const toolCallId = generateId();
-			const segment = await executionSegments.create({
-				narratorId,
-				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
-				sourceToolCallId: toolCallId,
-				sourceExecutionAttempt: 1,
-			});
-			await db.insert(narratorToolCalls).values({
-				executionSegmentId: segment.id,
-				id: toolCallId,
-				narratorId,
-				messageId: id,
-				toolUseId: block.id,
-				toolName: block.name,
-				inputChars: measureSerializedCharacters(block.input),
-				inputJson: withGeminiThoughtSignature(
-					block.input,
-					block.thoughtSignature,
-					block.thoughtSignatureSource,
-				),
-				status: "initializing",
-				executionAttempt: 1,
-				executionIdentityVersion: 1,
-				streamStartedAt:
-					"streamStartedAt" in block && typeof block.streamStartedAt === "number"
-						? new Date(block.streamStartedAt).toISOString()
-						: null,
-				streamCompletedAt:
-					"streamCompletedAt" in block && typeof block.streamCompletedAt === "number"
-						? new Date(block.streamCompletedAt).toISOString()
-						: null,
-				createdAt: now,
-			});
-			queueContextCharacterRefresh(narratorId, id);
-		}
-
 		return { ...msg, seq };
 	},
 
@@ -2205,6 +2414,14 @@ const sqliteNarratorPersistence = {
 			  },
 		options?: { republishUnchanged?: boolean },
 	) {
+		// The segment parent is read up front; the block and its ledger row are then one
+		// transaction, so a tool_use never commits without the row that pairs its result.
+		const toolParentSegmentId =
+			block.type === "tool_use"
+				? ((await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null)
+				: null;
+		const toolCreatedAt = new Date().toISOString();
+		let toolCallId: string | undefined;
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
 		const persisted = db.transaction((tx) => {
@@ -2329,6 +2546,14 @@ const sqliteNarratorPersistence = {
 					.run();
 				queueContextCharacterRefresh(narratorId, messageId);
 			}
+			if (block.type === "tool_use")
+				toolCallId = insertToolCallRowTx(tx, {
+					narratorId,
+					messageId,
+					parentSegmentId: toolParentSegmentId,
+					block,
+					createdAt: toolCreatedAt,
+				});
 			return existing;
 		});
 		if (!persisted) return undefined;
@@ -2382,48 +2607,8 @@ const sqliteNarratorPersistence = {
 			);
 		};
 
-		if (block.type === "tool_use") {
-			const now = new Date().toISOString();
-			const parentToolCall = await findExecutionSegmentParent(narratorId);
-			const toolCallId = generateId();
-			const segment = await executionSegments.create({
-				narratorId,
-				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
-				sourceToolCallId: toolCallId,
-				sourceExecutionAttempt: 1,
-			});
-			await db.insert(narratorToolCalls).values({
-				executionSegmentId: segment.id,
-				id: toolCallId,
-				narratorId,
-				messageId,
-				toolUseId: block.id,
-				toolName: block.name,
-				inputChars: measureSerializedCharacters(block.input),
-				inputJson: withGeminiThoughtSignature(
-					block.input,
-					block.thoughtSignature,
-					block.thoughtSignatureSource,
-				),
-				status: "initializing",
-				executionAttempt: 1,
-				executionIdentityVersion: 1,
-				streamStartedAt:
-					typeof block.streamStartedAt === "number"
-						? new Date(block.streamStartedAt).toISOString()
-						: null,
-				streamCompletedAt:
-					typeof block.streamCompletedAt === "number"
-						? new Date(block.streamCompletedAt).toISOString()
-						: null,
-				createdAt: now,
-			});
-			queueContextCharacterRefresh(narratorId, messageId);
-			await publishPartial();
-			return toolCallId;
-		}
 		await publishPartial();
-		return undefined;
+		return toolCallId;
 	},
 
 	async patchReasoningTranslation(
@@ -2509,16 +2694,6 @@ const sqliteNarratorPersistence = {
 				updatedAt: now,
 			})
 			.where(eq(narrators.id, narratorId));
-	},
-
-	async updateMessageCost(messageId: string, costUsd: number, turnUsage?: Record<string, unknown>) {
-		await db
-			.update(narratorMessages)
-			.set({
-				costUsd,
-				...(turnUsage ? { turnUsageJson: turnUsage } : {}),
-			})
-			.where(eq(narratorMessages.id, messageId));
 	},
 
 	async updateMessageHistoryTokenEstimate(
@@ -3228,37 +3403,45 @@ const sqliteNarratorPersistence = {
 			parentToolUseId,
 			parentBinding.toolCallId,
 		);
-		const segment = await executionSegments.create({
-			narratorId,
-			parentSegmentId: parentReceipt.executionSegmentId ?? null,
-			sourceToolCallId: toolCallId,
-			sourceExecutionAttempt: 1,
-		});
-		await db.insert(narratorToolCalls).values({
-			executionSegmentId: segment.id,
-			id: toolCallId,
-			narratorId,
-			messageId,
-			toolUseId,
-			toolName: "Read",
-			inputChars: measureSerializedCharacters(input),
-			inputJson: {
-				...input,
-				__internalRead: {
-					parentToolCallId: parentBinding.toolCallId,
-					parentAttempt: parentBinding.attempt,
-					sequence,
-				},
-			},
-			status: "initializing",
-			executionAttempt: 1,
-			executionIdentityVersion: 1,
-			createdAt: new Date().toISOString(),
+		const createdAt = new Date().toISOString();
+		// The internal attempt and its execution segment are one transaction.
+		const segmentId = db.transaction((tx) => {
+			const executionSegmentId = insertExecutionSegmentTx(tx, {
+				narratorId,
+				parentSegmentId: parentReceipt.executionSegmentId ?? null,
+				toolCallId,
+				attempt: 1,
+				createdAt,
+			});
+			tx.insert(narratorToolCalls)
+				.values({
+					executionSegmentId,
+					id: toolCallId,
+					narratorId,
+					messageId,
+					toolUseId,
+					toolName: "Read",
+					inputChars: measureSerializedCharacters(input),
+					inputJson: {
+						...input,
+						__internalRead: {
+							parentToolCallId: parentBinding.toolCallId,
+							parentAttempt: parentBinding.attempt,
+							sequence,
+						},
+					},
+					status: "initializing",
+					executionAttempt: 1,
+					executionIdentityVersion: 1,
+					createdAt,
+				})
+				.run();
+			return executionSegmentId;
 		});
 		queueContextCharacterRefresh(narratorId, messageId);
 		return {
 			toolUseId,
-			binding: Object.freeze({ toolCallId, attempt: 1, executionSegmentId: segment.id }),
+			binding: Object.freeze({ toolCallId, attempt: 1, executionSegmentId: segmentId }),
 		};
 	},
 
@@ -3444,6 +3627,9 @@ const sqliteNarratorPersistence = {
 			}
 			// COW only copies historical references; none of those clones becomes execution authority.
 			const messageId = await this.copyOnWriteMessage(narratorId, source.messageId);
+			const parentSegmentId =
+				(await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null;
+			// The new attempt and its execution segment are one transaction.
 			const toolCall = db.transaction((tx) => {
 				const latest = tx.query.narratorToolCalls
 					.findFirst({
@@ -3459,10 +3645,23 @@ const sqliteNarratorPersistence = {
 				if (latest && latest.executionAttempt > source.executionAttempt) {
 					throw new ValidationError("This tool call already has a newer execution attempt");
 				}
+				const id = generateId();
+				const createdAt = new Date().toISOString();
+				const executionAttempt = Math.max(
+					1,
+					(latest?.executionAttempt ?? source.executionAttempt) + 1,
+				);
+				const executionSegmentId = insertExecutionSegmentTx(tx, {
+					narratorId,
+					parentSegmentId,
+					toolCallId: id,
+					attempt: executionAttempt,
+					createdAt,
+				});
 				const [created] = tx
 					.insert(narratorToolCalls)
 					.values({
-						id: generateId(),
+						id,
 						narratorId,
 						messageId,
 						toolUseId: source.toolUseId,
@@ -3470,31 +3669,18 @@ const sqliteNarratorPersistence = {
 						inputJson: source.inputJson,
 						inputChars: source.inputChars,
 						executionIdentityVersion: 1,
-						executionAttempt: Math.max(
-							1,
-							(latest?.executionAttempt ?? source.executionAttempt) + 1,
-						),
+						executionAttempt,
+						executionSegmentId,
 						status: "initializing",
-						createdAt: new Date().toISOString(),
+						createdAt,
 						// Deliberately no operation, approval, timing, result, token accounting or tree data.
 					})
 					.returning()
 					.all();
 				return created;
 			});
-			const parent = await findExecutionSegmentParent(narratorId);
-			const segment = await executionSegments.create({
-				narratorId,
-				parentSegmentId: parent?.executionSegmentId ?? null,
-				sourceToolCallId: toolCall.id,
-				sourceExecutionAttempt: toolCall.executionAttempt,
-			});
-			await db
-				.update(narratorToolCalls)
-				.set({ executionSegmentId: segment.id })
-				.where(eq(narratorToolCalls.id, toolCall.id));
 			return {
-				toolCall: { ...toolCall, executionSegmentId: segment.id },
+				toolCall,
 				requiresFreshPermission: shared || source.narratorId !== narratorId,
 			};
 		});
@@ -3728,9 +3914,6 @@ const sqliteNarratorPersistence = {
 				.set({
 					outputJson: result.output ?? null,
 					outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
-					...(result.input !== undefined
-						? { inputJson: result.input, inputChars: measureSerializedCharacters(result.input) }
-						: {}),
 					status: result.status,
 					errorMessage: result.errorMessage ?? null,
 					permissionStartedAt:
@@ -3754,6 +3937,7 @@ const sqliteNarratorPersistence = {
 				})
 				.where(and(...conditions))
 				.returning({
+					id: narratorToolCalls.id,
 					narratorId: narratorToolCalls.narratorId,
 					messageId: narratorToolCalls.messageId,
 					toolUseId: narratorToolCalls.toolUseId,
@@ -3764,6 +3948,9 @@ const sqliteNarratorPersistence = {
 			if (expected && updated.length !== 1) {
 				throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
 			}
+			// A redirected or sanitized input is stored with the result it produced.
+			if (result.input !== undefined)
+				for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
 			result.onPersist?.(tx);
 			return updated;
 		});
@@ -3909,7 +4096,11 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		messageId: string,
 		overrides?: Partial<typeof narratorMessages.$inferInsert>,
-		options: { preserveExecutionOwner?: boolean } = {},
+		options: {
+			preserveExecutionOwner?: boolean;
+			/** Writes that belong to the edit, run first in its transaction. */
+			beforeWrite?: (tx: DbTx) => void;
+		} = {},
 	): Promise<string> {
 		const ref = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -3942,6 +4133,7 @@ const sqliteNarratorPersistence = {
 				.findFirst({ where: eq(narratorMessages.id, messageId) })
 				.sync();
 			if (!original) throw new NotFoundError("Message", messageId);
+			options.beforeWrite?.(tx);
 			// Read ref membership atomically with the rewrite, including forks made while the
 			// caller awaited context accounting. Never mutate a newly-shared row in place.
 			const recipients = tx
@@ -4062,6 +4254,130 @@ const sqliteNarratorPersistence = {
 		return result;
 	},
 
+	/**
+	 * Drop what a discarded provider attempt wrote into an open step: the blocks after
+	 * the attempt's baseline, and the ledger rows of its calls that never ran. A call that
+	 * did run keeps its row and its block, so a result never loses its call. The row
+	 * removal and the truncation are one transaction. Null when there was nothing to drop.
+	 */
+	async discardAttemptBlocks(
+		narratorId: string,
+		messageId: string,
+		baseline: number,
+	): Promise<{
+		messageId: string;
+		discardedBlocks: number;
+		retainedExecutedCalls: number;
+		removedToolUseIds: string[];
+	} | null> {
+		const message = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { contentJson: true },
+		});
+		const blocks = Array.isArray(message?.contentJson)
+			? (message.contentJson as Array<Record<string, unknown>>)
+			: [];
+		if (blocks.length <= baseline) return null;
+		// An in-flight partial may have been forked. Keep execution/approval identity on the
+		// real owner while isolating sibling snapshots before any mutation.
+		let partialId = await this.copyOnWriteMessage(narratorId, messageId, undefined, {
+			preserveExecutionOwner: true,
+		});
+		const discarded = blocks.slice(baseline);
+		const discardedToolUseIds = discarded.flatMap((block) =>
+			block.type === "tool_use" && typeof block.id === "string" ? [block.id] : [],
+		);
+		// Which of those calls never ran — only these may be removed.
+		const executedToolUseIds = new Set<string>();
+		const removableRowIds: string[] = [];
+		if (discardedToolUseIds.length > 0) {
+			const rows = await db.query.narratorToolCalls.findMany({
+				where: and(
+					eq(narratorToolCalls.messageId, partialId),
+					inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
+				),
+				columns: { id: true, toolUseId: true, status: true },
+			});
+			for (const row of rows) {
+				if (row.status === "initializing" || row.status === "pending") removableRowIds.push(row.id);
+				else executedToolUseIds.add(row.toolUseId);
+			}
+		}
+		// Keep the blocks of tools that actually executed, drop the rest. Order is preserved
+		// by filtering the whole array: blocks are kept in `outputIndex` order, and the tool
+		// reordering at the step's seal reads tool positions.
+		const nextBlocks = blocks.filter(
+			(block, index) =>
+				index < baseline ||
+				(block.type === "tool_use" &&
+					typeof block.id === "string" &&
+					executedToolUseIds.has(block.id)),
+		);
+		const contentText = nextBlocks
+			.flatMap((block) =>
+				block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+			)
+			.join("\n");
+		// A fork can acquire a ref after the isolation above; the COW rechecks membership
+		// and truncates in the same transaction that removes the unexecuted rows.
+		partialId = await this.copyOnWriteMessage(
+			narratorId,
+			partialId,
+			{
+				contentJson: nextBlocks,
+				contentText: contentText || null,
+				contextCharsJson: measureMessageCharacters("assistant", nextBlocks, contentText),
+			},
+			{
+				preserveExecutionOwner: true,
+				...(removableRowIds.length
+					? {
+							beforeWrite: (tx: DbTx) =>
+								tx
+									.delete(narratorToolCalls)
+									.where(inArray(narratorToolCalls.id, removableRowIds))
+									.run(),
+						}
+					: {}),
+			},
+		);
+		return {
+			messageId: partialId,
+			discardedBlocks: discarded.length - (nextBlocks.length - baseline),
+			retainedExecutedCalls: nextBlocks.length - baseline,
+			removedToolUseIds: discardedToolUseIds.filter((id) => !executedToolUseIds.has(id)),
+		};
+	},
+
+	/** Final metadata of a sealed step (upstream id, credential, turn usage). */
+	async patchStepMeta(
+		messageId: string,
+		meta: { messageUuid?: string; credentialId?: string; turnUsageJson?: Record<string, unknown> },
+	): Promise<void> {
+		const updates = Object.fromEntries(
+			Object.entries(meta).filter(([, value]) => value !== undefined),
+		);
+		if (Object.keys(updates).length === 0) return;
+		await db.update(narratorMessages).set(updates).where(eq(narratorMessages.id, messageId));
+	},
+
+	/** Put a sealed step's tool_use blocks into the model's call order. */
+	async reorderStepToolBlocks(
+		narratorId: string,
+		messageId: string,
+		content: unknown[],
+		contentText: string | null,
+	): Promise<void> {
+		await db
+			.update(narratorMessages)
+			.set({
+				contentJson: content,
+				contextCharsJson: measureMessageCharacters("assistant", content, contentText),
+			})
+			.where(eq(narratorMessages.id, messageId));
+		queueContextCharacterRefresh(narratorId, messageId);
+	},
+
 	async copyOnWriteToolCallMessage(
 		narratorId: string,
 		messageId: string,
@@ -4075,47 +4391,25 @@ const sqliteNarratorPersistence = {
 		input: Record<string, unknown>,
 		toolCallId?: string,
 	) {
-		logger.info("Overwriting broken tool call input", {
+		logger.info("Overwriting tool call input", {
 			toolUseId,
 			toolCallId,
 			inputKeys: Object.keys(input),
 		});
 		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId });
 		if (!exactId) return;
-		const condition = eq(narratorToolCalls.id, exactId);
-
-		const existing = await db.query.narratorToolCalls.findFirst({
-			where: condition,
-			columns: { messageId: true, toolName: true, inputJson: true, narratorId: true },
+		const owner = db.transaction((tx) => {
+			overwriteToolInputTx(tx, exactId, toolUseId, input);
+			return tx
+				.select({
+					narratorId: narratorToolCalls.narratorId,
+					messageId: narratorToolCalls.messageId,
+				})
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, exactId))
+				.get();
 		});
-		const effectiveInput = guardPersistedPlanBody(input, existing, toolUseId);
-
-		await db
-			.update(narratorToolCalls)
-			.set({ inputJson: effectiveInput, inputChars: measureSerializedCharacters(effectiveInput) })
-			.where(condition);
-		if (existing)
-			queueContextCharacterRefresh(existing.narratorId, existing.messageId ?? undefined);
-
-		// Question responses belong to the execution receipt, never the authored SDK call.
-		if (existing?.messageId && existing.toolName !== "AskUserQuestion") {
-			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, existing.messageId),
-				columns: { contentJson: true },
-			});
-			if (msg?.contentJson && Array.isArray(msg.contentJson)) {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const patched = (msg.contentJson as any[]).map((block: any) =>
-					block.type === "tool_use" && block.id === toolUseId
-						? { ...block, input: effectiveInput }
-						: block,
-				);
-				await db
-					.update(narratorMessages)
-					.set({ contentJson: patched })
-					.where(eq(narratorMessages.id, existing.messageId));
-			}
-		}
+		if (owner) queueContextCharacterRefresh(owner.narratorId, owner.messageId ?? undefined);
 	},
 
 	async getToolCallPlanText(toolUseId: string): Promise<string | null> {

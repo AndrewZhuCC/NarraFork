@@ -1,5 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve, sep } from "node:path";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
@@ -47,7 +48,6 @@ import {
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
 	measureMessageCharacters,
-	measureSerializedCharacters,
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
@@ -136,11 +136,7 @@ import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
 // child row gets it rather than only the subagent entry point that remembered to call it.
-import {
-	appendMessageRef,
-	deleteRecipientMessageRefs,
-	narratorPersistence,
-} from "./narrator-persistence";
+import { deleteRecipientMessageRefs, narratorPersistence } from "./narrator-persistence";
 import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	claimNextRefSeq,
@@ -150,6 +146,7 @@ import {
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -465,6 +462,27 @@ async function resolveLayeredTraitsFor(
 	return resolved.traits;
 }
 
+/** Persist a tool load/unload notice row and announce it to the transcript. */
+async function persistToolChange(
+	narratorId: string,
+	block: Parameters<typeof narratorStore.appendToolChange>[1],
+): Promise<void> {
+	const msg = await narratorStore.appendToolChange(narratorId, block);
+	broadcastToNarrator(narratorId, {
+		type: "user_message",
+		narratorId,
+		message: {
+			id: msg.id,
+			narratorId,
+			role: "user",
+			contentJson: msg.contentJson,
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			children: [],
+		},
+	});
+}
+
 /**
  * Shared handler for `/load <tool>` commands.
  */
@@ -547,40 +565,11 @@ export async function handleLoadToolCommand(
 		// The registry names this row changed; tool loading reads them to keep the
 		// request's tool array fixed (see lib/agent/tool-loading.ts).
 		const changedToolNames = toolNames.filter((_, index) => results[index] === "loaded");
-		const block = {
+		await persistToolChange(narratorId, {
 			type: "tool_loaded",
 			toolName: displayToolName,
 			toolNames: changedToolNames,
 			text,
-		};
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "user",
-				contentJson: [block],
-				contextCharsJson: measureMessageCharacters("user", [block], text),
-				contentText: text,
-				createdAt: now,
-			})
-			.returning();
-		await appendMessageRef(narratorId, id);
-		queueContextCharacterRefresh(narratorId, id);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: {
-				id: msg.id,
-				narratorId,
-				role: "user",
-				contentJson: msg.contentJson,
-				contentText: msg.contentText,
-				createdAt: msg.createdAt,
-				children: [],
-			},
 		});
 	}
 
@@ -626,40 +615,11 @@ export async function handleUnloadToolCommand(
 	if (!notLoaded && !unknownTool) {
 		const text = getToolMessageWithParams("toolUnloaded", locale, { toolName: displayToolName });
 		const changedToolNames = toolNames.filter((_, index) => results[index] === "unloaded");
-		const block = {
+		await persistToolChange(narratorId, {
 			type: "tool_unloaded",
 			toolName: displayToolName,
 			toolNames: changedToolNames,
 			text,
-		};
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "user",
-				contentJson: [block],
-				contextCharsJson: measureMessageCharacters("user", [block], text),
-				contentText: text,
-				createdAt: now,
-			})
-			.returning();
-		await appendMessageRef(narratorId, id);
-		queueContextCharacterRefresh(narratorId, id);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: {
-				id: msg.id,
-				narratorId,
-				role: "user",
-				contentJson: msg.contentJson,
-				contentText: msg.contentText,
-				createdAt: msg.createdAt,
-				children: [],
-			},
 		});
 	}
 
@@ -985,7 +945,7 @@ export async function handleBashCommand(
 	const streamStartedAtIso = new Date(streamStartedAt).toISOString();
 	const toolInput = { command, description: command };
 	const toolUseBlock = {
-		type: "tool_use",
+		type: "tool_use" as const,
 		id: toolUseId,
 		name: "Bash",
 		input: toolInput,
@@ -994,32 +954,14 @@ export async function handleBashCommand(
 	const now = new Date().toISOString();
 
 	// 2. Persist and broadcast a running assistant tool card before the process starts.
-	const [assistantMsg] = await db
-		.insert(narratorMessages)
-		.values({
-			id: assistantMsgId,
-			narratorId,
-			role: "assistant",
-			contentJson: [toolUseBlock],
-			contextCharsJson: measureMessageCharacters("assistant", [toolUseBlock]),
-			contentText: null,
-			createdAt: now,
-		})
-		.returning();
-	const assistantSeq = await appendMessageRef(narratorId, assistantMsgId);
-	await db.insert(narratorToolCalls).values({
-		id: toolCallId,
-		narratorId,
+	const assistantMsg = await narratorStore.callManualTool(narratorId, {
 		messageId: assistantMsgId,
-		toolUseId,
-		toolName: "Bash",
-		inputJson: toolInput,
-		inputChars: measureSerializedCharacters(toolInput),
-		status: "running",
+		toolCallId,
+		toolUseBlock,
 		streamStartedAt: streamStartedAtIso,
 		createdAt: now,
 	});
-	queueContextCharacterRefresh(narratorId, assistantMsgId);
+	const assistantSeq = assistantMsg.seq;
 
 	broadcastToNarrator(narratorId, {
 		type: "message",
@@ -1129,9 +1071,7 @@ export async function handleBashCommand(
 	const completedAt = Date.now();
 	const durationMs = completedAt - streamStartedAt;
 	const status = result.isError ? "fail" : "success";
-	const persistedOutput = result.metadata
-		? { _text: result.output, _metadata: result.metadata }
-		: result.output;
+	const persistedOutput = encodeToolOutput(result.output, { metadata: result.metadata });
 	const toolResultBlock = {
 		type: "tool_result",
 		tool_use_id: toolUseId,
@@ -1139,15 +1079,8 @@ export async function handleBashCommand(
 		is_error: result.isError ?? false,
 	};
 
-	await db
-		.update(narratorMessages)
-		.set({
-			contentJson: [toolUseBlock, toolResultBlock],
-			contextCharsJson: measureMessageCharacters("assistant", [toolUseBlock, toolResultBlock]),
-			durationMs,
-		})
-		.where(eq(narratorMessages.id, assistantMsgId));
-	await narratorService.updateToolCallResult(
+	// The card's display copy of the result and the ledger result are one transaction.
+	await narratorStore.settleTool(
 		toolUseId,
 		{
 			output: persistedOutput,
@@ -1156,6 +1089,19 @@ export async function handleBashCommand(
 			durationMs,
 			executionStartedAt: streamStartedAt,
 			completedAt,
+			onPersist: (tx) =>
+				tx
+					.update(narratorMessages)
+					.set({
+						contentJson: [toolUseBlock, toolResultBlock],
+						contextCharsJson: measureMessageCharacters("assistant", [
+							toolUseBlock,
+							toolResultBlock,
+						]),
+						durationMs,
+					})
+					.where(eq(narratorMessages.id, assistantMsgId))
+					.run(),
 		},
 		assistantMsgId,
 		toolCallId,
@@ -3322,8 +3268,6 @@ export const narratorService = {
 	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
-	removeCompactingMessage:
-		narratorMessageQueries.removeCompactingMessage.bind(narratorMessageQueries),
 	updateCompactSummary: narratorMessageQueries.updateCompactSummary.bind(narratorMessageQueries),
 	getPendingPermissions: narratorMessageQueries.getPendingPermissions.bind(narratorMessageQueries),
 
@@ -3349,7 +3293,6 @@ export const narratorService = {
 		narratorPersistence.patchReasoningTranslation.bind(narratorPersistence),
 	updateConversationId: narratorPersistence.updateConversationId.bind(narratorPersistence),
 	updateStats: narratorPersistence.updateStats.bind(narratorPersistence),
-	updateMessageCost: narratorPersistence.updateMessageCost.bind(narratorPersistence),
 	updateMessageHistoryTokenEstimate:
 		narratorPersistence.updateMessageHistoryTokenEstimate.bind(narratorPersistence),
 	updateTitle: narratorPersistence.updateTitle.bind(narratorPersistence),
@@ -3379,7 +3322,6 @@ export const narratorService = {
 	copyOnWriteMessage: narratorPersistence.copyOnWriteMessage.bind(narratorPersistence),
 	copyOnWriteToolCallMessage:
 		narratorPersistence.copyOnWriteToolCallMessage.bind(narratorPersistence),
-	overwriteToolCallInput: narratorPersistence.overwriteToolCallInput.bind(narratorPersistence),
 	getToolCallPlanText: narratorPersistence.getToolCallPlanText.bind(narratorPersistence),
 	persistSegmentCompactMarker:
 		narratorPersistence.persistSegmentCompactMarker.bind(narratorPersistence),

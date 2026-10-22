@@ -328,8 +328,8 @@ describe("subagent logical-run receipts", () => {
 					createdAt: now,
 					updatedAt: now,
 				});
-				const service = (await import("../narrator-service")).narratorService;
-				spyOn(service, "updateToolCallResult").mockRejectedValue(
+				const { narratorStore } = await import("../narrator-store");
+				spyOn(narratorStore, "settleTool").mockRejectedValue(
 					new Error("result persistence failed"),
 				);
 			}

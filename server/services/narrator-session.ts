@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
@@ -375,6 +376,7 @@ import {
 	revertPrincipalForUser,
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
+import { narratorStore } from "./narrator-store";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
 import {
 	assertSnapshotRevertComplete,
@@ -3612,7 +3614,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 	const resultRow = resultRows[0];
 	const timing = refreshTiming ? resolveToolCallConclusionTiming(resultRow) : undefined;
 
-	await narratorService.updateToolCallResult(
+	await narratorStore.settleTool(
 		toolUseId,
 		{
 			output,
@@ -5660,7 +5662,7 @@ async function reExecuteDeniedToolCallUnlocked(
 		async (): Promise<ReExecuteDeniedResult> => {
 			try {
 				await options?.onAdmitted?.();
-				const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
+				const preparedAttempt = await narratorStore.retryTool(
 					narratorId,
 					sourceToolCall.id,
 					restoringPersistedCall,
@@ -5927,29 +5929,21 @@ async function reExecuteDeniedToolCallUnlocked(
 							}
 						}
 					}
-					await narratorService.updateToolCallResult(
+					await narratorStore.settleTool(
 						toolUseId,
 						{
-							output: result.metadata
-								? { _text: result.output, _metadata: result.metadata }
-								: result.output,
+							output: encodeToolOutput(result.output, { metadata: result.metadata }),
 							status: result.isError ? "fail" : "success",
 							errorMessage: result.isError ? result.output : undefined,
 							durationMs: result.durationMs,
 							permissionStartedAt: result.permissionStartedAt,
 							executionStartedAt: result.executionStartedAt,
 							completedAt: result.completedAt,
+							...(result.updatedInput ? { input: result.updatedInput } : {}),
 						},
 						toolCall.messageId,
 						toolCall.id,
 					);
-					if (result.updatedInput) {
-						await narratorService.overwriteToolCallInput(
-							toolUseId,
-							result.updatedInput,
-							toolCall.id,
-						);
-					}
 
 					broadcastToNarrator(narratorId, {
 						type: "tool_completed",
@@ -5958,9 +5952,7 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						toolName,
 						status: result.isError ? "fail" : "success",
-						output: result.metadata
-							? { _text: result.output, _metadata: result.metadata }
-							: result.output,
+						output: encodeToolOutput(result.output, { metadata: result.metadata }),
 						durationMs: result.durationMs,
 						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
 						...(result.metadata ? { metadata: result.metadata } : {}),
@@ -5973,8 +5965,8 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						error: message,
 					});
-					await narratorService
-						.updateToolCallResult(
+					await narratorStore
+						.settleTool(
 							toolUseId,
 							{
 								output: `Re-execution failed: ${message}`,
