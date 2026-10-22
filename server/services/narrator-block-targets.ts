@@ -9,11 +9,15 @@
  *   - a block row: its envelope's rows in ordinal order each hold `payload.raw` elements and
  *     assemble to the stored array (§10.1), so the range follows from the rows' lengths;
  *   - an envelope not converted yet: the ids the decoder gives its blocks (§8.1), matched
- *     through `splitEnvelope`, which groups the same elements the rows would.
+ *     through `splitEnvelope`, which groups the same elements the rows would. Decoded ids
+ *     name positions, so they resolve only while the envelope is legacy format: once it
+ *     has rows (converted, or materialized by a block-addressed mutation) a decoded id is
+ *     stale, and a retried delete fails instead of removing the block that moved up.
  *
  * An envelope waiting in the sync queue is brought current first; the ids of unchanged
- * blocks survive a sync (rows are matched by key). Callers resolve inside the narrator's
- * admission, so the ranges cannot move before the mutation reads them.
+ * blocks survive a sync (`matchBlocks`). Only legacy envelopes and queued ones are parsed,
+ * within one budget per call. Callers resolve inside the narrator's admission, so the
+ * ranges cannot move before the mutation reads them.
  */
 
 import { parseStored } from "@shared/narrator-blocks/plan";
@@ -27,6 +31,14 @@ import { syncEnvelopeNow } from "./narrator-block-sync";
 
 /** Envelopes larger than this are not decoded on the main thread to resolve a target. */
 const TARGET_ENVELOPE_BYTES = 16 * 1024 * 1024;
+/** Stored content one resolve may parse in all (legacy envelopes, queued syncs). */
+const TARGET_PARSE_BYTES = 32 * 1024 * 1024;
+/**
+ * Most elements one delete by block id removes. The blocks are capped at
+ * `MAX_BATCH_DELETE_BLOCKS` and the history they touch by the deletion budgets; this only
+ * bounds the position list handed to them.
+ */
+export const MAX_BLOCK_DELETE_ELEMENTS = 4096;
 
 export interface BlockTarget {
 	/** The id the caller named (a row id, or a decoded id of an unconverted envelope). */
@@ -56,43 +68,67 @@ interface LayoutBlock {
 	to: number;
 }
 
-interface EnvelopeRow {
+interface EnvelopeHead {
 	id: string;
 	narratorId: string;
 	role: EnvelopeRole;
-	contentJson: string | null;
 	contentText: string | null;
 	parentToolUseId: string | null;
 	messageUuid: string | null;
 	origin: string | null;
 	provider: string | null;
 	bodyFormat: number;
+}
+
+/** What one resolve may still parse; each envelope it decodes or syncs draws on it. */
+interface ParseBudget {
 	bytes: number;
 }
 
-function readEnvelope(messageId: string): EnvelopeRow {
+const newBudget = (): ParseBudget => ({ bytes: TARGET_PARSE_BYTES });
+
+function readHead(messageId: string): EnvelopeHead {
 	const row = database.sqlite
 		.prepare(
-			`SELECT id, narrator_id AS narratorId, role, content_json AS contentJson,
-				content_text AS contentText, parent_tool_use_id AS parentToolUseId,
-				sdk_message_uuid AS messageUuid, origin, provider, body_format AS bodyFormat,
-				coalesce(length(CAST(content_json AS BLOB)), 0) AS bytes
+			`SELECT id, narrator_id AS narratorId, role, content_text AS contentText,
+				parent_tool_use_id AS parentToolUseId, sdk_message_uuid AS messageUuid, origin,
+				provider, body_format AS bodyFormat
 			 FROM narrator_messages WHERE id = ?`,
 		)
-		.get(messageId) as EnvelopeRow | null;
+		.get(messageId) as EnvelopeHead | null;
 	if (!row) throw new NotFoundError("Message", messageId);
-	if (row.bytes > TARGET_ENVELOPE_BYTES)
+	return row;
+}
+
+/** Charge an envelope's stored size to the budget before anything parses it. */
+function chargeParse(messageId: string, budget: ParseBudget): void {
+	const { bytes } = database.sqlite
+		.prepare(
+			`SELECT coalesce(length(CAST(content_json AS BLOB)), 0) AS bytes
+			 FROM narrator_messages WHERE id = ?`,
+		)
+		.get(messageId) as { bytes: number };
+	budget.bytes -= bytes;
+	if (bytes > TARGET_ENVELOPE_BYTES || budget.bytes < 0)
 		throw new AppError(
 			"The message is too large to address by block",
 			413,
 			"BLOCK_TARGET_TOO_LARGE",
 		);
-	return row;
+}
+
+/** An envelope's stored array, charged to the budget. */
+function readContent(messageId: string, budget: ParseBudget): unknown {
+	chargeParse(messageId, budget);
+	const row = database.sqlite
+		.prepare("SELECT content_json AS contentJson FROM narrator_messages WHERE id = ?")
+		.get(messageId) as { contentJson: string | null };
+	return parseStored(row.contentJson);
 }
 
 /** The envelope's blocks as the decoder groups its stored elements. */
-function splitLayout(envelope: EnvelopeRow): LayoutBlock[] {
-	const content = parseStored(envelope.contentJson);
+function splitLayout(envelope: EnvelopeHead, budget: ParseBudget): LayoutBlock[] {
+	const content = readContent(envelope.id, budget);
 	if (!Array.isArray(content)) return [];
 	const { blocks } = splitEnvelope({
 		id: envelope.id,
@@ -158,26 +194,35 @@ function isQueued(messageId: string): boolean {
 }
 
 /**
- * The layout of an envelope as its blocks are addressed now: its rows when it is block
- * format (synced first if a write outside the store left it queued), else the decoder's.
- * A decoded id still resolves on a converted envelope: the rows were built from the same
- * split, so the k-th decoded block is the k-th row.
+ * The blocks of an envelope as they are addressed now: its rows when it is block format
+ * (synced first if a write outside the store left it queued), else the decoder's.
  */
-function layoutOf(envelope: EnvelopeRow): { rows: LayoutBlock[]; decoded: LayoutBlock[] } {
-	if (envelope.bodyFormat !== 2) return { rows: [], decoded: splitLayout(envelope) };
-	if (isQueued(envelope.id)) database.sqlite.transaction(() => syncQueued(envelope.id))();
-	const rows = rowLayout(envelope.id);
-	// A sync rebuilds rows from `content_json`; the content itself is unchanged.
-	const decoded = splitLayout(envelope);
-	if (decoded.length === rows.length)
-		for (const [index, block] of decoded.entries()) block.rowId = rows[index].rowId;
-	return { rows, decoded };
+function layoutOf(envelope: EnvelopeHead, budget: ParseBudget): LayoutBlock[] {
+	if (envelope.bodyFormat !== 2) return splitLayout(envelope, budget);
+	if (isQueued(envelope.id)) {
+		chargeParse(envelope.id, budget);
+		database.sqlite.transaction(() => syncQueued(envelope.id))();
+	}
+	return rowLayout(envelope.id);
 }
 
-/** The envelope a decoded id names (`${messageId}:…`; message ids hold no colon). */
-function decodedMessageId(blockId: string): string | null {
-	const colon = blockId.indexOf(":");
-	return colon > 0 ? blockId.slice(0, colon) : null;
+/**
+ * The envelope a decoded id names among the narrator's: decoded ids are
+ * `${messageId}:${suffix}`, and the suffix holds colons too (`:call:…`).
+ */
+function decodedMessageId(narratorId: string, blockId: string): string | null {
+	const prefixes: string[] = [];
+	for (let colon = blockId.indexOf(":"); colon > 0; colon = blockId.indexOf(":", colon + 1))
+		prefixes.push(blockId.slice(0, colon));
+	if (!prefixes.length) return null;
+	const row = database.sqlite
+		.prepare(
+			`SELECT message_id AS messageId FROM narrator_message_refs
+			 WHERE narrator_id = ? AND message_id IN (${prefixes.map(() => "?").join(",")})
+			 ORDER BY length(message_id) DESC LIMIT 1`,
+		)
+		.get(narratorId, ...prefixes) as { messageId: string } | null;
+	return row?.messageId ?? null;
 }
 
 /**
@@ -204,7 +249,7 @@ export function resolveBlockTargets(
 	);
 	const byMessage = new Map<string, string[]>();
 	for (const blockId of unique) {
-		const messageId = rowMessages.get(blockId) ?? decodedMessageId(blockId);
+		const messageId = rowMessages.get(blockId) ?? decodedMessageId(narratorId, blockId);
 		if (!messageId) throw new NotFoundError("Block", blockId);
 		byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), blockId]);
 	}
@@ -212,16 +257,17 @@ export function resolveBlockTargets(
 	const refSeq = database.sqlite.prepare(
 		"SELECT seq FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?",
 	);
+	const budget = newBudget();
 	for (const [messageId, ids] of byMessage) {
 		const ref = refSeq.get(narratorId, messageId) as { seq: number } | null;
 		if (!ref) throw new NotFoundError("Block", ids[0]);
-		const envelope = readEnvelope(messageId);
-		const { rows, decoded } = layoutOf(envelope);
+		const envelope = readHead(messageId);
+		const layout = layoutOf(envelope, budget);
 		for (const blockId of ids) {
-			const block =
-				rows.find((candidate) => candidate.rowId === blockId) ??
-				decoded.find((candidate) => candidate.decodedId === blockId);
-			// A row id that a sync replaced, or a decoded id the content no longer has.
+			const block = layout.find(
+				(candidate) => candidate.rowId === blockId || candidate.decodedId === blockId,
+			);
+			// A row id that a sync replaced, or a decoded id of an envelope that has rows now.
 			if (!block)
 				throw new AppError("Message history changed; reload and retry", 409, "BLOCK_TARGET_STALE");
 			resolved.set(blockId, {
@@ -273,6 +319,22 @@ export function materializeEnvelope(messageId: string): void {
 	})();
 }
 
+/**
+ * Give the targets' unconverted envelopes their rows before a mutation, so it removes rows
+ * by id and its decoded ids go stale with it. With block writes off nothing converts: the
+ * targets stay positions, as the index-addressed API has them.
+ */
+export function materializeTargets(targets: readonly BlockTarget[]): BlockTarget[] {
+	if (!settings.narratorBlocks.write) return [...targets];
+	const legacy = new Set(
+		targets.filter((target) => !target.rowId).map((target) => target.messageId),
+	);
+	for (const messageId of legacy) materializeEnvelope(messageId);
+	return targets.map((target) =>
+		target.rowId ? target : { ...target, rowId: rowAt(target.messageId, target.from)?.id ?? null },
+	);
+}
+
 /** The row holding the elements starting at `from` (rows keep their grouping across edits). */
 export function rowAt(messageId: string, from: number): { id: string } | null {
 	const block = rowLayout(messageId).find((candidate) => candidate.from === from);
@@ -294,6 +356,34 @@ export function lastTargetElement(targets: readonly BlockTarget[]): {
 			: latest,
 	);
 	return { messageId: last.messageId, blockIndex: last.to - 1 };
+}
+
+/**
+ * The position of a tool block's `tool_use` element, which the index-addressed revert
+ * planner checks. Usually the block's first element, but an envelope's first block also
+ * holds any elements before it that have no block of their own.
+ */
+export function toolElementIndex(target: BlockTarget): number {
+	if (target.kind !== "tool" || !target.wireId) return target.from;
+	if (target.rowId) {
+		const row = database.sqlite
+			.prepare(
+				`SELECT min(element.key) AS offset
+				 FROM narrator_blocks b, json_each(b.payload, '$.raw') AS element
+				 WHERE b.id = ? AND json_extract(element.value, '$.type') = 'tool_use'
+					AND json_extract(element.value, '$.id') = ?`,
+			)
+			.get(target.rowId, target.wireId) as { offset: number | null } | null;
+		return target.from + (row?.offset ?? 0);
+	}
+	const content = readContent(target.messageId, newBudget());
+	const elements = Array.isArray(content) ? content.slice(target.from, target.to) : [];
+	const offset = elements.findIndex(
+		(element) =>
+			(element as { type?: unknown })?.type === "tool_use" &&
+			(element as { id?: unknown }).id === target.wireId,
+	);
+	return target.from + Math.max(offset, 0);
 }
 
 /** Ceiling on one block's full body: the page truncates, this serves the rest on demand. */
@@ -324,7 +414,7 @@ export function blockDetail(target: BlockTarget): BlockDetail {
 		wireId: target.wireId,
 	};
 	if (!target.rowId) {
-		const content = parseStored(readEnvelope(target.messageId).contentJson);
+		const content = readContent(target.messageId, newBudget());
 		const elements = Array.isArray(content) ? content.slice(target.from, target.to) : [];
 		return { ...base, phase: null, revision: null, elements, originalElements: null };
 	}

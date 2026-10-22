@@ -234,6 +234,21 @@ describe("bodies not in rows", () => {
 });
 
 describe("body read helpers", () => {
+	test("a body's size is what content_json measures, an input's text counted once", async () => {
+		await writeConversation();
+		await narratorStore.appendInput("n1", "y".repeat(100_000));
+		blockSync.flushChangedEnvelopes();
+		const sizes = () =>
+			db
+				.select({ id: narratorMessages.id, bytes: bodyReads.storedBodyBytesSql() })
+				.from(narratorMessages)
+				.orderBy(narratorMessages.id)
+				.all();
+		const { legacy, blocks } = await readBoth(sizes);
+		expect(blocks).toEqual(legacy);
+		expect(Math.max(...blocks.map((row) => row.bytes))).toBeLessThan(101_000);
+	});
+
 	test("with block reads off they are the plain column and options", () => {
 		settings.narratorBlocks.read = false;
 		expect(bodyReads.contentJsonSql()).toBe(narratorMessages.contentJson as never);

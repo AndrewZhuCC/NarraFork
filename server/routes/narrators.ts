@@ -305,6 +305,7 @@ import {
 	blockDetail,
 	lastTargetElement,
 	resolveBlockTargets,
+	toolElementIndex,
 } from "../services/narrator-block-targets";
 import {
 	blockBody,
@@ -4115,7 +4116,7 @@ narratorRoutes.post("/:id/blocks/revert-action-preview", async (c) => {
 	if (action === "delete_tool_block") {
 		if (targets.length !== 1 || targets[0].kind !== "tool")
 			throw new ValidationError("A tool block deletion names exactly one tool block");
-		boundary = { messageId: targets[0].messageId, blockIndex: targets[0].from };
+		boundary = { messageId: targets[0].messageId, blockIndex: toolElementIndex(targets[0]) };
 	} else boundary = lastTargetElement(targets);
 	const result = await prepareLocalRevertAction(
 		narratorPrincipalOf(c),

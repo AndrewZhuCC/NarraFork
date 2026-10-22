@@ -988,6 +988,33 @@ describe("action-bound HTTP preview and real local execution", () => {
 				.all(),
 		).toEqual([]);
 	});
+	test("delete_tool_block refuses a call whose id another call of the message shares", async () => {
+		const path = join(workspace, "twin.txt");
+		await writeFile(path, "T0\n");
+		const first = await write(path, "T1\n");
+		const twin = await write(path, "T2\n", first.messageId);
+		db.update(schema.narratorToolCalls)
+			.set({ toolUseId: first.toolUseId })
+			.where(eq(schema.narratorToolCalls.id, twin.toolCallId))
+			.run();
+		const content = messageRow(first.messageId)?.contentJson as Array<{ id?: string }>;
+		db.update(schema.narratorMessages)
+			.set({
+				contentJson: content.map((element) =>
+					element.id === twin.toolUseId ? { ...element, id: first.toolUseId } : element,
+				),
+			})
+			.where(eq(schema.narratorMessages.id, first.messageId))
+			.run();
+		const before = history();
+		const body = await actionUnavailable(
+			await actionPreview("delete_tool_block", first.messageId, { blockIndex: first.blockIndex }),
+			"delete_tool_block",
+		);
+		expect(body.unavailable).toBe("incomplete_coverage");
+		expect(await readFile(path, "utf8")).toBe("T2\n");
+		expect(history()).toBe(before);
+	});
 	test("assistant rollback uses exact after_block and removes the entire later window", async () => {
 		const path = join(workspace, "window.txt");
 		const original = "A0\n1\n2\n3\nB0\n4\n5\n6\nC0\n";

@@ -150,9 +150,11 @@ type Applied = "converted" | "changed" | "gone" | "undecodable";
 function applyEnvelope(envelope: BackfillEnvelope): Applied {
 	const current = database.sqlite
 		.prepare(
-			"SELECT body_format AS bodyFormat, body_revision AS bodyRevision FROM narrator_messages WHERE id = ?",
+			`SELECT body_format AS bodyFormat, body_revision AS bodyRevision,
+				state_revision AS stateRevision
+			 FROM narrator_messages WHERE id = ?`,
 		)
-		.get(envelope.id) as { bodyFormat: number; bodyRevision: number } | null;
+		.get(envelope.id) as { bodyFormat: number; bodyRevision: number; stateRevision: number } | null;
 	// Deleted, or converted by a write since the worker read it.
 	if (!current || current.bodyFormat !== 1) return "gone";
 	if (!envelope.blocks) {
@@ -161,6 +163,7 @@ function applyEnvelope(envelope: BackfillEnvelope): Applied {
 	}
 	if (
 		current.bodyRevision !== envelope.bodyRevision ||
+		current.stateRevision !== envelope.stateRevision ||
 		ledgerFingerprint(database.sqlite, envelope.id) !== envelope.ledgerFingerprint
 	) {
 		// The plan is stale. Flip without rows: the sync queue trigger fires on the flip and

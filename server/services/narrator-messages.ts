@@ -87,8 +87,13 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
-import { newEnvelopeColumns } from "./narrator-block-sync";
-import { resolveBlockTargets, targetElements } from "./narrator-block-targets";
+import { newEnvelopeColumns, syncEnvelopeNow, withRetiredBlocks } from "./narrator-block-sync";
+import {
+	MAX_BLOCK_DELETE_ELEMENTS,
+	materializeTargets,
+	resolveBlockTargets,
+	targetElements,
+} from "./narrator-block-targets";
 import {
 	bodyColumns,
 	contentJsonSql,
@@ -901,13 +906,19 @@ function applyBlockDeletionTx(
 	}
 }
 
-/** File attempts finish first; a separate bounded history transaction retains COW and selection checks. */
+/**
+ * File attempts finish first; a separate bounded history transaction retains COW and selection checks.
+ * A delete by block id (`byBlock`) selects whole blocks, whose elements may outnumber the block
+ * cap, and names the rows it removes: the transaction rebuilds the envelopes' rows with those
+ * retired, so no remaining block takes over a removed block's id.
+ */
 async function deleteBlockSelection(
 	narratorId: string,
 	blocks: BlockSelection[],
 	opts?: BlockDeleteOptions,
+	byBlock?: { retiredRows: readonly string[] },
 ) {
-	if (blocks.length > MAX_BATCH_DELETE_BLOCKS) {
+	if (blocks.length > (byBlock ? MAX_BLOCK_DELETE_ELEMENTS : MAX_BATCH_DELETE_BLOCKS)) {
 		throw new ValidationError(`Select at most ${MAX_BATCH_DELETE_BLOCKS} blocks`);
 	}
 	const grouped = new Map<string, number[]>();
@@ -982,6 +993,7 @@ async function deleteBlockSelection(
 						seq: plan.ref.seq,
 					});
 			}
+			for (const { id } of updatedMessageIds) syncEnvelopeNow(id);
 			if (!opts?.skipNarratorUpdate) {
 				tx.update(narrators)
 					.set({
@@ -998,7 +1010,7 @@ async function deleteBlockSelection(
 	try {
 		if (snapshotRevert && opts?.principal) await authorizeRevertHistory(narratorId, opts);
 		opts?.signal?.throwIfAborted();
-		mutate();
+		withRetiredBlocks(byBlock?.retiredRows ?? [], mutate);
 	} catch (error) {
 		if (snapshotRevert) throw snapshotHistoryFailure(snapshotRevert, error);
 		throw error;
@@ -5237,11 +5249,12 @@ const narratorMessageQueriesUnlocked = {
 	 * attachments, and a reasoning run is the ids of all its blocks.
 	 */
 	async deleteBlocks(narratorId: string, blockIds: string[], opts?: BlockDeleteOptions) {
-		const targets = resolveBlockTargets(narratorId, blockIds);
+		const targets = materializeTargets(resolveBlockTargets(narratorId, blockIds));
 		const { results, ...outcome } = await deleteBlockSelection(
 			narratorId,
 			targetElements(targets),
 			opts,
+			{ retiredRows: targets.flatMap((target) => (target.rowId ? [target.rowId] : [])) },
 		);
 		const deletedMessages = new Set(
 			results.filter((result) => result.messageDeleted).map((result) => result.messageId),

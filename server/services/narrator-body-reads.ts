@@ -19,6 +19,7 @@ import { sql } from "drizzle-orm";
 import * as database from "../db";
 import { narratorMessages } from "../db/schema";
 import { blockBodies } from "../lib/narrator-bodies";
+import { assembledBodyLengthSql } from "../lib/narrator-body-length";
 import { blockReadsEnabled } from "./narrator-block-scans";
 
 /** The envelope columns the expression reads: `narratorMessages`, or a relational alias of it. */
@@ -38,11 +39,6 @@ export function contentJsonSql(table: EnvelopeColumns = narratorMessages): SQL<u
 	return sql`CASE WHEN ${blocksCurrent(table)} THEN NULL ELSE ${table.contentJson} END`.mapWith(
 		table.contentJson,
 	);
-}
-
-/** Envelope columns read by the predicates below. */
-interface SizedEnvelopeColumns extends EnvelopeColumns {
-	bodyBytes: AnyColumn;
 }
 
 /** Whether the envelope's block rows are current, so they hold its body. */
@@ -76,15 +72,22 @@ export function hasStoredElementSql(
 }
 
 /**
- * The stored size of the envelope's body: `body_bytes` (the sum of its rows) for a
- * block-format envelope, so the body is not read just to be measured; the length of
- * `content_json` otherwise.
+ * The size in bytes of the envelope's body, for limits on it (a composer document's cap,
+ * history recovery's thresholds): of the array its rows assemble to when they hold it
+ * (`assembledBodyLengthSql`, exactly what `content_json` measures), of `content_json`
+ * otherwise. Not `body_bytes`, which counts an input's text twice.
  */
-export function storedBodyBytesSql(table: SizedEnvelopeColumns = narratorMessages): SQL<number> {
+export function storedBodyBytesSql(table: EnvelopeColumns = narratorMessages): SQL<number> {
 	const json = sql`length(CAST(${table.contentJson} AS BLOB))`;
 	if (!blockReadsEnabled()) return sql<number>`${json}`;
-	return sql<number>`(CASE WHEN ${table.bodyFormat} = 2 AND ${table.bodyBytes} > 0
-		THEN ${table.bodyBytes} ELSE ${json} END)`;
+	const marker = "{{envelope}}";
+	const assembled = sql.join(
+		assembledBodyLengthSql(marker, "bytes")
+			.split(marker)
+			.map((part) => sql.raw(part)),
+		sql`${table.id}`,
+	);
+	return sql<number>`(CASE WHEN ${blocksCurrent(table)} THEN ${assembled} ELSE ${json} END)`;
 }
 
 /**

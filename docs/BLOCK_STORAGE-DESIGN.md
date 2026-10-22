@@ -1620,9 +1620,16 @@ reconcile(narrator, target, now):
   - P2c-3：前端以块 id 为键的 store，删除流式交接启发式，同一 PR 打开 `wsV2`。
 - **按块寻址**（`server/services/narrator-block-targets.ts`）：
   - 块 id 解析为它所持有的元素区间：
-    - 有块行的信封按各行 `payload.raw` 的长度累加（在同步队列里的先同步，未变的块 id 不变）；
-    - 未转换的旧信封用解码器给出的 id，经 `splitEnvelope` 匹配。
+    - 有块行的信封按各行 `payload.raw` 的长度累加，不解析正文（在同步队列里的先同步，未变的块 id 不变）；
+    - 未转换的旧信封用解码器给出的 id，经 `splitEnvelope` 匹配。解码 id 表示位置，只在信封仍是旧格式时有效；信封有了块行（转换或被按块操作物化）后解码 id 一律 409。
+    - 一次解析解析正文的总量有上限（旧信封与待同步信封合计 32 MiB，单个 16 MiB）。
   - 解析在叙述者的 admission 内进行，结果交给现有有界、带 COW 的历史机制，所以安全检查与按下标的路径相同。
+  - 按块删除先物化目标旧信封（块写入开启时），再按行删除：删除事务内即重建块行，并把被删的行标为 retired（`withRetiredBlocks`），同步与 COW 副本都不会让剩下的块接走被删块的 id。重试同一删除因此失败，而不是删掉顶上来的块。
+- **块行匹配**（`matchBlocks`，`shared/narrator-blocks/storage.ts`；同步与 COW 血缘共用）：
+  1. 有自身身份的块（tool 调用、带 id 的元素、输入的整块）按 key 匹配，无论移到哪里；
+  2. 其余按顺序对齐：身份按 key、无身份的按 payload 原文（最长公共子序列，先去掉相同的头尾），删除或插入一个无 id 的块不会把它的 id 交给只是同类型、同位置的邻居，`original_payload` 也不会迁到别的块；
+  3. 仍未匹配的，在相邻两个对齐块之间按类型顺序配对：原地编辑或流式增长的块保留其行。
+  - 此前按 `type#n` 位置 key 匹配：删掉第一个无 id 文本后，第二个文本会接走它的 id 与 `original_payload`。
 - **新接口**（按下标的旧接口保留，供 P2c-3 之前的前端使用）：
   - `DELETE /:id/blocks`：整块删除。tool 块连同其调用的全部账本 attempt；`input` 连同全部附件；reasoning run 传整组 id（修正附录 B 第 18、19 条）。
   - `POST /:id/blocks/rollback`：所有目标块整块保留，删除最后一块之后的内容（修正附录 B 第 19 条）。
@@ -1646,6 +1653,8 @@ reconcile(narrator, target, now):
 - **余下的纯读取方**（`server/services/narrator-body-reads.ts`）：
   - 消息查询族（分页、最近消息、compact 摘要、历史恢复）、卡片关闭检查、段压缩、事件处理与会话中的广播重读、publication、子代理提取、prompt 优化上下文、计划任务清理，都按 P2b 的规则读块行。
   - 工具续跑的恢复排序改按 tool 块的 `ordinal`（§9），不再读正文。
+  - 对正文本身设限的地方（`storedBodyBytesSql`：composer 文档上限、历史恢复阈值、计划任务清理、工具续跑）按块行组装出的数组精确计算（`assembledBodyLengthSql`），与 `content_json` 的长度一致；不用 `body_bytes`，它把输入的文本按 model text 又算了一遍。只用来切分读取批次的（worker 里的 `bodyBytesSql`）仍用 `body_bytes`：高估只会让批次变小，且不必为测量而读正文。
+- **回填**：计划同时记录 `state_revision`；worker 读取后发生的状态写入（如翻译）会让应用改走"翻转格式 + 同步队列"，不再用过期计划建行。
 - **留给 P3 的 `content_json` 读改写：** `narrator-output-recovery`、编辑重生成与工具清理、删除叙述者时的归属转移、`updateCompactSummary`、计划输入补丁、`copyOnWriteMessage`、`discardAttemptBlocks`、段压缩摘要更新、compact 定稿；以及按 `content_json` 精确字节摘要与重写的回退管线（`revert-selection-service`、`revert-history-commit`）。双写期间这些路径的结果不变。
 
 ### P3 退役与新能力

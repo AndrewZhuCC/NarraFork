@@ -209,6 +209,118 @@ export function splitEnvelope(
 	return { blocks, envelope };
 }
 
+/** A block as row matching sees it: its codec key and its stored payload text. */
+export interface MatchableBlock {
+	key: string;
+	payload: string;
+}
+
+/** Past this many alignment cells only the common head and tail align (a bulk rewrite). */
+const ALIGN_CELLS = 1 << 22;
+
+const POSITIONAL_SUFFIX = /#\d+(?:~\d+)?$/;
+
+/** The element type of a key made from position (`type#n`); undefined for an identity. */
+function positionalType(key: string): string | undefined {
+	return !key.includes(":") && POSITIONAL_SUFFIX.test(key)
+		? key.replace(POSITIONAL_SUFFIX, "")
+		: undefined;
+}
+
+/**
+ * Which of `before` (an envelope's rows, in ordinal order) each of `after` (the blocks its
+ * content splits into now) continues: an index into `before`, or undefined for a new
+ * block. A row is continued at most once.
+ *
+ *   1. A block with an identity of its own (a tool call, an element id, an input's single
+ *      block) continues the row with the same key, wherever it moved.
+ *   2. All blocks align in order, identities by key and the rest by payload, so a block
+ *      removed or added never hands its id to a neighbour that only shares its type and
+ *      position: deleting the first of two id-less texts keeps the second text's row.
+ *   3. Blocks still unmatched pair up by type, in order, between the same two aligned
+ *      blocks: a block edited or streamed in place keeps its row.
+ */
+export function matchBlocks(
+	before: readonly MatchableBlock[],
+	after: readonly MatchableBlock[],
+): Array<number | undefined> {
+	const matched = new Array<number | undefined>(after.length).fill(undefined);
+	const taken = new Array<boolean>(before.length).fill(false);
+	const take = (from: number, to: number) => {
+		matched[to] = from;
+		taken[from] = true;
+	};
+
+	const identities = new Map<string, number>();
+	before.forEach((block, index) => {
+		if (positionalType(block.key) === undefined) identities.set(block.key, index);
+	});
+	after.forEach((block, index) => {
+		const from = positionalType(block.key) === undefined ? identities.get(block.key) : undefined;
+		if (from !== undefined && !taken[from]) take(from, index);
+	});
+
+	const tokens = new Map<string, number>();
+	const tokenOf = (block: MatchableBlock) => {
+		const text =
+			positionalType(block.key) === undefined ? `key\0${block.key}` : `raw\0${block.payload}`;
+		const token = tokens.get(text) ?? tokens.size;
+		tokens.set(text, token);
+		return token;
+	};
+	const a = before.map(tokenOf);
+	const b = after.map(tokenOf);
+	const anchors: Array<[number, number]> = [];
+	let head = 0;
+	while (head < a.length && head < b.length && a[head] === b[head]) anchors.push([head, head++]);
+	let endA = a.length;
+	let endB = b.length;
+	const tail: Array<[number, number]> = [];
+	while (endA > head && endB > head && a[endA - 1] === b[endB - 1]) tail.push([--endA, --endB]);
+	const rows = endA - head;
+	const cols = endB - head;
+	if (rows > 0 && cols > 0 && (rows + 1) * (cols + 1) <= ALIGN_CELLS) {
+		// Longest common subsequence of the middle; lcs[i][j] covers a[head+i..], b[head+j..].
+		const width = cols + 1;
+		const lcs = new Int32Array((rows + 1) * width);
+		for (let i = rows - 1; i >= 0; i--)
+			for (let j = cols - 1; j >= 0; j--)
+				lcs[i * width + j] =
+					a[head + i] === b[head + j]
+						? lcs[(i + 1) * width + j + 1] + 1
+						: Math.max(lcs[(i + 1) * width + j], lcs[i * width + j + 1]);
+		for (let i = 0, j = 0; i < rows && j < cols; ) {
+			if (a[head + i] === b[head + j]) anchors.push([head + i++, head + j++]);
+			else if (lcs[(i + 1) * width + j] >= lcs[i * width + j + 1]) i++;
+			else j++;
+		}
+	}
+	anchors.push(...tail.reverse());
+	for (const [from, to] of anchors) if (matched[to] === undefined && !taken[from]) take(from, to);
+
+	let previousA = -1;
+	let previousB = -1;
+	for (const [endFrom, endTo] of [...anchors, [before.length, after.length] as [number, number]]) {
+		const waiting = new Map<string, number[]>();
+		for (let from = previousA + 1; from < endFrom; from++) {
+			const type = positionalType(before[from].key);
+			if (type === undefined || taken[from]) continue;
+			const queue = waiting.get(type);
+			if (queue) queue.push(from);
+			else waiting.set(type, [from]);
+		}
+		for (let to = previousB + 1; to < endTo; to++) {
+			const type = positionalType(after[to].key);
+			const from =
+				type === undefined || matched[to] !== undefined ? undefined : waiting.get(type)?.shift();
+			if (from !== undefined) take(from, to);
+		}
+		previousA = endFrom;
+		previousB = endTo;
+	}
+	return matched;
+}
+
 /**
  * Whether `after` differs from `before` only in reader-only fields: same elements, same
  * fields outside `state`. A state-only write (§5.4) is one of these whose blocks also keep

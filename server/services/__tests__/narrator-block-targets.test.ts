@@ -167,6 +167,30 @@ describe("resolving block ids", () => {
 		expect(() => targets.resolveBlockTargets("n1", ["no-such-block"])).toThrow();
 	});
 
+	test("a tool block's call element is found past elements that ride with it", async () => {
+		const stepId = await step();
+		const tool = content(stepId).find((element) => element.type === "tool_use");
+		// Content written outside the store: an element without a block of its own leads.
+		sqlite.run("UPDATE narrator_messages SET content_json = ? WHERE id = ?", [
+			JSON.stringify([{ type: "bash_display", text: "$ ls" }, tool]),
+			stepId,
+		]);
+		const [target] = targets.resolveBlockTargets("n1", [blockOf(stepId, "tool")]);
+		expect([target.from, target.to]).toEqual([0, 2]);
+		expect(targets.toolElementIndex(target)).toBe(1);
+	});
+
+	test("converted envelopes resolve without parsing their content", async () => {
+		const stepId = await step();
+		const tool = blockOf(stepId, "tool");
+		const [before] = targets.resolveBlockTargets("n1", [tool]);
+		sqlite.run("UPDATE narrator_messages SET content_json = '\"unreadable\"' WHERE id = ?", [
+			stepId,
+		]);
+		sqlite.run("DELETE FROM narrator_block_sync_queue");
+		expect(targets.resolveBlockTargets("n1", [tool])).toEqual([before]);
+	});
+
 	test("an envelope waiting in the sync queue is brought current first", async () => {
 		const stepId = await step();
 		const kept = blockOf(stepId, "tool");
@@ -206,8 +230,7 @@ describe("operations by block id", () => {
 			"text",
 			"text",
 		]);
-		// The index-addressed deletion leaves its envelope to the sync queue.
-		sqlite.transaction(() => blockSync.flushChangedEnvelopes())();
+		// The deletion rebuilds the envelope's rows in its own transaction.
 		expect(assembled(stepId)).toEqual(content(stepId));
 	});
 
@@ -325,5 +348,111 @@ describe("operations by block id", () => {
 			elements: [expect.objectContaining({ id: "r2", text: "second thought" })],
 			originalElements: null,
 		});
+	});
+});
+
+/** A step of id-less texts around a tool call: blocks keyed only by type and position. */
+async function idlessStep(texts: [string, string], narratorId = "n1") {
+	const opened = await narratorStore.openStep(narratorId, { uuid: "u", session_id: "s" });
+	const write = (item: Parameters<typeof narratorStore.writeStepItem>[2]) =>
+		narratorStore.writeStepItem(opened.id, narratorId, item);
+	await write({ type: "text", text: texts[0], completed: true, outputIndex: 0 } as never);
+	await write({
+		type: "tool_use",
+		id: "c1",
+		name: "Bash",
+		input: { command: "ls" },
+		outputIndex: 1,
+	});
+	await write({ type: "text", text: texts[1], completed: true, outputIndex: 2 } as never);
+	return opened.id;
+}
+
+const texts = (messageId: string) =>
+	content(messageId)
+		.filter((element) => element.type === "text")
+		.map((element) => element.text);
+
+describe("block ids survive deletes and edits of their neighbours", () => {
+	test("a retried delete fails instead of removing the block that moved up", async () => {
+		const stepId = await idlessStep(["Alpha", "Beta"]);
+		const [alpha, beta] = [blockOf(stepId, "output", 0), blockOf(stepId, "output", 1)];
+		await narratorService.deleteBlocks("n1", [alpha], { skipRevert: true });
+		expect(texts(stepId)).toEqual(["Beta"]);
+		expect(blockOf(stepId, "output")).toBe(beta);
+		await expect(
+			narratorService.deleteBlocks("n1", [alpha], { skipRevert: true }),
+		).rejects.toThrow();
+		expect(texts(stepId)).toEqual(["Beta"]);
+	});
+
+	test("of two identical texts, the one not deleted keeps its id", async () => {
+		for (const deleted of [0, 1]) {
+			cleanDb(sqlite);
+			sqlite.run(
+				"INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('n1', 'N', ?, ?)",
+				[NOW, NOW],
+			);
+			const stepId = await idlessStep(["Done.", "Done."]);
+			const ids = [blockOf(stepId, "output", 0), blockOf(stepId, "output", 1)];
+			await narratorService.deleteBlocks("n1", [ids[deleted]], { skipRevert: true });
+			expect(rows(stepId).map((row) => row.id)).not.toContain(ids[deleted]);
+			expect(blockOf(stepId, "output")).toBe(ids[1 - deleted]);
+		}
+	});
+
+	test("a deleted block's pre-edit body stays with it, in place or in a copy", async () => {
+		for (const shared of [false, true]) {
+			cleanDb(sqlite);
+			for (const id of ["n1", "n2"])
+				sqlite.run(
+					"INSERT INTO narrators (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+					[id, id, NOW, NOW],
+				);
+			const stepId = await idlessStep(["Alpha original", "Beta original"]);
+			await session.editOutputBlock("n1", blockOf(stepId, "output", 0), "Alpha edited", null);
+			if (shared)
+				sqlite.run(
+					"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('fork-ref', 'n2', ?, 1)",
+					[stepId],
+				);
+			await narratorService.deleteBlocks("n1", [blockOf(stepId, "output", 0)], {
+				skipRevert: true,
+			});
+			const messageId = (
+				sqlite
+					.prepare("SELECT message_id AS id FROM narrator_message_refs WHERE narrator_id = 'n1'")
+					.get() as { id: string }
+			).id;
+			expect(messageId === stepId).toBe(!shared);
+			expect(texts(messageId)).toEqual(["Beta original"]);
+			expect(rows(messageId).every((row) => row.originalPayload === null)).toBe(true);
+			// Restoring the remaining text is a no-op, not a revival of the deleted one's body.
+			await session.restoreOutputBlock("n1", blockOf(messageId, "output")).catch(() => undefined);
+			expect(texts(messageId)).toEqual(["Beta original"]);
+		}
+	});
+
+	test("an edit in place keeps the edited block's id and its neighbours'", async () => {
+		const stepId = await idlessStep(["Alpha", "Beta"]);
+		const before = rows(stepId).map((row) => row.id);
+		await session.editOutputBlock("n1", before[0], "Beta", null);
+		expect(texts(stepId)).toEqual(["Beta", "Beta"]);
+		expect(rows(stepId).map((row) => row.id)).toEqual(before);
+	});
+
+	test("a decoded id goes stale once a delete gives its envelope rows", async () => {
+		settings.narratorBlocks.write = false;
+		const stepId = await idlessStep(["Alpha", "Beta"]);
+		settings.narratorBlocks.write = true;
+		expect(rows(stepId)).toEqual([]);
+		const decoded = `${stepId}:0`;
+		await narratorService.deleteBlocks("n1", [decoded], { skipRevert: true });
+		expect(texts(stepId)).toEqual(["Beta"]);
+		expect(assembled(stepId)).toEqual(content(stepId));
+		await expect(
+			narratorService.deleteBlocks("n1", [decoded], { skipRevert: true }),
+		).rejects.toThrow("Message history changed");
+		expect(texts(stepId)).toEqual(["Beta"]);
 	});
 });
