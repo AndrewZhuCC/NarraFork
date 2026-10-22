@@ -8,6 +8,7 @@ import {
 	createFileRoute,
 	Outlet,
 	useNavigate,
+	useRouter,
 	useRouterState,
 	useSearch,
 } from "@tanstack/react-router";
@@ -456,8 +457,29 @@ function SettingsProvidersPage() {
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
 	const [testingModel, setTestingModel] = useState<string | null>(null);
-	// selectedProvider: provider ID for multi-instance providers, prefix for platform providers (codex)
-	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+	// The open provider lives in the URL (`?provider=`), not in component state, so deep
+	// links (model picker, Codex quota, TokenDance recovery), reloads and back/forward all
+	// land on the same page. Opening from the overview pushes an entry and closing steps
+	// back over it; closing a deep-linked detail replaces its entry with the overview.
+	const router = useRouter();
+	const setSelectedProvider = useCallback(
+		(key: string | null) => {
+			if (key) {
+				void navigate({
+					to: "/settings/providers",
+					search: { provider: key },
+					state: (prev) => ({ ...prev, providerDetailFromOverview: true }),
+				});
+				return;
+			}
+			if (router.state.location.state.providerDetailFromOverview) {
+				router.history.back();
+				return;
+			}
+			void navigate({ to: "/settings/providers", search: {}, replace: true });
+		},
+		[navigate, router],
+	);
 
 	useEffect(() => {
 		if (providerSettingsDirty) {
@@ -531,8 +553,8 @@ function SettingsProvidersPage() {
 			const id = creationIdRef.current ?? nanoid();
 			creationIdRef.current = id;
 			const result = await createProvider(id, draft);
-			if (providerPageMountedRef.current && isAddingRef.current && creationIdRef.current === id)
-				setSelectedProvider(result.providerId);
+			const openCreated =
+				providerPageMountedRef.current && isAddingRef.current && creationIdRef.current === id;
 			if ("refreshError" in result) {
 				notifications.show({
 					title: t("addProviderSavedRefreshFailed"),
@@ -549,6 +571,8 @@ function SettingsProvidersPage() {
 					color: "green",
 				});
 			}
+			// The add route navigates back with this id, which opens the new provider.
+			return openCreated ? result.providerId : undefined;
 		},
 		[createProvider, t, tc],
 	);
@@ -952,36 +976,31 @@ function SettingsProvidersPage() {
 		t,
 	]);
 
-	// `?provider=` deep link (model picker's provider settings button, Codex quota
-	// indicator, TokenDance recovery). Accepts a provider id or a model prefix and
-	// opens that provider's config once per link, so going back to the overview
-	// afterwards is not undone by later state changes.
-	const consumedProviderLinkRef = useRef<string | null>(null);
-	useEffect(() => {
+	// Resolve `?provider=` (a provider id or a model prefix) to a key the config view can
+	// render: the provider id for multi-instance providers, the prefix for platform and
+	// plugin providers. Anything else (an unknown or not-yet-loaded target, or a prefix
+	// that only carries custom models) shows the overview rather than an empty detail.
+	const selectedProvider = useMemo(() => {
 		const target = search.provider;
-		if (!target) {
-			consumedProviderLinkRef.current = null;
-			return;
-		}
-		if (consumedProviderLinkRef.current === target) return;
-		if (target === "tokendance") {
-			if (!tokenDance?.connected) return;
-			consumedProviderLinkRef.current = target;
-			setSelectedProvider("tokendance");
-			return;
-		}
-		if (target === "codex") {
-			consumedProviderLinkRef.current = target;
-			setSelectedProvider("codex");
-			return;
-		}
-		const group =
-			providerGroups.find((item) => item.providerId === target) ??
-			providerGroups.find((item) => item.prefix === target);
-		if (!group) return;
-		consumedProviderLinkRef.current = target;
-		setSelectedProvider(group.providerId ?? group.prefix);
-	}, [search.provider, tokenDance?.connected, providerGroups]);
+		if (!target) return null;
+		if (target === "tokendance") return tokenDance?.connected ? "tokendance" : null;
+		if (target === "codex" || target === "CommandCode") return target;
+		const configured = [...state.customApiProviders, ...state.nugProviders];
+		const byId = configured.find((p) => p.id === target);
+		if (byId) return byId.id;
+		const lower = target.toLowerCase();
+		const byPrefix =
+			configured.find((p) => p.prefix === target) ??
+			configured.find((p) => p.prefix?.toLowerCase() === lower);
+		if (byPrefix) return byPrefix.id;
+		return pluginProviderGroups?.some((group) => group.prefix === target) ? target : null;
+	}, [
+		search.provider,
+		tokenDance?.connected,
+		state.customApiProviders,
+		state.nugProviders,
+		pluginProviderGroups,
+	]);
 
 	// ── Provider label for detail panel ──
 	/**

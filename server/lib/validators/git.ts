@@ -107,24 +107,36 @@ export const gitCommitDiffQuerySchema = z.object({
  * client-local offset, which the comparison handles because boundaries are normalized to
  * UTC before they reach it.
  */
-export const gitModificationsQuerySchema = z.object({
-	limit: z.coerce.number().int().min(1).max(2000).optional(),
-	since: z.iso.datetime({ offset: true }).optional(),
-	until: z.iso.datetime({ offset: true }).optional(),
-	/**
-	 * A narrator id, or the literal `"external"` selecting changes with no narrator at all.
-	 * Length-bounded rather than pattern-matched: ids are nanoid, whose alphabet includes
-	 * `-` and `_`, and short ids (8 chars) are as valid as the 21-char default.
-	 */
-	narratorId: z.union([z.literal("external"), z.string().trim().min(1).max(64)]).optional(),
-	scope: z.literal("uncommitted").optional(),
-	/**
-	 * Which projections to build. `byFile` omits the full timeline but includes a bounded
-	 * per-file event summary for the Git status hover card. Absent means "everything", so
-	 * an older client is unaffected.
-	 */
-	projection: z.enum(["all", "byFile"]).optional(),
-});
+export const gitModificationsQuerySchema = z
+	.object({
+		limit: z.coerce.number().int().min(1).max(2000).optional(),
+		since: z.iso.datetime({ offset: true }).optional(),
+		until: z.iso.datetime({ offset: true }).optional(),
+		/**
+		 * A narrator id, or the literal `"external"` selecting changes with no narrator at all.
+		 * Length-bounded rather than pattern-matched: ids are nanoid, whose alphabet includes
+		 * `-` and `_`, and short ids (8 chars) are as valid as the 21-char default.
+		 */
+		narratorId: z.union([z.literal("external"), z.string().trim().min(1).max(64)]).optional(),
+		scope: z.literal("uncommitted").optional(),
+		/**
+		 * Which projections to build. `byFile` omits the full timeline but includes a bounded
+		 * per-file event summary for the Git status hover card. Absent means "everything", so
+		 * an older client is unaffected.
+		 */
+		projection: z.enum(["all", "byFile"]).optional(),
+		/**
+		 * One Git-root-relative path for the hover card. It only selects an entry of the
+		 * server's own status; rename sources and cwd scopes are never accepted from clients.
+		 */
+		filePath: z.string().min(1).max(4096).optional(),
+	})
+	.refine(
+		(query) =>
+			query.filePath === undefined ||
+			(query.scope === "uncommitted" && query.projection === "byFile"),
+		{ message: "filePath requires scope=uncommitted and projection=byFile", path: ["filePath"] },
+	);
 
 // === commits list ===
 

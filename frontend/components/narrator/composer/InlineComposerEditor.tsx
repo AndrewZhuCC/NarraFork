@@ -127,6 +127,8 @@ export interface InlineComposerEditorProps {
 }
 
 const candidateKey = new PluginKey<number | null>("inlineComposerCandidate");
+/** Bounds the unacknowledged-emission queue for a parent that never renders changes back. */
+const MAX_PENDING_ECHOES = 32;
 
 type AtomNode = Exclude<ComposerInlineNode, { type: "text" } | { type: "break" }>;
 type AtomContextValue = Pick<
@@ -478,6 +480,14 @@ export const InlineComposerEditor = forwardRef<
 	const latestRef = useRef(props.value);
 	const signatureRef = useRef(JSON.stringify(props.value));
 	const actualSignatureRef = useRef<string | null>(null);
+	/*
+	 * Documents emitted through onChange that the parent has not rendered back yet,
+	 * oldest first. Under load the parent can commit an older emission after the
+	 * editor moved on (an insert's render landing after the next undo); such a stale
+	 * echo is not a new controlled value, and replacing the document with it would
+	 * rebuild the state and wipe the undo history.
+	 */
+	const pendingEchoesRef = useRef<string[]>([]);
 	const receivedValueRef = useRef(props.value);
 	const transactionStartedRef = useRef(0);
 	const candidateHostRef = useRef<HTMLSpanElement | null>(null);
@@ -709,6 +719,8 @@ export const InlineComposerEditor = forwardRef<
 			latestRef.current = document;
 			signatureRef.current = JSON.stringify(document);
 			actualSignatureRef.current = signatureRef.current;
+			pendingEchoesRef.current.push(signatureRef.current);
+			if (pendingEchoesRef.current.length > MAX_PENDING_ECHOES) pendingEchoesRef.current.shift();
 			propsRef.current.onChange(document);
 			for (const asset of removed) propsRef.current.onRemoveAsset?.(asset.id);
 			if (transactionStartedRef.current)
@@ -790,8 +802,18 @@ export const InlineComposerEditor = forwardRef<
 	useEffect(() => {
 		if (!editor || receivedValueRef.current === props.value) return;
 		receivedValueRef.current = props.value;
+		const signature = JSON.stringify(props.value);
+		const echo = pendingEchoesRef.current.indexOf(signature);
+		if (echo >= 0) {
+			// The parent caught up to (at least) this emission; anything older is settled.
+			pendingEchoesRef.current.splice(0, echo + 1);
+			return;
+		}
 		// Internal render/imperative restore is not a newly received controlled value.
-		if (JSON.stringify(props.value) !== signatureRef.current) replaceDocument(props.value);
+		if (signature !== signatureRef.current) {
+			pendingEchoesRef.current = [];
+			replaceDocument(props.value);
+		}
 	});
 	useLayoutEffect(() => {
 		if (!editor) return;

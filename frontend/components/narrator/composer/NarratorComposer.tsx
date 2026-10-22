@@ -28,7 +28,7 @@ import { useDraftComposerCommands, useNarratorCommands } from "../../../hooks/us
 import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInputHistory";
 import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
-import { ApiError, api } from "../../../lib/api";
+import { api } from "../../../lib/api";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
@@ -336,9 +336,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const [draftSyncState, setDraftSyncState] = useState<"loading" | "ready" | "error" | "local">(
 			"loading",
 		);
-		// A remote write replaced non-empty local content; the overwritten version
-		// sits in the server's undo slot until restored or the user edits again.
-		const [draftReplacedByRemote, setDraftReplacedByRemote] = useState(false);
+		/*
+		 * A draft version this composer set aside, offered back until the user edits,
+		 * restores or dismisses it. "remote": another editor replaced what was shown
+		 * here. "stale": this device's unsynced edits lost to a newer server draft.
+		 * Held in memory rather than in the server's undo slot, which only remembers
+		 * the newest overwrite and so drifts once the other editor keeps typing.
+		 */
+		const [displacedDraft, setDisplacedDraft] = useState<{
+			kind: "remote" | "stale";
+			input: FileReferenceInput;
+		} | null>(null);
 		const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
 		const inputRef = useRef(input);
 		const draftSourceIdRef = useRef(createDraftSourceId());
@@ -349,6 +357,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			unsynced: boolean;
 		} | null>(null);
 		const lastDraftRevisionRef = useRef<number | null>(null);
+		// Highest revision announced to this composer, including summaries whose body is still loading.
+		const seenDraftRevisionRef = useRef<number | null>(null);
+		// Revision known when the current unsynced edits began; edits begun before a remote
+		// revision are older than it, edits begun after it are newer.
+		const unsyncedBaseRevisionRef = useRef<number | null>(null);
 		const lastDraftUpdatedAtRef = useRef<string | null>(null);
 		const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 		const draftSyncSeqRef = useRef(0);
@@ -727,6 +740,18 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			},
 		});
 
+		const hasUnsyncedLocalInput = useCallback(() => {
+			if (lastSyncedDraftRef.current)
+				return !sameFileReferenceInput(inputStateRef.current, lastSyncedDraftRef.current);
+			const unknown = unacknowledgedDraftRef.current;
+			return !!(
+				inputRef.current ||
+				inputStateRef.current.fileReferences.length ||
+				unknown?.unsynced ||
+				(unknown && !sameFileReferenceInput(inputStateRef.current, unknown.input))
+			);
+		}, []);
+
 		useEffect(() => {
 			if (
 				!currentUserId ||
@@ -735,18 +760,24 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				draftOwnerScopeRef.current !== currentDraftScope
 			)
 				return;
+			if (!hasUnsyncedLocalInput()) unsyncedBaseRevisionRef.current = null;
+			else
+				unsyncedBaseRevisionRef.current ??= Math.max(
+					lastDraftRevisionRef.current ?? -1,
+					seenDraftRevisionRef.current ?? -1,
+				);
 			const unknown = unacknowledgedDraftRef.current;
 			const unknownEdited =
 				unknown &&
 				(unknown.unsynced || !sameFileReferenceInput(inputStateRef.current, unknown.input));
 			// Without a trusted server baseline, reverting to the restored value cannot acknowledge edits.
 			if (unknownEdited) unknown.unsynced = true;
-			// Editing resumes: the remote-replace notice and its undo offer are stale.
+			// Editing resumes: the displaced-draft notice and its restore offer are stale.
 			if (
 				lastSyncedDraftRef.current &&
 				!sameFileReferenceInput(inputState, lastSyncedDraftRef.current)
 			)
-				setDraftReplacedByRemote(false);
+				setDisplacedDraft(null);
 			persistNarratorInputDraft(
 				currentUserId,
 				narratorId,
@@ -767,6 +798,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			narratorId,
 			sendingRef,
 			readPersistableDocument,
+			hasUnsyncedLocalInput,
 		]);
 
 		const syncDraftNow = useCallback(
@@ -807,6 +839,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					};
 					lastDraftRevisionRef.current = result.revision;
 					lastDraftUpdatedAtRef.current = result.updatedAt;
+					// Typing that continued during the save builds on it, not on an older base.
+					unsyncedBaseRevisionRef.current = sameFileReferenceInput(
+						inputStateRef.current,
+						lastSyncedDraftRef.current,
+					)
+						? null
+						: result.revision;
 					setDraftSyncState("ready");
 					persistNarratorInputDraft(
 						currentUserId,
@@ -859,6 +898,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			draftSyncSeqRef.current++;
 			const readEpoch = ++draftReadEpochRef.current;
 			draftOwnerScopeRef.current = null;
+			seenDraftRevisionRef.current = null;
+			unsyncedBaseRevisionRef.current = null;
 			if (!currentUserId) {
 				restoreInput("", []);
 				lastDraftRevisionRef.current = null;
@@ -878,7 +919,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId;
 			setDraftHydrated(false);
 			setDraftSyncState("loading");
-			setDraftReplacedByRemote(false);
+			setDisplacedDraft(null);
 			lastSyncedDraftRef.current = null;
 			unacknowledgedDraftRef.current = null;
 			lastDraftRevisionRef.current = null;
@@ -901,6 +942,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					input: localDraftAtRequest,
 					unsynced: !!localDraft.unsynced,
 				};
+				unsyncedBaseRevisionRef.current = localDraft.serverRevision;
 			}
 			draftOwnerScopeRef.current = currentDraftScope;
 			setDraftHydrated(true);
@@ -976,6 +1018,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						);
 					else
 						restoreInput(resolved.text, resolved.fileReferences ?? [], resolved.composerDocument);
+					if (resolved.staleLocal)
+						setDisplacedDraft({
+							kind: "stale",
+							input: {
+								text: resolved.staleLocal.text,
+								fileReferences: resolved.staleLocal.fileReferences ?? [],
+								composerDocument: resolved.staleLocal.composerDocument,
+							},
+						});
 					lastSyncedDraftRef.current = {
 						text: serverText,
 						fileReferences: serverFileReferences,
@@ -1053,52 +1104,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			releaseUnusedResources();
 		}, [draftSyncState, syncDraftNow, releaseUnusedResources]);
 
-		/** Swap the draft back to the version the last remote write replaced. */
-		const restorePreviousDraft = useCallback(() => {
-			if (!currentUserId) return;
-			void api
-				.restoreNarratorDraftPrevious(narratorId, draftSourceIdRef.current)
-				.then((draft) => {
-					const text = draft.hasDraft ? draft.text : "";
-					const refs = draft.hasDraft ? readFileReferences(draft.fileReferences, text) : [];
-					const document = readComposerDocument(draft.composerDocument);
-					lastSyncedDraftRef.current = { text, fileReferences: refs, composerDocument: document };
-					lastDraftRevisionRef.current = draft.revision;
-					lastDraftUpdatedAtRef.current = draft.updatedAt;
-					restoreRemoteInput(text, refs, document);
-					setDraftSyncState("ready");
-					persistNarratorInputDraft(
-						currentUserId,
-						narratorId,
-						text,
-						draft.revision,
-						draft.updatedAt,
-						refs,
-						lastSyncedDraftRef.current,
-						readPersistableDocument(inputStateRef.current.composerDocument),
-					);
-					setDraftReplacedByRemote(false);
-				})
-				.catch((err) => {
-					// 404: the undo slot was already consumed elsewhere — drop the notice quietly.
-					// Other failures keep the notice so the restore can be retried.
-					if (err instanceof ApiError && err.status === 404) {
-						setDraftReplacedByRemote(false);
-						return;
-					}
-					notifications.show({
-						title: t("draftSyncFailed"),
-						message: err instanceof Error ? err.message : String(err),
-						color: "red",
-					});
-				});
-		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument, t]);
+		/** Bring back the set-aside version; the debounced save then makes it the draft. */
+		const restoreDisplacedDraft = useCallback(() => {
+			if (!displacedDraft) return;
+			const { text, fileReferences: refs, composerDocument } = displacedDraft.input;
+			restoreRemoteInput(text, refs, composerDocument);
+			setDisplacedDraft(null);
+		}, [displacedDraft, restoreRemoteInput]);
 
 		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
 			(draft: NarratorRemoteDraft) => {
 				const currentRevision = lastDraftRevisionRef.current;
 				if (currentRevision != null && draft.revision < currentRevision) return;
+				seenDraftRevisionRef.current = Math.max(seenDraftRevisionRef.current ?? -1, draft.revision);
 				if (draft.hasDraft && draft.hasComposerDocument && !draft.composerDocument) {
 					const epoch = ++draftReadEpochRef.current;
 					const scope = draftOwnerScopeRef.current;
@@ -1147,22 +1166,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					fileReferences: remoteRefs,
 					composerDocument: draft.composerDocument,
 				};
-				const unknown = unacknowledgedDraftRef.current;
-				const hasLocalUnsyncedChanges = lastSyncedDraftRef.current
-					? !sameFileReferenceInput(inputStateRef.current, lastSyncedDraftRef.current)
-					: !!(
-							inputRef.current ||
-							inputStateRef.current.fileReferences.length ||
-							unknown?.unsynced ||
-							(unknown && !sameFileReferenceInput(inputStateRef.current, unknown.input))
-						);
+				const hasLocalUnsyncedChanges = hasUnsyncedLocalInput();
 				const fromThisEditor = draft.sourceId === draftSourceIdRef.current;
-				if (!fromThisEditor && hasLocalUnsyncedChanges) {
+				const unsyncedBase = unsyncedBaseRevisionRef.current ?? currentRevision ?? -1;
+				if (!fromThisEditor && hasLocalUnsyncedChanges && unsyncedBase >= draft.revision) {
 					/*
-					 * Local keystrokes win. The user is typing here, so the remote body is
-					 * left untouched on screen; the next debounced save overwrites it and
-					 * the server keeps the overwritten version in its undo slot. Only the
-					 * revision bookkeeping advances, keeping the out-of-order guard fresh.
+					 * The edits began after this revision was announced (typed while its body
+					 * loaded), so they are the newer version: leave them on screen and let the
+					 * next debounced save supersede the remote. Only the bookkeeping advances.
 					 * "ready" matters when this event discarded the in-flight hydration:
 					 * without it the debounced save would stay gated on "loading" forever.
 					 */
@@ -1171,21 +1182,31 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					setDraftSyncState("ready");
 					return;
 				}
+				const hasContent = (value: FileReferenceInput) =>
+					!!(value.text || value.fileReferences.length || value.composerDocument?.assets.length);
 				if (!fromThisEditor) {
-					const replaced = lastSyncedDraftRef.current;
-					const hadContent = !!(
-						replaced &&
-						(replaced.text ||
-							replaced.fileReferences.length ||
-							replaced.composerDocument?.assets.length)
-					);
-					const remoteEmpty =
-						!remoteText && remoteRefs.length === 0 && !draft.composerDocument?.assets.length;
+					/*
+					 * Another editor wrote a revision newer than any unsynced edits here. One
+					 * user does not type on two devices at once, so those edits are stale: a
+					 * backgrounded phone tab resuming with a pending save, say. Keeping them
+					 * would push them over the newer draft on the next debounced save, so the
+					 * remote body is shown and the local edits are only offered back.
+					 */
+					const displaced = {
+						kind: hasLocalUnsyncedChanges ? ("stale" as const) : ("remote" as const),
+						input: inputStateRef.current,
+					};
 					restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
-					// Only a remote CLEAR of real content earns the undo offer — anything
-					// noisier would fire on every routine cross-tab sync. A later non-empty
-					// write supersedes the offer (the undo slot holds the newest overwrite).
-					setDraftReplacedByRemote(hadContent && remoteEmpty);
+					setDisplacedDraft((previous) => {
+						// A write that brings back the set-aside version settles it.
+						if (previous && sameFileReferenceInput(previous.input, remoteInput)) return null;
+						// Keep the earliest version: it is the one this composer actually showed.
+						if (previous) return previous;
+						return hasContent(displaced.input) &&
+							!sameFileReferenceInput(displaced.input, remoteInput)
+							? displaced
+							: null;
+					});
 				}
 				lastSyncedDraftRef.current = remoteInput;
 				lastDraftRevisionRef.current = draft.revision;
@@ -1205,7 +1226,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					);
 				}
 			},
-			[currentUserId, narratorId, restoreRemoteInput, readPersistableDocument],
+			[
+				currentUserId,
+				narratorId,
+				restoreRemoteInput,
+				readPersistableDocument,
+				hasUnsyncedLocalInput,
+			],
 		);
 
 		remoteDraftHandlerRef.current = handleDraftChanged;
@@ -1780,19 +1807,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						</Button>
 					</Group>
 				)}
-				{draftReplacedByRemote && (
+				{displacedDraft && (
 					<Group gap="xs" mb={4} wrap="nowrap">
 						<Text size="xs" c="orange" style={{ flex: 1 }}>
-							{t("draftReplacedByRemote")}
+							{t(
+								displacedDraft.kind === "stale"
+									? "draftStaleLocalSetAside"
+									: "draftReplacedByRemote",
+							)}
 						</Text>
-						<Button size="compact-xs" variant="light" onClick={restorePreviousDraft}>
-							{t("draftRestorePrevious")}
+						<Button size="compact-xs" variant="light" onClick={restoreDisplacedDraft}>
+							{t(displacedDraft.kind === "stale" ? "draftUseStaleLocal" : "draftRestorePrevious")}
 						</Button>
 						<Button
 							size="compact-xs"
 							variant="subtle"
 							color="gray"
-							onClick={() => setDraftReplacedByRemote(false)}
+							onClick={() => setDisplacedDraft(null)}
 						>
 							{t("draftDismissReplace")}
 						</Button>

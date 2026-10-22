@@ -146,9 +146,11 @@ export function CatalogMetadataFields({
 													aria-label={label}
 													value={value}
 													placeholder={
-														field.kind === "list" || field.kind === "modalities"
-															? t("catalog.listHint")
-															: t("catalog.valueHint")
+														field.kind === "toolModes"
+															? t("catalog.toolModesHint")
+															: field.kind === "list" || field.kind === "modalities"
+																? t("catalog.listHint")
+																: t("catalog.valueHint")
 													}
 													disabled={readOnly || (!!edit && edit.mode !== "set")}
 													onChange={(event) => setValue(event.currentTarget.value)}

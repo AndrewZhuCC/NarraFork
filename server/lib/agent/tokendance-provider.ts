@@ -279,6 +279,9 @@ export class TokenDanceProvider implements ProviderAdapter {
 	formatTools(...args: Parameters<ProviderAdapter["formatTools"]>) {
 		return this.active().formatTools(...args);
 	}
+	toolLoadingTarget(model: string) {
+		return this.active(model).toolLoadingTarget?.(model);
+	}
 	buildHistory(...args: Parameters<ProviderAdapter["buildHistory"]>) {
 		return this.active(args[1]).buildHistory(...args);
 	}

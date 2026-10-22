@@ -60,6 +60,14 @@ export interface ResolvedNarratorDraft {
 	composerDocument?: ComposerDocument;
 }
 
+export interface HydratedNarratorDraft extends ResolvedNarratorDraft {
+	/**
+	 * This device's unsynced draft, set aside because the server moved on since it
+	 * was written. Offered back to the user instead of being pushed automatically.
+	 */
+	staleLocal?: ResolvedNarratorDraft;
+}
+
 function emptyStoredDraft(): StoredNarratorInputDraft {
 	return { text: "", serverRevision: null, serverUpdatedAt: null };
 }
@@ -361,7 +369,7 @@ export function resolveHydratedNarratorDraft(options: {
 	currentFileReferences?: FileReference[];
 	currentComposerDocument?: ComposerDocument;
 	localChangedSinceRequest: boolean;
-}): ResolvedNarratorDraft {
+}): HydratedNarratorDraft {
 	const input = (text: string, refs: unknown, doc: unknown): FileReferenceInput => {
 		const fileReferences = readFileReferences(refs, text);
 		const composerDocument = readInputComposerDocument(doc, text, fileReferences);
@@ -398,16 +406,25 @@ export function resolveHydratedNarratorDraft(options: {
 		// Text AND references share one revision; metadata-only changes are edits too.
 		return result(local);
 	}
+	const hasContent = (value: FileReferenceInput) =>
+		!!(value.text || value.fileReferences.length || value.composerDocument?.assets.length);
 	if (
 		(options.local.unsynced || options.local.serverRevision === null) &&
-		(local.text ||
-			local.fileReferences.length ||
-			local.composerDocument?.assets.length ||
-			options.local.unsynced) &&
 		!sameFileReferenceInput(local, server)
 	) {
-		// Version-1 browser storage has no trustworthy base revision; keep it anyway.
-		return result(local);
+		/*
+		 * The local copy was never acknowledged AND the server moved past its base:
+		 * another tab or device wrote since. Pushing it now would silently replace
+		 * that newer draft (an old phone tab reopening and wiping the desktop's
+		 * text), so the server version is shown and the local one is only offered.
+		 *
+		 * Version-1 storage and edits made before the first load have no base at
+		 * all. Against an empty server there is nothing to overwrite, so they are
+		 * still kept as before.
+		 */
+		if (options.local.serverRevision === null && !hasContent(server) && hasContent(local))
+			return result(local);
+		return hasContent(local) ? { ...result(server), staleLocal: result(local) } : result(server);
 	}
 	// A newer server clear tombstone removes both text and references.
 	return result(server);

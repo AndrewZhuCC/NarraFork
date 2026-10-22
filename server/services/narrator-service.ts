@@ -521,7 +521,7 @@ export async function handleLoadToolCommand(
 	}
 
 	const { loadOptionalTool } = await import("./narrator-session");
-	const results = [];
+	const results: Awaited<ReturnType<typeof loadOptionalTool>>[] = [];
 	for (const toolName of toolNames) {
 		results.push(await loadOptionalTool(narratorId, toolName));
 	}
@@ -544,6 +544,15 @@ export async function handleLoadToolCommand(
 			toolName: displayToolName,
 			toolDescription,
 		});
+		// The registry names this row changed; tool loading reads them to keep the
+		// request's tool array fixed (see lib/agent/tool-loading.ts).
+		const changedToolNames = toolNames.filter((_, index) => results[index] === "loaded");
+		const block = {
+			type: "tool_loaded",
+			toolName: displayToolName,
+			toolNames: changedToolNames,
+			text,
+		};
 		const id = generateId();
 		const now = new Date().toISOString();
 		const [msg] = await db
@@ -552,12 +561,8 @@ export async function handleLoadToolCommand(
 				id,
 				narratorId,
 				role: "user",
-				contentJson: [{ type: "tool_loaded", toolName: displayToolName, text }],
-				contextCharsJson: measureMessageCharacters(
-					"user",
-					[{ type: "tool_loaded", toolName: displayToolName, text }],
-					text,
-				),
+				contentJson: [block],
+				contextCharsJson: measureMessageCharacters("user", [block], text),
 				contentText: text,
 				createdAt: now,
 			})
@@ -604,7 +609,7 @@ export async function handleUnloadToolCommand(
 	const toolNames = cmdResult.unloadTools ?? [cmdResult.unloadTool];
 	const displayToolName = cmdResult.unloadToolId ?? cmdResult.unloadTool;
 	const { unloadOptionalTool } = await import("./narrator-session");
-	const results = [];
+	const results: Awaited<ReturnType<typeof unloadOptionalTool>>[] = [];
 	for (const toolName of toolNames) {
 		results.push(await unloadOptionalTool(narratorId, toolName));
 	}
@@ -620,6 +625,13 @@ export async function handleUnloadToolCommand(
 	// Persist a user-role message so the model is aware the tool is no longer available.
 	if (!notLoaded && !unknownTool) {
 		const text = getToolMessageWithParams("toolUnloaded", locale, { toolName: displayToolName });
+		const changedToolNames = toolNames.filter((_, index) => results[index] === "unloaded");
+		const block = {
+			type: "tool_unloaded",
+			toolName: displayToolName,
+			toolNames: changedToolNames,
+			text,
+		};
 		const id = generateId();
 		const now = new Date().toISOString();
 		const [msg] = await db
@@ -628,12 +640,8 @@ export async function handleUnloadToolCommand(
 				id,
 				narratorId,
 				role: "user",
-				contentJson: [{ type: "tool_unloaded", toolName: displayToolName, text }],
-				contextCharsJson: measureMessageCharacters(
-					"user",
-					[{ type: "tool_unloaded", toolName: displayToolName, text }],
-					text,
-				),
+				contentJson: [block],
+				contextCharsJson: measureMessageCharacters("user", [block], text),
 				contentText: text,
 				createdAt: now,
 			})

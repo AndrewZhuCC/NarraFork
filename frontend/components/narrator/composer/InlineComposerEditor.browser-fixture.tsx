@@ -13,6 +13,7 @@ import { TextSelection } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
 import i18next from "i18next";
 import { createRef, useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { composerOptimizeTarget } from "./composer-optimize-target";
@@ -70,6 +71,8 @@ let pasted: string[] = [];
 let pasteCalls = 0;
 let panelDrops = 0;
 let captureNextDrop = false;
+// While set, onChange emissions queue here instead of rendering: a parent lagging behind.
+let heldEchoes: ComposerDocument[] | null = null;
 const removed: string[] = [];
 const candidate: QuoteCandidate = {
 	kind: "text",
@@ -109,7 +112,8 @@ function Fixture() {
 							value={value}
 							onChange={(document) => {
 								changes++;
-								setValue(document);
+								if (heldEchoes) heldEchoes.push(document);
+								else setValue(document);
 							}}
 							resources={resources}
 							attachmentsHydrating={hydrating}
@@ -172,6 +176,19 @@ export function ready() {
 }
 export function load(document: ComposerDocument) {
 	externalDocument(document);
+}
+export function holdEchoes() {
+	heldEchoes = [];
+}
+/** Commit the oldest held emission as its own parent render; false once none are left. */
+export function releaseEcho() {
+	const next = heldEchoes?.shift();
+	if (!next) {
+		heldEchoes = null;
+		return false;
+	}
+	flushSync(() => externalDocument(next));
+	return true;
 }
 export function restoreSilently(document: ComposerDocument) {
 	editor.current?.setDocument(document);

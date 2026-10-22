@@ -36,7 +36,7 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { parseJsonResponseWithBody } from "./response-body";
-
+import type { ToolLoadingTarget } from "./tool-loading";
 import {
 	type AgentToolUse,
 	ApiError,
@@ -378,6 +378,24 @@ export class NugProvider implements ProviderAdapter {
 		}
 		// Unreachable: all supported channel types create a delegate.
 		return tools;
+	}
+
+	toolLoadingTarget(model: string): ToolLoadingTarget | undefined {
+		const meta = this.resolveMeta(model);
+		const protocol: ToolLoadingTarget["protocol"] | undefined =
+			meta.channelType === "anthropic"
+				? "anthropic-messages"
+				: meta.channelType === "codex" || meta.channelType === "responses"
+					? "openai-responses"
+					: meta.channelType === "openai"
+						? "completions-compatible"
+						: undefined;
+		if (!protocol) return undefined;
+		return {
+			protocol,
+			codexBackend: meta.channelType === "codex",
+			model: meta.routedModel,
+		};
 	}
 
 	async buildHistory(

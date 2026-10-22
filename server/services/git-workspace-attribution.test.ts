@@ -3,7 +3,12 @@ import { eq, inArray } from "drizzle-orm";
 import { narrators, users } from "../db/schema";
 import { generateId } from "../lib/id";
 import { type AttributionActor, EXTERNAL_ACTOR } from "./attribution-actors";
-import { redactGitActors, redactGitModificationView } from "./git-workspace-attribution";
+import {
+	cachedScopeProbe,
+	redactGitActors,
+	redactGitModificationView,
+	resetScopeProbeCacheForTest,
+} from "./git-workspace-attribution";
 import { canReadNarrator, canWriteNarrator } from "./narrator-acl";
 import type { WorkspaceModificationView } from "./workspace-modification-view";
 
@@ -197,4 +202,30 @@ test("nested-only actor ids use existing read ACL without granting write", async
 	expect(JSON.stringify(result)).not.toContain(privateId);
 	expect(await canWriteNarrator(publicRow, principal)).toBe(false);
 	expect(await canReadNarrator(privateRow, principal)).toBe(false);
+});
+
+test("scope probes are reused briefly, while thrown probes are retried", async () => {
+	resetScopeProbeCacheForTest();
+	let calls = 0;
+	const probe = async () => {
+		calls++;
+		return { state: "ready", rootPath: "/repo", repositoryPath: "/repo/.git" };
+	};
+	expect(await cachedScopeProbe("local\0/repo/a", probe, 1_000)).toEqual({
+		state: "ready",
+		rootPath: "/repo",
+	});
+	await cachedScopeProbe("local\0/repo/a", probe, 2_000);
+	expect(calls).toBe(1);
+	await cachedScopeProbe("local\0/repo/a", probe, 1_000 + 30_000);
+	expect(calls).toBe(2);
+
+	const failing = async () => {
+		calls++;
+		throw new Error("probe timed out");
+	};
+	await expect(cachedScopeProbe("local\0/repo/b", failing, 1_000)).rejects.toThrow();
+	await cachedScopeProbe("local\0/repo/b", probe, 1_001);
+	expect(calls).toBe(4);
+	resetScopeProbeCacheForTest();
 });
