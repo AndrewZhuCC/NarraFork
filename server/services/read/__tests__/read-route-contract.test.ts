@@ -1,25 +1,20 @@
 /**
- * What `GET /api/projects`, `GET /api/chapters` and `GET /api/projects/:id/graph` promise their
- * existing clients.
+ * What `GET /api/projects` promises its existing clients.
  *
- * These three endpoints are consumed as BARE JSON ARRAYS (and, for the graph, a fixed object)
- * by the dashboard, the project page, the merge modal and the scheduled-task editor. None of
- * them sends a paging parameter, so every property asserted here is something a client already
- * depends on and would lose without any error being raised:
+ * The endpoint is consumed as a BARE JSON ARRAY by the dashboard, the project list and the
+ * scheduled-task editor. None of them sends a paging parameter, so every property asserted
+ * here is something a client already depends on and would lose without any error being raised:
  *
  *  - the project list is most-recently-updated FIRST, and complete;
- *  - the chapter list requires project read, and `[]` versus 404 is a real distinction —
- *    an unreadable project and an empty project produce the same empty array otherwise;
- *  - a bounded read announces itself (`X-Read-Truncated` / a graph fallback) instead of looking
- *    like the whole set;
+ *  - a bounded read announces itself (`X-Read-Truncated`) instead of looking like the whole set;
  *  - the response SHAPE stays an array — no pagination envelope, because wrapping it would
  *    break every caller to serve a case none of them have.
  *
  * The adapter is INJECTED here rather than exercised against a database: these are statements
- * about the routes' translation layer (order preserved, headers set, gate applied, fallback
- * emitted), and the adapters' own behaviour against real rows is covered by the SQLite matrix
- * and the PostgreSQL parity suite. A recording stub also makes it possible to assert what the
- * route ASKED for, which is where the "default page of 100" regression actually lived.
+ * about the routes' translation layer (order preserved, headers set, gate applied), and the
+ * adapters' own behaviour against real rows is covered by the SQLite matrix and the PostgreSQL
+ * parity suite. A recording stub also makes it possible to assert what the route ASKED for,
+ * which is where the "default page of 100" regression actually lived.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
@@ -34,12 +29,10 @@ process.env.NARRAFORK_HOME = testHome;
 process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
 const { projectRoutes } = await import("../../../routes/projects");
-const { chapterRoutes } = await import("../../../routes/chapters");
-const { graphRoutes } = await import("../../../routes/graph");
 const { setProjectReadAdapter } = await import("..");
 const { AppError } = await import("../../../lib/errors");
 const { db } = await import("../../../db");
-const { aclGrants, chapters, projects, users } = await import("../../../db/schema");
+const { aclGrants, projects, users } = await import("../../../db/schema");
 const { generateId } = await import("../../../lib/id");
 const { READ_LIMITS } = await import("../project-read-adapter");
 const { COLLECT_MAX_ROWS } = await import("../read-collect");
@@ -59,20 +52,13 @@ type Call = { method: string; page?: ReadPage; status?: string; projectId?: stri
 /**
  * An adapter that answers from a fixed row set and records every call.
  *
- * `listProjects`/`listChaptersPage` implement real keyset paging over that set, because the
+ * `listProjects` implements real keyset paging over that set, because the
  * routes' full-walk behaviour is exactly what is under test: a stub that ignored the cursor
  * would make `collectAllPages` look correct no matter what it did.
  */
-function stubAdapter(options: {
-	projects?: Array<Record<string, unknown>>;
-	chapters?: Array<Record<string, unknown>>;
-	graph?: Record<string, unknown>;
-	auxiliary?: Record<string, unknown>;
-	pageSize?: number;
-}) {
+function stubAdapter(options: { projects?: Array<Record<string, unknown>>; pageSize?: number }) {
 	const calls: Call[] = [];
 	const projectRows = options.projects ?? [];
-	const chapterRows = options.chapters ?? [];
 	const pageSize = options.pageSize ?? READ_LIMITS.projectPage;
 
 	const page = <T extends { id: string }>(
@@ -121,31 +107,6 @@ function stubAdapter(options: {
 			calls.push({ method: "anyProjectExists" });
 			return projectRows.length > 0;
 		},
-		async listChapters(projectId: string) {
-			calls.push({ method: "listChapters", projectId });
-			return chapterRows;
-		},
-		async listChaptersPage(projectId: string, _principal, requested?: ReadPage, status?: string) {
-			calls.push({ method: "listChaptersPage", projectId, page: requested, status });
-			const filtered = status ? chapterRows.filter((row) => row.status === status) : chapterRows;
-			return page(filtered as Array<{ id: string }>, "createdAt", "createdAt", requested);
-		},
-		async getChapter(id: string) {
-			calls.push({ method: "getChapter", projectId: id });
-			return chapterRows.find((row) => row.id === id) ?? null;
-		},
-		async getGraph(projectId: string) {
-			calls.push({ method: "getGraph", projectId });
-			return options.graph ?? { chapters: [], edges: [] };
-		},
-		async getGraphAuxiliaryData(projectId: string) {
-			calls.push({ method: "getGraphAuxiliaryData", projectId });
-			return (options.auxiliary ?? {
-				narrators: [],
-				containers: [],
-				detachedPanels: [],
-			}) as never;
-		},
 	};
 	setProjectReadAdapter(adapter);
 	return calls;
@@ -167,8 +128,6 @@ function appAs(userId: string, role: "admin" | "user" = "user") {
 		return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
 	});
 	app.route("/projects", projectRoutes);
-	app.route("/projects", graphRoutes);
-	app.route("/chapters", chapterRoutes);
 	return app;
 }
 
@@ -178,10 +137,6 @@ function request(userId: string, path: string, role: "admin" | "user" = "user") 
 
 function projectRow(id: string, updatedAt: string, status = "active") {
 	return { id, name: id, status, visibility: "private", ownerUserId: OWNER, updatedAt };
-}
-
-function chapterRow(id: string, createdAt: string, status = "active") {
-	return { id, projectId: privateProject, title: id, status, createdAt };
 }
 
 beforeAll(async () => {
@@ -199,8 +154,8 @@ beforeAll(async () => {
 			.onConflictDoNothing();
 	}
 	privateProject = generateId();
-	// A real row, because the chapter route's gate loads the project from the database rather
-	// than through the adapter — the gate is authorization, not a read projection.
+	// A real row: project gates load the project from the database rather than through the
+	// adapter — the gate is authorization, not a read projection.
 	await db.insert(projects).values({
 		id: privateProject,
 		name: "read route project",
@@ -228,7 +183,6 @@ afterEach(() => {
 
 afterAll(async () => {
 	setProjectReadAdapter(undefined);
-	await db.delete(chapters).where(eqProject(privateProject));
 	await db.delete(aclGrants).where(scopedTo(privateProject));
 	await db.delete(projects).where(byId(privateProject));
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -240,10 +194,6 @@ afterAll(async () => {
 function byId(id: string) {
 	const { eq } = require("drizzle-orm") as typeof import("drizzle-orm");
 	return eq(projects.id, id);
-}
-function eqProject(id: string) {
-	const { eq } = require("drizzle-orm") as typeof import("drizzle-orm");
-	return eq(chapters.projectId, id);
 }
 function scopedTo(id: string) {
 	const { eq } = require("drizzle-orm") as typeof import("drizzle-orm");
@@ -377,21 +327,6 @@ describe("GET /projects/hidden-existence uses the serving backend", () => {
 			async anyProjectExists() {
 				return true;
 			},
-			async listChapters() {
-				return [];
-			},
-			async listChaptersPage() {
-				return { rows: [], nextCursor: null };
-			},
-			async getChapter() {
-				return null;
-			},
-			async getGraph() {
-				return { chapters: [], edges: [] };
-			},
-			async getGraphAuxiliaryData() {
-				return { narrators: [], containers: [], detachedPanels: [] };
-			},
 		});
 		expect(await (await request(OUTSIDER, "/projects/hidden-existence")).json()).toEqual({
 			hasHidden: true,
@@ -404,187 +339,5 @@ describe("GET /projects/hidden-existence uses the serving backend", () => {
 			await (await request("read-route-admin", "/projects/hidden-existence", "admin")).json(),
 		).toEqual({ hasHidden: false });
 		expect(calls).toEqual([]);
-	});
-});
-
-describe("GET /chapters keeps its project gate", () => {
-	test("an outsider gets 404, not an empty array", async () => {
-		// This is a change of ANSWER, not of status code: the adapter's ACL predicate makes an
-		// unreadable project return `[]`, which is exactly what a readable empty project returns.
-		// Without the gate the endpoint stops distinguishing "not yours" from "nothing here".
-		stubAdapter({ chapters: [chapterRow("c_1", "2026-01-01T00:00:00.000Z")] });
-		const res = await request(OUTSIDER, `/chapters?projectId=${privateProject}`);
-		expect(res.status).toBe(404);
-	});
-
-	test("a read-grant holder gets the chapters", async () => {
-		stubAdapter({
-			chapters: [
-				chapterRow("c_1", "2026-01-01T00:00:00.000Z"),
-				chapterRow("c_2", "2026-01-02T00:00:00.000Z"),
-			],
-		});
-		const res = await request(READER, `/chapters?projectId=${privateProject}`);
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as Array<{ id: string }>;
-		// Oldest first: a chapter's parents come before it, which is how the graph reads them.
-		expect(body.map((row) => row.id)).toEqual(["c_1", "c_2"]);
-	});
-
-	test("a missing projectId is a 400, before any read happens", async () => {
-		const calls = stubAdapter({});
-		expect((await request(READER, "/chapters")).status).toBe(400);
-		expect(calls).toEqual([]);
-	});
-
-	test("returns every chapter by default and reports a truncated page", async () => {
-		const rows = Array.from({ length: 250 }, (_, index) =>
-			chapterRow(`c_${String(index).padStart(3, "0")}`, "2026-01-01T00:00:00.000Z"),
-		);
-		const calls = stubAdapter({ chapters: rows, pageSize: 100 });
-		const res = await request(READER, `/chapters?projectId=${privateProject}`);
-		const body = (await res.json()) as unknown[];
-		// The merge modal builds its target list from this array: a chapter missing from it looks
-		// like a chapter that cannot be merged into.
-		expect(body).toHaveLength(250);
-		expect(calls.filter((call) => call.method === "listChaptersPage").length).toBe(3);
-		expect(res.headers.get("X-Read-Truncated")).toBeNull();
-
-		const paged = await request(READER, `/chapters?projectId=${privateProject}&limit=50`);
-		expect((await paged.json()) as unknown[]).toHaveLength(50);
-		expect(paged.headers.get("X-Read-Truncated")).toBe("1");
-		expect(paged.headers.get("X-Next-Cursor")).toBeString();
-	});
-
-	test("the status filter reaches the adapter", async () => {
-		const calls = stubAdapter({
-			chapters: [
-				chapterRow("c_active", "2026-01-01T00:00:00.000Z", "active"),
-				chapterRow("c_dormant", "2026-01-02T00:00:00.000Z", "dormant"),
-			],
-		});
-		const body = (await (
-			await request(READER, `/chapters?projectId=${privateProject}&status=dormant`)
-		).json()) as Array<{ id: string }>;
-		expect(body.map((row) => row.id)).toEqual(["c_dormant"]);
-		expect(calls.at(-1)?.status).toBe("dormant");
-	});
-});
-
-describe("GET /projects/:id/graph admits a bounded read", () => {
-	const graphChapter = (id: string) => ({
-		id,
-		title: id,
-		status: "dormant",
-		branch: `b/${id}`,
-		role: "branch",
-		color: null,
-		groupLabel: null,
-		explorationGroupId: null,
-		isRoot: 0,
-		graphX: null,
-		graphY: null,
-		commitCount: 0,
-		headCommitSha: null,
-		// No worktree path: keeps the route off the git-refresh path, which is not what this
-		// suite is about (see `routes/__tests__/graph-degraded.test.ts` for that).
-		worktreePath: null,
-		panelExpanded: 0,
-		panelWidth: null,
-		panelHeight: null,
-		reviewSourceChapterId: null,
-		reviewStatus: null,
-	});
-
-	test("a complete graph reports no degradation", async () => {
-		stubAdapter({
-			graph: { chapters: [graphChapter("c_1")], edges: [] },
-			auxiliary: { narrators: [], containers: [], detachedPanels: [] },
-		});
-		const res = await request(OWNER, `/projects/${privateProject}/graph`);
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as {
-			nodes: unknown[];
-			degraded: boolean;
-			fallbacks: unknown[];
-		};
-		expect(body.nodes).toHaveLength(1);
-		expect(body.degraded).toBe(false);
-		expect(body.fallbacks).toEqual([]);
-	});
-
-	test("a truncated chapter list surfaces as a graph.size fallback", async () => {
-		// A canvas that quietly drops chapters also drops every edge attached to them, which reads
-		// as "those branches were deleted" rather than "we did not send them".
-		stubAdapter({
-			graph: {
-				chapters: [graphChapter("c_1"), graphChapter("c_2")],
-				edges: [],
-				truncated: true,
-				truncatedChapters: true,
-			},
-			auxiliary: { narrators: [], containers: [], detachedPanels: [] },
-		});
-		const body = (await (await request(OWNER, `/projects/${privateProject}/graph`)).json()) as {
-			degraded: boolean;
-			fallbacks: Array<{ feature: string; reason?: string; failedChapters?: number }>;
-		};
-		expect(body.degraded).toBe(true);
-		expect(body.fallbacks).toContainEqual({
-			feature: "graph.size",
-			reason: "graph_chapters_truncated",
-			failedChapters: 2,
-		});
-	});
-
-	test("a truncated edge list is reported with its own reason", async () => {
-		stubAdapter({
-			graph: {
-				chapters: [graphChapter("c_1")],
-				edges: [],
-				truncated: true,
-				truncatedEdges: true,
-			},
-			auxiliary: { narrators: [], containers: [], detachedPanels: [] },
-		});
-		const body = (await (await request(OWNER, `/projects/${privateProject}/graph`)).json()) as {
-			fallbacks: Array<{ reason?: string }>;
-		};
-		expect(body.fallbacks.map((fallback) => fallback.reason)).toContain("graph_edges_truncated");
-	});
-
-	test("truncated auxiliary data is reported separately from graph size", async () => {
-		// Narrator badges become a floor rather than a count; the canvas must be able to say so.
-		stubAdapter({
-			graph: { chapters: [graphChapter("c_1")], edges: [] },
-			auxiliary: {
-				narrators: [],
-				containers: [],
-				detachedPanels: [],
-				truncated: true,
-			},
-		});
-		const body = (await (await request(OWNER, `/projects/${privateProject}/graph`)).json()) as {
-			degraded: boolean;
-			fallbacks: Array<{ feature: string; reason?: string }>;
-		};
-		expect(body.degraded).toBe(true);
-		expect(body.fallbacks.map((fallback) => fallback.feature)).toContain("graph.auxiliary");
-	});
-
-	test("an empty graph is served without fallbacks and without auxiliary reads", async () => {
-		const calls = stubAdapter({ graph: { chapters: [], edges: [] } });
-		const body = (await (await request(OWNER, `/projects/${privateProject}/graph`)).json()) as {
-			nodes: unknown[];
-			degraded: boolean;
-		};
-		expect(body.nodes).toEqual([]);
-		expect(body.degraded).toBe(false);
-		expect(calls.map((call) => call.method)).not.toContain("getGraphAuxiliaryData");
-	});
-
-	test("an outsider cannot read the graph at all", async () => {
-		stubAdapter({ graph: { chapters: [graphChapter("c_1")], edges: [] } });
-		expect((await request(OUTSIDER, `/projects/${privateProject}/graph`)).status).toBe(404);
 	});
 });

@@ -175,7 +175,8 @@ describe("default visibility settings validation", () => {
 			"utf8",
 		);
 		expect(service).toMatch(
-			/resolveNarratorAudiences\(\s*input.visibility,\s*input.writeAudience,\s*chapterId,\s*settings.agent.defaultNarratorVisibility,\s*settings.agent.defaultNarratorWriteAudience,/,
+			// Direct service creation has no project page; HTTP project creation passes its own.
+			/resolveNarratorAudiences\(\s*input.visibility,\s*input.writeAudience,\s*null,\s*settings.agent.defaultNarratorVisibility,\s*settings.agent.defaultNarratorWriteAudience,/,
 		);
 		const loader = readFileSync(new URL("../settings/index.ts", import.meta.url), "utf8");
 		expect(loader).toMatch(

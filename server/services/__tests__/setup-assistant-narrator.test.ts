@@ -3,7 +3,6 @@
  *
  * Covers what needs the DB and the narrator service:
  *  - create() preinstalls Terminal (a PTY, which package managers and sudo want)
- *  - the kind must be standalone (a chapterId is rejected)
  *  - the authorization choice actually lands on the narrator row
  *
  * The pure prompt/briefing/authorization-mapping assertions live in
@@ -18,8 +17,6 @@ import { SETUP_KIND_PRELOAD_TOOLS, SETUP_KIND_TRAIT } from "../../lib/agent/tool
 import { resolveDangerReflectionLevel } from "../../lib/boolean-override";
 import { resolveSetupAuthorization } from "../../lib/prompt-i18n";
 import { narratorService } from "../narrator-service";
-
-const TAG = Date.now();
 
 describe("setup kind preload tools", () => {
 	test("every preloaded tool is a real optional tool", () => {
@@ -48,12 +45,6 @@ describe("create() preinstall", () => {
 			systemPrompt: "custom setup instructions",
 		});
 		expect(narrator.systemPrompt).toBe("custom setup instructions");
-	});
-
-	test("setup kind with a chapterId is rejected (must be standalone)", async () => {
-		expect(
-			narratorService.create({ kind: "setup", chapterId: `some-chapter-${TAG}` }),
-		).rejects.toThrow();
 	});
 });
 

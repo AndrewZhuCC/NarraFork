@@ -277,7 +277,6 @@ describe("standalone personal search", () => {
 				id,
 				name: id,
 				status: "active" as const,
-				flowMode: "classic" as const,
 				createdAt: now,
 				updatedAt: now,
 			})),

@@ -54,7 +54,7 @@ function seedNarrator(): void {
 		.run();
 }
 
-/** The bridge handler is async (narrator/chapter lookup + runHooks). */
+/** The bridge handler is async (narrator lookup + runHooks). */
 async function settleBridge(): Promise<void> {
 	for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }

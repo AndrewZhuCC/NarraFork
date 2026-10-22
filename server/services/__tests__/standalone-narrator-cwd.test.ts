@@ -4,8 +4,7 @@
  * Where a standalone narrator starts when the client sent no directory. The rule the
  * tests pin: a configured default is used only when it EXISTS, nothing is ever
  * created, and with no usable default the answer is "the user must choose" — never a
- * guessed directory (home included). Chapter-bound narrators stay unset so session
- * start binds their worktree.
+ * guessed directory (home included).
  */
 
 import { describe, expect, test } from "bun:test";
@@ -39,24 +38,6 @@ describe("an explicit cwd from the client", () => {
 
 	test("a whitespace-only cwd is treated as absent", () => {
 		expect(resolveStandaloneNarratorCwd({ cwd: "   " }, deps())).toEqual({ kind: "required" });
-	});
-});
-
-describe("chapter-bound narrators", () => {
-	test("are left unset so session start binds the worktree", () => {
-		expect(
-			resolveStandaloneNarratorCwd(
-				{ chapterId: "ch1" },
-				deps({ configuredDir: "/data/projects", existing: ["/data/projects"] }),
-			),
-		).toEqual({ kind: "session" });
-	});
-
-	test("still honour an explicit cwd", () => {
-		expect(resolveStandaloneNarratorCwd({ cwd: "/srv/work", chapterId: "ch1" }, deps())).toEqual({
-			kind: "cwd",
-			cwd: "/srv/work",
-		});
 	});
 });
 

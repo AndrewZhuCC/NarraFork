@@ -83,7 +83,6 @@ function seed(cwd: string, blocks: Block[]) {
 	db.insert(narrators)
 		.values({
 			id: "n1",
-			chapterId: null,
 			type: "primary",
 			variant: "primary",
 			inheritMode: "fresh",
@@ -415,7 +414,6 @@ describe("editAndRegenerate text_file management", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: null,
 				type: "primary",
 				variant: "primary",
 				inheritMode: "full",

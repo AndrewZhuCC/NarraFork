@@ -54,10 +54,8 @@ export const RESOURCE_SCOPE_FIELD_BY_TYPE = {
 	integration: "integrationId",
 	project: "projectId",
 	workspace: "workspaceId",
-	chapter: "chapterId",
 	narrator: "narratorId",
 	message: "messageId",
-	review: "reviewId",
 	routine: "routineId",
 	provider: "providerInstanceId",
 	device: "deviceId",
@@ -120,7 +118,7 @@ export function resourceToScope(resource: unknown): ResourceScope {
 /**
  * Fail-closed containment: global contains every valid scope; otherwise containment
  * requires the exact same resource type and id. Cross-type ancestry (for example a
- * chapter belonging to a project) must be resolved by a trusted service before calling.
+ * narrator belonging to a project) must be resolved by a trusted service before calling.
  */
 export function scopeContains(container: unknown, candidate: unknown): boolean {
 	const parsedContainer = assertResourceScope(container);

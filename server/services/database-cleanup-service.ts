@@ -148,7 +148,6 @@ export interface DatabaseCleanupApiRequestSample {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
 	createdAt: string;
 	approxBytes: number;
 }
@@ -284,7 +283,6 @@ function normalizeNarratorCleanupRecord(row: Record<string, unknown>): NarratorC
 	return {
 		id: String(row.id ?? ""),
 		parentNarratorId: row.parentNarratorId ? String(row.parentNarratorId) : null,
-		chapterId: row.chapterId ? String(row.chapterId) : null,
 		type: String(row.type ?? "primary"),
 		variant: String(row.variant ?? "primary"),
 		traits,
@@ -305,7 +303,6 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 			`SELECT
 				id,
 				parent_narrator_id AS parentNarratorId,
-				chapter_id AS chapterId,
 				type,
 				variant,
 				traits,
@@ -423,13 +420,11 @@ async function buildToolCallPayloadPreview(
 			tc.id AS id,
 			tc.narrator_id AS narratorId,
 			n.title AS narratorTitle,
-			c.title AS chapterTitle,
 			tc.created_at AS createdAt,
 			length(CAST(coalesce(tc.input_json, '') AS BLOB)) +
 				length(CAST(coalesce(tc.output_json, '') AS BLOB)) AS approxBytes
 		 FROM narrator_tool_calls tc
 		 LEFT JOIN narrators n ON n.id = tc.narrator_id
-		 LEFT JOIN chapters c ON c.id = n.chapter_id
 		 WHERE tc.created_at <= ?
 			 AND tc.is_file_history_checkpoint = 0
 			 AND (tc.input_json IS NOT NULL OR tc.output_json IS NOT NULL)
@@ -440,7 +435,6 @@ async function buildToolCallPayloadPreview(
 		id: string;
 		narratorId: string | null;
 		narratorTitle: string | null;
-		chapterTitle: string | null;
 		createdAt: string;
 		approxBytes: number | string | bigint;
 	}>;
@@ -464,7 +458,6 @@ async function buildToolCallPayloadPreview(
 			id: sample.id,
 			narratorId: sample.narratorId,
 			narratorTitle: sample.narratorTitle,
-			chapterTitle: sample.chapterTitle,
 			createdAt: sample.createdAt,
 			approxBytes: numberFromRow(sample.approxBytes),
 		})),

@@ -16,18 +16,13 @@ export function rejectUnsupportedTerminalResourceSelector(input: unknown, ctx: z
 
 export const createTerminalSchema = z.preprocess(
 	rejectUnsupportedTerminalResourceSelector,
-	z
-		.object({
-			chapterId: z.string().min(1).optional(),
-			narratorId: z.string().min(1).optional(),
-			name: z.string().max(100).optional(),
-			cols: z.number().int().min(10).max(500).optional(),
-			rows: z.number().int().min(2).max(200).optional(),
-			deviceId: z.string().min(1).optional(),
-		})
-		.refine((d) => !(d.chapterId && d.narratorId), {
-			message: "Only one of chapterId or narratorId may be provided",
-		}),
+	z.object({
+		narratorId: z.string().min(1).optional(),
+		name: z.string().max(100).optional(),
+		cols: z.number().int().min(10).max(500).optional(),
+		rows: z.number().int().min(2).max(200).optional(),
+		deviceId: z.string().min(1).optional(),
+	}),
 );
 
 // === Terminal Tabs: removed ===
@@ -40,7 +35,6 @@ export const createTerminalSchema = z.preprocess(
 
 export const updateTerminalViewStateSchema = z
 	.object({
-		chapterId: z.string().min(1).optional(),
 		narratorId: z.string().min(1).optional(),
 		layout: z.enum(["single", "split-h", "split-v", "triple", "quad"]).optional(),
 		activeTabId: z.string().nullable().optional(),
@@ -49,6 +43,6 @@ export const updateTerminalViewStateSchema = z
 			.nullable()
 			.optional(),
 	})
-	.refine((d) => d.chapterId || d.narratorId, {
-		message: "Either chapterId or narratorId is required",
+	.refine((d) => d.narratorId, {
+		message: "narratorId is required",
 	});

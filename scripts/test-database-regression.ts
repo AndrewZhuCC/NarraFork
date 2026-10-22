@@ -192,12 +192,6 @@ export const BATCH_STAGE2: readonly string[] = [
 		"server/db/__tests__/connection-test-guard.test.ts",
 		"server/db/__tests__/connection-guard-subprocess.test.ts",
 		"server/db/__tests__/integrity-check.test.ts",
-		// Project archive, including replacement atomicity and snapshot columns
-		"server/services/project-archive/__tests__/manifest-format.test.ts",
-		"server/services/project-archive/__tests__/main-store-contract.test.ts",
-		"server/services/project-archive/__tests__/paging.test.ts",
-		"server/services/project-archive/__tests__/archive-roundtrip.test.ts",
-		"server/services/project-archive/__tests__/replace-atomicity.test.ts",
 		// Stage 1 registration contracts and existing registration coverage
 		"server/lib/__tests__/register-with-code.test.ts",
 		"server/services/__tests__/registration-code-service.test.ts",

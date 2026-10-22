@@ -2193,8 +2193,6 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	reviewVerdict_request_changes: "Changes Requested",
 	reviewVerdict_comment_only: "Comments Only",
 	reviewFeedbackRevisedBadge: "Revised",
-	reviewFeedbackApply: "Handle",
-	reviewFeedbackApplied: "Handled",
 	// Message-origin attribution (see @shared/message-origin). The heading row of
 	// an origin_notice card, and the name shown on a user bubble whose author is
 	// not a NarraFork account.
@@ -2525,7 +2523,6 @@ function adaptReviewCard(
 	ctx: AdapterContext,
 ): ElementSpec {
 	const verdict = reviewVerdict(block);
-	const applied = block.applied === true;
 	return {
 		kind: "review-card",
 		// `-b{blockIndex}` ties the row to its content block, so the selection system can
@@ -2538,10 +2535,6 @@ function adaptReviewCard(
 			...(block.revised === true
 				? { revisedLabel: sysLabel(ctx, "reviewFeedbackRevisedBadge") }
 				: {}),
-			// Always present, so the reserved action row is never empty; `applied` only
-			// changes the wording and disables it.
-			actionLabel: sysLabel(ctx, applied ? "reviewFeedbackApplied" : "reviewFeedbackApply"),
-			applied,
 		},
 	};
 }
@@ -2745,37 +2738,14 @@ function adaptFramedSystemCard(
 		data: {
 			payload: { kind: innerPayloadKind(inner), data: inner.data },
 			source: kind,
-			// A merge is authored by whoever pressed the button, and `creator` is already
-			// loaded for system rows — so the header can name a real person with a real
-			// avatar instead of a placeholder.
+			// `creator` is already loaded for system rows — so the header can name a real
+			// person with a real avatar instead of a placeholder.
 			creator: msg.creator ?? null,
 			hasHeader: true,
 			// The verbatim model-facing copy for the context-menu inspector.
 			modelFacing: modelFacingText,
-			// Both of these rows are ABOUT another chapter, and each already carries its
-			// id: a review's feedback names the review chapter it came from, a merge
-			// summary names the source chapter that was merged in. Read off the raw block
-			// rather than the projected card data, because the projection keeps only what
-			// the card paints.
-			target: framedCardTarget(kind, block),
 		},
 	};
-}
-
-/**
- * The chapter a framed system card refers to, when it names one.
- *
- * `merge_summary` carries `sourceChapterId` (the chapter that was merged in), written by
- * its producer today, so it needs no new field.
- *
- * Returns null when the id is absent, which is the shape of rows written before that
- * producer recorded it. An inert header is the correct outcome there; a link built on a
- * missing id would 404.
- */
-function framedCardTarget(kind: string, block: AdapterContentBlock): InjectionTarget | null {
-	const raw = block as unknown as Record<string, unknown>;
-	const id = kind === "merge_summary" ? raw.sourceChapterId : undefined;
-	return typeof id === "string" && id.trim().length > 0 ? { kind: "chapter", chapterId: id } : null;
 }
 
 /**

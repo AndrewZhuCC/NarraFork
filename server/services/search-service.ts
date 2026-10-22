@@ -24,17 +24,14 @@ export interface MessageHit {
 }
 
 interface SearchResult {
-	type: "chapter" | "message" | "narrator" | "knowledge";
+	type: "message" | "narrator" | "knowledge";
 	id: string;
 	title?: string;
 	snippet: string;
-	chapterId?: string;
-	chapterTitle?: string;
 	narratorId?: string;
 	narratorTitle?: string;
 	projectName?: string;
 	status?: string;
-	role?: string;
 	model?: string;
 	messageRole?: string;
 	/** Knowledge hits: the collection the entry lives in. */
@@ -202,9 +199,8 @@ export const searchService = {
 		if (!safeQuery) return results;
 
 		const strategy = strategyFor(safeQuery);
-		const safeQueryLower = safeQuery.toLowerCase();
-		// One query object for all three entity searches: the viewer travels with it, so a
-		// branch cannot accidentally run ungated.
+		// One query object for every entity search: the viewer travels with it, so a branch
+		// cannot accidentally run ungated.
 		const base = {
 			text: safeQuery,
 			strategy,
@@ -214,26 +210,6 @@ export const searchService = {
 			signal: options.signal,
 			scope,
 		};
-
-		if (entities.includes("chapters")) {
-			// A chapter hit exposes its title, description snippet and project name, so the
-			// backend gates it by the owning project inside the query.
-			for (const row of await searchStore.searchChapters(base)) {
-				results.push({
-					type: "chapter",
-					id: row.id,
-					title: row.title ?? undefined,
-					projectName: row.projectName ?? undefined,
-					status: row.status ?? undefined,
-					role: row.role ?? undefined,
-					createdAt: row.createdAt ?? undefined,
-					updatedAt: row.updatedAt ?? undefined,
-					matchField: row.title?.toLowerCase().includes(safeQueryLower) ? "title" : "description",
-					matchScore: scoreFromRank(row.rank, strategy === "index" ? 760 : 520),
-					snippet: row.snippet || row.description || "",
-				});
-			}
-		}
 
 		if (entities.includes("messages")) {
 			const candidateLimit = messageCandidateLimit(limit);
@@ -246,8 +222,6 @@ export const searchService = {
 					id: row.id,
 					narratorId: row.narratorId ?? undefined,
 					narratorTitle: row.narratorTitle ?? undefined,
-					chapterId: row.chapterId ?? undefined,
-					chapterTitle: row.chapterTitle ?? undefined,
 					projectName: row.projectName ?? undefined,
 					model: row.model ?? undefined,
 					messageRole: row.messageRole ?? undefined,
@@ -275,8 +249,6 @@ export const searchService = {
 					type: "narrator",
 					id: row.id,
 					title: row.title ?? undefined,
-					chapterId: row.chapterId ?? undefined,
-					chapterTitle: row.chapterTitle ?? undefined,
 					projectName: row.projectName ?? undefined,
 					status: row.status ?? undefined,
 					model: row.model ?? undefined,
@@ -298,7 +270,7 @@ export const searchService = {
 	 *
 	 * Kept separate from `search()` because its visibility gate differs in kind: knowledge
 	 * visibility is a dual-axis (clearance + controlled tag) check that reads grants, so it
-	 * cannot be expressed as a SQL fragment the way the narrator/project gates are. The
+	 * cannot be expressed as a SQL fragment the way the narrator gate is. The
 	 * matched rows are post-filtered by `knowledgeService.filterReadable`, which
 	 * fails closed — the same gate the knowledge routes use.
 	 *

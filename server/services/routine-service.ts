@@ -35,7 +35,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
-import type { Command } from "./chapter-service";
+import type { Command } from "./command-service";
 
 // ---------------------------------------------------------------------------
 // Marker used to identify routine-managed entries
@@ -641,7 +641,6 @@ async function removeProjectSkill(routine: BuiltinRoutine, gitPath: string): Pro
 // ---------------------------------------------------------------------------
 
 interface ChapterSettingsObj {
-	autoCreateNarrator?: boolean;
 	commands?: Command[];
 	routines?: RoutineModeConfig;
 	[key: string]: unknown;

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { eq, inArray, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -24,13 +24,10 @@ export interface LifecycleTarget {
 	scopeProjectId?: string | null;
 }
 export interface ResourceClaim extends LifecycleTarget {
-	kind: "registry" | "chapter" | "narrator" | "receipt";
+	kind: "registry" | "narrator" | "receipt";
 	id: string;
-	chapterId?: string | null;
 	state?: string;
 	revision?: number;
-	/** Only pre-switch, still chapter-bound legacy references have one-way containment. */
-	legacyChapterCwd?: boolean;
 }
 export interface ProtectionInspection {
 	status: "clear" | "protected" | "unavailable";
@@ -62,12 +59,6 @@ export function isResourceProtectionError(error: unknown): error is ResourceProt
 const MAX_BYTES = 256 * 1024;
 const MAX_MS = 5000;
 const MAX_TARGETS = 128;
-/** Opaque, service-created authority; callers cannot supply chapter IDs as a force token. */
-interface VerifiedReleaseScope {
-	chapters: Set<string>;
-	/** Raw pre-switch legacy bindings; canonicalized only by an actual sink. */
-	narrators: Map<string, string[]>;
-}
 interface PathFootprint {
 	raw: string;
 	canonical: string;
@@ -80,9 +71,6 @@ interface Reservation {
 	ports?: LifecycleGuardPorts;
 	targets: LifecycleTarget[];
 	admission: boolean;
-	/** Rows inserted by this service creation, not pre-existing legacy ownership. */
-	createdChapters?: Set<string>;
-	createdNarrators?: Set<string>;
 	/** Paths proven to have been born inside this identity context. */
 	createdPaths?: Set<string>;
 	/** Positive Git-root evidence acquired before this reserved retirement changes paths. */
@@ -90,28 +78,15 @@ interface Reservation {
 }
 const domain = hotSafe("narrafork.worktreeLifecycleGuard", () => ({
 	reservations: new Set<Reservation>(),
-	context: new AsyncLocalStorage<{ reservation: Reservation; scope?: VerifiedReleaseScope }>(),
+	context: new AsyncLocalStorage<{ reservation: Reservation }>(),
 }));
 
-const creationContext = hotSafe(
-	"narrafork.chapterCreationAdmission",
-	() => new AsyncLocalStorage<Reservation>(),
-);
-
-const verifiedScopes = hotSafe(
-	"narrafork.worktreeLifecycleScopes",
-	() => new WeakSet<VerifiedReleaseScope>(),
-);
 function liveContext() {
 	const current = domain.context.getStore();
 	return current && domain.reservations.has(current.reservation) ? current : undefined;
 }
 function footprintReservation(): Reservation | undefined {
-	const current = creationContext.getStore();
-	return (
-		liveContext()?.reservation ??
-		(current && domain.reservations.has(current) ? current : undefined)
-	);
+	return liveContext()?.reservation;
 }
 function overlaps(a: LifecycleTarget, b: LifecycleTarget): boolean {
 	if (a.scopeProjectId && a.scopeProjectId === b.scopeProjectId) return true;
@@ -150,98 +125,6 @@ export function assertWorkspaceAdmission(target: LifecycleTarget): void {
 			reject("workspace admission", { status: "protected", complete: true, claims: [] });
 	}
 }
-/** Initial chapter creation is an admission, never a legacy-release authority.
- * The source repository is identity context, not an exclusive directory target. */
-export async function withChapterCreation<T>(
-	projectId: string,
-	gitPath: string,
-	body: () => Promise<T>,
-	worktreePath?: string,
-): Promise<T> {
-	const targets: LifecycleTarget[] = [{ scopeProjectId: projectId }];
-	if (worktreePath)
-		targets.push(
-			{ deviceId: "local", path: worktreePath },
-			{ deviceId: "local", path: treeSnapshotPhysicalDir("local", worktreePath) },
-		);
-	const prepare = async (held: Reservation) => {
-		const deadline = performance.now() + MAX_MS;
-		const repository = await freezeFootprint(held, gitPath, deadline);
-		if (repository.identity === null) reject("chapter repository unavailable", unavailable());
-		// Re-read after admission, not from a project captured before an await gap.
-		const { db } = await import("../db");
-		const { projects } = await import("../db/schema");
-		const project = db
-			.select({ path: projects.gitPath })
-			.from(projects)
-			.where(eq(projects.id, projectId))
-			.limit(1)
-			.get();
-		if (
-			!project?.path ||
-			(await boundedRead(productionPorts.canonicalPath(project.path), deadline)) !==
-				repository.canonical
-		)
-			reject("chapter project changed or unavailable", unavailable());
-		if (worktreePath) {
-			const footprint = await freezeFootprint(held, worktreePath, deadline);
-			if (footprint.identity !== null) reject("chapter destination already exists", unavailable());
-			const shadow = await freezeFootprint(
-				held,
-				treeSnapshotPhysicalDir("local", worktreePath),
-				deadline,
-			);
-			if (shadow.identity !== null)
-				reject("chapter shadow destination already exists", unavailable());
-		}
-		await revalidateFootprints(held, deadline);
-	};
-	const current = creationContext.getStore();
-	const previous = current && domain.reservations.has(current) ? current : undefined;
-	const held: Reservation = previous ?? {
-		id: Symbol(),
-		targets: [],
-		admission: true,
-		ports: productionPorts,
-	};
-	try {
-		await prepare(held);
-		const canonical = await Promise.all(targets.map(canonicalWorkspaceAdmissionTarget));
-		await revalidateFootprints(held);
-		if (held.targets.length + canonical.length > MAX_TARGETS)
-			reject("chapter creation budget", unavailable());
-		// No await between comparing published canonical targets and publishing ours.
-		for (const target of canonical) assertWorkspaceAdmission(target);
-		held.targets.push(...canonical);
-		if (!previous) domain.reservations.add(held);
-		// Publication may follow a completed project retirement. Re-read the row, too.
-		await prepare(held);
-		// An unrelated enclosing retirement must neither supply release authority
-		// nor intercept the new creator's identity ledger.
-		return await domain.context.exit(() => creationContext.run(held, body));
-	} finally {
-		if (!previous) domain.reservations.delete(held);
-	}
-}
-
-/** Called synchronously after the service insert returns; this grants row
- * compensation provenance, never an exemption for independent resource claims. */
-export function recordChapterCreated(chapterId: string): void {
-	const held = creationContext.getStore();
-	if (!held || !domain.reservations.has(held))
-		reject("unreserved chapter insertion", unavailable());
-	held.createdChapters ??= new Set();
-	held.createdChapters.add(chapterId);
-}
-
-export function recordChapterNarratorCreated(narratorId: string): void {
-	const held = creationContext.getStore();
-	if (!held || !domain.reservations.has(held))
-		reject("unreserved narrator creation", unavailable());
-	held.createdNarrators ??= new Set();
-	held.createdNarrators.add(narratorId);
-}
-
 /**
  * Backend canonicalization for a newly committed cwd/context claim, never inventory adoption.
  * `path` is the comparison key used by reservations; `canonicalCwd` is safe to persist/execute.
@@ -315,23 +198,6 @@ async function canonicalShadowReference(
 		deviceId,
 		physicalPath: treeSnapshotPhysicalDir(deviceId, path),
 	};
-}
-
-/** The caller's complete actual deletion set; retained shadows do not own checkout paths. */
-export function legacyDeletionTargets(
-	path: string | null | undefined,
-	effects: { checkout: boolean; shadow: boolean },
-): LifecycleTarget[] {
-	if (!path) return [];
-	return [
-		...(effects.checkout ? [{ deviceId: "local", path }] : []),
-		...(effects.shadow
-			? [
-					{ deviceId: "local", shadowKey: treeSnapshotKey("local", path) },
-					{ deviceId: "local", path: treeSnapshotPhysicalDir("local", path) },
-				]
-			: []),
-	];
 }
 
 const fixturePorts = new AsyncLocalStorage<LifecycleGuardPorts>();
@@ -479,28 +345,24 @@ export function withLifecycleContext<T>(
 async function runLifecycleContext<T>(
 	paths: readonly string[],
 	body: () => Promise<T>,
-	scope?: VerifiedReleaseScope,
 	deadline = performance.now() + MAX_MS,
 	signal?: AbortSignal,
 ): Promise<T> {
 	if (paths.length > MAX_TARGETS || signal?.aborted) reject("lifecycle context", unavailable());
 	const previous = liveContext();
-	const creation = creationContext.getStore();
-	if (creation && domain.reservations.has(creation)) creation.footprints ??= new Map();
 	const held: Reservation = previous?.reservation ?? {
 		id: Symbol(),
 		targets: [],
 		admission: false,
 		ports: productionPorts,
-		// Trusted births must remain visible to an enclosing chapter creation.
-		footprints: creation && domain.reservations.has(creation) ? creation.footprints : new Map(),
+		footprints: new Map(),
 	};
 	try {
 		for (const path of paths) await freezeFootprint(held, path, deadline);
 		await revalidateFootprints(held, deadline);
 		if (signal?.aborted) reject("lifecycle context", unavailable());
 		if (!previous) domain.reservations.add(held);
-		return await domain.context.run({ reservation: held, scope: scope ?? previous?.scope }, body);
+		return await domain.context.run({ reservation: held }, body);
 	} finally {
 		if (!previous) domain.reservations.delete(held);
 	}
@@ -612,14 +474,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 	async function inspectOnce(
 		targets: readonly LifecycleTarget[],
 		_operation: string,
-		scope?: VerifiedReleaseScope,
 		signal?: AbortSignal,
 		frozenTargets = false,
 		creatingShadow = false,
 	): Promise<ProtectionInspection> {
 		const deadline = performance.now() + MAX_MS;
 		try {
-			if (scope && !verifiedScopes.has(scope)) return unavailable();
 			if (
 				!targets.length ||
 				targets.length > MAX_TARGETS ||
@@ -699,7 +559,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 					signal?.aborted
 				)
 					return unavailable();
-				if (claim.kind === "chapter" && scope?.chapters.has(claim.id)) continue;
 				const canonical = {
 					...claim,
 					...(claim.path && (claim.deviceId ?? "local") === "local"
@@ -719,14 +578,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 								? await ports.canonicalPath(shadow.physicalPath)
 								: shadow.physicalPath,
 					};
-				if (claim.kind === "narrator" && claim.revision === 0 && canonical.path) {
-					const released = await Promise.all(
-						(scope?.narrators.get(claim.id) ?? []).map((path) =>
-							boundedRead(ports.canonicalPath(path), deadline),
-						),
-					);
-					if (released.includes(canonical.path)) continue;
-				}
 				for (const target of normalized) {
 					if (!overlaps(target, canonical) && !(shadowPhysical && overlaps(target, shadowPhysical)))
 						continue;
@@ -744,7 +595,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 						!(target.shadowKey && target.shadowKey === canonical.shadowKey);
 					if (
 						pathOnlyAncestor &&
-						(claim.kind === "chapter" || claim.kind === "narrator") &&
+						claim.kind === "narrator" &&
 						targetPath &&
 						claimPath &&
 						(await distinctGitRoots(targetPath, claimPath))
@@ -763,7 +614,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 	async function inspect(
 		targets: readonly LifecycleTarget[],
 		operation: string,
-		scope?: VerifiedReleaseScope,
 		signal?: AbortSignal,
 		frozenTargets = false,
 		creatingShadow = false,
@@ -771,7 +621,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		const started = performance.now();
 		try {
 			return await boundedRead(
-				inspectOnce(targets, operation, scope, signal, frozenTargets, creatingShadow),
+				inspectOnce(targets, operation, signal, frozenTargets, creatingShadow),
 				started + MAX_MS,
 			);
 		} catch {
@@ -790,7 +640,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		targets: readonly LifecycleTarget[],
 		operation: string,
 		body: () => Promise<T>,
-		scope?: VerifiedReleaseScope,
 		deadline = performance.now() + MAX_MS,
 		signal?: AbortSignal,
 		contextPaths: readonly string[] = [],
@@ -802,7 +651,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			targets.length > MAX_TARGETS ||
 			contextPaths.length > MAX_TARGETS ||
 			Buffer.byteLength(JSON.stringify(targets)) > MAX_BYTES ||
-			(scope && !verifiedScopes.has(scope)) ||
 			targets.some(
 				(target) =>
 					(target.deviceId ?? "local") !== "local" ||
@@ -811,43 +659,11 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		)
 			reject(operation, unavailable());
 		const previous = liveContext();
-		const effectiveScope = scope ?? previous?.scope;
 		const held: Reservation = previous?.reservation ?? {
 			id: Symbol(),
 			targets: [],
 			admission: false,
 		};
-		const ownCreation = creationContext.getStore();
-		const isCompensation =
-			!targets.some((target) => target.scopeProjectId) &&
-			(operation === "legacy creation rollback" ||
-				(!!effectiveScope &&
-					effectiveScope.chapters.size > 0 &&
-					[...effectiveScope.chapters].every((id) => ownCreation?.createdChapters?.has(id))));
-		// A cold initializer can reuse only its creator's frozen absent destination;
-		// preparation stays private until all canonical targets are known.
-		const birth = creatingShadow && targets.length === 1 ? targets[0] : undefined;
-		const birthTarget =
-			birth?.deviceId === "local" &&
-			!birth.scopeProjectId &&
-			!birth.repositoryKey &&
-			!birth.shadowKey
-				? birth.path
-				: undefined;
-		const birthFootprint =
-			birthTarget &&
-			(ownCreation?.footprints?.get(normalizePathForComparison(birthTarget)) ??
-				[...(ownCreation?.footprints?.values() ?? [])].find(
-					(item) => item.canonical === normalizePathForComparison(birthTarget),
-				));
-		const isOwnedBirth = !!(
-			birthFootprint &&
-			(birthFootprint.identity === null || birthFootprint.removed) &&
-			ownCreation?.targets.some(
-				(target) => !target.scopeProjectId && target.path === birthFootprint.canonical,
-			)
-		);
-		if (birthFootprint && !previous) held.footprints = ownCreation?.footprints;
 		held.ports ??= ports;
 		const publishedTargets: LifecycleTarget[] = [];
 		let admitted = false;
@@ -872,13 +688,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			const ownBirthRollback =
 				operation === "shadow initialization rollback" &&
 				resolved.every((target) => target.path && held.createdPaths?.has(target.path));
-			const skipOwnAdmission = isCompensation || ownBirthRollback || isOwnedBirth;
 			// Compare and publish in one synchronous segment. Preparing work stays private;
 			// any claim committed during it is checked by the subsequent inventory read.
 			for (const other of domain.reservations) {
 				if (
 					other !== held &&
-					!(skipOwnAdmission && other === ownCreation) &&
+					!ownBirthRollback &&
 					other.targets.some((a) =>
 						resolved.some((b) =>
 							other.admission ? deletionContainsAdmission(b, a) : overlaps(a, b),
@@ -915,8 +730,8 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			);
 			if (resources.length) {
 				const inspection = await boundedRead(
-					domain.context.run({ reservation: held, scope: effectiveScope }, () =>
-						inspect(resources, operation, effectiveScope, signal, true, creatingShadow),
+					domain.context.run({ reservation: held }, () =>
+						inspect(resources, operation, signal, true, creatingShadow),
 					),
 					deadline,
 				);
@@ -925,7 +740,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			await revalidateFootprints(held, deadline);
 			if (signal?.aborted) reject(operation, unavailable());
 			admitted = true;
-			return await domain.context.run({ reservation: held, scope: effectiveScope }, body);
+			return await domain.context.run({ reservation: held }, body);
 		} catch (error) {
 			if (isResourceProtectionError(error)) throw error;
 			if (!admitted) reject(operation, unavailable());
@@ -943,16 +758,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			target: { deviceId: "local"; path: string },
 			body: () => Promise<T>,
 		): Promise<T> {
-			return reserve(
-				[target],
-				"shadow initialization",
-				body,
-				undefined,
-				undefined,
-				undefined,
-				[],
-				true,
-			);
+			return reserve([target], "shadow initialization", body, undefined, undefined, [], true);
 		},
 	};
 }
@@ -990,7 +796,7 @@ export async function assertLifecycleProtectionCurrent(
 	}
 	const inspection = await createLifecycleGuard(
 		current.reservation.ports ?? productionPorts,
-	).inspect(resolved, operation, current.scope, undefined, true);
+	).inspect(resolved, operation, undefined, true);
 	if (inspection.status !== "clear") reject(operation, inspection);
 	await revalidateFootprints(current.reservation);
 }
@@ -1001,15 +807,7 @@ export function withProtectionReservation<T>(
 	signal?: AbortSignal,
 	contextPaths: readonly string[] = [],
 ): Promise<T> {
-	return guard.withProtectionReservation(
-		targets,
-		operation,
-		body,
-		undefined,
-		undefined,
-		signal,
-		contextPaths,
-	);
+	return guard.withProtectionReservation(targets, operation, body, undefined, signal, contextPaths);
 }
 
 /** Creation reserves only its physical destination; it never grants cleanup authority. */
@@ -1020,185 +818,9 @@ export function withShadowCreationReservation<T>(
 	return guard.withShadowCreationReservation(target, body);
 }
 
-/** Rollback preflight precedes even narrator/chapter deletion, so deleting those rows
- * cannot erase the evidence which protects an independently claimed resource. */
-export async function withLegacyCreationRollback<T>(
-	chapterId: string,
-	path: string,
-	body: () => Promise<T>,
-): Promise<T> {
-	const { db } = await import("../db");
-	const { chapters } = await import("../db/schema");
-	const row = db
-		.select({ path: chapters.worktreePath, shadowKey: chapters.snapshotShadowKey })
-		.from(chapters)
-		.where(eq(chapters.id, chapterId))
-		.limit(1)
-		.get();
-	const creation = creationContext.getStore();
-	if (row && creation && !creation.createdChapters?.has(chapterId))
-		reject("unowned chapter compensation", unavailable());
-	if (!row)
-		return withProtectionReservation(
-			legacyDeletionTargets(path, { checkout: true, shadow: true }),
-			"legacy creation rollback",
-			body,
-		);
-	if (row.path && normalizePathForComparison(row.path) !== normalizePathForComparison(path))
-		reject("legacy creation rollback", unavailable());
-	if (row.shadowKey && row.shadowKey !== `local\0${normalizePathForComparison(path)}`)
-		reject("legacy creation rollback", unavailable());
-	return withLegacyRetirement(
-		[chapterId],
-		"legacy creation rollback",
-		body,
-		// A dormant split prefix never had a checkout. Its rollback destroys
-		// only the real shadow storage, not an invented path beneath the repo.
-		legacyDeletionTargets(path, { checkout: !!row.path, shadow: true }),
-	);
-}
-
-/** Compensate only steps recorded AFTER successful creation. A refused compensation
- * leaves protected resources intact and never replaces the original creation error. */
-export async function compensateLegacyCreation(
-	chapterId: string,
-	path: string,
-	steps: Array<() => Promise<void>>,
-): Promise<void> {
-	if (!steps.length) return;
-	try {
-		const creation = creationContext.getStore();
-		if (creation && domain.reservations.has(creation)) await revalidateFootprints(creation);
-		await withLegacyCreationRollback(chapterId, path, async () => {
-			for (const step of steps.reverse()) {
-				try {
-					await step();
-				} catch (error) {
-					if (isResourceProtectionError(error)) throw error;
-					logger.error("Creation compensation step failed", { error: String(error) });
-				}
-			}
-		});
-	} catch (error) {
-		logger.error("Creation compensation refused or failed; preserving original error", {
-			chapterId,
-			error: String(error),
-		});
-	}
-}
-
-/** The chapter service alone derives its release authority from the current DB rows. */
-export async function withLegacyRetirement<T>(
-	chapterIds: readonly string[],
-	operation: string,
-	body: () => Promise<T>,
-	targets: readonly LifecycleTarget[] = [],
-	deadlineLimit = performance.now() + MAX_MS,
-	signal?: AbortSignal,
-): Promise<T> {
-	if (signal?.aborted) reject(operation, unavailable());
-	const current = liveContext();
-	if (current?.scope && chapterIds.every((id) => current.scope?.chapters.has(id))) {
-		return targets.length
-			? guard.withProtectionReservation(targets, operation, body, undefined, deadlineLimit, signal)
-			: body();
-	}
-	if (!chapterIds.length || chapterIds.length > MAX_TARGETS) reject(operation, unavailable());
-	const deadline = Math.min(deadlineLimit, performance.now() + MAX_MS);
-	let admitted = false;
-	try {
-		const { db } = await import("../db");
-		const { chapters, narrators } = await import("../db/schema");
-		const rows = db
-			.select({
-				id: chapters.id,
-				path: chapters.worktreePath,
-				shadowKey: chapters.snapshotShadowKey,
-			})
-			.from(chapters)
-			.where(inArray(chapters.id, [...chapterIds]))
-			.limit(MAX_TARGETS + 1)
-			.all();
-		if (rows.length !== new Set(chapterIds).size) reject(operation, unavailable());
-		const scope: VerifiedReleaseScope = {
-			chapters: new Set(rows.map((row) => row.id)),
-			narrators: new Map(),
-		};
-		verifiedScopes.add(scope);
-		const owners = db
-			.select({
-				id: narrators.id,
-				cwd: narrators.cwd,
-				contextCwd: sql<string | null>`json_extract(${narrators.workspaceContext}, '$.cwd')`,
-				revision: narrators.workspaceRevision,
-			})
-			.from(narrators)
-			.where(inArray(narrators.chapterId, [...chapterIds]))
-			.limit(MAX_TARGETS + 1)
-			.all();
-		const provenanceComplete =
-			owners.length <= MAX_TARGETS &&
-			Buffer.byteLength(JSON.stringify(rows)) + Buffer.byteLength(JSON.stringify(owners)) <=
-				MAX_BYTES;
-		if (performance.now() > deadline) reject(operation, unavailable());
-		const creation = creationContext.getStore();
-		const newlyCreated = creation && chapterIds.every((id) => creation.createdChapters?.has(id));
-		for (const owner of provenanceComplete ? owners : []) {
-			// A new chapter binding is not proof that this request created that narrator.
-			if (newlyCreated && !creation.createdNarrators?.has(owner.id)) continue;
-			// Changed contexts are ordinary independent claims, not old chapter cwd aliases.
-			if (owner.revision > 0) continue;
-			const allowed: string[] = [];
-			for (const path of [owner.cwd, owner.contextCwd]) {
-				if (
-					typeof path === "string" &&
-					path.length > 0 &&
-					path.length <= 4096 &&
-					!path.includes("\0") &&
-					isAbsolute(path) &&
-					rows.some((row) =>
-						[row.path, row.shadowKey?.split("\0")[1]].some(
-							(logicalPath) => logicalPath && localPathSemantics.contains(logicalPath, path),
-						),
-					)
-				)
-					allowed.push(path); // Canonicalize only if a real sink later needs this release proof.
-			}
-			scope.narrators.set(owner.id, allowed);
-		}
-		if (performance.now() > deadline) reject(operation, unavailable());
-		if (!targets.length)
-			return await runLifecycleContext(
-				[],
-				async () => {
-					admitted = true;
-					return body();
-				},
-				scope,
-				deadline,
-				signal,
-			);
-		return await guard.withProtectionReservation(
-			targets,
-			operation,
-			async () => {
-				admitted = true;
-				return body();
-			},
-			scope,
-			deadline,
-			signal,
-		);
-	} catch (error) {
-		if (isResourceProtectionError(error) || admitted) throw error;
-		reject(operation, unavailable());
-	}
-}
-
-/** Project metadata is a scope barrier; only actual non-root cleanup owns disk targets. */
+/** Project metadata is a scope barrier: a project with live worktree resources is protected. */
 export async function withProjectRetirement<T>(
 	projectId: string,
-	gitPath: string | null,
 	body: () => Promise<T>,
 	signal?: AbortSignal,
 ): Promise<T> {
@@ -1210,14 +832,14 @@ export async function withProjectRetirement<T>(
 		return body();
 	};
 	try {
-		// Publish metadata first, without inventory or filesystem probing. Chapter
-		// creation and scope CAS now cannot insert a missed same-project resource.
+		// Publish metadata first, without inventory or filesystem probing. Scope CAS now
+		// cannot insert a missed same-project resource.
 		return await guard.withProtectionReservation(
 			[{ scopeProjectId: projectId }],
 			"project delete",
 			async () => {
 				const { db } = await import("../db");
-				const { chapters, narratorWorktreeResources } = await import("../db/schema");
+				const { narratorWorktreeResources } = await import("../db/schema");
 				const scopedResource = db
 					.select({
 						id: narratorWorktreeResources.id,
@@ -1236,32 +858,10 @@ export async function withProjectRetirement<T>(
 						complete: false,
 						claims: [{ kind: "registry", ...scopedResource }],
 					});
-				const rows = db
-					.select({ id: chapters.id, path: chapters.worktreePath, isRoot: chapters.isRoot })
-					.from(chapters)
-					.where(eq(chapters.projectId, projectId))
-					.limit(MAX_TARGETS + 1)
-					.all();
-				if (rows.length > MAX_TARGETS) reject("project delete", unavailable());
-				const targets: LifecycleTarget[] = [];
-				for (const row of rows) {
-					if (gitPath && !row.isRoot && row.path)
-						targets.push(...legacyDeletionTargets(row.path, { checkout: true, shadow: true }));
-				}
 				if (performance.now() > deadline || signal?.aborted)
 					reject("project delete", unavailable());
-				return rows.length
-					? withLegacyRetirement(
-							rows.map((row) => row.id),
-							"project delete",
-							run,
-							targets,
-							deadline,
-							signal,
-						)
-					: run();
+				return run();
 			},
-			undefined,
 			deadline,
 			signal,
 		);

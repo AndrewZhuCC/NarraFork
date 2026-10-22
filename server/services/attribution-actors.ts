@@ -1,10 +1,9 @@
 /**
  * Resolving "who wrote this file" into something displayable.
  *
- * A worktree is shared. Subagents, standalone narrators, and narrators bound to a
- * different chapter all write to the same directory, so an attribution row can point at
- * any narrator in the instance. A client that only knows its own chapter's primary
- * narrators cannot label those rows — that gap is what made the Git panel report
+ * A worktree is shared. Subagents and other sessions working in the same directory all
+ * write to it, so an attribution row can point at any narrator in the instance. A client
+ * that only knows its own session cannot label those rows — that gap is what made the Git panel report
  * "Unknown" for the majority of real writers.
  *
  * Resolution lives here, in one module, rather than in each consumer: this is the single
@@ -229,7 +228,7 @@ export async function resolveAttributionActors(
 	return buildAttributionActors(ids, [...rows, ...parentRows]);
 }
 
-/** A human is resolved by userId, never by the narrator that happens to own a chapter. */
+/** A human is resolved by userId, never by the narrator that happens to own a workspace. */
 export async function resolveHumanAttributionActors(
 	ids: string[],
 ): Promise<Map<string, AttributionActor>> {

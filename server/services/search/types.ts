@@ -12,7 +12,7 @@
  * ------------------------------------
  * Four call sites search text today and they do NOT agree on recall:
  *
- *   - global search (chapters / messages / narrators) matches the whole query as ONE PHRASE;
+ *   - global search (messages / narrators) matches the whole query as ONE PHRASE;
  *   - the narrator timeline and Recall match each whitespace-separated term as a PREFIX;
  *   - knowledge matches prefixes too, but supports any-term matching and a field restriction;
  *   - the substring fallbacks disagree on wildcard escaping: knowledge escapes `%`/`_` typed
@@ -89,7 +89,7 @@ export interface SnippetFormat {
 	readonly tokens: number;
 }
 
-/** Global search (chapter descriptions, message bodies, narrator titles): unmarked excerpt. */
+/** Global search (message bodies, narrator titles): unmarked excerpt. */
 export const GLOBAL_SNIPPET: SnippetFormat = {
 	open: "",
 	close: "",
@@ -144,7 +144,7 @@ export interface EntitySearchQuery {
 	limit: number;
 	viewer: SearchViewer;
 	/** Which conversation content message and narrator hits may come from. Omitted means
-	 *  {@link FULL_MESSAGE_SCOPE}; chapter search ignores it. */
+	 *  {@link FULL_MESSAGE_SCOPE}. */
 	scope?: MessageSearchScope;
 }
 
@@ -270,25 +270,11 @@ export interface ShadowedEntryQuery {
 // Rows
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface ChapterSearchRow {
-	id: string;
-	title: string | null;
-	description: string | null;
-	status: string | null;
-	role: string | null;
-	projectName: string | null;
-	createdAt: string | null;
-	updatedAt: string | null;
-	snippet: string;
-	rank: RelevanceRank;
-}
-
 export interface MessageSearchRow {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
+	/** Name of the narrator's project (the `resolveNarratorProjectId` rule), if it has one. */
 	projectName: string | null;
 	model: string | null;
 	messageRole: string | null;
@@ -308,8 +294,7 @@ export interface MessageSearchRow {
 export interface NarratorSearchRow {
 	id: string;
 	title: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
+	/** See {@link MessageSearchRow.projectName}. */
 	projectName: string | null;
 	status: string | null;
 	model: string | null;
@@ -336,7 +321,6 @@ export interface RecallMessageRow {
 	messageId: string;
 	narratorId: string;
 	narratorTitle: string | null;
-	chapterId: string | null;
 	role: string;
 	createdAt: string;
 	snippet: string;

@@ -822,12 +822,8 @@ export type NarratorServerMessage =
 	| {
 			type: "git_status";
 			narratorId: string;
-			/** Null for chapter-less narrators, whose tools still touch a local Git repo. */
-			chapterId: string | null;
 			toolUseId: string;
 			status: GitStatusSummary;
-			commitsAhead?: number;
-			baseBranch?: string;
 			linesAdded?: number;
 			linesRemoved?: number;
 	  }
@@ -839,18 +835,16 @@ export type NarratorServerMessage =
 			 * Paths are worktree-RELATIVE: the client knows its own root, and absolute
 			 * paths would disclose the host's directory layout to every subscriber.
 			 *
-			 * Only emitted while the native watcher is running
-			 * (`NARRAFORK_ENABLE_NATIVE_WATCHER=1`); the default polling fallback observes
-			 * no paths. A receiver must therefore treat this as an accelerator over its own
-			 * on-demand fetching, never as its only route to a fresh view.
+			 * Emitted after a tool call changes files; edits from outside the tool path
+			 * are not reported. A receiver must therefore treat this as an accelerator over
+			 * its own on-demand fetching, never as its only route to a fresh view.
 			 *
-			 * `truncated` says more changed than `changes` lists — the batch hit the
-			 * watcher's per-window cap. The list is then a sample, not the set, and the
-			 * receiver must invalidate broadly instead of applying it literally.
+			 * `truncated` says more changed than `changes` lists — the call hit the
+			 * per-broadcast cap. The list is then a sample, not the set, and the receiver
+			 * must invalidate broadly instead of applying it literally.
 			 */
 			type: "workspace_paths_changed";
 			narratorId: string;
-			chapterId: string;
 			toolUseId: string;
 			changes: readonly { path: string; kind: "added" | "updated" | "deleted" }[];
 			truncated: boolean;
@@ -911,24 +905,6 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			timeoutMs: number;
 	  }
-	| { type: "commits_updated"; narratorId: string; chapterId: string; newCount: number }
-	/**
-	 * Background commit sync failed, so the commit list and Git panel are serving
-	 * cached rows. The client already had the handler for this (a warning toast plus
-	 * a refetch of the chapter's git state); nothing on the server ever sent it, so
-	 * a failed sync silently kept showing stale data.
-	 */
-	| {
-			type: "commit_sync_error";
-			narratorId: string;
-			chapterId: string;
-			code: string;
-			error: string;
-			/** Cached rows are still being served, so this is a degradation, not a stop. */
-			fallback: boolean;
-			/** Raised by a watcher tick rather than by something the user just asked for. */
-			backgroundSync: boolean;
-	  }
 	| {
 			type: "presence_update";
 			narratorId: string;
@@ -966,12 +942,6 @@ export type NarratorServerMessage =
 			type: "browser_session_visual_change";
 			narratorId: string;
 			sessionId: string;
-	  }
-	| {
-			type: "container_status_changed";
-			narratorId: string;
-			chapterId: string;
-			containerStatus: string | null;
 	  }
 	| {
 			type: "quota_balance";

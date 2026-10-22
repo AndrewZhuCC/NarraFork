@@ -1,10 +1,9 @@
 /**
  * Narrator-visibility gate on message and narrator search results.
  *
- * The chapter gate has its own regression (`search-narrator-acl`'s sibling,
- * `search-chapter-acl.test.ts`) and knowledge has `search-knowledge.test.ts`, but the
- * narrator gate — the one that decides whether a stranger can read a private session's
- * TITLE and a snippet of its TRANSCRIPT — had no test of its own. That gap became load-bearing
+ * Knowledge has its own regression (`search-knowledge.test.ts`), but the narrator gate — the
+ * one that decides whether a stranger can read a private session's TITLE and a snippet of its
+ * TRANSCRIPT — had no test of its own. That gap became load-bearing
  * when the gate moved from prepared statements inside `search-service.ts` into the search
  * backend: the move is only safe if something fails when the gate is dropped, and nothing did.
  *
@@ -16,18 +15,11 @@
  * is one short query away from leaking.
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import {
-	aclGrants,
-	chapters,
-	narratorMessages,
-	narrators,
-	projects,
-	users,
-} from "../../../server/db/schema";
+import { aclGrants, narratorMessages, narrators, projects, users } from "../../../server/db/schema";
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
 const searchStore = createSqliteSearchStore(async (sql, params) =>
@@ -55,7 +47,7 @@ function seedNarrator(
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: "chap-1",
+			contextProjectId: "proj-1",
 			type: "primary",
 			inheritMode: "fresh",
 			title,
@@ -136,17 +128,6 @@ beforeEach(() => {
 			updatedAt: NOW,
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "chap-1",
-			projectId: "proj-1",
-			title: "Chapter",
-			branch: "chapter/chap-1",
-			baseBranch: "main",
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
 
 	// Long titles/bodies for the FTS path, plus a 2-character needle for the fallback.
 	seedNarrator("narr-private", "Zephyr private session Qx", "private");
@@ -157,14 +138,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	sqlite.run("PRAGMA foreign_keys = OFF");
-	for (const table of [
-		"acl_grants",
-		"narrator_messages",
-		"narrators",
-		"chapters",
-		"projects",
-		"users",
-	]) {
+	for (const table of ["acl_grants", "narrator_messages", "narrators", "projects", "users"]) {
 		sqlite.run(`DELETE FROM "${table}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");

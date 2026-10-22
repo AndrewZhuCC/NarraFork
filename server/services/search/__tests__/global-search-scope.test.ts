@@ -16,7 +16,7 @@ import {
 } from "../types";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../db", () => ({ db, sqlite }));
+mock.module("../../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { ensureFts, replaceBlockIndexText } = await import("../../../db/fts");
 ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
@@ -41,18 +41,13 @@ run(
 	 VALUES ('p1', 'Project', 'public', 'u1', ?, ?)`,
 	[NOW, NOW],
 );
-run(
-	`INSERT INTO chapters (id, project_id, title, description, branch, base_branch, created_at, updated_at)
-	 VALUES ('ch1', 'p1', 'Chapter', '', 'b1', 'main', ?, ?)`,
-	[NOW, NOW],
-);
 for (const [id, type, title] of [
 	["primary", "primary", "zebrafish primary session"],
 	["sub", "subagent", "zebrafish explore subagent"],
 ] as const) {
 	run(
-		`INSERT INTO narrators (id, chapter_id, title, type, visibility, owner_user_id, created_at, updated_at)
-		 VALUES (?, 'ch1', ?, ?, 'public', 'u1', ?, ?)`,
+		`INSERT INTO narrators (id, context_project_id, title, type, visibility, owner_user_id, created_at, updated_at)
+		 VALUES (?, 'p1', ?, ?, 'public', 'u1', ?, ?)`,
 		[id, title, type, NOW, NOW],
 	);
 }
@@ -157,8 +152,6 @@ function row(id: string, narratorId: string | null): MessageSearchRow {
 		id,
 		narratorId,
 		narratorTitle: null,
-		chapterId: null,
-		chapterTitle: null,
 		projectName: null,
 		model: null,
 		messageRole: "assistant",

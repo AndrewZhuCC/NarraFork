@@ -6,7 +6,7 @@
  *
  * Usage:
  *   const lock = new AsyncMutex();
- *   await lock.acquire("chapter-123", async () => { ... });
+ *   await lock.acquire("narrator-123", async () => { ... });
  */
 import { normalizePathForComparison } from "./platform-path";
 
@@ -108,8 +108,8 @@ export class AsyncMutex {
  * Exists because a raw path is not a usable identity: `/a/wt`, `/a/wt/`,
  * `/a/./wt` and (on Windows) `C:\A\WT` are the same directory but four distinct
  * Map keys, so two callers guarding "the same worktree" could both hold the lock
- * and interleave their git writes. Every path that reaches a lock originates
- * from `chapters.worktreePath`, a free-form string nobody canonicalizes on write,
+ * and interleave their git writes. Paths reach a lock from session working
+ * directories and resource rows, free-form strings nobody canonicalizes on write,
  * so the variants are reachable rather than theoretical.
  *
  * The normalization is deliberately not exposed as "normalize, then call
@@ -173,24 +173,22 @@ async function raceWithTimeout(promise: Promise<unknown>, timeoutMs: number): Pr
 }
 
 /**
- * Lock hierarchy for the chapter/worktree subsystem — acquire in this order only:
+ * Lock hierarchy for the worktree subsystem — acquire in this order only:
  *
- *   `chapterLock` → `worktreeLock` → { shadow-repo lock, `containerLock` }
+ *   `worktreeLock` → shadow-repo lock
  *
  * Deadlock between two locks needs a cycle, and a cycle needs two callers acquiring the
  * same pair in opposite orders. A single global order makes that unrepresentable, which
  * is why the rule is about *order* rather than about which locks a function may take.
  *
  * The current shape, verified by inspection of every call site:
- *   - `chapterLock` (keyed by chapterId) is outermost. `chapter-cleanup`'s dormant path
- *     holds it and takes `worktreeLock` inside.
- *   - `worktreeLock` (keyed by normalized path) is the middle level. It is the only
- *     worktree mutex: `git-service`'s write methods take *this* one, which is why they
- *     also expose `*Unlocked` variants for callers that already hold it.
- *   - The shadow-repo mutex in `worktree-tree-snapshot` and `containerLock` are leaves:
- *     neither acquires anything else. `worktree-tree-snapshot` has no reference to
- *     `gitService` at all — it spawns git directly against a scratch index — so the
- *     tempting `shadow → git` edge does not exist.
+ *   - `worktreeLock` (keyed by normalized path) is the only worktree mutex:
+ *     `git-service`'s write methods take *this* one; nothing else acquires it, so no
+ *     caller may invoke them while holding it.
+ *   - The shadow-repo mutex in `worktree-tree-snapshot` is a leaf: it acquires nothing
+ *     else. `worktree-tree-snapshot` has no reference to `gitService` at all — it spawns
+ *     git directly against a scratch index — so the tempting `shadow → git` edge does not
+ *     exist.
  *
  * No runtime assertion enforces this. Detecting "which locks does this async call stack
  * hold" needs `AsyncLocalStorage` context threaded through `AsyncMutex`, and `AsyncMutex`
@@ -202,19 +200,13 @@ async function raceWithTimeout(promise: Promise<unknown>, timeoutMs: number): Pr
  * prevents. `git-service-worktree-lock.test.ts` covers the concrete hazard instead.
  */
 
-/** Per-chapter mutex — guards state transitions (dormant, wake, remove, update). */
-export const chapterLock = new AsyncMutex();
-
 /**
- * Per-worktree mutex — guards git operations (merge, cherry-pick, autoCommit).
+ * Per-worktree mutex — guards git write operations.
  *
  * Path-keyed so that every caller lands on the same key regardless of how the
  * worktree path was spelled in the row it came from.
  */
 export const worktreeLock = new PathKeyedMutex();
-
-/** Per-chapter mutex — guards container lifecycle operations (start, stop, pause, remove). */
-export const containerLock = new AsyncMutex();
 
 /** Per-narrator mutex — guards read-modify-write updates to narrator traits. */
 export const narratorTraitsLock = new AsyncMutex();

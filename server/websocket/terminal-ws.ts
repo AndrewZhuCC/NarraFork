@@ -39,7 +39,6 @@ export type TerminalClientMessage =
 	| {
 			type: "create";
 			requestId: string;
-			chapterId?: string;
 			narratorId?: string;
 			deviceId?: string;
 			name?: string;

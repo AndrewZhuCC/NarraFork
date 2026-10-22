@@ -633,3 +633,27 @@ export const MODEL_HISTORY_SQLITE_TRIGGERS = MODEL_HISTORY_V2_SQLITE_TRIGGERS.ma
 export const MODEL_HISTORY_PG_TRIGGERS = MODEL_HISTORY_V2_PG_TRIGGERS.map(
 	([name, table]) => [name.replace("model_history_v2_", "model_history_v3_"), table] as const,
 );
+
+/**
+ * The versioned reinstall of the current contract around a SQLite table rebuild (Drizzle's
+ * `CREATE __new_x` / copy / `DROP TABLE x` / `RENAME`), for a database that already has it.
+ *
+ * Dropping the table drops its own triggers, and SQLite refuses the RENAME (and any later
+ * `DROP COLUMN`) while a trigger on another table still names the dropped one. So `before`
+ * drops every current-contract trigger ahead of the rebuild, and `after` drops them again (a
+ * self-contained suffix never meets an "already exists") and installs the contract exactly as
+ * {@link renderModelHistoryRevisionSql} does: the catalog ends byte-identical to a fresh install.
+ * PostgreSQL alters tables in place, so it has no counterpart.
+ */
+export function renderModelHistoryReinstallSql(dialect: "sqlite"): {
+	before: string;
+	after: string;
+} {
+	const before = MODEL_HISTORY_SQLITE_TRIGGERS.map(
+		(name) => `DROP TRIGGER IF EXISTS ${name};`,
+	).join("\n--> statement-breakpoint\n");
+	return {
+		before,
+		after: `${before}\n--> statement-breakpoint\n${renderModelHistoryRevisionSql(dialect)}`,
+	};
+}

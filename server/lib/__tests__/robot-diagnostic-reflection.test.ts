@@ -23,7 +23,7 @@ const PRESET_POLICY = compileExecutionPolicy(robotDiagnosticRuleSet(), null);
 const ROBOT_CWD = "/home/robot";
 
 async function reflects(command: string, preset: boolean): Promise<boolean> {
-	const analysis = await analyzeShellCommand(command, ROBOT_CWD, "posix", false);
+	const analysis = await analyzeShellCommand(command, ROBOT_CWD, "posix");
 	const danger = classifyDanger(
 		"Bash",
 		{ command },

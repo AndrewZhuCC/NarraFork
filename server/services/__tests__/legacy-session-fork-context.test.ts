@@ -7,12 +7,12 @@ import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import {
 	aclGrants,
-	chapters,
 	integrationResourceBindings,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorProjectLinks,
 	narrators,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
@@ -67,7 +67,6 @@ const friend = generateId();
 const stranger = generateId();
 const projectId = generateId();
 const otherProjectId = generateId();
-const chapterId = generateId();
 const projectPath = `${process.env.NARRAFORK_HOME}/original-project`;
 const worktreePath = `${process.env.NARRAFORK_HOME}/original-worktree`;
 
@@ -98,17 +97,20 @@ beforeAll(async () => {
 		capability: "read",
 		createdAt: now,
 	});
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "old resource",
-		branch: "old-resource",
-		baseBranch: "main",
-		worktreePath,
-		createdAt: now,
+});
+
+/** A link the project index derives from a working directory. */
+async function cwdLink(narratorId: string, project: string, role: "primary" | "additional") {
+	await db.insert(narratorProjectLinks).values({
+		narratorId,
+		projectId: project,
+		role,
+		source: "cwd",
+		deviceId: "local",
+		directory: project === projectId ? projectPath : `${projectPath}-other`,
 		updatedAt: now,
 	});
-});
+}
 
 async function parent(fields: Partial<typeof narrators.$inferInsert> = {}) {
 	const id = generateId();
@@ -242,17 +244,24 @@ describe("skill project context", () => {
 			cwd: projectPath,
 		});
 	});
-	test("chapter project wins over conflicting explicit context", async () => {
-		const id = await parent({ chapterId, contextProjectId: otherProjectId, cwd: null });
+	test("explicit project wins over a project derived from the directory", async () => {
+		const otherPath = `${projectPath}-other`;
+		const id = await parent({ contextProjectId: projectId, cwd: otherPath });
+		await cwdLink(id, otherProjectId, "additional");
 		expect(await resolveSkillContextForNarrator(id)).toEqual({
 			projectGitPath: projectPath,
-			cwd: worktreePath,
+			cwd: otherPath,
 		});
 	});
-	test("an arbitrary directory never infers project membership", async () => {
+	test("a directory implies membership only through the project index", async () => {
 		const id = await parent({ cwd: projectPath });
 		expect(await resolveSkillContextForNarrator(id)).toEqual({
 			projectGitPath: null,
+			cwd: projectPath,
+		});
+		await cwdLink(id, projectId, "primary");
+		expect(await resolveSkillContextForNarrator(id)).toEqual({
+			projectGitPath: projectPath,
 			cwd: projectPath,
 		});
 	});
@@ -315,16 +324,29 @@ describe("ordinary session fork context and constraints", () => {
 			deviceId: "device-original",
 		});
 	});
+	test("a former chapter session without a directory cannot be forked into the home directory", async () => {
+		// No `standalone` trait and no directory: a session created inside a chapter whose
+		// directory came from the chapter that no longer exists.
+		const id = await parent({ traits: [], cwd: null, contextProjectId: projectId });
+		await expect(
+			narratorService.forkNarrator(id, null, { inheritMode: "fresh" }),
+		).rejects.toMatchObject({ code: "WORKSPACE_DIRECTORY_REQUIRED" });
+		// Its own directory, once chosen, is forked like any other.
+		await db.update(narrators).set({ cwd: "/chosen" }).where(eq(narrators.id, id));
+		const child = await narratorService.forkNarrator(id, null, { inheritMode: "fresh" });
+		expect(child.cwd).toBe("/chosen");
+	});
+
 	test("ordinary tool wrapper refuses review/general subagents before allocating a child", async () => {
 		for (const kind of ["review", "general"] as const) {
-			const rootId = await parent({ chapterId });
+			const rootId = await parent({ contextProjectId: projectId });
 			const id = await parent({
 				type: "subagent",
 				parentNarratorId: rootId,
 				aclRootNarratorId: rootId,
 				variant: `subagent:${kind}`,
 				subagentType: kind,
-				chapterId,
+				contextProjectId: projectId,
 			});
 			const before = sqlite.query("SELECT COUNT(*) AS n FROM narrators").get();
 			await expect(narratorService.forkStandaloneFromTool(id, "fresh")).rejects.toThrow(
@@ -333,10 +355,9 @@ describe("ordinary session fork context and constraints", () => {
 			expect(sqlite.query("SELECT COUNT(*) AS n FROM narrators").get()).toEqual(before);
 		}
 	});
-	test("committed device/context project wins over stale mirror and child revision is self-consistent", async () => {
+	test("committed device context wins over stale mirror, project over a stale context project, and child revision is self-consistent", async () => {
 		const id = await parent({
-			chapterId,
-			contextProjectId: otherProjectId,
+			contextProjectId: projectId,
 			defaultDeviceId: "device-original",
 			cwd: "/stale-mirror",
 			workspaceRevision: 9,
@@ -352,7 +373,6 @@ describe("ordinary session fork context and constraints", () => {
 		});
 		const child = await narratorService.forkStandaloneFromTool(id, "fresh");
 		expect(child).toMatchObject({
-			chapterId: null,
 			contextProjectId: projectId,
 			cwd: "/verified-remote",
 			defaultDeviceId: "device-original",
@@ -366,7 +386,11 @@ describe("ordinary session fork context and constraints", () => {
 		});
 	});
 	test("unresolved remote workspace refuses rather than borrowing host project paths", async () => {
-		const id = await parent({ chapterId, defaultDeviceId: "device-original", cwd: null });
+		const id = await parent({
+			contextProjectId: projectId,
+			defaultDeviceId: "device-original",
+			cwd: null,
+		});
 		await expect(narratorService.forkStandaloneFromTool(id, "fresh")).rejects.toThrow(
 			"Remote workspace is unresolved",
 		);
@@ -374,16 +398,16 @@ describe("ordinary session fork context and constraints", () => {
 	test.each([
 		"fresh",
 		"full",
-	] as const)("chapter %s tool fork retains constraints and model without creating resources", async (inheritMode) => {
+	] as const)("project %s tool fork retains constraints and model without creating resources", async (inheritMode) => {
 		const id = await parent({
-			chapterId,
+			contextProjectId: projectId,
+			cwd: worktreePath,
 			defaultDeviceId: "local",
 			traits: ["review", "disabledTools:dangerous-tool"],
 			model: "old-model",
 			aclRootNarratorId: "root",
 		});
 		await rules(id);
-		const beforeChapters = sqlite.query("SELECT COUNT(*) AS n FROM chapters").get();
 		const beforeProjects = sqlite.query("SELECT COUNT(*) AS n FROM projects").get();
 		const child = await narratorService.forkStandaloneFromTool(
 			id,
@@ -391,11 +415,9 @@ describe("ordinary session fork context and constraints", () => {
 			{ inheritMode: inheritMode === "full" ? "full" : undefined, model: "new-model" },
 		);
 		await assertInherited(id, child.id, worktreePath, "local");
-		expect(child.chapterId).toBeNull();
 		expect(child.aclRootNarratorId).toBe("root");
 		expect(child.traits).toContain("review");
 		expect(child.model).toBe("new-model");
-		expect(sqlite.query("SELECT COUNT(*) AS n FROM chapters").get()).toEqual(beforeChapters);
 		expect(sqlite.query("SELECT COUNT(*) AS n FROM projects").get()).toEqual(beforeProjects);
 	});
 	test.each([
@@ -410,21 +432,6 @@ describe("ordinary session fork context and constraints", () => {
 		await rules(id);
 		const child = await narratorService.forkNarrator(id, null, { inheritMode });
 		await assertInherited(id, child.id, "/remote-context");
-	});
-	test("forking an old chapter session keeps its project gate and actual worktree, without unbinding the parent", async () => {
-		const id = await parent({
-			chapterId,
-			contextProjectId: otherProjectId,
-			defaultDeviceId: "local",
-			cwd: null,
-		});
-		await rules(id);
-		const child = await narratorService.forkNarrator(id, null, {
-			standalone: true,
-			inheritMode: "fresh",
-		});
-		await assertInherited(id, child.id, worktreePath, "local");
-		expect((await narratorService.getById(id)).chapterId).toBe(chapterId);
 	});
 	test("selected-message forks inherit the same access and execution profile", async () => {
 		const id = await parent({
@@ -460,15 +467,19 @@ describe("ordinary session fork context and constraints", () => {
 		await assertInherited(id, child.id, "/remote-context");
 		expect(child.model).toBe("custom-model");
 	});
-	test("compressed chapter tool forks preserve model and read-only context without network or resource creation", async () => {
+	test("compressed project tool forks preserve model and read-only context without network or resource creation", async () => {
 		const { narratorContext } = await import("../narrator-context");
 		const summary = spyOn(narratorContext, "generateContextSummary").mockResolvedValue(
 			"fixture summary",
 		);
 		try {
-			const id = await parent({ chapterId, defaultDeviceId: "local", model: "old-model" });
+			const id = await parent({
+				contextProjectId: projectId,
+				cwd: worktreePath,
+				defaultDeviceId: "local",
+				model: "old-model",
+			});
 			await rules(id);
-			const beforeChapters = sqlite.query("SELECT COUNT(*) AS n FROM chapters").get();
 			const beforeProjects = sqlite.query("SELECT COUNT(*) AS n FROM projects").get();
 			const child = await narratorService.forkStandaloneFromTool(id, "fork", {
 				inheritMode: "compressed",
@@ -477,13 +488,11 @@ describe("ordinary session fork context and constraints", () => {
 			});
 			await assertInherited(id, child.id, worktreePath, "local");
 			expect(child).toMatchObject({
-				chapterId: null,
 				model: "new-model",
 				contextSummary: "fixture summary",
 				inheritMode: "compressed",
 			});
 			expect(summary).toHaveBeenCalledWith(id, "en", { userId: owner });
-			expect(sqlite.query("SELECT COUNT(*) AS n FROM chapters").get()).toEqual(beforeChapters);
 			expect(sqlite.query("SELECT COUNT(*) AS n FROM projects").get()).toEqual(beforeProjects);
 		} finally {
 			summary.mockRestore();

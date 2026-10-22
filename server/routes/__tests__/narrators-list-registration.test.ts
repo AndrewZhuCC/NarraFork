@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { db } from "../../db";
-import { chapters, narrators, projects, users } from "../../db/schema";
+import { narrators, projects, users } from "../../db/schema";
 import { narratorService } from "../../services/narrator-service";
 import { narratorRoutes } from "../narrators";
 
@@ -20,23 +20,14 @@ beforeAll(async () => {
 		createdAt: NOW,
 		updatedAt: NOW,
 	});
-	await db.insert(chapters).values({
-		id: "list-chapter",
-		projectId: "list-project",
-		title: "List",
-		branch: "list",
-		baseBranch: "main",
-		createdAt: NOW,
-		updatedAt: NOW,
-	});
 	await db.insert(narrators).values(
-		[null, "list-chapter"].map((chapterId, i) => ({
+		[null, "list-project"].map((contextProjectId, i) => ({
 			id: `list-${i}`,
-			chapterId,
+			contextProjectId,
 			ownerUserId: "list-owner",
 			handle: i === 0 ? "list-named" : null,
 			handleFolded: i === 0 ? "list-named" : null,
-			traits: i === 0 ? ["standalone", "named"] : [],
+			traits: i === 0 ? ["standalone", "named"] : ["standalone"],
 			runtimeRegistrationJson: {
 				version: 1 as const,
 				run: {
@@ -58,19 +49,18 @@ test("list queries exclude the registration at SQL projection, not only response
 	for (const site of [
 		routes.slice(routes.indexOf("const [list, countResult]"), routes.indexOf("const totalCount")),
 		service.slice(service.indexOf("async listNamed()"), service.indexOf("async setHandle(")),
-		service.slice(service.indexOf("async listByChapter("), service.indexOf("async remove(")),
 	]) {
 		expect(site).toMatch(/columns:\s*\{\s*runtimeRegistrationJson:\s*false\s*\}/);
 	}
 });
-test("standalone, chapter and named lists never return live runtime registration", async () => {
+test("all, project and named lists never return live runtime registration", async () => {
 	const app = new Hono();
 	app.use("*", async (c, next) => {
 		c.set("user", { sub: "list-owner", role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	app.route("/narrators", narratorRoutes);
-	for (const suffix of ["?standalone=true", "?chapterId=list-chapter", "/named"]) {
+	for (const suffix of ["", "?projectId=list-project", "/named"]) {
 		const response = await app.request(`http://localhost/narrators${suffix}`);
 		expect(response.status).toBe(200);
 		const body = await response.json();
@@ -79,11 +69,7 @@ test("standalone, chapter and named lists never return live runtime registration
 		for (const item of items) expect(item).not.toHaveProperty("runtimeRegistrationJson");
 		expect(JSON.stringify(body)).not.toContain("private-execution-principal");
 	}
-	for (const items of [
-		await narratorService.listNamed(),
-		await narratorService.listByChapter("list-chapter"),
-	]) {
-		expect(items.length).toBeGreaterThan(0);
-		for (const item of items) expect(item).not.toHaveProperty("runtimeRegistrationJson");
-	}
+	const named = await narratorService.listNamed();
+	expect(named.length).toBeGreaterThan(0);
+	for (const item of named) expect(item).not.toHaveProperty("runtimeRegistrationJson");
 });

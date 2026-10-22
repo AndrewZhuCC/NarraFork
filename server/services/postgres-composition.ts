@@ -3,8 +3,7 @@
  *
  * Every PostgreSQL store adapter in this repository is deliberately INJECTED: the store
  * modules (`registration/store.ts`, `auth/store.ts`, `knowledge/store.ts`,
- * `chapter-write/store.ts`, `project-archive/store.ts`, `read/index.ts`,
- * `search/postgres-store.ts`) open no
+ * `read/index.ts`, `search/postgres-store.ts`) open no
  * connection and resolve to SQLite until someone hands them an adapter built on a real
  * runtime. This module is that someone — the ONE place production code turns
  * `server/db/index.ts`'s `postgresRuntime` into live stores.
@@ -33,15 +32,11 @@ import { requireRuntimeQueuePort } from "./agent-runtime/runtime-queue-port";
 import { createPostgresAuthMfaStore } from "./auth/postgres-mfa-store";
 import { createPostgresAuthSessionStore } from "./auth/postgres-session-store";
 import { setAuthStores } from "./auth/store";
-import { createPostgresChapterWriteStore } from "./chapter-write/postgres-write-store";
-import { setChapterWriteStore } from "./chapter-write/store";
 import { createPostgresKnowledgeReadStore } from "./knowledge/postgres-read-store";
 import { createPostgresKnowledgeWriteStore } from "./knowledge/postgres-write-store";
 import { setKnowledgeReadStore, setKnowledgeWriteStore } from "./knowledge/store";
 import { createPostgresNarratorMessageRefsPort } from "./narrator-refs/postgres-store";
 import { bindNarratorMessageRefs } from "./narrator-refs/store";
-import { createPostgresProjectArchiveMainStore } from "./project-archive/postgres-main-store";
-import { setProjectArchiveMainStore } from "./project-archive/store";
 import { setProjectReadAdapter } from "./read";
 import { PostgresProjectReadAdapter } from "./read/postgres-project-read-adapter";
 import { createPostgresRegistrationAccountStore } from "./registration/postgres-account-store";
@@ -67,8 +62,6 @@ export function composePostgresStores(runtime: PostgresRuntime): void {
 	});
 	setKnowledgeWriteStore(createPostgresKnowledgeWriteStore(db));
 	setKnowledgeReadStore(createPostgresKnowledgeReadStore(db));
-	setChapterWriteStore(createPostgresChapterWriteStore(db));
-	setProjectArchiveMainStore(createPostgresProjectArchiveMainStore(db));
 	setProjectReadAdapter(new PostgresProjectReadAdapter(db));
 	// The runtime queue (mailbox + publication outbox). Constructed and bound here so the
 	// caller-migration track has exactly one consumption point (`getPostgresRuntimeQueue`

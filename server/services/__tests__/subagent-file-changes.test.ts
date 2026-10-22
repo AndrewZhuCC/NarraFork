@@ -20,7 +20,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
-	chapters,
 	fileAttributions,
 	fileChangeEffects,
 	fileChangeExecutionSegments,
@@ -1044,7 +1043,7 @@ describe("getFileChangesBySubagent — the card projection", () => {
 
 	test("claims nothing about location when the parent has no workspace", async () => {
 		// Unknown must not be read as "outside": that would cry wolf on every ordinary
-		// change made by a chapter-bound narrator with no explicit cwd.
+		// change made by a narrator with no workspace of its own.
 		await attribute({ narratorId: "sub-a", filePath: "a.ts", linesAdded: 1 });
 
 		const byId = await getFileChangesBySubagent(["sub-a"]);
@@ -1052,29 +1051,20 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		expect(byId.get("sub-a")?.files[0]?.outsideParentWorkspace).toBeNull();
 	});
 
-	test("resolves a chapter-bound parent's workspace from its worktree", async () => {
-		// Chapter narrators usually have no cwd of their own; the session works in the
-		// chapter worktree, so the card must classify against it rather than say unknown.
+	test("resolves a project parent without a cwd from its project directory", async () => {
+		// A session in a project may have no cwd of its own; it works in the project root
+		// (the session's own precedence), so the card must classify against it rather than
+		// say unknown.
 		cleanDb(sqlite);
 		const now = new Date().toISOString();
 		await db.insert(projects).values({
 			id: "project-1",
 			name: "p",
-			gitPath: OTHER_WORKSPACE,
+			gitPath: WORKSPACE,
 			createdAt: now,
 			updatedAt: now,
 		});
-		await db.insert(chapters).values({
-			id: "chapter-1",
-			projectId: "project-1",
-			title: "c",
-			branch: "chapter/c",
-			baseBranch: "main",
-			worktreePath: WORKSPACE,
-			createdAt: now,
-			updatedAt: now,
-		});
-		await makeNarrator(PARENT, null, undefined, { chapterId: "chapter-1" });
+		await makeNarrator(PARENT, null, undefined, { contextProjectId: "project-1" });
 		await makeNarrator("sub-a", PARENT);
 		await attribute({ narratorId: "sub-a", filePath: "in.ts", linesAdded: 1 });
 		await attribute({

@@ -60,7 +60,6 @@ export interface ExternalOAuthDeviceResource {
 /** Minimal narrator projection needed for authorization and device binding. */
 export interface ExternalOAuthNarratorResource {
 	id: string;
-	chapterId: string | null;
 	contextProjectId: string | null;
 	defaultDeviceId: string | null;
 }
@@ -360,7 +359,6 @@ export async function requireOwnedExternalNarrator(
 	const [narrator] = await db
 		.select({
 			id: narrators.id,
-			chapterId: narrators.chapterId,
 			contextProjectId: narrators.contextProjectId,
 			defaultDeviceId: narrators.defaultDeviceId,
 		})

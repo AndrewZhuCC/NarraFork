@@ -21,7 +21,7 @@ import { GLOBAL_SNIPPET, RECALL_SNIPPET } from "../../../server/services/search/
 
 describe("search query sanitization", () => {
 	it("strips SQL injection attempts", () => {
-		expect(sanitizeQuery("test'; DROP TABLE chapters;--")).toBe("test DROP TABLE chapters--");
+		expect(sanitizeQuery("test'; DROP TABLE narrators;--")).toBe("test DROP TABLE narrators--");
 	});
 
 	it("preserves alphanumeric, spaces, hyphens, dots, underscores", () => {
@@ -107,8 +107,8 @@ describe("substring patterns", () => {
 
 describe("snippet rendering", () => {
 	it("renders the unmarked global format", () => {
-		expect(snippetCall("chapters_fts", 1, GLOBAL_SNIPPET)).toBe(
-			"snippet(chapters_fts, 1, '', '', '...', 96)",
+		expect(snippetCall("narrators_fts", 0, GLOBAL_SNIPPET)).toBe(
+			"snippet(narrators_fts, 0, '', '', '...', 96)",
 		);
 	});
 

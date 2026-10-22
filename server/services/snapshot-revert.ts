@@ -97,26 +97,10 @@ export function snapshotHistoryFailure(result: RevertResult, error: unknown): Sn
 export async function resolveNarratorCwd(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: (row, { eq }) => eq(row.id, narratorId),
-		columns: { chapterId: true, cwd: true, contextProjectId: true },
+		columns: { cwd: true, contextProjectId: true },
 	});
 	if (!narrator) return null;
 	if (narrator.cwd) return narrator.cwd;
-	const chapterId = narrator.chapterId;
-	if (chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: (row, { eq }) => eq(row.id, chapterId),
-			columns: { worktreePath: true, projectId: true },
-		});
-		if (chapter?.worktreePath) return chapter.worktreePath;
-		if (chapter?.projectId) {
-			const project = await db.query.projects.findFirst({
-				where: (row, { eq }) => eq(row.id, chapter.projectId),
-				columns: { gitPath: true },
-			});
-			if (project?.gitPath) return project.gitPath;
-		}
-		return null;
-	}
 	const projectId = narrator.contextProjectId;
 	if (projectId) {
 		const project = await db.query.projects.findFirst({

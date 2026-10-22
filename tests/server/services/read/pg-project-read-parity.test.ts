@@ -31,10 +31,9 @@
  *   - an adapter that throws is reported as a difference, not swallowed;
  *   - positive cases assert their shared result is non-empty, because two empty results
  *     agree about nothing;
- *   - nothing is skipped. The four oversized cases (`listChapters`/`getGraph` on a
- *     205-chapter project, and the 200-row clamp) take no paging parameter and produce a
- *     ~221KB payload the harness' 16KiB command cap cannot carry; they are relayed in
- *     chunks instead of being declared unobservable. `OVERSIZED_CASES` is pinned empty.
+ *   - nothing is skipped. The oversized case (the 200-row `listProjects` clamp) produces a
+ *     payload the harness' 16KiB command cap cannot carry; it is relayed in chunks instead
+ *     of being declared unobservable. `OVERSIZED_CASES` is pinned empty.
  */
 
 import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
@@ -54,7 +53,7 @@ import {
 	type RelayStats,
 } from "./pg-parity-matrix";
 import { type FixtureTable, seedFixtures } from "./read-fixture-seed";
-import { NARRATOR, PRIV_CHAPTER_IDS_ORDERED, PROJECT, USER } from "./read-fixtures";
+import { PROJECT, USER } from "./read-fixtures";
 
 const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 /**
@@ -93,20 +92,12 @@ const sqliteAdapter = new SqliteProjectReadAdapter() as unknown as ReadAdapterLi
 const SQLITE_TABLES: Record<FixtureTable, unknown> = {
 	users: schema.users,
 	projects: schema.projects,
-	chapters: schema.chapters,
-	chapterEdges: schema.chapterEdges,
-	narrators: schema.narrators,
-	containerInstances: schema.containerInstances,
 	aclGrants: schema.aclGrants,
 };
 
 const PG_TABLES: Record<FixtureTable, unknown> = {
 	users: pgSchema.users,
 	projects: pgSchema.projects,
-	chapters: pgSchema.chapters,
-	chapterEdges: pgSchema.chapterEdges,
-	narrators: pgSchema.narrators,
-	containerInstances: pgSchema.containerInstances,
 	aclGrants: pgSchema.aclGrants,
 };
 
@@ -127,21 +118,19 @@ afterAll(() => {
 /**
  * Landmarks proving the fixtures reached PostgreSQL, read with plain counts.
  *
- * Deliberately not read through `getGraphAuxiliaryData`: a broken adapter must surface as
- * a parity failure naming the call, not as a misleading "fixtures missing".
+ * Deliberately not read through the adapter: a broken adapter must surface as a parity
+ * failure naming the call, not as a misleading "fixtures missing".
  */
 async function pgFixtureProblems(pgDb: BunSQLDatabase): Promise<string[]> {
 	const problems: string[] = [];
 	const rows = await pgDb
 		.select({
+			users: sql<number>`(select count(*) from ${pgSchema.users})`,
 			projects: sql<number>`(select count(*) from ${pgSchema.projects})`,
-			chapters: sql<number>`(select count(*) from ${pgSchema.chapters})`,
-			edges: sql<number>`(select count(*) from ${pgSchema.chapterEdges})`,
-			narrators: sql<number>`(select count(*) from ${pgSchema.narrators})`,
-			containers: sql<number>`(select count(*) from ${pgSchema.containerInstances} where status <> 'removed')`,
-			panels: sql<number>`(select count(*) from ${pgSchema.chapters} where detached_panels_json is not null)`,
+			bulkProjects: sql<number>`(select count(*) from ${pgSchema.projects} where owner_user_id = ${USER.bulk})`,
+			archived: sql<number>`(select count(*) from ${pgSchema.projects} where status = 'archived')`,
 			grants: sql<number>`(select count(*) from ${pgSchema.aclGrants})`,
-			privNarrator: sql<number>`(select count(*) from ${pgSchema.narrators} where id = ${NARRATOR.privOther})`,
+			domainGrant: sql<number>`(select count(*) from ${pgSchema.aclGrants} where domain_kind is not null)`,
 		})
 		.from(pgSchema.projects)
 		.limit(1);
@@ -182,7 +171,7 @@ describe("PostgreSQL vs SQLite project read parity", () => {
 							}
 						}
 						// The relaying handle: identical for every ordinary statement, and able to carry
-						// the unpaged 201-row responses that used to be skipped outright.
+						// the clamped 200-row response that used to be skipped outright.
 						const relayStats: RelayStats = { relayed: 0 };
 						const pgDb = chunkedProxyDb(exec, relayStats);
 						try {
@@ -198,13 +187,13 @@ describe("PostgreSQL vs SQLite project read parity", () => {
 						const pgAdapter = new PostgresProjectReadAdapter(pgDb) as unknown as ReadAdapterLike;
 						// A landmark read before the matrix, so "PostgreSQL answered at all" is
 						// established independently of the comparison.
-						const landmark = (await pgAdapter.listChapters(
+						const landmark = (await pgAdapter.getProject(
 							PROJECT.priv,
 							principal(USER.admin, true),
-						)) as Array<{ id: string }>;
-						if (landmark.map((r) => r.id).join(",") !== PRIV_CHAPTER_IDS_ORDERED.join(",")) {
+						)) as { id: string } | null;
+						if (landmark?.id !== PROJECT.priv) {
 							return {
-								problems: [`PostgreSQL landmark read wrong: ${landmark.map((r) => r.id)}`],
+								problems: [`PostgreSQL landmark read wrong: ${JSON.stringify(landmark)}`],
 								skipped: [],
 							};
 						}
@@ -242,9 +231,9 @@ describe("PostgreSQL vs SQLite project read parity", () => {
 				expect(result.skipped ?? ["matrix did not run"]).toEqual([...OVERSIZED_CASES]);
 				// Pinned exactly, not as a lower bound: a case silently dropping out of the matrix
 				// would otherwise still satisfy a `>` check. Raise this when cases are added.
-				expect(result.compared ?? 0).toBe(103);
+				expect(result.compared ?? 0).toBe(39);
 				// At least one response really exceeded the harness cap and was relayed. Without
-				// this, shrinking the bulk fixtures below 200 rows would leave the oversized cases
+				// this, shrinking the bulk fixtures below 200 rows would leave the oversized case
 				// green while no longer testing anything oversized.
 				expect(result.relayed ?? 0).toBeGreaterThan(0);
 				expect(result.problems ?? ["matrix did not run"]).toEqual([]);

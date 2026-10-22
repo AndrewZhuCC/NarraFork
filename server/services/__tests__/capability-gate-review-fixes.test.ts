@@ -7,12 +7,10 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
-	projects,
 	users,
 } from "../../db/schema";
 import { localBackend } from "../../lib/agent/execution/registry";
@@ -51,7 +49,6 @@ const { resolveNarratorCapabilities, resetTraitLayerCaches } = await import(
 const { executionPolicyEngine } = await import("../execution-policy/engine");
 const { createExecutionTargetContext } = await import("../execution-policy/target-context");
 const { permissionRuleService } = await import("../permission-rule-service");
-const { reviewService } = await import("../review-service");
 const { materializeLegacyDelegations } = await import("../legacy-delegation-materializer");
 
 const skillBody = mock(async () => ({ output: "skill ran" }));
@@ -400,59 +397,5 @@ describe("S5 both fork entry points preserve policy and model sources", () => {
 				);
 			});
 		}
-	}
-});
-
-describe("S8 review conversion only narrows existing ceilings", () => {
-	for (const tools of [["Read"], []]) {
-		test(`preserves own tools ${JSON.stringify(tools)}`, async () => {
-			const projectId = generateId(),
-				sourceChapterId = generateId(),
-				reviewChapterId = generateId();
-			await db.insert(projects).values({
-				id: projectId,
-				name: "fixture",
-				gitPath: cwd,
-				ownerUserId: owner,
-				createdAt: now(),
-				updatedAt: now(),
-			});
-			await db.insert(chapters).values([
-				{
-					id: sourceChapterId,
-					projectId,
-					title: "source",
-					branch: "source",
-					baseBranch: "main",
-					worktreePath: cwd,
-					createdAt: now(),
-					updatedAt: now(),
-				},
-				{
-					id: reviewChapterId,
-					projectId,
-					title: "review",
-					branch: "review",
-					baseBranch: "source",
-					role: "review",
-					reviewStatus: "concluded",
-					reviewSourceChapterId: sourceChapterId,
-					createdAt: now(),
-					updatedAt: now(),
-				},
-			]);
-			await db.update(narrators).set({ chapterId: sourceChapterId }).where(eq(narrators.id, root));
-			const id = await actor({
-				chapterId: reviewChapterId,
-				traits: withRuntimePolicyTrait([], { version: 1, tools }),
-			});
-			const before = await resolveNarratorCapabilities(id, owner);
-			await reviewService.convertToSubagent(reviewChapterId);
-			const after = await resolveNarratorCapabilities(id, owner);
-			expect(after.policy.tools.builtin).toEqual(before.policy.tools.builtin);
-			expect(after.policy.tools.builtin).toEqual(tools);
-			const row = await db.query.narrators.findFirst({ where: eq(narrators.id, id) });
-			expect(parseRuntimePolicyTraits(row?.traits)).toHaveLength(2);
-		});
 	}
 });

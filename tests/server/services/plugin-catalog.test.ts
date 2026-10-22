@@ -156,4 +156,53 @@ describe("PluginCatalog", () => {
 			style: "ui/second.css",
 		});
 	});
+
+	test("keeps a package whose views name the removed graph surface compatible", async () => {
+		const root = await makeTempRoot();
+		const source = join(root, "graph-source");
+		await cp(validPackage, source, { recursive: true });
+		const manifestPath = join(source, "manifest.json");
+		const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+		manifest.pluginId = "com.example.graph";
+		manifest.displayName = "Graph views";
+		manifest.ui = { entry: "ui/node.js", format: "iife", shell: "host-controlled" };
+		manifest.activationEvents = ["onView:docked", "onView:node"];
+		manifest.contributes = {
+			providers: [],
+			tools: [],
+			commands: [],
+			events: [],
+			views: [
+				{
+					id: "docked",
+					title: "Docked",
+					entry: "ui/node.js",
+					surfaces: ["focus", "graph"],
+					scope: "narrator",
+					instance: "multiple",
+				},
+				{
+					id: "node",
+					title: "Node",
+					entry: "ui/node.js",
+					surfaces: ["graph"],
+					scope: "narrator",
+					instance: "multiple",
+				},
+			],
+		};
+		await mkdir(join(source, "ui"), { recursive: true });
+		await writeFile(join(source, "ui", "node.js"), "/* fixture */\n");
+		await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+		const installed = await new PluginPackageStore(root).install(source);
+		const snapshot = await new PluginCatalog(root).scan();
+		const pkg = snapshot.packages.find((item) => item.hash === installed.hash);
+		const views = pkg?.contributions.filter((item) => item.kind === "view");
+
+		expect(pkg?.status).toBe("compatible");
+		expect(views?.find((item) => item.id === "docked")?.surfaces).toEqual(["focus"]);
+		// Reported as an empty list ("mounts nowhere"), never omitted ("unrestricted").
+		expect(views?.find((item) => item.id === "node")?.surfaces).toEqual([]);
+	});
 });

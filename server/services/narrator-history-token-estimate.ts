@@ -1,7 +1,4 @@
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { chapters, projects } from "../db/schema";
 import { buildHistory, resolveProviderAndModel } from "../lib/agent";
 import { estimateJsonTokens } from "../lib/agent/estimate-json-tokens";
 import { isPlanModeTrait } from "../lib/narrator-utils";
@@ -29,28 +26,6 @@ export interface NarratorHistoryTokenEstimate {
 		context_window?: number;
 		is_estimated: true;
 	};
-}
-
-async function resolvePromptCwd(narrator: {
-	chapterId: string | null;
-	cwd: string | null;
-}): Promise<string> {
-	if (!narrator.chapterId) {
-		return resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
-	}
-
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true, worktreePath: true },
-	});
-	if (!chapter) {
-		return resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
-	}
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, chapter.projectId),
-		columns: { gitPath: true },
-	});
-	return resolveNarratorSessionCwd(narrator.cwd, chapter.worktreePath, project?.gitPath, getHome());
 }
 
 /**
@@ -91,7 +66,7 @@ export async function estimateNarratorBuildHistoryTokens(
 			: resolveEffectiveModel(narrator.model, resolveProvider(narrator.model ?? undefined));
 	const resolved = resolveProviderAndModel(effectiveModel, resolveProvider(effectiveModel));
 	const { history } = await buildHistory(dbMessages, resolved.model, resolved.provider, narratorId);
-	const cwd = await resolvePromptCwd({ chapterId: narrator.chapterId, cwd: narrator.cwd });
+	const cwd = resolveNarratorSessionCwd(narrator.cwd, null, getHome());
 	const { prompt: systemPrompt } = await buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
 		cwd,

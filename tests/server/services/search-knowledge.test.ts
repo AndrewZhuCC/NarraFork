@@ -22,7 +22,7 @@ import {
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
 const searchStore = createSqliteSearchStore(async (sql, params) =>

@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../../../tests/setup";
-import { chapters, narrators, projects } from "../../../../db/schema";
+import { narrators, projects } from "../../../../db/schema";
 import type { ToolContext } from "../../types";
 
 const { db, sqlite } = getTestDb();
@@ -17,19 +17,16 @@ mock.module("@server/services/narrator-session", () => ({
 }));
 mock.module("../../fork-narrator-depth", () => ({ ...realDepth, resolveForkDepth: async () => 0 }));
 const { narratorService } = await import("@server/services/narrator-service");
-const { chapterFork } = await import("@server/services/chapter-fork");
 const { forkNarratorTool } = await import("../fork-narrator");
 const original = {
 	getById: narratorService.getById,
 	getLatestMessageUuid: narratorService.getLatestMessageUuid,
 	forkNarrator: narratorService.forkNarrator,
-	forkChapter: chapterFork.fork,
 };
 afterEach(() => {
 	narratorService.getById = original.getById;
 	narratorService.getLatestMessageUuid = original.getLatestMessageUuid;
 	narratorService.forkNarrator = original.forkNarrator;
-	chapterFork.fork = original.forkChapter;
 	sendCalls.length = 0;
 	cleanDb(sqlite);
 });
@@ -42,33 +39,24 @@ afterAll(() => {
 const ctx = { narratorId: "parent", userId: "caller-A", locale: "en" } as ToolContext;
 
 describe("ordinary ForkNarrator", () => {
-	for (const chapterId of [null, "chapter"]) {
+	for (const contextProjectId of [null, "project"]) {
 		for (const inheritMode of ["fresh", "full", "compressed"] as const) {
-			test(`${chapterId ?? "standalone"} ${inheritMode} retains model, actor and origin without resources`, async () => {
+			test(`${contextProjectId ? "project" : "standalone"} ${inheritMode} retains model, actor and origin without resources`, async () => {
 				const now = new Date().toISOString();
-				if (chapterId) {
+				if (contextProjectId) {
 					await db.insert(projects).values({
-						id: "project",
+						id: contextProjectId,
 						name: "fixture",
 						gitPath: "/fixture",
-						createdAt: now,
-						updatedAt: now,
-					});
-					await db.insert(chapters).values({
-						id: chapterId,
-						projectId: "project",
-						title: "fixture",
-						branch: "fixture",
-						baseBranch: "main",
 						createdAt: now,
 						updatedAt: now,
 					});
 				}
 				await db
 					.insert(narrators)
-					.values({ id: "parent", chapterId, createdAt: now, updatedAt: now });
+					.values({ id: "parent", contextProjectId, createdAt: now, updatedAt: now });
 				narratorService.getById = mock(
-					async () => ({ id: "parent", chapterId, variant: "primary" }) as never,
+					async () => ({ id: "parent", contextProjectId, variant: "primary" }) as never,
 				);
 				narratorService.getLatestMessageUuid = mock(async () => "latest");
 				const fork = mock(
@@ -76,10 +64,6 @@ describe("ordinary ForkNarrator", () => {
 						({ id: "child", title: "child" }) as never,
 				);
 				narratorService.forkNarrator = fork;
-				const resourceFork = mock(async () => {
-					throw new Error("must not create resources");
-				});
-				chapterFork.fork = resourceFork;
 				const result = await forkNarratorTool.execute(
 					{
 						mode: inheritMode === "fresh" ? "fresh" : "fork",
@@ -94,13 +78,11 @@ describe("ordinary ForkNarrator", () => {
 				expect(fork.mock.calls[0]?.[2]).toMatchObject({
 					userId: "caller-A",
 					inheritMode,
-					standalone: true,
 					model: "custom-model",
 					title: "child",
 				});
-				expect(resourceFork).not.toHaveBeenCalled();
-				expect(await db.select().from(chapters)).toHaveLength(chapterId ? 1 : 0);
-				expect(await db.select().from(projects)).toHaveLength(chapterId ? 1 : 0);
+				expect(await db.select().from(narrators)).toHaveLength(1);
+				expect(await db.select().from(projects)).toHaveLength(contextProjectId ? 1 : 0);
 				expect(sendCalls[0]?.[6]).toBe("caller-A");
 				expect(sendCalls[0]?.[9]).toMatchObject({ origin: "assistant" });
 			});

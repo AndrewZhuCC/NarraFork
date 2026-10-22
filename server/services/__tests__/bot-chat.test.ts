@@ -646,11 +646,8 @@ describe("bot narrators", () => {
 		expect(isBotNarrator(fork.traits)).toBe(false);
 	});
 
-	test("a bot needs a name and cannot belong to a chapter", async () => {
+	test("a bot needs a name", async () => {
 		await expect(narratorService.create({ kind: "bot" })).rejects.toBeInstanceOf(ValidationError);
-		await expect(
-			narratorService.create({ kind: "bot", title: "X", chapterId: "some-chapter" }),
-		).rejects.toThrow();
 	});
 
 	test("the bot protocol follows the persona in the system prompt", () => {

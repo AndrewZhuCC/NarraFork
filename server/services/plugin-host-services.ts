@@ -84,7 +84,6 @@ const storageScopeTypeSchema = z.enum([
 	"user",
 	"project",
 	"workspace",
-	"chapter",
 	"narrator",
 	"provider",
 	"device",
@@ -403,17 +402,13 @@ function assertStorageScopeBound(scope: PluginStorageScope, context: PluginHostC
 
 function resourceFromUnknown(value: unknown):
 	| {
-			type: "user" | "project" | "workspace" | "chapter" | "narrator" | "provider" | "device";
+			type: "user" | "project" | "workspace" | "narrator" | "provider" | "device";
 			id: string;
 	  }
 	| undefined {
 	if (!isRecord(value) || typeof value.type !== "string" || typeof value.id !== "string")
 		return undefined;
-	if (
-		!["user", "project", "workspace", "chapter", "narrator", "provider", "device"].includes(
-			value.type,
-		)
-	) {
+	if (!["user", "project", "workspace", "narrator", "provider", "device"].includes(value.type)) {
 		return undefined;
 	}
 	return { type: value.type as never, id: value.id };

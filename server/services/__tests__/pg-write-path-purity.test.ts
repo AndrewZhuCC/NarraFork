@@ -43,11 +43,6 @@ const PG_MODULES: ReadonlyArray<readonly [path: string, ownVocabulary: string]> 
 	["server/services/postgres-revert-journal-store.ts", "PostgresRevertMutationJournal"],
 	["server/services/postgres-file-change-evidence-store.ts", "PostgresFileChangeEvidenceStore"],
 	["server/services/postgres-file-change-blob-catalog.ts", "PostgresFileChangeBlobCatalog"],
-	[
-		"server/services/project-archive/postgres-main-store.ts",
-		"createPostgresProjectArchiveMainStore",
-	],
-	["server/services/chapter-write/postgres-write-store.ts", "createPostgresChapterWriteStore"],
 ];
 
 /** The connection-scoped SQLite vocabulary that must never reach a PG path. */

@@ -47,12 +47,11 @@ const taskFieldsSchema = {
 		.optional()
 		.describe("Narrator permission mode (e.g. bypassPermissions)"),
 	runContext: z
-		.enum(["standalone", "chapter"])
+		.enum(["standalone", "project"])
 		.optional()
 		.describe("Run context (default standalone)"),
 	cwd: z.string().max(4096).nullable().optional().describe("Working directory for the narrator"),
-	projectId: z.string().max(100).nullable().optional().describe("Project id (chapter runContext)"),
-	chapterId: z.string().max(100).nullable().optional().describe("Chapter id (chapter runContext)"),
+	projectId: z.string().max(100).nullable().optional().describe("Project id (project runContext)"),
 	narratorMode: z
 		.enum(["new", "reuse"])
 		.optional()
@@ -281,7 +280,6 @@ function sanitizeTask(task: Record<string, unknown>): Record<string, unknown> {
 		"runContext",
 		"cwd",
 		"projectId",
-		"chapterId",
 		"narratorMode",
 		"reuseNarratorId",
 		"createdBy",

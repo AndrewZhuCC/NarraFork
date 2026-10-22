@@ -23,10 +23,7 @@ import {
 	count as countFn,
 	desc,
 	eq,
-	exists,
 	gt,
-	isNotNull,
-	isNull,
 	lt,
 	ne,
 	or,
@@ -37,7 +34,6 @@ import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import {
-	chapters,
 	containerInstances,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
@@ -48,6 +44,7 @@ import {
 	narratorToolCalls,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
+	narratorWorktreeResources,
 	projects,
 	terminals,
 	users,
@@ -415,7 +412,6 @@ import {
 	runSegmentCompact,
 	sendMessage,
 	setNarratorDefaultDevice,
-	startInjectionContinuationIfPossible,
 	startSpecContinuationIfPossible,
 	toBufferSummary,
 	updateActiveBlockedSkills,
@@ -429,7 +425,6 @@ import {
 	activeNarrators,
 	type BufferedMessage,
 	getNarratorRuntimeModel,
-	isNarratorRuntimeBusy,
 	planModeAskedOnce,
 	requestPlanModePromptRebuild,
 	resetActiveUpstreamSession,
@@ -995,310 +990,239 @@ function publicTraitsResponse(traits: unknown): string[] {
 	return redactInternalTraits(traits);
 }
 
-// List narrators — by chapterId, or standalone (chapterId IS NULL)
+// List narrators (paginated)
 narratorRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	const chapterId = c.req.query("chapterId");
-	const standalone = c.req.query("standalone");
 	const projectId = c.req.query("projectId")?.trim();
 	if (projectId !== undefined) {
 		if (!projectId || projectId.length > 128) throw new ValidationError("Invalid projectId");
 		await requireProjectAccess(c, projectId, "read");
 	}
 
-	if (standalone === "true" || standalone === "all" || projectId) {
-		// Paginated session list
-		// standalone=true: only standalone (chapterId IS NULL)
-		// standalone=all: all sessions (standalone + chapter-bound)
-		const status = c.req.query("status");
-		const filter = c.req.query("filter"); // "standalone" | "chapter" | undefined (all)
-		const rawSortBy = c.req.query("sortBy") ?? "updatedAt";
-		const sortOrder = c.req.query("sortOrder") ?? "desc";
-		const rawLimit = Number.parseInt(c.req.query("limit") ?? "20", 10);
-		const limit = Math.min(Number.isNaN(rawLimit) ? 20 : rawLimit, 100);
-		const cursorParam = c.req.query("cursor");
+	const status = c.req.query("status");
+	const rawSortBy = c.req.query("sortBy") ?? "updatedAt";
+	const sortOrder = c.req.query("sortOrder") ?? "desc";
+	const rawLimit = Number.parseInt(c.req.query("limit") ?? "20", 10);
+	const limit = Math.min(Number.isNaN(rawLimit) ? 20 : rawLimit, 100);
+	const cursorParam = c.req.query("cursor");
 
-		// Presence-based filters
-		const hasTerminals = c.req.query("hasTerminals") === "true";
-		const hasContainers = c.req.query("hasContainers") === "true";
-		const hasRunningContainers = c.req.query("hasRunningContainers") === "true";
-		const hasViewers = c.req.query("hasViewers") === "true";
+	// Presence-based filters
+	const hasTerminals = c.req.query("hasTerminals") === "true";
+	const hasContainers = c.req.query("hasContainers") === "true";
+	const hasRunningContainers = c.req.query("hasRunningContainers") === "true";
+	const hasViewers = c.req.query("hasViewers") === "true";
 
-		// Build base where conditions.
-		//
-		// The visibility predicate is pushed into SQL rather than applied to the fetched
-		// page: filtering afterwards would break `LIMIT limit + 1` as the "hasMore"
-		// signal and make `totalCount` count narrators the caller cannot see. Returns
-		// undefined for admins, which `and(...)` treats as no extra restriction.
-		const conditions = [
-			eq(narrators.variant, "primary"),
-			narratorReadableWhere(narratorPrincipalOf(c)),
-		];
+	// Build base where conditions.
+	//
+	// The visibility predicate is pushed into SQL rather than applied to the fetched
+	// page: filtering afterwards would break `LIMIT limit + 1` as the "hasMore"
+	// signal and make `totalCount` count narrators the caller cannot see. Returns
+	// undefined for admins, which `and(...)` treats as no extra restriction.
+	const conditions = [
+		eq(narrators.variant, "primary"),
+		narratorReadableWhere(narratorPrincipalOf(c)),
+	];
 
-		if (status === "archived") {
-			conditions.push(eq(narrators.status, "archived"));
-		} else if (status === "idle" || status === "working" || status === "waiting") {
-			// Exact per-status filter (e.g. dashboard working/waiting counts and lists)
-			conditions.push(eq(narrators.status, status));
-		} else {
-			conditions.push(ne(narrators.status, "archived"));
-		}
-
-		// Filter by standalone vs chapter-bound
-		if (standalone === "true" || filter === "standalone") {
-			conditions.push(isNull(narrators.chapterId));
-		} else if (filter === "chapter") {
-			conditions.push(isNotNull(narrators.chapterId));
-		}
-		// standalone=all with no filter: show all
-		if (projectId) {
-			conditions.push(
-				or(
-					and(isNull(narrators.chapterId), eq(narrators.contextProjectId, projectId)),
-					exists(
-						db
-							.select({ id: chapters.id })
-							.from(chapters)
-							.where(and(eq(chapters.id, narrators.chapterId), eq(chapters.projectId, projectId))),
-					),
-				),
-			);
-		}
-
-		// Filter: has active terminals
-		if (hasTerminals) {
-			conditions.push(
-				sql`EXISTS (SELECT 1 FROM terminals WHERE terminals.narrator_id = ${narrators.id} AND terminals.status = 'running')`,
-			);
-		}
-
-		// Filter: has containers (via chapter)
-		if (hasContainers) {
-			conditions.push(
-				sql`EXISTS (SELECT 1 FROM container_instances WHERE container_instances.chapter_id = ${narrators.chapterId})`,
-			);
-		}
-
-		// Filter: has running containers (via chapter)
-		if (hasRunningContainers) {
-			conditions.push(
-				sql`EXISTS (SELECT 1 FROM container_instances WHERE container_instances.chapter_id = ${narrators.chapterId} AND container_instances.status = 'running')`,
-			);
-		}
-
-		// Filter: has viewers (in-memory presence)
-		if (hasViewers) {
-			const viewedIds = getNarratorIdsWithPresence();
-			if (viewedIds.size === 0) {
-				// No narrators have viewers — return empty result
-				return c.json({ items: [], hasMore: false, nextCursor: null, totalCount: 0 });
-			}
-			conditions.push(sql`${narrators.id} IN ${[...viewedIds]}`);
-		}
-
-		const baseWhere = and(...conditions);
-
-		// messageCount sorts on the stored column, which is an insert-only upper bound
-		// (see narrator-message-count.ts). Ordering is the one job that genuinely needs
-		// a stored value: it must be applied before LIMIT, so it cannot use the exact
-		// per-page counts computed after pagination. An approximate ordering with exact
-		// displayed numbers is the right trade here — the alternative is a correlated
-		// count(*) per candidate row, measured at 40ms per list request.
-		const sortColumnMap: Record<string, Column> = {
-			updatedAt: narrators.updatedAt,
-			createdAt: narrators.createdAt,
-			title: narrators.title,
-			messageCount: narrators.messageCount,
-		};
-		const sortBy = rawSortBy in sortColumnMap ? rawSortBy : "updatedAt";
-		const column = sortColumnMap[sortBy];
-		const orderFn = sortOrder === "asc" ? asc : desc;
-		const cmpFn = sortOrder === "asc" ? gt : lt;
-
-		// Decode cursor: { v: sortValue, id: narratorId }
-		let cursorWhere: ReturnType<typeof and> | undefined;
-		if (cursorParam) {
-			try {
-				const decoded = JSON.parse(Buffer.from(cursorParam, "base64url").toString());
-				const cursorVal = decoded.v;
-				const cursorId = decoded.id;
-				cursorWhere = or(
-					cmpFn(column, cursorVal),
-					and(eq(column, cursorVal), cmpFn(narrators.id, cursorId)),
-				);
-			} catch {
-				// Invalid cursor — ignore, start from beginning
-			}
-		}
-
-		const whereClause = cursorWhere ? and(baseWhere, cursorWhere) : baseWhere;
-
-		const [list, countResult] = await Promise.all([
-			db.query.narrators.findMany({
-				columns: { runtimeRegistrationJson: false },
-				where: whereClause,
-				orderBy: [orderFn(column), orderFn(narrators.id)],
-				limit: limit + 1,
-			}),
-			db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere),
-		]);
-		const totalCount = countResult[0]?.count ?? 0;
-
-		const hasMore = list.length > limit;
-		const rawItems = hasMore ? list.slice(0, limit) : list;
-		const lastItem = rawItems[rawItems.length - 1];
-		const nextCursor =
-			hasMore && lastItem
-				? Buffer.from(
-						JSON.stringify({
-							v: (lastItem as Record<string, unknown>)[sortBy] ?? lastItem.updatedAt,
-							id: lastItem.id,
-						}),
-					).toString("base64url")
-				: null;
-
-		// Enrich items with chapter info, terminal counts, and viewers
-		const narratorIds = rawItems.map((n) => n.id);
-		const chapterIds = rawItems.map((n) => n.chapterId).filter(Boolean) as string[];
-
-		// Batch fetch chapter info
-		const chapterMap = new Map<
-			string,
-			{
-				id: string;
-				title: string;
-				projectId: string;
-				projectName: string | null;
-				status: string;
-				role: string;
-			}
-		>();
-		if (chapterIds.length > 0) {
-			const chapterRows = await db
-				.select({
-					id: chapters.id,
-					title: chapters.title,
-					projectId: chapters.projectId,
-					projectName: projects.name,
-					status: chapters.status,
-					role: chapters.role,
-				})
-				.from(chapters)
-				.leftJoin(projects, eq(chapters.projectId, projects.id))
-				.where(sql`${chapters.id} IN ${chapterIds}`);
-			for (const row of chapterRows) {
-				chapterMap.set(row.id, row);
-			}
-		}
-
-		// Batch fetch active terminal counts
-		const terminalCounts = new Map<string, number>();
-		if (narratorIds.length > 0) {
-			const termRows = await db
-				.select({
-					narratorId: terminals.narratorId,
-					count: countFn(),
-				})
-				.from(terminals)
-				.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
-				.groupBy(terminals.narratorId);
-			for (const row of termRows) {
-				if (row.narratorId) terminalCounts.set(row.narratorId, row.count);
-			}
-		}
-
-		// Batch fetch container counts per chapter (total + running)
-		const containerCounts = new Map<string, { total: number; running: number }>();
-		if (chapterIds.length > 0) {
-			const containerRows = await db
-				.select({
-					chapterId: containerInstances.chapterId,
-					total: countFn(),
-					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
-				})
-				.from(containerInstances)
-				.where(
-					and(
-						sql`${containerInstances.chapterId} IN ${chapterIds}`,
-						isNull(containerInstances.worktreeResourceId),
-					),
-				)
-				.groupBy(containerInstances.chapterId);
-			for (const row of containerRows) {
-				if (row.chapterId === null) continue;
-				containerCounts.set(row.chapterId, {
-					total: row.total,
-					running: row.running ?? 0,
-				});
-			}
-		}
-
-		// Exact message counts for this page. The stored `message_count` column is
-		// incremented per ref insert but never decremented (refs are removed from many
-		// scattered call sites), so it is an upper bound — a rolled-back or compacted
-		// conversation would keep reporting its high-water mark. Counting the page's
-		// ids is one grouped, indexed query: 0.8ms for a typical page, 11ms for a
-		// synthetic page of the 20 largest narrators in the database.
-		const messageCounts = await countNarratorMessageRefsBatch(narratorIds);
-
-		// Batch fetch presence and the current user's private draft markers
-		const presenceMap = getNarratorPresenceBatch(narratorIds);
-		const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
-
-		// Batch fetch active background task counts (subagents + bash + transfers).
-		// Lazy import matches the other background-task routes in this file.
-		let backgroundTaskCounts:
-			| Map<string, import("@shared/background-task-list").BackgroundTaskActiveCounts>
-			| undefined;
-		try {
-			const { backgroundTaskService } = await import("../services/background-task-service");
-			backgroundTaskCounts = await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
-		} catch (err) {
-			// Occupancy is auxiliary: unknown counts must not become fabricated zeros.
-			logger.warn("Failed to load background counts for narrator list", {
-				count: narratorIds.length,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-
-		const items = rawItems.map((n) => ({
-			...publicNarratorResponse(n, draftNarratorIds.has(n.id)),
-			messageCount: messageCounts.get(n.id) ?? 0,
-			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
-			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
-			...(backgroundTaskCounts
-				? {
-						activeBackgroundTaskCount: backgroundTaskCounts.get(n.id)?.activeCount ?? 0,
-						activeBackgroundWorkCount: backgroundTaskCounts.get(n.id)?.activeWorkCount ?? 0,
-						activeBackgroundServiceCount: backgroundTaskCounts.get(n.id)?.activeServiceCount ?? 0,
-					}
-				: {}),
-			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
-			runningContainerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.running ?? 0) : 0,
-			viewers: presenceMap.get(n.id) ?? [],
-		}));
-
-		return c.json({ items, hasMore, nextCursor, totalCount });
+	if (status === "archived") {
+		conditions.push(eq(narrators.status, "archived"));
+	} else if (status === "idle" || status === "working" || status === "waiting") {
+		// Exact per-status filter (e.g. dashboard working/waiting counts and lists)
+		conditions.push(eq(narrators.status, status));
+	} else {
+		conditions.push(ne(narrators.status, "archived"));
 	}
 
-	if (!chapterId) throw new ValidationError("chapterId or standalone=true is required");
-	// This branch does not paginate (a chapter holds a handful of narrators), so an
-	// in-memory filter is safe here — unlike the paged branch above, where it would
-	// corrupt hasMore/totalCount.
-	const list = await filterReadableNarrators(
-		await narratorService.listByChapter(chapterId),
-		narratorPrincipalOf(c),
-	);
-	const narratorIds = list.map((narrator) => narrator.id);
-	const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
-	// Same reason as the paged branch: the stored column only ever grows.
+	// A session is on a project's page through any of its links (primary or
+	// additional); `context_project_id` is checked too, so an explicit project shows up
+	// before the index has caught up with a freshly created session.
+	if (projectId) {
+		conditions.push(
+			sql`${narrators.id} IN (SELECT npl.narrator_id FROM narrator_project_links npl WHERE npl.project_id = ${projectId} UNION SELECT n2.id FROM narrators n2 WHERE n2.context_project_id = ${projectId})`,
+		);
+	}
+
+	// Filter: has active terminals
+	if (hasTerminals) {
+		conditions.push(
+			sql`EXISTS (SELECT 1 FROM terminals WHERE terminals.narrator_id = ${narrators.id} AND terminals.status = 'running')`,
+		);
+	}
+
+	// Filter: has containers (via the narrator's worktree resources)
+	if (hasContainers) {
+		conditions.push(
+			sql`EXISTS (SELECT 1 FROM container_instances JOIN narrator_worktree_resources ON narrator_worktree_resources.id = container_instances.worktree_resource_id WHERE narrator_worktree_resources.owner_narrator_id = ${narrators.id})`,
+		);
+	}
+
+	// Filter: has running containers
+	if (hasRunningContainers) {
+		conditions.push(
+			sql`EXISTS (SELECT 1 FROM container_instances JOIN narrator_worktree_resources ON narrator_worktree_resources.id = container_instances.worktree_resource_id WHERE narrator_worktree_resources.owner_narrator_id = ${narrators.id} AND container_instances.status = 'running')`,
+		);
+	}
+
+	// Filter: has viewers (in-memory presence)
+	if (hasViewers) {
+		const viewedIds = getNarratorIdsWithPresence();
+		if (viewedIds.size === 0) {
+			// No narrators have viewers — return empty result
+			return c.json({ items: [], hasMore: false, nextCursor: null, totalCount: 0 });
+		}
+		conditions.push(sql`${narrators.id} IN ${[...viewedIds]}`);
+	}
+
+	const baseWhere = and(...conditions);
+
+	// messageCount sorts on the stored column, which is an insert-only upper bound
+	// (see narrator-message-count.ts). Ordering is the one job that genuinely needs
+	// a stored value: it must be applied before LIMIT, so it cannot use the exact
+	// per-page counts computed after pagination. An approximate ordering with exact
+	// displayed numbers is the right trade here — the alternative is a correlated
+	// count(*) per candidate row, measured at 40ms per list request.
+	const sortColumnMap: Record<string, Column> = {
+		updatedAt: narrators.updatedAt,
+		createdAt: narrators.createdAt,
+		title: narrators.title,
+		messageCount: narrators.messageCount,
+	};
+	const sortBy = rawSortBy in sortColumnMap ? rawSortBy : "updatedAt";
+	const column = sortColumnMap[sortBy];
+	const orderFn = sortOrder === "asc" ? asc : desc;
+	const cmpFn = sortOrder === "asc" ? gt : lt;
+
+	// Decode cursor: { v: sortValue, id: narratorId }
+	let cursorWhere: ReturnType<typeof and> | undefined;
+	if (cursorParam) {
+		try {
+			const decoded = JSON.parse(Buffer.from(cursorParam, "base64url").toString());
+			const cursorVal = decoded.v;
+			const cursorId = decoded.id;
+			cursorWhere = or(
+				cmpFn(column, cursorVal),
+				and(eq(column, cursorVal), cmpFn(narrators.id, cursorId)),
+			);
+		} catch {
+			// Invalid cursor — ignore, start from beginning
+		}
+	}
+
+	const whereClause = cursorWhere ? and(baseWhere, cursorWhere) : baseWhere;
+
+	const [list, countResult] = await Promise.all([
+		db.query.narrators.findMany({
+			columns: { runtimeRegistrationJson: false },
+			where: whereClause,
+			orderBy: [orderFn(column), orderFn(narrators.id)],
+			limit: limit + 1,
+		}),
+		db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere),
+	]);
+	const totalCount = countResult[0]?.count ?? 0;
+
+	const hasMore = list.length > limit;
+	const rawItems = hasMore ? list.slice(0, limit) : list;
+	const lastItem = rawItems[rawItems.length - 1];
+	const nextCursor =
+		hasMore && lastItem
+			? Buffer.from(
+					JSON.stringify({
+						v: (lastItem as Record<string, unknown>)[sortBy] ?? lastItem.updatedAt,
+						id: lastItem.id,
+					}),
+				).toString("base64url")
+			: null;
+
+	// Enrich items with terminal and container counts, and viewers
+	const narratorIds = rawItems.map((n) => n.id);
+
+	// Batch fetch active terminal counts
+	const terminalCounts = new Map<string, number>();
+	if (narratorIds.length > 0) {
+		const termRows = await db
+			.select({
+				narratorId: terminals.narratorId,
+				count: countFn(),
+			})
+			.from(terminals)
+			.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
+			.groupBy(terminals.narratorId);
+		for (const row of termRows) {
+			if (row.narratorId) terminalCounts.set(row.narratorId, row.count);
+		}
+	}
+
+	// Batch fetch container counts per narrator (total + running), through the
+	// worktree resources each narrator owns.
+	const containerCounts = new Map<string, { total: number; running: number }>();
+	if (narratorIds.length > 0) {
+		const containerRows = await db
+			.select({
+				narratorId: narratorWorktreeResources.ownerNarratorId,
+				total: countFn(),
+				running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
+			})
+			.from(containerInstances)
+			.innerJoin(
+				narratorWorktreeResources,
+				eq(narratorWorktreeResources.id, containerInstances.worktreeResourceId),
+			)
+			.where(sql`${narratorWorktreeResources.ownerNarratorId} IN ${narratorIds}`)
+			.groupBy(narratorWorktreeResources.ownerNarratorId);
+		for (const row of containerRows) {
+			if (row.narratorId === null) continue;
+			containerCounts.set(row.narratorId, {
+				total: row.total,
+				running: row.running ?? 0,
+			});
+		}
+	}
+
+	// Exact message counts for this page. The stored `message_count` column is
+	// incremented per ref insert but never decremented (refs are removed from many
+	// scattered call sites), so it is an upper bound — a rolled-back or compacted
+	// conversation would keep reporting its high-water mark. Counting the page's
+	// ids is one grouped, indexed query: 0.8ms for a typical page, 11ms for a
+	// synthetic page of the 20 largest narrators in the database.
 	const messageCounts = await countNarratorMessageRefsBatch(narratorIds);
-	return c.json(
-		list.map((narrator) => ({
-			...publicNarratorResponse(narrator, draftNarratorIds.has(narrator.id)),
-			messageCount: messageCounts.get(narrator.id) ?? 0,
-		})),
-	);
+
+	// Batch fetch presence and the current user's private draft markers
+	const presenceMap = getNarratorPresenceBatch(narratorIds);
+	const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
+
+	// Batch fetch active background task counts (subagents + bash + transfers).
+	// Lazy import matches the other background-task routes in this file.
+	let backgroundTaskCounts:
+		| Map<string, import("@shared/background-task-list").BackgroundTaskActiveCounts>
+		| undefined;
+	try {
+		const { backgroundTaskService } = await import("../services/background-task-service");
+		backgroundTaskCounts = await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
+	} catch (err) {
+		// Occupancy is auxiliary: unknown counts must not become fabricated zeros.
+		logger.warn("Failed to load background counts for narrator list", {
+			count: narratorIds.length,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+
+	const items = rawItems.map((n) => ({
+		...publicNarratorResponse(n, draftNarratorIds.has(n.id)),
+		messageCount: messageCounts.get(n.id) ?? 0,
+		activeTerminalCount: terminalCounts.get(n.id) ?? 0,
+		...(backgroundTaskCounts
+			? {
+					activeBackgroundTaskCount: backgroundTaskCounts.get(n.id)?.activeCount ?? 0,
+					activeBackgroundWorkCount: backgroundTaskCounts.get(n.id)?.activeWorkCount ?? 0,
+					activeBackgroundServiceCount: backgroundTaskCounts.get(n.id)?.activeServiceCount ?? 0,
+				}
+			: {}),
+		containerCount: containerCounts.get(n.id)?.total ?? 0,
+		runningContainerCount: containerCounts.get(n.id)?.running ?? 0,
+		viewers: presenceMap.get(n.id) ?? [],
+	}));
+
+	return c.json({ items, hasMore, nextCursor, totalCount });
 });
 
 /**
@@ -1311,7 +1235,6 @@ narratorRoutes.get("/", async (c) => {
 function standaloneNarratorCwd(
 	input: {
 		cwd?: string;
-		chapterId?: string | null;
 	},
 	projectDir?: string | null,
 ): string | undefined {
@@ -1348,10 +1271,7 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	// Explicit project context selects an ordinary, chapterless session. A deprecated
-	// chapter field in the same request must not create a second, conflicting binding.
-	// Legacy chapter-only callers and internal service callers retain their semantics.
-	const input = parsed.data.contextProjectId ? { ...parsed.data, chapterId: null } : parsed.data;
+	const input = parsed.data;
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -2504,7 +2424,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					? (await resolveSubagentModelForRun(narrator, userId)).model
 					: (narrator.model ?? undefined);
 			const newNarrator = await narratorService.create({
-				chapterId: null,
 				model: newModel,
 				systemPrompt: narrator.systemPrompt ?? undefined,
 				permissionMode: narrator.permissionMode ?? undefined,
@@ -4016,9 +3935,9 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
  * worktree. That check matched by path, so a different narrator or a background
  * subagent sharing the worktree made every deletion fail — including "delete
  * messages only", which touches no file at all. It was also redundant for the file
- * rollback: `reverseAndRestore` re-captures the worktree under its own lock and
- * 3-way merges, reporting a conflict only on the paths actually being restored. That
- * is a precise answer where this was a guess, so the guess is gone.
+ * rollback, which restores file by file through the file-write queue and reports a
+ * conflict only on the paths actually being restored. That is a precise answer where
+ * this was a guess, so the guess is gone.
  */
 async function prepareHistoryRewrite(narratorId: string): Promise<void> {
 	if (!(await interruptAndWaitForIdle(narratorId))) {
@@ -4243,83 +4162,6 @@ narratorRoutes.delete("/:id/spec-carryover-messages/:messageId", async (c) => {
 		deletedMessageIds: [messageId],
 	});
 	return c.json({ ok: true, deletedMessageIds: [messageId] });
-});
-
-/**
- * Start a turn for a review conclusion the narrator already has.
- *
- * The card's "handle" button. It deliberately writes NO message: the conclusion row is
- * itself the `role: "user"` message and has been in the history since the review
- * concluded, so there is nothing to hand over — only a loop to start over what is
- * already there. Writing a copy here is what would put the same findings on screen
- * twice.
- *
- * Which is also why a concluded review does not wake an idle narrator on its own: being
- * informed needs no turn, and spending a model request is the reader's decision.
- *
- * `started: false` splits into two OUTCOMES that must not be conflated, because the
- * latch is what disables the button forever:
- *
- *   - `busy` — a loop is already running, and it rebuilds history from the database on
- *     its next pass, so the conclusion is taken up without this route doing anything.
- *     The latch stays: the reader's intent is satisfied.
- *   - `not_started` — nothing is running AND nothing was started (plan mode, a status
- *     row that is not idle, a throw). Nobody is going to read the row, so the latch is
- *     RELEASED — otherwise the button reads "Handled" for a turn that never happened
- *     and the reader has no way to ask again.
- */
-narratorRoutes.post("/:id/review-feedback/:messageId/apply", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.param("messageId");
-	const userId = c.get("user").sub;
-	const locale = await getUserLanguage(userId);
-
-	const claim = await narratorService.markReviewFeedbackApplied(narratorId, messageId);
-	if (claim.alreadyApplied) return c.json({ ok: true, started: false, reason: "already_applied" });
-	if (claim.message) {
-		broadcastToNarrator(narratorId, {
-			type: "message_updated",
-			narratorId,
-			message: claim.message,
-		});
-	}
-
-	// Read BEFORE trying to start: afterwards a loop this call started is itself busy,
-	// so the two outcomes would be indistinguishable.
-	const alreadyRunning = isNarratorRuntimeBusy(narratorId);
-
-	// `startInjectionContinuationIfPossible` owns the gating (continuation lock, idle in
-	// both senses, not in plan mode) and runs the loop with an empty prompt — the
-	// established spelling for "the turn's content is already in the database".
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
-	let started = false;
-	try {
-		({ started } = await startInjectionContinuationIfPossible(
-			narratorId,
-			locale,
-			replyInUserLanguage,
-		));
-	} finally {
-		// A latch nobody will act on is worse than no latch: the card would be
-		// permanently disabled for findings the model never saw.
-		if (!started && !alreadyRunning) {
-			const released = await narratorService
-				.releaseReviewFeedbackClaim(narratorId, messageId)
-				.catch(() => undefined);
-			if (released) {
-				broadcastToNarrator(narratorId, {
-					type: "message_updated",
-					narratorId,
-					message: released,
-				});
-			}
-		}
-	}
-	return c.json({
-		ok: true,
-		started,
-		reason: started ? "started" : alreadyRunning ? "busy" : "not_started",
-	});
 });
 
 // Dismiss a working-directory recovery display message after continuation succeeds.
@@ -5369,7 +5211,7 @@ narratorRoutes.post("/:id/fork-messages", async (c) => {
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
 
-// Ordinary fork always creates an independent narrator, including chapter-bound sources.
+// Ordinary fork always creates an independent narrator.
 narratorRoutes.post("/:id/fork", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json();
@@ -5389,7 +5231,6 @@ narratorRoutes.post("/:id/fork", async (c) => {
 		userId: c.get("user").sub,
 		inheritMode: parsed.data.inheritMode ?? "full",
 		forkMessageId: parsed.data.forkMessageId,
-		standalone: true,
 	});
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
@@ -5571,7 +5412,6 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		inheritMode: "full",
 		forkMessageId: sourceMessageId,
 		title,
-		standalone: true,
 		// Ask-in-passing is a lightweight, read-only side conversation; inherited
 		// task management is just noise there, so clear it instead of surfacing
 		// the reset card.
@@ -5689,8 +5529,7 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 });
 
 // === Promote ask-in-passing narrator ===
-// Standalone: unlock permission mode (readOnly → default)
-// Chapter-bound: fork a new chapter from the parent chapter
+// Unlocks the narrator (drops the ask-in-passing label); never broadens its execution policy.
 narratorRoutes.post("/:id/promote", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
@@ -5701,79 +5540,33 @@ narratorRoutes.post("/:id/promote", async (c) => {
 		throw new ValidationError("Only ask-in-passing narrators can be promoted");
 	}
 
-	if (!narrator.chapterId) {
-		// Standalone narrator: just unlock
-		await narratorTraitsLock.acquire(id, async () => {
-			const current = await narratorService.getById(id);
-			const unlockedTraits = removeTrait(parseTraits(current.traits), "ask-in-passing");
-			await db
-				.update(narrators)
-				.set({
-					isAskInPassing: false,
-					traits: unlockedTraits,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, id));
-		});
-
-		// Promotion removes the ask label, never broadens the existing execution policy.
-		await updateNarratorPermissionMode(id, narrator.permissionMode ?? "readOnly");
-
-		const updated = await narratorService.getById(id);
-		broadcastToNarrator(id, {
-			type: "permission_mode_changed",
-			narratorId: id,
-			permissionMode: updated.permissionMode ?? "readOnly",
-		});
-
-		return c.json({
-			type: "unlocked",
-			narratorId: updated.id,
-			narrator: publicNarratorResponse(updated),
-		});
-	}
-
-	// Promotion no longer creates a chapter/worktree; the source remains an audit record.
-	const forkedNarrator = await narratorService.forkStandaloneFromTool(id, "fork", {
-		inheritMode: "full",
-		userId: c.get("user").sub,
-	});
-
-	// The fork inherits traits; clear only the ask label on the new ordinary narrator,
-	// preserving its existing readOnly/OAuth/review permission restrictions.
-	await narratorTraitsLock.acquire(forkedNarrator.id, async () => {
-		const current = await narratorService.getById(forkedNarrator.id);
-		await db
-			.update(narrators)
-			.set({
-				isAskInPassing: false,
-				traits: removeTrait(parseTraits(current.traits), "ask-in-passing"),
-				updatedAt: new Date().toISOString(),
-			})
-			.where(eq(narrators.id, forkedNarrator.id));
-	});
-	const promotedNarrator = await narratorService.getById(forkedNarrator.id);
-
-	// Mark the original ask-in-passing narrator as promoted so the UI
-	// no longer shows it as locked.  We keep permissionMode as readOnly
-	// since the original narrator stays as a read-only question record.
 	await narratorTraitsLock.acquire(id, async () => {
 		const current = await narratorService.getById(id);
-		const promotedTraits = removeTrait(parseTraits(current.traits), "ask-in-passing");
+		const unlockedTraits = removeTrait(parseTraits(current.traits), "ask-in-passing");
 		await db
 			.update(narrators)
 			.set({
 				isAskInPassing: false,
-				traits: promotedTraits,
+				traits: unlockedTraits,
 				updatedAt: new Date().toISOString(),
 			})
 			.where(eq(narrators.id, id));
 	});
 
+	// Promotion removes the ask label, never broadens the existing execution policy.
+	await updateNarratorPermissionMode(id, narrator.permissionMode ?? "readOnly");
+
+	const updated = await narratorService.getById(id);
+	broadcastToNarrator(id, {
+		type: "permission_mode_changed",
+		narratorId: id,
+		permissionMode: updated.permissionMode ?? "readOnly",
+	});
+
 	return c.json({
-		type: "forked",
-		narratorId: promotedNarrator.id,
-		narrator: publicNarratorResponse(promotedNarrator),
+		type: "unlocked",
+		narratorId: updated.id,
+		narrator: publicNarratorResponse(updated),
 	});
 });
 
@@ -6262,9 +6055,9 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 /**
  * Current lightweight Git file states for the narrator file tree.
  *
- * The tree may be rooted at a standalone narrator's cwd or at a subdirectory inside a
- * chapter worktree, so this route is narrator-scoped rather than chapter-scoped. Git's
- * status query is likewise scoped to that cwd; paths therefore match the tree's relative
+ * The tree is rooted at the narrator's cwd, which may be a subdirectory inside a
+ * repository, so this route is narrator-scoped. Git's status query is likewise scoped to
+ * that cwd; paths therefore match the tree's relative
  * keys without the client guessing how the cwd relates to the repository root.
  */
 narratorRoutes.get("/:id/file-tree-status", async (c) => {

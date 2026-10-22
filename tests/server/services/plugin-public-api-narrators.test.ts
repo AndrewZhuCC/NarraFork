@@ -13,7 +13,12 @@ import {
 	type PluginPublicApiAdapters,
 	PluginPublicApiError,
 } from "@server/services/plugin-public-api";
-import { chapters, narratorMessages, narrators, projects } from "../../../server/db/schema";
+import {
+	narratorMessages,
+	narratorProjectLinks,
+	narrators,
+	projects,
+} from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const CURSOR_SECRET = "public-api-narrator-test-cursor-secret-32-bytes";
@@ -78,7 +83,6 @@ function buildApi(options: { broker?: FakeBroker; adapters?: PluginPublicApiAdap
 function narratorRow(
 	id: string,
 	overrides: Partial<{
-		chapterId: string | null;
 		projectId: string | null;
 		title: string | null;
 		handle: string | null;
@@ -97,7 +101,6 @@ function narratorRow(
 	const now = "2026-07-16T12:00:00.000Z";
 	return {
 		id,
-		chapterId: null,
 		projectId: null,
 		title: null,
 		handle: null,
@@ -136,17 +139,14 @@ describe("narrafork.narrators.list (public API surface)", () => {
 					return [
 						narratorRow("n-c", {
 							projectId: "p1",
-							chapterId: "ch1",
 							updatedAt: "2026-07-16T03:00:00.000Z",
 						}),
 						narratorRow("n-b", {
 							projectId: "p1",
-							chapterId: "ch1",
 							updatedAt: "2026-07-16T02:00:00.000Z",
 						}),
 						narratorRow("n-a", {
 							projectId: "p1",
-							chapterId: "ch1",
 							updatedAt: "2026-07-16T01:00:00.000Z",
 						}),
 					]
@@ -194,7 +194,6 @@ describe("narrafork.narrators.list (public API surface)", () => {
 				async list(input) {
 					seen.push({
 						projectId: input.projectId,
-						chapterId: input.chapterId,
 						status: input.status,
 					});
 					return [narratorRow("n1", { projectId: input.projectId })];
@@ -210,15 +209,12 @@ describe("narrafork.narrators.list (public API surface)", () => {
 			callContext,
 			createQueryRequest(callContext, "narrafork.narrators.list", {
 				projectId: "other-project",
-				chapterId: "ch-x",
 				status: ["working", "idle"],
 			}),
 		);
 		expect(result.status).toBe("succeeded");
 		// The untrusted input projectId must not escape the bound scope.
-		expect(seen).toEqual([
-			{ projectId: "bound-project", chapterId: "ch-x", status: ["working", "idle"] },
-		]);
+		expect(seen).toEqual([{ projectId: "bound-project", status: ["working", "idle"] }]);
 	});
 
 	test("fails with HOST_UNAVAILABLE when the narrator adapter is missing", async () => {
@@ -245,6 +241,20 @@ describe("narrafork.narrators.list (public API surface)", () => {
 		expect(result.status).toBe("failed");
 		if (result.status === "failed") expect(result.error.code).toBe("INVALID_PARAMS");
 		expect(result.diagnostics?.some((item) => item.field === "actor")).toBe(true);
+	});
+
+	test("no longer accepts the removed chapterId filter", async () => {
+		const { api } = buildApi({ adapters: {} });
+		const callContext = context();
+		const result = await api.query(
+			callContext,
+			createQueryRequest(callContext, "narrafork.narrators.list", {
+				limit: 10,
+				chapterId: "chapter-1",
+			}),
+		);
+		expect(result.status).toBe("failed");
+		if (result.status === "failed") expect(result.error.code).toBe("INVALID_PARAMS");
 	});
 });
 
@@ -546,29 +556,15 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			.run();
 	}
 
-	function seedChapter(projectId: string, chapterId: string) {
-		db.insert(chapters)
-			.values({
-				id: chapterId,
-				projectId,
-				title: `Chapter ${chapterId}`,
-				branch: `chapter/${chapterId}`,
-				baseBranch: "main",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.run();
-	}
-
 	function seedNarrator(
 		id: string,
-		chapterId: string | null,
+		projectId: string | null,
 		overrides: Partial<typeof narrators.$inferInsert> = {},
 	) {
 		db.insert(narrators)
 			.values({
 				id,
-				chapterId,
+				contextProjectId: projectId,
 				type: "primary",
 				inheritMode: "fresh",
 				createdAt: now,
@@ -580,13 +576,52 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			.run();
 	}
 
-	test("lists narrators joined with their chapter's project", async () => {
+	test("lists a narrator under the project its working directory was indexed into", async () => {
 		seedProject("p1");
-		seedChapter("p1", "ch1");
-		seedChapter("p1", "ch2");
-		seedNarrator("n1", "ch1", { title: "Leader", updatedAt: "2026-07-16T03:00:00.000Z" });
-		seedNarrator("n2", "ch2", { title: "Worker", updatedAt: "2026-07-16T02:00:00.000Z" });
+		seedNarrator("n-cwd", null, { cwd: "/repo/p1/src" });
+		db.insert(narratorProjectLinks)
+			.values({
+				narratorId: "n-cwd",
+				projectId: "p1",
+				role: "primary",
+				source: "cwd",
+				directory: "/repo/p1",
+				updatedAt: now,
+			})
+			.run();
+		const adapters = createCorePluginPublicApiAdapters({
+			db,
+			pluginManager: {
+				async list() {
+					return [];
+				},
+				async getStatus() {
+					return undefined;
+				},
+				async enable() {
+					throw new Error("not used");
+				},
+				async disable() {
+					throw new Error("not used");
+				},
+			},
+		});
+		const rows = await adapters.narrators?.list({
+			limit: 10,
+			projectId: "p1",
+			context: context(),
+			signal: new AbortController().signal,
+		});
+		expect(rows?.map((row) => [row.id, row.projectId])).toEqual([["n-cwd", "p1"]]);
+	});
+
+	test("lists narrators with their project", async () => {
+		seedProject("p1");
+		seedProject("p2");
+		seedNarrator("n1", "p1", { title: "Leader", updatedAt: "2026-07-16T03:00:00.000Z" });
+		seedNarrator("n2", "p1", { title: "Worker", updatedAt: "2026-07-16T02:00:00.000Z" });
 		seedNarrator("n3", null, { title: "Standalone", updatedAt: "2026-07-16T01:00:00.000Z" });
+		seedNarrator("n5", "p2", { title: "Elsewhere", updatedAt: "2026-07-16T00:30:00.000Z" });
 
 		const adapters = createCorePluginPublicApiAdapters({
 			db,
@@ -608,7 +643,7 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		const narratorsAdapter = adapters.narrators;
 		expect(narratorsAdapter).toBeDefined();
 
-		// projectId filter excludes standalone narrators (no chapter → no project)
+		// projectId filter excludes standalone narrators and other projects' narrators
 		const rows = await narratorsAdapter?.list({
 			limit: 10,
 			projectId: "p1",
@@ -618,23 +653,21 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		expect(rows?.map((row) => row.id).sort()).toEqual(["n1", "n2"]);
 		expect(rows?.find((row) => row.id === "n1")).toMatchObject({
 			projectId: "p1",
-			chapterId: "ch1",
 			title: "Leader",
 			status: "idle",
 		});
+		expect(rows?.[0]).not.toHaveProperty("chapterId");
 
-		// chapterId filter narrows further
-		const chapterRows = await narratorsAdapter?.list({
+		// Without a project filter, standalone narrators are listed with a null project.
+		const allRows = await narratorsAdapter?.list({
 			limit: 10,
-			projectId: "p1",
-			chapterId: "ch2",
 			context: context(),
 			signal: new AbortController().signal,
 		});
-		expect(chapterRows?.map((row) => row.id)).toEqual(["n2"]);
+		expect(allRows?.find((row) => row.id === "n3")?.projectId).toBeNull();
 
 		// status filter
-		seedNarrator("n4", "ch1", { status: "working", updatedAt: "2026-07-16T04:00:00.000Z" });
+		seedNarrator("n4", "p1", { status: "working", updatedAt: "2026-07-16T04:00:00.000Z" });
 		const workingRows = await narratorsAdapter?.list({
 			limit: 10,
 			projectId: "p1",

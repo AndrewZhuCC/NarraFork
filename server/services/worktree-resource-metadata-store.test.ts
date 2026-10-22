@@ -76,18 +76,6 @@ beforeEach(() => {
 		.values({ id: "source", ownerUserId: "owner", createdAt: now, updatedAt: now })
 		.run();
 	fixture.database
-		.insert(schema.chapters)
-		.values({
-			id: "legacy",
-			projectId: "project",
-			title: "legacy",
-			branch: "legacy",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
-	fixture.database
 		.insert(schema.narratorWorktreeResources)
 		.values({
 			id: "resource",
@@ -137,13 +125,10 @@ describe("bounded isolated metadata", () => {
 		);
 		expect(
 			fixture.sqlite
-				.query(
-					"SELECT status,chapter_id,narrator_id,worktree_resource_id,cwd,dtach_socket FROM terminals",
-				)
+				.query("SELECT status,narrator_id,worktree_resource_id,cwd,dtach_socket FROM terminals")
 				.get(),
 		).toEqual({
 			status: "exited",
-			chapter_id: null,
 			narrator_id: null,
 			worktree_resource_id: "resource",
 			cwd: null,
@@ -151,14 +136,11 @@ describe("bounded isolated metadata", () => {
 		});
 		expect(
 			fixture.sqlite
-				.query(
-					"SELECT status,container_id,chapter_id,worktree_resource_id FROM container_instances",
-				)
+				.query("SELECT status,container_id,worktree_resource_id FROM container_instances")
 				.get(),
 		).toEqual({
 			status: "stopped",
 			container_id: null,
-			chapter_id: null,
 			worktree_resource_id: "resource",
 		});
 		expect(
@@ -366,7 +348,8 @@ describe("bounded isolated metadata", () => {
 	test("port conflict rolls back only this request and retains unrelated legacy and resource rows", async () => {
 		fixture.database
 			.insert(schema.portAllocations)
-			.values({ port: 10000, chapterId: "legacy", serviceName: "legacy", allocatedAt: now })
+			// A legacy row: its former chapter owner is gone, so it has no owner column.
+			.values({ port: 10000, serviceName: "legacy", allocatedAt: now })
 			.run();
 		await store.write(request([{ kind: "port", port: 10001, serviceName: "prior" }], "prior"));
 		await expect(
@@ -442,16 +425,15 @@ describe("bounded isolated metadata", () => {
 		).rejects.toThrow("RESOURCE_AUTH_CANCELLED");
 		expect(fixture.sqlite.query("SELECT port FROM port_allocations").all()).toEqual([]);
 	});
-	test("deleted legacy owner retains resource rows; project deletion preserves scope kind but denies grants", async () => {
+	test("project deletion retains resource rows and preserves scope kind but denies grants", async () => {
 		await store.write(
 			request([
 				{ kind: "terminal", id: "t", name: "t" },
 				{ kind: "port", port: 10000, serviceName: "app" },
 			]),
 		);
-		fixture.sqlite.run("DELETE FROM chapters WHERE id='legacy'");
-		expect(fixture.sqlite.query("SELECT id FROM terminals").all()).toEqual([{ id: "t" }]);
 		fixture.sqlite.run("DELETE FROM projects WHERE id='project'");
+		expect(fixture.sqlite.query("SELECT id FROM terminals").all()).toEqual([{ id: "t" }]);
 		expect(resourceRow()?.scopeKind).toBe("project");
 		expect(resourceRow()?.scopeProjectId).toBeNull();
 		await expect(store.summary("resource", 3, "terminal")).rejects.toThrow(
@@ -516,7 +498,7 @@ describe("bounded isolated metadata", () => {
 	});
 	test("strict selector, byte and traversal limits fail before any store write", async () => {
 		await expect(
-			store.write({ ...request([{ kind: "terminal", id: "t", name: "t" }]), chapterId: "legacy" }),
+			store.write({ ...request([{ kind: "terminal", id: "t", name: "t" }]), narratorId: "source" }),
 		).rejects.toThrow("RESOURCE_METADATA_INVALID");
 		await expect(
 			store.write(request([{ kind: "terminal", id: "t", name: "x".repeat(17000) }])),
@@ -599,14 +581,13 @@ describe("bounded isolated metadata", () => {
 		).toThrow();
 		expect(() =>
 			fixture.database
-				.insert(schema.containerInstances)
+				.insert(schema.terminals)
 				.values({
 					id: "mixed",
-					chapterId: "legacy",
+					narratorId: "source",
 					worktreeResourceId: "resource",
-					serviceName: "app",
+					name: "mixed",
 					createdAt: now,
-					updatedAt: now,
 				})
 				.run(),
 		).toThrow();

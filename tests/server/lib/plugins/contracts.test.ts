@@ -56,7 +56,7 @@ describe("Manifest fixtures", () => {
 		const manifest = parseManifest(await loadManifestFixture("valid-manifest.json"));
 
 		expect(manifest.pluginId).toBe("com.example.hello");
-		expect(getContributionIds(manifest)).toEqual(["hello", "chapterChanged"]);
+		expect(getContributionIds(manifest)).toEqual(["hello", "projectChanged"]);
 		expect(getContributionFullId(manifest.pluginId, "hello")).toBe("com.example.hello/hello");
 	});
 
@@ -124,9 +124,9 @@ describe("Manifest primitive contracts", () => {
 			kind: "onCommand",
 			reference: "build",
 		});
-		expect(parseActivationEvent("onEvent:chapter.changed")).toEqual({
+		expect(parseActivationEvent("onEvent:project.changed")).toEqual({
 			kind: "onEvent",
-			reference: "chapter.changed",
+			reference: "project.changed",
 		});
 		expect(parseActivationEvent("onCommand")).toBeUndefined();
 		expect(parseActivationEvent("onUnknown:thing")).toBeUndefined();
@@ -139,10 +139,10 @@ describe("Manifest primitive contracts", () => {
 		expect(isManifestWidePermission("admin")).toBe(true);
 		expect(isManifestWidePermission("network.any")).toBe(true);
 		expect(isManifestWidePermission("query.*")).toBe(true);
-		expect(isManifestWidePermission("query.chapters.read")).toBe(false);
+		expect(isManifestWidePermission("query.projects.read")).toBe(false);
 
 		// Capability names are open strings now, so previously-refused tokens are accepted.
-		expect(isPermissionName("query.chapters.read")).toBe(true);
+		expect(isPermissionName("query.projects.read")).toBe(true);
 		expect(isPermissionName("admin")).toBe(true);
 		expect(isPermissionName("*")).toBe(true);
 		expect(isPermissionName("com.acme.custom.capability")).toBe(true);

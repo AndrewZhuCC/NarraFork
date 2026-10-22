@@ -98,7 +98,7 @@ function startHostCalls() {
 		jsonrpc: "2.0",
 		id: "host-denied-command",
 		method: "commands.execute",
-		params: { command: "chapter.delete", chapterId: "forged-chapter" },
+		params: { command: "narrator.delete", narratorId: "forged-narrator" },
 	});
 	void write({
 		jsonrpc: "2.0",

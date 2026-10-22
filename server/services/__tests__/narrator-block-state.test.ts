@@ -17,7 +17,6 @@ const { narratorService } = await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
 const { narratorPersistence } = await import("../narrator-persistence");
 const blockSync = await import("../narrator-block-sync");
-const { mergeSummaryService } = await import("../merge-summary-service");
 const { markRecoveryCardResolved } = await import("../narrator-subagent-recovery");
 const { markCompactAsBlocking } = await import("../narrator-compact");
 
@@ -252,52 +251,6 @@ describe("patchState", () => {
 });
 
 describe("state writers", () => {
-	test("review feedback applied and released", async () => {
-		seed("f1", "system", [{ type: "review_feedback", text: "fix the typo" }], {
-			contentText: "fix the typo",
-		});
-		const applied = await measure("f1", () =>
-			narratorService.markReviewFeedbackApplied("n1", "f1"),
-		);
-		const result = applied.result;
-		expect(result.alreadyApplied).toBe(false);
-		expect((result.message?.contentJson as Array<{ applied?: boolean }>)[0].applied).toBe(true);
-		expect(applied).toMatchObject({ bumped: false, stateRevision: 1 });
-		expect(JSON.parse(rows("f1")[0].state ?? "null")).toEqual({ raw: [{ applied: true }] });
-		expect((await narratorService.markReviewFeedbackApplied("n1", "f1")).alreadyApplied).toBe(true);
-		const released = await measure("f1", () =>
-			narratorService.releaseReviewFeedbackClaim("n1", "f1"),
-		);
-		await released.result;
-		expect(released).toMatchObject({ bumped: false, stateRevision: 1 });
-		expectRowsCurrent("f1");
-	});
-
-	test("unmerge restores isLatest on the previous round's card", async () => {
-		const card = (round: number, isLatest: boolean) => ({
-			type: "merge_summary",
-			sourceBranch: "feature",
-			sourceChapterId: "Qx7Lm2pR",
-			targetBranch: "main",
-			strategy: "merge",
-			commitSha: null,
-			mergedBy: null,
-			mergeRound: round,
-			isLatest,
-			summary: "did things",
-			modelText: "[Merged] feature → main",
-		});
-		seed("m1", "system", [card(1, false)], { createdAt: "2026-10-01T00:00:01.000Z" });
-		seed("m2", "system", [card(2, true)], { createdAt: "2026-10-01T00:00:02.000Z" });
-		const before = envelope("m1");
-		await mergeSummaryService.cleanupForMerge("Qx7Lm2pR", null);
-		expect(sqlite.prepare("SELECT id FROM narrator_messages").all()).toEqual([{ id: "m1" }]);
-		expect(JSON.parse(envelope("m1").contentJson)[0].isLatest).toBe(true);
-		expect(envelope("m1").body).toBe(before.body);
-		expect(envelope("m1").state).toBe(before.state + 1);
-		expectRowsCurrent("m1");
-	});
-
 	test("a recovery card resolves as card state", async () => {
 		seed(
 			"rc",

@@ -143,7 +143,6 @@ describe("forkNarrator omits in-flight compact markers", () => {
 		const forked = await narratorService.forkNarrator(parentId, null, {
 			inheritMode: "full",
 			forkMessageId: `${TAG}-msg-8`,
-			standalone: true,
 			title: "fork-pending-test",
 		});
 
@@ -220,7 +219,6 @@ describe("forkNarrator omits in-flight compact markers", () => {
 
 		const forked = await narratorService.forkNarrator(parentId, null, {
 			inheritMode: "full",
-			standalone: true,
 			title: "fork-boundary-test",
 		});
 

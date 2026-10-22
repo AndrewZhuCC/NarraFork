@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
-	chapters,
 	narratorBlacklistDirs,
 	narratorMessages,
 	narrators,
@@ -35,6 +34,7 @@ const {
 	isSignedReviewBoundaryRow,
 	isTrustedReviewBoundary,
 	sanitizeUntrustedReviewBoundaryIds,
+	signReviewBoundaryRuleId,
 } = await import("../narrator-review-boundary");
 const { ExecutionPolicyEngine } = await import("../execution-policy/engine");
 const originalGlobalBlacklist = settings.agent.blacklistDirs;
@@ -73,17 +73,6 @@ beforeEach(async () => {
 		createdAt: now,
 		updatedAt: now,
 	});
-	await db.insert(chapters).values({
-		id: "review",
-		projectId: "project",
-		title: "real review shape",
-		branch: "review",
-		baseBranch: "main",
-		role: "review",
-		worktreePath: root,
-		createdAt: now,
-		updatedAt: now,
-	});
 });
 afterEach(() => {
 	settings.agent.blacklistDirs = originalGlobalBlacklist;
@@ -92,15 +81,38 @@ afterEach(() => {
 afterAll(() => {
 	mock.module("../../db", () => realDb);
 });
-async function source() {
-	// Exactly the review-service.create() narrator input shape: no readonly mode or review trait.
-	const parent = await narratorService.create({
-		chapterId: "review",
+/** An ordinary project session working in the review worktree, with no boundary of its own. */
+async function plain() {
+	return await narratorService.create({
+		contextProjectId: "project",
 		type: "primary",
 		cwd: root,
-		systemPrompt: "review fixture",
 		ownerUserId: "owner",
 	});
+}
+/** Persist the server-signed denyWrite row a fork of a review session received. */
+async function signedBoundary(narratorId: string, path: string) {
+	await db.insert(narratorBlacklistDirs).values({
+		id: signReviewBoundaryRuleId(narratorId, path),
+		narratorId,
+		path,
+		denyLevel: "denyWrite",
+		enabled: true,
+		targetKind: "host",
+		deviceScope: "local",
+		createdAt: now,
+	});
+	executionPolicyEngine.invalidate(narratorId);
+}
+/**
+ * A session that inherited a review workspace boundary before review chapters were
+ * removed. Those signed rows persist after the upgrade: they stay enforced, are re-signed
+ * onto every fork and cannot be edited away. The boundary does not depend on a read-only
+ * mode or the review trait.
+ */
+async function source(protectedRoot = root) {
+	const parent = await plain();
+	await signedBoundary(parent.id, protectedRoot);
 	expect(parent.permissionMode).not.toBe("readOnly");
 	expect(parent.traits).not.toContain("review");
 	return parent;
@@ -226,9 +238,7 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 	});
 	test("minimal .worktrees parent move reproduction is caught by the review layer, not structure guard", async () => {
 		const protectedRoot = "/repo/.worktrees/review";
-		await db.update(projects).set({ gitPath: "/repo" }).where(eq(projects.id, "project"));
-		await db.update(chapters).set({ worktreePath: protectedRoot }).where(eq(chapters.id, "review"));
-		const parent = await source();
+		const parent = await source(protectedRoot);
 		const child = await narratorService.forkStandaloneFromTool(parent.id, "fresh");
 		const command = "mv /repo/.worktrees /repo/moved";
 		const analysis = await analyzeShellCommand(command, protectedRoot, "bash");
@@ -285,11 +295,7 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 			// GNU cp follows an existing destination-file symlink even with -P: -P
 			// describes SOURCE dereferencing, not the write target derived from the directory.
 			symlinkSync(join("worktree", "source.ts"), join(destination, "source.ts"));
-			await db
-				.update(chapters)
-				.set({ worktreePath: protectedRoot })
-				.where(eq(chapters.id, "review"));
-			const parent = await source();
+			const parent = await source(protectedRoot);
 			const child = await narratorService.forkStandaloneFromTool(parent.id, "fresh");
 			const command =
 				flags === "-t"
@@ -318,11 +324,10 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 			writeFileSync(join(sourceDir, "source.ts"), "replacement");
 			writeFileSync(join(destination, "real.ts"), "outside original");
 			symlinkSync("real.ts", join(destination, "source.ts"));
-			await db
-				.update(chapters)
-				.set({ worktreePath: protectedRoot })
-				.where(eq(chapters.id, "review"));
-			const child = await narratorService.forkStandaloneFromTool((await source()).id, "fresh");
+			const child = await narratorService.forkStandaloneFromTool(
+				(await source(protectedRoot)).id,
+				"fresh",
+			);
 			for (const sourceName of ["source.ts", "new.ts"]) {
 				writeFileSync(join(sourceDir, sourceName), "outside copy");
 				for (const flag of ["", "-P"]) {
@@ -346,11 +351,10 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 			mkdirSync(protectedRoot, { recursive: true });
 			const alias = join(fixture, "alias");
 			symlinkSync(parentPath, alias);
-			await db
-				.update(chapters)
-				.set({ worktreePath: protectedRoot })
-				.where(eq(chapters.id, "review"));
-			const child = await narratorService.forkStandaloneFromTool((await source()).id, "fresh");
+			const child = await narratorService.forkStandaloneFromTool(
+				(await source(protectedRoot)).id,
+				"fresh",
+			);
 			for (const [tool, input] of [
 				["Bash", { command: `mv '${alias}' '${fixture}/moved'` }],
 				["Bash", { command: `mv '${alias}/review' '${fixture}/moved'` }],
@@ -430,8 +434,7 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 		"global",
 		"narrator",
 	] as const)("untrusted %s review prefix cannot weaken denyAll or confer hard authority", async (scope) => {
-		await db.update(chapters).set({ role: "branch" }).where(eq(chapters.id, "review"));
-		const parent = await source();
+		const parent = await plain();
 		const row = {
 			id: "review-boundary:fake",
 			path: root,
@@ -555,10 +558,9 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 		const fence = await recheckFinalToolExecutionPermission(allowed);
 		expect(() => fence.assertStillCurrent()).not.toThrow();
 	});
-	test("real review creation shape denies source/child writes in protected root, but not ordinary free paths", async () => {
+	test("an inherited boundary denies source/child writes in protected root, but not ordinary free paths", async () => {
 		const parent = await source();
 		const child = await narratorService.forkStandaloneFromTool(parent.id, "fresh");
-		expect(child.chapterId).toBeNull();
 		expect(child.permissionMode).toBe(parent.permissionMode);
 		for (const id of [parent.id, child.id]) {
 			expect(
@@ -573,10 +575,6 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 			).toBe("allow");
 			expect(await decision(id, "Bash", { command: `touch ${free}/note.txt` })).toBe("allow");
 		}
-		// Review conclusions are metadata, not worktree writes.
-		expect(
-			await decision(parent.id, "ReviewConclusion", { verdict: "approve", summary: "fixture" }),
-		).toBe("allow");
 	});
 	test("whitelist, plan-file exemption and bypass modes cannot erase the child hard boundary", async () => {
 		const child = await narratorService.forkStandaloneFromTool((await source()).id, "fresh");
@@ -616,17 +614,16 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 			}),
 		).toBe("deny");
 	});
-	test("changing source role/child cwd and removing the source cannot unfreeze descendant deny rows", async () => {
+	test("changing child cwd and removing the source cannot unfreeze descendant deny rows", async () => {
 		const parent = await source();
 		const child = await narratorService.forkStandaloneFromTool(parent.id, "fresh");
-		await db.update(chapters).set({ role: "branch" }).where(eq(chapters.id, "review"));
 		await db
 			.update(narrators)
 			.set({ cwd: free, traits: [], permissionMode: "bypassPermissions" })
 			.where(eq(narrators.id, child.id));
 		const grandchild = await narratorService.forkStandaloneFromTool(child.id, "fresh");
 		// Simulate removal after the legacy parent link is cleared; the boundary must
-		// survive independently of both chapter role and narrator lineage.
+		// survive independently of narrator lineage.
 		await db.update(narrators).set({ parentNarratorId: null }).where(eq(narrators.id, child.id));
 		await db.delete(narrators).where(eq(narrators.id, parent.id));
 		for (const id of [child.id, grandchild.id]) {
@@ -656,11 +653,14 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 		}
 	});
 	test("a pre-existing denyAll row remains independently editable without losing inherited read/write protection", async () => {
-		const parent = await source();
+		const parent = await plain();
 		await permissionRuleService.createNarratorRule(parent.id, {
 			ruleType: "directoryBlacklist",
 			value: { path: root, denyLevel: "denyAll", targetKind: "host" },
 		});
+		// The legacy unique index uses lexical paths, so a boundary written beside an
+		// editable row on the same root got a bounded '/.' suffix.
+		await signedBoundary(parent.id, `${root}/.`);
 		const child = await narratorService.forkStandaloneFromTool(parent.id, "fresh");
 		const rows = await db
 			.select()
@@ -718,13 +718,7 @@ describe("ordinary fork preserves effective review workspace hard boundary", () 
 		).toBe("deny");
 	});
 	test("non-review ordinary fork retains normal write/Bash authority", async () => {
-		await db.update(chapters).set({ role: "branch" }).where(eq(chapters.id, "review"));
-		const parent = await narratorService.create({
-			chapterId: "review",
-			type: "primary",
-			cwd: root,
-			ownerUserId: "owner",
-		});
+		const parent = await plain();
 		const child = await narratorService.forkStandaloneFromTool(parent.id, "fresh");
 		expect(
 			await decision(child.id, "Write", { file_path: `${root}/source.ts`, content: "allowed" }),

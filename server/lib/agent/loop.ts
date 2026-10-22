@@ -613,7 +613,7 @@ function isTaskStateMaintenanceToolUse(tu: AgentToolUse): boolean {
 
 export async function shouldInjectRelaxedPlanToolReminder(
 	tu: AgentToolUse,
-	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "chapterId" | "planFilePath">,
+	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "planFilePath">,
 ): Promise<boolean> {
 	if (!config.planMode || !config.relaxedPlan) return false;
 	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
@@ -632,12 +632,7 @@ export async function shouldInjectRelaxedPlanToolReminder(
 		try {
 			const workdir = typeof tu.input.workdir === "string" ? tu.input.workdir : undefined;
 			const shellCwd = workdir ? resolve(config.cwd, workdir) : config.cwd;
-			const analysis = await analyzeShellCommand(
-				command,
-				shellCwd,
-				detectShell().type,
-				!!config.chapterId,
-			);
+			const analysis = await analyzeShellCommand(command, shellCwd, detectShell().type);
 			return analysis.hasWriteOperation;
 		} catch (err) {
 			logger.debug("Failed to classify relaxed-plan shell tool use", {
