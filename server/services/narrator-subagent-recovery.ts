@@ -54,6 +54,7 @@ import { controllerOf, RUNTIME_SOURCE_COLUMNS, runDeliverToOf } from "../lib/run
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
+import { bodyColumns, fillBody } from "./narrator-body-reads";
 import { narratorService } from "./narrator-service";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
 import { registerAndPersistSubagentAlias } from "./subagent-alias";
@@ -1314,10 +1315,13 @@ export async function startRecoveryAwaitBatch(input: {
 		},
 	});
 
-	const persisted = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, message.id),
-		with: { toolCalls: true },
-	});
+	const persisted = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, message.id),
+			...bodyColumns(),
+			with: { toolCalls: true },
+		}),
+	);
 	const toolCallIdByUseId = new Map<string, string>();
 	for (const call of persisted?.toolCalls ?? []) {
 		toolCallIdByUseId.set(call.toolUseId, call.id);

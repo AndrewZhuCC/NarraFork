@@ -298,6 +298,13 @@ import {
 } from "../services/narrator-acl";
 import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
+	blockBody,
+	bodyColumns,
+	contentJsonSql,
+	fillBody,
+	storedBodyBytesSql,
+} from "../services/narrator-body-reads";
+import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
 	retryBufferedMessage,
@@ -1653,21 +1660,25 @@ narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 		columns: { id: true },
 	});
 	if (!ref) throw new NotFoundError("Message", mid);
+	// A user message within the size limit; its body from block rows when they hold it.
+	const admitted = sql`${narratorMessages.role} = 'user' AND ${storedBodyBytesSql()} <= ${4 * 1024 * 1024}`;
 	const message = await db
 		.select({
 			composerDocument: narratorMessages.composerDocument,
 			bodyRevision: narratorMessages.bodyRevision,
-			content: sql<
-				string | null
-			>`CASE WHEN ${narratorMessages.role} = 'user' AND length(CAST(${narratorMessages.contentJson} AS BLOB)) <= ${4 * 1024 * 1024} THEN ${narratorMessages.contentJson} ELSE NULL END`,
+			admitted: sql<number>`CASE WHEN ${admitted} THEN 1 ELSE 0 END`,
+			content: sql<string | null>`CASE WHEN ${admitted} THEN ${contentJsonSql()} ELSE NULL END`,
 		})
 		.from(narratorMessages)
 		.where(eq(narratorMessages.id, mid))
 		.get();
 	if (!message) throw new NotFoundError("Message", mid);
-	if (message.content === null)
+	if (!message.admitted)
 		throw new ValidationError("Message attachment metadata exceeds the composer detail limit");
-	const blocks: Record<string, unknown>[] = JSON.parse(message.content);
+	const blocks: Record<string, unknown>[] =
+		message.content === null
+			? (blockBody(mid) as Record<string, unknown>[])
+			: JSON.parse(message.content);
 	const images = Array.isArray(blocks)
 		? blocks
 				.filter((block) => block.type === "image" && typeof block.imageId === "string")
@@ -2838,10 +2849,12 @@ async function resolveEditedFileReferences(
 		columns: { messageId: true },
 	});
 	if (!ref) throw new NotFoundError("Message", messageId);
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, ref.messageId),
-		columns: { role: true, contentJson: true },
-	});
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, ref.messageId),
+			...bodyColumns({ id: true, role: true, contentJson: true }),
+		}),
+	);
 	if (!message) throw new NotFoundError("Message", messageId);
 	if (message.role !== "user") throw new ValidationError("Can only edit user messages");
 	return replaceFileReferenceSnapshots(
@@ -4825,10 +4838,13 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		msg.id,
 		manualToolCall.id,
 	);
-	const fullMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, msg.id),
-		with: { toolCalls: true },
-	});
+	const fullMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, msg.id),
+			...bodyColumns(),
+			with: { toolCalls: true },
+		}),
+	);
 	if (fullMsg) {
 		broadcastToNarrator(id, {
 			type: "message",
@@ -5460,9 +5476,12 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 
 	// Verify the message exists and is a pending ask-in-passing
-	const msg = await db.query.narratorMessages.findFirst({
-		where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-	});
+	const msg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+			...bodyColumns(),
+		}),
+	);
 	if (!msg || !getAskInPassingPendingBlock(msg)) {
 		throw new ValidationError("Pending ask-in-passing message not found");
 	}

@@ -349,6 +349,7 @@ import {
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
 import { recoverBlockStorage } from "./narrator-block-sync";
+import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
 import {
 	cleanupBufferedTextFilesAsync,
 	enqueueBufferedMessage,
@@ -1434,10 +1435,13 @@ async function broadcastInterruptedPartialMessage(
 	partialId: string,
 ): Promise<void> {
 	try {
-		const fullMessage = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			with: { toolCalls: true },
-		});
+		const fullMessage = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		if (!fullMessage) return;
 
 		const ref = await db.query.narratorMessageRefs.findFirst({
@@ -5033,13 +5037,16 @@ async function retryLastMessageUnlocked(
 		throw new ValidationError("No messages to retry");
 	}
 
-	const tailMessages = await db.query.narratorMessages.findMany({
-		where: inArray(
-			narratorMessages.id,
-			tailRefs.map((ref) => ref.messageId),
-		),
-		with: { toolCalls: { columns: { id: true } } },
-	});
+	const tailMessages = fillBodies(
+		await db.query.narratorMessages.findMany({
+			where: inArray(
+				narratorMessages.id,
+				tailRefs.map((ref) => ref.messageId),
+			),
+			...bodyColumns(),
+			with: { toolCalls: { columns: { id: true } } },
+		}),
+	);
 	const tailById = new Map(tailMessages.map((msg) => [msg.id, msg]));
 	// resolveRetryTarget expects oldest → newest; tailRefs is newest first.
 	const orderedTail = tailRefs
@@ -6792,9 +6799,12 @@ async function editAndRegenerateUnlocked(
 
 	// Broadcast the updated message.  If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
-	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, privateMessageId),
-	});
+	const updatedMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, privateMessageId),
+			...bodyColumns(),
+		}),
+	);
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",

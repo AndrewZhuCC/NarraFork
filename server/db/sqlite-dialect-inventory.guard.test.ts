@@ -563,6 +563,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid"],
 	// Scans that find envelopes through block rows (SQLite-only, like block storage).
 	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
+	// Main-thread Drizzle readers' bodies from block rows (SQLite-only, like block storage).
+	"server/services/narrator-body-reads.ts": ["handle", "json1"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
 	"server/lib/narrator-bodies.ts": ["driver"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block

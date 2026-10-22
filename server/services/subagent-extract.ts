@@ -15,7 +15,7 @@
  * - `aclRootNarratorId = null` — primary narrators are judged on their own columns.
  */
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
-import { asc, eq, inArray } from "drizzle-orm";
+import { asc, eq, getTableColumns, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
@@ -35,6 +35,7 @@ import {
 	newEnvelopeColumns,
 	newEnvelopeFormat,
 } from "./narrator-block-sync";
+import { contentJsonSql, fillBodies } from "./narrator-body-reads";
 import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
@@ -148,10 +149,12 @@ export async function extractSubagentToPrimary(
 		const byId = new Map<string, typeof narratorMessages.$inferSelect>();
 		for (let i = 0; i < sourceRefs.length; i += CHUNK) {
 			const chunk = sourceRefs.slice(i, i + CHUNK).map((row) => row.messageId);
-			const rows = await db
-				.select()
-				.from(narratorMessages)
-				.where(inArray(narratorMessages.id, chunk));
+			const rows = fillBodies(
+				await db
+					.select({ ...getTableColumns(narratorMessages), contentJson: contentJsonSql() })
+					.from(narratorMessages)
+					.where(inArray(narratorMessages.id, chunk)),
+			);
 			for (const msg of rows) byId.set(msg.id, msg);
 		}
 		for (const row of sourceRefs) {

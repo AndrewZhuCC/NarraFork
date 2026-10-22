@@ -118,6 +118,8 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 	const message = {
 		composerDocument: document,
 		bodyRevision: 8,
+		// The route's SQL admits user bodies within the limit; an oversized one comes back 0.
+		admitted: options.content === null ? 0 : 1,
 		content:
 			options.content === undefined
 				? JSON.stringify([
@@ -151,6 +153,10 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 		NotFoundError,
 		ValidationError,
 		getFileReferenceSnapshots,
+		// Block reads off: the plain column, as before block storage.
+		storedBodyBytesSql: () => sql`length(CAST(${narratorMessages.contentJson} AS BLOB))`,
+		contentJsonSql: () => narratorMessages.contentJson,
+		blockBody: () => [],
 		db: {
 			query: {
 				narratorMessageRefs: {
