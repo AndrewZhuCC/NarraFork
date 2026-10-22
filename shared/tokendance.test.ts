@@ -25,7 +25,10 @@ describe("TokenDance public contract", () => {
 				"anthropic:messages",
 				"openai:responses",
 			]),
-		).toBe("openai-responses");
+		).toBe("anthropic-messages");
+		expect(selectTokenDanceProtocol(["openai:chat-completions", "openai:responses"])).toBe(
+			"openai-responses",
+		);
 		expect(selectTokenDanceProtocol(["openai:chat-completions", "anthropic:messages"])).toBe(
 			"anthropic-messages",
 		);

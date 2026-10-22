@@ -448,6 +448,8 @@ interface ResponsesFunctionCallOutputMessage {
 export interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
 	content?: string | OAIContentPart[] | null;
+	/** Kimi dynamic tool loading: tools a `system` message declares from its position on. */
+	tools?: OAITool[];
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
 	/**
@@ -650,16 +652,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			return tools.map(formatResponsesTool);
 		}
 		// Completions: nested format { type: "function", function: { ... } }
-		return tools.map(
-			(tool): OAITool => ({
-				type: "function",
-				function: {
-					name: tool.name,
-					description: tool.description,
-					parameters: resolveToolJsonSchema(tool),
-				},
-			}),
-		);
+		return tools.map(formatCompletionsTool);
 	}
 
 	async buildHistory(
@@ -3618,6 +3611,31 @@ function responsesWireHistory(
 	return history;
 }
 
+/** One tool in Chat Completions shape; also an entry of a Kimi `system` tools message. */
+function formatCompletionsTool(tool: ResolvedToolDefinition): OAITool {
+	return {
+		type: "function",
+		function: {
+			name: tool.name,
+			description: tool.description,
+			parameters: resolveToolJsonSchema(tool),
+		},
+	};
+}
+
+/**
+ * Kimi's dynamic tool loading: a `system` message whose `tools` become callable from
+ * this position on, beside the top-level `tools`. Definitions must be complete.
+ */
+function systemToolsMessage(change: ToolLoadingChange): OAIMessage {
+	return {
+		role: "system",
+		tools: change.additions.flatMap((addition) =>
+			addition.definition ? [formatCompletionsTool(addition.definition)] : [],
+		),
+	};
+}
+
 /** Second projection stage for Chat Completions: neutral turns → messages. */
 function completionsWireHistory(
 	turns: readonly NeutralTurn[],
@@ -3627,6 +3645,7 @@ function completionsWireHistory(
 	for (const turn of turns) {
 		if (turn.kind === "input") {
 			for (const item of turn.items) {
+				if (item.toolChange) history.push(systemToolsMessage(item.toolChange as ToolLoadingChange));
 				const message = buildOAIUserMessage(
 					item.text,
 					item.images.flatMap((image) => (image ? [image] : [])),

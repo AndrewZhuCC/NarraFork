@@ -89,7 +89,12 @@ export function mapCommandCodeProtocol(protocol?: string): CommandCodeEndpoint |
 	}
 }
 
-/** 用模型目录里的 `supported_endpoints` 选端点。只有 `/messages` 的模型走 Anthropic。 */
+/**
+ * 用模型目录里的 `supported_endpoints` 选端点。只有 `/messages` 的模型走 Anthropic。
+ *
+ * 特例：其他平台在同时支持时优先 Anthropic Messages，这里仍然优先 `/responses`，
+ * 因为 Command Code 的 `/messages` 对实测账户恒返回 403（见文件头注释）。
+ */
 export function endpointFromSupported(
 	endpoints: readonly string[],
 ): CommandCodeEndpoint | undefined {
