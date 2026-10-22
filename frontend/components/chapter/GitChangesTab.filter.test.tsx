@@ -409,7 +409,14 @@ describe("GitChangesTab status filter", () => {
 			complete: false,
 		});
 		const container = renderTab(chapterId, client);
-		await flushRender();
+		// React may yield under parallel CI load; a single timer tick does not
+		// guarantee the concurrent root has committed the measured file rows.
+		await waitFor(
+			() =>
+				container.querySelector('[aria-label="View diff of binary.png"]') !== null &&
+				container.querySelector('[aria-label="View diff of unknown.png"]') !== null,
+			"binary and unmeasured file rows",
+		);
 		expect(
 			container.querySelector('[aria-label="View diff of binary.png"]')?.textContent,
 		).toContain("+0-0");

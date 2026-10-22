@@ -66,4 +66,10 @@ export const narratorStore = {
 	/** Create the next attempt of a call (re-execution). */
 	retryTool: (...args: Parameters<Persistence["prepareToolCallAttempt"]>) =>
 		narratorPersistence.prepareToolCallAttempt(...args),
+	/**
+	 * Reader-only fields of an envelope (a translation, a card's status): no model-history
+	 * bump, no COW, no search index (§5.4).
+	 */
+	patchState: (...args: Parameters<Persistence["patchState"]>) =>
+		narratorPersistence.patchState(...args),
 };

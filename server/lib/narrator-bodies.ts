@@ -34,9 +34,11 @@ export function bodySql(alias: string, fromBlocks: boolean): string {
 }
 
 /**
- * The stored size of an envelope's body, for byte budgets: `body_bytes` for a
+ * The stored size of an envelope's body, for sizing read batches: `body_bytes` for a
  * block-format envelope (the sum of its rows), so `content_json` is not read just to be
- * measured; the length of `content_json` otherwise.
+ * measured; the length of `content_json` otherwise. `body_bytes` may exceed what the body
+ * measures (an input's text is stored again as its model text), which only makes batches
+ * smaller; a limit on the body itself uses `storedBodyBytesSql`, which is exact.
  */
 export function bodyBytesSql(alias: string, fromBlocks: boolean): string {
 	const json = `length(CAST(${alias}.content_json AS BLOB))`;

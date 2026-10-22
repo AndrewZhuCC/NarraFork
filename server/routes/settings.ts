@@ -12,6 +12,7 @@ import {
 	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
 } from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
+import { updateSettingsKey } from "@shared/update-settings";
 import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
@@ -324,6 +325,8 @@ const externalWebSocketOriginSchema = z
  */
 export const updateSettingsSchema = z
 	.object({
+		// Optional request precondition, never a persisted setting.
+		expectedUpdateSettingsKey: z.string().max(2048).optional(),
 		server: z
 			.object({
 				port: z.number().int().min(1).max(65535),
@@ -624,7 +627,10 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		narratorBlocks: z.object({ write: z.boolean(), read: z.boolean() }).partial().optional(),
+		narratorBlocks: z
+			.object({ write: z.boolean(), read: z.boolean(), wsV2: z.boolean() })
+			.partial()
+			.optional(),
 		containers: z
 			.object({
 				portRangeStart: z.number().int().min(1).max(65535),
@@ -1450,7 +1456,17 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 		const current = structuredClone(settings);
-		const validated = parsed.data;
+		const { expectedUpdateSettingsKey, ...validated } = parsed.data;
+		// Check inside the same lock as the save; a preceding GET cannot prevent races.
+		if (
+			expectedUpdateSettingsKey !== undefined &&
+			expectedUpdateSettingsKey !== updateSettingsKey(current.update)
+		) {
+			return c.json(
+				{ error: "Update settings changed. Check again.", code: "UPDATE_SOURCE_CHANGED" },
+				409,
+			);
+		}
 
 		const effectiveCustomApiProviders =
 			validated.customApiProviders ??

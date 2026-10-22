@@ -38,6 +38,7 @@ import {
 	resetActiveUpstreamSession,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 
 /**
  * How long a compact may make NO observable progress before it is aborted.
@@ -530,15 +531,13 @@ export async function markCompactAsBlocking(narratorId: string) {
 			columns: { id: true, contentJson: true },
 		});
 		for (const marker of markers) {
-			const blocks = Array.isArray(marker.contentJson) ? marker.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (!compactBlock) continue;
-			await db
-				.update(narratorMessages)
-				.set({ contentJson: [{ ...compactBlock, mode: "blocking" }] })
-				.where(
-					and(eq(narratorMessages.id, marker.id), eq(narratorMessages.narratorId, narratorId)),
-				);
+			// The mode is compact state: it changes nothing the model reads (§5.4).
+			narratorStore.patchState(marker.id, (blocks) => {
+				const index = blocks.findIndex((block) => parseCompactMessageBlock(block));
+				if (index < 0) return null;
+				blocks[index] = { ...(blocks[index] as Record<string, unknown>), mode: "blocking" };
+				return blocks;
+			});
 		}
 	} catch (err) {
 		logger.warn("Failed to update compact marker mode", { narratorId, error: String(err) });

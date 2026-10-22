@@ -229,8 +229,15 @@
 		{
 			"idx": 32,
 			"version": "7",
-			"when": 1792665501892,
-			"tag": "0032_bot_rooms",
+			"when": 1792663582482,
+			"tag": "0032_block_state_writes",
+			"breakpoints": true
+		},
+		{
+			"idx": 33,
+			"version": "7",
+			"when": 1792684370944,
+			"tag": "0033_bot_rooms",
 			"breakpoints": true
 		}
   ]

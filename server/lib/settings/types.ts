@@ -901,6 +901,12 @@ export interface NarraForkSettings {
 		 * `content_json`, which holds the same content while both are written.
 		 */
 		read: boolean;
+		/**
+		 * Whether clients may negotiate the block-keyed message protocol v2: page API
+		 * envelopes + blocks, block-level WS events (§8). A client opts in per
+		 * subscription; off, every connection gets v1.
+		 */
+		wsV2: boolean;
 	};
 	containers: {
 		portRangeStart: number;

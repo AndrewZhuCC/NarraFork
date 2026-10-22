@@ -1683,6 +1683,12 @@ export const narratorMessages = sqliteTable(
 		providerResponseId: text("provider_response_id"),
 		/** Sum of this envelope's blocks' `byte_size`, so reads batch without opening bodies. */
 		bodyBytes: integer("body_bytes").notNull().default(0),
+		/**
+		 * Incremented only by state-only writes (patchState: translations, card status). A
+		 * body-column change that moves it is not a model-visible change, so the revision
+		 * triggers (contract v3) neither bump nor queue a block sync for it.
+		 */
+		stateRevision: integer("state_revision").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [

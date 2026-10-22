@@ -5,6 +5,8 @@ import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { parseStored } from "@shared/narrator-blocks/plan";
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
 	isPreloadedMode,
@@ -354,6 +356,13 @@ import {
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
 import { recoverBlockStorage } from "./narrator-block-sync";
+import {
+	lastTargetElement,
+	materializeEnvelope,
+	resolveBlockTargets,
+	rowAt,
+} from "./narrator-block-targets";
+import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
 import {
 	cleanupBufferedTextFilesAsync,
 	enqueueBufferedMessage,
@@ -1449,10 +1458,13 @@ async function broadcastInterruptedPartialMessage(
 	partialId: string,
 ): Promise<void> {
 	try {
-		const fullMessage = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			with: { toolCalls: true },
-		});
+		const fullMessage = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		if (!fullMessage) return;
 
 		const ref = await db.query.narratorMessageRefs.findFirst({
@@ -5058,13 +5070,16 @@ async function retryLastMessageUnlocked(
 		throw new ValidationError("No messages to retry");
 	}
 
-	const tailMessages = await db.query.narratorMessages.findMany({
-		where: inArray(
-			narratorMessages.id,
-			tailRefs.map((ref) => ref.messageId),
-		),
-		with: { toolCalls: { columns: { id: true } } },
-	});
+	const tailMessages = fillBodies(
+		await db.query.narratorMessages.findMany({
+			where: inArray(
+				narratorMessages.id,
+				tailRefs.map((ref) => ref.messageId),
+			),
+			...bodyColumns(),
+			with: { toolCalls: { columns: { id: true } } },
+		}),
+	);
 	const tailById = new Map(tailMessages.map((msg) => [msg.id, msg]));
 	// resolveRetryTarget expects oldest → newest; tailRefs is newest first.
 	const orderedTail = tailRefs
@@ -6237,6 +6252,22 @@ async function rollbackToBlockUnlocked(
 	};
 }
 
+/**
+ * Rollback to blocks named by id (docs/BLOCK_STORAGE-DESIGN.md §5.5): every target block
+ * stays whole and what follows the last of them is deleted. A reasoning run is the ids of
+ * all its blocks, so none of it is cut; an input block is its whole message.
+ */
+export async function rollbackToBlocks(
+	narratorId: string,
+	blockIds: string[],
+	opts?: ScopedRevertOptions & { skipRevert?: boolean; scope?: RevertScope },
+): ReturnType<typeof rollbackToBlockUnlocked> {
+	return withNarratorStartAdmission(narratorId, () => {
+		const boundary = lastTargetElement(resolveBlockTargets(narratorId, blockIds));
+		return rollbackToBlockUnlocked(narratorId, boundary.messageId, boundary.blockIndex, opts);
+	});
+}
+
 /** Extract image refs from a message's contentJson. */
 function extractImageRefs(
 	contentJson: unknown,
@@ -6817,9 +6848,12 @@ async function editAndRegenerateUnlocked(
 
 	// Broadcast the updated message.  If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
-	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, privateMessageId),
-	});
+	const updatedMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, privateMessageId),
+			...bodyColumns(),
+		}),
+	);
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -7051,6 +7085,16 @@ async function restoreAssistantMessageUnlocked(
 		narratorId,
 		messageId,
 		overrides,
+		{
+			// The whole original is back: no block keeps a pre-edit body of its own.
+			afterWrite: (_tx, id) => {
+				sqlite
+					.prepare(
+						"UPDATE narrator_blocks SET original_payload = NULL WHERE message_id = ? AND original_payload IS NOT NULL",
+					)
+					.run(id);
+			},
+		},
 	);
 
 	const updatedMsg = await db.query.narratorMessages.findFirst({
@@ -7068,6 +7112,199 @@ async function restoreAssistantMessageUnlocked(
 	}
 
 	return { ok: true };
+}
+
+/**
+ * An edited output block's elements (§5.5): its text element holds the new text, keeps
+ * its identity (rows are matched by it, so the block keeps its id), keeps only the
+ * citations whose span still reads the same at the same place, and loses its upstream
+ * item metadata, translation and streaming bookkeeping, so the block projects as plain
+ * text from now on. Elements riding with the text (display-only ones) stay.
+ */
+export function editedOutputElements(
+	elements: ReadonlyArray<Record<string, unknown>>,
+	text: string,
+): Array<Record<string, unknown>> {
+	const index = elements.findIndex((element) => element?.type === "text");
+	if (index < 0) throw new ValidationError("This block has no text to edit");
+	const before = typeof elements[index].text === "string" ? (elements[index].text as string) : "";
+	const citations = Array.isArray(elements[index].citations)
+		? (elements[index].citations as Array<{ startIndex?: unknown; endIndex?: unknown }>).filter(
+				(citation) =>
+					Number.isSafeInteger(citation?.startIndex) &&
+					Number.isSafeInteger(citation?.endIndex) &&
+					(citation.startIndex as number) <= (citation.endIndex as number) &&
+					before.slice(citation.startIndex as number, citation.endIndex as number) ===
+						text.slice(citation.startIndex as number, citation.endIndex as number),
+			)
+		: [];
+	const { id, completed } = elements[index];
+	const edited = {
+		type: "text",
+		...(id !== undefined ? { id } : {}),
+		text,
+		...(citations.length ? { citations } : {}),
+		...(completed !== undefined ? { completed } : {}),
+	};
+	return elements.map((element, position) => (position === index ? edited : element));
+}
+
+function broadcastEditedMessage(
+	narratorId: string,
+	messageId: string,
+	privateMessageId: string,
+): void {
+	const updated = db.query.narratorMessages
+		.findFirst({ where: eq(narratorMessages.id, privateMessageId) })
+		.sync();
+	if (!updated) return;
+	broadcastToNarrator(narratorId, {
+		type: "message_updated",
+		narratorId,
+		message: fileReferenceMessageForDisplay(updated),
+	});
+	// A copy replaced the shared row for this narrator only: reload its view.
+	if (privateMessageId !== messageId)
+		broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+}
+
+/**
+ * Edit the text of one output block (docs/BLOCK_STORAGE-DESIGN.md §5.5), without touching
+ * the envelope's other blocks or regenerating. The block's body before its first edit is
+ * kept on its row (`original_payload`) for `restoreOutputBlock`; a shared envelope is
+ * copied for this narrator first. Returns the edited block's id, which a copy changes.
+ */
+export async function editOutputBlock(
+	...args: Parameters<typeof editOutputBlockUnlocked>
+): ReturnType<typeof editOutputBlockUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => editOutputBlockUnlocked(...args));
+}
+
+async function editOutputBlockUnlocked(
+	narratorId: string,
+	blockId: string,
+	text: string,
+	editedBy?: string | null,
+): Promise<{ ok: true; messageId: string; blockId: string }> {
+	const [target] = resolveBlockTargets(narratorId, [blockId]);
+	if (target.kind !== "output") throw new ValidationError("Only an output block can be edited");
+	// The original payload lives on the block's row: an unconverted envelope gets its rows.
+	if (!target.rowId) materializeEnvelope(target.messageId);
+	const row = rowAt(target.messageId, target.from);
+	if (!row)
+		throw new AppError("Message history changed; reload and retry", 409, "BLOCK_TARGET_STALE");
+	const before = sqlite.prepare("SELECT payload FROM narrator_blocks WHERE id = ?").get(row.id) as {
+		payload: string;
+	};
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, target.messageId),
+	});
+	if (!message) throw new NotFoundError("Message", target.messageId);
+	const elements = Array.isArray(message.contentJson)
+		? (message.contentJson as Array<Record<string, unknown>>)
+		: [];
+	const contentJson = [
+		...elements.slice(0, target.from),
+		...editedOutputElements(elements.slice(target.from, target.to), text),
+		...elements.slice(target.to),
+	];
+	let editedBlockId = row.id;
+	const privateMessageId = await narratorService.copyOnWriteMessage(
+		narratorId,
+		target.messageId,
+		{
+			contentJson,
+			contentText: modelTextFromContentBlocks(contentJson) || null,
+			editedAt: new Date().toISOString(),
+			editedBy: editedBy ?? null,
+			...(message.editedAt ? {} : { originalContentJson: message.contentJson }),
+		},
+		{
+			afterWrite: (_tx, messageId) => {
+				const edited = rowAt(messageId, target.from);
+				if (!edited)
+					throw new AppError(
+						"Message history changed; reload and retry",
+						409,
+						"BLOCK_TARGET_STALE",
+					);
+				editedBlockId = edited.id;
+				sqlite
+					.prepare(
+						"UPDATE narrator_blocks SET original_payload = coalesce(original_payload, ?) WHERE id = ?",
+					)
+					.run(before.payload, edited.id);
+			},
+		},
+	);
+	broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
+	return { ok: true, messageId: privateMessageId, blockId: editedBlockId };
+}
+
+/**
+ * Put one edited output block back to its body before its first edit (§5.5), leaving the
+ * envelope's other blocks as they are. The envelope stays marked edited while another of
+ * its blocks still is.
+ */
+export async function restoreOutputBlock(
+	...args: Parameters<typeof restoreOutputBlockUnlocked>
+): ReturnType<typeof restoreOutputBlockUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => restoreOutputBlockUnlocked(...args));
+}
+
+async function restoreOutputBlockUnlocked(
+	narratorId: string,
+	blockId: string,
+): Promise<{ ok: true; messageId: string; blockId: string }> {
+	const [target] = resolveBlockTargets(narratorId, [blockId]);
+	if (target.kind !== "output") throw new ValidationError("Only an output block can be restored");
+	const original = target.rowId
+		? (sqlite
+				.prepare("SELECT original_payload AS originalPayload FROM narrator_blocks WHERE id = ?")
+				.get(target.rowId) as { originalPayload: string | null } | null)
+		: null;
+	const raw = (parseStored(original?.originalPayload ?? null) as { raw?: unknown } | null)?.raw;
+	// Never edited by block: nothing to restore.
+	if (!target.rowId || !Array.isArray(raw))
+		return { ok: true, messageId: target.messageId, blockId: target.blockId };
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, target.messageId),
+	});
+	if (!message) throw new NotFoundError("Message", target.messageId);
+	const elements = Array.isArray(message.contentJson) ? (message.contentJson as unknown[]) : [];
+	const contentJson = [...elements.slice(0, target.from), ...raw, ...elements.slice(target.to)];
+	const othersEdited = !!sqlite
+		.prepare(
+			"SELECT 1 FROM narrator_blocks WHERE message_id = ? AND id <> ? AND original_payload IS NOT NULL",
+		)
+		.get(target.messageId, target.rowId);
+	let restoredBlockId = target.rowId;
+	const privateMessageId = await narratorService.copyOnWriteMessage(
+		narratorId,
+		target.messageId,
+		{
+			contentJson,
+			contentText: modelTextFromContentBlocks(contentJson) || null,
+			...(othersEdited ? {} : { editedAt: null, editedBy: null, originalContentJson: null }),
+		},
+		{
+			afterWrite: (_tx, messageId) => {
+				const restored = rowAt(messageId, target.from);
+				if (!restored)
+					throw new AppError(
+						"Message history changed; reload and retry",
+						409,
+						"BLOCK_TARGET_STALE",
+					);
+				restoredBlockId = restored.id;
+				sqlite
+					.prepare("UPDATE narrator_blocks SET original_payload = NULL WHERE id = ?")
+					.run(restored.id);
+			},
+		},
+	);
+	broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
+	return { ok: true, messageId: privateMessageId, blockId: restoredBlockId };
 }
 
 /**

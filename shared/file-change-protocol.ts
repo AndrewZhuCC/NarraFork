@@ -301,11 +301,13 @@ export function fileChangeRevertActionMatches(
 		return kind === "revert" && (selector.kind === "all" || selector.kind === "from_seq");
 	if (action === "rollback_to_block" || action === "edit_and_regenerate")
 		return kind === "rollback_to_block" && selector.kind === "after_block";
+	// One tool block: every execution attempt of its call, which the server derives from
+	// the block (a re-run tool has one ledger row per attempt).
 	return (
 		action === "delete_tool_block" &&
 		kind === "history_delete" &&
 		selector.kind === "tool_calls" &&
-		selector.toolCallIds.length === 1
+		selector.toolCallIds.length >= 1
 	);
 }
 

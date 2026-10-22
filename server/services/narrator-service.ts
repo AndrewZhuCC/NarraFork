@@ -133,6 +133,7 @@ import { compileDelegationCeiling } from "./custom-subagent-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { newEnvelopeColumns, syncEnvelopeNow } from "./narrator-block-sync";
+import { contentJsonSql, fillBodies } from "./narrator-body-reads";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -304,7 +305,7 @@ function annotateImageBlocksWithUploadOwner(contentJson: unknown, narratorId: st
 
 async function hasSharedOwnedImageMessages(narratorId: string): Promise<boolean> {
 	const sharedOwnedMessages = await db
-		.select({ contentJson: narratorMessages.contentJson })
+		.select({ id: narratorMessages.id, contentJson: contentJsonSql() })
 		.from(narratorMessages)
 		.where(
 			and(
@@ -316,7 +317,7 @@ async function hasSharedOwnedImageMessages(narratorId: string): Promise<boolean>
 				)`,
 			),
 		);
-	return sharedOwnedMessages.some((row) => contentJsonHasImageBlocks(row.contentJson));
+	return fillBodies(sharedOwnedMessages).some((row) => contentJsonHasImageBlocks(row.contentJson));
 }
 
 /**
@@ -3291,6 +3292,7 @@ export const narratorService = {
 	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
+	deleteBlocks: narratorMessageQueries.deleteBlocks.bind(narratorMessageQueries),
 	updateCompactSummary: narratorMessageQueries.updateCompactSummary.bind(narratorMessageQueries),
 	getPendingPermissions: narratorMessageQueries.getPendingPermissions.bind(narratorMessageQueries),
 

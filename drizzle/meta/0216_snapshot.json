@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "56abc11d-5006-4a26-ad7b-34fe16d6d1b9",
+  "id": "c5204a13-b528-45e6-ba11-ccfb998e4d33",
   "prevId": "d1ad81e2-d6ef-4f8b-8d95-99311171395f",
   "tables": {
     "acl_events": {
@@ -2284,13 +2284,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "sender_narrator_id": {
-          "name": "sender_narrator_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "kind": {
           "name": "kind",
           "type": "text",
@@ -2329,13 +2322,6 @@
         },
         "reply_to_guest_name": {
           "name": "reply_to_guest_name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "reply_to_sender_narrator_id": {
-          "name": "reply_to_sender_narrator_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -2392,13 +2378,6 @@
             "sender_share_id"
           ],
           "isUnique": false
-        },
-        "idx_chat_messages_sender_narrator": {
-          "name": "idx_chat_messages_sender_narrator",
-          "columns": [
-            "sender_narrator_id"
-          ],
-          "isUnique": false
         }
       },
       "foreignKeys": {
@@ -2434,19 +2413,6 @@
           "tableTo": "narrator_public_shares",
           "columnsFrom": [
             "sender_share_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        },
-        "fk_chat_messages_sender_narrator": {
-          "name": "fk_chat_messages_sender_narrator",
-          "tableFrom": "chat_messages",
-          "tableTo": "narrators",
-          "columnsFrom": [
-            "sender_narrator_id"
           ],
           "columnsTo": [
             "id"
@@ -2645,15 +2611,7 @@
           "columns": [
             "narrator_id"
           ],
-          "isUnique": true,
-          "where": "\"kind\" = 'narrator'"
-        },
-        "idx_chat_rooms_narrator_id": {
-          "name": "idx_chat_rooms_narrator_id",
-          "columns": [
-            "narrator_id"
-          ],
-          "isUnique": false
+          "isUnique": true
         },
         "idx_chat_rooms_kind_last": {
           "name": "idx_chat_rooms_kind_last",
@@ -10832,6 +10790,14 @@
         },
         "body_bytes": {
           "name": "body_bytes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "state_revision": {
+          "name": "state_revision",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,

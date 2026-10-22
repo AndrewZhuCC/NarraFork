@@ -46,6 +46,7 @@ import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tra
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { FileReferenceContextTracker } from "./file-reference-context";
+import { bodyColumns, fillBody } from "./narrator-body-reads";
 import { storeNarratorContextUsage } from "./narrator-context-composition";
 import { completeAssistantOutput } from "./narrator-output-recovery";
 import { bumpNarratorMessageVersion, narratorPersistence } from "./narrator-persistence";
@@ -259,10 +260,13 @@ export async function persistDetachedToolResult(
 
 	// Refresh persisted history, not tool_completed (which mutates live streaming
 	// state by toolUseId). Project the current row so a newer attempt remains visible.
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, affected.messageId),
-		with: { toolCalls: true },
-	});
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, affected.messageId),
+			...bodyColumns(),
+			with: { toolCalls: true },
+		}),
+	);
 	const ref = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -348,6 +352,10 @@ export interface EventHandlerContext {
 	>;
 	/** Avoid translating the same checkpoint concurrently while metadata catches up. */
 	reasoningTranslations?: Set<string>;
+	/** Latest checkpoints wait for real output; reasoning-only retries never translate. */
+	pendingReasoningTranslations?: Map<string, { messageId: string; block: PersistedReasoningBlock }>;
+	/** A reasoning block is dispatched at most once per provider attempt. */
+	dispatchedReasoningTranslations?: Set<string>;
 	/** Retry publication after a checkpoint write succeeded but its announce failed. */
 	unpublishedContentBlockIds?: Set<string>;
 	getTtftMs?: () => number | undefined;
@@ -1233,10 +1241,12 @@ function reorderPersistedToolUseBlocks(
 /** Block count of a partial assistant message, or 0 when there is no partial row yet. */
 async function countPersistedBlocks(partialMessageId: string | undefined): Promise<number> {
 	if (!partialMessageId) return 0;
-	const row = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, partialMessageId),
-		columns: { contentJson: true },
-	});
+	const row = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialMessageId),
+			...bodyColumns({ id: true, contentJson: true }),
+		}),
+	);
 	return Array.isArray(row?.contentJson) ? row.contentJson.length : 0;
 }
 
@@ -1347,10 +1357,13 @@ async function discardAttemptPersistedBlocks(
 		// message mutation) so an attached client and a reconnecting one agree.
 		await bumpNarratorMessageVersion(narratorId);
 		queueContextCharacterRefresh(narratorId, partialId);
-		const updated = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			with: { toolCalls: true },
-		});
+		const updated = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		if (updated) {
 			const ref = await db.query.narratorMessageRefs.findFirst({
 				where: and(
@@ -1621,6 +1634,33 @@ export async function processEvent(
 	hooks?: EventHooks,
 ): Promise<{ titleUpdate?: boolean } | null> {
 	const { narratorId, broadcastTargetId } = ctx;
+
+	if (
+		event.type === "attempt_discarded" ||
+		event.type === "stream_reset" ||
+		event.type === "api_request_start"
+	) {
+		ctx.pendingReasoningTranslations?.clear();
+		ctx.dispatchedReasoningTranslations?.clear();
+	} else if (
+		(event.type === "stream_text" && event.text.trim().length > 0) ||
+		event.type === "tool_call" ||
+		event.type === "tool_use_chunk" ||
+		(event.type === "block_complete" &&
+			((event.block.type === "text" && event.block.text.trim().length > 0) ||
+				event.block.type === "tool_use"))
+	) {
+		// Drain synchronously before starting asynchronous translations. Further tokens,
+		// tool argument chunks and completion events must not dispatch the same block.
+		ctx.dispatchedReasoningTranslations ??= new Set();
+		for (const [key, { messageId, block }] of ctx.pendingReasoningTranslations ?? []) {
+			ctx.dispatchedReasoningTranslations.add(key);
+			if (settings.agent.translateReasoning && block.text) {
+				translateReasoningBlock(messageId, narratorId, broadcastTargetId, block.text, ctx, block);
+			}
+		}
+		ctx.pendingReasoningTranslations?.clear();
+	}
 
 	switch (event.type) {
 		case "stream_text": {
@@ -2082,13 +2122,20 @@ export async function processEvent(
 					outputIndex: block.outputIndex,
 				});
 				retireCompletedSnapshot();
-				// Fire-and-forget reasoning translation
+				// Summary segments share a block ID and can repeatedly checkpoint a growing
+				// prefix. Only retain the latest version until real output begins.
 				if (settings.agent.translateReasoning && block.text) {
-					translateReasoningBlock(partialId, narratorId, broadcastTargetId, block.text, ctx, {
-						id: block.id,
-						providerMetadata: block.providerMetadata,
-						outputIndex: block.outputIndex,
-					});
+					const key = JSON.stringify([
+						partialId,
+						block.id ??
+							getReasoningItemId(block.providerMetadata) ??
+							block.outputIndex ??
+							block.text,
+					]);
+					if (!ctx.dispatchedReasoningTranslations?.has(key)) {
+						ctx.pendingReasoningTranslations ??= new Map();
+						ctx.pendingReasoningTranslations.set(key, { messageId: partialId, block });
+					}
 				}
 			} else if (block.type === "redacted_thinking") {
 				await writeAttemptItem(ctx, partialId, {
@@ -2343,10 +2390,13 @@ export async function processEvent(
 			}
 
 			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
-			let fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedId),
-				with: { toolCalls: true },
-			});
+			let fullMessage = fillBody(
+				await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, savedId),
+					...bodyColumns(),
+					with: { toolCalls: true },
+				}),
+			);
 
 			// Tool blocks may have been appended by block_complete in stop/completion order.
 			// The final event's toolUses is already in stable model/start order, so reconcile
