@@ -704,7 +704,7 @@ function isRetiredIndexCreateError(
 // Only outer whitespace and SQLite's omitted final semicolon are interchangeable. In
 // particular, never normalize whitespace/case inside a trigger body or a SQL literal.
 // CRLF is the one exception: it only reflects the checkout the migration file was read from.
-function normalizeModelHistorySql(sql: string): string {
+function normalizeMigrationSql(sql: string): string {
 	return sql.replace(/\r\n/g, "\n").trim().replace(/;$/, "").trimEnd();
 }
 
@@ -718,7 +718,7 @@ const MODEL_HISTORY_MIGRATION_SQL = [
 	"ALTER TABLE `narrators` ADD `model_history_revision` integer DEFAULT 0 NOT NULL;",
 	"PRAGMA foreign_keys=ON;",
 	...renderModelHistoryRevisionSqlV1("sqlite").split("--> statement-breakpoint"),
-].map(normalizeModelHistorySql);
+].map(normalizeMigrationSql);
 function canonicalTriggers(statements: readonly string[]) {
 	return statements.map((sql) => {
 		const match =
@@ -734,7 +734,7 @@ const MODEL_HISTORY_TRIGGERS = canonicalTriggers(MODEL_HISTORY_MIGRATION_SQL.sli
 const MODEL_HISTORY_V2_TRIGGERS = canonicalTriggers(
 	renderModelHistoryRevisionSql("sqlite")
 		.split("--> statement-breakpoint")
-		.map(normalizeModelHistorySql)
+		.map(normalizeMigrationSql)
 		.filter((sql) => sql.startsWith("CREATE TRIGGER")),
 );
 
@@ -742,8 +742,7 @@ function isOfficialModelHistoryMigration(statements: readonly string[]): boolean
 	return (
 		statements.length === MODEL_HISTORY_MIGRATION_SQL.length &&
 		statements.every(
-			(statement, index) =>
-				normalizeModelHistorySql(statement) === MODEL_HISTORY_MIGRATION_SQL[index],
+			(statement, index) => normalizeMigrationSql(statement) === MODEL_HISTORY_MIGRATION_SQL[index],
 		)
 	);
 }
@@ -779,7 +778,7 @@ function isModelHistoryContractInstalled(
 		// Room for a CRLF form: one extra byte per line.
 		const maxLength = expected.length + expected.split("\n").length;
 		const row = catalogSql.get(type, name, table, maxLength) as { sql: string } | null;
-		return row !== null && normalizeModelHistorySql(row.sql) === expected;
+		return row !== null && normalizeMigrationSql(row.sql) === expected;
 	};
 	if (
 		!matchesCatalogSql(
@@ -844,6 +843,40 @@ function isRecordedMigration(
 	const lf = migration.sql.join("--> statement-breakpoint").replace(/\r\n/g, "\n");
 	const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 	return appliedHashes.has(sha256(lf)) || appliedHashes.has(sha256(lf.replace(/\n/g, "\r\n")));
+}
+
+// The complete published 0207 program, not a filename/timestamp/column-name heuristic.
+// Keep the asset and its recorded hash unchanged; compatibility only changes execution order.
+const LEGACY_REQUEST_DUMP_DROP_SQL = [
+	"PRAGMA foreign_keys=OFF;",
+	"DROP TABLE `usage_token_repair_candidates`;",
+	"DROP TABLE `usage_token_repair_jobs`;",
+	"DROP INDEX `idx_api_requests_token_repair_pending`;",
+	"DROP INDEX `idx_api_requests_token_repair_reviewed`;",
+	"ALTER TABLE `api_requests` DROP COLUMN `token_accounting_version`;",
+	"ALTER TABLE `api_requests` DROP COLUMN `token_accounting_review_version`;",
+	"ALTER TABLE `api_requests` DROP COLUMN `raw_dump_json`;",
+	"PRAGMA foreign_keys=ON;",
+].map(normalizeMigrationSql);
+
+/**
+ * SQLite rewrites rows on DROP COLUMN. Removing the two small columns first copies the
+ * still-live multi-GB request dumps twice, inflating WAL and in-memory statement journals.
+ * Drop the payload first, but only for the exact known program whose three independent
+ * drops have the same final schema/data. Keep its dependency drops ahead of all three,
+ * the original migration hash, and the encompassing transaction/rollback semantics.
+ */
+function orderLegacyRequestDumpDrops(statements: string[]): string[] {
+	if (
+		statements.length !== LEGACY_REQUEST_DUMP_DROP_SQL.length ||
+		!statements.every(
+			(statement, index) =>
+				normalizeMigrationSql(statement) === LEGACY_REQUEST_DUMP_DROP_SQL[index],
+		)
+	) {
+		return statements;
+	}
+	return [...statements.slice(0, 5), statements[7], statements[5], statements[6], statements[8]];
 }
 
 /**
@@ -919,6 +952,10 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = OFF");
 
 	let stampedWithoutRun = 0;
+	let activeMigration:
+		| { migrationIndex: number; folderMillis: number; executionStatementIndex?: number }
+		| undefined;
+	logger.info("Applying pending SQLite migrations", { pending: pending.length });
 	try {
 		const apply = sqlite.transaction(() => {
 			// Source-built databases can have a fully installed v1 contract but no matching
@@ -933,7 +970,15 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					: -1;
 			const effectiveLastAppliedIndex = Math.max(lastAppliedIndex, installedModelHistoryIndex);
 			for (const { migration, index } of pending) {
-				const statements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
+				const originalStatements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
+				const statements = orderLegacyRequestDumpDrops(originalStatements);
+				const migrationStarted = performance.now();
+				activeMigration = { migrationIndex: index, folderMillis: migration.folderMillis };
+				logger.info("Starting SQLite migration", {
+					...activeMigration,
+					statementCount: statements.length,
+					legacyRequestDumpDropReordered: statements !== originalStatements,
+				});
 				const droppedTables = migrationDropsRealTables(statements);
 				const isDestructive = droppedTables.length > 0;
 				// A destructive migration is only skipped when the database already advanced past
@@ -967,48 +1012,66 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 						droppedTables,
 					});
 				} else {
-					for (const rawStmt of statements) {
-						const stmt = rewriteQualifiedNewTableChecks(rawStmt);
-						// Validate before SQLite can accept missing DQS names as literals. Neither
-						// compatibility failures nor repaired-copy failures are tolerable DDL errors.
-						const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
-						if (copyStatement !== stmt) {
-							if (copyStatement !== null) sqlite.run(copyStatement);
-							continue;
-						}
+					for (const [executionStatementIndex, rawStmt] of statements.entries()) {
+						activeMigration.executionStatementIndex = executionStatementIndex;
+						const statementStarted = performance.now();
+						// Ordinals only: migration SQL can contain literals and must not enter logs.
+						logger.debug("Starting SQLite migration statement", { ...activeMigration });
 						try {
-							sqlite.run(stmt);
-						} catch (err) {
-							if (isAlreadyExistsError(err)) continue;
-							// An index/column drop whose target is already gone: the statement's
-							// own goal is satisfied, verified against the live catalog.
-							if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
-							if (isRetiredIndexCreateError(sqlite, err, stmt, migrations.slice(index + 1))) {
-								logger.info("Skipped retired historical index DDL", {
-									folderMillis: migration.folderMillis,
-								});
+							const stmt = rewriteQualifiedNewTableChecks(rawStmt);
+							// Validate before SQLite can accept missing DQS names as literals. Neither
+							// compatibility failures nor repaired-copy failures are tolerable DDL errors.
+							const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
+							if (copyStatement !== stmt) {
+								if (copyStatement !== null) sqlite.run(copyStatement);
 								continue;
 							}
-							// Scoped to the failing statement, not the whole migration: only a
-							// `DROP TABLE` whose own target is the table SQLite reports missing is
-							// harmless. Anything else failing with "no such table" means the
-							// migration's assumptions are broken, and continuing through the rest of
-							// a rebuild sequence would drop live rows into an empty replacement.
-							if (isDestructive && isMissingDropTargetError(err, stmt, droppedTables)) {
-								continue;
+							try {
+								sqlite.run(stmt);
+							} catch (err) {
+								if (isAlreadyExistsError(err)) continue;
+								// An index/column drop whose target is already gone: the statement's
+								// own goal is satisfied, verified against the live catalog.
+								if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
+								if (isRetiredIndexCreateError(sqlite, err, stmt, migrations.slice(index + 1))) {
+									logger.info("Skipped retired historical index DDL", {
+										folderMillis: migration.folderMillis,
+									});
+									continue;
+								}
+								// Scoped to the failing statement, not the whole migration: only a
+								// DROP TABLE whose own target is reported missing is harmless. Other
+								// missing tables must abort, or a rebuild could destroy live rows.
+								if (isDestructive && isMissingDropTargetError(err, stmt, droppedTables)) {
+									continue;
+								}
+								throw err;
 							}
-							throw err;
+						} finally {
+							const durationMs = Math.round(performance.now() - statementStarted);
+							if (durationMs >= 1_000) {
+								logger.warn("Slow SQLite migration statement", { ...activeMigration, durationMs });
+							}
 						}
 					}
 				}
 
+				delete activeMigration.executionStatementIndex;
 				sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
 					migration.hash,
 					migration.folderMillis,
 				]);
+				// This is progress, not a durability claim: a later failure rolls it back.
+				logger.info("SQLite migration executed; awaiting batch commit", {
+					...activeMigration,
+					durationMs: Math.round(performance.now() - migrationStarted),
+				});
 			}
 		});
 		apply();
+	} catch (error) {
+		logger.error("SQLite migration batch failed; rolled back", { ...activeMigration });
+		throw error;
 	} finally {
 		if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = ON");
 	}
