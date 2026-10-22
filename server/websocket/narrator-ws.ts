@@ -43,6 +43,7 @@ import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
 import { getUserLanguage } from "../lib/prompt-i18n";
+import { settings } from "../lib/settings";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
 import type {
@@ -126,6 +127,13 @@ export interface NarratorWSData {
 	 * sets it, any other kind clears it.
 	 */
 	activityOnlyNarrators?: Set<string>;
+	/**
+	 * Subset of `subscribedNarrators` whose message stream uses the block-keyed protocol
+	 * v2 (docs/BLOCK_STORAGE-DESIGN.md §8.2): message-shaped events reach them as
+	 * envelopes + blocks. A `messages` subscribe sets the protocol it asks for; v2 is
+	 * granted only while `narratorBlocks.wsV2` is on.
+	 */
+	blockProtocolNarrators?: Set<string>;
 	subscribedStats?: boolean;
 	/** narratorId → number of in-flight catch-up queries buffering realtime frames. */
 	catchingUpNarrators: Map<string, number>;
@@ -2261,6 +2269,21 @@ export const handleNarratorWS = {
 					sendRuntimeSnapshot(ws, allowedIds, requestId);
 				}
 				if (kind === "messages") {
+					const protocol = msg.protocol === 2 && settings.narratorBlocks.wsV2 ? 2 : 1;
+					if (protocol === 2) ws.data.blockProtocolNarrators ??= new Set();
+					for (const id of allowedIds) {
+						if (protocol === 2) ws.data.blockProtocolNarrators?.add(id);
+						else ws.data.blockProtocolNarrators?.delete(id);
+					}
+					// Only a client that asked learns what it got; v1 clients see no new frame.
+					if (msg.protocol !== undefined)
+						safeSend(
+							ws,
+							withSubscriptionRequestId(
+								{ type: "message_protocol", narratorIds: allowedIds, protocol },
+								requestId,
+							),
+						);
 					sendStreamingSnapshot(ws, allowedIds, requestId);
 				}
 
@@ -2306,6 +2329,7 @@ export const handleNarratorWS = {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.delete(id);
 					ws.data.activityOnlyNarrators?.delete(id);
+					ws.data.blockProtocolNarrators?.delete(id);
 					toolInputLaneSender.clearNarrator(ws, id);
 				}
 				break;

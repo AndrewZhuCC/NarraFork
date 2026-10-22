@@ -1145,6 +1145,12 @@ export type NarratorServerMessage =
 	  }
 	| { type: "sync_ok"; narratorId: string; version: number }
 	/**
+	 * The message protocol a `messages` subscribe got, sent only to a subscribe that
+	 * named one: 2 (block-keyed, docs/BLOCK_STORAGE-DESIGN.md §8.2) while
+	 * `narratorBlocks.wsV2` is on, else 1.
+	 */
+	| { type: "message_protocol"; narratorIds: string[]; protocol: 1 | 2 }
+	/**
 	 * A subscribe request was refused because the connection's user may not read
 	 * that narrator (or it does not exist — deliberately indistinguishable, matching
 	 * the 404-on-denial rule of the HTTP surface).
