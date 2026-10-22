@@ -2682,77 +2682,20 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
 }
 
 /**
- * Text of a trailing `role: "user"` row that a pass with no prompt of its own must resend.
- *
- * Every provider's history builder POPS the last top-level user row and expects the
- * caller to send it as the current turn (`buildAnthropicHistory` line ~2832 and the
- * same three lines in openai/gemini). That contract holds for an ordinary user
- * message, because whoever wrote the row also passes its text into `runAgentLoop`.
- *
- * It does NOT hold for a row written by a producer that then starts a bare
- * `runAgentLoop(active, "")` — the review conclusion written by
- * `review-event-handler` is the first such producer. The row was popped as "the
- * current turn" and the current turn was empty, so the conclusion reached the model
- * in NEITHER place: `pushUserTurn` pushes nothing for empty content, and history no
- * longer contains the row. The reviewer's findings simply were not in the request.
- *
- * Nothing reports that. The turn runs, the model answers something generic about the
- * previous context, and the transcript still shows the conclusion sitting there — so
- * it reads as the model ignoring it rather than never receiving it.
- *
- * Recovered here rather than at the producer because the gap belongs to this seam:
- * any future producer that persists a user row and starts an empty pass inherits the
- * same bug, and a fix at one call site would not cover it. `sys` rows need none of
- * this — the builders lift those into `trailingUserText` themselves.
- */
-export function resolvePoppedTrailingUserText(
-	messages: ContinuableTopLevelMessage[],
-): string | null {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (!msg || msg.parentToolUseId) continue;
-		// Mirrors the builders' filter: they only consider user/assistant/sys, and only
-		// a trailing `user` row is popped. A trailing `sys` run is lifted by the builder
-		// itself, so reaching one means there is nothing for this helper to recover.
-		if (msg.role === "sys") return null;
-		if (msg.role !== "user") return null;
-		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-		const text = blocks
-			.filter(
-				(block: { type?: string; text?: unknown }) =>
-					block?.type === "text" && typeof block.text === "string" && block.text.trim(),
-			)
-			.map((block: { text?: unknown }) => String(block.text))
-			.join("\n");
-		// Snapshot-only inputs are real turns too. Prefer contentText for the old
-		// uploaded-file hint when references are present, just as history projection does.
-		const flat = typeof msg.contentText === "string" ? msg.contentText : "";
-		const snapshots = getFileReferenceSnapshots(blocks);
-		const projected = projectFileReferenceText(
-			snapshots.length ? flat || text : text || flat,
-			snapshots,
-		);
-		return projected.trim() ? projected : null;
-	}
-	return null;
-}
-
-/**
  * Does model-visible history end on a server-authored injection?
  *
  * `resolveContinuationTail` walks PAST `sys` rows by design — it answers "what turn can
  * a continuation build on", and an injection is not a turn. But its absence from that
  * answer must not be read as "history ends on the row underneath": an injection sitting
  * last is the freshest thing the narrator was handed, and every provider's history
- * builder already sends a trailing `sys` run as the CURRENT turn
- * (`buildAnthropicHistory`'s `trailingUserText`).
+ * already ends with it as the latest input, so it IS the current turn.
  *
  * So a continuation whose tail is an injection has its content already in place and needs
  * nothing but a loop — the same `runAgentLoop(active, "")` that
  * `startInjectionContinuationIfPossible` uses. Appending a synthetic "please continue"
  * user row instead would be actively wrong, not merely redundant: it displaces the
- * injection from the trailing position, so the builder stops lifting it and the model
- * reads it as background while being asked to continue something unnamed.
+ * injection from the trailing position, and the model reads it as background while
+ * being asked to continue something unnamed.
  */
 export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
 	for (let i = messages.length - 1; i >= 0; i--) {

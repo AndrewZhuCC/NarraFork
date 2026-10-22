@@ -1,5 +1,4 @@
-import { outputToText } from "@shared/agent-protocol/tool-output";
-import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -12,6 +11,7 @@ import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
+import { type NeutralTurn, projectHistory, webSearchSummary } from "./projection";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -225,10 +225,22 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
+		model: string,
+		narratorId?: string,
 	): Promise<BuiltHistory> {
-		return this.buildGeminiHistory(dbMessages);
+		const projected = await projectHistory(
+			dbMessages,
+			{
+				strict: hasCredentialBoundReasoning(parseModelId(model).model),
+				reasoningSource: this.getActiveReasoningSource(),
+			},
+			narratorId,
+		);
+		return {
+			history: this.interactionsWireHistory(projected.turns),
+			trailingToolResults: [],
+			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
+		};
 	}
 
 	injectSystemPrompt(
@@ -649,155 +661,81 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		return { text, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
-	private buildGeminiHistory(dbMessages: DbMessage[]): {
-		history: GeminiHistoryItem[];
-		trailingToolResults: GeminiFunctionResultStep[];
-		trailingUserText?: string;
-		replayedInjectionMessageIds: string[];
-	} {
-		const topLevel = dbMessages.filter(
-			(message) =>
-				!message.parentToolUseId &&
-				(message.role === "user" || message.role === "assistant" || message.role === "sys"),
-		);
-		if (topLevel.at(-1)?.role === "user") topLevel.pop();
-
+	/** Second projection stage for Interactions: neutral turns → steps. */
+	private interactionsWireHistory(turns: readonly NeutralTurn[]): GeminiHistoryItem[] {
 		const history: GeminiHistoryItem[] = [];
-		const replayedInjectionMessageIds: string[] = [];
-		let pendingToolResults: GeminiFunctionResultStep[] = [];
-		const flushToolResults = () => {
-			if (pendingToolResults.length > 0) {
-				history.push(...pendingToolResults);
-				pendingToolResults = [];
+		for (const turn of turns) {
+			if (turn.kind === "input") {
+				for (const item of turn.items) {
+					const images = item.images.flatMap((image) => (image ? [image] : []));
+					if (!images.length) {
+						if (item.text) history.push({ type: "user_input", content: item.text });
+						continue;
+					}
+					history.push({
+						type: "user_input",
+						content: orderUserContent(item.text, images, "after").map(
+							(part): GeminiInputContent =>
+								part.type === "text"
+									? { type: "text", text: part.text }
+									: { type: "image", data: part.image.base64, mime_type: part.image.mediaType },
+						),
+					});
+				}
+				continue;
 			}
-		};
-
-		for (const message of topLevel) {
-			if (message.role === "assistant") {
-				flushToolResults();
-
-				const content = Array.isArray(message.contentJson)
-					? (message.contentJson as Array<Record<string, unknown>>)
-					: [];
-				const completedCalls =
-					message.toolCalls?.filter(
-						(call) => call.status === "success" || call.status === "fail",
-					) ?? [];
-				const toolBlocks = new Map(
-					content
-						.filter(
-							(block) =>
-								block.type === "tool_use" &&
-								(typeof block.id === "string" || typeof block.toolUseId === "string"),
-						)
-						.map((block) => [(block.id ?? block.toolUseId) as string, block]),
-				);
-				const ordered: Array<{ index: number; sequence: number; step: GeminiInteractionStep }> = [];
-				const seenThoughtSignatures = new Set<string>();
-				let sequence = 0;
-
-				for (const block of content) {
-					const outputIndex = numericOutputIndex(block.outputIndex);
-					if (block.type === "reasoning") {
-						const metadata = block.providerMetadata as
-							| import("./types").ReasoningProviderMetadata
-							| undefined;
-						const signature = extractThoughtSignature(metadata, this.getActiveReasoningSource());
-						if (signature) seenThoughtSignatures.add(signature);
-						ordered.push({
-							index: outputIndex ?? Number.MAX_SAFE_INTEGER - 2,
-							sequence: sequence++,
-							step: {
-								type: "thought",
-								...(metadata?.gemini?.stepId ? { id: metadata.gemini.stepId } : {}),
-								...(signature ? { signature } : {}),
-								...(typeof block.text === "string" && block.text
-									? { summary: [{ type: "text", text: block.text }] }
-									: {}),
-							},
-						});
-					} else if (block.type === "text" && typeof block.text === "string" && block.text) {
-						ordered.push({
-							index: outputIndex ?? Number.MAX_SAFE_INTEGER - 1,
-							sequence: sequence++,
-							step: { type: "model_output", content: block.text },
-						});
-					}
-				}
-
-				if (!content.some((block) => block.type === "text") && message.contentText) {
-					ordered.push({
-						index: Number.MAX_SAFE_INTEGER - 1,
-						sequence: sequence++,
-						step: { type: "model_output", content: message.contentText },
-					});
-				}
-
-				for (const call of completedCalls) {
-					const block = toolBlocks.get(call.toolUseId);
-					const input = block?.input ?? call.inputJson;
-					const { args, signature, signatureSource } = extractArgsAndSignature(input);
-					const blockSignature =
-						typeof block?.thoughtSignature === "string" ? block.thoughtSignature : undefined;
-					const blockSignatureSource =
-						typeof block?.thoughtSignatureSource === "string"
-							? block.thoughtSignatureSource
-							: signatureSource;
-					const thoughtSignature = signatureSourcesCompatible(
-						blockSignatureSource,
-						this.getActiveReasoningSource(),
-					)
-						? (blockSignature ?? signature)
-						: undefined;
-					if (thoughtSignature && !seenThoughtSignatures.has(thoughtSignature)) {
-						seenThoughtSignatures.add(thoughtSignature);
-						ordered.push({
-							index: numericOutputIndex(block?.outputIndex) ?? Number.MAX_SAFE_INTEGER,
-							sequence: sequence++,
-							step: { type: "thought", signature: thoughtSignature },
-						});
-					}
-					ordered.push({
-						index: numericOutputIndex(block?.outputIndex) ?? Number.MAX_SAFE_INTEGER,
-						sequence: sequence++,
-						step: {
-							type: "function_call",
-							id: call.toolUseId,
-							name: call.toolName,
-							arguments: args,
-						},
-					});
-					const output = outputToText(call.outputJson);
-					pendingToolResults.push({
+			if (turn.kind === "tool_results") {
+				for (const result of turn.results)
+					history.push({
 						type: "function_result",
-						call_id: call.toolUseId,
-						name: call.toolName,
-						result: call.status === "fail" ? { error: output } : output,
+						call_id: result.wireId,
+						name: result.name,
+						result: result.isError ? { error: result.text } : result.text,
 					});
-				}
-				ordered.sort((a, b) => a.index - b.index || a.sequence - b.sequence);
-				history.push(...ordered.map((item) => item.step));
-			} else if (message.role === "user") {
-				flushToolResults();
-				const text = message.contentText || "";
-				if (text) {
-					history.push({ type: "user_input", content: text });
-					replayedInjectionMessageIds.push(...historyInputMessageIds([message], [text]));
-				}
-			} else {
-				flushToolResults();
-				const blocks = Array.isArray(message.contentJson)
-					? (message.contentJson as Array<{ type?: string; text?: string }>)
-					: [];
-				const text = modelTextFromContentBlocks(blocks) || message.contentText || "";
-				if (text) {
-					history.push({ type: "user_input", content: text });
-					replayedInjectionMessageIds.push(...historyInputMessageIds([message], [text]));
+				continue;
+			}
+			const searches = turn.items.filter((item) => item.kind === "web_search");
+			// Searches ran on another provider; the model only learns of them as context.
+			if (searches.length)
+				history.push({ type: "user_input", content: searches.map(webSearchSummary).join("\n") });
+			// A call's signature rides on a thought step; one already carried by a thought
+			// is not repeated.
+			const seenSignatures = new Set<string>();
+			for (const item of turn.items) {
+				if (item.kind === "reasoning") {
+					const gemini = (item.credentials.gemini ?? {}) as {
+						thoughtSignature?: unknown;
+						stepId?: unknown;
+					};
+					const signature =
+						item.sameSource && typeof gemini.thoughtSignature === "string"
+							? gemini.thoughtSignature
+							: undefined;
+					if (signature) seenSignatures.add(signature);
+					history.push({
+						type: "thought",
+						...(item.sameSource && typeof gemini.stepId === "string" ? { id: gemini.stepId } : {}),
+						...(signature ? { signature } : {}),
+						...(item.text ? { summary: [{ type: "text", text: item.text }] } : {}),
+					});
+				} else if (item.kind === "text") {
+					history.push({ type: "model_output", content: item.text });
+				} else if (item.kind === "tool_call") {
+					const signature = item.signature?.sameSource ? item.signature.value : undefined;
+					if (signature && !seenSignatures.has(signature)) {
+						seenSignatures.add(signature);
+						history.push({ type: "thought", signature });
+					}
+					history.push({
+						type: "function_call",
+						id: item.wireId,
+						name: item.name,
+						arguments: item.input,
+					});
 				}
 			}
 		}
-
-		return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
+		return history;
 	}
 
 	private async *parseSSEStream(
@@ -1430,10 +1368,6 @@ function extractArgsAndSignature(input: unknown): {
 		signature: typeof signature === "string" ? signature : undefined,
 		signatureSource: typeof signatureSource === "string" ? signatureSource : undefined,
 	};
-}
-
-function numericOutputIndex(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {

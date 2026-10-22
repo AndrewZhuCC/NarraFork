@@ -926,8 +926,9 @@ describe("Gemini Interactions API provider", () => {
 			"gemini-test:model",
 		);
 
-		expect(rebuilt.history).toEqual(pushed);
-		expect(rebuilt.trailingToolResults).toEqual([
+		// The rebuild ends with the result the live request appends separately.
+		expect(rebuilt.history).toEqual([
+			...pushed,
 			{
 				type: "function_result",
 				call_id: "call_roundtrip",
@@ -935,6 +936,7 @@ describe("Gemini Interactions API provider", () => {
 				result: "file contents",
 			},
 		]);
+		expect(rebuilt.trailingToolResults).toEqual([]);
 	});
 
 	test("lightweight generation streams Interactions deltas and usage", async () => {

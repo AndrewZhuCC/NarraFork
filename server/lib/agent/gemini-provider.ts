@@ -1,5 +1,4 @@
-import { outputToText } from "@shared/agent-protocol/tool-output";
-import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -13,6 +12,7 @@ import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
+import { type NeutralTurn, projectHistory, webSearchSummary } from "./projection";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -221,10 +221,22 @@ export class GeminiProvider implements ProviderAdapter {
 
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
+		model: string,
+		narratorId?: string,
 	): Promise<BuiltHistory> {
-		return this.buildGeminiHistory(dbMessages);
+		const projected = await projectHistory(
+			dbMessages,
+			{
+				strict: hasCredentialBoundReasoning(parseModelId(model).model),
+				reasoningSource: this.getActiveReasoningSource(),
+			},
+			narratorId,
+		);
+		return {
+			history: this.geminiWireHistory(projected.turns),
+			trailingToolResults: [],
+			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
+		};
 	}
 
 	injectSystemPrompt(
@@ -631,168 +643,71 @@ export class GeminiProvider implements ProviderAdapter {
 		return { text, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
-	private buildGeminiHistory(dbMessages: DbMessage[]): {
-		history: GeminiHistoryItem[];
-		trailingToolResults: GeminiToolResult[];
-		replayedInjectionMessageIds: string[];
-	} {
-		const topLevel = dbMessages.filter(
-			(m) =>
-				!m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
-		);
-
-		// Drop the last user message — it is sent as the current message.
-		if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-			topLevel.pop();
-		}
-
+	/**
+	 * Second projection stage for generateContent: neutral turns → contents.
+	 *
+	 * functionResponse parts carry no call id, so results pair with calls by name and
+	 * order; the first stage emits both in call order.
+	 */
+	private geminiWireHistory(turns: readonly NeutralTurn[]): GeminiHistoryItem[] {
 		const history: GeminiHistoryItem[] = [];
-		const replayedInjectionMessageIds: string[] = [];
-		let pendingToolResults: GeminiToolResult[] = [];
-
-		const flushToolResults = () => {
-			if (pendingToolResults.length > 0) {
+		for (const turn of turns) {
+			if (turn.kind === "input") {
+				for (const item of turn.items) {
+					const parts = geminiUserParts(
+						item.text,
+						item.images.flatMap((image) => (image ? [image] : [])),
+					);
+					if (parts.length) history.push({ role: "user", parts });
+				}
+				continue;
+			}
+			if (turn.kind === "tool_results") {
 				history.push({
 					role: "user",
-					parts: pendingToolResults.map((tr) => ({
-						functionResponse: { name: tr.name, response: tr.response },
+					parts: turn.results.map((result) => ({
+						functionResponse: {
+							name: result.name,
+							response: result.isError ? { error: result.text } : { output: result.text },
+						},
 					})),
 				});
-				pendingToolResults = [];
+				continue;
 			}
-		};
-
-		for (const msg of topLevel) {
-			if (msg.role === "assistant") {
-				flushToolResults();
-
-				const content = Array.isArray(msg.contentJson)
-					? (msg.contentJson as Array<Record<string, unknown>>)
-					: [];
-				const completedCalls =
-					msg.toolCalls?.filter((call) => call.status === "success" || call.status === "fail") ??
-					[];
-				const callsById = new Map(completedCalls.map((call) => [call.toolUseId, call]));
-				const seenCalls = new Set<string>();
-				const ordered: Array<{ index: number; sequence: number; part: GeminiPart }> = [];
-				let sequence = 0;
-				const currentSource = this.getActiveReasoningSource();
-				for (const block of content) {
-					const index = numericOutputIndex(block.outputIndex);
-					if (block.type === "reasoning" && typeof block.text === "string" && block.text) {
-						const metadata = block.providerMetadata as
-							| import("./types").ReasoningProviderMetadata
-							| undefined;
-						const signature = extractThoughtSignature(metadata, currentSource);
-						ordered.push({
-							index: index ?? Number.MAX_SAFE_INTEGER - 2,
-							sequence: sequence++,
-							part: {
-								text: block.text,
-								thought: true,
-								...(signature ? { thoughtSignature: signature } : {}),
-							},
-						});
-					} else if (block.type === "text" && typeof block.text === "string" && block.text) {
-						ordered.push({
-							index: index ?? Number.MAX_SAFE_INTEGER - 1,
-							sequence: sequence++,
-							part: { text: block.text },
-						});
-					} else if (block.type === "tool_use") {
-						const toolUseId =
-							typeof block.id === "string"
-								? block.id
-								: typeof block.toolUseId === "string"
-									? block.toolUseId
-									: undefined;
-						const call = toolUseId ? callsById.get(toolUseId) : undefined;
-						if (!call) continue;
-						seenCalls.add(call.toolUseId);
-						this.toolUseIdToName.set(call.toolUseId, call.toolName);
-						const { args, signature, signatureSource } = extractArgsAndSignature(
-							block.input ?? call.inputJson,
-						);
-						const source =
-							typeof block.thoughtSignatureSource === "string"
-								? block.thoughtSignatureSource
-								: signatureSource;
-						const replaySignature = signatureSourcesCompatible(source, currentSource)
-							? typeof block.thoughtSignature === "string"
-								? block.thoughtSignature
-								: signature
+			const searches = turn.items.filter((item) => item.kind === "web_search");
+			// Searches ran on another provider; the model only learns of them as context.
+			if (searches.length)
+				history.push({
+					role: "user",
+					parts: [{ text: searches.map(webSearchSummary).join("\n") }],
+				});
+			const parts: GeminiPart[] = [];
+			for (const item of turn.items) {
+				if (item.kind === "reasoning") {
+					if (!item.text) continue;
+					const gemini = item.credentials.gemini as { thoughtSignature?: unknown } | undefined;
+					const signature =
+						item.sameSource && typeof gemini?.thoughtSignature === "string"
+							? gemini.thoughtSignature
 							: undefined;
-						ordered.push({
-							index: index ?? Number.MAX_SAFE_INTEGER,
-							sequence: sequence++,
-							part: {
-								functionCall: { name: call.toolName, args },
-								...(replaySignature ? { thoughtSignature: replaySignature } : {}),
-							},
-						});
-					}
-				}
-				if (!content.some((block) => block.type === "text") && msg.contentText) {
-					ordered.push({
-						index: Number.MAX_SAFE_INTEGER - 1,
-						sequence: sequence++,
-						part: { text: msg.contentText },
+					parts.push({
+						text: item.text,
+						thought: true,
+						...(signature ? { thoughtSignature: signature } : {}),
 					});
-				}
-				for (const call of completedCalls) {
-					if (seenCalls.has(call.toolUseId)) continue;
-					this.toolUseIdToName.set(call.toolUseId, call.toolName);
-					const { args, signature, signatureSource } = extractArgsAndSignature(call.inputJson);
-					const replaySignature = signatureSourcesCompatible(signatureSource, currentSource)
-						? signature
-						: undefined;
-					ordered.push({
-						index: Number.MAX_SAFE_INTEGER,
-						sequence: sequence++,
-						part: {
-							functionCall: { name: call.toolName, args },
-							...(replaySignature ? { thoughtSignature: replaySignature } : {}),
-						},
+				} else if (item.kind === "text") {
+					parts.push({ text: item.text });
+				} else if (item.kind === "tool_call") {
+					this.toolUseIdToName.set(item.wireId, item.name);
+					parts.push({
+						functionCall: { name: item.name, args: item.input },
+						...(item.signature?.sameSource ? { thoughtSignature: item.signature.value } : {}),
 					});
-				}
-				ordered.sort((left, right) => left.index - right.index || left.sequence - right.sequence);
-				const parts = ordered.map((item) => item.part);
-				if (parts.length === 0) continue;
-				history.push({ role: "model", parts });
-
-				// Collect tool results for the following user turn.
-				if (msg.toolCalls) {
-					for (const tc of msg.toolCalls) {
-						if (tc.status === "success" || tc.status === "fail") {
-							const outputText = outputToText(tc.outputJson);
-							pendingToolResults.push({
-								name: tc.toolName,
-								response: tc.status === "fail" ? { error: outputText } : { output: outputText },
-							});
-						}
-					}
-				}
-			} else if (msg.role === "user") {
-				flushToolResults();
-				const text = msg.contentText || "";
-				if (text) {
-					history.push({ role: "user", parts: [{ text }] });
-					replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
-				}
-			} else if (msg.role === "sys") {
-				flushToolResults();
-
-				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-				const text = modelTextFromContentBlocks(content) || msg.contentText || "";
-				// Gemini has no system role in contents; fold as a user turn.
-				if (text) {
-					history.push({ role: "user", parts: [{ text }] });
-					replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 				}
 			}
+			if (parts.length) history.push({ role: "model", parts });
 		}
-
-		return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
+		return history;
 	}
 
 	private async *parseSSEStream(
@@ -1378,10 +1293,6 @@ function extractArgsAndSignature(input: unknown): {
 		signature: typeof signature === "string" ? signature : undefined,
 		signatureSource: typeof signatureSource === "string" ? signatureSource : undefined,
 	};
-}
-
-function numericOutputIndex(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 let geminiToolIdCounter = 0;

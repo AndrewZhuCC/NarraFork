@@ -3,10 +3,7 @@ import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
 import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
-import {
-	type FileReferenceProjectionOptions,
-	projectFileReferencesForModel,
-} from "./file-reference-projection";
+import { projectFileReferencesForModel } from "./file-reference-projection";
 import { isRetryableError } from "./loop";
 import {
 	type BuiltHistory,
@@ -94,7 +91,7 @@ export async function buildHistory(
 	// callers resolve the provider before calling, so there is nothing to guess.
 	provider: string,
 	narratorId?: string,
-	options?: FileReferenceProjectionOptions & {
+	options?: {
 		/**
 		 * Loading state the request's `tools` array is built from, and the strategy
 		 * resolved for this model. Tool loads inside the history are rendered for it.
@@ -115,7 +112,6 @@ export async function buildHistory(
 	// a source file are data and must not be rewritten by the citation sanitizer.
 	const cleanedMessages = projectFileReferencesForModel(
 		stripCitationMarkersForModel(modelMessages),
-		options,
 	);
 	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
 	// which only breaks once several turns accumulate: the replayed history then

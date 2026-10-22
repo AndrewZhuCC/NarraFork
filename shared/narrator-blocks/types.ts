@@ -242,6 +242,10 @@ export function isModelVisible(block: CanonicalBlock): boolean {
 		case "tool":
 			return block.phase === "done";
 		case "input":
+			return (
+				block.phase === "done" &&
+				(!!block.modelText || block.payload.parts.some((part) => part.type === "image"))
+			);
 		case "context":
 			return block.phase === "done" && !!block.modelText;
 	}

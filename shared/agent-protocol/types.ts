@@ -189,11 +189,16 @@ export interface DbToolCall {
 	status: string;
 }
 
+/**
+ * A complete model history: every persisted row, the latest input and any tool results
+ * the model has not answered yet included, so a request needs no separate current turn
+ * for persisted content.
+ */
 export interface BuiltHistory {
 	history: unknown[];
+	/** Always empty: trailing tool results ride in `history`. Kept for adapter compatibility. */
 	trailingToolResults: unknown[];
-	trailingUserText?: string;
-	/** Persisted input rows actually emitted into history, not lifted into current input. */
+	/** Persisted input rows emitted into history (delivery receipts, de-duplication). */
 	replayedInjectionMessageIds?: readonly string[];
 }
 

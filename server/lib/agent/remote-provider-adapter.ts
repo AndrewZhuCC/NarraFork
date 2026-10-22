@@ -12,12 +12,13 @@ import type {
 	ProviderOperation,
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
-import { historyInputMessageIds } from "@shared/native-injection";
+import { parseModelId } from "@shared/model-id";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
+import { type NeutralTurn, projectHistory, type ResolvedImage } from "./projection";
 import type {
 	BuiltHistory,
 	ChatParams,
 	DbMessage,
-	DbToolCall,
 	GenerateMetaResult,
 	GenerateOptions,
 	ParsedStreamEvent,
@@ -134,52 +135,125 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
+		model: string,
+		narratorId?: string,
 	): Promise<BuiltHistory> {
+		const projected = await projectHistory(
+			dbMessages,
+			{
+				strict: hasCredentialBoundReasoning(parseModelId(model).model),
+				reasoningSource: this.activeReasoningSource,
+			},
+			narratorId,
+		);
+		return {
+			history: this.remoteWireHistory(projected.turns),
+			trailingToolResults: [],
+			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
+		};
+	}
+
+	/** Second projection stage for plugin providers: neutral turns → the canonical DTO. */
+	private remoteWireHistory(turns: readonly NeutralTurn[]): ProviderMessage[] {
 		const history: ProviderMessage[] = [];
-		const replayedInjectionMessageIds: string[] = [];
-		let pendingToolResults: ProviderContentBlock[] = [];
-
-		for (const message of dbMessages) {
-			if (message.role === "disp") continue;
-			const role = canonicalRole(message.role);
-			if (!role) continue;
-
-			if (role === "assistant") {
-				if (pendingToolResults.length > 0) {
-					history.push({ role: "tool", content: pendingToolResults });
-					pendingToolResults = [];
+		const source = this.activeReasoningSource;
+		const image = (resolved: ResolvedImage): ProviderContentBlock => ({
+			type: "image",
+			mediaType: resolved.mediaType,
+			dataBase64: resolved.base64,
+		});
+		for (const turn of turns) {
+			if (turn.kind === "input") {
+				for (const item of turn.items) {
+					const content = orderUserContent(
+						item.text,
+						item.images.flatMap((resolved) => (resolved ? [resolved] : [])),
+						"after",
+					).map(
+						(part): ProviderContentBlock =>
+							part.type === "text" ? { type: "text", text: part.text } : image(part.image),
+					);
+					if (content.length) history.push({ role: "user", content });
 				}
-				const content = canonicalAssistantContent(message, this.activeReasoningSource);
-				if (content.length > 0) history.push({ role, content });
-				pendingToolResults = [
-					...pendingToolResults,
-					...canonicalToolResults(message.toolCalls ?? []),
-				];
 				continue;
 			}
-
-			if (pendingToolResults.length > 0) {
-				history.push({ role: "tool", content: pendingToolResults });
-				pendingToolResults = [];
+			if (turn.kind === "tool_results") {
+				history.push({
+					role: "tool",
+					content: turn.results.map((result) => ({
+						type: "tool_result",
+						toolUseId: result.wireId,
+						name: result.name,
+						content: [{ type: "text", text: result.text }, ...result.images.map(image)],
+						isError: result.isError,
+					})),
+				});
+				continue;
 			}
-
-			const content = canonicalMessageContent(message, role, this.activeReasoningSource);
-			if (content.length > 0) {
-				history.push({ role, content });
-				const texts = content.flatMap((block) =>
-					block.type === "text" && typeof block.text === "string" ? [block.text] : [],
-				);
-				replayedInjectionMessageIds.push(...historyInputMessageIds([message], texts));
+			const content: ProviderContentBlock[] = [];
+			for (const item of turn.items) {
+				switch (item.kind) {
+					case "text":
+						content.push({ type: "text", text: item.text });
+						break;
+					case "reasoning": {
+						const plugin = item.credentials.plugin;
+						const continuation = isCanonicalReasoningMetadata(plugin)
+							? compatibleContinuation(plugin, source)
+							: undefined;
+						if (item.text || continuation)
+							content.push({
+								type: "reasoning",
+								text: item.text,
+								...(continuation ? { continuation } : {}),
+							});
+						break;
+					}
+					case "redacted_reasoning":
+						content.push({
+							type: "redacted_reasoning",
+							data: item.data,
+							...(item.sameSource ? { source } : {}),
+						});
+						break;
+					case "tool_call":
+						content.push({
+							type: "tool_call",
+							toolUseId: item.wireId,
+							name: item.name,
+							input: cloneJson(item.input as JsonObject),
+							...(item.signature?.sameSource
+								? {
+										continuation: {
+											source,
+											format: "tool-continuation",
+											data: item.signature.value,
+										},
+									}
+								: {}),
+						});
+						break;
+					case "web_search":
+						content.push({
+							type: "web_search",
+							id: item.wireId,
+							...(item.query ? { query: item.query } : {}),
+							...(item.queries ? { queries: item.queries } : {}),
+						});
+						break;
+					case "image_generation":
+						content.push({
+							type: "image_generation",
+							id: item.wireId,
+							...(item.result ? { result: item.result } : {}),
+							...(item.revisedPrompt ? { revisedPrompt: item.revisedPrompt } : {}),
+						});
+						break;
+				}
 			}
+			if (content.length) history.push({ role: "assistant", content });
 		}
-
-		return {
-			history,
-			trailingToolResults: pendingToolResults,
-			replayedInjectionMessageIds,
-		};
+		return history;
 	}
 
 	getActiveReasoningSource(): string {
@@ -691,6 +765,34 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		const toolResults = params.toolResults
 			.map(canonicalizeToolResult)
 			.filter(isProviderContentBlock);
+		let currentText = params.content;
+		let currentImages = (params.images ?? []).map((image) => ({
+			mediaType: mediaTypeFor(image.format),
+			dataBase64: image.base64,
+		}));
+		// The projected history already ends with the current turn. Plugins expect it in
+		// `current`, so the trailing user or tool message moves there.
+		if (!currentText && !currentImages.length && !toolResults.length) {
+			const last = history.at(-1);
+			if (last?.role === "tool") {
+				history.pop();
+				toolResults.push(...last.content.filter((block) => block.type === "tool_result"));
+			} else if (last?.role === "user") {
+				history.pop();
+				currentText = last.content
+					.flatMap((block) =>
+						block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+					)
+					.join("");
+				currentImages = last.content.flatMap((block) =>
+					block.type === "image" &&
+					typeof block.mediaType === "string" &&
+					typeof block.dataBase64 === "string"
+						? [{ mediaType: block.mediaType, dataBase64: block.dataBase64 }]
+						: [],
+				);
+			}
+		}
 		return {
 			...(await this.baseParams(params.model)),
 			conversation: {
@@ -712,15 +814,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			request: {
 				history,
 				current: {
-					text: params.content,
-					...(params.images?.length
-						? {
-								images: params.images.map((image) => ({
-									mediaType: mediaTypeFor(image.format),
-									dataBase64: image.base64,
-								})),
-							}
-						: {}),
+					text: currentText,
+					...(currentImages.length ? { images: currentImages } : {}),
 					toolResults,
 				},
 				tools: canonicalTools(params.tools),
@@ -1157,61 +1252,6 @@ function canonicalHistory(history: unknown[], reasoningSource: string): Provider
 				role,
 				content,
 				...(typeof record.messageId === "string" ? { messageId: record.messageId } : {}),
-			},
-		];
-	});
-}
-
-function canonicalMessageContent(
-	message: DbMessage,
-	role: ProviderMessage["role"],
-	reasoningSource: string,
-): ProviderContentBlock[] {
-	const blocks = Array.isArray(message.contentJson)
-		? message.contentJson.flatMap((block) => {
-				const canonical = canonicalizeContentBlock(block, reasoningSource);
-				return canonical ? [canonical] : [];
-			})
-		: [];
-	if (blocks.length > 0) return blocks;
-	if (message.contentText) return [{ type: "text", text: message.contentText }];
-	return role === "assistant" ? [] : [];
-}
-
-function canonicalAssistantContent(
-	message: DbMessage,
-	reasoningSource: string,
-): ProviderContentBlock[] {
-	const content = canonicalMessageContent(message, "assistant", reasoningSource);
-	const seen = new Set(
-		content.flatMap((block) => (block.type === "tool_call" ? [String(block.toolUseId)] : [])),
-	);
-	for (const call of message.toolCalls ?? []) {
-		if (call.status !== "success" && call.status !== "fail") continue;
-		if (seen.has(call.toolUseId)) continue;
-		const input = parseJsonObject(call.inputJson);
-		content.push({
-			type: "tool_call",
-			toolUseId: call.toolUseId,
-			name: call.toolName,
-			input,
-		});
-		seen.add(call.toolUseId);
-	}
-	return content;
-}
-
-function canonicalToolResults(toolCalls: DbToolCall[]): ProviderContentBlock[] {
-	return toolCalls.flatMap((call) => {
-		if (call.status !== "success" && call.status !== "fail") return [];
-		const output = outputText(call.outputJson);
-		return [
-			{
-				type: "tool_result",
-				toolUseId: call.toolUseId,
-				name: call.toolName,
-				content: [{ type: "text", text: output }],
-				isError: call.status === "fail",
 			},
 		];
 	});

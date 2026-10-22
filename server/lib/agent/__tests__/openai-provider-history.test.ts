@@ -173,13 +173,21 @@ describe("native Responses reasoning continuation", () => {
 				],
 				params.model,
 			);
-			expect(stored.history).toEqual(history);
-			for (const replay of [history, stored.history]) {
+			// The rebuild also carries the result the live request appends separately.
+			const liveResults = [provider.formatToolResult(call.call_id, "ok", false)];
+			expect(stored.history).toEqual([
+				...history,
+				{ type: "function_call_output", call_id: call.call_id, output: "ok" },
+			]);
+			for (const [replay, toolResults] of [
+				[history, liveResults],
+				[stored.history, []],
+			] as const) {
 				for await (const _event of provider.chat({
 					...params,
 					content: "",
-					history: replay,
-					toolResults: [provider.formatToolResult(call.call_id, "ok", false)],
+					history: replay as unknown[],
+					toolResults: toolResults as unknown[],
 				})) {
 					/* consume mocked stream */
 				}
@@ -929,7 +937,8 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
 		const historyJson = JSON.stringify(result.history);
-		expect(historyJson).toContain('"role":"developer"');
+		// A user item, not developer: the request's instructions must not change with history.
+		expect(historyJson).not.toContain('"role":"developer"');
 		expect(historyJson).toContain(savedPath);
 		expect(historyJson).toContain('"type":"image_generation_call"');
 		expect(historyJson).toContain('"id":"ig_saved"');
@@ -977,7 +986,9 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
 		expect(result.history).toHaveLength(3);
-		expect(JSON.stringify(result.history[0])).toContain('"id":"msg_remote_3"');
+		// Message item ids never reach the wire (the send path rebuilds the item), so the
+		// projection does not emit them.
+		expect(JSON.stringify(result.history[0])).not.toContain('"id":"msg_remote_3"');
 		expect(JSON.stringify(result.history[0])).toContain("Lead in");
 		expect(JSON.stringify(result.history[1])).toContain('"type":"web_search_call"');
 		expect(JSON.stringify(result.history[2])).toContain("Follow up");
@@ -1038,8 +1049,16 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		);
 		const pushedTrailing = [provider.formatToolResult("call_sync", "file contents", false)];
 
-		expect(pushedHistory).toEqual(rebuilt.history);
-		expect(pushedTrailing).toEqual(rebuilt.trailingToolResults);
+		provider.pushUserTurn(pushedHistory, "", "openai:gpt-5", pushedTrailing);
+		// Ignore the live-only message id; the wire never carries it either.
+		expect(
+			JSON.parse(
+				JSON.stringify(pushedHistory, (key, value) =>
+					key === "id" && typeof value === "string" && value.startsWith("msg") ? undefined : value,
+				),
+			),
+		).toEqual(rebuilt.history);
+		expect(rebuilt.trailingToolResults).toEqual([]);
 	});
 
 	test("buildHistory replays persisted user images from the message owner narrator", async () => {

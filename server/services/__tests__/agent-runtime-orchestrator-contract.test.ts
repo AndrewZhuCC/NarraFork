@@ -191,6 +191,23 @@ const profiles: Shape[] = [
 		parentToolUseId: "origin-agent",
 	},
 ];
+/**
+ * Everything one pass gives the model: its history, where a persisted input now lives,
+ * and the current text no row carries. Strings only, so JSON escaping cannot interfere.
+ */
+function modelInputText(options: Pick<ExecuteLoopOptions, "history" | "userText"> | undefined) {
+	const strings: string[] = [];
+	const visit = (value: unknown): void => {
+		if (typeof value === "string") strings.push(value);
+		else if (Array.isArray(value)) for (const entry of value) visit(entry);
+		else if (value && typeof value === "object")
+			for (const entry of Object.values(value)) visit(entry);
+	};
+	visit(options?.history);
+	strings.push(options?.userText ?? "");
+	return strings.join("\n");
+}
+
 function fixture(
 	profile: Shape,
 	script: Array<ExecuteLoopResult | ((options: ExecuteLoopOptions) => Promise<ExecuteLoopResult>)>,
@@ -562,13 +579,11 @@ describe("real shared orchestrator profile contract", () => {
 					},
 					async (options) => {
 						expect(existsSync(spillPath)).toBe(false);
-						if (references) expect(options.userText).toContain(snapshot.snapshotText);
+						if (references) expect(modelInputText(options)).toContain(snapshot.snapshotText);
 						if (official) {
-							// Official provider: the snapshot is the current input exactly once,
-							// never a second copy in history; the trailing sys row is kept.
-							expect(options.userText.split(snapshot.snapshotText).length).toBe(2);
-							const history = JSON.stringify(options.history);
-							expect(history).not.toContain(snapshot.snapshotText);
+							// Official provider: the snapshot reaches the model exactly once, in the
+							// persisted input row; the trailing sys row is kept.
+							expect(modelInputText(options).split(snapshot.snapshotText).length).toBe(2);
 							// Official semantics: the trailing sys row stays a system message in history.
 							expect(options.history).toEqual(
 								expect.arrayContaining([
@@ -1045,7 +1060,7 @@ describe("real shared orchestrator profile contract", () => {
 				},
 				async (options) => {
 					expect(options.config.userId).toBe(scenario.recipient);
-					expect(options.userText).toContain(feedback);
+					expect(modelInputText(options)).toContain(feedback);
 					order.push("feedback-before-next-tool");
 					const message = db
 						.select()
@@ -1282,7 +1297,7 @@ describe("real shared orchestrator profile contract", () => {
 				h.runControl.wake?.("input");
 				expect((await run).hasError).toBe(false);
 				expect(h.calls).toHaveLength(2);
-				expect(h.calls[1].userText).toContain("manual resume");
+				expect(modelInputText(h.calls[1])).toContain("manual resume");
 				expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
 			} finally {
 				await endRun(h, run);
@@ -1316,7 +1331,7 @@ describe("real shared orchestrator profile contract", () => {
 				const result = await run;
 				expect(result.hasError).toBe(false);
 				expect(h.calls).toHaveLength(2);
-				expect(h.calls[1].userText).toContain("after stop");
+				expect(modelInputText(h.calls[1])).toContain("after stop");
 			} finally {
 				await endRun(h, run);
 			}
@@ -1354,7 +1369,7 @@ describe("real shared orchestrator profile contract", () => {
 				setRunHold(fixtureRun.session.narratorId, { released: true });
 				fixtureRun.runControl.wake?.("input");
 				expect((await run).hasError).toBe(false);
-				expect(fixtureRun.calls.at(-1)?.userText).toContain("after backoff stop");
+				expect(modelInputText(fixtureRun.calls.at(-1))).toContain("after backoff stop");
 			} finally {
 				await endRun(fixtureRun, run);
 			}
@@ -1390,7 +1405,7 @@ describe("real shared orchestrator profile contract", () => {
 					return { ...finished, completedNaturally: false, hadToolUses: true };
 				},
 				async (options) => {
-					expect(options.userText).toContain("urgent input");
+					expect(modelInputText(options)).toContain("urgent input");
 					// Each pass gets a fresh urgent channel.
 					expect(options.config.urgentGuidanceSignal?.aborted).toBe(false);
 					return finished;
@@ -1499,11 +1514,14 @@ for (const profile of profiles) {
 				throw new Error("Real keyword lookup did not persist a knowledge hit");
 			const projected = projectMessageSenderText(knowledge, knowledge.contentText);
 			expect(projected).toStartWith('<sender kind="system" />\n');
-			expect(h.calls[0].userText).toStartWith(
-				'<sender kind="human" id="principal-a" name="principal-a" />\n',
+			// The request and its knowledge hit are both persisted rows the history carries.
+			expect(h.calls[0].userText).toBe("");
+			const input = modelInputText(h.calls[0]);
+			expect(input).toContain(
+				`<sender kind="human" id="principal-a" name="principal-a" />\n${request}`,
 			);
-			expect(h.calls[0].userText).toContain(`\n\n${projected}`);
-			expect(h.calls[0].userText.match(/<sender kind="system"/g)).toHaveLength(1);
+			expect(input).toContain(projected);
+			expect(input.match(/<sender kind="system"/g)).toHaveLength(1);
 			expect(knowledge.contentText).not.toContain("<sender ");
 			const rebuilt = await buildRuntimeHistory({
 				narratorId: h.session.narratorId,
@@ -1511,7 +1529,8 @@ for (const profile of profiles) {
 				provider: "orchestratorfixture",
 				sourceMessages: rawMessages,
 			});
-			expect(JSON.stringify(rebuilt.history)).toContain(JSON.stringify(projected).slice(1, -1));
+			// Live and rebuilt requests carry the same bytes.
+			expect(rebuilt.history).toEqual(h.calls[0].history);
 			expect(h.session._currentUserId).toBe("principal-a");
 		} finally {
 			settings.knowledge.injectMode = previousMode;

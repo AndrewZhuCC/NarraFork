@@ -417,7 +417,8 @@ describe("model input adoption boundary", () => {
 			],
 			"history-probe-model",
 		);
-		expect(initial.trailingToolResults).toHaveLength(1);
+		// Tool results are part of the projected history, never a separate trailing list.
+		expect(initial.trailingToolResults).toEqual([]);
 		expect(rebuilt.trailingToolResults).toEqual([]);
 		let switched = false;
 		const requests = await runHistoryInput(
@@ -452,7 +453,7 @@ describe("model input adoption boundary", () => {
 			[completedHistoryTool("newly-completed", "newly-completed", "newly-completed")],
 			"history-probe-model",
 		);
-		expect(rebuilt.trailingToolResults).toHaveLength(1);
+		expect(rebuilt.trailingToolResults).toEqual([]);
 		let switched = false;
 		const requests = await runHistoryInput(
 			format,

@@ -12,8 +12,8 @@ function prepared(): runtimeHistory.PreparedRuntimeHistory {
 		replayedInjectionMessageIds: [],
 		currentText: "",
 		currentInputText: "",
-		isPureToolResultReplay: false,
-		recoveredTrailingUserText: null,
+		currentInputPersisted: false,
+		endsWithToolResults: false,
 	};
 }
 function hooks(signal: AbortSignal) {

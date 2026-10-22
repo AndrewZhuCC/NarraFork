@@ -15,6 +15,8 @@ export interface ExecuteLoopOptions {
 	userText: string;
 	history: unknown[];
 	trailingToolResults?: unknown[];
+	/** The history ends with tool results the model has not answered yet. */
+	startedWithToolResults?: boolean;
 	images?: Array<{ format: string; base64: string }>;
 	eventContext: EventHandlerContext;
 	hooks?: EventHooks;
@@ -133,6 +135,8 @@ export async function executeAgentLoop(
 	sourceOptions?: ExecuteLoopSourceOptions,
 ): Promise<ExecuteLoopResult> {
 	const { config, userText, history, trailingToolResults, images, eventContext, hooks } = options;
+	const startedWithToolResults =
+		options.startedWithToolResults ?? (trailingToolResults?.length ?? 0) > 0;
 	config.requireToolCallBinding = true;
 	eventContext.requireToolCallBinding = true;
 	// Read the active pass's mutable default only when a new text block starts.
@@ -161,7 +165,6 @@ export async function executeAgentLoop(
 	let interruptionError: string | undefined;
 	let interruptionDiagnostics: ApiRequestDiagnostics | undefined;
 	let maxTurnsExceeded = false;
-	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
 	let lastAssistantHadToolUses = false;
 	let hadToolUses = false;

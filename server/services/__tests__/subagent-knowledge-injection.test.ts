@@ -503,6 +503,17 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			}
 			expect(requests).toHaveLength(drainInExecutor ? 2 : 1);
 			const request = requests[requests.length - 1];
+			// The queued message and its hint are persisted rows: the history carries both.
+			expect(request.userText).toBe("");
+			const strings: string[] = [];
+			const visit = (value: unknown): void => {
+				if (typeof value === "string") strings.push(value);
+				else if (Array.isArray(value)) for (const entry of value) visit(entry);
+				else if (value && typeof value === "object")
+					for (const entry of Object.values(value)) visit(entry);
+			};
+			visit(request.history);
+			const historyText = strings.join("\n");
 			const rows = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			expect(rows.find((row) => row.role === "user")?.contentText).toBe(text);
 			const hint = rows.find((row) => row.role === "sys");
@@ -510,21 +521,20 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 				expect(hint?.contentText).toContain(secretEntryId);
 				expect(hint?.parentToolUseId).toBe(toolUseId);
 				expect(hint?.contentText).not.toContain("<sender");
-				if (officialApi) {
-					expect(request.userText).toContain(modelText);
-					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
-				} else {
-					// The hint and the queued message both join the current turn, once each.
-					expect(request.userText).toContain(modelText);
-					expect(request.userText).toContain(hint?.contentText ?? "");
-					expect(JSON.stringify(request.history)).not.toContain(secretEntryId);
-					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
-				}
+				expect(historyText).toContain(modelText);
+				expect(historyText).toContain(hint?.contentText ?? "");
+				expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
+				// Official endpoints take the hint as a system message; compatible ones as input.
+				const hintMessage = (request.history as Array<{ role: string }>).find((message) =>
+					JSON.stringify(message).includes(secretEntryId),
+				);
+				expect(hintMessage?.role).toBe(officialApi ? "system" : "user");
 				expect(JSON.stringify(request).match(/Relevant knowledge-base entries/g)).toHaveLength(1);
 			} else {
-				// A denied/no-hit scan must not invent current-turn text or replay old input.
+				// A denied/no-hit scan must not invent input or replay old input.
 				expect(hint).toBeUndefined();
-				expect(request.userText).toBe(modelText);
+				expect(historyText).toContain(modelText);
+				expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
 				expect(JSON.stringify(request)).not.toContain(secretEntryId);
 			}
 		} finally {
@@ -533,7 +543,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 		}
 	}
 
-	test("compatible Anthropic carries the new sys hint and buffered message into the current turn", () =>
+	test("compatible Anthropic carries the new sys hint and buffered message as the latest input", () =>
 		resumeBufferedMessage(false, SECRET_KW, true));
 
 	test("the executor's own pass-restart drain also carries the extracted hint", () =>

@@ -161,7 +161,7 @@ describe("RemoteProviderAdapter", () => {
 				},
 			],
 			contentText: "done",
-			parentToolUseId: "parent-secret",
+			parentToolUseId: null,
 			messageUuid: "uuid-secret",
 			toolCalls: [
 				{
@@ -176,17 +176,21 @@ describe("RemoteProviderAdapter", () => {
 
 		const result = await adapter.buildHistory([message], "remote:model-1");
 		const serialized = JSON.stringify(result);
-		expect(result.history).toHaveLength(1);
+		expect(result.history).toHaveLength(2);
 		expect(result.history[0]).toMatchObject({ role: "assistant" });
-		expect(result.trailingToolResults).toEqual([
-			{
-				type: "tool_result",
-				toolUseId: "call-1",
-				name: "Read",
-				content: [{ type: "text", text: "contents" }],
-				isError: false,
-			},
-		]);
+		expect(result.history[1]).toEqual({
+			role: "tool",
+			content: [
+				{
+					type: "tool_result",
+					toolUseId: "call-1",
+					name: "Read",
+					content: [{ type: "text", text: "contents" }],
+					isError: false,
+				},
+			],
+		});
+		expect(result.trailingToolResults).toEqual([]);
 		expect(serialized).not.toContain("db-secret-id");
 		expect(serialized).not.toContain("narrator-secret");
 		expect(serialized).not.toContain("should-not-cross-rpc");
