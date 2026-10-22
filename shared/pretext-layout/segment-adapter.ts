@@ -198,7 +198,20 @@ export interface AdapterContentBlock {
 	[key: string]: unknown;
 }
 
+/** One block of a message in the block-keyed protocol: its id and its elements `[from, to)`. */
+export interface AdapterBlockRef {
+	id: string;
+	from: number;
+	to: number;
+}
+
 export interface AdapterMessage {
+	/**
+	 * The message's blocks, when it arrived in the block-keyed protocol: its elements are
+	 * then keyed by block id (`elementKey`), so a row keeps its key when blocks before it
+	 * are deleted or inserted.
+	 */
+	blockRefs?: readonly AdapterBlockRef[];
 	/** Actual per-message identity; absent legacy identity must not enable GPT parsing. */
 	model?: string | null;
 	provider?: string | null;
@@ -1489,7 +1502,7 @@ function adaptContextBlocks(
 	for (let index = 0; index < blocks.length; index++) {
 		const block = blocks[index];
 		if (!block || owned.has(index) || block.type !== "text" || !block.text?.trim()) continue;
-		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: block.text });
+		specs.push({ kind: "markdown", key: `${elementKey(idBase, msg, index)}`, data: block.text });
 	}
 	return specs;
 }
@@ -1602,6 +1615,29 @@ function longSingleReasoningStep(key: string, text: string): ReasoningSegment[] 
 	return [{ title: probe.title, body, isEmpty: body.length === 0 || body === "<!-- -->" }];
 }
 
+/**
+ * The key base of a message's element `index`. A message from the block-keyed protocol
+ * keys it by its block — `${idBase}-blk[<blockId>]`, plus `+<offset>` for a later element
+ * of a multi-element block — so the key stays put when blocks before it come or go
+ * (docs/BLOCK_STORAGE-DESIGN.md §8.3). Otherwise it is the positional `${idBase}-b<index>`.
+ * Block ids hold no `[` or `]`, so the id is recoverable from the key
+ * (`blockIdFromElementKey`).
+ */
+export function elementKey(idBase: string, msg: AdapterMessage, index: number): string {
+	const block = msg.blockRefs?.find((ref) => index >= ref.from && index < ref.to);
+	if (!block) return `${idBase}-b${index}`;
+	const offset = index - block.from;
+	return `${idBase}-blk[${block.id}]${offset ? `+${offset}` : ""}`;
+}
+
+const ELEMENT_BLOCK_TOKEN = /-blk\[([^\]]+)\](?:\+(\d+))?/;
+
+/** The block id and element offset an `elementKey` names; null for a positional key. */
+export function blockIdFromElementKey(key: string): { blockId: string; offset: number } | null {
+	const match = ELEMENT_BLOCK_TOKEN.exec(key);
+	return match ? { blockId: match[1], offset: match[2] ? Number(match[2]) : 0 } : null;
+}
+
 function adaptMessage(
 	msg: AdapterMessage,
 	visibleBlockIndices: number[] | undefined,
@@ -1687,7 +1723,7 @@ function adaptMessage(
 		const reviewBlockIndex = blocks.findIndex((b) => b.type === "review_feedback");
 		if (reviewBlockIndex >= 0 && !blocks.some((b) => b.type === "system_injection")) {
 			const reviewBlock = blocks[reviewBlockIndex];
-			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, ctx)];
+			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, msg, ctx)];
 		}
 		// Send deliveries keep role=user for the model, but their structured block owns
 		// the reader-facing identity. Match it BEFORE origin erases that structure.
@@ -1729,7 +1765,7 @@ function adaptMessage(
 			return [
 				{
 					kind: "injection-bubble",
-					key: `${idBase}-b0-m-legacy`,
+					key: `${elementKey(idBase, msg, 0)}-m-legacy`,
 					data: {
 						markdown: rawSideCarToMarkdown(text),
 						speaker: originHeadingLabel(ctx, msg.origin, msg.originLabel),
@@ -1860,7 +1896,7 @@ function adaptMessage(
 			return [
 				{
 					kind: "system-simple",
-					key: `${idBase}-b${snapshotIndex}`,
+					key: `${elementKey(idBase, msg, snapshotIndex)}`,
 					data: {
 						kind: "publication_result",
 						text: "",
@@ -1935,7 +1971,7 @@ function adaptMessage(
 		if (!block) continue;
 		const kind = classifyContentBlock(block);
 		if (kind === null) continue;
-		const key = `${idBase}-b${bi}`;
+		const key = `${elementKey(idBase, msg, bi)}`;
 		if (kind === "reasoning") {
 			const reasoningBlocks = [block];
 			let nextPosition = position + 1;
@@ -2485,6 +2521,7 @@ function adaptReviewCard(
 	block: AdapterContentBlock,
 	idBase: string,
 	blockIndex: number,
+	msg: AdapterMessage,
 	ctx: AdapterContext,
 ): ElementSpec {
 	const verdict = reviewVerdict(block);
@@ -2493,7 +2530,7 @@ function adaptReviewCard(
 		kind: "review-card",
 		// `-b{blockIndex}` ties the row to its content block, so the selection system can
 		// address it for the context menu (delete / rollback / fork).
-		key: `${idBase}-b${blockIndex}-review`,
+		key: `${elementKey(idBase, msg, blockIndex)}-review`,
 		data: {
 			text: composeReviewFeedbackText(block, ctx),
 			verdictLabel: sysLabel(ctx, `reviewVerdict_${verdict}`),
@@ -2680,7 +2717,7 @@ function adaptFramedSystemCard(
 			kind: "injection-bubble",
 			// `-b{blockIndex}` ties the row to its single content block, so the selection
 			// system can address it for the context menu (delete / rollback / fork).
-			key: `${idBase}-b${blockIndex}-f-${kind}`,
+			key: `${elementKey(idBase, msg, blockIndex)}-f-${kind}`,
 			data: {
 				payload: {
 					kind: "spec-task",
@@ -2704,7 +2741,7 @@ function adaptFramedSystemCard(
 	const inner = adaptSystemBlock(kind, block, idBase, msg, ctx, blockIndex);
 	return {
 		kind: "injection-bubble",
-		key: `${idBase}-b${blockIndex}-f-${kind}`,
+		key: `${elementKey(idBase, msg, blockIndex)}-f-${kind}`,
 		data: {
 			payload: { kind: innerPayloadKind(inner), data: inner.data },
 			source: kind,
@@ -2864,7 +2901,7 @@ function adaptSpokenInjection(
 				// Keyed by block index + SENDER: the block index ties the row to its single
 				// content block so the selection system can address it; the sender keeps the
 				// key stable across a same-block re-projection.
-				key: `${idBase}-b${blockIndex}-m-${message.fromId ?? "anon"}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-m-${message.fromId ?? "anon"}`,
 				data: {
 					...deliveryProjection(msg),
 					markdown: rawSideCarToMarkdown(text),
@@ -2935,7 +2972,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-t-${task.id}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-t-${task.id}`,
 				data: {
 					...deliveryProjection(msg),
 					markdown,
@@ -3010,7 +3047,7 @@ function adaptSpokenInjection(
 		// and key correctness, and relaxing the policy later would silently break it.
 		return substantive.map(({ hit, excerpt }) => ({
 			kind: "injection-bubble" as const,
-			key: `${idBase}-b${blockIndex}-k-${hit.scope === "personal" ? "personal-" : ""}${hit.entryId}`,
+			key: `${elementKey(idBase, msg, blockIndex)}-k-${hit.scope === "personal" ? "personal-" : ""}${hit.entryId}`,
 			data: {
 				...deliveryProjection(msg),
 				// PLAIN text, escaped rather than parsed: the excerpt is prose by
@@ -3089,7 +3126,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-p-${source}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-p-${source}`,
 				data: {
 					...deliveryProjection(msg),
 					payload: {
@@ -3122,7 +3159,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-p-${source}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-p-${source}`,
 				data: {
 					markdown,
 					// No speaker name: the integration layer resolves the shared platform
@@ -3252,7 +3289,7 @@ function adaptSystemBlock(
 	ctx: AdapterContext,
 	blockIndex = 0,
 ): ElementSpec {
-	const keyBase = `${idBase}-b${blockIndex}`;
+	const keyBase = `${elementKey(idBase, msg, blockIndex)}`;
 	// The message's leading text block is the chunk renderer's `contentText`
 	// fallback (goalBlock.task ?? message.contentText, etc.).
 	const contentText =

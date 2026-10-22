@@ -14,12 +14,28 @@ import type { MessageBlockRef } from "./api/types";
 /** Messages remembered at most; the oldest are dropped first. */
 const LIMIT = 20_000;
 const byMessage = new Map<string, MessageBlockRef[]>();
+/** The message each remembered block belongs to. */
+const messageOfBlock = new Map<string, string>();
+
+function forget(messageId: string): void {
+	for (const block of byMessage.get(messageId) ?? [])
+		if (messageOfBlock.get(block.id) === messageId) messageOfBlock.delete(block.id);
+	byMessage.delete(messageId);
+}
 
 /** Record the blocks a decoded message row arrived with (its latest view wins). */
 export function rememberBlockRefs(messageId: string, refs: MessageBlockRef[]): void {
-	byMessage.delete(messageId);
+	forget(messageId);
 	byMessage.set(messageId, refs);
-	if (byMessage.size > LIMIT) byMessage.delete(byMessage.keys().next().value as string);
+	for (const block of refs) messageOfBlock.set(block.id, messageId);
+	if (byMessage.size > LIMIT) forget(byMessage.keys().next().value as string);
+}
+
+/** Where a remembered block starts: its message and the index of its first element. */
+export function blockStart(blockId: string): { messageId: string; from: number } | undefined {
+	const messageId = messageOfBlock.get(blockId);
+	const block = messageId ? byMessage.get(messageId)?.find((ref) => ref.id === blockId) : undefined;
+	return messageId && block ? { messageId, from: block.from } : undefined;
 }
 
 /** The block of `messageId` holding element `index`, when the message was seen in v2. */
@@ -36,4 +52,5 @@ export function onlyBlockOfKind(messageId: string, kind: string): MessageBlockRe
 /** Forget every remembered message (tests). */
 export function clearBlockRefs(): void {
 	byMessage.clear();
+	messageOfBlock.clear();
 }
