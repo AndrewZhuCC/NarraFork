@@ -215,8 +215,10 @@ describe("PostgreSQL baseline", () => {
 				}
 				// The SQL itself must NOT be idempotent: if it were, applying it over an existing
 				// database would silently do nothing and the ledger would be the only guard.
+				// Never committed: a migration that opens with a DROP would otherwise succeed at
+				// that statement before failing, and the catalog read below would see the damage.
 				const rawReplay = await exec(
-					await readFile(`${MIGRATIONS_FOLDER}/${entries.at(-1)?.tag}.sql`, "utf8"),
+					`BEGIN;\n${await readFile(`${MIGRATIONS_FOLDER}/${entries.at(-1)?.tag}.sql`, "utf8")}\n;ROLLBACK;`,
 				);
 				if (rawReplay.code === 0) {
 					problems.push("re-applying the migration SQL succeeded; it is not creating anything");

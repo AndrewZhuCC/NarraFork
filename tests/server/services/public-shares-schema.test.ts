@@ -14,8 +14,9 @@ import { cleanDb, getTestDb } from "../../setup";
 const { db, sqlite } = getTestDb();
 const now = "2026-01-01T00:00:00.000Z";
 
-beforeEach(() => {
-	cleanDb(sqlite);
+type TestDb = ReturnType<typeof getTestDb>["db"];
+
+function seed(db: TestDb): void {
 	db.insert(users)
 		.values({ id: "owner", username: "owner", passwordHash: "x", createdAt: now })
 		.run();
@@ -62,21 +63,42 @@ beforeEach(() => {
 			createdAt: now,
 		})
 		.run();
+}
+
+beforeEach(() => {
+	cleanDb(sqlite);
+	seed(db);
 });
 afterAll(() => sqlite.close());
 
 describe("generated public share schema", () => {
 	test("the generated FK rebuild preserves existing message bodies and references", () => {
-		const before = db.select().from(chatMessages).all();
-		const migration = readFileSync(
-			new URL("../../../drizzle/0163_spooky_mad_thinker.sql", import.meta.url),
-			"utf8",
-		);
-		for (const statement of migration.split("--> statement-breakpoint")) {
-			if (statement.trim()) sqlite.run(statement);
+		// Replayed on today's schema, the rebuild drops every column added after it, which
+		// production never sees (0163 runs before them). So it runs on its own database,
+		// and the comparison covers the columns the rebuild carries.
+		const replay = getTestDb();
+		try {
+			seed(replay.db);
+			const rows = () =>
+				replay.sqlite.query("SELECT * FROM chat_messages").all() as Record<string, unknown>[];
+			const before = rows();
+			const migration = readFileSync(
+				new URL("../../../drizzle/0163_spooky_mad_thinker.sql", import.meta.url),
+				"utf8",
+			);
+			for (const statement of migration.split("--> statement-breakpoint")) {
+				if (statement.trim()) replay.sqlite.run(statement);
+			}
+			const after = rows();
+			const carried = Object.keys(after[0] ?? {});
+			expect(carried).toContain("content_text");
+			expect(after).toEqual(
+				before.map((row) => Object.fromEntries(carried.map((column) => [column, row[column]]))),
+			);
+			expect(replay.sqlite.query("PRAGMA foreign_key_check").all()).toEqual([]);
+		} finally {
+			replay.sqlite.close();
 		}
-		expect(db.select().from(chatMessages).all()).toEqual(before);
-		expect(sqlite.query("PRAGMA foreign_key_check").all()).toEqual([]);
 	});
 
 	test("allows multiple links for one session but never duplicate credentials", () => {
