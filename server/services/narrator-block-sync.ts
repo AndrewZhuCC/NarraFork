@@ -6,8 +6,9 @@
  * additionally carry their blocks (`shared/narrator-blocks/storage.ts` maps one onto the
  * other losslessly). `syncEnvelope` brings the rows in line with the content and ledger
  * inside the caller's transaction:
- *   - rows keep their id across rewrites (blocks are matched by key, not by position),
- *     so attempt ids, lineage and timestamps survive a checkpoint or an edit;
+ *   - rows keep their id across rewrites (`matchBlocks`: by identity, then by payload in
+ *     order, then by type in place), so attempt ids, lineage and timestamps survive a
+ *     checkpoint or an edit, and a removed block's id never passes to a neighbour;
  *   - a row is written only when what it stores changed, so a streaming checkpoint of one
  *     item writes that one block;
  *   - each tool block becomes the `block_id` of its ledger attempts, and the assets and
@@ -20,6 +21,7 @@
  * too.
  */
 
+import type { DecodableMessage } from "@shared/narrator-blocks/decode";
 import {
 	adoptedLedger,
 	blockAssets,
@@ -28,13 +30,22 @@ import {
 	parseStored as parse,
 	planEnvelopeBlocks,
 } from "@shared/narrator-blocks/plan";
-import { assembleContent, inAssembledOrder, splitEnvelope } from "@shared/narrator-blocks/storage";
+import {
+	assembleContent,
+	type BlockDraft,
+	inAssembledOrder,
+	isStateOnlyChange,
+	type MatchableBlock,
+	matchBlocks,
+	splitEnvelope,
+} from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { blockIdForElement, reassignBlockIdForElement } from "./narrator-block-ids";
 import { activeTurnId } from "./narrator-turns";
 
 /** How incomplete output and reasoning are read: still streaming, sealed, or as they were. */
@@ -228,6 +239,68 @@ interface BlockRow {
 	revision: number;
 }
 
+/**
+ * Rows a writer removed together with the elements they held (a delete by block id,
+ * §5.5). While `withRetiredBlocks` runs, syncs and copies treat them as gone already, so
+ * no remaining block can continue one even where the content left behind is ambiguous
+ * (two identical id-less texts).
+ */
+let retiredRows: ReadonlySet<string> = new Set();
+
+/** Run a synchronous write (a transaction) with these block rows retired. */
+export function withRetiredBlocks<T>(rowIds: Iterable<string>, write: () => T): T {
+	const outer = retiredRows;
+	retiredRows = new Set([...outer, ...rowIds]);
+	try {
+		return write();
+	} finally {
+		retiredRows = outer;
+	}
+}
+
+/**
+ * Rows in ordinal order as `matchBlocks` takes them: each keyed by what the codec makes of
+ * the content they assemble. Rows the codec would group differently match nothing.
+ */
+function keyed(
+	message: Omit<DecodableMessage, "contentJson">,
+	rows: ReadonlyArray<{ id: string; payload: string; state: string | null }>,
+): MatchableBlock[] {
+	const keys = splitEnvelope({
+		...message,
+		contentJson: assembleContent(
+			rows.map((row) => ({ payload: parse(row.payload), state: parse(row.state) })),
+		),
+	}).blocks.map((draft) => draft.key);
+	return rows.map((row, index) => ({
+		key: keys.length === rows.length ? keys[index] : `unmatched:${row.id}`,
+		payload: row.payload,
+	}));
+}
+
+/** The element identity a codec key names exactly (`type:identity`); none for positional keys. */
+function elementIdentity(key: string): string | undefined {
+	const colon = key.indexOf(":");
+	return colon > 0 && !/~\d+$/.test(key) ? key.slice(colon + 1) : undefined;
+}
+
+/**
+ * A new row's id. A streaming element's row takes the block id handed out when the item
+ * opened (`narrator-block-ids.ts`, §5.2), or hands one out now for its later deltas;
+ * every other row gets a fresh id.
+ */
+function newRowId(narratorId: string, key: string, mode: SyncMode): string {
+	const identity = mode === "streaming" ? elementIdentity(key) : undefined;
+	if (!identity) return generateId();
+	const { blockId } = blockIdForElement(narratorId, identity);
+	if (!database.sqlite.prepare("SELECT 1 FROM narrator_blocks WHERE id = ?").get(blockId))
+		return blockId;
+	// The id names a row already (a copy of the envelope kept the element): use a new one.
+	const fresh = generateId();
+	reassignBlockIdForElement(narratorId, identity, fresh);
+	return fresh;
+}
+
 /** Non-internal ledger rows of a message, in the order `adoptedLedger` expects. */
 function ledgerRows(messageId: string): PlanLedgerRow[] {
 	return database.sqlite
@@ -284,22 +357,18 @@ export function syncEnvelope(
 			 FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal`,
 		)
 		.all(messageId) as BlockRow[];
-	// The rows' keys are what the codec makes of the content they assemble.
-	const existingKeys = splitEnvelope({
-		...message,
-		contentJson: assembleContent(
-			existing.map((block) => ({ payload: parse(block.payload), state: parse(block.state) })),
-		),
-	}).blocks.map((draft) => draft.key);
-	const byKey = new Map<string, BlockRow>();
-	if (existingKeys.length === existing.length)
-		for (const [index, block] of existing.entries()) byKey.set(existingKeys[index], block);
+	const live = existing.filter((block) => !retiredRows.has(block.id));
+	const continued = matchBlocks(
+		keyed(message, live),
+		planned.blocks.map((block) => ({ key: block.draft.key, payload: block.payload })),
+	);
 
 	const now = new Date().toISOString();
 	const kept = new Set<string>();
 	const plans = planned.blocks.map((block, ordinal) => {
 		const { draft } = block;
-		const current = byKey.get(draft.key);
+		const at = continued[ordinal];
+		const current = at === undefined ? undefined : live[at];
 		if (current) kept.add(current.id);
 		let phase = draft.phase;
 		// Only a sealing write turns an item still streaming into an interrupted one.
@@ -310,7 +379,13 @@ export function syncEnvelope(
 			(draft.kind === "output" || draft.kind === "reasoning")
 		)
 			phase = "open";
-		return { ...block, ordinal, current, phase, id: current?.id ?? generateId() };
+		return {
+			...block,
+			ordinal,
+			current,
+			phase,
+			id: current?.id ?? newRowId(message.narratorId, draft.key, mode),
+		};
 	});
 
 	const removed = existing.filter((block) => !kept.has(block.id));
@@ -415,6 +490,136 @@ export function syncEnvelope(
 		.run(planned.bodyBytes, messageId, planned.bodyBytes);
 }
 
+// === State-only writes (§5.4) ===
+
+const utf8 = (text: string | null) => (text ? Buffer.byteLength(text) : 0);
+
+/** The columns the decoder derives from a block's elements, which the model reads. */
+function sameDerivedColumns(before: BlockDraft[], after: BlockDraft[]): boolean {
+	return (
+		before.length === after.length &&
+		before.every((draft, index) => {
+			const next = after[index];
+			return (
+				draft.key === next.key &&
+				draft.kind === next.kind &&
+				draft.subtype === next.subtype &&
+				draft.phase === next.phase &&
+				draft.wireId === next.wireId &&
+				draft.modelText === next.modelText
+			);
+		})
+	);
+}
+
+/**
+ * Write the new `state` of the rows a state-only write changed, in place. Rows that do not
+ * line up with the content (a sync still owed) are rebuilt from it instead.
+ */
+function writeBlockStates(messageId: string, drafts: BlockDraft[]): void {
+	if (
+		database.sqlite
+			.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
+			.get(messageId)
+	)
+		return; // The sync owed rebuilds the rows from content_json, state included.
+	const rows = database.sqlite
+		.prepare("SELECT id, kind, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal")
+		.all(messageId) as Array<{ id: string; kind: string; state: string | null }>;
+	const payloadOf = database.sqlite.prepare("SELECT payload FROM narrator_blocks WHERE id = ?");
+	const changes: Array<{ id: string; state: string | null; delta: number }> = [];
+	const aligned =
+		rows.length === drafts.length &&
+		rows.every((row, index) => {
+			const draft = drafts[index];
+			if (row.kind !== draft.kind) return false;
+			const state = draft.state === null ? null : JSON.stringify(draft.state);
+			if (row.state === state) return true;
+			// Only the rows whose state moves are read in full.
+			const { payload } = payloadOf.get(row.id) as { payload: string };
+			if (payload !== JSON.stringify(draft.payload)) return false;
+			changes.push({ id: row.id, state, delta: utf8(state) - utf8(row.state) });
+			return true;
+		});
+	if (!aligned) {
+		syncEnvelopeNow(messageId);
+		return;
+	}
+	const writeState = database.sqlite.prepare(
+		"UPDATE narrator_blocks SET state = ?, byte_size = byte_size + ? WHERE id = ?",
+	);
+	for (const change of changes) writeState.run(change.state, change.delta, change.id);
+	const delta = changes.reduce((sum, change) => sum + change.delta, 0);
+	if (delta)
+		database.sqlite
+			.prepare("UPDATE narrator_messages SET body_bytes = body_bytes + ? WHERE id = ?")
+			.run(delta, messageId);
+}
+
+/**
+ * A state-only write (§5.4): reader-only fields of an envelope's elements, the ones
+ * `splitEnvelope` keeps in a block's `state` (a translation, a card's status). One
+ * transaction: `content_json`, the complete compatibility projection, with
+ * `state_revision` moved, which contract v3 neither counts nor queues; and the `state` of
+ * the block rows it changes, written in place. No revision bump, no COW (a shared envelope
+ * is patched for every holder), no search index.
+ *
+ * `mutate` gets a copy of the stored content and returns the new content, or null to
+ * leave it. A change that is not state-only is written as the body change it is: a field
+ * outside the state, or a state field the decoder derives a model-visible column from (a
+ * compact's status sets its phase). Returns whether anything was written.
+ */
+export function patchEnvelopeState(
+	messageId: string,
+	mutate: (content: unknown[]) => unknown[] | null,
+): boolean {
+	return database.sqlite.transaction(() => {
+		const row = database.sqlite
+			.prepare(
+				`SELECT id, narrator_id AS narratorId, role, content_json AS contentJson,
+					content_text AS contentText, parent_tool_use_id AS parentToolUseId,
+					sdk_message_uuid AS messageUuid, origin, provider, body_format AS bodyFormat
+				 FROM narrator_messages WHERE id = ?`,
+			)
+			.get(messageId) as EnvelopeRow | null;
+		if (!row) return false;
+		const content = parse(row.contentJson);
+		if (!Array.isArray(content)) return false;
+		const next = mutate(structuredClone(content));
+		if (!next) return false;
+		const json = JSON.stringify(next);
+		if (json === row.contentJson) return false;
+		const message = {
+			id: row.id,
+			narratorId: row.narratorId,
+			role: row.role,
+			contentText: row.contentText,
+			parentToolUseId: row.parentToolUseId,
+			messageUuid: row.messageUuid,
+			origin: row.origin,
+			provider: row.provider,
+		};
+		const after = splitEnvelope({ ...message, contentJson: next }).blocks;
+		const stateOnly =
+			isStateOnlyChange(content, next) &&
+			sameDerivedColumns(splitEnvelope({ ...message, contentJson: content }).blocks, after);
+		if (!stateOnly) {
+			database.sqlite
+				.prepare("UPDATE narrator_messages SET content_json = ? WHERE id = ?")
+				.run(json, messageId);
+			if (row.bodyFormat === 2) syncEnvelopeNow(messageId);
+			return true;
+		}
+		database.sqlite
+			.prepare(
+				"UPDATE narrator_messages SET content_json = ?, state_revision = state_revision + 1 WHERE id = ?",
+			)
+			.run(json, messageId);
+		if (row.bodyFormat === 2 && hasBlockSchema()) writeBlockStates(messageId, after);
+		return true;
+	})();
+}
+
 /**
  * An envelope's stored content block by block, each marked by whether `attemptId`
  * created it (§5.3). Null when the envelope keeps no block rows (a legacy-format
@@ -455,70 +660,68 @@ export function syncCopiedEnvelope(fromMessageId: string, toMessageId: string): 
 }
 
 /**
- * Point a copy's blocks at the blocks they were copied from (§6.3): the copy keeps the
- * lineage root, the attempt and the creation time of each block it shares a key with.
+ * Point a copy's blocks at the blocks they were copied from (§6.3): each block of the copy
+ * that continues one of the original (`matchBlocks`) keeps its lineage root, attempt,
+ * creation time and pre-edit body.
  */
 export function inheritBlockLineage(fromMessageId: string, toMessageId: string): void {
-	const source = keyedRows(fromMessageId);
+	const source = lineageRows(fromMessageId).filter((row) => !retiredRows.has(row.id));
 	if (!source.length) return;
-	const byKey = new Map(source.map((row) => [row.key, row]));
+	const copy = lineageRows(toMessageId);
+	const envelope = envelopeOf(toMessageId);
+	if (!envelope) return;
+	const continued = matchBlocks(keyed(envelope, source), keyed(envelope, copy));
 	const inherit = database.sqlite.prepare(
-		`UPDATE narrator_blocks SET origin_block_id = ?, attempt_id = ?, created_at = ?
-		 WHERE id = ? AND (origin_block_id IS NOT ? OR attempt_id IS NOT ? OR created_at IS NOT ?)`,
+		`UPDATE narrator_blocks SET origin_block_id = ?, attempt_id = ?, created_at = ?,
+			original_payload = coalesce(original_payload, ?)
+		 WHERE id = ? AND (origin_block_id IS NOT ? OR attempt_id IS NOT ? OR created_at IS NOT ?
+			OR (original_payload IS NULL AND ? IS NOT NULL))`,
 	);
-	for (const row of keyedRows(toMessageId)) {
-		const from = byKey.get(row.key);
-		if (!from) continue;
+	for (const [index, row] of copy.entries()) {
+		const at = continued[index];
+		if (at === undefined) continue;
+		const from = source[at];
 		const origin = from.originBlockId ?? from.id;
 		inherit.run(
 			origin,
 			from.attemptId,
 			from.createdAt,
+			from.originalPayload,
 			row.id,
 			origin,
 			from.attemptId,
 			from.createdAt,
+			from.originalPayload,
 		);
 	}
 }
 
-/** An envelope's block rows with the codec key of each, in ordinal order. */
-function keyedRows(messageId: string): Array<{
-	id: string;
-	key: string;
-	originBlockId: string | null;
-	attemptId: string | null;
-	createdAt: string;
-}> {
-	const envelope = database.sqlite
+function envelopeOf(messageId: string): Omit<DecodableMessage, "contentJson"> | null {
+	return database.sqlite
 		.prepare(
 			`SELECT id, narrator_id AS narratorId, role, content_text AS contentText,
 				parent_tool_use_id AS parentToolUseId, origin FROM narrator_messages WHERE id = ?`,
 		)
-		.get(messageId) as Omit<EnvelopeRow, "contentJson" | "bodyFormat"> | null;
-	if (!envelope) return [];
-	const rows = database.sqlite
+		.get(messageId) as Omit<DecodableMessage, "contentJson"> | null;
+}
+
+/** An envelope's block rows with what a copy inherits from each, in ordinal order. */
+function lineageRows(messageId: string): Array<{
+	id: string;
+	payload: string;
+	state: string | null;
+	originBlockId: string | null;
+	attemptId: string | null;
+	createdAt: string;
+	originalPayload: string | null;
+}> {
+	return database.sqlite
 		.prepare(
 			`SELECT id, payload, state, origin_block_id AS originBlockId, attempt_id AS attemptId,
-				created_at AS createdAt
+				created_at AS createdAt, original_payload AS originalPayload
 			 FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal`,
 		)
-		.all(messageId) as Array<{
-		id: string;
-		payload: string;
-		state: string | null;
-		originBlockId: string | null;
-		attemptId: string | null;
-		createdAt: string;
-	}>;
-	const keys = splitEnvelope({
-		...envelope,
-		contentJson: assembleContent(
-			rows.map((row) => ({ payload: parse(row.payload), state: parse(row.state) })),
-		),
-	}).blocks.map((draft) => draft.key);
-	if (keys.length !== rows.length) return [];
-	return rows.map((row, index) => ({ ...row, key: keys[index] }));
+		.all(messageId) as ReturnType<typeof lineageRows>;
 }
 
 // === Block search index (§4.6) ===

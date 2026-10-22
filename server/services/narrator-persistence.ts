@@ -11,7 +11,7 @@ import {
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, getTableColumns, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	fileChangeExecutionSegments,
@@ -65,10 +65,12 @@ import {
 	contentByAttempt,
 	flushChangedEnvelopes,
 	newEnvelopeColumns,
+	patchEnvelopeState,
 	type SyncMode,
 	syncCopiedEnvelope,
 	syncEnvelopeNow,
 } from "./narrator-block-sync";
+import { bodyColumns, contentJsonSql, fillBodies, fillBody } from "./narrator-body-reads";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import {
@@ -2667,10 +2669,13 @@ const sqliteNarratorPersistence = {
 			// The parent embeds this child's messages, so its reconnect version must
 			// change at the same boundary as the child's (never for the empty shell).
 			await bumpNarratorMessageVersions([narratorId, broadcastTargetId]);
-			const published = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				with: { toolCalls: true },
-			});
+			const published = fillBody(
+				await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					...bodyColumns(),
+					with: { toolCalls: true },
+				}),
+			);
 			if (!published) throw new NotFoundError("Assistant message", messageId);
 			const ref = await db.query.narratorMessageRefs.findFirst({
 				where: and(
@@ -2705,33 +2710,30 @@ const sqliteNarratorPersistence = {
 		translatedText: string,
 		expected?: { id?: string; text: string },
 	) {
-		const existing = db.query.narratorMessages
-			.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			})
-			.sync();
-		if (!existing) return false;
-
-		const content = Array.isArray(existing.contentJson) ? [...existing.contentJson] : [];
-		const index = expected?.id
-			? content.findIndex((entry) => entry?.type === "reasoning" && entry.id === expected.id)
-			: reasoningIndex;
-		const block = content[index] as Record<string, unknown> | undefined;
-		if (!block || block.type !== "reasoning") return false;
-		if (expected && block.text !== expected.text) return false;
-		if (block.translatedText === translatedText) return false;
-
-		block.translatedText = translatedText;
-		db.transaction(() => {
-			db.update(narratorMessages)
-				.set({ contentJson: content })
-				.where(eq(narratorMessages.id, messageId))
-				.run();
-			// A translation is block state: no body revision.
-			syncEnvelopeNow(messageId);
+		// A translation is block state: no body revision (§5.4).
+		return patchEnvelopeState(messageId, (content) => {
+			const index = expected?.id
+				? content.findIndex(
+						(entry) =>
+							(entry as { type?: unknown } | null)?.type === "reasoning" &&
+							(entry as { id?: unknown }).id === expected.id,
+					)
+				: reasoningIndex;
+			const block = content[index] as Record<string, unknown> | undefined;
+			if (!block || block.type !== "reasoning") return null;
+			if (expected && block.text !== expected.text) return null;
+			if (block.translatedText === translatedText) return null;
+			block.translatedText = translatedText;
+			return content;
 		});
-		return true;
+	},
+
+	/**
+	 * A state-only write (§5.4): reader-only fields of one envelope's elements, without a
+	 * model-history bump, COW or search index. See `patchEnvelopeState`.
+	 */
+	patchState(messageId: string, mutate: (content: unknown[]) => unknown[] | null): boolean {
+		return patchEnvelopeState(messageId, mutate);
 	},
 
 	/**
@@ -4197,6 +4199,8 @@ const sqliteNarratorPersistence = {
 			preserveExecutionOwner?: boolean;
 			/** Writes that belong to the edit, run first in its transaction. */
 			beforeWrite?: (tx: DbTx) => void;
+			/** Writes that follow the edit once its block rows are rebuilt, in its transaction. */
+			afterWrite?: (tx: DbTx, messageId: string) => void;
 		} = {},
 	): Promise<string> {
 		const ref = await db.query.narratorMessageRefs.findFirst({
@@ -4228,6 +4232,7 @@ const sqliteNarratorPersistence = {
 		const result = db.transaction((tx) => {
 			const id = rewrite(tx);
 			flushChangedEnvelopes();
+			options.afterWrite?.(tx, id);
 			return id;
 		});
 		function rewrite(tx: DbTx): string {
@@ -4623,7 +4628,12 @@ const sqliteNarratorPersistence = {
 			return { refs, insertSeq };
 		});
 
-		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));
+		const [msg] = fillBodies(
+			await db
+				.select({ ...getTableColumns(narratorMessages), contentJson: contentJsonSql() })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, id)),
+		);
 
 		const hiddenMessageIds = refs.map((r) => r.messageId);
 		return { message: { ...msg, seq: insertSeq }, hiddenMessageIds };
@@ -4647,10 +4657,13 @@ const sqliteNarratorPersistence = {
 		if (refs.length === 0) return [];
 
 		const ids = refs.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, ids),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -4759,10 +4772,13 @@ const sqliteNarratorPersistence = {
 		if (refs.length === 0) return [];
 
 		const ids = refs.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, ids),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -4770,9 +4786,12 @@ const sqliteNarratorPersistence = {
 	},
 
 	async deleteSegmentCompact(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+				...bodyColumns(),
+			}),
+		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -4819,9 +4838,12 @@ const sqliteNarratorPersistence = {
 	},
 
 	async getSegmentCompactSummary(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+				...bodyColumns(),
+			}),
+		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

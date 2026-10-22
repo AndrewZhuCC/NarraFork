@@ -16,8 +16,10 @@ import { logger } from "../lib/logger";
 import {
 	MODEL_HISTORY_REVISION_CONTRACT,
 	MODEL_HISTORY_REVISION_CONTRACT_V1,
+	MODEL_HISTORY_REVISION_CONTRACT_V2,
 	renderModelHistoryRevisionSql,
 	renderModelHistoryRevisionSqlV1,
+	renderModelHistoryRevisionSqlV2,
 } from "../services/agent-runtime/model-history-revision-sql";
 
 const FILESYSTEM_MIGRATIONS_FOLDER = "./drizzle";
@@ -730,13 +732,16 @@ function canonicalTriggers(statements: readonly string[]) {
 	});
 }
 const MODEL_HISTORY_TRIGGERS = canonicalTriggers(MODEL_HISTORY_MIGRATION_SQL.slice(6, -1));
-/** The current (v2) contract's triggers, which supersede v1 once its reinstall ran. */
-const MODEL_HISTORY_V2_TRIGGERS = canonicalTriggers(
-	renderModelHistoryRevisionSql("sqlite")
-		.split("--> statement-breakpoint")
-		.map(normalizeMigrationSql)
-		.filter((sql) => sql.startsWith("CREATE TRIGGER")),
-);
+const contractTriggers = (sql: string) =>
+	canonicalTriggers(
+		sql
+			.split("--> statement-breakpoint")
+			.map(normalizeMigrationSql)
+			.filter((statement) => statement.startsWith("CREATE TRIGGER")),
+	);
+/** The v2 (block storage) and current v3 contracts' triggers: each supersedes the ones before. */
+const MODEL_HISTORY_V2_TRIGGERS = contractTriggers(renderModelHistoryRevisionSqlV2("sqlite"));
+const MODEL_HISTORY_V3_TRIGGERS = contractTriggers(renderModelHistoryRevisionSql("sqlite"));
 
 function isOfficialModelHistoryMigration(statements: readonly string[]): boolean {
 	return (
@@ -749,7 +754,8 @@ function isOfficialModelHistoryMigration(statements: readonly string[]): boolean
 
 /**
  * Bounded catalog proof only; this never installs or repairs live DDL. A database whose
- * v1 contract was later reinstalled as v2 (block storage) has the v1 migration's effect too.
+ * v1 contract was later reinstalled as v2 (block storage) or v3 (state writes) has the v1
+ * migration's effect too.
  */
 function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
 	return (
@@ -760,8 +766,13 @@ function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
 		) ||
 		isModelHistoryContractInstalled(
 			sqlite,
-			MODEL_HISTORY_REVISION_CONTRACT,
+			MODEL_HISTORY_REVISION_CONTRACT_V2,
 			MODEL_HISTORY_V2_TRIGGERS,
+		) ||
+		isModelHistoryContractInstalled(
+			sqlite,
+			MODEL_HISTORY_REVISION_CONTRACT,
+			MODEL_HISTORY_V3_TRIGGERS,
 		)
 	);
 }

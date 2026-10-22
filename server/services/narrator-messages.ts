@@ -87,7 +87,21 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
-import { newEnvelopeColumns } from "./narrator-block-sync";
+import { newEnvelopeColumns, syncEnvelopeNow, withRetiredBlocks } from "./narrator-block-sync";
+import {
+	MAX_BLOCK_DELETE_ELEMENTS,
+	materializeTargets,
+	resolveBlockTargets,
+	targetElements,
+} from "./narrator-block-targets";
+import {
+	bodyColumns,
+	contentJsonSql,
+	fillBodies,
+	fillBody,
+	hasStoredElementSql,
+	storedBodyBytesSql,
+} from "./narrator-body-reads";
 import {
 	createPostgresNarratorDisplayPagePort,
 	readDisplayFixtureMessages,
@@ -111,6 +125,7 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 import {
 	attachActiveSendDeliveryTargets,
 	attachSendTargetDetails,
@@ -891,13 +906,19 @@ function applyBlockDeletionTx(
 	}
 }
 
-/** File attempts finish first; a separate bounded history transaction retains COW and selection checks. */
+/**
+ * File attempts finish first; a separate bounded history transaction retains COW and selection checks.
+ * A delete by block id (`byBlock`) selects whole blocks, whose elements may outnumber the block
+ * cap, and names the rows it removes: the transaction rebuilds the envelopes' rows with those
+ * retired, so no remaining block takes over a removed block's id.
+ */
 async function deleteBlockSelection(
 	narratorId: string,
 	blocks: BlockSelection[],
 	opts?: BlockDeleteOptions,
+	byBlock?: { retiredRows: readonly string[] },
 ) {
-	if (blocks.length > MAX_BATCH_DELETE_BLOCKS) {
+	if (blocks.length > (byBlock ? MAX_BLOCK_DELETE_ELEMENTS : MAX_BATCH_DELETE_BLOCKS)) {
 		throw new ValidationError(`Select at most ${MAX_BATCH_DELETE_BLOCKS} blocks`);
 	}
 	const grouped = new Map<string, number[]>();
@@ -972,6 +993,7 @@ async function deleteBlockSelection(
 						seq: plan.ref.seq,
 					});
 			}
+			for (const { id } of updatedMessageIds) syncEnvelopeNow(id);
 			if (!opts?.skipNarratorUpdate) {
 				tx.update(narrators)
 					.set({
@@ -988,7 +1010,7 @@ async function deleteBlockSelection(
 	try {
 		if (snapshotRevert && opts?.principal) await authorizeRevertHistory(narratorId, opts);
 		opts?.signal?.throwIfAborted();
-		mutate();
+		withRetiredBlocks(byBlock?.retiredRows ?? [], mutate);
 	} catch (error) {
 		if (snapshotRevert) throw snapshotHistoryFailure(snapshotRevert, error);
 		throw error;
@@ -3323,10 +3345,13 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((row) => row.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		const seqMap = new Map(refRows.map((row) => [row.messageId, row.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		return messages.map((message) => ({
@@ -3365,10 +3390,13 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 
 		if (messages.length !== refRows.length) {
 			const foundIds = new Set(messages.map((m) => m.id));
@@ -3415,11 +3443,7 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					ne(narratorMessages.role, "disp"),
 					isNull(narratorMessageRefs.segmentCompactId),
-					sql`NOT EXISTS (
-						SELECT 1
-						FROM json_each(${narratorMessages.contentJson}) AS compact_block
-						WHERE json_extract(compact_block.value, '$.type') = 'compact'
-					)`,
+					sql`NOT ${hasStoredElementSql("compact")}`,
 				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -3652,14 +3676,17 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: {
-				toolCalls: true,
-				creator: { columns: { username: true } },
-				narrator: { columns: { title: true } },
-			},
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: {
+					toolCalls: true,
+					creator: { columns: { username: true } },
+					narrator: { columns: { title: true } },
+				},
+			}),
+		);
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -3701,7 +3728,7 @@ const narratorMessageQueriesUnlocked = {
 				id: narratorMessages.id,
 				narratorId: narratorMessages.narratorId,
 				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 				contentText: narratorMessages.contentText,
 				createdAt: narratorMessages.createdAt,
 			})
@@ -3716,7 +3743,7 @@ const narratorMessageQueriesUnlocked = {
 			)
 			.orderBy(narratorMessageRefs.seq)
 			.limit(limit);
-		return rows;
+		return fillBodies(rows);
 	},
 
 	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
@@ -3787,7 +3814,7 @@ const narratorMessageQueriesUnlocked = {
 				id: narratorMessages.id,
 				narratorId: narratorMessages.narratorId,
 				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 				contentText: narratorMessages.contentText,
 				createdAt: narratorMessages.createdAt,
 			})
@@ -3802,7 +3829,7 @@ const narratorMessageQueriesUnlocked = {
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(limit);
-		return rows.reverse();
+		return fillBodies(rows).reverse();
 	},
 
 	/**
@@ -3827,7 +3854,7 @@ const narratorMessageQueriesUnlocked = {
 		const rows = await db
 			.select({
 				id: narratorMessages.id,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -3842,7 +3869,7 @@ const narratorMessageQueriesUnlocked = {
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(Math.max(1, Math.floor(scanLimit)));
 
-		for (const row of rows) {
+		for (const row of fillBodies(rows)) {
 			const blocks = Array.isArray(row.contentJson)
 				? (row.contentJson as Array<{ type: string; text?: string }>)
 				: [];
@@ -3867,7 +3894,7 @@ const narratorMessageQueriesUnlocked = {
 		const rows = await db
 			.select({
 				id: narratorMessages.id,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -3877,7 +3904,7 @@ const narratorMessageQueriesUnlocked = {
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(1);
 
-		const row = rows[0];
+		const row = fillBody(rows[0]);
 		if (!row) return null;
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
 		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
@@ -3910,7 +3937,7 @@ const narratorMessageQueriesUnlocked = {
 			WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
 				AND narrator_tool_calls.is_file_history_checkpoint = 0
 		)`;
-		const byteSize = sql<number>`length(CAST(${narratorMessages.contentJson} AS BLOB))`;
+		const byteSize = storedBodyBytesSql();
 		const rows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -3932,7 +3959,7 @@ const narratorMessageQueriesUnlocked = {
 						 WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
 						   AND narrator_tool_calls.is_file_history_checkpoint = 0)
 						> ${HISTORY_RECOVERY_TOOL_COUNT}
-						OR length(CAST(${narratorMessages.contentJson} AS BLOB)) > ${HISTORY_RECOVERY_BYTE_SIZE}
+						OR ${byteSize} > ${HISTORY_RECOVERY_BYTE_SIZE}
 					)`,
 				),
 			)
@@ -4752,10 +4779,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
 			: [];
@@ -4812,10 +4841,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		// Unreachable while foreign keys are on: `narrator_message_refs.message_id` is a
 		// NOT NULL reference to `narrator_messages.id`, so a ref cannot outlive its
 		// message. Treated as "already gone" (like the missing-ref case above) rather
@@ -4897,13 +4928,15 @@ const narratorMessageQueriesUnlocked = {
 				return { alreadyApplied: true };
 			}
 
-			const patched = blocks.map((entry, i) => (i === index ? { ...entry, applied: true } : entry));
-			const updated = tx
-				.update(narratorMessages)
-				.set({ contentJson: patched })
-				.where(eq(narratorMessages.id, messageId))
-				.returning()
-				.get();
+			// The latch is card state: the model reads the feedback either way (§5.4).
+			narratorStore.patchState(messageId, (content) =>
+				content.map((entry, i) =>
+					i === index ? { ...(entry as Record<string, unknown>), applied: true } : entry,
+				),
+			);
+			const updated = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -4942,15 +4975,14 @@ const narratorMessageQueriesUnlocked = {
 				: [];
 			const index = blocks.findIndex((block) => block?.type === "review_feedback");
 			if (!msg || index < 0) return undefined;
-			const patched = blocks.map((entry, i) =>
-				i === index ? { ...entry, applied: false } : entry,
+			narratorStore.patchState(messageId, (content) =>
+				content.map((entry, i) =>
+					i === index ? { ...(entry as Record<string, unknown>), applied: false } : entry,
+				),
 			);
-			const updated = tx
-				.update(narratorMessages)
-				.set({ contentJson: patched })
-				.where(eq(narratorMessages.id, messageId))
-				.returning()
-				.get();
+			const updated = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -4996,10 +5028,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
 			: [];
@@ -5054,10 +5088,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		// Unreachable while foreign keys are on (a ref cannot outlive its message);
 		// treated as "already gone" rather than as an error, like the missing-ref case.
 		if (!msg) return;
@@ -5098,10 +5134,12 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async dismissErrorMessage(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 
 		// The message may already be gone (e.g. a historical "message without ref"
 		// orphan that disappeared on reload, or a double-dismiss). Treat that as an
@@ -5203,6 +5241,33 @@ const narratorMessageQueriesUnlocked = {
 		opts?: BlockDeleteOptions,
 	) {
 		return deleteBlockSelection(narratorId, blocks, opts);
+	},
+
+	/**
+	 * Delete blocks named by id (docs/BLOCK_STORAGE-DESIGN.md §5.5): each block whole, so a
+	 * tool block goes with every ledger attempt of its call, an input with all its
+	 * attachments, and a reasoning run is the ids of all its blocks.
+	 */
+	async deleteBlocks(narratorId: string, blockIds: string[], opts?: BlockDeleteOptions) {
+		const targets = materializeTargets(resolveBlockTargets(narratorId, blockIds));
+		const { results, ...outcome } = await deleteBlockSelection(
+			narratorId,
+			targetElements(targets),
+			opts,
+			{ retiredRows: targets.flatMap((target) => (target.rowId ? [target.rowId] : [])) },
+		);
+		const deletedMessages = new Set(
+			results.filter((result) => result.messageDeleted).map((result) => result.messageId),
+		);
+		return {
+			...outcome,
+			deleted: targets.length,
+			results: targets.map((target) => ({
+				blockId: target.blockId,
+				messageId: target.messageId,
+				messageDeleted: deletedMessages.has(target.messageId),
+			})),
+		};
 	},
 
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
@@ -5349,6 +5414,7 @@ export const narratorMessageQueries = {
 	deleteMessagesAfter: admittedMutation(narratorMessageQueriesUnlocked.deleteMessagesAfter),
 	deleteMessageBlock: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlock),
 	deleteMessageBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlocks),
+	deleteBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteBlocks),
 	deleteEmptyRetryPlaceholder: admittedMutation(
 		narratorMessageQueriesUnlocked.deleteEmptyRetryPlaceholder,
 	),

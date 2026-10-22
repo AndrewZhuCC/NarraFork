@@ -737,6 +737,33 @@ export const batchDeleteBlocksSchema = z.object({
 	scope: revertScopeSchema,
 });
 
+/** Block ids of one operation (docs/BLOCK_STORAGE-DESIGN.md §5.5): rows, or decoded ids. */
+export const blockIdsSchema = z
+	.array(z.string().min(1).max(256))
+	.min(1)
+	.max(MAX_BATCH_DELETE_BLOCKS)
+	.transform((ids) => [...new Set(ids)]);
+
+export const deleteBlocksSchema = z.object({
+	blockIds: blockIdsSchema,
+	skipRevert: z.boolean().optional(),
+	scope: revertScopeSchema,
+});
+
+export const rollbackToBlocksSchema = rollbackToBlockSchema
+	.omit({ blockIndex: true })
+	.extend({ blockIds: blockIdsSchema });
+
+/** A file-restore preview for an operation addressed by block id. */
+export const blockRevertActionPreviewSchema = z
+	.object({
+		action: z.enum(["rollback_to_block", "delete_tool_block"]),
+		blockIds: blockIdsSchema,
+		idempotencyKey: revertPlanIdentifierSchema,
+		recoveryMode: z.literal("snapshot").optional(),
+	})
+	.strict();
+
 export const forkFromMessagesSchema = z.object({
 	messageIds: z.array(z.string().min(1)).min(1).max(500),
 	title: z.string().max(200).optional(),

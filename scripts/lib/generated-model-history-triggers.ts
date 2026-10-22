@@ -1,8 +1,10 @@
 import {
 	MODEL_HISTORY_REVISION_CONTRACT,
 	MODEL_HISTORY_REVISION_CONTRACT_V1,
+	MODEL_HISTORY_REVISION_CONTRACT_V2,
 	renderModelHistoryRevisionSql,
 	renderModelHistoryRevisionSqlV1,
+	renderModelHistoryRevisionSqlV2,
 } from "../../server/services/agent-runtime/model-history-revision-sql";
 
 export type MigrationDialect = "sqlite" | "postgres";
@@ -69,6 +71,14 @@ export function hasModelHistoryBlockSchema(snapshot: Snapshot, dialect: Migratio
 	);
 }
 
+/** Whether the schema carries what the v3 contract reads beyond v2: the state-write counter. */
+export function hasModelHistoryStateSchema(snapshot: Snapshot, dialect: MigrationDialect): boolean {
+	return (
+		hasModelHistoryBlockSchema(snapshot, dialect) &&
+		hasColumns(snapshot, dialect, { narrator_messages: ["state_revision"] })
+	);
+}
+
 /** Tables a contract's triggers are attached to; a schema rebuild of one needs a reinstall. */
 export function modelHistoryTriggerTables(contract: string): readonly string[] {
 	return contract === MODEL_HISTORY_REVISION_CONTRACT_V1
@@ -78,16 +88,19 @@ export function modelHistoryTriggerTables(contract: string): readonly string[] {
 
 /**
  * The contract a schema transition installs, if any. Only the migration that introduces a
- * contract's schema carries its triggers; v2 is a versioned reinstall (it drops v1 itself).
- * Never inferred from a process flag, never added to an already-published migration.
+ * contract's schema carries its triggers; v2 and v3 are versioned reinstalls (each drops the
+ * contracts before it). Never inferred from a process flag, never added to an
+ * already-published migration.
  */
 export function generatedModelHistoryTriggerContract(
 	before: Snapshot,
 	after: Snapshot,
 	dialect: MigrationDialect,
 ): string | undefined {
-	if (hasModelHistoryBlockSchema(after, dialect) && !hasModelHistoryBlockSchema(before, dialect))
+	if (hasModelHistoryStateSchema(after, dialect) && !hasModelHistoryStateSchema(before, dialect))
 		return MODEL_HISTORY_REVISION_CONTRACT;
+	if (hasModelHistoryBlockSchema(after, dialect) && !hasModelHistoryBlockSchema(before, dialect))
+		return MODEL_HISTORY_REVISION_CONTRACT_V2;
 	if (
 		hasModelHistoryRevisionSchema(after, dialect) &&
 		!hasModelHistoryRevisionSchema(before, dialect)
@@ -109,6 +122,8 @@ export function generatedModelHistoryTriggerSuffix(
 export function renderModelHistoryContractSql(dialect: MigrationDialect, contract: string): string {
 	if (contract === MODEL_HISTORY_REVISION_CONTRACT_V1)
 		return renderModelHistoryRevisionSqlV1(dialect);
+	if (contract === MODEL_HISTORY_REVISION_CONTRACT_V2)
+		return renderModelHistoryRevisionSqlV2(dialect);
 	if (contract === MODEL_HISTORY_REVISION_CONTRACT) return renderModelHistoryRevisionSql(dialect);
 	throw new Error(`Unknown model-history contract ${contract}`);
 }
@@ -122,7 +137,11 @@ export function modelHistoryTriggerSuffix(
 
 /** Identity of every renderer a pending generation may append; a change refuses resume. */
 export function modelHistoryRendererFingerprint(dialect: MigrationDialect): string {
-	return [MODEL_HISTORY_REVISION_CONTRACT_V1, MODEL_HISTORY_REVISION_CONTRACT]
+	return [
+		MODEL_HISTORY_REVISION_CONTRACT_V1,
+		MODEL_HISTORY_REVISION_CONTRACT_V2,
+		MODEL_HISTORY_REVISION_CONTRACT,
+	]
 		.map((contract) => `${contract}\n${renderModelHistoryContractSql(dialect, contract)}`)
 		.join("\n");
 }
@@ -144,6 +163,8 @@ export function appendGeneratedModelHistoryTriggers(sql: string, suffix: string)
 export {
 	MODEL_HISTORY_REVISION_CONTRACT,
 	MODEL_HISTORY_REVISION_CONTRACT_V1,
+	MODEL_HISTORY_REVISION_CONTRACT_V2,
 	renderModelHistoryRevisionSql,
 	renderModelHistoryRevisionSqlV1,
+	renderModelHistoryRevisionSqlV2,
 };

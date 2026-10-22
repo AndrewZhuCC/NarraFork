@@ -535,6 +535,9 @@ export async function prepareLocalRevertAction(
 			} else {
 				if (message.blockType !== "tool_use" || typeof message.toolUseId !== "string")
 					throw new ValidationError("The selected block is not a tool call");
+				// Every execution attempt of the call (docs/BLOCK_STORAGE-DESIGN.md §5.5): a re-run
+				// tool has one ledger row per attempt, and each one's file changes belong to the
+				// tool block being deleted.
 				const tools = db
 					.select({ id: narratorToolCalls.id })
 					.from(narratorToolCalls)
@@ -544,15 +547,21 @@ export async function prepareLocalRevertAction(
 							eq(narratorToolCalls.toolUseId, message.toolUseId),
 						),
 					)
-					.limit(2)
+					.orderBy(narratorToolCalls.id)
+					.limit(FILE_CHANGE_LIMITS.historyToolRelatedChanges + 1)
 					.all();
-				if (tools.length !== 1)
+				if (tools.length === 0)
 					throw new RevertPlannerError(
 						"EVIDENCE_INCOMPLETE",
-						"The selected tool has no unique execution identity",
+						"The selected tool has no execution record",
+					);
+				if (tools.length > FILE_CHANGE_LIMITS.historyToolRelatedChanges)
+					throw new RevertPlannerError(
+						"BUDGET_EXCEEDED",
+						"The selected tool has more execution attempts than one rollback covers",
 					);
 				kind = "history_delete";
-				selector = { kind: "tool_calls", toolCallIds: [tools[0].id] };
+				selector = { kind: "tool_calls", toolCallIds: tools.map((tool) => tool.id) };
 			}
 		}
 		const result = await prepareLocalRevertPlanCore({
