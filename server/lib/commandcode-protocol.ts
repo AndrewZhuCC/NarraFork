@@ -90,8 +90,10 @@ export function mapCommandCodeProtocol(protocol?: string): CommandCodeEndpoint |
 }
 
 /**
- * 用模型目录里的 `supported_endpoints` 选端点：`/chat/completions` 优先；
- * 其余两者都支持时优先 Anthropic `/messages`，而不是 OpenAI `/responses`。
+ * 用模型目录里的 `supported_endpoints` 选端点。只有 `/messages` 的模型走 Anthropic。
+ *
+ * 特例：其他平台在同时支持时优先 Anthropic Messages，这里仍然优先 `/responses`，
+ * 因为 Command Code 的 `/messages` 对实测账户恒返回 403（见文件头注释）。
  */
 export function endpointFromSupported(
 	endpoints: readonly string[],
@@ -100,9 +102,10 @@ export function endpointFromSupported(
 	const messages = normalized.has("/messages");
 	const completions = normalized.has("/chat/completions");
 	const responses = normalized.has("/responses");
+	if (messages && !completions && !responses) return "messages";
 	if (completions) return "completions";
-	if (messages) return "messages";
 	if (responses) return "responses";
+	if (messages) return "messages";
 	return undefined;
 }
 
