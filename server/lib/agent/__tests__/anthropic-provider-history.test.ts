@@ -20,10 +20,7 @@ type ParseAnthropicEventForTest = (
 ) => TestParsedEvent[];
 
 type TestAnthropicProvider = {
-	buildHistory: (
-		dbMessages: unknown[],
-		model: string,
-	) => Promise<{ history: unknown[]; trailingToolResults: unknown[] }>;
+	buildHistory: (dbMessages: unknown[], model: string) => Promise<{ history: unknown[] }>;
 };
 
 let AnthropicProvider: new (config: Record<string, unknown>) => TestAnthropicProvider;

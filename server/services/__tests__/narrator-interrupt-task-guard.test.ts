@@ -51,7 +51,7 @@ let releaseChat: (() => void) | null = null;
 const providerCalls: string[] = [];
 const testProvider = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params: { content: string; onRequestStart?: () => void; signal?: AbortSignal }) {
 		providerCalls.push(params.content);
