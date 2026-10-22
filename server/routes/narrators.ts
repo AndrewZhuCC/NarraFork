@@ -225,11 +225,15 @@ import {
 } from "../lib/validators";
 import {
 	applyRevertPlanSchema,
+	blockIdsSchema,
+	blockRevertActionPreviewSchema,
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
+	deleteBlocksSchema,
 	optimizePromptSchema,
 	revertPlanFilesQuerySchema,
 	revertPlanIdSchema,
+	rollbackToBlocksSchema,
 } from "../lib/validators/narrators";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
@@ -297,6 +301,11 @@ import {
 	narratorReadableWhere,
 } from "../services/narrator-acl";
 import { newEnvelopeColumns } from "../services/narrator-block-sync";
+import {
+	blockDetail,
+	lastTargetElement,
+	resolveBlockTargets,
+} from "../services/narrator-block-targets";
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
@@ -370,6 +379,7 @@ import {
 	continueNarrator,
 	editAndRegenerate,
 	editAssistantMessage,
+	editOutputBlock,
 	getBufferedMessagesAsync,
 	getNarratorExecutionDeviceState,
 	interruptAndWaitForIdle,
@@ -387,9 +397,11 @@ import {
 	resolveOptionalToolState,
 	resolvePermissionOrDangerReflection,
 	restoreAssistantMessage,
+	restoreOutputBlock,
 	retryFailedCompact,
 	retryLastMessage,
 	rollbackToBlock,
+	rollbackToBlocks,
 	runCustomCompact,
 	runSegmentCompact,
 	sendMessage,
@@ -648,6 +660,7 @@ for (const path of [
 	"/:id/messages",
 	"/:id/draft",
 	"/:id/edit-and-regenerate/:messageId",
+	"/:id/blocks/:blockId/edit-and-regenerate",
 	"/:id/buffer/:mid",
 ]) {
 	narratorRoutes.use(path, (c, next) => {
@@ -682,6 +695,7 @@ const boundedRevertRequest = bodyLimit({
 });
 narratorRoutes.use("/:id/revert-plans", boundedRevertRequest);
 narratorRoutes.use("/:id/revert-action-preview", boundedRevertRequest);
+narratorRoutes.use("/:id/blocks/revert-action-preview", boundedRevertRequest);
 narratorRoutes.use("/:id/revert-plans/:planId/apply", boundedRevertRequest);
 
 const boundedQuestionRequest = bodyLimit({
@@ -2752,9 +2766,12 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 // After an interrupt the in-memory pending-permission entry is gone, so this
 // path resets the tool call row, executes it with a pre-granted permission,
 // writes the fresh result back, and auto-continues the loop.
-narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
-	const id = c.req.param("id");
-	const toolUseId = c.req.param("toolUseId");
+narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", (c) =>
+	allowRetryResponse(c, c.req.param("id"), c.req.param("toolUseId")),
+);
+
+/** Re-execute a denied tool call. */
+async function allowRetryResponse(c: Context, id: string, toolUseId: string) {
 	const narrator = await narratorService.getById(id);
 
 	// Reconcile FIRST, then judge: repair a stale idle status (so the user regains the
@@ -2781,7 +2798,7 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 		return c.json({ error: "Cannot re-execute tool call", reason: result.reason }, statusCode);
 	}
 	return c.json({ ok: true });
-});
+}
 
 // Rollback to a specific block — delete everything after it (no re-run)
 narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
@@ -2854,10 +2871,11 @@ async function resolveEditedFileReferences(
 // Edit a user message and regenerate the response.
 // Supports JSON (text-only / keep-image-subset) and multipart/form-data (when the
 // user adds new images during editing).
-narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
-	const id = c.req.param("id");
-	const messageId = c.req.param("messageId");
+narratorRoutes.post("/:id/edit-and-regenerate/:messageId", (c) =>
+	editAndRegenerateResponse(c, c.req.param("id"), c.req.param("messageId")),
+);
 
+async function editAndRegenerateResponse(c: Context, id: string, messageId: string) {
 	let content: string;
 	let fileReferences: FileReference[] | undefined;
 	let composerDocument: ComposerDocument | undefined;
@@ -3020,7 +3038,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		...(result.revertResult ? { revertResult: result.revertResult } : {}),
 		...(result.warnings?.length ? { warnings: result.warnings } : {}),
 	});
-});
+}
 
 // Edit an assistant message's text without deleting later messages or regenerating.
 // The edited text is persisted for display and subsequent history assembly, while
@@ -4021,6 +4039,148 @@ narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 		signal: c.req.raw.signal,
 	});
 	return c.json({ ok: true, ...result });
+});
+
+// === Operations addressed by block id (docs/BLOCK_STORAGE-DESIGN.md §5.5) ===
+// Each target is a whole block: a tool block with every ledger attempt of its call, an
+// input with its attachments, a reasoning run as the ids of all its blocks. The routes
+// above that take message ids and element indexes stay for older clients.
+
+// Delete blocks.
+narratorRoutes.delete("/:id/blocks", async (c) => {
+	const narratorId = c.req.param("id");
+	const { blockIds, skipRevert } = deleteBlocksSchema.parse(await c.req.json());
+	requireHistoryOnlyDeletion(skipRevert === true);
+	await prepareHistoryRewrite(narratorId);
+	const result = await narratorService.deleteBlocks(narratorId, blockIds, {
+		skipRevert: true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
+	});
+	return c.json({ ok: true, ...result });
+});
+
+// Roll back to blocks: keep them whole, delete what follows the last (no re-run).
+narratorRoutes.post("/:id/blocks/rollback", async (c) => {
+	const id = c.req.param("id");
+	const { blockIds, skipRevert, scope, revertPlan } = rollbackToBlocksSchema.parse(
+		await c.req.json(),
+	);
+	if (skipRevert !== true && !revertPlan)
+		throw new AppError(
+			"Review a fresh rollback preview before restoring files",
+			409,
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
+	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
+	const narrator = await narratorService.getById(id);
+	// As for the index route: the rollback discards the running turn it lands in.
+	await prepareHistoryRewrite(id);
+	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	const result = await rollbackToBlocks(id, blockIds, {
+		revertPlan,
+		skipRevert: skipRevert === true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
+		...(scope ? { scope } : {}),
+	});
+	return c.json(result);
+});
+
+// The file-restore plan of a block rollback or a tool block deletion.
+narratorRoutes.post("/:id/blocks/revert-action-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const raw = await c.req.json().catch((error: unknown) => {
+		if (!(error instanceof SyntaxError)) throw error;
+		throw new ValidationError("Invalid preview JSON body");
+	});
+	const { action, blockIds, idempotencyKey, recoveryMode } = validRevertPreview(
+		blockRevertActionPreviewSchema.safeParse(raw),
+	);
+	const targets = resolveBlockTargets(narratorId, blockIds);
+	let boundary: { messageId: string; blockIndex: number };
+	if (action === "delete_tool_block") {
+		if (targets.length !== 1 || targets[0].kind !== "tool")
+			throw new ValidationError("A tool block deletion names exactly one tool block");
+		boundary = { messageId: targets[0].messageId, blockIndex: targets[0].from };
+	} else boundary = lastTargetElement(targets);
+	const result = await prepareLocalRevertAction(
+		narratorPrincipalOf(c),
+		narratorId,
+		{ action, ...boundary, idempotencyKey, ...(recoveryMode ? { recoveryMode } : {}) },
+		AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(60_000)]),
+	);
+	return revertPreviewJson(c, result);
+});
+
+// What rolling back to blocks would delete and restore (`?blockIds=a,b`).
+narratorRoutes.get("/:id/blocks/rollback-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const blockIds = blockIdsSchema.parse((c.req.query("blockIds") ?? "").split(",").filter(Boolean));
+	const boundary = lastTargetElement(resolveBlockTargets(narratorId, blockIds));
+	return rollbackPreviewResponse(c, narratorId, boundary.messageId, boundary.blockIndex);
+});
+
+// One block in full; a tool block with its call's ledger detail.
+narratorRoutes.get("/:id/blocks/:blockId", async (c) => {
+	const id = c.req.param("id");
+	const [target] = resolveBlockTargets(id, [c.req.param("blockId")]);
+	const block = blockDetail(target);
+	const toolCall =
+		target.kind === "tool" && target.wireId
+			? await narratorService.getToolCallDetail(id, target.wireId, { messageId: target.messageId })
+			: null;
+	return c.json({ block, ...(toolCall ? { toolCall } : {}) });
+});
+
+// What editing an input block and regenerating would delete and restore.
+narratorRoutes.get("/:id/blocks/:blockId/edit-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const [target] = resolveBlockTargets(narratorId, [c.req.param("blockId")]);
+	if (target.kind !== "input") throw new ValidationError("Only an input block is edited this way");
+	return rollbackPreviewResponse(c, narratorId, target.messageId, null);
+});
+
+// The files deleting a tool block would roll back.
+narratorRoutes.get("/:id/blocks/:blockId/delete-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const [target] = resolveBlockTargets(narratorId, [c.req.param("blockId")]);
+	if (target.kind !== "tool" || !target.wireId) return notAToolUse(c);
+	return toolBlockDeletePreviewResponse(c, narratorId, target.messageId, target.wireId);
+});
+
+// Edit an output block's text; the envelope's other blocks stay as they are.
+narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
+	const id = c.req.param("id");
+	const { content } = editAssistantMessageSchema.parse(await c.req.json());
+	const narrator = await narratorService.getById(id);
+	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	return c.json(await editOutputBlock(id, c.req.param("blockId"), content, c.get("user").sub));
+});
+
+// Put an edited output block back to its text before its first edit.
+narratorRoutes.post("/:id/blocks/:blockId/restore", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	return c.json(await restoreOutputBlock(id, c.req.param("blockId")));
+});
+
+// Edit an input block and regenerate from it.
+narratorRoutes.post("/:id/blocks/:blockId/edit-and-regenerate", async (c) => {
+	const id = c.req.param("id");
+	const [target] = resolveBlockTargets(id, [c.req.param("blockId")]);
+	if (target.kind !== "input") throw new ValidationError("Only an input block is edited this way");
+	return editAndRegenerateResponse(c, id, target.messageId);
+});
+
+// Re-execute a denied tool block.
+narratorRoutes.post("/:id/blocks/:blockId/allow-retry", async (c) => {
+	const id = c.req.param("id");
+	const [target] = resolveBlockTargets(id, [c.req.param("blockId")]);
+	if (target.kind !== "tool" || !target.wireId)
+		throw new ValidationError("Only a tool block can be re-executed");
+	return allowRetryResponse(c, id, target.wireId);
 });
 
 // Delete a single content block from a message
@@ -6130,7 +6290,19 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	) {
 		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
 	}
+	return rollbackPreviewResponse(c, narratorId, messageId, requestedBlockIndex);
+});
 
+/**
+ * What rolling back to `requestedBlockIndex` of a message would delete and restore; a
+ * null index keeps the whole message (the edit-and-regenerate preview).
+ */
+async function rollbackPreviewResponse(
+	c: Context,
+	narratorId: string,
+	messageId: string,
+	requestedBlockIndex: number | null,
+) {
 	// Verify narrator exists
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -6214,7 +6386,7 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 			preview.historySummary?.deletedBlockCount ?? blocks.length - effectiveBlockIndex - 1,
 		deletedMessageCount: preview.historySummary?.deletedMessageCount ?? 0,
 	});
-});
+}
 
 /**
  * Preview the files that deleting a single tool_use block would roll back.
@@ -6258,15 +6430,26 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 	if (!block) return c.json({ error: `Block index ${blockIndex} out of range` }, 400);
 
 	// A non-tool block changes no files, so there is nothing to roll back.
-	if (block.type !== "tool_use" || !block.id) {
-		return c.json({ available: false, reason: "not_a_tool_use", files: [], conflicts: [] });
-	}
+	if (block.type !== "tool_use" || !block.id) return notAToolUse(c);
+	return toolBlockDeletePreviewResponse(c, narratorId, messageId, block.id);
+});
 
-	const preview = await previewNarratorScopedForToolUses(
-		narratorId,
-		[{ messageId, toolUseId: block.id }],
-		{ withContents: true, principal: narratorPrincipalOf(c), signal: c.req.raw.signal },
-	);
+function notAToolUse(c: Context) {
+	return c.json({ available: false, reason: "not_a_tool_use", files: [], conflicts: [] });
+}
+
+/** The files deleting the tool call `toolUseId` of a message would roll back. */
+async function toolBlockDeletePreviewResponse(
+	c: Context,
+	narratorId: string,
+	messageId: string,
+	toolUseId: string,
+) {
+	const preview = await previewNarratorScopedForToolUses(narratorId, [{ messageId, toolUseId }], {
+		withContents: true,
+		principal: narratorPrincipalOf(c),
+		signal: c.req.raw.signal,
+	});
 	return revertPreviewJson(c, {
 		available: preview.available && preview.plan?.coverageComplete === true,
 		...(preview.reason
@@ -6280,7 +6463,7 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 		totalFileCount: preview.totalFileCount,
 		hasMore: preview.hasMore,
 	});
-});
+}
 
 /** Preview file state for a pending Write/Edit permission request */
 narratorRoutes.get("/:id/permission-file-preview", async (c) => {

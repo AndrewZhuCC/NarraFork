@@ -4197,6 +4197,8 @@ const sqliteNarratorPersistence = {
 			preserveExecutionOwner?: boolean;
 			/** Writes that belong to the edit, run first in its transaction. */
 			beforeWrite?: (tx: DbTx) => void;
+			/** Writes that follow the edit once its block rows are rebuilt, in its transaction. */
+			afterWrite?: (tx: DbTx, messageId: string) => void;
 		} = {},
 	): Promise<string> {
 		const ref = await db.query.narratorMessageRefs.findFirst({
@@ -4228,6 +4230,7 @@ const sqliteNarratorPersistence = {
 		const result = db.transaction((tx) => {
 			const id = rewrite(tx);
 			flushChangedEnvelopes();
+			options.afterWrite?.(tx, id);
 			return id;
 		});
 		function rewrite(tx: DbTx): string {

@@ -954,6 +954,40 @@ describe("action-bound HTTP preview and real local execution", () => {
 		expect(events.some((event) => event.message.type === "full_reload")).toBe(true);
 		expect(events.every((event) => event.committed)).toBe(true);
 	});
+	test("delete_tool_block selects every execution attempt of a re-run call", async () => {
+		const path = join(workspace, "rerun.txt");
+		await writeFile(path, "R0\n");
+		const first = await write(path, "R1\n");
+		// The same call run again: a second ledger row of the first tool_use that also wrote,
+		// and no tool_use element of its own. (Its file journal is bound to the attempt it ran
+		// as, so the row keeps that attempt number.)
+		const again = await write(path, "R2\n", first.messageId);
+		db.update(schema.narratorToolCalls)
+			.set({ toolUseId: first.toolUseId })
+			.where(eq(schema.narratorToolCalls.id, again.toolCallId))
+			.run();
+		const content = messageRow(first.messageId)?.contentJson as Array<{ id?: string }>;
+		db.update(schema.narratorMessages)
+			.set({ contentJson: content.filter((element) => element.id !== again.toolUseId) })
+			.where(eq(schema.narratorMessages.id, first.messageId))
+			.run();
+		const plan = await actionPrepared("delete_tool_block", first.messageId, {
+			blockIndex: first.blockIndex,
+		});
+		expect((await originalManifest(plan.manifestDigests.selector)).request.selector).toEqual({
+			kind: "tool_calls",
+			toolCallIds: [first.toolCallId, again.toolCallId].sort(),
+		});
+		await committed(plan, "delete_tool_block");
+		expect(await readFile(path, "utf8")).toBe("R0\n");
+		expect(
+			db
+				.select({ id: schema.narratorToolCalls.id })
+				.from(schema.narratorToolCalls)
+				.where(eq(schema.narratorToolCalls.toolUseId, first.toolUseId))
+				.all(),
+		).toEqual([]);
+	});
 	test("assistant rollback uses exact after_block and removes the entire later window", async () => {
 		const path = join(workspace, "window.txt");
 		const original = "A0\n1\n2\n3\nB0\n4\n5\n6\nC0\n";

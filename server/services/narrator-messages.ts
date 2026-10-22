@@ -88,6 +88,7 @@ import {
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
 import { newEnvelopeColumns } from "./narrator-block-sync";
+import { resolveBlockTargets, targetElements } from "./narrator-block-targets";
 import {
 	createPostgresNarratorDisplayPagePort,
 	readDisplayFixtureMessages,
@@ -5205,6 +5206,32 @@ const narratorMessageQueriesUnlocked = {
 		return deleteBlockSelection(narratorId, blocks, opts);
 	},
 
+	/**
+	 * Delete blocks named by id (docs/BLOCK_STORAGE-DESIGN.md §5.5): each block whole, so a
+	 * tool block goes with every ledger attempt of its call, an input with all its
+	 * attachments, and a reasoning run is the ids of all its blocks.
+	 */
+	async deleteBlocks(narratorId: string, blockIds: string[], opts?: BlockDeleteOptions) {
+		const targets = resolveBlockTargets(narratorId, blockIds);
+		const { results, ...outcome } = await deleteBlockSelection(
+			narratorId,
+			targetElements(targets),
+			opts,
+		);
+		const deletedMessages = new Set(
+			results.filter((result) => result.messageDeleted).map((result) => result.messageId),
+		);
+		return {
+			...outcome,
+			deleted: targets.length,
+			results: targets.map((target) => ({
+				blockId: target.blockId,
+				messageId: target.messageId,
+				messageDeleted: deletedMessages.has(target.messageId),
+			})),
+		};
+	},
+
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
 		const result = db.transaction((tx) => {
 			const ref = tx.query.narratorMessageRefs
@@ -5349,6 +5376,7 @@ export const narratorMessageQueries = {
 	deleteMessagesAfter: admittedMutation(narratorMessageQueriesUnlocked.deleteMessagesAfter),
 	deleteMessageBlock: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlock),
 	deleteMessageBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlocks),
+	deleteBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteBlocks),
 	deleteEmptyRetryPlaceholder: admittedMutation(
 		narratorMessageQueriesUnlocked.deleteEmptyRetryPlaceholder,
 	),

@@ -36,6 +36,8 @@ const DIRECT_WRITERS: Record<string, string> = {
 	"server/services/narrator-persistence.ts": "store implementation",
 	"server/services/narrator-block-sync.ts": "block rows: ledger block binding, body bytes",
 	"server/services/narrator-turns.ts": "the run's trigger envelope",
+	"server/services/narrator-block-targets.ts":
+		"materialize: flip an envelope to block format, the store syncs its rows",
 	"server/services/narrator-block-backfill.ts":
 		"legacy envelope conversion: format, bytes, ledger block",
 	"server/services/narrator-messages.ts": "block deletion, truncation, card dismissal, COW",

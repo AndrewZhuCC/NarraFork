@@ -456,15 +456,18 @@ export function syncCopiedEnvelope(fromMessageId: string, toMessageId: string): 
 
 /**
  * Point a copy's blocks at the blocks they were copied from (§6.3): the copy keeps the
- * lineage root, the attempt and the creation time of each block it shares a key with.
+ * lineage root, the attempt, the creation time and the pre-edit body of each block it
+ * shares a key with.
  */
 export function inheritBlockLineage(fromMessageId: string, toMessageId: string): void {
 	const source = keyedRows(fromMessageId);
 	if (!source.length) return;
 	const byKey = new Map(source.map((row) => [row.key, row]));
 	const inherit = database.sqlite.prepare(
-		`UPDATE narrator_blocks SET origin_block_id = ?, attempt_id = ?, created_at = ?
-		 WHERE id = ? AND (origin_block_id IS NOT ? OR attempt_id IS NOT ? OR created_at IS NOT ?)`,
+		`UPDATE narrator_blocks SET origin_block_id = ?, attempt_id = ?, created_at = ?,
+			original_payload = coalesce(original_payload, ?)
+		 WHERE id = ? AND (origin_block_id IS NOT ? OR attempt_id IS NOT ? OR created_at IS NOT ?
+			OR (original_payload IS NULL AND ? IS NOT NULL))`,
 	);
 	for (const row of keyedRows(toMessageId)) {
 		const from = byKey.get(row.key);
@@ -474,10 +477,12 @@ export function inheritBlockLineage(fromMessageId: string, toMessageId: string):
 			origin,
 			from.attemptId,
 			from.createdAt,
+			from.originalPayload,
 			row.id,
 			origin,
 			from.attemptId,
 			from.createdAt,
+			from.originalPayload,
 		);
 	}
 }
@@ -489,6 +494,7 @@ function keyedRows(messageId: string): Array<{
 	originBlockId: string | null;
 	attemptId: string | null;
 	createdAt: string;
+	originalPayload: string | null;
 }> {
 	const envelope = database.sqlite
 		.prepare(
@@ -500,7 +506,7 @@ function keyedRows(messageId: string): Array<{
 	const rows = database.sqlite
 		.prepare(
 			`SELECT id, payload, state, origin_block_id AS originBlockId, attempt_id AS attemptId,
-				created_at AS createdAt
+				created_at AS createdAt, original_payload AS originalPayload
 			 FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal`,
 		)
 		.all(messageId) as Array<{
@@ -510,6 +516,7 @@ function keyedRows(messageId: string): Array<{
 		originBlockId: string | null;
 		attemptId: string | null;
 		createdAt: string;
+		originalPayload: string | null;
 	}>;
 	const keys = splitEnvelope({
 		...envelope,

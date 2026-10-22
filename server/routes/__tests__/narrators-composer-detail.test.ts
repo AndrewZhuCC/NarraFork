@@ -22,6 +22,7 @@ test.each([
 	"/n/messages",
 	"/n/draft",
 	"/n/edit-and-regenerate/m",
+	"/n/blocks/b/edit-and-regenerate",
 	"/n/buffer/m",
 ])("composer JSON budget bounds streamed and dishonest-length requests at %s", async (path) => {
 	const app = new Hono();
@@ -81,6 +82,7 @@ test("JSON-only draft cannot bypass its limit with a forged multipart header", a
 test.each([
 	"/n/messages",
 	"/n/edit-and-regenerate/m",
+	"/n/blocks/b/edit-and-regenerate",
 	"/n/buffer/m",
 ])("%s budgets the actual decoder rather than a MIME substring", async (path) => {
 	const app = new Hono();
