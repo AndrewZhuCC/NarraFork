@@ -3,6 +3,7 @@ import type { SQL } from "bun";
 import { compiledWorkerSpecifiers } from "../../lib/compiled-worker";
 import { hotSafe } from "../../lib/hot-safe";
 import { isCompiledRuntime } from "../../lib/runtime-target";
+import { settings } from "../../lib/settings";
 import { modelHistoryManifest } from "./model-history-delta";
 import {
 	MODEL_HISTORY_MAX_BYTES,
@@ -317,6 +318,7 @@ async function readWorker(
 						limit: options.limit,
 						maxBytes: MODEL_HISTORY_MAX_BYTES,
 						versioned,
+						bodiesFromBlocks: backend.backend === "sqlite" && settings.narratorBlocks.read,
 						previous: previous ? modelHistoryManifest(previous.source) : undefined,
 						previousCatalogIdentity: previous?.catalogIdentity,
 						...(backend.backend === "sqlite"
@@ -408,6 +410,7 @@ export async function loadModelHistorySource(
 			maxBytes: 1024 * 1024,
 			inlineRowBytes: 64 * 1024,
 			versioned: before.trusted,
+			bodiesFromBlocks: settings.narratorBlocks.read,
 		});
 	else {
 		let loaded: Awaited<ReturnType<typeof readWorker>>;

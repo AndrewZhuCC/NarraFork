@@ -11,6 +11,7 @@ import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
 
 export type { NarratorDisplayMessage } from "../lib/db-worker/display-page-protocol";
 
@@ -213,6 +214,9 @@ export async function readNarratorDisplayMessages(
 		ioBudget: options.ioBudget,
 		...(options.maxRawBytes !== undefined && { maxRawBytes: options.maxRawBytes }),
 		deadlineAt: startedAt + Math.min(timeoutMs, DISPLAY_PAGE_LIMITS.timeoutMs),
+		// PostgreSQL is still written in the legacy shape only.
+		...(source.backend !== "postgres" &&
+			settings.narratorBlocks.read && { bodiesFromBlocks: true }),
 	};
 	try {
 		validateDisplayPageRequest(request, limits);
