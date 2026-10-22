@@ -31,6 +31,7 @@ import { ProviderConfigView } from "../../components/providers/ProviderConfigVie
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
 	ProviderAddContext,
+	ProviderImportContext,
 	TokenDanceAddContext,
 } from "../../components/providers/provider-add-context";
 import type { AddProviderDraft } from "../../components/providers/provider-add-draft";
@@ -489,12 +490,11 @@ function SettingsProvidersPage() {
 	}, [providerSettingsDirty]);
 
 	// ── Add provider ──
-	const handleAddProvider = useCallback(
-		async (draft: AddProviderDraft) => {
+	/** Save one provider under `id`, then refresh its models (shared by add and import). */
+	const createProvider = useCallback(
+		async (id: string, draft: AddProviderDraft) => {
 			if (!settingsFeatureCapability.patchSupported)
 				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
-			const id = creationIdRef.current ?? nanoid();
-			creationIdRef.current = id;
 			const bounded = async <T,>(
 				execute: (options: { signal: AbortSignal; maxResponseBytes: number }) => Promise<T>,
 			): Promise<T> => {
@@ -519,7 +519,7 @@ function SettingsProvidersPage() {
 				qc.setQueryData(["admin", "settings"], response);
 				qc.setQueryData(["settings"], response);
 			};
-			const result = await createProviderAndRefresh(id, draft, stateRef.current, {
+			return createProviderAndRefresh(id, draft, stateRef.current, {
 				getSettings: () => bounded((options) => api.getSettings(options)),
 				updateSettings: (payload) => bounded((options) => api.updateSettings(payload, options)),
 				refreshModels: (providerId, protocol) =>
@@ -544,6 +544,15 @@ function SettingsProvidersPage() {
 					unconfirmedSave: t("addProviderSaveUnconfirmed"),
 				},
 			});
+		},
+		[settingsFeatureCapability.patchSupported, qc, t],
+	);
+
+	const handleAddProvider = useCallback(
+		async (draft: AddProviderDraft) => {
+			const id = creationIdRef.current ?? nanoid();
+			creationIdRef.current = id;
+			const result = await createProvider(id, draft);
 			const openCreated =
 				providerPageMountedRef.current && isAddingRef.current && creationIdRef.current === id;
 			if ("refreshError" in result) {
@@ -565,7 +574,17 @@ function SettingsProvidersPage() {
 			// The add route navigates back with this id, which opens the new provider.
 			return openCreated ? result.providerId : undefined;
 		},
-		[settingsFeatureCapability.patchSupported, qc, t, tc],
+		[createProvider, t, tc],
+	);
+
+	// Each imported provider is a separate creation with its own id; the import
+	// panel reports the batch outcome itself, so no per-provider notification.
+	const handleImportProvider = useCallback(
+		async (draft: AddProviderDraft) => {
+			const result = await createProvider(nanoid(), draft);
+			return { refreshFailed: "refreshError" in result };
+		},
+		[createProvider],
 	);
 
 	const confirmSaveBeforeRefresh = useCallback(async () => {
@@ -1091,19 +1110,21 @@ function SettingsProvidersPage() {
 				}
 			>
 				<ProviderAddContext value={handleAddProvider}>
-					{restoreFetchError && (
-						<Alert color="yellow">
-							{t("tokendance.settingsUnavailable")}
-							<Button
-								size="xs"
-								variant="light"
-								onClick={() => setReturnEpoch((value) => value + 1)}
-							>
-								{t("tokendance.retryRestore")}
-							</Button>
-						</Alert>
-					)}
-					<Outlet />
+					<ProviderImportContext value={user?.role === "admin" ? handleImportProvider : null}>
+						{restoreFetchError && (
+							<Alert color="yellow">
+								{t("tokendance.settingsUnavailable")}
+								<Button
+									size="xs"
+									variant="light"
+									onClick={() => setReturnEpoch((value) => value + 1)}
+								>
+									{t("tokendance.retryRestore")}
+								</Button>
+							</Alert>
+						)}
+						<Outlet />
+					</ProviderImportContext>
 				</ProviderAddContext>
 			</TokenDanceAddContext>
 		);

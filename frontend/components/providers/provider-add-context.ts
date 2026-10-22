@@ -7,6 +7,17 @@ export const ProviderAddContext = createContext<
 	((draft: AddProviderDraft) => Promise<string | undefined>) | null
 >(null);
 
+/**
+ * Saves one provider imported from another tool's local config as a new provider.
+ * Null when the viewer cannot import (not an admin, or outside the providers route).
+ */
+export const ProviderImportContext = createContext<
+	((draft: AddProviderDraft) => Promise<{ refreshFailed: boolean }>) | null
+>(null);
+export function useProviderImport() {
+	return useContext(ProviderImportContext);
+}
+
 export const TokenDanceAddContext = createContext<{
 	login: (addPage?: Record<string, unknown>) => Promise<void>;
 	restoredAddPage?: Record<string, unknown>;

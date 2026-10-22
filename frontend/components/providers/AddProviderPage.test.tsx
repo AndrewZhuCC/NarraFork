@@ -6,7 +6,8 @@ import type { Root } from "react-dom/client";
 import { ApiError } from "../../lib/api";
 import settingsEn from "../../locales/en/settings.json";
 import settingsZhCn from "../../locales/zh-CN/settings.json";
-import { TokenDanceAddContext } from "./provider-add-context";
+import { defaultLocalImportSelection } from "./LocalProviderImport";
+import { ProviderImportContext, TokenDanceAddContext } from "./provider-add-context";
 import type { AddProviderDraft } from "./provider-add-draft";
 import { PROVIDER_PRESETS } from "./provider-presets";
 
@@ -214,7 +215,8 @@ describe("AddProviderPage interactions", () => {
 		],
 		[new Error("secret request body"), "loginStartClientFailed"],
 	] as const) {
-		for (const language of ["en", "zh-CN"] as const) {
+		// TokenDance is only offered in the Chinese UI.
+		for (const language of ["zh-CN"] as const) {
 			test(`TokenDance start failure is actionable and redacted (${language}, ${key}, ${error instanceof ApiError ? error.status : "client"})`, async () => {
 				await act(async () => {
 					await i18n.changeLanguage(language);
@@ -302,13 +304,13 @@ describe("AddProviderPage interactions", () => {
 		expect(button("addProviderContinue").disabled).toBe(false);
 	});
 
-	test("popular shows the seven requested providers in order and search spans the full catalog", async () => {
+	test("popular shows the requested providers in order and search spans the full catalog", async () => {
 		const ids = () =>
 			[...container.querySelectorAll("button[data-provider-preset]")].map((node) =>
 				node.getAttribute("data-provider-preset"),
 			);
+		// English UI: TokenDance is hidden everywhere, including search and "all".
 		expect(ids()).toEqual([
-			"tokendance",
 			"deepseek",
 			"zhipu",
 			"moonshot",
@@ -318,12 +320,25 @@ describe("AddProviderPage interactions", () => {
 			"anthropic",
 		]);
 		await click(button("addProviderCategoryAll"));
-		expect(ids().length).toBe(PROVIDER_PRESETS.length);
+		expect(ids().length).toBe(PROVIDER_PRESETS.length - 1);
+		expect(ids()).not.toContain("tokendance");
 		await click(button("addProviderCategoryPopular"));
 		await type("addProviderSearch", "Groq");
 		expect(ids()).toEqual(["groq"]);
+		await type("addProviderSearch", "TokenDance");
+		expect(ids()).toEqual([]);
 		await type("addProviderSearch", "");
-		expect(ids().length).toBe(8);
+		expect(ids().length).toBe(7);
+	});
+
+	test("Chinese UI lists TokenDance first with its tagline", async () => {
+		await act(async () => {
+			await i18n.changeLanguage("zh-CN");
+		});
+		const card = container.querySelector('button[data-provider-preset="tokendance"]');
+		expect(card).not.toBeNull();
+		expect(container.querySelector("button[data-provider-preset]")).toBe(card);
+		expect(card?.textContent).toContain("便捷使用正规国模");
 	});
 
 	test("Chinese defaults the four configurable platforms to China without overriding manual choices", async () => {
@@ -579,5 +594,46 @@ describe("AddProviderPage interactions", () => {
 		expect(field("addProviderApiKey").value).toBe("entered-key");
 		expect(field("providerPrefix").value).toBe("");
 		expect(added).toEqual([]);
+	});
+});
+
+describe("import from this machine", () => {
+	test("the panel only appears where importing is allowed, and reads nothing until authorized", async () => {
+		expect(container.textContent).not.toContain("Import from this machine");
+		await act(async () => {
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<ProviderImportContext value={async () => ({ refreshFailed: false })}>
+							<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+						</ProviderImportContext>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+		});
+		expect(container.textContent).toContain("Import from this machine");
+		// Only the authorize button: no candidates or import action before a scan.
+		expect(button("localImport.authorize")).toBeTruthy();
+		expect(container.querySelector("[data-local-import-candidate]")).toBeNull();
+		// Choosing a preset hides the panel so the configuration form has the page.
+		await click(preset("OpenAI"));
+		expect(container.textContent).not.toContain("Import from this machine");
+	});
+
+	test("default selection skips providers without a key or already configured", () => {
+		const base = {
+			source: "codex" as const,
+			name: "x",
+			protocol: "openai-responses" as const,
+			baseUrl: "https://example.com/v1",
+			apiKeyPreview: "",
+			configPath: "/x",
+		};
+		const selection = defaultLocalImportSelection([
+			{ ...base, id: "a", hasKey: true, alreadyConfigured: false },
+			{ ...base, id: "b", hasKey: true, alreadyConfigured: true },
+			{ ...base, id: "c", hasKey: false, alreadyConfigured: false },
+		]);
+		expect([...selection]).toEqual(["a"]);
 	});
 });
