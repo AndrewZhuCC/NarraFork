@@ -41,14 +41,11 @@ const MODEL = "identitytest:model";
 const NOW = "2026-09-30T00:00:00.000Z";
 const provider = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("Unexpected model request");
 	},
-	formatToolResult: () => ({}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 } as unknown as ProviderAdapter;
 const unregister = registerExternalProviderResolver({
 	resolve: (name) => (name === "identitytest" ? provider : null),

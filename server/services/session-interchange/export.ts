@@ -46,14 +46,19 @@ import {
 	type InterchangeWarning,
 	WarningCollector,
 } from "@shared/session-interchange/model";
-import { and, asc, eq, inArray } from "drizzle-orm";
-import { db } from "../../db";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { db, sqlite } from "../../db";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
 import { NotFoundError, ValidationError } from "../../lib/errors";
+import { bodySql, readBodies } from "../../lib/narrator-bodies";
 import { getSubagentType, isSubagentVariant } from "../../lib/narrator-utils";
 import { settings } from "../../lib/settings";
 import { getImagePath, imageToBase64 } from "../../lib/uploads";
-import { iterateNarratorTranscript, resolveTranscriptScope } from "../narrator-export";
+import {
+	exportBodiesFromBlocks,
+	iterateNarratorTranscript,
+	resolveTranscriptScope,
+} from "../narrator-export";
 /**
  * Ceiling on the characters one export may hold in memory, subagents included.
  *
@@ -107,7 +112,19 @@ export interface SessionExportResult {
 
 // ── Reading ────────────────────────────────────────────────────────────────
 
-type MessageRow = typeof narratorMessages.$inferSelect;
+/** The message columns the conversion reads; never the large or derived ones. */
+const MESSAGE_COLUMNS = {
+	id: narratorMessages.id,
+	narratorId: narratorMessages.narratorId,
+	role: narratorMessages.role,
+	contentText: narratorMessages.contentText,
+	model: narratorMessages.model,
+	createdAt: narratorMessages.createdAt,
+} as const;
+type MessageRow = Pick<
+	typeof narratorMessages.$inferSelect,
+	keyof typeof MESSAGE_COLUMNS | "contentJson"
+>;
 type ToolRow = Pick<
 	typeof narratorToolCalls.$inferSelect,
 	| "messageId"
@@ -437,6 +454,27 @@ async function rowsToMessages(
 	return out;
 }
 
+/** Message rows by id; a block-format body is assembled from its rows. */
+async function loadMessageRows(ids: string[]): Promise<MessageRow[]> {
+	if (!exportBodiesFromBlocks())
+		return db
+			.select({ ...MESSAGE_COLUMNS, contentJson: narratorMessages.contentJson })
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.id, ids));
+	const rows = await db
+		.select({
+			...MESSAGE_COLUMNS,
+			body: sql<string | null>`${sql.raw(bodySql("narrator_messages", true))}`,
+		})
+		.from(narratorMessages)
+		.where(inArray(narratorMessages.id, ids));
+	const bodies = readBodies(
+		sqlite,
+		rows.map((row) => ({ id: row.id, body: row.body })),
+	);
+	return rows.map(({ body: _body, ...row }) => ({ ...row, contentJson: bodies.get(row.id) }));
+}
+
 /** The narrator's own top-level transcript, full scope, in seq order. */
 async function readTopLevel(narratorId: string, ctx: ReadContext): Promise<InterchangeMessage[]> {
 	const scope = await resolveTranscriptScope(narratorId, "full");
@@ -445,10 +483,7 @@ async function readTopLevel(narratorId: string, ctx: ReadContext): Promise<Inter
 		if (page.refs.length === 0) continue;
 		const ids = page.refs.map((ref) => ref.messageId);
 		const compactIds = new Set(page.refs.filter((ref) => ref.isCompact).map((r) => r.messageId));
-		const loaded = await db
-			.select()
-			.from(narratorMessages)
-			.where(inArray(narratorMessages.id, ids));
+		const loaded = await loadMessageRows(ids);
 		const byId = new Map(loaded.map((row) => [row.id, row]));
 		const ordered = ids.flatMap((id) => {
 			const row = byId.get(id);

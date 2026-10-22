@@ -18,6 +18,7 @@ import {
 import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
+	BlockBackfillStatus,
 	ChangelogEntry,
 	CodexCredentialEntry,
 	CodexLoadBalancingMode,
@@ -1411,6 +1412,13 @@ export const miscApi = {
 	vacuumDatabase: () =>
 		request<DatabaseVacuumResult>("/storage/database/vacuum", {
 			method: "POST",
+		}),
+	getBlockBackfillStatus: () =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill"),
+	setBlockBackfillPaused: (paused: boolean) =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill/pause", {
+			method: "POST",
+			body: JSON.stringify({ paused }),
 		}),
 
 	// Runtime Resources

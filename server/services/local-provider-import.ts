@@ -192,12 +192,68 @@ async function readYaml(ctx: LocalScanContext, path: string): Promise<unknown> {
 	}
 }
 
+// ── Locations ───────────────────────────────────────────────────────────────
+
+function claudeConfigDir(ctx: LocalScanContext): string {
+	return str(ctx.env.CLAUDE_CONFIG_DIR) ?? join(ctx.home, ".claude");
+}
+
+/** `.claude.json` sits beside the config dir by default, inside it with CLAUDE_CONFIG_DIR. */
+function claudeStateFile(ctx: LocalScanContext): string {
+	return str(ctx.env.CLAUDE_CONFIG_DIR)
+		? join(claudeConfigDir(ctx), ".claude.json")
+		: join(ctx.home, ".claude.json");
+}
+
+function codexHomeDir(ctx: LocalScanContext): string {
+	return str(ctx.env.CODEX_HOME) ?? join(ctx.home, ".codex");
+}
+
+function opencodeDirs(ctx: LocalScanContext): { configDir: string; dataDir: string } {
+	return {
+		configDir: join(str(ctx.env.XDG_CONFIG_HOME) ?? join(ctx.home, ".config"), "opencode"),
+		dataDir: join(str(ctx.env.XDG_DATA_HOME) ?? join(ctx.home, ".local", "share"), "opencode"),
+	};
+}
+
+function dshHomeDir(ctx: LocalScanContext): string {
+	return str(ctx.env.DSH_HOME) ?? join(ctx.home, ".dsh");
+}
+
+/** Paths whose existence means the tool is installed or configured here. */
+function sourceMarkers(ctx: LocalScanContext): Record<LocalImportSource, string[]> {
+	const opencode = opencodeDirs(ctx);
+	return {
+		claude: [claudeConfigDir(ctx), claudeStateFile(ctx)],
+		codex: [codexHomeDir(ctx)],
+		opencode: [opencode.configDir, opencode.dataDir],
+		"deepseek-harness": [dshHomeDir(ctx)],
+	};
+}
+
+/**
+ * Which tools have a config location on this machine. Only checks that the
+ * paths exist; no file is opened, so the page may ask this without the admin's
+ * explicit authorization to read configs.
+ */
+export async function detectLocalProviderSources(
+	ctx: LocalScanContext = createDefaultScanContext(),
+): Promise<Array<{ source: LocalImportSource; found: boolean }>> {
+	const markers = sourceMarkers(ctx);
+	return Promise.all(
+		(Object.keys(markers) as LocalImportSource[]).map(async (source) => {
+			const checks = await Promise.all(markers[source].map((path) => ctx.exists(path)));
+			return { source, found: checks.some(Boolean) };
+		}),
+	);
+}
+
 // ── Claude Code ─────────────────────────────────────────────────────────────
 
 const ANTHROPIC_OFFICIAL_BASE = "https://api.anthropic.com";
 
 export async function scanClaude(ctx: LocalScanContext): Promise<SourceScan> {
-	const configDir = str(ctx.env.CLAUDE_CONFIG_DIR) ?? join(ctx.home, ".claude");
+	const configDir = claudeConfigDir(ctx);
 	const notes: LocalImportNote[] = [];
 	const candidates: LocalProviderCandidate[] = [];
 	const found = await ctx.exists(configDir);
@@ -237,9 +293,7 @@ export async function scanClaude(ctx: LocalScanContext): Promise<SourceScan> {
 
 	// An API key saved by `claude` itself lives in .claude.json (beside the config
 	// dir by default, inside it when CLAUDE_CONFIG_DIR is set).
-	const stateFile = str(ctx.env.CLAUDE_CONFIG_DIR)
-		? join(configDir, ".claude.json")
-		: join(ctx.home, ".claude.json");
+	const stateFile = claudeStateFile(ctx);
 	const state = await readJson(ctx, stateFile);
 	const primaryApiKey = str(state?.primaryApiKey);
 	if (primaryApiKey && primaryApiKey !== envKey) {
@@ -264,7 +318,7 @@ export async function scanClaude(ctx: LocalScanContext): Promise<SourceScan> {
 const OPENAI_OFFICIAL_BASE = "https://api.openai.com/v1";
 
 export async function scanCodex(ctx: LocalScanContext): Promise<SourceScan> {
-	const codexHome = str(ctx.env.CODEX_HOME) ?? join(ctx.home, ".codex");
+	const codexHome = codexHomeDir(ctx);
 	const configPath = join(codexHome, "config.toml");
 	const authPath = join(codexHome, "auth.json");
 	const notes: LocalImportNote[] = [];
@@ -428,8 +482,7 @@ async function resolveOpencodeValue(
 }
 
 export async function scanOpencode(ctx: LocalScanContext): Promise<SourceScan> {
-	const configDir = join(str(ctx.env.XDG_CONFIG_HOME) ?? join(ctx.home, ".config"), "opencode");
-	const dataDir = join(str(ctx.env.XDG_DATA_HOME) ?? join(ctx.home, ".local", "share"), "opencode");
+	const { configDir, dataDir } = opencodeDirs(ctx);
 	const authPath = join(dataDir, "auth.json");
 	const notes: LocalImportNote[] = [];
 	const candidates: LocalProviderCandidate[] = [];
@@ -639,7 +692,7 @@ export function parseDotenv(text: string): Record<string, string> {
 }
 
 export async function scanDeepseekHarness(ctx: LocalScanContext): Promise<SourceScan> {
-	const dshHome = str(ctx.env.DSH_HOME) ?? join(ctx.home, ".dsh");
+	const dshHome = dshHomeDir(ctx);
 	const candidates: LocalProviderCandidate[] = [];
 	const found = await ctx.exists(dshHome);
 	if (!found) return { found, candidates, notes: [] };

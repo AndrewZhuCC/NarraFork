@@ -13,12 +13,20 @@
  *   - `anthropic_deferred_tail` — the definition is appended to the end of `tools`
  *     with `defer_loading`, and a `tool_addition` block names it by reference.
  *   - `openai_additional_tools` — an `additional_tools` input item (Responses API).
+ *   - `kimi_system_tools` — a mid-conversation `role:"system"` message whose `tools`
+ *     field defines the tool by value (Kimi Chat Completions).
  *   - `custom_injection` — the JSON schema is written into the load notice itself,
  *     for endpoints that do not validate tool names against the declared list.
  *
  * Everything else (`replace_tools`) keeps the old behaviour: the array follows the
- * loaded set and the cache is lost. A compact starts a new epoch, so the loads before
- * it simply become part of the array.
+ * loaded set and the cache is lost. A new epoch (a compact, or an epoch marker row the
+ * runtime writes when the target changes or the cache has gone cold) folds the loads
+ * before it into the array.
+ *
+ * An epoch that recorded its loaded set (`ToolLoadingEpoch`) fixes the array's share for
+ * its whole length; a change that bypassed `/load` is reconciled into the history as a
+ * notice row instead (docs/BLOCK_STORAGE-DESIGN.md §7.7). Without one, the share is
+ * derived backwards from the current set.
  *
  * Unloading never shrinks the array within an epoch; the executor rejects a call to
  * an unloaded tool instead, and the Anthropic modes also send a `tool_removal` block.
@@ -42,6 +50,7 @@ export const TOOL_LOADING_MODES = [
 	"anthropic_tool_addition",
 	"anthropic_deferred_tail",
 	"openai_additional_tools",
+	"kimi_system_tools",
 	"custom_injection",
 ] as const;
 
@@ -67,6 +76,7 @@ const MODE_PROTOCOL: Record<ToolLoadingMode, ModelProtocol | null> = {
 	anthropic_tool_addition: "anthropic-messages",
 	anthropic_deferred_tail: "anthropic-messages",
 	openai_additional_tools: "openai-responses",
+	kimi_system_tools: "completions-compatible",
 	custom_injection: null,
 };
 
@@ -103,6 +113,21 @@ function gptSupportsAdditionalTools(model: string, codexBackend: boolean): boole
 	return major > floorMajor || (major === floorMajor && minor >= floorMinor);
 }
 
+/** `kimi-k3`, `kimi-k3.5`, and Kimi Coding's `k3`/`k3-256k` → major. */
+const KIMI_VERSION_PATTERN = /(?:^|kimi[-_.]?)k(\d{1,2})(?!\d)/i;
+
+/**
+ * Dynamic tool loading (a `system` message carrying `tools`) is reported for Kimi K3 and
+ * Kimi Coding's `kimi-for-coding`. K2.x and `kimi-for-coding-highspeed` reject a
+ * tool-bearing system message with a 400, so ids that are not known to support it inject.
+ */
+function kimiSupportsSystemTools(model: string): boolean {
+	if (model.includes("highspeed")) return false;
+	if (model === "kimi-for-coding") return true;
+	const match = KIMI_VERSION_PATTERN.exec(model);
+	return !!match && Number(match[1]) >= 3;
+}
+
 /**
  * The modes a model gets when its catalog card declares none. Matched on the bare
  * name so the catalog does not have to list every current model.
@@ -120,6 +145,8 @@ export function defaultToolLoadingModes(
 			? ["openai_additional_tools"]
 			: [];
 	if (bare.includes("deepseek")) return ["anthropic_deferred_tail"];
+	// Through an Anthropic or Responses relay Kimi has no native form; inject instead.
+	if (kimiSupportsSystemTools(bare)) return ["kimi_system_tools", "custom_injection"];
 	return ["custom_injection"];
 }
 
@@ -191,12 +218,66 @@ export interface ToolLoadingEvent {
  */
 export interface ToolLoadingState {
 	managed: ReadonlySet<string>;
+	/**
+	 * The epoch marker row the history's epoch opened at; rows up to and including it
+	 * belong to an earlier epoch, whose loads only keep their notice text.
+	 */
+	epochMarkerId?: string;
 	/** Managed tools loaded when the visible history starts: the `tools` array's share. */
 	base: ReadonlySet<string>;
 	/** Managed tools loaded inside the visible history, in first-load order. */
 	loaded: readonly string[];
 	/** Managed tools loaded right now. */
 	current: ReadonlySet<string>;
+}
+
+/** The loaded set an epoch froze when it opened, and where it opened. */
+export interface ToolLoadingEpoch {
+	/** The marker row inside the history; absent when the epoch opens at its start. */
+	markerId?: string;
+	/** Optional tools loaded when the epoch opened (any tool; managed ones are kept). */
+	toolNames: readonly string[];
+	/** The request target the epoch opened for (`resolveEpochTarget`), when recorded. */
+	target?: string;
+}
+
+/** What an epoch marker records (§7.7); a compact element carries the same as `epoch`. */
+export interface EpochRecord {
+	reason: "compact" | "target" | "cold" | "manual";
+	target?: string;
+	toolNames: string[];
+}
+
+/** The epoch a stored element opens: a marker `{type:"epoch"}` or a compact with `epoch`. */
+export function epochRecordOf(block: unknown): EpochRecord | undefined {
+	if (!block || typeof block !== "object") return undefined;
+	const record = block as Record<string, unknown>;
+	if (record.type !== "epoch" && record.type !== "compact") return undefined;
+	const epoch = record.epoch as Record<string, unknown> | undefined;
+	if (!epoch || typeof epoch !== "object" || !Array.isArray(epoch.toolNames)) return undefined;
+	return {
+		reason: (typeof epoch.reason === "string" ? epoch.reason : "manual") as EpochRecord["reason"],
+		...(typeof epoch.target === "string" ? { target: epoch.target } : {}),
+		toolNames: epoch.toolNames.filter((name): name is string => typeof name === "string"),
+	};
+}
+
+/** The latest epoch marker row of a history, if it has one. */
+export function latestToolLoadingEpoch(
+	messages: readonly DbMessage[],
+): ToolLoadingEpoch | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "system" || !Array.isArray(message.contentJson)) continue;
+		const epoch = epochRecordOf(message.contentJson[0]);
+		if (epoch)
+			return {
+				markerId: message.id,
+				toolNames: epoch.toolNames,
+				...(epoch.target ? { target: epoch.target } : {}),
+			};
+	}
+	return undefined;
 }
 
 /** Older rows name a routine id; newer rows also carry the expanded `toolNames`. */
@@ -224,32 +305,78 @@ export function toolLoadingEventOf(
 	return tools.length > 0 ? { kind, tools } : null;
 }
 
+/** The rows of the current epoch: those after its marker, or all of them. */
+function epochRows(messages: readonly DbMessage[], markerId: string | undefined) {
+	if (!markerId) return messages;
+	const index = messages.findIndex((message) => message.id === markerId);
+	return index === -1 ? messages : messages.slice(index + 1);
+}
+
 /**
- * Replay the visible history's events backwards from the current set to find what
- * was loaded when the history starts. Loads with no notice row (resident tools,
- * creation-time preloads, fork inheritance) therefore land in `base`.
+ * The loading state of the history's current epoch.
+ *
+ * With an epoch that froze its loaded set, that set is the array's share. Without one,
+ * the epoch's events are replayed backwards from the current set to find what was
+ * loaded when it opened, so loads with no notice row (resident tools, creation-time
+ * preloads, fork inheritance) land in `base`.
  */
 export function deriveToolLoadingState(
 	messages: readonly DbMessage[],
 	managed: ReadonlySet<string>,
 	current: Iterable<string>,
+	epoch?: ToolLoadingEpoch,
 ): ToolLoadingState {
-	const events = messages.flatMap((message) => toolLoadingEventOf(message, managed) ?? []);
+	const events = epochRows(messages, epoch?.markerId).flatMap(
+		(message) => toolLoadingEventOf(message, managed) ?? [],
+	);
 	const currentSet = new Set([...current].filter((name) => managed.has(name)));
-	const base = new Set(currentSet);
-	for (let index = events.length - 1; index >= 0; index--) {
-		const event = events[index];
-		for (const name of event.tools) {
-			if (event.kind === "load") base.delete(name);
-			else base.add(name);
+	const base = epoch
+		? new Set(epoch.toolNames.filter((name) => managed.has(name)))
+		: new Set(currentSet);
+	if (!epoch)
+		for (let index = events.length - 1; index >= 0; index--) {
+			const event = events[index];
+			for (const name of event.tools) {
+				if (event.kind === "load") base.delete(name);
+				else base.add(name);
+			}
 		}
-	}
 	const loaded: string[] = [];
 	for (const event of events) {
 		if (event.kind !== "load") continue;
 		for (const name of event.tools) if (!loaded.includes(name)) loaded.push(name);
 	}
-	return { managed, base, loaded, current: currentSet };
+	return {
+		managed,
+		...(epoch?.markerId ? { epochMarkerId: epoch.markerId } : {}),
+		base,
+		loaded,
+		current: currentSet,
+	};
+}
+
+/**
+ * What the current set says that the epoch's frozen set and its notices do not: tools
+ * loaded or unloaded without a notice row. Only meaningful for a frozen epoch; the
+ * runtime writes the difference as notices before the request (§7.7).
+ */
+export function toolLoadingDrift(
+	messages: readonly DbMessage[],
+	state: ToolLoadingState,
+): { loads: string[]; unloads: string[] } {
+	const expected = new Set(state.base);
+	for (const message of epochRows(messages, state.epochMarkerId)) {
+		const event = toolLoadingEventOf(message, state.managed);
+		if (!event) continue;
+		for (const name of event.tools) {
+			if (event.kind === "load") expected.add(name);
+			else expected.delete(name);
+		}
+	}
+	return {
+		loads: [...state.current].filter((name) => !expected.has(name)).sort(),
+		unloads: [...expected].filter((name) => !state.current.has(name)).sort(),
+	};
 }
 
 /**
@@ -417,10 +544,20 @@ export function projectToolLoadingHistory(
 	// Under the additive modes a tool is only ever declared once per epoch. A base tool
 	// that no longer resolves is not in the request's array either.
 	const declared = new Set([...state.base].filter((name) => resolveDefinition(name)));
+	// Loads of an earlier epoch are part of the array now; their notices stay plain text.
+	let inEpoch = !state.epochMarkerId || !messages.some((row) => row.id === state.epochMarkerId);
 	return messages.map((message) => {
+		if (!inEpoch) {
+			if (message.id === state.epochMarkerId) inEpoch = true;
+			return message;
+		}
 		const event = toolLoadingEventOf(message, state.managed);
 		if (!event) return message;
-		if (strategy === "custom_injection" || strategy === "openai_additional_tools") {
+		if (
+			strategy === "custom_injection" ||
+			strategy === "openai_additional_tools" ||
+			strategy === "kimi_system_tools"
+		) {
 			if (event.kind !== "load") return message;
 			const fresh = event.tools.flatMap((name) => {
 				if (declared.has(name)) return [];

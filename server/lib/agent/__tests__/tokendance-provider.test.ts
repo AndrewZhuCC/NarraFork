@@ -30,6 +30,7 @@ let settings: typeof import("../../settings").settings;
 let transport: typeof import("../tokendance-provider").tokenDanceTransport;
 let runTransport: typeof import("../provider-transport").runProviderTransport;
 let resolve: typeof import("../provider").resolveProviderAndModel;
+let LoopTranscript: typeof import("../loop-transcript").LoopTranscript;
 let home = "";
 let oldHome: string | undefined;
 const apiKey = "test-key-that-must-never-escape-12345";
@@ -52,6 +53,7 @@ beforeAll(async () => {
 	settingsProvider = await import("../../settings/provider");
 	settings = (await import("../../settings")).settings;
 	resolve = (await import("../provider")).resolveProviderAndModel;
+	LoopTranscript = (await import("../loop-transcript")).LoopTranscript;
 });
 beforeEach(() => {
 	config = { apiKey, generation: 1, disabled: false };
@@ -99,15 +101,13 @@ function catalog(protocol: string) {
 		},
 	];
 }
-function params(provider: ProviderType): ChatParams {
-	const history: unknown[] = [];
-	provider.pushUserTurn(history, "hello", "tokendance:opaque-model", []);
+function params(): ChatParams {
 	return {
 		model: "tokendance:opaque-model",
 		conversationId: "test-conversation",
 		content: "hello",
 		cwd: home,
-		history,
+		history: [],
 		tools: [],
 		toolResults: [],
 		signal: new AbortController().signal,
@@ -117,7 +117,7 @@ function params(provider: ProviderType): ChatParams {
 describe("strict TokenDance protocol mapping", () => {
 	test("fixed priority and no inference", () => {
 		expect(selectTokenDanceProtocol(protocols.map(([protocol]) => protocol).reverse())).toBe(
-			"openai-responses",
+			"anthropic-messages",
 		);
 		expect(selectTokenDanceProtocol(["openai", "claude", "gemini"])).toBeUndefined();
 		models = [
@@ -137,6 +137,8 @@ describe("strict TokenDance protocol mapping", () => {
 			const provider = new TokenDanceProvider();
 			provider.prepareForModel("tokendance:opaque-model");
 			expect(provider.getActiveReasoningSource()).toBe("tokendance:anthropic-messages");
+			// The stateful /responses helpers follow the protocol actually used.
+			expect(settingsProvider.usesStatefulModel("tokendance", "opaque-model")).toBe(false);
 		} finally {
 			settings.agent.modelProtocolOverrides = previous;
 		}
@@ -225,13 +227,13 @@ describe("strict TokenDance protocol mapping", () => {
 				expect(formatted[0]).toHaveProperty("functionDeclarations");
 			await provider.buildHistory([], "tokendance:opaque-model");
 			expect(provider.getActiveReasoningSource()).toBe(source);
-			const history: unknown[] = [];
-			provider.pushAssistantTurn(history, "calling", [
-				{ toolUseId: "tool1", name: "inspect", input: { text: "x" } },
+			const transcript = new LoopTranscript();
+			transcript.appendStep([
+				{ type: "text", text: "calling" },
+				{ type: "tool_use", toolUseId: "tool1", name: "inspect", input: { text: "x" } },
 			]);
-			provider.pushUserTurn(history, "", "tokendance:opaque-model", [
-				provider.formatToolResult("tool1", "done", false, undefined, "inspect"),
-			]);
+			transcript.settleTool("tool1", { output: "done" });
+			const { history } = await provider.buildHistory(transcript.rows, "tokendance:opaque-model");
 			expect(JSON.stringify(history)).toContain("done");
 		}
 	});
@@ -258,7 +260,7 @@ describe("final headers, recovery, redaction and generation", () => {
 				try {
 					if (mode === "generate") await provider.generate("hello", "tokendance:opaque-model");
 					else
-						for await (const _ of provider.chat(params(provider))) {
+						for await (const _ of provider.chat(params())) {
 							/* no output expected */
 						}
 					throw new Error("Expected API failure");

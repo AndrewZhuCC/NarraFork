@@ -1,4 +1,6 @@
 import type { Database } from "bun:sqlite";
+import { assembleContent } from "@shared/narrator-blocks/storage";
+import { bodyBytesSql, bodySql } from "../../lib/narrator-bodies";
 import { modelJsonContainerBytes } from "./model-history-json";
 
 export const MODEL_HISTORY_REF_BATCH = 200;
@@ -14,6 +16,8 @@ export interface ModelHistoryQueryOptions {
 	/** In-memory unit fixtures have no worker identity; reject large inline JSON before decoding. */
 	inlineRowBytes?: number;
 	versioned?: boolean;
+	/** Read block-format bodies from `narrator_blocks` (SQLite with `narratorBlocks.read`). */
+	bodiesFromBlocks?: boolean;
 }
 export interface ModelHistoryCounters {
 	refQueries: number;
@@ -35,6 +39,7 @@ export type ModelSourceRow = {
 	bodyRevision: number;
 	jsonContainerBytes?: number;
 	narratorId: string;
+	authorNarratorId: string | null;
 	role: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown;
 	contentText: string | null;
@@ -76,6 +81,45 @@ function decode(value: unknown): unknown {
 	return typeof value === "string" ? JSON.parse(value) : value;
 }
 
+/**
+ * The bodies `bodySql` left out, assembled from their block rows, with the allocation
+ * preflight each row's stored payload and state pass, as a `content_json` string would.
+ */
+export async function assembleBlockBodies(
+	query: HistoryQuery,
+	ids: readonly string[],
+	deadline: number,
+	remainingBytes: () => number,
+): Promise<Map<string, { content: unknown[]; jsonContainerBytes: number }>> {
+	const bodies = new Map<
+		string,
+		{ rows: Array<{ payload: unknown; state: unknown }>; bytes: number }
+	>();
+	if (!ids.length) return new Map();
+	const rows = await query<{ messageId: string; payload: string; state: string | null }>(
+		`SELECT message_id AS "messageId", payload, state FROM narrator_blocks
+		 WHERE message_id IN (${ids.map(() => "?").join(",")}) ORDER BY message_id, ordinal`,
+		[...ids],
+	);
+	for (const row of rows) {
+		const body = bodies.get(row.messageId) ?? { rows: [], bytes: 0 };
+		body.bytes +=
+			modelJsonContainerBytes(row.payload, deadline, remainingBytes()) +
+			modelJsonContainerBytes(row.state, deadline, remainingBytes());
+		body.rows.push({ payload: decode(row.payload), state: decode(row.state) });
+		bodies.set(row.messageId, body);
+	}
+	return new Map(
+		ids.map((id) => {
+			const body = bodies.get(id);
+			return [
+				id,
+				{ content: assembleContent(body?.rows ?? []), jsonContainerBytes: body?.bytes ?? 0 },
+			];
+		}),
+	);
+}
+
 /** No ORM relation joins: both message bodies and tools have their own metadata/byte preflight. */
 export async function queryModelHistory(
 	query: HistoryQuery,
@@ -95,6 +139,7 @@ export async function queryModelHistory(
 		maxToolBatchBytes: 0,
 	};
 	const maxBytes = Math.min(options.maxBytes ?? MODEL_HISTORY_MAX_BYTES, MODEL_HISTORY_MAX_BYTES);
+	const fromBlocks = options.bodiesFromBlocks === true;
 	// Reserve decoded UTF-16 strings, detached provider projections and object overhead, not
 	// only wire bytes. Exhaustion is an error, never a silently shortened model conversation.
 	let preparedBytes = 0;
@@ -121,7 +166,7 @@ export async function queryModelHistory(
 		check();
 		const refs = await query<{ messageId: string; seq: number; bytes: number }>(
 			`SELECT r.message_id AS "messageId", r.seq,
-			 length(CAST(m.content_json AS BLOB)) + coalesce(length(CAST(m.content_text AS BLOB)), 0) AS bytes
+			 ${bodyBytesSql("m", fromBlocks)} + coalesce(length(CAST(m.content_text AS BLOB)), 0) AS bytes
 			 FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id
 			 WHERE r.narrator_id = ? AND r.seq > ? AND r.segment_compact_id IS NULL AND m.role <> 'disp'
 			 ORDER BY r.seq LIMIT ?`,
@@ -158,30 +203,37 @@ export async function queryModelHistory(
 					title: string | null;
 				}
 			>(
-				`SELECT m.id, ${options.versioned ? "m.body_revision" : "0"} AS "bodyRevision", m.narrator_id AS "narratorId", m.role, m.content_json AS "contentJson",
+				`SELECT m.id, ${options.versioned ? "m.body_revision" : "0"} AS "bodyRevision", m.narrator_id AS "narratorId",
+				 m.author_narrator_id AS "authorNarratorId", m.role, ${bodySql("m", fromBlocks)} AS "contentJson",
 				 m.content_text AS "contentText", m.parent_tool_use_id AS "parentToolUseId",
 				 m.sdk_message_uuid AS "messageUuid", m.created_by AS "createdBy", m.origin,
 				 m.origin_label AS "originLabel", u.username, n.title
 				 FROM narrator_messages m LEFT JOIN users u ON u.id = m.created_by
-				 LEFT JOIN narrators n ON n.id = m.narrator_id WHERE m.id IN (${placeholders})`,
+				 LEFT JOIN narrators n ON n.id = coalesce(m.author_narrator_id, m.narrator_id)
+				 WHERE m.id IN (${placeholders})`,
 				ids,
 			);
 			counters.bodyQueries++;
 			if (bodies.length !== ids.length)
 				throw new Error("Model history snapshot contains missing messages");
+			const fromRows = await assembleBlockBodies(
+				query,
+				bodies.filter((body) => body.contentJson === null).map((body) => body.id),
+				options.deadline,
+				() => maxBytes - preparedBytes,
+			);
 			const byId = new Map<string, ModelSourceRow>();
 			for (const { username, title, ...body } of bodies) {
-				const jsonContainerBytes = modelJsonContainerBytes(
-					body.contentJson,
-					options.deadline,
-					maxBytes - preparedBytes,
-				);
+				const assembled = fromRows.get(body.id);
+				const jsonContainerBytes =
+					assembled?.jsonContainerBytes ??
+					modelJsonContainerBytes(body.contentJson, options.deadline, maxBytes - preparedBytes);
 				check(0, 0, jsonContainerBytes);
 				byId.set(body.id, {
 					jsonContainerBytes,
 					...body,
 					seq: batchRefs.find((ref) => ref.messageId === body.id)?.seq ?? 0,
-					contentJson: decode(body.contentJson),
+					contentJson: assembled ? assembled.content : decode(body.contentJson),
 					creator: username == null ? null : { username },
 					narrator: { title },
 					toolCalls: [],

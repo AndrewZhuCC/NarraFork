@@ -1988,7 +1988,11 @@
 			"spec_context_cleared": "上下文已清空",
 			"review_feedback": "代码评审",
 			"interrupt_task_guard": "中断任务提醒",
-			"tutorial_lesson": "教程课程"
+			"tutorial_lesson": "教程课程",
+			"turn_nudge": "轮次预算",
+			"broken_call": "无效的工具调用",
+			"continue_prompt": "继续",
+			"workspace_changed": "工作区已切换"
 		},
 		"cadence": {
 			"everyNTools": "每 {{n}} 次工具调用"
@@ -2009,6 +2013,10 @@
 			"noticeSilentProgress": "已连续 {{count}} 次工具调用未输出可见文本",
 			"noticeRelaxedPlan": "仍在规划中 — 计划写入 {{planFile}}，暂不要开始实现",
 			"noticePipelineExit": "Pipeline 仍在活动 — 请确认是否仍需要",
+			"noticeTurnNudge": "已用 {{turnIndex}}/{{maxTurns}} 轮 — 该收尾了",
+			"noticeBrokenCall": "无效的 {{toolNames}} 调用已从上下文移除 — 请用有效参数重试",
+			"noticeContinue": "空回复后请模型继续",
+			"noticeWorkspaceChanged": "工作目录已切换 — 在新工作区中继续",
 			"tasksCurrent": "Dynamic Spec — {{n}} 条开放任务",
 			"tasksEmptyNever": "Dynamic Spec — 尚未建立任务",
 			"tasksEmptyDone": "Dynamic Spec — 任务已全部完成，需要重新整理",

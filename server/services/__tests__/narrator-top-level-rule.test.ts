@@ -11,6 +11,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { historyStrings } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
@@ -185,7 +186,7 @@ for (const shape of shapes) {
 			expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 		});
 
-		test("official provider: the retried snapshot is current input once, never history; trailing sys kept", async () => {
+		test("official provider: the retried snapshot reaches history once; trailing sys kept", async () => {
 			seed(shape);
 			const snapshotText = "the exact accepted bytes for the official provider";
 			const accepted = {
@@ -251,8 +252,11 @@ for (const shape of shapes) {
 					provider: "top-level-official",
 					currentInput: started[0],
 				});
-				expect(prepared.currentText.split(snapshotText).length).toBe(2);
-				expect(JSON.stringify(prepared.history)).not.toContain(snapshotText);
+				// The retried row carries the snapshot into the history exactly once.
+				expect(prepared.currentInputPersisted).toBe(true);
+				expect(prepared.currentText).toBe("");
+				expect(prepared.currentInputText.split(snapshotText).length).toBe(2);
+				expect(historyStrings(prepared.history).split(snapshotText).length).toBe(2);
 				// Official semantics: the trailing sys row stays a system message in history.
 				expect(prepared.history).toEqual(
 					expect.arrayContaining([
@@ -359,7 +363,7 @@ for (const shape of shapes) {
 			const seen: Array<{ id: string; parentToolUseId?: string | null }> = [];
 			const builder = spyOn(agent, "buildHistory").mockImplementation(async (messages) => {
 				for (const row of messages) seen.push({ id: row.id, parentToolUseId: row.parentToolUseId });
-				return { history: [], trailingToolResults: [] };
+				return { history: [] };
 			});
 			try {
 				// No destination passed: it is read from the session's run registration.

@@ -878,7 +878,7 @@ AskUserQuestion 的作答不走 `patchState`：它是 attempt 的执行输入，
 | assistant 编辑 / 删除 / 回滚 | `editBlock`、`deleteBlocks`；共享则 COW | 显式操作，允许改写前缀；编辑清空骨架（§5.5） |
 | 翻译 | `patchState`（按 part） | 不触发 revision，前缀不变 |
 | 跨 provider 切换 | 下一次请求前 `openEpoch(reason = target)` | 旧块的凭据按携带策略降级或丢弃（§7.4）；新纪元完整重建 |
-| reflection 循环 | 不写块。reflection 请求 = 父请求的线上前缀 + 只在内存里的后缀，工具表沿用父请求的快照（`loop.ts:1399-1401`） | 结论经父侧 tool 块的结果（账本）回到历史；reflection 自己的轮次不入库，与现状相同（`loop.ts:1352-1385` 关掉了它的持久化回调） |
+| reflection 循环 | 不写块。reflection 拿到父请求所投影的行（父 transcript + 当前轮输入），自己的 prompt 与纠正轮写进它的内存 transcript，经同一投影发出，工具表沿用父请求的快照；前缀与父请求逐字节相同 | 结论经父侧 tool 块的结果（账本）回到历史；reflection 自己的轮次不入库，与现状相同（关掉了它的持久化回调） |
 | 内部执行（`internal_read_`） | 只写账本行，`block_id` 为 null，带内部标记 | 不投影（§3.7） |
 | `/bash` | `input`（`model_text` = 命令）→ 合成 assistant 步，一个 `issuer = "user"` 的 tool 块，`cause_block_id` 指回输入 | 不再有只给显示用的 `tool_result` 块 |
 | plan mode | 进入 / 退出写 `context/plan` 标记；system 中的 plan 段冻结，变化追加提醒 | 工具描述的 plan 改写见 §7.7 |
@@ -1050,6 +1050,13 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 - loop 持有一个 `HistoryView`。store 写入块之后，把**同一个规范块对象**追加进 view。
 - 每次发请求都调用 `toTurns` 和 `toWire`。
 - provider 接口删去 `pushAssistantTurn`、`pushUserTurn`、`formatToolResult`、`buildHistory`，只剩 `toWire` 和 `chat(wire)`。
+
+**P0 的实现**（块表之前，行仍是 `DbMessage`）
+- 行 → provider 历史只有一个入口：`buildAdapterHistory`（`server/lib/agent/history-build.ts`），宿主重建与 loop 投影都走它。
+- loop 持有 `LoopTranscript`（`server/lib/agent/loop-transcript.ts`）：与 store 相同写入点、相同行形状的内存行（输入行、带账本的 assistant 步、结果结算）。宿主的行作为初值，每次重建替换它。
+- 有宿主时，首个请求用宿主构造的历史，之后每个请求用 `rebuildRequestHistory`（DB 行）；没有宿主（reflection、搜索探针）或重建失败时，请求就是 transcript 的投影，`content` 为空。
+- provider 接口已删去 `pushAssistantTurn`、`pushUserTurn`、`formatToolResult`，`BuiltHistory.trailingToolResults` 一并删除；`buildHistory` 暂作第二段入口，P1 改为 `toWire`。
+- loop 内的 tool_use id 重映射随之删除：重复或不合规的 id 由投影里的 `uniquifyDbMessageToolUseIds` 统一处理。
 - loop 内不再拼接字符串。当前轮由哪些单元组成、以什么顺序合并，完全由 seq 和第一段的分组规则决定。现在由三处各自拼接：`history.ts:238-243`、`orchestrator.ts:2007`、`loop.ts:3309-3311`。
 
 **性能与缓存**
@@ -1529,6 +1536,30 @@ reconcile(narrator, target, now):
 - 双写校验没有差异。
 - 流式期间块表每秒的写入次数，不高于现状的 checkpoint 次数。
 
+**P1 实现说明（与上文的差异）**
+- **块行内容。** P1 的块行 `payload = {raw: [原样存储元素]}`，读者专用字段（译文、卡片状态、`isLatest`）移进 `state = {raw: [...]}`；`assembleContent` 把各行按 ordinal 拼回后与 store 写入的 `content_json` 逐字节一致（`shared/narrator-blocks/storage.ts`；读者专用字段排在最后，见 P2b 实现说明的键序规则）。kind、subtype、phase、`model_text`、`wire_id` 取自 `decodeLegacyContent`。规范化 payload（parts、`provider_meta`）在所有读取方改读块表时（P2）再换，P1 先不存两份正文。
+- **同步路径。** store 的写操作在同一事务里同步受影响的信封（`server/services/narrator-block-sync.ts`）。其余写入方由生成的 v2 触发器写入 `narrator_block_sync_queue`，再由三处排空：事务末尾的 flush（有上限）、5 秒一次的限时清扫，以及启动恢复。块行按 key 匹配，id、attempt、lineage 在改写中保持不变。
+- **revision。** P1 中 `content_json` / `content_text` 的变化对所有格式仍然 bump（读取方仍读 `content_json`）。所以 `patchState` 类写入（译文、卡片状态）在 P1 仍会让模型历史 revision 加一次，P2 切读后取消。
+- **旧信封。** `body_format = 1` 的信封被修改时不就地物化成块，统一留给 P2 回填。
+- **PG。** v2 触发器、块表与 FTS 的迁移齐全，但 PG 写路径在 P1 仍写 `body_format = 1`，块同步只在 SQLite 上进行。
+- **COW。** 事务内的复制统一走 `cowEnvelopeTx`（`narrator-persistence.ts`），四处调用方都改用它：
+  - 副本的属主是持有者，作者保留原值；
+  - 副本的块指回所复制的块。
+  - `revert-history-commit` 的批量程序同样改为属主为持有者、作者保留；
+  - sender 标签读作者（`coalesce(author_narrator_id, narrator_id)`），v2 的标题触发器同时覆盖作者。
+- **丢弃 attempt。** 按块上的 `attempt_id`（即 loop 的 requestId）。没有块行的旧格式信封仍按基线截断。
+- **轮。**
+  - 每次 `runAgentLoopUnlocked` 写一行。
+  - `trigger_message_id` 取运行开始时历史里最新、且尚未归属任何轮的 user 行，并把这行的 `turn_id` 一并补上。
+  - `cause_block_id`、`provider_response_id` 列已建，P1 不写。
+- **纪元。** P1 只冻结工具集合：
+  - compact 成功时，compact 元素里写 `epoch`。
+  - 对账在每个 pass 开始时做，而不是每次请求：
+    - target 变化或缓存已冷，而且重建确实会改变工具布局时，写一行 role=system 的 `epoch` 标记（模型不可见，前端隐藏）；
+    - 冻结纪元内绕过 `/load` 的变化，写成 origin=system 的 `tool_loaded` / `tool_unloaded` 提示。
+  - 冻结工具定义、system 分节快照与提醒、前缀核对，以及 `narrator_text_snapshots` 的写入，留到后续阶段。
+- **双写校验。** 启动时审计最近 50 个块格式信封（`auditRecentEnvelopes`）。有差异就记日志并重新同步。
+
 ### P2 切换读取与回填
 
 **交付**
@@ -1540,6 +1571,47 @@ reconcile(narrator, target, now):
 - 回填完成。
 - 除 project.db 组装和 decode 兜底之外，代码中不再读取 `content_json`。
 - SQLite 方言台账里与 `content_json` 有关的 `json_extract` / `json_each` / `LIKE` 全部清零。
+
+**P2 拆分与 P2a 实现说明**
+- P2 分三个 PR：P2a 回填作业（本节）、P2b 服务端读取方改读块表、P2c 前端一步切换与 WS v2。
+- **回填作业**（`server/services/narrator-block-backfill.ts`）：
+  - 两个作业共用一张进度表 `narrator_block_backfill`：`convert` 把旧信封转成块，`verify` 校验块格式信封。游标为 `narrator_messages.rowid`。
+  - **读与写的分工：** 只读 db-worker 中的 `blockBackfillSlice` 读正文并规划块行（`server/lib/db-worker/block-backfill-query.ts`），规划逻辑与 store 同步共用 `shared/narrator-blocks/plan.ts`。主线程只插入。
+  - **单片上限：** 100 个信封 / 4 MiB / 1 秒；写事务超过 50ms 时下一片减半。worker 不可用时回到主线程，单片降为 10 个信封 / 256 KiB。
+  - **一个事务内的写入顺序：** 删除残留块行，插入块、asset、块级索引，绑定账本 `block_id`，最后写 `body_bytes` 并把 `body_format` 改为 2，再清掉翻转引起的同步队列项。块插入时信封仍是格式 1，所以不 bump 任何 revision。
+  - **过期计划：** 若 `body_revision` 或账本指纹（行数与 `model_revision` 之和）与 worker 读取时不同，只翻转格式，由 store 同步按当前内容建块。
+  - **无法解码：** 不是数组的 `content_json` 记入 `narrator_block_diagnostics`（`undecodable`），信封保持格式 1，作业越过它继续。
+  - **校验：** `verify` 在 worker 中比对「块组装出的数组」与 `content_json`，不一致的记 `mismatch` 并重新同步；仍在同步队列里的信封不算。
+  - **启动与控制：** 服务就绪后在后台启动，`setTimeout(0)` 驱动，重启后从游标继续。存储设置页显示进度，可暂停与继续（`/api/storage/blocks/backfill`）。
+  - **PG：** 与 P1 一致，只在 SQLite 上运行。
+
+**P2b 实现说明（服务端读取方）**
+- **开关与统一读取：** `narratorBlocks.read`（默认开）。读取方把原来选 `content_json` 的位置换成 `bodySql(alias)`（`server/lib/narrator-bodies.ts`），再由 `readBodies` / `blockBodies` 从块行组装为 NULL 的正文：
+  - 读块的条件（`blocksCurrentSql`）：`body_format = 2`、不在同步队列里、且有块行；
+  - 其余情况仍读 `content_json`：旧信封、仍在同步队列里的信封（store 之外改过正文，块行还没重建），以及没有块行的信封（空内容或无法解码）；
+  - 开关关闭或在 PG 上时，读取方与 P2 之前完全一致（PG 仍只写旧格式）。
+- **字节预算：** 块格式信封按 `body_bytes` 计；需要精确字符数或字节数的地方（导出的子代理摘录、归档的行上限）用 `assembledBodyLengthSql` 由块行长度算出，不解析 payload。解码预检逐个作用于块的 payload / state 字符串。
+- **已切换的读取方：**
+  - 模型历史 worker（全量与增量）；
+  - 展示页 worker；
+  - External API 的推理扫描：按 `kind = 'reasoning'` 的块读取；
+  - transcript 导出、session interchange 导出、project.db 同步 / 归档：归档格式不变，`content_json` 列由块组装；
+  - merge summary 的三处扫描：经 `idx_blocks_context_subtype` 定位；
+  - 孤儿上传回收：经 `input_image` asset 行定位；
+  - 问题补充回执、compact epoch：读单块 payload。
+- **旧信封索引：** 部分索引 `idx_messages_legacy_body`（`body_format = 1`）正好收录旧信封。扫描的旧信封分支、回填的候选查询都走这条索引，回填完成后索引为空。旧信封在回填完成之后仍可能出现：块写入关闭期间写入的、或导入的。启动时若有这类信封（不含无法解码的），`convert` 作业回到第一条重新转换；块写入关闭期间 `convert` 不运行。
+- **一条键序规则：** 元素的读者专用字段（§10.1 的 state 字段）排在其他字段之后。
+  - store 由块派生 `content_json`，本就遵守这条规则；P1 之前写入的、或在 store 之外写入的 `content_json` 可能把这些字段放在中间，含义相同。
+  - 双写审计与 `verify` 用 `inAssembledOrder(stored)` 与组装结果比较，不再把仅键序不同的信封记为 mismatch。
+  - 有意的字节变化：输出原始元素的读取方（JSON 导出、归档的 `content_json` 列、展示页与模型历史的元素对象）在这类信封上按此键序输出。
+- **其它行为变化：** External API 原先对超过 256 KiB 的整条信封标记「推理不可用」；改为只看推理块本身，所以与大工具输入同在一条信封里的推理现在可以返回。
+- **留给 P2c 的读取方：** 主线程的读改写路径仍读 `content_json`，在 P2c 改为按块 id 寻址时一起切换：
+  - 编辑、翻译、块删除、回退（`narrator-messages.ts`、`routes/narrators.ts`、`revert-*`）；
+  - 页面 API（`pretext-document`）与 WS；
+  - 会话 / 恢复路径（`narrator-session.ts`、`narrator-service.ts`、`narrator-output-recovery.ts`、`tool-continuation-service.ts`、`subagent-extract.ts`）；
+  - 投递与收件（`agent-runtime/inbox.ts`、`agent-message-delivery.ts`、`send-delivery-resolution.ts`、`await-agent-resolution.ts`）。
+  双写期间 `content_json` 与块行一致，这些路径的结果不变；P3 把新行的 `content_json` 写成 `'[]'` 之前必须全部切换。
+- **不切换的：** compact 定稿的 CAS 是按主键读一行来保护对 `content_json` 本身的写入，块的 `phase` / `revision` 不携带它比较的尝试次数与状态，留在 `content_json` 上，随 P2c 的 compact 写入改造一起处理。project.db 导入仍读 `content_json` 列（§9）。
 
 ### P3 退役与新能力
 

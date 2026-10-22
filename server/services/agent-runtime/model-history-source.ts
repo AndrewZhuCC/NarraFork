@@ -3,6 +3,7 @@ import type { SQL } from "bun";
 import { compiledWorkerSpecifiers } from "../../lib/compiled-worker";
 import { hotSafe } from "../../lib/hot-safe";
 import { isCompiledRuntime } from "../../lib/runtime-target";
+import { settings } from "../../lib/settings";
 import { modelHistoryManifest } from "./model-history-delta";
 import {
 	MODEL_HISTORY_MAX_BYTES,
@@ -99,6 +100,13 @@ const state = hotSafe("narrator.modelHistorySource.v1", () => {
 // miss these maps and must take the fully validated cold path before they can be reused.
 state.sourceSignatures ??= new WeakMap<ModelHistorySource, SourceSignatureRecord>();
 state.workerSpecifier ??= null;
+
+/** Order of a message's ledger rows: creation (call) order, ids breaking ties. */
+function compareToolRows(a: ModelToolSourceRow, b: ModelToolSourceRow): number {
+	if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+	return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 export function modelHistorySourceStats() {
 	return {
 		loads: state.loads,
@@ -244,8 +252,9 @@ async function readWorker(
 						if (error || !counters)
 							reject(error ?? new Error("Model history worker did not complete"));
 						else {
-							for (const row of messages)
-								row.toolCalls.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+							// Call order, not random-id order: a call only kept in the ledger is
+							// replayed where it was made, and renames follow the same sequence.
+							for (const row of messages) row.toolCalls.sort(compareToolRows);
 							resolve({ source: { messages, counters, compactSeq }, signature });
 						}
 					};
@@ -309,6 +318,7 @@ async function readWorker(
 						limit: options.limit,
 						maxBytes: MODEL_HISTORY_MAX_BYTES,
 						versioned,
+						bodiesFromBlocks: backend.backend === "sqlite" && settings.narratorBlocks.read,
 						previous: previous ? modelHistoryManifest(previous.source) : undefined,
 						previousCatalogIdentity: previous?.catalogIdentity,
 						...(backend.backend === "sqlite"
@@ -400,6 +410,7 @@ export async function loadModelHistorySource(
 			maxBytes: 1024 * 1024,
 			inlineRowBytes: 64 * 1024,
 			versioned: before.trusted,
+			bodiesFromBlocks: settings.narratorBlocks.read,
 		});
 	else {
 		let loaded: Awaited<ReturnType<typeof readWorker>>;

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import {
 	anthropicBaseWithVersion,
+	detectLocalProviderSources,
 	harnessPatchRows,
 	type LocalScanContext,
 	parseJsonc,
@@ -445,5 +446,27 @@ describe("summarizeLocalScan", () => {
 			alreadyConfigured: true,
 		});
 		expect(summarizeLocalScan(scan, new Set()).candidates[0]?.alreadyConfigured).toBe(false);
+	});
+});
+
+describe("detectLocalProviderSources", () => {
+	test("reports tools by config location without reading any file", async () => {
+		const ctx = memoryContext({
+			[h(".claude.json")]: "{}",
+			[h(".dsh", "profiles", "default", "cordis.patch.yml")]: "[]",
+		});
+		let reads = 0;
+		const readText = ctx.readText;
+		ctx.readText = async (path) => {
+			reads++;
+			return readText(path);
+		};
+		expect(await detectLocalProviderSources(ctx)).toEqual([
+			{ source: "claude", found: true },
+			{ source: "codex", found: false },
+			{ source: "opencode", found: false },
+			{ source: "deepseek-harness", found: true },
+		]);
+		expect(reads).toBe(0);
 	});
 });

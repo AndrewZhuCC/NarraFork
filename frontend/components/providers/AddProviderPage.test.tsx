@@ -73,7 +73,7 @@ installDom();
 const { createRoot } = await import("react-dom/client");
 const { MantineProvider } = await import("@mantine/core");
 const { I18nextProvider } = await import("react-i18next");
-const { AddProviderPage } = await import("./AddProviderPage");
+const { AddProviderPage, defaultAddProviderPresetId } = await import("./AddProviderPage");
 const i18n = createInstance();
 await i18n.init({
 	lng: "en",
@@ -598,26 +598,91 @@ describe("AddProviderPage interactions", () => {
 });
 
 describe("import from this machine", () => {
-	test("the panel only appears where importing is allowed, and reads nothing until authorized", async () => {
-		expect(container.textContent).not.toContain("Import from this machine");
+	async function renderWithImport(
+		sources: Array<{
+			source: "claude" | "codex" | "opencode" | "deepseek-harness";
+			found: boolean;
+		}>,
+		detecting = false,
+	) {
 		await act(async () => {
 			root?.render(
 				<I18nextProvider i18n={i18n}>
 					<MantineProvider env="test">
-						<ProviderImportContext value={async () => ({ refreshFailed: false })}>
+						<ProviderImportContext
+							value={{
+								importProvider: async () => ({ refreshFailed: false }),
+								detectedSources: detecting ? undefined : sources,
+								detecting,
+							}}
+						>
 							<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
 						</ProviderImportContext>
 					</MantineProvider>
 				</I18nextProvider>,
 			);
 		});
-		expect(container.textContent).toContain("Import from this machine");
-		// Only the authorize button: no candidates or import action before a scan.
+	}
+	const importOption = () => container.querySelector("button[data-local-import-option]");
+	const selectedPreset = () =>
+		container
+			.querySelector("button[data-provider-preset][data-selected]")
+			?.getAttribute("data-provider-preset") ?? null;
+
+	test("without the import context there is no import entry and DeepSeek is preselected (English)", () => {
+		expect(importOption()).toBeNull();
+		expect(selectedPreset()).toBe("deepseek");
+		expect(field("addProviderBaseUrl").value).toBe("https://api.deepseek.com/v1");
+	});
+
+	test("detected configs add the entry above the catalog and select it by default", async () => {
+		root?.unmount();
+		root = createRoot(container);
+		await renderWithImport([
+			{ source: "claude", found: false },
+			{ source: "codex", found: true },
+			{ source: "opencode", found: false },
+			{ source: "deepseek-harness", found: true },
+		]);
+		const option = importOption();
+		expect(option?.getAttribute("aria-pressed")).toBe("true");
+		expect(option?.textContent).toContain("Codex");
+		expect(option?.textContent).toContain("DeepSeek Harness");
+		expect(selectedPreset()).toBeNull();
+		// The right pane holds the import controls; nothing is read before authorizing.
 		expect(button("localImport.authorize")).toBeTruthy();
 		expect(container.querySelector("[data-local-import-candidate]")).toBeNull();
-		// Choosing a preset hides the panel so the configuration form has the page.
+		// Picking a preset leaves import; picking import again returns to it.
 		await click(preset("OpenAI"));
-		expect(container.textContent).not.toContain("Import from this machine");
+		expect(importOption()?.getAttribute("aria-pressed")).toBe("false");
+		expect(() => button("localImport.authorize")).toThrow();
+		await click(importOption() as Element);
+		expect(button("localImport.authorize")).toBeTruthy();
+	});
+
+	test("no detected config hides the entry; waits for detection before defaulting", async () => {
+		root?.unmount();
+		root = createRoot(container);
+		await renderWithImport([], true);
+		expect(selectedPreset()).toBeNull();
+		await renderWithImport([
+			{ source: "claude", found: false },
+			{ source: "codex", found: false },
+		]);
+		expect(importOption()).toBeNull();
+		expect(selectedPreset()).toBe("deepseek");
+	});
+
+	test("Chinese UI without importable configs preselects TokenDance", async () => {
+		root?.unmount();
+		root = createRoot(container);
+		await act(async () => {
+			await i18n.changeLanguage("zh-CN");
+		});
+		await renderWithImport([{ source: "codex", found: false }]);
+		expect(selectedPreset()).toBe("tokendance");
+		expect(defaultAddProviderPresetId("zh-CN")).toBe("tokendance");
+		expect(defaultAddProviderPresetId("en")).toBe("deepseek");
 	});
 
 	test("default selection skips providers without a key or already configured", () => {

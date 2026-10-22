@@ -14,9 +14,9 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-	MODEL_HISTORY_REVISION_CONTRACT,
+	MODEL_HISTORY_REVISION_CONTRACT_V1,
 	modelHistoryTriggerSuffix,
-	renderModelHistoryRevisionSql,
+	renderModelHistoryRevisionSqlV1,
 } from "../generated-model-history-triggers";
 import type { runPostgresKit } from "../postgres-kit";
 import {
@@ -187,11 +187,13 @@ test("PG revision triggers join the generated schema batch before durable receip
 	expect(kitCalls).toBe(2);
 	const receipt = pending(f);
 	expect(receipt.modelHistoryTriggers).toEqual({
-		contract: MODEL_HISTORY_REVISION_CONTRACT,
-		sqlDigest: digest(renderModelHistoryRevisionSql("postgres")),
+		contract: MODEL_HISTORY_REVISION_CONTRACT_V1,
+		sqlDigest: digest(renderModelHistoryRevisionSqlV1("postgres")),
 	});
 	const staged = readFileSync(join(f.root, receipt.stage, "publish/0002_generated.sql"), "utf8");
-	expect(staged.endsWith(modelHistoryTriggerSuffix("postgres"))).toBe(true);
+	expect(
+		staged.endsWith(modelHistoryTriggerSuffix("postgres", MODEL_HISTORY_REVISION_CONTRACT_V1)),
+	).toBe(true);
 	expect(receipt.newFiles["0002_generated.sql"]).toBe(digest(staged));
 	expect(readPgMetadata(f.folder, { allowPending: true }).files).toEqual(old);
 	await executePostgresMigrations("resume", [], {

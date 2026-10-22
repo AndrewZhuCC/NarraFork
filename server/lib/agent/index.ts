@@ -3,10 +3,7 @@ import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
 import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
-import {
-	type FileReferenceProjectionOptions,
-	projectFileReferencesForModel,
-} from "./file-reference-projection";
+import { buildAdapterHistory } from "./history-build";
 import { isRetryableError } from "./loop";
 import {
 	type BuiltHistory,
@@ -14,20 +11,13 @@ import {
 	type ProviderResolution,
 	resolveProviderAndModel,
 } from "./provider";
-import { projectAskUserQuestionMessagesForModel } from "./question-model-input";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
-import { projectMessageSenderForModel } from "./sender-projection";
-import { stripCitationMarkersForModel } from "./strip-citation-markers";
-import { stripPlanBodyForModel } from "./strip-plan-body";
 import {
-	projectToolLoadingHistory,
 	resolveAdapterToolLoadingStrategy,
-	resolveLoadableToolDefinition,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 } from "./tool-loading";
 import "./tools";
-import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
 import { initTruncateCleanup } from "./truncate";
 
 // Start periodic cleanup of truncated output files
@@ -50,6 +40,7 @@ export type {
 	AgentEvent,
 	AgentHistoryReplacement,
 	AgentInputPart,
+	AgentLoopHistory,
 	AgentToolUse,
 	DangerInfo,
 	DangerSeverity,
@@ -81,6 +72,27 @@ export function resolveHistoryToolLoadingStrategy(
 	return resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
 }
 
+/** How long an Anthropic prompt cache entry certainly lives (the default 5-minute tier). */
+const ANTHROPIC_CACHE_TTL_MS = 5 * 60_000;
+
+/**
+ * The target a request for `model` on `provider` goes to, for epoch boundaries
+ * (docs/BLOCK_STORAGE-DESIGN.md §7.7): the routed model with the tool loading strategy
+ * it implies, and how long its prompt cache certainly lives (null when unknown).
+ */
+export function resolveEpochTarget(
+	model: string,
+	provider: string,
+): { fingerprint: string; cacheTtlMs: number | null } {
+	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
+	const strategy = resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
+	const protocol = resolved.adapter.toolLoadingTarget?.(resolved.model)?.protocol;
+	return {
+		fingerprint: `${resolved.model}#${strategy}`,
+		cacheTtlMs: protocol === "anthropic-messages" ? ANTHROPIC_CACHE_TTL_MS : null,
+	};
+}
+
 /**
  * Convert DB narrator messages into provider history format.
  * Routes to the correct provider based on the provider name.
@@ -94,7 +106,7 @@ export async function buildHistory(
 	// callers resolve the provider before calling, so there is nothing to guess.
 	provider: string,
 	narratorId?: string,
-	options?: FileReferenceProjectionOptions & {
+	options?: {
 		/**
 		 * Loading state the request's `tools` array is built from, and the strategy
 		 * resolved for this model. Tool loads inside the history are rendered for it.
@@ -103,44 +115,10 @@ export async function buildHistory(
 	},
 ): Promise<BuiltHistory> {
 	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
-	// Replace file-based ExitPlanMode plan bodies with a short path reference so
-	// the model history does not carry the full plan text on every rebuild. The
-	// persisted DB rows keep the full plan for the UI; this only mutates the
-	// in-memory copy passed to the provider adapter.
-	const modelMessages = stripPlanBodyForModel(projectAskUserQuestionMessagesForModel(dbMessages));
-	// Historical rows may still embed provider-internal citation markers. Replaying
-	// them teaches the model the markers are part of its output format, so it keeps
-	// producing them; strip on the in-memory copy only.
-	// Expand accepted file bytes after prose cleanup: citation-like strings in
-	// a source file are data and must not be rewritten by the citation sanitizer.
-	const cleanedMessages = projectFileReferencesForModel(
-		stripCitationMarkersForModel(modelMessages),
-		options,
-	);
-	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
-	// which only breaks once several turns accumulate: the replayed history then
-	// carries duplicate ids and the API rejects the request with 400. Rename the
-	// later collisions in this in-memory copy — DB rows keep the original ids.
-	// Attribution is a model-only projection, after accepted file material. Roles and
-	// stored rows stay unchanged; every provider receives the same sender format.
-	const uniqueMessages = uniquifyDbMessageToolUseIds(
-		cleanedMessages.map(projectMessageSenderForModel),
-		{
-			narratorId,
-			provider: resolved.provider,
-			model: resolved.model,
-		},
-	);
-	// Last, so builders see exactly these row objects (changes are keyed by row).
-	const projectedMessages = options?.toolLoading
-		? projectToolLoadingHistory(
-				uniqueMessages,
-				options.toolLoading.state,
-				options.toolLoading.strategy,
-				resolveLoadableToolDefinition,
-			)
-		: uniqueMessages;
-	return resolved.adapter.buildHistory(projectedMessages, resolved.model, narratorId);
+	return buildAdapterHistory(resolved.adapter, dbMessages, resolved, {
+		narratorId,
+		...(options?.toolLoading ? { toolLoading: options.toolLoading } : {}),
+	});
 }
 
 /**

@@ -1,32 +1,17 @@
 /**
  * A concluded review has to reach the MODEL, not just the transcript.
  *
- * `review-event-handler` writes the conclusion as a `role: "user"` row and the design
- * rests on "the next request rebuilds history and sees it". That premise is false on its
- * own, and the failure is completely silent:
+ * `review-event-handler` writes the conclusion as a `role: "user"` row and starts a bare
+ * `runAgentLoop(active, "")`: the row is supposed to already be in history. Builders used
+ * to pop the last top-level user row as "the current turn", so with an empty prompt the
+ * findings reached the model in neither place, silently.
  *
- * Every provider's history builder POPS the last top-level user row, on the contract
- * that the caller sends it as the current turn (`buildAnthropicHistory`, and the
- * identical three lines in openai/gemini). An ordinary user message satisfies that
- * contract because whoever wrote the row also passes its text into `runAgentLoop`. The
- * review card's "handle" button starts `runAgentLoop(active, "")` — deliberately, since
- * the row is supposed to already be in history — so the conclusion was popped as "the
- * current turn" while the current turn was empty. `pushUserTurn` pushes nothing for empty
- * content, so the findings appeared in NEITHER history nor the turn.
- *
- * Nothing signals that. The turn runs, the model answers from stale context, and the card
- * still sits in the transcript — so it reads as the model ignoring the review rather than
- * never having been shown it.
- *
- * Asserted at both levels:
- *   1. the builder really does drop the row (so the recovery is not guarding a non-bug);
- *   2. `resolvePoppedTrailingUserText` recovers exactly that text, and stays silent for
- *      the shapes where recovery would double-send or displace something.
+ * Histories are now complete: the trailing user row is part of the built history, so a
+ * pass with no prompt of its own still sends it, once.
  */
 
 import { describe, expect, test } from "bun:test";
 import { AnthropicProvider } from "../../lib/agent/anthropic-provider";
-import { resolvePoppedTrailingUserText } from "../narrator-session";
 
 const CONCLUSION_TEXT =
 	"## Code Review: Changes Requested\n\n- 🚨 **[critical]** `server/db/schema.ts` — the index has no migration\n";
@@ -85,57 +70,37 @@ function provider(): AnthropicProvider {
 	} as never);
 }
 
-describe("the provider history builder drops a trailing user row", () => {
-	test("the conclusion is in NEITHER the history nor trailingUserText", async () => {
+describe("a trailing user row stays in the built history", () => {
+	test("the conclusion is the last input of the history, sent once", async () => {
 		const built = await provider().buildHistory(
 			[...CONVERSATION, conclusionRow()] as never,
 			"claude-sonnet-4-5",
 			"n1",
 		);
-
-		// This is the whole reason the recovery exists: without it, an empty pass sends a
-		// request that contains no trace of the review at all.
-		expect(JSON.stringify(built.history)).not.toContain("the index has no migration");
-		// `trailingUserText` only lifts trailing `sys` rows, so it cannot cover this.
-		expect(built.trailingUserText).toBeUndefined();
-	});
-});
-
-describe("resolvePoppedTrailingUserText", () => {
-	test("recovers the conclusion text the builder popped", () => {
-		const recovered = resolvePoppedTrailingUserText([...CONVERSATION, conclusionRow()]);
-		expect(recovered).toContain("the index has no migration");
-		// The model-facing `text` block, not the card's structured fields.
-		expect(recovered).toBe(CONCLUSION_TEXT);
+		const last = built.history.at(-1) as { role: string; content: unknown };
+		expect(last.role).toBe("user");
+		expect(JSON.stringify(last.content)).toContain("the index has no migration");
+		// The model-facing text only, never the card's structured fields.
+		expect(JSON.stringify(built.history).split("the index has no migration")).toHaveLength(2);
 	});
 
-	test("falls back to contentText for a row written without a text block", () => {
-		// Older rows (and any producer that only persists a structured block) still have
-		// the flat column, which is what the builders' own text reader falls back to.
+	test("a legacy row without a text block falls back to its flat text", async () => {
 		const legacy = row("m3", "user", [{ type: "review_feedback", verdict: "approve" }], "Approved");
-		expect(resolvePoppedTrailingUserText([...CONVERSATION, legacy])).toBe("Approved");
+		const built = await provider().buildHistory(
+			[...CONVERSATION, legacy] as never,
+			"claude-sonnet-4-5",
+			"n1",
+		);
+		expect(JSON.stringify(built.history.at(-1))).toContain("Approved");
 	});
 
-	test("returns null when history ends on an assistant turn", () => {
-		// Nothing was popped, so there is nothing to resend — and inventing text here
-		// would put words in the user's mouth on every continuation.
-		expect(resolvePoppedTrailingUserText(CONVERSATION)).toBeNull();
-	});
-
-	test("returns null when history ends on a sys injection", () => {
-		// The builders lift a trailing `sys` run into `trailingUserText` themselves.
-		// Recovering it here too would send the same text twice.
-		const injection = row("m3", "sys", [{ type: "text", text: "spec reminder" }], "spec reminder");
-		expect(resolvePoppedTrailingUserText([...CONVERSATION, injection])).toBeNull();
-	});
-
-	test("ignores subagent rows, matching the builders' top-level filter", () => {
+	test("subagent rows are not part of the session's own history", async () => {
 		const subagentRow = { ...conclusionRow(), parentToolUseId: "tu_1" };
-		expect(resolvePoppedTrailingUserText([...CONVERSATION, subagentRow])).toBeNull();
-	});
-
-	test("returns null for a user row with no usable text", () => {
-		const empty = row("m3", "user", [{ type: "text", text: "   " }], "");
-		expect(resolvePoppedTrailingUserText([...CONVERSATION, empty])).toBeNull();
+		const built = await provider().buildHistory(
+			[...CONVERSATION, subagentRow] as never,
+			"claude-sonnet-4-5",
+			"n1",
+		);
+		expect(JSON.stringify(built.history)).not.toContain("the index has no migration");
 	});
 });

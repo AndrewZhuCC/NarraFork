@@ -27,7 +27,7 @@ describe("executeAgentLoop file-reference context", () => {
 		for (const cwd of ["/first/pass", "/second/pass"]) {
 			const config = { ...makeConfig(new AbortController().signal), cwd };
 			await executeAgentLoop(
-				{ config, userText: "", history: [], eventContext },
+				{ config, userText: "", history: { rows: [] }, eventContext },
 				{
 					eventSource: makeEventSource([{ type: "stream_text", text: "src/a.ts" }]),
 					processEventFn: async (_event, ctx) => {
@@ -46,7 +46,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(new AbortController().signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -70,7 +70,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -93,7 +93,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -120,7 +120,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -142,7 +142,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -167,7 +167,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -196,7 +196,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -238,7 +238,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -266,7 +266,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -290,7 +290,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -317,7 +317,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -337,7 +337,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -360,7 +360,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -393,7 +393,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -423,7 +423,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -450,7 +450,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -478,7 +478,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -505,7 +505,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -543,7 +543,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 				hooks: {
 					onErrorCleanup: async (message) => {
@@ -575,7 +575,7 @@ describe("executeAgentLoop result handling", () => {
 				{
 					config: makeConfig(ac.signal),
 					userText: "",
-					history: [],
+					history: { rows: [] },
 					eventContext: {} as EventHandlerContext,
 				},
 				{
@@ -606,7 +606,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -633,7 +633,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 				hooks: {
 					onErrorCleanup: async (message) => {
@@ -677,7 +677,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -714,7 +714,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{

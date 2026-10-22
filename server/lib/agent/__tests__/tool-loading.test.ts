@@ -8,12 +8,15 @@ import {
 	DEFERRED_TOOL_PLACEHOLDER,
 	defaultToolLoadingModes,
 	deriveToolLoadingState,
+	epochRecordOf,
 	formatRequestTools,
+	latestToolLoadingEpoch,
 	projectToolLoadingHistory,
 	resolveToolLoadingStrategy,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 	toolLoadingChangeOf,
+	toolLoadingDrift,
 } from "../tool-loading";
 import type { ResolvedToolDefinition } from "../types";
 
@@ -82,6 +85,33 @@ describe("tool loading strategy resolution", () => {
 
 		expect(defaultToolLoadingModes("deepseek-v4-pro")).toEqual(["anthropic_deferred_tail"]);
 		expect(defaultToolLoadingModes("anthropic:glm-5.1")).toEqual(["custom_injection"]);
+
+		expect(defaultToolLoadingModes("kimi-k3")).toEqual(["kimi_system_tools", "custom_injection"]);
+		expect(defaultToolLoadingModes("moonshot:kimi-k3.5")).toEqual([
+			"kimi_system_tools",
+			"custom_injection",
+		]);
+		expect(defaultToolLoadingModes("kimi-for-coding")).toEqual([
+			"kimi_system_tools",
+			"custom_injection",
+		]);
+		expect(defaultToolLoadingModes("k3-256k")).toEqual(["kimi_system_tools", "custom_injection"]);
+		// K2.x and the highspeed coding model reject a tool-bearing system message.
+		expect(defaultToolLoadingModes("kimi-k2.7-code")).toEqual(["custom_injection"]);
+		expect(defaultToolLoadingModes("kimi-for-coding-highspeed")).toEqual(["custom_injection"]);
+		expect(defaultToolLoadingModes("kimi-latest")).toEqual(["custom_injection"]);
+	});
+
+	test("Kimi uses system tools on Chat Completions and injection elsewhere", () => {
+		expect(resolveToolLoadingStrategy("kimi-k3", { protocol: "completions-compatible" })).toBe(
+			"kimi_system_tools",
+		);
+		expect(resolveToolLoadingStrategy("kimi-k3", { protocol: "anthropic-messages" })).toBe(
+			"custom_injection",
+		);
+		expect(resolveToolLoadingStrategy("kimi-k3", { protocol: "openai-responses" })).toBe(
+			"custom_injection",
+		);
 	});
 
 	test("a mode is only used on the protocol it targets", () => {
@@ -314,16 +344,23 @@ async function send(adapter: ProviderAdapter, params: ChatParams) {
 	return captured[captured.length - 1];
 }
 
-/** Build one request the way the runtime does: derive state, project, build, format. */
+/**
+ * Build one request the way the runtime does: derive state, project, build, format. The
+ * history already ends with the persisted current input, so no separate content is sent.
+ */
 async function request(
 	adapter: ProviderAdapter,
 	model: string,
 	strategy: ToolLoadingStrategy,
 	messages: DbMessage[],
 	current: string[],
-	content: string,
 ) {
-	const state = deriveToolLoadingState(messages, MANAGED, current);
+	const state = deriveToolLoadingState(
+		messages,
+		MANAGED,
+		current,
+		latestToolLoadingEpoch(messages),
+	);
 	const projected = projectToolLoadingHistory(messages, state, strategy, resolveDefinition);
 	const built = await adapter.buildHistory(projected, model);
 	const tools = formatRequestTools(
@@ -334,12 +371,12 @@ async function request(
 	);
 	return send(adapter, {
 		conversationId: "tool-loading",
-		content,
+		content: "",
 		model,
 		cwd: process.cwd(),
 		history: built.history,
 		tools,
-		toolResults: built.trailingToolResults,
+		toolResults: [],
 		toolLoadingStrategy: strategy,
 		signal: new AbortController().signal,
 		reasoningEffort: "none",
@@ -378,7 +415,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[first, reply, row("user", "anything else")],
 			[],
-			"anything else",
 		);
 		const after = await request(
 			provider,
@@ -386,7 +422,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[first, reply, loaded, ask],
 			["Eval"],
-			"run it",
 		);
 		expect(after.body.tools).toEqual(before.body.tools);
 		// Terminal is not loaded, and Eval arrives in the history instead.
@@ -416,7 +451,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[first, reply, loaded, ask, answer, row("user", "thanks")],
 			["Eval"],
-			"thanks",
 		);
 		const nextMessages = stripCache(next.body.messages) as unknown[];
 		expect(nextMessages.slice(0, messages.length)).toEqual(messages);
@@ -432,7 +466,6 @@ describe("anthropic_tool_addition wire", () => {
 			"anthropic_tool_addition",
 			[row("user", "a"), row("assistant", "b"), notice("tool_unloaded", ["Terminal"])],
 			[],
-			"ignored",
 		);
 		const messages = stripCache(sent.body.messages) as Array<{ role: string; content: unknown }>;
 		expect(messages.at(-1)).toEqual({
@@ -462,7 +495,6 @@ describe("anthropic_deferred_tail wire", () => {
 			"anthropic_deferred_tail",
 			[row("user", "a"), row("assistant", "b"), notice("tool_loaded", ["Eval"]), row("user", "c")],
 			["Eval"],
-			"c",
 		);
 		const tools = sent.body.tools as Array<{ name: string; defer_loading?: boolean }>;
 		expect(tools.map((t) => [t.name, t.defer_loading ?? false])).toEqual([
@@ -506,7 +538,6 @@ describe("openai_additional_tools wire", () => {
 			"openai_additional_tools",
 			[first, reply, row("user", "more")],
 			[],
-			"more",
 		);
 		// The notice is the current turn here, so its item ends the history.
 		const current = await request(
@@ -515,7 +546,6 @@ describe("openai_additional_tools wire", () => {
 			"openai_additional_tools",
 			[first, reply, loaded],
 			["Eval"],
-			loaded.contentText ?? "",
 		);
 		const later = await request(
 			provider,
@@ -523,7 +553,6 @@ describe("openai_additional_tools wire", () => {
 			"openai_additional_tools",
 			[first, reply, loaded, row("assistant", "ok"), row("user", "go")],
 			["Eval"],
-			"go",
 		);
 		expect(current.body.tools).toEqual(before.body.tools);
 		expect(later.body.tools).toEqual(before.body.tools);
@@ -538,5 +567,169 @@ describe("openai_additional_tools wire", () => {
 		// Rebuilt later, the item and notice keep their place: a growing prefix.
 		expect((later.body.input as unknown[]).slice(0, input.length)).toEqual(input);
 		expect(String(later.body.instructions ?? "")).not.toContain("additional_tools");
+	});
+});
+
+describe("epochs", () => {
+	function marker(toolNames: string[]): DbMessage {
+		return row("system", "", {
+			contentJson: [{ type: "epoch", epoch: { reason: "cold", target: "t", toolNames } }],
+			contentText: null,
+		});
+	}
+
+	test("an epoch is read from a marker row or a compact element", () => {
+		expect(epochRecordOf(marker(["Eval"]).contentJson as unknown[])).toBeUndefined();
+		expect(epochRecordOf((marker(["Eval"]).contentJson as unknown[])[0])).toEqual({
+			reason: "cold",
+			target: "t",
+			toolNames: ["Eval"],
+		});
+		expect(
+			epochRecordOf({
+				type: "compact",
+				status: "compacted",
+				summary: "s",
+				epoch: { reason: "compact", toolNames: ["Terminal"] },
+			}),
+		).toEqual({ reason: "compact", toolNames: ["Terminal"] });
+		// A compact from before epochs records nothing: its epoch is derived.
+		expect(epochRecordOf({ type: "compact", status: "compacted", summary: "s" })).toBeUndefined();
+	});
+
+	test("a frozen epoch fixes the array's share; loads before its marker are folded in", () => {
+		const opened = marker(["Eval"]);
+		const earlier = notice("tool_loaded", ["Eval"]);
+		const later = notice("tool_loaded", ["Terminal"]);
+		const messages = [
+			row("user", "a"),
+			earlier,
+			row("assistant", "b"),
+			opened,
+			row("user", "c"),
+			later,
+		];
+		const state = deriveToolLoadingState(
+			messages,
+			MANAGED,
+			["Eval", "Terminal"],
+			latestToolLoadingEpoch(messages),
+		);
+		expect(state).toMatchObject({ epochMarkerId: opened.id, loaded: ["Terminal"] });
+		expect([...state.base]).toEqual(["Eval"]);
+
+		const projected = projectToolLoadingHistory(
+			messages,
+			state,
+			"openai_additional_tools",
+			resolveDefinition,
+		);
+		// The earlier epoch's load is plain notice text now; Eval is in the array.
+		expect(projected[1]).toBe(earlier);
+		expect(toolLoadingChangeOf(projected[1])).toBeUndefined();
+		expect(toolLoadingChangeOf(projected[5])?.additions.map((addition) => addition.name)).toEqual([
+			"Terminal",
+		]);
+	});
+
+	test("drift is what the current set says that the epoch's notices do not", () => {
+		const messages = [marker(["Eval"]), notice("tool_unloaded", ["Eval"])];
+		const epoch = latestToolLoadingEpoch(messages);
+		const drifted = deriveToolLoadingState(messages, MANAGED, ["Terminal"], epoch);
+		expect(toolLoadingDrift(messages, drifted)).toEqual({ loads: ["Terminal"], unloads: [] });
+		const consistent = deriveToolLoadingState(messages, MANAGED, [], epoch);
+		expect(toolLoadingDrift(messages, consistent)).toEqual({ loads: [], unloads: [] });
+	});
+
+	test("the marker row never reaches the model", async () => {
+		captureFetch();
+		const provider = new AnthropicProvider({
+			id: "tool-loading-epoch",
+			name: "Tool loading",
+			prefix: "tl_epoch",
+			apiKey: "sk-test",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "claude-opus-5-5",
+			officialApi: false,
+		});
+		const model = "tl_epoch:claude-opus-5-5";
+		const first = row("user", "hello");
+		const reply = row("assistant", "hi");
+		const ask = row("user", "again");
+		const without = await request(
+			provider,
+			model,
+			"anthropic_tool_addition",
+			[first, reply, ask],
+			[],
+		);
+		const withMarker = await request(
+			provider,
+			model,
+			"anthropic_tool_addition",
+			[first, reply, marker([]), ask],
+			[],
+		);
+		expect(stripCache(withMarker.body.messages)).toEqual(stripCache(without.body.messages));
+		expect(withMarker.body.tools).toEqual(without.body.tools);
+	});
+});
+
+describe("kimi_system_tools wire", () => {
+	const config: OpenAIProviderConfig = {
+		id: "tool-loading-kimi",
+		name: "Tool loading Kimi",
+		prefix: "tl_kimi",
+		apiKey: "sk-test",
+		baseUrl: "https://example.invalid/v1",
+		defaultModel: "kimi-k3",
+		apiMode: "completions",
+	};
+
+	test("the load becomes a system message with tools before its notice", async () => {
+		captureFetch();
+		const provider = new OpenAIProvider(config);
+		const model = "tl_kimi:kimi-k3";
+		const first = row("user", "hello");
+		const reply = row("assistant", "hi there");
+		const loaded = notice("tool_loaded", ["Eval"]);
+
+		const before = await request(
+			provider,
+			model,
+			"kimi_system_tools",
+			[first, reply, row("user", "more")],
+			[],
+		);
+		// The notice is the current turn here, so its system message ends the history.
+		const current = await request(
+			provider,
+			model,
+			"kimi_system_tools",
+			[first, reply, loaded],
+			["Eval"],
+		);
+		const later = await request(
+			provider,
+			model,
+			"kimi_system_tools",
+			[first, reply, loaded, row("assistant", "ok"), row("user", "go")],
+			["Eval"],
+		);
+		expect(current.body.tools).toEqual(before.body.tools);
+		expect(later.body.tools).toEqual(before.body.tools);
+		expect(
+			(before.body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name),
+		).toEqual(["Read"]);
+		// The declaration is complete: name, description and parameters, as in `tools`.
+		const message = { role: "system", tools: provider.formatTools([EVAL]) };
+		const messages = current.body.messages as unknown[];
+		expect(messages.at(-2)).toEqual(message);
+		expect(messages.at(-1)).toEqual({ role: "user", content: loaded.contentText });
+		// Rebuilt later, the declaration and notice keep their place: a growing prefix.
+		expect((later.body.messages as unknown[]).slice(0, messages.length)).toEqual(messages);
+		// Declared once per epoch.
+		const declarations = (later.body.messages as Array<{ tools?: unknown }>).filter((m) => m.tools);
+		expect(declarations).toEqual([message]);
 	});
 });

@@ -296,6 +296,7 @@ import {
 	NARRATOR_ACL_COLUMNS,
 	narratorReadableWhere,
 } from "../services/narrator-acl";
+import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
@@ -4460,18 +4461,21 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 			import("../services/agent-runtime/ownership"),
 			import("../services/agent-runtime/run"),
 		]);
-	const deliverTo = await readSessionDeliverTo(id);
-	if (!deliverTo) return c.json({ error: "This session does not deliver a result" }, 400);
 	if (!getRunHold(id)) return c.json({ error: "Subagent is not taken over" }, 400);
 	const run = getRunControl(id);
+	const deliverTo = run?.deliverTo ?? (await readSessionDeliverTo(id));
 	const deferred = !!run && !run.wake;
+	// Restored/legacy holds may have no delivery registration. Releasing the hold
+	// must still work; historical parentage alone does not grant result delivery.
 	await controlRun(id, { kind: "release" });
-	await broadcastSubagentTakeoverChanged({
-		parentNarratorId: deliverTo.narratorId,
-		subagentNarratorId: id,
-		takenOver: false,
-		toolUseId: deliverTo.toolUseId,
-	});
+	if (deliverTo) {
+		await broadcastSubagentTakeoverChanged({
+			parentNarratorId: deliverTo.narratorId,
+			subagentNarratorId: id,
+			takenOver: false,
+			toolUseId: deliverTo.toolUseId,
+		});
+	}
 	return c.json({ stopped: true, deferred });
 });
 
@@ -5289,6 +5293,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 				id: msgId,
 				narratorId: id,
 				role: "system",
+				...newEnvelopeColumns(id),
 				contentJson: [
 					{
 						type: "ask_in_passing",

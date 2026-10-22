@@ -13,6 +13,7 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getMergeSummaryLabel, getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import { safeSpawn } from "../lib/spawn";
+import { blockReadsEnabled, envelopesWithContext } from "./narrator-block-scans";
 import { narratorService } from "./narrator-service";
 
 /** Maximum number of commits to include in the summary input. */
@@ -108,6 +109,39 @@ function mergeRoundOf(contentJson: unknown): number {
 	return 0;
 }
 
+/**
+ * Block-format merge_summary cards are found through their context block's subtype rather
+ * than a substring scan of every message's content_json; the match itself is the same
+ * substring match, on the card's stored fields.
+ */
+const cardsFromBlocks = (sourceChapterId: string, commitSha: string | null) =>
+	envelopesWithContext("merge_summary", '"type":"merge_summary"', [
+		sourceChapterId,
+		...(commitSha ? [commitSha] : []),
+	]);
+
+/** The merge_summary cards whose content mentions `sourceChapterId` (and `commitSha`). */
+async function findCards(
+	sourceChapterId: string,
+	commitSha: string | null,
+): Promise<Array<{ id: string; contentJson: unknown }>> {
+	if (blockReadsEnabled())
+		return cardsFromBlocks(sourceChapterId, commitSha).map(({ id, content }) => ({
+			id,
+			contentJson: content,
+		}));
+	return db
+		.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
+		.from(narratorMessages)
+		.where(
+			and(
+				sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+				sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+				...(commitSha ? [sql`${narratorMessages.contentJson} LIKE ${`%${commitSha}%`}`] : []),
+			),
+		);
+}
+
 export const mergeSummaryService = {
 	/**
 	 * Asynchronously generate a merge summary and inject it as a message
@@ -172,15 +206,7 @@ export const mergeSummaryService = {
 
 			// Count existing merge_summary messages for this source chapter
 			// to determine the merge round (wake → re-merge produces round 2+).
-			const existingSummaries = await db
-				.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-				.from(narratorMessages)
-				.where(
-					and(
-						sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-						sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
-					),
-				);
+			const existingSummaries = await findCards(sourceChapterId, null);
 			const mergeRound = existingSummaries.length + 1;
 
 			// Mark existing merge_summary messages as historical (isLatest: false)
@@ -323,73 +349,12 @@ export const mergeSummaryService = {
 	},
 
 	/**
-	 * Remove merge_summary messages for a given source chapter from all narrators.
-	 * Called during unmerge to clean up stale summary cards.
-	 *
-	 * Uses a JSON content search to find messages containing the sourceChapterId
-	 * in a merge_summary block, then deletes the message and its refs.
-	 *
-	 * Returns the count of deleted messages and the affected narrator IDs
-	 * so callers can broadcast reload notifications.
-	 */
-	async cleanupForSource(
-		sourceChapterId: string,
-	): Promise<{ deletedCount: number; narratorIds: string[] }> {
-		// Find messages whose contentJson contains a merge_summary block
-		// referencing this source chapter. SQLite JSON: content_json is stored
-		// as text, so we use LIKE for a simple substring match.
-		const rows = await db
-			.select({ id: narratorMessages.id })
-			.from(narratorMessages)
-			.where(
-				and(
-					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
-				),
-			);
-
-		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
-
-		const ids = rows.map((r) => r.id);
-
-		// Get ALL narrators referencing these messages (via refs junction table),
-		// not just the original narratorId — messages can be shared via fork.
-		const refRows = await db
-			.select({ narratorId: narratorMessageRefs.narratorId })
-			.from(narratorMessageRefs)
-			.where(inArray(narratorMessageRefs.messageId, ids));
-		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
-
-		// Delete refs first (FK), then messages
-		db.transaction((tx) => {
-			for (const id of ids) {
-				tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id)).run();
-				tx.delete(narratorMessages).where(eq(narratorMessages.id, id)).run();
-			}
-			if (narratorIds.length > 0) {
-				tx.update(narrators)
-					.set({
-						messageVersion: sql`${narrators.messageVersion} + 1`,
-						messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
-						updatedAt: new Date().toISOString(),
-					})
-					.where(inArray(narrators.id, narratorIds))
-					.run();
-			}
-		});
-
-		logger.info("Cleaned up merge summary messages", {
-			sourceChapterId,
-			deletedCount: ids.length,
-		});
-
-		return { deletedCount: ids.length, narratorIds };
-	},
-
-	/**
 	 * @internal Exposed for the round-based lookup below and its tests.
 	 */
 	_mergeRoundOf: mergeRoundOf,
+
+	/** @internal Exposed for the block-read comparison tests. */
+	_findCards: findCards,
 
 	/**
 	 * Remove the merge_summary message for one specific merge.
@@ -408,16 +373,7 @@ export const mergeSummaryService = {
 		sourceChapterId: string,
 		commitSha: string | null,
 	): Promise<{ deletedCount: number; narratorIds: string[] }> {
-		const rows = await db
-			.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-			.from(narratorMessages)
-			.where(
-				and(
-					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
-					...(commitSha ? [sql`${narratorMessages.contentJson} LIKE ${`%${commitSha}%`}`] : []),
-				),
-			);
+		const rows = await findCards(sourceChapterId, commitSha);
 
 		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
 
@@ -464,17 +420,21 @@ export const mergeSummaryService = {
 
 		// After removing the latest card, restore isLatest on the most recent
 		// remaining merge_summary for this source chapter (if any).
-		const remaining = await db
-			.select({ id: narratorMessages.id, createdAt: narratorMessages.createdAt })
-			.from(narratorMessages)
-			.where(
-				and(
-					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
-				),
-			)
-			.orderBy(sql`${narratorMessages.createdAt} DESC`)
-			.limit(1);
+		const remaining = blockReadsEnabled()
+			? cardsFromBlocks(sourceChapterId, null)
+					.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0))
+					.slice(0, 1)
+			: await db
+					.select({ id: narratorMessages.id, createdAt: narratorMessages.createdAt })
+					.from(narratorMessages)
+					.where(
+						and(
+							sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+							sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+						),
+					)
+					.orderBy(sql`${narratorMessages.createdAt} DESC`)
+					.limit(1);
 
 		if (remaining.length > 0) {
 			const latest = await db.query.narratorMessages.findFirst({

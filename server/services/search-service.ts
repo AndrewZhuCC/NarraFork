@@ -30,6 +30,8 @@ interface SearchResult {
 	lastMessageAt?: string | null;
 	matchField?: string;
 	matchScore: number;
+	/** Message hits: the block the match is in, when it is known. */
+	blockId?: string;
 }
 
 interface SearchOptions {
@@ -53,6 +55,8 @@ export interface NarratorMessageSearchResult {
 	snippet: string;
 	preview: string;
 	createdAt: string;
+	/** The block the match is in, when it is known. */
+	blockId?: string;
 }
 
 /**
@@ -168,6 +172,7 @@ export const searchService = {
 					matchField: "message",
 					matchScore: scoreFromRank(row.rank, strategy === "index" ? 700 : 500),
 					snippet: row.snippet || row.preview || "",
+					...(row.blockId ? { blockId: row.blockId } : {}),
 				});
 			}
 		}

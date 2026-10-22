@@ -36,6 +36,7 @@ import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { dropRecentlyAttributed } from "./file-attribution-service";
 import { dropStatus } from "./git-status-cache";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
+import { blockReadsEnabled, imageEnvelopeOwners } from "./narrator-block-scans";
 import { isRegisteredNarratorWorktree } from "./narrator-worktree-resources";
 import { parseWorktreePorcelain } from "./narrator-worktree-service";
 import {
@@ -199,6 +200,29 @@ export function buildReferencedUploadOwnerIds(
 		ownerIds.add(row.narratorId);
 	}
 	return ownerIds;
+}
+
+/**
+ * Narrators whose upload dir must stay: every existing narrator, and the owner of any
+ * message with an image block. With block reads, block-format messages answer from their
+ * `input_image` asset rows (the same `{type: "image", imageId}` elements
+ * `contentJsonHasImageBlocks` looks for) instead of a substring scan of every message.
+ */
+export function referencedUploadOwnerIds(narratorIds: Iterable<string>): Set<string> {
+	if (blockReadsEnabled()) {
+		const { owners, unindexed } = imageEnvelopeOwners();
+		return buildReferencedUploadOwnerIds([...narratorIds, ...owners], unindexed);
+	}
+	// Only messages that contain an image block can pin an upload dir. Pre-filter
+	// with a substring match on content_json (a superset of contentJsonHasImageBlocks,
+	// which requires the literal `"type":"image"`) so we avoid loading every
+	// message's content_json into memory. The exact check below stays authoritative.
+	const uploadMessageOwners = db
+		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
+		.from(narratorMessages)
+		.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`)
+		.all();
+	return buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
 }
 
 // ── Scan functions (each returns one category) ─────────────────────────────
@@ -824,16 +848,7 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 		.from(narrators)
 		.all()
 		.map((n) => n.id);
-	// Only messages that contain an image block can pin an upload dir. Pre-filter
-	// with a substring match on content_json (a superset of contentJsonHasImageBlocks,
-	// which requires the literal `"type":"image"`) so we avoid loading every
-	// message's content_json into memory. The exact check below stays authoritative.
-	const uploadMessageOwners = db
-		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`)
-		.all();
-	const preservedOwnerIds = buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
+	const preservedOwnerIds = referencedUploadOwnerIds(narratorIds);
 
 	let removed = 0;
 	let freedBytes = 0;

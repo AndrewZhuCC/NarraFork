@@ -47,6 +47,11 @@ export interface LocalImportNote {
 	code: LocalImportNoteCode;
 }
 
+export interface LocalProviderDetectResponse {
+	/** Which tools have a config location on the server machine (existence check only). */
+	sources: Array<{ source: LocalImportSource; found: boolean }>;
+}
+
 export interface LocalProviderScanResponse {
 	candidates: LocalProviderCandidateSummary[];
 	notes: LocalImportNote[];

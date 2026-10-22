@@ -1,6 +1,6 @@
 {
-  "id": "99ad7e81-08d6-415e-85c1-b0a350926f04",
-  "prevId": "8b50bffe-308c-45db-9e1c-64c73f06c646",
+  "id": "20534647-c4ef-455c-8c6f-4250ed5f2786",
+  "prevId": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10810,6 +10810,511 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.narrator_block_assets": {
+      "name": "narrator_block_assets",
+      "schema": "",
+      "columns": {
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "asset_id": {
+          "name": "asset_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_block_assets_asset": {
+          "name": "idx_block_assets_asset",
+          "columns": [
+            {
+              "expression": "asset_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_block_assets_block_id_narrator_blocks_id_fk": {
+          "name": "narrator_block_assets_block_id_narrator_blocks_id_fk",
+          "tableFrom": "narrator_block_assets",
+          "tableTo": "narrator_blocks",
+          "columnsFrom": [
+            "block_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "narrator_block_assets_block_id_asset_id_pk": {
+          "name": "narrator_block_assets_block_id_asset_id_pk",
+          "columns": [
+            "block_id",
+            "asset_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_block_assets_role": {
+          "name": "ck_block_assets_role",
+          "value": "\"role\" in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.narrator_block_backfill": {
+      "name": "narrator_block_backfill",
+      "schema": "",
+      "columns": {
+        "job": {
+          "name": "job",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "cursor": {
+          "name": "cursor",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "complete": {
+          "name": "complete",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "paused": {
+          "name": "paused",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "processed": {
+          "name": "processed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_block_backfill_job": {
+          "name": "ck_block_backfill_job",
+          "value": "\"job\" in ('convert', 'verify')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.narrator_block_diagnostics": {
+      "name": "narrator_block_diagnostics",
+      "schema": "",
+      "columns": {
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "detail": {
+          "name": "detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "narrator_block_diagnostics_message_id_narrator_messages_id_fk": {
+          "name": "narrator_block_diagnostics_message_id_narrator_messages_id_fk",
+          "tableFrom": "narrator_block_diagnostics",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_block_diagnostics_kind": {
+          "name": "ck_block_diagnostics_kind",
+          "value": "\"kind\" in ('mismatch', 'undecodable')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.narrator_block_sync_queue": {
+      "name": "narrator_block_sync_queue",
+      "schema": "",
+      "columns": {
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "narrator_block_sync_queue_message_id_narrator_messages_id_fk": {
+          "name": "narrator_block_sync_queue_message_id_narrator_messages_id_fk",
+          "tableFrom": "narrator_block_sync_queue",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.narrator_blocks": {
+      "name": "narrator_blocks",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subtype": {
+          "name": "subtype",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "phase": {
+          "name": "phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'done'"
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "wire_id": {
+          "name": "wire_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_id": {
+          "name": "attempt_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "origin_block_id": {
+          "name": "origin_block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "model_chars": {
+          "name": "model_chars",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "byte_size": {
+          "name": "byte_size",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "model_text": {
+          "name": "model_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "payload": {
+          "name": "payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "provider_meta": {
+          "name": "provider_meta",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "original_payload": {
+          "name": "original_payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_blocks_message_ordinal": {
+          "name": "idx_blocks_message_ordinal",
+          "columns": [
+            {
+              "expression": "message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "ordinal",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_blocks_single": {
+          "name": "idx_blocks_single",
+          "columns": [
+            {
+              "expression": "message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"kind\" in ('input', 'context')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_blocks_open": {
+          "name": "idx_blocks_open",
+          "columns": [
+            {
+              "expression": "message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"phase\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_blocks_origin": {
+          "name": "idx_blocks_origin",
+          "columns": [
+            {
+              "expression": "origin_block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"origin_block_id\" is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_blocks_context_subtype": {
+          "name": "idx_blocks_context_subtype",
+          "columns": [
+            {
+              "expression": "subtype",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"kind\" = 'context'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_blocks_tool_wire": {
+          "name": "idx_blocks_tool_wire",
+          "columns": [
+            {
+              "expression": "wire_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"kind\" = 'tool'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_blocks_message_id_narrator_messages_id_fk": {
+          "name": "narrator_blocks_message_id_narrator_messages_id_fk",
+          "tableFrom": "narrator_blocks",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_blocks_kind": {
+          "name": "ck_blocks_kind",
+          "value": "\"kind\" in ('input', 'output', 'reasoning', 'tool', 'context')"
+        },
+        "ck_blocks_phase": {
+          "name": "ck_blocks_phase",
+          "value": "\"phase\" in ('open', 'done', 'aborted', 'failed')"
+        },
+        "ck_blocks_subtype": {
+          "name": "ck_blocks_subtype",
+          "value": "(\"subtype\" is not null) = (\"kind\" in ('tool', 'context'))"
+        },
+        "ck_blocks_aborted": {
+          "name": "ck_blocks_aborted",
+          "value": "\"phase\" <> 'aborted' or \"kind\" in ('output', 'reasoning')"
+        },
+        "ck_blocks_input_done": {
+          "name": "ck_blocks_input_done",
+          "value": "\"phase\" = 'done' or \"kind\" <> 'input'"
+        },
+        "ck_blocks_model_text": {
+          "name": "ck_blocks_model_text",
+          "value": "\"model_text\" is null or \"kind\" in ('input', 'context')"
+        },
+        "ck_blocks_provider_meta": {
+          "name": "ck_blocks_provider_meta",
+          "value": "\"provider_meta\" is null or \"kind\" in ('output', 'reasoning', 'tool')"
+        },
+        "ck_blocks_wire_id": {
+          "name": "ck_blocks_wire_id",
+          "value": "(\"wire_id\" is not null) = (\"kind\" = 'tool')"
+        },
+        "ck_blocks_original_payload": {
+          "name": "ck_blocks_original_payload",
+          "value": "\"original_payload\" is null or \"kind\" = 'output'"
+        }
+      },
+      "isRLSEnabled": false
+    },
     "public.narrator_buffered_messages": {
       "name": "narrator_buffered_messages",
       "schema": "",
@@ -12459,6 +12964,44 @@
             "type": "stored"
           }
         },
+        "body_format": {
+          "name": "body_format",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "turn_id": {
+          "name": "turn_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "author_narrator_id": {
+          "name": "author_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cause_block_id": {
+          "name": "cause_block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "provider_response_id": {
+          "name": "provider_response_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "body_bytes": {
+          "name": "body_bytes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -12587,6 +13130,22 @@
           "method": "btree",
           "with": {}
         },
+        "idx_messages_author": {
+          "name": "idx_messages_author",
+          "columns": [
+            {
+              "expression": "author_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"author_narrator_id\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_messages_compact_pending": {
           "name": "idx_messages_compact_pending",
           "columns": [
@@ -12599,6 +13158,22 @@
           ],
           "isUnique": false,
           "where": "\"compact_pending\" = 1",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_messages_legacy_body": {
+          "name": "idx_messages_legacy_body",
+          "columns": [
+            {
+              "expression": "body_format",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"body_format\" = 1",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -13273,6 +13848,43 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.narrator_text_snapshots": {
+      "name": "narrator_text_snapshots",
+      "schema": "",
+      "columns": {
+        "sha256": {
+          "name": "sha256",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "text": {
+          "name": "text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "byte_size": {
+          "name": "byte_size",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.narrator_tool_calls": {
       "name": "narrator_tool_calls",
       "schema": "",
@@ -13648,6 +14260,19 @@
           "primaryKey": false,
           "notNull": false
         },
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "is_internal": {
+          "name": "is_internal",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -13661,6 +14286,21 @@
           "columns": [
             {
               "expression": "message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_toolcalls_block": {
+          "name": "idx_toolcalls_block",
+          "columns": [
+            {
+              "expression": "block_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -13990,6 +14630,19 @@
           "onDelete": "no action",
           "onUpdate": "no action"
         },
+        "narrator_tool_calls_block_id_narrator_blocks_id_fk": {
+          "name": "narrator_tool_calls_block_id_narrator_blocks_id_fk",
+          "tableFrom": "narrator_tool_calls",
+          "tableTo": "narrator_blocks",
+          "columnsFrom": [
+            "block_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
         "narrator_tool_calls_file_change_operation_id_file_8799150935_fk": {
           "name": "narrator_tool_calls_file_change_operation_id_file_8799150935_fk",
           "tableFrom": "narrator_tool_calls",
@@ -14208,6 +14861,122 @@
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.narrator_turns": {
+      "name": "narrator_turns",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "trigger_message_id": {
+          "name": "trigger_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ended_at": {
+          "name": "ended_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stop_reason": {
+          "name": "stop_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "step_count": {
+          "name": "step_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "tool_call_count": {
+          "name": "tool_call_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "usage_json": {
+          "name": "usage_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_turns_narrator_started": {
+          "name": "idx_turns_narrator_started",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "started_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_turns_narrator_id_narrators_id_fk": {
+          "name": "narrator_turns_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_turns",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_turns_status": {
+          "name": "ck_turns_status",
+          "value": "\"status\" in ('running', 'completed', 'interrupted', 'failed')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.narrator_whitelist_cmds": {

@@ -171,8 +171,10 @@ export interface WebSearchAction {
 
 export interface DbMessage {
 	id: string;
-	/** Original owner narrator for this persisted message row. */
+	/** Owner narrator for this persisted message row (a copy belongs to its holder). */
 	narratorId?: string;
+	/** The narrator that wrote it; unchanged by copies (§6.3). Null means the owner. */
+	authorNarratorId?: string | null;
 	role: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown;
 	contentText: string | null;
@@ -189,11 +191,14 @@ export interface DbToolCall {
 	status: string;
 }
 
+/**
+ * A complete model history: every persisted row, the latest input and any tool results
+ * the model has not answered yet included, so a request needs no separate current turn
+ * for persisted content.
+ */
 export interface BuiltHistory {
 	history: unknown[];
-	trailingToolResults: unknown[];
-	trailingUserText?: string;
-	/** Persisted input rows actually emitted into history, not lifted into current input. */
+	/** Persisted input rows emitted into history (delivery receipts, de-duplication). */
 	replayedInjectionMessageIds?: readonly string[];
 }
 

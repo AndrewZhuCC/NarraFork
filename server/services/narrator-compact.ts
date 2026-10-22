@@ -27,6 +27,7 @@ import {
 } from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
+import { compactEpochRecord } from "./narrator-epochs";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
@@ -1115,6 +1116,7 @@ async function doRunCustomCompact({
 				mode: finalizeMode,
 				expectedAttempt,
 				expectedSeq,
+				epoch: compactEpochRecord(activeNarrators.get(narratorId)),
 				...(options?.preparedRetryMessage
 					? {
 							expectedCompactBoundaryMessageId:

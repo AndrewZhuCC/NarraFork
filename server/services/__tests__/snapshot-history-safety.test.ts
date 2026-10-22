@@ -724,9 +724,20 @@ describe("fixed block selection and shared-message COW", () => {
 		expect(newId).not.toBe(messageId);
 		expect(messageBlocks(newId)).toEqual([{ type: "text", text: "keep" }]);
 		expect(messageBlocks(messageId)).toEqual(original);
+		// The copy belongs to the fork that holds it; the narrator that wrote it stays its author.
 		expect(
 			db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, narratorId)).all(),
-		).toHaveLength(2);
+		).toHaveLength(1);
+		expect(
+			db
+				.select({
+					narratorId: narratorMessages.narratorId,
+					authorNarratorId: narratorMessages.authorNarratorId,
+				})
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, newId))
+				.get(),
+		).toEqual({ narratorId: forkId, authorNarratorId: narratorId });
 		expect(
 			db.query.narratorToolCalls
 				.findMany({ where: eq(narratorToolCalls.messageId, messageId) })

@@ -232,6 +232,30 @@
 			"prevId": "8b50bffe-308c-45db-9e1c-64c73f06c646",
 			"version": "7",
 			"snapshotDigest": "ec7d2682b1a4c006cfeb6c8997022f6a15972e0629ef5bdfe4b646b0d802ae90"
+		},
+		{
+			"idx": 29,
+			"tag": "0029_block_storage",
+			"id": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
+			"prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
+			"version": "7",
+			"snapshotDigest": "178a8dc056bd01e7dc5c5c8a44589feddfc3759d4933f09d6c7925106c8e2897"
+		},
+		{
+			"idx": 30,
+			"tag": "0030_block_backfill",
+			"id": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
+			"prevId": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
+			"version": "7",
+			"snapshotDigest": "5e578336c6af458dbd932125cca0beda4d111ab389f5a5610a559c747efe6def"
+		},
+		{
+			"idx": 31,
+			"tag": "0031_legacy_body_index",
+			"id": "20534647-c4ef-455c-8c6f-4250ed5f2786",
+			"prevId": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
+			"version": "7",
+			"snapshotDigest": "99a5dcc17aa730f78b3b9d8a1683d3b5e0693d79541580d15b70961ec66c171b"
 		}
 	]
 }

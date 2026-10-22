@@ -62,6 +62,7 @@ import type { NarraForkEvent } from "../lib/event-bus";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { projectDbManager } from "../lib/project-db";
+import { settings } from "../lib/settings";
 import type { ArchiveActor } from "./project-archive/access";
 import {
 	copyTable,
@@ -556,6 +557,7 @@ export async function fullSync(
 						? (process.env.NF_DATABASE_URL ?? process.env.DATABASE_URL)
 						: undefined,
 				actor: options.actor,
+				bodiesFromBlocks: activeDatabaseBackend === "sqlite" && settings.narratorBlocks.read,
 				deadline:
 					Date.now() +
 					Math.min(options.timeoutMs ?? PROJECT_ARCHIVE_LIMITS.jobMs, PROJECT_ARCHIVE_LIMITS.jobMs),

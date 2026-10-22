@@ -6,7 +6,7 @@ import type { AgentConfig, AgentEvent } from "../types";
 
 // Records which tools' execute() actually started, in start order.
 const executionOrder: string[] = [];
-// Model-facing tool_result order (provider.formatToolResult call order).
+// Model-facing tool_result order: the settled calls of the latest step, in call order.
 const modelResultOrder: string[] = [];
 
 let scenario:
@@ -39,7 +39,24 @@ const PARALLEL_TOOL_NAMES = ["Read", "Glob", "Grep"] as const;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	// The model reads a step's results in call order: record the settled calls of the
+	// latest step in the order its blocks hold them.
+	buildHistory: async (rows) => {
+		const step = rows.findLast((row) => row.role === "assistant");
+		if (step) {
+			const settled = new Set(
+				(step.toolCalls ?? [])
+					.filter((call) => call.status !== "running")
+					.map((call) => call.toolUseId),
+			);
+			const blocks = step.contentJson as Array<{ type?: string; id?: string }>;
+			modelResultOrder.length = 0;
+			for (const block of blocks)
+				if (block.type === "tool_use" && block.id && settled.has(block.id))
+					modelResultOrder.push(block.id);
+		}
+		return { history: [] };
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
@@ -138,12 +155,6 @@ const testProvider: ProviderAdapter = {
 			throw new Error("Aborted");
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => {
-		modelResultOrder.push(String(toolUseId));
-		return { toolUseId, output, isError };
-	},
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -276,7 +287,7 @@ describe("Bash streaming barriers", () => {
 				for await (const event of agentLoop(
 					makeConfig(new AbortController().signal),
 					"run Bash then Read",
-					[],
+					{ rows: [] },
 				)) {
 					events.push(event);
 				}
@@ -308,7 +319,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel tools with one failure",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -344,7 +355,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel tools that all throw",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -369,7 +380,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run a serial tool that throws",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -392,7 +403,7 @@ describe("agent loop tool-result settlement", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "await then send", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "await then send", { rows: [] })) {
 			events.push(event);
 			if (event.type === "stream_text") {
 				await Promise.resolve();

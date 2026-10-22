@@ -33,22 +33,23 @@
 - 卸载不缩小数组，执行器拒绝调用未加载的 managed 工具（`config.isToolLoaded`）。
 - 提示行的 `contentJson[0].toolNames` 记录实际变化的注册表工具名；旧行只有 `toolName`（可能是例程 id），按例程展开。
 
-**四种保持前缀的方式**（策略 5 `replace_tools` 即旧行为）
+**五种保持前缀的方式**（策略 5 `replace_tools` 即旧行为）
 
 | 策略 | 协议 | `tools` 数组 | 加载位置写什么 |
 |---|---|---|---|
 | `anthropic_tool_addition` | Anthropic Messages | `base` + 末尾一个 `defer_loading` 占位工具 | `role:"system"` 消息：`tool_addition` 内联完整定义；卸载发 `tool_removal`；请求头加 `inline-tools-2026-09-15` |
 | `anthropic_deferred_tail` | Anthropic Messages | `base` + 占位工具 + 纪元内加载过的工具（`defer_loading`，按首次加载顺序追加在末尾） | `role:"system"` 消息：`tool_addition` 按名引用；不发 `tool_removal`（已知端点只读 addition）；请求头加 `mid-conversation-tool-changes-2026-07-01` |
 | `openai_additional_tools` | OpenAI Responses | `base` | 提示行之前插入一项 `{type:"additional_tools", role:"developer", tools}`；每个工具每纪元只声明一次；卸载只靠文本 |
+| `kimi_system_tools` | Chat Completions | `base` | 提示行之前插入一条 `{role:"system", tools}`，`tools` 与顶层 `tools` 同格式、带完整定义；每个工具每纪元只声明一次；卸载只靠文本 |
 | `custom_injection` | 任意 | `base` | 提示行文本末尾追加 `<tool_definitions>` JSON schema；每个工具每纪元只追加一次 |
 
 **选择规则**
-- 模型卡字段 `tool_loading_modes`（按优先级排列）优先；未声明时按裸模型名取默认值：含 `claude` → `anthropic_tool_addition`（Opus 4.8+、Sonnet/Haiku 5.5+、Fable/Mythos；更早的版本不启用），含 `gpt` → `openai_additional_tools`（OpenAI API 需 5.4+，Codex 后端需 5.6+；开源权重的 `gpt-oss` 按"其他"处理），含 `deepseek` → `anthropic_deferred_tail`，其他 → `custom_injection`。解析不出版本号的照常启用。
+- 模型卡字段 `tool_loading_modes`（按优先级排列）优先；未声明时按裸模型名取默认值：含 `claude` → `anthropic_tool_addition`（Opus 4.8+、Sonnet/Haiku 5.5+、Fable/Mythos；更早的版本不启用），含 `gpt` → `openai_additional_tools`（OpenAI API 需 5.4+，Codex 后端需 5.6+；开源权重的 `gpt-oss` 按"其他"处理），含 `deepseek` → `anthropic_deferred_tail`，Kimi K3+（`kimi-k3*`、Kimi Coding 的 `k3`/`k3-256k`）与 `kimi-for-coding` → `kimi_system_tools`、`custom_injection`（K2.x 与 `kimi-for-coding-highspeed` 会以 400 拒绝带 `tools` 的 system 消息，只用 `custom_injection`；经 Anthropic/Responses 协议访问时落到 `custom_injection`），其他 → `custom_injection`。解析不出版本号的照常启用。
 - 取列表里第一个与适配器 `toolLoadingTarget()` 报告的协议相容的方式，都不相容就用 `replace_tools`。NUG 按渠道类型报告协议，并用路由后的模型名匹配默认值。
 - 设为空列表 `[]` 即对该模型关闭，在设置页模型卡里编辑。
 
 **几处容易出错的地方**
 - Anthropic 的系统消息只能紧跟 user 轮，且后面只能是 assistant 轮或数组末尾。构造器把工具变更放在提示行旁边，由 `ensureAlternating` 统一挪到下一个 assistant 之前；兼容端点的 system 降级为 user 时，带工具变更的消息不降级。
-- 提示行本身是当前轮（被构造器弹出）时，变更仍要进入请求：Anthropic 放在历史末尾，Responses 放在当前轮之前，与之后重建时的位置一致。
+- 提示行本身是当前轮（被构造器弹出）时，变更仍要进入请求：Anthropic 放在历史末尾，Responses 与 Kimi 放在当前轮之前，与之后重建时的位置一致。
 - `custom_injection` 的文本改写在 `buildRuntimeHistory` 里做，这样从历史恢复的当前轮文本和接收方守卫看到的字节都带 schema；原生方式在 `buildHistory` 的最后一步按行打标，构造器通过 `toolLoadingChangeOf(row)` 读取。
 - 历史重建（compact、plan mode 切换）会返回新的加载状态，loop 据此重新格式化 `tools`；换模型时按新适配器重新选择策略。

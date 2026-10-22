@@ -4,9 +4,9 @@
  * Turn 0: send user message → model should call a tool (e.g. Read)
  * Turn 1: send fake tool result back → model should respond with text
  *
- * This script exercises the full OpenAIProvider flow:
+ * This script exercises the OpenAIProvider wire flow by hand:
  *   injectSystemPrompt → formatTools → chat() SSE parsing →
- *   pushAssistantTurn → formatToolResult → pushUserTurn → chat() again
+ *   a hand-built assistant item and tool results → chat() again
  *
  * Usage: bun run scripts/test-responses-e2e.ts
  */
@@ -172,8 +172,7 @@ for (const tu of collectedToolUses) {
 	toolResults.push({ role: "tool", tool_call_id: tu.toolUseId, content: output });
 }
 
-// Don't push anything extra to history — tool results go via chat() param
-// provider.pushUserTurn(history, "", model, []);
+// Nothing else goes into history — the tool results go via chat()'s toolResults.
 
 console.log("\n=== History before Turn 1 (full JSON) ===");
 for (const [i, m] of (history as Record<string, unknown>[]).entries()) {
