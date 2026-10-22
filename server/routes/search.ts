@@ -1,10 +1,29 @@
 import { Hono } from "hono";
-import { searchService, sortSearchResults } from "../services/search-service";
+import {
+	type MessageSearchScope,
+	searchService,
+	sortSearchResults,
+} from "../services/search-service";
 
 export const searchRoutes = new Hono();
 
 /** Entity names `/api/search` accepts. Anything else in the query is ignored. */
 const SEARCH_ENTITIES = ["chapters", "messages", "narrators", "knowledge"] as const;
+
+/**
+ * Conversation content `include` adds to the default (primary sessions, what people wrote
+ * and read). Unknown names are ignored, like unknown entities.
+ */
+const SEARCH_INCLUDES = ["subagents", "system", "tools"] as const;
+
+function parseScope(include: string | undefined): MessageSearchScope {
+	const names = new Set((include ?? "").split(",").map((name) => name.trim()));
+	return {
+		subagents: names.has("subagents"),
+		system: names.has("system"),
+		tools: names.has("tools"),
+	} satisfies Record<(typeof SEARCH_INCLUDES)[number], boolean>;
+}
 
 searchRoutes.get("/", async (c) => {
 	const q = c.req.query("q");
@@ -24,6 +43,7 @@ searchRoutes.get("/", async (c) => {
 	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
 	const limit = Math.max(1, Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 100));
 	const sort = c.req.query("sort") === "time" ? "time" : "relevance";
+	const scope = parseScope(c.req.query("include"));
 
 	const user = c.get("user");
 	const principal = { userId: user.sub, isAdmin: user.role === "admin" };
@@ -34,9 +54,10 @@ searchRoutes.get("/", async (c) => {
 		entities,
 		limit,
 		sort,
+		scope,
 		signal: c.req.raw.signal,
-		// Narrator and message hits are filtered to what this user may read; chapter
-		// hits are unaffected (chapters have no per-user ACL).
+		// Narrator and message hits are filtered to what this user may read, chapter hits
+		// to the projects they may read.
 		principal,
 	});
 

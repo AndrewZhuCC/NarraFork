@@ -46,10 +46,13 @@ describe("misc APIs", () => {
 		await api.search("中文", "chapters", "time");
 		await api.search("ab", "messages", "relevance");
 		await api.search("legacy", "chapters");
+		await api.search("wider", "messages", "time", undefined, ["subagents", "tools"]);
 		expect(urls[0]).toContain("q=%E4%B8%AD%E6%96%87&entities=chapters&sort=time");
 		expect(urls[1]).toContain("q=ab&entities=messages&sort=relevance");
 		expect(urls[2]).toContain("q=legacy&entities=chapters");
 		expect(urls[2]).not.toContain("sort=");
+		expect(urls[2]).not.toContain("include=");
+		expect(urls[3]).toContain("q=wider&entities=messages&sort=time&include=subagents,tools");
 	});
 
 	test("preserves search degraded metadata", async () => {

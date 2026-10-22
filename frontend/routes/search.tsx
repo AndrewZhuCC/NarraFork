@@ -2,6 +2,7 @@ import {
 	Alert,
 	Badge,
 	Card,
+	Chip,
 	Group,
 	Loader,
 	SegmentedControl,
@@ -19,8 +20,11 @@ import {
 	DEFAULT_SEARCH_SORT,
 	getSearchResultDisplayTitle,
 	highlightSearchText,
+	normalizeSearchInclude,
 	normalizeSearchSort,
 	normalizeSearchType,
+	SEARCH_INCLUDES,
+	type SearchInclude,
 	type SearchSortMode,
 	sortVisibleSearchResults,
 	summarizeSearchRuntimeState,
@@ -48,6 +52,22 @@ function humanizeEnumValue(value: string): string {
 	const normalized = value.replace(/[_-]+/g, " ").trim();
 	if (!normalized) return value;
 	return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+interface MessageHit {
+	id: string;
+	snippet?: string;
+	messageRole?: string;
+	createdAt?: string;
+}
+
+/** Link to one message inside a narrator. */
+function messageLink(narratorId: string, messageId: string) {
+	return {
+		to: "/narrators/$narratorId",
+		params: { narratorId },
+		hash: `msg-${messageId}`,
+	} as const;
 }
 
 /** Resolve the navigation target for a search result */
@@ -84,6 +104,8 @@ interface SearchParams {
 	q?: string;
 	type?: string;
 	sort?: SearchSortMode;
+	/** Comma-separated {@link SearchInclude} names; absent means the default scope. */
+	include?: string;
 }
 
 export const Route = createFileRoute("/search")({
@@ -92,13 +114,20 @@ export const Route = createFileRoute("/search")({
 		q: typeof search.q === "string" ? search.q : undefined,
 		type: normalizeSearchType(search.type),
 		sort: normalizeSearchSort(search.sort),
+		include: normalizeSearchInclude(search.include).join(",") || undefined,
 	}),
 });
 
 function SearchPage() {
-	const { q, type = "all", sort = DEFAULT_SEARCH_SORT } = Route.useSearch();
+	const { q, type = "all", sort = DEFAULT_SEARCH_SORT, include: includeParam } = Route.useSearch();
 	const navigate = Route.useNavigate();
-	const { data, isLoading } = useSearch(q ?? "", "chapters,messages,narrators,knowledge", sort);
+	const include = useMemo(() => normalizeSearchInclude(includeParam), [includeParam]);
+	const { data, isLoading } = useSearch(
+		q ?? "",
+		"chapters,messages,narrators,knowledge",
+		sort,
+		include,
+	);
 	const { t } = useTranslation("search");
 	const searchRuntimeStatus = useMemo(() => summarizeSearchRuntimeState(data), [data]);
 	const translateSearchEnum = (prefix: string, value: string) =>
@@ -182,6 +211,35 @@ function SearchPage() {
 				</Alert>
 			)}
 
+			{q && (
+				<Group gap="xs" align="center">
+					<Text size="xs" c="dimmed">
+						{t("includeLabel")}
+					</Text>
+					<Chip.Group
+						multiple
+						value={include}
+						onChange={(value) =>
+							navigate({
+								search: (prev) => ({
+									...prev,
+									include: normalizeSearchInclude(value).join(",") || undefined,
+								}),
+								replace: true,
+							})
+						}
+					>
+						<Group gap={6}>
+							{SEARCH_INCLUDES.map((name: SearchInclude) => (
+								<Chip key={name} value={name} size="xs" variant="outline">
+									{t(`include_${name}`)}
+								</Chip>
+							))}
+						</Group>
+					</Chip.Group>
+				</Group>
+			)}
+
 			{data?.results?.length ? (
 				<Group justify="space-between" align="center">
 					<SegmentedControl
@@ -261,34 +319,89 @@ function SearchPage() {
 							collectionName,
 							timestamp,
 						}) => {
+							const hits: MessageHit[] =
+								result.type === "message" && result.narratorId && Array.isArray(result.hits)
+									? result.hits
+									: [];
+							const grouped = hits.length > 0;
+							const titleNode = (
+								<Text fw={500} truncate>
+									{highlightSearchText(title, q ?? "")}
+								</Text>
+							);
 							const card = (
 								<Card
 									key={key}
 									shadow="sm"
 									padding="md"
 									withBorder
-									style={{ textDecoration: "none", cursor: link ? "pointer" : undefined }}
+									style={{
+										textDecoration: "none",
+										cursor: link && !grouped ? "pointer" : undefined,
+									}}
 								>
 									<Group gap="xs" mb={6} justify="space-between" wrap="nowrap">
 										<Group gap="xs" style={{ minWidth: 0 }}>
 											<Badge size="xs" color={RESULT_TYPE_COLORS[result.type] ?? "grape"}>
 												{t(`label_${result.type}`)}
 											</Badge>
-											<Text fw={500} truncate>
-												{highlightSearchText(title, q ?? "")}
-											</Text>
+											{grouped && link ? (
+												<Link
+													to={link.to}
+													params={link.params}
+													hash={link.hash}
+													style={{ ...linkStyle, minWidth: 0 }}
+												>
+													{titleNode}
+												</Link>
+											) : (
+												titleNode
+											)}
+											{grouped && (
+												<Badge size="xs" variant="light" color="grape">
+													{t(result.hitCountIsLowerBound ? "hitCountAtLeast" : "hitCount", {
+														count: result.hitCount ?? hits.length,
+													})}
+												</Badge>
+											)}
 										</Group>
 										<Badge size="xs" variant="light" color="gray">
 											{t("score", { score: result.matchScore ?? 0 })}
 										</Badge>
 									</Group>
-									<Text size="sm" c="dimmed" lineClamp={3} mb={8}>
-										{highlightSearchText(snippet ?? "", q ?? "")}
-									</Text>
+									{grouped ? (
+										<Stack gap={4} mb={8}>
+											{hits.map((hit) => (
+												<Link
+													key={hit.id}
+													{...messageLink(result.narratorId, hit.id)}
+													style={linkStyle}
+												>
+													<Group gap={6} wrap="nowrap" align="flex-start">
+														{hit.messageRole && (
+															<Badge size="xs" variant="dot" style={{ flexShrink: 0 }}>
+																{translateSearchEnum("messageRole", hit.messageRole)}
+															</Badge>
+														)}
+														<Text size="sm" c="dimmed" lineClamp={2} style={{ minWidth: 0 }}>
+															{highlightSearchText(
+																clampSearchText(hit.snippet, MAX_SEARCH_SNIPPET_CHARS) ?? "",
+																q ?? "",
+															)}
+														</Text>
+													</Group>
+												</Link>
+											))}
+										</Stack>
+									) : (
+										<Text size="sm" c="dimmed" lineClamp={3} mb={8}>
+											{highlightSearchText(snippet ?? "", q ?? "")}
+										</Text>
+									)}
 									<Group gap={6} wrap="wrap">
 										{projectName && <Badge variant="outline">{projectName}</Badge>}
 										{chapterTitle && <Badge variant="light">{chapterTitle}</Badge>}
-										{narratorTitle && <Badge variant="light">{narratorTitle}</Badge>}
+										{narratorTitle && !grouped && <Badge variant="light">{narratorTitle}</Badge>}
 										{collectionName && (
 											<Badge variant="outline" color="teal">
 												{collectionName}
@@ -299,7 +412,7 @@ function SearchPage() {
 												{translateSearchEnum(`status_${result.type}`, result.status)}
 											</Badge>
 										)}
-										{result.messageRole && (
+										{result.messageRole && !grouped && (
 											<Badge variant="dot">
 												{translateSearchEnum("messageRole", result.messageRole)}
 											</Badge>
@@ -319,7 +432,7 @@ function SearchPage() {
 									</Group>
 								</Card>
 							);
-							if (!link) return card;
+							if (!link || grouped) return card;
 							return (
 								<Link
 									key={key}
