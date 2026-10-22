@@ -2110,6 +2110,44 @@ export const narratorTurns = sqliteTable(
 	],
 );
 
+// === narrator_block_backfill (§10.3) ===
+/**
+ * Progress of the background block jobs, one row per job:
+ *   - `convert` turns legacy (`body_format = 1`) envelopes into block rows;
+ *   - `verify` checks block-format envelopes' rows against their stored content.
+ * `cursor` is the last `narrator_messages.rowid` the job handled; it resumes after it.
+ */
+export const narratorBlockBackfill = sqliteTable(
+	"narrator_block_backfill",
+	{
+		job: text("job", { enum: ["convert", "verify"] }).primaryKey(),
+		cursor: integer("cursor").notNull().default(0),
+		complete: integer("complete", { mode: "boolean" }).notNull().default(false),
+		paused: integer("paused", { mode: "boolean" }).notNull().default(false),
+		/** Envelopes the job has handled so far. */
+		processed: integer("processed").notNull().default(0),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [check("ck_block_backfill_job", sql`${table.job} in ('convert', 'verify')`)],
+);
+
+// === narrator_block_diagnostics (§10.3) ===
+/** Envelopes a block job could not reconcile: rows that differed, or content it could not read. */
+export const narratorBlockDiagnostics = sqliteTable(
+	"narrator_block_diagnostics",
+	{
+		messageId: text("message_id")
+			.primaryKey()
+			.references(() => narratorMessages.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["mismatch", "undecodable"] }).notNull(),
+		detail: text("detail"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		check("ck_block_diagnostics_kind", sql`${table.kind} in ('mismatch', 'undecodable')`),
+	],
+);
+
 // === narrator_questions ===
 /**
  * Asynchronous AskUserQuestion records — questions the agent asked WITHOUT stopping.

@@ -1,6 +1,6 @@
 {
-  "id": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
-  "prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
+  "id": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
+  "prevId": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10880,6 +10880,120 @@
         "ck_block_assets_role": {
           "name": "ck_block_assets_role",
           "value": "\"role\" in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.narrator_block_backfill": {
+      "name": "narrator_block_backfill",
+      "schema": "",
+      "columns": {
+        "job": {
+          "name": "job",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "cursor": {
+          "name": "cursor",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "complete": {
+          "name": "complete",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "paused": {
+          "name": "paused",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "processed": {
+          "name": "processed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_block_backfill_job": {
+          "name": "ck_block_backfill_job",
+          "value": "\"job\" in ('convert', 'verify')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.narrator_block_diagnostics": {
+      "name": "narrator_block_diagnostics",
+      "schema": "",
+      "columns": {
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "detail": {
+          "name": "detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "narrator_block_diagnostics_message_id_narrator_messages_id_fk": {
+          "name": "narrator_block_diagnostics_message_id_narrator_messages_id_fk",
+          "tableFrom": "narrator_block_diagnostics",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_block_diagnostics_kind": {
+          "name": "ck_block_diagnostics_kind",
+          "value": "\"kind\" in ('mismatch', 'undecodable')"
         }
       },
       "isRLSEnabled": false

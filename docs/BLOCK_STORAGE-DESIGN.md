@@ -1572,6 +1572,19 @@ reconcile(narrator, target, now):
 - 除 project.db 组装和 decode 兜底之外，代码中不再读取 `content_json`。
 - SQLite 方言台账里与 `content_json` 有关的 `json_extract` / `json_each` / `LIKE` 全部清零。
 
+**P2 拆分与 P2a 实现说明**
+- P2 分三个 PR：P2a 回填作业（本节）、P2b 服务端读取方改读块表、P2c 前端一步切换与 WS v2。
+- **回填作业**（`server/services/narrator-block-backfill.ts`）：
+  - 两个作业共用一张进度表 `narrator_block_backfill`：`convert` 把旧信封转成块，`verify` 校验块格式信封。游标为 `narrator_messages.rowid`。
+  - **读与写的分工：** 只读 db-worker 中的 `blockBackfillSlice` 读正文并规划块行（`server/lib/db-worker/block-backfill-query.ts`），规划逻辑与 store 同步共用 `shared/narrator-blocks/plan.ts`。主线程只插入。
+  - **单片上限：** 100 个信封 / 4 MiB / 1 秒；写事务超过 50ms 时下一片减半。worker 不可用时回到主线程，单片降为 10 个信封 / 256 KiB。
+  - **一个事务内的写入顺序：** 删除残留块行，插入块、asset、块级索引，绑定账本 `block_id`，最后写 `body_bytes` 并把 `body_format` 改为 2，再清掉翻转引起的同步队列项。块插入时信封仍是格式 1，所以不 bump 任何 revision。
+  - **过期计划：** 若 `body_revision` 或账本指纹（行数与 `model_revision` 之和）与 worker 读取时不同，只翻转格式，由 store 同步按当前内容建块。
+  - **无法解码：** 不是数组的 `content_json` 记入 `narrator_block_diagnostics`（`undecodable`），信封保持格式 1，作业越过它继续。
+  - **校验：** `verify` 在 worker 中比对「块组装出的数组」与 `content_json`，不一致的记 `mismatch` 并重新同步；仍在同步队列里的信封不算。
+  - **启动与控制：** 服务就绪后在后台启动，`setTimeout(0)` 驱动，重启后从游标继续。存储设置页显示进度，可暂停与继续（`/api/storage/blocks/backfill`）。
+  - **PG：** 与 P1 一致，只在 SQLite 上运行。
+
 ### P3 退役与新能力
 
 **交付**

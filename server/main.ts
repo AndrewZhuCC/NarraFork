@@ -1616,6 +1616,14 @@ withBackgroundOccupancyInitialization(
 		if (completions.length) startupReadiness.markRecovering();
 		else startupReadiness.markReady();
 		startupReadiness.settle({ ok: true });
+		// Convert legacy envelopes to block rows in the background, slice by slice (§10.3).
+		void import("./services/narrator-block-backfill")
+			.then(({ startBlockBackfill }) => startBlockBackfill())
+			.catch((err) =>
+				logger.warn("Block backfill did not start", {
+					error: err instanceof Error ? err.message : String(err),
+				}),
+			);
 		if (completions.length) {
 			Promise.all(completions)
 				.then(() => {

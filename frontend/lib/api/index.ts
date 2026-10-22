@@ -221,6 +221,8 @@ export type {
 	BaseContentBlock,
 	BlacklistCmd,
 	BlacklistDir,
+	BlockBackfillStatus,
+	BlockJobState,
 	BufferCreator,
 	BufferMessageSummary,
 	ChangelogEntry,

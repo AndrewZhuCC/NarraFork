@@ -439,6 +439,25 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	changed: boolean;
 }
 
+/** One background block job (`server/services/narrator-block-backfill.ts`). */
+export interface BlockJobState {
+	cursor: number;
+	complete: boolean;
+	paused: boolean;
+	processed: number;
+	updatedAt: string;
+}
+
+export interface BlockBackfillStatus {
+	available: boolean;
+	convert: BlockJobState | null;
+	verify: BlockJobState | null;
+	/** Newest message row: a job's cursor against it is its progress. */
+	maxRowid: number;
+	diagnostics: number;
+	running: boolean;
+}
+
 export interface DatabaseVacuumResult {
 	ok: true;
 	beforeBytes: number;

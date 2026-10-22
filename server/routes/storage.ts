@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { z } from "zod/v4";
 import { requireAdmin } from "../middleware/auth";
 import { databaseCleanupService } from "../services/database-cleanup-service";
+import { blockBackfillStatus, setBlockBackfillPaused } from "../services/narrator-block-backfill";
 import {
 	cancelStorageScan,
 	getStorageScanJob,
@@ -49,6 +50,26 @@ storageRoutes.post("/scan/cancel", requireAdmin, async (c) => {
 	// report the very status the caller just cancelled. The service waits (briefly,
 	// bounded) for those categories to reach a terminal state before answering.
 	return c.json({ state: await cancelStorageScan(parsed.data) });
+});
+
+/**
+ * GET /api/storage/blocks/backfill — Progress of the background block jobs that convert
+ * older messages to block storage and check converted ones (admin only).
+ */
+storageRoutes.get("/blocks/backfill", requireAdmin, (c) => {
+	return c.json({ status: blockBackfillStatus() });
+});
+
+const backfillPauseSchema = z.object({ paused: z.boolean() });
+
+/**
+ * POST /api/storage/blocks/backfill/pause — Pause (`{ paused: true }`) or resume the block
+ * jobs (admin only). Resuming restarts them from their saved position.
+ */
+storageRoutes.post("/blocks/backfill/pause", requireAdmin, async (c) => {
+	const parsed = backfillPauseSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) return c.json({ error: "Invalid pause request" }, 400);
+	return c.json({ status: setBlockBackfillPaused(parsed.data.paused) });
 });
 
 /**
