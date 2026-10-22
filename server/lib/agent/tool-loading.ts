@@ -107,16 +107,19 @@ function gptSupportsAdditionalTools(model: string, codexBackend: boolean): boole
 	return major > floorMajor || (major === floorMajor && minor >= floorMinor);
 }
 
-/** `kimi-k3`, `kimi-k3.5` → major; anything else does not parse. */
-const KIMI_VERSION_PATTERN = /kimi[-_.]?k(\d{1,2})(?!\d)/i;
+/** `kimi-k3`, `kimi-k3.5`, and Kimi Coding's `k3`/`k3-256k` → major. */
+const KIMI_VERSION_PATTERN = /(?:^|kimi[-_.]?)k(\d{1,2})(?!\d)/i;
 
 /**
- * Dynamic tool loading (a `system` message carrying `tools`) is documented for kimi-k3.
- * An id without a parseable version (`kimi-latest`, `kimi-for-coding`) is left enabled.
+ * Dynamic tool loading (a `system` message carrying `tools`) is reported for Kimi K3 and
+ * Kimi Coding's `kimi-for-coding`. K2.x and `kimi-for-coding-highspeed` reject a
+ * tool-bearing system message with a 400, so ids that are not known to support it inject.
  */
 function kimiSupportsSystemTools(model: string): boolean {
+	if (model.includes("highspeed")) return false;
+	if (model === "kimi-for-coding") return true;
 	const match = KIMI_VERSION_PATTERN.exec(model);
-	return !match || Number(match[1]) >= 3;
+	return !!match && Number(match[1]) >= 3;
 }
 
 /**
@@ -137,8 +140,7 @@ export function defaultToolLoadingModes(
 			: [];
 	if (bare.includes("deepseek")) return ["anthropic_deferred_tail"];
 	// Through an Anthropic or Responses relay Kimi has no native form; inject instead.
-	if (bare.includes("kimi") && kimiSupportsSystemTools(bare))
-		return ["kimi_system_tools", "custom_injection"];
+	if (kimiSupportsSystemTools(bare)) return ["kimi_system_tools", "custom_injection"];
 	return ["custom_injection"];
 }
 

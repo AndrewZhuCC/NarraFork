@@ -92,7 +92,11 @@ describe("tool loading strategy resolution", () => {
 			"kimi_system_tools",
 			"custom_injection",
 		]);
-		expect(defaultToolLoadingModes("kimi-k2.5")).toEqual(["custom_injection"]);
+		expect(defaultToolLoadingModes("k3-256k")).toEqual(["kimi_system_tools", "custom_injection"]);
+		// K2.x and the highspeed coding model reject a tool-bearing system message.
+		expect(defaultToolLoadingModes("kimi-k2.7-code")).toEqual(["custom_injection"]);
+		expect(defaultToolLoadingModes("kimi-for-coding-highspeed")).toEqual(["custom_injection"]);
+		expect(defaultToolLoadingModes("kimi-latest")).toEqual(["custom_injection"]);
 	});
 
 	test("Kimi uses system tools on Chat Completions and injection elsewhere", () => {
