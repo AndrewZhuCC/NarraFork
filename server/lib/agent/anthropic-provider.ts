@@ -60,6 +60,12 @@ import {
 } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
+import {
+	type ToolLoadingChange,
+	type ToolLoadingStrategy,
+	type ToolLoadingTarget,
+	toolLoadingChangeOf,
+} from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { flattenTopLevelUnion } from "./tool-schema-compat";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -365,7 +371,12 @@ function applyFinalCacheBreakpoint(messages: AnthropicMessage[]): void {
 
 	for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex--) {
 		const block = message.content[blockIndex];
-		if (block.type === "text" || block.type === "image" || block.type === "tool_result") {
+		if (
+			block.type === "text" ||
+			block.type === "image" ||
+			block.type === "tool_result" ||
+			isToolChangePart(block)
+		) {
 			Object.assign(block, CACHE_CONTROL);
 			return;
 		}
@@ -403,7 +414,60 @@ type AnthropicContentPart =
 			cache_control?: CacheControl;
 	  }
 	| { type: "thinking"; thinking: string; signature: string }
-	| { type: "redacted_thinking"; data: string };
+	| { type: "redacted_thinking"; data: string }
+	| {
+			type: "tool_addition";
+			tool:
+				| { type: "tool_definition"; definition: AnthropicTool }
+				| { type: "tool_reference"; name: string };
+			cache_control?: CacheControl;
+	  }
+	| {
+			type: "tool_removal";
+			tool: { type: "tool_reference"; name: string };
+			cache_control?: CacheControl;
+	  };
+
+/** Tool-change blocks only live in mid-conversation system messages. */
+type AnthropicToolChangePart = Extract<
+	AnthropicContentPart,
+	{ type: "tool_addition" | "tool_removal" }
+>;
+
+function isToolChangePart(part: AnthropicContentPart): part is AnthropicToolChangePart {
+	return part.type === "tool_addition" || part.type === "tool_removal";
+}
+
+/** Whether a message carries tool changes, which only the system role can deliver. */
+function hasToolChangeParts(message: AnthropicMessage): boolean {
+	return Array.isArray(message.content) && message.content.some(isToolChangePart);
+}
+
+/**
+ * Beta that enables the tool-change blocks a strategy writes. Inline definitions need
+ * `inline-tools` (Claude API only); by-reference changes also work with the older beta,
+ * which Bedrock, Vertex and the DeepSeek Anthropic endpoint accept.
+ */
+function toolLoadingBetaFlag(strategy: ToolLoadingStrategy | undefined): string | undefined {
+	if (strategy === "anthropic_tool_addition") return "inline-tools-2026-09-15";
+	if (strategy === "anthropic_deferred_tail") return "mid-conversation-tool-changes-2026-07-01";
+	return undefined;
+}
+
+/** The `role:"system"` message announcing one history position's tool changes. */
+function toolChangeMessage(change: ToolLoadingChange): AnthropicMessage {
+	const content: AnthropicContentPart[] = [];
+	for (const name of change.removals)
+		content.push({ type: "tool_removal", tool: { type: "tool_reference", name } });
+	for (const addition of change.additions)
+		content.push({
+			type: "tool_addition",
+			tool: addition.definition
+				? { type: "tool_definition", definition: formatAnthropicTool(addition.definition) }
+				: { type: "tool_reference", name: addition.name },
+		});
+	return { role: "system", content };
+}
 
 /** Ensure content parts have at least one text or tool_use block (some APIs reject thinking-only messages). */
 function ensureTextOrToolBlock(parts: AnthropicContentPart[]): void {
@@ -424,6 +488,18 @@ interface AnthropicTool {
 	description: string;
 	input_schema: Record<string, unknown>;
 	cache_control?: { type: string };
+}
+
+/** One tool in Messages API shape; also the body of an inline `tool_addition`. */
+function formatAnthropicTool(tool: ResolvedToolDefinition): AnthropicTool {
+	return {
+		name: tool.name,
+		description: tool.description,
+		input_schema: {
+			$schema: "https://json-schema.org/draft/2020-12/schema",
+			...flattenTopLevelUnion(resolveToolJsonSchema(tool)),
+		},
+	};
 }
 
 interface AnthropicContextManagement {
@@ -1488,16 +1564,7 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
-		return tools.map(
-			(tool): AnthropicTool => ({
-				name: tool.name,
-				description: tool.description,
-				input_schema: {
-					$schema: "https://json-schema.org/draft/2020-12/schema",
-					...flattenTopLevelUnion(resolveToolJsonSchema(tool)),
-				},
-			}),
-		);
+		return tools.map(formatAnthropicTool);
 	}
 
 	async buildHistory(
@@ -1516,6 +1583,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			narratorId,
 			hasCredentialBoundReasoning(parseModelId(model).model),
 		);
+	}
+
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "anthropic-messages" };
 	}
 
 	getActiveReasoningSource(): string | undefined {
@@ -1562,8 +1633,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		// equivalent is the downgrade the compatible path already performs, so a
 		// model without the capability never receives a message role it will reject.
 		const midConversationSystem = isOfficial && supportsMidConversationSystem(model);
+		// Tool changes are exempt: they exist only because the selected tool loading
+		// strategy targets mid-conversation system messages, and as user content they
+		// would be rejected outright.
 		const history = (params.history as AnthropicMessage[]).map((message) =>
-			!midConversationSystem && message.role === "system"
+			!midConversationSystem && message.role === "system" && !hasToolChangeParts(message)
 				? { ...message, role: "user" as const }
 				: message,
 		);
@@ -1816,6 +1890,11 @@ export class AnthropicProvider implements ProviderAdapter {
 			"application/json",
 			params.conversationId,
 		);
+		const toolBeta = toolLoadingBetaFlag(params.toolLoadingStrategy);
+		if (toolBeta) {
+			const declared = reqHeaders["anthropic-beta"];
+			reqHeaders["anthropic-beta"] = declared ? `${declared},${toolBeta}` : toolBeta;
+		}
 
 		logger.debug("Anthropic chat request", {
 			model,
@@ -3090,8 +3169,10 @@ async function buildAnthropicHistory(
 		.join("\n\n");
 
 	// Drop the last user message — it's sent as the current message
+	let trailingToolChange: ToolLoadingChange | undefined;
 	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-		topLevel.pop();
+		const current = topLevel.pop();
+		trailingToolChange = current ? toolLoadingChangeOf(current) : undefined;
 	}
 
 	const history: AnthropicMessage[] = [];
@@ -3316,6 +3397,12 @@ async function buildAnthropicHistory(
 				pendingToolResults = [];
 			}
 
+			// A tool load's change rides next to its notice. `ensureAlternating` moves it to
+			// the legal slot in front of the next assistant turn, the same place every
+			// later rebuild puts it.
+			const toolChange = toolLoadingChangeOf(msg);
+			if (toolChange) history.push(toolChangeMessage(toolChange));
+
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const text = modelTextFromContentBlocks(content) || msg.contentText || "";
 
@@ -3342,6 +3429,10 @@ async function buildAnthropicHistory(
 			}
 		}
 	}
+
+	// The current notice is sent as the current turn; its change still has to be in
+	// the request, and `ensureAlternating` places it right after that turn.
+	if (trailingToolChange) history.push(toolChangeMessage(trailingToolChange));
 
 	return {
 		history,
@@ -3510,6 +3601,8 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	const result: AnthropicMessage[] = [];
 	/** Mid-conversation system text awaiting a legal position. */
 	const pendingSystem: string[] = [];
+	/** Tool changes awaiting the same position; they cannot fall back to user content. */
+	const pendingToolChanges: AnthropicToolChangePart[] = [];
 
 	const pushOrMerge = (message: AnthropicMessage): void => {
 		const last = result[result.length - 1];
@@ -3521,6 +3614,19 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	};
 
 	const flushSystem = (): void => {
+		if (pendingToolChanges.length > 0) {
+			const changes = pendingToolChanges.splice(0);
+			const text = pendingSystem.splice(0).join("\n\n");
+			// Never observed (a change always follows its user-role notice), but a system
+			// turn may only follow a user turn, so keep the request legal regardless.
+			if (result[result.length - 1]?.role !== "user")
+				pushOrMerge({ role: "user", content: [{ type: "text", text: "…" }] });
+			result.push({
+				role: "system",
+				content: [...(text ? [{ type: "text" as const, text }] : []), ...changes],
+			});
+			return;
+		}
 		if (pendingSystem.length === 0) return;
 		const text = pendingSystem.join("\n\n");
 		pendingSystem.length = 0;
@@ -3537,6 +3643,8 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 		if (msg.role === "system") {
 			const text = systemMessageText(msg);
 			if (text) pendingSystem.push(text);
+			if (Array.isArray(msg.content))
+				pendingToolChanges.push(...msg.content.filter(isToolChangePart));
 			continue;
 		}
 

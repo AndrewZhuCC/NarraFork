@@ -89,6 +89,8 @@ export interface ChatParams extends ProtocolChatParams {
 	maxOutputTokens?: number;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** How tool loads in `history` were rendered; decides the Anthropic tool-change beta. */
+	toolLoadingStrategy?: import("./tool-loading").ToolLoadingStrategy;
 	/** Metadata to include in the request body (e.g. user_id for Anthropic) */
 	metadata?: { user_id: string };
 	/** Optional collector for persisting raw provider request/response dumps. */
@@ -164,6 +166,13 @@ export interface ProviderAdapter {
 
 	/** Convert DB messages to provider history + trailing tool results */
 	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory>;
+
+	/**
+	 * The wire protocol this adapter speaks for `model`, used to pick a prefix-preserving
+	 * tool loading strategy (see `tool-loading.ts`). Absent means tools are always
+	 * re-declared in full.
+	 */
+	toolLoadingTarget?(model: string): import("./tool-loading").ToolLoadingTarget | undefined;
 
 	/**
 	 * Stable identity ("provider:channel") of the upstream this provider is

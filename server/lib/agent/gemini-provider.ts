@@ -32,6 +32,7 @@ import { type ProviderTransport, runProviderTransport } from "./provider-transpo
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
+import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
@@ -243,6 +244,10 @@ export class GeminiProvider implements ProviderAdapter {
 
 	setReasoningSourceOverride(source: string | undefined): void {
 		this.reasoningSourceOverride = source;
+	}
+
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "gemini-compatible" };
 	}
 
 	getActiveReasoningSource(): string | undefined {

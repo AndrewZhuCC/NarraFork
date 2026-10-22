@@ -60,6 +60,11 @@ import { type ProviderTransport, runProviderTransport } from "./provider-transpo
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
+import {
+	type ToolLoadingChange,
+	type ToolLoadingTarget,
+	toolLoadingChangeOf,
+} from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, isDeepSeekModel, type ResolvedToolDefinition } from "./types";
 import {
@@ -630,6 +635,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		this.reasoningSourceOverride = source;
 	}
 
+	toolLoadingTarget(): ToolLoadingTarget {
+		return this.responsesFormat
+			? { protocol: "openai-responses", codexBackend: this.apiMode === "codex" }
+			: { protocol: "completions-compatible" };
+	}
+
 	/** Convenience: does the current mode use Responses API message format? */
 	private get responsesFormat(): boolean {
 		return usesResponsesFormat(this.apiMode);
@@ -666,13 +677,7 @@ export class OpenAIProvider implements ProviderAdapter {
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.responsesFormat) {
 			// Responses API & Codex: flat format { type: "function", name, description, parameters, strict }
-			return tools.map((tool) => ({
-				type: "function",
-				name: tool.name,
-				description: tool.description,
-				parameters: resolveToolJsonSchema(tool),
-				strict: false, // Strict mode disabled by default (can be made configurable later)
-			}));
+			return tools.map(formatResponsesTool);
 		}
 		// Completions: nested format { type: "function", function: { ... } }
 		return tools.map(
@@ -819,7 +824,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			for (const msg of messages) {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
 				const m = msg as any;
-				if (m.role === "developer" || m.role === "system") {
+				if (!isResponsesInputItem(m) && (m.role === "developer" || m.role === "system")) {
 					// Accumulate instructions from developer/system messages
 					if (typeof m.content === "string") {
 						instructions += (instructions ? "\n\n" : "") + m.content;
@@ -1737,7 +1742,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		for (const msg of messages) {
 			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
 			const role = (msg as any).role;
-			if (role === "system" || role === "developer") {
+			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
 				if (typeof msg.content === "string") {
 					instructions += (instructions ? "\n\n" : "") + msg.content;
 				}
@@ -4055,6 +4060,36 @@ function compareOptionalOutputIndex(
 	return aSourceIndex - bSourceIndex;
 }
 
+/** One tool in Responses API shape; also an entry of an `additional_tools` item. */
+function formatResponsesTool(tool: ResolvedToolDefinition) {
+	return {
+		type: "function",
+		name: tool.name,
+		description: tool.description,
+		parameters: resolveToolJsonSchema(tool),
+		strict: false, // Strict mode disabled by default (can be made configurable later)
+	};
+}
+
+/**
+ * Input item declaring tools loaded at this position. Tools in it become callable from
+ * this point on; earlier items and the top-level `tools` stay untouched.
+ */
+function additionalToolsItem(change: ToolLoadingChange): OAIMessage {
+	return {
+		type: "additional_tools",
+		role: "developer",
+		tools: change.additions.flatMap((addition) =>
+			addition.definition ? [formatResponsesTool(addition.definition)] : [],
+		),
+	} as unknown as OAIMessage;
+}
+
+/** Input items that carry a `role` but are not messages and must stay in `input`. */
+export function isResponsesInputItem(message: unknown): boolean {
+	return (message as { type?: unknown }).type === "additional_tools";
+}
+
 async function buildResponsesHistory(
 	dbMessages: DbMessage[],
 	narratorId?: string,
@@ -4070,8 +4105,12 @@ async function buildResponsesHistory(
 		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 	);
 
+	// The current notice is sent as the current turn; its tool declaration still has
+	// to precede it, exactly where every later rebuild places it.
+	let trailingToolChange: ToolLoadingChange | undefined;
 	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-		topLevel.pop();
+		const current = topLevel.pop();
+		trailingToolChange = current ? toolLoadingChangeOf(current) : undefined;
 	}
 
 	const history: OAIMessage[] = [];
@@ -4101,6 +4140,8 @@ async function buildResponsesHistory(
 		} else if (msg.role === "user") {
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
+			const toolChange = toolLoadingChangeOf(msg);
+			if (toolChange) history.push(additionalToolsItem(toolChange));
 			const userMessage = await buildResponsesUserMessageFromDbMessage(msg, narratorId);
 			if (userMessage) {
 				history.push(userMessage);
@@ -4128,6 +4169,12 @@ async function buildResponsesHistory(
 				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		}
+	}
+
+	if (trailingToolChange) {
+		history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
+		pendingToolResults = [];
+		history.push(additionalToolsItem(trailingToolChange));
 	}
 
 	return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };

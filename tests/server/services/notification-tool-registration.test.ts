@@ -54,6 +54,18 @@ describe("Notification optional tool integration", () => {
 		expect((await resolveOptionalToolState(NARRATOR_ID, "Notification")).state).toBe("not_loaded");
 	});
 
+	test("loading a tool the session already preloaded writes no load notice", async () => {
+		const { activeNarrators } = await import("../../../server/services/narrator-session-state");
+		activeNarrators.set(NARRATOR_ID, { _enabledOptionalTools: new Set(["Notification"]) } as never);
+		try {
+			// The handler only writes a notice row for "loaded"; a notice would move the
+			// preloaded tool out of the request's fixed tool array.
+			expect(await loadOptionalTool(NARRATOR_ID, "Notification")).toBe("already_loaded");
+		} finally {
+			activeNarrators.delete(NARRATOR_ID);
+		}
+	});
+
 	test("resident preloads while manual and reserved auto modes stay unloaded", async () => {
 		for (const mode of ["manual", "auto", "resident"] as const) {
 			settings.routines = applyToolRoutineMode(settings.routines, "notification", mode);

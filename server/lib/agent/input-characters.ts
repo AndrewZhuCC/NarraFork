@@ -265,6 +265,14 @@ async function measureInputCharacters(
 			case "thought":
 				await content(part.summary, category, depth + 1);
 				return;
+			// Tools declared mid-conversation (see tool-loading.ts) are tool definitions too.
+			case "tool_addition":
+			case "tool_removal":
+				await json(part.tool, "toolDefinition");
+				return;
+			case "additional_tools":
+				await json(part.tools, "toolDefinition");
+				return;
 			case "function_result":
 				if (typeof part.result === "string" || Array.isArray(part.result)) {
 					await content(part.result, "toolResult", depth + 1);
