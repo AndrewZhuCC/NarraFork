@@ -1,5 +1,6 @@
 import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
+import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators, users } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
@@ -20,10 +21,10 @@ let observedNarratorId: string | undefined;
 const observedPrincipals: Array<string | null | undefined> = [];
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: rowsAsHistory,
 	injectSystemPrompt: () => {},
 	async *chat(params) {
-		providerCalls.push(params.content);
+		providerCalls.push(requestInput(params));
 		if (observedNarratorId) observedPrincipals.push(getRunControl(observedNarratorId)?.principal);
 		params.onRequestStart?.();
 		yield { text: "finished" };

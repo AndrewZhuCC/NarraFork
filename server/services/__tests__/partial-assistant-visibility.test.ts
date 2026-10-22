@@ -540,6 +540,11 @@ describe("identified content checkpoints through the real event consumer", () =>
 					},
 				],
 			},
+			// The unanswered result rides in the history too.
+			{
+				role: "user",
+				parts: [{ functionResponse: { name: "Read", response: { output: "file content" } } }],
+			},
 		]);
 	});
 

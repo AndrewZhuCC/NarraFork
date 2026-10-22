@@ -20,6 +20,7 @@
 
 import { describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
+import { historyStrings } from "../../../tests/fixtures/model-input";
 import { db } from "../../db";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
@@ -897,30 +898,22 @@ describe("persisted continuation reaches the next executor request", () => {
 			});
 			for (const request of requests.slice(1)) {
 				// Assert the ACTUAL next pass input, not a manually concatenated BuiltHistory.
+				// Every route carries the persisted continuation and tool results in history.
+				expect(request.userText).toBe("");
+				expect(request.trailingToolResults).toEqual([]);
 				if (route === "responses") {
-					expect(request.userText).toBe("");
 					expect(request.history).toContainEqual({
 						role: "user",
 						content: [{ type: "input_text", text: modelContent }],
 					});
 				} else if (route === "official") {
-					expect(request.userText).toBe("");
 					expect(request.history).toContainEqual({ role: "system", content: modelContent });
 				} else {
-					expect(request.userText).toBe(
-						options.hints ? `${freshHint}\n\n${modelContent}` : modelContent,
-					);
-					expect(request.trailingToolResults).toEqual(
-						options.noTools
-							? []
-							: [
-									{
-										tool_use_id: completedToolId,
-										content: "TOOL_RESULT_MARKER",
-										is_error: undefined,
-									},
-								],
-					);
+					// Compatible endpoints take runtime context as user input, after the hint.
+					const text = historyStrings(request.history);
+					expect(text).toContain(modelContent);
+					if (options.hints)
+						expect(text.indexOf(freshHint)).toBeLessThan(text.indexOf(modelContent));
 				}
 				expect(request.userText).not.toContain("DISPATCH_MARKER");
 				expect(JSON.stringify(request).match(/Self-continuations left/g)).toHaveLength(1);

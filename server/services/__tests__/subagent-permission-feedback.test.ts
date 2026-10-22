@@ -10,6 +10,7 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
+import { modelInputText } from "../../../tests/fixtures/model-input";
 import { getTestDb } from "../../../tests/setup";
 import {
 	narratorMessages,
@@ -307,7 +308,7 @@ describe("approval feedback takes one path for every session", () => {
 			const requests: string[] = [];
 			const { spyOn } = await import("bun:test");
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
-				requests.push(options.userText);
+				requests.push(modelInputText(options));
 				if (requests.length === 1) {
 					expect(options.config.userId).toBe(STARTER_ID);
 					expect(new Set(options.config.disabledTools).has("Write")).toBe(false);
@@ -355,9 +356,8 @@ describe("approval feedback takes one path for every session", () => {
 			}
 			// Adopted at the next safe boundary of the same run, exactly once.
 			expect(requests).toHaveLength(2);
-			expect(requests[1]).toBe(
-				`<sender kind="human" id="${APPROVER_ID}" name="feedback-approver" />\n记得同时更新迁移`,
-			);
+			const feedback = `<sender kind="human" id="${APPROVER_ID}" name="feedback-approver" />\n记得同时更新迁移`;
+			expect(requests[1].split(feedback)).toHaveLength(2);
 			expect(pendingFeedback.has(SUBJECT_ID)).toBe(false);
 			expect(
 				(await getModelHistorySinceLastCompact(SUBJECT_ID)).some(

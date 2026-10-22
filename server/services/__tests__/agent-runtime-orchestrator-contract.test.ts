@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { modelInputText } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
@@ -191,23 +192,6 @@ const profiles: Shape[] = [
 		parentToolUseId: "origin-agent",
 	},
 ];
-/**
- * Everything one pass gives the model: its history, where a persisted input now lives,
- * and the current text no row carries. Strings only, so JSON escaping cannot interfere.
- */
-function modelInputText(options: Pick<ExecuteLoopOptions, "history" | "userText"> | undefined) {
-	const strings: string[] = [];
-	const visit = (value: unknown): void => {
-		if (typeof value === "string") strings.push(value);
-		else if (Array.isArray(value)) for (const entry of value) visit(entry);
-		else if (value && typeof value === "object")
-			for (const entry of Object.values(value)) visit(entry);
-	};
-	visit(options?.history);
-	strings.push(options?.userText ?? "");
-	return strings.join("\n");
-}
-
 function fixture(
 	profile: Shape,
 	script: Array<ExecuteLoopResult | ((options: ExecuteLoopOptions) => Promise<ExecuteLoopResult>)>,

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, mock, test } from "bun:test";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { asc, eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
 import { getTestDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
@@ -44,10 +45,11 @@ const childStarted = Promise.withResolvers<AbortSignal>();
 const childReturned = Promise.withResolvers<ToolResult>();
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: rowsAsHistory,
 	injectSystemPrompt: () => {},
 	async *chat(params) {
-		calls.push(params.content.replace(/^<sender kind="human" \/>\n/, ""));
+		const input = requestInput(params);
+		calls.push(input.replace(/^<sender kind="human" \/>\n/, ""));
 		params.onRequestStart?.();
 		if (calls.length === 1) {
 			yield {
@@ -60,7 +62,7 @@ const provider: ProviderAdapter = {
 					},
 				],
 			};
-		} else if (params.content.includes("start child real Await")) {
+		} else if (input.includes("start child real Await")) {
 			yield {
 				toolUses: [
 					{

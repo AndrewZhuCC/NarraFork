@@ -61,11 +61,11 @@ describe("OpenAIProvider history builder", () => {
 
 		const { history } = await provider.buildHistory(dbMessages, "test:gpt-5");
 
-		expect(history).toHaveLength(1);
-		expect(history[0]).toEqual({
-			role: "user",
-			content: [{ type: "input_text", text: "hello" }],
-		});
+		// The empty assistant stub is skipped; the trailing input stays in the history.
+		expect(history).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			{ role: "user", content: [{ type: "input_text", text: "next" }] },
+		]);
 	});
 });
 

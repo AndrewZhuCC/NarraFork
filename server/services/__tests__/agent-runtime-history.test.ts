@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { historyStrings } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
 import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
@@ -402,19 +403,6 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 		expect(prepared.trailingToolResults).toEqual([]);
 		expect(source).toEqual(before);
 	});
-}
-
-/** Every string in a provider history, so assertions read model text rather than JSON escapes. */
-function historyStrings(history: unknown): string {
-	const strings: string[] = [];
-	const visit = (value: unknown): void => {
-		if (typeof value === "string") strings.push(value);
-		else if (Array.isArray(value)) for (const entry of value) visit(entry);
-		else if (value && typeof value === "object")
-			for (const entry of Object.values(value)) visit(entry);
-	};
-	visit(history);
-	return strings.join("\n");
 }
 
 function injectionMessage(id: string, role: "sys" | "user", text: string) {

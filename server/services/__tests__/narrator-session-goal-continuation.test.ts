@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
+import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
@@ -39,12 +40,13 @@ const providerCalls: string[] = [];
 let disableContinuationNarratorId: string | null = null;
 const testProvider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: rowsAsHistory,
 	injectSystemPrompt: () => {},
 	async *chat(params) {
-		providerCalls.push(params.content);
+		const input = requestInput(params);
+		providerCalls.push(input);
 		params.onRequestStart?.();
-		if (disableContinuationNarratorId && params.content.endsWith("\ndisable auto continuation")) {
+		if (disableContinuationNarratorId && input.endsWith("\ndisable auto continuation")) {
 			await db
 				.update(narrators)
 				.set({ autoContinuationOverride: "off" })

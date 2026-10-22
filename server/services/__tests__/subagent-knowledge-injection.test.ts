@@ -25,6 +25,7 @@
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
+import { historyStrings } from "../../../tests/fixtures/model-input";
 import { db } from "../../db";
 import { aclGrants, knowledgeTags, narrators, users } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
@@ -505,15 +506,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			const request = requests[requests.length - 1];
 			// The queued message and its hint are persisted rows: the history carries both.
 			expect(request.userText).toBe("");
-			const strings: string[] = [];
-			const visit = (value: unknown): void => {
-				if (typeof value === "string") strings.push(value);
-				else if (Array.isArray(value)) for (const entry of value) visit(entry);
-				else if (value && typeof value === "object")
-					for (const entry of Object.values(value)) visit(entry);
-			};
-			visit(request.history);
-			const historyText = strings.join("\n");
+			const historyText = historyStrings(request.history);
 			const rows = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			expect(rows.find((row) => row.role === "user")?.contentText).toBe(text);
 			const hint = rows.find((row) => row.role === "sys");
