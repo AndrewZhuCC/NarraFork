@@ -20,6 +20,22 @@ const { broadcastToNarrator, getNarratorConnections, handleNarratorWS } = await 
 	"./narrator-ws"
 );
 const protocol = await import("./narrator-block-protocol");
+const { decodeBlockFrame } = await import("@frontend/lib/block-protocol");
+
+/** A decoded value without the block sidecar the client adds to every row. */
+function withoutBlockRefs<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value), (key, field) =>
+		key === "blockRefs" ? undefined : field,
+	);
+}
+
+/** What a v2 client's decoder makes of one v1 broadcast. */
+const roundTrip = (frame: Parameters<typeof protocol.toBlockFrames>[0]) =>
+	withoutBlockRefs(
+		protocol
+			.toBlockFrames(frame)
+			.flatMap((item) => decodeBlockFrame(item as unknown as Record<string, unknown>)),
+	);
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
@@ -60,7 +76,7 @@ beforeEach(() => {
 afterEach(() => {
 	for (const ws of opened.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
-	settings.narratorBlocks.wsV2 = false;
+	settings.narratorBlocks.wsV2 = true;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -200,6 +216,34 @@ describe("block ids of streaming items", () => {
 	});
 });
 
+describe("tool lifecycle frames", () => {
+	test("name the tool block of their ledger attempt", async () => {
+		const step = await narratorStore.openStep("n1", { uuid: "u", session_id: "s" });
+		const callRowId = await narratorStore.writeStepItem(step.id, "n1", {
+			type: "tool_use",
+			id: "call_led",
+			name: "Bash",
+			input: { command: "ls" },
+			outputIndex: 0,
+		});
+		const block = rowOf(step.id, "tool")?.id;
+		const completed = {
+			type: "tool_completed" as const,
+			narratorId: "n1",
+			toolCallId: callRowId as string,
+			toolUseId: "call_led",
+			status: "success",
+		};
+		expect(protocol.toBlockFrames(completed)).toEqual([{ ...completed, blockId: block }]);
+		// Without the attempt's id, the newest attempt of the call decides.
+		expect(protocol.toBlockFrames({ ...completed, toolCallId: null })).toEqual([
+			{ ...completed, toolCallId: null, blockId: block },
+		]);
+		const unknown = { ...completed, toolCallId: null, toolUseId: "call_none" };
+		expect(protocol.toBlockFrames(unknown)).toEqual([unknown]);
+	});
+});
+
 describe("negotiating the message protocol", () => {
 	async function subscribe(ws: FakeWs, version?: 1 | 2) {
 		await handleNarratorWS.message(ws, {
@@ -259,11 +303,72 @@ describe("negotiating the message protocol", () => {
 	});
 
 	test("with wsV2 off a client asking for v2 is told it has v1", async () => {
+		settings.narratorBlocks.wsV2 = false;
 		const { ws, sent } = openWs();
 		await subscribe(ws, 2);
 		expect(sent).toContainEqual(expect.objectContaining({ type: "message_protocol", protocol: 1 }));
 		sent.length = 0;
 		broadcastToNarrator("n1", delta("att4:0", "x"));
 		expect(sent.map((frame) => frame.type)).toEqual(["stream_event"]);
+	});
+});
+
+describe("the client's decoder", () => {
+	test("gives back each v1 frame a v2 subscriber was sent", async () => {
+		const input = await narratorStore.appendInput("n1", "hello");
+		for (const type of ["message", "user_message", "message_updated"] as const) {
+			const frame = { type, narratorId: "n1", message: messageRow(input.id) };
+			expect(roundTrip(frame)).toEqual([JSON.parse(JSON.stringify(frame))]);
+		}
+		const text = {
+			type: "stream_event" as const,
+			narratorId: "n1",
+			event: {
+				type: "content_block_delta",
+				delta: { type: "text_delta", text: "Hi", id: "att5:0", revision: 2, textOffset: 4 },
+				fileReferenceContext: { blockId: "att5:0" },
+				outputIndex: 1,
+			},
+		};
+		expect(roundTrip(text)).toEqual([text]);
+		const reasoning = {
+			type: "stream_event" as const,
+			narratorId: "parent",
+			event: {
+				type: "content_block_delta",
+				delta: { type: "reasoning_delta", text: "hmm", id: "att6:0", outputIndex: 0 },
+				subagentToolUseId: "agent1",
+				subagentNarratorId: "n1",
+			},
+		};
+		expect(roundTrip(reasoning)).toEqual([reasoning]);
+		const chunk = {
+			type: "tool_use_chunk" as const,
+			narratorId: "n1",
+			toolCallId: null,
+			toolUseId: "call_rt",
+			toolName: "Bash",
+			inputCharsTotal: 0,
+		};
+		expect(roundTrip(chunk)).toEqual([chunk]);
+	});
+
+	test("gives back a catch-up's top-level rows, their children and orphan children", async () => {
+		const parent = await narratorStore.appendInput("n1", "parent");
+		const orphan = await narratorStore.appendInput("n1", "orphan");
+		const child = await narratorStore.appendInput("n1", "child");
+		const frame = {
+			type: "catch_up",
+			narratorId: "n1",
+			topLevel: [
+				{ ...messageRow(parent.id), children: [{ ...messageRow(child.id), children: [] }] },
+			],
+			orphanChildren: [{ ...messageRow(orphan.id), children: [] }],
+			subagentActivities: [],
+			cursor: { parentLastMessageId: parent.id },
+			messageVersion: 4,
+		};
+		const decoded = decodeBlockFrame(protocol.toBlockCatchUp(frame));
+		expect(withoutBlockRefs(decoded)).toEqual([JSON.parse(JSON.stringify(frame))]);
 	});
 });

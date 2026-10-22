@@ -344,13 +344,56 @@ export function patchToolCallFields(
 	messages: readonly TreeMessage[],
 	toolUseId: string,
 	fields: Record<string, unknown>,
+	/**
+	 * The tool block the event is about (block-keyed protocol): the patch then writes only
+	 * the row holding that block. Without it, or when no loaded row holds it, every
+	 * occurrence of `toolUseId` is written as before.
+	 */
+	blockId?: string | null,
 ): LivePatchResult {
 	if (!toolUseId || !Array.isArray(messages) || messages.length === 0) return unchanged(messages);
 	if (Object.keys(fields).length === 0) return unchanged(messages);
 	const safeFields = withoutTerminalRegression(messages, toolUseId, fields);
 	if (Object.keys(safeFields).length === 0) return unchanged(messages);
+	if (blockId) {
+		const exact = patchRowHoldingBlock(messages, blockId, (row) =>
+			mergeToolCallFieldsInTree([{ ...row, children: [] }], toolUseId, safeFields),
+		);
+		if (exact) return exact.changed ? exact : unchanged(messages);
+	}
 	const result = mergeToolCallFieldsInTree(messages as TreeMessage[], toolUseId, safeFields);
 	return result.changed ? result : unchanged(messages);
+}
+
+/**
+ * Apply `patch` to the one loaded row whose blocks include `blockId`, children kept.
+ * Undefined when no loaded row holds the block.
+ */
+function patchRowHoldingBlock(
+	rows: readonly TreeMessage[],
+	blockId: string,
+	patch: (row: TreeMessage) => { messages: TreeMessage[]; changed: boolean },
+): LivePatchResult | undefined {
+	for (let i = rows.length - 1; i >= 0; i--) {
+		const row = rows[i];
+		if (row.blockRefs?.some((block) => block.id === blockId)) {
+			const result = patch(row);
+			if (!result.changed) return { messages: rows as TreeMessage[], changed: false };
+			const updated = [...rows];
+			updated[i] = { ...result.messages[0], children: row.children };
+			return { messages: updated, changed: true };
+		}
+		if (row.children?.length) {
+			const nested = patchRowHoldingBlock(row.children, blockId, patch);
+			if (nested) {
+				if (!nested.changed) return { messages: rows as TreeMessage[], changed: false };
+				const updated = [...rows];
+				updated[i] = { ...row, children: nested.messages as TreeMessage[] };
+				return { messages: updated, changed: true };
+			}
+		}
+	}
+	return undefined;
 }
 
 /**

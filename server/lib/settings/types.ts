@@ -904,7 +904,8 @@ export interface NarraForkSettings {
 		/**
 		 * Whether clients may negotiate the block-keyed message protocol v2: page API
 		 * envelopes + blocks, block-level WS events (§8). A client opts in per
-		 * subscription; off, every connection gets v1.
+		 * subscription; off, every connection gets v1 (the client handles both, so this
+		 * is the rollback switch).
 		 */
 		wsV2: boolean;
 	};
