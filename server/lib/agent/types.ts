@@ -937,19 +937,29 @@ export interface AgentAfterToolsInput {
 	onConsumed?: () => void;
 }
 
+/**
+ * What an agent loop's first request is built from.
+ *
+ * `rows` are the conversation (`DbMessage` rows, the stored shape); the loop keeps them
+ * as its transcript (`loop-transcript.ts`) and projects every request that has no
+ * host-built history from them. A host that already built the request from the same
+ * rows passes that history as `built`, which then is what the first request sends.
+ */
+export interface AgentLoopHistory {
+	rows: readonly import("./provider").DbMessage[];
+	built?: unknown[];
+}
+
+/** A host's rebuild: the rows of the conversation and the history built from them. */
 export interface AgentHistoryReplacement {
 	history: unknown[];
-	pendingToolResults: unknown[];
+	/** The rows `history` was built from; they replace the loop's transcript. */
+	rows: readonly import("./provider").DbMessage[];
 	systemPrompt?: string;
 	/** Persisted input rows the rebuilt history carries. */
 	replayedInjectionMessageIds?: readonly string[];
 	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
-	/**
-	 * Whether the history ends with input the model has not answered yet: a user or sys
-	 * row, or tool results. A reasoning-only reply to such a history is retried as is.
-	 */
-	endsWithInput?: boolean;
 }
 
 export interface AgentConfig {
@@ -1182,9 +1192,8 @@ export interface AgentConfig {
 	onEvent?: (event: AgentEvent) => void;
 	/**
 	 * Called before each non-first turn in the agent loop.
-	 * If it returns a new history + pendingToolResults, the loop replaces its
-	 * internal state — used for mid-turn context pruning and forced rebuilds
-	 * before model/provider switches.
+	 * If it returns a rebuilt history, the loop replaces its history and transcript —
+	 * used for mid-turn context pruning and forced rebuilds before model/provider switches.
 	 */
 	onBeforeTurn?: (
 		turnIndex: number,
@@ -1194,7 +1203,7 @@ export interface AgentConfig {
 	 * Rebuild the history a request is sent with, from persisted rows.
 	 *
 	 * When present, every request after the first is built by this instead of from the
-	 * loop's in-memory turns, so a live request is byte-for-byte what a later rebuild of
+	 * loop's own transcript, so a live request is byte-for-byte what a later rebuild of
 	 * the same rows produces. Everything the model saw in earlier turns is persisted by
 	 * then (assistant steps, tool results, notice rows); only text no row carries is
 	 * still sent as the request's current content. Hosts without a store leave it unset.

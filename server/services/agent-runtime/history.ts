@@ -5,6 +5,7 @@ import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../../lib/agent/file-reference-projection";
+import { historyTail } from "../../lib/agent/history-build";
 import type { BuiltHistory } from "../../lib/agent/provider";
 import {
 	findCurrentSenderMessage,
@@ -75,23 +76,6 @@ export interface PreparedRuntimeHistory extends BuiltHistory {
 	endsWithInput: boolean;
 	/** Loading state of this history; the loop derives the tool array from it. */
 	toolLoading?: ToolLoadingState;
-}
-
-/** The last top-level row the model reads, and whether it is an answered tool step. */
-function historyTail(messages: readonly RuntimeHistoryMessage[]): {
-	toolResults: boolean;
-	input: boolean;
-} {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (message.parentToolUseId || message.role === "disp" || message.role === "system") continue;
-		if (message.role !== "assistant") return { toolResults: false, input: true };
-		const toolResults = (message.toolCalls ?? []).some(
-			(call) => call.status === "success" || call.status === "fail",
-		);
-		return { toolResults, input: toolResults };
-	}
-	return { toolResults: false, input: false };
 }
 
 /**

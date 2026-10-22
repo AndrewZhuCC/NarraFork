@@ -65,7 +65,7 @@ import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingStrategy, ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { flattenTopLevelUnion } from "./tool-schema-compat";
-import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import { ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
 
 // === Claude Code protocol constants ===
@@ -1938,214 +1938,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 	}
 
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-	): unknown {
-		if (images?.length) {
-			const content: Array<
-				| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
-				| { type: "text"; text: string }
-			> = [];
-			for (const img of images) {
-				content.push({
-					type: "image",
-					source: {
-						type: "base64",
-						media_type: `image/${img.format}`,
-						data: img.base64,
-					},
-				});
-			}
-			content.push({ type: "text", text: output });
-			return { tool_use_id: toolUseId, content, is_error: isError || undefined };
-		}
-		return { tool_use_id: toolUseId, content: output, is_error: isError || undefined };
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const h = history as AnthropicMessage[];
-		const parts: AnthropicContentPart[] = [];
-
-		for (const tr of toolResults as Array<{
-			tool_use_id: string;
-			content:
-				| string
-				| Array<
-						| { type: "text"; text: string }
-						| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
-				  >;
-			is_error?: boolean;
-		}>) {
-			parts.push({
-				type: "tool_result",
-				tool_use_id: tr.tool_use_id,
-				content: tr.content,
-				is_error: tr.is_error,
-			});
-		}
-
-		const hasText = !!content && content !== ".";
-		if (hasText) {
-			parts.push(...anthropicUserParts(content, images));
-		} else if (images?.length) {
-			parts.push(...anthropicUserParts("[user sent image(s)]", images));
-		}
-
-		if (parts.length > 0) {
-			h.push({ role: "user", content: parts });
-		}
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		_webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-		}>,
-		_messageId?: string,
-		_imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const h = history as AnthropicMessage[];
-		if (orderedContent) {
-			const parts: AnthropicContentPart[] = [];
-			for (const block of orderedContent) {
-				if (block.type === "text" && block.text.trim()) {
-					parts.push({ type: "text", text: block.text });
-				} else if (block.type === "reasoning" && block.text.trim()) {
-					parts.push({
-						type: "thinking",
-						thinking: block.text,
-						signature: block.providerMetadata?.anthropic?.signature ?? "",
-					});
-				} else if (block.type === "redacted_thinking") {
-					parts.push({ type: "redacted_thinking", data: block.data });
-				} else if (block.type === "tool_use") {
-					parts.push({
-						type: "tool_use",
-						id: block.toolUseId,
-						name: block.name,
-						input: block.input,
-					});
-				}
-			}
-			if (parts.length) {
-				ensureTextOrToolBlock(parts);
-				h.push({ role: "assistant", content: parts });
-			}
-			return;
-		}
-
-		// Collect all blocks with their outputIndex and sort by position.
-		// When no block has an explicit outputIndex (legacy messages), fall back
-		// to the fixed ordering: reasoning → text → tool_use.
-		const indexed: Array<{ part: AnthropicContentPart; outputIndex: number }> = [];
-
-		if (reasoningBlocks) {
-			for (let i = 0; i < reasoningBlocks.length; i++) {
-				const rb = reasoningBlocks[i];
-				// A thinking block with empty text is rejected upstream
-				// ("messages.N.content.M.thinking: ... too short"), and because the
-				// offending block lives in replayed history every later turn fails at
-				// the same index — the conversation is permanently wedged.
-				//
-				// Empty text with a signature is produced by an interrupted stream:
-				// content_block_start opens a thinking block, signature_delta fills the
-				// signature, and the connection dies before any thinking_delta arrives.
-				// Such a block carries no information — the signature is only meaningful
-				// as proof-of-origin for text that exists — so it is dropped rather than
-				// padded. Padding is not an option: the signature is cryptographically
-				// bound to the original text, so invented filler turns a length error
-				// into a harder-to-diagnose signature verification failure.
-				if (!rb.text || rb.text.trim() === "") continue;
-				const sig = rb.providerMetadata?.anthropic?.signature ?? "";
-				indexed.push({
-					part: { type: "thinking", thinking: rb.text, signature: sig },
-					// Fallback uses the kept-block count (indexed.length), not the raw
-					// loop index i: dropping an empty block above must not leave a gap
-					// that reorders the surviving block after the text/tool_use blocks,
-					// which anchor their own fallback to indexed.length too.
-					outputIndex: rb.outputIndex ?? indexed.length,
-				});
-			}
-		}
-
-		if (redactedThinkingBlocks) {
-			for (const rb of redactedThinkingBlocks) {
-				indexed.push({
-					part: { type: "redacted_thinking", data: rb.data },
-					outputIndex: rb.outputIndex ?? indexed.length,
-				});
-			}
-		}
-
-		// Whitespace-only text is rejected upstream ("text content blocks must
-		// contain non-whitespace text"), and because the block lands in replayed
-		// history every later turn fails at the same index — the conversation is
-		// permanently wedged, exactly like the empty-thinking case above. A plain
-		// truthiness check is not enough: it stops "" but passes " " and "\n".
-		if (text?.trim()) {
-			// Use the real textOutputIndex when available; otherwise place text
-			// after reasoning blocks but before tool_use blocks.
-			const fallbackIdx = indexed.length;
-			indexed.push({
-				part: { type: "text", text },
-				outputIndex: textOutputIndex ?? fallbackIdx,
-			});
-		}
-
-		for (let i = 0; i < toolUses.length; i++) {
-			const tu = toolUses[i];
-			const fallbackIdx = indexed.length;
-			indexed.push({
-				part: {
-					type: "tool_use",
-					id: tu.toolUseId,
-					name: tu.name,
-					input: tu.input,
-				},
-				outputIndex: tu.outputIndex ?? fallbackIdx,
-			});
-		}
-
-		indexed.sort((a, b) => a.outputIndex - b.outputIndex);
-		const parts = indexed.map((e) => e.part);
-
-		if (parts.length > 0) {
-			ensureTextOrToolBlock(parts);
-			h.push({ role: "assistant", content: parts });
-		}
-	}
-
 	async generate(text: string, model: string): Promise<string> {
 		const result = await this.generateWithMeta(text, model);
 		return result.text;
@@ -3130,7 +2922,6 @@ async function buildAnthropicHistory(
 	strictReasoning = false,
 ): Promise<{
 	history: AnthropicMessage[];
-	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
 	replayedInjectionMessageIds: string[];
 }> {
 	const projected = await projectHistory(
@@ -3143,7 +2934,6 @@ async function buildAnthropicHistory(
 			midConversationSystem: useMidConversationSystemRole,
 			strict: strictReasoning,
 		}),
-		trailingToolResults: [],
 		replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
 	};
 }
@@ -3608,8 +3398,8 @@ function dropEmptyThinkingBlocks(messages: AnthropicMessage[]): void {
  *     before `signatureSource` existed). Echoing a foreign signature would fail
  *     verification, so blanking it was the safe half of the decision — but
  *     keeping the text alongside a blank signature is not a legal request.
- *   - `pushAssistantTurn` defaults the signature to `""` when a stream died
- *     between `content_block_start` and `signature_delta`.
+ *   - a reasoning block whose stream died between `content_block_start` and
+ *     `signature_delta` is stored, and replayed, without a signature.
  *
  * Dropping is what Anthropic prescribes for exactly this case: thinking blocks are
  * "passed back unchanged on the same model; other models drop them silently

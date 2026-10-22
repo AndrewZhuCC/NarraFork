@@ -160,6 +160,14 @@ export function projectInjectionSenderText(text: string, source: string, body?: 
 const projected = Symbol("senderProjection");
 type ProjectedMessage = SenderMessage & { [projected]?: true };
 
+/**
+ * Mark a row whose text is already exactly what the model reads — a loop's own input
+ * (`loop-transcript.ts`), which was never attributed and is sent as written.
+ */
+export function markSenderProjected<T extends SenderMessage>(message: T): T {
+	return Object.assign(message, { [projected]: true as const });
+}
+
 /** Immutable model projection; preserve blocks, body metadata and all non-text payloads. */
 export function projectMessageSenderForModel<T extends SenderMessage>(message: T): T {
 	if (

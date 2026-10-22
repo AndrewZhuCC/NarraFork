@@ -5,7 +5,7 @@
  * these bytes.
  */
 
-import type { CanonicalEnvelope } from "@shared/narrator-blocks/types";
+import type { CanonicalEnvelope, ImagePart } from "@shared/narrator-blocks/types";
 import { logger } from "../../logger";
 import { getImagePath, imageToBase64 } from "../../uploads";
 import type { ProjectionAssets, ResolvedImage } from "./turns";
@@ -86,6 +86,13 @@ async function readUpload(
 	}
 }
 
+/** Bytes a loop's in-memory row carries itself; there is no upload to read. */
+function inlineImage(part: ImagePart): ResolvedImage | null {
+	if (!part.data) return null;
+	const mediaType = part.mediaType ?? "image/png";
+	return { mediaType, format: FORMAT_BY_MEDIA_TYPE[mediaType] ?? "png", base64: part.data };
+}
+
 /** Load the image bytes of every input, tool result and generated image in the view. */
 export async function resolveProjectionAssets(
 	envelopes: readonly CanonicalEnvelope[],
@@ -100,21 +107,18 @@ export async function resolveProjectionAssets(
 			if (block.kind === "input") {
 				const images = block.payload.parts.filter((part) => part.type === "image");
 				if (!images.length) continue;
-				if (!owner) {
-					inputImages.set(
-						block.id,
-						images.map(() => null),
-					);
-					continue;
-				}
 				const slots: Array<ResolvedImage | null> = [];
-				for (const image of images)
+				for (const image of images) {
+					const uploader = image.uploadNarratorId ?? owner;
 					slots.push(
-						await readUpload(image.uploadNarratorId ?? owner, image.assetId, image.mediaType, {
-							narratorId,
-							messageId: envelope.id,
-						}),
+						image.data || !uploader
+							? inlineImage(image)
+							: await readUpload(uploader, image.assetId, image.mediaType, {
+									narratorId,
+									messageId: envelope.id,
+								}),
 					);
+				}
 				inputImages.set(block.id, slots);
 				continue;
 			}
@@ -124,13 +128,14 @@ export async function resolveProjectionAssets(
 				const images: ResolvedImage[] = [];
 				for (const part of parts) {
 					const uploader = part.uploadNarratorId ?? owner;
-					const image = uploader
-						? await readUpload(uploader, part.assetId, part.mediaType, {
-								narratorId,
-								messageId: envelope.id,
-								toolUseId: block.wireId,
-							})
-						: null;
+					const image =
+						part.data || !uploader
+							? inlineImage(part)
+							: await readUpload(uploader, part.assetId, part.mediaType, {
+									narratorId,
+									messageId: envelope.id,
+									toolUseId: block.wireId,
+								});
 					if (image) images.push(image);
 				}
 				if (images.length) toolResultImages.set(block.id, images);

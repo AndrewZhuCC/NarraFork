@@ -196,8 +196,6 @@ export interface DbToolCall {
  */
 export interface BuiltHistory {
 	history: unknown[];
-	/** Always empty: trailing tool results ride in `history`. Kept for adapter compatibility. */
-	trailingToolResults: unknown[];
 	/** Persisted input rows emitted into history (delivery receipts, de-duplication). */
 	replayedInjectionMessageIds?: readonly string[];
 }

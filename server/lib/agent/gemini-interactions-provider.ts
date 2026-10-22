@@ -27,12 +27,11 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
-import { signatureSourcesCompatible } from "./reasoning-source";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
-import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import { ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
 
 const GEMINI_IDENTITY: Record<string, string> = {
@@ -238,7 +237,6 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		);
 		return {
 			history: this.interactionsWireHistory(projected.turns),
-			trailingToolResults: [],
 			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
 		};
 	}
@@ -334,142 +332,6 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		} finally {
 			tap.finish();
 		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		assertByteLimit(output, GEMINI_MAX_TEXT_BYTES, "tool result text");
-		let result: unknown = isError ? { error: output } : output;
-		if (!isError && images?.length) {
-			result = [
-				{ type: "text", text: output },
-				...images.map((image) => ({
-					type: "image",
-					data: image.base64,
-					mime_type: `image/${image.format}`,
-				})),
-			];
-		}
-		return {
-			type: "function_result",
-			call_id: toolUseId,
-			name: toolName ?? toolUseId,
-			result,
-		} satisfies GeminiFunctionResultStep;
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const steps = history as GeminiHistoryItem[];
-		steps.push(...(toolResults as GeminiFunctionResultStep[]));
-		appendCurrentUserInput(steps, content, images);
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		_webSearches?: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }>,
-		_messageId?: string,
-		_imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const ordered: Array<{ index: number; sequence: number; step: GeminiInteractionStep }> = [];
-		let sequence = 0;
-		if (orderedContent) {
-			reasoningBlocks = [];
-			toolUses = [];
-			text = "";
-			for (const [index, block] of orderedContent.entries()) {
-				if (block.type === "text" && block.text)
-					ordered.push({
-						index,
-						sequence: sequence++,
-						step: { type: "model_output", content: block.text },
-					});
-				else if (block.type === "reasoning") reasoningBlocks.push({ ...block, outputIndex: index });
-				else if (block.type === "tool_use") toolUses.push({ ...block, outputIndex: index });
-			}
-		}
-		const currentSource = this.getActiveReasoningSource();
-
-		for (const block of reasoningBlocks ?? []) {
-			const metadata = block.providerMetadata;
-			const signature = extractThoughtSignature(metadata, currentSource);
-			ordered.push({
-				index: block.outputIndex ?? Number.MAX_SAFE_INTEGER - 2,
-				sequence: sequence++,
-				step: {
-					type: "thought",
-					...(metadata?.gemini?.stepId ? { id: metadata.gemini.stepId } : {}),
-					...(signature ? { signature } : {}),
-					...(block.text ? { summary: [{ type: "text", text: block.text }] } : {}),
-				},
-			});
-		}
-		if (text) {
-			ordered.push({
-				index: textOutputIndex ?? Number.MAX_SAFE_INTEGER - 1,
-				sequence: sequence++,
-				step: { type: "model_output", content: text },
-			});
-		}
-		for (const toolUse of toolUses) {
-			const { args, signature, signatureSource } = extractArgsAndSignature(toolUse.input);
-			const replaySignature = signatureSourcesCompatible(
-				toolUse.thoughtSignatureSource ?? signatureSource,
-				currentSource,
-			)
-				? (toolUse.thoughtSignature ?? signature)
-				: undefined;
-			if (
-				replaySignature &&
-				!(reasoningBlocks ?? []).some(
-					(block) =>
-						extractThoughtSignature(block.providerMetadata, currentSource) === replaySignature,
-				)
-			) {
-				ordered.push({
-					index: toolUse.outputIndex ?? Number.MAX_SAFE_INTEGER,
-					sequence: sequence++,
-					step: { type: "thought", signature: replaySignature },
-				});
-			}
-			ordered.push({
-				index: toolUse.outputIndex ?? Number.MAX_SAFE_INTEGER,
-				sequence: sequence++,
-				step: {
-					type: "function_call",
-					id: toolUse.toolUseId,
-					name: toolUse.name,
-					arguments: args,
-				},
-			});
-		}
-		ordered.sort((a, b) => a.index - b.index || a.sequence - b.sequence);
-		(history as GeminiHistoryItem[]).push(...ordered.map((item) => item.step));
 	}
 
 	async generate(text: string, model: string): Promise<string> {
@@ -1346,41 +1208,8 @@ function mapUsageStream(usage: GeminiInteractionUsage): NonNullable<ParsedStream
 	};
 }
 
-function extractThoughtSignature(
-	metadata: import("./types").ReasoningProviderMetadata | undefined,
-	currentSource: string | undefined,
-): string | undefined {
-	const signature = metadata?.gemini?.thoughtSignature;
-	if (!signature) return undefined;
-	return signatureSourcesCompatible(metadata.signatureSource, currentSource)
-		? signature
-		: undefined;
-}
-
 export const GEMINI_THOUGHT_SIGNATURE_KEY = "__geminiThoughtSignature";
 export const GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY = "__geminiThoughtSignatureSource";
-
-function extractArgsAndSignature(input: unknown): {
-	args: Record<string, unknown>;
-	signature?: string;
-	signatureSource?: string;
-} {
-	if (!input || typeof input !== "object" || Array.isArray(input)) {
-		return { args: (input as Record<string, unknown>) ?? {} };
-	}
-	const record = input as Record<string, unknown>;
-	if (!(GEMINI_THOUGHT_SIGNATURE_KEY in record)) return { args: record };
-	const {
-		[GEMINI_THOUGHT_SIGNATURE_KEY]: signature,
-		[GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY]: signatureSource,
-		...args
-	} = record;
-	return {
-		args,
-		signature: typeof signature === "string" ? signature : undefined,
-		signatureSource: typeof signatureSource === "string" ? signatureSource : undefined,
-	};
-}
 
 export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {
 	return sanitizeNode(schema) as Record<string, unknown>;

@@ -19,11 +19,23 @@ export function historyStrings(history: unknown): string {
 	return strings.join("\n");
 }
 
+/**
+ * The history a request sends. An executor request carries `{ rows, built }`: the host's
+ * build when it made one, otherwise the rows the loop projects; a chat request carries
+ * the provider history itself.
+ */
+export function sentHistory(history: unknown): unknown {
+	if (!history || typeof history !== "object" || Array.isArray(history) || !("rows" in history))
+		return history;
+	const { rows, built } = history as { rows: unknown; built?: unknown };
+	return built ?? rows;
+}
+
 /** The history's strings followed by the current text of one executor or chat request. */
 export function modelInputText(
 	request: { history?: unknown; userText?: string } | undefined,
 ): string {
-	return `${historyStrings(request?.history)}\n${request?.userText ?? ""}`;
+	return `${historyStrings(sentHistory(request?.history))}\n${request?.userText ?? ""}`;
 }
 
 /** How many times `needle` reaches the model in this request. */
@@ -45,7 +57,7 @@ export async function rowsAsHistory(
 		contentText?: string | null;
 		parentToolUseId?: string | null;
 	}>,
-): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+): Promise<{ history: unknown[] }> {
 	return {
 		history: messages
 			.filter(
@@ -54,7 +66,6 @@ export async function rowsAsHistory(
 					(message.role === "user" || message.role === "assistant" || message.role === "sys"),
 			)
 			.map((message) => ({ role: message.role, content: message.contentText ?? "" })),
-		trailingToolResults: [],
 	};
 }
 

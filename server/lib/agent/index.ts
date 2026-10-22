@@ -3,7 +3,7 @@ import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
 import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
-import { projectFileReferencesForModel } from "./file-reference-projection";
+import { buildAdapterHistory } from "./history-build";
 import { isRetryableError } from "./loop";
 import {
 	type BuiltHistory,
@@ -11,20 +11,13 @@ import {
 	type ProviderResolution,
 	resolveProviderAndModel,
 } from "./provider";
-import { projectAskUserQuestionMessagesForModel } from "./question-model-input";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
-import { projectMessageSenderForModel } from "./sender-projection";
-import { stripCitationMarkersForModel } from "./strip-citation-markers";
-import { stripPlanBodyForModel } from "./strip-plan-body";
 import {
-	projectToolLoadingHistory,
 	resolveAdapterToolLoadingStrategy,
-	resolveLoadableToolDefinition,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 } from "./tool-loading";
 import "./tools";
-import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
 import { initTruncateCleanup } from "./truncate";
 
 // Start periodic cleanup of truncated output files
@@ -47,6 +40,7 @@ export type {
 	AgentEvent,
 	AgentHistoryReplacement,
 	AgentInputPart,
+	AgentLoopHistory,
 	AgentToolUse,
 	DangerInfo,
 	DangerSeverity,
@@ -100,43 +94,10 @@ export async function buildHistory(
 	},
 ): Promise<BuiltHistory> {
 	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
-	// Replace file-based ExitPlanMode plan bodies with a short path reference so
-	// the model history does not carry the full plan text on every rebuild. The
-	// persisted DB rows keep the full plan for the UI; this only mutates the
-	// in-memory copy passed to the provider adapter.
-	const modelMessages = stripPlanBodyForModel(projectAskUserQuestionMessagesForModel(dbMessages));
-	// Historical rows may still embed provider-internal citation markers. Replaying
-	// them teaches the model the markers are part of its output format, so it keeps
-	// producing them; strip on the in-memory copy only.
-	// Expand accepted file bytes after prose cleanup: citation-like strings in
-	// a source file are data and must not be rewritten by the citation sanitizer.
-	const cleanedMessages = projectFileReferencesForModel(
-		stripCitationMarkersForModel(modelMessages),
-	);
-	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
-	// which only breaks once several turns accumulate: the replayed history then
-	// carries duplicate ids and the API rejects the request with 400. Rename the
-	// later collisions in this in-memory copy — DB rows keep the original ids.
-	// Attribution is a model-only projection, after accepted file material. Roles and
-	// stored rows stay unchanged; every provider receives the same sender format.
-	const uniqueMessages = uniquifyDbMessageToolUseIds(
-		cleanedMessages.map(projectMessageSenderForModel),
-		{
-			narratorId,
-			provider: resolved.provider,
-			model: resolved.model,
-		},
-	);
-	// Last, so builders see exactly these row objects (changes are keyed by row).
-	const projectedMessages = options?.toolLoading
-		? projectToolLoadingHistory(
-				uniqueMessages,
-				options.toolLoading.state,
-				options.toolLoading.strategy,
-				resolveLoadableToolDefinition,
-			)
-		: uniqueMessages;
-	return resolved.adapter.buildHistory(projectedMessages, resolved.model, narratorId);
+	return buildAdapterHistory(resolved.adapter, dbMessages, resolved, {
+		narratorId,
+		...(options?.toolLoading ? { toolLoading: options.toolLoading } : {}),
+	});
 }
 
 /**

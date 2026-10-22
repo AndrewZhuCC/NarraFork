@@ -1101,7 +1101,6 @@ export async function runAgentLoopUnlocked(
 				});
 			}
 
-			const { history, trailingToolResults } = preparedHistory;
 			const receipts = questionModelReceipts(preparedHistory.modelMessages);
 			active._questionAnswerModelReceipts = new Map(receipts.map(({ id, text }) => [id, text]));
 			runState.firstPass = false;
@@ -2245,8 +2244,7 @@ export async function runAgentLoopUnlocked(
 					config,
 					// Only input no persisted row carries; the projected history holds the rest.
 					userText: preparedHistory.currentText,
-					history,
-					trailingToolResults,
+					history: { rows: preparedHistory.modelMessages, built: preparedHistory.history },
 					startedWithToolResults: preparedHistory.endsWithToolResults,
 					images: loopImages,
 					eventContext,

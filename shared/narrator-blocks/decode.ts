@@ -160,7 +160,9 @@ function toolState(call: DecodableToolCall | undefined): {
 							type: "image" as const,
 							assetId: image.imageId,
 							mediaType: image.mediaType,
-							uploadNarratorId: image.uploadNarratorId,
+							...("data" in image
+								? { data: image.data }
+								: { uploadNarratorId: image.uploadNarratorId }),
 						})),
 					}
 				: {}),
@@ -496,6 +498,7 @@ function inputParts(raws: RawBlock[]): BlockPart[] {
 						...(string(raw.uploadNarratorId)
 							? { uploadNarratorId: string(raw.uploadNarratorId) }
 							: {}),
+						...(string(raw.data) ? { data: string(raw.data) } : {}),
 					},
 				];
 			}

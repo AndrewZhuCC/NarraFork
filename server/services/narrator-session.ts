@@ -2813,9 +2813,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 		return {
 			history: result.history,
-			pendingToolResults: result.trailingToolResults,
+			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
-			endsWithInput: result.endsWithInput,
 			...(result.toolLoading ? { toolLoading: result.toolLoading } : {}),
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
 		};
@@ -5122,8 +5121,7 @@ async function retryLastMessageUnlocked(
  * Continue the agent loop.
  *
  * If the last top-level message is a tool-call assistant turn, resumes by
- * reconstructing the tool-result upload packet (buildHistory produces
- * trailingToolResults).
+ * re-sending the history, which ends with that step's tool results.
  *
  * Otherwise (e.g. the assistant's text reply was truncated), sends a
  * locale-aware "please continue" user message via feedMessage so the
@@ -5884,7 +5882,7 @@ async function reExecuteDeniedToolCallUnlocked(
 					const result = await executePersistedToolAfterReflections(
 						{ name: toolName, input: toolInput, toolUseId },
 						config,
-						reflectionHistory.history,
+						reflectionHistory.modelMessages,
 						{
 							toolCallBinding,
 							recoveryGate: restoringPersistedCall ? sourceToolCall : undefined,

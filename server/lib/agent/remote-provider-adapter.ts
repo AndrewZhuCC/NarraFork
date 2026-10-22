@@ -32,7 +32,6 @@ import {
 } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import type {
-	AgentToolUse,
 	ApiRequestDiagnostics,
 	ReasoningProviderMetadata,
 	ResolvedToolDefinition,
@@ -148,7 +147,6 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		);
 		return {
 			history: this.remoteWireHistory(projected.turns),
-			trailingToolResults: [],
 			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
 		};
 	}
@@ -341,211 +339,6 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			// Preserve a request that never got a response (e.g. connect failure) so the
 			// persisted dump still shows what was sent.
 			dumpTap.flush();
-		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		const content: ProviderContentBlock[] = [{ type: "text", text: output }];
-		for (const image of images ?? []) {
-			content.push({
-				type: "image",
-				mediaType: mediaTypeFor(image.format),
-				dataBase64: image.base64,
-			});
-		}
-		return {
-			type: "tool_result",
-			toolUseId,
-			...(toolName ? { name: toolName } : {}),
-			content,
-			isError,
-		} satisfies ProviderContentBlock;
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const canonical = history as ProviderMessage[];
-		const results = toolResults.map(canonicalizeToolResult).filter(isProviderContentBlock);
-		if (results.length > 0) canonical.push({ role: "tool", content: results });
-		const blocks = orderUserContent(content, images ?? [], "after").map(
-			(part): ProviderContentBlock =>
-				part.type === "text"
-					? { type: "text", text: part.text }
-					: {
-							type: "image",
-							mediaType: mediaTypeFor(part.image.format),
-							dataBase64: part.image.base64,
-						},
-		);
-		if (blocks.length > 0) canonical.push({ role: "user", content: blocks });
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: import("./provider").WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		if (orderedContent) {
-			const content = orderedContent
-				.map((block) => canonicalizeContentBlock(block, this.activeReasoningSource))
-				.filter(isProviderContentBlock);
-			if (content.length)
-				(history as ProviderMessage[]).push({
-					role: "assistant",
-					content,
-					...(messageId ? { messageId } : {}),
-				});
-			return;
-		}
-		const blocks: Array<{ block: ProviderContentBlock; outputIndex?: number; order: number }> = [];
-		let order = 0;
-		if (text)
-			blocks.push({
-				block: withOptionalIndex({ type: "text", text }, textOutputIndex),
-				outputIndex: textOutputIndex,
-				order: order++,
-			});
-		for (const block of reasoningBlocks ?? []) {
-			if (!block.text) continue;
-			const continuation = continuationFromMetadata(
-				block.providerMetadata,
-				this.activeReasoningSource,
-			);
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "reasoning",
-						text: block.text,
-						...(continuation ? { continuation } : {}),
-					},
-					block.outputIndex,
-				),
-				outputIndex: block.outputIndex,
-				order: order++,
-			});
-		}
-		for (const block of redactedThinkingBlocks ?? []) {
-			if (!block.data) continue;
-			const source =
-				block.signatureSource === this.activeReasoningSource ? block.signatureSource : undefined;
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "redacted_reasoning",
-						data: block.data,
-						...(source ? { source } : {}),
-					},
-					block.outputIndex,
-				),
-				outputIndex: block.outputIndex,
-				order: order++,
-			});
-		}
-		for (const tool of toolUses) {
-			if (!tool.toolUseId || !tool.name) continue;
-			const continuation = tool.thoughtSignature
-				? {
-						source: tool.thoughtSignatureSource ?? this.activeReasoningSource,
-						format: "tool-continuation",
-						data: tool.thoughtSignature,
-					}
-				: undefined;
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "tool_call",
-						toolUseId: tool.toolUseId,
-						name: tool.name,
-						input: jsonObject(tool.input),
-						...(continuation ? { continuation } : {}),
-					},
-					tool.outputIndex,
-				),
-				outputIndex: tool.outputIndex,
-				order: order++,
-			});
-		}
-		for (const search of webSearches ?? []) {
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "web_search",
-						id: search.id,
-						...(search.query ? { query: search.query } : {}),
-						...(search.queries ? { queries: [...search.queries] } : {}),
-					},
-					search.outputIndex,
-				),
-				outputIndex: search.outputIndex,
-				order: order++,
-			});
-		}
-		for (const image of imageGenerations ?? []) {
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "image_generation",
-						id: image.id,
-						...(image.revisedPrompt ? { revisedPrompt: image.revisedPrompt } : {}),
-						...(image.result ? { result: image.result } : {}),
-					},
-					image.outputIndex,
-				),
-				outputIndex: image.outputIndex,
-				order: order++,
-			});
-		}
-		blocks.sort((left, right) => {
-			if (left.outputIndex === undefined && right.outputIndex === undefined)
-				return left.order - right.order;
-			if (left.outputIndex === undefined) return 1;
-			if (right.outputIndex === undefined) return -1;
-			return left.outputIndex - right.outputIndex || left.order - right.order;
-		});
-		if (blocks.length > 0) {
-			const message: ProviderMessage = {
-				role: "assistant",
-				content: blocks.map(({ block }) => block),
-				...(messageId ? { messageId } : {}),
-			};
-			(history as ProviderMessage[]).push(message);
 		}
 	}
 
@@ -1430,16 +1223,6 @@ function continuationFromStoredBlock(
 		return compatibleContinuation(record.plugin, reasoningSource);
 	}
 	return undefined;
-}
-
-function continuationFromMetadata(
-	metadata: ReasoningProviderMetadata | undefined,
-	reasoningSource: string,
-): CanonicalReasoningMetadata | undefined {
-	if (!metadata) return undefined;
-	const plugin = (metadata as PluginReasoningMetadata).plugin;
-	if (!plugin) return undefined;
-	return compatibleContinuation(plugin, reasoningSource);
 }
 
 function compatibleContinuation(

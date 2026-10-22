@@ -29,7 +29,6 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
-import { signatureSourcesCompatible } from "./reasoning-source";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import type { ToolLoadingTarget } from "./tool-loading";
@@ -234,7 +233,6 @@ export class GeminiProvider implements ProviderAdapter {
 		);
 		return {
 			history: this.geminiWireHistory(projected.turns),
-			trailingToolResults: [],
 			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
 		};
 	}
@@ -375,129 +373,8 @@ export class GeminiProvider implements ProviderAdapter {
 		}
 	}
 
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		_images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		// Gemini matches results to calls by function name, not by an ID. The loop
-		// passes the tool-use id here; buildHistory/pushAssistantTurn track the
-		// name->id association, but for trailing results we must recover the name.
-		// The loop always pairs formatToolResult output with the tool name via the
-		// tool-call record, so we encode name in a lookup done by the loop caller.
-		// To keep the name we stash it on a private map keyed by toolUseId.
-		assertByteLimit(output, GEMINI_GENERATE_MAX_TEXT_BYTES, "tool result text");
-		const name = toolName ?? this.toolUseIdToName.get(toolUseId) ?? toolUseId;
-		const response: Record<string, unknown> = isError ? { error: output } : { output };
-		return { name, response } satisfies GeminiToolResult;
-	}
-
 	/** Maps a tool_use id to its function name so tool results can reference it. */
 	private toolUseIdToName = new Map<string, string>();
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const h = history as GeminiHistoryItem[];
-		const toolParts: GeminiPart[] = (toolResults as GeminiToolResult[]).map((tr) => ({
-			functionResponse: { name: tr.name, response: tr.response },
-		}));
-		if (toolParts.length > 0) {
-			h.push({ role: "user", parts: toolParts });
-		}
-		const hasText = !!content && content !== ".";
-		const userParts = geminiUserParts(
-			hasText ? content : images?.length ? "[user sent image(s)]" : "",
-			images,
-		);
-		if (userParts.length > 0) {
-			h.push({ role: "user", parts: userParts });
-		}
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		_webSearches?: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }>,
-		_messageId?: string,
-		_imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const ordered: Array<{ index: number; sequence: number; part: GeminiPart }> = [];
-		let sequence = 0;
-		if (orderedContent) {
-			// Gemini's wire parts carry no outputIndex; use encounter positions only
-			// for assembly and retain opaque signatures on their entire native part.
-			reasoningBlocks = [];
-			toolUses = [];
-			text = "";
-			for (const [index, block] of orderedContent.entries()) {
-				if (block.type === "text" && block.text)
-					ordered.push({ index, sequence: sequence++, part: { text: block.text } });
-				else if (block.type === "reasoning") reasoningBlocks.push({ ...block, outputIndex: index });
-				else if (block.type === "tool_use") toolUses.push({ ...block, outputIndex: index });
-			}
-		}
-		const currentSource = this.getActiveReasoningSource();
-		for (const block of reasoningBlocks ?? []) {
-			if (!block.text) continue;
-			const part: GeminiPart = { text: block.text, thought: true };
-			const signature = extractThoughtSignature(block.providerMetadata, currentSource);
-			if (signature) part.thoughtSignature = signature;
-			ordered.push({
-				index: block.outputIndex ?? Number.MAX_SAFE_INTEGER - 2,
-				sequence: sequence++,
-				part,
-			});
-		}
-		if (text) {
-			ordered.push({
-				index: textOutputIndex ?? Number.MAX_SAFE_INTEGER - 1,
-				sequence: sequence++,
-				part: { text },
-			});
-		}
-		for (const toolUse of toolUses) {
-			this.toolUseIdToName.set(toolUse.toolUseId, toolUse.name);
-			const { args, signature, signatureSource } = extractArgsAndSignature(toolUse.input);
-			const replaySignature = signatureSourcesCompatible(
-				toolUse.thoughtSignatureSource ?? signatureSource,
-				currentSource,
-			)
-				? (toolUse.thoughtSignature ?? signature)
-				: undefined;
-			const part: GeminiPart = { functionCall: { name: toolUse.name, args } };
-			if (replaySignature) part.thoughtSignature = replaySignature;
-			ordered.push({
-				index: toolUse.outputIndex ?? Number.MAX_SAFE_INTEGER,
-				sequence: sequence++,
-				part,
-			});
-		}
-		ordered.sort((left, right) => left.index - right.index || left.sequence - right.sequence);
-		const parts = ordered.map((item) => item.part);
-		if (parts.length === 0) parts.push({ text: "" });
-		(history as GeminiHistoryItem[]).push({ role: "model", parts });
-	}
 
 	async generate(text: string, model: string): Promise<string> {
 		const result = await this.generateWithMeta(text, model);
@@ -1246,18 +1123,6 @@ function mapUsageStream(usage: GeminiUsageMetadata): NonNullable<ParsedStreamEve
 	};
 }
 
-/** Extract a Gemini thoughtSignature stored on reasoning provider metadata. */
-function extractThoughtSignature(
-	metadata: import("./types").ReasoningProviderMetadata | undefined,
-	currentSource: string | undefined,
-): string | undefined {
-	const signature = metadata?.gemini?.thoughtSignature;
-	if (!signature) return undefined;
-	return signatureSourcesCompatible(metadata.signatureSource, currentSource)
-		? signature
-		: undefined;
-}
-
 /**
  * Reserved key used to persist a functionCall's Gemini thought signature inside
  * the tool call's stored `inputJson` (avoids a DB schema migration). It is
@@ -1265,35 +1130,6 @@ function extractThoughtSignature(
  */
 export const GEMINI_THOUGHT_SIGNATURE_KEY = "__geminiThoughtSignature";
 export const GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY = "__geminiThoughtSignatureSource";
-
-/**
- * Split a persisted/streamed tool-call input into the real function args and the
- * embedded Gemini thought signature (if any). The reserved signature key is
- * removed from the returned args so it never reaches the model.
- */
-function extractArgsAndSignature(input: unknown): {
-	args: Record<string, unknown>;
-	signature?: string;
-	signatureSource?: string;
-} {
-	if (!input || typeof input !== "object" || Array.isArray(input)) {
-		return { args: (input as Record<string, unknown>) ?? {} };
-	}
-	const record = input as Record<string, unknown>;
-	if (!(GEMINI_THOUGHT_SIGNATURE_KEY in record)) {
-		return { args: record };
-	}
-	const {
-		[GEMINI_THOUGHT_SIGNATURE_KEY]: signature,
-		[GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY]: signatureSource,
-		...args
-	} = record;
-	return {
-		args,
-		signature: typeof signature === "string" ? signature : undefined,
-		signatureSource: typeof signatureSource === "string" ? signatureSource : undefined,
-	};
-}
 
 let geminiToolIdCounter = 0;
 function generateGeminiToolId(): string {

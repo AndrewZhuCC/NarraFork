@@ -28,13 +28,18 @@ export function outputToText(value: unknown): string {
 	return value == null ? "" : JSON.stringify(value);
 }
 
-/** An image a tool returned, saved as an upload; the ledger keeps only the reference. */
-export interface ToolOutputImageRef {
-	imageId: string;
-	mediaType: string;
-	/** Narrator whose upload directory holds the file. */
-	uploadNarratorId: string;
-}
+/**
+ * An image a tool returned. A stored ledger keeps only the reference to the saved upload;
+ * a loop's in-memory rows (`loop-transcript.ts`) have no upload store and keep the bytes.
+ */
+export type ToolOutputImageRef =
+	| {
+			imageId: string;
+			mediaType: string;
+			/** Narrator whose upload directory holds the file. */
+			uploadNarratorId: string;
+	  }
+	| { imageId: string; mediaType: string /** Base64 bytes, in memory only. */; data: string };
 
 /**
  * Encode a tool result for `narrator_tool_calls.outputJson`.
@@ -77,19 +82,15 @@ export function isBrokenToolOutput(value: unknown): boolean {
 export function toolOutputImages(value: unknown): ToolOutputImageRef[] {
 	const images = outputRecord(value)?._images;
 	if (!Array.isArray(images)) return [];
-	return images.flatMap((image) => {
+	return images.flatMap((image): ToolOutputImageRef[] => {
 		const ref = outputRecord(image);
-		return ref &&
-			typeof ref.imageId === "string" &&
-			typeof ref.mediaType === "string" &&
-			typeof ref.uploadNarratorId === "string"
-			? [
-					{
-						imageId: ref.imageId,
-						mediaType: ref.mediaType,
-						uploadNarratorId: ref.uploadNarratorId,
-					},
-				]
+		if (!ref || typeof ref.imageId !== "string" || typeof ref.mediaType !== "string") return [];
+		if (typeof ref.uploadNarratorId === "string")
+			return [
+				{ imageId: ref.imageId, mediaType: ref.mediaType, uploadNarratorId: ref.uploadNarratorId },
+			];
+		return typeof ref.data === "string"
+			? [{ imageId: ref.imageId, mediaType: ref.mediaType, data: ref.data }]
 			: [];
 	});
 }

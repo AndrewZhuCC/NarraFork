@@ -57,6 +57,11 @@ export interface ImagePart {
 	height?: number;
 	sha256?: string;
 	uploadNarratorId?: string;
+	/**
+	 * Base64 bytes of an image that only lives in memory: a loop's own rows
+	 * (`loop-transcript.ts`), which have no upload store. Stored rows never carry it.
+	 */
+	data?: string;
 }
 
 /** A text file attached by the user (`text_file`). */

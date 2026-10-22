@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
@@ -498,21 +497,6 @@ type ResponsesReasoningBlock = {
 	outputIndex?: number;
 };
 
-type ResponsesWebSearchBlock = {
-	id: string;
-	query?: string;
-	queries?: string[];
-	outputIndex?: number;
-	action?: import("./provider").WebSearchAction;
-};
-
-type ResponsesImageGenerationBlock = {
-	id: string;
-	revisedPrompt?: string;
-	result?: string;
-	outputIndex?: number;
-};
-
 // === SSE delta types ===
 
 interface OAIDelta {
@@ -593,13 +577,6 @@ export class OpenAIProvider implements ProviderAdapter {
 	/** Whether to use Responses WebSocket for codex mode (experimental). */
 	private useWebSocket: boolean;
 
-	/**
-	 * The model the current chat() run targets. Remembered so the synchronous
-	 * pushAssistantTurn — which has no model parameter — can classify reasoning
-	 * blocks the same way (strict credential handling vs plain-text relay).
-	 */
-	private activeModel?: string;
-
 	/** Reasoning-source identity override (NUG injects its channel identity). */
 	private reasoningSourceOverride?: string;
 
@@ -612,12 +589,6 @@ export class OpenAIProvider implements ProviderAdapter {
 		this.apiMode = resolveApiMode(config);
 		this.proxy = proxy;
 		this.useWebSocket = !!(config.codexWebSocket && this.apiMode === "codex");
-		this.activeModel = config.defaultModel;
-	}
-
-	/** Remember the model a chat() run targets (see {@link activeModel}). */
-	noteActiveModel(model: string): void {
-		this.activeModel = model;
 	}
 
 	/**
@@ -708,7 +679,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			history: this.responsesFormat
 				? responsesWireHistory(projected.turns, { strict })
 				: completionsWireHistory(projected.turns, { strict }),
-			trailingToolResults: [],
 			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
 		};
 	}
@@ -783,7 +753,6 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		// ── Build request body & endpoint based on apiMode ──
 		const model = parseModelId(params.model).model;
-		this.noteActiveModel(model);
 		let endpoint: string;
 		let body: Record<string, unknown>;
 
@@ -883,9 +852,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		} else {
 			// Completions: POST /chat/completions
 			endpoint = `${baseUrl}/chat/completions`;
-			// Live tool loops replay pushAssistantTurn history instead of a fresh
-			// buildHistory. Thinking-mode relays reject that request unless every
-			// assistant message still carries reasoning_content.
+			// Thinking-mode relays reject a request unless every assistant message
+			// carries reasoning_content, including steps that produced none.
 			if (!hasCredentialBoundReasoning(model)) {
 				ensureCompletionsReasoningContent(messages);
 			}
@@ -1029,16 +997,6 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Whether the model a chat() run targets (falling back to the configured
-	 * default) treats reasoning as credential-bound. Drives the retention
-	 * split: strict models drop uncredentialed reasoning, relay models echo
-	 * the plain text back.
-	 */
-	private isCredentialStrict(): boolean {
-		return hasCredentialBoundReasoning(this.activeModel ?? this.config.defaultModel ?? "");
-	}
-
-	/**
 	 * Wrap parseSSEStream to detect Responses API format from Codex gateways.
 	 * Only relevant for "codex" mode — completions mode ignores the marker.
 	 */
@@ -1050,151 +1008,6 @@ export class OpenAIProvider implements ProviderAdapter {
 				logger.debug("Codex gateway confirmed Responses API format");
 			}
 			yield evt;
-		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		_isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-	): unknown {
-		// Removed debug log to prevent log spam in high-frequency scenarios
-		if (this.responsesFormat) {
-			return buildResponsesToolResultMessage(toolUseId, output, images);
-		}
-		return { tool_call_id: toolUseId, content: output } satisfies OAIToolResult;
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const h = history as OAIMessage[];
-		if (this.responsesFormat) {
-			for (const tr of toolResults as ResponsesFunctionCallOutputMessage[]) {
-				h.push(...expandResponsesToolResultMessage(tr));
-			}
-			const userMessage = buildOAIUserMessage(content, images);
-			if (userMessage) h.push(userMessage);
-			return;
-		}
-		for (const tr of toolResults as OAIToolResult[]) {
-			h.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-		}
-		const userMessage = buildOAIUserMessage(content, images);
-		if (userMessage) h.push(userMessage);
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: import("./provider").WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const h = history as OAIMessage[];
-		if (orderedContent && this.responsesFormat) {
-			// Reuse history replay's source validation and native-item serialization,
-			// but never sort the accumulator's encounter order or split a reasoning item.
-			const orderedTools = orderedContent.filter((block) => block.type === "tool_use");
-			h.push(
-				...buildResponsesAssistantItemsFromStoredContent(
-					{
-						id: "",
-						role: "assistant",
-						contentText: null,
-						parentToolUseId: null,
-						messageUuid: messageId ?? null,
-						contentJson: orderedContent.map((block) =>
-							block.type === "tool_use" ? { ...block, id: block.toolUseId } : block,
-						),
-						toolCalls: orderedTools.map((tool) => ({
-							toolUseId: tool.toolUseId,
-							toolName: tool.name,
-							inputJson: tool.input,
-							outputJson: null,
-							status: "success",
-						})),
-					},
-					{ strict: this.isCredentialStrict(), currentSource: this.getActiveReasoningSource() },
-					true,
-				),
-			);
-			return;
-		}
-		if (orderedContent) {
-			// Chat Completions has no interleaved-content wire representation. Keep
-			// every text/reasoning fragment in encounter order inside its native lane.
-			text = orderedContent
-				.filter((block) => block.type === "text")
-				.map((block) => block.text)
-				.join("");
-			reasoningBlocks = orderedContent.filter((block) => block.type === "reasoning");
-			toolUses = orderedContent.filter((block) => block.type === "tool_use");
-		}
-		if (this.responsesFormat) {
-			const items = buildResponsesAssistantTurnItems(
-				text,
-				toolUses,
-				reasoningBlocks,
-				webSearches,
-				messageId,
-				imageGenerations,
-				textOutputIndex,
-				this.isCredentialStrict(),
-			);
-			for (const item of items) {
-				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				h.push(item as any);
-			}
-		} else {
-			// Use empty string instead of null: although the official OpenAI spec
-			// allows content:null when tool_calls is present, many OpenAI-compatible
-			// endpoints (local inference servers, translating proxies/gateways) reject
-			// null content outright. An empty string is accepted everywhere.
-			const msg: OAIMessage = { role: "assistant", content: text || "" };
-			if (toolUses.length > 0) {
-				msg.tool_calls = toolUses.map((tu) => ({
-					id: tu.toolUseId,
-					type: "function" as const,
-					function: { name: tu.name, arguments: JSON.stringify(tu.input) },
-				}));
-			}
-			// Pass reasoning_content back for relay models that replay reasoning as
-			// plain text (DeepSeek, QwQ, GLM, Kimi…). A tool-call turn that produced
-			// no reasoning text still needs the field — thinking mode 400s with
-			// "reasoning_content must be passed back" when it is absent. Credential-
-			// strict models must not receive the field at all.
-			if (!this.isCredentialStrict()) {
-				const reasoningText = reasoningBlocks?.map((b) => b.text).join("\n\n");
-				if (reasoningText) msg.reasoning_content = reasoningText;
-				ensureCompletionsReasoningContent([msg]);
-			}
-			h.push(msg);
 		}
 	}
 
@@ -3612,141 +3425,11 @@ function serializeResponsesReasoning(
 	return undefined;
 }
 
-function buildResponsesPreludeItems(
-	reasoningBlocks?: ResponsesReasoningBlock[],
-	webSearchBlocks?: ResponsesWebSearchBlock[],
-	imageGenerationBlocks?: ResponsesImageGenerationBlock[],
-	text?: string,
-	messageId?: string,
-	textOutputIndex?: number,
-	strict = true,
-): { items: OAIMessage[] } {
-	const entries: Array<{ item: OAIMessage; outputIndex?: number; sourceIndex: number }> = [];
-	const fallbackParts: string[] = [];
-	let sourceIndex = 0;
-	for (const block of reasoningBlocks ?? []) {
-		const text = block.text?.trim() ?? "";
-		const nativeItem = serializeResponsesReasoning(block, { strict }, true);
-		if (nativeItem) {
-			// These blocks belong to the current in-memory upstream turn. Preserve
-			// its encrypted credential or explicitly identified native plaintext.
-			entries.push({
-				item: nativeItem,
-				outputIndex: block.outputIndex,
-				sourceIndex: sourceIndex++,
-			});
-		} else if (!strict && text) {
-			// Genuine plain-text relay (no credential protocol): degrade to text so
-			// the model still sees its own prior thoughts.
-			fallbackParts.push(text);
-		}
-		// Strict + no credential: dropped entirely (the official API rejects
-		// unsigned reasoning replay).
-	}
-	for (const block of webSearchBlocks ?? []) {
-		// Use the stored action if available; fall back to building a search action from query/queries.
-		const action =
-			block.action ??
-			(block.query || block.queries?.length
-				? {
-						type: "search",
-						...(block.query ? { query: block.query } : {}),
-						...(Array.isArray(block.queries) && block.queries.length > 0
-							? { queries: block.queries }
-							: {}),
-					}
-				: undefined);
-		if (!action) continue;
-		entries.push({
-			item: {
-				type: "web_search_call",
-				// NOTE: `id` is intentionally omitted — the upstream Responses API
-				// does not accept it on input items (codex-rs skips serializing it).
-				status: "completed",
-				action,
-			} as unknown as OAIMessage,
-			outputIndex: block.outputIndex,
-			sourceIndex: sourceIndex++,
-		});
-	}
-	for (const block of imageGenerationBlocks ?? []) {
-		entries.push({
-			item: {
-				type: "image_generation_call",
-				id: block.id,
-				status: "completed",
-				result: block.result ?? "",
-				...(block.revisedPrompt ? { revised_prompt: block.revisedPrompt } : {}),
-			} as unknown as OAIMessage,
-			outputIndex: block.outputIndex,
-			sourceIndex: sourceIndex++,
-		});
-	}
-	const assistantText = mergeAssistantText(text ?? "", fallbackParts.join("\n"));
-	if (assistantText) {
-		entries.push({
-			item: {
-				...(messageId ? { id: messageId } : {}),
-				role: "assistant",
-				content: [{ type: "output_text", text: assistantText }],
-			} as unknown as OAIMessage,
-			outputIndex: textOutputIndex,
-			sourceIndex: sourceIndex++,
-		});
-	}
-	entries.sort((a, b) =>
-		compareOptionalOutputIndex(a.outputIndex, b.outputIndex, a.sourceIndex, b.sourceIndex),
-	);
-	return { items: entries.map((entry) => entry.item) };
-}
-
 function mergeAssistantText(text: string, reasoningFallbackText: string): string {
 	const trimmedText = text.trim();
 	const trimmedFallback = reasoningFallbackText.trim();
 	if (trimmedFallback && trimmedText) return `${trimmedFallback}\n\n${trimmedText}`;
 	return trimmedFallback || trimmedText;
-}
-
-function buildResponsesAssistantTurnItems(
-	text: string,
-	toolUses: AgentToolUse[],
-	reasoningBlocks?: ResponsesReasoningBlock[],
-	webSearches?: ResponsesWebSearchBlock[],
-	messageId?: string,
-	imageGenerations?: ResponsesImageGenerationBlock[],
-	textOutputIndex?: number,
-	strict = true,
-): OAIMessage[] {
-	const items: OAIMessage[] = [];
-	const prelude = buildResponsesPreludeItems(
-		reasoningBlocks,
-		webSearches,
-		imageGenerations,
-		text,
-		messageId,
-		textOutputIndex,
-		strict,
-	);
-	items.push(...prelude.items);
-	for (const tu of toolUses) {
-		items.push({
-			type: "function_call",
-			call_id: tu.toolUseId,
-			name: tu.name,
-			arguments: JSON.stringify(tu.input),
-		} as unknown as OAIMessage);
-	}
-	return items;
-}
-
-function buildResponsesAssistantMessageItem(text: string, messageId?: string): OAIMessage | null {
-	const trimmed = text.trim();
-	if (!trimmed) return null;
-	return {
-		...(messageId ? { id: messageId } : {}),
-		role: "assistant",
-		content: [{ type: "output_text", text: trimmed }],
-	} as unknown as OAIMessage;
 }
 
 /**
@@ -3762,196 +3445,6 @@ function buildResponsesAssistantMessageItem(text: string, messageId?: string): O
 interface ReasoningReplayOptions {
 	strict: boolean;
 	currentSource?: string;
-}
-
-function buildResponsesAssistantItemsFromStoredContent(
-	msg: DbMessage,
-	options: ReasoningReplayOptions,
-	preserveTextBlocks = false,
-): OAIMessage[] {
-	type StoredAssistantBlock =
-		| { type: "text"; text?: string; outputIndex?: number }
-		| {
-				type: "reasoning";
-				text?: string;
-				providerMetadata?: import("./types").ReasoningProviderMetadata;
-				outputIndex?: number;
-		  }
-		| {
-				type: "web_search";
-				id: string;
-				query?: string;
-				queries?: string[];
-				outputIndex?: number;
-				action?: import("./provider").WebSearchAction;
-		  }
-		| {
-				type: "image_generation";
-				id: string;
-				revisedPrompt?: string;
-				result?: string;
-				savedPath?: string;
-				outputIndex?: number;
-		  }
-		| { type: "tool_use"; id: string; name?: string; input?: Record<string, unknown> }
-		| { type: string; [key: string]: unknown };
-
-	const blocks = (Array.isArray(msg.contentJson) ? msg.contentJson : []) as StoredAssistantBlock[];
-	const completedToolCalls = new Map(
-		(msg.toolCalls ?? [])
-			.filter((tc) => tc.status === "success" || tc.status === "fail")
-			.filter((tc) => tc.toolName && tc.toolUseId)
-			.map((tc) => [tc.toolUseId, tc]),
-	);
-	const items: OAIMessage[] = [];
-	const textBuffer: string[] = [];
-	const consumedToolUseIds = new Set<string>();
-	let messageIdAvailable = msg.messageUuid ?? undefined;
-
-	const flushTextBuffer = () => {
-		const text = textBuffer.join("\n");
-		textBuffer.length = 0;
-		const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
-		if (item) {
-			items.push(item);
-			messageIdAvailable = undefined;
-		}
-	};
-
-	for (const block of blocks) {
-		if (block.type === "text") {
-			if (typeof block.text === "string" && block.text.length > 0) {
-				textBuffer.push(block.text);
-				if (preserveTextBlocks) flushTextBuffer();
-			}
-			continue;
-		}
-
-		if (block.type === "reasoning") {
-			flushTextBuffer();
-			const reasoningBlock = block as Extract<StoredAssistantBlock, { type: "reasoning" }>;
-			const text = typeof reasoningBlock.text === "string" ? reasoningBlock.text.trim() : "";
-			const nativeItem = serializeResponsesReasoning(
-				{ ...reasoningBlock, text: reasoningBlock.text ?? "" },
-				options,
-			);
-			if (nativeItem) {
-				items.push(nativeItem);
-			} else if (!options.strict && text) {
-				// Genuine plain-text relay (or foreign encrypted block we must not echo
-				// to this upstream): degrade to an assistant message so the model still
-				// sees its own prior thoughts.
-				const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
-				if (item) {
-					items.push(item);
-					messageIdAvailable = undefined;
-				}
-			}
-			continue;
-		}
-
-		if (block.type === "web_search") {
-			flushTextBuffer();
-			const webSearchBlock = block as Extract<StoredAssistantBlock, { type: "web_search" }>;
-			// Use stored action if available; fall back to building a search action from query/queries.
-			const action =
-				webSearchBlock.action ??
-				(webSearchBlock.query ||
-				(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0)
-					? {
-							type: "search",
-							...(webSearchBlock.query ? { query: webSearchBlock.query } : {}),
-							...(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0
-								? { queries: webSearchBlock.queries }
-								: {}),
-						}
-					: undefined);
-			if (!action) continue;
-			items.push({
-				type: "web_search_call",
-				// NOTE: `id` is intentionally omitted — the upstream Responses API
-				// does not accept it on input items (codex-rs skips serializing it).
-				status: "completed",
-				action,
-			} as unknown as OAIMessage);
-			continue;
-		}
-
-		if (block.type === "image_generation") {
-			flushTextBuffer();
-			const igBlock = block as Extract<StoredAssistantBlock, { type: "image_generation" }>;
-			let result = igBlock.result ?? "";
-			// If result is empty but savedPath exists, read from file
-			// TODO: readFileSync blocks the event loop; refactor
-			// buildResponsesAssistantItemsFromStoredContent to async to use
-			// fs.promises.readFile instead.
-			if (!result && igBlock.savedPath) {
-				try {
-					const fileData = readFileSync(igBlock.savedPath);
-					result = fileData.toString("base64");
-				} catch {
-					// File may have been deleted — skip this block
-				}
-			}
-			if (!result) continue;
-			if (igBlock.savedPath) {
-				items.push({
-					role: "developer",
-					content: buildImageGenerationSavedPathInstruction(igBlock.savedPath),
-				} as unknown as OAIMessage);
-			}
-			items.push({
-				type: "image_generation_call",
-				id: igBlock.id,
-				status: "completed",
-				result,
-				...(igBlock.revisedPrompt ? { revised_prompt: igBlock.revisedPrompt } : {}),
-			} as unknown as OAIMessage);
-			continue;
-		}
-
-		if (block.type === "tool_use") {
-			flushTextBuffer();
-			const toolUseBlock = block as Extract<StoredAssistantBlock, { type: "tool_use" }>;
-			const toolCall = completedToolCalls.get(toolUseBlock.id);
-			// Defensive guard: replaying a function_call without a persisted completed
-			// tool call would create an invalid Responses history (missing the paired
-			// function_call_output). If the DB/tool-call relation is missing, skip the
-			// orphaned tool_use block instead of sending malformed history.
-			if (!toolCall?.toolName) continue;
-			consumedToolUseIds.add(toolUseBlock.id);
-			items.push({
-				type: "function_call",
-				call_id: toolUseBlock.id,
-				name: toolCall.toolName,
-				arguments: JSON.stringify(toolCall.inputJson ?? toolUseBlock.input ?? {}),
-			} as unknown as OAIMessage);
-		}
-	}
-
-	flushTextBuffer();
-	for (const [toolUseId, toolCall] of completedToolCalls.entries()) {
-		if (consumedToolUseIds.has(toolUseId)) continue;
-		items.push({
-			type: "function_call",
-			call_id: toolUseId,
-			name: toolCall.toolName,
-			arguments: JSON.stringify(toolCall.inputJson ?? {}),
-		} as unknown as OAIMessage);
-	}
-	return items;
-}
-
-function compareOptionalOutputIndex(
-	a: number | undefined,
-	b: number | undefined,
-	aSourceIndex: number,
-	bSourceIndex: number,
-): number {
-	if (a != null && b != null) return a - b || aSourceIndex - bSourceIndex;
-	if (a != null) return -1;
-	if (b != null) return 1;
-	return aSourceIndex - bSourceIndex;
 }
 
 /** One tool in Responses API shape; also an entry of an `additional_tools` item. */

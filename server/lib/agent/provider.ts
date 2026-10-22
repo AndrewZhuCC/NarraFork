@@ -196,61 +196,6 @@ export interface ProviderAdapter {
 	/** Stream a chat completion, yielding parsed events */
 	chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent>;
 
-	/** Format a single tool result for the provider protocol */
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		/** Real tool name for protocols (e.g. Gemini Interactions) that echo it with results. */
-		toolName?: string,
-	): unknown;
-
-	/** Append a user turn to history (mutates in place) */
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void;
-
-	/** Append an assistant turn to history (mutates in place) */
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		/** Provider-native content block index for the text block (for interleaved ordering). */
-		textOutputIndex?: number,
-		/** Anthropic redacted thinking blocks to preserve during a tool-use trajectory. */
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		/** Authoritative encounter order; reasoning entries contain whole native items, not checkpoints. */
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void;
-
 	/** Simple text generation — no tools, no loop. Returns generated text. */
 	generate(text: string, model: string): Promise<string>;
 
