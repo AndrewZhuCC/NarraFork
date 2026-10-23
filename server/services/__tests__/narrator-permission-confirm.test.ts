@@ -568,10 +568,7 @@ describe(".git internal review routing", () => {
 			input,
 			permissionMode: "bypassPermissions",
 		});
-		await db
-			.update(narrators)
-			.set({ dangerReflectionOverride: level })
-			.where(eq(narrators.id, id));
+		await db.update(narrators).set({ dangerReflectionOverride: level }).where(eq(narrators.id, id));
 		const permissionPromise = handlePermission(
 			id,
 			new AbortController().signal,
