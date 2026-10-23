@@ -1,21 +1,38 @@
 /**
- * SQL predicates for {@link MessageSearchScope}, shared by the SQLite and PostgreSQL stores.
+ * SQL predicates for {@link MessageSearchScope} and {@link SearchFilters}, shared by the
+ * SQLite and PostgreSQL stores.
  *
- * Portable SQL only, and built from the scope's booleans alone, so each result is one of a
- * handful of fixed strings: safe to interpolate and safe to use in a cached template's key.
- * The aliases are the stores' own (`n` narrators, `m` messages, `b` blocks).
+ * Portable SQL only. Scope predicates are built from the scope's booleans alone, so each is
+ * one of a handful of fixed strings: safe to interpolate and safe to key a cached template
+ * on. Filter predicates carry user values, so they come back with `?` placeholders and the
+ * values to bind in order; their `key` names only which filters are present. The aliases are
+ * the stores' own (`n` narrators, `m` messages, `b` blocks, `c` chapters).
  */
 
-import { FULL_MESSAGE_SCOPE, type MessageSearchScope } from "./types";
+import { FULL_MESSAGE_SCOPE, type MessageSearchScope, type SearchFilters } from "./types";
 
 /** Stable cache-key fragment for a scope. */
 export function scopeKey(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): string {
-	return `${scope.subagents ? "S" : "s"}${scope.system ? "Y" : "y"}${scope.tools ? "T" : "t"}`;
+	return `${scope.subagents ? "S" : "s"}${scope.system ? "Y" : "y"}${scope.tools ? "T" : "t"}${
+		scope.archived ? "A" : "a"
+	}`;
+}
+
+/** Clauses restricting a narrators row aliased `n`. */
+function narratorClauses(scope: MessageSearchScope): string[] {
+	const clauses: string[] = [];
+	if (!scope.subagents) clauses.push("n.type <> 'subagent'");
+	if (!scope.archived) clauses.push("n.status <> 'archived'");
+	return clauses;
+}
+
+function and(clauses: readonly string[]): string {
+	return clauses.length === 0 ? "" : `AND ${clauses.join(" AND ")}`;
 }
 
 /** `AND …` restricting a narrators row aliased `n`; empty when nothing is excluded. */
 export function narratorScopeSql(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): string {
-	return scope.subagents ? "" : "AND n.type <> 'subagent'";
+	return and(narratorClauses(scope));
 }
 
 /**
@@ -28,13 +45,12 @@ export function narratorScopeSql(scope: MessageSearchScope = FULL_MESSAGE_SCOPE)
  * {@link blockScopeSql}.
  */
 export function messageScopeSql(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): string {
-	const clauses: string[] = [];
-	if (!scope.subagents) clauses.push("n.type <> 'subagent'");
+	const clauses = narratorClauses(scope);
 	if (!scope.system) {
 		clauses.push("m.role IN ('user', 'assistant')");
 		clauses.push("COALESCE(m.origin, 'user') <> 'system'");
 	}
-	return clauses.length === 0 ? "" : `AND ${clauses.join(" AND ")}`;
+	return and(clauses);
 }
 
 /** `AND …` restricting a narrator_blocks row aliased `b` and its envelope `m`/`n`. */
@@ -44,4 +60,60 @@ export function blockScopeSql(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): s
 	if (!scope.tools) kinds.push("'tool'");
 	const kindClause = kinds.length === 0 ? "" : `AND b.kind NOT IN (${kinds.join(", ")})`;
 	return [messageScopeSql(scope), kindClause].filter(Boolean).join(" ");
+}
+
+/** Which entity a filter predicate restricts, and so which columns it reads. */
+export type FilterTarget = "chapter" | "narrator" | "message";
+
+/** A bound predicate: `sql` has one `?` per entry of `values`, in order. */
+export interface BoundSql {
+	sql: string;
+	values: string[];
+	/** Which filters are present, for cache keys; never contains a value. */
+	key: string;
+}
+
+/** Activity time each target's time bounds compare against. */
+const TIME_COLUMN: Record<FilterTarget, string> = {
+	chapter: "COALESCE(c.updated_at, c.created_at)",
+	narrator: "COALESCE(n.last_message_at, n.updated_at, n.created_at)",
+	message: "m.created_at",
+};
+
+/**
+ * `AND …` applying {@link SearchFilters} to one target.
+ *
+ * Chapter targets need `c`; narrator and message targets need `n` and a joined `c` (a LEFT
+ * JOIN is fine: a narrator without a chapter simply fails a project or chapter filter).
+ */
+export function filterSql(filters: SearchFilters | undefined, target: FilterTarget): BoundSql {
+	const clauses: string[] = [];
+	const values: string[] = [];
+	let key = "";
+	if (filters?.projectId) {
+		clauses.push("c.project_id = ?");
+		values.push(filters.projectId);
+		key += "p";
+	}
+	if (filters?.chapterId) {
+		clauses.push(target === "chapter" ? "c.id = ?" : "n.chapter_id = ?");
+		values.push(filters.chapterId);
+		key += "c";
+	}
+	if (filters?.from) {
+		clauses.push(`${TIME_COLUMN[target]} >= ?`);
+		values.push(filters.from);
+		key += "f";
+	}
+	if (filters?.to) {
+		clauses.push(`${TIME_COLUMN[target]} <= ?`);
+		values.push(filters.to);
+		key += "t";
+	}
+	if (filters?.ownerUserId && target !== "chapter") {
+		clauses.push("n.owner_user_id = ?");
+		values.push(filters.ownerUserId);
+		key += "o";
+	}
+	return { sql: and(clauses), values, key: key || "-" };
 }

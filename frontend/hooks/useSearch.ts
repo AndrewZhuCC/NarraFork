@@ -1,40 +1,88 @@
-import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { api } from "../lib/api";
-import type { SearchInclude, SearchSortMode } from "../lib/search-utils";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { api, type SearchRequest, type SearchSectionName } from "../lib/api";
+import { searchParams } from "../lib/api/misc";
 
-export function useSearch(
-	query: string,
-	entities = "chapters,messages,narrators",
-	sort: SearchSortMode = "relevance",
-	include: readonly SearchInclude[] = [],
+/** Sections the overview ("All" tab) loads, in display order. */
+export const SEARCH_SECTION_ORDER: readonly SearchSectionName[] = [
+	"sessions",
+	"knowledge",
+	"chapters",
+];
+/** Items per section on the overview. */
+export const SEARCH_OVERVIEW_LIMIT = 5;
+/** Items per page inside one section's tab. */
+export const SEARCH_PAGE_LIMIT = 20;
+/** Hits per page when a session card is expanded. */
+export const SESSION_HITS_PAGE_LIMIT = 20;
+
+/** Cache identity of a request: its query string, without paging. */
+function requestKey(request: SearchRequest): string {
+	return searchParams({ ...request, cursor: undefined, limit: undefined }).toString();
+}
+
+const SEARCH_CACHE = { staleTime: 30_000, gcTime: 60_000 } as const;
+
+/** The first page of every section, for the overview and the tab counts. */
+export function useSearchOverview(request: SearchRequest) {
+	const q = request.q.trim();
+	return useQuery({
+		queryKey: ["search", "overview", requestKey({ ...request, q })],
+		queryFn: ({ signal }) =>
+			api.searchSections(
+				{ ...request, q, limit: SEARCH_OVERVIEW_LIMIT },
+				SEARCH_SECTION_ORDER,
+				signal,
+			),
+		enabled: q.length > 0,
+		...SEARCH_CACHE,
+	});
+}
+
+/** One section, paged with its cursor. */
+export function useSearchSection(
+	request: SearchRequest,
+	section: SearchSectionName,
+	enabled: boolean,
 ) {
-	const normalizedQuery = query.trim();
-	const [debouncedQuery, setDebouncedQuery] = useState(normalizedQuery);
+	const q = request.q.trim();
+	return useInfiniteQuery({
+		queryKey: ["search", "section", section, requestKey({ ...request, q })],
+		queryFn: async ({ pageParam, signal }) => {
+			const response = await api.searchSections(
+				{ ...request, q, cursor: pageParam, limit: SEARCH_PAGE_LIMIT },
+				[section],
+				signal,
+			);
+			return (
+				response.sections[section] ?? {
+					items: [],
+					total: 0,
+					totalIsLowerBound: false,
+					nextCursor: null,
+				}
+			);
+		},
+		initialPageParam: undefined as string | undefined,
+		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		enabled: enabled && q.length > 0,
+		...SEARCH_CACHE,
+	});
+}
 
-	useEffect(() => {
-		const timer = setTimeout(() => setDebouncedQuery(normalizedQuery), 300);
-		return () => clearTimeout(timer);
-	}, [normalizedQuery]);
-
-	const isShortQuery = debouncedQuery.length > 0 && debouncedQuery.length < 3;
-
-	return {
-		...useQuery({
-			queryKey: ["search", debouncedQuery, entities, sort, include.join(",")],
-			// Title/type only reorder the relevance-selected candidates on the page.
-			queryFn: ({ signal }) =>
-				api.search(
-					debouncedQuery,
-					entities,
-					sort === "time" ? "time" : "relevance",
-					signal,
-					include,
-				),
-			enabled: debouncedQuery.length > 0,
-			staleTime: 30_000,
-			gcTime: 60_000,
-		}),
-		isShortQuery,
-	};
+/** One session's hits beyond those its card shows, paged; loads only once expanded. */
+export function useSessionHits(narratorId: string, request: SearchRequest, enabled: boolean) {
+	const q = request.q.trim();
+	return useInfiniteQuery({
+		queryKey: ["search", "session-hits", narratorId, requestKey({ ...request, q })],
+		queryFn: ({ pageParam, signal }) =>
+			api.searchSessionHits(
+				narratorId,
+				{ ...request, q, cursor: pageParam, limit: SESSION_HITS_PAGE_LIMIT },
+				signal,
+			),
+		initialPageParam: undefined as string | undefined,
+		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		enabled: enabled && q.length > 0,
+		...SEARCH_CACHE,
+	});
 }
