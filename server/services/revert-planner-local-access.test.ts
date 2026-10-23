@@ -20,7 +20,6 @@ import {
 	type FileChangeState,
 } from "@shared/file-change-protocol";
 import { eq, inArray } from "drizzle-orm";
-import { sign } from "hono/jwt";
 import { testEnvironment } from "../../tests/preload";
 import { app } from "../app";
 import { db, sqlite } from "../db";
@@ -2355,21 +2354,6 @@ describe("real requireAuth and conjunctive ACL", () => {
 		for (const endpoint of [`revert-plans/${plan.id}`, `revert-plans/${plan.id}/files`])
 			expect((await http(endpoint, "GET", undefined, otherToken)).status).toBe(404);
 		expect(history()).toBe(before);
-	});
-	test("legacy JWT with a changed database role fails even through the session cache", async () => {
-		await fixture();
-		// Legacy session JWTs carry the role from issuance; opaque sessions read it live.
-		const issuedAt = Math.floor(Date.now() / 1000);
-		const legacy = await sign(
-			{ sub: userId, role: "user", iat: issuedAt, exp: issuedAt + 3600, sst: issuedAt, sv: 0 },
-			settings.auth.jwtSecret,
-		);
-		await http("revert-plans", "POST", request({ unexpected: true }), legacy);
-		db.update(schema.users).set({ role: "admin" }).where(eq(schema.users.id, userId)).run();
-		restorers.push(() => {
-			db.update(schema.users).set({ role: "user" }).where(eq(schema.users.id, userId)).run();
-		});
-		await refused(await prepare({}, legacy), "REVERT_PREVIEW_AUTHENTICATION_CHANGED");
 	});
 	test("project gate cannot be bypassed by owning the narrator", async () => {
 		await fixture();

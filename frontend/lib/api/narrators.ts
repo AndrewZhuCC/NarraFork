@@ -30,7 +30,6 @@ import { createSharedInflight, type SharedReadOptions } from "../shared-inflight
 import type { GitIdentity } from "./auth";
 import {
 	ApiError,
-	absorbRenewedToken,
 	apiBase,
 	authorizedFetch,
 	clearTokenOnSessionFailure,
@@ -1746,9 +1745,6 @@ export const narratorsApi = {
 				signal,
 			});
 		}
-		// The XHR upload branch cannot go through authorizedFetch, so absorption
-		// stays explicit here — with the token this request used, for the CAS.
-		absorbRenewedToken(res, token);
 		if (res.status === 401) {
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
@@ -1917,7 +1913,6 @@ export const narratorsApi = {
 				body,
 			},
 		);
-		absorbRenewedToken(res, token);
 		if (res.status === 401) {
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);

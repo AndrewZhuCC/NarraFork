@@ -76,7 +76,6 @@ export {
 } from "./auth";
 export {
 	ApiError,
-	absorbRenewedToken,
 	authorizedFetch,
 	clearToken,
 	clearTokenOnSessionFailure,

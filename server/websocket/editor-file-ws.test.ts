@@ -70,7 +70,13 @@ test.each([
 			narratorId,
 			auth: {
 				type: "session",
-				user: { sub: userId, role: "user", iat: Date.now() / 1000, exp: ws.data.sessionExp, sv: 0 },
+				user: {
+					sub: userId,
+					role: "user",
+					iat: Date.now() / 1000,
+					exp: ws.data.sessionExp,
+					tokenVersion: 0,
+				},
 			},
 		});
 		const doc = await service.create(actor, {

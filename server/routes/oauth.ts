@@ -58,9 +58,8 @@ async function getSessionUser(c: Context): Promise<{ id: string; username: strin
 	const header = c.req.header("Authorization");
 	if (!header?.startsWith("Bearer ")) return null;
 	const token = header.slice(7);
-	// Session tokens are either prefixed opaque tokens or legacy compact JWS (three
-	// base64url segments). Skip the lookup for anything else, like OAuth access tokens.
-	if (!isOpaqueSessionToken(token) && !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) return null;
+	// Skip the lookup for anything that is not a session token, like OAuth access tokens.
+	if (!isOpaqueSessionToken(token)) return null;
 	try {
 		const payload = await verifyToken(token);
 		const row = await db.query.users.findFirst({

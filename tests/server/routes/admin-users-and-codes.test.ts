@@ -129,10 +129,9 @@ describe("POST /users", () => {
 /**
  * Role changes and the token generation.
  *
- * A session JWT carries its own `role` claim and `assertAdmin` reads that claim, so a
- * demotion that only clears the existence cache leaves the target's already-issued
- * token passing `requireAdmin` until it expires — the version check the cache serves
- * compares `tokenVersion`, not the role.
+ * The role is read live on every request, so a demotion takes away admin access at
+ * once. It still ends the target's sessions, so every open client starts over under
+ * the reduced role.
  */
 describe("PATCH /users/:id role changes", () => {
 	async function seedUser(id: string, role: "admin" | "user") {

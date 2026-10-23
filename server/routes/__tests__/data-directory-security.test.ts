@@ -9,7 +9,6 @@ import { users } from "../../db/schema";
 import { createToken } from "../../lib/auth";
 import { generateId } from "../../lib/id";
 import * as home from "../../lib/narrafork-home";
-import { invalidateUserCache } from "../../middleware/auth";
 
 let root: string;
 let data: string;
@@ -47,7 +46,6 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	restoreHome?.();
-	for (const id of userIds) invalidateUserCache(id);
 	if (userIds.length)
 		db.delete(users)
 			.where(inArray(users.id, userIds.splice(0)))
@@ -142,7 +140,6 @@ describe("data directory maintenance authorization", () => {
 	test("administrator role is checked against live account state", async () => {
 		const adminId = userIds[0];
 		db.update(users).set({ role: "user" }).where(eq(users.id, adminId)).run();
-		invalidateUserCache(adminId);
 		expect((await repair(admin)).status).toBe(403);
 	});
 });

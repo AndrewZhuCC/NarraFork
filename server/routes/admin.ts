@@ -21,7 +21,7 @@ import {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 } from "../lib/validators";
-import { invalidateUserCache, requireAdmin, requireAuth } from "../middleware/auth";
+import { notifyAuthChanged, requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
 import { purgeNarratorGrantsForUser } from "../services/narrator-sharing";
 import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocation";
@@ -177,24 +177,17 @@ adminRoutes.patch("/users/:id", async (c) => {
 		.returning({ id: users.id, username: users.username, role: users.role });
 	if (!updated) throw new AppError("User not found", 404, "NOT_FOUND");
 	// An administrator resets a password when they believe the old one is compromised, so the
-	// sessions opened with it must die too. Session JWTs are self-contained, so only bumping the
-	// token generation can end them — a new password alone would leave a stolen token valid for
-	// up to its remaining lifetime.
+	// sessions opened with it must die too: bumping the token generation ends every one of
+	// them on its next request. A new password alone would leave a stolen token valid.
 	//
-	// A DEMOTION needs the same treatment, for the same reason: the presented JWT carries its
-	// own `role`, and `assertAdmin` reads that claim. Clearing the existence cache alone is not
-	// enough — the version check the cache serves compares `tokenVersion`, not the role — so a
-	// just-demoted user's existing token would keep passing `requireAdmin` until it expired
-	// (up to 7 days). Sliding renewal does re-read the live role, but only for tokens that
-	// happen to be inside the renewal window, so it cannot be relied on as the boundary.
+	// The role is read live on every request, so a demotion takes away admin access at once
+	// regardless. It still ends the user's sessions, so every open client starts over under
+	// the reduced role instead of failing piecemeal on its next privileged request.
 	if (password || isDemotion) {
 		await revokeUserSessions(id);
 	}
-	// A role or password change must take effect on the next request rather than
-	// after the 60s existence-cache window: the cache is what lets a request skip
-	// the live `users` lookup, and sliding renewal re-reads the role from there.
 	if (role || password) {
-		invalidateUserCache(id);
+		notifyAuthChanged(id);
 	}
 	return c.json(updated);
 });
@@ -211,7 +204,6 @@ adminRoutes.post("/users/:id/revoke-sessions", async (c) => {
 	});
 	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
 	const tokenVersion = await revokeUserSessions(id);
-	invalidateUserCache(id);
 	logger.info("Administrator revoked all sessions for a user", {
 		userId: id,
 		actorUserId: c.get("user").sub,
@@ -252,9 +244,8 @@ adminRoutes.delete("/users/:id", async (c) => {
 		return tx.delete(users).where(eq(users.id, id)).returning().all();
 	})[0];
 	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
-	// Drop the existence cache immediately; otherwise the deleted user's token
-	// keeps passing (and renewing) for the rest of the cache window.
-	invalidateUserCache(id);
+	// The user's sessions went with the row (cascade); tell live subscribers.
+	notifyAuthChanged(id);
 	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).
 	await knowledgeAcl.purgeUserGrants(id);
 	// Cascade: remove narrator shares held by this user. `principal_id` is not a

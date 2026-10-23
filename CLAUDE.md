@@ -133,7 +133,7 @@ server/
 
 **数据库：** SQLite 位于 `~/.narrafork/narrafork.db`。主键均为 nanoid 文本 ID。FTS5（trigram tokenizer，支持 CJK）用于章节、叙述者标题和消息全文搜索，触发器同步。
 
-**认证：** 会话令牌是不透明随机串（`nfs_` 前缀），库中 `auth_sessions` 只存其 SHA-256；经 `Authorization: Bearer` 头（HTTP）或 `?token=` 查询参数（WebSocket）传递。滑动续期在服务端延长 `expires_at`，登出 `POST /api/auth/logout` 只吊销当前会话，`users.token_version` 递增吊销该用户全部会话。旧版 HS256 会话 JWT 仅在剩余有效期内兼容，首个请求即换发不透明令牌（`X-NarraFork-Session-Token`）；`auth.jwtSecret` 仍用于 MFA 挑战令牌和若干 HMAC。首个注册用户自动获得管理员权限。
+**认证：** 会话令牌是不透明随机串（`nfs_` 前缀），库中 `auth_sessions` 只存其 SHA-256；经 `Authorization: Bearer` 头（HTTP）或 `?token=` 查询参数（WebSocket）传递。滑动续期在服务端延长 `expires_at`，登出 `POST /api/auth/logout` 只吊销当前会话，`users.token_version` 递增吊销该用户全部会话。旧版 HS256 会话 JWT 不再被接受（升级后需重新登录）；`auth.jwtSecret` 仍用于 MFA 挑战令牌和若干 HMAC。首个注册用户自动获得管理员权限。
 
 ### 前端（`frontend/`）
 

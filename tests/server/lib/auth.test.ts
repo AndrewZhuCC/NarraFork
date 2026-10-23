@@ -5,11 +5,7 @@
  * `server/db`. No real NarraFork database is touched.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import {
-	ABSOLUTE_SESSION_MAX_SECONDS,
-	SESSION_START_CLAIM,
-	SESSION_TOKEN_TTL_SECONDS,
-} from "@shared/session-auth";
+import { ABSOLUTE_SESSION_MAX_SECONDS, SESSION_TOKEN_TTL_SECONDS } from "@shared/session-auth";
 import { eq } from "drizzle-orm";
 import { authSessions, users } from "../../../server/db/schema";
 import { generateId } from "../../../server/lib/id";
@@ -25,7 +21,6 @@ const {
 	pruneStaleSessions,
 	revokeSessionToken,
 	revokeUserSessions,
-	upgradeLegacySessionToken,
 	verifyToken,
 } = await import("../../../server/lib/auth");
 const { hashSessionToken } = await import("../../../server/lib/session-token-hash");
@@ -89,15 +84,15 @@ describe("createToken", () => {
 		expect(payload.sub).toBe(userId);
 		expect(payload.role).toBe("admin");
 		expect(payload.sid).toBeString();
-		expect(payload[SESSION_START_CLAIM]).toBeGreaterThanOrEqual(before);
+		expect(payload.sessionStart).toBeGreaterThanOrEqual(before);
 		expect(payload.exp - payload.iat).toBe(SESSION_TOKEN_TTL_SECONDS);
 	});
 });
 
 describe("verifyToken (opaque)", () => {
-	test("rejects an unknown or tampered token as invalid", async () => {
+	test("rejects an unknown, tampered or non-session token as invalid", async () => {
 		const token = await createToken(await makeUser());
-		for (const bad of [`${token}x`, `nfs_${"A".repeat(43)}`]) {
+		for (const bad of [`${token}x`, `nfs_${"A".repeat(43)}`, token.slice(4), "a.b.c"]) {
 			const error = await verifyToken(bad).catch((e: unknown) => e);
 			expect(error).toMatchObject({ statusCode: 401, code: "UNAUTHORIZED" });
 		}
@@ -167,7 +162,7 @@ describe("extendSessionToken", () => {
 		await extendSessionToken(await verifyToken(token));
 		const payload = await verifyToken(token);
 		expect(payload.exp).toBeGreaterThanOrEqual(now() + SESSION_TOKEN_TTL_SECONDS - 1);
-		expect(payload[SESSION_START_CLAIM]).toBe(row.sessionStart);
+		expect(payload.sessionStart).toBe(row.sessionStart);
 	});
 
 	test("never slides past the absolute ceiling", async () => {
@@ -188,24 +183,6 @@ describe("extendSessionToken", () => {
 		await revokeSessionToken(payload);
 		await extendSessionToken({ ...payload, exp: now() + 60 });
 		expect(await errorName(verifyToken(token))).toBe("SessionTokenRevoked");
-	});
-});
-
-describe("upgradeLegacySessionToken", () => {
-	test("keeps the legacy anchor and shares one replacement per legacy token", async () => {
-		const userId = await makeUser();
-		const anchor = now() - 10 * 24 * 60 * 60;
-		const legacy = `legacy.${generateId()}.jwt`;
-		const [a, b] = await Promise.all([
-			upgradeLegacySessionToken(legacy, userId, anchor, 0),
-			upgradeLegacySessionToken(legacy, userId, anchor, 0),
-		]);
-		expect(a).toBe(b);
-		expect((await verifyToken(a))[SESSION_START_CLAIM]).toBe(anchor);
-		expect(await db.select().from(authSessions)).toHaveLength(1);
-
-		const other = await upgradeLegacySessionToken(`legacy.${generateId()}.jwt`, userId, anchor, 0);
-		expect(other).not.toBe(a);
 	});
 });
 

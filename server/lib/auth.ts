@@ -2,12 +2,8 @@ import { type Locale, normalizeLocale } from "@shared/i18n-locales";
 import {
 	ABSOLUTE_SESSION_MAX_SECONDS,
 	isOpaqueSessionToken,
-	isSessionTokenVersionCurrent,
-	SESSION_START_CLAIM,
 	SESSION_TOKEN_TTL_SECONDS,
-	SESSION_VERSION_CLAIM,
 } from "@shared/session-auth";
-import { verify } from "hono/jwt";
 import { authSessionStore } from "../services/auth/store";
 import { registrationAccountStore as accountStore } from "../services/registration/store";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
@@ -21,45 +17,35 @@ import { issueMfaToken } from "./mfa";
 import { generateSessionToken, hashSessionToken } from "./session-token-hash";
 import { saveSettings, settings } from "./settings";
 
-/** Read JWT secret lazily so it picks up the auto-generated value even when
- *  the module is imported before settings finishes initialization. */
-function getJwtSecret(): string {
-	return settings.auth.jwtSecret;
-}
-
 // A fixed cost-10 bcrypt hash used only to equalize the unknown-user path with
 // a normal password failure. The plaintext is intentionally public and is not
 // an account credential.
 const INVALID_LOGIN_PADDING_HASH = "$2b$10$aF/evsAjCJZn2KANblVddeLsw19IUoALQbTSxTaCJeNxztOQHrWWm";
 
-/** The verified claims of a first-party session, whichever token kind carried them. */
-export interface JwtPayload {
+/**
+ * The authenticated user a request acts as. For a first-party session it also names the
+ * session; an OAuth principal carries only the user facts.
+ */
+export interface SessionPayload {
 	sub: string;
+	/** The account's live role. */
 	role: "admin" | "user";
 	iat: number;
 	exp: number;
-	/**
-	 * Session start (unix seconds) of the original login. Optional because legacy JWTs
-	 * issued before the absolute session ceiling existed do not carry it; see
-	 * `resolveSessionStart` for how those are anchored.
-	 */
-	[SESSION_START_CLAIM]?: number;
-	/**
-	 * `users.token_version` at issuance. Optional for the same reason as the anchor above:
-	 * legacy JWTs predating the column do not carry it. A missing value reads as 0 (see
-	 * `isSessionTokenVersionCurrent`).
-	 */
-	[SESSION_VERSION_CLAIM]?: number;
-	/** `auth_sessions.id` of an opaque session. Absent on a legacy JWT. */
+	/** `auth_sessions.id`. Absent on an OAuth principal. */
 	sid?: string;
+	/** Original login instant (unix seconds). Absent on an OAuth principal. */
+	sessionStart?: number;
+	/** `users.token_version` the session was issued against. Absent on an OAuth principal. */
+	tokenVersion?: number;
 }
 
-/** An opaque session token that is known but past its expiry or absolute ceiling. */
+/** A session token that is known but past its expiry or absolute ceiling. */
 export class SessionTokenExpiredError extends Error {
 	override name = "SessionTokenExpired";
 }
 
-/** An opaque session token that was revoked, alone or by a token-generation bump. */
+/** A session token that was revoked, alone or by a token-generation bump. */
 export class SessionTokenRevokedError extends Error {
 	override name = "SessionTokenRevoked";
 }
@@ -73,11 +59,11 @@ function slidExpiry(sessionStart: number, now: number): number {
 	return Math.min(now + SESSION_TOKEN_TTL_SECONDS, sessionStart + ABSOLUTE_SESSION_MAX_SECONDS);
 }
 
-async function issueSession(
-	userId: string,
-	tokenVersion: number,
-	sessionStart: number,
-): Promise<string> {
+/**
+ * Issue a session token for a fresh login. `tokenVersion` must be the user's current
+ * `users.token_version`, or the session is born revoked.
+ */
+export async function createToken(userId: string, tokenVersion = 0): Promise<string> {
 	const now = nowSeconds();
 	const token = generateSessionToken();
 	await authSessionStore.createSession({
@@ -85,67 +71,26 @@ async function issueSession(
 		userId,
 		tokenHash: hashSessionToken(token),
 		tokenVersion,
-		sessionStart,
+		sessionStart: now,
 		createdAt: now,
-		expiresAt: slidExpiry(sessionStart, now),
+		expiresAt: slidExpiry(now, now),
 	});
 	return token;
 }
 
 /**
- * Issue a session token for a *fresh login*: the absolute-session anchor starts now.
- * `tokenVersion` must be the user's current `users.token_version`, or the session is
- * born revoked.
+ * Slide a session's expiry forward. Callers decide *when* (only inside the renewal
+ * window, so ordinary requests write nothing); this decides how far.
  */
-export async function createToken(userId: string, tokenVersion = 0): Promise<string> {
-	return issueSession(userId, tokenVersion, nowSeconds());
-}
-
-/** Recently issued replacements, keyed by the legacy JWT's hash (see below). */
-const legacyUpgrades = new Map<string, { token: Promise<string>; at: number }>();
-const LEGACY_UPGRADE_REUSE_MS = 5 * 60 * 1000;
-
-/**
- * Replace a verified legacy session JWT with an opaque session, keeping its original
- * session-start anchor so the upgrade cannot extend the absolute ceiling.
- *
- * A page fires many requests in parallel with the same JWT before the first replacement
- * lands, and each would otherwise mint (and leave behind) its own session. Requests that
- * present the same JWT within a few minutes share one replacement instead.
- */
-export async function upgradeLegacySessionToken(
-	legacyToken: string,
-	userId: string,
-	sessionStart: number,
-	tokenVersion: number,
-): Promise<string> {
-	const key = hashSessionToken(legacyToken);
-	const now = Date.now();
-	for (const [entryKey, entry] of legacyUpgrades) {
-		if (now - entry.at > LEGACY_UPGRADE_REUSE_MS) legacyUpgrades.delete(entryKey);
-	}
-	const existing = legacyUpgrades.get(key);
-	if (existing) return existing.token;
-	const token = issueSession(userId, tokenVersion, sessionStart);
-	legacyUpgrades.set(key, { token, at: now });
-	token.catch(() => legacyUpgrades.delete(key));
-	return token;
-}
-
-/**
- * Slide an opaque session's expiry forward. Callers decide *when* (only inside the
- * renewal window, so ordinary requests write nothing); this decides how far.
- */
-export async function extendSessionToken(payload: JwtPayload): Promise<void> {
-	const sessionStart = payload[SESSION_START_CLAIM];
-	if (!payload.sid || sessionStart === undefined) return;
-	const expiresAt = slidExpiry(sessionStart, nowSeconds());
+export async function extendSessionToken(payload: SessionPayload): Promise<void> {
+	if (!payload.sid || payload.sessionStart === undefined) return;
+	const expiresAt = slidExpiry(payload.sessionStart, nowSeconds());
 	if (expiresAt <= payload.exp) return;
 	await authSessionStore.extendSession(payload.sid, expiresAt);
 }
 
-/** Revoke the one session a request authenticated with (logout). No-op for legacy JWTs. */
-export async function revokeSessionToken(payload: JwtPayload): Promise<void> {
+/** Revoke the one session a request authenticated with (logout). */
+export async function revokeSessionToken(payload: SessionPayload): Promise<void> {
 	if (!payload.sid) return;
 	await authSessionStore.revokeSession(payload.sid, nowSeconds());
 	eventBus.emit({ type: "auth:changed", userId: payload.sub });
@@ -167,42 +112,22 @@ export async function revokeUserSessions(userId: string): Promise<number> {
 }
 
 /**
- * Reject payloads that are signed correctly but are not usable session
- * credentials. `hono/jwt` skips `exp`/`sub` when they are absent, so a token
- * without them would otherwise be an unexpiring credential that never even
- * enters the renewal (and therefore ceiling) logic.
+ * Resolve a session token against the live database, so the role is the account's
+ * current role and revocation is immediate.
+ *
+ * Throws `AppError` 401 for anything that is not a known session token,
+ * `SessionTokenRevokedError` / `SessionTokenExpiredError` for a known one that is
+ * finished, and lets storage failures through unchanged.
  */
-function assertSessionPayload(payload: JwtPayload & { stage?: string }): void {
-	// Reject intermediate tokens (e.g. MFA challenge tokens carry `stage`).
-	// Only fully-authenticated session tokens are accepted as credentials.
-	if (payload.stage) {
+export async function verifyToken(token: string): Promise<SessionPayload> {
+	if (!isOpaqueSessionToken(token)) {
 		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
 	}
-	if (typeof payload.sub !== "string" || !payload.sub.trim()) {
-		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
-	}
-	if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
-		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
-	}
-	// Only opaque sessions carry `sid`; a JWT claiming one is not ours.
-	if (payload.sid !== undefined) {
-		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
-	}
-}
-
-/**
- * Resolve an opaque session token. Unlike a JWT this observes the live database, so the
- * role is the account's current role and revocation is immediate.
- */
-async function verifyOpaqueSessionToken(token: string): Promise<JwtPayload> {
 	const session = await authSessionStore.findSessionByTokenHash(hashSessionToken(token));
 	if (!session) {
 		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
 	}
-	if (
-		session.revokedAt !== null ||
-		!isSessionTokenVersionCurrent(session.sessionTokenVersion, session.userTokenVersion)
-	) {
+	if (session.revokedAt !== null || session.sessionTokenVersion < session.userTokenVersion) {
 		throw new SessionTokenRevokedError("Session revoked");
 	}
 	const now = nowSeconds();
@@ -214,47 +139,10 @@ async function verifyOpaqueSessionToken(token: string): Promise<JwtPayload> {
 		role: session.role,
 		iat: session.createdAt,
 		exp: session.expiresAt,
-		[SESSION_START_CLAIM]: session.sessionStart,
-		[SESSION_VERSION_CLAIM]: session.sessionTokenVersion,
 		sid: session.id,
+		sessionStart: session.sessionStart,
+		tokenVersion: session.sessionTokenVersion,
 	};
-}
-
-/**
- * Verify a first-party session token: an opaque session, or a legacy HS256 session JWT
- * still inside its lifetime. Legacy JWTs are no longer issued; remove the JWT branch
- * once every one of them has expired (one `SESSION_TOKEN_TTL_SECONDS` after release).
- */
-export async function verifyToken(token: string): Promise<JwtPayload> {
-	if (isOpaqueSessionToken(token)) return verifyOpaqueSessionToken(token);
-	const payload = (await verify(token, getJwtSecret(), "HS256")) as unknown as JwtPayload & {
-		stage?: string;
-	};
-	assertSessionPayload(payload);
-	return payload;
-}
-
-/**
- * Verify a legacy session JWT's signature and shape while ignoring `exp`.
- *
- * `hono/jwt` checks `exp` *before* the signature, so an arbitrarily forged token
- * with a past `exp` raises `JwtTokenExpired`. Reporting that as "your session
- * expired" would confirm to an unauthenticated caller that the token was once
- * ours and would make the client drop its stored token. This re-verification
- * tells a genuinely expired session apart from a forgery.
- */
-export async function isAuthenticSessionTokenIgnoringExpiry(token: string): Promise<boolean> {
-	if (isOpaqueSessionToken(token)) return false;
-	try {
-		const payload = (await verify(token, getJwtSecret(), {
-			alg: "HS256",
-			exp: false,
-		})) as unknown as JwtPayload & { stage?: string };
-		assertSessionPayload(payload);
-		return true;
-	} catch {
-		return false;
-	}
 }
 
 /** Keep expired/revoked rows around this long, so a late request still reads "expired". */

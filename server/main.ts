@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-import { SESSION_VERSION_CLAIM } from "@shared/session-auth";
 import { eq } from "drizzle-orm";
 
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
@@ -827,7 +826,7 @@ async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAu
 	if (token) {
 		try {
 			const payload = await verifyToken(token);
-			return { kind: "jwt", userId: payload.sub };
+			return { kind: "session", userId: payload.sub };
 		} catch {
 			// Fall through to anonymous only when explicitly enabled.
 		}
@@ -1021,7 +1020,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 				// WebSocket upgrade for /ws/narrator and /ws/terminal
 				if (url.pathname.startsWith("/ws")) {
 					// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
-					// of a session JWT. Verified once at upgrade, scoped at subscribe time
+					// of a session token. Verified once at upgrade, scoped at subscribe time
 					// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
 					const shareId = url.searchParams.get("share");
 					if (shareId && url.pathname === "/ws/narrator") {
@@ -1082,9 +1081,8 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							username: true,
 							avatarColor: true,
 							avatarImageId: true,
-							// Read live rather than taken from the token, so a demotion applies to
-							// the next socket instead of riding along until the JWT expires. The
-							// narrator subscribe path uses it for the admin short-circuit.
+							// Read live, so a demotion applies to the next socket. The narrator
+							// subscribe path uses it for the admin short-circuit.
 							role: true,
 						},
 					});
@@ -1102,7 +1100,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 					// when it lapses; the upgrade is the only place the token is verified.
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
-						sessionTokenVersion: payload[SESSION_VERSION_CLAIM] ?? 0,
+						sessionTokenVersion: payload.tokenVersion ?? 0,
 						sessionUserId: payload.sub,
 					});
 					if (!wsData) {

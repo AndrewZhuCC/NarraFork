@@ -38,13 +38,13 @@ import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 /**
  * Session credential snapshot captured at upgrade time.
  *
- * The upgrade verifies the session JWT once and the socket then lives as long as
+ * The upgrade verifies the session token once and the socket then lives as long as
  * the TCP connection does. With sliding renewal on the HTTP side, "the token
  * expired" is no longer a natural end point for a long-lived socket, so the
  * heartbeat has to enforce `exp` itself.
  */
 export interface SessionWSAuth {
-	/** `exp` (unix seconds) of the session JWT presented at upgrade. */
+	/** `exp` (unix seconds) of the session token presented at upgrade. */
 	sessionExp?: number;
 	sessionTokenVersion?: number;
 	/** `sub` of that token, for logging when the connection is dropped. */
@@ -209,7 +209,7 @@ const SESSION_EXPIRED_CLOSE_CODE = 4001;
  * Whether a session-authenticated socket has outlived the token that opened it.
  *
  * Connections opened before this snapshot existed (or by paths that do not carry
- * a session JWT) have no `sessionExp` and are left alone — the heartbeat timeout
+ * a session token) have no `sessionExp` and are left alone — the heartbeat timeout
  * still governs them.
  */
 function isSessionWSExpired(data: SessionWSAuth, nowSeconds: number): boolean {

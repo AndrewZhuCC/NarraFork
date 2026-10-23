@@ -191,7 +191,7 @@ test.each([
 						{
 							sessionExp: verified.exp,
 							sessionUserId: verified.sub,
-							sessionTokenVersion: verified.sv ?? 0,
+							sessionTokenVersion: verified.tokenVersion ?? 0,
 						},
 					);
 					if (data && server.upgrade(request, { data })) return;

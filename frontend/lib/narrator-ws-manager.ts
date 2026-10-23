@@ -369,12 +369,12 @@ export function decideNarratorForegroundRecovery(opts: {
 // ── Share-auth mode ─────────────────────────────────────────────────────────
 // The anonymous public-share page rides THIS manager (same /ws/narrator channel,
 // same event fan-out) but authenticates with the share credential instead of the
-// session JWT. The mode is process-wide and deliberately trivial: the public
+// session token. The mode is process-wide and deliberately trivial: the public
 // route never mounts the authenticated shell, so the two modes never coexist.
 let shareAuth: { shareId: string; token: string } | null = null;
 
 /**
- * Switch the manager's credential to a public share (or back to the session JWT
+ * Switch the manager's credential to a public share (or back to the session token
  * with `null`). Reconnects so the socket re-opens under the new credential.
  */
 export function setNarratorWSShareAuth(auth: { shareId: string; token: string } | null): void {

@@ -41,7 +41,6 @@
  */
 
 import { endSession, getToken, onTokenChange, setToken } from "@frontend/lib/api/client";
-import { isOpaqueSessionToken } from "@shared/session-auth";
 
 /** URL parameter through which the embedder declares itself. */
 const EMBED_MARKER_PARAM = "nfEmbed";
@@ -50,27 +49,21 @@ const BOOTSTRAP_MESSAGE = "narrafork.bootstrap";
 const TOKEN_CHANGED_MESSAGE = "narrafork.token-changed";
 const SIGN_OUT_MESSAGE = "narrafork.sign-out";
 
-/** `nfs_` followed by 32 random bytes in unpadded base64url. */
-const OPAQUE_SESSION_TOKEN_SHAPE = /^nfs_[A-Za-z0-9_-]{43}$/;
-
 interface HostMessage {
 	type?: unknown;
 	token?: unknown;
 }
 
 /**
- * Whether a value is shaped like a session token the server issues: an opaque
- * `nfs_` token, or a legacy session JWT that is still inside its lifetime.
+ * Whether a value is shaped like a session token the server issues: `nfs_` followed by
+ * 32 random bytes in unpadded base64url.
  *
- * Not verified — the client has no key, and the backend is the only party that can accept
- * or reject it. This only refuses values that could not possibly be a token, so that an
- * arbitrary string cannot be parked in storage and later sent as a credential.
+ * Not verified — only the backend can accept or reject it. This only refuses values that
+ * could not possibly be a token, so that an arbitrary string cannot be parked in storage
+ * and later sent as a credential.
  */
 export function looksLikeSessionToken(value: unknown): value is string {
-	if (typeof value !== "string") return false;
-	if (value.length < 20 || value.length > 8_192) return false;
-	if (isOpaqueSessionToken(value)) return OPAQUE_SESSION_TOKEN_SHAPE.test(value);
-	return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+	return typeof value === "string" && /^nfs_[A-Za-z0-9_-]{43}$/.test(value);
 }
 
 /** True when this document is framed AND the embedder supplied the marker. */
