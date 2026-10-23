@@ -260,6 +260,13 @@
 			"when": 1792700457769,
 			"tag": "0036_project_index",
 			"breakpoints": true
+		},
+		{
+			"idx": 37,
+			"version": "7",
+			"when": 1792724756605,
+			"tag": "0037_body_rows_only",
+			"breakpoints": true
 		}
   ]
 }

@@ -742,6 +742,7 @@ export const narratorMessages = pgTable(
 		providerResponseId: text("provider_response_id"),
 		bodyBytes: integer("body_bytes").notNull().default(0),
 		stateRevision: integer("state_revision").notNull().default(0),
+		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -3851,7 +3852,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 124,
-  "columnCount": 1662,
+  "columnCount": 1663,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -8101,6 +8102,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "stateRevision",
           "name": "state_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "bodyRowsOnly",
+          "name": "body_rows_only",
           "kind": "integer",
           "pgType": "integer",
           "notNull": true,

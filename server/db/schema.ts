@@ -1376,6 +1376,12 @@ export const narratorMessages = sqliteTable(
 		 * triggers (contract v3) neither bump nor queue a block sync for it.
 		 */
 		stateRevision: integer("state_revision").notNull().default(0),
+		/**
+		 * 1: `content_json` holds `[]`, not this block-format envelope's body; the block rows
+		 * are its only copy (`narratorBlocks.compactJson`, the clearing job; §10.4). 0: the
+		 * column holds the complete projection (or is the body, for `body_format = 1`).
+		 */
+		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [

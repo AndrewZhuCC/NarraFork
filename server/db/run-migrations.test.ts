@@ -1881,16 +1881,22 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			`INSERT INTO narrator_message_refs (id,narrator_id,message_id,seq)
 			 VALUES ('kept-owner-ref','preserved','kept-message',0),('kept-holder-ref','holder','kept-message',0)`,
 		);
-		// 0003 can resurrect an unrelated retired nullable tool column. Compare every
-		// pre-existing tool field, not a stronger claim that old replay adds no columns.
-		const toolProjection = columnNames(sqlite, "narrator_tool_calls")
-			.map((column) => `"${column}"`)
-			.join(", ");
+		// 0003 can resurrect an unrelated retired nullable tool column, and a later migration
+		// may add a message column. Compare every pre-existing field, not a stronger claim
+		// that old replay or the upgrade adds no columns.
+		const projection = (table: string) =>
+			columnNames(sqlite, table)
+				.map((column) => `"${column}"`)
+				.join(", ");
+		const toolProjection = projection("narrator_tool_calls");
+		const messageProjection = projection("narrator_messages");
 		const stableHistory = () => ({
 			narrators: sqlite
 				?.prepare("SELECT id, title, model_history_revision FROM narrators ORDER BY id")
 				.all(),
-			messages: sqlite?.prepare("SELECT * FROM narrator_messages ORDER BY id").all(),
+			messages: sqlite
+				?.prepare(`SELECT ${messageProjection} FROM narrator_messages ORDER BY id`)
+				.all(),
 			tools: sqlite?.prepare(`SELECT ${toolProjection} FROM narrator_tool_calls ORDER BY id`).all(),
 			refs: sqlite?.prepare("SELECT * FROM narrator_message_refs ORDER BY id").all(),
 		});

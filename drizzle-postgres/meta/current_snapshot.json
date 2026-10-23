@@ -1,6 +1,6 @@
 {
-  "id": "ad79826f-3e84-4be5-8553-5879cace6553",
-  "prevId": "da73efaf-92c0-4786-9720-a50f994a0756",
+  "id": "08a277a3-303b-4df5-bef0-ee9535cae552",
+  "prevId": "ad79826f-3e84-4be5-8553-5879cace6553",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -11750,6 +11750,13 @@
         },
         "state_revision": {
           "name": "state_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "body_rows_only": {
+          "name": "body_rows_only",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
