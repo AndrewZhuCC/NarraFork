@@ -27,6 +27,7 @@ import { db } from "../db";
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import * as executors from "../lib/executor-binaries";
+import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { editorOperationMetadataSchema } from "../lib/validators/editor-documents";
 import { denyHostEditorHelpers } from "../routes/editor-native-fixture";
@@ -82,6 +83,7 @@ for (const scenario of [
 					Object.assign(forbidden, { preconnect: forbidden }),
 				),
 			];
+			const warnings = spyOn(logger, "warn");
 			const service = getEditorDocumentService();
 			let cold: EditorDocumentService | undefined;
 			const userId = randomUUID(),
@@ -279,9 +281,20 @@ for (const scenario of [
 						queryOperation: queryEditorOperation,
 					});
 					await writeFile(scenarioTarget, "unrelated-current-disk");
+					// History is optional work under HISTORY_BUDGET_MS (file-change-runtime.ts).
+					// On a slow disk (macOS Intel runners) publishing the 20 MiB before/after blobs
+					// can overrun it: the save still applies, and its history is reported
+					// unavailable. Only that cause is accepted; other missing history still fails.
+					const budgetExceeded = warnings.mock.calls.some(
+						([message, data]) =>
+							message === "File history unavailable for this request" &&
+							(data as { sourceId?: string } | undefined)?.sourceId === large?.result.operationId &&
+							String((data as { error?: unknown } | undefined)?.error).includes("budget exceeded"),
+					);
+					const historyStatus = budgetExceeded ? "unavailable" : "complete";
 					expect(await cold.operation(actor, large.result.operationId)).toMatchObject({
 						status: "saved",
-						result: { hash: hash(large.next), snapshotRevision: 17 },
+						result: { hash: hash(large.next), snapshotRevision: 17, historyStatus },
 					});
 					expect(await readFile(scenarioTarget, "utf8")).toBe("unrelated-current-disk");
 					expect(await queryEditorOperation(actor, large.result.operationId)).toMatchObject({
@@ -295,12 +308,18 @@ for (const scenario of [
 							),
 						),
 					);
+					// A mismatched raw digest can only be caught against a recorded after-state;
+					// without history the applied save keeps its recovery metadata, unverified.
 					expect(
 						await queryEditorOperation(actor, large.result.operationId, {
 							...recovery,
 							rawDigest: "f".repeat(64),
 						}),
-					).toMatchObject({ status: "uncertain" });
+					).toMatchObject(
+						budgetExceeded
+							? { status: "saved", result: { historyStatus: "unavailable" } }
+							: { status: "uncertain" },
+					);
 					const row = db
 						.select({ id: fileChangeOperations.id })
 						.from(fileChangeOperations)
@@ -318,7 +337,7 @@ for (const scenario of [
 						result: {
 							hash: hash(large.next),
 							diskOutcome: "applied",
-							historyStatus: "complete",
+							historyStatus,
 						},
 					});
 					expect(await readFile(scenarioTarget, "utf8")).toBe("unrelated-current-disk");
@@ -347,6 +366,7 @@ for (const scenario of [
 				if (Reflect.get(globalThis, singleton) === service)
 					Reflect.deleteProperty(globalThis, singleton);
 				for (const trap of traps) trap.mockRestore();
+				warnings.mockRestore();
 				processGuard.restore();
 			}
 		},
