@@ -1,5 +1,6 @@
 // Real Dockview + FilePanelContent/LargeFileGate + Monaco. Transport is the isolated real host.
 import { MantineProvider } from "@mantine/core";
+import { QueryClientProvider } from "@tanstack/react-query";
 import "@mantine/core/styles.css";
 import {
 	type DockviewApi,
@@ -31,6 +32,9 @@ import { NarratorPanelVisibilityProvider } from "../frontend/components/narrator
 import { WorkspaceResourceFrame } from "../frontend/components/narrator/workspace/WorkspaceResourceFrame";
 import { editorDocumentApi } from "../frontend/lib/api/editor-documents";
 import translations from "../frontend/locales/en/narrator.json";
+import { createSmokeEditorQueryClient } from "./smoke-editor-query-client";
+
+const queryClient = createSmokeEditorQueryClient();
 
 export async function runEditorCacheFixture(config: { path: string; narratorId: string }) {
 	const monaco = await loadMonaco();
@@ -112,6 +116,7 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 		const [visible, setVisible] = useState(true);
 		setWorkspaceVisible = setVisible;
 		return (
+			<QueryClientProvider client={queryClient}>
 			<MantineProvider forceColorScheme="dark">
 				<I18nextProvider i18n={i18n}>
 					<NarratorPanelVisibilityProvider value={visible}>
@@ -131,6 +136,7 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 					</NarratorPanelVisibilityProvider>
 				</I18nextProvider>
 			</MantineProvider>
+			</QueryClientProvider>
 		);
 	}
 	const host = document.getElementById("root");
