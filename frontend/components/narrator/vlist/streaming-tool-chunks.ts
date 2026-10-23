@@ -31,6 +31,7 @@ import {
 	mergeSendDeliveryTargets,
 	type SendDeliveryReceipt,
 } from "@shared/communication-tool";
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
 import {
 	handoffStreamingEditOrigin,
@@ -540,16 +541,15 @@ export function collectPersistedDocumentPins(
 	const visit = (list: readonly unknown[]) => {
 		for (const entry of list) {
 			if (!entry || typeof entry !== "object") continue;
-			const message = entry as {
+			const message = entry as MessageBodySource & {
 				id?: string;
 				narratorId?: string;
 				toolCalls?: unknown[];
-				contentJson?: unknown[];
 				children?: unknown[];
 			};
 			for (const [records, blocks] of [
 				[message.toolCalls, false],
-				[message.contentJson, true],
+				[messageBody(message), true],
 			] as const) {
 				for (const raw of records ?? []) {
 					if (!raw || typeof raw !== "object") continue;
@@ -612,18 +612,16 @@ export function streamingToolChunks(store: StreamingToolStore): TopLevelStreamin
  * child message can be the persisted owner of a live id.
  */
 export function collectPersistedToolUseIds(
-	messages: readonly {
+	messages: readonly (MessageBodySource & {
 		toolCalls?: unknown;
-		contentJson?: unknown;
 		children?: readonly unknown[];
-	}[],
+	})[],
 ): ReadonlySet<string> {
 	const ids = new Set<string>();
 	const visit = (list: readonly unknown[]): void => {
 		for (const entry of list) {
-			const message = entry as {
+			const message = entry as MessageBodySource & {
 				toolCalls?: unknown;
-				contentJson?: unknown;
 				children?: readonly unknown[];
 			};
 			if (Array.isArray(message?.toolCalls)) {
@@ -632,12 +630,10 @@ export function collectPersistedToolUseIds(
 					if (typeof id === "string" && id.length > 0) ids.add(id);
 				}
 			}
-			if (Array.isArray(message?.contentJson)) {
-				for (const block of message.contentJson) {
-					const candidate = block as { type?: unknown; id?: unknown } | null;
-					if (candidate?.type !== "tool_use") continue;
-					if (typeof candidate.id === "string" && candidate.id.length > 0) ids.add(candidate.id);
-				}
+			for (const block of messageBody(message)) {
+				const candidate = block as { type?: unknown; id?: unknown } | null;
+				if (candidate?.type !== "tool_use") continue;
+				if (typeof candidate.id === "string" && candidate.id.length > 0) ids.add(candidate.id);
 			}
 			if (Array.isArray(message?.children) && message.children.length > 0) visit(message.children);
 		}

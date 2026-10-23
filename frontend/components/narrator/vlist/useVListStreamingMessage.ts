@@ -22,6 +22,7 @@
  */
 
 import { textDocumentStore } from "@frontend/lib/text-document-store";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { TextDocumentRangeReader } from "@shared/pretext-layout/text-document";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
@@ -243,8 +244,7 @@ export function useVListStreamingMessage(
 		const retainedLegacy = new Set(legacy);
 		const acknowledged = new Map<string, number>();
 		for (const message of committedMessages) {
-			if (!Array.isArray(message.contentJson)) continue;
-			for (const block of message.contentJson) {
+			for (const block of messageBody(message) as readonly Record<string, unknown>[]) {
 				const identity = contentBlockIdentity(block);
 				if (identity)
 					acknowledged.set(
@@ -313,13 +313,8 @@ export function useVListStreamingMessage(
 		{
 			onMessage: (data) => {
 				const message = data.message as NarratorMsg | undefined;
-				if (
-					message?.role !== "assistant" ||
-					(!isSubagent && message.parentToolUseId) ||
-					!Array.isArray(message.contentJson)
-				)
-					return;
-				for (const block of message.contentJson) {
+				if (message?.role !== "assistant" || (!isSubagent && message.parentToolUseId)) return;
+				for (const block of messageBody(message)) {
 					const identity = contentBlockIdentity(block);
 					if (identity)
 						finalizedRef.current.set(
@@ -746,7 +741,7 @@ export function useVListStreamingMessage(
 			// only snapshot-covered lanes, before projections filter/reorder them:
 			// a genuinely NEW lane on a later live frame must still fade on birth.
 			for (const [index, raw] of blocksRef.current.entries()) {
-				const block = streaming.contentJson[index];
+				const block = messageBody(streaming)[index];
 				if (block && snapshotBlocksRef.current.has(raw)) {
 					block._streamAnimSnapshotEpoch = snapshotEpochRef.current;
 				}

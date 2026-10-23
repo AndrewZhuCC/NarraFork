@@ -1,9 +1,8 @@
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 
 export function askInPassingBlock(message: TreeMessage) {
-	return Array.isArray(message.contentJson)
-		? message.contentJson.find((block) => block?.type === "ask_in_passing")
-		: undefined;
+	return messageBody(message).find((block) => block?.type === "ask_in_passing");
 }
 
 /** Source-id anchored insertion; only the first observation consumes a seq slot. */

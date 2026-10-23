@@ -1,3 +1,4 @@
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 /**
  * vlist-tail-meta.ts — Pure replication of ChunkedMessageList's buildChunkTailMeta,
  * operating on a FLAT message list (PretextMessageList already flattens chunks).
@@ -17,7 +18,7 @@ export interface TailMetaMessage {
 	role: string;
 	contextPercent?: number | null;
 	turnUsageJson?: unknown;
-	contentJson?: Array<{ type?: unknown }>;
+	contentJson?: ReadonlyArray<{ type?: unknown }>;
 }
 
 export interface TailMetaResult {
@@ -39,11 +40,7 @@ export interface TailMetaOptions {
 
 /** True when a message is a system error card (excluded from lastRealMessage). */
 function isErrorSystemMessage(msg: TailMetaMessage): boolean {
-	return (
-		msg.role === "system" &&
-		Array.isArray(msg.contentJson) &&
-		msg.contentJson.some((block) => block?.type === "error")
-	);
+	return msg.role === "system" && messageBody(msg).some((block) => block?.type === "error");
 }
 
 /**

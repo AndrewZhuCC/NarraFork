@@ -1,11 +1,11 @@
 /** Per-block ownership evidence. Modern content uses global id + monotonic
  * revision; only unversioned history/snapshots use the conservative legacy match. */
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { getStreamingBlockOutputIndex, type StreamingBlock } from "../message/message-segments";
 
-export interface SupersedeCandidateMessage {
+export interface SupersedeCandidateMessage extends MessageBodySource {
 	role?: unknown;
 	parentToolUseId?: unknown;
-	contentJson?: unknown;
 }
 interface PersistedBlock {
 	type?: unknown;
@@ -97,8 +97,8 @@ function collectCurrentTurnBlocks(
 		const message = messages[index];
 		if (!message || message.parentToolUseId) continue;
 		if (message.role === "user") break;
-		if (message.role !== "assistant" || !Array.isArray(message.contentJson)) continue;
-		for (const block of message.contentJson) {
+		if (message.role !== "assistant") continue;
+		for (const block of messageBody(message)) {
 			if (block && typeof block === "object") blocks.push(block as PersistedBlock);
 		}
 	}

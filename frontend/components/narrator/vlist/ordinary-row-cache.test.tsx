@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act, memo, useMemo, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -29,6 +30,7 @@ const dependencies = {
 	...payloadReuse,
 	sameRowInteraction,
 	toolDetailRequestFromData,
+	messageBody,
 };
 const code = new Bun.Transpiler({ loader: "ts" }).transformSync(`
 function useBindings({ narratorId, selectionIndex, rowHandlers, openEditor,

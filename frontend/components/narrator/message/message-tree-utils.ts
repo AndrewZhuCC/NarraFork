@@ -12,6 +12,7 @@ import type {
 	ToolCallRecord,
 	TreeMessage,
 } from "@frontend/lib/api";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { copyStreamingEditInput, handoffStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { mergeToolLifecycleRecord, type ToolLifecycleRecord } from "@shared/tool-row-status";
 
@@ -645,7 +646,7 @@ export function getNewestReflectionToolOccurrenceInTree(
 			}
 		}
 
-		const contentBlocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+		const contentBlocks = messageBody(msg);
 		let matchingContentBlock:
 			| (BaseContentBlock & { permissionSuggestions?: unknown[]; suggestions?: unknown[] })
 			| undefined;

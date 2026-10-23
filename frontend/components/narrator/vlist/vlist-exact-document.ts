@@ -12,6 +12,7 @@
  */
 
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { PretextLayoutIndex } from "@shared/pretext-layout";
 import { resolveExactReloadDecision } from "./vlist-reload-policy";
@@ -78,9 +79,7 @@ export function hasRenderableExactLayout(
  * the document (ask_in_passing, context_cleared) still answers the reload.
  */
 export function isCompactMarkerMessage(message: TreeMessage | undefined): boolean {
-	const blocks = message?.contentJson;
-	if (!Array.isArray(blocks)) return false;
-	for (const block of blocks) {
+	for (const block of messageBody(message)) {
 		const type = (block as { type?: unknown } | null)?.type;
 		if (type === "compact" || type === "segment_compact") return true;
 	}

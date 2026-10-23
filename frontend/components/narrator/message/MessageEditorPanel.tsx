@@ -37,7 +37,7 @@ export interface MessageEditorPanelProps {
 	messageId: string;
 	imageNarratorId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: persisted SDK blocks
-	blocks: any[];
+	blocks: readonly any[];
 	creator?: {
 		id: string;
 		username: string;

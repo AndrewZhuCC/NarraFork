@@ -1,6 +1,7 @@
 import { notifications } from "@mantine/notifications";
 import { quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -929,7 +930,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearRetryIfActive();
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
+				const blocks = messageBody(wsData.message);
 				const compactBlock = blocks.find(
 					(b: ContentBlock) =>
 						(b.type === "compact" && b.subtype !== "plan") || b.type === "segment_compact",
