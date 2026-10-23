@@ -414,4 +414,62 @@ describe("block reindex", () => {
 		expect(indexed("quince")).toHaveLength(1);
 		expect(indexed("cellar")).toHaveLength(1);
 	});
+	const reindexParams = {
+		kind: "blockReindexSlice" as const,
+		afterRowid: 0,
+		maxEnvelopes: 100,
+		maxSourceBytes: 1 << 22,
+		maxIndexChars: 1 << 20,
+		budgetMs: 1000,
+	};
+
+	test("the worker computes every sealed block's text; none falls back to the main thread", async () => {
+		const stepId = await conversation();
+		const slice = runBlockReindexSlice(sqlite, reindexParams);
+		expect(slice.done).toBe(true);
+		expect(slice.envelopes.map((envelope) => envelope.resync)).toEqual([false, false]);
+		const step = slice.envelopes.find((envelope) => envelope.id === stepId);
+		expect(step?.blocks.map((block) => /cellar|quince/.test(block.text))).toEqual([true, true]);
+	});
+
+	test("an envelope rewritten after the read is reindexed from what it holds now", async () => {
+		const stepId = await conversation();
+		await drain();
+		sqlite.run("DELETE FROM narrator_blocks_fts");
+		sqlite.run("UPDATE narrator_block_backfill SET cursor = 0, complete = 0 WHERE job = 'reindex'");
+		let raced = false;
+		const racing = {
+			...inline,
+			reindex: async (params: Parameters<typeof runBlockReindexSlice>[1]) => {
+				const slice = await inline.reindex(params);
+				if (!raced) {
+					raced = true;
+					sqlite.run(
+						`UPDATE narrator_blocks SET revision = revision + 1,
+							payload = json_set(payload, '$.raw[0].text', 'The persimmons are in the attic.')
+						 WHERE message_id = ? AND kind = 'output'`,
+						[stepId],
+					);
+				}
+				return slice;
+			},
+		};
+		while (await backfill.runBlockJobSlice(racing));
+		expect(indexed("persimmons")).toHaveLength(1);
+		expect(indexed("cellar")).toEqual([]);
+		expect(indexed("quince")).toHaveLength(1);
+	});
+
+	test("a slice stops at its index text budget, and a queued envelope is left to the sync", async () => {
+		const stepId = await conversation();
+		const first = runBlockReindexSlice(sqlite, { ...reindexParams, maxIndexChars: 1 });
+		expect(first.envelopes).toHaveLength(1);
+		expect(first.done).toBe(false);
+		sqlite.run("INSERT OR IGNORE INTO narrator_block_sync_queue (message_id) VALUES (?)", [stepId]);
+		const slice = runBlockReindexSlice(sqlite, reindexParams);
+		expect(slice.envelopes.find((envelope) => envelope.id === stepId)).toMatchObject({
+			resync: true,
+			blocks: [],
+		});
+	});
 });
