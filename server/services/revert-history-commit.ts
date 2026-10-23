@@ -86,6 +86,7 @@ type Row = Record<string, Value>;
 type Statement = { text: string; values: SQLQueryBindings[] };
 type Check = Statement & { count: number };
 type Target = { row: Row; count: number };
+type StoredColumns = { message: string[]; tool: string[] };
 type Snapshot = {
 	versions: { narratorId: string; messageVersion: number }[];
 	signal: AbortSignal;
@@ -322,8 +323,8 @@ export class RevertHistoryCommitService {
 			)
 				throw fail("EVIDENCE_INCOMPLETE", "The complete fixed selection is not settled");
 			await compareSelection(fixed, current, () => this.pause(snapshot));
-			await this.verifyCopyProjection(snapshot);
-			await this.build(snapshot, current, worker);
+			const columns = await this.storedColumns(snapshot);
+			await this.build(snapshot, current, worker, columns);
 			const latest = await this.selection.collect({
 				principal,
 				narratorId: fixed.narratorId,
@@ -479,14 +480,14 @@ export class RevertHistoryCommitService {
 		}
 	}
 
-	private async verifyCopyProjection(work: Snapshot) {
-		// The application-owned schema and SQLite's enabled FK/trigger machinery are
-		// authoritative. Do not veto a user's recovery because an unrelated table or
-		// trigger was added after a hand-maintained whitelist was written.
-		// Only COW copy projections need a structural check to avoid dropping columns.
-		for (const [table, expected] of [
-			["narrator_messages", MESSAGE_COLUMNS],
-			["narrator_tool_calls", TOOL_COLUMNS],
+	private async storedColumns(work: Snapshot): Promise<StoredColumns> {
+		// Row-length commitments and COW copies follow the live stored columns, so fields
+		// unknown to this build (e.g. left by a newer version) are fixed and copied verbatim
+		// instead of vetoing the revert. A missing known field is still unsupported.
+		const result: StoredColumns = { message: [], tool: [] };
+		for (const [key, table, expected] of [
+			["message", "narrator_messages", MESSAGE_COLUMNS],
+			["tool", "narrator_tool_calls", TOOL_COLUMNS],
 		] as const) {
 			const columns = this.root
 				.query<{ name: string; hidden: number }, [string]>(
@@ -495,16 +496,20 @@ export class RevertHistoryCommitService {
 				.all(table);
 			bound(columns.length, 256, "stored/generated columns");
 			const stored = columns.filter((column) => column.hidden === 0).map((column) => column.name);
-			if (stored.length !== expected.length || stored.some((column) => !expected.includes(column)))
-				throw fail(
-					"UNSUPPORTED_SCHEMA",
-					"Stored columns differ from the explicit non-generated copy projection",
-				);
+			if (expected.some((column) => !stored.includes(column)))
+				throw fail("UNSUPPORTED_SCHEMA", "A known history column is missing from storage");
+			result[key] = stored;
 			await this.pause(work);
 		}
+		return result;
 	}
 
-	private async build(work: Snapshot, selection: RevertSelectionResult, worker: RewriteWorker) {
+	private async build(
+		work: Snapshot,
+		selection: RevertSelectionResult,
+		worker: RewriteWorker,
+		stored: StoredColumns,
+	) {
 		const messages = selection.history.messages;
 		const messageById = new Map<string, RevertSelectionMessage>();
 		const blocks = new Map<string, RevertSelectionBlock[]>();
@@ -589,7 +594,7 @@ export class RevertHistoryCommitService {
 			// remain deferred until every full-row admission check has passed.
 			const observed = this.one<Row & { ftsBytes: number; rowBytes: number }>(
 				work,
-				`SELECT id,role,tree_hash_after,snapshot_commit_sha,coalesce(octet_length(content_text),0) AS ftsBytes,${whole ? "content_json" : `${rowLength(MESSAGE_COLUMNS)} AS rowBytes`} FROM narrator_messages WHERE id=?${whole ? " AND octet_length(content_json)=?" : ""} LIMIT 1`,
+				`SELECT id,role,tree_hash_after,snapshot_commit_sha,coalesce(octet_length(content_text),0) AS ftsBytes,${whole ? "content_json" : `${rowLength(stored.message)} AS rowBytes`} FROM narrator_messages WHERE id=?${whole ? " AND octet_length(content_json)=?" : ""} LIMIT 1`,
 				whole ? [message.id, message.contentBytes] : [message.id],
 			);
 			capture(messageRows, message.id, observed);
@@ -634,7 +639,7 @@ export class RevertHistoryCommitService {
 				if (action === "copy") {
 					const size = this.one<{ id: string; rowBytes: number }>(
 						work,
-						`SELECT id,${rowLength(TOOL_COLUMNS)} AS rowBytes FROM narrator_tool_calls WHERE id=? LIMIT 1`,
+						`SELECT id,${rowLength(stored.tool)} AS rowBytes FROM narrator_tool_calls WHERE id=? LIMIT 1`,
 						[tool.id],
 					);
 					capture(toolRows, tool.id, size);
@@ -789,16 +794,18 @@ export class RevertHistoryCommitService {
 
 		// All full-row admission checks have now passed. Only rewrites and retained COW
 		// tools get raw strings; deleting a 32MB tool output never fetches or JSON parses it.
+		// COW rows read every live stored field, including ones unknown to this build, so
+		// the copy keeps them and the consumed-row checks still fix each one.
 		for (const [id, bytes] of messageSizes) {
 			const message = messageById.get(id);
 			if (!message) throw fail("MANIFEST_INVALID", "Unknown rewrite");
 			const columns =
 				message.action === "copy_on_write"
-					? MESSAGE_COLUMNS
+					? stored.message
 					: ["id", "content_json", "role", "tree_hash_after", "snapshot_commit_sha"];
 			const body = this.one<Row>(
 				work,
-				`SELECT ${columns.map(quote).join(",")},coalesce(octet_length(content_text),0) AS ftsBytes,${rowLength(MESSAGE_COLUMNS)} AS rowBytes FROM narrator_messages WHERE id=? AND ${rowLength(MESSAGE_COLUMNS)}=? LIMIT 1`,
+				`SELECT ${columns.map(quote).join(",")},coalesce(octet_length(content_text),0) AS ftsBytes,${rowLength(stored.message)} AS rowBytes FROM narrator_messages WHERE id=? AND ${rowLength(stored.message)}=? LIMIT 1`,
 				[id, bytes],
 			);
 			capture(messageRows, id, body);
@@ -808,7 +815,7 @@ export class RevertHistoryCommitService {
 		for (const [id, bytes] of toolSizes) {
 			const copy = this.one<Row>(
 				work,
-				`SELECT ${TOOL_COLUMNS.map(quote).join(",")},octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,${rowLength(TOOL_COLUMNS)} AS rowBytes FROM narrator_tool_calls WHERE id=? AND ${rowLength(TOOL_COLUMNS)}=? LIMIT 1`,
+				`SELECT ${stored.tool.map(quote).join(",")},octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,${rowLength(stored.tool)} AS rowBytes FROM narrator_tool_calls WHERE id=? AND ${rowLength(stored.tool)}=? LIMIT 1`,
 				[id, bytes],
 			);
 			capture(toolRows, id, copy);
@@ -858,7 +865,7 @@ export class RevertHistoryCommitService {
 							narrator_id: message.narratorId,
 							author_narrator_id: original.author_narrator_id ?? original.narrator_id,
 						},
-						MESSAGE_COLUMNS,
+						stored.message,
 					),
 				);
 				const ref = refPatches.get(message.refId);
@@ -881,7 +888,7 @@ export class RevertHistoryCommitService {
 									message_id: id,
 									execution_origin_tool_call_id: copy.execution_origin_tool_call_id ?? toolId,
 								},
-								TOOL_COLUMNS,
+								stored.tool,
 							),
 						);
 					}
@@ -976,13 +983,13 @@ export class RevertHistoryCommitService {
 		work.checks.push(
 			...rowChecks("narrator_messages", "id", messageRows.values(), {
 				ftsBytes: "coalesce(octet_length(a.content_text),0)",
-				rowBytes: rowLength(MESSAGE_COLUMNS, "a."),
+				rowBytes: rowLength(stored.message, "a."),
 			}),
 			...rowChecks("narrator_message_refs", "id", refRows.values()),
 			...rowChecks("narrator_tool_calls", "id", toolRows.values(), {
 				inputBytes: "octet_length(a.input_json)",
 				outputBytes: "octet_length(a.output_json)",
-				rowBytes: rowLength(TOOL_COLUMNS, "a."),
+				rowBytes: rowLength(stored.tool, "a."),
 			}),
 			...rowChecks("narrators", "id", narrators.values()),
 			...targetChecks(

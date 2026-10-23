@@ -2600,14 +2600,139 @@ describe("bounded preparation and synchronous atomic commit", () => {
 		).rejects.toMatchObject({ code: "REVERT_HISTORY_BUDGET_EXCEEDED" });
 		expect(count("narrator_messages")).toBe(1);
 	});
-	test("stored-schema drift cannot silently omit a new copy field", async () => {
+	for (const action of ["delete", "unlink", "rewrite"] as const)
+		test(`stored-schema drift does not block ${action} without copying rows`, async () => {
+			const target = withTools();
+			if (action === "unlink") ref(target.messageId, "fork", 1);
+			const original = body(target.messageId);
+			for (const table of ["narrator_messages", "narrator_tool_calls"])
+				sqlite.exec(
+					`ALTER TABLE ${table} ADD COLUMN new_unhandled_reference TEXT DEFAULT 'preserved'`,
+				);
+			const selector: FileChangeRevertSelector =
+				action === "rewrite"
+					? { kind: "tool_calls", toolCallIds: [target.tools[0]] }
+					: { kind: "all" };
+			apply(await prepare(selector));
+			expect(version()).toBe(8);
+			expect(version("fork")).toBe(7);
+			if (action === "delete") {
+				expect(count("narrator_messages")).toBe(0);
+				expect(count("narrator_tool_calls")).toBe(0);
+			} else {
+				expect(
+					query(
+						"SELECT new_unhandled_reference FROM narrator_messages WHERE id=?",
+						target.messageId,
+					),
+				).toEqual([{ new_unhandled_reference: "preserved" }]);
+				expect(
+					query(
+						"SELECT new_unhandled_reference FROM narrator_tool_calls WHERE message_id=?",
+						target.messageId,
+					),
+				).toEqual(
+					Array.from({ length: action === "unlink" ? 2 : 1 }, () => ({
+						new_unhandled_reference: "preserved",
+					})),
+				);
+				if (action === "unlink") {
+					expect(body(target.messageId)).toBe(original);
+					expect(query("SELECT narrator_id FROM narrator_message_refs")).toEqual([
+						{ narrator_id: "fork" },
+					]);
+				} else {
+					expect(JSON.parse(body(target.messageId))).toHaveLength(2);
+					expect(query("SELECT id FROM narrator_tool_calls")).toEqual([{ id: target.tools[1] }]);
+				}
+			}
+		});
+	test("stored-schema drift in tools does not block COW that copies only a message", async () => {
+		const target = withTools(1, ["remove"]);
+		ref(target.messageId, "fork", 1);
+		const original = body(target.messageId);
+		sqlite.exec("ALTER TABLE narrator_tool_calls ADD COLUMN new_unhandled_reference TEXT");
+		const result = apply(await prepare({ kind: "tool_calls", toolCallIds: target.tools }, "fork"));
+		expect(result.replacements).toHaveLength(1);
+		expect(body(target.messageId)).toBe(original);
+		const forkMessage = query<{ message_id: string }>(
+			"SELECT message_id FROM narrator_message_refs WHERE narrator_id='fork'",
+		)[0].message_id;
+		expect(forkMessage).not.toBe(target.messageId);
+		expect(JSON.parse(body(forkMessage))).toEqual([{ type: "text", text: "keep" }]);
+		expect(count("narrator_messages")).toBe(2);
+		expect(count("narrator_tool_calls")).toBe(1);
+		expect(version()).toBe(7);
+		expect(version("fork")).toBe(8);
+	});
+	test("stored-schema drift copies unknown fields into COW rows", async () => {
 		const target = withTools();
 		ref(target.messageId, "fork", 1);
-		sqlite.exec("ALTER TABLE narrator_tool_calls ADD COLUMN new_unhandled_reference TEXT");
-		await expect(
-			prepare({ kind: "tool_calls", toolCallIds: [target.tools[0]] }, "fork"),
-		).rejects.toMatchObject({ code: "REVERT_HISTORY_UNSUPPORTED_SCHEMA" });
+		for (const table of ["narrator_messages", "narrator_tool_calls"])
+			sqlite.exec(`ALTER TABLE ${table} ADD COLUMN new_unhandled_reference TEXT`);
+		sqlite
+			.query("UPDATE narrator_messages SET new_unhandled_reference='message' WHERE id=?")
+			.run(target.messageId);
+		sqlite
+			.query("UPDATE narrator_tool_calls SET new_unhandled_reference='tool' WHERE id=?")
+			.run(target.tools[1]);
+		const original = body(target.messageId);
+		const result = apply(
+			await prepare({ kind: "tool_calls", toolCallIds: [target.tools[0]] }, "fork"),
+		);
+		const forkMessage = result.replacements[0].messageId;
+		expect(forkMessage).not.toBe(target.messageId);
+		expect(body(target.messageId)).toBe(original);
+		expect(
+			query("SELECT new_unhandled_reference FROM narrator_messages WHERE id=?", forkMessage),
+		).toEqual([{ new_unhandled_reference: "message" }]);
+		expect(
+			query(
+				"SELECT new_unhandled_reference FROM narrator_tool_calls WHERE message_id=?",
+				forkMessage,
+			),
+		).toEqual([{ new_unhandled_reference: "tool" }]);
+		expect(count("narrator_tool_calls")).toBe(3);
+		expect(version("fork")).toBe(8);
 	});
+	for (const action of ["copy_on_write", "rewrite"] as const)
+		test(`unknown-field edit after preparation stales ${action}`, async () => {
+			const target = withTools();
+			if (action === "copy_on_write") ref(target.messageId, "fork", 1);
+			sqlite.exec("ALTER TABLE narrator_messages ADD COLUMN new_unhandled_reference TEXT");
+			const update = sqlite.query(
+				"UPDATE narrator_messages SET new_unhandled_reference=? WHERE id=?",
+			);
+			update.run("old", target.messageId);
+			const token = await prepare(
+				{ kind: "tool_calls", toolCallIds: [target.tools[0]] },
+				action === "copy_on_write" ? "fork" : undefined,
+			);
+			// COW fixes every copied field; an in-place rewrite fixes the complete row length.
+			update.run(action === "copy_on_write" ? "new" : "longer", target.messageId);
+			expect(() => apply(token)).toThrow("Selected history changed");
+			expect(count("narrator_messages")).toBe(1);
+			expect(count("narrator_tool_calls")).toBe(2);
+		});
+	for (const table of ["narrator_messages", "narrator_tool_calls"])
+		for (const action of ["delete", "unlink", "rewrite"] as const)
+			test(`a missing known ${table} column rejects ${action}`, async () => {
+				const target = withTools();
+				if (action === "unlink") ref(target.messageId, "fork", 1);
+				sqlite.exec(
+					`ALTER TABLE ${table} DROP COLUMN ${table === "narrator_messages" ? "turn_usage_json" : "error_message"}`,
+				);
+				await expect(
+					prepare(
+						action === "rewrite"
+							? { kind: "tool_calls", toolCallIds: [target.tools[0]] }
+							: { kind: "all" },
+					),
+				).rejects.toMatchObject({ code: "REVERT_HISTORY_UNSUPPORTED_SCHEMA" });
+				expect(count("narrator_messages")).toBe(1);
+				expect(count("narrator_tool_calls")).toBe(2);
+				expect(version()).toBe(7);
+			});
 	test("SQL failure on second ref deletion rolls back first deletion and every other mutation", async () => {
 		const first = message(1);
 		const second = message(2);
