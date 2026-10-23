@@ -222,30 +222,27 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 					).map((r) => r.id),
 				).toEqual(newest);
 
-				for (const sort of ["time", "relevance", "invalid", undefined]) {
-					const params = new URLSearchParams({ q: query, entities: entity, limit: "2" });
+				// Over HTTP, messages surface as their sessions (one narrator per seeded hit).
+				// Narrator titles join sessions too, but a session's activity is its last
+				// message, which this corpus pins elsewhere on purpose.
+				const section = entity === "messages" ? "sessions" : null;
+				for (const sort of section ? ["time", "relevance", "invalid", undefined] : []) {
+					const params = new URLSearchParams({ q: query, sections: section ?? "", limit: "2" });
 					if (sort !== undefined) params.set("sort", sort);
 					const response = await searchApp.request(`/api/search?${params}`);
 					expect(response.status).toBe(200);
-					const body = (await response.json()) as { results: { id: string }[] };
-					const expected =
-						sort === "time"
-							? newest
-							: (
-									await searchService.search({
-										query,
-										entities: [entity],
-										limit: 2,
-										principal: TIME_VIEWER,
-									})
-								).map((r) => r.id);
-					expect(body.results.map((r) => r.id)).toEqual(expected);
+					const body = (await response.json()) as {
+						sections: Record<string, { items: { id: string }[] }>;
+					};
+					const ids = body.sections[section ?? ""].items.map((r) => r.id);
+					expect(ids).toHaveLength(2);
+					if (sort === "time") expect(ids).toEqual(newest.map((id) => `narr-${id}`));
 				}
 			});
 		}
 	}
 
-	it("all entity results interleave by time rather than putting narrators first", async () => {
+	it("session matches by title and by message interleave by time", async () => {
 		for (const [id, time] of [
 			["n-all-old", "2026-01-01"],
 			["n-all-mid", "2026-09-03"],
@@ -280,20 +277,19 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 				.run();
 		}
 		for (const query of ["PR", "chronometer"]) {
-			const response = await searchApp.request(`/api/search?q=${query}&sort=time`);
+			const response = await searchApp.request(
+				`/api/search?q=${query}&sort=time&sections=sessions`,
+			);
 			expect(response.status).toBe(200);
-			const body = (await response.json()) as { results: { id: string; type: string }[] };
-			expect(body.results.map((r) => r.id)).toEqual([
-				"m-all-new",
-				"n-all-mid",
-				"m-all-mid",
-				"n-all-old",
-			]);
-			expect(body.results.map((r) => r.type)).toEqual([
-				"message",
-				"narrator",
-				"message",
-				"narrator",
+			const body = (await response.json()) as {
+				sections: { sessions: { items: { id: string; titleMatch: boolean }[] } };
+			};
+			// Title matches and message matches interleave by activity in one section.
+			expect(body.sections.sessions.items.map((r) => [r.id, r.titleMatch])).toEqual([
+				["narr-m-all-new", false],
+				["n-all-mid", true],
+				["narr-m-all-mid", false],
+				["n-all-old", true],
 			]);
 		}
 	});
@@ -781,11 +777,13 @@ describe("global search content scope over HTTP", () => {
 				.run();
 		}
 		const ids = async (include?: string) => {
-			const params = new URLSearchParams({ q: "quokka", entities: "messages" });
+			const params = new URLSearchParams({ q: "quokka", sections: "sessions" });
 			if (include !== undefined) params.set("include", include);
 			const response = await searchApp.request(`/api/search?${params}`);
-			const body = (await response.json()) as { results: { id: string }[] };
-			return body.results.map((r) => r.id).sort();
+			const body = (await response.json()) as {
+				sections: { sessions: { items: { id: string; hits: { id: string }[] }[] } };
+			};
+			return body.sections.sessions.items.flatMap((r) => r.hits.map((hit) => hit.id)).sort();
 		};
 		expect(await ids()).toEqual([]);
 		expect(await ids("subagents")).toEqual(["m-scope-sub"]);

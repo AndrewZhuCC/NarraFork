@@ -146,6 +146,21 @@ export interface EntitySearchQuery {
 	/** Which conversation content message and narrator hits may come from. Omitted means
 	 *  {@link FULL_MESSAGE_SCOPE}. */
 	scope?: MessageSearchScope;
+	/** Narrowing filters; values are always bound, never interpolated. */
+	filters?: SearchFilters;
+}
+
+/**
+ * Narrowing filters for global search. Time bounds are inclusive ISO strings compared against
+ * the entity's activity time: a message's creation, a narrator's last activity.
+ */
+export interface SearchFilters {
+	/** The narrator's project, by the `resolveNarratorProjectId` rule. */
+	projectId?: string;
+	from?: string;
+	to?: string;
+	/** Only narrators this user owns. */
+	ownerUserId?: string;
 }
 
 /**
@@ -163,6 +178,8 @@ export interface MessageSearchScope {
 	system: boolean;
 	/** Tool calls and their results. */
 	tools: boolean;
+	/** Archived narrators. */
+	archived: boolean;
 }
 
 /** Everything, which is what global search matched before scopes existed. */
@@ -170,6 +187,7 @@ export const FULL_MESSAGE_SCOPE: MessageSearchScope = Object.freeze({
 	subagents: true,
 	system: true,
 	tools: true,
+	archived: true,
 });
 
 /** The global search default: what people wrote and read in primary sessions. */
@@ -177,7 +195,26 @@ export const CONVERSATION_MESSAGE_SCOPE: MessageSearchScope = Object.freeze({
 	subagents: false,
 	system: false,
 	tools: false,
+	archived: false,
 });
+
+/**
+ * Message hits rolled up per narrator, for session-level global search.
+ *
+ * `query.limit` caps the number of narrators returned. Rows come best first: by best hit
+ * rank for relevance (then by hit count and recency), by latest hit for time. Every hit the
+ * narrator has counts, not only those within a window.
+ */
+export type SessionAggregateQuery = EntitySearchQuery;
+
+/** The top hits of each of a few narrators. */
+export interface SessionHitsQuery extends EntitySearchQuery {
+	/** The narrators to read hits for; a bounded page, not a corpus. */
+	narratorIds: readonly string[];
+	/** Hits returned per narrator, after skipping `offset` of them. */
+	perSession: number;
+	offset?: number;
+}
 
 /**
  * Search inside one narrator's own timeline.
@@ -294,6 +331,10 @@ export interface MessageSearchRow {
 export interface NarratorSearchRow {
 	id: string;
 	title: string | null;
+	type: string | null;
+	subagentType: string | null;
+	/** The narrator's project id, by the same rule as {@link MessageSearchRow.projectName}. */
+	projectId: string | null;
 	/** See {@link MessageSearchRow.projectName}. */
 	projectName: string | null;
 	status: string | null;
@@ -303,6 +344,24 @@ export interface NarratorSearchRow {
 	updatedAt: string | null;
 	snippet: string;
 	rank: RelevanceRank;
+}
+
+/** One narrator's message hits, with what a session result needs to show it. */
+export interface SessionAggregateRow {
+	narratorId: string;
+	/** Best (lowest) relevance rank among the hits; null on the substring path. */
+	bestRank: RelevanceRank;
+	hitCount: number;
+	lastHitAt: string | null;
+	title: string | null;
+	type: string | null;
+	subagentType: string | null;
+	status: string | null;
+	projectId: string | null;
+	projectName: string | null;
+	lastMessageAt: string | null;
+	createdAt: string | null;
+	updatedAt: string | null;
 }
 
 export interface TimelineSearchRow {

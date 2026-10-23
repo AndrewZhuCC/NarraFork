@@ -42,7 +42,10 @@ import type {
 	OpencodeUsageCache,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
-	SearchResponse,
+	SearchRequest,
+	SearchSectionName,
+	SearchSectionsResponse,
+	SessionHitsResponse,
 	StorageCategoryKey,
 	StorageScanJobState,
 	StorageScanResult,
@@ -64,6 +67,20 @@ export interface WorkspaceDetail extends ApiEntity {
 }
 
 /** Server code for a layout save that lost a race against another session. */
+/** Query string for a global-search request; empty and default values stay out of it. */
+export function searchParams(query: SearchRequest): URLSearchParams {
+	const params = new URLSearchParams({ q: query.q });
+	if (query.sort === "time") params.set("sort", "time");
+	if (query.include?.length) params.set("include", query.include.join(","));
+	if (query.projectId) params.set("projectId", query.projectId);
+	if (query.from) params.set("from", query.from);
+	if (query.to) params.set("to", query.to);
+	if (query.mine) params.set("mine", "1");
+	if (query.cursor) params.set("cursor", query.cursor);
+	if (query.limit) params.set("limit", String(query.limit));
+	return params;
+}
+
 export const WORKSPACE_LAYOUT_CONFLICT_CODE = "WORKSPACE_LAYOUT_CONFLICT";
 
 /**
@@ -110,18 +127,20 @@ export const miscApi = {
 		),
 
 	// Search
-	search: (
-		q: string,
-		entities = "messages",
-		sort?: "time" | "relevance",
+	/** Sectioned global search; a cursor continues one section, so pass exactly one. */
+	searchSections: (
+		query: SearchRequest,
+		sections: readonly SearchSectionName[],
 		signal?: AbortSignal,
-		/** Conversation content beyond the default: `subagents`, `system`, `tools`. */
-		include: readonly string[] = [],
-	) =>
-		request<SearchResponse>(
-			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}${
-				include.length ? `&include=${include.join(",")}` : ""
-			}`,
+	) => {
+		const params = searchParams(query);
+		params.set("sections", sections.join(","));
+		return request<SearchSectionsResponse>(`/search?${params}`, { signal });
+	},
+	/** More hits of one session, for expanding its result card. */
+	searchSessionHits: (narratorId: string, query: SearchRequest, signal?: AbortSignal) =>
+		request<SessionHitsResponse>(
+			`/search/sessions/${encodeURIComponent(narratorId)}/hits?${searchParams(query)}`,
 			{ signal },
 		),
 

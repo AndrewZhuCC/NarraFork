@@ -558,6 +558,52 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						check(`messages index tokens owner (${backend})`, ids(ownerRows), ["m1"]);
 					}
 
+					// ── sessions: hits rolled up per narrator, gated and filtered ─────────
+					const sessionIds = (rows: readonly { narratorId: string; hitCount: number }[]) =>
+						rows.map((r) => `${r.narratorId}:${r.hitCount}`).sort();
+					for (const [label, query, expected] of [
+						["index auth owner", entity("auth", "index", OWNER), ["n1:1", "n2:1"]],
+						["index auth stranger", entity("auth", "index", STRANGER), ["n2:1"]],
+						["substring 充电", entity("充电", "substring"), ["n2:1"]],
+						[
+							"index auth in project p2",
+							{ ...entity("auth", "index", OWNER), filters: { projectId: "p2" } },
+							["n2:1"],
+						],
+						[
+							"index auth owned by a stranger",
+							{ ...entity("auth", "index", OWNER), filters: { ownerUserId: "u-stranger" } },
+							[],
+						],
+						[
+							"index auth after the fixture's time",
+							{ ...entity("auth", "index", OWNER), filters: { from: "2027-01-01T00:00:00.000Z" } },
+							[],
+						],
+					] as const) {
+						const [a, b] = await Promise.all([
+							lite.searchSessionAggregates(query),
+							store.searchSessionAggregates(query),
+						]);
+						check(`session aggregates ${label} (sqlite)`, sessionIds(a), expected);
+						check(`session aggregates ${label} (postgres)`, sessionIds(b), expected);
+					}
+					for (const [label, viewer, expected] of [
+						["owner", OWNER, ["m1", "m2"]],
+						["stranger", STRANGER, ["m2"]],
+					] as const) {
+						const query = {
+							...entity("auth", "index", viewer),
+							narratorIds: ["n1", "n2"],
+							perSession: 3,
+						};
+						const [a, b] = await Promise.all([
+							lite.searchSessionHits(query),
+							store.searchSessionHits(query),
+						]);
+						check(`session hits auth ${label} (sqlite)`, ids(a), expected);
+						check(`session hits auth ${label} (postgres)`, ids(b), expected);
+					}
 					// ── timeline: own refs and an inherited fork scope ────────────────────
 					const timelineCases: [string, TimelineSearchQuery, string[]][] = [
 						[

@@ -38,7 +38,14 @@ import { ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { narratorProjectIdText } from "../read/acl-sql";
 import type { SearchStore } from "./port";
-import { blockScopeSql, messageScopeSql, narratorScopeSql, scopeKey } from "./scope";
+import {
+	type BoundSql,
+	blockScopeSql,
+	filterSql,
+	messageScopeSql,
+	narratorScopeSql,
+	scopeKey,
+} from "./scope";
 import {
 	escapedContains,
 	phraseExpr,
@@ -61,6 +68,9 @@ import {
 	RECALL_SNIPPET,
 	type RecallMessageRow,
 	type RecallSearchQuery,
+	type SessionAggregateQuery,
+	type SessionAggregateRow,
+	type SessionHitsQuery,
 	type ShadowedEntryQuery,
 	TIMELINE_SNIPPET,
 	type TimelineSearchQuery,
@@ -126,6 +136,9 @@ function mergeBlockHits<T extends { blockId?: string }>(
 	return [...merged.values()].sort(order).slice(0, limit);
 }
 
+/** Characters of context a substring-path session excerpt keeps before the match. */
+const SUBSTRING_LEAD = 60;
+
 /** Binary string order, as SQLite compares TEXT. */
 function compareText(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
@@ -157,8 +170,9 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			  m.role as message_role, m.created_at,
 			  n.title as narrator_title, n.model, p.name as project_name`;
 
-	const NARRATOR_COLUMNS = `n.id, n.title, n.status, n.model, n.message_count,
-			  n.last_message_at, n.created_at, n.updated_at, p.name as project_name`;
+	const NARRATOR_COLUMNS = `n.id, n.title, n.type, n.subagent_type, n.status, n.model,
+			  n.message_count, n.last_message_at, n.created_at, n.updated_at,
+			  p.id as project_id, p.name as project_name`;
 
 	const KNOWLEDGE_ENTRY_COLUMNS = `e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
 				  e.created_at, e.updated_at`;
@@ -168,10 +182,11 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		gated: boolean,
 		sort: EntitySearchQuery["sort"],
 		scope: MessageSearchScope | undefined,
+		filter: BoundSql,
 	): QueryTemplate {
-		const key = `messages:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}`;
+		const key = `messages:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}:${filter.key}`;
 		return cached(key, () => {
-			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${messageScopeSql(scope)}`;
+			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${messageScopeSql(scope)} ${filter.sql}`;
 			if (strategy === "index") {
 				return `SELECT ${MESSAGE_COLUMNS},
 			  ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)} as snippet,
@@ -201,10 +216,11 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		gated: boolean,
 		sort: EntitySearchQuery["sort"],
 		scope: MessageSearchScope | undefined,
+		filter: BoundSql,
 	): QueryTemplate {
-		const key = `messages:blocks:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}`;
+		const key = `messages:blocks:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}:${filter.key}`;
 		return cached(key, () => {
-			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${blockScopeSql(scope)}`;
+			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${blockScopeSql(scope)} ${filter.sql}`;
 			return `SELECT ${MESSAGE_COLUMNS}, b.id as block_id,
 			  rank as rank_score
 			 FROM narrator_blocks_fts
@@ -222,10 +238,11 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		gated: boolean,
 		sort: EntitySearchQuery["sort"],
 		scope: MessageSearchScope | undefined,
+		filter: BoundSql,
 	): QueryTemplate {
-		const key = `narrators:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}`;
+		const key = `narrators:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}:${filter.key}`;
 		return cached(key, () => {
-			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${narratorScopeSql(scope)}`;
+			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${narratorScopeSql(scope)} ${filter.sql}`;
 			if (strategy === "index") {
 				return `SELECT ${NARRATOR_COLUMNS},
 			  ${snippetCall("narrators_fts", 0, GLOBAL_SNIPPET)} as snippet,
@@ -477,6 +494,99 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────────
+	// Session search: message hits rolled up per narrator
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * `WITH …` defining `per_msg`: one row per matching message (id, narrator_id, created_at,
+	 * r, block_id), gated, scoped and filtered, plus the values its placeholders bind in order.
+	 *
+	 * The index path reads both the envelope index and the block index; a message matched by
+	 * both counts once, keeping its best rank and naming one matching block. `extra` narrows
+	 * further (the narrator page of a hits query) and comes with its own values.
+	 */
+	function sessionHitsCte(
+		query: EntitySearchQuery,
+		extra: { sql: string; values: readonly string[] } = { sql: "", values: [] },
+	): { sql: string; values: Array<string | number> } {
+		const gated = !query.viewer.isAdmin;
+		const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
+		const gateValues = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
+		const filter = filterSql(query.filters, "message");
+		const tail = [...gateValues, ...filter.values, ...extra.values];
+		if (query.strategy !== "index") {
+			return {
+				sql: `WITH per_msg AS (
+				SELECT m.id, m.narrator_id, m.created_at, NULL AS r, NULL AS block_id
+				 FROM narrator_messages m
+				 JOIN narrators n ON n.id = m.narrator_id
+				 WHERE m.content_text LIKE ? ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
+			)`,
+				values: [rawContains(query.text), ...tail],
+			};
+		}
+		const needle = phraseExpr(query.text);
+		return {
+			sql: `WITH hits AS (
+				SELECT m.id, m.narrator_id, m.created_at, narrator_messages_fts.rank AS r, NULL AS block_id
+				 FROM narrator_messages_fts
+				 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+				 JOIN narrators n ON n.id = m.narrator_id
+				 WHERE narrator_messages_fts MATCH ? ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
+				UNION ALL
+				SELECT m.id, m.narrator_id, m.created_at, narrator_blocks_fts.rank AS r, b.id AS block_id
+				 FROM narrator_blocks_fts
+				 JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
+				 JOIN narrator_messages m ON m.id = b.message_id
+				 JOIN narrators n ON n.id = m.narrator_id
+				 WHERE narrator_blocks_fts MATCH ? ${gate} ${blockScopeSql(query.scope)} ${filter.sql} ${extra.sql}
+			), per_msg AS (
+				SELECT id, narrator_id, MAX(created_at) AS created_at, MIN(r) AS r, MIN(block_id) AS block_id
+				 FROM hits GROUP BY id, narrator_id
+			)`,
+			values: [needle, ...tail, needle, ...tail],
+		};
+	}
+
+	/** Excerpt for a session hit: FTS5's own on the index path, a window around the first
+	 *  occurrence on the substring path. Returns SQL plus its values, in textual order. */
+	function sessionSnippet(query: EntitySearchQuery): { sql: string; values: string[] } {
+		if (query.strategy === "index") {
+			return {
+				sql: `(SELECT ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)}
+				 FROM narrator_messages_fts
+				 WHERE narrator_messages_fts MATCH ? AND narrator_messages_fts.rowid = m.rowid)`,
+				values: [phraseExpr(query.text)],
+			};
+		}
+		const at = "instr(lower(m.content_text), lower(?))";
+		return {
+			sql: `CASE WHEN ${at} > ${SUBSTRING_LEAD}
+				 THEN '...' || substr(m.content_text, ${at} - ${SUBSTRING_LEAD}, ${PREVIEW_CHARS})
+				 ELSE substr(m.content_text, 1, ${PREVIEW_CHARS}) END`,
+			values: [query.text, query.text],
+		};
+	}
+
+	function toSessionAggregate(row: RawRow, strategy: "index" | "substring"): SessionAggregateRow {
+		return {
+			narratorId: row.narrator_id,
+			bestRank: rankOf({ rank_score: row.best_rank }, strategy),
+			hitCount: Number(row.hit_count) || 0,
+			lastHitAt: row.last_hit_at ?? null,
+			title: row.title ?? null,
+			type: row.type ?? null,
+			subagentType: row.subagent_type ?? null,
+			status: row.status ?? null,
+			projectId: row.project_id ?? null,
+			projectName: row.project_name ?? null,
+			lastMessageAt: row.last_message_at ?? null,
+			createdAt: row.created_at ?? null,
+			updatedAt: row.updated_at ?? null,
+		};
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────────
 	// Row mappers for the entity searches
 	// ─────────────────────────────────────────────────────────────────────────────
 
@@ -491,9 +601,13 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 		async searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]> {
 			const gated = !query.viewer.isAdmin;
-			const stmt = messageStmt(query.strategy, gated, query.sort, query.scope);
+			const filter = filterSql(query.filters, "message");
+			const stmt = messageStmt(query.strategy, gated, query.sort, query.scope, filter);
 			const options = { signal: query.signal, operation: "searchMessages" };
-			const gate = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
+			const gate = [
+				...(gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : []),
+				...filter.values,
+			];
 			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
 			const rows: RawRow[] = await stmt.all(options, needle, ...gate, query.limit);
 			const toRow = (row: RawRow): MessageSearchRow => ({
@@ -510,12 +624,12 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				...(row.block_id ? { blockId: row.block_id } : {}),
 			});
 			if (query.strategy !== "index") return rows.map(toRow);
-			const blockRows: RawRow[] = await messageBlockStmt(gated, query.sort, query.scope).all(
-				options,
-				needle,
-				...gate,
-				query.limit,
-			);
+			const blockRows: RawRow[] = await messageBlockStmt(
+				gated,
+				query.sort,
+				query.scope,
+				filter,
+			).all(options, needle, ...gate, query.limit);
 			return mergeBlockHits(
 				rows.map(toRow),
 				blockRows.map(toRow),
@@ -529,14 +643,21 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 		async searchNarrators(query: EntitySearchQuery): Promise<NarratorSearchRow[]> {
 			const gated = !query.viewer.isAdmin;
-			const stmt = narratorStmt(query.strategy, gated, query.sort, query.scope);
+			const filter = filterSql(query.filters, "narrator");
+			const stmt = narratorStmt(query.strategy, gated, query.sort, query.scope, filter);
 			const options = { signal: query.signal, operation: "searchNarrators" };
-			const gate = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
+			const gate = [
+				...(gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : []),
+				...filter.values,
+			];
 			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
 			const rows: RawRow[] = await stmt.all(options, needle, ...gate, query.limit);
 			return rows.map((row) => ({
 				id: row.id,
 				title: row.title ?? null,
+				type: row.type ?? null,
+				subagentType: row.subagent_type ?? null,
+				projectId: row.project_id ?? null,
 				projectName: row.project_name ?? null,
 				status: row.status ?? null,
 				model: row.model ?? null,
@@ -545,6 +666,76 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				updatedAt: row.updated_at ?? null,
 				snippet: row.snippet ?? "",
 				rank: rankOf(row, query.strategy),
+			}));
+		},
+
+		async searchSessionAggregates(query: SessionAggregateQuery): Promise<SessionAggregateRow[]> {
+			const cte = sessionHitsCte(query);
+			const order =
+				query.sort === "time"
+					? "agg.last_hit_at DESC, agg.narrator_id ASC"
+					: "agg.best_rank IS NULL, agg.best_rank ASC, agg.hit_count DESC, agg.last_hit_at DESC, agg.narrator_id ASC";
+			const rows: RawRow[] = await execute(
+				`${cte.sql}, agg AS (
+				SELECT narrator_id, MIN(r) AS best_rank, COUNT(*) AS hit_count, MAX(created_at) AS last_hit_at
+				 FROM per_msg GROUP BY narrator_id
+			)
+			SELECT agg.narrator_id, agg.best_rank, agg.hit_count, agg.last_hit_at,
+				  n.title, n.type, n.subagent_type, n.status, n.last_message_at,
+				  n.created_at, n.updated_at, p.id AS project_id, p.name AS project_name
+			 FROM agg
+			 JOIN narrators n ON n.id = agg.narrator_id
+			 ${PROJECT_JOIN}
+			 ORDER BY ${order}
+			 LIMIT ?`,
+				[...cte.values, query.limit],
+				{ signal: query.signal, operation: "searchSessionAggregates" },
+			);
+			return rows.map((row) => toSessionAggregate(row, query.strategy));
+		},
+
+		async searchSessionHits(query: SessionHitsQuery): Promise<MessageSearchRow[]> {
+			const ids = query.narratorIds.filter((id) => NARRATOR_ID_PATTERN.test(id));
+			if (ids.length === 0) return [];
+			// The id list varies per page, so this statement is not cached; ids are bound.
+			const cte = sessionHitsCte(query, {
+				sql: `AND m.narrator_id IN (${ids.map(() => "?").join(", ")})`,
+				values: ids,
+			});
+			const order =
+				query.sort === "time"
+					? "created_at DESC, id ASC"
+					: "r IS NULL, r ASC, created_at DESC, id ASC";
+			const snippet = sessionSnippet(query);
+			const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+			const rows: RawRow[] = await execute(
+				`${cte.sql}, ranked AS (
+				SELECT per_msg.*, ROW_NUMBER() OVER (PARTITION BY narrator_id ORDER BY ${order}) AS rn
+				 FROM per_msg
+			)
+			SELECT ${MESSAGE_COLUMNS}, ranked.block_id, ranked.r AS rank_score,
+				  ${snippet.sql} AS snippet
+			 FROM ranked
+			 JOIN narrator_messages m ON m.id = ranked.id
+			 JOIN narrators n ON n.id = m.narrator_id
+			 ${PROJECT_JOIN}
+			 WHERE ranked.rn > ? AND ranked.rn <= ?
+			 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
+				[...cte.values, ...snippet.values, offset, offset + query.perSession],
+				{ signal: query.signal, operation: "searchSessionHits" },
+			);
+			return rows.map((row) => ({
+				id: row.id,
+				narratorId: row.narrator_id ?? null,
+				narratorTitle: row.narrator_title ?? null,
+				projectName: row.project_name ?? null,
+				model: row.model ?? null,
+				messageRole: row.message_role ?? null,
+				createdAt: row.created_at ?? null,
+				snippet: row.snippet ?? "",
+				preview: row.content_preview ?? "",
+				rank: rankOf(row, query.strategy),
+				...(row.block_id ? { blockId: row.block_id } : {}),
 			}));
 		},
 
