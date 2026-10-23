@@ -267,6 +267,41 @@ describe("Recall result presentation", () => {
 		expect(ids).toEqual(["msg-short"]);
 	});
 
+	// Each term matches on its own; a term too short for the index filters the indexed ones.
+	it("narrows an indexed term by a 2-char term", async () => {
+		seedMessage({
+			id: "msg-login",
+			ownerId: "narr-self",
+			refFor: ["narr-self"],
+			text: "refresh 后登录失败",
+			createdAt: EARLY,
+			seq: 2,
+		});
+		seedMessage({
+			id: "msg-other",
+			ownerId: "narr-self",
+			refFor: ["narr-self"],
+			text: "refresh 之后正常",
+			createdAt: EARLY,
+			seq: 3,
+		});
+		expect((await recallSearch("narr-self", { query: "refresh 登录" })).ids).toEqual(["msg-login"]);
+		expect((await recallSearch("narr-self", { query: "refresh 注销" })).ids).toEqual([]);
+	});
+
+	it("matches several short terms apart, not as one phrase", async () => {
+		seedMessage({
+			id: "msg-apart",
+			ownerId: "narr-self",
+			refFor: ["narr-self"],
+			text: "登录之后一直失败",
+			createdAt: EARLY,
+			seq: 2,
+		});
+		const { ids } = await recallSearch("narr-self", { query: "登录 失败", all_narrators: true });
+		expect(ids).toEqual(["msg-apart"]);
+	});
+
 	it("reports an empty result for a query that sanitizes away", async () => {
 		const { ids, isError } = await recallSearch("narr-self", { query: "***" });
 		expect(ids).toEqual([]);

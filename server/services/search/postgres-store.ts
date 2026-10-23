@@ -710,14 +710,15 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					snippet: markSnippet(str(row, "snippet"), terms, RECALL_SNIPPET),
 				}));
 			}
-			const needle = params.add(rawContains(query.text));
+			const preview = params.add(query.previewChars);
+			const contains = globalClause(["m.content_text"], query.text, params);
 			rows = await run(
 				`SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
 					n.title AS narrator_title,
-					substr(m.content_text, 1, ${params.add(query.previewChars)}) AS snippet
+					substr(m.content_text, 1, ${preview}) AS snippet
 				 FROM narrator_messages m
 				 ${source}
-				 WHERE m.content_text ILIKE ${needle}${scopeFilter}${timeSuffix}
+				 WHERE ${contains}${scopeFilter}${timeSuffix}
 				 ORDER BY m.created_at DESC
 				 LIMIT ${params.add(query.limit)}`,
 				params,

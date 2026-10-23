@@ -2,7 +2,7 @@ import type { Statement } from "bun:sqlite";
 import { z } from "zod/v4";
 import { sqlite } from "../../../db";
 import { searchStore } from "../../../services/search/backend";
-import { canUseIndex, sanitizeQuery } from "../../../services/search/query";
+import { globalStrategy, sanitizeQuery } from "../../../services/search/query";
 import type { RecallMessageRow } from "../../../services/search/types";
 import { isBashToolName } from "../tool-name";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -496,7 +496,7 @@ async function handleSearch(
 
 	const rows: RecallMessageRow[] = await searchStore.searchRecallMessages({
 		text: safeQuery,
-		strategy: canUseIndex(safeQuery) ? "index" : "substring",
+		strategy: globalStrategy(safeQuery),
 		limit: cap,
 		// `null` widens the search to every narrator. The tool's permission flow has already
 		// approved that before this point; scoped mode resolves through the narrator's own
