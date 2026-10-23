@@ -1,4 +1,8 @@
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import {
+	mapRowElements,
+	messageBody,
+	splitRowBlocks,
+} from "@shared/narrator-blocks/message-blocks";
 import {
 	appendSourceText,
 	createSourceText,
@@ -666,7 +670,7 @@ export function buildTopLevelStreamingChunksMsg(
 		narratorId,
 		parentToolUseId: null,
 		role: "assistant",
-		contentJson: blocks,
+		blocks: splitRowBlocks({ id: STREAMING_CHUNKS_MSG_ID, role: "assistant" }, blocks),
 		contentText: null,
 		toolCalls,
 		createdAt: createdAt ?? new Date().toISOString(),
@@ -742,24 +746,23 @@ export function preserveLiveSubagentActivity(
 		changed = true;
 		return { ...toolCall, _subagentActivity: activity };
 	});
-	const contentJson = (incoming.contentJson ?? []).map((block) => {
+	const withContent = mapRowElements(incoming, (block) => {
 		if (block.type !== "tool_use" || typeof block.id !== "string") return block;
 		const activity = mergeSubagentActivity(
 			existingActivities.get(block.id),
 			block._subagentActivity,
 		);
 		if (activity === block._subagentActivity) return block;
-		changed = true;
 		return { ...block, _subagentActivity: activity };
 	});
-	return changed ? { ...incoming, toolCalls, contentJson } : incoming;
+	return changed || withContent !== incoming ? { ...withContent, toolCalls } : incoming;
 }
 
 /**
  * Find the tool-use id of the LAST spec://tasks.json operation across an ordered
  * message list (Read/Write/Edit). Only this snapshot reflects the live task
  * state, so SpecTasksDetail animates a "doing" row only on this card. Scans both
- * the assistant `contentJson` tool_use blocks and the `toolCalls` records, in
+ * the assistant's tool_use elements and the `toolCalls` records, in
  * message order, and returns the id seen last. Returns null when there is none.
  */
 export function findLatestSpecTasksToolUseId(messages: NarratorMsg[]): string | null {

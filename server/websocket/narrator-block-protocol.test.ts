@@ -21,16 +21,18 @@ const { broadcastToNarrator, getNarratorConnections, handleNarratorWS } = await 
 const protocol = await import("./narrator-block-protocol");
 const { decodeBlockFrame } = await import("@frontend/lib/block-protocol");
 
-/** A decoded value without the block sidecar the client adds to every row. */
-function withoutBlockRefs<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value), (key, field) =>
-		key === "blockRefs" ? undefined : field,
-	);
+/** A decoded value with each row's body back as the elements its blocks hold. */
+function withBodies<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value), (_key, field) => {
+		if (!field || typeof field !== "object" || !Array.isArray(field.blocks)) return field;
+		const { blocks, ...row } = field as { blocks: Array<{ elements: unknown[] }> };
+		return { ...row, contentJson: blocks.flatMap((block) => block.elements) };
+	});
 }
 
-/** What a v2 client's decoder makes of one v1 broadcast. */
+/** What a client's decoder makes of one broadcast, as the row it was built from. */
 const roundTrip = (frame: Parameters<typeof protocol.toBlockFrames>[0]) =>
-	withoutBlockRefs(
+	withBodies(
 		protocol
 			.toBlockFrames(frame)
 			.flatMap((item) => decodeBlockFrame(item as unknown as Record<string, unknown>)),
@@ -347,6 +349,6 @@ describe("the client's decoder", () => {
 			messageVersion: 4,
 		};
 		const decoded = decodeBlockFrame(protocol.toBlockCatchUp(frame));
-		expect(withoutBlockRefs(decoded)).toEqual([JSON.parse(JSON.stringify(frame))]);
+		expect(withBodies(decoded)).toEqual([JSON.parse(JSON.stringify(frame))]);
 	});
 });

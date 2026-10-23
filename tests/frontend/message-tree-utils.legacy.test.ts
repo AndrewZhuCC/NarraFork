@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	buildToolUseIndex,
 	insertChildIntoCache,
@@ -51,7 +52,7 @@ describe("message-tree-utils legacy behavior", () => {
 		expect(msg.toolCalls[0].status).toBe("success");
 		expect(msg.toolCalls[0].outputJson).toEqual({ ok: true });
 
-		const block = msg.contentJson.find((b) => b.type === "tool_use" && b.id === "tu-parent");
+		const block = messageBody(msg).find((b) => b.type === "tool_use" && b.id === "tu-parent");
 		expect(block?.status).toBe("success");
 		expect(block?.outputJson).toEqual({ ok: true });
 	});

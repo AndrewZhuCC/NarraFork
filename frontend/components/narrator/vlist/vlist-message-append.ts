@@ -27,16 +27,22 @@
  * Pure: no React, no DOM, no network.
  */
 
+import {
+	type BlockSourceMessage,
+	type MessageBodySource,
+	mapRowElements,
+	messageBody,
+	withoutBody,
+} from "@shared/narrator-blocks/message-blocks";
 import { mergeToolRecordWithSubagentActivity } from "../message/message-tree-utils";
 import { contentBlockIdentity } from "../streaming/streaming-block-supersede";
 
 /** The subset of a message this module reads. */
-export interface AppendCandidate {
+export interface AppendCandidate extends MessageBodySource {
 	id?: unknown;
 	seq?: unknown;
 	role?: unknown;
 	parentToolUseId?: unknown;
-	contentJson?: unknown;
 	children?: readonly unknown[];
 	toolCalls?: readonly unknown[];
 	deliveryId?: unknown;
@@ -80,10 +86,12 @@ export type AppendDecision = { append: true } | { append: false; reason: AppendR
  */
 const STRUCTURAL_BLOCK_TYPES = new Set(["ask_in_passing", "context_cleared"]);
 
+/** The candidate as the block accessors read it. */
+const asRow = (message: AppendCandidate) =>
+	message as unknown as BlockSourceMessage<Record<string, unknown>>;
+
 function hasStructuralBlock(message: AppendCandidate): boolean {
-	const blocks = message.contentJson;
-	if (!Array.isArray(blocks)) return false;
-	for (const block of blocks) {
+	for (const block of messageBody(asRow(message))) {
 		const type = (block as { type?: unknown } | null)?.type;
 		if (typeof type === "string" && STRUCTURAL_BLOCK_TYPES.has(type)) return true;
 	}
@@ -172,22 +180,23 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 	if (sameId >= 0) {
 		if (loaded[sameId] === message) return { messages: loaded, changed: false, appended: false };
 		const previous = loaded[sameId];
-		let contentJson = message.contentJson;
-		if (Array.isArray(contentJson) && Array.isArray(previous.contentJson)) {
+		const previousBody = messageBody(asRow(previous));
+		let incoming = message;
+		if (previousBody.length > 0) {
 			const revisions = new Map(
-				previous.contentJson.flatMap((block) => {
+				previousBody.flatMap((block) => {
 					const identity = block && typeof block === "object" ? contentBlockIdentity(block) : null;
 					return identity ? [[identity.id, { block, revision: identity.revision }] as const] : [];
 				}),
 			);
 			const previousTools = new Map(
-				previous.contentJson.flatMap((block) => {
+				previousBody.flatMap((block) => {
 					const candidate = block as { type?: unknown; id?: unknown } | null;
 					if (candidate?.type !== "tool_use" || typeof candidate.id !== "string") return [];
 					return [[candidate.id, block] as const];
 				}),
 			);
-			contentJson = contentJson.map((block) => {
+			incoming = mapRowElements(asRow(message), (block) => {
 				const identity = block && typeof block === "object" ? contentBlockIdentity(block) : null;
 				const existing = identity ? revisions.get(identity.id) : undefined;
 				if (existing && identity && existing.revision > identity.revision) return existing.block;
@@ -202,7 +211,7 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 					}
 				}
 				return block;
-			});
+			}) as unknown as T;
 		}
 		const previousToolCalls = new Map(
 			(Array.isArray(previous.toolCalls) ? previous.toolCalls : []).map((call) => {
@@ -221,11 +230,11 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 			: previous.toolCalls;
 		const messages = [...loaded];
 		messages[sameId] = {
-			...previous,
-			...message,
+			// The body is the incoming one, never the previous row's.
+			...withoutBody(previous),
 			// Same-block replay cannot roll an acknowledged revision backwards. Missing
 			// blocks still follow the incoming snapshot (explicit rollback/edit semantics).
-			contentJson,
+			...incoming,
 			// Projection broadcasts intentionally omit aggregate children/tool calls; retain
 			// the already-loaded rich tree while still applying canonical body/state fields.
 			children: message.children?.length ? message.children : previous.children,

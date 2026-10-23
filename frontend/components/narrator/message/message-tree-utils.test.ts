@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	getDangerReflectionRequestIdInTree,
 	getNewestReflectionToolOccurrenceInTree,
@@ -128,7 +129,7 @@ describe("subagent activity reducers", () => {
 		});
 		const result = updateSubagentActivityInMessages([parent], "parent-tool", () => snapshot);
 		expect(result.changed).toBe(true);
-		expect(result.messages[0].contentJson[0]._subagentActivity).toEqual(snapshot);
+		expect(messageBody(result.messages[0])[0]._subagentActivity).toEqual(snapshot);
 		expect(result.messages[0].toolCalls[0]).toMatchObject({ _subagentActivity: snapshot });
 	});
 });
@@ -168,7 +169,7 @@ describe("message-tree-utils tool state parity", () => {
 			permissionDenyMessage: "Needs a smaller diff",
 			permissionDecisionReason: "user_feedback",
 		});
-		expect(result.messages[0].contentJson[1]).toMatchObject({
+		expect(messageBody(result.messages[0])[1]).toMatchObject({
 			type: "tool_use",
 			id: "tool-1",
 			status: "denied",
@@ -214,7 +215,7 @@ describe("message-tree-utils tool state parity", () => {
 			outputJson: output,
 			durationMs: 123,
 		});
-		expect(child.contentJson[0]).toMatchObject({
+		expect(messageBody(child)[0]).toMatchObject({
 			type: "tool_use",
 			id: "tool-nested",
 			status: "success",

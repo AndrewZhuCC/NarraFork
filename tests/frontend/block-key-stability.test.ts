@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	buildStreamingMsg,
 	clearToolBlockCache,
@@ -11,8 +12,8 @@ import type { ContentBlock } from "../../frontend/lib/api";
 
 type StreamingMsg = ReturnType<typeof buildStreamingMsg>;
 
-function getContentBlocks(msg: StreamingMsg): ContentBlock[] {
-	return msg?.contentJson ?? [];
+function getContentBlocks(msg: StreamingMsg): readonly ContentBlock[] {
+	return messageBody(msg);
 }
 
 function findContentBlock(msg: StreamingMsg, type: string): ContentBlock | undefined {

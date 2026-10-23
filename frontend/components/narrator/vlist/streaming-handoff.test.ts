@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { BaseContentBlock, TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isLiveStreamingBlock } from "@shared/pretext-layout/streaming-live-blocks";
 import {
 	projectPendingEmptyReasoning,
@@ -38,7 +39,7 @@ describe("block identity/revision handoff projection", () => {
 		}
 		const newer = projectStreamingDocument(committed, live([text("global-b", 4, "AB")], 0));
 		expect(newer).toHaveLength(2);
-		expect(newer[0].contentJson).toEqual([text("global-b", 4, "AB")]);
+		expect(messageBody(newer[0])).toEqual([text("global-b", 4, "AB")]);
 	});
 	it("keeps a different block even when the committed assistant ends in identical text", () => {
 		const streaming = live([text("new", 1)]);
@@ -47,9 +48,9 @@ describe("block identity/revision handoff projection", () => {
 	it("retires each tool independently, never the unrelated text-only remainder", () => {
 		const streaming = live([text("r1", 1), tool("t1"), tool("t2")]);
 		const afterFirst = projectStreamingMessage(streaming, [message([tool("t1")])]);
-		expect(afterFirst?.contentJson).toEqual([text("r1", 1), tool("t2")]);
+		expect(messageBody(afterFirst)).toEqual([text("r1", 1), tool("t2")]);
 		expect(
-			projectStreamingMessage(afterFirst, [message([tool("t1"), tool("t2")])])?.contentJson,
+			messageBody(projectStreamingMessage(afterFirst, [message([tool("t1"), tool("t2")])])),
 		).toEqual([text("r1", 1)]);
 	});
 	it("committed revision wins even when citation cleaning changed its text", () => {
@@ -59,9 +60,11 @@ describe("block identity/revision handoff projection", () => {
 			]),
 		).toBeNull();
 		expect(
-			projectStreamingMessage(live([text("b", 4, "RAW marker MORE")], 0), [
-				message([text("b", 3, "RAW")]),
-			])?.contentJson,
+			messageBody(
+				projectStreamingMessage(live([text("b", 4, "RAW marker MORE")], 0), [
+					message([text("b", 3, "RAW")]),
+				]),
+			),
 		).toEqual([text("b", 4, "RAW marker MORE")]);
 	});
 	it("merges a newer live revision into the real block, with no duplicated row or input mutation", () => {
@@ -73,9 +76,9 @@ describe("block identity/revision handoff projection", () => {
 			live([text("b", 2, "正文 continued"), text("new", 1, "NEW")], 0),
 		);
 		expect(document.map((m) => m.id)).toEqual(["a1", "__streaming__"]);
-		expect(document[0].contentJson).toEqual([text("b", 2, "正文 continued")]);
-		expect(document[1].contentJson).toEqual([text("new", 1, "NEW")]);
-		expect(committed[0].contentJson).toEqual([
+		expect(messageBody(document[0])).toEqual([text("b", 2, "正文 continued")]);
+		expect(messageBody(document[1])).toEqual([text("new", 1, "NEW")]);
+		expect(messageBody(committed[0])).toEqual([
 			{ ...text("b", 1), translatedText: "old translation", citations: [] },
 		]);
 	});
@@ -140,7 +143,7 @@ describe("pending empty reasoning display projection", () => {
 		expect(isLive(projected[0])).toBe(false);
 		expect(isLive(projected[1])).toBe(true);
 		expect(isLive(committed[1])).toBe(false);
-		expect(projected[1].contentJson).toBe(committed[1].contentJson);
+		expect(messageBody(projected[1])).toBe(messageBody(committed[1]));
 	});
 
 	it("stops on idle, interruption or failure (inactive session)", () => {

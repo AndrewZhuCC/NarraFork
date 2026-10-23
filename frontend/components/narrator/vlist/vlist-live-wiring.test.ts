@@ -28,6 +28,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ContentBlock } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
@@ -493,7 +494,7 @@ describe("live patches vs the structural reload", () => {
 	}
 
 	function loadedToolStatus(snapshot: { input?: { messages: readonly Msg[] } }): unknown {
-		const block = snapshot.input?.messages[0]?.contentJson?.find((b) => b.type === "tool_use");
+		const block = messageBody(snapshot.input?.messages[0])?.find((b) => b.type === "tool_use");
 		return (block as { status?: unknown } | undefined)?.status;
 	}
 });
@@ -552,7 +553,7 @@ describe("live event → patch field mapping", () => {
 	}
 
 	const block = (messages: readonly Msg[]) =>
-		messages[0]?.contentJson?.[0] as unknown as Record<string, unknown>;
+		messageBody(messages[0])?.[0] as unknown as Record<string, unknown>;
 
 	it("tool_completed writes status, output and duration onto the card", async () => {
 		const { toolCompletedPatch } = await import("./vlist-live-events");
@@ -1132,7 +1133,7 @@ describe("live event → patch field mapping", () => {
 		});
 		const result = patch([...old, ...live]);
 		expect(block(result.messages)._sendDeliveryTargets).toBeUndefined();
-		expect(result.messages[1].contentJson?.[0]).toHaveProperty("_sendDeliveryTargets");
+		expect(messageBody(result.messages[1])?.[0]).toHaveProperty("_sendDeliveryTargets");
 		expect(patch(old).changed).toBe(false);
 	});
 

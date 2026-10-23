@@ -16,6 +16,7 @@ import type {
 	TreeMessage,
 } from "@frontend/lib/api";
 import { sha256 as nobleSHA256 } from "@noble/hashes/sha2.js";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { projectDiffDocument } from "@shared/pretext-layout/diff-core";
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -125,7 +126,7 @@ describe("persisted Edit origin handoff", () => {
 		];
 		function assertRows(startLine: number) {
 			const row = messages[0].toolCalls?.[0];
-			const block = messages[0].contentJson?.[0] as unknown as typeof row;
+			const block = messageBody(messages[0])?.[0] as unknown as typeof row;
 			for (const record of [row, block]) {
 				if (!record) throw new Error("missing tool representation");
 				const detail = classifyToolDetail({
@@ -224,7 +225,7 @@ describe("persisted Edit origin handoff", () => {
 		if (!streamingEditOrigin) throw new Error("missing fixture origin");
 		function assertOrigin(messages: readonly TreeMessage[], line: number | undefined) {
 			const row = messages[0].toolCalls?.[0];
-			const block = messages[0].contentJson?.[0] as unknown as typeof row;
+			const block = messageBody(messages[0])?.[0] as unknown as typeof row;
 			for (const record of [row, block]) {
 				if (!record) throw new Error("missing tool");
 				const detail = classifyToolDetail({
@@ -299,7 +300,7 @@ describe("persisted Edit origin handoff", () => {
 			input: { file_path: "/a.ts", old_string: "other", new_string: "new" },
 		})(messages).messages;
 		expect(patched[0].toolCalls?.[0].inputJson).not.toHaveProperty("_streamingMetadata");
-		expect(patched[0].contentJson?.[0]).toMatchObject({ inputJson: { old_string: "other" } });
+		expect(messageBody(patched[0])?.[0]).toMatchObject({ inputJson: { old_string: "other" } });
 	});
 });
 
@@ -310,7 +311,7 @@ function readStatuses(
 ): { row?: string; block?: string } {
 	for (const msg of messages) {
 		const row = msg.toolCalls?.find((tc) => tc.toolUseId === toolUseId);
-		const block = msg.contentJson?.find((b) => b.type === "tool_use" && b.id === toolUseId);
+		const block = messageBody(msg)?.find((b) => b.type === "tool_use" && b.id === toolUseId);
 		if (row || block) {
 			return {
 				...(row ? { row: row.status as string } : {}),
@@ -330,7 +331,7 @@ function findBlock(
 	toolUseId: string,
 ): Record<string, unknown> | undefined {
 	for (const msg of messages) {
-		const block = msg.contentJson?.find((b) => b.type === "tool_use" && b.id === toolUseId);
+		const block = messageBody(msg)?.find((b) => b.type === "tool_use" && b.id === toolUseId);
 		if (block) return block as unknown as Record<string, unknown>;
 		if (msg.children?.length) {
 			const nested = findBlock(msg.children, toolUseId);
@@ -509,7 +510,7 @@ describe("terminal-status guard", () => {
 		const result = patchToolCallFields([older, newer], "tu-dup", { status: "running" });
 		expect(result.changed).toBe(true);
 		expect(
-			(result.messages[1]?.contentJson[0] as unknown as { status?: string } | undefined)?.status,
+			(messageBody(result.messages[1])[0] as unknown as { status?: string } | undefined)?.status,
 		).toBe("running");
 	});
 
@@ -620,8 +621,8 @@ describe("patchReflection", () => {
 			},
 		);
 		expect(result.changed).toBe(true);
-		expect(result.messages[0]?.contentJson[0]?.permissionSuggestions).toBeNull();
-		expect(result.messages[1]?.contentJson[0]?.permissionSuggestions).toEqual([
+		expect(messageBody(result.messages[0])[0]?.permissionSuggestions).toBeNull();
+		expect(messageBody(result.messages[1])[0]?.permissionSuggestions).toEqual([
 			{ type: "plan_reflection", status: "running", requestId: "req-1" },
 		]);
 	});

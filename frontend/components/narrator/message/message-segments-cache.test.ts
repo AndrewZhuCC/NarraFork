@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { MessageSegmentationCache, type RenderSegment, segmentMessages } from "./message-segments";
 
@@ -36,7 +37,7 @@ describe("MessageSegmentationCache", () => {
 		let resolutionReads = 0;
 		const history = Array.from({ length: 500 }, (_, index) => {
 			const msg = toolMessage(String(index));
-			const block = msg.contentJson[0];
+			const block = messageBody(msg)[0];
 			Object.defineProperty(block, "type", {
 				enumerable: true,
 				get() {
@@ -60,7 +61,7 @@ describe("MessageSegmentationCache", () => {
 		expect(resolutionReads).toBe(500);
 		for (let index = 0; index < 20; index++) {
 			const streamingMsg = toolMessage("__streaming__");
-			streamingMsg.contentJson.push({ type: "text", text: `tail ${index}` });
+			streamingMsg.contentJson?.push({ type: "text", text: `tail ${index}` });
 			classificationReads = 0;
 			resolutionReads = 0;
 			const hot = segmentMessages(history, { cache, streamingMsg });
@@ -86,7 +87,7 @@ describe("MessageSegmentationCache", () => {
 		const first = expectColdEqual([a, b], cache);
 		const original = structuredClone(first);
 		const [firstA, firstB] = toolItems(first);
-		const replacement = { ...a, contentJson: [...a.contentJson, { type: "text", text: "edit" }] };
+		const replacement = { ...a, contentJson: [...messageBody(a), { type: "text", text: "edit" }] };
 		const edited = expectColdEqual([replacement, b], cache);
 		expect(toolItems(edited)[0]).not.toBe(firstA);
 		expect(toolItems(edited)[1]).toBe(firstB);
@@ -130,7 +131,7 @@ describe("MessageSegmentationCache", () => {
 		const msg = toolMessage("a");
 		const stable = toolMessage("stable");
 		const [first, stableItem] = toolItems(expectColdEqual([msg, stable], cache));
-		msg.contentJson[0].name = "Send";
+		messageBody(msg)[0].name = "Send";
 		cache.invalidate("a");
 		const [updated, same] = toolItems(expectColdEqual([msg, stable], cache));
 		expect(updated).not.toBe(first);
@@ -199,8 +200,8 @@ describe("MessageSegmentationCache", () => {
 		const cache = new MessageSegmentationCache({ maxMessages: 10, maxAtoms: 3 });
 		const a = toolMessage("a");
 		const b = toolMessage("b");
-		a.contentJson.push({ type: "text", text: "a" });
-		b.contentJson.push({ type: "text", text: "b" });
+		a.contentJson?.push({ type: "text", text: "a" });
+		b.contentJson?.push({ type: "text", text: "b" });
 		const first = toolItems(expectColdEqual([a, b], cache));
 		const second = toolItems(expectColdEqual([a, b], cache));
 		expect(second[0]).toBe(first[0]);

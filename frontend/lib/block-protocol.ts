@@ -3,14 +3,13 @@
  * boundary (docs/BLOCK_STORAGE-DESIGN.md §8, P2c-3).
  *
  * The server sends messages as envelopes that name their blocks, plus the blocks. This
- * module turns pages and WS frames back into the v1 shapes the document store renders —
- * `TreeMessage` rows with `contentJson` and nested `children` — and keeps each row's
- * blocks alongside as `blockRefs`: every block's id and the elements `[from, to)` it holds
- * in `contentJson`, which block-addressed actions read from the row (`messageBlocks`).
- * v2 is the only message protocol (P3d); frames that are not message-shaped pass through.
+ * module turns pages and WS frames into the rows the document store renders: each
+ * `TreeMessage` holds its blocks (`blocks`, read through `messageBlocks`), and a row the
+ * server nests under another one goes into that row's `children`. v2 is the only message
+ * protocol (P3d); frames that are not message-shaped pass through.
  */
 
-import type { ContentBlock, MessageBlockRef, TreeMessage } from "./api/types";
+import type { MessageRowBlock, TreeMessage } from "./api/types";
 
 /** One block as the server sends it. */
 interface BlockDTO {
@@ -31,7 +30,7 @@ interface BlockDTO {
 type EnvelopeDTO = Record<string, unknown> & {
 	id: string;
 	blockIds: string[];
-	/** The row it is nested under (v1 `children`); null at the top. */
+	/** The row it is nested under (`children`); null at the top. */
 	parentMessageId: string | null;
 };
 
@@ -42,9 +41,9 @@ const text = (value: unknown) => (typeof value === "string" ? value : undefined)
 const number = (value: unknown) => (typeof value === "number" ? value : undefined);
 
 /**
- * Envelopes + blocks as v1 rows, in envelope order. A row nested under another one in v1
- * goes back into that row's `children`; `withChildren` gives every row a `children` list,
- * as page and catch-up rows have one.
+ * Envelopes + blocks as rows, in envelope order. A row nested under another one goes into
+ * that row's `children`; `withChildren` gives every row a `children` list, as page and
+ * catch-up rows have one.
  */
 function rowsOf(
 	envelopes: EnvelopeDTO[],
@@ -56,14 +55,11 @@ function rowsOf(
 	const byId = new Map<string, TreeMessage>();
 	for (const envelope of envelopes) {
 		const { blockIds, parentMessageId, ...fields } = envelope;
-		const contentJson: unknown[] = [];
-		const blockRefs: MessageBlockRef[] = [];
+		const rowBlocks: MessageRowBlock[] = [];
 		for (const blockId of blockIds) {
 			const block = byBlockId.get(blockId);
 			if (!block) continue;
-			const from = contentJson.length;
-			contentJson.push(...block.elements);
-			blockRefs.push({
+			rowBlocks.push({
 				id: block.id,
 				kind: block.kind,
 				subtype: block.subtype,
@@ -72,14 +68,13 @@ function rowsOf(
 				wireId: block.wireId,
 				attemptId: block.attemptId,
 				hasOriginal: block.hasOriginal,
-				from,
-				to: contentJson.length,
+				named: true,
+				elements: block.elements as MessageRowBlock["elements"],
 			});
 		}
 		const row = {
 			...fields,
-			contentJson: contentJson as ContentBlock[],
-			blockRefs,
+			blocks: rowBlocks,
 			...(withChildren ? { children: [] } : {}),
 		} as unknown as TreeMessage;
 		const parent = parentMessageId ? byId.get(parentMessageId) : undefined;

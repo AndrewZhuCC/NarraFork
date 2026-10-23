@@ -12,7 +12,11 @@ import type {
 	ToolCallRecord,
 	TreeMessage,
 } from "@frontend/lib/api";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import {
+	mapRowElements,
+	messageBody,
+	splitRowBlocks,
+} from "@shared/narrator-blocks/message-blocks";
 import { copyStreamingEditInput, handoffStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { mergeToolLifecycleRecord, type ToolLifecycleRecord } from "@shared/tool-row-status";
 
@@ -229,14 +233,13 @@ export function updateSubagentActivityInMessages(
 	let changed = false;
 	const updated = messages.map((message) => {
 		let nextMessage = message;
-		let localChanged = false;
-		const nextContent = (message.contentJson ?? []).map((block) => {
+		const withContent = mapRowElements(message, (block) => {
 			if (block.type !== "tool_use" || block.id !== parentToolUseId) return block;
 			const nextActivity = updater(block._subagentActivity);
 			if (nextActivity === block._subagentActivity) return block;
-			localChanged = true;
 			return { ...block, _subagentActivity: nextActivity };
 		});
+		let localChanged = withContent !== message;
 		const nextCalls = (message.toolCalls ?? []).map((call) => {
 			if (call.toolUseId !== parentToolUseId) return call;
 			const current = (call as ToolCallRecord & { _subagentActivity?: SubagentActivitySummary })
@@ -248,7 +251,7 @@ export function updateSubagentActivityInMessages(
 		});
 		if (localChanged) {
 			changed = true;
-			nextMessage = { ...message, contentJson: nextContent, toolCalls: nextCalls };
+			nextMessage = { ...withContent, toolCalls: nextCalls };
 		}
 		if (nextMessage.children?.length) {
 			const childResult = updateSubagentActivityInMessages(
@@ -287,10 +290,7 @@ function hasToolUseInMessage(msg: TreeMessage, toolUseId: string | null | undefi
 	if ((msg.toolCalls as ToolCall[] | undefined)?.some((tc) => tc.toolUseId === toolUseId)) {
 		return true;
 	}
-	return (
-		Array.isArray(msg.contentJson) &&
-		msg.contentJson.some((block) => block.type === "tool_use" && block.id === toolUseId)
-	);
+	return messageBody(msg).some((block) => block.type === "tool_use" && block.id === toolUseId);
 }
 
 /**
@@ -331,23 +331,21 @@ function mergeToolFields<T extends { inputJson?: unknown; outputJson?: unknown; 
 }
 
 /**
- * Sync fields into the enriched tool_use block in contentJson that matches
- * the given toolUseId. This keeps contentJson in sync with toolCalls so that
- * resolveAllToolCallsFromMsg (which reads enriched blocks first) sees updates
+ * Sync fields into the message's enriched tool_use element that matches the given
+ * toolUseId. This keeps the body in sync with toolCalls so that
+ * resolveAllToolCallsFromMsg (which reads enriched elements first) sees updates
  * from WS events like tool_completed / tool_started / permission changes.
  */
-function syncContentJsonFields(
-	contentJson: ContentBlock[],
+function syncToolElementFields(
+	message: TreeMessage,
 	toolUseId: string,
 	fields: Record<string, unknown>,
-): ContentBlock[] {
-	let changed = false;
-	const result = contentJson.map((block) => {
-		if (block.type !== "tool_use" || block.id !== toolUseId) return block;
-		changed = true;
-		return mergeToolFields(block, fields) as ContentBlock;
-	});
-	return changed ? result : contentJson;
+): TreeMessage {
+	return mapRowElements(message, (block) =>
+		block.type !== "tool_use" || block.id !== toolUseId
+			? block
+			: (mergeToolFields(block, fields) as ContentBlock),
+	);
 }
 
 interface CachePage {
@@ -439,7 +437,7 @@ export function insertChildIntoMessages(
 	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
-		// Check both persisted tool-call rows and partial contentJson blocks.
+		// Check both persisted tool-call rows and partial tool_use elements.
 		const hasParentTool = hasToolUseInMessage(msg, childMsg.parentToolUseId);
 		if (hasParentTool) {
 			const children = msg.children || [];
@@ -487,21 +485,13 @@ export function mergeToolCallFieldsInTree(
 			return mergeToolFields(tc, fields);
 		});
 
-		let contentChanged = false;
-		if (Array.isArray(msg.contentJson)) {
-			contentChanged = msg.contentJson.some(
-				(block) => block.type === "tool_use" && block.id === toolUseId,
-			);
-		}
+		const contentChanged = messageBody(msg).some(
+			(block) => block.type === "tool_use" && block.id === toolUseId,
+		);
 		if (tcChanged || contentChanged) {
 			anyChanged = true;
-			result = {
-				...result,
-				...(tcChanged ? { toolCalls: updatedCalls as ToolCallRecord[] } : {}),
-				...(contentChanged
-					? { contentJson: syncContentJsonFields(msg.contentJson, toolUseId, fields) }
-					: {}),
-			};
+			if (contentChanged) result = syncToolElementFields(result, toolUseId, fields);
+			if (tcChanged) result = { ...result, toolCalls: updatedCalls as ToolCallRecord[] };
 		}
 		if (msg.children?.length) {
 			const childResult = mergeToolCallFieldsInTree(msg.children, toolUseId, fields);
@@ -547,13 +537,8 @@ export function updateToolCallInTree(
 				if (output !== undefined) fields.outputJson = output;
 				if (durationMs != null) fields.durationMs = durationMs;
 				result = { ...result, toolCalls: updatedCalls as ToolCallRecord[] };
-				// Sync enriched contentJson blocks
-				if (Array.isArray(result.contentJson)) {
-					result = {
-						...result,
-						contentJson: syncContentJsonFields(result.contentJson, toolUseId, fields),
-					};
-				}
+				// Sync the enriched tool_use element
+				result = syncToolElementFields(result, toolUseId, fields);
 			}
 		}
 
@@ -580,12 +565,9 @@ export function findMsgByToolUseIdInTree(
 	for (const msg of messages) {
 		if ((msg.toolCalls as ToolCall[])?.some((tc) => tc.toolUseId === toolUseId)) return msg;
 		// Partial assistant messages can briefly expose the tool_use block before the
-		// narrator_tool_calls row is visible to the history query. Match contentJson
+		// narrator_tool_calls row is visible to the history query. Match the body
 		// as well so reconnect reconciliation does not create a second synthetic card.
-		if (
-			Array.isArray(msg.contentJson) &&
-			msg.contentJson.some((block) => block.type === "tool_use" && block.id === toolUseId)
-		) {
+		if (messageBody(msg).some((block) => block.type === "tool_use" && block.id === toolUseId)) {
 			return msg;
 		}
 		if (msg.children?.length) {
@@ -712,10 +694,10 @@ export function mergeFieldsIntoNewestToolOccurrenceInTree(
 				break;
 			}
 		}
-		const contentJson = Array.isArray(msg.contentJson) ? [...msg.contentJson] : [];
+		const body = messageBody(msg);
 		let contentBlockIndex = -1;
-		for (let index = contentJson.length - 1; index >= 0; index--) {
-			const block = contentJson[index];
+		for (let index = body.length - 1; index >= 0; index--) {
+			const block = body[index];
 			if (block.type === "tool_use" && block.id === toolUseId) {
 				contentBlockIndex = index;
 				break;
@@ -726,17 +708,16 @@ export function mergeFieldsIntoNewestToolOccurrenceInTree(
 		if (toolCallIndex >= 0) {
 			toolCalls[toolCallIndex] = mergeToolFields(toolCalls[toolCallIndex], fields);
 		}
-		if (contentBlockIndex >= 0) {
-			contentJson[contentBlockIndex] = mergeToolFields(
-				contentJson[contentBlockIndex],
-				fields,
-			) as ContentBlock;
-		}
+		const next =
+			contentBlockIndex >= 0
+				? mapRowElements(msg, (block, index) =>
+						index === contentBlockIndex ? (mergeToolFields(block, fields) as ContentBlock) : block,
+					)
+				: msg;
 		const updated = [...messages];
 		updated[messageIndex] = {
-			...msg,
+			...next,
 			...(toolCallIndex >= 0 ? { toolCalls: toolCalls as ToolCallRecord[] } : {}),
-			...(contentBlockIndex >= 0 ? { contentJson } : {}),
 		};
 		return { messages: updated, changed: true };
 	}
@@ -831,11 +812,9 @@ function indexMessages(
 		}
 		// Partial assistant messages can expose tool_use before the tool-call row is
 		// materialized. Index the content block as a fallback identity source too.
-		if (Array.isArray(msg.contentJson)) {
-			for (const block of msg.contentJson) {
-				if (block.type === "tool_use" && block.id) {
-					index.set(block.id, { pageIdx, path: [...path, i] });
-				}
+		for (const block of messageBody(msg)) {
+			if (block.type === "tool_use" && block.id) {
+				index.set(block.id, { pageIdx, path: [...path, i] });
 			}
 		}
 		if (msg.children?.length) {
@@ -869,21 +848,15 @@ function mergeAtPath(
 			return mergeToolFields(tc, fields);
 		});
 
-		let contentChanged = false;
-		let enrichedContent = msg.contentJson;
-		if (Array.isArray(enrichedContent)) {
-			enrichedContent = enrichedContent.map((block) => {
-				if (block.type !== "tool_use" || block.id !== toolUseId) return block;
-				contentChanged = true;
-				return mergeToolFields(block, fields) as BaseContentBlock;
-			});
-			if (!contentChanged) enrichedContent = msg.contentJson;
-		}
-		if (!tcChanged && !contentChanged) return messages;
+		const enriched = mapRowElements(msg, (block) =>
+			block.type !== "tool_use" || block.id !== toolUseId
+				? block
+				: (mergeToolFields(block, fields) as BaseContentBlock),
+		);
+		if (!tcChanged && enriched === msg) return messages;
 		updated[idx] = {
-			...msg,
+			...enriched,
 			toolCalls: tcChanged ? (updatedCalls as ToolCallRecord[]) : msg.toolCalls,
-			contentJson: enrichedContent,
 		};
 	} else {
 		// Navigate deeper into children
@@ -1171,7 +1144,7 @@ function upsertStreamingChildOnMsg(
 	}
 
 	const { blocks, toolCalls } = upsertStreamingToolBlock(
-		existing ? [...existing.contentJson] : [],
+		existing ? [...messageBody(existing)] : [],
 		existing ? [...existing.toolCalls] : [],
 		toolUseId,
 		toolName,
@@ -1186,7 +1159,7 @@ function upsertStreamingChildOnMsg(
 		narratorId,
 		parentToolUseId,
 		role: "assistant",
-		contentJson: blocks,
+		blocks: splitRowBlocks({ id: syntheticId, role: "assistant", parentToolUseId }, blocks),
 		contentText: null,
 		toolCalls: patchedToolCalls,
 		createdAt: existing?.createdAt ?? new Date().toISOString(),
@@ -1220,7 +1193,7 @@ export function upsertStreamingChildInMessages(
 	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
 	const updated = messages.map((msg) => {
-		// Check both persisted tool-call rows and partial contentJson blocks.
+		// Check both persisted tool-call rows and partial tool_use elements.
 		const hasParentTool = hasToolUseInMessage(msg, parentToolUseId);
 		if (hasParentTool) {
 			anyChanged = true;
@@ -1240,7 +1213,7 @@ export function upsertStreamingChildInMessages(
 			}
 
 			const { blocks, toolCalls } = upsertStreamingToolBlock(
-				existing ? [...existing.contentJson] : [],
+				existing ? [...messageBody(existing)] : [],
 				existing ? [...existing.toolCalls] : [],
 				toolUseId,
 				toolName,
@@ -1255,7 +1228,7 @@ export function upsertStreamingChildInMessages(
 				narratorId,
 				parentToolUseId,
 				role: "assistant",
-				contentJson: blocks,
+				blocks: splitRowBlocks({ id: syntheticId, role: "assistant", parentToolUseId }, blocks),
 				contentText: null,
 				toolCalls: patchedToolCalls,
 				createdAt: existing?.createdAt ?? new Date().toISOString(),
