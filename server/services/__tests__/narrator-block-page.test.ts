@@ -20,6 +20,7 @@ const blockSync = await import("../narrator-block-sync");
 const targets = await import("../narrator-block-targets");
 const page = await import("../narrator-block-page");
 const { decodeBlockPage } = await import("@frontend/lib/block-protocol");
+const { messageBlocks } = await import("@frontend/lib/message-blocks");
 
 /** A decoded value without the block sidecar the client adds to every row. */
 function withoutBlockRefs<T>(value: T): T {
@@ -130,6 +131,18 @@ describe("the message page in protocol v2", () => {
 		expect(resolved.map((target) => target.to - target.from)).toEqual(
 			stepBlocks.map((block) => block.elements.length),
 		);
+		// A row the client builds itself is split into these same blocks.
+		for (const message of v1.messages)
+			expect(
+				messageBlocks(message).map(({ from: _from, ...block }) => ({
+					...block,
+					elements: [...block.elements] as unknown[],
+				})),
+			).toEqual(
+				v2.blocks
+					.filter((block) => block.messageId === message.id)
+					.map(({ messageId: _messageId, ordinal: _ordinal, ...block }) => block),
+			);
 	});
 
 	test("an envelope rewritten outside the store is synced before its ids are sent", async () => {
