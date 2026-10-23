@@ -11,12 +11,17 @@ export interface ProviderBalanceAmount {
 	total?: number;
 	/** For example 5h, 1d, 7d, daily, weekly or monthly. */
 	window?: string;
+	/** Upstream-reported window start, ISO timestamp; not a reset-time guarantee. */
+	windowStart?: string;
 }
 
 export interface ProviderBalanceData {
 	scope: ProviderBalanceScope;
 	unlimited: boolean;
 	amounts: ProviderBalanceAmount[];
+	/** Subscription metadata only; optional on older upstream deployments. */
+	planName?: string;
+	expiresAt?: string;
 }
 
 export interface ProviderBalanceSnapshot {

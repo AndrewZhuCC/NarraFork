@@ -182,7 +182,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
 import { commandCodeQuotaView } from "./model/commandcode-quota-format";
-import { usageSourceFor } from "./model/custom-api-usage-source";
+import { customApiBalanceDisplayFor, usageSourceFor } from "./model/custom-api-usage-source";
 import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
@@ -779,6 +779,12 @@ function NarratorPanelBody({
 		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
 		firstScreenActivity,
 	);
+	const { pushedQuota, subscriptionSnapshot: sub2ApiSubscriptionSnapshot } =
+		customApiBalanceDisplayFor({
+			providerId: currentBalanceProviderId,
+			pushedQuotas: settingsData?.customApiQuotas,
+			snapshot: providerBalanceQuery.data,
+		});
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1194,6 +1200,14 @@ function NarratorPanelBody({
 		if (usageSource === "kimi") {
 			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
 		}
+		if (cfg.id === currentBalanceProviderId && pushedQuota) {
+			return { providerId: cfg.id, ...pushedQuota };
+		}
+		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
+			// The shared window panel owns subscription amounts, including unknown/stale
+			// placeholders. Do not duplicate them in the generic balance text slot.
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
+		}
 		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
 			return {
 				providerId: cfg.id,
@@ -1221,6 +1235,8 @@ function NarratorPanelBody({
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,
 		currentBalanceProviderId,
+		pushedQuota,
+		sub2ApiSubscriptionSnapshot,
 		providerBalanceQuery.data,
 		providerBalanceQuery.isError,
 		balanceT,
@@ -3647,10 +3663,16 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								// Command Code renders through `panel`; its generic slot stays empty.
+								// Structured subscription quotas are rendered by the status bar, not this text slot.
 								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
 								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
 								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
+								sub2api: sub2ApiSubscriptionSnapshot
+									? {
+											snapshot: sub2ApiSubscriptionSnapshot,
+											queryFailed: providerBalanceQuery.isError,
+										}
+									: undefined,
 								opencode: opencodeQuotaProps,
 								panel: quotaPanelProps,
 								shouldShowNugRechargeButton,

@@ -6,13 +6,37 @@ import type {
 } from "@frontend/lib/api/narrators";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import type { PendingPermission } from "@frontend/types/narrator";
-import { notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
+import { notifyManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { customApiBalanceDisplayFor } from "./model/custom-api-usage-source";
 import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "./useNarratorPanelWS";
+
+type QuotaSettings = {
+	customApiQuotas: NonNullable<Parameters<typeof customApiBalanceDisplayFor>[0]["pushedQuotas"]>;
+};
+let quotaProviderId: string | null = null;
+let balanceSnapshot: ProviderBalanceSnapshot | undefined;
+let quotaDisplay: ReturnType<typeof customApiBalanceDisplayFor>;
+function subscriptionSnapshot(): ProviderBalanceSnapshot {
+	return {
+		generation: "g1",
+		status: "supported",
+		adapter: "sub2api",
+		balance: {
+			scope: "subscription",
+			unlimited: false,
+			amounts: [{ unit: "USD", window: "daily", total: 10, used: 2, remaining: 8 }],
+		},
+		fetchedAt: 1,
+		attemptedAt: 1,
+		error: null,
+	};
+}
 
 let root: Root;
 let host: HTMLElement;
@@ -74,12 +98,34 @@ function Harness() {
 	current = useNarratorPanelWS({ narratorId, narratorStatus, isAtBottomRef: { current: true } });
 	return null;
 }
+function QuotaHarness() {
+	const { data: settings } = useQuery<QuotaSettings>({
+		queryKey: ["settings"],
+		queryFn: async () => ({ customApiQuotas: {} }),
+		enabled: false,
+	});
+	quotaDisplay = customApiBalanceDisplayFor({
+		providerId: quotaProviderId,
+		pushedQuotas: settings?.customApiQuotas,
+		snapshot: balanceSnapshot,
+	});
+	current = useNarratorPanelWS({
+		narratorId,
+		narratorStatus,
+		isAtBottomRef: { current: true },
+		customApiProviderId: quotaProviderId ?? undefined,
+		quotaProviderKey: quotaProviderId ?? undefined,
+		initialQuotaBalance: quotaDisplay.pushedQuota?.quotaBalance ?? null,
+		initialDetailedQuotaBalance: quotaDisplay.pushedQuota?.detailedQuotaBalance ?? null,
+	});
+	return null;
+}
 const render = () =>
 	act(async () =>
 		root.render(
 			<QueryClientProvider client={qc}>
 				<I18nextProvider i18n={instance}>
-					<Harness />
+					{quotaProviderId ? <QuotaHarness /> : <Harness />}
 				</I18nextProvider>
 			</QueryClientProvider>,
 		),
@@ -147,6 +193,8 @@ beforeEach(async () => {
 		restores.push(() => spy.mockRestore());
 	narratorId = "n1";
 	narratorStatus = "waiting";
+	quotaProviderId = null;
+	balanceSnapshot = undefined;
 	connected = false;
 	listeners.clear();
 	connections.clear();
@@ -182,6 +230,70 @@ afterEach(async () => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 	originals.clear();
+});
+
+describe("pushed custom API quota precedence with the real WS hook", () => {
+	test("a live push replaces the subscription and survives subsequent auto-balance polling", async () => {
+		quotaProviderId = "p1";
+		const snapshot = subscriptionSnapshot();
+		balanceSnapshot = snapshot;
+		qc.setQueryData(["settings"], { customApiQuotas: {} });
+		await render();
+		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(snapshot);
+		expect(current.quotaBalance).toBeNull();
+
+		const pushed = {
+			quotaBalance: "站点额度 75%",
+			detailedQuotaBalance: "专用套餐\n日 USD 0.004\n周 USD 1",
+		};
+		await event({ type: "quota_balance", ...pushed });
+		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(current.quotaBalance).toBe(pushed.quotaBalance);
+		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
+		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toMatchObject(pushed);
+
+		balanceSnapshot = { ...snapshot, fetchedAt: 2 };
+		await render();
+		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(current.quotaBalance).toBe(pushed.quotaBalance);
+		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
+
+		await event({ type: "quota_balance", quotaBalance: "0", detailedQuotaBalance: "已耗尽" });
+		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(current.quotaBalance).toBe("0");
+		expect(current.detailedQuotaBalance).toBe("已耗尽");
+
+		await event({ type: "quota_balance", quotaBalance: null, detailedQuotaBalance: null });
+		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
+		expect(current.quotaBalance).toBeNull();
+		expect(current.detailedQuotaBalance).toBeNull();
+	});
+
+	test("cached pushes win on mount and never leak when switching providers", async () => {
+		quotaProviderId = "p1";
+		balanceSnapshot = subscriptionSnapshot();
+		const pushed = {
+			quotaBalance: "Cached site plan",
+			detailedQuotaBalance: "Cached site details",
+		};
+		qc.setQueryData(["settings"], { customApiQuotas: { p1: pushed } });
+		await render();
+		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(current.quotaBalance).toBe(pushed.quotaBalance);
+		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
+
+		quotaProviderId = "p2";
+		await render();
+		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
+		expect(current.quotaBalance).toBeNull();
+		expect(current.detailedQuotaBalance).toBeNull();
+
+		quotaProviderId = "p1";
+		await render();
+		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(current.quotaBalance).toBe(pushed.quotaBalance);
+		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
+	});
 });
 
 describe("mounted panel and real WS hook reconciliation", () => {

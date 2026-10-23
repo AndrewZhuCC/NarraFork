@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -708,8 +709,9 @@ function isRetiredIndexCreateError(
 
 // Only outer whitespace and SQLite's omitted final semicolon are interchangeable. In
 // particular, never normalize whitespace/case inside a trigger body or a SQL literal.
+// CRLF is the one exception: it only reflects the checkout the migration file was read from.
 function normalizeModelHistorySql(sql: string): string {
-	return sql.trim().replace(/;$/, "").trimEnd();
+	return sql.replace(/\r\n/g, "\n").trim().replace(/;$/, "").trimEnd();
 }
 
 // The official SQLite v1 schema prelude, followed by the generator's pure trigger SQL.
@@ -747,7 +749,9 @@ function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
 		"SELECT sql FROM sqlite_schema WHERE type = ? AND name = ? AND tbl_name = ? AND length(sql) <= ? LIMIT 1",
 	);
 	const matchesCatalogSql = (type: string, name: string, table: string, expected: string) => {
-		const row = catalogSql.get(type, name, table, expected.length + 1) as { sql: string } | null;
+		// Room for a CRLF form: one extra byte per line.
+		const maxLength = expected.length + expected.split("\n").length;
+		const row = catalogSql.get(type, name, table, maxLength) as { sql: string } | null;
 		return row !== null && normalizeModelHistorySql(row.sql) === expected;
 	};
 	if (
@@ -794,6 +798,25 @@ function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
 			)
 			.get(...MODEL_HISTORY_TRIGGERS.map((trigger) => trigger.name)) === null
 	);
+}
+
+/**
+ * Whether the ledger already records this migration, under either line-ending form.
+ *
+ * Drizzle hashes the raw file text, so the same migration read from a CRLF checkout (Windows
+ * git with `core.autocrlf`, or a binary built from one) is recorded under a different hash than
+ * its LF copy. Without this, a database migrated by one form looks entirely unmigrated to the
+ * other: every migration is replayed from the start, and the high-water mark that protects
+ * already-applied destructive rebuilds is lost.
+ */
+function isRecordedMigration(
+	appliedHashes: ReadonlySet<string>,
+	migration: { sql: string[]; hash: string },
+): boolean {
+	if (appliedHashes.has(migration.hash)) return true;
+	const lf = migration.sql.join("--> statement-breakpoint").replace(/\r\n/g, "\n");
+	const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+	return appliedHashes.has(sha256(lf)) || appliedHashes.has(sha256(lf.replace(/\n/g, "\r\n")));
 }
 
 /**
@@ -851,14 +874,15 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	// past that journal position (normal incremental upgrades only ever leave a trailing
 	// suffix pending). A destructive migration in a hole must not be re-run: its rebuild
 	// already happened, so replaying the DROP would destroy live data.
+	const applied = migrations.map((migration) => isRecordedMigration(appliedHashes, migration));
 	let lastAppliedIndex = -1;
 	for (let i = 0; i < migrations.length; i++) {
-		if (appliedHashes.has(migrations[i].hash)) lastAppliedIndex = i;
+		if (applied[i]) lastAppliedIndex = i;
 	}
 
 	const pending = migrations
 		.map((migration, index) => ({ migration, index }))
-		.filter(({ migration }) => !appliedHashes.has(migration.hash));
+		.filter(({ index }) => !applied[index]);
 	if (pending.length === 0) return;
 
 	const foreignKeyState = sqlite.prepare("PRAGMA foreign_keys").get() as {

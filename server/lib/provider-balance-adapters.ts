@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type {
 	ProviderBalanceAdapter,
 	ProviderBalanceAmount,
@@ -65,6 +66,17 @@ function quotaAmount(value: unknown, window?: string): ProviderBalanceAmount | n
 	};
 }
 
+const subscriptionTimestamp = z.iso.datetime({ offset: true });
+
+/** Optional metadata must not invalidate a supported allowance or invent local time. */
+function normalizedSubscriptionTimestamp(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length > 128) return undefined;
+	const parsed = subscriptionTimestamp.safeParse(value);
+	if (!parsed.success) return undefined;
+	const timestamp = Date.parse(parsed.data);
+	return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : undefined;
+}
+
 export function parseSub2ApiBalance(body: unknown): ProviderBalanceData | null {
 	if (!record(body) || !bounded(body) || typeof body.isValid !== "boolean") return null;
 	if (body.success === false || body.error !== undefined) return null;
@@ -98,10 +110,13 @@ export function parseSub2ApiBalance(body: unknown): ProviderBalanceData | null {
 			amounts: [{ unit: "USD", remaining: body.balance }],
 		};
 	}
-	if (!shortString(body.planName)) return null;
+	if (!shortString(body.planName) || !body.planName.trim()) return null;
 	const amounts: ProviderBalanceAmount[] = [];
+	let expiresAt: string | undefined;
 	if (body.subscription !== undefined && body.subscription !== null) {
 		if (!record(body.subscription)) return null;
+		expiresAt = normalizedSubscriptionTimestamp(body.subscription.expires_at);
+		const weeklyStart = normalizedSubscriptionTimestamp(body.subscription.weekly_window_start);
 		for (const window of ["daily", "weekly", "monthly"]) {
 			const total = body.subscription[`${window}_limit_usd`];
 			const used = body.subscription[`${window}_usage_usd`];
@@ -109,10 +124,24 @@ export function parseSub2ApiBalance(body: unknown): ProviderBalanceData | null {
 			if (!finite(total) || total < 0 || !finite(used) || used < 0) return null;
 			const remaining = total - used;
 			if (!finite(remaining)) return null;
-			amounts.push({ unit: "USD", remaining, used, total, window });
+			amounts.push({
+				unit: "USD",
+				remaining,
+				used,
+				total,
+				window,
+				...(window === "weekly" && weeklyStart ? { windowStart: weeklyStart } : {}),
+			});
 		}
 	}
-	return { scope: "subscription", unlimited: false, amounts };
+	return {
+		scope: "subscription",
+		// The gateway explicitly reports -1 when no positive period limit is configured.
+		unlimited: body.remaining === -1,
+		amounts,
+		planName: body.planName.trim(),
+		...(expiresAt ? { expiresAt } : {}),
+	};
 }
 
 interface Conversion {
