@@ -421,6 +421,8 @@ type PretextExactMessageListProps = {
 	highlightMessageId?: string;
 	/** A new request repeats the jump while retaining this list's loaded window. */
 	highlightRequestId?: string;
+	/** Text that picks which row of a multi-row message the jump lands on. */
+	highlightNeedle?: string;
 	tailFooter?: ReactNode;
 	/**
 	 * Pluggable data boundary for surfaces rendering the same document through a
@@ -531,6 +533,7 @@ export const PretextExactMessageList = memo(
 				permCb,
 				highlightMessageId,
 				highlightRequestId,
+				highlightNeedle,
 				tailFooter,
 				dataSource,
 				selectedMessageIds: messageSelectedIds,
@@ -4750,7 +4753,12 @@ export const PretextExactMessageList = memo(
 					return;
 				}
 				if (!documentReady) return;
-				const key = JSON.stringify([narratorId, highlightMessageId, highlightRequestId]);
+				const key = JSON.stringify([
+					narratorId,
+					highlightMessageId,
+					highlightRequestId,
+					highlightNeedle,
+				]);
 				if (jumpedHighlightRef.current === key) return;
 				// Latch BEFORE awaiting: a failed deep-link jump has already told the reader
 				// why (the notice inside scrollToMessageTarget), and re-running it on the next
@@ -4760,11 +4768,13 @@ export const PretextExactMessageList = memo(
 					domIds: [`msg-${highlightMessageId}`],
 					targetIds: [highlightMessageId],
 					highlightId: highlightMessageId,
+					needle: highlightNeedle,
 				});
 			}, [
 				documentReady,
 				highlightMessageId,
 				highlightRequestId,
+				highlightNeedle,
 				narratorId,
 				scrollToMessageTarget,
 			]);

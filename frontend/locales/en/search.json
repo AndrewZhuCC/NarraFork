@@ -47,5 +47,7 @@
 	"messageRole_sys": "System",
 	"messageRole_disp": "Display",
 	"recentOnly": "Every search term is short, so only the last {{days}} days of sessions were searched.",
-	"searchFullHistory": "Search full history"
+	"searchFullHistory": "Search full history",
+	"toolHit": "Tool",
+	"toolHitNamed": "Tool · {{tool}}"
 }

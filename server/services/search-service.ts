@@ -227,6 +227,9 @@ export interface SessionHit {
 	messageRole?: string;
 	createdAt?: string;
 	blockId?: string;
+	/** Set when the hit is in a tool call, so the client can jump to that tool's row. */
+	toolUseId?: string;
+	toolName?: string;
 }
 
 /** One session (narrator) matching the query by its title, its messages, or both. */
@@ -432,6 +435,8 @@ function toSessionHit(row: MessageSearchRow): SessionHit {
 		...(row.messageRole ? { messageRole: row.messageRole } : {}),
 		...(row.createdAt ? { createdAt: row.createdAt } : {}),
 		...(row.blockId ? { blockId: row.blockId } : {}),
+		...(row.toolUseId ? { toolUseId: row.toolUseId } : {}),
+		...(row.toolName ? { toolName: row.toolName } : {}),
 	};
 }
 

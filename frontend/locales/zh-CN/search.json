@@ -47,5 +47,7 @@
 	"messageRole_sys": "系统",
 	"messageRole_disp": "展示",
 	"recentOnly": "搜索词都很短，只搜索了最近 {{days}} 天的会话。",
-	"searchFullHistory": "搜索全部历史"
+	"searchFullHistory": "搜索全部历史",
+	"toolHit": "工具",
+	"toolHitNamed": "工具 · {{tool}}"
 }
