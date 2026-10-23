@@ -80,8 +80,8 @@ const MIN_SLICE_ENVELOPES = 1;
 const MAX_SLICE_SOURCE_BYTES = 4 * 1024 * 1024;
 const SLICE_BUDGET_MS = 1_000;
 /**
- * A write transaction should stay under this. Past it, a slice written in one transaction
- * halves the next slice; `reindex`, which writes a block at a time, ends the transaction.
+ * A write transaction should stay under this, commit included. Past it, a slice written in
+ * one transaction halves the next slice, and `reindex` halves its index text per transaction.
  */
 const APPLY_TARGET_MS = 50;
 /**
@@ -90,13 +90,19 @@ const APPLY_TARGET_MS = 50;
  * slice is read meanwhile.
  */
 const APPLY_PACE_FACTOR = 3;
-const MAX_PACE_MS = 2_000;
+const MAX_PACE_MS = 30_000;
 /** Without workers the main thread decodes, so slices shrink to stay short. */
 const INLINE_SLICE_ENVELOPES = 10;
 const INLINE_SLICE_SOURCE_BYTES = 256 * 1024;
 const WORKER_TIMEOUT_MS = 30_000;
 /** Index text one reindex slice computes; the main thread writes it in short transactions. */
 const REINDEX_SLICE_INDEX_CHARS = 256 * 1024;
+/**
+ * Index text one reindex transaction writes, sized by how long the last one took. FTS5
+ * tokenizes as rows are written but flushes the segment, and does the merge work it owes for
+ * it, at commit: about nine tenths of the time, roughly proportional to the text written.
+ */
+const REINDEX_TX_CHARS = { initial: 32 * 1024, min: 4 * 1024, max: 256 * 1024 };
 const SLOW_LOG_INTERVAL_MS = 60_000;
 
 /** How a slice is read: by a db-worker (production) or inline on a given connection. */
@@ -153,6 +159,16 @@ const state = hotSafe("narrator-block-backfill:state", () => ({
 
 /** When the jobs' next write transaction may start. */
 const pace = hotSafe("narrator-block-backfill:pace", () => ({ notBefore: 0 }));
+const reindexBudget = hotSafe("narrator-block-backfill:reindex-budget", () => ({
+	chars: REINDEX_TX_CHARS.initial,
+}));
+
+/** Back to how a fresh process paces and sizes the jobs. */
+export function resetBlockJobPacingForTests(): void {
+	pace.notBefore = 0;
+	reindexBudget.chars = REINDEX_TX_CHARS.initial;
+	state.sliceEnvelopes = MAX_SLICE_ENVELOPES;
+}
 
 /** Wait until the jobs may take the main thread again (`APPLY_PACE_FACTOR`). */
 async function applyTurn(): Promise<void> {
@@ -405,10 +421,12 @@ interface ReindexPosition {
 }
 
 /**
- * One slice of `reindex`: a db-worker computes the next envelopes' block index text; the main
- * thread writes it a block at a time, in transactions that end past `APPLY_TARGET_MS` and are
- * paced like every job's, so an envelope with megabytes of tool output spans several. The
- * cursor moves past an envelope once all of it is written; a restart redoes a partial one.
+ * One slice of `reindex`: a db-worker computes the index text the next envelopes' blocks lack
+ * (entries the store wrote are right as they are); the main thread writes it a block at a
+ * time, in transactions that end at their index text budget (`REINDEX_TX_CHARS`) or past
+ * `APPLY_TARGET_MS` and are paced like every job's, so an envelope with megabytes of tool
+ * output spans several. The cursor moves past an envelope once all of it is written; a
+ * restart redoes a partial one.
  */
 async function reindexSlice(reader: SliceReader): Promise<void> {
 	const job = jobState("reindex");
@@ -427,12 +445,13 @@ async function reindexSlice(reader: SliceReader): Promise<void> {
 		let cursor = job.cursor;
 		do {
 			await applyTurn();
+			const budget = reindexBudget.chars;
 			const started = performance.now();
 			const written = database.sqlite.transaction(() => {
 				// Paused, or sent back to the start, while this slice was being written.
 				const current = jobState("reindex");
 				if (current.paused || current.complete || current.cursor !== cursor) return null;
-				const done = writeReindexed(slice.envelopes, at, watch.synced, started);
+				const done = writeReindexed(slice.envelopes, at, watch.synced, started, budget);
 				if (done.envelopes > 0) cursor = slice.envelopes[at.envelope - 1].rowid;
 				const complete = slice.done && at.envelope === slice.envelopes.length;
 				if (complete) cursor = slice.lastRowid;
@@ -442,9 +461,16 @@ async function reindexSlice(reader: SliceReader): Promise<void> {
 			if (!written) return;
 			const elapsedMs = performance.now() - started;
 			paceAfter(elapsedMs);
-			// Each transaction ends past the target; one well past it took that long on one
-			// block or one envelope's sync.
-			if (elapsedMs > 2 * APPLY_TARGET_MS) noteSlow("reindex", elapsedMs, written);
+			// Sized by the whole transaction, its commit included; grown only by one that used
+			// its budget.
+			if (elapsedMs > APPLY_TARGET_MS)
+				reindexBudget.chars = Math.max(REINDEX_TX_CHARS.min, Math.floor(budget / 2));
+			else if (elapsedMs < APPLY_TARGET_MS / 2 && written.indexChars >= budget)
+				reindexBudget.chars = Math.min(REINDEX_TX_CHARS.max, Math.ceil(budget * 1.25));
+			// One well past the target: a merge fell due at its commit, or one block or one
+			// envelope's sync took that long.
+			if (elapsedMs > 2 * APPLY_TARGET_MS)
+				noteSlow("reindex", elapsedMs, { ...written, nextChars: reindexBudget.chars });
 		} while (at.envelope < slice.envelopes.length);
 	} finally {
 		watch.stop();
@@ -452,17 +478,19 @@ async function reindexSlice(reader: SliceReader): Promise<void> {
 }
 
 /**
- * Write a reindex slice's text from `at` on, inside the caller's transaction, until done or
- * past `APPLY_TARGET_MS` (at least one block or envelope each time). An envelope synced or
- * queued since the read began, or whose rows moved, is synced here instead, which computes
- * the same text from what it holds now (rare: only envelopes written while the slice was read
- * or written). Every envelope is checked again in each transaction that writes some of it.
+ * Write a reindex slice's text from `at` on, inside the caller's transaction, until done, at
+ * `maxChars` of index text, or past `APPLY_TARGET_MS` (at least one block or envelope each
+ * time). An envelope synced or queued since the read began, or whose rows moved, is synced
+ * here instead, which computes the same text from what it holds now (rare: only envelopes
+ * written while the slice was read or written). Every envelope is checked again in each
+ * transaction that writes some of it.
  */
 function writeReindexed(
 	envelopes: ReindexEnvelope[],
 	at: ReindexPosition,
 	synced: ReadonlySet<string>,
 	started: number,
+	maxChars: number,
 ): { envelopes: number; blocks: number; indexChars: number; resynced: number } {
 	const rows = database.sqlite.prepare(
 		"SELECT rowid, id, revision FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal",
@@ -472,7 +500,8 @@ function writeReindexed(
 	);
 	const done = { envelopes: 0, blocks: 0, indexChars: 0, resynced: 0 };
 	const spent = () =>
-		done.envelopes + done.blocks > 0 && performance.now() - started > APPLY_TARGET_MS;
+		done.envelopes + done.blocks > 0 &&
+		(done.indexChars >= maxChars || performance.now() - started > APPLY_TARGET_MS);
 	while (at.envelope < envelopes.length && !spent()) {
 		const envelope = envelopes[at.envelope];
 		const current = rows.all(envelope.id) as Array<{ rowid: number; id: string; revision: number }>;
@@ -486,8 +515,11 @@ function writeReindexed(
 				return row.rowid === block.rowid && row.id === block.id && row.revision === block.revision;
 			});
 		if (asRead) {
-			// In rowid order: FTS5 flushes its pending terms whenever a write goes back.
-			const blocks = [...envelope.blocks].sort((a, b) => a.rowid - b.rowid);
+			// Only the entries the index lacks, in rowid order: FTS5 flushes its pending terms
+			// whenever a write goes back.
+			const blocks = envelope.blocks
+				.filter((block): block is typeof block & { text: string } => block.text !== null)
+				.sort((a, b) => a.rowid - b.rowid);
 			while (at.block < blocks.length && !spent()) {
 				const block = blocks[at.block++];
 				replaceBlockIndexRow(database.sqlite, block.rowid, block.text);
