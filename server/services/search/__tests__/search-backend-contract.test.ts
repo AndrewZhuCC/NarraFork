@@ -40,7 +40,6 @@ function source(relativePath: string): string {
 
 /** Every method the port declares, so a caller-coverage gap is a listed name, not a vibe. */
 const PORT_METHODS = [
-	"searchChapters",
 	"searchMessages",
 	"searchNarrators",
 	"searchTimeline",
@@ -129,7 +128,6 @@ describe("the port is async, and un-awaited calls fail at compile time", () => {
 			: never;
 	};
 	const asyncReturns: AsyncReturns = {
-		searchChapters: true,
 		searchMessages: true,
 		searchNarrators: true,
 		searchTimeline: true,
@@ -201,7 +199,7 @@ describe("backend selection", () => {
 	it("fails closed when the postgres store is queried before its client is bound", async () => {
 		const store = resolveSearchStore("postgres");
 		await expect(
-			store.searchChapters({
+			store.searchNarrators({
 				text: "anything",
 				strategy: "index",
 				limit: 1,

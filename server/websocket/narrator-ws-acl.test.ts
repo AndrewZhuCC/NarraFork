@@ -12,29 +12,19 @@
  *  - a mixed batch subscribes the allowed ids and refuses the rest;
  *  - read access is not write access: buffered-input frames need write;
  *  - a connection with no user identity gets nothing;
- *  - the frames that name a request/session id instead of a narrator
- *    (`permission_decision`, `merge_decision`, `update_timeout`) are authorized too.
+ *  - the frames that name a request id instead of a narrator
+ *    (`permission_decision`, `update_timeout`) are authorized too.
  *    Those were the second hole: a reader who could see a permission request could
  *    approve it, because the id was all the handler asked for.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { cleanDb, getTestDb } from "../../tests/setup";
-import {
-	aclGrants,
-	chapters,
-	mergeSessions,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-	projects,
-	users,
-} from "../db/schema";
+import { aclGrants, narratorMessages, narrators, narratorToolCalls, users } from "../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 
-const { eventBus } = await import("../lib/event-bus");
 const { getNarratorConnections, handleNarratorWS } = await import("./narrator-ws");
 
 type SentMessage = Record<string, unknown>;
@@ -67,18 +57,6 @@ function openWs(options: { userId?: string; userRole?: string } = {}) {
 	handleNarratorWS.open(ws);
 	openedConnections.push(ws);
 	return { ws, sent };
-}
-
-/**
- * Wait until a condition holds, for the broadcasts that resolve access
- * asynchronously before sending.
- */
-async function waitUntil(predicate: () => boolean): Promise<boolean> {
-	for (let i = 0; i < 50; i++) {
-		if (predicate()) return true;
-		await new Promise((resolve) => setTimeout(resolve, 5));
-	}
-	return predicate();
 }
 
 /**
@@ -158,43 +136,6 @@ function seedToolCall(requestId: string, narratorId: string) {
 			toolName: "Bash",
 			status: "pending",
 			createdAt: NOW,
-		})
-		.run();
-}
-
-/** A merge session reachable through its target chapter's project. */
-function seedMergeSession(sessionId: string, opts: { visibility: "private" | "public" }) {
-	const projectId = `proj-${sessionId}`;
-	const chapterId = `chap-${sessionId}`;
-	db.insert(projects)
-		.values({
-			id: projectId,
-			name: projectId,
-			ownerUserId: OWNER,
-			visibility: opts.visibility,
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
-	db.insert(chapters)
-		.values({
-			id: chapterId,
-			projectId,
-			title: chapterId,
-			branch: chapterId,
-			baseBranch: "main",
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
-	db.insert(mergeSessions)
-		.values({
-			id: sessionId,
-			targetChapterId: chapterId,
-			sourceChapterIds: [],
-			status: "waiting_decision",
-			createdAt: NOW,
-			updatedAt: NOW,
 		})
 		.run();
 }
@@ -422,133 +363,5 @@ describe("decision frame authorization", () => {
 		// Reaches the resolver, which finds nothing pending in memory and says so.
 		// The point is that it got that far rather than being dropped by the gate.
 		expect(await waitForSent(sent, (m) => m.type === "error")).toBe(true);
-	});
-
-	it("refuses a merge decision from a user who cannot write the project", async () => {
-		// A public project shares a view of the work; it must not let every signed-in
-		// user commit or roll back a conflicted merge.
-		seedMergeSession("merge-public", { visibility: "public" });
-		const { ws, sent } = openWs({ userId: STRANGER });
-
-		await handleNarratorWS.message(ws, {
-			type: "merge_decision",
-			mergeSessionId: "merge-public",
-			decision: "continue",
-		});
-
-		expect(sent).toEqual([]);
-	});
-
-	it("refuses a merge decision for an unknown session id", async () => {
-		const { ws, sent } = openWs({ userId: OWNER });
-
-		await handleNarratorWS.message(ws, {
-			type: "merge_decision",
-			mergeSessionId: "merge-nonexistent",
-			decision: "cancel",
-		});
-
-		expect(sent).toEqual([]);
-	});
-
-	it("lets the project owner decide a merge", async () => {
-		seedMergeSession("merge-owned", { visibility: "private" });
-		const { ws, sent } = openWs({ userId: OWNER });
-
-		await handleNarratorWS.message(ws, {
-			type: "merge_decision",
-			mergeSessionId: "merge-owned",
-			decision: "cancel",
-		});
-
-		// Passed the gate and reached `resolveMergeDecision`, which rejects on the
-		// half-seeded session and reports it as an error frame.
-		expect(await waitForSent(sent, (m) => m.type === "error")).toBe(true);
-	});
-});
-
-/**
- * Outbound scoping for the two frames whose payload is narrower than the whole
- * deployment: container build output (raw lines) and merge progress (conflicting
- * paths). Both used to go through `broadcastToAll`.
- */
-describe("project-scoped broadcasts", () => {
-	function seedProject(id: string, visibility: "private" | "public") {
-		db.insert(projects)
-			.values({
-				id,
-				name: id,
-				ownerUserId: OWNER,
-				visibility,
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
-			.run();
-	}
-
-	function seedChapter(id: string, projectId: string) {
-		db.insert(chapters)
-			.values({
-				id,
-				projectId,
-				title: id,
-				branch: id,
-				baseBranch: "main",
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
-			.run();
-	}
-
-	it("sends container logs only to readers of the owning project", async () => {
-		seedProject("proj-logs", "private");
-		seedChapter("chap-logs", "proj-logs");
-		const owner = openWs({ userId: OWNER });
-		const stranger = openWs({ userId: STRANGER });
-
-		eventBus.emit({
-			type: "container:log",
-			chapterId: "chap-logs",
-			line: "Step 1/9 : FROM oven/bun",
-			phase: "build",
-		});
-
-		expect(await waitUntil(() => owner.sent.some((m) => m.type === "container:log"))).toBe(true);
-		// Raw build output of a private project must not reach an outsider.
-		expect(stranger.sent).toEqual([]);
-	});
-
-	it("sends merge conflict paths only to readers of the owning project", async () => {
-		seedProject("proj-merge-evt", "private");
-		const owner = openWs({ userId: OWNER });
-		const stranger = openWs({ userId: STRANGER });
-
-		eventBus.emit({
-			type: "merge:conflict",
-			mergeSessionId: "ms-1",
-			projectId: "proj-merge-evt",
-			targetChapterId: "chap-x",
-			sourceChapterId: "chap-y",
-			index: 0,
-			total: 1,
-			conflictFiles: ["server/secret-plan.ts"],
-		});
-
-		expect(await waitUntil(() => owner.sent.some((m) => m.type === "merge:conflict"))).toBe(true);
-		expect(stranger.sent).toEqual([]);
-	});
-
-	it("drops a container log whose chapter has no resolvable project", async () => {
-		// An unknown owner must not mean "everyone".
-		const owner = openWs({ userId: OWNER });
-
-		eventBus.emit({
-			type: "container:log",
-			chapterId: "chap-nonexistent",
-			line: "orphan",
-			phase: "build",
-		});
-
-		expect(await waitUntil(() => owner.sent.length > 0)).toBe(false);
 	});
 });

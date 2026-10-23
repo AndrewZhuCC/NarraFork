@@ -1,4 +1,4 @@
-import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
+import { useContainersCapability } from "@frontend/hooks/usePlatform";
 import { api } from "@frontend/lib/api";
 import { Button, Code, Group, Loader, Modal, Stack, Text, ThemeIcon } from "@mantine/core";
 import { IconCheck, IconX } from "@tabler/icons-react";
@@ -19,12 +19,10 @@ const INSTALL_HINTS: Record<string, string> = {
 export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps) {
 	const { t } = useTranslation("containers");
 	const qc = useQueryClient();
-	const containerCapability = useChapterContainersCapability();
+	const containerCapability = useContainersCapability();
 	const containerCapabilityReason = containerCapability.reason ?? t("capabilityUnsupported");
-	const canReadPodmanStatus =
-		containerCapability.supported && containerCapability.routes.podmanStatus;
-	const canInstallPodman =
-		containerCapability.supported && containerCapability.routes.podmanInstall;
+	const canReadPodmanStatus = containerCapability.supported;
+	const canInstallPodman = containerCapability.supported;
 
 	const { data: status, isLoading } = useQuery({
 		queryKey: ["podmanStatus"],

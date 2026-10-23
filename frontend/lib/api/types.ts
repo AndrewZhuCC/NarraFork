@@ -358,7 +358,6 @@ export interface DatabaseStorageBreakdown {
 export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
-	| "chapterBound"
 	| "runningTerminal"
 	| "backgroundRunning"
 	| "nonArchived"
@@ -403,7 +402,6 @@ export interface DatabaseCleanupApiRequestSample extends FallbackDiagnostics {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
 	createdAt: string;
 	approxBytes: number;
 }

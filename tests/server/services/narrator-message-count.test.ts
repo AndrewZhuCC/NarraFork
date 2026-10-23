@@ -10,7 +10,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { eq } from "drizzle-orm";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -39,21 +38,10 @@ function seed(narratorId = "n1") {
 	db.insert(projects)
 		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: ts(), updatedAt: ts() })
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "ch1",
-			projectId: "p1",
-			title: "Chapter 1",
-			branch: "chapter/ch1",
-			baseBranch: "main",
-			createdAt: ts(),
-			updatedAt: ts(),
-		})
-		.run();
 	db.insert(narrators)
 		.values({
 			id: narratorId,
-			chapterId: "ch1",
+			contextProjectId: "p1",
 			type: "primary",
 			inheritMode: "fresh",
 			createdAt: ts(),
@@ -79,7 +67,7 @@ function addMessage(id: string, seq: number, role: "user" | "assistant" | "sys" 
 		.run();
 }
 
-/** A second narrator in the same chapter, optionally a subagent of n1. */
+/** A second narrator in the same project, optionally a subagent of n1. */
 function seedExtraNarrator(
 	id: string,
 	opts: { type?: "primary" | "subagent"; parentNarratorId?: string } = {},
@@ -87,7 +75,7 @@ function seedExtraNarrator(
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: "ch1",
+			contextProjectId: "p1",
 			type: opts.type ?? "primary",
 			parentNarratorId: opts.parentNarratorId ?? null,
 			inheritMode: "fresh",

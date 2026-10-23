@@ -171,6 +171,24 @@ async function makeRoutes(
 }
 
 describe("plugin UI routes", () => {
+	test("refuses a session on the retired graph surface", async () => {
+		const routes = await makeRoutes();
+		const create = await routes.request("http://localhost/ui/sessions", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				pluginId,
+				version,
+				hash,
+				contributionId: "panel",
+				panelInstanceId: "panel-graph",
+				surface: "graph",
+				surfaceScope: "workspace",
+			}),
+		});
+		expect(create.status).toBe(400);
+	});
+
 	test("creates a bound session, returns bootstrap metadata, and serves immutable shell assets", async () => {
 		const routes = await makeRoutes();
 		const create = await routes.request("http://localhost/ui/sessions", {
@@ -1181,31 +1199,17 @@ describe("isSurfaceAllowedForView", () => {
 	test("an exact surface match is allowed", () => {
 		expect(isSurfaceAllowedForView(["workspace"], "workspace")).toBe(true);
 		expect(isSurfaceAllowedForView(["focus", "settings"], "settings")).toBe(true);
-		expect(isSurfaceAllowedForView(["graph"], "graph")).toBe(true);
 	});
 
-	test("a focus-only view is admitted on graph (already-published plugins keep working)", () => {
-		// This is the compatibility rule: without it every existing plugin that
-		// declared `focus` would fail inside a chapter node with SCOPE_DENIED.
-		expect(isSurfaceAllowedForView(["focus"], "graph")).toBe(true);
-		expect(isSurfaceAllowedForView(["focus", "workspace"], "graph")).toBe(true);
-	});
-
-	test("a graph-only view is NOT admitted on focus", () => {
-		// Declaring graph alone states the view only makes sense at node size, so the
-		// family rule is deliberately one-way.
-		expect(isSurfaceAllowedForView(["graph"], "focus")).toBe(false);
-	});
-
-	test("an unrelated surface is still refused on graph", () => {
-		expect(isSurfaceAllowedForView(["workspace"], "graph")).toBe(false);
-		expect(isSurfaceAllowedForView(["settings"], "graph")).toBe(false);
-		expect(isSurfaceAllowedForView([], "graph")).toBe(false);
-	});
-
-	test("the family rule does not leak to other surfaces", () => {
+	test("any other surface is refused", () => {
 		expect(isSurfaceAllowedForView(["focus"], "workspace")).toBe(false);
 		expect(isSurfaceAllowedForView(["focus"], "settings")).toBe(false);
 		expect(isSurfaceAllowedForView(["workspace"], "director")).toBe(false);
+	});
+
+	test("a view that only declared the retired graph surface is admitted nowhere", () => {
+		// Its manifest parses to an empty surface list.
+		expect(isSurfaceAllowedForView([], "focus")).toBe(false);
+		expect(isSurfaceAllowedForView([], "workspace")).toBe(false);
 	});
 });

@@ -9,8 +9,8 @@
  *   - a FILE row named `feature` with an `A` badge in the git panel, with the
  *     three real files missing entirely (the tree splits on "/" and discards the
  *     empty trailing segment);
- *   - an unreadable `Bun.file()` target in `copyDirtyFiles`, silently dropping
- *     the whole folder from a review worktree;
+ *   - an empty diff from `getFileDiff`, which would not see a file inside the
+ *     new directory as untracked;
  *   - a `git clean -f -- src/feature/` target in `discardFiles`, which deletes
  *     every sibling when the user asked to discard one file.
  *
@@ -79,24 +79,6 @@ describe("untracked directories are expanded to files", () => {
 		// changes its default, this assertion fails and the guard below can be
 		// revisited rather than silently becoming a no-op.
 		expect(collapsed.split("\n")).toContain("?? newdir/");
-	});
-
-	test("getStatus lists every file inside a new directory, never the directory", async () => {
-		const repo = await makeRepo();
-		writeNested(repo);
-
-		const paths = (await gitService.getStatus(repo))
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => line.slice(3));
-
-		expect(paths).toContain("newdir/a.txt");
-		expect(paths).toContain("newdir/sub/b.txt");
-		expect(paths).toContain("loose.txt");
-		// The directory entry itself must be gone: it is what the panel rendered as
-		// a file, and what `Bun.file()` could not read.
-		expect(paths).not.toContain("newdir/");
-		expect(paths.some((path) => path.endsWith("/"))).toBe(false);
 	});
 
 	test("getStatusSummary counts and lists the files, not one directory", async () => {
@@ -387,10 +369,7 @@ describe("untracked directories are expanded to files", () => {
 		writeFileSync(join(repo, "build", "out.js"), "generated\n");
 		writeFileSync(join(repo, ".gitignore"), "build/\n");
 
-		const paths = (await gitService.getStatus(repo))
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => line.slice(3));
+		const paths = (await gitService.getStatusSummary(repo)).files.map((file) => file.path);
 
 		// Enumerating a directory ourselves would have required reimplementing these
 		// semantics; letting git expand keeps them for free.
@@ -416,10 +395,9 @@ describe("untracked directories are expanded to files", () => {
 
 		await gitService.discardFiles(repo, ["newdir/a.txt"]);
 
-		const remaining = (await gitService.getStatus(repo))
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => line.slice(3));
+		const remaining = (await gitService.getStatusSummary(repo, { ttlMs: 0 })).files.map(
+			(file) => file.path,
+		);
 
 		expect(remaining).not.toContain("newdir/a.txt");
 		// The destructive version of this bug: `git clean -f -- newdir/` would have

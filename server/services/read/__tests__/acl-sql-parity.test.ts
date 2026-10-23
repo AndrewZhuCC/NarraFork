@@ -93,9 +93,13 @@ describe("the neutral rules keep their load-bearing clauses", () => {
 		expect(text).not.toContain("coalesce(n.acl_root_narrator_id");
 	});
 
-	test("the narrator project gate is resolved chapter-first, with no coalesce fallthrough", () => {
+	test("the narrator project gate is the explicit context, else only the primary link", () => {
+		// Mirrors `resolveNarratorProjectId`: an `additional` link (another working directory)
+		// must never become the project that gates reading.
 		const text = normalize(narratorReadableText("n"));
-		expect(text).toContain("case when jn.chapter_id is null then jn.context_project_id end");
+		expect(text).toContain(
+			"coalesce(jn.context_project_id, (select npl.project_id from narrator_project_links npl where npl.narrator_id = jn.id and npl.role = 'primary'))",
+		);
 	});
 
 	test("write_audience never appears in a READ predicate", () => {
@@ -107,9 +111,11 @@ describe("the neutral rules keep their load-bearing clauses", () => {
 	test("a project id expression is reached through an EXISTS on projects", () => {
 		// A join would let several grants on one project duplicate rows and corrupt `limit n + 1`
 		// paging.
-		const text = normalize(projectReadableForIdText("chapters.project_id"));
+		const text = normalize(projectReadableForIdText("narrators.context_project_id"));
 		expect(
-			text.startsWith("exists ( select 1 from projects p where p.id = chapters.project_id"),
+			text.startsWith(
+				"exists ( select 1 from projects p where p.id = narrators.context_project_id",
+			),
 		).toBe(true);
 	});
 });

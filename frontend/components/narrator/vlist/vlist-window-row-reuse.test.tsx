@@ -87,7 +87,6 @@ const PROP_KEYS = {
 	specCarryoverActions: true,
 	errorNoticeActions: true,
 	injectionGuardActions: true,
-	reviewFeedbackActions: true,
 	compactActions: true,
 	compactCancelTitle: true,
 	askInPassingPending: true,

@@ -22,17 +22,22 @@ export function normalizeDefaultNarratorWriteAudience(
 	return value === "owner" || value === "project" || value === "public" ? value : "auto";
 }
 
-/** Creation only: explicit audiences win; only global write defaults are clamped. */
+/**
+ * Creation only: explicit audiences win; only global write defaults are clamped.
+ *
+ * `projectPageId` is set for sessions a user opens from a project page: "auto" makes
+ * those project-visible, and everything else private.
+ */
 export function resolveNarratorAudiences(
 	visibility: NarratorVisibility | undefined,
 	writeAudience: NarratorWriteAudience | undefined,
-	chapterId: string | null | undefined,
+	projectPageId: string | null | undefined,
 	defaultVisibility: NarraForkSettings["agent"]["defaultNarratorVisibility"] = "auto",
 	defaultWriteAudience: NarraForkSettings["agent"]["defaultNarratorWriteAudience"] = "auto",
 ): { visibility: NarratorVisibility; writeAudience: NarratorWriteAudience } {
 	const configured = normalizeDefaultNarratorVisibility(defaultVisibility);
 	const effectiveVisibility =
-		visibility ?? (configured === "auto" ? (chapterId ? "project" : "private") : configured);
+		visibility ?? (configured === "auto" ? (projectPageId ? "project" : "private") : configured);
 	const configuredWrite = normalizeDefaultNarratorWriteAudience(defaultWriteAudience);
 	const effectiveWriteAudience =
 		writeAudience ??

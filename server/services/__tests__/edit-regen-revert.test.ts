@@ -102,7 +102,6 @@ function seed(cwd: string) {
 	db.insert(narrators)
 		.values({
 			id: "n1",
-			chapterId: null,
 			type: "primary",
 			variant: "primary",
 			inheritMode: "fresh",

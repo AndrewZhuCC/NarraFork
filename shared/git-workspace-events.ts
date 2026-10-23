@@ -37,7 +37,6 @@ export interface GitWorkspaceSubscribe {
 	type: "git_workspace_subscribe";
 	subscriptionId: string;
 	narratorId?: string;
-	chapterId?: string;
 	workspaceKey?: string;
 	view?: GitWorkspaceView;
 }
@@ -53,7 +52,6 @@ export interface GitWorkspaceEventIdentity {
 	workspaceKey: string;
 	repositoryKey: string;
 	narratorId?: string;
-	chapterId?: string;
 }
 export type GitWorkspaceServerMessage =
 	| ({ type: "git_workspace_subscribed" } & GitWorkspaceEventIdentity)

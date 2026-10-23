@@ -44,8 +44,6 @@ const DIRECT_WRITERS: Record<string, string> = {
 	"server/services/narrator-messages.ts": "block deletion, truncation, card dismissal, COW",
 	// Card state and envelope metadata.
 	"server/routes/narrators.ts": "manual plan/compact cards and their state",
-	"server/services/commit-sync-service.ts": "commit card state",
-	"server/services/merge-summary-service.ts": "merge summary cards",
 	"server/services/narrator-subagent-recovery.ts": "recovery card state and parent call result",
 	"server/services/narrator-tree-snapshot-hooks.ts": "tree snapshot metadata",
 	"server/lib/usage-tracking.ts": "message usage and cost",
@@ -78,11 +76,8 @@ const DIRECT_WRITERS: Record<string, string> = {
 	"server/services/narrator-refs-backfill.ts": "lazy fork ref backfill",
 	"server/services/narrator-refs/seq-store.ts": "ref seq shifting",
 	"server/services/subagent-extract.ts": "subagent extraction copy",
-	// Bulk jobs: import, archive, sync, cleanup, migration, revision triggers.
+	// Bulk jobs: import, cleanup, migration, revision triggers.
 	"server/services/session-interchange/import.ts": "session import",
-	"server/services/project-archive/legacy-sync-worker.ts": "legacy archive sync",
-	"server/services/project-db-sync.ts": "project database sync",
-	"server/routes/projects.ts": "project purge",
 	"server/services/database-cleanup-service.ts": "storage cleanup",
 	"server/db/migrate-role-to-disp.ts": "one-off role migration",
 	"server/services/agent-runtime/model-history-revision-sql.ts": "revision trigger SQL",

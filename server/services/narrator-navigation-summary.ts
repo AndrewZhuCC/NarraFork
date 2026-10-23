@@ -1,24 +1,23 @@
 import type { NarratorNavigationSummary } from "@shared/narrator-panel-state";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { narrators, projects } from "../db/schema";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { canReadNarrator, NARRATOR_ACL_COLUMNS, type NarratorPrincipal } from "./narrator-acl";
-import { projectReadableWhere, projectReadableWhereForColumn } from "./project-acl";
+import { resolveNarratorProjectId } from "./narrator-project";
+import { projectReadableWhereForColumn } from "./project-acl";
 
 /** Navigation is a separate read surface, never a title-based authorization guess. */
 export async function getNarratorNavigationSummary(
 	row: Pick<
 		typeof narrators.$inferSelect,
-		"parentNarratorId" | "variant" | "chapterId" | "contextProjectId"
+		"id" | "parentNarratorId" | "variant" | "contextProjectId"
 	>,
 	principal: NarratorPrincipal,
 ): Promise<NarratorNavigationSummary> {
 	const result: NarratorNavigationSummary = {
 		parentNarratorId: null,
 		parentNarratorTitle: null,
-		chapterId: null,
-		chapterTitle: null,
 		projectId: null,
 	};
 	let context = row;
@@ -33,25 +32,14 @@ export async function getNarratorNavigationSummary(
 		result.parentNarratorTitle = parent.title;
 		context = parent;
 	}
-	if (context.chapterId) {
-		const chapter = await db
-			.select({ id: chapters.id, title: chapters.title, projectId: projects.id })
-			.from(chapters)
-			.innerJoin(projects, eq(projects.id, chapters.projectId))
-			.where(and(eq(chapters.id, context.chapterId), projectReadableWhere(principal)))
-			.get();
-		if (chapter) {
-			result.chapterId = chapter.id;
-			result.chapterTitle = chapter.title;
-			result.projectId = chapter.projectId;
-		}
-	} else if (context.contextProjectId) {
+	const contextProjectId = await resolveNarratorProjectId(context);
+	if (contextProjectId) {
 		const project = await db
 			.select({ id: projects.id })
 			.from(projects)
 			.where(
 				and(
-					eq(projects.id, context.contextProjectId),
+					eq(projects.id, contextProjectId),
 					projectReadableWhereForColumn(principal, sql`projects.id`),
 				),
 			)
@@ -67,8 +55,6 @@ export async function getNarratorNavigationSummary(
 			return {
 				parentNarratorId: null,
 				parentNarratorTitle: null,
-				chapterId: null,
-				chapterTitle: null,
 				projectId: null,
 			};
 	}

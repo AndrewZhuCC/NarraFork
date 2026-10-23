@@ -17,7 +17,6 @@ export type WorktreeResourceRecord = Pick<
 >;
 
 export type WorktreeResourceOwner =
-	| { kind: "legacyChapter"; chapterId: string }
 	| { kind: "legacyNarrator"; narratorId: string }
 	| { kind: "legacyStandalone" }
 	| { kind: "worktreeResource"; worktreeResourceId: string };
@@ -34,7 +33,7 @@ export function resolveWorktreeResourceOwner(input: unknown): WorktreeResourceOw
 	if (!input || typeof input !== "object" || Array.isArray(input))
 		throw new WorktreeResourceError("OWNER_SELECTOR_INVALID");
 	const selector = input as Record<string, unknown>;
-	const values = ["worktreeResourceId", "chapterId", "narratorId"] as const;
+	const values = ["worktreeResourceId", "narratorId"] as const;
 	for (const key of values) {
 		const value = selector[key];
 		if (
@@ -44,12 +43,11 @@ export function resolveWorktreeResourceOwner(input: unknown): WorktreeResourceOw
 		)
 			throw new WorktreeResourceError("OWNER_SELECTOR_INVALID");
 	}
-	const { worktreeResourceId, chapterId, narratorId } = selector;
+	const { worktreeResourceId, narratorId } = selector;
 	if (values.filter((key) => selector[key] != null).length > 1)
 		throw new WorktreeResourceError("OWNER_SELECTOR_MIXED");
 	if (typeof worktreeResourceId === "string")
 		return { kind: "worktreeResource", worktreeResourceId };
-	if (typeof chapterId === "string") return { kind: "legacyChapter", chapterId };
 	if (typeof narratorId === "string") return { kind: "legacyNarrator", narratorId };
 	return { kind: "legacyStandalone" };
 }

@@ -187,7 +187,7 @@ describe("SQLite lifecycle startup sequence", () => {
 		// statement about ORDER rather than about FTS being absent altogether.
 		const afterwards = tableNames(lifecycle.connection).filter((name) => name.endsWith("_fts"));
 		expect(afterwards).toContain("narrator_messages_fts");
-		expect(afterwards).toContain("chapters_fts");
+		expect(afterwards).toContain("narrators_fts");
 	}, 120_000);
 
 	test("patches a column an older build never created", async () => {

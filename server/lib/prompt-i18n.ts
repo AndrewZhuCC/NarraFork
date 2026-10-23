@@ -5,9 +5,8 @@
  * domain under `./prompts` so new locales can fall back without duplicating
  * every internal instruction.
  */
-export type { Locale, MergeSummaryLabelKey, ToolMessageKey } from "./i18n";
+export type { Locale, ToolMessageKey } from "./i18n";
 export {
-	getMergeSummaryLabel,
 	getToolMessage,
 	getToolMessageWithParams,
 	getUserLanguage,
@@ -17,10 +16,6 @@ export { getBotModePrompt } from "./prompts/bot";
 export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
-export {
-	buildReviewSystemPrompt,
-	getReviewStartMessage,
-} from "./prompts/review";
 export type {
 	SetupAuthorization,
 	SetupAuthorizationResolution,

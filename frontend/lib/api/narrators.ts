@@ -578,7 +578,6 @@ export interface BrokenModelNarrator {
 	title: string | null;
 	model: string;
 	status: string;
-	chapterId: string | null;
 	hasBrokenPendingRestore: boolean;
 }
 
@@ -724,14 +723,12 @@ export const narratorsApi = {
 	ensureWriteDocumentSource,
 	readTextDocumentRange,
 	listNarrators: (opts?: {
-		chapterId?: string;
 		standalone?: boolean;
 		status?: string;
 		sortBy?: string;
 		sortOrder?: string;
 	}) => {
 		const params = new URLSearchParams();
-		if (opts?.chapterId) params.set("chapterId", opts.chapterId);
 		if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
@@ -741,9 +738,7 @@ export const narratorsApi = {
 	},
 	listNarratorsPaginated: (opts?: {
 		projectId?: string;
-		standalone?: boolean | "all";
 		status?: string;
-		filter?: string;
 		sortBy?: string;
 		sortOrder?: string;
 		limit?: number;
@@ -755,10 +750,7 @@ export const narratorsApi = {
 	}) => {
 		const params = new URLSearchParams();
 		if (opts?.projectId) params.set("projectId", opts.projectId);
-		if (opts?.standalone === "all") params.set("standalone", "all");
-		else if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
-		if (opts?.filter) params.set("filter", opts.filter);
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
 		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
 		if (opts?.limit) params.set("limit", String(opts.limit));
@@ -910,7 +902,6 @@ export const narratorsApi = {
 		}>(`/narrators/${id}/skills${qs ? `?${qs}` : ""}`);
 	},
 	createNarrator: (data: {
-		chapterId?: string | null;
 		contextProjectId?: string;
 		type?: string;
 		model?: string;
@@ -1273,7 +1264,7 @@ export const narratorsApi = {
 	// per-narrator one structurally cannot.
 	getAllAsyncQuestions: () =>
 		request<{
-			items: (AsyncQuestion & { narratorTitle: string | null; chapterId: string | null })[];
+			items: (AsyncQuestion & { narratorTitle: string | null })[];
 			openCount: number;
 			awaitedCount: number;
 		}>("/narrators/questions/all"),
@@ -1318,7 +1309,6 @@ export const narratorsApi = {
 		return request<{
 			items: (AsyncQuestion & {
 				narratorTitle: string | null;
-				chapterId: string | null;
 				canAct?: boolean;
 			})[];
 			nextCursor: string | null;
@@ -2027,21 +2017,6 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
-	/**
-	 * Start a turn for a review conclusion the narrator already holds.
-	 *
-	 * Writes no message: the conclusion row IS the user message and has been in the
-	 * history since the review concluded. `started: false` is a normal outcome (the
-	 * narrator is busy, or the row was already handled), not an error — either way the
-	 * findings are in the history the next request rebuilds.
-	 */
-	applyReviewFeedback: (narratorId: string, messageId: string) =>
-		request<{ ok: boolean; started: boolean; reason: string }>(
-			`/narrators/${narratorId}/review-feedback/${messageId}/apply`,
-			{
-				method: "POST",
-			},
-		),
 	dismissCwdRecoveryMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/cwd-recovery-messages/${messageId}`,
@@ -2210,7 +2185,7 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
 		),
 
-	// Ordinary conversation fork (standalone output, including legacy chapter sources).
+	// Ordinary conversation fork (standalone output).
 	// The fork point is identified by the local narrator message id: only
 	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
 	// from a user message.
@@ -2251,7 +2226,7 @@ export const narratorsApi = {
 			method: "DELETE",
 		}),
 	promoteNarrator: (narratorId: string) =>
-		request<{ type: "unlocked" | "forked"; narratorId: string; narrator?: ApiEntity }>(
+		request<{ type: "unlocked"; narratorId: string; narrator?: ApiEntity }>(
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
 		),

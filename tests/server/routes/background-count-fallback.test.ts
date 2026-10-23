@@ -108,7 +108,9 @@ describe("auxiliary background count failures", () => {
 				activeBackgroundServiceCount: 2,
 			},
 			{ type: "subagent", id: SECOND_ID },
-			{ type: "chapter", id: "chapter-tab", narratorId: FIRST_ID },
+			// Legacy tab type, migrated to "narrator" before enrichment: a second entry for the
+			// same narrator, so the batch read sees the id twice.
+			{ type: "session", id: FIRST_ID },
 		];
 
 		const enriched = await broadcastTabsSnapshot(USER_ID, tabs);
@@ -171,7 +173,6 @@ describe("auxiliary background count failures", () => {
 			status: "working",
 			messageCount: 0,
 			activeTerminalCount: 0,
-			chapter: null,
 			viewers: [],
 		});
 		expectUnknownCounts(first.items[0]);

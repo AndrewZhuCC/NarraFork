@@ -2,7 +2,7 @@
  * Unified backend i18n module.
  *
  * Provides a single source of truth for all server-side localised strings.
- * Messages are organised by namespace (e.g. "tool.*", "merge.*", "gateway.*").
+ * Messages are organised by namespace (e.g. "tool.*", "gateway.*").
  */
 
 import {
@@ -283,34 +283,19 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 			'[可选工具 "{toolName}" 刚刚从本次会话中卸载。除非它再次被加载，否则不要使用这个工具。]',
 	},
 	"tool.forkNarratorSuccess": {
-		en: "New narrator forked successfully.\n\nNarrator ID: {narratorId}\nTitle: {title}\n{chapterInfo}\nThe new narrator is now running independently with your message.",
+		en: "New narrator forked successfully.\n\nNarrator ID: {narratorId}\nTitle: {title}\n\nThe new narrator is now running independently with your message.",
 		"zh-CN":
-			"叙述者分叉成功。\n\n叙述者 ID：{narratorId}\n标题：{title}\n{chapterInfo}\n新叙述者正在独立运行你的消息。",
-	},
-	"tool.forkNarratorChapterInfo": {
-		en: "Chapter ID: {chapterId}\nChapter: {chapterTitle}\n",
-		"zh-CN": "章节 ID：{chapterId}\n章节：{chapterTitle}\n",
+			"叙述者分叉成功。\n\n叙述者 ID：{narratorId}\n标题：{title}\n\n新叙述者正在独立运行你的消息。",
 	},
 	"tool.forkNarratorError": {
 		en: "Failed to fork narrator: {error}",
 		"zh-CN": "分叉叙述者失败：{error}",
 	},
 	"tool.forkNarratorDepthExceeded": {
-		en: "Refused: this narrator is already {depth} forks deep, and the limit is {limit}. Each fork creates a chapter, a git worktree and a narrator that can fork again, so the chain is capped. Do the work here, or ask the user to start a new branch.",
+		en: "Refused: this narrator is already {depth} forks deep, and the limit is {limit}. Each fork creates a narrator that can fork again, so the chain is capped. Do the work here, or ask the user to start a new session.",
 		"zh-CN":
-			"已拒绝：当前叙述者已处于第 {depth} 层分叉，上限是 {limit} 层。每次分叉都会创建章节、git worktree 和一个还能继续分叉的叙述者，因此链条有上限。请在当前叙述者内完成工作，或请用户另起一个分支。",
+			"已拒绝：当前叙述者已处于第 {depth} 层分叉，上限是 {limit} 层。每次分叉都会创建一个还能继续分叉的叙述者，因此链条有上限。请在当前叙述者内完成工作，或请用户另开一个会话。",
 	},
-	// --- merge.* (migrated from prompt-i18n.ts mergeSummaryLabels) ---
-	"merge.branch": { en: "Branch", "zh-CN": "分支" },
-	"merge.mergedInto": { en: "Merged into", "zh-CN": "合并到" },
-	"merge.strategy": { en: "Strategy", "zh-CN": "策略" },
-	"merge.mergeCommit": { en: "Merge commit", "zh-CN": "合并提交" },
-	"merge.mergedBy": { en: "Merged by", "zh-CN": "合并者" },
-	"merge.chapterTitle": { en: "Chapter title", "zh-CN": "章节标题" },
-	"merge.description": { en: "Description", "zh-CN": "描述" },
-	"merge.commits": { en: "Commits", "zh-CN": "提交记录" },
-	"merge.diffSummary": { en: "Diff summary", "zh-CN": "变更统计" },
-	"merge.headerMerged": { en: "Branch Merged", "zh-CN": "分支已合并" },
 	// --- gateway.* (IM gateway command responses) ---
 	"gateway.rateLimited": {
 		en: "⏳ Rate limited. Please wait a moment.",
@@ -868,7 +853,6 @@ export type ToolMessageKey =
 	| "toolLoaded"
 	| "toolUnloaded"
 	| "forkNarratorSuccess"
-	| "forkNarratorChapterInfo"
 	| "forkNarratorError"
 	| "forkNarratorDepthExceeded";
 
@@ -882,23 +866,4 @@ export function getToolMessageWithParams(
 	params: Record<string, string | number> = {},
 ): string {
 	return t(`tool.${key}`, locale, params);
-}
-
-export type MergeSummaryLabelKey =
-	| "branch"
-	| "mergedInto"
-	| "strategy"
-	| "mergeCommit"
-	| "mergedBy"
-	| "chapterTitle"
-	| "description"
-	| "commits"
-	| "diffSummary"
-	| "headerMerged";
-
-export function getMergeSummaryLabel(
-	key: MergeSummaryLabelKey,
-	locale: Locale = DEFAULT_LOCALE,
-): string {
-	return t(`merge.${key}`, locale);
 }

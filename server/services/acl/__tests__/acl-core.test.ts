@@ -22,7 +22,7 @@
  */
 import { beforeAll, describe, expect, test } from "bun:test";
 import { db } from "../../../db";
-import { aclGrants, chapters, narrators, projects, users } from "../../../db/schema";
+import { aclGrants, narratorProjectLinks, narrators, projects, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import {
 	type AclCapability,
@@ -43,10 +43,11 @@ const TAG = Date.now();
 let member: string;
 let outsider: string;
 let projectId: string;
-let chapterId: string;
-/** A narrator inside `chapterId`, i.e. inside `projectId`. */
+/** A narrator whose explicit context is `projectId`. */
 let narratorInProject: string;
-/** A narrator with no chapter and no project context. */
+/** A narrator indexed into `projectId` by its working directory, without explicit context. */
+let indexedNarrator: string;
+/** A narrator with no project. */
 let standaloneNarrator: string;
 
 const asUser = (userId: string): AclPrincipal => ({ userId, role: "user" });
@@ -112,32 +113,37 @@ beforeAll(async () => {
 		updatedAt: now,
 	});
 
-	chapterId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "chapter",
-		branch: `chapter/${TAG}`,
-		baseBranch: "main",
-		createdAt: now,
-		updatedAt: now,
-	});
-
 	narratorInProject = generateId();
+	indexedNarrator = generateId();
 	standaloneNarrator = generateId();
 	await db.insert(narrators).values([
-		{ id: narratorInProject, chapterId, createdAt: now, updatedAt: now },
+		{ id: narratorInProject, contextProjectId: projectId, createdAt: now, updatedAt: now },
+		{ id: indexedNarrator, cwd: `/tmp/acl-${TAG}`, createdAt: now, updatedAt: now },
 		{ id: standaloneNarrator, createdAt: now, updatedAt: now },
 	]);
+	await db.insert(narratorProjectLinks).values({
+		narratorId: indexedNarrator,
+		projectId,
+		role: "primary",
+		source: "cwd",
+		directory: `/tmp/acl-${TAG}`,
+		updatedAt: now,
+	});
 });
 
 // ─── 1. Ancestor chains ──────────────────────────────────────────────────
 
 describe("ancestor chains", () => {
-	test("a narrator in a chapter chains through chapter and project to global", async () => {
+	test("a narrator with a project context chains through the project to global", async () => {
 		const chain = await resolveAncestorChain({ type: "narrator", id: narratorInProject });
-		expect(chain.map((s) => s.type)).toEqual(["chapter", "project", "global"]);
-		expect(chain[1].id).toBe(projectId);
+		expect(chain.map((s) => s.type)).toEqual(["project", "global"]);
+		expect(chain[0].id).toBe(projectId);
+	});
+
+	test("a narrator indexed into a project by its cwd chains through that project", async () => {
+		const chain = await resolveAncestorChain({ type: "narrator", id: indexedNarrator });
+		expect(chain.map((s) => s.type)).toEqual(["project", "global"]);
+		expect(chain[0].id).toBe(projectId);
 	});
 
 	test("a standalone narrator chains straight to global", async () => {

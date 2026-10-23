@@ -142,7 +142,6 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				substatus: [],
 				title: "Existing title",
 				cwd: import.meta.dir,
-				chapterId: null,
 			}),
 			persistUserMessage: async (id: string, text: string, blocks: unknown[]) =>
 				saveMessage(id, text, blocks),

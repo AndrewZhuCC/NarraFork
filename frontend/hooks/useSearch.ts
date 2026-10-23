@@ -5,7 +5,7 @@ import type { SearchInclude, SearchSortMode } from "../lib/search-utils";
 
 export function useSearch(
 	query: string,
-	entities = "chapters,messages,narrators",
+	entities = "messages,narrators",
 	sort: SearchSortMode = "relevance",
 	include: readonly SearchInclude[] = [],
 ) {

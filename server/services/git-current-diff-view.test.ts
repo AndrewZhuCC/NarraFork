@@ -25,7 +25,6 @@ import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import {
-	chapters,
 	fileAttributions,
 	fileChangeEffects,
 	fileChangeScopes,
@@ -43,7 +42,7 @@ import type { JwtPayload } from "../lib/auth";
 import { generateId } from "../lib/id";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
-import { gitRoutes } from "../routes/git";
+import { narratorGitRoutes } from "../routes/git";
 import { recordAttribution } from "./file-attribution-service";
 import { fileChangeLocalIo } from "./file-change-local-io";
 import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
@@ -704,7 +703,7 @@ describe("current Git targets matched against recorded writes", () => {
 			.set({ changedAt: "2026-01-01T00:00:00.000Z" })
 			.where(eq(fileAttributions.workspacePath, workspace));
 		const projectId = generateId();
-		const chapterId = generateId();
+		const sessionId = generateId();
 		const now = new Date().toISOString();
 		await db.insert(projects).values({
 			id: projectId,
@@ -714,13 +713,13 @@ describe("current Git targets matched against recorded writes", () => {
 			createdAt: now,
 			updatedAt: now,
 		});
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
+		await db.insert(narrators).values({
+			id: sessionId,
 			title: "current api",
-			branch: "main",
-			baseBranch: "main",
-			worktreePath: workspace,
+			cwd: workspace,
+			contextProjectId: projectId,
+			ownerUserId: userId,
+			traits: ["standalone"],
 			createdAt: now,
 			updatedAt: now,
 		});
@@ -729,8 +728,8 @@ describe("current Git targets matched against recorded writes", () => {
 			c.set("user", { sub: userId, role: "admin", iat: 0, exp: 2_147_483_647 });
 			await next();
 		});
-		app.route("/chapters", gitRoutes);
-		const route = `http://localhost/chapters/${chapterId}/git/modifications`;
+		app.route("/narrators", narratorGitRoutes);
+		const route = `http://localhost/narrators/${sessionId}/git/modifications`;
 		const response = await app.request(`${route}?scope=uncommitted&projection=byFile`);
 		expect(response.status).toBe(200);
 		const combined = await response.json();

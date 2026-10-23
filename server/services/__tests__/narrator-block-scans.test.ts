@@ -30,7 +30,6 @@ const legacyIndexed = () =>
 			)
 			.get() as { n: number }
 	).n;
-const { mergeSummaryService } = await import("../merge-summary-service");
 const { referencedUploadOwnerIds } = await import("../storage-service");
 const { compactToolLoadingEpoch } = await import("../narrator-epochs");
 
@@ -132,132 +131,6 @@ afterAll(() => {
 	sqlite.close();
 });
 
-describe("merge summary cards", () => {
-	// Nanoid-like ids: the scan is a case-insensitive substring match, so a word like "chA"
-	// would also match the "Cha" of `sourceChapterId`.
-	const A = "Qx7Lm2pR";
-	const B = "Zp4Rt8vN";
-	const card = (chapterId: string, round: number, commitSha: string | null, isLatest = false) => [
-		{
-			type: "merge_summary",
-			sourceBranch: "feature",
-			sourceChapterId: chapterId,
-			targetBranch: "main",
-			strategy: "merge",
-			commitSha,
-			mergedBy: null,
-			mergeRound: round,
-			isLatest,
-			summary: "did things",
-			modelText: "[Merged] feature → main\n\ndid things",
-		},
-	];
-	const at = (second: number) => `2026-10-01T00:00:0${second}.000Z`;
-
-	function seedCards(): void {
-		envelope("c1", card(A, 1, "sha1"), { createdAt: at(1) });
-		envelope("c2", card(A, 2, "sha2"), { createdAt: at(2) });
-		envelope("c3", card(A, 3, null, true), { createdAt: at(3) });
-		// Same commit, another chapter; and a message that only mentions the chapter.
-		envelope("c4", card(B, 1, "sha1", true), { createdAt: at(4) });
-		envelope("text", [{ type: "text", text: `${A} was merged` }], { createdAt: at(5) });
-	}
-
-	const find = async (chapterId: string, commitSha: string | null) =>
-		(await mergeSummaryService._findCards(chapterId, commitSha))
-			.map((row) => ({ id: row.id, round: mergeSummaryService._mergeRoundOf(row.contentJson) }))
-			.sort((a, b) => a.id.localeCompare(b.id));
-
-	const lookups: Array<[string, string | null]> = [
-		[A, null],
-		[A, "sha1"],
-		[A, "sha2"],
-		[B, null],
-		[B, "sha2"],
-		["Mn3Hy6sT", null],
-	];
-
-	test("block-format cards are found as the content_json scan finds them, from their rows", async () => {
-		seedCards();
-		await convert();
-		for (const id of ["c1", "c2", "c3", "c4", "text"]) expect(bodyFormat(id)).toBe(2);
-		expect(legacyIndexed()).toBe(0);
-		for (const [chapterId, commitSha] of lookups) {
-			const { off, on } = await both(() => find(chapterId, commitSha));
-			expect(on).toEqual(off);
-		}
-		expect((await find(A, null)).map((row) => row.id)).toEqual(["c1", "c2", "c3"]);
-
-		diverge("c1", card("Mn3Hy6sT", 1, "sha1"));
-		const { off, on } = await both(async () => (await find(A, null)).map((row) => row.id));
-		expect(off).toEqual(["c2", "c3"]);
-		expect(on).toEqual(["c1", "c2", "c3"]);
-	});
-
-	test("finds legacy envelopes written after the backfill finished, through the index", async () => {
-		envelope("c1", card(A, 1, "sha1"), { createdAt: at(1) });
-		await convert();
-		expect(backfill.blockBackfillStatus().convert?.complete).toBe(true);
-		expect(legacyIndexed()).toBe(0);
-		// An import, or a write while block writes were off: legacy again, job long done.
-		envelope("c2", card(A, 2, "sha2"), { createdAt: at(2) });
-		expect(legacyIndexed()).toBe(1);
-		const { off, on } = await both(async () => (await find(A, null)).map((row) => row.id));
-		expect(on).toEqual(off);
-		expect(on).toEqual(["c1", "c2"]);
-		const plan = sqlite
-			.prepare(
-				"EXPLAIN QUERY PLAN SELECT id FROM narrator_messages WHERE body_format = 1 AND content_json LIKE '%x%'",
-			)
-			.all() as Array<{ detail: string }>;
-		expect(plan.map((row) => row.detail).join("\n")).toContain("idx_messages_legacy_body");
-	});
-
-	test("queued and legacy cards are still matched on content_json", async () => {
-		envelope("c1", card(A, 1, "sha1"), { createdAt: at(1) });
-		await convert();
-		rewrite("c1", card(A, 1, "sha9"));
-		expect(queued("c1")).toBe(true);
-		settings.narratorBlocks.write = false;
-		envelope("c2", card(A, 2, "sha2", true), { createdAt: at(2) });
-		expect(bodyFormat("c2")).toBe(1);
-		expect(legacyIndexed()).toBe(1);
-		for (const commitSha of [null, "sha1", "sha9", "sha2"]) {
-			const { off, on } = await both(() => find(A, commitSha));
-			expect(on).toEqual(off);
-		}
-		expect((await find(A, "sha9")).map((row) => row.id)).toEqual(["c1"]);
-		expect((await find(A, "sha2")).map((row) => row.id)).toEqual(["c2"]);
-	});
-
-	test("unmerge deletes the same card and restores the same latest either way", async () => {
-		const outcomes = [];
-		for (const read of [false, true]) {
-			reset();
-			seedCards();
-			await convert();
-			settings.narratorBlocks.read = read;
-			const result = await mergeSummaryService.cleanupForMerge(A, null);
-			const cards = sqlite
-				.prepare(
-					`SELECT id, json_extract(content_json, '$[0].isLatest') AS isLatest
-					 FROM narrator_messages WHERE id LIKE 'c%' ORDER BY id`,
-				)
-				.all();
-			outcomes.push({ result, cards });
-		}
-		expect(outcomes[0]).toEqual({
-			result: { deletedCount: 1, narratorIds: ["n1"] },
-			cards: [
-				{ id: "c1", isLatest: 0 },
-				{ id: "c2", isLatest: 1 },
-				{ id: "c4", isLatest: 1 },
-			],
-		});
-		expect(outcomes[1]).toEqual(outcomes[0]);
-	});
-});
-
 describe("upload owners", () => {
 	const image = (imageId: string) => ({
 		type: "image",
@@ -281,6 +154,25 @@ describe("upload owners", () => {
 		const after = await both(owners);
 		expect(after.off).toEqual([]);
 		expect(after.on).toEqual(["n1"]);
+	});
+
+	test("finds legacy envelopes written after the backfill finished, through the index", async () => {
+		envelope("i1", [image("img1")], { role: "user" });
+		await convert();
+		expect(backfill.blockBackfillStatus().convert?.complete).toBe(true);
+		expect(legacyIndexed()).toBe(0);
+		// An import, or a write while block writes were off: legacy again, job long done.
+		envelope("i2", [image("img2")], { role: "user", narratorId: "n2" });
+		expect(legacyIndexed()).toBe(1);
+		const { off, on } = await both(owners);
+		expect(on).toEqual(off);
+		expect(on).toEqual(["n1", "n2"]);
+		const plan = sqlite
+			.prepare(
+				"EXPLAIN QUERY PLAN SELECT id FROM narrator_messages WHERE body_format = 1 AND content_json LIKE '%x%'",
+			)
+			.all() as Array<{ detail: string }>;
+		expect(plan.map((row) => row.detail).join("\n")).toContain("idx_messages_legacy_body");
 	});
 
 	test("queued and legacy envelopes are checked on content_json", async () => {

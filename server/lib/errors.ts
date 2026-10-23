@@ -104,7 +104,7 @@ export class RateLimitError extends AppError {
 /**
  * The signature is unchanged on purpose: attaching the catalog entry here localizes all ~319
  * call sites at once, without editing any of them. `entity` stays a plain English label
- * (`Chapter`, `Narrator`, `Knowledge entry`) — the frontend looks it up under
+ * (`Project`, `Narrator`, `Knowledge entry`) — the frontend looks it up under
  * `errors:entity.<Entity>` and falls back to showing it verbatim, so an unlisted entity
  * degrades to today's wording instead of breaking the sentence.
  */

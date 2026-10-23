@@ -151,7 +151,12 @@ export const narraforkDir = getNarraforkHome();
 const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
-const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = [];
+/**
+ * Groups whose settings no longer exist: `chapters` (its tree-snapshot switch moved to
+ * `workspace`, migrated in `loadSettingsFromDisk` before this strip runs) and the
+ * chapter-container `containers` group.
+ */
+const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = ["chapters", "containers"];
 
 /** Pre-unification `agent.*` request dump keys, replaced by `requestEvidence`. */
 const LEGACY_REQUEST_DUMP_KEYS = [
@@ -353,6 +358,19 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	const merged = deepMerge(DEFAULTS, raw);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
+
+	// `chapters.treeSnapshotsEnabled` became `workspace.treeSnapshotsEnabled` when chapters
+	// were removed. Read from `raw`, so the strip of the obsolete group below cannot race it.
+	if (
+		typeof raw.chapters?.treeSnapshotsEnabled === "boolean" &&
+		raw.workspace?.treeSnapshotsEnabled === undefined
+	) {
+		// A fresh object: without a stored `workspace` group, `merged.workspace` is DEFAULTS'.
+		merged.workspace = {
+			...merged.workspace,
+			treeSnapshotsEnabled: raw.chapters.treeSnapshotsEnabled,
+		};
+	}
 
 	const normalizedUpdate = normalizeUpdateSourceSettings(merged, raw);
 	merged.update = normalizedUpdate.update;

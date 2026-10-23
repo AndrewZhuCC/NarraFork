@@ -104,13 +104,6 @@ export interface ReviewCardData {
 	color?: string;
 	/** "Revised" badge label; absent → the badge is not drawn. Height-neutral. */
 	revisedLabel?: string;
-	/** Action button label (Handle / Handled), always present. Height-neutral. */
-	actionLabel?: string;
-	/**
-	 * A turn has already been started for this conclusion. Height-neutral — the action
-	 * row is reserved either way; this only disables it and changes the label.
-	 */
-	applied?: boolean;
 	/**
 	 * `text` is only a prefix of the real conclusion → reserve the full cap, matching
 	 * every other capped body. Present for symmetry with the plan path; conclusions are

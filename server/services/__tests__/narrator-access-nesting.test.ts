@@ -38,7 +38,7 @@ import {
 } from "@shared/narrator-access";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { aclGrants, chapters, narrators, projects, users } from "../../db/schema";
+import { aclGrants, narratorProjectLinks, narrators, projects, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { canReadNarrator, canWriteNarrator, type NarratorPrincipal } from "../narrator-acl";
 import {
@@ -58,7 +58,6 @@ let readMember: string;
 let outsider: string;
 
 let projectId: string;
-let chapterId: string;
 
 const asUser = (userId: string): NarratorPrincipal => ({ userId, isAdmin: false });
 
@@ -86,26 +85,40 @@ async function grantProject(userId: string, capability: "read" | "write") {
 	});
 }
 
-/** Insert a narrator with an explicit pair. Callers here always pass legal ones. */
+/**
+ * Insert a narrator with an explicit pair. Callers here always pass legal ones.
+ * `indexedProjectId` places it in a project through its working directory: the primary
+ * link the project index derives from its cwd.
+ */
 async function makeNarrator(options: {
 	visibility: NarratorVisibility;
 	writeAudience: NarratorWriteAudience;
-	chapterId?: string | null;
+	indexedProjectId?: string | null;
 	contextProjectId?: string | null;
 }): Promise<string> {
 	const id = generateId();
 	const now = new Date().toISOString();
+	const directory = `/tmp/nest-${TAG}`;
 	await db.insert(narrators).values({
 		id,
 		title: `nest-${TAG}`,
 		ownerUserId: owner,
-		chapterId: options.chapterId ?? null,
+		cwd: options.indexedProjectId ? directory : null,
 		contextProjectId: options.contextProjectId ?? null,
 		visibility: options.visibility,
 		writeAudience: options.writeAudience,
 		createdAt: now,
 		updatedAt: now,
 	});
+	if (options.indexedProjectId)
+		await db.insert(narratorProjectLinks).values({
+			narratorId: id,
+			projectId: options.indexedProjectId,
+			role: "primary",
+			source: "cwd",
+			directory,
+			updatedAt: now,
+		});
 	return id;
 }
 
@@ -142,16 +155,6 @@ beforeAll(async () => {
 		createdAt: now,
 		updatedAt: now,
 	});
-	chapterId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "nest-chapter",
-		branch: `nest/${TAG}`,
-		baseBranch: "main",
-		createdAt: now,
-		updatedAt: now,
-	});
 
 	await grantProject(writeMember, "write");
 	await grantProject(readMember, "read");
@@ -162,11 +165,11 @@ beforeAll(async () => {
 describe("write implies read", () => {
 	test("for every legal pair, every project membership, and every principal", async () => {
 		// Three kinds of project attachment, because read and write once resolved "which
-		// project" differently: read tested `chapterId` while write also accepted
-		// `contextProjectId`, so a `project`/`project` session carrying only the latter was
-		// drivable but unopenable. The contextProjectId row is what catches a regression.
+		// project" differently: read tested one source of membership while write also
+		// accepted `contextProjectId`, so a `project`/`project` session carrying only the
+		// latter was drivable but unopenable. Both sources must agree on both paths.
 		const attachments = [
-			{ label: "chapter-bound", opts: { chapterId } },
+			{ label: "cwd-indexed", opts: { indexedProjectId: projectId } },
 			{ label: "contextProjectId-only", opts: { contextProjectId: projectId } },
 			{ label: "no project", opts: {} },
 		];
@@ -206,7 +209,11 @@ describe("write implies read", () => {
 		// Guards the loop above: if nothing could ever write, "write implies read" would
 		// pass trivially.
 		const row = await rowOf(
-			await makeNarrator({ visibility: "project", writeAudience: "project", chapterId }),
+			await makeNarrator({
+				visibility: "project",
+				writeAudience: "project",
+				indexedProjectId: projectId,
+			}),
 		);
 		expect(await canWriteNarrator(row, asUser(writeMember))).toBe(true);
 	});
@@ -217,7 +224,11 @@ describe("write implies read", () => {
 describe("the nesting rule at the API boundary", () => {
 	test("all six legal pairs can be set", async () => {
 		for (const pair of legalPairs()) {
-			const id = await makeNarrator({ visibility: "public", writeAudience: "owner", chapterId });
+			const id = await makeNarrator({
+				visibility: "public",
+				writeAudience: "owner",
+				indexedProjectId: projectId,
+			});
 			// Visibility first, so the write audience is never momentarily too wide.
 			await setNarratorVisibility(id, pair.visibility, asUser(owner));
 			const view = await setNarratorWriteAudience(id, pair.writeAudience, asUser(owner));
@@ -231,7 +242,11 @@ describe("the nesting rule at the API boundary", () => {
 	test("widening the write audience past the read audience is refused, not auto-escalated", async () => {
 		// Pulling visibility up implicitly would enlarge an audience the user did not ask
 		// to enlarge, so this direction fails loudly.
-		const priv = await makeNarrator({ visibility: "private", writeAudience: "owner", chapterId });
+		const priv = await makeNarrator({
+			visibility: "private",
+			writeAudience: "owner",
+			indexedProjectId: projectId,
+		});
 		await expect(setNarratorWriteAudience(priv, "project", asUser(owner))).rejects.toThrow(
 			/visible/i,
 		);
@@ -242,14 +257,22 @@ describe("the nesting rule at the API boundary", () => {
 		const after = await getNarratorAccess(priv, asUser(owner));
 		expect({ v: after.visibility, w: after.writeAudience }).toEqual({ v: "private", w: "owner" });
 
-		const proj = await makeNarrator({ visibility: "project", writeAudience: "owner", chapterId });
+		const proj = await makeNarrator({
+			visibility: "project",
+			writeAudience: "owner",
+			indexedProjectId: projectId,
+		});
 		await expect(setNarratorWriteAudience(proj, "public", asUser(owner))).rejects.toThrow(
 			/visible/i,
 		);
 	});
 
 	test("the refusal names the control that has to change first", async () => {
-		const id = await makeNarrator({ visibility: "private", writeAudience: "owner", chapterId });
+		const id = await makeNarrator({
+			visibility: "private",
+			writeAudience: "owner",
+			indexedProjectId: projectId,
+		});
 		await expect(setNarratorWriteAudience(id, "public", asUser(owner))).rejects.toThrow(
 			/set visibility to everyone/i,
 		);
@@ -260,7 +283,11 @@ describe("the nesting rule at the API boundary", () => {
 
 describe("narrowing the read audience", () => {
 	test("public+public down to private clamps the write audience to owner", async () => {
-		const id = await makeNarrator({ visibility: "public", writeAudience: "public", chapterId });
+		const id = await makeNarrator({
+			visibility: "public",
+			writeAudience: "public",
+			indexedProjectId: projectId,
+		});
 		const view = await setNarratorVisibility(id, "private", asUser(owner));
 		expect({ v: view.visibility, w: view.writeAudience }).toEqual({ v: "private", w: "owner" });
 	});
@@ -268,25 +295,41 @@ describe("narrowing the read audience", () => {
 	test("public+public down to project clamps to project, not all the way to owner", async () => {
 		// The clamp lands on the widest tier the new read audience allows: collapsing to
 		// `owner` would silently revoke collaboration the user never asked to revoke.
-		const id = await makeNarrator({ visibility: "public", writeAudience: "public", chapterId });
+		const id = await makeNarrator({
+			visibility: "public",
+			writeAudience: "public",
+			indexedProjectId: projectId,
+		});
 		const view = await setNarratorVisibility(id, "project", asUser(owner));
 		expect({ v: view.visibility, w: view.writeAudience }).toEqual({ v: "project", w: "project" });
 	});
 
 	test("an already-legal write audience is left alone", async () => {
-		const id = await makeNarrator({ visibility: "public", writeAudience: "owner", chapterId });
+		const id = await makeNarrator({
+			visibility: "public",
+			writeAudience: "owner",
+			indexedProjectId: projectId,
+		});
 		const view = await setNarratorVisibility(id, "project", asUser(owner));
 		expect({ v: view.visibility, w: view.writeAudience }).toEqual({ v: "project", w: "owner" });
 	});
 
 	test("narrowing is never refused for producing an illegal pair", async () => {
 		// The safety-critical direction: a user tightening access must always succeed.
-		const id = await makeNarrator({ visibility: "public", writeAudience: "public", chapterId });
+		const id = await makeNarrator({
+			visibility: "public",
+			writeAudience: "public",
+			indexedProjectId: projectId,
+		});
 		expect((await setNarratorVisibility(id, "private", asUser(owner))).visibility).toBe("private");
 	});
 
 	test("the clamp is recorded as a consequence, not as a direct request", async () => {
-		const id = await makeNarrator({ visibility: "public", writeAudience: "public", chapterId });
+		const id = await makeNarrator({
+			visibility: "public",
+			writeAudience: "public",
+			indexedProjectId: projectId,
+		});
 		await setNarratorVisibility(id, "private", asUser(owner));
 		// Audit rows are written fire-and-forget, so allow the insert to land.
 		await new Promise((resolve) => setTimeout(resolve, 50));
@@ -309,7 +352,7 @@ describe("subagent delegation", () => {
 		const root = await makeNarrator({
 			visibility: "project",
 			writeAudience: "project",
-			chapterId,
+			indexedProjectId: projectId,
 		});
 		const subId = generateId();
 		const now = new Date().toISOString();

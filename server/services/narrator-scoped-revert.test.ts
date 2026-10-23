@@ -48,7 +48,7 @@ beforeEach(async () => {
 	db.insert(schema.narrators)
 		.values({ id: narratorId, cwd, ownerUserId: userId, createdAt: now(), updatedAt: now() })
 		.run();
-	settings.chapters.treeSnapshotsEnabled = false;
+	settings.workspace.treeSnapshotsEnabled = false;
 });
 afterEach(async () => {
 	mock.restore();

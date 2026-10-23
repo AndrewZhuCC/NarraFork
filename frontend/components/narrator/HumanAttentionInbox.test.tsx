@@ -60,7 +60,6 @@ function item(id: string, overrides: Partial<HumanAttentionItem> = {}): HumanAtt
 		narratorTitle: `Source ${id}`,
 		parentNarratorId: null,
 		rootNarratorId: null,
-		chapterId: null,
 		createdAt: "2026-01-01T00:00:00.000Z",
 		blocking: true,
 		canAct: true,
@@ -264,7 +263,6 @@ for (const state of ["empty", "pending", "history"] as const) {
 			status: "answered" as const,
 			context: "Stored context",
 			narratorTitle: "Owner",
-			chapterId: null,
 			resolution:
 				state === "history"
 					? { answerMessageId: "m", note: "Handled", actor: "agent", resolvedAt: "2026-01-01" }
@@ -301,7 +299,6 @@ test("the shared drawer retains other attention items and paginates pending and 
 		status: "answered" as const,
 		context: "Frozen context",
 		narratorTitle: "Owner",
-		chapterId: null,
 	};
 	const page = track(
 		spyOn(api, "getGlobalQuestionPage").mockImplementation(async (filter, cursor) => ({
@@ -374,7 +371,6 @@ describe("human attention global listener and pagination", () => {
 			"narrator_access_changed",
 			"project_access_changed",
 			"narrator_deleted",
-			"chapter_deleted",
 			"project_deleted",
 		]) {
 			const calls = list.mock.calls.length;

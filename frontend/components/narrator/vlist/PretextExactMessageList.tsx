@@ -291,10 +291,6 @@ import {
 } from "./vlist-reload-policy";
 import { indexWithHeightOverrides } from "./vlist-resize-preview";
 import {
-	resolveReviewFeedbackActions,
-	useReviewFeedbackActions,
-} from "./vlist-review-feedback-actions";
-import {
 	buildRowCtxActions,
 	buildRowToolActions,
 	rowActionHandlerDependencies,
@@ -414,8 +410,6 @@ type PretextExactMessageListProps = {
 	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
-	/** Narrator is bound to a chapter (git) → user-edit offers the rollback option. */
-	hasChapter?: boolean;
 	/**
 	 * Deep-link / search target: jump to this message once and flash it.
 	 *
@@ -535,7 +529,6 @@ export const PretextExactMessageList = memo(
 				onSelectionResolverChange,
 				rowHandlers,
 				permCb,
-				hasChapter,
 				highlightMessageId,
 				highlightRequestId,
 				tailFooter,
@@ -1620,11 +1613,6 @@ export const PretextExactMessageList = memo(
 			}, []);
 			const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
 
-			// Review feedback cards: the button hands the conclusion to this narrator as a user
-			// turn. A concluded review does not wake an idle narrator by design, so this is how
-			// the findings get acted on.
-			const resolveReviewActions = useReviewFeedbackActions(narratorId);
-
 			// Error notice cards: "mark as retryable" opens the shared rule dialog, the
 			// close button deletes the notice. The dialog is one shell-level instance
 			// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
@@ -1659,7 +1647,6 @@ export const PretextExactMessageList = memo(
 					narrator: t("openFullSubagentSession"),
 					knowledge: t("injectionTarget.openKnowledge"),
 					spec: t("injectionTarget.openSpecFile"),
-					chapter: t("injectionTarget.openChapter"),
 				}),
 				[t],
 			);
@@ -5197,7 +5184,6 @@ export const PretextExactMessageList = memo(
 								creator={msg.creator ?? null}
 								initialText={row.initialText}
 								isLastUserMessage={row.messageId === tailMeta.lastUserMessageId}
-								hasChapter={hasChapter}
 								onEditAndRegenerate={handlers.onEditAndRegenerate}
 								onEditAssistantMessage={handlers.onEditAssistantMessage}
 								onClose={closeEditor}
@@ -5205,14 +5191,7 @@ export const PretextExactMessageList = memo(
 						</Suspense>
 					);
 				},
-				[
-					messagesById,
-					rowHandlers,
-					narratorId,
-					tailMeta.lastUserMessageId,
-					hasChapter,
-					closeEditor,
-				],
+				[messagesById, rowHandlers, narratorId, tailMeta.lastUserMessageId, closeEditor],
 			);
 
 			const originalModalMessage = originalModalMessageId
@@ -5237,14 +5216,12 @@ export const PretextExactMessageList = memo(
 					onOpenNarrator: rowHandlers?.onViewSubagentSession,
 					onOpenKnowledge: rowHandlers?.onOpenKnowledgeEntry,
 					onOpenSpec: rowHandlers?.onOpenSpecFile,
-					onOpenChapter: rowHandlers?.onOpenChapter,
 					labels: injectionTargetLabels,
 				}),
 				[
 					rowHandlers?.onViewSubagentSession,
 					rowHandlers?.onOpenKnowledgeEntry,
 					rowHandlers?.onOpenSpecFile,
-					rowHandlers?.onOpenChapter,
 					injectionTargetLabels,
 				],
 			);
@@ -5328,11 +5305,6 @@ export const PretextExactMessageList = memo(
 							item,
 							sourceIds,
 							resolveGuardActions,
-						),
-						reviewFeedbackActions: resolveReviewFeedbackActions(
-							item,
-							sourceIds,
-							resolveReviewActions,
 						),
 						compactActions: compact.byKey.get(item.spec.key),
 						compactCancelTitle: compact.cancelTitle,

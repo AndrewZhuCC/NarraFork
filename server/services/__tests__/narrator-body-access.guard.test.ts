@@ -12,9 +12,9 @@
  *     rows from the body handed over instead of reading the column back.
  *
  * `RAW_BODY_ACCESS` counts what each file still does to the column directly. Some entries
- * are permanent: the body layer, where the column is the body (legacy envelopes, PG, the
- * block read switch off), another database's column of the same name (project.db). The
- * rest is the work left; the counts only go down:
+ * are permanent: the body layer, and readers where the column is the body (legacy
+ * envelopes, PG, the block read switch off). The rest is the work left; the counts only
+ * go down:
  *   - a raw access in an unlisted file, or more than its count, fails — read and write
  *     through the body layer instead;
  *   - fewer than its count fails too — lower it (drop the entry at zero).
@@ -43,7 +43,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	},
 	"server/lib/narrator-bodies.ts": { count: 3, why: "body reads off the main thread" },
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
-	"server/services/narrator-block-scans.ts": { count: 11, why: "scans: column fallback" },
+	"server/services/narrator-block-scans.ts": { count: 5, why: "scans: column fallback" },
 	"server/services/narrator-block-targets.ts": { count: 2, why: "legacy envelopes' ids" },
 	"server/services/narrator-block-backfill.ts": { count: 2, why: "legacy envelope conversion" },
 	"server/lib/db-worker/block-backfill-query.ts": { count: 3, why: "legacy envelope conversion" },
@@ -54,13 +54,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/services/agent-runtime/model-history-fixture.ts": { count: 1, why: "trigger fixture" },
 	"server/lib/settings/defaults.ts": { count: 3, why: "switch descriptions" },
 	"server/db/test-role-migration.ts": { count: 4, why: "one-off role migration check" },
-	// project.db's own column (§10.5).
-	"server/lib/project-db.ts": { count: 1, why: "project.db schema" },
-	"server/services/project-archive/legacy-sync-worker.ts": { count: 4, why: "project.db" },
-	"server/services/project-archive/manifest.ts": { count: 1, why: "project.db" },
-	"server/services/project-archive/sqlite-main-store.ts": { count: 4, why: "project.db" },
 	// Readers whose column branch serves block reads off (or PG), where it is the body.
-	"server/services/merge-summary-service.ts": { count: 6, why: "read switch off" },
 	"server/services/narrator-question-service.ts": { count: 3, why: "read switch off" },
 	"server/services/storage-service.ts": { count: 2, why: "read switch off" },
 	"server/services/narrator-export.ts": { count: 1, why: "read switch off" },

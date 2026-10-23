@@ -24,21 +24,13 @@ export function initializeAbsentReceiptProtectionSource(
 		.run();
 }
 
-export const protectionSources = ["narrator", "chapter", "registry", "receipt"] as const;
+export const protectionSources = ["narrator", "registry", "receipt"] as const;
 export type ProtectionSource = (typeof protectionSources)[number];
 export const protectionTables = {
 	narrator: {
 		table: "narrators",
-		fields: [
-			"id",
-			"cwd",
-			"chapter_id",
-			"default_device_id",
-			"workspace_context",
-			"workspace_revision",
-		],
+		fields: ["id", "cwd", "default_device_id", "workspace_context", "workspace_revision"],
 	},
-	chapter: { table: "chapters", fields: ["id", "worktree_path", "snapshot_shadow_key"] },
 	registry: {
 		table: "narrator_worktree_resources",
 		fields: ["id", "device_id", "worktree_path", "repository_key", "scope_project_id", "state"],

@@ -1307,11 +1307,6 @@ export const uiRpcNotificationEnvelopeSchema = uiRpcNotificationSchema;
 
 export const PUBLIC_EVENT_TOPICS = [
 	"narrafork.project.changed",
-	"narrafork.chapter.created",
-	"narrafork.chapter.lifecycle",
-	"narrafork.chapter.edge.changed",
-	"narrafork.chapter.commits.changed",
-	"narrafork.review.lifecycle",
 	"narrafork.narrator.lifecycle",
 	"narrafork.narrator.attention",
 	"narrafork.narrator.message.changed",
@@ -1336,9 +1331,7 @@ export const publicEventTopicSchema = z.enum(PUBLIC_EVENT_TOPICS);
 const publicEventClassSchema = z.enum(["state", "lifecycle", "progress", "attention", "audit"]);
 const publicResourceTypeSchema = z.enum([
 	"project",
-	"chapter",
 	"narrator",
-	"review",
 	"terminal",
 	"container",
 	"background_task",
@@ -1350,7 +1343,6 @@ const publicEventResourceSchema = z
 		type: publicResourceTypeSchema,
 		id: nonEmptyIdSchema,
 		projectId: nonEmptyIdSchema.optional(),
-		chapterId: nonEmptyIdSchema.optional(),
 		narratorId: nonEmptyIdSchema.optional(),
 		resourceVersion: z.number().int().nonnegative().optional(),
 	})
@@ -1395,18 +1387,9 @@ export type PublicEventFilter = {
 	topic?: PublicEventTopic[];
 	eventClass?: Array<"state" | "lifecycle" | "progress" | "attention" | "audit">;
 	projectIds?: string[];
-	chapterIds?: string[];
 	narratorIds?: string[];
 	resourceTypes?: Array<
-		| "project"
-		| "chapter"
-		| "narrator"
-		| "review"
-		| "terminal"
-		| "container"
-		| "background_task"
-		| "provider"
-		| "plugin"
+		"project" | "narrator" | "terminal" | "container" | "background_task" | "provider" | "plugin"
 	>;
 	statuses?: string[];
 	actorKinds?: Array<"user" | "system" | "plugin">;
@@ -1421,7 +1404,6 @@ const publicEventFilterNodeSchema: z.ZodType<PublicEventFilter> = z.lazy(() =>
 			topic: z.array(publicEventTopicSchema).min(1).max(20).optional(),
 			eventClass: z.array(publicEventClassSchema).min(1).max(5).optional(),
 			projectIds: filterIdsSchema.optional(),
-			chapterIds: filterIdsSchema.optional(),
 			narratorIds: filterIdsSchema.optional(),
 			resourceTypes: z.array(publicResourceTypeSchema).min(1).max(20).optional(),
 			statuses: z.array(z.string().trim().min(1).max(100)).max(20).optional(),

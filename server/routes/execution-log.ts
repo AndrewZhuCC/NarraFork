@@ -29,7 +29,6 @@ const booleanFlag = z
 const listQuerySchema = z.object({
 	narratorId: z.string().min(1).max(128).optional(),
 	includeSubagents: booleanFlag,
-	chapterId: z.string().min(1).max(128).optional(),
 	projectId: z.string().min(1).max(128).optional(),
 	toolName: z.string().min(1).max(128).optional(),
 	status: z.enum(["initializing", "pending", "running", "success", "fail"]).optional(),

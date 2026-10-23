@@ -123,7 +123,7 @@ describe("importInterchangeSession", () => {
 		expect(narrator.ownerUserId).toBe(USER);
 		expect(narrator.traits).toContain("standalone");
 		expect(narrator.traits).toContain("imported");
-		expect(narrator.chapterId).toBeNull();
+		expect(narrator.contextProjectId).toBeNull();
 
 		const refs = await refsOf(result.narratorId);
 		expect(refs.map((r) => r.role)).toEqual(["user", "assistant", "assistant"]);

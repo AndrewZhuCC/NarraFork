@@ -104,7 +104,6 @@ const narratorColumns = {
 	title: sql<string | null>`substr(${narrators.title}, 1, ${TITLE_CHARS})`,
 	parentNarratorId: narrators.parentNarratorId,
 	aclRootNarratorId: narrators.aclRootNarratorId,
-	chapterId: narrators.chapterId,
 	contextProjectId: narrators.contextProjectId,
 	type: narrators.type,
 	ownerUserId: narrators.ownerUserId,
@@ -161,7 +160,6 @@ function baseItem(owner: VisibleNarrator) {
 		narratorTitle: owner.row.title,
 		parentNarratorId: owner.row.type === "subagent" ? owner.row.parentNarratorId : null,
 		rootNarratorId: owner.row.type === "subagent" ? owner.row.aclRootNarratorId : null,
-		chapterId: owner.row.chapterId,
 		canAct: owner.canAct,
 	};
 }

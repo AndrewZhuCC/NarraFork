@@ -2,6 +2,7 @@ import {
 	MODEL_HISTORY_REVISION_CONTRACT,
 	MODEL_HISTORY_REVISION_CONTRACT_V1,
 	MODEL_HISTORY_REVISION_CONTRACT_V2,
+	renderModelHistoryReinstallSql,
 	renderModelHistoryRevisionSql,
 	renderModelHistoryRevisionSqlV1,
 	renderModelHistoryRevisionSqlV2,
@@ -31,6 +32,7 @@ const blockColumns = {
 		"phase",
 	],
 } as const;
+/** Tables the block contracts' (v2, v3) triggers are attached to or name in their bodies. */
 export const MODEL_HISTORY_TRIGGER_TABLES = [
 	"narrators",
 	"narrator_messages",
@@ -38,7 +40,10 @@ export const MODEL_HISTORY_TRIGGER_TABLES = [
 	"narrator_message_refs",
 	"users",
 	"narrator_blocks",
+	"narrator_block_sync_queue",
 ] as const;
+/** What v2 added; v1's triggers neither live on nor name these. */
+const V2_ONLY_TRIGGER_TABLES: readonly string[] = ["narrator_blocks", "narrator_block_sync_queue"];
 
 function columnsOf(snapshot: Snapshot, name: string, dialect: MigrationDialect) {
 	if (!snapshot.tables || typeof snapshot.tables !== "object") return undefined;
@@ -79,10 +84,10 @@ export function hasModelHistoryStateSchema(snapshot: Snapshot, dialect: Migratio
 	);
 }
 
-/** Tables a contract's triggers are attached to; a schema rebuild of one needs a reinstall. */
+/** Tables a contract's triggers live on or name; a schema rebuild of one needs a reinstall. */
 export function modelHistoryTriggerTables(contract: string): readonly string[] {
 	return contract === MODEL_HISTORY_REVISION_CONTRACT_V1
-		? MODEL_HISTORY_TRIGGER_TABLES.filter((table) => table !== "narrator_blocks")
+		? MODEL_HISTORY_TRIGGER_TABLES.filter((table) => !V2_ONLY_TRIGGER_TABLES.includes(table))
 		: MODEL_HISTORY_TRIGGER_TABLES;
 }
 
@@ -135,15 +140,43 @@ export function modelHistoryTriggerSuffix(
 	return `\n--> statement-breakpoint\n${renderModelHistoryContractSql(dialect, contract).trimEnd()}\n`;
 }
 
+/**
+ * The versioned reinstall a SQLite rebuild of a current-contract trigger table needs: the
+ * previous schema already carries the current (v3) contract's schema (an earlier migration
+ * installed it) and this transition keeps it. An older contract is never reinstalled: its
+ * rebuilds stay refused. The generator wraps the schema SQL in exactly `prefix` + `suffix`; the
+ * finalizer accepts such a rebuild only inside this byte-exact wrapper and nowhere else.
+ */
+export function modelHistoryReinstall(
+	before: Snapshot,
+	after: Snapshot,
+	dialect: MigrationDialect,
+): { prefix: string; suffix: string } | undefined {
+	if (
+		dialect !== "sqlite" ||
+		!hasModelHistoryStateSchema(before, dialect) ||
+		!hasModelHistoryStateSchema(after, dialect)
+	)
+		return undefined;
+	const { before: drops, after: install } = renderModelHistoryReinstallSql(dialect);
+	return {
+		prefix: `${drops}\n--> statement-breakpoint\n`,
+		suffix: `\n--> statement-breakpoint\n${install.trimEnd()}\n`,
+	};
+}
+
 /** Identity of every renderer a pending generation may append; a change refuses resume. */
 export function modelHistoryRendererFingerprint(dialect: MigrationDialect): string {
-	return [
+	const contracts = [
 		MODEL_HISTORY_REVISION_CONTRACT_V1,
 		MODEL_HISTORY_REVISION_CONTRACT_V2,
 		MODEL_HISTORY_REVISION_CONTRACT,
 	]
 		.map((contract) => `${contract}\n${renderModelHistoryContractSql(dialect, contract)}`)
 		.join("\n");
+	if (dialect !== "sqlite") return contracts;
+	const reinstall = renderModelHistoryReinstallSql(dialect);
+	return `${contracts}\nreinstall\n${reinstall.before}\n${reinstall.after}`;
 }
 
 /** Byte-exact allowlist, not a CREATE TRIGGER grammar relaxation. The ordinary SQL

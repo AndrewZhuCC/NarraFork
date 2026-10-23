@@ -87,7 +87,7 @@ export interface RevertPlannerAccess {
 	/** Validate that this principal still represents an authenticated, enabled user. */
 	authenticate(principal: NarratorPrincipal, signal: AbortSignal): Promise<void>;
 	authorizeNarrator: RevertSelectionOptions["authorize"];
-	/** Resolve the real project (including chapter context) and enforce its write gate.
+	/** Resolve the real project and enforce its write gate.
 	 * Null must mean truly standalone, never lookup/authorization failure. */
 	resolveContext(input: {
 		principal: NarratorPrincipal;

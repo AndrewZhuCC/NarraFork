@@ -164,7 +164,7 @@ export function agentResultTag(label: string): string {
  * single-row primary-key lookups and memoizes STABLE outcomes briefly.
  *
  * Only alias-derived labels are cached. A title-slug label must not be, because a
- * title is mutable (`PATCH /narrators/:id/title`, and chapter title sync): a
+ * title is mutable (`PATCH /narrators/:id/title`): a
  * renamed subagent would keep being printed under its old slug, and that slug no
  * longer matches anything — so the model would be handed a selector that resolves
  * to "No accessible subagent found". Aliases live in traits / `background_tasks`

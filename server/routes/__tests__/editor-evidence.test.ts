@@ -37,7 +37,6 @@ import {
 } from "../../services/file-change-runtime";
 import * as fileEditInterject from "../../services/file-edit-interject";
 import * as sessionState from "../../services/narrator-session-state";
-import { worktreeTreeSnapshot } from "../../services/worktree-tree-snapshot";
 
 // Actual app, session JWT, application DB, ACL, local backend and journal. The
 // preload owns every file/database here; only faults and synchronization points
@@ -74,7 +73,7 @@ beforeEach(async () => {
 		})
 		.run();
 	token = await createToken(userId, "user");
-	settings.chapters.treeSnapshotsEnabled = false;
+	settings.workspace.treeSnapshotsEnabled = false;
 	applyCalls = 0;
 	io = {
 		...fileChangeLocalIo,
@@ -767,24 +766,22 @@ describe("editor evidence failures and immutable human projection", () => {
 		expect(applyCalls).toBe(1);
 	});
 
-	test("tree capture and notification failures cannot turn a settled save into a failure", async () => {
-		settings.chapters.treeSnapshotsEnabled = true;
-		const invalidate = spyOn(sessionState, "invalidateWorkspaceTreeCache");
-		const capture = spyOn(worktreeTreeSnapshot, "tryCaptureHot").mockRejectedValue(
-			new Error("injected tree fault"),
+	test("tree cache and notification failures cannot turn a settled save into a failure", async () => {
+		const invalidate = spyOn(sessionState, "invalidateWorkspaceTreeCache").mockImplementation(
+			() => {
+				throw new Error("injected tree fault");
+			},
 		);
 		const notify = spyOn(fileEditInterject, "interjectFileEditAsUserMessage").mockRejectedValue(
 			new Error("injected notify fault"),
 		);
 		restorers.push(
 			() => invalidate.mockRestore(),
-			() => capture.mockRestore(),
 			() => notify.mockRestore(),
 		);
 		const path = join(workspace, "best-effort.txt");
 		expect((await save({ path, content: "saved\n", notifyAgent: true })).status).toBe(200);
 		expect(invalidate).toHaveBeenCalledWith(workspace);
-		expect(capture).toHaveBeenCalledWith(workspace, "local");
 		expect(notify).toHaveBeenCalledTimes(1);
 		expect(await readFile(path, "utf8")).toBe("saved\n");
 		expect(operations()[0].settlement).toBe("settled");

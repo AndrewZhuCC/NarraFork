@@ -756,9 +756,9 @@ export function StorageSection() {
 					count: Number(d.archiveCount ?? 0),
 				});
 				const orphans = Number(d.orphanCount ?? 0);
-				// Orphans are called out because they are the actionable part: an archive
-				// belonging to a live chapter is waiting to be restored, one whose chapter is
-				// gone is untracked secrets nothing will ever read.
+				// Orphans are called out because they are the actionable part: these archives
+				// were left by dormant chapters, which no longer exist, so nothing will ever
+				// restore them — they are untracked secrets the user may want to review.
 				if (orphans <= 0) return archives;
 				return `${archives} · ${t("storageIgnoredArchiveOrphans", { count: orphans })}`;
 			}
@@ -1571,11 +1571,6 @@ export function StorageSection() {
 																{sample.narratorTitle || sample.narratorId || sample.id.slice(0, 8)}
 															</Text>
 															<Group gap="xs" wrap="wrap" mt={4}>
-																{sample.chapterTitle && (
-																	<Text size="xs" c="dimmed">
-																		{sample.chapterTitle}
-																	</Text>
-																)}
 																<Text size="xs" c="dimmed">
 																	{t("storageDatabaseCreatedAt", {
 																		time: formatDateTime(sample.createdAt),

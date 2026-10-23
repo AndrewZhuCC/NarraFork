@@ -15,17 +15,11 @@
  * narrator or knowledge entry is still decided by that resource's own ACL. That is
  * why a teammate's private session stays invisible to fellow project members — the
  * gate never contributes read to the resource itself.
- *
- * Chapters deliberately have no ACL of their own and inherit the project verdict
- * wholesale: every chapter worktree lives inside the same git repository, so
- * anything with filesystem access to one chapter can read every branch through
- * `git` or a `../` path. Per-chapter isolation would be fiction, and fiction in an
- * access-control layer is worse than an honest coarse boundary.
  */
 
 import { eq, or, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, projects } from "../db/schema";
+import { projects } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
 import { type AclPrincipal, resolveCaps } from "./acl/acl-core";
 
@@ -74,8 +68,7 @@ async function ownCaps(
 }
 
 /**
- * Whether the principal may see the project: its chapters, story graph, commits and
- * settings.
+ * Whether the principal may see the project: its sessions, commits and settings.
  *
  * A write or manage grant implies read — someone who may change a project can
  * obviously see it, and requiring separate rows would make every membership a
@@ -93,12 +86,11 @@ export async function canReadProject(
 }
 
 /**
- * Whether the principal may act in the project: create chapters, commit, merge,
- * run containers, edit skills.
+ * Whether the principal may act in the project: start sessions in it, commit, edit
+ * skills.
  *
  * `visibility` is deliberately not consulted. Making a project public shares a view
- * of the work; it must not hand every signed-in user the ability to merge into the
- * trunk or delete a chapter's worktree.
+ * of the work; it must not hand every signed-in user the ability to change it.
  */
 export async function canWriteProject(
 	row: ProjectAclRow,
@@ -116,8 +108,7 @@ export async function canWriteProject(
  *
  * `manage` is the third tier of the read/write/manage model: a write member works
  * in the project but cannot decide who else may. Deletion belongs here rather than
- * in `write` because it cascades through every chapter, worktree, container and
- * conversation.
+ * in `write` because it detaches every session and project-level setting.
  */
 export async function canManageProject(
 	row: ProjectAclRow,
@@ -163,27 +154,6 @@ export async function loadProjectForAccess(
 	if (!row) throw new NotFoundError("Project", projectId);
 	await assertProjectAccess(row, principal, need);
 	return row;
-}
-
-/**
- * Assert access to the project owning a chapter.
- *
- * Chapters have no ACL of their own, so this is the whole chapter authorization
- * story. A chapter whose project has vanished is reported as not found: a dangling
- * reference must not read as "no project, therefore nothing to enforce".
- */
-export async function assertChapterProjectAccess(
-	chapterId: string,
-	principal: ProjectPrincipal,
-	need: ProjectAccessNeed,
-): Promise<{ projectId: string }> {
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, chapterId),
-		columns: { projectId: true },
-	});
-	if (!chapter?.projectId) throw new NotFoundError("Chapter", chapterId);
-	await loadProjectForAccess(chapter.projectId, principal, need);
-	return { projectId: chapter.projectId };
 }
 
 /**
@@ -248,7 +218,7 @@ export function projectReadableWhere(principal: ProjectPrincipal) {
 
 /**
  * The same predicate against an arbitrary column holding a project id, for queries
- * that filter a different table (chapters, scheduled tasks, graph aggregates).
+ * that filter a different table (narrators, scheduled tasks).
  */
 export function projectReadableWhereForColumn(
 	principal: ProjectPrincipal,

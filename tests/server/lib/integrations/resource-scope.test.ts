@@ -38,18 +38,18 @@ describe("canonical resource scopes", () => {
 		const project = { type: "project" as const, id: "project-1" };
 		const sameProject = { type: "project" as const, id: "project-1" };
 		const otherProject = { type: "project" as const, id: "project-2" };
-		const chapter = { type: "chapter" as const, id: "chapter-1" };
+		const narrator = { type: "narrator" as const, id: "narrator-1" };
 
 		expect(scopeContains(global, project)).toBe(true);
 		expect(scopeContains(project, global)).toBe(false);
 		expect(scopeContains(project, sameProject)).toBe(true);
 		expect(scopeContains(project, otherProject)).toBe(false);
-		expect(scopeContains(project, chapter)).toBe(false);
+		expect(scopeContains(project, narrator)).toBe(false);
 
-		expect(scopeIntersects(global, chapter)).toBe(true);
+		expect(scopeIntersects(global, narrator)).toBe(true);
 		expect(scopeIntersects(project, sameProject)).toBe(true);
 		expect(scopeIntersects(project, otherProject)).toBe(false);
-		expect(scopeIntersects(project, chapter)).toBe(false);
+		expect(scopeIntersects(project, narrator)).toBe(false);
 	});
 
 	test("asserts requested scopes against trusted bindings", () => {

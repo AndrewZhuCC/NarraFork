@@ -1,10 +1,11 @@
 /**
  * A concluded review has to reach the MODEL, not just the transcript.
  *
- * `review-event-handler` writes the conclusion as a `role: "user"` row and starts a bare
- * `runAgentLoop(active, "")`: the row is supposed to already be in history. Builders used
+ * Reviews wrote the conclusion as a `role: "user"` row and started a bare
+ * `runAgentLoop(active, "")`: the row was supposed to already be in history. Builders used
  * to pop the last top-level user row as "the current turn", so with an empty prompt the
- * findings reached the model in neither place, silently.
+ * findings reached the model in neither place, silently. Reviews are gone, but their
+ * conclusion rows stay in existing histories, and any trailing user row follows this rule.
  *
  * Histories are now complete: the trailing user row is part of the built history, so a
  * pass with no prompt of its own still sends it, once.

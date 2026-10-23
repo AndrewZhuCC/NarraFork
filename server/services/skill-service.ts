@@ -16,7 +16,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { and, asc, count, eq, inArray, lt } from "drizzle-orm";
 import matter from "gray-matter";
 import { db } from "../db";
-import { chapters, narrators, projects, skillDirectoryCaches } from "../db/schema";
+import { narrators, projects, skillDirectoryCaches } from "../db/schema";
 import { getBuiltinSkillRoutines } from "../lib/builtin-routines";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotTimer } from "../lib/hot-safe";
@@ -967,18 +967,13 @@ export async function loadSkillByNameForContext(
 export async function resolveSkillContextForNarrator(narratorId: string): Promise<SkillContext> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, contextProjectId: true, cwd: true },
+		columns: { id: true, contextProjectId: true, cwd: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
-	// Use the same explicit project resolution as ACL/traits; cwd never implies membership.
+	// The same project resolution as ACL/traits: the explicit project, else the project the
+	// session's directory was indexed into.
 	const projectId = await resolveNarratorProjectId(narrator);
-	const chapter = narrator.chapterId
-		? await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { worktreePath: true },
-			})
-		: null;
 	const project = projectId
 		? await db.query.projects.findFirst({
 				where: eq(projects.id, projectId),
@@ -988,7 +983,7 @@ export async function resolveSkillContextForNarrator(narratorId: string): Promis
 	const projectGitPath = project?.gitPath ?? null;
 	return {
 		projectGitPath,
-		cwd: narrator.cwd || chapter?.worktreePath || projectGitPath || homedir(),
+		cwd: narrator.cwd || projectGitPath || homedir(),
 	};
 }
 

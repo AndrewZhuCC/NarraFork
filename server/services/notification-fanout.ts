@@ -7,7 +7,6 @@
 
 import { db } from "@server/db";
 import {
-	chapters,
 	chatMessages,
 	chatRoomMembers,
 	chatRooms,
@@ -28,6 +27,7 @@ import {
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { botDisplayName, CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
 import { canReadNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	type RecordNotificationInput,
 	recordNotifications as recordNotificationsImpl,
@@ -307,7 +307,6 @@ export async function fanoutPermissionRequestNotifications(
 			writeAudience: true,
 			type: true,
 			aclRootNarratorId: true,
-			chapterId: true,
 			contextProjectId: true,
 		},
 	});
@@ -320,22 +319,13 @@ export async function fanoutPermissionRequestNotifications(
 		writeAudience: narrator.writeAudience,
 		type: narrator.type,
 		aclRootNarratorId: narrator.aclRootNarratorId,
-		chapterId: narrator.chapterId,
 		contextProjectId: narrator.contextProjectId,
 	};
 
 	const recipients = await resolvePermissionRecipients(aclRow);
 	if (recipients.length === 0) return;
 
-	const chapterId: string | null = narrator.chapterId ?? null;
-	let projectId: string | null = narrator.contextProjectId ?? null;
-	if (chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, chapterId),
-			columns: { projectId: true },
-		});
-		projectId = chapter?.projectId ?? null;
-	}
+	const projectId = await resolveNarratorProjectId(narrator);
 
 	// Short summary: prefer a path column; never inputJson/outputJson.
 	const pathHint = toolCall.canonicalFilePath || toolCall.resolvedFilePath || null;
@@ -351,7 +341,6 @@ export async function fanoutPermissionRequestNotifications(
 		preview,
 		link: { type: "narrator" as const, narratorId: event.narratorId },
 		projectId,
-		chapterId,
 		narratorId: event.narratorId,
 	}));
 

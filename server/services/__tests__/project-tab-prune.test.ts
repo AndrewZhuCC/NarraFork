@@ -5,8 +5,8 @@
  * otherwise leaves them holding tabs that 404 on click. These tests pin the three
  * properties that make the cleanup safe rather than merely aggressive:
  *
- *  1. tabs pointing into the lost project are removed — including chapter and session
- *     tabs, which carry no projectId of their own
+ *  1. tabs pointing into the lost project are removed — including session tabs, which
+ *     carry no projectId of their own (the project index places them by directory)
  *  2. tabs the user can STILL open are kept, even inside that same project (an explicit
  *     narrator grant, or a project that is public anyway) — the prune asks the gate, it
  *     does not pattern-match on ids
@@ -26,7 +26,9 @@ process.env.NARRAFORK_HOME = testHome;
 process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
 const { db } = await import("../../db");
-const { aclGrants, chapters, narrators, projects, users } = await import("../../db/schema");
+const { aclGrants, narratorProjectLinks, narrators, projects, users } = await import(
+	"../../db/schema"
+);
 const { generateId } = await import("../../lib/id");
 const { listAllRecentTabs, pruneUnreadableProjectTabs, upsertRecentTab } = await import(
 	"../recent-tabs-service"
@@ -69,20 +71,26 @@ async function makeProject(visibility: "private" | "public"): Promise<string> {
 	return id;
 }
 
-async function makeChapter(projectId: string): Promise<string> {
+/** A session the project index placed in the project by its working directory. */
+async function makeIndexedSession(projectId: string): Promise<string> {
 	const id = generateId();
 	const now = new Date().toISOString();
-	await db.insert(chapters).values({
+	const directory = join(testHome, `work-${generateId(6)}`);
+	await db.insert(narrators).values({
 		id,
-		projectId,
-		title: `chapter-${generateId(6)}`,
-		branch: `br-${generateId(6)}`,
-		baseBranch: "main",
-		status: "active",
-		role: "branch",
-		axisOffset: 0,
-		crossOffset: 0,
+		title: `session-${generateId(6)}`,
+		ownerUserId: ownerId,
+		visibility: "project",
+		cwd: directory,
 		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(narratorProjectLinks).values({
+		narratorId: id,
+		projectId,
+		role: "primary",
+		source: "cwd",
+		directory,
 		updatedAt: now,
 	});
 	return id;
@@ -105,11 +113,7 @@ async function addMember(
 	});
 }
 
-async function addTab(
-	userId: string,
-	type: "project" | "chapter" | "narrator",
-	id: string,
-): Promise<void> {
+async function addTab(userId: string, type: "project" | "narrator", id: string): Promise<void> {
 	await upsertRecentTab(userId, {
 		type,
 		id,
@@ -139,29 +143,30 @@ describe("pruning tabs a user can no longer open", () => {
 		expect(await tabKeysOf(outsiderId)).not.toContain(`project:${projectId}`);
 	});
 
-	test("chapter tabs inside the lost project are removed too", async () => {
+	test("session tabs inside the lost project are removed too", async () => {
 		const projectId = await makeProject("private");
-		const chapterId = await makeChapter(projectId);
-		await addTab(outsiderId, "chapter", chapterId);
+		const narratorId = await makeIndexedSession(projectId);
+		await addTab(outsiderId, "narrator", narratorId);
+		expect(await tabKeysOf(outsiderId)).toContain(`narrator:${narratorId}`);
 
-		// The chapter tab carries no projectId; the prune has to resolve it.
+		// The session tab carries no projectId; the prune has to resolve it.
 		await pruneUnreadableProjectTabs(outsiderId, projectId);
-		expect(await tabKeysOf(outsiderId)).not.toContain(`chapter:${chapterId}`);
+		expect(await tabKeysOf(outsiderId)).not.toContain(`narrator:${narratorId}`);
 	});
 
 	test("a member keeps their tabs — the gate still opens for them", async () => {
 		const projectId = await makeProject("private");
-		const chapterId = await makeChapter(projectId);
+		const narratorId = await makeIndexedSession(projectId);
 		await addMember(projectId, memberId, "read");
 		await addTab(memberId, "project", projectId);
-		await addTab(memberId, "chapter", chapterId);
+		await addTab(memberId, "narrator", narratorId);
 
 		// Running the prune against a user who still has access must be a no-op: this is
 		// what makes it safe to call on the whole tab-holder set for a visibility change.
 		await pruneUnreadableProjectTabs(memberId, projectId);
 		const keys = await tabKeysOf(memberId);
 		expect(keys).toContain(`project:${projectId}`);
-		expect(keys).toContain(`chapter:${chapterId}`);
+		expect(keys).toContain(`narrator:${narratorId}`);
 	});
 
 	test("a public project's tabs survive for a non-member", async () => {

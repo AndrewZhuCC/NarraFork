@@ -28,8 +28,8 @@ describe("protected routes without auth", () => {
 		expect(res.status).toBe(401);
 	});
 
-	it("GET /api/chapters/fake-id returns 401", async () => {
-		const res = await app.request("/api/chapters/fake-id");
+	it("GET /api/projects/fake-id returns 401", async () => {
+		const res = await app.request("/api/projects/fake-id");
 		expect(res.status).toBe(401);
 	});
 

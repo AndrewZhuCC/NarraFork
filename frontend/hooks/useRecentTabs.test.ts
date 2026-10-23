@@ -729,7 +729,6 @@ describe("recent tabs delta reducer", () => {
 						activeTerminalCount: 2,
 						viewers: [{ userId: "u1", username: "u1", avatarColor: null, avatarImageId: null }],
 						viewerCount: 1,
-						containerStatus: "running",
 						hasDraft: true,
 					} as RecentTab,
 				],
@@ -765,7 +764,6 @@ describe("recent tabs delta reducer", () => {
 		expect(tab?.substatus).toEqual(["planning"]);
 		expect(tab?.activeTerminalCount).toBe(2);
 		expect(tab?.viewerCount).toBe(1);
-		expect(tab?.containerStatus).toBe("running");
 		expect(tab?.hasDraft).toBeTrue();
 	});
 
@@ -895,7 +893,6 @@ describe("recent tabs delta reducer", () => {
 				{ userId: "u2", username: "bob", avatarColor: null, avatarImageId: null },
 			],
 			viewerCount: 2,
-			containerStatus: "running",
 			hasDraft: true,
 		};
 		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData([enriched], 1));
@@ -930,7 +927,6 @@ describe("recent tabs delta reducer", () => {
 			lastVisitedAt: 99,
 			activeTerminalCount: 2,
 			viewerCount: 2,
-			containerStatus: "running",
 			hasDraft: true,
 			substatus: ["unread"],
 		});
@@ -1325,7 +1321,6 @@ describe("recent tab identity preservation", () => {
 			activeTerminalCount: 1,
 			viewers,
 			viewerCount: 1,
-			containerStatus: null,
 			hasDraft: false,
 		};
 
@@ -1336,7 +1331,6 @@ describe("recent tab identity preservation", () => {
 			activeTerminalCount: 1,
 			viewers: [{ userId: "u1", username: "u1", avatarColor: null, avatarImageId: null }],
 			viewerCount: 1,
-			containerStatus: null,
 			hasDraft: false,
 		});
 

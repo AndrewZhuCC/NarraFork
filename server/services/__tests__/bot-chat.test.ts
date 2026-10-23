@@ -390,6 +390,21 @@ describe("Send({ user })", () => {
 		expect(page.messages.at(-1)?.contentText).toBe("Done.");
 	});
 
+	test("strips native-search citation markers before the person sees them", async () => {
+		const marker = "\ue200cite\ue202turn0search0\ue202turn0search3\ue201";
+		const result = await sendTool.execute(
+			{ user: aliceName, message: `Bun 1.3 ships it.${marker} See [docs](https://bun.sh).` },
+			ctx(openBot),
+		);
+		expect(result.isError).toBeFalsy();
+		const room = await resolveBotRoom(openBot, alice);
+		const page = await listMessages({ roomId: room.id, userId: alice });
+		expect(page.messages.at(-1)?.contentText).toBe("Bun 1.3 ships it. See [docs](https://bun.sh).");
+
+		const onlyMarker = await sendTool.execute({ user: aliceName, message: marker }, ctx(openBot));
+		expect(onlyMarker.isError).toBe(true);
+	});
+
 	test("accepts an @mention and any letter case", async () => {
 		const sent = await sendAsBot({
 			narratorId: openBot,
@@ -646,11 +661,8 @@ describe("bot narrators", () => {
 		expect(isBotNarrator(fork.traits)).toBe(false);
 	});
 
-	test("a bot needs a name and cannot belong to a chapter", async () => {
+	test("a bot needs a name", async () => {
 		await expect(narratorService.create({ kind: "bot" })).rejects.toBeInstanceOf(ValidationError);
-		await expect(
-			narratorService.create({ kind: "bot", title: "X", chapterId: "some-chapter" }),
-		).rejects.toThrow();
 	});
 
 	test("the bot protocol follows the persona in the system prompt", () => {

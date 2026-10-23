@@ -8,8 +8,9 @@
 
 ### 1.1 实际导出
 
-- `SCOPE_TYPES`：`global`、`session`、`user`、`project`、`workspace`、`chapter`、`narrator`、`provider`、`device`。
-- `INVOCATION_SCOPE_TYPES`：`global`、`user`、`project`、`workspace`、`chapter`、`narrator`、`provider`、`device`。
+- `SCOPE_TYPES`：`global`、`session`、`user`、`project`、`workspace`、`narrator`、`provider`、`device`。
+- `INVOCATION_SCOPE_TYPES`：`global`、`user`、`project`、`workspace`、`narrator`、`provider`、`device`。
+- 章节随叙事线一起移除：`chapter` scope 与 `query.read.chapters`、`event.subscribe.chapter`、`command.chapter.write`、`command.chapter.merge`、`command.review.write` 不再存在。旧版本留下的这类授权、待审批请求和永久拒绝在读取时被丢弃（`RETIRED_SCOPE_TYPES` / `RETIRED_CAPABILITIES`），不会让整份权限文件失效。
 - `CAPABILITIES`：本文第 2 节的完整白名单。
 - `PERMISSION_SOURCES`：`manifestRequested`、`installationGrants`、`hostPolicy`、`currentUserAuthority`、`currentInvocationScope`、`contributionPolicy`、`runnerEnforcement`。
 - `HIGH_RISK_CAPABILITIES` 与 `DEFAULT_DENIED_CAPABILITIES` 相同，见第 3 节。
@@ -20,8 +21,8 @@
 1. **Manifest 请求不是授权**：未在 Manifest 请求的 capability，即使管理员想授予也不能补齐。
 2. **信任等级不是授权**：签名、来源和 T0–T3 只影响可申请能力与 runner 策略，不能跳过 grant、用户 ACL、scope、审计或沙箱。
 3. **scope 不是 capability**：capability 表示允许哪一类宿主 API；scope、字段、topic、路径、provider instance、速率和字节上限负责收窄资源范围。
-4. **后台主体不继承用户主体**：`plugin_background` 不得继承最近一次 UI 用户的私有项目、章节、叙述者、消息或 secret 权限。
-5. **宿主重新绑定身份**：`pluginId`、user、project、chapter、workspace、narrator、device、provider instance 和 secret ID 由宿主连接/调用上下文绑定，不能相信插件参数中的同名字段。
+4. **后台主体不继承用户主体**：`plugin_background` 不得继承最近一次 UI 用户的私有项目、叙述者、消息或 secret 权限。
+5. **宿主重新绑定身份**：`pluginId`、user、project、workspace、narrator、device、provider instance 和 secret ID 由宿主连接/调用上下文绑定，不能相信插件参数中的同名字段。
 
 ## 2. Capability 白名单
 
@@ -30,9 +31,9 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 | 命名空间 | v1 capability |
 |---|---|
 | `plugin` | `plugin.install`、`plugin.enable`、`plugin.disable`、`plugin.upgrade`、`plugin.uninstall`、`plugin.grant` |
-| `query` | `query.read.projects`、`query.read.chapters`、`query.read.narrators`、`query.read.message_summary`、`query.read.message_content`、`query.read.audit_self`、`query.read.audit_all`、`query.read.host_settings` |
-| `event` | `event.subscribe.chapter`、`event.subscribe.narrator`、`event.subscribe.permission`、`event.subscribe.provider` |
-| `command` | `command.narrator.send_message`、`command.narrator.interrupt`、`command.permission.decide`、`command.chapter.write`、`command.chapter.merge`、`command.review.write`、`command.routine.write` |
+| `query` | `query.read.projects`、`query.read.narrators`、`query.read.message_summary`、`query.read.message_content`、`query.read.audit_self`、`query.read.audit_all`、`query.read.host_settings` |
+| `event` | `event.subscribe.narrator`、`event.subscribe.permission`、`event.subscribe.provider` |
+| `command` | `command.narrator.send_message`、`command.narrator.interrupt`、`command.permission.decide`、`command.routine.write` |
 | `provider` | `provider.register`、`provider.use`、`provider.refresh_catalog` |
 | `config` | `config.read_self`、`config.write_self` |
 | `secret` | `secret.use_self` |
@@ -52,8 +53,6 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 - `query.read.message_content`
 - `query.read.audit_all`
 - `command.permission.decide`
-- `command.chapter.merge`
-- `command.chapter.write`
 - `secret.use_self`
 - `device.command`
 - `filesystem.workspace.write`
@@ -84,7 +83,7 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 ```ts
 {
   type: "global" | "session" | "user" | "project" | "workspace" |
-    "chapter" | "narrator" | "provider" | "device";
+    "narrator" | "provider" | "device";
   id?: string;
 }
 ```
@@ -92,7 +91,7 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 - `global` **不得**携带 `id`。
 - 除 `global` 外的所有 scope **必须**携带非空 `id`，长度上限 128。
 - `session` 是存储/授权可用的 scope；它不属于 `INVOCATION_SCOPE_TYPES`，不能被伪装成稳定的用户或资源授权。
-- scope 只能向下收窄：不能把一个具体 project/chapter/narrator scope 改写成 global，也不能用数组或模糊表达式扩展到全部资源。
+- scope 只能向下收窄：不能把一个具体 project/narrator scope 改写成 global，也不能用数组或模糊表达式扩展到全部资源。
 
 ### 3.2 Invocation scope
 
@@ -102,7 +101,6 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 {
   userId?: string;
   projectId?: string;
-  chapterId?: string;
   workspaceId?: string;
   narratorId?: string;
   deviceId?: string;
@@ -110,7 +108,7 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 }
 ```
 
-它对应 `global`、`user`、`project`、`workspace`、`chapter`、`narrator`、`provider`、`device` 八类 invocation scope。插件提供的 `scope` 只能从宿主当前上下文收窄，不能切换到另一个用户或资源。
+它对应 `global`、`user`、`project`、`workspace`、`narrator`、`provider`、`device` 七类 invocation scope。插件提供的 `scope` 只能从宿主当前上下文收窄，不能切换到另一个用户或资源。
 
 ## 4. 信任等级（已撤销）
 

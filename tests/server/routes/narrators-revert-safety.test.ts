@@ -18,6 +18,7 @@ import { generateId } from "@server/lib/id";
 import { safeSpawn } from "@server/lib/spawn";
 import { narratorRoutes } from "@server/routes/narrators";
 import { type ActiveNarrator, activeNarrators } from "@server/services/narrator-session-state";
+import { treeSnapshotPhysicalDir } from "@server/services/tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "@server/services/worktree-tree-snapshot";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -177,7 +178,7 @@ afterEach(async () => {
 		await db.delete(narrators).where(eq(narrators.id, id));
 	}
 	for (const dir of dirs.splice(0)) {
-		await worktreeTreeSnapshot.destroy(dir);
+		rmSync(treeSnapshotPhysicalDir("local", dir), { recursive: true, force: true });
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

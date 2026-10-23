@@ -136,7 +136,6 @@ beforeEach(async () => {
 				.get();
 			if (!narrator) throw new Error("Narrator not found");
 			checkNarrator(user, narrator);
-			if (narrator.chapterId) throw new Error("Fixture has no chapter capability");
 			if (!narrator.contextProjectId) return { projectId: null };
 			const project = db
 				.select()

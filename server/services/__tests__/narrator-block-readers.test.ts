@@ -1,8 +1,7 @@
 /**
  * Readers that switched to block bodies (docs/BLOCK_STORAGE-DESIGN.md §9, §10.5): the
- * External API reasoning scan, transcript export, session interchange and the project
- * archive. With `narratorBlocks.read` on they must produce exactly what they produced from
- * `content_json`.
+ * External API reasoning scan, transcript export and session interchange. With
+ * `narratorBlocks.read` on they must produce exactly what they produced from `content_json`.
  *
  * Each comparison reads once with the switch off, then overwrites every block-format
  * envelope's `content_json` (and clears the sync queue, so nothing re-reads it) and reads
@@ -10,7 +9,6 @@
  * taken and that it reproduces the column.
  */
 
-import { Database } from "bun:sqlite";
 import {
 	afterAll,
 	afterEach,
@@ -21,12 +19,7 @@ import {
 	setSystemTime,
 	test,
 } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { inAssembledOrder } from "@shared/narrator-blocks/storage";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { ARCHIVE_COLUMNS, ARCHIVE_TABLE_ORDER } from "../project-archive/manifest";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -41,33 +34,20 @@ const blockSync = await import("../narrator-block-sync");
 const { externalReasoningScan } = await import("../external-resource-service");
 const { NARRATOR_EXPORT_DEFAULTS, streamNarratorExport } = await import("../narrator-export");
 const { narratorToInterchange } = await import("../session-interchange/export");
-const { sqliteProjectArchiveMainStore } = await import("../project-archive/sqlite-main-store");
-const { runLegacySyncWorker } = await import("../project-archive/legacy-sync-worker");
 
 const NOW = "2026-10-01T00:00:00.000Z";
-const dirs: string[] = [];
 
 beforeEach(() => {
 	cleanDb(sqlite);
 	sqlite.run(
-		"INSERT INTO projects (id, name, git_path, created_at, updated_at) VALUES ('p1', 'P', '/p', ?, ?)",
-		[NOW, NOW],
-	);
-	sqlite.run(
-		`INSERT INTO chapters (id, project_id, title, branch, base_branch, created_at, updated_at)
-		 VALUES ('c1', 'p1', 'C', 'main', 'main', ?, ?)`,
-		[NOW, NOW],
-	);
-	sqlite.run(
-		`INSERT INTO narrators (id, title, chapter_id, model, created_at, updated_at)
-		 VALUES ('n1', 'Main', 'c1', 'claude-opus-4.6', ?, ?)`,
+		`INSERT INTO narrators (id, title, model, created_at, updated_at)
+		 VALUES ('n1', 'Main', 'claude-opus-4.6', ?, ?)`,
 		[NOW, NOW],
 	);
 });
-afterEach(async () => {
+afterEach(() => {
 	settings.narratorBlocks.read = true;
 	setSystemTime();
-	for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -118,8 +98,8 @@ async function writeConversation() {
 
 	sqlite.run(
 		`INSERT INTO narrators (id, title, type, variant, parent_narrator_id, origin_tool_call_id,
-			subagent_origin_kind, chapter_id, created_at, updated_at)
-		 VALUES ('sub1', 'Explore', 'subagent', 'subagent:explore', 'n1', ?, 'tool', 'c1', ?, ?)`,
+			subagent_origin_kind, created_at, updated_at)
+		 VALUES ('sub1', 'Explore', 'subagent', 'subagent:explore', 'n1', ?, 'tool', ?, ?)`,
 		[callRow ?? null, NOW, NOW],
 	);
 	const placement = { parentToolUseId: "call_task" };
@@ -284,55 +264,6 @@ describe("readers on block bodies", () => {
 		expect(blocks).toBe(legacy);
 	});
 
-	test("the archive store assembles the content_json column", async () => {
-		await writeConversation();
-		const { legacy, blocks } = await readBoth(() =>
-			sqliteProjectArchiveMainStore.readRows({
-				table: "narrator_messages",
-				filter: { column: "narrator_id", values: ["n1", "sub1"] },
-				limit: 500,
-				after: null,
-			}),
-		);
-		expect(legacy.rows.length).toBe(messageIds().length);
-		expect(blocks).toEqual(legacy);
-	});
-
-	test("the archive worker assembles the content_json column", async () => {
-		await writeConversation();
-		const root = await mkdtemp(join(tmpdir(), "nf-block-readers-"));
-		dirs.push(root);
-		const exportTo = async (name: string, bodiesFromBlocks: boolean) => {
-			const databasePath = join(root, `${name}.sqlite`);
-			const archivePath = join(root, `${name}-archive.sqlite`);
-			await writeFile(databasePath, sqlite.serialize());
-			const archive = new Database(archivePath, { create: true });
-			for (const table of ARCHIVE_TABLE_ORDER)
-				archive.run(`CREATE TABLE ${table} (${ARCHIVE_COLUMNS[table].join(",")})`);
-			archive.close();
-			const result = await runLegacySyncWorker({
-				databasePath,
-				archivePath,
-				backend: "sqlite",
-				projectId: "p1",
-				deadline: Date.now() + 30_000,
-				cancellation: new SharedArrayBuffer(4),
-				bodiesFromBlocks,
-			});
-			const written = new Database(archivePath, { readonly: true });
-			const rows = written
-				.prepare("SELECT id, content_json FROM narrator_messages ORDER BY id")
-				.all();
-			written.close();
-			return { result, rows };
-		};
-		const legacy = await exportTo("legacy", false);
-		overwriteContentJson();
-		const blocks = await exportTo("blocks", true);
-		expect(legacy.rows.length).toBe(messageIds().length);
-		expect(blocks).toEqual(legacy);
-	});
-
 	test("with the switch off, readers read content_json", async () => {
 		await writeConversation();
 		const before = await exportText("n1", "json");
@@ -341,34 +272,5 @@ describe("readers on block bodies", () => {
 		const after = await exportText("n1", "json");
 		expect(after).not.toBe(before);
 		expect(after).toContain('"stale"');
-	});
-});
-
-describe("assembled key order", () => {
-	// One rule (shared/narrator-blocks/storage.ts): an element's reader-only fields come
-	// after its other fields. A compact marker written with `status` first reads back from
-	// its rows with `status` last: the same value, different JSON bytes in readers that emit
-	// raw elements (JSON export, the archive column).
-	test("a compact marker's archived content_json follows the assembled order", async () => {
-		await narratorPersistence.persistCompactingMessage("n1");
-		blockSync.flushChangedEnvelopes();
-		const read = () =>
-			sqliteProjectArchiveMainStore.readRows({
-				table: "narrator_messages",
-				filter: { column: "narrator_id", values: ["n1"] },
-				limit: 500,
-				after: null,
-			});
-		settings.narratorBlocks.read = false;
-		const legacy = await read();
-		settings.narratorBlocks.read = true;
-		const blocks = await read();
-		expect(blocks.rows).not.toEqual(legacy.rows);
-		expect(blocks.rows).toEqual(
-			legacy.rows.map((row) => ({
-				...row,
-				content_json: JSON.stringify(inAssembledOrder(JSON.parse(String(row.content_json)))),
-			})),
-		);
 	});
 });

@@ -11,19 +11,14 @@ export const terminalRoutes = new Hono();
 // === Terminal CRUD (collection) ===
 
 terminalRoutes.get("/", async (c) => {
-	const chapterId = c.req.query("chapterId");
 	const narratorId = c.req.query("narratorId");
-	if (!chapterId && !narratorId) {
-		throw new ValidationError("chapterId or narratorId query parameter is required");
+	if (!narratorId) {
+		throw new ValidationError("narratorId query parameter is required");
 	}
 	// Listing a narrator's terminals reveals what it is running, so it follows the
-	// narrator's read access. The chapter branch is unchanged: chapters have no
-	// per-user ACL of their own.
-	if (narratorId) await requireNarratorAccess(c, narratorId, "read");
-	const list = chapterId
-		? await terminalService.listByChapter(chapterId)
-		: await terminalService.listByNarrator(narratorId ?? "");
-	return c.json(list);
+	// narrator's read access.
+	await requireNarratorAccess(c, narratorId, "read");
+	return c.json(await terminalService.listByNarrator(narratorId));
 });
 
 terminalRoutes.post("/", async (c) => {
@@ -36,7 +31,6 @@ terminalRoutes.post("/", async (c) => {
 		await requireNarratorAccess(c, parsed.data.narratorId, "write");
 	}
 	const terminal = await terminalService.create({
-		chapterId: parsed.data.chapterId,
 		narratorId: parsed.data.narratorId,
 		name: parsed.data.name,
 		cols: parsed.data.cols,
@@ -63,10 +57,8 @@ terminalRoutes.post("/", async (c) => {
 
 terminalRoutes.get("/view-state", requireAuth, async (c) => {
 	const userId = c.get("user").sub;
-	const chapterId = c.req.query("chapterId");
 	const narratorId = c.req.query("narratorId");
 	const state = await terminalViewService.get(userId, {
-		chapterId: chapterId ?? undefined,
 		narratorId: narratorId ?? undefined,
 	});
 	return c.json(state ?? { layout: "single", activeTabId: null, panelAssignments: null });
@@ -105,10 +97,6 @@ terminalRoutes.patch("/:id", async (c) => {
 		}
 		await terminalService.rename(id, name.trim());
 	}
-
-	// Graph-state updates used to be accepted here, for terminals shown as their own
-	// canvas nodes. That node type is gone — a chapter's terminals live in its dock's
-	// terminal panel — so the route now only renames.
 
 	const terminal = await terminalService.getById(id);
 	return c.json(terminal);

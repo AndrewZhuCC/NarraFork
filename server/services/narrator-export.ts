@@ -1533,7 +1533,6 @@ export interface NarratorExportHeader {
 	variant: string | null;
 	model: string | null;
 	cwd: string | null;
-	chapterId: string | null;
 	parentNarratorId: string | null;
 	createdAt: string | null;
 }
@@ -1550,7 +1549,6 @@ async function loadHeader(
 			variant: true,
 			model: true,
 			cwd: true,
-			chapterId: true,
 			parentNarratorId: true,
 			createdAt: true,
 		},
@@ -1563,7 +1561,6 @@ async function loadHeader(
 		variant: row.variant ?? null,
 		model: row.model ?? null,
 		cwd: row.cwd ?? null,
-		chapterId: row.chapterId ?? null,
 		parentNarratorId: row.parentNarratorId ?? null,
 		createdAt: row.createdAt ?? null,
 		isSubagent: isSubagentVariant(row.variant),

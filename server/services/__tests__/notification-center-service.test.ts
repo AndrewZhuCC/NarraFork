@@ -46,8 +46,8 @@ function notification(
 ) {
 	sqlite.run(
 		`INSERT INTO notifications
-		(id,user_id,kind,source_key,title,preview,link_json,status,created_at,read_at,project_id,chapter_id,narrator_id)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(id,user_id,kind,source_key,title,preview,link_json,status,created_at,read_at,project_id,narrator_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		[
 			id,
 			options.userId ?? alice,
@@ -60,7 +60,6 @@ function notification(
 			options.createdAt ?? now,
 			options.readAt ?? null,
 			"secret-project",
-			"secret-chapter",
 			"secret-narrator",
 		],
 	);
@@ -101,22 +100,24 @@ function permission(
 			"INSERT OR IGNORE INTO projects (id,name,owner_user_id,created_at,updated_at) VALUES ('project','Project title',?,?,?)",
 			[alice, new Date(now).toISOString(), new Date(now).toISOString()],
 		);
-		sqlite.run(
-			"INSERT OR IGNORE INTO chapters (id,project_id,title,branch,base_branch,created_at,updated_at) VALUES ('chapter','project','Chapter title','feature','main',?,?)",
-			[new Date(now).toISOString(), new Date(now).toISOString()],
-		);
 	}
 	sqlite.run(
-		"INSERT INTO narrators (id,title,owner_user_id,visibility,write_audience,chapter_id,created_at,updated_at) VALUES (?,? ,?,'private','owner',?,?,?)",
+		"INSERT INTO narrators (id,title,owner_user_id,visibility,write_audience,cwd,created_at,updated_at) VALUES (?,? ,?,'private','owner',?,?,?)",
 		[
 			`n-${id}`,
 			"Narrator",
 			options.owner ?? alice,
-			options.context ? "chapter" : null,
+			options.context ? "/project" : null,
 			new Date(now).toISOString(),
 			new Date(now).toISOString(),
 		],
 	);
+	// In the project through the link the index derives from its working directory.
+	if (options.context)
+		sqlite.run(
+			"INSERT INTO narrator_project_links (narrator_id,project_id,role,source,directory,updated_at) VALUES (?,'project','primary','cwd','/project',?)",
+			[`n-${id}`, new Date(now).toISOString()],
+		);
 	sqlite.run(
 		"INSERT INTO narrator_messages (id,narrator_id,role,content_json,created_at) VALUES (?,?,'assistant','[]',?)",
 		[`m-${id}`, `n-${id}`, new Date(now).toISOString()],
@@ -138,10 +139,8 @@ function expectGone(item: NotificationListItem | undefined) {
 		preview: "",
 		link: { type: "unavailable" },
 		projectId: null,
-		chapterId: null,
 		narratorId: null,
 		projectTitle: null,
-		chapterTitle: null,
 		groupKey: `notification:${item.id}`,
 	});
 }
@@ -373,9 +372,7 @@ describe("whole-window grouping and derived source state", () => {
 			sourceState: "active",
 			narratorId: "n-pending",
 			projectId: "project",
-			chapterId: "chapter",
 			projectTitle: "Project title",
-			chapterTitle: "Chapter title",
 		});
 		expect(items.find((item) => item.sourceKey === "decided")?.sourceState).toBe("resolved");
 		expectGone(items.find((item) => item.id === "notification-denied"));

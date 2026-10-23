@@ -58,9 +58,9 @@ describe("Manifest/capability parity", () => {
 		const legacy = await loadFixture("valid-manifest.json");
 		const parsed = parseManifest(legacy);
 
-		expect(parsed.permissions.host).toEqual(["query.read.chapters", "ui.panel"]);
-		expect(manifestCapabilitySchema.parse("query.chapters.read")).toBe("query.read.chapters");
-		expect(normalizeCapabilityName("query.chapters.read")).toBe("query.read.chapters");
+		expect(parsed.permissions.host).toEqual(["query.read.projects", "ui.panel"]);
+		expect(manifestCapabilitySchema.parse("query.projects.read")).toBe("query.read.projects");
+		expect(normalizeCapabilityName("query.projects.read")).toBe("query.read.projects");
 		expect(Object.values(LEGACY_CAPABILITY_ALIASES).every(isCanonicalPermissionName)).toBe(true);
 		expect(LEGACY_CAPABILITY_ALIAS_POLICY).toMatchObject({
 			status: "deprecated",
@@ -105,10 +105,42 @@ describe("Manifest/capability parity", () => {
 		// Duplicates created by alias normalization are still a manifest authoring error.
 		const duplicate = await loadFixture("valid-manifest.json");
 		(duplicate.permissions as { host: string[] }).host = [
-			"query.chapters.read",
-			"query.read.chapters",
+			"query.projects.read",
+			"query.read.projects",
 		];
 		expect(safeParseManifest(duplicate).success).toBe(false);
+	});
+
+	test("still loads a manifest written for chapters, which no longer exist", async () => {
+		const legacy = await loadFixture("valid-ui-only.json");
+		(legacy.permissions as { host: string[] }).host = [
+			"ui.panel",
+			"query.read.chapters",
+			"command.chapter.write",
+			"query.chapters.read",
+		];
+		const views = (legacy.contributes as { views: Array<Record<string, unknown>> }).views;
+		views[0].surfaces = ["workspace", "graph"];
+		views.push({ ...views[0], id: "node", surfaces: ["graph"] });
+
+		const parsed = parseManifest(legacy);
+
+		// Retired capability names are ordinary well-formed names now: no longer known and no
+		// longer rewritten as aliases, so they simply grant nothing.
+		expect(parsed.permissions.host).toEqual([
+			"ui.panel",
+			"query.read.chapters",
+			"command.chapter.write",
+			"query.chapters.read",
+		]);
+		expect(KNOWN_CAPABILITIES).not.toContain("query.read.chapters");
+		// The retired `graph` surface is dropped; a view that listed only it mounts nowhere.
+		expect(parsed.contributes.views.map((view) => view.surfaces)).toEqual([["workspace"], []]);
+		// Registries re-parse an already-parsed manifest, so the result must parse again.
+		expect(parseManifest(parsed).contributes.views.map((view) => view.surfaces)).toEqual([
+			["workspace"],
+			[],
+		]);
 	});
 
 	test("keeps every reference Manifest on canonical permission and protocol fields", async () => {

@@ -24,7 +24,7 @@ const hookCode = new Bun.Transpiler({ loader: "ts" }).transformSync(`
 function useSpecActions({ dock, narratorId, onToggleSpecPanel, specPanelOpen, isWorkspacePreview }) {
 	${section("const dockOpenToolPanel =", "\n")}
 	${section("const [internalSpecOpen,", "// Background tasks:")}
-	${section("const handleOpenSpecFile =", "/**\n\t * Open a chapter referenced")}
+	${section("const handleOpenSpecFile =", "\n\tconst handleDetachSubagent =")}
 	return { openSpecTool, handleOpenSpecFile, specToolOpened, specToolAvailable, useInternalSpec };
 }`);
 

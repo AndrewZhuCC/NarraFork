@@ -24,11 +24,10 @@ import { authRoutes } from "./routes/auth";
 import { benchmarkRoutes } from "./routes/benchmarks";
 import brandingRoutes from "./routes/branding";
 import changelogRoutes from "./routes/changelog";
-import chapterEdgeRoutes from "./routes/chapter-edges";
-import { chapterRoutes } from "./routes/chapters";
 import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
 import { commandCodeRoutes } from "./routes/commandcode";
+import { containerRoutes } from "./routes/containers";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
 import { deepseekRoutes } from "./routes/deepseek";
@@ -43,9 +42,8 @@ import { fsRoutes } from "./routes/fs";
 import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
 import { geminiRoutes } from "./routes/gemini";
 import { genUiRoutes } from "./routes/gen-ui";
-import { gitRoutes, narratorGitRoutes } from "./routes/git";
+import { narratorGitRoutes } from "./routes/git";
 import { grammarRoutes } from "./routes/grammars";
-import { graphRoutes } from "./routes/graph";
 import { hookRoutes } from "./routes/hooks";
 import { integrationRoutes } from "./routes/integrations";
 import { kimiRoutes } from "./routes/kimi";
@@ -67,7 +65,6 @@ import { openaiRoutes } from "./routes/openai";
 import { opencodeRoutes } from "./routes/opencode";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
-import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
@@ -75,9 +72,7 @@ import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
 } from "./routes/public-narrator-shares";
-import { reviewsRouter } from "./routes/reviews";
 import { routineRoutes } from "./routes/routines";
-import { rulerRoutes } from "./routes/ruler";
 import { runtimeRoutes } from "./routes/runtime";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks";
 import { searchRoutes } from "./routes/search";
@@ -99,7 +94,6 @@ import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
-import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
 
@@ -398,22 +392,6 @@ type GitRequiredRule = {
 const GIT_REQUIRED_RULES: readonly GitRequiredRule[] = [
 	// Creating a project invokes git init/clone/repository detection.
 	{ methods: ["POST"], pattern: /^\/api\/projects$/ },
-	// Ruler/NarraFlow routes are backed by git log/rev-list/rebase operations.
-	{ pattern: /^\/api\/projects\/[^/]+\/ruler(?:\/|$)/ },
-	// Chapter lifecycle and merge operations create/remove branches and worktrees.
-	{ methods: ["POST"], pattern: /^\/api\/chapters$/ },
-	{ methods: ["DELETE"], pattern: /^\/api\/chapters\/[^/]+$/ },
-	{ methods: ["POST"], pattern: /^\/api\/chapters\/(?:cleanup|batch-merge)$/ },
-	{
-		methods: ["GET", "POST"],
-		pattern:
-			/^\/api\/chapters\/[^/]+\/(?:fork|review|merge-check|merge|ai-resolve|unmerge|dormant|wake|git-status)(?:\/|$)/,
-	},
-	// Git panel endpoints are explicitly git-backed.
-	{ pattern: /^\/api\/chapters\/[^/]+\/git(?:\/|$)/ },
-	// Commit file diff endpoints need git diff-tree. Commit list/details can fall
-	// back to database records, so they are intentionally not blocked here.
-	{ methods: ["GET"], pattern: /^\/api\/chapters\/[^/]+\/commits\/[^/]+\/files(?:\/|$)/ },
 ];
 
 function requiresGit(method: string, path: string): boolean {
@@ -434,9 +412,7 @@ app.use("/api/*", async (c, next) => {
 });
 
 app.route("/api/projects", projectRoutes);
-app.route("/api/chapters", chapterRoutes);
-app.route("/api/chapters", gitRoutes);
-app.route("/api/chapter-edges", chapterEdgeRoutes);
+app.route("/api/containers", containerRoutes);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
@@ -494,7 +470,6 @@ app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/scheduled-tasks", scheduledTaskRoutes);
 app.route("/api/hooks", hookRoutes);
-app.route("/api/reviews", reviewsRouter);
 app.route("/api/update", updateRoutes);
 app.route("/api/system/lifecycle", systemLifecycleRoutes);
 app.route("/api/vnet", vnetRoutes);
@@ -506,16 +481,6 @@ app.route("/api/dashboard", dashboardRoutes);
 
 // IM Gateway management routes (status, sessions, etc.)
 app.route("/api/gateway", gatewayRoutes);
-
-// Graph routes are nested under projects for RESTful consistency
-app.route("/api/projects", graphRoutes);
-// Ruler routes (new NarraFlow) nested under projects
-app.route("/api/projects", rulerRoutes);
-// Project DB backup/import routes
-app.route("/api/projects", projectDbRoutes);
-// Volume snapshot routes (nested under projects for list/create, standalone for single-item ops)
-app.route("/api/projects", volumeSnapshotRoutes);
-app.route("/api/volume-snapshots", volumeSnapshotRoutes);
 
 app.onError((err, c) => {
 	const storageError = isDiskFullError(err)
