@@ -31,6 +31,8 @@ import {
 	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
 import { AppError } from "../lib/errors";
+import { bodyLengthSql, boundedBodyText, hasBlockStorage } from "../lib/narrator-bodies";
+import { settings } from "../lib/settings";
 import {
 	createFileChangeIdentity,
 	fileChangeExecutionBindingMatches,
@@ -527,7 +529,7 @@ export class RevertSelectionService {
 	private ref(state: ScopeState, narratorId: string, messageId: string): RefRow {
 		const ref = this.one<RefRow>(
 			state,
-			`${REF_SELECT} WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
+			`${refSelect(this.database.$client)} WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
 			[narratorId, messageId],
 		);
 		if (!ref) throw fail("NOT_FOUND", "Selected message has no actual owning ref");
@@ -579,7 +581,7 @@ export class RevertSelectionService {
 		for (;;) {
 			const page = this.rows<RefRow>(
 				state,
-				`${REF_SELECT} WHERE r.narrator_id = ? AND (r.seq, r.rowid) >= (?, ?) ORDER BY r.seq, r.rowid LIMIT ?`,
+				`${refSelect(this.database.$client)} WHERE r.narrator_id = ? AND (r.seq, r.rowid) >= (?, ?) ORDER BY r.seq, r.rowid LIMIT ?`,
 				[narratorId, cursor.seq, cursor.rowid, REVERT_SELECTION_PAGE_ITEMS + 1],
 			);
 			for (const ref of page.slice(0, REVERT_SELECTION_PAGE_ITEMS))
@@ -608,14 +610,19 @@ export class RevertSelectionService {
 		return summary;
 	}
 	private readBody(state: ScopeState, ref: RefRow): string {
-		const content = this.one<{ body: string }>(
-			state,
-			"SELECT content_json AS body FROM narrator_messages WHERE id = ? AND octet_length(content_json) = ? AND octet_length(content_json) <= ? LIMIT 1",
-			[ref.id, ref.contentBytes, REVERT_SELECTION_LIMITS.messageBytes],
-			false,
+		this.check(state);
+		state.queries++;
+		const body = boundedBodyText(
+			this.database.$client,
+			ref.id,
+			bodiesFromBlocks(this.database.$client),
+			{
+				exactBytes: ref.contentBytes,
+				maxBytes: REVERT_SELECTION_LIMITS.messageBytes,
+			},
 		);
-		if (!content) throw fail("STALE", "Message changed before bounded inspection");
-		return content.body;
+		if (body === undefined) throw fail("STALE", "Message changed before bounded inspection");
+		return body;
 	}
 
 	private async message(
@@ -1214,11 +1221,17 @@ const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, wr
  message_version AS messageVersion, refs_inherited_from AS refsInheritedFrom, status,
  parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators`;
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
-const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
- coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
- octet_length(m.content_json) + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
+/** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
+const bodiesFromBlocks = (db: Database) => settings.narratorBlocks.read && hasBlockStorage(db);
+/** Refs with their message's sizes; a body is measured as readers read it. */
+const refSelect = (db: Database) => {
+	const body = bodyLengthSql("m", bodiesFromBlocks(db));
+	return `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
+ coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, ${body} AS contentBytes,
+ ${body} + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
  m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha
  FROM narrator_message_refs r LEFT JOIN narrator_messages m ON m.id = r.message_id`;
+};
 const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS messageId, tool_use_id AS toolUseId, tool_name AS toolName, status,
  CASE WHEN tool_name = 'GenUI' AND octet_length(input_json) <= 8192
  THEN CASE WHEN json_valid(input_json) THEN CASE WHEN json_extract(input_json, '$.action') = 'show'

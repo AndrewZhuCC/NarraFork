@@ -18,6 +18,8 @@ import { type BunSQLiteDatabase, SQLiteBunTransaction } from "drizzle-orm/bun-sq
 import { narratorBufferedMessages, narratorMessages, narratorToolCalls } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { bodyLengthSql, boundedBodyText, hasBlockStorage } from "../lib/narrator-bodies";
+import { settings } from "../lib/settings";
 import {
 	nextCurrentRevision,
 	recipientDeletedReceiptPatch,
@@ -232,6 +234,8 @@ const TOOL_COLUMNS = Object.values(getTableColumns(narratorToolCalls))
 	.filter((column) => !column.generated)
 	.map((column) => column.name);
 const PAGE = REVERT_SELECTION_PAGE_ITEMS;
+/** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
+const bodiesFromBlocks = (db: Database) => settings.narratorBlocks.read && hasBlockStorage(db);
 const MAILBOX_FIELDS: Record<string, { name: string }> = getTableColumns(narratorBufferedMessages);
 /** The shared runtime patch uses schema field names; map them to stored SQL columns. */
 function mailboxPatch(patch: Record<string, Value>): Row {
@@ -548,6 +552,7 @@ export class RevertHistoryCommitService {
 		const hiddenOwner: Target[] = [];
 		const copies = new Map<string, Row>();
 		const bodies = new Map<string, Row>();
+		const bodyTexts = new Map<string, string>();
 		let rowBytes = 0;
 		let indexBytes = 0;
 		const addAffected = (id: string) => {
@@ -587,14 +592,22 @@ export class RevertHistoryCommitService {
 		};
 		const messageSizes = new Map<string, number>();
 		const toolSizes = new Map<string, number>();
+		// What fixes a message's body for the apply-time checks: its revisions (every body or
+		// state write moves one), or the stored column on a schema without them.
+		const bodyRevisions = ["body_revision", "state_revision"];
+		const fixedBody = bodyRevisions.every((column) => stored.message.includes(column))
+			? bodyRevisions
+			: ["content_json"];
 		for (const message of messages) {
 			const whole = message.action === "delete" || message.action === "unlink";
 			if (whole) reserveRow(message.contentBytes);
 			// Combine the consumed message metadata and FTS size observation. Copy bodies
 			// remain deferred until every full-row admission check has passed.
+			// A removed message's body is fixed by `fixedBody` and its size as readers
+			// measure it.
 			const observed = this.one<Row & { ftsBytes: number; rowBytes: number }>(
 				work,
-				`SELECT id,role,tree_hash_after,snapshot_commit_sha,coalesce(octet_length(content_text),0) AS ftsBytes,${whole ? "content_json" : `${rowLength(stored.message)} AS rowBytes`} FROM narrator_messages WHERE id=?${whole ? " AND octet_length(content_json)=?" : ""} LIMIT 1`,
+				`SELECT id,role,tree_hash_after,snapshot_commit_sha,coalesce(octet_length(content_text),0) AS ftsBytes,${whole ? fixedBody.map(quote).join(",") : `${rowLength(stored.message)} AS rowBytes`} FROM narrator_messages m WHERE id=?${whole ? ` AND ${bodyLengthSql("m", bodiesFromBlocks(this.root))}=?` : ""} LIMIT 1`,
 				whole ? [message.id, message.contentBytes] : [message.id],
 			);
 			capture(messageRows, message.id, observed);
@@ -802,14 +815,22 @@ export class RevertHistoryCommitService {
 			const columns =
 				message.action === "copy_on_write"
 					? stored.message
-					: ["id", "content_json", "role", "tree_hash_after", "snapshot_commit_sha"];
-			const body = this.one<Row>(
+					: ["id", "role", "tree_hash_after", "snapshot_commit_sha", ...fixedBody];
+			const row = this.one<Row>(
 				work,
 				`SELECT ${columns.map(quote).join(",")},coalesce(octet_length(content_text),0) AS ftsBytes,${rowLength(stored.message)} AS rowBytes FROM narrator_messages WHERE id=? AND ${rowLength(stored.message)}=? LIMIT 1`,
 				[id, bytes],
 			);
-			capture(messageRows, id, body);
-			bodies.set(id, body);
+			capture(messageRows, id, row);
+			// The body as readers read it (its rows when they hold it), at the size selected.
+			this.check(work);
+			const text = boundedBodyText(this.root, id, bodiesFromBlocks(this.root), {
+				exactBytes: message.contentBytes,
+				maxBytes: FILE_CHANGE_LIMITS.historyCowBytes,
+			});
+			if (text === undefined) throw fail("STALE", "A selected message body changed");
+			bodies.set(id, row);
+			bodyTexts.set(id, text);
 			await this.pause(work);
 		}
 		for (const [id, bytes] of toolSizes) {
@@ -827,15 +848,10 @@ export class RevertHistoryCommitService {
 		for (const message of messages) {
 			if (message.action !== "rewrite" && message.action !== "copy_on_write") continue;
 			const original = bodies.get(message.id);
-			if (!original || typeof original.content_json !== "string")
-				throw fail("BODY_INVALID", "No raw body");
+			const text = bodyTexts.get(message.id);
+			if (!original || text === undefined) throw fail("BODY_INVALID", "No raw body");
 			const selectedBlocks = blocks.get(message.id) ?? [];
-			const rewritten = await worker.rewrite(
-				message,
-				selectedBlocks,
-				original.content_json,
-				String(original.role),
-			);
+			const rewritten = await worker.rewrite(message, selectedBlocks, text, String(original.role));
 			this.check(work);
 			producedBytes += rewritten.bytes;
 			bound(producedBytes, FILE_CHANGE_LIMITS.historyCowBytes, "rewritten body bytes");

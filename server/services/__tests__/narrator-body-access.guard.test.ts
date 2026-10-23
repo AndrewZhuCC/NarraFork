@@ -11,10 +11,10 @@
  *     `insertEnvelope` / `writeEnvelopeBody` (`narrator-body-writes.ts`), which build the
  *     rows from the body handed over instead of reading the column back.
  *
- * `RAW_BODY_ACCESS` counts what each file still does to the column directly. Some entries
- * are permanent: the body layer, and readers where the column is the body (legacy
- * envelopes, PG, the block read switch off). The rest is the work left; the counts only
- * go down:
+ * `RAW_BODY_ACCESS` counts what each file still does to the column directly: the body
+ * layer; readers where the column is the body (legacy envelopes, PG, the block read switch
+ * off); and writes whose rows the sync queue builds from the column. The counts only go
+ * down:
  *   - a raw access in an unlisted file, or more than its count, fails — read and write
  *     through the body layer instead;
  *   - fewer than its count fails too — lower it (drop the entry at zero).
@@ -41,7 +41,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 		count: 4,
 		why: "the dual-write audit, column resync",
 	},
-	"server/lib/narrator-bodies.ts": { count: 3, why: "body reads off the main thread" },
+	"server/lib/narrator-bodies.ts": { count: 6, why: "body reads off the main thread" },
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
 	"server/services/narrator-block-scans.ts": { count: 5, why: "scans: column fallback" },
 	"server/services/narrator-block-targets.ts": { count: 2, why: "legacy envelopes' ids" },
@@ -61,12 +61,11 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/services/session-interchange/export.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-epochs.ts": { count: 1, why: "read switch off" },
 	"server/services/agent-runtime/publication.ts": { count: 1, why: "column fallback" },
-	// Imports write legacy envelopes; the backfill converts them.
+	// Writes whose rows the sync queue builds from the column (`insertEnvelopeQueued`'s
+	// contract): a legacy-format import, and the revert program's prepared statements, which
+	// apply without reads or JSON work and so cannot sync inline.
 	"server/services/session-interchange/import.ts": { count: 1, why: "legacy-format import" },
-	// Left to move onto the body layer (P3a).
-	"server/services/revert-history-commit.ts": { count: 7, why: "revert rewrite" },
-	"server/services/revert-selection-service.ts": { count: 5, why: "revert digests" },
-	"server/services/revert-planner-local-access.ts": { count: 3, why: "rollback preview" },
+	"server/services/revert-history-commit.ts": { count: 3, why: "prepared row rewrite/copy" },
 };
 
 function isExempt(path: string): boolean {

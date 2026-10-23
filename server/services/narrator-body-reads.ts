@@ -18,7 +18,7 @@ import type { AnyColumn, SQL } from "drizzle-orm";
 import { getTableColumns, sql } from "drizzle-orm";
 import * as database from "../db";
 import { narratorMessages } from "../db/schema";
-import { blockBodies } from "../lib/narrator-bodies";
+import { blockBodies, boundedBodyText } from "../lib/narrator-bodies";
 import { assembledBodyLengthSql } from "../lib/narrator-body-length";
 import { blockReadsEnabled } from "./narrator-block-scans";
 
@@ -173,6 +173,14 @@ export function fillBodies<T extends { id: string; contentJson: unknown }>(rows:
 	const bodies = blockBodies(database.sqlite, missing);
 	for (const row of rows) if (row.contentJson === null) row.contentJson = bodies.get(row.id) ?? [];
 	return rows;
+}
+
+/**
+ * One envelope's body as stored text, measured before it is read and read only within
+ * `maxBytes` (`boundedBodyText`): for a reader on the HTTP thread that parses it.
+ */
+export function boundedStoredBody(messageId: string, maxBytes: number): string | undefined {
+	return boundedBodyText(database.sqlite, messageId, blockReadsEnabled(), { maxBytes });
 }
 
 /** One envelope's body assembled from its block rows (for a reader that saw it NULL). */

@@ -7,7 +7,7 @@ import {
 	type FileChangeRevertAction,
 	type FileChangeState,
 } from "@shared/file-change-protocol";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narratorMessageRefs,
@@ -32,6 +32,7 @@ import {
 	type LocalFileChangeRuntime,
 } from "./file-change-runtime";
 import { assertNarratorAccess, type NarratorAclRow, type NarratorPrincipal } from "./narrator-acl";
+import { boundedStoredBody } from "./narrator-body-reads";
 import { resolveNarratorProjectId } from "./narrator-project";
 import type { ScopedRevertUnavailableReason } from "./narrator-scoped-revert";
 import {
@@ -490,17 +491,8 @@ export async function prepareLocalRevertAction(
 				throw new ValidationError("An edit preview keeps the complete user message");
 			if (index === undefined || !Number.isSafeInteger(index) || index < 0)
 				throw new ValidationError("A valid block index is required");
-			// Bound JSON1 parsing on the HTTP thread; never select the complete message body.
-			const body = sql`CASE WHEN octet_length(${narratorMessages.contentJson}) <= ${FILE_CHANGE_LIMITS.summaryBytes}
-				THEN CASE WHEN json_valid(${narratorMessages.contentJson}) THEN ${narratorMessages.contentJson} ELSE NULL END
-				ELSE NULL END`;
-			const message = db
-				.select({
-					role: narratorMessages.role,
-					blockCount: sql<number | null>`json_array_length(${body})`,
-					blockType: sql<string | null>`json_extract(${body}, ${`$[${index}].type`})`,
-					toolUseId: sql<string | null>`json_extract(${body}, ${`$[${index}].id`})`,
-				})
+			const found = db
+				.select({ role: narratorMessages.role })
 				.from(narratorMessageRefs)
 				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 				.where(
@@ -510,7 +502,8 @@ export async function prepareLocalRevertAction(
 					),
 				)
 				.get();
-			if (!message) throw new NotFoundError("Message", input.messageId);
+			if (!found) throw new NotFoundError("Message", input.messageId);
+			const message = { role: found.role, ...boundaryElement(input.messageId, index) };
 			if (message.blockCount === null)
 				throw new RevertPlannerError(
 					"BUDGET_EXCEEDED",
@@ -742,4 +735,30 @@ export async function applyLocalRevertPlan(
 	return refreshFailed && response.status === "committed"
 		? { ...response, reason: response.reason ?? "POST_COMMIT_REFRESH_FAILED" }
 		: response;
+}
+
+/**
+ * How many elements a message's body has, and the type and id of element `index`: the body
+ * as readers read it (`narrator-bodies.ts`), measured before it is read and parsed only
+ * within the HTTP thread's budget. A null count when it exceeds the budget or is no JSON.
+ */
+function boundaryElement(
+	messageId: string,
+	index: number,
+): { blockCount: number | null; blockType: string | null; toolUseId: string | null } {
+	const text = boundedStoredBody(messageId, FILE_CHANGE_LIMITS.summaryBytes);
+	let body: unknown;
+	try {
+		body = text === undefined ? undefined : JSON.parse(text);
+	} catch {
+		body = undefined;
+	}
+	if (body === undefined) return { blockCount: null, blockType: null, toolUseId: null };
+	const elements = Array.isArray(body) ? body : [];
+	const element = elements[index] as { type?: unknown; id?: unknown } | null | undefined;
+	return {
+		blockCount: elements.length,
+		blockType: typeof element?.type === "string" ? element.type : null,
+		toolUseId: typeof element?.id === "string" ? element.id : null,
+	};
 }

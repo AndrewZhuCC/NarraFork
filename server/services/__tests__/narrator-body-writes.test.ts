@@ -358,3 +358,31 @@ describe("output recovery reads the rows", () => {
 		]);
 	});
 });
+
+describe("bounded body reads", () => {
+	test("a body read from its rows has the length the column measured", async () => {
+		const messageId = await step();
+		await narratorPersistence.patchReasoningTranslation(messageId, 0, "思考：译文", {
+			id: "r1",
+			text: "think",
+		});
+		const { bodyLengthSql, boundedBodyText } = await import("../../lib/narrator-bodies");
+		const length = () =>
+			(
+				sqlite
+					.prepare(`SELECT ${bodyLengthSql("m", true)} AS n FROM narrator_messages m WHERE id = ?`)
+					.get(messageId) as { n: number }
+			).n;
+		const columnBytes = Buffer.byteLength(JSON.stringify(column(messageId)));
+		expect(length()).toBe(columnBytes);
+		detachColumn(messageId);
+		expect(length()).toBe(columnBytes);
+		const text = boundedBodyText(sqlite, messageId, true, { maxBytes: 1 << 20 });
+		expect(JSON.parse(text ?? "null")).toEqual(assembled(messageId));
+		expect(Buffer.byteLength(text ?? "")).toBe(columnBytes);
+		expect(boundedBodyText(sqlite, messageId, true, { maxBytes: columnBytes - 1 })).toBeUndefined();
+		expect(
+			boundedBodyText(sqlite, messageId, true, { maxBytes: 1 << 20, exactBytes: columnBytes + 1 }),
+		).toBeUndefined();
+	});
+});
