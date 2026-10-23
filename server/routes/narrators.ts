@@ -200,7 +200,6 @@ import {
 	restoreNarratorDraftSchema,
 	retryFailedCompactSchema,
 	revertScopeSchema,
-	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
 	sessionExportDownloadQuerySchema,
@@ -407,7 +406,6 @@ import {
 	restoreOutputBlock,
 	retryFailedCompact,
 	retryLastMessage,
-	rollbackToBlock,
 	rollbackToBlocks,
 	runCustomCompact,
 	runSegmentCompact,
@@ -2739,44 +2737,6 @@ async function allowRetryResponse(c: Context, id: string, toolUseId: string) {
 	return c.json({ ok: true });
 }
 
-// Rollback to a specific block — delete everything after it (no re-run)
-narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
-	const id = c.req.param("id");
-	const messageId = c.req.param("messageId");
-	const { blockIndex, skipRevert, scope, revertPlan } = rollbackToBlockSchema.parse(
-		await c.req.json(),
-	);
-	if (skipRevert !== true && !revertPlan)
-		throw new AppError(
-			"Review a fresh rollback preview before restoring files",
-			409,
-			"REVERT_CONFIRMATION_REQUIRED",
-		);
-	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
-
-	const narrator = await narratorService.getById(id);
-
-	// A rollback discards the turn it lands in, so a user asking for one has already
-	// decided the running turn is unwanted: stop it for them instead of refusing and
-	// making them press Stop first. A subagent is included — it used to be the one
-	// case that refused outright, but "the work I am undoing is still running" is not
-	// a reason to keep running it.
-	await prepareHistoryRewrite(id);
-
-	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
-	}
-
-	const result = await rollbackToBlock(id, messageId, blockIndex, {
-		revertPlan,
-		skipRevert: skipRevert === true,
-		principal: narratorPrincipalOf(c),
-		signal: c.req.raw.signal,
-		...(scope ? { scope } : {}),
-	});
-	return c.json(result);
-});
-
 /** Read snapshots only from the message being edited, never from a different session. */
 async function resolveEditedFileReferences(
 	narratorId: string,
@@ -3967,26 +3927,10 @@ function requireHistoryOnlyDeletion(historyOnly: boolean): void {
 		);
 }
 
-// Batch-delete multiple content blocks across messages
-narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
-	const narratorId = c.req.param("id");
-	const body = await c.req.json();
-	const { batchDeleteBlocksSchema } = await import("../lib/validators");
-	const { blocks, skipRevert } = batchDeleteBlocksSchema.parse(body);
-	requireHistoryOnlyDeletion(skipRevert === true);
-	await prepareHistoryRewrite(narratorId);
-	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
-		skipRevert: true,
-		principal: narratorPrincipalOf(c),
-		signal: c.req.raw.signal,
-	});
-	return c.json({ ok: true, ...result });
-});
-
 // === Operations addressed by block id (docs/BLOCK_STORAGE-DESIGN.md §5.5) ===
 // Each target is a whole block: a tool block with every ledger attempt of its call, an
-// input with its attachments, a reasoning run as the ids of all its blocks. The routes
-// above that take message ids and element indexes stay for older clients.
+// input with its attachments, a reasoning run as the ids of all its blocks. They are the
+// only routes that act on part of a message.
 
 // Delete blocks.
 narratorRoutes.delete("/:id/blocks", async (c) => {
@@ -4123,24 +4067,6 @@ narratorRoutes.post("/:id/blocks/:blockId/allow-retry", async (c) => {
 	if (target.kind !== "tool" || !target.wireId)
 		throw new ValidationError("Only a tool block can be re-executed");
 	return allowRetryResponse(c, id, target.wireId);
-});
-
-// Delete a single content block from a message
-narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.param("messageId");
-	const blockIndex = Number.parseInt(c.req.param("blockIndex"), 10);
-	if (Number.isNaN(blockIndex) || blockIndex < 0) {
-		throw new ValidationError("Invalid block index");
-	}
-	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
-	await prepareHistoryRewrite(narratorId);
-	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
-		skipRevert: true,
-		principal: narratorPrincipalOf(c),
-		signal: c.req.raw.signal,
-	});
-	return c.json({ ok: true, ...result });
 });
 
 // Delete a message and all subsequent messages
@@ -4331,14 +4257,6 @@ narratorRoutes.get("/:id/segment-compact/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const summary = await narratorService.getSegmentCompactSummary(narratorId, messageId);
 	return c.json({ summary });
-});
-
-// Get messages hidden by a segment compact
-narratorRoutes.get("/:id/segment-compact/:messageId/messages", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.param("messageId");
-	const messages = await narratorService.getSegmentCompactHiddenMessages(narratorId, messageId);
-	return c.json({ messages });
 });
 
 // Delete segment compact (undo)
@@ -6091,32 +6009,6 @@ narratorRoutes.get("/:id/file-tree-status", async (c) => {
 });
 
 /**
- * Preview file changes that would be reverted by a rollback-to-block operation.
- *
- * `blockIndex` is optional. Omitting it means "everything after this message",
- * which is the window edit-and-regenerate truncates: it keeps the whole user turn
- * and removes the later ones. That is the same boundary the endpoint already
- * computes for a user message, since `normalizeRollbackBlockIndexForMessage` pins
- * a user message's index to its last block — so the edit dialog can share this
- * preview instead of inventing a block index that only looks meaningful.
- */
-narratorRoutes.get("/:id/rollback-preview", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.query("messageId");
-	const blockIndexStr = c.req.query("blockIndex");
-	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
-	const requestedBlockIndex =
-		blockIndexStr === undefined ? null : Number.parseInt(blockIndexStr, 10);
-	if (
-		requestedBlockIndex !== null &&
-		(Number.isNaN(requestedBlockIndex) || requestedBlockIndex < 0)
-	) {
-		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
-	}
-	return rollbackPreviewResponse(c, narratorId, messageId, requestedBlockIndex);
-});
-
-/**
  * What rolling back to `requestedBlockIndex` of a message would delete and restore; a
  * null index keeps the whole message (the edit-and-regenerate preview).
  */
@@ -6212,54 +6104,6 @@ async function rollbackPreviewResponse(
 		deletedMessageCount: preview.historySummary?.deletedMessageCount ?? 0,
 	});
 }
-
-/**
- * Preview the files that deleting a single tool_use block would roll back.
- *
- * A block deletion reverses exactly one recorded call, so its preview
- * has to come from the tool-use scope or it would overstate what is removed.
- *
- * Contents are attached because this response also backs the diff view; without
- * them every file renders as an empty change.
- */
-narratorRoutes.get("/:id/block-delete-preview", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.query("messageId");
-	const blockIndexStr = c.req.query("blockIndex");
-	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
-	if (!blockIndexStr) return c.json({ error: "blockIndex query param is required" }, 400);
-	const blockIndex = Number.parseInt(blockIndexStr, 10);
-	if (Number.isNaN(blockIndex) || blockIndex < 0) {
-		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
-	}
-
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
-	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
-
-	const message = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			...bodyColumns({ id: true, contentJson: true }),
-		}),
-	);
-	if (!message) return c.json({ error: "Message not found" }, 404);
-
-	const blocks = Array.isArray(message.contentJson)
-		? (message.contentJson as Array<{ type: string; id?: string }>)
-		: [];
-	const block = blocks[blockIndex];
-	if (!block) return c.json({ error: `Block index ${blockIndex} out of range` }, 400);
-
-	// A non-tool block changes no files, so there is nothing to roll back.
-	if (block.type !== "tool_use" || !block.id) return notAToolUse(c);
-	return toolBlockDeletePreviewResponse(c, narratorId, messageId, block.id);
-});
 
 function notAToolUse(c: Context) {
 	return c.json({ available: false, reason: "not_a_tool_use", files: [], conflicts: [] });

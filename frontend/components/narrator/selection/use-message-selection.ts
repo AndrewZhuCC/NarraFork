@@ -361,12 +361,14 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		// Confirm
 		const ok = await confirm({ message: t("batchDeleteConfirm", { count: metas.length }) });
 		if (!ok) return;
+		// Only blocks the server named can be deleted; the live row has none yet.
+		const targets = metas.flatMap(
+			(m) => blockTargetOf(chunkListRef.current, m.messageId, m.blockIndex) ?? [],
+		);
 		exitSelection();
+		if (targets.length === 0) return;
 		try {
-			const res = await api.deleteMessageBlocks(
-				narratorId,
-				metas.map((m) => blockTargetOf(chunkListRef.current, m.messageId, m.blockIndex)),
-			);
+			const res = await api.deleteMessageBlocks(narratorId, targets);
 			if (
 				!res.ok ||
 				res.failed > 0 ||

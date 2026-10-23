@@ -1,9 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
-import {
-	collectSegmentTargetIds,
-	segmentMessages,
-} from "../../frontend/components/narrator/message/message-segments";
+import { segmentMessages } from "../../frontend/components/narrator/message/message-segments";
 import { makeMessage } from "./narrator-timeline.fixtures";
 
 describe("segmentMessages", () => {
@@ -265,32 +262,6 @@ describe("segmentMessages", () => {
 		// Reasoning blocks are ignored, but the message still gets a fallback segment
 		expect(segs).toHaveLength(1);
 		expect(segs[0].kind).toBe("message");
-	});
-
-	test("adjacent messages produce only their content segments", () => {
-		const m1 = makeMessage(
-			rowWithElements(
-				{
-					id: "u1",
-					role: "user",
-				},
-				[{ type: "text", text: "hi" }],
-			),
-		);
-		const m2 = makeMessage(
-			rowWithElements(
-				{
-					id: "a1",
-					role: "assistant",
-				},
-				[{ type: "text", text: "hello" }],
-			),
-		);
-		const segs = segmentMessages([m1, m2]);
-		expect(segs).toHaveLength(2);
-		expect(segs.map((segment) => segment.kind)).toEqual(["message", "message"]);
-		expect(collectSegmentTargetIds(segs[0])).toEqual(["u1"]);
-		expect(collectSegmentTargetIds(segs[1])).toEqual(["a1"]);
 	});
 
 	test("streaming text + tool: text stays before tool", () => {

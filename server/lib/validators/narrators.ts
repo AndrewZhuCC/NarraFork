@@ -711,33 +711,6 @@ export const suggestAnswersSchema = z.object({
 
 export const MAX_BATCH_DELETE_BLOCKS = 200;
 
-export const batchDeleteBlocksSchema = z.object({
-	blocks: z
-		.array(
-			z.object({
-				messageId: z.string().min(1),
-				blockIndex: z.number().int().min(0),
-			}),
-		)
-		.min(1)
-		.max(MAX_BATCH_DELETE_BLOCKS)
-		.transform((blocks) => {
-			const seen = new Map<string, Set<number>>();
-			return blocks.filter(({ messageId, blockIndex }) => {
-				const indices = seen.get(messageId) ?? new Set<number>();
-				if (indices.has(blockIndex)) return false;
-				indices.add(blockIndex);
-				seen.set(messageId, indices);
-				return true;
-			});
-		}),
-	// When true, delete the blocks from history only, leaving files/spec untouched.
-	skipRevert: z.boolean().optional(),
-	// The narrator scope is the default and refuses on conflict, so the caller needs
-	// a way to ask for the wider one its error suggests.
-	scope: revertScopeSchema,
-});
-
 /** Block ids of one operation (docs/BLOCK_STORAGE-DESIGN.md §5.5): rows, or decoded ids. */
 export const blockIdsSchema = z
 	.array(z.string().min(1).max(256))

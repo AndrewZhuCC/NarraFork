@@ -1859,7 +1859,8 @@ reconcile(narrator, target, now):
    - 7b 行改为直接持有块：`messageBody` / `messageBlocks` 改从块读，守卫里列出的改写行的代码改为按块；删除 `contentJson`、`children`、`blockRefs`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。分三个 PR：
      - 7b-1 行持有块：`TreeMessage.blocks`（`RowBlock`：块的身份 + 元素，服务端命名的块 `named`）取代 `contentJson` + `blockRefs`。解码器直接给出块；客户端自建的行（流式行、子代理流式行、工具分片行、聊天行、夹具）由 `rowWithElements` / `splitRowBlocks` 按 `splitEnvelope` 切块；改写正文一律经 `mapRowElements` / `filterRowElements`，块保持 id，未变的块与行保持引用，空块去掉。`messageBody` 按块数组缓存展平结果，正文身份随块不变。交接从流式行去掉已落库的块后，余下块的 id（与键）不再因重切而移位。守卫只剩访问器与行类型；尚未迁移的夹具仍以 `contentJson` 建行，访问器读它时按服务端规则切块。（已完成）
      - 7b-2 删除行上的 `contentJson`：`TreeMessage.blocks` 必填，`contentJson` 从行类型与访问器里删除，没有块的行正文为空，访问器不再替任何行切块。顺手问的开始与解答接口原先直接返回带 `contentJson` 的行，改为按块协议返回该消息（`toEnvelopes`），前端在接口层解码（`decodeBlockMessage`）。测试夹具一律经 `rowWithElements` 建行，原地改正文的测试改为替换块。守卫只剩 `splitRowBlocks` 交给服务端切分函数的一处。（已完成）
-     - 7b-3 `children` 改为平铺的行加父索引；删除按下标的路由、客户端的下标回退与死代码；更新文档。
+     - 7b-3a 按下标的路由与死代码：前端的块操作（回滚、删除块、批量删除、文件恢复预览）只认服务端命名的块，客户端自建的行（流式行）没有可操作的块，不再退回按下标的路由。服务端删除只有旧前端调用的按下标路由：`POST /:id/rollback/:messageId`、`DELETE /:id/messages/:messageId/blocks/:blockIndex`、`DELETE /:id/messages/batch-blocks`、`GET /:id/rollback-preview`、`GET /:id/block-delete-preview`，以及没有调用方的 `GET /:id/segment-compact/:messageId/messages`；路由测试改走 `/blocks` 路由（`tests/block-ids.ts` 按元素位置取块 id）。编辑重生成仍可按消息寻址（整条消息，不是下标）。前端删除没有生产调用方的消息树与流式子行辅助函数（React Query 消息缓存、按 toolUseId 的索引、子代理流式子行、顶层流式分片对账等）及只测它们的用例，失效查询里去掉已无查询的预览键。服务层按下标的函数仍是块路由的实现，保留。（已完成）
+     - 7b-3b `children` 改为平铺的行加父索引；更新文档。
 
 **验收**：
 - §10.7 的直接升级测试通过。

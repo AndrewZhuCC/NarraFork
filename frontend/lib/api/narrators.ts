@@ -357,13 +357,13 @@ export interface RevertActionTarget {
 	blockIndex?: number;
 	/**
 	 * The server's id for the block holding `blockIndex`, read from the row the action
-	 * was picked on (§5.5). A row the server did not name has none: index routes then.
+	 * was picked on (§5.5). A block action (rollback, tool block deletion) names it.
 	 */
 	blockId?: string;
 }
 
-/** A message element an action starts from, with the block holding it when named. */
-export type BlockTarget = RevertActionTarget & { blockIndex: number };
+/** A message element an action starts from, with the server's id for its block. */
+export type BlockTarget = RevertActionTarget & { blockIndex: number; blockId: string };
 
 /** The exact durable plan reviewed by the user, never a request to re-plan. */
 export interface RevertPlanConfirmation {
@@ -651,6 +651,8 @@ function deleteBlocksById(narratorId: string, blockIds: string[]) {
 		deleted: number;
 		failed?: number;
 		results: Array<{ blockId: string; messageId: string; messageDeleted: boolean }>;
+		/** A deletion's file outcome when the server reports one. */
+		revertResult?: FileChangeRevertApplyResponse;
 	}>(`/narrators/${narratorId}/blocks`, {
 		method: "DELETE",
 		body: JSON.stringify({ blockIds, skipRevert: true }),
@@ -1784,7 +1786,8 @@ export const narratorsApi = {
 	) => {
 		// A rollback or a tool block deletion is planned for the whole block (§5.5).
 		const { blockId, ...indexBody } = body;
-		if (blockId && (body.action === "rollback_to_block" || body.action === "delete_tool_block"))
+		if (body.action === "rollback_to_block" || body.action === "delete_tool_block") {
+			if (!blockId) return Promise.reject(new Error(`${body.action} needs the block's id`));
 			return request<RevertActionPreview>(`/narrators/${narratorId}/blocks/revert-action-preview`, {
 				method: "POST",
 				body: JSON.stringify({
@@ -1795,6 +1798,7 @@ export const narratorsApi = {
 				}),
 				signal,
 			});
+		}
 		return request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
 			method: "POST",
 			body: JSON.stringify(indexBody),
@@ -1826,26 +1830,23 @@ export const narratorsApi = {
 				}),
 			},
 		),
+	/** Keep the whole block the element belongs to (§5.5) and delete what follows it. */
 	rollbackToBlock: (
 		narratorId: string,
-		{ messageId, blockIndex, blockId }: BlockTarget,
+		{ blockId }: BlockTarget,
 		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) => {
-		const options = {
-			skipRevert: opts?.skipRevert === true,
-			...(opts?.scope ? { scope: opts.scope } : {}),
-		};
-		// Keep the whole block the element belongs to (§5.5); index route for an unnamed row.
-		if (blockId)
-			return request<{ ok: boolean; warnings?: RevertWarning[] }>(
-				`/narrators/${narratorId}/blocks/rollback`,
-				{ method: "POST", body: JSON.stringify({ blockIds: [blockId], ...options }) },
-			);
-		return request<{ ok: boolean; warnings?: RevertWarning[] }>(
-			`/narrators/${narratorId}/rollback/${messageId}`,
-			{ method: "POST", body: JSON.stringify({ blockIndex, ...options }) },
-		);
-	},
+	) =>
+		request<{ ok: boolean; warnings?: RevertWarning[] }>(
+			`/narrators/${narratorId}/blocks/rollback`,
+			{
+				method: "POST",
+				body: JSON.stringify({
+					blockIds: [blockId],
+					skipRevert: opts?.skipRevert === true,
+					...(opts?.scope ? { scope: opts.scope } : {}),
+				}),
+			},
+		),
 	/**
 	 * Edit a user message and regenerate from it.
 	 *
@@ -2030,16 +2031,8 @@ export const narratorsApi = {
 			},
 		),
 	/** History-only: deleting a tool block with its files uses `applyRevertPlan`. */
-	deleteMessageBlock: async (
-		narratorId: string,
-		{ messageId, blockIndex, blockId }: BlockTarget,
-	) => {
-		// The whole block the element belongs to (§5.5); index route for an unnamed row.
-		if (!blockId)
-			return request<{ ok: boolean; messageDeleted: boolean }>(
-				`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}?skipRevert=1`,
-				{ method: "DELETE" },
-			);
+	deleteMessageBlock: async (narratorId: string, { blockId }: BlockTarget) => {
+		// The whole block the element belongs to (§5.5).
 		const result = await deleteBlocksById(narratorId, [blockId]);
 		return {
 			ok: result.ok,
@@ -2047,22 +2040,18 @@ export const narratorsApi = {
 		};
 	},
 	/** History-only: a multi-block selection has no previewable file restore plan. */
-	deleteMessageBlocks: async (narratorId: string, targets: readonly BlockTarget[]) => {
-		const ids = targets.map((target) => target.blockId);
-		if (ids.length && ids.every((id): id is string => !!id)) {
-			const result = await deleteBlocksById(narratorId, [...new Set(ids)]);
-			return { ok: result.ok, deleted: result.deleted, failed: result.failed ?? 0 };
-		}
-		const blocks = targets.map(({ messageId, blockIndex }) => ({ messageId, blockIndex }));
-		return request<{
-			ok: boolean;
-			deleted: number;
-			failed: number;
-			revertResult?: FileChangeRevertApplyResponse;
-		}>(`/narrators/${narratorId}/messages/batch-blocks`, {
-			method: "DELETE",
-			body: JSON.stringify({ blocks, skipRevert: true }),
-		});
+	deleteMessageBlocks: async (
+		narratorId: string,
+		targets: readonly BlockTarget[],
+	): Promise<{
+		ok: boolean;
+		deleted: number;
+		failed: number;
+		revertResult?: FileChangeRevertApplyResponse;
+	}> => {
+		const ids = [...new Set(targets.map((target) => target.blockId))];
+		const { ok, deleted, failed, revertResult } = await deleteBlocksById(narratorId, ids);
+		return { ok, deleted, failed: failed ?? 0, ...(revertResult ? { revertResult } : {}) };
 	},
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
@@ -2084,10 +2073,6 @@ export const narratorsApi = {
 		}),
 	getSegmentCompactSummary: (narratorId: string, messageId: string) =>
 		request<{ summary: string }>(`/narrators/${narratorId}/segment-compact/${messageId}`),
-	getSegmentCompactMessages: (narratorId: string, messageId: string) =>
-		request<{ messages: unknown[] }>(
-			`/narrators/${narratorId}/segment-compact/${messageId}/messages`,
-		),
 	deleteSegmentCompact: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact/${messageId}`, {
 			method: "DELETE",
