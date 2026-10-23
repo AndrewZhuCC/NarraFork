@@ -39,7 +39,7 @@ describe("narrators API", () => {
 			},
 		});
 		await api.deleteMessage("n", "m");
-		await api.deleteMessageBlock("n", "m", 2);
+		await api.deleteMessageBlock("n", { messageId: "m", blockIndex: 2 });
 		await api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0 }]);
 		expect(requests[0].url).toEndWith("/narrators/n/messages/m?skipRevert=1");
 		expect(requests[1].url).toEndWith("/narrators/n/messages/m/blocks/2?skipRevert=1");

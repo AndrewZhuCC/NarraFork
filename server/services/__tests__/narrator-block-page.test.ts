@@ -134,7 +134,7 @@ describe("the message page in protocol v2", () => {
 		// A row the client builds itself is split into these same blocks.
 		for (const message of v1.messages)
 			expect(
-				messageBlocks(message).map(({ from: _from, ...block }) => ({
+				messageBlocks(message).map(({ from: _from, named: _named, ...block }) => ({
 					...block,
 					elements: [...block.elements] as unknown[],
 				})),

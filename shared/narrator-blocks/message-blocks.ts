@@ -53,6 +53,11 @@ export interface MessageBlock<E = unknown> {
 	attemptId: string | null;
 	/** An edited output block keeps its body from before the first edit. */
 	hasOriginal: boolean;
+	/**
+	 * The server named this block, so its id addresses it in the block routes. A
+	 * client-built row's blocks are split here and their ids are derived.
+	 */
+	named: boolean;
 	elements: readonly E[];
 	/** Where its elements start in the message's `contentJson` (until rows hold blocks). */
 	from: number;
@@ -129,6 +134,7 @@ function fromRefs<E>(
 		wireId: ref.wireId ?? null,
 		attemptId: ref.attemptId ?? null,
 		hasOriginal: ref.hasOriginal ?? false,
+		named: true,
 		elements: elements.slice(ref.from, ref.to),
 		from: ref.from,
 	}));
@@ -161,6 +167,7 @@ function split<E>(message: BlockSourceMessage<E>, elements: readonly E[]): Messa
 			wireId: draft.wireId,
 			attemptId: null,
 			hasOriginal: false,
+			named: false,
 			elements: elements.slice(from, from + count),
 			from,
 		};

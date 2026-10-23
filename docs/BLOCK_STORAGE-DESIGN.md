@@ -1699,7 +1699,7 @@ reconcile(narrator, target, now):
 - **传输边界解码**（`frontend/lib/block-protocol.ts`）：
   - 所有 `messages` 订阅都带 `protocol: 2`（服务端按连接、按叙述者只有一种协议，三处订阅必须一致），页面请求带 `?protocol=2`（含公开分享页）。
   - v2 页面与帧在边界还原成 v1 形态：信封 + 块 → 带 `contentJson` 与嵌套 `children` 的 `TreeMessage`；`message_upserted` → 其 `cause` 指名的 v1 帧（按帧计 `messageVersion` 不变）；`block_delta` → v1 `stream_event`；v2 catch-up → `topLevel` / `orphanChildren`。
-  - 每行附 `blockRefs`（块 id 与在 `contentJson` 中的元素区间），解码时同时记入 `frontend/lib/block-refs.ts`。
+  - 每行附 `blockRefs`（块 id 与在 `contentJson` 中的元素区间），解码时同时记入 `frontend/lib/block-refs.ts`（P3d 第 4 步删除这个登记表，操作改从行读块）。
   - 服务端信封带 `parentMessageId`（在 v1 中嵌套于哪一行），v2 catch-up 带 `orphanMessageIds`，客户端据此精确还原 v1 树。往返测试保证"服务端编码 + 客户端解码"得到原来的 v1 页面与帧。
   - 服务端回 v1（`wsV2` 关）时一切照旧，所以 `wsV2` 是回退开关。
 - **按块寻址的操作**：删除（单个、批量）、回滚、回滚与删除预览、文件恢复预览、编辑重生成，在已知块时走 `/blocks` 路由，作用于该元素所在的整块；只从 v1 服务端见过的消息仍走按下标的路由。编辑、恢复 assistant 消息仍按整条消息（编辑器编辑的是整条文本，按块编辑需要编辑器指明块）；allow-retry 按调用 id，本就精确。
@@ -1845,11 +1845,13 @@ reconcile(narrator, target, now):
 **P3d 分步**（每步提交后 CI 全绿、应用可用；服务端两步与前端各自成 PR）：
 1. 直接升级测试（§10.7）：P1 之前 schema 的库快照，覆盖迁移、现场解码、回填与退役。只测服务端，先行落地，后面各步都受它保护。（已完成）
 2. 服务端保证每个流式增量都带元素 id：loop 是 `stream_text` / `stream_reasoning` 唯一的产生者，它的 `OutputContentAccumulator` 总给出与落库元素相同的 `${attempt}:${order}`；事件类型改为必填，删掉无 id 的回退（按 lane 的随机 id、OpenAI itemId、`FileReferenceContextTracker` 按输出下标的通道），每个增量都以 `block_delta` 发出。（已完成）
-3. 前端的块访问器 `messageBlocks`（`shared/narrator-blocks/message-blocks.ts`）：协议行按它带的块；客户端自建的行（流式行、聊天与分享页的行、测试数据）按服务端切分旧信封的同一函数 `splitEnvelope` 切块，两边分组一致（块页测试里有对齐检查）。之后读消息正文的代码都经它，不再按 `contentJson` 下标。
+3. 前端的块访问器 `messageBlocks`（`shared/narrator-blocks/message-blocks.ts`）：协议行按它带的块；客户端自建的行（流式行、聊天与分享页的行、测试数据）按服务端切分旧信封的同一函数 `splitEnvelope` 切块，两边分组一致（块页测试里有对齐检查）。之后读消息正文的代码都经它，不再按 `contentJson` 下标。（已完成）
 4. 身份：所有元素行按块作键（`elementKey` 经访问器）；块目标、选择、编辑目标、ask、各索引与操作改为块 id（加块内偏移），经文档里的行解析，不再查全局登记表。
-5. 分组：分段、活动单元、`segment-adapter` 逐块遍历；注入与伴随块的配对取块边界。
+   - 已完成：元素行键与 vlist 块目标经访问器；删除（单个、批量）、回滚、文件恢复预览与编辑重生成在操作开始时从列表的行解析块（`MessageListHandle.messageOf` + `message/block-target.ts`），API 直接用块 id。服务端命名过的块（`MessageBlock.named`）才走 `/blocks` 路由，客户端自建的行仍走按下标的路由，直到第 7 步。`block-refs.ts` 与没有调用方的回滚预览、块删除预览查询已删除。
+   - 余下的选择项、编辑目标、ask、工具元信息与反思索引并入第 5 步：它们的 `(messageId, blockIndex)` 来自分段按元素下标的遍历，分段改为逐块后随之得到块 id，单独先改只会多一层下标与块之间的换算。
+5. 分组与其余身份：分段、活动单元、`segment-adapter` 逐块遍历；注入与伴随块的配对取块边界；选择项、编辑目标、ask、各索引随之改为块 id（加块内偏移）。
 6. 流式改为按块 id 的 open 块，删除累加器、交接与启发式。
-7. 行改为直接持有块：删除 `contentJson`、`children`、`blockRefs` 与 `block-refs.ts`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
+7. 行改为直接持有块：删除 `contentJson`、`children`、`blockRefs`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
 
 **验收**：
 - §10.7 的直接升级测试通过。
