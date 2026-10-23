@@ -20,7 +20,7 @@ const blockSync = await import("../narrator-block-sync");
 const targets = await import("../narrator-block-targets");
 const page = await import("../narrator-block-page");
 const { decodeBlockPage } = await import("@frontend/lib/block-protocol");
-const { messageBlocks } = await import("@frontend/lib/message-blocks");
+const { messageBlocks } = await import("@shared/narrator-blocks/message-blocks");
 
 /** A decoded value without the block sidecar the client adds to every row. */
 function withoutBlockRefs<T>(value: T): T {

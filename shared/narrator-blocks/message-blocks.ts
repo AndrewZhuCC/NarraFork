@@ -10,12 +10,40 @@
  * envelope (`splitEnvelope`), so both kinds group their elements the same way.
  */
 
-import { splitEnvelope } from "@shared/narrator-blocks/storage";
-import type { EnvelopeRole } from "@shared/narrator-blocks/types";
-import type { ContentBlock, MessageBlockRef, TreeMessage } from "./api/types";
+import { splitEnvelope } from "./storage";
+import type { EnvelopeRole } from "./types";
+
+/** A block a message names, over its elements `[from, to)` (the block protocol's refs). */
+export interface MessageBlockRefLike {
+	id: string;
+	kind?: string;
+	subtype?: string | null;
+	phase?: string;
+	revision?: number;
+	wireId?: string | null;
+	attemptId?: string | null;
+	hasOriginal?: boolean;
+	from: number;
+	to: number;
+}
+
+/** What a message needs for its blocks: its body, and its refs when it has them. */
+export interface BlockSourceMessage<E> {
+	id?: string;
+	narratorId?: string;
+	role: string;
+	contentJson: readonly E[] | unknown;
+	contentText?: string | null;
+	parentToolUseId?: string | null;
+	messageUuid?: string | null;
+	provider?: string | null;
+	/** Who wrote the row; server rows carry it, and it decides input versus context. */
+	origin?: unknown;
+	blockRefs?: readonly MessageBlockRefLike[];
+}
 
 /** One block of a message: its identity and its elements. */
-export interface MessageBlock {
+export interface MessageBlock<E = unknown> {
 	id: string;
 	kind: string;
 	subtype: string | null;
@@ -25,35 +53,29 @@ export interface MessageBlock {
 	attemptId: string | null;
 	/** An edited output block keeps its body from before the first edit. */
 	hasOriginal: boolean;
-	elements: readonly ContentBlock[];
+	elements: readonly E[];
 	/** Where its elements start in the message's `contentJson` (until rows hold blocks). */
 	from: number;
 }
 
-type BlockSource = Pick<
-	TreeMessage,
-	"id" | "role" | "contentJson" | "contentText" | "parentToolUseId"
-> &
-	Partial<Pick<TreeMessage, "narratorId" | "messageUuid" | "provider" | "blockRefs">> & {
-		/** Who wrote the row; server rows carry it, and it decides input versus context. */
-		origin?: unknown;
-	};
-
 /** The last split of each body, with what it was split for (copies can share a body). */
 const cache = new WeakMap<
-	readonly ContentBlock[],
+	readonly unknown[],
 	{
-		id: string;
+		id: string | undefined;
 		role: string;
 		origin: unknown;
-		refs: readonly MessageBlockRef[] | undefined;
+		refs: readonly MessageBlockRefLike[] | undefined;
 		blocks: readonly MessageBlock[];
 	}
 >();
+const EMPTY: readonly never[] = [];
 
 /** The message's blocks in order; the same array while its body and refs are the same. */
-export function messageBlocks(message: BlockSource): readonly MessageBlock[] {
-	const elements = Array.isArray(message.contentJson) ? message.contentJson : [];
+export function messageBlocks<E>(message: BlockSourceMessage<E>): readonly MessageBlock<E>[] {
+	const elements = (
+		Array.isArray(message.contentJson) ? message.contentJson : EMPTY
+	) as readonly E[];
 	const { id, role, origin, blockRefs: refs } = message;
 	const cached = cache.get(elements);
 	if (
@@ -63,25 +85,28 @@ export function messageBlocks(message: BlockSource): readonly MessageBlock[] {
 		cached.role === role &&
 		cached.origin === origin
 	)
-		return cached.blocks;
+		return cached.blocks as readonly MessageBlock<E>[];
 	const blocks = refsCover(refs, elements.length)
 		? fromRefs(refs, elements)
 		: split(message, elements);
-	cache.set(elements, { id, role, origin, refs, blocks });
+	if (elements !== EMPTY) cache.set(elements, { id, role, origin, refs, blocks });
 	return blocks;
 }
 
 /** The message's block holding element `index`. */
-export function blockAtIndex(message: BlockSource, index: number): MessageBlock | undefined {
+export function blockAtIndex<E>(
+	message: BlockSourceMessage<E>,
+	index: number,
+): MessageBlock<E> | undefined {
 	return messageBlocks(message).find(
 		(block) => index >= block.from && index < block.from + block.elements.length,
 	);
 }
 
 function refsCover(
-	refs: readonly MessageBlockRef[] | undefined,
+	refs: readonly MessageBlockRefLike[] | undefined,
 	length: number,
-): refs is readonly MessageBlockRef[] {
+): refs is readonly MessageBlockRefLike[] {
 	if (!refs?.length) return false;
 	let next = 0;
 	for (const ref of refs) {
@@ -91,22 +116,30 @@ function refsCover(
 	return next === length;
 }
 
-function fromRefs(
-	refs: readonly MessageBlockRef[],
-	elements: readonly ContentBlock[],
-): MessageBlock[] {
-	return refs.map(({ from, to, ...ref }) => ({
-		...ref,
-		elements: elements.slice(from, to),
-		from,
+function fromRefs<E>(
+	refs: readonly MessageBlockRefLike[],
+	elements: readonly E[],
+): MessageBlock<E>[] {
+	return refs.map((ref) => ({
+		id: ref.id,
+		kind: ref.kind ?? "unknown",
+		subtype: ref.subtype ?? null,
+		phase: ref.phase ?? "done",
+		revision: ref.revision ?? 0,
+		wireId: ref.wireId ?? null,
+		attemptId: ref.attemptId ?? null,
+		hasOriginal: ref.hasOriginal ?? false,
+		elements: elements.slice(ref.from, ref.to),
+		from: ref.from,
 	}));
 }
 
 /** A client-built message, split into blocks as the server splits a legacy envelope. */
-function split(message: BlockSource, elements: readonly ContentBlock[]): MessageBlock[] {
+function split<E>(message: BlockSourceMessage<E>, elements: readonly E[]): MessageBlock<E>[] {
 	if (!elements.length) return [];
+	const messageId = message.id ?? "msg";
 	const { blocks } = splitEnvelope({
-		id: message.id,
+		id: messageId,
 		narratorId: message.narratorId,
 		role: message.role as EnvelopeRole,
 		contentJson: elements,
@@ -119,8 +152,8 @@ function split(message: BlockSource, elements: readonly ContentBlock[]): Message
 	let from = 0;
 	return blocks.map((draft) => {
 		const count = draft.payload.raw.length;
-		const block: MessageBlock = {
-			id: draft.canonical?.id ?? `${message.id}:${from}`,
+		const block: MessageBlock<E> = {
+			id: draft.canonical?.id ?? `${messageId}:${from}`,
 			kind: draft.kind,
 			subtype: draft.subtype,
 			phase: draft.phase,
