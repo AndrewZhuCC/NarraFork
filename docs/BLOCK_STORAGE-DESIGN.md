@@ -1848,8 +1848,8 @@ reconcile(narrator, target, now):
 3. 前端的块访问器 `messageBlocks`（`shared/narrator-blocks/message-blocks.ts`）：协议行按它带的块；客户端自建的行（流式行、聊天与分享页的行、测试数据）按服务端切分旧信封的同一函数 `splitEnvelope` 切块，两边分组一致（块页测试里有对齐检查）。之后读消息正文的代码都经它，不再按 `contentJson` 下标。（已完成）
 4. 身份：所有元素行按块作键（`elementKey` 经访问器）；块目标、选择、编辑目标、ask、各索引与操作改为块 id（加块内偏移），经文档里的行解析，不再查全局登记表。
    - 已完成：元素行键与 vlist 块目标经访问器；删除（单个、批量）、回滚、文件恢复预览与编辑重生成在操作开始时从列表的行解析块（`MessageListHandle.messageOf` + `message/block-target.ts`），API 直接用块 id。服务端命名过的块（`MessageBlock.named`）才走 `/blocks` 路由，客户端自建的行仍走按下标的路由，直到第 7 步。`block-refs.ts` 与没有调用方的回滚预览、块删除预览查询已删除。
-   - 待做：选择项、编辑目标、ask、工具元信息与反思索引从 `(messageId, blockIndex)` 改为块 id。
-5. 分组：分段、活动单元、`segment-adapter` 逐块遍历；注入与伴随块的配对取块边界。
+   - 余下的选择项、编辑目标、ask、工具元信息与反思索引并入第 5 步：它们的 `(messageId, blockIndex)` 来自分段按元素下标的遍历，分段改为逐块后随之得到块 id，单独先改只会多一层下标与块之间的换算。
+5. 分组与其余身份：分段、活动单元、`segment-adapter` 逐块遍历；注入与伴随块的配对取块边界；选择项、编辑目标、ask、各索引随之改为块 id（加块内偏移）。
 6. 流式改为按块 id 的 open 块，删除累加器、交接与启发式。
 7. 行改为直接持有块：删除 `contentJson`、`children`、`blockRefs`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
 
