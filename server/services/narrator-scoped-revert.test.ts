@@ -308,7 +308,7 @@ describe("HTTP edit confirmation keeps primary/subagent semantics", () => {
 					.run();
 				const target = userMessage();
 				const call = await write("http-edit.txt");
-				const token = await createToken(userId, "user");
+				const token = await createToken(userId);
 				const headers = { Authorization: `Bearer ${token}` };
 				const previewResponse = await app.request(
 					`/api/narrators/${narratorId}/revert-action-preview`,
@@ -599,7 +599,7 @@ describe("narrator-scoped per-file recovery consumers", () => {
 		const { app } = await import("../app");
 		const { createToken } = await import("../lib/auth");
 		const headers = {
-			authorization: `Bearer ${await createToken(userId, "user")}`,
+			authorization: `Bearer ${await createToken(userId)}`,
 			"content-type": "application/json",
 		};
 		const call = await write("http-revert.txt");
@@ -671,7 +671,7 @@ describe("narrator-scoped per-file recovery consumers", () => {
 		const response = await app.request(`/api/narrators/${narratorId}/blocks`, {
 			method: "DELETE",
 			headers: {
-				authorization: `Bearer ${await createToken(userId, "user")}`,
+				authorization: `Bearer ${await createToken(userId)}`,
 				"content-type": "application/json",
 			},
 			body: JSON.stringify({ blockIds: [await blockIdAt(messageId, 0)], skipRevert: true }),

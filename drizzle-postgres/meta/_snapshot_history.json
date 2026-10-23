@@ -328,6 +328,14 @@
 			"prevId": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
 			"version": "7",
 			"snapshotDigest": "2dba7d428fd7926fc02c936fa76436d811253158ef0bb2d6ec82be9ec427526f"
+		},
+		{
+			"idx": 41,
+			"tag": "0041_auth_sessions",
+			"id": "91f6f10c-d8bb-4405-b309-5266d0e4d545",
+			"prevId": "37ee90e1-966f-4646-8711-b18d17576d47",
+			"version": "7",
+			"snapshotDigest": "83f0cabdb8bc32378f567ca096267d392395bc520a222aa130a37f042652e67c"
 		}
 	]
 }

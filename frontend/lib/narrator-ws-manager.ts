@@ -368,12 +368,12 @@ export function decideNarratorForegroundRecovery(opts: {
 // ── Share-auth mode ─────────────────────────────────────────────────────────
 // The anonymous public-share page rides THIS manager (same /ws/narrator channel,
 // same event fan-out) but authenticates with the share credential instead of the
-// session JWT. The mode is process-wide and deliberately trivial: the public
+// session token. The mode is process-wide and deliberately trivial: the public
 // route never mounts the authenticated shell, so the two modes never coexist.
 let shareAuth: { shareId: string; token: string } | null = null;
 
 /**
- * Switch the manager's credential to a public share (or back to the session JWT
+ * Switch the manager's credential to a public share (or back to the session token
  * with `null`). Reconnects so the socket re-opens under the new credential.
  */
 export function setNarratorWSShareAuth(auth: { shareId: string; token: string } | null): void {
@@ -1583,9 +1583,9 @@ export class NarratorWSManager {
 			// supervisor), and it is usually back within seconds, so run a fresh
 			// backoff cycle instead of stranding the client until a visibility or
 			// network event happens to fire.
-			// 4001 = the session token this socket was opened with expired. HTTP
-			// sliding renewal has very likely already stored a fresh one, so retry
-			// immediately with whatever is in localStorage instead of backing off.
+			// 4001 = the session this socket was opened with ended. Retry immediately
+			// with whatever is in localStorage: after a re-login that is the new token,
+			// otherwise the upgrade fails and the app falls back to its login flow.
 			if (
 				ev.code === SESSION_EXPIRED_CLOSE_CODE ||
 				ev.code === SERVER_SHUTDOWN_CLOSE_CODE ||

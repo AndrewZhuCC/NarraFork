@@ -134,15 +134,16 @@ export interface NarratorWSData {
 	 */
 	subscribedChatRooms: Set<string>;
 	userId?: string;
+	sessionId?: string;
 	sessionExp?: number;
-	sessionTokenVersion?: number;
 	username?: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
 	/**
-	 * Live role captured at upgrade time, for the admin short-circuit in narrator
-	 * authorization. Absent on connections whose user row could not be resolved,
-	 * which are treated as non-admin.
+	 * Live role, for the admin short-circuit in narrator authorization. Captured at
+	 * upgrade and refreshed whenever the user's authorization changes (see
+	 * `revalidateSessionSockets`). Absent on connections whose user row could not be
+	 * resolved, which are treated as non-admin.
 	 */
 	userRole?: string;
 	/**

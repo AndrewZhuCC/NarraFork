@@ -2347,14 +2347,12 @@ export const users = sqliteTable("users", {
 		.notNull()
 		.default("user"),
 	/**
-	 * Generation counter for this user's session tokens. Every issued JWT carries the value that
-	 * was current at signing time; verification rejects a token whose value is behind.
+	 * Generation counter for this user's sessions. Every session records the value that was
+	 * current when it was issued; verification rejects a session whose value is behind.
 	 *
-	 * This is the only mechanism that can end a session before its `exp`. Session JWTs are
-	 * self-contained, so without it a password change could not evict an already-stolen token and
-	 * "sign out everywhere" was impossible — the credential simply stayed valid for up to its full
-	 * lifetime. Bumping this column invalidates every outstanding token for the user at once,
-	 * across every device, on their next request.
+	 * Bumping this column ends every session of the user at once, across every device, on
+	 * their next request — a password reset or "sign out everywhere". A single session is
+	 * ended through `auth_sessions.revoked_at` instead.
 	 */
 	tokenVersion: integer("token_version").notNull().default(0),
 	avatarColor: text("avatar_color"),
@@ -2371,6 +2369,35 @@ export const users = sqliteTable("users", {
 	mfaEnabled: integer("mfa_enabled", { mode: "boolean" }).notNull().default(false),
 	createdAt: text("created_at").notNull(),
 });
+
+// === auth_sessions ===
+// First-party login sessions. The bearer credential is an opaque random token; only its
+// SHA-256 is stored, so neither a leaked database nor a leaked instance secret yields a
+// usable session. Times are unix seconds, matching the session lifetime constants in
+// `shared/session-auth.ts`.
+export const authSessions = sqliteTable(
+	"auth_sessions",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		tokenHash: text("token_hash").notNull(),
+		/** `users.token_version` at issuance; the session dies once the user's counter passes it. */
+		tokenVersion: integer("token_version").notNull().default(0),
+		/** Original login instant. Sliding renewal never moves it (absolute session ceiling). */
+		sessionStart: integer("session_start").notNull(),
+		createdAt: integer("created_at").notNull(),
+		expiresAt: integer("expires_at").notNull(),
+		revokedAt: integer("revoked_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_auth_sessions_token_hash").on(table.tokenHash),
+		index("idx_auth_sessions_user").on(table.userId),
+		index("idx_auth_sessions_expires").on(table.expiresAt),
+		index("idx_auth_sessions_revoked").on(table.revokedAt),
+	],
+);
 
 // === user_git_identities ===
 // A user's reusable git commit identities (a `user.name` / `user.email` pair).

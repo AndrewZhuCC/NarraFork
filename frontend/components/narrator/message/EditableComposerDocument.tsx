@@ -8,7 +8,7 @@ import { IconPaperclip } from "@tabler/icons-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../../lib/api";
+import { clearTokenOnSessionFailure, getToken } from "../../../lib/api";
 import { apiUrl } from "../../../lib/base-path";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { Z } from "../../../lib/z-index";
@@ -183,7 +183,6 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 						signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
 					},
 				);
-				absorbRenewedToken(response, token);
 				if (!response.ok) {
 					await clearTokenOnSessionFailure(response);
 					return;
