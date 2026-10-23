@@ -187,3 +187,99 @@ describe("rewrites read the rows", () => {
 		expect(assembled(messageId)).toEqual([body[0]]);
 	});
 });
+
+describe("store writes read the rows", () => {
+	test("a step item lands among the items the rows hold", async () => {
+		const messageId = await step();
+		const body = assembled(messageId);
+		detachColumn(messageId);
+		await narratorStore.writeStepItem(messageId, "n1", {
+			type: "text",
+			id: "t2",
+			text: "More.",
+			completed: true,
+			outputIndex: 2,
+		});
+		expect(assembled(messageId)).toEqual([
+			...body,
+			expect.objectContaining({ type: "text", id: "t2", text: "More." }),
+		]);
+		expect(column(messageId)).toEqual(assembled(messageId));
+	});
+
+	test("a tool call's input is overwritten in the body the rows hold", async () => {
+		const messageId = await step();
+		const call = await narratorStore.writeStepItem(messageId, "n1", {
+			type: "tool_use",
+			id: "c1",
+			name: "Bash",
+			input: { command: "ls" },
+			outputIndex: 2,
+		});
+		const body = assembled(messageId) as Array<Record<string, unknown>>;
+		detachColumn(messageId);
+		await narratorPersistence.overwriteToolCallInput("c1", { command: "ls -la" }, call);
+		expect(assembled(messageId)).toEqual([
+			body[0],
+			body[1],
+			{ ...body[2], input: { command: "ls -la" } },
+		]);
+	});
+
+	test("a compact finalizes from the marker the rows hold", async () => {
+		await narratorStore.appendInput("n1", "before the compact");
+		const marker = await narratorPersistence.persistCompactingMessage("n1");
+		detachColumn(marker.id);
+		const done = await narratorPersistence.finalizeCompactingMessage(marker.id, "n1", "summary");
+		expect(done?.contentJson).toEqual([
+			expect.objectContaining({ type: "compact", status: "compacted", summary: "summary" }),
+		]);
+		expect(assembled(marker.id)).toEqual(done?.contentJson as unknown[]);
+	});
+
+	test("a finalize whose marker moved on loses the compare-and-set", async () => {
+		await narratorStore.appendInput("n1", "before the compact");
+		const marker = await narratorPersistence.persistCompactingMessage("n1");
+		const finished = await narratorPersistence.finalizeCompactingMessage(marker.id, "n1", "first");
+		expect(finished).not.toBeNull();
+		// A second finalize of the same attempt finds the marker compacted already.
+		expect(
+			await narratorPersistence.finalizeCompactingMessage(marker.id, "n1", "second"),
+		).toBeNull();
+		expect(assembled(marker.id)).toEqual([
+			expect.objectContaining({ status: "compacted", summary: "first" }),
+		]);
+	});
+
+	test("a segment compact's summary is rewritten from the rows", async () => {
+		const input = await narratorStore.appendInput("n1", "hidden");
+		const { message } = await narratorPersistence.persistSegmentCompactMarker("n1", [input.id]);
+		await narratorPersistence.finalizeSegmentCompact(message.id, "n1", "first summary");
+		detachColumn(message.id);
+		await narratorPersistence.updateSegmentCompactSummary("n1", message.id, "second summary");
+		expect(assembled(message.id)).toEqual([
+			{ type: "segment_compact", status: "compacted", summary: "second summary", messageCount: 1 },
+		]);
+	});
+
+	test("a discarded attempt drops its blocks from the rows' body", async () => {
+		const opened = await narratorStore.openStep("n1", { uuid: "u", session_id: "s" });
+		await narratorStore.writeStepItem(
+			opened.id,
+			"n1",
+			{ type: "text", id: "t1", text: "kept", completed: true, outputIndex: 0 },
+			{ attemptId: "a1" },
+		);
+		await narratorStore.writeStepItem(
+			opened.id,
+			"n1",
+			{ type: "text", id: "t2", text: "dropped", completed: true, outputIndex: 1 },
+			{ attemptId: "a2" },
+		);
+		detachColumn(opened.id);
+		await narratorStore.discardAttempt("n1", opened.id, 1, "a2");
+		expect(assembled(opened.id)).toEqual([
+			expect.objectContaining({ type: "text", id: "t1", text: "kept" }),
+		]);
+	});
+});

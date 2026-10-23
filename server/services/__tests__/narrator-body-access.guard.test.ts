@@ -36,7 +36,7 @@ const ROOT = join(import.meta.dir, "..", "..", "..");
 /** Raw body accesses per file, and why they are there. */
 const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// The body layer.
-	"server/services/narrator-body-writes.ts": { count: 3, why: "body writes" },
+	"server/services/narrator-body-writes.ts": { count: 4, why: "body writes" },
 	"server/services/narrator-block-sync.ts": {
 		count: 4,
 		why: "the dual-write audit, column resync",
@@ -68,9 +68,8 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// Imports write legacy envelopes; the backfill converts them.
 	"server/services/session-interchange/import.ts": { count: 1, why: "legacy-format import" },
 	// Left to move onto the body layer (P3a).
-	"server/services/narrator-persistence.ts": { count: 37, why: "store internals" },
-	"server/services/narrator-messages.ts": { count: 9, why: "delete, truncate, checkpoint" },
-	"server/services/narrator-session.ts": { count: 11, why: "edit, restore, partial cleanup" },
+	"server/services/narrator-messages.ts": { count: 19, why: "delete, truncate, checkpoint" },
+	"server/services/narrator-session.ts": { count: 14, why: "edit, restore, partial cleanup" },
 	"server/services/narrator-service.ts": { count: 4, why: "ownership transfer, bash card" },
 	"server/routes/narrators.ts": { count: 6, why: "ask-in-passing, previews" },
 	"server/services/narrator-event-handler.ts": { count: 3, why: "card reads" },
@@ -94,9 +93,14 @@ function isExempt(path: string): boolean {
 	);
 }
 
-/** Line comments and block comments out, string contents kept (SQL lives in strings). */
+/**
+ * Line comments and block comments out (their line breaks kept, so reported lines match
+ * the file), string contents kept (SQL lives in strings).
+ */
 function stripComments(source: string): string {
-	return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
+	return source
+		.replace(/\/\*[\s\S]*?\*\//g, (comment) => comment.replace(/[^\n]/g, ""))
+		.replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
 }
 
 /** The text between the parenthesis at `open` and the one closing it. */
@@ -134,7 +138,7 @@ export function rawBodyAccesses(code: string): Access[] {
 	add("column in Drizzle", /\bnarratorMessages\.contentJson\b/g);
 	add("whole-row read", /\.select\(\s*\)\s*\.from\(\s*narratorMessages\s*\)/g);
 	add("whole-row read", /\bgetTableColumns\(\s*narratorMessages\s*\)/g);
-	add("whole-row read", /\bnarratorMessages\.find(?:First|Many)\(/g, (match) => {
+	add("whole-row read", /\bnarratorMessages\s*\.find(?:First|Many)\(/g, (match) => {
 		const args = argsOf(match);
 		return (
 			!args.includes("bodyColumns(") &&

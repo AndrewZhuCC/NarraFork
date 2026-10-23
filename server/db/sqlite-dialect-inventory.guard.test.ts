@@ -547,7 +547,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
-	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	"server/services/narrator-block-sync.ts": ["handle", "sqliteCatalog", "insertOr", "rowid"],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
