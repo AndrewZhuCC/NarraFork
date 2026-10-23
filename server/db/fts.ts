@@ -188,6 +188,20 @@ export function replaceBlockIndexText(sqlite: Database, blockId: string, text: s
 }
 
 /**
+ * Set the searchable text of a block by its row's rowid, which the caller has checked (the
+ * reindex job, which also writes in rowid order: FTS5 flushes its pending terms whenever a
+ * write goes back to a lower rowid).
+ */
+export function replaceBlockIndexRow(sqlite: Database, rowid: number, text: string): void {
+	if (!hasBlockIndex(sqlite)) return;
+	sqlite.query("DELETE FROM narrator_blocks_fts WHERE rowid = ?").run(rowid);
+	if (!text) return;
+	sqlite
+		.query("INSERT INTO narrator_blocks_fts(rowid, text) VALUES (?, ?)")
+		.run(rowid, text.slice(0, BLOCK_INDEX_MAX_CHARS));
+}
+
+/**
  * Make one block unsearchable (it reopened, or it is about to be deleted). Deleting a block
  * row removes its index text by itself (`narrator_blocks_fts_delete`), cascades included.
  */
