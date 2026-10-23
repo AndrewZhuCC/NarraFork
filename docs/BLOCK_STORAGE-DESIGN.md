@@ -1798,6 +1798,65 @@ reconcile(narrator, target, now):
 - **存储页**：块索引计入「搜索」分类。
 - **测试**：`block-only-search.test.ts`（删掉信封级索引后覆盖各路径、旧信封、跨块语义）；`narrator-block-backfill.test.ts`（reindex 在 verify 后运行且不动 revision，清空的块索引重建得与写入时一致，覆盖只存行的信封）；`fts-retire.test.ts`（退役前后、退役后再丢块索引的恢复、无块存储的库）。
 
+**P3d 设计（前端按块渲染，删除 v1 协议）**
+
+现状（main，P3c 之后）：
+- **只有一个渲染器**：叙述者面板、聊天、公开分享都挂 `PretextExactMessageList`（vlist）。
+- **入口转回 v1**：页面（`getPretextDocumentPage`、分享页）与 WS（`narrator-ws-manager`）都请求 `protocol=2`。`frontend/lib/block-protocol.ts` 在入口处把信封 + 块拼回带 `contentJson` 的 `TreeMessage`，按 `parentMessageId` 嵌进 `children`，块的范围另存进 `block-refs.ts` 的模块级登记表。
+- **存储与渲染**：`PretextLayoutCoordinator` 持有 `TreeMessage[]`。行由 `message-segments` → `render-units` → `pretext-document-layout` → `segment-adapter`（`shared/pretext-layout`，只有前端用）按 `contentJson` 下标逐元素构建，注入与伴随块的配对在前端用 `contextBlockViews` / `injectionBlockViews` 重做一遍。
+- **已经按块的**：行键（`blk-<blockId>`）、账本补丁（`tool_started` / `tool_completed` 带 `blockId`）、删除与回滚等操作（已知块时走 `/blocks` 路由）。
+- **流式还不按块**：`block_delta` 被转回 v1 的 `stream_event`，块 id 丢掉；`block_opened` 被丢弃。流式副本与落库副本按元素 id + revision 配对，没有元素 id 的流（provider 不带 id 时服务端不发 `block_delta`，原样发 v1 `stream_event`）靠文本后缀与 `outputIndex` 的启发式。
+- **规模**：约 48 个生产文件、5.5–7 千行要改，另有约 1 千行死代码可删（`message-tree-utils` 中 15 个无调用的导出、`narrator-message-helpers` 的几个辅助函数、`TreeMessage._blockOriginalIndices`、没人填充的 React Query 消息缓存）。
+
+目标：前端只认信封 + 块。入口不再转换，`contentJson`、`children`、`blockRefs` 登记表从叙述者消息的前端代码里消失。
+
+- **store**：`PretextDocumentInput` 改为 `{envelopes, blocks}`。
+  - 信封保留现有元数据（role、origin、`toolCalls` 账本行、编辑信息、`parentMessageId`、seq），按 seq 排序，用 `blockIds` 列出自己的块。
+  - 块按 id 存（`BlockDTO`：kind、subtype、phase、revision、wireId、attemptId、elements、hasOriginal）。
+  - 派生索引代替树遍历：`parentMessageId` → 子信封（取代 `children`），`wireId` → tool 块，信封 → 块。
+- **帧的应用**：
+  - `message_upserted` 与 catch-up：信封替换；块按 id + revision 取新；信封不再列出的块删除。
+  - `messages_deleted`：删信封及其块。
+  - `segment_compact_hide`、compact 标记状态：照旧作用于信封。
+  - 现有的 upsert / replace / insert / remove 改写为按块的同一套规则。`message_updated` 只接受截尾或 COW 别名的限制随之消失，因为块按 id 合并，不再按元素下标比对。
+- **流式**：
+  - `block_opened` 在 store 里建一个 open 块（尚无 messageId 时挂在流式尾部）；`block_delta` 按块 id 追加（revision / textOffset 去重）；工具的输入片段按 `block_opened` 给出的块 id 归到 tool 块。
+  - 同一块 id 的落库块（下一次 checkpoint 的 `message_upserted`）到达时直接取代 open 块。
+  - 流式累加器、`streaming-handoff`、`streaming-block-supersede` 的文本后缀与 `outputIndex` 启发式、`streaming-tool-chunks` 里遍历 `contentJson` / `children` 找已落库工具的逻辑全部删除。
+  - 前提：服务端给每个流式元素都配上元素 id（provider 不带时由服务端按 `${attempt}:${order}` 补上），这样每个增量都以 `block_delta` 发出，不再有 v1 `stream_event` 的旁路。
+- **建行**：
+  - 分段、活动单元、`segment-adapter` 改为逐块遍历。一个块是一个渲染来源，多元素块（附件 + 文本的 input、注入 + 伴随的 context）把块内元素交给现有的逐元素适配函数（`adaptSystemBlock`、`adaptReviewCard`、`adaptFramedSystemCard`、`adaptSpokenInjection`、`buildToolCardData` 等）。
+  - 注入与伴随块的配对由块边界给出，服务端解码与同步时已按同样的规则分组，前端不再重做 `contextBlockViews` / `injectionBlockViews`。
+  - tool 卡由 tool 块与信封的 `toolCalls` 按 `wireId` 关联；reasoning 段由相邻的 reasoning 块组成。
+  - 键：叙述者消息一律 `blk-<blockId>`，块内多个可选元素加 `+<offset>`；tool 行仍是 `tool-<toolUseId>`；按位置的 `-b<i>` 键只剩非叙述者行。
+- **补丁与寻址**：
+  - 工具字段：按 `blockId`；只给了 toolUseId 的事件经 `wireId` 索引找块。
+  - 子代理活动：经子信封索引。
+  - 选择、编辑目标、ask-in-passing、工具元信息、反思与 spec 任务索引：从 `(messageId, blockIndex)` 改为块 id（加块内偏移）。
+  - 操作只走 `/blocks` 路由，前端删除按下标的调用；服务端按下标的路由若无其他调用方一并删除。
+  - 「显示原文」按块的 `hasOriginal` 走块详情路由，不再读信封的 `originalContentJson`。
+- **非叙述者行**：聊天（`chat-vlist-adapter`）与分享页讨论区现在拼合成的 `contentJson` 行，改由一个小的辅助函数生成信封 + 块（每个元素一块，合成 id），渲染器只有一种输入形态。
+- **服务端**：
+  - 删除 v1 页面与 v1 消息帧的输出、订阅时的协议协商和 `narratorBlocks.wsV2` 设置（设置迁移去掉这个键）。
+  - 发射方内部仍可产出 v1 形态的帧，经 `narrator-block-protocol.ts` 映射后发出；这个映射成为唯一出口。
+  - 旧格式信封照旧现场解码成块（§10.7），前端只见块。
+- **回退**：前端改造后 v1 路径不可达，所以 `wsV2` 开关与改造在同一个 PR 里删除，回退靠上一个正式版本。P3d 在默认开启 v2 的版本正式发布之后开始，这样 v2 协议本身已在线上跑过。
+
+**P3d 分步**（一个 PR，每步提交后 CI 全绿、应用可用）：
+1. 直接升级测试（§10.7）：P1 之前 schema 的库快照，覆盖迁移、现场解码、回填与退役。只测服务端，先行落地，后面各步都受它保护。
+2. 服务端为所有流式元素补元素 id，所有增量都以 `block_delta` 发出；补齐各 provider 的流式测试。
+3. 前端 store 与入口改为信封 + 块；在布局入口临时把块投影回旧的行形态，渲染不变。
+4. 建行改为按块（分段、活动单元、`segment-adapter`、键），删除临时投影。
+5. 流式改为 store 里的 open 块，删除累加器、交接与启发式。
+6. 补丁、选择、编辑、ask、各索引与操作改为按块 id；聊天与分享页的行生成改走辅助函数。
+7. 删除 v1 协议、`wsV2`、`block-protocol.ts` / `block-refs.ts`、按下标的路由与死代码；更新文档。
+
+**验收**：
+- §10.7 的直接升级测试通过。
+- 前端生产代码里叙述者消息不再读 `contentJson` / `children`（加一条守卫测试计数）。
+- 流式、交接、编辑、删除、回滚、ask、反思、子代理、compact、翻译的现有前端测试改为喂信封 + 块后全部通过。
+- 浏览器测试覆盖一次完整的流式回合：open 块 → 落库块，键不变、无闪烁。
+
 ## 12. 风险与成本
 
 ### 12.1 存储
