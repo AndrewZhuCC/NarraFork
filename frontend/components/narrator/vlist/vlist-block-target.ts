@@ -20,7 +20,9 @@
  * `selectionIndex.byBlockId.get(blockId)`.
  */
 
+import { blockStart } from "@frontend/lib/block-refs";
 import type { VListElementKind } from "@shared/pretext-layout/element-kinds";
+import { blockIdFromElementKey } from "@shared/pretext-layout/segment-adapter";
 
 export interface VListBlockTarget {
 	/** Selection-system blockId (msg-… | tc-… | sa-…). */
@@ -65,8 +67,22 @@ const BLOCK_INDEXED_KINDS = new Set<VListElementKind>([
 
 const BLOCK_INDEX_TOKEN = /-b(\d+)(?:-|$)/;
 
+/**
+ * The element index a block-keyed spec key (`-blk[<blockId>]+<offset>`, see `elementKey`)
+ * names in `messageId`, from the blocks the message arrived with; undefined for a
+ * positional key, null when the block is not one of the message's.
+ */
+function blockKeyedIndex(key: string, messageId?: string): number | null | undefined {
+	const named = blockIdFromElementKey(key);
+	if (!named) return undefined;
+	const start = blockStart(named.blockId);
+	return start && (!messageId || start.messageId === messageId) ? start.from + named.offset : null;
+}
+
 /** Extract the stable `-b{n}` block index from a spec key, or null. */
 function blockIndexFromKey(key: string, messageId?: string): number | null {
+	const keyed = blockKeyedIndex(key, messageId);
+	if (keyed !== undefined) return keyed;
 	const suffix = messageId && key.startsWith(`${messageId}-`) ? key.slice(messageId.length) : key;
 	const match = BLOCK_INDEX_TOKEN.exec(suffix);
 	if (!match) return null;
@@ -81,6 +97,8 @@ function blockIndexFromKey(key: string, messageId?: string): number | null {
  */
 const INJECTION_BLOCK_INDEX = /-b(\d+)-/;
 function injectionBlockIndexFromKey(key: string, messageId?: string): number | null {
+	const keyed = blockKeyedIndex(key, messageId);
+	if (keyed !== undefined) return keyed;
 	const suffix = messageId && key.startsWith(`${messageId}-`) ? key.slice(messageId.length) : key;
 	const match = INJECTION_BLOCK_INDEX.exec(suffix);
 	if (!match) return null;

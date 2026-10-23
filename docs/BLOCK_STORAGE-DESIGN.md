@@ -1481,7 +1481,7 @@ reconcile(narrator, target, now):
 |---|---|---|
 | `narratorBlocks.write` | store 写块表（双写） | P1 |
 | `narratorBlocks.read` | 读取方读块表 | P2 |
-| `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5） | P2 |
+| `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5）；默认开，关闭即回到 v1（前端两种都处理） | P2 |
 | `narratorBlocks.compactJson` | 新行的 `content_json` 写 `'[]'` | P3 |
 
 每个开关都可以单独关闭。P3 之前，关闭 `narratorBlocks.read` 就完全回到现状。
@@ -1679,6 +1679,19 @@ reconcile(narrator, target, now):
   - 公开分享连接先做公开投影再转 v2；其余帧原样发送。
   - 与 §8.2 的差别：信封不再列出的块就是已删除的块，所以不单独发 `blocks_deleted`；`message_sealed` 并入 `message_upserted`，由块的 `phase` 表明是否仍在流式。
 - **留给后续：** 检查点仍随 `message_upserted` 发整条信封的块（与 v1 的整行等量）。只带 `blockId, revision, phase` 的 `block_checkpoint`、`block_state` 增量、按帧合并 delta，等 P2c-3 前端确定消费方式后再做。
+
+**P2c-3 实现说明（前端切到块协议，`narratorBlocks.wsV2` 默认开）**
+- **一个 PR，分步提交，每步 CI 单独验证。**
+- **传输边界解码**（`frontend/lib/block-protocol.ts`）：
+  - 所有 `messages` 订阅都带 `protocol: 2`（服务端按连接、按叙述者只有一种协议，三处订阅必须一致），页面请求带 `?protocol=2`（含公开分享页）。
+  - v2 页面与帧在边界还原成 v1 形态：信封 + 块 → 带 `contentJson` 与嵌套 `children` 的 `TreeMessage`；`message_upserted` → 其 `cause` 指名的 v1 帧（按帧计 `messageVersion` 不变）；`block_delta` → v1 `stream_event`；v2 catch-up → `topLevel` / `orphanChildren`。
+  - 每行附 `blockRefs`（块 id 与在 `contentJson` 中的元素区间），解码时同时记入 `frontend/lib/block-refs.ts`。
+  - 服务端信封带 `parentMessageId`（在 v1 中嵌套于哪一行），v2 catch-up 带 `orphanMessageIds`，客户端据此精确还原 v1 树。往返测试保证"服务端编码 + 客户端解码"得到原来的 v1 页面与帧。
+  - 服务端回 v1（`wsV2` 关）时一切照旧，所以 `wsV2` 是回退开关。
+- **按块寻址的操作**：删除（单个、批量）、回滚、回滚与删除预览、文件恢复预览、编辑重生成，在已知块时走 `/blocks` 路由，作用于该元素所在的整块；只从 v1 服务端见过的消息仍走按下标的路由。编辑、恢复 assistant 消息仍按整条消息（编辑器编辑的是整条文本，按块编辑需要编辑器指明块）；allow-retry 按调用 id，本就精确。
+- **账本按块打补丁**：v2 连接上的 `tool_started` / `tool_completed` 带账本 attempt 所属的 tool 块（`blockId`：帧带 `toolCallId` 时取该 attempt 的 `block_id`，否则取该调用最新的 attempt）；前端只写持有该块的那一行，没有块 id 或未加载该块时仍写所有出现处。
+- **元素按块 id 作键**：以块协议到达的消息，其元素键为 `${messageId}-blk[<blockId>]`（多元素块的后续元素加 `+<offset>`），取代按位置的 `${messageId}-b<index>`；删除或插入前面的块不再改变后面行的键（测量高度、折叠、选择随之保留）。v1 消息仍用按位置的键。tool 行仍以调用 id 作键（反思、权限匹配、跳转都按它寻址）。
+- **流式交接**：流式元素与其落库副本已按元素的全局标识（`${attempt}:${order}`，即 v2 的块 id 所对应的元素）配对：supersede 用 id + revision，生命周期动画用 `lifecycleId`。按文本后缀、`outputIndex` 的旧匹配只服务于不带元素 id 的 provider 流与 `wsV2` 关闭时的 v1，因此保留，与 v1 协议和开关一起在 P3 删除。
 
 ### P3 退役与新能力
 

@@ -65,6 +65,8 @@ export type ReflectionDecision = "allow" | "deny" | "aborted" | "failed" | (stri
 export function toolStartedPatch(opts: {
 	streamingEditOrigin?: StreamingEditOrigin;
 	toolUseId: string;
+	/** The tool block the frame names (block-keyed protocol): only that block is patched. */
+	blockId?: string | null;
 	streamStartedAt?: number;
 	streamCompletedAt?: number;
 	input?: Record<string, unknown>;
@@ -86,7 +88,7 @@ export function toolStartedPatch(opts: {
 	};
 	// Await-style tools carry their own timeout on the input; the header shows it.
 	if (typeof opts.input?.timeout === "number") fields._timeoutMs = opts.input.timeout;
-	return (messages) => patchToolCallFields(messages, opts.toolUseId, fields);
+	return (messages) => patchToolCallFields(messages, opts.toolUseId, fields, opts.blockId);
 }
 
 /**
@@ -99,6 +101,8 @@ export function toolStartedPatch(opts: {
  */
 export function toolCompletedPatch(opts: {
 	toolUseId: string;
+	/** The tool block the frame names (block-keyed protocol): only that block is patched. */
+	blockId?: string | null;
 	status: string;
 	output?: unknown;
 	durationMs?: number;
@@ -112,7 +116,7 @@ export function toolCompletedPatch(opts: {
 		...(opts.updatedInput ? { inputJson: opts.updatedInput } : {}),
 		...(opts.metadata ? { _metadata: opts.metadata } : {}),
 	};
-	return (messages) => patchToolCallFields(messages, opts.toolUseId, fields);
+	return (messages) => patchToolCallFields(messages, opts.toolUseId, fields, opts.blockId);
 }
 
 /**

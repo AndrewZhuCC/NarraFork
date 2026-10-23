@@ -13,6 +13,7 @@ import type {
 import type { WriteDocumentSourceReference } from "./api/narrators";
 import type { PretextDocumentPageResult } from "./api/types";
 import { apiUrl, assetUrl } from "./base-path";
+import { decodeBlockPage } from "./block-protocol";
 
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -253,8 +254,10 @@ export function createPublicShareClient(shareId: string, credential: string): Pu
 				query.set("limit", String(opts.limit));
 			if (opts.messageVersion !== undefined && Number.isSafeInteger(opts.messageVersion))
 				query.set("messageVersion", String(opts.messageVersion));
-			const suffix = query.size ? `/pretext-document?${query}` : "/pretext-document";
-			return json(suffix, signal);
+			query.set("protocol", "2");
+			return json<PretextDocumentPageResult>(`/pretext-document?${query}`, signal).then(
+				decodeBlockPage,
+			);
 		},
 		messageLocation: (messageId, signal) => {
 			if (!IDENTIFIER.test(messageId)) return Promise.reject(new PublicShareError(400));
