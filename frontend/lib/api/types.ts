@@ -413,6 +413,8 @@ export interface DatabaseStorageBreakdown {
 		 */
 		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
+	/** Request dumps kept by an upgrade that deferred migration 0207's column rewrites. */
+	legacyRequestDumps?: { retained: boolean };
 }
 
 export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
@@ -495,6 +497,16 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	freedBytes: number;
 	vacuumRan: boolean;
 	changed: boolean;
+	/** Planned sessions left in place because they changed mid-cleanup. */
+	skippedSessions?: number;
+}
+
+export interface LegacyRequestDumpClearResult {
+	ok: true;
+	cleared: number;
+	beforeBytes: number;
+	afterBytes: number;
+	restartRequired: boolean;
 }
 
 /** One background block job (`server/services/narrator-block-backfill.ts`). */

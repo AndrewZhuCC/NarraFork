@@ -40,9 +40,12 @@ import type {
 	StorageScanCleanupSummariesParams,
 	StorageScanCleanupSummariesResult,
 	StorageScanContextResult,
+	StorageScanSessionPreviewParams,
+	StorageScanSessionPreviewResult,
 	StorageScanTablesParams,
 	StorageScanTablesResult,
 } from "./protocol";
+import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
 
 declare const self: Worker;
@@ -155,6 +158,21 @@ function runStorageScanCleanupSummaries(
 	};
 }
 
+function runStorageScanSessionPreview(
+	dbPath: string,
+	params: StorageScanSessionPreviewParams,
+	signal: AbortSignal,
+): StorageScanSessionPreviewResult {
+	assertSessionPreviewBudget(params);
+	const sqlite = getConnection(dbPath);
+	const aggregate = collectSessionAggregateStats(sqlite, params.narratorIds, params.relations);
+	const sampleBytes = params.sampleNarratorIds.map((ids) => {
+		if (signal.aborted) throw new Error("Session cleanup preview aborted");
+		return collectSessionAggregateStats(sqlite, ids, params.relations).approxBytes;
+	});
+	return { aggregate, sampleBytes };
+}
+
 const activeTasks = new Map<string, AbortController>();
 self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	const message = event.data;
@@ -213,12 +231,18 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 													)
 												: params.kind === "storageScanCleanupSummaries"
 													? runStorageScanCleanupSummaries(message.dbPath, params)
-													: runStorageScanTables(
-															message.dbPath,
-															message.requestId,
-															params,
-															controller.signal,
-														);
+													: params.kind === "storageScanSessionPreview"
+														? runStorageScanSessionPreview(
+																message.dbPath,
+																params,
+																controller.signal,
+															)
+														: runStorageScanTables(
+																message.dbPath,
+																message.requestId,
+																params,
+																controller.signal,
+															);
 		post({
 			type: "result",
 			requestId: message.requestId,
