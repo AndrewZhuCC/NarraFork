@@ -71,6 +71,11 @@ import {
 } from "./recovery-gate";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
+import {
+	describeFirstTokenTimeout,
+	describeStreamIdleTimeout,
+	StreamProgress,
+} from "./stream-progress";
 import { interleaveWakeups, STREAM_WAKEUP, WakeSignal } from "./stream-wakeups";
 import {
 	groupToolExecutions,
@@ -4676,14 +4681,42 @@ async function* agentLoopInMetadataSnapshot(
 				let providerActivitySeen = false;
 				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
 				let streamIdleTimer: ReturnType<typeof setTimeout> | undefined;
-				const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
-					firstTokenTimeoutMs / 1000,
-				)}s without upstream activity`;
+				// Bytes and SSE heartbeats only explain *where* an attempt stalled; they never
+				// cancel or extend the event-based timers below.
+				const streamProgress = new StreamProgress();
+				let firstTokenTimeoutMessage = describeFirstTokenTimeout(
+					effectiveProvider,
+					firstTokenTimeoutMs,
+					undefined,
+				);
 				const streamIdleTimeoutMs =
 					firstTokenTimeoutMs > 0 ? Math.max(firstTokenTimeoutMs * 5, 300_000) : 0;
-				const streamIdleTimeoutMessage = `${effectiveProvider}: Stream idle timeout after ${Math.round(
-					streamIdleTimeoutMs / 1000,
-				)}s without a parsed stream event`;
+				let streamIdleTimeoutMessage = describeStreamIdleTimeout(
+					effectiveProvider,
+					streamIdleTimeoutMs,
+					undefined,
+				);
+				const logStreamTimeout = (reason: string, message: string) => {
+					logger.warn("Provider stream timeout", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						reason,
+						message,
+						stallPhase: streamProgress.stallPhase(),
+						...streamProgress.snapshot(),
+					});
+				};
+				const streamTimeoutDiagnostics = () => {
+					const snapshot = streamProgress.snapshot();
+					return {
+						...(snapshot.statusCode !== undefined ? { statusCode: snapshot.statusCode } : {}),
+						...(streamProgress.stallPhase() && !providerActivitySeen
+							? { cause: streamProgress.stallPhase() }
+							: {}),
+					};
+				};
 				const clearFirstTokenTimer = () => {
 					if (firstTokenTimer) {
 						clearTimeout(firstTokenTimer);
@@ -4702,11 +4735,18 @@ async function* agentLoopInMetadataSnapshot(
 					streamIdleTimer = setTimeout(() => {
 						if (config.signal.aborted) return;
 						streamIdleTimeoutTriggered = true;
+						streamIdleTimeoutMessage = describeStreamIdleTimeout(
+							effectiveProvider,
+							streamIdleTimeoutMs,
+							streamProgress,
+						);
+						logStreamTimeout("stream_idle_timeout", streamIdleTimeoutMessage);
 						attemptAbort.abort(new Error(streamIdleTimeoutMessage));
 					}, streamIdleTimeoutMs);
 				};
 				const markProviderActivity = () => {
 					providerActivitySeen = true;
+					streamProgress.markEvent();
 					clearFirstTokenTimer();
 					armStreamIdleTimer();
 				};
@@ -4722,6 +4762,12 @@ async function* agentLoopInMetadataSnapshot(
 					firstTokenTimer = setTimeout(() => {
 						if (config.signal.aborted || providerActivitySeen || sawMeaningfulResponse) return;
 						firstTokenTimeoutTriggered = true;
+						firstTokenTimeoutMessage = describeFirstTokenTimeout(
+							effectiveProvider,
+							firstTokenTimeoutMs,
+							streamProgress,
+						);
+						logStreamTimeout("first_token_timeout", firstTokenTimeoutMessage);
 						attemptAbort.abort(new Error(firstTokenTimeoutMessage));
 					}, firstTokenTimeoutMs);
 				};
@@ -4818,6 +4864,7 @@ async function* agentLoopInMetadataSnapshot(
 						serviceTier: config.serviceTier,
 						metadata: config.metadata,
 						requestDump,
+						streamProgress,
 						resetUpstreamSession,
 						onRequestStart: markRequestStarted,
 						onInputCharacters: async (counts) => {
@@ -5974,6 +6021,7 @@ async function* agentLoopInMetadataSnapshot(
 							message: firstTokenTimeoutMessage,
 							provider: effectiveProvider,
 							model: effectiveModel,
+							...streamTimeoutDiagnostics(),
 						});
 						if (
 							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
@@ -6037,6 +6085,7 @@ async function* agentLoopInMetadataSnapshot(
 							message: streamIdleTimeoutMessage,
 							provider: effectiveProvider,
 							model: effectiveModel,
+							...streamTimeoutDiagnostics(),
 						});
 						if (
 							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
@@ -6414,6 +6463,7 @@ async function* agentLoopInMetadataSnapshot(
 						message: firstTokenTimeoutMessage,
 						provider: effectiveProvider,
 						model: effectiveModel,
+						...streamTimeoutDiagnostics(),
 					});
 					if (
 						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
@@ -6469,6 +6519,7 @@ async function* agentLoopInMetadataSnapshot(
 						message: streamIdleTimeoutMessage,
 						provider: effectiveProvider,
 						model: effectiveModel,
+						...streamTimeoutDiagnostics(),
 					});
 					if (
 						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
