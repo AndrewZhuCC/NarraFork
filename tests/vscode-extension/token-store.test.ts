@@ -27,6 +27,12 @@ describe("looksLikeSessionToken", () => {
 		expect(looksLikeSessionToken(TOKEN)).toBe(true);
 	});
 
+	it("accepts an opaque session token and rejects a malformed one", () => {
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(43)}`)).toBe(true);
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}`)).toBe(false);
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}.`)).toBe(false);
+	});
+
 	it("rejects values that could not be a token", () => {
 		for (const value of [null, undefined, 7, {}, "", "nope", "only.two", "a b.c d.e f"]) {
 			expect(looksLikeSessionToken(value)).toBe(false);

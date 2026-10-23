@@ -73,7 +73,7 @@ beforeEach(async () => {
 			updatedAt: now,
 		})
 		.run();
-	token = await createToken(userId, "user");
+	token = await createToken(userId);
 	settings.chapters.treeSnapshotsEnabled = false;
 	applyCalls = 0;
 	io = {

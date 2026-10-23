@@ -1,11 +1,12 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 
 /**
- * Session-token issuance and verification, exercised without the database.
+ * Legacy session-JWT verification, exercised without the database.
  *
- * `server/lib/auth.ts` imports `../db` for the login/registration helpers, which
- * would run the whole migration stack. Only the JWT layer is under test here, so
- * the module is stubbed out.
+ * Session JWTs are no longer issued, but those issued before opaque session tokens
+ * stay valid for their remaining lifetime. `server/lib/auth.ts` imports `../db` for
+ * the session store, which would run the whole migration stack. Only the JWT layer
+ * is under test here, so the module is stubbed out.
  *
  * Snapshot the real module first. Bun's mock.module is process-wide and
  * mock.restore() does NOT undo it, so afterAll re-points the specifier back —
@@ -22,9 +23,9 @@ afterAll(() => {
 });
 
 const [
-	{ createToken, isAuthenticSessionTokenIgnoringExpiry, renewToken, verifyToken },
+	{ isAuthenticSessionTokenIgnoringExpiry, verifyToken },
 	{ settings },
-	{ SESSION_START_CLAIM, SESSION_TOKEN_TTL_SECONDS },
+	{ SESSION_START_CLAIM },
 	{ sign },
 ] = await Promise.all([
 	import("../auth"),
@@ -34,37 +35,6 @@ const [
 ]);
 
 type Claims = Record<string, unknown>;
-
-describe("createToken", () => {
-	test("anchors a fresh login at the present and expires after the full TTL", async () => {
-		const before = Math.floor(Date.now() / 1000);
-		const payload = (await verifyToken(await createToken("user-1", "admin"))) as unknown as Claims;
-		const anchor = payload[SESSION_START_CLAIM] as number;
-		expect(anchor).toBeGreaterThanOrEqual(before);
-		expect(payload.sub).toBe("user-1");
-		expect(payload.role).toBe("admin");
-		expect((payload.exp as number) - (payload.iat as number)).toBe(SESSION_TOKEN_TTL_SECONDS);
-	});
-});
-
-describe("renewToken", () => {
-	test("inherits the supplied session anchor instead of resetting it", async () => {
-		const anchor = Math.floor(Date.now() / 1000) - 20 * 24 * 60 * 60;
-		const payload = (await verifyToken(
-			await renewToken("user-1", "user", anchor),
-		)) as unknown as Claims;
-		expect(payload[SESSION_START_CLAIM]).toBe(anchor);
-		// The expiry still slides forward — only the anchor is frozen.
-		expect(payload.exp as number).toBeGreaterThan(Math.floor(Date.now() / 1000));
-	});
-
-	test("signs the role it is given rather than any role from a previous token", async () => {
-		const payload = (await verifyToken(
-			await renewToken("user-1", "user", Math.floor(Date.now() / 1000)),
-		)) as unknown as Claims;
-		expect(payload.role).toBe("user");
-	});
-});
 
 describe("verifyToken shape checks", () => {
 	const now = () => Math.floor(Date.now() / 1000);
@@ -96,6 +66,22 @@ describe("verifyToken shape checks", () => {
 			settings.auth.jwtSecret,
 		);
 		expect(verifyToken(blankSub)).rejects.toThrow();
+	});
+
+	test("accepts a correctly signed legacy session JWT", async () => {
+		const token = await sign(
+			{ sub: "user-1", role: "user", iat: now(), exp: now() + 3600 },
+			settings.auth.jwtSecret,
+		);
+		expect((await verifyToken(token)).sub).toBe("user-1");
+	});
+
+	test("rejects a JWT that claims an opaque session id", async () => {
+		const token = await sign(
+			{ sub: "user-1", role: "user", iat: now(), exp: now() + 3600, sid: "x" },
+			settings.auth.jwtSecret,
+		);
+		expect(verifyToken(token)).rejects.toThrow();
 	});
 
 	test("still rejects an intermediate MFA-stage token", async () => {
@@ -133,8 +119,9 @@ describe("isAuthenticSessionTokenIgnoringExpiry", () => {
 		expect(await isAuthenticSessionTokenIgnoringExpiry(forged)).toBe(false);
 	});
 
-	test("refuses garbage and OAuth access tokens", async () => {
+	test("refuses garbage, OAuth access tokens and opaque session tokens", async () => {
 		expect(await isAuthenticSessionTokenIgnoringExpiry("not-a-jwt")).toBe(false);
+		expect(await isAuthenticSessionTokenIgnoringExpiry(`nfs_${"A".repeat(43)}`)).toBe(false);
 		expect(await isAuthenticSessionTokenIgnoringExpiry("nfat_abc123")).toBe(false);
 	});
 

@@ -11,9 +11,10 @@
  *
  * WHY IT MUST BE BIDIRECTIONAL
  * ----------------------------
- * ⚠️ The token is not stable. The backend re-signs it as it nears expiry and returns the
- * replacement in the `X-NarraFork-Session-Token` response header, which the SPA absorbs
- * (`frontend/lib/api/client.ts`). A write-only store therefore goes stale on its own, and
+ * ⚠️ The token is not stable. The backend replaces a legacy session JWT with an opaque
+ * session token in the `X-NarraFork-Session-Token` response header, which the SPA absorbs
+ * (`frontend/lib/api/client.ts`), and a re-login replaces either. A write-only store
+ * therefore goes stale on its own, and
  * the symptom appears LATER and elsewhere: the next panel injects an expired token and
  * the user is bounced to the login screen for no visible reason. So the SPA reports every
  * change back and this store follows it.
@@ -34,7 +35,8 @@ function secretKey(origin: string): string {
 }
 
 /**
- * Reject anything that is not shaped like the JWT the backend issues.
+ * Reject anything that is not shaped like a session token the backend issues: an opaque
+ * `nfs_` token, or a legacy session JWT that is still inside its lifetime.
  *
  * The value arrives from the webview, so it is untrusted input even though the relay
  * checks the sender's origin. Storing an arbitrary string would be harmless in itself but
@@ -44,8 +46,9 @@ function secretKey(origin: string): string {
 export function looksLikeSessionToken(value: unknown): value is string {
 	if (typeof value !== "string") return false;
 	if (value.length < 20 || value.length > 8_192) return false;
-	// Three base64url segments. Not verified — the extension has no key and does not need
-	// one; the backend is the only party that can accept or reject it.
+	// Not verified — only the backend can accept or reject it. Opaque tokens are `nfs_`
+	// plus 32 random bytes in base64url; legacy JWTs are three base64url segments.
+	if (value.startsWith("nfs_")) return /^nfs_[A-Za-z0-9_-]{43}$/.test(value);
 	return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 }
 

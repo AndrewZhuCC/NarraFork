@@ -43,7 +43,7 @@ beforeEach(async () => {
 			createdAt: new Date().toISOString(),
 		});
 		invalidateUserCache(id);
-		const session = await createToken(id, role);
+		const session = await createToken(id);
 		if (role === "admin") adminToken = session;
 		else memberToken = session;
 	}

@@ -1,4 +1,5 @@
 import {
+	isOpaqueSessionToken,
 	isSessionTokenVersionCurrent,
 	isWithinAbsoluteSessionLimit,
 	resolveSessionStart,
@@ -10,9 +11,10 @@ import {
 import type { Context, Next } from "hono";
 import { JwtTokenExpired } from "hono/utils/jwt/types";
 import {
+	extendSessionToken,
 	isAuthenticSessionTokenIgnoringExpiry,
 	type JwtPayload,
-	renewToken,
+	upgradeLegacySessionToken,
 	verifyToken,
 } from "../lib/auth";
 import { AppError, catalogError } from "../lib/errors";
@@ -36,7 +38,7 @@ export interface OAuthAuthContext {
 	scopes: string[];
 }
 
-/** The first-party session principal established by a session JWT. */
+/** The first-party session principal established by a session token. */
 export interface SessionAuthPrincipal {
 	type: "session";
 	user: JwtPayload;
@@ -134,11 +136,9 @@ function setAuthPrincipal(c: Context, principal: AuthPrincipal): void {
 /**
  * Whether a verification failure reports an `exp` in the past.
  *
- * Session tokens are verified with `hono/jwt`, which raises its own
+ * Legacy session JWTs are verified with `hono/jwt`, which raises its own
  * `JwtTokenExpired`. The `name` check keeps this working across duplicated
- * module instances where `instanceof` fails. (jose is intentionally not matched:
- * every session-token path in this codebase goes through `hono/jwt`, so a jose
- * `JWTExpired` branch here would be dead code.)
+ * module instances where `instanceof` fails.
  *
  * This alone does NOT mean the token was ever ours — `hono/jwt` evaluates `exp`
  * before the signature, so a forged token with a past `exp` lands here too. See
@@ -151,7 +151,7 @@ function reportsExpiredJwt(err: unknown): boolean {
 }
 
 /**
- * Whether a verification failure means the session JWT was well-formed,
+ * Whether a verification failure means a legacy session JWT was well-formed,
  * correctly signed by this instance, and only past its `exp`.
  *
  * The signature is re-checked with `exp` disabled, because otherwise any forged
@@ -173,14 +173,14 @@ async function isExpiredSessionJwt(err: unknown, token: string): Promise<boolean
  * Paths whose responses are served with a `public` or otherwise shared
  * `Cache-Control`, and must therefore never carry a session credential.
  *
- * A renewal header attached to `public, max-age=31536000, immutable` is written
- * to the browser's disk cache alongside the asset and is reusable by any
+ * A replacement-token header attached to `public, max-age=31536000, immutable` is
+ * written to the browser's disk cache alongside the asset and is reusable by any
  * intermediary cache (reverse proxy, CDN, corporate proxy). Worse, a later cache
  * hit would replay a days-old header and push a stale token back into
  * localStorage. Excluding these paths is preferred over forcing `no-store` on
- * the renewal response, which would destroy asset caching for no benefit: these
- * routes are polled often enough that some other API call will carry the
- * renewal instead.
+ * the response, which would destroy asset caching for no benefit: these routes
+ * are polled often enough that some other API call will carry the replacement
+ * instead.
  *
  * Verified against every `Cache-Control` set behind the session gate:
  *  - /api/uploads/*            → public, max-age=31536000, immutable
@@ -200,43 +200,59 @@ function allowsSessionRenewalHeader(path: string): boolean {
 }
 
 /**
- * Sliding session renewal.
+ * Sliding renewal of an opaque session.
  *
- * Session JWTs are self-contained and have no companion refresh token, so
- * without this an active user is logged out the moment the original lifetime
- * elapses. Whenever a request arrives with a still-valid token that is close to
- * expiry, re-sign it and hand the replacement back in a response header; the
- * frontend API client stores it and subsequent requests carry the fresh token.
+ * Only inside the renewal window (the last 3 days of a 7-day expiry), so ordinary
+ * requests write nothing; the next request after a renewal sees the new expiry and
+ * stops renewing. The token itself never changes. The absolute ceiling is enforced
+ * by `extendSessionToken`. Failures are swallowed: the current request is already
+ * authenticated and must not fail just because renewal did.
+ */
+async function maybeExtendOpaqueSession(payload: JwtPayload): Promise<void> {
+	if (!shouldRenewSessionToken(payload.exp, Math.floor(Date.now() / 1000))) return;
+	try {
+		await extendSessionToken(payload);
+	} catch (error) {
+		logger.warn("Failed to extend session", {
+			userId: payload.sub,
+			error: error instanceof Error ? error.name : "UnknownError",
+		});
+	}
+}
+
+/**
+ * Replace a legacy session JWT with an opaque session token.
+ *
+ * Session JWTs are no longer issued, but those issued before the switch stay valid for
+ * their remaining lifetime. Every authenticated request still carrying one gets an
+ * opaque replacement in `SESSION_RENEWAL_HEADER`; the frontend stores it, and the next
+ * request moves onto the opaque session. The replacement inherits the JWT's session
+ * start, so the absolute ceiling still counts from the original login.
  *
  * Deliberately narrow:
- *  - only first-party session JWTs (OAuth access tokens have their own refresh
- *    flow and revocation semantics, and must not be silently extended);
- *  - only inside the renewal window, so the common request pays no signing cost;
+ *  - only first-party session JWTs (OAuth access tokens have their own lifecycle);
  *  - never past the absolute ceiling anchored at the original login;
  *  - never on responses that are cacheable by the browser or a shared cache;
- *  - the role is always re-read from `users`, never copied from the presented
- *    token, so a demotion cannot be frozen into an endless renewal chain;
+ *  - bound to the live token generation, so a bump that lands between the version
+ *    check and this line cannot be dodged by the replacement;
  *  - failures are swallowed, since the current request is already authenticated
- *    and must not fail just because renewal did.
- *
- * The extra `users` lookup is bounded: it runs only inside the renewal window
- * (the last 3 days of a 7-day token), and the very next request carries the
- * refreshed token, so a client makes at most a handful of these per week — not
- * one per request.
+ *    and must not fail just because the upgrade did.
  *
  * Throws when the user row is gone, matching the existence check in
- * `authenticateRequest`: a deleted user must not be renewed *or* served.
+ * `authenticateRequest`: a deleted user must not be upgraded *or* served.
  */
-async function maybeRenewSessionToken(c: Context, payload: JwtPayload): Promise<void> {
-	const nowSeconds = Math.floor(Date.now() / 1000);
-	if (!shouldRenewSessionToken(payload.exp, nowSeconds)) return;
+async function maybeUpgradeLegacySession(
+	c: Context,
+	token: string,
+	payload: JwtPayload,
+): Promise<void> {
 	if (!allowsSessionRenewalHeader(c.req.path)) return;
-
+	const nowSeconds = Math.floor(Date.now() / 1000);
 	const sessionStart = resolveSessionStart(payload[SESSION_START_CLAIM], nowSeconds);
 	if (!isWithinAbsoluteSessionLimit(sessionStart, nowSeconds)) return;
 
-	// Re-read the live role. Outside the try/catch below so a vanished user
-	// surfaces as a 401 instead of being silently treated as "renewal failed".
+	// Outside the try/catch below so a vanished user surfaces as a 401 instead of being
+	// silently treated as "upgrade failed".
 	const row = await authSessionStore.findSessionState(payload.sub);
 	if (!row) {
 		invalidateUserCache(payload.sub);
@@ -244,20 +260,25 @@ async function maybeRenewSessionToken(c: Context, payload: JwtPayload): Promise<
 	}
 
 	try {
-		// Sign against the live generation, exactly as the role is taken live. The request that
-		// reached here already passed the version check, so this cannot mint a token for a
-		// revoked session — it only avoids handing back a token that a bump landing between
-		// that check and this line would immediately invalidate.
-		const renewed = await renewToken(row.id, row.role, sessionStart, row.tokenVersion);
-		c.header(SESSION_RENEWAL_HEADER, renewed);
+		const replacement = await upgradeLegacySessionToken(
+			token,
+			row.id,
+			sessionStart,
+			row.tokenVersion,
+		);
+		c.header(SESSION_RENEWAL_HEADER, replacement);
 	} catch (error) {
 		// Never log the error message itself: hono's JWT errors embed the whole
 		// token in `message` (`token (${token}) expired`).
-		logger.warn("Failed to renew session token", {
+		logger.warn("Failed to upgrade legacy session token", {
 			userId: payload.sub,
 			error: error instanceof Error ? error.name : "UnknownError",
 		});
 	}
+}
+
+function hasErrorName(err: unknown, name: string): boolean {
+	return (err as { name?: unknown } | null)?.name === name;
 }
 
 /**
@@ -279,17 +300,26 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 	try {
 		payload = await verifyToken(token);
 	} catch (err) {
+		// Error names rather than `instanceof`, to survive duplicated module instances.
+		if (hasErrorName(err, "SessionTokenRevoked")) throw catalogError("SESSION_REVOKED");
+		if (hasErrorName(err, "SessionTokenExpired")) throw catalogError("TOKEN_EXPIRED");
+		if (isOpaqueSessionToken(token)) {
+			// An unknown opaque token is not an OAuth token either. Anything other than
+			// that verdict (a storage failure) must not read as "your session is gone".
+			if (err instanceof AppError && err.statusCode === 401) throw catalogError("TOKEN_INVALID");
+			throw err;
+		}
 		if (await isExpiredSessionJwt(err, token)) {
 			throw catalogError("TOKEN_EXPIRED");
 		}
-		// Not a valid session JWT — fall through to OAuth access tokens issued by
+		// Not a valid session token — fall through to OAuth access tokens issued by
 		// NarraFork's own authorization server (third-party API clients).
 		const oauthGrant = await validateAccessToken(token).catch(() => null);
 		if (!oauthGrant) {
 			throw catalogError("TOKEN_INVALID");
 		}
 		// OAuth access tokens are short-lived and revocable, so always resolve the
-		// live user row instead of using the session-JWT existence cache.
+		// live user row instead of using the session existence cache.
 		const row = await authSessionStore.findSessionState(oauthGrant.userId);
 		if (!row) {
 			throw catalogError("USER_GONE");
@@ -311,11 +341,20 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 		return principal;
 	}
 
-	// Confirm the user still exists (handles DB wipe, user deletion) and that this token's
-	// generation has not been revoked. Both facts come from the same row and share one cache
-	// entry, so token-version enforcement costs no extra query — the revocation window is the
-	// existing 60s TTL, which anything bumping the counter shortens to zero by invalidating
-	// the entry (see invalidateUserCache).
+	if (payload.sid) {
+		// Opaque sessions were resolved against the live account row: existence, role and
+		// token generation are already current, so neither the cache nor a second read applies.
+		const principal: SessionAuthPrincipal = { type: "session", user: payload };
+		setAuthPrincipal(c, principal);
+		await maybeExtendOpaqueSession(payload);
+		return principal;
+	}
+
+	// Legacy JWT. Confirm the user still exists (handles DB wipe, user deletion) and that
+	// this token's generation has not been revoked. Both facts come from the same row and
+	// share one cache entry, so token-version enforcement costs no extra query — the
+	// revocation window is the existing 60s TTL, which anything bumping the counter
+	// shortens to zero by invalidating the entry (see invalidateUserCache).
 	let verified = getVerifiedUser(payload.sub);
 	if (!verified) {
 		const row = await authSessionStore.findSessionState(payload.sub);
@@ -334,12 +373,12 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 
 	const principal: SessionAuthPrincipal = { type: "session", user: payload };
 	setAuthPrincipal(c, principal);
-	await maybeRenewSessionToken(c, payload);
+	await maybeUpgradeLegacySession(c, token, payload);
 	return principal;
 }
 
 /**
- * Authenticate either a first-party session JWT or an OAuth access token.
+ * Authenticate either a first-party session token or an OAuth access token.
  * This dual-mode helper is reserved for explicitly external/legacy paths and tests;
  * ordinary application routes use requireSessionAuth.
  */
@@ -354,7 +393,7 @@ export async function requireExternalAuth(c: Context, next: Next) {
 	await next();
 }
 
-/** Require an OAuth access token and reject first-party session JWTs. */
+/** Require an OAuth access token and reject first-party session tokens. */
 export async function requireOAuthAuth(c: Context, next: Next) {
 	const principal = await authenticateRequest(c);
 	if (principal.type !== "oauth") {
@@ -364,7 +403,7 @@ export async function requireOAuthAuth(c: Context, next: Next) {
 }
 
 /**
- * Require a first-party session JWT. OAuth access tokens authenticate normal API
+ * Require a first-party session token. OAuth access tokens authenticate normal API
  * requests through requireExternalAuth/requireAuth, but they must never satisfy
  * user-consent flows.
  */
@@ -400,7 +439,7 @@ export async function requireAdmin(c: Context, next: Next) {
 /**
  * 管理员会话，或管理器面板持有的本机令牌。
  *
- * 面板是独立进程、没有用户 JWT。令牌由面板生成，只放进它拉起的服务进程的环境变量。
+ * 面板是独立进程、没有用户会话令牌。令牌由面板生成，只放进它拉起的服务进程的环境变量。
  * 对端必须是回环 socket（`peerIp`，不是解析过转发头的 clientIp），并且 Bearer 与令牌一致。
  * 终端里手动启动的服务没有这个环境变量，因此没有旁路。
  */
@@ -422,7 +461,7 @@ export async function requireAdminOrManagerToken(c: Context, next: Next) {
 }
 
 /**
- * Gate a route on an OAuth scope. Requests authenticated by a session JWT
+ * Gate a route on an OAuth scope. Requests authenticated by a session token
  * (first-party UI) always pass — scopes only constrain third-party OAuth
  * access tokens. The auth lookup is cached, so this is safe after requireAuth
  * and can also be used as a standalone boundary.

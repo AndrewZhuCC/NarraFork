@@ -1,19 +1,24 @@
 import { type Locale, normalizeLocale } from "@shared/i18n-locales";
 import {
+	ABSOLUTE_SESSION_MAX_SECONDS,
+	isOpaqueSessionToken,
+	isSessionTokenVersionCurrent,
 	SESSION_START_CLAIM,
 	SESSION_TOKEN_TTL_SECONDS,
 	SESSION_VERSION_CLAIM,
 } from "@shared/session-auth";
-import { sign, verify } from "hono/jwt";
+import { verify } from "hono/jwt";
 import { authSessionStore } from "../services/auth/store";
 import { registrationAccountStore as accountStore } from "../services/registration/store";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
 import { randomAvatarColor } from "./avatar-colors";
 import { AppError, RateLimitError } from "./errors";
 import { eventBus } from "./event-bus";
+import { hotTimer } from "./hot-safe";
 import { generateId } from "./id";
 import { logger } from "./logger";
 import { issueMfaToken } from "./mfa";
+import { generateSessionToken, hashSessionToken } from "./session-token-hash";
 import { saveSettings, settings } from "./settings";
 
 /** Read JWT secret lazily so it picks up the auto-generated value even when
@@ -22,81 +27,135 @@ function getJwtSecret(): string {
 	return settings.auth.jwtSecret;
 }
 
-const TOKEN_EXPIRY_SECONDS = SESSION_TOKEN_TTL_SECONDS;
-
 // A fixed cost-10 bcrypt hash used only to equalize the unknown-user path with
 // a normal password failure. The plaintext is intentionally public and is not
 // an account credential.
 const INVALID_LOGIN_PADDING_HASH = "$2b$10$aF/evsAjCJZn2KANblVddeLsw19IUoALQbTSxTaCJeNxztOQHrWWm";
 
+/** The verified claims of a first-party session, whichever token kind carried them. */
 export interface JwtPayload {
 	sub: string;
 	role: "admin" | "user";
 	iat: number;
 	exp: number;
 	/**
-	 * Session start (unix seconds) of the original login. Optional because tokens
+	 * Session start (unix seconds) of the original login. Optional because legacy JWTs
 	 * issued before the absolute session ceiling existed do not carry it; see
 	 * `resolveSessionStart` for how those are anchored.
 	 */
 	[SESSION_START_CLAIM]?: number;
 	/**
-	 * `users.token_version` at signing time. Optional for the same reason as the
-	 * anchor above: tokens predating the column do not carry it. A missing value
-	 * reads as 0 (see `isSessionTokenVersionCurrent`), so those tokens keep working
-	 * until the user's counter is bumped for the first time.
+	 * `users.token_version` at issuance. Optional for the same reason as the anchor above:
+	 * legacy JWTs predating the column do not carry it. A missing value reads as 0 (see
+	 * `isSessionTokenVersionCurrent`).
 	 */
 	[SESSION_VERSION_CLAIM]?: number;
+	/** `auth_sessions.id` of an opaque session. Absent on a legacy JWT. */
+	sid?: string;
 }
 
-/**
- * Issue a session JWT for a *fresh login*: the absolute-session anchor starts now.
- * Renewals must use `renewToken` so the anchor is inherited instead of reset.
- */
-export async function createToken(userId: string, role: string, tokenVersion = 0): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	return signSessionToken(userId, role, now, now, tokenVersion);
+/** An opaque session token that is known but past its expiry or absolute ceiling. */
+export class SessionTokenExpiredError extends Error {
+	override name = "SessionTokenExpired";
 }
 
-/**
- * Re-sign a session JWT for sliding renewal, carrying the original session-start
- * anchor forward untouched. Callers must check the absolute ceiling before
- * calling this — the anchor alone does not stop an over-age chain.
- */
-export async function renewToken(
+/** An opaque session token that was revoked, alone or by a token-generation bump. */
+export class SessionTokenRevokedError extends Error {
+	override name = "SessionTokenRevoked";
+}
+
+function nowSeconds(): number {
+	return Math.floor(Date.now() / 1000);
+}
+
+/** The expiry a session may slide to at `now`: one TTL ahead, never past its ceiling. */
+function slidExpiry(sessionStart: number, now: number): number {
+	return Math.min(now + SESSION_TOKEN_TTL_SECONDS, sessionStart + ABSOLUTE_SESSION_MAX_SECONDS);
+}
+
+async function issueSession(
 	userId: string,
-	role: string,
+	tokenVersion: number,
 	sessionStart: number,
-	tokenVersion = 0,
 ): Promise<string> {
-	return signSessionToken(userId, role, sessionStart, Math.floor(Date.now() / 1000), tokenVersion);
+	const now = nowSeconds();
+	const token = generateSessionToken();
+	await authSessionStore.createSession({
+		id: generateId(),
+		userId,
+		tokenHash: hashSessionToken(token),
+		tokenVersion,
+		sessionStart,
+		createdAt: now,
+		expiresAt: slidExpiry(sessionStart, now),
+	});
+	return token;
 }
 
-async function signSessionToken(
+/**
+ * Issue a session token for a *fresh login*: the absolute-session anchor starts now.
+ * `tokenVersion` must be the user's current `users.token_version`, or the session is
+ * born revoked.
+ */
+export async function createToken(userId: string, tokenVersion = 0): Promise<string> {
+	return issueSession(userId, tokenVersion, nowSeconds());
+}
+
+/** Recently issued replacements, keyed by the legacy JWT's hash (see below). */
+const legacyUpgrades = new Map<string, { token: Promise<string>; at: number }>();
+const LEGACY_UPGRADE_REUSE_MS = 5 * 60 * 1000;
+
+/**
+ * Replace a verified legacy session JWT with an opaque session, keeping its original
+ * session-start anchor so the upgrade cannot extend the absolute ceiling.
+ *
+ * A page fires many requests in parallel with the same JWT before the first replacement
+ * lands, and each would otherwise mint (and leave behind) its own session. Requests that
+ * present the same JWT within a few minutes share one replacement instead.
+ */
+export async function upgradeLegacySessionToken(
+	legacyToken: string,
 	userId: string,
-	role: string,
 	sessionStart: number,
-	nowSeconds: number,
 	tokenVersion: number,
 ): Promise<string> {
-	return sign(
-		{
-			sub: userId,
-			role,
-			iat: nowSeconds,
-			exp: nowSeconds + TOKEN_EXPIRY_SECONDS,
-			[SESSION_START_CLAIM]: sessionStart,
-			[SESSION_VERSION_CLAIM]: tokenVersion,
-		},
-		getJwtSecret(),
-	);
+	const key = hashSessionToken(legacyToken);
+	const now = Date.now();
+	for (const [entryKey, entry] of legacyUpgrades) {
+		if (now - entry.at > LEGACY_UPGRADE_REUSE_MS) legacyUpgrades.delete(entryKey);
+	}
+	const existing = legacyUpgrades.get(key);
+	if (existing) return existing.token;
+	const token = issueSession(userId, tokenVersion, sessionStart);
+	legacyUpgrades.set(key, { token, at: now });
+	token.catch(() => legacyUpgrades.delete(key));
+	return token;
 }
 
 /**
- * Bump a user's token generation, invalidating every session token they hold.
+ * Slide an opaque session's expiry forward. Callers decide *when* (only inside the
+ * renewal window, so ordinary requests write nothing); this decides how far.
+ */
+export async function extendSessionToken(payload: JwtPayload): Promise<void> {
+	const sessionStart = payload[SESSION_START_CLAIM];
+	if (!payload.sid || sessionStart === undefined) return;
+	const expiresAt = slidExpiry(sessionStart, nowSeconds());
+	if (expiresAt <= payload.exp) return;
+	await authSessionStore.extendSession(payload.sid, expiresAt);
+}
+
+/** Revoke the one session a request authenticated with (logout). No-op for legacy JWTs. */
+export async function revokeSessionToken(payload: JwtPayload): Promise<void> {
+	if (!payload.sid) return;
+	await authSessionStore.revokeSession(payload.sid, nowSeconds());
+	eventBus.emit({ type: "auth:changed", userId: payload.sub });
+}
+
+/**
+ * Bump a user's token generation, invalidating every session they hold.
  *
  * Returns the new value so a caller that is also issuing a replacement token
- * (a self-service password change, say) can sign it against the bumped counter
+ * (a self-service password change, say) can bind it to the bumped counter
  * instead of locking itself out. The increment itself is one atomic statement
  * owned by the session store — this layer holds no transaction handle and
  * names no table, so a second backend implements the same capability.
@@ -125,9 +184,49 @@ function assertSessionPayload(payload: JwtPayload & { stage?: string }): void {
 	if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
 		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
 	}
+	// Only opaque sessions carry `sid`; a JWT claiming one is not ours.
+	if (payload.sid !== undefined) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
 }
 
+/**
+ * Resolve an opaque session token. Unlike a JWT this observes the live database, so the
+ * role is the account's current role and revocation is immediate.
+ */
+async function verifyOpaqueSessionToken(token: string): Promise<JwtPayload> {
+	const session = await authSessionStore.findSessionByTokenHash(hashSessionToken(token));
+	if (!session) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
+	if (
+		session.revokedAt !== null ||
+		!isSessionTokenVersionCurrent(session.sessionTokenVersion, session.userTokenVersion)
+	) {
+		throw new SessionTokenRevokedError("Session revoked");
+	}
+	const now = nowSeconds();
+	if (session.expiresAt <= now || now - session.sessionStart >= ABSOLUTE_SESSION_MAX_SECONDS) {
+		throw new SessionTokenExpiredError("Session expired");
+	}
+	return {
+		sub: session.userId,
+		role: session.role,
+		iat: session.createdAt,
+		exp: session.expiresAt,
+		[SESSION_START_CLAIM]: session.sessionStart,
+		[SESSION_VERSION_CLAIM]: session.sessionTokenVersion,
+		sid: session.id,
+	};
+}
+
+/**
+ * Verify a first-party session token: an opaque session, or a legacy HS256 session JWT
+ * still inside its lifetime. Legacy JWTs are no longer issued; remove the JWT branch
+ * once every one of them has expired (one `SESSION_TOKEN_TTL_SECONDS` after release).
+ */
 export async function verifyToken(token: string): Promise<JwtPayload> {
+	if (isOpaqueSessionToken(token)) return verifyOpaqueSessionToken(token);
 	const payload = (await verify(token, getJwtSecret(), "HS256")) as unknown as JwtPayload & {
 		stage?: string;
 	};
@@ -136,7 +235,7 @@ export async function verifyToken(token: string): Promise<JwtPayload> {
 }
 
 /**
- * Verify signature and shape while ignoring `exp`.
+ * Verify a legacy session JWT's signature and shape while ignoring `exp`.
  *
  * `hono/jwt` checks `exp` *before* the signature, so an arbitrarily forged token
  * with a past `exp` raises `JwtTokenExpired`. Reporting that as "your session
@@ -145,6 +244,7 @@ export async function verifyToken(token: string): Promise<JwtPayload> {
  * tells a genuinely expired session apart from a forgery.
  */
 export async function isAuthenticSessionTokenIgnoringExpiry(token: string): Promise<boolean> {
+	if (isOpaqueSessionToken(token)) return false;
 	try {
 		const payload = (await verify(token, getJwtSecret(), {
 			alg: "HS256",
@@ -155,6 +255,42 @@ export async function isAuthenticSessionTokenIgnoringExpiry(token: string): Prom
 	} catch {
 		return false;
 	}
+}
+
+/** Keep expired/revoked rows around this long, so a late request still reads "expired". */
+const STALE_SESSION_RETENTION_SECONDS = 24 * 60 * 60;
+const STALE_SESSION_BATCH = 500;
+const STALE_SESSION_MAX_BATCHES = 20;
+const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const SESSION_CLEANUP_TIMER_KEY = "narrafork.authSessionCleanupTimer";
+
+/** Delete stale sessions in bounded batches, yielding between them. */
+export async function pruneStaleSessions(): Promise<number> {
+	const before = nowSeconds() - STALE_SESSION_RETENTION_SECONDS;
+	let total = 0;
+	try {
+		for (let batch = 0; batch < STALE_SESSION_MAX_BATCHES; batch++) {
+			const deleted = await authSessionStore.deleteStaleSessions(before, STALE_SESSION_BATCH);
+			total += deleted;
+			if (deleted < STALE_SESSION_BATCH) break;
+			await Bun.sleep(0);
+		}
+	} catch (error) {
+		logger.warn("Failed to prune stale auth sessions", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	return total;
+}
+
+/** Sweep on startup, then hourly. `hotTimer` keeps --hot reloads from stacking intervals. */
+export function startSessionCleanupTimer(): ReturnType<typeof setInterval> {
+	void pruneStaleSessions();
+	return hotTimer(SESSION_CLEANUP_TIMER_KEY, () =>
+		setInterval(() => {
+			void pruneStaleSessions();
+		}, SESSION_CLEANUP_INTERVAL_MS),
+	);
 }
 
 export interface RegisterUserInput {
@@ -227,7 +363,7 @@ export async function registerUser(input: RegisterUserInput) {
 		closeRegistrationAfterFirstAdmin();
 	}
 
-	const token = await createToken(user.id, user.role);
+	const token = await createToken(user.id);
 	return { user, token, language: resolvedLang };
 }
 
@@ -303,7 +439,7 @@ export interface MfaChallenge {
 }
 
 /**
- * Build a fully-authenticated session result (real JWT + profile + language)
+ * Build a fully-authenticated session result (session token + profile + language)
  * for a user id. Shared by password login (no second factor) and the MFA
  * verify step (after the second factor is proven).
  */
@@ -315,7 +451,7 @@ export async function buildSessionResult(userId: string): Promise<LoginSuccess> 
 	// tokenVersion stays out of the returned user object: it is an internal revocation
 	// counter, not profile data the frontend has any use for.
 	const { tokenVersion, language: preferredLanguage, gitUsername, gitEmail, ...user } = profile;
-	const token = await createToken(user.id, user.role, tokenVersion);
+	const token = await createToken(user.id, tokenVersion);
 	return { user, token, language: normalizeLocale(preferredLanguage) };
 }
 

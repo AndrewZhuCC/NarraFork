@@ -1336,6 +1336,27 @@ export const users = pgTable("users", {
 	createdAt: text("created_at").notNull(),
 });
 
+export const authSessions = pgTable(
+	"auth_sessions",
+	{
+		id: text("id").primaryKey().notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		tokenHash: text("token_hash").notNull(),
+		tokenVersion: integer("token_version").notNull().default(0),
+		sessionStart: integer("session_start").notNull(),
+		createdAt: integer("created_at").notNull(),
+		expiresAt: integer("expires_at").notNull(),
+		revokedAt: integer("revoked_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_auth_sessions_token_hash").on(table.tokenHash),
+		index("idx_auth_sessions_user").on(table.userId),
+		index("idx_auth_sessions_expires").on(table.expiresAt),
+	],
+);
+
 export const userGitIdentities = pgTable(
 	"user_git_identities",
 	{
@@ -3886,8 +3907,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 122,
-  "columnCount": 1717,
+  "tableCount": 123,
+  "columnCount": 1725,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11910,6 +11931,121 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         }
       ],
       "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "authSessions",
+      "name": "auth_sessions",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "auth_sessions_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "tokenHash",
+          "name": "token_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "tokenVersion",
+          "name": "token_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "sessionStart",
+          "name": "session_start",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "expiresAt",
+          "name": "expires_at",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revokedAt",
+          "name": "revoked_at",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_auth_sessions_token_hash",
+          "columns": [
+            "tokenHash"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_auth_sessions_user",
+          "columns": [
+            "userId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_auth_sessions_expires",
+          "columns": [
+            "expiresAt"
+          ],
+          "unique": false
+        }
+      ],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],

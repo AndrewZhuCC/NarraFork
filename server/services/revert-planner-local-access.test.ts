@@ -20,6 +20,7 @@ import {
 	type FileChangeState,
 } from "@shared/file-change-protocol";
 import { eq, inArray } from "drizzle-orm";
+import { sign } from "hono/jwt";
 import { testEnvironment } from "../../tests/preload";
 import { app } from "../app";
 import { db, sqlite } from "../db";
@@ -170,8 +171,8 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 			})
 			.run();
 	});
-	token = await createToken(userId, "user");
-	otherToken = await createToken(otherId, "user");
+	token = await createToken(userId);
+	otherToken = await createToken(otherId);
 	settings.chapters.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
 	owner.runtime = runtime;
@@ -2355,14 +2356,20 @@ describe("real requireAuth and conjunctive ACL", () => {
 			expect((await http(endpoint, "GET", undefined, otherToken)).status).toBe(404);
 		expect(history()).toBe(before);
 	});
-	test("existing JWT with a changed database role fails even through the session cache", async () => {
+	test("legacy JWT with a changed database role fails even through the session cache", async () => {
 		await fixture();
-		await http("revert-plans", "POST", request({ unexpected: true }));
+		// Legacy session JWTs carry the role from issuance; opaque sessions read it live.
+		const issuedAt = Math.floor(Date.now() / 1000);
+		const legacy = await sign(
+			{ sub: userId, role: "user", iat: issuedAt, exp: issuedAt + 3600, sst: issuedAt, sv: 0 },
+			settings.auth.jwtSecret,
+		);
+		await http("revert-plans", "POST", request({ unexpected: true }), legacy);
 		db.update(schema.users).set({ role: "admin" }).where(eq(schema.users.id, userId)).run();
 		restorers.push(() => {
 			db.update(schema.users).set({ role: "user" }).where(eq(schema.users.id, userId)).run();
 		});
-		await refused(await prepare(), "REVERT_PREVIEW_AUTHENTICATION_CHANGED");
+		await refused(await prepare({}, legacy), "REVERT_PREVIEW_AUTHENTICATION_CHANGED");
 	});
 	test("project gate cannot be bypassed by owning the narrator", async () => {
 		await fixture();

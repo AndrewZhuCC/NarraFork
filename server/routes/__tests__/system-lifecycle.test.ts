@@ -30,7 +30,7 @@ beforeEach(async () => {
 			createdAt: new Date().toISOString(),
 		});
 		invalidateUserCache(id);
-		const token = await createToken(id, role);
+		const token = await createToken(id);
 		if (role === "admin") admin = token;
 		else member = token;
 	}

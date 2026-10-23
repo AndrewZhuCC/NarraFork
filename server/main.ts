@@ -1062,7 +1062,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 						return new Response("WebSocket upgrade failed", { status: 400 });
 					}
 
-					// Verify JWT from query param
+					// Verify the session token from the query param
 					const token = url.searchParams.get("token");
 					if (!token) {
 						return new Response("Authentication required", { status: 401 });
@@ -1701,6 +1701,11 @@ startSkillCacheCleanupTimer();
 import { startChallengeCleanupTimer } from "./lib/webauthn";
 
 startChallengeCleanupTimer();
+
+// Periodically delete expired and revoked login sessions.
+import { startSessionCleanupTimer } from "./lib/auth";
+
+startSessionCleanupTimer();
 
 // Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
 import {

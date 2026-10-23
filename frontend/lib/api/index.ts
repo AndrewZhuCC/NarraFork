@@ -80,6 +80,7 @@ export {
 	authorizedFetch,
 	clearToken,
 	clearTokenOnSessionFailure,
+	endSession,
 	getToken,
 	isAbortError,
 	readFetchError,

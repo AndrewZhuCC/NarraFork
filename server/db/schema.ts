@@ -2461,6 +2461,34 @@ export const users = sqliteTable("users", {
 	createdAt: text("created_at").notNull(),
 });
 
+// === auth_sessions ===
+// First-party login sessions. The bearer credential is an opaque random token; only its
+// SHA-256 is stored, so neither a leaked database nor a leaked instance secret yields a
+// usable session. Times are unix seconds, matching the session lifetime constants in
+// `shared/session-auth.ts`.
+export const authSessions = sqliteTable(
+	"auth_sessions",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		tokenHash: text("token_hash").notNull(),
+		/** `users.token_version` at issuance; the session dies once the user's counter passes it. */
+		tokenVersion: integer("token_version").notNull().default(0),
+		/** Original login instant. Sliding renewal never moves it (absolute session ceiling). */
+		sessionStart: integer("session_start").notNull(),
+		createdAt: integer("created_at").notNull(),
+		expiresAt: integer("expires_at").notNull(),
+		revokedAt: integer("revoked_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_auth_sessions_token_hash").on(table.tokenHash),
+		index("idx_auth_sessions_user").on(table.userId),
+		index("idx_auth_sessions_expires").on(table.expiresAt),
+	],
+);
+
 // === user_git_identities ===
 // A user's reusable git commit identities (a `user.name` / `user.email` pair).
 // Commits are attributed through `GIT_AUTHOR_*`/`GIT_COMMITTER_*` (see

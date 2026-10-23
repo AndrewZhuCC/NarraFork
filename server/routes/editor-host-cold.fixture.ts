@@ -130,7 +130,7 @@ if (config.manifest) {
 	bundle = await manifestFile.json();
 }
 const assets = new Map(bundle.assets);
-const token = await createToken(config.userId, "user");
+const token = await createToken(config.userId);
 let dropReply = false,
 	blockQuery = false,
 	failSettlement = false,

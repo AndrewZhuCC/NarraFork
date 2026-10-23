@@ -1,26 +1,37 @@
 /**
  * Shared contract between the server auth middleware and the frontend API client
- * for first-party session JWTs.
+ * for first-party session tokens.
  *
- * Two problems this solves:
- *  1. Not every 401 means "your session is gone". Second-factor verification
- *     failures, OAuth-only boundaries and consent-page login hints all answer
- *     401 while the caller's session is still perfectly valid. Clearing the
- *     stored token on those responses logs the user out for no reason, so the
- *     client only discards a token when the error code is in
- *     `SESSION_INVALID_ERROR_CODES`.
- *  2. Session JWTs have a fixed lifetime and no refresh token, so an active user
- *     was forced to re-login every time the window elapsed. The server now
- *     re-signs a token when it is close to expiry and returns it in
- *     `SESSION_RENEWAL_HEADER`; the client swaps it in transparently.
+ * Session tokens are opaque random strings prefixed with `SESSION_TOKEN_PREFIX`. The
+ * server stores only their SHA-256 in `auth_sessions`, so a session cannot be forged
+ * from any instance secret, and a single session can be revoked on its own.
+ *
+ * Session JWTs issued before opaque tokens existed are still accepted for one token
+ * lifetime. The first authenticated request carrying one gets an opaque replacement in
+ * `SESSION_RENEWAL_HEADER`; the client swaps it in transparently. Opaque sessions slide
+ * their expiry server-side and never need a replacement token.
+ *
+ * Not every 401 means "your session is gone". Second-factor verification failures,
+ * OAuth-only boundaries and consent-page login hints all answer 401 while the caller's
+ * session is still perfectly valid. Clearing the stored token on those responses logs
+ * the user out for no reason, so the client only discards a token when the error code
+ * is in `SESSION_INVALID_ERROR_CODES`.
  */
+
+/** Prefix that marks a first-party opaque session token. */
+export const SESSION_TOKEN_PREFIX = "nfs_";
+
+/** Whether a bearer string is an opaque first-party session token (by shape only). */
+export function isOpaqueSessionToken(token: string): boolean {
+	return token.startsWith(SESSION_TOKEN_PREFIX);
+}
 
 /**
  * Error codes that mean the presented session credential itself is no longer
  * usable. Only these justify dropping the locally stored token.
  */
 export const SESSION_INVALID_ERROR_CODES = [
-	// Session JWT expired past its lifetime.
+	// Session expired past its lifetime, or was revoked.
 	"TOKEN_EXPIRED",
 	// Missing/invalid Authorization header, unverifiable token, or the user row
 	// backing the token no longer exists.
@@ -52,14 +63,14 @@ export function isSessionInvalidResponse(
 	return SESSION_INVALID_ERROR_CODE_SET.has(code);
 }
 
-/** Response header carrying a re-signed session JWT for sliding renewal. */
+/** Response header carrying the opaque replacement for a legacy session JWT. */
 export const SESSION_RENEWAL_HEADER = "X-NarraFork-Session-Token";
 
-/** Total lifetime of a session JWT. */
+/** Lifetime of a session without activity. */
 export const SESSION_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 /**
- * Renew a session JWT once its remaining lifetime drops below this threshold.
+ * Renew a session once its remaining lifetime drops below this threshold.
  * At 3 days against a 7-day TTL, any user who touches the app at least once a
  * week keeps a valid session indefinitely, while an abandoned session still
  * expires within the original window.
@@ -67,12 +78,12 @@ export const SESSION_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const SESSION_RENEWAL_THRESHOLD_SECONDS = 3 * 24 * 60 * 60;
 
 /**
- * Absolute ceiling on a renewal chain, measured from the original login instant
- * recorded in `SESSION_START_CLAIM`.
+ * Absolute ceiling on a session, measured from the original login instant
+ * (`auth_sessions.session_start`, or `SESSION_START_CLAIM` on a legacy JWT).
  *
- * Sliding renewal alone turns a 7-day JWT into an unbounded bearer credential:
- * any request inside the renewal window mints a new token, so a stolen token
- * stays alive forever as long as it is touched occasionally. This ceiling caps
+ * Sliding renewal alone turns a 7-day session into an unbounded bearer credential:
+ * any request inside the renewal window extends it, so a stolen token stays alive
+ * forever as long as it is touched occasionally. This ceiling caps
  * the whole chain — after 30 days the user must authenticate again, no matter
  * how active the session was.
  */
@@ -80,15 +91,16 @@ export const ABSOLUTE_SESSION_MAX_SECONDS = 30 * 24 * 60 * 60;
 
 /**
  * Claim carrying the session-start time (unix seconds) of the original login.
- * It is copied verbatim into every renewed token and must never be reset by a
- * renewal, otherwise the absolute ceiling below could be slid forward forever.
+ * Legacy JWTs carry it; the verified payload of an opaque session carries the
+ * stored value under the same name. It must never be reset by a renewal,
+ * otherwise the absolute ceiling could be slid forward forever.
  */
 export const SESSION_START_CLAIM = "sst";
 
 /**
- * Claim carrying `users.token_version` as it stood when the token was signed.
+ * Claim carrying `users.token_version` as it stood when the session was issued.
  *
- * This is what makes a self-contained JWT revocable: bumping the column leaves every
+ * Bumping the column leaves every
  * outstanding token behind, so a password change or an explicit "sign out everywhere"
  * takes effect on the next request instead of waiting out the token's lifetime.
  */

@@ -1,5 +1,9 @@
 import { apiUrl } from "@frontend/lib/base-path";
-import { isSessionInvalidResponse, SESSION_RENEWAL_HEADER } from "@shared/session-auth";
+import {
+	isOpaqueSessionToken,
+	isSessionInvalidResponse,
+	SESSION_RENEWAL_HEADER,
+} from "@shared/session-auth";
 
 /**
  * The API root, resolved against the app's mount prefix.
@@ -33,7 +37,8 @@ export class ApiError extends Error {
  *
  * Exists for the editor-host bridge (`lib/host-bridge.ts`), which mirrors the token into
  * VS Code's SecretStorage. A one-shot injection at panel load is not enough: the server
- * re-signs the token as it nears expiry and `absorbRenewedToken` swaps it mid-session, so
+ * replaces a legacy session JWT with an opaque token and `absorbRenewedToken` swaps it
+ * mid-session, so
  * a host copy taken at load time goes stale on its own. The staleness surfaces later and
  * somewhere else — the NEXT panel injects an expired token and the user is bounced to the
  * login screen with nothing explaining why — which is why the notification lives at the
@@ -78,63 +83,54 @@ export function clearToken(): void {
 }
 
 /**
- * Read a JWT's `exp` without verifying it.
+ * Sign out: revoke the stored session on the server, then forget it locally.
  *
- * Only used to order two tokens the server already signed, so no signature check
- * is needed — but the input is still treated as untrusted: anything that is not
- * a three-part token with a numeric `exp` yields null and is refused below.
+ * The revocation is fire-and-forget with `keepalive`, because callers navigate away
+ * immediately. If it never arrives, the session still expires on its own.
  */
-function readTokenExp(token: string): number | null {
-	const parts = token.split(".");
-	if (parts.length !== 3) return null;
-	try {
-		const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-		const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
-		const payload = JSON.parse(atob(padded)) as unknown;
-		if (!payload || typeof payload !== "object") return null;
-		const exp = (payload as { exp?: unknown }).exp;
-		return typeof exp === "number" && Number.isFinite(exp) ? exp : null;
-	} catch {
-		return null;
+export function endSession(): void {
+	const token = getToken();
+	if (token) {
+		void fetch(apiUrl("/api/auth/logout"), {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+			keepalive: true,
+		}).catch(() => {});
 	}
+	clearToken();
 }
 
 /**
- * Pick up a slid session token from any authenticated response.
+ * Pick up an opaque session token that replaces a legacy session JWT.
  *
- * The server re-signs the session JWT when it nears expiry and returns it in
- * `SESSION_RENEWAL_HEADER`. Storing it here means every code path that talks to
- * the API — `request`, `authorizedFetch`, SSE and upload helpers — keeps the
- * session alive just by passing its response through.
+ * Session JWTs issued before opaque session tokens existed stay valid for their
+ * remaining lifetime, and the server answers any authenticated request carrying one
+ * with an opaque replacement in `SESSION_RENEWAL_HEADER`. Storing it here means every
+ * code path that talks to the API — `request`, `authorizedFetch`, SSE and upload
+ * helpers — completes the switch just by passing its response through. Opaque
+ * sessions slide their expiry server-side, so no further replacement ever arrives.
  *
- * Two orderings have to be defended against, because parallel requests inside
- * the renewal window each get their own independently signed token and the
- * responses can land in any order:
- *  - a token that is not strictly newer than the stored one is discarded, so the
- *    last response to arrive cannot install the earliest-issued token;
- *  - `expectedToken` (the credential the request was actually sent with) turns
- *    the write into a compare-and-swap, so a renewal for account A cannot
- *    overwrite a session that has since been replaced by account B's.
+ * Only a legacy token is ever replaced, and `expectedToken` (the credential the request
+ * was actually sent with) turns the write into a compare-and-swap, so a late response
+ * for account A cannot overwrite a session that has since become account B's.
  */
 export function absorbRenewedToken(response: Response, expectedToken?: string | null): void {
 	const renewed = response.headers.get(SESSION_RENEWAL_HEADER);
 	if (!renewed) return;
-	// A renewal only ever accompanies a successful response. The server strips the
+	// A replacement only ever accompanies a successful response. The server strips the
 	// header from 401s; refusing it here too keeps a "store then clear" race from
 	// resurrecting a session that the same response invalidated.
 	if (!response.ok) return;
+	if (!isOpaqueSessionToken(renewed)) return;
 
 	const current = getToken();
-	// Only replace an existing session. A renewal arriving after the user logged
+	// Only replace an existing session. A replacement arriving after the user logged
 	// out in another tab must not silently resurrect the session.
 	if (!current) return;
+	// Already on an opaque session: nothing to upgrade.
+	if (isOpaqueSessionToken(current)) return;
 	// Compare-and-swap: the session must still be the one this request used.
 	if (expectedToken !== undefined && expectedToken !== null && current !== expectedToken) return;
-
-	const renewedExp = readTokenExp(renewed);
-	if (renewedExp === null) return;
-	const currentExp = readTokenExp(current);
-	if (currentExp !== null && renewedExp <= currentExp) return;
 
 	setToken(renewed);
 }

@@ -232,6 +232,14 @@
 			"prevId": "8b50bffe-308c-45db-9e1c-64c73f06c646",
 			"version": "7",
 			"snapshotDigest": "ec7d2682b1a4c006cfeb6c8997022f6a15972e0629ef5bdfe4b646b0d802ae90"
+		},
+		{
+			"idx": 29,
+			"tag": "0029_auth_sessions",
+			"id": "8016a01d-520f-44ea-a3e9-ff25a82968c9",
+			"prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
+			"version": "7",
+			"snapshotDigest": "edd18c50d4a7805eacf591aeedb1276128664046176bbc143e39de16ca4d05f4"
 		}
 	]
 }

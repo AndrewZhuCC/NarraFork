@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
- * Sliding session renewal, exercised through the real app so the response header
- * is observed exactly as a browser would see it (middleware order, Hono response
+ * Session tokens through the real app: legacy session JWTs being upgraded to opaque
+ * sessions, and opaque sessions sliding, revoking and expiring. The response header is
+ * observed exactly as a browser would see it (middleware order, Hono response
  * construction and the global error handler all included).
  *
  * NARRAFORK_HOME is redirected to a temp directory before the app is imported so
@@ -20,7 +21,7 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 const [
 	{ app },
 	{ db },
-	{ users },
+	{ authSessions, users },
 	{ eq },
 	{ sign },
 	{ generateId },
@@ -33,7 +34,8 @@ const [
 		SESSION_TOKEN_TTL_SECONDS,
 		SESSION_VERSION_CLAIM,
 	},
-	{ revokeUserSessions, verifyToken },
+	{ createToken, revokeUserSessions, verifyToken },
+	{ hashSessionToken },
 	{ invalidateUserCache },
 ] = await Promise.all([
 	import("../../app"),
@@ -45,6 +47,7 @@ const [
 	import("../../lib/settings"),
 	import("@shared/session-auth"),
 	import("../../lib/auth"),
+	import("../../lib/session-token-hash"),
 	import("../auth"),
 ]);
 
@@ -54,7 +57,7 @@ let userId = "";
 /** How long into the renewal window a "nearly expired" test token sits. */
 const NEARLY_EXPIRED_REMAINING = SESSION_RENEWAL_THRESHOLD_SECONDS - 3600;
 
-/** Sign a session JWT whose remaining lifetime is exactly `remainingSeconds`. */
+/** Sign a legacy session JWT whose remaining lifetime is exactly `remainingSeconds`. */
 async function sessionTokenExpiringIn(
 	remainingSeconds: number,
 	options?: {
@@ -112,45 +115,35 @@ afterAll(async () => {
 	rmSync(testHome, { recursive: true, force: true });
 });
 
-describe("sliding session renewal", () => {
-	test("issues a fresh token when the current one nears expiry", async () => {
-		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING);
-		const response = await authGet("/api/auth/me", nearlyExpired);
-		expect(response.status).toBe(200);
+describe("legacy session JWT upgrade", () => {
+	test("answers any valid legacy JWT with an opaque replacement", async () => {
+		for (const remaining of [SESSION_TOKEN_TTL_SECONDS, NEARLY_EXPIRED_REMAINING]) {
+			const legacy = await sessionTokenExpiringIn(remaining);
+			const response = await authGet("/api/auth/me", legacy);
+			expect(response.status).toBe(200);
 
-		const renewed = response.headers.get(SESSION_RENEWAL_HEADER);
-		expect(renewed).toBeString();
-		expect(renewed).not.toBe(nearlyExpired);
-
-		// The replacement must be a valid session token for the same principal,
-		// with a lifetime reset to the full window.
-		const payload = await verifyToken(renewed as string);
-		expect(payload.sub).toBe(userId);
-		expect(payload.role).toBe("user");
-		const nowSeconds = Math.floor(Date.now() / 1000);
-		expect(payload.exp - nowSeconds).toBeGreaterThan(SESSION_RENEWAL_THRESHOLD_SECONDS);
+			const replacement = response.headers.get(SESSION_RENEWAL_HEADER);
+			expect(replacement).toMatch(/^nfs_/);
+			const payload = await verifyToken(replacement as string);
+			expect(payload.sub).toBe(userId);
+			expect(payload.role).toBe("user");
+			const nowSeconds = Math.floor(Date.now() / 1000);
+			expect(payload.exp - nowSeconds).toBeGreaterThan(SESSION_RENEWAL_THRESHOLD_SECONDS);
+		}
 	});
 
-	test("leaves a freshly issued token untouched", async () => {
-		const fresh = await sessionTokenExpiringIn(SESSION_TOKEN_TTL_SECONDS);
-		const response = await authGet("/api/auth/me", fresh);
-		expect(response.status).toBe(200);
-		expect(response.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
-	});
+	test("the replacement authenticates and is never replaced again", async () => {
+		const legacy = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING);
+		const first = await authGet("/api/auth/me", legacy);
+		const replacement = first.headers.get(SESSION_RENEWAL_HEADER) as string;
+		expect(replacement).toBeString();
 
-	test("the renewed token authenticates subsequent requests", async () => {
-		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING);
-		const first = await authGet("/api/auth/me", nearlyExpired);
-		const renewed = first.headers.get(SESSION_RENEWAL_HEADER) as string;
-		expect(renewed).toBeString();
-
-		const second = await authGet("/api/auth/me", renewed);
+		const second = await authGet("/api/auth/me", replacement);
 		expect(second.status).toBe(200);
-		// The replacement is far from expiry, so it must not renew again.
 		expect(second.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
 	});
 
-	test("an expired token is rejected as TOKEN_EXPIRED and gets no renewal", async () => {
+	test("an expired token is rejected as TOKEN_EXPIRED and gets no replacement", async () => {
 		const expired = await sessionTokenExpiringIn(-60);
 		const response = await authGet("/api/auth/me", expired);
 		expect(response.status).toBe(401);
@@ -158,7 +151,7 @@ describe("sliding session renewal", () => {
 		expect(await response.json()).toMatchObject({ code: "TOKEN_EXPIRED" });
 	});
 
-	test("an unauthenticated request gets no renewal", async () => {
+	test("an unauthenticated request gets no replacement", async () => {
 		const response = await app.request("/api/auth/me");
 		expect(response.status).toBe(401);
 		expect(response.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
@@ -166,7 +159,7 @@ describe("sliding session renewal", () => {
 });
 
 describe("absolute session ceiling", () => {
-	test("carries the original session start through every renewal", async () => {
+	test("carries the original session start into the replacement", async () => {
 		const sessionStart = Math.floor(Date.now() / 1000) - 10 * 24 * 60 * 60;
 		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, { sessionStart });
 		const response = await authGet("/api/auth/me", nearlyExpired);
@@ -174,12 +167,12 @@ describe("absolute session ceiling", () => {
 		expect(renewed).toBeString();
 
 		const payload = (await verifyToken(renewed)) as unknown as Record<string, unknown>;
-		// The anchor must not slide forward, otherwise the ceiling can be pushed
-		// out forever one renewal at a time.
+		// The anchor must not slide forward, otherwise the upgrade would grant a fresh
+		// 30-day ceiling.
 		expect(payload[SESSION_START_CLAIM]).toBe(sessionStart);
 	});
 
-	test("stops renewing once the chain exceeds the absolute maximum", async () => {
+	test("issues no replacement once the session exceeds the absolute maximum", async () => {
 		const sessionStart = Math.floor(Date.now() / 1000) - ABSOLUTE_SESSION_MAX_SECONDS - 60;
 		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, { sessionStart });
 		const response = await authGet("/api/auth/me", nearlyExpired);
@@ -189,9 +182,8 @@ describe("absolute session ceiling", () => {
 		expect(response.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
 	});
 
-	test("repeated renewal terminates instead of extending forever", async () => {
-		// Walk a chain that is one renewal short of the ceiling: the first request
-		// renews, and a token anchored a hair past the ceiling no longer does.
+	test("the ceiling boundary decides whether a replacement is issued", async () => {
+		// A token just inside the ceiling is upgraded; one a hair past it is not.
 		const nowSeconds = Math.floor(Date.now() / 1000);
 		const almostOver = nowSeconds - (ABSOLUTE_SESSION_MAX_SECONDS - 120);
 		const first = await authGet(
@@ -217,18 +209,18 @@ describe("absolute session ceiling", () => {
 
 		const payload = (await verifyToken(renewed)) as unknown as Record<string, unknown>;
 		const anchor = payload[SESSION_START_CLAIM] as number;
-		// Legacy sessions get one more full window rather than an immediate logout,
+		// Unanchored sessions get one more full window rather than an immediate logout,
 		// but they are anchored from here on.
 		expect(anchor).toBeGreaterThanOrEqual(before);
 		expect(anchor).toBeLessThanOrEqual(Math.floor(Date.now() / 1000));
 	});
 });
 
-describe("renewal reflects live authorization state", () => {
-	test("renews with the database role, not the role in the presented token", async () => {
+describe("the upgrade reflects live authorization state", () => {
+	test("the replacement carries the database role, not the role in the presented token", async () => {
 		// The user was demoted to `user` in the database but still holds an admin
 		// token. Copying the presented role would freeze the stale admin grant into
-		// an endless renewal chain.
+		// the new session.
 		const staleAdmin = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, { role: "admin" });
 		const response = await authGet("/api/auth/me", staleAdmin);
 		expect(response.status).toBe(200);
@@ -239,7 +231,7 @@ describe("renewal reflects live authorization state", () => {
 		expect(payload.role).toBe("user");
 	});
 
-	test("refuses to renew (and rejects) a token whose user row is gone", async () => {
+	test("refuses to upgrade (and rejects) a token whose user row is gone", async () => {
 		const ghostId = generateId();
 		const ghostToken = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, { sub: ghostId });
 		invalidateUserCache(ghostId);
@@ -249,7 +241,7 @@ describe("renewal reflects live authorization state", () => {
 	});
 });
 
-describe("renewal never rides on a cacheable response", () => {
+describe("a replacement never rides on a cacheable response", () => {
 	test("skips paths that answer with a public or long-lived Cache-Control", async () => {
 		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING);
 		// These routes serve `public`/`immutable` (uploads, notification sounds) or a
@@ -264,7 +256,7 @@ describe("renewal never rides on a cacheable response", () => {
 			expect(response.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
 		}
 
-		// Control: an ordinary JSON route on the same token does renew, so the
+		// Control: an ordinary JSON route on the same token does get one, so the
 		// assertions above are about the path filter and not about the token.
 		const control = await authGet("/api/auth/me", nearlyExpired);
 		expect(control.headers.get(SESSION_RENEWAL_HEADER)).toBeString();
@@ -364,7 +356,7 @@ describe("session revocation via token generation", () => {
 		expect(after.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
 	});
 
-	test("a revoked token cannot be renewed even inside the renewal window", async () => {
+	test("a revoked token is never upgraded", async () => {
 		const current = await resetGeneration();
 		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, {
 			tokenVersion: current,
@@ -387,7 +379,7 @@ describe("session revocation via token generation", () => {
 		expect((await authGet("/api/auth/me", reissued)).status).toBe(200);
 	});
 
-	test("renewal signs the replacement against the live generation", async () => {
+	test("the replacement is bound to the live generation", async () => {
 		const current = await resetGeneration();
 		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, {
 			tokenVersion: current,
@@ -397,8 +389,8 @@ describe("session revocation via token generation", () => {
 		expect(renewed).toBeString();
 
 		const payload = (await verifyToken(renewed)) as unknown as Record<string, unknown>;
-		// Copying the presented claim instead of reading it live would let a renewal chain
-		// outlive a bump that landed while the chain was in flight.
+		// Copying the presented claim instead of reading it live would let the new session
+		// outlive a bump that landed while the upgrade was in flight.
 		expect(payload[SESSION_VERSION_CLAIM]).toBe(current);
 		expect((await authGet("/api/auth/me", renewed)).status).toBe(200);
 	});
@@ -450,5 +442,71 @@ describe("session revocation via token generation", () => {
 			settings.auth.jwtSecret,
 		);
 		expect((await authGet("/api/auth/me", malformed)).status).toBe(401);
+	});
+});
+
+describe("opaque sessions", () => {
+	async function resetUser(): Promise<number> {
+		await db.update(users).set({ tokenVersion: 0 }).where(eq(users.id, userId));
+		invalidateUserCache(userId);
+		return 0;
+	}
+
+	async function setExpiry(token: string, expiresAt: number): Promise<void> {
+		await db
+			.update(authSessions)
+			.set({ expiresAt })
+			.where(eq(authSessions.tokenHash, hashSessionToken(token)));
+	}
+
+	test("slide their expiry server-side inside the renewal window, without a new token", async () => {
+		const token = await createToken(userId, await resetUser());
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		await setExpiry(token, nowSeconds + NEARLY_EXPIRED_REMAINING);
+
+		const response = await authGet("/api/auth/me", token);
+		expect(response.status).toBe(200);
+		expect(response.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
+		const payload = await verifyToken(token);
+		expect(payload.exp - nowSeconds).toBeGreaterThan(SESSION_RENEWAL_THRESHOLD_SECONDS);
+	});
+
+	test("an expired session reports TOKEN_EXPIRED", async () => {
+		const token = await createToken(userId, await resetUser());
+		await setExpiry(token, Math.floor(Date.now() / 1000) - 60);
+		const response = await authGet("/api/auth/me", token);
+		expect(response.status).toBe(401);
+		expect(await response.json()).toMatchObject({ code: "TOKEN_EXPIRED" });
+	});
+
+	test("logout revokes the presenting session and no other", async () => {
+		const version = await resetUser();
+		const token = await createToken(userId, version);
+		const other = await createToken(userId, version);
+		const logout = await app.request("/api/auth/logout", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(logout.status).toBe(200);
+
+		const after = await authGet("/api/auth/me", token);
+		expect(after.status).toBe(401);
+		expect(await after.json()).toMatchObject({ code: "TOKEN_EXPIRED" });
+		expect((await authGet("/api/auth/me", other)).status).toBe(200);
+	});
+
+	test("a generation bump revokes them immediately", async () => {
+		const token = await createToken(userId, await resetUser());
+		expect((await authGet("/api/auth/me", token)).status).toBe(200);
+		await revokeUserSessions(userId);
+		const after = await authGet("/api/auth/me", token);
+		expect(after.status).toBe(401);
+		expect(await after.json()).toMatchObject({ code: "TOKEN_EXPIRED" });
+	});
+
+	test("an unknown opaque token is UNAUTHORIZED", async () => {
+		const response = await authGet("/api/auth/me", `nfs_${"A".repeat(43)}`);
+		expect(response.status).toBe(401);
+		expect(await response.json()).toMatchObject({ code: "UNAUTHORIZED" });
 	});
 });

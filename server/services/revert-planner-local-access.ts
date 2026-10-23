@@ -69,7 +69,8 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			.from(users)
 			.where(eq(users.id, principal.userId))
 			.get();
-		// requireSessionAuth verifies the JWT; this closes its cached-user/stale-role window.
+		// A legacy session JWT carries its issuance role behind a cached user check; this
+		// closes that stale-role window. Opaque sessions already resolve the role live.
 		if (
 			!user ||
 			!["user", "admin"].includes(user.role) ||

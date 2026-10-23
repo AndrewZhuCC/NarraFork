@@ -7,8 +7,8 @@
  * (`composePostgresStores`), so the whole loop runs on the stores production itself would
  * hold:
  *
- *   register → login → session JWT → session-middleware verification → sliding
- *   renewal → MFA enrollment/status/enable → MFA-gated login → tokenVersion
+ *   register → login → opaque session → session-middleware verification → legacy
+ *   JWT upgrade → MFA enrollment/status/enable → MFA-gated login → tokenVersion
  *   revocation — write and read never splitting across engines.
  *
  * The SQLite half of every semantic is pinned by
@@ -24,7 +24,7 @@
  *   - migrations are applied by the production runtime, EXACTLY as the disk journal
  *     specifies (no psql relay, no hand-applied baseline);
  *   - the container is the harness' own random name and only it is cleaned up;
- *   - sensitive values (plaintext password, issued JWTs, backup codes, the TOTP
+ *   - sensitive values (plaintext password, issued tokens, backup codes, the TOTP
  *     secret, the connection URL) must not appear in any captured log line.
  */
 
@@ -259,8 +259,8 @@ async function runLoop(
 			);
 		});
 
-		// ── 3. The session middleware verifies the issued JWT ────────────────
-		await check("the session gate accepts the JWT and rejects non-credentials", async () => {
+		// ── 3. The session middleware verifies the issued session token ──────
+		await check("the session gate accepts the session and rejects non-credentials", async () => {
 			expect((await authGet(adminToken)).status).toBe(200);
 
 			const noHeader = await authGet();
@@ -280,8 +280,8 @@ async function runLoop(
 			landmarks.middleware = "200+401+401";
 		});
 
-		// ── 4. Sliding renewal re-signs inside the window ────────────────────
-		await check("a near-expiry token is renewed; the renewal authenticates", async () => {
+		// ── 4. A legacy session JWT is upgraded to an opaque session on PG ───
+		await check("a legacy JWT is upgraded; the replacement authenticates", async () => {
 			const now = Math.floor(Date.now() / 1000);
 			const state = await authStores.authSessionStore.findSessionState(adminId);
 			const nearlyExpired = await sign(

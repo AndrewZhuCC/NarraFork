@@ -102,6 +102,12 @@ describe("looksLikeSessionToken", () => {
 		expect(looksLikeSessionToken(TOKEN_A)).toBe(true);
 	});
 
+	it("accepts an opaque session token and rejects a malformed one", () => {
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(43)}`)).toBe(true);
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}`)).toBe(false);
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}.`)).toBe(false);
+	});
+
 	it("rejects values that could not be a token", () => {
 		// Refusing these keeps an arbitrary string from being parked in storage and later
 		// sent out as a credential.
