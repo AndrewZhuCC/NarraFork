@@ -1464,9 +1464,10 @@ reconcile(narrator, target, now):
 | 阶段 | `body_format = 2` 信封的 `content_json` | 回退方式 |
 |---|---|---|
 | P1–P2 | 写入完整的派生投影 | 关闭 `narratorBlocks.read` 开关，读取方回到 `content_json` |
-| P3 | 继续写派生投影（D8）。确认稳定后再单独立项：新行写 `'[]'`，旧行由第二个作业清空 | 清空之前一直可以直接回退；清空之后需要先运行「重组作业」，由块回写 `content_json` |
+| P3 | 继续写派生投影（D8）。P3b 起可开 `narratorBlocks.compactJson`：新行写 `'[]'` 并置 `body_rows_only = 1`（compact 标记除外），旧行由管理员启动的 `clear` 作业清空 | 关闭开关后新行恢复写投影；已清空的由 `restore` 作业从块写回，之后才能关闭 `narratorBlocks.read` |
 
 - 这一列本身不删除。重建带触发器的表需要一次带版本的重装迁移，收益不值得这个代价。
+- 只要存在只存行的信封，读者就一直读块，读开关不生效；回退顺序是关 `compactJson` → 运行 `restore` → 关 `read`。
 - 清空释放出的空间，只能在管理员维护窗口里用 `/api/storage/database/vacuum` 回收。
 
 ### 10.5 对外格式
@@ -1482,9 +1483,9 @@ reconcile(narrator, target, now):
 | `narratorBlocks.write` | store 写块表（双写） | P1 |
 | `narratorBlocks.read` | 读取方读块表 | P2 |
 | `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5）；默认开，关闭即回到 v1（前端两种都处理） | P2 |
-| `narratorBlocks.compactJson` | 新行的 `content_json` 写 `'[]'` | P3 |
+| `narratorBlocks.compactJson` | 新行的 `content_json` 写 `'[]'`（`body_rows_only = 1`）；只在 SQLite 且 `write`、`read` 都开时生效，默认关 | P3b |
 
-每个开关都可以单独关闭。P3 之前，关闭 `narratorBlocks.read` 就完全回到现状。
+每个开关都可以单独关闭。P3 之前，关闭 `narratorBlocks.read` 就完全回到现状；P3b 之后，存在只存行的信封时须先运行 `restore`。
 
 ## 11. 实施阶段
 
@@ -1696,7 +1697,7 @@ reconcile(narrator, target, now):
 ### P3 退役与新能力
 
 **交付**
-1. 新行的 `content_json` 写 `'[]'`；运行清空旧行的作业；删除 `compact_pending` 的读取方。
+1. 新行的 `content_json` 写 `'[]'`；运行清空旧行的作业。compact 标记保留投影，`compact_pending` 及其读取方不变（见 P3b 实现说明）。
 2. 退役信封级 FTS：删除 `narrator_messages_fts` 及其触发器，搜索只查块级索引。
 3. 解码路径保留一个版本后删除，只留给 project.db 旧归档导入使用。
 4. 按需开放新能力：
@@ -1729,6 +1730,36 @@ reconcile(narrator, target, now):
   - 审计与回填 verify 只对非紧凑信封以列为基准。
   - 由队列从列建行的写入在 P3b 继续写完整投影；清空作业只处理行已当前的信封。
   - `compactJson` 只在 `narratorBlocks.read` 开启且为 SQLite 时生效。
+
+**P3b 实现说明（只存行的信封）**
+- **标记**：`narrator_messages.body_rows_only`（默认 0）。为 1 时 `content_json` 是 `'[]'`，正文只在块行里。
+  - 用单独的列，而不是新的 `body_format` 值或 `'[]'` 哨兵：这些信封仍是 `body_format = 2`，触发器契约 v3 原样适用，不需要 v4。
+  - 部分索引 `idx_messages_rows_only` 让"是否存在只存行的信封"只是一次索引探测（`hasRowsOnlyBodies`，主线程缓存为 `rowsOnlyEnvelopesExist`）。
+- **写入**：开关生效时（`rowsOnlyWrites`：SQLite，`compactJson`、`write`、`read` 都开），正文层（`insertEnvelope`、`writeEnvelopeBody`）与 `patchEnvelopeState` 按 `storedProjection` 存列。
+  - 块格式、数组正文、不是 compact 标记：存 `'[]'`，标记置 1。
+  - 其他情况：存完整投影，标记置 0。开关关闭后，下一次重写就把投影写回。
+  - 由队列从列建行的写入（`insertEnvelopeQueued` 批量复制、revert 预编译语句、导入）继续写完整投影，并把标记置 0。
+- **compact 标记保留投影**：首元素类型为 `compact` 或 `segment_compact` 的标记（`keepsProjection`），包括 compact、plan、clear 与段压缩，始终写完整投影。`compact_pending` 生成列、启动恢复与 fork 排除因此不用改。
+- **读取与同步**：
+  - `blocksCurrentSql` / `blocksCurrent` 把只存行的信封视为行当前，排队时也一样。账本变化入队期间，读者与无正文的同步都读行，不需要让队列区分写入来源。
+  - `writeBlockStates` 对只存行的信封不推迟到队列。
+  - 审计、回填 verify、`resyncFromColumn` 与图片扫描的列分支都跳过只存行的信封。
+- **读开关**：只要存在只存行的信封，`blockReadsEnabled()` 就保持为真，读开关不会把读者带到空列上。原先自己判断读开关的读者也改走同一规则：模型历史源、消息页、导出、External API 推理读取、revert 选择与提交。
+- **作业**（`narrator-block-backfill.ts`）：与 convert / verify 共用游标表，CHECK 扩为四个作业。由管理员在存储页启动，一次只跑一个；行初始为暂停；重启后已启动的作业继续。
+  - `clear`：要求开关生效，且 convert、verify 已完成。
+    - db-worker 找出块组装结果与列完全一致的块格式信封，跳过 compact 标记与排队中的信封。
+    - 主线程只在 `body_revision`、`state_revision` 与读取时相同、且信封不在队列中时，才置 `'[]'` 和标记 1。
+    - 不一致的信封记入诊断表，并按列重建，与 verify 相同。
+  - `restore`：要求开关关闭。
+    - db-worker 由行组装出投影。
+    - 主线程只在 revision 与行签名都与读取时相同时写回，并把标记置 0。行签名由各行的 id、revision 与 state 长度按 ordinal 组成，覆盖了只改 state、不推进任何 revision 的同步重写。
+    - 每遍走到最后一个只存行的信封。没有剩余即完成；否则从头再来一遍；从头开始的一整遍没有写回任何信封，就停下并记日志。
+  - 两个作业都是仅状态写入（推进 `state_revision`）：模型可见内容和块行都不变，不 bump、不入队。读取后作业被停止或前置条件消失，这一片就不落库。
+  - API：`POST /api/storage/blocks/projection`，参数为 `clear`、`restore` 或 `stop`。进度接口给出两个作业的状态、各自缺少的前置条件，以及是否存在只存行的信封。
+- **测试**：
+  - `narrator-rows-only.test.ts`：读者、排队、账本、状态写入、审计、读开关，以及开关开启时的写入与 compact 标记。
+  - `narrator-projection-jobs.test.ts`：清空与恢复、前置条件、读取后被改写的信封被跳过、中途关开关、两作业互斥。
+  - 把开关默认值临时改为开启，跑了相关测试：余下的失败都是测试本身直接读写 `content_json`。
 
 ## 12. 风险与成本
 
