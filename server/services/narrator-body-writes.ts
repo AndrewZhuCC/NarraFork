@@ -3,9 +3,10 @@
  * (docs/BLOCK_STORAGE-DESIGN.md §10.4, P3a).
  *
  * A block-format envelope keeps its body as block rows; `content_json` is the projection
- * written alongside them (D8). A writer hands the body it writes to these functions
- * instead of the column, and the rows are built from what it handed over, never read back
- * from the column. So what the column holds can change (P3b) without any writer noticing:
+ * written alongside them (D8), or `[]` when the envelope is rows-only (`body_rows_only`,
+ * `narratorBlocks.compactJson`, P3b; `storedProjection` decides). A writer hands the body
+ * it writes to these functions instead of the column, and the rows are built from what it
+ * handed over, never read back from the column:
  *
  *   - `insertEnvelope` (`insertEnvelopeIfAbsent`): a new envelope with its body; its rows
  *     are built in the same transaction. `insertEnvelopeQueued` leaves a bulk copy's rows
@@ -24,6 +25,7 @@ import { narratorMessages } from "../db/schema";
 import {
 	type BlockStamp,
 	type SyncMode,
+	storedProjection,
 	syncCopiedEnvelope,
 	syncEnvelopeNow,
 } from "./narrator-block-sync";
@@ -48,7 +50,7 @@ export interface BodySync {
  * Returns the row as stored, with the body it was given.
  */
 export function insertEnvelope(tx: BodyTx, values: NewEnvelope, sync: InsertSync = {}): Envelope {
-	return built(tx.insert(narratorMessages).values(values).returning().get(), values, sync);
+	return built(tx.insert(narratorMessages).values(stored(values)).returning().get(), values, sync);
 }
 
 /** `insertEnvelope` unless an envelope with its id exists already (then undefined). */
@@ -57,7 +59,12 @@ export function insertEnvelopeIfAbsent(
 	values: NewEnvelope,
 	sync: InsertSync = {},
 ): Envelope | undefined {
-	const row = tx.insert(narratorMessages).values(values).onConflictDoNothing().returning().get();
+	const row = tx
+		.insert(narratorMessages)
+		.values(stored(values))
+		.onConflictDoNothing()
+		.returning()
+		.get();
 	return row ? built(row, values, sync) : undefined;
 }
 
@@ -68,7 +75,14 @@ export function insertEnvelopeIfAbsent(
  * insert queues it; readers read the column until the sweep has built its rows.
  */
 export function insertEnvelopeQueued(tx: BodyTx, values: NewEnvelope): void {
-	tx.insert(narratorMessages).values(values).run();
+	tx.insert(narratorMessages)
+		.values({ ...values, bodyRowsOnly: 0 })
+		.run();
+}
+
+/** The values an envelope is inserted with: its column as `storedProjection` decides. */
+function stored(values: NewEnvelope): NewEnvelope {
+	return { ...values, ...storedProjection(values.bodyFormat, values.contentJson) };
 }
 
 type InsertSync = BodySync & { rows?: () => void; copyOf?: string };
@@ -114,9 +128,16 @@ export function writeEnvelopeBody(
 	options: BodySync & { set?: Partial<NewEnvelope>; where?: SQL; rows?: () => void } = {},
 ): boolean {
 	const target = eq(narratorMessages.id, messageId);
+	const bodyFormat =
+		options.set?.bodyFormat ??
+		tx
+			.select({ bodyFormat: narratorMessages.bodyFormat })
+			.from(narratorMessages)
+			.where(target)
+			.get()?.bodyFormat;
 	const written = tx
 		.update(narratorMessages)
-		.set({ ...options.set, contentJson: content })
+		.set({ ...options.set, ...storedProjection(bodyFormat, content) })
 		.where(options.where ? and(target, options.where) : target)
 		.returning({ id: narratorMessages.id })
 		.get();

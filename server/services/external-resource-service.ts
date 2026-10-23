@@ -22,7 +22,7 @@ import {
 	SUBAGENT_SUMMARY_INPUT_KEYS,
 } from "@shared/subagent-tool-summary";
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or, type SQL, sql } from "drizzle-orm";
-import { activeDatabaseBackend, db } from "../db";
+import { db } from "../db";
 import {
 	integrationResourceBindings,
 	narratorMessageRefs,
@@ -42,7 +42,6 @@ import {
 	type OAuthExternalPermissionMode,
 	type OAuthNarratorProvisionSnapshot,
 } from "../lib/oauth-client-policy";
-import { settings } from "../lib/settings";
 import {
 	EXTERNAL_V1_DEFAULT_LIMIT,
 	EXTERNAL_V1_MAX_CURSOR_BYTES,
@@ -75,6 +74,7 @@ import {
 	listIntegrationProjects,
 	toIntegrationDeviceSummary,
 } from "./integration-resource-service";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import {
 	createPreparedNarratorInTransaction,
 	// Reached through `narratorService` rather than by importing `narrator-messages`
@@ -1334,7 +1334,7 @@ async function findUnscannableReasoningMessages(
 
 /** Read block-format bodies from their rows: SQLite only, where blocks are written. */
 function reasoningFromBlocks(): boolean {
-	return settings.narratorBlocks.read && activeDatabaseBackend === "sqlite";
+	return blockReadsEnabled();
 }
 
 /** Exported for tests: both scans read legacy content and block rows alike. */

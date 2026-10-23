@@ -36,9 +36,9 @@ const ROOT = join(import.meta.dir, "..", "..", "..");
 /** Raw body accesses per file, and why they are there. */
 const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// The body layer.
-	"server/services/narrator-body-writes.ts": { count: 7, why: "body writes" },
+	"server/services/narrator-body-writes.ts": { count: 6, why: "body writes" },
 	"server/services/narrator-block-sync.ts": {
-		count: 4,
+		count: 3,
 		why: "the dual-write audit, column resync",
 	},
 	"server/lib/narrator-bodies.ts": { count: 6, why: "body reads off the main thread" },

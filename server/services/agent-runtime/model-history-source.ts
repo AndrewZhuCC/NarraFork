@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import type { SQL } from "bun";
 import { compiledWorkerSpecifiers } from "../../lib/compiled-worker";
 import { hotSafe } from "../../lib/hot-safe";
+import { hasRowsOnlyBodies } from "../../lib/narrator-bodies";
 import { isCompiledRuntime } from "../../lib/runtime-target";
 import { settings } from "../../lib/settings";
 import { modelHistoryManifest } from "./model-history-delta";
@@ -100,6 +101,14 @@ const state = hotSafe("narrator.modelHistorySource.v1", () => {
 // miss these maps and must take the fully validated cold path before they can be reused.
 state.sourceSignatures ??= new WeakMap<ModelHistorySource, SourceSignatureRecord>();
 state.workerSpecifier ??= null;
+
+/**
+ * Whether block-format bodies are read from their rows: with `narratorBlocks.read`, or while
+ * the database holds rows-only envelopes, which have nothing else to read.
+ */
+function blockBodies(sqlite: Database): boolean {
+	return settings.narratorBlocks.read || hasRowsOnlyBodies(sqlite);
+}
 
 /** Order of a message's ledger rows: creation (call) order, ids breaking ties. */
 function compareToolRows(a: ModelToolSourceRow, b: ModelToolSourceRow): number {
@@ -318,7 +327,7 @@ async function readWorker(
 						limit: options.limit,
 						maxBytes: MODEL_HISTORY_MAX_BYTES,
 						versioned,
-						bodiesFromBlocks: backend.backend === "sqlite" && settings.narratorBlocks.read,
+						bodiesFromBlocks: backend.backend === "sqlite" && blockBodies(backend.sqlite),
 						previous: previous ? modelHistoryManifest(previous.source) : undefined,
 						previousCatalogIdentity: previous?.catalogIdentity,
 						...(backend.backend === "sqlite"
@@ -410,7 +419,7 @@ export async function loadModelHistorySource(
 			maxBytes: 1024 * 1024,
 			inlineRowBytes: 64 * 1024,
 			versioned: before.trusted,
-			bodiesFromBlocks: settings.narratorBlocks.read,
+			bodiesFromBlocks: blockBodies(backend.sqlite),
 		});
 	else {
 		let loaded: Awaited<ReturnType<typeof readWorker>>;

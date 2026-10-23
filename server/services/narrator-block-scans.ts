@@ -20,7 +20,7 @@
 
 import { parseStored } from "@shared/narrator-blocks/plan";
 import * as database from "../db";
-import { blocksCurrentSql } from "../lib/narrator-bodies";
+import { blocksCurrentSql, hasRowsOnlyBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 
 /**
@@ -37,13 +37,9 @@ export function blockReadsEnabled(): boolean {
 
 let rowsOnlyKnown: boolean | undefined;
 
-/** Whether any envelope is rows-only; cached, found through `idx_messages_rows_only`. */
+/** Whether any envelope is rows-only (`hasRowsOnlyBodies`), cached. */
 export function rowsOnlyEnvelopesExist(): boolean {
-	rowsOnlyKnown ??= !!database.sqlite
-		.query(
-			"SELECT 1 FROM narrator_messages INDEXED BY idx_messages_rows_only WHERE body_rows_only = 1 LIMIT 1",
-		)
-		.get();
+	rowsOnlyKnown ??= hasRowsOnlyBodies(database.sqlite);
 	return rowsOnlyKnown;
 }
 

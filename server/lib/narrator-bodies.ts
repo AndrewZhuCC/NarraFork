@@ -43,6 +43,18 @@ export function hasBlockStorage(db: Database): boolean {
 }
 
 /**
+ * Whether the database holds rows-only envelopes (P3b): their `content_json` holds no body,
+ * so they are read from their rows whatever the read switch says. Answered by the partial
+ * index `idx_messages_rows_only`, which holds exactly these.
+ */
+export function hasRowsOnlyBodies(db: Database): boolean {
+	return (
+		hasBlockStorage(db) &&
+		!!db.query("SELECT 1 FROM narrator_messages WHERE body_rows_only = 1 LIMIT 1").get()
+	);
+}
+
+/**
  * Whether the envelope at `alias` reads from its block rows: it is rows-only, or its rows
  * are current (no write outside the store waits on the sync, and it has rows).
  */

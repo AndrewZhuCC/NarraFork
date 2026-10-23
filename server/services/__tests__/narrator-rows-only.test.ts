@@ -24,6 +24,8 @@ const { queryModelHistory, sqliteHistoryQuery } = await import(
 	"../agent-runtime/model-history-query"
 );
 const { runDisplayPageQuery } = await import("../../lib/db-worker/display-page-query");
+const { loadModelHistorySource } = await import("../agent-runtime/model-history-source");
+const { exportBodiesFromBlocks } = await import("../narrator-export");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
@@ -188,6 +190,10 @@ describe("rows-only envelopes", () => {
 		settings.narratorBlocks.read = false;
 		expect(scans.blockReadsEnabled()).toBe(true);
 		expect(bodies.readEnvelopeBody(db, stepId)).toEqual(body);
+		// Readers that decide for themselves (model history, export) follow the same rule.
+		const source = await loadModelHistorySource({ backend: "sqlite", sqlite }, "n1");
+		expect(source.messages.find((m) => m.id === stepId)?.contentJson).toEqual(body);
+		expect(exportBodiesFromBlocks()).toBe(true);
 		// Once none is rows-only, the switch takes effect again.
 		sqlite.run("UPDATE narrator_messages SET content_json = ?, body_rows_only = 0 WHERE id = ?", [
 			JSON.stringify(body),
@@ -195,5 +201,95 @@ describe("rows-only envelopes", () => {
 		]);
 		scans.noteRowsOnlyEnvelopes(undefined);
 		expect(scans.blockReadsEnabled()).toBe(false);
+	});
+});
+
+describe("with compactJson on", () => {
+	beforeEach(() => {
+		settings.narratorBlocks.compactJson = true;
+	});
+	afterEach(() => {
+		settings.narratorBlocks.compactJson = false;
+	});
+
+	test("new envelopes keep their body only in their rows", async () => {
+		const { inputId, stepId } = await conversation();
+		for (const id of [inputId, stepId]) expect(column(id)).toEqual({ c: "[]", r: 1 });
+		expect(assembled(inputId)).toEqual([{ type: "text", text: "list the files" }]);
+		const history = await modelBodies(true);
+		expect(history.get(inputId)).toEqual(assembled(inputId));
+		expect(history.get(stepId)).toEqual(assembled(stepId));
+		expect((assembled(stepId) as Array<{ type: string }>).map((e) => e.type)).toEqual([
+			"reasoning",
+			"tool_use",
+		]);
+	});
+
+	test("compact markers keep their projection, so their lifecycle stays visible", async () => {
+		await narratorStore.appendInput("n1", "before the compact");
+		const marker = await narratorPersistence.persistCompactingMessage("n1");
+		expect(column(marker.id).r).toBe(0);
+		expect(
+			sqlite
+				.prepare("SELECT compact_pending AS p FROM narrator_messages WHERE id = ?")
+				.get(marker.id),
+		).toEqual({ p: 1 });
+		await narratorPersistence.finalizeCompactingMessage(marker.id, "n1", "summary");
+		expect(column(marker.id).r).toBe(0);
+		expect(JSON.parse(column(marker.id).c)[0]).toMatchObject({
+			type: "compact",
+			summary: "summary",
+		});
+	});
+
+	test("a copy of a shared rows-only envelope is rows-only and holds the same body", async () => {
+		const { stepId } = await conversation();
+		sqlite.run(
+			"INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('n2', 'B', ?, ?)",
+			[NOW, NOW],
+		);
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('r2', 'n2', ?, 0)",
+			[stepId],
+		);
+		const body = assembled(stepId);
+		const copyId = await narratorPersistence.copyOnWriteMessage("n2", stepId, {
+			contentText: "copied",
+		});
+		expect(copyId).not.toBe(stepId);
+		expect(column(copyId)).toEqual({ c: "[]", r: 1 });
+		expect(assembled(copyId)).toEqual(body);
+	});
+
+	test("edits and state writes keep a rows-only envelope rows-only", async () => {
+		const { stepId } = await conversation();
+		await narratorPersistence.patchReasoningTranslation(stepId, 0, "pensando", {
+			id: "r1",
+			text: "thinking",
+		});
+		expect(column(stepId)).toEqual({ c: "[]", r: 1 });
+		expect(assembled(stepId)[0]).toMatchObject({ translatedText: "pensando" });
+		await narratorService.deleteMessageBlock("n1", stepId, 0, { skipRevert: true });
+		expect(column(stepId)).toEqual({ c: "[]", r: 1 });
+		expect((assembled(stepId) as Array<{ type: string }>).map((e) => e.type)).toEqual(["tool_use"]);
+	});
+
+	test("once the switch is off, the next rewrite writes the projection back", async () => {
+		const { inputId } = await conversation();
+		expect(column(inputId).r).toBe(1);
+		settings.narratorBlocks.compactJson = false;
+		const edited = [{ type: "text", text: "edited" }];
+		await narratorPersistence.copyOnWriteMessage("n1", inputId, {
+			contentJson: edited,
+			contentText: "edited",
+		});
+		expect(column(inputId)).toEqual({ c: JSON.stringify(edited), r: 0 });
+		expect(assembled(inputId)).toEqual(edited);
+	});
+
+	test("the switch has no effect while block reads are off", async () => {
+		settings.narratorBlocks.read = false;
+		const { inputId } = await conversation();
+		expect(column(inputId).r).toBe(0);
 	});
 });

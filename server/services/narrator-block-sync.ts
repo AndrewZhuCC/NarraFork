@@ -47,7 +47,7 @@ import { logger } from "../lib/logger";
 import { bodySql, readBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import { blockIdForElement, reassignBlockIdForElement } from "./narrator-block-ids";
-import { blockReadsEnabled } from "./narrator-block-scans";
+import { blockReadsEnabled, noteRowsOnlyEnvelopes } from "./narrator-block-scans";
 import { activeTurnId } from "./narrator-turns";
 
 /** How incomplete output and reasoning are read: still streaming, sealed, or as they were. */
@@ -64,6 +64,50 @@ export function newEnvelopeFormat(): 1 | 2 {
 	if (!settings.narratorBlocks?.write || !hasBlockSchema()) return 1;
 	startSweep();
 	return 2;
+}
+
+// === What the column stores (§10.4, P3b) ===
+
+/**
+ * Whether new block-format bodies are kept only in their rows: `narratorBlocks.compactJson`
+ * on SQLite, with block writes and reads both on.
+ */
+export function rowsOnlyWrites(): boolean {
+	const blocks = settings.narratorBlocks;
+	return (
+		database.activeDatabaseBackend === "sqlite" &&
+		!!blocks?.compactJson &&
+		!!blocks.write &&
+		!!blocks.read &&
+		hasBlockSchema()
+	);
+}
+
+/**
+ * Compact markers (compact, plan, clear, segment compact) keep their projection: their
+ * lifecycle is read from `content_json` (the `compact_pending` column behind startup
+ * recovery and fork exclusion).
+ */
+const PROJECTED_MARKERS = new Set(["compact", "segment_compact"]);
+
+/**
+ * The `content_json` and `body_rows_only` an envelope of `bodyFormat` is stored with for
+ * `content`: `[]` and 1 when its body is kept only in its rows (`rowsOnlyWrites`, a
+ * block-format envelope that is not a compact marker), the body itself and 0 otherwise.
+ */
+export function storedProjection(
+	bodyFormat: number | null | undefined,
+	content: unknown,
+): { contentJson: unknown; bodyRowsOnly: 0 | 1 } {
+	const first = Array.isArray(content) ? (content[0] as { type?: unknown } | undefined) : undefined;
+	const rowsOnly =
+		bodyFormat === 2 &&
+		Array.isArray(content) &&
+		!PROJECTED_MARKERS.has(String(first?.type)) &&
+		rowsOnlyWrites();
+	if (!rowsOnly) return { contentJson: content, bodyRowsOnly: 0 };
+	noteRowsOnlyEnvelopes(true);
+	return { contentJson: [], bodyRowsOnly: 1 };
 }
 
 /** Columns every newly written envelope gets: its format and its run (§3.6). */
@@ -564,15 +608,13 @@ function sameDerivedColumns(before: BlockDraft[], after: BlockDraft[]): boolean 
  * Write the new `state` of the rows a state-only write changed, in place. Rows that do not
  * line up with the content (a sync still owed) are rebuilt from it instead.
  */
-function writeBlockStates(messageId: string, drafts: BlockDraft[]): void {
+function writeBlockStates(messageId: string, drafts: BlockDraft[], wasRowsOnly: boolean): void {
 	// A sync still owed rebuilds the rows from content_json, state included — unless the
-	// envelope is rows-only: its column holds nothing, so its rows take the state now.
+	// envelope was rows-only: the rows are what the state was patched on, so they take it now.
 	if (
+		!wasRowsOnly &&
 		database.sqlite
-			.prepare(
-				`SELECT 1 FROM narrator_block_sync_queue q JOIN narrator_messages m ON m.id = q.message_id
-				 WHERE q.message_id = ? AND m.body_rows_only = 0`,
-			)
+			.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
 			.get(messageId)
 	)
 		return;
@@ -649,19 +691,33 @@ export function patchEnvelopeState(
 		const stateOnly =
 			isStateOnlyChange(content, next) &&
 			sameDerivedColumns(splitEnvelope({ ...message, contentJson: content }).blocks, after);
+		// The column takes what the envelope stores: `[]` when its body is kept in its rows.
+		const stored = storedProjection(row.bodyFormat, next);
+		const marked = hasBlockSchema();
+		const wasRowsOnly =
+			marked &&
+			!!(
+				database.sqlite
+					.prepare("SELECT body_rows_only AS r FROM narrator_messages WHERE id = ?")
+					.get(messageId) as { r: number } | null
+			)?.r;
+		const set = `content_json = ?${marked ? ", body_rows_only = ?" : ""}`;
+		const values = [
+			JSON.stringify(stored.contentJson),
+			...(marked ? [stored.bodyRowsOnly] : []),
+			messageId,
+		];
 		if (!stateOnly) {
-			database.sqlite
-				.prepare("UPDATE narrator_messages SET content_json = ? WHERE id = ?")
-				.run(json, messageId);
+			database.sqlite.prepare(`UPDATE narrator_messages SET ${set} WHERE id = ?`).run(...values);
 			if (row.bodyFormat === 2) syncEnvelopeNow(messageId, "keep", {}, next);
 			return true;
 		}
 		database.sqlite
 			.prepare(
-				"UPDATE narrator_messages SET content_json = ?, state_revision = state_revision + 1 WHERE id = ?",
+				`UPDATE narrator_messages SET ${set}, state_revision = state_revision + 1 WHERE id = ?`,
 			)
-			.run(json, messageId);
-		if (row.bodyFormat === 2 && hasBlockSchema()) writeBlockStates(messageId, after);
+			.run(...values);
+		if (row.bodyFormat === 2 && marked) writeBlockStates(messageId, after, wasRowsOnly);
 		return true;
 	})();
 }
