@@ -11,6 +11,10 @@
  *     it is flipped without rows instead, and the store's sync builds them.
  *   - `verify` then walks block-format envelopes and records any whose rows do not
  *     assemble to its stored content in `narrator_block_diagnostics`, re-syncing it.
+ *   - `reindex` (P3c) then rewrites every block-format envelope's block search index text,
+ *     as the sync computes it, in small slices on the main thread. The envelope index
+ *     retires once it has completed (`ensureFts`), which also starts it over when the block
+ *     index has to be cleared.
  *
  * Two more are started from the storage page (P3b, §10.4), one at a time:
  *
@@ -53,11 +57,16 @@ import { logger } from "../lib/logger";
 import { hasRowsOnlyBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import { noteRowsOnlyEnvelopes, rowsOnlyEnvelopesExist } from "./narrator-block-scans";
-import { resyncFromColumn, rowsOnlyWrites, syncEnvelopeNow } from "./narrator-block-sync";
+import {
+	reindexEnvelope,
+	resyncFromColumn,
+	rowsOnlyWrites,
+	syncEnvelopeNow,
+} from "./narrator-block-sync";
 
 /** The admin-started jobs that drop or write back envelopes' projections (P3b). */
 export type ProjectionJob = "clear" | "restore";
-export type BlockJob = "convert" | "verify" | ProjectionJob;
+export type BlockJob = "convert" | "verify" | "reindex" | ProjectionJob;
 const PROJECTION_JOBS: readonly ProjectionJob[] = ["clear", "restore"];
 
 const MAX_SLICE_ENVELOPES = 100;
@@ -330,8 +339,46 @@ async function verifySlice(reader: SliceReader): Promise<void> {
 }
 
 /**
- * Run one slice of whichever job has work: convert first, then verify. Returns whether a
- * slice ran (false when both are complete or paused).
+ * One slice of `reindex`: the next block-format envelopes have their blocks' search index text
+ * rewritten from their rows and ledger, as many as fit the inline budget. On the main thread
+ * because the sync computes the text, in the same transaction that reads what it indexes.
+ */
+function reindexSlice(): void {
+	const job = jobState("reindex");
+	const candidates = database.sqlite
+		.prepare(
+			`SELECT rowid, id, body_bytes AS bytes FROM narrator_messages
+			 WHERE rowid > ? AND body_format = 2 ORDER BY rowid LIMIT ?`,
+		)
+		.all(job.cursor, INLINE_SLICE_ENVELOPES) as Array<{ rowid: number; id: string; bytes: number }>;
+	const started = performance.now();
+	database.sqlite.transaction(() => {
+		let lastRowid = job.cursor;
+		let bytes = 0;
+		let handled = 0;
+		for (const row of candidates) {
+			if (
+				handled > 0 &&
+				(bytes + row.bytes > INLINE_SLICE_SOURCE_BYTES ||
+					performance.now() - started > APPLY_TARGET_MS)
+			)
+				break;
+			reindexEnvelope(row.id);
+			bytes += row.bytes;
+			handled++;
+			lastRowid = row.rowid;
+		}
+		const done = handled === candidates.length && candidates.length < INLINE_SLICE_ENVELOPES;
+		advance("reindex", lastRowid, handled, done);
+	})();
+	const elapsedMs = performance.now() - started;
+	if (elapsedMs > APPLY_TARGET_MS * 4)
+		logger.warn("Slow block reindex slice", { elapsedMs: Math.round(elapsedMs) });
+}
+
+/**
+ * Run one slice of whichever job has work: convert first, then verify, then reindex.
+ * Returns whether a slice ran (false when all are complete or paused).
  */
 export async function runBlockJobSlice(reader: SliceReader = workerReader): Promise<boolean> {
 	if (!hasSchema()) return false;
@@ -343,8 +390,14 @@ export async function runBlockJobSlice(reader: SliceReader = workerReader): Prom
 		return true;
 	}
 	const verify = jobState("verify");
-	if (verify.complete || verify.paused) return false;
-	await verifySlice(reader);
+	if (!verify.complete) {
+		if (verify.paused) return false;
+		await verifySlice(reader);
+		return true;
+	}
+	const reindex = jobState("reindex");
+	if (reindex.complete || reindex.paused) return false;
+	reindexSlice();
 	return true;
 }
 
@@ -399,6 +452,7 @@ export interface BlockBackfillStatus {
 	available: boolean;
 	convert: BlockJobState | null;
 	verify: BlockJobState | null;
+	reindex: BlockJobState | null;
 	clear: BlockJobState | null;
 	restore: BlockJobState | null;
 	/** What a projection job needs that is missing (`projectionBlocked`), or null. */
@@ -418,6 +472,7 @@ export function blockBackfillStatus(): BlockBackfillStatus {
 			available: false,
 			convert: null,
 			verify: null,
+			reindex: null,
 			clear: null,
 			restore: null,
 			blocked: { clear: "unavailable", restore: "unavailable" },
@@ -442,6 +497,7 @@ export function blockBackfillStatus(): BlockBackfillStatus {
 		available: true,
 		convert: jobState("convert"),
 		verify: jobState("verify"),
+		reindex: jobState("reindex"),
 		clear: jobState("clear"),
 		restore: jobState("restore"),
 		blocked: { clear: projectionBlocked("clear"), restore: projectionBlocked("restore") },
@@ -453,14 +509,15 @@ export function blockBackfillStatus(): BlockBackfillStatus {
 	};
 }
 
-/** Pause or resume both jobs; resuming restarts them. */
+/** Pause or resume the background jobs; resuming restarts them. */
 export function setBlockBackfillPaused(paused: boolean): BlockBackfillStatus {
 	if (hasSchema()) {
 		jobState("convert");
 		jobState("verify");
+		jobState("reindex");
 		database.sqlite
 			.prepare(
-				"UPDATE narrator_block_backfill SET paused = ?, updated_at = ? WHERE job IN ('convert', 'verify')",
+				"UPDATE narrator_block_backfill SET paused = ?, updated_at = ? WHERE job IN ('convert', 'verify', 'reindex')",
 			)
 			.run(paused ? 1 : 0, new Date().toISOString());
 		if (!paused) startBlockBackfill();

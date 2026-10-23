@@ -516,6 +516,8 @@ export interface BlockBackfillStatus {
 	available: boolean;
 	convert: BlockJobState | null;
 	verify: BlockJobState | null;
+	/** Rewrites every block's search index text; the message index retires after it. */
+	reindex: BlockJobState | null;
 	/** Drops verified messages' duplicate `content_json` (admin-started). */
 	clear: BlockJobState | null;
 	/** Writes it back from the block rows (admin-started). */

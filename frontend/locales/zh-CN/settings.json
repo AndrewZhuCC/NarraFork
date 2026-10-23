@@ -2132,6 +2132,7 @@
 	"storageBlocksDescription": "旧消息会在后台迁移到块存储。只改变存储方式，对话内容不变。",
 	"storageBlocksConvert": "正在转换旧消息",
 	"storageBlocksVerify": "正在校验已转换的消息",
+	"storageBlocksReindex": "正在为搜索重建消息索引",
 	"storageBlocksProcessed_one": "{{count}} 条消息",
 	"storageBlocksProcessed_other": "{{count}} 条消息",
 	"storageBlocksComplete": "已完成",

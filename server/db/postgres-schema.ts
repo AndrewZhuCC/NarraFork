@@ -1045,7 +1045,10 @@ export const narratorBlockBackfill = pgTable(
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
-		check("ck_block_backfill_job", sql.raw("\"job\" in ('convert', 'verify', 'clear', 'restore')")),
+		check(
+			"ck_block_backfill_job",
+			sql.raw("\"job\" in ('convert', 'verify', 'reindex', 'clear', 'restore')"),
+		),
 	],
 );
 
@@ -9761,7 +9764,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "checkDefinitions": [
         {
           "name": "ck_block_backfill_job",
-          "expression": "\"job\" in ('convert', 'verify', 'clear', 'restore')"
+          "expression": "\"job\" in ('convert', 'verify', 'reindex', 'clear', 'restore')"
         }
       ],
       "foreignKeys": [],

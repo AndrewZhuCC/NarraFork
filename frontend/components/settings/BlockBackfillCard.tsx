@@ -60,10 +60,11 @@ export function BlockBackfillCard() {
 
 	if (!data?.available) return null;
 	const paused = !!data.convert?.paused;
-	const done = !!data.convert?.complete && !!data.verify?.complete;
+	const done = !!data.convert?.complete && !!data.verify?.complete && !!data.reindex?.complete;
 	const jobs = [
 		{ key: "convert", label: t("storageBlocksConvert"), job: data.convert },
 		{ key: "verify", label: t("storageBlocksVerify"), job: data.verify },
+		{ key: "reindex", label: t("storageBlocksReindex"), job: data.reindex },
 	];
 	// A projection job is listed once started; one runs at a time.
 	const projectionJobs = [
