@@ -335,8 +335,8 @@ const QUIET_STOP_REASONS = new Set(["stop", "end_turn", "completed"]);
 
 /**
  * A served request that ended without content and without a fault: the model chose to
- * say nothing. For a bot after a tool round that is how a turn ends — its answers went
- * out through Send, and the transcript is not a channel — so it is not an empty reply.
+ * say nothing. After some tool rounds that is how a turn ends (see `handsOffWork`), so
+ * it is not an empty reply.
  */
 function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): boolean {
 	if (kind === "empty_response_usage_only") return true;
@@ -344,6 +344,16 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
 		kind === "empty_response_stop_without_content" &&
 		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
 	);
+}
+
+/**
+ * A tool call that hands work or words to someone else — an agent, a background command,
+ * a message. Whatever comes next arrives later as its own input, so after a round with
+ * one the model may rightly have nothing to add yet.
+ */
+function handsOffWork(toolUse: AgentToolUse): boolean {
+	if (toolUse.name === "Send" || toolUse.name === "Agent") return true;
+	return isBashToolName(toolUse.name) && toolUse.input.run_in_background === true;
 }
 
 /**
@@ -2850,6 +2860,11 @@ async function* agentLoopInMetadataSnapshot(
 	 */
 	let toolsPlanModeDisabled = planModeDisablesTools();
 	let turnIndex = 0;
+	/**
+	 * The last round ran tools after which an empty reply is a finish, not a fault: any
+	 * tool round of a bot (it answers through Send), or one that handed work off.
+	 */
+	let quietFinishAllowed = false;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
 	const silentToolCallThreshold = normalizeSilentToolCallThreshold(config.silentToolCallThreshold);
 	let silentToolCallCount = 0;
@@ -6505,6 +6520,7 @@ async function* agentLoopInMetadataSnapshot(
 					commitInput();
 					nextTurnContent = buildReflectionCorrectionPrompt(config);
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					continue turnLoop;
 				}
@@ -6553,11 +6569,8 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
-					// A bot answers through Send({ user }); once a tool round has run, a model
-					// with nothing left to say for the transcript is done, not failing.
 					if (
-						config.bot &&
-						turnIndex > 0 &&
+						quietFinishAllowed &&
 						requestStarted &&
 						!lastRetryErrorMessage &&
 						isQuietFinish(emptyKind, emptySignals)
@@ -6957,6 +6970,7 @@ async function* agentLoopInMetadataSnapshot(
 					// there is no pending input to re-send. Open a fresh turn that nudges
 					// the model to continue, so the loop can make progress.
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					queueLoopNotice("continue_prompt");
 					await flushLoopInjections();
@@ -7114,6 +7128,7 @@ async function* agentLoopInMetadataSnapshot(
 					// No tools ran, so the boundary below is skipped: deliver the notice here.
 					await flushLoopInjections();
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					continue;
 				}
@@ -7135,6 +7150,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (assistantText) transcript.appendStep([{ type: "text", text: assistantText }]);
 				nextTurnContent = buildReflectionCorrectionPrompt(config);
 				yield { type: "turn_complete", turnIndex };
+				quietFinishAllowed = false;
 				turnIndex++;
 				continue;
 			}
@@ -7451,6 +7467,7 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			yield { type: "turn_complete", turnIndex };
+			quietFinishAllowed = !!config.bot || toolUses.some(handsOffWork);
 			turnIndex++;
 		} catch (error) {
 			activeRequestDump?.finish({ status: "error", error: extractErrorMessage(error) });

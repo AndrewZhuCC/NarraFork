@@ -26,7 +26,7 @@
 
 - **入站**：在 bot 房间发言就是在 bot 的输入框里打字。`chat-service.postMessage` 先把发言交给 `bot-chat.admitBotPost`，**bot 接下了才记录**：走与 bot 输入框相同的 `acceptUserMessage`（忙时排队、空闲时开轮）；bot 接不下（队列满、文件复制失败、bot 没有工作目录却带了附件）时这次发言整体被拒，房间里什么都不记，内容和附件草稿仍留在发言人的输入框里可以重发——和输入框的报错一致，而不是房间显示了一条 bot 从没收到的消息。同一个 bot 的发言串行（`AsyncMutex`），接收顺序就是房间的 seq 顺序。作者是发言人，所以模型从普通的 `<sender kind="human" id="…" name="…">` 标记读出是谁在说话；回复以 `> 引文` 前置，附件复制进 bot 工作目录 `.narrafork/attached/` 并附 `<attached_files>` 提示（与讨论房间转发同一布局；被拒时复制品会删掉）。聊天文字按原文投递（`executionIntent.literal`）：`/new …`、`/goal …` 只是一句话，不会被当成会话命令。bot 自己的消息永远不会回投给它。
 - **出站**：`Send({ user, message })` 只对 bot 提供（`AgentConfig.bot` 决定 schema；`sendAsBot` 重新读取 trait 作为权威检查）。按用户名解析（精确匹配优先，其次大小写不敏感的唯一匹配，忽略前导 `@`），写入 `postBotMessage`：`sender_narrator_id` 记作者，`sender_user_id` 为空。**只能发给能打开这个 bot 的人**（与 `resolveBotRoom` 同一门槛）：否则收件人收到一条来自任意名字、既查不到来源也无法回复的消息。权限层对 bot 的 `Send({ user })` 自动放行（`shouldAutoAllowSendWithinScope`）——那是它唯一的声音。
-- **不等没人看得见的人**：没人读 bot 的会话记录，所以创建时给它存一层运行时上限（`BOT_RUNTIME_CEILING`，与委派模板同一机制）：禁用 AskUserQuestion 与计划审批，也不会以计划模式启动。需要问人时用 Send 发问，回答作为对方下一条消息到达。同理，bot 在一轮工具调用（通常就是 Send）之后不再输出任何文字，是正常收尾：Agent Loop 对 bot 把这种“已服务但无内容”的回复当作 `done`，而不是上游空响应错误（拒答、截断等仍照常报错）。工具权限审批仍会发生，头部会提示能驱动 bot 的人去监控里处理。
+- **不等没人看得见的人**：没人读 bot 的会话记录，所以创建时给它存一层运行时上限（`BOT_RUNTIME_CEILING`，与委派模板同一机制）：禁用 AskUserQuestion 与计划审批，也不会以计划模式启动。需要问人时用 Send 发问，回答作为对方下一条消息到达。同理，bot 在一轮工具调用（通常就是 Send）之后不再输出任何文字，是正常收尾：Agent Loop 把这种“已服务但无内容”的回复当作 `done`，而不是上游空响应错误（拒答、截断等仍照常报错）。普通叙述者在一轮包含 Agent、后台 Bash 或 Send 的工具调用之后也一样——后续结果会作为新的输入到达，此刻无话可说是正常的。工具权限审批仍会发生，头部会提示能驱动 bot 的人去监控里处理。
 - **提示词**：`runtimeBasePrompt` 在 bot 自身的 system prompt（人设）之后追加 bot 协议段（`server/lib/prompts/bot.ts`）：对方只看得到 Send 的内容、按发送者标记回复谁、每条来自人的消息都要回复、提问也走 Send、多人对话互相隔离（除非作者本人要求转达）。
 
 ## 3. 访问控制

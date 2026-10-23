@@ -40,7 +40,8 @@ let providerScenario:
 let quietTail:
 	| { usage: { promptTokens: number; completionTokens: number } }
 	| { stopReason: string } = { usage: { promptTokens: 900, completionTokens: 0 } };
-const QUIET_TOOL = "__QuietFinishTest";
+/** The call `tool_then_quiet` makes first; a stand-in replaces any real tool by that name. */
+let quietCall: { name: string; input: string } = { name: "__QuietFinishTest", input: "{}" };
 let providerAttempts = 0;
 let wsBaseUrl = "";
 /**
@@ -158,7 +159,12 @@ const testProvider: ProviderAdapter = {
 		if (providerScenario === "tool_then_quiet") {
 			if (providerAttempts === 1) {
 				yield {
-					toolUseChunk: { toolUseId: "tu-send", name: QUIET_TOOL, input: "{}", stop: true },
+					toolUseChunk: {
+						toolUseId: "tu-quiet",
+						name: quietCall.name,
+						input: quietCall.input,
+						stop: true,
+					},
 				};
 				return;
 			}
@@ -544,52 +550,70 @@ describe("空响应细分归因", () => {
 	});
 });
 
-describe("bot turns end quietly after answering through tools", () => {
-	async function quietRun(overrides: Partial<AgentConfig>, tail: typeof quietTail) {
+describe("an empty reply after handing work off is a finish", () => {
+	async function quietRun(
+		overrides: Partial<AgentConfig>,
+		tail: typeof quietTail,
+		call: typeof quietCall = { name: "__QuietFinishTest", input: "{}" },
+	) {
 		providerScenario = "tool_then_quiet";
 		providerAttempts = 0;
 		quietTail = tail;
+		quietCall = call;
+		const real = toolRegistry.get(call.name);
+		if (real) toolRegistry.unregister(call.name);
 		toolRegistry.register({
-			name: QUIET_TOOL,
-			description: "Stands in for Send({ user })",
-			parameters: z.object({}),
-			execute: async () => ({ output: "Delivered." }),
+			name: call.name,
+			description: "Stand-in tool",
+			parameters: z.object({}).passthrough(),
+			execute: async () => ({ output: "Started." }),
 		});
 		try {
 			return await runLoop({ maxTurns: 4, ...overrides });
 		} finally {
-			toolRegistry.unregister(QUIET_TOOL);
+			toolRegistry.unregister(call.name);
+			if (real) toolRegistry.register(real);
 		}
 	}
 	const usageOnly = { usage: { promptTokens: 900, completionTokens: 0 } };
+	const lastType = (events: AgentEvent[]) => events.at(-1)?.type;
 
-	test("a bot with nothing left to say after a tool round is done", async () => {
+	test("a bot with nothing left to say after any tool round is done", async () => {
 		const events = await quietRun({ bot: true }, usageOnly);
-		expect(events.at(-1)?.type).toBe("done");
-		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
+		expect(lastType(events)).toBe("done");
 		expect(events.some((event) => event.type === "retrying")).toBe(false);
 		expect(providerAttempts).toBe(2);
 	});
 
 	test("so is one that stops normally without text", async () => {
-		const events = await quietRun({ bot: true }, { stopReason: "stop" });
-		expect(events.at(-1)?.type).toBe("done");
+		expect(lastType(await quietRun({ bot: true }, { stopReason: "stop" }))).toBe("done");
 	});
 
-	test("a refusal is still reported, bot or not", async () => {
+	test.each([
+		["Send", '{"id":"parent","message":"done"}'],
+		["Agent", '{"prompt":"look into it"}'],
+		["Bash", '{"command":"bun test","run_in_background":true}'],
+	])("an ordinary narrator that handed work off with %s is done", async (name, input) => {
+		expect(lastType(await quietRun({}, usageOnly, { name, input }))).toBe("done");
+	});
+
+	test("a foreground command is not a hand-off", async () => {
+		const call = { name: "Bash", input: '{"command":"ls"}' };
+		expect(lastType(await quietRun({}, usageOnly, call))).toBe("invalid_state");
+	});
+
+	test("an ordinary narrator after other tools still reports the empty reply", async () => {
+		expect(lastType(await quietRun({}, usageOnly))).toBe("invalid_state");
+	});
+
+	test("a refusal is still reported after a hand-off", async () => {
 		const events = await quietRun({ bot: true }, { stopReason: "content_filter" });
-		expect(events.at(-1)?.type).toBe("invalid_state");
+		expect(lastType(events)).toBe("invalid_state");
 	});
 
-	test("an ordinary narrator still treats the empty reply as a fault", async () => {
-		const events = await quietRun({}, usageOnly);
-		expect(events.at(-1)?.type).toBe("invalid_state");
-	});
-
-	test("a bot whose first reply is empty has answered no one", async () => {
+	test("an empty first reply has handed nothing off", async () => {
 		providerScenario = "usage_only_forever";
 		providerAttempts = 0;
-		const events = await runLoop({ bot: true });
-		expect(events.at(-1)?.type).toBe("invalid_state");
+		expect(lastType(await runLoop({ bot: true }))).toBe("invalid_state");
 	});
 });
