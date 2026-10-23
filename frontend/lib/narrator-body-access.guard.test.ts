@@ -15,11 +15,16 @@
  *   - fewer than its count fails too — lower it (drop the entry at zero).
  *
  * The scan is lexical over comment-stripped source. A floor, not a proof.
+ *
+ * Rows do not nest either: a row nested under another one is a row of its own, after
+ * its parent, naming it (`parentMessageId`). `TreeMessage` has no `children`, which the
+ * type check holds below.
  */
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import type { TreeMessage } from "./api/types";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -70,6 +75,12 @@ function sourceFiles(path: string, out: string[]): string[] {
 }
 
 describe("narrator body access", () => {
+	test("rows are flat: TreeMessage has no children", () => {
+		// @ts-expect-error A nested row names its parent instead (`message/nested-rows.ts`).
+		const children: TreeMessage["children"] = undefined;
+		expect(children).toBeUndefined();
+	});
+
 	test("bodyFieldUses counts the field, not comments or other names", () => {
 		expect(bodyFieldUses(stripComments("// contentJson\nconst a = row.contentJson;"))).toBe(1);
 		expect(bodyFieldUses("const contentJsonBytes = 1; originalContentJson;")).toBe(0);

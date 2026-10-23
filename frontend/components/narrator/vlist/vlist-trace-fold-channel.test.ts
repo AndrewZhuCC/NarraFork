@@ -54,7 +54,6 @@ const reasoningMessage = rowWithElements(
 		seq: 1,
 		role: "assistant",
 		toolCalls: [],
-		children: [],
 	},
 	[{ type: "reasoning", text: "**A**\n\nfirst body\n\n**B**\n\nsecond body" }],
 );
@@ -62,7 +61,7 @@ const reasoningMessage = rowWithElements(
 /** A finished tool call, the row an `activity-trace` folds. */
 const toolItem = {
 	kind: "tool" as const,
-	msg: rowWithElements({ id: "m3", seq: 3, role: "assistant", toolCalls: [], children: [] }, []),
+	msg: rowWithElements({ id: "m3", seq: 3, role: "assistant", toolCalls: [] }, []),
 	blockIndex: 0,
 	tc: {
 		toolUseId: "tu-1",

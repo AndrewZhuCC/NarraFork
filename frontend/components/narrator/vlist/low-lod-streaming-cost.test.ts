@@ -47,7 +47,6 @@ function finishedTool(index: number) {
 			toolCalls: [
 				{ id: `c${index}`, toolUseId: `tu-${index}`, toolName: "Read", status: "success" },
 			],
-			children: [],
 		},
 		[
 			{
@@ -69,7 +68,6 @@ function streamingMessage(text: string) {
 			seq: 999,
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 		},
 		[{ type: "reasoning", text }],
 	);
@@ -88,7 +86,6 @@ function checkpointProjectionMessage(text: string) {
 			seq: 100,
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 			liveBlockIndex: 0,
 			liveContentProjection: true,
 		},

@@ -669,7 +669,6 @@ describe("scrollbar feedback through the real measure stack", () => {
 				seq,
 				role: "assistant",
 				toolCalls: [],
-				children: [],
 			},
 			[{ type: "image_generation", status: "completed", width: 1024, height: 512, result: "x" }],
 		);
@@ -868,7 +867,6 @@ describe("layout height is monotone in width for TEXT-shaped content", () => {
 					seq: i,
 					role: "assistant",
 					toolCalls: [],
-					children: [],
 				},
 				[{ type: "text", text: bodies[i % bodies.length] }],
 			),

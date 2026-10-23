@@ -25,7 +25,7 @@
  *    (the backend's `enrichToolUseBlocks` copies the row onto the block). The
  *    layout adapter reads the BLOCK FIRST (`segment-adapter.mergeSource`), so
  *    patching only the row leaves the adapter seeing the stale status and the
- *    fix silently does nothing. The shared tree helpers reused below already
+ *    fix silently does nothing. The shared row helpers reused below already
  *    write both (`syncToolElementFields`), which is precisely why they are
  *    reused rather than reimplemented.
  * 2. NO-OP MUST BE REFERENTIALLY DETECTABLE. When nothing matched we return the
@@ -33,7 +33,7 @@
  *    rebuild entirely (a narrator with no loaded occurrence of the toolUseId
  *    must not pay for a layout pass on every event).
  *
- * Reuse note: the tree walkers come from `../message-tree-utils`, the same pure
+ * Reuse note: the row walkers come from `../message-tree-utils`, the same pure
  * (DOM-free, React-free) helpers the chunked path uses. Sharing them is
  * deliberate — a second implementation would be free to drift from the chunked
  * path's semantics, which is the class of bug this whole module is fixing. The
@@ -63,9 +63,9 @@ import {
 } from "@shared/pretext-layout/reflection";
 import {
 	activityForSubagent,
-	getNewestReflectionToolOccurrenceInTree,
-	mergeFieldsIntoNewestToolOccurrenceInTree,
-	mergeToolCallFieldsInTree,
+	getNewestReflectionToolOccurrence,
+	mergeFieldsIntoNewestToolOccurrence,
+	mergeToolCallFieldsInRows,
 	replaceSubagentActivitySnapshot,
 	updateSubagentActivityInMessages,
 	upsertSubagentToolCallHeader,
@@ -124,10 +124,6 @@ function newestToolStatus(messages: readonly TreeMessage[], toolUseId: string): 
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (!msg) continue;
-		if (msg.children?.length) {
-			const nested = newestToolStatus(msg.children, toolUseId);
-			if (nested !== undefined) return nested;
-		}
 		const blocks = messageBody(msg);
 		for (let b = blocks.length - 1; b >= 0; b--) {
 			const block = blocks[b];
@@ -174,7 +170,7 @@ function newestToolStatus(messages: readonly TreeMessage[], toolUseId: string): 
  * same unguarded writes and can regress a card the same way. That is a separate
  * bug in a separate channel — this one is new code, so it starts out correct
  * rather than bug-compatible. The precedent for the guard already exists in the
- * shared tree helpers: `upsertSubagentToolCallHeader`'s `preventTerminalRegression`
+ * shared row helpers: `upsertSubagentToolCallHeader`'s `preventTerminalRegression`
  * protects the activity header's status this same way, just not the main one.
  */
 function withoutTerminalRegression(
@@ -245,14 +241,6 @@ export function patchSendDeliveryTargets(
 	function patch(rows: readonly TreeMessage[]): LivePatchResult {
 		for (let i = rows.length - 1; i >= 0; i--) {
 			const row = rows[i];
-			if (row.children?.length) {
-				const nested = patch(row.children);
-				if (nested.changed) {
-					const updated = [...rows];
-					updated[i] = { ...row, children: nested.messages as TreeMessage[] };
-					return { messages: updated, changed: true };
-				}
-			}
 			const block = [...messageBody(row)]
 				.reverse()
 				.find((value) => value.type === "tool_use" && value.id === toolUseId);
@@ -324,14 +312,10 @@ export function patchSendDeliveryTargets(
 					? { tcId: toolCallBinding.toolCallId, executionAttempt: toolCallBinding.attempt }
 					: {}),
 			};
-			// Scope the shared row/block writer to this exact message, not its newer children.
-			const result = mergeFieldsIntoNewestToolOccurrenceInTree(
-				[{ ...row, children: [] }],
-				toolUseId,
-				fields,
-			);
+			// Scope the shared row/block writer to this exact message.
+			const result = mergeFieldsIntoNewestToolOccurrence([row], toolUseId, fields);
 			const updated = [...rows];
-			updated[i] = { ...result.messages[0], children: row.children };
+			updated[i] = result.messages[0];
 			return { messages: updated, changed: true };
 		}
 		return unchanged(rows);
@@ -356,17 +340,17 @@ export function patchToolCallFields(
 	if (Object.keys(safeFields).length === 0) return unchanged(messages);
 	if (blockId) {
 		const exact = patchRowHoldingBlock(messages, blockId, (row) =>
-			mergeToolCallFieldsInTree([{ ...row, children: [] }], toolUseId, safeFields),
+			mergeToolCallFieldsInRows([row], toolUseId, safeFields),
 		);
 		if (exact) return exact.changed ? exact : unchanged(messages);
 	}
-	const result = mergeToolCallFieldsInTree(messages as TreeMessage[], toolUseId, safeFields);
+	const result = mergeToolCallFieldsInRows(messages as TreeMessage[], toolUseId, safeFields);
 	return result.changed ? result : unchanged(messages);
 }
 
 /**
- * Apply `patch` to the one loaded row whose blocks include `blockId`, children kept.
- * Undefined when no loaded row holds the block.
+ * Apply `patch` to the one loaded row whose blocks include `blockId`. Undefined when no
+ * loaded row holds the block.
  */
 function patchRowHoldingBlock(
 	rows: readonly TreeMessage[],
@@ -379,17 +363,8 @@ function patchRowHoldingBlock(
 			const result = patch(row);
 			if (!result.changed) return { messages: rows as TreeMessage[], changed: false };
 			const updated = [...rows];
-			updated[i] = { ...result.messages[0], children: row.children };
+			updated[i] = result.messages[0];
 			return { messages: updated, changed: true };
-		}
-		if (row.children?.length) {
-			const nested = patchRowHoldingBlock(row.children, blockId, patch);
-			if (nested) {
-				if (!nested.changed) return { messages: rows as TreeMessage[], changed: false };
-				const updated = [...rows];
-				updated[i] = { ...row, children: nested.messages as TreeMessage[] };
-				return { messages: updated, changed: true };
-			}
 		}
 	}
 	return undefined;
@@ -418,7 +393,7 @@ export function patchReflection(
 	fields: Record<string, unknown>,
 ): LivePatchResult {
 	if (!toolUseId || !Array.isArray(messages) || messages.length === 0) return unchanged(messages);
-	const occurrence = getNewestReflectionToolOccurrenceInTree(
+	const occurrence = getNewestReflectionToolOccurrence(
 		messages as TreeMessage[],
 		toolUseId,
 		reflectionType,
@@ -435,7 +410,7 @@ export function patchReflection(
 	// newest one on a card the completion already finished).
 	const safeFields = withoutTerminalRegression(messages, toolUseId, fields);
 	if (Object.keys(safeFields).length === 0) return unchanged(messages);
-	const result = mergeFieldsIntoNewestToolOccurrenceInTree(
+	const result = mergeFieldsIntoNewestToolOccurrence(
 		messages as TreeMessage[],
 		toolUseId,
 		safeFields,
@@ -710,13 +685,6 @@ function markTakenOverForNarrator(
 		if (localChanged) {
 			changed = true;
 			next = { ...withContent, toolCalls: nextCalls };
-		}
-		if (next.children?.length) {
-			const child = markTakenOverForNarrator(next.children, subagentNarratorId, takenOver);
-			if (child.changed) {
-				changed = true;
-				next = { ...next, children: child.messages as TreeMessage[] };
-			}
 		}
 		return next;
 	});

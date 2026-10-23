@@ -55,7 +55,6 @@ function toolMessage(): NarratorMsg {
 				},
 			],
 			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
 		},
 		[
 			{
@@ -80,7 +79,6 @@ function textMessage(id: string, role: string, text: string): NarratorMsg {
 			contentText: text,
 			toolCalls: [],
 			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
 		},
 		[{ type: "text", text }],
 	) as unknown as NarratorMsg;
@@ -330,7 +328,6 @@ describe("adapter × real segmentMessages", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
 			},
 			[
 				{ type: "text", text: "note" },
@@ -352,7 +349,6 @@ describe("adapter × real segmentMessages", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
 			},
 			[
 				{ type: "text", text: "x" },
@@ -374,7 +370,6 @@ describe("adapter × real segmentMessages", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
 			},
 			[
 				{ type: "image", imageId: "img-1", filename: "pic.png" },
@@ -403,7 +398,6 @@ describe("adapter × real segmentMessages", () => {
 					contentText: null,
 					toolCalls: [],
 					createdAt: "2026-01-01T00:00:00Z",
-					children: [],
 				},
 				[{ type: "ask_in_passing", status, text: "q?" }],
 			) as unknown as NarratorMsg;
@@ -430,7 +424,6 @@ describe("adapter × real segmentMessages", () => {
 				contentText: null,
 				toolCalls: [{ toolUseId: "tu-agent", toolName: "Agent", inputJson: {}, status: "success" }],
 				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
 			},
 			[
 				{
@@ -485,7 +478,6 @@ describe("adapter × real segmentMessages", () => {
 					{ toolUseId: "tu-agent-2", toolName: "Agent", inputJson: {}, status: "running" },
 				],
 				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
 			},
 			[
 				{
@@ -533,7 +525,6 @@ describe("adapter × real segmentMessages", () => {
 				contentText: "have a look",
 				toolCalls: [],
 				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
 			},
 			[
 				{ type: "image", imageId: "img-1", filename: "shot.png", mediaType: "image/png" },
@@ -567,7 +558,6 @@ describe("adapter × real segmentMessages", () => {
 					contentText: "hi",
 					toolCalls: [],
 					createdAt: "2026-01-01T00:00:00Z",
-					children: [],
 				},
 				withImage
 					? [

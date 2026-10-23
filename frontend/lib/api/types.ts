@@ -1085,7 +1085,11 @@ export interface TreeMessage {
 	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
 	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
 	createdAt: string;
-	children: TreeMessage[];
+	/**
+	 * The row this one is nested under; absent at the top. Rows are flat, each row
+	 * followed by the rows nested under it (`message/nested-rows.ts`).
+	 */
+	parentMessageId?: string | null;
 	/**
 	 * Synthetic live row only: index of the text/reasoning block still being written,
 	 * or -1 when the model has moved on to tool calls.

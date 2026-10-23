@@ -441,7 +441,6 @@ describe("live patches vs the structural reload", () => {
 						contentText: "下一步",
 						toolCalls: [],
 						createdAt: "2026-01-01T00:01:00.000Z",
-						children: [],
 						seq: 1,
 					},
 					[{ type: "text", text: "下一步" }],
@@ -479,7 +478,6 @@ describe("live patches vs the structural reload", () => {
 							},
 						],
 						createdAt: "2026-01-01T00:00:00.000Z",
-						children: [],
 					},
 					[
 						{
@@ -553,7 +551,6 @@ describe("live event → patch field mapping", () => {
 						},
 					],
 					createdAt: "2026-01-01T00:00:00.000Z",
-					children: [],
 				},
 				[{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} }],
 			) as unknown as Msg,
@@ -807,18 +804,21 @@ describe("live event → patch field mapping", () => {
 			_sendDeliveryTargets: [target],
 		});
 		Object.assign(block(recent), { name: "Send", tcId: "new", executionAttempt: 2 });
-		const parent = toolDoc("parent", "running");
-		parent[0] = { ...parent[0], children: [...old, ...recent] };
+		const rows = [
+			...toolDoc("parent", "running"),
+			{ ...old[0], id: "old", parentMessageId: "m1" },
+			{ ...recent[0], id: "recent", parentMessageId: "m1" },
+		];
 		const received = { ...target, injectionConsumedAt: "2026-07-18T00:00:00.000Z" };
 		const event = {
 			toolUseId: "same",
 			targets: [received],
 			toolCallBinding: { toolCallId: "old", attempt: 1 },
 		};
-		const result = sendDeliveryResolvedPatch(event)(parent);
+		const result = sendDeliveryResolvedPatch(event)(rows);
 		expect(result.changed).toBe(true);
-		expect(block(result.messages[0].children ?? [])._sendDeliveryTargets).toEqual([received]);
-		expect(result.messages[0].children?.[1]).toBe(recent[0]);
+		expect(block(result.messages.slice(1))._sendDeliveryTargets).toEqual([received]);
+		expect(result.messages[2]).toBe(rows[2]);
 		expect(
 			sendDeliveryResolvedPatch({ ...event, toolCallBinding: { toolCallId: "new", attempt: 2 } })(
 				old,

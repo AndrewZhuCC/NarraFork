@@ -90,7 +90,6 @@ function message(id: string, text: string): NarratorMsg {
 			seq: 0,
 			role: "assistant",
 			contentText: text,
-			children: [],
 			toolCalls: [],
 		},
 		[{ type: "text", text }],

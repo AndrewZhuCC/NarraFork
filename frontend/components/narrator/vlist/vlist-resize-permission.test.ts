@@ -76,7 +76,6 @@ function fixture({
 			contentText: null,
 			toolCalls: [],
 			createdAt: "2026-08-01T00:00:00.000Z",
-			children: [],
 			seq: 0,
 		},
 		requests.map((permission) => ({

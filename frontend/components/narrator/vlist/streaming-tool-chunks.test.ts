@@ -456,10 +456,9 @@ describe("collectPersistedToolUseIds", () => {
 		expect([...ids].sort()).toEqual(["a", "b"]);
 	});
 
-	it("walks child messages (a subagent page owns its children's tools)", () => {
-		const ids = collectPersistedToolUseIds([
-			{ toolCalls: [{ toolUseId: "parent" }], children: [{ toolCalls: [{ toolUseId: "child" }] }] },
-		]);
+	it("reads nested rows (a subagent page owns their tools)", () => {
+		const nested = { toolCalls: [{ toolUseId: "child" }], parentMessageId: "parent-row" };
+		const ids = collectPersistedToolUseIds([{ toolCalls: [{ toolUseId: "parent" }] }, nested]);
 		expect([...ids].sort()).toEqual(["child", "parent"]);
 	});
 

@@ -24,7 +24,6 @@ export function makeMessage(
 			subagentModel: partial.subagentModel ?? null,
 			seq: partial.seq,
 			createdAt: partial.createdAt ?? NOW,
-			children: partial.children ?? [],
 		},
 		(messageBody(partial) ?? []) as ContentBlock[],
 	);

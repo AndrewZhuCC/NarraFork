@@ -1,5 +1,6 @@
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { endOfNestedRows } from "../message/nested-rows";
 
 export function askInPassingBlock(message: TreeMessage) {
 	return messageBody(message).find((block) => block?.type === "ask_in_passing");
@@ -37,6 +38,8 @@ export function syncAskInPassingMessage(
 	const messages = loaded.map((row) =>
 		typeof row.seq === "number" && row.seq >= seq ? { ...row, seq: row.seq + 1 } : row,
 	);
-	messages.splice(sourceIndex + 1, 0, { ...message, seq });
-	return { messages, changed: true, appended: sourceIndex === loaded.length - 1 };
+	// After the source row and the rows nested under it.
+	const insertAt = endOfNestedRows(loaded, sourceIndex);
+	messages.splice(insertAt, 0, { ...message, seq });
+	return { messages, changed: true, appended: insertAt === loaded.length };
 }

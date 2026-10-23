@@ -32,6 +32,15 @@ function withBodies<T>(value: T): T {
 	});
 }
 
+/** v1 rows as the client keeps them: flat, each row then the rows nested under it. */
+type V1Row = { id: string; children?: V1Row[] };
+function flatRows(rows: readonly V1Row[], parentMessageId?: string): unknown[] {
+	return rows.flatMap(({ children = [], ...row }) => [
+		parentMessageId ? { ...row, parentMessageId } : row,
+		...flatRows(children, row.id),
+	]);
+}
+
 const NOW = "2026-10-01T00:00:00.000Z";
 
 beforeEach(() => {
@@ -180,7 +189,9 @@ describe("the client's decoder", () => {
 		const decoded = decodeBlockPage(
 			page.toBlockPage(structuredClone(v1)) as unknown as PretextDocumentPageResult,
 		);
-		expect(withBodies(decoded)).toEqual(JSON.parse(JSON.stringify(v1)));
+		expect(withBodies(decoded)).toEqual(
+			JSON.parse(JSON.stringify({ ...v1, messages: flatRows(v1.messages as V1Row[]) })),
+		);
 		const step = decoded.messages.find((message) => message.id === stepId);
 		if (!step) throw new Error("step row missing");
 		const blocks = messageBlocks(step);
@@ -194,7 +205,7 @@ describe("the client's decoder", () => {
 		]);
 	});
 
-	test("rebuilds nested children under the row they belong to", () => {
+	test("lays nested rows out flat after the row they belong to", () => {
 		const child = {
 			id: "c1",
 			narratorId: "n1",
@@ -219,6 +230,7 @@ describe("the client's decoder", () => {
 			hasPrev: false,
 		};
 		const decoded = decodeBlockPage(page.toBlockPage(structuredClone(v1)) as unknown as typeof v1);
-		expect(withBodies(decoded)).toEqual(v1);
+		expect(withBodies(decoded) as unknown).toEqual({ ...v1, messages: flatRows(v1.messages) });
+		expect(decoded.messages.map((row) => row.id)).toEqual(["p1", "c1"]);
 	});
 });

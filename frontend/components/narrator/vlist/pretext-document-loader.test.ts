@@ -20,7 +20,6 @@ function message(seq: number): TreeMessage {
 			contentText: `message ${seq}`,
 			toolCalls: [],
 			createdAt: "2026-07-23T00:00:00.000Z",
-			children: [],
 			seq,
 		},
 		[{ type: "text", text: `message ${seq}` }],

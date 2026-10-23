@@ -64,7 +64,6 @@ function message(seq: number): TreeMessage {
 			contentText: "词".repeat(60),
 			toolCalls: [],
 			createdAt: "2026-07-28T00:00:00.000Z",
-			children: [],
 			seq,
 		},
 		[{ type: "text", text: "词".repeat(60) }],

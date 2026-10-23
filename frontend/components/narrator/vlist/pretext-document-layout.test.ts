@@ -30,7 +30,6 @@ function message(id: string, seq: number, role: "user" | "assistant", text: stri
 			role,
 			contentText: text,
 			toolCalls: [],
-			children: [],
 			parentToolUseId: null,
 			createdAt: "2026-07-23T00:00:00.000Z",
 		},

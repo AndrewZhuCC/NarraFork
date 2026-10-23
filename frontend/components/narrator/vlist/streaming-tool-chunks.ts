@@ -538,45 +538,40 @@ export function collectPersistedDocumentPins(
 	messages: readonly unknown[],
 ): ReadonlyMap<string, readonly PersistedDocumentPin[]> {
 	const pins = new Map<string, PersistedDocumentPin[]>();
-	const visit = (list: readonly unknown[]) => {
-		for (const entry of list) {
-			if (!entry || typeof entry !== "object") continue;
-			const message = entry as MessageBodySource & {
-				id?: string;
-				narratorId?: string;
-				toolCalls?: unknown[];
-				children?: unknown[];
-			};
-			for (const [records, blocks] of [
-				[message.toolCalls, false],
-				[messageBody(message), true],
-			] as const) {
-				for (const raw of records ?? []) {
-					if (!raw || typeof raw !== "object") continue;
-					const call = raw as {
-						id?: string;
-						tcId?: string;
-						toolUseId?: string;
-						type?: string;
-						executionAttempt?: number;
-					};
-					if (blocks && call.type !== "tool_use") continue;
-					const id = blocks ? call.id : call.toolUseId;
-					if (!id) continue;
-					const values = pins.get(id) ?? [];
-					values.push({
-						narratorId: message.narratorId,
-						messageId: message.id,
-						toolCallId: blocks ? call.tcId : call.id,
-						executionAttempt: call.executionAttempt,
-					});
-					pins.set(id, values);
-				}
+	for (const entry of messages) {
+		if (!entry || typeof entry !== "object") continue;
+		const message = entry as MessageBodySource & {
+			id?: string;
+			narratorId?: string;
+			toolCalls?: unknown[];
+		};
+		for (const [records, blocks] of [
+			[message.toolCalls, false],
+			[messageBody(message), true],
+		] as const) {
+			for (const raw of records ?? []) {
+				if (!raw || typeof raw !== "object") continue;
+				const call = raw as {
+					id?: string;
+					tcId?: string;
+					toolUseId?: string;
+					type?: string;
+					executionAttempt?: number;
+				};
+				if (blocks && call.type !== "tool_use") continue;
+				const id = blocks ? call.id : call.toolUseId;
+				if (!id) continue;
+				const values = pins.get(id) ?? [];
+				values.push({
+					narratorId: message.narratorId,
+					messageId: message.id,
+					toolCallId: blocks ? call.tcId : call.id,
+					executionAttempt: call.executionAttempt,
+				});
+				pins.set(id, values);
 			}
-			if (message.children) visit(message.children);
 		}
-	};
-	visit(messages);
+	}
 	return pins;
 }
 
@@ -606,38 +601,27 @@ export function streamingToolChunks(store: StreamingToolStore): TopLevelStreamin
 }
 
 /**
- * Collect every tool-use id present in a committed message tree.
- *
- * Walks children too: a subagent page renders its own tools as top-level, so a
- * child message can be the persisted owner of a live id.
+ * Collect every tool-use id present in the committed rows, nested rows included: a
+ * subagent page renders its own tools as top-level, so a nested row can be the
+ * persisted owner of a live id.
  */
 export function collectPersistedToolUseIds(
-	messages: readonly (MessageBodySource & {
-		toolCalls?: unknown;
-		children?: readonly unknown[];
-	})[],
+	messages: readonly (MessageBodySource & { toolCalls?: unknown })[],
 ): ReadonlySet<string> {
 	const ids = new Set<string>();
-	const visit = (list: readonly unknown[]): void => {
-		for (const entry of list) {
-			const message = entry as MessageBodySource & {
-				toolCalls?: unknown;
-				children?: readonly unknown[];
-			};
-			if (Array.isArray(message?.toolCalls)) {
-				for (const call of message.toolCalls) {
-					const id = (call as { toolUseId?: unknown } | null)?.toolUseId;
-					if (typeof id === "string" && id.length > 0) ids.add(id);
-				}
+	for (const message of messages) {
+		if (!message) continue;
+		if (Array.isArray(message.toolCalls)) {
+			for (const call of message.toolCalls) {
+				const id = (call as { toolUseId?: unknown } | null)?.toolUseId;
+				if (typeof id === "string" && id.length > 0) ids.add(id);
 			}
-			for (const block of messageBody(message)) {
-				const candidate = block as { type?: unknown; id?: unknown } | null;
-				if (candidate?.type !== "tool_use") continue;
-				if (typeof candidate.id === "string" && candidate.id.length > 0) ids.add(candidate.id);
-			}
-			if (Array.isArray(message?.children) && message.children.length > 0) visit(message.children);
 		}
-	};
-	visit(messages);
+		for (const block of messageBody(message)) {
+			const candidate = block as { type?: unknown; id?: unknown } | null;
+			if (candidate?.type !== "tool_use") continue;
+			if (typeof candidate.id === "string" && candidate.id.length > 0) ids.add(candidate.id);
+		}
+	}
 	return ids;
 }

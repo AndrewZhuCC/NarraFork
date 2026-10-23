@@ -79,7 +79,6 @@ function assistantWithTools(id: string, tools: readonly ToolSeed[]): TreeMessage
 				createdAt: "2026-01-01T00:00:00.000Z",
 			})) as unknown as TreeMessage["toolCalls"],
 			createdAt: "2026-01-01T00:00:00.000Z",
-			children: [],
 		},
 		tools.map((tool) => ({
 			type: "tool_use",
@@ -320,10 +319,6 @@ function readStatuses(
 				...(block ? { block: (block as { status?: string }).status } : {}),
 			};
 		}
-		if (msg.children?.length) {
-			const nested = readStatuses(msg.children, toolUseId);
-			if (nested.row || nested.block) return nested;
-		}
 	}
 	return {};
 }
@@ -335,10 +330,6 @@ function findBlock(
 	for (const msg of messages) {
 		const block = messageBody(msg)?.find((b) => b.type === "tool_use" && b.id === toolUseId);
 		if (block) return block as unknown as Record<string, unknown>;
-		if (msg.children?.length) {
-			const nested = findBlock(msg.children, toolUseId);
-			if (nested) return nested;
-		}
 	}
 	return undefined;
 }
@@ -392,13 +383,14 @@ describe("patchToolCallFields", () => {
 		expect(patchToolCallFields([], "tu-1", { status: "success" }).changed).toBe(false);
 	});
 
-	it("patches a tool call nested in a child (subagent) message tree", () => {
-		const child = assistantWithTools("c1", [{ toolUseId: "tu-child", status: "running" }]);
-		const parent: TreeMessage = {
-			...assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }]),
-			children: [{ ...child, parentToolUseId: "tu-parent" }],
+	it("patches a tool call in a row nested under another one", () => {
+		const parent = assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }]);
+		const child: TreeMessage = {
+			...assistantWithTools("c1", [{ toolUseId: "tu-child", status: "running" }]),
+			parentToolUseId: "tu-parent",
+			parentMessageId: "m1",
 		};
-		const result = patchToolCallFields([parent], "tu-child", { status: "fail" });
+		const result = patchToolCallFields([parent, child], "tu-child", { status: "fail" });
 		expect(result.changed).toBe(true);
 		expect(readStatuses(result.messages, "tu-child")).toEqual({ row: "fail", block: "fail" });
 	});

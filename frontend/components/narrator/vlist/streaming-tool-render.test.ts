@@ -319,7 +319,6 @@ describe("per-tool hand-off leaves exactly one card", () => {
 						},
 					],
 					createdAt: "2026-07-28T00:00:00.000Z",
-					children: [],
 					seq: 1,
 				},
 				[{ type: "tool_use", id: "t1", name: "Bash", input: { command: "x" } }],

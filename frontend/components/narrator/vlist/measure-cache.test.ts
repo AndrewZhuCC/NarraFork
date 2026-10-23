@@ -100,7 +100,6 @@ describe("mixed action-card append cache locality", () => {
 					id,
 					role: "assistant",
 					toolCalls: [],
-					children: [],
 					parentToolUseId: null,
 				},
 				contentJson,

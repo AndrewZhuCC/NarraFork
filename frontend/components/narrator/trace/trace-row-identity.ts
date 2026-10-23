@@ -317,10 +317,10 @@ export function traceRowToolMeta(tc: TraceRowToolCallLike): TraceRowToolMeta {
  * delete / range) silently skip it.
  *
  * @param toolName  The tool call's name (equals the content block's `name`).
- * @param hasChildren  Whether any child message has this call as its parent tool use.
+ * @param hasNestedRows  Whether any row nested under the message answers this call.
  */
-export function isSelectionSubagentTool(toolName: string, hasChildren: boolean): boolean {
-	return toolName === "Agent" || hasChildren;
+export function isSelectionSubagentTool(toolName: string, hasNestedRows: boolean): boolean {
+	return toolName === "Agent" || hasNestedRows;
 }
 
 /**

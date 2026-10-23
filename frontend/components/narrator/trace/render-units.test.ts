@@ -25,7 +25,6 @@ function toolMessage(
 					status: opts.status ?? "success",
 				},
 			],
-			children: [],
 			createdAt: "2026-07-19T00:00:00.000Z",
 		},
 		[
@@ -44,7 +43,6 @@ function userMessage(messageId: string): NarratorMsg {
 			role: "user",
 			contentText: "hi",
 			toolCalls: [],
-			children: [],
 			createdAt: "2026-07-19T00:00:00.000Z",
 		},
 		[{ type: "text", text: "hi" }],
@@ -387,7 +385,6 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 				toolCalls: [
 					{ id: "call-tool-x", toolUseId: "tool-x", toolName: "Read", status: "success" },
 				],
-				children: [],
 				createdAt: "2026-07-19T00:00:00.000Z",
 			},
 			[
@@ -432,7 +429,6 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 						status: "success",
 					},
 				],
-				children: [],
 				createdAt: "2026-07-19T00:00:00.000Z",
 			},
 			[
@@ -508,7 +504,6 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 					role: "assistant",
 					contentText: null,
 					toolCalls: [],
-					children: [],
 					createdAt: "2026-07-19T00:00:00.000Z",
 				},
 				[{ type: "reasoning", text: "weighing the options" }],
@@ -571,7 +566,6 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 				role: "assistant",
 				contentText: null,
 				toolCalls: [],
-				children: [],
 				createdAt: "2026-07-19T00:00:00.000Z",
 			},
 			[{ type: "reasoning", text: "just thinking" }],
@@ -659,7 +653,6 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 					{ id: "call-pinned", toolUseId: "tool-pinned", toolName: "Write", status: "success" },
 					{ id: "call-c", toolUseId: "tool-c", toolName: "Bash", status: "success" },
 				],
-				children: [],
 				createdAt: "2026-07-19T00:00:00.000Z",
 			},
 			[

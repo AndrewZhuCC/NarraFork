@@ -56,7 +56,6 @@ function message(seq: number, blocks?: unknown[]): TreeMessage {
 			contentText: text,
 			toolCalls: [],
 			createdAt: "2026-07-28T00:00:00.000Z",
-			children: [],
 			seq,
 		},
 		blocks ?? [{ type: "text", text }],

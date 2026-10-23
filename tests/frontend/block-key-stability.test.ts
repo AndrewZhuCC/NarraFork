@@ -88,7 +88,6 @@ describe("buildStreamingMsg — block ids", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: new Date().toISOString(),
-				children: [],
 			},
 			[
 				{ type: "tool_use", id: "tu-1", name: "Bash", input: {} },
@@ -111,7 +110,6 @@ describe("buildStreamingMsg — block ids", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: new Date().toISOString(),
-				children: [],
 			},
 			[{ type: "tool_use", id: "tu-1", name: "Bash", input: {} }],
 		);
@@ -295,7 +293,6 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: new Date().toISOString(),
-				children: [],
 			},
 			[{ type: "tool_use", id: "tu-1", name: "Bash", input }],
 		);
@@ -331,7 +328,6 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: new Date().toISOString(),
-				children: [],
 			},
 			[{ type: "tool_use", id: "tu-1", name: "Bash", input: { x: 1 } }],
 		);
@@ -362,7 +358,6 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 				contentText: null,
 				toolCalls: [],
 				createdAt: new Date().toISOString(),
-				children: [],
 			},
 			[
 				{ type: "tool_use", id: "tu-1", name: "Bash", input: {} },

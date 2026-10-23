@@ -1860,11 +1860,11 @@ reconcile(narrator, target, now):
      - 7b-1 行持有块：`TreeMessage.blocks`（`RowBlock`：块的身份 + 元素，服务端命名的块 `named`）取代 `contentJson` + `blockRefs`。解码器直接给出块；客户端自建的行（流式行、子代理流式行、工具分片行、聊天行、夹具）由 `rowWithElements` / `splitRowBlocks` 按 `splitEnvelope` 切块；改写正文一律经 `mapRowElements` / `filterRowElements`，块保持 id，未变的块与行保持引用，空块去掉。`messageBody` 按块数组缓存展平结果，正文身份随块不变。交接从流式行去掉已落库的块后，余下块的 id（与键）不再因重切而移位。守卫只剩访问器与行类型；尚未迁移的夹具仍以 `contentJson` 建行，访问器读它时按服务端规则切块。（已完成）
      - 7b-2 删除行上的 `contentJson`：`TreeMessage.blocks` 必填，`contentJson` 从行类型与访问器里删除，没有块的行正文为空，访问器不再替任何行切块。顺手问的开始与解答接口原先直接返回带 `contentJson` 的行，改为按块协议返回该消息（`toEnvelopes`），前端在接口层解码（`decodeBlockMessage`）。测试夹具一律经 `rowWithElements` 建行，原地改正文的测试改为替换块。守卫只剩 `splitRowBlocks` 交给服务端切分函数的一处。（已完成）
      - 7b-3a 按下标的路由与死代码：前端的块操作（回滚、删除块、批量删除、文件恢复预览）只认服务端命名的块，客户端自建的行（流式行）没有可操作的块，不再退回按下标的路由。服务端删除只有旧前端调用的按下标路由：`POST /:id/rollback/:messageId`、`DELETE /:id/messages/:messageId/blocks/:blockIndex`、`DELETE /:id/messages/batch-blocks`、`GET /:id/rollback-preview`、`GET /:id/block-delete-preview`，以及没有调用方的 `GET /:id/segment-compact/:messageId/messages`；路由测试改走 `/blocks` 路由（`tests/block-ids.ts` 按元素位置取块 id）。编辑重生成仍可按消息寻址（整条消息，不是下标）。前端删除没有生产调用方的消息树与流式子行辅助函数（React Query 消息缓存、按 toolUseId 的索引、子代理流式子行、顶层流式分片对账等）及只测它们的用例，失效查询里去掉已无查询的预览键。服务层按下标的函数仍是块路由的实现，保留。（已完成）
-     - 7b-3b `children` 改为平铺的行加父索引；更新文档。
+     - 7b-3b 行平铺，删除 `children`：服务端只把一种消息嵌在另一行下面——旧数据里非子代理工具的内联回复（`inlineRows`；Agent / Task / Send 的子会话从不进父树，父行只带活动摘要），前端从不单独渲染它们。解码器不再把信封嵌回 `children`，行按信封顺序平铺：每行之后紧跟嵌在它下面的行，嵌套的行保留 `parentMessageId`（`TreeMessage.children` 删除，`message/nested-rows.ts` 给出判断与索引）。会话主线是不嵌套的行：分段、选择、尾部元信息、catch-up 游标、spec 任务定位与流式交接跳过嵌套的行；工具项的嵌套行（定子代理样式）由分段每轮按 `parentMessageId` + `parentToolUseId` 建索引取得，分段缓存按它浅比较。补丁、反思索引、工具元信息与已落库工具的收集直接扫平铺的行，不再递归。文档操作：追加拒绝嵌套的行，尾部 seq 判断跳过它们；upsert 原地更新已有行（嵌套的行原地不动，不再继承 `children`），新的嵌套行插到父行的嵌套行之后，父行不在则拒绝；中间插入与 ask 卡不插进一行与它的嵌套行之间；删除与裁头连带嵌套的行；COW 替换让嵌套的行改挂到新 id。守卫测试以类型检查保证 `TreeMessage` 没有 `children`。（已完成）
 
 **验收**：
 - §10.7 的直接升级测试通过。
-- 前端生产代码里叙述者消息不再读 `contentJson` / `children`（加一条守卫测试计数）。
+- 前端生产代码里叙述者消息不再读 `contentJson` / `children`（`narrator-body-access.guard.test.ts`：`contentJson` 按文件计数，`children` 由类型检查保证）。
 - 流式、交接、编辑、删除、回滚、ask、反思、子代理、compact、翻译的现有前端测试改为喂信封 + 块后全部通过。
 - 浏览器测试覆盖一次完整的流式回合：open 块 → 落库块，键不变、无闪烁。
 

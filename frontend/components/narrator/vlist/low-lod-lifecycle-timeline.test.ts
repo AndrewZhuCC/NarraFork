@@ -48,17 +48,13 @@ const USER = rowWithElements(
 		seq: 1,
 		role: "user",
 		toolCalls: [],
-		children: [],
 	},
 	[{ type: "text", text: "请帮我构建" }],
 );
 
 /** One persisted assistant message (the partial the server keeps appending to). */
 function persisted(blocks: unknown[]) {
-	return rowWithElements(
-		{ id: "a1", seq: 2, role: "assistant", toolCalls: [], children: [] },
-		blocks,
-	);
+	return rowWithElements({ id: "a1", seq: 2, role: "assistant", toolCalls: [] }, blocks);
 }
 
 const REASONING = {

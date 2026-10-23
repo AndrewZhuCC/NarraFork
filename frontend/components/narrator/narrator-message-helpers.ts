@@ -11,6 +11,7 @@ import {
 import { copyStreamingEditInput } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import { upsertStreamingToolBlock } from "./message/message-tree-utils";
+import { isNestedRow } from "./message/nested-rows";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import { isSpecTasksToolUse } from "./tool-call/tool-display";
@@ -36,7 +37,6 @@ export {
 
 // Re-export functions that moved to message-segments.ts for backward compatibility
 export {
-	filterChildrenByToolUse,
 	hasToolUse,
 	isToolOnlyMessage,
 	resolveAllToolCallsFromMsg,
@@ -450,7 +450,6 @@ export function buildTopLevelStreamingChunksMsg(
 		contentText: null,
 		toolCalls,
 		createdAt: createdAt ?? new Date().toISOString(),
-		children: [],
 	} as NarratorMsg;
 }
 
@@ -464,6 +463,7 @@ export function buildTopLevelStreamingChunksMsg(
 export function findLatestSpecTasksToolUseId(messages: NarratorMsg[]): string | null {
 	let latest: string | null = null;
 	for (const msg of messages) {
+		if (isNestedRow(msg)) continue;
 		for (const block of messageBody(msg)) {
 			if (block.type !== "tool_use") continue;
 			const id = typeof block.id === "string" ? block.id : null;

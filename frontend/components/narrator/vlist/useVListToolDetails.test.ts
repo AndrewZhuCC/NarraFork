@@ -399,7 +399,6 @@ function message(ref: VListToolDetailRequest): NarratorMsg {
 			id: ref.messageId,
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 		},
 		[
 			{

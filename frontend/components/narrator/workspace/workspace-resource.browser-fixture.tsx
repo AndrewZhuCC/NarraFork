@@ -208,7 +208,6 @@ const fetchMessagePage: PretextDocumentFetchPage = async (narratorId, options) =
 			contentText: text,
 			toolCalls: [],
 			createdAt: "2026-10-01T00:00:00.000Z",
-			children: [],
 			seq,
 		} as Omit<TreeMessage, "blocks">;
 		return rowWithElements(row, [{ type: "text", text }]);

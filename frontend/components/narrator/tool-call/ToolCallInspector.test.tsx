@@ -403,7 +403,6 @@ function toolItems() {
 				id: ref.messageId,
 				role: "assistant",
 				toolCalls: [],
-				children: [],
 			},
 			[
 				{

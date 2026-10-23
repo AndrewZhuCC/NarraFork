@@ -15,7 +15,6 @@ function message(contentJson: BaseContentBlock[], id = "a1", extra = {}): TreeMe
 			role: "assistant",
 			parentToolUseId: null,
 			toolCalls: [],
-			children: [],
 			...extra,
 		},
 		contentJson,

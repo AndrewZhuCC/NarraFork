@@ -4,9 +4,10 @@
  *
  * The server sends messages as envelopes that name their blocks, plus the blocks. This
  * module turns pages and WS frames into the rows the document store renders: each
- * `TreeMessage` holds its blocks (`blocks`, read through `messageBlocks`), and a row the
- * server nests under another one goes into that row's `children`. v2 is the only message
- * protocol (P3d); frames that are not message-shaped pass through.
+ * `TreeMessage` holds its blocks (`blocks`, read through `messageBlocks`). Rows stay
+ * flat in envelope order; a row the server nests under another one keeps its
+ * `parentMessageId` (`message/nested-rows.ts`). v2 is the only message protocol (P3d);
+ * frames that are not message-shaped pass through.
  */
 
 import type { MessageRowBlock, TreeMessage } from "./api/types";
@@ -30,7 +31,7 @@ interface BlockDTO {
 type EnvelopeDTO = Record<string, unknown> & {
 	id: string;
 	blockIds: string[];
-	/** The row it is nested under (`children`); null at the top. */
+	/** The row it is nested under; null at the top. */
 	parentMessageId: string | null;
 };
 
@@ -41,19 +42,12 @@ const text = (value: unknown) => (typeof value === "string" ? value : undefined)
 const number = (value: unknown) => (typeof value === "number" ? value : undefined);
 
 /**
- * Envelopes + blocks as rows, in envelope order. A row nested under another one goes into
- * that row's `children`; `withChildren` gives every row a `children` list, as page and
- * catch-up rows have one.
+ * Envelopes + blocks as rows, in envelope order. A nested row keeps its
+ * `parentMessageId`; a row at the top has none.
  */
-function rowsOf(
-	envelopes: EnvelopeDTO[],
-	blocks: BlockDTO[],
-	withChildren: boolean,
-): Array<{ row: TreeMessage; parentMessageId: string | null }> {
+function rowsOf(envelopes: EnvelopeDTO[], blocks: BlockDTO[]): TreeMessage[] {
 	const byBlockId = new Map(blocks.map((block) => [block.id, block]));
-	const rows: Array<{ row: TreeMessage; parentMessageId: string | null }> = [];
-	const byId = new Map<string, TreeMessage>();
-	for (const envelope of envelopes) {
+	return envelopes.map((envelope) => {
 		const { blockIds, parentMessageId, ...fields } = envelope;
 		const rowBlocks: MessageRowBlock[] = [];
 		for (const blockId of blockIds) {
@@ -72,19 +66,12 @@ function rowsOf(
 				elements: block.elements as MessageRowBlock["elements"],
 			});
 		}
-		const row = {
+		return {
 			...fields,
+			...(parentMessageId ? { parentMessageId } : {}),
 			blocks: rowBlocks,
-			...(withChildren ? { children: [] } : {}),
 		} as unknown as TreeMessage;
-		const parent = parentMessageId ? byId.get(parentMessageId) : undefined;
-		if (parent) {
-			parent.children ??= [];
-			parent.children.push(row);
-		} else rows.push({ row, parentMessageId: parentMessageId ?? null });
-		byId.set(row.id, row);
-	}
-	return rows;
+	});
 }
 
 /** A `pretext-document` page (envelopes + blocks) as rows. */
@@ -92,8 +79,8 @@ export function decodeBlockPage<T>(page: T): T {
 	const value = page as unknown as Frame;
 	if (!value) return page;
 	const { protocol: _protocol, messages, blocks, ...rest } = value;
-	const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), true);
-	return { ...rest, messages: rows.map(({ row }) => row) } as unknown as T;
+	const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks));
+	return { ...rest, messages: rows } as unknown as T;
 }
 
 /** One message as envelopes + blocks, as an action's response carries it. */
@@ -108,12 +95,8 @@ export function decodeBlockMessage<T extends { message?: unknown }>(
 ): Omit<T, "message"> & { message?: TreeMessage } {
 	const encoded = response.message as BlockMessageDTO | undefined;
 	if (!encoded) return response as Omit<T, "message">;
-	const [first] = rowsOf(
-		array<EnvelopeDTO>(encoded.messages),
-		array<BlockDTO>(encoded.blocks),
-		true,
-	);
-	return { ...response, message: first?.row };
+	const [first] = rowsOf(array<EnvelopeDTO>(encoded.messages), array<BlockDTO>(encoded.blocks));
+	return { ...response, message: first };
 }
 
 /**
@@ -156,8 +139,8 @@ export function decodeBlockFrame(frame: Frame): Frame[] {
 	switch (frame.type) {
 		case "message_upserted": {
 			const { type: _type, cause, messages, blocks, ...rest } = frame;
-			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), false);
-			return rows.map(({ row }) => ({ ...rest, type: cause, message: row }));
+			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks));
+			return rows.map((row) => ({ ...rest, type: cause, message: row }));
 		}
 		case "block_delta":
 			return [streamEvent(frame)];
@@ -167,12 +150,13 @@ export function decodeBlockFrame(frame: Frame): Frame[] {
 		case "catch_up": {
 			const { protocol: _protocol, messages, blocks, orphanMessageIds, ...rest } = frame;
 			const orphans = new Set(array<string>(orphanMessageIds));
-			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), true);
+			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks));
 			return [
 				{
 					...rest,
-					topLevel: rows.filter(({ row }) => !orphans.has(row.id)).map(({ row }) => row),
-					orphanChildren: rows.filter(({ row }) => orphans.has(row.id)).map(({ row }) => row),
+					// The frame's rows, each followed by the rows nested under it.
+					topLevel: rows.filter((row) => !orphans.has(row.id)),
+					orphanChildren: rows.filter((row) => orphans.has(row.id)),
 				},
 			];
 		}
