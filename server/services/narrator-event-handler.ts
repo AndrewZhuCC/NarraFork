@@ -1672,15 +1672,14 @@ export async function processEvent(
 	switch (event.type) {
 		case "stream_text": {
 			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
+			const textBlockId = event.blockId;
 			const fileReferenceContext = ctx.fileReferenceContexts.capture(
-				event.outputIndex,
+				textBlockId,
 				ctx.getFileReferenceContext,
-				event.blockId,
 			);
-			const textBlockId = event.blockId ?? ctx.fileReferenceContexts.blockId(event.outputIndex);
 			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
 			const existing = snap.streamingBlocks.find((b) => b.type === "text" && b.id === textBlockId);
-			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const base = ctx.committedContentSnapshots?.get(textBlockId);
 			const latestRevision = existing?.type === "text" ? existing.revision : base?.revision;
 			if (
 				event.blockRevision != null &&
@@ -1703,12 +1702,7 @@ export async function processEvent(
 			// Track AI output character rate
 			recordOutputChunk(event.text.length);
 			// A subagent's reply length is the parent card's live progress signal.
-			noteSubagentOutputText(
-				ctx,
-				textBlockId ?? `output:${event.outputIndex ?? 0}`,
-				event.text,
-				event.blockTextOffset,
-			);
+			noteSubagentOutputText(ctx, textBlockId, event.text, event.blockTextOffset);
 
 			// Text snapshots belong to the actual author (also on a subagent's own
 			// page), never to a different narrator sharing the parent's subscription.
@@ -1966,27 +1960,11 @@ export async function processEvent(
 		case "block_complete": {
 			const { block } = event;
 			const snapshotNarratorId = ctx.parentToolUseId ? narratorId : broadcastTargetId;
-			const textBlockId =
-				block.type === "text"
-					? (block.id ?? ctx.fileReferenceContexts?.blockId(block.outputIndex))
-					: undefined;
-			const mixedTextSources =
-				block.type === "text" && !block.id && ctx.fileReferenceContexts?.hasDifferentContexts();
-			let fileReferenceContext =
-				block.type === "text"
-					? (ctx.fileReferenceContexts?.peek(block.outputIndex, block.id) ?? null)
-					: null;
-			if (mixedTextSources && block.type === "text") {
-				// The loop can combine multiple output items into one block_complete.
-				// Unless this is provably the exact lane, a mixed-device body has no
-				// single trustworthy base. Keep the text; only disable inferred links.
-				const streamed = streamingSnapshots
-					.get(ctx.parentToolUseId ? narratorId : broadcastTargetId)
-					?.streamingBlocks.find(
-						(candidate) => candidate.type === "text" && candidate.id === textBlockId,
-					);
-				if (streamed?.type !== "text" || streamed.text !== block.text) fileReferenceContext = null;
-			}
+			const textBlockId = block.type === "text" ? block.id : undefined;
+			// The element's own context; a text block without an element id names no
+			// device to resolve its links against, so it gets none.
+			const fileReferenceContext =
+				block.type === "text" ? (ctx.fileReferenceContexts?.peek(block.id) ?? null) : null;
 
 			// Capture the exact live object, but keep it visible until BOTH persistence
 			// and publication finish. A later delta may advance it while we await I/O.
@@ -2110,13 +2088,6 @@ export async function processEvent(
 					...(block.citations ? { citations: block.citations } : {}),
 				});
 				retireCompletedSnapshot();
-				if (
-					!block.id &&
-					ctx.fileReferenceContexts?.blockId(block.outputIndex) === textBlockId &&
-					(!completedSnapshot || !snap?.streamingBlocks.includes(completedSnapshot))
-				) {
-					ctx.fileReferenceContexts?.complete(block.outputIndex);
-				}
 			} else if (block.type === "reasoning") {
 				await persistContentCheckpoint(ctx, partialId, {
 					type: "reasoning",
@@ -3020,18 +2991,14 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
-			// Provider itemId is replay metadata, not the attempt-scoped display ID.
-			// Keep its legacy fallback only when the producer has no loop identity.
-			const reasoningId = event.blockId ?? event.providerMetadata?.openai?.itemId;
+			// The loop's attempt-scoped element id; a provider itemId is replay metadata only.
+			const reasoningId = event.blockId;
 			const reasoningOutputIndex = event.outputIndex;
 			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
-			const existing = snap.streamingBlocks.find((b) => {
-				if (b.type !== "reasoning") return false;
-				if (reasoningId) return b.id === reasoningId;
-				if (reasoningOutputIndex != null) return b.outputIndex === reasoningOutputIndex;
-				return !b.id && b.outputIndex == null;
-			});
-			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const existing = snap.streamingBlocks.find(
+				(b) => b.type === "reasoning" && b.id === reasoningId,
+			);
+			const base = ctx.committedContentSnapshots?.get(reasoningId);
 			const latestRevision = existing?.type === "reasoning" ? existing.revision : base?.revision;
 			if (
 				event.blockRevision != null &&

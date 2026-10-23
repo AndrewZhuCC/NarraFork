@@ -439,8 +439,11 @@ export type AgentEvent =
 			type: "stream_text";
 			text: string;
 			outputIndex?: number;
-			/** Attempt-scoped identity and revision shared with persisted content. */
-			blockId?: string;
+			/**
+			 * Attempt-scoped identity and revision shared with persisted content: every delta
+			 * names its element, so clients match it to its block (protocol v2).
+			 */
+			blockId: string;
 			blockRevision?: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
 			blockTextOffset?: number;
@@ -715,7 +718,8 @@ export type AgentEvent =
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
-			blockId?: string;
+			/** As on `stream_text`: the element this delta extends. */
+			blockId: string;
 			blockRevision?: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
 			blockTextOffset?: number;

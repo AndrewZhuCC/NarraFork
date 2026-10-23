@@ -1183,7 +1183,7 @@ describe("real shared orchestrator profile contract", () => {
 		const h = fixture(profiles[1], [
 			async (options) => {
 				await processEvent(
-					{ type: "stream_text", text: "child output" },
+					{ type: "stream_text", blockId: "text-2", text: "child output" },
 					options.eventContext,
 					options.hooks,
 				);
