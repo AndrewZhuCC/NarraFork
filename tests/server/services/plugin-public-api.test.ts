@@ -152,7 +152,6 @@ describe("PluginPublicApi", () => {
 	test("uses strict query/command registries and rejects unknown IDs", async () => {
 		const { api, broker } = buildApi();
 		expect(api.queries.listIds()).toEqual([
-			"narrafork.chapters.list",
 			"narrafork.narrator.messages.list",
 			"narrafork.narrators.list",
 			"narrafork.plugin.getOwn",
@@ -189,9 +188,19 @@ describe("PluginPublicApi", () => {
 		);
 		expect(command.status).toBe("failed");
 		expect(command.error?.code).toBe("METHOD_NOT_FOUND");
+
+		// The chapters query was removed with chapters.
+		const chaptersContext = context();
+		const chapters = await api.query(
+			chaptersContext,
+			createQueryRequest(chaptersContext, "narrafork.chapters.list", { projectId: "project-1" }),
+		);
+		expect(chapters.status).toBe("failed");
+		if (chapters.status === "failed") expect(chapters.error.code).toBe("METHOD_NOT_FOUND");
 		expect(broker.calls.map((call) => call.methodId)).toEqual([
 			"narrafork.projects.get",
 			"narrafork.projects.delete",
+			"narrafork.chapters.list",
 		]);
 	});
 
@@ -373,7 +382,7 @@ describe("PluginPublicApi", () => {
 		const commands = new CommandRegistry();
 		commands.register({
 			commandId: "narrafork.test.identity",
-			capability: "command.chapter.write",
+			capability: "command.routine.write",
 			inputSchema: z
 				.object({
 					pluginId: z.string(),
@@ -502,7 +511,7 @@ describe("PluginPublicApi", () => {
 		const commands = new CommandRegistry();
 		commands.register({
 			commandId: "narrafork.test.side-effect",
-			capability: "command.chapter.write",
+			capability: "command.routine.write",
 			inputSchema: z.object({ value: z.string() }).strict(),
 			sideEffect: "idempotent",
 			idempotency: "required",
@@ -604,7 +613,7 @@ describe("PluginPublicApi", () => {
 		expect(serialized).not.toContain("/home/user/private/file");
 	});
 
-	test("projects, chapters, and plugins expose allowlisted summaries only", async () => {
+	test("projects, narrators, and plugins expose allowlisted summaries only", async () => {
 		const adapters: PluginPublicApiAdapters = {
 			plugins: {
 				async list() {
@@ -622,16 +631,22 @@ describe("PluginPublicApi", () => {
 					return projectRows().slice(0, input.limit);
 				},
 			},
-			chapters: {
+			narrators: {
 				async list() {
 					return [
 						{
-							id: "chapter-1",
+							id: "narrator-1",
 							projectId: "project-c",
-							title: "Safe chapter",
-							status: "active",
-							role: "branch",
-							commitCount: 3,
+							title: "Safe narrator",
+							handle: null,
+							variant: "primary",
+							type: "primary",
+							status: "idle",
+							substatus: [],
+							model: null,
+							permissionMode: null,
+							messageCount: 3,
+							lastMessageAt: null,
 							createdAt: "2026-07-16T01:00:00.000Z",
 							updatedAt: "2026-07-16T02:00:00.000Z",
 							contentJson: { private: true },
@@ -640,6 +655,9 @@ describe("PluginPublicApi", () => {
 							worktreePath: "/home/private/worktree",
 						} as never,
 					];
+				},
+				async listMessages() {
+					return [];
 				},
 			},
 		};
@@ -650,13 +668,10 @@ describe("PluginPublicApi", () => {
 			pluginContext,
 			createQueryRequest(pluginContext, "narrafork.plugins.list", { limit: 10 }),
 		);
-		const chapterContext = context({ scope: { projectId: "project-c" } });
-		const chapters = await api.query(
-			chapterContext,
-			createQueryRequest(chapterContext, "narrafork.chapters.list", {
-				projectId: "project-c",
-				limit: 10,
-			}),
+		const narratorContext = context({ scope: { projectId: "project-c" } });
+		const narrators = await api.query(
+			narratorContext,
+			createQueryRequest(narratorContext, "narrafork.narrators.list", { limit: 10 }),
 		);
 		const projectContext = context();
 		const projects = await api.query(
@@ -665,9 +680,9 @@ describe("PluginPublicApi", () => {
 		);
 
 		expect(plugins.status).toBe("succeeded");
-		expect(chapters.status).toBe("succeeded");
+		expect(narrators.status).toBe("succeeded");
 		expect(projects.status).toBe("succeeded");
-		const serialized = JSON.stringify({ plugins, chapters, projects });
+		const serialized = JSON.stringify({ plugins, narrators, projects });
 		expect(serialized).not.toContain("contentJson");
 		expect(serialized).not.toContain("rawDumpJson");
 		expect(serialized).not.toContain("outputJson");

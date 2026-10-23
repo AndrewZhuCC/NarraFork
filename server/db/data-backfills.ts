@@ -132,25 +132,7 @@ export async function applySqliteDataBackfills(
 			});
 		}
 
-		// 2. Ensure standalone trait for narrators without a chapter
-		const fixStandalone = sqlite
-			.prepare(
-				`UPDATE narrators SET traits = CASE
-					WHEN traits = '[]' THEN '["standalone"]'
-					WHEN traits LIKE '%]' THEN SUBSTR(traits, 1, LENGTH(traits) - 1) || ',"standalone"]'
-					ELSE '["standalone"]'
-				 END
-				 WHERE chapter_id IS NULL
-				   AND traits NOT LIKE '%"standalone"%'`,
-			)
-			.run();
-		if (fixStandalone.changes > 0) {
-			logger.info("Backfilled standalone trait for chapter-less narrators", {
-				count: fixStandalone.changes,
-			});
-		}
-
-		// 3. Ensure background trait for narrators with is_background=1
+		// 2. Ensure background trait for narrators with is_background=1
 		const fixBg = sqlite
 			.prepare(
 				`UPDATE narrators SET traits = CASE
@@ -167,7 +149,7 @@ export async function applySqliteDataBackfills(
 			});
 		}
 
-		// 4. Ensure ask-in-passing trait for narrators with is_ask_in_passing=1
+		// 3. Ensure ask-in-passing trait for narrators with is_ask_in_passing=1
 		const fixAip = sqlite
 			.prepare(
 				`UPDATE narrators SET traits = CASE

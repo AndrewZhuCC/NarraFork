@@ -1,15 +1,13 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
-import { eq, inArray } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { db } from "../../db";
 import {
 	backgroundTasks,
-	chapters,
 	narratorMessages,
 	narrators,
-	projects,
 	scheduledTaskRuns,
 	scheduledTasks,
 	terminals,
@@ -42,8 +40,6 @@ const { scheduledTaskRoutes } = await import("../../routes/scheduled-tasks");
 
 const taskIds: string[] = [];
 const narratorIds: string[] = [];
-const projectIds: string[] = [];
-const chapterIds: string[] = [];
 const old = new Date(Date.now() - 60 * 86_400_000).toISOString();
 
 async function task(policy: ScheduledTaskCleanupPolicy = { mode: "none" }) {
@@ -66,7 +62,7 @@ async function narrator(
 	await db.insert(narrators).values({
 		id,
 		scheduledTaskId: taskId,
-		traits: taskId ? ["scheduled"] : [],
+		traits: taskId ? ["standalone", "scheduled"] : ["standalone"],
 		createdAt: old,
 		updatedAt: old,
 		status: "idle",
@@ -84,27 +80,6 @@ async function exists(id: string) {
 	}));
 }
 
-async function chapter() {
-	const projectId = generateId();
-	const chapterId = generateId();
-	const at = new Date().toISOString();
-	await db
-		.insert(projects)
-		.values({ id: projectId, name: "cleanup", gitPath: "/unused", createdAt: at, updatedAt: at });
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "cleanup",
-		branch: "cleanup",
-		baseBranch: "main",
-		createdAt: at,
-		updatedAt: at,
-	});
-	projectIds.push(projectId);
-	chapterIds.push(chapterId);
-	return chapterId;
-}
-
 afterEach(async () => {
 	runningLoops.clear();
 	failDispatch = false;
@@ -119,10 +94,6 @@ afterEach(async () => {
 	}
 	for (const id of narratorIds.splice(0)) if (await exists(id)) await narratorService.remove(id);
 	for (const id of taskIds.splice(0)) await scheduledTaskService.delete(id);
-	if (chapterIds.length)
-		await db.delete(chapters).where(inArray(chapters.id, chapterIds.splice(0)));
-	if (projectIds.length)
-		await db.delete(projects).where(inArray(projects.id, projectIds.splice(0)));
 });
 
 describe("task-scoped narrator retention", () => {
@@ -203,13 +174,12 @@ describe("task-scoped narrator retention", () => {
 		for (const id of [other, ordinary, legacy]) expect(await exists(id)).toBe(true);
 	});
 
-	test("protects running loops, status, terminals, background sessions and chapter bindings, including children", async () => {
+	test("protects running loops, status, terminals and background sessions, including children", async () => {
 		const t = await task({ mode: "olderThanDays", olderThanDays: 1 });
 		const loop = await narrator(t.id);
 		runningLoops.add(loop);
 		const status = await narrator(t.id, { status: "working" });
 		const background = await narrator(t.id, { isBackground: true, backgroundStatus: "running" });
-		const bound = await narrator(t.id, { chapterId: await chapter() });
 		const terminalRoot = await narrator(t.id);
 		const terminalChild = await narrator(null, {
 			parentNarratorId: terminalRoot,
@@ -221,8 +191,8 @@ describe("task-scoped narrator retention", () => {
 			.values({ id: generateId(), narratorId: terminalChild, name: "running", createdAt: old });
 		const result = await cleanupScheduledTaskNarrators(t.id);
 		expect(result.deletedRoots).toBe(0);
-		expect(result.blockedRoots).toBe(5);
-		for (const id of [loop, status, background, bound, terminalRoot, terminalChild])
+		expect(result.blockedRoots).toBe(4);
+		for (const id of [loop, status, background, terminalRoot, terminalChild])
 			expect(await exists(id)).toBe(true);
 	});
 

@@ -1,25 +1,12 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { AppError, ValidationError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
+import { VIEW_SURFACES, type ViewSurface } from "@server/lib/plugins/manifest";
 import type { InvocationScope } from "./plugin-capability-broker";
 
 export type PluginUiSurfaceScope = "workspace" | "narrator" | "project" | "global";
-/**
- * Host surfaces a plugin UI session may be opened on.
- *
- * `graph` is a chapter node's embedded dock on the story-network canvas. Like
- * `focus` it hosts exactly one narrator, so the two form a "focus family": a
- * contribution that declares only `focus` is still accepted on `graph` (see
- * `isSurfaceAllowedForView` in `routes/plugin-ui.ts`). Reported separately so a
- * plugin can opt into declaring node support explicitly.
- */
-export type PluginUiSurface =
-	| "workspace"
-	| "director"
-	| "focus"
-	| "graph"
-	| "settings"
-	| "provider-settings";
+/** Host surfaces a plugin UI session may be opened on. */
+export type PluginUiSurface = ViewSurface;
 
 export interface PluginUiSessionBinding {
 	pluginId: string;
@@ -144,7 +131,7 @@ export class PluginUiSessionService {
 		if (binding.scope) {
 			for (const [key, value] of Object.entries(binding.scope)) {
 				if (
-					!"userId projectId chapterId workspaceId narratorId deviceId providerInstanceId"
+					!"userId projectId workspaceId narratorId deviceId providerInstanceId"
 						.split(" ")
 						.includes(key)
 				)
@@ -152,11 +139,7 @@ export class PluginUiSessionService {
 				assertText(String(value), `scope.${key}`, 128);
 			}
 		}
-		if (
-			!["workspace", "director", "focus", "graph", "settings", "provider-settings"].includes(
-				binding.surface,
-			)
-		) {
+		if (!(VIEW_SURFACES as readonly string[]).includes(binding.surface)) {
 			throw new ValidationError("Invalid surface");
 		}
 		if (!["workspace", "narrator", "project", "global"].includes(binding.surfaceScope)) {

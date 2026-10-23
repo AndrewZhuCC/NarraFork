@@ -837,26 +837,6 @@ describe("sidebar tab close cascades to workspace membership", () => {
 
 	it("closing a grouped narrator tab removes its panel membership and announces it", async () => {
 		seedGroupedWorkspaceWithNarrator();
-		// A chapter tab grouped under the workspace via its narrator: it must be
-		// released to the top level with the narrator's membership, matching what
-		// `removeWorkspacePanel`'s projection does in the reverse direction.
-		db.insert(userRecentTabs)
-			.values({
-				id: "tab-ch1",
-				userId: "workspace-user",
-				tabKey: "chapter:ch1",
-				section: "work",
-				type: "chapter",
-				entityId: "ch1",
-				narratorId: "n1",
-				workspaceId: "ws",
-				title: "ch1",
-				lastVisitedAt: 99,
-				sortOrder: 2,
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
-			.run();
 		broadcasts.length = 0;
 
 		const result = await removeRecentTab("workspace-user", "narrator", "n1");
@@ -868,48 +848,9 @@ describe("sidebar tab close cascades to workspace membership", () => {
 		expect(
 			db.select().from(userRecentTabs).where(eq(userRecentTabs.tabKey, "narrator:n1")).all(),
 		).toHaveLength(0);
-		// The chapter tab survives but is released from the group.
-		expect(
-			db
-				.select({ workspaceId: userRecentTabs.workspaceId })
-				.from(userRecentTabs)
-				.where(eq(userRecentTabs.tabKey, "chapter:ch1"))
-				.get()?.workspaceId,
-		).toBe(null);
 		expect(workspaceChangedEvents()).toEqual([
 			{ type: "workspace_changed", workspaceId: "ws", reason: "membership" },
 		]);
-	});
-
-	it("closing a grouped CHAPTER tab keeps its narrator's membership", async () => {
-		seedGroupedWorkspaceWithNarrator();
-		// A chapter tab groups with the workspace only because its narrator is a
-		// member (`getTabNarratorId` maps it); the chapter itself is not a panel.
-		db.insert(userRecentTabs)
-			.values({
-				id: "tab-ch1",
-				userId: "workspace-user",
-				tabKey: "chapter:ch1",
-				section: "work",
-				type: "chapter",
-				entityId: "ch1",
-				narratorId: "n1",
-				workspaceId: "ws",
-				title: "ch1",
-				lastVisitedAt: 99,
-				sortOrder: 2,
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
-			.run();
-		broadcasts.length = 0;
-
-		await removeRecentTab("workspace-user", "chapter", "ch1");
-
-		expect(
-			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
-		).toHaveLength(1);
-		expect(workspaceChangedEvents()).toEqual([]);
 	});
 
 	it("closing an UNGROUPED narrator tab announces nothing", async () => {

@@ -12,23 +12,15 @@ const { db, sqlite } = getTestDb();
 // back. Bun's mock.module is process-wide and mock.restore() does NOT undo it.
 const realDbModule = { ...(await import("../../../server/db")) };
 const realTerminalService = { ...(await import("../../../server/services/terminal-service")) };
-const realWorktreeWatcher = { ...(await import("../../../server/services/worktree-watcher")) };
 const realAdminModules: Record<string, () => unknown> = {
 	"../../../server/db": () => realDbModule,
 	"../../../server/services/terminal-service": () => realTerminalService,
-	"../../../server/services/worktree-watcher": () => realWorktreeWatcher,
 };
 
 mock.module("../../../server/db", () => ({ db, sqlite }));
 mock.module("../../../server/services/terminal-service", () => ({
 	terminalService: {
 		listAll: async () => [{ status: "running" }, { status: "exited" }],
-	},
-}));
-mock.module("../../../server/services/worktree-watcher", () => ({
-	worktreeWatcher: {
-		getActivePaths: () => ["/repo/.worktrees/chapter-a"],
-		getActiveCount: () => 1,
 	},
 }));
 
@@ -105,10 +97,10 @@ describe("admin diagnostics", () => {
 		const body = (await res.json()) as {
 			narrators: { thinking: number; waiting: number };
 			terminals: { total: number; running: number };
-			worktreeWatchers: { count: number; paths: string[] };
+			worktreeWatchers?: unknown;
 		};
 		expect(body.narrators).toEqual({ thinking: 2, waiting: 1 });
 		expect(body.terminals).toEqual({ total: 2, running: 1 });
-		expect(body.worktreeWatchers).toEqual({ count: 1, paths: ["/repo/.worktrees/chapter-a"] });
+		expect(body.worktreeWatchers).toBeUndefined();
 	});
 });

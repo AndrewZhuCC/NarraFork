@@ -28,7 +28,7 @@
 		"startupTimeoutMs": 15000,
 		"activationTimeoutMs": 30000
 	},
-	"activationEvents": ["onCommand:hello", "onEvent:chapter.changed"],
+	"activationEvents": ["onCommand:hello", "onEvent:project.changed"],
 	"contributes": {
 		"commands": [
 			{
@@ -39,12 +39,12 @@
 		],
 		"events": [
 			{
-				"id": "chapterChanged",
-				"topic": "chapter.changed",
+				"id": "projectChanged",
+				"topic": "project.changed",
 				"filter": {
 					"type": "object",
 					"properties": {
-						"chapterId": { "type": "string" }
+						"projectId": { "type": "string" }
 					}
 				}
 			}
@@ -59,7 +59,7 @@
 		}
 	},
 	"permissions": {
-		"host": ["query.chapters.read", "ui.panel"],
+		"host": ["query.projects.read", "ui.panel"],
 		"network": {
 			"mode": "none",
 			"allow": []

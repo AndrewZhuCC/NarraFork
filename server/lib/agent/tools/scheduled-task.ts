@@ -1,4 +1,5 @@
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES } from "@shared/i18n-locales";
+import { normalizeRunContext } from "@shared/scheduled-task-run-context";
 import { z } from "zod/v4";
 import type { scheduledTasks } from "../../../db/schema";
 import { isValidCron, nextCronRun } from "../../cron";
@@ -46,7 +47,7 @@ async function getService() {
 const RUNS_LIMIT_MAX = 50;
 const RUNS_LIMIT_DEFAULT = 10;
 
-const runContextEnum = z.enum(["standalone", "chapter"]);
+const runContextEnum = z.enum(["standalone", "project"]);
 const narratorModeEnum = z.enum(["new", "reuse"]);
 
 /**
@@ -93,20 +94,21 @@ const taskFieldsSchema = z.object({
 	runContext: runContextEnum
 		.optional()
 		.describe(
-			'"standalone" runs in its own session at `cwd`; "chapter" runs inside a chapter worktree and requires projectId + chapterId.',
+			'"standalone" runs in its own session at `cwd`; "project" runs as a session of the project (at `cwd`, else the project directory) and requires projectId.',
 		),
 	cwd: z
 		.string()
 		.max(4096)
 		.nullable()
 		.optional()
-		.describe("Working directory for standalone runs. Defaults to the home directory."),
-	projectId: z.string().max(100).nullable().optional().describe("Required for chapter runContext."),
-	chapterId: z.string().max(100).nullable().optional().describe("Required for chapter runContext."),
+		.describe(
+			"Working directory for the run. Defaults to the project directory for project runs, else the home directory.",
+		),
+	projectId: z.string().max(100).nullable().optional().describe("Required for project runContext."),
 	narratorMode: narratorModeEnum
 		.optional()
 		.describe(
-			'Standalone only: "new" creates a fresh narrator per run, "reuse" keeps appending to the same session.',
+			'"new" creates a fresh narrator per run, "reuse" keeps appending to the same session.',
 		),
 	enabled: z.boolean().optional().describe("Whether the schedule is armed."),
 });
@@ -177,8 +179,7 @@ function summarizeTask(task: TaskRow) {
 		lastRunAt: task.lastRunAt,
 		lastStatus: task.lastStatus,
 		...(task.lastError ? { lastError: truncate(task.lastError, 200) } : {}),
-		runContext: task.runContext,
-		...(task.chapterId ? { chapterId: task.chapterId } : {}),
+		runContext: normalizeRunContext(task.runContext),
 		permissionMode: task.permissionMode,
 		promptChars: task.prompt.length,
 		...(task.systemPrompt ? { systemPromptChars: task.systemPrompt.length } : {}),
@@ -229,20 +230,15 @@ function validateSchedule(
 }
 
 /**
- * Chapter runs need both ids. Checked here rather than only in the service so the
+ * Project runs need a project id. Checked here rather than only in the service so the
  * model is told which field is missing instead of getting the service's message.
  */
-function validateChapterContext(
+function validateProjectContext(
 	runContext: string,
 	projectId: string | null | undefined,
-	chapterId: string | null | undefined,
 ): string | null {
-	if (runContext !== "chapter") return null;
-	const missing: string[] = [];
-	if (!projectId) missing.push("projectId");
-	if (!chapterId) missing.push("chapterId");
-	if (missing.length === 0) return null;
-	return `runContext "chapter" requires ${missing.join(" and ")}.`;
+	if (runContext !== "project" || projectId) return null;
+	return 'runContext "project" requires projectId.';
 }
 
 export const scheduledTaskTool: ToolDefinition = {
@@ -251,7 +247,7 @@ export const scheduledTaskTool: ToolDefinition = {
 		"Manage NarraFork scheduled tasks (cron-driven prompts that launch a narrator unattended). " +
 		"Actions: list, get, create, update, enable, disable, delete, run_now (trigger immediately), " +
 		"runs (run history). A task runs on a cron schedule and injects its prompt into a new or " +
-		"reused narrator, either standalone or inside a chapter worktree. Mutating actions require " +
+		"reused narrator, either standalone or as a project session. Mutating actions require " +
 		"user approval because a scheduled task keeps executing after this session ends.",
 	parameters: parametersSchema,
 	async execute(args, ctx): Promise<ToolResult> {
@@ -306,11 +302,7 @@ export const scheduledTaskTool: ToolDefinition = {
 					const runContext = fields.runContext ?? "standalone";
 					const scheduleError = validateSchedule(fields.cronExpr, fields.timezone);
 					if (scheduleError) return fail(scheduleError);
-					const contextError = validateChapterContext(
-						runContext,
-						fields.projectId,
-						fields.chapterId,
-					);
+					const contextError = validateProjectContext(runContext, fields.projectId);
 					if (contextError) return fail(contextError);
 
 					const created = await service.create({
@@ -346,10 +338,9 @@ export const scheduledTaskTool: ToolDefinition = {
 						const tzError = validateSchedule(existing.cronExpr, fields.timezone);
 						if (tzError) return fail(tzError);
 					}
-					const contextError = validateChapterContext(
-						fields.runContext ?? existing.runContext,
+					const contextError = validateProjectContext(
+						fields.runContext ?? normalizeRunContext(existing.runContext),
 						fields.projectId !== undefined ? fields.projectId : existing.projectId,
-						fields.chapterId !== undefined ? fields.chapterId : existing.chapterId,
 					);
 					if (contextError) return fail(contextError);
 

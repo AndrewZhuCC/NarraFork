@@ -97,10 +97,10 @@ export async function resolveSubagentModelInheritance(
 		where: eq(narrators.id, sourceId),
 		columns: {
 			...RUNTIME_SOURCE_COLUMNS,
+			id: true,
 			model: true,
 			reasoningEffort: true,
 			traits: true,
-			chapterId: true,
 			contextProjectId: true,
 		},
 	});

@@ -2,8 +2,8 @@
  * Per-user git commit identity.
  *
  * NarraFork is a multi-user deployment where every commit — whether the model
- * runs `git commit` through the Bash tool, or a merge/dormant auto-save goes
- * through `gitService` — used to land under the HOST machine's global
+ * runs `git commit` through the Bash tool, or the Git panel commits through
+ * `gitService` — used to land under the HOST machine's global
  * `user.name`/`user.email`. With several people driving the same server that
  * makes the whole history look like one author's work.
  *

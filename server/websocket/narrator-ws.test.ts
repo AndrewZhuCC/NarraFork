@@ -7,7 +7,6 @@ import {
 import { cleanDb, getTestDb } from "../../tests/setup";
 import {
 	backgroundTasks,
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -88,22 +87,11 @@ async function seedNarrators() {
 			updatedAt: now,
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "chapter-ws",
-			projectId: "project-ws",
-			title: "WebSocket Test",
-			branch: "chapter/ws-test",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
 	db.insert(narrators)
 		.values([
 			{
 				id: "narrator-working",
-				chapterId: "chapter-ws",
+				contextProjectId: "project-ws",
 				status: "working",
 				substatus: '["reasoning"]',
 				turnStartedAt: now,
@@ -115,7 +103,7 @@ async function seedNarrators() {
 			},
 			{
 				id: "narrator-idle",
-				chapterId: "chapter-ws",
+				contextProjectId: "project-ws",
 				status: "idle",
 				substatus: "[]",
 				visibility: "public",

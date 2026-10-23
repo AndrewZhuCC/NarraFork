@@ -5,8 +5,8 @@ import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	aclGrants,
-	chapters,
 	narratorMessages,
+	narratorProjectLinks,
 	narratorQuestions,
 	narrators,
 	narratorToolCalls,
@@ -258,7 +258,7 @@ describe("human attention discovery", () => {
 		await expect(detail(reader, `question:${id}`)).rejects.toBeInstanceOf(NotFoundError);
 	});
 
-	test("project membership gates read and write separately, including standalone project context", async () => {
+	test("project membership gates read and write separately, for cwd-derived and explicit project context", async () => {
 		await db.insert(projects).values({
 			id: "p",
 			name: "Project",
@@ -268,26 +268,29 @@ describe("human attention discovery", () => {
 			createdAt: now,
 			updatedAt: now,
 		});
-		await db.insert(chapters).values({
-			id: "ch",
-			projectId: "p",
-			title: "Chapter",
-			branch: "test",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		});
+		// Sessions whose working directory the project index placed in the project.
+		const linkToProject = (narratorId: string) =>
+			db.insert(narratorProjectLinks).values({
+				narratorId,
+				projectId: "p",
+				role: "primary",
+				source: "cwd",
+				directory: "/unused/work",
+				updatedAt: now,
+			});
 		await narrator("project-n", {
-			chapterId: "ch",
+			cwd: "/unused/work",
 			visibility: "project",
 			writeAudience: "project",
 		});
+		await linkToProject("project-n");
 		await narrator("context-n", {
 			contextProjectId: "p",
 			visibility: "project",
 			writeAudience: "project",
 		});
-		await narrator("private-n", { chapterId: "ch", visibility: "private" });
+		await narrator("private-n", { cwd: "/unused/work", visibility: "private" });
+		await linkToProject("private-n");
 		await question("project-n");
 		await question("context-n");
 		await question("private-n");

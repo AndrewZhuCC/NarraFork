@@ -23,7 +23,7 @@
 	"activationEvents": ["onStartup"],
 	"contributes": {},
 	"permissions": {
-		"host": ["query.read.projects", "command.chapter.write"],
+		"host": ["query.read.projects", "command.routine.write"],
 		"network": { "mode": "none", "allow": [] },
 		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
 		"process": { "spawn": "none" }

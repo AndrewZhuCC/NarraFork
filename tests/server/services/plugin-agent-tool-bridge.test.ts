@@ -80,7 +80,6 @@ function context(): ToolContext {
 		locale: "en",
 		userId: "user-1",
 		projectId: "project-1",
-		chapterId: "chapter-1",
 		currentToolUseId: "tooluse-1",
 		requestPermission: async () => ({ behavior: "allow" }),
 	};

@@ -12,10 +12,9 @@
  *     that a nonexistent id is absent tests the fixture, not the gate.
  *
  * Covered: visibility (public/private), authority (admin / owner / read / write / manage
- * grant), the `domain_kind` trap, unknown and missing principals, cross-project chapter
- * reads, the graph's five edge types and its narrator/container/detached-panel auxiliary
- * data, cursor paging where every row shares `updatedAt`, limit clamping, and the 200/201
- * truncation caps.
+ * grant), the `domain_kind` trap, unknown and missing principals, cursor paging where every
+ * row shares `updatedAt`, byte-order collation of mixed-case ids, limit clamping, the 200-row
+ * truncation cap, and the access-blind existence probe.
  */
 
 import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
@@ -28,23 +27,12 @@ import { READ_LIMITS } from "../../../../server/services/read/project-read-adapt
 import { cleanDb, getTestDb } from "../../../setup";
 import { type FixtureTable, seedFixtures } from "./read-fixture-seed";
 import {
-	BULK_CHAPTER_COUNT,
 	BULK_PROJECT_COUNT,
-	bulkChapterIds,
 	bulkProjectIds,
-	CASE_MIX_CHAPTER_IDS,
-	CASE_MIX_CHAPTER_IDS_BYTE_ORDER,
-	CASE_MIX_EDGE_IDS,
-	CASE_MIX_EDGE_IDS_BYTE_ORDER,
 	CASE_MIX_PROJECT_IDS,
 	CASE_MIX_PROJECT_IDS_BYTE_ORDER,
-	CHAPTER,
 	caseInsensitiveOrderDiffers,
-	EDGE,
 	GHOST_USER,
-	NARRATOR,
-	PRIV_CHAPTER_IDS_ORDERED,
-	PRIV_EDGE_IDS,
 	PROJECT,
 	USER,
 } from "./read-fixtures";
@@ -62,10 +50,6 @@ const adapter = new SqliteProjectReadAdapter();
 const TABLES: Record<FixtureTable, unknown> = {
 	users: schema.users,
 	projects: schema.projects,
-	chapters: schema.chapters,
-	chapterEdges: schema.chapterEdges,
-	narrators: schema.narrators,
-	containerInstances: schema.containerInstances,
 	aclGrants: schema.aclGrants,
 };
 
@@ -233,7 +217,8 @@ describe("listProjects cursor paging", () => {
 		expect(negative.rows).toHaveLength(1);
 
 		const huge = await adapter.listProjects(principal(USER.bulk), { limit: 5000 });
-		expect(huge.rows).toHaveLength(200);
+		expect(huge.rows).toHaveLength(READ_LIMITS.projectPage);
+		expect(READ_LIMITS.projectPage).toBe(200);
 		// 206 rows are visible to u_bulk (205 bulk + p_bulk), so paging must continue.
 		expect(huge.nextCursor).not.toBeNull();
 
@@ -269,12 +254,7 @@ describe("mixed-case ids: byte order is the actual contract", () => {
 		// A fixture claiming to expose a collation difference must actually have one. This
 		// fails loudly if a later edit normalises the ids to a single case, which is exactly
 		// the edit that let the original defect hide for so long.
-		for (const ids of [
-			CASE_MIX_PROJECT_IDS,
-			CASE_MIX_CHAPTER_IDS,
-			CASE_MIX_EDGE_IDS,
-			bulkProjectIds(),
-		]) {
+		for (const ids of [CASE_MIX_PROJECT_IDS, bulkProjectIds()]) {
 			expect(caseInsensitiveOrderDiffers(ids)).toBe(true);
 		}
 	});
@@ -317,25 +297,9 @@ describe("mixed-case ids: byte order is the actual contract", () => {
 		expect(new Set(seen).size).toBe(seen.length);
 	});
 
-	it("orders chapters by id in byte order when every row shares createdAt", async () => {
-		const rows = (await adapter.listChapters(PROJECT.caseMix, principal(USER.caseMix))) as Array<{
-			id: string;
-		}>;
-		expect(rows.map((row) => row.id)).toEqual([...CASE_MIX_CHAPTER_IDS_BYTE_ORDER]);
-	});
-
-	it("orders graph chapters and edges by id in byte order", async () => {
-		const graph = (await adapter.getGraph(PROJECT.caseMix, principal(USER.caseMix))) as {
-			chapters: Array<{ id: string }>;
-			edges: Array<{ id: string }>;
-		};
-		expect(graph.chapters.map((ch) => ch.id)).toEqual([...CASE_MIX_CHAPTER_IDS_BYTE_ORDER]);
-		expect(graph.edges.map((edge) => edge.id)).toEqual([...CASE_MIX_EDGE_IDS_BYTE_ORDER]);
-	});
-
-	it("keeps byte order across the 200-row clamp and the 201-row chapter cap", async () => {
+	it("keeps byte order across the 200-row clamp", async () => {
 		// The bulk ids interleave two letter cases by number (`bA001`, `ba001`, `bA002`, …).
-		// Byte order therefore keeps a DIFFERENT SET at the caps than a case-insensitive
+		// Byte order therefore keeps a DIFFERENT SET at the clamp than a case-insensitive
 		// locale would, not merely a reshuffled one — so these expectations cannot pass
 		// under a locale collation.
 		const clamped = await adapter.listProjects(principal(USER.bulk), { limit: 5000 });
@@ -346,14 +310,7 @@ describe("mixed-case ids: byte order is the actual contract", () => {
 		// (`p_ba…`), so the first 200 rows are all 103 uppercase ids plus 97 lowercase ones.
 		expect(projectIds.filter((id) => id.startsWith("p_bA"))).toHaveLength(103);
 		expect(projectIds.filter((id) => id.startsWith("p_ba"))).toHaveLength(97);
-
-		const chapters = (await adapter.listChapters(PROJECT.bulk, principal(USER.bulk))) as Array<{
-			id: string;
-		}>;
-		expect(chapters).toHaveLength(201);
-		expect(chapters.map((row) => row.id)).toEqual([...chapters.map((row) => row.id)].sort());
-		expect(chapters.filter((row) => row.id.startsWith("c_bkA"))).toHaveLength(103);
-		expect(chapters.filter((row) => row.id.startsWith("c_bka"))).toHaveLength(98);
+		expect(BULK_PROJECT_COUNT).toBeGreaterThan(projectIds.length);
 	});
 });
 
@@ -381,220 +338,13 @@ describe("getProject", () => {
 	});
 });
 
-describe("listChapters and getChapter", () => {
-	it("returns the project's chapters in createdAt,id order for a grant holder", async () => {
-		const rows = (await adapter.listChapters(PROJECT.priv, principal(USER.read))) as Array<{
-			id: string;
-		}>;
-		expect(rows.map((row) => row.id)).toEqual(PRIV_CHAPTER_IDS_ORDERED);
-	});
-
-	it("applies the status filter while keeping the gate", async () => {
-		const dormant = (await adapter.listChapters(
-			PROJECT.priv,
-			principal(USER.owner),
-			"dormant",
-		)) as Array<{ id: string }>;
-		expect(dormant.map((row) => row.id)).toEqual([CHAPTER.c]);
-		expect(await adapter.listChapters(PROJECT.priv, principal(USER.none), "dormant")).toEqual([]);
-	});
-
-	it("hides another project's chapters even though they exist", async () => {
-		// Proven non-empty through an authority that may see them.
-		const asAdmin = (await adapter.listChapters(
-			PROJECT.other,
-			principal(USER.admin, true),
-		)) as Array<{ id: string }>;
-		expect(asAdmin.map((row) => row.id)).toEqual([CHAPTER.other1, CHAPTER.other2]);
-		expect(await adapter.listChapters(PROJECT.other, principal(USER.read))).toEqual([]);
-		expect(await adapter.getChapter(CHAPTER.other1, principal(USER.read))).toBeNull();
-		expect(await adapter.getChapter(CHAPTER.other1, principal(USER.domain))).toBeNull();
-		expect(await adapter.getChapter(CHAPTER.other1, principal(GHOST_USER))).toBeNull();
-	});
-
-	it("reads a single chapter through the project gate", async () => {
-		const row = (await adapter.getChapter(CHAPTER.review, principal(USER.write))) as {
-			id: string;
-			role: string;
-			reviewSourceChapterId: string | null;
-		} | null;
-		expect(row?.id).toBe(CHAPTER.review);
-		expect(row?.role).toBe("review");
-		expect(row?.reviewSourceChapterId).toBe(CHAPTER.a);
-	});
-
-	it("caps a large chapter listing at 201 rows", async () => {
-		const rows = (await adapter.listChapters(PROJECT.bulk, principal(USER.bulk))) as Array<{
-			id: string;
-		}>;
-		// 205 chapters exist; the adapter returns limit+1 so a caller can detect truncation.
-		expect(BULK_CHAPTER_COUNT).toBeGreaterThan(rows.length);
-		expect(rows).toHaveLength(201);
-		expect(new Set(rows.map((row) => row.id)).size).toBe(201);
-		expect(bulkChapterIds()).toHaveLength(BULK_CHAPTER_COUNT);
-	});
-});
-
-describe("getGraph", () => {
-	it("returns every edge type with its metadata, plus the chapters", async () => {
-		const graph = (await adapter.getGraph(PROJECT.priv, principal(USER.read))) as {
-			chapters: Array<{ id: string; role: string; graphX: number | null }>;
-			edges: Array<{ id: string; type: string; sourceId: string; targetId: string }>;
-		};
-		expect(graph.chapters.map((ch) => ch.id)).toEqual(PRIV_CHAPTER_IDS_ORDERED);
-		expect(graph.edges.map((edge) => edge.id).sort()).toEqual([...PRIV_EDGE_IDS].sort());
-		expect(graph.edges.map((edge) => edge.type).sort()).toEqual(
-			["cherry_pick", "dependency", "fork", "merge", "review"].sort(),
-		);
-		const fork = graph.edges.find((edge) => edge.id === EDGE.fork);
-		expect(fork).toMatchObject({ sourceId: CHAPTER.a, targetId: CHAPTER.b, type: "fork" });
-		// Edges never cross the project boundary.
-		expect(graph.edges.map((edge) => edge.id)).not.toContain(EDGE.otherProject);
-	});
-
-	it("returns an empty graph for an existing project the caller cannot read", async () => {
-		const asAdmin = (await adapter.getGraph(PROJECT.other, principal(USER.admin, true))) as {
-			chapters: unknown[];
-			edges: Array<{ id: string }>;
-		};
-		// Non-empty for someone allowed, so the denial below is a real one.
-		expect(asAdmin.chapters.length).toBeGreaterThan(0);
-		expect(asAdmin.edges.map((edge) => edge.id)).toEqual([EDGE.otherProject]);
-
-		for (const who of [principal(USER.none), principal(USER.domain), principal(GHOST_USER)]) {
-			expect(await adapter.getGraph(PROJECT.other, who)).toEqual({ chapters: [], edges: [] });
-		}
-	});
-
-	/**
-	 * A >200-chapter graph is bounded AND says so.
-	 *
-	 * This was a deliberately-red test while SQLite's `getGraph` had no chapter limit and
-	 * returned all 205 rows against PostgreSQL's cap. Both adapters now stop at
-	 * `READ_LIMITS.graphChapters` and set `truncated`, so it is green for the right reason
-	 * and the docblock no longer claims otherwise — a stale "kept failing on purpose" note
-	 * invites the next reader to ignore a genuine failure here.
-	 *
-	 * The bound is asserted EXACTLY rather than as `<= 201`: the point of the flag is that a
-	 * canvas losing chapters also loses every edge attached to them, which reads as "those
-	 * branches were deleted", and a range would let the cap drift without failing. That the
-	 * PostgreSQL adapter agrees on both the count and the flag is pinned by the parity
-	 * matrix's `getGraph(bulk)` cases, which are no longer skipped.
-	 */
-	it("bounds a large graph at the chapter cap and marks it as truncated", async () => {
-		const graph = (await adapter.getGraph(PROJECT.bulk, principal(USER.bulk))) as {
-			chapters: Array<{ id: string }>;
-			truncated?: boolean;
-		};
-		expect(BULK_CHAPTER_COUNT).toBe(205);
-		expect(BULK_CHAPTER_COUNT).toBeGreaterThan(READ_LIMITS.graphChapters);
-		expect(graph.chapters).toHaveLength(READ_LIMITS.graphChapters);
-		expect(graph.truncated).toBe(true);
-	});
-});
-
-describe("getGraphAuxiliaryData", () => {
-	it("returns narrator, container and detached-panel data for a readable project", async () => {
-		const aux = await adapter.getGraphAuxiliaryData(
-			PROJECT.priv,
-			PRIV_CHAPTER_IDS_ORDERED,
-			principal(USER.read),
-		);
-		const narratorIds = aux.narrators.map((n) => n.id).sort();
-		// Public, own-private, project-visible (via the project grant) and narrator-granted
-		// sessions are all readable; another user's plain private session is not.
-		expect(narratorIds).toEqual(
-			[NARRATOR.pubOther, NARRATOR.projOther, NARRATOR.ownRead, NARRATOR.granted].sort(),
-		);
-		expect(narratorIds).not.toContain(NARRATOR.privOther);
-		// The hidden narrator exists — an admin sees it.
-		const asAdmin = await adapter.getGraphAuxiliaryData(
-			PROJECT.priv,
-			PRIV_CHAPTER_IDS_ORDERED,
-			principal(USER.admin, true),
-		);
-		expect(asAdmin.narrators.map((n) => n.id)).toContain(NARRATOR.privOther);
-
-		expect(aux.detachedPanels).toEqual([{ id: CHAPTER.a, detachedPanelsJson: '[{"id":"dp-a"}]' }]);
-	});
-
-	it("hides a private narrator inside a public project", async () => {
-		const aux = await adapter.getGraphAuxiliaryData(
-			PROJECT.pub,
-			[CHAPTER.pub],
-			principal(USER.none),
-		);
-		// The project gate is open to everyone here, so only the narrator ACL can filter.
-		expect(aux.narrators.map((n) => n.id)).toEqual([NARRATOR.pubVisible]);
-		expect(aux.detachedPanels.map((row) => row.id)).toEqual([CHAPTER.pub]);
-	});
-
-	/**
-	 * RED — container badges vanish for every non-admin principal.
-	 *
-	 * `sqlite-project-read-adapter.ts` filters the container query with
-	 * `projectReadableWhereForColumn(principal, containerInstances.chapterId)`, which
-	 * compiles to `p.id = container_instances.chapter_id`: a PROJECT id compared against a
-	 * CHAPTER id, so the EXISTS is never satisfied. Admins are unaffected only because the
-	 * helper returns `undefined` for them, which `and(...)` drops.
-	 *
-	 * The rows are readable — the same call with `isAdmin: true` returns both — so this is
-	 * a predicate bug, not an access decision. Symptom in the product: the "has containers"
-	 * badge disappears from every chapter node for ordinary users.
-	 *
-	 * The correct predicate has to reach the project through the chapter, e.g. a subquery
-	 * on `chapters.id = container_instances.chapter_id`, mirroring the narrator path.
-	 */
-	it("returns live container rows for the project owner and a read-grant holder", async () => {
-		const expected = [{ chapterId: CHAPTER.a }, { chapterId: CHAPTER.c }];
-		const asAdmin = await adapter.getGraphAuxiliaryData(
-			PROJECT.priv,
-			PRIV_CHAPTER_IDS_ORDERED,
-			principal(USER.admin, true),
-		);
-		// Proof the rows exist and that `removed` is the only exclusion.
-		expect(asAdmin.containers).toEqual(expected);
-
-		for (const who of [USER.owner, USER.read, USER.write, USER.manage]) {
-			expect(
-				await adapter
-					.getGraphAuxiliaryData(PROJECT.priv, PRIV_CHAPTER_IDS_ORDERED, principal(who))
-					.then((aux) => aux.containers),
-			).toEqual(expected);
-		}
-
-		const inPublicProject = await adapter.getGraphAuxiliaryData(
-			PROJECT.pub,
-			[CHAPTER.pub],
-			principal(USER.none),
-		);
-		expect(inPublicProject.containers).toEqual([{ chapterId: CHAPTER.pub }]);
-	});
-
-	it("returns empty auxiliary data for an unreadable project and for no chapter ids", async () => {
-		expect(
-			await adapter.getGraphAuxiliaryData(
-				PROJECT.other,
-				[CHAPTER.other1, CHAPTER.other2],
-				principal(USER.read),
-			),
-		).toEqual({ narrators: [], containers: [], detachedPanels: [] });
-		expect(await adapter.getGraphAuxiliaryData(PROJECT.priv, [], principal(USER.read))).toEqual({
-			narrators: [],
-			containers: [],
-			detachedPanels: [],
-		});
-	});
-
-	it("does not return auxiliary rows for chapters outside the requested project", async () => {
-		// c_o1 belongs to p_other; asking for it under p_priv must not reach its rows.
-		const aux = await adapter.getGraphAuxiliaryData(
-			PROJECT.priv,
-			[CHAPTER.a, CHAPTER.other1],
-			principal(USER.admin, true),
-		);
-		expect(aux.detachedPanels.map((row) => row.id)).toEqual([CHAPTER.a]);
-		// Admin path, so the container predicate is not in play here (see the RED case above).
-		expect(aux.containers.map((row) => row.chapterId)).toEqual([CHAPTER.a]);
+describe("anyProjectExists", () => {
+	it("answers yes regardless of who could read the projects", async () => {
+		// Access-blind by contract: it backs the "nothing exists yet" versus "none of them are
+		// yours" distinction, so it must not consult the ACL — and it discloses no row.
+		expect(await adapter.anyProjectExists()).toBe(true);
+		// The same fixtures are invisible to an absent principal, which is what makes the two
+		// questions different.
+		expect(await listedProjectIds(principal(""))).toEqual([]);
 	});
 });

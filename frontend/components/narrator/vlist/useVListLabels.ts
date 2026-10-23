@@ -322,8 +322,6 @@ export function useVListLabels(): VListLabels {
 			reviewVerdict_request_changes: t("reviewVerdict_request_changes"),
 			reviewVerdict_comment_only: t("reviewVerdict_comment_only"),
 			reviewFeedbackRevisedBadge: t("reviewFeedbackRevisedBadge"),
-			reviewFeedbackApply: t("reviewFeedbackApply"),
-			reviewFeedbackApplied: t("reviewFeedbackApplied"),
 			// ── message-origin attribution ──────────────────────────────────────────
 			// The origin_notice heading is composed during adaptation (it is a
 			// measured row), so these belong to the adapter labels.

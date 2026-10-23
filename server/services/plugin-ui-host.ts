@@ -1078,7 +1078,6 @@ export class PluginUiHost {
 				? {
 						narrator: {
 							id: narratorId,
-							...(typeof scope.chapterId === "string" ? { chapterId: scope.chapterId } : {}),
 							...(typeof scope.projectId === "string" ? { projectId: scope.projectId } : {}),
 						},
 					}

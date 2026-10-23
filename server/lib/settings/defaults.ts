@@ -121,26 +121,13 @@ export const DEFAULTS: NarraForkSettings = {
 		queueDuringCompaction: true,
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
-	chapters: {
-		maxActiveWorktrees: 10,
-		maxActiveContainers: 5,
-		worktreeSizeWarningMb: 500,
-		autoSaveOnDormant: true,
-		dormantAfterMinutes: 0,
+	workspace: {
 		treeSnapshotsEnabled: true,
 	},
 	narratorBlocks: {
 		write: true,
 		read: true,
 		wsV2: true,
-	},
-	containers: {
-		portRangeStart: 10000,
-		portRangeEnd: 20000,
-		proxy: {
-			enabled: false,
-			port: 7780,
-		},
 	},
 	editor: {
 		type: "vscode",
@@ -780,33 +767,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 true",
 	},
 
-	// ── chapters ────────────────────────────────────────────────────────
-	"chapters.maxActiveWorktrees": {
-		desc: "最大活跃 worktree 数量。超出时自动将最不活跃的章节休眠。≤0 禁用自动休眠。",
-		type: "number",
-		valid: "≥1, 默认 10",
-	},
-	"chapters.maxActiveContainers": {
-		desc: "最大活跃容器数量。超出时新容器创建会被拒绝。",
-		type: "number",
-		valid: "≥0, 默认 5",
-	},
-	"chapters.worktreeSizeWarningMb": {
-		desc: "Worktree 大小警告阈值(MB)。超出时向用户发出警告。0 表示禁用警告。",
-		type: "number",
-		valid: "≥0, 默认 500",
-	},
-	"chapters.autoSaveOnDormant": {
-		desc: "章节休眠时是否自动 git commit 保存未提交的更改。",
-		type: "boolean",
-	},
-	"chapters.dormantAfterMinutes": {
-		desc: "章节不活跃多少分钟后自动休眠。0 表示禁用自动休眠（仅在超出 maxActiveWorktrees 时休眠）。",
-		type: "number",
-		valid: "≥0, 默认 0 (禁用)",
-	},
-	"chapters.treeSnapshotsEnabled": {
-		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。结构性快照（fork/merge/restore）不受影响。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
+	// ── workspace ───────────────────────────────────────────────────────
+	"workspace.treeSnapshotsEnabled": {
+		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},
@@ -826,24 +789,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "是否接受以块为单位的消息协议 v2（页面接口返回信封 + 块，WS 推送块级事件）。只有声明支持 v2 的客户端会收到 v2；关闭时所有连接都使用 v1，前端照常工作（回退开关）。默认 true。",
 		type: "boolean",
 		valid: "true / false，默认 true",
-	},
-
-	// ── containers ──────────────────────────────────────────────────────
-	"containers.portRangeStart": {
-		desc: "容器端口分配范围起始值。",
-		type: "number",
-	},
-	"containers.portRangeEnd": {
-		desc: "容器端口分配范围结束值。",
-		type: "number",
-	},
-	"containers.proxy.enabled": {
-		desc: "是否启用容器代理服务。代理将 Host 头匹配的请求路由到对应容器。",
-		type: "boolean",
-	},
-	"containers.proxy.port": {
-		desc: "容器代理服务监听端口。",
-		type: "number",
 	},
 
 	// ── editor ──────────────────────────────────────────────────────────

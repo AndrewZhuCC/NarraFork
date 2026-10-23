@@ -1,6 +1,6 @@
 import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
-import { lstat, opendir, readdir, realpath, rm, stat } from "node:fs/promises";
+import { readdir, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
 	STORAGE_CATEGORY_KEYS,
@@ -9,15 +9,7 @@ import {
 } from "@shared/storage-categories";
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapters,
-	chatAttachments,
-	chatRooms,
-	narratorMessages,
-	narrators,
-	projects,
-} from "../db/schema";
-import { localBackend } from "../lib/agent/execution/registry";
+import { chatAttachments, chatRooms, narratorMessages, narrators, projects } from "../db/schema";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
@@ -33,25 +25,12 @@ import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "../lib/request-recorder";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
-import { dropRecentlyAttributed } from "./file-attribution-service";
-import { dropStatus } from "./git-status-cache";
-import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import { blockReadsEnabled, imageEnvelopeOwners } from "./narrator-block-scans";
-import { isRegisteredNarratorWorktree } from "./narrator-worktree-resources";
-import { parseWorktreePorcelain } from "./narrator-worktree-service";
 import {
 	DatabaseStorageScanCancelledError,
 	DatabaseStorageUnsupportedError,
 } from "./storage/database-storage-port";
 import { databaseStoragePort } from "./storage/store";
-import { withWorkspaceRepositoryLock } from "./workspace-context-service";
-import {
-	captureLifecycleContextPath,
-	confirmLifecyclePathRemoved,
-	isResourceProtectionError,
-	revalidateLifecycleTarget,
-	withProtectionReservation,
-} from "./worktree-lifecycle-guard";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -91,13 +70,13 @@ const NARRAFORK_DIR = getNarraforkHome();
 const SHARES_DIR = resolve(NARRAFORK_DIR, "shares");
 const TREE_SNAPSHOTS_DIR = resolve(NARRAFORK_DIR, "tree-snapshots");
 /**
- * Git-ignored files a dormant chapter parked outside its worktree.
+ * Git-ignored files dormant chapters parked outside their worktrees, before chapters
+ * were removed.
  *
  * Accounted for here because it is the one data area holding content git refuses to
  * track — `.env` files, local credentials — and nothing else in the storage view would
- * ever mention it. A chapter's own terminal transitions now discard its archive, but
- * directories created before that was true have no owner at all, which is what the
- * sweep below collects.
+ * ever mention it. Nothing owns these archives any more, and nothing deletes them: the
+ * user decides what to keep.
  *
  * Resolved per call rather than into a module constant, unlike the paths above.
  * `getNarraforkHome` reads `NARRAFORK_HOME` on every call precisely so an override can
@@ -432,8 +411,8 @@ async function scanTreeSnapshots(
  * Ignored-file archives left by dormant chapters (`~/.narrafork/dormant-ignored`).
  *
  * Reported separately from the snapshot repositories because the contents are the
- * user's untracked secrets rather than derived data, so "how much is here and is any of
- * it orphaned" is a question worth being able to answer.
+ * user's untracked secrets rather than derived data. Chapters are gone, so every
+ * archive is unowned.
  */
 async function scanDormantIgnored(
 	options: CategoryScanOptions = {},
@@ -446,18 +425,7 @@ async function scanDormantIgnored(
 		const entries = await readdir(dir, { withFileTypes: true });
 		const dirs = entries.filter((e) => e.isDirectory());
 		archiveCount = dirs.length;
-		if (dirs.length > 0) {
-			// One bounded query rather than a lookup per directory: the id set is
-			// human-scale (one entry per chapter that has ever gone dormant).
-			const liveChapterIds = new Set(
-				db
-					.select({ id: chapters.id })
-					.from(chapters)
-					.all()
-					.map((row) => row.id),
-			);
-			orphanCount = dirs.filter((dir) => !liveChapterIds.has(dir.name)).length;
-		}
+		orphanCount = dirs.length;
 	} catch {
 		// dir may not exist yet
 	}
@@ -990,69 +958,6 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 	return { removed, freedBytes };
 }
 
-/**
- * Remove ignored-file archives whose chapter no longer exists.
- *
- * The archive is written when a chapter goes dormant and consumed when it wakes, so its
- * lifetime is bounded by a chapter that can still do both. Chapter deletion, project
- * deletion and batch cleanup now discard it directly, but directories created before
- * that was true have no owner and no expiry — and what they hold is precisely the files
- * git refuses to track, i.e. the user's plaintext credentials sitting under
- * `~/.narrafork` indefinitely.
- *
- * Keyed on the chapter row existing at all rather than on its status: a dormant chapter
- * still needs its archive, and any status can still be woken or deleted, so the row
- * disappearing is the only signal that nothing will ever read it again.
- */
-export async function cleanupOrphanedIgnoredArchives(): Promise<{
-	removed: number;
-	freedBytes: number;
-}> {
-	const baseDir = dormantIgnoredDir();
-	if (!existsSync(baseDir)) return { removed: 0, freedBytes: 0 };
-
-	let removed = 0;
-	let freedBytes = 0;
-	try {
-		const entries = await readdir(baseDir, { withFileTypes: true });
-		const liveChapterIds = new Set(
-			db
-				.select({ id: chapters.id })
-				.from(chapters)
-				.all()
-				.map((row) => row.id),
-		);
-		for (const entry of entries) {
-			if (!entry.isDirectory()) continue;
-			if (liveChapterIds.has(entry.name)) continue;
-			const dirPath = resolve(baseDir, entry.name);
-			// Per directory, not around the loop: one unreadable or permission-denied
-			// archive must not stop the sweep, because everything after it would then stay
-			// on disk indefinitely while the caller was told the clean-up ran.
-			try {
-				const size = await dirSize(dirPath);
-				await rm(dirPath, { recursive: true, force: true });
-				removed++;
-				freedBytes += size;
-				logger.info("Removed an ignored-file archive with no chapter", {
-					chapterId: entry.name,
-					size,
-				});
-			} catch (err) {
-				logger.warn("Could not remove an orphaned ignored-file archive", {
-					chapterId: entry.name,
-					error: String(err),
-				});
-			}
-		}
-	} catch (err) {
-		logger.error("Failed to clean up orphaned ignored-file archives", { error: String(err) });
-	}
-
-	cachedResult = null;
-	return { removed, freedBytes };
-}
-
 export async function cleanupAllShares(): Promise<{ removed: number; freedBytes: number }> {
 	if (!existsSync(SHARES_DIR)) return { removed: 0, freedBytes: 0 };
 
@@ -1073,210 +978,18 @@ export async function cleanupAllShares(): Promise<{ removed: number; freedBytes:
 	return { removed, freedBytes };
 }
 
-export async function cleanupOrphanedWorktrees(): Promise<{
+/**
+ * Repack the tree-snapshot repositories. Each captured state writes loose objects, so
+ * without this they grow with every tool call.
+ *
+ * Worktree directories under `<project>/.worktrees` are never removed here: those left
+ * by removed chapters have no owner record, and deleting one would lose whatever it
+ * still holds.
+ */
+export async function repackTreeSnapshots(): Promise<{
 	removed: number;
 	freedBytes: number;
 }> {
-	let removed = 0;
-	let freedBytes = 0;
-
-	try {
-		// Caps bound work, not ownership: unvisited projects are simply left untouched.
-		const allProjects = db
-			.select({ id: projects.id, gitPath: projects.gitPath })
-			.from(projects)
-			.orderBy(projects.id)
-			.limit(64)
-			.all();
-		const deadline = performance.now() + 30_000;
-		const gitEnv = {
-			...process.env,
-			GIT_DIR: undefined,
-			GIT_COMMON_DIR: undefined,
-			GIT_WORK_TREE: undefined,
-			GIT_INDEX_FILE: undefined,
-		};
-		for (const proj of allProjects) {
-			if (!proj.gitPath || performance.now() > deadline) continue;
-			const probe = await probeLocalGitWorkspace(proj.gitPath);
-			if (
-				probe.state !== "ready" ||
-				!probe.rootPath ||
-				!probe.repositoryPath ||
-				!localBackend.paths.equals(probe.rootPath, await realpath(proj.gitPath))
-			)
-				continue;
-			const wtDir = resolve(proj.gitPath, ".worktrees");
-			try {
-				// Same identity/lock as narrator creation, including the pre-registration window.
-				await withWorkspaceRepositoryLock(
-					gitWorkspaceIdentity(localBackend, probe.repositoryPath),
-					async () => {
-						const parent = await lstat(wtDir).catch(() => null);
-						if (
-							!parent?.isDirectory() ||
-							parent.isSymbolicLink() ||
-							(await realpath(wtDir)) !== wtDir
-						)
-							return;
-						// Never treat a capped porcelain prefix as proof that a worktree is absent.
-						const list = await safeSpawn({
-							cmd: [
-								"git",
-								"--no-optional-locks",
-								"-C",
-								proj.gitPath ?? "",
-								"worktree",
-								"list",
-								"--porcelain",
-								"-z",
-							],
-							timeout: 5000,
-							maxOutputBytes: 128 * 1024,
-							env: gitEnv,
-						});
-						if (list.exitCode !== 0 || list.stdoutTruncated || list.stderrTruncated) return;
-						const registered = parseWorktreePorcelain(list.stdout);
-						if (registered.truncated) return;
-						const candidates: string[] = [];
-						let count = 0;
-						for await (const entry of await opendir(wtDir)) {
-							if (++count > 512 || performance.now() > deadline) return;
-							if (entry.isDirectory()) candidates.push(resolve(wtDir, entry.name));
-						}
-						for (const fullPath of candidates) {
-							if (performance.now() > deadline) break;
-							// ALL resource states survive narrator deletion. Errors (e.g. an unmigrated
-							// registry) abort the repo sweep, rather than making ownership disappear.
-							if (isRegisteredNarratorWorktree(fullPath)) continue;
-							const chapter = db
-								.select({ id: chapters.id })
-								.from(chapters)
-								.where(eq(chapters.worktreePath, fullPath))
-								.limit(1)
-								.get();
-							if (chapter) continue;
-							// The final reservation below checks receipt and legacy cwd references
-							// for this target; do not rescan every session once per repository.
-							const entry = registered.entries.find((item) =>
-								localBackend.paths.equals(item.path, fullPath),
-							);
-							const leaf = localBackend.paths.basename(fullPath);
-							// Only the old, positively identifiable chapter convention is eligible.
-							// Unknown directories, ordinary narrators and unverifiable Git state fail closed.
-							if (
-								!entry ||
-								entry.locked ||
-								entry.prunable ||
-								!/^[a-z0-9-]+-[A-Za-z0-9_-]{6}$/.test(leaf) ||
-								entry.branch !== `refs/heads/chapter/${leaf}`
-							)
-								continue;
-							if (
-								db
-									.select({ id: chapters.id })
-									.from(chapters)
-									.where(eq(chapters.branch, `chapter/${leaf}`))
-									.limit(1)
-									.get()
-							)
-								continue;
-							if ((await realpath(fullPath)) !== fullPath) continue;
-							const identity = await probeLocalGitWorkspace(fullPath);
-							if (
-								identity.state !== "ready" ||
-								!identity.rootPath ||
-								!identity.repositoryPath ||
-								!localBackend.paths.equals(identity.rootPath, fullPath) ||
-								!localBackend.paths.equals(identity.repositoryPath, probe.repositoryPath ?? "")
-							)
-								continue;
-							const clean = await safeSpawn({
-								cmd: [
-									"git",
-									"--no-optional-locks",
-									"-C",
-									fullPath,
-									"status",
-									"--porcelain=v1",
-									"-z",
-									"--untracked-files=all",
-									"--ignored",
-								],
-								timeout: 5000,
-								maxOutputBytes: 128 * 1024,
-							});
-							if (
-								clean.exitCode !== 0 ||
-								clean.stdoutTruncated ||
-								clean.stderrTruncated ||
-								clean.stdout !== ""
-							)
-								continue;
-							try {
-								await withProtectionReservation(
-									[{ path: fullPath }],
-									"orphan worktree cleanup",
-									async () => {
-										const size = await dirSize(await revalidateLifecycleTarget(fullPath));
-										const frozenRepository = await captureLifecycleContextPath(proj.gitPath ?? "");
-										const frozenPath = await revalidateLifecycleTarget(fullPath);
-										// No --force and no rm fallback. Git must prove this clean registered
-										// chapter worktree is removable; a late dirty write makes remove fail.
-										const deletion = await safeSpawn({
-											cmd: ["git", "-C", frozenRepository, "worktree", "remove", "--", frozenPath],
-											timeout: 10_000,
-											maxOutputBytes: 32 * 1024,
-											env: gitEnv,
-										});
-										if (deletion.exitCode !== 0) return;
-										await confirmLifecyclePathRemoved(frozenPath);
-										await worktreeTreeSnapshot.destroy(fullPath);
-										dropStatus(fullPath);
-										dropRecentlyAttributed(fullPath);
-										removed++;
-										freedBytes += size;
-										logger.info("Removed verified clean orphaned chapter worktree", {
-											path: fullPath,
-											size,
-										});
-									},
-								);
-							} catch (error) {
-								if (!isResourceProtectionError(error)) throw error;
-								logger.warn("Kept protected or unverifiable orphan worktree", {
-									path: fullPath,
-									error: String(error),
-								});
-							}
-						}
-					},
-				);
-			} catch (err) {
-				logger.warn("Skipped unverifiable or busy worktree repository during cleanup", {
-					projectId: proj.id,
-					error: String(err),
-				});
-			}
-		}
-	} catch (err) {
-		logger.error("Failed to cleanup orphaned worktrees", { error: String(err) });
-	}
-
-	// Ignored-file archives are swept on the same trigger: they are the same class of
-	// leftover (per-chapter state outside the repository, orphaned when a chapter row
-	// goes), and a user reclaiming space has no reason to run two separate actions.
-	try {
-		const archives = await cleanupOrphanedIgnoredArchives();
-		removed += archives.removed;
-		freedBytes += archives.freedBytes;
-	} catch (err) {
-		logger.warn("Failed to sweep orphaned ignored-file archives", { error: String(err) });
-	}
-
-	// Repack the surviving snapshot repos. Each captured state writes loose objects,
-	// so without this they grow with every tool call. Runs after the orphan sweep so
-	// removed repos are not repacked first.
 	try {
 		await worktreeTreeSnapshot.gcAll();
 	} catch (err) {
@@ -1284,7 +997,7 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 	}
 
 	cachedResult = null;
-	return { removed, freedBytes };
+	return { removed: 0, freedBytes: 0 };
 }
 
 export async function pruneContainerImages(): Promise<{ success: boolean; output: string }> {
@@ -1307,8 +1020,7 @@ export const storageService = {
 	scanStorage,
 	cleanupOrphanedUploads,
 	cleanupOrphanedChatAttachments,
-	cleanupOrphanedIgnoredArchives,
 	cleanupAllShares,
-	cleanupOrphanedWorktrees,
+	repackTreeSnapshots,
 	pruneContainerImages,
 };

@@ -2,7 +2,7 @@
  * The shared authorization kernel.
  *
  * It answers one question — "what does this principal hold, here?" — and answers
- * it identically for projects, chapters, narrators and knowledge. Domain rules
+ * it identically for projects, narrators and knowledge. Domain rules
  * (the knowledge base's clearance ranks and compartment tags) are NOT decided
  * here; the kernel carries their credentials through untouched and lets the domain
  * layer compare them. That separation is what lets the knowledge base move onto
@@ -219,9 +219,6 @@ export async function resolveCaps(
  *
  * `global` is not a gate: a grant there is instance-wide authorization, and
  * requiring one would mean nobody could read anything without a global grant.
- * Ancestors that carry no access rules of their own (a chapter, which deliberately
- * has no ACL of its own — see the plan) are likewise not gates; they are only
- * present in the chain so a grant can be attached to them.
  *
  * The gates that actually exist today are project-level. Their verdict is supplied
  * by the domain adapter through {@link withResolvedGate}, because "is this user a
@@ -246,9 +243,7 @@ function resolveGate(
 /**
  * Scope types that act as gates for their descendants.
  *
- * Only projects. Chapters intentionally have no ACL of their own (a chapter's
- * worktree shares the project's git repository, so chapter-level isolation would
- * be fiction), and knowledge collections gate their entries through the knowledge
+ * Only projects. Knowledge collections gate their entries through the knowledge
  * layer's existing two-axis check rather than through plain capabilities.
  */
 function isGateScope(type: AclScope["type"]): boolean {

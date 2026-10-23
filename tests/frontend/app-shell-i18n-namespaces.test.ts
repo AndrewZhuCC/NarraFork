@@ -35,7 +35,6 @@ const AUTHENTICATED_PATHS: string[] = [
 	"/narrators/abc",
 	"/narrators/workspace/abc",
 	`/git/narrators/abc/commits/${"a".repeat(40)}`,
-	`/git/chapters/abc/commits/${"b".repeat(40)}`,
 	"/settings",
 	"/settings/agent",
 	"/settings/users",
@@ -49,8 +48,8 @@ const AUTHENTICATED_PATHS: string[] = [
 ];
 
 describe("app shell i18n namespaces", () => {
-	test.each(["narrators", "chapters"])("%s window preloads only its own translations", (kind) => {
-		expect(getNamespacesForPath(`/windows/git/${kind}/abc/commits/${"a".repeat(40)}`)).toEqual([
+	test("narrator git windows preload only their own translations", () => {
+		expect(getNamespacesForPath(`/windows/git/narrators/abc/commits/${"a".repeat(40)}`)).toEqual([
 			"common",
 			"errors",
 			"git",
@@ -68,8 +67,8 @@ describe("app shell i18n namespaces", () => {
 	test("workspace windows preload the workspace page's namespaces", () => {
 		expect(getNamespacesForPath("/windows/workspaces/abc")).toContain("narrators");
 	});
-	test.each(["narrators", "chapters"])("%s commit deep links preload git translations", (kind) => {
-		const loaded = getNamespacesForPath(`/git/${kind}/abc/commits/${"a".repeat(40)}`);
+	test("narrator commit deep links preload git translations", () => {
+		const loaded = getNamespacesForPath(`/git/narrators/abc/commits/${"a".repeat(40)}`);
 		expect(loaded).toContain("git");
 	});
 	test.each(

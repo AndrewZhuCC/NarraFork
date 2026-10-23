@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import * as schema from "../db/schema";
-import { settings } from "../lib/settings";
 import { fixtureDatabase } from "./__tests__/worktree-resource-fixture";
 
 let fixture: ReturnType<typeof fixtureDatabase>;
@@ -24,7 +23,7 @@ const database = new Proxy(
 		},
 	},
 );
-mock.module("../db", () => ({ db: database }));
+mock.module("../db", () => ({ db: database, activeDatabaseBackend: "sqlite" }));
 const command = mock(async (_options: unknown) => ({ exitCode: 0, stdout: "", stderr: "" }));
 mock.module("../lib/spawn", () => ({ safeSpawn: command }));
 mock.module("../lib/agent/shell", () => ({ detectShell: () => ({ path: "/fixture/shell" }) }));
@@ -102,16 +101,11 @@ const { AppError } = await import("../lib/errors");
 const { createTerminalSchema } = await import("../lib/validators/terminals");
 const { terminalWsMessageSchema } = await import("../lib/validators/websocket");
 const { terminalViewService } = await import("./terminal-view-service");
-const { portAllocator } = await import("./port-allocator");
-const { containerService } = await import("./container-service");
-const { refreshCache, reconcileContainerStates } = await import("./container-proxy");
-const { volumeSnapshotService } = await import("./volume-snapshot-service");
 const now = "2026-01-01T00:00:00.000Z";
 
 beforeEach(() => {
 	fixture = fixtureDatabase();
 	directory = mkdtempSync(join(tmpdir(), "resource-consumer-fixture-"));
-	writeFileSync(join(directory, "compose.yml"), "services:\n  app:\n    image: fixture\n");
 	fixture.database
 		.insert(schema.users)
 		.values({ id: "owner", username: "owner", passwordHash: "fixture", createdAt: now })
@@ -130,20 +124,6 @@ beforeEach(() => {
 	fixture.database
 		.insert(schema.narrators)
 		.values({ id: "source", ownerUserId: "owner", cwd: directory, createdAt: now, updatedAt: now })
-		.run();
-	fixture.database
-		.insert(schema.chapters)
-		.values({
-			id: "legacy",
-			projectId: "project",
-			title: "legacy",
-			branch: "legacy",
-			baseBranch: "main",
-			worktreePath: directory,
-			containerConfig: { composeFile: "compose.yml" },
-			createdAt: now,
-			updatedAt: now,
-		})
 		.run();
 	fixture.database
 		.insert(schema.narratorWorktreeResources)
@@ -232,7 +212,6 @@ describe("legacy compatibility routes resource rows away from runtime", () => {
 			.insert(schema.terminals)
 			.values({
 				id: "legacy-buffer",
-				chapterId: "legacy",
 				name: "legacy",
 				status: "exited",
 				createdAt: now,
@@ -267,15 +246,14 @@ describe("legacy compatibility routes resource rows away from runtime", () => {
 			dtach.socketsDir = "/nonexistent-fixture-sockets";
 		}
 	});
-	test("legacy terminal and global standalone creation keep old runtime commands (stubs only)", async () => {
-		const legacy = await terminalService.create({ chapterId: "legacy", name: "legacy" });
-		expect(legacy.chapterId).toBe("legacy");
+	test("legacy narrator terminal and global standalone creation keep old runtime commands (stubs only)", async () => {
+		const legacy = await terminalService.create({ narratorId: "source", name: "legacy" });
+		expect(legacy.narratorId).toBe("source");
 		expect(legacy.worktreeResourceId).toBeNull();
 		expect(pty).toHaveBeenCalledTimes(1);
 		expect(pty.mock.calls[0]?.[0]).toMatchObject({ cmd: ["/fixture/shell", "-l"], cwd: directory });
 		await terminalService.kill(legacy.id);
 		const standalone = await terminalService.create({ name: "standalone" });
-		expect(standalone.chapterId).toBeNull();
 		expect(standalone.narratorId).toBeNull();
 		await terminalService.kill(standalone.id);
 	});
@@ -283,9 +261,8 @@ describe("legacy compatibility routes resource rows away from runtime", () => {
 		resourceTerminal();
 		fixture.database
 			.insert(schema.terminals)
-			.values({ id: "lt", chapterId: "legacy", name: "lt", status: "exited", createdAt: now })
+			.values({ id: "lt", narratorId: "source", name: "lt", status: "exited", createdAt: now })
 			.run();
-		await terminalService.cleanupForChapter("legacy");
 		await terminalService.cleanupForNarrator("source");
 		await terminalService.recoverOnStartup();
 		expect(fixture.sqlite.query("SELECT id,status FROM terminals").all()).toEqual([
@@ -296,13 +273,13 @@ describe("legacy compatibility routes resource rows away from runtime", () => {
 	});
 	test("terminal layout selectors cannot silently fall through from resource to legacy", async () => {
 		const legacy = await terminalViewService.upsert("owner", {
-			chapterId: "legacy",
+			narratorId: "source",
 			layout: "quad",
 		});
-		expect(legacy?.chapterId).toBe("legacy");
+		expect(legacy?.narratorId).toBe("source");
 		await expect(
-			terminalViewService.get("owner", { chapterId: "legacy", worktreeResourceId: "resource" } as {
-				chapterId: string;
+			terminalViewService.get("owner", { narratorId: "source", worktreeResourceId: "resource" } as {
+				narratorId: string;
 			}),
 		).rejects.toThrow("OWNER_SELECTOR_MIXED");
 		await expect(
@@ -310,143 +287,6 @@ describe("legacy compatibility routes resource rows away from runtime", () => {
 				layout: string;
 			}),
 		).rejects.toThrow("WORKTREE_RESOURCE_RUNTIME_DISABLED");
-	});
-	test("proxy cache and startup inspect skip resource records even when marked running", async () => {
-		fixture.database
-			.insert(schema.containerInstances)
-			.values({
-				id: "rc",
-				worktreeResourceId: "resource",
-				serviceName: "app",
-				status: "running",
-				containerId: "do-not-inspect",
-				proxyLabel: "resource",
-				containerPort: 80,
-				containerIp: "192.0.2.1",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.run();
-		await refreshCache();
-		await reconcileContainerStates();
-		expect(command).toHaveBeenCalledTimes(0);
-		expect(fixture.sqlite.query("SELECT id,status FROM container_instances").all()).toEqual([
-			{ id: "rc", status: "running" },
-		]);
-	});
-	test("chapter pause executes old compose namespace only and never mutates resource containers", async () => {
-		fixture.database
-			.insert(schema.containerInstances)
-			.values({
-				id: "lc",
-				chapterId: "legacy",
-				serviceName: "app",
-				status: "running",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.run();
-		fixture.database
-			.insert(schema.containerInstances)
-			.values({
-				id: "rc",
-				worktreeResourceId: "resource",
-				serviceName: "app",
-				status: "running",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.run();
-		await containerService.pauseChapterContainers("legacy");
-		const composeCalls = command.mock.calls.filter(
-			([options]) => (options as { cmd: string[] }).cmd[1] === "compose",
-		);
-		expect(composeCalls).toHaveLength(1);
-		expect(composeCalls[0]?.[0]).toMatchObject({
-			cmd: ["podman", "compose", "-f", join(directory, "compose.yml"), "pause"],
-			cwd: directory,
-		});
-		expect(
-			fixture.sqlite.query("SELECT id,status FROM container_instances ORDER BY id").all(),
-		).toEqual([
-			{ id: "lc", status: "paused" },
-			{ id: "rc", status: "running" },
-		]);
-	});
-	test("legacy port release and failed batch undo preserve previous rows and resource ports", async () => {
-		settings.containers.portRangeStart = 10000;
-		settings.containers.portRangeEnd = 10002;
-		fixture.database
-			.insert(schema.portAllocations)
-			.values({
-				port: 10000,
-				worktreeResourceId: "resource",
-				serviceName: "resource",
-				allocatedAt: now,
-			})
-			.run();
-		fixture.database
-			.insert(schema.portAllocations)
-			.values({ port: 10001, chapterId: "legacy", serviceName: "prior", allocatedAt: now })
-			.run();
-		await expect(
-			portAllocator.allocate("legacy", [
-				{ containerPort: 80, serviceName: "new1" },
-				{ containerPort: 81, serviceName: "new2" },
-			]),
-		).rejects.toThrow("Port pool exhausted");
-		expect(fixture.sqlite.query("SELECT port FROM port_allocations ORDER BY port").all()).toEqual([
-			{ port: 10000 },
-			{ port: 10001 },
-		]);
-		await portAllocator.release("legacy");
-		expect(fixture.sqlite.query("SELECT port FROM port_allocations").all()).toEqual([
-			{ port: 10000 },
-		]);
-	});
-	test("dense port inventory uses bounded cursor pages without losing resource conflicts", async () => {
-		settings.containers.portRangeStart = 10000;
-		settings.containers.portRangeEnd = 10260;
-		for (let index = 0; index < 260; index++)
-			fixture.database
-				.insert(schema.portAllocations)
-				.values({
-					port: 10000 + index,
-					worktreeResourceId: "resource",
-					serviceName: "resource",
-					allocatedAt: now,
-				})
-				.run();
-		const mappings = await portAllocator.allocate("legacy", [
-			{ containerPort: 80, serviceName: "app" },
-		]);
-		expect(mappings).toEqual([{ hostPort: 10260, containerPort: 80, serviceName: "app" }]);
-		await portAllocator.release("legacy");
-		expect(fixture.sqlite.query("SELECT COUNT(*) AS n FROM port_allocations").get()).toEqual({
-			n: 260,
-		});
-	});
-	test("resource volume target never enters legacy restore or creates successful application history", async () => {
-		await expect(
-			volumeSnapshotService.applySnapshot({
-				snapshotId: "snapshot",
-				targetChapterId: "legacy",
-				targetWorktreeResourceId: "resource",
-			}),
-		).rejects.toThrow("OWNER_SELECTOR_MIXED");
-		await expect(
-			volumeSnapshotService.createSnapshot({
-				projectId: "project",
-				chapterId: "legacy",
-				sourceWorktreeResourceId: "resource",
-				serviceName: "app",
-				containerPath: "/data",
-				name: "snapshot",
-			}),
-		).rejects.toThrow("OWNER_SELECTOR_MIXED");
-		expect(command).toHaveBeenCalledTimes(0);
-		expect(restore).toHaveBeenCalledTimes(0);
-		expect(fixture.sqlite.query("SELECT id FROM volume_snapshot_applications").all()).toEqual([]);
 	});
 });
 
@@ -477,15 +317,12 @@ function fixtureWs() {
 const rejectedTerminalInputs = [
 	{ worktreeResourceId: "resource" },
 	{ worktreeResourceId: "resource", narratorId: "source" },
-	{ worktreeResourceId: "resource", chapterId: "legacy" },
 	{ worktreeResourceId: null },
 	{ worktreeResourceId: "" },
 	{ worktreeResourceId: 7 },
 	{ worktreeResourceId: { id: "resource" } },
 	{ worktreeResourceId: null, narratorId: "source" },
-	{ chapterId: null },
 	{ narratorId: "" },
-	{ chapterId: "legacy", narratorId: "source" },
 ];
 describe("HTTP/WS DTO to real terminal service fail closed before all runtime effects", () => {
 	for (const [index, payload] of rejectedTerminalInputs.entries()) {
@@ -535,7 +372,6 @@ describe("HTTP/WS DTO to real terminal service fail closed before all runtime ef
 		["standalone", { name: "standalone", clientCompatibilityField: true }],
 		["narrator", { narratorId: "source" }],
 		["no-cwd narrator", { narratorId: "source" }],
-		["chapter", { chapterId: "legacy" }],
 	] as const) {
 		test(`HTTP retains legacy ${name}, with one PTY and no role/ACL mutation`, async () => {
 			if (name === "no-cwd narrator")

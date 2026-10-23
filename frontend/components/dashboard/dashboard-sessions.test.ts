@@ -24,7 +24,6 @@ function decision(narratorId: string, extra: Partial<HumanAttentionItem> = {}): 
 		narratorTitle: `owner-${narratorId}`,
 		parentNarratorId: null,
 		rootNarratorId: null,
-		chapterId: null,
 		createdAt: "2026-01-01T00:00:00Z",
 		blocking: false,
 		canAct: true,

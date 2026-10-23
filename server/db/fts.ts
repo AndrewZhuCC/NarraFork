@@ -233,6 +233,34 @@ function repopulateKnowledgeDraftsFts(sqlite: Database, hasKnowledgeEntries: boo
 	refill();
 }
 
+/**
+ * FTS objects of retired features, dropped on startup.
+ *
+ * An upgrade's migration drops the content table (and SQLite drops the table's triggers with
+ * it), but the FTS5 virtual table and its shadow tables are runtime objects this module created
+ * and no migration knows about. Triggers go first so a trigger can never outlive the index it
+ * writes to. A healthy database has none of them: one schema lookup and no writes.
+ */
+const RETIRED_FTS_TRIGGERS = ["chapters_fts_insert", "chapters_fts_update", "chapters_fts_delete"];
+const RETIRED_FTS_TABLES = ["chapters_fts"];
+
+function dropRetiredFtsObjects(sqlite: Database): void {
+	const names = [...RETIRED_FTS_TRIGGERS, ...RETIRED_FTS_TABLES];
+	const present = sqlite
+		.prepare(
+			`SELECT name FROM sqlite_master WHERE type IN ('trigger', 'table') AND name IN (${names
+				.map(() => "?")
+				.join(", ")})`,
+		)
+		.all(...names) as Array<{ name: string }>;
+	if (present.length === 0) return;
+	sqlite.transaction(() => {
+		for (const name of RETIRED_FTS_TRIGGERS) sqlite.run(`DROP TRIGGER IF EXISTS ${name}`);
+		for (const name of RETIRED_FTS_TABLES) sqlite.run(`DROP TABLE IF EXISTS ${name}`);
+	})();
+	logger.info("Dropped retired FTS objects", { objects: present.map((row) => row.name) });
+}
+
 export function ensureFts(
 	sqlite: Database,
 	options: {
@@ -251,22 +279,19 @@ export function ensureFts(
 	// Guard: skip if base tables don't exist yet (fresh DB before first migration)
 	const hasBaseTables = sqlite
 		.prepare(
-			"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name IN ('chapters','narrators','narrator_messages')",
+			"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name IN ('narrators','narrator_messages')",
 		)
 		.get() as { c: number };
 
-	if (hasBaseTables.c !== 3) {
+	if (hasBaseTables.c !== 2) {
 		return { rebuilt: false };
 	}
 
+	dropRetiredFtsObjects(sqlite);
+
 	// Detect and drop old non-trigram FTS tables so they get recreated correctly
 	const ftsTablesRecreated: string[] = [];
-	for (const table of [
-		"chapters_fts",
-		"narrator_messages_fts",
-		"narrators_fts",
-		"knowledge_drafts_fts",
-	]) {
+	for (const table of ["narrator_messages_fts", "narrators_fts", "knowledge_drafts_fts"]) {
 		const info = sqlite
 			.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
 			.get(table) as { sql: string } | undefined;
@@ -277,11 +302,6 @@ export function ensureFts(
 	}
 
 	// --- Virtual tables ---
-	sqlite.run(`
-		CREATE VIRTUAL TABLE IF NOT EXISTS chapters_fts USING fts5(
-			title, description, content='chapters', content_rowid=rowid, tokenize='trigram'
-		)
-	`);
 	sqlite.run(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS narrator_messages_fts USING fts5(
 			content_text, content='narrator_messages', content_rowid=rowid, tokenize='trigram'
@@ -385,11 +405,6 @@ export function ensureFts(
 	const repairedContentIndexes = new Set<string>();
 	const contentIndexTriggerSets = [
 		{
-			table: "chapters_fts",
-			rebuild: true,
-			triggers: ["chapters_fts_insert", "chapters_fts_update", "chapters_fts_delete"],
-		},
-		{
 			table: "narrator_messages_fts",
 			rebuild: true,
 			triggers: [
@@ -488,28 +503,6 @@ export function ensureFts(
 			throw error;
 		}
 	}
-
-	// --- Sync triggers: chapters ---
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS chapters_fts_insert AFTER INSERT ON chapters BEGIN
-			INSERT INTO chapters_fts(rowid, title, description)
-			VALUES (NEW.rowid, NEW.title, NEW.description);
-		END
-	`);
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS chapters_fts_update AFTER UPDATE ON chapters BEGIN
-			INSERT INTO chapters_fts(chapters_fts, rowid, title, description)
-			VALUES ('delete', OLD.rowid, OLD.title, OLD.description);
-			INSERT INTO chapters_fts(rowid, title, description)
-			VALUES (NEW.rowid, NEW.title, NEW.description);
-		END
-	`);
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS chapters_fts_delete AFTER DELETE ON chapters BEGIN
-			INSERT INTO chapters_fts(chapters_fts, rowid, title, description)
-			VALUES ('delete', OLD.rowid, OLD.title, OLD.description);
-		END
-	`);
 
 	// --- Sync triggers: narrator_messages ---
 	sqlite.run(`
@@ -677,7 +670,6 @@ export function ensureFts(
 		const probeThenRebuild = uncleanShutdown && !migrationForcedRebuild && !FORCE_FULL_FTS_REBUILD;
 		const ftsTables = [
 			"narrators_fts",
-			"chapters_fts",
 			"narrator_messages_fts",
 			...(hasKnowledgeEntries ? ["knowledge_entries_fts"] : []),
 		];

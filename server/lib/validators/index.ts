@@ -24,21 +24,6 @@ export {
 	updateProfileSchema,
 } from "./auth";
 export {
-	batchCleanupSchema,
-	batchMergeSchema,
-	containerConfigSchema,
-	createChapterSchema,
-	createReviewSchema,
-	forkChapterSchema,
-	mergeChapterSchema,
-	mergeCheckSchema,
-	splitChapterSchema,
-	updateChapterDetachedPanelsSchema,
-	updateChapterDockLayoutSchema,
-	updateChapterSchema,
-	updateGraphPositionsSchema,
-} from "./chapters";
-export {
 	chatDirectoryQuerySchema,
 	chatMessagesQuerySchema,
 	createDmRoomSchema,
@@ -61,12 +46,6 @@ export {
 	whitelistDirEntrySchema,
 } from "./common";
 export {
-	applyVolumeSnapshotSchema,
-	containerRemoveSchema,
-	createVolumeSnapshotSchema,
-	updateVolumeSnapshotSchema,
-} from "./containers";
-export {
 	buildPathRulesConfigSnippet,
 	createRemoteDeviceSchema,
 	deviceBrowseQuerySchema,
@@ -78,10 +57,6 @@ export {
 	updateDevicePathRulesSchema,
 	updateRemoteDeviceSchema,
 } from "./devices";
-export {
-	createExplorationGroupSchema,
-	updateExplorationGroupSchema,
-} from "./explorations";
 export { type FsWriteInput, fsWriteSchema } from "./fs";
 export {
 	gitCommitDiffQuerySchema,
@@ -216,13 +191,6 @@ export {
 	projectVisibilitySchema,
 	updateProjectSchema,
 } from "./projects";
-export {
-	rulerAbandonSchema,
-	rulerMergeSchema,
-	rulerRebaseResolveSchema,
-	rulerRebaseSchema,
-	updateRulerPositionsSchema,
-} from "./ruler";
 export {
 	createScheduledTaskSchema,
 	toggleScheduledTaskSchema,

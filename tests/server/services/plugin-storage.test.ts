@@ -173,6 +173,32 @@ describe("PluginStorage", () => {
 		expect(JSON.parse(await readFile(storage.storagePath, "utf8")).scopes).toEqual({});
 	});
 
+	test("drops entries stored under the removed chapter scope instead of rejecting the file", async () => {
+		const root = await makeRoot();
+		const storage = new PluginStorage({ pluginId: "com.example.chapters", root });
+		await storage.set({ scope: userScope, key: "kept", value: "user" });
+		// A file the released version could have written while chapter scopes existed.
+		const document = JSON.parse(await readFile(storage.storagePath, "utf8")) as {
+			scopes: Record<string, unknown>;
+		};
+		document.scopes["chapter\u0000chapter-1"] = document.scopes["user\u0000user-1"];
+		await writeFile(storage.storagePath, JSON.stringify(document), { mode: 0o600 });
+
+		const reloaded = new PluginStorage({ pluginId: "com.example.chapters", root });
+		expect((await reloaded.get({ scope: userScope, key: "kept" }))?.value).toBe("user");
+		await expect(
+			reloaded.get({ scope: { type: "chapter", id: "chapter-1" } as never, key: "kept" }),
+		).rejects.toMatchObject({ reason: "INVALID_SCOPE" });
+		await reloaded.set({ scope: otherUserScope, key: "next", value: 1 });
+		const rewritten = JSON.parse(await readFile(storage.storagePath, "utf8")) as {
+			scopes: Record<string, unknown>;
+			diagnostics: unknown[];
+		};
+		expect(Object.keys(rewritten.scopes).sort()).toEqual(["user\u0000user-1", "user\u0000user-2"]);
+		expect(rewritten.diagnostics).toEqual([]);
+		expect((await readdir(root)).some((name) => name.includes(".corrupt-"))).toBe(false);
+	});
+
 	test("does not replace the previous file when atomic rename fails and supports purge", async () => {
 		const root = await makeRoot();
 		const stable = new PluginStorage({ pluginId: "com.example.purge", root });

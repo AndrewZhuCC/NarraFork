@@ -13,8 +13,8 @@
  * length occupies the height the measure pass committed to.
  */
 
-import { Badge, Button, Group, Paper, Text } from "@mantine/core";
-import { IconCheck, IconEyeCheck, IconPlayerPlay } from "@tabler/icons-react";
+import { Badge, Group, Paper, Text } from "@mantine/core";
+import { IconEyeCheck } from "@tabler/icons-react";
 import {
 	type MeasuredReviewCard,
 	REVIEW_CARD_BORDER,
@@ -25,35 +25,17 @@ import {
 import { DETAIL_BOX_PADDING_X, DETAIL_BOX_PADDING_Y } from "../measure/measure-tool-call";
 import { RenderMarkdown } from "./RenderMarkdown";
 
-/**
- * Live action for the card's single button.
- *
- * Whether the button EXISTS is not this slot's decision: the measure pass always reserves
- * the action row, because handing the conclusion over flips the label on a row whose
- * height is already committed. An absent handler renders it disabled, the same rule every
- * other card's controls follow.
- */
-export interface ReviewCardActions {
-	/** Start a turn for this conclusion (it is already in the history). */
-	onApply?: () => void;
-	/** The round trip is in flight. */
-	applying?: boolean;
-}
-
 export interface RenderReviewCardProps {
 	measured: MeasuredReviewCard;
 	/**
-	 * Header chrome + the action label, forwarded by the adapter as height-neutral data.
+	 * Header chrome, forwarded by the adapter as height-neutral data.
 	 * Read off the measured element's `data` slot by the integration layer.
 	 */
 	data?: {
 		verdictLabel?: string;
 		revisedLabel?: string;
-		actionLabel?: string;
 		color?: string;
-		applied?: boolean;
 	};
-	actions?: ReviewCardActions;
 	/** Localized note for a body cut at the parse ceiling. */
 	truncatedLabel?: string;
 }
@@ -62,14 +44,8 @@ function cssColor(color: string, shade: number): string {
 	return `var(--mantine-color-${color}-${shade})`;
 }
 
-export function RenderReviewCard({
-	measured,
-	data,
-	actions,
-	truncatedLabel,
-}: RenderReviewCardProps) {
+export function RenderReviewCard({ measured, data, truncatedLabel }: RenderReviewCardProps) {
 	const color = data?.color ?? "gray";
-	const applied = data?.applied === true;
 	return (
 		<Paper
 			p="sm"
@@ -104,22 +80,6 @@ export function RenderReviewCard({
 					<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
 						{truncatedLabel}
 					</Text>
-				) : null}
-				{data?.actionLabel ? (
-					<Button
-						size="compact-xs"
-						variant={applied ? "subtle" : "light"}
-						color={color}
-						leftSection={applied ? <IconCheck size={12} /> : <IconPlayerPlay size={12} />}
-						style={{ flexShrink: 0, marginLeft: "auto" }}
-						loading={actions?.applying === true}
-						// Applied is terminal for a row: the conclusion is already in the history, so
-						// a second click would start a second turn for the same findings.
-						disabled={applied || !actions?.onApply}
-						onClick={actions?.onApply}
-					>
-						{data.actionLabel}
-					</Button>
 				) : null}
 			</Group>
 			<div

@@ -823,37 +823,6 @@ describe("manifest associations and real FK behavior", () => {
 				createdAt: time,
 			})
 			.run();
-		db.insert(schema.projects)
-			.values({
-				id: "project",
-				name: "fixture",
-				gitPath: "/not-used",
-				createdAt: time,
-				updatedAt: time,
-			})
-			.run();
-		db.insert(schema.chapters)
-			.values({
-				id: "chapter",
-				projectId: "project",
-				title: "fixture",
-				branch: "fixture",
-				baseBranch: "main",
-				createdAt: time,
-				updatedAt: time,
-			})
-			.run();
-		db.insert(schema.chapterCommits)
-			.values({
-				id: "commit",
-				chapterId: "chapter",
-				sha: "not-a-real-git-commit",
-				message: "fixture",
-				authoredAt: time,
-				createdAt: time,
-				narratorMessageId: target.messageId,
-			})
-			.run();
 		db.insert(schema.knowledgeCollections)
 			.values({
 				id: "collection",
@@ -896,9 +865,6 @@ describe("manifest associations and real FK behavior", () => {
 		expect(
 			query("SELECT source_message_id,content FROM spec_file_revisions WHERE id='revision'")[0],
 		).toEqual({ source_message_id: null, content: "private revision" });
-		expect(query("SELECT narrator_message_id FROM chapter_commits WHERE id='commit'")[0]).toEqual({
-			narrator_message_id: null,
-		});
 		expect(
 			query(
 				"SELECT trigger_message_id,trigger_tool_call_id,summary FROM knowledge_injection_events WHERE id='knowledge'",

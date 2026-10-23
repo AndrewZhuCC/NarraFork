@@ -20,7 +20,6 @@ const { narratorService } = await import("../narrator-service");
 const { retryLastMessage } = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
 const scopedRevert = await import("../narrator-scoped-revert");
-const treeSnapshots = await import("../worktree-tree-snapshot");
 const localRevert = await import("../revert-planner-local-access");
 
 const ID = "retry-history-only";
@@ -168,7 +167,6 @@ describe("retry after history-only rollback", () => {
 				message("notice", 3, "sys", [{ type: "text", text: "background notice" }]);
 			}
 			const scoped = spyOn(scopedRevert, "revertNarratorScopedForMessages");
-			const workspace = spyOn(treeSnapshots.worktreeTreeSnapshot, "restore");
 			const apply = spyOn(localRevert, "applyLocalRevertPlan");
 			const { start, reachedStart } = stopAtModelStart();
 			for (let retry = 0; retry < 2; retry++) {
@@ -178,7 +176,6 @@ describe("retry after history-only rollback", () => {
 			}
 			expect(start).toHaveBeenCalledTimes(2);
 			expect(scoped).not.toHaveBeenCalled();
-			expect(workspace).not.toHaveBeenCalled();
 			expect(apply).not.toHaveBeenCalled();
 			expect(
 				db

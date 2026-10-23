@@ -29,7 +29,7 @@
  * time as changing what is underneath it would make a behaviour regression
  * indistinguishable from a refactoring mistake.
  *
- * Two levels, conjunctive. A chapter-bound narrator sits inside a project, and the
+ * Two levels, conjunctive. A project narrator sits inside a project, and the
  * project is a GATE: passing it is necessary for anything inside, never sufficient.
  * So a project member has to get through the project door AND satisfy the narrator's
  * own ACL. That is why a teammate's `private` session stays invisible to fellow
@@ -52,6 +52,7 @@ import type { AclPrincipal } from "./acl/acl-core";
 import { resolveCaps } from "./acl/acl-core";
 import { resolveProjectIdForNarratorId } from "./narrator-project";
 import { resolveProjectGate } from "./project-acl";
+import { narratorProjectIdText } from "./read/acl-sql";
 
 /** What an operation needs from the caller. */
 export type NarratorAccessNeed = "read" | "write";
@@ -85,8 +86,7 @@ export interface NarratorAclRow {
 	type: string;
 	/** For subagents, the root to judge by. Null ⇒ undeterminable ⇒ fail closed. */
 	aclRootNarratorId: string | null;
-	chapterId?: string | null;
-	/** Project context for standalone narrators; participates in project resolution. */
+	/** The narrator's project; see `resolveNarratorProjectId`. */
 	contextProjectId?: string | null;
 }
 
@@ -106,7 +106,6 @@ export const NARRATOR_ACL_COLUMNS = {
 	writeAudience: true,
 	type: true,
 	aclRootNarratorId: true,
-	chapterId: true,
 	contextProjectId: true,
 } as const;
 
@@ -138,13 +137,8 @@ function visibilityGrantsRead(visibility: string): boolean {
  * it would otherwise be a way to be visible to everybody with no project constraining
  * it.
  *
- * "Resolves to a project" means `resolveNarratorProjectId` — chapter first, then
- * `contextProjectId`. This used to test `chapterId` directly, which was a fourth
- * private answer to "which project is this?" and disagreed with the one the project
- * gate itself uses: an externally provisioned session carrying only
- * `contextProjectId` was judged by its project at the gate, then treated as
- * project-less here. See `narrator-project.ts` for why divergent copies of that
- * question are a problem.
+ * "Resolves to a project" means `resolveNarratorProjectId`. See `narrator-project.ts`
+ * for why divergent copies of that question are a problem.
  */
 function visibilityGrantsReadInProject(visibility: string): boolean {
 	return visibility === "project";
@@ -289,10 +283,9 @@ export async function resolveAclRootId(row: NarratorAclRow): Promise<string | nu
  * removing that branch is what makes `visibility` an honest description of who can read
  * a session again. Two things had to be true first, and both must stay true:
  *   - the nesting is enforced on every write path, and
- *   - both sides resolve "which project" identically. They did not: read tested
- *     `chapterId` while write resolved `contextProjectId` too, so a
- *     `project`/`project` session carrying only `contextProjectId` was drivable but
- *     unreadable. Re-introducing that split would resurrect the same hole.
+ *   - both sides resolve "which project" identically, through
+ *     `resolveNarratorProjectId`. A split would make a `project`/`project` session
+ *     drivable but unreadable, or the reverse.
  */
 export async function canReadNarrator(
 	row: NarratorAclRow,
@@ -420,17 +413,9 @@ export async function loadNarratorForAccess(
  * The project a narrator resolves to, as a SQL scalar — the exact rule
  * `resolveNarratorProjectId` implements.
  *
- * The chapter wins; `context_project_id` is consulted ONLY when there is no chapter.
- * The `case` wrapper is load-bearing: a bare `coalesce` would keep falling through to
- * `context_project_id` when the chapter reference dangles, whereas the row-level
- * resolution reports "no project" in that case. Dropping it makes a narrator with a
- * deleted chapter resolve to a different project in SQL than in memory.
  */
 function projectIdOfSql(alias: string): string {
-	return `coalesce(
-		(select ch.project_id from chapters ch where ch.id = ${alias}.chapter_id),
-		case when ${alias}.chapter_id is null then ${alias}.context_project_id end
-	)`;
+	return narratorProjectIdText(alias);
 }
 
 /**
@@ -617,7 +602,7 @@ export function narratorReadableSqlParamCount(): number {
 /**
  * Filter an already-loaded set of narrator rows down to the readable ones.
  *
- * For unpaginated callers only (e.g. every narrator of one chapter). Paginated
+ * For unpaginated callers only. Paginated
  * endpoints must use `narratorReadableWhere` instead so `hasMore`/`totalCount` stay
  * truthful.
  *
@@ -628,8 +613,8 @@ export function narratorReadableSqlParamCount(): number {
  * the list predicate produces exactly the confusing pair of symptoms this design is
  * meant to avoid: rows that appear in one view and 404 in another.
  *
- * Chunked because every id becomes its own bind parameter: a chapter's narrator count
- * and the named-narrator list are both driven by user behaviour, so "naturally
+ * Chunked because every id becomes its own bind parameter: the named-narrator list is
+ * driven by user behaviour, so "naturally
  * bounded" was a comment rather than a guarantee, and crossing SQLite's variable
  * ceiling throws instead of degrading. Chunking makes the bound structural.
  */
@@ -709,33 +694,16 @@ export async function listNarratorAudience(
 }
 
 /**
- * Default visibility for a newly created narrator.
- *
- * Standalone sessions are private: they are personal work and nothing else refers
- * to them. Chapter-bound ones are project-visible, because a chapter is a shared
- * artifact — teammates who fork, review or merge it would otherwise face nodes on
- * the story graph they cannot open.
- */
-export function defaultVisibilityForNarrator(
-	chapterId: string | null | undefined,
-): "private" | "project" {
-	return chapterId ? "project" : "private";
-}
-
-/**
  * Default write audience for a newly created narrator, derived from the read audience
  * it will actually have.
  *
- * Takes the visibility rather than the chapter id so the pair cannot start out
- * illegal: the widest write audience a read audience permits is by definition legal
- * with it. Deriving from `chapterId` independently happened to agree for the two
- * default cases, but it would have quietly produced `private` + `project` for any
- * caller that passed an explicit `visibility` of its own.
+ * Takes the visibility so the pair cannot start out illegal: the widest write audience
+ * a read audience permits is by definition legal with it.
  *
  * The result is the most collaborative legal setting, which is the point of this axis:
- * a chapter-bound session becomes `project`, so a teammate who can already see the
- * work can pick it up without being granted individually, while a standalone private
- * session stays owner-only because there is no project to bound anything against.
+ * a project-visible session becomes `project`, so a teammate who can already see the
+ * work can pick it up without being granted individually, while a private session
+ * stays owner-only.
  */
 export function defaultWriteAudienceForNarrator(visibility: string): NarratorWriteAudience {
 	return widestWriteAudienceFor(visibility);

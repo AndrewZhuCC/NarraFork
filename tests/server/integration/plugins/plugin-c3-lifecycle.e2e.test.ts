@@ -139,7 +139,6 @@ function toolContext(): ToolContext {
 		locale: "en",
 		userId: "user-1",
 		projectId: "project-1",
-		chapterId: "chapter-1",
 		currentToolUseId: "agent-tool-1",
 		signal: new AbortController().signal,
 		requestPermission: async () => ({ behavior: "allow" }),

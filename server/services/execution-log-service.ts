@@ -15,7 +15,7 @@
  *     `getRecord`, and even there they are byte-capped.
  */
 import { db } from "@server/db";
-import { chapters, narrators, narratorToolCalls, projects } from "@server/db/schema";
+import { narrators, narratorToolCalls, projects } from "@server/db/schema";
 import { toolRegistry } from "@server/lib/agent/tool-registry";
 import {
 	type ExecutionLogCursor,
@@ -29,6 +29,7 @@ import {
 	type ApiExecutionTarget,
 	toolCallWithExecutionTargets,
 } from "@server/lib/tool-execution-target-projection";
+import { narratorProjectIdColumn } from "@server/services/narrator-project";
 import { and, desc, eq, gte, isNotNull, lte, or, type SQL, sql } from "drizzle-orm";
 import { summarizeSubagentToolCall } from "./subagent-activity";
 
@@ -87,7 +88,6 @@ export interface ExecutionLogFilters {
 	narratorId?: string;
 	/** Also include tool calls made by the narrator's subagents. */
 	includeSubagents?: boolean;
-	chapterId?: string;
 	projectId?: string;
 	toolName?: string;
 	status?: ExecutionLogStatus;
@@ -141,8 +141,6 @@ export interface ExecutionLogRecord {
 	narratorTitle: string | null;
 	narratorType: string | null;
 	subagentType: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
 	projectId: string | null;
 	projectName: string | null;
 }
@@ -224,9 +222,7 @@ const LIST_COLUMNS = {
 	narratorTitle: narrators.title,
 	narratorType: narrators.type,
 	subagentType: narrators.subagentType,
-	chapterId: narrators.chapterId,
-	chapterTitle: chapters.title,
-	projectId: chapters.projectId,
+	projectId: narratorProjectIdColumn,
 	projectName: projects.name,
 } as const;
 
@@ -371,8 +367,7 @@ export class ExecutionLogService {
 			.select({ ...LIST_COLUMNS, ...SUMMARY_HINT_COLUMNS })
 			.from(narratorToolCalls)
 			.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
-			.leftJoin(projects, eq(chapters.projectId, projects.id))
+			.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
 			.where(and(...conditions))
 			.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
 			.limit(boundedLimit + 1);
@@ -416,8 +411,7 @@ export class ExecutionLogService {
 			})
 			.from(narratorToolCalls)
 			.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
-			.leftJoin(projects, eq(chapters.projectId, projects.id))
+			.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
 			.where(eq(narratorToolCalls.id, id))
 			.limit(1);
 
@@ -544,8 +538,6 @@ export class ExecutionLogService {
 			narratorTitle: (row.narratorTitle as string | null) ?? null,
 			narratorType: (row.narratorType as string | null) ?? null,
 			subagentType: (row.subagentType as string | null) ?? null,
-			chapterId: (row.chapterId as string | null) ?? null,
-			chapterTitle: (row.chapterTitle as string | null) ?? null,
 			projectId: (row.projectId as string | null) ?? null,
 			projectName: (row.projectName as string | null) ?? null,
 		};
@@ -570,8 +562,7 @@ export class ExecutionLogService {
 					: (eq(narratorToolCalls.narratorId, filters.narratorId) as SQL),
 			);
 		}
-		if (filters.chapterId) conditions.push(eq(narrators.chapterId, filters.chapterId) as SQL);
-		if (filters.projectId) conditions.push(eq(chapters.projectId, filters.projectId) as SQL);
+		if (filters.projectId) conditions.push(eq(narratorProjectIdColumn, filters.projectId) as SQL);
 
 		const toolName = filters.toolName?.trim();
 		if (toolName) conditions.push(eq(narratorToolCalls.toolName, toolName) as SQL);

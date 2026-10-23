@@ -145,7 +145,7 @@ function applyViews(views: ViewOverrides[], pluginId = "com.example.demo") {
 }
 
 async function renderPanel(pluginId = "com.example.demo") {
-	// PluginDockPanelView resolves owner narrator/chapter through React Query hooks, so a
+	// PluginDockPanelView resolves the owner narrator through React Query hooks, so a
 	// client must be in scope even though this surface never has an owner narrator.
 	const queryClient = new QueryClient({
 		defaultOptions: {

@@ -5,7 +5,11 @@ import type {
 } from "@shared/scheduled-task-cleanup";
 import { request } from "./client";
 
-export type ScheduledTaskRunContext = "standalone" | "chapter";
+/**
+ * Rows saved before chapters were removed may still report `"chapter"`; the UI treats
+ * anything other than `"standalone"` as a project task, as the server does.
+ */
+export type ScheduledTaskRunContext = "standalone" | "project";
 export type ScheduledTaskNarratorMode = "new" | "reuse";
 export type ScheduledTaskLocale = Locale;
 export type ScheduledTaskLastStatus = "success" | "failed" | "skipped";
@@ -24,7 +28,6 @@ export interface ScheduledTask {
 	runContext: ScheduledTaskRunContext;
 	cwd: string | null;
 	projectId: string | null;
-	chapterId: string | null;
 	narratorMode: ScheduledTaskNarratorMode;
 	cleanupPolicy: ScheduledTaskCleanupPolicy;
 	reuseNarratorId: string | null;
@@ -69,7 +72,6 @@ export interface ScheduledTaskInput {
 	runContext?: ScheduledTaskRunContext;
 	cwd?: string | null;
 	projectId?: string | null;
-	chapterId?: string | null;
 	narratorMode?: ScheduledTaskNarratorMode;
 	cleanupPolicy?: ScheduledTaskCleanupPolicy;
 	enabled?: boolean;

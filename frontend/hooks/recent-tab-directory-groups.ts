@@ -11,10 +11,6 @@
  * (see `addRecentTab` call sites and `buildSubagentRecentTab`). Everything else is left
  * exactly where it was, for reasons that are not stylistic:
  *
- *  - `chapter` tabs put the CHAPTER TITLE in `subtitle`, not a path. Grouping on that
- *    field would invent directories out of titles. A chapter's real directory is its
- *    worktree path, which is only reachable through a per-tab API call
- *    (`resolveTabDirectory`) — far too expensive for list rendering.
  *  - `workspace` children are an explicit user-built structure. Pulling them into a
  *    directory group would dismantle the workspace the user assembled by hand, so the
  *    header and its children stay adjacent and untouched.
@@ -60,7 +56,7 @@ export type RecentTabRow =
  */
 export const MIN_DIRECTORY_GROUP_SIZE = 2;
 
-/** Tab types whose `subtitle` is a working directory (not a chapter title). */
+/** Tab types whose `subtitle` is a working directory. */
 export function hasDirectorySubtitle(tab: Pick<RecentTab, "type">): boolean {
 	return tab.type === "narrator" || tab.type === "subagent";
 }

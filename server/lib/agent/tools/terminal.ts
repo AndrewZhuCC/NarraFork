@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
-import { narrators, terminals } from "../../../db/schema";
+import { terminals } from "../../../db/schema";
 import { terminalService } from "../../../services/terminal-service";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -61,21 +61,18 @@ function extractPlainText(serialized: string): string {
 
 /**
  * Verify that the given narrator is allowed to access the terminal.
- * A narrator can access a terminal if:
- *   1. The terminal's narratorId matches, OR
- *   2. The terminal's chapterId matches the narrator's chapterId.
+ * A narrator can access a terminal it owns.
  */
 async function assertTerminalAccess(
 	terminalId: string,
 	narratorId: string,
-	cachedChapterId?: string,
 ): Promise<
 	| { allowed: true; terminal: { id: string; name: string; status: string | null } }
 	| { allowed: false; error: string }
 > {
 	const terminal = await db.query.terminals.findFirst({
 		where: eq(terminals.id, terminalId),
-		columns: { id: true, name: true, status: true, narratorId: true, chapterId: true },
+		columns: { id: true, name: true, status: true, narratorId: true },
 	});
 	if (!terminal) {
 		return { allowed: false, error: `Terminal not found: ${terminalId}` };
@@ -86,25 +83,9 @@ async function assertTerminalAccess(
 		return { allowed: true, terminal };
 	}
 
-	// Chapter-level access: terminal belongs to the same chapter as the narrator
-	if (terminal.chapterId) {
-		// Use cached chapterId from ToolContext when available to avoid a DB lookup
-		const narratorChapterId =
-			cachedChapterId ??
-			(
-				await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { chapterId: true },
-				})
-			)?.chapterId;
-		if (narratorChapterId && narratorChapterId === terminal.chapterId) {
-			return { allowed: true, terminal };
-		}
-	}
-
 	return {
 		allowed: false,
-		error: `Access denied: terminal ${terminalId} does not belong to this narrator or its chapter.`,
+		error: `Access denied: terminal ${terminalId} does not belong to this narrator.`,
 	};
 }
 
@@ -116,7 +97,6 @@ async function assertTerminalAccess(
 async function resolveTerminalId(
 	idOrName: string,
 	narratorId: string,
-	cachedChapterId?: string,
 ): Promise<{ id: string } | { error: string }> {
 	// 1. Try exact ID match
 	const byId = await db.query.terminals.findFirst({
@@ -131,32 +111,7 @@ async function resolveTerminalId(
 		columns: { id: true, name: true },
 	});
 
-	const chapterId =
-		cachedChapterId ??
-		(
-			await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { chapterId: true },
-			})
-		)?.chapterId;
-
-	let chapterTerminals: { id: string; name: string }[] = [];
-	if (chapterId) {
-		chapterTerminals = await db.query.terminals.findMany({
-			where: eq(terminals.chapterId, chapterId),
-			columns: { id: true, name: true },
-		});
-	}
-
-	// Deduplicate
-	const seen = new Set<string>();
-	const all: { id: string; name: string }[] = [];
-	for (const t of [...narratorTerminals, ...chapterTerminals]) {
-		if (!seen.has(t.id)) {
-			seen.add(t.id);
-			all.push(t);
-		}
-	}
+	const all = narratorTerminals;
 
 	// Exact name match (case-insensitive)
 	const nameLower = idOrName.toLowerCase();
@@ -241,7 +196,7 @@ export const terminalTool: ToolDefinition = {
 			case "list":
 				return await listTerminals(ctx.narratorId);
 			case "create":
-				return await createTerminal(ctx.narratorId, ctx.chapterId, name);
+				return await createTerminal(ctx.narratorId, name);
 			case "rename": {
 				if (!terminal_id) {
 					return {
@@ -252,27 +207,20 @@ export const terminalTool: ToolDefinition = {
 				if (!name) {
 					return { output: "name is required for 'rename' action", isError: true };
 				}
-				return await renameTerminal(terminal_id, name, ctx.narratorId, ctx.chapterId);
+				return await renameTerminal(terminal_id, name, ctx.narratorId);
 			}
 			case "read": {
 				if (!terminal_id) {
 					return { output: "terminal_id is required for 'read' action", isError: true };
 				}
-				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId, ctx.chapterId);
+				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId);
 				if ("error" in resolved) {
 					return { output: resolved.error, isError: true };
 				}
 				// Treat last_n_lines < 1 as unset (AI models sometimes pass 0 or floats)
 				const effectiveLastN =
 					last_n_lines !== undefined && last_n_lines >= 1 ? Math.round(last_n_lines) : undefined;
-				return await readBuffer(
-					resolved.id,
-					ctx.narratorId,
-					ctx.chapterId,
-					ctx.signal,
-					effectiveLastN,
-					wait_for,
-				);
+				return await readBuffer(resolved.id, ctx.narratorId, ctx.signal, effectiveLastN, wait_for);
 			}
 			case "write": {
 				if (!terminal_id) {
@@ -281,11 +229,11 @@ export const terminalTool: ToolDefinition = {
 				if (input === undefined || input === null) {
 					return { output: "input is required for 'write' action", isError: true };
 				}
-				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId, ctx.chapterId);
+				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId);
 				if ("error" in resolved) {
 					return { output: resolved.error, isError: true };
 				}
-				return await writeInput(resolved.id, ctx.narratorId, ctx.chapterId, ctx.signal, input);
+				return await writeInput(resolved.id, ctx.narratorId, ctx.signal, input);
 			}
 
 			default:
@@ -301,32 +249,11 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 		columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
 	});
 
-	// Also find terminals associated with the narrator's chapter
-	const narrator = await db.query.narrators.findFirst({
-		where: (n, { eq }) => eq(n.id, narratorId),
-		columns: { chapterId: true },
-	});
-
-	let chapterTerminals: typeof narratorTerminals = [];
-	if (narrator?.chapterId) {
-		chapterTerminals = await db.query.terminals.findMany({
-			where: eq(terminals.chapterId, narrator.chapterId),
-			columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
-		});
-	}
-
-	// Deduplicate by ID and exclude exited terminals
-	const seen = new Set<string>();
-	const all = [];
-	for (const t of [...narratorTerminals, ...chapterTerminals]) {
-		if (!seen.has(t.id) && t.status !== "exited") {
-			seen.add(t.id);
-			all.push(t);
-		}
-	}
+	// Exclude exited terminals
+	const all = narratorTerminals.filter((t) => t.status !== "exited");
 
 	if (all.length === 0) {
-		return { output: "No terminals found for this narrator or its chapter." };
+		return { output: "No terminals found for this narrator." };
 	}
 
 	const lines = all.map(
@@ -339,15 +266,9 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 	};
 }
 
-async function createTerminal(
-	narratorId: string,
-	cachedChapterId?: string,
-	name?: string,
-): Promise<ToolResult> {
+async function createTerminal(narratorId: string, name?: string): Promise<ToolResult> {
 	try {
-		const terminal = cachedChapterId
-			? await terminalService.create({ chapterId: cachedChapterId, narratorId, name })
-			: await terminalService.create({ narratorId, name });
+		const terminal = await terminalService.create({ narratorId, name });
 		return {
 			output:
 				`Terminal created successfully.\n` +
@@ -366,13 +287,12 @@ async function renameTerminal(
 	idOrName: string,
 	newName: string,
 	narratorId: string,
-	cachedChapterId?: string,
 ): Promise<ToolResult> {
-	const resolved = await resolveTerminalId(idOrName, narratorId, cachedChapterId);
+	const resolved = await resolveTerminalId(idOrName, narratorId);
 	if ("error" in resolved) {
 		return { output: resolved.error, isError: true };
 	}
-	const access = await assertTerminalAccess(resolved.id, narratorId, cachedChapterId);
+	const access = await assertTerminalAccess(resolved.id, narratorId);
 	if (!access.allowed) {
 		return { output: access.error, isError: true };
 	}
@@ -424,12 +344,11 @@ export async function abortableSleep(ms: number, signal: AbortSignal): Promise<b
 async function readBuffer(
 	terminalId: string,
 	narratorId: string,
-	cachedChapterId: string | undefined,
 	signal: AbortSignal,
 	lastNLines?: number,
 	waitFor?: string,
 ): Promise<ToolResult> {
-	const access = await assertTerminalAccess(terminalId, narratorId, cachedChapterId);
+	const access = await assertTerminalAccess(terminalId, narratorId);
 	if (!access.allowed) {
 		return { output: access.error, isError: true };
 	}
@@ -580,11 +499,10 @@ function tailSlice(text: string, maxLines: number, maxChars: number): string {
 async function writeInput(
 	terminalId: string,
 	narratorId: string,
-	cachedChapterId: string | undefined,
 	signal: AbortSignal,
 	input: string,
 ): Promise<ToolResult> {
-	const access = await assertTerminalAccess(terminalId, narratorId, cachedChapterId);
+	const access = await assertTerminalAccess(terminalId, narratorId);
 	if (!access.allowed) {
 		return { output: access.error, isError: true };
 	}

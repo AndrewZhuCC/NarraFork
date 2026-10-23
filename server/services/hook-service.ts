@@ -20,7 +20,6 @@ export interface HookInput {
 	narrator_id?: string;
 	/** Human-readable narrator title (resolved from the narrator record when available). */
 	narrator_title?: string;
-	chapter_id?: string;
 	project_id?: string;
 	cwd?: string;
 	tool_name?: string;

@@ -1060,7 +1060,6 @@ export async function provisionExternalNarrator(
 
 		try {
 			const prepared = await prepareNarratorCreation({
-				chapterId: null,
 				title: input.title ?? `External narrator ${provisionKey}`,
 				permissionMode,
 				systemPrompt,

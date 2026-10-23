@@ -51,7 +51,6 @@ export interface BrokenModelNarrator {
 	title: string | null;
 	model: string;
 	status: string;
-	chapterId: string | null;
 	/** True when `pendingModelRestore` would resurrect a broken model after a restart. */
 	hasBrokenPendingRestore: boolean;
 }
@@ -198,7 +197,6 @@ export async function scanBrokenModelNarrators(
 				model: narrators.model,
 				pendingModelRestore: narrators.pendingModelRestore,
 				status: narrators.status,
-				chapterId: narrators.chapterId,
 			})
 			.from(narrators)
 			.where(where)
@@ -232,7 +230,6 @@ export async function scanBrokenModelNarrators(
 				title: row.title,
 				model,
 				status: row.status,
-				chapterId: row.chapterId,
 				hasBrokenPendingRestore:
 					!!pending &&
 					!isMetaModelValue(pending) &&

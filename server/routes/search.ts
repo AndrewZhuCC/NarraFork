@@ -8,7 +8,7 @@ import {
 export const searchRoutes = new Hono();
 
 /** Entity names `/api/search` accepts. Anything else in the query is ignored. */
-const SEARCH_ENTITIES = ["chapters", "messages", "narrators", "knowledge"] as const;
+const SEARCH_ENTITIES = ["messages", "narrators", "knowledge"] as const;
 
 /**
  * Conversation content `include` adds to the default (primary sessions, what people wrote
@@ -29,7 +29,7 @@ searchRoutes.get("/", async (c) => {
 	const q = c.req.query("q");
 	if (!q?.trim()) return c.json({ results: [] });
 
-	const entitiesParam = c.req.query("entities") ?? "chapters,messages,narrators,knowledge";
+	const entitiesParam = c.req.query("entities") ?? SEARCH_ENTITIES.join(",");
 	const entities = entitiesParam
 		.split(",")
 		.filter((e): e is (typeof SEARCH_ENTITIES)[number] =>
@@ -56,8 +56,7 @@ searchRoutes.get("/", async (c) => {
 		sort,
 		scope,
 		signal: c.req.raw.signal,
-		// Narrator and message hits are filtered to what this user may read, chapter hits
-		// to the projects they may read.
+		// Narrator and message hits are filtered to what this user may read.
 		principal,
 	});
 

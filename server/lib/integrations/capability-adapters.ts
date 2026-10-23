@@ -59,7 +59,6 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 	"plugin.uninstall": { descriptorId: "integration.uninstall", visibility: "internal-only" },
 	"plugin.grant": { descriptorId: "integration.grant", visibility: "internal-only" },
 	"query.read.projects": { descriptorId: "project.read", visibility: "integration" },
-	"query.read.chapters": { descriptorId: "chapter.read", visibility: "integration" },
 	"query.read.narrators": { descriptorId: "narrator.read", visibility: "integration" },
 	"query.read.message_summary": {
 		descriptorId: "message.summary.read",
@@ -72,10 +71,6 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 	"query.read.audit_self": { descriptorId: "audit.self.read", visibility: "integration" },
 	"query.read.audit_all": { descriptorId: "audit.all.read", visibility: "internal-only" },
 	"query.read.host_settings": { descriptorId: "settings.read", visibility: "internal-only" },
-	"event.subscribe.chapter": {
-		descriptorId: "event.chapter.subscribe",
-		visibility: "integration",
-	},
 	"event.subscribe.narrator": {
 		descriptorId: "event.narrator.subscribe",
 		visibility: "integration",
@@ -152,9 +147,6 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 		descriptorId: "permission.decide",
 		visibility: "internal-only",
 	},
-	"command.chapter.write": { descriptorId: "chapter.write", visibility: "integration" },
-	"command.chapter.merge": { descriptorId: "chapter.merge", visibility: "integration" },
-	"command.review.write": { descriptorId: "review.write", visibility: "integration" },
 	"command.routine.write": { descriptorId: "routine.write", visibility: "integration" },
 	"provider.register": { descriptorId: "provider.register", visibility: "integration" },
 	"provider.use": { descriptorId: "provider.use", visibility: "integration" },

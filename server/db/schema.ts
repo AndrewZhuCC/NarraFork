@@ -81,7 +81,7 @@ export const permissionRuleRequests = sqliteTable(
 export const resourceProtectionPaths = sqliteTable(
 	"resource_protection_paths",
 	{
-		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		source: text("source", { enum: ["narrator", "registry", "receipt"] }).notNull(),
 		sourceId: text("source_id").notNull(),
 		slot: integer("slot").notNull(),
 		deviceId: text("device_id").notNull(),
@@ -128,7 +128,7 @@ export const resourceProtectionPaths = sqliteTable(
 export const resourceProtectionSources = sqliteTable(
 	"resource_protection_sources",
 	{
-		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		source: text("source", { enum: ["narrator", "registry", "receipt"] }).notNull(),
 		sourceId: text("source_id").notNull(),
 		revision: integer("revision").notNull().default(1),
 		dirty: integer("dirty").notNull().default(1),
@@ -167,7 +167,7 @@ export const narratorWorktreeResources = sqliteTable(
 		}>(),
 		deviceId: text("device_id").notNull(),
 		repositoryKey: text("repository_key").notNull(),
-		/** Canonical backend path; never derive cleanup ownership from chapters alone. */
+		/** Canonical backend path. */
 		worktreePath: text("worktree_path").notNull(),
 		state: text("state", { enum: ["preparing", "ready", "unknown"] }).notNull(),
 		createRequestId: text("create_request_id").notNull(),
@@ -197,58 +197,65 @@ export const narratorWorktreeResources = sqliteTable(
 );
 
 // === projects ===
-export const projects = sqliteTable("projects", {
-	id: text("id").primaryKey(),
-	name: text("name").notNull(),
-	description: text("description"),
-	status: text("status", { enum: ["active", "archived"] })
-		.notNull()
-		.default("active"),
-	flowMode: text("flow_mode", { enum: ["classic", "ruler"] })
-		.notNull()
-		.default("classic"),
-	gitPath: text("git_path"),
-	remoteUrl: text("remote_url"),
-	defaultBranch: text("default_branch").default("main"),
-	startupScript: text("startup_script"),
-	copyFiles: text("copy_files"),
-	chapterSettings: text("chapter_settings", { mode: "json" }),
-	proxyDomain: text("proxy_domain"),
-	/**
-	 * Project layer of the layered trait system, same encoding as
-	 * `narrators.traits` so one encode/decode implementation serves both.
-	 * Resolution order is user → project → narrator (see lib/trait-layers.ts).
-	 */
-	traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
-	/**
-	 * The user who created the project, and the only non-admin principal that may
-	 * change its membership without holding an explicit `manage` grant.
-	 *
-	 * `set null` rather than cascade: deleting an account must never delete the
-	 * project (and, through it, every chapter, worktree and conversation). A null
-	 * owner is therefore a real, permanent state — it also covers every project that
-	 * predates project ACLs, which the migration marks `public`. Those are
-	 * admin-managed until someone is handed ownership.
-	 */
-	// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
-	ownerUserId: text("owner_user_id").references((): any => users.id, { onDelete: "set null" }),
-	/**
-	 * Who may reach the project at all — the outermost gate in the ACL chain.
-	 *
-	 * - "private" — owner, admins, and principals holding an `acl_grants` row
-	 * - "public"  — every signed-in user. What the migration assigns to existing
-	 *               projects so an upgrade hides nothing.
-	 *
-	 * Passing this gate is necessary, never sufficient: a narrator or knowledge
-	 * entry inside a reachable project is still governed by its own ACL, which is
-	 * why a private session stays invisible to project members.
-	 */
-	visibility: text("visibility", { enum: ["private", "public"] })
-		.notNull()
-		.default("private"),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
-});
+export const projects = sqliteTable(
+	"projects",
+	{
+		id: text("id").primaryKey(),
+		name: text("name").notNull(),
+		description: text("description"),
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		gitPath: text("git_path"),
+		remoteUrl: text("remote_url"),
+		defaultBranch: text("default_branch").default("main"),
+		chapterSettings: text("chapter_settings", { mode: "json" }),
+		/**
+		 * Project layer of the layered trait system, same encoding as
+		 * `narrators.traits` so one encode/decode implementation serves both.
+		 * Resolution order is user → project → narrator (see lib/trait-layers.ts).
+		 */
+		traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/**
+		 * The user who created the project, and the only non-admin principal that may
+		 * change its membership without holding an explicit `manage` grant.
+		 *
+		 * `set null` rather than cascade: deleting an account must never delete the
+		 * project. A null
+		 * owner is therefore a real, permanent state — it also covers every project that
+		 * predates project ACLs, which the migration marks `public`. Those are
+		 * admin-managed until someone is handed ownership.
+		 */
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
+		ownerUserId: text("owner_user_id").references((): any => users.id, { onDelete: "set null" }),
+		/**
+		 * Who may reach the project at all — the outermost gate in the ACL chain.
+		 *
+		 * - "private" — owner, admins, and principals holding an `acl_grants` row
+		 * - "public"  — every signed-in user. What the migration assigns to existing
+		 *               projects so an upgrade hides nothing.
+		 *
+		 * Passing this gate is necessary, never sufficient: a narrator or knowledge
+		 * entry inside a reachable project is still governed by its own ACL, which is
+		 * why a private session stays invisible to project members.
+		 */
+		visibility: text("visibility", { enum: ["private", "public"] })
+			.notNull()
+			.default("private"),
+		/**
+		 * Normalized root directory (realpath, case-folded where the filesystem is), the key
+		 * the project index matches session directories against. Null until the index has
+		 * computed it, and permanently null for a project whose directory another, older
+		 * project already claims — such a project takes no part in matching.
+		 */
+		rootKey: text("root_key"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_projects_root_key").on(table.rootKey).where(sql`"root_key" IS NOT NULL`),
+	],
+);
 
 // === skill_directory_caches ===
 export const skillDirectoryCaches = sqliteTable(
@@ -270,363 +277,11 @@ export const skillDirectoryCaches = sqliteTable(
 	],
 );
 
-// === exploration_groups ===
-export const explorationGroups = sqliteTable(
-	"exploration_groups",
-	{
-		id: text("id").primaryKey(),
-		projectId: text("project_id")
-			.notNull()
-			.references(() => projects.id, { onDelete: "cascade" }),
-		title: text("title").notNull(),
-		description: text("description"),
-		// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
-		baseChapterId: text("base_chapter_id").references((): any => chapters.id, {
-			onDelete: "set null",
-		}),
-		status: text("status", { enum: ["active", "decided", "abandoned"] })
-			.notNull()
-			.default("active"),
-		// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
-		decidedChapterId: text("decided_chapter_id").references((): any => chapters.id, {
-			onDelete: "set null",
-		}),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_exploration_groups_project").on(table.projectId),
-		// FK covering indexes so deleting a chapter does not scan this table per row.
-		index("idx_exploration_groups_base_chapter").on(table.baseChapterId),
-		index("idx_exploration_groups_decided_chapter").on(table.decidedChapterId),
-	],
-);
-
-// === chapters ===
-export const chapters = sqliteTable(
-	"chapters",
-	{
-		id: text("id").primaryKey(),
-		projectId: text("project_id")
-			.notNull()
-			.references(() => projects.id, { onDelete: "cascade" }),
-		title: text("title").notNull(),
-		description: text("description"),
-		/**
-		 * `frozen` was removed rather than implemented.
-		 *
-		 * It was declared here and accepted by the validator, but no code path ever
-		 * wrote it, and every operation that matters rejected it: `fork` and `review`
-		 * require active/dormant, `wake` accepts only dormant, `dormant` requires
-		 * active. A chapter that reached `frozen` could therefore never be forked,
-		 * woken, merged or reviewed again — a state with no exit. The one observable
-		 * symptom was `GET /api/chapters?status=frozen` silently returning *every*
-		 * chapter, because the filter's own allowlist omitted it too.
-		 *
-		 * Dropping it needs no migration: Drizzle's `enum` is a TypeScript-level
-		 * constraint, and the SQLite column is a plain `text` with no CHECK (verified
-		 * against the live schema). No row has ever held the value.
-		 *
-		 * The idea it served — "merged chapters freeze on the ruler timeline" — is
-		 * better expressed by `merged`, which already means exactly that and has a
-		 * real exit (`unmerge`).
-		 */
-		status: text("status", {
-			enum: ["active", "dormant", "merged", "abandoned"],
-		})
-			.notNull()
-			.default("active"),
-
-		// 角色（视觉和语义标签，不限制操作能力）
-		role: text("role", { enum: ["trunk", "branch", "exploration", "review"] })
-			.notNull()
-			.default("branch"),
-
-		branch: text("branch").notNull(),
-		worktreePath: text("worktree_path"),
-		baseBranch: text("base_branch").notNull(),
-		// biome-ignore lint/suspicious/noExplicitAny: self-referencing FK
-		parentChapterId: text("parent_chapter_id").references((): any => chapters.id, {
-			onDelete: "set null",
-		}),
-		forkPoint: text("fork_point", { mode: "json" }),
-		mergedIntoChapterId: text("merged_into_chapter_id").references(
-			// biome-ignore lint/suspicious/noExplicitAny: self-referencing FK
-			(): any => chapters.id,
-			{ onDelete: "set null" },
-		),
-		mergeCommitSha: text("merge_commit_sha"),
-		mergeStrategy: text("merge_strategy", { enum: ["merge", "squash", "cherry-pick"] }),
-		preMergeTargetSha: text("pre_merge_target_sha"),
-
-		/**
-		 * Snapshot commit produced by a commit-free merge.
-		 *
-		 * The snapshot-space counterpart of `mergeCommitSha`, and the flag that routes
-		 * an unmerge: present means the merge happened in the shadow DAG and has to be
-		 * reversed there, absent means it produced a real git commit. Deliberately a
-		 * separate column rather than reusing `mergeCommitSha`, which nine backend and
-		 * five frontend readers interpret as a genuine git commit — a snapshot id put
-		 * there would be a lie they cannot detect.
-		 */
-		mergeSnapshotCommitSha: text("merge_snapshot_commit_sha"),
-		/**
-		 * Target's snapshot immediately before a commit-free merge.
-		 *
-		 * The snapshot-space counterpart of `preMergeTargetSha`, used to undo the merge
-		 * and to abort a conflicted one.
-		 */
-		preMergeTargetSnapshotSha: text("pre_merge_target_snapshot_sha"),
-		/**
-		 * The source snapshot that was merged in.
-		 *
-		 * Serves two purposes, both load-bearing. It is the merge base for the reverse
-		 * three-way merge that undoes the merge; and it is the only remaining record of
-		 * the source's uncommitted work, since a commit-free merge leaves the source
-		 * branch tip untouched while its worktree is removed. Waking or unmerging the
-		 * source restores this tree, without which the user would get back a chapter
-		 * holding only its last commit.
-		 */
-		mergedSourceSnapshotSha: text("merged_source_snapshot_sha"),
-		containerConfig: text("container_config", { mode: "json" }),
-
-		// 探索组
-		explorationGroupId: text("exploration_group_id").references(() => explorationGroups.id, {
-			onDelete: "set null",
-		}),
-
-		// Root chapter — represents the project's own git directory, not a worktree
-		isRoot: integer("is_root").default(0),
-
-		// Commit 范围边界（精确定义章节的 commit "窗口"）
-		headCommitSha: text("head_commit_sha"),
-		startCommitSha: text("start_commit_sha"),
-		commitCount: integer("commit_count").default(0),
-
-		/**
-		 * Latest snapshot commit for this chapter's workspace — its narrative state
-		 * independent of whether the user has committed anything.
-		 *
-		 * The chapter's identity used to be defined purely by commits, which is why
-		 * forking and merging required one: there was no other name for "the state
-		 * this chapter is in". This is that name. It advances as the workspace
-		 * changes and needs no cooperation from the user's git history.
-		 */
-		snapshotCommitSha: text("snapshot_commit_sha"),
-		/**
-		 * Canonical key of the shadow repository holding this chapter's snapshots.
-		 *
-		 * Recorded separately from `worktreePath` because it must outlive it. Going
-		 * dormant nulls `worktreePath` while the lineage stays valuable (waking
-		 * rebuilds the identical path), so without this the orphan sweep cannot tell
-		 * a dormant chapter's shadow repository from a genuinely abandoned one, and
-		 * would delete the chapter's entire snapshot history.
-		 */
-		snapshotShadowKey: text("snapshot_shadow_key"),
-		/**
-		 * Snapshot holding work the branch tip does NOT carry, recorded when going
-		 * dormant.
-		 *
-		 * Written only when the pre-dormant auto-commit failed — which `dormant`
-		 * deliberately tolerates before deleting the worktree, so at that moment the
-		 * snapshot becomes the only copy of the user's uncommitted work. Waking
-		 * restores it.
-		 *
-		 * Deliberately not written after a successful commit, so its presence carries
-		 * one unambiguous meaning: "the branch is missing this chapter's state". A value
-		 * set unconditionally would make every wake overwrite a worktree that git had
-		 * already restored correctly. Distinct from `snapshotCommitSha`, which tracks
-		 * the latest state regardless of whether it is also committed.
-		 */
-		dormantSnapshotCommitSha: text("dormant_snapshot_commit_sha"),
-		/**
-		 * Uncommitted work parked so a rebase could run, awaiting reapplication.
-		 *
-		 * Rebase and cherry-pick genuinely require commits — they replay a commit
-		 * sequence — but git also refuses to start either one over a dirty workspace,
-		 * which is what made a chapter with uncommitted work unrebasable at all. The
-		 * work is moved into the DAG first and put back afterwards.
-		 *
-		 * Persisted rather than held in memory because a conflicted rebase deliberately
-		 * *stops* with the worktree mid-rebase, so the reapply happens in a later
-		 * request (resolve, or abort) that has no other way to learn where the work went.
-		 * Non-null therefore means "this chapter owes itself a reapply"; it is cleared at
-		 * every terminal outcome, since a stale value would later restore an old
-		 * workspace over current work.
-		 */
-		parkedSnapshotCommitSha: text("parked_snapshot_commit_sha"),
-		/** Base tree of {@link parkedSnapshotCommitSha}, i.e. the clean state git was handed. */
-		parkedSnapshotBaseTree: text("parked_snapshot_base_tree"),
-
-		// 图可视化
-		color: text("color"),
-		groupLabel: text("group_label"),
-		pinned: integer("pinned").default(0),
-		/**
-		 * Ruler 坐标系：锚定到 commit + 轴上偏移 + 离轴距离。
-		 *
-		 * 这三列**只属于 ruler**：`axisOffset`/`crossOffset` 是相对 `anchorCommitSha`
-		 * 对应刻度的偏移，绝对位置是 `tickPosition(anchorCommitSha) + axisOffset`。
-		 * 脱离锚点它们没有意义 —— ruler 的刻度间距是每个 commit 240px，历史较长的
-		 * 章节其刻度坐标轻易上万，直接当世界坐标读会把节点丢到视口外极远处。
-		 *
-		 * classic 画布不要读写这三列，用下面的 `graphX`/`graphY`。
-		 */
-		anchorCommitSha: text("anchor_commit_sha"),
-		axisOffset: real("axis_offset").default(0),
-		crossOffset: real("cross_offset").default(0),
-		/**
-		 * Classic 画布的绝对世界坐标（React Flow 的 x/y），与 ruler 的锚定偏移分列存放。
-		 *
-		 * 两套坐标必须分开，因为它们语义不同且不可互换：ruler 存的是相对刻度的偏移，
-		 * classic 存的是绝对坐标。历史上两者共用 `axisOffset`/`crossOffset`，导致在
-		 * ruler 里拖过卡片的项目切回 classic 后，节点被按绝对坐标丢到极远处 —— 表现为
-		 * `fitView` 把缩放压到极小、画布看起来整个空白（节点其实在渲染，只是小到看不见），
-		 * 并且缩放低于 `MIN_EFFECTIVE_ZOOM` 还会让展开节点的 dock 反复挂载卸载。
-		 *
-		 * null = 该章节在 classic 中还没有被手动摆放过，交给 dagre 自动布局。这与 0 有
-		 * 实质区别：0 是一个用户真的可以拖到的位置（原点），若用 0 表示"未摆放"，任何
-		 * 拖到原点附近的节点都会在下次加载时被自动布局重新弹走。
-		 */
-		graphX: real("graph_x"),
-		graphY: real("graph_y"),
-		panelExpanded: integer("panel_expanded").default(0),
-		panelWidth: real("panel_width"),
-		panelHeight: real("panel_height"),
-		/**
-		 * 展开节点内嵌 dockview 表面的布局（序列化 envelope）；null = 用默认布局（仅 chat 面板）。
-		 *
-		 * 大字段：列表/图查询的 columns 白名单里不要加它（图接口一次返回全项目章节），
-		 * 只有 `GET /api/chapters/:id/dock-layout` 读取。写入上限见 updateChapterDockLayoutSchema。
-		 */
-		dockLayoutJson: text("dock_layout_json"),
-		/**
-		 * 从该章节 dock 中拖出、以独立节点形式留在画布上的工具面板（序列化 envelope）；null = 没有。
-		 *
-		 * 与 dockLayoutJson 分列存放：后者是 dockview 自己的 SerializedDockview，
-		 * 把自定义条目混进去会破坏 fromJSON。同样是大字段，列表/图查询不要读。
-		 */
-		detachedPanelsJson: text("detached_panels_json"),
-
-		// Review 相关
-		// biome-ignore lint/suspicious/noExplicitAny: self-referencing FK
-		reviewSourceChapterId: text("review_source_chapter_id").references((): any => chapters.id, {
-			onDelete: "set null",
-		}),
-		reviewStatus: text("review_status", {
-			enum: ["reviewing", "concluded", "converted", "dismissed"],
-		}),
-
-		lastAccessedAt: text("last_accessed_at"),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_chapters_project").on(table.projectId, table.status),
-		index("idx_chapters_parent").on(table.parentChapterId),
-		uniqueIndex("idx_chapters_project_branch").on(table.projectId, table.branch),
-		// FK covering indexes. chapters is deleted in several places (chapter-service,
-		// projects routes), and the two self-references plus the exploration-group link
-		// would otherwise be enforced with a full table scan per deleted row.
-		index("idx_chapters_merged_into").on(table.mergedIntoChapterId),
-		index("idx_chapters_review_source").on(table.reviewSourceChapterId),
-		index("idx_chapters_exploration_group").on(table.explorationGroupId),
-		// Looked up on every shadow-repo destroy to decide whether a chapter still
-		// claims it; without an index that is a full table scan per orphan swept.
-		index("idx_chapters_snapshot_shadow_key").on(table.snapshotShadowKey),
-		/**
-		 * Matched on every snapshot-pointer advance, which is the hottest write in the
-		 * system: the workspace watcher polls each active chapter and a narrator's every
-		 * file-mutating tool call crosses two boundaries. `advanceChapterSnapshot` updates
-		 * by workspace path rather than by chapter id — a workspace can back several
-		 * narrators, so the position belongs to the path — and without this index each of
-		 * those updates scanned the whole table.
-		 */
-		index("idx_chapters_worktree_path").on(table.worktreePath),
-	],
-);
-
-// === chapter_edges ===
-export const chapterEdges = sqliteTable(
-	"chapter_edges",
-	{
-		id: text("id").primaryKey(),
-		projectId: text("project_id")
-			.notNull()
-			.references(() => projects.id, { onDelete: "cascade" }),
-		sourceId: text("source_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
-		targetId: text("target_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
-		type: text("type", {
-			enum: ["fork", "merge", "dependency", "cherry_pick", "review"],
-		}).notNull(),
-		metadata: text("metadata", { mode: "json" }),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_chapter_edges_src_tgt_type").on(table.sourceId, table.targetId, table.type),
-		index("idx_chapter_edges_project").on(table.projectId),
-		index("idx_chapter_edges_source").on(table.sourceId),
-		index("idx_chapter_edges_target").on(table.targetId),
-	],
-);
-
-// === chapter_commits ===
-export const chapterCommits = sqliteTable(
-	"chapter_commits",
-	{
-		id: text("id").primaryKey(),
-		chapterId: text("chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
-		sha: text("sha").notNull(),
-		message: text("message").notNull(),
-		fullMessage: text("full_message"),
-		authorName: text("author_name"),
-		authorEmail: text("author_email"),
-		authoredAt: text("authored_at").notNull(),
-
-		// 来源追踪
-		source: text("source", {
-			enum: ["manual", "auto", "merge", "cherry_pick", "initial"],
-		})
-			.notNull()
-			.default("manual"),
-
-		// narrator 关联
-		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "set null" }),
-		narratorMessageId: text("narrator_message_id").references(
-			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
-			(): any => narratorMessages.id,
-			{ onDelete: "set null" },
-		),
-
-		// diff 统计缓存
-		filesChanged: integer("files_changed"),
-		linesAdded: integer("lines_added"),
-		linesRemoved: integer("lines_removed"),
-
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		uniqueIndex("idx_chapter_commits_sha").on(table.chapterId, table.sha),
-		index("idx_chapter_commits_chapter").on(table.chapterId, table.authoredAt),
-		index("idx_chapter_commits_narrator").on(table.narratorId),
-		// FK covering index: without it every narrator_messages row deletion triggers a
-		// full scan of this table to enforce the ON DELETE SET NULL constraint.
-		index("idx_chapter_commits_narrator_message").on(table.narratorMessageId),
-	],
-);
-
 // === narrators ===
 export const narrators = sqliteTable(
 	"narrators",
 	{
 		id: text("id").primaryKey(),
-		chapterId: text("chapter_id").references(() => chapters.id),
 		/** Creation provenance, never attached when a scheduled task reuses a session. */
 		scheduledTaskId: text("scheduled_task_id").references(
 			(): AnySQLiteColumn => scheduledTasks.id,
@@ -871,16 +526,13 @@ export const narrators = sqliteTable(
 		 *
 		 * - "private" — owner (+ granted users) only. Default for standalone narrators.
 		 * - "project" — visible to the members of the owning project, resolved the same
-		 *               way every other check resolves it (chapter first, then
-		 *               `contextProjectId`). Default for chapter-bound narrators, so
-		 *               forking or merging someone else's chapter does not leave an
-		 *               unopenable node on the story graph.
+		 *               way every other check resolves it (`resolveNarratorProjectId`).
+		 *               Default for sessions created from a project page.
 		 * - "public"  — every authenticated user. Also what the one-time backfill assigns
 		 *               to pre-ACL rows so an upgrade never silently hides existing work.
 		 *
 		 * "public" here is deliberately NOT behind the project gate: its audience is
-		 * meant to be wider than any project. "project" is, and is resolved through
-		 * the owning chapter (see `narrator-acl.ts`).
+		 * meant to be wider than any project. "project" is (see `narrator-acl.ts`).
 		 */
 		visibility: text("visibility", { enum: ["private", "project", "public"] })
 			.notNull()
@@ -983,7 +635,6 @@ export const narrators = sqliteTable(
 			table.createdAt,
 			table.id,
 		),
-		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
@@ -1023,6 +674,44 @@ export const narrators = sqliteTable(
 		index("idx_narrators_background_parent_created")
 			.on(table.parentNarratorId, table.createdAt, table.id)
 			.where(sql`"is_background" = 1`),
+	],
+);
+
+/**
+ * Which projects a narrator belongs to — a derived index, never a source of truth.
+ *
+ * Every row is a pure function of the narrator's own data (`context_project_id`, its
+ * working directory) and the project roots, so the whole table may be rebuilt at any
+ * time; a rebuild deletes links that can no longer be derived. See
+ * `services/project-index.ts`.
+ *
+ * At most one `primary` link per narrator: it is the project that gates access and
+ * supplies configuration. `additional` links only make the session appear on other
+ * project pages.
+ */
+export const narratorProjectLinks = sqliteTable(
+	"narrator_project_links",
+	{
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		role: text("role", { enum: ["primary", "additional"] }).notNull(),
+		/** `explicit` comes from `context_project_id`; `cwd` from a working directory. */
+		source: text("source", { enum: ["cwd", "explicit"] }).notNull(),
+		deviceId: text("device_id").notNull().default("local"),
+		/** The normalized directory a `cwd` link was derived from. */
+		directory: text("directory"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.narratorId, table.projectId] }),
+		uniqueIndex("uq_narrator_project_links_primary")
+			.on(table.narratorId)
+			.where(sql`"role" = 'primary'`),
+		index("idx_narrator_project_links_project").on(table.projectId, table.narratorId),
 	],
 );
 
@@ -1089,7 +778,7 @@ export const narratorGrants = sqliteTable(
 
 // === acl_grants ===
 /**
- * The unified grant table: one shape for project, chapter, narrator and knowledge
+ * The unified grant table: one shape for project, narrator and knowledge
  * authorization.
  *
  * Supersedes `knowledge_grants` and `narrator_grants`, which expressed the same
@@ -1125,7 +814,7 @@ export const aclGrants = sqliteTable(
 		 * Orphans are cleaned up by the same paths that delete the resource.
 		 */
 		scopeType: text("scope_type", {
-			enum: ["global", "project", "chapter", "narrator", "knowledge_collection", "knowledge_entry"],
+			enum: ["global", "project", "narrator", "knowledge_collection", "knowledge_entry"],
 		}).notNull(),
 		scopeId: text("scope_id"),
 		/** "user" → users.id; "role" → a users.role value ("admin" | "user"). */
@@ -1621,10 +1310,8 @@ export const narratorMessages = sqliteTable(
 		 * Snapshot commit for {@link treeHashAfter}, i.e. this boundary's position in
 		 * the shadow DAG.
 		 *
-		 * Kept alongside the tree hash rather than replacing it: rolling back only
-		 * needs the bytes, and every existing row has them. Forking from this message
-		 * needs the ancestry, which only the commit carries — it is what lets the new
-		 * chapter's later work still find a merge base with this one.
+		 * No longer written: the shadow DAG only served chapter forks and merges. Kept for
+		 * rows written before chapters were removed; rollback only needs the tree hash.
 		 */
 		snapshotCommitSha: text("snapshot_commit_sha"),
 		// 斜杠命令原始文本（展示用），如 "/translate typescript some code"
@@ -2327,15 +2014,10 @@ export const terminals = sqliteTable(
 	{
 		id: text("id").primaryKey(),
 		/**
-		 * Cascaded rather than left to explicit clean-up, because the default
-		 * (`NO ACTION`) actively *blocked* deleting a chapter: SQLite refuses the parent
-		 * row while any terminal still references it, so one missed clean-up step turned
-		 * into "FOREIGN KEY constraint failed" and the entire delete failed. A terminal is
-		 * a derived resource with no meaning once its chapter is gone, so cascading is
-		 * both correct and the safer default. `chapter-service` still deletes these rows
-		 * explicitly — that is now defence in depth rather than the only line.
+		 * Owner: the narrator, or a worktree resource. A row with neither was a chapter
+		 * terminal before chapters were removed; `legacy-chapter-resource-cleanup`
+		 * retires those at startup.
 		 */
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id),
 		worktreeResourceId: text("worktree_resource_id").references(
 			() => narratorWorktreeResources.id,
@@ -2350,29 +2032,15 @@ export const terminals = sqliteTable(
 			.notNull()
 			.default("running"),
 		exitCode: integer("exit_code"),
-		/**
-		 * 已停用（不再读写）：这五列服务于"把某个终端作为画布上的专用节点显示"，
-		 * 该节点类型已删除 —— 章节的终端现在都在其 dock 的终端面板里（自带多标签）。
-		 *
-		 * 保留而不删列：删列需要迁移，而它们不影响任何查询正确性，留着只是几个无人读取的
-		 * 字段；一旦删错则数据不可恢复。后续可单独做一次纯清理迁移，届时连带
-		 * `idx_terminals_chapter` 里的 `graphOpened` 一起处理。
-		 */
-		graphOpened: integer("graph_opened").notNull().default(0),
-		graphX: real("graph_x"),
-		graphY: real("graph_y"),
-		graphWidth: real("graph_width"),
-		graphHeight: real("graph_height"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
-		index("idx_terminals_chapter").on(table.chapterId, table.status, table.graphOpened),
 		index("idx_terminals_narrator").on(table.narratorId),
 		index("idx_terminals_status").on(table.status),
 		index("idx_terminals_resource_status").on(table.worktreeResourceId, table.status, table.id),
 		check(
 			"ck_terminals_resource_owner",
-			sql`${table.worktreeResourceId} is null or (${table.chapterId} is null and ${table.narratorId} is null)`,
+			sql`${table.worktreeResourceId} is null or ${table.narratorId} is null`,
 		),
 	],
 );
@@ -2402,7 +2070,6 @@ export const terminalViewState = sqliteTable(
 		userId: text("user_id")
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		worktreeResourceId: text("worktree_resource_id").references(
 			() => narratorWorktreeResources.id,
@@ -2418,19 +2085,17 @@ export const terminalViewState = sqliteTable(
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
-		uniqueIndex("idx_view_state_user_chapter").on(table.userId, table.chapterId),
 		uniqueIndex("idx_view_state_user_narrator").on(table.userId, table.narratorId),
 		// The unique indexes above lead with userId, so they cannot serve lookups keyed only
-		// on chapterId/narratorId. Those columns are used both by FK enforcement when a
-		// chapter/narrator row is deleted and by the bulk cleanup deletes in
-		// chapter-service / narrator-service / projects routes, which would otherwise scan.
-		index("idx_view_state_chapter").on(table.chapterId),
+		// on narratorId. That column is used both by FK enforcement when a narrator row is
+		// deleted and by the bulk cleanup deletes in narrator-service, which would otherwise
+		// scan.
 		index("idx_view_state_narrator").on(table.narratorId),
 		uniqueIndex("idx_view_state_user_resource").on(table.userId, table.worktreeResourceId),
 		index("idx_view_state_resource").on(table.worktreeResourceId),
 		check(
 			"ck_view_state_resource_owner",
-			sql`${table.worktreeResourceId} is null or (${table.chapterId} is null and ${table.narratorId} is null)`,
+			sql`${table.worktreeResourceId} is null or ${table.narratorId} is null`,
 		),
 	],
 );
@@ -2440,8 +2105,11 @@ export const containerInstances = sqliteTable(
 	"container_instances",
 	{
 		id: text("id").primaryKey(),
-		/** Legacy chapters still cascade; new resource-domain containers are independent. */
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		/**
+		 * Owning worktree resource. Null only on rows that belonged to a chapter before
+		 * chapters were removed; `legacy-chapter-resource-cleanup` retires those at
+		 * startup, and nothing creates new ones.
+		 */
 		worktreeResourceId: text("worktree_resource_id").references(
 			() => narratorWorktreeResources.id,
 			{ onDelete: "restrict" },
@@ -2462,18 +2130,11 @@ export const containerInstances = sqliteTable(
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
-		index("idx_container_instances_chapter").on(table.chapterId),
-		index("idx_container_instances_chapter_service").on(table.chapterId, table.serviceName),
 		index("idx_container_instances_container").on(table.containerId),
-		index("idx_container_instances_status").on(table.chapterId, table.status),
 		index("idx_container_instances_resource_service_status").on(
 			table.worktreeResourceId,
 			table.serviceName,
 			table.status,
-		),
-		check(
-			"ck_container_instances_owner",
-			sql`(${table.chapterId} is null) <> (${table.worktreeResourceId} is null)`,
 		),
 	],
 );
@@ -2483,13 +2144,7 @@ export const portAllocations = sqliteTable(
 	"port_allocations",
 	{
 		port: integer("port").primaryKey(),
-		/**
-		 * Cascaded for the same reason as `terminals.chapterId`, and this table was the
-		 * most likely one to block a delete: a port stays allocated in proxy mode even
-		 * after the container is removed, so `removeChapterContainers` could return
-		 * successfully while leaving a row that then refused the chapter's deletion.
-		 */
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		/** Null only on rows a chapter held before chapters were removed (see containers). */
 		worktreeResourceId: text("worktree_resource_id").references(
 			() => narratorWorktreeResources.id,
 			{ onDelete: "restrict" },
@@ -2497,15 +2152,7 @@ export const portAllocations = sqliteTable(
 		serviceName: text("service_name"),
 		allocatedAt: text("allocated_at").notNull(),
 	},
-	// FK covering index for chapter deletion.
-	(table) => [
-		index("idx_port_allocations_chapter").on(table.chapterId),
-		index("idx_port_allocations_resource").on(table.worktreeResourceId),
-		check(
-			"ck_port_allocations_owner",
-			sql`${table.chapterId} is null or ${table.worktreeResourceId} is null`,
-		),
-	],
+	(table) => [index("idx_port_allocations_resource").on(table.worktreeResourceId)],
 );
 
 // === user_preferences ===
@@ -3454,67 +3101,6 @@ export const narratorPatches = sqliteTable(
 	],
 );
 
-// === merge_sessions ===
-export const mergeSessions = sqliteTable(
-	"merge_sessions",
-	{
-		id: text("id").primaryKey(),
-		/**
-		 * Cascaded for the same reason as `terminals.chapterId`. A merge session describes
-		 * work in progress against this target; once the target is gone the session can
-		 * never be resumed, and leaving the row behind both blocked the delete and left
-		 * the startup sweep trying to restore a worktree that no longer exists.
-		 */
-		targetChapterId: text("target_chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
-		sourceChapterIds: text("source_chapter_ids", { mode: "json" }).notNull().$type<string[]>(),
-		strategy: text("strategy", { enum: ["merge", "squash", "cherry-pick"] })
-			.notNull()
-			.default("merge"),
-		status: text("status", {
-			enum: ["running", "waiting_decision", "ai_resolving", "completed", "cancelled", "error"],
-		}).notNull(),
-		currentIndex: integer("current_index").notNull().default(0),
-		mergedCount: integer("merged_count").notNull().default(0),
-		currentSourceChapterId: text("current_source_chapter_id"),
-		conflictFiles: text("conflict_files", { mode: "json" }).$type<string[]>(),
-		/**
-		 * Target's workspace snapshot before the in-flight merge was applied.
-		 *
-		 * A git-based interactive merge keeps its own half-finished state on disk, so
-		 * `git merge --abort` knows what to return to. A snapshot merge has no such
-		 * state: the conflicted tree is simply written into the worktree, so the way
-		 * back has to be recorded explicitly. Persisted rather than held in memory
-		 * because the two halves of an interactive merge are separate requests and a
-		 * restart between them must not strand the worktree in a conflicted state.
-		 */
-		preMergeTree: text("pre_merge_tree"),
-		/** The conflicted tree written to the worktree, kept for diagnosis and replay. */
-		conflictTree: text("conflict_tree"),
-		/**
-		 * The two snapshot commits being merged, recorded so the resolution can be
-		 * committed with both parents.
-		 *
-		 * Not re-derived at completion time: the target's head ref can legitimately
-		 * advance while the conflict is being resolved (the workspace watcher records
-		 * the narrator's edits), so reading it later would name a conflicted state
-		 * instead of the merge's actual parents — and a wrong parent makes the *next*
-		 * merge recompute a stale base and report already-resolved conflicts.
-		 */
-		preMergeTargetSnapshot: text("pre_merge_target_snapshot"),
-		mergeSourceSnapshot: text("merge_source_snapshot"),
-		/** Target's git HEAD before the merge, for parity with the commit path. */
-		preMergeTargetSha: text("pre_merge_target_sha"),
-		error: text("error"),
-		locale: text("locale").$type<Locale>(),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	// FK covering index for chapter deletion.
-	(table) => [index("idx_merge_sessions_target_chapter").on(table.targetChapterId)],
-);
-
 // === narrator_whitelist_dirs ===
 export const narratorWhitelistDirs = sqliteTable(
 	"narrator_whitelist_dirs",
@@ -3668,9 +3254,6 @@ export const volumeSnapshots = sqliteTable(
 			.references(() => projects.id, { onDelete: "cascade" }),
 		name: text("name").notNull(),
 		description: text("description"),
-		sourceChapterId: text("source_chapter_id").references(() => chapters.id, {
-			onDelete: "set null",
-		}),
 		// Provenance only: the existing non-null project FK and its cascade remain unchanged.
 		sourceWorktreeResourceId: text("source_worktree_resource_id").references(
 			() => narratorWorktreeResources.id,
@@ -3685,7 +3268,6 @@ export const volumeSnapshots = sqliteTable(
 	},
 	(table) => [
 		index("idx_volume_snapshots_project").on(table.projectId),
-		index("idx_volume_snapshots_source_chapter").on(table.sourceChapterId),
 		index("idx_volume_snapshots_source_resource").on(table.sourceWorktreeResourceId),
 	],
 );
@@ -3698,7 +3280,7 @@ export const volumeSnapshotApplications = sqliteTable(
 		snapshotId: text("snapshot_id")
 			.notNull()
 			.references(() => volumeSnapshots.id, { onDelete: "cascade" }),
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		/** Null only on applications to a chapter, recorded before chapters were removed. */
 		targetWorktreeResourceId: text("target_worktree_resource_id").references(
 			() => narratorWorktreeResources.id,
 			{ onDelete: "restrict" },
@@ -3708,42 +3290,7 @@ export const volumeSnapshotApplications = sqliteTable(
 	},
 	(table) => [
 		index("idx_snapshot_applications_snapshot").on(table.snapshotId),
-		index("idx_snapshot_applications_chapter").on(table.chapterId),
 		index("idx_snapshot_applications_target_resource").on(table.targetWorktreeResourceId),
-		check(
-			"ck_snapshot_applications_owner",
-			sql`(${table.chapterId} is null) <> (${table.targetWorktreeResourceId} is null)`,
-		),
-	],
-);
-
-// === review_conclusions ===
-export const reviewConclusions = sqliteTable(
-	"review_conclusions",
-	{
-		id: text("id").primaryKey(),
-		reviewChapterId: text("review_chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
-		sourceChapterId: text("source_chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
-		verdict: text("verdict", {
-			enum: ["approve", "request_changes", "comment_only"],
-		}).notNull(),
-		findingsJson: text("findings_json", { mode: "json" }).$type<
-			Array<{
-				severity: "critical" | "major" | "minor" | "suggestion";
-				file?: string;
-				line?: number;
-				message: string;
-			}>
-		>(),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_review_conclusions_review").on(table.reviewChapterId),
-		index("idx_review_conclusions_source").on(table.sourceChapterId),
 	],
 );
 
@@ -4217,8 +3764,6 @@ export const gatewaySessionMappings = sqliteTable(
 		appUserId: text("app_user_id").references(() => users.id, { onDelete: "set null" }),
 		/** Optional project binding */
 		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
-		/** Optional chapter binding */
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "set null" }),
 		lastMessageAt: text("last_message_at"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -4227,8 +3772,7 @@ export const gatewaySessionMappings = sqliteTable(
 		uniqueIndex("idx_gsm_platform_chat_user").on(table.platform, table.chatId, table.userId),
 		index("idx_gsm_narrator").on(table.narratorId),
 		index("idx_gsm_app_user").on(table.appUserId),
-		// FK covering indexes for chapter / project deletion.
-		index("idx_gsm_chapter").on(table.chapterId),
+		// FK covering index for project deletion.
 		index("idx_gsm_project").on(table.projectId),
 	],
 );
@@ -4400,7 +3944,7 @@ export const backgroundTasks = sqliteTable(
 // === file_attributions ===
 // Records every file modification attributed to a narrator/subagent (or an
 // external/terminal change). Keyed by normalized workspace path so it works
-// for chapters AND standalone narrators sharing the same directory. Powers the
+// for every narrator sharing the same directory. Powers the
 // "who changed this file" timeline in the Git panel.
 export const fileAttributions = sqliteTable(
 	"file_attributions",
@@ -5743,7 +5287,7 @@ export const knowledgePackActivations = sqliteTable(
 // === scheduled tasks ===
 // A scheduled task periodically starts a narrator with a preset prompt. The schedule is
 // always stored as a cron expression (the UI may generate it from friendly presets). At
-// each fire the scheduler either spawns a fresh standalone/chapter narrator or reuses an
+// each fire the scheduler either spawns a fresh standalone/project narrator or reuses an
 // existing one, then injects `prompt` to auto-start its agent loop (unattended).
 export const scheduledTasks = sqliteTable(
 	"scheduled_tasks",
@@ -5764,15 +5308,16 @@ export const scheduledTasks = sqliteTable(
 		// Permission mode for unattended execution; defaults to bypassPermissions.
 		permissionMode: text("permission_mode").notNull().default("bypassPermissions"),
 		locale: text("locale").$type<Locale>().notNull().default(DEFAULT_LOCALE),
-		// Run environment: standalone (no chapter/git) or bound to a chapter's worktree.
-		runContext: text("run_context", { enum: ["standalone", "chapter"] })
+		// Run environment: standalone (at `cwd`) or a project session (at `cwd`, else the
+		// project directory). Rows written before chapters were removed may still read
+		// "chapter"; `normalizeRunContext` maps that to "project".
+		runContext: text("run_context", { enum: ["standalone", "project"] })
 			.notNull()
 			.default("standalone"),
-		// standalone: working directory (null → home dir).
+		// Working directory (null → the project directory in project mode, else home).
 		cwd: text("cwd"),
-		// chapter mode: target project + chapter.
+		// project mode: target project.
 		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
-		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "set null" }),
 		// Whether to spawn a fresh narrator each run or reuse the same one.
 		narratorMode: text("narrator_mode", { enum: ["new", "reuse"] })
 			.notNull()
@@ -5803,11 +5348,10 @@ export const scheduledTasks = sqliteTable(
 		index("idx_scheduled_tasks_enabled").on(table.enabled),
 		index("idx_scheduled_tasks_next_run").on(table.enabled, table.nextRunAt),
 		index("idx_scheduled_tasks_project").on(table.projectId),
-		// FK covering indexes for user / narrator / chapter deletion.
+		// FK covering indexes for user / narrator deletion.
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
 		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
-		index("idx_scheduled_tasks_chapter").on(table.chapterId),
 	],
 );
 
@@ -5827,7 +5371,7 @@ export const scheduledTaskRuns = sqliteTable(
 		status: text("status", { enum: ["success", "failed", "skipped"] }).notNull(),
 		error: text("error"),
 		// Run environment snapshot at dispatch time.
-		runContext: text("run_context", { enum: ["standalone", "chapter"] }).notNull(),
+		runContext: text("run_context", { enum: ["standalone", "project"] }).notNull(),
 		// Whether this run was triggered manually ("Run now") vs the cron schedule.
 		manual: integer("manual", { mode: "boolean" }).notNull().default(false),
 		startedAt: text("started_at"),
@@ -6297,9 +5841,8 @@ export const notifications = sqliteTable(
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
 		kind: text("kind", { enum: ["chat_message", "permission_request"] }).notNull(),
-		/** Best-effort denormalized filters; null when the source has no project/chapter. */
+		/** Best-effort denormalized filter; null when the source has no project. */
 		projectId: text("project_id"),
-		chapterId: text("chapter_id"),
 		/** Required for permission_request; chat_message may leave this null. */
 		narratorId: text("narrator_id"),
 		title: text("title").notNull(),

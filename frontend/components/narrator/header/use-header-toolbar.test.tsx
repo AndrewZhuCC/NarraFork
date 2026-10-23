@@ -120,7 +120,7 @@ describe("panel toolbar controller", () => {
 	test("overflow plugin options track live surface transitions instead of a stale callback", async () => {
 		const props = options();
 		const close = mock(() => {});
-		for (const surface of ["workspace", "director", "focus", "graph"] as const) {
+		for (const surface of ["workspace", "director", "focus"] as const) {
 			await render(props, surface);
 			const element = controller.renderToolbarInlineOptions("plugins", close) as ReactElement<{
 				surface: PluginUiHostSurface;

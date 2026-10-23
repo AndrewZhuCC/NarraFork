@@ -3,7 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import type { GitWorkspace, GitWorkspaceState } from "@shared/git-workspace";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { narrators, projects } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -11,7 +11,8 @@ import { getHome } from "../lib/platform";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { gitDiscoveryCache } from "./git-discovery-cache";
-import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
+import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
+import { resolveNarratorProjectId } from "./narrator-project";
 import { activeNarrators } from "./narrator-session-state";
 import { createRemoteGitService, supportsRemoteGitWorkspace } from "./remote-git-service";
 
@@ -19,9 +20,7 @@ import { createRemoteGitService, supportsRemoteGitWorkspace } from "./remote-git
 export interface ResolvedWorkspace {
 	workspacePath: string;
 	rawPath: string;
-	chapterId?: string;
 	projectId?: string;
-	baseBranch?: string;
 }
 
 export function normalizeWorkspacePath(path: string): string {
@@ -109,7 +108,7 @@ export interface GitWorkspaceTarget {
 	workspace: GitWorkspace;
 	backend?: ExecutionBackend;
 	repositoryPath?: string;
-	/** Associated project is for authorization even when cwd overrides the chapter. */
+	/** Associated project is for authorization even when cwd is elsewhere. */
 	contextProjectId?: string;
 	/** The local session cwd is NOT used as a remote cwd fallback. */
 	configuredCwd?: string;
@@ -135,20 +134,13 @@ export async function resolveNarratorGitTarget(
 			cwd: true,
 			workspaceRevision: true,
 			workspaceContext: true,
-			chapterId: true,
 			contextProjectId: true,
 			defaultDeviceId: true,
+			traits: true,
 		},
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
-	const chapter = narrator.chapterId
-		? await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { id: true, projectId: true, worktreePath: true, isRoot: true },
-			})
-		: undefined;
-	if (narrator.chapterId && !chapter) throw new NotFoundError("Chapter", narrator.chapterId);
-	const projectId = chapter?.projectId ?? narrator.contextProjectId ?? undefined;
+	const projectId = (await resolveNarratorProjectId(narrator)) ?? undefined;
 	const project = projectId
 		? await db.query.projects.findFirst({
 				where: eq(projects.id, projectId),
@@ -166,14 +158,9 @@ export async function resolveNarratorGitTarget(
 	const localCwd =
 		committedContext?.cwd ??
 		active?.cwd ??
-		(chapter
-			? resolveLegacyNarratorCwd(
-					narrator.cwd,
-					chapter.worktreePath,
-					project?.gitPath,
-					chapter.isRoot === 1,
-				) || ""
-			: resolveNarratorSessionCwd(narrator.cwd, null, project?.gitPath, getHome()));
+		(isFormerChapterSessionWithoutDirectory(narrator)
+			? ""
+			: resolveNarratorSessionCwd(narrator.cwd, project?.gitPath, getHome()));
 	const deviceId = active
 		? (active._defaultDeviceId ?? "local")
 		: (narrator.defaultDeviceId ?? "local");
@@ -346,54 +333,7 @@ export async function resolveNarratorGitTarget(
 			}),
 		);
 	}
-	// A chapter is only a side-effect adapter for its *actual* worktree.
-	if (backend.kind === "local" && chapter?.worktreePath) {
-		const chapterRoot = await realpath(chapter.worktreePath).catch(() => null);
-		if (chapterRoot && backend.paths.equals(chapterRoot, probe.rootPath))
-			workspace.chapterId = chapter.id;
-	}
 	return target;
-}
-
-export async function resolveWorkspaceFromChapter(chapterId: string): Promise<ResolvedWorkspace> {
-	const ch = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-	if (!ch) throw new NotFoundError("Chapter", chapterId);
-	if (!ch.worktreePath) throw new ValidationError("Chapter has no active worktree");
-	return {
-		workspacePath: normalizeWorkspacePath(ch.worktreePath),
-		rawPath: ch.worktreePath,
-		chapterId: ch.id,
-		projectId: ch.projectId,
-		baseBranch: ch.baseBranch,
-	};
-}
-
-export async function resolveChapterGitTarget(
-	chapterId: string,
-	signal?: AbortSignal,
-): Promise<GitWorkspaceTarget> {
-	const legacy = await resolveWorkspaceFromChapter(chapterId);
-	const probe = await probeLocalGitWorkspace(legacy.rawPath, signal);
-	const root = probe.rootPath ?? null;
-	return {
-		backend: localBackend,
-		repositoryPath: probe.repositoryPath,
-		contextProjectId: legacy.projectId,
-		workspace: {
-			cwd: legacy.rawPath,
-			deviceId: "local",
-			rootPath: root,
-			workspaceKey: root ? gitWorkspaceIdentity(localBackend, root) : null,
-			repositoryKey: probe.repositoryPath
-				? gitWorkspaceIdentity(localBackend, probe.repositoryPath)
-				: null,
-			state: probe.state,
-			reason: probe.reason,
-			capabilities: { read: false, write: false },
-			chapterId,
-			projectId: legacy.projectId,
-		},
-	};
 }
 
 export async function resolveWorkspaceFromNarrator(
@@ -407,7 +347,6 @@ export async function resolveWorkspaceFromNarrator(
 			workspace.deviceId === "local"
 				? normalizeWorkspacePath(workspace.rootPath)
 				: workspace.workspaceKey,
-		chapterId: workspace.chapterId,
 		projectId: workspace.projectId,
 	};
 }

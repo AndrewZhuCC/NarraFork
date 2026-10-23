@@ -308,7 +308,7 @@ describe("Bash Git command detection for status refresh", () => {
 });
 
 describe("tool Git status refresh", () => {
-	test("invalidates at the write boundary and shares cached status in the trailing chapter broadcast", async () => {
+	test("invalidates at the write boundary and shares cached status in the trailing broadcast", async () => {
 		const statusCache = await import("../git-status-cache");
 		const { gitService } = await import("../git-service");
 		const ws = await import("../../websocket/narrator-ws");
@@ -331,19 +331,15 @@ describe("tool Git status refresh", () => {
 		spyOn(gitService, "getStatusSummary").mockImplementation((path, options) =>
 			coordinateGitStatusQuery(getLocalGitStatusQueryKey(path), query, options),
 		);
-		const ahead = spyOn(gitService, "getCommitsAhead").mockResolvedValue({
-			count: 2,
-			baseBranch: "main",
-		});
 		const invalidate = spyOn(statusCache, "invalidateStatus");
 		const cachedRead = spyOn(statusCache, "getStatusSummaryCached");
 		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
 		let verified = false;
 		const h = fixture(profiles[0], [
 			async (options) => {
-				h.session._chapterId = "git-track-chapter";
-				h.session._worktreePath = repo;
-				h.session._baseBranch = "main";
+				// A local session working in a Git repository tracks its cwd.
+				h.session.cwd = repo;
+				h.session._isInGitRepo = true;
 				const scheduled: Array<() => void> = [];
 				const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
 					callback: () => void,
@@ -374,15 +370,13 @@ describe("tool Git status refresh", () => {
 				expect(invalidate).toHaveBeenCalledTimes(2);
 				expect(query).toHaveBeenCalledTimes(1);
 				expect(cachedRead).toHaveBeenCalledWith(repo);
-				expect(ahead).toHaveBeenCalledWith(repo, "main");
 				expect(
 					broadcast.mock.calls.some(
 						([, message]) =>
 							message.type === "git_status" &&
 							message.toolUseId === "write-2" &&
-							message.chapterId === "git-track-chapter" &&
-							message.commitsAhead === 2 &&
-							message.baseBranch === "main" &&
+							message.narratorId === h.session.narratorId &&
+							message.status.headSha === "fixture-head" &&
 							!("files" in message.status),
 					),
 				).toBe(true);

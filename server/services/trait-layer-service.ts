@@ -148,9 +148,7 @@ async function loadUserTraits(
 
 /**
  * Re-exported so the many existing importers keep working while there is exactly
- * one implementation. This module used to carry its own copy that preferred
- * `contextProjectId` over the chapter — the opposite of what the session layer
- * did. See `narrator-project.ts` for why the chapter wins.
+ * one implementation, in `narrator-project.ts`.
  */
 export { resolveNarratorProjectId };
 
@@ -212,8 +210,8 @@ async function resolveNarratorTraitsInChain(
 		where: eq(narrators.id, narratorId),
 		columns: {
 			...RUNTIME_SOURCE_COLUMNS,
+			id: true,
 			traits: true,
-			chapterId: true,
 			contextProjectId: true,
 		},
 	});

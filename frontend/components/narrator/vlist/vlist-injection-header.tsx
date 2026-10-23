@@ -81,10 +81,9 @@ const PLATFORM_SOURCES = new Set([
 	"browser_session_lost",
 	"spec_continuation",
 	"spec_blocked_continuation",
-	// A concluded review is announced BY the platform: the reviewer is a separate
-	// chapter with its own narrator, and this row is NarraFork reporting its verdict
-	// rather than that narrator speaking here. Missing from this list, it fell through
-	// to "unknown sender" — which is what the reader actually saw on every review.
+	// A concluded review (written by the removed chapter-review feature, still present
+	// in old histories) was announced BY the platform rather than by a narrator speaking
+	// here. Missing from this list, it would fall through to "unknown sender".
 	"review_feedback",
 	// ⚠️ These three do NOT reach this header yet, and their `sidecar.sources.*` keys are
 	// therefore unused TODAY — do not delete either as orphans. The adapter deliberately
@@ -489,8 +488,6 @@ export interface InjectionNavigation {
 	onOpenKnowledge?: (entryId: string, scope: "global" | "personal") => void;
 	/** Open the Dynamic Spec panel with one file selected. */
 	onOpenSpec?: (uri: string) => void;
-	/** Open a chapter. */
-	onOpenChapter?: (chapterId: string) => void;
 	/** Localized tooltip / aria label per target kind. */
 	labels?: Partial<Record<InjectionTarget["kind"], string>>;
 }
@@ -519,10 +516,6 @@ function resolveInjectionOpener(
 		case "spec": {
 			const open = navigation.onOpenSpec;
 			return open ? () => open(target.uri) : undefined;
-		}
-		case "chapter": {
-			const open = navigation.onOpenChapter;
-			return open ? () => open(target.chapterId) : undefined;
 		}
 	}
 }

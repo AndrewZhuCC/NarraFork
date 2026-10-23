@@ -168,13 +168,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		action: "null",
 	},
 	{
-		table: "chapter_commits",
-		column: "narrator_message_id",
-		index: "idx_chapter_commits_narrator_message",
-		target: "narrator_messages",
-		action: "null",
-	},
-	{
 		table: "spec_file_revisions",
 		column: "source_message_id",
 		index: "idx_spec_file_revisions_source_message",

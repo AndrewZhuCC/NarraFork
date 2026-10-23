@@ -234,16 +234,8 @@ export function getEditorDocumentService(): EditorDocumentService {
 							try {
 								const { invalidateWorkspaceTreeCache } = await import("./narrator-session-state");
 								invalidateWorkspaceTreeCache(binding.cwd);
-								if (settings.chapters.treeSnapshotsEnabled) {
-									const { worktreeTreeSnapshot } = await import("./worktree-tree-snapshot");
-									const tree = await worktreeTreeSnapshot.tryCaptureHot(binding.cwd, "local");
-									if (tree) {
-										const { advanceChapterSnapshot } = await import("./chapter-snapshot-ref");
-										await advanceChapterSnapshot(binding.cwd, tree, "human editor save");
-									}
-								}
 							} catch (error) {
-								logger.debug("Large editor compatibility snapshot failed", {
+								logger.debug("Large editor tree cache invalidation failed", {
 									error: String(error),
 								});
 							}

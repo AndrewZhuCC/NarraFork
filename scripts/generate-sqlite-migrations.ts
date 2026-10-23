@@ -3,6 +3,7 @@ import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSy
 import { resolve } from "node:path";
 import { safeSpawn } from "../server/lib/spawn";
 import {
+	appendModelHistoryReinstall,
 	assertResourceMigrationValidated,
 	finalizeResourceMigration,
 	type ResourceMigrationSnapshot,
@@ -279,8 +280,14 @@ async function generateLocked(
 	const before = snapshot(baselineLast.idx);
 	const after = snapshot(latest.idx);
 	const triggerSuffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
+	// A contract's first install appends its triggers; a rebuild of a table the installed
+	// contract's triggers live on or name is wrapped in its versioned reinstall.
 	const finalized = (options.finalize ?? finalizeResourceMigration)(
-		appendGeneratedModelHistoryTriggers(original, triggerSuffix),
+		appendModelHistoryReinstall(
+			appendGeneratedModelHistoryTriggers(original, triggerSuffix),
+			before,
+			after,
+		),
 		before,
 		after,
 	);

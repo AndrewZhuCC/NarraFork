@@ -61,15 +61,23 @@ function isKnownAlreadyAppliedMigrationError(statement: MigrationStatement, err:
 	].some((prefix) => statement.sql.startsWith(prefix));
 }
 
+/**
+ * Replay like the production runner (`applyPendingMigrationsByHash`): foreign keys off and
+ * every statement in one transaction, where a migration's own `PRAGMA foreign_keys` is a no-op.
+ * Outside a transaction a mid-file `PRAGMA foreign_keys=ON` would take effect, and a later
+ * table rebuild's `DROP TABLE` would run FK actions/checks against already dropped tables.
+ */
 function applyMigrations(sqlite: Database): void {
-	for (const statement of MIGRATION_STATEMENTS) {
-		try {
-			sqlite.run(statement.sql);
-		} catch (err) {
-			if (isKnownAlreadyAppliedMigrationError(statement, err)) continue;
-			throw err;
+	sqlite.transaction(() => {
+		for (const statement of MIGRATION_STATEMENTS) {
+			try {
+				sqlite.run(statement.sql);
+			} catch (err) {
+				if (isKnownAlreadyAppliedMigrationError(statement, err)) continue;
+				throw err;
+			}
 		}
-	}
+	})();
 }
 
 export function getTestDb() {

@@ -42,7 +42,6 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			type: z.literal("git_workspace_subscribe"),
 			subscriptionId: z.string().min(1).max(128),
 			narratorId: z.string().min(1).max(128).optional(),
-			chapterId: z.string().min(1).max(128).optional(),
 			workspaceKey: z.string().min(1).max(128).optional(),
 			view: z.enum(["summary", "details"]).optional(),
 		})
@@ -85,11 +84,6 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		feedbackText: z.string().optional(),
 		compactAfter: z.boolean().optional(),
 		updatedPlan: z.string().optional(),
-	}),
-	z.object({
-		type: z.literal("merge_decision"),
-		mergeSessionId: z.string().min(1),
-		decision: z.enum(["continue", "cancel"]),
 	}),
 	z.object({
 		type: z.literal("buffer_message"),
@@ -181,7 +175,6 @@ export const terminalWsMessageSchema = z.preprocess(
 		z.object({
 			type: z.literal("create"),
 			requestId: z.string().min(1),
-			chapterId: z.string().min(1).optional(),
 			narratorId: z.string().min(1).optional(),
 			deviceId: z.string().min(1).optional(),
 			name: z.string().max(100).optional(),

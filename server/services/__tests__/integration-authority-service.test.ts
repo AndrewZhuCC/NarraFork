@@ -10,6 +10,7 @@ const ids = {
 	authority: generateId(),
 	legacyAuthority: generateId(),
 	duplicateAuthority: generateId(),
+	retiredAuthority: generateId(),
 };
 const now = new Date().toISOString();
 
@@ -31,6 +32,7 @@ afterAll(async () => {
 				ids.authority,
 				ids.legacyAuthority,
 				ids.duplicateAuthority,
+				ids.retiredAuthority,
 			]),
 		);
 	await db
@@ -40,6 +42,7 @@ afterAll(async () => {
 				ids.authority,
 				ids.legacyAuthority,
 				ids.duplicateAuthority,
+				ids.retiredAuthority,
 			]),
 		);
 	await db.delete(users).where(eq(users.id, ids.user));
@@ -195,5 +198,63 @@ describe("IntegrationAuthorityService", () => {
 				],
 			}),
 		).rejects.toThrow(/Unknown canonical capability/);
+	});
+
+	test("leaves out stored grants naming removed chapter capabilities or scopes", async () => {
+		const created = await integrationAuthorityService.create({
+			id: ids.retiredAuthority,
+			kind: "plugin_installation",
+			integrationId: "example.retired-plugin",
+			grants: [
+				{
+					capabilityId: "project.read",
+					scope: { type: "global" },
+					createdBy: { type: "system" },
+				},
+			],
+		});
+		// Rows the released version could have written before chapters were removed.
+		const row = {
+			authorityId: ids.retiredAuthority,
+			createdByType: "system" as const,
+			createdAt: now,
+			updatedAt: now,
+		};
+		await db.insert(integrationCapabilityGrants).values([
+			{
+				...row,
+				id: generateId(),
+				capabilityId: "chapter.read",
+				scopeType: "global",
+				scopeId: null,
+				scopeKey: "global",
+			},
+			{
+				...row,
+				id: generateId(),
+				capabilityId: "narrator.read",
+				scopeType: "chapter",
+				scopeId: "chapter-1",
+				scopeKey: "chapter:chapter-1",
+			},
+		]);
+
+		const snapshot = await integrationAuthorityService.requireSnapshot(ids.retiredAuthority);
+		expect(snapshot.grants.map((grant) => grant.capabilityId)).toEqual(["project.read"]);
+
+		// The next replacement revokes every active row, the hidden ones included.
+		await integrationAuthorityService.replaceGrants({
+			authorityId: ids.retiredAuthority,
+			expectedRevision: created.authority.revision,
+			grants: [
+				{ capabilityId: "project.read", scope: { type: "global" }, createdBy: { type: "system" } },
+			],
+		});
+		const active = await db.query.integrationCapabilityGrants.findMany({
+			where: eq(integrationCapabilityGrants.authorityId, ids.retiredAuthority),
+		});
+		expect(
+			active.filter((grant) => grant.revokedAt === null).map((grant) => grant.capabilityId),
+		).toEqual(["project.read"]);
 	});
 });

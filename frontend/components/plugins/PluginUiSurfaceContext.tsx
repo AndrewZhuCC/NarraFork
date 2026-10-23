@@ -11,13 +11,6 @@ import type { PluginDockPanelParams } from "./protocol";
 
 export type PluginUiHostSurface =
 	| "focus"
-	/**
-	 * A chapter node's embedded dock on the story-network canvas. Same shape as
-	 * `focus` (one surface, one narrator) but reported distinctly so a plugin can
-	 * adapt to the much smaller viewport. Treated as part of the focus family by
-	 * {@link sameSurfaceFamily}, so contributions declaring only `focus` still work.
-	 */
-	| "graph"
 	| "workspace"
 	| "director"
 	| "settings"
@@ -29,13 +22,11 @@ export interface PluginUiSessionContext {
 	workspaceId?: string;
 	projectId?: string;
 	narratorId?: string;
-	chapterId?: string | null;
 	presentation?: "grid" | "director";
 }
 
 type NarratorRuntimeContext = {
 	narratorId: string;
-	chapterId?: string | null;
 	projectId?: string;
 };
 
@@ -56,12 +47,10 @@ const PluginUiSurfaceContext = createContext<PluginUiSurfaceContextValue | null>
  *
  * Two families exist:
  *  - `workspace` / `director` — the same workspace seen as a grid or as an overlay.
- *  - `focus` / `graph` — a single narrator's dock, either full-page or embedded in
- *    a canvas node. A panel bound on one must resolve on the other, otherwise
- *    every plugin declaring `focus` would be rejected inside a graph node.
+ *  - `focus` — a single narrator's dock.
  */
 function isFocusFamily(surface: PluginUiHostSurface): boolean {
-	return surface === "focus" || surface === "graph";
+	return surface === "focus";
 }
 
 function isWorkspaceFamily(surface: PluginUiHostSurface): boolean {
@@ -135,7 +124,6 @@ function sameSessionContext(
 		previous.workspaceId === context.workspaceId &&
 		previous.projectId === context.projectId &&
 		previous.narratorId === context.narratorId &&
-		previous.chapterId === context.chapterId &&
 		previous.presentation === context.presentation
 	);
 }
@@ -165,9 +153,7 @@ export function PluginUiSurfaceProvider({
 	);
 	const registerNarratorContext = useCallback((context: NarratorRuntimeContext) => {
 		const previous = narratorContextsRef.current.get(context.narratorId);
-		if (previous?.chapterId === context.chapterId && previous?.projectId === context.projectId) {
-			return;
-		}
+		if (previous?.projectId === context.projectId) return;
 		narratorContextsRef.current.set(context.narratorId, context);
 		setRevision((value) => value + 1);
 	}, []);
