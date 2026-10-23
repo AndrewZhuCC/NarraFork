@@ -3,7 +3,7 @@ import { join, relative, resolve, sep } from "node:path";
 import { formatZodError } from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
-import { type Manifest, safeParseManifest } from "../lib/plugins/manifest";
+import { type Manifest, safeParseManifest, type ViewSurface } from "../lib/plugins/manifest";
 import { NARRAFORK_RPC_PROTOCOL } from "../lib/plugins/protocol";
 import { compileThemeContribution } from "../lib/plugins/theme-compiler";
 import {
@@ -28,21 +28,8 @@ export interface PluginDiagnostic {
 	path?: string;
 }
 
-/**
- * Host surfaces a plugin view may be mounted on.
- *
- * `graph` is a chapter node's embedded dock on the story-network canvas. It forms
- * a "focus family" with `focus` (both host exactly one narrator), so a view
- * declaring only `focus` is still admitted there — see `isSurfaceAllowedForView`
- * in `routes/plugin-ui.ts`.
- */
-export type PluginViewSurface =
-	| "workspace"
-	| "director"
-	| "focus"
-	| "graph"
-	| "settings"
-	| "provider-settings";
+/** Host surfaces a plugin view may be mounted on. */
+export type PluginViewSurface = ViewSurface;
 
 export interface PluginContributionSummary {
 	pluginId: string;
@@ -209,6 +196,9 @@ function contributionSummaries(
 			// surface; the session route re-checks them, so this is a routing hint rather than
 			// an authorization decision. `manifest` is already schema-validated here, so the
 			// names are known-good and only the array shape needs narrowing for the type.
+			// An empty list is passed on as-is: it is what a view that only declared the
+			// retired `graph` surface parses to, and it must reach the client as "mounts
+			// nowhere" — an absent list reads as "no restriction".
 			const surfaces =
 				kind === "view" && Array.isArray(item.surfaces)
 					? (item.surfaces as PluginViewSurface[])
@@ -242,7 +232,7 @@ function contributionSummaries(
 				...(stylePath ? { stylePath, style: stylePath } : {}),
 				...(scope ? { scope } : {}),
 				...(runtime ? { runtime } : {}),
-				...(surfaces && surfaces.length > 0 ? { surfaces } : {}),
+				...(surfaces ? { surfaces } : {}),
 				...(inputSchema ? { inputSchema } : {}),
 				...(execution ? { execution } : {}),
 				...(allowBackground === undefined ? {} : { allowBackground }),

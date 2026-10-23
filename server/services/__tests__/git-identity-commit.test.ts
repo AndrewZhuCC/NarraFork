@@ -2,9 +2,8 @@
  * Per-user commit attribution, asserted against real repositories.
  *
  * The behaviour under test IS git's behaviour — which identity wins between an env
- * variable and a config file, what happens to an empty ident, whether a cherry-pick
- * keeps its original author — so mocking `safeSpawn` would only encode our
- * assumptions about git rather than check them.
+ * variable and a config file, what happens to an empty ident — so mocking `safeSpawn`
+ * would only encode our assumptions about git rather than check them.
  *
  * Every repository here sets a repo-local `user.name`/`user.email` standing in for
  * the host machine's global config. That is what a mis-wired identity silently falls
@@ -169,117 +168,8 @@ if (IDENTITY_ENV_KEYS.some((key) => process.env[key] !== undefined)) {
 		});
 	});
 
-	describe("gitService.autoCommit identity", () => {
-		test("the dormant/pre-merge auto-save is attributed to the acting user", async () => {
-			const dir = await createRepo("autocommit-identity");
-			writeFileSync(join(dir, "dirty.txt"), "uncommitted\n");
-
-			const sha = await gitService.autoCommit(dir, "auto-save before dormant", ALICE);
-
-			expect(sha).toMatch(/^[0-9a-f]{40}$/);
-			expect(await identityOf(dir)).toBe(
-				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-			);
-		});
-
-		test("an unattended auto-save with no identity falls back to the host", async () => {
-			// The scheduled dormant sweep passes no user on purpose: a timer firing is
-			// nobody's authored change.
-			const dir = await createRepo("autocommit-host");
-			writeFileSync(join(dir, "dirty.txt"), "uncommitted\n");
-
-			await gitService.autoCommit(dir, "auto-save before dormant");
-
-			expect(await identityOf(dir)).toBe(
-				`author=${HOST_NAME} <${HOST_EMAIL}> committer=${HOST_NAME} <${HOST_EMAIL}>`,
-			);
-		});
-	});
-
-	describe("gitService.merge identity", () => {
-		test("the merge commit belongs to whoever asked for the merge", async () => {
-			const dir = await createRepo("merge-identity");
-			await git(["checkout", "-b", "feature"], dir);
-			writeFileSync(join(dir, "feature.txt"), "feature\n");
-			await git(["add", "-A"], dir);
-			await gitService.commit(dir, "feature work", BOB);
-
-			await git(["checkout", "main"], dir);
-			writeFileSync(join(dir, "trunk.txt"), "trunk\n");
-			await git(["add", "-A"], dir);
-			await gitService.commit(dir, "trunk work", BOB);
-
-			const result = await gitService.merge(dir, "feature", "merge", "merge feature", {
-				identity: ALICE,
-			});
-
-			expect(result.success).toBe(true);
-			expect(await identityOf(dir)).toBe(
-				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-			);
-		});
-
-		test("a squash merge's synthesized commit is attributed too", async () => {
-			// The squash path commits in a SECOND git invocation after the merge, which is
-			// easy to leave un-threaded: the merge would carry the identity and the commit
-			// that actually lands would not.
-			const dir = await createRepo("merge-squash-identity");
-			await git(["checkout", "-b", "feature"], dir);
-			writeFileSync(join(dir, "feature.txt"), "feature\n");
-			await git(["add", "-A"], dir);
-			await gitService.commit(dir, "feature work", BOB);
-			await git(["checkout", "main"], dir);
-
-			const result = await gitService.merge(dir, "feature", "squash", "squashed feature", {
-				identity: ALICE,
-			});
-
-			expect(result.success).toBe(true);
-			expect(await identityOf(dir)).toBe(
-				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-			);
-		});
-	});
-
-	describe("gitService.cherryPick identity", () => {
-		test("keeps the original author and records the acting user as committer", async () => {
-			// git's own semantics, kept deliberately: Alice transplanted Bob's change, she
-			// did not write it. Rewriting the author would misattribute Bob's work.
-			const dir = await createRepo("cherry-pick-identity");
-			const baseSha = await git(["rev-parse", "HEAD"], dir);
-
-			await git(["checkout", "-b", "feature"], dir);
-			writeFileSync(join(dir, "feature.txt"), "feature\n");
-			await git(["add", "-A"], dir);
-			await gitService.commit(dir, "bob work", BOB);
-			await git(["checkout", "main"], dir);
-
-			const result = await gitService.cherryPick(dir, dir, "feature", baseSha, ALICE);
-
-			expect(result.success).toBe(true);
-			expect(await identityOf(dir)).toBe(
-				"author=Bob <bob@example.com> committer=Alice <alice@example.com>",
-			);
-		});
-	});
-
-	describe("gitService.revertCommit identity", () => {
-		test("the revert is a new commit authored by whoever undid the change", async () => {
-			const dir = await createRepo("revert-identity");
-			writeFileSync(join(dir, "work.txt"), "work\n");
-			await git(["add", "-A"], dir);
-			const target = await gitService.commit(dir, "bob work", BOB);
-
-			await gitService.revertCommit(dir, target, ALICE);
-
-			expect(await identityOf(dir)).toBe(
-				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-			);
-		});
-	});
-
-	describe("gitService.initRepo / stageAndCommit identity", () => {
-		test("project setup commits belong to the project creator", async () => {
+	describe("gitService.initRepo identity", () => {
+		test("the initial commit of a new project belongs to the project creator", async () => {
 			const parent = mkdtempSync(join(tmpdir(), "nf-init-identity-"));
 			tempDirs.push(parent);
 			const dir = join(parent, "repo");
@@ -289,13 +179,6 @@ if (IDENTITY_ENV_KEYS.some((key) => process.env[key] !== undefined)) {
 			// A repo created this way has NO user.name/user.email of its own, so the
 			// initial commit would fail outright without a usable identity — which is
 			// exactly why buildGitIdentityEnv must never emit a half-filled env.
-			expect(await identityOf(dir)).toBe(
-				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-			);
-
-			writeFileSync(join(dir, ".gitignore"), "node_modules\n");
-			await gitService.stageAndCommit(dir, [".gitignore"], "Add .gitignore", ALICE);
-
 			expect(await identityOf(dir)).toBe(
 				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
 			);

@@ -286,7 +286,6 @@ test("metadata edits submit only this form's settings, not stale commands, routi
 		root.render(
 			<ProjectSettingsModal
 				projectId="original-id"
-				proxyDomain={null}
 				chapterSettings={chapterSettings}
 				opened
 				onClose={() => {}}
@@ -308,13 +307,11 @@ test("metadata edits submit only this form's settings, not stale commands, routi
 			name: "New name",
 			description: "New description",
 			gitPath: "/new-default",
-			proxyDomain: null,
 			chapterSettings: {
 				whitelistDirs: [],
 				blacklistDirs: [],
 				commandWhitelist: [],
 				commandBlacklist: [],
-				requireReviewBeforeMerge: false,
 			},
 		},
 	});

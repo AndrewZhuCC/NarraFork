@@ -16,14 +16,7 @@ import type { GitLineStats } from "@shared/git-line-stats";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import {
-	chapters,
-	narrators,
-	projects,
-	remoteDevices,
-	userGitIdentities,
-	users,
-} from "../db/schema";
+import { narrators, projects, remoteDevices, userGitIdentities, users } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
@@ -31,8 +24,7 @@ import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { getHome } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
-import { gitRoutes, narratorGitRoutes } from "../routes/git";
-import { commitSyncService } from "./commit-sync-service";
+import { narratorGitRoutes } from "../routes/git";
 import { compileExecutionPolicy } from "./execution-policy/compiler";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import type { ExecutionTargetContext } from "./execution-policy/types";
@@ -61,7 +53,6 @@ const { db } = await import("../db");
 
 let root: string, repo: string, owner: string, narratorId: string;
 const scanProjectIds: string[] = [];
-const scanChapterIds: string[] = [];
 const now = () => new Date().toISOString();
 async function git(cwd: string, ...args: string[]) {
 	const r = await safeSpawn({
@@ -119,7 +110,6 @@ function app(user = owner) {
 			),
 	);
 	result.route("/narrators", narratorGitRoutes);
-	result.route("/chapters", gitRoutes);
 	return result;
 }
 async function request(suffix: string, body?: unknown, id = narratorId, user = owner) {
@@ -290,22 +280,14 @@ describe("missing checkout durable worktree listing", () => {
 		);
 		expect(list.entries.map((entry) => entry.path)).toContain(moved);
 	});
-	test("reading a directory-less legacy branch cannot persist the main repository as execution cwd", async () => {
+	test("a former chapter session without a directory cannot persist the main repository as execution cwd", async () => {
 		const projectId = await project(repo);
-		const chapterId = generateId();
 		scanProjectIds.push(projectId);
-		scanChapterIds.push(chapterId);
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
-			title: "Missing legacy branch",
-			branch: "legacy",
-			baseBranch: "main",
-			isRoot: 0,
-			createdAt: now(),
-			updatedAt: now(),
-		});
-		await db.update(narrators).set({ chapterId, cwd: null }).where(eq(narrators.id, narratorId));
+		// No cwd and no `standalone` trait: the chapter that supplied its directory is gone.
+		await db
+			.update(narrators)
+			.set({ contextProjectId: projectId, cwd: null, traits: [] })
+			.where(eq(narrators.id, narratorId));
 		await expect(workspaceContextService.get(narratorId)).rejects.toMatchObject({
 			code: "WORKSPACE_DIRECTORY_REQUIRED",
 		});
@@ -319,7 +301,6 @@ describe("missing checkout durable worktree listing", () => {
 		);
 		expect(resolved.workspace.state).toBe("missing_directory");
 		expect(resolved.workspace.rootPath).toBeNull();
-		await db.update(narrators).set({ chapterId: null }).where(eq(narrators.id, narratorId));
 	});
 	test("legacy standalone cache can verify a surviving recorded Git root", async () => {
 		const cwd = join(repo, "deleted-subdirectory");
@@ -536,18 +517,6 @@ async function commitPreviewFixture() {
 	const projectId = await project(repo);
 	scanProjectIds.push(projectId);
 	await db.update(projects).set({ visibility: "public" }).where(eq(projects.id, projectId));
-	const chapterId = generateId();
-	scanChapterIds.push(chapterId);
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Commit preview",
-		branch: "main",
-		baseBranch: "main",
-		worktreePath: repo,
-		createdAt: now(),
-		updatedAt: now(),
-	});
 	const reader = generateId();
 	await db
 		.insert(users)
@@ -560,10 +529,9 @@ async function commitPreviewFixture() {
 	return {
 		reader,
 		projectId,
-		chapterId,
 		workspaceKey: ws.workspaceKey as string,
 		sha: await git(repo, "rev-parse", "HEAD"),
-		bases: [`/narrators/${narratorId}/git`, `/chapters/${chapterId}/git`],
+		bases: [`/narrators/${narratorId}/git`],
 	};
 }
 
@@ -594,8 +562,6 @@ beforeEach(async () => {
 afterEach(async () => {
 	activeNarrators.delete(narratorId);
 	setRemoteBackendResolver(null);
-	if (scanChapterIds.length)
-		await db.delete(chapters).where(inArray(chapters.id, scanChapterIds.splice(0)));
 	if (scanProjectIds.length)
 		await db.delete(projects).where(inArray(projects.id, scanProjectIds.splice(0)));
 	await rm(root, { recursive: true, force: true });
@@ -628,59 +594,43 @@ describe("Git workspace discovery", () => {
 		expect(a.workspaceKey).not.toBe(b.workspaceKey);
 		expect(b.rootPath).toBe(linked);
 	});
-	test("context project fallback and explicit cwd override preserve chapter attribution", async () => {
+	test("context project fallback and explicit cwd override", async () => {
 		const projectId = await project(repo);
-		const chapterId = generateId();
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
-			title: "Chapter",
-			branch: "main",
-			baseBranch: "main",
-			worktreePath: repo,
-			createdAt: now(),
-			updatedAt: now(),
+		const context = await newNarrator(null, {
+			contextProjectId: projectId,
+			traits: ["standalone"],
 		});
-		const context = await newNarrator(null, { contextProjectId: projectId });
 		expect((await workspace(context)).rootPath).toBe(repo);
 		const other = await newRepo("other");
-		await db.update(narrators).set({ chapterId, cwd: other }).where(eq(narrators.id, narratorId));
+		await db
+			.update(narrators)
+			.set({ contextProjectId: projectId, cwd: other })
+			.where(eq(narrators.id, narratorId));
 		const ws = await workspace();
 		expect(ws.rootPath).toBe(other);
-		expect(ws.chapterId).toBeUndefined();
-		const record = spyOn(commitSyncService, "recordCommit");
 		await writeFile(join(other, "new.txt"), "new\n");
 		expect((await request("stage", { all: true, workspaceKey: ws.workspaceKey })).status).toBe(200);
 		expect(
 			(await request("commit", { message: "separate repo", workspaceKey: ws.workspaceKey })).status,
 		).toBe(200);
-		expect(record).not.toHaveBeenCalled();
-		record.mockRestore();
-		const legacy = await app().request(`/chapters/${chapterId}/git/workspace`);
-		expect(((await legacy.json()) as GitWorkspace).rootPath).toBe(repo);
+		expect(await git(other, "log", "-1", "--format=%s")).toBe("separate repo");
+		expect(await git(repo, "log", "-1", "--format=%s")).toBe("baseline");
 	});
-	test("old branch with no directory is unavailable, while a known root keeps the project directory", async () => {
+	test("a former chapter session without a directory is unavailable, while a project session keeps the project directory", async () => {
 		const projectId = await project(repo);
-		const chapterId = generateId();
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
-			title: "Old branch",
-			branch: "old-branch",
-			baseBranch: "main",
-			status: "dormant",
-			worktreePath: null,
-			isRoot: 0,
-			createdAt: now(),
-			updatedAt: now(),
-		});
-		await db.update(narrators).set({ chapterId, cwd: null }).where(eq(narrators.id, narratorId));
+		await db
+			.update(narrators)
+			.set({ contextProjectId: projectId, cwd: null, traits: [] })
+			.where(eq(narrators.id, narratorId));
 		const missing = await workspace();
 		expect(missing.state).toBe("missing_directory");
 		expect(missing.rootPath).toBeNull();
 		expect(missing.cwd).toBe("");
 		expect(missing.capabilities).toEqual({ read: false, write: false });
-		await db.update(chapters).set({ isRoot: 1 }).where(eq(chapters.id, chapterId));
+		await db
+			.update(narrators)
+			.set({ traits: ["standalone"] })
+			.where(eq(narrators.id, narratorId));
 		expect((await workspace()).rootPath).toBe(repo);
 	});
 	test("running local session cwd wins over stale persisted configuration", async () => {
@@ -703,7 +653,7 @@ describe("Git workspace discovery", () => {
 });
 
 describe("Git workspace project scan pagination", () => {
-	async function fixtures(mode: "unrelated" | "lexical" | "chapter", foreign = false) {
+	async function fixtures(mode: "unrelated" | "lexical", foreign = false) {
 		const unrelated = join(root, "unrelated");
 		await mkdir(unrelated);
 		const values = Array.from({ length: 300 }, (_, index) => ({
@@ -719,23 +669,6 @@ describe("Git workspace project scan pagination", () => {
 		// Small inserts avoid SQLite parameter limits as well as oversized test transactions.
 		for (let start = 0; start < values.length; start += 50)
 			await db.insert(projects).values(values.slice(start, start + 50));
-		if (mode === "chapter") {
-			for (const [index, row] of values.entries()) {
-				const id = `scan-chapter-${owner}-${String(index).padStart(4, "0")}`;
-				scanChapterIds.push(id);
-				await db.insert(chapters).values({
-					id,
-					projectId: row.id,
-					title: "Scan chapter",
-					branch: `scan-${index}`,
-					baseBranch: "main",
-					worktreePath: repo,
-					status: "active",
-					createdAt: now(),
-					updatedAt: now(),
-				});
-			}
-		}
 		return values[values.length - 1].id;
 	}
 
@@ -771,14 +704,12 @@ describe("Git workspace project scan pagination", () => {
 		expect((await workspace()).state).toBe("access_denied");
 	});
 
-	for (const mode of ["lexical", "chapter"] as const) {
-		test(`${mode} associations paginate completely and enforce the final private project`, async () => {
-			const lastId = await fixtures(mode, true);
-			expect((await workspace()).state).toBe("ready");
-			await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, lastId));
-			expect((await workspace()).state).toBe("access_denied");
-		});
-	}
+	test("lexical associations paginate completely and enforce the final private project", async () => {
+		const lastId = await fixtures("lexical", true);
+		expect((await workspace()).state).toBe("ready");
+		await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, lastId));
+		expect((await workspace()).state).toBe("access_denied");
+	});
 });
 
 describe("authenticated Git management", () => {
@@ -847,41 +778,6 @@ describe("authenticated Git management", () => {
 		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(200);
 		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, narratorId));
 		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(404);
-	});
-
-	test("legacy chapter routes retain their existing no-workspace-key contract", async () => {
-		const projectId = await project(repo);
-		const chapterId = generateId();
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
-			title: "Legacy Git",
-			branch: "main",
-			baseBranch: "main",
-			worktreePath: repo,
-			createdAt: now(),
-			updatedAt: now(),
-		});
-		await writeFile(join(repo, "seed.txt"), "legacy route\n");
-		const status = await app().request(`/chapters/${chapterId}/git/status`);
-		expect(status.status).toBe(200);
-		expect(((await status.json()) as { hasChanges: boolean }).hasChanges).toBe(true);
-		const stage = await app().request(`/chapters/${chapterId}/git/stage`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ files: ["seed.txt"] }),
-		});
-		expect(stage.status).toBe(200);
-		const diff = await app().request(`/chapters/${chapterId}/git/diff?file=seed.txt&staged=true`);
-		expect(diff.status).toBe(200);
-		expect(((await diff.json()) as { diff: string }).diff).toContain("legacy route");
-		const commit = await app().request(`/chapters/${chapterId}/git/commit`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ message: "legacy route" }),
-		});
-		expect(commit.status).toBe(200);
-		expect(await git(repo, "log", "-1", "--format=%s")).toBe("legacy route");
 	});
 
 	test("full standalone write flow and acting user commit identity", async () => {
@@ -961,7 +857,6 @@ describe("authenticated Git management", () => {
 			repositoryKey: null,
 		});
 		expect(deniedWorkspace.projectId).toBeUndefined();
-		expect(deniedWorkspace.chapterId).toBeUndefined();
 		expect((await request("status", undefined, privateNarrator, stranger)).status).toBe(403);
 	});
 	test("traversal, drive paths, metadata and directory symlinks are rejected", async () => {
@@ -1075,9 +970,8 @@ describe("commit preview routes", () => {
 		await writeFile(join(repo, "untracked.txt"), "untracked draft\n");
 		const indexBefore = await readFile(join(repo, ".git", "index"));
 		for (const base of f.bases) {
-			// The narrator path is pinned; the chapter adapter retains its keyless contract.
-			const params = new URLSearchParams();
-			if (base.startsWith("/narrators/")) params.set("workspaceKey", f.workspaceKey);
+			// The narrator path is pinned to its workspace.
+			const params = new URLSearchParams({ workspaceKey: f.workspaceKey });
 			const metadata = await app(f.reader).request(`${base}/commits/${f.sha}?${params}`);
 			expect(metadata.status).toBe(200);
 			const detail = (await metadata.json()) as GitCommitDetail;
@@ -1284,19 +1178,7 @@ test("a pre-cancelled modifications request starts no remote Git RPC", async () 
 	expect(calls).toBe(0);
 });
 
-test("a pre-cancelled chapter request returns no history and starts no Git probe", async () => {
-	const projectId = await project(repo);
-	const chapterId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Cancelled chapter",
-		branch: "main",
-		baseBranch: "main",
-		worktreePath: repo,
-		createdAt: now(),
-		updatedAt: now(),
-	});
+test("a pre-cancelled local request returns no history and starts no Git probe", async () => {
 	const stranger = generateId();
 	await db.insert(users).values({
 		id: stranger,
@@ -1323,7 +1205,7 @@ test("a pre-cancelled chapter request returns no history and starts no Git probe
 	const spawn = spyOn(Bun, "spawn");
 	try {
 		const response = await app().request(
-			new Request(`http://localhost/chapters/${chapterId}/git/modifications?scope=uncommitted`, {
+			new Request(`http://localhost/narrators/${narratorId}/git/modifications?scope=uncommitted`, {
 				signal: AbortSignal.abort(),
 			}),
 		);
@@ -1339,7 +1221,7 @@ test("a pre-cancelled chapter request returns no history and starts no Git probe
 		expect(JSON.stringify(body)).not.toContain("private/secret.txt");
 
 		const historyOnly = await app().request(
-			new Request(`http://localhost/chapters/${chapterId}/git/modifications`, {
+			new Request(`http://localhost/narrators/${narratorId}/git/modifications`, {
 				signal: AbortSignal.abort(),
 			}),
 		);

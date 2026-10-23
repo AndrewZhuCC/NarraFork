@@ -73,7 +73,6 @@ export function searchParams(query: SearchRequest): URLSearchParams {
 	if (query.sort === "time") params.set("sort", "time");
 	if (query.include?.length) params.set("include", query.include.join(","));
 	if (query.projectId) params.set("projectId", query.projectId);
-	if (query.chapterId) params.set("chapterId", query.chapterId);
 	if (query.from) params.set("from", query.from);
 	if (query.to) params.set("to", query.to);
 	if (query.mine) params.set("mine", "1");

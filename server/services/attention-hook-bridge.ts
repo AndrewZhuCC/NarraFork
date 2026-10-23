@@ -1,9 +1,10 @@
 import { db } from "@server/db";
-import { chapters, narrators } from "@server/db/schema";
+import { narrators } from "@server/db/schema";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { eq } from "drizzle-orm";
 import { type AttentionReason, type HookEvent, hookService } from "./hook-service";
+import { resolveNarratorProjectId } from "./narrator-project";
 
 // === Attention → Hook bridge ===
 //
@@ -26,30 +27,21 @@ async function runAttentionHook(
 		backgroundWorkActive?: boolean;
 	},
 ): Promise<void> {
-	// Resolve narrator context (chapter / cwd) for the hook input. The project
-	// scope for hook matching comes from the chapter (narrators have no direct
-	// projectId column); standalone narrators have no chapter → global hooks only.
+	// Resolve narrator context (project / cwd) for the hook input. Narrators with no
+	// project match global hooks only.
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, payload.narratorId),
-		columns: { chapterId: true, cwd: true },
+		columns: { id: true, cwd: true, contextProjectId: true },
 	});
 	if (!narrator) return;
 
-	let projectId: string | undefined;
-	if (narrator.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { projectId: true },
-		});
-		projectId = chapter?.projectId ?? undefined;
-	}
+	const projectId = (await resolveNarratorProjectId(narrator)) ?? undefined;
 
 	await hookService.runHooks(
 		event,
 		{
 			hook_event_name: event,
 			narrator_id: payload.narratorId,
-			chapter_id: narrator.chapterId ?? undefined,
 			project_id: projectId,
 			cwd: narrator.cwd ?? undefined,
 			attention_reason: payload.reason,

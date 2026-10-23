@@ -109,7 +109,6 @@ export function SessionResultCard({
 
 			<Group gap={6} wrap="wrap" mb={hits.length ? 8 : 0}>
 				{result.projectName && <Badge variant="outline">{result.projectName}</Badge>}
-				{result.chapterTitle && <Badge variant="light">{result.chapterTitle}</Badge>}
 				{result.lastActivityAt && (
 					<Text size="xs" c="dimmed">
 						{t("lastActivity", { time: formatSmartTime(result.lastActivityAt) })}

@@ -58,7 +58,7 @@ function translateOrNull(
 /**
  * Localize `NotFoundError`'s entity label.
  *
- * The server sends a plain English noun (`Chapter`, `Knowledge entry`) rather than an enum,
+ * The server sends a plain English noun (`Narrator`, `Knowledge entry`) rather than an enum,
  * because that is what ~319 existing call sites already pass and rewriting them all was not
  * worth the risk. An unlisted noun falls through verbatim, so a new entity reads slightly
  * awkwardly in Chinese instead of producing a broken sentence.

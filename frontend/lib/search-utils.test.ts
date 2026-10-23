@@ -29,14 +29,14 @@ describe("normalizeSearchTab", () => {
 	test("accepts the section names", () => {
 		expect(normalizeSearchTab("sessions")).toBe("sessions");
 		expect(normalizeSearchTab("knowledge")).toBe("knowledge");
-		expect(normalizeSearchTab("chapters")).toBe("chapters");
 	});
 
 	test("maps the old result types so bookmarked links open the right tab", () => {
 		for (const old of ["message", "messages", "narrator", "narrators"]) {
 			expect(normalizeSearchTab(old)).toBe("sessions");
 		}
-		expect(normalizeSearchTab("chapter")).toBe("chapters");
+		// Chapters are retired; their old links open the overview.
+		expect(normalizeSearchTab("chapter")).toBe("all");
 		expect(normalizeSearchTab(undefined)).toBe("all");
 		expect(normalizeSearchTab("nonsense")).toBe("all");
 	});

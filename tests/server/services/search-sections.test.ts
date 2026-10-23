@@ -1,18 +1,18 @@
 /**
- * Sectioned global search: sessions, knowledge and chapters, each ranked within itself and
+ * Sectioned global search: sessions and knowledge, each ranked within itself and
  * paged on its own, against a real FTS index.
  *
  * Sessions are the point: a session shows up once however many of its messages match, with
- * an exact hit count, its first few hits, and the rest pageable. Filters (project, chapter,
+ * an exact hit count, its first few hits, and the rest pageable. Filters (project,
  * time, owner) and the archived scope narrow every section they mean something to.
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
-import { chapters, narratorMessages, narrators, projects, users } from "../../../server/db/schema";
+import { narratorMessages, narrators, projects, users } from "../../../server/db/schema";
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { ensureFts } = await import("../../../server/db/fts");
 ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
@@ -55,7 +55,7 @@ function seedNarrator(
 	id: string,
 	options: {
 		title?: string;
-		chapterId?: string;
+		projectId?: string;
 		owner?: string;
 		visibility?: "public" | "private";
 		status?: "idle" | "archived";
@@ -67,7 +67,7 @@ function seedNarrator(
 		.values({
 			id,
 			title: options.title ?? null,
-			chapterId: options.chapterId ?? "ch-a",
+			contextProjectId: options.projectId ?? "proj-a",
 			type: options.type ?? "primary",
 			inheritMode: "fresh",
 			visibility: options.visibility ?? "public",
@@ -116,28 +116,11 @@ beforeEach(() => {
 			})
 			.run();
 	}
-	for (const [id, projectId, title] of [
-		["ch-a", "proj-a", "Kestrel migration"],
-		["ch-b", "proj-b", "Other work"],
-	]) {
-		db.insert(chapters)
-			.values({
-				id,
-				projectId,
-				title,
-				description: "",
-				branch: `b-${id}`,
-				baseBranch: "main",
-				createdAt: day(1),
-				updatedAt: day(2),
-			})
-			.run();
-	}
 });
 
 afterEach(() => {
 	sqlite.run("PRAGMA foreign_keys = OFF");
-	for (const table of ["narrator_messages", "narrators", "chapters", "projects", "users"]) {
+	for (const table of ["narrator_messages", "narrators", "projects", "users"]) {
 		sqlite.run(`DELETE FROM "${table}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");
@@ -179,7 +162,7 @@ describe("session results", () => {
 		const short = page.items.find((s) => s.id === "short");
 		expect(short?.hits[0]).toMatchObject({ messageRole: "assistant", createdAt: day(4) });
 		expect(short?.projectId).toBe("proj-a");
-		expect(short?.chapterTitle).toBe("Kestrel migration");
+		expect(short?.projectName).toBe("proj-a");
 	});
 
 	it("merges a title match with the same session's message hits", async () => {
@@ -251,9 +234,9 @@ describe("session results", () => {
 
 describe("filters and scope", () => {
 	beforeEach(() => {
-		seedNarrator("a-mine", { chapterId: "ch-a", owner: OWNER });
+		seedNarrator("a-mine", { projectId: "proj-a", owner: OWNER });
 		seedMessage("a-mine", "kestrel early", day(3));
-		seedNarrator("b-theirs", { chapterId: "ch-b", owner: OTHER });
+		seedNarrator("b-theirs", { projectId: "proj-b", owner: OTHER });
 		seedMessage("b-theirs", "kestrel late", day(20));
 		seedNarrator("archived", { status: "archived" });
 		seedMessage("archived", "kestrel archived", day(5));
@@ -262,10 +245,10 @@ describe("filters and scope", () => {
 	const ids = async (options: Partial<Parameters<typeof searchService.searchSections>[0]>) =>
 		(await sessions("kestrel", options)).items.map((s) => s.id).sort();
 
-	it("narrows sessions by project, chapter, time and owner", async () => {
+	it("narrows sessions by project, time and owner", async () => {
 		expect(await ids({})).toEqual(["a-mine", "b-theirs"]);
 		expect(await ids({ filters: { projectId: "proj-b" } })).toEqual(["b-theirs"]);
-		expect(await ids({ filters: { chapterId: "ch-a" } })).toEqual(["a-mine"]);
+		expect(await ids({ filters: { projectId: "proj-a" } })).toEqual(["a-mine"]);
 		expect(await ids({ filters: { from: day(10) } })).toEqual(["b-theirs"]);
 		expect(await ids({ filters: { to: day(10) } })).toEqual(["a-mine"]);
 		expect(await ids({ filters: { ownerUserId: OWNER } })).toEqual(["a-mine"]);
@@ -276,24 +259,6 @@ describe("filters and scope", () => {
 		expect(
 			await ids({ scope: { subagents: false, system: false, tools: false, archived: true } }),
 		).toEqual(["a-mine", "archived", "b-theirs"]);
-	});
-
-	it("narrows chapters by project", async () => {
-		const result = await searchService.searchSections({
-			query: "kestrel",
-			sections: ["chapters"],
-			principal: ADMIN,
-			limits: { chapters: 10 },
-			filters: { projectId: "proj-b" },
-		});
-		expect(result.chapters?.items).toEqual([]);
-		const all = await searchService.searchSections({
-			query: "kestrel",
-			sections: ["chapters"],
-			principal: ADMIN,
-			limits: { chapters: 10 },
-		});
-		expect(all.chapters?.items.map((c) => c.id)).toEqual(["ch-a"]);
 	});
 });
 
@@ -310,7 +275,7 @@ describe("over HTTP", () => {
 		const all = (await (await app.request("/api/search?q=kestrel")).json()) as {
 			sections: Record<string, { items: { id: string }[]; total: number }>;
 		};
-		expect(Object.keys(all.sections).sort()).toEqual(["chapters", "knowledge", "sessions"]);
+		expect(Object.keys(all.sections).sort()).toEqual(["knowledge", "sessions"]);
 		expect(all.sections.sessions.items.map((s) => s.id).sort()).toEqual(["mine", "theirs"]);
 
 		const mine = (await (
@@ -356,8 +321,6 @@ describe("session ranking", () => {
 					type: "primary",
 					subagentType: null,
 					status: "idle",
-					chapterId: null,
-					chapterTitle: null,
 					projectId: null,
 					projectName: null,
 					lastMessageAt: null,

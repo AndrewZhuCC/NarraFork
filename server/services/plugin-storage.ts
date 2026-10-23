@@ -6,6 +6,7 @@ import { generateShortId } from "@server/lib/id";
 import { resourceScopeSchema } from "@server/lib/integrations/resource-scope";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { pluginIdSchema } from "@server/lib/plugins/manifest";
+import { RETIRED_SCOPE_TYPES } from "@server/lib/plugins/permissions";
 
 const STORAGE_FILE_VERSION = 1;
 const DEFAULT_MAX_VALUE_BYTES = 64 * 1024;
@@ -30,7 +31,6 @@ export const PLUGIN_STORAGE_SCOPE_TYPES = [
 	"user",
 	"project",
 	"workspace",
-	"chapter",
 	"narrator",
 	"provider",
 	"device",
@@ -606,6 +606,9 @@ function validateDocument(
 	}
 	const scopes: Record<string, Record<string, StoredEntry>> = {};
 	for (const [key, rawEntries] of Object.entries(value.scopes)) {
+		// A retired scope type (chapters) can no longer be addressed, so its entries could
+		// never be read or purged again while still counting against the plugin's quota.
+		if (RETIRED_SCOPE_TYPES.some((type) => key.startsWith(`${type}\u0000`))) continue;
 		if (!Array.isArray(rawEntries) && !isRecord(rawEntries)) {
 			throw new ValidationError("Plugin storage scope entries are invalid");
 		}

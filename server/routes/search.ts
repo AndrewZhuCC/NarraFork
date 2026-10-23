@@ -38,7 +38,6 @@ type BaseQuery = {
 	sort?: string;
 	include?: string;
 	projectId?: string;
-	chapterId?: string;
 	from?: string;
 	to?: string;
 	mine?: string;
@@ -49,7 +48,6 @@ type BaseQuery = {
 function baseOptions(query: BaseQuery, user: { sub: string; role: string }, signal: AbortSignal) {
 	const filters: SearchFilters = {
 		projectId: query.projectId,
-		chapterId: query.chapterId,
 		from: query.from,
 		to: query.to,
 		ownerUserId: query.mine === "1" || query.mine === "true" ? user.sub : undefined,
@@ -59,8 +57,8 @@ function baseOptions(query: BaseQuery, user: { sub: string; role: string }, sign
 		sort: query.sort === "time" ? ("time" as const) : ("relevance" as const),
 		scope: parseScope(query.include),
 		filters,
-		// Session and message hits are filtered to what this user may read, chapter hits to
-		// the projects they may read, knowledge hits by its own grants.
+		// Session and message hits are filtered to what this user may read, knowledge hits by
+		// its own grants.
 		principal: { userId: user.sub, isAdmin: user.role === "admin" },
 		cursor: query.cursor,
 		signal,
@@ -68,7 +66,7 @@ function baseOptions(query: BaseQuery, user: { sub: string; role: string }, sign
 }
 
 /**
- * Sectioned global search: `{ sections: { sessions?, knowledge?, chapters? } }`, each a
+ * Sectioned global search: `{ sections: { sessions?, knowledge? } }`, each a
  * page `{ items, total, totalIsLowerBound, nextCursor }`. A cursor continues one section, so
  * it is honoured only when `sections` names exactly one.
  */

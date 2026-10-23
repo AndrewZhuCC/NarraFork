@@ -33,7 +33,6 @@ interface SearchParams {
 	/** Comma-separated content added to the default scope. */
 	include?: string;
 	project?: string;
-	chapter?: string;
 	range?: string;
 	mine?: string;
 }
@@ -53,7 +52,6 @@ export const Route = createFileRoute("/search")({
 			sort: sort === DEFAULT_SEARCH_SORT ? undefined : sort,
 			include: normalizeSearchInclude(search.include).join(",") || undefined,
 			project: optionalId(search.project),
-			chapter: optionalId(search.chapter),
 			range: normalizeSearchRange(search.range),
 			mine: search.mine === "1" || search.mine === 1 || search.mine === true ? "1" : undefined,
 		};
@@ -157,7 +155,6 @@ function SearchPage() {
 			sort: normalizeSearchSort(params.sort),
 			include: normalizeSearchInclude(params.include),
 			projectId: params.project,
-			chapterId: params.chapter,
 			range: normalizeSearchRange(params.range) as SearchTimeRange | undefined,
 			mine: params.mine === "1",
 		}),
@@ -169,7 +166,6 @@ function SearchPage() {
 			sort: filters.sort,
 			include: filters.include,
 			projectId: filters.projectId,
-			chapterId: filters.chapterId,
 			from: filters.range ? searchRangeStart(filters.range) : undefined,
 			mine: filters.mine,
 		}),
@@ -186,7 +182,6 @@ function SearchPage() {
 				sort: next.sort === DEFAULT_SEARCH_SORT ? undefined : next.sort,
 				include: next.include.join(",") || undefined,
 				project: next.projectId,
-				chapter: next.chapterId,
 				range: next.range,
 				mine: next.mine ? "1" : undefined,
 			}),

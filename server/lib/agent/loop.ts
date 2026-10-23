@@ -330,6 +330,32 @@ function classifyEmptyResponse(signals: EmptyResponseSignals): EmptyResponseKind
 	return "empty_response";
 }
 
+/** Stop reasons a provider gives for an ordinary finish, as opposed to a refusal or cutoff. */
+const QUIET_STOP_REASONS = new Set(["stop", "end_turn", "completed"]);
+
+/**
+ * A served request that ended without content and without a fault: the model chose to
+ * say nothing. After some tool rounds that is how a turn ends (see `handsOffWork`), so
+ * it is not an empty reply.
+ */
+function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): boolean {
+	if (kind === "empty_response_usage_only") return true;
+	return (
+		kind === "empty_response_stop_without_content" &&
+		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
+	);
+}
+
+/**
+ * A tool call that hands work or words to someone else — an agent, a background command,
+ * a message. Whatever comes next arrives later as its own input, so after a round with
+ * one the model may rightly have nothing to add yet.
+ */
+function handsOffWork(toolUse: AgentToolUse): boolean {
+	if (toolUse.name === "Send" || toolUse.name === "Agent") return true;
+	return isBashToolName(toolUse.name) && toolUse.input.run_in_background === true;
+}
+
 /**
  * Human-readable explanation for an empty turn.
  *
@@ -613,7 +639,7 @@ function isTaskStateMaintenanceToolUse(tu: AgentToolUse): boolean {
 
 export async function shouldInjectRelaxedPlanToolReminder(
 	tu: AgentToolUse,
-	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "chapterId" | "planFilePath">,
+	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "planFilePath">,
 ): Promise<boolean> {
 	if (!config.planMode || !config.relaxedPlan) return false;
 	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
@@ -632,12 +658,7 @@ export async function shouldInjectRelaxedPlanToolReminder(
 		try {
 			const workdir = typeof tu.input.workdir === "string" ? tu.input.workdir : undefined;
 			const shellCwd = workdir ? resolve(config.cwd, workdir) : config.cwd;
-			const analysis = await analyzeShellCommand(
-				command,
-				shellCwd,
-				detectShell().type,
-				!!config.chapterId,
-			);
+			const analysis = await analyzeShellCommand(command, shellCwd, detectShell().type);
 			return analysis.hasWriteOperation;
 		} catch (err) {
 			logger.debug("Failed to classify relaxed-plan shell tool use", {
@@ -2834,6 +2855,11 @@ async function* agentLoopInMetadataSnapshot(
 	 */
 	let toolsPlanModeDisabled = planModeDisablesTools();
 	let turnIndex = 0;
+	/**
+	 * The last round ran tools after which an empty reply is a finish, not a fault: any
+	 * tool round of a bot (it answers through Send), or one that handed work off.
+	 */
+	let quietFinishAllowed = false;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
 	const silentToolCallThreshold = normalizeSilentToolCallThreshold(config.silentToolCallThreshold);
 	let silentToolCallCount = 0;
@@ -6489,6 +6515,7 @@ async function* agentLoopInMetadataSnapshot(
 					commitInput();
 					nextTurnContent = buildReflectionCorrectionPrompt(config);
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					continue turnLoop;
 				}
@@ -6537,6 +6564,16 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
+					if (
+						quietFinishAllowed &&
+						requestStarted &&
+						!lastRetryErrorMessage &&
+						isQuietFinish(emptyKind, emptySignals)
+					) {
+						yield* finishRequest();
+						yield { type: "done" };
+						return;
+					}
 					const emptyEvidence = emptyResponseEvidence(emptySignals);
 					const emptyResponseText = emptyResponseMessageFor(emptyKind, emptySignals);
 					const buildEmptyDiagnostics = (message: string) =>
@@ -6928,6 +6965,7 @@ async function* agentLoopInMetadataSnapshot(
 					// there is no pending input to re-send. Open a fresh turn that nudges
 					// the model to continue, so the loop can make progress.
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					queueLoopNotice("continue_prompt");
 					await flushLoopInjections();
@@ -7085,6 +7123,7 @@ async function* agentLoopInMetadataSnapshot(
 					// No tools ran, so the boundary below is skipped: deliver the notice here.
 					await flushLoopInjections();
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					continue;
 				}
@@ -7106,6 +7145,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (assistantText) transcript.appendStep([{ type: "text", text: assistantText }]);
 				nextTurnContent = buildReflectionCorrectionPrompt(config);
 				yield { type: "turn_complete", turnIndex };
+				quietFinishAllowed = false;
 				turnIndex++;
 				continue;
 			}
@@ -7422,6 +7462,7 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			yield { type: "turn_complete", turnIndex };
+			quietFinishAllowed = !!config.bot || toolUses.some(handsOffWork);
 			turnIndex++;
 		} catch (error) {
 			activeRequestDump?.finish({ status: "error", error: extractErrorMessage(error) });

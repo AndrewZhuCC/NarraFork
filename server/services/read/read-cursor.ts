@@ -1,13 +1,12 @@
 /**
- * Opaque list cursors, shared by both read adapters.
+ * Opaque list cursors, shared by the read adapters.
  *
  * A cursor is a keyset position — a sort value plus the row id that breaks its ties —
  * rather than an offset, because every list here is ACL-filtered and rows appear and
  * disappear between pages: an offset would skip or repeat rows exactly when the set is
- * changing. The id tiebreak is not optional: `projects.updatedAt` and
- * `chapters.createdAt` are genuinely shared by many rows (a bulk import gives every row
- * the same timestamp), and a cursor on the timestamp alone would either loop forever on
- * that group or jump over the rest of it.
+ * changing. The id tiebreak is not optional: `projects.updatedAt` is genuinely shared by
+ * many rows (a bulk import gives every row the same timestamp), and a cursor on the
+ * timestamp alone would either loop forever on that group or jump over the rest of it.
  *
  * The encoding lives here rather than in each adapter so PostgreSQL and SQLite emit
  * byte-identical cursors for the same position. That is what lets the parity suite
@@ -44,7 +43,7 @@
  * Byte order is right for these keys because they are machine identifiers and ISO-8601
  * timestamps: nobody reads a page of them expecting locale-aware sequence, and byte order is
  * the only rule both backends can express. It is NOT right for a human-facing ordering. If a
- * list is ever sorted by something a person reads in order — a project or chapter name — that
+ * list is ever sorted by something a person reads in order — a project name — that
  * key must not be forced to `COLLATE "C"` (byte order would file `Zebra` before `apple`);
  * such a list needs a locale-aware order, which SQLite cannot reproduce, and its cursor stops
  * being portable across backends. That is a real trade-off, not an oversight, and it has to
@@ -72,8 +71,8 @@ export interface SortCursor {
 
 /**
  * Encode a position. `field` names the sort column in the payload (`updatedAt` for
- * projects, `createdAt` for chapters) so a cursor cannot be replayed against a list
- * ordered by a different column and silently resume in the wrong place.
+ * projects) so a cursor cannot be replayed against a list ordered by a different column
+ * and silently resume in the wrong place.
  */
 export function encodeSortCursor(field: string, sort: string, id: string): string {
 	return Buffer.from(JSON.stringify({ [field]: sort, id })).toString("base64url");

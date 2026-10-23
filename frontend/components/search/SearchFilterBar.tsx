@@ -1,8 +1,6 @@
 import { Chip, Group, SegmentedControl, Select, Stack, Text } from "@mantine/core";
-import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useProjects } from "../../hooks/useProjects";
-import { api } from "../../lib/api";
 import {
 	normalizeSearchInclude,
 	normalizeSearchRange,
@@ -17,7 +15,6 @@ export interface SearchFilterState {
 	sort: SearchSortMode;
 	include: SearchInclude[];
 	projectId?: string;
-	chapterId?: string;
 	range?: SearchTimeRange;
 	mine: boolean;
 }
@@ -29,7 +26,7 @@ interface NamedEntity {
 }
 
 /**
- * Scope and filters for global search: extra content to include, project and chapter, a
+ * Scope and filters for global search: extra content to include, the project, a
  * time window, only the viewer's own sessions, and the sort. Every change goes to the URL,
  * so a filtered search survives reloads and shared links.
  */
@@ -42,20 +39,10 @@ export function SearchFilterBar({
 }) {
 	const { t } = useTranslation("search");
 	const projects = useProjects();
-	const chapters = useQuery({
-		queryKey: ["chapters", { projectId: state.projectId, status: undefined }],
-		queryFn: () => api.listChapters(state.projectId as string),
-		enabled: !!state.projectId,
-	});
 	const projectOptions = ((projects.data ?? []) as NamedEntity[]).map((project) => ({
 		value: project.id,
 		label: project.name || project.id,
 	}));
-	const chapterOptions = ((chapters.data ?? []) as NamedEntity[]).map((chapter) => ({
-		value: chapter.id,
-		label: chapter.title || chapter.id,
-	}));
-
 	return (
 		<Stack gap="xs">
 			<Group gap="xs" align="center">
@@ -83,24 +70,11 @@ export function SearchFilterBar({
 					placeholder={t("projectPlaceholder")}
 					data={projectOptions}
 					value={state.projectId ?? null}
-					onChange={(value) => onChange({ projectId: value ?? undefined, chapterId: undefined })}
+					onChange={(value) => onChange({ projectId: value ?? undefined })}
 					searchable
 					clearable
 					aria-label={t("projectPlaceholder")}
 				/>
-				{state.projectId && (
-					<Select
-						size="xs"
-						w={180}
-						placeholder={t("chapterPlaceholder")}
-						data={chapterOptions}
-						value={state.chapterId ?? null}
-						onChange={(value) => onChange({ chapterId: value ?? undefined })}
-						searchable
-						clearable
-						aria-label={t("chapterPlaceholder")}
-					/>
-				)}
 				<SegmentedControl
 					size="xs"
 					value={state.range ?? "all"}

@@ -270,7 +270,7 @@ interface ScopeState {
  * history writers must bump messageVersion, and execution must recheck returned versions/digests.
  * A direct unversioned write after its source's last verification can still race the preview.
  *
- * Current FK actions are inventoried explicitly, including spec revisions/chapter commits;
+ * Current FK actions are inventoried explicitly, including spec revisions;
  * COW of a shared partial message counts retained tool payload bytes without loading them.
  * No record is physically deleted by this class. Device authorization/current-state checks,
  * history execution, reversal, blob publication and plan proof generation remain downstream.
@@ -1210,7 +1210,7 @@ function sourceRowsDigest(rows: unknown[]): string {
 }
 
 const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
- acl_root_narrator_id AS aclRootNarratorId, chapter_id AS chapterId, context_project_id AS contextProjectId,
+ acl_root_narrator_id AS aclRootNarratorId, context_project_id AS contextProjectId,
  message_version AS messageVersion, refs_inherited_from AS refsInheritedFrom, status,
  parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators`;
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
@@ -1357,7 +1357,6 @@ function stateRef(state: FileChangeState) {
 type AssociationSpec = readonly [table: string, column: string, index: string, idColumn?: string];
 const MESSAGE_ASSOCIATIONS: readonly AssociationSpec[] = [
 	["narrators", "fork_message_id", "idx_narrators_fork_message"],
-	["chapter_commits", "narrator_message_id", "idx_chapter_commits_narrator_message"],
 	["spec_file_revisions", "source_message_id", "idx_spec_file_revisions_source_message"],
 	["narrator_patches", "message_id", "idx_patches_message"],
 	["api_requests", "message_id", "idx_api_requests_message"],

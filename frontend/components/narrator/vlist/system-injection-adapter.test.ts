@@ -1155,12 +1155,8 @@ describe("injection bubbles — the navigation target", () => {
 });
 
 /**
- * Framed system cards point at the chapter they are about.
- *
- * Both ids are already written by their producers (`review_feedback.reviewChapterId`,
- * `merge_summary.sourceChapterId`), so this needed no new server field — but a row
- * written before those existed has none, and must stay inert rather than linking to
- * `undefined`.
+ * Framed system cards written by the removed review / merge features still render, but
+ * the chapters they name are gone, so their headers carry no navigation target.
  */
 describe("framed system cards — the navigation target", () => {
 	function framedTarget(block: Record<string, unknown>) {
@@ -1181,7 +1177,7 @@ describe("framed system cards — the navigation target", () => {
 	// shape that no longer exists. (The block still carries `reviewChapterId`, so the
 	// affordance can be restored on the card's own header when it is wanted.)
 
-	it("a merge summary points at the source chapter that was merged in", () => {
+	it("a historical merge summary stays inert: its source chapter no longer exists", () => {
 		expect(
 			framedTarget({
 				type: "merge_summary",
@@ -1191,12 +1187,8 @@ describe("framed system cards — the navigation target", () => {
 				summary: "merged the queue work",
 				text: "merged",
 			}),
-		).toEqual({ kind: "chapter", chapterId: "chap-source-1" });
-	});
-
-	it("a card written before the id existed stays inert", () => {
+		).toBeNull();
 		expect(framedTarget({ type: "review_feedback", verdict: "approve", text: "ok" })).toBeNull();
-		expect(framedTarget({ type: "merge_summary", summary: "s", text: "merged" })).toBeNull();
 	});
 });
 

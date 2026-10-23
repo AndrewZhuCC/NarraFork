@@ -326,7 +326,6 @@ export function pluginEventCapabilityForTopic(_topic: PublicEventTopic): string 
 function valueAt(event: PublicEvent, key: string): unknown {
 	if (key === "status") return event.data.status;
 	if (key === "projectId") return event.resource?.projectId ?? event.data.projectId;
-	if (key === "chapterId") return event.resource?.chapterId ?? event.data.chapterId;
 	if (key === "narratorId") return event.resource?.narratorId ?? event.data.narratorId;
 	return undefined;
 }
@@ -341,8 +340,6 @@ function matchesFilter(event: PublicEvent, filter: PublicEventFilter | undefined
 	)
 		return false;
 	if (filter.projectIds && !filter.projectIds.includes(String(valueAt(event, "projectId"))))
-		return false;
-	if (filter.chapterIds && !filter.chapterIds.includes(String(valueAt(event, "chapterId"))))
 		return false;
 	if (filter.narratorIds && !filter.narratorIds.includes(String(valueAt(event, "narratorId"))))
 		return false;
@@ -362,7 +359,6 @@ const SCOPE_RANK: Record<keyof InvocationScope, number> = {
 	userId: 1,
 	projectId: 2,
 	workspaceId: 2,
-	chapterId: 3,
 	providerInstanceId: 3,
 	deviceId: 3,
 	narratorId: 4,
@@ -390,7 +386,6 @@ function filterWithinScope(filter: PublicEventFilter | undefined, scope: Invocat
 	if (!filter) return true;
 	const checks: Array<[keyof InvocationScope, string[] | undefined]> = [
 		["projectId", filter.projectIds],
-		["chapterId", filter.chapterIds],
 		["narratorId", filter.narratorIds],
 	];
 	for (const [scopeKey, ids] of checks) {
@@ -406,7 +401,6 @@ function filterWithinScope(filter: PublicEventFilter | undefined, scope: Invocat
 function eventScopeValue(event: PublicEvent, key: keyof InvocationScope): string | undefined {
 	if (key === "userId") return event.actor?.id;
 	if (key === "projectId") return event.resource?.projectId ?? asString(event.data.projectId);
-	if (key === "chapterId") return event.resource?.chapterId ?? asString(event.data.chapterId);
 	if (key === "narratorId") return event.resource?.narratorId ?? asString(event.data.narratorId);
 	if (key === "providerInstanceId") return asString(event.data.providerInstanceId);
 	if (key === "deviceId") return asString(event.data.deviceId);
@@ -474,86 +468,6 @@ function baseMapping(
 export const defaultPluginEventMapper: PluginEventMapper = (event, context) => {
 	const type = String((event as { type?: unknown }).type ?? "");
 	const value = event as unknown as Record<string, unknown>;
-	if (type === "chapter:created") {
-		return baseMapping(
-			"narrafork.chapter.created",
-			"lifecycle",
-			{ chapterId: String(value.chapterId), projectId: String(value.projectId) },
-			"user_scoped",
-			context,
-			{
-				resource: resource("chapter", value.chapterId, { projectId: asString(value.projectId) }),
-			},
-		);
-	}
-	if (
-		[
-			"chapter:forked",
-			"chapter:dormant",
-			"chapter:woken",
-			"chapter:abandoned",
-			"chapter:role_changed",
-		].includes(type)
-	) {
-		const chapterId = value.chapterId;
-		return baseMapping(
-			"narrafork.chapter.lifecycle",
-			"lifecycle",
-			{
-				chapterId: String(chapterId),
-				changeKind: type.slice("chapter:".length),
-				...(typeof value.parentId === "string" ? { parentChapterId: value.parentId } : {}),
-				...(typeof value.role === "string" ? { role: value.role } : {}),
-			},
-			"user_scoped",
-			context,
-			{ resource: resource("chapter", chapterId) },
-		);
-	}
-	if (type === "chapter:merged") {
-		return baseMapping(
-			"narrafork.chapter.lifecycle",
-			"lifecycle",
-			{
-				changeKind: "merged",
-				sourceChapterId: String(value.sourceId),
-				targetChapterId: String(value.targetId),
-			},
-			"user_scoped",
-			context,
-			{ resource: resource("chapter", value.targetId) },
-		);
-	}
-	if (type === "chapter:commits_updated") {
-		return baseMapping(
-			"narrafork.chapter.commits.changed",
-			"state",
-			{ chapterId: String(value.chapterId), newCount: Number(value.newCount) },
-			"user_scoped",
-			context,
-			{ resource: resource("chapter", value.chapterId) },
-		);
-	}
-	// No `dependency:created`/`dependency:removed` mapping: the dependency edge type is gone,
-	// so `narrafork.chapter.edge.changed` had no remaining producer.
-	if (type.startsWith("review:")) {
-		const reviewChapterId = value.reviewChapterId;
-		return baseMapping(
-			"narrafork.review.lifecycle",
-			"lifecycle",
-			{
-				reviewChapterId: String(reviewChapterId),
-				changeKind: type.slice("review:".length),
-				...(typeof value.sourceChapterId === "string"
-					? { sourceChapterId: value.sourceChapterId }
-					: {}),
-				...(typeof value.action === "string" ? { action: value.action } : {}),
-			},
-			"user_scoped",
-			context,
-			{ resource: resource("review", reviewChapterId) },
-		);
-	}
 	if (type === "narrator:status_changed") {
 		return baseMapping(
 			"narrafork.narrator.lifecycle",
@@ -776,7 +690,6 @@ function sanitizeMappedEvent(
 
 function invocationToResourceScope(scope: InvocationScope): ResourceScope {
 	if (scope.narratorId) return { type: "narrator", id: scope.narratorId };
-	if (scope.chapterId) return { type: "chapter", id: scope.chapterId };
 	if (scope.deviceId) return { type: "device", id: scope.deviceId };
 	if (scope.providerInstanceId) return { type: "provider", id: scope.providerInstanceId };
 	if (scope.projectId) return { type: "project", id: scope.projectId };
@@ -817,7 +730,6 @@ function principalFromAuthorizationRequest(
 function invocationFromResourceScope(scope: ResourceScope): InvocationScope {
 	if (scope.type === "global") return {};
 	if (scope.type === "narrator") return { narratorId: scope.id };
-	if (scope.type === "chapter") return { chapterId: scope.id };
 	if (scope.type === "device") return { deviceId: scope.id };
 	if (scope.type === "provider") return { providerInstanceId: scope.id };
 	if (scope.type === "project") return { projectId: scope.id };

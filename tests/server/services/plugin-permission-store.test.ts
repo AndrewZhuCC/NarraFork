@@ -102,7 +102,7 @@ describe("PluginPermissionStore", () => {
 
 	test("enforces revision CAS under concurrency and advances revision when grants are revoked", async () => {
 		const { stateStore, permissionStore } = await makeStores();
-		const candidates = ["query.read.projects", "query.read.chapters"] as const;
+		const candidates = ["query.read.projects", "query.read.narrators"] as const;
 		const results = await Promise.allSettled(
 			candidates.map((capability, index) =>
 				permissionStore.replace(
@@ -196,7 +196,7 @@ describe("PluginPermissionStore", () => {
 			[
 				{
 					grantId: "grant-new",
-					capability: "query.read.chapters",
+					capability: "query.read.narrators",
 					scope: { type: "global" },
 					grantedBy: "admin-user-1",
 				},
@@ -275,7 +275,7 @@ describe("PluginPermissionStore", () => {
 		await permissionStore.ensureInstallation("com.example.permissions", installationId);
 
 		const input = {
-			capability: "query.read.chapters",
+			capability: "query.read.narrators",
 			scope: { type: "global" as const },
 		};
 		const first = await permissionStore.addPendingRequest(
@@ -365,7 +365,7 @@ describe("PluginPermissionStore", () => {
 		const request2 = await permissionStore.addPendingRequest(
 			"com.example.permissions",
 			installationId,
-			{ capability: "query.read.chapters", scope: { type: "global" as const } },
+			{ capability: "query.read.narrators", scope: { type: "global" as const } },
 		);
 		if (!request2) throw new Error("expected a queued pending request");
 		const denied = await permissionStore.resolvePendingRequest(
@@ -573,6 +573,92 @@ describe("PluginPermissionStore", () => {
 		expect(result2).toEqual([]);
 	});
 
+	test("loads a file naming removed chapter capabilities and scopes, dropping only those records", async () => {
+		const { root } = await makeStores();
+		const record = {
+			pluginId: "com.example.permissions",
+			installationId,
+			revision: 1,
+		};
+		const releasedDoc = {
+			version: 1,
+			plugins: {
+				"com.example.permissions": {
+					[installationId]: {
+						...record,
+						grants: [
+							{
+								...record,
+								grantId: "grant-projects",
+								capability: "query.read.projects",
+								scope: { type: "global" },
+								grantedBy: "admin",
+							},
+							{
+								...record,
+								grantId: "grant-chapter-scope",
+								capability: "query.read.narrators",
+								scope: { type: "chapter", id: "chapter-1" },
+								grantedBy: "admin",
+							},
+							{
+								...record,
+								grantId: "grant-chapter-write",
+								capability: "command.chapter.write",
+								scope: { type: "global" },
+								grantedBy: "admin",
+							},
+						],
+						pendingRequests: [
+							{
+								requestId: "request-chapter",
+								capability: "query.read.chapters",
+								scope: { type: "global" },
+								requestedAt: "2026-07-18T12:00:00.000Z",
+								status: "pending",
+							},
+							{
+								requestId: "request-narrators",
+								capability: "query.read.narrators",
+								scope: { type: "global" },
+								requestedAt: "2026-07-18T12:00:00.000Z",
+								status: "pending",
+							},
+						],
+						permanentDenials: [
+							{
+								capability: "query.read.projects",
+								scope: { type: "chapter", id: "chapter-1" },
+								deniedAt: "2026-07-18T12:00:00.000Z",
+							},
+						],
+						updatedAt: "2026-07-18T12:00:00.000Z",
+					},
+				},
+			},
+			diagnostics: [],
+			updatedAt: "2026-07-18T12:00:00.000Z",
+		};
+		await writeFile(join(root, "permissions.json"), JSON.stringify(releasedDoc, null, 2), "utf8");
+
+		const permissionStore = new PluginPermissionStore({
+			root,
+			now: () => new Date("2026-07-18T12:00:00.000Z"),
+		});
+		const set = await permissionStore.getSet("com.example.permissions", installationId);
+		expect(set.grants.map((grant) => grant.grantId)).toEqual(["grant-projects"]);
+		const pending = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pending.map((request) => request.requestId)).toEqual(["request-narrators"]);
+		expect(
+			await permissionStore.listPermanentDenials("com.example.permissions", installationId),
+		).toEqual([]);
+		// The file was read, not reset as corrupt.
+		expect(await permissionStore.getDiagnostics()).toEqual([]);
+	});
+
 	test("addPendingRequest validates capability and scope via schemas", async () => {
 		const { permissionStore } = await makeStores();
 		await permissionStore.ensureInstallation("com.example.permissions", installationId);
@@ -623,7 +709,7 @@ describe("PluginPermissionStore", () => {
 			[
 				{
 					grantId: "grant-new",
-					capability: "query.read.chapters",
+					capability: "query.read.narrators",
 					scope: { type: "global" },
 					grantedBy: "admin",
 				},
@@ -829,8 +915,8 @@ describe("PluginPermissionStore permanent denials", () => {
 			installationId,
 			[
 				{
-					grantId: "grant-chapters",
-					capability: "query.read.chapters",
+					grantId: "grant-narrators",
+					capability: "query.read.narrators",
 					scope: { type: "global" },
 					grantedBy: "admin-user-1",
 				},

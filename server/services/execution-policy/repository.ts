@@ -1,6 +1,5 @@
 import { db } from "@server/db";
 import {
-	chapters,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narrators,
@@ -11,21 +10,14 @@ import {
 import { MAX_POLICY_SOURCE_DEPTH, policySourceIdOf } from "@server/lib/runtime-source";
 import { getSettingsRevision, settings } from "@server/lib/settings";
 import { eq, inArray } from "drizzle-orm";
-import {
-	isSignedReviewBoundaryRow,
-	markTrustedReviewBoundary,
-	reviewBoundaryRule,
-} from "../narrator-review-boundary";
+import { narratorProjectIdColumn } from "../narrator-project";
+import { isSignedReviewBoundaryRow, markTrustedReviewBoundary } from "../narrator-review-boundary";
 import {
 	mergeExecutionPolicyRuleSets,
 	normalizeDirectoryBlacklistRule,
 	normalizeExecutionPolicyRuleSet,
 } from "./normalize";
-import type {
-	ExecutionPolicyRuleSet,
-	LegacyDirectoryBlacklistEntry,
-	LegacyExecutionPolicyRuleSet,
-} from "./types";
+import type { ExecutionPolicyRuleSet, LegacyExecutionPolicyRuleSet } from "./types";
 
 export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 	narratorId: string;
@@ -53,7 +45,6 @@ export class ExecutionPolicyRepository {
 		let next: string | null = narratorId;
 		let projectId: string | null = null;
 		const contextProjects = new Set<string>();
-		const reviewBoundaries: LegacyDirectoryBlacklistEntry[] = [];
 		while (next) {
 			if (
 				inheritedNarratorIds.includes(next) ||
@@ -64,8 +55,9 @@ export class ExecutionPolicyRepository {
 			const narrator = store
 				.select({
 					id: narrators.id,
-					chapterId: narrators.chapterId,
-					contextProjectId: narrators.contextProjectId,
+					// The narrator's primary project (explicit, else its indexed directory's):
+					// the same single answer as resolveNarratorProjectId.
+					projectId: narratorProjectIdColumn,
 					policySourceNarratorId: narrators.policySourceNarratorId,
 					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
 					type: narrators.type,
@@ -77,27 +69,7 @@ export class ExecutionPolicyRepository {
 				.get();
 			if (!narrator) throw new Error(`Narrator not found: ${next}`);
 			inheritedNarratorIds.push(narrator.id);
-			// The chapter owns project context. contextProjectId is an explicit
-			// standalone fallback, not a replacement and never inferred from cwd.
-			let effectiveProjectId = narrator.contextProjectId;
-			if (narrator.chapterId) {
-				const chapter = store
-					.select({
-						id: chapters.id,
-						projectId: chapters.projectId,
-						role: chapters.role,
-						worktreePath: chapters.worktreePath,
-					})
-					.from(chapters)
-					.where(eq(chapters.id, narrator.chapterId))
-					.get();
-				if (!chapter) throw new Error("Permission chapter context no longer exists");
-				effectiveProjectId = chapter.projectId;
-				if (chapter.role === "review") {
-					if (!chapter.worktreePath) throw new Error("Review workspace boundary is unavailable");
-					reviewBoundaries.push(reviewBoundaryRule(chapter.id, chapter.worktreePath));
-				}
-			}
+			const effectiveProjectId = narrator.projectId;
 			projectId ??= effectiveProjectId;
 			if (effectiveProjectId) contextProjects.add(effectiveProjectId);
 			next = policySourceIdOf(narrator);
@@ -184,9 +156,6 @@ export class ExecutionPolicyRepository {
 								? markTrustedReviewBoundary({ ...normalized, enabled: true })
 								: normalized;
 						}),
-						...reviewBoundaries.map((row) =>
-							markTrustedReviewBoundary(normalizeDirectoryBlacklistRule(row, "narrator")),
-						),
 					],
 					commandWhitelist: [],
 					commandBlacklist: [],

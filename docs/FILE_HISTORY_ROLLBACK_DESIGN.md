@@ -141,7 +141,7 @@ FileState = 不存在 | 原始文件内容引用及必要模式 | 链接对象�
 - Bash 回退按这些文件恢复，不 checkout 整棵旧 tree。
 - Git tree 未覆盖的内容，例如忽略文件、空目录、仓库外文件和外部系统副作用，不承诺由该 Bash 快照恢复。Edit/Write 则不因 gitignore 而丢失逐文件记录。
 
-章节 fork/merge 等结构性快照继续复用 [server/services/worktree-tree-snapshot.ts](../server/services/worktree-tree-snapshot.ts)，不与日常会话恢复资格绑定。既有结构性快照事务的 commit/finalize/discard 约定保持不变。
+叙事线移除后，[server/services/worktree-tree-snapshot.ts](../server/services/worktree-tree-snapshot.ts) 只服务 Bash 观测与编辑预览，不与日常会话恢复资格绑定。
 
 ### 5.2 唯一判据是实际窗口
 
@@ -327,7 +327,7 @@ summary   { selectedFileCount, skippedOperationCount, affectedOtherSessions }
 - 重试只执行尚未完成的项；已完成项不因为 HTTP 重试而再次覆盖文件。
 - 用户要撤销本次恢复，仍使用同一个文件版本恢复机制；不存在另一套 redo 引擎。
 
-逐文件结果替代跨文件补偿链。章节 fork/merge 的结构性快照事务和现有 commit/finalize/discard 出口不在此次替换范围内。
+逐文件结果替代跨文件补偿链。
 
 ### 7.4 会话历史最后处理
 

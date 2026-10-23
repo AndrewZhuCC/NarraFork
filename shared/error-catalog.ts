@@ -5,10 +5,10 @@
  *
  * ```jsonc
  * {
- *   "error": "Chapter not found: abc123",  // rendered English, always present
+ *   "error": "Project not found: abc123",  // rendered English, always present
  *   "code": "NOT_FOUND",                   // coarse, BEHAVIOUR-bearing code
  *   "messageCode": "RESOURCE_NOT_FOUND",   // fine-grained i18n key (optional)
- *   "messageParams": { "entity": "Chapter", "id": "abc123" }
+ *   "messageParams": { "entity": "Project", "id": "abc123" }
  * }
  * ```
  *
@@ -120,41 +120,11 @@ export const ERROR_CATALOG = {
 		en: "podman is not installed",
 	},
 
-	// --- git / merge -----------------------------------------------------------
+	// --- git -------------------------------------------------------------------
 	GIT_AUTH_REQUIRED: {
 		status: 401,
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
-	},
-	GIT_TREE_MERGE_FAILED: {
-		status: 422,
-		code: "GIT_ERROR",
-		en: "Git tree merge failed: {detail}",
-	},
-	GIT_TREE_MERGE_FALLBACK_FAILED: {
-		status: 422,
-		code: "GIT_ERROR",
-		en: "Git {version} does not support {feature}. An automatic compatibility merge in a temporary directory was attempted but failed: {detail}. Check your Git installation and the temporary directory's permissions and available space, or install Git 2.40+ (for example, install it separately and add it to the server's PATH).",
-	},
-	GIT_TREE_MERGE_CONFLICTS_UNLISTED: {
-		status: 422,
-		code: "GIT_ERROR",
-		en: "Merge conflicts were detected, but their full scope or resolution cannot be verified automatically. Automatic application was refused. Resolve the conflicts manually.",
-	},
-	MERGE_DIRTY_SOURCE: {
-		status: 400,
-		code: "VALIDATION_ERROR",
-		en: "The source worktree has uncommitted changes. Commit or discard them before merging.",
-	},
-	MERGE_DIRTY_TARGET: {
-		status: 400,
-		code: "VALIDATION_ERROR",
-		en: "The target worktree has uncommitted changes. Commit or discard them before merging.",
-	},
-	MERGE_DIRTY_TRUNK: {
-		status: 400,
-		code: "VALIDATION_ERROR",
-		en: "The trunk worktree has uncommitted changes. Commit or discard them before merging.",
 	},
 
 	// --- auth / session --------------------------------------------------------
@@ -259,7 +229,7 @@ export function sanitizeErrorParams(params: ErrorMessageParams | undefined): Err
  * Interpolate `{name}` placeholders.
  *
  * A placeholder with no matching param is left verbatim on purpose. Emitting an empty string
- * would produce a confident but incomplete sentence ("Chapter not found: "), whereas a visible
+ * would produce a confident but incomplete sentence ("Project not found: "), whereas a visible
  * `{id}` is unmistakably a defect and gets reported.
  */
 export function interpolate(template: string, params: ErrorMessageParams): string {

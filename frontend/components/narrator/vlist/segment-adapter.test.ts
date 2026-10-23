@@ -4825,7 +4825,7 @@ describe("adaptSegment — a concluded review", () => {
 		expect(specs[0]?.kind).not.toBe("review-card");
 	});
 
-	it("carries the producer's markdown as the body, with verdict + action chrome", () => {
+	it("carries the producer's markdown as the body, with verdict chrome and no action", () => {
 		const data = cardData({
 			verdict: "request_changes",
 			findings: [{ severity: "critical", message: "the index has no migration" }],
@@ -4837,9 +4837,9 @@ describe("adaptSegment — a concluded review", () => {
 		expect(data.text).toContain("- the index has no migration");
 		expect(data.verdictLabel).toBe("Changes Requested");
 		expect(data.color).toBe("orange");
-		// Always present, so the reserved action row is never empty.
-		expect(data.actionLabel).toBe("Handle");
-		expect(data.applied).toBe(false);
+		// A read-only record: the action that started a follow-up turn left with chapter review.
+		expect(data).not.toHaveProperty("actionLabel");
+		expect(data).not.toHaveProperty("applied");
 	});
 
 	it("composes a body from verdict + findings for rows written without text", () => {
@@ -4886,27 +4886,23 @@ describe("adaptSegment — a concluded review", () => {
 		expect(data.color).toBe("green");
 	});
 
-	it("marks a revision and flips the action once a turn has been started", () => {
+	it("marks a revision", () => {
 		const data = cardData({
 			verdict: "approve",
 			findings: [],
 			text: "## Code Review (revised): Approved\n",
 			revised: true,
-			applied: true,
 		});
 		expect(data.revisedLabel).toBe("Revised");
-		expect(data.applied).toBe(true);
-		expect(data.actionLabel).toBe("Handled");
 	});
 
 	it("uses the injected localized labels", () => {
 		const data = cardData(
 			{ verdict: "approve", findings: [] },
-			{ lod: 5, labels: { reviewVerdict_approve: "已通过", reviewFeedbackApply: "处理" } },
+			{ lod: 5, labels: { reviewVerdict_approve: "已通过" } },
 		);
 		expect(data.text).toBe("已通过");
 		expect(data.verdictLabel).toBe("已通过");
-		expect(data.actionLabel).toBe("处理");
 	});
 
 	it("measures through the registry: the markdown body drives the height", () => {

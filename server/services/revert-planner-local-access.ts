@@ -115,7 +115,6 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 				writeAudience: narrators.writeAudience,
 				type: narrators.type,
 				aclRootNarratorId: narrators.aclRootNarratorId,
-				chapterId: narrators.chapterId,
 				contextProjectId: narrators.contextProjectId,
 				cwd: narrators.cwd,
 			})
@@ -124,7 +123,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			.get();
 		if (!row) throw new NotFoundError("Narrator", narratorId);
 		await assertNarratorAccess(row, principal, "write");
-		// A subagent row carries no chapter/project of its own; its project is the
+		// A subagent row carries no project of its own; its project is the
 		// delegation root's. Without this, reverting inside a subagent would skip the
 		// project write gate its parent is held to.
 		const projectRow =
@@ -132,10 +131,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 				? await (async () => {
 						const rootId = await resolveNarratorAdmissionRoot(narratorId);
 						const root = db
-							.select({
-								chapterId: narrators.chapterId,
-								contextProjectId: narrators.contextProjectId,
-							})
+							.select({ id: narrators.id, contextProjectId: narrators.contextProjectId })
 							.from(narrators)
 							.where(eq(narrators.id, rootId))
 							.get();
@@ -144,7 +140,6 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 					})()
 				: row;
 		const projectId = await resolveNarratorProjectId(projectRow);
-		if (projectRow.chapterId && !projectId) throw new NotFoundError("Narrator project", narratorId);
 		if (projectId) {
 			const project = db
 				.select({

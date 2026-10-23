@@ -8,10 +8,6 @@
  * put first sessions in a folder the user never chose. With no usable default the
  * caller must refuse and ask for a directory instead of guessing one (home included).
  *
- * Chapter-bound narrators are deliberately excluded: an unset cwd there resolves to
- * the chapter worktree at session start (`resolveNarratorSessionCwd`), which is the
- * correct answer and must not be pre-empted.
- *
  * Filesystem effects are INJECTED so the decision can be tested without a real disk.
  */
 
@@ -31,18 +27,15 @@ export interface StandaloneNarratorCwdDeps {
 export type StandaloneNarratorCwd =
 	/** Persist this cwd. */
 	| { kind: "cwd"; cwd: string }
-	/** Leave unset: session start binds the chapter worktree. */
-	| { kind: "session" }
 	/** No directory sent and no existing default: the user must choose one. */
 	| { kind: "required" };
 
 export function resolveStandaloneNarratorCwd(
-	input: { cwd?: string; chapterId?: string | null },
+	input: { cwd?: string },
 	deps: StandaloneNarratorCwdDeps,
 ): StandaloneNarratorCwd {
 	const explicit = input.cwd?.trim();
 	if (explicit) return { kind: "cwd", cwd: explicit };
-	if (input.chapterId) return { kind: "session" };
 
 	const configured = deps.configuredDir?.trim();
 	if (!configured) return { kind: "required" };

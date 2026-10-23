@@ -17,7 +17,6 @@ const searchBaseQuerySchema = z.object({
 	/** Comma-separated content to add to the default scope; unknown names are ignored. */
 	include: z.string().max(128).optional(),
 	projectId: id.optional(),
-	chapterId: id.optional(),
 	from: isoTime.optional(),
 	to: isoTime.optional(),
 	/** Only sessions the viewer owns. */

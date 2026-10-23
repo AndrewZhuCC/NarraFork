@@ -42,17 +42,19 @@ describe("shared integration foundation", () => {
 
 	test("uses exact resource scopes and fails closed for unknown cross-type relations", () => {
 		const project = { type: "project" as const, id: "project-1" };
-		const chapter = { type: "chapter" as const, id: "chapter-1" };
+		const narrator = { type: "narrator" as const, id: "narrator-1" };
 		expect(resourceRefSchema.safeParse(project).success).toBe(true);
 		expect(resourceScopeSchema.safeParse({ type: "global", id: "nope" }).success).toBe(false);
-		expect(resolveResourceContainment(project, chapter)).toBe("unknown");
+		// Chapters were removed; their resource type is no longer canonical.
+		expect(resourceRefSchema.safeParse({ type: "chapter", id: "chapter-1" }).success).toBe(false);
+		expect(resolveResourceContainment(project, narrator)).toBe("unknown");
 		expect(
-			resolveResourceContainment(project, chapter, {
+			resolveResourceContainment(project, narrator, {
 				resolve: () => "contains",
 			}),
 		).toBe("contains");
 		expect(
-			resolveResourceContainment(project, chapter, {
+			resolveResourceContainment(project, narrator, {
 				resolve: () => "not_contains",
 			}),
 		).toBe("not_contains");
@@ -64,27 +66,28 @@ describe("shared integration foundation", () => {
 			defaultRedaction: "sensitive",
 			defaultRateClass: "standard",
 		});
-		expect(CANONICAL_CAPABILITY_DESCRIPTORS["event.chapter.subscribe"]).toBeDefined();
+		expect(CANONICAL_CAPABILITY_DESCRIPTORS["event.narrator.subscribe"]).toBeDefined();
 		expect(CANONICAL_CAPABILITY_DESCRIPTORS["event.public.subscribe"]).toBeDefined();
+		expect("event.chapter.subscribe" in CANONICAL_CAPABILITY_DESCRIPTORS).toBe(false);
 	});
 
 	test("bounds event subscriptions and keeps metadata strict", () => {
 		expect(
 			eventSubscriptionSchema.safeParse({
-				topics: ["chapter.updated"],
+				topics: ["narrator.updated"],
 				scope: { type: "project", id: "project-1" },
 			}).success,
 		).toBe(true);
 		expect(
 			eventSubscriptionSchema.safeParse({
-				topics: Array.from({ length: 33 }, (_, index) => `chapter.event_${index}`),
+				topics: Array.from({ length: 33 }, (_, index) => `narrator.event_${index}`),
 				scope: { type: "global" },
 			}).success,
 		).toBe(false);
 		expect(
 			integrationEventMetadataSchema.safeParse({
 				id: "event-1",
-				topic: "chapter.updated",
+				topic: "narrator.updated",
 				occurredAt: 1,
 				extra: true,
 			}).success,

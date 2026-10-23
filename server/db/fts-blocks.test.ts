@@ -26,7 +26,6 @@ function fixture(options: { blocks?: boolean } = {}): Database {
 	const sqlite = new Database(":memory:");
 	sqlite.exec(`
 		PRAGMA foreign_keys = ON;
-		CREATE TABLE chapters(id TEXT PRIMARY KEY, title TEXT, description TEXT);
 		CREATE TABLE narrators(id TEXT PRIMARY KEY, title TEXT);
 		CREATE TABLE narrator_messages(
 			id TEXT PRIMARY KEY, content_text TEXT, body_revision INTEGER NOT NULL DEFAULT 0

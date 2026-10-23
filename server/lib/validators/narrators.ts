@@ -71,7 +71,6 @@ export const narratorHandleSchema = z
 export const createNarratorSchema = z.object({
 	/** 自定义会话标题；留空（或不传）时由首条消息自动命名。 */
 	title: z.string().trim().min(1).max(200).optional(),
-	chapterId: z.string().min(1).nullish(),
 	contextProjectId: z.string().min(1).max(128).nullish(),
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),

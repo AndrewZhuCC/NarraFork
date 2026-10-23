@@ -13,14 +13,14 @@ function humanize(value: string): string {
 	return normalized ? normalized.replace(/\b\w/g, (char) => char.toUpperCase()) : value;
 }
 
-/** A knowledge entry or chapter hit; the whole card links to it. */
+/** A knowledge entry hit; the whole card links to it. */
 export function EntityResultCard({ result, query }: { result: EntitySearchResult; query: string }) {
 	const { t } = useTranslation("search");
 	const time = result.updatedAt ?? result.createdAt;
 	const card = (
 		<Card shadow="sm" padding="md" withBorder style={{ cursor: "pointer" }}>
 			<Group gap="xs" mb={6} wrap="nowrap" style={{ minWidth: 0 }}>
-				<Badge size="xs" color={result.type === "knowledge" ? "teal" : "blue"}>
+				<Badge size="xs" color="teal">
 					{t(`label_${result.type}`)}
 				</Badge>
 				<Text fw={500} truncate>
@@ -53,12 +53,8 @@ export function EntityResultCard({ result, query }: { result: EntitySearchResult
 			</Group>
 		</Card>
 	);
-	return result.type === "knowledge" ? (
+	return (
 		<Link to="/knowledge/$entryId" params={{ entryId: result.id }} style={linkStyle}>
-			{card}
-		</Link>
-	) : (
-		<Link to="/chapters/$chapterId" params={{ chapterId: result.id }} style={linkStyle}>
 			{card}
 		</Link>
 	);

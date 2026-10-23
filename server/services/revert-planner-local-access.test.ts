@@ -172,7 +172,7 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 	});
 	token = await createToken(userId, "user");
 	otherToken = await createToken(otherId, "user");
-	settings.chapters.treeSnapshotsEnabled = false;
+	settings.workspace.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
 	owner.runtime = runtime;
 	const verifyNamespace = runtime.verifyNamespace;

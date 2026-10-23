@@ -71,7 +71,6 @@ function scopeFromContext(context: ToolContext): InvocationScope {
 	const scope: InvocationScope = {};
 	if (validIdentifier(context.userId)) scope.userId = context.userId;
 	if (validIdentifier(context.projectId)) scope.projectId = context.projectId;
-	if (validIdentifier(context.chapterId)) scope.chapterId = context.chapterId;
 	if (validIdentifier(context.narratorId)) scope.narratorId = context.narratorId;
 	return scope;
 }

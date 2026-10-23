@@ -128,7 +128,7 @@ test("loads every section's first page for the overview, and one section's pages
 	await settle();
 	expect(sectionsSpy).toHaveBeenCalledWith(
 		{ q: "kestrel", sort: "time", limit: SEARCH_OVERVIEW_LIMIT },
-		["sessions", "knowledge", "chapters"],
+		["sessions", "knowledge"],
 		expect.any(AbortSignal),
 	);
 	expect(sectionsSpy).toHaveBeenCalledWith(

@@ -146,7 +146,7 @@ export const capabilityAuthorizationConstraintsSchema = authorizationConstraints
 
 const resourceSchema = z
 	.object({
-		type: z.enum(["user", "project", "workspace", "chapter", "narrator", "provider", "device"]),
+		type: z.enum(["user", "project", "workspace", "narrator", "provider", "device"]),
 		id: identifierSchema,
 	})
 	.strict();
@@ -409,7 +409,6 @@ const scopeFieldByType: Record<
 	user: "userId",
 	project: "projectId",
 	workspace: "workspaceId",
-	chapter: "chapterId",
 	narrator: "narratorId",
 	provider: "providerInstanceId",
 	device: "deviceId",
@@ -495,8 +494,6 @@ function scopeForResource(resource: CapabilityResource): InvocationScope {
 			return { projectId: resource.id };
 		case "workspace":
 			return { workspaceId: resource.id };
-		case "chapter":
-			return { chapterId: resource.id };
 		case "narrator":
 			return { narratorId: resource.id };
 		case "provider":

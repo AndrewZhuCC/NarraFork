@@ -19,13 +19,14 @@ import {
 } from "@shared/notification-center";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects, users } from "../db/schema";
+import { narrators, projects, users } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { notificationMarkReadSchema } from "../lib/validators/notifications";
 import { narratorReadableWhere } from "./narrator-acl";
+import { narratorProjectIdColumn } from "./narrator-project";
 
 export type {
 	NotificationKind,
@@ -172,10 +173,8 @@ function rowBase(row: NotificationRow): NotificationListItem {
 		notificationIds: [row.id],
 		kind: row.kind,
 		projectId: null,
-		chapterId: null,
 		narratorId: null,
 		projectTitle: null,
-		chapterTitle: null,
 		title: "",
 		preview: "",
 		link: { type: "unavailable" },
@@ -195,7 +194,6 @@ export interface RecordNotificationInput {
 	preview: string;
 	link: NotificationLink;
 	projectId?: string | null;
-	chapterId?: string | null;
 	narratorId?: string | null;
 	createdAt?: number;
 }
@@ -218,12 +216,11 @@ export async function recordNotifications(inputs: RecordNotificationInput[]): Pr
 					: Date.now();
 			db.run(sql`
 				INSERT INTO notifications (
-					id, user_id, kind, project_id, chapter_id, narrator_id,
+					id, user_id, kind, project_id, narrator_id,
 					title, preview, link_json, source_key, status, created_at, read_at
 				) VALUES (
 					${generateId()}, ${input.userId}, ${input.kind},
 					${isId(input.projectId) ? input.projectId : null},
-					${isId(input.chapterId) ? input.chapterId : null},
 					${link.type === "narrator" ? link.narratorId : null},
 					${clampNotificationText(input.title, NOTIFICATION_TITLE_MAX_LENGTH)},
 					${clampNotificationText(input.preview, NOTIFICATION_PREVIEW_MAX_LENGTH)},
@@ -306,8 +303,6 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 		string,
 		{
 			narratorId: string;
-			chapterId: string | null;
-			chapterTitle: string | null;
 			projectId: string | null;
 			projectTitle: string | null;
 		}
@@ -316,21 +311,13 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 		const found = await db
 			.select({
 				narratorId: narrators.id,
-				chapterId: chapters.id,
-				chapterTitle: sql<
-					string | null
-				>`substr(${chapters.title}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
 				projectId: projects.id,
 				projectTitle: sql<
 					string | null
 				>`substr(${projects.name}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
 			})
 			.from(narrators)
-			.leftJoin(chapters, eq(chapters.id, narrators.chapterId))
-			.leftJoin(
-				projects,
-				eq(projects.id, sql`coalesce(${chapters.projectId}, ${narrators.contextProjectId})`),
-			)
+			.leftJoin(projects, eq(projects.id, narratorProjectIdColumn))
 			.where(
 				and(
 					inArray(narrators.id, batch),
@@ -561,7 +548,7 @@ export async function deleteNotification(userId: string, id: string): Promise<vo
 export function ensureNotificationsTableForTests(sqlite: { run(query: string): unknown }): void {
 	sqlite.run(`CREATE TABLE IF NOT EXISTS notifications (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL,
-		project_id TEXT, chapter_id TEXT, narrator_id TEXT,
+		project_id TEXT, narrator_id TEXT,
 		title TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '',
 		link_json TEXT NOT NULL DEFAULT '{}', source_key TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'unread', created_at INTEGER NOT NULL, read_at INTEGER

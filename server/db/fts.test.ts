@@ -159,7 +159,6 @@ describe("FTS recovery after generated content-table migrations", () => {
 		const sqlite = new Database(":memory:");
 		try {
 			sqlite.exec(`
-				CREATE TABLE chapters (id TEXT PRIMARY KEY, title TEXT, description TEXT);
 				CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_text TEXT);
 				CREATE TABLE narrators (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
 				CREATE TABLE knowledge_entries (id TEXT PRIMARY KEY, title TEXT, current_content TEXT, current_keywords TEXT);
@@ -216,7 +215,6 @@ describe("FTS recovery after generated content-table migrations", () => {
 		const sqlite = new Database(":memory:");
 		try {
 			sqlite.exec(`
-				CREATE TABLE chapters (id TEXT PRIMARY KEY, title TEXT, description TEXT);
 				CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_text TEXT);
 				CREATE TABLE narrators (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
 				CREATE TABLE knowledge_entries (id TEXT PRIMARY KEY, title TEXT, current_content TEXT, current_keywords TEXT);
@@ -247,7 +245,6 @@ describe("FTS recovery after generated content-table migrations", () => {
 		const sqlite = new Database(":memory:");
 		try {
 			sqlite.exec(`
-				CREATE TABLE chapters (id TEXT PRIMARY KEY, title TEXT, description TEXT);
 				CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_text TEXT);
 				CREATE TABLE narrators (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
 				CREATE TABLE knowledge_entries (id TEXT PRIMARY KEY, title TEXT, current_content TEXT, current_keywords TEXT);
@@ -295,7 +292,6 @@ describe("FTS recovery after generated content-table migrations", () => {
 		const sqlite = new Database(":memory:");
 		try {
 			sqlite.exec(`
-				CREATE TABLE chapters (id TEXT PRIMARY KEY, title TEXT, description TEXT);
 				CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_text TEXT);
 				CREATE TABLE narrators (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
 				CREATE TABLE knowledge_entries (id TEXT PRIMARY KEY, title TEXT, current_content TEXT, current_keywords TEXT);
@@ -316,6 +312,141 @@ describe("FTS recovery after generated content-table migrations", () => {
 			} finally {
 				run.mockRestore();
 			}
+		} finally {
+			sqlite.close();
+		}
+	});
+});
+
+/**
+ * Upgrading from a release that still had chapters (and a chapter search index).
+ *
+ * The migration drops `chapters` (SQLite drops its triggers with it) and rebuilds `narrators`
+ * without `chapter_id`, which drops the narrators FTS triggers and renumbers rowids. What it
+ * cannot touch is the chapter index this module created at runtime: `chapters_fts` and its
+ * shadow tables. Startup must remove those and repair the narrators index.
+ */
+describe("upgrade from a release with chapter search", () => {
+	/** The released chapter index, as the previous `ensureFts` installed it. */
+	const RELEASED_CHAPTER_FTS = `
+		CREATE VIRTUAL TABLE chapters_fts USING fts5(
+			title, description, content='chapters', content_rowid=rowid, tokenize='trigram'
+		);
+		CREATE TRIGGER chapters_fts_insert AFTER INSERT ON chapters BEGIN
+			INSERT INTO chapters_fts(rowid, title, description)
+			VALUES (NEW.rowid, NEW.title, NEW.description);
+		END;
+		CREATE TRIGGER chapters_fts_update AFTER UPDATE ON chapters BEGIN
+			INSERT INTO chapters_fts(chapters_fts, rowid, title, description)
+			VALUES ('delete', OLD.rowid, OLD.title, OLD.description);
+			INSERT INTO chapters_fts(rowid, title, description)
+			VALUES (NEW.rowid, NEW.title, NEW.description);
+		END;
+		CREATE TRIGGER chapters_fts_delete AFTER DELETE ON chapters BEGIN
+			INSERT INTO chapters_fts(chapters_fts, rowid, title, description)
+			VALUES ('delete', OLD.rowid, OLD.title, OLD.description);
+		END;
+	`;
+
+	/** Same shape as the generated rebuild: drop the parent, then copy/drop/rename narrators. */
+	const CHAPTER_REMOVAL_MIGRATION = `
+		PRAGMA foreign_keys=OFF;
+		DROP TABLE chapters;
+		CREATE TABLE __new_narrators (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
+		INSERT INTO __new_narrators(id, title, created_at, updated_at)
+		SELECT id, title, created_at, updated_at FROM narrators;
+		DROP TABLE narrators;
+		ALTER TABLE __new_narrators RENAME TO narrators;
+		PRAGMA foreign_keys=ON;
+	`;
+
+	function releasedDatabase(): Database {
+		const sqlite = new Database(":memory:");
+		sqlite.exec(`
+			CREATE TABLE chapters (id TEXT PRIMARY KEY, title TEXT, description TEXT);
+			CREATE TABLE narrators (
+				id TEXT PRIMARY KEY, chapter_id TEXT REFERENCES chapters(id), title TEXT,
+				created_at TEXT, updated_at TEXT
+			);
+			CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_text TEXT);
+		`);
+		ensureFts(sqlite, { wasClean: true });
+		sqlite.exec(RELEASED_CHAPTER_FTS);
+		sqlite.exec(`
+			INSERT INTO chapters VALUES ('c1', 'chapterneedle', 'chapter body');
+			INSERT INTO narrators(rowid, id, chapter_id, title, created_at, updated_at)
+			VALUES (20, 'first', 'c1', 'uniqueneedle', 'now', 'now');
+			INSERT INTO narrators(rowid, id, chapter_id, title, created_at, updated_at)
+			VALUES (40, 'second', NULL, 'anotherneedle', 'now', 'now');
+		`);
+		return sqlite;
+	}
+
+	function chapterObjects(sqlite: Database): string[] {
+		return (
+			sqlite
+				.query("SELECT name FROM sqlite_master WHERE name LIKE 'chapters%' ORDER BY name")
+				.all() as Array<{ name: string }>
+		).map((row) => row.name);
+	}
+
+	test("drops the orphaned chapter index and repairs the rebuilt narrators index", () => {
+		const sqlite = releasedDatabase();
+		try {
+			sqlite.exec(CHAPTER_REMOVAL_MIGRATION);
+			// The migration leaves the runtime index (and its shadow tables) behind, but not its
+			// triggers, and the narrators index now points at renumbered rowids.
+			expect(chapterObjects(sqlite)).toEqual([
+				"chapters_fts",
+				"chapters_fts_config",
+				"chapters_fts_data",
+				"chapters_fts_docsize",
+				"chapters_fts_idx",
+			]);
+			expect(() => checkExternalContent(sqlite)).toThrow();
+
+			const run = spyOn(sqlite, "run");
+			try {
+				expect(ensureFts(sqlite, { wasClean: true }).rebuilt).toBe(true);
+				const rebuilds = run.mock.calls.filter(([sql]) => String(sql).includes("('rebuild')"));
+				expect(rebuilds.map(([sql]) => sql)).toEqual([
+					"INSERT INTO narrators_fts(narrators_fts) VALUES ('rebuild')",
+				]);
+			} finally {
+				run.mockRestore();
+			}
+			expect(chapterObjects(sqlite)).toEqual([]);
+			expect(matches(sqlite, "uniqueneedle")).toEqual(["first"]);
+			expect(matches(sqlite, "anotherneedle")).toEqual(["second"]);
+			expect(() => checkExternalContent(sqlite)).not.toThrow();
+			sqlite.exec("UPDATE narrators SET title='changedneedle' WHERE id='first'");
+			expect(matches(sqlite, "changedneedle")).toEqual(["first"]);
+			expect(sqlite.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+
+			// The next clean start finds nothing to drop and nothing to repair.
+			const second = spyOn(sqlite, "run");
+			try {
+				expect(ensureFts(sqlite, { wasClean: true }).rebuilt).toBe(false);
+				expect(second.mock.calls.some(([sql]) => /chapters_fts|rebuild/.test(String(sql)))).toBe(
+					false,
+				);
+			} finally {
+				second.mockRestore();
+			}
+		} finally {
+			sqlite.close();
+		}
+	});
+
+	test("drops the chapter triggers before the index they write to", () => {
+		const sqlite = releasedDatabase();
+		try {
+			// A chapters table that is still there must not keep triggers into a dropped index.
+			ensureFts(sqlite, { wasClean: true });
+			expect(chapterObjects(sqlite)).toEqual(["chapters"]);
+			expect(() =>
+				sqlite.exec("INSERT INTO chapters VALUES ('c2', 'later', 'still writable')"),
+			).not.toThrow();
 		} finally {
 			sqlite.close();
 		}

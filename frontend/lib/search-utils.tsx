@@ -20,9 +20,6 @@ export function normalizeSearchTab(value: unknown): SearchTab {
 			return "sessions";
 		case "knowledge":
 			return "knowledge";
-		case "chapters":
-		case "chapter":
-			return "chapters";
 		default:
 			return "all";
 	}

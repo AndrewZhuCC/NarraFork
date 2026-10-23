@@ -29,6 +29,7 @@ import {
 	narratorToolCalls,
 	worktreeTreeSnapshots,
 } from "../../db/schema";
+import { LOCAL_DEVICE_ID } from "../../lib/agent/execution/backend";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import { normalizePathForComparison } from "../../lib/platform-path";
@@ -39,6 +40,7 @@ import {
 	buildTreeSnapshotEventHooks,
 	buildTreeSnapshotExecutionHooks,
 } from "../tree-snapshot-loop-hooks";
+import { treeSnapshotPhysicalDir } from "../tree-snapshot-paths";
 import { resetHotPathCaptureStateForTests, worktreeTreeSnapshot } from "../worktree-tree-snapshot";
 import { peekClaim } from "../worktree-write-claims";
 
@@ -115,7 +117,7 @@ afterEach(async () => {
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
 	}
 	for (const dir of tempDirs.splice(0)) {
-		await worktreeTreeSnapshot.destroy(dir).catch(() => {});
+		rmSync(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, dir), { recursive: true, force: true });
 		await db
 			.delete(worktreeTreeSnapshots)
 			.where(eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(dir)));
@@ -282,10 +284,10 @@ describe("subagent snapshot hooks record boundaries", () => {
 		expect(message?.treeHashAfter).toBe(row?.treeHashAfter);
 	});
 
-	test("a recorded subagent boundary is restorable, undoing the tool's writes", async () => {
-		// The point of the tree path over per-file replay: the boundary is real bytes,
-		// so restoring it works for a shell command whose writes no input describes.
-		const repo = await createRepo("nf-sa-snap-restore-");
+	test("a recorded subagent boundary holds the bytes from before a shell command", async () => {
+		// The point of the tree path: the boundary is real bytes, so it observes a shell
+		// command whose writes no input describes.
+		const repo = await createRepo("nf-sa-snap-before-");
 		const narratorId = await createSubagent(repo);
 		const session: TreeSnapshotSession = { cwd: repo };
 		const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
@@ -306,8 +308,16 @@ describe("subagent snapshot hooks record boundaries", () => {
 		// A shell command declares nothing, so its owned set is derived from the delta.
 		expect((row?.ownedPathsJson as string[]).sort()).toEqual(["a.txt", "b.txt"]);
 
-		await worktreeTreeSnapshot.restore(repo, beforeHash);
-		expect(await worktreeTreeSnapshot.capture(repo)).toBe(beforeHash);
+		expect(
+			await worktreeTreeSnapshot.readFilePreviewAtTree(
+				repo,
+				beforeHash,
+				"a.txt",
+				LOCAL_DEVICE_ID,
+				4096,
+				{ signal: new AbortController().signal, timeoutMs: 15_000 },
+			),
+		).toEqual({ status: "available", content: "original\n" });
 	});
 
 	test("read-only tools are skipped entirely", async () => {
@@ -522,7 +532,7 @@ describe("subagent snapshot hooks record boundaries", () => {
 			);
 		} finally {
 			warn.mockRestore();
-			await worktreeTreeSnapshot.destroy(link).catch(() => {});
+			rmSync(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, link), { recursive: true, force: true });
 			await db
 				.delete(worktreeTreeSnapshots)
 				.where(eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(link)));
@@ -730,8 +740,8 @@ describe("subagent snapshot hooks record boundaries", () => {
 		const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
-		const previous = settings.chapters.treeSnapshotsEnabled;
-		settings.chapters.treeSnapshotsEnabled = false;
+		const previous = settings.workspace.treeSnapshotsEnabled;
+		settings.workspace.treeSnapshotsEnabled = false;
 		try {
 			const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
 			await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: join(repo, "a.txt") });
@@ -743,7 +753,7 @@ describe("subagent snapshot hooks record boundaries", () => {
 			expect(row?.treeHashAfter).toBeNull();
 			expect(session._lastTreeHash).toBeUndefined();
 		} finally {
-			settings.chapters.treeSnapshotsEnabled = previous;
+			settings.workspace.treeSnapshotsEnabled = previous;
 		}
 
 		// Re-enabled, the same session captures again — the disabled window left no
@@ -827,8 +837,8 @@ describe("subagent snapshot hooks never block the loop", () => {
 			hot.mockRestore();
 			spy.mockRestore();
 			// Kill the promoted background warm-up so the hung mock cannot outlive this
-			// test; destroy() aborts an in-flight warm-up by contract.
-			await worktreeTreeSnapshot.destroy(repo).catch(() => {});
+			// test; a direct capture preempts an in-flight warm-up by contract.
+			await worktreeTreeSnapshot.capture(repo).catch(() => {});
 			resetHotPathCaptureStateForTests();
 		}
 	}, 30_000);

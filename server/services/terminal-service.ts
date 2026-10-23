@@ -1,7 +1,7 @@
 import { readdir } from "node:fs/promises";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, terminals } from "../db/schema";
+import { narrators, terminals } from "../db/schema";
 import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -144,36 +144,29 @@ const activeTerminals = new Map<string, ActiveTerminal>();
  *
  * @param narratorId - Pass `null` if the terminal has no narrator.
  *   Pass `undefined` (or omit) to have the function look up the value from DB.
- * @param chapterId  - Same convention as narratorId.
  */
 async function markTerminalExited(
 	terminalId: string,
 	exitCode: number | null,
 	narratorId?: string | null,
-	chapterId?: string | null,
 ) {
 	await db
 		.update(terminals)
 		.set({ status: "exited", exitCode: exitCode ?? 0 })
 		.where(eq(terminals.id, terminalId));
-	// Resolve narrator/chapter IDs if not provided
+	// Resolve the narrator ID if not provided
 	let nId = narratorId;
-	let cId = chapterId;
-	if (nId === undefined || cId === undefined) {
+	if (nId === undefined) {
 		const row = await db.query.terminals.findFirst({
 			where: eq(terminals.id, terminalId),
-			columns: { narratorId: true, chapterId: true },
+			columns: { narratorId: true },
 		});
-		if (row) {
-			if (nId === undefined) nId = row.narratorId;
-			if (cId === undefined) cId = row.chapterId;
-		}
+		if (row) nId = row.narratorId;
 	}
 	eventBus.emit({
 		type: "terminal:exited",
 		terminalId,
 		narratorId: nId ?? null,
-		chapterId: cId ?? null,
 	});
 }
 
@@ -195,7 +188,6 @@ function monitorAttachProcess(
 	terminalId: string,
 	runtime: TerminalRuntime,
 	narratorId?: string | null,
-	chapterId?: string | null,
 ) {
 	runtime.exited.then(async (code) => {
 		const active = activeTerminals.get(terminalId);
@@ -214,7 +206,7 @@ function monitorAttachProcess(
 		await active.buffer.dispose();
 		activeTerminals.delete(terminalId);
 		runtime.close();
-		await markTerminalExited(terminalId, code ?? 0, narratorId, chapterId);
+		await markTerminalExited(terminalId, code ?? 0, narratorId);
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: code ?? 0 });
 		logger.info("Terminal exited", { terminalId, code });
 	});
@@ -222,7 +214,6 @@ function monitorAttachProcess(
 
 export const terminalService = {
 	async create(opts: {
-		chapterId?: string;
 		narratorId?: string;
 		name?: string;
 		cols?: number;
@@ -236,28 +227,13 @@ export const terminalService = {
 		const rows = opts.rows ?? 24;
 		let cwd: string;
 		let projectId: string | null = null;
-		const chapterId: string | undefined = opts.chapterId;
 		const narratorId: string | undefined = opts.narratorId;
 		const requestedDeviceId = opts.deviceId?.trim();
 		const hasExplicitDevice = requestedDeviceId !== undefined && requestedDeviceId !== "";
 		let deviceId: string | undefined =
 			hasExplicitDevice && requestedDeviceId !== "local" ? requestedDeviceId : undefined;
 
-		if (chapterId && narratorId) {
-			throw new ValidationError("Only one of chapterId or narratorId may be provided");
-		}
-
-		if (chapterId) {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, chapterId),
-			});
-			if (!chapter) throw new NotFoundError("Chapter", chapterId);
-			if (!chapter.worktreePath) {
-				throw new ValidationError("Chapter has no worktree (dormant?)");
-			}
-			projectId = chapter.projectId;
-			cwd = chapter.worktreePath;
-		} else if (narratorId) {
+		if (narratorId) {
 			const narrator = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
 			});
@@ -265,26 +241,7 @@ export const terminalService = {
 			if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
 				deviceId = narrator.defaultDeviceId;
 			}
-			if (narrator.chapterId) {
-				const chapter = await db.query.chapters.findFirst({
-					where: eq(chapters.id, narrator.chapterId),
-				});
-				projectId = chapter?.projectId ?? null;
-				logger.info("Terminal CWD resolution (chapter-bound narrator)", {
-					narratorId,
-					chapterId: narrator.chapterId,
-					chapterFound: !!chapter,
-					worktreePath: chapter?.worktreePath,
-					narratorCwd: narrator.cwd,
-				});
-				if (chapter?.worktreePath) {
-					cwd = chapter.worktreePath;
-				} else {
-					cwd = narrator.cwd ?? getHome();
-				}
-			} else {
-				cwd = narrator.cwd ?? getHome();
-			}
+			cwd = narrator.cwd ?? getHome();
 			if (!cwd || cwd === getHome()) {
 				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
 			}
@@ -410,7 +367,7 @@ export const terminalService = {
 		activeTerminals.set(id, { runtime, terminalId: id, buffer, useDtach });
 
 		if (useDtach) {
-			monitorAttachProcess(id, runtime, narratorId ?? null, chapterId ?? null);
+			monitorAttachProcess(id, runtime, narratorId ?? null);
 		} else {
 			// Direct mode: process exit means the shell exited
 			runtime.exited.then(async (code) => {
@@ -419,7 +376,7 @@ export const terminalService = {
 				await active.buffer.dispose();
 				activeTerminals.delete(id);
 				runtime.close();
-				await markTerminalExited(id, code ?? 0, narratorId ?? null, chapterId ?? null);
+				await markTerminalExited(id, code ?? 0, narratorId ?? null);
 				sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
 				logger.info("Terminal exited", { terminalId: id, code });
 			});
@@ -429,7 +386,6 @@ export const terminalService = {
 			.insert(terminals)
 			.values({
 				id,
-				chapterId: chapterId ?? null,
 				narratorId: narratorId ?? null,
 				name: opts.name ?? "Terminal",
 				cwd,
@@ -440,12 +396,11 @@ export const terminalService = {
 			})
 			.returning();
 
-		logger.info("Terminal created", { id, chapterId, narratorId, useDtach });
+		logger.info("Terminal created", { id, narratorId, useDtach });
 		eventBus.emit({
 			type: "terminal:created",
 			terminalId: id,
 			narratorId: narratorId ?? null,
-			chapterId: chapterId ?? null,
 		});
 		return terminal;
 	},
@@ -497,7 +452,7 @@ export const terminalService = {
 			await buf.deleteFromDisk();
 		}
 
-		await markTerminalExited(terminalId, -1, terminal.narratorId, terminal.chapterId);
+		await markTerminalExited(terminalId, -1, terminal.narratorId);
 
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: -1 });
 		logger.info("Terminal killed", { terminalId });
@@ -519,12 +474,6 @@ export const terminalService = {
 		if (!terminal) throw new NotFoundError("Terminal", id);
 		assertLegacyRuntimeOwner(terminal);
 		return terminal;
-	},
-
-	async listByChapter(chapterId: string) {
-		return db.query.terminals.findMany({
-			where: and(eq(terminals.chapterId, chapterId), isNull(terminals.worktreeResourceId)),
-		});
 	},
 
 	async listByNarrator(narratorId: string) {
@@ -676,7 +625,6 @@ export const terminalService = {
 			// Create DB record for the orphan
 			await db.insert(terminals).values({
 				id,
-				chapterId: null,
 				narratorId: null,
 				name: `Recovered ${id.slice(0, 8)}`,
 				cwd: getHome(),
@@ -736,7 +684,7 @@ export const terminalService = {
 			});
 			for (const terminal of running) {
 				if (terminal.worktreeResourceId != null) continue;
-				await markTerminalExited(terminal.id, null, terminal.narratorId, terminal.chapterId);
+				await markTerminalExited(terminal.id, null, terminal.narratorId);
 			}
 			if (running.length > 0) {
 				logger.info("Marked stale terminals as exited (no dtach)", { count: running.length });
@@ -777,14 +725,14 @@ export const terminalService = {
 				// Clear stale read cursors so next read returns full buffer
 				resetCursorForTerminal(terminal.id);
 
-				monitorAttachProcess(terminal.id, runtime, terminal.narratorId, terminal.chapterId);
+				monitorAttachProcess(terminal.id, runtime, terminal.narratorId);
 
 				recovered++;
 				continue;
 			}
 
 			// Socket dead — mark as exited
-			await markTerminalExited(terminal.id, null, terminal.narratorId, terminal.chapterId);
+			await markTerminalExited(terminal.id, null, terminal.narratorId);
 			marked++;
 		}
 
@@ -840,7 +788,7 @@ export const terminalService = {
 					// Clear stale read cursors so next read returns full buffer
 					resetCursorForTerminal(terminalId);
 
-					monitorAttachProcess(terminalId, runtime, existing.narratorId, existing.chapterId);
+					monitorAttachProcess(terminalId, runtime, existing.narratorId);
 
 					revivedFromExited++;
 				}
@@ -858,16 +806,9 @@ export const terminalService = {
 		}
 	},
 
-	async cleanupForChapter(chapterId: string) {
-		await this._cleanupByField("chapterId", chapterId);
-	},
-
 	async cleanupForNarrator(narratorId: string) {
-		await this._cleanupByField("narratorId", narratorId);
-	},
-
-	async _cleanupByField(field: "chapterId" | "narratorId", value: string) {
-		const col = field === "chapterId" ? terminals.chapterId : terminals.narratorId;
+		const col = terminals.narratorId;
+		const value = narratorId;
 		const matched = await db.query.terminals.findMany({
 			where: and(eq(col, value), isNull(terminals.worktreeResourceId)),
 		});

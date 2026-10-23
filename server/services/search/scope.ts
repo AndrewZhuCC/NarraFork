@@ -6,9 +6,10 @@
  * one of a handful of fixed strings: safe to interpolate and safe to key a cached template
  * on. Filter predicates carry user values, so they come back with `?` placeholders and the
  * values to bind in order; their `key` names only which filters are present. The aliases are
- * the stores' own (`n` narrators, `m` messages, `b` blocks, `c` chapters).
+ * the stores' own (`n` narrators, `m` messages, `b` blocks).
  */
 
+import { narratorProjectIdText } from "../read/acl-sql";
 import { FULL_MESSAGE_SCOPE, type MessageSearchScope, type SearchFilters } from "./types";
 
 /** Stable cache-key fragment for a scope. */
@@ -63,7 +64,7 @@ export function blockScopeSql(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): s
 }
 
 /** Which entity a filter predicate restricts, and so which columns it reads. */
-export type FilterTarget = "chapter" | "narrator" | "message";
+export type FilterTarget = "narrator" | "message";
 
 /** A bound predicate: `sql` has one `?` per entry of `values`, in order. */
 export interface BoundSql {
@@ -75,30 +76,22 @@ export interface BoundSql {
 
 /** Activity time each target's time bounds compare against. */
 const TIME_COLUMN: Record<FilterTarget, string> = {
-	chapter: "COALESCE(c.updated_at, c.created_at)",
 	narrator: "COALESCE(n.last_message_at, n.updated_at, n.created_at)",
 	message: "m.created_at",
 };
 
 /**
- * `AND …` applying {@link SearchFilters} to one target.
- *
- * Chapter targets need `c`; narrator and message targets need `n` and a joined `c` (a LEFT
- * JOIN is fine: a narrator without a chapter simply fails a project or chapter filter).
+ * `AND …` applying {@link SearchFilters} to one target. Both targets need `n`; the project is
+ * resolved by the shared `narratorProjectIdText` rule, so it agrees with the narrator gate.
  */
 export function filterSql(filters: SearchFilters | undefined, target: FilterTarget): BoundSql {
 	const clauses: string[] = [];
 	const values: string[] = [];
 	let key = "";
 	if (filters?.projectId) {
-		clauses.push("c.project_id = ?");
+		clauses.push(`${narratorProjectIdText("n")} = ?`);
 		values.push(filters.projectId);
 		key += "p";
-	}
-	if (filters?.chapterId) {
-		clauses.push(target === "chapter" ? "c.id = ?" : "n.chapter_id = ?");
-		values.push(filters.chapterId);
-		key += "c";
 	}
 	if (filters?.from) {
 		clauses.push(`${TIME_COLUMN[target]} >= ?`);
@@ -110,7 +103,7 @@ export function filterSql(filters: SearchFilters | undefined, target: FilterTarg
 		values.push(filters.to);
 		key += "t";
 	}
-	if (filters?.ownerUserId && target !== "chapter") {
+	if (filters?.ownerUserId) {
 		clauses.push("n.owner_user_id = ?");
 		values.push(filters.ownerUserId);
 		key += "o";

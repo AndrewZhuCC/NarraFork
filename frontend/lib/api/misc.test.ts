@@ -43,14 +43,13 @@ describe("misc APIs", () => {
 			},
 			configurable: true,
 		});
-		await api.searchSections({ q: "中文" }, ["sessions", "knowledge", "chapters"]);
+		await api.searchSections({ q: "中文" }, ["sessions", "knowledge"]);
 		await api.searchSections(
 			{
 				q: "wider",
 				sort: "time",
 				include: ["subagents", "tools"],
 				projectId: "p1",
-				chapterId: "c1",
 				from: "2026-10-01T00:00:00.000Z",
 				mine: true,
 				cursor: "abc",
@@ -58,9 +57,7 @@ describe("misc APIs", () => {
 			},
 			["sessions"],
 		);
-		expect(urls[0]).toContain(
-			"/search?q=%E4%B8%AD%E6%96%87&sections=sessions%2Cknowledge%2Cchapters",
-		);
+		expect(urls[0]).toContain("/search?q=%E4%B8%AD%E6%96%87&sections=sessions%2Cknowledge");
 		for (const absent of ["sort=", "include=", "projectId=", "mine=", "cursor="]) {
 			expect(urls[0]).not.toContain(absent);
 		}
@@ -70,7 +67,6 @@ describe("misc APIs", () => {
 			sort: "time",
 			include: "subagents,tools",
 			projectId: "p1",
-			chapterId: "c1",
 			from: "2026-10-01T00:00:00.000Z",
 			mine: "1",
 			cursor: "abc",

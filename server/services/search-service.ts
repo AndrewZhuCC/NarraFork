@@ -28,17 +28,14 @@ export interface MessageHit {
 }
 
 export interface SearchResult {
-	type: "chapter" | "message" | "narrator" | "knowledge";
+	type: "message" | "narrator" | "knowledge";
 	id: string;
 	title?: string;
 	snippet: string;
-	chapterId?: string;
-	chapterTitle?: string;
 	narratorId?: string;
 	narratorTitle?: string;
 	projectName?: string;
 	status?: string;
-	role?: string;
 	model?: string;
 	messageRole?: string;
 	/** Knowledge hits: the collection the entry lives in. */
@@ -194,7 +191,7 @@ export function sortSearchResults(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The sections the search page shows, in display order. */
-export const SEARCH_SECTIONS = ["sessions", "knowledge", "chapters"] as const;
+export const SEARCH_SECTIONS = ["sessions", "knowledge"] as const;
 export type SearchSection = (typeof SEARCH_SECTIONS)[number];
 
 /**
@@ -204,7 +201,6 @@ export type SearchSection = (typeof SEARCH_SECTIONS)[number];
  */
 const SESSION_AGGREGATE_CAP = 1000;
 const SESSION_TITLE_CAP = 200;
-const CHAPTER_CAP = 100;
 const KNOWLEDGE_CAP = 100;
 /** Hits listed under each session by default; more are paged on request. */
 export const HITS_PER_SESSION = 3;
@@ -233,8 +229,6 @@ export interface SessionResult {
 	narratorType?: string;
 	subagentType?: string;
 	status?: string;
-	chapterId?: string;
-	chapterTitle?: string;
 	projectId?: string;
 	projectName?: string;
 	/** Latest hit, or the session's own last activity when only the title matched. */
@@ -258,7 +252,6 @@ export interface SectionPage<T> {
 export interface SectionSearchResponse {
 	sessions?: SectionPage<SessionResult>;
 	knowledge?: SectionPage<SearchResult>;
-	chapters?: SectionPage<SearchResult>;
 }
 
 /** Opaque page cursor: an offset into the section's ranked window. */
@@ -296,8 +289,6 @@ export interface SessionCandidate {
 	type: string | null;
 	subagentType: string | null;
 	status: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
 	projectId: string | null;
 	projectName: string | null;
 	bestRank: number | null;
@@ -321,8 +312,6 @@ export function mergeSessionCandidates(
 			type: row.type,
 			subagentType: row.subagentType,
 			status: row.status,
-			chapterId: row.chapterId,
-			chapterTitle: row.chapterTitle,
 			projectId: row.projectId,
 			projectName: row.projectName,
 			bestRank: row.bestRank,
@@ -344,8 +333,6 @@ export function mergeSessionCandidates(
 			type: row.type,
 			subagentType: row.subagentType,
 			status: row.status,
-			chapterId: row.chapterId,
-			chapterTitle: row.chapterTitle,
 			projectId: row.projectId,
 			projectName: row.projectName,
 			bestRank: null,
@@ -465,18 +452,6 @@ function entityBase(
 	};
 }
 
-/** The project a knowledge search narrows to: the filter's, or the filtered chapter's. */
-async function knowledgeProjectId(filters: SearchFilters | undefined) {
-	if (filters?.projectId) return filters.projectId;
-	if (!filters?.chapterId) return undefined;
-	const chapter = await db.query.chapters.findFirst({
-		where: (c, { eq }) => eq(c.id, filters.chapterId as string),
-		columns: { projectId: true },
-	});
-	// A chapter that does not exist narrows to a project that does not either.
-	return chapter?.projectId ?? filters.chapterId;
-}
-
 /** Whether an ISO time falls inside the filter's inclusive bounds. */
 function withinTime(time: string | undefined, filters: SearchFilters | undefined): boolean {
 	if (!filters?.from && !filters?.to) return true;
@@ -534,8 +509,6 @@ async function searchSessionSection(
 			narratorType: candidate.type ?? undefined,
 			subagentType: candidate.subagentType ?? undefined,
 			status: candidate.status ?? undefined,
-			chapterId: candidate.chapterId ?? undefined,
-			chapterTitle: candidate.chapterTitle ?? undefined,
 			projectId: candidate.projectId ?? undefined,
 			projectName: candidate.projectName ?? undefined,
 			lastActivityAt: sessionActivityAt(candidate) ?? undefined,
@@ -564,9 +537,8 @@ export const searchService = {
 		if (!safeQuery) return results;
 
 		const strategy = strategyFor(safeQuery);
-		const safeQueryLower = safeQuery.toLowerCase();
-		// One query object for all three entity searches: the viewer travels with it, so a
-		// branch cannot accidentally run ungated.
+		// One query object for every entity search: the viewer travels with it, so a branch
+		// cannot accidentally run ungated.
 		const base = {
 			text: safeQuery,
 			strategy,
@@ -576,26 +548,6 @@ export const searchService = {
 			signal: options.signal,
 			scope,
 		};
-
-		if (entities.includes("chapters")) {
-			// A chapter hit exposes its title, description snippet and project name, so the
-			// backend gates it by the owning project inside the query.
-			for (const row of await searchStore.searchChapters(base)) {
-				results.push({
-					type: "chapter",
-					id: row.id,
-					title: row.title ?? undefined,
-					projectName: row.projectName ?? undefined,
-					status: row.status ?? undefined,
-					role: row.role ?? undefined,
-					createdAt: row.createdAt ?? undefined,
-					updatedAt: row.updatedAt ?? undefined,
-					matchField: row.title?.toLowerCase().includes(safeQueryLower) ? "title" : "description",
-					matchScore: scoreFromRank(row.rank, strategy === "index" ? 760 : 520),
-					snippet: row.snippet || row.description || "",
-				});
-			}
-		}
 
 		if (entities.includes("messages")) {
 			const candidateLimit = messageCandidateLimit(limit);
@@ -608,8 +560,6 @@ export const searchService = {
 					id: row.id,
 					narratorId: row.narratorId ?? undefined,
 					narratorTitle: row.narratorTitle ?? undefined,
-					chapterId: row.chapterId ?? undefined,
-					chapterTitle: row.chapterTitle ?? undefined,
 					projectName: row.projectName ?? undefined,
 					model: row.model ?? undefined,
 					messageRole: row.messageRole ?? undefined,
@@ -637,8 +587,6 @@ export const searchService = {
 					type: "narrator",
 					id: row.id,
 					title: row.title ?? undefined,
-					chapterId: row.chapterId ?? undefined,
-					chapterTitle: row.chapterTitle ?? undefined,
 					projectName: row.projectName ?? undefined,
 					status: row.status ?? undefined,
 					model: row.model ?? undefined,
@@ -656,12 +604,12 @@ export const searchService = {
 	},
 
 	/**
-	 * The search page's sectioned search: sessions, knowledge and chapters, each ranked
-	 * within itself and paged on its own.
+	 * The search page's sectioned search: sessions and knowledge, each ranked within itself
+	 * and paged on its own.
 	 *
 	 * Sessions merge title matches with message hits rolled up per narrator, so a session
-	 * appears once however many of its messages match. Knowledge and chapters keep their
-	 * stores' own order. `cursor` continues a single requested section.
+	 * appears once however many of its messages match. Knowledge keeps its store's own
+	 * order. `cursor` continues a single requested section.
 	 */
 	async searchSections(options: SectionSearchOptions): Promise<SectionSearchResponse> {
 		const safeQuery = sanitizeQuery(options.query);
@@ -681,29 +629,13 @@ export const searchService = {
 						offset,
 						limitOf(section),
 					);
-				} else if (section === "chapters") {
-					const rows = await searchStore.searchChapters({ ...base, limit: CHAPTER_CAP + 1 });
-					const capped = rows.length > CHAPTER_CAP;
-					const results = rows.slice(0, CHAPTER_CAP).map((row) => ({
-						type: "chapter" as const,
-						id: row.id,
-						title: row.title ?? undefined,
-						projectName: row.projectName ?? undefined,
-						status: row.status ?? undefined,
-						role: row.role ?? undefined,
-						createdAt: row.createdAt ?? undefined,
-						updatedAt: row.updatedAt ?? undefined,
-						matchScore: 0,
-						snippet: row.snippet || row.description || "",
-					}));
-					response.chapters = pageOf(results, offset, limitOf(section), capped);
 				} else {
 					const rows = await searchService.searchKnowledge({
 						query: safeQuery,
 						limit: KNOWLEDGE_CAP,
 						sort: base.sort,
 						principal: options.principal,
-						projectId: await knowledgeProjectId(options.filters),
+						projectId: options.filters?.projectId,
 						signal: options.signal,
 					});
 					const results = rows.filter((row) => withinTime(row.updatedAt, options.filters));
@@ -754,7 +686,7 @@ export const searchService = {
 	 *
 	 * Kept separate from `search()` because its visibility gate differs in kind: knowledge
 	 * visibility is a dual-axis (clearance + controlled tag) check that reads grants, so it
-	 * cannot be expressed as a SQL fragment the way the narrator/project gates are. The
+	 * cannot be expressed as a SQL fragment the way the narrator gate is. The
 	 * matched rows are post-filtered by `knowledgeService.filterReadable`, which
 	 * fails closed — the same gate the knowledge routes use.
 	 *

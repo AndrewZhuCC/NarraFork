@@ -205,9 +205,8 @@ export function bindNativeDropPreview(
  * Two requirements pull in opposite directions, which is why this is not a plain
  * `elementFromPoint(...) === root` test:
  *
- *  - Overlapping surfaces must not BOTH act on one drop (a detached canvas panel
- *    can sit on top of a chapter node's dock, and rect containment is true for
- *    both). So ordering has to be respected: only the frontmost surface wins.
+ *  - Overlapping surfaces must not BOTH act on one drop (rect containment is true
+ *    for both). So ordering has to be respected: only the frontmost surface wins.
  *  - Elements that are not surfaces at all must be transparent to the test. The
  *    concrete bug: @dnd-kit's `<DragOverlay>` is `position: fixed` and follows the
  *    pointer, so the topmost element at the release point is the drag ghost, not
@@ -350,9 +349,8 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			// its own stale hit-test. The result is the same panel in both places, which
 			// is what "the target got it but the original is still there" was.
 			//
-			// DOM hit-testing rather than comparing rects: surfaces overlap on the
-			// story-network canvas (a detached node can sit on top of a chapter node's
-			// dock), and rect containment would be true for both. But the topmost
+			// DOM hit-testing rather than comparing rects: when surfaces overlap, rect
+			// containment would be true for both. But the topmost
 			// element is often NOT a surface (a drag ghost rides under the pointer), so
 			// the whole stack is consulted and non-surface layers are skipped — see
 			// `isTopmostSurface`.

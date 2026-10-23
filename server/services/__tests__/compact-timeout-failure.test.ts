@@ -16,7 +16,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { chapters, narratorMessages, narrators, projects } from "../../db/schema";
+import { narratorMessages, narrators, projects } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -67,21 +67,11 @@ function seed(): void {
 	db.insert(projects)
 		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "ch1",
-			projectId: "p1",
-			title: "Chapter",
-			branch: "chapter/ch1",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
 	db.insert(narrators)
 		.values({
 			id: NARRATOR_ID,
-			chapterId: "ch1",
+			contextProjectId: "p1",
+			cwd: "/tmp/repo",
 			type: "primary",
 			inheritMode: "fresh",
 			createdAt: now,

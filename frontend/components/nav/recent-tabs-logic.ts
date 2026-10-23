@@ -86,9 +86,6 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "project") {
 		return pathname === `/projects/${tab.id}`;
 	}
-	if (tab.type === "chapter") {
-		return tab.narratorId ? pathname === `/narrators/${tab.narratorId}` : false;
-	}
 	if (tab.type === "workspace") {
 		return pathname === `/narrators/workspace/${tab.id}`;
 	}

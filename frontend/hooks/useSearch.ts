@@ -3,11 +3,7 @@ import { api, type SearchRequest, type SearchSectionName } from "../lib/api";
 import { searchParams } from "../lib/api/misc";
 
 /** Sections the overview ("All" tab) loads, in display order. */
-export const SEARCH_SECTION_ORDER: readonly SearchSectionName[] = [
-	"sessions",
-	"knowledge",
-	"chapters",
-];
+export const SEARCH_SECTION_ORDER: readonly SearchSectionName[] = ["sessions", "knowledge"];
 /** Items per section on the overview. */
 export const SEARCH_OVERVIEW_LIMIT = 5;
 /** Items per page inside one section's tab. */

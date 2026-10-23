@@ -1,5 +1,6 @@
 import { runtimePolicyForContext } from "@server/services/agent-runtime/policy";
 import { SUBAGENT_SEND_ASYNC_ONLY_ERROR } from "@server/services/subagent-communication-policy";
+import { cleanAssistantText } from "@shared/citations";
 import { z } from "zod/v4";
 import type { AgentConfig, ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
@@ -285,13 +286,17 @@ async function sendToUser(
 		};
 	}
 	if (!raw.user?.trim()) return { output: "Error: user is required.", isError: true };
-	if (!raw.message?.trim()) return { output: "Error: message is required.", isError: true };
+	// Native search's internal citation markers only resolve to links in assistant text,
+	// where the provider's annotations carry the URLs; inside a tool argument they are
+	// bare noise to the reader.
+	const message = cleanAssistantText(raw.message ?? "").text;
+	if (!message.trim()) return { output: "Error: message is required.", isError: true };
 	try {
 		const { sendAsBot } = await import("@server/services/bot-chat");
 		const result = await sendAsBot({
 			narratorId: ctx.narratorId,
 			user: raw.user,
-			message: raw.message,
+			message,
 		});
 		return {
 			output: `Delivered to ${result.username}. A reply, if any, arrives as their next message.`,

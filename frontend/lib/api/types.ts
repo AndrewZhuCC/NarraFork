@@ -207,7 +207,7 @@ export interface LearningSearchResponse {
 }
 
 /** Sections of the global search page, in display order. */
-export type SearchSectionName = "sessions" | "knowledge" | "chapters";
+export type SearchSectionName = "sessions" | "knowledge";
 
 /** One page of a search section. */
 export interface SearchSectionPage<T> {
@@ -236,8 +236,6 @@ export interface SessionSearchResult {
 	narratorType?: string;
 	subagentType?: string;
 	status?: string;
-	chapterId?: string;
-	chapterTitle?: string;
 	projectId?: string;
 	projectName?: string;
 	lastActivityAt?: string;
@@ -247,9 +245,9 @@ export interface SessionSearchResult {
 	score: number;
 }
 
-/** A knowledge entry or chapter hit. */
+/** A knowledge entry hit. */
 export interface EntitySearchResult {
-	type: "knowledge" | "chapter";
+	type: "knowledge";
 	id: string;
 	title?: string;
 	snippet: string;
@@ -265,7 +263,6 @@ export interface SearchSectionsResponse {
 	sections: {
 		sessions?: SearchSectionPage<SessionSearchResult>;
 		knowledge?: SearchSectionPage<EntitySearchResult>;
-		chapters?: SearchSectionPage<EntitySearchResult>;
 	};
 }
 
@@ -281,7 +278,6 @@ export interface SearchRequest {
 	/** Content added to the default scope: subagents, system, tools, archived. */
 	include?: readonly string[];
 	projectId?: string;
-	chapterId?: string;
 	/** Inclusive ISO bounds. */
 	from?: string;
 	to?: string;
@@ -414,7 +410,6 @@ export interface DatabaseStorageBreakdown {
 export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
-	| "chapterBound"
 	| "runningTerminal"
 	| "backgroundRunning"
 	| "nonArchived"
@@ -459,7 +454,6 @@ export interface DatabaseCleanupApiRequestSample extends FallbackDiagnostics {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
 	createdAt: string;
 	approxBytes: number;
 }

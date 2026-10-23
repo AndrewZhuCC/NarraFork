@@ -7,7 +7,6 @@ import {
 	canonicalWorkspaceAdmissionTarget,
 	createLifecycleGuard,
 	type LifecycleGuardPorts,
-	legacyDeletionTargets,
 	type ResourceClaim,
 	ResourceProtectionError,
 	revalidateLifecycleTarget,
@@ -35,17 +34,6 @@ function latch() {
 }
 
 describe("explicit deletion effects and identity contexts", () => {
-	test("legacy deletion helper returns only actual checkout and shadow effects", () => {
-		expect(legacyDeletionTargets(null, { checkout: true, shadow: true })).toEqual([]);
-		expect(legacyDeletionTargets(target.path, { checkout: false, shadow: false })).toEqual([]);
-		expect(legacyDeletionTargets(target.path, { checkout: true, shadow: false })).toEqual([
-			{ deviceId: "local", path: target.path },
-		]);
-		expect(legacyDeletionTargets(target.path, { checkout: false, shadow: true })).toEqual([
-			{ deviceId: "local", shadowKey: treeSnapshotKey("local", target.path) },
-			{ deviceId: "local", path: treeSnapshotPhysicalDir("local", target.path) },
-		]);
-	});
 	test("identity context permits shared use without reading inventory", async () => {
 		const { ports } = fixture();
 		ports.pathIdentity = async () => "device:inode";
@@ -248,7 +236,6 @@ describe("read-only lifecycle protection", () => {
 		["ordinary cwd", { kind: "narrator", id: "cwd", path: "/real/worktree/src" }],
 		["ordinary ancestor cwd", { kind: "narrator", id: "cwd", path: "/real" }],
 		["receipt", { kind: "receipt", id: "pending", path: "/real/worktree" }],
-		["other chapter", { kind: "chapter", id: "shared", path: "/real/worktree" }],
 	] satisfies Array<[string, ResourceClaim]>) {
 		test(`${name} protects without selecting or registering an owner`, async () => {
 			const { guard } = fixture([claim]);
@@ -258,66 +245,19 @@ describe("read-only lifecycle protection", () => {
 			});
 		});
 	}
-	test("dormant shadow owns its reference and storage, not its former checkout", async () => {
-		const { guard } = fixture([
-			{ kind: "chapter", id: "dormant", shadowKey: "local\0/real/worktree" },
-		]);
-		expect((await guard.inspect([target], "checkout remove")).status).toBe("clear");
-		expect(
-			(
-				await guard.inspect(
-					legacyDeletionTargets(target.path, {
-						checkout: false,
-						shadow: true,
-					}),
-					"shadow destroy",
-				)
-			).status,
-		).toBe("protected");
-		expect(
-			(
-				await guard.inspect(
-					[
-						{
-							path: treeSnapshotPhysicalDir("local", target.path),
-						},
-					],
-					"physical shadow remove",
-				)
-			).status,
-		).toBe("protected");
-	});
 	test("ordinary checkout cwd is not a claim on shadow storage", async () => {
 		const { guard } = fixture([{ kind: "narrator", id: "cwd", path: target.path }]);
 		expect(
 			(
 				await guard.inspect(
-					legacyDeletionTargets(target.path, {
-						checkout: false,
-						shadow: true,
-					}),
-					"shadow destroy",
-				)
-			).status,
-		).toBe("clear");
-	});
-	test("shadow aliases match references without inventing checkout ownership", async () => {
-		const { guard } = fixture([
-			{ kind: "chapter", id: "old-alias", shadowKey: "local\0/alias/worktree" },
-		]);
-		expect((await guard.inspect([target], "checkout remove")).status).toBe("clear");
-		expect(
-			(
-				await guard.inspect(
 					[
-						{
-							shadowKey: treeSnapshotKey("local", target.path),
-						},
+						{ deviceId: "local", shadowKey: treeSnapshotKey("local", target.path) },
+						{ deviceId: "local", path: treeSnapshotPhysicalDir("local", target.path) },
 					],
 					"shadow destroy",
 				)
 			).status,
-		).toBe("protected");
+		).toBe("clear");
 	});
 	test("same-repository inventory outside project gitPath protects project deletion", async () => {
 		const { guard } = fixture([
@@ -355,7 +295,6 @@ describe("read-only lifecycle protection", () => {
 			const result = await guard.inspect(
 				reason === "empty target" ? [{}] : [target],
 				"delete",
-				undefined,
 				controller.signal,
 			);
 			expect(result).toMatchObject({ status: "unavailable", complete: false });
@@ -381,21 +320,10 @@ describe("read-only lifecycle protection", () => {
 		expect(includeLegacy).toEqual([false, true, true]);
 	});
 
-	test("cold shadow initialization does not treat lineage projections as direct physical owners", async () => {
-		const shadowKey = treeSnapshotKey("local", target.path);
+	test("cold shadow initialization still refuses a direct physical owner", async () => {
 		const physical = treeSnapshotPhysicalDir("local", target.path);
-		const { guard } = fixture([{ kind: "chapter", id: "lineage", shadowKey }]);
-		expect(
-			await guard.withShadowCreationReservation(
-				{ deviceId: "local", path: physical },
-				async () => "created",
-			),
-		).toBe("created");
-		// The same lineage remains a hard pin for both real physical and logical deletion.
-		for (const deletion of [{ path: physical }, { shadowKey }])
-			expect((await guard.inspect([deletion], "destroy")).status).toBe("protected");
-		for (const kind of ["chapter", "narrator", "registry"] as const) {
-			const direct = fixture([{ kind, id: "direct-D-owner", path: physical, shadowKey }]);
+		for (const kind of ["narrator", "registry"] as const) {
+			const direct = fixture([{ kind, id: "direct-D-owner", path: physical }]);
 			await expect(
 				direct.guard.withShadowCreationReservation(
 					{ deviceId: "local", path: physical },
@@ -487,11 +415,8 @@ describe("read-only lifecycle protection", () => {
 });
 
 describe("Git-root compatibility requires positive identity proof", () => {
-	test("repo-root chapter/cwd does not own a distinct linked child worktree", async () => {
-		const { ports } = fixture([
-			{ kind: "chapter", id: "root", path: "/real" },
-			{ kind: "narrator", id: "root-session", path: "/real" },
-		]);
+	test("repo-root cwd does not own a distinct linked child worktree", async () => {
+		const { ports } = fixture([{ kind: "narrator", id: "root-session", path: "/real" }]);
 		ports.probeGitRoot = async (path) => ({ root: path, common: "/real/.git" });
 		expect(
 			(await createLifecycleGuard(ports).inspect([target], "remove legacy child")).status,

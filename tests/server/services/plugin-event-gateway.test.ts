@@ -74,8 +74,8 @@ describe("PluginEventGateway", () => {
 			await expect(
 				gateway.subscribe({
 					pluginId: "plugin.test",
-					topics: ["narrafork.chapter.created", "narrafork.chapter.lifecycle"],
-					filter: { topic: ["narrafork.chapter.created"] },
+					topics: ["narrafork.narrator.lifecycle", "narrafork.narrator.attention"],
+					filter: { topic: ["narrafork.narrator.lifecycle"] },
 					invocationScope: { projectId: "project-1" },
 					scope: { projectId: "project-2" },
 				}),
@@ -94,8 +94,23 @@ describe("PluginEventGateway", () => {
 			await expect(
 				gateway.subscribe({
 					pluginId: "plugin.test",
-					topics: ["narrafork.chapter.created"],
+					topics: ["narrafork.narrator.lifecycle"],
 					filter: { topic: ["narrafork.unknown.changed"] as never },
+				}),
+			).rejects.toThrow("INVALID_SUBSCRIPTION");
+
+			// Chapter topics and the chapter filter were removed with chapters.
+			await expect(
+				gateway.subscribe({
+					pluginId: "plugin.test",
+					topics: ["narrafork.chapter.created"] as never,
+				}),
+			).rejects.toThrow("INVALID_SUBSCRIPTION");
+			await expect(
+				gateway.subscribe({
+					pluginId: "plugin.test",
+					topics: ["narrafork.narrator.lifecycle"],
+					filter: { chapterIds: ["chapter-1"] } as never,
 				}),
 			).rejects.toThrow("INVALID_SUBSCRIPTION");
 		} finally {
@@ -110,16 +125,16 @@ describe("PluginEventGateway", () => {
 		try {
 			await gateway.subscribe({
 				pluginId: "plugin.test",
-				topics: ["narrafork.chapter.created"],
-				filter: { projectIds: ["project-1"] },
+				topics: ["narrafork.narrator.lifecycle"],
+				filter: { narratorIds: ["narrator-1"] },
 				onEvent: (event) => {
-					received.push(String(event.data.chapterId));
+					received.push(String(event.data.narratorId));
 				},
 			});
-			bus.emit({ type: "chapter:created", chapterId: "chapter-1", projectId: "project-1" });
-			bus.emit({ type: "chapter:created", chapterId: "chapter-2", projectId: "project-2" });
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-1", status: "working" });
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-2", status: "working" });
 			await eventually(() => received.length === 1);
-			expect(received).toEqual(["chapter-1"]);
+			expect(received).toEqual(["narrator-1"]);
 		} finally {
 			gateway.close();
 		}
@@ -179,11 +194,7 @@ describe("PluginEventGateway", () => {
 					received.push(event);
 				},
 			});
-			bus.emit({
-				type: "chapter:files_changed",
-				chapterId: "chapter-1",
-				worktreePath: "/secret/path",
-			});
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-1", status: "idle" });
 			bus.emit({ type: "narrator:message", narratorId: "narrator-1", role: "assistant" });
 			await eventually(() => received.length === 1);
 			expect(JSON.stringify(received[0])).not.toContain("contentJson");
@@ -204,13 +215,13 @@ describe("PluginEventGateway", () => {
 		try {
 			const subscription = await gateway.subscribe({
 				pluginId: "plugin.test",
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 				onEvent: (event) => {
-					received.push(String(event.data.chapterId));
+					received.push(String(event.data.narratorId));
 				},
 			});
 			expect(gateway.unsubscribe(subscription.subscriptionId)).toBe(true);
-			bus.emit({ type: "chapter:created", chapterId: "chapter-1", projectId: "project-1" });
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-1", status: "working" });
 			await sleep(20);
 			expect(received).toEqual([]);
 			expect(gateway.poll(subscription.subscriptionId)).toEqual([]);
@@ -230,11 +241,11 @@ describe("PluginEventGateway", () => {
 		try {
 			const subscription = await gateway.subscribe({
 				pluginId: "plugin.test",
-				topics: ["narrafork.chapter.commits.changed"],
+				topics: ["narrafork.narrator.lifecycle"],
 			});
 			const started = performance.now();
-			bus.emit({ type: "chapter:commits_updated", chapterId: "chapter-1", newCount: 1 });
-			bus.emit({ type: "chapter:commits_updated", chapterId: "chapter-2", newCount: 2 });
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-1", status: "working" });
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-2", status: "working" });
 			expect(performance.now() - started).toBeLessThan(20);
 			await sleep(25);
 			const events = gateway.poll(subscription.subscriptionId, 10);
@@ -285,12 +296,12 @@ describe("PluginEventGateway", () => {
 		try {
 			await gateway.subscribe({
 				pluginId: "plugin.first",
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			});
 			await expect(
 				gateway.subscribe({
 					pluginId: "plugin.second",
-					topics: ["narrafork.chapter.created"],
+					topics: ["narrafork.narrator.lifecycle"],
 				}),
 			).rejects.toThrow("SUBSCRIPTION_QUOTA_EXCEEDED");
 			expect(gateway.getDiagnostics().at(-1)).toMatchObject({
@@ -321,18 +332,18 @@ describe("PluginEventGateway", () => {
 				pluginId: "plugin.test",
 				runtimeId: "runtime-1",
 				generation: 3,
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			});
 			allowed = false;
-			bus.emit({ type: "chapter:created", chapterId: "chapter-1", projectId: "project-1" });
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-1", status: "working" });
 			await sleep(20);
 			expect(gateway.poll(subscription.subscriptionId)).toEqual([]);
 			allowed = true;
 			const second = await gateway.subscribe({
 				pluginId: "plugin.test",
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			});
-			bus.emit({ type: "chapter:created", chapterId: "chapter-2", projectId: "project-1" });
+			bus.emit({ type: "narrator:status_changed", narratorId: "narrator-2", status: "working" });
 			await sleep(20);
 			expect(gateway.disablePlugin("plugin.test")).toBe(2);
 			expect(gateway.poll(second.subscriptionId)).toEqual([]);

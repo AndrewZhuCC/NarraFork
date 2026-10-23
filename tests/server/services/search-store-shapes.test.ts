@@ -16,7 +16,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import {
-	chapters,
 	knowledgeCollections,
 	knowledgeEntries,
 	narratorMessageRefs,
@@ -29,7 +28,7 @@ import { createSqliteSearchQueryExecutor } from "../../../server/services/search
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { ensureFts } = await import("../../../server/db/fts");
 ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
@@ -54,21 +53,6 @@ searchApp.route("/api/search", searchRoutes);
 
 const NOW = "2026-07-19T00:00:00.000Z";
 const ADMIN = { userId: "shape-admin", isAdmin: true };
-
-function seedChapter(id: string, title: string, description: string) {
-	db.insert(chapters)
-		.values({
-			id,
-			projectId: "proj-shape",
-			title,
-			description,
-			branch: `chapter/${id}`,
-			baseBranch: "main",
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
-}
 
 function seedMessage(id: string, seq: number, text: string) {
 	db.insert(narratorMessages)
@@ -97,11 +81,10 @@ beforeEach(() => {
 			updatedAt: NOW,
 		})
 		.run();
-	seedChapter("chap-shape", "Zephyr calibration harness", "描述充电流程与电池温度监控");
 	db.insert(narrators)
 		.values({
 			id: "narr-shape",
-			chapterId: "chap-shape",
+			contextProjectId: "proj-shape",
 			type: "primary",
 			inheritMode: "fresh",
 			visibility: "public",
@@ -118,7 +101,6 @@ afterEach(() => {
 		"narrator_message_refs",
 		"narrator_messages",
 		"narrators",
-		"chapters",
 		"projects",
 		"knowledge_entries",
 		"knowledge_collections",
@@ -128,15 +110,14 @@ afterEach(() => {
 	sqlite.run("PRAGMA foreign_keys = ON");
 });
 
-type TimeEntity = "chapters" | "messages" | "narrators";
-const TIME_ENTITIES: TimeEntity[] = ["chapters", "messages", "narrators"];
+type TimeEntity = "messages" | "narrators";
+const TIME_ENTITIES: TimeEntity[] = ["messages", "narrators"];
 const TIME_VIEWER = { userId: "shape-viewer", isAdmin: false };
 
 function seedNarrator(id: string) {
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: "chap-shape",
 			type: "primary",
 			inheritMode: "fresh",
 			visibility: "public",
@@ -153,24 +134,11 @@ function seedTimeCorpus(entity: TimeEntity) {
 	const newTime = "2026-09-01T00:00:00.000Z";
 	const seed = (suffix: string, time: string, hidden = false) => {
 		const id = `${entity}-${suffix}`;
-		if (entity === "chapters") {
-			db.insert(chapters)
-				.values({
-					id,
-					projectId: hidden ? "proj-time-private" : "proj-shape",
-					title: text,
-					description: text,
-					branch: `chapter/${id}`,
-					baseBranch: "main",
-					createdAt: oldTime,
-					updatedAt: time,
-				})
-				.run();
-		} else if (entity === "narrators") {
+		if (entity === "narrators") {
 			db.insert(narrators)
 				.values({
 					id,
-					chapterId: "chap-shape",
+					contextProjectId: "proj-shape",
 					title: text,
 					type: "primary",
 					inheritMode: "fresh",
@@ -197,20 +165,10 @@ function seedTimeCorpus(entity: TimeEntity) {
 				.run();
 		}
 	};
-	db.insert(projects)
-		.values({
-			id: "proj-time-private",
-			name: "Private time corpus",
-			gitPath: "/tmp/proj-time-private",
-			visibility: "private",
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
 	db.insert(narrators)
 		.values({
 			id: "narr-time-private",
-			chapterId: "chap-shape",
+			contextProjectId: "proj-shape",
 			type: "primary",
 			inheritMode: "fresh",
 			visibility: "private",
@@ -234,7 +192,6 @@ async function searchTimeStore(entity: TimeEntity, query: string, sort?: "time" 
 		viewer: TIME_VIEWER,
 		sort,
 	};
-	if (entity === "chapters") return searchStore.searchChapters(options);
 	if (entity === "messages") return searchStore.searchMessages(options);
 	return searchStore.searchNarrators(options);
 }
@@ -265,11 +222,10 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 					).map((r) => r.id),
 				).toEqual(newest);
 
-				// Over HTTP, messages surface as their sessions (one narrator per seeded hit) and
-				// chapters as themselves. Narrator titles join sessions too, but a session's
-				// activity is its last message, which this corpus pins elsewhere on purpose.
-				const section =
-					entity === "chapters" ? "chapters" : entity === "messages" ? "sessions" : null;
+				// Over HTTP, messages surface as their sessions (one narrator per seeded hit).
+				// Narrator titles join sessions too, but a session's activity is its last
+				// message, which this corpus pins elsewhere on purpose.
+				const section = entity === "messages" ? "sessions" : null;
 				for (const sort of section ? ["time", "relevance", "invalid", undefined] : []) {
 					const params = new URLSearchParams({ q: query, sections: section ?? "", limit: "2" });
 					if (sort !== undefined) params.set("sort", sort);
@@ -280,8 +236,7 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 					};
 					const ids = body.sections[section ?? ""].items.map((r) => r.id);
 					expect(ids).toHaveLength(2);
-					if (sort === "time")
-						expect(ids).toEqual(section === "sessions" ? newest.map((id) => `narr-${id}`) : newest);
+					if (sort === "time") expect(ids).toEqual(newest.map((id) => `narr-${id}`));
 				}
 			});
 		}
@@ -298,7 +253,7 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 					title: "PR chronometer",
 					type: "primary",
 					inheritMode: "fresh",
-					chapterId: "chap-shape",
+					contextProjectId: "proj-shape",
 					visibility: "public",
 					createdAt: time,
 					updatedAt: time,
@@ -349,7 +304,7 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 				createdAt: "2020-01-01",
 			},
 			{
-				type: "chapter" as const,
+				type: "knowledge" as const,
 				id: "z",
 				snippet: "",
 				matchScore: 1,
@@ -417,6 +372,52 @@ describe("global search matches a phrase, the timeline matches prefixes", () => 
 	});
 });
 
+describe("hits name the narrator's own project", () => {
+	// The project shown on a hit is the one the narrator resolves to (here its explicit project);
+	// a narrator without one is still a hit, just without a project name.
+	beforeEach(() => {
+		db.insert(narrators)
+			.values({
+				id: "narr-loose",
+				title: "Zephyr loose session",
+				type: "primary",
+				inheritMode: "fresh",
+				visibility: "public",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(narratorMessages)
+			.values({
+				id: "msg-loose",
+				narratorId: "narr-loose",
+				role: "assistant",
+				contentJson: [{ type: "text", text: "Zephyr loose notes" }],
+				contentText: "Zephyr loose notes",
+				createdAt: NOW,
+			})
+			.run();
+	});
+
+	for (const strategy of ["index", "substring"] as const) {
+		it(`${strategy}: messages and narrators carry the project name, or none`, async () => {
+			const text = strategy === "index" ? "Zephyr" : "Ze";
+			const query = { text, strategy, limit: 10, viewer: ADMIN };
+			const projectOf = (rows: readonly { id: string; projectName: string | null }[]) =>
+				Object.fromEntries(rows.map((row) => [row.id, row.projectName]));
+			expect(projectOf(await searchStore.searchMessages(query))).toEqual({
+				"msg-shape": "Shapes",
+				"msg-loose": null,
+			});
+			sqlite.run("UPDATE narrators SET title = 'Zephyr shaped session' WHERE id = 'narr-shape'");
+			expect(projectOf(await searchStore.searchNarrators(query))).toEqual({
+				"narr-shape": "Shapes",
+				"narr-loose": null,
+			});
+		});
+	}
+});
+
 describe("CJK queries", () => {
 	// Three Han characters form a trigram token, so the index path works on them.
 	it("finds a 3-character CJK term through the index", async () => {
@@ -447,16 +448,6 @@ describe("CJK queries", () => {
 			viewer: ADMIN,
 		});
 		expect(viaSubstring.map((r) => r.id)).toEqual(["msg-shape"]);
-	});
-
-	it("matches a CJK chapter description on the substring path", async () => {
-		const rows = await searchStore.searchChapters({
-			text: "电池",
-			strategy: "substring",
-			limit: 10,
-			viewer: ADMIN,
-		});
-		expect(rows.map((r) => r.id)).toEqual(["chap-shape"]);
 	});
 });
 
@@ -607,7 +598,6 @@ describe("SQLite search executor boundary", () => {
 				excludeEntryIds: ["excluded"],
 			};
 			pending.push(
-				store.searchChapters(entity),
 				store.searchMessages(entity),
 				store.searchNarrators(entity),
 				store.searchTimeline({ ...common, narratorId: "narr-shape", inheritedScopes: [] }),
@@ -632,7 +622,6 @@ describe("SQLite search executor boundary", () => {
 		}
 		expect(operations).toEqual(
 			Array.from({ length: 2 }, () => [
-				"searchChapters",
 				"searchMessages",
 				"searchNarrators",
 				"searchTimeline",
@@ -651,16 +640,16 @@ describe("SQLite search executor boundary", () => {
 		await Promise.resolve();
 		expect(settled).toBe(false);
 		resolve([]);
-		expect(await done).toEqual(Array.from({ length: 18 }, () => []));
+		expect(await done).toEqual(Array.from({ length: 16 }, () => []));
 	});
 
 	it("keeps identical SQL templates bound to each store's own executor", async () => {
 		const first = createSqliteSearchStore(async () => [{ id: "first" }]);
 		const second = createSqliteSearchStore(async () => [{ id: "second" }]);
 		const query = { text: "Zephyr", strategy: "index" as const, limit: 5, viewer: ADMIN };
-		expect((await first.searchChapters(query)).map((row) => row.id)).toEqual(["first"]);
-		expect((await second.searchChapters(query)).map((row) => row.id)).toEqual(["second"]);
-		expect((await first.searchChapters(query)).map((row) => row.id)).toEqual(["first"]);
+		expect((await first.searchNarrators(query)).map((row) => row.id)).toEqual(["first"]);
+		expect((await second.searchNarrators(query)).map((row) => row.id)).toEqual(["second"]);
+		expect((await first.searchNarrators(query)).map((row) => row.id)).toEqual(["first"]);
 	});
 });
 
@@ -721,9 +710,6 @@ describe("real worker transport preserves the search store contract", () => {
 			}
 			for (const strategy of ["index", "substring"] as const) {
 				const query = { text: "Zephyr", strategy, limit: 10, viewer: TIME_VIEWER };
-				expect(await workerStore.searchChapters(query)).toEqual(
-					await searchStore.searchChapters(query),
-				);
 				expect(await workerStore.searchNarrators(query)).toEqual(
 					await searchStore.searchNarrators(query),
 				);
@@ -766,7 +752,6 @@ describe("global search content scope over HTTP", () => {
 		db.insert(narrators)
 			.values({
 				id: "narr-sub",
-				chapterId: "chap-shape",
 				type: "subagent",
 				parentNarratorId: "narr-shape",
 				aclRootNarratorId: "narr-shape",

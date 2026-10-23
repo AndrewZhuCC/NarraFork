@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { getPrompt } from "../../../server/lib/prompts/core";
 import { buildKnowledgeStewardSystemPrompt } from "../../../server/lib/prompts/knowledge-steward";
-import { buildReviewSystemPrompt, getReviewStartMessage } from "../../../server/lib/prompts/review";
 import { getRunDeliveryHint, getSubagentPrompt } from "../../../server/lib/prompts/subagents";
 import {
 	getDynamicSpecSystemReminder,
@@ -15,7 +14,6 @@ describe("model prompt modules", () => {
 	test("fall back to the canonical English prompt for untranslated locales", () => {
 		expect(getPrompt("title", futureLocale)).toBe(getPrompt("title", "en"));
 		expect(getSubagentPrompt("explore", futureLocale)).toBe(getSubagentPrompt("explore", "en"));
-		expect(getReviewStartMessage(futureLocale)).toBe(getReviewStartMessage("en"));
 		expect(buildKnowledgeStewardSystemPrompt(futureLocale)).toBe(
 			buildKnowledgeStewardSystemPrompt("en"),
 		);
@@ -23,7 +21,6 @@ describe("model prompt modules", () => {
 	});
 
 	test("preserves dynamic prompt interpolation", () => {
-		expect(buildReviewSystemPrompt("example diff", "en")).toContain("example diff");
 		// The reminder is handed a resolved path, not a plan identity: the write gate
 		// and ExitPlanMode must name the same file it tells the model to write.
 		expect(getPlanModeSystemReminder("en", ".narrafork/plans/plan-abc123.md", false)).toContain(
@@ -42,14 +39,15 @@ describe("model prompt modules", () => {
 		expect(en).toContain("read-only review follow-up");
 		expect(en).toContain("Read, Glob, Grep");
 		expect(en).toContain("WebSearch");
-		expect(en).toContain("do not call or require ConcludeReview");
+		expect(en).toContain("return the review as your final response");
 		expect(en).not.toContain("run bounded verification");
 		expect(en).not.toContain("focused tests or linters");
-		expect(en).not.toContain("MUST call ConcludeReview");
+		expect(en).not.toContain("ConcludeReview");
 		expect(zh).toContain("只读的 review follow-up");
 		expect(zh).toContain("Read、Glob、Grep");
 		expect(zh).toContain("WebSearch");
-		expect(zh).toContain("不要调用或要求 ConcludeReview");
+		expect(zh).toContain("将审查作为最终回复返回");
+		expect(zh).not.toContain("ConcludeReview");
 		expect(zh).not.toContain("focused tests");
 		expect(zh).not.toContain("linter");
 	});

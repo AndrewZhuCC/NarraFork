@@ -4,7 +4,6 @@ import { act, memo } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import * as narratorHooks from "../../../hooks/useNarrator";
 import {
-	ordinaryPromoteDestination,
 	type UseNarratorForkActionsOptions,
 	type UseNarratorForkActionsResult,
 	useNarratorForkActions,
@@ -70,26 +69,11 @@ afterEach(async () => {
 
 async function render(overrides: Partial<UseNarratorForkActionsOptions> = {}) {
 	await act(async () => {
-		root.render(
-			<Probe
-				narratorId="narrator-a"
-				chapterId={null}
-				onForkFromMessage={undefined}
-				navigateToNarrator={() => {}}
-				{...overrides}
-			/>,
-		);
+		root.render(<Probe narratorId="narrator-a" navigateToNarrator={() => {}} {...overrides} />);
 	});
 }
 
 describe("narrator fork action identity", () => {
-	test("promotion targets the independent narrator URL and missing IDs fail closed", () => {
-		expect(ordinaryPromoteDestination("ordinary-child")).toEqual({
-			to: "/narrators/$narratorId",
-			params: { narratorId: "ordinary-child" },
-		});
-		expect(() => ordinaryPromoteDestination("")).toThrow("missing");
-	});
 	test("inline navigation on unrelated renders does not invalidate memoized rows", async () => {
 		await render();
 		const first = actions.forkHandler;
@@ -137,29 +121,5 @@ describe("narrator fork action identity", () => {
 			narratorId: "narrator-b",
 			forkMessageId: "new-message",
 		});
-	});
-
-	test("chapter sources fork the conversation without invoking legacy resource callbacks", async () => {
-		const host = mock((_id: string) => {});
-		const replacement = mock((_id: string) => {});
-		const navigate = mock((_id: string) => {});
-		await render({ chapterId: "chapter", onForkFromMessage: host, navigateToNarrator: navigate });
-		const first = actions.forkHandler;
-		await render({
-			chapterId: "other-chapter",
-			onForkFromMessage: replacement,
-			navigateToNarrator: navigate,
-		});
-		expect(actions.forkHandler).toBe(first);
-		expect(rowRenders).toBe(1);
-		actions.forkHandler?.("host-message");
-		expect(host).not.toHaveBeenCalled();
-		expect(replacement).not.toHaveBeenCalled();
-		expect(mutate.mock.calls[0]?.[0]).toEqual({
-			narratorId: "narrator-a",
-			forkMessageId: "host-message",
-		});
-		mutate.mock.calls[0]?.[1].onSuccess({ id: "ordinary-child" });
-		expect(navigate).toHaveBeenCalledWith("ordinary-child");
 	});
 });

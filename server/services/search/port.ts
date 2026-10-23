@@ -44,7 +44,6 @@
  */
 
 import type {
-	ChapterSearchRow,
 	EntitySearchQuery,
 	KnowledgeDraftSearchQuery,
 	KnowledgeSearchQuery,
@@ -64,15 +63,6 @@ import type {
 export interface SearchStore {
 	/** Stable name for diagnostics and for the backend-selection test. */
 	readonly backend: string;
-
-	/**
-	 * Chapters, gated by the viewer's access to the owning project.
-	 *
-	 * A chapter hit exposes its title, a description excerpt and the project name, so the
-	 * project gate belongs in the query. A chapter whose project row has vanished must be
-	 * excluded rather than treated as ungated.
-	 */
-	searchChapters(query: EntitySearchQuery): Promise<ChapterSearchRow[]>;
 
 	/** Narrator messages, gated by the viewer's visibility of the owning narrator. */
 	searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]>;

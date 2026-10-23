@@ -7,16 +7,14 @@
  *     the door is open, and a resource inside still needs its own ACL. Tested here
  *     against the kernel so the two halves cannot drift apart.
  *  2. **Public grants read, never write.** Sharing a view of a project must not let
- *     any signed-in user merge into its trunk or delete a chapter.
+ *     any signed-in user change its sessions or settings.
  *  3. **write ≠ manage.** A write member works in the project; deciding who else
  *     may (and deleting the project) is a separate tier.
- *  4. **Chapters inherit wholesale**, because chapter-level isolation would be
- *     fiction on a shared git repository.
- *  5. **No project means no gate, not "unrestricted"** — and a dangling project
+ *  4. **No project means no gate, not "unrestricted"** — and a dangling project
  *     reference fails closed.
- *  6. **The SQL predicate agrees with the row predicate**, or lists would show
+ *  5. **The SQL predicate agrees with the row predicate**, or lists would show
  *     projects that 404 on open.
- *  7. **Knowledge credentials in the shared grant table never read as project
+ *  6. **Knowledge credentials in the shared grant table never read as project
  *     access.**
  *
  * Run: NARRAFORK_ALLOW_MULTIPLE=1 NARRAFORK_HOME=$(mktemp -d) \
@@ -25,12 +23,11 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { and, sql } from "drizzle-orm";
 import { db } from "../../db";
-import { aclGrants, chapters, projects, users } from "../../db/schema";
+import { aclGrants, projects, users } from "../../db/schema";
 import { NotFoundError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { capsCanRead, resolveCaps, withResolvedGate } from "../acl/acl-core";
 import {
-	assertChapterProjectAccess,
 	assertProjectAccess,
 	canManageProject,
 	canReadProject,
@@ -74,21 +71,6 @@ async function makeProject(options: {
 		gitPath: `/tmp/proj-${id}`,
 		ownerUserId: options.ownerUserId ?? null,
 		visibility: options.visibility ?? "private",
-		createdAt: now,
-		updatedAt: now,
-	});
-	return id;
-}
-
-async function makeChapter(projectId: string): Promise<string> {
-	const id = generateId();
-	const now = new Date().toISOString();
-	await db.insert(chapters).values({
-		id,
-		projectId,
-		title: "chapter",
-		branch: `chapter/${generateId(6)}`,
-		baseBranch: "main",
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -233,47 +215,7 @@ describe("assertProjectAccess", () => {
 	});
 });
 
-// ─── 3. Chapters inherit ─────────────────────────────────────────────────
-
-describe("chapters inherit the project verdict", () => {
-	test("a project member reaches its chapters", async () => {
-		const projectId = await makeProject({ ownerUserId: owner });
-		const chapterId = await makeChapter(projectId);
-		await grantProject(projectId, member, "read");
-
-		const result = await assertChapterProjectAccess(chapterId, asUser(member), "read");
-
-		expect(result.projectId).toBe(projectId);
-	});
-
-	test("an outsider does not", async () => {
-		const projectId = await makeProject({ ownerUserId: owner });
-		const chapterId = await makeChapter(projectId);
-
-		await expect(
-			assertChapterProjectAccess(chapterId, asUser(outsider), "read"),
-		).rejects.toBeInstanceOf(NotFoundError);
-	});
-
-	test("a read member cannot perform chapter write operations", async () => {
-		// dormant/delete/merge are project-write, not project-read.
-		const projectId = await makeProject({ ownerUserId: owner });
-		const chapterId = await makeChapter(projectId);
-		await grantProject(projectId, member, "read");
-
-		await expect(
-			assertChapterProjectAccess(chapterId, asUser(member), "write"),
-		).rejects.toBeInstanceOf(NotFoundError);
-	});
-
-	test("an unknown chapter is not found", async () => {
-		await expect(
-			assertChapterProjectAccess("no-such-chapter", asAdmin(), "read"),
-		).rejects.toBeInstanceOf(NotFoundError);
-	});
-});
-
-// ─── 4. The gate ─────────────────────────────────────────────────────────
+// ─── 3. The gate ─────────────────────────────────────────────────────────
 
 describe("resolveProjectGate", () => {
 	test("a member passes read but not write", async () => {
@@ -335,7 +277,7 @@ describe("resolveProjectGate", () => {
 	});
 });
 
-// ─── 5. SQL agreement ────────────────────────────────────────────────────
+// ─── 4. SQL agreement ────────────────────────────────────────────────────
 
 describe("list predicate matches single-row decisions", () => {
 	test("every combination decides the same way in SQL and in memory", async () => {
@@ -393,7 +335,7 @@ describe("list predicate matches single-row decisions", () => {
 	});
 });
 
-// ─── 6. Cross-domain safety ──────────────────────────────────────────────
+// ─── 5. Cross-domain safety ──────────────────────────────────────────────
 
 describe("shared grant table isolation", () => {
 	test("a knowledge credential never reads as project access", async () => {

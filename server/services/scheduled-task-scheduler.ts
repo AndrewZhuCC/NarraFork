@@ -15,7 +15,7 @@ async function tick(): Promise<void> {
 		const due = await scheduledTaskService.listDue();
 		// Fire due tasks concurrently. Each runTask is per-task locked and records its own
 		// failures, and the actual agent loop is dispatched fire-and-forget (not awaited here),
-		// so a slow launch (e.g. waking a dormant chapter's worktree) can't stall the others.
+		// so a slow launch can't stall the others.
 		// allSettled ensures one rejection never aborts the batch.
 		const results = await Promise.allSettled(
 			due.map((task) => scheduledTaskService.runTask(task.id)),

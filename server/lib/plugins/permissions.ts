@@ -61,7 +61,6 @@ export const SCOPE_TYPES = [
 	"user",
 	"project",
 	"workspace",
-	"chapter",
 	"narrator",
 	"provider",
 	"device",
@@ -75,7 +74,6 @@ export const INVOCATION_SCOPE_TYPES = [
 	"user",
 	"project",
 	"workspace",
-	"chapter",
 	"narrator",
 	"provider",
 	"device",
@@ -114,10 +112,39 @@ export const permissionScopeSchema = z
 		}
 	});
 
+/**
+ * Scope types and capabilities that only existed for chapters, chapter reviews and chapter
+ * merges, all of which were removed.
+ *
+ * Plugin grants, pending requests and permanent denials written before that can still be on
+ * disk. Readers drop records naming these instead of rejecting them, because a rejected
+ * record takes down the whole permission file it sits in — and with it every other grant
+ * the plugin holds. No schema in this module accepts the retired scope type any more; the
+ * capability names are still well-formed strings, but nothing grants or serves them.
+ */
+export const RETIRED_SCOPE_TYPES: readonly string[] = ["chapter"];
+export const RETIRED_CAPABILITIES: readonly string[] = [
+	"query.read.chapters",
+	"event.subscribe.chapter",
+	"command.chapter.write",
+	"command.chapter.merge",
+	"command.review.write",
+];
+
+/** Whether a stored permission record names a retired capability or scope type (see above). */
+export function isRetiredPermission(record: { capability?: unknown; scope?: unknown }): boolean {
+	if (typeof record.capability === "string" && RETIRED_CAPABILITIES.includes(record.capability)) {
+		return true;
+	}
+	const scope = record.scope;
+	if (typeof scope !== "object" || scope === null) return false;
+	const type = (scope as { type?: unknown }).type;
+	return typeof type === "string" && RETIRED_SCOPE_TYPES.includes(type);
+}
+
 export type InvocationScope = {
 	userId?: string;
 	projectId?: string;
-	chapterId?: string;
 	workspaceId?: string;
 	narratorId?: string;
 	deviceId?: string;
@@ -128,7 +155,6 @@ export const invocationScopeSchema = z
 	.object({
 		userId: scopeIdSchema.optional(),
 		projectId: scopeIdSchema.optional(),
-		chapterId: scopeIdSchema.optional(),
 		workspaceId: scopeIdSchema.optional(),
 		narratorId: scopeIdSchema.optional(),
 		deviceId: scopeIdSchema.optional(),
@@ -151,7 +177,6 @@ export const CAPABILITY_TAXONOMY = {
 	],
 	query: [
 		"query.read.projects",
-		"query.read.chapters",
 		"query.read.narrators",
 		"query.read.message_summary",
 		"query.read.message_content",
@@ -161,7 +186,6 @@ export const CAPABILITY_TAXONOMY = {
 	],
 	event: [
 		"event.subscribe",
-		"event.subscribe.chapter",
 		"event.subscribe.narrator",
 		"event.subscribe.permission",
 		"event.subscribe.provider",
@@ -182,9 +206,6 @@ export const CAPABILITY_TAXONOMY = {
 		"command.narrator.update_profile",
 		"command.narrator.spec_write",
 		"command.permission.decide",
-		"command.chapter.write",
-		"command.chapter.merge",
-		"command.review.write",
 		"command.routine.write",
 	],
 	provider: ["provider.register", "provider.use", "provider.refresh_catalog"],
@@ -277,12 +298,7 @@ export const KNOWN_CAPABILITIES: readonly string[] = CAPABILITIES;
  * emitted or accepted by capabilitySchema/grant authorization.
  */
 export const LEGACY_CAPABILITY_ALIASES = {
-	"query.chapters.read": "query.read.chapters",
 	"query.projects.read": "query.read.projects",
-	"command.chapters.read": "query.read.chapters",
-	"command.chapters.create": "command.chapter.write",
-	"command.reviews.create": "command.review.write",
-	"event.subscribe.chapter.changed": "event.subscribe.chapter",
 	"storage.workspace.read": "storage.read_self",
 	"storage.workspace.write": "storage.write_self",
 	"provider.models.read": "provider.register",
@@ -309,8 +325,8 @@ export const legacyCapabilityNameSchema = z.enum(legacyCapabilityNames);
  * The alias table is consulted *first* now. When capability names were a closed enum,
  * checking canonical-first was equivalent — an alias could never also be canonical. With
  * open strings every well-formed alias would parse as-is, so canonical-first would silently
- * stop rewriting them and `query.chapters.read` would survive into grants alongside
- * `query.read.chapters` as two distinct capabilities.
+ * stop rewriting them and `query.projects.read` would survive into grants alongside
+ * `query.read.projects` as two distinct capabilities.
  *
  * Returns `undefined` only for malformed names (empty, spaces, uppercase), never for
  * merely-unknown ones.
@@ -371,8 +387,6 @@ export const HIGH_RISK_CAPABILITIES = [
 	"query.read.message_content",
 	"query.read.audit_all",
 	"command.permission.decide",
-	"command.chapter.merge",
-	"command.chapter.write",
 	"secret.use_self",
 	"device.command",
 	"filesystem.workspace.write",

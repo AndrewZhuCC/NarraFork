@@ -37,9 +37,7 @@ let _getToolCallAny: Statement | null = null;
 
 function getNarratorStmt() {
 	if (!_getNarrator) {
-		_getNarrator = sqlite.prepare(
-			"SELECT id, title, chapter_id, model FROM narrators WHERE id = ?",
-		);
+		_getNarrator = sqlite.prepare("SELECT id, title, model FROM narrators WHERE id = ?");
 	}
 	return _getNarrator;
 }
@@ -267,7 +265,6 @@ interface SearchResultItem {
 	id: string;
 	narratorId: string;
 	narratorTitle: string | null;
-	chapterId: string | null;
 	role: string;
 	createdAt: string;
 	snippet: string;
@@ -526,7 +523,6 @@ async function handleSearch(
 		id: row.messageId,
 		narratorId: row.narratorId,
 		narratorTitle: row.narratorTitle,
-		chapterId: row.chapterId,
 		role: row.role,
 		createdAt: row.createdAt,
 		snippet: row.snippet.replace(/\n/g, " ").slice(0, SNIPPET_CHARS),
@@ -540,7 +536,6 @@ async function handleSearch(
 			`- [${r.role}] message ${r.id}` +
 				`  narrator=${r.narratorId}` +
 				(r.narratorTitle ? ` ("${r.narratorTitle}")` : "") +
-				(r.chapterId ? `  chapter=${r.chapterId}` : "") +
 				`  at ${r.createdAt}` +
 				`\n  ${r.snippet}`,
 		);
@@ -583,7 +578,7 @@ function handleReadConversation(
 
 	// Verify narrator exists
 	const narrator = getNarratorStmt().get(targetNarratorId) as
-		| { id: string; title: string | null; chapter_id: string | null; model: string | null }
+		| { id: string; title: string | null; model: string | null }
 		| undefined;
 
 	if (!narrator) {
@@ -668,7 +663,6 @@ function handleReadConversation(
 
 	const header =
 		`Narrator: ${narrator.title ?? targetNarratorId}` +
-		(narrator.chapter_id ? ` (chapter ${narrator.chapter_id})` : "") +
 		(narrator.model ? ` [${narrator.model}]` : "") +
 		`\nShowing ${rows.length} message(s):\n`;
 
@@ -691,7 +685,6 @@ function handleReadConversation(
 			action: "read_conversation",
 			narratorId: targetNarratorId,
 			narratorTitle: narrator.title,
-			chapterId: narrator.chapter_id,
 			model: narrator.model,
 			messages,
 		},

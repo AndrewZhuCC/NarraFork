@@ -18,10 +18,8 @@ export interface NotificationListItem {
 	notificationIds: string[];
 	kind: NotificationKind;
 	projectId: string | null;
-	chapterId: string | null;
 	narratorId: string | null;
 	projectTitle: string | null;
-	chapterTitle: string | null;
 	title: string;
 	preview: string;
 	link: NotificationLink;

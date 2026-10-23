@@ -116,16 +116,6 @@ describe("create() preinstall", () => {
 		expect(narrator.systemPrompt).toBe("custom steward instructions");
 	});
 
-	test("knowledge kind with a chapterId is rejected (must be standalone)", async () => {
-		expect(
-			narratorService.create({
-				kind: "knowledge",
-				chapterId: "some-chapter",
-				creatorIsAdmin: false,
-			}),
-		).rejects.toThrow();
-	});
-
 	test("named + knowledge steward coexist: naming does not clobber the knowledge toolset", async () => {
 		const narrator = await narratorService.create({
 			kind: "knowledge",

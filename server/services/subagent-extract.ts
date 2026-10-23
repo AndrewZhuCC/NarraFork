@@ -63,8 +63,8 @@ type WriteAudience = "owner" | "project" | "public";
 /**
  * Resolve visibility/writeAudience for the extract.
  * Prefer the parent primary's audiences; clamp standalone extracts away from
- * "project" visibility (no chapterId means project resolution has nothing to
- * read). Missing parent → private/owner.
+ * "project" visibility (an extract carries no project, so project resolution has
+ * nothing to read). Missing parent → private/owner.
  */
 async function resolveExtractAudiences(source: {
 	parentNarratorId: string | null;
@@ -79,7 +79,7 @@ async function resolveExtractAudiences(source: {
 		if (parent?.visibility) visibility = parent.visibility as Visibility;
 		if (parent?.writeAudience) writeAudience = parent.writeAudience as WriteAudience;
 	}
-	// Extract is always standalone in v1; project-visible without a chapter is a trap.
+	// Extract is always standalone in v1; project-visible without a project is a trap.
 	if (visibility === "project") visibility = "private";
 	if (writeAudience === "project") writeAudience = "owner";
 	return { visibility, writeAudience };
@@ -174,7 +174,6 @@ export async function extractSubagentToPrimary(
 	const title = opts?.title?.trim() || defaultExtractTitle(source.title, subagentType, locale);
 
 	const workspace = {
-		chapterId: null,
 		cwd: source.cwd ?? null,
 		defaultDeviceId: source.defaultDeviceId ?? null,
 	};
@@ -186,7 +185,6 @@ export async function extractSubagentToPrimary(
 					.insert(narrators)
 					.values({
 						id,
-						chapterId: null,
 						type: "primary",
 						variant: "primary",
 						subagentType: null,

@@ -872,7 +872,6 @@ export async function listQuestionSummaries(args: {
 			resolved: sql<boolean>`${narratorQuestions.resolutionJson} is not null`,
 			questions: sql<string>`case when length(cast(${narratorQuestions.summaryJson} as blob)) <= 16384 and json_valid(${narratorQuestions.summaryJson}) then ${narratorQuestions.summaryJson} when length(cast(${narratorQuestions.questionsJson} as blob)) <= ${QUESTION_SNAPSHOT_MAX_BYTES} and json_valid(${narratorQuestions.questionsJson}) then (select json_group_array(json_object('id', json_extract(value, '$.id'), 'header', substr(json_extract(value, '$.header'), 1, 120))) from json_each(${narratorQuestions.questionsJson}) where key < 4) else '[]' end`,
 			narratorTitle: narrators.title,
-			chapterId: narrators.chapterId,
 		})
 		.from(narratorQuestions)
 		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
@@ -894,7 +893,6 @@ export async function listQuestionSummaries(args: {
 					writeAudience: true,
 					type: true,
 					aclRootNarratorId: true,
-					chapterId: true,
 					contextProjectId: true,
 				},
 			});
@@ -1118,7 +1116,6 @@ export async function supplementAsyncQuestion(
 /** An open question plus the narrator context the global inbox needs to label it. */
 export interface AsyncQuestionWithContext extends AsyncQuestionRecord {
 	narratorTitle: string | null;
-	chapterId: string | null;
 }
 
 /**
@@ -1145,7 +1142,6 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 		.select({
 			question: narratorQuestions,
 			narratorTitle: narrators.title,
-			chapterId: narrators.chapterId,
 			// The ACL columns, so the filter below needs no second query per row.
 			narratorId: narrators.id,
 			ownerUserId: narrators.ownerUserId,
@@ -1172,7 +1168,6 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 				writeAudience: row.writeAudience,
 				type: row.type,
 				aclRootNarratorId: row.aclRootNarratorId,
-				chapterId: row.chapterId,
 				contextProjectId: row.contextProjectId,
 			},
 			principal,
@@ -1181,7 +1176,6 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 		visible.push({
 			...toRecord(row.question),
 			narratorTitle: row.narratorTitle,
-			chapterId: row.chapterId,
 		});
 	}
 

@@ -36,7 +36,7 @@
 
 import { ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
-import { projectReadableSqlFragment } from "../project-acl";
+import { narratorProjectIdText } from "../read/acl-sql";
 import type { SearchStore } from "./port";
 import {
 	type BoundSql,
@@ -55,7 +55,6 @@ import {
 } from "./sqlite-expressions";
 import { executeSqliteSearchQuery, type SearchQueryExecutor } from "./sqlite-worker-runner";
 import {
-	type ChapterSearchRow,
 	type EntitySearchQuery,
 	GLOBAL_SNIPPET,
 	KNOWLEDGE_SNIPPET,
@@ -83,12 +82,12 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Visibility clause for a narrators row aliased `n`, and for a projects row aliased `p`.
+ * Visibility clause for a narrators row aliased `n`.
  *
  * Derived from the shared ACL fragments rather than written here. A local copy drifted once
  * already: it still queried the deprecated `narrator_grants` table after the ACL layer moved
  * to `acl_grants`, which silently hid shared sessions from search. Deriving means the rules —
- * including the project gate — can only change in one place.
+ * including the project gate inside it — can only change in one place.
  *
  * Placeholder counts are derived from the rendered text for the same reason: a hard-coded
  * number silently shifts every later parameter when a fragment changes, and a shifted LIMIT
@@ -96,8 +95,6 @@ import {
  */
 const NARRATOR_GATE_SQL = narratorReadableSqlFragment(false, "n")?.sql ?? "1 = 1";
 const NARRATOR_GATE_PARAMS = (NARRATOR_GATE_SQL.match(/\?/g) ?? []).length;
-const PROJECT_GATE_SQL = projectReadableSqlFragment(false, "p")?.sql ?? "1 = 1";
-const PROJECT_GATE_PARAMS = (PROJECT_GATE_SQL.match(/\?/g) ?? []).length;
 
 /** The user id repeated once per placeholder in a gate clause. */
 function gateParams(userId: string, count: number): string[] {
@@ -161,56 +158,24 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		return { all: (options, ...params) => execute(templateSql, params, options) };
 	}
 
-	/** Columns every chapter hit needs, plus the project name its gate joins for anyway. */
-	const CHAPTER_COLUMNS = `c.id, c.title, substr(c.description, 1, ${PREVIEW_CHARS}) as description, c.status, c.role, c.created_at, c.updated_at,
-			  p.name as project_name`;
+	/**
+	 * The project a hit's narrator resolves to, by the one shared rule (`narratorProjectIdText`).
+	 * The join only supplies the name shown on a hit; it gates nothing (the narrator gate already
+	 * covers the project), so a narrator without a project, or whose project row is gone, is
+	 * still a hit.
+	 */
+	const PROJECT_JOIN = `LEFT JOIN projects p ON p.id = ${narratorProjectIdText("n")}`;
 
 	const MESSAGE_COLUMNS = `m.id, m.narrator_id, substr(m.content_text, 1, ${PREVIEW_CHARS}) as content_preview,
 			  m.role as message_role, m.created_at,
-			  n.chapter_id, n.title as narrator_title, n.model,
-			  c.title as chapter_title, p.name as project_name`;
+			  n.title as narrator_title, n.model, p.name as project_name`;
 
-	const NARRATOR_COLUMNS = `n.id, n.title, n.type, n.subagent_type, n.chapter_id, n.status, n.model,
+	const NARRATOR_COLUMNS = `n.id, n.title, n.type, n.subagent_type, n.status, n.model,
 			  n.message_count, n.last_message_at, n.created_at, n.updated_at,
-			  c.title as chapter_title, c.project_id, p.name as project_name`;
+			  p.id as project_id, p.name as project_name`;
 
 	const KNOWLEDGE_ENTRY_COLUMNS = `e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
 				  e.created_at, e.updated_at`;
-
-	/**
-	 * Chapter search.
-	 *
-	 * `JOIN projects` is an inner join in both strategies, so a chapter whose project row has
-	 * vanished is already excluded — a dangling reference must not read as "no project, therefore
-	 * no gate".
-	 */
-	function chapterStmt(
-		strategy: "index" | "substring",
-		gated: boolean,
-		sort: EntitySearchQuery["sort"],
-		filter: BoundSql,
-	): QueryTemplate {
-		const key = `chapters:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${filter.key}`;
-		return cached(key, () => {
-			const gate = `${gated ? `AND ${PROJECT_GATE_SQL}` : ""} ${filter.sql}`;
-			if (strategy === "index") {
-				return `SELECT ${CHAPTER_COLUMNS},
-			  ${snippetCall("chapters_fts", 1, GLOBAL_SNIPPET)} as snippet,
-			  rank as rank_score
-			 FROM chapters_fts
-			 JOIN chapters c ON c.rowid = chapters_fts.rowid
-			 JOIN projects p ON p.id = c.project_id
-			 WHERE chapters_fts MATCH ? ${gate}
-			 ORDER BY ${sort === "time" ? "COALESCE(c.updated_at, c.created_at) DESC, c.id ASC" : "rank"} LIMIT ?`;
-			}
-			return `SELECT ${CHAPTER_COLUMNS},
-			  substr(COALESCE(c.description, c.title, ''), 1, ${PREVIEW_CHARS}) as snippet
-			 FROM chapters c
-			 JOIN projects p ON p.id = c.project_id
-			 WHERE (c.title LIKE ? OR c.description LIKE ?) ${gate}
-			 ${sort === "time" ? "ORDER BY COALESCE(c.updated_at, c.created_at) DESC, c.id ASC" : ""} LIMIT ?`;
-		});
-	}
 
 	function messageStmt(
 		strategy: "index" | "substring",
@@ -229,8 +194,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 FROM narrator_messages_fts
 			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
 			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 ${PROJECT_JOIN}
 			 WHERE narrator_messages_fts MATCH ? ${gate}
 			 ORDER BY ${sort === "time" ? "m.created_at DESC, m.id ASC" : "rank"} LIMIT ?`;
 			}
@@ -238,8 +202,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			  substr(m.content_text, 1, ${PREVIEW_CHARS}) as snippet
 			 FROM narrator_messages m
 			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 ${PROJECT_JOIN}
 			 WHERE m.content_text LIKE ? ${gate}
 			 ${sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ?`;
 		});
@@ -264,8 +227,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
 			 JOIN narrator_messages m ON m.id = b.message_id
 			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 ${PROJECT_JOIN}
 			 WHERE narrator_blocks_fts MATCH ? ${gate}
 			 ORDER BY ${sort === "time" ? "m.created_at DESC, m.id ASC, b.ordinal ASC" : "rank"} LIMIT ?`;
 		});
@@ -287,8 +249,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			  rank as rank_score
 			 FROM narrators_fts
 			 JOIN narrators n ON n.rowid = narrators_fts.rowid
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 ${PROJECT_JOIN}
 			 WHERE narrators_fts MATCH ? ${gate}
 			 ORDER BY ${sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank"} LIMIT ?`;
 			}
@@ -296,8 +257,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			// the only text this search matches against.
 			return `SELECT ${NARRATOR_COLUMNS}
 			 FROM narrators n
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 ${PROJECT_JOIN}
 			 WHERE n.title LIKE ? ${gate}
 			 ${sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ?`;
 		});
@@ -439,7 +399,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			const scopeFilter = global ? "" : " AND r.narrator_id = ?";
 			if (strategy === "index") {
 				return `SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
-		        n.title AS narrator_title, n.chapter_id,
+		        n.title AS narrator_title,
 		        ${snippetCall("narrator_messages_fts", 0, RECALL_SNIPPET)} AS snippet
 		 FROM narrator_messages_fts
 		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
@@ -449,7 +409,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		 LIMIT ?`;
 			}
 			return `SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
-		        n.title AS narrator_title, n.chapter_id,
+		        n.title AS narrator_title,
 		        substr(m.content_text, 1, ?) AS snippet
 		 FROM narrator_messages m
 		 ${source}
@@ -553,16 +513,13 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
 		const gateValues = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
 		const filter = filterSql(query.filters, "message");
-		const joins = `JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id`;
 		const tail = [...gateValues, ...filter.values, ...extra.values];
 		if (query.strategy !== "index") {
 			return {
 				sql: `WITH per_msg AS (
 				SELECT m.id, m.narrator_id, m.created_at, NULL AS r, NULL AS block_id
 				 FROM narrator_messages m
-				 ${joins}
+				 JOIN narrators n ON n.id = m.narrator_id
 				 WHERE m.content_text LIKE ? ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
 			)`,
 				values: [rawContains(query.text), ...tail],
@@ -574,14 +531,14 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				SELECT m.id, m.narrator_id, m.created_at, narrator_messages_fts.rank AS r, NULL AS block_id
 				 FROM narrator_messages_fts
 				 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
-				 ${joins}
+				 JOIN narrators n ON n.id = m.narrator_id
 				 WHERE narrator_messages_fts MATCH ? ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
 				UNION ALL
 				SELECT m.id, m.narrator_id, m.created_at, narrator_blocks_fts.rank AS r, b.id AS block_id
 				 FROM narrator_blocks_fts
 				 JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
 				 JOIN narrator_messages m ON m.id = b.message_id
-				 ${joins}
+				 JOIN narrators n ON n.id = m.narrator_id
 				 WHERE narrator_blocks_fts MATCH ? ${gate} ${blockScopeSql(query.scope)} ${filter.sql} ${extra.sql}
 			), per_msg AS (
 				SELECT id, narrator_id, MAX(created_at) AS created_at, MIN(r) AS r, MIN(block_id) AS block_id
@@ -621,8 +578,6 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			type: row.type ?? null,
 			subagentType: row.subagent_type ?? null,
 			status: row.status ?? null,
-			chapterId: row.chapter_id ?? null,
-			chapterTitle: row.chapter_title ?? null,
 			projectId: row.project_id ?? null,
 			projectName: row.project_name ?? null,
 			lastMessageAt: row.last_message_at ?? null,
@@ -644,39 +599,6 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	return {
 		backend: "sqlite",
 
-		async searchChapters(query: EntitySearchQuery): Promise<ChapterSearchRow[]> {
-			const gated = !query.viewer.isAdmin;
-			const filter = filterSql(query.filters, "chapter");
-			const stmt = chapterStmt(query.strategy, gated, query.sort, filter);
-			const options = { signal: query.signal, operation: "searchChapters" };
-			const gate = [
-				...(gated ? gateParams(query.viewer.userId, PROJECT_GATE_PARAMS) : []),
-				...filter.values,
-			];
-			const rows: RawRow[] =
-				query.strategy === "index"
-					? await stmt.all(options, phraseExpr(query.text), ...gate, query.limit)
-					: await stmt.all(
-							options,
-							rawContains(query.text),
-							rawContains(query.text),
-							...gate,
-							query.limit,
-						);
-			return rows.map((row) => ({
-				id: row.id,
-				title: row.title ?? null,
-				description: row.description ?? null,
-				status: row.status ?? null,
-				role: row.role ?? null,
-				projectName: row.project_name ?? null,
-				createdAt: row.created_at ?? null,
-				updatedAt: row.updated_at ?? null,
-				snippet: row.snippet ?? "",
-				rank: rankOf(row, query.strategy),
-			}));
-		},
-
 		async searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]> {
 			const gated = !query.viewer.isAdmin;
 			const filter = filterSql(query.filters, "message");
@@ -692,8 +614,6 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				id: row.id,
 				narratorId: row.narrator_id ?? null,
 				narratorTitle: row.narrator_title ?? null,
-				chapterId: row.chapter_id ?? null,
-				chapterTitle: row.chapter_title ?? null,
 				projectName: row.project_name ?? null,
 				model: row.model ?? null,
 				messageRole: row.message_role ?? null,
@@ -737,8 +657,6 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				title: row.title ?? null,
 				type: row.type ?? null,
 				subagentType: row.subagent_type ?? null,
-				chapterId: row.chapter_id ?? null,
-				chapterTitle: row.chapter_title ?? null,
 				projectId: row.project_id ?? null,
 				projectName: row.project_name ?? null,
 				status: row.status ?? null,
@@ -763,13 +681,11 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				 FROM per_msg GROUP BY narrator_id
 			)
 			SELECT agg.narrator_id, agg.best_rank, agg.hit_count, agg.last_hit_at,
-				  n.title, n.type, n.subagent_type, n.status, n.chapter_id, n.last_message_at,
-				  n.created_at, n.updated_at,
-				  c.title AS chapter_title, c.project_id, p.name AS project_name
+				  n.title, n.type, n.subagent_type, n.status, n.last_message_at,
+				  n.created_at, n.updated_at, p.id AS project_id, p.name AS project_name
 			 FROM agg
 			 JOIN narrators n ON n.id = agg.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 ${PROJECT_JOIN}
 			 ORDER BY ${order}
 			 LIMIT ?`,
 				[...cte.values, query.limit],
@@ -802,8 +718,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 FROM ranked
 			 JOIN narrator_messages m ON m.id = ranked.id
 			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 ${PROJECT_JOIN}
 			 WHERE ranked.rn > ? AND ranked.rn <= ?
 			 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
 				[...cte.values, ...snippet.values, offset, offset + query.perSession],
@@ -813,8 +728,6 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				id: row.id,
 				narratorId: row.narrator_id ?? null,
 				narratorTitle: row.narrator_title ?? null,
-				chapterId: row.chapter_id ?? null,
-				chapterTitle: row.chapter_title ?? null,
 				projectName: row.project_name ?? null,
 				model: row.model ?? null,
 				messageRole: row.message_role ?? null,
@@ -888,7 +801,6 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				messageId: row.id,
 				narratorId: row.narrator_id,
 				narratorTitle: row.narrator_title ?? null,
-				chapterId: row.chapter_id ?? null,
 				role: row.role,
 				createdAt: row.created_at,
 				snippet: row.snippet ?? "",

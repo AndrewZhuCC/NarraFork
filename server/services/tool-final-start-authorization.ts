@@ -1,6 +1,13 @@
 import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
-import { aclGrants, chapters, narrators, narratorToolCalls, projects, users } from "../db/schema";
+import {
+	aclGrants,
+	narratorProjectLinks,
+	narrators,
+	narratorToolCalls,
+	projects,
+	users,
+} from "../db/schema";
 import type { AgentConfig, ToolCallBinding } from "../lib/agent/types";
 import {
 	measureSerializedCharacters,
@@ -62,27 +69,27 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 			: row;
 	if (!judged) throw new Error("Final authorization ACL root no longer exists");
 	const rows = row.id === judged.id ? [row] : [row, judged];
-	const chapterIds = rows.flatMap((entry) => (entry.chapterId ? [entry.chapterId] : []));
-	const chapterRows = chapterIds.length
-		? db
-				.select({ id: chapters.id, projectId: chapters.projectId, role: chapters.role })
-				.from(chapters)
-				.where(inArray(chapters.id, chapterIds))
-				.orderBy(asc(chapters.id))
-				.limit(3)
-				.all()
-		: [];
+	// Same rule as `resolveNarratorProjectId`, read synchronously: the explicit project,
+	// else the primary link of the project index.
+	const projectIdOf = (entry: (typeof rows)[number]): string | null =>
+		entry.contextProjectId ??
+		db
+			.select({ projectId: narratorProjectLinks.projectId })
+			.from(narratorProjectLinks)
+			.where(
+				and(
+					eq(narratorProjectLinks.narratorId, entry.id),
+					eq(narratorProjectLinks.role, "primary"),
+				),
+			)
+			.get()?.projectId ??
+		null;
 	const projectIds = [
 		...new Set(
-			rows.flatMap((entry) =>
-				entry.chapterId
-					? chapterRows
-							.filter((chapter) => chapter.id === entry.chapterId)
-							.map((chapter) => chapter.projectId)
-					: entry.contextProjectId
-						? [entry.contextProjectId]
-						: [],
-			),
+			rows.flatMap((entry) => {
+				const projectId = projectIdOf(entry);
+				return projectId ? [projectId] : [];
+			}),
 		),
 	];
 	const projectRows = projectIds.length
@@ -98,7 +105,7 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 				.limit(3)
 				.all()
 		: [];
-	// Two narrator/chapter/project scopes plus global, two principals and three
+	// Two narrator/project scopes plus global, two principals and three
 	// capabilities are bounded by the ACL unique indexes (at most 42 rows).
 	const grants = db
 		.select({
@@ -126,9 +133,6 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 							rows.map((entry) => entry.id),
 						),
 					),
-					chapterIds.length
-						? and(eq(aclGrants.scopeType, "chapter"), inArray(aclGrants.scopeId, chapterIds))
-						: undefined,
 					projectIds.length
 						? and(eq(aclGrants.scopeType, "project"), inArray(aclGrants.scopeId, projectIds))
 						: undefined,
@@ -142,7 +146,7 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 		throw new Error("Final ACL authorization scope exceeds its bounded budget");
 	return {
 		isAdmin: user.role === "admin",
-		revision: JSON.stringify({ user, rows, chapterRows, projectRows, grants }),
+		revision: JSON.stringify({ user, rows, projectRows, grants }),
 	};
 }
 

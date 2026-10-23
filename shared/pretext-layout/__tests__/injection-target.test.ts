@@ -33,7 +33,7 @@ describe("coerceInjectionTarget — accepts well-formed targets", () => {
 		});
 	});
 
-	it("accepts the other three kinds with their own identifiers", () => {
+	it("accepts the other kinds with their own identifiers", () => {
 		expect(coerceInjectionTarget({ kind: "knowledge", entryId: "k1", scope: "personal" })).toEqual({
 			kind: "knowledge",
 			entryId: "k1",
@@ -42,10 +42,6 @@ describe("coerceInjectionTarget — accepts well-formed targets", () => {
 		expect(coerceInjectionTarget({ kind: "spec", uri: "spec://tasks.json" })).toEqual({
 			kind: "spec",
 			uri: "spec://tasks.json",
-		});
-		expect(coerceInjectionTarget({ kind: "chapter", chapterId: "c1" })).toEqual({
-			kind: "chapter",
-			chapterId: "c1",
 		});
 	});
 
@@ -76,7 +72,6 @@ describe("coerceInjectionTarget — refuses everything else", () => {
 			{ kind: "narrator", narratorId: 7 },
 			{ kind: "knowledge" },
 			{ kind: "spec" },
-			{ kind: "chapter" },
 		]) {
 			expect(coerceInjectionTarget(value)).toBeUndefined();
 		}
@@ -84,6 +79,8 @@ describe("coerceInjectionTarget — refuses everything else", () => {
 
 	it("refuses an unknown kind rather than guessing one", () => {
 		expect(coerceInjectionTarget({ kind: "terminal", terminalId: "t1" })).toBeUndefined();
+		// Chapters were removed; a target persisted before that is refused, leaving the row inert.
+		expect(coerceInjectionTarget({ kind: "chapter", chapterId: "c1" })).toBeUndefined();
 		// A future `narrator.v2` must not be silently read as `narrator`.
 		expect(coerceInjectionTarget({ kind: "narrator.v2", narratorId: "n1" })).toBeUndefined();
 	});

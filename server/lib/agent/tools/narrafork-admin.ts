@@ -217,7 +217,7 @@ export const narraforkAdminTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe(
-				"Dot-separated path to a setting key (e.g. 'agent.defaultModel', 'chapters.maxActiveWorktrees'). " +
+				"Dot-separated path to a setting key (e.g. 'agent.defaultModel', 'workspace.treeSnapshotsEnabled'). " +
 					"Required for 'get_setting' and 'reset_setting'.",
 			),
 		value: z

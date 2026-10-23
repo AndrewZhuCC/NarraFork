@@ -12,7 +12,7 @@
  * ------------------------------------
  * Four call sites search text today and they do NOT agree on recall:
  *
- *   - global search (chapters / messages / narrators) matches the whole query as ONE PHRASE;
+ *   - global search (messages / narrators) matches the whole query as ONE PHRASE;
  *   - the narrator timeline and Recall match each whitespace-separated term as a PREFIX;
  *   - knowledge matches prefixes too, but supports any-term matching and a field restriction;
  *   - the substring fallbacks disagree on wildcard escaping: knowledge escapes `%`/`_` typed
@@ -89,7 +89,7 @@ export interface SnippetFormat {
 	readonly tokens: number;
 }
 
-/** Global search (chapter descriptions, message bodies, narrator titles): unmarked excerpt. */
+/** Global search (message bodies, narrator titles): unmarked excerpt. */
 export const GLOBAL_SNIPPET: SnippetFormat = {
 	open: "",
 	close: "",
@@ -144,23 +144,19 @@ export interface EntitySearchQuery {
 	limit: number;
 	viewer: SearchViewer;
 	/** Which conversation content message and narrator hits may come from. Omitted means
-	 *  {@link FULL_MESSAGE_SCOPE}; chapter search ignores it. */
+	 *  {@link FULL_MESSAGE_SCOPE}. */
 	scope?: MessageSearchScope;
 	/** Narrowing filters; values are always bound, never interpolated. */
 	filters?: SearchFilters;
 }
 
 /**
- * Narrowing filters for global search.
- *
- * Each applies where it has a meaning and is ignored elsewhere: chapters have no owner, so
- * `ownerUserId` leaves chapter search alone. Time bounds are inclusive ISO strings compared
- * against the entity's activity time: a message's creation, a narrator's last activity, a
- * chapter's last update.
+ * Narrowing filters for global search. Time bounds are inclusive ISO strings compared against
+ * the entity's activity time: a message's creation, a narrator's last activity.
  */
 export interface SearchFilters {
+	/** The narrator's project, by the `resolveNarratorProjectId` rule. */
 	projectId?: string;
-	chapterId?: string;
 	from?: string;
 	to?: string;
 	/** Only narrators this user owns. */
@@ -311,25 +307,11 @@ export interface ShadowedEntryQuery {
 // Rows
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface ChapterSearchRow {
-	id: string;
-	title: string | null;
-	description: string | null;
-	status: string | null;
-	role: string | null;
-	projectName: string | null;
-	createdAt: string | null;
-	updatedAt: string | null;
-	snippet: string;
-	rank: RelevanceRank;
-}
-
 export interface MessageSearchRow {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
+	/** Name of the narrator's project (the `resolveNarratorProjectId` rule), if it has one. */
 	projectName: string | null;
 	model: string | null;
 	messageRole: string | null;
@@ -351,9 +333,9 @@ export interface NarratorSearchRow {
 	title: string | null;
 	type: string | null;
 	subagentType: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
+	/** The narrator's project id, by the same rule as {@link MessageSearchRow.projectName}. */
 	projectId: string | null;
+	/** See {@link MessageSearchRow.projectName}. */
 	projectName: string | null;
 	status: string | null;
 	model: string | null;
@@ -375,8 +357,6 @@ export interface SessionAggregateRow {
 	type: string | null;
 	subagentType: string | null;
 	status: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
 	projectId: string | null;
 	projectName: string | null;
 	lastMessageAt: string | null;
@@ -400,7 +380,6 @@ export interface RecallMessageRow {
 	messageId: string;
 	narratorId: string;
 	narratorTitle: string | null;
-	chapterId: string | null;
 	role: string;
 	createdAt: string;
 	snippet: string;

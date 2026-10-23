@@ -2,7 +2,11 @@ import {
 	CANONICAL_CAPABILITY_DESCRIPTORS,
 	type CanonicalCapabilityId,
 } from "@shared/integrations/capabilities";
-import { type ResourceScope, resourceScopeSchema } from "@shared/integrations/resources";
+import {
+	type ResourceScope,
+	resourceScopeSchema,
+	resourceTypeIsCanonical,
+} from "@shared/integrations/resources";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db";
@@ -178,6 +182,21 @@ function inspectBoundedJson(
 		throw new ValidationError(`${field} exceeds ${maxBytes} bytes`);
 	}
 	return JSON.parse(serialized) as Record<string, unknown>;
+}
+
+/**
+ * Whether a stored grant row can still be expressed in the current catalog.
+ *
+ * Rows naming a capability or resource type that has since been removed (the chapter,
+ * chapter-merge and review capabilities, scoped to `chapter`) can outlive the removal.
+ * Every reader parses rows strictly, so one such row would make the whole authority fail
+ * to load. They grant nothing now and are left out; the next grant replacement revokes them.
+ */
+function isDescribableGrant(grant: IntegrationCapabilityGrant): boolean {
+	return (
+		grant.capabilityId in CANONICAL_CAPABILITY_DESCRIPTORS &&
+		(grant.scopeType === "global" || resourceTypeIsCanonical(grant.scopeType))
+	);
 }
 
 function normalizeScope(scope: ResourceScope): ResourceScope {
@@ -600,7 +619,7 @@ export class IntegrationAuthorityService {
 				"INTEGRATION_GRANT_LIMIT_EXCEEDED",
 			);
 		}
-		return { authority, grants };
+		return { authority, grants: grants.filter(isDescribableGrant) };
 	}
 
 	async requireSnapshot(
