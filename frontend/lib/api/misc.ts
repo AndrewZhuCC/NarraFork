@@ -38,6 +38,7 @@ import type {
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
+	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
 	OpencodeUsageCache,
 	PublicCodexQuotaOverview,
@@ -1432,6 +1433,10 @@ export const miscApi = {
 		request<DatabaseCleanupExecutionResult>("/storage/database/cleanup", {
 			method: "POST",
 			body: JSON.stringify(data),
+		}),
+	clearLegacyRequestDumps: () =>
+		request<LegacyRequestDumpClearResult>("/storage/database/legacy-request-dumps/clear", {
+			method: "POST",
 		}),
 	vacuumDatabase: () =>
 		request<DatabaseVacuumResult>("/storage/database/vacuum", {

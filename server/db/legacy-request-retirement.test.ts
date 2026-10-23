@@ -124,9 +124,14 @@ describe("populated legacy request storage upgrade", () => {
 				.run();
 			orm.delete(narrators).where(eq(narrators.id, "deleted-session")).run();
 			expect(orm.select().from(apiRequests).where(eq(apiRequests.id, "old")).get()).toBeUndefined();
+			// The repair tables and indexes are dropped now; only the column rewrites wait.
 			expect(
-				database.prepare("SELECT request_id FROM usage_token_repair_candidates").get(),
-			).toEqual({ request_id: "old" });
+				database
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE name GLOB '*token_repair*' AND sql IS NOT NULL",
+					)
+					.all(),
+			).toEqual([]);
 			expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
 			const ledger = database.prepare("SELECT hash, created_at FROM __drizzle_migrations").all();
 			expect(
@@ -164,8 +169,11 @@ const [path, folder] = process.argv.slice(2);
 const db = new Database(path);
 db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=250; PRAGMA cache_size=-16000; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456; PRAGMA wal_autocheckpoint=1000;");
 const size = () => { try { return statSync(path + "-wal").size; } catch { return 0; } };
+// Only the bounded presence probe may name the payload column; table/index drops are cheap.
+const PRESENCE_PROBE = /^SELECT 1 FROM api_requests WHERE raw_dump_json IS NOT NULL LIMIT 1$/;
 const guard = (sql) => {
-  if (/\b(DROP|ALTER|UPDATE|DELETE|VACUUM|REPLACE)\b/i.test(sql) ||
+  if (PRESENCE_PROBE.test(sql.trim())) return;
+  if (/\b(ALTER|UPDATE|DELETE|VACUUM|REPLACE)\b/i.test(sql) ||
       /\b(COUNT|SUM|AVG|length|raw_dump_json)\b/i.test(sql)) {
     throw new Error("Unexpected physical cleanup or payload/aggregate read in retirement");
   }

@@ -246,37 +246,43 @@ describe("session cleanup read workers", () => {
 		}, 30_000);
 	}
 
-	test("over-budget plan fails before sending either worker task or deleting any root", async () => {
+	function spyOnMaintenance(): void {
+		spyOn(realDbModule.databaseMaintenance, "checkpoint").mockReturnValue(supported({ ok: true }));
+		spyOn(realDbModule.databaseMaintenance, "refreshPlannerStatistics").mockReturnValue(
+			supported({ ok: true }),
+		);
+	}
+
+	test("over-budget plan skips worker statistics but still previews and deletes", async () => {
 		seedNarrator("n".repeat(SESSION_PREVIEW_MAX_ID_LENGTH + 1));
 		forbidMainThreadPayloadReads();
+		spyOnMaintenance();
 		const shared = spyOn(pool, "runReadTask");
 		const ephemeral = spyOn(pool, "runEphemeralReadTask");
 		const remove = spyOn(narratorService, "remove").mockResolvedValue(undefined);
-		for (const request of [
-			() => databaseCleanupService.previewCleanup("archivedSessions"),
-			() => databaseCleanupService.executeCleanup("archivedSessions"),
-		]) {
-			await expect(request()).rejects.toMatchObject({
-				statusCode: 413,
-				code: "DATABASE_CLEANUP_PREVIEW_BUDGET_EXCEEDED",
-			});
-		}
+		const preview = await databaseCleanupService.previewCleanup("archivedSessions");
+		expect(preview.counts.sessions).toBe(1);
+		expect(preview.counts.narrators).toBe(1);
+		expect(preview.approxBytes).toBe(0);
+		expect(preview.warningCodes).toEqual(["deletesUsageHistory", "statisticsUnavailable"]);
+		const result = await databaseCleanupService.executeCleanup("archivedSessions");
+		expect(result.changed).toBe(true);
+		expect(result.warningCodes).toContain("statisticsUnavailable");
+		expect(remove).toHaveBeenCalledTimes(1);
 		expect(shared).not.toHaveBeenCalled();
 		expect(ephemeral).not.toHaveBeenCalled();
-		expect(remove).not.toHaveBeenCalled();
 	});
 
-	test("both workers unavailable rejects preview with 503 and never scans synchronously", async () => {
+	test("both workers unavailable degrades preview statistics and never scans synchronously", async () => {
 		seedNarrator("archived");
 		const mainReads = forbidMainThreadPayloadReads();
 		spyOn(pool, "runReadTask").mockRejectedValue(new pool.WorkersUnavailableError("disabled"));
 		const ephemeral = spyOn(pool, "runEphemeralReadTask").mockRejectedValue(
 			new Error("spawn failed"),
 		);
-		await expect(databaseCleanupService.previewCleanup("archivedSessions")).rejects.toMatchObject({
-			statusCode: 503,
-			code: "DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
-		});
+		const preview = await databaseCleanupService.previewCleanup("archivedSessions");
+		expect(preview.counts.sessions).toBe(1);
+		expect(preview.warningCodes).toContain("statisticsUnavailable");
 		expect(ephemeral).toHaveBeenCalledTimes(1);
 		expect(mainReads.mock.calls.every(([sql]) => !/\bSUM\b/i.test(sql))).toBe(true);
 	});
@@ -310,10 +316,7 @@ describe("session cleanup read workers", () => {
 		seedNarrator("archived");
 		forbidMainThreadPayloadReads();
 		const remove = spyOn(narratorService, "remove").mockResolvedValue(undefined);
-		spyOn(realDbModule.databaseMaintenance, "checkpoint").mockReturnValue(supported({ ok: true }));
-		spyOn(realDbModule.databaseMaintenance, "refreshPlannerStatistics").mockReturnValue(
-			supported({ ok: true }),
-		);
+		spyOnMaintenance();
 		const run = pool.runReadTask;
 		let release!: () => void;
 		let started!: () => void;
@@ -364,10 +367,9 @@ describe("session cleanup read workers", () => {
 					return result;
 				},
 			);
-			await expect(databaseCleanupService.executeCleanup(target)).rejects.toMatchObject({
-				statusCode: 409,
-				code: "DATABASE_CLEANUP_PLAN_CHANGED",
-			});
+			const result = await databaseCleanupService.executeCleanup(target);
+			expect(result.skippedSessions).toBe(1);
+			expect(result.changed).toBe(false);
 			expect(remove).not.toHaveBeenCalled();
 			expect(sqlite.prepare("SELECT id FROM narrators WHERE id='root'").get()).toEqual({
 				id: "root",
@@ -375,17 +377,65 @@ describe("session cleanup read workers", () => {
 		}, 30_000);
 	}
 
-	test("cleanup refuses deletion when re-preview workers fail", async () => {
+	test("cleanup still deletes when statistics workers fail", async () => {
 		seedNarrator("archived");
 		forbidMainThreadPayloadReads();
+		spyOnMaintenance();
 		const remove = spyOn(narratorService, "remove").mockResolvedValue(undefined);
 		spyOn(pool, "runReadTask").mockRejectedValue(new pool.WorkersUnavailableError("disabled"));
 		spyOn(pool, "runEphemeralReadTask").mockRejectedValue(new Error("spawn failed"));
-		await expect(databaseCleanupService.executeCleanup("archivedSessions")).rejects.toMatchObject({
-			statusCode: 503,
-		});
-		expect(remove).not.toHaveBeenCalled();
+		const result = await databaseCleanupService.executeCleanup("archivedSessions");
+		expect(result.changed).toBe(true);
+		expect(result.warningCodes).toContain("statisticsUnavailable");
+		expect(remove).toHaveBeenCalledWith("archived");
 	});
+
+	test("cleanup re-checks each root right before removing it", async () => {
+		seedNarrator("first");
+		seedNarrator("second");
+		forbidMainThreadPayloadReads();
+		spyOnMaintenance();
+		const removed: string[] = [];
+		spyOn(narratorService, "remove").mockImplementation(async (id: string) => {
+			removed.push(id);
+			// While the first removal awaits, the second session is resumed.
+			sqlite.run("UPDATE narrators SET status='running' WHERE id='second'");
+		});
+		const result = await databaseCleanupService.executeCleanup("archivedSessions");
+		expect(removed).toEqual(["first"]);
+		expect(result.skippedSessions).toBe(1);
+		expect(result.changed).toBe(true);
+	}, 30_000);
+
+	test("stale preview caps blocked samples like narrator samples", async () => {
+		for (let i = 0; i < 12; i++) seedNarrator(`busy-${i}`, "running");
+		const preview = await databaseCleanupService.previewCleanup("staleSessions", {
+			sampleLimit: 25,
+		});
+		expect(preview.blockedCount).toBe(0);
+		for (let i = 0; i < 12; i++) {
+			sqlite.run("INSERT INTO terminals VALUES (?, ?, 'running')", [`t-${i}`, `idle-${i}`]);
+			seedNarrator(`idle-${i}`, "idle");
+		}
+		const blocked = await databaseCleanupService.previewCleanup("staleSessions", {
+			sampleLimit: 25,
+		});
+		expect(blocked.blockedCount).toBe(12);
+		expect(blocked.blocked).toHaveLength(10);
+	}, 30_000);
+
+	test("clears retained legacy request dumps in batches and reports them gone", async () => {
+		spyOnMaintenance();
+		const insert = sqlite.prepare("INSERT INTO api_requests VALUES (?, NULL, ?)");
+		for (let i = 0; i < 70; i++) insert.run(`dump-${i}`, i % 7 === 0 ? null : "x".repeat(1024));
+		const result = await databaseCleanupService.clearLegacyRequestDumps();
+		expect(result.cleared).toBe(60);
+		expect(result.restartRequired).toBe(true);
+		expect(
+			sqlite.prepare("SELECT 1 FROM api_requests WHERE raw_dump_json IS NOT NULL").get(),
+		).toBeNull();
+		expect(sqlite.prepare("SELECT COUNT(*) AS n FROM api_requests").get()).toEqual({ n: 70 });
+	}, 30_000);
 
 	test("pool shutdown does not start an ephemeral reader during maintenance", async () => {
 		seedNarrator("archived");

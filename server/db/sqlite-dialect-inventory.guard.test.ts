@@ -385,6 +385,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 		"the SQLite maintenance adapter: `PRAGMA wal_checkpoint`/`optimize`, freelist pages, `VACUUM`, `SQLITE_BUSY` classification — none of which a server-managed engine exposes",
 	],
 	["server/db/run-migrations.ts", "applies the SQLite migration SQL in `drizzle/`"],
+	[
+		"server/db/legacy-request-storage.ts",
+		"finishes SQLite migration 0207's deferred column drops and clears its retained dumps",
+	],
 	["server/db/migrate.ts", "the `bun run db:migrate` entry point: opens the file and applies SQL"],
 	["server/db/ensure-columns.ts", "patches columns on SQLite databases from older versions"],
 	[
@@ -448,6 +452,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
 	"server/db/migrate.ts": ["connectionModule"],
+	// Deferred half of SQLite migration 0207; rowid batches clear dumps in one ordered pass.
+	"server/db/legacy-request-storage.ts": ["driver", "pragma", "sqliteCatalog", "rowid"],
 	"server/db/run-migrations.ts": [
 		"driver",
 		"pragma",

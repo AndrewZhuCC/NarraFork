@@ -21,6 +21,12 @@ import {
 	renderModelHistoryRevisionSqlV1,
 	renderModelHistoryRevisionSqlV2,
 } from "../services/agent-runtime/model-history-revision-sql";
+import {
+	completeDeferredLegacyRequestRetirement,
+	hasRetainedLegacyRequestDump,
+	LEGACY_REQUEST_RETIREMENT_RECEIPT_PREFIX,
+	retireLegacyRequestStorage,
+} from "./legacy-request-storage";
 
 const FILESYSTEM_MIGRATIONS_FOLDER = "./drizzle";
 
@@ -859,8 +865,8 @@ function isRecordedMigration(
 }
 
 // The complete published 0207 program, not a filename/timestamp/column-name heuristic.
-// Keep the asset unchanged. Populated upgrade databases record logical retirement separately;
-// obsolete nullable/defaulted columns and tables can remain without being read by the runtime.
+// Keep the asset unchanged. When request dumps are retained, only its column drops wait; see
+// legacy-request-storage.ts for the deferred half and how it is completed.
 const LEGACY_REQUEST_DUMP_DROP_SQL = [
 	"PRAGMA foreign_keys=OFF;",
 	"DROP TABLE `usage_token_repair_candidates`;",
@@ -875,6 +881,10 @@ const LEGACY_REQUEST_DUMP_DROP_SQL = [
 
 /** Identify only the complete published program, never a filename or schema heuristic. */
 function legacyRequestRetirementReceipt(statements: readonly string[]): string | null {
+	// Cheap length gate first: this runs for every unrecorded migration on every startup.
+	let nonBlank = 0;
+	for (const statement of statements) if (statement.trim()) nonBlank++;
+	if (nonBlank !== LEGACY_REQUEST_DUMP_DROP_SQL.length) return null;
 	const normalized = statements.map(normalizeMigrationSql).filter(Boolean);
 	if (
 		normalized.length !== LEGACY_REQUEST_DUMP_DROP_SQL.length ||
@@ -882,19 +892,10 @@ function legacyRequestRetirementReceipt(statements: readonly string[]): string |
 	) {
 		return null;
 	}
-	// A separate receipt, NOT the original migration hash: physical cleanup has NOT run.
+	// A separate receipt, NOT the original migration hash: the column drops have NOT run.
 	// Normalized content binds the receipt to this exact program across LF/CRLF builds.
 	const digest = createHash("sha256").update(normalized.join("\n")).digest("hex");
-	return `narrafork:0207-logical-retirement:v1:${digest}`;
-}
-
-/** No payload reads, counts or cleanup on the upgrade path, even for multi-GB tables. */
-function hasLegacyRequestRows(sqlite: Database): boolean {
-	return ["api_requests", "usage_token_repair_candidates", "usage_token_repair_jobs"].some(
-		(table) =>
-			tableExists(sqlite, table) &&
-			sqlite.prepare(`SELECT 1 FROM "${table}" LIMIT 1`).get() !== null,
-	);
+	return `${LEGACY_REQUEST_RETIREMENT_RECEIPT_PREFIX}${digest}`;
 }
 
 /**
@@ -908,8 +909,9 @@ function hasLegacyRequestRows(sqlite: Database): boolean {
  *
  * Behavior:
  * - A migration whose hash is already recorded is skipped (idempotent no-op).
- * - Exact 0207 on populated legacy tables records a versioned logical-retirement receipt,
- *   not its original hash. No physical cleanup runs; subsequent starts recognize that receipt.
+ * - Exact 0207 while request dumps are retained drops its tables and indexes but defers the
+ *   column drops, recording a versioned receipt instead of its original hash. Subsequent starts
+ *   recognize that receipt, and `runMigrations` finishes the drops once the dumps are cleared.
  * - A destructive migration in a hole below the applied journal high-water mark, whose
  *   dropped tables all exist, is "already effective but unstamped": only record its hash.
  * - The exact official model-history v1 migration, proven fully installed in this transaction,
@@ -992,7 +994,8 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 			for (const { migration, index } of pending) {
 				const statements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
 				const retirementReceipt = legacyRequestRetirementReceipt(statements);
-				const deferPhysicalCleanup = retirementReceipt !== null && hasLegacyRequestRows(sqlite);
+				const deferPhysicalCleanup =
+					retirementReceipt !== null && hasRetainedLegacyRequestDump(sqlite);
 				let recordedHash = migration.hash;
 				const migrationStarted = performance.now();
 				activeMigration = { migrationIndex: index, folderMillis: migration.folderMillis };
@@ -1022,8 +1025,9 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					droppedTables.every((table) => tableExists(sqlite, table));
 
 				if (deferPhysicalCleanup && retirementReceipt) {
-					// Do not run any of 0207's drops, even when this is a historical hole.
-					// Retain data and physical schema; no automatic job silently cleans them later.
+					// Cheap drops now, even in a historical hole; the column rewrites wait for the
+					// dumps to be cleared rather than copying them during the upgrade.
+					retireLegacyRequestStorage(sqlite);
 					recordedHash = retirementReceipt;
 					logger.info("Legacy request storage logically retired; physical cleanup deferred", {
 						folderMillis: migration.folderMillis,
@@ -1854,6 +1858,9 @@ export async function runMigrations(sqlite: Database): Promise<{
 		// so a database whose `__drizzle_migrations` was polluted by a branch/version with
 		// larger migration timestamps still gets every unapplied migration (issue #5769).
 		applyPendingMigrationsByHash(sqlite, resolved.folder);
+		if (completeDeferredLegacyRequestRetirement(sqlite)) {
+			logger.info("Completed deferred legacy request storage cleanup");
+		}
 		repairMissingSpecTables(sqlite);
 		// Run one-time data backfills gated on the pre-migration snapshot. Safe to
 		// run from both the standalone `db:migrate` process and server startup —

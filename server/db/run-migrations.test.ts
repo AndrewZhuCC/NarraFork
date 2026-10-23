@@ -13,6 +13,10 @@ import {
 	renderModelHistoryRevisionSqlV1,
 } from "../services/agent-runtime/model-history-revision-sql";
 import {
+	clearLegacyRequestDumpBatch,
+	completeDeferredLegacyRequestRetirement,
+} from "./legacy-request-storage";
+import {
 	applyPendingMigrationsByHash,
 	repairMissingSpecTables,
 	runMigrations,
@@ -1575,17 +1579,24 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 					.join("--> statement-breakpoint"),
 			],
 		]) {
-			test(`retains populated storage with a distinct ${variant} compatibility receipt`, () => {
+			test(`retains dumps with a distinct ${variant} compatibility receipt`, () => {
 				sqlite = createLegacyRequestDatabase();
 				const folder = migrationsFolderWith(tag, [sql]);
 				const originalRows = sqlite.prepare("SELECT * FROM api_requests ORDER BY id").all();
 				const originalSchema = sqlite
 					.prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
-					.all();
+					.all()
+					.filter(
+						(row) =>
+							!/^(?:sqlite_autoindex_)?(?:usage_token_repair_|idx_api_requests_token_repair_)/.test(
+								(row as { name: string }).name,
+							),
+					);
 				const run = spyOn(sqlite, "run");
 				try {
 					applyPendingMigrationsByHash(sqlite, folder);
-					expect(migrationCalls(run.mock.calls)).toEqual([]);
+					// The cheap table/index drops run now; only the column rewrites wait.
+					expect(migrationCalls(run.mock.calls)).toEqual(officialStatements.slice(1, 5));
 					expect(sqlite.prepare("SELECT * FROM api_requests ORDER BY id").all()).toEqual(
 						originalRows,
 					);
@@ -1645,17 +1656,56 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			"usage_token_repair_jobs",
 			"usage_token_repair_candidates",
 		]) {
-			test(`defers all drops when only ${table} contains a row`, () => {
+			test(`runs the full migration when only ${table} has a row without a dump`, () => {
 				sqlite = createLegacyRequestDatabase(false);
 				sqlite.run(`INSERT INTO ${table} (id) VALUES ('retained')`);
 				applyPendingMigrationsByHash(sqlite, migrationsFolderWith(tag, [officialSql]));
-				expect(sqlite.prepare(`SELECT id FROM ${table}`).all()).toEqual([{ id: "retained" }]);
-				expect(columnNames(sqlite, "api_requests")).toContain("raw_dump_json");
+				expectLegacyColumnsRemoved(sqlite);
 				expect(sqlite.prepare("SELECT hash FROM __drizzle_migrations").get()).toEqual({
-					hash: receipt,
+					hash: createHash("sha256").update(officialSql).digest("hex"),
 				});
 			});
 		}
+
+		test("defers only the column drops while a dump is retained", () => {
+			sqlite = createLegacyRequestDatabase(false);
+			sqlite.run("INSERT INTO api_requests (id, raw_dump_json) VALUES ('retained', 'dump')");
+			applyPendingMigrationsByHash(sqlite, migrationsFolderWith(tag, [officialSql]));
+			expect(columnNames(sqlite, "api_requests")).toContain("raw_dump_json");
+			expect(indexExists(sqlite, "idx_api_requests_token_repair_pending")).toBe(false);
+			expect(indexExists(sqlite, "idx_api_requests_token_repair_reviewed")).toBe(false);
+			expect(
+				sqlite
+					.prepare("SELECT name FROM sqlite_master WHERE name GLOB 'usage_token_repair_*'")
+					.all(),
+			).toEqual([]);
+			expect(sqlite.prepare("SELECT hash FROM __drizzle_migrations").get()).toEqual({
+				hash: receipt,
+			});
+		});
+
+		test("a later startup finishes the deferred column drops once dumps are cleared", () => {
+			sqlite = createLegacyRequestDatabase();
+			const folder = migrationsFolderWith(tag, [officialSql]);
+			applyPendingMigrationsByHash(sqlite, folder);
+			// Still retained: nothing to finish, and nothing is rewritten.
+			expect(completeDeferredLegacyRequestRetirement(sqlite)).toBe(false);
+			expect(columnNames(sqlite, "api_requests")).toContain("raw_dump_json");
+			let cursor = 0;
+			for (;;) {
+				const batch = clearLegacyRequestDumpBatch(sqlite, cursor, 1);
+				if (!batch) break;
+				expect(batch.cleared).toBe(1);
+				cursor = batch.lastRowid;
+			}
+			expect(completeDeferredLegacyRequestRetirement(sqlite)).toBe(true);
+			expectLegacyColumnsRemoved(sqlite);
+			expectRetainedData(sqlite);
+			// Idempotent: nothing left to do on the next start, and the receipt still counts.
+			expect(completeDeferredLegacyRequestRetirement(sqlite)).toBe(false);
+			applyPendingMigrationsByHash(sqlite, folder);
+			expect(stampedHashes(sqlite)).toBe(1);
+		});
 
 		test("rolls back the compatibility receipt when a later migration fails", () => {
 			sqlite = createLegacyRequestDatabase();
@@ -1780,12 +1830,15 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			).toBeNull();
 		});
 
-		test("defers cleanup even when raw_dump_json was already removed", () => {
+		test("runs the physical migration when raw_dump_json was already removed", () => {
 			sqlite = createLegacyRequestDatabase();
 			sqlite.run("ALTER TABLE api_requests DROP COLUMN raw_dump_json");
 			applyPendingMigrationsByHash(sqlite, migrationsFolderWith(tag, [officialSql]));
-			expect(columnNames(sqlite, "api_requests")).toContain("token_accounting_version");
+			expectLegacyColumnsRemoved(sqlite);
 			expectRetainedData(sqlite);
+			expect(sqlite.prepare("SELECT hash FROM __drizzle_migrations").get()).toEqual({
+				hash: createHash("sha256").update(officialSql).digest("hex"),
+			});
 		});
 
 		test("logs data retention and pending commit without payloads or SQL", () => {
