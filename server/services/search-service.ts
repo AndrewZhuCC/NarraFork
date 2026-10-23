@@ -822,7 +822,7 @@ export const searchService = {
 		return searchStore.searchTimeline({
 			narratorId,
 			text: safeQuery,
-			strategy: strategyFor(safeQuery),
+			strategy: globalStrategyFor(safeQuery),
 			limit: Math.min(Math.max(1, limit), 100),
 			inheritedScopes,
 		});

@@ -193,7 +193,10 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	 * required) and one contains-pattern per term the index cannot check. On the substring
 	 * path every term is a pattern. See `globalQueryTerms`.
 	 */
-	function globalNeedles(query: EntitySearchQuery): { match: string | null; likes: string[] } {
+	function globalNeedles(query: Pick<EntitySearchQuery, "text" | "strategy">): {
+		match: string | null;
+		likes: string[];
+	} {
 		const { indexed, short } = globalQueryTerms(query.text);
 		if (query.strategy === "index" && indexed.length > 0) {
 			return { match: prefixExpr(indexed.join(" ")), likes: short.map(rawContains) };
@@ -333,32 +336,32 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		return `(${clauses.join(" OR ")})`;
 	}
 
-	/** Index-path timeline SQL for a given ref predicate. */
-	function timelineIndexSql(scopeSql: string): string {
+	/** Index-path timeline SQL for a given ref predicate; `likes` short terms filter its rows. */
+	function timelineIndexSql(scopeSql: string, likes: number): string {
 		return `SELECT ${TIMELINE_COLUMNS},
 			  ${snippetCall("narrator_messages_fts", 0, TIMELINE_SNIPPET)} as snippet
 			 FROM narrator_messages_fts
 			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
 			 JOIN narrator_message_refs r
 			   ON r.message_id = m.id AND ${scopeSql} AND r.segment_compact_id IS NULL
-			 WHERE narrator_messages_fts MATCH ?
+			 WHERE narrator_messages_fts MATCH ? ${likeSql("m.content_text", likes)}
 			 ORDER BY r.seq DESC
 			 LIMIT ?`;
 	}
 
 	/**
-	 * Substring-path timeline SQL.
+	 * Substring-path timeline SQL: one contains-pattern per term, all required.
 	 *
 	 * Starts from the narrator's refs (indexed by narrator_id + seq) and filters the joined
 	 * message text, ordered by seq DESC and capped by LIMIT, so it never scans the whole corpus.
 	 */
-	function timelineSubstringSql(scopeSql: string): string {
+	function timelineSubstringSql(scopeSql: string, likes: number): string {
 		return `SELECT ${TIMELINE_COLUMNS},
 			  substr(m.content_text, 1, ${PREVIEW_CHARS}) as snippet
 			 FROM narrator_message_refs r
 			 JOIN narrator_messages m ON m.id = r.message_id
 			 WHERE ${scopeSql} AND r.segment_compact_id IS NULL
-			   AND m.content_text LIKE ?
+			   ${likeSql("m.content_text", likes)}
 			 ORDER BY r.seq DESC
 			 LIMIT ?`;
 	}
@@ -376,14 +379,20 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 LIMIT ?`;
 	}
 
-	/** The no-ancestry case binds the narrator id instead of interpolating it, so it caches. */
-	function timelineOwnStmt(strategy: "index" | "substring" | "blocks"): QueryTemplate {
-		return cached(`timeline:${strategy}`, () =>
+	/**
+	 * The no-ancestry case binds the narrator id instead of interpolating it, so it caches.
+	 * `likes` is bounded by `MAX_GLOBAL_QUERY_TERMS`, so the cache stays small.
+	 */
+	function timelineOwnStmt(
+		strategy: "index" | "substring" | "blocks",
+		likes: number,
+	): QueryTemplate {
+		return cached(`timeline:${strategy}:${likes}`, () =>
 			strategy === "index"
-				? timelineIndexSql("r.narrator_id = ? ")
+				? timelineIndexSql("r.narrator_id = ? ", likes)
 				: strategy === "blocks"
 					? timelineBlockSql("r.narrator_id = ? ")
-					: timelineSubstringSql("r.narrator_id = ? "),
+					: timelineSubstringSql("r.narrator_id = ? ", likes),
 		);
 	}
 
@@ -837,19 +846,30 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 		async searchTimeline(query: TimelineSearchQuery): Promise<TimelineSearchRow[]> {
 			const options = { signal: query.signal, operation: "searchTimeline" };
-			const needle = query.strategy === "index" ? prefixExpr(query.text) : rawContains(query.text);
+			// The same term rules as global search: a term too short for the trigram index
+			// would silently match nothing in MATCH, so it filters the indexed rows instead.
+			const { match, likes } = globalNeedles(query);
+			const mainStrategy = match === null ? "substring" : "index";
 			const run = (strategy: "index" | "substring" | "blocks"): Promise<RawRow[]> => {
+				const needles =
+					strategy === "blocks" ? [match] : match === null ? likes : [match, ...likes];
+				const likeCount = strategy === "blocks" ? 0 : likes.length;
 				if (query.inheritedScopes.length === 0)
-					return timelineOwnStmt(strategy).all(options, query.narratorId, needle, query.limit);
+					return timelineOwnStmt(strategy, likeCount).all(
+						options,
+						query.narratorId,
+						...needles,
+						query.limit,
+					);
 				// Ancestry shape varies per narrator, so this statement cannot be cached.
 				const scopeSql = timelineScopeSql(query.narratorId, query.inheritedScopes);
 				const sql =
 					strategy === "index"
-						? timelineIndexSql(scopeSql)
+						? timelineIndexSql(scopeSql, likeCount)
 						: strategy === "blocks"
 							? timelineBlockSql(scopeSql)
-							: timelineSubstringSql(scopeSql);
-				return execute(sql, [needle, query.limit], options);
+							: timelineSubstringSql(scopeSql, likeCount);
+				return execute(sql, [...needles, query.limit], options);
 			};
 			const toRow = (row: RawRow): TimelineSearchRow => ({
 				messageId: row.id,
@@ -860,8 +880,9 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				createdAt: row.created_at,
 				...(row.block_id ? { blockId: row.block_id } : {}),
 			});
-			const rows = (await run(query.strategy)).map(toRow);
-			if (query.strategy !== "index") return rows;
+			const rows = (await run(mainStrategy)).map(toRow);
+			// Blocks cannot be checked for terms the index cannot tokenize; see messageBlockStmt.
+			if (match === null || likes.length > 0) return rows;
 			return mergeBlockHits(
 				rows,
 				(await run("blocks")).map(toRow),
