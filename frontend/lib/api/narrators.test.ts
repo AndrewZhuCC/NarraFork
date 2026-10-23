@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ComposerDocument } from "@shared/composer-document";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { ApiError } from "./client";
 import { api } from "./index";
 import {
@@ -448,31 +449,65 @@ describe("narrators API", () => {
 		expect((await api.getPretextDocumentPage("n", { maxResponseBytes: 32 })).messages).toEqual([]);
 	});
 
-	test("ask acknowledgements retain legacy fields and expose canonical messages", async () => {
+	test("ask acknowledgements keep their fields and decode the message's blocks", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },
 			configurable: true,
 		});
-		const message = {
-			id: "ask",
-			seq: 3,
-			contentJson: [{ type: "ask_in_passing", status: "pending" }],
+		const element = { type: "ask_in_passing", status: "pending" };
+		const encoded = {
+			messages: [
+				{
+					id: "ask",
+					seq: 3,
+					role: "assistant",
+					askInsertVersion: 7,
+					blockIds: ["ask:0"],
+					parentMessageId: null,
+				},
+			],
+			blocks: [
+				{
+					id: "ask:0",
+					messageId: "ask",
+					ordinal: 0,
+					kind: "context",
+					subtype: null,
+					phase: "done",
+					revision: 0,
+					wireId: null,
+					attemptId: null,
+					elements: [element],
+					hasOriginal: false,
+				},
+			],
 		};
 		Object.defineProperty(g, "fetch", {
-			value: async () => Response.json({ messageId: "ask", message }),
+			value: async () => Response.json({ messageId: "ask", message: encoded }),
 			configurable: true,
 		});
 		const started = await api.startAskInPassing("n", { sourceMessageId: "source" });
 		expect(started.messageId).toBe("ask");
-		expect(started.message?.id).toBe(message.id);
-		expect(started.message?.seq).toBe(message.seq);
+		expect(started.message?.id).toBe("ask");
+		expect(started.message?.seq).toBe(3);
+		expect(started.message?.askInsertVersion).toBe(7);
+		expect(started.message ? messageBody(started.message) : []).toEqual([element]);
+		expect(started.message?.blocks?.[0]).toMatchObject({ id: "ask:0", named: true });
 		Object.defineProperty(g, "fetch", {
-			value: async () => Response.json({ id: "target", message }),
+			value: async () => Response.json({ id: "target", message: encoded }),
 			configurable: true,
 		});
 		const resolved = await api.askInPassing("n", { question: "why", pendingMessageId: "ask" });
 		expect(resolved.id).toBe("target");
-		expect(resolved.message).toEqual(message);
+		expect(resolved.message?.id).toBe("ask");
+		expect(resolved.message ? messageBody(resolved.message) : []).toEqual([element]);
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json({ messageId: "ask" }),
+			configurable: true,
+		});
+		expect((await api.startAskInPassing("n", { sourceMessageId: "source" })).message).toBe(
+			undefined,
+		);
 	});
 
 	test("detaches Bash with an encoded tool endpoint and no request body", async () => {

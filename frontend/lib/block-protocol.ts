@@ -96,6 +96,26 @@ export function decodeBlockPage<T>(page: T): T {
 	return { ...rest, messages: rows.map(({ row }) => row) } as unknown as T;
 }
 
+/** One message as envelopes + blocks, as an action's response carries it. */
+interface BlockMessageDTO {
+	messages: EnvelopeDTO[];
+	blocks: BlockDTO[];
+}
+
+/** A response whose `message` arrived as envelopes + blocks, with that message as a row. */
+export function decodeBlockMessage<T extends { message?: unknown }>(
+	response: T,
+): Omit<T, "message"> & { message?: TreeMessage } {
+	const encoded = response.message as BlockMessageDTO | undefined;
+	if (!encoded) return response as Omit<T, "message">;
+	const [first] = rowsOf(
+		array<EnvelopeDTO>(encoded.messages),
+		array<BlockDTO>(encoded.blocks),
+		true,
+	);
+	return { ...response, message: first?.row };
+}
+
 /**
  * A streamed delta in v2 as the v1 `stream_event` it maps from. v1 carries a text item's
  * output index on the event and a reasoning item's on the delta.
