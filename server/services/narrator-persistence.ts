@@ -11,7 +11,7 @@ import {
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, getTableColumns, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	fileChangeExecutionSegments,
@@ -67,10 +67,16 @@ import {
 	newEnvelopeColumns,
 	patchEnvelopeState,
 	type SyncMode,
-	syncCopiedEnvelope,
 	syncEnvelopeNow,
 } from "./narrator-block-sync";
-import { bodyColumns, contentJsonSql, fillBodies, fillBody } from "./narrator-body-reads";
+import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
+import {
+	insertEnvelope,
+	readEnvelope,
+	readEnvelopeBody,
+	updateEnvelope,
+	writeEnvelopeBody,
+} from "./narrator-body-writes";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import {
@@ -508,6 +514,7 @@ type MessageCopyResult = {
 export function cowEnvelopeTx(
 	tx: DbTx,
 	input: {
+		/** The envelope copied, its body as readers read it (`readEnvelope`). */
 		original: typeof narratorMessages.$inferSelect;
 		ref: { id: string; narratorId: string };
 		changes?: Partial<typeof narratorMessages.$inferInsert>;
@@ -518,30 +525,32 @@ export function cowEnvelopeTx(
 	const { original, ref } = input;
 	const id = generateId();
 	const now = new Date().toISOString();
-	tx.insert(narratorMessages)
-		.values({
-			...original,
-			...input.changes,
-			id,
-			narratorId: ref.narratorId,
-			authorNarratorId: original.authorNarratorId ?? original.narratorId,
-			createdAt: original.createdAt,
-		})
-		.run();
-	if (input.toolCalls.length)
-		tx.insert(narratorToolCalls)
-			.values(
-				input.toolCalls.map((call) => ({
-					...call,
-					executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
-					id: generateId(),
-					narratorId: ref.narratorId,
-					messageId: id,
-					createdAt: now,
-				})),
-			)
-			.run();
-	syncCopiedEnvelope(original.id, id);
+	const copy = {
+		...original,
+		...input.changes,
+		id,
+		narratorId: ref.narratorId,
+		authorNarratorId: original.authorNarratorId ?? original.narratorId,
+		createdAt: original.createdAt,
+	};
+	insertEnvelope(tx, copy, {
+		copyOf: original.id,
+		rows: () => {
+			if (input.toolCalls.length)
+				tx.insert(narratorToolCalls)
+					.values(
+						input.toolCalls.map((call) => ({
+							...call,
+							executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
+							id: generateId(),
+							narratorId: ref.narratorId,
+							messageId: id,
+							createdAt: now,
+						})),
+					)
+					.run();
+		},
+	});
 	tx.update(narratorMessageRefs)
 		.set({ messageId: id })
 		.where(eq(narratorMessageRefs.id, ref.id))
@@ -570,9 +579,7 @@ function copyMessageForNarratorTx(
 	forceCopy = false,
 ): MessageCopyResult {
 	if (Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText")) {
-		const original = tx.query.narratorMessages
-			.findFirst({ where: eq(narratorMessages.id, messageId) })
-			.sync();
+		const original = readEnvelope(tx, messageId);
 		if (!original) throw new NotFoundError("Message", messageId);
 		overrides = {
 			...overrides,
@@ -600,16 +607,11 @@ function copyMessageForNarratorTx(
 		.all();
 	const shouldCopy = forceCopy || refs.length > 1;
 	if (!shouldCopy) {
-		if (Object.keys(overrides).length > 0) {
-			tx.update(narratorMessages).set(overrides).where(eq(narratorMessages.id, messageId)).run();
-			syncEnvelopeNow(messageId);
-		}
+		if (Object.keys(overrides).length) updateEnvelope(tx, messageId, overrides);
 		return { messageId, ref, copied: false };
 	}
 
-	const original = tx.query.narratorMessages
-		.findFirst({ where: eq(narratorMessages.id, messageId) })
-		.sync();
+	const original = readEnvelope(tx, messageId);
 	if (!original) throw new NotFoundError("Message", messageId);
 
 	const originalToolCalls = tx.query.narratorToolCalls
@@ -901,30 +903,24 @@ function overwriteToolInputTx(
 		.where(eq(narratorToolCalls.id, toolCallId))
 		.get();
 	const effective = guardPersistedPlanBody(input, existing, toolUseId);
+	// Question responses belong to the execution receipt, never the authored SDK call.
+	const messageId =
+		existing?.messageId && existing.toolName !== "AskUserQuestion" ? existing.messageId : null;
+	// Read before the ledger write, which queues the envelope for a sync.
+	const body = messageId ? readEnvelopeBody(tx, messageId) : undefined;
 	tx.update(narratorToolCalls)
 		.set({ inputJson: effective, inputChars: measureSerializedCharacters(effective) })
 		.where(eq(narratorToolCalls.id, toolCallId))
 		.run();
-	// Question responses belong to the execution receipt, never the authored SDK call.
-	if (!existing?.messageId || existing.toolName === "AskUserQuestion") return effective;
-	const message = tx
-		.select({ contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(eq(narratorMessages.id, existing.messageId))
-		.get();
-	if (!Array.isArray(message?.contentJson)) return effective;
+	if (!messageId || !Array.isArray(body)) return effective;
 	let changed = false;
-	const patched = (message.contentJson as Array<Record<string, unknown>>).map((block) => {
+	const patched = (body as Array<Record<string, unknown>>).map((block) => {
 		if (block?.type !== "tool_use" || block.id !== toolUseId) return block;
 		if (isDeepStrictEqual(block.input, effective)) return block;
 		changed = true;
 		return { ...block, input: effective };
 	});
-	if (changed)
-		tx.update(narratorMessages)
-			.set({ contentJson: patched })
-			.where(eq(narratorMessages.id, existing.messageId))
-			.run();
+	if (changed) writeEnvelopeBody(tx, messageId, patched);
 	return effective;
 }
 
@@ -995,17 +991,19 @@ export async function recoverStaleCompactingMessages(
 				const action = await withDbRetry(
 					async () =>
 						db.transaction((tx) => {
-							const current = tx.query.narratorMessages
-								.findFirst({
-									where: and(
-										eq(narratorMessages.id, stale.id),
-										eq(narratorMessages.compactPending, 1),
-										eq(narratorMessages.role, "system"),
-										eq(narratorMessages.contentText, "[Compacting]"),
-									),
-									columns: { contentJson: true },
-								})
-								.sync();
+							const current = fillBody(
+								tx.query.narratorMessages
+									.findFirst({
+										where: and(
+											eq(narratorMessages.id, stale.id),
+											eq(narratorMessages.compactPending, 1),
+											eq(narratorMessages.role, "system"),
+											eq(narratorMessages.contentText, "[Compacting]"),
+										),
+										...bodyColumns({ id: true, contentJson: true }),
+									})
+									.sync(),
+							);
 							if (!current) return "skipped" as const;
 
 							const refs = tx
@@ -1330,19 +1328,23 @@ async function appendPersistedMessage(
 	const created = await withDbRetry(
 		async () =>
 			db.transaction((tx) => {
-				const created = tx
-					.insert(narratorMessages)
-					.values({
+				let seq = 0;
+				// The blocks commit with the envelope and the rows that belong to it.
+				const created = insertEnvelope(
+					tx,
+					{
 						...newEnvelopeColumns(message.narratorId),
 						...message,
 						authorNarratorId: message.authorNarratorId ?? message.narratorId,
-					})
-					.returning()
-					.get();
-				const seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
-				options?.withRows?.(tx);
-				// The blocks commit with the envelope and the rows that belong to it.
-				syncEnvelopeNow(message.id, options?.blockMode);
+					},
+					{
+						mode: options?.blockMode,
+						rows: () => {
+							seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
+							options?.withRows?.(tx);
+						},
+					},
+				);
 				flushChangedEnvelopes();
 				return { ...created, seq };
 			}),
@@ -1490,9 +1492,10 @@ const sqliteNarratorPersistence = {
 				const id = placementMessageId(placement);
 				const now = new Date().toISOString();
 				return db.transaction((tx) => {
-					const created = tx
-						.insert(narratorMessages)
-						.values({
+					let seq = 0;
+					const created = insertEnvelope(
+						tx,
+						{
 							id,
 							...newEnvelopeColumns(narratorId),
 							narratorId,
@@ -1511,12 +1514,14 @@ const sqliteNarratorPersistence = {
 							origin: origin?.origin ?? "user",
 							originLabel: origin?.originLabel ?? null,
 							createdAt: now,
-						})
-						.returning()
-						.get();
-					const seq = appendMessageRefSync(tx, narratorId, id);
-					persistPlacement(tx, narratorId, id, placement);
-					syncEnvelopeNow(id);
+						},
+						{
+							rows: () => {
+								seq = appendMessageRefSync(tx, narratorId, id);
+								persistPlacement(tx, narratorId, id, placement);
+							},
+						},
+					);
 					return { ...created, seq };
 				});
 			},
@@ -1621,9 +1626,10 @@ const sqliteNarratorPersistence = {
 					const blocks: unknown[] = hasNativeModelContext
 						? providedBlocks
 						: [{ type: "text", text }, ...providedBlocks];
-					const created = tx
-						.insert(narratorMessages)
-						.values({
+					let seq = 0;
+					const created = insertEnvelope(
+						tx,
+						{
 							id,
 							...newEnvelopeColumns(narratorId),
 							narratorId,
@@ -1638,13 +1644,14 @@ const sqliteNarratorPersistence = {
 							origin: origin?.origin ?? "system",
 							originLabel: origin?.originLabel ?? null,
 							createdAt: now,
-						})
-						.returning()
-						.get();
-
-					const seq = appendMessageRefSync(tx, narratorId, id);
-					persistPlacement(tx, narratorId, id, placement);
-					syncEnvelopeNow(id);
+						},
+						{
+							rows: () => {
+								seq = appendMessageRefSync(tx, narratorId, id);
+								persistPlacement(tx, narratorId, id, placement);
+							},
+						},
+					);
 					return { ...created, seq };
 				}),
 			{ label: "persistSystemMessage", maxRetries: 5 },
@@ -1840,20 +1847,16 @@ const sqliteNarratorPersistence = {
 						seq = claimNextRefSeq(tx, narratorId);
 					}
 
-					const msg = tx
-						.insert(narratorMessages)
-						.values({
-							id,
-							...newEnvelopeColumns(narratorId),
-							narratorId,
-							role: "system",
-							contentJson: [compactBlock],
-							contextCharsJson: measureMessageCharacters("system", [compactBlock]),
-							contentText: "[Compacting]",
-							createdAt,
-						})
-						.returning()
-						.get();
+					const msg = insertEnvelope(tx, {
+						id,
+						...newEnvelopeColumns(narratorId),
+						narratorId,
+						role: "system",
+						contentJson: [compactBlock],
+						contextCharsJson: measureMessageCharacters("system", [compactBlock]),
+						contentText: "[Compacting]",
+						createdAt,
+					});
 
 					tx.insert(narratorMessageRefs)
 						.values({
@@ -1887,11 +1890,14 @@ const sqliteNarratorPersistence = {
 				db.transaction((tx) => {
 					// Authorization is by the caller's ref, not the message's historical
 					// owner. A full fork legitimately points at the parent's message row.
-					const msg = tx.query.narratorMessages
-						.findFirst({
-							where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-						})
-						.sync();
+					const msg = fillBody(
+						tx.query.narratorMessages
+							.findFirst({
+								...bodyColumns(),
+								where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+							})
+							.sync(),
+					);
 					const ref = tx.query.narratorMessageRefs
 						.findFirst({
 							where: and(
@@ -1929,14 +1935,17 @@ const sqliteNarratorPersistence = {
 						contentText: "[Compacting]",
 						contextPercent: null,
 					});
-					const updated = tx.query.narratorMessages
-						.findFirst({
-							where: and(
-								eq(narratorMessages.id, copied.messageId),
-								eq(narratorMessages.role, "system"),
-							),
-						})
-						.sync();
+					const updated = fillBody(
+						tx.query.narratorMessages
+							.findFirst({
+								...bodyColumns(),
+								where: and(
+									eq(narratorMessages.id, copied.messageId),
+									eq(narratorMessages.role, "system"),
+								),
+							})
+							.sync(),
+					);
 					if (!updated) throw new NotFoundError("Message", messageId);
 					tx.update(narrators)
 						.set({
@@ -1963,24 +1972,18 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 
 		const { msg, seq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
-			const msg = tx
-				.insert(narratorMessages)
-				.values({
-					id,
-					...newEnvelopeColumns(narratorId),
-					narratorId,
-					role: "system",
-					contentJson: [
-						{ type: "compact", status: "compacted", subtype: "plan", summary: content },
-					],
-					contextCharsJson: measureMessageCharacters("system", [
-						{ type: "compact", status: "compacted", summary: content },
-					]),
-					contentText: `[Plan] ${content.slice(0, 200)}...`,
-					createdAt: now,
-				})
-				.returning()
-				.get();
+			const msg = insertEnvelope(tx, {
+				id,
+				...newEnvelopeColumns(narratorId),
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "compact", status: "compacted", subtype: "plan", summary: content }],
+				contextCharsJson: measureMessageCharacters("system", [
+					{ type: "compact", status: "compacted", summary: content },
+				]),
+				contentText: `[Plan] ${content.slice(0, 200)}...`,
+				createdAt: now,
+			});
 
 			const seq = claimNextRefSeq(tx, narratorId);
 			tx.insert(narratorMessageRefs)
@@ -2014,20 +2017,16 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 
 		const { msg, seq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
-			const msg = tx
-				.insert(narratorMessages)
-				.values({
-					id,
-					...newEnvelopeColumns(narratorId),
-					narratorId,
-					role: "system",
-					contentJson: [{ type: "compact", status: "compacted", summary: "" }],
-					contextCharsJson: { segments: [] },
-					contentText: "[Context cleared]",
-					createdAt: now,
-				})
-				.returning()
-				.get();
+			const msg = insertEnvelope(tx, {
+				id,
+				...newEnvelopeColumns(narratorId),
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "compact", status: "compacted", summary: "" }],
+				contextCharsJson: { segments: [] },
+				contentText: "[Context cleared]",
+				createdAt: now,
+			});
 
 			const seq = claimNextRefSeq(tx, narratorId);
 			tx.insert(narratorMessageRefs)
@@ -2077,20 +2076,16 @@ const sqliteNarratorPersistence = {
 				.sync();
 			if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
 
-			const msg = tx
-				.insert(narratorMessages)
-				.values({
-					id,
-					...newEnvelopeColumns(narratorId),
-					narratorId,
-					role: "system",
-					contentJson: [{ type: "compact", status: "compacted", summary: "" }],
-					contextCharsJson: { segments: [] },
-					contentText: "[Context cleared]",
-					createdAt: now,
-				})
-				.returning()
-				.get();
+			const msg = insertEnvelope(tx, {
+				id,
+				...newEnvelopeColumns(narratorId),
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "compact", status: "compacted", summary: "" }],
+				contextCharsJson: { segments: [] },
+				contentText: "[Context cleared]",
+				createdAt: now,
+			});
 
 			claimShiftInsertSlot(tx, narratorId, targetRef.seq);
 			tx.insert(narratorMessageRefs)
@@ -2147,12 +2142,14 @@ const sqliteNarratorPersistence = {
 					),
 				})
 				.sync();
-			const existing = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-					columns: { contentJson: true },
-				})
-				.sync();
+			const existing = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						...bodyColumns({ id: true, contentJson: true }),
+					})
+					.sync(),
+			);
 			if (!existing || !currentRef) return null;
 			const blocks = Array.isArray(existing.contentJson) ? existing.contentJson : [];
 			const previous = blocks.map(parseCompactMessageBlock).find(Boolean);
@@ -2216,36 +2213,45 @@ const sqliteNarratorPersistence = {
 					? `[Compact] ${summary.slice(0, 200)}...`
 					: `[Compact Failed] ${failureText.slice(0, 200)}...`;
 
-			// Repeat the lifecycle checks in the UPDATE predicate. The transaction-level
-			// preflight above decides whether this attempt is eligible; this SQL CAS is
-			// what prevents a late finalize from winning after cancellation or retry.
-			const casWhere = and(
-				eq(narratorMessages.id, copied.messageId),
-				sql`EXISTS (
-					SELECT 1 FROM narrator_message_refs
-					WHERE id = ${copied.ref.id}
-						AND narrator_id = ${narratorId}
-						AND message_id = ${copied.messageId}
-						AND seq = ${expectedSeq}
-				)`,
-				sql`json_extract(${narratorMessages.contentJson}, '$[0].status') = ${previous.status}`,
-
-				sql`json_extract(${narratorMessages.contentJson}, '$[0].attempts[#-1].status') = ${latestAttempt.status}`,
-				sql`json_extract(${narratorMessages.contentJson}, '$[0].attempts[#-1].attempt') = ${expectedAttempt}`,
-
-				sql`coalesce(json_extract(${narratorMessages.contentJson}, '$[0].retryBaseCompactMessageId'), '') = coalesce(${expectedRetryBaseline}, '')`,
-			);
-			const updated = tx
-				.update(narratorMessages)
-				.set({
-					contentJson: [compactBlock],
-					contextCharsJson: measureMessageCharacters("system", [compactBlock]),
-					contentText,
-					contextPercent: status === "compacted" ? (contextPercent ?? null) : null,
-				})
-				.where(casWhere)
-				.returning()
+			// Repeat the lifecycle checks on the marker the write replaces (the copy above may
+			// have moved this narrator's ref to a private row). The preflight decides whether
+			// this attempt is eligible; this compare-and-set is what prevents a late finalize
+			// from winning after cancellation or retry.
+			const marker = (() => {
+				const body = readEnvelopeBody(tx, copied.messageId);
+				return Array.isArray(body) ? (body[0] as Record<string, unknown> | undefined) : undefined;
+			})();
+			const markerAttempt = Array.isArray(marker?.attempts)
+				? (marker.attempts.at(-1) as Record<string, unknown> | undefined)
+				: undefined;
+			const refHolds = tx
+				.select({ id: narratorMessageRefs.id })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.id, copied.ref.id),
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, copied.messageId),
+						eq(narratorMessageRefs.seq, expectedSeq),
+					),
+				)
 				.get();
+			const casHolds =
+				!!refHolds &&
+				marker?.status === previous.status &&
+				markerAttempt?.status === latestAttempt.status &&
+				markerAttempt?.attempt === expectedAttempt &&
+				(marker?.retryBaseCompactMessageId ?? "") === (expectedRetryBaseline ?? "");
+			const written =
+				casHolds &&
+				writeEnvelopeBody(tx, copied.messageId, [compactBlock], {
+					set: {
+						contextCharsJson: measureMessageCharacters("system", [compactBlock]),
+						contentText,
+						contextPercent: status === "compacted" ? (contextPercent ?? null) : null,
+					},
+				});
+			const updated = written ? readEnvelope(tx, copied.messageId) : undefined;
 			if (!updated) {
 				throw new AppError(
 					"Compact marker changed before finalize CAS completed",
@@ -2512,12 +2518,14 @@ const sqliteNarratorPersistence = {
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
 		const persisted = db.transaction((tx) => {
-			const existing = tx.query.narratorMessages
-				.findFirst({
-					where: eq(narratorMessages.id, messageId),
-					columns: { contentJson: true, parentToolUseId: true },
-				})
-				.sync();
+			const existing = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						where: eq(narratorMessages.id, messageId),
+						...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
+					})
+					.sync(),
+			);
 			if (!existing) throw new NotFoundError("Assistant message", messageId);
 
 			type StoredAssistantBlock =
@@ -2618,31 +2626,37 @@ const sqliteNarratorPersistence = {
 				content = [...current, block];
 			}
 			if (content === current && !options?.republishUnchanged) return undefined;
+			const writeLedgerRow = () => {
+				if (block.type === "tool_use")
+					toolCallId = insertToolCallRowTx(tx, {
+						narratorId,
+						messageId,
+						parentSegmentId: toolParentSegmentId,
+						block,
+						createdAt: toolCreatedAt,
+					});
+			};
+			// One item changed: its block row (and the tool's ledger binding) follows.
+			const stamp = { attemptId: options?.attemptId };
 			if (content !== current) {
 				const textParts: string[] = [];
 				for (const entry of content)
 					if (entry.type === "text" && typeof entry.text === "string") textParts.push(entry.text);
 				const contentText = textParts.join("\n");
-				tx.update(narratorMessages)
-					.set({
-						contentJson: content,
+				writeEnvelopeBody(tx, messageId, content, {
+					set: {
 						contextCharsJson: measureMessageCharacters("assistant", content),
 						contentText: contentText || null,
-					})
-					.where(eq(narratorMessages.id, messageId))
-					.run();
-				queueContextCharacterRefresh(narratorId, messageId);
-			}
-			if (block.type === "tool_use")
-				toolCallId = insertToolCallRowTx(tx, {
-					narratorId,
-					messageId,
-					parentSegmentId: toolParentSegmentId,
-					block,
-					createdAt: toolCreatedAt,
+					},
+					mode: "streaming",
+					stamp,
+					rows: writeLedgerRow,
 				});
-			// One item changed: its block row (and the tool's ledger binding) follows.
-			syncEnvelopeNow(messageId, "streaming", { attemptId: options?.attemptId });
+				queueContextCharacterRefresh(narratorId, messageId);
+			} else {
+				writeLedgerRow();
+				syncEnvelopeNow(messageId, "streaming", stamp);
+			}
 			flushChangedEnvelopes();
 			return existing;
 		});
@@ -2808,7 +2822,7 @@ const sqliteNarratorPersistence = {
 					...(estimate.contextPercent != null ? { contextPercent: estimate.contextPercent } : {}),
 				})
 				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
-				.returning()
+				.returning({ id: narratorMessages.id })
 				.get();
 			if (!updated) return null;
 
@@ -2822,7 +2836,7 @@ const sqliteNarratorPersistence = {
 				})
 				.sync();
 
-			return { ...updated, seq: ref?.seq };
+			return { ...readEnvelope(tx, messageId), seq: ref?.seq };
 		});
 	},
 
@@ -3123,17 +3137,15 @@ const sqliteNarratorPersistence = {
 					await withDbRetry(
 						async () =>
 							dbTransactionWithSeqFloor(narratorId, (tx) => {
-								tx.insert(narratorMessages)
-									.values({
-										id: msgId,
-										...newEnvelopeColumns(narratorId),
-										narratorId,
-										role: "system",
-										contentJson,
-										contentText,
-										createdAt: now,
-									})
-									.run();
+								insertEnvelope(tx, {
+									id: msgId,
+									...newEnvelopeColumns(narratorId),
+									narratorId,
+									role: "system",
+									contentJson,
+									contentText,
+									createdAt: now,
+								});
 								const seq = claimNextRefSeq(tx, narratorId);
 								tx.insert(narratorMessageRefs)
 									.values({
@@ -4214,9 +4226,7 @@ const sqliteNarratorPersistence = {
 			overrides != null &&
 			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
 		if (semanticEdit && overrides) {
-			const original = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-			});
+			const original = readEnvelope(db, messageId);
 			if (!original) throw new NotFoundError("Message", messageId);
 			overrides = {
 				...overrides,
@@ -4236,9 +4246,7 @@ const sqliteNarratorPersistence = {
 			return id;
 		});
 		function rewrite(tx: DbTx): string {
-			const original = tx.query.narratorMessages
-				.findFirst({ where: eq(narratorMessages.id, messageId) })
-				.sync();
+			const original = readEnvelope(tx, messageId);
 			if (!original) throw new NotFoundError("Message", messageId);
 			options.beforeWrite?.(tx);
 			// Read ref membership atomically with the rewrite, including forks made while the
@@ -4268,10 +4276,7 @@ const sqliteNarratorPersistence = {
 			};
 			const updateOriginal = () => {
 				if (overrides && Object.keys(overrides).length > 0) {
-					tx.update(narratorMessages)
-						.set(overrides)
-						.where(eq(narratorMessages.id, messageId))
-						.run();
+					updateEnvelope(tx, messageId, overrides);
 					if (semanticEdit)
 						updateRecipientMessageRef(tx, narratorId, currentRef.id, {
 							kind: "semantic_edit",
@@ -4355,13 +4360,8 @@ const sqliteNarratorPersistence = {
 		retainedExecutedCalls: number;
 		removedToolUseIds: string[];
 	} | null> {
-		const message = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true },
-		});
-		const blocks = Array.isArray(message?.contentJson)
-			? (message.contentJson as Array<Record<string, unknown>>)
-			: [];
+		const body = readEnvelopeBody(db, messageId);
+		const blocks = Array.isArray(body) ? (body as Array<Record<string, unknown>>) : [];
 		// What the rows say must be what the envelope stores now: converge, then read.
 		const attemptRows = attemptId
 			? db.transaction(() => {
@@ -4462,11 +4462,10 @@ const sqliteNarratorPersistence = {
 		const updates = Object.fromEntries(
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
+		// The step is complete: items it left incomplete are interrupted, not streaming.
 		db.transaction((tx) => {
-			if (Object.keys(updates).length)
-				tx.update(narratorMessages).set(updates).where(eq(narratorMessages.id, messageId)).run();
-			// The step is complete: items it left incomplete are interrupted, not streaming.
-			syncEnvelopeNow(messageId, "sealed");
+			updateEnvelope(tx, messageId, updates, { mode: "sealed" });
+			flushChangedEnvelopes();
 		});
 	},
 
@@ -4486,14 +4485,11 @@ const sqliteNarratorPersistence = {
 		contentText: string | null,
 	): Promise<void> {
 		db.transaction((tx) => {
-			tx.update(narratorMessages)
-				.set({
-					contentJson: content,
-					contextCharsJson: measureMessageCharacters("assistant", content, contentText),
-				})
-				.where(eq(narratorMessages.id, messageId))
-				.run();
-			syncEnvelopeNow(messageId, "sealed");
+			writeEnvelopeBody(tx, messageId, content, {
+				set: { contextCharsJson: measureMessageCharacters("assistant", content, contentText) },
+				mode: "sealed",
+			});
+			flushChangedEnvelopes();
 		});
 		queueContextCharacterRefresh(narratorId, messageId);
 	},
@@ -4577,24 +4573,22 @@ const sqliteNarratorPersistence = {
 			// Shift consumes one top-of-history slot — see narrator-refs/seq-store.ts.
 			claimShiftInsertSlot(tx, narratorId, insertSeq);
 
-			tx.insert(narratorMessages)
-				.values({
-					id,
-					...newEnvelopeColumns(narratorId),
-					narratorId,
-					role: "user",
-					contentJson: [
-						{
-							type: "segment_compact",
-							status: "compacting",
-							messageCount: refs.length,
-						},
-					],
-					contextCharsJson: { segments: [] },
-					contentText: "[Segment compacting]",
-					createdAt: now,
-				})
-				.run();
+			insertEnvelope(tx, {
+				id,
+				...newEnvelopeColumns(narratorId),
+				narratorId,
+				role: "user",
+				contentJson: [
+					{
+						type: "segment_compact",
+						status: "compacting",
+						messageCount: refs.length,
+					},
+				],
+				contextCharsJson: { segments: [] },
+				contentText: "[Segment compacting]",
+				createdAt: now,
+			});
 
 			tx.insert(narratorMessageRefs)
 				.values({
@@ -4628,12 +4622,8 @@ const sqliteNarratorPersistence = {
 			return { refs, insertSeq };
 		});
 
-		const [msg] = fillBodies(
-			await db
-				.select({ ...getTableColumns(narratorMessages), contentJson: contentJsonSql() })
-				.from(narratorMessages)
-				.where(eq(narratorMessages.id, id)),
-		);
+		const msg = readEnvelope(db, id);
+		if (!msg) throw new NotFoundError("Message", id);
 
 		const hiddenMessageIds = refs.map((r) => r.messageId);
 		return { message: { ...msg, seq: insertSeq }, hiddenMessageIds };
@@ -4704,18 +4694,15 @@ const sqliteNarratorPersistence = {
 		const prefix = status === "failed" ? "[Segment Compact Failed]" : "[Segment Compact]";
 
 		return db.transaction((tx) => {
-			const updated = tx
-				.update(narratorMessages)
-				.set({
-					contentJson: [block],
+			const written = writeEnvelopeBody(tx, messageId, [block], {
+				set: {
 					contextCharsJson: measureMessageCharacters("user", [block]),
 					contentText: `${prefix}\n${summary}`,
 					contextPercent: contextPercent ?? null,
-				})
-				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
-				.returning()
-				.get();
-
+				},
+				where: eq(narratorMessages.narratorId, narratorId),
+			});
+			const updated = written ? readEnvelope(tx, messageId) : undefined;
 			if (!updated) return null;
 
 			if (status === "failed") {
@@ -4856,9 +4843,12 @@ const sqliteNarratorPersistence = {
 	},
 
 	async updateSegmentCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				...bodyColumns(),
+				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+			}),
+		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -4878,14 +4868,12 @@ const sqliteNarratorPersistence = {
 
 		const now = new Date().toISOString();
 		db.transaction((tx) => {
-			tx.update(narratorMessages)
-				.set({
-					contentJson: [newBlock],
+			writeEnvelopeBody(tx, messageId, [newBlock], {
+				set: {
 					contextCharsJson: measureMessageCharacters("user", [newBlock]),
 					contentText: `[Segment Compact]\n${summary}`,
-				})
-				.where(eq(narratorMessages.id, messageId))
-				.run();
+				},
+			});
 
 			tx.update(narrators)
 				.set({ apiConversationId: null, contextUsageSnapshotJson: null, updatedAt: now })

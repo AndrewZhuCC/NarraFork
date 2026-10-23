@@ -312,6 +312,7 @@ import {
 	fillBody,
 	storedBodyBytesSql,
 } from "../services/narrator-body-reads";
+import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-writes";
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
@@ -5308,28 +5309,24 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 	const now = new Date().toISOString();
 	const msgId = generateId();
 	const msg = dbTransactionWithSeqFloor(id, (tx) => {
-		const insertedMsg = tx
-			.insert(narratorMessages)
-			.values({
-				id: msgId,
-				narratorId: id,
-				role: "system",
-				...newEnvelopeColumns(id),
-				contentJson: [
-					{
-						type: "ask_in_passing",
-						status: "pending",
-						sourceMessageId,
-						sourceMessageUuid: sourceMessageUuid ?? null,
-					},
-				],
-				contentText: buildAskInPassingContentText(),
-				contextCharsJson: { segments: [] },
-				createdBy: userId,
-				createdAt: now,
-			})
-			.returning()
-			.get();
+		const insertedMsg = insertEnvelope(tx, {
+			id: msgId,
+			narratorId: id,
+			role: "system",
+			...newEnvelopeColumns(id),
+			contentJson: [
+				{
+					type: "ask_in_passing",
+					status: "pending",
+					sourceMessageId,
+					sourceMessageUuid: sourceMessageUuid ?? null,
+				},
+			],
+			contentText: buildAskInPassingContentText(),
+			contextCharsJson: { segments: [] },
+			createdBy: userId,
+			createdAt: now,
+		});
 
 		// Single seq authority (narrator-refs/seq-store.ts): the shift consumes one
 		// top-of-history slot; the primitive owns both the shift and, once
@@ -5390,9 +5387,12 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const { question, pendingMessageId } = parsed.data;
 
 	// Verify the pending message exists, belongs to this narrator, and is still pending
-	const pendingMsg = await db.query.narratorMessages.findFirst({
-		where: and(eq(narratorMessages.id, pendingMessageId), eq(narratorMessages.narratorId, id)),
-	});
+	const pendingMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: and(eq(narratorMessages.id, pendingMessageId), eq(narratorMessages.narratorId, id)),
+		}),
+	);
 	const pendingBlock = getAskInPassingPendingBlock(pendingMsg);
 	if (!pendingMsg || !pendingBlock) {
 		throw new ValidationError("Pending ask-in-passing message not found");
@@ -5446,14 +5446,9 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	];
 	const resolvedContentText = buildAskInPassingContentText(question);
 	const updatedMsg = db.transaction((tx) => {
-		tx.update(narratorMessages)
-			.set({
-				contentJson: resolvedContentJson,
-				contentText: resolvedContentText,
-				contextCharsJson: { segments: [] },
-			})
-			.where(eq(narratorMessages.id, pendingMessageId))
-			.run();
+		writeEnvelopeBody(tx, pendingMessageId, resolvedContentJson, {
+			set: { contentText: resolvedContentText, contextCharsJson: { segments: [] } },
+		});
 
 		tx.update(narrators)
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
@@ -6138,10 +6133,12 @@ async function rollbackPreviewResponse(
 	});
 	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-		columns: { role: true, contentJson: true },
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			...bodyColumns({ id: true, role: true, contentJson: true }),
+		}),
+	);
 	if (!targetMsg) return c.json({ error: "Message not found" }, 404);
 
 	const blocks = Array.isArray(targetMsg.contentJson)
@@ -6236,10 +6233,12 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 	});
 	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
 
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-		columns: { contentJson: true },
-	});
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			...bodyColumns({ id: true, contentJson: true }),
+		}),
+	);
 	if (!message) return c.json({ error: "Message not found" }, 404);
 
 	const blocks = Array.isArray(message.contentJson)

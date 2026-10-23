@@ -522,13 +522,14 @@ function currentHistoryCompactMode(narratorId: string, fallback: CompactMode): C
 export async function markCompactAsBlocking(narratorId: string) {
 	await setCompactingSubstatus(narratorId, "blocking", true);
 	try {
+		// patchState reads each marker's body itself.
 		const markers = await db.query.narratorMessages.findMany({
 			where: and(
 				eq(narratorMessages.narratorId, narratorId),
 				eq(narratorMessages.role, "system"),
 				eq(narratorMessages.contentText, "[Compacting]"),
 			),
-			columns: { id: true, contentJson: true },
+			columns: { id: true },
 		});
 		for (const marker of markers) {
 			// The mode is compact state: it changes nothing the model reads (§5.4).

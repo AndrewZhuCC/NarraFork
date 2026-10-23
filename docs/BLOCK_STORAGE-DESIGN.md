@@ -1705,6 +1705,31 @@ reconcile(narrator, target, now):
    - 块 revision 历史；
    - External API 追加 `blockId`。
 
+**P3 分阶段**：每阶段一个 PR，PR 内分步提交、每步 CI。
+- P3a：所有读改写经正文层，不改数据（下文）。
+- P3b：`narratorBlocks.compactJson`（默认关）让新行写 `'[]'`；清空旧行的作业只在回填 verify 之后由管理员显式触发。
+- P3c：退役信封级 FTS。
+- P3d：删除 v1 解码 / 协议与 `wsV2` 开关。
+
+**P3a 实现说明（正文只经正文层读写）**
+- **正文层**（`server/services/narrator-body-writes.ts`）：写入方把正文交给它，块行由交来的正文建出，不回读 `content_json`，所以列里存什么（P3b）对写入方透明。
+  - `insertEnvelope` / `insertEnvelopeIfAbsent`：插入信封并同事务建行；`rows` 先写随信封落库的 ref、账本行，`copyOf` 让副本的块继承原块谱系。
+  - `writeEnvelopeBody`：替换正文（`set` 带同变的列，`where` 做比较并交换，`rows` 先写随正文的账本变更）；`updateEnvelope`：可能含正文的一组列。
+  - `readEnvelope` / `readEnvelopeBody`：读改写的起点，与读者同口径（行当前时组装自行）。
+  - `insertEnvelopeQueued`：批量复制（子代理提取最多 2000 条）不在主线程逐条同步，列保留完整投影，由同步队列建行。
+- **同步**：`syncEnvelope` 接收写入方刚写的正文；不带正文时（账本变化等）按读者口径读正文：排队时读列，行当前时读行，由行与账本重新推导 tool 块的 phase。双写审计与回填 verify 以列为基准，用 `resyncFromColumn` 重建。
+- **读取**：读改写一律经 `bodyColumns` / `contentJsonSql` / `readEnvelope`。删除与截断的体积预算用 `envelopeStoredBytesSql`（行持有正文时计 `body_bytes`）。文件历史检查点用 `hasStoredElementSql` 查找，不再精确匹配 `content_json`。
+- **compact finalize**：比较并交换改为在同一事务里重读标记并逐项比对，不再对 `content_json` 做 `json_extract`；`narrator-persistence` 不再依赖 JSON1。
+- **revert 管线**：选择阶段与提交阶段都按读者口径度量与读取正文（`bodyLengthSql`、`boundedBodyText`），摘要两边一致；提交时的行检查用 `body_revision` / `state_revision` 固定正文（任何正文或状态写入都会推进其一），不再捕获 `content_json`。预编译语句仍把改写后的正文写入列、由同步队列建行，因为 apply 阶段不允许读取与 JSON 处理。回滚预览改为解析有界正文（`boundedStoredBody`），不再在 HTTP 线程上对列做 JSON1。
+- **守卫**：`narrator-body-access.guard.test.ts` 按文件计数直接把列当正文的读写，只减不增。P3a 结束时余下的都是长期条目：正文层本身；列即正文的读取方（旧格式、PG、读开关关闭）；由同步队列从列建行的写入（旧格式导入、revert 预编译语句）。
+- **测试**：`narrator-body-writes.test.ts` 先让列与正文脱钩（列置 `'[]'` 且不入队，即 P3b 的样子），再逐一验证 COW、步内写入、工具输入覆盖、compact finalize 及其 CAS、段压缩、丢弃 attempt、删块、编辑输出块、改压缩摘要、输出恢复、有界正文读取都从行出发。
+- **留给 P3b**：
+  - 账本变化会让信封入队，入队期间读者与同步读列。对紧凑信封（列为 `'[]'`）要么免除这项排队判断，要么让队列区分"列被外部写入"与"账本变化"（触发器契约 v4）。
+  - `compact_pending` 生成列读 `content_json`：启动恢复与 fork 排除运行中 compact 的读取方需改看 compact 块的状态。
+  - 审计与回填 verify 只对非紧凑信封以列为基准。
+  - 由队列从列建行的写入在 P3b 继续写完整投影；清空作业只处理行已当前的信封。
+  - `compactJson` 只在 `narratorBlocks.read` 开启且为 SQLite 时生效。
+
 ## 12. 风险与成本
 
 ### 12.1 存储

@@ -35,6 +35,7 @@ const DIRECT_WRITERS: Record<string, string> = {
 	// The persistence layer behind narrator-store, and the message query/edit layer.
 	"server/services/narrator-persistence.ts": "store implementation",
 	"server/services/narrator-block-sync.ts": "block rows: ledger block binding, body bytes",
+	"server/services/narrator-body-writes.ts": "envelope bodies, their rows built from them",
 	"server/services/narrator-turns.ts": "the run's trigger envelope",
 	"server/services/narrator-block-targets.ts":
 		"materialize: flip an envelope to block format, the store syncs its rows",

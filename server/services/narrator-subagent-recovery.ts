@@ -1252,9 +1252,12 @@ export async function markRecoveryCardResolved(input: {
 		.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
 		.run(input.narratorId);
 
-	const updated = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, input.messageId),
-	});
+	const updated = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, input.messageId),
+		}),
+	);
 	if (!updated) return;
 	broadcastToNarrator(input.narratorId, {
 		type: "message_updated",

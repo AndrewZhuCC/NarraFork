@@ -130,8 +130,9 @@ import { getAvailableOptionalToolIds } from "./command-service";
 import { compileDelegationCeiling } from "./custom-subagent-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
-import { newEnvelopeColumns, syncEnvelopeNow } from "./narrator-block-sync";
+import { newEnvelopeColumns } from "./narrator-block-sync";
 import { contentJsonSql, fillBodies } from "./narrator-body-reads";
+import { insertEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -1091,19 +1092,17 @@ export async function handleBashCommand(
 			durationMs,
 			executionStartedAt: streamStartedAt,
 			completedAt,
-			onPersist: (tx) =>
-				tx
-					.update(narratorMessages)
-					.set({
-						contentJson: [toolUseBlock, toolResultBlock],
+			onPersist: (tx) => {
+				writeEnvelopeBody(tx, assistantMsgId, [toolUseBlock, toolResultBlock], {
+					set: {
 						contextCharsJson: measureMessageCharacters("assistant", [
 							toolUseBlock,
 							toolResultBlock,
 						]),
 						durationMs,
-					})
-					.where(eq(narratorMessages.id, assistantMsgId))
-					.run(),
+					},
+				});
+			},
 		},
 		assistantMsgId,
 		toolCallId,
@@ -2305,35 +2304,34 @@ export const narratorService = {
 			tx.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, narratorId)).run();
 			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
 
-			const sharedRows = tx
-				.select({
-					id: narratorMessages.id,
-					contentJson: narratorMessages.contentJson,
-					newOwnerId: sql<string>`(
-						SELECT nmr.narrator_id FROM narrator_message_refs nmr
-						WHERE nmr.message_id = narrator_messages.id
-						ORDER BY nmr.seq ASC
-						LIMIT 1
-					)`,
-				})
-				.from(narratorMessages)
-				.where(
-					and(
-						eq(narratorMessages.narratorId, narratorId),
-						sql`EXISTS (
-							SELECT 1 FROM narrator_message_refs nmr
-							WHERE nmr.message_id = ${narratorMessages.id}
+			const sharedRows = fillBodies(
+				tx
+					.select({
+						id: narratorMessages.id,
+						contentJson: contentJsonSql(),
+						newOwnerId: sql<string>`(
+							SELECT nmr.narrator_id FROM narrator_message_refs nmr
+							WHERE nmr.message_id = narrator_messages.id
+							ORDER BY nmr.seq ASC
+							LIMIT 1
 						)`,
-					),
-				)
-				.all();
+					})
+					.from(narratorMessages)
+					.where(
+						and(
+							eq(narratorMessages.narratorId, narratorId),
+							sql`EXISTS (
+								SELECT 1 FROM narrator_message_refs nmr
+								WHERE nmr.message_id = ${narratorMessages.id}
+							)`,
+						),
+					)
+					.all(),
+			);
 
 			for (const row of sharedRows) {
 				const contentJson = annotateImageBlocksWithUploadOwner(row.contentJson, narratorId);
-				tx.update(narratorMessages)
-					.set({ narratorId: row.newOwnerId, contentJson })
-					.where(eq(narratorMessages.id, row.id))
-					.run();
+				writeEnvelopeBody(tx, row.id, contentJson, { set: { narratorId: row.newOwnerId } });
 				// Keep the shared card's exact historical tool rows, but do not transfer
 				// execution authority: a retained provenance clone is never resumable.
 				tx.update(narratorToolCalls)
@@ -2930,18 +2928,16 @@ export const narratorService = {
 						if (inheritMode === "compressed" && contextSummary) {
 							const compactMsgId = generateId();
 							const compactNow = new Date().toISOString();
-							tx.insert(narratorMessages)
-								.values({
-									id: compactMsgId,
-									narratorId: id,
-									role: "system",
-									...newEnvelopeColumns(id),
-									contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
-									contextCharsJson: { segments: [] },
-									contentText: `[Compressed context from parent conversation]`,
-									createdAt: compactNow,
-								})
-								.run();
+							insertEnvelope(tx, {
+								id: compactMsgId,
+								narratorId: id,
+								role: "system",
+								...newEnvelopeColumns(id),
+								contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+								contextCharsJson: { segments: [] },
+								contentText: `[Compressed context from parent conversation]`,
+								createdAt: compactNow,
+							});
 							// Same single seq authority as every other refs writer — the child's
 							// copied prefix is already in place, so this claims max(prefix)+1.
 							const compactSeq = claimNextRefSeq(tx, id);
@@ -2954,7 +2950,6 @@ export const narratorService = {
 									isCompact: 1,
 								})
 								.run();
-							syncEnvelopeNow(compactMsgId);
 						}
 
 						copyForkAccessAndRules(tx, parentNarratorId, id);

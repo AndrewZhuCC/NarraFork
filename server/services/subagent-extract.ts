@@ -15,7 +15,7 @@
  * - `aclRootNarratorId = null` — primary narrators are judged on their own columns.
  */
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
-import { asc, eq, getTableColumns, inArray } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
@@ -35,7 +35,8 @@ import {
 	newEnvelopeColumns,
 	newEnvelopeFormat,
 } from "./narrator-block-sync";
-import { contentJsonSql, fillBodies } from "./narrator-body-reads";
+import { bodyColumns, fillBodies } from "./narrator-body-reads";
+import { insertEnvelope, insertEnvelopeQueued } from "./narrator-body-writes";
 import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
@@ -150,10 +151,10 @@ export async function extractSubagentToPrimary(
 		for (let i = 0; i < sourceRefs.length; i += CHUNK) {
 			const chunk = sourceRefs.slice(i, i + CHUNK).map((row) => row.messageId);
 			const rows = fillBodies(
-				await db
-					.select({ ...getTableColumns(narratorMessages), contentJson: contentJsonSql() })
-					.from(narratorMessages)
-					.where(inArray(narratorMessages.id, chunk)),
+				await db.query.narratorMessages.findMany({
+					...bodyColumns(),
+					where: inArray(narratorMessages.id, chunk),
+				}),
 			);
 			for (const msg of rows) byId.set(msg.id, msg);
 		}
@@ -238,56 +239,55 @@ export async function extractSubagentToPrimary(
 				if (inheritMode === "full") {
 					for (const msg of orderedSourceMessages) {
 						const newMessageId = generateId();
-						tx.insert(narratorMessages)
-							.values({
-								id: newMessageId,
-								narratorId: id,
-								// Detach from the parent Agent tool-call tree so primary history
-								// builders that filter top-level messages keep this exploration.
-								parentToolUseId: null,
-								// New identity: never reuse the source SDK uuid.
-								messageUuid: null,
-								role: msg.role,
-								bodyFormat: newEnvelopeFormat(),
-								// A copy stays in the run that produced it.
-								turnId: msg.turnId,
-								// The subagent still authored what the new narrator holds (§6.3).
-								authorNarratorId: msg.authorNarratorId ?? msg.narratorId,
-								contentJson: msg.contentJson,
-								contextCharsJson: msg.contextCharsJson,
-								contentText: msg.contentText,
-								tokensIn: msg.tokensIn,
-								costUsd: msg.costUsd,
-								costStatus: msg.costStatus,
-								costMissingFields: msg.costMissingFields,
-								turnUsageJson: msg.turnUsageJson,
-								provider: msg.provider,
-								credentialId: msg.credentialId,
-								model: msg.model,
-								outputTokens: msg.outputTokens,
-								cachedInputTokens: msg.cachedInputTokens,
-								cacheCreationInputTokens: msg.cacheCreationInputTokens,
-								cacheCreation5mTokens: msg.cacheCreation5mTokens,
-								cacheCreation1hTokens: msg.cacheCreation1hTokens,
-								reasoningTokens: msg.reasoningTokens,
-								ttftMs: msg.ttftMs,
-								durationMs: msg.durationMs,
-								contextPercent: msg.contextPercent,
-								meterUsage: msg.meterUsage,
-								meterUnit: msg.meterUnit,
-								commitSha: msg.commitSha,
-								treeHashAfter: msg.treeHashAfter,
-								snapshotCommitSha: msg.snapshotCommitSha,
-								commandText: msg.commandText,
-								createdBy: msg.createdBy,
-								origin: msg.origin,
-								originLabel: msg.originLabel,
-								editedAt: msg.editedAt,
-								editedBy: msg.editedBy,
-								originalContentJson: msg.originalContentJson,
-								createdAt: msg.createdAt,
-							})
-							.run();
+						// Up to EXTRACT_FULL_MAX_MESSAGES copies: their rows are built by the sweep.
+						insertEnvelopeQueued(tx, {
+							id: newMessageId,
+							narratorId: id,
+							// Detach from the parent Agent tool-call tree so primary history
+							// builders that filter top-level messages keep this exploration.
+							parentToolUseId: null,
+							// New identity: never reuse the source SDK uuid.
+							messageUuid: null,
+							role: msg.role,
+							bodyFormat: newEnvelopeFormat(),
+							// A copy stays in the run that produced it.
+							turnId: msg.turnId,
+							// The subagent still authored what the new narrator holds (§6.3).
+							authorNarratorId: msg.authorNarratorId ?? msg.narratorId,
+							contentJson: msg.contentJson,
+							contextCharsJson: msg.contextCharsJson,
+							contentText: msg.contentText,
+							tokensIn: msg.tokensIn,
+							costUsd: msg.costUsd,
+							costStatus: msg.costStatus,
+							costMissingFields: msg.costMissingFields,
+							turnUsageJson: msg.turnUsageJson,
+							provider: msg.provider,
+							credentialId: msg.credentialId,
+							model: msg.model,
+							outputTokens: msg.outputTokens,
+							cachedInputTokens: msg.cachedInputTokens,
+							cacheCreationInputTokens: msg.cacheCreationInputTokens,
+							cacheCreation5mTokens: msg.cacheCreation5mTokens,
+							cacheCreation1hTokens: msg.cacheCreation1hTokens,
+							reasoningTokens: msg.reasoningTokens,
+							ttftMs: msg.ttftMs,
+							durationMs: msg.durationMs,
+							contextPercent: msg.contextPercent,
+							meterUsage: msg.meterUsage,
+							meterUnit: msg.meterUnit,
+							commitSha: msg.commitSha,
+							treeHashAfter: msg.treeHashAfter,
+							snapshotCommitSha: msg.snapshotCommitSha,
+							commandText: msg.commandText,
+							createdBy: msg.createdBy,
+							origin: msg.origin,
+							originLabel: msg.originLabel,
+							editedAt: msg.editedAt,
+							editedBy: msg.editedBy,
+							originalContentJson: msg.originalContentJson,
+							createdAt: msg.createdAt,
+						});
 
 						const seq = claimNextRefSeq(tx, id);
 						tx.insert(narratorMessageRefs)
@@ -303,24 +303,22 @@ export async function extractSubagentToPrimary(
 					}
 				} else if (contextSummary) {
 					const compactMsgId = generateId();
-					tx.insert(narratorMessages)
-						.values({
-							id: compactMsgId,
-							narratorId: id,
-							parentToolUseId: null,
-							role: "system",
-							...newEnvelopeColumns(id),
-							contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
-							contextCharsJson: { segments: [] },
-							contentText:
-								locale === "zh-CN"
-									? `[来自子代理的压缩上下文：${source.title ?? sourceId}]`
-									: `[Compressed context extracted from subagent ${source.title ?? sourceId}]`,
-							origin: "system",
-							originLabel: `extractFromSubagent:${sourceId}`,
-							createdAt: now,
-						})
-						.run();
+					insertEnvelope(tx, {
+						id: compactMsgId,
+						narratorId: id,
+						parentToolUseId: null,
+						role: "system",
+						...newEnvelopeColumns(id),
+						contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+						contextCharsJson: { segments: [] },
+						contentText:
+							locale === "zh-CN"
+								? `[来自子代理的压缩上下文：${source.title ?? sourceId}]`
+								: `[Compressed context extracted from subagent ${source.title ?? sourceId}]`,
+						origin: "system",
+						originLabel: `extractFromSubagent:${sourceId}`,
+						createdAt: now,
+					});
 					const seq = claimNextRefSeq(tx, id);
 					tx.insert(narratorMessageRefs)
 						.values({

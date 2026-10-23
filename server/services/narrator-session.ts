@@ -362,6 +362,7 @@ import {
 	rowAt,
 } from "./narrator-block-targets";
 import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
+import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
 	enqueueBufferedMessage,
@@ -6088,9 +6089,12 @@ async function rollbackToBlockUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 
 	const blocks = Array.isArray(targetMsg.contentJson)
@@ -6176,9 +6180,12 @@ async function rollbackToBlockUnlocked(
 			});
 		} else {
 			// Broadcast the updated message
-			const updatedMsg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-			});
+			const updatedMsg = fillBody(
+				await db.query.narratorMessages.findFirst({
+					...bodyColumns(),
+					where: eq(narratorMessages.id, messageId),
+				}),
+			);
 			if (updatedMsg) {
 				broadcastToNarrator(narratorId, {
 					type: "message_updated",
@@ -6490,9 +6497,12 @@ async function editAndRegenerateUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "user") {
 		// The message was found; the request is what is wrong. As a NotFoundError this
@@ -6924,9 +6934,12 @@ async function editAssistantMessageUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
 		throw new ValidationError("Can only edit assistant messages");
@@ -6955,9 +6968,12 @@ async function editAssistantMessageUnlocked(
 
 	// Broadcast the updated message. If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
-	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, privateMessageId),
-	});
+	const updatedMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, privateMessageId),
+		}),
+	);
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -6999,9 +7015,12 @@ async function restoreAssistantMessageUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
 		throw new ValidationError("Can only restore assistant messages");
@@ -7044,9 +7063,12 @@ async function restoreAssistantMessageUnlocked(
 		},
 	);
 
-	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, privateMessageId),
-	});
+	const updatedMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, privateMessageId),
+		}),
+	);
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -7101,9 +7123,11 @@ function broadcastEditedMessage(
 	messageId: string,
 	privateMessageId: string,
 ): void {
-	const updated = db.query.narratorMessages
-		.findFirst({ where: eq(narratorMessages.id, privateMessageId) })
-		.sync();
+	const updated = fillBody(
+		db.query.narratorMessages
+			.findFirst({ ...bodyColumns(), where: eq(narratorMessages.id, privateMessageId) })
+			.sync(),
+	);
 	if (!updated) return;
 	broadcastToNarrator(narratorId, {
 		type: "message_updated",
@@ -7143,9 +7167,12 @@ async function editOutputBlockUnlocked(
 	const before = sqlite.prepare("SELECT payload FROM narrator_blocks WHERE id = ?").get(row.id) as {
 		payload: string;
 	};
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, target.messageId),
-	});
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, target.messageId),
+		}),
+	);
 	if (!message) throw new NotFoundError("Message", target.messageId);
 	const elements = Array.isArray(message.contentJson)
 		? (message.contentJson as Array<Record<string, unknown>>)
@@ -7214,9 +7241,12 @@ async function restoreOutputBlockUnlocked(
 	// Never edited by block: nothing to restore.
 	if (!target.rowId || !Array.isArray(raw))
 		return { ok: true, messageId: target.messageId, blockId: target.blockId };
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, target.messageId),
-	});
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, target.messageId),
+		}),
+	);
 	if (!message) throw new NotFoundError("Message", target.messageId);
 	const elements = Array.isArray(message.contentJson) ? (message.contentJson as unknown[]) : [];
 	const contentJson = [...elements.slice(0, target.from), ...raw, ...elements.slice(target.to)];
@@ -7417,12 +7447,14 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 			// meaningful text/reasoning content that should be preserved
 			// (e.g. user interrupted while the model was streaming a long text block).
 			const hasContent = db.transaction((tx) => {
-				const msg = tx.query.narratorMessages
-					.findFirst({
-						where: eq(narratorMessages.id, partialId),
-						columns: { contentJson: true },
-					})
-					.sync();
+				const msg = fillBody(
+					tx.query.narratorMessages
+						.findFirst({
+							where: eq(narratorMessages.id, partialId),
+							...bodyColumns({ id: true, contentJson: true }),
+						})
+						.sync(),
+				);
 				const blocks = Array.isArray(msg?.contentJson)
 					? (msg.contentJson as Array<Record<string, unknown>>)
 					: [];
@@ -7440,24 +7472,22 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 				// Note: since executed.length === 0, toolCalls here are all unexecuted.
 				if (toolCalls.length > 0) {
 					const toolUseIds = new Set(toolCalls.map((tc) => tc.toolUseId));
-					tx.delete(narratorToolCalls)
-						.where(
-							inArray(
-								narratorToolCalls.id,
-								toolCalls.map((tc) => tc.id),
-							),
-						)
-						.run();
 					const filtered = blocks.filter(
 						(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
 					);
-					tx.update(narratorMessages)
-						.set({
-							contentJson: filtered,
-							contextCharsJson: measureMessageCharacters("assistant", filtered),
-						})
-						.where(eq(narratorMessages.id, partialId))
-						.run();
+					writeEnvelopeBody(tx, partialId, filtered, {
+						set: { contextCharsJson: measureMessageCharacters("assistant", filtered) },
+						rows: () =>
+							tx
+								.delete(narratorToolCalls)
+								.where(
+									inArray(
+										narratorToolCalls.id,
+										toolCalls.map((tc) => tc.id),
+									),
+								)
+								.run(),
+					});
 				}
 
 				logger.info("Preserved partial message with streamed content (no tool execution)", {
@@ -7487,6 +7517,8 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 		const unexecutedToolUseIds = new Set(unexecuted.map((tc) => tc.toolUseId));
 
 		db.transaction((tx) => {
+			// The body is read before the ledger writes, which queue the envelope for a sync.
+			const body = unexecutedToolUseIds.size > 0 ? readEnvelopeBody(tx, partialId) : undefined;
 			// Delete unexecuted tool_call records
 			if (unexecuted.length > 0) {
 				tx.delete(narratorToolCalls)
@@ -7516,26 +7548,14 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 					.run();
 			}
 
-			// Remove unexecuted tool_use blocks from contentJson
-			if (unexecutedToolUseIds.size > 0) {
-				const msg = tx.query.narratorMessages
-					.findFirst({
-						where: eq(narratorMessages.id, partialId),
-						columns: { contentJson: true },
-					})
-					.sync();
-				if (msg && Array.isArray(msg.contentJson)) {
-					const filtered = (msg.contentJson as Array<Record<string, unknown>>).filter(
-						(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
-					);
-					tx.update(narratorMessages)
-						.set({
-							contentJson: filtered,
-							contextCharsJson: measureMessageCharacters("assistant", filtered),
-						})
-						.where(eq(narratorMessages.id, partialId))
-						.run();
-				}
+			// Remove unexecuted tool_use blocks from the body
+			if (Array.isArray(body)) {
+				const filtered = (body as Array<Record<string, unknown>>).filter(
+					(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
+				);
+				writeEnvelopeBody(tx, partialId, filtered, {
+					set: { contextCharsJson: measureMessageCharacters("assistant", filtered) },
+				});
 			}
 		});
 

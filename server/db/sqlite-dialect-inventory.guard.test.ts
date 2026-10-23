@@ -523,7 +523,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
-	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	"server/services/narrator-block-sync.ts": ["handle", "sqliteCatalog", "insertOr", "rowid"],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
@@ -546,7 +546,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// Main-thread Drizzle readers' bodies from block rows (SQLite-only, like block storage).
 	"server/services/narrator-body-reads.ts": ["handle", "json1"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
-	"server/lib/narrator-bodies.ts": ["driver"],
+	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
 	// storage): exports, the session interchange, and the body length they measure in SQL.
 	"server/lib/narrator-body-length.ts": ["json1"],
@@ -579,7 +579,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 		"json1",
 	],
-	"server/services/revert-planner-local-access.ts": ["json1"],
 	"server/services/revert-planner-service.ts": ["nativeClient"],
 	"server/services/revert-selection-service.ts": [
 		"driver",

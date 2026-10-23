@@ -87,7 +87,7 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
-import { newEnvelopeColumns, syncEnvelopeNow, withRetiredBlocks } from "./narrator-block-sync";
+import { newEnvelopeColumns, withRetiredBlocks } from "./narrator-block-sync";
 import {
 	MAX_BLOCK_DELETE_ELEMENTS,
 	materializeTargets,
@@ -97,11 +97,13 @@ import {
 import {
 	bodyColumns,
 	contentJsonSql,
+	envelopeStoredBytesSql,
 	fillBodies,
 	fillBody,
 	hasStoredElementSql,
 	storedBodyBytesSql,
 } from "./narrator-body-reads";
+import { insertEnvelope, readEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	createPostgresNarratorDisplayPagePort,
 	readDisplayFixtureMessages,
@@ -495,7 +497,7 @@ function planDerivedHistoryCleanup(
 				.select({
 					id: narratorMessages.id,
 					parentToolUseId: narratorMessages.parentToolUseId,
-					bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))),
+					bytes: envelopeStoredBytesSql(),
 				})
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, child.id))
@@ -562,12 +564,14 @@ function planDerivedHistoryCleanup(
 function assertNoRunningCompactMessagesTx(tx: MessageTx, messageIds: string[]) {
 	if (messageIds.length === 0) return [];
 	// All selected message bytes have already been admitted by the caller.
-	const rows = tx
-		.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.id, messageIds))
-		.limit(BLOCK_DELETE_ROW_LIMIT + 1)
-		.all();
+	const rows = fillBodies(
+		tx
+			.select({ id: narratorMessages.id, contentJson: contentJsonSql() })
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.id, messageIds))
+			.limit(BLOCK_DELETE_ROW_LIMIT + 1)
+			.all(),
+	);
 	const toolBlocks: Array<{ messageId: string; toolUseId: string }> = [];
 	for (const row of rows) {
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
@@ -636,16 +640,14 @@ function planBlockDeletions(
 			.sync();
 		if (!ref) throw new NotFoundError("Message", messageId);
 		const size = tx
-			.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))) })
+			.select({ bytes: envelopeStoredBytesSql() })
 			.from(narratorMessages)
 			.where(eq(narratorMessages.id, messageId))
 			.get();
 		if (!size) throw new NotFoundError("Message", messageId);
 		// Check bytes in SQL before materializing any large JSON/text field.
 		reserve(4, size.bytes);
-		const message = tx.query.narratorMessages
-			.findFirst({ where: eq(narratorMessages.id, messageId) })
-			.sync();
+		const message = readEnvelope(tx, messageId);
 		if (!message) throw new NotFoundError("Message", messageId);
 		const blocks = Array.isArray(message.contentJson)
 			? (message.contentJson as DeletableBlock[])
@@ -887,21 +889,24 @@ function applyBlockDeletionTx(
 			receipt: "semantic_edit",
 		});
 	} else {
-		tx.update(narratorMessages).set(patch).where(eq(narratorMessages.id, message.id)).run();
+		writeEnvelopeBody(tx, message.id, remaining, {
+			set: patch,
+			rows: () => {
+				if (removedToolIds.length > 0)
+					tx.delete(narratorToolCalls)
+						.where(
+							and(
+								eq(narratorToolCalls.messageId, message.id),
+								inArray(narratorToolCalls.toolUseId, removedToolIds),
+							),
+						)
+						.run();
+			},
+		});
 		updateRecipientMessageRef(tx, narratorId, ref.id, {
 			kind: "semantic_edit",
 			messageId: message.id,
 		});
-		if (removedToolIds.length > 0) {
-			tx.delete(narratorToolCalls)
-				.where(
-					and(
-						eq(narratorToolCalls.messageId, message.id),
-						inArray(narratorToolCalls.toolUseId, removedToolIds),
-					),
-				)
-				.run();
-		}
 		return message.id;
 	}
 }
@@ -993,7 +998,6 @@ async function deleteBlockSelection(
 						seq: plan.ref.seq,
 					});
 			}
-			for (const { id } of updatedMessageIds) syncEnvelopeNow(id);
 			if (!opts?.skipNarratorUpdate) {
 				tx.update(narrators)
 					.set({
@@ -1024,12 +1028,15 @@ async function deleteBlockSelection(
 	try {
 		const uniqueUpdated = [...new Map(updatedMessageIds.map((item) => [item.id, item])).values()];
 		for (const item of uniqueUpdated) {
-			const message = db.query.narratorMessages
-				.findFirst({
-					where: eq(narratorMessages.id, item.id),
-					with: { toolCalls: true },
-				})
-				.sync();
+			const message = fillBody(
+				db.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: eq(narratorMessages.id, item.id),
+						with: { toolCalls: true },
+					})
+					.sync(),
+			);
 			if (!message) throw new Error("updated message disappeared after commit");
 			broadcastToNarrator(narratorId, {
 				type: "message_updated",
@@ -1102,14 +1109,19 @@ function copySharedCompactMessageTx(
 
 function assertNoRunningCompactRefsTx(tx: MessageTx, narratorId: string, refIds: string[]): void {
 	if (refIds.length === 0) return;
-	const rows = tx
-		.select({ contentJson: narratorMessages.contentJson })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), inArray(narratorMessageRefs.id, refIds)),
-		)
-		.all();
+	const rows = fillBodies(
+		tx
+			.select({ id: narratorMessages.id, contentJson: contentJsonSql() })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessageRefs.id, refIds),
+				),
+			)
+			.all(),
+	);
 	for (const row of rows) {
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
 		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
@@ -1139,20 +1151,23 @@ function deleteOutputlessAssistantMessage(
 			})
 			.sync();
 		if (!ref) return false;
-		const msg = tx.query.narratorMessages
-			.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: {
-					role: true,
-					contentJson: true,
-					contentText: true,
-					parentToolUseId: true,
-					treeHashAfter: true,
-					snapshotCommitSha: true,
-				},
-				with: { toolCalls: { columns: { id: true }, limit: 1 } },
-			})
-			.sync();
+		const msg = fillBody(
+			tx.query.narratorMessages
+				.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					...bodyColumns({
+						id: true,
+						role: true,
+						contentJson: true,
+						contentText: true,
+						parentToolUseId: true,
+						treeHashAfter: true,
+						snapshotCommitSha: true,
+					}),
+					with: { toolCalls: { columns: { id: true }, limit: 1 } },
+				})
+				.sync(),
+		);
 		if (!msg) return false;
 		const valid =
 			kind === "reasoning-only"
@@ -1392,7 +1407,7 @@ function planMessageRangeDeletion(
 						WHERE ${narratorMessages.id} = ${narratorMessageRefs.messageId}
 						AND ${narratorMessageRefs.segmentCompactId} = ${narratorMessageRefs.messageId}
 						AND ${narratorMessages.role} = 'disp'
-						AND ${narratorMessages.contentJson} = ${JSON.stringify([{ type: "file_history_checkpoint" }])}
+						AND ${hasStoredElementSql("file_history_checkpoint")}
 					)`
 					: undefined,
 			),
@@ -1409,7 +1424,7 @@ function planMessageRangeDeletion(
 					.select({
 						id: narratorMessages.id,
 						narratorId: narratorMessages.narratorId,
-						bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))),
+						bytes: envelopeStoredBytesSql(),
 					})
 					.from(narratorMessages)
 					.where(inArray(narratorMessages.id, messageIds))
@@ -1650,18 +1665,16 @@ function insertFileHistoryCheckpoints(
 	for (const group of groups) {
 		if (group.toolCalls.length === 0) continue;
 		const checkpointId = generateId();
-		tx.insert(narratorMessages)
-			.values({
-				id: checkpointId,
-				narratorId,
-				role: "disp",
-				...newEnvelopeColumns(narratorId),
-				contentJson: [{ type: "file_history_checkpoint" }],
-				contextCharsJson: { segments: [] },
-				contentText: null,
-				createdAt: new Date().toISOString(),
-			})
-			.run();
+		insertEnvelope(tx, {
+			id: checkpointId,
+			narratorId,
+			role: "disp",
+			...newEnvelopeColumns(narratorId),
+			contentJson: [{ type: "file_history_checkpoint" }],
+			contextCharsJson: { segments: [] },
+			contentText: null,
+			createdAt: new Date().toISOString(),
+		});
 		tx.insert(narratorMessageRefs)
 			.values({
 				id: generateId(),
@@ -4608,11 +4621,14 @@ const narratorMessageQueriesUnlocked = {
 
 	async getCompactSummary(narratorId: string, messageId: string) {
 		return db.transaction((tx) => {
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-				})
-				.sync();
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					})
+					.sync(),
+			);
 			const ref = tx.query.narratorMessageRefs
 				.findFirst({
 					where: and(
@@ -4692,11 +4708,14 @@ const narratorMessageQueriesUnlocked = {
 					),
 				})
 				.sync();
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-				})
-				.sync();
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					})
+					.sync(),
+			);
 			if (!msg || !currentRef) throw new NotFoundError("Message", messageId);
 
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -5175,11 +5194,14 @@ const narratorMessageQueriesUnlocked = {
 					),
 				})
 				.sync();
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-				})
-				.sync();
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					})
+					.sync(),
+			);
 			if (!msg || !ref) throw new NotFoundError("Message", messageId);
 
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -5194,14 +5216,12 @@ const narratorMessageQueriesUnlocked = {
 			const now = new Date().toISOString();
 			const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
 
-			tx.update(narratorMessages)
-				.set({
-					contentJson: [newBlock],
+			writeEnvelopeBody(tx, copied.messageId, [newBlock], {
+				set: {
 					contextCharsJson: { segments: [] },
 					contentText: `${prefix} ${summary.slice(0, 200)}...`,
-				})
-				.where(eq(narratorMessages.id, copied.messageId))
-				.run();
+				},
+			});
 
 			tx.update(narrators)
 				.set({

@@ -19,6 +19,26 @@
 import type { Database } from "bun:sqlite";
 import { parseStored } from "@shared/narrator-blocks/plan";
 import { assembleContent } from "@shared/narrator-blocks/storage";
+import { assembledBodyLengthSql } from "./narrator-body-length";
+
+const blockStorage = new WeakMap<Database, boolean>();
+
+/**
+ * Whether the database has block storage at all; a connection to a schema predating it
+ * (or a test fixture without it) keeps reading `content_json`.
+ */
+export function hasBlockStorage(db: Database): boolean {
+	let known = blockStorage.get(db);
+	if (known === undefined) {
+		known = !!db
+			.query(
+				"SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'narrator_block_sync_queue' LIMIT 1",
+			)
+			.get();
+		blockStorage.set(db, known);
+	}
+	return known;
+}
 
 /** Whether the envelope at `alias` reads from its block rows: they are current. */
 export function blocksCurrentSql(alias: string): string {
@@ -45,6 +65,53 @@ export function bodyBytesSql(alias: string, fromBlocks: boolean): string {
 	if (!fromBlocks) return json;
 	return `CASE WHEN ${alias}.body_format = 2 AND ${alias}.body_bytes > 0
 		THEN ${alias}.body_bytes ELSE ${json} END`;
+}
+
+/**
+ * The UTF-8 length of the envelope's body as readers read it: of the array its rows
+ * assemble to when they hold it (`assembledBodyLengthSql`, exactly what `content_json`
+ * measures), of `content_json` otherwise.
+ */
+export function bodyLengthSql(alias: string, fromBlocks: boolean): string {
+	const json = `octet_length(${alias}.content_json)`;
+	if (!fromBlocks) return json;
+	return `(CASE WHEN ${blocksCurrentSql(alias)} THEN ${assembledBodyLengthSql(`${alias}.id`, "bytes")} ELSE ${json} END)`;
+}
+
+/**
+ * An envelope's body as stored text, read as readers read it and only within bounds:
+ * `content_json`, or its rows assembled and serialized (the same length, `bodyLengthSql`).
+ * The length is checked before the body is read; `exactBytes` also requires that length.
+ * Undefined when there is no such envelope or its body is outside the bounds.
+ */
+export function boundedBodyText(
+	db: Database,
+	messageId: string,
+	fromBlocks: boolean,
+	bounds: { maxBytes: number; exactBytes?: number },
+): string | undefined {
+	const measured = db
+		.query<{ inBlocks: number; bytes: number | null }, [string]>(
+			`SELECT ${fromBlocks ? blocksCurrentSql("m") : "0"} AS inBlocks,
+				${bodyLengthSql("m", fromBlocks)} AS bytes
+			 FROM narrator_messages m WHERE m.id = ? LIMIT 1`,
+		)
+		.get(messageId);
+	const within = (bytes: number | null | undefined): bytes is number =>
+		typeof bytes === "number" &&
+		bytes <= bounds.maxBytes &&
+		(bounds.exactBytes === undefined || bytes === bounds.exactBytes);
+	if (!measured || !within(measured.bytes)) return undefined;
+	if (!measured.inBlocks)
+		return (
+			db
+				.query<{ body: string }, [string, number]>(
+					"SELECT content_json AS body FROM narrator_messages WHERE id = ? AND octet_length(content_json) = ? LIMIT 1",
+				)
+				.get(messageId, measured.bytes)?.body ?? undefined
+		);
+	const text = JSON.stringify(blockBodies(db, [messageId]).get(messageId) ?? []);
+	return Buffer.byteLength(text) === measured.bytes ? text : undefined;
 }
 
 const ID_BATCH = 500;

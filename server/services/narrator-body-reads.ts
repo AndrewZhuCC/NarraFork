@@ -15,10 +15,10 @@
  */
 
 import type { AnyColumn, SQL } from "drizzle-orm";
-import { sql } from "drizzle-orm";
+import { getTableColumns, sql } from "drizzle-orm";
 import * as database from "../db";
 import { narratorMessages } from "../db/schema";
-import { blockBodies } from "../lib/narrator-bodies";
+import { blockBodies, boundedBodyText } from "../lib/narrator-bodies";
 import { assembledBodyLengthSql } from "../lib/narrator-body-length";
 import { blockReadsEnabled } from "./narrator-block-scans";
 
@@ -91,6 +91,23 @@ export function storedBodyBytesSql(table: EnvelopeColumns = narratorMessages): S
 }
 
 /**
+ * The stored size of an envelope row for a budget on rows read or copied: every column but
+ * the body, and the body where it is kept (`body_bytes` when its rows hold it, as
+ * `bodyBytesSql` sizes read batches; the column's length otherwise).
+ */
+export function envelopeStoredBytesSql(): SQL<number> {
+	const { contentJson: body, ...columns } = getTableColumns(narratorMessages);
+	const sized = Object.values(columns)
+		.filter((column) => !column.generated)
+		.map((column) => sql`coalesce(octet_length(${column}), 0)`);
+	const json = sql`coalesce(octet_length(${body}), 0)`;
+	const stored = blockReadsEnabled()
+		? sql`(CASE WHEN ${blocksCurrent(narratorMessages)} THEN ${narratorMessages.bodyBytes} ELSE ${json} END)`
+		: json;
+	return sql<number>`${sql.join([...sized, stored], sql` + `)}`;
+}
+
+/**
  * The ordinal of the envelope's tool block for the call `wireId`, when its block rows hold
  * its body (NULL otherwise, or without such a block): the position the call's `tool_use`
  * element has among the stored elements, in the same order.
@@ -156,6 +173,14 @@ export function fillBodies<T extends { id: string; contentJson: unknown }>(rows:
 	const bodies = blockBodies(database.sqlite, missing);
 	for (const row of rows) if (row.contentJson === null) row.contentJson = bodies.get(row.id) ?? [];
 	return rows;
+}
+
+/**
+ * One envelope's body as stored text, measured before it is read and read only within
+ * `maxBytes` (`boundedBodyText`): for a reader on the HTTP thread that parses it.
+ */
+export function boundedStoredBody(messageId: string, maxBytes: number): string | undefined {
+	return boundedBodyText(database.sqlite, messageId, blockReadsEnabled(), { maxBytes });
 }
 
 /** One envelope's body assembled from its block rows (for a reader that saw it NULL). */
