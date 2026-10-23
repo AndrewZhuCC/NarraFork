@@ -1842,14 +1842,14 @@ reconcile(narrator, target, now):
   - 旧格式信封照旧现场解码成块（§10.7），前端只见块。
 - **回退**：前端改造后 v1 路径不可达，所以 `wsV2` 开关与改造在同一个 PR 里删除，回退靠上一个正式版本。P3d 在默认开启 v2 的版本正式发布之后开始，这样 v2 协议本身已在线上跑过。
 
-**P3d 分步**（一个 PR，每步提交后 CI 全绿、应用可用）：
-1. 直接升级测试（§10.7）：P1 之前 schema 的库快照，覆盖迁移、现场解码、回填与退役。只测服务端，先行落地，后面各步都受它保护。
-2. 服务端为所有流式元素补元素 id，所有增量都以 `block_delta` 发出；补齐各 provider 的流式测试。
-3. 前端 store 与入口改为信封 + 块；在布局入口临时把块投影回旧的行形态，渲染不变。
-4. 建行改为按块（分段、活动单元、`segment-adapter`、键），删除临时投影。
-5. 流式改为 store 里的 open 块，删除累加器、交接与启发式。
-6. 补丁、选择、编辑、ask、各索引与操作改为按块 id；聊天与分享页的行生成改走辅助函数。
-7. 删除 v1 协议、`wsV2`、`block-protocol.ts` / `block-refs.ts`、按下标的路由与死代码；更新文档。
+**P3d 分步**（每步提交后 CI 全绿、应用可用；服务端两步与前端各自成 PR）：
+1. 直接升级测试（§10.7）：P1 之前 schema 的库快照，覆盖迁移、现场解码、回填与退役。只测服务端，先行落地，后面各步都受它保护。（已完成）
+2. 服务端保证每个流式增量都带元素 id：loop 是 `stream_text` / `stream_reasoning` 唯一的产生者，它的 `OutputContentAccumulator` 总给出与落库元素相同的 `${attempt}:${order}`；事件类型改为必填，删掉无 id 的回退（按 lane 的随机 id、OpenAI itemId、`FileReferenceContextTracker` 按输出下标的通道），每个增量都以 `block_delta` 发出。（已完成）
+3. 前端的块访问器 `messageBlocks`（`shared/narrator-blocks/message-blocks.ts`）：协议行按它带的块；客户端自建的行（流式行、聊天与分享页的行、测试数据）按服务端切分旧信封的同一函数 `splitEnvelope` 切块，两边分组一致（块页测试里有对齐检查）。之后读消息正文的代码都经它，不再按 `contentJson` 下标。
+4. 身份：所有元素行按块作键（`elementKey` 经访问器）；块目标、选择、编辑目标、ask、各索引与操作改为块 id（加块内偏移），经文档里的行解析，不再查全局登记表。
+5. 分组：分段、活动单元、`segment-adapter` 逐块遍历；注入与伴随块的配对取块边界。
+6. 流式改为按块 id 的 open 块，删除累加器、交接与启发式。
+7. 行改为直接持有块：删除 `contentJson`、`children`、`blockRefs` 与 `block-refs.ts`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
 
 **验收**：
 - §10.7 的直接升级测试通过。
