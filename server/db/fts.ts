@@ -261,6 +261,16 @@ function dropRetiredFtsObjects(sqlite: Database): void {
 	logger.info("Dropped retired FTS objects", { objects: present.map((row) => row.name) });
 }
 
+const envelopeIndexRetired = false;
+
+/**
+ * Whether `ensureFts` retired the envelope index (`narrator_messages_fts`) on this process's
+ * database (docs/BLOCK_STORAGE-DESIGN.md §4.6, P3c): search then reads the block index alone.
+ */
+export function isEnvelopeIndexRetired(): boolean {
+	return envelopeIndexRetired;
+}
+
 export function ensureFts(
 	sqlite: Database,
 	options: {
