@@ -23,7 +23,7 @@ import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { isSubagentModelInheritance } from "../model-inheritance";
-import { blockAtIndex } from "../narrator-blocks/message-blocks";
+import { blockAtIndex, messageBody } from "../narrator-blocks/message-blocks";
 import {
 	contextBlockViews,
 	injectionBlockViews,
@@ -373,7 +373,7 @@ export interface AdapterToolDetailRef {
 
 export function resolveToolDetailRef(item: AdapterToolItem): AdapterToolDetailRef {
 	const messageId = item.msg?.id ?? item.tc.messageId;
-	const block = item.msg?.contentJson[item.blockIndex];
+	const block = messageBody(item.msg)[item.blockIndex];
 	const attempt =
 		item.tc.executionAttempt ??
 		(block?.type === "tool_use" && block.id === item.tc.toolUseId
@@ -1454,7 +1454,7 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 
 /** Render native/legacy context blocks independently while preserving physical order. */
 function adaptContextBlocks(
-	blocks: AdapterContentBlock[],
+	blocks: readonly AdapterContentBlock[],
 	idBase: string,
 	msg: AdapterMessage,
 	ctx: AdapterContext,
@@ -1645,7 +1645,7 @@ function adaptMessage(
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const specs: ElementSpec[] = [];
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	const indices = visibleBlockIndices ?? blocks.map((_, i) => i);
 	const idBase = msg.id ?? "msg";
 
@@ -3264,7 +3264,7 @@ function adaptSystemBlock(
 	// The message's leading text block is the chunk renderer's `contentText`
 	// fallback (goalBlock.task ?? message.contentText, etc.).
 	const contentText =
-		msg.contentJson.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
+		messageBody(msg).find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
 
 	if (blockType === "compact" && block.subtype === "plan") {
 		return {
@@ -4565,15 +4565,13 @@ function collectUpstreamPeers(
 	ctx: AdapterContext,
 ): ToolUpstreamPeer[] {
 	const peers: ToolUpstreamPeer[] = [];
-	const blocks = item.msg?.contentJson;
+	const blocks = messageBody(item.msg);
 	const covered = new Set<string>();
-	if (Array.isArray(blocks)) {
-		for (let i = 0; i < item.blockIndex; i++) {
-			const block = blocks[i];
-			if (!block || block.type !== "tool_use") continue;
-			if (typeof block.id === "string" && block.id) covered.add(block.id);
-			peers.push(blockAsToolUpstreamPeer(block, ctx));
-		}
+	for (let i = 0; i < item.blockIndex; i++) {
+		const block = blocks[i];
+		if (!block || block.type !== "tool_use") continue;
+		if (typeof block.id === "string" && block.id) covered.add(block.id);
+		peers.push(blockAsToolUpstreamPeer(block, ctx));
 	}
 	for (const peer of earlier) {
 		// Same-message peers are already in `peers` via blockIndex order.
@@ -5041,11 +5039,11 @@ function reasoningRowIdentity(
 	const messageId = item.msg?.id;
 	if (!messageId || messageId === "__streaming__") return undefined;
 	const blockIndex = item.blockIndex ?? 0;
-	const blocks = item.msg?.contentJson;
-	if (Array.isArray(blocks) && blocks.length > 0) {
+	const blocks = messageBody(item.msg);
+	if (blocks.length > 0) {
 		// AdapterContentBlock allows null on text/thinking, so it is not structurally
 		// assignable to ContentBlockLike; grouping only reads `type`, which matches.
-		const { runs } = groupReasoningRuns(blocks as unknown as ContentBlockLike[]);
+		const { runs } = groupReasoningRuns(blocks as unknown as readonly ContentBlockLike[]);
 		for (const run of runs) {
 			if (run.indices.includes(blockIndex)) {
 				return {

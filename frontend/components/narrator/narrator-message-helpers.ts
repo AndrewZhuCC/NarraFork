@@ -1,3 +1,4 @@
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	appendSourceText,
 	createSourceText,
@@ -486,7 +487,7 @@ function findStreamingChunkMessage(
 				(message.toolCalls ?? []).some(
 					(call) => call.toolUseId === chunk.toolUseId && matches(call.id, call.executionAttempt),
 				) ||
-				message.contentJson.some(
+				messageBody(message).some(
 					(block) =>
 						block.type === "tool_use" &&
 						block.id === chunk.toolUseId &&
@@ -514,7 +515,7 @@ export function topLevelStreamingChunkMatchesPersistedTool(
 			records.push(toolCall as unknown as Record<string, unknown>);
 		}
 	}
-	for (const block of Array.isArray(message.contentJson) ? message.contentJson : []) {
+	for (const block of messageBody(message)) {
 		if (block.type === "tool_use" && block.id === chunk.toolUseId) {
 			records.push(block as unknown as Record<string, unknown>);
 		}
@@ -724,7 +725,7 @@ export function preserveLiveSubagentActivity(
 			existingActivities.set(toolCall.toolUseId, toolCall._subagentActivity);
 		}
 	}
-	for (const block of existing.contentJson ?? []) {
+	for (const block of messageBody(existing)) {
 		if (block.type === "tool_use" && typeof block.id === "string" && block._subagentActivity) {
 			existingActivities.set(block.id, block._subagentActivity);
 		}
@@ -764,7 +765,7 @@ export function preserveLiveSubagentActivity(
 export function findLatestSpecTasksToolUseId(messages: NarratorMsg[]): string | null {
 	let latest: string | null = null;
 	for (const msg of messages) {
-		for (const block of msg.contentJson ?? []) {
+		for (const block of messageBody(msg)) {
 			if (block.type !== "tool_use") continue;
 			const id = typeof block.id === "string" ? block.id : null;
 			const name = typeof block.name === "string" ? block.name : null;

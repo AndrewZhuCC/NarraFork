@@ -10,6 +10,7 @@
  * dedicated connection via `useTerminalWS`.
  */
 
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import {
@@ -94,12 +95,11 @@ interface ListenerEntry {
 
 type ConnectionChangeCallback = (connected: boolean, isReconnect: boolean) => void;
 
-type MinimalTreeMessage = {
+type MinimalTreeMessage = MessageBodySource & {
 	id?: unknown;
 	narratorId?: unknown;
 	parentToolUseId?: unknown;
 	toolCalls?: unknown;
-	contentJson?: unknown;
 };
 
 /**
@@ -170,12 +170,10 @@ function extractToolUseIds(message: MinimalTreeMessage): string[] {
 			}
 		}
 	}
-	if (Array.isArray(message.contentJson)) {
-		for (const block of message.contentJson) {
-			if (block && typeof block === "object") {
-				const record = block as { type?: unknown; id?: unknown };
-				if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
-			}
+	for (const block of messageBody(message)) {
+		if (block && typeof block === "object") {
+			const record = block as { type?: unknown; id?: unknown };
+			if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
 		}
 	}
 	return [...ids];

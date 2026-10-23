@@ -1,3 +1,4 @@
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 /**
  * vlist-message-replace.ts — Decides whether a `message_updated` event can be
  * applied to the loaded document IN PLACE, instead of answering it with a full
@@ -45,9 +46,8 @@
  */
 
 /** The subset of a message this module reads. */
-export interface ReplaceCandidate {
+export interface ReplaceCandidate extends MessageBodySource {
 	id?: unknown;
-	contentJson?: unknown;
 }
 
 /** Optional server alias for copy-on-write replacement events. */
@@ -147,11 +147,8 @@ export function replaceLoadedMessage<T extends ReplaceCandidate>(
 	}
 
 	const previous = loaded[index];
-	const nextBlocks = message.contentJson;
-	const prevBlocks = previous?.contentJson;
-	if (!Array.isArray(nextBlocks) || !Array.isArray(prevBlocks)) {
-		return { messages: loaded, replaced: false, reason: "not-a-truncation" };
-	}
+	const nextBlocks = messageBody(message);
+	const prevBlocks = messageBody(previous);
 	// STRICTLY fewer blocks. Equal length is not a truncation (it is an edit, whose
 	// stable keys would serve stale heights), and more blocks is an append the
 	// reload path places correctly.

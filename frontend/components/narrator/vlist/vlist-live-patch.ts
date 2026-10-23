@@ -56,6 +56,7 @@ import {
 	type SendDeliveryTarget,
 } from "@shared/communication-tool";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	ACTIVE_REFLECTION_STATUSES,
 	getPermissionReflectionSuggestion,
@@ -127,7 +128,7 @@ function newestToolStatus(messages: readonly TreeMessage[], toolUseId: string): 
 			const nested = newestToolStatus(msg.children, toolUseId);
 			if (nested !== undefined) return nested;
 		}
-		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+		const blocks = messageBody(msg);
 		for (let b = blocks.length - 1; b >= 0; b--) {
 			const block = blocks[b];
 			if (block?.type === "tool_use" && block.id === toolUseId) {
@@ -254,7 +255,7 @@ export function patchSendDeliveryTargets(
 					return { messages: updated, changed: true };
 				}
 			}
-			const block = [...(row.contentJson ?? [])]
+			const block = [...messageBody(row)]
 				.reverse()
 				.find((value) => value.type === "tool_use" && value.id === toolUseId);
 			const tc = [...(row.toolCalls ?? [])]

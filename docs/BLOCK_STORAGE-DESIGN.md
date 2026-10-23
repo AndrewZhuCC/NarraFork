@@ -1849,9 +1849,11 @@ reconcile(narrator, target, now):
 4. 身份：所有元素行按块作键（`elementKey` 经访问器）；块目标、选择、编辑目标、ask、各索引与操作改为块 id（加块内偏移），经文档里的行解析，不再查全局登记表。
    - 已完成：元素行键与 vlist 块目标经访问器；删除（单个、批量）、回滚、文件恢复预览与编辑重生成在操作开始时从列表的行解析块（`MessageListHandle.messageOf` + `message/block-target.ts`），API 直接用块 id。服务端命名过的块（`MessageBlock.named`）才走 `/blocks` 路由，客户端自建的行仍走按下标的路由，直到第 7 步。`block-refs.ts` 与没有调用方的回滚预览、块删除预览查询已删除。
    - 余下的选择项、编辑目标、ask、工具元信息与反思索引并入第 5 步：它们的 `(messageId, blockIndex)` 来自分段按元素下标的遍历，分段改为逐块后随之得到块 id，单独先改只会多一层下标与块之间的换算。
-5. 分组与其余身份：分段、活动单元、`segment-adapter` 逐块遍历；注入与伴随块的配对取块边界；选择项、编辑目标、ask、各索引随之改为块 id（加块内偏移）。
+5. 正文经访问器：读消息正文的代码一律经 `messageBody`（元素）或 `messageBlocks`（块），不再读行的 `contentJson`。`frontend/lib/narrator-body-access.guard.test.ts` 按文件计数余下的直接使用，只降不升：访问器本身、行类型、构建或改写行的代码（store 的合并与补丁、流式、协议解码、聊天与夹具的行）。（已完成）
+   - 分组不另改写：非 assistant 消息在服务端解码为一个块（input 或 context），注入与伴随块的配对用的是与服务端解码相同的 `contextBlockViews` / `injectionBlockViews`；assistant 消息的分段按元素的类别（正文、工具、相邻 reasoning 成段），块边界只落在元素之间、不跨类别（旧信封每个元素一块）。按元素遍历得到的分组因此与逐块遍历相同，改写不会改变输出。
+   - 元素在消息内的位置只作遍历坐标（选择项、编辑目标、ask、各索引仍以 `(messageId, 位置)` 记），由 `messageBody` 从块推出，第 7 步后含义不变；身份（行键、操作）已按块。
 6. 流式改为按块 id 的 open 块，删除累加器、交接与启发式。
-7. 行改为直接持有块：删除 `contentJson`、`children`、`blockRefs`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
+7. 行改为直接持有块：`messageBody` / `messageBlocks` 改从块读，守卫里列出的改写行的代码改为按块；删除 `contentJson`、`children`、`blockRefs`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
 
 **验收**：
 - §10.7 的直接升级测试通过。

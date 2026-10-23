@@ -23,6 +23,7 @@
  */
 
 import type { ToolCallRecord } from "@frontend/lib/api";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	getPermissionReflectionSuggestion,
 	isReflectionPermissionLike,
@@ -121,8 +122,7 @@ function collectFromMessage(msg: NarratorMsg, index: Map<string, VListReflection
 	}
 
 	const covered = new Set<string>();
-	const blocks = Array.isArray(msg?.contentJson) ? (msg.contentJson as ContentBlock[]) : [];
-	for (const block of blocks) {
+	for (const block of messageBody(msg)) {
 		if (!block || typeof block !== "object" || block.type !== "tool_use") continue;
 		const toolUseId = nonEmpty(block.id);
 		if (!toolUseId) continue;

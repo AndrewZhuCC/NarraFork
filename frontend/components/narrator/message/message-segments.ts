@@ -7,6 +7,7 @@
 import { mergeSendDeliveryTargetCount, mergeSendDeliveryTargets } from "@shared/communication-tool";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import { appendStreamingTextPreview } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "../narrator-panel-types";
@@ -71,14 +72,14 @@ function isVisibleContentBlock(b: ContentBlock): boolean {
 
 export function hasToolUse(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	return blocks.some((b: ContentBlock) => b.type === "tool_use");
 }
 
 /** True when every visible block is either tool_use or blank text. */
 export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	return (
 		blocks.length > 0 &&
 		blocks.every(
@@ -112,7 +113,7 @@ function parseToolTimestamp(value: unknown): number | undefined {
  * synthetic-tool-call path had no remaining consumer and is gone.
  */
 export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	const results: ToolCallData[] = [];
 	for (const block of blocks) {
 		if (block.type !== "tool_use") continue;
@@ -354,7 +355,7 @@ function classifyBlock(b: ContentBlock): VisualLane | null {
 }
 
 function isEpochMarker(msg: NarratorMsg): boolean {
-	const head = Array.isArray(msg.contentJson) ? msg.contentJson[0] : undefined;
+	const head = messageBody(msg)[0];
 	return !!head && typeof head === "object" && (head as { type?: unknown }).type === "epoch";
 }
 
@@ -369,7 +370,7 @@ function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
 		return materials;
 	}
 
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	let hasTools = false;
 	for (let bi = 0; bi < blocks.length; bi++) {
 		const lane = classifyBlock(blocks[bi]);
@@ -924,7 +925,7 @@ export function buildStreamingMsg(opts: {
 	}
 
 	if (toolChunksMsg) {
-		const chunkBlocks = Array.isArray(toolChunksMsg.contentJson) ? toolChunksMsg.contentJson : [];
+		const chunkBlocks = messageBody(toolChunksMsg);
 		for (const raw of chunkBlocks) {
 			blocks.push(stabilizeToolUseBlock(raw));
 		}

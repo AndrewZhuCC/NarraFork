@@ -35,6 +35,7 @@ import {
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
@@ -4907,7 +4908,7 @@ export const PretextExactMessageList = memo(
 				(key: string, messageId: string, role: VListEditRole) => {
 					const msg = messagesByIdRef.current.get(messageId);
 					if (!msg) return;
-					const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+					const blocks = messageBody(msg);
 					const preview = resolveEditorInitialText(blocks, role);
 					if (preview.truncated) {
 						notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
@@ -4995,7 +4996,7 @@ export const PretextExactMessageList = memo(
 						{
 							canEditUser,
 							canEditAssistant,
-							hasEditableText: hasEditableTextBlock(msg?.contentJson),
+							hasEditableText: hasEditableTextBlock(messageBody(msg)),
 						},
 					);
 					const specKey = item.spec.key;
@@ -5193,7 +5194,7 @@ export const PretextExactMessageList = memo(
 								narratorId={narratorId}
 								messageId={row.messageId}
 								imageNarratorId={msg.narratorId ?? narratorId}
-								blocks={Array.isArray(msg.contentJson) ? msg.contentJson : []}
+								blocks={messageBody(msg)}
 								creator={msg.creator ?? null}
 								initialText={row.initialText}
 								isLastUserMessage={row.messageId === tailMeta.lastUserMessageId}

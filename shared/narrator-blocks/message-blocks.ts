@@ -63,6 +63,32 @@ export interface MessageBlock<E = unknown> {
 	from: number;
 }
 
+const EMPTY: readonly never[] = [];
+
+/** The least a row needs for `messageBody`: whatever holds its elements. */
+export interface MessageBodySource {
+	contentJson?: unknown;
+}
+
+/** A row's elements, typed after its body. */
+export type MessageBody<M> = M extends { contentJson?: infer B }
+	? NonNullable<B> extends readonly (infer E)[]
+		? readonly E[]
+		: readonly unknown[]
+	: readonly unknown[];
+
+/**
+ * The message's elements in order: its blocks' elements, one after another. Readers take a
+ * message's body through here, never from the row's storage field, so the row can change
+ * how it holds its blocks without them.
+ */
+export function messageBody<M extends MessageBodySource>(
+	message: M | null | undefined,
+): MessageBody<M> {
+	const body = message?.contentJson;
+	return (Array.isArray(body) ? body : EMPTY) as unknown as MessageBody<M>;
+}
+
 /** The last split of each body, with what it was split for (copies can share a body). */
 const cache = new WeakMap<
 	readonly unknown[],
@@ -74,13 +100,10 @@ const cache = new WeakMap<
 		blocks: readonly MessageBlock[];
 	}
 >();
-const EMPTY: readonly never[] = [];
 
 /** The message's blocks in order; the same array while its body and refs are the same. */
 export function messageBlocks<E>(message: BlockSourceMessage<E>): readonly MessageBlock<E>[] {
-	const elements = (
-		Array.isArray(message.contentJson) ? message.contentJson : EMPTY
-	) as readonly E[];
+	const elements = messageBody(message) as readonly E[];
 	const { id, role, origin, blockRefs: refs } = message;
 	const cached = cache.get(elements);
 	if (
