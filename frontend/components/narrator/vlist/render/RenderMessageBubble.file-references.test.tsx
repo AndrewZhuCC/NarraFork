@@ -180,7 +180,13 @@ describe("captured message file references", () => {
 				type: "content_block_delta",
 				outputIndex: 0,
 				fileReferenceContext: context,
-				delta: { type: "text_delta", text: "[file](src/a.ts#L2)" },
+				delta: {
+					type: "text_delta",
+					id: "1:0",
+					revision: 1,
+					textOffset: 0,
+					text: "[file](src/a.ts#L2)",
+				},
 			},
 			false,
 		);
@@ -190,7 +196,7 @@ describe("captured message file references", () => {
 				type: "content_block_delta",
 				outputIndex: 0,
 				fileReferenceContext: { deviceId: "ChangedDevice", cwd: "/other" },
-				delta: { type: "text_delta", text: "." },
+				delta: { type: "text_delta", id: "1:0", revision: 2, textOffset: 19, text: "." },
 			},
 			false,
 		);
@@ -236,7 +242,13 @@ describe("captured message file references", () => {
 						type: "content_block_delta",
 						outputIndex,
 						fileReferenceContext: { deviceId, cwd: "/repo" },
-						delta: { type: "text_delta", id: `lane-${deviceId}`, text: "[same](src/a.ts)" },
+						delta: {
+							type: "text_delta",
+							id: `lane-${deviceId}`,
+							revision: 1,
+							textOffset: 0,
+							text: "[same](src/a.ts)",
+						},
 					},
 					false,
 				);
