@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+// A zero-delay timer, not setImmediate: Bun can leave a queued immediate waiting on its next
+// long poll (up to ~1s), the same stall revert-selection-service.ts avoids.
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeRevertAction,
@@ -282,7 +284,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 						hash.update(
 							observed.bytes.subarray(offset, offset + FILE_CHANGE_LIMITS.streamChunkBytes),
 						);
-						await yieldToEventLoop();
+						await yieldToEventLoop(0);
 					}
 					state = {
 						kind: "regular",

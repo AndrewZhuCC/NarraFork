@@ -1,57 +1,48 @@
 import { Mark } from "@mantine/core";
 import type { ReactNode } from "react";
-import type { SearchFallback, SearchResponse } from "./api";
+import type { SearchSectionName, SearchSectionPage } from "./api";
 
-export type SearchResultType = "all" | "narrator" | "message" | "knowledge";
+/** The search page's tabs: everything, or one section. */
+export type SearchTab = "all" | SearchSectionName;
 
-export function normalizeSearchType(value: unknown): SearchResultType {
+/**
+ * Parse the `tab` URL value. Also accepts the old `type` values, so a bookmarked
+ * `?type=message` still opens the matching tab.
+ */
+export function normalizeSearchTab(value: unknown): SearchTab {
 	switch (value) {
-		case "narrator":
-		case "narrators":
-			return "narrator";
+		case "sessions":
+		case "session":
 		case "message":
 		case "messages":
-			return "message";
+		case "narrator":
+		case "narrators":
+			return "sessions";
 		case "knowledge":
 			return "knowledge";
-		case "all":
-		case undefined:
-		case null:
-			return "all";
 		default:
 			return "all";
 	}
 }
 
-/** Sort modes the search page offers. `time` (newest first) is the default. */
-export type SearchSortMode = "time" | "relevance" | "type" | "title";
+/** Sort modes the search page offers. */
+export type SearchSortMode = "relevance" | "time";
 
 /**
- * Default sort for the global search page: newest first.
- *
- * Relevance ranking on a trigram index puts short-but-old matches ahead of the
- * work in front of you, so recency is the better default and relevance stays one
- * click away.
+ * Default sort: relevance. Each section ranks within itself, and session relevance already
+ * folds in recency, so the newest-first crutch is no longer needed.
  */
-export const DEFAULT_SEARCH_SORT: SearchSortMode = "time";
+export const DEFAULT_SEARCH_SORT: SearchSortMode = "relevance";
 
 export function normalizeSearchSort(value: unknown): SearchSortMode {
-	switch (value) {
-		case "relevance":
-		case "type":
-		case "title":
-		case "time":
-			return value;
-		default:
-			return DEFAULT_SEARCH_SORT;
-	}
+	return value === "time" ? "time" : DEFAULT_SEARCH_SORT;
 }
 
 /**
- * Conversation content global search skips unless asked: subagent sessions, system-written
- * rows (injected knowledge hints, reminders, automation prompts) and tool calls.
+ * Content global search skips unless asked: subagent sessions, system-written rows
+ * (injected knowledge hints, reminders, automation prompts), tool calls, archived sessions.
  */
-export const SEARCH_INCLUDES = ["subagents", "system", "tools"] as const;
+export const SEARCH_INCLUDES = ["subagents", "system", "tools", "archived"] as const;
 export type SearchInclude = (typeof SEARCH_INCLUDES)[number];
 
 /** Parse the `include` URL value (comma-separated) into known names, in canonical order. */
@@ -61,52 +52,33 @@ export function normalizeSearchInclude(value: unknown): SearchInclude[] {
 	return SEARCH_INCLUDES.filter((name) => names.has(name));
 }
 
-export function getSearchResultDisplayTitle(
-	result: {
-		id?: string;
-		title?: string | null;
-		narratorTitle?: string | null;
-	},
-	untitled: (id: string) => string,
+/** Time range presets, in days. */
+export const SEARCH_TIME_RANGES = { "7d": 7, "30d": 30, "90d": 90, "365d": 365 } as const;
+export type SearchTimeRange = keyof typeof SEARCH_TIME_RANGES;
+
+export function normalizeSearchRange(value: unknown): SearchTimeRange | undefined {
+	return typeof value === "string" && value in SEARCH_TIME_RANGES
+		? (value as SearchTimeRange)
+		: undefined;
+}
+
+/**
+ * Start of a range as an ISO instant, rounded down to the UTC day so it stays stable (and
+ * cacheable) for the whole day instead of changing on every render.
+ */
+export function searchRangeStart(range: SearchTimeRange, now = Date.now()): string {
+	const day = 86_400_000;
+	return new Date(Math.floor(now / day) * day - SEARCH_TIME_RANGES[range] * day).toISOString();
+}
+
+/** A section's match count as shown: exact, or `N+` when the window filled up. */
+export function formatSearchTotal(
+	page: Pick<SearchSectionPage<unknown>, "total" | "totalIsLowerBound"> | undefined,
 ): string {
-	return result.title || result.narratorTitle || untitled(String(result.id ?? "").slice(0, 8));
+	if (!page) return "0";
+	return `${page.total}${page.totalIsLowerBound ? "+" : ""}`;
 }
 
-interface SortableSearchResult {
-	id?: string;
-	type?: string;
-	title?: string | null;
-	narratorTitle?: string | null;
-	updatedAt?: string | null;
-	createdAt?: string | null;
-	lastMessageAt?: string | null;
-	matchScore?: number;
-}
-
-/** All result types share one ordering; only explicit type sorting groups them. */
-export function sortVisibleSearchResults<T extends SortableSearchResult>(
-	results: readonly T[],
-	type: SearchResultType,
-	sort: SearchSortMode,
-	untitled: (id: string) => string,
-): T[] {
-	const items = results.filter((result) => type === "all" || result.type === type);
-	if (sort === "title") {
-		return items
-			.map((result) => ({ result, title: getSearchResultDisplayTitle(result, untitled) }))
-			.sort((a, b) => a.title.localeCompare(b.title))
-			.map(({ result }) => result);
-	}
-	return items.sort((a, b) => {
-		if (sort === "time") {
-			const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
-			const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
-			return bTime - aTime;
-		}
-		if (sort === "type") return String(a.type).localeCompare(String(b.type));
-		return (b.matchScore ?? 0) - (a.matchScore ?? 0);
-	});
-}
 export function normalizeSearchText(value: unknown): string {
 	return String(value ?? "")
 		.toLowerCase()
@@ -119,53 +91,27 @@ export function includesSearch(text: unknown, query: string): boolean {
 	return normalizeSearchText(text).includes(normalizedQuery);
 }
 
-export interface SearchRuntimeStatus {
-	degraded: boolean;
-	mode?: string;
-	fallbackMessages: string[];
-}
-
-export function formatSearchFallbackMessage(fallback: SearchFallback): string {
-	const scope = String(fallback.entity ?? fallback.feature ?? "search");
-	const detail = String(
-		fallback.reason ?? fallback.message ?? fallback.error ?? fallback.code ?? "fallback",
-	);
-	const route = fallback.from && fallback.to ? ` (${fallback.from} → ${fallback.to})` : "";
-	return `${scope}: ${detail}${route}`;
-}
-
-export function summarizeSearchRuntimeState(response?: SearchResponse): SearchRuntimeStatus {
-	const metadataFallbacks = Array.isArray(response?.searchMetadata?.fallbacks)
-		? response.searchMetadata.fallbacks
-		: [];
-	const topLevelFallbacks = Array.isArray(response?.fallbacks) ? response.fallbacks : [];
-	const seen = new Set<string>();
-	const fallbackMessages = [...metadataFallbacks, ...topLevelFallbacks]
-		.map((fallback) => formatSearchFallbackMessage(fallback))
-		.filter((message) => {
-			if (seen.has(message)) return false;
-			seen.add(message);
-			return true;
-		});
-	return {
-		degraded:
-			response?.degraded === true ||
-			response?.searchMetadata?.degraded === true ||
-			fallbackMessages.length > 0,
-		mode: response?.searchMetadata?.mode,
-		fallbackMessages,
-	};
+/**
+ * Each whitespace-separated query term, longest first so a longer term wins where two
+ * overlap. Search matches terms on their own, so highlighting does too.
+ */
+export function searchHighlightTerms(query: string): string[] {
+	const terms = new Map<string, string>();
+	for (const term of query.trim().split(/\s+/)) {
+		if (term) terms.set(term.toLowerCase(), term);
+	}
+	return [...terms.values()].sort((a, b) => b.length - a.length);
 }
 
 export function highlightSearchText(text: string, query: string): ReactNode {
-	if (!query) return text;
-	const normalizedQuery = query.trim();
-	if (!normalizedQuery) return text;
-	const escaped = normalizedQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const parts = text.split(new RegExp(`(${escaped})`, "gi"));
+	const terms = searchHighlightTerms(query ?? "");
+	if (terms.length === 0) return text;
+	const escaped = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+	const parts = text.split(new RegExp(`(${escaped.join("|")})`, "gi"));
 	if (parts.length === 1) return text;
+	const lowered = new Set(terms.map((term) => term.toLowerCase()));
 	return parts.map((part, i) =>
-		part.toLowerCase() === normalizedQuery.toLowerCase() ? (
+		lowered.has(part.toLowerCase()) ? (
 			// biome-ignore lint/suspicious/noArrayIndexKey: stable split output
 			<Mark key={i} color="yellow">
 				{part}

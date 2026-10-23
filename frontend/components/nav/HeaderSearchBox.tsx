@@ -1,6 +1,6 @@
 import { ActionIcon, Group, TextInput } from "@mantine/core";
 import { IconSearch, IconX } from "@tabler/icons-react";
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -23,11 +23,19 @@ export function HeaderSearchBox({
 	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
 	const [query, setQuery] = useState("");
+	// A search started from a project page is scoped to that project; the search page
+	// shows it as a filter that can be cleared.
+	const projectId = useRouterState({
+		select: (state) => state.location.pathname.match(/^\/projects\/([^/]+)/)?.[1],
+	});
 
 	const handleSearch = () => {
 		const q = query.trim();
 		if (!q) return;
-		navigate({ to: "/search", search: { q } });
+		navigate({
+			to: "/search",
+			search: { q, ...(projectId ? { project: decodeURIComponent(projectId) } : {}) },
+		});
 		onSearchOpenChange(false);
 	};
 

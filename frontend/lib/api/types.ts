@@ -206,33 +206,89 @@ export interface LearningSearchResponse {
 	results: LearningDocSummary[];
 }
 
-export interface SearchFallback {
-	feature?: string;
-	entity?: string;
+/** Sections of the global search page, in display order. */
+export type SearchSectionName = "sessions" | "knowledge";
+
+/** One page of a search section. */
+export interface SearchSectionPage<T> {
+	items: T[];
+	/** Matches in the section's candidate window. */
+	total: number;
+	/** The window filled up, so there may be more than `total`. */
+	totalIsLowerBound: boolean;
+	nextCursor: string | null;
+	/** The search limited itself to this many recent days (a query of only short terms). */
+	recentDays?: number;
+}
+
+/** A message hit listed under its session. */
+export interface SessionSearchHit {
+	id: string;
+	snippet: string;
+	messageRole?: string;
+	createdAt?: string;
+	blockId?: string;
+}
+
+/** A session (narrator) matching by its title, its messages, or both. */
+export interface SessionSearchResult {
+	type: "session";
+	id: string;
+	title?: string;
+	narratorType?: string;
+	subagentType?: string;
+	status?: string;
+	projectId?: string;
+	projectName?: string;
+	lastActivityAt?: string;
+	titleMatch: boolean;
+	hitCount: number;
+	hits: SessionSearchHit[];
+	score: number;
+}
+
+/** A knowledge entry hit. */
+export interface EntitySearchResult {
+	type: "knowledge";
+	id: string;
+	title?: string;
+	snippet: string;
+	projectName?: string;
+	collectionName?: string;
+	tags?: string[];
+	status?: string;
+	createdAt?: string;
+	updatedAt?: string;
+}
+
+export interface SearchSectionsResponse {
+	sections: {
+		sessions?: SearchSectionPage<SessionSearchResult>;
+		knowledge?: SearchSectionPage<EntitySearchResult>;
+	};
+}
+
+export interface SessionHitsResponse {
+	hits: SessionSearchHit[];
+	nextCursor: string | null;
+}
+
+/** Query, sort, scope and filters every global-search request carries. */
+export interface SearchRequest {
+	q: string;
+	sort?: "relevance" | "time";
+	/** Content added to the default scope: subagents, system, tools, archived. */
+	include?: readonly string[];
+	projectId?: string;
+	/** Inclusive ISO bounds. */
 	from?: string;
 	to?: string;
-	reason?: string;
-	error?: string;
-	message?: string;
-	code?: string;
-	[key: string]: unknown;
-}
-
-export interface SearchMetadata {
-	degraded?: boolean;
-	fallbacks?: SearchFallback[];
-	mode?: string;
-	ftsReady?: boolean | null;
-	shortQuery?: boolean;
-	requestedEntities?: string[];
-	[key: string]: unknown;
-}
-
-export interface SearchResponse {
-	results: ApiEntity[];
-	degraded?: boolean;
-	fallbacks?: SearchFallback[];
-	searchMetadata?: SearchMetadata;
+	/** Only the viewer's own sessions. */
+	mine?: boolean;
+	/** Search all of history even for a query of only short terms. */
+	fullHistory?: boolean;
+	cursor?: string;
+	limit?: number;
 }
 
 export interface StorageCategoryResult {

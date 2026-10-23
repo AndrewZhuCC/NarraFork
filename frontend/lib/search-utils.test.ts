@@ -1,144 +1,105 @@
 import { describe, expect, test } from "bun:test";
 import {
 	DEFAULT_SEARCH_SORT,
+	formatSearchTotal,
+	highlightSearchText,
 	normalizeSearchInclude,
+	normalizeSearchRange,
 	normalizeSearchSort,
-	normalizeSearchType,
-	sortVisibleSearchResults,
-	summarizeSearchRuntimeState,
+	normalizeSearchTab,
+	searchHighlightTerms,
+	searchRangeStart,
 } from "./search-utils";
 
-describe("search sort defaults", () => {
-	// The global search page defaults to newest-first. This is the assertion that stops
-	// it drifting back to relevance: the page reads the default through this constant,
-	// and a silent switch back would only show up as "the ordering feels wrong".
-	test("defaults to newest first", () => {
-		expect(DEFAULT_SEARCH_SORT).toBe("time");
-		expect(normalizeSearchSort(undefined)).toBe("time");
-		expect(normalizeSearchSort("nonsense")).toBe("time");
+describe("search sort", () => {
+	// Relevance is the default again: sections rank within themselves and session relevance
+	// already folds in recency. This stops the default drifting silently.
+	test("defaults to relevance", () => {
+		expect(DEFAULT_SEARCH_SORT).toBe("relevance");
+		expect(normalizeSearchSort(undefined)).toBe("relevance");
+		expect(normalizeSearchSort("nonsense")).toBe("relevance");
 	});
 
-	test("keeps every explicitly chosen sort mode", () => {
-		expect(normalizeSearchSort("relevance")).toBe("relevance");
-		expect(normalizeSearchSort("type")).toBe("type");
-		expect(normalizeSearchSort("title")).toBe("title");
+	test("keeps time, and reads the retired client-side sorts as the default", () => {
 		expect(normalizeSearchSort("time")).toBe("time");
+		expect(normalizeSearchSort("type")).toBe("relevance");
+		expect(normalizeSearchSort("title")).toBe("relevance");
 	});
 });
 
-describe("normalizeSearchType", () => {
-	test("accepts knowledge as a result type", () => {
-		expect(normalizeSearchType("knowledge")).toBe("knowledge");
+describe("normalizeSearchTab", () => {
+	test("accepts the section names", () => {
+		expect(normalizeSearchTab("sessions")).toBe("sessions");
+		expect(normalizeSearchTab("knowledge")).toBe("knowledge");
 	});
 
-	test("still normalizes the plural entity names and unknown input", () => {
-		expect(normalizeSearchType("narrators")).toBe("narrator");
-		expect(normalizeSearchType("messages")).toBe("message");
-		expect(normalizeSearchType(undefined)).toBe("all");
-		expect(normalizeSearchType("nonsense")).toBe("all");
-	});
-});
-
-describe("summarizeSearchRuntimeState", () => {
-	test("summarizes degraded search metadata and deduplicates fallbacks", () => {
-		const status = summarizeSearchRuntimeState({
-			results: [],
-			degraded: true,
-			fallbacks: [{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" }],
-			searchMetadata: {
-				degraded: true,
-				mode: "degraded-like-fallback",
-				ftsReady: false,
-				shortQuery: false,
-				requestedEntities: ["narrators"],
-				fallbacks: [
-					{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" },
-					{ entity: "messages", from: "fts5", to: "like", message: "message fallback" },
-				],
-			},
-		});
-
-		expect(status).toEqual({
-			degraded: true,
-			mode: "degraded-like-fallback",
-			fallbackMessages: [
-				"narrators: fts_query_failed (fts5 → like)",
-				"messages: message fallback (fts5 → like)",
-			],
-		});
-	});
-
-	test("does not mark successful FTS search as degraded", () => {
-		expect(
-			summarizeSearchRuntimeState({
-				results: [],
-				degraded: false,
-				fallbacks: [],
-				searchMetadata: { degraded: false, mode: "fts5-with-like-fallback", fallbacks: [] },
-			}),
-		).toEqual({ degraded: false, mode: "fts5-with-like-fallback", fallbackMessages: [] });
-	});
-
-	test("tolerates additive backend metadata on ready Search responses", () => {
-		const status = summarizeSearchRuntimeState({
-			results: [{ type: "narrator", id: "n1", title: "Ready narrator" }],
-			degraded: false,
-			fallbacks: [],
-			searchMetadata: {
-				degraded: false,
-				mode: "fts5-with-like-fallback",
-				ftsReady: true,
-				shortQuery: false,
-				requestedEntities: ["messages", "narrators"],
-				fallbacks: [],
-				backendDiagnostic: "safe-to-ignore",
-			},
-		});
-
-		expect(status).toEqual({
-			degraded: false,
-			mode: "fts5-with-like-fallback",
-			fallbackMessages: [],
-		});
-	});
-});
-
-describe("all results share the selected ordering", () => {
-	const hits = [
-		{ id: "n-old", type: "narrator", title: "D", updatedAt: "2026-01-01", matchScore: 10 },
-		{ id: "n-new", type: "narrator", title: "B", updatedAt: "2026-09-03", matchScore: 30 },
-		{ id: "m-new", type: "message", narratorTitle: "A", createdAt: "2026-09-04", matchScore: 40 },
-		{ id: "m-mid", type: "message", narratorTitle: "C", createdAt: "2026-09-02", matchScore: 20 },
-	];
-	const order = (sort: "time" | "relevance" | "title" | "type") =>
-		sortVisibleSearchResults(hits, "all", sort, (id) => id).map((r) => r.id);
-
-	for (const sort of ["time", "relevance", "title"] as const) {
-		test(`${sort} interleaves messages and narrators rather than grouping types`, () => {
-			expect(order(sort)).toEqual(["m-new", "n-new", "m-mid", "n-old"]);
-			expect(hits.map((r) => r.id)).toEqual(["n-old", "n-new", "m-new", "m-mid"]);
-		});
-	}
-
-	test("only an explicit type sort groups the types", () => {
-		expect(order("type")).toEqual(["m-new", "m-mid", "n-old", "n-new"]);
-	});
-
-	test("a type filter still uses the selected ordering within that type", () => {
-		expect(sortVisibleSearchResults(hits, "narrator", "time", (id) => id).map((r) => r.id)).toEqual(
-			["n-new", "n-old"],
-		);
+	test("maps the old result types so bookmarked links open the right tab", () => {
+		for (const old of ["message", "messages", "narrator", "narrators"]) {
+			expect(normalizeSearchTab(old)).toBe("sessions");
+		}
+		// Chapters are retired; their old links open the overview.
+		expect(normalizeSearchTab("chapter")).toBe("all");
+		expect(normalizeSearchTab(undefined)).toBe("all");
+		expect(normalizeSearchTab("nonsense")).toBe("all");
 	});
 });
 
 describe("normalizeSearchInclude", () => {
 	test("keeps known names in canonical order and drops the rest", () => {
 		expect(normalizeSearchInclude("tools,nonsense, subagents")).toEqual(["subagents", "tools"]);
-		expect(normalizeSearchInclude(["system", "system"])).toEqual(["system"]);
+		expect(normalizeSearchInclude(["archived", "system", "system"])).toEqual([
+			"system",
+			"archived",
+		]);
 	});
 
 	test("treats a missing value as the default scope", () => {
 		expect(normalizeSearchInclude(undefined)).toEqual([]);
 		expect(normalizeSearchInclude("")).toEqual([]);
+	});
+});
+
+describe("time ranges", () => {
+	test("accept only the presets", () => {
+		expect(normalizeSearchRange("30d")).toBe("30d");
+		expect(normalizeSearchRange("2d")).toBeUndefined();
+		expect(normalizeSearchRange(undefined)).toBeUndefined();
+	});
+
+	test("start at a UTC day boundary, stable through the day", () => {
+		const morning = Date.parse("2026-10-23T01:00:00.000Z");
+		const evening = Date.parse("2026-10-23T23:00:00.000Z");
+		expect(searchRangeStart("7d", morning)).toBe("2026-10-16T00:00:00.000Z");
+		expect(searchRangeStart("7d", evening)).toBe(searchRangeStart("7d", morning));
+	});
+});
+
+describe("formatSearchTotal", () => {
+	test("marks a filled candidate window as a lower bound", () => {
+		expect(formatSearchTotal({ total: 12, totalIsLowerBound: false })).toBe("12");
+		expect(formatSearchTotal({ total: 1000, totalIsLowerBound: true })).toBe("1000+");
+		expect(formatSearchTotal(undefined)).toBe("0");
+	});
+});
+
+describe("highlighting", () => {
+	test("highlights each term on its own, longest first, case-insensitively", () => {
+		expect(searchHighlightTerms("  token  Refresh token ")).toEqual(["Refresh", "token"]);
+		const parts = highlightSearchText("Token refreshed: refresh TOKEN", "refresh token");
+		expect(Array.isArray(parts)).toBe(true);
+		const marked = (parts as Array<string | { props: { children: string } }>)
+			.filter((part): part is { props: { children: string } } => typeof part !== "string")
+			.map((part) => part.props.children);
+		expect(marked).toEqual(["Token", "refresh", "refresh", "TOKEN"]);
+	});
+
+	test("treats regex characters in a term literally", () => {
+		expect(highlightSearchText("a.b axb", "a.b")).not.toBe("a.b axb");
+		const parts = highlightSearchText("axb", "a.b");
+		expect(parts).toBe("axb");
+	});
+
+	test("returns the text untouched without terms", () => {
+		expect(highlightSearchText("text", "   ")).toBe("text");
 	});
 });
