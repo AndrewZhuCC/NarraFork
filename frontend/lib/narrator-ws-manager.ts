@@ -1974,9 +1974,6 @@ export class NarratorWSManager {
 				type: "subscribe",
 				narratorIds: activeNarratorIds,
 				kind,
-				// Every message subscribe asks for the block-keyed protocol: the server keeps
-				// one protocol per connection and narrator, so all of them must agree.
-				protocol: 2,
 				...(requestId ? { requestId } : {}),
 			};
 			if (cursor) msg.catchUpCursor = cursor;
@@ -2000,7 +1997,6 @@ export class NarratorWSManager {
 					type: "subscribe",
 					narratorIds,
 					kind,
-					...(kind === "messages" ? { protocol: 2 } : {}),
 					...(requestId ? { requestId } : {}),
 					...(downgrade ? { downgrade: true } : {}),
 				}),

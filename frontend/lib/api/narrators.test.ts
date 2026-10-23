@@ -395,9 +395,15 @@ describe("narrators API", () => {
 		});
 		Object.defineProperty(g, "fetch", {
 			value: async () =>
-				new Response(JSON.stringify({ messages: [{ text: "x".repeat(100) }] }), {
-					headers: { "content-type": "application/json" },
-				}),
+				new Response(
+					JSON.stringify({
+						protocol: 2,
+						messages: [],
+						blocks: [],
+						padding: "x".repeat(100),
+					}),
+					{ headers: { "content-type": "application/json" } },
+				),
 			configurable: true,
 		});
 		await expect(api.getPretextDocumentPage("n", { maxResponseBytes: 32 })).rejects.toThrow(

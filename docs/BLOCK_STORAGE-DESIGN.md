@@ -1483,7 +1483,7 @@ reconcile(narrator, target, now):
 |---|---|---|
 | `narratorBlocks.write` | store 写块表（双写） | P1 |
 | `narratorBlocks.read` | 读取方读块表 | P2 |
-| `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5）；默认开，关闭即回到 v1（前端两种都处理）。P3d 与 v1 协议一起删除 | P2 |
+| `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5）；默认开，关闭即回到 v1（前端两种都处理）。P3d 第 7a 步已与 v1 协议一起删除，设置加载时去掉存量的键 | P2 |
 | `narratorBlocks.compactJson` | 新行的 `content_json` 写 `'[]'`（`body_rows_only = 1`）；只在 SQLite 且 `write`、`read` 都开时生效，默认关 | P3b |
 
 每个开关都可以单独关闭。P3 之前，关闭 `narratorBlocks.read` 就完全回到现状；P3b 之后，存在只存行的信封时须先运行 `restore`。
@@ -1854,7 +1854,9 @@ reconcile(narrator, target, now):
    - 元素在消息内的位置只作遍历坐标（选择项、编辑目标、ask、各索引仍以 `(messageId, 位置)` 记），由 `messageBody` 从块推出，第 7 步后含义不变；身份（行键、操作）已按块。
 6. 流式只认元素标识：每个流式增量都带元素 id、revision 与原始偏移，服务端快照块同样（loop 的累加器本来就给出，`stream_text` / `stream_reasoning` 的这两个字段改为必填，事件处理去掉缺偏移的分支）。前端的增量折叠、快照合并与交接只按 id + revision：删除按 `outputIndex` 认道、按文本后缀与 `providerMetadata.openai.itemId` 判断覆盖、合成的 `streaming:*` id，以及只为无版本块保留的丢弃路径；不带标识的增量与快照道不再应用。web_search / image_generation 仍按 id 在本轮落库后退场。开发用的模拟流按服务端的方式给出 id、revision 与偏移。（已完成）
    - 累加器与交接保留：它们本就以元素 id 为键。交接把更新的 revision 合进同 id 的落库块，把已按该 revision 落库的道从流式行里去掉，这就是"同一块 id 的落库块取代 open 块"。把它们改成 store 里的 open 块只换数据结构，与第 7 步行直接持有块一起做。
-7. 行改为直接持有块：`messageBody` / `messageBlocks` 改从块读，守卫里列出的改写行的代码改为按块；删除 `contentJson`、`children`、`blockRefs`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
+7. 协议与行：
+   - 7a 删除 v1 协议与 `wsV2`：页面接口（含公开分享页）与 WS 只发 v2，消息帧、流式快照、catch-up、工具开启都按 v2 发给每个订阅者；订阅不再协商协议（已加载的旧前端仍会带的 `protocol` 字段照常接受、不起作用），`message_protocol` 帧删除；设置加载时去掉存量的 `narratorBlocks.wsV2`。前端不再请求协议，解码不再放行 v1 页面与 v1 catch-up。服务端内部仍以行的形状（`contentJson`、`children`）构建消息，由 `narrator-block-protocol.ts` / `narrator-block-page.ts` 统一转成 v2 发出。（已完成）
+   - 7b 行改为直接持有块：`messageBody` / `messageBlocks` 改从块读，守卫里列出的改写行的代码改为按块；删除 `contentJson`、`children`、`blockRefs`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
 
 **验收**：
 - §10.7 的直接升级测试通过。

@@ -1131,15 +1131,9 @@ export type NarratorServerMessage =
 			durationMs?: number;
 	  }
 	| { type: "sync_ok"; narratorId: string; version: number }
-	/**
-	 * The message protocol a `messages` subscribe got, sent only to a subscribe that
-	 * named one: 2 (block-keyed, docs/BLOCK_STORAGE-DESIGN.md §8.2) while
-	 * `narratorBlocks.wsV2` is on, else 1.
-	 */
-	| { type: "message_protocol"; narratorIds: string[]; protocol: 1 | 2 }
 	// ── Message protocol v2 (docs/BLOCK_STORAGE-DESIGN.md §8.2) ─────────────────
-	// Sent only to connections that negotiated v2; `narrator-block-protocol.ts` maps
-	// the v1 frames onto these.
+	// The only message protocol (P3d): `narrator-block-protocol.ts` maps the row-shaped
+	// frames the emitters build onto these for every connection.
 	/**
 	 * Message rows as envelopes + blocks: what `message`, `user_message` and
 	 * `message_updated` carry in v1, named by `cause`. An envelope lists its blocks in
