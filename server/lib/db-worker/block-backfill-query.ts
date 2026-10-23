@@ -53,9 +53,9 @@ export interface BlockReindexSliceParams extends BlockSliceLimits {
 /** One envelope's blocks with the search text a sync gives them, as read. */
 export interface ReindexEnvelope {
 	id: string;
-	ledgerFingerprint: string;
+	rowid: number;
 	/** In ordinal order; empty text leaves a block unsearchable (it is still streaming). */
-	blocks: Array<{ id: string; revision: number; text: string }>;
+	blocks: Array<{ rowid: number; id: string; revision: number; text: string }>;
 	/** Not computed here (queued for its sync, or its rows do not line up with its body):
 	 *  the main thread syncs it itself. */
 	resync: boolean;
@@ -438,19 +438,15 @@ function reindexPlan(db: Database, rowid: number): ReindexEnvelope {
 	> & {
 		queued: number;
 	};
-	const envelope = {
-		id: source.id,
-		ledgerFingerprint: ledgerFingerprint(db, source.id),
-		blocks: [] as ReindexEnvelope["blocks"],
-		resync: true,
-	};
+	const envelope = { id: source.id, rowid, blocks: [] as ReindexEnvelope["blocks"], resync: true };
 	if (source.queued) return envelope;
 	const rows = db
 		.query(
-			`SELECT id, revision, kind, phase, payload, state FROM narrator_blocks
+			`SELECT rowid, id, revision, kind, phase, payload, state FROM narrator_blocks
 			 WHERE message_id = ? ORDER BY ordinal`,
 		)
 		.all(source.id) as Array<{
+		rowid: number;
 		id: string;
 		revision: number;
 		kind: string;
@@ -475,6 +471,7 @@ function reindexPlan(db: Database, rowid: number): ReindexEnvelope {
 		...envelope,
 		resync: false,
 		blocks: rows.map((row, ordinal) => ({
+			rowid: row.rowid,
 			id: row.id,
 			revision: row.revision,
 			text:

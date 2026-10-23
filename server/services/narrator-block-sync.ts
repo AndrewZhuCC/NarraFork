@@ -42,6 +42,7 @@ import {
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
+import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { bodySql, keepsProjection, readBodies } from "../lib/narrator-bodies";
@@ -141,6 +142,21 @@ export function flushChangedEnvelopes(limit = FLUSH_LIMIT): number {
 		done.run(id);
 	}
 	return ids.length;
+}
+
+/** The envelopes synced since each open `watchSyncs` began. */
+const syncWatches = hotSafe("narrator-block-sync:watches", () => new Set<Set<string>>());
+
+/**
+ * Record every envelope synced from now until `stop`. A reader that computed something from
+ * an envelope as it was (the reindex job's worker) checks this before writing it: whatever
+ * changes an envelope's rows or ledger reaches a sync, since the store syncs what it writes
+ * and triggers queue the rest, so an envelope neither synced since nor queued is as read.
+ */
+export function watchSyncs(): { synced: ReadonlySet<string>; stop(): void } {
+	const synced = new Set<string>();
+	syncWatches.add(synced);
+	return { synced, stop: () => syncWatches.delete(synced) };
 }
 
 /**
@@ -425,6 +441,7 @@ export function syncEnvelope(
 	given?: unknown,
 	options: { reindex?: boolean } = {},
 ): void {
+	for (const watch of syncWatches) watch.add(messageId);
 	const row = envelopeRow(messageId);
 	if (!row || row.bodyFormat !== 2) return;
 	const content = given === undefined ? envelopeBody(messageId) : given;
