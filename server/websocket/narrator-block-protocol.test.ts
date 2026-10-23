@@ -333,22 +333,36 @@ describe("the client's decoder", () => {
 		expect(roundTrip(chunk)).toEqual([chunk]);
 	});
 
-	test("gives back a catch-up's top-level rows, their children and orphan children", async () => {
+	test("gives back a catch-up's rows flat, each nested row after its parent, and orphan children", async () => {
 		const parent = await narratorStore.appendInput("n1", "parent");
 		const orphan = await narratorStore.appendInput("n1", "orphan");
 		const child = await narratorStore.appendInput("n1", "child");
-		const frame = {
+		const rest = {
 			type: "catch_up",
 			narratorId: "n1",
-			topLevel: [
-				{ ...messageRow(parent.id), children: [{ ...messageRow(child.id), children: [] }] },
-			],
-			orphanChildren: [{ ...messageRow(orphan.id), children: [] }],
 			subagentActivities: [],
 			cursor: { parentLastMessageId: parent.id },
 			messageVersion: 4,
 		};
+		const frame = {
+			...rest,
+			topLevel: [
+				{ ...messageRow(parent.id), children: [{ ...messageRow(child.id), children: [] }] },
+			],
+			orphanChildren: [{ ...messageRow(orphan.id), children: [] }],
+		};
 		const decoded = decodeBlockFrame(protocol.toBlockCatchUp(frame));
-		expect(withBodies(decoded)).toEqual([JSON.parse(JSON.stringify(frame))]);
+		expect(withBodies(decoded)).toEqual([
+			JSON.parse(
+				JSON.stringify({
+					...rest,
+					topLevel: [
+						messageRow(parent.id),
+						{ ...messageRow(child.id), parentMessageId: parent.id },
+					],
+					orphanChildren: [messageRow(orphan.id)],
+				}),
+			),
+		]);
 	});
 });
