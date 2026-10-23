@@ -22,6 +22,7 @@ import type { LegacyCompletionAdmission } from "./agent-runtime/publication-outb
 import type { CompletedNotification } from "./background-task-service";
 import type { CompletedBgSubagentNotification } from "./bg-completion-queue";
 import { newEnvelopeColumns } from "./narrator-block-sync";
+import { insertEnvelope } from "./narrator-body-writes";
 import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "./narrator-refs/seq-store";
 import type { ParentInboundMessage } from "./parent-inbound-queue";
@@ -97,19 +98,17 @@ function persistUnboundLegacyAgentMessage(
 	dbTransactionWithSeqFloor(narratorId, (tx) => {
 		const messageId = generateId();
 		const text = `旧代理消息无法绑定工具执行 / Legacy agent message has no exact execution receipt. It was not resent.\nSender: ${entry.message.fromId}\n${entry.message.text.slice(0, 8000)}`;
-		tx.insert(narratorMessages)
-			.values({
-				id: messageId,
-				narratorId,
-				role: "disp",
-				...newEnvelopeColumns(narratorId),
-				origin: "system",
-				contentText: text,
-				contentJson: [{ type: "text", text }],
-				contextCharsJson: { segments: [] },
-				createdAt: new Date().toISOString(),
-			})
-			.run();
+		insertEnvelope(tx, {
+			id: messageId,
+			narratorId,
+			role: "disp",
+			...newEnvelopeColumns(narratorId),
+			origin: "system",
+			contentText: text,
+			contentJson: [{ type: "text", text }],
+			contextCharsJson: { segments: [] },
+			createdAt: new Date().toISOString(),
+		});
 		// Single seq authority (narrator-refs/seq-store.ts); base 0 for an empty
 		// narrator — previously this site alone started at 1.
 		tx.insert(narratorMessageRefs)

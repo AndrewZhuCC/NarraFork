@@ -1534,10 +1534,12 @@ function translateReasoningBlock(
 
 	(async () => {
 		try {
-			const before = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			});
+			const before = fillBody(
+				await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					...bodyColumns({ id: true, contentJson: true }),
+				}),
+			);
 			const beforeBlocks = Array.isArray(before?.contentJson) ? before.contentJson : [];
 			const beforeIndex = findReasoningBlockIndex(beforeBlocks, { ...locator, reasoningText });
 			const beforeBlock = beforeBlocks[beforeIndex] as PersistedReasoningBlock | undefined;
@@ -1557,10 +1559,12 @@ function translateReasoningBlock(
 
 			// Find the exact reasoning block in the message.
 			// Prefer loop identity; provider coordinates/text are legacy-only fallbacks.
-			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			});
+			const msg = fillBody(
+				await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					...bodyColumns({ id: true, contentJson: true }),
+				}),
+			);
 			if (!msg) return;
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const targetIdx = findReasoningBlockIndex(blocks, {
@@ -1587,10 +1591,13 @@ function translateReasoningBlock(
 			if (!patched) return;
 
 			// Broadcast updated message so frontend picks up the translation
-			const fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				with: { toolCalls: true },
-			});
+			const fullMessage = fillBody(
+				await db.query.narratorMessages.findFirst({
+					...bodyColumns(),
+					where: eq(narratorMessages.id, messageId),
+					with: { toolCalls: true },
+				}),
+			);
 			if (fullMessage) {
 				const ref = await db.query.narratorMessageRefs.findFirst({
 					where: and(

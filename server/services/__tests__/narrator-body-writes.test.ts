@@ -316,3 +316,45 @@ describe("history edits read the rows", () => {
 		]);
 	});
 });
+
+describe("output recovery reads the rows", () => {
+	async function streaming() {
+		const opened = await narratorStore.openStep("n1", { uuid: "u", session_id: "s" });
+		await narratorStore.writeStepItem(opened.id, "n1", {
+			type: "text",
+			id: "t1",
+			text: "Done.",
+			completed: true,
+			outputIndex: 0,
+		});
+		await narratorStore.writeStepItem(opened.id, "n1", {
+			type: "text",
+			id: "t2",
+			text: "Half",
+			completed: false,
+			outputIndex: 1,
+		});
+		return opened.id;
+	}
+
+	test("a cold cleanup drops the incomplete output the rows hold", async () => {
+		const messageId = await streaming();
+		detachColumn(messageId);
+		const { cleanupIncompleteNarratorOutput } = await import("../narrator-output-recovery");
+		expect(await cleanupIncompleteNarratorOutput("n1")).toEqual({ messageId, removedBlocks: 1 });
+		expect(assembled(messageId)).toEqual([
+			expect.objectContaining({ type: "text", id: "t1", text: "Done." }),
+		]);
+	});
+
+	test("completing the output marks what the rows hold complete", async () => {
+		const messageId = await streaming();
+		detachColumn(messageId);
+		const { completeAssistantOutput } = await import("../narrator-output-recovery");
+		await completeAssistantOutput("n1", messageId);
+		expect(assembled(messageId)).toEqual([
+			expect.objectContaining({ id: "t1", completed: true }),
+			expect.objectContaining({ id: "t2", text: "Half", completed: true }),
+		]);
+	});
+});

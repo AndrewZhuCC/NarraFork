@@ -36,7 +36,7 @@ const ROOT = join(import.meta.dir, "..", "..", "..");
 /** Raw body accesses per file, and why they are there. */
 const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// The body layer.
-	"server/services/narrator-body-writes.ts": { count: 4, why: "body writes" },
+	"server/services/narrator-body-writes.ts": { count: 7, why: "body writes" },
 	"server/services/narrator-block-sync.ts": {
 		count: 4,
 		why: "the dual-write audit, column resync",
@@ -60,18 +60,10 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/services/narrator-export.ts": { count: 1, why: "read switch off" },
 	"server/services/session-interchange/export.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-epochs.ts": { count: 1, why: "read switch off" },
+	"server/services/agent-runtime/publication.ts": { count: 1, why: "column fallback" },
 	// Imports write legacy envelopes; the backfill converts them.
 	"server/services/session-interchange/import.ts": { count: 1, why: "legacy-format import" },
 	// Left to move onto the body layer (P3a).
-	"server/services/narrator-service.ts": { count: 4, why: "ownership transfer, bash card" },
-	"server/routes/narrators.ts": { count: 6, why: "ask-in-passing, previews" },
-	"server/services/narrator-event-handler.ts": { count: 3, why: "card reads" },
-	"server/services/narrator-output-recovery.ts": { count: 2, why: "output recovery" },
-	"server/services/narrator-compact.ts": { count: 1, why: "compact card read" },
-	"server/services/narrator-subagent-recovery.ts": { count: 1, why: "recovery card read" },
-	"server/services/agent-runtime/publication.ts": { count: 3, why: "run publication insert" },
-	"server/services/parent-injection-queue.ts": { count: 1, why: "parent injection insert" },
-	"server/services/subagent-extract.ts": { count: 3, why: "extraction copy" },
 	"server/services/revert-history-commit.ts": { count: 7, why: "revert rewrite" },
 	"server/services/revert-selection-service.ts": { count: 5, why: "revert digests" },
 	"server/services/revert-planner-local-access.ts": { count: 3, why: "rollback preview" },

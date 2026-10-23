@@ -42,6 +42,7 @@ export interface StartedRun {
 import { blockReadsEnabled } from "../narrator-block-scans";
 import { newEnvelopeColumns } from "../narrator-block-sync";
 import { bodyInBlocksSql } from "../narrator-body-reads";
+import { insertEnvelopeIfAbsent } from "../narrator-body-writes";
 import {
 	claimNextRefSeq,
 	NARRATOR_REF_SEQ_EMPTY_TOP,
@@ -348,38 +349,33 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		const truncated = originalBytes > Buffer.byteLength(storedText);
 		const messageId = `publication-result:${run.logicalRunId}`;
 		const narratorId = run.producerKind === "agent" ? run.taskId : run.recipientId;
-		const inserted = tx
-			.insert(narratorMessages)
-			.values({
-				id: messageId,
-				narratorId,
-				role: "disp",
-				...newEnvelopeColumns(narratorId),
-				contextCharsJson: { segments: [] },
-				origin: "system",
-				contentText: storedText,
-				contentJson: [
-					{
-						type: "text",
-						text: storedText,
-						publicationResult: {
-							...(eventKind ? { eventKind } : {}),
-							logicalRunId: run.logicalRunId,
-							truncated,
-							originalBytes,
-							sourceResultRef:
-								capturedSourceRef ??
-								(assistant
-									? `message:${assistant.id}`
-									: `background_task:${run.taskId}:${run.logicalRunId}`),
-						},
+		const inserted = insertEnvelopeIfAbsent(tx, {
+			id: messageId,
+			narratorId,
+			role: "disp",
+			...newEnvelopeColumns(narratorId),
+			contextCharsJson: { segments: [] },
+			origin: "system",
+			contentText: storedText,
+			contentJson: [
+				{
+					type: "text",
+					text: storedText,
+					publicationResult: {
+						...(eventKind ? { eventKind } : {}),
+						logicalRunId: run.logicalRunId,
+						truncated,
+						originalBytes,
+						sourceResultRef:
+							capturedSourceRef ??
+							(assistant
+								? `message:${assistant.id}`
+								: `background_task:${run.taskId}:${run.logicalRunId}`),
 					},
-				],
-				createdAt: new Date().toISOString(),
-			})
-			.onConflictDoNothing()
-			.returning({ id: narratorMessages.id })
-			.get();
+				},
+			],
+			createdAt: new Date().toISOString(),
+		});
 		if (inserted) {
 			// Single seq authority (narrator-refs/seq-store.ts); base 0 for an empty
 			// narrator, unified with every other refs writer.
@@ -746,22 +742,17 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 					const text = publicationSummary(
 						`Legacy task notification could not be migrated (${source.taskId}): ${registration.reason}. No task was rerun.`,
 					);
-					const inserted = tx
-						.insert(narratorMessages)
-						.values({
-							id: messageId,
-							narratorId: recipientId,
-							role: "disp",
-							...newEnvelopeColumns(recipientId),
-							contextCharsJson: { segments: [] },
-							origin: "system",
-							contentText: text,
-							contentJson: [{ type: "text", text }],
-							createdAt: new Date().toISOString(),
-						})
-						.onConflictDoNothing()
-						.returning({ id: narratorMessages.id })
-						.get();
+					const inserted = insertEnvelopeIfAbsent(tx, {
+						id: messageId,
+						narratorId: recipientId,
+						role: "disp",
+						...newEnvelopeColumns(recipientId),
+						contextCharsJson: { segments: [] },
+						origin: "system",
+						contentText: text,
+						contentJson: [{ type: "text", text }],
+						createdAt: new Date().toISOString(),
+					});
 					if (inserted) {
 						// Single seq authority (narrator-refs/seq-store.ts); base 0 for an
 						// empty narrator, unified with every other refs writer.

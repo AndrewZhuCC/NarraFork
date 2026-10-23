@@ -46,12 +46,33 @@ export interface BodySync {
  * names the envelope it copies, whose blocks the new ones then descend from (§6.3).
  * Returns the row as stored, with the body it was given.
  */
-export function insertEnvelope(
+export function insertEnvelope(tx: BodyTx, values: NewEnvelope, sync: InsertSync = {}): Envelope {
+	return built(tx.insert(narratorMessages).values(values).returning().get(), values, sync);
+}
+
+/** `insertEnvelope` unless an envelope with its id exists already (then undefined). */
+export function insertEnvelopeIfAbsent(
 	tx: BodyTx,
 	values: NewEnvelope,
-	sync: BodySync & { rows?: () => void; copyOf?: string } = {},
-): Envelope {
-	const row = tx.insert(narratorMessages).values(values).returning().get();
+	sync: InsertSync = {},
+): Envelope | undefined {
+	const row = tx.insert(narratorMessages).values(values).onConflictDoNothing().returning().get();
+	return row ? built(row, values, sync) : undefined;
+}
+
+/**
+ * Insert an envelope whose rows the sync queue builds later, from the body stored with it
+ * (its `content_json` projection stays complete until then): for a bulk copy (an
+ * extraction of a whole history), whose inline sync would hold the main thread. The
+ * insert queues it; readers read the column until the sweep has built its rows.
+ */
+export function insertEnvelopeQueued(tx: BodyTx, values: NewEnvelope): void {
+	tx.insert(narratorMessages).values(values).run();
+}
+
+type InsertSync = BodySync & { rows?: () => void; copyOf?: string };
+
+function built(row: Envelope, values: NewEnvelope, sync: InsertSync): Envelope {
 	sync.rows?.();
 	if (sync.copyOf) syncCopiedEnvelope(sync.copyOf, row.id, values.contentJson);
 	else syncEnvelopeNow(row.id, sync.mode, sync.stamp, values.contentJson);
