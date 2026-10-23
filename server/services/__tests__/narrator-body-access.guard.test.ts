@@ -52,7 +52,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/db/postgres-schema.ts": { count: 8, why: "PG: the column is the body" },
 	"server/services/agent-runtime/model-history-revision-sql.ts": { count: 3, why: "triggers" },
 	"server/services/agent-runtime/model-history-fixture.ts": { count: 1, why: "trigger fixture" },
-	"server/lib/settings/defaults.ts": { count: 3, why: "switch descriptions" },
+	"server/lib/settings/defaults.ts": { count: 5, why: "switch descriptions" },
 	"server/db/test-role-migration.ts": { count: 4, why: "one-off role migration check" },
 	// Readers whose column branch serves block reads off (or PG), where it is the body.
 	"server/services/narrator-question-service.ts": { count: 3, why: "read switch off" },

@@ -759,6 +759,7 @@ export const narratorMessages = pgTable(
 			.on(table.compactPending)
 			.where(sql.raw('"compact_pending" = 1')),
 		index("idx_messages_legacy_body").on(table.bodyFormat).where(sql.raw('"body_format" = 1')),
+		index("idx_messages_rows_only").on(table.bodyRowsOnly).where(sql.raw('"body_rows_only" = 1')),
 	],
 );
 
@@ -8202,6 +8203,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "\"body_format\" = 1"
+        },
+        {
+          "name": "idx_messages_rows_only",
+          "columns": [
+            "bodyRowsOnly"
+          ],
+          "unique": false,
+          "predicate": "\"body_rows_only\" = 1"
         }
       ],
       "checks": [],

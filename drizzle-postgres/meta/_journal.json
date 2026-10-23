@@ -267,6 +267,13 @@
 			"when": 1792724756605,
 			"tag": "0037_body_rows_only",
 			"breakpoints": true
+		},
+		{
+			"idx": 38,
+			"version": "7",
+			"when": 1792724989809,
+			"tag": "0038_rows_only_index",
+			"breakpoints": true
 		}
   ]
 }

@@ -134,16 +134,14 @@ export function syncEnvelopeNow(
  */
 export function resyncFromColumn(messageId: string, stored?: unknown): void {
 	if (!hasBlockSchema()) return;
-	const content =
-		stored ??
-		parse(
-			(
-				database.sqlite
-					.prepare("SELECT content_json AS contentJson FROM narrator_messages WHERE id = ?")
-					.get(messageId) as { contentJson: string | null } | null
-			)?.contentJson ?? null,
-		);
-	syncEnvelopeNow(messageId, "keep", {}, content);
+	const row = database.sqlite
+		.prepare(
+			"SELECT content_json AS contentJson, body_rows_only AS rowsOnly FROM narrator_messages WHERE id = ?",
+		)
+		.get(messageId) as { contentJson: string | null; rowsOnly: number } | null;
+	// A rows-only envelope's column is no reference: its rows are its only copy.
+	if (!row || row.rowsOnly) return;
+	syncEnvelopeNow(messageId, "keep", {}, stored ?? parse(row.contentJson));
 }
 
 const SWEEP_INTERVAL_MS = 5_000;
@@ -204,8 +202,9 @@ export function recoverBlockStorage(): number {
 const AUDIT_ENVELOPES = 50;
 
 /**
- * Dual-write check (P1 exit criterion): the newest block-format envelopes must assemble
- * from their rows to exactly what they store. A mismatch is logged and re-synced.
+ * Dual-write check (P1 exit criterion): the newest block-format envelopes that keep a
+ * projection (not rows-only) must assemble from their rows to exactly what they store. A
+ * mismatch is logged and re-synced.
  * Returns the ids that differed.
  */
 export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
@@ -213,7 +212,7 @@ export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
 	const rows = database.sqlite
 		.prepare(
 			`SELECT id, content_json AS contentJson FROM narrator_messages
-			 WHERE body_format = 2 ORDER BY rowid DESC LIMIT ?`,
+			 WHERE body_format = 2 AND body_rows_only = 0 ORDER BY rowid DESC LIMIT ?`,
 		)
 		.all(limit) as Array<{ id: string; contentJson: string | null }>;
 	const differing = rows.flatMap((row) => {
@@ -566,12 +565,17 @@ function sameDerivedColumns(before: BlockDraft[], after: BlockDraft[]): boolean 
  * line up with the content (a sync still owed) are rebuilt from it instead.
  */
 function writeBlockStates(messageId: string, drafts: BlockDraft[]): void {
+	// A sync still owed rebuilds the rows from content_json, state included — unless the
+	// envelope is rows-only: its column holds nothing, so its rows take the state now.
 	if (
 		database.sqlite
-			.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
+			.prepare(
+				`SELECT 1 FROM narrator_block_sync_queue q JOIN narrator_messages m ON m.id = q.message_id
+				 WHERE q.message_id = ? AND m.body_rows_only = 0`,
+			)
 			.get(messageId)
 	)
-		return; // The sync owed rebuilds the rows from content_json, state included.
+		return;
 	const rows = database.sqlite
 		.prepare("SELECT id, kind, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal")
 		.all(messageId) as Array<{ id: string; kind: string; state: string | null }>;

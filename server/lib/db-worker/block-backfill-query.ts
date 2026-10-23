@@ -109,8 +109,10 @@ function candidates(
 	return db
 		.query(
 			// A literal format, so convert's candidates come from idx_messages_legacy_body.
+			// Verify compares rows with the column, which a rows-only envelope (P3b) has none of.
 			`SELECT rowid, coalesce(length(CAST(content_json AS BLOB)), 0) AS bytes
 			 FROM narrator_messages WHERE rowid > ? AND body_format = ${bodyFormat === 1 ? 1 : 2}
+				${bodyFormat === 1 ? "" : "AND body_rows_only = 0"}
 			 ORDER BY rowid LIMIT ?`,
 		)
 		.all(params.afterRowid, params.maxEnvelopes) as Array<{

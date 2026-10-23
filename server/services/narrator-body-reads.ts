@@ -26,6 +26,7 @@ import { blockReadsEnabled } from "./narrator-block-scans";
 interface EnvelopeColumns {
 	id: AnyColumn;
 	bodyFormat: AnyColumn;
+	bodyRowsOnly: AnyColumn;
 	contentJson: AnyColumn;
 }
 
@@ -47,9 +48,9 @@ export function bodyInBlocksSql(table: EnvelopeColumns = narratorMessages): SQL 
 }
 
 function blocksCurrent(table: EnvelopeColumns): SQL {
-	return sql`(${table.bodyFormat} = 2
-		AND NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = ${table.id})
-		AND EXISTS (SELECT 1 FROM narrator_blocks b WHERE b.message_id = ${table.id}))`;
+	return sql`(${table.bodyFormat} = 2 AND (${table.bodyRowsOnly} = 1
+		OR (NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = ${table.id})
+			AND EXISTS (SELECT 1 FROM narrator_blocks b WHERE b.message_id = ${table.id}))))`;
 }
 
 /**

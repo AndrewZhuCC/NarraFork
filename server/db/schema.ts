@@ -1408,6 +1408,7 @@ export const narratorMessages = sqliteTable(
 		// converts and body scans still match on content_json. Empty once the backfill is
 		// done, so finding them never walks message bodies (docs/BLOCK_STORAGE-DESIGN.md §10.3).
 		index("idx_messages_legacy_body").on(table.bodyFormat).where(sql`"body_format" = 1`),
+		index("idx_messages_rows_only").on(table.bodyRowsOnly).where(sql`"body_rows_only" = 1`),
 	],
 );
 
