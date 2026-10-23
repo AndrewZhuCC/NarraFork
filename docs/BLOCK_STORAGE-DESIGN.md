@@ -701,7 +701,7 @@ narrator_block_assets
   - `tool`：工具名 + 输入的紧凑 JSON + 被采用结果的文本（取自账本，截断到 64 KiB）；
   - `context`：有 `model_text` 时取它，UI 卡片取 `body` 里的标题与正文。
 - 搜索结果返回 `blockId`，前端直接定位到块并高亮；列表仍按信封聚合显示。
-- 迁移期两套索引并存：没有块的旧信封仍由信封级索引命中；回填（§10.3）为旧信封补写块级索引；回填完成后搜索只查块级索引，信封级 FTS 在 P3 退役（`content_text` 仍保留，供列表摘要）。
+- 迁移期两套索引并存：没有块的旧信封仍由信封级索引命中；回填（§10.3）为旧信封补写块级索引；回填完成后搜索只查块级索引，信封级 FTS 在 P3 退役（`content_text` 仍保留，供列表摘要）。退役的条件与做法见 P3c 实现说明。
 
 **信封级 FTS 触发器（迁移期）**
 - update 触发器改为 `AFTER UPDATE OF content_text`。
@@ -1709,7 +1709,7 @@ reconcile(narrator, target, now):
 **P3 分阶段**：每阶段一个 PR，PR 内分步提交、每步 CI。
 - P3a：所有读改写经正文层，不改数据（下文）。
 - P3b：`narratorBlocks.compactJson`（默认关）让新行写 `'[]'`；清空旧行的作业只在回填 verify 之后由管理员显式触发。
-- P3c：退役信封级 FTS。
+- P3c：退役信封级 FTS（下文）。
 - P3d：删除 v1 解码 / 协议与 `wsV2` 开关。
 
 **P3a 实现说明（正文只经正文层读写）**
@@ -1760,6 +1760,24 @@ reconcile(narrator, target, now):
   - `narrator-rows-only.test.ts`：读者、排队、账本、状态写入、审计、读开关，以及开关开启时的写入与 compact 标记。
   - `narrator-projection-jobs.test.ts`：清空与恢复、前置条件、读取后被改写的信封被跳过、中途关开关、两作业互斥。
   - 把开关默认值临时改为开启，跑了相关测试：余下的失败都是测试本身直接读写 `content_json`。
+
+**P3c 实现说明（退役信封级 FTS）**
+- **只读块索引的搜索**：`createSqliteSearchStore` 带 `blockOnly` 模式，默认读 `isEnvelopeIndexRetired`（由 `ensureFts` 在启动时设定）。退役前各路径照旧；退役后全局消息、会话聚合与命中、时间线、Recall 的索引路径只读 `narrator_blocks_fts`：
+  - 消息的某一个块包含全部可索引词即命中，取最好的 rank 并带上该块的 id；
+  - 太短、无法用 trigram 索引的词仍作为 `content_text` 的子串过滤；
+  - 旧格式信封（`body_format = 1`：导入、关闭块写入时写的、回填解不开的）没有块，按 `content_text` 子串匹配，无 rank，排在有 rank 的命中之后；
+  - 摘录取消息文本中首个词附近的一段；只有块里有这个词时（工具输入输出、context）取该块的摘录；Recall 仍用 `>>>`/`<<<` 标出命中。
+  - 子串策略不用索引，两种模式下相同。
+  - **行为变化**：同一条消息里分在不同块的词（例如被一次工具调用隔开的两段输出）不再一起命中。这就是 D6 选定的按块匹配。
+- **重建块索引的作业 `reindex`**：块索引是 contentless 的，文本由 store 计算，SQL 无法重建，所以退役前必须有重建它的办法。
+  - `narrator_block_backfill` 增加 `reindex` 作业，接在 verify 之后自动运行。
+  - 每片在主线程处理少量块格式信封（受信封数、字节数和 50ms 预算限制），对每个信封以 reindex 标记跑一次块同步：同一事务里读当前的行与账本，重写每个已封口块的索引文本。行只在与正文不一致时改动，与普通同步相同，不推进任何 revision。
+  - 存储页列出该作业，暂停对它同样有效。
+- **退役**：`ensureFts` 在启动时，若 reindex 作业已完成，就在一个事务里先删三个触发器、再删 `narrator_messages_fts`，并设定 `isEnvelopeIndexRetired`。退役的判断先于一切信封级索引的处理，非 trigram 检查、缺触发器修复、非正常退出后的探测都跳过已退役的索引。
+- **块索引丢失**：删除触发器缺失（表被迁移重建，rowid 可能已变），或非正常退出后完整性探测失败时，清空块索引并让 reindex 从头开始。信封级索引因此留下，或者经已有的缺触发器修复从 `content_text` 重建回来，直到 reindex 再次完成。旧版本发现索引缺失时也按同样方式重建，所以退役可以回退。
+- **PG**：PG 还没有块行，搜索不变。
+- **存储页**：块索引计入「搜索」分类。
+- **测试**：`block-only-search.test.ts`（删掉信封级索引后覆盖各路径、旧信封、跨块语义）；`narrator-block-backfill.test.ts`（reindex 在 verify 后运行且不动 revision，清空的块索引重建得与写入时一致，覆盖只存行的信封）；`fts-retire.test.ts`（退役前后、退役后再丢块索引的恢复、无块存储的库）。
 
 ## 12. 风险与成本
 
