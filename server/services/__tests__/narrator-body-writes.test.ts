@@ -15,11 +15,12 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 // narrator-service must be imported before narrator-persistence (pre-existing cycle).
-await import("../narrator-service");
+const { narratorService } = await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
 const { narratorPersistence } = await import("../narrator-persistence");
 const blockSync = await import("../narrator-block-sync");
 const bodies = await import("../narrator-body-writes");
+const session = await import("../narrator-session");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
@@ -280,6 +281,38 @@ describe("store writes read the rows", () => {
 		await narratorStore.discardAttempt("n1", opened.id, 1, "a2");
 		expect(assembled(opened.id)).toEqual([
 			expect.objectContaining({ type: "text", id: "t1", text: "kept" }),
+		]);
+	});
+});
+
+describe("history edits read the rows", () => {
+	test("deleting a block keeps the others the rows hold", async () => {
+		const messageId = await step();
+		const body = assembled(messageId);
+		detachColumn(messageId);
+		await narratorService.deleteMessageBlock("n1", messageId, 1, { skipRevert: true });
+		expect(assembled(messageId)).toEqual([body[0]]);
+		expect(column(messageId)).toEqual([body[0]]);
+	});
+
+	test("editing an output block rewrites it within the body the rows hold", async () => {
+		const messageId = await step();
+		const body = assembled(messageId) as Array<Record<string, unknown>>;
+		const [, outputBlock] = rowIds(messageId);
+		detachColumn(messageId);
+		await session.editOutputBlock("n1", outputBlock, "Edited.", null);
+		expect(assembled(messageId)).toEqual([
+			body[0],
+			expect.objectContaining({ type: "text", text: "Edited." }),
+		]);
+	});
+
+	test("a compact summary is rewritten from the rows", async () => {
+		const plan = await narratorPersistence.persistPlanMessage("n1", "first plan");
+		detachColumn(plan.id);
+		await narratorService.updateCompactSummary("n1", plan.id, "second plan");
+		expect(assembled(plan.id)).toEqual([
+			{ type: "compact", status: "compacted", subtype: "plan", summary: "second plan" },
 		]);
 	});
 });

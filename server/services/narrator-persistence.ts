@@ -4463,7 +4463,10 @@ const sqliteNarratorPersistence = {
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
 		// The step is complete: items it left incomplete are interrupted, not streaming.
-		db.transaction((tx) => updateEnvelope(tx, messageId, updates, { mode: "sealed" }));
+		db.transaction((tx) => {
+			updateEnvelope(tx, messageId, updates, { mode: "sealed" });
+			flushChangedEnvelopes();
+		});
 	},
 
 	/** Seal a step's blocks without changing its metadata (a kept partial after a stop). */
@@ -4481,12 +4484,13 @@ const sqliteNarratorPersistence = {
 		content: unknown[],
 		contentText: string | null,
 	): Promise<void> {
-		db.transaction((tx) =>
+		db.transaction((tx) => {
 			writeEnvelopeBody(tx, messageId, content, {
 				set: { contextCharsJson: measureMessageCharacters("assistant", content, contentText) },
 				mode: "sealed",
-			}),
-		);
+			});
+			flushChangedEnvelopes();
+		});
 		queueContextCharacterRefresh(narratorId, messageId);
 	},
 

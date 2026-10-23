@@ -42,6 +42,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 		why: "the dual-write audit, column resync",
 	},
 	"server/lib/narrator-bodies.ts": { count: 3, why: "body reads off the main thread" },
+	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
 	"server/services/narrator-block-scans.ts": { count: 11, why: "scans: column fallback" },
 	"server/services/narrator-block-targets.ts": { count: 2, why: "legacy envelopes' ids" },
 	"server/services/narrator-block-backfill.ts": { count: 2, why: "legacy envelope conversion" },
@@ -68,8 +69,6 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// Imports write legacy envelopes; the backfill converts them.
 	"server/services/session-interchange/import.ts": { count: 1, why: "legacy-format import" },
 	// Left to move onto the body layer (P3a).
-	"server/services/narrator-messages.ts": { count: 19, why: "delete, truncate, checkpoint" },
-	"server/services/narrator-session.ts": { count: 14, why: "edit, restore, partial cleanup" },
 	"server/services/narrator-service.ts": { count: 4, why: "ownership transfer, bash card" },
 	"server/routes/narrators.ts": { count: 6, why: "ask-in-passing, previews" },
 	"server/services/narrator-event-handler.ts": { count: 3, why: "card reads" },

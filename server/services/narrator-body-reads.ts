@@ -15,7 +15,7 @@
  */
 
 import type { AnyColumn, SQL } from "drizzle-orm";
-import { sql } from "drizzle-orm";
+import { getTableColumns, sql } from "drizzle-orm";
 import * as database from "../db";
 import { narratorMessages } from "../db/schema";
 import { blockBodies } from "../lib/narrator-bodies";
@@ -88,6 +88,23 @@ export function storedBodyBytesSql(table: EnvelopeColumns = narratorMessages): S
 		sql`${table.id}`,
 	);
 	return sql<number>`(CASE WHEN ${blocksCurrent(table)} THEN ${assembled} ELSE ${json} END)`;
+}
+
+/**
+ * The stored size of an envelope row for a budget on rows read or copied: every column but
+ * the body, and the body where it is kept (`body_bytes` when its rows hold it, as
+ * `bodyBytesSql` sizes read batches; the column's length otherwise).
+ */
+export function envelopeStoredBytesSql(): SQL<number> {
+	const { contentJson: body, ...columns } = getTableColumns(narratorMessages);
+	const sized = Object.values(columns)
+		.filter((column) => !column.generated)
+		.map((column) => sql`coalesce(octet_length(${column}), 0)`);
+	const json = sql`coalesce(octet_length(${body}), 0)`;
+	const stored = blockReadsEnabled()
+		? sql`(CASE WHEN ${blocksCurrent(narratorMessages)} THEN ${narratorMessages.bodyBytes} ELSE ${json} END)`
+		: json;
+	return sql<number>`${sql.join([...sized, stored], sql` + `)}`;
 }
 
 /**
