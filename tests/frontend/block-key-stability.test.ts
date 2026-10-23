@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	buildStreamingMsg,
 	clearToolBlockCache,
@@ -80,20 +80,22 @@ describe("buildStreamingMsg — block ids", () => {
 	});
 
 	test("tool_use blocks keep their original ids from toolChunksMsg", () => {
-		const toolChunksMsg = {
-			id: "__streaming_chunks__",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant" as const,
-			contentJson: [
+		const toolChunksMsg = rowWithElements(
+			{
+				id: "__streaming_chunks__",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant" as const,
+				contentText: null,
+				toolCalls: [],
+				createdAt: new Date().toISOString(),
+				children: [],
+			},
+			[
 				{ type: "tool_use", id: "tu-1", name: "Bash", input: {} },
 				{ type: "tool_use", id: "tu-2", name: "Write", input: {} },
 			],
-			contentText: null,
-			toolCalls: [],
-			createdAt: new Date().toISOString(),
-			children: [],
-		};
+		);
 		const msg = buildStreamingMsg({ ...base, toolChunksMsg });
 		expect(msg).not.toBeNull();
 		const toolBlocks = getToolUseBlocks(msg);
@@ -101,17 +103,19 @@ describe("buildStreamingMsg — block ids", () => {
 	});
 
 	test("all block types combined: ids remain stable", () => {
-		const toolChunksMsg = {
-			id: "__streaming_chunks__",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant" as const,
-			contentJson: [{ type: "tool_use", id: "tu-1", name: "Bash", input: {} }],
-			contentText: null,
-			toolCalls: [],
-			createdAt: new Date().toISOString(),
-			children: [],
-		};
+		const toolChunksMsg = rowWithElements(
+			{
+				id: "__streaming_chunks__",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant" as const,
+				contentText: null,
+				toolCalls: [],
+				createdAt: new Date().toISOString(),
+				children: [],
+			},
+			[{ type: "tool_use", id: "tu-1", name: "Bash", input: {} }],
+		);
 		const msg = buildStreamingMsg({
 			...base,
 			streamingBlocks: [
@@ -430,17 +434,19 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 
 	test("same tool-use data returns same block object reference", () => {
 		const input = { command: "ls", timeout: 5000 };
-		const toolChunksMsg = {
-			id: "__streaming_tool_chunks__",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant" as const,
-			contentJson: [{ type: "tool_use", id: "tu-1", name: "Bash", input }],
-			contentText: null,
-			toolCalls: [],
-			createdAt: new Date().toISOString(),
-			children: [],
-		};
+		const toolChunksMsg = rowWithElements(
+			{
+				id: "__streaming_tool_chunks__",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant" as const,
+				contentText: null,
+				toolCalls: [],
+				createdAt: new Date().toISOString(),
+				children: [],
+			},
+			[{ type: "tool_use", id: "tu-1", name: "Bash", input }],
+		);
 
 		const msg1 = buildStreamingMsg({
 			narratorId: "n1",
@@ -464,21 +470,25 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 	});
 
 	test("different tool-use data returns new block object reference", () => {
-		const toolChunksMsg1 = {
-			id: "__streaming_tool_chunks__",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant" as const,
-			contentJson: [{ type: "tool_use", id: "tu-1", name: "Bash", input: { x: 1 } }],
-			contentText: null,
-			toolCalls: [],
-			createdAt: new Date().toISOString(),
-			children: [],
-		};
-		const toolChunksMsg2 = {
-			...toolChunksMsg1,
-			contentJson: [{ type: "tool_use", id: "tu-1", name: "Bash", input: { x: 2 } }],
-		};
+		const toolChunksMsg1 = rowWithElements(
+			{
+				id: "__streaming_tool_chunks__",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant" as const,
+				contentText: null,
+				toolCalls: [],
+				createdAt: new Date().toISOString(),
+				children: [],
+			},
+			[{ type: "tool_use", id: "tu-1", name: "Bash", input: { x: 1 } }],
+		);
+		const toolChunksMsg2 = rowWithElements(
+			{
+				...toolChunksMsg1,
+			},
+			[{ type: "tool_use", id: "tu-1", name: "Bash", input: { x: 2 } }],
+		);
 
 		const msg1 = buildStreamingMsg({ narratorId: "n1", toolChunksMsg: toolChunksMsg1 });
 		const msg2 = buildStreamingMsg({ narratorId: "n1", toolChunksMsg: toolChunksMsg2 });
@@ -491,20 +501,22 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 	});
 
 	test("text-only streaming preserves tool-use block references", () => {
-		const toolChunksMsg = {
-			id: "__streaming_tool_chunks__",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant" as const,
-			contentJson: [
+		const toolChunksMsg = rowWithElements(
+			{
+				id: "__streaming_tool_chunks__",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant" as const,
+				contentText: null,
+				toolCalls: [],
+				createdAt: new Date().toISOString(),
+				children: [],
+			},
+			[
 				{ type: "tool_use", id: "tu-1", name: "Bash", input: {} },
 				{ type: "tool_use", id: "tu-2", name: "Write", input: {} },
 			],
-			contentText: null,
-			toolCalls: [],
-			createdAt: new Date().toISOString(),
-			children: [],
-		};
+		);
 
 		// Simulate streaming: same tool chunks, changing text
 		const msg1 = buildStreamingMsg({

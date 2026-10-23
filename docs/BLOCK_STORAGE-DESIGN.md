@@ -1858,7 +1858,7 @@ reconcile(narrator, target, now):
    - 7a 删除 v1 协议与 `wsV2`：页面接口（含公开分享页）与 WS 只发 v2，消息帧、流式快照、catch-up、工具开启都按 v2 发给每个订阅者；订阅不再协商协议（已加载的旧前端仍会带的 `protocol` 字段照常接受、不起作用），`message_protocol` 帧删除；设置加载时去掉存量的 `narratorBlocks.wsV2`。前端不再请求协议，解码不再放行 v1 页面与 v1 catch-up。服务端内部仍以行的形状（`contentJson`、`children`）构建消息，由 `narrator-block-protocol.ts` / `narrator-block-page.ts` 统一转成 v2 发出。（已完成）
    - 7b 行改为直接持有块：`messageBody` / `messageBlocks` 改从块读，守卫里列出的改写行的代码改为按块；删除 `contentJson`、`children`、`blockRefs`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。分三个 PR：
      - 7b-1 行持有块：`TreeMessage.blocks`（`RowBlock`：块的身份 + 元素，服务端命名的块 `named`）取代 `contentJson` + `blockRefs`。解码器直接给出块；客户端自建的行（流式行、子代理流式行、工具分片行、聊天行、夹具）由 `rowWithElements` / `splitRowBlocks` 按 `splitEnvelope` 切块；改写正文一律经 `mapRowElements` / `filterRowElements`，块保持 id，未变的块与行保持引用，空块去掉。`messageBody` 按块数组缓存展平结果，正文身份随块不变。交接从流式行去掉已落库的块后，余下块的 id（与键）不再因重切而移位。守卫只剩访问器与行类型；尚未迁移的夹具仍以 `contentJson` 建行，访问器读它时按服务端规则切块。（已完成）
-     - 7b-2 夹具改为按块建行，删除行类型上的 `contentJson` 与访问器的回退。
+     - 7b-2 删除行上的 `contentJson`：`TreeMessage.blocks` 必填，`contentJson` 从行类型与访问器里删除，没有块的行正文为空，访问器不再替任何行切块。顺手问的开始与解答接口原先直接返回带 `contentJson` 的行，改为按块协议返回该消息（`toEnvelopes`），前端在接口层解码（`decodeBlockMessage`）。测试夹具一律经 `rowWithElements` 建行，原地改正文的测试改为替换块。守卫只剩 `splitRowBlocks` 交给服务端切分函数的一处。（已完成）
      - 7b-3 `children` 改为平铺的行加父索引；删除按下标的路由、客户端的下标回退与死代码；更新文档。
 
 **验收**：

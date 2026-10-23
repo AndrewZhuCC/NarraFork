@@ -2,7 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { MantineProvider } from "@mantine/core";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { act, useEffect, useSyncExternalStore } from "react";
@@ -23,18 +23,20 @@ const VIEW = () => ({ scrollTop: 0, viewportHeight: 600, pinnedToBottom: true })
 const REASON = "分析甲";
 const TEXT = "正文乙";
 function message(contentJson: unknown[], id = "assistant-1"): TreeMessage {
-	return {
-		id,
-		seq: 1,
-		narratorId: "handoff-n",
-		role: "assistant",
-		parentToolUseId: null,
+	return rowWithElements(
+		{
+			id,
+			seq: 1,
+			narratorId: "handoff-n",
+			role: "assistant",
+			parentToolUseId: null,
+			contentText: null,
+			toolCalls: [],
+			children: [],
+			createdAt: "2026-09-20T00:00:00Z",
+		},
 		contentJson,
-		contentText: null,
-		toolCalls: [],
-		children: [],
-		createdAt: "2026-09-20T00:00:00Z",
-	} as TreeMessage;
+	) as TreeMessage;
 }
 function content(
 	type: "text" | "reasoning",

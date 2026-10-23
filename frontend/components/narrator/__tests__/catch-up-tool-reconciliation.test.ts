@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { ToolCallRecord, TreeMessage } from "../../../lib/api";
 import { mergeToolCallFieldsInTree } from "../message/message-tree-utils";
 import {
@@ -27,12 +27,18 @@ function persistedToolMessage(
 		permissionDecisionReason,
 		createdAt: "2026-04-11T10:00:00.000Z",
 	};
-	return {
-		id: `message-${toolUseId}`,
-		narratorId: NARRATOR_ID,
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [
+	return rowWithElements(
+		{
+			id: `message-${toolUseId}`,
+			narratorId: NARRATOR_ID,
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: options.withToolCall === false ? [] : [toolCall],
+			createdAt: "2026-04-11T10:00:00.000Z",
+			children: [],
+		},
+		[
 			{
 				type: "tool_use",
 				id: toolUseId,
@@ -43,11 +49,7 @@ function persistedToolMessage(
 				permissionDecisionReason,
 			},
 		],
-		contentText: null,
-		toolCalls: options.withToolCall === false ? [] : [toolCall],
-		createdAt: "2026-04-11T10:00:00.000Z",
-		children: [],
-	};
+	);
 }
 
 function startedChunk(toolUseId = TOOL_USE_ID): TopLevelStreamingChunk {

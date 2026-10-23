@@ -21,7 +21,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -46,28 +46,32 @@ const BUILD = {
 // is a plain string, so it carries no content signature in its key.
 function message(seq: number, blocks?: unknown[]): TreeMessage {
 	const text = "词".repeat(80);
-	return {
-		id: `insert-m${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: blocks ?? [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `insert-m${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			children: [],
+			seq,
+		},
+		blocks ?? [{ type: "text", text }],
+	) as unknown as TreeMessage;
 }
 
 function segmentMarker(seq: number): TreeMessage {
-	return {
-		...message(seq),
-		id: `insert-seg-${seq}`,
-		role: "user",
-		contentJson: [{ type: "segment_compact", status: "compacting", messageCount: 2 }],
-		contentText: "[Segment compacting]",
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			...message(seq),
+			id: `insert-seg-${seq}`,
+			role: "user",
+			contentText: "[Segment compacting]",
+		},
+		[{ type: "segment_compact", status: "compacting", messageCount: 2 }],
+	) as unknown as TreeMessage;
 }
 
 async function loaded(count = 30, hasPrev = true) {
@@ -107,18 +111,22 @@ describe("ask-in-passing canonical document mutations", () => {
 			const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
 			const coordinator = new PretextLayoutCoordinator();
 			const base = [message(0), message(1)];
-			const pending = {
-				...message(1),
-				id: "epoch-A",
-				role: "system",
-				contentJson: [{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m0" }],
-			} as unknown as TreeMessage;
+			const pending = rowWithElements(
+				{
+					...message(1),
+					id: "epoch-A",
+					role: "system",
+				},
+				[{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m0" }],
+			) as unknown as TreeMessage;
 			const later =
 				eventKind === "insert"
 					? { ...pending, id: "epoch-B" }
-					: ({
-							...pending,
-							contentJson: [
+					: (rowWithElements(
+							{
+								...pending,
+							},
+							[
 								{
 									type: "ask_in_passing",
 									status: "resolved",
@@ -126,7 +134,7 @@ describe("ask-in-passing canonical document mutations", () => {
 									targetNarratorId: "target",
 								},
 							],
-						} as unknown as TreeMessage);
+						) as unknown as TreeMessage);
 			const deferred = Promise.withResolvers<void>();
 			const started = Promise.withResolvers<void>();
 			let fetches = 0;
@@ -184,14 +192,14 @@ describe("ask-in-passing canonical document mutations", () => {
 	it("allows cancelling an all-ask window without changing generic full-delete semantics", async () => {
 		const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
 		const coordinator = new PretextLayoutCoordinator();
-		const ask = {
-			...message(1),
-			id: "only-ask",
-			role: "system",
-			contentJson: [
-				{ type: "ask_in_passing", status: "pending", sourceMessageId: "unloaded-source" },
-			],
-		} as unknown as TreeMessage;
+		const ask = rowWithElements(
+			{
+				...message(1),
+				id: "only-ask",
+				role: "system",
+			},
+			[{ type: "ask_in_passing", status: "pending", sourceMessageId: "unloaded-source" }],
+		) as unknown as TreeMessage;
 		await coordinator.load("n1", BUILD, {
 			fetchPage: async () => ({
 				messages: [ask],
@@ -215,13 +223,15 @@ describe("ask-in-passing canonical document mutations", () => {
 		let refresh = false;
 		let scrollTop = 200;
 		const getView = () => ({ scrollTop, viewportHeight: 600, pinnedToBottom: false });
-		const ask = {
-			...message(11),
-			id: "ask-refresh",
-			askInsertVersion: 9,
-			role: "system",
-			contentJson: [{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m10" }],
-		} as unknown as TreeMessage;
+		const ask = rowWithElements(
+			{
+				...message(11),
+				id: "ask-refresh",
+				askInsertVersion: 9,
+				role: "system",
+			},
+			[{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m10" }],
+		) as unknown as TreeMessage;
 		const canonical = [
 			...base.slice(0, 11),
 			ask,
@@ -256,13 +266,15 @@ describe("ask-in-passing canonical document mutations", () => {
 	});
 	it("inserts in history without a fetch, deduplicates HTTP/WS and rejects resurrection", async () => {
 		const { coordinator, state } = await loaded();
-		const ask = {
-			...message(11),
-			id: "ask-sync-card",
-			askInsertVersion: 8,
-			role: "system",
-			contentJson: [{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m10" }],
-		} as unknown as TreeMessage;
+		const ask = rowWithElements(
+			{
+				...message(11),
+				id: "ask-sync-card",
+				askInsertVersion: 8,
+				role: "system",
+			},
+			[{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m10" }],
+		) as unknown as TreeMessage;
 		expect(coordinator.upsertMessage(ask, false, scrolledUp)).toBe(true);
 		expect(coordinator.upsertMessage({ ...ask }, false, scrolledUp)).toBe(true);
 		let messages = coordinator.getSnapshot().input?.messages ?? [];

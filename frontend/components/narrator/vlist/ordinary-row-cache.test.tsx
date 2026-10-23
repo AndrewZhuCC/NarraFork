@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act, memo, useMemo, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -83,16 +83,18 @@ function Probe({ narratorId, messages, handlers }: Input) {
 	return [...bindings].map(([id, payload]) => <Row key={id} id={id} payload={payload} />);
 }
 function message(id: string, text: string): NarratorMsg {
-	return {
-		id,
-		narratorId: "owner",
-		seq: 0,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		children: [],
-		toolCalls: [],
-	} as unknown as NarratorMsg;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "owner",
+			seq: 0,
+			role: "assistant",
+			contentText: text,
+			children: [],
+			toolCalls: [],
+		},
+		[{ type: "text", text }],
+	) as unknown as NarratorMsg;
 }
 async function render(messages: NarratorMsg[], handlers: VListRowHandlers, narratorId = "owner") {
 	await act(async () => root.render(<Probe {...{ narratorId, messages, handlers }} />));

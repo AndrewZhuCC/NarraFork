@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { StreamingBlock } from "../message/message-segments";
 import {
 	applyExactStreamDelta,
@@ -292,7 +293,7 @@ describe("blockIndex — where the delta landed", () => {
 		const blocks: StreamingBlock[] = [];
 		applyExactStreamDelta(blocks, reasoningDelta("thinking", undefined, 0), false);
 		const answer = applyExactStreamDelta(blocks, textDelta("answer", 1), false);
-		const msg = { contentJson: blocks, liveBlockIndex: answer.blockIndex };
+		const msg = rowWithElements({ liveBlockIndex: answer.blockIndex }, blocks);
 
 		expect(resolveLiveBlockIndex(true, msg)).toBe(answer.blockIndex);
 		// The reasoning run has settled; only the text lane is live.
@@ -302,7 +303,7 @@ describe("blockIndex — where the delta landed", () => {
 		// Reasoning reopens mid-turn: the stamp moves back to the middle block, and the
 		// consumer follows it rather than the array's tail.
 		const reopened = applyExactStreamDelta(blocks, reasoningDelta("!", undefined, 0), false);
-		const reopenedMsg = { contentJson: blocks, liveBlockIndex: reopened.blockIndex };
+		const reopenedMsg = rowWithElements({ liveBlockIndex: reopened.blockIndex }, blocks);
 		expect(isLiveStreamingBlock(true, reopenedMsg, 0)).toBe(true);
 		expect(isLiveStreamingBlock(true, reopenedMsg, blocks.length - 1)).toBe(false);
 	});

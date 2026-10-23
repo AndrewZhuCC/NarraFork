@@ -16,7 +16,7 @@ import type {
 	TreeMessage,
 } from "@frontend/lib/api";
 import { sha256 as nobleSHA256 } from "@noble/hashes/sha2.js";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { projectDiffDocument } from "@shared/pretext-layout/diff-core";
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -59,12 +59,29 @@ interface ToolSeed {
 
 /** An assistant message carrying `tool_use` blocks enriched exactly as the API does. */
 function assistantWithTools(id: string, tools: readonly ToolSeed[]): TreeMessage {
-	return {
-		id,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: tools.map((tool) => ({
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: tools.map((tool, index) => ({
+				id: `tc-${tool.toolUseId}-${index}`,
+				narratorId: "n1",
+				messageId: id,
+				toolUseId: tool.toolUseId,
+				toolName: tool.toolName ?? "Bash",
+				status: tool.status ?? "running",
+				inputJson: tool.inputJson,
+				outputJson: tool.outputJson,
+				permissionSuggestions: tool.permissionSuggestions ?? null,
+				createdAt: "2026-01-01T00:00:00.000Z",
+			})) as unknown as TreeMessage["toolCalls"],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			children: [],
+		},
+		tools.map((tool) => ({
 			type: "tool_use",
 			id: tool.toolUseId,
 			name: tool.toolName ?? "Bash",
@@ -74,23 +91,8 @@ function assistantWithTools(id: string, tools: readonly ToolSeed[]): TreeMessage
 			inputJson: tool.inputJson,
 			outputJson: tool.outputJson,
 			permissionSuggestions: tool.permissionSuggestions ?? null,
-		})) as TreeMessage["contentJson"],
-		contentText: null,
-		toolCalls: tools.map((tool, index) => ({
-			id: `tc-${tool.toolUseId}-${index}`,
-			narratorId: "n1",
-			messageId: id,
-			toolUseId: tool.toolUseId,
-			toolName: tool.toolName ?? "Bash",
-			status: tool.status ?? "running",
-			inputJson: tool.inputJson,
-			outputJson: tool.outputJson,
-			permissionSuggestions: tool.permissionSuggestions ?? null,
-			createdAt: "2026-01-01T00:00:00.000Z",
-		})) as unknown as TreeMessage["toolCalls"],
-		createdAt: "2026-01-01T00:00:00.000Z",
-		children: [],
-	};
+		})),
+	);
 }
 
 describe("persisted Edit origin handoff", () => {

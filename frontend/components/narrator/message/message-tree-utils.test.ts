@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	getDangerReflectionRequestIdInTree,
 	getNewestReflectionToolOccurrenceInTree,
@@ -16,20 +16,22 @@ import {
 } from "./message-tree-utils";
 
 function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
-	return {
-		id: "msg-1",
-		narratorId: "narrator-1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [],
-		contentText: null,
-		toolCalls: [],
-		tokensIn: null,
-		costUsd: null,
-		createdAt: "2026-05-14T00:00:00.000Z",
-		children: [],
-		...overrides,
-	};
+	return rowWithElements(
+		{
+			id: "msg-1",
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			tokensIn: null,
+			costUsd: null,
+			createdAt: "2026-05-14T00:00:00.000Z",
+			children: [],
+			...overrides,
+		},
+		[],
+	);
 }
 
 describe("subagent activity reducers", () => {
@@ -109,10 +111,14 @@ describe("subagent activity reducers", () => {
 	});
 
 	test("replaces snapshots and updates the matching parent tool block", () => {
-		const parent = message({
-			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent" }],
-			toolCalls: [{ toolUseId: "parent-tool", toolName: "Agent" }],
-		});
+		const parent = message(
+			rowWithElements(
+				{
+					toolCalls: [{ toolUseId: "parent-tool", toolName: "Agent" }],
+				},
+				[{ type: "tool_use", id: "parent-tool", name: "Agent" }],
+			),
+		);
 		const snapshot = replaceSubagentActivitySnapshot({
 			subagentNarratorId: "sub-1",
 			model: "model-1",
@@ -137,24 +143,28 @@ describe("subagent activity reducers", () => {
 describe("message-tree-utils tool state parity", () => {
 	test("mergeToolCallFieldsInTree syncs permission fields into enriched content blocks", () => {
 		const messages = [
-			message({
-				contentJson: [
-					{ type: "text", text: "before" },
+			message(
+				rowWithElements(
 					{
-						type: "tool_use",
-						id: "tool-1",
-						name: "Edit",
-						status: "permission_pending",
+						toolCalls: [
+							{
+								toolUseId: "tool-1",
+								toolName: "Edit",
+								status: "permission_pending",
+							},
+						],
 					},
-				],
-				toolCalls: [
-					{
-						toolUseId: "tool-1",
-						toolName: "Edit",
-						status: "permission_pending",
-					},
-				],
-			}),
+					[
+						{ type: "text", text: "before" },
+						{
+							type: "tool_use",
+							id: "tool-1",
+							name: "Edit",
+							status: "permission_pending",
+						},
+					],
+				),
+			),
 		];
 
 		const result = mergeToolCallFieldsInTree(messages, "tool-1", {
@@ -183,24 +193,28 @@ describe("message-tree-utils tool state parity", () => {
 			message({
 				id: "parent",
 				children: [
-					message({
-						id: "child",
-						contentJson: [
+					message(
+						rowWithElements(
 							{
-								type: "tool_use",
-								id: "tool-nested",
-								name: "Bash",
-								status: "running",
+								id: "child",
+								toolCalls: [
+									{
+										toolUseId: "tool-nested",
+										toolName: "Bash",
+										status: "running",
+									},
+								],
 							},
-						],
-						toolCalls: [
-							{
-								toolUseId: "tool-nested",
-								toolName: "Bash",
-								status: "running",
-							},
-						],
-					}),
+							[
+								{
+									type: "tool_use",
+									id: "tool-nested",
+									name: "Bash",
+									status: "running",
+								},
+							],
+						),
+					),
 				],
 			}),
 		];
@@ -225,9 +239,9 @@ describe("message-tree-utils tool state parity", () => {
 	});
 
 	test("contentJson-only parent accepts and removes persisted child messages", () => {
-		const parent = message({
-			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }],
-		});
+		const parent = message(
+			rowWithElements({}, [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }]),
+		);
 		const child = message({ id: "child", parentToolUseId: "parent-tool" });
 
 		const inserted = insertChildIntoMessages([parent], child);
@@ -236,9 +250,9 @@ describe("message-tree-utils tool state parity", () => {
 	});
 
 	test("contentJson-only parent accepts and removes synthetic streaming children", () => {
-		const parent = message({
-			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }],
-		});
+		const parent = message(
+			rowWithElements({}, [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }]),
+		);
 		const inserted = upsertStreamingChildInMessages(
 			[parent],
 			"parent-tool",

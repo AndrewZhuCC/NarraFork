@@ -1,20 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { MessageSegmentationCache, type RenderSegment, segmentMessages } from "./message-segments";
 
 function message(id: string, contentJson: ContentBlock[] = []): NarratorMsg {
-	return {
-		id,
-		narratorId: "narrator",
-		parentToolUseId: null,
-		role: "assistant",
+	return rowWithElements(
+		{
+			id,
+			narratorId: "narrator",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			children: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+		},
 		contentJson,
-		contentText: null,
-		toolCalls: [],
-		children: [],
-		createdAt: "2026-01-01T00:00:00.000Z",
-	} as NarratorMsg;
+	) as NarratorMsg;
 }
 
 function toolMessage(id: string): NarratorMsg {
@@ -61,7 +63,13 @@ describe("MessageSegmentationCache", () => {
 		expect(resolutionReads).toBe(500);
 		for (let index = 0; index < 20; index++) {
 			const streamingMsg = toolMessage("__streaming__");
-			streamingMsg.contentJson?.push({ type: "text", text: `tail ${index}` });
+			Object.assign(
+				streamingMsg,
+				rowWithElements(streamingMsg, [
+					...messageBody(streamingMsg),
+					{ type: "text", text: `tail ${index}` },
+				]),
+			);
 			classificationReads = 0;
 			resolutionReads = 0;
 			const hot = segmentMessages(history, { cache, streamingMsg });
@@ -87,7 +95,10 @@ describe("MessageSegmentationCache", () => {
 		const first = expectColdEqual([a, b], cache);
 		const original = structuredClone(first);
 		const [firstA, firstB] = toolItems(first);
-		const replacement = { ...a, contentJson: [...messageBody(a), { type: "text", text: "edit" }] };
+		const replacement = rowWithElements({ ...a }, [
+			...messageBody(a),
+			{ type: "text", text: "edit" },
+		]);
 		const edited = expectColdEqual([replacement, b], cache);
 		expect(toolItems(edited)[0]).not.toBe(firstA);
 		expect(toolItems(edited)[1]).toBe(firstB);
@@ -120,7 +131,7 @@ describe("MessageSegmentationCache", () => {
 		expect(childrenChanged).not.toBe(rowChanged);
 		expect(childrenChanged.children).toEqual([child]);
 		expect(childrenChanged.isSubagent).toBe(true);
-		msg.contentJson = [{ type: "text", text: "replacement" }];
+		Object.assign(msg, rowWithElements(msg, [{ type: "text", text: "replacement" }]));
 		expectColdEqual([msg], cache);
 		msg.role = "user";
 		expect(expectColdEqual([msg], cache)).toEqual([{ kind: "message", msg }]);
@@ -200,8 +211,8 @@ describe("MessageSegmentationCache", () => {
 		const cache = new MessageSegmentationCache({ maxMessages: 10, maxAtoms: 3 });
 		const a = toolMessage("a");
 		const b = toolMessage("b");
-		a.contentJson?.push({ type: "text", text: "a" });
-		b.contentJson?.push({ type: "text", text: "b" });
+		Object.assign(a, rowWithElements(a, [...messageBody(a), { type: "text", text: "a" }]));
+		Object.assign(b, rowWithElements(b, [...messageBody(b), { type: "text", text: "b" }]));
 		const first = toolItems(expectColdEqual([a, b], cache));
 		const second = toolItems(expectColdEqual([a, b], cache));
 		expect(second[0]).toBe(first[0]);

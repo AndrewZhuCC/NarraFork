@@ -28,8 +28,8 @@
  */
 
 import {
-	type BlockSourceMessage,
 	type MessageBodySource,
+	type MessageWithBody,
 	mapRowElements,
 	messageBody,
 	withoutBody,
@@ -88,7 +88,7 @@ const STRUCTURAL_BLOCK_TYPES = new Set(["ask_in_passing", "context_cleared"]);
 
 /** The candidate as the block accessors read it. */
 const asRow = (message: AppendCandidate) =>
-	message as unknown as BlockSourceMessage<Record<string, unknown>>;
+	message as unknown as MessageWithBody<Record<string, unknown>>;
 
 function hasStructuralBlock(message: AppendCandidate): boolean {
 	for (const block of messageBody(asRow(message))) {

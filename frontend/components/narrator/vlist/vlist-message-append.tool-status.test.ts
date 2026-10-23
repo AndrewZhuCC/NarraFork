@@ -8,7 +8,11 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import {
+	type MessageWithBody,
+	messageBody,
+	rowWithElements,
+} from "@shared/narrator-blocks/message-blocks";
 import type { AppendCandidate } from "./vlist-message-append";
 import { upsertLoadedMessage } from "./vlist-message-append";
 
@@ -17,12 +21,22 @@ function toolMessage(
 	status: string,
 	extra: Record<string, unknown> = {},
 ): AppendCandidate {
-	return {
-		id,
-		seq: 2,
-		role: "assistant",
-		parentToolUseId: null,
-		contentJson: [
+	return rowWithElements(
+		{
+			id,
+			seq: 2,
+			role: "assistant",
+			parentToolUseId: null,
+			toolCalls: [
+				{
+					toolUseId: "tool-1",
+					toolName: "Edit",
+					status,
+					...extra,
+				},
+			],
+		},
+		[
 			{
 				type: "tool_use",
 				id: "tool-1",
@@ -31,15 +45,7 @@ function toolMessage(
 				...extra,
 			},
 		],
-		toolCalls: [
-			{
-				toolUseId: "tool-1",
-				toolName: "Edit",
-				status,
-				...extra,
-			},
-		],
-	};
+	);
 }
 
 describe("upsertLoadedMessage preserves subagent file evidence", () => {
@@ -137,10 +143,12 @@ describe("upsertLoadedMessage preserves subagent file evidence", () => {
 	});
 	it("does not restore a tool block removed by an authoritative edit", () => {
 		const previous = toolMessage("m1", "running", { _subagentActivity: activity });
-		const incoming = {
-			...toolMessage("m1", "running"),
-			contentJson: [{ type: "text", text: "edited" }],
-		};
+		const incoming = rowWithElements(
+			{
+				...toolMessage("m1", "running"),
+			},
+			[{ type: "text", text: "edited" }],
+		);
 		const result = upsertLoadedMessage([previous], incoming, false);
 		expect(messageBody(result.messages[0])).toEqual(messageBody(incoming));
 	});
@@ -157,10 +165,11 @@ describe("upsertLoadedMessage preserves live tool lifecycle", () => {
 		});
 		const result = upsertLoadedMessage([previous], stale, false);
 		expect(result.changed).toBe(true);
-		const msg = result.messages[0] as {
-			contentJson: Array<{ status?: string; durationMs?: number }>;
-			toolCalls: Array<{ status?: string; durationMs?: number }>;
-		};
+		const msg = result.messages[0] as unknown as MessageWithBody<{
+			id?: string;
+			status?: string;
+			durationMs?: number;
+		}> & { toolCalls: Array<{ status?: string; durationMs?: number }> };
 		expect(msg.toolCalls[0]?.status).toBe("success");
 		expect(msg.toolCalls[0]?.durationMs).toBe(15_000);
 		const block = messageBody(msg).find((b) => (b as { id?: string }).id === "tool-1");
@@ -182,13 +191,15 @@ describe("upsertLoadedMessage preserves live tool lifecycle", () => {
 
 	it("keeps previous toolCalls when the snapshot omits them", () => {
 		const previous = toolMessage("m1", "success", { durationMs: 9 });
-		const sparse = {
-			id: "m1",
-			seq: 2,
-			role: "assistant",
-			parentToolUseId: null,
-			contentJson: [{ type: "text", text: "hello" }],
-		} satisfies AppendCandidate;
+		const sparse = rowWithElements(
+			{
+				id: "m1",
+				seq: 2,
+				role: "assistant",
+				parentToolUseId: null,
+			},
+			[{ type: "text", text: "hello" }],
+		) satisfies AppendCandidate;
 		const result = upsertLoadedMessage([previous], sparse, false);
 		const msg = result.messages[0] as { toolCalls: Array<{ status?: string }> };
 		expect(msg.toolCalls[0]?.status).toBe("success");

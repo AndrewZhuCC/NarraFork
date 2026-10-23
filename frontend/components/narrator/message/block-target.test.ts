@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { TreeMessage } from "../../../lib/api/types";
 import { decodeBlockPage } from "../../../lib/block-protocol";
 import { blockTargetOf, inputBlockIdOf } from "./block-target";
@@ -59,12 +60,14 @@ describe("block targets", () => {
 	});
 
 	test("a client-built row, an unknown element or an unloaded message names no block", () => {
-		const row: TreeMessage = {
-			id: "u1",
-			narratorId: "n1",
-			role: "user",
-			contentJson: [{ type: "text", text: "hi" }],
-		} as TreeMessage;
+		const row: TreeMessage = rowWithElements(
+			{
+				id: "u1",
+				narratorId: "n1",
+				role: "user",
+			},
+			[{ type: "text", text: "hi" }],
+		) as TreeMessage;
 		const list = { messageOf: (id: string) => (id === "u1" ? row : undefined) };
 		expect(blockTargetOf(list, "u1", 0)).toEqual({ messageId: "u1", blockIndex: 0 });
 		expect(inputBlockIdOf(list, "u1")).toBeUndefined();

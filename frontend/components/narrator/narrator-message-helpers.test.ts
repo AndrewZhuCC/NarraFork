@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { createSourceText } from "@shared/pretext-layout/source-text";
 import {
 	buildTopLevelStreamingChunksMsg,
@@ -16,18 +16,20 @@ import {
 import type { NarratorMsg } from "./narrator-panel-types";
 
 function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
-	return {
-		id: "m1",
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [],
-		contentText: null,
-		toolCalls: [],
-		children: [],
-		createdAt: "2026-01-01T00:00:00.000Z",
-		...overrides,
-	} as NarratorMsg;
+	return rowWithElements(
+		{
+			id: "m1",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			children: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			...overrides,
+		},
+		[],
+	) as NarratorMsg;
 }
 
 describe("streaming source-range projection", () => {
@@ -88,56 +90,64 @@ describe("streaming source-range projection", () => {
 
 describe("preserveLiveSubagentActivity", () => {
 	test("keeps a known model when a terminal refresh carries an empty activity model", () => {
-		const existing = msg({
-			contentJson: [
+		const existing = msg(
+			rowWithElements(
 				{
-					type: "tool_use",
-					id: "parent-tool",
-					name: "Agent",
-					_subagentActivity: {
-						subagentNarratorId: "sub-1",
-						model: "known-model",
-						latestToolCalls: [],
-					},
+					toolCalls: [
+						{
+							toolUseId: "parent-tool",
+							toolName: "Agent",
+							_subagentActivity: {
+								subagentNarratorId: "sub-1",
+								model: "known-model",
+								latestToolCalls: [],
+							},
+						},
+					],
 				},
-			],
-			toolCalls: [
+				[
+					{
+						type: "tool_use",
+						id: "parent-tool",
+						name: "Agent",
+						_subagentActivity: {
+							subagentNarratorId: "sub-1",
+							model: "known-model",
+							latestToolCalls: [],
+						},
+					},
+				],
+			),
+		);
+		const incoming = msg(
+			rowWithElements(
 				{
-					toolUseId: "parent-tool",
-					toolName: "Agent",
-					_subagentActivity: {
-						subagentNarratorId: "sub-1",
-						model: "known-model",
-						latestToolCalls: [],
-					},
+					toolCalls: [
+						{
+							toolUseId: "parent-tool",
+							toolName: "Agent",
+							_subagentActivity: {
+								subagentNarratorId: "sub-1",
+								model: null,
+								latestToolCalls: [],
+							},
+						},
+					],
 				},
-			],
-		});
-		const incoming = msg({
-			contentJson: [
-				{
-					type: "tool_use",
-					id: "parent-tool",
-					name: "Agent",
-					_subagentActivity: {
-						subagentNarratorId: "sub-1",
-						model: "",
-						latestToolCalls: [],
+				[
+					{
+						type: "tool_use",
+						id: "parent-tool",
+						name: "Agent",
+						_subagentActivity: {
+							subagentNarratorId: "sub-1",
+							model: "",
+							latestToolCalls: [],
+						},
 					},
-				},
-			],
-			toolCalls: [
-				{
-					toolUseId: "parent-tool",
-					toolName: "Agent",
-					_subagentActivity: {
-						subagentNarratorId: "sub-1",
-						model: null,
-						latestToolCalls: [],
-					},
-				},
-			],
-		});
+				],
+			),
+		);
 
 		const preserved = preserveLiveSubagentActivity(existing, incoming);
 
@@ -201,24 +211,24 @@ describe("findLatestSpecTasksToolUseId", () => {
 
 	test("returns the last spec tasks tool-use id from contentJson", () => {
 		const messages = [
-			msg({ id: "m1", contentJson: [tasksBlock("t1")] as never }),
-			msg({ id: "m2", contentJson: [tasksBlock("t2")] as never }),
+			msg(rowWithElements({ id: "m1" }, [tasksBlock("t1")] as never)),
+			msg(rowWithElements({ id: "m2" }, [tasksBlock("t2")] as never)),
 		];
 		expect(findLatestSpecTasksToolUseId(messages)).toBe("t2");
 	});
 
 	test("ignores non-tasks file operations", () => {
 		const messages = [
-			msg({
-				contentJson: [
+			msg(
+				rowWithElements({}, [
 					{
 						type: "tool_use",
 						id: "other",
 						name: "Write",
 						input: { file_path: "src/index.ts", content: "x" },
 					},
-				] as never,
-			}),
+				] as never),
+			),
 		];
 		expect(findLatestSpecTasksToolUseId(messages)).toBeNull();
 	});

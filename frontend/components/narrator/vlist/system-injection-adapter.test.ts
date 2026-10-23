@@ -13,6 +13,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { coerceInjectionTarget } from "@shared/pretext-layout/injection-target";
 import { type AdapterRenderUnit, adaptRenderUnits } from "@shared/pretext-layout/segment-adapter";
 import type {
@@ -65,15 +66,15 @@ function injectionSegment(
 	const { native: _native, ...messageOver } = over;
 	return {
 		kind: "message",
-		msg: {
-			id: "m1",
-			role: "sys",
-			createdAt: "2026-07-28T10:00:00.000Z",
-			// Legacy rows have a sibling text block; native rows keep modelText on the
-			// injection itself and have no second projection to fall back to.
-			contentJson: (native ? [block] : [{ type: "text", text: MODEL_TEXT }, block]) as never,
-			...messageOver,
-		},
+		msg: rowWithElements(
+			{
+				id: "m1",
+				role: "sys",
+				createdAt: "2026-07-28T10:00:00.000Z",
+				...messageOver,
+			},
+			(native ? [block] : [{ type: "text", text: MODEL_TEXT }, block]) as never,
+		),
 	};
 }
 
@@ -468,14 +469,16 @@ describe("communication delivery — protocol role is not the speaker", () => {
 	it("old agentMessage rows keep complete prose, readable attribution and index-zero identity", () => {
 		const text = "[Message from agent X]\\nKeep this exact prefix; agentMessage:not-an-id";
 		for (const lod of [1, 2, 3, 4, 5] as const) {
-			const row = {
-				id: "legacy",
-				seq: 1,
-				role: "user",
-				origin: "assistant",
-				originLabel: "agentMessage:main narrator",
-				contentJson: [{ type: "text", text }],
-			};
+			const row = rowWithElements(
+				{
+					id: "legacy",
+					seq: 1,
+					role: "user",
+					origin: "assistant",
+					originLabel: "agentMessage:main narrator",
+				},
+				[{ type: "text", text }],
+			);
 			const spec = adaptSegment({ kind: "message", msg: row }, { lod })[0];
 			if (!spec) throw new Error("Missing legacy communication bubble");
 			expect(spec.kind).toBe("injection-bubble");
@@ -498,12 +501,14 @@ describe("communication delivery — protocol role is not the speaker", () => {
 			const specs = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: "human",
-						role: "user",
-						origin,
-						contentJson: [{ type: "text", text: "[Message from agent parent] hello" }],
-					},
+					msg: rowWithElements(
+						{
+							id: "human",
+							role: "user",
+							origin,
+						},
+						[{ type: "text", text: "[Message from agent parent] hello" }],
+					),
 				},
 				CTX,
 			);
@@ -638,11 +643,13 @@ describe("spoken injections — which producers qualify", () => {
 		const continuation = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "m1",
-					role: "system",
-					contentJson: [{ type: "spec_continuation", task: "wire the flag", protected: true }],
-				},
+				msg: rowWithElements(
+					{
+						id: "m1",
+						role: "system",
+					},
+					[{ type: "spec_continuation", task: "wire the flag", protected: true }],
+				),
 			},
 			CTX,
 		);
@@ -1164,7 +1171,7 @@ describe("framed system cards — the navigation target", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: { id: "m1", role: "system", contentJson: [block] },
+				msg: rowWithElements({ id: "m1", role: "system" }, [block]),
 				// biome-ignore lint/suspicious/noExplicitAny: adapter segment fixture
 			} as any,
 			CTX,

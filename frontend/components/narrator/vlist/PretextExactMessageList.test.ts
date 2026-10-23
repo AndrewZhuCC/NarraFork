@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { buildPretextLayoutIndex, type PretextLayoutManifest } from "@shared/pretext-layout";
 import { NarratorWSManager } from "../../../lib/narrator-ws-manager";
 import { shellModule, shellSource } from "./guard-source";
@@ -173,25 +174,25 @@ describe("PretextExactMessageList", () => {
 		// These markers get the in-place treatment (append at the tail, insert
 		// mid-window, live-patch on the status flip) instead of the deferred reload.
 		expect(
-			isCompactMarkerMessage({
-				contentJson: [{ type: "compact", status: "compacting" }],
-			} as never),
+			isCompactMarkerMessage(
+				rowWithElements({}, [{ type: "compact", status: "compacting" }]) as never,
+			),
 		).toBe(true);
 		expect(
-			isCompactMarkerMessage({
-				contentJson: [{ type: "segment_compact", status: "compacted" }],
-			} as never),
+			isCompactMarkerMessage(
+				rowWithElements({}, [{ type: "segment_compact", status: "compacted" }]) as never,
+			),
 		).toBe(true);
 		// Ordinary messages and the OTHER structural inserts must not take that path.
-		expect(isCompactMarkerMessage({ contentJson: [{ type: "text" }] } as never)).toBe(false);
-		expect(isCompactMarkerMessage({ contentJson: [{ type: "ask_in_passing" }] } as never)).toBe(
+		expect(isCompactMarkerMessage(rowWithElements({}, [{ type: "text" }]) as never)).toBe(false);
+		expect(isCompactMarkerMessage(rowWithElements({}, [{ type: "ask_in_passing" }]) as never)).toBe(
 			false,
 		);
-		expect(isCompactMarkerMessage({ contentJson: [{ type: "context_cleared" }] } as never)).toBe(
-			false,
-		);
+		expect(
+			isCompactMarkerMessage(rowWithElements({}, [{ type: "context_cleared" }]) as never),
+		).toBe(false);
 		expect(isCompactMarkerMessage(undefined)).toBe(false);
-		expect(isCompactMarkerMessage({ contentJson: null } as never)).toBe(false);
+		expect(isCompactMarkerMessage({ blocks: null } as never)).toBe(false);
 	});
 
 	it("prefers the synchronous live scroll view when capturing a rebuild anchor", () => {

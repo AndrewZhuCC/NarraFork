@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	buildToolUseIndex,
 	insertChildIntoCache,
@@ -17,20 +17,24 @@ function createBaseCache(): {
 	pages: Array<{ messages: TreeMessage[]; hasMore?: boolean; nextCursor?: string | null }>;
 	pageParams?: unknown[];
 } {
-	const parent = makeMessage({
-		id: "msg-parent",
-		role: "assistant",
-		contentJson: [{ type: "tool_use", id: "tu-parent", name: "Task", input: {} }],
-		toolCalls: [
+	const parent = makeMessage(
+		rowWithElements(
 			{
-				id: "tc-parent",
-				toolUseId: "tu-parent",
-				toolName: "Task",
-				status: "running",
-				createdAt: "2025-01-01T00:00:00.000Z",
+				id: "msg-parent",
+				role: "assistant",
+				toolCalls: [
+					{
+						id: "tc-parent",
+						toolUseId: "tu-parent",
+						toolName: "Task",
+						status: "running",
+						createdAt: "2025-01-01T00:00:00.000Z",
+					},
+				],
 			},
-		],
-	});
+			[{ type: "tool_use", id: "tu-parent", name: "Task", input: {} }],
+		),
+	);
 	return {
 		pages: [{ messages: [parent], hasMore: false, nextCursor: null }],
 		pageParams: [undefined],
@@ -62,19 +66,23 @@ describe("message-tree-utils legacy behavior", () => {
 		const prevPages = cache.pages;
 		const prevIndex = buildToolUseIndex(prevPages);
 
-		const nextMsg = makeMessage({
-			id: "msg-next",
-			role: "assistant",
-			contentJson: [{ type: "tool_use", id: "tu-next", name: "Bash", input: {} }],
-			toolCalls: [
+		const nextMsg = makeMessage(
+			rowWithElements(
 				{
-					toolUseId: "tu-next",
-					toolName: "Bash",
-					status: "running",
-					createdAt: "2025-01-01T00:00:00.000Z",
+					id: "msg-next",
+					role: "assistant",
+					toolCalls: [
+						{
+							toolUseId: "tu-next",
+							toolName: "Bash",
+							status: "running",
+							createdAt: "2025-01-01T00:00:00.000Z",
+						},
+					],
 				},
-			],
-		});
+				[{ type: "tool_use", id: "tu-next", name: "Bash", input: {} }],
+			),
+		);
 		const newPages = [{ ...prevPages[0], messages: [...prevPages[0].messages, nextMsg] }];
 
 		const nextIndex = updateToolUseIndex(prevIndex, prevPages, newPages);
@@ -85,13 +93,17 @@ describe("message-tree-utils legacy behavior", () => {
 	test("insertChildIntoCache 依据 parentToolUseId 挂载子消息", () => {
 		const cache = createBaseCache();
 		const index = buildToolUseIndex(cache.pages);
-		const child = makeMessage({
-			id: "child-1",
-			narratorId: "n-sub",
-			parentToolUseId: "tu-parent",
-			role: "assistant",
-			contentJson: [{ type: "text", text: "child" }],
-		});
+		const child = makeMessage(
+			rowWithElements(
+				{
+					id: "child-1",
+					narratorId: "n-sub",
+					parentToolUseId: "tu-parent",
+					role: "assistant",
+				},
+				[{ type: "text", text: "child" }],
+			),
+		);
 
 		const updated = insertChildIntoCache(cache, child, index);
 		expect(updated.pages[0].messages[0].children.map((m: TreeMessage) => m.id)).toEqual([

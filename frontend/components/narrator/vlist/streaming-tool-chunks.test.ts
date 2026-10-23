@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	createDiffDocument,
 	getDiffRowAnchor,
@@ -447,12 +448,10 @@ describe("collectPersistedToolUseIds", () => {
 	it("reads ids from toolCalls and from tool_use content blocks", () => {
 		const ids = collectPersistedToolUseIds([
 			{ toolCalls: [{ toolUseId: "a" }] },
-			{
-				contentJson: [
-					{ type: "tool_use", id: "b" },
-					{ type: "text", text: "x" },
-				],
-			},
+			rowWithElements({}, [
+				{ type: "tool_use", id: "b" },
+				{ type: "text", text: "x" },
+			]),
 		]);
 		expect([...ids].sort()).toEqual(["a", "b"]);
 	});
@@ -467,7 +466,7 @@ describe("collectPersistedToolUseIds", () => {
 	it("skips malformed entries", () => {
 		const ids = collectPersistedToolUseIds([
 			{ toolCalls: [{ toolUseId: "" }, {}, { toolUseId: 7 }] },
-			{ contentJson: [{ type: "tool_use" }] },
+			rowWithElements({}, [{ type: "tool_use" }]),
 			{},
 		]);
 		expect(ids.size).toBe(0);

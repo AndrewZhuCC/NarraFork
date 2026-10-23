@@ -17,6 +17,7 @@ import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { MantineProvider } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -629,10 +630,22 @@ describe("Read execution target — real row menu", () => {
 			try {
 				const onOpenFileTarget = mock((..._args: unknown[]) => {});
 				const legacyOpen = mock((_path: string) => {});
-				const message = {
-					id: "read-message",
-					narratorId: "actual-child",
-					contentJson: [
+				const message = rowWithElements(
+					{
+						id: "read-message",
+						narratorId: "actual-child",
+						toolCalls: [
+							{
+								toolUseId: "read-1",
+								toolName: "Read",
+								inputJson: { file_path: item.path },
+								status: "success",
+								executionDeviceId: item.deviceId,
+								executionCwd: item.cwd,
+							},
+						],
+					},
+					[
 						{
 							type: "tool_use",
 							name: "Read",
@@ -640,17 +653,7 @@ describe("Read execution target — real row menu", () => {
 							input: { file_path: item.path, device: "wrong-current-default" },
 						},
 					],
-					toolCalls: [
-						{
-							toolUseId: "read-1",
-							toolName: "Read",
-							inputJson: { file_path: item.path },
-							status: "success",
-							executionDeviceId: item.deviceId,
-							executionCwd: item.cwd,
-						},
-					],
-				} as unknown as NarratorMsg;
+				) as unknown as NarratorMsg;
 				const [historyDto] = JSON.parse(
 					JSON.stringify(stripRedundantToolCallRows(enrichToolUseBlocks([message]))),
 				);
@@ -693,11 +696,36 @@ describe("Read execution target — real row menu", () => {
 					stripProviderMetadata(
 						stripRedundantToolCallRows(
 							enrichToolUseBlocks([
-								{
-									id: "history",
-									narratorId: "actual-history-child",
-									children: [],
-									contentJson: [
+								rowWithElements(
+									{
+										id: "history",
+										narratorId: "actual-history-child",
+										children: [],
+										toolCalls: [
+											{
+												id: "retry",
+												toolUseId: "history-read",
+												toolName: "Read",
+												status: "success",
+												executionAttempt: 2,
+												inputJson: { file_path: relative },
+												executionDeviceId: target.deviceId,
+												executionCwd: cwd,
+												executionTarget: { deviceId: target.deviceId, cwd },
+											},
+											{
+												id: "old",
+												toolUseId: "history-read",
+												toolName: "Read",
+												status: "error",
+												executionAttempt: 1,
+												inputJson: { file_path: "old.txt" },
+												executionDeviceId: "old-device",
+												executionCwd: "/old",
+											},
+										],
+									},
+									[
 										{
 											type: "tool_use",
 											name: "Read",
@@ -711,30 +739,7 @@ describe("Read execution target — real row menu", () => {
 											executionTarget: { deviceId: "stale", cwd: "/stale" },
 										},
 									],
-									toolCalls: [
-										{
-											id: "retry",
-											toolUseId: "history-read",
-											toolName: "Read",
-											status: "success",
-											executionAttempt: 2,
-											inputJson: { file_path: relative },
-											executionDeviceId: target.deviceId,
-											executionCwd: cwd,
-											executionTarget: { deviceId: target.deviceId, cwd },
-										},
-										{
-											id: "old",
-											toolUseId: "history-read",
-											toolName: "Read",
-											status: "error",
-											executionAttempt: 1,
-											inputJson: { file_path: "old.txt" },
-											executionDeviceId: "old-device",
-											executionCwd: "/old",
-										},
-									],
-								},
+								),
 							]),
 						),
 					),
@@ -876,10 +881,12 @@ describe("Read execution target — real row menu", () => {
 
 	test("UNC input remains copyable but is never joined to a current local directory", async () => {
 		const path = "\\\\server\\share\\中文 空格.png";
-		const message = {
-			id: "m",
-			narratorId: "child",
-			contentJson: [
+		const message = rowWithElements(
+			{
+				id: "m",
+				narratorId: "child",
+			},
+			[
 				{
 					type: "tool_use",
 					name: "Read",
@@ -889,7 +896,7 @@ describe("Read execution target — real row menu", () => {
 					executionCwd: "C:/original",
 				},
 			],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		await renderRow({
 			narratorId: "host",
 			toolMeta: buildToolMetaIndex([message]).get("unc"),

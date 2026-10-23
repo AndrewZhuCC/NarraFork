@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	buildStreamingMsg,
@@ -10,11 +11,13 @@ import {
 
 describe("buildStreamingMsg request identity", () => {
 	test("carries actual identity without inferring it from tool chunks", () => {
-		const toolChunksMsg = {
-			contentJson: [{ type: "tool_use", id: "tool", name: "Read" }],
-			model: "unrelated-model",
-			provider: "unrelated-provider",
-		} as NarratorMsg;
+		const toolChunksMsg = rowWithElements(
+			{
+				model: "unrelated-model",
+				provider: "unrelated-provider",
+			},
+			[{ type: "tool_use", id: "tool", name: "Read" }],
+		) as NarratorMsg;
 		expect(
 			buildStreamingMsg({
 				narratorId: "n",
@@ -32,22 +35,26 @@ describe("buildStreamingMsg request identity", () => {
 describe("resolveAllToolCallsFromMsg", () => {
 	test("accepts numeric tcCreatedAt values", () => {
 		const createdAt = 1_700_000_000_000;
-		const msg = {
-			role: "assistant",
-			contentJson: [{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
-			toolCalls: [],
-		} as unknown as NarratorMsg;
+		const msg = rowWithElements(
+			{
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
+		) as unknown as NarratorMsg;
 
 		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({ createdAt, startedAt: createdAt });
 	});
 
 	test("accepts ISO tcCreatedAt values", () => {
 		const createdAt = "2023-11-14T22:13:20.000Z";
-		const msg = {
-			role: "assistant",
-			contentJson: [{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
-			toolCalls: [],
-		} as unknown as NarratorMsg;
+		const msg = rowWithElements(
+			{
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
+		) as unknown as NarratorMsg;
 
 		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({
 			createdAt,
@@ -56,12 +63,18 @@ describe("resolveAllToolCallsFromMsg", () => {
 	});
 
 	test("recognizes Send as a subagent card from _subagentActivity without children", () => {
-		const msg = {
-			id: "message-1",
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const msg = rowWithElements(
+			{
+				id: "message-1",
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [{ toolUseId: "send-1", toolName: "Send", status: "running" }],
+				children: [],
+				createdAt: "2026-07-18T00:00:00.000Z",
+			},
+			[
 				{
 					type: "tool_use",
 					id: "send-1",
@@ -73,11 +86,7 @@ describe("resolveAllToolCallsFromMsg", () => {
 					},
 				},
 			],
-			contentText: null,
-			toolCalls: [{ toolUseId: "send-1", toolName: "Send", status: "running" }],
-			children: [],
-			createdAt: "2026-07-18T00:00:00.000Z",
-		} as NarratorMsg;
+		) as NarratorMsg;
 		const segments = segmentMessages([msg]);
 		expect(segments[0]).toMatchObject({
 			kind: "tool-run",
@@ -88,12 +97,25 @@ describe("resolveAllToolCallsFromMsg", () => {
 
 describe("segmentMessages", () => {
 	function toolMessage(messageId: string, toolUseId: string, reasoningText: string): NarratorMsg {
-		return {
-			id: messageId,
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		return rowWithElements(
+			{
+				id: messageId,
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{
+						id: `call-${toolUseId}`,
+						toolUseId,
+						toolName: "Read",
+						status: "success",
+					},
+				],
+				children: [],
+				createdAt: "2026-07-19T00:00:00.000Z",
+			},
+			[
 				{
 					type: "reasoning",
 					text: reasoningText,
@@ -104,18 +126,7 @@ describe("segmentMessages", () => {
 				},
 				{ type: "tool_use", id: toolUseId, name: "Read", input: { file_path: "a.ts" } },
 			],
-			contentText: null,
-			toolCalls: [
-				{
-					id: `call-${toolUseId}`,
-					toolUseId,
-					toolName: "Read",
-					status: "success",
-				},
-			],
-			children: [],
-			createdAt: "2026-07-19T00:00:00.000Z",
-		} as NarratorMsg;
+		) as NarratorMsg;
 	}
 
 	test("metadata-only empty reasoning does not split consecutive tool runs", () => {

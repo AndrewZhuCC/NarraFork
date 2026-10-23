@@ -20,7 +20,7 @@ const blockSync = await import("../narrator-block-sync");
 const targets = await import("../narrator-block-targets");
 const page = await import("../narrator-block-page");
 const { decodeBlockPage } = await import("@frontend/lib/block-protocol");
-const { messageBlocks } = await import("@shared/narrator-blocks/message-blocks");
+const { messageBlocks, splitRowBlocks } = await import("@shared/narrator-blocks/message-blocks");
 
 /** A decoded value without the block sidecar the client adds to every row. */
 /** The value with each decoded row's body back as the elements its blocks hold. */
@@ -136,7 +136,7 @@ describe("the message page in protocol v2", () => {
 		// A row the client builds itself is split into these same blocks.
 		for (const message of v1.messages)
 			expect(
-				messageBlocks(message).map(({ from: _from, named: _named, ...block }) => ({
+				splitRowBlocks(message, message.contentJson).map(({ named: _named, ...block }) => ({
 					...block,
 					elements: [...block.elements] as unknown[],
 				})),

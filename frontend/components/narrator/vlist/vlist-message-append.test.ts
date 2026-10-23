@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	type AppendCandidate,
 	appendLoadedMessage,
@@ -7,14 +8,16 @@ import {
 } from "./vlist-message-append";
 
 function msg(id: string, seq: number, extra: Partial<AppendCandidate> = {}): AppendCandidate {
-	return {
-		id,
-		seq,
-		role: "assistant",
-		parentToolUseId: null,
-		contentJson: [{ type: "text", text: "hello" }],
-		...extra,
-	};
+	return rowWithElements(
+		{
+			id,
+			seq,
+			role: "assistant",
+			parentToolUseId: null,
+			...extra,
+		},
+		[{ type: "text", text: "hello" }],
+	);
 }
 
 const loaded = [msg("m1", 1), msg("m2", 2), msg("m3", 3)];
@@ -64,7 +67,7 @@ describe("resolveMessageAppend — what may extend the loaded window", () => {
 		// These land mid-history and shift every following seq, so the window must be
 		// rebuilt from the server rather than extended locally.
 		for (const type of ["ask_in_passing", "context_cleared"]) {
-			expect(decide(msg(`s-${type}`, 9, { contentJson: [{ type }] }))).toEqual({
+			expect(decide(msg(`s-${type}`, 9, rowWithElements({}, [{ type }])))).toEqual({
 				append: false,
 				reason: "structural",
 			});
@@ -77,7 +80,7 @@ describe("resolveMessageAppend — what may extend the loaded window", () => {
 		// to a reader's already-loaded window. Declining it here used to defer the
 		// marker behind the reload gate until the reader scrolled back to the bottom.
 		expect(
-			decide(msg("c-tail", 9, { contentJson: [{ type: "compact", status: "compacting" }] })),
+			decide(msg("c-tail", 9, rowWithElements({}, [{ type: "compact", status: "compacting" }]))),
 		).toEqual({ append: true });
 	});
 
@@ -86,16 +89,18 @@ describe("resolveMessageAppend — what may extend the loaded window", () => {
 		// compresses, so it is never newer than the loaded tail while that segment is
 		// loaded. The caller routes this to the in-place insert, not the reload.
 		expect(
-			decide(msg("c-mid", 2, { contentJson: [{ type: "segment_compact", status: "compacting" }] })),
+			decide(
+				msg("c-mid", 2, rowWithElements({}, [{ type: "segment_compact", status: "compacting" }])),
+			),
 		).toEqual({ append: false, reason: "not-tail" });
 		expect(
-			decide(msg("c-mid", 2, { contentJson: [{ type: "compact", status: "compacting" }] })),
+			decide(msg("c-mid", 2, rowWithElements({}, [{ type: "compact", status: "compacting" }]))),
 		).toEqual({ append: false, reason: "not-tail" });
 	});
 
 	it("still appends a normal message that merely contains a tool_use block", () => {
 		expect(
-			decide(msg("m4", 4, { contentJson: [{ type: "tool_use", id: "t1", name: "Bash" }] })),
+			decide(msg("m4", 4, rowWithElements({}, [{ type: "tool_use", id: "t1", name: "Bash" }]))),
 		).toEqual({ append: true });
 	});
 

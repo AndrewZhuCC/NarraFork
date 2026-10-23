@@ -8,7 +8,7 @@
  * live output do not have it:
  *
  *   - the STREAMING row is built by `buildStreamingMsg`, which sets
- *     `contentText: null` outright and carries its text in `contentJson` blocks;
+ *     `contentText: null` outright and carries its text in its blocks;
  *   - an APPENDED broadcast message carries the same block shape.
  *
  * So a scan keyed on `contentText` reports "no math" for exactly the messages whose
