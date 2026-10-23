@@ -536,7 +536,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"insertOr",
 		"indexHint",
 	],
-	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid"],
+	// Its reindex reads which blocks the block index already has, by rowid.
+	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid", "sqliteCatalog", "fts5"],
 	// Operations addressed by block id resolve to element ranges from block rows.
 	"server/services/narrator-block-targets.ts": ["handle", "json1"],
 	// Message protocol v2 (§8): a page's envelopes read their block rows' layouts.
