@@ -66,7 +66,6 @@ import {
 	sameFileReferenceInput,
 } from "./file-reference-input";
 import { InlineComposerEditor, type InlineComposerEditorHandle } from "./InlineComposerEditor";
-import { InlineQuoteCandidate } from "./InlineQuoteCandidate";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import classes from "./NarratorComposer.module.css";
 import {
@@ -80,6 +79,7 @@ import {
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
 import { QuoteDetailModal } from "./QuoteDetailModal";
+import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import { revealComposerQuote, revealQuotedFile } from "./quote-jump";
 import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
 import { type QuoteCandidate, useQuoteCandidate } from "./use-quote-candidate";
@@ -1730,6 +1730,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				aria-modal={fullscreenOpened || undefined}
 				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}
 			>
+				<QuoteSelectionButton
+					candidate={quoteCandidate.candidate}
+					anchor={editorElement?.closest<HTMLElement>("[data-inline-composer]") ?? null}
+					placement={quoteCandidate.showShortcut ? "selection" : "composer"}
+					showShortcut={quoteCandidate.showShortcut}
+					disabled={sending || hasUnconfirmedLegacyAttachments()}
+					onAccept={acceptQuote}
+					onDismiss={quoteCandidate.hide}
+				/>
 				<QuoteDetailModal
 					quote={quoteDetail}
 					onClose={() => setQuoteDetail(null)}
@@ -1843,22 +1852,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					value={document}
 					adaptive={adaptive && !fullscreenOpened}
 					leadingControls={controls}
-					candidate={
-						quoteCandidate.candidate
-							? {
-									key: quoteCandidate.candidate.key,
-									content: (
-										<InlineQuoteCandidate
-											candidate={quoteCandidate.candidate}
-											showShortcut={quoteCandidate.showShortcut}
-											disabled={sending || hasUnconfirmedLegacyAttachments()}
-											onAccept={acceptQuote}
-											onDismiss={quoteCandidate.hide}
-										/>
-									),
-								}
-							: undefined
-					}
 					onChange={applyDocument}
 					resources={resources}
 					attachmentsHydrating={attachmentsHydrating}
