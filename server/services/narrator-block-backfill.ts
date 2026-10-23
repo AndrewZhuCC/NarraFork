@@ -11,10 +11,11 @@
  *     it is flipped without rows instead, and the store's sync builds them.
  *   - `verify` then walks block-format envelopes and records any whose rows do not
  *     assemble to its stored content in `narrator_block_diagnostics`, re-syncing it.
- *   - `reindex` (P3c) then rewrites every block-format envelope's block search index text,
- *     as the sync computes it, in small slices on the main thread. The envelope index
- *     retires once it has completed (`ensureFts`), which also starts it over when the block
- *     index has to be cleared.
+ *   - `reindex` (P3c) then rewrites every block-format envelope's block search index text.
+ *     A db-worker computes it as the sync would (rows assembled, planned with the ledger);
+ *     the main thread only writes it, for envelopes unchanged since the read, and syncs the
+ *     rare changed one itself. The envelope index retires once it has completed
+ *     (`ensureFts`), which also starts it over when the block index has to be cleared.
  *
  * Two more are started from the storage page (P3b, §10.4), one at a time:
  *
@@ -41,12 +42,15 @@ import {
 	type BlockBackfillSliceResult,
 	type BlockProjectionSliceParams,
 	type BlockProjectionSliceResult,
+	type BlockReindexSliceParams,
+	type BlockReindexSliceResult,
 	type BlockVerifySliceParams,
 	type BlockVerifySliceResult,
 	ledgerFingerprint,
 	rowsSignature,
 	runBlockBackfillSlice,
 	runBlockProjectionSlice,
+	runBlockReindexSlice,
 	runBlockVerifySlice,
 } from "../lib/db-worker/block-backfill-query";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
@@ -79,15 +83,23 @@ const APPLY_TARGET_MS = 50;
 const INLINE_SLICE_ENVELOPES = 10;
 const INLINE_SLICE_SOURCE_BYTES = 256 * 1024;
 const WORKER_TIMEOUT_MS = 30_000;
+/** Index text one reindex slice writes: trigram tokenizing it is the main thread's cost. */
+const REINDEX_SLICE_INDEX_CHARS = 256 * 1024;
+const SLOW_LOG_INTERVAL_MS = 60_000;
 
 /** How a slice is read: by a db-worker (production) or inline on a given connection. */
 export interface SliceReader {
 	backfill(params: BlockBackfillSliceParams): Promise<BlockBackfillSliceResult>;
 	verify(params: BlockVerifySliceParams): Promise<BlockVerifySliceResult>;
+	reindex(params: BlockReindexSliceParams): Promise<BlockReindexSliceResult>;
 }
 
 async function readInWorker<T>(
-	params: BlockBackfillSliceParams | BlockVerifySliceParams | BlockProjectionSliceParams,
+	params:
+		| BlockBackfillSliceParams
+		| BlockVerifySliceParams
+		| BlockReindexSliceParams
+		| BlockProjectionSliceParams,
 	inline: () => T,
 ): Promise<T> {
 	try {
@@ -110,6 +122,8 @@ const workerReader: SliceReader = {
 		readInWorker(params, () => runBlockBackfillSlice(database.sqlite, inlineLimits(params))),
 	verify: (params) =>
 		readInWorker(params, () => runBlockVerifySlice(database.sqlite, inlineLimits(params))),
+	reindex: (params) =>
+		readInWorker(params, () => runBlockReindexSlice(database.sqlite, inlineLimits(params))),
 };
 
 /** How a projection job's slice is read: by a db-worker, or inline on a given connection. */
@@ -273,15 +287,25 @@ function applyEnvelope(envelope: BackfillEnvelope): Applied {
 	return "converted";
 }
 
+const slowLog = hotSafe("narrator-block-backfill:slow-log", () => ({ at: 0, suppressed: 0 }));
+
 /** Size the next slice by how long this slice's write transaction took. */
 function adapt(elapsedMs: number, envelopes: number): void {
 	if (elapsedMs > APPLY_TARGET_MS) {
 		state.sliceEnvelopes = Math.max(MIN_SLICE_ENVELOPES, Math.floor(state.sliceEnvelopes / 2));
-		logger.warn("Slow block backfill transaction", {
-			elapsedMs: Math.round(elapsedMs),
-			envelopes,
-			nextSlice: state.sliceEnvelopes,
-		});
+		// At most one line a minute: a run of large envelopes would otherwise log every slice.
+		const now = Date.now();
+		if (now - slowLog.at < SLOW_LOG_INTERVAL_MS) slowLog.suppressed++;
+		else {
+			logger.warn("Slow block backfill transaction", {
+				elapsedMs: Math.round(elapsedMs),
+				envelopes,
+				nextSlice: state.sliceEnvelopes,
+				suppressedSinceLast: slowLog.suppressed,
+			});
+			slowLog.at = now;
+			slowLog.suppressed = 0;
+		}
 	} else if (state.sliceEnvelopes < MAX_SLICE_ENVELOPES) {
 		state.sliceEnvelopes = Math.min(MAX_SLICE_ENVELOPES, state.sliceEnvelopes * 2);
 	}
@@ -339,41 +363,51 @@ async function verifySlice(reader: SliceReader): Promise<void> {
 }
 
 /**
- * One slice of `reindex`: the next block-format envelopes have their blocks' search index text
- * rewritten from their rows and ledger, as many as fit the inline budget. On the main thread
- * because the sync computes the text, in the same transaction that reads what it indexes.
+ * One slice of `reindex`: a db-worker computes the next envelopes' block index text; the main
+ * thread writes it in one short transaction. An envelope whose rows, ledger or queue entry
+ * changed since the read is synced here instead, which computes the same text from what it
+ * holds now (rare: only envelopes written while the slice was read).
  */
-function reindexSlice(): void {
+async function reindexSlice(reader: SliceReader): Promise<void> {
 	const job = jobState("reindex");
-	const candidates = database.sqlite
-		.prepare(
-			`SELECT rowid, id, body_bytes AS bytes FROM narrator_messages
-			 WHERE rowid > ? AND body_format = 2 ORDER BY rowid LIMIT ?`,
-		)
-		.all(job.cursor, INLINE_SLICE_ENVELOPES) as Array<{ rowid: number; id: string; bytes: number }>;
+	const slice = await reader.reindex({
+		kind: "blockReindexSlice",
+		afterRowid: job.cursor,
+		maxEnvelopes: state.sliceEnvelopes,
+		maxSourceBytes: MAX_SLICE_SOURCE_BYTES,
+		maxIndexChars: REINDEX_SLICE_INDEX_CHARS,
+		budgetMs: SLICE_BUDGET_MS,
+	});
 	const started = performance.now();
 	database.sqlite.transaction(() => {
-		let lastRowid = job.cursor;
-		let bytes = 0;
-		let handled = 0;
-		for (const row of candidates) {
-			if (
-				handled > 0 &&
-				(bytes + row.bytes > INLINE_SLICE_SOURCE_BYTES ||
-					performance.now() - started > APPLY_TARGET_MS)
-			)
-				break;
-			reindexEnvelope(row.id);
-			bytes += row.bytes;
-			handled++;
-			lastRowid = row.rowid;
+		const rows = database.sqlite.prepare(
+			"SELECT id, revision FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal",
+		);
+		const queued = database.sqlite.prepare(
+			"SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?",
+		);
+		for (const envelope of slice.envelopes) {
+			const current = rows.all(envelope.id) as Array<{ id: string; revision: number }>;
+			const unchanged =
+				!envelope.resync &&
+				!queued.get(envelope.id) &&
+				ledgerFingerprint(database.sqlite, envelope.id) === envelope.ledgerFingerprint &&
+				current.length === envelope.blocks.length &&
+				current.every(
+					(row, ordinal) =>
+						row.id === envelope.blocks[ordinal].id &&
+						row.revision === envelope.blocks[ordinal].revision,
+				);
+			if (!unchanged) {
+				reindexEnvelope(envelope.id);
+				continue;
+			}
+			for (const block of envelope.blocks)
+				replaceBlockIndexText(database.sqlite, block.id, block.text);
 		}
-		const done = handled === candidates.length && candidates.length < INLINE_SLICE_ENVELOPES;
-		advance("reindex", lastRowid, handled, done);
+		advance("reindex", slice.lastRowid, slice.envelopes.length, slice.done);
 	})();
-	const elapsedMs = performance.now() - started;
-	if (elapsedMs > APPLY_TARGET_MS * 4)
-		logger.warn("Slow block reindex slice", { elapsedMs: Math.round(elapsedMs) });
+	adapt(performance.now() - started, slice.envelopes.length);
 }
 
 /**
@@ -397,7 +431,7 @@ export async function runBlockJobSlice(reader: SliceReader = workerReader): Prom
 	}
 	const reindex = jobState("reindex");
 	if (reindex.complete || reindex.paused) return false;
-	reindexSlice();
+	await reindexSlice(reader);
 	return true;
 }
 

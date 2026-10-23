@@ -22,9 +22,12 @@ const blockSync = await import("../narrator-block-sync");
 const scans = await import("../narrator-block-scans");
 const bodies = await import("../narrator-body-writes");
 const backfill = await import("../narrator-block-backfill");
-const { runBlockBackfillSlice, runBlockVerifySlice, runBlockProjectionSlice } = await import(
-	"../../lib/db-worker/block-backfill-query"
-);
+const {
+	runBlockBackfillSlice,
+	runBlockVerifySlice,
+	runBlockReindexSlice,
+	runBlockProjectionSlice,
+} = await import("../../lib/db-worker/block-backfill-query");
 const { queryModelHistory, sqliteHistoryQuery } = await import(
 	"../agent-runtime/model-history-query"
 );
@@ -37,6 +40,8 @@ const inline = {
 		runBlockBackfillSlice(sqlite, params),
 	verify: async (params: Parameters<typeof runBlockVerifySlice>[1]) =>
 		runBlockVerifySlice(sqlite, params),
+	reindex: async (params: Parameters<typeof runBlockReindexSlice>[1]) =>
+		runBlockReindexSlice(sqlite, params),
 };
 const read = async (params: Parameters<typeof runBlockProjectionSlice>[1]) =>
 	runBlockProjectionSlice(sqlite, params);

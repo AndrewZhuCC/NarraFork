@@ -17,7 +17,7 @@ await import("../narrator-service");
 const { settings } = await import("../../lib/settings");
 const blockSync = await import("../narrator-block-sync");
 const backfill = await import("../narrator-block-backfill");
-const { runBlockBackfillSlice, runBlockVerifySlice } = await import(
+const { runBlockBackfillSlice, runBlockVerifySlice, runBlockReindexSlice } = await import(
 	"../../lib/db-worker/block-backfill-query"
 );
 
@@ -38,6 +38,8 @@ const inline = {
 		runBlockBackfillSlice(sqlite, params),
 	verify: async (params: Parameters<typeof runBlockVerifySlice>[1]) =>
 		runBlockVerifySlice(sqlite, params),
+	reindex: async (params: Parameters<typeof runBlockReindexSlice>[1]) =>
+		runBlockReindexSlice(sqlite, params),
 };
 
 /** Convert every legacy envelope to block format, as the backfill does. */
