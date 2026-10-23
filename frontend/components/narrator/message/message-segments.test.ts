@@ -220,4 +220,3 @@ describe("mergeStreamingSnapshotBlocks", () => {
 		expect(blocks.map((b) => (b.type === "text" ? b.text : ""))).toEqual(["first", "second"]);
 	});
 });
-
