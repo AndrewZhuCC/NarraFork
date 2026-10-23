@@ -6,6 +6,8 @@
  *     envelopes; the main thread only inserts them.
  *   - `blockVerifySlice` checks block-format envelopes' rows against their stored content
  *     and names the ones that differ.
+ *   - `blockReindexSlice` computes block-format envelopes' block search index text, as the
+ *     sync would write it, for the main thread to write (P3c).
  *   - `blockProjectionSlice` serves the admin-started projection jobs (P3b): `clear` names
  *     the envelopes whose rows assemble to their `content_json`, so the main thread can drop
  *     it; `restore` assembles rows-only envelopes' projections for it to write back.
@@ -40,6 +42,29 @@ export interface BlockBackfillSliceParams extends BlockSliceLimits {
 
 export interface BlockVerifySliceParams extends BlockSliceLimits {
 	kind: "blockVerifySlice";
+}
+
+export interface BlockReindexSliceParams extends BlockSliceLimits {
+	kind: "blockReindexSlice";
+	/** Index text a slice computes before it stops: what the main thread then writes. */
+	maxIndexChars: number;
+}
+
+/** One envelope's blocks with the search text a sync gives them, as read. */
+export interface ReindexEnvelope {
+	id: string;
+	ledgerFingerprint: string;
+	/** In ordinal order; empty text leaves a block unsearchable (it is still streaming). */
+	blocks: Array<{ id: string; revision: number; text: string }>;
+	/** Not computed here (queued for its sync, or its rows do not line up with its body):
+	 *  the main thread syncs it itself. */
+	resync: boolean;
+}
+
+export interface BlockReindexSliceResult {
+	envelopes: ReindexEnvelope[];
+	lastRowid: number;
+	done: boolean;
 }
 
 export interface BlockProjectionSliceParams extends BlockSliceLimits {
@@ -390,4 +415,109 @@ export function runBlockProjectionSlice(
 		lastRowid,
 		done,
 	};
+}
+
+/**
+ * An envelope's blocks with the text the sync's index write gives them: its body assembled
+ * from its rows, planned with its ledger exactly as `syncEnvelope` plans it, each planned block
+ * matched to the row at its ordinal. A queued envelope, or one whose plan does not line up
+ * with its rows, is left to the main thread's own sync.
+ */
+function reindexPlan(db: Database, rowid: number): ReindexEnvelope {
+	const source = db
+		.query(
+			`SELECT m.id, m.narrator_id AS narratorId, m.role, m.content_text AS contentText,
+				m.parent_tool_use_id AS parentToolUseId, m.sdk_message_uuid AS messageUuid,
+				m.origin, m.provider,
+				EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = m.id) AS queued
+			 FROM narrator_messages m WHERE m.rowid = ?`,
+		)
+		.get(rowid) as Omit<
+		EnvelopeSource,
+		"rowid" | "contentJson" | "createdAt" | "bodyRevision" | "stateRevision"
+	> & {
+		queued: number;
+	};
+	const envelope = {
+		id: source.id,
+		ledgerFingerprint: ledgerFingerprint(db, source.id),
+		blocks: [] as ReindexEnvelope["blocks"],
+		resync: true,
+	};
+	if (source.queued) return envelope;
+	const rows = db
+		.query(
+			`SELECT id, revision, kind, phase, payload, state FROM narrator_blocks
+			 WHERE message_id = ? ORDER BY ordinal`,
+		)
+		.all(source.id) as Array<{
+		id: string;
+		revision: number;
+		kind: string;
+		phase: string;
+		payload: string;
+		state: string | null;
+	}>;
+	const content = assembleContent(
+		rows.map((row) => ({ payload: parseStored(row.payload), state: parseStored(row.state) })),
+	);
+	const { queued: _queued, ...message } = source;
+	const planned = planEnvelopeBlocks(
+		{ ...message, contentJson: content },
+		adoptedLedger(ledgerOf(db, source.id)),
+	).blocks;
+	if (
+		planned.length !== rows.length ||
+		planned.some((block, ordinal) => block.draft.kind !== rows[ordinal].kind)
+	)
+		return envelope;
+	return {
+		...envelope,
+		resync: false,
+		blocks: rows.map((row, ordinal) => ({
+			id: row.id,
+			revision: row.revision,
+			text:
+				row.phase === "open"
+					? ""
+					: blockIndexText(planned[ordinal].draft.canonical, planned[ordinal].output),
+		})),
+	};
+}
+
+/**
+ * `reindex`: the next block-format envelopes' index text, within the slice's envelope, body
+ * byte, index text and time budgets (at least one envelope). Sized by `body_bytes`, which a
+ * rows-only envelope's column would not show.
+ */
+export function runBlockReindexSlice(
+	db: Database,
+	params: BlockReindexSliceParams,
+): BlockReindexSliceResult {
+	const rows = db
+		.query(
+			`SELECT rowid, body_bytes AS bytes FROM narrator_messages
+			 WHERE rowid > ? AND body_format = 2 ORDER BY rowid LIMIT ?`,
+		)
+		.all(params.afterRowid, params.maxEnvelopes) as Candidate[];
+	const started = performance.now();
+	const envelopes: ReindexEnvelope[] = [];
+	let lastRowid = params.afterRowid;
+	let bytes = 0;
+	let chars = 0;
+	for (const row of rows) {
+		if (
+			envelopes.length > 0 &&
+			(bytes + row.bytes > params.maxSourceBytes ||
+				chars >= params.maxIndexChars ||
+				performance.now() - started > params.budgetMs)
+		)
+			return { envelopes, lastRowid, done: false };
+		const envelope = reindexPlan(db, row.rowid);
+		envelopes.push(envelope);
+		bytes += row.bytes;
+		for (const block of envelope.blocks) chars += block.text.length;
+		lastRowid = row.rowid;
+	}
+	return { envelopes, lastRowid, done: rows.length < params.maxEnvelopes };
 }

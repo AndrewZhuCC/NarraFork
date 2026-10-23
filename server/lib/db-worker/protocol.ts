@@ -24,6 +24,7 @@ export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 import type {
 	BlockBackfillSliceParams,
 	BlockProjectionSliceParams,
+	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
 import type {
@@ -42,6 +43,7 @@ export type DbReadTaskName =
 	| "displayPageMessagesPostgres"
 	| "blockBackfillSlice"
 	| "blockVerifySlice"
+	| "blockReindexSlice"
 	| "blockProjectionSlice";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
@@ -161,6 +163,7 @@ export interface StorageScanTablesResult {
 export type DbReadTaskParams =
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
+	| BlockReindexSliceParams
 	| BlockProjectionSliceParams
 	| StorageScanContextParams
 	| StorageScanTablesParams
