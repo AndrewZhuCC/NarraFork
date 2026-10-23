@@ -9,7 +9,15 @@ import {
 	shutdownDbWorkerPool,
 	WorkersUnavailableError,
 } from "@server/lib/db-worker/pool";
-import type { StorageScanCleanupSummariesResult } from "@server/lib/db-worker/protocol";
+import {
+	assertSessionPreviewBudget,
+	SESSION_PREVIEW_MAX_SAMPLES,
+	SessionPreviewBudgetError,
+	type StorageScanCleanupSummariesParams,
+	type StorageScanCleanupSummariesResult,
+	type StorageScanSessionPreviewParams,
+	type StorageScanSessionPreviewResult,
+} from "@server/lib/db-worker/protocol";
 import {
 	type ParallelScanOutcome,
 	runParallelObjectStorageScan,
@@ -28,7 +36,6 @@ import {
 // Storage-scan query primitives live in a DB-singleton-free module so the read worker can import
 // them without re-bootstrapping the database. See storage-scan-queries.ts for why that matters.
 import {
-	collectSessionAggregateStats as collectSessionAggregateStatsOn,
 	type DatabaseStorageCategoryKey,
 	type DatabaseStorageCategorySummary,
 	type DatabaseStorageReadFailures,
@@ -36,7 +43,6 @@ import {
 	type DatabaseTableKind,
 	getDatabaseStorageCategory,
 	numberFromRow,
-	type SessionAggregateStats,
 	type SessionOwnedTableRelation,
 	summarizeToolCallPayloads,
 } from "./storage-scan-queries";
@@ -330,12 +336,42 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 	};
 }
 
-function collectSessionAggregateStats(narratorIds: string[]): SessionAggregateStats {
-	return collectSessionAggregateStatsOn(sqlite, narratorIds, SESSION_OWNED_TABLES);
-}
-
-function estimateNarratorSampleApproxBytes(root: CleanupPlanRoot): number {
-	return collectSessionAggregateStats(root.deletedNarratorIds).approxBytes;
+/** Never scan payload columns on the HTTP/agent thread, even when both worker paths fail. */
+async function runCleanupReadTask<T>(
+	params: StorageScanCleanupSummariesParams | StorageScanSessionPreviewParams,
+	signal?: AbortSignal,
+): Promise<T> {
+	if (params.kind === "storageScanSessionPreview") {
+		try {
+			assertSessionPreviewBudget(params);
+		} catch (err) {
+			if (err instanceof SessionPreviewBudgetError) {
+				throw new AppError(err.message, 413, err.code);
+			}
+			throw err;
+		}
+	}
+	const dbPath = getDbPath();
+	try {
+		return await runReadTask<T>(dbPath, params, { signal });
+	} catch (err) {
+		if (signal?.aborted) throw err;
+		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
+		try {
+			return await runEphemeralReadTask<T>(dbPath, params, { signal });
+		} catch (ephemeralErr) {
+			if (signal?.aborted) throw ephemeralErr;
+			logger.warn("Database cleanup read workers unavailable", {
+				task: params.kind,
+				reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
+			});
+			throw new AppError(
+				"Database cleanup statistics are unavailable: read workers failed",
+				503,
+				"DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
+			);
+		}
+	}
 }
 
 async function buildSessionPreview(
@@ -353,11 +389,16 @@ async function buildSessionPreview(
 		runningTerminalIds: cleanupContext.runningTerminalIds,
 	});
 	const allNarratorIds = [...new Set(plan.safeRoots.flatMap((root) => root.deletedNarratorIds))];
-	const aggregate = collectSessionAggregateStats(allNarratorIds);
-	const limitedRoots = plan.safeRoots.slice(0, Math.max(0, sampleLimit));
-	// Synchronous on purpose: these are bun:sqlite aggregates, so Promise.all would only have wrapped
-	// blocking calls in promises without buying any concurrency.
-	const sampleBytes = limitedRoots.map((root) => estimateNarratorSampleApproxBytes(root));
+	const limitedRoots = plan.safeRoots.slice(
+		0,
+		Math.min(SESSION_PREVIEW_MAX_SAMPLES, Math.max(0, sampleLimit)),
+	);
+	const { aggregate, sampleBytes } = await runCleanupReadTask<StorageScanSessionPreviewResult>({
+		kind: "storageScanSessionPreview",
+		narratorIds: allNarratorIds,
+		sampleNarratorIds: limitedRoots.map((root) => root.deletedNarratorIds),
+		relations: SESSION_OWNED_TABLES,
+	});
 	const samples: DatabaseCleanupNarratorSample[] = limitedRoots.map((root, index) => ({
 		type: "narrator",
 		id: root.rootNarratorId,
@@ -572,29 +613,12 @@ function cleanupSummariesFromAggregates(
 	};
 }
 
-function measureCleanupCandidatesOnConnection(
-	db: Parameters<typeof collectSessionAggregateStatsOn>[0],
-	archivedNarratorIds: string[],
-	staleNarratorIds: string[],
-): StorageScanCleanupSummariesResult {
-	return {
-		archivedApproxBytes: collectSessionAggregateStatsOn(
-			db,
-			archivedNarratorIds,
-			SESSION_OWNED_TABLES,
-		).approxBytes,
-		staleApproxBytes: collectSessionAggregateStatsOn(db, staleNarratorIds, SESSION_OWNED_TABLES)
-			.approxBytes,
-		toolCalls: summarizeToolCallPayloads(db, getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS)),
-	};
-}
-
 /**
  * Cleanup-candidate byte totals.
  *
  * The plan (which sessions are eligible) is pure data and stays on the main thread. The
- * COUNT/SUM(length) aggregates run on a read worker. If no worker can start, the same queries
- * run here so the settings page still shows a number.
+ * COUNT/SUM(length) aggregates run on a read worker. If neither worker path can run, fail
+ * explicitly instead of blocking the main thread or reporting an unknown total as zero.
  */
 async function measureCleanupCandidatesOffThread(
 	signal?: AbortSignal,
@@ -620,34 +644,8 @@ async function measureCleanupCandidatesOffThread(
 		relations: SESSION_OWNED_TABLES,
 		toolCallCutoffIso: getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS),
 	};
-	const dbPath = getDbPath();
-	try {
-		const aggregates = await runReadTask<StorageScanCleanupSummariesResult>(dbPath, params, {
-			signal,
-		});
-		return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
-	} catch (err) {
-		if (signal?.aborted) throw err;
-		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
-		try {
-			const aggregates = await runEphemeralReadTask<StorageScanCleanupSummariesResult>(
-				dbPath,
-				params,
-				{ signal },
-			);
-			return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
-		} catch (ephemeralErr) {
-			if (signal?.aborted) throw ephemeralErr;
-			logger.warn("Cleanup candidate scan fell back to the main thread", {
-				reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
-			});
-			return cleanupSummariesFromAggregates(
-				archivedPlan,
-				stalePlan,
-				measureCleanupCandidatesOnConnection(sqlite, archivedNarratorIds, staleNarratorIds),
-			);
-		}
-	}
+	const aggregates = await runCleanupReadTask<StorageScanCleanupSummariesResult>(params, signal);
+	return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
 }
 
 export const databaseCleanupService = {
@@ -668,6 +666,8 @@ export const databaseCleanupService = {
 		let executedOn: ParallelScanOutcome["executedOn"] = "workers";
 		if (options.signal?.aborted) throw new Error("database storage scan aborted");
 		const cleanup = measureCleanupCandidatesOffThread(options.signal);
+		// It runs concurrently with the object scan, which may outlive a fast worker failure.
+		cleanup.catch(() => {});
 		try {
 			const fileSizes = await getDatabaseFileSizes();
 			const objectStorage = await runParallelObjectStorageScan({
@@ -766,6 +766,38 @@ export const databaseCleanupService = {
 						0,
 						cleanupContext,
 					);
+					// Worker scans yield the main thread: a session may resume, acquire a terminal,
+					// or gain descendants while measuring. Never delete a stale eligibility plan.
+					const latestContext = await loadCleanupNarratorContext();
+					const normalizedDays = normalizePreviewDays(target, options.olderThanDays);
+					const latestPlan = buildNarratorCleanupPlan(target, latestContext.narrators, {
+						staleCutoffIso:
+							target === "staleSessions" && normalizedDays
+								? getCutoffIso(normalizedDays)
+								: undefined,
+						runningTerminalIds: latestContext.runningTerminalIds,
+						rootNarratorIds: new Set(sessionPreview.safeRoots.map((root) => root.rootNarratorId)),
+					});
+					const latestRoots = new Map(
+						latestPlan.safeRoots.map((root) => [root.rootNarratorId, root]),
+					);
+					if (
+						sessionPreview.safeRoots.some((root) => {
+							const latest = latestRoots.get(root.rootNarratorId);
+							const expectedIds = new Set(root.deletedNarratorIds);
+							return (
+								!latest ||
+								latest.deletedNarratorIds.length !== expectedIds.size ||
+								latest.deletedNarratorIds.some((id) => !expectedIds.has(id))
+							);
+						})
+					) {
+						throw new AppError(
+							"Database cleanup plan changed during preview; retry cleanup",
+							409,
+							"DATABASE_CLEANUP_PLAN_CHANGED",
+						);
+					}
 					preview = sessionPreview.preview;
 					if (sessionPreview.safeRoots.length > 0) {
 						for (const root of sessionPreview.safeRoots) {
