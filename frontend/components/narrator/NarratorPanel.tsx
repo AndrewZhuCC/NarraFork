@@ -171,6 +171,7 @@ import { capabilityModelReference, useResolvedModel } from "./interaction/use-re
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { inputBlockIdOf } from "./message/block-target";
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
 import type { MessageListHandle, MessageListTailMeta } from "./message/message-list-handle";
@@ -797,6 +798,7 @@ function NarratorPanelBody({
 				const result = await api.editAndRegenerate(narratorId, messageId, newContent, {
 					...revertOpts,
 					...opts,
+					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});
 				if (!result.ok || (result.revertResult && !isRevertHistoryCommitted(result.revertResult))) {
 					throw new ApiError(t("editFailed"), 409, { ...result });

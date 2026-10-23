@@ -4731,6 +4731,7 @@ export const PretextExactMessageList = memo(
 					detachFromBottom,
 					scrollToMessageTarget,
 					prepareLodChange,
+					messageOf: (messageId) => messagesByIdRef.current.get(messageId),
 				}),
 				[
 					detachFromBottom,

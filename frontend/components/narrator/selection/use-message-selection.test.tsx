@@ -115,7 +115,11 @@ beforeEach(() => {
 		// This test exercises selection, not layout; no shared HTMLElement geometry stubs.
 		viewportRef: { current: null },
 		chunkListRef: {
-			current: { detachFromBottom: mock(() => {}), refreshStructure: mock(() => {}) },
+			current: {
+				detachFromBottom: mock(() => {}),
+				refreshStructure: mock(() => {}),
+				messageOf: () => undefined,
+			},
 		},
 		navigate: mock(async () => {}),
 		t: (key) => key,
