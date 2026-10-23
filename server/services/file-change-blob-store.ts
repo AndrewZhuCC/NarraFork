@@ -11,7 +11,9 @@ import {
 	unlink,
 } from "node:fs/promises";
 import { isAbsolute, join, parse, resolve, sep } from "node:path";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+// A zero-delay timer, not setImmediate: Bun can leave a queued immediate waiting on its next
+// long poll (up to ~1s), the same stall revert-selection-service.ts avoids.
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { FILE_CHANGE_LIMITS, type FileChangeBlobRef } from "@shared/file-change-protocol";
 
@@ -200,7 +202,7 @@ export class FileChangeBlobStore {
 				}
 				if (chunk.value.byteLength === 0) {
 					// An endless stream of empty resolved promises must not starve the deadline timer.
-					await yieldToEventLoop();
+					await yieldToEventLoop(0);
 					continue;
 				}
 				// Never hash/write a producer-owned view while asynchronous IO can mutate it.

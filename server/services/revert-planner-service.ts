@@ -7,7 +7,9 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+// A zero-delay timer, not setImmediate: Bun can leave a queued immediate waiting on its next
+// long poll (up to ~1s), the same stall revert-selection-service.ts avoids.
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
@@ -270,7 +272,7 @@ export class RevertPlannerService {
 			let processedEffects = 0;
 			for (const effect of selected.effects) {
 				if (processedEffects++ % FILE_CHANGE_LIMITS.historyPageItems === 0) {
-					await yieldToEventLoop();
+					await yieldToEventLoop(0);
 					work.check();
 				}
 				Object.freeze(effect.identity);
@@ -444,7 +446,7 @@ export class RevertPlannerService {
 						steps: [],
 					});
 				}
-				await yieldToEventLoop();
+				await yieldToEventLoop(0);
 			}
 			// No plan/header claims completeness until every selected file succeeded.
 			const ordered = files.map(({ sequence, identity, expected, desired }) => ({
@@ -453,12 +455,12 @@ export class RevertPlannerService {
 				expected,
 				desired,
 			}));
-			await yieldToEventLoop();
+			await yieldToEventLoop(0);
 			work.check();
 			// This helper hashes bounded per-file metadata (<=1000 x 8KiB), never
 			// serialized source bodies. Large manifest serialization below is chunked.
 			const fingerprint = fingerprintRevertPlanFiles(ordered);
-			await yieldToEventLoop();
+			await yieldToEventLoop(0);
 			work.check();
 			const header: RevertPlanHeader = {
 				...owner,
@@ -684,7 +686,7 @@ export class RevertPlannerService {
 				const end = Math.min(raw.length, offset + FILE_CHANGE_LIMITS.streamChunkBytes);
 				raw.set(observation.raw.subarray(offset, end), offset);
 				hash.update(raw.subarray(offset, end));
-				await yieldToEventLoop();
+				await yieldToEventLoop(0);
 			}
 			if (hash.digest("hex") !== ref.digest)
 				throw fail("BLOB_INTEGRITY", "Actual raw fingerprint mismatch");
@@ -1047,7 +1049,7 @@ async function encodeJson(value: unknown, work: Work): Promise<Encoded> {
 		characters += token.length;
 		if (characters >= 16 * 1024) {
 			flush();
-			await yieldToEventLoop();
+			await yieldToEventLoop(0);
 			work.check();
 		}
 	}

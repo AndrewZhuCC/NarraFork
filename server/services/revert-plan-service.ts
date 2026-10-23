@@ -1,6 +1,8 @@
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+// A zero-delay timer, not setImmediate: Bun can leave a queued immediate waiting on its next
+// long poll (up to ~1s), the same stall revert-selection-service.ts avoids.
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
@@ -510,7 +512,7 @@ export class RevertPlanService {
 			});
 			if (page.length <= REVERT_PLAN_BATCH_ITEMS) break;
 			cursor = fileCursor(page[REVERT_PLAN_BATCH_ITEMS - 1]);
-			await yieldToEventLoop();
+			await yieldToEventLoop(0);
 		}
 		options.signal?.throwIfAborted();
 		if (
@@ -600,7 +602,7 @@ export class RevertPlanService {
 						})),
 					options,
 				);
-				await yieldToEventLoop();
+				await yieldToEventLoop(0);
 			}
 		return this.finalize(fixed, plan.id, fixed.manifestProof, options);
 	}
