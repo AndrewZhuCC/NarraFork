@@ -1884,8 +1884,9 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		// 0003 can resurrect an unrelated retired nullable tool column, and a later migration
 		// may add a message column. Compare every pre-existing field, not a stronger claim
 		// that old replay or the upgrade adds no columns.
+		const db = sqlite;
 		const projection = (table: string) =>
-			columnNames(sqlite, table)
+			columnNames(db, table)
 				.map((column) => `"${column}"`)
 				.join(", ");
 		const toolProjection = projection("narrator_tool_calls");
