@@ -26,47 +26,38 @@ export interface GitLogEntry {
 	parents?: string[];
 }
 
-/** Strings remain the legacy chapter adapter; new callers carry a resolved workspace. */
-export type GitTarget =
-	| string
-	| {
-			narratorId: string;
-			workspaceKey: string;
-			repositoryKey?: string | null;
-			canWrite: boolean;
-			rootPath?: string | null;
-			chapterId?: string | null;
-	  };
+/** A narrator's resolved Git workspace. */
+export type GitTarget = {
+	narratorId: string;
+	workspaceKey: string;
+	repositoryKey?: string | null;
+	canWrite: boolean;
+	rootPath?: string | null;
+};
 
 export function gitTargetKey(target: GitTarget | null | undefined): string | undefined {
-	return typeof target === "string" ? target : target?.workspaceKey;
+	return target?.workspaceKey;
 }
 
 export function gitCanWrite(target: GitTarget): boolean {
-	return typeof target === "string" || target.canWrite;
+	return target.canWrite;
 }
 
 export function gitBasePath(target: GitTarget): string {
-	return typeof target === "string"
-		? `/chapters/${encodeURIComponent(target)}/git`
-		: `/narrators/${encodeURIComponent(target.narratorId)}/git`;
+	return `/narrators/${encodeURIComponent(target.narratorId)}/git`;
 }
 
 /** Pin reads too, so a late response cannot cache the new root under an old identity. */
 function gitReadPath(target: GitTarget, suffix: string): string {
 	const path = `${gitBasePath(target)}${suffix}`;
-	return typeof target === "string"
-		? path
-		: `${path}${suffix.includes("?") ? "&" : "?"}workspaceKey=${encodeURIComponent(target.workspaceKey)}`;
+	return `${path}${suffix.includes("?") ? "&" : "?"}workspaceKey=${encodeURIComponent(target.workspaceKey)}`;
 }
 
 function writeBody(target: GitTarget, body: object = {}): string {
-	if (typeof target !== "string" && (!target.workspaceKey || !target.canWrite)) {
+	if (!target.workspaceKey || !target.canWrite) {
 		throw new Error("Git workspace is read-only or unavailable");
 	}
-	return JSON.stringify(
-		typeof target === "string" ? body : { ...body, workspaceKey: target.workspaceKey },
-	);
+	return JSON.stringify({ ...body, workspaceKey: target.workspaceKey });
 }
 
 /** HTTP ceiling includes workspace probing plus the server's bounded Git/AI operation. */
@@ -127,6 +118,8 @@ export const gitApi = {
 			limit?: number;
 			cursor?: { changedAt: string; rowId: string };
 			projection?: "byFile" | "all";
+			/** Git-root-relative; the server accepts it only with uncommitted + byFile. */
+			filePath?: string;
 		},
 		signal?: AbortSignal,
 	) => {
@@ -134,6 +127,7 @@ export const gitApi = {
 		if (opts?.scope) params.set("scope", opts.scope);
 		if (opts?.limit) params.set("limit", String(opts.limit));
 		if (opts?.projection) params.set("projection", opts.projection);
+		if (opts?.filePath !== undefined) params.set("filePath", opts.filePath);
 		if (opts?.cursor) {
 			params.set("cursorAt", opts.cursor.changedAt);
 			params.set("cursorRowId", opts.cursor.rowId);

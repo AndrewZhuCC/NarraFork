@@ -5,15 +5,13 @@ import { generateId } from "../lib/id";
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
 
 export const terminalViewService = {
-	async get(userId: string, opts: { chapterId?: string; narratorId?: string }) {
+	async get(userId: string, opts: { narratorId?: string }) {
 		assertLegacyRuntimeOwner(opts);
 		const conditions = [
 			eq(terminalViewState.userId, userId),
 			isNull(terminalViewState.worktreeResourceId),
 		];
-		if (opts.chapterId) {
-			conditions.push(eq(terminalViewState.chapterId, opts.chapterId));
-		} else if (opts.narratorId) {
+		if (opts.narratorId) {
 			conditions.push(eq(terminalViewState.narratorId, opts.narratorId));
 		} else {
 			return null;
@@ -27,7 +25,6 @@ export const terminalViewService = {
 	async upsert(
 		userId: string,
 		opts: {
-			chapterId?: string;
 			narratorId?: string;
 			layout?: string;
 			activeTabId?: string | null;
@@ -52,7 +49,6 @@ export const terminalViewService = {
 			.values({
 				id: generateId(),
 				userId,
-				chapterId: opts.chapterId ?? null,
 				narratorId: opts.narratorId ?? null,
 				layout: (opts.layout ?? "single") as "single" | "split-h" | "split-v" | "triple" | "quad",
 				activeTabId: opts.activeTabId ?? null,

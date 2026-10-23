@@ -39,3 +39,39 @@ export const INDEX_MIN_QUERY_CHARS = 3;
 export function canUseIndex(safeQuery: string): boolean {
 	return safeQuery.length >= INDEX_MIN_QUERY_CHARS;
 }
+
+/** Terms a global search reads; further terms are ignored so SQL stays a bounded shape. */
+export const MAX_GLOBAL_QUERY_TERMS = 8;
+
+/**
+ * Global search's terms, split by whether the trigram index can match them.
+ *
+ * Global search matches every whitespace-separated term, anywhere and in any order (each
+ * term is a prefix match on the index path, so "calibr harn" finds "calibration harness").
+ * Terms the index cannot tokenize (under {@link INDEX_MIN_QUERY_CHARS}, such as most
+ * two-character Chinese words) are still required: stores check them with a substring
+ * filter on the rows the indexed terms selected. Duplicates (case-insensitively) count once.
+ */
+export function globalQueryTerms(safeQuery: string): { indexed: string[]; short: string[] } {
+	const seen = new Set<string>();
+	const terms: string[] = [];
+	for (const term of safeQuery.split(/\s+/)) {
+		const key = term.toLowerCase();
+		if (!term || seen.has(key)) continue;
+		seen.add(key);
+		terms.push(term);
+		if (terms.length === MAX_GLOBAL_QUERY_TERMS) break;
+	}
+	return {
+		indexed: terms.filter((term) => canUseIndex(term)),
+		short: terms.filter((term) => !canUseIndex(term)),
+	};
+}
+
+/**
+ * Global search's strategy: the index whenever at least one term can use it (short terms
+ * then filter its rows), the unindexed substring path only when no term can.
+ */
+export function globalStrategy(safeQuery: string): "index" | "substring" {
+	return globalQueryTerms(safeQuery).indexed.length > 0 ? "index" : "substring";
+}

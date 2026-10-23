@@ -281,19 +281,6 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 		},
 	},
 	{
-		id: "review-git-guard",
-		summary: "A review narrator modified files; reset the worktree and tell it to continue.",
-		outcome: "inject",
-		dispositions: {
-			primary: handled,
-			subagent: na(
-				"The guard resets a review CHAPTER's git state and concludes the review through " +
-					"review-service. A review subagent has no chapter of its own to reset and does not " +
-					"own a review record; its read-only tool filter is what keeps it from writing.",
-			),
-		},
-	},
-	{
 		id: "post-turn-compact",
 		summary: "Context (or pruned ratio) crossed its threshold; start a background compact.",
 		outcome: "effect",

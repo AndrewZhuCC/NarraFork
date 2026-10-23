@@ -1,339 +1,254 @@
-import {
-	Alert,
-	Badge,
-	Card,
-	Group,
-	Loader,
-	SegmentedControl,
-	Select,
-	Stack,
-	Text,
-	Title,
-} from "@mantine/core";
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { Alert, Button, Group, Loader, SegmentedControl, Stack, Text, Title } from "@mantine/core";
+import { createFileRoute } from "@tanstack/react-router";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { useSearch } from "../hooks/useSearch";
-import { formatSmartTime } from "../lib/format";
+import { EntityResultCard } from "../components/search/EntityResultCard";
+import { SearchFilterBar, type SearchFilterState } from "../components/search/SearchFilterBar";
+import { SessionResultCard } from "../components/search/SessionResultCard";
+import { SEARCH_SECTION_ORDER, useSearchOverview, useSearchSection } from "../hooks/useSearch";
+import type {
+	EntitySearchResult,
+	SearchRequest,
+	SearchSectionName,
+	SearchSectionPage,
+	SessionSearchResult,
+} from "../lib/api";
 import {
 	DEFAULT_SEARCH_SORT,
-	getSearchResultDisplayTitle,
-	highlightSearchText,
+	formatSearchTotal,
+	normalizeSearchInclude,
+	normalizeSearchRange,
 	normalizeSearchSort,
-	normalizeSearchType,
-	type SearchSortMode,
-	sortVisibleSearchResults,
-	summarizeSearchRuntimeState,
+	normalizeSearchTab,
+	type SearchTab,
+	type SearchTimeRange,
+	searchRangeStart,
 } from "../lib/search-utils";
-
-const linkStyle = { textDecoration: "none", color: "inherit" } as const;
-/** Badge color per result type; unknown types fall back to grape. */
-const RESULT_TYPE_COLORS: Record<string, string> = {
-	chapter: "blue",
-	narrator: "indigo",
-	message: "grape",
-	knowledge: "teal",
-};
-const MAX_VISIBLE_RESULTS = 200;
-const MAX_SEARCH_TITLE_CHARS = 500;
-const MAX_SEARCH_SNIPPET_CHARS = 2_000;
-const MAX_SEARCH_META_CHARS = 500;
-
-function clampSearchText(value: string | undefined, maxChars: number): string | undefined {
-	if (!value) return value;
-	return value.length > maxChars ? value.slice(0, maxChars) : value;
-}
-
-function humanizeEnumValue(value: string): string {
-	const normalized = value.replace(/[_-]+/g, " ").trim();
-	if (!normalized) return value;
-	return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
-}
-
-/** Resolve the navigation target for a search result */
-function getResultLink(
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	result: any,
-): { to: string; params: Record<string, string>; hash?: string } | null {
-	if (result.type === "chapter") {
-		return { to: "/chapters/$chapterId", params: { chapterId: result.id } };
-	}
-	if (result.type === "message") {
-		const hash = `msg-${result.id}`;
-		// Prefer direct narrator link — the /chapters/ route is a redirect that loses the hash
-		if (result.narratorId) {
-			return { to: "/narrators/$narratorId", params: { narratorId: result.narratorId }, hash };
-		}
-		if (result.chapterId) {
-			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId }, hash };
-		}
-	}
-	if (result.type === "narrator") {
-		if (result.chapterId) {
-			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId } };
-		}
-		return { to: "/narrators/$narratorId", params: { narratorId: result.id } };
-	}
-	if (result.type === "knowledge") {
-		return { to: "/knowledge/$entryId", params: { entryId: result.id } };
-	}
-	return null;
-}
 
 interface SearchParams {
 	q?: string;
-	type?: string;
-	sort?: SearchSortMode;
+	/** The open tab; absent means the overview of every section. */
+	tab?: string;
+	sort?: string;
+	/** Comma-separated content added to the default scope. */
+	include?: string;
+	project?: string;
+	range?: string;
+	mine?: string;
+	/** `all` lifts the recent-days limit on a query of only short terms. */
+	history?: string;
 }
+
+const optionalId = (value: unknown) =>
+	typeof value === "string" && value.length > 0 && value.length <= 64 ? value : undefined;
 
 export const Route = createFileRoute("/search")({
 	component: SearchPage,
-	validateSearch: (search: Record<string, unknown>): SearchParams => ({
-		q: typeof search.q === "string" ? search.q : undefined,
-		type: normalizeSearchType(search.type),
-		sort: normalizeSearchSort(search.sort),
-	}),
+	validateSearch: (search: Record<string, unknown>): SearchParams => {
+		// `type` is the pre-sections name of `tab`; old links keep opening the right tab.
+		const tab = normalizeSearchTab(search.tab ?? search.type);
+		const sort = normalizeSearchSort(search.sort);
+		return {
+			q: typeof search.q === "string" ? search.q : undefined,
+			tab: tab === "all" ? undefined : tab,
+			sort: sort === DEFAULT_SEARCH_SORT ? undefined : sort,
+			include: normalizeSearchInclude(search.include).join(",") || undefined,
+			project: optionalId(search.project),
+			range: normalizeSearchRange(search.range),
+			mine: search.mine === "1" || search.mine === 1 || search.mine === true ? "1" : undefined,
+			history: search.history === "all" ? "all" : undefined,
+		};
+	},
 });
 
-function SearchPage() {
-	const { q, type = "all", sort = DEFAULT_SEARCH_SORT } = Route.useSearch();
-	const navigate = Route.useNavigate();
-	const { data, isLoading } = useSearch(q ?? "", "chapters,messages,narrators,knowledge", sort);
+/** Every section's cards render through this one switch. */
+function ResultCard({
+	result,
+	request,
+}: {
+	result: SessionSearchResult | EntitySearchResult;
+	request: SearchRequest;
+}) {
+	return result.type === "session" ? (
+		<SessionResultCard result={result} request={request} />
+	) : (
+		<EntityResultCard result={result} query={request.q} />
+	);
+}
+
+/** The overview: each section's best few, with a way into the full section. */
+function Overview({
+	sections,
+	request,
+	onOpen,
+}: {
+	sections: Partial<
+		Record<SearchSectionName, SearchSectionPage<SessionSearchResult | EntitySearchResult>>
+	>;
+	request: SearchRequest;
+	onOpen: (tab: SearchSectionName) => void;
+}) {
 	const { t } = useTranslation("search");
-	const searchRuntimeStatus = useMemo(() => summarizeSearchRuntimeState(data), [data]);
-	const translateSearchEnum = (prefix: string, value: string) =>
-		t(`${prefix}_${value}`, { defaultValue: humanizeEnumValue(value) });
-	const results = useMemo(
-		() =>
-			sortVisibleSearchResults(data?.results ?? [], normalizeSearchType(type), sort, (id) =>
-				t("resultUntitled", { id }),
-			),
-		[data?.results, type, sort, t],
+	const visible = SEARCH_SECTION_ORDER.filter((name) => (sections[name]?.items.length ?? 0) > 0);
+	if (visible.length === 0) return <Text c="dimmed">{t("noResults")}</Text>;
+	return (
+		<Stack gap="lg">
+			{visible.map((name) => {
+				const page = sections[name] as SearchSectionPage<SessionSearchResult | EntitySearchResult>;
+				return (
+					<Stack key={name} gap="xs">
+						<Group justify="space-between" align="center">
+							<Title order={4}>
+								{t(`section_${name}`)}{" "}
+								<Text span c="dimmed" fw={400}>
+									{formatSearchTotal(page)}
+								</Text>
+							</Title>
+							{page.nextCursor && (
+								<Button size="compact-sm" variant="subtle" onClick={() => onOpen(name)}>
+									{t("viewAll", { count: formatSearchTotal(page) })}
+								</Button>
+							)}
+						</Group>
+						{page.items.map((result) => (
+							<ResultCard key={`${result.type}-${result.id}`} result={result} request={request} />
+						))}
+					</Stack>
+				);
+			})}
+		</Stack>
 	);
-	const counts = useMemo(() => {
-		return ((data?.results ?? []) as Array<{ type?: string }>).reduce(
-			(acc, result) => {
-				acc.all += 1;
-				switch (result.type) {
-					case "chapter":
-						acc.chapter += 1;
-						break;
-					case "narrator":
-						acc.narrator += 1;
-						break;
-					case "message":
-						acc.message += 1;
-						break;
-					case "knowledge":
-						acc.knowledge += 1;
-						break;
-				}
-				return acc;
-			},
-			{ all: 0, chapter: 0, narrator: 0, message: 0, knowledge: 0 },
-		);
-	}, [data?.results]);
-	const displayedResults = useMemo(() => results.slice(0, MAX_VISIBLE_RESULTS), [results]);
-	const displayedResultEntries = useMemo(
-		() =>
-			displayedResults.map((result) => ({
-				result,
-				key: `${result.type}-${result.id}`,
-				link: getResultLink(result),
-				title:
-					clampSearchText(
-						getSearchResultDisplayTitle(result, (id) => t("resultUntitled", { id })),
-						MAX_SEARCH_TITLE_CHARS,
-					) ?? "",
-				snippet: clampSearchText(result.snippet, MAX_SEARCH_SNIPPET_CHARS),
-				projectName: clampSearchText(result.projectName, MAX_SEARCH_META_CHARS),
-				chapterTitle: clampSearchText(result.chapterTitle, MAX_SEARCH_META_CHARS),
-				narratorTitle: clampSearchText(result.narratorTitle, MAX_SEARCH_META_CHARS),
-				collectionName: clampSearchText(result.collectionName, MAX_SEARCH_META_CHARS),
-				timestamp: result.updatedAt ?? result.createdAt ?? result.lastMessageAt,
-			})),
-		[displayedResults, t],
+}
+
+/** One section, paged with "load more". */
+function SectionList({ section, request }: { section: SearchSectionName; request: SearchRequest }) {
+	const { t } = useTranslation("search");
+	const query = useSearchSection(request, section, true);
+	const items =
+		query.data?.pages.flatMap(
+			(page) => page.items as Array<SessionSearchResult | EntitySearchResult>,
+		) ?? [];
+	if (query.isLoading) return <Loader />;
+	if (items.length === 0) return <Text c="dimmed">{t("noResults")}</Text>;
+	return (
+		<Stack>
+			{items.map((result) => (
+				<ResultCard key={`${result.type}-${result.id}`} result={result} request={request} />
+			))}
+			{query.hasNextPage && (
+				<Button
+					variant="light"
+					loading={query.isFetchingNextPage}
+					onClick={() => query.fetchNextPage()}
+				>
+					{t("loadMore")}
+				</Button>
+			)}
+		</Stack>
 	);
-	const hiddenResultCount = results.length - displayedResults.length;
+}
+
+function SearchPage() {
+	const params = Route.useSearch();
+	const navigate = Route.useNavigate();
+	const { t } = useTranslation("search");
+	const tab: SearchTab = normalizeSearchTab(params.tab);
+	const filters: SearchFilterState = useMemo(
+		() => ({
+			sort: normalizeSearchSort(params.sort),
+			include: normalizeSearchInclude(params.include),
+			projectId: params.project,
+			range: normalizeSearchRange(params.range) as SearchTimeRange | undefined,
+			mine: params.mine === "1",
+		}),
+		[params],
+	);
+	const request: SearchRequest = useMemo(
+		() => ({
+			q: (params.q ?? "").trim(),
+			sort: filters.sort,
+			include: filters.include,
+			projectId: filters.projectId,
+			from: filters.range ? searchRangeStart(filters.range) : undefined,
+			mine: filters.mine,
+			fullHistory: params.history === "all",
+		}),
+		[params.q, params.history, filters],
+	);
+	const overview = useSearchOverview(request);
+	const sections = overview.data?.sections ?? {};
+
+	const setFilters = (patch: Partial<SearchFilterState>) => {
+		const next = { ...filters, ...patch };
+		navigate({
+			search: (prev) => ({
+				...prev,
+				sort: next.sort === DEFAULT_SEARCH_SORT ? undefined : next.sort,
+				include: next.include.join(",") || undefined,
+				project: next.projectId,
+				range: next.range,
+				mine: next.mine ? "1" : undefined,
+			}),
+			replace: true,
+		});
+	};
+	const openTab = (value: SearchTab) =>
+		navigate({
+			search: (prev) => ({ ...prev, tab: value === "all" ? undefined : value }),
+			replace: true,
+		});
+
+	const recentDays = sections.sessions?.recentDays;
+	const searchFullHistory = () =>
+		navigate({ search: (prev) => ({ ...prev, history: "all" }), replace: true });
+
+	const tabLabel = (name: SearchSectionName) =>
+		t(`tab_${name}`, { count: formatSearchTotal(sections[name]) });
 
 	return (
 		<Stack>
 			<Title order={2}>{t("title")}</Title>
-			{q && (
+			{request.q ? (
 				<Text c="dimmed" size="sm">
-					{t("resultsFor", { query: q })}
+					{t("resultsFor", { query: request.q })}
 				</Text>
+			) : (
+				<Text c="dimmed">{t("enterQuery")}</Text>
 			)}
 
-			{searchRuntimeStatus.degraded && (
-				<Alert color="yellow" variant="light" title={t("degradedTitle")}>
-					<Stack gap={4}>
-						<Text size="sm">
-							{t("degradedDescription", {
-								mode: searchRuntimeStatus.mode ?? t("degradedModeUnknown"),
-							})}
-						</Text>
-						{searchRuntimeStatus.fallbackMessages.map((message) => (
-							<Text key={message} size="xs" c="dimmed">
-								{message}
-							</Text>
-						))}
-					</Stack>
-				</Alert>
-			)}
-
-			{data?.results?.length ? (
-				<Group justify="space-between" align="center">
+			{request.q && (
+				<>
+					<SearchFilterBar state={filters} onChange={setFilters} />
 					<SegmentedControl
 						size="xs"
-						value={type}
-						onChange={(value) =>
-							navigate({
-								search: (prev) => ({ ...prev, type: value === "all" ? undefined : value }),
-								replace: true,
-							})
-						}
+						value={tab}
+						onChange={(value) => openTab(normalizeSearchTab(value))}
 						data={[
-							{ value: "all", label: t("typeAll", { count: counts.all }) },
-							{ value: "chapter", label: t("typeChapter", { count: counts.chapter }) },
-							{ value: "narrator", label: t("typeNarrator", { count: counts.narrator }) },
-							{ value: "message", label: t("typeMessage", { count: counts.message }) },
-							{ value: "knowledge", label: t("typeKnowledge", { count: counts.knowledge }) },
+							{ value: "all", label: t("tab_all") },
+							...SEARCH_SECTION_ORDER.map((name) => ({ value: name, label: tabLabel(name) })),
 						]}
+						style={{ alignSelf: "flex-start" }}
 					/>
-					<Select
-						size="xs"
-						w={150}
-						value={sort}
-						allowDeselect={false}
-						onChange={(value) =>
-							value &&
-							navigate({
-								search: (prev) => ({
-									...prev,
-									// `time` is the default, so it stays out of the URL; any other mode is
-									// explicit and must survive a reload / shared link.
-									sort: value === DEFAULT_SEARCH_SORT ? undefined : normalizeSearchSort(value),
-								}),
-								replace: true,
-							})
-						}
-						data={[
-							{ value: "time", label: t("sortTime") },
-							{ value: "relevance", label: t("sortRelevance") },
-							{ value: "type", label: t("sortType") },
-							{ value: "title", label: t("sortTitle") },
-						]}
-					/>
-				</Group>
-			) : null}
-
-			{isLoading ? (
-				<Loader />
-			) : !data?.results?.length ? (
-				<Text c="dimmed">{q ? t("noResults") : t("enterQuery")}</Text>
-			) : !results.length ? (
-				<Text c="dimmed">{t("noFilteredResults")}</Text>
-			) : (
-				<Stack>
-					{hiddenResultCount > 0 && (
-						<Alert color="blue" radius="md">
-							<Text size="sm">
-								{t("tooManyResults", {
-									limit: MAX_VISIBLE_RESULTS,
-									total: results.length,
-									defaultValue:
-										"Showing the first {{limit}} of {{total}} filtered results. Refine the search to see fewer results.",
-								})}
-							</Text>
+					{recentDays && (
+						<Alert color="blue" variant="light" p="xs">
+							<Group gap="xs" justify="space-between" wrap="wrap">
+								<Text size="sm">{t("recentOnly", { days: recentDays })}</Text>
+								<Button size="compact-sm" variant="light" onClick={searchFullHistory}>
+									{t("searchFullHistory")}
+								</Button>
+							</Group>
 						</Alert>
 					)}
-					{displayedResultEntries.map(
-						({
-							result,
-							key,
-							link,
-							title,
-							snippet,
-							projectName,
-							chapterTitle,
-							narratorTitle,
-							collectionName,
-							timestamp,
-						}) => {
-							const card = (
-								<Card
-									key={key}
-									shadow="sm"
-									padding="md"
-									withBorder
-									style={{ textDecoration: "none", cursor: link ? "pointer" : undefined }}
-								>
-									<Group gap="xs" mb={6} justify="space-between" wrap="nowrap">
-										<Group gap="xs" style={{ minWidth: 0 }}>
-											<Badge size="xs" color={RESULT_TYPE_COLORS[result.type] ?? "grape"}>
-												{t(`label_${result.type}`)}
-											</Badge>
-											<Text fw={500} truncate>
-												{highlightSearchText(title, q ?? "")}
-											</Text>
-										</Group>
-										<Badge size="xs" variant="light" color="gray">
-											{t("score", { score: result.matchScore ?? 0 })}
-										</Badge>
-									</Group>
-									<Text size="sm" c="dimmed" lineClamp={3} mb={8}>
-										{highlightSearchText(snippet ?? "", q ?? "")}
-									</Text>
-									<Group gap={6} wrap="wrap">
-										{projectName && <Badge variant="outline">{projectName}</Badge>}
-										{chapterTitle && <Badge variant="light">{chapterTitle}</Badge>}
-										{narratorTitle && <Badge variant="light">{narratorTitle}</Badge>}
-										{collectionName && (
-											<Badge variant="outline" color="teal">
-												{collectionName}
-											</Badge>
-										)}
-										{result.status && (
-											<Badge variant="dot">
-												{translateSearchEnum(`status_${result.type}`, result.status)}
-											</Badge>
-										)}
-										{result.messageRole && (
-											<Badge variant="dot">
-												{translateSearchEnum("messageRole", result.messageRole)}
-											</Badge>
-										)}
-										{result.matchField && (
-											<Badge variant="outline">
-												{t("matchField", {
-													field: translateSearchEnum("matchField", result.matchField),
-												})}
-											</Badge>
-										)}
-										{timestamp && (
-											<Text size="xs" c="dimmed">
-												{formatSmartTime(timestamp)}
-											</Text>
-										)}
-									</Group>
-								</Card>
-							);
-							if (!link) return card;
-							return (
-								<Link
-									key={key}
-									to={link.to}
-									params={link.params}
-									hash={link.hash}
-									style={linkStyle}
-								>
-									{card}
-								</Link>
-							);
-						},
+					{tab === "all" ? (
+						overview.isLoading ? (
+							<Loader />
+						) : (
+							<Overview sections={sections} request={request} onOpen={openTab} />
+						)
+					) : (
+						<SectionList key={tab} section={tab} request={request} />
 					)}
-				</Stack>
+				</>
 			)}
 		</Stack>
 	);

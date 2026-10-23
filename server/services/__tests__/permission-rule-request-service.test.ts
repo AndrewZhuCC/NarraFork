@@ -191,7 +191,7 @@ let reflectionScenario: "confirm" | "text" | "throw" | "cancel" | "confirmError"
 const providerModule = { ...(await import("../../lib/agent/provider")) };
 const fakeProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -210,9 +210,6 @@ const fakeProvider: ProviderAdapter = {
 			],
 		};
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -653,26 +650,17 @@ async function installRealOAuthFinalAuthority(
 		assertActive: () => assertOAuthNarratorRuntimeActive(fixture.actor.narratorId, userId),
 	};
 }
-async function seedChapterDenyProject() {
+async function seedDenyProject() {
 	await db.insert(schema.projects).values({
-		id: "chapter-policy-project",
-		name: "Chapter policy",
-		gitPath: "/tmp/chapter-policy-repository",
+		id: "deny-policy-project",
+		name: "Deny policy",
+		gitPath: "/tmp/deny-policy-repository",
 		chapterSettings: {
 			commandWhitelist: [{ pattern: "pwd", enabled: true }],
 			commandBlacklist: [{ pattern: "pwd", enabled: true }],
 			whitelistDirs: [{ path: "/tmp", accessLevel: "full", enabled: true }],
-			blacklistDirs: [{ path: "/tmp/chapter-policy-private", denyLevel: "denyAll", enabled: true }],
+			blacklistDirs: [{ path: "/tmp/deny-policy-private", denyLevel: "denyAll", enabled: true }],
 		},
-		createdAt: now(),
-		updatedAt: now(),
-	});
-	await db.insert(schema.chapters).values({
-		id: "policy-chapter",
-		projectId: "chapter-policy-project",
-		title: "Policy",
-		branch: "policy",
-		baseBranch: "main",
 		createdAt: now(),
 		updatedAt: now(),
 	});
@@ -817,6 +805,10 @@ describe("attempt-bound permission requests", () => {
 				const path = symlink ? join(fixture.directory, "alias.json") : configuration;
 				if (symlink) symlinkSync(configuration, path);
 				if (kind === "Edit") {
+					// Edit would normally need a prior Read of the file. The secret-path
+					// guard now refuses even that Read of the host settings file, so the
+					// bypass is cut off a step earlier; the Edit below is still blocked by
+					// the host-settings write boundary.
 					const read = await call(fixture.actor.narratorId);
 					const input = { file_path: path, offset: 1, limit: 2 };
 					await db
@@ -831,7 +823,7 @@ describe("attempt-bound permission requests", () => {
 								{ toolCallBinding: read.binding },
 							)
 						).isError,
-					).not.toBe(true);
+					).toBe(true);
 				}
 				fixture.tu.input =
 					kind === "Write"
@@ -861,13 +853,17 @@ describe("attempt-bound permission requests", () => {
 				expect(readFileSync(configuration, "utf8")).toBe(original);
 			});
 
-	test("host settings Read and trusted saveSettings remain available; repository settings Write is unrelated", async () => {
+	test("agent Read of host settings is now refused; trusted saveSettings and repository settings Write are unrelated", async () => {
 		settings.agent.permissionRuleAutoApprove = true;
+		// Trusted, non-agent saveSettings still writes the host settings file.
 		saveSettings(structuredClone(settings));
 		expect(
 			JSON.parse(readFileSync(join(narraforkDir, "settings.json"), "utf8")).agent
 				.permissionRuleAutoApprove,
 		).toBe(true);
+		// An agent file tool, however, may no longer read the host settings file:
+		// it holds auth.jwtSecret and provider keys, so a hijacked agent could
+		// otherwise exfiltrate them. The secret-path guard refuses it in every mode.
 		const reader = await finalExecutionFixture("Read", false, undefined, {
 			file_path: join(narraforkDir, "settings.json"),
 			offset: 1,
@@ -875,7 +871,7 @@ describe("attempt-bound permission requests", () => {
 		});
 		expect(
 			(await executeTool(reader.tu, reader.config, { toolCallBinding: reader.binding })).isError,
-		).not.toBe(true);
+		).toBe(true);
 		const writer = await finalExecutionFixture("Write", false);
 		writer.tu.input.file_path = join(writer.directory, "settings.json");
 		await db
@@ -897,6 +893,16 @@ describe("attempt-bound permission requests", () => {
 			await next();
 		});
 		app.route("/settings", settingsRoutes);
+		// assertAdmin now authorizes against the live DB role, so the acting
+		// administrator must exist as an admin row (the token claim alone no
+		// longer grants admin).
+		await db.insert(schema.users).values({
+			id: "trusted-human",
+			username: "trusted-human",
+			passwordHash: "not-a-real-password",
+			role: "admin",
+			createdAt: now(),
+		});
 		settings.agent.permissionRuleAutoApprove = false;
 		const response = await app.request("/settings", {
 			method: "PATCH",
@@ -1759,7 +1765,7 @@ describe("attempt-bound permission requests", () => {
 		});
 		const policy = await executionPolicyEngine.compile(identity.narratorId, identity.context);
 		const { analyzeShellCommand } = await import("../../lib/agent/bash-analyze");
-		const analysis = await analyzeShellCommand("rm -rf /", "/tmp", "bash", false);
+		const analysis = await analyzeShellCommand("rm -rf /", "/tmp", "bash");
 		expect(
 			permission.resolvePermissionDecision({
 				toolName: "Bash",
@@ -2212,56 +2218,54 @@ describe("attempt-bound permission requests", () => {
 			),
 		).rejects.toThrow("Device differs");
 	});
-	test("chapter-bound narrator with null contextProjectId enforces project directory and command denies in bypass", async () => {
-		await seedChapterDenyProject();
+	test("a narrator indexed into a project by its cwd enforces project directory and command denies in bypass", async () => {
+		await seedDenyProject();
 		const identity = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ chapterId: "policy-chapter", contextProjectId: null })
+			.set({ cwd: "/tmp/deny-policy-repository", contextProjectId: null })
 			.where(eq(schema.narrators.id, identity.narratorId));
+		// The primary link the project index derives from that directory.
+		await db.insert(schema.narratorProjectLinks).values({
+			narratorId: identity.narratorId,
+			projectId: "deny-policy-project",
+			role: "primary",
+			source: "cwd",
+			directory: "/tmp/deny-policy-repository",
+			updatedAt: now(),
+		});
 		const loaded = db.transaction((tx) =>
 			executionPolicyRepository.loadNow(identity.narratorId, tx),
 		);
-		expect(loaded.projectId).toBe("chapter-policy-project");
-		expect(loaded.projectGitPath).toBe("/tmp/chapter-policy-repository");
+		expect(loaded.projectId).toBe("deny-policy-project");
+		expect(loaded.projectGitPath).toBe("/tmp/deny-policy-repository");
 		expect(loaded.commandBlacklist).toHaveLength(1);
 		expect(loaded.directoryBlacklist).toHaveLength(1);
 		await expectProjectPolicyDeny(identity.narratorId, "Bash", { command: "pwd" });
 		await expectProjectPolicyDeny(identity.narratorId, "Read", {
-			file_path: "/tmp/chapter-policy-private/secret",
+			file_path: "/tmp/deny-policy-private/secret",
 		});
 	});
-	test("chapter project takes precedence over a permissive explicit context project", async () => {
-		await seedChapterDenyProject();
-		await db.insert(schema.projects).values({
-			id: "permissive-explicit-project",
-			name: "Other",
-			chapterSettings: { commandWhitelist: [{ pattern: "pwd", enabled: true }] },
-			createdAt: now(),
-			updatedAt: now(),
-		});
-		const identity = await seed("bypassPermissions");
-		await db
-			.update(schema.narrators)
-			.set({ chapterId: "policy-chapter", contextProjectId: "permissive-explicit-project" })
-			.where(eq(schema.narrators.id, identity.narratorId));
-		expect(executionPolicyRepository.loadNow(identity.narratorId).projectId).toBe(
-			"chapter-policy-project",
-		);
-		await expectProjectPolicyDeny(identity.narratorId, "Bash", { command: "pwd" });
-	});
-	test("child and nested subagent inherit chapter ancestor project denies without explicit project context", async () => {
-		await seedChapterDenyProject();
+	test("child and nested subagent inherit the source's project denies without explicit project context", async () => {
+		await seedDenyProject();
 		const parent = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ chapterId: "policy-chapter", contextProjectId: null })
+			.set({ contextProjectId: "deny-policy-project" })
 			.where(eq(schema.narrators.id, parent.narratorId));
 		const child = await seed("bypassPermissions", parent.narratorId),
 			nested = await seed("bypassPermissions", child.narratorId);
 		for (const actor of [child, nested]) {
+			expect(
+				(
+					await db.query.narrators.findFirst({
+						where: eq(schema.narrators.id, actor.narratorId),
+						columns: { contextProjectId: true },
+					})
+				)?.contextProjectId,
+			).toBeNull();
 			expect(executionPolicyRepository.loadNow(actor.narratorId).projectId).toBe(
-				"chapter-policy-project",
+				"deny-policy-project",
 			);
 			await permissionRuleService.createNarratorRule(actor.narratorId, {
 				ruleType: "commandWhitelist",
@@ -2269,40 +2273,33 @@ describe("attempt-bound permission requests", () => {
 			});
 			await expectProjectPolicyDeny(actor.narratorId, "Bash", { command: "pwd" });
 			await expectProjectPolicyDeny(actor.narratorId, "Read", {
-				file_path: "/tmp/chapter-policy-private/secret",
+				file_path: "/tmp/deny-policy-private/secret",
 			});
 		}
 	});
 	test("standalone explicit project retains deny policy in actual bypass permission handling", async () => {
-		await seedChapterDenyProject();
+		await seedDenyProject();
 		const identity = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ chapterId: null, contextProjectId: "chapter-policy-project" })
+			.set({ contextProjectId: "deny-policy-project" })
 			.where(eq(schema.narrators.id, identity.narratorId));
 		expect(executionPolicyRepository.loadNow(identity.narratorId).projectId).toBe(
-			"chapter-policy-project",
+			"deny-policy-project",
 		);
 		await expectProjectPolicyDeny(identity.narratorId, "Bash", { command: "pwd" });
 		await expectProjectPolicyDeny(identity.narratorId, "Read", {
-			file_path: "/tmp/chapter-policy-private/secret",
+			file_path: "/tmp/deny-policy-private/secret",
 		});
 	});
-	test("standalone cwd alone never selects a project and dangling chapter fails closed", async () => {
-		await seedChapterDenyProject();
+	test("a directory inside a project selects nothing without an index link", async () => {
+		await seedDenyProject();
 		const identity = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ cwd: "/tmp/chapter-policy-repository", chapterId: null, contextProjectId: null })
+			.set({ cwd: "/tmp/deny-policy-repository", contextProjectId: null })
 			.where(eq(schema.narrators.id, identity.narratorId));
 		expect(executionPolicyRepository.loadNow(identity.narratorId).projectId).toBeNull();
-		await db
-			.update(schema.narrators)
-			.set({ chapterId: "missing-policy-chapter", contextProjectId: "chapter-policy-project" })
-			.where(eq(schema.narrators.id, identity.narratorId));
-		expect(() => executionPolicyRepository.loadNow(identity.narratorId)).toThrow(
-			"chapter context no longer exists",
-		);
 	});
 	test("standalone contextProjectId supplies project deny layers", async () => {
 		const identity = await seed();

@@ -322,8 +322,6 @@ export function useVListLabels(): VListLabels {
 			reviewVerdict_request_changes: t("reviewVerdict_request_changes"),
 			reviewVerdict_comment_only: t("reviewVerdict_comment_only"),
 			reviewFeedbackRevisedBadge: t("reviewFeedbackRevisedBadge"),
-			reviewFeedbackApply: t("reviewFeedbackApply"),
-			reviewFeedbackApplied: t("reviewFeedbackApplied"),
 			// ── message-origin attribution ──────────────────────────────────────────
 			// The origin_notice heading is composed during adaptation (it is a
 			// measured row), so these belong to the adapter labels.
@@ -509,6 +507,13 @@ export function useVListLabels(): VListLabels {
 			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
 			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan", { planFile: "{planFile}" }),
 			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
+			noticeTurnNudge: t("sidecar.body.noticeTurnNudge", {
+				turnIndex: "{turnIndex}",
+				maxTurns: "{maxTurns}",
+			}),
+			noticeBrokenCall: t("sidecar.body.noticeBrokenCall", { toolNames: "{toolNames}" }),
+			noticeContinue: t("sidecar.body.noticeContinue"),
+			noticeWorkspaceChanged: t("sidecar.body.noticeWorkspaceChanged"),
 			tasksCurrent: t("sidecar.body.tasksCurrent", { n: "{n}" }),
 			tasksEmptyNever: t("sidecar.body.tasksEmptyNever"),
 			tasksEmptyDone: t("sidecar.body.tasksEmptyDone"),
@@ -544,6 +549,10 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
 			sidecarSourceTutorialLesson: t("sidecar.sources.tutorial_lesson"),
+			sidecarSourceTurnNudge: t("sidecar.sources.turn_nudge"),
+			sidecarSourceBrokenCall: t("sidecar.sources.broken_call"),
+			sidecarSourceContinuePrompt: t("sidecar.sources.continue_prompt"),
+			sidecarSourceWorkspaceChanged: t("sidecar.sources.workspace_changed"),
 		}),
 		[t, tCommon],
 	);

@@ -33,6 +33,8 @@ export interface DisplayPageMessagesParams {
 	maxRawBytes?: number;
 	/** Absolute: queueing/startup and execution spend the same budget. */
 	deadlineAt: number;
+	/** Read block-format bodies from `narrator_blocks` (SQLite with `narratorBlocks.read`). */
+	bodiesFromBlocks?: boolean;
 }
 
 export interface PostgresDisplayPageMessagesParams extends Omit<DisplayPageMessagesParams, "kind"> {

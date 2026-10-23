@@ -13,6 +13,7 @@ import {
 	type HostBridgeHandle,
 	installHostBridge,
 	isEmbeddedByHost,
+	isPinnableOrigin,
 	looksLikeSessionToken,
 } from "@frontend/lib/host-bridge";
 
@@ -146,6 +147,27 @@ describe("isEmbeddedByHost", () => {
 	});
 });
 
+describe("isPinnableOrigin", () => {
+	const SELF = "https://nf.test";
+	it("accepts the vscode-webview scheme", () => {
+		expect(isPinnableOrigin(HOST_ORIGIN, SELF, [])).toBe(true);
+	});
+	it("accepts the app's own origin", () => {
+		expect(isPinnableOrigin(SELF, SELF, [])).toBe(true);
+	});
+	it("accepts a configured embed origin, and only when configured", () => {
+		expect(isPinnableOrigin("https://editor.example.com", SELF, [])).toBe(false);
+		expect(
+			isPinnableOrigin("https://editor.example.com", SELF, ["https://editor.example.com"]),
+		).toBe(true);
+	});
+	it("refuses an arbitrary web origin and an opaque origin", () => {
+		expect(isPinnableOrigin("https://evil.example.com", SELF, [])).toBe(false);
+		expect(isPinnableOrigin("null", SELF, [])).toBe(false);
+		expect(isPinnableOrigin("", SELF, [])).toBe(false);
+	});
+});
+
 describe("installHostBridge", () => {
 	it("installs nothing when the document is not an embedded panel", () => {
 		const win = makeWindow("https://nf.test/");
@@ -195,6 +217,34 @@ describe("installHostBridge", () => {
 			data: { type: "narrafork.bootstrap", token: TOKEN_B },
 		});
 		expect(getToken()).toBe(TOKEN_A);
+	});
+
+	it("refuses to pin an arbitrary web origin, even as the first sender", () => {
+		// The token-theft vector: a page frames the app and tries to win the bridge by
+		// speaking first. An ordinary web origin is not an approved embedder, so no pin.
+		const win = makeWindow("https://nf.test/?nfEmbed=n1");
+		bridge = installHostBridge(win as never);
+		win.deliver({
+			origin: "https://evil.example.com",
+			data: { type: "narrafork.bootstrap", token: TOKEN_A },
+		});
+		expect(getToken()).toBeNull();
+		expect(bridge?.pinnedOrigin).toBeNull();
+	});
+
+	it("pins a configured embed origin", () => {
+		// A non-webview editor host (e.g. code-server) is trusted only when the operator
+		// lists its origin — the same origins the backend trusts for CORS / frame-ancestors.
+		const win = makeWindow("https://nf.test/?nfEmbed=n1");
+		bridge = installHostBridge(win as never, {
+			allowedEmbedOrigins: ["https://editor.example.com"],
+		});
+		win.deliver({
+			origin: "https://editor.example.com",
+			data: { type: "narrafork.bootstrap", token: TOKEN_A },
+		});
+		expect(getToken()).toBe(TOKEN_A);
+		expect(bridge?.pinnedOrigin).toBe("https://editor.example.com");
 	});
 
 	it("ignores unknown message types and malformed payloads", () => {

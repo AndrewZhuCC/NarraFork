@@ -5,7 +5,12 @@ import { useTranslation } from "react-i18next";
 import { useUpdateUserPreferences } from "../hooks/useUserPreferences";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 
-export function LanguageSwitcher() {
+/**
+ * `persistToAccount` saves the choice to the signed-in user's preferences. The login
+ * page has no session, so it only switches the UI (the detector caches it locally,
+ * and registration sends it along as the new account's language).
+ */
+export function LanguageSwitcher({ persistToAccount = true }: { persistToAccount?: boolean }) {
 	const { i18n } = useTranslation();
 	const updatePrefs = useUpdateUserPreferences();
 	const [isChangingLanguage, setIsChangingLanguage] = useState(false);
@@ -20,7 +25,7 @@ export function LanguageSwitcher() {
 		void (async () => {
 			try {
 				await changeAppLanguage(locale, getNamespacesForPath(window.location.pathname));
-				updatePrefs.mutate({ language: locale });
+				if (persistToAccount) updatePrefs.mutate({ language: locale });
 			} finally {
 				setIsChangingLanguage(false);
 			}

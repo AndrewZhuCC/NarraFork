@@ -6,20 +6,15 @@ import {
 	benchmarkRuns,
 	benchmarkSuites,
 	benchmarkTaskResults,
-	chapterCommits,
-	chapterEdges,
-	chapters,
 	chatAttachments,
 	chatMessages,
 	chatRoomMembers,
 	chatRooms,
 	containerInstances,
-	explorationGroups,
 	gatewaySessionMappings,
 	hooks,
 	integrationAuthorities,
 	integrationCapabilityGrants,
-	mergeSessions,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorBufferedMessages,
@@ -44,7 +39,6 @@ import {
 	projects,
 	registrationCodes,
 	remoteDevices,
-	reviewConclusions,
 	specFileRevisions,
 	specNamespaceFiles,
 	specNamespaces,
@@ -63,79 +57,12 @@ import {
 } from "./schema";
 
 export const projectsRelations = relations(projects, ({ many }) => ({
-	chapters: many(chapters),
-	chapterEdges: many(chapterEdges),
-	explorationGroups: many(explorationGroups),
 	volumeSnapshots: many(volumeSnapshots),
 	hooks: many(hooks),
 	oauthGrantProjects: many(oauthGrantProjects),
 }));
 
-export const chaptersRelations = relations(chapters, ({ one, many }) => ({
-	project: one(projects, { fields: [chapters.projectId], references: [projects.id] }),
-	parentChapter: one(chapters, {
-		fields: [chapters.parentChapterId],
-		references: [chapters.id],
-		relationName: "chapterParent",
-	}),
-	childChapters: many(chapters, { relationName: "chapterParent" }),
-	reviewSourceChapter: one(chapters, {
-		fields: [chapters.reviewSourceChapterId],
-		references: [chapters.id],
-		relationName: "reviewSource",
-	}),
-	reviewChapters: many(chapters, { relationName: "reviewSource" }),
-	explorationGroup: one(explorationGroups, {
-		fields: [chapters.explorationGroupId],
-		references: [explorationGroups.id],
-		relationName: "explorationGroupChapters",
-	}),
-	sourceEdges: many(chapterEdges, { relationName: "edgeSource" }),
-	targetEdges: many(chapterEdges, { relationName: "edgeTarget" }),
-	narrators: many(narrators),
-	terminals: many(terminals),
-	containerInstances: many(containerInstances),
-	portAllocations: many(portAllocations),
-	commits: many(chapterCommits),
-	snapshotApplications: many(volumeSnapshotApplications),
-	reviewConclusionsAsReview: many(reviewConclusions, { relationName: "reviewChapter" }),
-	reviewConclusionsAsSource: many(reviewConclusions, { relationName: "sourceChapter" }),
-}));
-
-export const chapterEdgesRelations = relations(chapterEdges, ({ one }) => ({
-	project: one(projects, { fields: [chapterEdges.projectId], references: [projects.id] }),
-	source: one(chapters, {
-		fields: [chapterEdges.sourceId],
-		references: [chapters.id],
-		relationName: "edgeSource",
-	}),
-	target: one(chapters, {
-		fields: [chapterEdges.targetId],
-		references: [chapters.id],
-		relationName: "edgeTarget",
-	}),
-}));
-
-export const explorationGroupsRelations = relations(explorationGroups, ({ one, many }) => ({
-	project: one(projects, {
-		fields: [explorationGroups.projectId],
-		references: [projects.id],
-	}),
-	baseChapter: one(chapters, {
-		fields: [explorationGroups.baseChapterId],
-		references: [chapters.id],
-		relationName: "explorationBase",
-	}),
-	decidedChapter: one(chapters, {
-		fields: [explorationGroups.decidedChapterId],
-		references: [chapters.id],
-		relationName: "explorationDecided",
-	}),
-	chapters: many(chapters, { relationName: "explorationGroupChapters" }),
-}));
-
 export const narratorsRelations = relations(narrators, ({ one, many }) => ({
-	chapter: one(chapters, { fields: [narrators.chapterId], references: [chapters.id] }),
 	contextProject: one(projects, {
 		fields: [narrators.contextProjectId],
 		references: [projects.id],
@@ -161,7 +88,6 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	questions: many(narratorQuestions),
 	fileSnapshots: many(narratorFileSnapshots),
 	terminals: many(terminals),
-	commits: many(chapterCommits),
 	whitelistDirs: many(narratorWhitelistDirs),
 	blacklistDirs: many(narratorBlacklistDirs),
 	whitelistCmds: many(narratorWhitelistCmds),
@@ -182,7 +108,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 
 /**
  * `acl_grants` has no relations to its scope: `scope_id` is polymorphic (a project,
- * chapter, narrator or knowledge id depending on `scope_type`), so there is no
+ * narrator or knowledge id depending on `scope_type`), so there is no
  * single table for Drizzle to join. Resolution goes through `acl-scope.ts`.
  */
 export const aclGrantsRelations = relations(aclGrants, ({ one }) => ({
@@ -359,7 +285,6 @@ export const terminalsRelations = relations(terminals, ({ one }) => ({
 		fields: [terminals.worktreeResourceId],
 		references: [narratorWorktreeResources.id],
 	}),
-	chapter: one(chapters, { fields: [terminals.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminals.narratorId], references: [narrators.id] }),
 }));
 
@@ -369,7 +294,6 @@ export const terminalViewStateRelations = relations(terminalViewState, ({ one })
 		references: [narratorWorktreeResources.id],
 	}),
 	user: one(users, { fields: [terminalViewState.userId], references: [users.id] }),
-	chapter: one(chapters, { fields: [terminalViewState.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminalViewState.narratorId], references: [narrators.id] }),
 }));
 
@@ -378,20 +302,12 @@ export const containerInstancesRelations = relations(containerInstances, ({ one 
 		fields: [containerInstances.worktreeResourceId],
 		references: [narratorWorktreeResources.id],
 	}),
-	chapter: one(chapters, {
-		fields: [containerInstances.chapterId],
-		references: [chapters.id],
-	}),
 }));
 
 export const portAllocationsRelations = relations(portAllocations, ({ one }) => ({
 	worktreeResource: one(narratorWorktreeResources, {
 		fields: [portAllocations.worktreeResourceId],
 		references: [narratorWorktreeResources.id],
-	}),
-	chapter: one(chapters, {
-		fields: [portAllocations.chapterId],
-		references: [chapters.id],
 	}),
 }));
 
@@ -457,6 +373,10 @@ export const chatMessagesRelations = relations(chatMessages, ({ one, many }) => 
 	sender: one(users, {
 		fields: [chatMessages.senderUserId],
 		references: [users.id],
+	}),
+	senderNarrator: one(narrators, {
+		fields: [chatMessages.senderNarratorId],
+		references: [narrators.id],
 	}),
 	// The reply snapshot columns are deliberately NOT modelled as a relation: the
 	// point of the snapshot is that the quote renders without reading the target
@@ -530,28 +450,6 @@ export const userRecentTabsMetaRelations = relations(userRecentTabsMeta, ({ one 
 	}),
 }));
 
-export const mergeSessionsRelations = relations(mergeSessions, ({ one }) => ({
-	targetChapter: one(chapters, {
-		fields: [mergeSessions.targetChapterId],
-		references: [chapters.id],
-	}),
-}));
-
-export const chapterCommitsRelations = relations(chapterCommits, ({ one }) => ({
-	chapter: one(chapters, {
-		fields: [chapterCommits.chapterId],
-		references: [chapters.id],
-	}),
-	narrator: one(narrators, {
-		fields: [chapterCommits.narratorId],
-		references: [narrators.id],
-	}),
-	narratorMessage: one(narratorMessages, {
-		fields: [chapterCommits.narratorMessageId],
-		references: [narratorMessages.id],
-	}),
-}));
-
 export const narratorWhitelistDirsRelations = relations(narratorWhitelistDirs, ({ one }) => ({
 	narrator: one(narrators, {
 		fields: [narratorWhitelistDirs.narratorId],
@@ -589,10 +487,6 @@ export const volumeSnapshotsRelations = relations(volumeSnapshots, ({ one, many 
 		fields: [volumeSnapshots.projectId],
 		references: [projects.id],
 	}),
-	sourceChapter: one(chapters, {
-		fields: [volumeSnapshots.sourceChapterId],
-		references: [chapters.id],
-	}),
 	createdByUser: one(users, {
 		fields: [volumeSnapshots.createdBy],
 		references: [users.id],
@@ -610,10 +504,6 @@ export const volumeSnapshotApplicationsRelations = relations(
 		snapshot: one(volumeSnapshots, {
 			fields: [volumeSnapshotApplications.snapshotId],
 			references: [volumeSnapshots.id],
-		}),
-		chapter: one(chapters, {
-			fields: [volumeSnapshotApplications.chapterId],
-			references: [chapters.id],
 		}),
 		appliedByUser: one(users, {
 			fields: [volumeSnapshotApplications.appliedBy],
@@ -638,19 +528,6 @@ export const workspacePanelsRelations = relations(workspacePanels, ({ one }) => 
 	narrator: one(narrators, {
 		fields: [workspacePanels.narratorId],
 		references: [narrators.id],
-	}),
-}));
-
-export const reviewConclusionsRelations = relations(reviewConclusions, ({ one }) => ({
-	reviewChapter: one(chapters, {
-		fields: [reviewConclusions.reviewChapterId],
-		references: [chapters.id],
-		relationName: "reviewChapter",
-	}),
-	sourceChapter: one(chapters, {
-		fields: [reviewConclusions.sourceChapterId],
-		references: [chapters.id],
-		relationName: "sourceChapter",
 	}),
 }));
 
@@ -686,10 +563,6 @@ export const gatewaySessionMappingsRelations = relations(gatewaySessionMappings,
 	project: one(projects, {
 		fields: [gatewaySessionMappings.projectId],
 		references: [projects.id],
-	}),
-	chapter: one(chapters, {
-		fields: [gatewaySessionMappings.chapterId],
-		references: [chapters.id],
 	}),
 }));
 

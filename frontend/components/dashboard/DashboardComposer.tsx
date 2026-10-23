@@ -2,13 +2,12 @@ import { ActionIcon, Box, Button, Group, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { composerDocumentText, parseComposerDocument } from "@shared/composer-document";
 import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useCreateNarrator } from "../../hooks/useNarrator";
-import { useFileSystemCapability } from "../../hooks/usePlatform";
+import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api, isAbortError } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
@@ -41,7 +40,6 @@ const CreateNarratorModal = lazy(() =>
  */
 export const DASHBOARD_COMPOSER_KEY = "dashboard-composer";
 const COMPOSER_PREFS_KEY = "narrafork_dashboard_composer";
-const SETTINGS_QUERY_GC_TIME_MS = 60_000;
 
 interface ComposerPrefs {
 	cwd?: string;
@@ -78,21 +76,18 @@ export function DashboardComposer() {
 	const { t: tns } = useTranslation("narrators");
 	const navigate = useNavigate();
 	const createNarrator = useCreateNarrator();
-	const fsCapability = useFileSystemCapability();
 	const { data: currentUser } = useCurrentUser();
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
-	const { data: settings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		gcTime: SETTINGS_QUERY_GC_TIME_MS,
-	});
-	const defaultProjectDir: string = settings?.paths?.defaultProjectDir ?? "";
+	const projectDir = useProjectDirStatus();
 
 	const [prefs] = useState(readPrefs);
 	// `null` = never chosen on this device: follow the instance default directory.
 	const [chosenCwd, setChosenCwd] = useState<string | null>(prefs.cwd || null);
 	const [model, setModel] = useState(prefs.model || FOLLOW_DEFAULT_MODEL);
-	const cwd = chosenCwd ?? defaultProjectDir;
+	const cwd = chosenCwd ?? projectDir.usablePath ?? "";
+	// Nothing chosen and the default is unset or gone: the server would refuse the
+	// session, so ask for a directory instead of failing on send.
+	const directoryRequired = !chosenCwd && projectDir.needsChoice;
 	const [browseOpen, setBrowseOpen] = useState(false);
 	const [advancedOpen, setAdvancedOpen] = useState(false);
 	const [hasText, setHasText] = useState(false);
@@ -150,6 +145,8 @@ export function DashboardComposer() {
 		writePrefs({ cwd: chosenCwd ?? undefined, model: value });
 	};
 
+	const openDirectoryChooser = () => setBrowseOpen(true);
+
 	const openSession = (session: CreateNarratorResult) => {
 		void addRecentTab({
 			type: "narrator",
@@ -164,6 +161,10 @@ export function DashboardComposer() {
 	const send = async () => {
 		const composer = composerRef.current;
 		if (!composer || sendingRef.current || ingestingRef.current) return;
+		if (directoryRequired) {
+			openDirectoryChooser();
+			return;
+		}
 		const rawText = composer.getText();
 		const liveDocument = composer.getDocument();
 		const document = liveDocument ? parseComposerDocument(liveDocument) : undefined;
@@ -208,7 +209,8 @@ export function DashboardComposer() {
 		try {
 			let session = pendingSessionRef.current;
 			if (!session) {
-				// Unchosen → let the server resolve (and create) the default project directory.
+				// Unchosen → the server uses the default project directory, which exists
+				// (`directoryRequired` stops the send otherwise).
 				const data = await createNarrator.mutateAsync({
 					...(chosenCwd ? { cwd: chosenCwd } : {}),
 					model,
@@ -325,7 +327,7 @@ export function DashboardComposer() {
 						<Button
 							onClick={() => void send()}
 							loading={sending}
-							disabled={!hasText && !hasAttachments}
+							disabled={directoryRequired || (!hasText && !hasAttachments)}
 						>
 							{t("composer.start")}
 						</Button>
@@ -334,20 +336,17 @@ export function DashboardComposer() {
 			</Box>
 
 			<Group gap="xs" mt="xs" wrap="wrap">
-				<Tooltip
-					label={fsCapability.browse.supported ? cwd || t("composer.homeDirectory") : undefined}
-					disabled={!fsCapability.browse.supported && !cwd}
-				>
+				<Tooltip label={cwd || t("composer.chooseDirectory")}>
 					<Button
-						variant="default"
+						variant={directoryRequired ? "light" : "default"}
+						color={directoryRequired ? "orange" : undefined}
 						size="xs"
 						leftSection={<IconFolder size={14} />}
-						disabled={!fsCapability.browse.supported}
-						onClick={() => setBrowseOpen(true)}
+						onClick={openDirectoryChooser}
 						styles={{ label: { maxWidth: 260 } }}
 					>
 						<Text span size="xs" truncate>
-							{cwd ? directoryLabel(cwd) : t("composer.homeDirectory")}
+							{cwd ? directoryLabel(cwd) : t("composer.chooseDirectory")}
 						</Text>
 					</Button>
 				</Tooltip>
@@ -365,6 +364,12 @@ export function DashboardComposer() {
 					</ActionIcon>
 				</Tooltip>
 			</Group>
+
+			{directoryRequired && (
+				<Text size="xs" c="orange" mt={6}>
+					{t("composer.directoryRequired")}
+				</Text>
+			)}
 
 			<DirectoryBrowserModal
 				opened={browseOpen}

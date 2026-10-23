@@ -109,13 +109,8 @@ export function fallbackPluginUiContext(
 			panelInstanceId: params.panelInstanceId,
 		},
 		surface: {
-			// `graph` (a chapter node's embedded dock) reports as `narrator-focus`
-			// rather than introducing a new wire value: both host exactly one
-			// narrator, and an unrecognized `kind` would break already-published
-			// plugins. A node's smaller viewport is something the iframe observes
-			// through its own size, not through a distinct surface kind.
 			kind:
-				sessionContext.surface === "focus" || sessionContext.surface === "graph"
+				sessionContext.surface === "focus"
 					? "narrator-focus"
 					: sessionContext.surface === "settings"
 						? "settings"
@@ -127,7 +122,6 @@ export function fallbackPluginUiContext(
 			? {
 					narrator: {
 						id: sessionContext.narratorId,
-						chapterId: sessionContext.chapterId,
 						projectId: sessionContext.projectId,
 					},
 				}

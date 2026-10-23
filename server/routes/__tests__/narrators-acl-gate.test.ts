@@ -89,6 +89,15 @@ beforeAll(async () => {
 			createdAt: now,
 		});
 	}
+	// assertAdmin now reads the live DB role, so the admin actor used by the
+	// admin-gated route cases must exist as an admin row.
+	await db.insert(users).values({
+		id: "some-admin",
+		username: `some-admin-${Date.now()}`,
+		passwordHash: "x",
+		role: "admin",
+		createdAt: now,
+	});
 
 	privateNarratorId = generateId();
 	await db.insert(narrators).values({

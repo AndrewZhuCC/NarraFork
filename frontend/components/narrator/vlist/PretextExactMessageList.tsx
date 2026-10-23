@@ -35,6 +35,7 @@ import {
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
@@ -291,10 +292,6 @@ import {
 } from "./vlist-reload-policy";
 import { indexWithHeightOverrides } from "./vlist-resize-preview";
 import {
-	resolveReviewFeedbackActions,
-	useReviewFeedbackActions,
-} from "./vlist-review-feedback-actions";
-import {
 	buildRowCtxActions,
 	buildRowToolActions,
 	rowActionHandlerDependencies,
@@ -414,8 +411,6 @@ type PretextExactMessageListProps = {
 	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
-	/** Narrator is bound to a chapter (git) → user-edit offers the rollback option. */
-	hasChapter?: boolean;
 	/**
 	 * Deep-link / search target: jump to this message once and flash it.
 	 *
@@ -427,6 +422,8 @@ type PretextExactMessageListProps = {
 	highlightMessageId?: string;
 	/** A new request repeats the jump while retaining this list's loaded window. */
 	highlightRequestId?: string;
+	/** Text that picks which row of a multi-row message the jump lands on. */
+	highlightNeedle?: string;
 	tailFooter?: ReactNode;
 	/**
 	 * Pluggable data boundary for surfaces rendering the same document through a
@@ -535,9 +532,9 @@ export const PretextExactMessageList = memo(
 				onSelectionResolverChange,
 				rowHandlers,
 				permCb,
-				hasChapter,
 				highlightMessageId,
 				highlightRequestId,
+				highlightNeedle,
 				tailFooter,
 				dataSource,
 				selectedMessageIds: messageSelectedIds,
@@ -1620,11 +1617,6 @@ export const PretextExactMessageList = memo(
 			}, []);
 			const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
 
-			// Review feedback cards: the button hands the conclusion to this narrator as a user
-			// turn. A concluded review does not wake an idle narrator by design, so this is how
-			// the findings get acted on.
-			const resolveReviewActions = useReviewFeedbackActions(narratorId);
-
 			// Error notice cards: "mark as retryable" opens the shared rule dialog, the
 			// close button deletes the notice. The dialog is one shell-level instance
 			// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
@@ -1659,7 +1651,6 @@ export const PretextExactMessageList = memo(
 					narrator: t("openFullSubagentSession"),
 					knowledge: t("injectionTarget.openKnowledge"),
 					spec: t("injectionTarget.openSpecFile"),
-					chapter: t("injectionTarget.openChapter"),
 				}),
 				[t],
 			);
@@ -4741,6 +4732,7 @@ export const PretextExactMessageList = memo(
 					detachFromBottom,
 					scrollToMessageTarget,
 					prepareLodChange,
+					messageOf: (messageId) => messagesByIdRef.current.get(messageId),
 				}),
 				[
 					detachFromBottom,
@@ -4763,7 +4755,12 @@ export const PretextExactMessageList = memo(
 					return;
 				}
 				if (!documentReady) return;
-				const key = JSON.stringify([narratorId, highlightMessageId, highlightRequestId]);
+				const key = JSON.stringify([
+					narratorId,
+					highlightMessageId,
+					highlightRequestId,
+					highlightNeedle,
+				]);
 				if (jumpedHighlightRef.current === key) return;
 				// Latch BEFORE awaiting: a failed deep-link jump has already told the reader
 				// why (the notice inside scrollToMessageTarget), and re-running it on the next
@@ -4773,11 +4770,13 @@ export const PretextExactMessageList = memo(
 					domIds: [`msg-${highlightMessageId}`],
 					targetIds: [highlightMessageId],
 					highlightId: highlightMessageId,
+					needle: highlightNeedle,
 				});
 			}, [
 				documentReady,
 				highlightMessageId,
 				highlightRequestId,
+				highlightNeedle,
 				narratorId,
 				scrollToMessageTarget,
 			]);
@@ -4869,7 +4868,7 @@ export const PretextExactMessageList = memo(
 			}, [semanticItems]);
 
 			// Full messages by id — the inline editor and the original-content modal need
-			// the raw payload (contentJson / creator / narratorId / editedAt), which the
+			// the raw payload (blocks / creator / narratorId / editedAt), which the
 			// measured layout spec deliberately drops.
 			const messagesById = useMemo(() => {
 				const map = new Map<string, TreeMessage>();
@@ -4909,7 +4908,7 @@ export const PretextExactMessageList = memo(
 				(key: string, messageId: string, role: VListEditRole) => {
 					const msg = messagesByIdRef.current.get(messageId);
 					if (!msg) return;
-					const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+					const blocks = messageBody(msg);
 					const preview = resolveEditorInitialText(blocks, role);
 					if (preview.truncated) {
 						notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
@@ -4972,7 +4971,9 @@ export const PretextExactMessageList = memo(
 					if (!item) continue;
 					const manifestItem = manifestByKey.get(item.spec.key);
 					const sourceIds = manifestItem?.sourceMessageIds ?? [];
-					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds);
+					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds, (id) =>
+						messagesById.get(id),
+					);
 					if (!target) continue;
 					const entry = selectionIndex.byBlockId.get(target.blockId);
 					// Authoritative message id / block index come from the selection entry
@@ -4995,7 +4996,7 @@ export const PretextExactMessageList = memo(
 						{
 							canEditUser,
 							canEditAssistant,
-							hasEditableText: hasEditableTextBlock(msg?.contentJson),
+							hasEditableText: hasEditableTextBlock(messageBody(msg)),
 						},
 					);
 					const specKey = item.spec.key;
@@ -5193,11 +5194,10 @@ export const PretextExactMessageList = memo(
 								narratorId={narratorId}
 								messageId={row.messageId}
 								imageNarratorId={msg.narratorId ?? narratorId}
-								blocks={Array.isArray(msg.contentJson) ? msg.contentJson : []}
+								blocks={messageBody(msg)}
 								creator={msg.creator ?? null}
 								initialText={row.initialText}
 								isLastUserMessage={row.messageId === tailMeta.lastUserMessageId}
-								hasChapter={hasChapter}
 								onEditAndRegenerate={handlers.onEditAndRegenerate}
 								onEditAssistantMessage={handlers.onEditAssistantMessage}
 								onClose={closeEditor}
@@ -5205,14 +5205,7 @@ export const PretextExactMessageList = memo(
 						</Suspense>
 					);
 				},
-				[
-					messagesById,
-					rowHandlers,
-					narratorId,
-					tailMeta.lastUserMessageId,
-					hasChapter,
-					closeEditor,
-				],
+				[messagesById, rowHandlers, narratorId, tailMeta.lastUserMessageId, closeEditor],
 			);
 
 			const originalModalMessage = originalModalMessageId
@@ -5237,14 +5230,12 @@ export const PretextExactMessageList = memo(
 					onOpenNarrator: rowHandlers?.onViewSubagentSession,
 					onOpenKnowledge: rowHandlers?.onOpenKnowledgeEntry,
 					onOpenSpec: rowHandlers?.onOpenSpecFile,
-					onOpenChapter: rowHandlers?.onOpenChapter,
 					labels: injectionTargetLabels,
 				}),
 				[
 					rowHandlers?.onViewSubagentSession,
 					rowHandlers?.onOpenKnowledgeEntry,
 					rowHandlers?.onOpenSpecFile,
-					rowHandlers?.onOpenChapter,
 					injectionTargetLabels,
 				],
 			);
@@ -5328,11 +5319,6 @@ export const PretextExactMessageList = memo(
 							item,
 							sourceIds,
 							resolveGuardActions,
-						),
-						reviewFeedbackActions: resolveReviewFeedbackActions(
-							item,
-							sourceIds,
-							resolveReviewActions,
 						),
 						compactActions: compact.byKey.get(item.spec.key),
 						compactCancelTitle: compact.cancelTitle,

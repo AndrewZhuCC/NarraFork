@@ -11,7 +11,7 @@ import type {
 import { FILE_PANEL_PAGE_BYTES, MAX_FILE_PANEL_BYTES } from "../../shared/file-reference";
 import { testEnvironment } from "../../tests/preload";
 import { db } from "../db";
-import { chapters, narrators, projects, users } from "../db/schema";
+import { narrators, projects, users } from "../db/schema";
 import { LocalBackend } from "../lib/agent/execution/local-backend";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
@@ -194,39 +194,26 @@ async function seal(doc: EditorDocumentDescriptor) {
 	expect(put.status).toBe(200);
 	return { upload, url };
 }
-function bindChapter(
-	options: { cwd?: string | null; worktreePath?: string | null; gitPath?: string } = {},
-) {
+/** Bind the narrator to a project; without its own cwd it works in the project directory. */
+function bindProject(options: { cwd?: string | null; gitPath?: string } = {}) {
 	const projectId = generateId();
-	const chapterId = generateId();
 	const now = new Date().toISOString();
 	db.insert(projects)
 		.values({
 			id: projectId,
 			name: "Editor workspace",
-			gitPath: options.gitPath ?? testEnvironment.isolatedHome,
+			gitPath: options.gitPath ?? root,
 			ownerUserId: userId,
 			createdAt: now,
 			updatedAt: now,
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: chapterId,
-			projectId,
-			title: "Editor chapter",
-			branch: "main",
-			baseBranch: "main",
-			worktreePath: options.worktreePath === undefined ? root : options.worktreePath,
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
 	db.update(narrators)
-		.set({ chapterId, cwd: options.cwd ?? null })
+		// Every session created today carries `standalone`; only former chapter sessions lack it.
+		.set({ contextProjectId: projectId, cwd: options.cwd ?? null, traits: ["standalone"] })
 		.where(eq(narrators.id, narratorId))
 		.run();
-	return { chapterId, projectId };
+	return { projectId };
 }
 
 async function anchorFor(
@@ -920,8 +907,8 @@ describe("editor HTTP identity, small metadata and policies", () => {
 	test.each([
 		"legacy",
 		"reference",
-	])("chapter without explicit cwd can open and save a relative %s source", async (origin) => {
-		bindChapter();
+	])("project session without explicit cwd can open and save a relative %s source", async (origin) => {
+		bindProject();
 		const response = await request(base(), "POST", {
 			path: "test.txt",
 			origin,
@@ -936,8 +923,8 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		expect(await saved.json()).toMatchObject({ status: "saved" });
 		expect(await readFile(path, "utf8")).toBe("new\r\n");
 	});
-	test("explicit narrator cwd takes precedence over the chapter worktree", async () => {
-		bindChapter({ cwd: root, worktreePath: testEnvironment.isolatedHome });
+	test("explicit narrator cwd takes precedence over the project directory", async () => {
+		bindProject({ cwd: root, gitPath: testEnvironment.isolatedHome });
 		const response = await request(base(), "POST", {
 			path: "test.txt",
 			origin: "reference",
@@ -946,32 +933,13 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		expect(response.status).toBe(200);
 		expect(((await response.json()) as EditorDocumentDescriptor).target.path).toBe(path);
 	});
-	test.each([
-		"dormant chapter",
-		"standalone project",
-	])("%s without cwd falls back to the project directory", async (kind) => {
-		const { projectId } = bindChapter({ worktreePath: null, gitPath: root });
-		if (kind === "standalone project") {
-			db.update(narrators)
-				.set({ chapterId: null, contextProjectId: projectId })
-				.where(eq(narrators.id, narratorId))
-				.run();
-		}
-		const response = await request(base(), "POST", {
-			path: "test.txt",
-			origin: "reference",
-			deviceId: "local",
-		});
-		expect(response.status).toBe(200);
-		expect(((await response.json()) as EditorDocumentDescriptor).target.path).toBe(path);
-	});
-	test("inherited worktree changes invalidate an opened document before commit", async () => {
-		const { chapterId } = bindChapter();
+	test("inherited project directory changes invalidate an opened document before commit", async () => {
+		const { projectId } = bindProject();
 		const doc = await openDoc();
 		const { url } = await seal(doc);
-		db.update(chapters)
-			.set({ worktreePath: testEnvironment.isolatedHome })
-			.where(eq(chapters.id, chapterId))
+		db.update(projects)
+			.set({ gitPath: testEnvironment.isolatedHome })
+			.where(eq(projects.id, projectId))
 			.run();
 		const response = await request(`${url}/commit`, "POST", {});
 		expect(response.status).toBe(403);

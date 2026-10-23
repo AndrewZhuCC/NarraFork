@@ -286,14 +286,14 @@ describe("Plugin -> Host protocol golden vectors", () => {
 
 	test("fixes v1 event delivery to live + poll and rejects snapshot_live", () => {
 		const live = eventsSubscribeParamsSchema.parse({
-			topics: ["narrafork.chapter.created"],
+			topics: ["narrafork.narrator.lifecycle"],
 		});
 		expect(live.mode).toBe("live");
 		expect(live.delivery.transport).toBe("poll");
 		expect(eventsPollParamsSchema.parse({ subscriptionId: "subscription-1" }).limit).toBe(100);
 
 		const snapshot = eventsSubscribeParamsSchema.safeParse({
-			topics: ["narrafork.chapter.created"],
+			topics: ["narrafork.narrator.lifecycle"],
 			mode: "snapshot_live",
 		});
 		expect(snapshot.success).toBe(false);

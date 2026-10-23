@@ -1,19 +1,20 @@
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { formatOriginLabel } from "@shared/message-origin";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
+import { normalizeRunContext, type ScheduledRunContext } from "@shared/scheduled-task-run-context";
 import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
+import { narrators, projects, scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { nextCronRun } from "../lib/cron";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
-import { chapterCleanup } from "./chapter-cleanup";
 import { canWriteNarrator, type NarratorPrincipal } from "./narrator-acl";
 import { narratorService } from "./narrator-service";
 import { isLoopRunning, sendMessage } from "./narrator-session";
+import { canWriteProject } from "./project-acl";
 import { cleanupScheduledTaskNarrators } from "./scheduled-task-cleanup";
 
 type ScheduledTask = typeof scheduledTasks.$inferSelect;
@@ -48,10 +49,9 @@ export interface CreateScheduledTaskInput {
 	model?: string | null;
 	permissionMode?: string;
 	locale?: Locale;
-	runContext?: "standalone" | "chapter";
+	runContext?: ScheduledRunContext;
 	cwd?: string | null;
 	projectId?: string | null;
-	chapterId?: string | null;
 	narratorMode?: "new" | "reuse";
 	cleanupPolicy?: ScheduledTaskCleanupPolicy;
 	enabled?: boolean;
@@ -68,7 +68,7 @@ const runLock = new AsyncMutex();
  *
  * After {@link CIRCUIT_BREAKER_THRESHOLD} consecutive failures a task is
  * automatically disabled to prevent infinite retry noise (e.g. deleted
- * chapter, broken config). The counter resets on success or process restart.
+ * project, broken config). The counter resets on success or process restart.
  * An in-memory approach was chosen over a schema column because:
  *  - no migration required for a defensive heuristic,
  *  - a process restart naturally resets the breaker (giving the task another
@@ -141,8 +141,8 @@ export const scheduledTaskService = {
 
 	async create(input: CreateScheduledTaskInput): Promise<ScheduledTask> {
 		const runContext = input.runContext ?? "standalone";
-		if (runContext === "chapter" && (!input.projectId || !input.chapterId)) {
-			throw new ValidationError("chapter runContext requires projectId and chapterId");
+		if (runContext === "project" && !input.projectId) {
+			throw new ValidationError("project runContext requires projectId");
 		}
 		const nextRunAt = nextCronRun(input.cronExpr, input.timezone);
 		if (!nextRunAt) throw new ValidationError("Invalid cron expression");
@@ -162,7 +162,6 @@ export const scheduledTaskService = {
 			runContext,
 			cwd: input.cwd ?? null,
 			projectId: input.projectId ?? null,
-			chapterId: input.chapterId ?? null,
 			narratorMode: input.narratorMode ?? "new",
 			cleanupPolicy: input.cleanupPolicy ?? { mode: "none" },
 			reuseNarratorId: null,
@@ -183,11 +182,10 @@ export const scheduledTaskService = {
 		const existing = await this.get(id);
 		if (!existing) throw new NotFoundError("ScheduledTask", id);
 
-		const runContext = input.runContext ?? existing.runContext;
+		const runContext = input.runContext ?? normalizeRunContext(existing.runContext);
 		const projectId = input.projectId !== undefined ? input.projectId : existing.projectId;
-		const chapterId = input.chapterId !== undefined ? input.chapterId : existing.chapterId;
-		if (runContext === "chapter" && (!projectId || !chapterId)) {
-			throw new ValidationError("chapter runContext requires projectId and chapterId");
+		if (runContext === "project" && !projectId) {
+			throw new ValidationError("project runContext requires projectId");
 		}
 
 		const cronExpr = input.cronExpr ?? existing.cronExpr;
@@ -219,10 +217,9 @@ export const scheduledTaskService = {
 			...(input.model !== undefined && { model: input.model }),
 			...(input.permissionMode !== undefined && { permissionMode: input.permissionMode }),
 			...(input.locale !== undefined && { locale: input.locale }),
-			...(input.runContext !== undefined && { runContext: input.runContext }),
+			...((input.runContext !== undefined || existing.runContext !== runContext) && { runContext }),
 			...(input.cwd !== undefined && { cwd: input.cwd }),
 			...(input.projectId !== undefined && { projectId: input.projectId }),
-			...(input.chapterId !== undefined && { chapterId: input.chapterId }),
 			...(input.narratorMode !== undefined && { narratorMode: input.narratorMode }),
 			...(input.cleanupPolicy !== undefined && { cleanupPolicy: input.cleanupPolicy }),
 			...(input.enabled !== undefined && { enabled: input.enabled }),
@@ -316,7 +313,7 @@ export const scheduledTaskService = {
 					name: task.name,
 					status,
 					narratorId,
-					runContext: task.runContext,
+					runContext: normalizeRunContext(task.runContext),
 					permissionMode: task.permissionMode,
 					createdBy: task.createdBy,
 					manual: opts.manual === true,
@@ -352,7 +349,7 @@ export const scheduledTaskService = {
 					narratorId,
 					status,
 					error,
-					runContext: task.runContext,
+					runContext: normalizeRunContext(task.runContext),
 					manual: opts.manual === true,
 					startedAt,
 					finishedAt,
@@ -368,7 +365,7 @@ export const scheduledTaskService = {
 
 			// Circuit breaker: auto-disable after repeated consecutive failures.
 			// Prevents infinite retry noise from permanently broken tasks (e.g.
-			// deleted chapter, invalid config). Success resets the counter.
+			// deleted project, invalid config). Success resets the counter.
 			if (status === "failed") {
 				const count = (consecutiveFailures.get(id) ?? 0) + 1;
 				consecutiveFailures.set(id, count);
@@ -435,104 +432,63 @@ export const scheduledTaskService = {
 		let narratorId: string | null = null;
 		let newReuseId: string | null | undefined;
 
-		if (task.runContext === "chapter") {
-			if (!task.chapterId) {
-				return { status: "skipped", narratorId: null, error: "Missing chapterId" };
+		let contextProjectId: string | null = null;
+		let cwd = task.cwd ?? null;
+		if (normalizeRunContext(task.runContext) === "project") {
+			if (!task.projectId) {
+				return { status: "skipped", narratorId: null, error: "Missing projectId" };
 			}
-			// Wake the chapter if dormant so the worktree exists.
-			const chapter = await db.query.chapters.findFirst({
-				where: (c, { eq: e }) => e(c.id, task.chapterId as string),
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, task.projectId),
+				columns: { id: true, ownerUserId: true, visibility: true, gitPath: true },
 			});
-			if (!chapter) {
-				return { status: "skipped", narratorId: null, error: "Chapter not found" };
+			if (!project) {
+				return { status: "skipped", narratorId: null, error: "Project not found" };
 			}
-			// Merged is reported as a skip rather than passed to `wake`.
-			//
-			// `wake` refuses a merged chapter outright (waking one erased the merge
-			// coordinates while its changes stayed applied downstream, making `unmerge`
-			// unreachable). This call is not inside a try, so including "merged" here turned
-			// every tick into a thrown ValidationError: the run failed instead of skipping,
-			// and the recorded error was `wake`'s prose about unmerge — accurate for someone
-			// who clicked Wake, meaningless as the outcome of a schedule.
-			if (chapter.status === "merged") {
+			// A task must not keep launching sessions in a project its creator has since
+			// lost write access to.
+			if (!(await canWriteProject(project, await principalForTask(task)))) {
 				return {
 					status: "skipped",
 					narratorId: null,
-					error: "Chapter is merged; unmerge it before this task can run",
+					error: "Task creator no longer has write access to this project",
 				};
 			}
-			if (chapter.status === "dormant") {
-				await chapterCleanup.wake(task.chapterId);
-			} else if (chapter.status !== "active") {
-				return {
-					status: "skipped",
-					narratorId: null,
-					error: `Chapter is ${chapter.status}, cannot run`,
-				};
+			contextProjectId = project.id;
+			cwd ??= project.gitPath;
+		}
+
+		if (task.narratorMode === "reuse" && task.reuseNarratorId) {
+			// getById throws NotFoundError when the remembered narrator was deleted;
+			// swallow it so we fall back to creating a fresh narrator below instead
+			// of failing the run permanently.
+			const existing = await narratorService.getById(task.reuseNarratorId).catch(() => null);
+			// The remembered narrator may since have been transferred or un-shared, and a
+			// task must not keep writing to a session its creator can no longer reach.
+			// Falls through to a fresh one.
+			const mayReuse =
+				existing !== null && (await canWriteNarrator(existing, await principalForTask(task)));
+			if (existing && mayReuse && existing.status !== "archived") {
+				narratorId = existing.id;
 			}
-			// Reuse the chapter's existing primary narrator if present — but only if the
-			// task's creator may actually drive it. Otherwise a scheduled task would be a
-			// way to inject messages into someone else's private session.
-			const existing = await narratorService.listByChapter(task.chapterId);
-			const reusable = existing[0]
-				? await canWriteNarrator(existing[0], await principalForTask(task))
-				: false;
-			if (existing.length > 0 && reusable) {
-				narratorId = existing[0].id;
-			} else if (existing.length > 0) {
-				return {
-					status: "skipped",
-					narratorId: null,
-					error: "Task creator no longer has write access to this chapter's narrator",
-				};
-			} else {
-				const created = await narratorService.create({
-					chapterId: task.chapterId,
-					model: task.model ?? undefined,
-					systemPrompt: task.systemPrompt ?? undefined,
-					permissionMode: task.permissionMode,
-					startInPlanMode: false,
-					title: task.name,
-					extraTraits: ["scheduled"],
-					scheduledTaskId: task.id,
-					// Whoever configured the task owns the sessions it spawns — the same id
-					// already used as the run's message author and ACL principal.
-					ownerUserId: task.createdBy ?? null,
-				});
-				narratorId = created.id;
-			}
-		} else {
-			// standalone
-			if (task.narratorMode === "reuse" && task.reuseNarratorId) {
-				// getById throws NotFoundError when the remembered narrator was deleted;
-				// swallow it so we fall back to creating a fresh narrator below instead
-				// of failing the run permanently.
-				const existing = await narratorService.getById(task.reuseNarratorId).catch(() => null);
-				// Same guard as the chapter branch: the remembered narrator may since have
-				// been transferred or un-shared, and a task must not keep writing to a
-				// session its creator can no longer reach. Falls through to a fresh one.
-				const mayReuse =
-					existing !== null && (await canWriteNarrator(existing, await principalForTask(task)));
-				if (existing && mayReuse && existing.status !== "archived") {
-					narratorId = existing.id;
-				}
-			}
-			if (!narratorId) {
-				const created = await narratorService.create({
-					chapterId: null,
-					model: task.model ?? undefined,
-					systemPrompt: task.systemPrompt ?? undefined,
-					permissionMode: task.permissionMode,
-					startInPlanMode: false,
-					cwd: task.cwd ?? getHome(),
-					title: task.name,
-					extraTraits: ["scheduled"],
-					scheduledTaskId: task.id,
-					ownerUserId: task.createdBy ?? null,
-				});
-				narratorId = created.id;
-				if (task.narratorMode === "reuse") newReuseId = created.id;
-			}
+		}
+		if (!narratorId) {
+			const created = await narratorService.create({
+				contextProjectId,
+				model: task.model ?? undefined,
+				systemPrompt: task.systemPrompt ?? undefined,
+				permissionMode: task.permissionMode,
+				startInPlanMode: false,
+				cwd: cwd ?? getHome(),
+				title: task.name,
+				extraTraits: ["scheduled"],
+				scheduledTaskId: task.id,
+				// Whoever configured the task owns the sessions it spawns — the same id
+				// already used as the run's message author and ACL principal.
+				ownerUserId: task.createdBy ?? null,
+			});
+			narratorId = created.id;
+			if (task.narratorMode === "reuse") newReuseId = created.id;
 		}
 
 		if (!narratorId) {

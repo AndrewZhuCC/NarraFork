@@ -384,15 +384,39 @@ const eventContributionSchema = contributionBaseSchema
 	})
 	.strict();
 
+/** Host surfaces a plugin view may be mounted on. */
+export const VIEW_SURFACES = [
+	"workspace",
+	"director",
+	"focus",
+	"settings",
+	"provider-settings",
+] as const;
+export type ViewSurface = (typeof VIEW_SURFACES)[number];
+
+/**
+ * `graph` was a chapter node's dock on the story canvas, which was removed with chapters.
+ *
+ * A manifest published before that still parses: the name is accepted and dropped, so a
+ * view that listed only `graph` parses to an empty list and is mounted nowhere. The empty
+ * list therefore has to be accepted too — registries re-parse an already-parsed manifest,
+ * and rejecting the second pass would stop the whole plugin from loading.
+ */
+const RETIRED_VIEW_SURFACE = "graph";
+
+const viewSurfacesSchema = z
+	.array(z.union([z.enum(VIEW_SURFACES), z.literal(RETIRED_VIEW_SURFACE)]))
+	.max(VIEW_SURFACES.length + 1)
+	.transform((surfaces) =>
+		surfaces.filter((surface): surface is ViewSurface => surface !== RETIRED_VIEW_SURFACE),
+	);
+
 const viewContributionSchema = contributionBaseSchema
 	.extend({
 		title: textSchema(200),
 		entry: manifestPathSchema,
 		style: manifestPathSchema.optional(),
-		surfaces: z
-			.array(z.enum(["workspace", "director", "focus", "graph", "settings", "provider-settings"]))
-			.min(1)
-			.max(6),
+		surfaces: viewSurfacesSchema,
 		scope: z.enum(["workspace", "narrator", "project", "global"]),
 		/**
 		 * Provider this view configures. Required for (and only meaningful on) the

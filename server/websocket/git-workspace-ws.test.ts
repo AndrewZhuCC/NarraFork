@@ -182,12 +182,13 @@ test("ack contains server-resolved identity; notification rechecks principal", a
 	await notify?.(["worktree"]);
 	expect(frames.at(-1)?.type).toBe("git_workspace_changed");
 });
-test("denied subscription never acks; ambiguous target fails closed", async () => {
+test("denied subscription never acks; a target without a narrator fails closed", async () => {
 	denied = true;
 	await handleGitWorkspaceMessage(ws, message);
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
 	frames.length = 0;
-	await handleGitWorkspaceMessage(ws, { ...message, chapterId: "chapter" });
+	denied = false;
+	await handleGitWorkspaceMessage(ws, { ...message, narratorId: undefined });
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
 });
 test("revocation stops subscription without disclosing changes", async () => {

@@ -154,7 +154,7 @@ describe("integration kernel authorization evaluator", () => {
 		resource.context.boundScopes = [{ type: "global" }];
 		resource.grants[0].scope = { type: "global" };
 		resource.requirement.scope = { type: "global" };
-		resource.requirement.resource = { type: "chapter", id: "chapter-1" };
+		resource.requirement.resource = { type: "narrator", id: "narrator-1" };
 		expectDeniedAt(resource, "resource", "resource_type_mismatch");
 
 		const constraints = cloneInput();
@@ -181,22 +181,22 @@ describe("integration kernel authorization evaluator", () => {
 				id: "grant-1",
 				authorityId: "authority-1",
 				authorityRevision: 7,
-				capability: "chapter.read",
+				capability: "narrator.read",
 				scope: { type: "project", id: "project-1" },
 			},
 		];
 		input.requirement = {
-			operation: "chapter.get",
-			capability: "chapter.read",
-			scope: { type: "chapter", id: "chapter-1" },
-			resource: { type: "chapter", id: "chapter-1" },
+			operation: "narrator.get",
+			capability: "narrator.read",
+			scope: { type: "narrator", id: "narrator-1" },
+			resource: { type: "narrator", id: "narrator-1" },
 			deadlineAt: 200,
 		};
 		expectDeniedAt(input, "scope", "scope_relation_unknown");
 
 		input.relationResolver = {
 			resolve: (container, candidate) =>
-				container.type === "project" && candidate.type === "chapter" ? "contains" : "not_contains",
+				container.type === "project" && candidate.type === "narrator" ? "contains" : "not_contains",
 		};
 		expect(new AuthorizationEvaluator().evaluate(input)).toEqual({
 			allowed: true,

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -8,18 +8,37 @@ import { Hono } from "hono";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import { getDefaults, reloadSettings, saveSettings, settings } from "../../../server/lib/settings";
 import { settingsRoutes, updateSettingsSchema } from "../../../server/routes/settings";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
+
+const ADMIN_SUB = "context-window-test-admin";
 
 const snapshot = structuredClone(settings);
 const settingsPath = resolve(getNarraforkHome(), "settings.json");
 const original = readFileSync(settingsPath, "utf8");
+
+// `assertAdmin` authorizes against the live store role, not the token claim, so the
+// acting administrator must be reported as an admin by the session store.
+beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === ADMIN_SUB ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+});
 afterEach(() => {
+	setAuthStores(undefined);
 	saveSettings(structuredClone(snapshot));
 	writeFileSync(settingsPath, original);
 });
 
 const app = new Hono<{ Variables: { user: { sub: string; role: string } } }>();
 app.use("*", async (c, next) => {
-	c.set("user", { sub: "context-window-test-admin", role: "admin" });
+	c.set("user", { sub: ADMIN_SUB, role: "admin" });
 	await next();
 });
 app.onError((error, c) => c.json({ error: error.message }, 400));

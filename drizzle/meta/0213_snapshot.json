@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "79680360-7146-49e7-a87a-e45c3b904b2f",
+  "id": "d46b0e51-b83d-43ea-a8ea-b1b26def0a78",
   "prevId": "58a3cdfc-6942-482e-9bd2-adfbbd392ae7",
   "tables": {
     "acl_events": {
@@ -596,116 +596,6 @@
             "id"
           ],
           "onDelete": "set null",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "auth_sessions": {
-      "name": "auth_sessions",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "user_id": {
-          "name": "user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "token_hash": {
-          "name": "token_hash",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "token_version": {
-          "name": "token_version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "session_start": {
-          "name": "session_start",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "expires_at": {
-          "name": "expires_at",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "revoked_at": {
-          "name": "revoked_at",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_auth_sessions_token_hash": {
-          "name": "idx_auth_sessions_token_hash",
-          "columns": [
-            "token_hash"
-          ],
-          "isUnique": true
-        },
-        "idx_auth_sessions_user": {
-          "name": "idx_auth_sessions_user",
-          "columns": [
-            "user_id"
-          ],
-          "isUnique": false
-        },
-        "idx_auth_sessions_expires": {
-          "name": "idx_auth_sessions_expires",
-          "columns": [
-            "expires_at"
-          ],
-          "isUnique": false
-        },
-        "idx_auth_sessions_revoked": {
-          "name": "idx_auth_sessions_revoked",
-          "columns": [
-            "revoked_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "auth_sessions_user_id_users_id_fk": {
-          "name": "auth_sessions_user_id_users_id_fk",
-          "tableFrom": "auth_sessions",
-          "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },
@@ -9001,6 +8891,350 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
+    "narrator_block_assets": {
+      "name": "narrator_block_assets",
+      "columns": {
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "asset_id": {
+          "name": "asset_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_block_assets_asset": {
+          "name": "idx_block_assets_asset",
+          "columns": [
+            "asset_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "narrator_block_assets_block_id_narrator_blocks_id_fk": {
+          "name": "narrator_block_assets_block_id_narrator_blocks_id_fk",
+          "tableFrom": "narrator_block_assets",
+          "tableTo": "narrator_blocks",
+          "columnsFrom": [
+            "block_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "narrator_block_assets_block_id_asset_id_pk": {
+          "columns": [
+            "block_id",
+            "asset_id"
+          ],
+          "name": "narrator_block_assets_block_id_asset_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "ck_block_assets_role": {
+          "name": "ck_block_assets_role",
+          "value": "\"narrator_block_assets\".\"role\" in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')"
+        }
+      }
+    },
+    "narrator_block_sync_queue": {
+      "name": "narrator_block_sync_queue",
+      "columns": {
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "narrator_block_sync_queue_message_id_narrator_messages_id_fk": {
+          "name": "narrator_block_sync_queue_message_id_narrator_messages_id_fk",
+          "tableFrom": "narrator_block_sync_queue",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "narrator_blocks": {
+      "name": "narrator_blocks",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "subtype": {
+          "name": "subtype",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "phase": {
+          "name": "phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'done'"
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "wire_id": {
+          "name": "wire_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "attempt_id": {
+          "name": "attempt_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "origin_block_id": {
+          "name": "origin_block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "model_chars": {
+          "name": "model_chars",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "byte_size": {
+          "name": "byte_size",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "model_text": {
+          "name": "model_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "payload": {
+          "name": "payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "provider_meta": {
+          "name": "provider_meta",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "original_payload": {
+          "name": "original_payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_blocks_message_ordinal": {
+          "name": "idx_blocks_message_ordinal",
+          "columns": [
+            "message_id",
+            "ordinal"
+          ],
+          "isUnique": true
+        },
+        "idx_blocks_single": {
+          "name": "idx_blocks_single",
+          "columns": [
+            "message_id"
+          ],
+          "isUnique": true,
+          "where": "\"narrator_blocks\".\"kind\" in ('input', 'context')"
+        },
+        "idx_blocks_open": {
+          "name": "idx_blocks_open",
+          "columns": [
+            "message_id"
+          ],
+          "isUnique": false,
+          "where": "\"narrator_blocks\".\"phase\" = 'open'"
+        },
+        "idx_blocks_origin": {
+          "name": "idx_blocks_origin",
+          "columns": [
+            "origin_block_id"
+          ],
+          "isUnique": false,
+          "where": "\"narrator_blocks\".\"origin_block_id\" is not null"
+        },
+        "idx_blocks_context_subtype": {
+          "name": "idx_blocks_context_subtype",
+          "columns": [
+            "subtype"
+          ],
+          "isUnique": false,
+          "where": "\"narrator_blocks\".\"kind\" = 'context'"
+        },
+        "idx_blocks_tool_wire": {
+          "name": "idx_blocks_tool_wire",
+          "columns": [
+            "wire_id"
+          ],
+          "isUnique": false,
+          "where": "\"narrator_blocks\".\"kind\" = 'tool'"
+        }
+      },
+      "foreignKeys": {
+        "narrator_blocks_message_id_narrator_messages_id_fk": {
+          "name": "narrator_blocks_message_id_narrator_messages_id_fk",
+          "tableFrom": "narrator_blocks",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "ck_blocks_kind": {
+          "name": "ck_blocks_kind",
+          "value": "\"narrator_blocks\".\"kind\" in ('input', 'output', 'reasoning', 'tool', 'context')"
+        },
+        "ck_blocks_phase": {
+          "name": "ck_blocks_phase",
+          "value": "\"narrator_blocks\".\"phase\" in ('open', 'done', 'aborted', 'failed')"
+        },
+        "ck_blocks_subtype": {
+          "name": "ck_blocks_subtype",
+          "value": "(\"narrator_blocks\".\"subtype\" is not null) = (\"narrator_blocks\".\"kind\" in ('tool', 'context'))"
+        },
+        "ck_blocks_aborted": {
+          "name": "ck_blocks_aborted",
+          "value": "\"narrator_blocks\".\"phase\" <> 'aborted' or \"narrator_blocks\".\"kind\" in ('output', 'reasoning')"
+        },
+        "ck_blocks_input_done": {
+          "name": "ck_blocks_input_done",
+          "value": "\"narrator_blocks\".\"phase\" = 'done' or \"narrator_blocks\".\"kind\" <> 'input'"
+        },
+        "ck_blocks_model_text": {
+          "name": "ck_blocks_model_text",
+          "value": "\"narrator_blocks\".\"model_text\" is null or \"narrator_blocks\".\"kind\" in ('input', 'context')"
+        },
+        "ck_blocks_provider_meta": {
+          "name": "ck_blocks_provider_meta",
+          "value": "\"narrator_blocks\".\"provider_meta\" is null or \"narrator_blocks\".\"kind\" in ('output', 'reasoning', 'tool')"
+        },
+        "ck_blocks_wire_id": {
+          "name": "ck_blocks_wire_id",
+          "value": "(\"narrator_blocks\".\"wire_id\" is not null) = (\"narrator_blocks\".\"kind\" = 'tool')"
+        },
+        "ck_blocks_original_payload": {
+          "name": "ck_blocks_original_payload",
+          "value": "\"narrator_blocks\".\"original_payload\" is null or \"narrator_blocks\".\"kind\" = 'output'"
+        }
+      }
+    },
     "narrator_buffered_messages": {
       "name": "narrator_buffered_messages",
       "columns": {
@@ -10400,6 +10634,50 @@
             "type": "virtual"
           }
         },
+        "body_format": {
+          "name": "body_format",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
+        "turn_id": {
+          "name": "turn_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "author_narrator_id": {
+          "name": "author_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "cause_block_id": {
+          "name": "cause_block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "provider_response_id": {
+          "name": "provider_response_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "body_bytes": {
+          "name": "body_bytes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -10455,6 +10733,14 @@
             "edited_by"
           ],
           "isUnique": false
+        },
+        "idx_messages_author": {
+          "name": "idx_messages_author",
+          "columns": [
+            "author_narrator_id"
+          ],
+          "isUnique": false,
+          "where": "\"author_narrator_id\" IS NOT NULL"
         },
         "idx_messages_compact_pending": {
           "name": "idx_messages_compact_pending",
@@ -11028,6 +11314,44 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
+    "narrator_text_snapshots": {
+      "name": "narrator_text_snapshots",
+      "columns": {
+        "sha256": {
+          "name": "sha256",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "text": {
+          "name": "text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "byte_size": {
+          "name": "byte_size",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "narrator_tool_calls": {
       "name": "narrator_tool_calls",
       "columns": {
@@ -11460,6 +11784,21 @@
           "notNull": false,
           "autoincrement": false
         },
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "is_internal": {
+          "name": "is_internal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -11473,6 +11812,13 @@
           "name": "idx_toolcalls_message",
           "columns": [
             "message_id"
+          ],
+          "isUnique": false
+        },
+        "idx_toolcalls_block": {
+          "name": "idx_toolcalls_block",
+          "columns": [
+            "block_id"
           ],
           "isUnique": false
         },
@@ -11608,6 +11954,19 @@
           "tableTo": "file_change_operations",
           "columnsFrom": [
             "file_change_operation_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrator_tool_calls_block_id_narrator_blocks_id_fk": {
+          "name": "narrator_tool_calls_block_id_narrator_blocks_id_fk",
+          "tableFrom": "narrator_tool_calls",
+          "tableTo": "narrator_blocks",
+          "columnsFrom": [
+            "block_id"
           ],
           "columnsTo": [
             "id"
@@ -11779,6 +12138,116 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
+    },
+    "narrator_turns": {
+      "name": "narrator_turns",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "trigger_message_id": {
+          "name": "trigger_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ended_at": {
+          "name": "ended_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "stop_reason": {
+          "name": "stop_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "step_count": {
+          "name": "step_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "tool_call_count": {
+          "name": "tool_call_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "usage_json": {
+          "name": "usage_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_turns_narrator_started": {
+          "name": "idx_turns_narrator_started",
+          "columns": [
+            "narrator_id",
+            "started_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "narrator_turns_narrator_id_narrators_id_fk": {
+          "name": "narrator_turns_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_turns",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "ck_turns_status": {
+          "name": "ck_turns_status",
+          "value": "\"narrator_turns\".\"status\" in ('running', 'completed', 'interrupted', 'failed')"
+        }
+      }
     },
     "narrator_whitelist_cmds": {
       "name": "narrator_whitelist_cmds",

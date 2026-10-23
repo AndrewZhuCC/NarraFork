@@ -10,6 +10,7 @@
  * dedicated connection via `useTerminalWS`.
  */
 
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import {
@@ -17,6 +18,7 @@ import {
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import { getToken } from "./api";
+import { decodeBlockFrame } from "./block-protocol";
 import { observePageLifecycle } from "./page-lifecycle";
 import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
 import { buildWsUrl, safeCloseWs } from "./ws";
@@ -93,12 +95,11 @@ interface ListenerEntry {
 
 type ConnectionChangeCallback = (connected: boolean, isReconnect: boolean) => void;
 
-type MinimalTreeMessage = {
+type MinimalTreeMessage = MessageBodySource & {
 	id?: unknown;
 	narratorId?: unknown;
 	parentToolUseId?: unknown;
 	toolCalls?: unknown;
-	contentJson?: unknown;
 };
 
 /**
@@ -169,12 +170,10 @@ function extractToolUseIds(message: MinimalTreeMessage): string[] {
 			}
 		}
 	}
-	if (Array.isArray(message.contentJson)) {
-		for (const block of message.contentJson) {
-			if (block && typeof block === "object") {
-				const record = block as { type?: unknown; id?: unknown };
-				if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
-			}
+	for (const block of messageBody(message)) {
+		if (block && typeof block === "object") {
+			const record = block as { type?: unknown; id?: unknown };
+			if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
 		}
 	}
 	return [...ids];
@@ -1559,7 +1558,8 @@ export class NarratorWSManager {
 					return;
 				}
 				dispatchTokenDanceRecovery(data);
-				this._dispatch(data);
+				// Block-keyed (v2) frames reach listeners as the v1 frames they stand for.
+				for (const frame of decodeBlockFrame(data)) this._dispatch(frame);
 			} catch {
 				if (import.meta.env.DEV) {
 					console.warn("[NarratorWSManager] Failed to parse WS message");

@@ -1,4 +1,4 @@
-import { type AgentConfig, agentLoop } from "../lib/agent";
+import { type AgentConfig, type AgentLoopHistory, agentLoop } from "../lib/agent";
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -13,8 +13,9 @@ import {
 export interface ExecuteLoopOptions {
 	config: AgentConfig;
 	userText: string;
-	history: unknown[];
-	trailingToolResults?: unknown[];
+	history: AgentLoopHistory;
+	/** The history ends with tool results the model has not answered yet. */
+	startedWithToolResults?: boolean;
 	images?: Array<{ format: string; base64: string }>;
 	eventContext: EventHandlerContext;
 	hooks?: EventHooks;
@@ -132,14 +133,14 @@ export async function executeAgentLoop(
 	options: ExecuteLoopOptions,
 	sourceOptions?: ExecuteLoopSourceOptions,
 ): Promise<ExecuteLoopResult> {
-	const { config, userText, history, trailingToolResults, images, eventContext, hooks } = options;
+	const { config, userText, history, images, eventContext, hooks } = options;
+	const startedWithToolResults = options.startedWithToolResults ?? false;
 	config.requireToolCallBinding = true;
 	eventContext.requireToolCallBinding = true;
 	// Read the active pass's mutable default only when a new text block starts.
 	// Rebind per pass: a reused event context must not close over an older config.
 	eventContext.getFileReferenceContext = () => getAgentFileReferenceContext(config);
-	const eventSource =
-		sourceOptions?.eventSource ?? agentLoop(config, userText, history, trailingToolResults, images);
+	const eventSource = sourceOptions?.eventSource ?? agentLoop(config, userText, history, images);
 	const processEventFn = sourceOptions?.processEventFn ?? processEvent;
 
 	let finalText = "";
@@ -161,7 +162,6 @@ export async function executeAgentLoop(
 	let interruptionError: string | undefined;
 	let interruptionDiagnostics: ApiRequestDiagnostics | undefined;
 	let maxTurnsExceeded = false;
-	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
 	let lastAssistantHadToolUses = false;
 	let hadToolUses = false;

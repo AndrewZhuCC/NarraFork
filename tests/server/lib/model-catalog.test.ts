@@ -43,6 +43,8 @@ import {
 } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
 import { modelCatalogRoutes } from "../../../server/routes/model-catalog";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 import { decimalValue } from "../../../shared/model-catalog/card";
 import type { ModelCardMutation } from "../../../shared/model-catalog/card-local";
 import * as cardResolvers from "../../../shared/model-catalog/card-resolver";
@@ -66,8 +68,18 @@ beforeEach(() => {
 	if (typeof window !== "number") throw new Error("Expected GPT-5.5 preset context window");
 	presetContextWindow = window;
 	restoreVersion = undefined;
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === "catalog-admin" ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
 });
 afterEach(() => {
+	setAuthStores(undefined);
 	globalThis.fetch = originalFetch;
 	if (restoreVersion && getModelCardSnapshot().catalog.catalogVersion !== restoreVersion)
 		rollbackModelCatalog(restoreVersion);
@@ -95,8 +107,11 @@ function mutate(value: Omit<Extract<ModelCardMutation, { action: "patch" }>, "ba
 }
 function app(role: "admin" | "user" = "admin") {
 	const app = new Hono();
+	// Distinct subs per role: assertAdmin authorizes against the live store role
+	// (not the token claim), and the seam below maps each sub to its role.
+	const sub = role === "admin" ? "catalog-admin" : "catalog-user";
 	app.use("*", async (c, next) => {
-		c.set("user", { sub: "catalog-test", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	app.route("/api/model-catalog", modelCatalogRoutes);

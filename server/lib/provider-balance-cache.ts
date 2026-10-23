@@ -1,9 +1,17 @@
-import type { ProviderBalanceAdapter, ProviderBalanceSnapshot } from "@shared/provider-balance";
+import type {
+	ProviderBalanceAdapter,
+	ProviderBalanceData,
+	ProviderBalanceSnapshot,
+} from "@shared/provider-balance";
 import { isDeepSeekCustomApiProvider } from "./deepseek-balance-cache";
 import { isKimiCustomApiProvider } from "./kimi-usage-cache";
 import { logger } from "./logger";
 import type { outboundFetch } from "./net/outbound-fetch";
 import { isOpencodeCustomApiProvider } from "./opencode-usage-cache";
+import {
+	createPersistedCredentialCache,
+	type PersistedCredentialCache,
+} from "./persisted-credential-cache";
 import {
 	buildBalanceRoots,
 	probeProviderBalance,
@@ -62,9 +70,61 @@ function connectionIdentity(config: CustomApiProviderConfig, globalProxy: unknow
 	]);
 }
 
+/** What survives a restart: the discovery result and the last good balance. */
+export interface PersistedProviderBalance {
+	status: "supported" | "unsupported";
+	endpoint?: { adapter: ProviderBalanceAdapter; root: string };
+	balance: ProviderBalanceData | null;
+	fetchedAt: number;
+	attemptedAt: number;
+}
+
+export function parsePersistedProviderBalance(raw: unknown): PersistedProviderBalance | null {
+	if (!raw || typeof raw !== "object") return null;
+	const value = raw as Record<string, unknown>;
+	if (value.status !== "supported" && value.status !== "unsupported") return null;
+	if (typeof value.fetchedAt !== "number" || typeof value.attemptedAt !== "number") return null;
+	let endpoint: PersistedProviderBalance["endpoint"];
+	if (value.endpoint && typeof value.endpoint === "object") {
+		const e = value.endpoint as Record<string, unknown>;
+		if ((e.adapter === "sub2api" || e.adapter === "new-api") && typeof e.root === "string") {
+			endpoint = { adapter: e.adapter, root: e.root };
+		}
+	}
+	if (value.status === "supported" && !endpoint) return null;
+	let balance: ProviderBalanceData | null = null;
+	if (value.balance && typeof value.balance === "object") {
+		const b = value.balance as Record<string, unknown>;
+		if (
+			(b.scope === "wallet" || b.scope === "key" || b.scope === "subscription") &&
+			typeof b.unlimited === "boolean" &&
+			Array.isArray(b.amounts)
+		) {
+			const amounts = b.amounts.filter(
+				(a): a is ProviderBalanceData["amounts"][number] =>
+					!!a &&
+					typeof a === "object" &&
+					typeof (a as { unit?: unknown }).unit === "string" &&
+					((a as { remaining?: unknown }).remaining === null ||
+						typeof (a as { remaining?: unknown }).remaining === "number"),
+			);
+			balance = { scope: b.scope, unlimited: b.unlimited, amounts };
+		}
+	}
+	return {
+		status: value.status,
+		...(endpoint ? { endpoint } : {}),
+		balance,
+		fetchedAt: value.fetchedAt,
+		attemptedAt: value.attemptedAt,
+	};
+}
+
 interface CacheOptions {
 	providers: () => CustomApiProviderConfig[];
 	globalProxy: () => unknown;
+	/** Survive restarts; values are only restored under the same connection identity. */
+	persistence?: PersistedCredentialCache<PersistedProviderBalance>;
 	fetch?: typeof outboundFetch;
 	now?: () => number;
 	requestTimeoutMs?: number;
@@ -72,7 +132,7 @@ interface CacheOptions {
 	maxQueued?: number;
 }
 
-/** Memory-only, bounded background jobs. Read paths never await upstream IO. */
+/** Bounded background jobs. Read paths never await upstream IO. */
 export class ProviderBalanceCache {
 	private entries = new Map<string, Entry>();
 	private queue: Task[] = [];
@@ -96,31 +156,63 @@ export class ProviderBalanceCache {
 			if (!config || entry.identity !== connectionIdentity(config, globalProxy)) {
 				this.entries.delete(id);
 				this.cancel(entry);
+				if (!config) this.options.persistence?.remove(id);
 			}
 		}
 		for (const [id, config] of providers) {
 			if (this.entries.has(id)) continue;
-			let valid = true;
+			let roots: string[] | null = null;
 			try {
-				buildBalanceRoots(config.baseUrl);
+				roots = buildBalanceRoots(config.baseUrl);
 			} catch {
-				valid = false;
+				roots = null;
 			}
+			const identity = connectionIdentity(config, globalProxy);
+			const restored = roots ? this.options.persistence?.restore(id, identity) : undefined;
+			// A restored endpoint must still be one this base URL would probe.
+			const usable =
+				restored && (!restored.endpoint || roots?.includes(restored.endpoint.root))
+					? restored
+					: undefined;
 			this.entries.set(id, {
 				id,
-				identity: connectionIdentity(config, globalProxy),
+				identity,
 				config: structuredClone(config),
 				nextManualAt: 0,
-				snapshot: {
-					generation: crypto.randomUUID(),
-					status: valid ? "pending" : "error",
-					balance: null,
-					fetchedAt: 0,
-					attemptedAt: 0,
-					error: valid ? null : "invalid_configuration",
-				},
+				...(usable?.endpoint ? { endpoint: usable.endpoint } : {}),
+				snapshot: usable
+					? {
+							generation: crypto.randomUUID(),
+							status: usable.status,
+							...(usable.endpoint ? { adapter: usable.endpoint.adapter } : {}),
+							balance: usable.balance,
+							fetchedAt: usable.fetchedAt,
+							attemptedAt: usable.attemptedAt,
+							error: null,
+						}
+					: {
+							generation: crypto.randomUUID(),
+							status: roots ? "pending" : "error",
+							balance: null,
+							fetchedAt: 0,
+							attemptedAt: 0,
+							error: roots ? null : "invalid_configuration",
+						},
 			});
 		}
+	}
+
+	private persist(entry: Entry): void {
+		const { status, balance, fetchedAt, attemptedAt } = entry.snapshot;
+		if (status !== "supported" && status !== "unsupported") return;
+		if (status === "supported" && !entry.endpoint) return;
+		this.options.persistence?.save(entry.id, entry.identity, {
+			status,
+			...(entry.endpoint ? { endpoint: entry.endpoint } : {}),
+			balance,
+			fetchedAt,
+			attemptedAt,
+		});
 	}
 
 	private cancel(entry: Entry): void {
@@ -284,6 +376,7 @@ export class ProviderBalanceCache {
 		} finally {
 			clearTimeout(timer);
 			if (entry.task === task) entry.task = undefined;
+			if (this.entries.get(entry.id) === entry) this.persist(entry);
 			const elapsed = performance.now() - startedAt;
 			if (elapsed >= 2_000) {
 				const safeId = /^[\w-]{1,64}$/.test(entry.id) ? entry.id : "custom-provider";
@@ -299,6 +392,10 @@ export class ProviderBalanceCache {
 export const providerBalanceCache = new ProviderBalanceCache({
 	providers: () => settings.customApiProviders ?? [],
 	globalProxy: () => settings.proxy,
+	persistence: createPersistedCredentialCache(
+		"provider-balances.json",
+		parsePersistedProviderBalance,
+	),
 });
 
 export const getProviderBalanceGenerations = () => providerBalanceCache.generations();

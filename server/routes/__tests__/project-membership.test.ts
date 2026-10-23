@@ -26,7 +26,7 @@ process.env.NARRAFORK_HOME = testHome;
 process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
 const { projectRoutes } = await import("../projects");
-const { chapterRoutes } = await import("../chapters");
+const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
 const { knowledgeCollections, projects, users } = await import("../../db/schema");
 const { eventBus } = await import("../../lib/event-bus");
@@ -60,7 +60,7 @@ function appAs(userId: string, role: "admin" | "user" = "user") {
 		return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
 	});
 	app.route("/projects", projectRoutes);
-	app.route("/chapters", chapterRoutes);
+	app.route("/narrators", narratorRoutes);
 	return app;
 }
 
@@ -158,7 +158,7 @@ describe("who may change membership", () => {
 });
 
 describe("tiers stay distinct", () => {
-	test("a read member cannot create a chapter, a write member can be added to do so", async () => {
+	test("a read member cannot start a session in the project", async () => {
 		const id = await makeProject();
 		await request(OWNER, `/projects/${id}/members`, {
 			method: "POST",
@@ -167,9 +167,9 @@ describe("tiers stay distinct", () => {
 
 		expect(
 			(
-				await request(READER, "/chapters", {
+				await request(READER, "/narrators", {
 					method: "POST",
-					body: { projectId: id, title: "nope" },
+					body: { contextProjectId: id, title: "nope" },
 				})
 			).status,
 		).toBe(404);
@@ -181,6 +181,15 @@ describe("tiers stay distinct", () => {
 			method: "POST",
 			body: { userIds: [WRITER], role: "write" },
 		});
+		// The write tier really can start a session, so the refusal below is the downgrade.
+		expect(
+			(
+				await request(WRITER, "/narrators", {
+					method: "POST",
+					body: { contextProjectId: id, title: "allowed" },
+				})
+			).status,
+		).toBe(201);
 		// Downgrade to read.
 		await request(OWNER, `/projects/${id}/members`, {
 			method: "POST",
@@ -193,12 +202,12 @@ describe("tiers stay distinct", () => {
 		// taking effect.
 		expect(entry.role).toBe("read");
 		expect(access.members.filter((m: { userId: string }) => m.userId === WRITER)).toHaveLength(1);
-		// And the downgrade is real: they can no longer create chapters.
+		// And the downgrade is real: they can no longer start sessions in it.
 		expect(
 			(
-				await request(WRITER, "/chapters", {
+				await request(WRITER, "/narrators", {
 					method: "POST",
-					body: { projectId: id, title: "nope" },
+					body: { contextProjectId: id, title: "nope" },
 				})
 			).status,
 		).toBe(404);
@@ -278,9 +287,9 @@ describe("visibility", () => {
 		expect((await request(OUTSIDER, `/projects/${id}`)).status).toBe(200);
 		expect(
 			(
-				await request(OUTSIDER, "/chapters", {
+				await request(OUTSIDER, "/narrators", {
 					method: "POST",
-					body: { projectId: id, title: "nope" },
+					body: { contextProjectId: id, title: "nope" },
 				})
 			).status,
 		).toBe(404);

@@ -8,7 +8,7 @@ import {
 } from "@server/services/plugin-capability-broker";
 
 const capability = "query.read.projects" as const;
-const otherCapability = "query.read.chapters" as const;
+const otherCapability = "query.read.narrators" as const;
 const now = new Date("2026-07-16T12:00:00.000Z");
 
 const principal = {
@@ -212,8 +212,8 @@ describe("CapabilityBroker authorization", () => {
 			{
 				scopeResolver: {
 					belongs: (child: { type: string; id: string }, parent: { type: string; id: string }) =>
-						child.type === "chapter" &&
-						child.id === "chapter-1" &&
+						child.type === "narrator" &&
+						child.id === "narrator-1" &&
 						parent.type === "project" &&
 						parent.id === "project-1",
 				},
@@ -222,7 +222,7 @@ describe("CapabilityBroker authorization", () => {
 		const child = await ownership.authorize({
 			context: context({ scope: {} }),
 			capability,
-			resource: { type: "chapter", id: "chapter-1" },
+			resource: { type: "narrator", id: "narrator-1" },
 		});
 		expect(child.allowed).toBe(true);
 	});
@@ -274,7 +274,7 @@ describe("CapabilityBroker authorization", () => {
 		const denied = await constrained.authorize({
 			context: context(),
 			capability,
-			constraints: { topic: "narrafork.chapter.created" },
+			constraints: { topic: "narrafork.narrator.lifecycle" },
 		});
 		expect(denied.allowed).toBe(false);
 		if (!denied.allowed) expect(denied.error.reason).toBe("CONSTRAINT_MISMATCH");

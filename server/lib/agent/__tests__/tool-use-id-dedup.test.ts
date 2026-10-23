@@ -2,15 +2,10 @@ import { describe, expect, test } from "bun:test";
 import type { DbMessage } from "../provider";
 import {
 	allocateUniqueToolUseId,
-	applyToolUseIdRemap,
-	collectToolUseIdsFromHistory,
 	isWireSafeToolUseId,
-	remapToolResultIds,
-	reserveUniqueToolUseIds,
 	toWireSafeToolUseId,
 	uniquifyDbMessageToolUseIds,
 } from "../tool-use-id-dedup";
-import type { AgentToolUse } from "../types";
 
 /** The pattern NUG validates tool ids against. */
 const WIRE_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -272,151 +267,5 @@ describe("toWireSafeToolUseId", () => {
 		const id = "c".repeat(64);
 		expect(isWireSafeToolUseId(id)).toBe(true);
 		expect(toWireSafeToolUseId(id)).toBe(id);
-	});
-});
-
-describe("collectToolUseIdsFromHistory", () => {
-	test("识别 Anthropic 形态的 tool_use 与 tool_result", () => {
-		const history = [
-			{
-				role: "assistant",
-				content: [{ type: "tool_use", id: "call_go_0", name: "Bash", input: {} }],
-			},
-			{
-				role: "user",
-				content: [{ type: "tool_result", tool_use_id: "call_go_0", content: "ok" }],
-			},
-		];
-		expect(collectToolUseIdsFromHistory(history)).toEqual(new Set(["call_go_0"]));
-	});
-
-	test("识别 OpenAI completions / responses 形态", () => {
-		const history = [
-			{
-				role: "assistant",
-				content: "",
-				tool_calls: [
-					{ id: "call_a", type: "function", function: { name: "Bash", arguments: "{}" } },
-				],
-			},
-			{ role: "tool", tool_call_id: "call_a", content: "ok" },
-			{ type: "function_call", call_id: "call_b", name: "Bash", arguments: "{}" },
-			{ type: "function_call_output", call_id: "call_b", output: "ok" },
-		];
-		expect(collectToolUseIdsFromHistory(history)).toEqual(new Set(["call_a", "call_b"]));
-	});
-
-	test("识别任意嵌套形态", () => {
-		const history = [
-			{
-				envelope: {
-					content: "",
-					toolUses: [{ toolUseId: "call_nug", name: "Bash", input: {} }],
-				},
-			},
-			{
-				wrapper: {
-					content: "",
-					context: { toolResults: [{ toolUseId: "call_nug", status: "success" }] },
-				},
-			},
-		];
-		expect(collectToolUseIdsFromHistory(history)).toEqual(new Set(["call_nug"]));
-	});
-
-	test("普通消息 ID 不会被误认为工具 ID", () => {
-		const history = [{ role: "assistant", id: "msg_123", content: [{ type: "text", text: "hi" }] }];
-		expect(collectToolUseIdsFromHistory(history).has("msg_123")).toBe(false);
-	});
-});
-
-describe("reserveUniqueToolUseIds + remapToolResultIds", () => {
-	function toolUse(id: string): AgentToolUse {
-		return { toolUseId: id, name: "Bash", input: {} };
-	}
-
-	test("与历史冲突的 ID 被改名，未冲突的保持原样", () => {
-		const used = new Set(["call_go_0"]);
-		const toolUses = [toolUse("call_go_0"), toolUse("call_fresh")];
-		const remap = reserveUniqueToolUseIds(toolUses, used);
-
-		expect(remap.size).toBe(1);
-		expect(remap.get("call_go_0")).toBeDefined();
-		expect(remap.has("call_fresh")).toBe(false);
-		// The live objects keep the provider's id — persistence/UI/permissions use it.
-		expect(toolUses.map((tu) => tu.toolUseId)).toEqual(["call_go_0", "call_fresh"]);
-		// Both ids (renamed and fresh) are now reserved against later turns.
-		expect(used.has("call_fresh")).toBe(true);
-		expect(used.has(remap.get("call_go_0") as string)).toBe(true);
-	});
-
-	test("applyToolUseIdRemap 产生历史用副本而不改动原对象", () => {
-		const used = new Set(["call_go_0"]);
-		const toolUses = [toolUse("call_go_0")];
-		const remap = reserveUniqueToolUseIds(toolUses, used);
-		const forHistory = applyToolUseIdRemap(toolUses, remap);
-		const renamed = remap.get("call_go_0") as string;
-
-		expect(forHistory[0].toolUseId).toBe(renamed);
-		expect(toolUses[0].toolUseId).toBe("call_go_0");
-	});
-
-	test("工具结果 ID 跟随改名，保持 tool_use ↔ tool_result 配对", () => {
-		const used = new Set(["call_go_0"]);
-		const toolUses = [toolUse("call_go_0")];
-		const remap = reserveUniqueToolUseIds(toolUses, used);
-		const renamed = remap.get("call_go_0") as string;
-
-		const anthropicResults = [{ type: "tool_result", tool_use_id: "call_go_0", content: "ok" }];
-		const oaiResults = [{ role: "tool", tool_call_id: "call_go_0", content: "ok" }];
-		const responsesResults = [{ type: "function_call_output", call_id: "call_go_0", output: "ok" }];
-		const nestedResults = [{ toolUseId: "call_go_0", status: "success", content: [] }];
-
-		expect(remapToolResultIds(anthropicResults, remap)).toBe(1);
-		expect(remapToolResultIds(oaiResults, remap)).toBe(1);
-		expect(remapToolResultIds(responsesResults, remap)).toBe(1);
-		expect(remapToolResultIds(nestedResults, remap)).toBe(1);
-
-		expect(anthropicResults[0].tool_use_id).toBe(renamed);
-		expect(oaiResults[0].tool_call_id).toBe(renamed);
-		expect(responsesResults[0].call_id).toBe(renamed);
-		expect(nestedResults[0].toolUseId).toBe(renamed);
-	});
-
-	test("空 remap 时不触碰结果", () => {
-		const results = [{ type: "tool_result", tool_use_id: "call_a", content: "ok" }];
-		expect(remapToolResultIds(results, new Map())).toBe(0);
-		expect(results[0].tool_use_id).toBe("call_a");
-	});
-
-	test("含非法字符的 ID 即使未与历史冲突也被改写", () => {
-		const used = new Set<string>();
-		const toolUses = [toolUse("Bash:0")];
-		const remap = reserveUniqueToolUseIds(toolUses, used);
-
-		expect(remap.get("Bash:0")).toBe("Bash_0");
-		expect(used.has("Bash_0")).toBe(true);
-		// Live objects keep the provider's id — persistence/UI/permissions key off it.
-		expect(toolUses[0].toolUseId).toBe("Bash:0");
-	});
-
-	test("净化后的 ID 与历史已有 ID 冲突时再改名", () => {
-		const used = new Set(["Bash_0"]);
-		const remap = reserveUniqueToolUseIds([toolUse("Bash:0")], used);
-		const next = remap.get("Bash:0") as string;
-
-		expect(next).not.toBe("Bash_0");
-		expect(next).toMatch(WIRE_PATTERN);
-	});
-
-	test("净化后的工具结果 ID 跟随改名，配对不断", () => {
-		const used = new Set<string>();
-		const remap = reserveUniqueToolUseIds([toolUse("Bash:0")], used);
-		const renamed = remap.get("Bash:0") as string;
-
-		const nestedResults = [{ toolUseId: "Bash:0", status: "success", content: [] }];
-		expect(remapToolResultIds(nestedResults, remap)).toBe(1);
-		expect(nestedResults[0].toolUseId).toBe(renamed);
-		expect(renamed).toMatch(WIRE_PATTERN);
 	});
 });

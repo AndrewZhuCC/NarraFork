@@ -1,11 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import {
-	batchMergeSchema,
 	createProjectSchema,
-	createReviewSchema,
 	createScheduledTaskSchema,
-	forkChapterSchema,
-	mergeChapterSchema,
+	localeSchema,
 	registerSchema,
 	updateUserPreferencesSchema,
 } from "../../../server/lib/validators";
@@ -68,58 +65,11 @@ describe("registerSchema", () => {
 	});
 });
 
-describe("forkChapterSchema", () => {
-	it("accepts valid fork input", () => {
-		const result = forkChapterSchema.safeParse({
-			title: "Experiment",
-			inheritMode: "compressed",
-		});
-		expect(result.success).toBe(true);
-	});
-
-	it("rejects invalid inherit mode", () => {
-		const result = forkChapterSchema.safeParse({
-			title: "Test",
-			inheritMode: "invalid",
-		});
-		expect(result.success).toBe(false);
-	});
-});
-
-describe("mergeChapterSchema", () => {
-	it("accepts valid merge input", () => {
-		const result = mergeChapterSchema.safeParse({
-			targetChapterId: "abc",
-			strategy: "squash",
-		});
-		expect(result.success).toBe(true);
-	});
-
-	it("rejects invalid strategy", () => {
-		const result = mergeChapterSchema.safeParse({
-			targetChapterId: "abc",
-			strategy: "rebase",
-		});
-		expect(result.success).toBe(false);
-	});
-});
-
-describe("batchMergeSchema", () => {
-	it("requires at least one source chapter", () => {
-		const result = batchMergeSchema.safeParse({
-			baseChapterId: "a",
-			sourceChapterIds: [],
-			title: "Merge",
-		});
-		expect(result.success).toBe(false);
-	});
-});
-
 describe("shared locale validation", () => {
 	it("accepts every locale from the shared registry", () => {
 		for (const locale of SUPPORTED_LOCALES) {
 			expect(updateUserPreferencesSchema.safeParse({ language: locale }).success).toBe(true);
-			expect(createReviewSchema.safeParse({ locale }).success).toBe(true);
+			expect(localeSchema.safeParse(locale).success).toBe(true);
 			expect(
 				createScheduledTaskSchema.safeParse({
 					name: "Hourly task",
@@ -133,7 +83,15 @@ describe("shared locale validation", () => {
 
 	it("rejects locales outside the shared registry", () => {
 		expect(updateUserPreferencesSchema.safeParse({ language: "unsupported" }).success).toBe(false);
-		expect(createReviewSchema.safeParse({ locale: "unsupported" }).success).toBe(false);
+		expect(localeSchema.safeParse("unsupported").success).toBe(false);
+		expect(
+			createScheduledTaskSchema.safeParse({
+				name: "Hourly task",
+				cronExpr: "0 * * * *",
+				prompt: "Run checks",
+				locale: "unsupported",
+			}).success,
+		).toBe(false);
 	});
 });
 

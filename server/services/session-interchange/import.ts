@@ -448,7 +448,6 @@ function createImportedSubagent(input: {
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: null,
 			type: "subagent",
 			subagentType: input.subagentType,
 			variant: subagentVariant(input.subagentType),

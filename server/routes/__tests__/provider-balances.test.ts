@@ -4,6 +4,8 @@ import { AppError } from "../../lib/errors";
 import * as outbound from "../../lib/net/outbound-fetch";
 import { providerBalanceCache } from "../../lib/provider-balance-cache";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { providerBalanceRoutes } from "../provider-balances";
 import { settingsRoutes } from "../settings";
 
@@ -20,8 +22,11 @@ const config = (apiKey = "key-current"): CustomApiProviderConfig => ({
 
 function appForRole(role: "admin" | "user") {
 	const app = new Hono();
+	// Distinct subs per role: assertAdmin reads the live store role, and the seam
+	// in beforeEach maps each sub to its role.
+	const sub = role === "admin" ? "balance-admin" : "balance-user";
 	app.use("*", async (c, next) => {
-		c.set("user", { sub: "test-balance-user", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	app.onError((error) => {
@@ -35,6 +40,15 @@ function appForRole(role: "admin" | "user") {
 }
 
 beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === "balance-admin" ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
 	settings.customApiProviders = [];
 	providerBalanceCache.sync();
 	settings.customApiProviders = [config()];
@@ -43,6 +57,7 @@ beforeEach(() => {
 	);
 });
 afterEach(() => {
+	setAuthStores(undefined);
 	settings.customApiProviders = [];
 	providerBalanceCache.sync();
 	mock.restore();

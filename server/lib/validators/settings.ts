@@ -46,8 +46,8 @@ const gatewayPlatformConfigSchema = z.object({
 	// Feishu / QQ Bot
 	appId: z.string().max(200).optional(),
 	appSecret: z.string().max(500).optional(),
-	// Webhook
-	secret: z.string().max(500).optional(),
+	// Webhook — must be non-empty when present (empty secret = unauthenticated HMAC).
+	secret: z.string().min(1).max(500).optional(),
 	// Weixin
 	accountId: z.string().max(200).optional(),
 	baseUrl: z.string().max(500).optional(),
@@ -72,7 +72,6 @@ const gatewayPlatformConfigSchema = z.object({
 const gatewayConfigSchema = z.object({
 	enabled: z.boolean().optional(),
 	defaultProjectId: z.string().max(50).optional(),
-	defaultChapterId: z.string().max(50).optional(),
 	defaultPermissionMode: legacyPermissionModeSchema.optional(),
 	sessionIdleMinutes: z.number().int().min(0).max(43200).optional(),
 	rateLimitPerMinute: z.number().int().min(0).max(1000).optional(),
@@ -215,7 +214,7 @@ export const specTabLayoutPatchSchema = z.object({
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 
 export const recentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "project", "workspace", "subagent", "group"]),
+	type: z.enum(["narrator", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	parentNarratorId: z.string().min(1).max(50).optional(),
@@ -274,10 +273,10 @@ export const batchUpsertRecentTabsSchema = z.object({
 });
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent", "group"]),
+	type: z.enum(["narrator", "session", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
 	/**
-	 * Entity-teardown cleanup (chapter deleted, narrator archived). When set, no undo
+	 * Entity-teardown cleanup (project deleted, narrator archived). When set, no undo
 	 * token is minted — a cascade must not overwrite the user's pending undo slot with
 	 * a snapshot that points at entities that are already gone.
 	 */

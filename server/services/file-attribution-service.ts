@@ -2,8 +2,8 @@
  * File attribution service.
  *
  * Records a timeline of file modifications attributed to narrators / subagents
- * (or external/terminal changes), keyed by normalized workspace path. Works for
- * chapters AND standalone narrators that share the same directory.
+ * (or external/terminal changes), keyed by normalized workspace path, so sessions
+ * sharing the same directory see one timeline.
  *
  * Writes are fire-and-forget and fully fault-tolerant: a failure here must
  * never block tool execution (same philosophy as file-snapshot-service).

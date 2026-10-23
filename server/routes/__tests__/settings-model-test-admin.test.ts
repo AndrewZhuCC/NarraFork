@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
+import { updateSettingsKey } from "../../../shared/update-settings";
 import { AppError } from "../../lib/errors";
+import { settingsUpdateLock } from "../../lib/settings/write-lock";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-model-test-admin-"));
@@ -18,7 +22,27 @@ const { getDefaults, deepMerge } = await import("../../lib/settings");
 const { registerServerRestart } = await import("../../lib/server-restart");
 const { tlsRoutes } = await import("../tls");
 
+/**
+ * The admin-gated settings routes run `requireAdmin`, which authorizes against the LIVE role
+ * read through the session store, never the token's `role` claim. The middleware below only
+ * sets `c.get("user")`, so this seam resolves each principal's role by actor id ("admin-id"
+ * → admin, anything else → user). Without it a non-admin would surface as 401 USER_GONE
+ * instead of the expected 403 ADMIN_REQUIRED.
+ */
+const ADMIN_ACTOR_ID = "admin-id";
+const NON_ADMIN_ACTOR_ID = "user-id";
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === ADMIN_ACTOR_ID ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 afterAll(() => {
+	setAuthStores(undefined);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	rmSync(testHome, { recursive: true, force: true });
@@ -677,6 +701,134 @@ describe("settings conditional admin guards", () => {
 			expect(settings.customApiProviders?.[0]?.prefix).toBe("new-prefix");
 		} finally {
 			await db.delete(narrators).where(eq(narrators.id, narratorId));
+			saveSettings(original);
+		}
+	});
+});
+
+describe("conditional update source settings", () => {
+	test("an expected source is checked after acquiring the settings write lock", async () => {
+		const original = structuredClone(settings);
+		const initialUpdate = original.update;
+		if (!initialUpdate) throw new Error("Missing default update settings");
+		const gate = Promise.withResolvers<void>();
+		let blocker: Promise<unknown> | undefined;
+		try {
+			saveSettings({ ...original, update: { ...initialUpdate, source: "github" } });
+			const app = appForRole("admin");
+			const checked = await (await app.request("http://localhost/settings")).json();
+			const expectedUpdateSettingsKey = updateSettingsKey(checked.update);
+			const concurrent = {
+				...initialUpdate,
+				source: "update-server" as const,
+				serverUrl: "https://private.example",
+			};
+			blocker = settingsUpdateLock.acquire("settings", async () => {
+				saveSettings({ ...settings, update: concurrent });
+				await gate.promise;
+			});
+			const pending = app.request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					expectedUpdateSettingsKey,
+					update: { source: "update-server", serverUrl: "https://narrafork-update.b.domexie.cn" },
+				}),
+			});
+			gate.resolve();
+			await blocker;
+			const response = await pending;
+			expect(response.status).toBe(409);
+			expect((await response.json()).code).toBe("UPDATE_SOURCE_CHANGED");
+			expect(settings.update).toEqual(concurrent);
+		} finally {
+			gate.resolve();
+			await blocker;
+			saveSettings(original);
+		}
+	});
+
+	test("a matching conditional patch preserves other preferences without persisting its precondition", async () => {
+		const original = structuredClone(settings);
+		const initialUpdate = original.update;
+		if (!initialUpdate) throw new Error("Missing default update settings");
+		try {
+			saveSettings({
+				...original,
+				update: {
+					...initialUpdate,
+					source: "github",
+					channel: "beta",
+					autoDownload: true,
+					proxy: { mode: "direct" },
+				},
+			});
+			const before = structuredClone(settings.update);
+			if (!before) throw new Error("Missing saved update settings");
+			const response = await appForRole("admin").request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					expectedUpdateSettingsKey: updateSettingsKey(before),
+					update: { source: "update-server", serverUrl: "https://narrafork-update.b.domexie.cn" },
+				}),
+			});
+			expect(response.status).toBe(200);
+			expect(settings.update).toEqual({
+				...before,
+				source: "update-server",
+				serverUrl: "https://narrafork-update.b.domexie.cn",
+			});
+			expect(settings).not.toHaveProperty("expectedUpdateSettingsKey");
+			expect(await response.json()).not.toHaveProperty("expectedUpdateSettingsKey");
+		} finally {
+			saveSettings(original);
+		}
+	});
+
+	test("an ordinary patch without a precondition remains supported", async () => {
+		const original = structuredClone(settings);
+		try {
+			const response = await appForRole("admin").request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ update: { channel: "beta" } }),
+			});
+			expect(response.status).toBe(200);
+			expect(settings.update?.channel).toBe("beta");
+		} finally {
+			saveSettings(original);
+		}
+	});
+});
+
+describe("default project directory", () => {
+	async function patchProjectDir(defaultProjectDir: string) {
+		return appForRole("admin").request("/settings", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ paths: { defaultProjectDir } }),
+		});
+	}
+
+	test("accepts only an existing directory, and unchanged or empty values always save", async () => {
+		const original = structuredClone(settings);
+		const existing = mkdtempSync(join(testHome, "projects-"));
+		try {
+			const missing = await patchProjectDir(join(testHome, "no-such-dir"));
+			expect(missing.status).toBe(400);
+			expect((await missing.json()).code).toBe("PROJECT_DIR_NOT_FOUND");
+			expect(settings.paths.defaultProjectDir).toBe(original.paths.defaultProjectDir);
+
+			expect((await patchProjectDir(existing)).status).toBe(200);
+			expect(settings.paths.defaultProjectDir).toBe(existing);
+
+			// The chosen directory disappearing must not block re-saving the form.
+			rmSync(existing, { recursive: true, force: true });
+			expect((await patchProjectDir(existing)).status).toBe(200);
+			expect((await patchProjectDir("")).status).toBe(200);
+			expect(settings.paths.defaultProjectDir).toBe("");
+		} finally {
 			saveSettings(original);
 		}
 	});

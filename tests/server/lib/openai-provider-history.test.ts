@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { LoopTranscript } from "../../../server/lib/agent/loop-transcript";
 import { OpenAIProvider } from "../../../server/lib/agent/openai-provider";
 import type { ChatParams, DbMessage } from "../../../server/lib/agent/provider";
 
@@ -61,11 +62,11 @@ describe("OpenAIProvider history builder", () => {
 
 		const { history } = await provider.buildHistory(dbMessages, "test:gpt-5");
 
-		expect(history).toHaveLength(1);
-		expect(history[0]).toEqual({
-			role: "user",
-			content: [{ type: "input_text", text: "hello" }],
-		});
+		// The empty assistant stub is skipped; the trailing input stays in the history.
+		expect(history).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			{ role: "user", content: [{ type: "input_text", text: "next" }] },
+		]);
 	});
 });
 
@@ -159,16 +160,22 @@ describe("OpenAIProvider chat request formatting", () => {
 		}) as typeof fetch;
 
 		try {
-			const history: unknown[] = [];
-			codexProvider.injectSystemPrompt(history, "Stay cached", "codex:gpt-5.3-codex", "en");
+			// Each request is what the loop sends: its transcript plus the turn's input,
+			// projected, with the system prompt.
+			const request = async (rows: DbMessage[]): Promise<unknown[]> => {
+				const { history } = await codexProvider.buildHistory(rows, "codex:gpt-5.3-codex");
+				codexProvider.injectSystemPrompt(history, "Stay cached", "codex:gpt-5.3-codex", "en");
+				return history;
+			};
 			const conversationId = "cache-conv-1";
+			const transcript = new LoopTranscript();
 
 			const firstParams: ChatParams = {
 				conversationId,
-				content: "hello 1",
+				content: "",
 				model: "codex:gpt-5.3-codex",
 				cwd: "/tmp",
-				history,
+				history: await request(transcript.withInput("hello 1")),
 				tools: [],
 				toolResults: [],
 				signal: new AbortController().signal,
@@ -177,32 +184,27 @@ describe("OpenAIProvider chat request formatting", () => {
 				// Drain stream
 			}
 
-			codexProvider.pushUserTurn(history, "hello 1", "codex:gpt-5.3-codex", []);
-			codexProvider.pushAssistantTurn(
-				history,
-				"assistant 1",
-				[],
-				[
-					{
-						text: "reasoning 1",
-						providerMetadata: {
-							openai: {
-								itemId: "rs_cache_1",
-								reasoningEncryptedContent: "enc_cache_1",
-							},
-						},
-						outputIndex: 0,
+			transcript.appendInput("hello 1");
+			transcript.appendStep([
+				{
+					type: "reasoning",
+					text: "reasoning 1",
+					providerMetadata: {
+						signatureSource: codexProvider.getActiveReasoningSource(),
+						openai: { itemId: "rs_cache_1", reasoningEncryptedContent: "enc_cache_1" },
 					},
-				],
-				[{ id: "ws_cache_1", query: "cache query", outputIndex: 1 }],
-			);
+					outputIndex: 0,
+				},
+				{ type: "web_search", id: "ws_cache_1", query: "cache query", outputIndex: 1 },
+				{ type: "text", text: "assistant 1" },
+			]);
 
 			const secondParams: ChatParams = {
 				conversationId,
-				content: "hello 2",
+				content: "",
 				model: "codex:gpt-5.3-codex",
 				cwd: "/tmp",
-				history,
+				history: await request(transcript.withInput("hello 2")),
 				tools: [],
 				toolResults: [],
 				signal: new AbortController().signal,

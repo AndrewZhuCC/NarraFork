@@ -1,6 +1,7 @@
 import {
 	Alert,
 	Anchor,
+	Box,
 	Button,
 	Center,
 	Divider,
@@ -18,6 +19,7 @@ import { createFileRoute, Link, Navigate, useNavigate } from "@tanstack/react-ro
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { BrandTitle } from "../components/common/BrandTitle";
+import { LanguageSwitcher } from "../components/LanguageSwitcher";
 import {
 	useAuthStatus,
 	useLogin,
@@ -388,8 +390,11 @@ function LoginPage() {
 	const hasPasskeyMfa = mfaMethods.includes("passkey");
 
 	return (
-		<Center h="100vh">
-			<Paper withBorder shadow="md" p="xl" w={400}>
+		<Center h="100vh" pos="relative">
+			<Box pos="absolute" top={16} right={16}>
+				<LanguageSwitcher persistToAccount={false} />
+			</Box>
+			<Paper withBorder shadow="md" p="xl" w={400} maw="calc(100vw - 32px)">
 				<form onSubmit={(e) => e.preventDefault()}>
 					<Stack>
 						{/* The instance name is what tells a user which deployment they are
@@ -521,12 +526,16 @@ function LoginPage() {
 								{error && <Alert color="red">{error}</Alert>}
 								<TextInput
 									label={t("username")}
+									description={t("firstUserUsernameHint")}
+									autoComplete="username"
 									value={username}
 									onChange={(e) => setUsername(e.currentTarget.value)}
 									onKeyDown={(e) => handleKeyDown(e, handleRegister)}
 								/>
 								<PasswordInput
 									label={t("password")}
+									description={t("firstUserPasswordHint")}
+									autoComplete="new-password"
 									value={password}
 									onChange={(e) => setPassword(e.currentTarget.value)}
 									onKeyDown={(e) => handleKeyDown(e, handleRegister)}

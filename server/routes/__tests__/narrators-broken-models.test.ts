@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-broken-models-route-"));
@@ -20,7 +22,27 @@ process.env.NARRAFORK_HOME = testHome;
 // layer at import time and must not contend for the real ~/.narrafork instance.
 const { narratorRoutes } = await import("../narrators");
 
+/**
+ * The migration endpoint runs `requireAdmin`, which authorizes against the LIVE role read
+ * through the session store, never the token's `role` claim. The middleware below only sets
+ * `c.get("user")`, so this seam resolves each principal's role by actor id ("admin-id" →
+ * admin, anything else → user). Without it a non-admin would surface as 401 USER_GONE
+ * instead of the expected 403 ADMIN_REQUIRED.
+ */
+const ADMIN_ACTOR_ID = "admin-id";
+const NON_ADMIN_ACTOR_ID = "user-id";
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === ADMIN_ACTOR_ID ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 afterAll(() => {
+	setAuthStores(undefined);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	rmSync(testHome, { recursive: true, force: true });

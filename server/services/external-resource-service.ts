@@ -34,6 +34,7 @@ import {
 } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { bodySql } from "../lib/narrator-bodies";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import {
@@ -73,6 +74,7 @@ import {
 	listIntegrationProjects,
 	toIntegrationDeviceSummary,
 } from "./integration-resource-service";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import {
 	createPreparedNarratorInTransaction,
 	// Reached through `narratorService` rather than by importing `narrator-messages`
@@ -1058,7 +1060,6 @@ export async function provisionExternalNarrator(
 
 		try {
 			const prepared = await prepareNarratorCreation({
-				chapterId: null,
 				title: input.title ?? `External narrator ${provisionKey}`,
 				permissionMode,
 				systemPrompt,
@@ -1222,6 +1223,10 @@ function jsonPath(key: string): string {
  *    blanking reasoning for every message in the page rather than just its own.
  *  - `octet_length`: bounds the parse for a pathological blob.
  *  - `substr` + `LIMIT`: bounds what crosses the boundary per block and per page.
+ *
+ * A block-format envelope is walked through its reasoning rows instead, each behind
+ * the same guards, so its tool payloads are not parsed at all. Both walks feed one
+ * ordered, limited result: the page budget is shared exactly as before.
  */
 async function loadExternalReasoningBlocks(
 	messageIds: readonly string[],
@@ -1229,30 +1234,53 @@ async function loadExternalReasoningBlocks(
 	const byMessage = new Map<string, string[]>();
 	if (messageIds.length === 0) return byMessage;
 	const idsJson = JSON.stringify([...messageIds]);
-	const rows = (await db.all(sql`
-		SELECT scanned.id AS id,
-			substr(
+	const fromBlocks = reasoningFromBlocks();
+	const body = sql.raw(bodySql("m", fromBlocks));
+	const reasoningBody = (element: SQL) => sql`substr(
 				coalesce(
-					json_extract(block.value, ${jsonPath("thinking")}),
-					json_extract(block.value, ${jsonPath("text")})
+					json_extract(${element}, ${jsonPath("thinking")}),
+					json_extract(${element}, ${jsonPath("text")})
 				),
 				1,
 				${EXTERNAL_MESSAGE_REASONING_SCAN_MAX_CHARS}
-			) AS body
+			)`;
+	const isReasoning = (element: SQL) =>
+		sql`json_extract(${element}, ${jsonPath("type")}) IN ('thinking', 'reasoning')`;
+	const fromContent = sql`
+		SELECT scanned.id AS id, 0 AS ordinal, block.key AS position,
+			${reasoningBody(sql`block.value`)} AS body
 		FROM (
 			SELECT m.id AS id,
 				CASE
-					WHEN m.content_json IS NOT NULL
-						AND octet_length(m.content_json) <= ${EXTERNAL_MESSAGE_REASONING_SCAN_MAX_BYTES}
-						AND json_valid(m.content_json)
-					THEN m.content_json
+					WHEN ${body} IS NOT NULL
+						AND octet_length(${body}) <= ${EXTERNAL_MESSAGE_REASONING_SCAN_MAX_BYTES}
+						AND json_valid(${body})
+					THEN ${body}
 				END AS content
 			FROM narrator_messages m
 			WHERE m.id IN (SELECT value FROM json_each(${idsJson}))
 		) AS scanned
 		JOIN json_each(scanned.content) AS block
-		WHERE json_extract(block.value, ${jsonPath("type")}) IN ('thinking', 'reasoning')
-		ORDER BY scanned.id, block.key
+		WHERE ${isReasoning(sql`block.value`)}`;
+	const fromRows = sql`
+		SELECT b.message_id AS id, b.ordinal AS ordinal, element.key AS position,
+			${reasoningBody(sql`element.value`)} AS body
+		FROM narrator_messages m
+		JOIN narrator_blocks b ON b.message_id = m.id AND b.kind = 'reasoning'
+		JOIN json_each(
+			CASE
+				WHEN octet_length(b.payload) <= ${EXTERNAL_MESSAGE_REASONING_SCAN_MAX_BYTES}
+					AND json_valid(b.payload)
+				THEN b.payload
+			END,
+			'$.raw'
+		) AS element
+		WHERE m.id IN (SELECT value FROM json_each(${idsJson}))
+			AND ${body} IS NULL
+			AND ${isReasoning(sql`element.value`)}`;
+	const rows = (await db.all(sql`
+		${fromBlocks ? sql`${fromContent} UNION ALL ${fromRows}` : fromContent}
+		ORDER BY id, ordinal, position
 		LIMIT ${messageIds.length * EXTERNAL_MESSAGE_MAX_REASONING_BLOCKS}
 	`)) as Array<{ id: string; body: string | null }>;
 	for (const row of rows) {
@@ -1264,11 +1292,27 @@ async function loadExternalReasoningBlocks(
 	return byMessage;
 }
 
-/** Messages whose content column was too large / unparseable to scan for reasoning. */
+/**
+ * Messages whose content column was too large / unparseable to scan for reasoning; for a
+ * block-format envelope, one of its reasoning rows was.
+ */
 async function findUnscannableReasoningMessages(
 	messageIds: readonly string[],
 ): Promise<Set<string>> {
 	if (messageIds.length === 0) return new Set();
+	const fromBlocks = reasoningFromBlocks();
+	const body = sql.raw(bodySql("narrator_messages", fromBlocks));
+	const unscannableRows = sql`OR (
+					${body} IS NULL
+					AND EXISTS (
+						SELECT 1 FROM narrator_blocks b
+						WHERE b.message_id = narrator_messages.id AND b.kind = 'reasoning'
+							AND (
+								octet_length(b.payload) > ${EXTERNAL_MESSAGE_REASONING_SCAN_MAX_BYTES}
+								OR NOT json_valid(b.payload)
+							)
+					)
+				)`;
 	const rows = await db
 		.select({ id: narratorMessages.id })
 		.from(narratorMessages)
@@ -1276,17 +1320,28 @@ async function findUnscannableReasoningMessages(
 			and(
 				inArray(narratorMessages.id, [...messageIds]),
 				sql`(
-					${narratorMessages.contentJson} IS NOT NULL
+					${body} IS NOT NULL
 					AND (
-						octet_length(${narratorMessages.contentJson}) > ${EXTERNAL_MESSAGE_REASONING_SCAN_MAX_BYTES}
-						OR NOT json_valid(${narratorMessages.contentJson})
+						octet_length(${body}) > ${EXTERNAL_MESSAGE_REASONING_SCAN_MAX_BYTES}
+						OR NOT json_valid(${body})
 					)
-				)`,
+				) ${fromBlocks ? unscannableRows : sql``}`,
 			),
 		)
 		.limit(messageIds.length);
 	return new Set(rows.map((row) => row.id));
 }
+
+/** Read block-format bodies from their rows: SQLite only, where blocks are written. */
+function reasoningFromBlocks(): boolean {
+	return blockReadsEnabled();
+}
+
+/** Exported for tests: both scans read legacy content and block rows alike. */
+export const externalReasoningScan = {
+	loadExternalReasoningBlocks,
+	findUnscannableReasoningMessages,
+} as const;
 
 /** SQL projection of the whitelisted short input keys; never selects `input_json`. */
 function externalToolTargetSql(): SQL<string | null> {

@@ -307,6 +307,7 @@ export function useVListLivePatches(
 				enqueue(
 					toolStartedPatch({
 						toolUseId,
+						...(meta?.blockId ? { blockId: meta.blockId } : {}),
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input ? { input } : {}),
@@ -360,6 +361,7 @@ export function useVListLivePatches(
 					toolUseId,
 					toolCompletedPatch({
 						toolUseId,
+						...(meta?.blockId ? { blockId: meta.blockId } : {}),
 						status,
 						output,
 						...(durationMs != null ? { durationMs } : {}),

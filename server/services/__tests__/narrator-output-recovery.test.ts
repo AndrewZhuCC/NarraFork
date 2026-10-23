@@ -78,7 +78,9 @@ async function persist(events: Iterable<AgentEvent>, ctx: EventHandlerContext) {
 function seed() {
 	for (const id of ["owner", "fork"])
 		sqlite
-			.prepare("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)")
+			.prepare(
+				`INSERT INTO narrators (id, traits, created_at, updated_at) VALUES (?, '["standalone"]', ?, ?)`,
+			)
 			.run(id, now, now);
 }
 function message(id: string) {
@@ -334,7 +336,7 @@ describe("cold recovery output boundary", () => {
 		// fixture. Restart, COW, attempt guards, final authorization and approvals stay real.
 		mock.module("../../lib/agent", () => ({
 			...realAgent,
-			buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+			buildHistory: async () => ({ history: [] }),
 		}));
 		process.env.NARRAFORK_HOME = directory;
 		resetRestartRecoveryForTests();

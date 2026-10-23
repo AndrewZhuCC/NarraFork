@@ -1,24 +1,26 @@
 /**
- * /messages — standalone direct-message page.
+ * /messages — standalone conversation page.
  *
  * Conversation list on the left, the selected room on the right. The active room
  * lives in a `?room=` search param so a conversation is linkable and survives a
  * reload.
  *
  * The narrator-side discussion rooms are NOT listed here: they belong to a
- * narrator and are opened from its toolbar. This page is only for person-to-person
- * conversations, which is also why there is no "send to narrator" action — there is
- * no narrator on this surface to send to.
+ * narrator and are opened from its toolbar. This page holds a person's own
+ * conversations — with people, and with bots (a bot that writes to you lands here
+ * like a DM). That is also why there is no "send to narrator" action: posting in a
+ * bot room already reaches its bot, and a DM has no narrator to send to.
  */
 
-import { Box, Loader, Text } from "@mantine/core";
+import { Box, Button, Loader, Text } from "@mantine/core";
+import { IconRobot } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChatRoomList } from "../components/chat/ChatRoomList";
 import { ChatRoomView } from "../components/chat/ChatRoomView";
 import { NewDmModal } from "../components/chat/NewDmModal";
-import { useChatRooms, useOpenChatDm } from "../hooks/useChat";
+import { useBotChatRoom, useChatRooms, useOpenChatDm } from "../hooks/useChat";
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "../lib/safe-area";
 
 interface MessagesSearch {
@@ -48,6 +50,11 @@ function MessagesPage() {
 	);
 
 	const activeRoom = rooms?.find((room) => room.id === activeRoomId);
+	// Whether you may still drive a bot is not in the list (its owner can narrow access
+	// after it wrote to you). The bot's room lookup says, and is the query its page uses.
+	const activeBotId = activeRoom?.kind === "bot" ? (activeRoom.narratorId ?? undefined) : undefined;
+	const { data: botRoom, error: botRoomError } = useBotChatRoom(activeBotId);
+	const botReadOnly = !!activeBotId && (!!botRoomError || botRoom?.canPost === false);
 
 	return (
 		// Full bleed: Main's symmetric `md` gutter is cancelled with negative margins so
@@ -95,6 +102,26 @@ function MessagesPage() {
 							key={activeRoomId}
 							roomId={activeRoomId}
 							title={activeRoom?.peer?.username ?? t("conversations")}
+							readOnlyReason={botReadOnly ? t("botReadOnly") : undefined}
+							headerActions={
+								activeBotId && botRoom ? (
+									// The bot's own page adds its live status and the monitor.
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										color="gray"
+										leftSection={<IconRobot size={14} />}
+										onClick={() =>
+											navigate({
+												to: "/narrators/$narratorId",
+												params: { narratorId: activeBotId },
+											})
+										}
+									>
+										{t("openBot")}
+									</Button>
+								) : undefined
+							}
 						/>
 					) : (
 						<Box style={{ height: "100%", display: "grid", placeItems: "center" }}>

@@ -42,7 +42,6 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			type: z.literal("git_workspace_subscribe"),
 			subscriptionId: z.string().min(1).max(128),
 			narratorId: z.string().min(1).max(128).optional(),
-			chapterId: z.string().min(1).max(128).optional(),
 			workspaceKey: z.string().min(1).max(128).optional(),
 			view: z.enum(["summary", "details"]).optional(),
 		})
@@ -66,6 +65,9 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			// the server version, the subscribe short-circuits to sync_ok instead of
 			// running a full catch-up query (see narrator-ws.ts subscribe handler).
 			version: z.number().int().min(0).optional(),
+			// Ignored: every subscription gets the block-keyed message protocol
+			// (docs/BLOCK_STORAGE-DESIGN.md §8.2). Clients loaded before P3d still send it.
+			protocol: z.union([z.literal(1), z.literal(2)]).optional(),
 		})
 		.strict(),
 	z.object({
@@ -81,11 +83,6 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		feedbackText: z.string().optional(),
 		compactAfter: z.boolean().optional(),
 		updatedPlan: z.string().optional(),
-	}),
-	z.object({
-		type: z.literal("merge_decision"),
-		mergeSessionId: z.string().min(1),
-		decision: z.enum(["continue", "cancel"]),
 	}),
 	z.object({
 		type: z.literal("buffer_message"),
@@ -177,7 +174,6 @@ export const terminalWsMessageSchema = z.preprocess(
 		z.object({
 			type: z.literal("create"),
 			requestId: z.string().min(1),
-			chapterId: z.string().min(1).optional(),
 			narratorId: z.string().min(1).optional(),
 			deviceId: z.string().min(1).optional(),
 			name: z.string().max(100).optional(),

@@ -360,8 +360,10 @@ function dataOnly(tokens: readonly Token[]): void {
  *
  * Layout replay cannot see inside a dollar-quoted body, so procedural DDL stays fail-closed in
  * general. Admitted statements are the model-history revision triggers of migration 0012 (they
- * bump integer counters) and the numeric context-stats copy of migration 0022 (it upserts one
- * existing table). None of them alter, create or drop a relation or column. Each entry is the
+ * bump integer counters), the numeric context-stats copy of migration 0022 (it upserts one
+ * existing table), the model-history v2 reinstall of migration 0029 (it drops the v1
+ * triggers and functions; v2 also sets a tool block's phase and queues envelopes for block
+ * sync), and the v3 reinstall of migration 0032 (v2's bodies, skipping state-only writes). None of them alter, create or drop a relation or column. Each entry is the
  * SHA-256 of the statement as written in the SQL file (trimmed, without its terminating
  * semicolon); a single changed character falls back to the generic rejection and requires a
  * fresh review here.
@@ -430,6 +432,275 @@ const REVIEWED_PROCEDURAL_STATEMENTS = new Map<string, string>([
 		"adb48fb8a2e584de04374d4bdd36395b87299f1d5b0b53e726ecdef2890b4c13",
 		"trigger narrator_message_context_stats_update",
 	],
+	// 0029_block_storage.sql — model-history contract v2, a versioned reinstall: drops the v1
+	// triggers and functions, then installs v2 (revision bumps, tool-block phase, sync queue).
+	[
+		"4c5764c911db08f3937bfb02348d51f48280d288fd440d90c95235e89151cf65",
+		"drop trigger model_history_v1_message",
+	],
+	[
+		"9cc4e00ae32c088206b57b187ad78ac2b0c7bf380b6eb4936bada7c229549d89",
+		"drop function model_history_v1_message",
+	],
+	[
+		"80d20309b0e1aa94bf39cd0b73152c1d444e56991090fb94c9462dfb96d12898",
+		"drop trigger model_history_v1_tool",
+	],
+	[
+		"f4c0a8ae4394d7101a6f7137079df965ef6e3d1a542dd3207f2cda47674facaa",
+		"drop function model_history_v1_tool",
+	],
+	[
+		"f0f0e5450bd8f2b7df6ac44f58762509439d064f8b0cd5d7a2fda96b051fa826",
+		"drop trigger model_history_v1_ref",
+	],
+	[
+		"b65f55e72fbae77dac9e1b63b070dc6f75cc3f219847e4e252d3694b4cdf0c65",
+		"drop function model_history_v1_ref",
+	],
+	[
+		"31b85ca08d3bbb2704492e773a6e78207730060c751cbd3c21c7424cefbcdd5d",
+		"drop trigger model_history_v1_sender",
+	],
+	[
+		"7083bf694ecddeb70dddc3a4df5864cb2948c399d6f90ec6478a2d5c649dd219",
+		"drop function model_history_v1_sender",
+	],
+	[
+		"958ca35d4a6c3d643555c98f6615fc6d239edd9454beb4766bc470c661fa9206",
+		"drop trigger model_history_v1_narrator",
+	],
+	[
+		"d87ec539a72e18ec8105ef0f96b3b0c151e9936983a42ea26b1e8ed03205c9c1",
+		"drop function model_history_v1_narrator",
+	],
+	[
+		"d783a8a4723fbbb75d7d996779701210b04332be4fc49aabb8a373e283363062",
+		"function model_history_v2_message",
+	],
+	[
+		"d6926c3eda8bf3ece36d20a00d1b3184ecdfb353c73def2e6e275e96c489965b",
+		"trigger model_history_v2_message",
+	],
+	[
+		"0e7d7020a026dd1ac6a13676237aeab86ca933c2c70652e64c913b65ffb5b93f",
+		"function model_history_v2_tool",
+	],
+	[
+		"931aa34270cceff36c06bd857b4ae3d40f0c454ef58a9c87d6543358673954eb",
+		"trigger model_history_v2_tool",
+	],
+	[
+		"b9503fe634712ea69dee9063f32d4fbaffa22ea4d22a135b5c0827d719afcafb",
+		"function model_history_v2_ref",
+	],
+	[
+		"a5a5a58b2b2ac2cb01b590dfa994d229ada38a7b1a0afb8f9767201c32c153b4",
+		"trigger model_history_v2_ref",
+	],
+	[
+		"3928308ba47d26eca2c8ee3e3656343fcfba7a7c300668ca4a6c057540a5fb6a",
+		"function model_history_v2_block",
+	],
+	[
+		"ecd3e22563f3ae338b9ffdc5733647b6df08aa0ff27307b2e4b138b7bd58083a",
+		"trigger model_history_v2_block",
+	],
+	[
+		"0064fe3b4d6636f136b40229e77e5f7139599b01426f55a7b6fb61eacf4ca619",
+		"function model_history_v2_tool_phase",
+	],
+	[
+		"8abd70c11747beb4501aa6b16b77a5c9cb584a7a95878d36178ee7c7448e4e56",
+		"trigger model_history_v2_tool_phase",
+	],
+	[
+		"e5fbbb143be30768ed5ca37e5738736c27bd8c6a6aa464f53073194540ec1c8c",
+		"function model_history_v2_sync_message",
+	],
+	[
+		"7a7df5459db3608e9741bc53f873d62ec43f334f6c3be435d647d85a23e14fb0",
+		"trigger model_history_v2_sync_message",
+	],
+	[
+		"89f64c3a69622dbdba888396475006455439f8b6fd40c4fee36f17cc75f3be5a",
+		"function model_history_v2_sync_tool",
+	],
+	[
+		"6d9fb645eb12b0fda8257f307d3fb49a8466d7c5f8f1a828e8fb66339584f9fb",
+		"trigger model_history_v2_sync_tool",
+	],
+	[
+		"075a5660d50efb2b6d80c78fbc307a97968f193077a52fb401e5b2110c8f94ce",
+		"function model_history_v2_sender",
+	],
+	[
+		"a611b18a131d1585f1e704216651a30292b3bbc0f6c8751b3a9fe7352f13d61e",
+		"trigger model_history_v2_sender",
+	],
+	[
+		"b75813f047288bbb4c995647fbae67d429184528c606d587b9c4542083b33190",
+		"function model_history_v2_narrator",
+	],
+	[
+		"1b39a2e3c3f5d8351c562cc8efb72579929b1a7fec62a689174dc815105ae48b",
+		"trigger model_history_v2_narrator",
+	],
+	[
+		"86db7cec3aadd9b1a291f6450f678045f020d93eca502eb0924b656714aeedd4",
+		"seed model_history_revision_contracts",
+	], // 0032_block_state_writes.sql — model-history contract v3, a versioned reinstall: drops the
+	// v1 (identical to 0029's, admitted above) and v2 triggers and functions, then installs v3.
+	// Bodies are v2's (revision bumps, tool-block phase, sync queue) except that a body change
+	// carried by a state-only write (`state_revision` moved) neither bumps nor queues a sync.
+	[
+		"b6fa9ca4db465b23963167c07ff13bdf207b1e90ec699cc2cf4499d3155904e7",
+		"drop trigger model_history_v2_block",
+	],
+	[
+		"6a3ee70dd6f715cc01046f22e81b17d9d8b397a1929657e73391d0d2a4ae3600",
+		"drop function model_history_v2_block",
+	],
+	[
+		"4eb14de8c064df13cf4f55fab91a2065138618c0e212c5476f262cd282a98a1f",
+		"drop trigger model_history_v2_message",
+	],
+	[
+		"4159a609e64b7c0bacac8cb6a1250b202e7b7199e14a34d02b95f6f01aba6ac0",
+		"drop function model_history_v2_message",
+	],
+	[
+		"ebc69d839041de603db650762610740ef1d27fafac90ea5d7bc433c795dde767",
+		"drop trigger model_history_v2_narrator",
+	],
+	[
+		"d26a2c3a5ba9852941afe8bce2bdef4392d7de1b92e314080ff64af99228ad0d",
+		"drop function model_history_v2_narrator",
+	],
+	[
+		"8d6d1e0ee8f0bb2ea558fe2d4a0be9c0c572eb2ba7e81e80498b18bd7320d910",
+		"drop trigger model_history_v2_ref",
+	],
+	[
+		"f21e81752ea0b9f01314fb72f8c4600250da6d8cdb5182ee4f55a6a7bab90608",
+		"drop function model_history_v2_ref",
+	],
+	[
+		"6caf6fcce3d7670a6e9edb7de332471199d497b33238e32702e8c1482958779c",
+		"drop trigger model_history_v2_sender",
+	],
+	[
+		"f7a07fd1769a53dc8a60c0981f29408a428c0c5ba50c7a2a22ef932bb5c01306",
+		"drop function model_history_v2_sender",
+	],
+	[
+		"08171cf681fc4601755d291f5f9b849a5ffa711aff056925a854b60513dc3c39",
+		"drop trigger model_history_v2_sync_message",
+	],
+	[
+		"8fe829fc0eaceb62eea8851e08440a529f98de00ad46d0fbc9ac659e5bcd75c0",
+		"drop function model_history_v2_sync_message",
+	],
+	[
+		"80c35a995699fdc3292f00a05563b3e2230162ee9aedd6568845da76752b1ab4",
+		"drop trigger model_history_v2_sync_tool",
+	],
+	[
+		"71a6e897ee0f6c2392fc0322598996751512313cd941b46c1445c9c3f7e12bec",
+		"drop function model_history_v2_sync_tool",
+	],
+	[
+		"fca67a32fcdb7653bd79dd39d2a96d73742ff3b8a46b23e99b0498e707ac4606",
+		"drop trigger model_history_v2_tool",
+	],
+	[
+		"7adc55ea56705d46f4242d39141054cf5c218c0dcac264fb3567788c6b79b7a5",
+		"drop function model_history_v2_tool",
+	],
+	[
+		"6c3d9cc888d18bd3567e1c623cbb41140dcec11e45cc5fc2640ef2df1332fe19",
+		"drop trigger model_history_v2_tool_phase",
+	],
+	[
+		"1fca4d050230bb00020906ff571fe8cfb275e5a6c7c2474067f824f1beecaa97",
+		"drop function model_history_v2_tool_phase",
+	],
+	[
+		"020480d2ea4635270a066281a091742c73789cae058757fee4ea4ba6adceead7",
+		"function model_history_v3_block",
+	],
+	[
+		"0f613861586109fa19aa61a049a81a15b3609158e1a600fb24bb35cf6bca2b36",
+		"trigger model_history_v3_block",
+	],
+	[
+		"db6b7224bb19de85748d5d760373b8ac2976a70749943be3838dd771b2b62a71",
+		"function model_history_v3_message",
+	],
+	[
+		"4885eb7f72868b5a4792a6c80360fbb714207dd4392a129ee6a520ed9f8c6610",
+		"trigger model_history_v3_message",
+	],
+	[
+		"96231aea585f6b11b6877a679212ca9f62dd5550400c057a289a87eb3a1a7adc",
+		"function model_history_v3_narrator",
+	],
+	[
+		"74f5fe69acf0817face9e59b0aa00d0c18c19b64d1dcd7a4f958d5a3fdd8ba68",
+		"trigger model_history_v3_narrator",
+	],
+	[
+		"95c8339e98c6e96244dc83a18e2bc8cfd4d3a9184eed8a2c5e4fa7495656af41",
+		"function model_history_v3_ref",
+	],
+	[
+		"7d0491e5804a0a0cac246852f87333b89904cc8a2e7176da494fa8049f58aaf7",
+		"trigger model_history_v3_ref",
+	],
+	[
+		"47b4e2022b027855363bb27c5481543158f83e2252e32322d2b17b591f159b2d",
+		"function model_history_v3_sender",
+	],
+	[
+		"42f50663431da03b0d5618b33c363404f1a83bed1a2b570bb75823517f1b3ff1",
+		"trigger model_history_v3_sender",
+	],
+	[
+		"043a5a5b2ca706f3e92343f1c75587faf422d629b7a7dc8b7f6f0f03302f878b",
+		"function model_history_v3_sync_message",
+	],
+	[
+		"7e4357cec3310e9367e81cce1c7f9a1856e9db3a9cc3725b8f46994903ab1bc4",
+		"trigger model_history_v3_sync_message",
+	],
+	[
+		"4315610a299d811a48e9745135efa16b4bead351ac6a1b0370fbf7a7ffa1ea81",
+		"function model_history_v3_sync_tool",
+	],
+	[
+		"c5f7c4d4864a67a29412954459d5b2ef6f9a21f0b112430883f2efb74d263326",
+		"trigger model_history_v3_sync_tool",
+	],
+	[
+		"be786fc8166920136d4c1dbe393c9cb9578a883a92e4849c12618598fad21474",
+		"function model_history_v3_tool",
+	],
+	[
+		"7092284af0e6812ced6d97d7d28163d80d5d05d8bc526dfc4584cf1c03714183",
+		"trigger model_history_v3_tool",
+	],
+	[
+		"96a9a42f3ce3c279dd98562c0f102403d3c276adbf582325c5767387b2462a66",
+		"function model_history_v3_tool_phase",
+	],
+	[
+		"3c0bad8c22b457442fb7555b1fd17e9bb037a23b043d386bbc6bdae202ce7e5f",
+		"trigger model_history_v3_tool_phase",
+	],
+	[
+		"cb31b756676a5cda7d00a35e241e806f9acbace1f5f71d3ffa8d0574cc90c4ce",
+		"seed model_history_revision_contracts",
+	],
 ]);
 
 /** The exact source text of one statement, as the allow-list digests were computed. */
@@ -446,7 +717,9 @@ function reviewedProcedural(tokens: readonly Token[], sql: string): boolean {
 	// Defence in depth: the digest pins the text, the label pins what kind of statement it is.
 	const cursor = new Cursor(tokens);
 	if (label.startsWith("seed ")) return cursor.keyword("insert") && cursor.keyword("into");
-	return cursor.keyword("create") && cursor.keyword(label.split(" ")[0]);
+	const [verb, kind] = label.split(" ");
+	if (verb === "drop") return cursor.keyword("drop") && cursor.keyword(kind);
+	return cursor.keyword("create") && cursor.keyword(verb);
 }
 
 function replay(tokens: readonly Token[], order: Map<string, string[]>, sql = ""): void {

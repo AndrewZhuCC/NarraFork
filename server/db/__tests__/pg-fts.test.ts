@@ -53,8 +53,8 @@ async function shadowRow(pg: PgExecutor, shadow: string, id: string): Promise<Ro
 	return (rows[0] as Row) ?? null;
 }
 
-/** Seed the FK chain a chapter needs (user → project → chapter). */
-async function seedProjectChapter(pg: PgExecutor): Promise<void> {
+/** Seed the rows narrators and drafts point at (user → project). */
+async function seedUserProject(pg: PgExecutor): Promise<void> {
 	await pg.unsafe(
 		`INSERT INTO users (id, username, password_hash, created_at) VALUES ($1, $1, 'x', $2)`,
 		["pgfts-user", NOW],
@@ -63,11 +63,26 @@ async function seedProjectChapter(pg: PgExecutor): Promise<void> {
 		`INSERT INTO projects (id, name, created_at, updated_at) VALUES ($1, $1, $2, $2)`,
 		["pgfts-project", NOW],
 	);
+}
+
+/**
+ * The chapter search catalog a release before the chapter removal installed: a shadow table
+ * with its GIN index, its trigger function, and a trigger using it. The trigger hangs off a
+ * stand-in base table because the real `chapters` table is gone once the migration ran.
+ */
+async function installRetiredChapterCatalog(pg: PgExecutor): Promise<void> {
+	await pg.unsafe("CREATE EXTENSION IF NOT EXISTS pg_trgm");
 	await pg.unsafe(
-		`INSERT INTO chapters (id, project_id, title, description, branch, base_branch, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, 'b1', 'main', $5, $5)`,
-		["pgfts-chapter", "pgfts-project", "Initial chapter title", "initial description", NOW],
+		`CREATE TABLE "search_chapters" (id text PRIMARY KEY, "title" text, "description" text)`,
 	);
+	await pg.unsafe(
+		`CREATE INDEX "idx_search_chapters_title" ON "search_chapters" USING gin ("title" gin_trgm_ops)`,
+	);
+	await pg.unsafe(`CREATE OR REPLACE FUNCTION "nf_search_chapters_sync"() RETURNS trigger
+		LANGUAGE plpgsql AS $fn$ BEGIN RETURN NEW; END $fn$`);
+	await pg.unsafe(`CREATE TABLE "pgfts_retired_chapters" (id text PRIMARY KEY)`);
+	await pg.unsafe(`CREATE TRIGGER "chapters_fts_insert" AFTER INSERT ON "pgfts_retired_chapters"
+		FOR EACH ROW EXECUTE FUNCTION "nf_search_chapters_sync"()`);
 }
 
 describe("pg-fts shadow tables on a real PostgreSQL 17", () => {
@@ -108,8 +123,20 @@ describe("pg-fts shadow tables on a real PostgreSQL 17", () => {
 						client.sql.unsafe(query, params) as Promise<Record<string, unknown>[]>,
 				};
 				try {
+					// --- an upgraded database still carries the retired chapter catalog ---------
+					await installRetiredChapterCatalog(pg);
+
 					// --- install the search catalog; the probe must agree it is complete --------
 					await ensurePgFts(pg);
+					// ...and the retired catalog is gone: table (with its index), function, trigger.
+					expect(
+						await pg.unsafe(
+							`SELECT to_regclass('search_chapters') AS t,
+								to_regclass('idx_search_chapters_title') AS i,
+								to_regprocedure('nf_search_chapters_sync()') AS f,
+								(SELECT count(*)::int FROM pg_trigger WHERE tgname = 'chapters_fts_insert') AS tr`,
+						),
+					).toEqual([{ t: null, i: null, f: null, tr: 0 }]);
 					const clean = await probePgFtsDrift(pg);
 					expect(clean).toMatchObject({
 						missingExtensions: [],
@@ -123,41 +150,13 @@ describe("pg-fts shadow tables on a real PostgreSQL 17", () => {
 					await ensurePgFts(pg);
 					expect((await probePgFtsDrift(pg)).drifted).toBe(false);
 
-					await seedProjectChapter(pg);
-
-					// ── chapters: insert / update / delete parity ──────────────────────────
-					let row = await shadowRow(pg, "search_chapters", "pgfts-chapter");
-					expect(row).toMatchObject({
-						id: "pgfts-chapter",
-						title: "Initial chapter title",
-						description: "initial description",
-					});
-					await pg.unsafe(
-						`UPDATE chapters SET title = $1, description = $2 WHERE id = 'pgfts-chapter'`,
-						["Renamed chapter", "revised description"],
-					);
-					row = await shadowRow(pg, "search_chapters", "pgfts-chapter");
-					expect(row).toMatchObject({
-						title: "Renamed chapter",
-						description: "revised description",
-					});
-					// An update that touches no indexed column must still leave exactly one,
-					// unchanged shadow row (delete+insert semantics, no duplication).
-					await pg.unsafe(`UPDATE chapters SET status = 'merged' WHERE id = 'pgfts-chapter'`);
-					expect(
-						(
-							await one(
-								pg,
-								`SELECT count(*)::int AS c FROM search_chapters WHERE id = 'pgfts-chapter'`,
-							)
-						).c,
-					).toBe(1);
+					await seedUserProject(pg);
 
 					// ── narrators: null-title semantics ────────────────────────────────────
 					// Insert with NULL title: the WHEN clause keeps the row out of the index.
 					await pg.unsafe(
-						`INSERT INTO narrators (id, chapter_id, title, model, created_at, updated_at)
-						 VALUES ('pgfts-narr', 'pgfts-chapter', NULL, 'model-a', $1, $1)`,
+						`INSERT INTO narrators (id, context_project_id, title, model, created_at, updated_at)
+						 VALUES ('pgfts-narr', 'pgfts-project', NULL, 'model-a', $1, $1)`,
 						[NOW],
 					);
 					expect(await shadowRow(pg, "search_narrators", "pgfts-narr")).toBeNull();
@@ -188,8 +187,8 @@ describe("pg-fts shadow tables on a real PostgreSQL 17", () => {
 
 					// ── narrator_messages: insert / delete parity ──────────────────────────
 					await pg.unsafe(
-						`INSERT INTO narrators (id, chapter_id, title, created_at, updated_at)
-						 VALUES ('pgfts-narr2', 'pgfts-chapter', 'session', $1, $1)`,
+						`INSERT INTO narrators (id, context_project_id, title, created_at, updated_at)
+						 VALUES ('pgfts-narr2', 'pgfts-project', 'session', $1, $1)`,
 						[NOW],
 					);
 					await pg.unsafe(
@@ -206,6 +205,17 @@ describe("pg-fts shadow tables on a real PostgreSQL 17", () => {
 					expect(await shadowRow(pg, "search_narrator_messages", "pgfts-msg")).toMatchObject({
 						content_text: "edited body",
 					});
+					// An update that touches no indexed column must still leave exactly one,
+					// unchanged shadow row (delete+insert semantics, no duplication).
+					await pg.unsafe(`UPDATE narrator_messages SET role = 'assistant' WHERE id = 'pgfts-msg'`);
+					expect(
+						(
+							await one(
+								pg,
+								`SELECT count(*)::int AS c FROM search_narrator_messages WHERE id = 'pgfts-msg'`,
+							)
+						).c,
+					).toBe(1);
 					await pg.unsafe(`DELETE FROM narrator_messages WHERE id = 'pgfts-msg'`);
 					expect(await shadowRow(pg, "search_narrator_messages", "pgfts-msg")).toBeNull();
 
@@ -260,7 +270,7 @@ describe("pg-fts shadow tables on a real PostgreSQL 17", () => {
 					await pg.unsafe(`DROP TRIGGER narrators_fts_insert ON narrators`);
 					await pg.unsafe(`DROP TRIGGER narrators_fts_update ON narrators`);
 					await pg.unsafe(`DROP TRIGGER narrators_fts_delete ON narrators`);
-					await pg.unsafe(`DROP INDEX idx_search_chapters_description`);
+					await pg.unsafe(`DROP INDEX idx_search_knowledge_entries_current_keywords`);
 
 					const drifted = await probePgFtsDrift(pg);
 					// A dropped trigger is a durable retry signal: reported by NAME.
@@ -269,22 +279,22 @@ describe("pg-fts shadow tables on a real PostgreSQL 17", () => {
 						"narrators_fts_update",
 						"narrators_fts_delete",
 					]);
-					expect(drifted.missingIndexes).toEqual(["idx_search_chapters_description"]);
+					expect(drifted.missingIndexes).toEqual(["idx_search_knowledge_entries_current_keywords"]);
 					expect(drifted.drifted).toBe(true);
 
 					// Writes while the triggers are gone: one insert (missing), one title change
 					// (mismatched), one delete (stale). None of these reach the shadow.
 					await pg.unsafe(
-						`INSERT INTO narrators (id, chapter_id, title, created_at, updated_at)
-						 VALUES ('pgfts-narr3', 'pgfts-chapter', 'written while broken', $1, $1)`,
+						`INSERT INTO narrators (id, context_project_id, title, created_at, updated_at)
+						 VALUES ('pgfts-narr3', 'pgfts-project', 'written while broken', $1, $1)`,
 						[NOW],
 					);
 					await pg.unsafe(
 						`UPDATE narrators SET title = 'renamed while broken' WHERE id = 'pgfts-narr2'`,
 					);
 					await pg.unsafe(
-						`INSERT INTO narrators (id, chapter_id, title, created_at, updated_at)
-						 VALUES ('pgfts-narr4', 'pgfts-chapter', 'doomed', $1, $1)`,
+						`INSERT INTO narrators (id, context_project_id, title, created_at, updated_at)
+						 VALUES ('pgfts-narr4', 'pgfts-project', 'doomed', $1, $1)`,
 						[NOW],
 					);
 					// narr4's insert DID reach the shadow? No — the insert trigger is dropped,

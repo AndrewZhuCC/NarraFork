@@ -12,6 +12,7 @@ import {
 	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
 } from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
+import { updateSettingsKey } from "@shared/update-settings";
 import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
@@ -50,6 +51,7 @@ import {
 	syncOpencodeUsageCache,
 } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import { getHome } from "../lib/platform";
 import {
 	discoverPendingProviderBalances,
 	getProviderBalanceGenerations,
@@ -105,10 +107,10 @@ import {
 	CodexImageGenerationFixError,
 	disableCodexImageGenerationForPrefix,
 } from "../services/codex-image-generation-fix";
-import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
 import { listPluginProviderModelGroups } from "../services/plugin-provider-model-source";
 import { pluginProviderRegistry } from "../services/plugin-provider-registry";
+import { getProjectDirStatus } from "../services/project-dir";
 import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
@@ -322,6 +324,8 @@ const externalWebSocketOriginSchema = z
  */
 export const updateSettingsSchema = z
 	.object({
+		// Optional request precondition, never a persisted setting.
+		expectedUpdateSettingsKey: z.string().max(2048).optional(),
 		server: z
 			.object({
 				port: z.number().int().min(1).max(65535),
@@ -357,7 +361,8 @@ export const updateSettingsSchema = z
 		diskSafety: diskSafetySettingsSchema.optional(),
 		paths: z
 			.object({
-				defaultProjectDir: z.string().min(1),
+				// "" = unset; a non-empty value must name an existing directory (checked on save).
+				defaultProjectDir: z.string().trim(),
 				/**
 				 * Extra roots the in-browser editor may write to.
 				 *
@@ -610,28 +615,12 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		chapters: z
+		workspace: z.object({ treeSnapshotsEnabled: z.boolean() }).partial().optional(),
+		narratorBlocks: z
 			.object({
-				maxActiveWorktrees: z.number().int().min(1),
-				maxActiveContainers: z.number().int().min(0),
-				worktreeSizeWarningMb: z.number().int().min(0),
-				autoSaveOnDormant: z.boolean(),
-				dormantAfterMinutes: z.number().int().min(0),
-				treeSnapshotsEnabled: z.boolean(),
-			})
-			.partial()
-			.optional(),
-		containers: z
-			.object({
-				portRangeStart: z.number().int().min(1).max(65535),
-				portRangeEnd: z.number().int().min(1).max(65535),
-				proxy: z
-					.object({
-						enabled: z.boolean(),
-						port: z.number().int().min(1).max(65535),
-					})
-					.partial()
-					.optional(),
+				write: z.boolean(),
+				read: z.boolean(),
+				compactJson: z.boolean(),
 			})
 			.partial()
 			.optional(),
@@ -1446,7 +1435,17 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 		const current = structuredClone(settings);
-		const validated = parsed.data;
+		const { expectedUpdateSettingsKey, ...validated } = parsed.data;
+		// Check inside the same lock as the save; a preceding GET cannot prevent races.
+		if (
+			expectedUpdateSettingsKey !== undefined &&
+			expectedUpdateSettingsKey !== updateSettingsKey(current.update)
+		) {
+			return c.json(
+				{ error: "Update settings changed. Check again.", code: "UPDATE_SOURCE_CHANGED" },
+				409,
+			);
+		}
 
 		const effectiveCustomApiProviders =
 			validated.customApiProviders ??
@@ -1514,8 +1513,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			}
 		}
 
-		const oldProxyEnabled = current.containers.proxy.enabled;
-		const oldProxyPort = current.containers.proxy.port;
 		const oldHost = current.server.host;
 		const oldPort = current.server.port;
 		const oldTls = current.server.tls;
@@ -1545,6 +1542,21 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// Preserve real VNet relay token when the client sends a masked display value.
 		if (validated.vnet?.relayToken?.startsWith("*")) {
 			validated.vnet.relayToken = current.vnet?.relayToken;
+		}
+
+		// A newly chosen default project directory must already exist: nothing creates it,
+		// and a missing default leaves every new session without a working directory.
+		// Re-saving an unchanged value is allowed even if it has since disappeared, so an
+		// unrelated settings save never fails on it.
+		const nextProjectDir = validated.paths?.defaultProjectDir;
+		if (nextProjectDir && nextProjectDir !== current.paths.defaultProjectDir) {
+			const status = getProjectDirStatus(nextProjectDir, getHome());
+			if (status.state !== "valid") {
+				throw new ValidationError(
+					`Default project directory is not an existing directory: ${status.path ?? nextProjectDir}`,
+					"PROJECT_DIR_NOT_FOUND",
+				);
+			}
 		}
 
 		// Validate TLS cert/key files exist when enabling TLS
@@ -1733,21 +1745,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// This also removes stale settings references; the final save below persists them.
 		purgeRemovedProviderCaches(current, merged);
 		const prefixPlan = await planProviderPrefixNarratorMigration(prefixChanges);
-
-		// Apply container proxy runtime changes first, then persist settings.
-		// This keeps persisted config and runtime state consistent if start/restart fails.
-		const newProxyEnabled = merged.containers.proxy.enabled;
-		const newProxyPort = merged.containers.proxy.port;
-		if (oldProxyEnabled !== newProxyEnabled || oldProxyPort !== newProxyPort) {
-			try {
-				await ensureContainerProxyRuntime({
-					enabled: newProxyEnabled,
-					port: newProxyPort,
-				});
-			} catch (err) {
-				throw new ValidationError(`Container proxy runtime update failed: ${String(err)}`);
-			}
-		}
 
 		const vnetChanged = JSON.stringify(oldVNet ?? null) !== JSON.stringify(merged.vnet ?? null);
 

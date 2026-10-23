@@ -98,7 +98,7 @@ describe("PluginContributionRegistry", () => {
 				contribution(pluginId, "provider", "provider", { title: "Provider" }),
 				contribution(pluginId, "command", "command", { title: "Command" }),
 				contribution(pluginId, "event", "event", {
-					topic: "narrafork.chapter.lifecycle",
+					topic: "narrafork.narrator.lifecycle",
 				}),
 				contribution(pluginId, "view", "view", { title: "View" }),
 			],
@@ -245,7 +245,7 @@ describe("ActivationIndex", () => {
 				contribution(pluginId, "command", "command"),
 				contribution(pluginId, "view", "view"),
 				contribution(pluginId, "event", "event", {
-					topic: "narrafork.chapter.lifecycle",
+					topic: "narrafork.narrator.lifecycle",
 				}),
 			],
 			activationEvents: [
@@ -253,7 +253,7 @@ describe("ActivationIndex", () => {
 				"onStartup",
 				"onTool:tool",
 				"onProvider:com.example.activation/provider",
-				"onEvent:narrafork.chapter.lifecycle",
+				"onEvent:narrafork.narrator.lifecycle",
 				"onSchedule:nightly",
 				"onCommand:command",
 			],
@@ -271,7 +271,7 @@ describe("ActivationIndex", () => {
 		]);
 		expect(index.get("onCommand:command")[0]?.fullId).toBe(`${pluginId}/command`);
 		expect(index.get("onView:view")[0]?.fullId).toBe(`${pluginId}/view`);
-		expect(index.get("onEvent:narrafork.chapter.lifecycle")[0]?.fullId).toBe(`${pluginId}/event`);
+		expect(index.get("onEvent:narrafork.narrator.lifecycle")[0]?.fullId).toBe(`${pluginId}/event`);
 		expect(index.get("onSchedule:nightly")).toMatchObject([
 			{
 				pluginId,

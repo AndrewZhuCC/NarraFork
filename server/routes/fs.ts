@@ -36,12 +36,13 @@ import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-bounda
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
-import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { getHome, IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { isLoopbackHostname } from "../lib/public-origin";
 import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
 import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
+import { sanitizeSvg } from "../lib/svg-sanitize";
 import { fsWriteSchema } from "../lib/validators/fs";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import type { EditorActor } from "../services/editor-document-service";
@@ -52,6 +53,7 @@ import {
 	type FileChangeCompletion,
 } from "../services/file-change-runtime";
 import { resolveNarratorProjectId } from "../services/narrator-project";
+import { findProjectDirCandidates, getProjectDirStatus } from "../services/project-dir";
 import { closeClaim, openClaim, sealClaim } from "../services/worktree-write-claims";
 
 export const fsRoutes = new Hono();
@@ -116,6 +118,28 @@ fsRoutes.get("/browse", (c) => {
 	const parent = getParent(absPath, isWin);
 
 	return c.json({ ...listing, path: absPath, drives, parent, sep });
+});
+
+/**
+ * GET /api/fs/project-dir
+ *
+ * Whether the instance's default project directory is set and exists. Clients use it
+ * to ask the user for a working directory instead of creating sessions in a folder
+ * that is unset or gone. One `stat`; safe to poll.
+ */
+fsRoutes.get("/project-dir", (c) => {
+	return c.json(getProjectDirStatus(settings.paths.defaultProjectDir, getHome()));
+});
+
+/**
+ * GET /api/fs/project-dir/candidates
+ *
+ * Existing folders under home that look like where the user keeps code (conventional
+ * names in any case, or folders already holding several git repositories), to offer
+ * when choosing the default project directory. Bounded async scan; see project-dir.ts.
+ */
+fsRoutes.get("/project-dir/candidates", async (c) => {
+	return c.json({ candidates: await findProjectDirCandidates(getHome()) });
 });
 
 /**
@@ -387,9 +411,31 @@ fsRoutes.get("/preview", async (c) => {
 
 	const ext = extname(absPath).toLowerCase();
 	const mime = PREVIEW_MIME[ext];
+	// SVG is text that executes: it is served through the sanitizer below rather than
+	// streamed, and it gets the smaller TEXT cap (not the 20 MB binary cap) because the
+	// whole document is read and parsed on the server's single JS thread.
+	const isSvg = ext === ".svg";
 
-	if (stat.size > (mime ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)) {
+	if (stat.size > (mime && !isSvg ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)) {
 		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	if (isSvg) {
+		// An SVG runs as a document on this origin (directly or via the frontend's
+		// same-origin blob URL), so its bytes are sanitized before they leave the server;
+		// see lib/svg-sanitize.ts. `nosniff` keeps the declared type honest, and the CSP
+		// is a second line of defense for a DIRECT navigation to this endpoint — it cannot
+		// reach the blob case, which is exactly why the bytes themselves are cleaned.
+		const clean = sanitizeSvg(await Bun.file(absPath).text());
+		return new Response(clean, {
+			headers: {
+				"Content-Type": "image/svg+xml; charset=utf-8",
+				"Content-Disposition": "inline",
+				"Cache-Control": "private, max-age=60",
+				"X-Content-Type-Options": "nosniff",
+				"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+			},
+		});
 	}
 
 	if (mime) {
@@ -722,29 +768,14 @@ fsRoutes.post("/write", async (c) => {
 		);
 	} finally {
 		if (diskMayHaveChanged && claimPath) {
-			// Compatibility tree observation, OUTSIDE the coordinator lease: never acquire
-			// an old worktree/shadow lock in the reverse order. A watcher may miss a
-			// same-size dirty-file edit, so invalidate caches immediately and capture a
-			// bounded boundary for the DAG. This is not proof of human ownership; the
-			// immutable file receipt above is. Even an uncertain dispatch invalidates the
-			// cache, and no postprocessing failure may change the disk outcome.
+			// Invalidate the session tree cache immediately: a same-size dirty-file edit
+			// would otherwise keep serving the stale listing. No postprocessing failure may
+			// change the disk outcome.
 			try {
 				const { invalidateWorkspaceTreeCache } = await import("../services/narrator-session-state");
 				invalidateWorkspaceTreeCache(cwd);
-				if (settings.chapters.treeSnapshotsEnabled) {
-					const { worktreeTreeSnapshot } = await import("../services/worktree-tree-snapshot");
-					// The hot-path variant: a save is a user-facing request and must not stall
-					// behind (or trigger) an unbounded full-tree scan on a huge worktree.
-					const treeHash = await worktreeTreeSnapshot.tryCaptureHot(cwd, LOCAL_DEVICE_ID);
-					if (treeHash) {
-						// Linked into the snapshot DAG for the same reason the watcher does it: a fork
-						// taken after this save must start from a state that includes it.
-						const { advanceChapterSnapshot } = await import("../services/chapter-snapshot-ref");
-						await advanceChapterSnapshot(cwd, treeHash, "human editor save");
-					}
-				}
 			} catch (err) {
-				logger.debug("Tree snapshot boundary failed after human save", {
+				logger.debug("Tree cache invalidation failed after human save", {
 					narratorId,
 					path: claimPath,
 					error: String(err),

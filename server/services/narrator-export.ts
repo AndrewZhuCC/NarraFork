@@ -41,9 +41,11 @@ import {
 	publicGenUiSummary,
 } from "@shared/gen-ui-public";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { logger } from "../lib/logger";
+import { blockBodies, bodySql, readBodies } from "../lib/narrator-bodies";
+import { assembledBodyLengthSql } from "../lib/narrator-body-length";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import {
 	type OwnTurnPlacement,
@@ -51,6 +53,7 @@ import {
 	ownTurnSql,
 	RUNTIME_SOURCE_COLUMNS,
 } from "../lib/runtime-source";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import { resolveLazyLineage } from "./narrator-refs-backfill";
 import { projectPublicNarratorPayload } from "./public-narrator-share-gen-ui";
 
@@ -590,13 +593,37 @@ const MESSAGE_COLUMNS = {
 	parentToolUseId: narratorMessages.parentToolUseId,
 } as const;
 
+/**
+ * Whether block-format bodies are read from their rows: SQLite only, the one backend
+ * that writes them. Exported for the session interchange, which reads the same bodies.
+ */
+export function exportBodiesFromBlocks(): boolean {
+	return blockReadsEnabled();
+}
+
 async function loadMessages(messageIds: string[]): Promise<Map<string, ExportMessageRow>> {
 	if (messageIds.length === 0) return new Map();
+	if (!exportBodiesFromBlocks()) {
+		const rows = await db
+			.select(MESSAGE_COLUMNS)
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.id, messageIds));
+		return new Map(rows.map((row) => [row.id, row as ExportMessageRow]));
+	}
 	const rows = await db
-		.select(MESSAGE_COLUMNS)
+		.select({
+			...MESSAGE_COLUMNS,
+			contentJson: sql<string | null>`${sql.raw(bodySql("narrator_messages", true))}`,
+		})
 		.from(narratorMessages)
 		.where(inArray(narratorMessages.id, messageIds));
-	return new Map(rows.map((row) => [row.id, row as ExportMessageRow]));
+	const bodies = readBodies(
+		sqlite,
+		rows.map((row) => ({ id: row.id, body: row.contentJson })),
+	);
+	return new Map(
+		rows.map((row) => [row.id, { ...row, contentJson: bodies.get(row.id) } as ExportMessageRow]),
+	);
 }
 
 /**
@@ -795,6 +822,9 @@ const CHILD_MESSAGE_COLUMNS = {
 	parentToolUseId: narratorMessages.parentToolUseId,
 } as const;
 
+/** Characters of a block-format child's assembled `content_json`, measured like the column. */
+const BLOCK_CONTENT_CHARS = sql<number>`${sql.raw(assembledBodyLengthSql("narrator_messages.id", "chars"))}`;
+
 /**
  * Subagent messages for a page, with their content clamped inside SQLite.
  *
@@ -808,34 +838,57 @@ const CHILD_MESSAGE_COLUMNS = {
  * mapping the row. Parsing is done here instead, and a row whose JSON was clamped
  * falls back to its `content_text` excerpt — a labelled excerpt is worth more than
  * a hard failure, and far more than silently dropping the message.
+ *
+ * A block-format child is measured in SQL as well (`BLOCK_CONTENT_CHARS`), and only
+ * one that fits is assembled from its rows, so the same bound holds.
  */
 async function loadChildMessages(toolUseIds: string[]): Promise<ExportMessageRow[]> {
 	if (toolUseIds.length === 0) return [];
+	const fromBlocks = exportBodiesFromBlocks();
+	const body = sql.raw(bodySql("narrator_messages", fromBlocks));
 	const rows = await db
 		.select({
 			...CHILD_MESSAGE_COLUMNS,
 			contentJsonText: sql<
 				string | null
-			>`substr(CAST(${narratorMessages.contentJson} AS TEXT), 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
+			>`substr(CAST(${body} AS TEXT), 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
 			contentTextExcerpt: sql<
 				string | null
 			>`substr(${narratorMessages.contentText}, 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
-			contentJsonBytes: sql<number>`length(COALESCE(CAST(${narratorMessages.contentJson} AS TEXT), ''))`,
+			contentJsonBytes: fromBlocks
+				? sql<number>`CASE WHEN ${body} IS NULL THEN ${BLOCK_CONTENT_CHARS}
+					ELSE length(COALESCE(CAST(${body} AS TEXT), '')) END`
+				: sql<number>`length(COALESCE(CAST(${body} AS TEXT), ''))`,
 			contentTextBytes: sql<number>`length(COALESCE(${narratorMessages.contentText}, ''))`,
+			bodyInBlocks: sql<number>`${body} IS NULL`,
 		})
 		.from(narratorMessages)
 		.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
 		.orderBy(narratorMessages.createdAt)
 		// One over the cap: enough to know more exist without reading them all.
 		.limit(EXPORT_CHILD_MESSAGES_PER_PAGE + 1);
+	const assembled = blockBodies(
+		sqlite,
+		rows
+			.filter((row) => row.bodyInBlocks && row.contentJsonBytes <= EXPORT_CHILD_CONTENT_LIMIT)
+			.map((row) => row.id),
+	);
 
 	return rows.map((row) => {
-		const { contentJsonText, contentTextExcerpt, contentJsonBytes, contentTextBytes, ...rest } =
-			row;
+		const {
+			contentJsonText,
+			contentTextExcerpt,
+			contentJsonBytes,
+			contentTextBytes,
+			bodyInBlocks,
+			...rest
+		} = row;
 		const jsonClamped = contentJsonBytes > EXPORT_CHILD_CONTENT_LIMIT;
 		const textClamped = contentTextBytes > EXPORT_CHILD_CONTENT_LIMIT;
 		let contentJson: unknown = null;
-		if (!jsonClamped && contentJsonText) {
+		if (bodyInBlocks) {
+			contentJson = assembled.get(row.id) ?? null;
+		} else if (!jsonClamped && contentJsonText) {
 			try {
 				contentJson = JSON.parse(contentJsonText);
 			} catch {
@@ -1480,7 +1533,6 @@ export interface NarratorExportHeader {
 	variant: string | null;
 	model: string | null;
 	cwd: string | null;
-	chapterId: string | null;
 	parentNarratorId: string | null;
 	createdAt: string | null;
 }
@@ -1497,7 +1549,6 @@ async function loadHeader(
 			variant: true,
 			model: true,
 			cwd: true,
-			chapterId: true,
 			parentNarratorId: true,
 			createdAt: true,
 		},
@@ -1510,7 +1561,6 @@ async function loadHeader(
 		variant: row.variant ?? null,
 		model: row.model ?? null,
 		cwd: row.cwd ?? null,
-		chapterId: row.chapterId ?? null,
 		parentNarratorId: row.parentNarratorId ?? null,
 		createdAt: row.createdAt ?? null,
 		isSubagent: isSubagentVariant(row.variant),

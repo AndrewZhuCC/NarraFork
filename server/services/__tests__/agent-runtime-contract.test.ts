@@ -24,12 +24,12 @@ for (const scenario of runtimeContractScenarios) {
 	describe(`shared executeAgentLoop baseline: ${scenario.name}`, () => {
 		test("completes one pass, preserves input evidence and does not invent publication", async () => {
 			const harness = createRuntimeContractHarness(scenario);
-			const history = [{ role: "user", text: "earlier input", recipientRefId: "ref-fixture" }];
+			const built = [{ role: "user", text: "earlier input", recipientRefId: "ref-fixture" }];
 			const result = await harness.runPass([completed, { type: "done" }], {
 				userText: "current input",
-				history,
+				history: { rows: [], built },
 			});
-			history[0].text = "later mutation";
+			built[0].text = "later mutation";
 
 			expect(result).toMatchObject({
 				finalText: "completed",
@@ -40,7 +40,10 @@ for (const scenario of runtimeContractScenarios) {
 			expect(harness.trace[0]).toMatchObject({
 				kind: "pass-input",
 				userText: "current input",
-				history: [{ role: "user", text: "earlier input", recipientRefId: "ref-fixture" }],
+				history: {
+					rows: [],
+					built: [{ role: "user", text: "earlier input", recipientRefId: "ref-fixture" }],
+				},
 			});
 			expect(harness.trace.filter((entry) => entry.kind === "simulated-model-call")).toHaveLength(
 				1,
@@ -67,7 +70,13 @@ for (const scenario of runtimeContractScenarios) {
 						entered.resolve();
 						return release.promise;
 					},
-					{ type: "stream_text", text: "late text must not be processed" },
+					{
+						type: "stream_text",
+						blockRevision: 1,
+						blockTextOffset: 0,
+						blockId: "text-1",
+						text: "late text must not be processed",
+					},
 					toolResult,
 					{ type: "block_complete", block: { type: "text", text: "partial output" } },
 					{ type: "done" },
@@ -75,7 +84,7 @@ for (const scenario of runtimeContractScenarios) {
 				],
 				{
 					userText: "cancel test",
-					history: [],
+					history: { rows: [] },
 					hooks: {
 						onErrorCleanup: async (message) => {
 							cleanup.push(message);
@@ -302,13 +311,12 @@ describe("runtime contract fixture controls", () => {
 
 	test("tool-result replay input reaches the real pass's interrupted-result classification", async () => {
 		const harness = createRuntimeContractHarness(runtimeContractScenarios[0]);
-		const trailingToolResults = [{ toolUseId: "provider-reused-id", content: "stored output" }];
 		const result = await harness.runPass(
 			[{ type: "output_truncated", message: "length" }, { type: "done" }],
-			{ userText: "", history: [], trailingToolResults },
+			{ userText: "", history: { rows: [] }, startedWithToolResults: true },
 		);
 		expect(result.interrupted).toBe(true);
 		expect(result.shouldReplayInterruptedToolResultTurn).toBe(true);
-		expect(harness.trace[0]).toMatchObject({ kind: "pass-input", trailingToolResults });
+		expect(harness.trace[0]).toMatchObject({ kind: "pass-input", startedWithToolResults: true });
 	});
 });

@@ -20,7 +20,9 @@
  * `selectionIndex.byBlockId.get(blockId)`.
  */
 
+import { type BlockSourceMessage, messageBlocks } from "@shared/narrator-blocks/message-blocks";
 import type { VListElementKind } from "@shared/pretext-layout/element-kinds";
+import { blockIdFromElementKey } from "@shared/pretext-layout/segment-adapter";
 
 export interface VListBlockTarget {
 	/** Selection-system blockId (msg-… | tc-… | sa-…). */
@@ -65,8 +67,32 @@ const BLOCK_INDEXED_KINDS = new Set<VListElementKind>([
 
 const BLOCK_INDEX_TOKEN = /-b(\d+)(?:-|$)/;
 
+/** The document's row for a message id, when the caller has the document at hand. */
+export type MessageOf = (messageId: string) => BlockSourceMessage<unknown> | undefined;
+
+/**
+ * The element index a block-keyed spec key (`-blk[<blockId>]+<offset>`, see `elementKey`)
+ * names in the message, from the blocks the document's row names; undefined for a
+ * positional key, null when the block is not one of the message's.
+ */
+function blockKeyedIndex(
+	key: string,
+	messageId: string,
+	messageOf: MessageOf,
+): number | null | undefined {
+	const named = blockIdFromElementKey(key);
+	if (!named) return undefined;
+	const message = messageOf(messageId);
+	const block = message
+		? messageBlocks(message).find((candidate) => candidate.id === named.blockId)
+		: undefined;
+	return block ? block.from + named.offset : null;
+}
+
 /** Extract the stable `-b{n}` block index from a spec key, or null. */
-function blockIndexFromKey(key: string, messageId?: string): number | null {
+function blockIndexFromKey(key: string, messageId: string, messageOf: MessageOf): number | null {
+	const keyed = blockKeyedIndex(key, messageId, messageOf);
+	if (keyed !== undefined) return keyed;
 	const suffix = messageId && key.startsWith(`${messageId}-`) ? key.slice(messageId.length) : key;
 	const match = BLOCK_INDEX_TOKEN.exec(suffix);
 	if (!match) return null;
@@ -80,7 +106,13 @@ function blockIndexFromKey(key: string, messageId?: string): number | null {
  * `-b{n}-` segment rather than a trailing one.
  */
 const INJECTION_BLOCK_INDEX = /-b(\d+)-/;
-function injectionBlockIndexFromKey(key: string, messageId?: string): number | null {
+function injectionBlockIndexFromKey(
+	key: string,
+	messageId: string,
+	messageOf: MessageOf,
+): number | null {
+	const keyed = blockKeyedIndex(key, messageId, messageOf);
+	if (keyed !== undefined) return keyed;
 	const suffix = messageId && key.startsWith(`${messageId}-`) ? key.slice(messageId.length) : key;
 	const match = INJECTION_BLOCK_INDEX.exec(suffix);
 	if (!match) return null;
@@ -96,11 +128,13 @@ function injectionBlockIndexFromKey(key: string, messageId?: string): number | n
  * @param key   The stable spec key (spec.key).
  * @param sourceMessageIds  manifest item's source message ids (first is the
  *   owning message for single-message rows).
+ * @param messageOf  the document's row for a message id, which names its blocks.
  */
 export function resolveVListBlockTarget(
 	kind: VListElementKind,
 	key: string,
 	sourceMessageIds: readonly string[],
+	messageOf: MessageOf,
 ): VListBlockTarget | null {
 	const messageId = sourceMessageIds[0];
 	if (!messageId) return null;
@@ -127,13 +161,13 @@ export function resolveVListBlockTarget(
 	// the row's address for delete / rollback / fork — the same operations a user's own
 	// message exposes.
 	if (kind === "injection-bubble") {
-		const blockIndex = injectionBlockIndexFromKey(key, messageId);
+		const blockIndex = injectionBlockIndexFromKey(key, messageId, messageOf);
 		if (blockIndex == null) return null;
 		return { blockId: `msg-${messageId}-${blockIndex}`, messageId, blockIndex };
 	}
 
 	if (BLOCK_INDEXED_KINDS.has(kind)) {
-		const blockIndex = blockIndexFromKey(key, messageId);
+		const blockIndex = blockIndexFromKey(key, messageId, messageOf);
 		if (blockIndex == null) return null;
 		return { blockId: `msg-${messageId}-${blockIndex}`, messageId, blockIndex };
 	}

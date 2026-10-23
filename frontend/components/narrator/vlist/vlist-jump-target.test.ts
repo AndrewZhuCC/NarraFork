@@ -184,13 +184,16 @@ describe("dock message jump wiring", () => {
 		const panel = await Bun.file(new URL("../NarratorPanel.tsx", import.meta.url)).text();
 		expect(panel).toContain("highlightRequestId={highlightRequestId}");
 		const list = await Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url)).text();
-		expect(list).toContain("JSON.stringify([narratorId, highlightMessageId, highlightRequestId])");
-		// The dependency list is asserted whitespace-insensitively: biome reflows it
-		// across lines once it outgrows the column budget, and the invariant is which
-		// deps the jump effect tracks, not how they are wrapped.
+		// The key and the dependency list are asserted whitespace-insensitively: biome
+		// reflows them across lines once they outgrow the column budget, and the invariant is
+		// what the jump effect tracks, not how it is wrapped. The needle (global search's
+		// matched term) is part of both, so a new needle re-runs the jump.
 		const flat = list.replace(/\s+/g, " ");
 		expect(flat).toContain(
-			"documentReady, highlightMessageId, highlightRequestId, narratorId, scrollToMessageTarget",
+			"JSON.stringify([ narratorId, highlightMessageId, highlightRequestId, highlightNeedle, ])",
+		);
+		expect(flat).toContain(
+			"documentReady, highlightMessageId, highlightRequestId, highlightNeedle, narratorId, scrollToMessageTarget",
 		);
 	});
 });

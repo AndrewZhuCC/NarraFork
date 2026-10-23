@@ -214,6 +214,9 @@ function fixture(
 		validateComposerProjection,
 		replaceFileReferenceSnapshots,
 		getFileReferenceSnapshots,
+		// Block reads off: bodies read from the column, as before block storage.
+		bodyColumns: (columns?: Record<string, boolean>) => (columns ? { columns } : {}),
+		fillBody: <T>(row: T) => row,
 		fileReferenceMessageForDisplay,
 		sendMessageSchema,
 		bufferQueueModeSchema,

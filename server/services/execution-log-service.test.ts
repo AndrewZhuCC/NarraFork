@@ -11,8 +11,8 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import {
-	chapters,
 	narratorMessages,
+	narratorProjectLinks,
 	narrators,
 	narratorToolCalls,
 	projects,
@@ -402,7 +402,7 @@ describe("ExecutionLogService filters", () => {
 		).toEqual(["real", "checkpoint"]);
 	});
 
-	test("joins chapter and project context onto each row", async () => {
+	test("joins the narrator's primary project onto each row and filters by it", async () => {
 		db.insert(projects)
 			.values({
 				id: "project-1",
@@ -412,26 +412,37 @@ describe("ExecutionLogService filters", () => {
 				updatedAt: T.oldest,
 			})
 			.run();
-		db.insert(chapters)
+		// One session names the project explicitly, the other is indexed into it by its cwd.
+		seedNarrator("narrator-1", { contextProjectId: "project-1", title: "Demo narrator" });
+		seedNarrator("narrator-2", { cwd: "/tmp/demo/src", title: "Indexed narrator" });
+		seedNarrator("narrator-3", { title: "Unrelated narrator" });
+		db.insert(narratorProjectLinks)
 			.values({
-				id: "chapter-1",
+				narratorId: "narrator-2",
 				projectId: "project-1",
-				title: "Demo chapter",
-				branch: "demo",
-				baseBranch: "main",
-				createdAt: T.oldest,
+				role: "primary",
+				source: "cwd",
+				directory: "/tmp/demo",
 				updatedAt: T.oldest,
 			})
 			.run();
-		seedNarrator("narrator-1", { chapterId: "chapter-1", title: "Demo narrator" });
-		seedToolCalls([{ id: "call", createdAt: T.newest }]);
+		seedToolCalls([
+			{ id: "explicit", createdAt: T.newest },
+			{ id: "indexed", narratorId: "narrator-2", createdAt: T.middle },
+			{ id: "unrelated", narratorId: "narrator-3", createdAt: T.oldest },
+		]);
 
-		const record = (await service.listCursor({}, 10)).records[0];
-		expect(record?.narratorTitle).toBe("Demo narrator");
-		expect(record?.chapterId).toBe("chapter-1");
-		expect(record?.chapterTitle).toBe("Demo chapter");
-		expect(record?.projectId).toBe("project-1");
-		expect(record?.projectName).toBe("Demo project");
+		const records = (await service.listCursor({}, 10)).records;
+		const byId = new Map(records.map((record) => [record.id, record]));
+		expect(byId.get("explicit")?.narratorTitle).toBe("Demo narrator");
+		for (const id of ["explicit", "indexed"]) {
+			expect(byId.get(id)?.projectId).toBe("project-1");
+			expect(byId.get(id)?.projectName).toBe("Demo project");
+		}
+		expect(byId.get("unrelated")?.projectId).toBeNull();
+		expect(
+			(await service.listCursor({ projectId: "project-1" }, 10)).records.map((r) => r.id),
+		).toEqual(["explicit", "indexed"]);
 	});
 });
 

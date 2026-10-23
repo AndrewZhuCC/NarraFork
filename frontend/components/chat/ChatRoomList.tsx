@@ -1,5 +1,5 @@
 /**
- * ChatRoomList.tsx — The DM conversation list.
+ * ChatRoomList.tsx — The conversation list: people, and the bots that talk to you.
  *
  * Renders only what the server's room-list endpoint returns (peer, preview,
  * unread) — never message bodies. That is why the list stays cheap regardless of
@@ -10,6 +10,7 @@ import { ActionIcon, Badge, Box, Group, ScrollArea, Stack, Text, Tooltip } from 
 import { IconMessagePlus } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import type { ChatRoomSummary } from "../../lib/api/chat";
+import { NarratorAvatar } from "../narrator/header/NarratorAvatar";
 import { UserAvatar } from "../UserAvatar";
 import { CHAT_HEADER_HEIGHT } from "./chat-header";
 
@@ -90,18 +91,35 @@ export function ChatRoomList({
 								}}
 							>
 								<Group gap="sm" wrap="nowrap">
-									<UserAvatar
-										userId={room.peer?.id ?? ""}
-										username={room.peer?.username ?? "?"}
-										avatarColor={room.peer?.avatarColor ?? null}
-										avatarImageId={room.peer?.avatarImageId ?? null}
-										size={32}
-										showTooltip={false}
-									/>
+									{room.peer?.isBot ? (
+										<NarratorAvatar
+											narratorId={room.peer.id}
+											avatarImageId={room.peer.avatarImageId}
+											title={room.peer.username}
+											size={32}
+											showTooltip={false}
+										/>
+									) : (
+										<UserAvatar
+											userId={room.peer?.id ?? ""}
+											username={room.peer?.username ?? "?"}
+											avatarColor={room.peer?.avatarColor ?? null}
+											avatarImageId={room.peer?.avatarImageId ?? null}
+											size={32}
+											showTooltip={false}
+										/>
+									)}
 									<Box style={{ flex: 1, minWidth: 0 }}>
-										<Text size="sm" fw={500} truncate>
-											{room.peer?.username ?? t("unknownSender")}
-										</Text>
+										<Group gap={6} wrap="nowrap">
+											<Text size="sm" fw={500} truncate>
+												{room.peer?.username ?? t("unknownSender")}
+											</Text>
+											{room.peer?.isBot ? (
+												<Badge size="xs" variant="light" color="grape" style={{ flexShrink: 0 }}>
+													{t("botBadge")}
+												</Badge>
+											) : null}
+										</Group>
 										<Text size="xs" c="dimmed" truncate>
 											{room.lastMessagePreview ?? t("noMessagesYet")}
 										</Text>

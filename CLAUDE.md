@@ -7,9 +7,9 @@
 NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台里：部署在自己的电脑或服务器上，与同事共享项目，管理 Agent 的上下文和操作权限，也能通过手机查看进展、继续对话。
 
 **核心领域概念：**
-- **叙述者（Narrator）** — 基于自定义 Agent Loop 的 AI 会话，绑定工作目录；类型分 primary 和 subagent（explore/plan/general/review）
+- **叙述者（Narrator）** — 基于自定义 Agent Loop 的 AI 会话，绑定工作目录；类型分 primary 和 subagent（explore/plan/general/review）；带 `bot` trait 的是 Bot：人们在聊天房间里与它对话，只看到它 `Send({ user })` 的内容，会话记录是监控视图
 - **工作区（Workspace）** — 多叙述者的面板布局，可保存与恢复
-- **项目（Project）** — 关联 git 仓库的工作单元，叙述者在仓库目录或其 worktree 中工作
+- **项目（Project）** — 关联 git 仓库的轻量工作单元：会话按工作目录自动归入项目（`narrator_project_links` 索引，见 `server/services/project-index.ts`），不需要手动创建
 - **消息（Messages）** — 团队成员间的站内会话与通知
 - **技能（Skill）/ 例程（Routine）** — 项目级技能库与自动化例程
 - **知识库（Knowledge Base）** — 分级 + 分 tag 授权的团队知识库（详见 docs/KNOWLEDGE_BASE.md）
@@ -114,16 +114,14 @@ server/
 - **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（预留，当前等同 manual）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。
 - **子代理**：通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**：`full`（延迟会话 fork）/ `compressed`（摘要注入 system prompt）/ `fresh`（无上下文）。
-- **章节拆分（Split at Commit）**：从历史 commit 分叉时，原章节拆为 prefix + continuation，新分叉成为 prefix 的另一个 fork。
-- **章节边**：`chapter_edges` 表显式建模五种关系（fork/merge/dependency/cherry_pick/review），与冗余字段同步维护。
-- **Git worktrees**：每个活跃章节在 `<project.gitPath>/.worktrees/` 下创建；休眠章节移除 worktree 但保留分支。
-- **容器管理**：Podman compose，端口从可配置池分配（默认 10000–20000）。
+- **项目归属**：会话的项目只经 `resolveNarratorProjectId`（SQL 侧 `narratorProjectIdText` / `narratorProjectIdColumn`）判断：有 `contextProjectId` 用它，否则用工作目录推导出的主链接；最长前缀匹配已有项目根，否则取 git 主仓库根并自动建公开项目，非 git 目录不建项目。权限与配置只看主项目，`additional` 链接只让会话出现在其他项目页。索引可随时整表重建（启动时后台分页重建）。
+- **Git worktrees**：会话 worktree 由 narrator worktree 资源管理；`<project.gitPath>/.worktrees/` 下叙事线时代留下的目录和分支没有任何记录，任何清理逻辑都不得删除它们。
+- **容器**：Podman 只用于插件与基准测试；设置页“工作区与容器”提供检测与安装。
 - **终端管理**：Unix 用 `Bun.Terminal`，Windows 用 `bun-pty`，统一 `TerminalRuntime` 接口；可选 dtach；生命周期绑定服务器进程。
-- **故事网络图**：主界面 `/projects/$projectId`，两种流程模式：classic（React Flow 画布）和 ruler（**已弃用**），存于 `projects.flowMode`。
-- **Ruler 模式已弃用**：不再开发，已知问题不修复，新功能只加 classic 侧；涉及改动仅限"不破坏现状"的必要维护。
-- **文件写入与回退**：受控文件 IO 使用 [server/services/file-write-queue.ts](server/services/file-write-queue.ts) 的进程内单文件队列；[server/services/file-change-runtime.ts](server/services/file-change-runtime.ts) 分别报告实际写入结果与历史可用性。文件恢复由 [server/services/revert-transaction-service.ts](server/services/revert-transaction-service.ts) 逐项执行，部分成功保留，消息 COW 在文件恢复完整成功后单独提交。旧持久屏障、管理员解锁及补偿链已退役。Tree 快照继续服务 Bash 观测和章节结构操作，热捕获保留 4s 预算及后台暖捕获；`chapters.treeSnapshotsEnabled` 可关闭。
+- **项目页**：`/projects/$projectId` 列出目录与会话（按链接表过滤，任何角色的链接都算）。
+- **文件写入与回退**：受控文件 IO 使用 [server/services/file-write-queue.ts](server/services/file-write-queue.ts) 的进程内单文件队列；[server/services/file-change-runtime.ts](server/services/file-change-runtime.ts) 分别报告实际写入结果与历史可用性。文件恢复由 [server/services/revert-transaction-service.ts](server/services/revert-transaction-service.ts) 逐项执行，部分成功保留，消息 COW 在文件恢复完整成功后单独提交。旧持久屏障、管理员解锁及补偿链已退役。Tree 快照服务 Bash 观测与编辑预览，热捕获保留 4s 预算及后台暖捕获；`workspace.treeSnapshotsEnabled` 可关闭。
 - **叙述者服务拆分**：narrator-service / -session / -executor / -subagent / -context / -prompt / -title / -recovery / -event-handler。
-- 其余服务：评审（review-service）、技能、例程、通知、项目数据库同步、worktree 监视、提交同步、合并摘要、输出统计、更新检查等，均在 `server/services/` 下。
+- 其余服务：技能、例程、通知、输出统计、更新检查等，均在 `server/services/` 下。
 
 **叙述者消息存储：** 三层结构：
 - `narrator_messages` — 全部消息，`contentJson` 存 SDK content blocks，`parentToolUseId` 关联子代理消息树。
@@ -131,7 +129,7 @@ server/
 - `narrator_tool_calls` — 工具调用记录，同时承担权限审批职责，无独立 `permission_requests` 表。
 - 分页基于 `refs.seq` 游标；**Compact** 通过插入 system 压缩标记消息实现，后续查询从最近 compact 点之后加载。
 
-**数据库：** SQLite 位于 `~/.narrafork/narrafork.db`。主键均为 nanoid 文本 ID。FTS5（trigram tokenizer，支持 CJK）用于章节、叙述者标题和消息全文搜索，触发器同步。
+**数据库：** SQLite 位于 `~/.narrafork/narrafork.db`。主键均为 nanoid 文本 ID。FTS5（trigram tokenizer，支持 CJK）用于叙述者标题和消息全文搜索，触发器同步。
 
 **认证：** 会话令牌是不透明随机串（`nfs_` 前缀），库中 `auth_sessions` 只存其 SHA-256；经 `Authorization: Bearer` 头（HTTP）或 `?token=` 查询参数（WebSocket）传递。滑动续期在服务端延长 `expires_at`，登出 `POST /api/auth/logout` 只吊销当前会话，`users.token_version` 递增吊销该用户全部会话。旧版 HS256 会话 JWT 不再被接受（升级后需重新登录）；`auth.jwtSecret` 仍用于 MFA 挑战令牌和若干 HMAC。首个注册用户自动获得管理员权限。
 
@@ -147,7 +145,7 @@ frontend/
   components/   — 按领域分组的组件目录
 ```
 
-**路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目、章节、叙述者、管理面板、例程、设置、搜索、登录、许可证。
+**路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目、叙述者、管理面板、例程、设置、搜索、登录、许可证。
 **Vite 开发代理：** `/api/*` → `localhost:7779`，`/ws/*` → `ws://localhost:7779`。
 
 ### API 路由
@@ -181,6 +179,7 @@ frontend/
 - 改 agent provider 历史构造、图片处理、NUG 网关事件 → `docs/AGENT_PROVIDERS.md`
 - 注入机制（服务端把内容放进叙述者对话） → `docs/INJECTION.md`
 - 知识库（分级 + 分 tag 双轴授权、写时复制版本、知识图谱链接） → `docs/KNOWLEDGE_BASE.md`
+- Bot 模式叙述者（`bot` 聊天房间、`Send({ user })`、监控视图、往群聊扩展） → `docs/BOT_NARRATOR.md`
 - OAuth 2.0 + External API v1 接入 → `docs/OPEN_API.md`
 - VS Code 插件 → `docs/VSCODE_EXTENSION.md`
 - Codex Responses WebSocket → `docs/codex-websocket.md`

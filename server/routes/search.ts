@@ -1,60 +1,102 @@
 import { Hono } from "hono";
-import { searchService, sortSearchResults } from "../services/search-service";
+import { ValidationError } from "../lib/errors";
+import { searchSectionsQuerySchema, searchSessionHitsQuerySchema } from "../lib/validators/search";
+import {
+	type MessageSearchScope,
+	SEARCH_SECTIONS,
+	type SearchFilters,
+	type SearchSection,
+	searchService,
+} from "../services/search-service";
 
 export const searchRoutes = new Hono();
 
-/** Entity names `/api/search` accepts. Anything else in the query is ignored. */
-const SEARCH_ENTITIES = ["chapters", "messages", "narrators", "knowledge"] as const;
+/**
+ * Content `include` adds to the default scope (primary, unarchived sessions; what people
+ * wrote and read). Unknown names are ignored.
+ */
+const SEARCH_INCLUDES = ["subagents", "system", "tools", "archived"] as const;
 
+function parseScope(include: string | undefined): MessageSearchScope {
+	const names = new Set((include ?? "").split(",").map((name) => name.trim()));
+	return {
+		subagents: names.has("subagents"),
+		system: names.has("system"),
+		tools: names.has("tools"),
+		archived: names.has("archived"),
+	} satisfies Record<(typeof SEARCH_INCLUDES)[number], boolean>;
+}
+
+function parseSections(value: string | undefined): SearchSection[] {
+	const names = new Set((value ?? "").split(",").map((name) => name.trim()));
+	const sections = SEARCH_SECTIONS.filter((section) => names.has(section));
+	return sections.length > 0 ? sections : [...SEARCH_SECTIONS];
+}
+
+type BaseQuery = {
+	q: string;
+	sort?: string;
+	include?: string;
+	projectId?: string;
+	from?: string;
+	to?: string;
+	mine?: string;
+	history?: string;
+	cursor?: string;
+};
+
+/** What every search request shares: query, sort, scope, filters and the viewer. */
+function baseOptions(query: BaseQuery, user: { sub: string; role: string }, signal: AbortSignal) {
+	const filters: SearchFilters = {
+		projectId: query.projectId,
+		from: query.from,
+		to: query.to,
+		ownerUserId: query.mine === "1" || query.mine === "true" ? user.sub : undefined,
+	};
+	return {
+		query: query.q.trim(),
+		sort: query.sort === "time" ? ("time" as const) : ("relevance" as const),
+		scope: parseScope(query.include),
+		filters,
+		// Session and message hits are filtered to what this user may read, knowledge hits by
+		// its own grants.
+		principal: { userId: user.sub, isAdmin: user.role === "admin" },
+		cursor: query.cursor,
+		fullHistory: query.history === "all",
+		signal,
+	};
+}
+
+/**
+ * Sectioned global search: `{ sections: { sessions?, knowledge? } }`, each a
+ * page `{ items, total, totalIsLowerBound, nextCursor }`. A cursor continues one section, so
+ * it is honoured only when `sections` names exactly one.
+ */
 searchRoutes.get("/", async (c) => {
-	const q = c.req.query("q");
-	if (!q?.trim()) return c.json({ results: [] });
-
-	const entitiesParam = c.req.query("entities") ?? "chapters,messages,narrators,knowledge";
-	const entities = entitiesParam
-		.split(",")
-		.filter((e): e is (typeof SEARCH_ENTITIES)[number] =>
-			(SEARCH_ENTITIES as readonly string[]).includes(e),
-		);
-
-	if (entities.length === 0) {
-		return c.json({ results: [] });
-	}
-
-	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
-	const limit = Math.max(1, Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 100));
-	const sort = c.req.query("sort") === "time" ? "time" : "relevance";
-
-	const user = c.get("user");
-	const principal = { userId: user.sub, isAdmin: user.role === "admin" };
-	const query = q.trim();
-
-	const results = await searchService.search({
-		query,
-		entities,
-		limit,
-		sort,
-		signal: c.req.raw.signal,
-		// Narrator and message hits are filtered to what this user may read; chapter
-		// hits are unaffected (chapters have no per-user ACL).
-		principal,
+	const parsed = searchSectionsQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const query = parsed.data;
+	if (!query.q.trim()) return c.json({ sections: {} });
+	const sections = parseSections(query.sections);
+	const limit = query.limit ?? 10;
+	const result = await searchService.searchSections({
+		...baseOptions(query, c.get("user"), c.req.raw.signal),
+		sections,
+		limits: Object.fromEntries(sections.map((section) => [section, limit])),
 	});
+	return c.json({ sections: result });
+});
 
-	// Knowledge lives on its own path: its visibility gate reads grants, so it
-	// cannot ride along in the SQL search. Merged here and re-sorted with
-	// the shared comparator so one ordering governs the whole response.
-	if (entities.includes("knowledge")) {
-		const knowledgeResults = await searchService.searchKnowledge({
-			query,
-			limit,
-			principal,
-			sort,
-			signal: c.req.raw.signal,
-		});
-		if (knowledgeResults.length > 0) {
-			return c.json({ results: sortSearchResults([...results, ...knowledgeResults], sort) });
-		}
-	}
-
-	return c.json({ results });
+/** More hits of one session, paged, for expanding its result card. */
+searchRoutes.get("/sessions/:narratorId/hits", async (c) => {
+	const parsed = searchSessionHitsQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const query = parsed.data;
+	if (!query.q.trim()) return c.json({ hits: [], nextCursor: null });
+	const result = await searchService.searchSessionHits({
+		...baseOptions(query, c.get("user"), c.req.raw.signal),
+		narratorId: c.req.param("narratorId"),
+		limit: query.limit,
+	});
+	return c.json(result);
 });

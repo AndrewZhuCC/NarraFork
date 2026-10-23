@@ -428,7 +428,7 @@ test.skipIf(!PG_ENABLED)(
 						contentJson: [{ type: "text", text: "first hello" }],
 					},
 				]);
-				consumeAgentMessageHistory(history, "first hello");
+				consumeAgentMessageHistory(history);
 				// track+consume only queue bookkeeping; the ack promise is not exposed here, so
 				// assert through the already-proven direct path above and the zero-touch gate.
 

@@ -33,7 +33,7 @@
  * - Capture runs through `tryCaptureHot`, so an over-budget scan returns null
  *   and continues in the background instead of stalling tool execution indefinitely
  *   (see `worktree-tree-snapshot.tryCaptureHot`). The
- *   `chapters.treeSnapshotsEnabled` escape hatch is honoured inside
+ *   `workspace.treeSnapshotsEnabled` escape hatch is honoured inside
  *   `captureSessionTree`, so it applies to every caller of this module.
  */
 import { lstat } from "node:fs/promises";

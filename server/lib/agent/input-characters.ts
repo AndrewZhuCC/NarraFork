@@ -265,6 +265,14 @@ async function measureInputCharacters(
 			case "thought":
 				await content(part.summary, category, depth + 1);
 				return;
+			// Tools declared mid-conversation (see tool-loading.ts) are tool definitions too.
+			case "tool_addition":
+			case "tool_removal":
+				await json(part.tool, "toolDefinition");
+				return;
+			case "additional_tools":
+				await json(part.tools, "toolDefinition");
+				return;
 			case "function_result":
 				if (typeof part.result === "string" || Array.isArray(part.result)) {
 					await content(part.result, "toolResult", depth + 1);
@@ -275,6 +283,8 @@ async function measureInputCharacters(
 			// Role describes history, not fixed runtime ownership. The caller selects the prefix.
 			await content(part.content, category, depth + 1);
 			await content(part.parts, category, depth + 1);
+			// Kimi declares mid-conversation tools on a `system` message (see tool-loading.ts).
+			if (part.tools !== undefined) await json(part.tools, "toolDefinition");
 			if (part.tool_calls) {
 				if (!Array.isArray(part.tool_calls)) fail("unsupported_input");
 				for (const call of part.tool_calls) {

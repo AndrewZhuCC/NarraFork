@@ -27,17 +27,28 @@
  *     single explicit target origin — never `"*"`, which would hand the token to whatever
  *     occupies the frame.
  *
- *  4. **The parent's origin is pinned on first contact** and every later message must
- *     match it. The parent is a `vscode-webview://…` (desktop) or the editor's own origin
- *     (code-server); neither is knowable in advance, so it cannot be a constant — but
- *     accepting a *changing* origin would defeat the check entirely.
+ *  4. **Only an APPROVED origin may be pinned**, and once pinned every later message must
+ *     match it. The parent is a `vscode-webview://…` (desktop, and code-server's webview
+ *     host) or, for a non-webview editor origin, an operator-configured embed origin. An
+ *     arbitrary web origin — the page an attacker would frame us from — is never pinnable,
+ *     so the bridge cannot be claimed by whoever merely messages first (see
+ *     {@link isPinnableOrigin}). This is paired with a server-sent `frame-ancestors` CSP
+ *     that stops such a page from framing the app at all; the two are defense in depth.
  *
  *  5. **Tokens are shape-validated** before being stored, and are never logged.
  *
- * What an attacker who framed this app would still need: the `nfEmbed` marker AND a token
- * that the backend accepts. Framing alone yields nothing, because the bridge only ever
- * emits a token to the origin that first spoke to it — the frame's own parent — which is
- * a party that could already read the token from the document it hosts.
+ * What an attacker who framed this app would still need: to BE an approved embedder (a
+ * `vscode-webview://` host or a configured origin) AND supply a token the backend accepts.
+ * Framing from an ordinary web origin yields nothing — it is refused a pin, so the bridge
+ * never emits the user's token to it.
+ *
+ * ⚠️ RESIDUAL REQUIREMENT. The strongest check available without changing the host is the
+ * origin allow-list above; it is not a cryptographic proof of identity. A code-server
+ * deployment whose editor origin is NOT a `vscode-webview://` URL must have that origin
+ * added to `allowedEmbedOrigins` (the same origins the backend trusts for CORS /
+ * `frame-ancestors`). A full handshake — an app-MINTED, single-use secret the host must
+ * echo — would need matching changes on the host side (`vscode-extension/src/`) and the
+ * server that mints it; the `nfEmbed` marker is NOT that secret (see guard #2).
  */
 
 import { endSession, getToken, onTokenChange, setToken } from "@frontend/lib/api/client";
@@ -84,8 +95,41 @@ export function isEmbeddedByHost(win: Window = window): boolean {
 
 export interface HostBridgeHandle {
 	dispose(): void;
-	/** The parent origin pinned on first contact, for tests and diagnostics. */
+	/** The parent origin pinned on first approved contact, for tests and diagnostics. */
 	readonly pinnedOrigin: string | null;
+}
+
+export interface HostBridgeOptions {
+	/**
+	 * Extra embed origins the operator has approved, beyond the always-trusted
+	 * `vscode-webview://` scheme and the app's own origin. These are the non-webview
+	 * editor origins (e.g. a code-server instance) and should match what the backend
+	 * trusts for CORS / `frame-ancestors`. Empty by default — an arbitrary web origin is
+	 * never pinnable without an explicit entry here.
+	 */
+	allowedEmbedOrigins?: readonly string[];
+}
+
+/**
+ * Whether `origin` is allowed to be pinned as the embedder.
+ *
+ * The embedder's origin is not knowable as a constant (the desktop webview carries a
+ * per-webview UUID), but its SHAPE is: it is a `vscode-webview://` origin, the app's own
+ * origin (same-origin framing cannot steal what it could already read), or an origin the
+ * operator explicitly approved. Everything else — the arbitrary web origin an attacker
+ * would frame us from — is refused, so "first to speak" can no longer win the bridge.
+ */
+export function isPinnableOrigin(
+	origin: string,
+	selfOrigin: string | null,
+	allowedEmbedOrigins: readonly string[],
+): boolean {
+	// An opaque/unattributable origin can never be pinned: doing so would make every later
+	// opaque sender match, i.e. the origin check would stop being a check.
+	if (!origin || origin === "null") return false;
+	if (origin.startsWith("vscode-webview://")) return true;
+	if (selfOrigin && origin === selfOrigin) return true;
+	return allowedEmbedOrigins.includes(origin);
 }
 
 /**
@@ -93,8 +137,21 @@ export interface HostBridgeHandle {
  *
  * Safe to call unconditionally on startup; the guards decide.
  */
-export function installHostBridge(win: Window = window): HostBridgeHandle | null {
+export function installHostBridge(
+	win: Window = window,
+	options: HostBridgeOptions = {},
+): HostBridgeHandle | null {
 	if (!isEmbeddedByHost(win)) return null;
+
+	const allowedEmbedOrigins = options.allowedEmbedOrigins ?? [];
+	// The app's own origin, for the same-origin allowance in `isPinnableOrigin`. A throw
+	// (exotic context) just drops that one allowance; the scheme/configured checks remain.
+	let selfOrigin: string | null = null;
+	try {
+		selfOrigin = new URL(win.location.href).origin;
+	} catch {
+		selfOrigin = null;
+	}
 
 	let pinnedOrigin: string | null = null;
 	let disposed = false;
@@ -109,13 +166,12 @@ export function installHostBridge(win: Window = window): HostBridgeHandle | null
 		if (!data || typeof data !== "object") return;
 		if (data.type !== BOOTSTRAP_MESSAGE && data.type !== SIGN_OUT_MESSAGE) return;
 
-		// Pin on first contact; refuse any later origin. The parent's origin is not
-		// knowable in advance (a per-webview UUID on desktop), so this is the strongest
-		// available check — and without it the origin check would be no check at all.
+		// Pin the FIRST approved origin; refuse any later origin. Only an approved origin
+		// (vscode-webview scheme, same-origin, or a configured embed origin) may be pinned,
+		// so an arbitrary framer cannot claim the bridge by messaging first — see
+		// `isPinnableOrigin` and guard #4 in the module header.
 		if (pinnedOrigin === null) {
-			// A `null` origin is unattributable, so it can never be pinned: doing so would
-			// make every subsequent opaque sender match.
-			if (!event.origin || event.origin === "null") return;
+			if (!isPinnableOrigin(event.origin, selfOrigin, allowedEmbedOrigins)) return;
 			pinnedOrigin = event.origin;
 		} else if (event.origin !== pinnedOrigin) {
 			return;

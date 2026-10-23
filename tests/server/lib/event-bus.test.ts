@@ -13,24 +13,24 @@ describe("eventBus", () => {
 		const received: NarraForkEvent[] = [];
 		const handler = (e: NarraForkEvent) => received.push(e);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		eventBus.on("chapter:created", handler as any);
+		eventBus.on("terminal:created", handler as any);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		handlers.push(() => eventBus.off("chapter:created", handler as any));
+		handlers.push(() => eventBus.off("terminal:created", handler as any));
 
-		eventBus.emit({ type: "chapter:created", chapterId: "c1", projectId: "p1" });
+		eventBus.emit({ type: "terminal:created", terminalId: "t1", narratorId: "n1" });
 		expect(received).toHaveLength(1);
-		expect(received[0].type).toBe("chapter:created");
+		expect(received[0].type).toBe("terminal:created");
 	});
 
 	it("does not deliver events of other types", () => {
 		const received: NarraForkEvent[] = [];
 		const handler = (e: NarraForkEvent) => received.push(e);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		eventBus.on("chapter:dormant", handler as any);
+		eventBus.on("terminal:exited", handler as any);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
-		handlers.push(() => eventBus.off("chapter:dormant", handler as any));
+		handlers.push(() => eventBus.off("terminal:exited", handler as any));
 
-		eventBus.emit({ type: "chapter:created", chapterId: "c1", projectId: "p1" });
+		eventBus.emit({ type: "terminal:created", terminalId: "t1", narratorId: "n1" });
 		expect(received).toHaveLength(0);
 	});
 
@@ -40,7 +40,7 @@ describe("eventBus", () => {
 		eventBus.onAny(handler);
 		handlers.push(() => eventBus.offAny(handler));
 
-		eventBus.emit({ type: "chapter:created", chapterId: "c1", projectId: "p1" });
+		eventBus.emit({ type: "terminal:created", terminalId: "t1", narratorId: "n1" });
 		eventBus.emit({ type: "narrator:status_changed", narratorId: "n1", status: "idle" });
 		expect(received).toHaveLength(2);
 	});

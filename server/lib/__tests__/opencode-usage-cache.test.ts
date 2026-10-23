@@ -1,7 +1,28 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Hono } from "hono";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import * as outbound from "../net/outbound-fetch";
 import { type CustomApiProviderConfig, settings } from "../settings";
+
+/**
+ * The POST refresh route runs `requireAdmin`, which authorizes against the LIVE role read
+ * through the session store, never the token's `role` claim. The middleware below only sets
+ * `c.get("user")`, so this seam resolves each principal's role by actor id. The two roles
+ * carry distinct subs (below) so a single test can exercise both without the lookup (or its
+ * cache) colliding. Without the seam a non-admin would 401 USER_GONE instead of 403.
+ */
+const OPENCODE_ADMIN_ID = "opencode-admin";
+const OPENCODE_USER_ID = "opencode-user";
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === OPENCODE_ADMIN_ID ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
 
 const originalProviders = settings.customApiProviders;
 const originalProxy = settings.proxy;
@@ -54,6 +75,7 @@ beforeEach(() => {
 });
 afterEach(() => mock.restore());
 afterAll(() => {
+	setAuthStores(undefined);
 	settings.customApiProviders = originalProviders;
 	settings.proxy = originalProxy;
 	syncOpencodeUsageCache();
@@ -70,7 +92,8 @@ function deferred() {
 function appForRole(role: "admin" | "user") {
 	const app = new Hono();
 	app.use("*", async (c, next) => {
-		c.set("user", { sub: "test", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		const sub = role === "admin" ? OPENCODE_ADMIN_ID : OPENCODE_USER_ID;
+		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	app.onError((error) => {

@@ -302,6 +302,3 @@ export function getPlanModeSystemReminder(
 	const fn = pickLocalizedValue(planModeSystemReminder, locale);
 	return fn(planFile, allowInline, planFileState);
 }
-
-// mergeSummaryLabels, MergeSummaryLabelKey, getMergeSummaryLabel
-// are now re-exported from ./i18n

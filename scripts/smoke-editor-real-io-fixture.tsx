@@ -1,6 +1,7 @@
 // Browser-only fixture. All document requests use the real route/service;
 // the synthetic identity is supplied by the isolated test server, not a JWT test.
 import { MantineProvider } from "@mantine/core";
+import { QueryClientProvider } from "@tanstack/react-query";
 import "@mantine/core/styles.css";
 import i18next from "i18next";
 import type { editor as Monaco } from "monaco-editor/editor/editor.api";
@@ -12,6 +13,9 @@ import { FileEditorContent } from "../frontend/components/narrator/file-editor/F
 import { loadMonaco } from "../frontend/components/narrator/file-editor/monaco-loader";
 import { FilePanelContent } from "../frontend/components/narrator/file-panel/FilePanelContent";
 import translations from "../frontend/locales/en/narrator.json";
+import { createSmokeEditorQueryClient } from "./smoke-editor-query-client";
+
+const queryClient = createSmokeEditorQueryClient();
 
 declare global {
 	interface Window {
@@ -155,36 +159,38 @@ async function fingerprintModel(model: Monaco.ITextModel | null | undefined) {
 }
 function renderViews(secondary = true) {
 	root.render(
-		<MantineProvider forceColorScheme="dark">
-			<I18nextProvider i18n={i18n}>
-				<div style={{ display: "flex", height: "100%" }}>
-					<div key="primary" style={{ width: "50%", height: "100%" }}>
-						<FilePane
-							rawProtocol={false}
-							key={documentGeneration}
-							filePath={config.path}
-							narratorId={config.narratorId}
-							deviceId={config.deviceId}
-							referenceOrigin
-							onDirtyChange={(value) => {
-								dirty = value;
-							}}
-						/>
-					</div>
-					{secondary && (
-						<div key="secondary" style={{ width: "50%", height: "100%" }}>
+		<QueryClientProvider client={queryClient}>
+			<MantineProvider forceColorScheme="dark">
+				<I18nextProvider i18n={i18n}>
+					<div style={{ display: "flex", height: "100%" }}>
+						<div key="primary" style={{ width: "50%", height: "100%" }}>
 							<FilePane
 								rawProtocol={false}
+								key={documentGeneration}
 								filePath={config.path}
 								narratorId={config.narratorId}
 								deviceId={config.deviceId}
 								referenceOrigin
+								onDirtyChange={(value) => {
+									dirty = value;
+								}}
 							/>
 						</div>
-					)}
-				</div>
-			</I18nextProvider>
-		</MantineProvider>,
+						{secondary && (
+							<div key="secondary" style={{ width: "50%", height: "100%" }}>
+								<FilePane
+									rawProtocol={false}
+									filePath={config.path}
+									narratorId={config.narratorId}
+									deviceId={config.deviceId}
+									referenceOrigin
+								/>
+							</div>
+						)}
+					</div>
+				</I18nextProvider>
+			</MantineProvider>
+		</QueryClientProvider>,
 	);
 }
 // Remote acceptance exercises one ordinary file panel; local scenarios also test shared views.

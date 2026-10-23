@@ -47,7 +47,7 @@ const expectedSharedBusinessErrors = [
 
 const methodCapabilityExamples = {
 	"queries.execute": ["query.read.projects"],
-	"commands.execute": ["command.chapter.write"],
+	"commands.execute": ["command.routine.write"],
 	"events.subscribe": ["event.subscribe.public"],
 	"events.unsubscribe": ["event.subscribe.public"],
 	"events.poll": ["event.subscribe.public"],

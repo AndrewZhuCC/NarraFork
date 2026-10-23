@@ -9,6 +9,13 @@ export interface ProviderPreset {
 	endpoints: Partial<Record<AddProviderType, string>>;
 	category?: "api" | "platform-login";
 	defaultProtocol?: AddProviderType;
+	/** Short tagline shown on the catalog card. */
+	descriptionKey?: string;
+	/**
+	 * UI languages (primary subtags, e.g. "zh") the preset is offered in. Omitted
+	 * means every language.
+	 */
+	languages?: readonly string[];
 }
 
 // Data only, adapted from @cherrystudio/provider-registry (MIT), Cherry Studio.
@@ -77,8 +84,11 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		id: "tokendance",
 		name: "TokenDance",
 		nameKey: "providerNames.tokendance",
+		descriptionKey: "providerDescriptions.tokendance",
 		category: "platform-login",
 		endpoints: {},
+		// TokenDance serves licensed domestic models for users in China.
+		languages: ["zh"],
 	},
 	preset("lmstudio", "LM Studio", {
 		"anthropic-messages": "http://localhost:1234/v1",
@@ -254,6 +264,13 @@ export function getProviderPresetName(
 	translate: (key: string) => string,
 ): string {
 	return provider.nameKey ? translate(provider.nameKey) : provider.name;
+}
+
+/** Whether a preset is offered in the given UI language (see `ProviderPreset.languages`). */
+export function isProviderPresetAvailable(provider: ProviderPreset, language: string): boolean {
+	if (!provider.languages) return true;
+	const primary = language.toLowerCase().split("-")[0] ?? "";
+	return provider.languages.includes(primary);
 }
 
 /** Match all terms against raw/localized names, id, aliases, protocols and API URLs. */

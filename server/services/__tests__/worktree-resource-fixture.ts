@@ -73,6 +73,8 @@ export function fixtureDatabase() {
 		schema.volumeSnapshots,
 		schema.volumeSnapshotApplications,
 		schema.aclGrants,
+		// Narrator ACL resolves a session's project through its primary link.
+		schema.narratorProjectLinks,
 	])
 		materialize(table);
 	return { sqlite, database: drizzle({ client: sqlite, schema }) };

@@ -3,6 +3,17 @@
 import { resolveProxyForUrl } from "../../server/lib/net/proxy";
 import { redactExperimentError } from "./error-redaction";
 
+/** What the episode harness needs from its client. */
+export type BenchAdapter = Pick<
+	BenchProvider,
+	| "injectSystemPrompt"
+	| "formatTools"
+	| "chat"
+	| "toolResult"
+	| "appendUserTurn"
+	| "appendAssistantTurn"
+>;
+
 export class BenchProvider {
 	private nativeAssistant: any[] = [];
 	constructor(
@@ -32,12 +43,18 @@ export class BenchProvider {
 					},
 		);
 	}
-	formatToolResult(id: string, output: string, isError: boolean, ..._rest: unknown[]) {
+
+	/**
+	 * The harness keeps its own wire history: this experiment client replays each turn's
+	 * native items verbatim instead of going through NarraFork's row projection (its
+	 * provider adapters would take the live database lock).
+	 */
+	toolResult(id: string, output: string, isError: boolean) {
 		return this.config.protocol === "anthropic"
 			? { type: "tool_result", tool_use_id: id, content: output, is_error: isError }
 			: { type: "function_call_output", call_id: id, output };
 	}
-	pushUserTurn(history: unknown[], content: string, _model: string, results: unknown[]) {
+	appendUserTurn(history: unknown[], content: string, results: unknown[]) {
 		if (this.config.protocol === "anthropic") {
 			if (results.length)
 				history.push({
@@ -50,7 +67,8 @@ export class BenchProvider {
 			if (content) history.push({ role: "user", content: [{ type: "input_text", text: content }] });
 		}
 	}
-	pushAssistantTurn(history: unknown[], ..._rest: unknown[]) {
+	/** The last response's native items, as the next request replays them. */
+	appendAssistantTurn(history: unknown[]) {
 		if (this.config.protocol === "anthropic")
 			history.push({ role: "assistant", content: structuredClone(this.nativeAssistant) });
 		else history.push(...structuredClone(this.nativeAssistant));
@@ -79,7 +97,7 @@ export class BenchProvider {
 		const history = params.history
 			.filter((m: any) => m.role !== "__system")
 			.map((m: any) => structuredClone(m));
-		this.pushUserTurn(history, params.content, params.model, params.toolResults);
+		this.appendUserTurn(history, params.content, params.toolResults);
 		const anthropic = this.config.protocol === "anthropic";
 		const body: any = anthropic
 			? {

@@ -2,7 +2,7 @@ import type { Statement } from "bun:sqlite";
 import { z } from "zod/v4";
 import { sqlite } from "../../../db";
 import { searchStore } from "../../../services/search/backend";
-import { canUseIndex, sanitizeQuery } from "../../../services/search/query";
+import { globalStrategy, sanitizeQuery } from "../../../services/search/query";
 import type { RecallMessageRow } from "../../../services/search/types";
 import { isBashToolName } from "../tool-name";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -37,9 +37,7 @@ let _getToolCallAny: Statement | null = null;
 
 function getNarratorStmt() {
 	if (!_getNarrator) {
-		_getNarrator = sqlite.prepare(
-			"SELECT id, title, chapter_id, model FROM narrators WHERE id = ?",
-		);
+		_getNarrator = sqlite.prepare("SELECT id, title, model FROM narrators WHERE id = ?");
 	}
 	return _getNarrator;
 }
@@ -267,7 +265,6 @@ interface SearchResultItem {
 	id: string;
 	narratorId: string;
 	narratorTitle: string | null;
-	chapterId: string | null;
 	role: string;
 	createdAt: string;
 	snippet: string;
@@ -499,7 +496,7 @@ async function handleSearch(
 
 	const rows: RecallMessageRow[] = await searchStore.searchRecallMessages({
 		text: safeQuery,
-		strategy: canUseIndex(safeQuery) ? "index" : "substring",
+		strategy: globalStrategy(safeQuery),
 		limit: cap,
 		// `null` widens the search to every narrator. The tool's permission flow has already
 		// approved that before this point; scoped mode resolves through the narrator's own
@@ -526,7 +523,6 @@ async function handleSearch(
 		id: row.messageId,
 		narratorId: row.narratorId,
 		narratorTitle: row.narratorTitle,
-		chapterId: row.chapterId,
 		role: row.role,
 		createdAt: row.createdAt,
 		snippet: row.snippet.replace(/\n/g, " ").slice(0, SNIPPET_CHARS),
@@ -540,7 +536,6 @@ async function handleSearch(
 			`- [${r.role}] message ${r.id}` +
 				`  narrator=${r.narratorId}` +
 				(r.narratorTitle ? ` ("${r.narratorTitle}")` : "") +
-				(r.chapterId ? `  chapter=${r.chapterId}` : "") +
 				`  at ${r.createdAt}` +
 				`\n  ${r.snippet}`,
 		);
@@ -583,7 +578,7 @@ function handleReadConversation(
 
 	// Verify narrator exists
 	const narrator = getNarratorStmt().get(targetNarratorId) as
-		| { id: string; title: string | null; chapter_id: string | null; model: string | null }
+		| { id: string; title: string | null; model: string | null }
 		| undefined;
 
 	if (!narrator) {
@@ -668,7 +663,6 @@ function handleReadConversation(
 
 	const header =
 		`Narrator: ${narrator.title ?? targetNarratorId}` +
-		(narrator.chapter_id ? ` (chapter ${narrator.chapter_id})` : "") +
 		(narrator.model ? ` [${narrator.model}]` : "") +
 		`\nShowing ${rows.length} message(s):\n`;
 
@@ -691,7 +685,6 @@ function handleReadConversation(
 			action: "read_conversation",
 			narratorId: targetNarratorId,
 			narratorTitle: narrator.title,
-			chapterId: narrator.chapter_id,
 			model: narrator.model,
 			messages,
 		},

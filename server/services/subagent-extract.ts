@@ -31,6 +31,13 @@ import type { Locale } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	flushChangedEnvelopes,
+	newEnvelopeColumns,
+	newEnvelopeFormat,
+} from "./narrator-block-sync";
+import { bodyColumns, fillBodies } from "./narrator-body-reads";
+import { insertEnvelope, insertEnvelopeQueued } from "./narrator-body-writes";
+import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
 	withSeqFloorRaiseScope,
@@ -57,8 +64,8 @@ type WriteAudience = "owner" | "project" | "public";
 /**
  * Resolve visibility/writeAudience for the extract.
  * Prefer the parent primary's audiences; clamp standalone extracts away from
- * "project" visibility (no chapterId means project resolution has nothing to
- * read). Missing parent → private/owner.
+ * "project" visibility (an extract carries no project, so project resolution has
+ * nothing to read). Missing parent → private/owner.
  */
 async function resolveExtractAudiences(source: {
 	parentNarratorId: string | null;
@@ -73,7 +80,7 @@ async function resolveExtractAudiences(source: {
 		if (parent?.visibility) visibility = parent.visibility as Visibility;
 		if (parent?.writeAudience) writeAudience = parent.writeAudience as WriteAudience;
 	}
-	// Extract is always standalone in v1; project-visible without a chapter is a trap.
+	// Extract is always standalone in v1; project-visible without a project is a trap.
 	if (visibility === "project") visibility = "private";
 	if (writeAudience === "project") writeAudience = "owner";
 	return { visibility, writeAudience };
@@ -143,10 +150,12 @@ export async function extractSubagentToPrimary(
 		const byId = new Map<string, typeof narratorMessages.$inferSelect>();
 		for (let i = 0; i < sourceRefs.length; i += CHUNK) {
 			const chunk = sourceRefs.slice(i, i + CHUNK).map((row) => row.messageId);
-			const rows = await db
-				.select()
-				.from(narratorMessages)
-				.where(inArray(narratorMessages.id, chunk));
+			const rows = fillBodies(
+				await db.query.narratorMessages.findMany({
+					...bodyColumns(),
+					where: inArray(narratorMessages.id, chunk),
+				}),
+			);
 			for (const msg of rows) byId.set(msg.id, msg);
 		}
 		for (const row of sourceRefs) {
@@ -166,7 +175,6 @@ export async function extractSubagentToPrimary(
 	const title = opts?.title?.trim() || defaultExtractTitle(source.title, subagentType, locale);
 
 	const workspace = {
-		chapterId: null,
 		cwd: source.cwd ?? null,
 		defaultDeviceId: source.defaultDeviceId ?? null,
 	};
@@ -178,7 +186,6 @@ export async function extractSubagentToPrimary(
 					.insert(narrators)
 					.values({
 						id,
-						chapterId: null,
 						type: "primary",
 						variant: "primary",
 						subagentType: null,
@@ -232,51 +239,55 @@ export async function extractSubagentToPrimary(
 				if (inheritMode === "full") {
 					for (const msg of orderedSourceMessages) {
 						const newMessageId = generateId();
-						tx.insert(narratorMessages)
-							.values({
-								id: newMessageId,
-								narratorId: id,
-								// Detach from the parent Agent tool-call tree so primary history
-								// builders that filter top-level messages keep this exploration.
-								parentToolUseId: null,
-								// New identity: never reuse the source SDK uuid.
-								messageUuid: null,
-								role: msg.role,
-								contentJson: msg.contentJson,
-								contextCharsJson: msg.contextCharsJson,
-								contentText: msg.contentText,
-								tokensIn: msg.tokensIn,
-								costUsd: msg.costUsd,
-								costStatus: msg.costStatus,
-								costMissingFields: msg.costMissingFields,
-								turnUsageJson: msg.turnUsageJson,
-								provider: msg.provider,
-								credentialId: msg.credentialId,
-								model: msg.model,
-								outputTokens: msg.outputTokens,
-								cachedInputTokens: msg.cachedInputTokens,
-								cacheCreationInputTokens: msg.cacheCreationInputTokens,
-								cacheCreation5mTokens: msg.cacheCreation5mTokens,
-								cacheCreation1hTokens: msg.cacheCreation1hTokens,
-								reasoningTokens: msg.reasoningTokens,
-								ttftMs: msg.ttftMs,
-								durationMs: msg.durationMs,
-								contextPercent: msg.contextPercent,
-								meterUsage: msg.meterUsage,
-								meterUnit: msg.meterUnit,
-								commitSha: msg.commitSha,
-								treeHashAfter: msg.treeHashAfter,
-								snapshotCommitSha: msg.snapshotCommitSha,
-								commandText: msg.commandText,
-								createdBy: msg.createdBy,
-								origin: msg.origin,
-								originLabel: msg.originLabel,
-								editedAt: msg.editedAt,
-								editedBy: msg.editedBy,
-								originalContentJson: msg.originalContentJson,
-								createdAt: msg.createdAt,
-							})
-							.run();
+						// Up to EXTRACT_FULL_MAX_MESSAGES copies: their rows are built by the sweep.
+						insertEnvelopeQueued(tx, {
+							id: newMessageId,
+							narratorId: id,
+							// Detach from the parent Agent tool-call tree so primary history
+							// builders that filter top-level messages keep this exploration.
+							parentToolUseId: null,
+							// New identity: never reuse the source SDK uuid.
+							messageUuid: null,
+							role: msg.role,
+							bodyFormat: newEnvelopeFormat(),
+							// A copy stays in the run that produced it.
+							turnId: msg.turnId,
+							// The subagent still authored what the new narrator holds (§6.3).
+							authorNarratorId: msg.authorNarratorId ?? msg.narratorId,
+							contentJson: msg.contentJson,
+							contextCharsJson: msg.contextCharsJson,
+							contentText: msg.contentText,
+							tokensIn: msg.tokensIn,
+							costUsd: msg.costUsd,
+							costStatus: msg.costStatus,
+							costMissingFields: msg.costMissingFields,
+							turnUsageJson: msg.turnUsageJson,
+							provider: msg.provider,
+							credentialId: msg.credentialId,
+							model: msg.model,
+							outputTokens: msg.outputTokens,
+							cachedInputTokens: msg.cachedInputTokens,
+							cacheCreationInputTokens: msg.cacheCreationInputTokens,
+							cacheCreation5mTokens: msg.cacheCreation5mTokens,
+							cacheCreation1hTokens: msg.cacheCreation1hTokens,
+							reasoningTokens: msg.reasoningTokens,
+							ttftMs: msg.ttftMs,
+							durationMs: msg.durationMs,
+							contextPercent: msg.contextPercent,
+							meterUsage: msg.meterUsage,
+							meterUnit: msg.meterUnit,
+							commitSha: msg.commitSha,
+							treeHashAfter: msg.treeHashAfter,
+							snapshotCommitSha: msg.snapshotCommitSha,
+							commandText: msg.commandText,
+							createdBy: msg.createdBy,
+							origin: msg.origin,
+							originLabel: msg.originLabel,
+							editedAt: msg.editedAt,
+							editedBy: msg.editedBy,
+							originalContentJson: msg.originalContentJson,
+							createdAt: msg.createdAt,
+						});
 
 						const seq = claimNextRefSeq(tx, id);
 						tx.insert(narratorMessageRefs)
@@ -292,23 +303,22 @@ export async function extractSubagentToPrimary(
 					}
 				} else if (contextSummary) {
 					const compactMsgId = generateId();
-					tx.insert(narratorMessages)
-						.values({
-							id: compactMsgId,
-							narratorId: id,
-							parentToolUseId: null,
-							role: "system",
-							contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
-							contextCharsJson: { segments: [] },
-							contentText:
-								locale === "zh-CN"
-									? `[来自子代理的压缩上下文：${source.title ?? sourceId}]`
-									: `[Compressed context extracted from subagent ${source.title ?? sourceId}]`,
-							origin: "system",
-							originLabel: `extractFromSubagent:${sourceId}`,
-							createdAt: now,
-						})
-						.run();
+					insertEnvelope(tx, {
+						id: compactMsgId,
+						narratorId: id,
+						parentToolUseId: null,
+						role: "system",
+						...newEnvelopeColumns(id),
+						contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+						contextCharsJson: { segments: [] },
+						contentText:
+							locale === "zh-CN"
+								? `[来自子代理的压缩上下文：${source.title ?? sourceId}]`
+								: `[Compressed context extracted from subagent ${source.title ?? sourceId}]`,
+						origin: "system",
+						originLabel: `extractFromSubagent:${sourceId}`,
+						createdAt: now,
+					});
 					const seq = claimNextRefSeq(tx, id);
 					tx.insert(narratorMessageRefs)
 						.values({
@@ -322,6 +332,7 @@ export async function extractSubagentToPrimary(
 				}
 
 				initializeRefSeqFloor(tx, id);
+				flushChangedEnvelopes();
 				return created;
 			}),
 		),

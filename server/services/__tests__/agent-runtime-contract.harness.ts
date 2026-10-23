@@ -60,7 +60,12 @@ export function createContractClock() {
 }
 
 export type ContractObservation =
-	| { kind: "pass-input"; userText: string; history: unknown[]; trailingToolResults?: unknown[] }
+	| {
+			kind: "pass-input";
+			userText: string;
+			history: ExecuteLoopOptions["history"];
+			startedWithToolResults?: boolean;
+	  }
 	| { kind: "simulated-model-call"; model: string; provider: string }
 	| { kind: "event"; stage: "produced" | "processed"; event: AgentEvent }
 	| { kind: "binding"; toolUseId: string; binding: ToolCallBinding }
@@ -129,9 +134,12 @@ export function createRuntimeContractHarness(scenario: RuntimeContractScenario) 
 		},
 		async runPass(
 			steps: readonly ContractStep[],
-			input: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults" | "hooks"> = {
+			input: Pick<
+				ExecuteLoopOptions,
+				"userText" | "history" | "startedWithToolResults" | "hooks"
+			> = {
 				userText: "contract input",
-				history: [],
+				history: { rows: [] },
 			},
 			processEventFn?: ProcessEventFn,
 		) {
@@ -139,7 +147,7 @@ export function createRuntimeContractHarness(scenario: RuntimeContractScenario) 
 				kind: "pass-input",
 				userText: input.userText,
 				history: structuredClone(input.history),
-				trailingToolResults: structuredClone(input.trailingToolResults),
+				startedWithToolResults: input.startedWithToolResults,
 			});
 			async function* source(): AsyncIterable<AgentEvent> {
 				record({ kind: "simulated-model-call", model: config.model, provider: config.provider });

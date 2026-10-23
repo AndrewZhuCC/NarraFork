@@ -68,10 +68,24 @@ export type NarratorTrait =
 	| "plan"
 	| "knowledge-steward"
 	| "scheduled"
-	| "imported";
+	| "imported"
+	| "bot";
 
 /** Trait marking a narrator whose history was imported from Claude Code or Codex. */
 export const IMPORTED_TRAIT = "imported";
+
+/**
+ * Trait marking a bot: a narrator people talk to through chat rooms rather than its
+ * transcript. They see only what it delivers with `Send({ user })`; the transcript is
+ * its backstage. Set at creation and never toggled — viewing the transcript (the
+ * monitor) is a view, not a change of kind.
+ */
+export const BOT_TRAIT = "bot";
+
+/** Whether the given traits mark this narrator as a bot. */
+export function isBotNarrator(raw: unknown): boolean {
+	return parseTraits(raw).includes(BOT_TRAIT);
+}
 
 /** Trait marking a Knowledge Steward narrator (a standalone knowledge-base management session). */
 export const KNOWLEDGE_KIND_TRAIT = "knowledge-steward";

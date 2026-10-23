@@ -170,7 +170,7 @@ describe("extractSubagentToPrimary", () => {
 		expect(extracted.systemPrompt).toBeNull();
 		expect(extracted.contextSystemChars).toBe(0);
 		expect(extracted.contextToolsChars).toBe(0);
-		expect(extracted.chapterId).toBeNull();
+		expect(extracted.contextProjectId).toBeNull();
 		expect(extracted.permissionMode).toBe("default");
 		expect(extracted.refsInheritedFrom).toBeNull();
 		expect(extracted.aclRootNarratorId).toBeNull();

@@ -81,6 +81,7 @@ describe("sub2api shape validation", () => {
 		};
 		expect(parseSub2ApiBalance(body)).toEqual({
 			scope: "subscription",
+			planName: "Premium",
 			unlimited: false,
 			amounts: [
 				{ unit: "USD", total: 10, used: 12, remaining: -2, window: "daily" },
@@ -91,9 +92,138 @@ describe("sub2api shape validation", () => {
 		const { subscription: _subscription, ...withoutSubscription } = body;
 		expect(parseSub2ApiBalance(withoutSubscription)).toEqual({
 			scope: "subscription",
+			planName: "Premium",
 			unlimited: false,
 			amounts: [],
 		});
+	});
+
+	test("the gateway's explicit -1 remaining distinguishes unlimited from unknown subscription", () => {
+		const base = { mode: "unrestricted", isValid: true, unit: "USD", planName: "Unlimited" };
+		const subscription = {
+			daily_limit_usd: null,
+			daily_usage_usd: 0,
+			weekly_limit_usd: null,
+			weekly_usage_usd: 0,
+			monthly_limit_usd: null,
+			monthly_usage_usd: 0,
+			expires_at: "2026-11-20T00:00:00Z",
+		};
+		expect(parseSub2ApiBalance({ ...base, remaining: -1, subscription })).toMatchObject({
+			scope: "subscription",
+			unlimited: true,
+			amounts: [],
+		});
+		expect(
+			parseSub2ApiBalance({
+				...base,
+				remaining: -1,
+				subscription: {
+					...subscription,
+					daily_limit_usd: 0,
+					weekly_limit_usd: 0,
+					monthly_limit_usd: 0,
+				},
+			})?.unlimited,
+		).toBe(true);
+		// Missing active subscription has no remaining field in the source response.
+		expect(parseSub2ApiBalance(base)).toMatchObject({ unlimited: false, amounts: [] });
+		expect(parseSub2ApiBalance({ ...base, subscription })).toMatchObject({
+			unlimited: false,
+			amounts: [],
+		});
+		const limited = parseSub2ApiBalance({
+			...base,
+			remaining: 0,
+			subscription: {
+				...subscription,
+				daily_limit_usd: 10,
+				daily_usage_usd: 12,
+			},
+		});
+		expect(limited?.unlimited).toBe(false);
+		expect(limited?.amounts[0]?.remaining).toBe(-2);
+		expect(parseSub2ApiBalance({ ...wallet, balance: -1 })).toMatchObject({
+			scope: "wallet",
+			unlimited: false,
+		});
+	});
+
+	test("subscription metadata preserves only explicit values and normalizes RFC3339 offsets", () => {
+		const parsed = parseSub2ApiBalance({
+			mode: "unrestricted",
+			isValid: true,
+			unit: "USD",
+			planName: "  Pro plan  ",
+			subscription: {
+				daily_limit_usd: 10,
+				daily_usage_usd: 1,
+				weekly_limit_usd: 50,
+				weekly_usage_usd: 4,
+				monthly_limit_usd: 100,
+				monthly_usage_usd: 6,
+				weekly_window_start: "2026-10-19T12:30:00+08:00",
+				expires_at: "2026-11-20T12:30:00.123456789+08:00",
+			},
+		});
+		expect(parsed).toMatchObject({
+			scope: "subscription",
+			planName: "Pro plan",
+			expiresAt: "2026-11-20T04:30:00.123Z",
+		});
+		expect(parsed?.amounts[1]).toMatchObject({
+			window: "weekly",
+			windowStart: "2026-10-19T04:30:00.000Z",
+		});
+		expect(parsed?.amounts[0]).not.toHaveProperty("windowStart");
+		expect(parsed?.amounts[2]).not.toHaveProperty("windowStart");
+		expect(JSON.stringify(parsed)).not.toContain("reset");
+	});
+
+	for (const value of [
+		null,
+		"",
+		"invalid",
+		"2026-02-30T10:00:00Z",
+		"2026-10-19",
+		"2026-10-19T10:00:00",
+		"1",
+		1,
+		true,
+		{},
+	]) {
+		test(`invalid optional subscription dates do not discard valid quota: ${JSON.stringify(value)}`, () => {
+			const parsed = parseSub2ApiBalance({
+				mode: "unrestricted",
+				isValid: true,
+				unit: "USD",
+				planName: "Pro",
+				subscription: {
+					weekly_limit_usd: 50,
+					weekly_usage_usd: 4,
+					weekly_window_start: value,
+					expires_at: value,
+				},
+			});
+			expect(parsed?.amounts).toEqual([
+				{ unit: "USD", remaining: 46, used: 4, total: 50, window: "weekly" },
+			]);
+			expect(parsed).not.toHaveProperty("expiresAt");
+		});
+	}
+
+	test("subscription metadata does not change wallet or key response shapes", () => {
+		const metadata = {
+			planName: "Not a subscription",
+			subscription: { expires_at: "2026-11-20T10:00:00Z" },
+		};
+		expect(parseSub2ApiBalance({ ...wallet, ...metadata })).toEqual(parseSub2ApiBalance(wallet));
+		const key = {
+			mode: "quota_limited",
+			isValid: true,
+			quota: { unit: "USD", limit: 10, used: 1, remaining: 9 },
+		};
+		expect(parseSub2ApiBalance({ ...key, ...metadata })).toEqual(parseSub2ApiBalance(key));
 	});
 
 	test.each([

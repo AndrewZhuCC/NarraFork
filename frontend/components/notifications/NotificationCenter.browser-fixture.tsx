@@ -29,7 +29,6 @@ const item: HumanAttentionItem = {
 	narratorTitle: "Browser owner",
 	parentNarratorId: null,
 	rootNarratorId: null,
-	chapterId: null,
 	createdAt: "2026-01-01T00:00:00.000Z",
 	blocking: false,
 	canAct: true,

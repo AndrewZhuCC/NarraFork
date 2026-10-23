@@ -1,6 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
+import type { AccountRole } from "../../services/registration/account-store";
 import type { AuthPrincipal } from "../auth";
 import {
 	requireAdmin,
@@ -10,6 +13,25 @@ import {
 } from "../auth";
 
 const adminUser = { sub: "auth-boundary-admin", role: "admin" as const, iat: 0, exp: 0 };
+
+/**
+ * `assertAdmin` authorizes against the LIVE role read through the session store, never the
+ * token's `role` claim, so a test that stands up a session admin must make the store report
+ * that user as an admin. Without this seam the lookup would hit the real (empty) database and
+ * the admin boundary would 401 even for a correctly-shaped admin principal.
+ */
+function withLiveSessionRole(role: AccountRole): void {
+	const original = authSessionStore;
+	const store: AuthSessionStore = {
+		...original,
+		findSessionState: async (id) => ({ id, role, tokenVersion: 0 }),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+}
+
+afterEach(() => {
+	setAuthStores(undefined);
+});
 
 function appWithPrincipal(principal: AuthPrincipal): Hono {
 	const app = new Hono();
@@ -48,6 +70,7 @@ describe("session/oauth auth boundary", () => {
 	});
 
 	test("allows a session admin and keeps the principal stable across auth middleware", async () => {
+		withLiveSessionRole("admin");
 		const app = appWithPrincipal({ type: "session", user: adminUser });
 		app.get("/", requireExternalAuth, requireSessionAuth, requireAdmin, (c) => {
 			expect(c.get("auth").type).toBe("session");
@@ -57,6 +80,18 @@ describe("session/oauth auth boundary", () => {
 		const response = await app.request("/");
 		expect(response.status).toBe(200);
 		expect(await response.text()).toBe("ok");
+	});
+
+	test("rejects a session token that claims admin when the live role is not admin", async () => {
+		// The forged/stale-token case: the JWT carries role:"admin" but the user row says
+		// otherwise. Authorization must follow the database, not the claim.
+		withLiveSessionRole("user");
+		const app = appWithPrincipal({ type: "session", user: adminUser });
+		app.get("/", requireExternalAuth, requireAdmin, (c) => c.text("ok"));
+
+		const response = await app.request("/");
+		expect(response.status).toBe(403);
+		expect(await response.json()).toMatchObject({ code: "FORBIDDEN" });
 	});
 
 	test("enforces an OAuth scope while allowing the legacy session path", async () => {

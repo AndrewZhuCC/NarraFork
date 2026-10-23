@@ -3,6 +3,8 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { CodexOAuthError } from "../../../server/lib/codex-auth";
 import { AppError } from "../../../server/lib/errors";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 
 type CodexTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
 
@@ -166,6 +168,23 @@ const authUser = {
 	iat: 0,
 	exp: Number.MAX_SAFE_INTEGER,
 };
+
+/**
+ * `assertAdmin` authorizes against the LIVE role read through the session store, never the
+ * token's `role` claim. The middleware below only sets `c.get("user")`, so this seam makes
+ * the store report the acting admin as an admin; without it the admin-gated routes would
+ * hit the real (empty) database and 401 USER_GONE.
+ */
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === authUser.sub ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 const app = new Hono();
 app.use("*", async (c, next) => {
 	c.set("auth", { type: "session", user: authUser });
@@ -194,6 +213,7 @@ beforeEach(() => {
 });
 
 afterAll(() => {
+	setAuthStores(undefined);
 	// Re-point every globally-mocked module back to the real implementation so
 	// settings / manager / logger mocks don't leak into later suites.
 	for (const [specifier, factory] of Object.entries(realCodexModules)) {

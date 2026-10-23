@@ -68,6 +68,16 @@ describe("resolveMessageSender", () => {
 		expect(resolveMessageSender(message({ origin: "external", contentJson: [] }))).toEqual({
 			kind: "system",
 		});
+		// A segment-compact marker is a user row with no origin, but the system wrote it.
+		expect(
+			resolveMessageSender(
+				message({
+					origin: null,
+					contentText: "[Segment Compact]\nsummary",
+					contentJson: [{ type: "segment_compact", status: "compacted", summary: "summary" }],
+				}),
+			),
+		).toEqual({ kind: "system" });
 	});
 	test("native system source beats label, unknown sources never invent names", () => {
 		expect(

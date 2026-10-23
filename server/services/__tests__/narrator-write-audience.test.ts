@@ -18,10 +18,10 @@
  *     reports `{read: true, write: true}` for a narrator that belongs to none, meaning
  *     "no gate at this level" rather than "unrestricted", so a bare `gate.write` test
  *     would turn this tier into "anyone may write" on standalone sessions.
- *  4. **"Which project" has exactly one definition** — chapter first, then
- *     `contextProjectId`, and a dangling chapter resolves to none. Both the row check
- *     and the SQL predicate must use it; the rows below are the only automated way to
- *     catch a divergence.
+ *  4. **"Which project" has exactly one definition** — `contextProjectId` first, then
+ *     the primary link the project index derived from the cwd; an additional link never
+ *     counts. Both the row check and the SQL predicate must use it; the rows below are
+ *     the only automated way to catch a divergence.
  *  5. **Write implies read, and never the reverse.** Someone who may drive a session
  *     must be able to see it, but the write audience must NOT be hoisted above the
  *     project gate the way `public` visibility is — that would make read wider than
@@ -35,8 +35,8 @@
  */
 import { beforeAll, describe, expect, test } from "bun:test";
 import { and, eq, sql } from "drizzle-orm";
-import { db, sqlite } from "../../db";
-import { aclGrants, chapters, narrators, projects, users } from "../../db/schema";
+import { db } from "../../db";
+import { aclGrants, narratorProjectLinks, narrators, projects, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import {
 	canReadNarrator,
@@ -58,9 +58,7 @@ let readMember: string;
 let outsider: string;
 
 let privateProject: string;
-let privateChapter: string;
 let publicProject: string;
-let publicChapter: string;
 
 const asUser = (userId: string): NarratorPrincipal => ({ userId, isAdmin: false });
 const asAdmin = (): NarratorPrincipal => ({ userId: `wa-admin-${TAG}`, isAdmin: true });
@@ -92,21 +90,6 @@ async function makeProject(visibility: "private" | "public"): Promise<string> {
 	return id;
 }
 
-async function makeChapter(projectId: string): Promise<string> {
-	const id = generateId();
-	const now = new Date().toISOString();
-	await db.insert(chapters).values({
-		id,
-		projectId,
-		title: `wa-chapter-${TAG}`,
-		branch: `wa/${id}`,
-		baseBranch: "main",
-		createdAt: now,
-		updatedAt: now,
-	});
-	return id;
-}
-
 /**
  * Insert a narrator, defaulting `visibility` to the narrowest one that keeps the pair
  * LEGAL for the requested write audience.
@@ -119,11 +102,15 @@ async function makeChapter(projectId: string): Promise<string> {
  *
  * `visibility` can still be passed explicitly, including illegal pairs: a few tests need
  * them precisely to prove nothing depends on that state being reachable.
+ *
+ * `indexedProjectId` places the narrator in a project through its working directory: a
+ * link the project index derived from its cwd (`linkRole`, primary by default).
  */
 async function makeNarrator(options: {
 	writeAudience?: string;
 	visibility?: string;
-	chapterId?: string | null;
+	indexedProjectId?: string | null;
+	linkRole?: "primary" | "additional";
 	contextProjectId?: string | null;
 	ownerUserId?: string | null;
 }): Promise<string> {
@@ -138,7 +125,7 @@ async function makeNarrator(options: {
 		id,
 		title: `wa-${TAG}`,
 		ownerUserId: options.ownerUserId === undefined ? owner : options.ownerUserId,
-		chapterId: options.chapterId ?? null,
+		cwd: options.indexedProjectId ? `/tmp/wa-${options.indexedProjectId}/work` : null,
 		contextProjectId: options.contextProjectId ?? null,
 		// Casts: the suite deliberately covers out-of-enum values to prove the checks
 		// fail closed, which the columns' TS enums would otherwise forbid.
@@ -147,32 +134,34 @@ async function makeNarrator(options: {
 		createdAt: now,
 		updatedAt: now,
 	});
+	if (options.indexedProjectId)
+		await db.insert(narratorProjectLinks).values({
+			narratorId: id,
+			projectId: options.indexedProjectId,
+			role: options.linkRole ?? "primary",
+			source: "cwd",
+			directory: `/tmp/wa-${options.indexedProjectId}/work`,
+			updatedAt: now,
+		});
 	return id;
 }
 
 /**
- * A narrator whose `chapterId` points nowhere, with `contextProjectId` also set.
+ * A narrator explicitly in the public project whose working directory is ALSO indexed
+ * into the private one, as an additional link.
  *
- * `narrators.chapter_id` is a foreign key with no cascade, so this state cannot be
- * produced by ordinary inserts or by deleting the chapter — both are refused. Foreign
- * keys are therefore suspended for the two statements that build it.
- *
- * Worth constructing anyway: the resolution rule says the chapter wins whenever it is
- * set, so a dangling one must resolve to "no project" rather than falling through to
- * `contextProjectId`. If SQL and the row check disagree there, they resolve DIFFERENT
- * projects for the same narrator, and no other fixture can catch it.
+ * The resolution rule says the explicit project is primary and an additional link
+ * confers nothing, so the private project's members must get no write through it. If SQL
+ * and the row check disagree here, they resolve DIFFERENT projects for the same
+ * narrator, and no other fixture can catch it.
  */
-async function makeDanglingChapterNarrator(contextProjectId: string): Promise<string> {
-	sqlite.exec("PRAGMA foreign_keys = OFF");
-	try {
-		return await makeNarrator({
-			writeAudience: "project",
-			chapterId: `missing-${generateId()}`,
-			contextProjectId,
-		});
-	} finally {
-		sqlite.exec("PRAGMA foreign_keys = ON");
-	}
+async function makeAdditionallyLinkedNarrator(): Promise<string> {
+	return await makeNarrator({
+		writeAudience: "project",
+		contextProjectId: publicProject,
+		indexedProjectId: privateProject,
+		linkRole: "additional",
+	});
 }
 
 async function grantProject(projectId: string, userId: string, capability: "read" | "write") {
@@ -212,12 +201,10 @@ beforeAll(async () => {
 	outsider = await makeUser("wa-outsider");
 
 	privateProject = await makeProject("private");
-	privateChapter = await makeChapter(privateProject);
 	await grantProject(privateProject, writeMember, "write");
 	await grantProject(privateProject, readMember, "read");
 
 	publicProject = await makeProject("public");
-	publicChapter = await makeChapter(publicProject);
 });
 
 // ─── 1. A read audience never confers write ──────────────────────────────
@@ -228,7 +215,7 @@ describe("read audience does not grant write", () => {
 			await makeNarrator({
 				visibility: "public",
 				writeAudience: "owner",
-				chapterId: privateChapter,
+				indexedProjectId: privateProject,
 			}),
 		);
 		expect(await canReadNarrator(row, asUser(outsider))).toBe(true);
@@ -236,7 +223,7 @@ describe("read audience does not grant write", () => {
 	});
 
 	test("the owner and admins always retain write", async () => {
-		const row = await rowOf(await makeNarrator({ chapterId: privateChapter }));
+		const row = await rowOf(await makeNarrator({ indexedProjectId: privateProject }));
 		expect(await canWriteNarrator(row, asUser(owner))).toBe(true);
 		expect(await canWriteNarrator(row, asAdmin())).toBe(true);
 	});
@@ -247,7 +234,7 @@ describe("read audience does not grant write", () => {
 describe("writeAudience=project", () => {
 	test("a project write member may drive it", async () => {
 		const row = await rowOf(
-			await makeNarrator({ writeAudience: "project", chapterId: privateChapter }),
+			await makeNarrator({ writeAudience: "project", indexedProjectId: privateProject }),
 		);
 		expect(await canWriteNarrator(row, asUser(writeMember))).toBe(true);
 		// And can therefore see it, without any narrator-level grant.
@@ -256,14 +243,14 @@ describe("writeAudience=project", () => {
 
 	test("a project READ member may not — that tier is 'cannot change the project'", async () => {
 		const row = await rowOf(
-			await makeNarrator({ writeAudience: "project", chapterId: privateChapter }),
+			await makeNarrator({ writeAudience: "project", indexedProjectId: privateProject }),
 		);
 		expect(await canWriteNarrator(row, asUser(readMember))).toBe(false);
 	});
 
 	test("someone outside the project may not", async () => {
 		const row = await rowOf(
-			await makeNarrator({ writeAudience: "project", chapterId: privateChapter }),
+			await makeNarrator({ writeAudience: "project", indexedProjectId: privateProject }),
 		);
 		expect(await canWriteNarrator(row, asUser(outsider))).toBe(false);
 	});
@@ -279,7 +266,7 @@ describe("writeAudience=project", () => {
 			await makeNarrator({
 				visibility: "project",
 				writeAudience: "project",
-				chapterId: publicChapter,
+				indexedProjectId: publicProject,
 			}),
 		);
 		expect(await canReadNarrator(row, asUser(outsider))).toBe(true);
@@ -300,10 +287,10 @@ describe("project resolution for the write audience", () => {
 		expect(await canWriteNarrator(row, asUser(writeMember))).toBe(false);
 	});
 
-	test("honours contextProjectId when there is no chapter", async () => {
+	test("honours contextProjectId when the directory is in no project", async () => {
 		// Externally provisioned standalone sessions carry the project this way. If
-		// `hasProject` used a narrower "chapter only" rule, this tier could never work
-		// for them while the gate still judged them against the project.
+		// `hasProject` used a narrower "indexed directory only" rule, this tier could never
+		// work for them while the gate still judged them against the project.
 		const row = await rowOf(
 			await makeNarrator({ writeAudience: "project", contextProjectId: privateProject }),
 		);
@@ -312,9 +299,14 @@ describe("project resolution for the write audience", () => {
 		expect(await canWriteNarrator(row, asUser(outsider))).toBe(false);
 	});
 
-	test("a dangling chapter resolves to no project, and contextProjectId does not rescue it", async () => {
-		const row = await rowOf(await makeDanglingChapterNarrator(privateProject));
+	test("an additional directory link confers no project write; the explicit project decides", async () => {
+		const row = await rowOf(await makeAdditionallyLinkedNarrator());
 		expect(await canWriteNarrator(row, asUser(writeMember))).toBe(false);
+		// Control: the same directory as the PRIMARY link does put it in that project.
+		const primary = await rowOf(
+			await makeNarrator({ writeAudience: "project", indexedProjectId: privateProject }),
+		);
+		expect(await canWriteNarrator(primary, asUser(writeMember))).toBe(true);
 	});
 });
 
@@ -323,7 +315,7 @@ describe("project resolution for the write audience", () => {
 describe("writeAudience=public", () => {
 	test("anyone who can reach the project may drive it", async () => {
 		const row = await rowOf(
-			await makeNarrator({ writeAudience: "public", chapterId: publicChapter }),
+			await makeNarrator({ writeAudience: "public", indexedProjectId: publicProject }),
 		);
 		expect(await canWriteNarrator(row, asUser(outsider))).toBe(true);
 		expect(await canWriteNarrator(row, asUser(readMember))).toBe(true);
@@ -342,7 +334,7 @@ describe("writeAudience=public", () => {
 			await makeNarrator({
 				visibility: "public",
 				writeAudience: "public",
-				chapterId: privateChapter,
+				indexedProjectId: privateProject,
 			}),
 		);
 		expect(await canWriteNarrator(row, asUser(outsider))).toBe(false);
@@ -361,24 +353,24 @@ describe("list predicate matches single-row decisions", () => {
 		const publicWaPrivateProject = await makeNarrator({
 			visibility: "public",
 			writeAudience: "public",
-			chapterId: privateChapter,
+			indexedProjectId: privateProject,
 		});
 		const projectWaPublicProject = await makeNarrator({
 			writeAudience: "project",
-			chapterId: publicChapter,
+			indexedProjectId: publicProject,
 		});
 		const projectWaContextProject = await makeNarrator({
 			writeAudience: "project",
 			contextProjectId: privateProject,
 		});
-		const projectWaDanglingChapter = await makeDanglingChapterNarrator(privateProject);
+		const projectWaAdditionalLink = await makeAdditionallyLinkedNarrator();
 		const publicWaNoProject = await makeNarrator({ writeAudience: "public" });
-		const ownerOnly = await makeNarrator({ chapterId: privateChapter });
+		const ownerOnly = await makeNarrator({ indexedProjectId: privateProject });
 		const ids = [
 			publicWaPrivateProject,
 			projectWaPublicProject,
 			projectWaContextProject,
-			projectWaDanglingChapter,
+			projectWaAdditionalLink,
 			publicWaNoProject,
 			ownerOnly,
 		];
@@ -415,7 +407,7 @@ describe("unknown values and defaults", () => {
 	test("an unrecognized writeAudience grants nothing, in SQL too", async () => {
 		const id = await makeNarrator({
 			writeAudience: "everyone-lol",
-			chapterId: privateChapter,
+			indexedProjectId: privateProject,
 		});
 		const row = await rowOf(id);
 		expect(await canWriteNarrator(row, asUser(writeMember))).toBe(false);
@@ -424,7 +416,7 @@ describe("unknown values and defaults", () => {
 	});
 
 	test("the default write audience is the widest the read audience permits", () => {
-		// Derived from visibility rather than from the chapter id, so a new narrator can
+		// Derived from visibility rather than from the project, so a new narrator can
 		// never start out with a write audience wider than its read audience.
 		expect(defaultWriteAudienceForNarrator("project")).toBe("project");
 		expect(defaultWriteAudienceForNarrator("private")).toBe("owner");

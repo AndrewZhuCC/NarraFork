@@ -10,14 +10,12 @@ import {
 } from "@tanstack/react-router";
 import type { Direction } from "dockview-react";
 import type React from "react";
-import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
 import { NarratorPanelSkeleton } from "../../components/narrator/NarratorPanelSkeleton";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
-import { legacyRouteErrorKey } from "../../components/project/legacy-chapter-redirect";
 import { readOpeningLod } from "../../hooks/useNarratorLod";
 import { narratorLoadingMetrics } from "../../lib/narrator-loading-metrics";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
@@ -38,11 +36,15 @@ const NarratorPanel = lazy(() =>
 		default: memo(m.NarratorPanel),
 	})),
 );
+const BotChatPage = lazy(() =>
+	import("../../components/chat/BotChatPage").then((m) => ({
+		default: m.BotChatPage,
+	})),
+);
 
 import { FocusChatHost } from "../../components/narrator/dock/FocusChatHost";
 import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
 import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDockContext";
-import { useChapter } from "../../hooks/useChapters";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import { useMobileTerminalDrawerOpen } from "../../hooks/useMobileTerminalDrawerOpen";
 import { useNarrator } from "../../hooks/useNarrator";
@@ -75,6 +77,11 @@ import {
 export const Route = createFileRoute("/narrators/$narratorId")({
 	component: NarratorDetailPage,
 });
+
+function routeErrorKey(error: unknown): "denied" | "missing" | "error" {
+	const status = error && typeof error === "object" && "status" in error ? error.status : null;
+	return status === 401 || status === 403 ? "denied" : status === 404 ? "missing" : "error";
+}
 
 /** Drop zone overlay styles for drag-to-split — static, no need to recreate per render. */
 const DROP_OVERLAY_STYLES: Record<string, React.CSSProperties> = {
@@ -137,6 +144,9 @@ function NarratorDetailPage() {
 	const hashMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	// scrollTo search param takes precedence over hash-based highlight
 	const highlightMessageId = scrollToMessageId ?? hashMessageId;
+	// Global search passes the matched term, so the jump lands on the row that contains it.
+	const highlightNeedle =
+		typeof search?.find === "string" && search.find ? search.find.slice(0, 64) : undefined;
 	const isMobile = useMobileViewport();
 
 	// Fetch narrator data for recent tab tracking
@@ -153,36 +163,43 @@ function NarratorDetailPage() {
 		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			((narrator as any).traits as string[]).includes("scheduled")
 		: false;
+	// A bot's page is its conversation. The transcript is the monitor: a view of the same
+	// narrator kept in the URL (linkable, left with Back), never a change to the bot. A
+	// deep link to a transcript message means the monitor too.
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const isBot = Array.isArray((narrator as any)?.traits)
+		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			((narrator as any).traits as string[]).includes("bot")
+		: false;
+	const monitoring = search?.view === "monitor" || !!highlightMessageId;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const legacyParentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterId = isSubagent ? null : ((narrator as any)?.chapterId as string | null | undefined);
-	const { data: chapter } = useChapter(chapterId ?? "");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const projectId = (chapter as any)?.projectId as string | undefined;
-
 	// Authorized navigation-only metadata never triggers parent detail/Git discovery.
 	const navigationSummary = narrator?.navigationSummary as
 		| {
 				parentNarratorId: string | null;
 				parentNarratorTitle: string | null;
-				chapterId: string | null;
-				chapterTitle: string | null;
-				projectId: string | null;
 		  }
 		| undefined;
 	const parentNarratorId = navigationSummary
 		? navigationSummary.parentNarratorId
 		: legacyParentNarratorId;
-	const parentChapterId = isSubagent ? navigationSummary?.chapterId : null;
-	const parentProjectId = isSubagent ? navigationSummary?.projectId : null;
 
 	// Record recent tab visit (skip for subagent narrators)
 	const narratorTitle = narrator?.title;
 	const narratorCwd = narrator?.cwd;
 	const narratorStatus = narrator?.status;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterTitle = (chapter as any)?.title as string | undefined;
+	const narratorSubstatus = useMemo(
+		() =>
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			Array.isArray((narrator as any)?.substatus)
+				? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					((narrator as any).substatus as unknown[]).filter(
+						(tag): tag is string => typeof tag === "string",
+					)
+				: undefined,
+		[narrator],
+	);
 	const { data: userPrefs, isLoading: userPrefsLoading } = useUserPreferences();
 
 	// First visit: register the tab on the server (once per narratorId)
@@ -207,36 +224,20 @@ function NarratorDetailPage() {
 			});
 			return;
 		}
-		if (chapterId) {
-			// Chapter-bound narrator: record as chapter tab
-			const displayTitle = narratorTitle || chapterTitle || "Chapter";
-			void recordRecentTabVisit({
-				type: "chapter",
-				id: chapterId,
-				narratorId: narratorId,
-				title: displayTitle,
-				subtitle: chapterTitle,
-				status: narratorStatus,
-				isScheduled,
-			});
-		} else {
-			void recordRecentTabVisit({
-				type: "narrator",
-				id: narratorId,
-				title: narratorTitle || "New conversation",
-				subtitle: narratorCwd,
-				status: narratorStatus,
-				isScheduled,
-			});
-		}
+		void recordRecentTabVisit({
+			type: "narrator",
+			id: narratorId,
+			title: narratorTitle || "New conversation",
+			subtitle: narratorCwd,
+			status: narratorStatus,
+			isScheduled,
+		});
 	}, [
 		narratorId,
-		chapterId,
 		narrator,
 		narratorTitle,
 		narratorCwd,
 		narratorStatus,
-		chapterTitle,
 		isSubagent,
 		isScheduled,
 		parentNarratorId,
@@ -313,33 +314,50 @@ function NarratorDetailPage() {
 	const { t: tt } = useTranslation("terminal");
 	const navigate = useNavigate();
 
-	// When navigated from narraflow graph, show minimize button to return to graph
-	const onMinimize = useCallback(() => {
-		if (projectId && chapterId) {
-			navigate({
-				to: "/projects/$projectId",
-				params: { projectId },
-				search: { focus: chapterId },
-			});
+	// Switch a bot between its conversation and its monitor, keeping where it was opened
+	// from. Opened from the conversation, the monitor is a step forward that closing
+	// steps back from, so chat → monitor → chat leaves no extra history entries.
+	const botViewSearch = useCallback(
+		(view: "chat" | "monitor") => ({
+			...(from ? { from } : {}),
+			...(workspaceId ? { workspaceId } : {}),
+			...(view === "monitor" ? { view } : {}),
+		}),
+		[from, workspaceId],
+	);
+	const openBotMonitor = useCallback(() => {
+		navigate({
+			to: "/narrators/$narratorId",
+			params: { narratorId },
+			search: botViewSearch("monitor"),
+			state: (prev) => ({ ...prev, botMonitorFromChat: true }),
+		});
+	}, [navigate, narratorId, botViewSearch]);
+	const closeBotMonitor = useCallback(() => {
+		if (router.state.location.state.botMonitorFromChat) {
+			router.history.back();
+			return;
 		}
-	}, [navigate, projectId, chapterId]);
-	const showMinimize = from === "graph" && !!projectId && !!chapterId;
+		navigate({
+			to: "/narrators/$narratorId",
+			params: { narratorId },
+			search: botViewSearch("chat"),
+			replace: true,
+		});
+	}, [navigate, router, narratorId, botViewSearch]);
 
-	// Return to the originating workspace before applying subagent navigation defaults.
+	// A bot's monitor returns to its conversation; otherwise return to the originating
+	// workspace before applying subagent navigation defaults.
 	const onBack = useCallback(() => {
-		if (fromWorkspace && workspaceId) {
+		if (isBot && monitoring) {
+			closeBotMonitor();
+		} else if (fromWorkspace && workspaceId) {
 			navigate({
 				to: "/narrators/workspace/$workspaceId",
 				params: { workspaceId },
 			});
 		} else if (isSubagent) {
-			if (from === "graph" && parentProjectId && parentChapterId) {
-				navigate({
-					to: "/projects/$projectId",
-					params: { projectId: parentProjectId },
-					search: { focus: parentChapterId },
-				});
-			} else if (parentNarratorId) {
+			if (parentNarratorId) {
 				navigate({
 					to: "/narrators/$narratorId",
 					params: { narratorId: parentNarratorId },
@@ -352,23 +370,17 @@ function NarratorDetailPage() {
 			navigate({ to: ".." });
 		}
 	}, [
+		isBot,
+		monitoring,
+		closeBotMonitor,
 		fromWorkspace,
 		workspaceId,
 		isSubagent,
 		from,
-		parentProjectId,
-		parentChapterId,
 		parentNarratorId,
 		navigate,
 	]);
-
-	const [forkMessageId, setForkMessageId] = useState<string | null>(null);
-	const handleForkFromMessage = useCallback(
-		(messageId: string) => {
-			if (chapterId) setForkMessageId(messageId);
-		},
-		[chapterId],
-	);
+	const hasBack = isSubagent || fromWorkspace || (isBot && monitoring);
 
 	// Mobile drawer: auto-close when the last terminal exits
 	const handleTerminalExit = useCallback(() => {
@@ -491,8 +503,33 @@ function NarratorDetailPage() {
 	if (narratorError || !narrator)
 		return (
 			<Alert color="red">
-				{tns(`legacyRoute.${narratorError ? legacyRouteErrorKey(narratorError) : "missing"}`)}
+				{tns(`legacyRoute.${narratorError ? routeErrorKey(narratorError) : "missing"}`)}
 			</Alert>
+		);
+
+	if (isBot && !monitoring)
+		return (
+			<Suspense
+				fallback={
+					<Center h={APP_SHELL_CONTENT_HEIGHT}>
+						<Loader size="sm" />
+					</Center>
+				}
+			>
+				<BotChatPage
+					key={narratorId}
+					narratorId={narratorId}
+					title={narratorTitle}
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					handle={(narrator as any).handle as string | null | undefined}
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					avatarImageId={(narrator as any).avatarImageId as string | null | undefined}
+					status={narratorStatus}
+					substatus={narratorSubstatus}
+					onMonitor={openBotMonitor}
+					onBack={fromWorkspace ? onBack : undefined}
+				/>
+			</Suspense>
 		);
 
 	// The provider and portal owner never cross the responsive identity boundary.
@@ -500,11 +537,8 @@ function NarratorDetailPage() {
 		<NarratorDockProvider
 			key={narratorId}
 			narratorId={narratorId}
-			chapterId={chapterId}
-			onForkFromMessage={chapterId ? handleForkFromMessage : null}
 			highlightMessageId={highlightMessageId}
-			onBack={isSubagent || fromWorkspace ? onBack : null}
-			onMinimize={showMinimize ? onMinimize : null}
+			onBack={hasBack ? onBack : null}
 		>
 			<Box
 				ref={mergedRef}
@@ -532,7 +566,7 @@ function NarratorDetailPage() {
 								onHeaderPointerDown={isMobile ? undefined : onHeaderPointerDown}
 								onViewSubagentSession={onViewSubagentSession}
 								highlightMessageId={highlightMessageId}
-								onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
+								highlightNeedle={highlightNeedle}
 								onSendToTerminal={isMobile && !isSubagent ? handleSendToTerminal : undefined}
 								appendInputRef={isMobile && !isSubagent ? appendInputRef : undefined}
 								terminalOpen={isMobile && !isSubagent ? drawerOpened : undefined}
@@ -543,8 +577,7 @@ function NarratorDetailPage() {
 											: openDrawerWithTerminal
 										: undefined
 								}
-								onMinimize={showMinimize ? onMinimize : undefined}
-								onBack={isSubagent || fromWorkspace ? onBack : undefined}
+								onBack={hasBack ? onBack : undefined}
 								specPanelOpen={isMobile ? specDrawerOpened : undefined}
 								onToggleSpecPanel={
 									isMobile ? (specDrawerOpened ? closeSpecDrawer : openSpecDrawer) : undefined
@@ -620,16 +653,6 @@ function NarratorDetailPage() {
 				</FocusChatHost>
 
 				{/* Drop zone overlay for drag-to-split (drag another narrator here) */}
-				{chapterId && forkMessageId && (
-					<ChapterForkModal
-						chapterId={chapterId}
-						chapterStatus={(chapter as { status?: string } | undefined)?.status}
-						forkAtMessageId={forkMessageId}
-						opened
-						onClose={() => setForkMessageId(null)}
-					/>
-				)}
-
 				{dropSide && (
 					<Box
 						style={{

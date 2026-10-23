@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+// A zero-delay timer, not setImmediate: Bun can leave a queued immediate waiting on its next
+// long poll (up to ~1s), the same stall revert-selection-service.ts avoids.
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeRevertAction,
 	type FileChangeState,
 } from "@shared/file-change-protocol";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narratorMessageRefs,
@@ -32,6 +34,7 @@ import {
 	type LocalFileChangeRuntime,
 } from "./file-change-runtime";
 import { assertNarratorAccess, type NarratorAclRow, type NarratorPrincipal } from "./narrator-acl";
+import { boundedStoredBody } from "./narrator-body-reads";
 import { resolveNarratorProjectId } from "./narrator-project";
 import type { ScopedRevertUnavailableReason } from "./narrator-scoped-revert";
 import {
@@ -116,7 +119,6 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 				writeAudience: narrators.writeAudience,
 				type: narrators.type,
 				aclRootNarratorId: narrators.aclRootNarratorId,
-				chapterId: narrators.chapterId,
 				contextProjectId: narrators.contextProjectId,
 				cwd: narrators.cwd,
 			})
@@ -125,7 +127,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			.get();
 		if (!row) throw new NotFoundError("Narrator", narratorId);
 		await assertNarratorAccess(row, principal, "write");
-		// A subagent row carries no chapter/project of its own; its project is the
+		// A subagent row carries no project of its own; its project is the
 		// delegation root's. Without this, reverting inside a subagent would skip the
 		// project write gate its parent is held to.
 		const projectRow =
@@ -133,10 +135,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 				? await (async () => {
 						const rootId = await resolveNarratorAdmissionRoot(narratorId);
 						const root = db
-							.select({
-								chapterId: narrators.chapterId,
-								contextProjectId: narrators.contextProjectId,
-							})
+							.select({ id: narrators.id, contextProjectId: narrators.contextProjectId })
 							.from(narrators)
 							.where(eq(narrators.id, rootId))
 							.get();
@@ -145,7 +144,6 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 					})()
 				: row;
 		const projectId = await resolveNarratorProjectId(projectRow);
-		if (projectRow.chapterId && !projectId) throw new NotFoundError("Narrator project", narratorId);
 		if (projectId) {
 			const project = db
 				.select({
@@ -287,7 +285,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 						hash.update(
 							observed.bytes.subarray(offset, offset + FILE_CHANGE_LIMITS.streamChunkBytes),
 						);
-						await yieldToEventLoop();
+						await yieldToEventLoop(0);
 					}
 					state = {
 						kind: "regular",
@@ -496,17 +494,8 @@ export async function prepareLocalRevertAction(
 				throw new ValidationError("An edit preview keeps the complete user message");
 			if (index === undefined || !Number.isSafeInteger(index) || index < 0)
 				throw new ValidationError("A valid block index is required");
-			// Bound JSON1 parsing on the HTTP thread; never select the complete message body.
-			const body = sql`CASE WHEN octet_length(${narratorMessages.contentJson}) <= ${FILE_CHANGE_LIMITS.summaryBytes}
-				THEN CASE WHEN json_valid(${narratorMessages.contentJson}) THEN ${narratorMessages.contentJson} ELSE NULL END
-				ELSE NULL END`;
-			const message = db
-				.select({
-					role: narratorMessages.role,
-					blockCount: sql<number | null>`json_array_length(${body})`,
-					blockType: sql<string | null>`json_extract(${body}, ${`$[${index}].type`})`,
-					toolUseId: sql<string | null>`json_extract(${body}, ${`$[${index}].id`})`,
-				})
+			const found = db
+				.select({ role: narratorMessages.role })
 				.from(narratorMessageRefs)
 				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 				.where(
@@ -516,7 +505,8 @@ export async function prepareLocalRevertAction(
 					),
 				)
 				.get();
-			if (!message) throw new NotFoundError("Message", input.messageId);
+			if (!found) throw new NotFoundError("Message", input.messageId);
+			const message = { role: found.role, ...boundaryElement(input.messageId, index) };
 			if (message.blockCount === null)
 				throw new RevertPlannerError(
 					"BUDGET_EXCEEDED",
@@ -536,6 +526,9 @@ export async function prepareLocalRevertAction(
 			} else {
 				if (message.blockType !== "tool_use" || typeof message.toolUseId !== "string")
 					throw new ValidationError("The selected block is not a tool call");
+				// Every execution attempt of the call (docs/BLOCK_STORAGE-DESIGN.md §5.5): a re-run
+				// tool has one ledger row per attempt, and each one's file changes belong to the
+				// tool block being deleted.
 				const tools = db
 					.select({ id: narratorToolCalls.id })
 					.from(narratorToolCalls)
@@ -545,15 +538,21 @@ export async function prepareLocalRevertAction(
 							eq(narratorToolCalls.toolUseId, message.toolUseId),
 						),
 					)
-					.limit(2)
+					.orderBy(narratorToolCalls.id)
+					.limit(FILE_CHANGE_LIMITS.historyToolRelatedChanges + 1)
 					.all();
-				if (tools.length !== 1)
+				if (tools.length === 0)
 					throw new RevertPlannerError(
 						"EVIDENCE_INCOMPLETE",
-						"The selected tool has no unique execution identity",
+						"The selected tool has no execution record",
+					);
+				if (tools.length > FILE_CHANGE_LIMITS.historyToolRelatedChanges)
+					throw new RevertPlannerError(
+						"BUDGET_EXCEEDED",
+						"The selected tool has more execution attempts than one rollback covers",
 					);
 				kind = "history_delete";
-				selector = { kind: "tool_calls", toolCallIds: [tools[0].id] };
+				selector = { kind: "tool_calls", toolCallIds: tools.map((tool) => tool.id) };
 			}
 		}
 		const result = await prepareLocalRevertPlanCore({
@@ -739,4 +738,30 @@ export async function applyLocalRevertPlan(
 	return refreshFailed && response.status === "committed"
 		? { ...response, reason: response.reason ?? "POST_COMMIT_REFRESH_FAILED" }
 		: response;
+}
+
+/**
+ * How many elements a message's body has, and the type and id of element `index`: the body
+ * as readers read it (`narrator-bodies.ts`), measured before it is read and parsed only
+ * within the HTTP thread's budget. A null count when it exceeds the budget or is no JSON.
+ */
+function boundaryElement(
+	messageId: string,
+	index: number,
+): { blockCount: number | null; blockType: string | null; toolUseId: string | null } {
+	const text = boundedStoredBody(messageId, FILE_CHANGE_LIMITS.summaryBytes);
+	let body: unknown;
+	try {
+		body = text === undefined ? undefined : JSON.parse(text);
+	} catch {
+		body = undefined;
+	}
+	if (body === undefined) return { blockCount: null, blockType: null, toolUseId: null };
+	const elements = Array.isArray(body) ? body : [];
+	const element = elements[index] as { type?: unknown; id?: unknown } | null | undefined;
+	return {
+		blockCount: elements.length,
+		blockType: typeof element?.type === "string" ? element.type : null,
+		toolUseId: typeof element?.id === "string" ? element.id : null,
+	};
 }

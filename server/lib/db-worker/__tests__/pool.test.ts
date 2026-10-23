@@ -369,17 +369,51 @@ describe("worker pool", () => {
 	 */
 	test("grows to the configured concurrency for simultaneous tasks", async () => {
 		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "4";
-		const tasks = ["narrators", "projects", "api_requests", "narrator_messages"].map((name) =>
-			runReadTask<StorageScanTablesResult>(dbPath, {
-				kind: "storageScanTables",
-				tableNames: [name],
-			}),
+		const releasePath = join(home, "release-concurrent-tasks");
+		const specifier = writeWorkerFixture(
+			home,
+			"barrier-worker.ts",
+			`
+	import { existsSync } from "node:fs";
+	self.onmessage = async (event) => {
+		if (event.data?.type !== "task") return;
+		const { requestId, params } = event.data;
+		postMessage({ type: "progress", requestId, tableName: params.tableNames[0], done: 0, total: 1 });
+		while (!existsSync(${JSON.stringify(releasePath)})) await Bun.sleep(10);
+		postMessage({ type: "result", requestId, result: params.tableNames[0], durationMs: 0 });
+	};
+	`,
 		);
-		// Sample while the tasks are still in flight: all four must be resident simultaneously.
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		const peak = getDbWorkerPoolStats().workers;
-		await Promise.all(tasks);
-		expect(peak).toBe(4);
+		setDbWorkerSpecifiersForTest([specifier]);
+		const started = new Set<string>();
+		const allStarted = Promise.withResolvers<void>();
+		const names = ["narrators", "projects", "api_requests", "narrator_messages"];
+		const tasks = names.map((name) =>
+			runReadTask<string>(
+				dbPath,
+				{ kind: "storageScanTables", tableNames: [name] },
+				{
+					timeoutMs: 60_000,
+					onProgress: ({ tableName }) => {
+						started.add(tableName);
+						if (started.size === names.length) allStarted.resolve();
+					},
+				},
+			),
+		);
+		const completed = Promise.all(tasks);
+		try {
+			// Readiness can take longer than 50ms on CI. Hold every task at a barrier instead
+			// of sampling startup timing; four resident workers alone would not prove concurrency.
+			await Promise.race([allStarted.promise, completed]);
+			expect(started.size).toBe(4);
+			expect(getDbWorkerPoolStats().workers).toBe(4);
+			expect(getDbWorkerPoolStats().busy).toBe(4);
+		} finally {
+			writeFileSync(releasePath, "release");
+			await completed;
+		}
+		expect(await completed).toEqual(names);
 	}, 90_000);
 
 	test("serves more concurrent tasks than workers by queueing", async () => {

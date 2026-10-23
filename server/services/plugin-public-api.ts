@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
-import { chapters, narratorMessages, narrators } from "../db/schema";
+import { narratorMessages, narrators } from "../db/schema";
 import { BOOLEAN_OVERRIDE_VALUES, type BooleanOverride } from "../lib/boolean-override";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
@@ -10,6 +10,7 @@ import type { Capability } from "../lib/plugins/permissions";
 import type { JsonValue, PublicErrorCode } from "../lib/plugins/protocol";
 import { EXTERNAL_V1_MAX_MESSAGE_CHARS } from "../lib/validators/external";
 import { listIntegrationProjects } from "./integration-resource-service";
+import { narratorProjectIdColumn } from "./narrator-project";
 import { narratorService } from "./narrator-service";
 import {
 	addSpecTaskForPlugin as addSpecTaskForPluginSession,
@@ -334,15 +335,7 @@ type GatewayAuthorizationDecision =
 	  };
 
 export type PublicResource = {
-	type:
-		| "plugin"
-		| "user"
-		| "project"
-		| "workspace"
-		| "chapter"
-		| "narrator"
-		| "provider"
-		| "device";
+	type: "plugin" | "user" | "project" | "workspace" | "narrator" | "provider" | "device";
 	id: string;
 };
 
@@ -1128,23 +1121,6 @@ export interface ProjectListSource {
 	updatedAt: string;
 }
 
-export interface ChapterListSource {
-	id: string;
-	projectId: string;
-	title: string;
-	/**
-	 * Keeps `frozen` even though the column no longer produces it (see schema.ts).
-	 * This is a published plugin contract: narrowing it would turn a request that
-	 * used to return an empty list into a validation failure for any plugin still
-	 * passing the old value. It simply never matches now.
-	 */
-	status: "active" | "dormant" | "merged" | "abandoned" | "frozen";
-	role: "trunk" | "branch" | "exploration" | "review";
-	commitCount: number | null;
-	createdAt: string;
-	updatedAt: string;
-}
-
 export interface PluginListCursor {
 	pluginId: string;
 }
@@ -1189,19 +1165,6 @@ export interface ProjectQueryAdapter {
 	}): Promise<ProjectListSource[]>;
 }
 
-export interface ChapterQueryAdapter {
-	list(input: {
-		limit: number;
-		after?: TimestampCursor;
-		projectId: string;
-		chapterId?: string;
-		status?: Array<"active" | "dormant" | "merged" | "abandoned" | "frozen">;
-		role?: Array<"trunk" | "branch" | "exploration" | "review">;
-		context: HostCallContext;
-		signal: AbortSignal;
-	}): Promise<ChapterListSource[]>;
-}
-
 export interface PluginLifecycleAdapter {
 	enable(
 		pluginId: string,
@@ -1216,12 +1179,11 @@ export interface PluginLifecycleAdapter {
 }
 
 /**
- * Public narrator summary. A bounded projection of `narrators` joined with its
- * chapter's project; never carries `systemPrompt`, `cwd` or raw JSON columns.
+ * Public narrator summary. A bounded projection of `narrators` with its project; never
+ * carries `systemPrompt`, `cwd` or raw JSON columns.
  */
 export interface NarratorListSource {
 	id: string;
-	chapterId: string | null;
 	projectId: string | null;
 	title: string | null;
 	handle: string | null;
@@ -1242,7 +1204,6 @@ export interface NarratorQueryAdapter {
 		limit: number;
 		after?: TimestampCursor;
 		projectId?: string;
-		chapterId?: string;
 		status?: Array<"idle" | "working" | "waiting" | "archived">;
 		context: HostCallContext;
 		signal: AbortSignal;
@@ -1283,7 +1244,6 @@ export interface NarratorCommandAdapter {
 		title?: string;
 		model?: string;
 		cwd?: string;
-		chapterId?: string | null;
 		permissionMode?: string;
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		type?: "primary" | "subagent";
@@ -1366,7 +1326,6 @@ export interface NarratorCommandAdapter {
 export interface PluginPublicApiAdapters {
 	plugins?: PluginQueryAdapter;
 	projects?: ProjectQueryAdapter;
-	chapters?: ChapterQueryAdapter;
 	pluginLifecycle?: PluginLifecycleAdapter;
 	narrators?: NarratorQueryAdapter;
 	narratorCommands?: NarratorCommandAdapter;
@@ -1389,28 +1348,11 @@ export const projectsListInputSchema = z
 			.optional(),
 	})
 	.strict();
-export const chaptersListInputSchema = z
-	.object({
-		...listInputBase,
-		projectId: idSchema,
-		status: z
-			.array(z.enum(["active", "dormant", "merged", "abandoned", "frozen"]))
-			.min(1)
-			.max(5)
-			.optional(),
-		role: z
-			.array(z.enum(["trunk", "branch", "exploration", "review"]))
-			.min(1)
-			.max(4)
-			.optional(),
-	})
-	.strict();
 export const pluginLifecycleInputSchema = z.object({ pluginId: pluginIdSchema }).strict();
 export const narratorsListInputSchema = z
 	.object({
 		...listInputBase,
 		projectId: idSchema.optional(),
-		chapterId: idSchema.optional(),
 		status: z
 			.array(z.enum(["idle", "working", "waiting", "archived"]))
 			.min(1)
@@ -1439,7 +1381,6 @@ export const narratorCreateInputSchema = z
 		title: z.string().min(1).max(200).optional(),
 		model: z.string().min(1).max(200).optional(),
 		cwd: z.string().min(1).max(4096).optional(),
-		chapterId: idSchema.nullish(),
 		permissionMode: z
 			.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"])
 			.optional(),
@@ -1586,19 +1527,6 @@ function mapProjectSummary(row: ProjectListSource): Record<string, JsonValue> {
 	};
 }
 
-function mapChapterSummary(row: ChapterListSource): Record<string, JsonValue> {
-	return {
-		id: row.id,
-		projectId: row.projectId,
-		title: boundedSummaryText(row.title, 1_024) ?? "",
-		status: row.status,
-		role: row.role,
-		commitCount: Math.max(0, Math.trunc(row.commitCount ?? 0)),
-		createdAt: row.createdAt,
-		updatedAt: row.updatedAt,
-	};
-}
-
 /** Parse the `substatus` JSON-array text column defensively; never throw. */
 function parseNarratorSubstatus(raw: string | null): string[] {
 	if (!raw) return [];
@@ -1614,7 +1542,6 @@ function parseNarratorSubstatus(raw: string | null): string[] {
 function mapNarratorSummary(row: NarratorListSource): Record<string, JsonValue> {
 	return {
 		id: row.id,
-		chapterId: row.chapterId ?? null,
 		projectId: row.projectId ?? null,
 		title: boundedSummaryText(row.title ?? undefined, 1_024) ?? null,
 		handle: boundedSummaryText(row.handle ?? undefined, 256) ?? null,
@@ -1822,42 +1749,6 @@ export class PluginPublicApi {
 				},
 			});
 		}
-		if (!this.queries.has("narrafork.chapters.list")) {
-			this.queries.register({
-				queryId: "narrafork.chapters.list",
-				capability: "query.read.chapters",
-				inputSchema: chaptersListInputSchema,
-				redaction: "user_scoped",
-				paginated: true,
-				resource: (input) => ({ type: "project", id: input.projectId }),
-				handler: async (input, call) => {
-					const adapter = requireAdapter(this.adapters.chapters, "Chapter query");
-					const after = call.cursor ? timestampCursorSchema.parse(call.cursor) : undefined;
-					const requested = input.limit + 1;
-					// A project-scoped invocation must never list another project's chapters,
-					// even if the plugin supplies a different projectId. Mirror projects.list,
-					// which always reads the host-bound scope instead of trusting the input.
-					const projectId = call.host.scope.projectId ?? input.projectId;
-					const rows = boundedAdapterRows(
-						await adapter.list({
-							limit: requested,
-							after,
-							projectId,
-							chapterId: call.host.scope.chapterId,
-							status: input.status,
-							role: input.role,
-							context: call.host,
-							signal: call.signal,
-						}),
-						requested,
-					).map(mapChapterSummary);
-					return pageResponse(rows, input.limit, (row) => ({
-						updatedAt: row.updatedAt,
-						id: row.id,
-					}));
-				},
-			});
-		}
 		for (const action of ["enable", "disable"] as const) {
 			const commandId = `narrafork.plugins.${action}`;
 			if (this.commands.has(commandId)) continue;
@@ -1893,14 +1784,13 @@ export class PluginPublicApi {
 					const after = call.cursor ? timestampCursorSchema.parse(call.cursor) : undefined;
 					const requested = input.limit + 1;
 					// A project-scoped invocation must never list another project's narrators,
-					// even if the plugin supplies a different projectId. Mirror projects/chapters.
+					// even if the plugin supplies a different projectId. Mirror projects.list.
 					const projectId = call.host.scope.projectId ?? input.projectId;
 					const rows = boundedAdapterRows(
 						await adapter.list({
 							limit: requested,
 							after,
 							projectId,
-							chapterId: input.chapterId,
 							status: input.status,
 							context: call.host,
 							signal: call.signal,
@@ -2022,7 +1912,6 @@ export class PluginPublicApi {
 						title: input.title,
 						model: input.model,
 						cwd: input.cwd,
-						chapterId: input.chapterId,
 						permissionMode: input.permissionMode,
 						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 						type: input.type,
@@ -3124,51 +3013,6 @@ export function createCorePluginPublicApiAdapters(options: {
 				}));
 			},
 		},
-		chapters: {
-			async list(input) {
-				if (input.signal.aborted)
-					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
-				const predicates: SQL[] = [eq(chapters.projectId, input.projectId)];
-				if (input.chapterId) predicates.push(eq(chapters.id, input.chapterId));
-				if (input.status?.length) {
-					// The plugin contract still accepts `frozen` while the column no longer
-					// produces it, so the requested set is narrowed to values the column can
-					// actually hold. Filtering on `frozen` alone therefore yields an empty
-					// list — the same answer as before it was removed — rather than a type
-					// error here or a rejected request for the caller.
-					const storedStatuses = input.status.filter(
-						(s): s is (typeof chapters.status)["_"]["data"] => s !== "frozen",
-					);
-					// An all-`frozen` filter must stay empty rather than degrade to "no filter",
-					// which would return every chapter — exactly the bug this value used to cause.
-					if (storedStatuses.length === 0) return [];
-					predicates.push(inArray(chapters.status, storedStatuses));
-				}
-				if (input.role?.length) predicates.push(inArray(chapters.role, input.role));
-				if (input.after) {
-					const afterPredicate = or(
-						lt(chapters.updatedAt, input.after.updatedAt),
-						and(eq(chapters.updatedAt, input.after.updatedAt), lt(chapters.id, input.after.id)),
-					);
-					if (afterPredicate) predicates.push(afterPredicate);
-				}
-				return db
-					.select({
-						id: chapters.id,
-						projectId: chapters.projectId,
-						title: chapters.title,
-						status: chapters.status,
-						role: chapters.role,
-						commitCount: chapters.commitCount,
-						createdAt: chapters.createdAt,
-						updatedAt: chapters.updatedAt,
-					})
-					.from(chapters)
-					.where(and(...predicates))
-					.orderBy(desc(chapters.updatedAt), desc(chapters.id))
-					.limit(input.limit);
-			},
-		},
 		pluginLifecycle: {
 			async enable(pluginId, _context, signal) {
 				if (signal.aborted) throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
@@ -3184,7 +3028,6 @@ export function createCorePluginPublicApiAdapters(options: {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
 				const predicates: SQL[] = [];
-				if (input.chapterId) predicates.push(eq(narrators.chapterId, input.chapterId));
 				if (input.status?.length) predicates.push(inArray(narrators.status, input.status));
 				if (input.after) {
 					const afterPredicate = or(
@@ -3193,12 +3036,12 @@ export function createCorePluginPublicApiAdapters(options: {
 					);
 					if (afterPredicate) predicates.push(afterPredicate);
 				}
-				if (input.projectId) predicates.push(eq(chapters.projectId, input.projectId));
+				// The narrator's primary project, resolved the one way every caller must.
+				if (input.projectId) predicates.push(eq(narratorProjectIdColumn, input.projectId));
 				const rows = await db
 					.select({
 						id: narrators.id,
-						chapterId: narrators.chapterId,
-						projectId: chapters.projectId,
+						projectId: narratorProjectIdColumn,
 						title: narrators.title,
 						handle: narrators.handle,
 						variant: narrators.variant,
@@ -3214,13 +3057,11 @@ export function createCorePluginPublicApiAdapters(options: {
 						updatedAt: narrators.updatedAt,
 					})
 					.from(narrators)
-					.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 					.where(predicates.length ? and(...predicates) : undefined)
 					.orderBy(desc(narrators.updatedAt), desc(narrators.id))
 					.limit(input.limit);
 				return rows.map((row) => ({
 					id: row.id,
-					chapterId: row.chapterId,
 					projectId: row.projectId ?? null,
 					title: row.title,
 					handle: row.handle,
@@ -3311,7 +3152,6 @@ export function createCorePluginPublicApiAdapters(options: {
 						title: input.title,
 						model: input.model,
 						cwd: input.cwd,
-						chapterId: input.chapterId,
 						permissionMode: input.permissionMode,
 						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 						type: input.type,
@@ -3447,7 +3287,6 @@ export const PUBLIC_QUERY_IDS = [
 	"narrafork.plugin.getOwn",
 	"narrafork.plugins.list",
 	"narrafork.projects.list",
-	"narrafork.chapters.list",
 	"narrafork.narrators.list",
 ] as const;
 

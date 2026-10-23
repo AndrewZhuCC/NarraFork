@@ -1,0 +1,1 @@
+CREATE INDEX "idx_messages_rows_only" ON "narrator_messages" USING btree ("body_rows_only") WHERE "body_rows_only" = 1;

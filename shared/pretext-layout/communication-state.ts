@@ -26,7 +26,8 @@ function object(value: unknown): Record<string, unknown> {
 
 export function communicationSelectors(input: unknown): string[] {
 	const obj = object(input);
-	const values = [obj.id, obj.name, obj.target_id];
+	// `user` is a bot's person target: shown like any recipient while the call streams.
+	const values = [obj.id, obj.name, obj.target_id, obj.user];
 	for (const key of ["ids", "names"]) if (Array.isArray(obj[key])) values.push(...obj[key]);
 	return [
 		...new Set(

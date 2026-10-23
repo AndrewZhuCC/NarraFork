@@ -43,6 +43,7 @@ import { narratorGitIdentityQueryKey, useGitIdentities } from "../../hooks/useGi
 import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
+import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
@@ -171,7 +172,10 @@ export function CreateNarratorModal({
 		queryFn: api.getSettings,
 		gcTime: CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS,
 	});
-	const defaultProjectDir = settings?.paths?.defaultProjectDir ?? "";
+	// Only a default that EXISTS is prefilled: the server no longer creates it, so an unset
+	// or deleted one would just fail the create.
+	const { usablePath, needsChoice } = useProjectDirStatus();
+	const defaultProjectDir = usablePath ?? "";
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
@@ -193,6 +197,9 @@ export function CreateNarratorModal({
 	const [sessionTitle, setSessionTitle] = useState("");
 	const [makeNamed, setMakeNamed] = useState(false);
 	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
+	// A bot is met in a chat room and signs its messages with its title, so it is named
+	// at creation (the server refuses an unnamed bot). Exclusive with the steward kind.
+	const [bot, setBot] = useState(false);
 	// 提交身份只对当前用户生效（服务端按 用户 × 会话 保存），默认跟随本人默认身份。
 	const [gitIdentityId, setGitIdentityId] = useState(FOLLOW_DEFAULT_GIT_IDENTITY);
 	const gitIdentityVisibility = useGitIdentityVisibility();
@@ -205,6 +212,9 @@ export function CreateNarratorModal({
 	const defaultGitIdentity = gitIdentities.find((identity) => identity.isDefault);
 	const [handle, setHandle] = useState("");
 	const [activeId, setActiveId] = useState<string | null>(null);
+	// No directory typed and no usable default: the server would refuse, so ask up front.
+	// A project context supplies its own directory.
+	const directoryRequired = needsChoice && !cwd.trim() && !contextProjectId;
 
 	// Favorites list is a resizable region: defaults to ~5 rows, user can drag to adjust.
 	const FAV_LIST_DEFAULT_H = 165;
@@ -363,7 +373,11 @@ export function CreateNarratorModal({
 				// 自定义标题留空时不传，服务端沿用「首条消息后自动命名」的原逻辑。
 				...(sessionTitle.trim() ? { title: sessionTitle.trim() } : {}),
 				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),
-				...(knowledgeSteward ? { kind: "knowledge" as const } : {}),
+				...(bot
+					? { kind: "bot" as const }
+					: knowledgeSteward
+						? { kind: "knowledge" as const }
+						: {}),
 			},
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -410,6 +424,7 @@ export function CreateNarratorModal({
 		planModePrefilledForOpenRef.current = false;
 		setMakeNamed(false);
 		setKnowledgeSteward(false);
+		setBot(false);
 		setHandle("");
 		setSessionTitle("");
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
@@ -470,7 +485,8 @@ export function CreateNarratorModal({
 			<div style={{ flexShrink: 0 }}>
 				<DirectoryPicker
 					label={t("workingDirectory")}
-					description={t("workingDirectoryHint")}
+					description={directoryRequired ? undefined : t("workingDirectoryHint")}
+					error={directoryRequired ? t("workingDirectoryRequired") : undefined}
 					placeholder={defaultProjectDir || undefined}
 					leftSection={<IconFolder size={16} />}
 					value={cwd}
@@ -605,8 +621,9 @@ export function CreateNarratorModal({
 			/>
 
 			<TextInput
-				label={t("sessionTitle")}
-				description={t("sessionTitleHint")}
+				label={bot ? t("botName") : t("sessionTitle")}
+				description={bot ? t("botNameHint") : t("sessionTitleHint")}
+				required={bot}
 				value={sessionTitle}
 				onChange={(e) => setSessionTitle(e.currentTarget.value)}
 				maxLength={200}
@@ -636,7 +653,20 @@ export function CreateNarratorModal({
 				label={t("knowledgeSteward")}
 				description={t("knowledgeStewardHint")}
 				checked={knowledgeSteward}
-				onChange={(e) => setKnowledgeSteward(e.currentTarget.checked)}
+				onChange={(e) => {
+					setKnowledgeSteward(e.currentTarget.checked);
+					if (e.currentTarget.checked) setBot(false);
+				}}
+			/>
+
+			<Checkbox
+				label={t("botNarrator")}
+				description={t("botNarratorHint")}
+				checked={bot}
+				onChange={(e) => {
+					setBot(e.currentTarget.checked);
+					if (e.currentTarget.checked) setKnowledgeSteward(false);
+				}}
 			/>
 		</>
 	);
@@ -703,7 +733,11 @@ export function CreateNarratorModal({
 				<Button
 					onClick={handleCreate}
 					loading={createNarrator.isPending}
-					disabled={makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH}
+					disabled={
+						directoryRequired ||
+						(makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH) ||
+						(bot && !sessionTitle.trim())
+					}
 				>
 					{t("createNarrator")}
 				</Button>

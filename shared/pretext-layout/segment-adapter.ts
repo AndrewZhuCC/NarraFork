@@ -23,6 +23,7 @@ import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { isSubagentModelInheritance } from "../model-inheritance";
+import { blockAtIndex, type MessageWithBody, messageBody } from "../narrator-blocks/message-blocks";
 import {
 	contextBlockViews,
 	injectionBlockViews,
@@ -198,19 +199,23 @@ export interface AdapterContentBlock {
 	[key: string]: unknown;
 }
 
-export interface AdapterMessage {
+/**
+ * A message as the adapter reads it. Its body is its blocks (`messageBody` /
+ * `messageBlocks`); its elements are keyed by block id (`elementKey`), so a row keeps its
+ * key when blocks before it are deleted or inserted.
+ */
+export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	/** Actual per-message identity; absent legacy identity must not enable GPT parsing. */
 	model?: string | null;
 	provider?: string | null;
 	id?: string;
 	role: string;
-	contentJson: AdapterContentBlock[];
 	createdAt?: string;
 	/**
 	 * Slash command the user typed, when this user message was produced by one.
 	 *
 	 * The server EXPANDS a command into its full prompt template before storing
-	 * it, so `contentJson`'s text block holds the whole (often multi-thousand
+	 * it, so the body's text element holds the whole (often multi-thousand
 	 * character) expansion while this field keeps the short `/name args` the user
 	 * actually wrote. Rendering the expansion as the bubble body is what turned a
 	 * one-line command into a screen-filling wall of text in the virtual list;
@@ -359,7 +364,7 @@ export interface AdapterToolDetailRef {
 
 export function resolveToolDetailRef(item: AdapterToolItem): AdapterToolDetailRef {
 	const messageId = item.msg?.id ?? item.tc.messageId;
-	const block = item.msg?.contentJson[item.blockIndex];
+	const block = messageBody(item.msg)[item.blockIndex];
 	const attempt =
 		item.tc.executionAttempt ??
 		(block?.type === "tool_use" && block.id === item.tc.toolUseId
@@ -1440,7 +1445,7 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 
 /** Render native/legacy context blocks independently while preserving physical order. */
 function adaptContextBlocks(
-	blocks: AdapterContentBlock[],
+	blocks: readonly AdapterContentBlock[],
 	idBase: string,
 	msg: AdapterMessage,
 	ctx: AdapterContext,
@@ -1489,7 +1494,7 @@ function adaptContextBlocks(
 	for (let index = 0; index < blocks.length; index++) {
 		const block = blocks[index];
 		if (!block || owned.has(index) || block.type !== "text" || !block.text?.trim()) continue;
-		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: block.text });
+		specs.push({ kind: "markdown", key: `${elementKey(idBase, msg, index)}`, data: block.text });
 	}
 	return specs;
 }
@@ -1602,13 +1607,36 @@ function longSingleReasoningStep(key: string, text: string): ReasoningSegment[] 
 	return [{ title: probe.title, body, isEmpty: body.length === 0 || body === "<!-- -->" }];
 }
 
+/**
+ * The key base of a message's element `index`: its block — `${idBase}-blk[<blockId>]`,
+ * plus `+<offset>` for a later element of a multi-element block — so the key stays put
+ * when blocks before it come or go (docs/BLOCK_STORAGE-DESIGN.md §8.3). The blocks are the
+ * ones the message names, or, for a row built on the client, the ones the server would
+ * split it into (`messageBlocks`). Block ids hold no `[` or `]`, so the id is recoverable
+ * from the key (`blockIdFromElementKey`). An index past the body keeps a positional key.
+ */
+export function elementKey(idBase: string, msg: AdapterMessage, index: number): string {
+	const block = blockAtIndex(msg, index);
+	if (!block) return `${idBase}-b${index}`;
+	const offset = index - block.from;
+	return `${idBase}-blk[${block.id}]${offset ? `+${offset}` : ""}`;
+}
+
+const ELEMENT_BLOCK_TOKEN = /-blk\[([^\]]+)\](?:\+(\d+))?/;
+
+/** The block id and element offset an `elementKey` names; null for a positional key. */
+export function blockIdFromElementKey(key: string): { blockId: string; offset: number } | null {
+	const match = ELEMENT_BLOCK_TOKEN.exec(key);
+	return match ? { blockId: match[1], offset: match[2] ? Number(match[2]) : 0 } : null;
+}
+
 function adaptMessage(
 	msg: AdapterMessage,
 	visibleBlockIndices: number[] | undefined,
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const specs: ElementSpec[] = [];
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	const indices = visibleBlockIndices ?? blocks.map((_, i) => i);
 	const idBase = msg.id ?? "msg";
 
@@ -1687,7 +1715,7 @@ function adaptMessage(
 		const reviewBlockIndex = blocks.findIndex((b) => b.type === "review_feedback");
 		if (reviewBlockIndex >= 0 && !blocks.some((b) => b.type === "system_injection")) {
 			const reviewBlock = blocks[reviewBlockIndex];
-			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, ctx)];
+			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, msg, ctx)];
 		}
 		// Send deliveries keep role=user for the model, but their structured block owns
 		// the reader-facing identity. Match it BEFORE origin erases that structure.
@@ -1729,7 +1757,7 @@ function adaptMessage(
 			return [
 				{
 					kind: "injection-bubble",
-					key: `${idBase}-b0-m-legacy`,
+					key: `${elementKey(idBase, msg, 0)}-m-legacy`,
 					data: {
 						markdown: rawSideCarToMarkdown(text),
 						speaker: originHeadingLabel(ctx, msg.origin, msg.originLabel),
@@ -1860,7 +1888,7 @@ function adaptMessage(
 			return [
 				{
 					kind: "system-simple",
-					key: `${idBase}-b${snapshotIndex}`,
+					key: `${elementKey(idBase, msg, snapshotIndex)}`,
 					data: {
 						kind: "publication_result",
 						text: "",
@@ -1935,7 +1963,7 @@ function adaptMessage(
 		if (!block) continue;
 		const kind = classifyContentBlock(block);
 		if (kind === null) continue;
-		const key = `${idBase}-b${bi}`;
+		const key = `${elementKey(idBase, msg, bi)}`;
 		if (kind === "reasoning") {
 			const reasoningBlocks = [block];
 			let nextPosition = position + 1;
@@ -2157,8 +2185,6 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	reviewVerdict_request_changes: "Changes Requested",
 	reviewVerdict_comment_only: "Comments Only",
 	reviewFeedbackRevisedBadge: "Revised",
-	reviewFeedbackApply: "Handle",
-	reviewFeedbackApplied: "Handled",
 	// Message-origin attribution (see @shared/message-origin). The heading row of
 	// an origin_notice card, and the name shown on a user bubble whose author is
 	// not a NarraFork account.
@@ -2278,6 +2304,10 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
 	sidecarSourceTutorialLesson: "Tutorial lesson",
+	sidecarSourceTurnNudge: "Turn budget",
+	sidecarSourceBrokenCall: "Invalid tool call",
+	sidecarSourceContinuePrompt: "Continue",
+	sidecarSourceWorkspaceChanged: "Workspace changed",
 	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
 	// routine digest reads differently from a turn-end continuation in the header.
 	cadenceEveryNTools: "every {n} tool calls",
@@ -2384,6 +2414,11 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
+	turn_nudge: "sidecarSourceTurnNudge",
+	broken_call: "sidecarSourceBrokenCall",
+	continue_prompt: "sidecarSourceContinuePrompt",
+	workspace_changed: "sidecarSourceWorkspaceChanged",
 	// The interactive tutorial's lesson boundary. Named because a reused tutorial
 	// narrator shows one of these per lesson, and the generic "System" heading would
 	// make the row that separates lessons the least legible thing in the transcript.
@@ -2476,15 +2511,15 @@ function adaptReviewCard(
 	block: AdapterContentBlock,
 	idBase: string,
 	blockIndex: number,
+	msg: AdapterMessage,
 	ctx: AdapterContext,
 ): ElementSpec {
 	const verdict = reviewVerdict(block);
-	const applied = block.applied === true;
 	return {
 		kind: "review-card",
 		// `-b{blockIndex}` ties the row to its content block, so the selection system can
 		// address it for the context menu (delete / rollback / fork).
-		key: `${idBase}-b${blockIndex}-review`,
+		key: `${elementKey(idBase, msg, blockIndex)}-review`,
 		data: {
 			text: composeReviewFeedbackText(block, ctx),
 			verdictLabel: sysLabel(ctx, `reviewVerdict_${verdict}`),
@@ -2492,10 +2527,6 @@ function adaptReviewCard(
 			...(block.revised === true
 				? { revisedLabel: sysLabel(ctx, "reviewFeedbackRevisedBadge") }
 				: {}),
-			// Always present, so the reserved action row is never empty; `applied` only
-			// changes the wording and disables it.
-			actionLabel: sysLabel(ctx, applied ? "reviewFeedbackApplied" : "reviewFeedbackApply"),
-			applied,
 		},
 	};
 }
@@ -2671,7 +2702,7 @@ function adaptFramedSystemCard(
 			kind: "injection-bubble",
 			// `-b{blockIndex}` ties the row to its single content block, so the selection
 			// system can address it for the context menu (delete / rollback / fork).
-			key: `${idBase}-b${blockIndex}-f-${kind}`,
+			key: `${elementKey(idBase, msg, blockIndex)}-f-${kind}`,
 			data: {
 				payload: {
 					kind: "spec-task",
@@ -2695,41 +2726,18 @@ function adaptFramedSystemCard(
 	const inner = adaptSystemBlock(kind, block, idBase, msg, ctx, blockIndex);
 	return {
 		kind: "injection-bubble",
-		key: `${idBase}-b${blockIndex}-f-${kind}`,
+		key: `${elementKey(idBase, msg, blockIndex)}-f-${kind}`,
 		data: {
 			payload: { kind: innerPayloadKind(inner), data: inner.data },
 			source: kind,
-			// A merge is authored by whoever pressed the button, and `creator` is already
-			// loaded for system rows — so the header can name a real person with a real
-			// avatar instead of a placeholder.
+			// `creator` is already loaded for system rows — so the header can name a real
+			// person with a real avatar instead of a placeholder.
 			creator: msg.creator ?? null,
 			hasHeader: true,
 			// The verbatim model-facing copy for the context-menu inspector.
 			modelFacing: modelFacingText,
-			// Both of these rows are ABOUT another chapter, and each already carries its
-			// id: a review's feedback names the review chapter it came from, a merge
-			// summary names the source chapter that was merged in. Read off the raw block
-			// rather than the projected card data, because the projection keeps only what
-			// the card paints.
-			target: framedCardTarget(kind, block),
 		},
 	};
-}
-
-/**
- * The chapter a framed system card refers to, when it names one.
- *
- * `merge_summary` carries `sourceChapterId` (the chapter that was merged in), written by
- * its producer today, so it needs no new field.
- *
- * Returns null when the id is absent, which is the shape of rows written before that
- * producer recorded it. An inert header is the correct outcome there; a link built on a
- * missing id would 404.
- */
-function framedCardTarget(kind: string, block: AdapterContentBlock): InjectionTarget | null {
-	const raw = block as unknown as Record<string, unknown>;
-	const id = kind === "merge_summary" ? raw.sourceChapterId : undefined;
-	return typeof id === "string" && id.trim().length > 0 ? { kind: "chapter", chapterId: id } : null;
 }
 
 /**
@@ -2855,7 +2863,7 @@ function adaptSpokenInjection(
 				// Keyed by block index + SENDER: the block index ties the row to its single
 				// content block so the selection system can address it; the sender keeps the
 				// key stable across a same-block re-projection.
-				key: `${idBase}-b${blockIndex}-m-${message.fromId ?? "anon"}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-m-${message.fromId ?? "anon"}`,
 				data: {
 					...deliveryProjection(msg),
 					markdown: rawSideCarToMarkdown(text),
@@ -2926,7 +2934,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-t-${task.id}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-t-${task.id}`,
 				data: {
 					...deliveryProjection(msg),
 					markdown,
@@ -3001,7 +3009,7 @@ function adaptSpokenInjection(
 		// and key correctness, and relaxing the policy later would silently break it.
 		return substantive.map(({ hit, excerpt }) => ({
 			kind: "injection-bubble" as const,
-			key: `${idBase}-b${blockIndex}-k-${hit.scope === "personal" ? "personal-" : ""}${hit.entryId}`,
+			key: `${elementKey(idBase, msg, blockIndex)}-k-${hit.scope === "personal" ? "personal-" : ""}${hit.entryId}`,
 			data: {
 				...deliveryProjection(msg),
 				// PLAIN text, escaped rather than parsed: the excerpt is prose by
@@ -3080,7 +3088,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-p-${source}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-p-${source}`,
 				data: {
 					...deliveryProjection(msg),
 					payload: {
@@ -3113,7 +3121,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-p-${source}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-p-${source}`,
 				data: {
 					markdown,
 					// No speaker name: the integration layer resolves the shared platform
@@ -3154,6 +3162,10 @@ export const PLATFORM_INJECTION_SOURCES = new Set([
 	"silent_progress",
 	"pipeline_exit_confirmation",
 	"spec_update",
+	"turn_nudge",
+	"broken_call",
+	"continue_prompt",
+	"workspace_changed",
 ]);
 
 /**
@@ -3239,11 +3251,11 @@ function adaptSystemBlock(
 	ctx: AdapterContext,
 	blockIndex = 0,
 ): ElementSpec {
-	const keyBase = `${idBase}-b${blockIndex}`;
+	const keyBase = `${elementKey(idBase, msg, blockIndex)}`;
 	// The message's leading text block is the chunk renderer's `contentText`
 	// fallback (goalBlock.task ?? message.contentText, etc.).
 	const contentText =
-		msg.contentJson.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
+		messageBody(msg).find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
 
 	if (blockType === "compact" && block.subtype === "plan") {
 		return {
@@ -4544,15 +4556,13 @@ function collectUpstreamPeers(
 	ctx: AdapterContext,
 ): ToolUpstreamPeer[] {
 	const peers: ToolUpstreamPeer[] = [];
-	const blocks = item.msg?.contentJson;
+	const blocks = messageBody(item.msg);
 	const covered = new Set<string>();
-	if (Array.isArray(blocks)) {
-		for (let i = 0; i < item.blockIndex; i++) {
-			const block = blocks[i];
-			if (!block || block.type !== "tool_use") continue;
-			if (typeof block.id === "string" && block.id) covered.add(block.id);
-			peers.push(blockAsToolUpstreamPeer(block, ctx));
-		}
+	for (let i = 0; i < item.blockIndex; i++) {
+		const block = blocks[i];
+		if (!block || block.type !== "tool_use") continue;
+		if (typeof block.id === "string" && block.id) covered.add(block.id);
+		peers.push(blockAsToolUpstreamPeer(block, ctx));
 	}
 	for (const peer of earlier) {
 		// Same-message peers are already in `peers` via blockIndex order.
@@ -5020,11 +5030,11 @@ function reasoningRowIdentity(
 	const messageId = item.msg?.id;
 	if (!messageId || messageId === "__streaming__") return undefined;
 	const blockIndex = item.blockIndex ?? 0;
-	const blocks = item.msg?.contentJson;
-	if (Array.isArray(blocks) && blocks.length > 0) {
+	const blocks = messageBody(item.msg);
+	if (blocks.length > 0) {
 		// AdapterContentBlock allows null on text/thinking, so it is not structurally
 		// assignable to ContentBlockLike; grouping only reads `type`, which matches.
-		const { runs } = groupReasoningRuns(blocks as unknown as ContentBlockLike[]);
+		const { runs } = groupReasoningRuns(blocks as unknown as readonly ContentBlockLike[]);
 		for (const run of runs) {
 			if (run.indices.includes(blockIndex)) {
 				return {

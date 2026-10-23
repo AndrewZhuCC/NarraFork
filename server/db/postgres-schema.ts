@@ -167,25 +167,30 @@ export const narratorWorktreeResources = pgTable(
 	],
 );
 
-export const projects = pgTable("projects", {
-	id: text("id").primaryKey().notNull(),
-	name: text("name").notNull(),
-	description: text("description"),
-	status: text("status").notNull().default("active"),
-	flowMode: text("flow_mode").notNull().default("classic"),
-	gitPath: text("git_path"),
-	remoteUrl: text("remote_url"),
-	defaultBranch: text("default_branch").default("main"),
-	startupScript: text("startup_script"),
-	copyFiles: text("copy_files"),
-	chapterSettings: jsonText("chapter_settings"),
-	proxyDomain: text("proxy_domain"),
-	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
-	ownerUserId: text("owner_user_id").references((): PgColumn => users.id, { onDelete: "set null" }),
-	visibility: text("visibility").notNull().default("private"),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
-});
+export const projects = pgTable(
+	"projects",
+	{
+		id: text("id").primaryKey().notNull(),
+		name: text("name").notNull(),
+		description: text("description"),
+		status: text("status").notNull().default("active"),
+		gitPath: text("git_path"),
+		remoteUrl: text("remote_url"),
+		defaultBranch: text("default_branch").default("main"),
+		chapterSettings: jsonText("chapter_settings"),
+		traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
+		ownerUserId: text("owner_user_id").references((): PgColumn => users.id, {
+			onDelete: "set null",
+		}),
+		visibility: text("visibility").notNull().default("private"),
+		rootKey: text("root_key"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_projects_root_key").on(table.rootKey).where(sql.raw('"root_key" IS NOT NULL')),
+	],
+);
 
 export const skillDirectoryCaches = pgTable(
 	"skill_directory_caches",
@@ -206,170 +211,10 @@ export const skillDirectoryCaches = pgTable(
 	],
 );
 
-export const explorationGroups = pgTable(
-	"exploration_groups",
-	{
-		id: text("id").primaryKey().notNull(),
-		projectId: text("project_id")
-			.notNull()
-			.references((): PgColumn => projects.id, { onDelete: "cascade" }),
-		title: text("title").notNull(),
-		description: text("description"),
-		baseChapterId: text("base_chapter_id").references((): PgColumn => chapters.id, {
-			onDelete: "set null",
-		}),
-		status: text("status").notNull().default("active"),
-		decidedChapterId: text("decided_chapter_id").references((): PgColumn => chapters.id, {
-			onDelete: "set null",
-		}),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_exploration_groups_project").on(table.projectId),
-		index("idx_exploration_groups_base_chapter").on(table.baseChapterId),
-		index("idx_exploration_groups_decided_chapter").on(table.decidedChapterId),
-	],
-);
-
-export const chapters = pgTable(
-	"chapters",
-	{
-		id: text("id").primaryKey().notNull(),
-		projectId: text("project_id")
-			.notNull()
-			.references((): PgColumn => projects.id, { onDelete: "cascade" }),
-		title: text("title").notNull(),
-		description: text("description"),
-		status: text("status").notNull().default("active"),
-		role: text("role").notNull().default("branch"),
-		branch: text("branch").notNull(),
-		worktreePath: text("worktree_path"),
-		baseBranch: text("base_branch").notNull(),
-		parentChapterId: text("parent_chapter_id").references((): PgColumn => chapters.id, {
-			onDelete: "set null",
-		}),
-		forkPoint: jsonText("fork_point"),
-		mergedIntoChapterId: text("merged_into_chapter_id").references((): PgColumn => chapters.id, {
-			onDelete: "set null",
-		}),
-		mergeCommitSha: text("merge_commit_sha"),
-		mergeStrategy: text("merge_strategy"),
-		preMergeTargetSha: text("pre_merge_target_sha"),
-		mergeSnapshotCommitSha: text("merge_snapshot_commit_sha"),
-		preMergeTargetSnapshotSha: text("pre_merge_target_snapshot_sha"),
-		mergedSourceSnapshotSha: text("merged_source_snapshot_sha"),
-		containerConfig: jsonText("container_config"),
-		explorationGroupId: text("exploration_group_id").references(
-			(): PgColumn => explorationGroups.id,
-			{ onDelete: "set null" },
-		),
-		isRoot: integer("is_root").default(0),
-		headCommitSha: text("head_commit_sha"),
-		startCommitSha: text("start_commit_sha"),
-		commitCount: integer("commit_count").default(0),
-		snapshotCommitSha: text("snapshot_commit_sha"),
-		snapshotShadowKey: text("snapshot_shadow_key"),
-		dormantSnapshotCommitSha: text("dormant_snapshot_commit_sha"),
-		parkedSnapshotCommitSha: text("parked_snapshot_commit_sha"),
-		parkedSnapshotBaseTree: text("parked_snapshot_base_tree"),
-		color: text("color"),
-		groupLabel: text("group_label"),
-		pinned: integer("pinned").default(0),
-		anchorCommitSha: text("anchor_commit_sha"),
-		axisOffset: doublePrecision("axis_offset").default(0),
-		crossOffset: doublePrecision("cross_offset").default(0),
-		graphX: doublePrecision("graph_x"),
-		graphY: doublePrecision("graph_y"),
-		panelExpanded: integer("panel_expanded").default(0),
-		panelWidth: doublePrecision("panel_width"),
-		panelHeight: doublePrecision("panel_height"),
-		dockLayoutJson: text("dock_layout_json"),
-		detachedPanelsJson: text("detached_panels_json"),
-		reviewSourceChapterId: text("review_source_chapter_id").references(
-			(): PgColumn => chapters.id,
-			{ onDelete: "set null" },
-		),
-		reviewStatus: text("review_status"),
-		lastAccessedAt: text("last_accessed_at"),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_chapters_project").on(table.projectId, table.status),
-		index("idx_chapters_parent").on(table.parentChapterId),
-		uniqueIndex("idx_chapters_project_branch").on(table.projectId, table.branch),
-		index("idx_chapters_merged_into").on(table.mergedIntoChapterId),
-		index("idx_chapters_review_source").on(table.reviewSourceChapterId),
-		index("idx_chapters_exploration_group").on(table.explorationGroupId),
-		index("idx_chapters_snapshot_shadow_key").on(table.snapshotShadowKey),
-		index("idx_chapters_worktree_path").on(table.worktreePath),
-	],
-);
-
-export const chapterEdges = pgTable(
-	"chapter_edges",
-	{
-		id: text("id").primaryKey().notNull(),
-		projectId: text("project_id")
-			.notNull()
-			.references((): PgColumn => projects.id, { onDelete: "cascade" }),
-		sourceId: text("source_id")
-			.notNull()
-			.references((): PgColumn => chapters.id, { onDelete: "cascade" }),
-		targetId: text("target_id")
-			.notNull()
-			.references((): PgColumn => chapters.id, { onDelete: "cascade" }),
-		type: text("type").notNull(),
-		metadata: jsonText("metadata"),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_chapter_edges_src_tgt_type").on(table.sourceId, table.targetId, table.type),
-		index("idx_chapter_edges_project").on(table.projectId),
-		index("idx_chapter_edges_source").on(table.sourceId),
-		index("idx_chapter_edges_target").on(table.targetId),
-	],
-);
-
-export const chapterCommits = pgTable(
-	"chapter_commits",
-	{
-		id: text("id").primaryKey().notNull(),
-		chapterId: text("chapter_id")
-			.notNull()
-			.references((): PgColumn => chapters.id, { onDelete: "cascade" }),
-		sha: text("sha").notNull(),
-		message: text("message").notNull(),
-		fullMessage: text("full_message"),
-		authorName: text("author_name"),
-		authorEmail: text("author_email"),
-		authoredAt: text("authored_at").notNull(),
-		source: text("source").notNull().default("manual"),
-		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
-			onDelete: "set null",
-		}),
-		narratorMessageId: text("narrator_message_id").references((): PgColumn => narratorMessages.id, {
-			onDelete: "set null",
-		}),
-		filesChanged: integer("files_changed"),
-		linesAdded: integer("lines_added"),
-		linesRemoved: integer("lines_removed"),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		uniqueIndex("idx_chapter_commits_sha").on(table.chapterId, table.sha),
-		index("idx_chapter_commits_chapter").on(table.chapterId, table.authoredAt),
-		index("idx_chapter_commits_narrator").on(table.narratorId),
-		index("idx_chapter_commits_narrator_message").on(table.narratorMessageId),
-	],
-);
-
 export const narrators = pgTable(
 	"narrators",
 	{
 		id: text("id").primaryKey().notNull(),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, {}),
 		scheduledTaskId: text("scheduled_task_id").references((): PgColumn => scheduledTasks.id, {
 			onDelete: "set null",
 		}),
@@ -473,7 +318,6 @@ export const narrators = pgTable(
 			table.createdAt,
 			table.id,
 		),
-		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		index("idx_narrators_owner").on(table.ownerUserId),
@@ -497,6 +341,30 @@ export const narrators = pgTable(
 		index("idx_narrators_background_parent_created")
 			.on(table.parentNarratorId, table.createdAt, table.id)
 			.where(sql.raw('"is_background" = TRUE')),
+	],
+);
+
+export const narratorProjectLinks = pgTable(
+	"narrator_project_links",
+	{
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		projectId: text("project_id")
+			.notNull()
+			.references((): PgColumn => projects.id, { onDelete: "cascade" }),
+		role: text("role").notNull(),
+		source: text("source").notNull(),
+		deviceId: text("device_id").notNull().default("local"),
+		directory: text("directory"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_narrator_project_links_primary")
+			.on(table.narratorId)
+			.where(sql.raw("\"role\" = 'primary'")),
+		index("idx_narrator_project_links_project").on(table.projectId, table.narratorId),
+		primaryKey({ columns: [table.narratorId, table.projectId] }),
 	],
 );
 
@@ -867,6 +735,14 @@ export const narratorMessages = pgTable(
 				"(CASE WHEN (\"content_json\"::jsonb #>> '{0,type}') = 'compact' AND ((\"content_json\"::jsonb #>> '{0,status}') IN ('compacting', 'running') OR (\"content_json\"::jsonb #>> '{0,attempts,-1,status}') = 'running') THEN 1 ELSE 0 END)",
 			),
 		),
+		bodyFormat: integer("body_format").notNull().default(1),
+		turnId: text("turn_id"),
+		authorNarratorId: text("author_narrator_id"),
+		causeBlockId: text("cause_block_id"),
+		providerResponseId: text("provider_response_id"),
+		bodyBytes: integer("body_bytes").notNull().default(0),
+		stateRevision: integer("state_revision").notNull().default(0),
+		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -876,9 +752,14 @@ export const narratorMessages = pgTable(
 		index("idx_messages_toplevel").on(table.narratorId, table.parentToolUseId, table.createdAt),
 		index("idx_messages_created_by").on(table.createdBy),
 		index("idx_messages_edited_by").on(table.editedBy),
+		index("idx_messages_author")
+			.on(table.authorNarratorId)
+			.where(sql.raw('"author_narrator_id" IS NOT NULL')),
 		index("idx_messages_compact_pending")
 			.on(table.compactPending)
 			.where(sql.raw('"compact_pending" = 1')),
+		index("idx_messages_legacy_body").on(table.bodyFormat).where(sql.raw('"body_format" = 1')),
+		index("idx_messages_rows_only").on(table.bodyRowsOnly).where(sql.raw('"body_rows_only" = 1')),
 	],
 );
 
@@ -976,10 +857,15 @@ export const narratorToolCalls = pgTable(
 		provider: text("provider"),
 		model: text("model"),
 		resultMessageId: text("result_message_id"),
+		blockId: text("block_id").references((): PgColumn => narratorBlocks.id, {
+			onDelete: "set null",
+		}),
+		isInternal: boolean("is_internal").notNull().default(false),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
+		index("idx_toolcalls_block").on(table.blockId),
 		index("idx_toolcalls_context_id").on(
 			table.messageId,
 			table.id,
@@ -1019,6 +905,166 @@ export const narratorToolCalls = pgTable(
 			columns: [table.fileChangeOperationId],
 			foreignColumns: [fileChangeOperations.id],
 		}).onDelete("set null"),
+	],
+);
+
+export const narratorBlocks = pgTable(
+	"narrator_blocks",
+	{
+		id: text("id").primaryKey().notNull(),
+		messageId: text("message_id")
+			.notNull()
+			.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+		ordinal: integer("ordinal").notNull(),
+		kind: text("kind").notNull(),
+		subtype: text("subtype"),
+		phase: text("phase").notNull().default("done"),
+		revision: integer("revision").notNull().default(0),
+		wireId: text("wire_id"),
+		attemptId: text("attempt_id"),
+		originBlockId: text("origin_block_id"),
+		modelChars: integer("model_chars").notNull().default(0),
+		byteSize: integer("byte_size").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+		completedAt: text("completed_at"),
+		modelText: text("model_text"),
+		payload: jsonText("payload").notNull(),
+		state: jsonText("state"),
+		providerMeta: jsonText("provider_meta"),
+		originalPayload: jsonText("original_payload"),
+	},
+	(table) => [
+		uniqueIndex("idx_blocks_message_ordinal").on(table.messageId, table.ordinal),
+		uniqueIndex("idx_blocks_single")
+			.on(table.messageId)
+			.where(sql.raw("\"kind\" in ('input', 'context')")),
+		index("idx_blocks_open").on(table.messageId).where(sql.raw("\"phase\" = 'open'")),
+		index("idx_blocks_origin")
+			.on(table.originBlockId)
+			.where(sql.raw('"origin_block_id" is not null')),
+		index("idx_blocks_context_subtype").on(table.subtype).where(sql.raw("\"kind\" = 'context'")),
+		index("idx_blocks_tool_wire").on(table.wireId).where(sql.raw("\"kind\" = 'tool'")),
+		check(
+			"ck_blocks_kind",
+			sql.raw("\"kind\" in ('input', 'output', 'reasoning', 'tool', 'context')"),
+		),
+		check("ck_blocks_phase", sql.raw("\"phase\" in ('open', 'done', 'aborted', 'failed')")),
+		check(
+			"ck_blocks_subtype",
+			sql.raw("(\"subtype\" is not null) = (\"kind\" in ('tool', 'context'))"),
+		),
+		check(
+			"ck_blocks_aborted",
+			sql.raw("\"phase\" <> 'aborted' or \"kind\" in ('output', 'reasoning')"),
+		),
+		check("ck_blocks_input_done", sql.raw("\"phase\" = 'done' or \"kind\" <> 'input'")),
+		check(
+			"ck_blocks_model_text",
+			sql.raw("\"model_text\" is null or \"kind\" in ('input', 'context')"),
+		),
+		check(
+			"ck_blocks_provider_meta",
+			sql.raw("\"provider_meta\" is null or \"kind\" in ('output', 'reasoning', 'tool')"),
+		),
+		check("ck_blocks_wire_id", sql.raw('("wire_id" is not null) = ("kind" = \'tool\')')),
+		check(
+			"ck_blocks_original_payload",
+			sql.raw('"original_payload" is null or "kind" = \'output\''),
+		),
+	],
+);
+
+export const narratorBlockAssets = pgTable(
+	"narrator_block_assets",
+	{
+		blockId: text("block_id")
+			.notNull()
+			.references((): PgColumn => narratorBlocks.id, { onDelete: "cascade" }),
+		assetId: text("asset_id").notNull(),
+		role: text("role").notNull(),
+	},
+	(table) => [
+		index("idx_block_assets_asset").on(table.assetId),
+		check(
+			"ck_block_assets_role",
+			sql.raw(
+				"\"role\" in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')",
+			),
+		),
+		primaryKey({ columns: [table.blockId, table.assetId] }),
+	],
+);
+
+export const narratorBlockSyncQueue = pgTable("narrator_block_sync_queue", {
+	messageId: text("message_id")
+		.primaryKey()
+		.notNull()
+		.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+});
+
+export const narratorTextSnapshots = pgTable("narrator_text_snapshots", {
+	sha256: text("sha256").primaryKey().notNull(),
+	text: text("text").notNull(),
+	byteSize: integer("byte_size").notNull(),
+	createdAt: text("created_at").notNull(),
+});
+
+export const narratorTurns = pgTable(
+	"narrator_turns",
+	{
+		id: text("id").primaryKey().notNull(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		status: text("status").notNull(),
+		triggerMessageId: text("trigger_message_id"),
+		startedAt: text("started_at").notNull(),
+		endedAt: text("ended_at"),
+		stopReason: text("stop_reason"),
+		stepCount: integer("step_count").notNull().default(0),
+		toolCallCount: integer("tool_call_count").notNull().default(0),
+		usageJson: jsonText("usage_json"),
+	},
+	(table) => [
+		index("idx_turns_narrator_started").on(table.narratorId, table.startedAt),
+		check(
+			"ck_turns_status",
+			sql.raw("\"status\" in ('running', 'completed', 'interrupted', 'failed')"),
+		),
+	],
+);
+
+export const narratorBlockBackfill = pgTable(
+	"narrator_block_backfill",
+	{
+		job: text("job").primaryKey().notNull(),
+		cursor: integer("cursor").notNull().default(0),
+		complete: boolean("complete").notNull().default(false),
+		paused: boolean("paused").notNull().default(false),
+		processed: integer("processed").notNull().default(0),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		check(
+			"ck_block_backfill_job",
+			sql.raw("\"job\" in ('convert', 'verify', 'reindex', 'clear', 'restore')"),
+		),
+	],
+);
+
+export const narratorBlockDiagnostics = pgTable(
+	"narrator_block_diagnostics",
+	{
+		messageId: text("message_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		detail: text("detail"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		check("ck_block_diagnostics_kind", sql.raw("\"kind\" in ('mismatch', 'undecodable')")),
 	],
 );
 
@@ -1117,7 +1163,6 @@ export const terminals = pgTable(
 	"terminals",
 	{
 		id: text("id").primaryKey().notNull(),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {}),
 		worktreeResourceId: text("worktree_resource_id"),
 		name: text("name").notNull(),
@@ -1126,21 +1171,15 @@ export const terminals = pgTable(
 		deviceId: text("device_id"),
 		status: text("status").notNull().default("running"),
 		exitCode: integer("exit_code"),
-		graphOpened: integer("graph_opened").notNull().default(0),
-		graphX: doublePrecision("graph_x"),
-		graphY: doublePrecision("graph_y"),
-		graphWidth: doublePrecision("graph_width"),
-		graphHeight: doublePrecision("graph_height"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
-		index("idx_terminals_chapter").on(table.chapterId, table.status, table.graphOpened),
 		index("idx_terminals_narrator").on(table.narratorId),
 		index("idx_terminals_status").on(table.status),
 		index("idx_terminals_resource_status").on(table.worktreeResourceId, table.status, table.id),
 		check(
 			"ck_terminals_resource_owner",
-			sql.raw('"worktree_resource_id" is null or ("chapter_id" is null and "narrator_id" is null)'),
+			sql.raw('"worktree_resource_id" is null or "narrator_id" is null'),
 		),
 		foreignKey({
 			name: "terminals_worktree_resource_id_narrator_worktree_1ca6a4ef18_fk",
@@ -1157,7 +1196,6 @@ export const terminalViewState = pgTable(
 		userId: text("user_id")
 			.notNull()
 			.references((): PgColumn => users.id, { onDelete: "cascade" }),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "cascade",
 		}),
@@ -1168,15 +1206,13 @@ export const terminalViewState = pgTable(
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
-		uniqueIndex("idx_view_state_user_chapter").on(table.userId, table.chapterId),
 		uniqueIndex("idx_view_state_user_narrator").on(table.userId, table.narratorId),
-		index("idx_view_state_chapter").on(table.chapterId),
 		index("idx_view_state_narrator").on(table.narratorId),
 		uniqueIndex("idx_view_state_user_resource").on(table.userId, table.worktreeResourceId),
 		index("idx_view_state_resource").on(table.worktreeResourceId),
 		check(
 			"ck_view_state_resource_owner",
-			sql.raw('"worktree_resource_id" is null or ("chapter_id" is null and "narrator_id" is null)'),
+			sql.raw('"worktree_resource_id" is null or "narrator_id" is null'),
 		),
 		foreignKey({
 			name: "terminal_view_state_worktree_resource_id_narrator_e3fa08d232_fk",
@@ -1190,7 +1226,6 @@ export const containerInstances = pgTable(
 	"container_instances",
 	{
 		id: text("id").primaryKey().notNull(),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "cascade" }),
 		worktreeResourceId: text("worktree_resource_id"),
 		containerId: text("container_id"),
 		serviceName: text("service_name").notNull(),
@@ -1204,18 +1239,11 @@ export const containerInstances = pgTable(
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
-		index("idx_container_instances_chapter").on(table.chapterId),
-		index("idx_container_instances_chapter_service").on(table.chapterId, table.serviceName),
 		index("idx_container_instances_container").on(table.containerId),
-		index("idx_container_instances_status").on(table.chapterId, table.status),
 		index("idx_container_instances_resource_service_status").on(
 			table.worktreeResourceId,
 			table.serviceName,
 			table.status,
-		),
-		check(
-			"ck_container_instances_owner",
-			sql.raw('("chapter_id" is null) <> ("worktree_resource_id" is null)'),
 		),
 		foreignKey({
 			name: "container_instances_worktree_resource_id_narrator_5abc7adf1d_fk",
@@ -1229,18 +1257,12 @@ export const portAllocations = pgTable(
 	"port_allocations",
 	{
 		port: integer("port").primaryKey().notNull(),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "cascade" }),
 		worktreeResourceId: text("worktree_resource_id"),
 		serviceName: text("service_name"),
 		allocatedAt: text("allocated_at").notNull(),
 	},
 	(table) => [
-		index("idx_port_allocations_chapter").on(table.chapterId),
 		index("idx_port_allocations_resource").on(table.worktreeResourceId),
-		check(
-			"ck_port_allocations_owner",
-			sql.raw('"chapter_id" is null or "worktree_resource_id" is null'),
-		),
 		foreignKey({
 			name: "port_allocations_worktree_resource_id_narrator_wo_b0ba5bfaef_fk",
 			columns: [table.worktreeResourceId],
@@ -1522,7 +1544,10 @@ export const chatRooms = pgTable(
 	},
 	(table) => [
 		uniqueIndex("idx_chat_rooms_dm_key").on(table.dmKey),
-		uniqueIndex("idx_chat_rooms_narrator").on(table.narratorId),
+		uniqueIndex("idx_chat_rooms_narrator")
+			.on(table.narratorId)
+			.where(sql.raw("\"kind\" = 'narrator'")),
+		index("idx_chat_rooms_narrator_id").on(table.narratorId),
 		index("idx_chat_rooms_kind_last").on(table.kind, table.lastMessageAt),
 	],
 );
@@ -1561,12 +1586,14 @@ export const chatMessages = pgTable(
 		}),
 		senderShareId: text("sender_share_id"),
 		senderGuestName: text("sender_guest_name"),
+		senderNarratorId: text("sender_narrator_id"),
 		kind: text("kind").notNull().default("text"),
 		contentText: text("content_text").notNull(),
 		replyToMessageId: text("reply_to_message_id"),
 		replyToSeq: integer("reply_to_seq"),
 		replyToSenderUserId: text("reply_to_sender_user_id"),
 		replyToGuestName: text("reply_to_guest_name"),
+		replyToSenderNarratorId: text("reply_to_sender_narrator_id"),
 		replyToPreview: text("reply_to_preview"),
 		editedAt: text("edited_at"),
 		deletedAt: text("deleted_at"),
@@ -1576,10 +1603,16 @@ export const chatMessages = pgTable(
 		uniqueIndex("idx_chat_messages_room_seq").on(table.roomId, table.seq),
 		index("idx_chat_messages_sender").on(table.senderUserId),
 		index("idx_chat_messages_sender_share").on(table.senderShareId),
+		index("idx_chat_messages_sender_narrator").on(table.senderNarratorId),
 		foreignKey({
 			name: "fk_chat_messages_sender_share",
 			columns: [table.senderShareId],
 			foreignColumns: [narratorPublicShares.id],
+		}).onDelete("set null"),
+		foreignKey({
+			name: "fk_chat_messages_sender_narrator",
+			columns: [table.senderNarratorId],
+			foreignColumns: [narrators.id],
 		}).onDelete("set null"),
 	],
 );
@@ -1812,33 +1845,6 @@ export const narratorPatches = pgTable(
 	],
 );
 
-export const mergeSessions = pgTable(
-	"merge_sessions",
-	{
-		id: text("id").primaryKey().notNull(),
-		targetChapterId: text("target_chapter_id")
-			.notNull()
-			.references((): PgColumn => chapters.id, { onDelete: "cascade" }),
-		sourceChapterIds: jsonText("source_chapter_ids").notNull(),
-		strategy: text("strategy").notNull().default("merge"),
-		status: text("status").notNull(),
-		currentIndex: integer("current_index").notNull().default(0),
-		mergedCount: integer("merged_count").notNull().default(0),
-		currentSourceChapterId: text("current_source_chapter_id"),
-		conflictFiles: jsonText("conflict_files"),
-		preMergeTree: text("pre_merge_tree"),
-		conflictTree: text("conflict_tree"),
-		preMergeTargetSnapshot: text("pre_merge_target_snapshot"),
-		mergeSourceSnapshot: text("merge_source_snapshot"),
-		preMergeTargetSha: text("pre_merge_target_sha"),
-		error: text("error"),
-		locale: text("locale"),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [index("idx_merge_sessions_target_chapter").on(table.targetChapterId)],
-);
-
 export const narratorWhitelistDirs = pgTable(
 	"narrator_whitelist_dirs",
 	{
@@ -1959,9 +1965,6 @@ export const volumeSnapshots = pgTable(
 			.references((): PgColumn => projects.id, { onDelete: "cascade" }),
 		name: text("name").notNull(),
 		description: text("description"),
-		sourceChapterId: text("source_chapter_id").references((): PgColumn => chapters.id, {
-			onDelete: "set null",
-		}),
 		sourceWorktreeResourceId: text("source_worktree_resource_id"),
 		serviceName: text("service_name").notNull(),
 		containerPath: text("container_path").notNull(),
@@ -1972,7 +1975,6 @@ export const volumeSnapshots = pgTable(
 	},
 	(table) => [
 		index("idx_volume_snapshots_project").on(table.projectId),
-		index("idx_volume_snapshots_source_chapter").on(table.sourceChapterId),
 		index("idx_volume_snapshots_source_resource").on(table.sourceWorktreeResourceId),
 		foreignKey({
 			name: "volume_snapshots_source_worktree_resource_id_narr_7986881ef0_fk",
@@ -1989,44 +1991,18 @@ export const volumeSnapshotApplications = pgTable(
 		snapshotId: text("snapshot_id")
 			.notNull()
 			.references((): PgColumn => volumeSnapshots.id, { onDelete: "cascade" }),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "cascade" }),
 		targetWorktreeResourceId: text("target_worktree_resource_id"),
 		appliedAt: text("applied_at").notNull(),
 		appliedBy: text("applied_by").references((): PgColumn => users.id, { onDelete: "set null" }),
 	},
 	(table) => [
 		index("idx_snapshot_applications_snapshot").on(table.snapshotId),
-		index("idx_snapshot_applications_chapter").on(table.chapterId),
 		index("idx_snapshot_applications_target_resource").on(table.targetWorktreeResourceId),
-		check(
-			"ck_snapshot_applications_owner",
-			sql.raw('("chapter_id" is null) <> ("target_worktree_resource_id" is null)'),
-		),
 		foreignKey({
 			name: "volume_snapshot_applications_target_worktree_reso_e1d1ff4ffa_fk",
 			columns: [table.targetWorktreeResourceId],
 			foreignColumns: [narratorWorktreeResources.id],
 		}).onDelete("restrict"),
-	],
-);
-
-export const reviewConclusions = pgTable(
-	"review_conclusions",
-	{
-		id: text("id").primaryKey().notNull(),
-		reviewChapterId: text("review_chapter_id")
-			.notNull()
-			.references((): PgColumn => chapters.id, { onDelete: "cascade" }),
-		sourceChapterId: text("source_chapter_id")
-			.notNull()
-			.references((): PgColumn => chapters.id, { onDelete: "cascade" }),
-		verdict: text("verdict").notNull(),
-		findingsJson: jsonText("findings_json"),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_review_conclusions_review").on(table.reviewChapterId),
-		index("idx_review_conclusions_source").on(table.sourceChapterId),
 	],
 );
 
@@ -2329,7 +2305,6 @@ export const gatewaySessionMappings = pgTable(
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		appUserId: text("app_user_id").references((): PgColumn => users.id, { onDelete: "set null" }),
 		projectId: text("project_id").references((): PgColumn => projects.id, { onDelete: "set null" }),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "set null" }),
 		lastMessageAt: text("last_message_at"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -2338,7 +2313,6 @@ export const gatewaySessionMappings = pgTable(
 		uniqueIndex("idx_gsm_platform_chat_user").on(table.platform, table.chatId, table.userId),
 		index("idx_gsm_narrator").on(table.narratorId),
 		index("idx_gsm_app_user").on(table.appUserId),
-		index("idx_gsm_chapter").on(table.chapterId),
 		index("idx_gsm_project").on(table.projectId),
 	],
 );
@@ -3464,7 +3438,6 @@ export const scheduledTasks = pgTable(
 		runContext: text("run_context").notNull().default("standalone"),
 		cwd: text("cwd"),
 		projectId: text("project_id").references((): PgColumn => projects.id, { onDelete: "set null" }),
-		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "set null" }),
 		narratorMode: text("narrator_mode").notNull().default("new"),
 		cleanupPolicy: jsonText("cleanup_policy")
 			.notNull()
@@ -3488,7 +3461,6 @@ export const scheduledTasks = pgTable(
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
 		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
-		index("idx_scheduled_tasks_chapter").on(table.chapterId),
 	],
 );
 
@@ -3885,7 +3857,6 @@ export const notifications = pgTable(
 			.references((): PgColumn => users.id, { onDelete: "cascade" }),
 		kind: text("kind").notNull(),
 		projectId: text("project_id"),
-		chapterId: text("chapter_id"),
 		narratorId: text("narrator_id"),
 		title: text("title").notNull(),
 		preview: text("preview").notNull().default(""),
@@ -3908,8 +3879,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 123,
-  "columnCount": 1725,
+  "tableCount": 125,
+  "columnCount": 1671,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -4652,17 +4623,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "\"active\""
         },
         {
-          "property": "flowMode",
-          "name": "flow_mode",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"classic\"",
-          "defaultExpression": "\"classic\""
-        },
-        {
           "property": "gitPath",
           "name": "git_path",
           "kind": "text",
@@ -4692,37 +4652,10 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "\"main\""
         },
         {
-          "property": "startupScript",
-          "name": "startup_script",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "copyFiles",
-          "name": "copy_files",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
           "property": "chapterSettings",
           "name": "chapter_settings",
           "kind": "text",
           "mode": "json",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "proxyDomain",
-          "name": "proxy_domain",
-          "kind": "text",
           "pgType": "text",
           "notNull": false,
           "primary": false,
@@ -4768,6 +4701,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "\"private\""
         },
         {
+          "property": "rootKey",
+          "name": "root_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -4786,7 +4728,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
-      "indexes": [],
+      "indexes": [
+        {
+          "name": "uq_projects_root_key",
+          "columns": [
+            "rootKey"
+          ],
+          "unique": true,
+          "predicate": "\"root_key\" IS NOT NULL"
+        }
+      ],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],
@@ -4903,1020 +4854,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
-      "exportName": "explorationGroups",
-      "name": "exploration_groups",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "projectId",
-          "name": "project_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "projects",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "exploration_groups_project_id_projects_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "title",
-          "name": "title",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "description",
-          "name": "description",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "baseChapterId",
-          "name": "base_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "exploration_groups_base_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "status",
-          "name": "status",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"active\"",
-          "defaultExpression": "\"active\""
-        },
-        {
-          "property": "decidedChapterId",
-          "name": "decided_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "exploration_groups_decided_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "updatedAt",
-          "name": "updated_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_exploration_groups_project",
-          "columns": [
-            "projectId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_exploration_groups_base_chapter",
-          "columns": [
-            "baseChapterId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_exploration_groups_decided_chapter",
-          "columns": [
-            "decidedChapterId"
-          ],
-          "unique": false
-        }
-      ],
-      "checks": [],
-      "checkDefinitions": [],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
-      "exportName": "chapters",
-      "name": "chapters",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "projectId",
-          "name": "project_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "projects",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "chapters_project_id_projects_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "title",
-          "name": "title",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "description",
-          "name": "description",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "status",
-          "name": "status",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"active\"",
-          "defaultExpression": "\"active\""
-        },
-        {
-          "property": "role",
-          "name": "role",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"branch\"",
-          "defaultExpression": "\"branch\""
-        },
-        {
-          "property": "branch",
-          "name": "branch",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "worktreePath",
-          "name": "worktree_path",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "baseBranch",
-          "name": "base_branch",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "parentChapterId",
-          "name": "parent_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "chapters_parent_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "forkPoint",
-          "name": "fork_point",
-          "kind": "text",
-          "mode": "json",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "mergedIntoChapterId",
-          "name": "merged_into_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "chapters_merged_into_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "mergeCommitSha",
-          "name": "merge_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "mergeStrategy",
-          "name": "merge_strategy",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "preMergeTargetSha",
-          "name": "pre_merge_target_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "mergeSnapshotCommitSha",
-          "name": "merge_snapshot_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "preMergeTargetSnapshotSha",
-          "name": "pre_merge_target_snapshot_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "mergedSourceSnapshotSha",
-          "name": "merged_source_snapshot_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "containerConfig",
-          "name": "container_config",
-          "kind": "text",
-          "mode": "json",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "explorationGroupId",
-          "name": "exploration_group_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "explorationGroups",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "chapters_exploration_group_id_exploration_groups_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "isRoot",
-          "name": "is_root",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "headCommitSha",
-          "name": "head_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "startCommitSha",
-          "name": "start_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "commitCount",
-          "name": "commit_count",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "snapshotCommitSha",
-          "name": "snapshot_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "snapshotShadowKey",
-          "name": "snapshot_shadow_key",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "dormantSnapshotCommitSha",
-          "name": "dormant_snapshot_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "parkedSnapshotCommitSha",
-          "name": "parked_snapshot_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "parkedSnapshotBaseTree",
-          "name": "parked_snapshot_base_tree",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "color",
-          "name": "color",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "groupLabel",
-          "name": "group_label",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "pinned",
-          "name": "pinned",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "anchorCommitSha",
-          "name": "anchor_commit_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "axisOffset",
-          "name": "axis_offset",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "crossOffset",
-          "name": "cross_offset",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "graphX",
-          "name": "graph_x",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "graphY",
-          "name": "graph_y",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "panelExpanded",
-          "name": "panel_expanded",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "panelWidth",
-          "name": "panel_width",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "panelHeight",
-          "name": "panel_height",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "dockLayoutJson",
-          "name": "dock_layout_json",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "detachedPanelsJson",
-          "name": "detached_panels_json",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "reviewSourceChapterId",
-          "name": "review_source_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "chapters_review_source_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "reviewStatus",
-          "name": "review_status",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "lastAccessedAt",
-          "name": "last_accessed_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "updatedAt",
-          "name": "updated_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_chapters_project",
-          "columns": [
-            "projectId",
-            "status"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapters_parent",
-          "columns": [
-            "parentChapterId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapters_project_branch",
-          "columns": [
-            "projectId",
-            "branch"
-          ],
-          "unique": true
-        },
-        {
-          "name": "idx_chapters_merged_into",
-          "columns": [
-            "mergedIntoChapterId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapters_review_source",
-          "columns": [
-            "reviewSourceChapterId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapters_exploration_group",
-          "columns": [
-            "explorationGroupId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapters_snapshot_shadow_key",
-          "columns": [
-            "snapshotShadowKey"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapters_worktree_path",
-          "columns": [
-            "worktreePath"
-          ],
-          "unique": false
-        }
-      ],
-      "checks": [],
-      "checkDefinitions": [],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
-      "exportName": "chapterEdges",
-      "name": "chapter_edges",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "projectId",
-          "name": "project_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "projects",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "chapter_edges_project_id_projects_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "sourceId",
-          "name": "source_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "chapter_edges_source_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "targetId",
-          "name": "target_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "chapter_edges_target_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "type",
-          "name": "type",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "metadata",
-          "name": "metadata",
-          "kind": "text",
-          "mode": "json",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_chapter_edges_src_tgt_type",
-          "columns": [
-            "sourceId",
-            "targetId",
-            "type"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapter_edges_project",
-          "columns": [
-            "projectId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapter_edges_source",
-          "columns": [
-            "sourceId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapter_edges_target",
-          "columns": [
-            "targetId"
-          ],
-          "unique": false
-        }
-      ],
-      "checks": [],
-      "checkDefinitions": [],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
-      "exportName": "chapterCommits",
-      "name": "chapter_commits",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "chapter_commits_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "sha",
-          "name": "sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "message",
-          "name": "message",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "fullMessage",
-          "name": "full_message",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "authorName",
-          "name": "author_name",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "authorEmail",
-          "name": "author_email",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "authoredAt",
-          "name": "authored_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "source",
-          "name": "source",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"manual\"",
-          "defaultExpression": "\"manual\""
-        },
-        {
-          "property": "narratorId",
-          "name": "narrator_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "narrators",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "chapter_commits_narrator_id_narrators_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "narratorMessageId",
-          "name": "narrator_message_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "narratorMessages",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "chapter_commits_narrator_message_id_narrator_messages_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "filesChanged",
-          "name": "files_changed",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "linesAdded",
-          "name": "lines_added",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "linesRemoved",
-          "name": "lines_removed",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_chapter_commits_sha",
-          "columns": [
-            "chapterId",
-            "sha"
-          ],
-          "unique": true
-        },
-        {
-          "name": "idx_chapter_commits_chapter",
-          "columns": [
-            "chapterId",
-            "authoredAt"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapter_commits_narrator",
-          "columns": [
-            "narratorId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_chapter_commits_narrator_message",
-          "columns": [
-            "narratorMessageId"
-          ],
-          "unique": false
-        }
-      ],
-      "checks": [],
-      "checkDefinitions": [],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
       "exportName": "narrators",
       "name": "narrators",
       "columns": [
@@ -5928,21 +4865,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": true,
           "unique": false
-        },
-        {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "constraintName": "narrators_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
         },
         {
           "property": "scheduledTaskId",
@@ -6807,13 +5729,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "name": "idx_narrators_chapter",
-          "columns": [
-            "chapterId"
-          ],
-          "unique": false
-        },
-        {
           "name": "idx_narrators_parent",
           "columns": [
             "parentNarratorId"
@@ -6938,6 +5853,121 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "narratorProjectLinks",
+      "name": "narrator_project_links",
+      "columns": [
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_project_links_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projects",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_project_links_project_id_projects_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "role",
+          "name": "role",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"local\"",
+          "defaultExpression": "\"local\""
+        },
+        {
+          "property": "directory",
+          "name": "directory",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_narrator_project_links_primary",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": true,
+          "predicate": "\"role\" = 'primary'"
+        },
+        {
+          "name": "idx_narrator_project_links_project",
+          "columns": [
+            "projectId",
+            "narratorId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "narratorId",
+            "projectId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "narratorGrants",
@@ -9040,6 +8070,86 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           }
         },
         {
+          "property": "bodyFormat",
+          "name": "body_format",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "turnId",
+          "name": "turn_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "authorNarratorId",
+          "name": "author_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "causeBlockId",
+          "name": "cause_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "providerResponseId",
+          "name": "provider_response_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bodyBytes",
+          "name": "body_bytes",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "stateRevision",
+          "name": "state_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "bodyRowsOnly",
+          "name": "body_rows_only",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -9098,12 +8208,36 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_messages_author",
+          "columns": [
+            "authorNarratorId"
+          ],
+          "unique": false,
+          "predicate": "\"author_narrator_id\" IS NOT NULL"
+        },
+        {
           "name": "idx_messages_compact_pending",
           "columns": [
             "compactPending"
           ],
           "unique": false,
           "predicate": "\"compact_pending\" = 1"
+        },
+        {
+          "name": "idx_messages_legacy_body",
+          "columns": [
+            "bodyFormat"
+          ],
+          "unique": false,
+          "predicate": "\"body_format\" = 1"
+        },
+        {
+          "name": "idx_messages_rows_only",
+          "columns": [
+            "bodyRowsOnly"
+          ],
+          "unique": false,
+          "predicate": "\"body_rows_only\" = 1"
         }
       ],
       "checks": [],
@@ -9847,6 +8981,34 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorBlocks",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_tool_calls_block_id_narrator_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "isInternal",
+          "name": "is_internal",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -9861,6 +9023,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_toolcalls_message",
           "columns": [
             "messageId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_toolcalls_block",
+          "columns": [
+            "blockId"
           ],
           "unique": false
         },
@@ -9965,6 +9134,723 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "checks": [],
       "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlocks",
+      "name": "narrator_blocks",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_blocks_message_id_narrator_messages_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "ordinal",
+          "name": "ordinal",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "subtype",
+          "name": "subtype",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "phase",
+          "name": "phase",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"done\"",
+          "defaultExpression": "\"done\""
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "wireId",
+          "name": "wire_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attemptId",
+          "name": "attempt_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "originBlockId",
+          "name": "origin_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "modelChars",
+          "name": "model_chars",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "byteSize",
+          "name": "byte_size",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "completedAt",
+          "name": "completed_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "modelText",
+          "name": "model_text",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "payload",
+          "name": "payload",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "providerMeta",
+          "name": "provider_meta",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "originalPayload",
+          "name": "original_payload",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_blocks_message_ordinal",
+          "columns": [
+            "messageId",
+            "ordinal"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_blocks_single",
+          "columns": [
+            "messageId"
+          ],
+          "unique": true,
+          "predicate": "\"kind\" in ('input', 'context')"
+        },
+        {
+          "name": "idx_blocks_open",
+          "columns": [
+            "messageId"
+          ],
+          "unique": false,
+          "predicate": "\"phase\" = 'open'"
+        },
+        {
+          "name": "idx_blocks_origin",
+          "columns": [
+            "originBlockId"
+          ],
+          "unique": false,
+          "predicate": "\"origin_block_id\" is not null"
+        },
+        {
+          "name": "idx_blocks_context_subtype",
+          "columns": [
+            "subtype"
+          ],
+          "unique": false,
+          "predicate": "\"kind\" = 'context'"
+        },
+        {
+          "name": "idx_blocks_tool_wire",
+          "columns": [
+            "wireId"
+          ],
+          "unique": false,
+          "predicate": "\"kind\" = 'tool'"
+        }
+      ],
+      "checks": [
+        "ck_blocks_kind",
+        "ck_blocks_phase",
+        "ck_blocks_subtype",
+        "ck_blocks_aborted",
+        "ck_blocks_input_done",
+        "ck_blocks_model_text",
+        "ck_blocks_provider_meta",
+        "ck_blocks_wire_id",
+        "ck_blocks_original_payload"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_blocks_kind",
+          "expression": "\"kind\" in ('input', 'output', 'reasoning', 'tool', 'context')"
+        },
+        {
+          "name": "ck_blocks_phase",
+          "expression": "\"phase\" in ('open', 'done', 'aborted', 'failed')"
+        },
+        {
+          "name": "ck_blocks_subtype",
+          "expression": "(\"subtype\" is not null) = (\"kind\" in ('tool', 'context'))"
+        },
+        {
+          "name": "ck_blocks_aborted",
+          "expression": "\"phase\" <> 'aborted' or \"kind\" in ('output', 'reasoning')"
+        },
+        {
+          "name": "ck_blocks_input_done",
+          "expression": "\"phase\" = 'done' or \"kind\" <> 'input'"
+        },
+        {
+          "name": "ck_blocks_model_text",
+          "expression": "\"model_text\" is null or \"kind\" in ('input', 'context')"
+        },
+        {
+          "name": "ck_blocks_provider_meta",
+          "expression": "\"provider_meta\" is null or \"kind\" in ('output', 'reasoning', 'tool')"
+        },
+        {
+          "name": "ck_blocks_wire_id",
+          "expression": "(\"wire_id\" is not null) = (\"kind\" = 'tool')"
+        },
+        {
+          "name": "ck_blocks_original_payload",
+          "expression": "\"original_payload\" is null or \"kind\" = 'output'"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockAssets",
+      "name": "narrator_block_assets",
+      "columns": [
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_assets_block_id_narrator_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "assetId",
+          "name": "asset_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "role",
+          "name": "role",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_block_assets_asset",
+          "columns": [
+            "assetId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_block_assets_role"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_block_assets_role",
+          "expression": "\"role\" in ('input_image', 'input_file', 'output_image', 'tool_image', 'epoch_snapshot')"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "blockId",
+            "assetId"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "narratorBlockSyncQueue",
+      "name": "narrator_block_sync_queue",
+      "columns": [
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_sync_queue_message_id_narrator_messages_id_fk"
+          },
+          "emitAsTableConstraint": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorTextSnapshots",
+      "name": "narrator_text_snapshots",
+      "columns": [
+        {
+          "property": "sha256",
+          "name": "sha256",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "text",
+          "name": "text",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "byteSize",
+          "name": "byte_size",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorTurns",
+      "name": "narrator_turns",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_turns_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "triggerMessageId",
+          "name": "trigger_message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "startedAt",
+          "name": "started_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "endedAt",
+          "name": "ended_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "stopReason",
+          "name": "stop_reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "stepCount",
+          "name": "step_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "toolCallCount",
+          "name": "tool_call_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "usageJson",
+          "name": "usage_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_turns_narrator_started",
+          "columns": [
+            "narratorId",
+            "startedAt"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_turns_status"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_turns_status",
+          "expression": "\"status\" in ('running', 'completed', 'interrupted', 'failed')"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockBackfill",
+      "name": "narrator_block_backfill",
+      "columns": [
+        {
+          "property": "job",
+          "name": "job",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "cursor",
+          "name": "cursor",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "complete",
+          "name": "complete",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "paused",
+          "name": "paused",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "processed",
+          "name": "processed",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [
+        "ck_block_backfill_job"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_block_backfill_job",
+          "expression": "\"job\" in ('convert', 'verify', 'reindex', 'clear', 'restore')"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockDiagnostics",
+      "name": "narrator_block_diagnostics",
+      "columns": [
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_diagnostics_message_id_narrator_messages_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "detail",
+          "name": "detail",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [
+        "ck_block_diagnostics_kind"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_block_diagnostics_kind",
+          "expression": "\"kind\" in ('mismatch', 'undecodable')"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
@@ -10492,22 +10378,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "terminals_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
           "property": "narratorId",
           "name": "narrator_id",
           "kind": "text",
@@ -10595,53 +10465,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "property": "graphOpened",
-          "name": "graph_opened",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "graphX",
-          "name": "graph_x",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "graphY",
-          "name": "graph_y",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "graphWidth",
-          "name": "graph_width",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "graphHeight",
-          "name": "graph_height",
-          "kind": "real",
-          "pgType": "double precision",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -10652,15 +10475,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         }
       ],
       "indexes": [
-        {
-          "name": "idx_terminals_chapter",
-          "columns": [
-            "chapterId",
-            "status",
-            "graphOpened"
-          ],
-          "unique": false
-        },
         {
           "name": "idx_terminals_narrator",
           "columns": [
@@ -10691,7 +10505,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "checkDefinitions": [
         {
           "name": "ck_terminals_resource_owner",
-          "expression": "\"worktree_resource_id\" is null or (\"chapter_id\" is null and \"narrator_id\" is null)"
+          "expression": "\"worktree_resource_id\" is null or \"narrator_id\" is null"
         }
       ],
       "foreignKeys": [],
@@ -10724,22 +10538,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "column": "id",
             "onDelete": "cascade",
             "constraintName": "terminal_view_state_user_id_users_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "terminal_view_state_chapter_id_chapters_id_fk"
           },
           "emitAsTableConstraint": false
         },
@@ -10817,27 +10615,12 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "indexes": [
         {
-          "name": "idx_view_state_user_chapter",
-          "columns": [
-            "userId",
-            "chapterId"
-          ],
-          "unique": true
-        },
-        {
           "name": "idx_view_state_user_narrator",
           "columns": [
             "userId",
             "narratorId"
           ],
           "unique": true
-        },
-        {
-          "name": "idx_view_state_chapter",
-          "columns": [
-            "chapterId"
-          ],
-          "unique": false
         },
         {
           "name": "idx_view_state_narrator",
@@ -10868,7 +10651,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "checkDefinitions": [
         {
           "name": "ck_view_state_resource_owner",
-          "expression": "\"worktree_resource_id\" is null or (\"chapter_id\" is null and \"narrator_id\" is null)"
+          "expression": "\"worktree_resource_id\" is null or \"narrator_id\" is null"
         }
       ],
       "foreignKeys": [],
@@ -10887,22 +10670,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": true,
           "unique": false
-        },
-        {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "container_instances_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
         },
         {
           "property": "worktreeResourceId",
@@ -11015,32 +10782,9 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "indexes": [
         {
-          "name": "idx_container_instances_chapter",
-          "columns": [
-            "chapterId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_container_instances_chapter_service",
-          "columns": [
-            "chapterId",
-            "serviceName"
-          ],
-          "unique": false
-        },
-        {
           "name": "idx_container_instances_container",
           "columns": [
             "containerId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_container_instances_status",
-          "columns": [
-            "chapterId",
-            "status"
           ],
           "unique": false
         },
@@ -11054,15 +10798,8 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
-      "checks": [
-        "ck_container_instances_owner"
-      ],
-      "checkDefinitions": [
-        {
-          "name": "ck_container_instances_owner",
-          "expression": "(\"chapter_id\" is null) <> (\"worktree_resource_id\" is null)"
-        }
-      ],
+      "checks": [],
+      "checkDefinitions": [],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
@@ -11079,22 +10816,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": true,
           "unique": false
-        },
-        {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "port_allocations_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
         },
         {
           "property": "worktreeResourceId",
@@ -11133,13 +10854,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "indexes": [
         {
-          "name": "idx_port_allocations_chapter",
-          "columns": [
-            "chapterId"
-          ],
-          "unique": false
-        },
-        {
           "name": "idx_port_allocations_resource",
           "columns": [
             "worktreeResourceId"
@@ -11147,15 +10861,8 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
-      "checks": [
-        "ck_port_allocations_owner"
-      ],
-      "checkDefinitions": [
-        {
-          "name": "ck_port_allocations_owner",
-          "expression": "\"chapter_id\" is null or \"worktree_resource_id\" is null"
-        }
-      ],
+      "checks": [],
+      "checkDefinitions": [],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
@@ -12934,7 +12641,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "narratorId"
           ],
-          "unique": true
+          "unique": true,
+          "predicate": "\"kind\" = 'narrator'"
+        },
+        {
+          "name": "idx_chat_rooms_narrator_id",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": false
         },
         {
           "name": "idx_chat_rooms_kind_last",
@@ -13135,6 +12850,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "senderNarratorId",
+          "name": "sender_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "kind",
           "name": "kind",
           "kind": "text",
@@ -13184,6 +12908,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "replyToGuestName",
           "name": "reply_to_guest_name",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "replyToSenderNarratorId",
+          "name": "reply_to_sender_narrator_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -13249,6 +12982,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "senderShareId"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_chat_messages_sender_narrator",
+          "columns": [
+            "senderNarratorId"
+          ],
+          "unique": false
         }
       ],
       "checks": [],
@@ -13265,6 +13005,20 @@ export const POSTGRES_SCHEMA_COVERAGE = {
               "column": "id",
               "onDelete": "set null",
               "constraintName": "fk_chat_messages_sender_share"
+            }
+          ]
+        },
+        {
+          "name": "fk_chat_messages_sender_narrator",
+          "columns": [
+            "senderNarratorId"
+          ],
+          "references": [
+            {
+              "table": "narrators",
+              "column": "id",
+              "onDelete": "set null",
+              "constraintName": "fk_chat_messages_sender_narrator"
             }
           ]
         }
@@ -14485,203 +14239,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
-      "exportName": "mergeSessions",
-      "name": "merge_sessions",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "targetChapterId",
-          "name": "target_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "merge_sessions_target_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "sourceChapterIds",
-          "name": "source_chapter_ids",
-          "kind": "text",
-          "mode": "json",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "strategy",
-          "name": "strategy",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"merge\"",
-          "defaultExpression": "\"merge\""
-        },
-        {
-          "property": "status",
-          "name": "status",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "currentIndex",
-          "name": "current_index",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "mergedCount",
-          "name": "merged_count",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "currentSourceChapterId",
-          "name": "current_source_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "conflictFiles",
-          "name": "conflict_files",
-          "kind": "text",
-          "mode": "json",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "preMergeTree",
-          "name": "pre_merge_tree",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "conflictTree",
-          "name": "conflict_tree",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "preMergeTargetSnapshot",
-          "name": "pre_merge_target_snapshot",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "mergeSourceSnapshot",
-          "name": "merge_source_snapshot",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "preMergeTargetSha",
-          "name": "pre_merge_target_sha",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "error",
-          "name": "error",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "locale",
-          "name": "locale",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "updatedAt",
-          "name": "updated_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_merge_sessions_target_chapter",
-          "columns": [
-            "targetChapterId"
-          ],
-          "unique": false
-        }
-      ],
-      "checks": [],
-      "checkDefinitions": [],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
       "exportName": "narratorWhitelistDirs",
       "name": "narrator_whitelist_dirs",
       "columns": [
@@ -15316,22 +14873,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "property": "sourceChapterId",
-          "name": "source_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "volume_snapshots_source_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
           "property": "sourceWorktreeResourceId",
           "name": "source_worktree_resource_id",
           "kind": "text",
@@ -15418,13 +14959,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "name": "idx_volume_snapshots_source_chapter",
-          "columns": [
-            "sourceChapterId"
-          ],
-          "unique": false
-        },
-        {
           "name": "idx_volume_snapshots_source_resource",
           "columns": [
             "sourceWorktreeResourceId"
@@ -15464,22 +14998,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "column": "id",
             "onDelete": "cascade",
             "constraintName": "volume_snapshot_applications_snapshot_id_volume_snapshots_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "volume_snapshot_applications_chapter_id_chapters_id_fk"
           },
           "emitAsTableConstraint": false
         },
@@ -15534,119 +15052,9 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "name": "idx_snapshot_applications_chapter",
-          "columns": [
-            "chapterId"
-          ],
-          "unique": false
-        },
-        {
           "name": "idx_snapshot_applications_target_resource",
           "columns": [
             "targetWorktreeResourceId"
-          ],
-          "unique": false
-        }
-      ],
-      "checks": [
-        "ck_snapshot_applications_owner"
-      ],
-      "checkDefinitions": [
-        {
-          "name": "ck_snapshot_applications_owner",
-          "expression": "(\"chapter_id\" is null) <> (\"target_worktree_resource_id\" is null)"
-        }
-      ],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
-      "exportName": "reviewConclusions",
-      "name": "review_conclusions",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "reviewChapterId",
-          "name": "review_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "review_conclusions_review_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "sourceChapterId",
-          "name": "source_chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "cascade",
-            "constraintName": "review_conclusions_source_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
-          "property": "verdict",
-          "name": "verdict",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "findingsJson",
-          "name": "findings_json",
-          "kind": "text",
-          "mode": "json",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_review_conclusions_review",
-          "columns": [
-            "reviewChapterId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_review_conclusions_source",
-          "columns": [
-            "sourceChapterId"
           ],
           "unique": false
         }
@@ -17661,22 +17069,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "gateway_session_mappings_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
           "property": "lastMessageAt",
           "name": "last_message_at",
           "kind": "text",
@@ -17725,13 +17117,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_gsm_app_user",
           "columns": [
             "appUserId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_gsm_chapter",
-          "columns": [
-            "chapterId"
           ],
           "unique": false
         },
@@ -24377,22 +23762,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
-          "property": "chapterId",
-          "name": "chapter_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false,
-          "references": {
-            "table": "chapters",
-            "column": "id",
-            "onDelete": "set null",
-            "constraintName": "scheduled_tasks_chapter_id_chapters_id_fk"
-          },
-          "emitAsTableConstraint": false
-        },
-        {
           "property": "narratorMode",
           "name": "narrator_mode",
           "kind": "text",
@@ -24552,13 +23921,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_scheduled_tasks_last_narrator",
           "columns": [
             "lastNarratorId"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_scheduled_tasks_chapter",
-          "columns": [
-            "chapterId"
           ],
           "unique": false
         }
@@ -26892,15 +26254,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "projectId",
           "name": "project_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "chapterId",
-          "name": "chapter_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,

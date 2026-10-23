@@ -31,7 +31,9 @@ const now = "2026-07-30T10:00:00.000Z";
 
 function seedNarrator(id: string) {
 	sqlite
-		.prepare("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)")
+		.prepare(
+			`INSERT INTO narrators (id, traits, created_at, updated_at) VALUES (?, '["standalone"]', ?, ?)`,
+		)
 		.run(id, now, now);
 }
 
@@ -132,7 +134,6 @@ describe("fork materializes only post-compact refs", () => {
 			.where(eq(narratorMessages.id, tailMessageId));
 		const full = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
-			standalone: true,
 		});
 		expect(full.contextSummaryChars).toBe(4);
 		expect(full.contextSystemChars).toBe(20);
@@ -147,7 +148,6 @@ describe("fork materializes only post-compact refs", () => {
 		expect(legacyMessage?.contextCharsJson).toBeNull();
 		const fresh = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "fresh",
-			standalone: true,
 		});
 		expect(fresh.contextSummaryChars).toBe(0);
 		expect(fresh.contextSystemChars).toBe(0);
@@ -160,7 +160,6 @@ describe("fork materializes only post-compact refs", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		const childRefs = await refsOf(child.id);
@@ -187,7 +186,6 @@ describe("fork materializes only post-compact refs", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 		const childHistory = await narratorMessageQueries.getModelHistorySinceLastCompact(child.id);
 
@@ -205,7 +203,6 @@ describe("fork materializes only post-compact refs", () => {
 		const child = await narratorService.forkNarrator("plain", null, {
 			inheritMode: "full",
 			forkMessageId: "plain-3",
-			standalone: true,
 		});
 
 		const childRefs = await refsOf(child.id);
@@ -222,7 +219,6 @@ describe("older history stays reachable", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		expect(await hasUnmaterializedRefsBelow(child.id, 5)).toBeTrue();
@@ -237,7 +233,6 @@ describe("older history stays reachable", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		const tail = await narratorMessageQueries.getPretextDocumentPage(child.id);
@@ -260,7 +255,6 @@ describe("older history stays reachable", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		await ensureAllRefsMaterialized(child.id);
@@ -281,7 +275,6 @@ describe("older history stays reachable", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		// Ask only for seq >= 3: seq 0..2 must remain in the parent.
@@ -300,7 +293,6 @@ describe("older history stays reachable", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		await Promise.all([
@@ -329,7 +321,6 @@ describe("chained forks", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 		await seedMessage({ id: "child-own-9", narratorId: child.id, seq: 9 });
 		await seedMessage({
@@ -347,7 +338,6 @@ describe("chained forks", () => {
 		const grandchild = await narratorService.forkNarrator(child.id, null, {
 			inheritMode: "full",
 			forkMessageId: "child-own-12",
-			standalone: true,
 		});
 		return { childId: child.id, grandchildId: grandchild.id };
 	}
@@ -395,7 +385,6 @@ describe("lineage scopes handed to search", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		// The parent keeps working after the fork diverged.
@@ -442,7 +431,6 @@ describe("detaching lazy forks before their ancestor disappears", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 		expect((await lazyStateOf(child.id))?.refsInheritedFrom).toBe("parent");
 
@@ -464,7 +452,6 @@ describe("detaching lazy forks before their ancestor disappears", () => {
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
 			forkMessageId: tailMessageId,
-			standalone: true,
 		});
 
 		await narratorService.remove("parent");

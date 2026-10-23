@@ -222,7 +222,7 @@ describe("complete bounded model source", () => {
 		const restore = afterFirstSignature(() => {
 			const writer = new Database(db.filename);
 			try {
-				writer.run("DROP TRIGGER model_history_v1_tool_update");
+				writer.run("DROP TRIGGER model_history_v3_tool_update");
 			} finally {
 				writer.close();
 			}
@@ -242,7 +242,7 @@ describe("complete bounded model source", () => {
 		db.run(
 			"INSERT INTO narrator_tool_calls (id,narrator_id,message_id,tool_use_id,tool_name,input_json,output_json,status,created_at) VALUES ('tool','owner','shared','use','Read','{}','\"old\"','success','now')",
 		);
-		db.run("DROP TRIGGER model_history_v1_tool_update");
+		db.run("DROP TRIGGER model_history_v3_tool_update");
 		// A second connection changes rows while coverage is disabled, then restores catalog
 		// trust without a body/tool bump. The read started untrusted and must stay untrusted.
 		const restore = afterFirstSignature(() => {
@@ -252,7 +252,7 @@ describe("complete bounded model source", () => {
 				const trigger = renderModelHistoryRevisionSql("sqlite")
 					.split("--> statement-breakpoint")
 					.find((statement) =>
-						statement.trim().startsWith("CREATE TRIGGER model_history_v1_tool_update"),
+						statement.trim().startsWith("CREATE TRIGGER model_history_v3_tool_update"),
 					);
 				if (!trigger) throw new Error("missing fixture trigger");
 				writer.run(trigger);
@@ -292,7 +292,7 @@ describe("complete bounded model source", () => {
 		const cancel = setTimeout(() => controller.abort(), 0);
 		await expect(pending).rejects.toThrow("cancelled");
 		clearTimeout(cancel);
-		db.run("DROP TRIGGER model_history_v1_tool_update");
+		db.run("DROP TRIGGER model_history_v3_tool_update");
 		expect(readSqliteModelHistorySignature(db, "owner").trusted).toBe(false);
 		const first = await loadModelHistorySource(backend, "owner");
 		expect(await loadModelHistorySource(backend, "owner")).not.toBe(first);

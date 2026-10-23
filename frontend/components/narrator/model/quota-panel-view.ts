@@ -8,6 +8,8 @@
  * and the clock, so tests can pin it without rendering.
  */
 
+import { formatLocaleNumber } from "../../../lib/intl-format";
+
 /** Ordered by severity; `unknown` is "no number to judge by". */
 export type QuotaLevel = "ok" | "warning" | "critical" | "exhausted" | "unknown";
 
@@ -179,9 +181,13 @@ export function formatQuotaCountdown(ms: number, t: QuotaPanelT): string {
 	return t("quotaPanel.countdownM", { m: minutes });
 }
 
-/** Up to two decimals, no trailing zeros, for plan amounts. */
+/** Compact amounts, retaining small nonzero values rather than displaying a false zero. */
 export function formatQuotaAmount(value: number): string {
-	return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.?0+$/, "");
+	if (Number.isInteger(value)) return String(value);
+	const rounded = value.toFixed(2).replace(/\.?0+$/, "");
+	return Number(rounded) === 0
+		? formatLocaleNumber(value, { maximumSignificantDigits: 6 })
+		: rounded;
 }
 
 /**

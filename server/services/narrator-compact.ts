@@ -27,6 +27,7 @@ import {
 } from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
+import { compactEpochRecord } from "./narrator-epochs";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
@@ -37,6 +38,7 @@ import {
 	resetActiveUpstreamSession,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 
 /**
  * How long a compact may make NO observable progress before it is aborted.
@@ -520,24 +522,23 @@ function currentHistoryCompactMode(narratorId: string, fallback: CompactMode): C
 export async function markCompactAsBlocking(narratorId: string) {
 	await setCompactingSubstatus(narratorId, "blocking", true);
 	try {
+		// patchState reads each marker's body itself.
 		const markers = await db.query.narratorMessages.findMany({
 			where: and(
 				eq(narratorMessages.narratorId, narratorId),
 				eq(narratorMessages.role, "system"),
 				eq(narratorMessages.contentText, "[Compacting]"),
 			),
-			columns: { id: true, contentJson: true },
+			columns: { id: true },
 		});
 		for (const marker of markers) {
-			const blocks = Array.isArray(marker.contentJson) ? marker.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (!compactBlock) continue;
-			await db
-				.update(narratorMessages)
-				.set({ contentJson: [{ ...compactBlock, mode: "blocking" }] })
-				.where(
-					and(eq(narratorMessages.id, marker.id), eq(narratorMessages.narratorId, narratorId)),
-				);
+			// The mode is compact state: it changes nothing the model reads (§5.4).
+			narratorStore.patchState(marker.id, (blocks) => {
+				const index = blocks.findIndex((block) => parseCompactMessageBlock(block));
+				if (index < 0) return null;
+				blocks[index] = { ...(blocks[index] as Record<string, unknown>), mode: "blocking" };
+				return blocks;
+			});
 		}
 	} catch (err) {
 		logger.warn("Failed to update compact marker mode", { narratorId, error: String(err) });
@@ -1115,6 +1116,7 @@ async function doRunCustomCompact({
 				mode: finalizeMode,
 				expectedAttempt,
 				expectedSeq,
+				epoch: compactEpochRecord(activeNarrators.get(narratorId)),
 				...(options?.preparedRetryMessage
 					? {
 							expectedCompactBoundaryMessageId:

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { narrators, projects } from "../db/schema";
 import { generateId } from "../lib/id";
 import { safeSpawn } from "../lib/spawn";
 import {
@@ -15,7 +15,7 @@ import {
 	snapshotHistoryFailure,
 	unavailableSnapshotRevert,
 } from "./snapshot-revert";
-import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 
 const dirs: string[] = [];
 async function fixture() {
@@ -29,7 +29,7 @@ async function fixture() {
 }
 afterEach(async () => {
 	for (const dir of dirs.splice(0)) {
-		await worktreeTreeSnapshot.destroy(dir);
+		rmSync(treeSnapshotPhysicalDir("local", dir), { recursive: true, force: true });
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
@@ -81,35 +81,15 @@ describe("per-file restore results are independent of message history", () => {
 	});
 });
 
-describe("chapter workspace resolution remains available", () => {
-	test.each([
-		false,
-		true,
-	])("project fallback resolves the workspace (chapter=%s)", async (chapter) => {
+describe("workspace resolution", () => {
+	test("project fallback resolves the workspace", async () => {
 		const f = await fixture();
 		const projectId = generateId();
 		db.insert(projects)
 			.values({ id: projectId, name: "test", gitPath: f.repo, createdAt: f.now, updatedAt: f.now })
 			.run();
-		let chapterId: string | null = null;
-		if (chapter) {
-			chapterId = generateId();
-			db.insert(chapters)
-				.values({
-					id: chapterId,
-					projectId,
-					title: "dormant",
-					status: "dormant",
-					branch: "test",
-					baseBranch: "main",
-					worktreePath: null,
-					createdAt: f.now,
-					updatedAt: f.now,
-				})
-				.run();
-		}
 		db.update(narrators)
-			.set({ cwd: null, chapterId, contextProjectId: projectId })
+			.set({ cwd: null, contextProjectId: projectId })
 			.where(eq(narrators.id, f.narratorId))
 			.run();
 		expect(await resolveNarratorCwd(f.narratorId)).toBe(f.repo);

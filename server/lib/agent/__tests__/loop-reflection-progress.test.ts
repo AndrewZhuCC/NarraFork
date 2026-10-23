@@ -22,7 +22,7 @@ let streamPlan: Array<{ reasoning?: string; text?: string }> = [];
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -31,9 +31,6 @@ const testProvider: ProviderAdapter = {
 			toolUses: [{ toolUseId: "tu_decide", name: DECISION_TOOL_NAME, input: { value: "ok" } }],
 		};
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -89,7 +86,7 @@ async function runWithPlan(
 	const seen: ProgressSnapshot[] = [];
 	await runReflectionLoop({
 		parentConfig: parentConfig(),
-		history: [],
+		rows: [],
 		prompt: "decide",
 		reflectionLoop: {
 			allowedTools: [DECISION_TOOL_NAME],
@@ -139,7 +136,7 @@ describe("runReflectionLoop two-phase progress", () => {
 		streamPlan = [{ reasoning: "r" }, { text: "t" }];
 		const observed = await runReflectionLoop({
 			parentConfig: parentConfig(),
-			history: [],
+			rows: [],
 			prompt: "decide",
 			reflectionLoop: {
 				allowedTools: [DECISION_TOOL_NAME],

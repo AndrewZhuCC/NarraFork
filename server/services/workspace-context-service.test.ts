@@ -6,7 +6,6 @@ import type { WorkspaceContext } from "@shared/workspace-context";
 import { Hono } from "hono";
 
 let row: Record<string, unknown>;
-let chapter: { worktreePath: string; projectId: string } | undefined;
 let root = "";
 let events: unknown[] = [];
 let failInstall = false;
@@ -19,7 +18,6 @@ mock.module("@server/db", () => ({
 		get: () => undefined,
 		query: {
 			narrators: { findFirst: findRow },
-			chapters: { findFirst: async () => chapter },
 			projects: { findFirst: async () => undefined },
 		},
 		update: () => ({
@@ -81,13 +79,11 @@ beforeEach(async () => {
 		workspaceRevision: 0,
 		workspaceContext: null,
 		defaultDeviceId: null,
-		chapterId: null,
 		contextProjectId: "same-project",
 		variant: "primary",
 		traits: [],
 		status: "idle",
 	};
-	chapter = undefined;
 	events = [];
 	displayMessages.length = 0;
 	failInstall = false;
@@ -238,12 +234,6 @@ describe("local authoritative workspace context", () => {
 		}
 		row.variant = "primary";
 		row.traits = ["background"];
-		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
-		expect(row.workspaceRevision).toBe(0);
-	});
-	test("chapter worktree cannot be crossed even for accessible non-Git paths", async () => {
-		row.chapterId = "chapter";
-		chapter = { worktreePath: join(root, "old"), projectId: "same-project" };
 		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
 		expect(row.workspaceRevision).toBe(0);
 	});

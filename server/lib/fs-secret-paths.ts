@@ -117,16 +117,39 @@ export function isPrivateRequestRecordingPath(
 /** Home-relative prefixes: the database and every sidecar spelling of it. */
 const SECRET_HOME_PREFIXES: readonly string[] = ["narrafork.db"];
 
+// Case-folded forms of the secret leaves. The Win32 path layer opens `Settings.json`,
+// `settings.json.` (trailing dot) and `settings.json ` (trailing space) as the same
+// file, and NTFS alternate data streams (`settings.json::$DATA`) read the file's own
+// bytes — a case-sensitive, verbatim basename comparison missed all of them.
+const SECRET_HOME_FILES_LOWER: ReadonlySet<string> = new Set(
+	SECRET_HOME_FILES.map((name) => name.toLowerCase()),
+);
+const SECRET_HOME_PREFIXES_LOWER: readonly string[] = SECRET_HOME_PREFIXES.map((prefix) =>
+	prefix.toLowerCase(),
+);
+const SECRET_HOME_DIRS_LOWER: ReadonlySet<string> = new Set(
+	SECRET_HOME_DIRS.map((name) => name.toLowerCase()),
+);
+
 /**
- * A path whose bytes would hand over platform credentials.
+ * Collapse a path leaf to the name the filesystem would actually open, then fold case.
  *
- * `dir` is injectable so the tests do not depend on the runner's real home.
+ * Strips an NTFS alternate-data-stream suffix (`name::$DATA`, `name:stream`) and the
+ * trailing dots/spaces the Win32 layer discards before opening, so every spelling that
+ * resolves to a secret file compares equal to it. Over-matching here is deliberate: a
+ * POSIX file literally named `settings.json:x` is not a legitimate platform file, and
+ * refusing it fails closed.
  */
-export function isSecretPlatformPath(absPath: string, dir: string = narraforkDir): boolean {
-	if (isPrivateRequestRecordingPath(absPath, dir)) return true;
-	const home = resolve(dir);
-	const target = resolve(absPath);
-	// Outside the NarraFork home there is nothing this module claims to know about.
+function normalizeSecretLeaf(name: string): string {
+	let leaf = name;
+	const streamIndex = leaf.indexOf(":");
+	if (streamIndex >= 0) leaf = leaf.slice(0, streamIndex);
+	leaf = leaf.replace(/[. ]+$/, "");
+	return leaf.toLowerCase();
+}
+
+/** Whether `target` is a secret leaf/prefix/dir directly under the NarraFork `home`. */
+function matchesSecretHomeLeaf(home: string, target: string): boolean {
 	// `isInsidePath` is the repo's own boundary check, so a symlinked or
 	// differently-cased spelling of the home resolves the same way it does elsewhere.
 	if (!isInsidePath(home, target)) return false;
@@ -137,16 +160,39 @@ export function isSecretPlatformPath(absPath: string, dir: string = narraforkDir
 	const relative = relativePath(home, target);
 	if (!relative) return false;
 	const segments = relative.split(/[\\/]/);
-	const first = segments[0] ?? "";
+	const first = normalizeSecretLeaf(segments[0] ?? "");
+	if (!first) return false;
 
 	if (segments.length === 1) {
-		if (SECRET_HOME_FILES.includes(first)) return true;
-		if (SECRET_HOME_PREFIXES.some((prefix) => first.startsWith(prefix))) return true;
+		if (SECRET_HOME_FILES_LOWER.has(first)) return true;
+		if (SECRET_HOME_PREFIXES_LOWER.some((prefix) => first.startsWith(prefix))) return true;
 		return false;
 	}
 	// A directory match covers everything beneath it: a token store's layout is the
 	// provider's business and may gain files this list has never heard of.
-	return SECRET_HOME_DIRS.includes(first);
+	return SECRET_HOME_DIRS_LOWER.has(first);
+}
+
+/**
+ * A path whose bytes would hand over platform credentials.
+ *
+ * `dir` is injectable so the tests do not depend on the runner's real home.
+ *
+ * Checked against BOTH the lexical path and its real (symlink/junction-resolved)
+ * physical path: a link or an 8.3 short name (`SETTIN~1.JSO`) whose real target is a
+ * secret file must be refused by the name the filesystem would actually open, not only
+ * by the spelling the caller passed.
+ */
+export function isSecretPlatformPath(absPath: string, dir: string = narraforkDir): boolean {
+	if (isPrivateRequestRecordingPath(absPath, dir)) return true;
+	// Outside the NarraFork home there is nothing this module claims to know about.
+	const lexicalHome = resolve(dir);
+	const lexicalTarget = resolve(absPath);
+	if (matchesSecretHomeLeaf(lexicalHome, lexicalTarget)) return true;
+
+	const physicalHome = physicalOrLexicalPath(dir);
+	const physicalTarget = physicalOrLexicalPath(absPath);
+	return matchesSecretHomeLeaf(physicalHome, physicalTarget);
 }
 
 /**
@@ -176,3 +222,13 @@ export function isSecretUserPath(absPath: string, home: string): boolean {
 
 /** Message used by both routes, so the two cannot describe the refusal differently. */
 export const SECRET_PATH_REFUSAL = "This file is not readable through the file API";
+
+/**
+ * Refusal surfaced to the agent when a tool call targets a platform secret.
+ *
+ * This is an application authorization guard, not an OS sandbox: it is enforced in
+ * EVERY permission mode (bypassPermissions included), because disclosing these bytes
+ * escalates the agent into the platform's own credentials.
+ */
+export const SECRET_PATH_TOOL_REFUSAL =
+	"Access to NarraFork platform secrets (settings.json, narrafork.db, credential stores) is not permitted.";

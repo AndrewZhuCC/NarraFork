@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import {
 	createPluginRoutes,
@@ -6,9 +6,38 @@ import {
 	type ProviderCatalogRouteRefresher,
 	type ProviderConfigRouteService,
 } from "../../../server/routes/plugins";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 import { PluginPermissionConflictError } from "../../../server/services/plugin-permission-store";
 import { PluginProviderCatalogRefresher } from "../../../server/services/plugin-provider-catalog-refresh";
 import { PluginProviderConfigService } from "../../../server/services/plugin-provider-config-service";
+
+/**
+ * Plugin lifecycle/grant routes call the canonical `assertAdmin`, which authorizes against
+ * the LIVE role read through the session store — never the token's `role` claim. The
+ * injected auth middlewares below only set `c.get("user")`, so without this seam the admin
+ * lookup would hit the real (empty) database and reject even a correctly-shaped admin.
+ * Map every admin actor id this suite uses to role "admin"; everyone else resolves to
+ * "user" (a non-admin, which `assertPluginAdmin` turns into a 403 regardless).
+ */
+const ADMIN_ACTOR_IDS = new Set(["admin-user-42", "admin-7"]);
+const SEEN_ACTOR_IDS = [...ADMIN_ACTOR_IDS, "user-7"];
+
+beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: ADMIN_ACTOR_IDS.has(id) ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
+});
+
+afterEach(() => {
+	setAuthStores(undefined);
+});
 
 const allowAdmin: MiddlewareHandler = async (_c, next) => {
 	await next();

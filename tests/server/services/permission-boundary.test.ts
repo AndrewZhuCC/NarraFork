@@ -65,8 +65,6 @@ function makeBashAnalysis(partial: Partial<BashAnalysis> = {}): BashAnalysis {
 		hasEnvInjection: false,
 		commandEnvVars: [],
 		isCatastrophic: false,
-		gitBranchViolations: [],
-		gitBranchWarnings: [],
 		hasWriteOperation: false,
 		allReadOnly: false,
 		...partial,
@@ -323,62 +321,6 @@ describe("resolvePermissionDecision", () => {
 				cwd: CWD,
 			}),
 		).toBe("allow");
-	});
-
-	test("chapter git branch/worktree issues follow permission modes", () => {
-		const analysis = makeBashAnalysis({
-			commands: [
-				{
-					tokens: ["git", "worktree", "add", "../other", "main"],
-					text: "git worktree add ../other main",
-					fullText: "git worktree add ../other main",
-				},
-			],
-			gitBranchViolations: ["git worktree add (creates worktree for another branch)"],
-		});
-		const base = {
-			toolName: "Bash",
-			input: { command: "git worktree add ../other main" },
-			cwd: CWD,
-			bashAnalysis: analysis,
-			isChapter: true,
-		};
-
-		expect(resolvePermissionDecision({ ...base, permMode: "bypassPermissions" })).toBe("allow");
-		expect(resolvePermissionDecision({ ...base, permMode: "default" })).toBe("ask");
-		expect(resolvePermissionDecision({ ...base, permMode: "acceptEdits" })).toBe("ask");
-		expect(resolvePermissionDecision({ ...base, permMode: "readOnly" })).toBe("deny");
-		expect(resolvePermissionDecision({ ...base, permMode: "dontAsk" })).toBe("deny");
-		expect(
-			resolvePermissionDecision({
-				...base,
-				permMode: "bypassPermissions",
-				commandBlacklist: [{ pattern: "git worktree", enabled: true }],
-			}),
-		).toBe("deny");
-	});
-
-	test("chapter git warnings can be bypass-allowed for danger reflection", () => {
-		const analysis = makeBashAnalysis({
-			commands: [
-				{
-					tokens: ["git", "reset", "--soft", "HEAD~1"],
-					text: "git reset --soft HEAD~1",
-					fullText: "git reset --soft HEAD~1",
-				},
-			],
-			gitBranchWarnings: ["git reset --soft (moves HEAD, keeps working tree and index)"],
-		});
-		const base = {
-			toolName: "Bash",
-			input: { command: "git reset --soft HEAD~1" },
-			cwd: CWD,
-			bashAnalysis: analysis,
-			isChapter: true,
-		};
-
-		expect(resolvePermissionDecision({ ...base, permMode: "bypassPermissions" })).toBe("allow");
-		expect(resolvePermissionDecision({ ...base, permMode: "default" })).toBe("ask");
 	});
 
 	// --- dontAsk mode ---
@@ -1094,33 +1036,6 @@ describe("classifyDanger", () => {
 		if (!result) throw new Error("Expected medium-severity danger");
 		expect(shouldTriggerDangerReflection(result, "light")).toBe(false);
 		expect(shouldTriggerDangerReflection(result, "standard")).toBe(true);
-	});
-
-	test("chapter git issues trigger danger reflection classification", () => {
-		const analysis = makeBashAnalysis({
-			commands: [
-				{
-					tokens: ["git", "worktree", "add", "../other", "main"],
-					text: "git worktree add ../other main",
-					fullText: "git worktree add ../other main",
-				},
-			],
-			gitBranchViolations: ["git worktree add (creates worktree for another branch)"],
-		});
-
-		const result = classifyDanger(
-			"Bash",
-			{ command: "git worktree add ../other main" },
-			CWD,
-			analysis,
-			[],
-			[],
-			true,
-		);
-
-		expect(result?.summary).toContain("branch/worktree state");
-		expect(result?.details?.[0]).toContain("git worktree add");
-		expect(result?.severity).toBe("medium");
 	});
 
 	test("external read-only shell paths are low severity and only strict pauses them", () => {

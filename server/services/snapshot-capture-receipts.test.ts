@@ -34,6 +34,7 @@ import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
+import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 let root: string;
@@ -92,7 +93,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	if (crashChild) return;
 	for (const spy of cleanupSpies.splice(0)) spy.mockRestore();
-	await worktreeTreeSnapshot.destroy(workspace);
+	await rm(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, workspace), { recursive: true, force: true });
 	appDb
 		.delete(schema.narratorToolCalls)
 		.where(eq(schema.narratorToolCalls.narratorId, narratorId))
@@ -478,7 +479,9 @@ describe("actual tree-scan observation receipts", () => {
 			.run();
 		await capture();
 		expect(rows()).toHaveLength(0);
-		expect(await worktreeTreeSnapshot.tryCapture(workspace, "remote-device")).toBeNull();
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(workspace, "remote-device", { budgetMs: 30_000 }),
+		).toBeNull();
 		db.update(schema.fileChangeScopes)
 			.set({ deviceId: LOCAL_DEVICE_ID, sourceInstanceId: "imported-source" })
 			.where(eq(schema.fileChangeScopes.id, scope.id))
@@ -805,7 +808,7 @@ describe("actual tree-scan observation receipts", () => {
 				worktreeTreeSnapshot.capture(alias),
 			);
 			expect(rows()[0].treeHash).toBe(hash);
-			await worktreeTreeSnapshot.destroy(alias);
+			await rm(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, alias), { recursive: true, force: true });
 			const source = join(privateRoot, "file-change-source.json");
 			await rename(source, `${source}.saved`);
 			await symlink(`${source}.saved`, source);

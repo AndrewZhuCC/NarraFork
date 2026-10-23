@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { join } from "node:path";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -25,7 +23,6 @@ const now = new Date().toISOString();
 const activeIds: string[] = [];
 let owner: string;
 let projectId: string;
-let chapterId: string;
 let projectDir: string;
 let modelRequests: ReturnType<typeof spyOn<typeof provider, "getProvider">>;
 let remoteRequests: ReturnType<typeof spyOn<typeof deviceConnection, "sendRpc">>;
@@ -34,7 +31,6 @@ let gitProbe: ReturnType<typeof spyOn<typeof gitService, "isGitRepo">>;
 beforeEach(async () => {
 	owner = generateId();
 	projectId = generateId();
-	chapterId = generateId();
 	projectDir = join(getHome(), `legacy-project-${projectId}`);
 	await db
 		.insert(users)
@@ -44,18 +40,6 @@ beforeEach(async () => {
 		name: "Legacy",
 		gitPath: projectDir,
 		ownerUserId: owner,
-		createdAt: now,
-		updatedAt: now,
-	});
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Dormant non-root",
-		branch: "legacy",
-		baseBranch: "main",
-		status: "dormant",
-		isRoot: 0,
-		worktreePath: null,
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -89,14 +73,23 @@ function context(deviceId: string, cwd: string, revision = 3): WorkspaceContext 
 		capabilities: { switchDirectory: true },
 	};
 }
+/**
+ * A session created inside a chapter before chapters were removed: no `standalone` trait
+ * and, unless given, no directory of its own. Its project is not backfilled.
+ */
 async function seedNarrator(
-	options: { deviceId?: string; committed?: WorkspaceContext; cwd?: string } = {},
+	options: {
+		deviceId?: string;
+		committed?: WorkspaceContext;
+		cwd?: string;
+		contextProjectId?: string;
+	} = {},
 ) {
 	const id = generateId();
 	activeIds.push(id);
 	await db.insert(narrators).values({
 		id,
-		chapterId,
+		contextProjectId: options.contextProjectId ?? null,
 		cwd: options.cwd ?? null,
 		ownerUserId: owner,
 		model: "openai:test-model",
@@ -125,16 +118,15 @@ async function unchangedHistory(id: string) {
 	const before = await narratorService.getMessages(id);
 	return async () => {
 		expect(await narratorService.getMessages(id)).toEqual(before);
-		expect((await narratorService.getById(id, { userId: owner, isAdmin: false })).chapterId).toBe(
-			chapterId,
-		);
-		expect((await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) }))?.status).toBe(
-			"dormant",
-		);
+		// A directory derived at runtime is never written back onto the session.
+		expect((await narratorService.getById(id, { userId: owner, isAdmin: false })).cwd).toBeNull();
 	};
 }
 
-test("ensureNarrator initializes dormant non-root with null host directories and a committed remote workspace", async () => {
+test.each([
+	"explicit project",
+	"no project",
+] as const)("ensureNarrator initializes a former chapter session with no host directory and a committed remote workspace (%s)", async (shape) => {
 	const deviceId = generateId();
 	const remoteCwd = "/executor/legacy-workspace";
 	await db.insert(remoteDevices).values({
@@ -157,20 +149,26 @@ test("ensureNarrator initializes dormant non-root with null host directories and
 		(await deviceConnection.getSessionDevices(projectId))?.some((device) => device.id === deviceId),
 	).toBe(true);
 	const committed = context(deviceId, remoteCwd);
-	const id = await seedNarrator({ deviceId, committed });
+	const explicit = shape === "explicit project";
+	const id = await seedNarrator({
+		deviceId,
+		committed,
+		...(explicit ? { contextProjectId: projectId } : {}),
+	});
 	const checkHistory = await unchangedHistory(id);
 	const active = await ensureNarrator(id, "en");
 	expect(active.alive).toBe(true);
 	expect(active._defaultDeviceId).toBe(deviceId);
-	expect(active.cwd).toBe(projectDir);
-	expect(active._projectGitPath).toBe(projectDir);
-	expect(active._worktreePath).toBeUndefined();
+	// The project is not backfilled: without an explicit one there is no host project path,
+	// and a remote session is not blocked for lack of a local directory.
+	expect(active._projectGitPath).toBe(explicit ? projectDir : null);
+	if (explicit) expect(active.cwd).toBe(projectDir);
 	expect(isLoopRunning(id)).toBe(false);
 	expect((await narratorService.getById(id)).workspaceContext).toEqual(committed);
 	await checkHistory();
 });
 
-test("ensureNarrator accepts valid committed local cwd ahead of both missing chapter path and stale narrator cwd", async () => {
+test("ensureNarrator accepts a valid committed local cwd for a former chapter session without its own directory", async () => {
 	const committed = context("local", getHome());
 	const id = await seedNarrator({ committed });
 	const checkHistory = await unchangedHistory(id);
@@ -180,12 +178,6 @@ test("ensureNarrator accepts valid committed local cwd ahead of both missing cha
 	expect(active.cwd).not.toBe(projectDir);
 	expect(isLoopRunning(id)).toBe(false);
 	await checkHistory();
-	closeNarrator(id);
-	await db
-		.update(narrators)
-		.set({ cwd: join(getHome(), "stale-host-cwd") })
-		.where(eq(narrators.id, id));
-	expect((await ensureNarrator(id, "en")).cwd).toBe(getHome());
 });
 
 test("ensureNarrator rejects local non-root without a directory with a local 409, while history and row reads still work", async () => {

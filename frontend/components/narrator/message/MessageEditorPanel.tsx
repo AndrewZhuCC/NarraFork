@@ -37,7 +37,7 @@ export interface MessageEditorPanelProps {
 	messageId: string;
 	imageNarratorId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: persisted SDK blocks
-	blocks: any[];
+	blocks: readonly any[];
 	creator?: {
 		id: string;
 		username: string;
@@ -48,7 +48,6 @@ export interface MessageEditorPanelProps {
 	/** Optional preloaded detail; absent values are fetched only while editing. */
 	composerDocument?: ComposerDocument;
 	isLastUserMessage?: boolean;
-	hasChapter?: boolean;
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,

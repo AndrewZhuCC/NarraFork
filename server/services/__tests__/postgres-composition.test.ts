@@ -19,7 +19,6 @@ import {
 import { sqliteAuthMfaStore } from "../auth/sqlite-mfa-store";
 import { sqliteAuthSessionStore } from "../auth/sqlite-session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../auth/store";
-import { chapterWriteStore, setChapterWriteStore } from "../chapter-write/store";
 import {
 	knowledgeReadStore,
 	knowledgeWriteStore,
@@ -28,7 +27,6 @@ import {
 } from "../knowledge/store";
 import { bindNarratorMessageRefs, getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { activatePostgresRuntimeQueue, composePostgresStores } from "../postgres-composition";
-import { projectArchiveMainStore, setProjectArchiveMainStore } from "../project-archive/store";
 import { projectReadAdapter, setProjectReadAdapter } from "../read";
 import { PostgresProjectReadAdapter } from "../read/postgres-project-read-adapter";
 import { sqliteRegistrationAccountStore } from "../registration/sqlite-account-store";
@@ -65,8 +63,6 @@ afterAll(() => {
 	setAuthStores(undefined);
 	setKnowledgeWriteStore(undefined);
 	setKnowledgeReadStore(undefined);
-	setChapterWriteStore(undefined);
-	setProjectArchiveMainStore(undefined);
 	setProjectReadAdapter(undefined);
 	setPostgresRuntimeQueue(undefined);
 	bindNarratorMessageRefs(undefined);
@@ -99,21 +95,15 @@ describe("composePostgresStores", () => {
 		const injectedMfa = authMfaStore;
 		const injectedKnowledge = knowledgeWriteStore;
 		const injectedKnowledgeRead = knowledgeReadStore;
-		const injectedChapter = chapterWriteStore;
-		const injectedArchive = projectArchiveMainStore;
 		setAuthStores(undefined);
 		setKnowledgeWriteStore(undefined);
 		setKnowledgeReadStore(undefined);
-		setChapterWriteStore(undefined);
-		setProjectArchiveMainStore(undefined);
 		expect(authSessionStore).not.toBe(injectedSession);
 		expect(authMfaStore).not.toBe(injectedMfa);
 		expect(authSessionStore).toBe(sqliteAuthSessionStore);
 		expect(authMfaStore).toBe(sqliteAuthMfaStore);
 		expect(knowledgeWriteStore).not.toBe(injectedKnowledge);
 		expect(knowledgeReadStore).not.toBe(injectedKnowledgeRead);
-		expect(chapterWriteStore).not.toBe(injectedChapter);
-		expect(projectArchiveMainStore).not.toBe(injectedArchive);
 	});
 
 	test("binds the runtime queue and narrator refs ports without querying at construction", () => {

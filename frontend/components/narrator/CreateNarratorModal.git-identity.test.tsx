@@ -105,6 +105,9 @@ mock.module("@tanstack/react-query", () => ({
 	useQueryClient: () => ({ invalidateQueries }),
 }));
 mock.module("../../hooks/useModels", () => ({ useAllModels: () => ({ groupedModels: [] }) }));
+mock.module("../../hooks/useProjectDirStatus", () => ({
+	useProjectDirStatus: () => ({ usablePath: "/instance", needsChoice: false, isLoading: false }),
+}));
 mock.module("../../hooks/useNarrator", () => ({
 	useCreateNarrator: () => ({ mutate: create, isPending: false }),
 }));

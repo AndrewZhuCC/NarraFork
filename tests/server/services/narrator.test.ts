@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -20,24 +19,13 @@ function seedProject() {
 	db.insert(projects)
 		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "ch1",
-			projectId: "p1",
-			title: "Chapter 1",
-			branch: "chapter/ch1-abc",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
 }
 
-function seedNarrator(id = "n1", chapterId: string | null = "ch1") {
+function seedNarrator(id = "n1", contextProjectId: string | null = "p1") {
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId,
+			contextProjectId,
 			type: "primary",
 			inheritMode: "fresh",
 			createdAt: now,
@@ -79,23 +67,24 @@ function seedRef(narratorId: string, messageId: string, seq: number, isCompact =
 // === Narrator CRUD ===
 
 describe("narrator CRUD", () => {
-	it("can create a narrator bound to a chapter", async () => {
+	it("can create a narrator bound to a project", async () => {
 		seedProject();
 		seedNarrator();
 
 		const result = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		expect(result).toBeDefined();
-		expect(result?.chapterId).toBe("ch1");
+		expect(result?.contextProjectId).toBe("p1");
 		expect(result?.type).toBe("primary");
 		expect(result?.status).toBe("idle");
 		expect(result?.model).toBe("claude-sonnet-4.5");
 	});
 
-	it("can create a standalone narrator (null chapterId)", async () => {
+	it("can create a standalone narrator (no project)", async () => {
 		db.insert(narrators)
 			.values({
 				id: "n-standalone",
-				chapterId: null,
+				contextProjectId: null,
+				traits: ["standalone"],
 				type: "primary",
 				inheritMode: "fresh",
 				createdAt: now,
@@ -106,16 +95,17 @@ describe("narrator CRUD", () => {
 		const result = await db.query.narrators.findFirst({
 			where: eq(narrators.id, "n-standalone"),
 		});
-		expect(result?.chapterId).toBeNull();
+		expect(result?.contextProjectId).toBeNull();
+		expect(result?.traits).toEqual(["standalone"]);
 	});
 
-	it("can list narrators by chapter", async () => {
+	it("can list narrators by project", async () => {
 		seedProject();
 		seedNarrator("n1");
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				createdAt: now,
@@ -124,7 +114,7 @@ describe("narrator CRUD", () => {
 			.run();
 
 		const results = await db.query.narrators.findMany({
-			where: eq(narrators.chapterId, "ch1"),
+			where: eq(narrators.contextProjectId, "p1"),
 		});
 		expect(results).toHaveLength(2);
 	});
@@ -135,7 +125,7 @@ describe("narrator CRUD", () => {
 		db.insert(narrators)
 			.values({
 				id: "n-child",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
@@ -233,7 +223,7 @@ describe("narrator messages and refs", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n1",
@@ -273,7 +263,7 @@ describe("narrator fork via shared refs", () => {
 		db.insert(narrators)
 			.values({
 				id: "n-fork",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
@@ -311,7 +301,7 @@ describe("narrator fork via shared refs", () => {
 		db.insert(narrators)
 			.values({
 				id: "n-fork",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
@@ -352,7 +342,7 @@ describe("narrator fork via shared refs", () => {
 		db.insert(narrators)
 			.values({
 				id: "n-fork",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				parentNarratorId: "n-parent",
@@ -454,7 +444,7 @@ describe("fork validation", () => {
 		db.insert(narrators)
 			.values({
 				id: "n-sub",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "subagent",
 				subagentType: "explore",
 				inheritMode: "fresh",
@@ -483,7 +473,7 @@ describe("recursive child narrator deletion", () => {
 		db.insert(narrators)
 			.values({
 				id: "n-child",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "subagent",
 				subagentType: "explore",
 				inheritMode: "fresh",

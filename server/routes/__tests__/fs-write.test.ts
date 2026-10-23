@@ -620,7 +620,7 @@ describe("the tree snapshot boundary", () => {
 	let repoNarratorId: string;
 
 	beforeAll(async () => {
-		// A real git worktree: `tryCapture` needs one, and the workspace above is not.
+		// A real git worktree: a capture needs one, and the workspace above is not.
 		repo = mkdtempSync(join(tmpdir(), "nf-fs-write-repo-"));
 		mkdirSync(join(repo, "src"), { recursive: true });
 		await safeSpawn({ cmd: ["git", "init"], cwd: repo, timeout: 15_000 });
@@ -643,6 +643,14 @@ describe("the tree snapshot boundary", () => {
 		rmSync(repo, { recursive: true, force: true });
 	});
 
+	/** Read one file as a recorded tree holds it, through the production preview path. */
+	function readAtTree(treeHash: string, relPath: string) {
+		return worktreeTreeSnapshot.readFilePreviewAtTree(repo, treeHash, relPath, "local", 4096, {
+			signal: new AbortController().signal,
+			timeoutMs: 15_000,
+		});
+	}
+
 	test("captures a tree that contains the saved bytes", async () => {
 		const target = join(repo, "src", "bounded.ts");
 		const { status } = await save({
@@ -655,39 +663,37 @@ describe("the tree snapshot boundary", () => {
 		// The boundary the route took, read back from the shadow repository. Captured
 		// again here only to obtain the hash — `capture` is deduplicated by content, so
 		// this returns the same tree the save recorded.
-		const treeHash = await worktreeTreeSnapshot.tryCapture(repo);
+		const treeHash = await worktreeTreeSnapshot.capture(repo);
 		expect(treeHash).toBeTruthy();
-		if (!treeHash) throw new Error("expected a tree hash");
 
-		// The assertion that matters: the recorded tree holds the saved content, so a
-		// restore to this boundary reproduces the person's edit rather than losing it.
-		const restored = await worktreeTreeSnapshot.readFileAtTree(repo, treeHash, "src/bounded.ts");
-		expect(restored).toBe("saved by a person\n");
+		// The assertion that matters: the recorded tree holds the saved content, so this
+		// boundary describes the person's edit rather than losing it.
+		const recorded = await readAtTree(treeHash, "src/bounded.ts");
+		expect(recorded).toEqual({ status: "available", content: "saved by a person\n" });
 	});
 
 	test("the save is a boundary of its own, separating it from what follows", async () => {
 		const target = join(repo, "src", "sequenced.ts");
 		await save({ path: target, content: "first\n", narratorId: repoNarratorId });
-		const afterSave = await worktreeTreeSnapshot.tryCapture(repo);
+		const afterSave = await worktreeTreeSnapshot.capture(repo);
 
 		// Something else writes afterwards, the way a tool would.
 		writeFileSync(join(repo, "src", "by-a-tool.ts"), "tool wrote this\n");
-		const afterTool = await worktreeTreeSnapshot.tryCapture(repo);
+		const afterTool = await worktreeTreeSnapshot.capture(repo);
 
 		// Two distinct trees: the save's own state is addressable, so a revert of the
 		// later write can land on it instead of undoing the save too.
 		expect(afterSave).toBeTruthy();
 		expect(afterTool).not.toBe(afterSave);
 		// And the save's tree does NOT contain the tool's file.
-		if (!afterSave) throw new Error("expected a tree hash");
-		const leaked = await worktreeTreeSnapshot.readFileAtTree(repo, afterSave, "src/by-a-tool.ts");
-		expect(leaked).toBeNull();
+		const leaked = await readAtTree(afterSave, "src/by-a-tool.ts");
+		expect(leaked).toEqual({ status: "unavailable", reason: "missing_evidence" });
 	});
 
 	test("a failed boundary does not fail the save", async () => {
 		// The bytes are already on disk when the boundary is attempted, so a snapshot
 		// problem must never surface as a write failure. Exercised through a narrator
-		// whose cwd is not a git repository at all, which is what `tryCapture` refuses.
+		// whose cwd is not a git repository at all, which a capture refuses.
 		const target = join(workspace, "src", "no-repo.ts");
 		const { status, json } = await save({ path: target, content: "still saved\n", narratorId });
 

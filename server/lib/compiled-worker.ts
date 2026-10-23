@@ -42,8 +42,6 @@ export const COMPILED_WORKER_ENTRIES = [
 	"services/git-current-baseline-worker.ts",
 	"services/agent-runtime/model-history-worker.ts",
 	"services/revert-transaction-manifest-worker.ts",
-	"services/project-archive/legacy-sync-worker.ts",
-	"services/project-archive/legacy-import-worker.ts",
 ] as const;
 
 export type CompiledWorkerEntry = (typeof COMPILED_WORKER_ENTRIES)[number];

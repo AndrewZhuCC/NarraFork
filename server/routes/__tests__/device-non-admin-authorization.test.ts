@@ -30,6 +30,8 @@ import { redeemExecutorTicket, resetExecutorTickets } from "../../lib/executor-b
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { BUILD_EXECUTOR_DISTRIBUTION } from "../../lib/version";
+import type { AuthSessionStore } from "../../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
 const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
@@ -107,6 +109,19 @@ beforeEach(() => {
 	fetchCalls.length = 0;
 	resetExecutorManifestCache();
 	resetExecutorTickets();
+	// `assertAdmin` authorizes against the live role read through the session store, not the
+	// token's claim, so the admin-only endpoints resolve ADMIN as admin and everyone else as a
+	// plain user. Without it those endpoints would hit the empty database and 401 instead of 403.
+	const originalStore = authSessionStore;
+	const store: AuthSessionStore = {
+		...originalStore,
+		findSessionState: async (id) => ({
+			id,
+			role: id === ADMIN ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
 	// Preload isolates HOME/settings, not transport. Never let an authorization
 	// fixture reach GitHub (the manifest's 10s deadline exceeds Bun's 5s test limit).
 	globalThis.fetch = (async (input: RequestInfo | URL) => {
@@ -118,6 +133,7 @@ beforeEach(() => {
 
 afterEach(async () => {
 	globalThis.fetch = originalFetch;
+	setAuthStores(undefined);
 	resetExecutorManifestCache();
 	resetExecutorTickets();
 	if (created.length > 0) {

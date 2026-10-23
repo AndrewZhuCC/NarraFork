@@ -1,14 +1,39 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { AppError } from "../lib/errors";
+import type { AuthSessionStore } from "../services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../services/auth/store";
 import { storageRoutes } from "./storage";
+
+/**
+ * The guarded storage routes run `assertAdmin`, which authorizes against the LIVE role read
+ * through the session store, never the token's `role` claim. The middleware below only sets
+ * `c.get("user")`, so this seam resolves each principal's role by actor id. The two roles
+ * carry distinct subs so one test can exercise both without the lookup (or its cache)
+ * colliding; an unauthenticated request sets no user and still 401s before this is reached.
+ */
+const ADMIN_ACTOR_ID = "authenticated-admin";
+const NON_ADMIN_ACTOR_ID = "authenticated-user";
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === ADMIN_ACTOR_ID ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
+afterAll(() => {
+	setAuthStores(undefined);
+});
 
 const app = new Hono();
 app.use("*", async (c, next) => {
 	const role = c.req.header("x-test-role");
 	if (role)
 		c.set("user", {
-			sub: "authenticated-admin",
+			sub: role === "admin" ? ADMIN_ACTOR_ID : NON_ADMIN_ACTOR_ID,
 			role: role as "admin" | "user",
 			iat: 0,
 			exp: 9999999999,

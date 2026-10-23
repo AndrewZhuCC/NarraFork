@@ -1,10 +1,9 @@
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { AppError, ValidationError } from "../lib/errors";
+import { AppError, ValidationError, zodValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
-import { requireChapterAccess } from "../lib/project-access";
 import {
 	gitCommitDiffQuerySchema,
 	gitCommitSchema,
@@ -18,8 +17,6 @@ import {
 	gitStashSchema,
 	gitUnstageSchema,
 } from "../lib/validators";
-import { commitSyncService } from "../services/commit-sync-service";
-import { getCommitBoundariesCached } from "../services/git-commit-boundary-cache";
 import {
 	getGitWorkspaceLineStats,
 	getGitWorkspaceStatus,
@@ -29,7 +26,7 @@ import {
 	validateFilePaths,
 	validateGitFileTargets,
 } from "../services/git-management-service";
-import { withGitRequestContext } from "../services/git-service";
+import { type GitStatusSummary, withGitRequestContext } from "../services/git-service";
 import { getStatusSummaryCached } from "../services/git-status-cache";
 import { assertGitWorkspaceKey, type GitWorkspaceTarget } from "../services/git-workspace";
 import { authorizeGitTarget, requireReadyGitTarget } from "../services/git-workspace-access";
@@ -96,12 +93,31 @@ function cancelledCurrentDiff(filePaths: string[]) {
 	};
 }
 
-async function cancelledModificationResponse(c: Context, source: "chapter" | "narrator") {
-	const id = (source === "chapter" ? c.req.param("chapterId") : c.req.param("id")) ?? "";
+/**
+ * Uncommitted paths to read history for. A client-named path only selects an entry of
+ * this trusted status, whose rename source becomes the alias. A path absent from a
+ * truncated status is unknown, not clean: it is read without an alias and reported
+ * incomplete. Absent from a complete status, it has no uncommitted change to explain.
+ */
+function modificationFiles(status: GitStatusSummary, filePath: string | undefined) {
+	const files =
+		filePath === undefined ? status.files : status.files.filter((file) => file.path === filePath);
+	const pathAliases = new Map<string, string>();
+	for (const file of files) if (file.oldPath) pathAliases.set(file.oldPath, file.path);
+	if (filePath !== undefined && files.length === 0 && status.truncated === true)
+		return { filePaths: [filePath], pathAliases, truncated: true };
+	return {
+		filePaths: [...files.map((file) => file.path), ...pathAliases.keys()],
+		pathAliases,
+		truncated: filePath === undefined && status.truncated === true,
+	};
+}
+
+async function cancelledModificationResponse(c: Context) {
+	const id = c.req.param("id") ?? "";
 	const query = gitModificationsQuerySchema.parse(c.req.query());
 	modificationCursor(c);
-	if (source === "narrator") await requireNarratorAccess(c, id, "read");
-	else await requireChapterAccess(c, id, "read");
+	await requireNarratorAccess(c, id, "read");
 	return c.json({
 		source: "history",
 		...(query.scope === "uncommitted" ? { currentDiff: cancelledCurrentDiff([]) } : {}),
@@ -125,27 +141,25 @@ async function cancelledModificationResponse(c: Context, source: "chapter" | "na
 	});
 }
 
-/** One implementation, two authenticated domain adapters. No path comes from the client. */
-export function createGitRoutes(source: "chapter" | "narrator") {
+/**
+ * Git routes for a narrator's workspace. No workspace path comes from the client; a client file path is validated as Git-root-relative before any use.
+ */
+function createGitRoutes() {
 	const routes = new Hono<GitEnv>();
-	const prefix = source === "chapter" ? "/:chapterId/git" : "/:id/git";
+	const prefix = "/:id/git";
 	routes.use(`${prefix}/*`, bodyLimit({ maxSize: 1024 * 1024 }));
 	routes.use(`${prefix}/*`, async (c, next) => {
 		const need = c.req.method === "GET" ? "read" : "write";
 		const workspaceRequest = c.req.method === "GET" && c.req.path.endsWith("/workspace");
-		const origin =
-			source === "chapter"
-				? { chapterId: c.req.param("chapterId") ?? "" }
-				: { narratorId: c.req.param("id") ?? "" };
+		const origin = { narratorId: c.req.param("id") ?? "" };
 		if (c.req.method === "GET" && c.req.path.endsWith("/modifications") && c.req.raw.signal.aborted)
-			return cancelledModificationResponse(c, source);
+			return cancelledModificationResponse(c);
 		const target = await authorizeGitTarget(c, origin, need);
 		if (!workspaceRequest) {
 			if (need === "write") {
 				// Hono caches parsed JSON: each handler still uses its existing Zod schema.
 				const body = await c.req.json().catch(() => ({}));
-				if (source === "narrator" || body.workspaceKey !== undefined)
-					assertGitWorkspaceKey(target.workspace, body.workspaceKey);
+				assertGitWorkspaceKey(target.workspace, body.workspaceKey);
 			} else if (c.req.query("workspaceKey") !== undefined)
 				assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
 			requireReadyGitTarget(target, need);
@@ -160,13 +174,6 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 					409,
 					"GIT_WORKSPACE_CHANGED",
 				);
-			// A chapter rebound mid-request cannot inherit the completed operation.
-			if (fresh.workspace.chapterId !== target.workspace.chapterId)
-				throw new AppError(
-					"Git chapter binding changed; refresh before retrying",
-					409,
-					"GIT_WORKSPACE_CHANGED",
-				);
 		};
 		const lockKey = need === "write" ? target.workspace.repositoryKey : null;
 		c.set("gitTarget", target);
@@ -174,7 +181,7 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 		const run = () => withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
 		const write = () => (lockKey ? withWorkspaceRepositoryLock(lockKey, run) : run());
 		try {
-			if (source === "narrator" && need === "write" && target.workspace.deviceId === "local") {
+			if (need === "write" && target.workspace.deviceId === "local") {
 				const id = c.req.param("id") ?? "";
 				const context = await workspaceContextService.get(id);
 				await workspaceContextService.withRevision(
@@ -221,31 +228,30 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 	);
 	routes.get(`${prefix}/modifications`, async (c) => {
 		const { target, path, git } = access(c);
-		const query = gitModificationsQuerySchema.parse(c.req.query());
+		const parsed = gitModificationsQuerySchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const query = parsed.data;
 		if (query.narratorId && query.narratorId !== "external")
 			await requireNarratorAccess(c, query.narratorId, "read");
+		if (query.filePath !== undefined) validateFilePaths([query.filePath]);
 		const cursor = modificationCursor(c);
 		const status = query.scope === "uncommitted" ? await git.getStatusSummary(path) : null;
-		const pathAliases = new Map<string, string>();
-		for (const file of status?.files ?? [])
-			if (file.oldPath) pathAliases.set(file.oldPath, file.path);
-		const directScopes = gitAttributionScopes(target, status?.files.map((file) => file.path) ?? []);
+		const files = status ? modificationFiles(status, query.filePath) : null;
+		const directScopes = gitAttributionScopes(target, files?.filePaths ?? []);
 		const discoveredScopes = await collectGitAttributionScopes(target, c.req.raw.signal);
+		// Discovered cwd keys hold stored rows; ancestor-directory guesses come after them.
+		// The view drops spellings with no rows before applying its own scope cap.
 		const scopeMap = new Map(
-			[...directScopes.scopes, ...discoveredScopes.scopes].map((scope) => [
+			[...discoveredScopes.scopes, ...directScopes.scopes].map((scope) => [
 				scope.workspacePath,
 				scope,
 			]),
 		);
-		const mergedScopes = [...scopeMap.values()];
 		const scopesTruncated =
-			directScopes.truncated ||
-			discoveredScopes.truncated ||
-			status?.truncated === true ||
-			mergedScopes.length > 32;
+			directScopes.truncated || discoveredScopes.truncated || files?.truncated === true;
 		const view = await getWorkspaceModificationView(path, {
 			deviceId: target.workspace.deviceId,
-			additionalScopes: mergedScopes.slice(0, 32),
+			additionalScopes: [...scopeMap.values()],
 			additionalScopesTruncated: scopesTruncated,
 			currentDiff: query.scope === "uncommitted",
 			signal: c.req.raw.signal,
@@ -255,12 +261,7 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 			until: query.until,
 			narratorId: query.narratorId,
 			projection: query.projection,
-			...(status
-				? {
-						filePaths: [...status.files.map((file) => file.path), ...pathAliases.keys()],
-						pathAliases,
-					}
-				: {}),
+			...(files ? { filePaths: files.filePaths, pathAliases: files.pathAliases } : {}),
 		});
 		if (scopesTruncated) {
 			view.hasMore = true;
@@ -309,24 +310,10 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 		});
 	}
 	routes.post(`${prefix}/commit`, async (c) => {
-		const { target, path, git } = access(c);
+		const { path, git } = access(c);
 		const { message } = gitCommitSchema.parse(await c.req.json());
 		const sha = await git.commit(path, message, await resolveUserGitIdentityEnv(c.get("user").sub));
 		changed(c);
-		if (target.workspace.chapterId) {
-			try {
-				await commitSyncService.recordCommit({
-					chapterId: target.workspace.chapterId,
-					sha,
-					message,
-					source: "manual",
-				});
-			} catch {
-				logger.warn("Git commit completed; chapter synchronization failed", {
-					workspaceKey: target.workspace.workspaceKey,
-				});
-			}
-		}
 		// A failed follow-up read must never invite replaying an already successful commit.
 		let status: Awaited<ReturnType<typeof summary>> | undefined;
 		try {
@@ -376,20 +363,11 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 		return c.json(await git.getCommitPatch(path, sha, file, oldPath));
 	});
 	routes.post(`${prefix}/reset`, async (c) => {
-		const { target, path, git } = access(c);
+		const { path, git } = access(c);
 		const { target: ref, mode } = gitResetSchema.parse(await c.req.json());
 		if (mode === "hard") await git.resetHard(path, ref);
 		else await git.resetSoft(path, ref);
 		changed(c);
-		if (target.workspace.chapterId) {
-			try {
-				await commitSyncService.syncChapterCommits(target.workspace.chapterId);
-			} catch {
-				logger.warn("Git reset completed; chapter synchronization failed", {
-					workspaceKey: target.workspace.workspaceKey,
-				});
-			}
-		}
 		return c.json(await summary(c));
 	});
 	routes.post(`${prefix}/ai-commit-message`, async (c) => {
@@ -401,8 +379,7 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 	return routes;
 }
 
-export const gitRoutes = createGitRoutes("chapter");
-export const narratorGitRoutes = createGitRoutes("narrator");
+export const narratorGitRoutes = createGitRoutes();
 
 async function generateCommitMessage(diff: string, requestSignal: AbortSignal): Promise<string> {
 	const { summaryGenerateWithHistory } = await import("../lib/agent");
@@ -434,42 +411,4 @@ async function generateCommitMessage(diff: string, requestSignal: AbortSignal): 
 		.split("\n")[0]
 		.trim();
 	return !message || message.length > 200 ? "chore: update files" : message;
-}
-
-/** Legacy boundary helper retained for chapter consumers and its regression tests. */
-export async function resolveUncommittedScope(
-	worktreePath: string,
-	includeTimestampHints = true,
-): Promise<{
-	filePaths: string[];
-	sinceByPath: Map<string, string>;
-	pathAliases: Map<string, string>;
-}> {
-	const status = await getStatusSummaryCached(worktreePath);
-	const pathAliases = new Map<string, string>();
-	for (const file of status.files)
-		if (file.oldPath && file.oldPath !== file.path) pathAliases.set(file.oldPath, file.path);
-	const filePaths = [...status.files.map((file) => file.path), ...pathAliases.keys()];
-	if (!filePaths.length || !includeTimestampHints)
-		return { filePaths, sinceByPath: new Map(), pathAliases };
-	const { byPath, oldestInWindow } = await getCommitBoundariesCached(
-		worktreePath,
-		status.headSha,
-		filePaths,
-	);
-	const sinceByPath = new Map<string, string>();
-	for (const [path, boundary] of byPath) {
-		const displayPath = pathAliases.get(path) ?? path;
-		const existing = sinceByPath.get(displayPath);
-		if (existing === undefined || boundary < existing) sinceByPath.set(displayPath, boundary);
-	}
-	if (oldestInWindow) {
-		const untracked = new Set(
-			status.files.filter((file) => file.status.startsWith("?")).map((file) => file.path),
-		);
-		for (const file of status.files)
-			if (!sinceByPath.has(file.path) && !untracked.has(file.path))
-				sinceByPath.set(file.path, oldestInWindow);
-	}
-	return { filePaths, sinceByPath, pathAliases };
 }

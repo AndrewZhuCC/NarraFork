@@ -183,24 +183,7 @@ const EXACT: Map<string, string> = new Map([
 	],
 	["Run the same find command without -delete/-exec first.", "dangerCopy_findMutatingA1"],
 	["Apply changes to explicit paths.", "dangerCopy_findMutatingA2"],
-	// ── chapter git / env / patterns ────────────────────────────────────────
-	["Git command changes chapter branch/worktree state.", "dangerCopy_chapterGitSummary"],
-	[
-		"The command can switch, create, delete, rewrite, or otherwise move branch/worktree state outside the normal chapter workflow.",
-		"dangerCopy_chapterGitC1",
-	],
-	[
-		"NarraFork may lose track of which chapter owns the resulting git state.",
-		"dangerCopy_chapterGitC2",
-	],
-	[
-		"Prefer NarraFork chapter/fork/merge operations for branch and worktree changes.",
-		"dangerCopy_chapterGitA1",
-	],
-	[
-		"If this git operation is intentional, confirm the exact target branch or worktree first.",
-		"dangerCopy_chapterGitA2",
-	],
+	// ── env / patterns ──────────────────────────────────────────────────────
 	["Shell command contains dangerous execution patterns.", "dangerCopy_dangerousPatternsSummary"],
 	[
 		"Shell command includes unclassified execution patterns.",
@@ -245,7 +228,7 @@ const EXACT: Map<string, string> = new Map([
 		"dangerCopy_shellExternalPathsSummary",
 	],
 	[
-		"The command may read or modify files outside this chapter/worktree boundary.",
+		"The command may read or modify files outside this worktree boundary.",
 		"dangerCopy_shellExternalPathsC1",
 	],
 	[
@@ -255,7 +238,7 @@ const EXACT: Map<string, string> = new Map([
 	["Copy needed data into the worktree first.", "dangerCopy_shellExternalPathsA1"],
 	["Use a narrower command scoped to explicit paths.", "dangerCopy_shellExternalPathsA2"],
 	// ── tool-level external paths ───────────────────────────────────────────
-	["The operation crosses the chapter/worktree boundary.", "dangerCopy_toolExternalPathsC1"],
+	["The operation crosses the worktree boundary.", "dangerCopy_toolExternalPathsC1"],
 	[
 		"External files may not be covered by project git history or NarraFork snapshots.",
 		"dangerCopy_toolExternalPathsC2",
@@ -403,7 +386,6 @@ const DETAIL_PATTERNS: Array<{ re: RegExp; key: string; param: string }> = [
 	{ re: /^Analysis error: (.+)$/s, key: "dangerDetail_analysisError", param: "value" },
 	{ re: /^Target path: (.+)$/s, key: "dangerDetail_targetPath", param: "value" },
 	{ re: /^Pattern: (.+)$/s, key: "dangerDetail_pattern", param: "value" },
-	{ re: /^Chapter git issue: (.+)$/s, key: "dangerDetail_chapterGitIssue", param: "value" },
 	{ re: /^External paths: (.+)$/s, key: "dangerDetail_externalPaths", param: "value" },
 	{
 		re: /^Commands outside allowlist: (.+)$/s,
@@ -466,7 +448,6 @@ export function dangerCopyEnglishFallbacks(): Record<string, string> {
 	out.dangerDetail_analysisError = "Analysis error: {value}";
 	out.dangerDetail_targetPath = "Target path: {value}";
 	out.dangerDetail_pattern = "Pattern: {value}";
-	out.dangerDetail_chapterGitIssue = "Chapter git issue: {value}";
 	out.dangerDetail_externalPaths = "External paths: {value}";
 	out.dangerDetail_commandsOutsideAllowlist = "Commands outside allowlist: {value}";
 	out.dangerDetail_currentCwd = "Current working directory: {value}";
@@ -497,7 +478,6 @@ const LABEL_PLACEHOLDERS: Record<string, Record<string, string>> = {
 	dangerDetail_analysisError: { value: "{value}" },
 	dangerDetail_targetPath: { value: "{value}" },
 	dangerDetail_pattern: { value: "{value}" },
-	dangerDetail_chapterGitIssue: { value: "{value}" },
 	dangerDetail_externalPaths: { value: "{value}" },
 	dangerDetail_commandsOutsideAllowlist: { value: "{value}" },
 	dangerDetail_currentCwd: { value: "{value}" },

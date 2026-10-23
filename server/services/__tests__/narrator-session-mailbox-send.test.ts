@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { asc, eq } from "drizzle-orm";
+import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
@@ -32,21 +33,18 @@ const providerCalls: string[] = [];
 let beforeResponse: ((params: ChatParams) => Promise<void>) | undefined;
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: rowsAsHistory,
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		// Queue assertions address the task text, not the sender projection. Keep
 		// the real request signal/model while exposing the anonymous human body
 		// to fixture gates that otherwise never recognize their starting task.
-		const content = params.content.replace(/^<sender kind="human" \/>\n/, "");
+		const content = requestInput(params).replace(/^<sender kind="human" \/>\n/, "");
 		providerCalls.push(content);
 		params.onRequestStart?.();
 		await beforeResponse?.({ ...params, content });
 		yield { text: "mailbox send turn ran" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

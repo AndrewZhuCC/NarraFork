@@ -289,6 +289,7 @@ export function StorageSection() {
 	const [databasePreviewError, setDatabasePreviewError] = useState<string | null>(null);
 	const [databaseCleaning, setDatabaseCleaning] = useState(false);
 	const [databaseVacuuming, setDatabaseVacuuming] = useState(false);
+	const [legacyDumpsClearing, setLegacyDumpsClearing] = useState(false);
 	// Aborts only the status-polling fetches on unmount. The scan itself is a server-side
 	// background job: leaving this page neither cancels nor restarts it.
 	const pollAbortRef = useRef<AbortController | null>(null);
@@ -607,6 +608,38 @@ export function StorageSection() {
 		}
 	};
 
+	const handleClearLegacyRequestDumps = async () => {
+		if (!storageHealthReady) return;
+		if (
+			!(await confirm({
+				title: t("storageDatabaseLegacyDumpsConfirmTitle"),
+				message: t("storageDatabaseLegacyDumpsConfirm"),
+				confirmLabel: t("storageDatabaseLegacyDumpsClear"),
+				confirmColor: "red",
+			}))
+		) {
+			return;
+		}
+		setLegacyDumpsClearing(true);
+		try {
+			const result = await api.clearLegacyRequestDumps();
+			notifications.show({
+				color: "green",
+				message: t("storageDatabaseLegacyDumpsCleared", { count: result.cleared }),
+			});
+			void handleScan(["database"]);
+		} catch (err) {
+			console.error("Clearing legacy request dumps failed:", err);
+			notifications.show({
+				color: "red",
+				message:
+					err instanceof Error && err.message ? err.message : t("storageDatabaseLegacyDumpsFailed"),
+			});
+		} finally {
+			setLegacyDumpsClearing(false);
+		}
+	};
+
 	const handleDatabaseVacuum = async () => {
 		if (!storageHealthReady || !vacuumSupported) return;
 		if (
@@ -700,6 +733,12 @@ export function StorageSection() {
 					}),
 				});
 			}
+			if (result.skippedSessions) {
+				notifications.show({
+					color: "yellow",
+					message: t("storageDatabaseCleanupSkippedChanged", { count: result.skippedSessions }),
+				});
+			}
 			closeDatabasePreview();
 			void handleScan(["database"]);
 		} catch (err) {
@@ -756,9 +795,9 @@ export function StorageSection() {
 					count: Number(d.archiveCount ?? 0),
 				});
 				const orphans = Number(d.orphanCount ?? 0);
-				// Orphans are called out because they are the actionable part: an archive
-				// belonging to a live chapter is waiting to be restored, one whose chapter is
-				// gone is untracked secrets nothing will ever read.
+				// Orphans are called out because they are the actionable part: these archives
+				// were left by dormant chapters, which no longer exist, so nothing will ever
+				// restore them — they are untracked secrets the user may want to review.
 				if (orphans <= 0) return archives;
 				return `${archives} · ${t("storageIgnoredArchiveOrphans", { count: orphans })}`;
 			}
@@ -1211,6 +1250,28 @@ export function StorageSection() {
 																	})}
 														</Alert>
 													)}
+													{databaseDetails.legacyRequestDumps?.retained && (
+														<Alert
+															color="yellow"
+															variant="light"
+															icon={<IconAlertTriangle size={16} />}
+															title={t("storageDatabaseLegacyDumpsTitle")}
+														>
+															<Stack gap="xs" align="flex-start">
+																<Text size="sm">{t("storageDatabaseLegacyDumpsDesc")}</Text>
+																<Button
+																	size="xs"
+																	variant="light"
+																	color="orange"
+																	loading={legacyDumpsClearing}
+																	disabled={databaseScanRunning}
+																	onClick={handleClearLegacyRequestDumps}
+																>
+																	{t("storageDatabaseLegacyDumpsClear")}
+																</Button>
+															</Stack>
+														</Alert>
+													)}
 													{databaseUsageCategories.length > 0 && (
 														<Stack gap="xs">
 															<Group justify="space-between" align="center" gap="xs">
@@ -1433,6 +1494,12 @@ export function StorageSection() {
 						</Alert>
 					)}
 
+					{databasePreview?.warningCodes.includes("statisticsUnavailable") && (
+						<Alert color="yellow" icon={<IconAlertTriangle size={16} />}>
+							{t("storageDatabaseStatisticsUnavailable")}
+						</Alert>
+					)}
+
 					{databasePreview?.fallback && fallbackDiagnosticMessage(databasePreview) && (
 						<Alert color="yellow" icon={<IconAlertTriangle size={16} />}>
 							{fallbackDiagnosticMessage(databasePreview)}
@@ -1571,11 +1638,6 @@ export function StorageSection() {
 																{sample.narratorTitle || sample.narratorId || sample.id.slice(0, 8)}
 															</Text>
 															<Group gap="xs" wrap="wrap" mt={4}>
-																{sample.chapterTitle && (
-																	<Text size="xs" c="dimmed">
-																		{sample.chapterTitle}
-																	</Text>
-																)}
 																<Text size="xs" c="dimmed">
 																	{t("storageDatabaseCreatedAt", {
 																		time: formatDateTime(sample.createdAt),

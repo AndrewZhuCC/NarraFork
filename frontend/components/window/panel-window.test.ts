@@ -50,11 +50,11 @@ describe("buildPanelWindowHref + parsePanelWindowDescriptor", () => {
 			"appearance",
 			"filetree",
 		] as const) {
-			expect(roundtrip({ panelType, narratorId: "n1", chapterId: "c1" })).toEqual({
-				panelType,
-				narratorId: "n1",
-				chapterId: "c1",
-			});
+			expect(roundtrip({ panelType, narratorId: "n1" })).toEqual({ panelType, narratorId: "n1" });
+			// A legacy descriptor saved with a chapter id still opens; the id is dropped.
+			expect(
+				normalizePanelWindowDescriptor({ panelType, narratorId: "n1", chapterId: "c1" }),
+			).toEqual({ panelType, narratorId: "n1" });
 		}
 	});
 
@@ -188,7 +188,7 @@ describe("plugin window host context", () => {
 	}> = [
 		{
 			binding: { kind: "focus-current-narrator", narratorId: "n1" },
-			hostContext: { surface: "focus", narratorId: "n1", chapterId: null, projectId: "p1" },
+			hostContext: { surface: "focus", narratorId: "n1", projectId: "p1" },
 		},
 		{
 			binding: { kind: "workspace", workspaceId: "w1" },
@@ -200,22 +200,17 @@ describe("plugin window host context", () => {
 				surface: "director",
 				workspaceId: "w1",
 				narratorId: "n1",
-				chapterId: "ch1",
 				presentation: "director",
 			},
 		},
 		{ binding: { kind: "global" }, hostContext: { surface: "settings" } },
-		{
-			binding: { kind: "host-surface", surface: "focus" },
-			hostContext: { surface: "graph", narratorId: "n1", projectId: "p1" },
-		},
 		{
 			binding: { kind: "host-surface", surface: "provider-settings" },
 			hostContext: { surface: "provider-settings" },
 		},
 		{
 			binding: { kind: "host-surface", surface: "focus" },
-			hostContext: { surface: "focus", narratorId: "_n1", chapterId: "-c1", projectId: "_p1" },
+			hostContext: { surface: "focus", narratorId: "_n1", projectId: "_p1" },
 		},
 	];
 	test.each(cases)("round-trips a strict hostContext for %j", ({ binding, hostContext }) => {
@@ -227,6 +222,21 @@ describe("plugin window host context", () => {
 		});
 		expect(descriptor).toEqual({ ...plugin, binding, hostContext });
 		if (descriptor) expect(roundtrip(descriptor)).toEqual(descriptor);
+	});
+
+	test("reads a legacy canvas-node `graph` surface as focus", () => {
+		const binding = { kind: "host-surface", surface: "focus" } as const;
+		expect(
+			normalizePanelWindowDescriptor({
+				...plugin,
+				binding,
+				hostContext: { surface: "graph", narratorId: "n1", projectId: "p1", chapterId: "c1" },
+			}),
+		).toEqual({
+			...plugin,
+			binding,
+			hostContext: { surface: "focus", narratorId: "n1", projectId: "p1" },
+		});
 	});
 
 	test("rejects context that disagrees with explicit binding identity", () => {

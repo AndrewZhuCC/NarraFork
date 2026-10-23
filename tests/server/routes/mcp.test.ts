@@ -4,6 +4,8 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { ToolContext } from "../../../server/lib/agent/types";
 import { AppError } from "../../../server/lib/errors";
 import type { McpServerConfig } from "../../../server/lib/settings";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 
 const actualSettingsModule = { ...(await import("../../../server/lib/settings")) };
 const actualManagerModule = { ...(await import("../../../server/lib/mcp/manager")) };
@@ -102,9 +104,23 @@ mock.module("../../../server/lib/mcp/tool-bridge", () => ({
 const { mcpRoutes } = await import("../../../server/routes/mcp");
 
 let role: "admin" | "user" = "user";
+const ACTOR_ID = "mcp-test-user";
+
+/**
+ * `assertAdmin` authorizes against the LIVE role read through the session store, never the
+ * token's `role` claim. The middleware below only sets `c.get("user")`, so this seam makes
+ * the store report the acting user's current `role` (admin → allowed, user → 403). Without
+ * it the lookup would hit the real (empty) database and 401 USER_GONE instead of 403.
+ */
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({ id, role, tokenVersion: 0 }),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 const app = new Hono();
 app.use("*", async (c, next) => {
-	c.set("user", { sub: "mcp-test-user", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+	c.set("user", { sub: ACTOR_ID, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 	await next();
 });
 app.onError((error, c) => {
@@ -144,6 +160,8 @@ async function jsonRequest(path: string, method: string, body: unknown): Promise
 
 beforeEach(() => {
 	role = "user";
+	// The 60s verified-user cache would otherwise freeze the role a prior test left
+	// cached for this actor; drop it so each test re-reads the live `role` via the seam.
 	connectedServerIds.clear();
 	lastTestConfig = null;
 	saveSettingsCalls = 0;
@@ -154,6 +172,7 @@ beforeEach(() => {
 });
 
 afterAll(() => {
+	setAuthStores(undefined);
 	mock.module("../../../server/lib/settings", () => actualSettingsModule);
 	mock.module("../../../server/lib/mcp/manager", () => actualManagerModule);
 	mock.module("../../../server/lib/mcp/tool-bridge", () => actualToolBridgeModule);

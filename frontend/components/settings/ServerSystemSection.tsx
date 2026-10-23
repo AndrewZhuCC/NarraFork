@@ -18,6 +18,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
+import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { api } from "../../lib/api";
 import {
 	type UpdateSource,
@@ -119,6 +120,7 @@ export function ServerSystemSection({
 	setBrandIconColor,
 }: ServerSystemSectionProps) {
 	const { t } = useTranslation("settings");
+	const { status: projectDirStatus } = useProjectDirStatus();
 	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const tlsGenerationDisabledReason = t("tlsGenerationUnsupported");
 	const [checking, setChecking] = useState(false);
@@ -180,7 +182,20 @@ export function ServerSystemSection({
 				onChange={setHost}
 				data={HOST_PRESETS}
 			/>
-			<PathInput label={t("defaultProjectDir")} value={projectDir} onChange={setProjectDir} />
+			<PathInput
+				label={t("defaultProjectDir")}
+				description={t("defaultProjectDirDesc")}
+				value={projectDir}
+				onChange={setProjectDir}
+				error={
+					projectDirStatus &&
+					projectDirStatus.state !== "valid" &&
+					projectDirStatus.state !== "unset" &&
+					projectDir === projectDirStatus.configured
+						? t("projectDirMissing", { path: projectDirStatus.path ?? projectDir })
+						: undefined
+				}
+			/>
 			<div>
 				<Text size="sm" fw={500} mb={4}>
 					{t("openBrowser")}

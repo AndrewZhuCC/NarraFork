@@ -73,7 +73,7 @@ export function projectReadableText(projectAlias: string): string {
 
 /**
  * The same rule applied to an expression that yields a project id, for queries over a table
- * that merely references one (chapters, container instances, graph aggregates).
+ * that merely references one.
  *
  * `exists` rather than a join so several grants on one project cannot duplicate rows and
  * corrupt `limit n + 1` paging.
@@ -87,19 +87,12 @@ export function projectReadableForIdText(projectIdExpression: string): string {
 }
 
 /**
- * The project a narrator resolves to, as a scalar. Chapter first, then
- * `context_project_id` — and only when there is no chapter at all.
- *
- * The `case` wrapper is not decoration: a bare `coalesce` would fall through to
- * `context_project_id` when the chapter reference dangles, while the row-level resolution
- * reports "no project" there. Dropping it makes a narrator with a deleted chapter resolve
- * to a different project in SQL than in memory.
+ * The project a narrator resolves to, as a scalar — the same rule as
+ * `resolveNarratorProjectId`: the explicit project, else the primary link (an index
+ * lookup on the partial unique primary-link index).
  */
-function narratorProjectIdText(alias: string): string {
-	return `coalesce(
-		(select ch.project_id from chapters ch where ch.id = ${alias}.chapter_id),
-		case when ${alias}.chapter_id is null then ${alias}.context_project_id end
-	)`;
+export function narratorProjectIdText(alias: string): string {
+	return `coalesce(${alias}.context_project_id, (select npl.project_id from narrator_project_links npl where npl.narrator_id = ${alias}.id and npl.role = 'primary'))`;
 }
 
 /**

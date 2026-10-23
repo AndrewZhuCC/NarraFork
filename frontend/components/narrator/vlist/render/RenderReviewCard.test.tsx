@@ -19,6 +19,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -26,7 +27,6 @@ import { createRoot } from "react-dom/client";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "../registry";
 import { renderElement, resolveRenderExtra } from "../render-registry";
-import type { ReviewCardActions } from "./RenderReviewCard";
 
 const CONTENT_WIDTH = 800;
 
@@ -85,10 +85,7 @@ const CONCLUSION_MD = [
  * measurement and the paint have each been the broken link at some point, and only an
  * end-to-end drive covers all three.
  */
-function renderConclusion(
-	block: Record<string, unknown>,
-	actions?: ReviewCardActions,
-): {
+function renderConclusion(block: Record<string, unknown>): {
 	container: HTMLElement;
 	html: string;
 	buttons: HTMLButtonElement[];
@@ -96,13 +93,15 @@ function renderConclusion(
 } {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: {
-			id: "review-msg",
-			role: "user",
-			origin: "system",
-			originLabel: "review",
-			contentJson: [{ type: "text", text: String(block.text ?? "") } as never, block as never],
-		},
+		msg: rowWithElements(
+			{
+				id: "review-msg",
+				role: "user",
+				origin: "system",
+				originLabel: "review",
+			},
+			[{ type: "text", text: String(block.text ?? "") } as never, block as never],
+		),
 	};
 	const spec = adaptSegment(seg, { lod: 5 })[0];
 	if (!spec) throw new Error("no spec produced");
@@ -111,7 +110,6 @@ function renderConclusion(
 
 	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 5, spec.opts);
 	const extra = resolveRenderExtra(spec);
-	if (actions) extra.reviewFeedbackActions = actions;
 
 	const container = document.createElement("div");
 	document.body.appendChild(container);
@@ -211,45 +209,13 @@ describe("review card — the body scrolls instead of growing the row", () => {
 	});
 });
 
-describe("review card — the header and its action", () => {
-	it("shows the verdict and calls the injected handler", () => {
-		let clicked = 0;
-		const { container, buttons, unmount } = renderConclusion(
-			{ ...REVIEW_BLOCK },
-			{ onApply: () => clicked++ },
-		);
+describe("review card — the header", () => {
+	it("shows the verdict and offers no action", () => {
+		// The card is a read-only record of the conclusion: the button that started a
+		// follow-up turn went away with chapter review.
+		const { container, buttons, unmount } = renderConclusion({ ...REVIEW_BLOCK, applied: true });
 		expect(container.textContent ?? "").toContain("Changes Requested");
-		// More than one button is present, and that is itself evidence the markdown
-		// pipeline ran: the fenced block contributes a copy button. The action is the one
-		// carrying the adapter's label.
-		const action = buttons.find((b) => (b.textContent ?? "").includes("Handle"));
-		expect(action).toBeTruthy();
-		act(() => action?.click());
-		expect(clicked).toBe(1);
-		unmount();
-	});
-
-	it("disables the action once a turn has been started for the conclusion", () => {
-		// `applied` is terminal: a second click would start a second turn for the same
-		// findings, so the button must be inert even with a live handler attached.
-		let clicked = 0;
-		const { buttons, unmount } = renderConclusion(
-			{ ...REVIEW_BLOCK, applied: true },
-			{ onApply: () => clicked++ },
-		);
-		// Found by label rather than by position: the markdown body's code panel contributes
-		// its own copy button, so an index would silently assert about the wrong control.
-		const action = buttons.find((b) => (b.textContent ?? "").includes("Handled"));
-		expect(action?.hasAttribute("disabled")).toBe(true);
-		act(() => action?.click());
-		expect(clicked).toBe(0);
-		unmount();
-	});
-
-	it("renders the action disabled when no handler was injected", () => {
-		const { buttons, unmount } = renderConclusion({ ...REVIEW_BLOCK });
-		const action = buttons.find((b) => (b.textContent ?? "").includes("Handle"));
-		expect(action?.hasAttribute("disabled")).toBe(true);
+		expect(buttons.some((b) => /Handle/.test(b.textContent ?? ""))).toBe(false);
 		unmount();
 	});
 

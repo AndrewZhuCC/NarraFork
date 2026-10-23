@@ -1249,6 +1249,27 @@ export function migrationScript(queries: string[]): string {
 }
 
 /**
+ * Whether a migration only replaces constraints: every statement drops or adds a table
+ * constraint, and each one it adds it also drops (a widened CHECK, a changed foreign key).
+ * Such a migration re-runs cleanly by construction, so it says nothing about whether a
+ * migration's SQL creates something; the replay probe looks past it.
+ */
+export function replacesConstraintsOnly(sql: string): boolean {
+	const statements = sql
+		.split("--> statement-breakpoint")
+		.map((statement) => statement.trim().replace(/;$/, ""))
+		.filter(Boolean);
+	const dropped = new Set<string>();
+	const added = new Set<string>();
+	for (const statement of statements) {
+		const match = /^ALTER TABLE ("[^"]+") (DROP|ADD) CONSTRAINT ("[^"]+")/.exec(statement);
+		if (!match) return false;
+		(match[2] === "DROP" ? dropped : added).add(`${match[1]}.${match[3]}`);
+	}
+	return added.size > 0 && [...added].every((name) => dropped.has(name));
+}
+
+/**
  * A `pg-proxy` callback backed by the harness' `psql` exec.
  *
  * Only Drizzle's migrator runs through this, and it uses `db.execute`, which returns the

@@ -1,0 +1,1 @@
+ALTER TABLE "narrator_messages" ADD COLUMN "body_rows_only" integer DEFAULT 0 NOT NULL;

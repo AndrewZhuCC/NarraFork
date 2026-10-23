@@ -1,15 +1,23 @@
 import { Button, Center, Group, Loader, NumberInput, Stack, Text } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { EDITOR_FILE_MAX_BYTES, type EditorReadMode } from "@shared/editor-document";
 import {
 	FILE_PANEL_PAGE_BYTES,
 	type FilePanelPage,
 	MAX_FILE_PANEL_BYTES,
 } from "@shared/file-reference";
+import { IconCopy, IconFolder } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { usePlatform } from "../../../hooks/usePlatform";
+import { useUserPreferences } from "../../../hooks/useUserPreferences";
+import { api } from "../../../lib/api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { type FilePanelReadOrigin, fileReferenceApi } from "../../../lib/api/file-references";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { formatLocaleNumber } from "../../../lib/intl-format";
+import { canRevealFromBrowser } from "../../../lib/local-origin";
+import { fileRevealDirectory } from "../../../lib/reveal-directory";
 import { useEditorRecoveryHost } from "../file-editor/EditorRecoveryBoundary";
 import { useEditorPanelVisible } from "../narrator-panel-visibility";
 
@@ -225,8 +233,62 @@ function LargeFileResource({
 						{t("largeFile.viewAnyway")}
 					</Button>
 				)}
+				<LargeFileLocationActions filePath={filePath} deviceId={deviceId} />
 			</Stack>
 		</Center>
+	);
+}
+
+/** Unviewed or unviewable files still need a way out of the pane. */
+function LargeFileLocationActions({ filePath, deviceId }: { filePath: string; deviceId: string }) {
+	const { t } = useTranslation("narrator");
+	const platform = usePlatform();
+	const { data: userPrefs } = useUserPreferences();
+	const revealDirectory = fileRevealDirectory(
+		filePath,
+		deviceId,
+		platform,
+		canRevealFromBrowser(userPrefs?.treatAsLocalAccess),
+	);
+	return (
+		<Group gap="xs" justify="center">
+			<Button
+				variant="default"
+				size="xs"
+				leftSection={<IconCopy size={14} />}
+				onClick={() => {
+					void copyTextToClipboard(filePath).then(
+						() => notifications.show({ message: t("largeFile.pathCopied") }),
+						(error: unknown) =>
+							notifications.show({
+								color: "red",
+								title: t("largeFile.copyPathFailed"),
+								message: error instanceof Error ? error.message : String(error),
+							}),
+					);
+				}}
+			>
+				{t("largeFile.copyPath")}
+			</Button>
+			{revealDirectory && (
+				<Button
+					variant="default"
+					size="xs"
+					leftSection={<IconFolder size={14} />}
+					onClick={() => {
+						void api.fsReveal(revealDirectory).catch((error: unknown) => {
+							notifications.show({
+								color: "red",
+								title: t("largeFile.revealFailed"),
+								message: error instanceof Error ? error.message : String(error),
+							});
+						});
+					}}
+				>
+					{t("largeFile.revealInExplorer")}
+				</Button>
+			)}
+		</Group>
 	);
 }
 

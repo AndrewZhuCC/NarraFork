@@ -1,18 +1,17 @@
 /**
  * Project-level route gates.
  *
- * The instrumentation is spread across many routers (projects, chapters, git, graph,
- * ruler, skills), so these tests pin the behaviour at the boundary rather than
- * per-file:
+ * The instrumentation is spread across many routers (projects, narrators, git,
+ * skills), so these tests pin the behaviour at the boundary rather than per-file:
  *
  *  - a private project is invisible to non-members, and refusal is 404 (not 403) so
  *    ids cannot be probed;
  *  - the list endpoint filters instead of erroring, and filtering happens in SQL;
- *  - read does not imply write: a read member cannot create chapters or commit;
+ *  - read does not imply write: a read member cannot start sessions in it or commit;
  *  - write does not imply manage: a write member cannot delete the project or edit
  *    its settings;
- *  - chapters inherit the project verdict, including through the git surface, whose
- *    endpoints are the ones that touch the filesystem;
+ *  - project sessions inherit the project verdict, including through the git surface,
+ *    whose endpoints are the ones that touch the filesystem;
  *  - public projects are readable by everyone but still not writable.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -28,11 +27,10 @@ process.env.NARRAFORK_HOME = testHome;
 process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
 const { projectRoutes, requireSqliteProjectMutation } = await import("../projects");
-const { chapterRoutes, createChapterMutationAdmissionMiddleware, requireSqliteChapterMutation } =
-	await import("../chapters");
-const { gitRoutes } = await import("../git");
+const { narratorRoutes } = await import("../narrators");
+const { narratorGitRoutes } = await import("../git");
 const { db } = await import("../../db");
-const { aclGrants, chapters, projects, users } = await import("../../db/schema");
+const { aclGrants, narrators, projects, users } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
 
 afterAll(() => {
@@ -48,7 +46,7 @@ const OUTSIDER = "proj-gate-outsider";
 
 let privateProject: string;
 let publicProject: string;
-let chapterInPrivate: string;
+let sessionInPrivate: string;
 
 function appAs(userId: string, role: "admin" | "user" = "user") {
 	const app = new Hono();
@@ -66,8 +64,8 @@ function appAs(userId: string, role: "admin" | "user" = "user") {
 		return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
 	});
 	app.route("/projects", projectRoutes);
-	app.route("/chapters", chapterRoutes);
-	app.route("/chapters", gitRoutes);
+	app.route("/narrators", narratorRoutes);
+	app.route("/narrators", narratorGitRoutes);
 	return app;
 }
 
@@ -132,13 +130,16 @@ beforeAll(async () => {
 		},
 	]);
 
-	chapterInPrivate = generateId();
-	await db.insert(chapters).values({
-		id: chapterInPrivate,
-		projectId: privateProject,
-		title: "chapter",
-		branch: "chapter/gate",
-		baseBranch: "main",
+	sessionInPrivate = generateId();
+	await db.insert(narrators).values({
+		id: sessionInPrivate,
+		title: "project session",
+		ownerUserId: OWNER,
+		contextProjectId: privateProject,
+		cwd: join(testHome, "private-repo"),
+		traits: ["standalone"],
+		visibility: "project",
+		writeAudience: "project",
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -189,19 +190,19 @@ describe("the project list", () => {
 });
 
 describe("write is not read", () => {
-	test("a read member cannot create a chapter", async () => {
-		const res = await request(READER, "/chapters", {
+	test("a read member cannot start a session in the project", async () => {
+		const res = await request(READER, "/narrators", {
 			method: "POST",
-			body: { projectId: privateProject, title: "nope" },
+			body: { contextProjectId: privateProject, title: "nope" },
 		});
 		expect(res.status).toBe(404);
 	});
 
-	test("a public project does not accept chapters from outsiders", async () => {
+	test("a public project does not accept sessions from outsiders", async () => {
 		// Publishing a project shares a view of it, not commit rights.
-		const res = await request(OUTSIDER, "/chapters", {
+		const res = await request(OUTSIDER, "/narrators", {
 			method: "POST",
-			body: { projectId: publicProject, title: "nope" },
+			body: { contextProjectId: publicProject, title: "nope" },
 		});
 		expect(res.status).toBe(404);
 	});
@@ -230,24 +231,24 @@ describe("manage is not write", () => {
 	});
 });
 
-describe("chapters inherit the project", () => {
-	test("an outsider cannot read a chapter of a private project", async () => {
-		expect((await request(OUTSIDER, `/chapters/${chapterInPrivate}`)).status).toBe(404);
+describe("project sessions inherit the project", () => {
+	test("an outsider cannot read a session of a private project", async () => {
+		expect((await request(OUTSIDER, `/narrators/${sessionInPrivate}`)).status).toBe(404);
 	});
 
 	test("a read member can", async () => {
-		expect((await request(READER, `/chapters/${chapterInPrivate}`)).status).toBe(200);
+		expect((await request(READER, `/narrators/${sessionInPrivate}`)).status).toBe(200);
 	});
 
 	test("a read member cannot delete it", async () => {
 		expect(
-			(await request(READER, `/chapters/${chapterInPrivate}`, { method: "DELETE" })).status,
+			(await request(READER, `/narrators/${sessionInPrivate}`, { method: "DELETE" })).status,
 		).toBe(404);
 	});
 
-	test("chapter listing requires project read", async () => {
-		expect((await request(OUTSIDER, `/chapters?projectId=${privateProject}`)).status).toBe(404);
-		expect((await request(READER, `/chapters?projectId=${privateProject}`)).status).toBe(200);
+	test("project session listing requires project read", async () => {
+		expect((await request(OUTSIDER, `/narrators?projectId=${privateProject}`)).status).toBe(404);
+		expect((await request(READER, `/narrators?projectId=${privateProject}`)).status).toBe(200);
 	});
 });
 
@@ -270,126 +271,17 @@ describe("PostgreSQL mutation admission", () => {
 		}
 		expect(() => requireSqliteProjectMutation("Project creation", "sqlite")).not.toThrow();
 	});
-
-	const chapterMutationContracts = [
-		["POST", "/chapters"],
-		["PATCH", "/chapters/chapter-id"],
-		["DELETE", "/chapters/chapter-id"],
-		["PUT", "/chapters/chapter-id/dock-layout"],
-		["PUT", "/chapters/chapter-id/detached-panels"],
-		["POST", "/chapters/chapter-id/fork"],
-		["POST", "/chapters/chapter-id/split"],
-		["POST", "/chapters/chapter-id/review"],
-		["POST", "/chapters/chapter-id/merge"],
-		["POST", "/chapters/chapter-id/ai-resolve"],
-		["POST", "/chapters/chapter-id/unmerge"],
-		["POST", "/chapters/chapter-id/dormant"],
-		["POST", "/chapters/chapter-id/wake"],
-		["POST", "/chapters/cleanup"],
-		["POST", "/chapters/batch-merge"],
-		["POST", "/chapters/chapter-id/containers/start"],
-		["POST", "/chapters/chapter-id/containers/stop"],
-		["POST", "/chapters/chapter-id/containers/pause"],
-		["POST", "/chapters/chapter-id/containers/unpause"],
-		["POST", "/chapters/chapter-id/containers/remove"],
-	] as const;
-
-	function admissionApp(backend: "postgres" | "sqlite") {
-		const calls = { acl: 0, handler: 0 };
-		const app = new Hono();
-		app.onError((error) => {
-			if (error instanceof AppError) {
-				return new Response(JSON.stringify({ error: error.message, code: error.code }), {
-					status: error.statusCode,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
-		});
-		app.use("*", createChapterMutationAdmissionMiddleware(backend));
-		app.use("*", async (_c, next) => {
-			calls.acl++;
-			await next();
-		});
-		app.all("*", (c) => {
-			calls.handler++;
-			return c.json({ ok: true });
-		});
-		return { app, calls };
-	}
-
-	test("all chapter lifecycle mutations fail closed before ACL or handlers on PostgreSQL", async () => {
-		const { app, calls } = admissionApp("postgres");
-		for (const [method, path] of chapterMutationContracts) {
-			const response = await app.request(`http://localhost${path}`, { method });
-			expect(response.status, `${method} ${path}`).toBe(503);
-			expect(await response.json(), `${method} ${path}`).toEqual({
-				error: "Chapter mutation is not yet supported on the PostgreSQL backend",
-				code: "POSTGRES_UNSUPPORTED",
-			});
-		}
-		expect(calls).toEqual({ acl: 0, handler: 0 });
-	});
-
-	test("the centralized gate runs before body parsing", async () => {
-		let bodyParsed = false;
-		const app = new Hono();
-		app.onError((error) => {
-			if (error instanceof AppError) {
-				return new Response(JSON.stringify({ code: error.code }), { status: error.statusCode });
-			}
-			return new Response(null, { status: 500 });
-		});
-		app.use("*", createChapterMutationAdmissionMiddleware("postgres"));
-		app.post("*", async (c) => {
-			bodyParsed = true;
-			await c.req.json();
-			return c.body(null, 204);
-		});
-
-		const response = await app.request("http://localhost/chapters/chapter-id/fork", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: "not-json",
-		});
-		expect(response.status).toBe(503);
-		expect(bodyParsed).toBe(false);
-	});
-
-	test("SQLite mutations and database-independent Podman routes remain admitted", async () => {
-		const sqlite = admissionApp("sqlite");
-		for (const [method, path] of chapterMutationContracts) {
-			const response = await sqlite.app.request(`http://localhost${path}`, { method });
-			expect(response.status, `${method} ${path}`).toBe(200);
-		}
-		expect(sqlite.calls).toEqual({
-			acl: chapterMutationContracts.length,
-			handler: chapterMutationContracts.length,
-		});
-
-		const postgres = admissionApp("postgres");
-		for (const [method, path] of [
-			["POST", "/chapters/podman/install"],
-			["GET", "/chapters/podman/status"],
-			["GET", "/chapters/chapter-id"],
-		] as const) {
-			const response = await postgres.app.request(`http://localhost${path}`, { method });
-			expect(response.status, `${method} ${path}`).toBe(200);
-		}
-		expect(postgres.calls).toEqual({ acl: 3, handler: 3 });
-		expect(() => requireSqliteChapterMutation("Chapter creation", "sqlite")).not.toThrow();
-	});
 });
 
 describe("the git surface inherits too", () => {
-	test("an outsider cannot read git status of a private project's chapter", async () => {
+	test("an outsider cannot read git status of a private project's session", async () => {
 		// The git endpoints reach the filesystem, so this gate matters more than most.
-		const res = await request(OUTSIDER, `/chapters/${chapterInPrivate}/git/status`);
+		const res = await request(OUTSIDER, `/narrators/${sessionInPrivate}/git/status`);
 		expect(res.status).toBe(404);
 	});
 
 	test("a read member cannot stage files", async () => {
-		const res = await request(READER, `/chapters/${chapterInPrivate}/git/stage`, {
+		const res = await request(READER, `/narrators/${sessionInPrivate}/git/stage`, {
 			method: "POST",
 			body: { files: ["a.txt"] },
 		});

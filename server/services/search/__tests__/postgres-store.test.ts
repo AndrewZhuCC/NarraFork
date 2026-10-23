@@ -43,7 +43,7 @@ import type {
 } from "../types";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../db", () => ({ db, sqlite }));
+mock.module("../../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 // FTS virtual tables + sync triggers are runtime DDL on the SQLite side.
 const { ensureFts } = await import("../../../db/fts");
@@ -68,6 +68,13 @@ const NOW = "2026-09-20T00:00:00.000Z";
 
 const USERS = ["u-owner", "u-stranger", "u-author"];
 const NOW_PARAMS = [NOW];
+/** id, project (`narrators.context_project_id`), title, visibility. */
+const NARRATORS: [string, string, string | null, string][] = [
+	["n1", "p1", "Auth discussion session", "private"],
+	["n2", "p2", "Public brainstorm auth", "public"],
+	["n3", "p2", null, "public"],
+	["n4", "p2", "child session", "public"],
+];
 
 function seedSqlite(): void {
 	const run = (sql: string, params: unknown[] = []) =>
@@ -89,29 +96,11 @@ function seedSqlite(): void {
 		 VALUES ('p2', 'Public project', 'public', 'u-owner', ?, ?)`,
 		NOW_PARAMS.concat(NOW),
 	);
-	const chapters: [string, string, string, string][] = [
-		["ch1", "p1", "Authentication middleware overhaul", "Rework the auth flow for token refresh"],
-		["ch2", "p2", "充电三阶段任务", "实现三阶段充电策略"],
-		["ch3", "p2", "Middleware logging", "Add request logging to middleware"],
-	];
-	for (const [id, project, title, description] of chapters) {
+	for (const [id, project, title, visibility] of NARRATORS) {
 		run(
-			`INSERT INTO chapters (id, project_id, title, description, branch, base_branch, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, 'main', ?, ?)`,
-			[id, project, title, description, `branch-${id}`, NOW, NOW],
-		);
-	}
-	const narrators: [string, string, string | null, string][] = [
-		["n1", "ch1", "Auth discussion session", "private"],
-		["n2", "ch2", "Public brainstorm auth", "public"],
-		["n3", "ch3", null, "public"],
-		["n4", "ch2", "child session", "public"],
-	];
-	for (const [id, chapter, title, visibility] of narrators) {
-		run(
-			`INSERT INTO narrators (id, chapter_id, title, visibility, owner_user_id, created_at, updated_at)
+			`INSERT INTO narrators (id, context_project_id, title, visibility, owner_user_id, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, 'u-owner', ?, ?)`,
-			[id, chapter, title, visibility, NOW, NOW],
+			[id, project, title, visibility, NOW, NOW],
 		);
 	}
 	const messages: [string, string, string, string][] = [
@@ -195,29 +184,11 @@ async function seedPostgres(pg: PgExecutor): Promise<void> {
 		        ('p2', 'Public project', 'public', 'u-owner', $1, $1)`,
 		[NOW],
 	);
-	const chapters: [string, string, string, string][] = [
-		["ch1", "p1", "Authentication middleware overhaul", "Rework the auth flow for token refresh"],
-		["ch2", "p2", "充电三阶段任务", "实现三阶段充电策略"],
-		["ch3", "p2", "Middleware logging", "Add request logging to middleware"],
-	];
-	for (const [id, project, title, description] of chapters) {
+	for (const [id, project, title, visibility] of NARRATORS) {
 		await pg.unsafe(
-			`INSERT INTO chapters (id, project_id, title, description, branch, base_branch, created_at, updated_at)
-			 VALUES ($1, $2, $3, $4, $5, 'main', $6, $6)`,
-			[id, project, title, description, `branch-${id}`, NOW],
-		);
-	}
-	const narrators: [string, string, string | null, string][] = [
-		["n1", "ch1", "Auth discussion session", "private"],
-		["n2", "ch2", "Public brainstorm auth", "public"],
-		["n3", "ch3", null, "public"],
-		["n4", "ch2", "child session", "public"],
-	];
-	for (const [id, chapter, title, visibility] of narrators) {
-		await pg.unsafe(
-			`INSERT INTO narrators (id, chapter_id, title, visibility, owner_user_id, created_at, updated_at)
+			`INSERT INTO narrators (id, context_project_id, title, visibility, owner_user_id, created_at, updated_at)
 			 VALUES ($1, $2, $3, $4, 'u-owner', $5, $5)`,
-			[id, chapter, title, visibility, NOW],
+			[id, project, title, visibility, NOW],
 		);
 	}
 	const messages: [string, string, string, string][] = [
@@ -516,35 +487,6 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						}
 					};
 
-					// ── chapters: phrase recall + project ACL gate ────────────────────────
-					for (const [label, viewer, expected] of [
-						["owner", OWNER, ["ch1", "ch3"]],
-						["stranger (private project hidden)", STRANGER, ["ch3"]],
-						["admin", ADMIN, ["ch1", "ch3"]],
-					] as const) {
-						const [a, b] = await Promise.all([
-							lite.searchChapters(entity("middleware", "index", viewer)),
-							store.searchChapters(entity("middleware", "index", viewer)),
-						]);
-						check(`chapters index middleware ${label} (sqlite)`, ids(a), expected);
-						check(`chapters index middleware ${label} (postgres)`, ids(b), expected);
-						expectRankOrdered(a, `sqlite chapters ${label}`);
-						expectRankOrdered(b, `postgres chapters ${label}`);
-					}
-
-					// ── chapters: CJK index (3 chars) and substring (2 chars) ──────────────
-					for (const [label, query, expected] of [
-						["index 三阶段", entity("三阶段", "index"), ["ch2"]],
-						["substring 充电", entity("充电", "substring"), ["ch2"]],
-					] as const) {
-						const [a, b] = await Promise.all([
-							lite.searchChapters(query),
-							store.searchChapters(query),
-						]);
-						check(`chapters ${label} (sqlite)`, ids(a), expected);
-						check(`chapters ${label} (postgres)`, ids(b), expected);
-					}
-
 					// ── narrators: title recall + narrator ACL gate ───────────────────────
 					for (const [label, viewer, expected] of [
 						["owner", OWNER, ["n1", "n2"]],
@@ -558,6 +500,24 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						check(`narrators index auth ${label} (postgres)`, ids(b), expected);
 						expectRankOrdered(a, `sqlite narrators ${label}`);
 						expectRankOrdered(b, `postgres narrators ${label}`);
+					}
+					// A hit names the narrator's own project, on both hit types and both engines.
+					for (const [backend, s] of [
+						["sqlite", lite],
+						["postgres", store],
+					] as const) {
+						const projectOf = (rows: readonly { id: string; projectName: string | null }[]) =>
+							Object.fromEntries(rows.map((r) => [r.id, r.projectName]));
+						check(
+							`narrator project names (${backend})`,
+							projectOf(await s.searchNarrators(entity("auth", "index"))),
+							{ n1: "Private project", n2: "Public project" },
+						);
+						check(
+							`message project names (${backend})`,
+							projectOf(await s.searchMessages(entity("auth", "index"))),
+							{ m1: "Private project", m2: "Public project" },
+						);
 					}
 
 					// ── messages: narrator ACL gate on transcript excerpts ────────────────
@@ -598,6 +558,61 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						check(`messages index tokens owner (${backend})`, ids(ownerRows), ["m1"]);
 					}
 
+					// ── sessions: hits rolled up per narrator, gated and filtered ─────────
+					const sessionIds = (rows: readonly { narratorId: string; hitCount: number }[]) =>
+						rows.map((r) => `${r.narratorId}:${r.hitCount}`).sort();
+					for (const [label, query, expected] of [
+						["index auth owner", entity("auth", "index", OWNER), ["n1:1", "n2:1"]],
+						["index auth stranger", entity("auth", "index", STRANGER), ["n2:1"]],
+						["substring 充电", entity("充电", "substring"), ["n2:1"]],
+						// Terms match on their own, in any order; a short term filters the indexed ones.
+						[
+							"index terms out of order",
+							entity("middleware auth", "index", OWNER),
+							["n1:1", "n2:1"],
+						],
+						["index terms, one absent", entity("middleware rotate", "index", OWNER), ["n1:1"]],
+						["index term with a short term", entity("三阶段 充电", "index"), ["n2:1"]],
+						["short terms only", entity("充电 你好", "substring"), ["n2:1"]],
+						[
+							"index auth in project p2",
+							{ ...entity("auth", "index", OWNER), filters: { projectId: "p2" } },
+							["n2:1"],
+						],
+						[
+							"index auth owned by a stranger",
+							{ ...entity("auth", "index", OWNER), filters: { ownerUserId: "u-stranger" } },
+							[],
+						],
+						[
+							"index auth after the fixture's time",
+							{ ...entity("auth", "index", OWNER), filters: { from: "2027-01-01T00:00:00.000Z" } },
+							[],
+						],
+					] as const) {
+						const [a, b] = await Promise.all([
+							lite.searchSessionAggregates(query),
+							store.searchSessionAggregates(query),
+						]);
+						check(`session aggregates ${label} (sqlite)`, sessionIds(a), expected);
+						check(`session aggregates ${label} (postgres)`, sessionIds(b), expected);
+					}
+					for (const [label, viewer, expected] of [
+						["owner", OWNER, ["m1", "m2"]],
+						["stranger", STRANGER, ["m2"]],
+					] as const) {
+						const query = {
+							...entity("auth", "index", viewer),
+							narratorIds: ["n1", "n2"],
+							perSession: 3,
+						};
+						const [a, b] = await Promise.all([
+							lite.searchSessionHits(query),
+							store.searchSessionHits(query),
+						]);
+						check(`session hits auth ${label} (sqlite)`, ids(a), expected);
+						check(`session hits auth ${label} (postgres)`, ids(b), expected);
+					}
 					// ── timeline: own refs and an inherited fork scope ────────────────────
 					const timelineCases: [string, TimelineSearchQuery, string[]][] = [
 						[
@@ -616,6 +631,40 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 							{
 								narratorId: "n2",
 								text: "充电",
+								strategy: "substring",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							["m3"],
+						],
+						// A short term filters the indexed one; short terms match apart, in any order.
+						[
+							"index term with a short term",
+							{
+								narratorId: "n2",
+								text: "三阶段 充电",
+								strategy: "index",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							["m3"],
+						],
+						[
+							"index term with an absent short term",
+							{
+								narratorId: "n2",
+								text: "middleware 充电",
+								strategy: "index",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							[],
+						],
+						[
+							"short terms apart",
+							{
+								narratorId: "n2",
+								text: "充电 你好",
 								strategy: "substring",
 								limit: 20,
 								inheritedScopes: [],
@@ -672,6 +721,40 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 							"global substring 充电",
 							{
 								text: "充电",
+								strategy: "substring",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							["m3"],
+						],
+						// A short term filters the indexed one; short terms match apart.
+						[
+							"global index term with a short term",
+							{
+								text: "三阶段 充电",
+								strategy: "index",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							["m3"],
+						],
+						[
+							"global index term with an absent short term",
+							{
+								text: "middleware 充电",
+								strategy: "index",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							[],
+						],
+						[
+							"global short terms apart",
+							{
+								text: "充电 你好",
 								strategy: "substring",
 								limit: 20,
 								narratorId: null,

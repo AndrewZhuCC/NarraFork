@@ -113,11 +113,23 @@ async function main() {
 		const { token } = (await reg.json()) as { token: string };
 		if (!token) throw new Error("no token from register");
 
+		// A fresh instance sends its admin to the add-provider page until setup is done, which
+		// would navigate away from the narrator page this smoke drives.
+		const setupRes = await fetch(`${BASE}/api/user-preferences`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+			body: JSON.stringify({ setupWizardCompleted: true }),
+		});
+		if (!setupRes.ok)
+			throw new Error(`setup completion failed: ${setupRes.status} ${await setupRes.text()}`);
+
 		// ── 3. Create a standalone primary narrator ──
+		// An explicit directory: the isolated home has no default project directory, and the
+		// server refuses to guess one.
 		const narrRes = await fetch(`${BASE}/api/narrators`, {
 			method: "POST",
 			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-			body: JSON.stringify({}),
+			body: JSON.stringify({ cwd: runtime.home }),
 		});
 		if (narrRes.status !== 201)
 			throw new Error(`narrator create failed: ${narrRes.status} ${await narrRes.text()}`);

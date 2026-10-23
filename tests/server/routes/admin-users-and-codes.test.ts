@@ -21,9 +21,10 @@ const { adminRoutes } = await import("../../../server/routes/admin");
 
 const NOW = "2026-08-12T00:00:00.000Z";
 const ADMIN_ID = "admin-1";
+const NON_ADMIN_ID = "user-1";
 
 function appForRole(role: "admin" | "user") {
-	const user = { sub: role === "admin" ? ADMIN_ID : "user-1", role, iat: 0, exp: 2 ** 31 };
+	const user = { sub: role === "admin" ? ADMIN_ID : NON_ADMIN_ID, role, iat: 0, exp: 2 ** 31 };
 	const app = new Hono();
 	app.use("*", async (c, next) => {
 		c.set("auth", { type: "session", user });
@@ -53,17 +54,21 @@ function post(path: string, body: unknown, role: "admin" | "user" = "admin") {
 
 beforeEach(async () => {
 	cleanDb(sqlite);
-	// The acting administrator must exist: created rows reference them.
-	await db.insert(users).values({
-		id: ADMIN_ID,
-		username: "root-admin",
-		passwordHash: "x",
-		role: "admin",
-		createdAt: NOW,
-	});
+	// `assertAdmin` authorizes against the LIVE role read through the session store
+	// (which runs on this mocked db), never the token's `role` claim. Both acting
+	// principals must therefore exist as rows: the admin resolves to role "admin"
+	// (→ allowed), and the non-admin to role "user" (→ 403 ADMIN_REQUIRED, not the
+	// 401 USER_GONE an unseeded actor would raise). The admin row is also referenced
+	// by the accounts/codes it provisions.
+	await db.insert(users).values([
+		{ id: ADMIN_ID, username: "root-admin", passwordHash: "x", role: "admin", createdAt: NOW },
+		{ id: NON_ADMIN_ID, username: "plain-user", passwordHash: "x", role: "user", createdAt: NOW },
+	]);
 });
 
-afterEach(() => cleanDb(sqlite));
+afterEach(() => {
+	cleanDb(sqlite);
+});
 
 afterAll(() => {
 	mock.module("../../../server/db", () => realDbModule);

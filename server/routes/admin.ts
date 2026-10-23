@@ -29,7 +29,6 @@ import { purgeProjectGrantsForUser } from "../services/project-membership";
 import { registrationCodeService } from "../services/registration-code-service";
 import { terminalService } from "../services/terminal-service";
 import { releaseUserForeignKeys } from "../services/user-deletion";
-import { worktreeWatcher } from "../services/worktree-watcher";
 import { ProcessSnapshot } from "../terminal/dtach-service";
 import { getExternalNarratorConnectionSnapshot } from "../websocket/oauth-connection-registry";
 
@@ -462,9 +461,6 @@ adminRoutes.get("/diagnostics", async (c) => {
 	const workingNarratorCount = narratorCountByStatus.get("working") ?? 0;
 	const waitingNarratorCount = narratorCountByStatus.get("waiting") ?? 0;
 
-	// Worktree watchers
-	const watcherPaths = worktreeWatcher.getActivePaths();
-
 	// Terminals
 	const allTerminals = await terminalService.listAll();
 	const runningTerminals = allTerminals.filter((t) => t.status === "running");
@@ -494,10 +490,6 @@ adminRoutes.get("/diagnostics", async (c) => {
 		narrators: {
 			thinking: workingNarratorCount,
 			waiting: waitingNarratorCount,
-		},
-		worktreeWatchers: {
-			count: worktreeWatcher.getActiveCount(),
-			paths: watcherPaths,
 		},
 		terminals: {
 			total: allTerminals.length,

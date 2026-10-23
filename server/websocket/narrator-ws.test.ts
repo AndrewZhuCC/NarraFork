@@ -7,7 +7,6 @@ import {
 import { cleanDb, getTestDb } from "../../tests/setup";
 import {
 	backgroundTasks,
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -88,22 +87,11 @@ async function seedNarrators() {
 			updatedAt: now,
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "chapter-ws",
-			projectId: "project-ws",
-			title: "WebSocket Test",
-			branch: "chapter/ws-test",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
 	db.insert(narrators)
 		.values([
 			{
 				id: "narrator-working",
-				chapterId: "chapter-ws",
+				contextProjectId: "project-ws",
 				status: "working",
 				substatus: '["reasoning"]',
 				turnStartedAt: now,
@@ -115,7 +103,7 @@ async function seedNarrators() {
 			},
 			{
 				id: "narrator-idle",
-				chapterId: "chapter-ws",
+				contextProjectId: "project-ws",
 				status: "idle",
 				substatus: "[]",
 				visibility: "public",
@@ -330,7 +318,11 @@ describe("narrator WebSocket message snapshot subscribe", () => {
 			version: 1,
 			requestId: "messages-cursor-stale",
 		});
-		await new Promise((resolve) => setTimeout(resolve, 20));
+		// The catch-up query and its block conversion run after the subscribe returns.
+		for (let waited = 0; waited < 2000; waited += 10) {
+			if (sent.some((message) => message.type === "catch_up")) break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
 
 		const catchUp = sent.find((message) => message.type === "catch_up");
 		expect(catchUp).toMatchObject({
@@ -338,8 +330,10 @@ describe("narrator WebSocket message snapshot subscribe", () => {
 			messageVersion: 2,
 			subscriptionRequestId: "messages-cursor-stale",
 		});
+		// Catch-up arrives as envelopes + blocks (message protocol v2).
+		expect(catchUp).toMatchObject({ protocol: 2, orphanMessageIds: [] });
 		expect(
-			(catchUp?.topLevel as Array<{ id?: string }> | undefined)?.map((message) => message.id),
+			(catchUp?.messages as Array<{ id?: string }> | undefined)?.map((message) => message.id),
 		).toEqual(["message-2"]);
 		expect(sent.some((message) => message.type === "sync_ok")).toBe(false);
 	});

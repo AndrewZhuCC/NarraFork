@@ -1,13 +1,14 @@
 import { notifications } from "@mantine/notifications";
 import { quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { invalidateGitStatusPushQueries, invalidateWorkspaceQueries } from "../../hooks/useGit";
+import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
@@ -929,7 +930,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearRetryIfActive();
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
+				const blocks = messageBody(wsData.message);
 				const compactBlock = blocks.find(
 					(b: ContentBlock) =>
 						(b.type === "compact" && b.subtype !== "plan") || b.type === "segment_compact",
@@ -1386,36 +1387,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBrowserSessionVisualChange: (sessionId) => {
 				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
 			},
-			onGitStatus: (data) => {
-				if (data.chapterId) {
-					qc.setQueryData(["chapterGitStatus", data.chapterId], {
-						commitsAhead: data.commitsAhead,
-						baseBranch: data.baseBranch,
-						linesAdded: data.linesAdded,
-						linesRemoved: data.linesRemoved,
-					});
-				}
-				// The workspace bars (NarratorGitBar / ChapterBar with a narrator) read
-				// workspace-keyed gitStatus queries, which the chapter badge patch above
-				// never touches — without this the bar kept pre-session numbers until a
-				// foreground/reconnect refetch. Open Git panels additionally have their
-				// own workspace subscription; double invalidation is idempotent.
-				invalidateGitStatusPushQueries(qc, narratorId, data.chapterId);
-			},
-			onCommitSyncError: (event) => {
-				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });
-				invalidateWorkspaceQueries(qc, event.chapterId);
-				notifications.show({
-					title: t("commitSyncErrorTitle"),
-					message:
-						event.reason ??
-						event.message ??
-						event.error ??
-						event.code ??
-						t("commitSyncErrorFallback"),
-					color: "yellow",
-					autoClose: 5000,
-				});
+			onGitStatus: () => {
+				// The workspace bar reads workspace-keyed gitStatus queries; open Git panels
+				// additionally have their own workspace subscription. Double invalidation is
+				// idempotent.
+				invalidateGitStatusPushQueries(qc, narratorId);
 			},
 			onCompacting: () => {
 				dispatchStatus({

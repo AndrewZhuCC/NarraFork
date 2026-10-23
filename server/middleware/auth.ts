@@ -215,7 +215,7 @@ export async function requireSessionAuth(c: Context, next: Next) {
 	await next();
 }
 
-export function assertAdmin(c: Context): void {
+export async function assertAdmin(c: Context): Promise<void> {
 	const principal = getAuthPrincipal(c);
 	if (principal?.type === "oauth" || c.get("oauth")) {
 		// OAuth grants are intentionally never accepted for administrative actions,
@@ -226,13 +226,25 @@ export function assertAdmin(c: Context): void {
 	if (!user) {
 		throw catalogError("AUTH_REQUIRED");
 	}
-	if (user.role !== "admin") {
+	// Authorize against the LIVE role. A session the gate resolved in this request already
+	// carries it (read from `users` together with the session row). Anything else — a caller
+	// that set `user` directly without authenticating — reads the row now and fails closed
+	// if the user is gone.
+	let role: string | undefined = user.sid ? user.role : undefined;
+	if (role === undefined) {
+		const row = await authSessionStore.findSessionState(user.sub);
+		if (!row) {
+			throw catalogError("USER_GONE");
+		}
+		role = row.role;
+	}
+	if (role !== "admin") {
 		throw catalogError("ADMIN_REQUIRED");
 	}
 }
 
 export async function requireAdmin(c: Context, next: Next) {
-	assertAdmin(c);
+	await assertAdmin(c);
 	await next();
 }
 
@@ -256,7 +268,7 @@ export async function requireAdminOrManagerToken(c: Context, next: Next) {
 		return;
 	}
 	await authenticateRequest(c);
-	assertAdmin(c);
+	await assertAdmin(c);
 	await next();
 }
 

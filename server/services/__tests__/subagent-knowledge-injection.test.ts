@@ -25,6 +25,7 @@
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
+import { historyStrings, sentHistory } from "../../../tests/fixtures/model-input";
 import { db } from "../../db";
 import { aclGrants, knowledgeTags, narrators, users } from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
@@ -35,7 +36,6 @@ import { startNarratorRun } from "../agent-runtime/run";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
 import { clearBufferedMessages, enqueueBufferedMessage } from "../narrator-buffer";
-import type { ExecuteLoopOptions } from "../narrator-executor";
 import * as narratorExecutor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
 import { resumeBufferedMessagesIfIdle } from "../narrator-session";
@@ -468,13 +468,13 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			name: creator?.username,
 		});
 		await enqueueBufferedMessage(narratorId, text, undefined, null, userId);
-		const requests: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults">[] = [];
+		// What the model is sent: the host-built history (not the rows it was built from).
+		const requests: Array<{ userText: string; history: unknown }> = [];
 		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
 			async (input) => {
 				requests.push({
 					userText: input.userText,
-					history: structuredClone(input.history),
-					trailingToolResults: structuredClone(input.trailingToolResults),
+					history: structuredClone(sentHistory(input.history)),
 				});
 				return { finalText: "done", hasError: false, shouldUpdateTitle: false };
 			},
@@ -503,6 +503,9 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			}
 			expect(requests).toHaveLength(drainInExecutor ? 2 : 1);
 			const request = requests[requests.length - 1];
+			// The queued message and its hint are persisted rows: the history carries both.
+			expect(request.userText).toBe("");
+			const historyText = historyStrings(request.history);
 			const rows = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			expect(rows.find((row) => row.role === "user")?.contentText).toBe(text);
 			const hint = rows.find((row) => row.role === "sys");
@@ -510,21 +513,20 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 				expect(hint?.contentText).toContain(secretEntryId);
 				expect(hint?.parentToolUseId).toBe(toolUseId);
 				expect(hint?.contentText).not.toContain("<sender");
-				if (officialApi) {
-					expect(request.userText).toContain(modelText);
-					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
-				} else {
-					// The hint and the queued message both join the current turn, once each.
-					expect(request.userText).toContain(modelText);
-					expect(request.userText).toContain(hint?.contentText ?? "");
-					expect(JSON.stringify(request.history)).not.toContain(secretEntryId);
-					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
-				}
+				expect(historyText).toContain(modelText);
+				expect(historyText).toContain(hint?.contentText ?? "");
+				expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
+				// Official endpoints take the hint as a system message; compatible ones as input.
+				const hintMessage = (request.history as Array<{ role: string }>).find((message) =>
+					JSON.stringify(message).includes(secretEntryId),
+				);
+				expect(hintMessage?.role).toBe(officialApi ? "system" : "user");
 				expect(JSON.stringify(request).match(/Relevant knowledge-base entries/g)).toHaveLength(1);
 			} else {
-				// A denied/no-hit scan must not invent current-turn text or replay old input.
+				// A denied/no-hit scan must not invent input or replay old input.
 				expect(hint).toBeUndefined();
-				expect(request.userText).toBe(modelText);
+				expect(historyText).toContain(modelText);
+				expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
 				expect(JSON.stringify(request)).not.toContain(secretEntryId);
 			}
 		} finally {
@@ -533,7 +535,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 		}
 	}
 
-	test("compatible Anthropic carries the new sys hint and buffered message into the current turn", () =>
+	test("compatible Anthropic carries the new sys hint and buffered message as the latest input", () =>
 		resumeBufferedMessage(false, SECRET_KW, true));
 
 	test("the executor's own pass-restart drain also carries the extracted hint", () =>
