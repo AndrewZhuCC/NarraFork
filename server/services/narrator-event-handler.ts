@@ -756,14 +756,8 @@ async function persistContentCheckpoint(
 function appendRawStreamText(
 	previous: { text: string; textOffset?: number } | undefined,
 	text: string,
-	textOffset?: number,
-): { text: string; textOffset?: number } {
-	if (textOffset == null) {
-		return {
-			text: (previous?.text ?? "") + text,
-			...(previous?.textOffset != null ? { textOffset: previous.textOffset } : {}),
-		};
-	}
+	textOffset: number,
+): { text: string; textOffset: number } {
 	const previousStart = previous?.textOffset ?? 0;
 	const previousEnd = previousStart + (previous?.text.length ?? 0);
 	if (!previous || textOffset > previousEnd || textOffset < previousStart) {
@@ -947,7 +941,7 @@ function noteSubagentOutputText(
 	ctx: EventHandlerContext,
 	blockKey: string,
 	text: string,
-	textOffset?: number,
+	textOffset: number,
 ): void {
 	if (!ctx.parentToolUseId || !text) return;
 	const key = ctx.narratorId;
@@ -966,22 +960,18 @@ function noteSubagentOutputText(
 	// replayed/overlapping prefix (a resume) must not double-count.
 	const previous = counter.blocks.get(blockKey);
 	let span: { start: number; length: number };
-	if (textOffset == null) {
-		span = { start: previous?.start ?? 0, length: (previous?.length ?? 0) + text.length };
+	const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
+	if (!previous || textOffset > previousEnd || textOffset < previous.start) {
+		// A gap/missing prefix cannot be invented — the delta becomes the span.
+		span = { start: textOffset, length: text.length };
 	} else {
-		const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
-		if (!previous || textOffset > previousEnd || textOffset < previous.start) {
-			// A gap/missing prefix cannot be invented — the delta becomes the span.
-			span = { start: textOffset, length: text.length };
-		} else {
-			// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
-			// max keeps the old end), one extending past it grows by exactly the
-			// non-overlapping tail — the length-only form of appendRawStreamText.
-			span = {
-				start: previous.start,
-				length: Math.max(previousEnd, textOffset + text.length) - previous.start,
-			};
-		}
+		// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
+		// max keeps the old end), one extending past it grows by exactly the
+		// non-overlapping tail — the length-only form of appendRawStreamText.
+		span = {
+			start: previous.start,
+			length: Math.max(previousEnd, textOffset + text.length) - previous.start,
+		};
 	}
 	counter.blocks.set(blockKey, span);
 	let total = 0;
@@ -1683,12 +1673,7 @@ export async function processEvent(
 			const existing = snap.streamingBlocks.find((b) => b.type === "text" && b.id === textBlockId);
 			const base = ctx.committedContentSnapshots?.get(textBlockId);
 			const latestRevision = existing?.type === "text" ? existing.revision : base?.revision;
-			if (
-				event.blockRevision != null &&
-				latestRevision != null &&
-				event.blockRevision <= latestRevision
-			)
-				return null;
+			if (latestRevision != null && event.blockRevision <= latestRevision) return null;
 			// Clear "reasoning" substatus when text starts (reasoning phase ended)
 			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
 				ctx.removeSubstatus("reasoning").catch(() => {});
@@ -1715,7 +1700,7 @@ export async function processEvent(
 			);
 			if (existing?.type === "text") {
 				Object.assign(existing, rawText);
-				if (event.blockRevision != null) existing.revision = event.blockRevision;
+				existing.revision = event.blockRevision;
 			} else {
 				snap.streamingBlocks.splice(
 					findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
@@ -1723,7 +1708,7 @@ export async function processEvent(
 					{
 						type: "text",
 						id: textBlockId,
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						revision: event.blockRevision,
 						...rawText,
 						outputIndex: event.outputIndex,
 						fileReferenceContext,
@@ -1737,8 +1722,8 @@ export async function processEvent(
 					type: "text_delta",
 					text: event.text,
 					id: textBlockId,
-					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+					revision: event.blockRevision,
+					textOffset: event.blockTextOffset,
 				},
 				fileReferenceContext,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
@@ -1761,8 +1746,8 @@ export async function processEvent(
 						type: "text_delta",
 						text: event.text,
 						id: textBlockId,
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+						revision: event.blockRevision,
+						textOffset: event.blockTextOffset,
 					},
 					fileReferenceContext,
 					...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
@@ -2999,12 +2984,7 @@ export async function processEvent(
 			);
 			const base = ctx.committedContentSnapshots?.get(reasoningId);
 			const latestRevision = existing?.type === "reasoning" ? existing.revision : base?.revision;
-			if (
-				event.blockRevision != null &&
-				latestRevision != null &&
-				event.blockRevision <= latestRevision
-			)
-				return null;
+			if (latestRevision != null && event.blockRevision <= latestRevision) return null;
 			// Add "reasoning" substatus on first reasoning chunk
 			if (ctx.addSubstatus && ctx.getSubstatus && !ctx.getSubstatus().has("reasoning")) {
 				ctx.addSubstatus("reasoning").catch(() => {});
@@ -3028,7 +3008,7 @@ export async function processEvent(
 			);
 			if (existing?.type === "reasoning") {
 				Object.assign(existing, rawText);
-				if (event.blockRevision != null) existing.revision = event.blockRevision;
+				existing.revision = event.blockRevision;
 			} else {
 				snap.streamingBlocks.splice(
 					findOrderedSnapshotInsertIndex(snap.streamingBlocks, reasoningOutputIndex),
@@ -3037,7 +3017,7 @@ export async function processEvent(
 						type: "reasoning",
 						...rawText,
 						...(reasoningId ? { id: reasoningId } : {}),
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						revision: event.blockRevision,
 						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 					},
 				);
@@ -3049,8 +3029,8 @@ export async function processEvent(
 					type: "reasoning_delta",
 					text: event.text,
 					...(reasoningId ? { id: reasoningId } : {}),
-					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+					revision: event.blockRevision,
+					textOffset: event.blockTextOffset,
 					...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 				},
 			};
@@ -3072,8 +3052,8 @@ export async function processEvent(
 						type: "reasoning_delta",
 						text: event.text,
 						...(reasoningId ? { id: reasoningId } : {}),
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+						revision: event.blockRevision,
+						textOffset: event.blockTextOffset,
 						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 					},
 				},

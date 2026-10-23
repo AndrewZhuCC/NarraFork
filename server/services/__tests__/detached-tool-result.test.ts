@@ -357,7 +357,14 @@ describe("detached tool result durable settlement", () => {
 		await seed();
 		const ctx = context();
 		await processEvent(
-			{ type: "stream_text", blockId: "text-3", text: "new turn in progress", outputIndex: 0 },
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-3",
+				text: "new turn in progress",
+				outputIndex: 0,
+			},
 			ctx,
 		);
 		await processEvent(

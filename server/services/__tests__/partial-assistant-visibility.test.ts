@@ -333,6 +333,7 @@ describe("identified content checkpoints through the real event consumer", () =>
 			await processEvent(
 				{
 					type: "stream_reasoning",
+					blockTextOffset: 0,
 					blockId: "r1",
 					blockRevision: 1,
 					text: reasoning.text,
@@ -341,7 +342,13 @@ describe("identified content checkpoints through the real event consumer", () =>
 				ctx,
 			);
 			await processEvent(
-				{ type: "stream_text", blockId: "t1", blockRevision: 1, text: text.text },
+				{
+					type: "stream_text",
+					blockTextOffset: 0,
+					blockId: "t1",
+					blockRevision: 1,
+					text: text.text,
+				},
 				ctx,
 			);
 			expect(sqlite.prepare("SELECT count(*) AS n FROM narrator_messages").get()).toEqual({ n: 0 });
@@ -731,12 +738,26 @@ describe("identified content checkpoints through the real event consumer", () =>
 		const ctx = makeContext();
 		ctx.getFileReferenceContext = () => ({ deviceId: "A", cwd: "/a" });
 		await processEvent(
-			{ type: "stream_text", blockId: "first", blockRevision: 1, text: "same", outputIndex: 0 },
+			{
+				type: "stream_text",
+				blockTextOffset: 0,
+				blockId: "first",
+				blockRevision: 1,
+				text: "same",
+				outputIndex: 0,
+			},
 			ctx,
 		);
 		ctx.getFileReferenceContext = () => ({ deviceId: "B", cwd: "/b" });
 		await processEvent(
-			{ type: "stream_text", blockId: "second", blockRevision: 1, text: "same", outputIndex: 0 },
+			{
+				type: "stream_text",
+				blockTextOffset: 0,
+				blockId: "second",
+				blockRevision: 1,
+				text: "same",
+				outputIndex: 0,
+			},
 			ctx,
 		);
 		await processEvent(
@@ -878,6 +899,7 @@ describe("identified content checkpoints through the real event consumer", () =>
 							type: type === "text" ? "stream_text" : "stream_reasoning",
 							blockId: block.id,
 							blockRevision: 1,
+							blockTextOffset: 0,
 							text: block.text,
 						};
 						yield { type: "block_complete", block };
