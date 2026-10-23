@@ -146,7 +146,12 @@
 		"next": "Next",
 		"byteRange": "Bytes {{start}}–{{end}}",
 		"pageNumber": "Page number",
-		"go": "Go"
+		"go": "Go",
+		"copyPath": "Copy file path",
+		"pathCopied": "File path copied",
+		"copyPathFailed": "Could not copy the file path",
+		"revealInExplorer": "Show in File Manager",
+		"revealFailed": "Could not open the file manager"
 	},
 	"asyncQuestionResolved": "Agent responded",
 	"asyncQuestionPending": "Answered · awaiting Agent response",
