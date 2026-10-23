@@ -1,7 +1,6 @@
 /**
- * Pure utility functions for operating on the message tree cache.
- * Used by NarratorPanel's WebSocket handlers to immutably update
- * React Query's cached message pages.
+ * Pure utility functions for immutably updating loaded message rows from WebSocket
+ * events. Rows are flat: a nested row is a row like any other (`nested-rows.ts`).
  */
 
 import type {
@@ -219,7 +218,7 @@ export function mergeToolRecordWithSubagentActivity<
 	return result as P & I;
 }
 
-/** Update the Agent/Task/Send tool block identified by parentToolUseId in a message tree. */
+/** Update the Agent/Task/Send tool block identified by parentToolUseId in the rows. */
 export function updateSubagentActivityInMessages(
 	messages: TreeMessage[],
 	parentToolUseId: string,
@@ -248,17 +247,6 @@ export function updateSubagentActivityInMessages(
 		if (localChanged) {
 			changed = true;
 			nextMessage = { ...withContent, toolCalls: nextCalls };
-		}
-		if (nextMessage.children?.length) {
-			const childResult = updateSubagentActivityInMessages(
-				nextMessage.children,
-				parentToolUseId,
-				updater,
-			);
-			if (childResult.changed) {
-				changed = true;
-				nextMessage = { ...nextMessage, children: childResult.messages };
-			}
 		}
 		return nextMessage;
 	});
@@ -320,8 +308,8 @@ function syncToolElementFields(
 	);
 }
 
-/** Recursively merge extra fields into a tool call's record in the message tree. */
-export function mergeToolCallFieldsInTree(
+/** Merge extra fields into every occurrence of a tool call's record in the rows. */
+export function mergeToolCallFieldsInRows(
 	messages: TreeMessage[],
 	toolUseId: string,
 	fields: Record<string, unknown>,
@@ -345,13 +333,6 @@ export function mergeToolCallFieldsInTree(
 			if (contentChanged) result = syncToolElementFields(result, toolUseId, fields);
 			if (tcChanged) result = { ...result, toolCalls: updatedCalls as ToolCallRecord[] };
 		}
-		if (msg.children?.length) {
-			const childResult = mergeToolCallFieldsInTree(msg.children, toolUseId, fields);
-			if (childResult.changed) {
-				anyChanged = true;
-				result = { ...result, children: childResult.messages };
-			}
-		}
 		return result;
 	});
 	return { messages: updated, changed: anyChanged };
@@ -367,25 +348,17 @@ export interface ReflectionToolOccurrence {
  * reflection suggestions. A reused provider toolUseId on an older card must not
  * become the fallback identity when the newest card has no suggestion yet.
  */
-export function getNewestReflectionToolOccurrenceInTree(
+export function getNewestReflectionToolOccurrence(
 	messages: TreeMessage[],
 	toolUseId: string,
 	reflectionType: string,
 ): ReflectionToolOccurrence {
 	if (!Array.isArray(messages)) return { found: false };
 
-	// Walk newest-to-oldest at every level. Children are checked before their parent
-	// row because a nested reflection can be newer than the parent's tool-call data.
+	// Walk newest-to-oldest. A nested row follows its parent, so it is checked before
+	// the parent row: a nested reflection can be newer than the parent's tool-call data.
 	for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
 		const msg = messages[messageIndex];
-		if (msg.children?.length) {
-			const childOccurrence = getNewestReflectionToolOccurrenceInTree(
-				msg.children,
-				toolUseId,
-				reflectionType,
-			);
-			if (childOccurrence.found) return childOccurrence;
-		}
 
 		const toolCalls = Array.isArray(msg.toolCalls) ? (msg.toolCalls as ToolCall[]) : [];
 		let matchingToolCall: ToolCall | undefined;
@@ -424,7 +397,7 @@ export function getNewestReflectionToolOccurrenceInTree(
 }
 
 /** Merge fields into only the newest occurrence of a reused toolUseId. */
-export function mergeFieldsIntoNewestToolOccurrenceInTree(
+export function mergeFieldsIntoNewestToolOccurrence(
 	messages: TreeMessage[],
 	toolUseId: string,
 	fields: Record<string, unknown>,
@@ -432,19 +405,6 @@ export function mergeFieldsIntoNewestToolOccurrenceInTree(
 	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
 		const msg = messages[messageIndex];
-		if (msg.children?.length) {
-			const childResult = mergeFieldsIntoNewestToolOccurrenceInTree(
-				msg.children,
-				toolUseId,
-				fields,
-			);
-			if (childResult.changed) {
-				const updated = [...messages];
-				updated[messageIndex] = { ...msg, children: childResult.messages };
-				return { messages: updated, changed: true };
-			}
-		}
-
 		const toolCalls = Array.isArray(msg.toolCalls) ? [...msg.toolCalls] : [];
 		let toolCallIndex = -1;
 		for (let index = toolCalls.length - 1; index >= 0; index--) {

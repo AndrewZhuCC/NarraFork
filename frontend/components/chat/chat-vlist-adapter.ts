@@ -136,7 +136,6 @@ function projectChatRow(row: ChatRowInput, labels: ChatTreeProjectionLabels): Tr
 					...(message.sender.isBot ? { isBot: true } : {}),
 				}
 			: null,
-		children: [],
 		editedAt: message.editedAt,
 		// Kernel passthrough (see TreeMessage's projection-only fields).
 		replyQuote: row.reply

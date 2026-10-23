@@ -741,7 +741,6 @@ describe("fold vs LOD morph: the toggle path cannot move the effective LOD", () 
 						status: "completed",
 					},
 				],
-				children: [],
 				parentToolUseId: null,
 				createdAt: "2026-07-23T00:00:00.000Z",
 			},

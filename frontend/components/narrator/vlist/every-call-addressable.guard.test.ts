@@ -50,7 +50,6 @@ function toolMessage(id: string, toolUseId: string, status = "success"): Narrato
 			id,
 			role: "assistant",
 			toolCalls: [call],
-			children: [],
 		},
 		[{ type: "tool_use", id: toolUseId, name: "Read", input: call.inputJson }],
 	) as unknown as NarratorMsg;
@@ -154,7 +153,6 @@ describe("every tool call is addressable at every LOD (protected invariant)", ()
 				id: "r1",
 				role: "assistant",
 				toolCalls: [],
-				children: [],
 			},
 			[{ type: "reasoning", text: "**Look it up**\n\nchecking the cache" }],
 		) as unknown as NarratorMsg;

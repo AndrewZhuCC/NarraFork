@@ -76,7 +76,6 @@ const HISTORY = [
 			seq: 0,
 			role: "assistant",
 			toolCalls: [{ id: "c0", toolUseId: "tu-0", toolName: "Read", status: "success" }],
-			children: [],
 		},
 		[{ type: "tool_use", id: "tu-0", name: "Read", input: { file_path: "a.ts" } }],
 	),
@@ -89,7 +88,6 @@ const streamingMessage = (text: string) =>
 			seq: 999,
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 		},
 		[{ type: "reasoning", text }],
 	);
@@ -250,7 +248,6 @@ describe("the live tail reaches the DOM across the row memo", () => {
 				seq: 1,
 				role: "assistant",
 				toolCalls: [],
-				children: [],
 			},
 			[{ type: "reasoning", text: BODY(600) }],
 		);

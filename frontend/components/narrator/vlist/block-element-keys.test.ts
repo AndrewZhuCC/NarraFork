@@ -29,7 +29,6 @@ function message(texts: string[], named?: Named[]): TreeMessage {
 		contentText: null,
 		createdAt: "2026-10-01T00:00:00.000Z",
 		toolCalls: [],
-		children: [],
 	} as unknown as TreeMessage;
 	if (!named) return rowWithElements(row, elements);
 	return {

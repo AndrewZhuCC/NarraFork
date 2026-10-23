@@ -196,7 +196,6 @@ describe("the latest sealed empty reasoning stays live at every LOD", () => {
 							role: "assistant",
 							parentToolUseId: null,
 							toolCalls: [],
-							children: [],
 						},
 						[{ type: "reasoning", id: `${id}-block`, text: "", revision: 1 }],
 					) as unknown as TreeMessage,

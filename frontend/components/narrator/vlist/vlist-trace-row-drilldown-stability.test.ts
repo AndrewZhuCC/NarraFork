@@ -58,7 +58,6 @@ function tool(seq: number, id: string) {
 					durationMs: 900,
 				},
 			],
-			children: [],
 		},
 		[{ type: "tool_use", id, name: "Bash", input }],
 	);
@@ -73,7 +72,6 @@ function live(text: string) {
 			seq: 999,
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 		},
 		[{ type: "reasoning", text }],
 	);

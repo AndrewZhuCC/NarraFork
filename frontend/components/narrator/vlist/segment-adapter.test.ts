@@ -2260,7 +2260,6 @@ describe("live → persisted hand-off is visually inert", () => {
 				toolCalls: [
 					{ id: "call-1", toolUseId: "tu-1", toolName: "Read", status, inputJson: input },
 				],
-				children: [],
 			},
 			[{ type: "tool_use", id: "tu-1", name: "Read", input }],
 		) as never;
@@ -2836,7 +2835,6 @@ describe("structured reasoning model gate", () => {
 						role: "assistant",
 						model,
 						toolCalls: [],
-						children: [],
 					},
 					[{ type: "reasoning", text }],
 				),
@@ -4232,7 +4230,6 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 				model: "gpt-5.6",
 				role: "assistant",
 				toolCalls: [],
-				children: [],
 			},
 			blocks ?? [
 				{ type: "reasoning", text: "**第一步**\n\n分析正文。\n\n**第二步**\n\n继续分析。" },
@@ -4437,7 +4434,6 @@ describe("mixed action-card display runs from real message segments", () => {
 				id,
 				role,
 				toolCalls: [],
-				children: [],
 				parentToolUseId: null,
 			},
 			blocks,

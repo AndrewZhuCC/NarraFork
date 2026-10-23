@@ -717,7 +717,6 @@ describe("Read execution target — real row menu", () => {
 										{
 											id: "history",
 											narratorId: "actual-history-child",
-											children: [],
 											toolCalls: [
 												{
 													id: "retry",

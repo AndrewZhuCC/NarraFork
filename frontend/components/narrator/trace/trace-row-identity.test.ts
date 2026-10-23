@@ -59,7 +59,7 @@ test("running Send trace uses resolved id but excludes parent and fanout", () =>
 
 // biome-ignore lint/suspicious/noExplicitAny: structural test fixtures
 function msg(partial: Record<string, any>): NarratorMsg {
-	return { children: [], contentText: null, ...partial } as unknown as NarratorMsg;
+	return { contentText: null, ...partial } as unknown as NarratorMsg;
 }
 
 const reasoning = (text: string): ContentBlock =>

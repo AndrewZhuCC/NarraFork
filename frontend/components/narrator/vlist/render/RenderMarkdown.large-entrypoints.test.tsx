@@ -97,7 +97,6 @@ function message(id: string, role: string, contentJson: unknown[]): NarratorMsg 
 			role,
 			contentText: null,
 			toolCalls: [],
-			children: [],
 			createdAt: "2026-01-01T00:00:00Z",
 			seq: 1,
 		},

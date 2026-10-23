@@ -52,7 +52,6 @@ function message(seq: number, role: "user" | "assistant" = "assistant"): TreeMes
 			contentText: "词".repeat(80),
 			toolCalls: [],
 			createdAt: "2026-07-28T00:00:00.000Z",
-			children: [],
 			seq,
 		},
 		[{ type: "text", text: "词".repeat(80) }],

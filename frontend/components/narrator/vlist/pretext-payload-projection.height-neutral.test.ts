@@ -64,7 +64,6 @@ function fixture(opts: {
 }): NarratorMsg[] {
 	const base = {
 		narratorId: "n1",
-		children: [],
 		parentToolUseId: null,
 		createdAt: "2026-07-23T00:00:00.000Z",
 	};

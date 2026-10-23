@@ -35,6 +35,7 @@ import {
 	withoutBody,
 } from "@shared/narrator-blocks/message-blocks";
 import { mergeToolRecordWithSubagentActivity } from "../message/message-tree-utils";
+import { endOfNestedRows, isNestedRow } from "../message/nested-rows";
 import { contentBlockIdentity } from "../streaming/streaming-block-supersede";
 
 /** The subset of a message this module reads. */
@@ -43,7 +44,7 @@ export interface AppendCandidate extends MessageBodySource {
 	seq?: unknown;
 	role?: unknown;
 	parentToolUseId?: unknown;
-	children?: readonly unknown[];
+	parentMessageId?: unknown;
 	toolCalls?: readonly unknown[];
 	deliveryId?: unknown;
 	deliveryKind?: unknown;
@@ -55,7 +56,10 @@ export type AppendRejection =
 	| "no-id"
 	/** Already present in the loaded window (a duplicate broadcast / catch-up replay). */
 	| "duplicate"
-	/** A child message; it belongs to a subagent page's own document. */
+	/**
+	 * A child message: it belongs to a subagent page's own document, or is nested under
+	 * a row that is not loaded.
+	 */
 	| "child-message"
 	/** Carries no seq, so its position in the document is unknown. */
 	| "no-seq"
@@ -124,8 +128,9 @@ export function resolveMessageAppend(input: ResolveAppendInput): AppendDecision 
 		return { append: false, reason: "no-id" };
 	}
 	// A child message belongs to the subagent's own page; on a parent page only the
-	// activity summary reflects it (maintained by the live patch channel).
-	if (!isSubagent && message.parentToolUseId) {
+	// activity summary reflects it (maintained by the live patch channel). A nested row
+	// goes under its parent, never at the tail.
+	if ((!isSubagent && message.parentToolUseId) || isNestedRow(message)) {
 		return { append: false, reason: "child-message" };
 	}
 	if (hasStructuralBlock(message)) return { append: false, reason: "structural" };
@@ -138,6 +143,7 @@ export function resolveMessageAppend(input: ResolveAppendInput): AppendDecision 
 	// (or below it), which only the server can place correctly.
 	let maxLoadedSeq: number | undefined;
 	for (const existing of loaded) {
+		if (isNestedRow(existing)) continue;
 		const existingSeq = seqOf(existing);
 		if (existingSeq == null) continue;
 		if (maxLoadedSeq == null || existingSeq > maxLoadedSeq) maxLoadedSeq = existingSeq;
@@ -235,16 +241,27 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 			// Same-block replay cannot roll an acknowledged revision backwards. Missing
 			// blocks still follow the incoming snapshot (explicit rollback/edit semantics).
 			...incoming,
-			// Projection broadcasts intentionally omit aggregate children/tool calls; retain
-			// the already-loaded rich tree while still applying canonical body/state fields.
-			children: message.children?.length ? message.children : previous.children,
+			// Projection broadcasts intentionally omit aggregate tool calls; retain the
+			// already-loaded ones while still applying canonical body/state fields. Rows
+			// nested under this one stay where they are.
 			toolCalls,
 		} as T;
 		return { messages, changed: true, appended: false };
 	}
+	if (isNestedRow(message)) {
+		// A new nested row goes after its parent and the rows already nested under it.
+		const parent = loaded.findIndex((existing) => existing.id === message.parentMessageId);
+		if (parent < 0)
+			return { messages: loaded, changed: false, appended: false, reason: "child-message" };
+		const messages = [...loaded];
+		messages.splice(endOfNestedRows(loaded, parent), 0, message);
+		return { messages, changed: true, appended: false };
+	}
 	const seq = seqOf(message);
 	if (seq != null) {
-		const sameSeq = loaded.findIndex((existing) => seqOf(existing) === seq);
+		const sameSeq = loaded.findIndex(
+			(existing) => !isNestedRow(existing) && seqOf(existing) === seq,
+		);
 		if (sameSeq >= 0) {
 			// A canonical id is authoritative; do not overwrite another row merely because
 			// an old catch-up payload reused a stale seq.

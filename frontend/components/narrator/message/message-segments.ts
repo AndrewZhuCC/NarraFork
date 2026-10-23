@@ -13,6 +13,7 @@ import { appendStreamingTextPreview } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "../narrator-panel-types";
 import type { ToolCallData } from "../tool-call/tool-call-data";
 import { toolExecutionFallback } from "../tool-call/tool-file-target";
+import { isNestedRow, nestedRowsByParent } from "./nested-rows";
 
 // ---------------------------------------------------------------------------
 // Legacy tool name mapping
@@ -39,7 +40,8 @@ export type ToolRunItem = {
 	msg: NarratorMsg;
 	blockIndex: number;
 	tc: ToolCallData;
-	children: NarratorMsg[];
+	/** Rows nested under this tool call (`nested-rows.ts`). */
+	nestedRows: NarratorMsg[];
 	isSubagent: boolean;
 };
 
@@ -217,12 +219,19 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 	return results;
 }
 
-export function filterChildrenByToolUse(
-	children: NarratorMsg[],
+/** The rows among a row's nested rows that answer the tool call `toolUseId`. */
+export function nestedRowsOfTool(
+	nestedRows: readonly NarratorMsg[],
 	toolUseId: string | undefined,
 ): NarratorMsg[] {
 	if (!toolUseId) return [];
-	return children.filter((c) => c.parentToolUseId === toolUseId);
+	return nestedRows.filter((row) => row.parentToolUseId === toolUseId);
+}
+
+const NO_ROWS: readonly NarratorMsg[] = [];
+
+function sameRows(left: readonly NarratorMsg[], right: readonly NarratorMsg[]): boolean {
+	return left.length === right.length && left.every((row, index) => row === right[index]);
 }
 
 // ---------------------------------------------------------------------------
@@ -249,13 +258,13 @@ type CachedMessageMaterials = {
 	role: NarratorMsg["role"];
 	body: readonly unknown[];
 	toolCalls: NarratorMsg["toolCalls"];
-	children: NarratorMsg["children"];
+	nestedRows: readonly NarratorMsg[];
 	materials: MessageMaterials;
 };
 
 /**
  * Owned by one message-list coordinator, never shared globally. Direct message/
- * role/body/toolCalls/children replacement invalidates automatically.
+ * role/body/toolCalls/nested-row replacement invalidates automatically.
  * Nested in-place edits require invalidate(id), or invalidate()/clear() for all.
  * Only per-message materials are retained: runs are assembled afresh each time.
  */
@@ -303,7 +312,7 @@ export class MessageSegmentationCache {
 	}
 
 	/** Internal to segmentMessages; exposed for coordinator-independent ownership. */
-	getMaterials(msg: NarratorMsg): MessageMaterials {
+	getMaterials(msg: NarratorMsg, nestedRows: readonly NarratorMsg[] = NO_ROWS): MessageMaterials {
 		const entry = this.entries.get(msg.id);
 		if (
 			entry &&
@@ -311,7 +320,7 @@ export class MessageSegmentationCache {
 			entry.role === msg.role &&
 			entry.body === messageBody(msg) &&
 			entry.toolCalls === msg.toolCalls &&
-			entry.children === msg.children
+			sameRows(entry.nestedRows, nestedRows)
 		) {
 			return entry.materials;
 		}
@@ -319,7 +328,7 @@ export class MessageSegmentationCache {
 		// A same-id replacement must release the previous version even if the new
 		// materials exceed the budget and therefore cannot be retained.
 		this.invalidate(msg.id);
-		const materials = buildMessageMaterials(msg);
+		const materials = buildMessageMaterials(msg, nestedRows);
 		if (
 			msg.id !== "__streaming__" &&
 			this.entries.size < this.maxMessages &&
@@ -330,7 +339,7 @@ export class MessageSegmentationCache {
 				role: msg.role,
 				body: messageBody(msg),
 				toolCalls: msg.toolCalls,
-				children: msg.children,
+				nestedRows,
 				materials,
 			});
 			this.retainedAtoms += materials.atoms.length;
@@ -359,7 +368,10 @@ function isEpochMarker(msg: NarratorMsg): boolean {
 	return !!head && typeof head === "object" && (head as { type?: unknown }).type === "epoch";
 }
 
-function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
+function buildMessageMaterials(
+	msg: NarratorMsg,
+	nestedRows: readonly NarratorMsg[] = NO_ROWS,
+): MessageMaterials {
 	const atoms: MessageAtom[] = [];
 	const materials: MessageMaterials = { atoms, toolCalls: [] };
 	if (msg.role !== "assistant") {
@@ -392,19 +404,19 @@ function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
 			// Preserve first-match behavior for repeated toolUseIds (retry blocks).
 			const tc = materials.toolCalls.find((tool) => tool.toolUseId === block.id);
 			if (!tc) continue;
-			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
+			const toolRows = nestedRowsOfTool(nestedRows, tc.toolUseId);
 			atom.item = {
 				kind: "tool",
 				msg,
 				blockIndex: atom.blockIndex,
 				tc,
-				children,
+				nestedRows: toolRows,
 				isSubagent:
 					tc.toolName === "Agent" ||
 					tc.toolName === "Task" ||
 					tc.toolName === "Send" ||
 					!!tc._subagentActivity ||
-					children.length > 0,
+					toolRows.length > 0,
 			};
 		}
 	}
@@ -418,9 +430,15 @@ export function segmentMessages(
 	const { streamingMsg, cache } = opts;
 
 	const effectiveMessages = streamingMsg != null ? [...messages, streamingMsg] : messages;
+	const nestedByParent = nestedRowsByParent(messages);
 	const atoms: MessageAtom[] = [];
 	for (const msg of effectiveMessages) {
-		const materials = cache ? cache.getMaterials(msg) : buildMessageMaterials(msg);
+		// A nested row is read through its parent's tool call, never on its own.
+		if (isNestedRow(msg)) continue;
+		const nestedRows = nestedByParent.get(msg.id) ?? NO_ROWS;
+		const materials = cache
+			? cache.getMaterials(msg, nestedRows)
+			: buildMessageMaterials(msg, nestedRows);
 		// Do not spread arbitrarily large block lists into a function call.
 		for (const atom of materials.atoms) atoms.push(atom);
 	}
@@ -887,7 +905,6 @@ export function buildStreamingMsg(opts: {
 		contentText: null,
 		toolCalls: toolChunksMsg?.toolCalls ?? [],
 		createdAt: toolChunksMsg?.createdAt ?? new Date().toISOString(),
-		children: [],
 		// Text/reasoning blocks are emitted first and in the same order as
 		// `streamingBlocks`, so the accumulator's index carries over unchanged.
 		...(liveBlockIndex != null ? { liveBlockIndex } : {}),

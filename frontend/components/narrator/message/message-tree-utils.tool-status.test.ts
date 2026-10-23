@@ -8,7 +8,7 @@
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
 import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
-import { mergeToolCallFieldsInTree } from "./message-tree-utils";
+import { mergeToolCallFieldsInRows } from "./message-tree-utils";
 
 function msg(status: string, extra: Record<string, unknown> = {}): TreeMessage {
 	return rowWithElements(
@@ -20,16 +20,15 @@ function msg(status: string, extra: Record<string, unknown> = {}): TreeMessage {
 			contentText: null,
 			toolCalls: [{ toolUseId: "tu-1", toolName: "Edit", status, ...extra }],
 			createdAt: "2026-01-01T00:00:00.000Z",
-			children: [],
 		},
 		[{ type: "tool_use", id: "tu-1", name: "Edit", status, ...extra }],
 	) as TreeMessage;
 }
 
-describe("mergeToolCallFieldsInTree", () => {
+describe("mergeToolCallFieldsInRows", () => {
 	it("ignores a status regression from a late snapshot", () => {
 		const previous = msg("success", { durationMs: 12_000, outputJson: "ok" });
-		const result = mergeToolCallFieldsInTree([previous], "tu-1", {
+		const result = mergeToolCallFieldsInRows([previous], "tu-1", {
 			status: "running",
 			inputJson: { file_path: "a.css" },
 		});
@@ -48,7 +47,7 @@ describe("mergeToolCallFieldsInTree", () => {
 
 	it("applies a forward completion", () => {
 		const previous = msg("running", { startedAt: 5 });
-		const result = mergeToolCallFieldsInTree([previous], "tu-1", {
+		const result = mergeToolCallFieldsInRows([previous], "tu-1", {
 			status: "success",
 			durationMs: 7,
 		});

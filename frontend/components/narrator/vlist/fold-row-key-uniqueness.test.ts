@@ -53,7 +53,6 @@ function toolMessage(messageId: string, toolUseId: string, status: string, strea
 					inputJson: input,
 				},
 			],
-			children: [],
 		},
 		[{ type: "tool_use", id: toolUseId, name: "Bash", input }],
 	);
@@ -67,7 +66,6 @@ function reasoningMessage(messageId: string, text: string) {
 			model: "gpt-5.6",
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 		},
 		[{ type: "reasoning", text }],
 	);
@@ -196,7 +194,6 @@ describe("hand-off across an activity-unit boundary", () => {
 				id: messageId,
 				role: "assistant",
 				toolCalls: [],
-				children: [],
 			},
 			[{ type: "text", text }],
 		);
@@ -275,7 +272,6 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 						id: `m${counter}`,
 						role: "assistant",
 						toolCalls: [],
-						children: [],
 					},
 					[{ type: "text", text: "答案正文。" }],
 				);
@@ -285,7 +281,6 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 						id: `m${counter}`,
 						role: "user",
 						toolCalls: [],
-						children: [],
 					},
 					[{ type: "text", text: "问题" }],
 				);
@@ -295,7 +290,6 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 						id: `m${counter}`,
 						role: "assistant",
 						toolCalls: [],
-						children: [],
 					},
 					[{ type: "reasoning", text: "**一步**\n\n正文。" }],
 				);
@@ -365,7 +359,6 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 					seq,
 					role: "assistant",
 					toolCalls: [],
-					children: [],
 				},
 				[{ type: "text", text: "答案正文。" }],
 			);

@@ -50,7 +50,6 @@ function historyMessages(count: number, fixture: HistoryFixture = "shared"): Nar
 			parentToolUseId: null,
 			contentText: null,
 			createdAt: "2026-01-01T00:00:00.000Z",
-			children: [],
 		};
 		switch (index % 5) {
 			case 0: {
@@ -137,7 +136,6 @@ function streamingFrames(historyCount: number): NarratorMsg[] {
 				createdAt: "2026-01-01T00:00:00.000Z",
 				role: "assistant",
 				toolCalls: [],
-				children: [],
 			},
 			[{ type: "reasoning", text }],
 		);

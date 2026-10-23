@@ -191,7 +191,6 @@ function indexedResolver(ids: string[], prefix = "index"): MessageSelectionResol
 					seq: seq + 1,
 					role: "user",
 					contentText: `${prefix} ${id}`,
-					children: [],
 				},
 				[{ type: "text", text: `${prefix} ${id}` }],
 			) as unknown as NarratorMsg,

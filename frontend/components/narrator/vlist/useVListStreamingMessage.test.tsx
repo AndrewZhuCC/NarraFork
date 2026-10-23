@@ -32,7 +32,6 @@ function message(contentJson: unknown[], id = "assistant-1"): TreeMessage {
 			parentToolUseId: null,
 			contentText: null,
 			toolCalls: [],
-			children: [],
 			createdAt: "2026-09-20T00:00:00Z",
 		},
 		contentJson,

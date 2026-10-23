@@ -21,7 +21,6 @@ const CITATION_MARKER = `${CHATGPT_CITATION_OPEN}turn204588view0${CHATGPT_CITATI
 // biome-ignore lint/suspicious/noExplicitAny: test fixtures are structural
 function msg(partial: Record<string, any>): NarratorMsg {
 	return {
-		children: [],
 		contentText: null,
 		...partial,
 	} as unknown as NarratorMsg;

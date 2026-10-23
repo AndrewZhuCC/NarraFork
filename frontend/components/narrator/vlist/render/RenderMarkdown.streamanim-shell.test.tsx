@@ -82,7 +82,6 @@ function streamingMsg(text: string) {
 			contentText: null,
 			toolCalls: [],
 			createdAt: "2026-07-28T00:00:00.000Z",
-			children: [],
 		},
 		[{ type: "text", id: "streaming:text:0", text }],
 	) as never;

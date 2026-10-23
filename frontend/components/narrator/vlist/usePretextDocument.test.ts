@@ -123,7 +123,6 @@ function message(seq: number, text: string): TreeMessage {
 			contentText: text,
 			toolCalls: [],
 			createdAt: "2026-07-23T00:00:00.000Z",
-			children: [],
 			seq,
 		},
 		[{ type: "text", text }],

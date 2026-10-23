@@ -48,6 +48,7 @@ import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/mes
 /** The subset of a message this module reads. */
 export interface ReplaceCandidate extends MessageBodySource {
 	id?: unknown;
+	parentMessageId?: unknown;
 }
 
 /** Optional server alias for copy-on-write replacement events. */
@@ -139,9 +140,13 @@ export function replaceLoadedMessage<T extends ReplaceCandidate>(
 	if (index < 0) return { messages: loaded, replaced: false, reason: "not-loaded" };
 
 	// COW replacements deliberately replace the entire row. The new id gives every
-	// block a fresh spec.key, so changed heights cannot hit the old row's cache.
-	if (loaded[index]?.id !== id) {
-		const messages = [...loaded];
+	// block a fresh spec.key, so changed heights cannot hit the old row's cache. Rows
+	// nested under the old row now hang under its copy.
+	const previousId = loaded[index]?.id;
+	if (previousId !== id) {
+		const messages = loaded.map((row) =>
+			row.parentMessageId === previousId ? { ...row, parentMessageId: id } : row,
+		);
 		messages[index] = message;
 		return { messages, replaced: true };
 	}

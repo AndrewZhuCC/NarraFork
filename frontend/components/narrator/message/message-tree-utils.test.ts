@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
 import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
-	mergeToolCallFieldsInTree,
+	mergeToolCallFieldsInRows,
 	replaceSubagentActivitySnapshot,
 	updateSubagentActivityInMessages,
 	upsertSubagentToolCallHeader,
@@ -22,7 +22,6 @@ function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
 			tokensIn: null,
 			costUsd: null,
 			createdAt: "2026-05-14T00:00:00.000Z",
-			children: [],
 			...rest,
 		},
 		messageBody({ blocks }),
@@ -136,7 +135,7 @@ describe("subagent activity reducers", () => {
 });
 
 describe("message-tree-utils tool state parity", () => {
-	test("mergeToolCallFieldsInTree syncs permission fields into enriched content blocks", () => {
+	test("mergeToolCallFieldsInRows syncs permission fields into enriched content blocks", () => {
 		const messages = [
 			message(
 				rowWithElements(
@@ -162,7 +161,7 @@ describe("message-tree-utils tool state parity", () => {
 			),
 		];
 
-		const result = mergeToolCallFieldsInTree(messages, "tool-1", {
+		const result = mergeToolCallFieldsInRows(messages, "tool-1", {
 			status: "denied",
 			permissionDenyMessage: "Needs a smaller diff",
 			permissionDecisionReason: "user_feedback",

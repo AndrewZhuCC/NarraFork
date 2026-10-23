@@ -34,7 +34,6 @@ function msg(overrides: Partial<NarratorMsg> & { id: string }): NarratorMsg {
 			role: "assistant",
 			contentText: null,
 			toolCalls: [],
-			children: [],
 			narratorId: "n1",
 			parentToolUseId: null,
 			createdAt: "2026-01-01T00:00:00.000Z",
@@ -161,31 +160,25 @@ describe("buildReflectionSourceIndex", () => {
 		expect(index.size).toBe(0);
 	});
 
-	it("walks child messages (subagent tool calls)", () => {
+	it("reads nested rows (subagent tool calls)", () => {
 		const index = buildReflectionSourceIndex([
+			msg(
+				rowWithElements({ id: "m1" }, [toolBlock({ id: "tu-parent", name: "Agent" })]),
+			) as NarratorMsg,
 			msg(
 				rowWithElements(
 					{
-						id: "m1",
-						children: [
-							msg(
-								rowWithElements(
-									{
-										id: "m1c",
-										parentToolUseId: "tu-parent",
-									},
-									[
-										toolBlock({
-											id: "tu-child",
-											status: "success",
-											permissionSuggestions: [suggestion("task_reflection", "confirmed")],
-										}),
-									],
-								),
-							) as NarratorMsg,
-						],
+						id: "m1c",
+						parentToolUseId: "tu-parent",
+						parentMessageId: "m1",
 					},
-					[toolBlock({ id: "tu-parent", name: "Agent" })],
+					[
+						toolBlock({
+							id: "tu-child",
+							status: "success",
+							permissionSuggestions: [suggestion("task_reflection", "confirmed")],
+						}),
+					],
 				),
 			) as NarratorMsg,
 		]);
@@ -254,37 +247,25 @@ describe("buildReflectionSourceIndex", () => {
 		expect(index.has("tu-dup")).toBe(false);
 	});
 
-	it("child occurrences override their parent message rows", () => {
+	it("nested occurrences override their parent message rows", () => {
 		const index = buildReflectionSourceIndex([
 			msg(
-				rowWithElements(
-					{
-						id: "m1",
-						children: [
-							msg(
-								rowWithElements(
-									{
-										id: "m1c",
-									},
-									[
-										toolBlock({
-											id: "tu-1",
-											tcId: "tc-child",
-											permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
-										}),
-									],
-								),
-							) as NarratorMsg,
-						],
-					},
-					[
-						toolBlock({
-							id: "tu-1",
-							tcId: "tc-parent",
-							permissionSuggestions: [suggestion("danger_reflection", "running")],
-						}),
-					],
-				),
+				rowWithElements({ id: "m1" }, [
+					toolBlock({
+						id: "tu-1",
+						tcId: "tc-parent",
+						permissionSuggestions: [suggestion("danger_reflection", "running")],
+					}),
+				]),
+			) as NarratorMsg,
+			msg(
+				rowWithElements({ id: "m1c", parentMessageId: "m1" }, [
+					toolBlock({
+						id: "tu-1",
+						tcId: "tc-child",
+						permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
+					}),
+				]),
 			) as NarratorMsg,
 		]);
 		expect(index.get("tu-1")?.toolCallId).toBe("tc-child");

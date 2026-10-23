@@ -71,7 +71,6 @@ describe("resolveAllToolCallsFromMsg", () => {
 				role: "assistant",
 				contentText: null,
 				toolCalls: [{ toolUseId: "send-1", toolName: "Send", status: "running" }],
-				children: [],
 				createdAt: "2026-07-18T00:00:00.000Z",
 			},
 			[
@@ -112,7 +111,6 @@ describe("segmentMessages", () => {
 						status: "success",
 					},
 				],
-				children: [],
 				createdAt: "2026-07-19T00:00:00.000Z",
 			},
 			[

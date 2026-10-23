@@ -12,7 +12,6 @@ function message(id: string, contentJson: ContentBlock[] = []): NarratorMsg {
 			role: "assistant",
 			contentText: null,
 			toolCalls: [],
-			children: [],
 			createdAt: "2026-01-01T00:00:00.000Z",
 		},
 		contentJson,
@@ -117,7 +116,7 @@ describe("MessageSegmentationCache", () => {
 		expect(first).toEqual(original);
 	});
 
-	test("same-object direct role/content/toolCalls/children replacements invalidate materials", () => {
+	test("same-object direct role/content/toolCalls/nested-row replacements invalidate materials", () => {
 		const cache = new MessageSegmentationCache();
 		const msg = toolMessage("direct");
 		const first = toolItems(expectColdEqual([msg], cache))[0];
@@ -125,12 +124,15 @@ describe("MessageSegmentationCache", () => {
 		const rowChanged = toolItems(expectColdEqual([msg], cache))[0];
 		expect(rowChanged).not.toBe(first);
 		expect(rowChanged.tc.status).toBe("success");
-		const child = { ...message("child"), parentToolUseId: "tool-direct" };
-		msg.children = [child];
-		const childrenChanged = toolItems(expectColdEqual([msg], cache))[0];
-		expect(childrenChanged).not.toBe(rowChanged);
-		expect(childrenChanged.children).toEqual([child]);
-		expect(childrenChanged.isSubagent).toBe(true);
+		const child = {
+			...message("child"),
+			parentToolUseId: "tool-direct",
+			parentMessageId: "direct",
+		};
+		const nestedChanged = toolItems(expectColdEqual([msg, child], cache))[0];
+		expect(nestedChanged).not.toBe(rowChanged);
+		expect(nestedChanged.nestedRows).toEqual([child]);
+		expect(nestedChanged.isSubagent).toBe(true);
 		Object.assign(msg, rowWithElements(msg, [{ type: "text", text: "replacement" }]));
 		expectColdEqual([msg], cache);
 		msg.role = "user";
@@ -148,10 +150,10 @@ describe("MessageSegmentationCache", () => {
 		expect(updated).not.toBe(first);
 		expect(updated.tc.toolName).toBe("Send");
 		expect(same).toBe(stableItem);
-		msg.children.push({ ...message("child"), parentToolUseId: "tool-a" });
+		const child = { ...message("child"), parentToolUseId: "tool-a", parentMessageId: "a" };
 		cache.invalidate();
 		expect(cache.size).toBe(0);
-		expect(toolItems(expectColdEqual([msg, stable], cache))[0].children).toHaveLength(1);
+		expect(toolItems(expectColdEqual([msg, child, stable], cache))[0].nestedRows).toHaveLength(1);
 		cache.clear();
 		expect(cache.size).toBe(0);
 		expect(cache.atomCount).toBe(0);
@@ -260,7 +262,7 @@ describe("MessageSegmentationCache", () => {
 			{ type: "tool_use", id: "last", name: "Read" },
 		]);
 		b.toolCalls = [{ id: "retry-1", toolUseId: "repeat", toolName: "Task", status: "success" }];
-		b.children = [{ ...message("child"), parentToolUseId: "repeat" }];
+		const child = { ...message("child"), parentToolUseId: "repeat", parentMessageId: "b" };
 		const unknown = message("unknown", [{ type: "future_block" }]);
 		const mixed = message("mixed", [
 			{ type: "future_block" },
@@ -271,7 +273,15 @@ describe("MessageSegmentationCache", () => {
 			{ type: "image" },
 			{ type: "thinking", thinking: "visible" },
 		]);
-		const messages = [a, b, unknown, message("empty"), mixed, { ...a, id: "user", role: "user" }];
+		const messages = [
+			a,
+			b,
+			child,
+			unknown,
+			message("empty"),
+			mixed,
+			{ ...a, id: "user", role: "user" },
+		];
 		const cold = segmentMessages(messages);
 		const cached = expectColdEqual(messages, cache);
 		expect(expectColdEqual(messages, cache)).toEqual(cold);
@@ -279,7 +289,7 @@ describe("MessageSegmentationCache", () => {
 		const items = toolItems(cached);
 		expect(items[1].tc.id).toBe("retry-2");
 		expect(items[2].tc.id).toBe("retry-2");
-		expect(items[1].children).toEqual(b.children);
+		expect(items[1].nestedRows).toEqual([child]);
 		expect(items[1].isSubagent).toBe(true);
 		expect(cached).toContainEqual({ kind: "message", msg: unknown });
 	});

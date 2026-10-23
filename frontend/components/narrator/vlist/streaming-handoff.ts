@@ -8,6 +8,7 @@ import {
 import { isReasoningBlock } from "@shared/pretext-layout/reasoning-segments";
 import { resolveLiveBlockIndex } from "@shared/pretext-layout/streaming-live-blocks";
 import type { StreamingBlock } from "../message/message-segments";
+import { isNestedRow } from "../message/nested-rows";
 import { blockSupersedes, contentBlockIdentity } from "../streaming/streaming-block-supersede";
 import { collectPersistedToolUseIds } from "./streaming-tool-chunks";
 
@@ -17,16 +18,23 @@ export interface HandoffMessage extends MessageBodySource {
 	id?: unknown;
 	role?: unknown;
 	parentToolUseId?: unknown;
+	parentMessageId?: unknown;
 	toolCalls?: unknown;
-	children?: readonly unknown[];
+}
+
+/**
+ * A row that is not part of this page's conversation: a nested row, or on a parent
+ * page a row a subagent wrote.
+ */
+function offPage(message: HandoffMessage, isSubagent: boolean): boolean {
+	return (!isSubagent && !!message.parentToolUseId) || isNestedRow(message);
 }
 
 function currentTurn(messages: readonly HandoffMessage[], isSubagent: boolean): HandoffMessage[] {
 	const turn: HandoffMessage[] = [];
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
-		if (!message || message.id === "__streaming__" || (!isSubagent && message.parentToolUseId))
-			continue;
+		if (!message || message.id === "__streaming__" || offPage(message, isSubagent)) continue;
 		if (message.role === "user") break;
 		if (message.role === "assistant") turn.push(message);
 	}
@@ -50,7 +58,7 @@ export function projectStreamingMessage(
 		if (
 			message.id === "__streaming__" ||
 			message.role !== "assistant" ||
-			(!isSubagent && message.parentToolUseId)
+			offPage(message, isSubagent)
 		)
 			continue;
 		for (const block of messageBody(message) as readonly BaseContentBlock[]) {
@@ -181,7 +189,7 @@ export function projectPendingEmptyReasoning(
 	if (!active) return messages;
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
-		if (!message || (!isSubagent && message.parentToolUseId)) continue;
+		if (!message || offPage(message, isSubagent)) continue;
 		if (message.role !== "assistant") return messages;
 		const blocks = messageBody(message);
 		if (message.toolCalls?.length) return messages;

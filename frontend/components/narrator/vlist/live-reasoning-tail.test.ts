@@ -43,7 +43,6 @@ const HISTORY = [
 			seq: 0,
 			role: "assistant",
 			toolCalls: [{ id: "c0", toolUseId: "tu-0", toolName: "Read", status: "success" }],
-			children: [],
 		},
 		[{ type: "tool_use", id: "tu-0", name: "Read", input: { file_path: "src/a.ts" } }],
 	),
@@ -57,7 +56,6 @@ const streamingMessage = (text: string) =>
 			seq: 999,
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 		},
 		[{ type: "reasoning", text }],
 	);
@@ -70,7 +68,6 @@ const settledMessage = (text: string) =>
 			seq: 1,
 			role: "assistant",
 			toolCalls: [],
-			children: [],
 		},
 		[{ type: "reasoning", text }],
 	);

@@ -1,4 +1,5 @@
 import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
+import { isNestedRow } from "../message/nested-rows";
 
 /**
  * vlist-spec-tasks-pin.ts — Pure "latest spec://tasks.json call" identification
@@ -30,6 +31,7 @@ export interface SpecTasksToolCallLike {
 export interface SpecTasksMessageLike
 	extends MessageWithBody<{ type?: unknown; id?: unknown; name?: unknown; input?: unknown }> {
 	toolCalls?: readonly SpecTasksToolCallLike[] | null;
+	parentMessageId?: string | null;
 }
 
 /** The path a streaming tool call has extracted so far, if any. */
@@ -70,6 +72,7 @@ export function findLatestSpecTasksToolUseIdInMessages(
 ): string | null {
 	let latest: string | null = null;
 	for (const msg of messages) {
+		if (isNestedRow(msg)) continue;
 		for (const block of messageBody(msg)) {
 			if (block?.type !== "tool_use") continue;
 			const id = typeof block.id === "string" ? block.id : null;

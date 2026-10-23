@@ -126,7 +126,6 @@ if (process.env.NF_AIP_BRIDGE_TEST_CHILD !== "1") {
 				contentText: null,
 				toolCalls: [],
 				createdAt: "2026-01-01",
-				children: [],
 			},
 			[],
 		);

@@ -58,6 +58,41 @@ describe("block protocol decoding", () => {
 		expect(decoded.messages[0]).not.toHaveProperty("contentJson");
 	});
 
+	test("rows stay flat: a nested row follows its parent and names it", () => {
+		const decoded = decodeBlockPage({
+			protocol: 2,
+			messages: [envelope("m1", ["b1"]), envelope("c1", ["b2"], "m1"), envelope("m2", ["b3"])],
+			blocks: [
+				block("b1", "m1", [{ type: "tool_use", id: "t1", name: "Run" }]),
+				block("b2", "c1", [{ type: "text", text: "reply" }]),
+				block("b3", "m2", [{ type: "text", text: "next" }]),
+			],
+		}) as unknown as { messages: TreeMessage[] };
+		expect(decoded.messages.map((row) => row.id)).toEqual(["m1", "c1", "m2"]);
+		expect(decoded.messages[0]).not.toHaveProperty("parentMessageId");
+		expect(decoded.messages[1].parentMessageId).toBe("m1");
+		for (const row of decoded.messages) expect(row).not.toHaveProperty("children");
+	});
+
+	test("catch-up rows stay flat; orphans are split out", () => {
+		const [frame] = decodeBlockFrame({
+			type: "catch_up",
+			narratorId: "n1",
+			messages: [envelope("m1", ["b1"]), envelope("c1", ["b2"], "m1"), envelope("o1", [])],
+			blocks: [
+				block("b1", "m1", [{ type: "text", text: "a" }]),
+				block("b2", "c1", [{ type: "text", text: "b" }]),
+			],
+			orphanMessageIds: ["o1"],
+		});
+		const topLevel = frame.topLevel as TreeMessage[];
+		expect(topLevel.map((row) => [row.id, row.parentMessageId])).toEqual([
+			["m1", undefined],
+			["c1", "m1"],
+		]);
+		expect((frame.orphanChildren as TreeMessage[]).map((row) => row.id)).toEqual(["o1"]);
+	});
+
 	test("a block opening reaches no listener", () => {
 		expect(
 			decodeBlockFrame({
